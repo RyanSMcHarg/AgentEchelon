@@ -1,0 +1,76 @@
+/* Shared help affordances for the admin console: an info (ⓘ) tooltip and a
+   documentation "learn more" link. Styling mirrors the existing token system
+   (surfaces, radius, shadow, z-index) so it reads as one system. */
+
+.info-tip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  margin-left: 4px;
+  vertical-align: middle;
+}
+
+.info-tip-trigger {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--text-tertiary);
+  font-size: 12px;
+  line-height: 1;
+  cursor: help;
+  border-radius: var(--radius-full);
+  transition: color var(--duration-base) var(--ease-in-out),
+    background var(--duration-base) var(--ease-in-out);
+}
+
+.info-tip-trigger:hover,
+.info-tip-trigger:focus-visible {
+  color: var(--text-primary);
+  background: var(--surface-100);
+  outline: none;
+}
+
+.info-tip-content {
+  /* Rendered in a portal on <body>; top/left are set inline from the trigger
+     rect and clamped to the viewport, so it can't be clipped by an overflow
+     ancestor. Keep max-width in sync with TIP_MAX_WIDTH in AdminHelp.tsx. */
+  position: fixed;
+  z-index: var(--z-overlay);
+  width: max-content;
+  max-width: 260px;
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-0);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-lg);
+  box-shadow: var(--shadow-lg);
+  color: var(--text-secondary);
+  /* Reset any inherited title styling (e.g. uppercase mono metric titles). */
+  font-size: var(--text-base);
+  font-weight: 400;
+  line-height: var(--leading-relaxed);
+  text-transform: none;
+  letter-spacing: normal;
+  white-space: normal;
+  text-align: left;
+  animation: fadeIn var(--duration-fast) var(--ease-out);
+}
+
+.doc-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  color: var(--accent-500);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.doc-link:hover {
+  text-decoration: underline;
+}

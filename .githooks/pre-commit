@@ -1,0 +1,63 @@
+#!/usr/bin/env bash
+#
+# Pre-commit hook: prevent committing sensitive/critical files.
+# Install: git config core.hooksPath .githooks
+#
+
+set -euo pipefail
+
+# Files that must never be committed (exact paths)
+BLOCKED_FILES=(
+  "frontend/.env"
+  "frontend/.env.local"
+  ".env"
+  ".env.local"
+)
+
+# Patterns that must never be committed (matched against staged paths)
+BLOCKED_PATTERNS=(
+  '\.env\..*\.local$'
+  '\.pem$'
+  '\.key$'
+  '\.p12$'
+  '\.pfx$'
+  '\.jks$'
+  'credentials\.json$'
+  'serviceAccountKey\.json$'
+  '\.aws/credentials$'
+  'id_rsa$'
+  'id_ed25519$'
+)
+
+STAGED=$(git diff --cached --name-only --diff-filter=ACR)
+
+if [ -z "$STAGED" ]; then
+  exit 0
+fi
+
+VIOLATIONS=()
+
+# Check exact file matches
+for file in "${BLOCKED_FILES[@]}"; do
+  if echo "$STAGED" | grep -qxF "$file"; then
+    VIOLATIONS+=("  $file")
+  fi
+done
+
+# Check pattern matches
+for pattern in "${BLOCKED_PATTERNS[@]}"; do
+  while IFS= read -r match; do
+    [ -n "$match" ] && VIOLATIONS+=("  $match")
+  done < <(echo "$STAGED" | grep -E "$pattern" || true)
+done
+
+if [ ${#VIOLATIONS[@]} -gt 0 ]; then
+  echo ""
+  echo "COMMIT BLOCKED — sensitive files detected:"
+  echo ""
+  printf '%s\n' "${VIOLATIONS[@]}"
+  echo ""
+  echo "If this is intentional, bypass with: git commit --no-verify"
+  echo ""
+  exit 1
+fi

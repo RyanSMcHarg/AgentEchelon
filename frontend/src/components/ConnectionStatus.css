@@ -1,0 +1,34 @@
+.connection-status {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding: var(--space-1) 10px;
+  border-radius: var(--radius-xl);
+  font-size: var(--text-sm);
+  font-weight: 500;
+}
+
+.connection-status--disconnected {
+  background: var(--error-bg);
+  color: var(--error);
+}
+
+.connection-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+}
+
+.connection-dot--red {
+  background: var(--error);
+  animation: connection-pulse 2s ease-in-out infinite;
+}
+
+@keyframes connection-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.connection-label {
+  white-space: nowrap;
+}

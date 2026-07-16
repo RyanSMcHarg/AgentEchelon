@@ -1,0 +1,17 @@
+{
+  // Type-check gate for the test tree. The deployable build
+  // (tsconfig.json) is NodeNext and source files carry explicit `.js`
+  // specifiers. Test files use extensionless relative imports +
+  // dynamic import() the way ts-jest actually resolves them, so the
+  // test gate uses `Bundler` resolution to match runtime reality
+  // instead of forcing churn across every spec. Run: npm run typecheck
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "noEmit": true,
+    "types": ["node", "jest"]
+  },
+  "include": ["test/**/*", "lib/**/*", "lambda/**/*"],
+  "exclude": ["node_modules", "cdk.out"]
+}

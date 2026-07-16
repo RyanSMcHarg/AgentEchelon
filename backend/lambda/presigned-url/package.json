@@ -1,0 +1,10 @@
+{
+  "name": "presigned-url",
+  "version": "1.0.0",
+  "description": "Lambda handler for S3 presigned URL generation",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.600.0",
+    "@aws-sdk/s3-request-presigner": "^3.600.0"
+  }
+}

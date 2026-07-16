@@ -1,0 +1,24 @@
+# Line-ending policy, pinned so behavior does not depend on each clone's
+# core.autocrlf setting (which otherwise produces phantom "modified" files with
+# empty diffs). Canonical form in the repository is LF; the working tree gets
+# platform-native endings, with the exceptions noted below.
+* text=auto
+
+# Docs are authored in Obsidian with CRLF. Force CRLF in the working tree on
+# every platform so the authoring convention is deterministic.
+*.md eol=crlf
+
+# Shell scripts must stay LF even on Windows checkouts (they run on Linux/CI).
+*.sh text eol=lf
+
+# Binary assets, never apply EOL conversion.
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
+*.woff binary
+*.woff2 binary
+*.zip binary
+*.gz binary

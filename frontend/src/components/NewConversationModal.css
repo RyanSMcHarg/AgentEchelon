@@ -1,0 +1,382 @@
+/* ========================================
+   New Conversation Modal
+   Precision Engineering aesthetic
+   Classification-gated conversation creation
+   ======================================== */
+
+/* Modal container — wider than default to fit classification cards */
+.ncm-modal {
+  width: 560px;
+  max-width: 95vw;
+  max-height: 90vh;
+  overflow-y: auto;
+  background: var(--surface-0);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-xl), 0 0 0 1px var(--surface-200);
+  animation: ncm-enter var(--duration-slow) var(--ease-out);
+}
+
+@keyframes ncm-enter {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* Header */
+.ncm-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  padding: var(--space-6) var(--space-6) 0;
+}
+
+.ncm-title {
+  font-family: var(--font-sans);
+  font-size: var(--text-xl);
+  font-weight: 600;
+  color: var(--text-primary);
+  margin: 0;
+  letter-spacing: var(--tracking-tight);
+}
+
+.ncm-subtitle {
+  font-size: var(--text-base);
+  color: var(--text-tertiary);
+  margin: var(--space-1) 0 0;
+}
+
+/* Sections */
+.ncm-section {
+  padding: var(--space-4) var(--space-6);
+}
+
+/* Labels */
+.ncm-label {
+  display: block;
+  margin-bottom: var(--space-3);
+}
+
+.ncm-label-text {
+  display: block;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-secondary);
+  letter-spacing: var(--tracking-wider);
+  text-transform: uppercase;
+}
+
+.ncm-label-hint {
+  display: block;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  margin-top: 2px;
+  font-weight: 400;
+  letter-spacing: var(--tracking-normal);
+  text-transform: none;
+}
+
+/* Classification card grid — stacked vertically for readability */
+.ncm-classification-grid {
+  display: grid;
+  grid-template-columns: 1fr;
+  gap: var(--space-3);
+}
+
+/* Classification card */
+.ncm-class-card {
+  position: relative;
+  text-align: left;
+  padding: var(--space-4);
+  background: var(--surface-50);
+  border: 1px solid var(--surface-200);
+  border-left: 3px solid var(--tier-accent, var(--surface-300));
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  transition:
+    border-color var(--duration-fast) var(--ease-in-out),
+    background var(--duration-fast) var(--ease-in-out),
+    box-shadow var(--duration-fast) var(--ease-in-out);
+  font-family: var(--font-sans);
+}
+
+.ncm-class-card:hover {
+  background: var(--surface-0);
+  border-color: var(--surface-300);
+  box-shadow: var(--shadow-sm);
+}
+
+.ncm-class-card--selected {
+  background: var(--surface-0);
+  border-color: var(--tier-accent, var(--accent-500));
+  border-left-color: var(--tier-accent, var(--accent-500));
+  box-shadow: var(--shadow-md), 0 0 0 1px var(--tier-accent, var(--accent-500));
+}
+
+/* Card header: badge + model */
+.ncm-class-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-2);
+}
+
+.ncm-class-card-badge {
+  display: inline-flex;
+  align-items: center;
+  padding: 2px 8px;
+  border-radius: var(--radius-full);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: #fff;
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.ncm-class-card-model {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  letter-spacing: var(--tracking-wide);
+}
+
+/* Card description */
+.ncm-class-card-desc {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  line-height: var(--leading-relaxed);
+  margin: 0 0 var(--space-3);
+}
+
+/* Card meta (membership + detail toggle) */
+.ncm-class-card-meta {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+}
+
+.ncm-class-card-meta-item {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+}
+
+.ncm-class-card-detail-toggle {
+  background: none;
+  border: none;
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  color: var(--accent-600);
+  cursor: pointer;
+  padding: 0;
+  text-decoration: none;
+  white-space: nowrap;
+}
+
+.ncm-class-card-detail-toggle:hover {
+  color: var(--accent-700);
+  text-decoration: underline;
+}
+
+/* Expanded details */
+.ncm-class-card-details {
+  margin-top: var(--space-3);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--surface-200);
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: var(--space-3);
+  animation: ncm-detail-enter var(--duration-base) var(--ease-out);
+}
+
+@keyframes ncm-detail-enter {
+  from {
+    opacity: 0;
+    max-height: 0;
+  }
+  to {
+    opacity: 1;
+    max-height: 300px;
+  }
+}
+
+.ncm-detail-group {
+  min-width: 0;
+}
+
+.ncm-detail-label {
+  display: block;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+  margin-bottom: 4px;
+}
+
+.ncm-detail-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.ncm-detail-list li {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  line-height: 1.6;
+  padding-left: 12px;
+  position: relative;
+}
+
+.ncm-detail-list li::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 7px;
+  width: 4px;
+  height: 4px;
+  border-radius: var(--radius-full);
+  background: var(--tier-accent, var(--surface-300));
+}
+
+/* Selected checkmark */
+.ncm-class-card-check {
+  position: absolute;
+  top: var(--space-3);
+  right: var(--space-3);
+  width: 22px;
+  height: 22px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: var(--tier-accent, var(--accent-500));
+  color: #fff;
+  border-radius: var(--radius-full);
+  animation: ncm-check-enter var(--duration-base) var(--ease-out);
+}
+
+@keyframes ncm-check-enter {
+  from {
+    transform: scale(0);
+    opacity: 0;
+  }
+  to {
+    transform: scale(1);
+    opacity: 1;
+  }
+}
+
+/* Title input */
+.ncm-input {
+  width: 100%;
+  padding: var(--space-3);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--text-md);
+  color: var(--text-primary);
+  background: var(--surface-0);
+  box-sizing: border-box;
+  transition:
+    border-color var(--duration-fast) var(--ease-in-out),
+    box-shadow var(--duration-fast) var(--ease-in-out);
+}
+
+.ncm-input::placeholder {
+  color: var(--text-tertiary);
+}
+
+.ncm-input:focus {
+  outline: none;
+  border-color: var(--accent-500);
+  box-shadow: var(--shadow-glow);
+}
+
+/* Security context bar */
+.ncm-security-bar {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin: 0 var(--space-6);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-50);
+  border: 1px solid var(--surface-200);
+  border-left: 3px solid var(--tier-accent, var(--surface-300));
+  border-radius: var(--radius-md);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  animation: ncm-enter var(--duration-base) var(--ease-out);
+}
+
+.ncm-security-bar strong {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+.ncm-security-bar svg {
+  color: var(--tier-accent, var(--text-tertiary));
+  flex-shrink: 0;
+}
+
+/* Error */
+.ncm-error {
+  margin: var(--space-3) var(--space-6) 0;
+  padding: var(--space-3) var(--space-4);
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  border-radius: var(--radius-md);
+  color: var(--error);
+  font-size: var(--text-sm);
+}
+
+/* Actions */
+.ncm-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-6) var(--space-6);
+}
+
+.ncm-btn {
+  padding: var(--space-2) var(--space-5);
+  border-radius: var(--radius-md);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  font-weight: 500;
+  cursor: pointer;
+  border: none;
+  transition:
+    background var(--duration-fast) var(--ease-in-out),
+    opacity var(--duration-fast) var(--ease-in-out);
+}
+
+.ncm-btn:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.ncm-btn--secondary {
+  background: var(--surface-100);
+  color: var(--text-secondary);
+}
+
+.ncm-btn--secondary:hover:not(:disabled) {
+  background: var(--surface-200);
+  color: var(--text-primary);
+}
+
+.ncm-btn--primary {
+  background: var(--chrome-bg);
+  color: var(--chrome-text-bright);
+}
+
+.ncm-btn--primary:hover:not(:disabled) {
+  background: var(--chrome-surface);
+}

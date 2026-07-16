@@ -1,0 +1,132 @@
+.battle-tally {
+  position: sticky;
+  top: 0;
+  z-index: 5;
+  margin: 0 0 var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  background: var(--surface-50);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  font-size: var(--font-size-sm);
+  backdrop-filter: blur(6px);
+}
+
+.battle-tally-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--space-3);
+  margin-bottom: var(--space-2);
+}
+
+.battle-tally-title {
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.battle-tally-rounds {
+  color: var(--text-secondary, var(--text-muted, #888));
+  font-size: 0.85em;
+}
+
+.battle-tally-sides {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-3);
+  align-items: stretch;
+  margin-bottom: var(--space-2);
+}
+
+.battle-tally-side {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  padding: var(--space-2) var(--space-3);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-sm, 6px);
+  min-width: 8rem;
+}
+
+.battle-tally-side--leading {
+  border-color: var(--accent-500, #4f46e5);
+  background: var(--accent-50, rgba(79, 70, 229, 0.08));
+}
+
+.battle-tally-side-label {
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+}
+
+.battle-tally-side-wins {
+  font-variant-numeric: tabular-nums;
+  color: var(--text-primary);
+}
+
+.battle-tally-side-meta {
+  font-size: 0.78em;
+  color: var(--text-secondary, var(--text-muted, #888));
+  font-variant-numeric: tabular-nums;
+}
+
+.battle-tally-ties {
+  align-self: center;
+  font-size: 0.82em;
+  color: var(--text-secondary, var(--text-muted, #888));
+}
+
+.battle-tally-leaders {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  margin-bottom: var(--space-2);
+}
+
+.battle-tally-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1, 4px);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-pill, 999px);
+  background: var(--surface-100, rgba(0, 0, 0, 0.04));
+  font-size: 0.8em;
+  color: var(--text-secondary, var(--text-muted, #888));
+}
+
+.battle-tally-chip--set {
+  color: var(--text-primary);
+}
+
+.battle-tally-chip-key {
+  font-weight: var(--font-weight-semibold);
+}
+
+.battle-tally-chip-val {
+  font-variant-numeric: tabular-nums;
+}
+
+.battle-tally-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.battle-tally-progress-track {
+  flex: 1;
+  height: 6px;
+  border-radius: 999px;
+  background: var(--surface-200);
+  overflow: hidden;
+}
+
+.battle-tally-progress-fill {
+  height: 100%;
+  background: var(--accent-500, #4f46e5);
+  border-radius: 999px;
+  transition: width 0.3s ease;
+}
+
+.battle-tally-progress-caption {
+  font-size: 0.78em;
+  color: var(--text-secondary, var(--text-muted, #888));
+  white-space: nowrap;
+}

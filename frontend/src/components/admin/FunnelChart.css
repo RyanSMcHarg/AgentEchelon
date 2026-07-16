@@ -1,0 +1,205 @@
+/* FunnelChart — horizontal-step conversion funnel.
+   Visual language: matches DistributionBar + MetricCard family.
+   - Step tile: flex 1, soft border + electric-violet left accent.
+   - Connector: chevron + retained-% pill, sits between tiles.
+   - Success tile: filled accent background, white text on rank.
+   - Failure peel-off: dashed border row below the funnel, never inflates
+     the inter-step % math. */
+
+.funnel-chart {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  width: 100%;
+}
+
+.funnel-chart--empty,
+.funnel-chart--loading {
+  padding: var(--space-5) var(--space-4);
+  border: 1px dashed var(--border-subtle, var(--zinc-300, #d4d4d8));
+  border-radius: 10px;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+  font-size: 13px;
+}
+
+.funnel-chart-empty-msg {
+  margin: 0;
+  text-align: center;
+}
+
+.funnel-chart-row {
+  display: flex;
+  align-items: stretch;
+  gap: var(--space-2);
+}
+
+.funnel-chart-step {
+  position: relative;
+  flex: 1 1 0;
+  min-width: 0;
+  padding: var(--space-3) var(--space-3) var(--space-3) calc(var(--space-3) + 6px);
+  background: var(--surface-elevated, #ffffff);
+  border: 1px solid var(--border-subtle, var(--zinc-200, #e4e4e7));
+  border-radius: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* Electric-violet rail on the left edge — the funnel "spine". */
+  box-shadow: inset 4px 0 0 0 var(--accent-400, #8b5cf6);
+  transition: background 120ms ease, border-color 120ms ease;
+}
+
+.funnel-chart-step:hover {
+  background: var(--surface-hover, color-mix(in srgb, var(--accent-50, #faf5ff) 60%, transparent));
+  border-color: var(--accent-200, #ddd6fe);
+}
+
+.funnel-chart-step--success {
+  background: linear-gradient(180deg, color-mix(in srgb, var(--accent-50, #faf5ff) 80%, transparent), var(--surface-elevated, #ffffff) 100%);
+  border-color: var(--accent-300, #c4b5fd);
+  box-shadow: inset 4px 0 0 0 var(--accent-600, #7c3aed);
+}
+
+.funnel-chart-step-rank {
+  font-family: var(--font-mono, ui-monospace, "JetBrains Mono", monospace);
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent-600, #7c3aed);
+  opacity: 0.7;
+}
+
+.funnel-chart-step-label {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text-primary, var(--zinc-900, #18181b));
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+}
+
+.funnel-chart-step-value {
+  font-family: var(--font-mono, ui-monospace, "JetBrains Mono", monospace);
+  font-variant-numeric: tabular-nums;
+  font-size: 22px;
+  font-weight: 600;
+  color: var(--text-primary, var(--zinc-900, #18181b));
+  letter-spacing: -0.01em;
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+}
+
+.funnel-chart-step-unit {
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+}
+
+.funnel-chart-step-meta {
+  display: flex;
+  justify-content: space-between;
+  gap: var(--space-2);
+  font-family: var(--font-mono, ui-monospace, "JetBrains Mono", monospace);
+  font-size: 11px;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+}
+
+.funnel-chart-step-pct {
+  font-weight: 600;
+  color: var(--accent-700, #6d28d9);
+}
+
+.funnel-chart-connector {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 4px;
+  flex: 0 0 auto;
+  padding: 0 4px;
+  color: var(--accent-500, #8b5cf6);
+}
+
+.funnel-chart-connector-rate {
+  font-family: var(--font-mono, ui-monospace, "JetBrains Mono", monospace);
+  font-variant-numeric: tabular-nums;
+  font-size: 11px;
+  font-weight: 600;
+  padding: 2px 6px;
+  border-radius: 999px;
+  background: var(--accent-50, #faf5ff);
+  color: var(--accent-700, #6d28d9);
+  letter-spacing: 0.02em;
+  white-space: nowrap;
+}
+
+.funnel-chart-connector-arrow {
+  display: block;
+  opacity: 0.5;
+}
+
+.funnel-chart-failure {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-3);
+  border: 1px dashed var(--status-bad, #ef4444);
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--status-bad, #ef4444) 4%, transparent);
+  color: var(--text-primary, var(--zinc-900, #18181b));
+  font-size: 12px;
+  /* Peeled-off, indented to visually disconnect from the funnel row. */
+  margin-left: var(--space-6);
+  margin-right: var(--space-6);
+}
+
+.funnel-chart-failure-icon {
+  color: var(--status-bad, #ef4444);
+  font-size: 14px;
+  line-height: 1;
+}
+
+.funnel-chart-failure-label {
+  font-weight: 600;
+  color: var(--text-primary, var(--zinc-900, #18181b));
+}
+
+.funnel-chart-failure-value,
+.funnel-chart-failure-events {
+  font-family: var(--font-mono, ui-monospace, "JetBrains Mono", monospace);
+  font-variant-numeric: tabular-nums;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+}
+
+.funnel-chart-failure-value::before {
+  content: '· ';
+}
+
+.funnel-chart-failure-events::before {
+  content: '· ';
+}
+
+/* Stack vertically on narrow viewports — admin dashboard goes down to
+   tablet sizes; below that the chevron-row becomes unreadable. */
+@media (max-width: 720px) {
+  .funnel-chart-row {
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .funnel-chart-connector {
+    flex-direction: row;
+    width: 100%;
+    justify-content: flex-start;
+    padding: 0 var(--space-3);
+  }
+  .funnel-chart-connector-arrow {
+    transform: rotate(90deg);
+  }
+}

@@ -1,0 +1,50 @@
+{
+  "company": {
+    "name": "Stratum Technologies",
+    "tagline": "Enterprise workflow automation, simplified",
+    "founded": 2019,
+    "headquarters": "Austin, TX",
+    "website": "stratum.example.com",
+    "employeeCount": "~280",
+    "industry": "Enterprise SaaS — workflow automation"
+  },
+  "products": [
+    {
+      "name": "StratumFlow",
+      "type": "core",
+      "description": "Visual workflow builder for business processes. Drag-and-drop automation with conditional logic, 200+ pre-built connectors.",
+      "pricing": {
+        "starter": { "price": "$29/user/mo", "features": ["5 workflows", "50 runs/day", "Email support"] },
+        "professional": { "price": "$79/user/mo", "features": ["Unlimited workflows", "5000 runs/day", "Priority support", "Custom connectors", "StratumConnect included"] },
+        "enterprise": { "price": "Custom", "features": ["Unlimited everything", "SSO/SAML", "SOC2 compliance", "Dedicated CSM", "StratumAnalytics included", "99.99% SLA"] }
+      }
+    },
+    {
+      "name": "StratumConnect",
+      "type": "integration",
+      "description": "API gateway for custom integrations. Webhook management, event routing, OAuth2 provider for third-party apps.",
+      "availability": "Included with Professional and Enterprise plans"
+    },
+    {
+      "name": "StratumAnalytics",
+      "type": "analytics",
+      "description": "Real-time dashboards for workflow metrics. Custom report builder, SLA tracking, compliance reporting.",
+      "availability": "Enterprise plan only"
+    }
+  ],
+  "faq": [
+    { "q": "How do I sign up?", "a": "Visit stratum.example.com/signup. Free 14-day trial on all plans, no credit card required." },
+    { "q": "What browsers are supported?", "a": "Chrome, Firefox, Safari, and Edge (latest 2 versions). Mobile browsers supported for dashboard viewing." },
+    { "q": "What is the uptime SLA?", "a": "99.9% for Professional, 99.99% for Enterprise. Status page: status.stratum.example.com" },
+    { "q": "Is there a free plan?", "a": "No free plan, but all paid plans include a 14-day free trial." },
+    { "q": "Do you offer discounts for nonprofits?", "a": "Yes, 25% discount on all plans for verified 501(c)(3) organizations. Contact sales@stratum.example.com." },
+    { "q": "What integrations are available?", "a": "200+ connectors including Salesforce, Jira, Slack, HubSpot, Zendesk, Google Workspace, Microsoft 365, AWS, and more." },
+    { "q": "Is SOC2 compliance included?", "a": "SOC2 Type II compliance is included with Enterprise plans. Audit reports available on request." }
+  ],
+  "support": {
+    "email": "support@stratum.example.com",
+    "documentation": "docs.stratum.example.com",
+    "statusPage": "status.stratum.example.com",
+    "hours": "Mon-Fri 9am-6pm CT (Starter/Professional), 24/7 (Enterprise)"
+  }
+}

@@ -1,0 +1,13 @@
+*.js
+!jest.config.js
+# Lambda handler source files (CommonJS runtime, not compiled output)
+!lambda/*/index.js
+!lambda/*/*/index.js
+*.d.ts
+node_modules
+
+# CDK asset staging directory
+.cdk.staging
+cdk.out
+# Synth-generated context cache (embeds account-specific AZ/lookups — not portable)
+cdk.context.json

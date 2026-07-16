@@ -1,0 +1,23 @@
+{
+  "name": "tests",
+  "version": "1.0.0",
+  "main": "index.js",
+  "scripts": {
+    "test": "npx playwright test --config=playwright.config.ts",
+    "test:signup": "npx playwright test e2e/signup.spec.ts --config=playwright.config.ts",
+    "test:signin": "npx playwright test e2e/signin.spec.ts --config=playwright.config.ts",
+    "test:agents": "npx playwright test e2e/agent-intents.spec.ts --config=playwright.config.ts",
+    "test:headed": "npx playwright test --config=playwright.config.ts --headed",
+    "test:report": "npx playwright show-report"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "devDependencies": {
+    "@playwright/test": "^1.58.2"
+  },
+  "dependencies": {
+    "@aws-sdk/client-secrets-manager": "^3.990.0"
+  }
+}

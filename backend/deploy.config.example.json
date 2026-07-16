@@ -1,0 +1,14 @@
+{
+  "_comment": "Copy to deploy.config.json (gitignored) and set your values. Read by scripts/deploy.mjs and forwarded to cdk as --context k=v (CLI --context flags override). Keys are cdk context flags; `_`-prefixed keys are ignored. Omit a key to take its default. Do NOT set appUrl; deploy.mjs derives it from the live CloudFront distribution and closes the CORS loop for you.",
+  "_athena_default": "Minimal Athena-mode deploy: just set senderEmail.",
+  "senderEmail": "you@example.com",
+  "_aurora_optional": "Aurora mode adds a VPC + Aurora (advanced analytics). To reuse an existing VPC set analyticsVpcId + analyticsVpcSubnetType and createVpcEndpoints=false.",
+  "analyticsMode": "athena",
+  "analyticsVpcId": "",
+  "analyticsVpcSubnetType": "isolated",
+  "createVpcEndpoints": true,
+  "_features": "On/off toggles.",
+  "enableMembershipAudit": false,
+  "membershipAuditEnforce": false,
+  "environment": "dev"
+}

@@ -1,0 +1,52 @@
+{
+  "quarter": "Q3 2026",
+  "lastUpdated": "2026-07-01",
+  "stratumFlow": [
+    {
+      "feature": "Workflow versioning and rollback",
+      "status": "in_development",
+      "targetDate": "2026-08-15",
+      "owner": "David Kim",
+      "description": "Save workflow versions, compare diffs, rollback to any previous version. Critical for enterprise compliance."
+    },
+    {
+      "feature": "Conditional branching improvements",
+      "status": "design",
+      "targetDate": "2026-09-01",
+      "owner": "Jordan Hayes",
+      "description": "Visual branch editor with parallel execution paths, merge conditions, and timeout handling."
+    },
+    {
+      "feature": "Salesforce bi-directional sync",
+      "status": "scoping",
+      "targetDate": "2026-09-30",
+      "owner": "Emma Torres",
+      "description": "Real-time sync between StratumFlow workflow data and Salesforce objects. Currently one-way only."
+    }
+  ],
+  "stratumConnect": [
+    {
+      "feature": "OAuth2 PKCE support",
+      "status": "in_development",
+      "targetDate": "2026-07-31",
+      "owner": "Aisha Obi",
+      "description": "Add PKCE flow for public clients (SPAs, mobile apps). Required by several enterprise customers."
+    },
+    {
+      "feature": "Webhook retry policies",
+      "status": "design",
+      "targetDate": "2026-08-31",
+      "owner": "Aisha Obi",
+      "description": "Configurable retry with exponential backoff, dead letter queues, and alerting on webhook delivery failures."
+    }
+  ],
+  "stratumAnalytics": [
+    {
+      "feature": "Custom dashboard templates",
+      "status": "planned",
+      "targetDate": "Q4 2026",
+      "owner": "Raj Mehta",
+      "description": "Pre-built dashboard templates for common workflow patterns (approvals, onboarding, support tickets)."
+    }
+  ]
+}

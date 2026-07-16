@@ -1,0 +1,134 @@
+/**
+ * kinesis-archival — placeholder->final backfill unit tests.
+ *
+ * Delivery is placeholder->update: the bot posts a "One moment..." placeholder
+ * (CREATE_CHANNEL_MESSAGE), then edits in the real answer + model
+ * (UPDATE_CHANNEL_MESSAGE, archived as a separate `<id>-UPD` row). Analytics
+ * reads resolve the canonical CREATE row, so `backfillFromUpdateEvents` must
+ * fold the final content/model onto that message row and the intent/routing onto
+ * its exchange. These tests pin that contract:
+ *   - the CREATE message row is patched with updated_content + model/telemetry;
+ *   - the exchange is patched with intent/routing (intent lives only on the
+ *     exchange — there is no messages.intent column);
+ *   - the `-UPD` suffix is stripped to recover the CREATE message_id;
+ *   - a record whose id does not end in `-UPD` is skipped (no query issued);
+ *   - a failing patch is swallowed (archival of the batch must not abort).
+ */
+
+jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
+  query: jest.fn(),
+  transaction: jest.fn(),
+  batchInsert: jest.fn(),
+  ensureSchema: jest.fn(),
+  resetConnection: jest.fn(),
+  isAuthError: jest.fn(() => false),
+}));
+jest.mock('../../lambda/src/analytics-aurora/drift-detection', () => ({
+  detectDrift: jest.fn(),
+  recordDriftFire: jest.fn(),
+}));
+jest.mock('../../lambda/src/analytics-aurora/cross-conversation-context', () => ({
+  updateConversationContext: jest.fn(),
+}));
+jest.mock('../../lambda/src/lib/message-analytics', () => ({
+  readMessageAnalytics: jest.fn(),
+}));
+jest.mock('../../lambda/src/lib/sleep-mode', () => ({
+  touchActivity: jest.fn(),
+}));
+
+import { query } from '../../lambda/src/analytics-aurora/db-client';
+import { backfillFromUpdateEvents } from '../../lambda/src/analytics-aurora/kinesis-archival';
+
+const mockedQuery = query as jest.MockedFunction<typeof query>;
+
+/** Minimal UPDATE MessageRecord for the backfill (only the read fields matter). */
+function updateRecord(overrides: Record<string, any> = {}): any {
+  return {
+    event_type: 'UPDATE_CHANNEL_MESSAGE',
+    message_id: 'msg-123-UPD',
+    channel_arn: 'arn:aws:chime:...:channel/abc',
+    content: 'The Q2 ARR is $4.2M.',
+    sender_arn: 'arn:aws:chime:...:bot/premium',
+    sender_name: 'Assistant',
+    target_arn: null,
+    is_bot: true,
+    user_type: 'premium',
+    agent_type: 'premium',
+    bedrock_model: 'anthropic.claude-opus',
+    input_tokens: 120,
+    output_tokens: 340,
+    latency_ms: 900,
+    total_ms: 1800,
+    poll_ms: 50,
+    persistence: 'PERSISTENT',
+    metadata: {},
+    created_at: '2026-07-15T00:00:00.000Z',
+    intent: 'BUSINESS_QUERY',
+    intent_confidence: 'high',
+    original_intent: null,
+    was_rerouted: false,
+    delivery_option: 'inline',
+    task_id: null,
+    task_status: null,
+    experiment_id: null,
+    variant_id: null,
+    was_fallback: false,
+    ...overrides,
+  };
+}
+
+describe('kinesis-archival backfillFromUpdateEvents', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockedQuery.mockResolvedValue({ rows: [], rowCount: 0 } as any);
+  });
+
+  it('patches the CREATE message row with final content + model, keyed by the de-suffixed id', async () => {
+    await backfillFromUpdateEvents([updateRecord()]);
+
+    const messageCall = mockedQuery.mock.calls.find(([sql]) =>
+      /UPDATE messages/.test(sql as string)
+    );
+    expect(messageCall).toBeDefined();
+    const [sql, params] = messageCall as [string, any[]];
+    expect(sql).toMatch(/updated_content\s*=\s*COALESCE\(\$1, updated_content\)/);
+    expect(sql).toMatch(/bedrock_model\s*=\s*COALESCE\(\$2, bedrock_model\)/);
+    expect(sql).toContain("event_type = 'CREATE_CHANNEL_MESSAGE'");
+    // $1 final content, $2 model, $12 de-suffixed CREATE id, $13 channel.
+    expect(params[0]).toBe('The Q2 ARR is $4.2M.');
+    expect(params[1]).toBe('anthropic.claude-opus');
+    expect(params[11]).toBe('msg-123'); // '-UPD' stripped
+    expect(params[12]).toBe('arn:aws:chime:...:channel/abc');
+  });
+
+  it('patches the exchange with intent/routing (intent is exchange-only)', async () => {
+    await backfillFromUpdateEvents([updateRecord()]);
+
+    const exchangeCall = mockedQuery.mock.calls.find(([sql]) =>
+      /UPDATE exchanges/.test(sql as string)
+    );
+    expect(exchangeCall).toBeDefined();
+    const [sql, params] = exchangeCall as [string, any[]];
+    expect(sql).toMatch(/intent\s*=\s*COALESCE\(\$1, ex\.intent\)/);
+    expect(sql).toContain('ex.agent_message_id = am.id');
+    expect(sql).toContain('am.message_id = $12');
+    expect(params[0]).toBe('BUSINESS_QUERY');
+    expect(params[11]).toBe('msg-123');
+    expect(params[12]).toBe('arn:aws:chime:...:channel/abc');
+  });
+
+  it('skips a record whose id does not carry the -UPD suffix', async () => {
+    await backfillFromUpdateEvents([
+      updateRecord({ message_id: 'msg-999' }),
+    ]);
+    expect(mockedQuery).not.toHaveBeenCalled();
+  });
+
+  it('swallows a failing patch so archival of the batch is not aborted', async () => {
+    mockedQuery.mockRejectedValueOnce(new Error('deadlock'));
+    await expect(
+      backfillFromUpdateEvents([updateRecord()])
+    ).resolves.toBeUndefined();
+  });
+});

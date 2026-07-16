@@ -1,0 +1,42 @@
+{
+  "confidentiality": "INTERNAL — Premium tier only",
+  "lastUpdated": "2026-06-15",
+  "competitors": [
+    {
+      "name": "Zapier",
+      "positioning": "Consumer-first automation, largest marketplace",
+      "strengths": ["6000+ connectors", "Strong brand recognition", "Freemium model drives top-of-funnel", "Simple UX for non-technical users"],
+      "weaknesses": ["No SSO/SAML on lower plans", "Limited audit logging", "No SOC2 on Teams plan", "Workflow versioning is basic"],
+      "featureComparison": {
+        "ahead": ["Marketplace size (6000 vs 200)", "Consumer brand", "Free tier"],
+        "behind": ["Enterprise security (SSO, RBAC)", "Audit logging", "Compliance (SOC2)", "Approval workflows", "Conditional branching depth"],
+        "parity": ["Webhook triggers", "Scheduling", "Error handling", "Multi-step workflows"]
+      },
+      "pricing": "Free (100 tasks/mo), Starter $19.99/mo, Professional $49/mo, Team $69/mo, Enterprise custom",
+      "winRate": "38%",
+      "lossReasons": ["Connector count", "Brand familiarity", "Price sensitivity in SMB"]
+    },
+    {
+      "name": "Make (formerly Integromat)",
+      "positioning": "Visual automation for technical users",
+      "strengths": ["Powerful visual builder", "Complex data transformations", "Good API support", "Competitive pricing"],
+      "weaknesses": ["Steeper learning curve", "Smaller connector ecosystem than Zapier", "Limited enterprise features", "No dedicated CSM below Enterprise"],
+      "winRate": "52%",
+      "lossReasons": ["Pricing for high-volume scenarios", "Visual builder preference"]
+    },
+    {
+      "name": "n8n",
+      "positioning": "Open-source workflow automation",
+      "strengths": ["Self-hosted option", "Developer-friendly", "No per-execution pricing", "Active community"],
+      "weaknesses": ["Requires technical setup", "No managed cloud SLA", "Limited enterprise support", "Smaller connector library"],
+      "winRate": "61%",
+      "lossReasons": ["Prefer open-source / self-hosted", "Developer teams who want code-level control"]
+    }
+  ],
+  "strategicAdvantages": [
+    "Enterprise-grade security (SSO, RBAC, SOC2) that competitors don't offer at equivalent price points",
+    "Approval workflows with audit trails — compliance requirement for regulated industries",
+    "Dedicated CSM for all Enterprise accounts (competitors: Enterprise-only or none)",
+    "StratumAnalytics bundle — workflow metrics + BI in one platform"
+  ]
+}

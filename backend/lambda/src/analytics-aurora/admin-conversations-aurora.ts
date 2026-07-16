@@ -1,0 +1,205 @@
+/**
+ * Aurora (Postgres) read path for the admin Conversations views.
+ *
+ * In Aurora mode the admin-conversations Lambda must NOT read the archive via
+ * Athena: those `json_extract_scalar` full-scan queries take 15-27s and blow past
+ * both the Lambda timeout and API Gateway's 29s cap, so the Conversations tab
+ * 502s (see BUG #21). Aurora already holds the same records in the `messages`
+ * table (message events, plus channel + membership events as their own
+ * `event_type` rows), so these queries answer the same three views in
+ * sub-second time. Runs inside the VPC-attached data-plane Lambda (the only seam
+ * with Aurora access); the non-VPC admin handler invokes it (ADR-018 pattern).
+ *
+ * Field parity with the Athena path: the channel name is archived in `content`
+ * for CREATE/UPDATE_CHANNEL rows; the member name in `content` and the inviter in
+ * `sender_name` for membership rows - so nothing degrades.
+ */
+
+import { query } from './db-client.js';
+import { stripMessageMarkers } from '../lib/message-markers.js';
+
+export interface AdminConvSummary {
+  channelArn: string;
+  name: string;
+  messageCount: number;
+  lastMessageAt?: string;
+  memberCount: number;
+  metadata: { modelTier: string };
+}
+
+export interface AdminConvMessage {
+  id: string;
+  content: string;
+  senderArn: string;
+  senderName: string;
+  timestamp: string;
+  isBot: boolean;
+  redacted: boolean;
+  modelId?: string;
+  intent?: string;
+  metadata: Record<string, unknown>;
+  raw?: Record<string, unknown>;
+}
+
+export interface AdminMembershipEvent {
+  action: string;
+  memberArn: string;
+  memberName: string;
+  invitedBy?: string;
+  timestamp: string;
+  isBot: boolean;
+}
+
+export async function adminListConversations(limit = 50): Promise<AdminConvSummary[]> {
+  const lim = Math.min(Math.max(1, limit), 200);
+  const res = await query<{
+    channel_arn: string; tier: string | null; name: string | null;
+    message_count: string; last_message_at: string | null; member_count: string;
+  }>(
+    `WITH names AS (
+       SELECT DISTINCT ON (channel_arn) channel_arn, content AS name
+         FROM messages
+        WHERE event_type IN ('CREATE_CHANNEL','UPDATE_CHANNEL') AND content IS NOT NULL AND content <> ''
+        ORDER BY channel_arn, created_at DESC
+     ),
+     first_msg AS (
+       -- Fallback title: the first human message in the conversation. The title auto-derive
+       -- renames the LIVE Chime channel, but that UpdateChannel event is not streamed to Kinesis,
+       -- so Aurora has no derived title and every row showed 'Untitled'. Deriving from the first
+       -- user message (the same signal the client title-derive uses) gives a meaningful title.
+       SELECT DISTINCT ON (channel_arn) channel_arn,
+              LEFT(REGEXP_REPLACE(content, '<!--.*?-->', '', 'g'), 60) AS name
+         FROM messages
+        WHERE event_type = 'CREATE_CHANNEL_MESSAGE' AND is_bot = false AND content IS NOT NULL AND content <> ''
+        ORDER BY channel_arn, created_at ASC
+     ),
+     agg AS (
+       SELECT channel_arn,
+              MAX(user_type) AS tier,
+              COUNT(*) FILTER (WHERE event_type = 'CREATE_CHANNEL_MESSAGE') AS message_count,
+              MAX(created_at) FILTER (WHERE event_type = 'CREATE_CHANNEL_MESSAGE') AS last_message_at
+         FROM messages
+        GROUP BY channel_arn
+     ),
+     members AS (
+       -- Current member count from the archived membership events (humans + bots):
+       -- a member is present iff their most-recent membership event is a join, not a
+       -- leave. The archive captures CREATE/DELETE_CHANNEL_MEMBERSHIP as their own
+       -- event_type rows, so this is the same system of record adminMembershipHistory
+       -- reads. Channels predating membership archival resolve to 0 (not wrong — no
+       -- events to count), same honest-empty as before.
+       SELECT channel_arn, COUNT(*) AS member_count
+         FROM (
+           SELECT DISTINCT ON (channel_arn, target_arn) channel_arn, event_type
+             FROM messages
+            WHERE event_type IN ('CREATE_CHANNEL_MEMBERSHIP','DELETE_CHANNEL_MEMBERSHIP')
+              AND target_arn IS NOT NULL
+            ORDER BY channel_arn, target_arn, created_at DESC
+         ) latest
+        WHERE event_type = 'CREATE_CHANNEL_MEMBERSHIP'
+        GROUP BY channel_arn
+     )
+     SELECT a.channel_arn, a.tier, COALESCE(n.name, fm.name) AS name,
+            a.message_count::text AS message_count, a.last_message_at,
+            COALESCE(mem.member_count, 0)::text AS member_count
+       FROM agg a
+       LEFT JOIN names n ON n.channel_arn = a.channel_arn
+       LEFT JOIN first_msg fm ON fm.channel_arn = a.channel_arn
+       LEFT JOIN members mem ON mem.channel_arn = a.channel_arn
+      WHERE a.message_count > 0
+      ORDER BY a.last_message_at DESC NULLS LAST
+      LIMIT $1`,
+    [lim],
+  );
+  return res.rows.map((r) => ({
+    channelArn: r.channel_arn,
+    name: r.name || 'Untitled Conversation',
+    messageCount: Number(r.message_count || 0),
+    lastMessageAt: r.last_message_at || undefined,
+    memberCount: Number(r.member_count || 0),
+    metadata: { modelTier: r.tier || '' },
+  }));
+}
+
+export async function adminListMessages(channelArn: string): Promise<AdminConvMessage[]> {
+  const res = await query<{
+    message_id: string; content: string | null; sender_name: string | null;
+    sender_arn: string | null; created_at: string; is_bot: boolean | null;
+    bedrock_model: string | null; input_tokens: number | null; output_tokens: number | null;
+    total_ms: number | null; redacted: boolean | null; metadata: Record<string, unknown> | null;
+  }>(
+    `SELECT message_id,
+            COALESCE(updated_content, content) AS content,
+            sender_name, sender_arn, created_at, is_bot, bedrock_model,
+            input_tokens, output_tokens, total_ms, metadata
+       FROM messages
+      WHERE channel_arn = $1 AND event_type = 'CREATE_CHANNEL_MESSAGE'
+      ORDER BY created_at ASC`,
+    [channelArn],
+  );
+  return res.rows.map((r) => {
+    const metadata = (r.metadata as Record<string, unknown>) || {};
+    const senderArn = r.sender_arn || '';
+    return {
+      id: r.message_id,
+      content: stripMessageMarkers(r.content),
+      senderArn,
+      senderName: r.sender_name || 'Unknown',
+      timestamp: r.created_at,
+      isBot: r.is_bot === true || senderArn.includes('/bot/'),
+      redacted: false, // not tracked in the Aurora projection
+      modelId: r.bedrock_model || undefined,
+      intent: typeof metadata.intent === 'string' ? (metadata.intent as string) : undefined,
+      metadata,
+      // Inspect-drawer payload: the faithful stored projection of this message.
+      raw: {
+        MessageId: r.message_id,
+        Content: r.content,
+        Sender: { Arn: senderArn, Name: r.sender_name },
+        CreatedTimestamp: r.created_at,
+        BedrockModel: r.bedrock_model,
+        InputTokens: r.input_tokens,
+        OutputTokens: r.output_tokens,
+        TotalMs: r.total_ms,
+        Metadata: metadata,
+      },
+    };
+  });
+}
+
+const MEMBERSHIP_ACTION: Record<string, string> = {
+  CREATE_CHANNEL_MEMBERSHIP: 'joined',
+  DELETE_CHANNEL_MEMBERSHIP: 'left',
+  CREATE_CHANNEL_MODERATOR: 'granted_moderator',
+  DELETE_CHANNEL_MODERATOR: 'revoked_moderator',
+};
+
+export async function adminMembershipHistory(channelArn: string): Promise<AdminMembershipEvent[]> {
+  const res = await query<{
+    event_type: string; member_arn: string | null; member_name: string | null;
+    invited_by: string | null; at: string;
+  }>(
+    `SELECT event_type,
+            target_arn  AS member_arn,
+            content     AS member_name,
+            sender_name AS invited_by,
+            created_at  AS at
+       FROM messages
+      WHERE channel_arn = $1
+        AND event_type IN ('CREATE_CHANNEL_MEMBERSHIP','DELETE_CHANNEL_MEMBERSHIP',
+                           'CREATE_CHANNEL_MODERATOR','DELETE_CHANNEL_MODERATOR')
+      ORDER BY created_at ASC`,
+    [channelArn],
+  );
+  return res.rows.map((r) => {
+    const memberArn = r.member_arn || '';
+    return {
+      action: MEMBERSHIP_ACTION[r.event_type] || r.event_type,
+      memberArn,
+      memberName: r.member_name || 'Unknown',
+      invitedBy: r.invited_by || undefined,
+      timestamp: r.at,
+      isBot: memberArn.includes('/bot/'),
+    };
+  });
+}

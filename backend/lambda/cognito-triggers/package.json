@@ -1,0 +1,10 @@
+{
+  "name": "cognito-triggers",
+  "version": "1.0.0",
+  "description": "Lambda triggers for Cognito user pool",
+  "main": "index.js",
+  "dependencies": {
+    "@aws-sdk/client-cognito-identity-provider": "^3.600.0",
+    "@aws-sdk/client-chime-sdk-identity": "^3.600.0"
+  }
+}

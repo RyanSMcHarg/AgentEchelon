@@ -1,0 +1,30 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      Baseline CSP + companion headers.
+      Production deployers should ALSO set these as response headers via
+      CloudFront / their CDN — meta tags don't cover frame-ancestors and
+      can be stripped by certain proxies.
+
+      CSP source list:
+      - script-src 'self'              — only first-party JS (no inline, no CDN)
+      - style-src   'self' 'unsafe-inline' — Vite injects inline <style> on dev HMR
+      - connect-src 'self' …          — Cognito, Chime SDK WebSocket, S3 presigned URLs, API Gateway
+      - img-src     'self' data: …    — data: URLs are React inline assets; *.amazonaws.com covers S3 across any region / URL style. CSP only allows one wildcard per host, so the prior `*.s3.*.amazonaws.com` was rejected by browsers and emitted a console error (which fails the E2E console-monitor); use the same single-wildcard pattern connect-src already trusts.
+      - object/frame-src 'none'        — no embeds, no iframes
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://*.amazonaws.com wss://*.chime.aws https://*.execute-api.us-east-1.amazonaws.com; img-src 'self' data: https://*.amazonaws.com; font-src 'self' data:; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'self';" />
+    <meta http-equiv="X-Content-Type-Options" content="nosniff" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=(), payment=()" />
+    <link rel="icon" type="image/svg+xml" href="/brand-mark.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AgentEchelon</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

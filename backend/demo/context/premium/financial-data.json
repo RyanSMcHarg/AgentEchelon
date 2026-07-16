@@ -1,0 +1,38 @@
+{
+  "confidentiality": "INTERNAL — Premium tier only",
+  "lastUpdated": "2026-06-30",
+  "annualRecurringRevenue": {
+    "current": "$4.2M",
+    "previousQuarter": "$3.8M",
+    "yoyGrowth": "22%",
+    "qoqGrowth": "10.5%",
+    "target": "$4.0M",
+    "attainment": "105%"
+  },
+  "revenueByPlan": {
+    "starter": { "arr": "$420K", "customers": 312, "avgDealSize": "$1,345" },
+    "professional": { "arr": "$1.68M", "customers": 89, "avgDealSize": "$18,876" },
+    "enterprise": { "arr": "$2.1M", "customers": 14, "avgDealSize": "$150,000" }
+  },
+  "keyMetrics": {
+    "netNewCustomers_q2": 47,
+    "netNewCustomers_target": 40,
+    "grossChurn": "3.1%",
+    "churnTarget": "<3.5%",
+    "netRevRetention": "118%",
+    "nps": 62,
+    "npsTarget": 65,
+    "cac": "$8,200",
+    "ltv": "$42,000",
+    "ltvCacRatio": "5.1x",
+    "monthlyBurnRate": "$380K",
+    "runway": "14 months",
+    "cashOnHand": "$5.3M"
+  },
+  "q2Highlights": [
+    "Meridian Corp enterprise deal closed ($180K ARR) — 3 weeks ahead of schedule",
+    "Professional plan upgrades: 12 Starter customers converted (15% conversion rate)",
+    "APAC expansion pilot: 3 customers signed in Singapore (first international revenue)",
+    "NPS slightly below target (62 vs 65) — driver: onboarding friction for connector setup"
+  ]
+}

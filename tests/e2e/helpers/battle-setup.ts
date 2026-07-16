@@ -1,0 +1,177 @@
+/**
+ * Battle E2E setup helpers.
+ *
+ * The /battle behavioral specs require a live battle-enabled deploy: the
+ * AgentEchelonBattle stack (alt-bot slot pool + orchestrator + channel-battle API)
+ * and a premium/admin test user. Plain `cd tests && npm test` must NOT run them
+ * (no battle deploy guaranteed, real model duels are slow), so every battle
+ * behavioral test calls `requireBattleE2E()` and is SKIPPED unless BATTLE_E2E=1.
+ *
+ * Run them against a provisioned stack (frontend dev server up + backend
+ * deployed with enableBattle):
+ *   cd tests
+ *   BATTLE_E2E=1 AWS_PROFILE=<your-profile> npx playwright test e2e/battle.spec.ts \
+ *     --config=playwright.config.ts
+ *
+ * These reuse the exact admin-arm → enable → fire flow the post2 demo driver
+ * proves (post2-abtest-battle.demo.spec.ts), but hard-assert instead of
+ * honest-degrading. The selectors are the real frontend ones.
+ */
+import { Page, expect, test } from '@playwright/test';
+import { signIn } from './agent-helpers';
+import { getTestCredentials } from './test-credentials';
+
+export const BATTLE_E2E_ENABLED = process.env.BATTLE_E2E === '1' || process.env.BATTLE_E2E === 'true';
+
+/** Skip the calling test/suite unless BATTLE_E2E=1. */
+export function requireBattleE2E(): void {
+  test.skip(
+    !BATTLE_E2E_ENABLED,
+    'Battle E2E — set BATTLE_E2E=1 and point at a deployed battle-enabled stack (frontend running)',
+  );
+}
+
+/** A stable battle experiment id the suite arms once and reuses. */
+export const BATTLE_EXP_ID = 'e2e-battle-sonnet-vs-opus';
+
+/** Sign in as the admin test user (admin tab for arming + premium for the duel). */
+export async function signInAdmin(page: Page): Promise<void> {
+  const creds = await getTestCredentials();
+  await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
+}
+
+async function openAdminExperiments(page: Page): Promise<void> {
+  await page.locator('[data-testid="admin-button"], button:has-text("Admin")').first().click();
+  await page.waitForSelector('.admin-section-rail, .admin-dashboard', { timeout: 15_000 });
+  // The admin console is a section-rail + sub-tabs layout (AdminDashboard.tsx):
+  // Experiments is a top-level section button, not a `.admin-tabs` tab.
+  await page
+    .locator('.admin-section-rail button.admin-section-btn:has-text("Experiments")')
+    .first()
+    .click();
+  await expect(page.locator('h3:has-text("A/B Experiments")')).toBeVisible({ timeout: 15_000 });
+}
+
+async function leaveAdmin(page: Page): Promise<void> {
+  await page.locator('.admin-back-btn, button:has-text("Back")').first().click();
+  await expect(page.locator('.admin-dashboard')).toBeHidden({ timeout: 10_000 }).catch(() => {});
+}
+
+/**
+ * Ensure a battle-enabled premium experiment exists + is active, bound to an
+ * alt-bot slot. Idempotent: if BATTLE_EXP_ID already shows in the list, reuse it.
+ * Returns with the admin dashboard closed.
+ */
+export async function ensureBattleExperiment(
+  page: Page,
+  opts: { slot?: string; control?: string; treatment?: string } = {},
+): Promise<void> {
+  const slot = opts.slot ?? 'slot-0';
+  await openAdminExperiments(page);
+
+  // Already armed from a prior run? Reuse it (avoids duplicate-id create error).
+  const existing = page.locator(`text=${BATTLE_EXP_ID}`).first();
+  if (await existing.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await leaveAdmin(page);
+    return;
+  }
+
+  await page.locator('button:has-text("New Experiment")').click();
+  await expect(page.locator('h4:has-text("Create Experiment")')).toBeVisible();
+  await page.locator('label:has-text("Experiment ID") input').fill(BATTLE_EXP_ID);
+  await page.locator('label:has-text("Control Model") select').selectOption({ value: opts.control ?? 'sonnet' }).catch(() => {});
+  await page.locator('label:has-text("Treatment Model") select').selectOption({ value: opts.treatment ?? 'opus' }).catch(() => {});
+  await page.locator('label:has-text("Description") input').fill('E2E battle: Sonnet (Atlas) vs Opus (Echo).');
+
+  // A battle-enabled experiment must target EXACTLY ['premium'] (the backend
+  // BATTLE_TIER_PREMIUM_ONLY guard). The form defaults tiers to ['standard'],
+  // so deselect the non-premium tiers and ensure premium is the only one on.
+  const tierBtn = (tier: string) =>
+    page.locator(`.admin-filter-group button:has-text("${tier}")`).first();
+  const isActive = async (tier: string) =>
+    /\bactive\b/.test((await tierBtn(tier).getAttribute('class').catch(() => '')) ?? '');
+  for (const t of ['basic', 'standard']) {
+    if (await isActive(t)) await tierBtn(t).click();
+  }
+  if (!(await isActive('premium'))) await tierBtn('premium').click();
+
+  await page.locator('.experiment-battle-toggle-row input[type="checkbox"]').check();
+  await expect(page.locator('.experiment-battle-card')).toBeVisible({ timeout: 5000 });
+  const names = page.locator('.experiment-battle-variant-name');
+  await names.nth(0).fill('Atlas');
+  await names.nth(1).fill('Echo');
+  await page.locator('#alt-bot-slot-select').selectOption(slot).catch(() => {});
+  await page.locator('button:has-text("Create & Activate")').click();
+  await expect(page.locator(`text=${BATTLE_EXP_ID}`).first()).toBeVisible({ timeout: 15_000 });
+
+  await leaveAdmin(page);
+}
+
+/**
+ * Create a premium conversation and enable Battle Mode on it for BATTLE_EXP_ID.
+ * Throws (fails the test) if the alt-bot slot pool / battle API is unreachable —
+ * that IS the regression signal for the AgentEchelonBattle relocation.
+ */
+export async function newBattleChannel(page: Page, title: string): Promise<void> {
+  await page.locator('button.app-new-conversation-btn').click();
+  await page.waitForSelector('.ncm-modal', { timeout: 8000 });
+  const premiumCard = page.locator('.ncm-class-card:has-text("Premium")').first();
+  if (await premiumCard.isVisible({ timeout: 3000 }).catch(() => false)) {
+    await premiumCard.click();
+  } else {
+    await page.locator('.ncm-class-card').first().click();
+  }
+  void title;
+  await page.locator('button:has-text("Create Conversation")').click();
+  await page.waitForSelector('.conversation-header', { timeout: 20_000 });
+  await page.locator('.message-textarea').waitFor({ state: 'visible', timeout: 15_000 });
+
+  await page.locator('button[aria-label="Show channel members"]').click();
+  const section = page.locator('section.channel-members-panel-battle');
+  await expect(section).toBeVisible({ timeout: 10_000 });
+  const expSelect = section.locator('#battle-experiment-select');
+  await expSelect.waitFor({ state: 'visible', timeout: 25_000 });
+  await expSelect.selectOption(BATTLE_EXP_ID);
+  await section.locator('.channel-members-panel-battle-btn--enable').click();
+
+  const live = section.locator('.status-badge--live');
+  const err = section.locator('.channel-members-panel-battle-error');
+  await Promise.race([
+    live.waitFor({ state: 'visible', timeout: 30_000 }).catch(() => {}),
+    err.waitFor({ state: 'visible', timeout: 30_000 }).catch(() => {}),
+  ]);
+  if (await err.isVisible({ timeout: 500 }).catch(() => false)) {
+    throw new Error(`Battle enable failed: ${await err.innerText().catch(() => 'unknown error')}`);
+  }
+  await expect(live).toBeVisible();
+  // Close the members panel so it doesn't overlay the composer. The toggle
+  // button's label flips to "Hide channel members" while the panel is OPEN —
+  // clicking the "Show…" label here is a no-op that leaves the panel covering
+  // the textarea (every subsequent composer action then hangs).
+  await page.locator('button[aria-label="Hide channel members"]').first().click({ timeout: 5000 }).catch(() => {});
+  await page.locator('section.channel-members-panel-battle').waitFor({ state: 'hidden', timeout: 10_000 }).catch(() => {});
+}
+
+/**
+ * Fire a /battle prompt and wait for the dual reply to RESOLVE. Returns the
+ * number of .battle-message bubbles. Resolution is signalled by the scorecard's
+ * first response-time cell carrying a digit (the per-bot placeholders + an
+ * empty-dash scorecard render immediately, so bubble count alone lies).
+ */
+export async function fireBattle(page: Page, prompt: string, timeoutMs = 170_000): Promise<number> {
+  // Explicit fill timeout: if the composer is ever blocked (e.g. an overlay),
+  // fail in 30s with a clear error instead of hanging to the test timeout.
+  await page.locator('.message-textarea').fill(prompt, { timeout: 30_000 });
+  await page.keyboard.press('Enter');
+  await expect
+    .poll(async () => page.locator('.message.battle-message').count(), { timeout: timeoutMs })
+    .toBeGreaterThanOrEqual(2);
+  const card = page.locator('.battle-scorecard').last();
+  await card.waitFor({ state: 'visible', timeout: timeoutMs });
+  await expect
+    .poll(async () => card.locator('.battle-scorecard-cell').first().innerText().catch(() => ''), {
+      timeout: timeoutMs,
+    })
+    .toMatch(/\d/);
+  return page.locator('.message.battle-message').count();
+}

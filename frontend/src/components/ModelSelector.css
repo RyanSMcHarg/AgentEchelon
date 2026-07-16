@@ -1,0 +1,132 @@
+/* ========================================
+   Model Selector
+   Card-based model selection with tier badges
+   ======================================== */
+
+.model-selector {
+  width: 100%;
+}
+
+.model-selector-label {
+  display: block;
+  margin-bottom: var(--space-3);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  color: var(--text-secondary);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+.model-options {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+/* Individual model card */
+.model-option {
+  padding: var(--space-4);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-lg);
+  cursor: pointer;
+  background: var(--surface-0);
+  transition:
+    border-color var(--duration-fast) var(--ease-in-out),
+    background var(--duration-fast) var(--ease-in-out),
+    box-shadow var(--duration-fast) var(--ease-in-out);
+}
+
+.model-option:hover {
+  border-color: var(--accent-400);
+  box-shadow: 0 2px 4px rgba(124, 58, 237, 0.08);
+}
+
+.model-option.selected {
+  border-color: var(--accent-500);
+  background: var(--accent-50);
+  box-shadow: var(--shadow-glow);
+}
+
+/* Model card header */
+.model-option-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: var(--space-2);
+}
+
+.model-name {
+  font-weight: 600;
+  color: var(--text-primary);
+  font-size: var(--text-md);
+  letter-spacing: var(--tracking-tight);
+}
+
+/* Tier badges */
+.tier-badge {
+  font-family: var(--font-mono);
+  padding: 2px var(--space-2);
+  border-radius: var(--radius-sm);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+}
+
+.tier-badge-basic {
+  background: var(--tier-basic-bg);
+  color: var(--tier-basic);
+}
+
+.tier-badge-standard {
+  background: var(--tier-standard-bg);
+  color: var(--tier-standard);
+}
+
+.tier-badge-premium {
+  background: var(--tier-premium-bg);
+  color: var(--tier-premium);
+}
+
+/* Model description */
+.model-description {
+  margin: var(--space-1) 0;
+  font-size: var(--text-base);
+  color: var(--text-secondary);
+  line-height: var(--leading-normal);
+}
+
+/* Capability tags */
+.model-capabilities {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
+  margin-top: var(--space-3);
+}
+
+.capability-tag {
+  padding: 2px var(--space-2);
+  background: var(--surface-100);
+  color: var(--text-secondary);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  letter-spacing: var(--tracking-wide);
+}
+
+.model-option.selected .capability-tag {
+  background: var(--accent-100);
+  color: var(--accent-700);
+}
+
+/* Locked model indicator */
+.model-option.locked {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.model-option.locked:hover {
+  border-color: var(--surface-200);
+  box-shadow: none;
+}

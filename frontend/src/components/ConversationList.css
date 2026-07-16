@@ -1,0 +1,241 @@
+/* ========================================
+   Conversation List (Dark Chrome Sidebar)
+   ========================================
+   Dense, terminal-like list. Tier is signaled via the MODEL NAME color
+   in the meta row — NOT via a leading dot (which would be confused with
+   an unread indicator). Unread state uses a solid amber dot on the
+   right edge plus a bolded title.
+*/
+
+.conversation-list {
+  flex: 1;
+  overflow-y: auto;
+  padding: var(--space-2);
+  min-height: 0;
+}
+
+.conversation-list-header {
+  display: none;
+}
+
+.conversation-items {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+
+/* Empty state */
+.no-conversations {
+  text-align: center;
+  padding: var(--space-8) var(--space-4);
+  color: var(--chrome-text);
+}
+
+.no-conversations p {
+  font-size: var(--text-base);
+  margin: var(--space-2) 0;
+  color: var(--chrome-text);
+}
+
+.no-conversations .hint {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--chrome-border);
+  letter-spacing: var(--tracking-wide);
+  text-transform: uppercase;
+}
+
+/* Conversation item */
+.conversation-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-3);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  position: relative;
+  background: transparent;
+  border: none;
+  width: 100%;
+  text-align: left;
+  font-family: inherit;
+  color: var(--chrome-text);
+  transition:
+    background var(--duration-fast) var(--ease-in-out),
+    color var(--duration-fast) var(--ease-in-out);
+}
+
+.conversation-item:hover {
+  background: var(--chrome-hover);
+}
+
+.conversation-item:hover .conversation-title {
+  color: var(--chrome-text-bright);
+}
+
+.conversation-item.active {
+  background: var(--chrome-active);
+}
+
+/* Amber left accent on active item */
+.conversation-item.active::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 10px;
+  bottom: 10px;
+  width: 2px;
+  background: var(--accent-500);
+  border-radius: var(--radius-full);
+}
+
+.conversation-item-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.conversation-title {
+  font-size: var(--text-base);
+  font-weight: 500;
+  color: var(--chrome-text);
+  margin-bottom: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  letter-spacing: var(--tracking-tight);
+  transition: color var(--duration-fast) var(--ease-in-out);
+}
+
+.conversation-item.active .conversation-title {
+  color: var(--chrome-text-bright);
+}
+
+/* Unread state — bolder title + distinct amber dot on the right */
+.conversation-item.unread .conversation-title {
+  color: var(--chrome-text-bright);
+  font-weight: 600;
+}
+
+.conversation-item.unread .conversation-tier,
+.conversation-item.unread .conversation-date {
+  opacity: 1;
+}
+
+.conversation-item-unread-dot {
+  width: 8px;
+  height: 8px;
+  min-width: 8px;
+  border-radius: var(--radius-full);
+  background: var(--accent-400);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-500) 35%, transparent);
+  flex-shrink: 0;
+  animation: unreadPulse 2.2s var(--ease-in-out) infinite;
+}
+
+/* Archived conversations (ADR-017): read-only, revealed by the "Show archived"
+   toggle. Dimmed + a small badge so they read as inactive/read-only. */
+.conversation-archived-toggle {
+  width: 100%;
+  text-align: left;
+  padding: var(--space-2) var(--space-3);
+  margin-top: var(--space-2);
+  background: none;
+  border: none;
+  border-top: 1px solid var(--surface-200);
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: var(--text-sm);
+  cursor: pointer;
+}
+.conversation-archived-toggle:hover {
+  color: var(--text-primary);
+}
+.conversation-item--archived {
+  opacity: 0.7;
+}
+.conversation-item--archived .conversation-title {
+  font-style: italic;
+}
+.conversation-archived-badge {
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 1px 6px;
+  border-radius: var(--radius-full);
+  background: var(--surface-200);
+  color: var(--text-secondary);
+}
+
+@keyframes unreadPulse {
+  0%, 100% {
+    box-shadow: 0 0 0 2px color-mix(in srgb, var(--accent-500) 35%, transparent);
+  }
+  50% {
+    box-shadow: 0 0 0 4px color-mix(in srgb, var(--accent-500) 15%, transparent);
+  }
+}
+
+/* Meta line: model name + date */
+.conversation-meta {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--chrome-text);
+  letter-spacing: var(--tracking-wide);
+  opacity: 0.65;
+}
+
+.conversation-item:hover .conversation-meta,
+.conversation-item.active .conversation-meta {
+  opacity: 0.9;
+}
+
+/* Tier label — colored text by tier. Not the model name (which is
+   misleading with intent-based routing picking models per-message). */
+.conversation-tier {
+  display: inline-block;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: var(--tracking-wider);
+  transition: color var(--duration-fast) var(--ease-in-out);
+  cursor: help;
+}
+
+.conversation-item--basic .conversation-tier {
+  color: var(--chrome-text);
+}
+
+.conversation-item--standard .conversation-tier {
+  color: #7DD3FC; /* sky-300 — reads on dark chrome, distinct from amber */
+}
+
+.conversation-item--premium .conversation-tier {
+  color: var(--accent-400);
+  text-shadow: 0 0 8px color-mix(in srgb, var(--accent-500) 20%, transparent);
+}
+
+.conversation-date {
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  margin-left: auto;
+}
+
+/* Dark chrome scrollbar */
+.conversation-list::-webkit-scrollbar {
+  width: 4px;
+}
+
+.conversation-list::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.conversation-list::-webkit-scrollbar-thumb {
+  background: var(--chrome-border);
+  border-radius: var(--radius-full);
+}
+
+.conversation-list::-webkit-scrollbar-thumb:hover {
+  background: var(--chrome-text);
+}

@@ -1,0 +1,295 @@
+{
+  "project": "AgentEchelon",
+  "license": "MIT",
+  "purpose": "AgentEchelon is a governed, multi-party, multi-channel AI platform you deploy into your own AWS account. This context lets the assistant answer questions about the platform itself - what it is, how it works, and where a topic is documented.",
+  "overview": "**AgentEchelon is a self-hosted agent control plane: a governed, multi-party agentic AI platform that runs entirely in your own AWS account and serves your internal *and* customer-facing use cases from one place.** It is the governed layer between your agents and everything they touch (the harness around your models), deciding who may act, which model answers, where the context lives, and what get",
+  "answering_guidance": "Answer from these summaries and, when deployed in Aurora mode, from the retrieved full docs. Point the user at the named doc path for detail. Do not fabricate; if it is not here, say so.",
+  "docs": [
+    {
+      "title": "Agent Echelon",
+      "summary": "**A governed agent harness for enterprise AI - custom-built on AWS.** Agent Echelon gives your team controlled, tiered access to the best models for every task, with *who can do what* enforced by IAM - infrastructure, not application code - so a buggy prompt or a misrouted request can't exceed what the assumed role and the channel's policy already permit. Data, cost, and quality stay firmly in you",
+      "path": "README.md"
+    },
+    {
+      "title": "SPEC: Context-aware model routing (RoutingContext + provider adapter)",
+      "summary": "**Status:** Partial (`RoutingContext` runs on the standard tier; the provider-adapter seam is design)",
+      "path": "docs/design/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md"
+    },
+    {
+      "title": "Demo Company Spec: Stratum Technologies",
+      "summary": "**Status:** Implemented (the demo dataset and seed script ship)",
+      "path": "docs/design/SPEC-DEMO-COMPANY.md"
+    },
+    {
+      "title": "Federated Participants - bring external people in, safely, from any identity provider",
+      "summary": "**Status:** Design (a wired, opt-in seam; not the shipped experience)",
+      "path": "docs/design/SPEC-FEDERATED-PARTICIPANTS.md"
+    },
+    {
+      "title": "Admin Console Guide",
+      "summary": "How operators use the AgentEchelon admin dashboard to check platform health, review how the assistants are performing, and moderate conversations. Written to be portable - it describes behaviour, not any specific AWS account.",
+      "path": "docs/guides/admin/ADMIN-GUIDE.md"
+    },
+    {
+      "title": "Bringing Your Own Admin Console & Admin Auth",
+      "summary": "This guide explains how to run AgentEchelon's operator surface - analytics, moderation, evaluations, experiments - **behind your own application's admin console and admin authentication**, instead of AgentEchelon's built-in Cognito `admins` group and React dashboard.",
+      "path": "docs/guides/admin/ADMIN-INTEGRATION-GUIDE.md"
+    },
+    {
+      "title": "Aurora Mode Guide",
+      "summary": "AgentEchelon ships with two analytics backends. **Athena mode** (default) is serverless and cheap at low volume. **Aurora mode** adds a VPC with Aurora PostgreSQL Serverless v2 for sub-second dashboard queries, multi-turn evaluation, drift detection, and cross-conversation context search.",
+      "path": "docs/guides/admin/AURORA-MODE-GUIDE.md"
+    },
+    {
+      "title": "A/B Testing and Running Battles",
+      "summary": "How to run real A/B model experiments on your own traffic, measure which model wins, promote the winner, and use Battle Mode to put two assistants head to head on the same prompt.",
+      "path": "docs/guides/admin/GUIDE-AB-TESTING-AND-BATTLES.md"
+    },
+    {
+      "title": "Image Generation Providers",
+      "summary": "**Audience:** Deployers configuring `/battle` generation-out (and any future feature that calls `invokeImageGenModel`).",
+      "path": "docs/guides/admin/IMAGE-GEN-PROVIDERS.md"
+    },
+    {
+      "title": "Infrastructure and cost model",
+      "summary": "**Audience:** deployers and operators sizing an AgentEchelon instance, and anyone reviewing what each piece of infrastructure is for and what it costs to run.",
+      "path": "docs/guides/admin/INFRASTRUCTURE-COST.md"
+    },
+    {
+      "title": "Resource Tagging & Cost Attribution",
+      "summary": "This platform deploys as **multiple independent instances** (one per `AE_INSTANCE_NAME`). For cost attribution to work, each instance's resources must carry **its own** identity - so the tagging rule is:",
+      "path": "docs/guides/admin/TAGGING.md"
+    },
+    {
+      "title": "Chime SDK Integration",
+      "summary": "The frontend talks to AWS through Amazon Chime SDK Messaging: users authenticate with Cognito, exchange their identity for temporary AWS credentials, and use those credentials to create channels, send messages, and receive real-time updates. Assistant responses are generated by AWS Bedrock and delivered back into the channel as persistent messages.",
+      "path": "docs/guides/developer/CHIME_SDK_INTEGRATION.md"
+    },
+    {
+      "title": "AgentEchelon Design System",
+      "summary": "The design tokens and shared component classes described here are implemented in `frontend/src/styles/`. Some component CSS is still being migrated onto them - the [Migration Guide](#migration-guide) below is the reference for bringing a component onto the system.",
+      "path": "docs/guides/developer/DESIGN-SYSTEM.md"
+    },
+    {
+      "title": "Developer Guide",
+      "summary": "**Audience:** engineers building on or extending AgentEchelon. **Status:** hub / index. Points to the authoritative doc for each task; it does not restate them.",
+      "path": "docs/guides/developer/DEVELOPER-GUIDE.md"
+    },
+    {
+      "title": "Guide: Building and operating assistant context",
+      "summary": "**Audience:** developers building an assistant for a new use case, and admins/deployers who load and scope the content an assistant reads.",
+      "path": "docs/guides/developer/GUIDE-ASSISTANT-CONTEXT.md"
+    },
+    {
+      "title": "How to add or manage a tier",
+      "summary": "A practical guide for two adjacent tasks the per-tier ownership model ([SPEC-PER-TIER-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md)) makes routine:",
+      "path": "docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-TIER.md"
+    },
+    {
+      "title": "Latency targets (industry-sourced)",
+      "summary": "The admin console's latency targets (`frontend/src/components/admin/metricTargets.ts` and `LatencyTab.latencyColor`) are set to published industry standards, not to a self-imposed ceiling. This doc records the standards and how they map onto AgentEchelon so the numbers are defensible and reviewable.",
+      "path": "docs/guides/developer/LATENCY-TARGETS.md"
+    },
+    {
+      "title": "Message delivery & size: how assistant output reaches Chime",
+      "summary": "Canonical implementation: `backend/lambda/src/lib/async-processor-core.ts`.",
+      "path": "docs/guides/developer/MESSAGE-DELIVERY-GUIDE.md"
+    },
+    {
+      "title": "Message flow - how a message travels, who touches it, and why",
+      "summary": "AgentEchelon is a **multiparty** substrate: humans and assistants share Chime SDK channels. The flow below is what lets a channel be a plain human-to-human room, a 1:1 human↔assistant chat, or a mixed room where the assistant answers only when addressed - all with the same primitives, differing only in **bot configuration**",
+      "path": "docs/guides/developer/MESSAGE-FLOW.md"
+    },
+    {
+      "title": "Metadata and Tags: What Goes Where",
+      "summary": "This guide is the rule for storing data on Chime channels and users, and for using resource tags. It exists because the wrong choice leaks information to other users or silently weakens the tier boundary. Read it before you add a field to a channel, a user, or a tag.",
+      "path": "docs/guides/developer/METADATA-AND-TAGS.md"
+    },
+    {
+      "title": "Model Strategy",
+      "summary": "Agent Echelon treats model routing as a capability-first concern, not a tier-only choice.",
+      "path": "docs/guides/developer/MODEL_STRATEGY.md"
+    },
+    {
+      "title": "RAG - Document Retrieval",
+      "summary": "**Audience:** deployers who want the agent to ground its responses in project documentation (wiki pages, runbooks, design docs) rather than just the LLM's training data.",
+      "path": "docs/guides/developer/RAG.md"
+    },
+    {
+      "title": "npm Supply-Chain Hardening",
+      "summary": "This project treats every npm dependency as untrusted code that runs on your machine and in CI. This document records the controls the repo ships, why they exist, and how to work with them.",
+      "path": "docs/guides/developer/SECURITY-NPM-SUPPLY-CHAIN.md"
+    },
+    {
+      "title": "Demo setup and post-deploy validation",
+      "summary": "A runbook for standing up the **Stratum Technologies** demo and running the end-to-end validation that exercises every tier flow with real (measured, recorded) conversations, then verifies the admin dashboard. This is the POC surface: read it to understand how the platform behaves, and modify the demo data / tests for your own use case. For the demo company design, see",
+      "path": "docs/guides/user/DEMO-AND-VALIDATION.md"
+    },
+    {
+      "title": "Deploying the frontend (CloudFront + S3)",
+      "summary": "The AgentEchelon SPA deploys to **CloudFront + private S3 by default**. The `AgentEchelonFrontend` stack (part of `cdk deploy --all`) creates the hosting; a short build-and-publish step uploads the app. Local development still uses the Vite dev server (`npm run dev`) - this guide is for a real, shareable deploy.",
+      "path": "docs/guides/user/FRONTEND-DEPLOY.md"
+    },
+    {
+      "title": "Integrating Your Identity Provider",
+      "summary": "This guide explains how to connect your existing identity provider (IdP) to AgentEchelon so your users can authenticate with your organization's SSO, LDAP, or OAuth2 system instead of (or in addition to) Cognito User Pool username/password.",
+      "path": "docs/guides/user/IDENTITY-PROVIDER-GUIDE.md"
+    },
+    {
+      "title": "AgentEchelon Troubleshooting Guide",
+      "summary": "All `aws` examples assume credentials for **your target account** are already configured (via `AWS_PROFILE`, environment variables, SSO, or an instance role). Examples omit `--profile`; export `AWS_PROFILE=<your-profile>` (or set creds) for the shell first. Confirm with:",
+      "path": "docs/guides/user/TROUBLESHOOTING.md"
+    },
+    {
+      "title": "Architecture Guide",
+      "summary": "This document explains how AgentEchelon works end-to-end. It covers every major flow, how the CDK stacks connect, and where to look when extending or debugging the system.",
+      "path": "docs/overview/ARCHITECTURE.md"
+    },
+    {
+      "title": "AgentEchelon: one-page overview",
+      "summary": "**AgentEchelon is a self-hosted agent control plane: a governed, multi-party agentic AI platform that runs entirely in your own AWS account and serves your internal *and* customer-facing use cases from one place.** It is the governed layer between your agents and everything they touch (the harness around your models), deciding who may act, which model answers, where the context lives, and what get",
+      "path": "docs/overview/PLATFORM-OVERVIEW.md"
+    },
+    {
+      "title": "AgentEchelon Tenets",
+      "summary": "The non-negotiables. Every architectural decision in the project traces back to one of these, and where two designs competed, the tenet broke the tie.",
+      "path": "docs/overview/TENETS.md"
+    },
+    {
+      "title": "AgentEchelon documentation",
+      "summary": "The navigable map of everything under `docs/`, organized by **what you are trying to do**. The authoritative project overview and quickstart live in the root [`README.md`](../README.md); start there if you have not.",
+      "path": "docs/README.md"
+    },
+    {
+      "title": "SPEC - Admin Console (design)",
+      "summary": "**Status:** Design (the admin-console design; for using it, see the admin guide)",
+      "path": "docs/specs/admin-console/SPEC-ADMIN-CONSOLE.md"
+    },
+    {
+      "title": "SPEC: Abuse Controls (rate limiting, spend budgets, request dedup)",
+      "summary": "**Status:** Implemented (all phases). `lib/abuse-controls.ts` holds the logic, wired into all three tiers via `agent-tier-common.abuseControlsWiring`: request dedup (guard in `runSharedPipeline` + stable `correlationId` from `CHIME.message.id`), per-user/global spend budget with a fail-safe global ceiling, an SSM circuit trip, a per-tier hourly rate limit, and an inbound length cap. Active by defa",
+      "path": "docs/specs/analytics-eval/SPEC-ABUSE-CONTROLS.md"
+    },
+    {
+      "title": "SPEC: Optional Aurora PostgreSQL + VPC Deployment Mode",
+      "summary": "**Status:** Implemented (opt-in deployment mode)",
+      "path": "docs/specs/analytics-eval/SPEC-AURORA-VPC-MODE.md"
+    },
+    {
+      "title": "SPEC: Cost Sleep Mode (auto-sleep / wake)",
+      "summary": "**Status:** Implemented (Aurora-mode, opt-in `-c sleepMode=true`). Wired in `bin/backend.ts` (reads the `sleepMode` / `sleepAfterIdle` / `sleepCheckRate` / `sleepRecipients` context), provisioned by `analytics-stack-aurora.ts`, with the runtime in `lambda/src/deployment-sleep.ts` + `lib/sleep-mode.ts`. **Scope:** A deploy-time opt-in that auto-pauses the Aurora data plane after a configurable idle",
+      "path": "docs/specs/analytics-eval/SPEC-COST-SLEEP-MODE.md"
+    },
+    {
+      "title": "SPEC: Drift Detection",
+      "summary": "**Status:** Implemented (Aurora mode; the live-suggestion path is behind `enableLiveDrift`)",
+      "path": "docs/specs/analytics-eval/SPEC-DRIFT-CONVERGENCE.md"
+    },
+    {
+      "title": "Assistant Configuration - what the assistant *is*, per experience",
+      "summary": "**Status:** Partial (the per-tier config seams ship; the unified `AssistantConfig` bundle is the design target)",
+      "path": "docs/specs/assistant-context/SPEC-ASSISTANT-CONFIG.md"
+    },
+    {
+      "title": "SPEC: Bilingual conversations (reply-language, pivot, dual delivery)",
+      "summary": "**Status:** Partial (reply-language ships; the inference pivot and dual delivery are design)",
+      "path": "docs/specs/assistant-context/SPEC-BILINGUAL-CONVERSATIONS.md"
+    },
+    {
+      "title": "SPEC: Configurable intent pack (per-deployment intent taxonomy)",
+      "summary": "**Status:** Implemented (the taxonomy mechanism; the domain taxonomy is per-deployment config)",
+      "path": "docs/specs/assistant-context/SPEC-CONFIGURABLE-INTENT-PACK.md"
+    },
+    {
+      "title": "SPEC: Per-tier ownership (`AgentEchelonTier-*`)",
+      "summary": "**Status:** Implemented",
+      "path": "docs/specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md"
+    },
+    {
+      "title": "Cross-Channel Task Continuity",
+      "summary": "**Status:** Implemented",
+      "path": "docs/specs/conversation-messaging/CROSS-CHANNEL-TASKS.md"
+    },
+    {
+      "title": "SPEC: Conversation Archive and Member Removal (moderator)",
+      "summary": "**Status:** Proposed (behavior/detail under review); the archive **mechanism is Accepted in [ADR-017](../../design/decisions/017-conversation-archive-mechanism.md)** - Option 1 (mark archived + read-only via an immutable tag). It is composed with a conversation-type Chime expiration TTL that today is applied only from a per-request override (never the type default) - so channels currently get **no",
+      "path": "docs/specs/conversation-messaging/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md"
+    },
+    {
+      "title": "Conversation Configuration - a conversation is a configurable experience",
+      "summary": "**Status:** Partial (the `classification` type seam and the dimension/connector schemas ship and default to the tier today; the full conversation-type flexibility is the design target)",
+      "path": "docs/specs/conversation-messaging/SPEC-CONVERSATION-TYPES.md"
+    },
+    {
+      "title": "The AgentEchelon Interaction Layer - platform composition model",
+      "summary": "**Audience:** anyone deciding *whether* AgentEchelon fits their use case and gives them the right level of security, plus contributors who need to see how the interaction layer and security model is built before diving into a new use case or editing an existing use case. (Deployers who want *how do I add or edit one* want the **guides** in §7; this doc is the model behind them.)",
+      "path": "docs/specs/conversation-messaging/SPEC-INTERACTION-LAYER.md"
+    },
+    {
+      "title": "SPEC: Compact message metadata - a coded codebook + out-of-band lookup",
+      "summary": "**Status:** Partial (out-of-band lookup and the cap-shedding backstop ship; the coded-state codebook is design)",
+      "path": "docs/specs/conversation-messaging/SPEC-MESSAGE-METADATA-CODEBOOK.md"
+    },
+    {
+      "title": "SPEC: Conversation ↔ transport notification bridge (email now; SMS + voice/PSTN next)",
+      "summary": "The **conversation channel is the hub**; each transport is bridged to it, both directions, so the assistant is transport-agnostic.",
+      "path": "docs/specs/conversation-messaging/SPEC-NOTIFICATION-BRIDGE.md"
+    },
+    {
+      "title": "SPEC: Welcome flow and assistant context",
+      "summary": "**Status:** Partial (the welcome wiring ships; later context phases are design)",
+      "path": "docs/specs/conversation-messaging/SPEC-WELCOME-AND-CONTEXT.md"
+    },
+    {
+      "title": "SPEC: `/battle` - Multi-Assistant Adversarial Reply",
+      "summary": "**Status:** Implemented (premium-gated). Covers single-turn, `TASK_*`, and image (vision-in + generation-out) battles, the three-axis scorecard, and per-step telemetry. **Image-output safety:** ships as a basic default; production-grade moderation is the deployer's responsibility (open-source posture), not an internal sign-off gate.",
+      "path": "docs/specs/experiments-battle/SPEC-BATTLE.md"
+    },
+    {
+      "title": "Access control by example: blocked interactions, the policy that blocks them, and the experience",
+      "summary": "**Status:** Implemented (reference: worked examples of the live IAM enforcement)",
+      "path": "docs/specs/identity-access/ACCESS-CONTROL-BY-EXAMPLE.md"
+    },
+    {
+      "title": "Identity & Access Model",
+      "summary": "**Status:** Implemented (reference: the live identity and access model)",
+      "path": "docs/specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md"
+    },
+    {
+      "title": "Access & Controls Auditing - an append-only record of who could act, and what changed",
+      "summary": "**Status:** Implemented (audit capture and the membership-history view; forward extensions noted inline)",
+      "path": "docs/specs/identity-access/SPEC-ACCESS-AND-CONTROLS-AUDITING.md"
+    },
+    {
+      "title": "SPEC: Add a user to a conversation (eligible-member invite and assistant escalation)",
+      "summary": "Adding another human to a conversation should be safe by construction: the person added must be entitled to the conversation's tier, and no one should be able to email an arbitrary address or pull in someone who cannot actually access the thread. AgentEchelon supports two ways to add a user, and both pass through the SAME",
+      "path": "docs/specs/identity-access/SPEC-ADD-USER-ESCALATION.md"
+    },
+    {
+      "title": "SPEC: Admin Identity",
+      "summary": "**Status:** Implemented",
+      "path": "docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md"
+    },
+    {
+      "title": "Conversation Security, Membership, and Information Isolation",
+      "summary": "**Status:** Implemented (Layers 1-6 are live; Layer 7 mixed-trust visibility is partial)",
+      "path": "docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md"
+    },
+    {
+      "title": "Identity & Access - anyone participates at the right capability, only as themselves",
+      "summary": "**Status:** Implemented. The **Identity & Access** pillar of the interaction layer (`docs/specs/conversation-messaging/SPEC-INTERACTION-LAYER.md` is the map), built as a backend **Credential Exchange Service** (see §9).",
+      "path": "docs/specs/identity-access/SPEC-CREDENTIAL-EXCHANGE.md"
+    },
+    {
+      "title": "SPEC - Moderation Model (surfaces)",
+      "summary": "**Status:** Partial (the built moderation surfaces plus the can-work design; assistant-neutral)",
+      "path": "docs/specs/identity-access/SPEC-MODERATION.md"
+    }
+  ],
+  "blog": [],
+  "generated_from": {
+    "repo_docs": 56,
+    "public_blog_posts": 0,
+    "blog_vault_used": false
+  }
+}

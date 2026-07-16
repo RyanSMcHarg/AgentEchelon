@@ -1,0 +1,30 @@
+{
+  "escalationMatrix": [
+    { "severity": "P0 - Service Down", "responseTime": "15 minutes", "escalateTo": "VP Engineering + CTO", "examples": ["Production outage", "Data loss", "Security breach"] },
+    { "severity": "P1 - Critical", "responseTime": "1 hour", "escalateTo": "Engineering Manager", "examples": ["Major feature broken", "Performance degradation >50%", "Enterprise customer blocked"] },
+    { "severity": "P2 - High", "responseTime": "4 hours", "escalateTo": "Team Lead", "examples": ["Feature partially broken", "Non-critical data issue", "Integration failure"] },
+    { "severity": "P3 - Normal", "responseTime": "1 business day", "escalateTo": "Support Team", "examples": ["UI bug", "Documentation gap", "Feature request"] }
+  ],
+  "slaDefinitions": {
+    "starter": { "uptime": "99.5%", "supportHours": "Mon-Fri 9-6 CT", "responseTime": "24 hours", "resolutionTarget": "5 business days" },
+    "professional": { "uptime": "99.9%", "supportHours": "Mon-Fri 9-6 CT", "responseTime": "4 hours", "resolutionTarget": "2 business days" },
+    "enterprise": { "uptime": "99.99%", "supportHours": "24/7", "responseTime": "1 hour", "resolutionTarget": "4 hours (P0/P1)" }
+  },
+  "supportTicketTrends": {
+    "q2_2026": {
+      "totalTickets": 847,
+      "byCategory": { "integration": 312, "workflow": 218, "billing": 127, "access": 103, "other": 87 },
+      "avgResolutionHours": 18.4,
+      "csat": 4.3
+    }
+  },
+  "onboardingChecklist": [
+    "Account creation and email verification",
+    "Admin approval (if required by org policy)",
+    "First workflow created (guided wizard)",
+    "First connector configured",
+    "First successful workflow run",
+    "Team members invited",
+    "Support documentation reviewed"
+  ]
+}

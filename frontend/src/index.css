@@ -1,0 +1,11 @@
+/* Design System */
+@import './styles/design-tokens.css';
+@import './styles/components.css';
+
+/* Global layout */
+html, body, #root {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  padding: 0;
+}

@@ -1,0 +1,367 @@
+/* ========================================
+   Channel Members Panel
+   ========================================
+   Right-side collapsible panel listing channel participants.
+   Uses the existing design tokens — no fallback hacks.
+*/
+
+.channel-members-panel {
+  width: 288px;
+  min-width: 288px;
+  background: var(--surface-50);
+  border-left: 1px solid var(--surface-200);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  animation: slideInFromRight var(--duration-slower) var(--ease-out);
+}
+
+@keyframes slideInFromRight {
+  from {
+    opacity: 0;
+    transform: translateX(8px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+
+/* Header */
+.channel-members-panel-header {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-4) var(--space-4) var(--space-5);
+  border-bottom: 1px solid var(--surface-200);
+  background: var(--surface-0);
+  min-height: 52px;
+}
+
+.channel-members-panel-title {
+  margin: 0;
+  font-size: var(--text-md);
+  font-weight: 600;
+  color: var(--text-primary);
+  letter-spacing: var(--tracking-tight);
+  flex: 1;
+}
+
+.channel-members-panel-count {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  letter-spacing: var(--tracking-wide);
+  white-space: nowrap;
+}
+
+.channel-members-panel-close {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: none;
+  border: none;
+  border-radius: var(--radius-md);
+  color: var(--text-tertiary);
+  cursor: pointer;
+  padding: 0;
+  transition:
+    background var(--duration-fast) var(--ease-in-out),
+    color var(--duration-fast) var(--ease-in-out);
+}
+
+.channel-members-panel-close:hover {
+  background: var(--surface-100);
+  color: var(--text-primary);
+}
+
+/* Error alert */
+.channel-members-panel-error {
+  margin: var(--space-3) var(--space-4);
+  padding: var(--space-2) var(--space-3);
+  background: var(--error-bg);
+  color: var(--error);
+  border: 1px solid var(--error-border);
+  border-radius: var(--radius-md);
+  font-size: var(--text-xs);
+  line-height: var(--leading-normal);
+  animation: fadeIn var(--duration-slow) var(--ease-out);
+}
+
+/* Empty state */
+.channel-members-panel-empty {
+  padding: var(--space-8) var(--space-5);
+  margin: 0;
+  color: var(--text-tertiary);
+  font-size: var(--text-base);
+  text-align: center;
+  line-height: var(--leading-normal);
+}
+
+/* Member list */
+.channel-members-panel-list {
+  list-style: none;
+  padding: var(--space-2) 0;
+  margin: 0;
+  overflow-y: auto;
+  flex: 1;
+}
+
+.channel-members-panel-item {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  padding: var(--space-2) var(--space-4);
+  position: relative;
+  transition: background var(--duration-fast) var(--ease-in-out);
+}
+
+.channel-members-panel-item:hover {
+  background: var(--surface-100);
+}
+
+.channel-members-panel-item.is-self {
+  background: transparent;
+}
+
+.channel-members-panel-item.is-self::before {
+  content: '';
+  position: absolute;
+  left: 0;
+  top: 8px;
+  bottom: 8px;
+  width: 2px;
+  background: var(--accent-500);
+  border-radius: var(--radius-full);
+}
+
+/* Avatar */
+.channel-members-panel-avatar {
+  width: 32px;
+  height: 32px;
+  min-width: 32px;
+  border-radius: var(--radius-full);
+  background: var(--surface-200);
+  color: var(--text-secondary);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: var(--tracking-wide);
+  font-family: var(--font-mono);
+  position: relative;
+  box-shadow: inset 0 0 0 1px var(--surface-300);
+}
+
+/* Moderator gets an amber ring */
+.channel-members-panel-item[data-role="moderator"] .channel-members-panel-avatar {
+  box-shadow: inset 0 0 0 2px var(--accent-400);
+  background: var(--accent-50);
+  color: var(--accent-700);
+}
+
+/* Bot avatar is the bot icon on amber */
+.channel-members-panel-item[data-role="bot"] .channel-members-panel-avatar {
+  background: var(--chrome-bg);
+  color: var(--accent-400);
+  box-shadow: inset 0 0 0 1px var(--chrome-border);
+}
+
+/* Member info */
+.channel-members-panel-info {
+  flex: 1;
+  min-width: 0;
+}
+
+.channel-members-panel-name {
+  font-size: var(--text-base);
+  font-weight: 500;
+  color: var(--text-primary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  letter-spacing: var(--tracking-tight);
+}
+
+.channel-members-panel-you {
+  color: var(--text-tertiary);
+  font-weight: 400;
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  margin-left: 4px;
+}
+
+.channel-members-panel-role {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  margin-top: 2px;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+}
+
+/* Remove button — hidden until hover, amber-to-red on hover */
+.channel-members-panel-remove {
+  padding: 4px var(--space-2);
+  background: var(--surface-0);
+  color: var(--text-tertiary);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-sm);
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  font-weight: 500;
+  cursor: pointer;
+  opacity: 0;
+  transform: translateX(4px);
+  transition:
+    opacity var(--duration-fast) var(--ease-in-out),
+    transform var(--duration-fast) var(--ease-in-out),
+    color var(--duration-fast) var(--ease-in-out),
+    border-color var(--duration-fast) var(--ease-in-out),
+    background var(--duration-fast) var(--ease-in-out);
+}
+
+.channel-members-panel-item:hover .channel-members-panel-remove,
+.channel-members-panel-remove:focus-visible {
+  opacity: 1;
+  transform: translateX(0);
+}
+
+.channel-members-panel-remove:hover {
+  color: var(--error);
+  border-color: var(--error-border);
+  background: var(--error-bg);
+}
+
+.channel-members-panel-remove:disabled {
+  opacity: 0.5;
+  cursor: wait;
+  transform: translateX(0);
+}
+
+/* Scrollbar matches content area */
+.channel-members-panel-list::-webkit-scrollbar {
+  width: 4px;
+}
+
+.channel-members-panel-list::-webkit-scrollbar-thumb {
+  background: var(--surface-300);
+  border-radius: var(--radius-full);
+}
+
+/* ============================================================
+   Battle Mode section (SPEC-BATTLE.md)
+   Visible only to channel moderators of premium channels.
+   ============================================================ */
+.channel-members-panel-battle {
+  padding: var(--space-3) var(--space-4);
+  margin: 0 var(--space-3) var(--space-3);
+  border-radius: var(--radius-md);
+  background: var(--surface-50);
+  border: 1px solid var(--surface-200);
+}
+
+.channel-members-panel-battle-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-bottom: var(--space-2);
+}
+
+.channel-members-panel-battle-title {
+  margin: 0;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  color: var(--text-primary);
+  letter-spacing: 0.02em;
+}
+
+/* Battle Mode status badge migrated to the shared .status-badge primitive
+   (components.css). The header renders status-badge--live when active,
+   plain status-badge otherwise — no per-panel overrides needed. */
+
+.channel-members-panel-battle-help {
+  margin: 0 0 var(--space-2);
+  font-size: var(--font-size-xs);
+  color: var(--text-secondary);
+  line-height: 1.4;
+}
+
+.channel-members-panel-battle-error {
+  margin: var(--space-2) 0;
+  padding: var(--space-2);
+  border-radius: var(--radius-sm);
+  background: var(--status-error-bg, #fee2e2);
+  color: var(--status-error-text, #991b1b);
+  font-size: var(--font-size-xs);
+}
+
+.channel-members-panel-battle-controls {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.channel-members-panel-battle-label {
+  font-size: var(--font-size-xs);
+  font-weight: var(--font-weight-medium);
+  color: var(--text-secondary);
+}
+
+.channel-members-panel-battle-select {
+  width: 100%;
+  padding: var(--space-2);
+  border: 1px solid var(--surface-300);
+  border-radius: var(--radius-sm);
+  background: var(--surface-0);
+  font-size: var(--font-size-sm);
+  color: var(--text-primary);
+}
+
+.channel-members-panel-battle-btn {
+  width: 100%;
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-sm);
+  border: 1px solid transparent;
+  font-size: var(--font-size-sm);
+  font-weight: var(--font-weight-semibold);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease-in-out);
+}
+
+.channel-members-panel-battle-btn--enable {
+  background: var(--accent-500, #6366f1);
+  color: var(--surface-0);
+}
+
+.channel-members-panel-battle-btn--enable:hover:not(:disabled) {
+  background: var(--accent-600, #4f46e5);
+}
+
+.channel-members-panel-battle-btn--disable {
+  background: var(--surface-100);
+  color: var(--text-primary);
+  border-color: var(--surface-300);
+}
+
+.channel-members-panel-battle-btn--disable:hover:not(:disabled) {
+  background: var(--surface-200);
+}
+
+.channel-members-panel-battle-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.channel-members-panel-battle-empty {
+  margin: 0;
+  padding: var(--space-2);
+  background: var(--surface-100);
+  border-radius: var(--radius-sm);
+  font-size: var(--font-size-xs);
+  color: var(--text-tertiary);
+  line-height: 1.4;
+}

@@ -1,0 +1,103 @@
+# Dependencies
+node_modules/
+
+# Build outputs
+dist/
+build/
+*.js.map
+*.d.ts
+
+# CDK
+cdk.out/
+*.js
+!jest.config.js
+!vite.config.js
+!eslint.config.js
+
+# Lambda handler source files (CommonJS, not compiled output)
+!backend/lambda/*/index.js
+!backend/lambda/*/*/index.js
+!backend/lambda/cognito-triggers/*.js
+
+# Keep TypeScript source
+!*.ts
+
+# Environment
+.env
+.env.local
+.env.*.local
+
+# CDK — never commit the lookup cache (account-specific: account IDs, VPC/subnet IDs
+# from fromLookup) or synth output.
+cdk.context.json
+cdk.out/
+*.cdk.staging
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+
+# Test coverage
+coverage/
+
+# Playwright artifacts (generated per run)
+test-results/
+playwright-report/
+tests/demo-output/
+# Ad-hoc operator inspection artifacts (gunzipped archive samples, lambda
+# response captures, IAM role dumps) - these are temporary and should
+# never land in git.
+tests/*.gz
+tests/*.json
+!tests/package*.json
+!tests/playwright.config.json
+!tests/tsconfig*.json
+
+# Misc
+# .claude/ — local Claude Code state is gitignored, but the checked-in
+# pieces (hooks, project settings, slash commands) ship to all
+# contributors and OSS users.
+.claude/*
+!.claude/hooks/
+!.claude/commands/
+!.claude/settings.json
+# Hooks may include JS scripts — bypass the project-wide *.js ignore
+# (line ~12 above) just for those.
+!.claude/hooks/*.js
+.obsidian/
+.stfolder*/
+
+# Obsidian / Syncthing working directories
+AI Agent/
+
+# local throwaway probe/verify scripts (untracked)
+backend/*.mjs
+
+# Scratch / working directory (reflow tooling, spec backups, ad-hoc dumps)
+tmp/
+
+# Private session working files (plans, bug trackers, handoffs, consolidation notes)
+# and assistant memory — never part of the public repo. Kept out of a fresh checkout.
+HANDOFF-*.md
+HANDOVER-*.md
+PLAN-*.md
+BUGS-*.md
+DOC-CONSOLIDATION-*.md
+memory/
+
+# Per-instance deploy context (account-specific)
+deploy.config.json
+
+# Codex CLI local config — its hook uses a machine-specific absolute path, so it
+# is local-only (unlike .claude/, whose hooks are portable and checked in).
+.codex/

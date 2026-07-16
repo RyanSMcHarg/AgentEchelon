@@ -1,0 +1,43 @@
+{
+  "confidentiality": "INTERNAL — Premium tier only",
+  "quarter": "Q2 2026",
+  "okrProgress": [
+    {
+      "team": "Engineering",
+      "okrs": [
+        { "objective": "Ship workflow versioning MVP", "keyResult": "Beta with 5 Enterprise customers", "progress": 70, "status": "on_track", "owner": "Priya Patel" },
+        { "objective": "Reduce P1 incident MTTR", "keyResult": "< 2 hours average", "progress": 85, "status": "on_track", "current": "1.8 hours", "owner": "David Kim" },
+        { "objective": "Increase test coverage", "keyResult": "80% across all services", "progress": 65, "status": "at_risk", "current": "72%", "owner": "Emma Torres" }
+      ]
+    },
+    {
+      "team": "Product",
+      "okrs": [
+        { "objective": "Launch connector marketplace V2", "keyResult": "50 partner-built connectors", "progress": 40, "status": "behind", "current": "22 connectors", "owner": "Lin Wei" },
+        { "objective": "Improve onboarding completion", "keyResult": "70% of new users complete setup wizard", "progress": 90, "status": "on_track", "current": "68%", "owner": "Jordan Hayes" }
+      ]
+    },
+    {
+      "team": "Sales",
+      "okrs": [
+        { "objective": "Close 5 Enterprise deals", "keyResult": "$600K new ARR", "progress": 100, "status": "complete", "current": "$680K (7 deals)", "owner": "James Okafor" },
+        { "objective": "Expand APAC presence", "keyResult": "3 customers in APAC", "progress": 100, "status": "complete", "current": "3 customers (Singapore)", "owner": "Maria Santos" }
+      ]
+    },
+    {
+      "team": "Customer Success",
+      "okrs": [
+        { "objective": "Reduce churn below 3.5%", "keyResult": "Gross churn < 3.5%", "progress": 85, "status": "on_track", "current": "3.1%", "owner": "Alex Kim" },
+        { "objective": "Increase NPS to 65", "keyResult": "NPS >= 65", "progress": 60, "status": "at_risk", "current": "62", "owner": "Nicole Park" }
+      ]
+    }
+  ],
+  "engineeringVelocity": {
+    "sprintLength": "2 weeks",
+    "avgPointsPerSprint": 42,
+    "trend": "stable (±5% over last 4 sprints)",
+    "deployFrequency": "3.2 deploys/week",
+    "changeFailureRate": "4.1%",
+    "leadTimeForChanges": "2.3 days"
+  }
+}

@@ -1,0 +1,34 @@
+{
+  "confidentiality": "BOARD CONFIDENTIAL — Premium tier only",
+  "meeting": "Q2 2026 Board Meeting",
+  "date": "2026-06-28",
+  "attendees": ["Sarah Chen (CEO)", "Marcus Rivera (CTO)", "Board members"],
+  "summary": [
+    {
+      "topic": "Q2 Financial Review",
+      "discussion": "ARR reached $4.2M, exceeding the $4.0M target by 5%. Net revenue retention at 118%. Board expressed satisfaction with growth trajectory.",
+      "decision": "Approved revised FY2026 target of $5.5M ARR (up from $5.2M)"
+    },
+    {
+      "topic": "Series B Timing",
+      "discussion": "With 14 months runway and accelerating growth, the board discussed optimal timing for Series B. Consensus: begin process in Q4 2026, target close Q1 2027.",
+      "decision": "Sarah to engage 2-3 investment banks for market feedback. Target raise: $20-25M at $80-100M pre-money valuation."
+    },
+    {
+      "topic": "International Expansion",
+      "discussion": "APAC pilot (Singapore) showing early traction with 3 customers. EU data residency requirements need addressing before European launch.",
+      "decision": "Approved hiring APAC sales lead. EU expansion deferred to post-Series B to fund data residency infrastructure."
+    },
+    {
+      "topic": "Product Strategy",
+      "discussion": "StratumAnalytics adoption below expectations (only 6 of 14 Enterprise customers active). AI-powered workflow suggestions identified as potential differentiator.",
+      "decision": "Lin Wei to present AI product strategy at next board meeting. Consider strategic hire for AI/ML team lead."
+    },
+    {
+      "topic": "Talent",
+      "discussion": "Engineering headcount at 95, targeting 120 by year-end. Key hire needed: VP Marketing (role open 3 months).",
+      "decision": "Approved increased recruiter budget. Consider fractional CMO as interim solution."
+    }
+  ],
+  "nextMeeting": "2026-09-26"
+}

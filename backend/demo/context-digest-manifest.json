@@ -1,0 +1,14 @@
+{
+  "_comment": "Curated source for the per-tier company-context digest (ADR-017). seed-demo.ts turns this into cumulative context/{tier}/_digest.json files (premium includes standard + basic). Titles/descriptions are the always-present signal that tells an assistant what company context exists; keep them short and accurate. Add a row here when you add a company document under demo/context/{tier}/.",
+  "documents": [
+    { "file": "company-public.json", "tier": "basic", "title": "Company overview", "description": "Stratum Technologies profile, products, and public FAQ" },
+    { "file": "employee-directory.json", "tier": "standard", "title": "Employee directory", "description": "Departments, team leads, and staff (including platform engineering leadership)" },
+    { "file": "internal-processes.json", "tier": "standard", "title": "Internal processes", "description": "Escalation matrix, response times, and internal operating procedures" },
+    { "file": "product-roadmap.json", "tier": "standard", "title": "Product roadmap", "description": "Upcoming StratumFlow features and the quarterly delivery plan" },
+    { "file": "board-summary.json", "tier": "premium", "title": "Board summary", "description": "Q2 board meeting notes, decisions, and strategic priorities" },
+    { "file": "competitive-intel.json", "tier": "premium", "title": "Competitive intelligence", "description": "Competitor positioning, pricing, and win/loss analysis" },
+    { "file": "customer-accounts.json", "tier": "premium", "title": "Customer accounts", "description": "Top accounts by ARR, renewals, and account health" },
+    { "file": "financial-data.json", "tier": "premium", "title": "Financial data", "description": "Quarterly ARR, revenue by plan, churn, and key SaaS metrics" },
+    { "file": "team-metrics.json", "tier": "premium", "title": "Team metrics", "description": "Team OKR progress and internal performance metrics" }
+  ]
+}

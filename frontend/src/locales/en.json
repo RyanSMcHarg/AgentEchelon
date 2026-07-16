@@ -1,0 +1,306 @@
+{
+  "common": {
+    "yes": "Yes",
+    "no": "No",
+    "cancel": "Cancel",
+    "close": "Close",
+    "retry": "Retry",
+    "dismiss": "Dismiss",
+    "loading": "Loading…"
+  },
+  "tier": {
+    "basic": "Basic",
+    "standard": "Standard",
+    "premium": "Premium",
+    "assistant": "Assistant"
+  },
+  "app": {
+    "brandName": "AgentEchelon",
+    "welcomeTitle": "Welcome to AgentEchelon",
+    "welcomeBody": "Select a conversation from the sidebar or create a new one to get started.",
+    "loading": "Loading…"
+  },
+  "header": {
+    "admin": "Admin",
+    "conversations": "Conversations",
+    "signOut": "Sign out",
+    "home": "Go to home"
+  },
+  "connection": {
+    "reconnecting": "Reconnecting…"
+  },
+  "error": {
+    "boundaryTitle": "Something went wrong",
+    "boundaryBody": "An unexpected error occurred. Please try again.",
+    "retry": "Retry"
+  },
+  "auth": {
+    "login": {
+      "subtitle": "Sign in to your account",
+      "emailLabel": "Email address",
+      "emailPlaceholder": "you@example.com",
+      "passwordLabel": "Password",
+      "passwordPlaceholder": "Enter your password",
+      "validationError": "Please enter both email and password",
+      "signingIn": "Signing in…",
+      "signInButton": "Sign in",
+      "noAccountPrompt": "Don't have an account?",
+      "createAccountLink": "Create account",
+      "failureFallback": "Login failed",
+      "footerNote": "Authentication runs on Amazon Cognito. Sign in with a Cognito user directory or federate to your corporate identity provider (SAML/OIDC) — both are supported in production."
+    },
+    "register": {
+      "title": "Create Your Account",
+      "emailLabel": "Email address",
+      "emailPlaceholder": "you@example.com",
+      "passwordLabel": "Password",
+      "passwordPlaceholder": "Enter a strong password",
+      "passwordRequirementsTitle": "Password must contain:",
+      "reqMinLength": "At least 8 characters",
+      "reqUppercase": "Uppercase letter (A–Z)",
+      "reqLowercase": "Lowercase letter (a–z)",
+      "reqNumber": "Number (0–9)",
+      "reqSpecial": "Special character (!@#$%^&*)",
+      "confirmLabel": "Confirm password",
+      "confirmPlaceholder": "Re-enter your password",
+      "tierLabel": "Access tier",
+      "tierBasic": "Basic",
+      "tierBasicModels": "Claude Haiku",
+      "tierStandard": "Standard",
+      "tierStandardModels": "Sonnet, Haiku, Titan",
+      "tierPremium": "Premium",
+      "tierPremiumModels": "All models including Opus",
+      "errorFillAll": "Please fill in all fields",
+      "errorMismatch": "Passwords do not match",
+      "errorTooShort": "Password must be at least 8 characters",
+      "creating": "Creating account…",
+      "createButton": "Create account",
+      "haveAccountPrompt": "Already have an account?",
+      "signInLink": "Sign in",
+      "failureFallback": "Registration failed",
+      "processTitle": "Registration Process",
+      "step1Title": "Email Verification",
+      "step1Body": "After registration, you'll receive a verification email. Click the link to confirm your email address.",
+      "step2Title": "Admin Approval",
+      "step2Body": "An administrator will review and approve your account in Cognito. This typically takes 1–2 business days.",
+      "step3Title": "Access Granted",
+      "step3Body": "Once approved, you'll receive a notification and can sign in with your credentials.",
+      "noteTitle": "About Authentication",
+      "noteBody": "AgentEchelon authenticates with Amazon Cognito. You can use a Cognito user directory directly, or federate to any standards-based identity provider (SAML, OIDC) for single sign-on with your corporate authentication system — both are production-ready options.",
+      "learnMoreLink": "Learn more about enterprise identity integration →"
+    },
+    "verify": {
+      "title": "Verify Your Email",
+      "sentTo": "We've sent a verification code to",
+      "codeLabel": "Verification Code",
+      "codePlaceholder": "Enter 6-digit code",
+      "errorRequired": "Please enter the verification code",
+      "errorFallback": "Failed to verify email",
+      "verifying": "Verifying…",
+      "verifyButton": "Verify Email",
+      "backButton": "Back to Login",
+      "resendButton": "Resend code",
+      "resent": "A new code is on its way. Check your inbox.",
+      "resendError": "Could not resend the code. Please try again.",
+      "helpText": "Didn't receive the code? Check your spam folder."
+    },
+    "mfa": {
+      "subtitle": "Enter your authentication code to finish signing in",
+      "totpPrompt": "Open your authenticator app and enter the current 6-digit code.",
+      "smsPrompt": "Enter the code we texted to your phone.",
+      "codeLabel": "Authentication code",
+      "codeRequired": "Please enter your authentication code.",
+      "verify": "Verify & sign in",
+      "verifying": "Verifying…",
+      "error": "Could not verify the code. Please try again."
+    },
+    "forgot": {
+      "title": "Reset your password",
+      "subtitleRequest": "Enter your email and we'll send a reset code",
+      "subtitleConfirm": "Enter the code we emailed and choose a new password",
+      "linkPrompt": "Forgot your password?",
+      "emailRequired": "Please enter your email.",
+      "requestError": "Could not start the reset. Please try again.",
+      "sendCode": "Send reset code",
+      "sending": "Sending…",
+      "codeSentTo": "We sent a reset code to",
+      "codeLabel": "Reset code",
+      "newPasswordLabel": "New password",
+      "confirmPasswordLabel": "Confirm new password",
+      "passwordTooShort": "Password must be at least 8 characters.",
+      "passwordMismatch": "Passwords do not match.",
+      "resetPassword": "Reset password & sign in",
+      "resetting": "Resetting…",
+      "confirmError": "Could not reset the password. Please try again.",
+      "backToLogin": "Back to sign in"
+    }
+  },
+  "conversation": {
+    "shareTitle": "Share conversation",
+    "renameTitle": "Rename conversation",
+    "archiveTitle": "Archive conversation",
+    "archiveConfirm": "Archive this conversation? It becomes read-only for everyone and leaves the active list (you can still find it under \"Show archived\"). Members keep read-only access until it is permanently deleted 90 days after its last activity; administrators keep an archived copy. This cannot be undone.",
+    "archiveConfirmButton": "Archive",
+    "archiveError": "Could not archive the conversation: {{error}}",
+    "archivedBadge": "Archived",
+    "readOnlyNotice": "This conversation is archived and read-only.",
+    "newMessages": "New messages",
+    "newConversation": "New conversation",
+    "emptyMessages": "No messages yet. Start the conversation below.",
+    "placeholder": "Type your message…",
+    "placeholderMultiUser": "Mention @assistant or @all to engage me",
+    "scrollToBottom": "Scroll to bottom",
+    "attachFile": "Attach file",
+    "replyingTo": "Replying to",
+    "clearStickyTarget": "Clear reply target",
+    "battleWaitingOne": "An assistant is waiting for your reply",
+    "battleWaitingMany": "{{count}} assistants are waiting — choose who to reply to"
+  },
+  "conversationList": {
+    "heading": "Conversations",
+    "newButton": "+ New",
+    "loading": "Loading conversations…",
+    "emptyTitle": "No conversations yet",
+    "emptyHint": "Click \"New\" to start",
+    "unreadLabel": "Unread messages",
+    "showArchived": "Show archived ({{count}})",
+    "hideArchived": "Hide archived ({{count}})",
+    "date": {
+      "today": "Today",
+      "yesterday": "Yesterday",
+      "daysAgo_one": "{{count}} day ago",
+      "daysAgo_other": "{{count}} days ago"
+    }
+  },
+  "mentionBanner": {
+    "title": "Multi-user conversation",
+    "body": "Mention <0>@assistant</0> or <1>@all</1> to engage me. Direct chat between members won't trigger a response.",
+    "dismiss": "Dismiss"
+  },
+  "membersPanel": {
+    "title": "Members",
+    "toggleOpen": "Show channel members",
+    "toggleClose": "Hide channel members",
+    "memberCount_one": "{{count}} member",
+    "memberCount_other": "{{count}} members",
+    "empty": "No other members in this conversation.",
+    "youSuffix": "(You)",
+    "role": {
+      "moderator": "Moderator",
+      "bot": "Assistant",
+      "member": "Member"
+    },
+    "remove": {
+      "button": "Remove",
+      "confirm": "Remove {{name}} from this conversation?",
+      "success": "{{name}} was removed.",
+      "error": "Failed to remove {{name}}: {{error}}",
+      "moderatorOnly": "Only the channel creator can remove members."
+    },
+    "loading": "Loading members…"
+  },
+  "newConversation": {
+    "title": "New Conversation",
+    "subtitle": "Choose a classification level and optionally name your conversation",
+    "close": "Close",
+    "classificationLabel": "Classification",
+    "classificationHint": "Determines agent capabilities and who can join",
+    "defaultTitle": "New conversation",
+    "titleFieldLabel": "Title",
+    "titleFieldHint": "Optional — leave blank to auto-name from your first message",
+    "titleFieldPlaceholder": "What's this conversation about?",
+    "hideDetails": "Hide details",
+    "viewDetails": "View access details",
+    "contextAccessLabel": "Context access",
+    "agentToolsLabel": "Agent tools",
+    "securityBarSuffix": "classification",
+    "cancelButton": "Cancel",
+    "creating": "Creating…",
+    "createButton": "Create Conversation",
+    "errorFallback": "Failed to create conversation",
+    "class": {
+      "open": {
+        "label": "Open",
+        "description": "Public information only. Anyone can join.",
+        "membership": "Any authenticated user"
+      },
+      "basic": {
+        "label": "Basic",
+        "description": "Public context with basic Q&A capabilities.",
+        "membership": "Basic tier and above"
+      },
+      "standard": {
+        "label": "Standard",
+        "description": "Internal operations data. Conversation management tools.",
+        "membership": "Standard tier and above only"
+      },
+      "premium": {
+        "label": "Premium",
+        "description": "Full access including financials, customers, and strategic data.",
+        "membership": "Premium tier only"
+      }
+    }
+  },
+  "share": {
+    "title": "Share Conversation",
+    "emailLabel": "Recipient Email",
+    "emailPlaceholder": "colleague@example.com",
+    "emailHelper": "The recipient must have an account. They will receive an email with a link to this conversation.",
+    "invalidEmail": "Please enter a valid email address",
+    "sharing": "Sharing…",
+    "shareButton": "Share",
+    "closeButton": "Close",
+    "successPlain": "Conversation shared with {{name}}.",
+    "successMultiUser": "{{name}} added. This is now a multi-user conversation — mention @assistant or @all to engage the bot.",
+    "emailWarningWithReason": "Added to the channel, but the email invite could not be sent: {{reason}}",
+    "emailWarningNoReason": "Added to the channel, but the email invite could not be sent.",
+    "failureFallback": "Failed to share conversation"
+  },
+  "attachment": {
+    "uploading": "Uploading…",
+    "removeFile": "Remove file"
+  },
+  "notifications": {
+    "newMessageTitle": "New message",
+    "botReplied": "Assistant replied",
+    "memberMessage": "New message from a member"
+  },
+  "admin": {
+    "header": {
+      "title": "Admin Console",
+      "back": "← Back",
+      "backAria": "Return to conversations",
+      "auroraBadge": "Aurora",
+      "last7Days": "Last 7 days",
+      "last30Days": "Last 30 days",
+      "last90Days": "Last 90 days"
+    },
+    "tabs": {
+      "overview": "Overview",
+      "models": "Models",
+      "strategy": "Model Strategy",
+      "steps": "Execution Steps",
+      "experiments": "Experiments",
+      "conversations": "Conversations",
+      "evaluations": "Evaluations",
+      "latency": "Latency",
+      "users": "Users",
+      "manageUsers": "Manage Users",
+      "flows": "Flows",
+      "flagged": "Flagged",
+      "groundTruth": "Ground Truth",
+      "tasks": "Tasks",
+      "security": "Membership Audit"
+    },
+    "tablistAria": "Admin console sections",
+    "banners": {
+      "apiUnavailableTitle": "Analytics API unavailable.",
+      "apiUnavailableBody": "Check that VITE_ANALYTICS_API_URL is configured in your .env file and the Analytics stack is deployed.",
+      "noDataTitle": "No analytics data yet.",
+      "noDataBody": "Data appears after messages flow through the archival pipeline (Kinesis → Firehose → S3). This typically takes 5 minutes after the first conversation.",
+      "auroraUpgrade": "Deploy with ",
+      "unsupportedTitle": "This view isn't served by the current analytics mode.",
+      "unsupportedBody": "Redeploy with "
+    }
+  }
+}

@@ -1,0 +1,29 @@
+.task-status-indicator {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.task-status-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-full);
+  background: var(--accent-400);
+  flex-shrink: 0;
+}
+
+.task-status-dot--pulsing {
+  animation: task-pulse 2s ease-in-out infinite;
+}
+
+@keyframes task-pulse {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.4; }
+}
+
+.task-status-label {
+  font-size: var(--text-base);
+  font-style: italic;
+  color: var(--text-secondary);
+}

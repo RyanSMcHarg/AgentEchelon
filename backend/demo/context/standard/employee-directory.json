@@ -1,0 +1,48 @@
+{
+  "lastUpdated": "2026-06-15",
+  "departments": [
+    {
+      "name": "Executive",
+      "members": [
+        { "name": "Sarah Chen", "title": "CEO & Co-founder", "email": "sarah.chen@stratum.example.com", "location": "Austin, TX", "notes": "Ex-AWS, founded Stratum in 2019" },
+        { "name": "Marcus Rivera", "title": "CTO & Co-founder", "email": "marcus.rivera@stratum.example.com", "location": "Austin, TX", "notes": "Ex-Stripe, leads technical strategy" }
+      ]
+    },
+    {
+      "name": "Engineering",
+      "headcount": 95,
+      "members": [
+        { "name": "Priya Patel", "title": "VP Engineering", "email": "priya.patel@stratum.example.com", "location": "Austin, TX", "reports": "Marcus Rivera", "directReports": 8 },
+        { "name": "David Kim", "title": "Principal Engineer", "email": "david.kim@stratum.example.com", "location": "Seattle, WA (remote)", "team": "Platform Core" },
+        { "name": "Emma Torres", "title": "Engineering Manager", "email": "emma.torres@stratum.example.com", "location": "Austin, TX", "team": "Connectors" },
+        { "name": "Raj Mehta", "title": "Senior Engineer", "email": "raj.mehta@stratum.example.com", "location": "Austin, TX", "team": "StratumAnalytics" }
+      ]
+    },
+    {
+      "name": "Product",
+      "headcount": 18,
+      "members": [
+        { "name": "Lin Wei", "title": "Head of Product", "email": "lin.wei@stratum.example.com", "location": "San Francisco, CA", "reports": "Sarah Chen" },
+        { "name": "Jordan Hayes", "title": "Senior PM — StratumFlow", "email": "jordan.hayes@stratum.example.com", "location": "Austin, TX" },
+        { "name": "Aisha Obi", "title": "PM — StratumConnect", "email": "aisha.obi@stratum.example.com", "location": "Remote (NYC)" }
+      ]
+    },
+    {
+      "name": "Sales",
+      "headcount": 42,
+      "members": [
+        { "name": "James Okafor", "title": "VP Sales", "email": "james.okafor@stratum.example.com", "location": "Austin, TX", "reports": "Sarah Chen" },
+        { "name": "Maria Santos", "title": "Director, Enterprise Sales", "email": "maria.santos@stratum.example.com", "location": "Austin, TX" },
+        { "name": "Chris Thompson", "title": "Director, Mid-Market", "email": "chris.thompson@stratum.example.com", "location": "Chicago, IL" }
+      ]
+    },
+    {
+      "name": "Customer Success",
+      "headcount": 28,
+      "members": [
+        { "name": "Alex Kim", "title": "Director of Support", "email": "alex.kim@stratum.example.com", "location": "Austin, TX", "reports": "Sarah Chen" },
+        { "name": "Nicole Park", "title": "Support Team Lead", "email": "nicole.park@stratum.example.com", "location": "Austin, TX" }
+      ]
+    }
+  ]
+}

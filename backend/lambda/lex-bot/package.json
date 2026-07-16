@@ -1,0 +1,14 @@
+{
+  "name": "lex-bot-creation",
+  "version": "1.0.0",
+  "description": "Lambda functions for creating and managing Lex bot",
+  "dependencies": {
+    "@aws-sdk/client-lex-models-v2": "^3.600.0",
+    "@aws-sdk/client-chime-sdk-identity": "^3.600.0",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/aws-lambda": "^8.10.119",
+    "@types/uuid": "^9.0.2"
+  }
+}

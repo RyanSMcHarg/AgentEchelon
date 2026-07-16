@@ -1,0 +1,23 @@
+{
+  "confidentiality": "INTERNAL — Premium tier only",
+  "topAccountsByARR": [
+    { "name": "Meridian Corp", "arr": "$180K", "plan": "enterprise", "industry": "Financial Services", "users": 120, "status": "active", "csm": "Maria Santos", "renewalDate": "2027-06-01" },
+    { "name": "Apex Manufacturing", "arr": "$165K", "plan": "enterprise", "industry": "Manufacturing", "users": 95, "status": "active", "csm": "Maria Santos", "renewalDate": "2027-03-15" },
+    { "name": "Coastal Health Systems", "arr": "$155K", "plan": "enterprise", "industry": "Healthcare", "users": 200, "status": "active", "csm": "Maria Santos", "renewalDate": "2026-12-01", "notes": "Renewal at risk — competitor evaluation in progress" },
+    { "name": "Summit Logistics", "arr": "$142K", "plan": "enterprise", "industry": "Logistics", "users": 80, "status": "active", "csm": "Chris Thompson", "renewalDate": "2027-01-15" },
+    { "name": "BluePeak Digital", "arr": "$138K", "plan": "enterprise", "industry": "Digital Agency", "users": 65, "status": "active", "csm": "Chris Thompson", "renewalDate": "2027-04-01" },
+    { "name": "NovaTech Solutions", "arr": "$125K", "plan": "enterprise", "industry": "Technology", "users": 110, "status": "active", "csm": "Maria Santos", "renewalDate": "2027-02-28" },
+    { "name": "Greenfield Energy", "arr": "$120K", "plan": "enterprise", "industry": "Energy", "users": 75, "status": "active", "csm": "Chris Thompson", "renewalDate": "2026-11-15" },
+    { "name": "Urban Retail Group", "arr": "$98K", "plan": "enterprise", "industry": "Retail", "users": 55, "status": "active", "csm": "Chris Thompson", "renewalDate": "2027-05-01" },
+    { "name": "Precision Analytics", "arr": "$89K", "plan": "professional", "industry": "Data Analytics", "users": 40, "status": "active", "csm": "Nicole Park", "renewalDate": "2026-10-15" },
+    { "name": "Catalyst Education", "arr": "$78K", "plan": "professional", "industry": "EdTech", "users": 35, "status": "active", "csm": "Nicole Park", "renewalDate": "2027-01-01" }
+  ],
+  "expansionPipeline": [
+    { "account": "Meridian Corp", "opportunity": "StratumAnalytics add-on", "value": "$45K ARR", "stage": "Negotiation", "closeDate": "2026-08-15" },
+    { "account": "Apex Manufacturing", "opportunity": "Additional 50 seats", "value": "$85K ARR", "stage": "Proposal", "closeDate": "2026-09-01" },
+    { "account": "Summit Logistics", "opportunity": "StratumConnect API gateway", "value": "$30K ARR", "stage": "Discovery", "closeDate": "2026-10-01" }
+  ],
+  "churnRisk": [
+    { "account": "Coastal Health Systems", "arr": "$155K", "risk": "high", "reason": "Evaluating Zapier Enterprise + custom solution", "mitigationOwner": "James Okafor", "nextAction": "Executive sponsor meeting scheduled for July 15" }
+  ]
+}

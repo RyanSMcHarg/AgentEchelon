@@ -1,0 +1,35 @@
+.deployment-paused-banner {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  z-index: 1000;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 0.5rem;
+  padding: 0.5rem 1rem;
+  font-size: 0.875rem;
+  line-height: 1.3;
+  text-align: center;
+  color: #7a3e00;
+  background: #ffedd5;
+  border-bottom: 1px solid #fdba74;
+}
+
+.deployment-paused-dot {
+  display: inline-block;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: 50%;
+  background: #f59e0b;
+  flex: 0 0 auto;
+}
+
+@media (prefers-color-scheme: dark) {
+  .deployment-paused-banner {
+    color: #fed7aa;
+    background: #431407;
+    border-bottom-color: #9a3412;
+  }
+}
