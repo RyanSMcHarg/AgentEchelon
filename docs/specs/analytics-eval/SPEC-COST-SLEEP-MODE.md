@@ -10,13 +10,13 @@ The idle cost of an Aurora-mode deployment is concentrated in a few always-on re
 
 Idle cost drivers, from how this stack actually bills when no one is using it:
 - **Aurora Serverless v2** - bills its minimum ACU continuously. The dominant idle cost.
-- **RDS Proxy** - always-on hourly charge.
+- **RDS Proxy** (only when enabled - `enableRdsProxy`, off by default) - an always-on hourly charge. The default Aurora deployment has no proxy (Lambdas connect direct to the writer endpoint with IAM auth), so this line is zero unless you opted in.
 - **VPC interface endpoints** (Kinesis, Secrets Manager, Bedrock) - ~$7/mo each, always-on.
 - Kinesis/Firehose - small idle cost.
 - Lambda - idle is free (reserved concurrency costs nothing when uninvoked), so pausing Lambda saves nothing and is NOT part of sleep.
 - Athena mode - near-zero idle cost, so sleep mode is inert there.
 
-The primary, safe lever is **pausing Aurora Serverless v2 to 0 ACU**. RDS Proxy and the VPC endpoints are left in place (tearing them down is a stack change, not a runtime toggle); their residual idle cost is documented, not shed here. This keeps sleep/wake a fast, reversible runtime action with no CloudFormation churn.
+The primary, safe lever is **pausing Aurora Serverless v2 to 0 ACU**. The VPC endpoints (and the optional RDS Proxy, if `enableRdsProxy` was set) are left in place (tearing them down is a stack change, not a runtime toggle); their residual idle cost is documented, not shed here. This keeps sleep/wake a fast, reversible runtime action with no CloudFormation churn.
 
 ## What "sleep" does
 
@@ -71,7 +71,7 @@ The async processors get the state table name via env and update `lastActivityAt
 
 ## Safety / non-goals
 
-- Never touches RDS Proxy or VPC endpoints (no CloudFormation churn at runtime).
+- Never touches the VPC endpoints or the optional RDS Proxy (no CloudFormation churn at runtime).
 - Never zeroes Lambda concurrency (idle Lambda is free).
 - Wake is idempotent; sleeping an already-asleep (or Athena) deployment is a no-op that logs and returns 200.
 - If the modify-cluster call fails, state is NOT flipped (no false "asleep" while the DB is still billing) and the failure is published to SNS.

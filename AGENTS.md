@@ -42,7 +42,7 @@ cd backend && npm test                          # Jest tests (the gate)
 cd backend && npm run build                      # tsc, deployable build typecheck (test/ excluded)
 cd backend && npm run typecheck                  # tsc -p tsconfig.test.json, typecheck the test tree (Bundler res.)
 
-# Backend, Aurora mode (same stack count; swaps Analytics to AnalyticsAurora, adds VPC + Aurora + RDS Proxy)
+# Backend, Aurora mode (same stack count; swaps Analytics to AnalyticsAurora, adds VPC + Aurora; RDS Proxy is opt-in via -c enableRdsProxy=true)
 cd backend && npx cdk deploy --all --context analyticsMode=aurora
 
 # E2E Tests (requires frontend running + deployed backend)
@@ -64,7 +64,7 @@ Before making changes, verify:
 1. AWS credentials configured (`aws sts get-caller-identity`)
 2. Bedrock model access enabled (Opus, Sonnet, Haiku, Titan in us-east-1)
 3. `frontend/.env` populated with CDK stack outputs (use `.env.example` as template)
-4. If Aurora mode: RDS Proxy is healthy, schema migrations have run
+4. If Aurora mode: schema migrations have run (and, only if `-c enableRdsProxy=true`, RDS Proxy is healthy; the default path is direct writer-endpoint IAM auth)
 
 ## Architecture
 
@@ -107,7 +107,7 @@ The backend is composed of independently-deployable feature stacks rather than o
 - `AgentEchelonAnalytics`, Kinesis to Firehose to S3 to Glue to Athena pipeline + client-events `/events` API
 
 **Aurora mode (opt-in via `--context analyticsMode=aurora`):**
-- `AgentEchelonAnalyticsAurora`, VPC (created by default, or import an existing one with `-c analyticsVpcId=`), Aurora Serverless v2, RDS Proxy, Kinesis archival, evaluation runner, analytics API. Live drift detection runs in the per-tier message path (conversation-level, all-tier, on by default; the embedding path is Aurora-mode only).
+- `AgentEchelonAnalyticsAurora`, VPC (created by default, or import an existing one with `-c analyticsVpcId=`), Aurora Serverless v2, optional RDS Proxy (opt-in via `enableRdsProxy`; default is direct writer-endpoint IAM auth), Kinesis archival, evaluation runner, analytics API. Live drift detection is opt-in (`-c enableLiveDrift=true`, default off, Aurora-mode only); it runs conversation-level in the per-tier message path.
 
 ### Key Directories
 
@@ -223,7 +223,7 @@ aws cloudformation list-stacks --query 'StackSummaries[?starts_with(StackName, `
 # Check Bedrock model access
 aws bedrock list-foundation-models --query 'modelSummaries[?starts_with(modelId, `anthropic`)].modelId' --output table
 
-# Aurora mode only: verify RDS Proxy health
+# Aurora mode with -c enableRdsProxy=true only: verify RDS Proxy health (default deploy has no proxy)
 aws rds describe-db-proxies --query 'DBProxies[?starts_with(DBProxyName, `agent-echelon`)].{Name:DBProxyName,Status:Status,Endpoint:Endpoint}'
 ```
 

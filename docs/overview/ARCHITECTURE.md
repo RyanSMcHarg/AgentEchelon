@@ -107,7 +107,7 @@ ChimeMessaging                    (foundation — no dependencies)
      ├──► S3Storage               (attachments bucket)
      │
      ├──► Analytics               (Athena mode: Kinesis stream)
-     │    OR AnalyticsAurora      (Aurora mode: VPC + Aurora + Kinesis + RDS Proxy)
+     │    OR AnalyticsAurora      (Aurora mode: VPC + Aurora + Kinesis; RDS Proxy opt-in)
      │
      ├──► Foundations             (task tables + create-conversation/add-agent; depends on Analytics + CognitoAuth)
      │
@@ -602,7 +602,7 @@ reuses the existing Bedrock and Secrets endpoints, adding no new VPC endpoints (
 
 **Key files:**
 - `backend/lib/stacks/analytics-stack.ts` - Athena mode (Kinesis → Firehose → S3 → Glue → Athena)
-- `backend/lib/stacks/analytics-stack-aurora.ts` - Aurora mode (VPC + Aurora + RDS Proxy)
+- `backend/lib/stacks/analytics-stack-aurora.ts` - Aurora mode (VPC + Aurora; RDS Proxy opt-in via `enableRdsProxy`, default off)
 - `backend/lambda/src/analytics-aurora/kinesis-archival.ts` - Kinesis → Aurora consumer
 - `backend/lambda/src/analytics-aurora/analytics-query.ts` - Dashboard query API
 - `backend/lambda/src/analytics-aurora/drift-detection.ts` - Topic drift detection
@@ -756,7 +756,7 @@ This section summarizes security controls.
 **Data in transit:**
 - All AWS SDK calls use HTTPS
 - Aurora connections use SSL with certificate validation (`rejectUnauthorized: true`)
-- RDS Proxy connections use IAM authentication tokens
+- The default Aurora connection is direct to the writer endpoint with IAM authentication tokens; the optional RDS Proxy (opt-in) uses the same IAM auth
 
 ---
 

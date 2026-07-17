@@ -690,7 +690,7 @@ echo "Report:  npx playwright show-report"
 
 - **Frontend**: React 19, Vite, TypeScript
 - **Backend**: AWS CDK (TypeScript), Lambda (Node.js 20)
-- **AI**: Amazon Bedrock - model-agnostic, configurable per tier and per intent (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS); image generation additionally supports external HTTP providers
+- **AI**: Provider-open, not Bedrock-locked - model-agnostic and configurable per tier and per intent. The assistant runs on Bedrock model families (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS); the provider layer also supports **external HTTP APIs**, proven today by the image-generation path (Stability on Bedrock plus external providers), so adding a non-AWS model provider is an architecture the platform already demonstrates
 - **Messaging**: Amazon Chime SDK Messaging (WebSocket)
 - **Auth**: Amazon Cognito (SAML/OIDC) with automatic token refresh
 - **Storage**: Amazon S3 (presigned URLs)

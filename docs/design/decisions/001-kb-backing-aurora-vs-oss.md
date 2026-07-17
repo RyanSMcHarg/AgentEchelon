@@ -25,7 +25,7 @@ AE has Aurora as opt-in (`--context analyticsMode=aurora`), with a dormant pgvec
 - Schema evolution is in our hands
 
 **Cons:**
-- Requires VPC + RDS Proxy (Aurora-mode prerequisites)
+- Requires VPC + Aurora (Aurora-mode prerequisites; RDS Proxy is optional)
 - Bedrock KB → Aurora integration requires specific PG extension setup; conflicts possible with custom pgvector schemas
 - Forces AE deployments to opt into Aurora mode (changes the default-on/off question)
 - Connection scaling under heavy retrieval load is a Lambda-with-RDS-Proxy concern
@@ -45,7 +45,7 @@ AE has Aurora as opt-in (`--context analyticsMode=aurora`), with a dormant pgvec
 
 ## Recommendation
 
-**Aurora pgvector.** AE Aurora-mode users have already accepted the VPC + RDS Proxy footprint. OpenSearch Serverless's $175/month baseline is a real disincentive for OSS evaluators and adds an ops surface we don't otherwise need. Pgvector's HNSW + cosine-distance retrieval is more than sufficient for the corpus sizes we're targeting (low-thousands of documents, not millions).
+**Aurora pgvector.** AE Aurora-mode users have already accepted the VPC + Aurora footprint. OpenSearch Serverless's $175/month baseline is a real disincentive for OSS evaluators and adds an ops surface we don't otherwise need. Pgvector's HNSW + cosine-distance retrieval is more than sufficient for the corpus sizes we're targeting (low-thousands of documents, not millions).
 
 ## Decision
 

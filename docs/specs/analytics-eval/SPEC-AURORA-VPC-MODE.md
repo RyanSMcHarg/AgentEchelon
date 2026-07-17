@@ -18,7 +18,7 @@ It has real limits for advanced conversational AI workloads:
 4. **Real-time updates.** Conversation summaries that update incrementally as the agent responds need UPSERT semantics, which Athena does not provide.
 5. **Materialized views.** Pre-computed daily metrics for dashboards are a PostgreSQL feature, not an Athena one.
 
-A reference production deployment runs the advanced workload on Aurora PostgreSQL Serverless v2 in a private VPC with RDS Proxy, VPC endpoints, and pgvector. This configuration supports two-pass evaluation, intent flow scoring, drift detection, adversarial-aware classification, and a real-time admin dashboard. It's the architecture teams should reach for when the base Athena mode is no longer enough.
+A reference production deployment runs the advanced workload on Aurora PostgreSQL Serverless v2 in a private VPC with VPC endpoints and pgvector (RDS Proxy is opt-in, `enableRdsProxy`, off by default; the default path is direct writer-endpoint IAM auth). This configuration supports two-pass evaluation, intent flow scoring, drift detection, adversarial-aware classification, and a real-time admin dashboard. It's the architecture teams should reach for when the base Athena mode is no longer enough.
 
 Consumers of `AgentEchelon` should be able to opt into the Aurora mode at deploy time with a single CDK flag, without replacing the rest of the library.
 
@@ -84,7 +84,7 @@ Chime SDK → Kinesis Data Stream → ArchivalLambda (VPC) → Aurora PostgreSQL
 - Private VPC with 2 AZs, PRIVATE_ISOLATED subnets only (no NAT)
 - 4 VPC endpoints: Kinesis (interface), S3 (gateway), Secrets Manager (interface), Bedrock (interface)
 - Aurora Serverless v2, min 0.5 ACU, max 4 ACU, engine PostgreSQL 15.10
-- RDS Proxy with IAM authentication (primary) and Secrets Manager (admin fallback)
+- Direct writer-endpoint IAM authentication (default); the optional RDS Proxy (opt-in) adds connection pooling with the same IAM auth. Secrets Manager is the admin fallback
 - pgvector + uuid-ossp extensions
 - Schema auto-initialized on first deploy via custom resource Lambda
 - ~$50-95/month baseline cost (Aurora Serverless v2 0.5 ACU + Lambda; the 3 interface VPC endpoints add ~$44 on a stack-created VPC or $0 on an imported one; Kinesis is shared with Athena mode; RDS Proxy is optional and off by default; full model in [`INFRASTRUCTURE-COST.md`](../../guides/admin/INFRASTRUCTURE-COST.md))
