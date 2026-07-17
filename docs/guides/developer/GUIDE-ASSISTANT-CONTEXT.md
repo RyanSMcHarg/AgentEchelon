@@ -147,8 +147,8 @@ a short, context-gathering intake before the assistant proper. Choose the patter
   its schema from a per-tier SSM parameter, wired by the tier stack:
 
   ```
-  /agent-echelon/tier/standard/onboarding-intake
-  /agent-echelon/tier/premium/onboarding-intake
+  /agent-echelon/assistant/standard/onboarding-intake
+  /agent-echelon/assistant/premium/onboarding-intake
   ```
 
   (`/agent-echelon` is `SSM_ROOT`; it changes with the instance prefix.) The parameter is not created by the
@@ -156,7 +156,7 @@ a short, context-gathering intake before the assistant proper. Choose the patter
   redeploy (it takes effect on the router's next cold start):
 
   ```bash
-  aws ssm put-parameter --name /agent-echelon/tier/standard/onboarding-intake \
+  aws ssm put-parameter --name /agent-echelon/assistant/standard/onboarding-intake \
     --type String --overwrite --value "$(cat intake.json)"
   ```
 

@@ -204,7 +204,7 @@ The allowlist mirrors the onboarding-intake config plumbing
 |---|---|---|
 | Inline env | `ONBOARDING_INTAKE` | `ADD_USER_ALLOWLIST` |
 | SSM param name env | `ONBOARDING_INTAKE_PARAM` | `ADD_USER_ALLOWLIST_PARAM` |
-| SSM key | `/agent-echelon/tier/{tier}/onboarding-intake` | `/agent-echelon/tier/{tier}/add-user-allowlist` |
+| SSM key | `/agent-echelon/assistant/{tier}/onboarding-intake` | `/agent-echelon/tier/{tier}/add-user-allowlist` |
 | Loader | `loadIntakeConfig(ssmGet)` (cached warm, null when absent/malformed) | `loadAddUserAllowlist(ssmGet)` (same contract) |
 | Default | absent ⇒ onboarding OFF | absent ⇒ escalation OFF |
 
@@ -348,7 +348,7 @@ uses. The role mirrors `FederatedShareMemberRole` in `foundations-stack.ts`:
   adds. No `CreateChannel`: escalation adds into an EXISTING channel, it never
   creates one.
 - **SSM (`ssm:GetParameter`):** the per-tier bot ARN
-  (`/agent-echelon/tier/*/bot-arn`, the membership bearer) and the allowlist
+  (`/agent-echelon/assistant/*/bot-arn`, the membership bearer) and the allowlist
   param (`/agent-echelon/tier/{tier}/add-user-allowlist`).
 - **Cognito (`cognito-idp:AdminListGroupsForUser`, `AdminGetUser`):** resolve the
   added human's authoritative tier for the eligibility check, and the requester's

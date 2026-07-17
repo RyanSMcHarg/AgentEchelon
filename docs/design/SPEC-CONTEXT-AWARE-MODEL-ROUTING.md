@@ -1,9 +1,10 @@
 # SPEC: Context-aware model routing (RoutingContext + provider adapter)
 
-**Status:** Partial (`RoutingContext` runs on the standard tier; the provider-adapter seam is design)
+**Status:** Partial (`RoutingContext` runs on the standard profile; the provider-adapter seam is design)
 
-> `RoutingContext` + `resolveModelPlan` live in `lib/resolve-model-plan.ts` and run on the
-> **standard tier** in `standard-async-processor.ts`. The provider-adapter seam extends them to
+> `RoutingContext` + `resolveModelPlan` live in `lib/resolve-model-plan.ts` and run in the shared
+> `assistant-async-processor.ts`, gated on the standard profile's `contextRouting` topology flag
+> (the profile's stack sets `ENABLE_CONTEXT_ROUTING` + the DeepSeek env only for that profile). The provider-adapter seam extends them to
 > non-Bedrock providers, and the generic signal consumers (data-sensitivity, cost-ceiling, ...)
 > are later consumers of the same seam. The first routing consumer is a domain-specific deployment
 > routing by **geographic segment**, but the capability is generic and belongs to the platform.

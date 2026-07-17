@@ -132,7 +132,7 @@ That list is the helper's full capability. Each principal is granted only the su
 | Principal | Tag-gated actions actually granted | Source |
 | --- | --- | --- |
 | **Browser user** (exchange rung: `basic` / `standard` / `premium`) | `SendChannelMessage`, `GetChannelMessage`, `ListChannelMessages`, `DescribeChannel`, `ListChannelMemberships`, `UpdateChannelReadMarker`. No `Update`, `Redact`, or `Delete`. | `EXCHANGE_MSG_ACTIONS`, `cognito-auth-stack.ts:390` |
-| **Per-tier assistant** (processor role) | `SendChannelMessage`, `ListChannelMessages`, `GetChannelMessage`, `UpdateChannelMessage`, `DescribeChannel`, `UpdateChannel`. No `Redact` or `Delete`. | `{tier}-tier-stack.ts` (e.g. `premium-tier-stack.ts:122`) |
+| **Per-profile assistant** (processor role) | `SendChannelMessage`, `ListChannelMessages`, `GetChannelMessage`, `UpdateChannelMessage`, `DescribeChannel`, `UpdateChannel`. No `Redact` or `Delete`. | `assistant-profile-stack.ts` (`ProcessorRole` `ChimePolicy`) |
 | **Admin / guest rungs** | none tag-gated (the admin and `restricted` rungs are deliberately not tag-conditioned; see Category 4 and the guest example) | `cognito-auth-stack.ts:416-428` |
 
 **Deliberately not tag-gated, and why.** Actions that authorize against the **bearer** resource (`<appInstance>/user/<id>` or `<appInstance>/bot/<id>`) carry no classification tag, so adding a tag condition to them would fail closed and break them. These are membership management (`CreateChannelMembership`, `DeleteChannelMembership`), `DescribeChannelMembership`, and the profile and discovery actions. They are governed instead by Amazon Chime SDK's membership and moderator model plus the app-layer share and create gates. `ListChannelMemberships` is the exception that stays tag-gated because it is channel-scoped, not bearer-scoped (`agent-tier-common.ts:38-41`).
@@ -194,19 +194,19 @@ Beyond channels, an assistant is bounded in *which model* it may invoke and *wha
 
 **Attempt.** The basic tier's async processor tries to call `bedrock:InvokeModel` on a higher-tier model (for example an Opus-class model reserved for premium).
 
-**Acting role.** The basic tier's `ProcessorRole` (`{tier}-tier-stack.ts`, e.g. `premium-tier-stack.ts:113`).
+**Acting role.** The basic profile's `ProcessorRole` (`assistant-profile-stack.ts`, driven by the basic `ProfileTopology`).
 
-**Deciding policy** (`BedrockPolicy`, `premium-tier-stack.ts:131`; `basic` stack is the same shape with `tier='basic'`):
+**Deciding policy** (`BedrockPolicy` in `assistant-profile-stack.ts`; basic omits the streaming action because its topology sets `streaming: false`, while premium adds `InvokeModelWithResponseStream`):
 
 ```json
 {
   "Effect": "Allow",
-  "Action": ["bedrock:InvokeModel", "bedrock:InvokeModelWithResponseStream"],
+  "Action": ["bedrock:InvokeModel"],
   "Resource": "<modelArnsForTier('basic')>"
 }
 ```
 
-**Result: denied.** `modelArnsForTier('basic')` (`premium-tier-stack.ts:93`) resolves only the basic tier's model ARNs. A premium model ARN is not in the list, so `InvokeModel` on it is denied.
+**Result: denied.** `modelArnsForTier('basic')` (`agent-tier-common.ts`, called from `assistant-profile-stack.ts`) resolves only the basic profile's model ARNs. A premium model ARN is not in the list, so `InvokeModel` on it is denied.
 
 **User experience.** A basic user only ever receives answers from the basic model; the model selector in the console is scoped to their tier, so a higher model is not even offered.
 
@@ -220,7 +220,7 @@ Beyond channels, an assistant is bounded in *which model* it may invoke and *wha
 
 **Acting role.** The basic tier's `ProcessorRole`.
 
-**Deciding policy** (`ContextS3Read`, `premium-tier-stack.ts:154`; the **basic** stack grants only the `context/basic/*` prefix):
+**Deciding policy** (`ContextS3Read` in `assistant-profile-stack.ts`; the prefixes come from `classificationsAllowedFor`, so the basic profile grants only the `context/basic/*` prefix):
 
 ```json
 {

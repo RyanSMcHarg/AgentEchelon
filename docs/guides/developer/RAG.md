@@ -68,7 +68,7 @@ embed (about $0.0001 per turn) and one warm Lambda hop. Full per-piece figures a
 | `backend/lambda/src/analytics-aurora/data-plane-handler.ts` | Retrieval/drift data-plane Lambda: dispatches `retrieve`, `detectDrift`, `recordDriftFire`, `recordDriftOutcome` (project decision 018) |
 | `backend/lambda/src/lib/data-plane-client.ts` | Non-VPC client seam: same function signatures, implemented as a synchronous invoke of the data-plane Lambda |
 | `backend/lambda/src/router-agent-handler.ts` | Call site - invokes the data-plane Lambda for retrieval, attaches result to InvokeAsync payload |
-| `backend/lambda/src/premium-async-processor.ts`, `standard-async-processor.ts` | Receivers - fold the retrieved context into the system prompt |
+| `backend/lambda/src/assistant-async-processor.ts` | Receiver - folds the retrieved context into the system prompt (every profile, via the shared processor) |
 | `backend/lib/stacks/analytics-stack-aurora.ts` | CDK wiring (Lambda + IAM + S3 notification) |
 
 ## Prerequisites

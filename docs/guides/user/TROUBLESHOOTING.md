@@ -348,7 +348,7 @@ id/ARN. The catalog carried `inferenceProfileArns`, but the invoke path passed
 **Solution** - `bedrockInvokeId(def)` in
 `backend/lib/config/model-strategy.ts` returns
 `inferenceProfileArns?.[0] ?? bedrockModelId`; used by `model-resolver.ts`,
-`premium-async-processor.ts` (battle variant), `experiment-manager.ts` (A/B).
+`assistant-async-processor.ts` (battle path), `experiment-manager.ts` (A/B).
 
 **Check any model's requirements (your account/region):**
 ```bash
@@ -744,7 +744,7 @@ created (router logs show `FallbackIntent` invocations but zero `WelcomeIntent`)
 AppInstanceBot that is actually a member of the conversation channel** - and
 that bot also needs the resource policy above. `create-conversation` enrolls the
 **per-tier** AppInstanceBot for the conversation's tier (resolved from SSM
-`/agent-echelon/tier/{tier}/bot-arn`); that per-tier bot is the channel's
+`/agent-echelon/assistant/{tier}/bot-arn`); that per-tier bot is the channel's
 creator and its member. There is no shared cross-tier bot fallback, so the
 `WelcomeIntent` must be set on the per-tier bot that owns the channel. Confirm
 which bot is in the channel before chasing config:

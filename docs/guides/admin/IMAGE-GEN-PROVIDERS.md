@@ -79,7 +79,7 @@ The current state of the art for prompt adherence and typography. External-HTTP 
 
 **API surface caveat (verify against current OpenAI docs).** The current shaper passes `response_format: 'b64_json'`. That field is documented for DALL-E 3 but **may not be honored by `gpt-image-1`**, which is OpenAI's post-2024 image model and returns base64 by default. OpenAI's APIs generally tolerate extra fields, but if a future surface change starts returning hosted URLs instead of inline base64, the parser will currently return empty. The parser would need a URL-handling branch (the FAL parser already does this pattern) - small change, not yet implemented. Watch the first live invocation against `gpt-image-1` and confirm the response shape.
 
-Provision (the image-gen invocations are made from `premium-async-processor` Lambda - defined in `backend/lib/stacks/premium-tier-stack.ts`):
+Provision (the image-gen invocations are made from the shared `assistant-async-processor` Lambda - the premium profile's instance, whose topology is defined in `backend/lib/stacks/premium-tier-stack.ts` and wired by `backend/lib/stacks/assistant-profile-stack.ts`):
 
 1. Create an OpenAI account + API key at <https://platform.openai.com/api-keys>.
 2. Set the spend limit on the OpenAI side (separate from your AWS billing).
@@ -232,7 +232,7 @@ The NAT Gateway line is **not introduced by this project** - it's the cost of ru
 
 ## Agentic integration - where image-gen sits in the architecture
 
-AgentEchelon's fulfillment path is the **per-tier self-hosted Converse tool loop** - see CLAUDE.md > Architecture. Each tier's async processor (`async-processor-core.ts` `generateResponse`) runs a Converse `toolConfig` loop under its own IAM role; there is no Bedrock Agent and no Action Group. Image generation is called directly from `premium-async-processor.ts` during the `/battle` fan-out.
+AgentEchelon's fulfillment path is the **self-hosted Converse tool loop** - see CLAUDE.md > Architecture. The shared `assistant-async-processor.ts` (via `async-processor-core.ts`) runs a Converse `toolConfig` loop under the serving profile's own IAM role; there is no Bedrock Agent and no Action Group. Image generation is called directly from `assistant-async-processor.ts` during the `/battle` fan-out, and only for battle-eligible profiles (premium by default).
 
 **Why call it directly rather than as a tool?** Image generation is slow (5-20s per call). Folding a 15-second image-gen into the synchronous Converse tool loop would: (a) push the text reply's latency well past acceptable bounds, (b) couple the text reply timing to the image timing in a way that prevents the user from seeing the text-side response first.
 
@@ -268,7 +268,7 @@ The registry shape is the contract. To add a provider:
 4. Add a shape branch in `parseImageGenResponse` that extracts base64 PNG strings from the provider's response.
 5. If external-HTTP: add an entry in `EXTERNAL_HTTP_ENDPOINTS` with the URL + auth-header function. (Note: this constant is currently typed `Record<'openai' | 'fal', ...>` - broaden the type union or refactor to `Partial<Record<ImageGenProvider, ...>>` when adding a third external provider.)
 6. Add tests in `image-gen-models-providers.test.ts` for the new shape + parse + (if external) the env-var-missing error.
-7. **If `hosting: 'aws-bedrock'`:** grant `bedrock:InvokeModel` on the model ARN to the invoking Lambda's IAM role. Today the only caller is `premium-async-processor` - find the relevant `iam.PolicyStatement` in `backend/lib/stacks/premium-tier-stack.ts` and add the new ARN to its `resources` array. External-HTTP entries skip this step (IAM doesn't gate the call; the provider's API key does).
+7. **If `hosting: 'aws-bedrock'`:** grant `bedrock:InvokeModel` on the model ARN to the invoking Lambda's IAM role. The caller is the shared `assistant-async-processor` running as a battle-eligible profile (premium by default) - find the image-gen `iam.PolicyStatement` in the `imageGen` block of `backend/lib/stacks/assistant-profile-stack.ts` and add the new ARN to its `resources` array. External-HTTP entries skip this step (IAM doesn't gate the call; the provider's API key does).
 
 That's the surface - no other module changes needed. The exhaustiveness check in `shapeImageGenRequest`'s switch will fail the build if you miss step 3.
 

@@ -142,7 +142,7 @@ Twelve stacks deploy in both modes (ChimeMessaging, CognitoAuth, S3Storage, Foun
 | Experiments                   | `ExperimentsApiUrl`                                                                                                                                     |
 | Notifications                 | `ShareApiUrl`                                                                                                                                           |
 | Battle                        | `BattleOutcomeApiUrl`                                                                                                                                   |
-| Tier-{Basic,Standard,Premium} | SSM: `/agent-echelon/tier/{tier}/{processor-arn,bot-arn}`                                                                                               |
+| Tier-{Basic,Standard,Premium} | SSM: `/agent-echelon/assistant/{tier}/{processor-arn,bot-arn}`                                                                                               |
 | ChannelFlow                   | `ChannelFlowArn`, `ProcessorFunctionArn`                                                                                                                |
 | Analytics / AnalyticsAurora   | `AnalyticsApiUrl`, `ClientEventsApiUrl` (Athena)                                                                                                        |
 

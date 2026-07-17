@@ -70,8 +70,8 @@ A tier stack **publishes** (no CFN exports):
 
 | Parameter | Value |
 |---|---|
-| `/agent-echelon/tier/{tier}/processor-arn` | the tier async-processor Lambda ARN |
-| `/agent-echelon/tier/{tier}/bot-arn` | the tier AppInstanceBot ARN |
+| `/agent-echelon/assistant/{tier}/processor-arn` | the tier async-processor Lambda ARN |
+| `/agent-echelon/assistant/{tier}/bot-arn` | the tier AppInstanceBot ARN |
 
 A tier stack **consumes** (SSM-resolved ARNs / plain props from the composition
 root - never `Fn::importValue`):
@@ -85,8 +85,8 @@ root - never `Fn::importValue`):
 | `/agent-echelon/attachments-bucket` | platform | `CONTEXT_BUCKET` + tier S3 grants |
 
 Consumers of the tier contract: the **shared router** resolves
-`/agent-echelon/tier/{tier}/processor-arn` to dispatch; **`create-conversation`** resolves
-`/agent-echelon/tier/{tier}/bot-arn` to add the right tier bot to a new channel.
+`/agent-echelon/assistant/{tier}/processor-arn` to dispatch; **`create-conversation`** resolves
+`/agent-echelon/assistant/{tier}/bot-arn` to add the right tier bot to a new channel.
 
 ## How a per-tier processor reaches shared resources
 
@@ -97,42 +97,48 @@ string, **not** an `Fn::importValue`, so the SSM-only/decoupled-deploy goal
 holds. Tier isolation is unchanged: the processor's own role grants
 `s3:GetObject` only on its tier's `context/{...}/` prefixes.
 
-## Code layout - tier-as-class
+## Code layout - profile-as-data
 
 ```
 backend/
-├─ bin/backend.ts                          composition root; instantiates each class
+├─ bin/backend.ts                          composition root; instantiates each profile stack
+├─ lib/config/profiles.ts                  the config: classifications + profiles + groupClearance
+├─ lib/profile-registry.ts                 the ONLY interpreter of a classification tag / clearance
 └─ lib/stacks/
    ├─ agent-tier-common.ts                 SHARED: SSM contract keys + thin helpers
    │                                       (resolveSharedSSM, modelArnsForTier,
-   │                                        tierBotArnKey, tierProcessorArnKey,
-   │                                        legacyBotArnParamArn). No class.
-   ├─ basic-tier-stack.ts      class BasicTierStack     ← own file per tier;
-   ├─ standard-tier-stack.ts   class StandardTierStack    each hardcoded for its
-   └─ premium-tier-stack.ts    class PremiumTierStack     tier; team-owned end-to-end.
+   │                                        tierBotArnKey, tierProcessorArnKey). No class.
+   ├─ assistant-profile-stack.ts  class AssistantProfileStack   ← the SHARED body, parametrized
+   │                                                              by a ProfileTopology descriptor.
+   ├─ basic-tier-stack.ts      class BasicTierStack     ← thin wrapper: supplies the profile's
+   ├─ standard-tier-stack.ts   class StandardTierStack     ProfileTopology; team-owned.
+   └─ premium-tier-stack.ts    class PremiumTierStack
 ```
 
-One class per tier, in its own file, with the SSM contract centralised but
-the per-tier IAM/Lambda/Lex/AppInstanceBot wiring inlined per tier. A
-basic-team change touches exactly `basic-tier-stack.ts` (and possibly
-`basic-async-processor.ts`); standard / premium / the platform are untouched.
+One shared stack body, one thin descriptor file per profile. The divergence
+(model, sizing, guardrails, context routing, persona/pack params, image gen,
+streaming, battle) is DATA in the `ProfileTopology`, not three code copies. A
+basic-team change touches exactly its descriptor in `basic-tier-stack.ts`;
+standard / premium / the shared body / the platform are untouched. One shared
+`assistant-async-processor.ts` serves every profile and self-gates its
+capabilities on the env each topology flag sets.
 
-### What's in each tier-stack class
+### What each profile stack instantiates
 
 ```
-AgentEchelonTier-{Basic|Standard|Premium}        owned by that tier's file
-├─ AsyncProcessor Lambda  (entry: lambda/src/{tier}-async-processor.ts)
-│   env: CONTEXT_BUCKET, MODEL_ID/NAME, GUARDRAIL_ID/VERSION,
-│        APP_INSTANCE_ARN, *_TABLE_ARN (shared, std/prem), BATTLE_ORCHESTRATOR_ARN (prem)
-│   role: ContextS3Read(tier prefixes) + bedrock:InvokeModel[WithResponseStream (prem)]
-│         + bedrock:ApplyGuardrail(tier guardrail) + Amazon Chime SDK(send/list/update)
-│         + DynamoDB(shared tables, std/prem) + lambda:Invoke(orchestrator, prem)
-│         + image-gen + image-guardrail + battle-images S3 (prem)
-├─ Tier guardrail            (AgentGuardrails — `agent-echelon-{tier}-guardrail`)
-├─ Image-output guardrail    (premium only — `agent-echelon-premium-battle-image-guardrail`)
+AgentEchelonTier-{Basic|Standard|Premium}        driven by that profile's ProfileTopology
+├─ AsyncProcessor Lambda  (entry: lambda/src/assistant-async-processor.ts - shared)
+│   env: PROFILE_NAME, BATTLE_ELIGIBLE, MAX_TOKENS, CONTEXT_BUCKET, MODEL_ID/NAME,
+│        GUARDRAIL_ID/VERSION, APP_INSTANCE_ARN, *_TABLE (richProcessor), CN/battle env (per flag)
+│   role: ContextS3Read(classifications at/below rank) + bedrock:InvokeModel[WithResponseStream (streaming)]
+│         + bedrock:ApplyGuardrail(profile guardrail) + Amazon Chime SDK(send/list/update)
+│         + DynamoDB(shared tables, richProcessor) + lambda:Invoke(orchestrator, battle)
+│         + image-gen + image-guardrail + battle-images S3 (imageGen)
+├─ Profile guardrail         (AgentGuardrails - `agent-echelon-{profile}-guardrail`)
+├─ Image-output guardrail    (imageGen only - `agent-echelon-premium-battle-image-guardrail`)
 ├─ Lex bot                   (WelcomeIntent + FallbackIntent → shared router)
-├─ AppInstanceBot            (→ this tier's Lex bot)
-└─ SSM publishes             /agent-echelon/tier/{tier}/{processor-arn,bot-arn}
+├─ AppInstanceBot            (→ this profile's Lex bot)
+└─ SSM publishes             /agent-echelon/assistant/{profile}/{processor-arn,bot-arn}
   NO CfnAgent / CfnAgentAlias / action-group Lambdas.
 ```
 
@@ -144,8 +150,8 @@ second-assistant.
 ## Independent deployability
 
 Because the cross-stack contract is SSM-only, each tier stack deploys on its own
-cadence: the shared router resolves `/agent-echelon/tier/{tier}/processor-arn` to
-dispatch, and `create-conversation` resolves `/agent-echelon/tier/{tier}/bot-arn`
+cadence: the shared router resolves `/agent-echelon/assistant/{tier}/processor-arn` to
+dispatch, and `create-conversation` resolves `/agent-echelon/assistant/{tier}/bot-arn`
 to add the right tier bot to a new channel. A single-account demo still gets
 everything with one `cdk deploy --all`. `scripts/validate-tier-context.ts`
 verifies tier isolation. Premium is the trickiest coupling because it carries the

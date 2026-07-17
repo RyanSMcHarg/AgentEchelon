@@ -137,19 +137,18 @@ A JSON array of `IntentDef` (or `{ "intents": [...] }`), supplied via CDK contex
 **Transport - SSM, not a raw env var (this matters).** AWS caps a Lambda's **total** env-var size at
 **4 KB**. A realistic pack (~3 KB) plus the AgentHandler's existing table/ARN vars (~1.5 KB) blows
 that - and the persona (`ASSISTANT_SYSTEM_PROMPT`, ~1.6 KB) can't share a Lambda with it either. So
-`standard-tier-stack.ts` writes the pack JSON to an **SSM parameter**
-(`${SSM_ROOT}/tier/{tier}/assistant-intent-pack`, e.g. `/agent-echelon/tier/standard/assistant-intent-pack`)
+the shared `assistant-profile-stack.ts` writes the pack JSON to an **SSM parameter**
+(`${SSM_ROOT}/assistant/{profile}/assistant-intent-pack`, e.g. `/agent-echelon/assistant/standard/assistant-intent-pack`)
 and passes the AgentHandler only the small param **name** in `ASSISTANT_INTENT_PACK_PARAM` (+ an
 `ssm:GetParameter` grant). At cold start the handler calls `hydrateIntentPackFromSsm()` (once, cached)
 before classifying. `getIntentPack()` prefers the hydrated value, then the inline
 `ASSISTANT_INTENT_PACK` env (still honored for small packs / tests), then `DEFAULT`.
 
-**Tier scope (current):** wired in **`standard-tier-stack.ts`** only - on the AgentHandler (where the
-classifier runs; the AsyncProcessor consumes the already-classified `event.intent` and needs no
-pack). This matches the **standard-tier scope of `ASSISTANT_SYSTEM_PROMPT`** (the first consumer
-is standard-tier). `basic-tier-stack.ts` / `premium-tier-stack.ts` classify too but
-don't yet provision the param - a basic/premium deployment wanting a custom pack needs the same
-SSM-param + grant wiring there (parallel follow-up). Until then those tiers use `DEFAULT`.
+**Profile scope:** provisioned for profiles whose `ProfileTopology` sets `intentPackParam` (basic and
+standard by default) - on the AgentHandler (where the classifier runs; the AsyncProcessor consumes the
+already-classified `event.intent` and needs no pack). The premium profile does not provision the param
+by default (`intentPackParam: false`) and uses `DEFAULT`; flipping the flag in its descriptor
+provisions the same SSM-param + grant wiring, with no other change.
 
 **Injecting the context** (the JSON can exceed the Windows ~8 KB command-line limit, so don't inline
 it on the command - merge it into `cdk.context.json`, deploy, then revert):

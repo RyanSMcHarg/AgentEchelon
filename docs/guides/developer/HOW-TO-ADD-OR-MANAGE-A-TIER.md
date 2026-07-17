@@ -1,22 +1,32 @@
-# How to add or manage a tier
+# How to add or manage an assistant profile
 
-A practical guide for two adjacent tasks the per-tier ownership model
+A practical guide for two adjacent tasks the capability-profiles model
 ([SPEC-PER-TIER-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md))
 makes routine:
 
-1. **Add a brand-new tier** (e.g. `enterprise`) alongside the existing
+1. **Add a brand-new profile** (e.g. `enterprise`) alongside the shipped
    `basic` / `standard` / `premium`.
-2. **Manage an existing tier's assistant**: change its model, prompt,
-   guardrail, retrieval scope, or sizing without touching the other
-   tiers.
+2. **Manage an existing profile's assistant**: change its model, prompt,
+   guardrail, retrieval scope, or sizing without touching the others.
 
-The carve is **tier-as-class**: each tier lives in its own file
-(`backend/lib/stacks/{basic,standard,premium}-tier-stack.ts`), with
-shared constants centralised in
-`backend/lib/stacks/agent-tier-common.ts`. A tier-team change reviews
-and ships exactly that tier.
+The shipped platform separates the word "tier" into three config concepts
+(see `backend/lib/config/profiles.ts`):
 
-> The architectural rationale, SSM contract, and rollout phasing live in
+- a **classification** is the channel's immutable `classification` tag value plus a
+  declared rank (the min-cap and RAG-scope order);
+- a **profile** is a named capability bundle (model, classifier mode, timeout, task
+  depth, RAG scope, rate limit, battle eligibility) bound to a classification;
+- **clearance** maps a Cognito group to the classification it clears for.
+
+The stack topology is **profile-as-data**: one shared
+`AssistantProfileStack` is parametrized by a `ProfileTopology` descriptor, and each
+profile lives in a thin subclass
+(`backend/lib/stacks/{basic,standard,premium}-tier-stack.ts`) that supplies its
+descriptor. One shared assistant Lambda (`assistant-async-processor.ts`) serves every
+profile and self-gates its capabilities on the profile's env. A profile-team change
+edits its descriptor and ships exactly that profile.
+
+> The architectural rationale, SSM contract, and phasing live in
 > [SPEC-PER-TIER-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md). This file
 > is the **how**.
 
@@ -26,80 +36,66 @@ and ships exactly that tier.
 
 ```
 backend/
-├── bin/backend.ts                       ← composition root; instantiates each tier
+├── bin/backend.ts                        ← composition root; instantiates each profile stack
 ├── lib/
-│   ├── stacks/
-│   │   ├── agent-tier-common.ts         ← shared SSM keys + thin helpers (no class)
-│   │   ├── basic-tier-stack.ts          ← BasicTierStack
-│   │   ├── standard-tier-stack.ts       ← StandardTierStack
-│   │   └── premium-tier-stack.ts        ← PremiumTierStack
-│   └── config/model-strategy.ts         ← model catalog + tier-allowed lists
+│   ├── config/
+│   │   ├── profiles.ts                    ← classifications + profiles + groupClearance (the config)
+│   │   └── model-strategy.ts             ← model catalog + per-profile model selection
+│   ├── profile-registry.ts               ← the ONLY interpreter of a classification tag / clearance
+│   └── stacks/
+│       ├── assistant-profile-stack.ts    ← AssistantProfileStack + ProfileTopology (the shared body)
+│       ├── basic-tier-stack.ts           ← BasicTierStack: a thin ProfileTopology wrapper
+│       ├── standard-tier-stack.ts        ← StandardTierStack
+│       ├── premium-tier-stack.ts         ← PremiumTierStack
+│       └── agent-tier-common.ts          ← shared SSM keys + thin helpers (no class)
 └── lambda/src/
-    ├── basic-async-processor.ts         ← entry; thin wrapper over async-processor-core
-    ├── standard-async-processor.ts
-    ├── premium-async-processor.ts
+    ├── assistant-async-processor.ts      ← the ONE config-driven assistant (entry for every profile)
     └── lib/
-        ├── async-processor-core.ts      ← shared assistant logic (Converse tool loop, /battle, etc.)
-        └── company-context.ts           ← tier-scoped S3 retrieval
+        ├── async-processor-core.ts       ← shared assistant logic (Converse tool loop, /battle, etc.)
+        └── company-context.ts            ← classification-scoped S3 retrieval
 ```
 
-Per-tier file ownership: a tier team owns its own `*-tier-stack.ts` and
-`*-async-processor.ts`. The shared `async-processor-core.ts` and
-`agent-tier-common.ts` change rarely; PRs touching them should ping
-every tier owner.
+Ownership: a profile team owns its thin `*-tier-stack.ts` descriptor. The shared
+`assistant-profile-stack.ts` body, `assistant-async-processor.ts`,
+`async-processor-core.ts`, and `agent-tier-common.ts` change rarely; PRs touching them
+should ping every profile owner.
 
 ---
 
-## 1. Adding a new tier
+## 1. Adding a new profile
 
-Use case: deployer wants a fourth tier (say `enterprise`) with its
-own model selection, S3 scope, guardrail, and Lex bot.
+Use case: a deployer wants a fourth profile (say `enterprise`) with its own model
+selection, retrieval scope, guardrail, and Lex bot.
 
-There are six pieces. Skip none; each one is what keeps the tier
-isolated end-to-end.
+### 1.1 Add the classification + profile to config
 
-### 1.1 Add the tier to the user-facing type system
+`backend/lib/config/profiles.ts` is the single source. Add the classification (with a
+rank above premium), its profile, and the Cognito group that clears for it:
 
-Cognito group, frontend tier union, backend tier union.
-
-```bash
-# Frontend
-frontend/src/providers/AuthProvider.tsx       # export type UserTier
-frontend/src/types/index.ts                   # any tier-aware types
-
-# Backend
-backend/lib/stacks/agent-tier-common.ts       # export type Tier
-backend/lib/config/model-strategy.ts          # export type ModelTier
-backend/lambda/src/lib/async-processor-core.ts # AsyncProcessorConfig['userType']
-
-# Security controls that hardcode the tier set (NOT just types)
-backend/lambda/src/membership-audit.ts         # TIER_RANK (:54) + TIER_GROUPS (:~92)
-backend/lambda/src/credential-exchange.ts      # resolveRoleKey (:107-114)
+```ts
+classifications: [
+  { value: 'basic', rank: 1, profile: 'basic' },
+  { value: 'standard', rank: 2, profile: 'standard' },
+  { value: 'premium', rank: 3, profile: 'premium' },
+  { value: 'enterprise', rank: 4, profile: 'enterprise' },     // ← add
+],
+profiles: [
+  // ...basic/standard/premium...
+  { name: 'enterprise', modelKey: 'opus', classifierMode: 'llm', timeoutSeconds: 90,
+    taskSupport: 'full', contextScope: 'own-rank-and-below', rateLimitPerHour: 480, battleEligible: true },
+],
+groupClearance: { basic: 'basic', standard: 'standard', premium: 'premium', enterprise: 'enterprise' },
 ```
 
-In the Cognito User Pool stack (`backend/lib/stacks/cognito-auth-stack.ts`)
-add an `enterprise` group with precedence between admins and premium.
-Update the post-confirmation trigger and `user-management.ts` to mirror
-`custom:tier=enterprise` into the new group.
-
-The last two files are SECURITY controls, not conveniences, and they fail
-UNSAFE if the new tier is omitted:
-
-- `membership-audit.ts` `TIER_RANK` (:54) and `TIER_GROUPS` (:~92): a tier
-  missing from `TIER_RANK` ranks as `0` and a tier missing from `TIER_GROUPS`
-  resolves to `basic`, so the Layer 6 membership audit UNDER-ENFORCES and any
-  tier-ceiling check for the new tier collapses to `basic`.
-- `credential-exchange.ts` `resolveRoleKey` (:107-114): a user on the new tier
-  that is not handled here is vended `basic` exchange credentials, silently
-  under-provisioning them.
-
-Prefer deriving tier rank from the shared `Tier` union so a single edit covers
-every consumer, rather than re-listing the tiers in each control.
+`validateProfilesConfig` runs at synth and rejects a malformed config (duplicate rank,
+unknown profile, `failClosedTo` that is not the lowest rank). This one edit drives the
+Cognito groups, the Identity-Pool auth roles, the Layer-1 IAM classification boundary,
+the RAG scope ladder, the rate limit, and battle eligibility, because every runtime and
+synth site reads through `ProfileRegistry`.
 
 ### 1.2 Add the model selection slot
 
-Pick which model `enterprise` uses by default.
-`backend/lib/config/model-strategy.ts`:
+Pick the profile's default model. `backend/lib/config/model-strategy.ts`:
 
 ```ts
 export interface TierModelSelection {
@@ -110,140 +106,116 @@ export interface TierModelSelection {
 }
 
 export const DEFAULT_TIER_MODEL_SELECTION: TierModelSelection = {
-  basic: 'haiku',
-  standard: 'sonnet',
-  premium: 'opus',
+  basic: 'haiku', standard: 'sonnet', premium: 'opus',
   enterprise: 'opus',               // ← add
 };
 ```
 
-For every model in `getModelCatalog`, decide whether `enterprise` is
-in its `allowedTiers`. By default it's a strict superset of premium.
+For every model in `getModelCatalog`, decide whether `enterprise` is in its
+`allowedTiers`. By default it is a strict superset of premium. Also add `enterprise`
+to the `Tier` union in `agent-tier-common.ts` and the `ModelTier` union in
+`model-strategy.ts`.
 
-### 1.3 Create the tier processor entry-point Lambda
+### 1.3 Add the ProfileTopology descriptor + thin stack
 
-Mirror `premium-async-processor.ts` (it's the thinnest). Copy +
-rename to `backend/lambda/src/enterprise-async-processor.ts`. Set
-`userType: 'enterprise'` in the config it builds; everything else
-flows through `async-processor-core.ts`.
-
-If the new tier behaves identically to an existing tier just with a
-different name, a re-export is fine for now, but the moment behavior
-diverges (special model routing, extra tools, different sizing), copy
-the entire entry so the tier team can edit freely.
-
-### 1.4 Create the tier stack class
-
-Copy the closest existing class (usually `premium-tier-stack.ts`)
-into `backend/lib/stacks/enterprise-tier-stack.ts` and rename:
+There is no per-profile processor to copy: the one `assistant-async-processor.ts`
+serves every profile. Create `backend/lib/stacks/enterprise-tier-stack.ts` mirroring
+`premium-tier-stack.ts`, and supply the descriptor:
 
 ```ts
-export class EnterpriseTierStack extends cdk.Stack { ... }
+const ENTERPRISE_TOPOLOGY: ProfileTopology = {
+  name: 'enterprise',
+  modelSelectionKey: 'enterprise',
+  timeoutSeconds: 90, memorySize: 1024, reservedConcurrency: 20, maxTokens: 4096,
+  streaming: true,          // InvokeModelWithResponseStream
+  imageGen: true,           // /battle image generation-out + image guardrail (drop if not in scope)
+  contextRouting: false,    // external/CN routing (standard only, by default)
+  systemPromptParam: true,  // per-deployment persona in SSM
+  intentPackParam: true,    // per-deployment intent taxonomy in SSM
+  richProcessor: true,      // multi-turn tasks + docs + experiments + attachment-in
+  battleCapable: true,
+  handlerExperimentsIndex: false,
+  componentTag: 'Tier-Enterprise',
+};
+
+export class EnterpriseTierStack extends AssistantProfileStack {
+  constructor(scope: Construct, id: string, props: EnterpriseTierStackProps) {
+    super(scope, id, { ...props, topology: ENTERPRISE_TOPOLOGY });
+  }
+}
 ```
 
-Inside the class, change every literal `'premium'` to `'enterprise'`
-(or the new tier's name). Specifically:
+Every capability the profile does not want is a `false` flag, not deleted code: the
+shared body reads the flags, and the shared processor self-gates its code paths on the
+env each flag sets (a profile that sets no `ATTACHMENTS_BUCKET` / battle / context-routing
+env leaves those paths off, so its execution stays inside its own IAM role).
 
-- `const tier = 'enterprise' as const;`
-- `props.tierModelSelection.enterprise`
-- `name: 'agent-echelon-enterprise-guardrail'`
-- `name: 'agent-echelon-enterprise-battle-image-guardrail'` (if /battle is in scope)
-- S3 prefix list: include every prefix the tier may read
-  (e.g. `['context/basic/*', 'context/standard/*', 'context/premium/*', 'context/enterprise/*']`)
-  on both `s3:ListBucket` and `s3:GetObject`.
-- `entry: '../../lambda/src/enterprise-async-processor.ts'`
-- Sizing: `timeout`, `memorySize`, `reservedConcurrentExecutions`.
-  Default to a copy of the closest tier; tune later from CloudWatch.
-- `BOT_NAME: 'Assistant-enterprise'`
-- `Tags Component: 'Tier-Enterprise'`
-
-Drop anything the tier doesn't need. If `enterprise` doesn't use
-/battle, delete the image-guardrail block, the image-gen IAM, the
-`battle-images/*` S3 grant, and the `BATTLE_*` env vars; that's the
-upside of class-per-tier, you don't carry inherited dead code.
-
-### 1.5 Wire the stack in `bin/backend.ts`
+### 1.4 Wire the stack in `bin/backend.ts`
 
 ```ts
 import { EnterpriseTierStack } from '../lib/stacks/enterprise-tier-stack';
 
 const tierEnterpriseStack = new EnterpriseTierStack(app, `${STACK_PREFIX}Tier-Enterprise`, {
   ...tierSharedProps,
-  description: 'enterprise-tier assistant',
+  description: 'enterprise-profile assistant',
 });
 tierEnterpriseStack.addDependency(foundationsStack);
 tierEnterpriseStack.addDependency(experimentsStack);
 ```
 
-Match the existing three: every tier stack is named `${STACK_PREFIX}Tier-*`,
-where `STACK_PREFIX = AE_STACK_PREFIX || pascal(AE_INSTANCE_NAME)`
-(`bin/backend.ts:407-415`, `agent-tier-common.ts:199`). The prefix is
-INSTANCE-DERIVED, not literal: it is `AgentEchelon` only for the default
-instance, and (e.g.) `Acme` for `AE_INSTANCE_NAME=acme`. Add the stack to the
-deploy-order loop alongside the existing three.
+Every profile stack is named `${STACK_PREFIX}Tier-*`, where
+`STACK_PREFIX = AE_STACK_PREFIX || pascal(AE_INSTANCE_NAME)`. The prefix is
+instance-derived: `AgentEchelon` for the default instance, and (e.g.) `Acme` for
+`AE_INSTANCE_NAME=acme`.
 
-### 1.6 Add a synth test
+### 1.5 Add a synth test
 
-In `backend/test/cdk-synth.test.ts`, mirror the existing per-tier
-test block:
+In `backend/test/cdk-synth.test.ts`, mirror the existing per-profile block:
 
 ```ts
 it('should synthesize AgentEchelonTier-Enterprise (no Bedrock Agent)', () => {
-  const app = new cdk.App();
-  const stack = new EnterpriseTierStack(app, 'AgentEchelonTier-Enterprise', tierBasicProps);
+  const stack = new EnterpriseTierStack(new cdk.App(), 'AgentEchelonTier-Enterprise', tierBasicProps);
   const template = Template.fromStack(stack);
   template.resourceCountIs('AWS::Bedrock::Agent', 0);
-  template.hasResourceProperties('AWS::SSM::Parameter', {
-    Name: '/agent-echelon/tier/enterprise/processor-arn',
-  });
-  template.hasResourceProperties('AWS::SSM::Parameter', {
-    Name: '/agent-echelon/tier/enterprise/bot-arn',
-  });
+  template.hasResourceProperties('AWS::SSM::Parameter', { Name: '/agent-echelon/assistant/enterprise/processor-arn' });
+  template.hasResourceProperties('AWS::SSM::Parameter', { Name: '/agent-echelon/assistant/enterprise/bot-arn' });
 });
 ```
 
-### 1.7 Frontend tier gating
+### 1.6 Frontend gating
 
-The frontend already reads `custom:tier` from the JWT and gates
-the model picker by it. To surface the new tier in
-`NewConversationModal`, add a card entry there. To gate the admin
-button or /battle-related UI on the new tier, follow the same
-pattern as the existing `isPremium` checks.
+The frontend reads `custom:tier` from the JWT and gates the model picker by it. Add a
+card entry in `NewConversationModal` to surface the new classification, and follow the
+existing `isPremium` pattern to gate any profile-specific UI.
 
-### 1.8 Deploy + verify
+### 1.7 Deploy + verify
 
 ```bash
-# <Instance> = ${STACK_PREFIX} = AE_STACK_PREFIX || pascal(AE_INSTANCE_NAME);
-# AgentEchelon for the default instance.
+# <Instance> = ${STACK_PREFIX}; AgentEchelon for the default instance.
 cd backend && AWS_PROFILE=<your-profile> \
   npx cdk deploy <Instance>Tier-Enterprise --require-approval never
 ```
 
-The shared router (`router-agent-handler.ts`) is already SSM-first
-and will pick up `/agent-echelon/tier/enterprise/processor-arn`
-without redeploy. Verify the SSM key exists:
+The shared router (`router-agent-handler.ts`) is SSM-first and picks up
+`/agent-echelon/assistant/enterprise/processor-arn` without a redeploy. Confirm the SSM
+key exists, then create an enterprise-classification channel from the UI and confirm the
+processor's CloudWatch logs show its invocations.
 
 ```bash
-aws ssm get-parameter --name /agent-echelon/tier/enterprise/processor-arn \
+aws ssm get-parameter --name /agent-echelon/assistant/enterprise/processor-arn \
   --profile <your-profile> --query 'Parameter.Value' --output text
 ```
 
-Then create an enterprise-tier channel from the UI and confirm the
-processor's CloudWatch logs show its invocations.
-
 ---
 
-## 2. Managing an existing tier's assistant
+## 2. Managing an existing profile's assistant
 
-The tier team owns the entire file. The most common changes:
+The profile team owns its thin descriptor file. The most common changes:
 
 ### 2.1 Change the model
 
-Default model for the tier comes from `tierModelSelection` in
-`bin/backend.ts`. The model itself is defined in `model-strategy.ts`
-(catalog) and gated by `allowedTiers`.
-
-To switch premium from Opus to Sonnet:
+The default model comes from `tierModelSelection` in `bin/backend.ts`; the model itself
+is defined in `model-strategy.ts` (catalog) and gated by `allowedTiers`.
 
 ```ts
 // bin/backend.ts
@@ -253,252 +225,149 @@ const tierModelSelection: TierModelSelection = {
 };
 ```
 
-If the new model isn't in the catalog yet, add it to `getModelCatalog`
-in `model-strategy.ts` with the correct ARNs and `allowedTiers`. The
-processor role's `BedrockPolicy` derives its allowed ARNs from
-`modelArnsForTier`, no manual IAM update needed.
+If the new model is not in the catalog, add it to `getModelCatalog` with the correct
+ARNs and `allowedTiers`. The processor role's `BedrockPolicy` derives its allowed ARNs
+from `modelArnsForTier`, so there is no manual IAM update.
 
-To intent-route to different models within a tier (e.g. cheap model
-for greetings, expensive model for analysis), edit
-`INTENT_ROUTE_STRATEGY` in `model-strategy.ts`. The `min(userTier,
-channelTier)` clamp is computed in `router-agent-handler.ts` (`minTier`
-at :98/:454), so a mismatched route gets downgraded before dispatch;
-`model-resolver.ts` then enforces only the per-tier FLOOR (never below
-the tier's default model).
+To intent-route within a profile (cheap model for greetings, expensive for analysis),
+edit `INTENT_ROUTE_STRATEGY` in `model-strategy.ts`. The min-cap clamp,
+`min(callerClearance, channelClassification)`, is resolved through `ProfileRegistry` in
+`router-agent-handler.ts`, so a mismatched route is downgraded before dispatch;
+`model-resolver.ts` then enforces only the per-profile floor.
 
 ### 2.2 Change the system prompt
 
-The per-turn prompt is assembled inside the async-processor (the tier
-entry, e.g. `standard-async-processor.ts`, → shared
-`async-processor-core.ts`). Each turn it composes, in order:
+The per-turn prompt is assembled inside `assistant-async-processor.ts` (which calls the
+shared `async-processor-core.ts`). Each turn it composes, in order:
 
-1. **Base persona**: what the assistant *is* for this deployment
-   (`resolveBaseSystemPrompt()`; see "Per-deployment persona" below).
-2. **Host context sections**: registered resolvers (domain context,
-   user profile, …) via the registry + composer (see
-   "Context resolvers" below).
-3. **Dynamic sections**: S3 knowledge, task state, RAG hints, anti-
-   repeat, appended by the pipeline.
-4. **Persona addendum / battle constraints**: from the bound /battle
-   variant, appended last (SPEC-BATTLE.md "Prompt Addendum Sanitization").
+1. **Base persona**: what the assistant is for this deployment
+   (`resolveBaseSystemPrompt()`; see "Per-deployment persona" below), defaulting to the
+   profile's built-in persona keyed by `PROFILE_NAME`.
+2. **Host context sections**: registered resolvers (domain context, user profile) via
+   the registry + composer.
+3. **Dynamic sections**: S3 knowledge, task state, RAG hints, anti-repeat, appended by
+   the pipeline.
+4. **Persona addendum / battle constraints**: from the bound /battle variant, appended
+   last.
 
 #### Per-deployment persona + intent pack (SSM-backed, preserve-on-absent)
 
 A rich persona/pack exceeds Lambda's 4 KB env cap, so they live in SSM
-(`${SSM_ROOT}/tier/{tier}/assistant-{system-prompt,intent-pack}`); the
-processor (persona) and handler (pack) hydrate them by name at cold
-start. Set them at deploy via context, usually merged into
-`cdk.context.json` (see your deployment's config notes):
+(`${SSM_ROOT}/assistant/{profile}/assistant-{system-prompt,intent-pack}`); the processor
+(persona) and handler (pack) hydrate them by name at cold start. Set them at deploy via
+context:
 
 ```bash
 npx cdk deploy <Instance>Tier-Standard --require-approval never \
-  -c assistantTier=standard \
   -c assistantSystemPrompt="$(cat persona.txt)" \
   -c assistantIntentPack="$(cat intent-pack.json)"
 ```
 
-Persona and intent pack are stored as SSM `String` (not `SecureString`), and
-this deploy path routes them through shell history and, when merged, into
-`cdk.context.json` (a committable file). Keep secrets OUT of persona/pack. If a
-value ever must be sensitive, store it as `SecureString` and do not commit it to
-`cdk.context.json`.
+The persona param exists for `systemPromptParam` profiles; the intent pack for
+`intentPackParam` profiles. Both are stored as SSM `String` (not `SecureString`), and
+this path routes them through shell history and, when merged, into `cdk.context.json` (a
+committable file). Keep secrets OUT of persona/pack.
 
-**Preserve-on-absent (decision 012):** the params are written by an
-`AwsCustomResource` that `PutParameter`s **only when a non-empty value
-is supplied** and **never deletes**. So a deploy that *omits*
-`-c assistantSystemPrompt` does not blank a live persona. A
-standard/premium synth with an empty persona/pack emits a loud **synth
-warning** (WS1a). A *changed* value re-PUTs reliably (a content hash in
-the resource's physical id busts the CFN "no changes" no-op).
-
-#### Per-intent response settings
-
-A pack intent may carry `maxTokens` + coarse `verbosity` ('tight' |
-'normal' | 'long'). The handler forwards the classified intent's
-settings in the dispatch event; the processor clamps `maxTokens` to the
-tier ceiling (`CONFIG.maxTokens`) and the reasoning-turn floor. Tune
-answer sizes **per intent via config, no code** (e.g. tight `logistics`,
-longer `research`). See `SPEC-CONFIGURABLE-INTENT-PACK.md`.
+**Preserve-on-absent (decision 012):** an `AwsCustomResource` writes the params only when
+a non-empty value is supplied and never deletes, so a deploy that omits the context does
+not blank a live persona. A profile that carries `systemPromptParam` with an empty
+persona emits a loud synth warning. A changed value re-PUTs reliably (a content hash in
+the resource's physical id busts the CFN no-op).
 
 #### Config attribution
 
-Every turn's analytics (and every eval row / battle outcome) is stamped
-with a `configId` = hash(persona + intent-pack + base system prompt) so
-quality is sliceable **by config**, not just by model
-(`lib/config-identity.ts`; the pack hash already covers per-intent
-response settings). The stamped fields are short hashes, never the
-config text.
+Every turn's analytics is stamped with a `configId` = hash(persona + intent-pack + base
+system prompt) so quality is sliceable by config, not just by model
+(`lib/config-identity.ts`). The stamped fields are short hashes, never the config text.
 
-#### Context resolvers
-
-Host per-turn context is registered, not hardwired: a
-`contextType → resolver` registry (`lib/context-framework.ts`) +
-host resolvers (`lib/host-context-resolvers.ts`) the processor builds at
-cold start and composes every turn via the defensive `buildSystemPrompt`
-(ordered, empty-section-filtered, one throwing resolver isolated). To add
-a host context section, register a resolver, don't add a `+=` branch.
-
-To change a tier's base persona *in code* (the fallback default, used
-when no SSM persona is set), edit `DEFAULT_SYSTEM_PROMPT` in the tier's
-entry processor.
+To change a profile's built-in persona in code (the fallback default, used when no SSM
+persona is set), edit the profile's entry in `DEFAULT_PROMPTS` in
+`assistant-async-processor.ts`.
 
 ### 2.3 Change the guardrail
 
-Each tier owns its own Bedrock Guardrail. The construct is
-`backend/lib/constructs/bedrock-guardrails.ts` (`AgentGuardrails`).
-Topic denies, regex filters, PII actions, and metadata-marker filters
-are configured there.
-
-If you change config, the construct hashes the config into the
-`CfnGuardrailVersion` logical id, so a config edit *automatically*
-publishes a fresh version (consumers pin to version number, so an
-in-place edit would silently no-op without the hash trick).
-
-After editing, deploy only the affected tier:
-
-```bash
-npx cdk deploy AgentEchelonTier-Premium --require-approval never
-```
-
-Verify the new version is live:
-
-```bash
-aws bedrock-runtime apply-guardrail \
-  --guardrail-identifier <id> --guardrail-version <new-version> \
-  --source OUTPUT --content '[{"text":{"text":"hello world"}}]' \
-  --profile <your-profile>
-```
-
-`action: NONE` means clean; `action: GUARDRAIL_INTERVENED` with the
-filtered text means the rule fired.
+Each profile owns its own Bedrock Guardrail (construct
+`backend/lib/constructs/bedrock-guardrails.ts`, `AgentGuardrails`). Topic denies, regex
+filters, PII actions, and metadata-marker filters are configured there. The construct
+hashes its config into the `CfnGuardrailVersion` logical id, so a config edit
+automatically publishes a fresh version. Deploy only the affected profile, then verify
+with `aws bedrock-runtime apply-guardrail`.
 
 ### 2.4 Change context retrieval scope
 
-The tier's S3 read IAM defines what `load_company_context` can return.
-Each tier-stack hardcodes its allowed prefixes inline (e.g. premium has
-basic + standard + premium). To add a new prefix the tier may read:
+The profile's S3 read IAM defines what `load_company_context` can return. The
+`AssistantProfileStack` derives the allowed prefixes from `classificationsAllowedFor`
+(the `ProfileRegistry` scope ladder), so a profile reads `context/{classifications at or
+below its rank}/*`. To widen or narrow the scope, change the classification ranks in
+`profiles.ts`; there is no per-stack prefix list to hand-edit. The shared
+`loadCompanyContext` walks every prefix the IAM allows, with no Lambda-side change.
+
+### 2.5 Change sizing (timeout / memory / concurrency / token ceiling)
+
+Edit the profile's `ProfileTopology` in its thin stack file:
 
 ```ts
-// premium-tier-stack.ts ContextS3Read inline policy
-conditions: {
-  StringLike: {
-    's3:prefix': [
-      'context/basic/*',
-      'context/standard/*',
-      'context/premium/*',
-      'context/legal/*',          // ← add
-    ],
-  },
-},
-// AND the GetObject statement:
-resources: [
-  `${props.attachmentsBucketArn}/context/basic/*`,
-  `${props.attachmentsBucketArn}/context/standard/*`,
-  `${props.attachmentsBucketArn}/context/premium/*`,
-  `${props.attachmentsBucketArn}/context/legal/*`,   // ← add
-],
+const PREMIUM_TOPOLOGY: ProfileTopology = {
+  // ...
+  timeoutSeconds: 120,        // was 90
+  memorySize: 2048,           // was 1024
+  reservedConcurrency: 30,    // was 20
+  maxTokens: 4096,            // the response ceiling (MAX_TOKENS env)
+  // ...
+};
 ```
 
-The shared `loadCompanyContext` (`lambda/src/lib/company-context.ts`)
-walks every prefix the IAM allows, no Lambda-side change.
+Deploy only the affected profile. CloudWatch Duration and ConcurrentExecutions tell you
+whether the values fit; aim for p95 duration <= 70% of timeout and reserved concurrency
+>= peak observed concurrency x 2.
 
-### 2.5 Change sizing (timeout / memory / concurrency)
+### 2.6 Change a capability
 
-In the tier-stack file, edit the `NodejsFunction` props directly:
-
-```ts
-const asyncProcessor = new lambdaNodeJs.NodejsFunction(this, 'AsyncProcessor', {
-  ...
-  timeout: cdk.Duration.seconds(120),       // was 90
-  memorySize: 2048,                          // was 1024
-  reservedConcurrentExecutions: 30,          // was 20
-  ...
-});
-```
-
-Deploy only the affected tier. CloudWatch's *Duration* and
-*ConcurrentExecutions* metrics for the function tell you whether the
-new values fit; aim for p95 duration ≤ 70% of timeout, reserved
-concurrency ≥ peak observed concurrency × 2.
-
-### 2.6 Multiple assistants in a single tier
-
-If you want the same tier to expose two different assistants (different
-Lex bots / different AppInstanceBots / different personas), keep one
-tier processor and add a second Lex+AppInstanceBot pair in the same
-tier-stack:
-
-```ts
-// inside StandardTierStack, alongside the existing Lex bot block
-const lexResourceB = new cdk.CustomResource(this, 'CreateLexBotResourceB', {
-  serviceToken: lexProvider.serviceToken,
-  removalPolicy: cdk.RemovalPolicy.DESTROY,
-  properties: { tier: 'standard', botName: 'Assistant-standard-research' },
-});
-const botResourceB = new cdk.CustomResource(this, 'CreateBotResourceB', { ... });
-```
-
-Both AppInstanceBots route to the same `routerHandlerArn` → same async
-processor. Differentiate behavior by setting different `Metadata` on
-channels created by each bot (e.g. `metadata.assistantRole='research'`)
-and branching in the processor.
-
-Or, if the two assistants need genuinely different code paths and
-sizing, split the tier into two stack classes (e.g. `StandardCoreTierStack`
-and `StandardResearchTierStack`). The carve was designed for exactly this
-kind of growth.
+Turn a capability on or off through the `ProfileTopology` flags
+(`contextRouting`, `systemPromptParam`, `intentPackParam`, `richProcessor`, `imageGen`,
+`streaming`, `battleCapable`). The shared stack body wires the matching resources + IAM,
+and the shared processor self-gates the runtime path on the env the flag sets. Express
+divergence through the descriptor, never by branching the shared body or the shared
+processor.
 
 ---
 
 ## Deploy + verification cheat sheet
 
 ```bash
-# Deploy only one tier. <Instance> = ${STACK_PREFIX} = AE_STACK_PREFIX ||
-# pascal(AE_INSTANCE_NAME); AgentEchelon for the default instance.
+# Deploy only one profile. <Instance> = ${STACK_PREFIX}; AgentEchelon for the default instance.
 cd backend && AWS_PROFILE=<your-profile> \
-  npx cdk deploy <Instance>Tier-<Tier> --require-approval never
+  npx cdk deploy <Instance>Tier-<Profile> --require-approval never
 
-# Confirm the tier published its SSM contract
-aws ssm get-parameter --name /agent-echelon/tier/<tier>/processor-arn \
+# Confirm the profile published its SSM contract
+aws ssm get-parameter --name /agent-echelon/assistant/<profile>/processor-arn \
   --profile <your-profile> --query 'Parameter.Value' --output text
-
-aws ssm get-parameter --name /agent-echelon/tier/<tier>/bot-arn \
+aws ssm get-parameter --name /agent-echelon/assistant/<profile>/bot-arn \
   --profile <your-profile> --query 'Parameter.Value' --output text
 
 # Watch the processor's logs while exercising the channel
-aws logs tail /aws/lambda/<Instance>Tier-<Tier>-AsyncProcessor<...> \
+aws logs tail /aws/lambda/<Instance>Tier-<Profile>-AsyncProcessor<...> \
   --follow --profile <your-profile>
 
 # Confirm the synth still passes
 cd backend && npx jest cdk-synth
 ```
 
-If a tier deploy drifts the cross-stack export graph (rare; usually
-when retiring legacy blocks), deploy the **consumer** stack alone with
-`--exclusively` first to release the export, then redeploy the
-producer:
-
-```bash
-npx cdk deploy <consumer> --exclusively
-npx cdk deploy <producer>
-```
-
 ---
 
-## What NOT to touch from a tier file
+## What NOT to touch from a profile file
 
-- `agent-tier-common.ts` (the SSM contract keys). Changing a key here
-  silently breaks every tier and the shared router. If you genuinely
-  need a new key, add it; never rename or remove.
-- `async-processor-core.ts` (the shared assistant logic). Tier
-  behavior should be expressed by what the tier-stack passes in
-  (model, guardrail, env, IAM), not by branching inside the core.
-- The shared platform stacks (`foundations-stack.ts` for the
-  task-tracking tables + create-conversation, `experiments-stack.ts`,
-  `battle-stack.ts`). They publish the `/agent-echelon/shared/*` SSM
-  contract every tier reads. Adding a new shared resource (e.g. another
-  DynamoDB table) means publishing another SSM key there AND adding it
-  to `resolveSharedSSM` AND granting it in each tier that needs it.
+- `agent-tier-common.ts` (the SSM contract keys). Changing a key here silently breaks
+  every profile and the shared router. Add a key if you genuinely need one; never rename
+  or remove.
+- `assistant-profile-stack.ts` (the shared stack body) and `assistant-async-processor.ts`
+  (the shared assistant). Profile behavior is expressed by the `ProfileTopology` a thin
+  stack passes in, not by branching the shared body or processor.
+- `async-processor-core.ts` (the shared assistant logic).
+- The shared platform stacks (`foundations-stack.ts`, `experiments-stack.ts`,
+  `battle-stack.ts`). They publish the `/agent-echelon/shared/*` SSM contract every
+  profile reads. Adding a shared resource means publishing another SSM key there AND
+  adding it to `resolveSharedSSM` AND granting it in each profile that needs it.
 
 See [SPEC-PER-TIER-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md) for the
 full architectural contract.

@@ -71,9 +71,8 @@ reasons:
    every turn for users with multiple active tasks. Worth it only if
    user testing proves the richer hint moves the needle.
 
-Called from the two async processors at prompt-build time:
-- `premium-async-processor.ts`
-- `standard-async-processor.ts`
+Called from the shared async processor at prompt-build time:
+- `assistant-async-processor.ts` (every profile with `richProcessor`; the shared processor gates the hint on task support)
 
 Best-effort: a failure of the cross-channel lookup logs and proceeds.
 The agent still replies; it just doesn't know about other-channel
