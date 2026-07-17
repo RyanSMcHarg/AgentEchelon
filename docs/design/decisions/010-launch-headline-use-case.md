@@ -18,7 +18,7 @@ Open-source enterprise teams discovering AE will form their first impression fro
 - **D. Agentic task automation** via Bedrock Agents Action Groups
 - **E. Collaborative requirements / design-doc drafting** (Document Mode + RAG)
 
-Each maps to real value, but the README and ROADMAP can only have one headline.
+Each maps to real value, but the README can only have one headline.
 
 ## Options
 
