@@ -41,12 +41,12 @@ accountability-logging calibration noted there.
 | Platform Engineer | Read a full conversation with its history and the context the assistant had (running summary, cross-conversation context) to debug a turn | Conversations; Models > Steps |
 | Platform Engineer | Watch error rate, web vitals, and reconnect spikes as early-warning signals | Overview > Latency |
 | Platform Engineer | See the documented model-routing strategy and capability catalog | Models > Model Strategy |
-| AI Engineer | Review automated evaluation scores (relevance, compliance) by agent and intent | Quality > Evaluations |
-| AI Engineer | Analyze multi-turn conversation flow quality across weighted dimensions | Quality > Flows |
-| AI Engineer | Triage flagged low-quality responses and approve or reject them | Quality > Flagged |
-| AI Engineer | Submit human ground-truth scores to calibrate the automated evaluator | Quality > Ground Truth |
+| AI Engineer | Review automated evaluation scores (relevance, compliance) by agent and intent | Effectiveness > Evaluations |
+| AI Engineer | Analyze multi-turn conversation flow quality across weighted dimensions | Effectiveness > Flows |
+| AI Engineer | Triage flagged low-quality responses and approve or reject them | Effectiveness > Flagged |
+| AI Engineer | Submit human ground-truth scores to calibrate the automated evaluator | Effectiveness > Ground Truth |
 | AI Engineer | Compare two models head-to-head and read a ship recommendation | Experiments; Models > Models (effectiveness) |
-| AI Engineer | See the full conversation context and history behind an evaluated turn (preceding turns, running summary, cross-conversation context) | Conversations; Quality > Evaluations, Flows; Models > Steps |
+| AI Engineer | See the full conversation context and history behind an evaluated turn (preceding turns, running summary, cross-conversation context) | Conversations; Effectiveness > Evaluations, Flows; Models > Steps |
 | Legal Team Member | Review a conversation's message history and redact or delete specific messages | Conversations |
 | Legal Team Member | Establish who accessed a conversation and when (membership and moderator timeline) | Conversations > Membership history; Security |
 | Legal Team Member | Confirm cross-tier isolation is enforced | Security > Membership Audit |
@@ -66,7 +66,8 @@ accountability-logging calibration noted there.
 3. **Dual-mode, Aurora is a strict superset.** AE runs Athena (default, cheaper) or Aurora
    (opt-in, more expensive). Aurora must **only enhance, never degrade**: every capability
    available in Athena is available in Aurora at least as well, and Aurora adds the advanced
-   views (per-exchange evaluation, flows, ground truth, tasks, execution steps, drift, model
+   views (the intent-anchored Effectiveness dashboard + its drill, per-exchange evaluation, flows,
+   ground truth, tasks, per-task turn timeline, execution steps, drift, model
    effectiveness, experiments, cross-conversation context). **No capability is Athena-only.**
    Aurora-added views are hidden in Athena mode with an honest "requires Aurora" note rather
    than a silently empty table.
@@ -81,7 +82,7 @@ just groups the sub-views. Aurora-only sub-views are filtered out in Athena mode
 |---|---|
 | Overview | Overview, Latency |
 | Conversations | Conversations (moderation surface) |
-| Quality | Evaluations (+ Flows, Flagged, Ground Truth, Tasks in Aurora) |
+| Effectiveness | Effectiveness dashboard (the L0 intent-anchored drill entry) + Evaluations, Flows, Flagged, Ground Truth, Tasks in Aurora |
 | Models | Models, Model Strategy, Steps (Steps is Aurora-only) |
 | Experiments | Experiments |
 | Users | Users, Manage Users |
@@ -94,7 +95,7 @@ just groups the sub-views. Aurora-only sub-views are filtered out in Athena mode
   minus N days); the Aurora POST shim converts the span to a `days` integer. The backend
   validates ISO dates, requires `start <= end`, and caps the window at 365 days.
 - **Analytics mode badge** appears in Aurora mode. Aurora-only sub-tabs
-  (`flows`, `flagged`, `ground_truth`, `tasks`, `steps`) are hidden in Athena mode.
+  (`effectiveness`, `flows`, `flagged`, `ground_truth`, `tasks`, `steps`) are hidden in Athena mode.
 - **Targets.** Measurement surfaces show a documented target from `metricTargets.ts`
   (see "Targets" below). `MetricCard` renders good/warn/bad; `LineChart` draws target
   reference lines. Targets are display-only; alerting is a separate, later concern.
@@ -183,7 +184,18 @@ is no server-side bearer swap. Each action emits a telemetry event.
 | Redact | `RedactChannelMessage` (soft; body cleared, message remains) | `redact` |
 | Delete | `DeleteChannelMessage` (hard, irreversible) | `delete` |
 
-### Quality section
+### Effectiveness section
+
+The section landing is the **Effectiveness dashboard** (`EffectivenessTab.tsx`, Aurora-only): one row
+per intent, ranked worst-first on two quality axes kept separate - Classification (`intent_effectiveness`
+average confidence + reroute rate) and Execution (DIRECT intents by Pass A relevance, task intents by
+completion rate) - with Latency (avg / p95), Cost per reply (tokens times the model rate, null-honest),
+and Tool-error rate (from the per-step `tools[]` outcomes) as independently sortable decision columns,
+all coloured against `metricTargets.ts`. Clicking an intent drills L1 (its metric cards) -> L2 (its
+exchange list via `intent_exchanges`, or its task list via `task_details?intent`) -> L3 (a task's
+turn-by-turn state timeline via `task_timeline`) -> L4 (that turn's tool-loop steps, inline). The
+per-artifact views below (Evaluations, Flows, Flagged, Ground Truth, Tasks) remain as sub-tabs and drill
+depths. (The backing SQL is unit-tested at the query-dispatch layer.)
 
 #### Evaluations tab (`EvaluationsTab.tsx`)
 
@@ -247,7 +259,7 @@ human ground-truth label for the exchange.
 
 | Data element | What it is for | How it is calculated | Mode |
 |---|---|---|---|
-| Total, completed, failed, completion rate (cards); per (date, type) rollup; per-task detail | Track multi-step task outcomes | Aggregated client-side from `task_metrics` and `task_details`. The backing queries are not yet served in either analytics mode, so the tab renders its empty state until they are. | (backing query not yet served) |
+| Total, completed, failed, completion rate (cards); per (date, type) rollup; per-task detail | Track multi-step task outcomes | Aggregated client-side from `task_metrics` and `task_details` (Aurora). `task_details` returns each task's current `task_state` (the declared-graph machine state, distinct from the `task_status` lifecycle) + `transition_count`, and accepts an optional `intent` filter (the Effectiveness L2 task list). A task's turn-by-turn timeline is served by `task_timeline`. | Aurora only |
 
 Configuration: shared date preset. View toggle (metrics vs task list); status color map;
 completion-rate bands. Read-only.
@@ -281,7 +293,7 @@ Configuration: none. Presentational reference; nothing is editable here. Reflect
 | Data element | What it is for | How it is calculated | Mode |
 |---|---|---|---|
 | Turn list (message id, timestamp, intent, model, step count, total latency) | Turns that ran a multi-step tool loop | `execution_steps` (Aurora): over `messages` where bot and metadata has a non-empty `steps` array, newest first. | Aurora only |
-| Per-step detail (label, model, tokens in and out, estimated cost, start and end) | Debug a turn's tool loop | Each step object is read from the message metadata; duration is computed from start and end; cost was stamped at write time. | Aurora only |
+| Per-step detail (label, model, tokens in and out, estimated cost, start and end, per-tool outcomes) | Debug a turn's tool loop | Each step object is read from the message metadata; duration is computed from start and end; cost was stamped at write time. Each step also carries `tools: Array<{name, ok, errorClass}>` - structured per-tool success/failure with a bounded `errorClass` (`timeout` / `not_found` / `unauthorized` / `bad_input` / `error`, never raw text or PII) - which feeds the Effectiveness `tool_error_rate`. These steps also render inline at L4 of the Effectiveness `task_timeline`. | Aurora only |
 
 Configuration: shared date preset. A per-row expander reveals the step table from data
 already loaded. Read-only.
@@ -380,9 +392,10 @@ Aurora is a **strict superset** of Athena (see design principle 3). Everything t
 default serves - conversation volumes, intent distribution, active-user and messaging bands,
 error rate, latency, page web-vitals, connection health, per-user leaderboards, sign-up and
 sign-in funnels, and the conversation event archive - is served in Aurora as well. Aurora then
-**adds** the views that need relational joins or pgvector: per-exchange evaluation, multi-turn
-flows, ground truth, tasks, execution steps, drift, model effectiveness, experiment results,
-and cross-conversation context. Those Aurora-added views are hidden in Athena mode with an
+**adds** the views that need relational joins or pgvector: the intent-anchored Effectiveness
+dashboard + its drill (intents, exchanges, per-task turn timeline, steps), per-exchange evaluation,
+multi-turn flows, ground truth, tasks, execution steps, drift, model effectiveness, experiment
+results, and cross-conversation context. Those Aurora-added views are hidden in Athena mode with an
 honest "requires Aurora" note. The conversation event archive (the history and audit source
 the Conversations tab reads) exists in **both** modes as the mode-independent system of record
 (see [`MESSAGE-FLOW.md`](../../guides/developer/MESSAGE-FLOW.md) section 6.3).
@@ -404,10 +417,14 @@ a central registry `metricTargets.ts`:
 - Drift at or above 95 percent TPR and at or under 5 percent FPR from the drift-validation goal.
 - Relevance at or above 75 from the AE evaluation-score bands. Web vitals from Google CWV.
 - Error, reconnect, and conversion from reliability and engagement defaults (tunable).
+- Effectiveness dashboard: `intent_confidence` (classification confidence, higher is better),
+  `task_completion_rate` (higher), `intent_reroute_rate` (lower), `cost_per_reply` (lower), and
+  `tool_error_rate` (lower) - all defaults, tunable via the registry.
 
 `MetricCard` renders the target plus a good/warn/bad status; the reusable `LineChart` draws
 target reference lines (the Latency view has an actual-vs-target SLO trend). Applied to
-Latency, Overview (error percent), Evaluations (relevance), and Users (signup and signin
+Latency, Overview (error percent), Evaluations (relevance), the Effectiveness dashboard
+(classification, execution, cost, and tool-error columns), and Users (signup and signin
 conversion).
 
 ## Related

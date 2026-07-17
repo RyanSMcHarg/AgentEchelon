@@ -225,9 +225,9 @@ New location: `AgentEchelon/backend/lambda/src/analytics-aurora/schema/001-initi
 
 **Schema contents to extract:**
 - `conversations` table (channel_arn, created_at, summary, status)
-- `messages` table (message_id, channel_arn, content, sender_arn, metadata JSONB, created_at, is_bot)
-- `exchanges` table (id, conversation_id, user_message_id, agent_message_id, latency_ms, intent, task_id, delivery_option)
-- `evaluation_results` table (exchange_id, run_id, relevance_score, classification, flags, compliance)
+- `messages` table (message_id, channel_arn, content, sender_arn, metadata JSONB, created_at, is_bot, task_state, task_transition)
+- `exchanges` table (id, conversation_id, user_message_id, agent_message_id, latency_ms, intent, task_id, delivery_option, task_state, task_transition) - `task_state` is the declared-graph machine state per turn (distinct from `task_status`); `task_transition` is the `{from,to}` edge applied that turn
+- `evaluation_results` table (exchange_id, run_id, relevance_score, classification, flags, compliance, task_id, flow_id) - `task_id`/`flow_id` are the flow join keys Pass A stamps at write time
 - `intent_flows` table (task_id, agent_type, outcome_score, efficiency_score, context_retention_score)
 - `agent_scores` table (agent_type, date, composite_score, violation_count)
 - `conversation_summaries` table (channel_arn, purpose, name, topics, version)
@@ -307,7 +307,10 @@ backlog on demand.
    so the console and the judge always see exactly what the human saw.
 4. Calls Bedrock (Haiku, `EVALUATOR_MODEL`) and writes one `evaluation_results`
    row per exchange (`evaluation_type = 'exchange'`): relevance score,
-   classification, reasoning, agent_type, intent.
+   classification, reasoning, agent_type, intent. It also stamps the flow join
+   keys at write time - `task_id` (from the exchange) and `flow_id` (resolved to
+   the `intent_flows` row when one exists, else backfilled by Pass B) - so a
+   per-exchange score reaches its flow without round-tripping through `exchanges`.
 
 **Pass B - multi-turn flow scoring (the flow-eval runner).** Runs after Pass A in
 the same invocation.
@@ -332,8 +335,10 @@ the same invocation.
    `abandoned`, `failed` - the same set the Flows-tab status color map uses);
    `exchange_count` (user->agent pairs), `turn_count` (individual messages,
    about twice the exchange count), `first`/`last_exchange_at`,
-   `duration_seconds`, and the `exchanges` JSON summary. The Flows tab
-   (`SPEC-ADMIN-CONSOLE.md` Quality > Flows) reads these rows via
+   `duration_seconds`, and the `exchanges` JSON summary. It also backfills
+   `flow_id` onto the Pass A `evaluation_results` rows for that task (those
+   scored before the flow row existed). The Flows view
+   (`SPEC-ADMIN-CONSOLE.md` Effectiveness > Flows) reads these rows via
    `evaluation_flows`; it renders its empty state until the flow pass has
    populated `intent_flows`.
 
@@ -356,6 +361,12 @@ HTTP API Lambda that serves the admin dashboard. Endpoints:
 - `GET /analytics/admin-reviews` - flagged responses queue
 - `GET /analytics/funnel-counts` - conversion funnel metrics
 - `GET /analytics/conversations` - conversation list with summaries
+
+The POST query interface also serves the Effectiveness drill (Aurora-only): `intent_effectiveness`
+(the L0 per-intent dashboard - classification/execution/latency/cost/tools; pass an `intent` for the
+L1 single-intent view), `intent_exchanges` (L2 exchange list for a DIRECT intent), and `task_timeline`
+(L3 per-task turn timeline, with L4 steps inline). `task_details` returns the current `task_state` +
+`transition_count` and accepts an optional `intent` filter.
 
 ### 9. Summary Updater Lambda
 

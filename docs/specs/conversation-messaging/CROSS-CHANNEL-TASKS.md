@@ -8,7 +8,7 @@ asynchronous-fulfillment pipeline.
 
 ## How it works
 
-Tasks (`guided_troubleshooting`, `data_extraction`, `report_generation`)
+Tasks (`guided_troubleshooting`, `data_extraction`, `report_generation`, `place_item`, `action_item`)
 are resumed only when the active row's `channelArn` matches the
 current channel. Tasks active in OTHER channels are surfaced to the
 agent via a brief prompt hint, never auto-resumed. This keeps a task

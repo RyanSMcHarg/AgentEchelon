@@ -12,7 +12,8 @@
 - `backend/lambda/create-conversation/index.js` - channel creation + flow association
 - `docs/guides/admin/GUIDE-AB-TESTING-AND-BATTLES.md` - deployer/operator guide
 - `docs/specs/analytics-eval/SPEC-DRIFT-CONVERGENCE.md` - battle messages bypass the live-suggestion path; the drift-detection schema carries a `battle_id` tag
-- `backend/lambda/src/lib/task-tracking.ts` - task state machines; `UserTasksTable` GSI changes documented under Task-Tracking Implications
+- `backend/lambda/src/lib/task-state-machines.ts` - the declared task-state graphs (`DEFAULT_TASK_STATE_MACHINES`, `authorizeTransition`)
+- `backend/lambda/src/lib/task-tracking.ts` - task persistence + `stateHistory`; `UserTasksTable` GSI changes documented under Task-Tracking Implications
 
 ## Design Anchor
 
@@ -425,7 +426,7 @@ Round 2 must not fire until **each bot has fully completed the intent** for the 
 | `DIRECT` | The single direct reply is posted (no async invocation; round-1 complete the moment the bot's `SendChannelMessage` returns) |
 | `PLACEHOLDER_UPDATE` | The async processor's `UpdateChannelMessage` lands (the existing case) |
 | `TASK_UPDATE_IN_PLACE` | The task transitions to status `completed` or `failed` |
-| `TASK_MULTI_STEP` | The task chain reaches a terminal status (`completed`, `failed`, or `escalated`). May span many user turns |
+| `TASK_MULTI_STEP` | The task chain reaches a terminal `task_state` (a declared-graph state with no outgoing edges, i.e. disposition success/failure/handoff - e.g. `completed`, `resolved`, `escalated`), distinct from the `task_status` lifecycle. May span many user turns |
 
 A rebuttal mid-task-chain is nonsensical - the rebutting bot doesn't yet know what the rival is producing. The orchestrator therefore tracks **intent completion**, not message-write completion.
 

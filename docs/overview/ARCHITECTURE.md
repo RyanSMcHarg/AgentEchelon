@@ -592,7 +592,8 @@ check it. See `docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md`.
                                                    │
                                                    ▼
                                            Admin Dashboard
-                                           (12 tabs in Aurora mode)
+                                    (intent-anchored Effectiveness drill
+                                       + supporting views, Aurora mode)
 ```
 
 The diagram above is the **archival/analytics** path (asynchronous, off the request path). The **live
@@ -672,7 +673,7 @@ Access to AI models is enforced at the IAM level. Deployments can choose Anthrop
 
 | Tier | Models Available | Handler Timeout | Task Tracking | File Access |
 |------|-----------------|----------------|---------------|-------------|
-| Basic | Configurable basic model (default: Claude Haiku) | 30s | No | `/basic/*` prefix |
+| Basic | Configurable basic model (default: Claude Haiku) | 30s | DynamoDB tasks | `/basic/*` prefix |
 | Standard | Configurable standard model plus standard-safe fallbacks (default: Sonnet) | 60s | DynamoDB tasks | `/standard/*` prefix |
 | Premium | Configurable premium model with full catalog access (default: Opus) | 90s | DynamoDB tasks | `/premium/*` prefix |
 
@@ -686,11 +687,12 @@ Deployment model overrides are selected in CDK with `basicModelKey`, `standardMo
 
 ## Admin Dashboard
 
-The admin console groups its views into **6 sections** (section rail + sub-tabs):
-Overview (Overview + Latency), Conversations, Quality (Evaluations + the
-Aurora-only Flows/Flagged/Ground Truth/Tasks), Models (Models + Model Strategy),
-Experiments, and Users (Users + Manage Users). Aurora-only views are hidden in
-Athena mode. (Usage: [ADMIN-GUIDE.md](../guides/admin/ADMIN-GUIDE.md); design:
+The admin console groups its views into **7 sections** (section rail + sub-tabs):
+Overview (Overview + Latency), Conversations, Effectiveness (the intent-anchored
+Effectiveness dashboard + the Aurora-only Evaluations/Flows/Flagged/Ground Truth/Tasks
+as drill depths), Models (Models + Model Strategy + Steps), Experiments,
+Users (Users + Manage Users), and Security (Membership Audit). Aurora-only views
+are hidden in Athena mode. (Usage: [ADMIN-GUIDE.md](../guides/admin/ADMIN-GUIDE.md); design:
 [SPEC-ADMIN-CONSOLE.md](../specs/admin-console/SPEC-ADMIN-CONSOLE.md).) The individual views:
 
 | Tab | Mode | Data Source | Shows |
@@ -707,7 +709,8 @@ Athena mode. (Usage: [ADMIN-GUIDE.md](../guides/admin/ADMIN-GUIDE.md); design:
 | Flows | Aurora | `evaluation_flows` | Multi-turn evaluation: 5 weighted dimensions, drill into flow detail |
 | Flagged | Aurora | `flagged_responses` | Response review queue: approve/reject with notes |
 | Ground Truth | Aurora | `ground_truth` | Human scores vs automated scores, calibration metrics |
-| Tasks | Aurora | `task_metrics`, `task_details` | Completion rate, duration, per-type breakdown |
+| Tasks | Aurora | `task_metrics`, `task_details` | Completion rate, duration, per-type breakdown; `task_details` also carries each task's current `task_state` (declared-graph machine state) + `transition_count` |
+| Effectiveness | Aurora | `intent_effectiveness`, `intent_exchanges`, `task_timeline` | Intent-anchored worst-first dashboard (classification/execution/latency/cost/tool-error per intent), drilling intent -> exchanges/tasks -> per-task turn timeline -> steps |
 
 ---
 

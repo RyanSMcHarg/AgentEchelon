@@ -190,7 +190,7 @@ tokens × cost × outcome) is what makes A/B tests, per-tier cost, and quality
 | Channel flow / Lex entry | routed? mention type, selected **delivery mode** | archive event + message metadata |
 | Fulfillment handler | resolved tier `min(userTier,channelTier)`, classified **intent**, chosen **model**, **experiment assignment** (variant vs `deterministic`) | coded message metadata + analytics record |
 | `min(tier)` downgrade | `[SecurityEvent]` when a lower-tier user is in a higher-tier room | logs / security-event trail |
-| Async processor - **per Converse step** | one `ConverseStep` per tool-loop iteration: model, tokens in/out, step latency, **estimated cost** (`estCostUsd`) | out-of-band analytics, keyed by message id |
+| Async processor - **per Converse step** | one `ConverseStep` per tool-loop iteration: model, tokens in/out, step latency, **estimated cost** (`estCostUsd`), and structured per-tool outcomes `tools[]` (name, ok, bounded `errorClass`, no payloads/PII) | out-of-band analytics, keyed by message id |
 | Async processor - reply | totals: input/output tokens, Bedrock time, guardrail action, config fingerprint | `MESSAGE_ANALYTICS_TABLE` (out-of-band, keyed by message id, 7-day TTL) |
 | Every channel event | full event stream (message/redact/membership/channel) | Kinesis → conversation archive (Athena/Aurora) |
 | Drift / proactive analysis | conversation drift, tier/violation flags | archive-backed analysis (Aurora mode) |

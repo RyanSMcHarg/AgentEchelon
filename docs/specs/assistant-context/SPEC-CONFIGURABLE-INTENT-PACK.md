@@ -39,7 +39,12 @@ interface IntentDef {
   maxTokens?: number;                          // positive int; clamped to the tier ceiling + reasoning floor
   verbosity?: 'tight' | 'normal' | 'long';     // coarse hint
 }
-interface IntentPack { intents: IntentDef[]; }   // domain intents only
+interface IntentPack {
+  intents: IntentDef[];                             // domain intents only
+  machines?: Record<string, TaskStateMachine>;      // optional per-deployment task-state graphs
+}
+// `machines` is keyed by taskType and merged over DEFAULT_TASK_STATE_MACHINES; omit it and the
+// platform default graphs apply. This mirrors the intents-only universal-three pattern below.
 ```
 
 ### Per-intent response settings (P3)
@@ -173,8 +178,8 @@ test seam.
 
 `DEFAULT_INTENT_PACK` mirrors the default enterprise intents exactly. **A deployment that
 does not set `ASSISTANT_INTENT_PACK` uses the default** - same categories, same keyword
-fallback, same delivery mapping, same premium task-state-machine keys
-(`guided_troubleshooting` / `data_extraction` / `report_generation`).
+fallback, same delivery mapping, same default task-state-machine keys
+(`guided_troubleshooting` / `data_extraction` / `report_generation` / `place_item` / `action_item`).
 
 Pinned by `test/lib/intent-pack.test.ts` (the pack primitives + keyword fallback + delivery map for
 DEFAULT) and the existing routing/delivery suites (45 tests) staying green. **Scope of the
