@@ -162,6 +162,13 @@ export interface AnalyticsMetadata {
     label: string;
   };
 
+  // Task state machine (SPEC-TASK-STATE-TRANSITIONS §6). Analytics-only (NOT in
+  // FRONTEND_METADATA_KEYS): `taskState` is the machine state after this turn; `taskTransition` is
+  // present only on turns that transitioned, so quality can be sliced by state, and transition
+  // events (regression rate, time-in-state, terminal split) become countable.
+  taskState?: string;
+  taskTransition?: { from: string; to: string };
+
   // Bedrock resilience tracking
   wasFallback?: boolean;
   fallbackReason?: string;
@@ -217,6 +224,9 @@ export interface AnalyticsContext {
     status: string;
     label: string;
   };
+
+  taskState?: string;
+  taskTransition?: { from: string; to: string };
 
   wasFallback?: boolean;
   fallbackReason?: string;
@@ -299,6 +309,9 @@ export function buildAnalyticsMetadata(context: AnalyticsContext): AnalyticsMeta
   if (context.activeTask) {
     metadata.activeTask = context.activeTask;
   }
+
+  if (context.taskState) metadata.taskState = context.taskState;
+  if (context.taskTransition) metadata.taskTransition = context.taskTransition;
 
   if (context.wasFallback !== undefined) metadata.wasFallback = context.wasFallback;
   if (context.fallbackReason) metadata.fallbackReason = context.fallbackReason;

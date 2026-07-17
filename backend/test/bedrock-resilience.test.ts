@@ -190,6 +190,7 @@ describe('invokeBedrockWithFallback', () => {
       undefined, // enableEditTools (work-item propose-and-confirm) — off for this turn
       undefined, // documentInput (attachment-in) — no document on this turn
       undefined, // cacheableSystemPrefixLength — no prompt-cache prefix on this turn
+      undefined, // taskContext (SPEC-TASK-STATE-TRANSITIONS) — no active task on this turn
     );
   });
 
@@ -244,6 +245,7 @@ describe('invokeBedrockWithFallback', () => {
       undefined, // enableEditTools (work-item propose-and-confirm)
       undefined, // documentInput (attachment-in) — no document on this turn
       undefined, // cacheableSystemPrefixLength — no prompt-cache prefix on this turn
+      undefined, // taskContext (SPEC-TASK-STATE-TRANSITIONS) — no active task on this turn
     );
   });
 

@@ -30,6 +30,7 @@ import { persistImageGenOutput, buildBattleImageContent } from './lib/image-gen-
 import { resolveBotDisplayName } from './lib/experiment-manager.js';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { invokeBedrockWithFallback } from './lib/bedrock-resilience.js';
+import { buildTaskLoopContext, shadowKeywordTransition, recordStallIfNoTransition } from './lib/async-processor-core.js';
 import { buildRetrievedContextHint, buildConversationSummaryHint } from './analytics-aurora/document-retrieval.js';
 import {
   getTask,
@@ -44,7 +45,7 @@ import { getModelCatalog, INTENT_ROUTE_STRATEGY, DEFAULT_TIER_MODEL_SELECTION, b
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const CONTEXT_BUCKET = process.env.CONTEXT_BUCKET || '';
-// Per-tier bot SSM key (= /agent-echelon/tier/premium/bot-arn), always set by the
+// Per-tier bot SSM key (= /agent-echelon/assistant/premium/bot-arn), always set by the
 // premium tier stack. There is no shared-bot fallback.
 const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || '';
 
@@ -388,6 +389,14 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     //  - text             → unchanged.
     // Non-image battles and all non-battle invocations are unaffected.
     let bedrockResult;
+
+    // SPEC-TASK-STATE-TRANSITIONS: active-task context for the in-loop advance_task_state tool
+    // (undefined unless this turn belongs to a machine-backed task). Passing it registers the tool.
+    const taskContext = await buildTaskLoopContext({
+      taskId: event.taskId,
+      taskType: event.taskType,
+      channelArn: event.channelArn,
+    });
     let battleImageCount: number | undefined;
     // Phase-4 generation-out: a battle variant bound to an image-gen
     // model (Titan v2 / Nova Canvas) produces an IMAGE from the prompt
@@ -508,20 +517,20 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
         bedrockMessages,
         invokeConfig,
         resolution.fallbackModelId,
-        { enableCompanyContextTool: true, cacheableSystemPrefixLength },
+        { enableCompanyContextTool: true, cacheableSystemPrefixLength, taskContext },
       );
     }
     const { response } = bedrockResult;
 
-    // Detect and execute state transitions
-    if (event.taskId && event.taskType) {
-      const task = await getTask(event.taskId, event.channelArn);
-      if (task?.taskState && detectStateTransition(response, event.taskType, task.taskState, TASK_STATE_MACHINES)) {
-        const newState = await advanceTaskState(event.taskId, event.channelArn, event.taskType);
-        if (newState) {
-          console.log(`[PremiumAsyncProcessor] Task state advanced to: ${newState}`);
-        }
-      }
+    // SPEC-TASK-STATE-TRANSITIONS §8: task state now advances ONLY via the authorized
+    // advance_task_state tool inside the loop (recorded on taskContext.transitions). The legacy
+    // keyword detector runs in SHADOW mode — it logs what it WOULD have advanced (to measure the old
+    // race rate on real traffic) but no longer mutates state.
+    if (taskContext) {
+      shadowKeywordTransition(response, taskContext, 'PremiumAsyncProcessor');
+      // §7: a task turn that advanced nothing bumps the stall counter (emits task_state_stalled past
+      // the threshold). No-op when the tool advanced this turn.
+      await recordStallIfNoTransition(taskContext);
     }
 
     // Generate document attachment — on report tasks or explicit user request
@@ -580,6 +589,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       conversationHistoryLength: consolidatedHistory.length,
       startTime,
       activeTaskInfo,
+      taskContext,
       attachment,
       wasFallback: bedrockResult.wasFallback,
       fallbackReason: bedrockResult.fallbackReason,

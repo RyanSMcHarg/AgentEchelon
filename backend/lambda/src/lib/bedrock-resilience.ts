@@ -18,6 +18,7 @@ import {
   type BedrockDocumentInput,
 } from './async-processor-core.js';
 import type { ConverseStep } from './analytics-metadata.js';
+import type { TaskLoopContext } from './task-tools.js';
 
 // ============================================================
 // Circuit Breaker
@@ -149,6 +150,12 @@ interface ResilientInvokeOptions {
    * invokeBedrock on the primary AND fallback paths. Omit to disable caching.
    */
   cacheableSystemPrefixLength?: number;
+  /**
+   * SPEC-TASK-STATE-TRANSITIONS: the active task context. Passing it registers the task tools
+   * (advance_task_state) and lets the in-Lambda loop dispatch an authorized transition. Forwarded
+   * verbatim to invokeBedrock on the primary AND fallback paths.
+   */
+  taskContext?: TaskLoopContext;
 }
 
 /**
@@ -177,7 +184,7 @@ export async function invokeBedrockWithFallback(
     console.warn(`[BedrockResilience] Circuit open for ${primaryConfig.model}, skipping to fallback`);
 
     if (fallbackModelId) {
-      return tryFallback(systemPrompt, messages, primaryConfig, fallbackModelId, 0, 'circuit_open', options.imageInput, options.enableCompanyContextTool, options.enableEditTools, options.documentInput, options.cacheableSystemPrefixLength);
+      return tryFallback(systemPrompt, messages, primaryConfig, fallbackModelId, 0, 'circuit_open', options.imageInput, options.enableCompanyContextTool, options.enableEditTools, options.documentInput, options.cacheableSystemPrefixLength, options.taskContext);
     }
     // No fallback available — try primary anyway (circuit may be stale)
   }
@@ -186,7 +193,7 @@ export async function invokeBedrockWithFallback(
   let lastError: unknown;
   for (let attempt = 0; attempt <= maxRetries; attempt++) {
     try {
-      const result = await invokeBedrock(systemPrompt, messages, primaryConfig, options.imageInput, options.enableCompanyContextTool, options.enableEditTools, options.documentInput, options.cacheableSystemPrefixLength);
+      const result = await invokeBedrock(systemPrompt, messages, primaryConfig, options.imageInput, options.enableCompanyContextTool, options.enableEditTools, options.documentInput, options.cacheableSystemPrefixLength, options.taskContext);
       circuitBreaker.recordSuccess(primaryConfig.model);
       return {
         ...result,
@@ -213,7 +220,7 @@ export async function invokeBedrockWithFallback(
       if (action === 'fallback') {
         circuitBreaker.recordFailure(primaryConfig.model);
         if (fallbackModelId) {
-          return tryFallback(systemPrompt, messages, primaryConfig, fallbackModelId, attempt + 1, reason, options.imageInput, options.enableCompanyContextTool, options.enableEditTools, options.documentInput, options.cacheableSystemPrefixLength);
+          return tryFallback(systemPrompt, messages, primaryConfig, fallbackModelId, attempt + 1, reason, options.imageInput, options.enableCompanyContextTool, options.enableEditTools, options.documentInput, options.cacheableSystemPrefixLength, options.taskContext);
         }
         throw error;
       }
@@ -232,7 +239,7 @@ export async function invokeBedrockWithFallback(
   circuitBreaker.recordFailure(primaryConfig.model);
 
   if (fallbackModelId) {
-    return tryFallback(systemPrompt, messages, primaryConfig, fallbackModelId, retryCount, 'retries_exhausted', options.imageInput, options.enableCompanyContextTool, options.enableEditTools, options.documentInput, options.cacheableSystemPrefixLength);
+    return tryFallback(systemPrompt, messages, primaryConfig, fallbackModelId, retryCount, 'retries_exhausted', options.imageInput, options.enableCompanyContextTool, options.enableEditTools, options.documentInput, options.cacheableSystemPrefixLength, options.taskContext);
   }
 
   throw lastError;
@@ -250,11 +257,12 @@ async function tryFallback(
   enableEditTools?: boolean,
   documentInput?: BedrockDocumentInput,
   cacheableSystemPrefixLength?: number,
+  taskContext?: TaskLoopContext,
 ): Promise<ResilientInvokeResult> {
   console.log(`[BedrockResilience] Falling back to ${fallbackModelId} (reason: ${reason})`);
 
   const fallbackConfig = { ...primaryConfig, model: fallbackModelId };
-  const result = await invokeBedrock(systemPrompt, messages, fallbackConfig, imageInput, enableCompanyContextTool, enableEditTools, documentInput, cacheableSystemPrefixLength);
+  const result = await invokeBedrock(systemPrompt, messages, fallbackConfig, imageInput, enableCompanyContextTool, enableEditTools, documentInput, cacheableSystemPrefixLength, taskContext);
   circuitBreaker.recordSuccess(fallbackModelId);
 
   return {

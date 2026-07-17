@@ -13,7 +13,17 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, QueryCommand, ScanCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
 import { DeliveryOption } from './delivery-options.js';
+import {
+  type TaskStateMachine,
+  type TerminalKind,
+  DEFAULT_TASK_STATE_MACHINES,
+  authorizeTransition,
+} from './task-state-machines.js';
+import { emitEmfMetric } from './emf-metrics.js';
 import * as crypto from 'crypto';
+
+/** CloudWatch EMF namespace for task-lifecycle metrics (SPEC-TASK-STATE-TRANSITIONS §7). */
+const TASK_METRICS_NAMESPACE = 'AgentEchelon/Tasks';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 // removeUndefinedValues: createTask/createBattleTask write optional
@@ -35,6 +45,31 @@ export type TaskStatus = 'pending' | 'in_progress' | 'completed' | 'failed' | 'c
 
 /** Active = still needs work (eligible for resume, nudge, cascade-cancel). */
 export const ACTIVE_TASK_STATUSES: readonly TaskStatus[] = ['pending', 'in_progress', 'abandoned'];
+
+/**
+ * One entry in a task's append-only transition log (SPEC-TASK-STATE-TRANSITIONS §6) — the
+ * task-lifecycle analog of the membership-history timeline. `by: 'tool'` = the model requested it
+ * via advance_task_state / propose_item; `by: 'system'` = a TTL expiry, admin action, or error-path
+ * fail. `reason` is the model's stated justification; `messageId` is the turn that carried the call.
+ */
+export interface StateTransition {
+  from: string;
+  to: string;
+  at: string; // ISO
+  by: 'tool' | 'system';
+  reason?: string;
+  messageId?: string;
+}
+
+/** Result of a requested transition (authorization + persistence). Mirrors the tool result shape. */
+export type AdvanceResult =
+  | { ok: true; from: string; to: string; terminal?: TerminalKind }
+  | {
+      ok: false;
+      error: 'no_active_task' | 'unknown_state' | 'illegal_transition' | 'persist_failed';
+      from?: string;
+      legal?: string[];
+    };
 
 /**
  * Task state machines for multi-turn intents
@@ -93,6 +128,15 @@ export interface Task {
   deliveryOption: DeliveryOption;
   taskType?: string;
   taskState?: string; // Current state in the state machine
+  /** Append-only transition log (SPEC-TASK-STATE-TRANSITIONS §6). Absent on tasks with no machine. */
+  stateHistory?: StateTransition[];
+  /**
+   * Consecutive active-task turns spent in the current `taskState` without a transition
+   * (SPEC-TASK-STATE-TRANSITIONS §7). Reset to 0 on every authorized advance; incremented on a
+   * task turn that applied none. Feeds the `task_state_stalled` signal — the runtime NEVER
+   * force-advances, this is only a dashboard signal that the model is failing to drive the task.
+   */
+  turnsInState?: number;
   messageId?: string;
   details?: Record<string, unknown>; // State-specific data collected during the task
   createdAt: string;
@@ -824,6 +868,155 @@ export async function advanceTaskState(
     console.error('Error advancing task state:', error);
     return null;
   }
+}
+
+/**
+ * Advance a task to an EXPLICITLY REQUESTED state, authorized against the task type's graph
+ * (SPEC-TASK-STATE-TRANSITIONS §3). This is the only sanctioned mutation of `taskState` for
+ * machine-backed tasks under the new design: the model requests a transition (via the
+ * advance_task_state / propose_item tool), the runtime authorizes the edge, and only an authorized
+ * edge persists — appending to `stateHistory` (§6). Returns a discriminated result the tool layer
+ * renders directly; an unauthorized request changes no state and returns an error the model can read
+ * and recover from in the same loop iteration.
+ *
+ * The caller supplies the already-fetched `task` (the processor holds it), so this performs check 1
+ * ("an active task exists") on the passed object and checks 2-3 against the graph.
+ */
+export async function advanceTaskStateTo(args: {
+  task: Task;
+  toState: string;
+  by?: 'tool' | 'system';
+  reason?: string;
+  messageId?: string;
+  details?: Record<string, unknown>;
+  machines?: Record<string, TaskStateMachine>;
+}): Promise<AdvanceResult> {
+  const { task, toState } = args;
+  const machines = args.machines ?? DEFAULT_TASK_STATE_MACHINES;
+  if (!task.taskType || !task.taskState) {
+    return { ok: false, error: 'no_active_task' };
+  }
+
+  const authz = authorizeTransition(task.taskType, task.taskState, toState, machines);
+  if (!authz.ok) {
+    return { ok: false, error: authz.error, from: authz.from, legal: authz.legal };
+  }
+
+  if (!TASKS_TABLE) {
+    // No persistence backend (e.g. unit context): the authorization decision still stands, and the
+    // in-memory task moves — including clearing its stall counter, same as the persisted path.
+    task.turnsInState = 0;
+    return { ok: true, from: authz.from, to: authz.to, terminal: authz.terminal };
+  }
+
+  const now = new Date().toISOString();
+  const entry: StateTransition = {
+    from: authz.from,
+    to: authz.to,
+    at: now,
+    by: args.by ?? 'tool',
+    ...(args.reason ? { reason: args.reason } : {}),
+    ...(args.messageId ? { messageId: args.messageId } : {}),
+  };
+
+  try {
+    const sets = [
+      'taskState = :to',
+      'updatedAt = :now',
+      'stateHistory = list_append(if_not_exists(stateHistory, :empty), :entry)',
+      // §7: a transition clears the stall counter — the task moved, so it isn't stalled.
+      'turnsInState = :zero',
+    ];
+    const exprValues: Record<string, unknown> = {
+      ':to': authz.to,
+      ':now': now,
+      ':empty': [] as StateTransition[],
+      ':entry': [entry],
+      ':zero': 0,
+    };
+    if (args.details) {
+      sets.push('details = :details');
+      exprValues[':details'] = { ...task.details, ...args.details };
+    }
+    await dynamoClient.send(new UpdateCommand({
+      TableName: TASKS_TABLE,
+      Key: { taskId: task.taskId, channelArn: task.channelArn },
+      UpdateExpression: 'SET ' + sets.join(', '),
+      ExpressionAttributeValues: exprValues,
+    }));
+    task.turnsInState = 0;
+    console.log(
+      `[task-state] ${task.taskId} ${authz.from} -> ${authz.to} ` +
+        `(by ${entry.by}${args.reason ? `: ${args.reason}` : ''})`,
+    );
+    return { ok: true, from: authz.from, to: authz.to, terminal: authz.terminal };
+  } catch (error) {
+    // Persistence failed AFTER authorization — report failure so the model does not believe the
+    // state changed. The task rests in its current state (§7), which is recoverable.
+    console.error('[task-state] Error persisting transition:', error);
+    return { ok: false, error: 'persist_failed', from: authz.from };
+  }
+}
+
+/**
+ * Turns a machine-backed task may sit in one state before the runtime flags it stalled
+ * (SPEC-TASK-STATE-TRANSITIONS §7). Env-overridable (`TASK_STALL_TURNS`), default 6, floor 1. The
+ * runtime NEVER force-advances on a stall — this only surfaces, on the dashboard, tasks the model is
+ * failing to drive forward.
+ */
+export const TASK_STALL_TURNS = Math.max(1, Number(process.env.TASK_STALL_TURNS) || 6);
+
+/**
+ * Record an active-task turn that applied NO transition (SPEC-TASK-STATE-TRANSITIONS §7): atomically
+ * increment `turnsInState`, and once it reaches TASK_STALL_TURNS emit `task_state_stalled` (log + EMF)
+ * so a model that keeps a task pinned in one state is visible. Reflects the new count back onto the
+ * passed `task`. Best-effort — a telemetry miss never blocks the reply; returns the (best-known)
+ * counter for tests/callers. No-op for a task with no machine state.
+ */
+export async function recordNoTransitionTurn(task: Task): Promise<number> {
+  if (!task.taskType || !task.taskState) return task.turnsInState ?? 0;
+
+  // Resolve the new count: authoritative via an atomic ADD when a backend exists (survives concurrent
+  // turns), else the in-memory increment. The stall signal below fires off this resolved count either
+  // way, so it stays observable without a persistence backend (e.g. in tests).
+  let turns = (task.turnsInState ?? 0) + 1;
+  if (TASKS_TABLE) {
+    try {
+      const res = await dynamoClient.send(new UpdateCommand({
+        TableName: TASKS_TABLE,
+        Key: { taskId: task.taskId, channelArn: task.channelArn },
+        // ADD is atomic across concurrent turns and treats a missing attribute as 0.
+        UpdateExpression: 'SET updatedAt = :now ADD turnsInState :one',
+        ExpressionAttributeValues: { ':now': new Date().toISOString(), ':one': 1 },
+        ReturnValues: 'UPDATED_NEW',
+      }));
+      const persisted = Number((res.Attributes as { turnsInState?: number } | undefined)?.turnsInState);
+      if (Number.isFinite(persisted)) turns = persisted;
+    } catch (err) {
+      console.warn('[task-state] turnsInState increment failed (non-fatal):', err);
+    }
+  }
+  task.turnsInState = turns;
+
+  if (turns >= TASK_STALL_TURNS) {
+    console.log(
+      '[task-state] task_state_stalled ' +
+        JSON.stringify({ taskId: task.taskId, taskType: task.taskType, taskState: task.taskState, turnsInState: turns }),
+    );
+    emitEmfMetric({
+      namespace: TASK_METRICS_NAMESPACE,
+      metrics: [{ name: 'task_state_stalled', unit: 'Count' }],
+      dimensionSets: [['TaskType'], ['TaskType', 'TaskState']],
+      properties: {
+        task_state_stalled: 1,
+        TaskType: task.taskType,
+        TaskState: task.taskState,
+        turnsInState: turns,
+        TaskId: task.taskId,
+      },
+    });
+  }
+  return turns;
 }
 
 /**

@@ -16,6 +16,12 @@
  * signal (rule 3, INTENT_ROUTE_STRATEGY) — so a deployment's own intents drive model resolution.
  */
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import {
+  type TaskStateMachine,
+  type TerminalKind,
+  DEFAULT_TASK_STATE_MACHINES,
+  validateTaskStateMachines,
+} from './task-state-machines.js';
 
 /** The three intents every assistant has, regardless of domain. Their string values are stable
  *  (consumers compare against `IntentType.GREETING` etc.). */
@@ -52,6 +58,13 @@ export interface ResponseSettings {
 export interface IntentPack {
   /** Domain intents only — the universal three are added implicitly. */
   intents: IntentDef[];
+  /**
+   * Task state machines keyed by taskType (SPEC-TASK-STATE-TRANSITIONS §4). Optional and
+   * per-deployment: absent ⇒ the platform DEFAULT_TASK_STATE_MACHINES. A deployment may override
+   * a subset; the accessor (`taskStateMachines`) merges its overrides over the defaults so the
+   * work-item types (place_item, action_item) survive a pack that only tunes the domain machines.
+   */
+  machines?: Record<string, TaskStateMachine>;
 }
 
 /**
@@ -171,10 +184,63 @@ function coerceIntentDef(raw: unknown): IntentDef | null {
   };
 }
 
+const TERMINAL_KINDS: readonly TerminalKind[] = ['success', 'failure', 'handoff'];
+
+/**
+ * Coerce and validate the optional `machines` block from a parsed pack object. Never throws — a
+ * malformed machines block logs LOUDLY and yields `undefined` so the deployment falls back to the
+ * DEFAULT machines rather than shipping an unreachable state (SPEC-TASK-STATE-TRANSITIONS §4), while
+ * intent classification is never taken down with it.
+ */
+function coerceMachinesConfig(raw: unknown): Record<string, TaskStateMachine> | undefined {
+  if (raw === undefined) return undefined;
+  try {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+      throw new Error('machines must be an object keyed by taskType');
+    }
+    const out: Record<string, TaskStateMachine> = {};
+    for (const [name, m] of Object.entries(raw as Record<string, unknown>)) {
+      if (!m || typeof m !== 'object') throw new Error(`machine "${name}" is not an object`);
+      const mr = m as Record<string, unknown>;
+      if (typeof mr.initial !== 'string' || !mr.initial.trim()) throw new Error(`machine "${name}" has no initial state`);
+      if (!mr.states || typeof mr.states !== 'object' || Array.isArray(mr.states)) {
+        throw new Error(`machine "${name}" has no states object`);
+      }
+      const states: Record<string, TaskStateMachine['states'][string]> = {};
+      for (const [stateName, sd] of Object.entries(mr.states as Record<string, unknown>)) {
+        if (!sd || typeof sd !== 'object') throw new Error(`machine "${name}" state "${stateName}" is not an object`);
+        const sr = sd as Record<string, unknown>;
+        const transitions = Array.isArray(sr.transitions)
+          ? sr.transitions.filter((t): t is string => typeof t === 'string')
+          : (() => { throw new Error(`machine "${name}" state "${stateName}" transitions must be an array`); })();
+        const terminal =
+          typeof sr.terminal === 'string' && (TERMINAL_KINDS as readonly string[]).includes(sr.terminal)
+            ? (sr.terminal as TerminalKind)
+            : undefined;
+        states[stateName] = {
+          transitions,
+          ...(terminal ? { terminal } : {}),
+          ...(typeof sr.prompt === 'string' ? { prompt: sr.prompt } : {}),
+          ...(typeof sr.placeholder === 'string' ? { placeholder: sr.placeholder } : {}),
+        };
+      }
+      out[name] = { initial: mr.initial.trim(), states };
+    }
+    // Validate the merged view the runtime will actually use, so a partial override cannot leave a
+    // default machine shadowed by an unreachable one.
+    const merged = { ...DEFAULT_TASK_STATE_MACHINES, ...out };
+    validateTaskStateMachines(merged);
+    return out;
+  } catch (err) {
+    console.error('[IntentPack] Invalid `machines` block — falling back to DEFAULT machines:', err);
+    return undefined;
+  }
+}
+
 /**
  * The active intent pack. Parsed once from `ASSISTANT_INTENT_PACK` (a JSON array of IntentDef, or
- * an object `{ intents: [...] }`). Any parse/shape error logs and falls back to DEFAULT — a bad
- * pack must never break classification.
+ * an object `{ intents: [...], machines?: {...} }`). Any parse/shape error logs and falls back to
+ * DEFAULT — a bad pack must never break classification.
  */
 export function getIntentPack(): IntentPack {
   const raw = rawPackSource();
@@ -193,7 +259,10 @@ export function getIntentPack(): IntentPack {
       .map(coerceIntentDef)
       .filter((d): d is IntentDef => d !== null);
     if (intents.length === 0) throw new Error('no valid intents after coercion');
-    cachedPack = { intents };
+    const machines = Array.isArray(parsed)
+      ? undefined
+      : coerceMachinesConfig((parsed as Record<string, unknown>)?.machines);
+    cachedPack = machines ? { intents, machines } : { intents };
   } catch (err) {
     console.error('[IntentPack] Invalid ASSISTANT_INTENT_PACK — falling back to DEFAULT:', err);
     cachedPack = DEFAULT_INTENT_PACK;
@@ -267,6 +336,17 @@ export function clampResponseMaxTokens(
 /** All valid classified keys for the active pack (universal + domain) — used to validate LLM output. */
 export function knownIntentKeys(pack: IntentPack = getIntentPack()): Set<string> {
   return new Set<string>([...UNIVERSAL_INTENT_KEYS, ...pack.intents.map((d) => d.key)]);
+}
+
+/**
+ * The task state machines for the active pack (SPEC-TASK-STATE-TRANSITIONS §4). The deployment's
+ * declared machines are merged OVER the platform defaults, so a pack that overrides only the domain
+ * machines keeps the work-item defaults (place_item, action_item). Absent ⇒ the defaults verbatim.
+ */
+export function taskStateMachines(
+  pack: IntentPack = getIntentPack(),
+): Record<string, TaskStateMachine> {
+  return pack.machines ? { ...DEFAULT_TASK_STATE_MACHINES, ...pack.machines } : DEFAULT_TASK_STATE_MACHINES;
 }
 
 /**

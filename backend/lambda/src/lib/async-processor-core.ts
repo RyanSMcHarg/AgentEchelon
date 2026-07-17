@@ -46,7 +46,15 @@ import {
   IMAGE_GEN_MODELS,
   type ImageGenModelKey,
 } from './image-gen-models.js';
-import { updateTaskStatus, getTask, TASK_STATE_MACHINES, type TaskStatus, type Task } from './task-tracking.js';
+import { updateTaskStatus, getTask, recordNoTransitionTurn, TASK_STATE_MACHINES, type TaskStatus, type Task } from './task-tracking.js';
+import {
+  ADVANCE_TASK_STATE_TOOL_NAME,
+  taskToolSpecsFor,
+  handleAdvanceTaskStateTool,
+  advancePlaceItemOnProposal,
+  type TaskLoopContext,
+} from './task-tools.js';
+import { taskStateMachines } from './intent-pack.js';
 import { claimCorrelation, capUserMessage } from './abuse-controls.js';
 import { matchAssigneeInRoster, buildAssignmentNotice } from './task-notify.js';
 import type { RosterParticipant } from './channel-notify.js';
@@ -1120,6 +1128,7 @@ export async function invokeBedrock(
   enableEditTools = false,
   documentInput?: BedrockDocumentInput,
   cacheableSystemPrefixLength?: number,
+  taskContext?: TaskLoopContext,
 ): Promise<{ response: string; inputTokens: number; outputTokens: number; bedrockTime: number; steps: ConverseStep[] }> {
   const bedrockStart = Date.now();
   const convMessages = buildConverseMessages(messages, imageInput, documentInput) as Array<Record<string, unknown>>;
@@ -1147,15 +1156,21 @@ export async function invokeBedrock(
   // ENABLE_TRAVEL_TOOL=true, so the platform stays domain-neutral by default. Read at
   // call time (like CONTEXT_BUCKET) so the env is always current and testable.
   const travelToolOn = isTravelToolEnabled();
-  const useTools = companyToolOn || enableEditTools || travelToolOn;
+  // SPEC-TASK-STATE-TRANSITIONS §3: register advance_task_state only when a machine-backed task is
+  // active (one fewer distractor tool off-task). The tool result is the ONLY thing that changes
+  // task state — the loop authorizes it against the graph and persists in-loop.
+  const taskToolSpecs = taskContext ? taskToolSpecsFor(taskContext.task.taskType, taskContext.machines) : [];
+  const taskToolsOn = taskToolSpecs.length > 0;
+  const useTools = companyToolOn || enableEditTools || travelToolOn || taskToolsOn;
   // Combined tool config: company-context + corporate-travel (both executed in-loop) +
-  // work-item tools (intercepted as proposals, never executed here). Each defaults off.
+  // work-item tools (intercepted as proposals, never executed here) + task tools. Each defaults off.
   const toolConfig = useTools
     ? { tools: [
         ...(companyToolOn ? COMPANY_CONTEXT_TOOL_CONFIG.tools : []),
         ...(companyToolOn ? PLATFORM_INFO_TOOL_CONFIG.tools : []),
         ...(travelToolOn ? [CORPORATE_TRAVEL_TOOL_SPEC] : []),
         ...(enableEditTools ? WORK_ITEM_TOOL_CONFIG.tools : []),
+        ...taskToolSpecs,
       ] }
     : undefined;
 
@@ -1227,6 +1242,9 @@ export async function invokeBedrock(
       if (proposal) {
         const lead = firstText(outMessage) || "Here's the change I'd make — review and apply it when you're ready.";
         response = `${lead}\n\n${proposalMarker(proposal.name, proposal.input)}`;
+        // SPEC-TASK-STATE-TRANSITIONS §5: the proposal itself drives place_item collecting->confirming
+        // via the authorized path (coupled to the tool success, not the marker). No-op for other tasks.
+        await advancePlaceItemOnProposal(taskContext);
         pushStep(`tool-propose:${proposal.name}`);
         break;
       }
@@ -1241,14 +1259,31 @@ export async function invokeBedrock(
         let payload: Record<string, unknown>;
         try {
           const toolInput = (block as { toolUse?: { input?: Record<string, unknown> } }).toolUse?.input ?? {};
-          payload =
-            toolUse.name === 'load_company_context'
-              ? ((await loadCompanyContext(companyContextBucket)) as unknown as Record<string, unknown>)
-              : toolUse.name === 'load_platform_info'
-                ? ((await loadPlatformInfo(companyContextBucket)) as unknown as Record<string, unknown>)
-                : toolUse.name === 'search_corporate_travel'
-                  ? (searchCorporateTravel(toolInput as unknown as TravelSearchArgs) as unknown as Record<string, unknown>)
-                  : { error: `unknown tool: ${toolUse.name}` };
+          if (toolUse.name === 'load_company_context') {
+            payload = (await loadCompanyContext(companyContextBucket)) as unknown as Record<string, unknown>;
+          } else if (toolUse.name === 'load_platform_info') {
+            payload = (await loadPlatformInfo(companyContextBucket)) as unknown as Record<string, unknown>;
+          } else if (toolUse.name === 'search_corporate_travel') {
+            payload = searchCorporateTravel(toolInput as unknown as TravelSearchArgs) as unknown as Record<string, unknown>;
+          } else if (taskContext && toolUse.name === ADVANCE_TASK_STATE_TOOL_NAME) {
+            // SPEC-TASK-STATE-TRANSITIONS §3: authorize + persist the requested transition. On
+            // success reflect the new state so later iterations see it, and record the applied
+            // transition on the shared context (for analytics + the shadow comparison). An
+            // unauthorized request returns an error the model can read and recover from in-loop.
+            const { payload: taskPayload, result } = await handleAdvanceTaskStateTool({
+              task: taskContext.task,
+              input: toolInput,
+              machines: taskContext.machines,
+              messageId: taskContext.messageId,
+            });
+            if (result.ok) {
+              taskContext.task.taskState = result.to;
+              (taskContext.transitions ??= []).push({ from: result.from, to: result.to });
+            }
+            payload = taskPayload;
+          } else {
+            payload = { error: `unknown tool: ${toolUse.name}` };
+          }
         } catch (err) {
           payload = { error: err instanceof Error ? err.message : 'tool execution failed' };
         }
@@ -1750,6 +1785,9 @@ export async function finalizePlaceholderResponse(params: {
   conversationHistoryLength: number;
   startTime: number;
   activeTaskInfo?: { type: string; status: string; label: string; taskId: string };
+  /** SPEC-TASK-STATE-TRANSITIONS: the active-task context, so finalize can stamp taskState +
+   *  the net transition applied this turn onto the analytics. Absent on non-task turns. */
+  taskContext?: TaskLoopContext;
   attachment?: GeneratedDocument;
   wasFallback?: boolean;
   fallbackReason?: string;
@@ -1875,6 +1913,16 @@ export async function finalizePlaceholderResponse(params: {
     activeTaskInfo.label = getTaskLabel(activeTaskInfo.type, 'completed');
   }
 
+  // SPEC-TASK-STATE-TRANSITIONS §6: stamp the machine state after this turn + the net transition
+  // (first from → last to) applied this turn, so exchanges are sliceable by state and transitions
+  // are countable. Distinct from activeTask.status (the task lifecycle) — this is the machine state.
+  const taskTx = params.taskContext?.transitions;
+  const taskAnalytics = {
+    taskState: params.taskContext?.task.taskState,
+    taskTransition:
+      taskTx && taskTx.length ? { from: taskTx[0].from, to: taskTx[taskTx.length - 1].to } : undefined,
+  };
+
   // Build analytics metadata
   const analyticsMetadata = buildAnalyticsMetadata({
     messageNumber: conversationHistoryLength + 1,
@@ -1893,6 +1941,8 @@ export async function finalizePlaceholderResponse(params: {
     totalMs: totalTime,
     pollMs: pollTime,
     ...(activeTaskInfo && { activeTask: activeTaskInfo }),
+    ...(taskAnalytics.taskState && { taskState: taskAnalytics.taskState }),
+    ...(taskAnalytics.taskTransition && { taskTransition: taskAnalytics.taskTransition }),
     ...(params.wasFallback !== undefined && { wasFallback: params.wasFallback }),
     ...(params.fallbackReason && { fallbackReason: params.fallbackReason }),
     ...(params.retryCount !== undefined && { retryCount: params.retryCount }),
@@ -2354,6 +2404,63 @@ export function detectStateTransition(
   }
 
   return false;
+}
+
+/**
+ * Build the active-task context for the Converse loop (SPEC-TASK-STATE-TRANSITIONS). Returns
+ * undefined unless the turn belongs to a machine-backed task with a current state — only then are
+ * the task tools registered. Captures `initialState` (the pre-turn state) for the shadow comparison.
+ */
+export async function buildTaskLoopContext(args: {
+  taskId?: string;
+  taskType?: string;
+  channelArn: string;
+  messageId?: string;
+}): Promise<TaskLoopContext | undefined> {
+  if (!args.taskId || !args.taskType) return undefined;
+  const machines = taskStateMachines();
+  if (!machines[args.taskType]) return undefined;
+  const task = await getTask(args.taskId, args.channelArn);
+  if (!task || !task.taskState) return undefined;
+  return { task, machines, messageId: args.messageId, initialState: task.taskState, transitions: [] };
+}
+
+/**
+ * Shadow-mode comparison (SPEC-TASK-STATE-TRANSITIONS §8). The authoritative advance now happens via
+ * the advance_task_state tool inside the loop; here the LEGACY keyword detector runs in LOG-ONLY mode
+ * against the pre-turn state, emitting `keyword_would_have_advanced` so the old race rate is
+ * measurable on real traffic. It NEVER mutates state. Logs only when either signal fired, to keep the
+ * shadow log sparse.
+ */
+export function shadowKeywordTransition(response: string, ctx: TaskLoopContext, tag: string): void {
+  const taskType = ctx.task.taskType;
+  const from = ctx.initialState;
+  if (!taskType || !from) return;
+  const keywordWouldAdvance = detectStateTransition(response, taskType, from, TASK_STATE_MACHINES);
+  const toolAdvanced = (ctx.transitions?.length ?? 0) > 0;
+  if (keywordWouldAdvance || toolAdvanced) {
+    console.log(
+      '[task-state][shadow] ' +
+        JSON.stringify({
+          tag,
+          taskType,
+          from,
+          keyword_would_have_advanced: keywordWouldAdvance,
+          tool_advanced: toolAdvanced,
+          tool_transitions: ctx.transitions ?? [],
+        }),
+    );
+  }
+}
+
+/**
+ * SPEC-TASK-STATE-TRANSITIONS §7 stall telemetry. On an active-task turn that applied NO transition,
+ * bump the task's `turnsInState` (and emit `task_state_stalled` past the threshold). A no-op when the
+ * tool advanced this turn — a transition resets the counter in advanceTaskStateTo. Best-effort.
+ */
+export async function recordStallIfNoTransition(ctx: TaskLoopContext | undefined): Promise<void> {
+  if (!ctx || (ctx.transitions?.length ?? 0) > 0) return;
+  await recordNoTransitionTurn(ctx.task);
 }
 
 /**

@@ -36,6 +36,7 @@ import { buildConfigIdentity, componentVersion } from './lib/config-identity.js'
 import { buildSystemPrompt } from './lib/context-framework.js';
 import { createHostContextRegistry } from './lib/host-context-resolvers.js';
 import { invokeBedrockWithFallback } from './lib/bedrock-resilience.js';
+import { buildTaskLoopContext, shadowKeywordTransition, recordStallIfNoTransition } from './lib/async-processor-core.js';
 import { makeConverseStep, type ConverseStep } from './lib/analytics-metadata.js';
 import { resolveModelPlan } from './lib/resolve-model-plan.js';
 import { externalProviderFromEnv, invokeExternalLlm } from './lib/providers/external-llm.js';
@@ -500,6 +501,14 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       steps?: ConverseStep[];
     };
 
+    // SPEC-TASK-STATE-TRANSITIONS: active-task context for the in-loop advance_task_state tool
+    // (undefined unless this turn belongs to a machine-backed task). Passing it registers the tool.
+    const taskContext = await buildTaskLoopContext({
+      taskId: event.taskId,
+      taskType: event.taskType,
+      channelArn: event.channelArn,
+    });
+
     // Attachment-in: the user sent an image/PDF/doc — fetch it and attach a Converse image or
     // document block so the assistant can read it. Best-effort: a fetch/format miss degrades to a
     // normal text turn. Populated only on the direct-invoke paths (@all).
@@ -589,6 +598,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
           imageInput,
           documentInput,
           cacheableSystemPrefixLength,
+          taskContext,
         });
       }
     } else {
@@ -600,7 +610,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
         bedrockMessages,
         bedrockInvokeConfig,
         cnFallbackModelId,
-        { enableCompanyContextTool: true, enableEditTools, imageInput, documentInput, cacheableSystemPrefixLength },
+        { enableCompanyContextTool: true, enableEditTools, imageInput, documentInput, cacheableSystemPrefixLength, taskContext },
       );
     }
     // On plan conversations, extract any ```suggestions JSON block the model emitted into a
@@ -610,26 +620,31 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       ? extractSuggestions(bedrockResult.response)
       : bedrockResult.response;
 
-    // Detect and execute state transitions
-    if (event.taskId && event.taskType) {
-      const task = await getTask(event.taskId, event.channelArn);
-      if (task?.taskState && detectStateTransition(response, event.taskType, task.taskState, TASK_STATE_MACHINES)) {
-        const newState = await advanceTaskState(event.taskId, event.channelArn, event.taskType);
-        if (newState) {
-          console.log(`[StandardAsyncProcessor] Task state advanced to: ${newState}`);
-          // Hand-off notification (Phase 5b): when an action item becomes the assignee's to act on,
-          // and the assignee is SOMEONE OTHER than whoever is chatting, email them via the notify bridge.
-          if (event.taskType === 'action_item' && newState === 'awaiting_completion') {
-            const roster = Array.isArray(event.participants) ? (event.participants as RosterParticipant[]) : [];
-            await postTaskHandoffNotice({
-              channelArn: event.channelArn,
-              botArn: event.botArn,
-              task: { ...task, taskState: newState },
-              roster,
-              senderArn: event.senderArn,
-            });
-          }
-        }
+    // SPEC-TASK-STATE-TRANSITIONS §8: task state now advances ONLY via the authorized
+    // advance_task_state tool inside the loop. The legacy keyword detector runs in SHADOW mode
+    // (log-only, to measure the old race rate on real traffic). Side effects that used to hang off
+    // the keyword advance are re-keyed to the tool transition below.
+    if (taskContext) {
+      shadowKeywordTransition(response, taskContext, 'StandardAsyncProcessor');
+      // §7: a task turn that advanced nothing bumps the stall counter (emits task_state_stalled past
+      // the threshold). No-op when the tool advanced this turn.
+      await recordStallIfNoTransition(taskContext);
+
+      // Preserve the action_item hand-off email (Phase 5b): when the tool advances an action_item to
+      // awaiting_completion, and the assignee is someone other than the sender, notify them. The
+      // tool has already mutated taskContext.task.taskState to awaiting_completion.
+      const reachedAwaitingCompletion =
+        event.taskType === 'action_item' &&
+        (taskContext.transitions ?? []).some((t) => t.to === 'awaiting_completion');
+      if (reachedAwaitingCompletion) {
+        const roster = Array.isArray(event.participants) ? (event.participants as RosterParticipant[]) : [];
+        await postTaskHandoffNotice({
+          channelArn: event.channelArn,
+          botArn: event.botArn,
+          task: taskContext.task,
+          roster,
+          senderArn: event.senderArn,
+        });
       }
     }
 
@@ -678,6 +693,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       conversationHistoryLength: consolidatedHistory.length,
       startTime,
       activeTaskInfo,
+      taskContext,
       attachment,
       wasFallback: bedrockResult.wasFallback,
       fallbackReason: bedrockResult.fallbackReason,
