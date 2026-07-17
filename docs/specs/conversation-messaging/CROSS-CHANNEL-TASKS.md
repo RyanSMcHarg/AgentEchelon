@@ -193,5 +193,4 @@ they're enriching the hint) is not caught by it.
 
 - `backend/lambda/src/lib/task-tracking.ts` - implementation
 - `backend/test/lib/task-tracking-cross-channel.test.ts` - tests
-- `ROADMAP.md` P2 - Cross-channel task continuity entry
 - `docs/specs/experiments-battle/SPEC-BATTLE.md` - battle tasks (excluded from this pattern)

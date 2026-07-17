@@ -278,4 +278,3 @@ That's the surface - no other module changes needed. The exhaustiveness check in
 - `backend/test/lib/image-gen-models.test.ts` - Titan/Nova back-compat tests
 - `backend/test/lib/image-gen-models-providers.test.ts` - Stability, OpenAI, FAL, lifecycle, external-HTTP routing tests
 - `docs/specs/experiments-battle/SPEC-BATTLE.md` - `/battle` generation-out spec, cost guards, scorecard math
-- `ROADMAP.md` - generation-out resilient image-model source

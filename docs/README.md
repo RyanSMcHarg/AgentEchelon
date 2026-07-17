@@ -58,5 +58,4 @@ Design record:
 - **Audience-first.** This index is organized by what you are doing (deploy / operate / extend /
   understand), not by filename.
 
-See also the root [`CONTRIBUTING.md`](../CONTRIBUTING.md), [`SECURITY.md`](../SECURITY.md), and
-[`ROADMAP.md`](../ROADMAP.md).
+See also the root [`CONTRIBUTING.md`](../CONTRIBUTING.md) and [`SECURITY.md`](../SECURITY.md).
