@@ -1441,8 +1441,14 @@ async function getIntentEffectiveness(
               COUNT(*) FILTER (WHERE (t->>'ok') = 'false') AS tool_errors
          FROM exchanges e
          JOIN messages m ON e.agent_message_id = m.id
-         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(m.metadata->'steps', '[]'::jsonb)) s
-         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(s->'tools', '[]'::jsonb)) t
+         -- jsonb_typeof guards a non-array 'steps'/'tools' (COALESCE only catches SQL NULL, not a JSON
+         -- null/scalar) - one such row would otherwise error the WHOLE dashboard query, not just itself.
+         CROSS JOIN LATERAL jsonb_array_elements(
+           CASE WHEN jsonb_typeof(m.metadata->'steps') = 'array' THEN m.metadata->'steps' ELSE '[]'::jsonb END
+         ) s
+         CROSS JOIN LATERAL jsonb_array_elements(
+           CASE WHEN jsonb_typeof(s->'tools') = 'array' THEN s->'tools' ELSE '[]'::jsonb END
+         ) t
         WHERE e.created_at >= NOW() - INTERVAL '1 day' * $1
           AND e.intent IS NOT NULL
           AND ($2::varchar IS NULL OR e.intent = $2)
