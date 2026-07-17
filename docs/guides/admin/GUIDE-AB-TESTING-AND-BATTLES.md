@@ -79,8 +79,6 @@ Everything below lives in the admin console under the **Experiments** section, e
 
 Open the admin console, go to **Experiments**, and choose **New Experiment**.
 
-![The Create Experiment form: control and treatment models, the traffic-split slider, tiers, and the Enable for /battle toggle.](../../images/ab-battle/P2-S2.png)
-
 First choose a **Type** (Intent, Base Model, or Classification):
 
 - **Classification** - experiment with different models for intent classification. A classification test cannot run while any other type of test is running on the targeted tier(s), because changing the classifier shifts routing for every intent and would confound the other tests.
@@ -121,8 +119,6 @@ How the split is applied:
 Start conservative (for example 90/10) to expose the alt to a small slice, then widen the split as confidence grows by editing the experiment.
 
 Once active, each experiment shows its variants and weights in the **Active Experiments** table, rendered as `control: sonnet (70%) | treatment: opus (30%)`, alongside its status and start date.
-
-![The Active Experiments table showing each variant, its model, and its weight, with pause, resume, and complete actions.](../../images/ab-battle/P2-S3.png)
 
 You can **Pause** an experiment (stops new assignments, keeps the data), **Resume** it, or **Complete** it. While an experiment is active it overrides the default model routing for matching conversations; when it is paused or completed, routing falls back to the deployment's default model for that intent and tier (see Part 4).
 
@@ -182,8 +178,6 @@ For an image-generation battle, set an **image-gen model** on both variants (set
 
 Battle is opt-in per conversation, and only on premium channels. A channel moderator opens the conversation's **members panel**, finds the **Battle Mode** section (status **Off**), picks the armed experiment, and chooses **Turn on Battle Mode**. The status flips to **Active** and the treatment variant joins as a real member.
 
-![Turning on Battle Mode in a channel's members panel; the treatment assistant joins as a member.](../../images/ab-battle/P2-S4.png)
-
 #### Run the prompt and read the scorecard
 
 In a battle-enabled channel, start any prompt with the `/battle` command:
@@ -194,13 +188,9 @@ In a battle-enabled channel, start any prompt with the `/battle` command:
 
 Both assistants answer the same prompt in parallel (round one). A scorecard renders under the pair with three independent axes, never folded into a single number: **response time**, **estimated cost** (tokens times the model rate, an estimate for comparison and not a bill), and **quality**, which is your call (pick **A better**, **Tie**, or **B better**). A **Show steps** expander reveals the per-step rows (step label, model, duration), the same detail admins see.
 
-![A single-turn battle: two answers side by side, with the three-axis scorecard and a Show steps expander.](../../images/ab-battle/P2-B1.png)
-
 The quality pick is the point: it is direct human feedback. In Aurora mode each pick is credited to the winning variant and surfaces as the **Battle wins** column in the per-variant Experiment Results. *(Not included: feeding that signal into an experiment objective and recommendation, a one-tap thumbs prompt after a round, and a running "N picks collected toward a confident call" tally.)*
 
 After both answers land, a divider marks **round two**: each assistant receives the other's answer, knows it is in a battle, and may rebut, build on it, or stay silent. Round two is commentary; the deliverable is round one.
-
-![Round two: each assistant rebuts the other's answer below the round divider.](../../images/ab-battle/P2-B1R2.png)
 
 A few behaviors worth knowing:
 
@@ -223,8 +213,6 @@ Image generation depends on extra deploy-time setup (image-generation models ena
 #### Reading battle results
 
 Beyond the inline scorecard, the admin console shows the **per-step breakdown** for each battle (which model ran each step and how long it took), alongside the same A/B experiment metrics from A/B Experiments, Part 3.
-
-![The admin per-step breakdown for a battle: each step's model and duration.](../../images/ab-battle/P2-S7.png)
 
 Quality is captured as an explicit human pick (A, B, or tie) per battle, and in Aurora mode that pick is credited to the winning variant so it counts in the per-variant results as **Battle wins**. There is no algorithmic judge, and a battle outcome never auto-routes future traffic; the decision stays yours, and promotion follows the manual path in A/B Experiments, Part 4.
 
