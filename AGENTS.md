@@ -14,7 +14,7 @@
 ## Project Overview
 
 Enterprise conversational AI interface built on React 19 and AWS CDK. Users chat with AI agents
-(Claude Opus/Sonnet/Haiku, Amazon Titan) over Amazon Chime SDK real-time messaging. Three user
+(Claude Opus/Sonnet/Haiku, Amazon Nova) over Amazon Chime SDK real-time messaging. Three user
 tiers (Basic/Standard/Premium) control model access via Cognito and IAM policies. An optional
 Aurora PostgreSQL mode enables advanced evaluation, drift detection, and cross-conversation
 context.
@@ -62,7 +62,7 @@ cd tests && npm run test:report                 # View HTML report
 
 Before making changes, verify:
 1. AWS credentials configured (`aws sts get-caller-identity`)
-2. Bedrock model access enabled (Opus, Sonnet, Haiku, Titan in us-east-1)
+2. Bedrock model access enabled (Opus, Sonnet, Haiku, Amazon Nova in us-east-1)
 3. `frontend/.env` populated with CDK stack outputs (use `.env.example` as template)
 4. If Aurora mode: schema migrations have run (and, only if `-c enableRdsProxy=true`, RDS Proxy is healthy; the default path is direct writer-endpoint IAM auth)
 

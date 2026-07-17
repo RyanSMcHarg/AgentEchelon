@@ -38,9 +38,9 @@ Design-only specs live under [`design/`](design/).
 Specs, grouped by domain (each with its build-status header):
 
 - [`specs/identity-access/`](specs/identity-access/) - who may act, as whom: admin identity, credential exchange, conversation security, access controls and auditing, moderation, add-user escalation, and the identity/access model with a worked example.
-- [`specs/conversation-messaging/`](specs/conversation-messaging/) - conversation types, the interaction layer, welcome/context, the message-metadata codebook, the notification bridge, and cross-channel tasks.
+- [`specs/conversation-messaging/`](specs/conversation-messaging/) - conversation types, the interaction layer, welcome/context, the message-metadata codebook, the notification bridge, cross-channel tasks, and conversation archive and membership.
 - [`specs/assistant-context/`](specs/assistant-context/) - assistant config, configurable intent packs, bilingual conversations, per-tier ownership.
-- [`specs/analytics-eval/`](specs/analytics-eval/) - Aurora/VPC mode, drift convergence, cost sleep mode.
+- [`specs/analytics-eval/`](specs/analytics-eval/) - Aurora/VPC mode, drift convergence, cost sleep mode, and abuse/spend controls.
 - [`specs/experiments-battle/`](specs/experiments-battle/) - the `/battle` design.
 - [`specs/admin-console/`](specs/admin-console/) - the admin-console design behind `ADMIN-GUIDE.md`.
 

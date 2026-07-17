@@ -29,7 +29,7 @@ Built with React 19 and AWS CDK, Agent Echelon combines real-time messaging, dur
 ### Key Features
 
 **Model routing and resilience:**
-- **Multiple Bedrock Model Families** - Anthropic Claude, Amazon Titan, and OpenAI GPT-OSS selectable per tier at deploy time
+- **Multiple Bedrock Model Families** - Anthropic Claude, Amazon Nova, and OpenAI GPT-OSS selectable per tier at deploy time (the provider layer also supports external HTTP APIs, proven by the image-generation path)
 - **Intent-Based Model Routing** - Automatic model selection per intent (e.g., Haiku for Q&A, Sonnet for code, Opus for analysis) with configurable fallback chains
 - **Bedrock Resilience** - Exponential backoff retry on throttling, automatic model fallback on quota exhaustion, and circuit breaker to protect against cascading failures
 - **A/B Model Testing** - DynamoDB-backed experiment framework for comparing models per intent with deterministic conversation-level variant assignment and side-by-side analytics
@@ -135,7 +135,7 @@ The full documentation lives under [`docs/`](docs/README.md), organized by what 
                       ▼
 ┌─────────────────────────────────────────────────────────────────┐
 │                      Amazon Bedrock                             │
-│         (Claude Opus, Sonnet, Haiku, Titan)                     │
+│         (Claude Opus, Sonnet, Haiku, Amazon Nova)               │
 └─────────────────────────────────────────────────────────────────┘
 ```
 

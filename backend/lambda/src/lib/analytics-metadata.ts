@@ -4,7 +4,7 @@
  * Defines the analytics metadata structure attached to each Chime message.
  * The metadata flows through: Handler -> Chime Message -> Kinesis -> S3
  *
- * Design Tenet: Channel = Session
+ * Design principle: Channel = Session
  * Each channel represents a distinct conversation session.
  */
 

@@ -35,7 +35,7 @@ that buys two things a single-model assistant can't:
   alongside the existing per-user signals (name, current context,
   tier) the assistant is already grounded in.
 - **Accuracy / quality.** AgentEchelon already routes per intent and tier across
-  multiple providers (`docs/guides/developer/MODEL_STRATEGY.md` - Claude, Titan, GPT-OSS, future
+  multiple providers (`docs/guides/developer/MODEL_STRATEGY.md` - Claude, Nova, GPT-OSS, future
   CN-tuned Bedrock models). Adding `workingLanguage` lets a deployment **route a
   locale to the model that is strongest in that language *in the current
   context*** - e.g. a Chinese-tuned model for zh users on a China deployment - 

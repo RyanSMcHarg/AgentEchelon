@@ -16,7 +16,7 @@ The model catalog is `backend/lib/config/model-strategy.ts`. A model entry
 parity-testable attributes: `strengths`, `costClass`, `latencyClass`, and a
 **required** `visionCapable: boolean` (deliberately required "so the catalog
 stays exhaustive and parity-testable"). AgentEchelon is multi-provider
-(`docs/guides/developer/MODEL_STRATEGY.md` - Claude, Titan, GPT-OSS, and future CN-tuned Bedrock
+(`docs/guides/developer/MODEL_STRATEGY.md` - Claude, Nova, GPT-OSS, and future CN-tuned Bedrock
 models) and routes per intent/tier, so the language a model is strongest in is a
 real per-model property, independent of the user's language.
 
