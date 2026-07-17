@@ -136,8 +136,8 @@ Configuration: shared date preset. Error percent card carries the `error_rate` t
 | WebSocket connects, disconnects, reconnects (+ per-day table) | Amazon Chime SDK/WebSocket stability; reconnect spikes as early warning | `connection_health_daily`: `SUM(CASE ...)` over `client_events` connection events, per day. | both |
 
 Configuration: shared date preset. Card targets from `metricTargets.ts` - avg total
-(target 2000ms, warn 5000ms), avg Bedrock (target 1500ms, warn 4000ms), p95 total
-(target 5000ms, warn 8000ms), all lower-is-better. The trend chart draws p95 and avg
+(target 10000ms, warn 30000ms), avg Bedrock (target 6000ms, warn 12000ms), p95 total
+(target 15000ms, warn 30000ms), all lower-is-better. The trend chart draws p95 and avg
 target reference lines. Latency table cells and web-vital badges use in-tab band
 thresholds (latency good within the Nielsen 10s attention limit, warn to the ~30s abandon
 threshold; web vitals per `WEB_VITAL_META`). See [`LATENCY-TARGETS.md`](../../guides/developer/LATENCY-TARGETS.md).
