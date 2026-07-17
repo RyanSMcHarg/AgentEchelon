@@ -161,7 +161,7 @@ a short, context-gathering intake before the assistant proper. Choose the patter
   ```
 
   Disable it again by deleting the parameter (`aws ssm delete-parameter --name ...`); the router falls back to
-  the static welcome. The basic tier uses a separate handler and does not run the intake. For a single small
+  the static welcome. All tiers run the same shared router code (`router-agent-handler.ts`, deployed as a per-tier Lambda) and the same intake path. For a single small
   schema you can instead set the `ONBOARDING_INTAKE` env var directly on the router Lambda (read before the
   SSM param), but the SSM parameter is the deployment-managed path.
 

@@ -483,6 +483,9 @@ The admin console groups analytics, conversation moderation (redact/delete), mod
 |----------|--------|-------------|
 | `/create-conversation` | POST | Create new conversation with AI agent |
 | `/add-agent` | POST | Add AI agent to existing conversation |
+| `/conversations/archive` | POST | Archive a conversation (moderator): read-only + hidden from the active list; membership retained, so members keep read-only access until the 90-day expiry |
+| `/conversations/remove-member` | POST | Remove a member from a conversation (moderator; never the assistant) |
+| `/conversations/leave` | POST | Leave a conversation (any member; self only) |
 | `/presigned-url` | POST | Generate S3 presigned URL for file upload/download |
 | `/share-conversation` | POST | Share conversation via SES email |
 | `/admin/conversations` | GET | Browse conversations from the analytics archive (system of record) |

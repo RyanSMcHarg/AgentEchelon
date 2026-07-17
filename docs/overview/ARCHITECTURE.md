@@ -109,7 +109,9 @@ ChimeMessaging                    (foundation — no dependencies)
      ├──► Analytics               (Athena mode: Kinesis stream)
      │    OR AnalyticsAurora      (Aurora mode: VPC + Aurora + Kinesis; RDS Proxy opt-in)
      │
-     ├──► Foundations             (task tables + create-conversation/add-agent; depends on Analytics + CognitoAuth)
+     ├──► Foundations             (task tables + abuse-controls table [rate limit / spend budget / dedup] +
+     │                             conversation-actions audit table; create-conversation/add-agent +
+     │                             conversation-management [archive/remove-member/leave] APIs; depends on Analytics + CognitoAuth)
      │
      ├──► Experiments             (A/B experiments table + admin-experiments API; depends on CognitoAuth)
      │
@@ -131,18 +133,18 @@ Twelve stacks deploy in both modes (ChimeMessaging, CognitoAuth, S3Storage, Foun
 
 **Stack outputs flow:** Each stack exports values (ARNs, URLs) as CloudFormation outputs; the per-tier stacks instead publish their processor/bot ARNs to SSM. The frontend `.env` file is populated from these outputs. See `.env.example` for the mapping.
 
-| Stack | Key Outputs |
-|-------|-------------|
-| ChimeMessaging | `AppInstanceArn` |
-| CognitoAuth | `UserPoolId`, `UserPoolClientId`, `IdentityPoolId`, `CredentialExchangeApiUrl`, `UserManagementApiUrl`, `AdminConversationApiUrl`, `UserFeedbackApiUrl` |
-| S3Storage | `PresignedUrlApiUrl`, `AttachmentBucketArn` |
-| Foundations | `CreateConversationApiUrl`, `AddAgentApiUrl` |
-| Experiments | `ExperimentsApiUrl` |
-| Notifications | `ShareApiUrl` |
-| Battle | `BattleOutcomeApiUrl` |
-| Tier-{Basic,Standard,Premium} | SSM: `/agent-echelon/tier/{tier}/{processor-arn,bot-arn}` |
-| ChannelFlow | `ChannelFlowArn`, `ProcessorFunctionArn` |
-| Analytics / AnalyticsAurora | `AnalyticsApiUrl`, `ClientEventsApiUrl` (Athena) |
+| Stack                         | Key Outputs                                                                                                                                             |
+| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| ChimeMessaging                | `AppInstanceArn`                                                                                                                                        |
+| CognitoAuth                   | `UserPoolId`, `UserPoolClientId`, `IdentityPoolId`, `CredentialExchangeApiUrl`, `UserManagementApiUrl`, `AdminConversationApiUrl`, `UserFeedbackApiUrl` |
+| S3Storage                     | `PresignedUrlApiUrl`, `AttachmentBucketArn`                                                                                                             |
+| Foundations                   | `CreateConversationApiUrl`, `AddAgentApiUrl`                                                                                                            |
+| Experiments                   | `ExperimentsApiUrl`                                                                                                                                     |
+| Notifications                 | `ShareApiUrl`                                                                                                                                           |
+| Battle                        | `BattleOutcomeApiUrl`                                                                                                                                   |
+| Tier-{Basic,Standard,Premium} | SSM: `/agent-echelon/tier/{tier}/{processor-arn,bot-arn}`                                                                                               |
+| ChannelFlow                   | `ChannelFlowArn`, `ProcessorFunctionArn`                                                                                                                |
+| Analytics / AnalyticsAurora   | `AnalyticsApiUrl`, `ClientEventsApiUrl` (Athena)                                                                                                        |
 
 ---
 

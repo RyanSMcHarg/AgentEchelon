@@ -92,7 +92,7 @@ The backend is composed of independently-deployable feature stacks rather than o
 1. `AgentEchelonChimeMessaging`, Amazon Chime SDK AppInstance (foundation)
 2. `AgentEchelonCognitoAuth`, User Pool, Identity Pool, Cognito triggers, per-tier Identity-Pool roles
 3. `AgentEchelonS3Storage`, file attachment bucket with presigned URLs
-4. `AgentEchelonFoundations`, shared task-tracking tables (`agent-tasks` + `user-tasks`) + create-conversation/add-agent API + their SSM contract (hosts no bot)
+4. `AgentEchelonFoundations`, shared task-tracking tables (`agent-tasks` + `user-tasks`) + the abuse-controls table (rate limit / spend budget / request dedup) + the conversation-actions audit table + create-conversation/add-agent + conversation-management (archive / remove-member / leave) APIs + their SSM contract (hosts no bot)
 5. `AgentEchelonExperiments`, A/B experiments table + admin-experiments API (`/admin/experiments`); publishes the experiments SSM contract
 6. `AgentEchelonTier-{Basic,Standard,Premium}`, per-tier assistant stacks: each owns its async-processor (self-hosted Converse tool loop, no Bedrock Agent) + tier-scoped context IAM + content guardrail + per-tier Lex bot + AppInstanceBot
 7. `AgentEchelonNotifications`, SES email identity + conversation sharing + proactive-briefing EventBridge workflow (`lambda/src/proactive-briefing.ts`; recipients/schedule via `briefingRecipients`/`briefingScheduleRate` context)

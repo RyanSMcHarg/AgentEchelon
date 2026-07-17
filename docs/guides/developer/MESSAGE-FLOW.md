@@ -98,7 +98,7 @@ fulfillment) and *how the reply is addressed* (broadcast vs. targeted).
 ## 4. Fulfillment: from Lex to the model (the "why Lex isn't the brain")
 
 When Lex routes a turn, its **dialog code hook** invokes the tier's fulfillment
-handler (`router-agent-handler.ts` / `{tier}-agent-handler.ts`). This handler - not
+handler (`router-agent-handler.ts`, deployed as a per-tier Lambda). This handler - not
 Lex - is where the real work is decided:
 
 ```
