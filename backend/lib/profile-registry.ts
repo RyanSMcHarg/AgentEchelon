@@ -15,7 +15,7 @@ import {
   AssistantProfile,
   DEFAULT_PROFILES_CONFIG,
   validateProfilesConfig,
-} from './config/profiles.js';
+} from './config/profiles';
 
 export class ProfileRegistry {
   private readonly byValue = new Map<string, DeploymentClassification>();
