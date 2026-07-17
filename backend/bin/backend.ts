@@ -4,7 +4,6 @@ import { ChimeMessagingStack } from '../lib/stacks/chime-messaging-stack';
 import { FoundationsStack } from '../lib/stacks/foundations-stack';
 import { S3StorageStack } from '../lib/stacks/s3-storage-stack';
 import { CognitoAuthStack } from '../lib/stacks/cognito-auth-stack';
-import { IAMPoliciesStack } from '../lib/stacks/iam-policies-stack';
 import { AnalyticsStack } from '../lib/stacks/analytics-stack';
 import { AnalyticsStackAurora } from '../lib/stacks/analytics-stack-aurora';
 import { IAnalyticsStackOutputs } from '../lib/interfaces/analytics-stack-interface';
@@ -342,26 +341,11 @@ const notificationStack = new NotificationStack(app, `${STACK_PREFIX}Notificatio
   description: 'Email notifications for conversation sharing',
 });
 
-// 7. IAM Policies Stack - Tier-based Access Control
-const iamStack = new IAMPoliciesStack(app, `${STACK_PREFIX}IAMPolicies`, {
-  env,
-  appInstanceArn: chimeStack.appInstanceArn,
-  bedrockModelArns: {
-    opus: [
-      ...modelCatalog.opus.foundationModelArns,
-      ...(modelCatalog.opus.inferenceProfileArns ?? []),
-    ],
-    sonnet: [
-      ...modelCatalog.sonnet.foundationModelArns,
-      ...(modelCatalog.sonnet.inferenceProfileArns ?? []),
-    ],
-    haiku: modelCatalog.haiku.foundationModelArns,
-    titan: modelCatalog.titan.foundationModelArns,
-    gpt_oss_20b: modelCatalog.gpt_oss_20b.foundationModelArns,
-    gpt_oss_120b: modelCatalog.gpt_oss_120b.foundationModelArns,
-  },
-  description: 'IAM policies for tier-based model access control',
-});
+// 7. (removed) The per-tier IAMPolicies stack was inert scaffolding — its policies gated on
+// aws:PrincipalTag/tier (never populated) with a non-IAM `chime-sdk-messaging:` action prefix, and
+// were attached to no principal. The LIVE Layer-1 boundary is aws:ResourceTag/classification on the
+// per-tier processor + credential-exchange roles (agent-tier-common.tierChannelScopedAllow); the
+// model allowlist is the processor role's own Bedrock grant. Deleted per SPEC-CAPABILITY-PROFILES §D-2.
 
 // 8b. Per-tier stacks (docs/SPEC-PER-TIER-OWNERSHIP.md, ADR-011) — each tier is
 // an independently-deployable stack a separate team can own end-to-end: the
@@ -523,8 +507,6 @@ if (battleStack) {
 }
 notificationStack.addDependency(chimeStack);
 notificationStack.addDependency(cognitoStack);
-iamStack.addDependency(chimeStack);
-iamStack.addDependency(cognitoStack);
 
 // Standard cost-attribution tags, applied ONCE at the app root. Project is DERIVED from the
 // deployment identity (STACK_PREFIX ← AE_INSTANCE_NAME) so the same platform code deployed as

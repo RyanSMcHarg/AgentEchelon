@@ -13,7 +13,6 @@ import { Template, Match } from 'aws-cdk-lib/assertions';
 import { applyStandardTags, collectProjectTagValues } from '../lib/tagging';
 import { ChimeMessagingStack } from '../lib/stacks/chime-messaging-stack';
 import { CognitoAuthStack } from '../lib/stacks/cognito-auth-stack';
-import { IAMPoliciesStack } from '../lib/stacks/iam-policies-stack';
 
 const env = { account: '123456789012', region: 'us-east-1' };
 
@@ -26,19 +25,13 @@ function templateFor(project: string) {
   return Template.fromStack(stack);
 }
 
-/** The three real stacks that previously carried a hardcoded/overridden Project. */
+/** Real stacks that previously carried a hardcoded/overridden Project. */
 function realStackTemplates(project: string) {
   const app = new cdk.App();
   applyStandardTags(app, { project, codebase: 'AgentEchelon', instance: 'acme', environment: 'Production' });
   const chime = new ChimeMessagingStack(app, 'Chime', { env, appInstanceName: 'test' });
   const cog = new CognitoAuthStack(app, 'Cog', { env, appInstanceArn: chime.appInstanceArn });
-  const arn = ['arn:aws:bedrock:us-east-1::foundation-model/anthropic.claude'];
-  const iam = new IAMPoliciesStack(app, 'Iam', {
-    env,
-    appInstanceArn: chime.appInstanceArn,
-    bedrockModelArns: { opus: arn, sonnet: arn, haiku: arn, titan: arn, gpt_oss_20b: arn, gpt_oss_120b: arn },
-  });
-  return [chime, cog, iam].map((s) => Template.fromStack(s).toJSON());
+  return [chime, cog].map((s) => Template.fromStack(s).toJSON());
 }
 
 describe('Tagging standard', () => {
