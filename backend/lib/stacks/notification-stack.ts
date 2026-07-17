@@ -335,8 +335,8 @@ export class NotificationStack extends cdk.Stack {
           // metadata + classification tag) and runs as the STANDARD tier
           // assistant — no shared cross-tier bot. The tier must match the
           // channel's `classification` tag or the fail-closed Layer 1 IAM would
-          // block the assistant. ROADMAP: select a per-tier assistant per
-          // recipient (see ROADMAP.md).
+          // block the assistant. Future: select a per-tier assistant per
+          // recipient.
           BOT_ARN_PARAM: tierBotArnKey('standard'),
           REPORT_BUCKET: briefingsBucket.bucketName,
           APP_URL: appUrl,

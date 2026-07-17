@@ -2,7 +2,7 @@
 
 The non-negotiables. Every architectural decision in the project traces back to one of these, and where two designs competed, the tenet broke the tie.
 
-They align with the platform **invariants** in `docs/specs/conversation-messaging/SPEC-INTERACTION-LAYER.md` §6.
+The platform **invariants** in `docs/specs/conversation-messaging/SPEC-INTERACTION-LAYER.md` §6 elaborate the governance, forward-compatibility, and integration tenets (4, 3, and 6); the remaining tenets (shared control plane, context, fine-grained control) are design commitments these invariants sit beneath rather than restate.
 
 ---
 

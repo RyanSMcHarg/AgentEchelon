@@ -69,8 +69,6 @@ Perform a documentation review with the following parameters: $ARGUMENTS
 - Critical-path coverage: signup, signin, agent interaction, admin dashboard
 
 ### PM (Program Manager)
-- Sprint cadence and milestone tracking (ROADMAP P0-P3)
-- Roadmap accuracy vs implementation status
 - Definition of Done and release criteria
 - Delivery metrics and success criteria for v0.2.0
 - Backlog organization across launch threads
@@ -80,7 +78,6 @@ Perform a documentation review with the following parameters: $ARGUMENTS
 If reviewing all docs, check:
 - `CLAUDE.md` (project instructions, build/run, architecture, configuration)
 - `README.md`
-- `ROADMAP.md`
 - `CONTRIBUTING.md`
 - `docs/overview/ARCHITECTURE.md`
 - `SECURITY.md`

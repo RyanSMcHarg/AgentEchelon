@@ -33,6 +33,7 @@ Built with React 19 and AWS CDK, Agent Echelon combines real-time messaging, dur
 - **Intent-Based Model Routing** - Automatic model selection per intent (e.g., Haiku for Q&A, Sonnet for code, Opus for analysis) with configurable fallback chains
 - **Bedrock Resilience** - Exponential backoff retry on throttling, automatic model fallback on quota exhaustion, and circuit breaker to protect against cascading failures
 - **A/B Model Testing** - DynamoDB-backed experiment framework for comparing models per intent with deterministic conversation-level variant assignment and side-by-side analytics
+- **Cost and Abuse Controls** - Per-user and global hourly Bedrock spend budgets, per-tier request rate limiting, request dedup, an inbound length cap, and a global circuit trip - distinct from the model-fallback resilience above (see [SPEC-ABUSE-CONTROLS](docs/specs/analytics-eval/SPEC-ABUSE-CONTROLS.md))
 
 **Collaboration and access control:**
 - **AWS-Native Persistent Messaging** - Real-time WebSocket delivery with durable conversation history using AWS-managed messaging infrastructure
@@ -40,6 +41,7 @@ Built with React 19 and AWS CDK, Agent Echelon combines real-time messaging, dur
 - **Corporate Identity** - SAML/OIDC integration via Amazon Cognito (see [Identity Provider Guide](docs/guides/user/IDENTITY-PROVIDER-GUIDE.md))
 - **File Attachments** - S3-based secure upload/download with presigned URLs, drag-and-drop support
 - **Multi-Step Task Workflows** - Guided troubleshooting, data extraction, and report generation with state tracking across conversation turns
+- **Conversation Archive, Leave & Remove** - A moderator can archive a conversation (read-only + hidden from the active list; membership retained, so members keep read-only access until the 90-day expiry) or remove a member; any member can leave (see [SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP](docs/specs/conversation-messaging/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md))
 
 **Admin operations and analytics:**
 - **Admin Analytics Console** - Conversation volumes, model usage, model-by-intent effectiveness, evaluation scores, user activity, and user feedback summaries

@@ -230,6 +230,21 @@ classification - *not* silently added and then locked out by Layer 1. Two gates:
   the wrongly-added member **inert** (no send/read on a higher-tier channel), so the
   audit closes the *visibility* gap, not a write-leak.
 
+## 4c. Archived conversations (read-only via the `archived` tag)
+
+Archiving a conversation makes it **read-only for everyone by IAM**, using the same tag-gated
+mechanism as Layer 1 - the AWS-documented read-only-channel pattern (the blog referenced above,
+Approach 2). On archive, the backend sets an immutable `archived` tag on the channel, and a **Deny**
+on `chime:SendChannelMessage` + `chime:UpdateChannelMessage` conditioned on
+`aws:ResourceTag/archived == "true"` is layered onto both the per-tier assistant send grant and the
+user exchange creds (`agent-tier-common.archivedChannelReadOnlyDeny`). A Deny overrides the tag-gated
+ALLOW, so once the tag is set neither a member nor the assistant can send or edit - the channel is
+read-only by IAM, not by application logic. The app-instance-admin (admin-plane) bearer is
+deliberately un-tag-gated and stays exempt, so it can post the "archived by ..." system message.
+Membership is retained (members keep read-only access); the channel hard-expires on the
+conversation-type TTL (90 days after last activity). Full design: [ADR-017](../../design/decisions/017-conversation-archive-mechanism.md)
+and [SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP](../conversation-messaging/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md).
+
 ## 5. Layer 2: Channel Metadata (Application-Level)
 
 Channel metadata stores `classification` and `conversationType` as a JSON string. All Lambda handlers read this before membership operations.

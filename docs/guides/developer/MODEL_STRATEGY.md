@@ -36,7 +36,7 @@ Examples of the current strategy:
 - code generation -> Sonnet primary, OpenAI GPT-OSS 20B fallback
 - code review -> OpenAI GPT-OSS 20B primary, Sonnet fallback
 - document extraction -> Haiku primary, Sonnet fallback
-- report generation -> Titan primary, Sonnet fallback
+- report generation -> Amazon Nova primary, Sonnet fallback
 - strategic analysis -> Opus primary, Sonnet fallback
 - workflow actions -> Sonnet primary, Haiku fallback
 
