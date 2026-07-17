@@ -425,6 +425,28 @@ VITE_ANALYTICS_API_URL=your-analytics-api-url
 VITE_CLIENT_EVENTS_API_URL=your-client-events-api-url
 ```
 
+### Backend deploy-time configuration (CDK context)
+
+Backend config is set at deploy time via CDK context (`-c key=value` on `cdk deploy`). Defaults are shown; deeper detail for the admin-identity, membership-audit, and abuse-control keys lives in the linked docs.
+
+| Context key | Default | What it does |
+|---|---|---|
+| `analyticsMode` | `athena` | `athena` (serverless, cheap) or `aurora` (VPC + Aurora + pgvector; adds evaluation, drift, RAG). |
+| `enableRdsProxy` | `false` | Aurora-only, opt-in RDS Proxy connection pooling (~$86/mo floor). Default is direct writer-endpoint IAM auth. |
+| `enableLiveDrift` | `false` | Aurora-only, opt-in live drift suggestions in the message path. |
+| `enableBattle` | `true` | `/battle` alt-bot slot pool + orchestrator; `-c enableBattle=false` omits the Battle stack. `allowedBattleTiers` (default `['premium']`) gates which tiers may use it. |
+| `analyticsVpcId` / `createVpcEndpoints` | create / `true` | Aurora-only: import an existing VPC instead of creating one; skip interface/gateway endpoints when the imported VPC already egresses. |
+| `sleepMode` | `false` | Aurora-only auto-pause to 0 ACU when idle (`sleepAfterIdle` default `2h`, `sleepCheckRate` default `rate(15 minutes)`). |
+| `enableMembershipAudit` | `false` | Layer-6 over-tier membership audit. `membershipAuditEnforce` (default `false`) = report-only vs auto-revoke; `membershipAuditAlertChannelArn` routes findings. See [ADMIN-GUIDE](docs/guides/admin/ADMIN-GUIDE.md). |
+| `adminAuthMode` | `ae-cognito` | Which IdP authenticates admins: `ae-cognito` / `federated` (`hostAdminPoolId`, `adminGroupNames`) / `service`. See [SPEC-ADMIN-IDENTITY](docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md). |
+| `bedrockUserHourlyBudget` / `bedrockGlobalHourlyBudget` | (unset) | Per-user / global hourly spend ceilings (abuse controls). See [SPEC-ABUSE-CONTROLS](docs/specs/analytics-eval/SPEC-ABUSE-CONTROLS.md). |
+| `basicModelKey` / `standardModelKey` / `premiumModelKey` | (tier default) | Override the default model per tier (any key in the model catalog). |
+| `assistantIntentPack` | (default pack) | The request-classification taxonomy (per deployment). |
+| `senderEmail` | (required for email) | SES sender for notifications / conversation sharing. |
+| `appUrl` | `http://localhost:5173` | Frontend origin for the backend CORS allowlist; set to the CloudFront URL after the first deploy. |
+| `frontendWaf` | `true` | Managed-rules WAF on the CloudFront distribution (`wafRateLimit`, `wafAllowedIps` tune it). |
+| `environment` | `dev` | `prod` sets `RETAIN` removal policies + deletion protection on stateful resources. |
+
 ## Model Strategy
 
 Model routing is capability-first rather than tier-first. The canonical backend strategy lives in:

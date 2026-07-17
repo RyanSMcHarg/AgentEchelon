@@ -35,46 +35,52 @@ creation binds the **tier-matched** bot to the channel (`create-conversation`), 
 
 ---
 
-## 2. The two parallel paths: Channel Flow and Lex
+## 2. Channel Flow first, then Lex
 
-When a message is sent, Amazon Chime SDK hands it to **two independent consumers at once**:
+When a message is sent, the **Channel Flow Processor** runs **first**: it is Amazon Chime SDK's
+synchronous message interceptor, and **every** message passes through it *before* delivery.
+Only once the flow **releases** a message (`callbackAllow`) is it delivered to the channel's
+members - and only then is the assistant's **Lex** bot invoked (per its `InvokedBy` config) on
+the messages addressed to it. A denied message never reaches the members or the bot.
 
 ```
         User sends a message
                 │
                 ▼
-    ┌───────────────────────┐
-    │   Amazon Chime SDK Channel     │  (message persisted, tagged classification)
-    └───────────┬────────────┘
-                │  fan-out (parallel, non-blocking)
-        ┌───────┴─────────────────────────┐
-        ▼                                  ▼
-┌───────────────────┐            ┌───────────────────────┐
-│  Channel Flow      │            │  Lex bot (per InvokedBy)│
-│  Processor         │            │  routes to fulfillment  │
-│  (every message,   │            │  ONLY when this message │
-│   before delivery) │            │  is "for the assistant" │
-└─────────┬─────────┘            └───────────┬───────────┘
-          │                                  │
-   releases OR redirects              (see §3 + §4)
+    ┌────────────────────────────┐
+    │  Channel Flow Processor      │  runs FIRST, synchronously, on EVERY
+    │  (channel-flow-processor.ts) │  message (human-to-human included),
+    │                              │  BEFORE delivery:
+    └──────────────┬───────────────┘  callbackAllow (release) / callbackDeny (drop)
+                   │ released
+                   ▼
+    ┌────────────────────────────┐
+    │  Amazon Chime SDK Channel   │  (message delivered, tagged classification)
+    └──────────────┬───────────────┘
+                   │ delivered to members (the bot is a member)
+                   ▼
+    ┌────────────────────────────┐
+    │  Lex bot (per InvokedBy)     │  routes to fulfillment ONLY when this
+    │                              │  message is "for the assistant" (see §3 + §4)
+    └────────────────────────────┘
 ```
 
-**Why two paths?** They do different jobs:
+**The two components, in order:**
 
-- **Channel Flow Processor** (`channel-flow-processor.ts`) runs on **every** message
- - human-to-human included - *before* it is delivered. It is Amazon Chime SDK's synchronous
-  message interceptor: it **must call `ChannelFlowCallback`** to release each
-  message (`callbackAllow`) or hold/deny it (`callbackDeny`). This is the
-  conversation-level layer that exists **whether or not an assistant is involved**
-  (see [IDENTITY-AND-ACCESS-MODEL §6b](../../specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md#6b-defense-in-depth--guardrails-are-one-layer-not-the-boundary)).
+- **Channel Flow Processor** (`channel-flow-processor.ts`) is the **gate**. It runs on
+  **every** message - human-to-human included - *before* it is delivered, and it **must call
+  `ChannelFlowCallback`** to release each message (`callbackAllow`) or hold/deny it
+  (`callbackDeny`). This is the conversation-level layer that exists **whether or not an
+  assistant is involved** (see [IDENTITY-AND-ACCESS-MODEL §6b](../../specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md#6b-defense-in-depth--guardrails-are-one-layer-not-the-boundary)).
   In AgentEchelon it does: `@all` fan-out (see §3), `/battle` orchestration, notify
-  directives, and idempotency for at-least-once delivery - and it is the natural
-  home for any future conversation-level content rule.
-- **Lex** is the assistant's entry trigger. It only produces an assistant turn when
-  `InvokedBy` says this message is for the bot.
+  directives, and idempotency for at-least-once delivery - and it is the natural home for any
+  future conversation-level content rule.
+- **Lex** is the assistant's entry trigger, invoked on the **released** message. It only
+  produces an assistant turn when `InvokedBy` says this message is for the bot.
 
-They do not block each other: a message can be released by the channel flow while
-Lex independently spins up the assistant's turn.
+Because the flow is a synchronous gate, Lex never sees a message the flow denied; and `@all`
+is handled entirely inside the flow - it invokes the async processor directly, bypassing Lex
+(see §3).
 
 ---
 
