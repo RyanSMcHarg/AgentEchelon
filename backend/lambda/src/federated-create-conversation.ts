@@ -28,7 +28,9 @@ const ssm = new SSMClient({});
 
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN!;
 const CHANNEL_FLOW_ARN_PARAM = process.env.CHANNEL_FLOW_ARN_PARAM || '';
-const TIER = (process.env.ASSISTANT_TIER || 'basic').trim();
+// Classification this federated assistant is provisioned at (env renamed from ASSISTANT_TIER per
+// SPEC-CAPABILITY-PROFILES). Authoritative for federated users — the channel is created at it.
+const TIER = (process.env.ASSISTANT_CLASSIFICATION || 'basic').trim();
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
 const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/tier/${TIER}/bot-arn`;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';

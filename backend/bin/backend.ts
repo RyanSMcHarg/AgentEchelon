@@ -17,7 +17,6 @@ import { BattleStack } from '../lib/stacks/battle-stack';
 import { ExperimentsStack } from '../lib/stacks/experiments-stack';
 import { FrontendStack } from '../lib/stacks/frontend-stack';
 import {
-  parseAllowedBattleTiers,
   STACK_PREFIX,
   APP_INSTANCE_NAME,
   INSTANCE_NAME,
@@ -70,12 +69,10 @@ const analyticsMode: 'athena' | 'aurora' =
 // channel-battle API) lives in its own AgentEchelonBattle stack. Defaults to ON;
 // deploy with `-c enableBattle=false` to leave /battle out entirely (the tier
 // processors + channel-flow then carry no battle plumbing and fail open).
-// `allowedBattleTiers` (default ['premium']) sets which channel tiers may run
-// /battle.
+// Battle eligibility is per-profile config now (AssistantProfile.battleEligible), not a context knob.
 const enableBattle: boolean =
   (app.node.tryGetContext('enableBattle') ?? true) !== false
     && app.node.tryGetContext('enableBattle') !== 'false';
-const allowedBattleTiers = parseAllowedBattleTiers(app.node.tryGetContext('allowedBattleTiers'));
 
 // Live drift detection (SPEC-DRIFT-CONVERGENCE.md + ADR-013): conversation-level
 // + ALL-tier (basic/standard/premium). **OPT-IN, default OFF** — matches
@@ -445,7 +442,6 @@ const battleStack = enableBattle
       appInstanceArn: chimeStack.appInstanceArn,
       userPoolId: cognitoStack.userPool.userPoolId,
       appUrl,
-      allowedBattleTiers,
       description: 'AgentEchelon /battle — alt-slots + orchestrator + tables + channel-battle API (opt-in)',
     })
   : undefined;

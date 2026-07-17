@@ -462,7 +462,7 @@ export class FoundationsStack extends cdk.Stack {
           SSM_ROOT,
           APP_INSTANCE_ARN: props.appInstanceArn,
           CHANNEL_FLOW_ARN_PARAM: CHANNEL_FLOW_ARN_SSM_KEY,
-          ASSISTANT_TIER: (this.node.tryGetContext('assistantTier') as string) || 'basic',
+          ASSISTANT_CLASSIFICATION: (this.node.tryGetContext('assistantTier') as string) || 'basic',
           ALLOWED_ORIGIN: '*',
         },
         bundling: { minify: false, forceDockerBundling: false, externalModules: ['@aws-sdk/*'] },
@@ -528,7 +528,7 @@ export class FoundationsStack extends cdk.Stack {
         SSM_ROOT,
         APP_INSTANCE_ARN: props.appInstanceArn,
         CHANNEL_FLOW_ARN_PARAM: CHANNEL_FLOW_ARN_SSM_KEY,
-        ASSISTANT_TIER: (this.node.tryGetContext('assistantTier') as string) || 'basic',
+        ASSISTANT_CLASSIFICATION: (this.node.tryGetContext('assistantTier') as string) || 'basic',
       };
       const shareBundling = { minify: false, forceDockerBundling: false, externalModules: ['@aws-sdk/*'] };
 

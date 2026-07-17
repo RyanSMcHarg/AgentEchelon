@@ -26,7 +26,7 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
-import { SHARED_SSM, parseAllowedBattleTiers, INSTANCE_SSM } from './agent-tier-common';
+import { SHARED_SSM, INSTANCE_SSM } from './agent-tier-common';
 
 export interface ExperimentsStackProps extends cdk.StackProps {
   appInstanceArn: string;
@@ -109,10 +109,8 @@ export class ExperimentsStack extends cdk.Stack {
         APP_INSTANCE_ARN: props.appInstanceArn,
         ALT_BOT_SLOTS_ROSTER_PARAM: altBotRosterParamName,
         ALLOWED_ORIGIN: appUrl,
-        // Which channel tiers may run /battle (default 'premium'). The validator
-        // (experiment-manager.ts) requires a battle-enabled experiment to target
-        // exactly one of these. Same value AgentEchelonBattle stamps on channel-battle.ts.
-        ALLOWED_BATTLE_TIERS: parseAllowedBattleTiers(this.node.tryGetContext('allowedBattleTiers')).join(','),
+        // Battle eligibility is per-profile config now (AssistantProfile.battleEligible), read by
+        // experiment-manager.ts via the registry — no longer an ALLOWED_BATTLE_TIERS env var.
       },
       bundling: { minify: false, forceDockerBundling: false },
     });

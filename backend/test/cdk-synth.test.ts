@@ -698,7 +698,6 @@ describe('CDK Synthesis', () => {
       appInstanceArn,
       userPoolId: 'us-east-1_testpool',
       appUrl: 'https://app.example.com',
-      allowedBattleTiers: ['premium' as const],
     };
 
     it('owns the three battle tables + publishes the shared battle SSM contract', () => {

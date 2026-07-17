@@ -45,7 +45,7 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
-import { SHARED_SSM, Tier, SSM_ROOT, STACK_PREFIX, INSTANCE_SSM, tierProcessorArnKey } from './agent-tier-common';
+import { SHARED_SSM, SSM_ROOT, STACK_PREFIX, INSTANCE_SSM, tierProcessorArnKey } from './agent-tier-common';
 
 export interface BattleStackProps extends cdk.StackProps {
   /** Shared Chime AppInstance ARN (from AgentEchelonChimeMessaging). */
@@ -54,12 +54,6 @@ export interface BattleStackProps extends cdk.StackProps {
   userPoolId: string;
   /** Frontend URL for CORS (defaults to the `appUrl` context / localhost). */
   appUrl?: string;
-  /**
-   * Channel tiers permitted to run /battle. Default `['premium']`. Surfaced to
-   * channel-battle.ts (the enable gate) so /battle can be opened to other tiers
-   * without code changes.
-   */
-  allowedBattleTiers?: Tier[];
 }
 
 export class BattleStack extends cdk.Stack {
@@ -76,7 +70,6 @@ export class BattleStack extends cdk.Stack {
     const isProduction = this.node.tryGetContext('environment') === 'production';
     const dataRemovalPolicy = isProduction ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY;
     const appUrl = this.node.tryGetContext('appUrl') || props.appUrl || 'http://localhost:5173';
-    const allowedBattleTiers = props.allowedBattleTiers?.length ? props.allowedBattleTiers : (['premium'] as Tier[]);
 
     // Experiments table lives in the always-deployed experiments owner
     // (AgentEchelonExperiments). Resolve it via the shared SSM contract at deploy
@@ -469,8 +462,6 @@ export class BattleStack extends cdk.Stack {
         CHANNEL_BATTLE_CONFIG_TABLE: channelBattleConfigTable.tableName,
         EXPERIMENTS_TABLE: experimentsTableName,
         ALLOWED_ORIGIN: appUrl,
-        // Which tiers may arm /battle; enforced in channel-battle.ts.
-        ALLOWED_BATTLE_TIERS: allowedBattleTiers.join(','),
       },
       bundling: { minify: false, forceDockerBundling: false },
     });

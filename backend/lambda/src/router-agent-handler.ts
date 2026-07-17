@@ -481,7 +481,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     // exist in the AE Cognito pool, so a group-based tier lookup always throws
     // UserNotFoundException and would wrongly downgrade them to basic. Their entitlement is
     // fixed by the channel they were provisioned into (federated-create-conversation creates
-    // the channel at ASSISTANT_TIER and they can only ever be a member of that channel), so the
+    // the channel at ASSISTANT_CLASSIFICATION and they can only ever be a member of that channel), so the
     // channel tier IS authoritative for them — trust it and skip the Cognito lookup. Without
     // this, every turn downgrades to basic and the standard processor is never invoked.
     const isFederated = userSub.startsWith('fed_');
