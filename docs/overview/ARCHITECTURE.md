@@ -665,7 +665,7 @@ Access to AI models is enforced at the IAM level. Deployments can choose Anthrop
 
 Deployment model overrides are selected in CDK with `basicModelKey`, `standardModelKey`, and `premiumModelKey`.
 
-**How tier is determined:** User tier is stored as a Cognito custom attribute (`custom:tier`), set during admin approval. The Lex bot reads this from session attributes and routes to the corresponding handler Lambda.
+**How tier is determined:** User tier is stored as a Cognito custom attribute (`custom:tier`), set during admin approval. The fulfillment handler (`router-agent-handler.ts`) reads the tier and resolves the effective tier as `min(userTier, channelTier)`, then dispatches to that tier's async processor. Lex is only the entry trigger; it performs no routing or tier logic.
 
 **How tier is enforced:** Each handler Lambda has its own IAM role with Bedrock `InvokeModel` permissions scoped to specific model ARNs. The IAMPolicies stack adds Cognito Identity Pool role mappings so frontend SDK clients also have tier-appropriate permissions.
 
@@ -708,7 +708,7 @@ Athena mode. (Usage: [ADMIN-GUIDE.md](../guides/admin/ADMIN-GUIDE.md); design:
 | **S3 upload fails** | `attachmentService.ts` catches error → `FileUploadPreview` shows error state; user can retry |
 | **Presigned URL expires before upload** | URL defaults to 1-hour expiry; if expired, `attachmentService` returns error and user must re-attach |
 | **SES email fails (sharing)** | Lambda catches error → returns 500; `ShareConversationModal` shows error message |
-| **Lex classification fails** | Falls back to `FallbackIntent` → routes to default handler |
+| **Lex returns `FallbackIntent`** | The fulfillment handler classifies the request itself and applies its default routing (Lex is only the trigger) |
 | **Concurrent messages in same channel** | Chime SDK handles ordering; each message gets a unique `MessageId`; no deduplication - duplicate sends produce duplicate messages |
 | **Aurora connection failure** | `db-client.ts` pool reconnects on auth errors; other errors thrown to caller |
 | **Lambda timeout (30-90s by tier)** | Async processor is killed; placeholder message stays; no automatic cleanup of DynamoDB task state |

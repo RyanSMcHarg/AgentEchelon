@@ -1,16 +1,20 @@
 # Agent Echelon
 
-**A governed agent harness for enterprise AI - custom-built on AWS.** Agent Echelon gives your team controlled, tiered access to the best models for every task, with *who can do what* enforced by IAM - infrastructure, not application code - so a buggy prompt or a misrouted request can't exceed what the assumed role and the channel's policy already permit. Data, cost, and quality stay firmly in your hands.
+**Agent Echelon is a self-hosted agent control plane: a governed, multi-party agentic AI platform that runs entirely in your own AWS account and serves your internal and customer-facing use cases from one place.** It is the governed layer between your agents and everything they touch (the harness around your models), deciding who may act, which model answers, where the context lives, and what gets recorded. It does not bolt a new policy engine and a separate agent-identity service onto your stack: it enforces with the cloud's own primitives - every user and every conversation is an AWS resource with an ARN, so access is an IAM decision, and each agent acts under a bearer-pinned identity, never a shared backend credential. Self-hosted, model-agnostic, MIT-licensed.
+
+The point is centralization. Instead of standing up a separate tool for each use case (a support assistant here, an internal assistant there, each with its own login, data store, bill, and security review), you run one governed platform that serves them all - and a new experience is configuration over the same substrate rather than a new system.
 
 > **Status: reference implementation.** Agent Echelon is a starter application that demonstrates a governed agent architecture on AWS. It is a foundation to build on, not a turnkey production system. Every deployment should evaluate the features against its own security, privacy, and compliance needs and modify the project to meet them. Nothing here is legal advice.
 
 ## Why Agent Echelon
 
-Most AI tools give you a chat box and a bill. Agent Echelon gives you the controls underneath - a harness that surrounds the agents (routing, guardrails, evaluation, resilience), a control plane that governs every user *and* every assistant (tiered, IAM-enforced, bearer-pinned, provable with a deny-test), and a multiparty, multichannel conversation substrate (humans and assistants in shared channels, with who-sees-what enforced).
+Most agentic systems are a model plus tools, memory, and an orchestration loop. Agent Echelon assumes you have those and supplies the enterprise runtime around them, as three platform layers on a foundation of AWS managed primitives:
 
-Real workflows aren't one user and one assistant. A single customer relationship moves across sales, a scheduled service visit, and a support case - touching multiple business units, internal employees, and (often) outside partners, each working inside tools they already use. Agent Echelon is the single interaction layer those touchpoints share: the same platform expresses a 1:1 tiered chat, a routed support case, a masked service call, or an alert-triggered incident-triage room by **configuration, not new code**, and it **wires into the systems the business already uses rather than replacing them** - so no party has to abandon their existing tools, which is what actually drives adoption.
+- **Interface layer.** The surfaces a participant meets: a web console for users and an admin console today; an embedded widget, phone/voice (PSTN), SMS, and integration into existing third-party tools are designed and seamed.
+- **Communication layer.** The substrate that moves messages and keeps context: a durable conversation that *is* the memory, a server-side hook on every message, and event capture with per-message metadata.
+- **Interaction layer.** Who may act, as whom, at what capability, with which assistant, reaching which systems - governance enforced in IAM. Its composition root is the *conversation type*; five pillars (identity and access, assistant configuration, conversation configuration, connectors, auditing) compose every experience.
 
-Enterprise teams need AI collaboration that stays inside their security boundary, routes the right model to the right task, enforces spending limits by user tier, and produces outputs they can actually measure. Agent Echelon deploys entirely within your AWS account - no data leaves your boundary, no third-party SaaS sits between your users and your models.
+All three sit on AWS managed primitives (Amazon Chime SDK Messaging, Bedrock, S3, Cognito/STS, IAM, Kinesis), so inference, moderation, message delivery, and retention are AWS's to operate, not yours to build. The platform integrates your identity provider (Cognito by default, or your SSO/SAML/OIDC) rather than replacing it, and reaches outside systems through pluggable connectors. Real workflows span sales, a scheduled service visit, and a support case - across business units, internal employees, and outside partners - so the same platform expresses a 1:1 tiered chat, a routed support case, a masked service call, or an alert-triggered incident-triage room by **configuration, not new code**, wiring into the systems the business already uses rather than replacing them.
 
 **Security** - Every conversation runs inside your AWS account on infrastructure you own. Cognito handles authentication with corporate IdP support. Bedrock Guardrails filter PII, prompt injection, and sensitive content. IAM - keyed on each channel's immutable `classification` tag and bearer-pinned to each user's *own* identity - enforces not just which models a tier may use but which conversations a user (or an assistant) can read or send in: fail-closed, evaluated before any request is processed, and provable with a deny-test rather than a code review. Admins can browse, moderate, redact, or delete any message.
 
@@ -686,12 +690,12 @@ echo "Report:  npx playwright show-report"
 
 - **Frontend**: React 19, Vite, TypeScript
 - **Backend**: AWS CDK (TypeScript), Lambda (Node.js 20)
-- **AI**: Amazon Bedrock (Anthropic Claude, Amazon Titan, OpenAI GPT-OSS)
+- **AI**: Amazon Bedrock (model-agnostic and configurable per tier - Anthropic Claude, Amazon Nova, OpenAI GPT-OSS; external HTTP providers also supported)
 - **Messaging**: Amazon Chime SDK Messaging (WebSocket)
 - **Auth**: Amazon Cognito (SAML/OIDC) with automatic token refresh
 - **Storage**: Amazon S3 (presigned URLs)
 - **Analytics**: Kinesis Data Firehose, S3, Athena
-- **Routing**: Amazon Lex V2
+- **Message trigger**: Amazon Lex V2 - a Chime-to-Lambda passthrough that invokes the fulfillment handler; request classification and model routing are done in `router-agent-handler.ts`, not by Lex
 
 ## Contributing
 

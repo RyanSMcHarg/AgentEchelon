@@ -215,7 +215,7 @@ the chunker:
 
 ## Cost (estimate)
 
-Cheap-model (`haiku`-class: ~$1/1M in, ~$5/1M out) translation:
+Cheap-model (`haiku`-class: ~$0.25/1M in, ~$1.25/1M out) translation:
 
 - Level 1: **$0** (system-prompt only).
 - Level 2 pivot: ~$0.0006/turn (in + out), **only** when
