@@ -3,11 +3,13 @@
 **Audience:** deployers and operators sizing an AgentEchelon instance, and anyone reviewing what each
 piece of infrastructure is for and what it costs to run.
 
-**How to read the numbers.** Every figure below is an **estimate** at us-east-1 on-demand rates, expressed
-as a rate basis (the published unit price) times a stated usage assumption. Actual cost depends on traffic,
-retention, and the capacity floors you configure. Validate against the [AWS Pricing Calculator](https://calculator.aws)
-for your region and volume before budgeting. Where a line is highly usage-driven (Bedrock inference) or
-rate-uncertain (RDS Proxy floors), it is flagged as such rather than presented as precise.
+> **⚠️ Estimates only - validate your own costs.** Every figure in this project's docs is a rough
+> **estimate** at us-east-1 on-demand rates (a published unit price times a stated usage assumption),
+> provided for orientation, not budgeting. AWS pricing changes, and your actual cost depends on your
+> region, traffic, retention, and the capacity floors you configure. **Do not rely on these numbers** -
+> validate against the [AWS Pricing Calculator](https://calculator.aws) and your own bills before you
+> commit to any spend. Where a line is highly usage-driven (Bedrock inference) or rate-uncertain (RDS
+> Proxy floors), it is flagged as such rather than presented as precise.
 
 Two deployment modes have very different cost shapes:
 

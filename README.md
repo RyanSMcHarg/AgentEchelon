@@ -513,7 +513,9 @@ The admin console groups analytics, conversation moderation (redact/delete), mod
 
 ## Cost Estimate
 
-A low-volume Athena-mode deployment runs roughly **$30-50/month** (dominated by Kinesis and Bedrock inference); Aurora mode adds roughly **~$50-95/month**. The full per-component cost model, both deployment modes, both VPC configs, and the Bedrock inference drivers live in the single source of truth: **[docs/guides/admin/INFRASTRUCTURE-COST.md](docs/guides/admin/INFRASTRUCTURE-COST.md)**.
+> **⚠️ Estimates only.** The figures here are rough estimates for orientation, not budgeting. AWS pricing changes and your actual cost depends on region, traffic, and configuration. **Validate your own costs** against the [AWS Pricing Calculator](https://calculator.aws) and your bills before committing to spend.
+
+A low-volume Athena-mode deployment runs roughly **$30-50/month** (dominated by the always-on Kinesis stream and Bedrock inference); Aurora mode adds roughly **~$50-95/month**. The full per-component cost model, both deployment modes, both VPC configs, and the Bedrock inference drivers live in the single source of truth: **[docs/guides/admin/INFRASTRUCTURE-COST.md](docs/guides/admin/INFRASTRUCTURE-COST.md)**.
 
 ## Customization Guide
 

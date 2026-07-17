@@ -60,7 +60,7 @@ Chime SDK → Kinesis Data Stream → Firehose → S3 → Glue Catalog → Athen
 **Characteristics:**
 - No VPC
 - Pay-per-query Athena cost
-- ~$5-15/month at low volume
+- ~$30-50/month at low volume (dominated by the shared Kinesis pipeline; estimate)
 - Lambda cold starts: fast (no VPC)
 - Query latency: 3-10 seconds for complex queries
 - No UPSERTs, no transactions, no materialized views
@@ -411,7 +411,7 @@ AgentEchelon/
 
 A new section: "Choosing an Analytics Mode"
 
-> **Athena mode (default)** - Serverless Kinesis → Firehose → S3 → Athena pipeline. ~$5-15/month. No VPC. Slower query latency for complex analytics (3-10s). Best for: MVPs, low-volume deployments, workloads that don't need multi-turn evaluation.
+> **Athena mode (default)** - Serverless Kinesis → Firehose → S3 → Athena pipeline. ~$30-50/month (the Kinesis stream is an always-on ~$20/mo baseline; estimate). No VPC. Slower query latency for complex analytics (3-10s). Best for: MVPs, low-volume deployments, workloads that don't need multi-turn evaluation.
 >
 > **Aurora mode (opt-in)** - Full Aurora PostgreSQL Serverless v2 with VPC, RDS Proxy, pgvector, materialized views. ~$50-95/month baseline. Sub-100ms query latency for complex SQL. Best for: production deployments, multi-turn evaluation, drift detection, RAG, sophisticated admin dashboards.
 >
@@ -427,8 +427,9 @@ A new section: "Choosing an Analytics Mode"
 ## Cost Comparison
 
 The full per-component cost model for both modes lives in the single source of truth,
-[INFRASTRUCTURE-COST.md](../../guides/admin/INFRASTRUCTURE-COST.md). In summary: Athena mode has a ~$0
-at-rest baseline (analytics is pay-per-query); Aurora mode adds roughly ~$50/month when importing a VPC (no
+[INFRASTRUCTURE-COST.md](../../guides/admin/INFRASTRUCTURE-COST.md) (which carries the estimates-only
+disclaimer; validate your own costs). In summary: Athena mode's at-rest baseline is the shared Kinesis
+pipeline (~$20-30/mo always-on), with Athena query cost pay-per-query on top; Aurora mode adds roughly ~$50/month when importing a VPC (no
 interface endpoints) to ~$95/month on a stack-created VPC, dominated by the Aurora cluster at its ACU
 floor, with the optional RDS Proxy adding ~$86/month when enabled. This spec covers the VPC, subnet, and
 endpoint architecture that shapes those numbers.

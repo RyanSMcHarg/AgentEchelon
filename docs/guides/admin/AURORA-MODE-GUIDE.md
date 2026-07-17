@@ -15,7 +15,7 @@ This guide covers when to switch, how to deploy, and what to expect.
 | Drift detection | Not available | pgvector cosine similarity over Titan v2 embeddings |
 | Cross-conversation context | Not available | Per-user context search (keyword + pgvector) |
 | Materialized views | Not available | Pre-computed daily metrics |
-| Monthly cost (baseline) | ~$5-15 | ~$50-95 (proxy off by default; see INFRASTRUCTURE-COST.md) |
+| Monthly cost (baseline, rough estimate) | ~$30-50 (Kinesis-dominated) | ~$50-95 (proxy off by default; see INFRASTRUCTURE-COST.md) |
 | VPC required | No | Yes (auto-provisioned) |
 | Schema migrations | None | Automated via custom resource |
 
