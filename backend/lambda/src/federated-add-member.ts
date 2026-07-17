@@ -35,7 +35,7 @@ const CHANNEL_FLOW_ARN_PARAM = process.env.CHANNEL_FLOW_ARN_PARAM || '';
 // confined to it, so it is authoritative for federated users).
 const TIER = (process.env.ASSISTANT_CLASSIFICATION || 'basic').trim();
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/tier/${TIER}/bot-arn`;
+const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/assistant/${TIER}/bot-arn`;
 const META_CAP = 1000;
 
 let cachedBotArn: string | null = null;

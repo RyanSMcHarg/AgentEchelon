@@ -160,7 +160,7 @@ export class FoundationsStack extends cdk.Stack {
               // stacks; add-agent binds the channel's own-tier assistant. No
               // shared cross-tier bot.
               resources: [
-                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/tier/*/bot-arn`,
+                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
             }),
           ],
@@ -284,7 +284,7 @@ export class FoundationsStack extends cdk.Stack {
                 // stacks; create-conversation adds the right tier bot to a new
                 // channel. No shared cross-tier bot — a missing per-tier key
                 // is an error, not a silent fallback.
-                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/tier/*/bot-arn`,
+                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
             }),
           ],
@@ -513,7 +513,7 @@ export class FoundationsStack extends cdk.Stack {
                 actions: ['ssm:GetParameter'],
                 resources: [
                   channelFlowArnParamArn,
-                  `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/tier/*/bot-arn`,
+                  `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
                 ],
               }),
             ],

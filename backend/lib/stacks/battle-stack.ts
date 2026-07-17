@@ -440,7 +440,7 @@ export class BattleStack extends cdk.Stack {
               resources: [
                 // The per-tier bot keys channel-battle.ts resolves (resolveTierBotArn).
                 // Every tier owns its own bot; there is no shared /agent-echelon/bot-arn.
-                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/tier/*/bot-arn`,
+                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
             }),
           ],

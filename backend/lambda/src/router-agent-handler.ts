@@ -62,7 +62,7 @@ import {
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-// Per-tier bot SSM key (= /agent-echelon/tier/{tier}/bot-arn), always set by the
+// Per-tier bot SSM key (= /agent-echelon/assistant/{tier}/bot-arn), always set by the
 // deploying tier stack. There is no shared '/agent-echelon/bot-arn' fallback.
 const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || '';
 const USER_POOL_ID = process.env.USER_POOL_ID || '';
@@ -335,7 +335,7 @@ const processorArnCache = new Map<string, string>();
 
 /**
  * Resolve the tier's async-processor ARN, preferring the per-tier stack's
- * SSM-published value (/agent-echelon/tier/{tier}/processor-arn) and falling
+ * SSM-published value (/agent-echelon/assistant/{tier}/processor-arn) and falling
  * back to the *_ASYNC_PROCESSOR_ARN env var. A tier routes to its
  * AgentEchelonTier-* processor as soon as that stack publishes its SSM param.
  */
@@ -343,7 +343,7 @@ async function resolveAsyncProcessorArn(tier: string): Promise<string> {
   const cached = processorArnCache.get(tier);
   if (cached) return cached;
 
-  const fromSsm = await getSsmValue(`${SSM_ROOT}/tier/${tier}/processor-arn`);
+  const fromSsm = await getSsmValue(`${SSM_ROOT}/assistant/${tier}/processor-arn`);
   if (fromSsm) {
     processorArnCache.set(tier, fromSsm);
     return fromSsm;

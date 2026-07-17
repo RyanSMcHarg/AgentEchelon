@@ -298,7 +298,7 @@ describe('battle-orchestrator handler', () => {
 // (PREMIUM_PROCESSOR_ARN_PARAM), with a literal env override honored first.
 // These tests pin that resolution order + the unresolved guard.
 describe('premium processor ARN resolution (runtime SSM)', () => {
-  const SSM_PARAM = '/agent-echelon/tier/premium/processor-arn';
+  const SSM_PARAM = '/agent-echelon/assistant/premium/processor-arn';
   const SSM_ARN = 'arn:aws:lambda:us-east-1:111:function:premium-from-ssm';
   const terminalRows = [
     { battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED', round1Reply: 'A says X', round1MessageId: 'msg-A' },

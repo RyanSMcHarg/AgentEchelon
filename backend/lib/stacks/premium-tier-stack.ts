@@ -11,8 +11,8 @@
  *     /battle round participation including image-gen, generated docs).
  *   - Per-tier Lex bot (WelcomeIntent + FallbackIntent → shared router).
  *   - Per-tier AppInstanceBot for the channel-side handle.
- *   - SSM publishers: `/agent-echelon/tier/premium/processor-arn`,
- *     `/agent-echelon/tier/premium/bot-arn`.
+ *   - SSM publishers: `/agent-echelon/assistant/premium/processor-arn`,
+ *     `/agent-echelon/assistant/premium/bot-arn`.
  *
  * Tier isolation boundary: the processor role's S3 IAM is scoped to
  * `context/basic/` + `context/standard/` + `context/premium/`. Premium
@@ -365,7 +365,7 @@ export class PremiumTierStack extends cdk.Stack {
     // static welcome is used (the default). A deployment enables the multi-step
     // intake by writing the JSON schema here (no redeploy — takes effect on the
     // next cold start). See docs/GUIDE-ASSISTANT-CONTEXT.md "Welcome patterns".
-    const onboardingIntakeParamName = `${SSM_ROOT}/tier/${tier}/onboarding-intake`;
+    const onboardingIntakeParamName = `${SSM_ROOT}/assistant/${tier}/onboarding-intake`;
     const onboardingIntakeParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${onboardingIntakeParamName}`;
 
     const handlerRole = new iam.Role(this, 'AgentHandlerRole', {

@@ -17,7 +17,7 @@ const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN!;
 // Classification this federated assistant is provisioned at (env renamed from ASSISTANT_TIER).
 const TIER = (process.env.ASSISTANT_CLASSIFICATION || 'basic').trim();
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/tier/${TIER}/bot-arn`;
+const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/assistant/${TIER}/bot-arn`;
 
 let cachedBotArn: string | null = null;
 async function getBotArn(): Promise<string> {

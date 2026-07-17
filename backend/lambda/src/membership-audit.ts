@@ -182,7 +182,7 @@ async function resolveChannelTier(channelArn: string, _bearerArn: string): Promi
 }
 
 let botTierMap: Map<string, string> | null = null;
-/** Map each per-tier assistant's bot ARN (`${SSM_ROOT}/tier/{tier}/bot-arn`) to its tier.
+/** Map each per-tier assistant's bot ARN (`${SSM_ROOT}/assistant/{tier}/bot-arn`) to its tier.
  *  Cached for the Lambda's warm life. A bot ARN not in this map is not one of the default
  *  tier assistants (e.g. a `/battle` alt-slot bot), so it is left alone. */
 async function loadBotTierMap(): Promise<Map<string, string>> {
@@ -190,7 +190,7 @@ async function loadBotTierMap(): Promise<Map<string, string>> {
   const map = new Map<string, string>();
   for (const tier of profiles.classificationValues()) {
     try {
-      const resp = await ssm.send(new GetParameterCommand({ Name: `${SSM_ROOT}/tier/${tier}/bot-arn` }));
+      const resp = await ssm.send(new GetParameterCommand({ Name: `${SSM_ROOT}/assistant/${tier}/bot-arn` }));
       if (resp.Parameter?.Value) map.set(resp.Parameter.Value, tier);
     } catch {
       /* a tier without a published bot ARN is simply not mapped */

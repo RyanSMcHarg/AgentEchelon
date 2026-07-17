@@ -9,8 +9,8 @@
  *     no streaming, no image gen).
  *   - Per-tier Lex bot (WelcomeIntent + FallbackIntent → shared router).
  *   - Per-tier AppInstanceBot for the channel-side handle.
- *   - SSM publishers: `/agent-echelon/tier/standard/processor-arn`,
- *     `/agent-echelon/tier/standard/bot-arn`.
+ *   - SSM publishers: `/agent-echelon/assistant/standard/processor-arn`,
+ *     `/agent-echelon/assistant/standard/bot-arn`.
  *
  * Tier isolation boundary: the processor role's S3 IAM is scoped to
  * `context/basic/` + `context/standard/`. Standard inherits basic, blocks
@@ -292,7 +292,7 @@ export class StandardTierStack extends cdk.Stack {
       this.node.tryGetContext('assistantParamWriter') === 'true' ||
       this.node.tryGetContext('assistantParamWriter') === true;
 
-    const systemPromptParamName = `${SSM_ROOT}/tier/${tier}/assistant-system-prompt`;
+    const systemPromptParamName = `${SSM_ROOT}/assistant/${tier}/assistant-system-prompt`;
     const systemPromptParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${systemPromptParamName}`;
     if (systemPromptValue.trim()) {
       if (useParamWriter) {
@@ -416,14 +416,14 @@ export class StandardTierStack extends cdk.Stack {
     // D1 preserve-on-absent (same pattern as the persona above): write the pack via a custom resource
     // that PutParameters only when non-empty and never deletes; the hash in the physicalId busts
     // drift. Advanced tier (8 KB) — a rich intent pack exceeds the 4 KB Standard cap.
-    const intentPackParamName = `${SSM_ROOT}/tier/${tier}/assistant-intent-pack`;
+    const intentPackParamName = `${SSM_ROOT}/assistant/${tier}/assistant-intent-pack`;
     const intentPackParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${intentPackParamName}`;
     // Optional onboarding-intake schema (opt-in welcome). The router reads this
     // SSM param at cold start; absent/empty ⇒ onboarding is disabled and the
     // static welcome is used (the default). A deployment enables the multi-step
     // intake by writing the JSON schema here (no redeploy — takes effect on the
     // next cold start). See docs/GUIDE-ASSISTANT-CONTEXT.md "Welcome patterns".
-    const onboardingIntakeParamName = `${SSM_ROOT}/tier/${tier}/onboarding-intake`;
+    const onboardingIntakeParamName = `${SSM_ROOT}/assistant/${tier}/onboarding-intake`;
     const onboardingIntakeParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${onboardingIntakeParamName}`;
     if (intentPackJson.trim()) {
       if (useParamWriter) {

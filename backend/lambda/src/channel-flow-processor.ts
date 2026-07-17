@@ -113,7 +113,7 @@ async function getChannelTier(channelArn: string, _bearerArn: string): Promise<s
 const tierBotArnCache: Record<string, string> = {};
 async function resolveTierBotArn(tier: string): Promise<string> {
   if (tierBotArnCache[tier]) return tierBotArnCache[tier];
-  const key = `${SSM_ROOT}/tier/${tier}/bot-arn`;
+  const key = `${SSM_ROOT}/assistant/${tier}/bot-arn`;
   const resp = await ssmClient.send(new GetParameterCommand({ Name: key }));
   const arn = resp.Parameter?.Value;
   if (!arn) {

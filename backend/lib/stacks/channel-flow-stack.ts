@@ -112,7 +112,7 @@ export class ChannelFlowStack extends cdk.Stack {
                 // The processor resolves the channel's per-tier bot (the real
                 // member) to send @all broadcasts + member counts. No shared
                 // cross-tier bot.
-                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/tier/*/bot-arn`,
+                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
             }),
           ],

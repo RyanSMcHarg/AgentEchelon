@@ -124,7 +124,7 @@ describe('intent pack — SSM hydration (large packs)', () => {
   });
 
   test('hydrated SSM value takes precedence over env + DEFAULT', async () => {
-    process.env.ASSISTANT_INTENT_PACK_PARAM = '/agent-echelon/tier/standard/assistant-intent-pack';
+    process.env.ASSISTANT_INTENT_PACK_PARAM = '/agent-echelon/assistant/standard/assistant-intent-pack';
     _resetIntentPackCache();
     await hydrateIntentPackFromSsm({ getParameter: async () => DOMAIN_PACK });
     expect(knownIntentKeys().has('find_recipe')).toBe(true);
@@ -138,7 +138,7 @@ describe('intent pack — SSM hydration (large packs)', () => {
   });
 
   test('SSM fetch failure falls back to env/DEFAULT', async () => {
-    process.env.ASSISTANT_INTENT_PACK_PARAM = '/agent-echelon/tier/standard/assistant-intent-pack';
+    process.env.ASSISTANT_INTENT_PACK_PARAM = '/agent-echelon/assistant/standard/assistant-intent-pack';
     _resetIntentPackCache();
     await hydrateIntentPackFromSsm({ getParameter: async () => { throw new Error('ssm down'); } });
     expect(getIntentPack()).toBe(DEFAULT_INTENT_PACK);

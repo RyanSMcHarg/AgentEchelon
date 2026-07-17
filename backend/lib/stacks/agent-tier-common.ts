@@ -388,10 +388,10 @@ export function adminErrorAlertWiring(
  * owns its own bot.
  */
 export function tierBotArnKey(tier: Tier): string {
-  return `${SSM_ROOT}/tier/${tier}/bot-arn`;
+  return `${SSM_ROOT}/assistant/${tier}/bot-arn`;
 }
 export function tierProcessorArnKey(tier: Tier): string {
-  return `${SSM_ROOT}/tier/${tier}/processor-arn`;
+  return `${SSM_ROOT}/assistant/${tier}/processor-arn`;
 }
 
 /**

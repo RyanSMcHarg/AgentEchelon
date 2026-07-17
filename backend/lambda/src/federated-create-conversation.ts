@@ -32,7 +32,7 @@ const CHANNEL_FLOW_ARN_PARAM = process.env.CHANNEL_FLOW_ARN_PARAM || '';
 // SPEC-CAPABILITY-PROFILES). Authoritative for federated users — the channel is created at it.
 const TIER = (process.env.ASSISTANT_CLASSIFICATION || 'basic').trim();
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/tier/${TIER}/bot-arn`;
+const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/assistant/${TIER}/bot-arn`;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
 function cors(): Record<string, string> {

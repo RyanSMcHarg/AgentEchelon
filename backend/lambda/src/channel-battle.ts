@@ -89,7 +89,7 @@ async function resolveTierBotArn(tier: string): Promise<string> {
   if (tierBotArnCache[tier]) return tierBotArnCache[tier];
   try {
     const resp = await ssmClient.send(
-      new GetParameterCommand({ Name: `${SSM_ROOT}/tier/${tier}/bot-arn` }),
+      new GetParameterCommand({ Name: `${SSM_ROOT}/assistant/${tier}/bot-arn` }),
     );
     tierBotArnCache[tier] = resp.Parameter?.Value || '';
     return tierBotArnCache[tier];

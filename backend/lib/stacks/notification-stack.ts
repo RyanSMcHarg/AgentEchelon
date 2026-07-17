@@ -124,7 +124,7 @@ export class NotificationStack extends cdk.Stack {
                 // Resolve the channel's per-tier bot (the real creator+member)
                 // to add members + send as the assistant. No shared cross-tier
                 // bot.
-                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/tier/*/bot-arn`,
+                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
             }),
           ],
@@ -283,7 +283,7 @@ export class NotificationStack extends cdk.Stack {
                 // Resolve the channel's per-tier bot (the real creator+member)
                 // to add members + send as the assistant. No shared cross-tier
                 // bot.
-                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/tier/*/bot-arn`,
+                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
             }),
           ],

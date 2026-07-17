@@ -445,10 +445,10 @@ describe('CDK Synthesis', () => {
       // and create-conversation to discover.
       template.resourceCountIs('AWS::SSM::Parameter', 2);
       template.hasResourceProperties('AWS::SSM::Parameter', {
-        Name: '/agent-echelon/tier/basic/processor-arn',
+        Name: '/agent-echelon/assistant/basic/processor-arn',
       });
       template.hasResourceProperties('AWS::SSM::Parameter', {
-        Name: '/agent-echelon/tier/basic/bot-arn',
+        Name: '/agent-echelon/assistant/basic/bot-arn',
       });
     });
 
@@ -474,7 +474,7 @@ describe('CDK Synthesis', () => {
 
       // Still publishes its own processor ARN for the router to discover.
       template.hasResourceProperties('AWS::SSM::Parameter', {
-        Name: '/agent-echelon/tier/standard/processor-arn',
+        Name: '/agent-echelon/assistant/standard/processor-arn',
       });
     });
 

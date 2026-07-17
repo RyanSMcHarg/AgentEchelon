@@ -119,7 +119,7 @@ export class MembershipAuditConstruct extends Construct {
           cdk.Stack.of(this).formatArn({
             service: 'ssm',
             resource: 'parameter',
-            resourceName: `${SSM_ROOT.replace(/^\//, '')}/tier/*`,
+            resourceName: `${SSM_ROOT.replace(/^\//, '')}/assistant/*`,
           }),
         ],
       }),

@@ -10,8 +10,8 @@
  *   - Per-tier Lex bot fulfilling into the SHARED router (router-agent-handler,
  *     TIER=basic). There is no separate basic handler — that was drift; retired.
  *   - Per-tier AppInstanceBot for the channel-side handle.
- *   - SSM publishers: `/agent-echelon/tier/basic/processor-arn`,
- *     `/agent-echelon/tier/basic/bot-arn`.
+ *   - SSM publishers: `/agent-echelon/assistant/basic/processor-arn`,
+ *     `/agent-echelon/assistant/basic/bot-arn`.
  *
  * Tier isolation boundary: the processor role's S3 IAM is scoped to
  * `context/basic/` only. S3 returns AccessDenied for any other prefix — the
@@ -235,9 +235,9 @@ export class BasicTierStack extends cdk.Stack {
     const useParamWriter =
       this.node.tryGetContext('assistantParamWriter') === 'true' ||
       this.node.tryGetContext('assistantParamWriter') === true;
-    const intentPackParamName = `${SSM_ROOT}/tier/${tier}/assistant-intent-pack`;
+    const intentPackParamName = `${SSM_ROOT}/assistant/${tier}/assistant-intent-pack`;
     const intentPackParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${intentPackParamName}`;
-    const onboardingIntakeParamName = `${SSM_ROOT}/tier/${tier}/onboarding-intake`;
+    const onboardingIntakeParamName = `${SSM_ROOT}/assistant/${tier}/onboarding-intake`;
     const onboardingIntakeParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${onboardingIntakeParamName}`;
     if (intentPackJson.trim()) {
       if (useParamWriter) {
