@@ -83,7 +83,7 @@ export const DEFAULT_PROFILES_CONFIG: ProfilesConfig = {
     // classifierMode: 'llm' for ALL default profiles — basic is deliberately NOT keyword-classified
     // (a considered deviation from the legacy `classifyIntentBasic` path). 'keyword' remains a valid
     // schema option a deployment can select for a cheap profile; it is just not the default.
-    { name: 'basic', modelKey: 'haiku', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'lightweight', contextScope: 'own-rank-and-below', rateLimitPerHour: 60, battleEligible: false },
+    { name: 'basic', modelKey: 'haiku', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'full', contextScope: 'own-rank-and-below', rateLimitPerHour: 60, battleEligible: false },
     { name: 'standard', modelKey: 'sonnet', classifierMode: 'llm', timeoutSeconds: 60, taskSupport: 'full', contextScope: 'own-rank-and-below', rateLimitPerHour: 120, battleEligible: false },
     { name: 'premium', modelKey: 'opus', classifierMode: 'llm', timeoutSeconds: 90, taskSupport: 'full', contextScope: 'own-rank-and-below', rateLimitPerHour: 240, battleEligible: true },
   ],
