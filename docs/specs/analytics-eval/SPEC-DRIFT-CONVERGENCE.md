@@ -175,7 +175,7 @@ The related-conversation query is the highest-risk surface here - a bug here lea
 - 1:1 channel (sender + bot): scope = sender's channel memberships. Same as today's behavior.
 - Multi-member channel (sender + other human(s) + bot): scope = **intersection** of every human member's channel memberships. A related conversation can only be suggested if every current human member already has access to it. Bot/assistant memberships are excluded from the intersection set (bots are in many channels; including them would defeat the privacy boundary).
 
-Implementation: `getScopedChannelArns(currentChannelArn): Promise<string[]>` - lists current channel members via Chime, filters out bots by ARN segment (`/bot/`), takes the intersection of remaining humans' memberships via Aurora `channel_memberships` table.
+Implementation: `getScopedChannelArns(currentChannelArn): Promise<string[]>` - lists current channel members via Amazon Chime SDK, filters out bots by ARN segment (`/bot/`), takes the intersection of remaining humans' memberships via Aurora `channel_memberships` table.
 
 A second integration test: a 3-member channel (user A + user B + bot) where A is in some channel C that B is not in, and C has a summary that would otherwise match the drift query. The test fails if drift suggests C.
 
@@ -340,7 +340,7 @@ Drift detection is per-message overhead on the live path: one embedding call + o
 | **Medium** | 1k - 50k | 10k - 500k | Bedrock Titan v2 embedding latency on the critical path (~50-100ms per call adds to TTFR) | Add a summary-embedding DDB cache (write-through, 24h TTL backstop). The first post-launch optimization |
 | **Large** | 50k - 500k | 500k - 5M | Aurora memory pressure: pgvector HNSW index outgrows the minimum-ACU shared_buffers (~1GB at 0.5 ACU). At ~250k summary embeddings × 4KB/row + 2-3× index overhead, the index no longer fits in memory and queries hit disk | Raise Aurora Serverless v2 min ACU (config in `analytics-aurora-stack.ts`); document the breakpoint in `docs/guides/admin/AURORA-MODE-GUIDE.md` |
 | **Large** (parallel) | - | Same | Bedrock per-account/region TPS throttling on Titan v2 - sustained throttle = drift skipped per-message via the `signalAvailable:false` path. Bedrock resilience layer handles retries but sustained throttle is a real signal degradation | Request a quota increase, or move to Bedrock provisioned throughput for embedding endpoints |
-| **Huge** | >500k | >5M | Multi-member intersection scoping fan-out. For a 50-member channel where each user has 1000+ channels, `getScopedChannelArns()` makes 50 Chime `ListChannelMemberships` calls (each paginated). This adds ~500ms-1s of latency to the critical path | Per-user-memberships cache (Aurora or DDB), invalidated on `CreateChannelMembership` / `DeleteChannelMembership` events. Or: precompute a `scoped_channels_cache` table keyed by `(channelArn, computed_at)` and refresh on a TTL |
+| **Huge** | >500k | >5M | Multi-member intersection scoping fan-out. For a 50-member channel where each user has 1000+ channels, `getScopedChannelArns()` makes 50 Amazon Chime SDK `ListChannelMemberships` calls (each paginated). This adds ~500ms-1s of latency to the critical path | Per-user-memberships cache (Aurora or DDB), invalidated on `CreateChannelMembership` / `DeleteChannelMembership` events. Or: precompute a `scoped_channels_cache` table keyed by `(channelArn, computed_at)` and refresh on a TTL |
 
 ### Specific load math
 
@@ -362,7 +362,7 @@ Drift detection is per-message overhead on the live path: one embedding call + o
 
 **Per-user channel-list growth (the real long pole at extreme scale):**
 - A user accumulating channels over years: 10k channels per user means 10k-row scope per query
-- Each Chime `ListChannelMemberships` page is 50 channels = 200 paginated calls for that user
+- Each Amazon Chime SDK `ListChannelMemberships` page is 50 channels = 200 paginated calls for that user
 - Per-call latency ~50ms = 10s of latency added to the critical path
 - This is the strongest argument for a per-user-memberships cache. Not in launch scope: launch deployers won't have users with 10k channels
 

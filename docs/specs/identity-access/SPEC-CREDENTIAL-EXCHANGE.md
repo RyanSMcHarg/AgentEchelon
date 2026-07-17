@@ -8,7 +8,7 @@
 
 ## 1. Why
 
-For an interaction layer to be safe and open at the same time, every actor - a tiered user, an external person routed in from a connector, a guest, the assistant itself - must participate **at exactly the capability they should, and only as themselves.** Because AgentEchelon is built on AWS-native services (Chime SDK + Cognito + STS), it can make that an **IAM decision, not application logic**: a backend exchange vends short-lived AWS credentials **scoped by IAM** to the caller's own identity at the caller's capped classification. Identity becomes infrastructure-enforced, evaluated before any request is processed.
+For an interaction layer to be safe and open at the same time, every actor - a tiered user, an external person routed in from a connector, a guest, the assistant itself - must participate **at exactly the capability they should, and only as themselves.** Because AgentEchelon is built on AWS-native services (Amazon Chime SDK + Cognito + STS), it can make that an **IAM decision, not application logic**: a backend exchange vends short-lived AWS credentials **scoped by IAM** to the caller's own identity at the caller's capped classification. Identity becomes infrastructure-enforced, evaluated before any request is processed.
 
 ## 2. Who benefits
 
@@ -82,16 +82,16 @@ Two ways to offboard; the right one is **conversation/user-type dependent**:
 - **Bearer-pinned** - an actor can only ever act as itself (`…/user/${aws:PrincipalTag/sub}`), enforced by IAM.
 - **IDOR-safe** - identity comes only from validated token claims, never the request body.
 - **Per-tenant credential isolation** for connector-resolved externals (`SPEC-CONVERSATION-TYPES.md` §6).
-- **Tier gating is keyed on the global `aws:ResourceTag/classification`** in a fail-closed **Allow** - Chime exposes no service-specific condition keys, so a `chime:ResourceTag/...` condition would be a silent no-op. The Chime calls use the `chime-sdk-identity` / `chime-sdk-messaging` SDK namespaces (see `IDENTITY-PROVIDER-GUIDE.md` for the IdP-integration sample, and §4 here for the bearer pin).
+- **Tier gating is keyed on the global `aws:ResourceTag/classification`** in a fail-closed **Allow** - Amazon Chime SDK exposes no service-specific condition keys, so a `chime:ResourceTag/...` condition would be a silent no-op. The Amazon Chime SDK calls use the `chime-sdk-identity` / `chime-sdk-messaging` SDK namespaces (see `IDENTITY-PROVIDER-GUIDE.md` for the IdP-integration sample, and §4 here for the bearer pin).
 
 ## 9. Implementation
 
-**The exchange is the sole source of Chime credentials.** There is no Identity-Pool fallback.
+**The exchange is the sole source of Amazon Chime SDK credentials.** There is no Identity-Pool fallback.
 - **Exchange:** the Lambda + API + the bearer-pinned role spectrum + full-lifecycle delete (incl. membership cleanup) are in `AgentEchelonCognitoAuth`.
 - **Bearer pin:** `backend/scripts/deny-test-credential-exchange.mjs` provisions a real `classification=basic` channel and demonstrates that a basic user's exchange creds can send bearing their **own** ARN but are **AccessDenied** bearing the **premium** user's ARN - only the bearer differs, so the pin (not the tag-gate) is what enforces it.
 - **API contract:** `tests/e2e/credential-exchange.spec.ts` covers it (no-auth → 401; authed → own-ARN creds + tier; body-supplied sub/tier ignored - IDOR-safe).
 - **Assistant pin:** the per-tier `ProcessorRole`/`AgentHandlerRole` bearer is `/bot/*` only (no `/user/*`).
-- **Frontend:** `VITE_CREDENTIAL_EXCHANGE_API_URL` is **REQUIRED**; the authenticated Identity-Pool roles carry no Chime grant (they remain bare principals so the pool still resolves). The Playwright signin + agents suites run against the frontend with no Identity-Pool fallback - the round-trip (sign-in → exchange → Chime WebSocket → send → agent reply) runs entirely on bearer-pinned exchange creds.
+- **Frontend:** `VITE_CREDENTIAL_EXCHANGE_API_URL` is **REQUIRED**; the authenticated Identity-Pool roles carry no Amazon Chime SDK grant (they remain bare principals so the pool still resolves). The Playwright signin + agents suites run against the frontend with no Identity-Pool fallback - the round-trip (sign-in → exchange → Amazon Chime SDK WebSocket → send → agent reply) runs entirely on bearer-pinned exchange creds.
 
 ## 10. Design note: the bearer pin is tag-coupled
-The bearer pin resolves `…/user/${aws:PrincipalTag/sub}` from a session tag the exchange sets on `AssumeRole`. `${aws:PrincipalTag/sub}` only resolves for a credential the exchange itself vended (it is the thing that sets the tag), so a credential from any other source cannot satisfy the pin - which is why the exchange is the sole Chime credential source, with no fallback.
+The bearer pin resolves `…/user/${aws:PrincipalTag/sub}` from a session tag the exchange sets on `AssumeRole`. `${aws:PrincipalTag/sub}` only resolves for a credential the exchange itself vended (it is the thing that sets the tag), so a credential from any other source cannot satisfy the pin - which is why the exchange is the sole Amazon Chime SDK credential source, with no fallback.

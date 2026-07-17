@@ -66,7 +66,7 @@ reasons:
    reveal channel identifiers the user didn't ask about. The hint is
    metadata, not data.
 2. **Performance.** Looking up other channels' names (e.g. for
-   "in your Q3 sales conversation") would require a Chime
+   "in your Q3 sales conversation") would require an Amazon Chime SDK
    `DescribeChannel` per other-channel task. That cost would land on
    every turn for users with multiple active tasks. Worth it only if
    user testing proves the richer hint moves the needle.
@@ -107,7 +107,7 @@ no UserTasksTable rows at all.
   can offer to navigate them to the other channel (using the
   existing `NAVIGATE_CHANNEL` marker the frontend already handles).
   Auto-resuming would be a meaningful UX change and is out of scope.
-- **Channel name in the hint.** As above: an extra Chime call per turn
+- **Channel name in the hint.** As above: an extra Amazon Chime SDK call per turn
   for marginal value, so it is out of scope.
 - **Cross-channel battle tasks.** Battle tasks intentionally do NOT
   write to `UserTasksTable` (per-bot ownership, see SPEC-BATTLE.md).
@@ -158,7 +158,7 @@ points at a UserTasksTable / IAM problem worth investigating.
 under PK. PAY_PER_REQUEST (default in this project) charges per
 read-request-unit; expected ~$0.000000125 per turn at current AWS
 pricing. No additional cost for the hint emission itself (no DDB
-writes, no Chime calls, just a string concat into the prompt).
+writes, no Amazon Chime SDK calls, just a string concat into the prompt).
 
 **Latency.** Expected p50 in the 5-15ms range based on DynamoDB PK
 query semantics. No measurements taken on this specific call site;

@@ -50,7 +50,7 @@ interface ConversationTypeConfig {
   participants?: ParticipantPolicy;                  // who joins + how non-creator humans are resolved
   connectors?: ConnectorRef[];                       // external vendor systems (§6)
   offboardMode?: 'delete' | 'deactivate';            // how a departed member appears in history
-  expiration?: { days: number; criterion: 'CREATED_TIMESTAMP'|'LAST_MESSAGE_TIMESTAMP' };  // default channel TTL → Chime ExpirationSettings (SPEC-ACCESS-AND-CONTROLS-AUDITING §4c, toggle 2)
+  expiration?: { days: number; criterion: 'CREATED_TIMESTAMP'|'LAST_MESSAGE_TIMESTAMP' };  // default channel TTL → Amazon Chime SDK ExpirationSettings (SPEC-ACCESS-AND-CONTROLS-AUDITING §4c, toggle 2)
   metadataSchemaVersion?: number;                    // forward-compat snapshot version (§7)
 }
 ```
@@ -59,7 +59,7 @@ interface ConversationTypeConfig {
 Access is gated by a small, **ordered, closed** set of security classifications that IAM evaluates (the channel's `classification` tag - see SPEC-CONVERSATION-SECURITY). Conversation types are meant to proliferate and need no ordering (there's no order between `support` and `engagement`). So a type **carries** a classification (one of the closed set) rather than being one. **Invariant: adding a type never adds a classification** - a new classification is a separate, security-reviewed change (it touches the ordered allow-list and its deny-tests). This keeps the catalog open while the enforced security axis stays minimal.
 
 ### 4b. The conversation is the hub
-The conversation (a Chime SDK channel + its metadata/context) is the **runtime hub** every transport and connector attaches to: non-chat transports (voice/SMS/meeting) and external systems post their artifacts (summaries, structured cards) **back into the conversation** and link external records by reference (`ExternalRef`). So "history attached to the conversation" needs no separate aggregate store - the channel is the conversation, and everything attaches to it. A conversation-matcher routes inbound external comms to the right conversation. (`channel-creation.ts` stamps `parentChannelArn`/`createdViaDrift`.)
+The conversation (an Amazon Chime SDK channel + its metadata/context) is the **runtime hub** every transport and connector attaches to: non-chat transports (voice/SMS/meeting) and external systems post their artifacts (summaries, structured cards) **back into the conversation** and link external records by reference (`ExternalRef`). So "history attached to the conversation" needs no separate aggregate store - the channel is the conversation, and everything attaches to it. A conversation-matcher routes inbound external comms to the right conversation. (`channel-creation.ts` stamps `parentChannelArn`/`createdViaDrift`.)
 
 ## 5. How it composes with the other pillars
 
@@ -76,7 +76,7 @@ A **connector** is one integration to one external vendor (Salesforce, ServiceNo
 - **`resolveParticipant`** - turn "bring in a human" into a concrete identity via the vendor's router/assignment (the platform does **not** reimplement routing - it calls the vendor's API + existing AWS event integrations). The resolved person is admitted at the channel's classification.
 - **`syncRecord`** - create/update/read a ticket/case/work-order and attach the transcript; rides a normalized, vendor-neutral `PlatformEvent` taxonomy on an EventBridge bus, idempotent by `eventId`.
 - **`fetchContext`** - read external/observability data into the conversation (e.g. CloudWatch/CloudTrail).
-- **`provideComms`** - supply a non-chat transport (Twilio voice+SMS, Chime SDK Meetings); artifacts summarize back into the hub (§4b).
+- **`provideComms`** - supply a non-chat transport (Twilio voice+SMS, Amazon Chime SDK Meetings); artifacts summarize back into the hub (§4b).
 - **`ingest`** - inbound mirror (a vendor webhook → platform actions), signature-verified.
 
 A conversation **type** declares available connectors (`ConnectorRef`); a conversation **instance** holds the live bindings (`ExternalRef` - the specific case/call). **Security:** per-vendor, **per-tenant** credential isolation in Secrets Manager (`connector/{tenantId}/{connectorId}`) with scoped IAM - one tenant's connector run cannot read another's secret; outbound actions (dial, open case, dispatch) are audited; externally resolved humans are admitted under the **same** classification (connectors feed admission, never bypass it).

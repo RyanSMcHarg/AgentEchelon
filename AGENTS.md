@@ -199,7 +199,7 @@ npx cdk deploy --all -c adminAuthMode=federated -c hostAdminPoolId=us-east-1_XXX
 ```
 
 **2. How over-tier memberships are handled** (`-c enableMembershipAudit`, `-c membershipAuditEnforce`).
-The near-real-time membership audit (`docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md` Layer 6) watches Chime
+The near-real-time membership audit (`docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md` Layer 6) watches Amazon Chime SDK
 membership changes and flags any member or assistant placed on a channel above their tier.
 - Off by default. Enable with `-c enableMembershipAudit=true`.
 - **Report-only (default) vs auto-revoke of member access:** `-c membershipAuditEnforce=false` (default)

@@ -23,7 +23,7 @@ read [`../../overview/ARCHITECTURE.md`](../../overview/ARCHITECTURE.md) and
   [`MODEL_STRATEGY.md`](MODEL_STRATEGY.md).
 - **Assistant context and retrieval** (what the assistant is allowed to see; RAG):
   [`GUIDE-ASSISTANT-CONTEXT.md`](GUIDE-ASSISTANT-CONTEXT.md) and [`RAG.md`](RAG.md).
-- **Produce or extend channel messages** (read before writing any bot message): Chime's encoded-length
+- **Produce or extend channel messages** (read before writing any bot message): Amazon Chime SDK's encoded-length
   caps, the CJK multiplier, and the split/attachment helpers in
   [`MESSAGE-DELIVERY-GUIDE.md`](MESSAGE-DELIVERY-GUIDE.md).
 - **Frontend** (design tokens and component conventions): [`DESIGN-SYSTEM.md`](DESIGN-SYSTEM.md).

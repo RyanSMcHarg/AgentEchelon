@@ -38,8 +38,8 @@ Three findings forced this decision.
 The live-drift re-homing (`auroraDriftWiring`) VPC-attaches each per-tier
 agent handler to `PRIVATE_ISOLATED` subnets so it can run a synchronous
 pgvector cosine query against Aurora in the reply path. The first live
-Aurora deploy proved this severs the handler's egress to Chime
-SDK Messaging: an isolated-subnet Lambda has no route to Chime (Chime
+Aurora deploy proved this severs the handler's egress to Amazon Chime SDK
+SDK Messaging: an isolated-subnet Lambda has no route to Amazon Chime SDK (Amazon Chime SDK
 exposes no PrivateLink endpoint, and the VPC is built with `natGateways: 0`).
 The handler reaches Bedrock fine (there is a `bedrock-runtime` VPC endpoint,
 so intent classification worked) but `SendChannelMessage` hangs until the
@@ -100,7 +100,7 @@ actually fits, and stop running it inside the VPC-bound reply handler.
    the retrieval result and writes a lightweight, **TTL'd** flag -- e.g. a
    DynamoDB item with a short expiry, since the drift signal is ephemeral and
    single-turn; the next non-VPC turn reads the flag and surfaces the
-   suggestion). Either way the handler keeps its Chime egress. No NAT gateway
+   suggestion). Either way the handler keeps its Amazon Chime SDK egress. No NAT gateway
    (it would force a VPC topology change that replaces the VPC and the Aurora
    cluster).
 
@@ -203,8 +203,8 @@ retrieval-scoped -- note the contract change there when this lands.
 - **Pure pgvector cosine for the drift decision (current SPEC).** The bluntness
   critique holds: similarity is the wrong instrument for the tangent-vs-drift
   judgment. Retained only for retrieval.
-- **NAT gateway / Chime VPC endpoint to keep the handler VPC-attached.** No
-  Chime PrivateLink exists. Adding NAT means giving the isolated VPC public
+- **NAT gateway / Amazon Chime SDK VPC endpoint to keep the handler VPC-attached.** No
+  Amazon Chime SDK PrivateLink exists. Adding NAT means giving the isolated VPC public
   subnets + IGW + NAT, which replaces the VPC and the Aurora cluster --
   destructive and ~$32/mo -- to solve a problem that decoupling removes for
   free.

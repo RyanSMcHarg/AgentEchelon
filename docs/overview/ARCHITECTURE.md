@@ -28,7 +28,7 @@ For deployment instructions, see [README.md](../../README.md). For Aurora-specif
         │ IAM credentials               │     │    │     │    │
         ▼                                │     │    │     │    │
  ┌──────────────┐                        │     │    │     │    │
- │  Chime SDK   │◄───────────────────────┘     │    │     │    │
+ │  Amazon Chime SDK   │◄───────────────────────┘     │    │     │    │
  │  Messaging   │                              │    │     │    │
  │  AppInstance  │                              │    │     │    │
  └──────┬───────┘                              │    │     │    │
@@ -91,7 +91,7 @@ For deployment instructions, see [README.md](../../README.md). For Aurora-specif
               └───────────────────┘
 ```
 
-**Reading the flow:** the **Channel Flow Processor** runs first on every message (mention rules, filtering, marker stripping); `@all` bypasses Lex and invokes the async processor directly. **Amazon Lex is only the entry trigger** - a Chime-to-Lambda passthrough via its Dialog Code Hook - not a classifier or router. Each tier's Lex bot fulfils into that tier's **own handler Lambda**: all run the shared `router-agent-handler.ts` code but are deployed one per tier (per-tier ownership, ADR-011), not a single shared router. The models shown per tier are **defaults**; model selection is configurable per tier and per intent via `model-strategy` (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS), so the platform is model-agnostic, not Anthropic-only.
+**Reading the flow:** the **Channel Flow Processor** runs first on every message (mention rules, filtering, marker stripping); `@all` bypasses Lex and invokes the async processor directly. **Amazon Lex is only the entry trigger** - an Amazon Chime SDK-to-Lambda passthrough via its Dialog Code Hook - not a classifier or router. Each tier's Lex bot fulfils into that tier's **own handler Lambda**: all run the shared `router-agent-handler.ts` code but are deployed one per tier (per-tier ownership, ADR-011), not a single shared router. The models shown per tier are **defaults**; model selection is configurable per tier and per intent via `model-strategy` (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS), so the platform is model-agnostic, not Anthropic-only.
 
 ---
 
@@ -164,7 +164,7 @@ Twelve stacks deploy in both modes (ChimeMessaging, CognitoAuth, S3Storage, Foun
                                     ┌──────────▼──────────┐
                                     │ Post-Confirmation    │
                                     │ Lambda Trigger       │
-                                    │ (creates Chime       │
+                                    │ (creates Amazon Chime SDK       │
                                     │  AppInstanceUser)    │
                                     └──────────┬──────────┘
                                                │
@@ -184,7 +184,7 @@ Twelve stacks deploy in both modes (ChimeMessaging, CognitoAuth, S3Storage, Foun
                               │ AwsClientProvider:              │
                               │  IdToken → Cognito Identity Pool│
                               │  → Temporary IAM credentials    │
-                              │  → Chime SDK client initialized │
+                              │  → Amazon Chime SDK client initialized │
                               └────────────────┬────────────────┘
                                                │
                               ┌────────────────▼────────────────┐
@@ -210,7 +210,7 @@ Twelve stacks deploy in both modes (ChimeMessaging, CognitoAuth, S3Storage, Foun
 - `frontend/src/providers/AuthProvider.tsx` - Cognito auth, token management, refresh logic
 - `frontend/src/providers/AwsClientProvider.tsx` - Identity Pool → IAM credentials → SDK clients
 - `backend/lib/stacks/cognito-auth-stack.ts` - User Pool, Identity Pool, Lambda triggers
-- `backend/lambda/cognito-triggers/post-confirmation.js` - Creates Chime AppInstanceUser on signup
+- `backend/lambda/cognito-triggers/post-confirmation.js` - Creates Amazon Chime SDK AppInstanceUser on signup
 
 ---
 
@@ -235,7 +235,7 @@ This is the core flow: user sends a message and receives an AI response.
  │  ConversationProvider.sendMessage()                                  │
  │       │                                                              │
  │       ▼                                                              │
- │  Chime SDK: SendChannelMessage (REST via IAM credentials)            │
+ │  Amazon Chime SDK: SendChannelMessage (REST via IAM credentials)            │
  │       │                                                              │
  │       └─── optimistic update: message appears in UI immediately      │
  └───────┼──────────────────────────────────────────────────────────────┘
@@ -244,7 +244,7 @@ This is the core flow: user sends a message and receives an AI response.
  ┌──────────────────────────────────────────────────────────────────────┐
  │ Backend                                                              │
  │                                                                      │
- │  Chime SDK receives message in channel                               │
+ │  Amazon Chime SDK receives message in channel                               │
  │       │                                                              │
  │       ▼                                                              │
  │  Channel Flow Processor runs first (@all/@everyone → invoke the      │
@@ -312,7 +312,7 @@ This is the core flow: user sends a message and receives an AI response.
 | DIRECT response | Bot reply appears within seconds, no loading indicator |
 | PLACEHOLDER_UPDATE | "One moment..." placeholder appears as a bot message; replaced in-place when real response arrives |
 | TASK_MULTI_STEP | `isBotTyping` indicator shows a pulsing dot; status updates stream into the channel; task completes when done |
-| WebSocket disconnect | `ConnectionStatus` component shows reconnecting state; Chime SDK auto-reconnects |
+| WebSocket disconnect | `ConnectionStatus` component shows reconnecting state; Amazon Chime SDK auto-reconnects |
 | Async processor fails | Placeholder message stays as-is (user sees "One moment..." indefinitely - no automatic error recovery) |
 
 **Key files:**
@@ -436,7 +436,7 @@ A classification experiment cannot run alongside an intent or base-model experim
   (PUT file to S3 via presigned URL)
           │
           ▼
-  Message sent with attachment in Chime message metadata:
+  Message sent with attachment in Amazon Chime SDK message metadata:
   {
     "attachment": {
       "fileKey": "attachments/<conversationId>/<userId>/<timestamp>-<filename>",
@@ -535,7 +535,7 @@ check it. See `docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md`.
 ### Athena Mode (Default)
 
 ```
-  Chime SDK message events
+  Amazon Chime SDK message events
           │
           ▼
   Kinesis Data Stream (1 shard)
@@ -559,7 +559,7 @@ check it. See `docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md`.
 ### Aurora Mode (Optional)
 
 ```
-  Chime SDK message events
+  Amazon Chime SDK message events
           │
           ▼
   Kinesis Data Stream
@@ -613,7 +613,7 @@ reuses the existing Bedrock and Secrets endpoints, adding no new VPC endpoints (
 - `frontend/src/services/analyticsService.ts` - Analytics API client
 
 **Aurora-mode add-ons (opt-in, same stack):**
-- **Out-of-band message analytics (A/B + metadata-cap decoupling).** Heavy per-message analytics - per-step execution telemetry and the full analytics blob - are written to a `MessageAnalytics` DynamoDB table keyed by message id (keeping the Chime `Metadata` under its ~1 KB cap), and the archival Lambda merges them back on ingest; surfaced via `/analytics/execution-steps` (admin **Steps** tab). Per-variant experiment results also fold in **real human signals** - thumbs (from the feedback table) and `/battle` wins (from the BattleOutcome table) - via read-time scans over the VPC DynamoDB gateway endpoint. See `docs/specs/conversation-messaging/SPEC-MESSAGE-METADATA-CODEBOOK.md`.
+- **Out-of-band message analytics (A/B + metadata-cap decoupling).** Heavy per-message analytics - per-step execution telemetry and the full analytics blob - are written to a `MessageAnalytics` DynamoDB table keyed by message id (keeping the Amazon Chime SDK `Metadata` under its ~1 KB cap), and the archival Lambda merges them back on ingest; surfaced via `/analytics/execution-steps` (admin **Steps** tab). Per-variant experiment results also fold in **real human signals** - thumbs (from the feedback table) and `/battle` wins (from the BattleOutcome table) - via read-time scans over the VPC DynamoDB gateway endpoint. See `docs/specs/conversation-messaging/SPEC-MESSAGE-METADATA-CODEBOOK.md`.
 - **Cost sleep mode (`-c sleepMode=true`).** The same stack conditionally adds a `deployment-state` table, an EventBridge idle checker, an admin sleep/wake API (`/deployment/{state,sleep,wake}`), and an SNS topic. The checker pauses Aurora Serverless v2 (`ModifyDBCluster` → MinCapacity 0) after `sleepAfterIdle` of inactivity; an admin wake restores it, and users see a paused-state banner meanwhile. See `docs/specs/analytics-eval/SPEC-COST-SLEEP-MODE.md`.
 
 **Cost attribution (tagging).** Every stack self-tags at the app root via `applyStandardTags` (`backend/lib/tagging.ts`): `Project` is **derived from the deployment identity** (`STACK_PREFIX`), never hardcoded, so several instances in one AWS account bill apart in Cost Explorer. See `docs/guides/admin/TAGGING.md`.
@@ -627,7 +627,7 @@ Providers must be initialized in order. Each depends on the one above it.
 ```
   <AuthProvider>                    ← Cognito tokens (IdToken, AccessToken, RefreshToken)
     │
-    └─ <AwsClientProvider>          ← IAM credentials from Identity Pool; creates Chime SDK client
+    └─ <AwsClientProvider>          ← IAM credentials from Identity Pool; creates Amazon Chime SDK client
          │
          └─ <MessagingProvider>     ← WebSocket session; channel message callbacks
               │
@@ -638,7 +638,7 @@ Providers must be initialized in order. Each depends on the one above it.
 
 **Why this order matters:**
 - `AwsClientProvider` needs the IdToken from `AuthProvider` to call Cognito Identity Pool
-- `MessagingProvider` needs the Chime SDK client from `AwsClientProvider` to open a WebSocket
+- `MessagingProvider` needs the Amazon Chime SDK client from `AwsClientProvider` to open a WebSocket
 - `ConversationProvider` needs the WebSocket from `MessagingProvider` to receive messages
 
 If a provider fails to initialize, everything below it is unavailable. The `ConnectionStatus` component shows the current state.
@@ -699,7 +699,7 @@ Athena mode. (Usage: [ADMIN-GUIDE.md](../guides/admin/ADMIN-GUIDE.md); design:
 | Models | Both | `model_usage`, `model_effectiveness`, `/feedback` | Per-model usage, intent-by-model effectiveness, latency, compliance, and user feedback summaries |
 | Model Strategy | Both | Static frontend config mirrored from backend strategy metadata | Provider posture, deploy-time model choices, intent routing, fallback model guidance, tier availability |
 | Experiments | Both | `experiment_results`, DynamoDB `ExperimentsTable` | A/B test management: create/pause/complete experiments, side-by-side variant comparison (score, latency, tokens, compliance, fallback rate) |
-| Conversations | Both | `/admin/conversations{,/messages,/members,/membership-history,/add-member,/remove-member,/redact-message,/delete-message}`, `drift_events` | **Archive-backed** conversation browser (Athena over the `conversations` Glue table - not live Chime), messages with per-message inspect (all fields + metadata + raw), member list + add/remove, membership-history timeline, and redact/delete moderation - acting as the **app-instance-admin** (delete is admin-only). Optional drift view in Aurora mode. |
+| Conversations | Both | `/admin/conversations{,/messages,/members,/membership-history,/add-member,/remove-member,/redact-message,/delete-message}`, `drift_events` | **Archive-backed** conversation browser (Athena over the `conversations` Glue table - not live Amazon Chime SDK), messages with per-message inspect (all fields + metadata + raw), member list + add/remove, membership-history timeline, and redact/delete moderation - acting as the **app-instance-admin** (delete is admin-only). Optional drift view in Aurora mode. |
 | Evaluations | Both | `evaluation_scores` | Scores by date, agent type, intent - color-coded by quality |
 | Latency | Both | `latency_metrics` | Avg/P95 total, Bedrock inference, and polling time |
 | Users | Both | `active_users_daily`, `messages_per_user`, `signup`/`signin_funnel_conversion` (client-events); `user_activity` legacy fallback | Session DAU vs messaging DAU + tier breakdown, sign-up/sign-in conversion funnels, top-50 sender leaderboard |
@@ -716,13 +716,13 @@ Athena mode. (Usage: [ADMIN-GUIDE.md](../guides/admin/ADMIN-GUIDE.md); design:
 | Scenario | Behavior |
 |----------|----------|
 | **Bedrock unavailable** | Async processor catches `ServiceException` → logs error; placeholder message stays as "One moment..." with no automatic recovery |
-| **WebSocket disconnect** | Chime SDK `MessagingSession` auto-reconnects with exponential backoff; `ConnectionStatus` component shows state |
+| **WebSocket disconnect** | Amazon Chime SDK `MessagingSession` auto-reconnects with exponential backoff; `ConnectionStatus` component shows state |
 | **Token expires mid-conversation** | 50-minute refresh interval prevents this in most cases; if refresh fails, user is redirected to login; in-flight messages may be lost |
 | **S3 upload fails** | `attachmentService.ts` catches error → `FileUploadPreview` shows error state; user can retry |
 | **Presigned URL expires before upload** | URL defaults to 1-hour expiry; if expired, `attachmentService` returns error and user must re-attach |
 | **SES email fails (sharing)** | Lambda catches error → returns 500; `ShareConversationModal` shows error message |
 | **Lex returns `FallbackIntent`** | The fulfillment handler classifies the request itself and applies its default routing (Lex is only the trigger) |
-| **Concurrent messages in same channel** | Chime SDK handles ordering; each message gets a unique `MessageId`; no deduplication - duplicate sends produce duplicate messages |
+| **Concurrent messages in same channel** | Amazon Chime SDK handles ordering; each message gets a unique `MessageId`; no deduplication - duplicate sends produce duplicate messages |
 | **Aurora connection failure** | `db-client.ts` pool reconnects on auth errors; other errors thrown to caller |
 | **Lambda timeout (30-90s by tier)** | Async processor is killed; placeholder message stays; no automatic cleanup of DynamoDB task state |
 
@@ -768,7 +768,7 @@ This section summarizes security controls.
 
 | Data | Storage | Retention | Contains PII? |
 |------|---------|-----------|---------------|
-| Messages | Chime SDK AppInstance | Controlled by Chime SDK (not configurable in this project) | Yes - message content, sender ARN |
+| Messages | Amazon Chime SDK AppInstance | Controlled by Amazon Chime SDK (not configurable in this project) | Yes - message content, sender ARN |
 | File attachments | S3 bucket | 90 days (lifecycle rule) | Possible - depends on uploaded files |
 | Analytics (Athena) | Kinesis → Firehose → S3 | 90 days (S3 lifecycle) | Yes - sender ARN, message content |
 | Analytics (Aurora) | Aurora PostgreSQL | 90 days for evaluation_results (`expires_at`); messages table has no auto-expiry | Yes - `sender_name`, `sender_arn`, `user_sub` |
@@ -777,7 +777,7 @@ This section summarizes security controls.
 
 **Third-party data processing:**
 - **Amazon Bedrock:** User messages are sent to Bedrock for model inference. Bedrock runs within your AWS account and region. Per [AWS documentation](https://docs.aws.amazon.com/bedrock/latest/userguide/data-protection.html), Bedrock does not use customer inputs to train models and does not share data with model providers (Anthropic, Amazon). Data stays within your AWS account boundary.
-- **Amazon Chime SDK:** Messages are stored in the Chime SDK AppInstance within your AWS account. Chime SDK is an AWS-managed service subject to the [AWS Data Processing Addendum](https://d1.awsstatic.com/legal/aws-dpa/aws-dpa.pdf).
+- **Amazon Chime SDK:** Messages are stored in the Amazon Chime SDK AppInstance within your AWS account. Amazon Chime SDK is an AWS-managed service subject to the [AWS Data Processing Addendum](https://d1.awsstatic.com/legal/aws-dpa/aws-dpa.pdf).
 - **Amazon SES:** Recipient email addresses are sent to SES for conversation sharing. SES is subject to the AWS DPA.
 
 **PII in analytics:**
@@ -804,7 +804,7 @@ cd backend && npm test
 **Known testing gaps:**
 - E2E tests are disabled in CI (`.github/workflows/ci.yml`) because they require a deployed AWS environment
 - No frontend unit tests (React component tests, provider tests, service tests)
-- Backend unit tests mock everything - no integration tests verify actual database queries, Bedrock calls, or Chime SDK interactions
+- Backend unit tests mock everything - no integration tests verify actual database queries, Bedrock calls, or Amazon Chime SDK interactions
 - No load/performance testing
 - Error paths and edge cases are largely untested
 
@@ -835,7 +835,7 @@ AgentEchelon is released under the **MIT License**. Key dependency licenses:
 | Playwright (dev) | Apache 2.0 |
 | Vite (dev) | MIT |
 
-All dependencies are permissive (MIT or Apache 2.0). No GPL-licensed dependencies are included. AWS services (Bedrock, Cognito, Chime, S3) are used at runtime but not bundled.
+All dependencies are permissive (MIT or Apache 2.0). No GPL-licensed dependencies are included. AWS services (Bedrock, Cognito, Amazon Chime SDK, S3) are used at runtime but not bundled.
 
 ---
 
@@ -846,7 +846,7 @@ All dependencies are permissive (MIT or Apache 2.0). No GPL-licensed dependencie
 | [README.md](../../README.md) | Setup, configuration, cost estimates, customization guide |
 | [CLAUDE.md](../../CLAUDE.md) | Quick reference for development sessions |
 | [SPEC-AURORA-VPC-MODE.md](../specs/analytics-eval/SPEC-AURORA-VPC-MODE.md) | Full Aurora mode spec (VPC, RDS Proxy, schema, costs, risks) |
-| [CHIME_SDK_INTEGRATION.md](../guides/developer/CHIME_SDK_INTEGRATION.md) | Chime SDK integration details and Lex event format |
+| [CHIME_SDK_INTEGRATION.md](../guides/developer/CHIME_SDK_INTEGRATION.md) | Amazon Chime SDK integration details and Lex event format |
 | [SECURITY-NPM-SUPPLY-CHAIN.md](../guides/developer/SECURITY-NPM-SUPPLY-CHAIN.md) | npm supply-chain hardening (install-script blocking, lockfile pinning, audit practices) |
 | [DESIGN-SYSTEM.md](../guides/developer/DESIGN-SYSTEM.md) | CSS design tokens, component patterns, typography |
 | [IDENTITY-PROVIDER-GUIDE.md](../guides/user/IDENTITY-PROVIDER-GUIDE.md) | How to integrate Auth0, Okta, Azure AD, LDAP, or any IdP |

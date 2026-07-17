@@ -180,7 +180,7 @@ gates everything past the static shell regardless.
 - **Security response headers**: HSTS (1 yr, preload), `X-Content-Type-Options:
   nosniff`, `Referrer-Policy: strict-origin-when-cross-origin`, and
   `X-Frame-Options: DENY` (anti-clickjacking). A Content-Security-Policy is left
-  to the deployer - a strict CSP must enumerate your Cognito / Chime /
+  to the deployer - a strict CSP must enumerate your Cognito / Amazon Chime SDK /
   API-Gateway origins.
 - **HTTPS only** (HTTP redirects to HTTPS), HTTP/2 + HTTP/3, TLS 1.2_2021 floor.
 

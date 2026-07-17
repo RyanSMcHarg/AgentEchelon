@@ -24,7 +24,7 @@ The solution requires **six defense layers**, any one of which should prevent th
 │ channels above the user's tier.                             │
 ├─────────────────────────────────────────────────────────────┤
 │ Layer 2: Channel Metadata (Application-Level)               │
-│ classification field in Chime channel metadata.             │
+│ classification field in Amazon Chime SDK channel metadata.             │
 │ All Lambda handlers read metadata before membership ops.    │
 ├─────────────────────────────────────────────────────────────┤
 │ Layer 3: User Tier (Cognito Groups)                         │
@@ -72,7 +72,7 @@ flow to every new channel; existing channels are backfilled by
 
 ## 4. Layer 1: Channel Tags (IAM Condition Keys)
 
-Chime SDK channels support resource tags. Tags are set at creation and can be used in IAM policy conditions to block actions on tagged resources.
+Amazon Chime SDK channels support resource tags. Tags are set at creation and can be used in IAM policy conditions to block actions on tagged resources.
 
 ### Tag Schema
 
@@ -103,7 +103,7 @@ aws chime create-channel \
 >    AND the caller's **bearer identity** (`.../user/<id>` or `.../bot/<id>`). The
 >    `classification` tag only exists on the channel, so the boundary is the
 >    *channel-resource* grant; the *bearer-resource* grant must be unconditioned
->    (Chime restricts the bearer to the caller's own identity, so it widens nothing).
+>    (Amazon Chime SDK restricts the bearer to the caller's own identity, so it widens nothing).
 
 We use **ALLOW**, not Deny, because **allow fails CLOSED**: a tier identity is
 granted the channel action ONLY when the channel's `classification` ∈ {its tier
@@ -120,7 +120,7 @@ deny. (A deny-on-higher fails OPEN on untagged/legacy channels - a real hole.)
              "chime:ListChannelMemberships"],
   "Resource": "arn:aws:chime:...:app-instance/<id>/channel/*",
   "Condition": { "StringEquals": { "aws:ResourceTag/classification": ["basic"] } } },   // standard→["basic","standard"], premium→all
-// (2) bearer identity resource, UNCONDITIONED (no channel access; Chime pins bearer to self)
+// (2) bearer identity resource, UNCONDITIONED (no channel access; Amazon Chime SDK pins bearer to self)
 { "Effect": "Allow",
   "Action": [ /* same actions */ ],
   "Resource": ["arn:aws:chime:...:app-instance/<id>/user/*",
@@ -139,7 +139,7 @@ deny. (A deny-on-higher fails OPEN on untagged/legacy channels - a real hole.)
 Per-member membership actions (`CreateChannelMembership` / `DeleteChannelMembership`
 / `DescribeChannelMembership`) authorize against the **AppInstanceUser** resource
 (no `classification` tag), so they CANNOT be tag-gated and are granted unconditioned
- - they are governed by Chime's moderator model + the **app-layer membership
+ - they are governed by Amazon Chime SDK's moderator model + the **app-layer membership
 admission gate** (below) + the **Layer 6 Kinesis audit**.
 
 **Why this is powerful:** enforced by **IAM itself**, before any application logic.
@@ -160,8 +160,8 @@ appInstanceArn, actions?)` and attached to the **credential-exchange rung roles*
 (`grantPinnedExchangePermissions` in `cognito-auth-stack.ts`, bearer-pinned to the
 caller's own `.../user/${aws:PrincipalTag/sub}`) and the **per-tier assistant roles**
 (`*-tier-stack.ts`). It is not on the per-tier Cognito Identity-Pool user roles:
-those are intentionally empty (`makeTierRole`), because the frontend reaches Chime
-only through the exchange (there is no Identity-Pool Chime fallback). See
+those are intentionally empty (`makeTierRole`), because the frontend reaches Amazon Chime SDK
+only through the exchange (there is no Identity-Pool Amazon Chime SDK fallback). See
 `docs/specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md` §8 (row 2). The `iam-policies-stack.ts` per-tier
 managed policies are **legacy and unattached** (they use a non-IAM
 `chime-sdk-messaging:` prefix + an unset `aws:PrincipalTag/tier`);
@@ -188,7 +188,7 @@ tier, Team is set at creation, Open = `basic`). Levels: **RW** = read + write,
 | HIDDEN observer / admin-console² | RO | RO | RO | RO |
 
 ¹ Admins are unconditioned (moderation spans tiers), so they also reach untagged
-channels - the only role that does. ² **Read-only** is Chime-enforced for `HIDDEN`
+channels - the only role that does. ² **Read-only** is Amazon Chime SDK-enforced for `HIDDEN`
 members (spec §10) and for the app-instance-admin moderation surface (archive-backed
 viewing); they observe without a send capability.
 
@@ -201,7 +201,7 @@ viewing); they observe without a send capability.
 | `UpdateChannelMessage`, `RedactChannelMessage` | channel **+** bearer | yes | write (own/mod) |
 | `DescribeChannel`, `ListChannelMemberships` | channel **+** bearer | yes | read |
 | `UpdateChannel`, `DeleteChannel` | channel **+** bearer | yes | write (moderator) |
-| `CreateChannelMembership`, `DeleteChannelMembership`, `DescribeChannelMembership` | **bearer/user** only | **no** (unconditioned) | gov. by app-layer admission gate + Chime moderator model + Layer 6 audit |
+| `CreateChannelMembership`, `DeleteChannelMembership`, `DescribeChannelMembership` | **bearer/user** only | **no** (unconditioned) | gov. by app-layer admission gate + Amazon Chime SDK moderator model + Layer 6 audit |
 | `CreateChannel` | n/a (no channel yet) | no | tier-gated at app-layer (`create-conversation` 403s over-tier) |
 | `Connect`, `GetMessagingSessionEndpoint`, `ListChannels`, `ListChannelMembershipsForAppInstanceUser` | app / user | no | session-level, no channel exposure |
 
@@ -220,7 +220,7 @@ classification - *not* silently added and then locked out by Layer 1. Two gates:
     creation 403s); `add-agent` / `channel-battle` add only the tier-matched
     assistant. So no app path adds an under-tier human.
 - **Asynchronous (Layer 6 Kinesis audit) - the backstop for direct-SDK adds.** A
-  membership created out-of-band (direct Chime API by a moderator, a script, or
+  membership created out-of-band (direct Amazon Chime SDK API by a moderator, a script, or
   compromised creds) bypasses the app gate. The Kinesis stream carries every
   `CREATE_CHANNEL_MEMBERSHIP` / `UPDATE_CHANNEL_MEMBERSHIP` event; the audit Lambda
   re-checks **(a) tier** (member's Cognito-group tier ≥ channel `classification`) and
@@ -275,7 +275,7 @@ Applied in:
 
 ## 6. Layer 3: User Tier from Cognito Groups
 
-A user's tier is their **Cognito group** membership, not a stored Chime
+A user's tier is their **Cognito group** membership, not a stored Amazon Chime SDK
 AppInstanceUser tag. The groups `basic`, `standard`, `premium`, and `admins` are
 defined in `cognito-auth-stack.ts`. `custom:tier` is mirrored into the matching
 group by `post-confirmation.js` (at sign-up) and `user-management.ts` (on an admin
@@ -373,7 +373,7 @@ you can retrieve. In this case:
 
 ## 9. Layer 6: Kinesis Stream Audit (Async Enforcement)
 
-The Kinesis archival Lambda already processes every Chime event (`CREATE_CHANNEL_MEMBERSHIP`, `UPDATE_CHANNEL_MEMBERSHIP`, `DELETE_CHANNEL_MEMBERSHIP`, `CREATE_CHANNEL`, `UPDATE_CHANNEL`, `CREATE_CHANNEL_MESSAGE`, etc.). This is the **last line of defense** - it catches violations from any source, including backend systems, direct API calls, or compromised credentials that bypass Layers 1-5.
+The Kinesis archival Lambda already processes every Amazon Chime SDK event (`CREATE_CHANNEL_MEMBERSHIP`, `UPDATE_CHANNEL_MEMBERSHIP`, `DELETE_CHANNEL_MEMBERSHIP`, `CREATE_CHANNEL`, `UPDATE_CHANNEL`, `CREATE_CHANNEL_MESSAGE`, etc.). This is the **last line of defense** - it catches violations from any source, including backend systems, direct API calls, or compromised credentials that bypass Layers 1-5.
 
 ### The membership-audit consumer
 
@@ -506,20 +506,20 @@ alongside internal responders.
 **The visibility model:**
 - The external guest is admitted at a **capped classification** (`min(idpGroupCeiling, channel)`, `docs/design/SPEC-FEDERATED-PARTICIPANTS.md`) **and** scoped to that one channel (membership pin) - Layers 1/2/6 as today.
 - **On top of that, a per-message visibility gate:** every message is either **targeted** (internal-only) or **broadcast** (guest-visible); the external guest is **broadcast-only**. Internal context (including `fetchContext`/dashboard data, D9) stays targeted.
-- The assistant is the gate (it chooses targeted vs broadcast based on content sensitivity), riding **Chime targeted messaging** (`Target=[…]`) - the *mechanism exists today*; the missing piece is the **policy + discipline**: a single wrong broadcast leaks internal context to the external party.
+- The assistant is the gate (it chooses targeted vs broadcast based on content sensitivity), riding **Amazon Chime SDK targeted messaging** (`Target=[…]`) - the *mechanism exists today*; the missing piece is the **policy + discipline**: a single wrong broadcast leaks internal context to the external party.
 
 **Why a distinct layer:** the existing layers gate *which channels* a principal can touch and at *what tier* - they do **not** gate *within a channel* between a broadcast and a targeted message when trust levels are mixed. This is the new gate. The federated-guest admission model is in `docs/design/SPEC-FEDERATED-PARTICIPANTS.md`.
 
 ## 10. HIDDEN Membership and Restricted Operations
 
-From the [read-only channels blog post](https://aws.amazon.com/blogs/business-productivity/creating-read-only-chat-channels-for-announcements-with-amazon-chime-sdk-messaging/) (McHarg, 2021), HIDDEN membership allows users to read channel messages without being visible to other members or being able to send. This is **enforced by the Chime SDK itself** - no application code needed.
+From the [read-only channels blog post](https://aws.amazon.com/blogs/business-productivity/creating-read-only-chat-channels-for-announcements-with-amazon-chime-sdk-messaging/) (McHarg, 2021), HIDDEN membership allows users to read channel messages without being visible to other members or being able to send. This is **enforced by the Amazon Chime SDK itself** - no application code needed.
 
 ### HIDDEN Member Capabilities
 
 | Operation | DEFAULT member | HIDDEN member |
 |-----------|:-:|:-:|
 | `ListChannelMessages` (read) | Yes | Yes |
-| `SendChannelMessage` (write) | Yes | **No** (Chime enforces) |
+| `SendChannelMessage` (write) | Yes | **No** (Amazon Chime SDK enforces) |
 | `UpdateChannelMessage` | Yes | **No** |
 | Visible in `ListChannelMemberships` | Yes | **No** |
 | Receives WebSocket events | Yes | Yes (real-time observation) |
@@ -568,12 +568,12 @@ for (const userArn of allUserArns) {
 A Basic user cannot be a DEFAULT member of a Premium conversation (Layers 1-2 enforce this). But an admin could explicitly add them as HIDDEN for read-only observation of non-sensitive higher-tier conversations. This is an **opt-in policy decision**:
 - Kinesis audit (Layer 6) logs HIDDEN cross-tier memberships separately
 - Admin must explicitly approve
-- HIDDEN member cannot send (Chime enforces) - no write-side risk
+- HIDDEN member cannot send (Amazon Chime SDK enforces) - no write-side risk
 - Read-side risk remains - use only for non-sensitive conversations
 
 ### Extended IAM Restrictions
 
-Beyond Chime's built-in HIDDEN enforcement, IAM policies can further restrict what users can do on tagged channels:
+Beyond Amazon Chime SDK's built-in HIDDEN enforcement, IAM policies can further restrict what users can do on tagged channels:
 
 ```json
 {
@@ -586,7 +586,7 @@ Beyond Chime's built-in HIDDEN enforcement, IAM policies can further restrict wh
 }
 ```
 
-This prevents HIDDEN members from discovering who else is in the channel - they can only read messages. **Chime SDK-enforced at the API level.**
+This prevents HIDDEN members from discovering who else is in the channel - they can only read messages. **Amazon Chime SDK-enforced at the API level.**
 
 ## 11. Drift Detection
 

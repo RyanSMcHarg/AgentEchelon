@@ -106,7 +106,7 @@ The full documentation lives under [`docs/`](docs/README.md), organized by what 
               ┌───────────────┼───────────────┐
               ▼               ▼               ▼
 ┌──────────────────┐ ┌───────────────┐ ┌─────────────┐
-│  Chime SDK       │ │  API Gateway  │ │  Amazon S3  │
+│  Amazon Chime SDK       │ │  API Gateway  │ │  Amazon S3  │
 │  Messaging       │ │               │ │             │
 │  (WebSocket)     │ │               │ │             │
 └────────┬─────────┘ └───────────────┘ └─────────────┘
@@ -146,7 +146,7 @@ AuthProvider → AwsClientProvider → MessagingProvider → ConversationProvide
 ```
 
 - **AuthProvider**: Cognito authentication with automatic token refresh
-- **AwsClientProvider**: Chime SDK client initialization with Cognito Identity Pool credentials
+- **AwsClientProvider**: Amazon Chime SDK client initialization with Cognito Identity Pool credentials
 - **MessagingProvider**: WebSocket session management with channel-specific callbacks
 - **ConversationProvider**: Conversation CRUD, message state, optimistic updates
 
@@ -367,7 +367,7 @@ IPs. Full guide, including teardown and the security headers applied:
 > | **Admin** (who sees analytics / moderates) | AE `admins` group + AE dashboard | Your console - [ADMIN-INTEGRATION-GUIDE](docs/guides/admin/ADMIN-INTEGRATION-GUIDE.md) |
 >
 > **"Admin" means three distinct things** in this system (a Cognito *group*, an
-> empty IAM *role*, and a Chime *service* principal), and the tier boundary lives
+> empty IAM *role*, and an Amazon Chime SDK *service* principal), and the tier boundary lives
 > on the credential exchange rather than the Identity-Pool roles. The full,
 > code-grounded account - with a capability matrix and a spec-drift table - is
 > **[docs/specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md](docs/specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md)**.
@@ -381,7 +381,7 @@ New deployments have no users. Run the setup script to create the first admin:
 AWS_PROFILE=your-profile ./scripts/create-admin-user.sh admin@example.com
 ```
 
-This creates a premium-tier user, adds it to the `premium` + `admins` Cognito groups (the authoritative tier/admin signal), and creates the Chime AppInstance User required for messaging. The account uses a **temporary password** - on first sign-in the app prompts you to set a permanent one (`NEW_PASSWORD_REQUIRED`). Sign in at http://localhost:5173.
+This creates a premium-tier user, adds it to the `premium` + `admins` Cognito groups (the authoritative tier/admin signal), and creates the Amazon Chime SDK AppInstance User required for messaging. The account uses a **temporary password** - on first sign-in the app prompts you to set a permanent one (`NEW_PASSWORD_REQUIRED`). Sign in at http://localhost:5173.
 
 **Password requirements:** 8+ characters, uppercase, lowercase, digit, symbol.
 
@@ -407,13 +407,13 @@ VITE_USER_POOL_ID=your-user-pool-id
 VITE_CLIENT_ID=your-client-id
 VITE_IDENTITY_POOL_ID=your-identity-pool-id
 
-# Chime SDK Configuration
+# Amazon Chime SDK Configuration
 # No bot ARN is needed — channels enroll the per-tier assistant server-side.
 VITE_APP_INSTANCE_ARN=your-app-instance-arn
 
 # API Endpoints
-# REQUIRED — the credential exchange is the sole source of Chime credentials
-# (bearer-pinned, classification-capped). Unset means the frontend cannot reach Chime.
+# REQUIRED — the credential exchange is the sole source of Amazon Chime SDK credentials
+# (bearer-pinned, classification-capped). Unset means the frontend cannot reach Amazon Chime SDK.
 VITE_CREDENTIAL_EXCHANGE_API_URL=your-credential-exchange-api-url
 VITE_CREATE_CONVERSATION_API_URL=your-create-conversation-api-url
 VITE_PRESIGNED_URL_API_URL=your-presigned-url-api-url
@@ -526,7 +526,7 @@ Extending AgentEchelon, adding or changing a tier, adding a tool or intent, conf
 
 ## Troubleshooting
 
-Symptom-to-fix runbook (deploy, connection, Chime, Bedrock, Aurora): **[docs/guides/user/TROUBLESHOOTING.md](docs/guides/user/TROUBLESHOOTING.md)**.
+Symptom-to-fix runbook (deploy, connection, Amazon Chime SDK, Bedrock, Aurora): **[docs/guides/user/TROUBLESHOOTING.md](docs/guides/user/TROUBLESHOOTING.md)**.
 
 ## End-to-End Tests
 
@@ -621,7 +621,7 @@ The suite is ~55 tests across 8 spec files:
 | admin-dashboard.spec.ts | 14 | Admin console navigation, analytics tabs, date range switching, and back navigation |
 | battle.spec.ts | 6 | `/battle` multi-assistant arming, parallel replies, and scorecard |
 | mentions.spec.ts | 2 | Mention routing (`@assistant` / `@all`) in multi-user channels |
-| credential-exchange.spec.ts | 3 | Bearer-pinned Chime credential vending from the exchange |
+| credential-exchange.spec.ts | 3 | Bearer-pinned Amazon Chime SDK credential vending from the exchange |
 | drift-detection.spec.ts | 5 | Topic-drift detection + suggestion flow (Aurora mode) |
 
 All tests include video recordings and trace files in `tests/test-results/` for debugging.
@@ -700,7 +700,7 @@ echo "Report:  npx playwright show-report"
 - **Auth**: Amazon Cognito (SAML/OIDC) with automatic token refresh
 - **Storage**: Amazon S3 (presigned URLs)
 - **Analytics**: Kinesis Data Firehose, S3, Athena
-- **Message trigger**: Amazon Lex V2 - a Chime-to-Lambda passthrough that invokes the fulfillment handler; request classification and model routing are done in `router-agent-handler.ts`, not by Lex
+- **Message trigger**: Amazon Lex V2 - an Amazon Chime SDK-to-Lambda passthrough that invokes the fulfillment handler; request classification and model routing are done in `router-agent-handler.ts`, not by Lex
 
 ## Contributing
 

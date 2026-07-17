@@ -14,7 +14,7 @@ The concerns this layer addresses, by impact:
 
 1. **Global spend budget.** Without a global ceiling, a bug, an automated client, or a traffic spike drives model spend with nothing to trip. A global hourly budget plus a circuit breaker bounds total cost.
 2. **Per-user rate limit.** Without a per-user ceiling, one client can monopolize the assistant, raising cost and degrading service for others. An hourly per-tier quota keeps usage fair.
-3. **Request dedup.** Chime and Lex deliver at least once, so a single user message can be fulfilled more than once. Each duplicate is a second model call (double cost) and can corrupt task state: two fulfillments of one message mint two random correlation ids, so the losing async invocation cannot find its placeholder and overwrites a `completed` task with `failed`. See "Request deduplication" below.
+3. **Request dedup.** Amazon Chime SDK and Lex deliver at least once, so a single user message can be fulfilled more than once. Each duplicate is a second model call (double cost) and can corrupt task state: two fulfillments of one message mint two random correlation ids, so the losing async invocation cannot find its placeholder and overwrites a `completed` task with `failed`. See "Request deduplication" below.
 4. **Inbound length cap.** An oversized message inflates token cost and widens the prompt-injection surface.
 
 ## Design
@@ -49,7 +49,7 @@ on ConditionalCheckFailedException -> log "duplicate, skipping", return null (no
 on any other error -> fail open (proceed); dedup is best-effort, never blocks real work
 ```
 
-For dedup to collapse duplicate *deliveries of the same message*, the correlation id must be stable per message rather than random. The router derives it from the inbound Chime message id, which the fulfillment event already carries (`event.requestAttributes['CHIME.message.id']`, used today by the live-drift flow), falling back to a random UUID only when absent:
+For dedup to collapse duplicate *deliveries of the same message*, the correlation id must be stable per message rather than random. The router derives it from the inbound Amazon Chime SDK message id, which the fulfillment event already carries (`event.requestAttributes['CHIME.message.id']`, used today by the live-drift flow), falling back to a random UUID only when absent:
 
 ```
 const correlationId = event.requestAttributes?.['CHIME.message.id'] || randomUUID();

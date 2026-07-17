@@ -58,7 +58,7 @@ Reply-in-user-language works on the federated path, end to end:
 | Stage | Where |
 |---|---|
 | Host sends `userLanguage` in the create-conversation body | Host user-api (`POST /…/assistant/session` → federated create-conversation) |
-| AE persists it to `Channel.Metadata.userLanguage` | `backend/lambda/src/federated-create-conversation.ts:95` (reads `body.userLanguage`), `:122` (stamps metadata); the `buildMetadata` cap-shedder (`:106 - 130`) keeps it under Chime's ~1 KB Metadata cap |
+| AE persists it to `Channel.Metadata.userLanguage` | `backend/lambda/src/federated-create-conversation.ts:95` (reads `body.userLanguage`), `:122` (stamps metadata); the `buildMetadata` cap-shedder (`:106 - 130`) keeps it under Amazon Chime SDK's ~1 KB Metadata cap |
 | Router forwards it from channel metadata | `backend/lambda/src/router-agent-handler.ts:148` (`resolveChannelMetadata`), `:515` (extracts `userLanguage` into context grounding) |
 | Shared prompt builder emits the reply-language instruction | `backend/lambda/src/lib/async-processor-core.ts:397 - 407` (`formatDomainContextForPrompt`): a closed `LANG_NAMES` map → "Respond in {language} unless the user writes in another language", non-English only |
 
@@ -97,12 +97,12 @@ Grounded in `backend/ARCHITECTURE.md` and `docs/specs/conversation-messaging/SPE
 message path:
 
 ```
-User → Chime channel → Lex (AUTO) → router-agent-handler (one fulfillment)
+User → Amazon Chime SDK channel → Lex (AUTO) → router-agent-handler (one fulfillment)
    • resolveUserName / resolveChannelMetadata / resolveUserTier
    ├─ WelcomeIntent → composeWelcome(...)          (static, no Bedrock)
    └─ FallbackIntent → classifyIntent → per-tier async-processor
           → formatDomainContextForPrompt (Level 1 lang instruction)
-          → Bedrock Converse tool loop → handleLongResponse → Chime
+          → Bedrock Converse tool loop → handleLongResponse → Amazon Chime SDK
 ```
 
 | Level | Hook point | File(s) |
@@ -160,7 +160,7 @@ Dual delivery adds length, so it must ride AgentEchelon's **existing** over-cap
 machinery. Full pattern + do/don't list: `docs/guides/developer/MESSAGE-DELIVERY-GUIDE.md`.
 Constants/helpers: `backend/lambda/src/lib/async-processor-core.ts`.
 
-- **Chime caps are on the ENCODED length** (`encodeURIComponent(s).length`):
+- **Amazon Chime SDK caps are on the ENCODED length** (`encodeURIComponent(s).length`):
   `CHIME_CONTENT_MAX = 4096`, `CHIME_METADATA_MAX = 1024`; working budget
   `CHIME_CONTENT_SAFE = 3600` (`CHUNK0_MARKER_HEADROOM = 700` reserved on chunk[0]).
 - **Prose ~2×, CJK ~9× per char** when encoded (`你` → `%E4%BD%A0` = 9). Effective
@@ -178,7 +178,7 @@ Constants/helpers: `backend/lambda/src/lib/async-processor-core.ts`.
 
 ## Level 3 - Deliver both languages (opt-in)
 
-The processor already writes the assistant message to Chime (direct-send,
+The processor already writes the assistant message to Amazon Chime SDK (direct-send,
 `ARCHITECTURE.md` §3). Doubling is real, so the design minimises it and reuses
 the chunker:
 
@@ -199,7 +199,7 @@ the chunker:
    the 3600 budget - concatenating both would inflate one message's chunk count
    and spend the CJK budget twice as fast.
 4. **No separate translation cache needed.** Because the translation is
-   materialised as a real sibling **message** (persisted in Chime), the widget's
+   materialised as a real sibling **message** (persisted in Amazon Chime SDK), the widget's
    `ListChannelMessages` re-polls just read it - there is nothing to re-translate.
    (A cache would only matter for *lazy, per-reader-language* translation, which
    this design avoids by translating once, at send time, for the channel's
@@ -274,9 +274,9 @@ admin analytics surface without a new pipeline.
 
 ## Related docs
 
-- `docs/guides/developer/MESSAGE-DELIVERY-GUIDE.md` - Chime size/encoding/chunking pattern this
+- `docs/guides/developer/MESSAGE-DELIVERY-GUIDE.md` - Amazon Chime SDK size/encoding/chunking pattern this
   reuses (read before extending any message).
-- `backend/ARCHITECTURE.md` - Lex/Lambda/Chime flow and direct-send.
+- `backend/ARCHITECTURE.md` - Lex/Lambda/Amazon Chime SDK flow and direct-send.
 - `docs/specs/conversation-messaging/SPEC-WELCOME-AND-CONTEXT.md` - channel-metadata schema + router/processor
   split this extends.
 - `docs/guides/developer/MODEL_STRATEGY.md` - multi-provider, intent-routed model layer the

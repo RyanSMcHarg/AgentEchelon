@@ -28,7 +28,7 @@ tier / membership eligibility gate and the SAME email-with-deep-link delivery:
 The reference implementation for the escalation shape is the communication-hub
 `add-ryan` design (`auth-agent-handler.ts` `addRyanToChannel`): the model emits an
 `<!--ADD_RYAN-->` marker, the backend runs `CreateChannelMembership` under an admin
-AppInstanceUser bearer (Chime requires an `AppInstanceUser`, not the bot, for that
+AppInstanceUser bearer (Amazon Chime SDK requires an `AppInstanceUser`, not the bot, for that
 call), and posts a targeted briefing to Ryan. The target there is **hardcoded** to a
 single Cognito sub as the abuse control: even a prompt injection can only ever add one
 specific person. AgentEchelon generalizes that single hardcoded target to a **per-tier
@@ -340,7 +340,7 @@ The add path runs in a DEDICATED Lambda, so the async-processor role is never
 granted membership-write. This is the same isolation `federated-add-member`
 uses. The role mirrors `FederatedShareMemberRole` in `foundations-stack.ts`:
 
-- **Chime (scoped to `${appInstanceArn}/*`):**
+- **Amazon Chime SDK (scoped to `${appInstanceArn}/*`):**
   `chime:CreateChannelMembership`, `chime:AssociateChannelFlow`,
   `chime:SendChannelMessage`, `chime:DescribeChannel` (read the channel's
   enforced tier for the eligibility check), and `chime:DescribeChannelMembership`
@@ -355,11 +355,11 @@ uses. The role mirrors `FederatedShareMemberRole` in `foundations-stack.ts`:
   display name for the briefing. Scoped to the primary user pool ARN.
 - **Bearer identity:** the tier bot AppInstanceUser (`${appInstanceArn}/bot/*`
   as the ChimeBearer resource), matching how the tier processors already scope
-  their Chime grants.
+  their Amazon Chime SDK grants.
 
 The async-processor role gains exactly ONE new grant: `lambda:InvokeFunction`
 on the add-user Lambda's ARN (the same shape as its existing
-`BATTLE_ORCHESTRATOR_ARN` invoke). It gains NO Chime membership permission.
+`BATTLE_ORCHESTRATOR_ARN` invoke). It gains NO Amazon Chime SDK membership permission.
 
 ## GUARDRAILS (critical)
 
@@ -433,7 +433,7 @@ a conversation's participants never exceed the conversation's classification.
 |---|---|
 | Marker emitted, KEY not in allowlist | No-op + log. No add, no message. |
 | Marker emitted, allowlist absent/malformed | Loader returns null ⇒ capability disabled ⇒ no-op + log. |
-| Config present but IAM grant missing | The Chime/SSM/Cognito call throws ⇒ **fail closed** (no partial add), log the error. |
+| Config present but IAM grant missing | The Amazon Chime SDK/SSM/Cognito call throws ⇒ **fail closed** (no partial add), log the error. |
 | Human already a member | `CreateChannelMembership` ⇒ `ConflictException` ⇒ skip the add; OPTIONALLY re-post the targeted welcome (deployment toggle) so a re-escalation still briefs them; never a duplicate join notice. The re-post carries the email mirror, so gate it behind a per-(channel, KEY) cooldown/dedupe: one-add-per-turn does NOT bound a marker repeated across many turns, which would otherwise re-page the human by email every turn. Suppress both the re-post and the email when the same (channel, KEY) already fired inside the cooldown window. |
 | Eligibility check fails (over-tier / unresolvable identity) | No-op + log. An unresolvable identity (Cognito `UserNotFoundException`) is treated as ineligible, never as "allow" (parity with membership-audit skip-rather-than-act). |
 | Briefing/summary lookup fails | Degrade to a simpler welcome; never block the add. |
@@ -459,7 +459,7 @@ missing the capability is inert (fail closed), which is the intended default.
    renders the `whenToAdd` guidance for each KEY, so the model knows the keys
    exist and when to use each. Without this the model never emits the marker.
 3. **Dedicated-Lambda IAM grant.** The add-user Lambda's role carries the scoped
-   Chime membership-write + SSM + Cognito grants, and the async-processor role
+   Amazon Chime SDK membership-write + SSM + Cognito grants, and the async-processor role
    carries `lambda:InvokeFunction` on the add-user Lambda ARN (and nothing more).
 4. **A test proves the chain.** A test asserts
    marker → eligibility-check → add → welcome: given a channel of tier T and an
@@ -485,7 +485,7 @@ sequenceDiagram
     participant L as Add-user Lambda (dedicated role)
     participant SSM as SSM allowlist
     participant CID as Identity provider (Cognito)
-    participant CH as Chime channel
+    participant CH as Amazon Chime SDK channel
     participant NB as Notification bridge (email)
     participant H as Human (added)
 

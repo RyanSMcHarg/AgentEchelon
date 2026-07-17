@@ -1,4 +1,4 @@
-# Chime SDK Integration
+# Amazon Chime SDK Integration
 
 ## Overview
 
@@ -23,12 +23,12 @@ channel as persistent messages.
 CDK stack outputs - App Instance ARN, Identity Pool ID, User Pool ID and Client
 ID, and the API URLs. See `frontend/.env.example` for the full list.
 
-### Chime SDK service layer
+### Amazon Chime SDK service layer
 
 `frontend/src/services/chimeService.ts` wraps the SDK:
 
 - **Initialize** - sets up the SDK clients with Cognito-vended credentials
-- **Create Conversation** - creates Chime channels with model metadata
+- **Create Conversation** - creates Amazon Chime SDK channels with model metadata
 - **List Conversations** - fetches the user's channels
 - **Send Message** - posts messages to channels
 - **List Messages** - retrieves channel message history
@@ -38,18 +38,18 @@ ID, and the API URLs. See `frontend/.env.example` for the full list.
 
 `AuthProvider.tsx` exposes the Cognito `idToken` on its context. The token is
 retrieved on login, cleared on logout, and consumed by the client/messaging
-providers to initialize the Chime SDK.
+providers to initialize the Amazon Chime SDK.
 
 ### Conversation & messaging providers
 
 The provider hierarchy is `AuthProvider → AwsClientProvider → MessagingProvider →
-ConversationProvider`. `MessagingProvider` owns the Chime WebSocket session;
+ConversationProvider`. `MessagingProvider` owns the Amazon Chime SDK WebSocket session;
 `ConversationProvider` handles conversation and message state, including
 tier-based model filtering when a channel is created.
 
 ## Real-time messaging
 
-New messages arrive over a Chime SDK Messaging WebSocket session managed by
+New messages arrive over an Amazon Chime SDK Messaging WebSocket session managed by
 `MessagingProvider`. On visibility-stale reconnects the provider refreshes
 credentials before re-opening the socket so the handshake uses fresh credentials.
 
@@ -65,7 +65,7 @@ credentials before re-opening the socket so the handshake uses fresh credentials
        │ (ID Token)
        ▼
 ┌─────────────────┐
-│ Chime SDK       │
+│ Amazon Chime SDK       │
 │ Messaging       │
 │ - Create Channel│
 │ - Send Message  │
@@ -74,7 +74,7 @@ credentials before re-opening the socket so the handshake uses fresh credentials
          │
          ▼
 ┌────────────────────┐
-│ Chime App Instance │
+│ Amazon Chime SDK App Instance │
 │ - Channels         │
 │ - Bot Member       │
 └────────┬───────────┘
@@ -103,7 +103,7 @@ credentials before re-opening the socket so the handshake uses fresh credentials
          │ Response
          ▼
 ┌────────────────┐
-│ Chime Channel  │
+│ Amazon Chime SDK Channel  │
 │ (Message)      │
 └────────────────┘
 ```
@@ -132,7 +132,7 @@ Truth, Tasks, Steps) when Aurora mode is detected. See
 
 ## Resources
 
-- **Chime SDK Messaging Docs**: https://docs.aws.amazon.com/chime-sdk/latest/dg/using-the-messaging-sdk.html
+- **Amazon Chime SDK Messaging Docs**: https://docs.aws.amazon.com/chime-sdk/latest/dg/using-the-messaging-sdk.html
 - **AWS SDK for JavaScript v3**: https://docs.aws.amazon.com/AWSJavaScriptSDK/v3/latest/
 - **Bedrock Runtime API**: https://docs.aws.amazon.com/bedrock/latest/APIReference/welcome.html
 - **Aurora Mode Spec**: [SPEC-AURORA-VPC-MODE.md](../../specs/analytics-eval/SPEC-AURORA-VPC-MODE.md) for VPC, Aurora cluster, drift detection, evaluation pipeline

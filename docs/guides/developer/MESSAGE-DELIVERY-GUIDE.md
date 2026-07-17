@@ -1,9 +1,9 @@
-# Message delivery & size: how assistant output reaches Chime
+# Message delivery & size: how assistant output reaches Amazon Chime SDK
 
 > **Read this before building any feature that produces, extends, or
 > re-renders a channel message** - a reply, a recap, a notification, a
 > bilingual/translated message, an attachment, anything that calls
-> `SendChannelMessage`/`UpdateChannelMessage`. The Chime size limits and the
+> `SendChannelMessage`/`UpdateChannelMessage`. The Amazon Chime SDK size limits and the
 > encoding multiplier are non-obvious and have bitten real features
 > (a 4641-char answer threw `BadRequestException: size limit exceeded` even
 > after a naive 5-way split). The machinery to do it right already exists;
@@ -13,7 +13,7 @@ Canonical implementation: `backend/lambda/src/lib/async-processor-core.ts`.
 
 ## The two hard limits - and they're on the ENCODED length
 
-Chime SDK Messaging caps the **request-parameter length**, i.e.
+Amazon Chime SDK Messaging caps the **request-parameter length**, i.e.
 `encodeURIComponent(s).length`, **not** the raw character count:
 
 | Field | Cap (encoded chars) | Constant |
@@ -58,9 +58,9 @@ measure - never `s.length`.
   carry text, it goes in **Content** (through `handleLongResponse`) or an
   **attachment** - never Metadata. **Analytics decoupling (Aurora mode):** the
   heavy per-message analytics fields (tokens, latencies, config fingerprint,
-  etc.) do not ride Chime `Metadata`. The async processor writes the full blob
+  etc.) do not ride Amazon Chime SDK `Metadata`. The async processor writes the full blob
   to a dedicated `MessageAnalyticsTable` keyed by message id, the Aurora archival
-  pipeline reads it from there, and the Chime `Metadata` carries just the
+  pipeline reads it from there, and the Amazon Chime SDK `Metadata` carries just the
   frontend-rendered fields (`pickFrontendMetadata`). So an over-budget turn does
   not drop analytics or the experiment join. In Athena mode (no archival consumer
   for these fields) the Metadata stays full and relies on the shedding backstop.
@@ -109,7 +109,7 @@ only small tags in Metadata, precisely because of the limits above).
   1024 cap durably: coded (integer) values for bounded state fields + heavy
   analytics moved out of band, keyed by message id. OSS-replicable for your own
   intents/states.
-- `docs/overview/ARCHITECTURE.md` / `backend/ARCHITECTURE.md` - the Lex->Lambda->Chime
+- `docs/overview/ARCHITECTURE.md` / `backend/ARCHITECTURE.md` - the Lex->Lambda->Amazon Chime SDK
   message flow and the direct-send pattern these helpers implement.
 - `docs/specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md` - the per-tier async-processors that call
   `handleLongResponse` on every reply.

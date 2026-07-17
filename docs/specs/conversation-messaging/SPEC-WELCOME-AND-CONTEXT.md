@@ -41,7 +41,7 @@ they should carry in AgentEchelon:
 | Pattern                                                                                                                                                                                                                  | Where it's used there                                                                              | Why it matters for AgentEchelon                                                                                                                                                                                                                                  |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | -------------------------------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | **Two-tier context model** - a fast static-shaped path (`handleDirectResponse` / `getXxxWelcomeMessage`) for greetings, and a full Bedrock path (`handlePlaceholderUpdate` + `buildXxxSystemPrompt`) for everything else | Sibling reference, agent-handler entry                                                             | The welcome path should be **instant, predictable, no Bedrock call**. Bedrock is reserved for turns that actually need reasoning.                                                                                                                                |
-| **`DescribeAppInstanceUser` (Chime SDK) → user's `Name`**                                                                                                                                                                | `getUserName(senderArn)` helper                                                                    | The frontend sets the user's display name on the AppInstanceUser at first sign-in; the router reads it back when the Lex event carries `CHIME.sender.arn`. No Cognito hop required (AE uses Cognito `AdminGetUser`; equivalent path, slightly more permissions). |
+| **`DescribeAppInstanceUser` (Amazon Chime SDK) → user's `Name`**                                                                                                                                                                | `getUserName(senderArn)` helper                                                                    | The frontend sets the user's display name on the AppInstanceUser at first sign-in; the router reads it back when the Lex event carries `CHIME.sender.arn`. No Cognito hop required (AE uses Cognito `AdminGetUser`; equivalent path, slightly more permissions). |
 | **`conversationHistory` in `event.sessionState.sessionAttributes`** - JSON-serialised, capped at the last 10 - 20 turns                                                                                                    | `extractConversationHistory(event)` / `updateConversationHistory(event, userMessage, botResponse)` | Lex carries it for free; no DynamoDB hit per turn. The next FallbackIntent turn reads it and the system prompt knows "this is message #N".                                                                                                                       |
 | **`isFirstMessage = conversationLength === 0` as a top-level signal**                                                                                                                                                    | Threaded into `buildXxxSystemPrompt`                                                               | The full-context system prompt should branch on it - first-message gets a brevity-first instruction; later turns get a "this is message #N" anchor.                                                                                                              |
 | **Role / persona-specific welcome variants**                                                                                                                                                                             | `getGuestWelcomeMessage` / `getAuthWelcomeMessage` / `getAdminWelcomeMessage`                      | AgentEchelon has tiers (basic/standard/premium). The welcome text can flex by tier; the *shape* (userName + triggerContext + topic + generic copy) stays the same.                                                                                               |
@@ -62,23 +62,23 @@ runs in the router.
 | -------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | WelcomeIntent fulfillment        | `create-lex-bot.ts` sets `fulfillmentCodeHook: { enabled: true }`, `router-agent-handler.ts` detects `intentName === 'WelcomeIntent'` and runs the welcome composer.                                                                                                                |
 | User name                        | Pulled from Cognito `AdminGetUser` via `resolveUserName(userSub)` in `router-agent-handler.ts`. Custom attribute `name` → `given_name` → email-local-part → `'there'`. Cached for the Lambda's warm life.                                                                           |
-| Channel topic                    | Written to `Channel.Metadata.topic` when `create-conversation` is called with a `topic` body field; the router reads it. The frontend modal does not surface a topic input today. The topic is not frozen at creation: channel metadata is updatable at any time via Chime `UpdateChannel`, so the topic can be refreshed as the conversation evolves (for example derived from the running conversation summary, or rewritten on a drift-redirect). That refresh path is supported by the primitive but not yet wired. |
+| Channel topic                    | Written to `Channel.Metadata.topic` when `create-conversation` is called with a `topic` body field; the router reads it. The frontend modal does not surface a topic input today. The topic is not frozen at creation: channel metadata is updatable at any time via Amazon Chime SDK `UpdateChannel`, so the topic can be refreshed as the conversation evolves (for example derived from the running conversation summary, or rewritten on a drift-redirect). That refresh path is supported by the primitive but not yet wired. |
 | Drift / creation trigger context | `Channel.Metadata.triggerContext` (string, ≤240 chars). Set by callers that create a channel as a redirect from another flow (drift-confirm, cross-channel handoff). The router reads it; the drift-confirm flow is its producer.                                                   |
-| Conversation history             | The async-processor reads recent channel messages from Chime when it needs them; history is not held in Lex `sessionAttributes`. WelcomeIntent's reply is persisted (the bot's first message lands in the channel), so the next turn's processor sees it via `ListChannelMessages`. |
+| Conversation history             | The async-processor reads recent channel messages from Amazon Chime SDK when it needs them; history is not held in Lex `sessionAttributes`. WelcomeIntent's reply is persisted (the bot's first message lands in the channel), so the next turn's processor sees it via `ListChannelMessages`. |
 | Welcome composition              | `composeWelcome({ userName, triggerContext, topic })` in `router-agent-handler.ts`. Single function, three optional inputs, generic fallback when none are set.                                                                                                                     |
 | Tier-flavoured welcome           | A single welcome shape across basic/standard/premium; the composer flexes by tier when a deployment wants it.                                                                                                                                                                       |
 
 ## Architecture: where context is gathered
 
 ```
-User types something → Chime AUTO routes to Lex (multi-user requires
+User types something → Amazon Chime SDK AUTO routes to Lex (multi-user requires
                        CHIME.mentions attribute carrying the bot ARN;
                        1:1 routes regardless)
                                   │
                                   ▼
                     ┌───────────────────────────────────┐
                     │  Lex bot: TRANSPORT + SESSION only. │
-                    │  Chime routes to Lex, Lex invokes   │
+                    │  Amazon Chime SDK routes to Lex, Lex invokes   │
                     │  the router as its fulfillment hook.│
                     │  Lex NLU is bypassed on real turns; │
                     │  the router classifies (Haiku).     │
@@ -87,7 +87,7 @@ User types something → Chime AUTO routes to Lex (multi-user requires
               ┌───────────────────┴───────────────────┐
               ▼                                       ▼
        WelcomeIntent                           FallbackIntent
-   (Chime SYSTEM event, fired         (the catch-all carrying EVERY
+   (Amazon Chime SDK SYSTEM event, fired         (the catch-all carrying EVERY
     when the assistant is ADDED        real user turn; Lex runs no
     to the channel; the ONLY           NLU on it)
     meaningful Lex intent)                      │
@@ -123,17 +123,17 @@ User types something → Chime AUTO routes to Lex (multi-user requires
 ```
 
 **Transport versus classification.** Every real user turn still transits the Lex
-bot: Chime routes the message to Lex, and Lex invokes the router as its
+bot: Amazon Chime SDK routes the message to Lex, and Lex invokes the router as its
 fulfillment code hook (`Chime` to `Lex` to router). What the router does NOT do is
 trust Lex's NLU. Lex matches at most two intents (`WelcomeIntent`,
 `FallbackIntent`), and only `WelcomeIntent` carries meaning, and only in its
-Chime-triggered form: a SYSTEM event fired when the assistant is added to a
+Amazon Chime SDK-triggered form: a SYSTEM event fired when the assistant is added to a
 channel, which the router detects by the absence of an `inputTranscript`. Every
 other turn arrives as `FallbackIntent`, whose label the router ignores entirely;
 it classifies the request category itself with a separate Haiku classifier
 (`classifyIntent` for standard and premium, a keyword-only `classifyIntentBasic`
 for basic with no model call). So a message reaching Lex is transport, not
-classification: Lex is the managed Chime-to-Lambda bridge and per-turn session,
+classification: Lex is the managed Amazon Chime SDK-to-Lambda bridge and per-turn session,
 and the router is the brain. This is consistent with
 [`MESSAGE-FLOW.md`](../../guides/developer/MESSAGE-FLOW.md) §4 ("why Lex isn't the brain"), which is the
 fuller treatment of the same hop.

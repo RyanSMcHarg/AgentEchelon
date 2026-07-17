@@ -59,7 +59,7 @@ This is the **admin-console surface** of the moderation model (see
 `docs/specs/identity-access/SPEC-MODERATION.md`, which describes the full open set of surfaces). Two
 halves, deliberately separate:
 
-**Viewing reads the ARCHIVE, not live Chime.** The conversation list and a
+**Viewing reads the ARCHIVE, not live Amazon Chime SDK.** The conversation list and a
 conversation's messages come from the analytics archive (the system of record
 for history) - so you see every conversation regardless of which assistant
 created it. Open a conversation from the list to load its messages and members.
@@ -73,7 +73,7 @@ audit/debug view.
 **Members:** the Members panel lists current members; **add** a member by ARN
 (must belong to this app instance) or **remove** one (×). **Membership history**
 below it is a timeline of joins / leaves / moderator grants, sourced from the
-archive - the audit trail (Chime exposes only the *current* members, not history).
+archive - the audit trail (Amazon Chime SDK exposes only the *current* members, not history).
 
 **Moderate a message:**
 - **Redact** blanks a message's content (recoverable concept: the message stays,

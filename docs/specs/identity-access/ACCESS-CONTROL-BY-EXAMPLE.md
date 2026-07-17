@@ -9,13 +9,13 @@ The synthesized statements shown are what CDK emits from the constructs cited; v
 
 ---
 
-## Identities and resources: how your IdP, Chime SDK identities, ARNs, and IAM relate
+## Identities and resources: how your IdP, Amazon Chime SDK identities, ARNs, and IAM relate
 
 One relationship underlies every example here:
 
-- **Your identity provider** (Cognito by default, or a federated SAML/OIDC IdP) authenticates a person. That identity maps 1:1 to a **Chime SDK AppInstanceUser** of the same id (the Cognito `sub`). Assistants are **AppInstanceBots**; moderation runs as a single **AppInstanceAdmin** service identity (see Category 4).
+- **Your identity provider** (Cognito by default, or a federated SAML/OIDC IdP) authenticates a person. That identity maps 1:1 to a **Amazon Chime SDK AppInstanceUser** of the same id (the Cognito `sub`). Assistants are **AppInstanceBots**; moderation runs as a single **AppInstanceAdmin** service identity (see Category 4).
 - **Users, assistants, and channels are all AWS resources with ARNs** (`<appInstance>/user/<id>`, `<appInstance>/bot/<id>`, `<appInstance>/channel/<id>`). Because they are ARN-able resources, "who may act on what" is an **IAM and resource-policy decision**, not application logic.
-- **IAM policies** over those ARNs, plus the channel's immutable `classification` tag, allow or deny each action. On top of IAM, the Chime SDK enforces its own membership and bearer rules (the next section).
+- **IAM policies** over those ARNs, plus the channel's immutable `classification` tag, allow or deny each action. On top of IAM, the Amazon Chime SDK enforces its own membership and bearer rules (the next section).
 
 Two kinds of denial recur:
 
@@ -32,9 +32,9 @@ The policies below never act alone. Every Amazon Chime SDK messaging call carrie
 
 **IAM (the AWS layer)** decides whether your credentials may name that bearer and act on that resource. A channel-message action authorizes against two resources at once, the **bearer** (`<appInstance>/user/<id>` or `<appInstance>/bot/<id>`) and the **channel** (`<appInstance>/channel/*`). That is why every grant in this doc is two statements: one for the channel (tag-gated, the tier boundary) and one for the bearer (identity-pinned).
 
-**Chime SDK (the app-instance layer)** enforces its own implicit rules regardless of what IAM allows. It binds `x-amz-chime-bearer` to the caller's authenticated identity, so you can only ever act as yourself, and it gates message access on **channel membership**, so a non-member cannot read or send even where a policy shape would permit it. This is the Amazon Chime SDK's documented model: every messaging call requires the `x-amz-chime-bearer` header naming the `AppInstanceUser` or `AppInstanceBot` making it ([making SDK calls from a back-end service](https://docs.aws.amazon.com/chime-sdk/latest/dg/call-from-backend.html), [using the messaging SDK](https://docs.aws.amazon.com/chime-sdk/latest/dg/using-the-messaging-sdk.html)), and "an `AppInstanceUser` can only send a message or list a channel membership in channels to which the user belongs" ([authorization by role](https://docs.aws.amazon.com/chime-sdk/latest/dg/auth-by-role.html), with [example IAM roles](https://docs.aws.amazon.com/chime-sdk/latest/dg/iam-roles.html)).
+**Amazon Chime SDK (the app-instance layer)** enforces its own implicit rules regardless of what IAM allows. It binds `x-amz-chime-bearer` to the caller's authenticated identity, so you can only ever act as yourself, and it gates message access on **channel membership**, so a non-member cannot read or send even where a policy shape would permit it. This is the Amazon Chime SDK's documented model: every messaging call requires the `x-amz-chime-bearer` header naming the `AppInstanceUser` or `AppInstanceBot` making it ([making SDK calls from a back-end service](https://docs.aws.amazon.com/chime-sdk/latest/dg/call-from-backend.html), [using the messaging SDK](https://docs.aws.amazon.com/chime-sdk/latest/dg/using-the-messaging-sdk.html)), and "an `AppInstanceUser` can only send a message or list a channel membership in channels to which the user belongs" ([authorization by role](https://docs.aws.amazon.com/chime-sdk/latest/dg/auth-by-role.html), with [example IAM roles](https://docs.aws.amazon.com/chime-sdk/latest/dg/iam-roles.html)).
 
-So three boundaries do three different jobs: the IAM **tag condition** is the tier boundary, Chime **membership** is the admission boundary, and the **bearer binding** is the impersonation boundary. Some rungs (the guest rung) carry no IAM tag condition at all and are scoped entirely by Chime membership. In each example, watch which of the three is doing the work.
+So three boundaries do three different jobs: the IAM **tag condition** is the tier boundary, Amazon Chime SDK **membership** is the admission boundary, and the **bearer binding** is the impersonation boundary. Some rungs (the guest rung) carry no IAM tag condition at all and are scoped entirely by Amazon Chime SDK membership. In each example, watch which of the three is doing the work.
 
 ---
 
@@ -44,7 +44,7 @@ So three boundaries do three different jobs: the IAM **tag condition** is the ti
 
 **Attempt.** A `basic` user (or a bug on their behalf) calls `chime:SendChannelMessage` on a channel tagged `classification=premium`.
 
-**Acting role.** The user's `basic` credential-exchange rung role, bearer-pinned to their own AppInstanceUser (`grantPinnedExchangePermissions`, `cognito-auth-stack.ts:403`). The SPA reaches Chime only through this exchange; the Cognito Identity-Pool tier roles are empty (`makeTierRole`, `cognito-auth-stack.ts:342`).
+**Acting role.** The user's `basic` credential-exchange rung role, bearer-pinned to their own AppInstanceUser (`grantPinnedExchangePermissions`, `cognito-auth-stack.ts:403`). The SPA reaches Amazon Chime SDK only through this exchange; the Cognito Identity-Pool tier roles are empty (`makeTierRole`, `cognito-auth-stack.ts:342`).
 
 **Deciding policy** (`tierChannelScopedAllow('basic', …)`, `agent-tier-common.ts:115`):
 
@@ -60,7 +60,7 @@ So three boundaries do three different jobs: the IAM **tag condition** is the ti
 }
 ```
 
-**Result: denied (conditional).** The channel's tag is `premium`, not in `["basic"]`, so the condition is false, no Allow matches, and the action is implicitly denied. This is fail-closed: an untagged or unknown-tag channel also fails to match, so a tagging gap denies rather than leaks. The tag condition is IAM, evaluated before any application code runs, so even a routing bug cannot make a basic identity act on a premium channel. Two boundaries at the Chime layer back it up: the call must name the user's own AppInstanceUser as `x-amz-chime-bearer` (the second statement in the grant authorizes exactly that bearer), and Chime requires channel membership, so a non-member is refused regardless of tier.
+**Result: denied (conditional).** The channel's tag is `premium`, not in `["basic"]`, so the condition is false, no Allow matches, and the action is implicitly denied. This is fail-closed: an untagged or unknown-tag channel also fails to match, so a tagging gap denies rather than leaks. The tag condition is IAM, evaluated before any application code runs, so even a routing bug cannot make a basic identity act on a premium channel. Two boundaries at the Amazon Chime SDK layer back it up: the call must name the user's own AppInstanceUser as `x-amz-chime-bearer` (the second statement in the grant authorizes exactly that bearer), and Amazon Chime SDK requires channel membership, so a non-member is refused regardless of tier.
 
 **User experience.** The user is never vended credentials that can act on the premium channel; the console does not list channels above their tier, and a direct API attempt returns `AccessDenied`.
 
@@ -76,7 +76,7 @@ So three boundaries do three different jobs: the IAM **tag condition** is the ti
 
 **Deciding policy.** IAM grants `EXCHANGE_MSG_ACTIONS` on `<appInstance>/channel/*` with no tag condition, and the guest rung deliberately omits channel discovery (no `ListChannels`) and self-membership management (the higher-rung block at `cognito-auth-stack.ts:438-461` that the restricted rung skips).
 
-**Result: denied by Chime, not by IAM.** This is the clearest case of the two layers dividing the work. IAM would permit the action shape on any channel, but the guest is not a member of the other channel, and Chime SDK gates message access on membership, so the read or send is refused at the app-instance layer. The guest is scoped by **admission** (which channels they are a member of), enforced by Chime, not by a classification tag.
+**Result: denied by Amazon Chime SDK, not by IAM.** This is the clearest case of the two layers dividing the work. IAM would permit the action shape on any channel, but the guest is not a member of the other channel, and Amazon Chime SDK gates message access on membership, so the read or send is refused at the app-instance layer. The guest is scoped by **admission** (which channels they are a member of), enforced by Amazon Chime SDK, not by a classification tag.
 
 **User experience.** A guest sees only the channel they were invited into and cannot discover or reach others. This is the mechanism the external and federated-participant use cases build on.
 
@@ -88,13 +88,13 @@ So three boundaries do three different jobs: the IAM **tag condition** is the ti
 
 ## Someone tries to add a lower-tier member to a higher-tier channel
 
-**Attempt.** A `basic` user is added as a member of a `premium` channel, either by invite or by a direct Chime API call.
+**Attempt.** A `basic` user is added as a member of a `premium` channel, either by invite or by a direct Amazon Chime SDK API call.
 
 **Why IAM tags cannot fully prevent this.** `CreateChannelMembership` and `DeleteChannelMembership` authorize against the **bearer/user** resource (`<appInstance>/user/<id>`), which carries no `classification` tag. A tag condition on them would fail closed and break legitimate membership, so they are granted unconditioned (see the tag-gated-actions section and `agent-tier-common.ts:38-41`). Membership is therefore governed by three other mechanisms, not by the tag gate. This is the honest edge: the tier boundary on *messages* is provable IAM, but the boundary on *membership* is not, so it is defended in depth.
 
 **Gate 1, synchronous app-layer admission (live).** Every path that adds a human validates `memberTier ≥ channelClassification` and refuses. The invite-by-email path (`share-conversation/index.js`) reads the recipient's authoritative Cognito-group tier, compares it to the channel's `modelTier`, and returns **403 `TIER_FORBIDDEN`** on a shortfall. `create-conversation` adds only the creator (over-tier creation already 403s), and the assistant-add paths add only the tier-matched bot, so no in-app path adds an under-tier human. This is application code, so it is defense in depth, not the provable IAM boundary.
 
-**Gate 2, IAM containment (live).** A membership added out of band (a direct Chime API call by a moderator, a script, or compromised creds) bypasses Gate 1. But the tier tag gate (the first example above) still denies that member's `SendChannelMessage`, `GetChannelMessage`, and `ListChannelMessages` on the higher-tier channel, because their credentials are classification-capped. A wrongly-added member is therefore **inert**: present, but unable to read or send. The residual exposure is at most the visibility of the channel's existence and membership, never a message leak.
+**Gate 2, IAM containment (live).** A membership added out of band (a direct Amazon Chime SDK API call by a moderator, a script, or compromised creds) bypasses Gate 1. But the tier tag gate (the first example above) still denies that member's `SendChannelMessage`, `GetChannelMessage`, and `ListChannelMessages` on the higher-tier channel, because their credentials are classification-capped. A wrongly-added member is therefore **inert**: present, but unable to read or send. The residual exposure is at most the visibility of the channel's existence and membership, never a message leak.
 
 **Gate 3, near-real-time Kinesis audit (implemented, opt-in).** Every `CREATE_CHANNEL_MEMBERSHIP` and `UPDATE_CHANNEL_MEMBERSHIP` event streams to Kinesis. The membership-audit consumer (`backend/lambda/src/membership-audit.ts`, wired into both analytics stacks, enabled with `-c enableMembershipAudit`) re-checks the member's tier against the channel classification and, on a violation, logs a `[MembershipAudit][SecurityEvent]`, alerts the admin conversation (an in-app message plus an email through the notification bridge), and, when `-c membershipAuditEnforce=true`, auto-revokes the membership (`DeleteChannelMembership` as the admin bearer). It is **report-only by default**, so a false positive alerts rather than removing a legitimate member. It audits humans and assistants alike (below), and skips the admin service user and federated members. With Gate 2, a wrongly-added member is both inert and then surfaced or revoked.
 
@@ -106,7 +106,7 @@ So three boundaries do three different jobs: the IAM **tag condition** is the ti
 
 ---
 
-# Category 2. Channel actions: IAM prevention and the implicit Chime roles
+# Category 2. Channel actions: IAM prevention and the implicit Amazon Chime SDK roles
 
 Category 1 was about *being on* a channel. This category is about *what actions* are allowed once you are, and how absolute denials differ from the conditional (tag-gated) ones.
 
@@ -135,7 +135,7 @@ That list is the helper's full capability. Each principal is granted only the su
 | **Per-tier assistant** (processor role) | `SendChannelMessage`, `ListChannelMessages`, `GetChannelMessage`, `UpdateChannelMessage`, `DescribeChannel`, `UpdateChannel`. No `Redact` or `Delete`. | `{tier}-tier-stack.ts` (e.g. `premium-tier-stack.ts:122`) |
 | **Admin / guest rungs** | none tag-gated (the admin and `restricted` rungs are deliberately not tag-conditioned; see Category 4 and the guest example) | `cognito-auth-stack.ts:416-428` |
 
-**Deliberately not tag-gated, and why.** Actions that authorize against the **bearer** resource (`<appInstance>/user/<id>` or `<appInstance>/bot/<id>`) carry no classification tag, so adding a tag condition to them would fail closed and break them. These are membership management (`CreateChannelMembership`, `DeleteChannelMembership`), `DescribeChannelMembership`, and the profile and discovery actions. They are governed instead by Chime's membership and moderator model plus the app-layer share and create gates. `ListChannelMemberships` is the exception that stays tag-gated because it is channel-scoped, not bearer-scoped (`agent-tier-common.ts:38-41`).
+**Deliberately not tag-gated, and why.** Actions that authorize against the **bearer** resource (`<appInstance>/user/<id>` or `<appInstance>/bot/<id>`) carry no classification tag, so adding a tag condition to them would fail closed and break them. These are membership management (`CreateChannelMembership`, `DeleteChannelMembership`), `DescribeChannelMembership`, and the profile and discovery actions. They are governed instead by Amazon Chime SDK's membership and moderator model plus the app-layer share and create gates. `ListChannelMemberships` is the exception that stays tag-gated because it is channel-scoped, not bearer-scoped (`agent-tier-common.ts:38-41`).
 
 ## Absolute denials: actions a rung simply never holds
 
@@ -160,7 +160,7 @@ The tag gate above is a *conditional* denial. Some denials are *absolute*: the a
 
 **Result: denied on the chat rung, including an admin's chat identity.** No chat credential can redact or delete another user's message, because the action is not on the chat rungs and the chat identity `${sub}` is not an app-instance-admin. This holds even for an admin: their *chat* credential is powerless to moderate.
 
-**User experience.** Moderation is a deliberate, separate step. The admin console requests an `identity:'admin'` credential (a distinct rung, `ExchangeRoleAdminPlane`) scoped to one channel, short-lived and audited, and calls Chime redact/delete client-side as the admin's own `${sub}-admin` bearer (the next example). No server-side component wields the bearer.
+**User experience.** Moderation is a deliberate, separate step. The admin console requests an `identity:'admin'` credential (a distinct rung, `ExchangeRoleAdminPlane`) scoped to one channel, short-lived and audited, and calls Amazon Chime SDK redact/delete client-side as the admin's own `${sub}-admin` bearer (the next example). No server-side component wields the bearer.
 
 **Assistant experience.** Unaffected; assistants do not delete or redact.
 
@@ -170,10 +170,10 @@ The tag gate above is a *conditional* denial. Some denials are *absolute*: the a
 
 **Attempt.** A crafted message tries to get the premium assistant to act as a user, or as another user's identity (a confused-deputy or impersonation attempt). In AWS the generic way to become another identity is `sts:AssumeRole`, so the real question is not only "can the credentials name another bearer" but "can this actor obtain different credentials at all."
 
-**Acting role.** The premium `ProcessorRole`. Its channel grant pins the bearer to a **bot** resource, never a user (`bearerResources: ['<appInstance>/bot/*']`, `premium-tier-stack.ts:129`); user rungs pin the other way, to `<appInstance>/user/${aws:PrincipalTag/sub}` (`cognito-auth-stack.ts:387`). At the Chime layer, Chime binds `x-amz-chime-bearer` to the caller's authenticated identity, so an AppInstanceBot and an AppInstanceUser are distinct principals that cannot be swapped.
+**Acting role.** The premium `ProcessorRole`. Its channel grant pins the bearer to a **bot** resource, never a user (`bearerResources: ['<appInstance>/bot/*']`, `premium-tier-stack.ts:129`); user rungs pin the other way, to `<appInstance>/user/${aws:PrincipalTag/sub}` (`cognito-auth-stack.ts:387`). At the Amazon Chime SDK layer, Amazon Chime SDK binds `x-amz-chime-bearer` to the caller's authenticated identity, so an AppInstanceBot and an AppInstanceUser are distinct principals that cannot be swapped.
 
 **Deciding policy.** Two things have to hold, and both do:
-- **The bearer is pinned.** With the credentials it holds, the assistant can bear only its own bot identity, and a user can bear only their own `sub`. Neither names the other, and Chime enforces the same binding.
+- **The bearer is pinned.** With the credentials it holds, the assistant can bear only its own bot identity, and a user can bear only their own `sub`. Neither names the other, and Amazon Chime SDK enforces the same binding.
 - **The escalation path is closed.** `sts:AssumeRole` is a real impersonation vector, so it is blocked three ways. The vended rung credentials carry **no** `sts:AssumeRole` permission, so the assistant (or a user) cannot assume a different role to get different credentials. The rung roles' **trust policy names only the credential-exchange Lambda** (`assumedBy: ArnPrincipal(credentialExchangeRole)`, `cognito-auth-stack.ts:484`), so nothing else may assume them. And the exchange may assume a rung role **only with the `sub` session tag** (`sts:TagSession` plus a required `aws:RequestTag/sub`, `cognito-auth-stack.ts:488-493`), which it sets from the caller's verified token, so a rung role is never assumed un-pinned.
 
 **Result: blocked, and the boundary is explicit.** A prompt cannot make the assistant borrow another identity, because the assistant's credentials can neither name another bearer nor assume another role. The one component that can mint credentials pinned to a given `sub` is the credential-exchange Lambda, and it pins to the caller's own verified `sub`, so it cannot mint someone else's identity either. The trust boundary is therefore the exchange Lambda's role and code, not the assistant and not the prompt: impersonation would require compromising that role, not talking a model into it.
@@ -252,7 +252,7 @@ Beyond channels, an assistant is bounded in *which model* it may invoke and *wha
 
 **Deciding policy** (the `rung === 'admin'` branch, `cognito-auth-stack.ts:416-428`): the channel grant is `EXCHANGE_MSG_ACTIONS` on `<appInstance>/channel/*` with **no** `classification` tag condition. The tag gate from Category 1 simply does not appear on this rung.
 
-**Result: allowed across every tier, as themselves.** Because the admin rung is not tag-gated, an admin reads and participates in any tier's channel. The Chime layer still applies: the admin acts as their own AppInstanceUser (their `sub` on every action for the audit trail), and Chime's membership rules still govern message read and send at the app-instance layer. Because the `admin` (chat) rung uses `EXCHANGE_MSG_ACTIONS`, the admin still cannot redact or delete with their CHAT credential (Category 2); moderation uses the separate `${sub}-admin` identity (next section).
+**Result: allowed across every tier, as themselves.** Because the admin rung is not tag-gated, an admin reads and participates in any tier's channel. The Amazon Chime SDK layer still applies: the admin acts as their own AppInstanceUser (their `sub` on every action for the audit trail), and Amazon Chime SDK's membership rules still govern message read and send at the app-instance layer. Because the `admin` (chat) rung uses `EXCHANGE_MSG_ACTIONS`, the admin still cannot redact or delete with their CHAT credential (Category 2); moderation uses the separate `${sub}-admin` identity (next section).
 
 **User experience.** An admin gets cross-tier oversight as themselves, not through a shared or elevated account, so every action is attributable. Moderation runs client-side as the admin's own `${sub}-admin` identity (next section).
 
@@ -262,7 +262,7 @@ Beyond channels, an assistant is bounded in *which model* it may invoke and *wha
 
 The human admin above participates through the `admin` (chat) rung as their chat identity `${sub}`, which cannot moderate. Destructive moderation, redacting and deleting others' messages, runs as a SEPARATE per-human identity: the admin's own `${sub}-admin` `AppInstanceUser`, registered as an `AppInstanceAdmin`, which holds cross-channel redact and delete.
 
-The admin console requests this identity's credential from the Credential-Exchange on an `identity:'admin'` request (the `ExchangeRoleAdminPlane` role): scoped to one channel, short-lived, and recorded (`admin_scoped_credential_vend`). The SPA then calls Chime redact/delete directly with the `${sub}-admin` bearer, so the action is the human acting as themselves, not a server-side bearer swap. This is why the CHAT rungs, admin included, never hold redact or delete (the absolute denial in Category 2): those capabilities live only on the separate `${sub}-admin` identity, vended per request. A dedicated SERVICE `app-instance-admin` (created by `create-app-instance-admin.ts`, ARN in SSM) still exists but only for no-human automation; see `SPEC-ADMIN-IDENTITY.md` for the two-identity model and `SPEC-MODERATION.md` for the moderation surfaces.
+The admin console requests this identity's credential from the Credential-Exchange on an `identity:'admin'` request (the `ExchangeRoleAdminPlane` role): scoped to one channel, short-lived, and recorded (`admin_scoped_credential_vend`). The SPA then calls Amazon Chime SDK redact/delete directly with the `${sub}-admin` bearer, so the action is the human acting as themselves, not a server-side bearer swap. This is why the CHAT rungs, admin included, never hold redact or delete (the absolute denial in Category 2): those capabilities live only on the separate `${sub}-admin` identity, vended per request. A dedicated SERVICE `app-instance-admin` (created by `create-app-instance-admin.ts`, ARN in SSM) still exists but only for no-human automation; see `SPEC-ADMIN-IDENTITY.md` for the two-identity model and `SPEC-MODERATION.md` for the moderation surfaces.
 
 ---
 
@@ -276,7 +276,7 @@ The admin console requests this identity's credential from the Credential-Exchan
 | What the browser may do | `EXCHANGE_MSG_ACTIONS` (`cognito-auth-stack.ts`) | The action set on every user rung; keep destructive actions off it |
 | Who is an admin | `admins` group, `ADMIN_GROUP_NAMES` | Unlocks the cross-tier admin rung and the admin API |
 | Identity pinning | `bearerResources` (`agent-tier-common.ts`) | Which identity a role may bear; keep pinned |
-| Who can join a channel (guest admission) | channel membership via create-conversation / invite path | The Chime-membership boundary for guests and shared channels |
+| Who can join a channel (guest admission) | channel membership via create-conversation / invite path | The Amazon Chime SDK-membership boundary for guests and shared channels |
 | Cross-tier membership control | `share-conversation` / `create-conversation` tier check, plus the Layer 6 Kinesis audit consumer | App gate refuses over-tier invites; the tag gate makes any out-of-band add inert; the audit revokes |
 | Preventing role escalation | rung-role trust policy + no `sts:AssumeRole` on rungs (`cognito-auth-stack.ts`) | Only the exchange Lambda may assume rung roles, always `sub`-pinned |
 

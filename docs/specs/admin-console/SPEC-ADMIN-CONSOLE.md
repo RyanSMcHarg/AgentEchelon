@@ -59,7 +59,7 @@ accountability-logging calibration noted there.
    from the **archive** (the system of record for history) and *acts* through the operator's
    **own `${sub}-admin` identity**. Each live moderation action vends a per-channel,
    short-lived, audited credential from the Credential-Exchange (`identity:'admin'`) and calls
-   Chime directly from the browser. No server-side component holds or swaps a bearer. The
+   Amazon Chime SDK directly from the browser. No server-side component holds or swaps a bearer. The
    dedicated **service** app-instance-admin exists only for no-human automation (the
    membership-audit auto-revoke path). This is the model defined in `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md`.
 2. **Fewer, clearer tabs.** Navigation is **7 sections** with sub-tabs rather than a flat tab row.
@@ -133,7 +133,7 @@ Configuration: shared date preset. Error percent card carries the `error_rate` t
 |---|---|---|---|
 | Avg total, avg Bedrock, avg polling, p95 total (+ distribution rail and per-row table) | Response-latency breakdown across the message journey | `latency_metrics`. Aurora: over `messages` joined to `exchanges` where bot and `total_ms>0`, grouped by day, agent, delivery: `AVG(total_ms)`, `AVG(latency_ms)` (Bedrock), `AVG(poll_ms)`, `PERCENTILE_CONT(0.95)` on `total_ms`, `COUNT(*)`. Athena: count-only. | both (Aurora full) |
 | Page-load web vitals (p50/p95/p99/avg per metric) | Real-user web-vital percentiles | `page_load_metrics`: over `client_events` where `record_type='performance'`, `APPROX_PERCENTILE(perf_value, ...)` grouped by metric. | both |
-| WebSocket connects, disconnects, reconnects (+ per-day table) | Chime/WebSocket stability; reconnect spikes as early warning | `connection_health_daily`: `SUM(CASE ...)` over `client_events` connection events, per day. | both |
+| WebSocket connects, disconnects, reconnects (+ per-day table) | Amazon Chime SDK/WebSocket stability; reconnect spikes as early warning | `connection_health_daily`: `SUM(CASE ...)` over `client_events` connection events, per day. | both |
 
 Configuration: shared date preset. Card targets from `metricTargets.ts` - avg total
 (target 2000ms, warn 5000ms), avg Bedrock (target 1500ms, warn 4000ms), p95 total
@@ -149,7 +149,7 @@ threshold; web vitals per `WEB_VITAL_META`). See [`LATENCY-TARGETS.md`](../../gu
 The moderation surface. It has a **Browser** view (conversation list, messages, live members,
 membership history) and a **Drift Detection** view. Viewing reads the archive through
 `admin-conversations.ts` (Athena over the `conversations` Glue table); that handler holds
-**no Chime bearer**. Live members and every mutation run client-side under the operator's own
+**no Amazon Chime SDK bearer**. Live members and every mutation run client-side under the operator's own
 `${sub}-admin` identity (see below).
 
 The full conversation view combines two sources by design: the **event archive** for a
@@ -163,8 +163,8 @@ answers which question, is the multi-store rationale in
 |---|---|---|---|
 | Conversation list (name, tier, last activity) | Pick a channel to moderate | `admin-conversations.ts` `listConversations`: latest name per `ChannelArn`, `MAX(CreatedTimestamp)` as last activity, tier from the archive partition, ordered by recency. | Browser |
 | Messages (time, sender, intent, model, body, redacted flag) | Read a conversation | `listMessages`: per `MessageId` keep the latest row; body is decoded and unwrapped from the Lex envelope so raw Lex JSON is never shown; redacted rows render as redacted. | Browser |
-| Live members (name, type, is-bot) | Current membership before an action | Chime `ListChannelMemberships` called client-side as the `${sub}-admin` identity, not the archive. | Browser (live) |
-| Membership history timeline | Audit who joined, left, or held moderator, and when | `membershipHistory`: archive events (create/delete membership, create/delete moderator) mapped to joined / left / granted-moderator / revoked-moderator, with `invitedBy`. Chime has no history API, so the archive is the system of record. | Browser (audit) |
+| Live members (name, type, is-bot) | Current membership before an action | Amazon Chime SDK `ListChannelMemberships` called client-side as the `${sub}-admin` identity, not the archive. | Browser (live) |
+| Membership history timeline | Audit who joined, left, or held moderator, and when | `membershipHistory`: archive events (create/delete membership, create/delete moderator) mapped to joined / left / granted-moderator / revoked-moderator, with `invitedBy`. Amazon Chime SDK has no history API, so the archive is the system of record. | Browser (audit) |
 | Inspect drawer (content, sender ARN, timestamps, metadata, full raw payload) | Faithful per-message record for troubleshooting | Renders every stored field plus the raw archived `Payload`. | Inspect drawer |
 | Drift events (detected-at, topics, drift score, suggested action, resolved) | Review topic drift in a conversation | `drift_events` from the pgvector drift store. Drift score is the cosine distance between the latest user-message embedding and the running conversation-summary embedding (Titan v2, 1024-dim); a distance over the threshold (default 0.35) is drift. An explicit routing request scores 1.0. Suggested action is continue, confirm, or redirect. | Aurora only |
 
@@ -329,7 +329,7 @@ admins manage them.
 | Action | What it does | Endpoint and effect |
 |---|---|---|
 | List users | Load all Cognito users and derive status (pending / approved / disabled) | `GET /users`, paginated. |
-| Approve | Approve a pending user at a chosen tier | `POST /approve`: sets approved and tier, syncs the single tier group, enables the user, and provisions the member Chime app-instance-user `.../user/${sub}`. |
+| Approve | Approve a pending user at a chosen tier | `POST /approve`: sets approved and tier, syncs the single tier group, enables the user, and provisions the member Amazon Chime SDK app-instance-user `.../user/${sub}`. |
 | Reject / Disable | Reject a pending user or disable an approved one | `POST /reject`: clears approved and disables the user. |
 | Re-enable | Reactivate a disabled user | `POST /enable`: enables and marks approved. |
 | Change tier | Move a user between basic, standard, premium | `POST /tier`: validates the tier and syncs the single tier group. |
@@ -344,7 +344,7 @@ provisioned at the identity path defined in `docs/specs/identity-access/SPEC-ADM
 #### Membership Audit tab (`MembershipAuditTab.tsx`)
 
 Layer 6 of the conversation-security model (`docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md`). An auditor
-Lambda consumes the same Chime-to-Kinesis stream as the archive, filtered to membership
+Lambda consumes the same Amazon Chime SDK-to-Kinesis stream as the archive, filtered to membership
 create and update events, and flags cross-tier leaks. Findings and the enforce toggle live in
 one DynamoDB table; the admin API (`membership-audit-admin.ts`) is admin-gated by `requireAdmin`.
 

@@ -58,7 +58,7 @@ processor.
 | **Tier-scoped `context/{tier}/` S3 IAM** | The defense-in-depth isolation boundary (basic→basic; standard→+standard; premium→all) |
 | **Tier guardrail** (text; out-of-band ApplyGuardrail on output) | Each team owns its content policy |
 | **Lex bot** (WelcomeIntent + FallbackIntent → shared router) | The ownership/blast-radius boundary; bot ARN published to SSM |
-| **AppInstanceBot** | The Chime-side handle for the tier bot |
+| **AppInstanceBot** | The Amazon Chime SDK-side handle for the tier bot |
 | **Per-tier model IAM** (InvokeModel[WithResponseStream] on allowed models) | Each tier grants only its models |
 
 Not present in a tier stack: `CfnAgent`, `CfnAgentAlias`, agent role, agent SSM
@@ -81,7 +81,7 @@ root - never `Fn::importValue`):
 | `/agent-echelon/shared/router-arn` | platform | Lex FallbackIntent fulfillment target |
 | `/agent-echelon/shared/tables/*-arn` | platform | processor IAM + env (tasks/experiments/battle) |
 | `/agent-echelon/shared/battle-orchestrator-arn` | platform | premium processor (battle) |
-| `/agent-echelon/app-instance-arn` | platform | AppInstanceBot + Chime IAM |
+| `/agent-echelon/app-instance-arn` | platform | AppInstanceBot + Amazon Chime SDK IAM |
 | `/agent-echelon/attachments-bucket` | platform | `CONTEXT_BUCKET` + tier S3 grants |
 
 Consumers of the tier contract: the **shared router** resolves
@@ -125,7 +125,7 @@ AgentEchelonTier-{Basic|Standard|Premium}        owned by that tier's file
 │   env: CONTEXT_BUCKET, MODEL_ID/NAME, GUARDRAIL_ID/VERSION,
 │        APP_INSTANCE_ARN, *_TABLE_ARN (shared, std/prem), BATTLE_ORCHESTRATOR_ARN (prem)
 │   role: ContextS3Read(tier prefixes) + bedrock:InvokeModel[WithResponseStream (prem)]
-│         + bedrock:ApplyGuardrail(tier guardrail) + Chime(send/list/update)
+│         + bedrock:ApplyGuardrail(tier guardrail) + Amazon Chime SDK(send/list/update)
 │         + DynamoDB(shared tables, std/prem) + lambda:Invoke(orchestrator, prem)
 │         + image-gen + image-guardrail + battle-images S3 (prem)
 ├─ Tier guardrail            (AgentGuardrails — `agent-echelon-{tier}-guardrail`)

@@ -236,7 +236,7 @@ AgentEchelon's fulfillment path is the **per-tier self-hosted Converse tool loop
 
 **Why call it directly rather than as a tool?** Image generation is slow (5-20s per call). Folding a 15-second image-gen into the synchronous Converse tool loop would: (a) push the text reply's latency well past acceptable bounds, (b) couple the text reply timing to the image timing in a way that prevents the user from seeing the text-side response first.
 
-Today's split: the text side runs through the Converse tool loop → produces the text reply → the `/battle` orchestrator (after the text battle settles) fires `invokeImageGenModel` separately for each bot's image-gen variant. The image arrives as an out-of-band Chime message with a `<!--battleimage:-->` marker, decoupled from the text reply.
+Today's split: the text side runs through the Converse tool loop → produces the text reply → the `/battle` orchestrator (after the text battle settles) fires `invokeImageGenModel` separately for each bot's image-gen variant. The image arrives as an out-of-band Amazon Chime SDK message with a `<!--battleimage:-->` marker, decoupled from the text reply.
 
 This decoupled, direct-invocation pattern is the correct shape for any slow generation step that must not block the text turn.
 

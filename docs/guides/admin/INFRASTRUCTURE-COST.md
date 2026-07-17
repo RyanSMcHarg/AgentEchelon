@@ -34,7 +34,7 @@ Two deployment modes have very different cost shapes:
 | **S3 (attachments, context, SPA, archive)** | Tier context documents (`context/{tier}/`), the RAG corpus (`rag/`), user attachments, the built frontend, and the message archive. | $0.023 / GB-mo Standard + request tiers | **$1 to 10** |
 | **Cognito** | User pool, tier groups, hosted sign-in. Free below 50k MAU on the standard tier. | Free tier, then per-MAU | **$0** at demo scale |
 | **CloudFront + API Gateway** | SPA delivery + REST APIs (credential exchange, admin, analytics query). | CloudFront $0.085/GB out; API GW $1.00 / M requests (REST) | **$1 to 15**, usage-driven |
-| **Chime SDK messaging** | The messaging backbone: channels, memberships, app-instance bots, channel flows. Billed per active user and per message. | Per-message + per-active-user | **usage-driven**; low at demo scale |
+| **Amazon Chime SDK messaging** | The messaging backbone: channels, memberships, app-instance bots, channel flows. Billed per active user and per message. | Per-message + per-active-user | **usage-driven**; low at demo scale |
 | **Bedrock model inference** | The dominant variable cost. Per-tier models: basic Haiku, standard Sonnet, premium Opus (see [`MODEL_STRATEGY.md`](../developer/MODEL_STRATEGY.md)). | Per M input/output tokens (confirm current Bedrock pricing) | **usage-driven** (see below) |
 
 **Bedrock inference, per-turn order of magnitude** (representative token sizes; confirm current per-model
@@ -58,7 +58,7 @@ latency.
 | **RDS Proxy (optional, off by default)** | Connection pooling + IAM database auth in front of Aurora. **Off by default** (opt in with `enableRdsProxy=true`): on Serverless v2 the proxy bills a fixed **8-ACU minimum** regardless of load, so on an idle cluster it costs more than the database it fronts. By default the analytics Lambdas connect directly to the cluster writer endpoint with IAM auth. Enable only for high Lambda-concurrency workloads that need pooling. | 8 ACU x $0.015 / ACU-hour (fixed floor) | **$0** (default) / **~$86** when enabled |
 | **VPC interface endpoints (Bedrock, Secrets Manager, Kinesis)** | Private egress from the isolated subnets to those AWS services, so VPC-attached Lambdas reach them without a NAT gateway. Two ENIs each (one per AZ). **$0 when you import a VPC that already provides egress** (`createVpcEndpoints=false`); the stack creates them only for a new NAT-free VPC. | $0.01 / endpoint-AZ-hour + $0.01 / GB | **$0** (imported VPC) / **~$44** (stack-created, 3 services x 2 AZ) |
 | **VPC gateway endpoints (S3, DynamoDB)** | Private egress to S3 and DynamoDB. Gateway endpoints are free. | Free | **$0** |
-| **Kinesis Data Stream** | Ingests Chime message events for archival + analytics. | 1 shard $0.015/hr, or on-demand $0.04/hr + payload units | **$11 to 30** |
+| **Kinesis Data Stream** | Ingests Amazon Chime SDK message events for archival + analytics. | 1 shard $0.015/hr, or on-demand $0.04/hr + payload units | **$11 to 30** |
 | **Kinesis Firehose** | Batches stream records to the S3 archive. | $0.029 / GB ingested (first 500 TB) | **< $5** at demo volume |
 | **KMS (archive CMK)** | Customer-managed key encrypting the message archive. | $1 / key-mo + $0.03 / 10k requests | **~$1 to 3** |
 | **Analytics / drift / summary / ingestion Lambdas** | VPC-attached Lambdas doing embedding + Aurora reads/writes: document ingestion, evaluation, summary updater, abandonment, archival, and the retrieval data-plane (below). | $0.20 / M requests + GB-s | **$1 to 5**, usage-driven |

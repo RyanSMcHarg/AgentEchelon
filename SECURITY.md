@@ -31,8 +31,8 @@ channel's policy already permit.
   whose classification is at or below the caller's tier; an untagged or higher-tier channel
   carries no matching grant, so the action is implicitly denied.
 - **Bearer-pinned credentials.** The backend Credential Exchange vends short-lived,
-  classification-capped Chime credentials pinned to the caller's own identity - an actor can
-  only ever act as itself. It is the sole source of Chime credentials (there is no Identity-Pool
+  classification-capped Amazon Chime SDK credentials pinned to the caller's own identity - an actor can
+  only ever act as itself. It is the sole source of Amazon Chime SDK credentials (there is no Identity-Pool
   over-grant fallback).
 - **Guardrails.** The per-tier processors apply a Bedrock Guardrail out of band on **both sides**
   of an assistant turn: `source:'INPUT'` before the model call (prompt-injection / `PROMPT_ATTACK`

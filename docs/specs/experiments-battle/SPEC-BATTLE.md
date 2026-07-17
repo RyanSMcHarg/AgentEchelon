@@ -19,7 +19,7 @@
 A `/battle` does not introduce a parallel persona infrastructure. **The "alternative assistant" is the treatment variant of an existing A/B experiment**, surfaced as a real channel member. /battle can be turned on/off in any conversation where there is an active /battle for the primary assistant in a given tier. 
 
 - The admin defines experiment variants today (control model vs treatment model, weighted). This spec extends that schema with `battleEnabled`, `displayName`, and an optional `systemPromptAddendum` per variant.
-- When a channel's "Enable Battle" toggle flips on, the channel adds the active experiment's **treatment variant** as a second `AppInstanceBot` member. That bot principal is the alternative assistant. Both variants are now channel members in the literal Chime sense.
+- When a channel's "Enable Battle" toggle flips on, the channel adds the active experiment's **treatment variant** as a second `AppInstanceBot` member. That bot principal is the alternative assistant. Both variants are now channel members in the literal Amazon Chime SDK sense.
 - `/battle` then fans out routing to *all bot members of the channel* (1 default bot + 1+ alt-slot bots), exactly as `@all` does today but per-bot rather than to a single bot. Each invocation carries its own variant config (model + system-prompt addendum) so the two responses are visibly different - same machinery that already powers A/B testing, but the routing decision changes from "pick one stochastically" to "fan out to both."
 - This unifies `/battle` with A/B testing as one feature: instead of probabilistically picking a variant per conversation, the user can compare both on the same prompt within a single channel.
 
@@ -138,7 +138,7 @@ After this spec is implemented:
 
 **Channel membership.** `create-conversation/index.js` creates the channel with the bot as moderator and adds the human user. `add-agent-to-conversation/index.js` adds the same bot (idempotent) on demand.
 
-**Routing.** `channel-flow-processor.ts` recognizes `@all` and broadcasts a bot reply. `@assistant` is routed by Chime's native `CHIME.mentions` attribute via `AUTO` + `TargetedMessages: ALL`. `/battle` fans out to every bot member of the channel.
+**Routing.** `channel-flow-processor.ts` recognizes `@all` and broadcasts a bot reply. `@assistant` is routed by Amazon Chime SDK's native `CHIME.mentions` attribute via `AUTO` + `TargetedMessages: ALL`. `/battle` fans out to every bot member of the channel.
 
 **Async processor.** `async-processor-core.ts` handles placeholder + update. The processor reads `userMessage`, `botArn`, `senderArn`, `intent`, `deliveryOption`, and `responseTarget` from the invoke payload. There is no `battleContext` field today.
 
@@ -269,7 +269,7 @@ export function deriveBattleId(channelArn: string, userMessageId: string): strin
 }
 ```
 
-Both the channel-flow-processor (when fanning out round 1) and the async-processor (when transitioning state) derive `battleId` from the same inputs. The `userMessageId` is the Chime message id of the `/battle` user message - stable across retries.
+Both the channel-flow-processor (when fanning out round 1) and the async-processor (when transitioning state) derive `battleId` from the same inputs. The `userMessageId` is the Amazon Chime SDK message id of the `/battle` user message - stable across retries.
 
 **State-transition contract** (each async-processor invocation, on round-1 completion):
 
@@ -346,7 +346,7 @@ const mentionsAll = /@all\b/i.test(decodedContent);
 const mentionsBattle = //battle\b/i.test(decodedContent);
 ```
 
-Both `@all` and `/battle` are processor-side bypasses (not native Chime mentions). The detection is mutually exclusive - if both are present, `/battle` wins.
+Both `@all` and `/battle` are processor-side bypasses (not native Amazon Chime SDK mentions). The detection is mutually exclusive - if both are present, `/battle` wins.
 
 ### Fan-Out - Round 1 (Parallel)
 
@@ -502,7 +502,7 @@ The full path is in place: detection `parseBattleClarification`; state `markBotW
 
 - Default selection: the most recent bot to enter `WAITING_FOR_USER`.
 - User can toggle to any subset of waiting bots (or "all").
-- Selection emits `MessageAttributes.CHIME.mentions = [...selectedBotArns]` so native Chime routing delivers to the right bots.
+- Selection emits `MessageAttributes.CHIME.mentions = [...selectedBotArns]` so native Amazon Chime SDK routing delivers to the right bots.
 - A small "1 of 2 assistants is waiting for your reply" affordance shows above the composer.
 
 The router uses the `CHIME.mentions` set + each bot's state to decide who consumes the user's reply. A bot in `WAITING_FOR_USER` consumes a directed reply and transitions back to `INVOKED`. A bot not in `WAITING_FOR_USER` ignores the reply unless explicitly addressed - it has already finished its round 1.
@@ -572,7 +572,7 @@ When a channel has ≥2 bot members, the existing routing tokens carry these sem
 |-------|----------------------|----------------------------------|
 | `@all` | Default bot broadcasts a reply | **Default bot broadcasts a short clarification** asking which assistant should respond (e.g., "Both Atlas and Echo are listening. Mention `@Atlas`, `@Echo`, or `/battle` to compare them"). The clarification reply is broadcast (visible to all members), is generated without an LLM call (deterministic templated text), and does **not** consume a turn against the bound model variant. |
 | `/battle` | One-line "Battle Mode isn't enabled here - ask a moderator" hint to the sender; nothing broadcast (delivered-scope item 1) | Fan-out to all bot members with round-1 + opt-in round-2 (this spec's main flow) |
-| `@<displayName>` (e.g., `@Atlas`) | N/A | Frontend autocomplete lists channel bot members by display name. Selecting one inserts the bot's ARN into `CHIME.mentions` and Chime's native `AUTO + ALL` routing delivers the message to that bot specifically. No processor-side bypass needed - this is the same path `@assistant` uses today |
+| `@<displayName>` (e.g., `@Atlas`) | N/A | Frontend autocomplete lists channel bot members by display name. Selecting one inserts the bot's ARN into `CHIME.mentions` and Amazon Chime SDK's native `AUTO + ALL` routing delivers the message to that bot specifically. No processor-side bypass needed - this is the same path `@assistant` uses today |
 | `@assistant` | Default bot reply via native `CHIME.mentions` | Default bot reply via native `CHIME.mentions` (unchanged - `assistant` always resolves to the default bot ARN for backward compatibility) |
 
 **Rationale for the clarification path on `@all`:** doing nothing (only the default bot replies) trains users that the alt-bot is invisible to broadcasts and undercuts the value of having both members present. Having both bots auto-respond to `@all` doubles cost on every broadcast and is what `/battle` is *for*. The clarification keeps the addressee explicit, costs almost nothing, and makes `/battle` discoverable.
@@ -719,7 +719,7 @@ selection** - see the Non-Goal.
 > (`makeConverseStep`), the standard external (Chinese) path synthesizes one
 > `generate` step, and `finalizePlaceholderResponse` persists the array **out of
 > band** in the message-analytics record keyed by message id - NOT on the
-> ≤1024 Chime Metadata. Archival merges that record into Aurora's
+> ≤1024 Amazon Chime SDK Metadata. Archival merges that record into Aurora's
 > `messages.metadata` JSONB, so `steps[]` is queryable there with no cap and no
 > schema change. This resolves the open item below ("how `steps[]` is assembled")
 > for the tool-loop case; each TASK_* state-machine transition is a separate
@@ -872,7 +872,7 @@ onward, so every stage of the progression shows time/cost/quality.
 | `backend/lambda/src/analytics-aurora/drift-detection.ts` | Accept optional `battleContext` parameter; tag `drift_detection` rows with `battle_id` when present; `detectDriftWithSuggestion()` short-circuits when `battleContext` is set |
 | `backend/lambda/src/analytics-aurora/schema/` | Add migration (e.g., `005-battle-tagging.sql`) adding `battle_id` nullable column to `drift_detection` |
 | `backend/lambda/src/battle-orchestrator.ts` (new) | Reads `BattleStateTable`, fires round 2 for each bot member once both round-1 replies are in |
-| `backend/lambda/src/channel-battle.ts` (new) | API handler for `POST /channels/battle/enable`, `POST /channels/battle/disable`, `GET /channels/battle` (channel ARN in the request body for POST, query string for GET); writes `ChannelBattleConfigTable`; calls Chime `CreateChannelMembership` / `DeleteChannelMembership` for the alt-slot ARN |
+| `backend/lambda/src/channel-battle.ts` (new) | API handler for `POST /channels/battle/enable`, `POST /channels/battle/disable`, `GET /channels/battle` (channel ARN in the request body for POST, query string for GET); writes `ChannelBattleConfigTable`; calls Amazon Chime SDK `CreateChannelMembership` / `DeleteChannelMembership` for the alt-slot ARN |
 | `backend/lambda/user-management.ts` (or `cognito-auth-stack.ts` API) | Wire the new channel-battle endpoints into the existing admin API Gateway |
 | `frontend/src/services/experimentService.ts` | Extend `Experiment` + `Variant` types with the new fields; add `setBattleBinding` call |
 | `frontend/src/services/channelService.ts` (new or existing) | Add `enableBattle(channelArn, experimentId)` and `disableBattle(channelArn)` |
@@ -972,7 +972,7 @@ battle-enabled deploy to exercise.
 | `NO_REBUTTAL` sentinel collides with legitimate model output | Strict match: trimmed, case-insensitive, exact match (or with trailing period); also accept JSON `{"rebuttal": null}` as a future-proofing alternative |
 | Frontend renders rounds out-of-order if updates arrive late | Sort by `createdAt`, not arrival; round divider keyed off `battle.round` transition rather than position |
 | Multi-user channel with `/battle` fires for many humans | Single-active-battle lock applies per-channel, not per-user. The lock makes the second user's `/battle` get a "already in progress" reply |
-| The orchestrator Lambda fails between round-1 and round-2 | Round 1 is durable in Chime regardless of round 2; the worst case is no rebuttals (graceful degradation). DDB TTL cleans up state |
+| The orchestrator Lambda fails between round-1 and round-2 | Round 1 is durable in Amazon Chime SDK regardless of round 2; the worst case is no rebuttals (graceful degradation). DDB TTL cleans up state |
 | Channel members confused by a new bot suddenly appearing | The enable endpoint posts a system message announcing the new bot's display name and a one-line description ("Echo joined to battle. Try `/battle`."). The disable endpoint posts a corresponding leave message |
 | Admin disables a battle-enabled experiment while channels are using it | Disable returns 409 with the affected channel list. Admin must disable battle per-channel first. Bulk-disable is out of scope |
 | Probabilistic experiment routing conflicts with battle membership | When a channel has battle enabled, the existing `experiment-manager.resolveExperimentModel` is bypassed (both variants serve concurrently as members). Non-battle channels still see the normal stochastic assignment. No experiment double-counts |

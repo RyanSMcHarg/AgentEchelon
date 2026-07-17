@@ -7,7 +7,7 @@ This guide explains how to connect your existing identity provider (IdP) to Agen
 1. **Federate into Cognito Identity Pools** (recommended) - your IdP issues tokens, Cognito Identity Pools exchanges them for AWS credentials. Minimal code changes.
 2. **Credential Exchange Service** - a backend Lambda validates your IdP's token and calls STS `AssumeRole` directly. More flexible, works with any auth system.
 
-This guide is adapted from the [AWS blog post "Integrate your Identity Provider with Amazon Chime SDK Messaging"](https://aws.amazon.com/blogs/business-productivity/integrate-your-identity-provider-with-amazon-chime-sdk-messaging/) (June 2021), updated for AWS SDK v3, current Chime SDK namespaces, and the AgentEchelon architecture.
+This guide is adapted from the [AWS blog post "Integrate your Identity Provider with Amazon Chime SDK Messaging"](https://aws.amazon.com/blogs/business-productivity/integrate-your-identity-provider-with-amazon-chime-sdk-messaging/) (June 2021), updated for AWS SDK v3, current Amazon Chime SDK namespaces, and the AgentEchelon architecture.
 
 ---
 
@@ -31,7 +31,7 @@ AgentEchelon ships with Cognito User Pool as its identity provider. The credenti
   Identity Pool validates token, returns temporary AWS credentials
           │
           ▼
-  AWS credentials used to initialize Chime SDK MessagingClient
+  AWS credentials used to initialize Amazon Chime SDK MessagingClient
 ```
 
 The key insight: **Cognito Identity Pools don't care where the token comes from.** They accept tokens from any configured identity provider - Cognito User Pools, SAML, OIDC, Google, Facebook, Apple, or custom. This is the integration point.
@@ -43,7 +43,7 @@ The key insight: **Cognito Identity Pools don't care where the token comes from.
 | `frontend/src/providers/AuthProvider.tsx` | User login, token management, refresh | Approach 1: minor changes. Approach 2: significant rewrite. |
 | `frontend/src/services/chimeService.ts` | Exchanges IdToken for AWS credentials via Identity Pool | Approach 1: change login key only. Approach 2: replace credential provider entirely. |
 | `backend/lib/stacks/cognito-auth-stack.ts` | CDK stack: User Pool, Identity Pool, IAM roles | Approach 1: add OIDC/SAML provider to Identity Pool. Approach 2: replace User Pool with custom auth stack. |
-| `backend/lambda/cognito-triggers/post-confirmation.js` | Creates Chime AppInstanceUser on signup | Both: adapt to your IdP's user lifecycle events. |
+| `backend/lambda/cognito-triggers/post-confirmation.js` | Creates Amazon Chime SDK AppInstanceUser on signup | Both: adapt to your IdP's user lifecycle events. |
 
 ---
 
@@ -55,7 +55,7 @@ enforcement - work cleanly, and it dictates *where* access is enforced.
 **Amazon Chime SDK messaging authorizes every channel action at two native
 layers, neither of which knows or cares which IdP a user came from:**
 
-1. **The AppInstanceUser** (the `ChimeBearer`) - Chime's own model: channel
+1. **The AppInstanceUser** (the `ChimeBearer`) - Amazon Chime SDK's own model: channel
    membership, `RESTRICTED` mode, moderator status, `HIDDEN` membership. This
    decides whether *this principal* may act on *this channel*.
 2. **The IAM role the caller assumes** - via the Identity Pool (or, in Approach
@@ -80,7 +80,7 @@ to. It is **not** a property of the IdP.
   a *claim* that any IdP can emit, and why the channel-join boundary is expressed
   as "who may be a channel member" + "what the assumed role may call" - both
   IdP-neutral - rather than a Cognito construct.)
-- **Unauthenticated / guest access is a first-class, *controlled* level.** Chime
+- **Unauthenticated / guest access is a first-class, *controlled* level.** Amazon Chime SDK
   supports unauthenticated Identity Pool identities (a guest role) and guest
   AppInstanceUsers. AgentEchelon ships with `allowUnauthenticatedIdentities:
   false`, but the model is designed so a deployer can grant guests a deliberate,
@@ -118,7 +118,7 @@ This is the recommended approach if your IdP supports OIDC or SAML. You keep Cog
   Identity Pool validates with your IdP, returns AWS credentials
           │
           ▼
-  Chime SDK initialized (unchanged)
+  Amazon Chime SDK initialized (unchanged)
 ```
 
 ### Step 1: Register your IdP with Cognito Identity Pool
@@ -250,7 +250,7 @@ interface AuthContract {
   // Must produce an OIDC-compatible IdToken (or SAML assertion)
   idToken: string | null;
 
-  // Must provide a stable user ID (used as Chime AppInstanceUserId)
+  // Must provide a stable user ID (used as Amazon Chime SDK AppInstanceUserId)
   user: { id: string; email: string; tier: string } | null;
 
   // Auth state
@@ -289,13 +289,13 @@ const user = await auth0.getUser();
 // Pass idToken to chimeService.initialize(idToken, user.sub)
 ```
 
-### Step 5: Handle Chime AppInstanceUser creation
+### Step 5: Handle Amazon Chime SDK AppInstanceUser creation
 
-The post-confirmation Lambda creates a Chime `AppInstanceUser` when a user first registers. With an external IdP, you need an equivalent trigger:
+The post-confirmation Lambda creates an Amazon Chime SDK `AppInstanceUser` when a user first registers. With an external IdP, you need an equivalent trigger:
 
 **Option A: Just-in-time creation on first login**
 
-Add this to your frontend's login flow (after successful auth, before Chime initialization):
+Add this to your frontend's login flow (after successful auth, before Amazon Chime SDK initialization):
 
 ```typescript
 import { ChimeSDKIdentityClient, CreateAppInstanceUserCommand } from '@aws-sdk/client-chime-sdk-identity';
@@ -432,7 +432,7 @@ new lambda.CfnPermission(this, 'PostAuthenticationPermission', {
 
 ### Step 8: Tier → IAM role mapping (channel-join enforcement) - important for federated IdPs
 
-The Cognito **group also selects the user's IAM role**, not just the application-layer tier. `cognito-auth-stack.ts` defines one authenticated IAM role per tier, attaches each to its group via `roleArn`, and the Identity Pool uses **Token-based role mapping** (`roleMappings … type: 'Token'`, keyed on the `cognito:preferred_role` claim Cognito derives from the group `roleArn`s). Each tier's role carries a pure-IAM **Deny** keyed on the GLOBAL `aws:ResourceTag/classification` (not `chime:ResourceTag`, which the Chime SDK does not surface as a condition key and would silently never match) so a tier-X user's credentials physically cannot send/join/read a channel tagged for a higher tier (`SPEC-CONVERSATION-SECURITY.md` Layer 1).
+The Cognito **group also selects the user's IAM role**, not just the application-layer tier. `cognito-auth-stack.ts` defines one authenticated IAM role per tier, attaches each to its group via `roleArn`, and the Identity Pool uses **Token-based role mapping** (`roleMappings … type: 'Token'`, keyed on the `cognito:preferred_role` claim Cognito derives from the group `roleArn`s). Each tier's role carries a pure-IAM **Deny** keyed on the GLOBAL `aws:ResourceTag/classification` (not `chime:ResourceTag`, which the Amazon Chime SDK does not surface as a condition key and would silently never match) so a tier-X user's credentials physically cannot send/join/read a channel tagged for a higher tier (`SPEC-CONVERSATION-SECURITY.md` Layer 1).
 
 **What this means when you swap the IdP:**
 
@@ -464,7 +464,7 @@ Use this approach when your IdP doesn't support OIDC or SAML (e.g., LDAP, custom
           4. Returns temporary AWS credentials
           │
           ▼
-  Frontend uses credentials to initialize Chime SDK
+  Frontend uses credentials to initialize Amazon Chime SDK
 ```
 
 ### Step 1: Create the Credential Exchange Lambda
@@ -516,7 +516,7 @@ async function validateToken(token: string): Promise<UserInfo> {
 
 /**
  * STEP 2: Assume an IAM role scoped to this user.
- * The role must have Chime SDK messaging permissions.
+ * The role must have Amazon Chime SDK messaging permissions.
  */
 async function assumeRole(user: UserInfo) {
   const command = new AssumeRoleCommand({
@@ -534,7 +534,7 @@ async function assumeRole(user: UserInfo) {
 }
 
 /**
- * STEP 3: Ensure Chime AppInstanceUser exists (idempotent).
+ * STEP 3: Ensure Amazon Chime SDK AppInstanceUser exists (idempotent).
  */
 async function ensureChimeUser(user: UserInfo): Promise<string> {
   const userArn = `${APP_INSTANCE_ARN}/user/${user.uuid}`;
@@ -571,7 +571,7 @@ export async function handler(event: any) {
     // 2. Assume role for this user
     const credentials = await assumeRole(user);
 
-    // 3. Ensure Chime user exists
+    // 3. Ensure Amazon Chime SDK user exists
     const userArn = await ensureChimeUser(user);
 
     // 4. Return credentials to frontend
@@ -705,15 +705,15 @@ useEffect(() => {
 
 ## Common Pitfalls
 
-**AppInstanceUserId must be stable and unique.** The Chime `AppInstanceUserId` you create must be the same every time a given user logs in. Use your IdP's stable user identifier (e.g., `sub` claim in OIDC, `NameID` in SAML, UUID in your system). Do not use email addresses - they can change.
+**AppInstanceUserId must be stable and unique.** The Amazon Chime SDK `AppInstanceUserId` you create must be the same every time a given user logs in. Use your IdP's stable user identifier (e.g., `sub` claim in OIDC, `NameID` in SAML, UUID in your system). Do not use email addresses - they can change.
 
 **Token must reach the credential provider.** In Approach 1, the Identity Pool login key must exactly match the provider name registered in the Identity Pool. A mismatch silently returns unauthenticated credentials (or fails with `NotAuthorizedException`).
 
-**Tier mapping must happen before Chime initialization.** The user's tier determines which IAM policies apply. If your IdP doesn't have a `tier` claim, you need to resolve the tier (from a lookup table, IdP group, or default) before the frontend calls `chimeService.initialize()`.
+**Tier mapping must happen before Amazon Chime SDK initialization.** The user's tier determines which IAM policies apply. If your IdP doesn't have a `tier` claim, you need to resolve the tier (from a lookup table, IdP group, or default) before the frontend calls `chimeService.initialize()`.
 
 **Credential refresh timing matters.** STS credentials and IdP tokens expire independently. Refresh credentials at 50 minutes (before the 60-minute default expiry) to avoid interrupted sessions. The existing `AuthProvider.tsx` refresh interval pattern works for both approaches.
 
-**Chime user creation is idempotent.** `CreateAppInstanceUser` returns a `ConflictException` if the user already exists. Always catch this - it means the user was already created (by a previous login or the post-confirmation trigger) and is safe to proceed.
+**Amazon Chime SDK user creation is idempotent.** `CreateAppInstanceUser` returns a `ConflictException` if the user already exists. Always catch this - it means the user was already created (by a previous login or the post-confirmation trigger) and is safe to proceed.
 
 ---
 
@@ -723,5 +723,5 @@ useEffect(() => {
 - [Amazon Cognito Identity Pools Developer Guide](https://docs.aws.amazon.com/cognito/latest/developerguide/cognito-identity.html)
 - [Amazon Cognito Identity Pools - External Identity Providers](https://docs.aws.amazon.com/cognito/latest/developerguide/external-identity-providers.html)
 - [AWS STS AssumeRole](https://docs.aws.amazon.com/STS/latest/APIReference/API_AssumeRole.html)
-- [Chime SDK CreateAppInstanceUser](https://docs.aws.amazon.com/chime-sdk/latest/APIReference/API_identity-chime_CreateAppInstanceUser.html)
+- [Amazon Chime SDK CreateAppInstanceUser](https://docs.aws.amazon.com/chime-sdk/latest/APIReference/API_identity-chime_CreateAppInstanceUser.html)
 - [Original AWS Blog Post (2021)](https://aws.amazon.com/blogs/business-productivity/integrate-your-identity-provider-with-amazon-chime-sdk-messaging/) - covers the same concepts but uses older SDK namespaces

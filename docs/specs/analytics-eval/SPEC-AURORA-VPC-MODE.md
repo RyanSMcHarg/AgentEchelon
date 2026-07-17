@@ -50,7 +50,7 @@ Aurora mode is an **optional deployment mode** selectable via CDK context. When 
 ### Current Default Mode (Athena)
 
 ```
-Chime SDK → Kinesis Data Stream → Firehose → S3 → Glue Catalog → Athena
+Amazon Chime SDK → Kinesis Data Stream → Firehose → S3 → Glue Catalog → Athena
                                                         ↓
                                               AnalyticsQueryLambda (non-VPC)
                                                         ↓
@@ -68,7 +68,7 @@ Chime SDK → Kinesis Data Stream → Firehose → S3 → Glue Catalog → Athen
 ### Aurora Mode (Opt-In)
 
 ```
-Chime SDK → Kinesis Data Stream → ArchivalLambda (VPC) → Aurora PostgreSQL Serverless v2
+Amazon Chime SDK → Kinesis Data Stream → ArchivalLambda (VPC) → Aurora PostgreSQL Serverless v2
                                            ↓                      ↑
                                     (via RDS Proxy)       (via RDS Proxy, IAM auth)
                                                                   ↑
@@ -275,11 +275,11 @@ Rewritten version of `AgentEchelon/backend/lambda/src/archival/*` that writes to
 
 **Responsibilities:**
 - Consume Kinesis records
-- Parse Chime SDK events (CREATE_CHANNEL_MESSAGE, UPDATE_CHANNEL_MESSAGE)
+- Parse Amazon Chime SDK events (CREATE_CHANNEL_MESSAGE, UPDATE_CHANNEL_MESSAGE)
 - Insert into `messages` table
 - In-batch exchange pairing: match user messages with bot responses
 - DB-side exchange pairing: LEFT JOIN for messages that arrived in different Kinesis batches
-- Extract metadata (intent, task_id, delivery_option) from Chime message metadata
+- Extract metadata (intent, task_id, delivery_option) from Amazon Chime SDK message metadata
 - Update conversation stats via trigger
 
 ### 7. Evaluation Runner Lambda

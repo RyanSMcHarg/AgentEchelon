@@ -38,7 +38,7 @@ Placeholders used below - resolve each **once** and reuse:
 |---|---|---|
 | `<REGION>` | Deploy region | `frontend/.env` → `VITE_AWS_REGION` (default `us-east-1`) |
 | `<USER_POOL_ID>` | Cognito user pool | CDK output `AgentEchelonCognitoAuth.UserPoolId` / `.env` `VITE_USER_POOL_ID` |
-| `<APP_INSTANCE_ARN>` | Chime app instance | CDK output `AgentEchelonChimeMessaging.AppInstanceArn` / `.env` `VITE_APP_INSTANCE_ARN` |
+| `<APP_INSTANCE_ARN>` | Amazon Chime SDK app instance | CDK output `AgentEchelonChimeMessaging.AppInstanceArn` / `.env` `VITE_APP_INSTANCE_ARN` |
 | `<DEMO_EMAIL>` | A seeded test identity | Whatever `backend/scripts/seed-demo.ts` created in *your* pool (reference seed uses `*@stratum.example.com`) |
 | `<STACK>` | A CDK stack | `AgentEchelonTier-Premium`, `AgentEchelonChannelFlow`, `AgentEchelonCognitoAuth`, … |
 | `<LOGICAL_ID>` | A construct's CFN logical id | Stable across accounts for the same CDK code (e.g. `AsyncProcessor`, `ChannelFlowProcessor`, `ExperimentsTable`, `ChannelBattleConfigTable`) |
@@ -145,7 +145,7 @@ it, so single-turn shows no final answer on that side. By design.
 | EOL fallback model | §8 |
 | Cross-region inference profile: IAM only granted the deploy-region foundation-model ARN (alt-slot `AccessDenied` on `us-east-2`) | §11 |
 | Default bot ran the intent-default model, not the experiment's configured **control** variant (battle wasn't the configured A/B) | §1 resolution below |
-| Variant `displayName` resolved server-side but never surfaced to the frontend (scorecard/chip showed the bot's Chime name) | §1 resolution below |
+| Variant `displayName` resolved server-side but never surfaced to the frontend (scorecard/chip showed the bot's Amazon Chime SDK name) | §1 resolution below |
 
 §c - *Battle Mode panel never renders*: `ChannelMembersPanel` must read the
 caller ARN from `useAwsClient().userArn` (the canonical chimeService ARN), and
@@ -186,7 +186,7 @@ the same frame:
 3. **Variant `displayName` never reached the frontend.**
    `prepareBattleInvocation` resolves `selfDisplayName` ("Atlas"/"Echo")
    but it was only logged. No marker field carried it, so the scorecard
-   header + variant chip fell back to the bot's generic Chime
+   header + variant chip fell back to the bot's generic Amazon Chime SDK
    AppInstanceUser name ("Assistant"/"AltSlot0"). Fix: the
    `<!--battlestats:-->` marker now carries `name=<uri-encoded
    displayName>`; `messageParser.ts` parses it into `battle.label`;
@@ -267,7 +267,7 @@ USERNAME=$(aws cognito-idp admin-get-user --user-pool-id <USER_POOL_ID> \
 aws chime-sdk-identity describe-app-instance-user \
   --app-instance-user-arn "<APP_INSTANCE_ARN>/user/$USERNAME"
 ```
-`NotFoundException` ⇒ the user was never registered as a Chime
+`NotFoundException` ⇒ the user was never registered as an Amazon Chime SDK
 AppInstanceUser. (Note: an email-alias pool's canonical `Username` is a UUID,
 not the email - always resolve it as above.)
 
@@ -326,7 +326,7 @@ read the channel `modelTier`. The role granted
 rejected every battle.
 
 **Solution** - add `chime:DescribeChannel` to that role statement (same
-`<APP_INSTANCE_ARN>/*` scope as the other Chime actions). File:
+`<APP_INSTANCE_ARN>/*` scope as the other Amazon Chime SDK actions). File:
 `backend/lib/stacks/channel-flow-stack.ts`; redeploy `AgentEchelonChannelFlow`.
 
 **Prevention** - when a Lambda's code adds a new AWS call, audit its CDK role
@@ -556,7 +556,7 @@ Bedrock-console model-access check in "CDK / deploy notes" must pass.
 
 ---
 
-## 13. Chime BadRequestException: Channel Messages size limit exceeded (long answers)
+## 13. Amazon Chime SDK BadRequestException: Channel Messages size limit exceeded (long answers)
 
 ### Symptom
 
@@ -569,7 +569,7 @@ Most visible on `/battle` (Opus/Sonnet answers are long).
 
 ### Root Cause
 
-Chime SDK Messaging caps the REQUEST PARAMETER length: Content max 4096,
+Amazon Chime SDK Messaging caps the REQUEST PARAMETER length: Content max 4096,
 Metadata max 1024 - measured on the URL-encoded string actually sent
 (`encodeURIComponent(...)`), not the raw character count. Markdown/prose
 roughly doubles (worst case triples) when encoded. The long-response
@@ -586,7 +586,7 @@ natural-boundary backoff), chunk[0] gets a smaller budget reserving
 marker headroom (`CHUNK0_MARKER_HEADROOM`), and `safeMetadataString`
 drops an oversized Metadata with a warning rather than fabricating it or
 failing the post (the battle scorecard/name ride the Content marker, not
-Chime Metadata; analytics also flows via the archival pipeline). Pinned
+Amazon Chime SDK Metadata; analytics also flows via the archival pipeline). Pinned
 by tests in `backend/test/lib/async-processor-battle.test.ts`.
 `async-processor-core.ts` is bundled into every tier's async processor, so
 redeploy the affected `AgentEchelonTier-*` stack(s).
@@ -611,7 +611,7 @@ without errors - but every Athena query returns zero rows.
 ### Diagnosis Steps
 
 ```bash
-# 1. Are Chime events arriving at Kinesis at all?
+# 1. Are Amazon Chime SDK events arriving at Kinesis at all?
 aws cloudwatch get-metric-statistics \
   --namespace AWS/Kinesis --metric-name IncomingRecords \
   --dimensions Name=StreamName,Value=chime-messaging-agent-echelon \
@@ -619,7 +619,7 @@ aws cloudwatch get-metric-statistics \
   --end-time "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
   --period 3600 --statistics Sum
 
-# 2. If Sum is 0, the Chime → Kinesis wiring is broken. Verify it.
+# 2. If Sum is 0, the Amazon Chime SDK → Kinesis wiring is broken. Verify it.
 APP_INSTANCE_ARN="$(aws cloudformation describe-stacks \
   --stack-name AgentEchelonChimeMessaging \
   --query 'Stacks[0].Outputs[?OutputKey==`AppInstanceArnOutput`].OutputValue' \
@@ -630,8 +630,8 @@ aws chime-sdk-messaging get-messaging-streaming-configurations \
 
 ### Root Cause
 
-The Chime → Kinesis streaming configuration is missing, points at the
-wrong stream, or the Chime AppInstance was rotated and the wiring lost.
+The Amazon Chime SDK → Kinesis streaming configuration is missing, points at the
+wrong stream, or the Amazon Chime SDK AppInstance was rotated and the wiring lost.
 `AnalyticsStack` re-applies this on every deploy via an
 `AwsCustomResource`, so it normally heals itself - but a partial deploy,
 manual `delete-messaging-streaming-configurations` call, or account-level
@@ -663,7 +663,7 @@ recipient must also be verified.
 
 ---
 
-## 15. Bot replies with `{"Code":403}` to every message (Chime can't invoke Lex)
+## 15. Bot replies with `{"Code":403}` to every message (Amazon Chime SDK can't invoke Lex)
 
 ### Symptom
 
@@ -704,7 +704,7 @@ Amazon Chime SDK Messaging invokes an AppInstanceBot's configured Lex bot via
 the **bot-alias ARN**, and is denied unless a Lex **resource policy** grants
 `messaging.chime.amazonaws.com` permission to call it. **BOTH** the Lex bot
 **and** the bot-alias need the policy (the alias one is the one most often
-missed - Chime invokes the *alias*). The condition must use `ArnLike` (not
+missed - Amazon Chime SDK invokes the *alias*). The condition must use `ArnLike` (not
 `ArnEquals`) so the `app-instance/<id>/bot/*` source wildcard matches.
 
 Newly-created Lex bots do not get these policies unless the creation code adds
@@ -817,8 +817,8 @@ node backend/scripts/backfill-channel-flow.mjs
 ### Symptom
 
 After enabling live drift / RAG (`-c enableLiveDrift=true`) in Aurora mode, every tier conversation returns the
-literal text `{"Code":429}` with a very long TTFR (~43s, near the handler's 30s timeout plus Chime retries). The
-tier AgentHandler log group shows ZERO events for the turn, so it looks like an upstream Lex/Chime throttle. It
+literal text `{"Code":429}` with a very long TTFR (~43s, near the handler's 30s timeout plus Amazon Chime SDK retries). The
+tier AgentHandler log group shows ZERO events for the turn, so it looks like an upstream Lex/Amazon Chime SDK throttle. It
 is not.
 
 ### Diagnosis
@@ -843,7 +843,7 @@ A VPC-attached, Lex-facing AgentHandler in ISOLATED subnets cannot reach the con
 runtime: SSM (bot ARN / channel-flow ARN parameters), Cognito (`AdminListGroupsForUser` to resolve the caller
 tier), and Lambda (`InvokeFunction` to start the async processor). None of those has a VPC endpoint in the
 analytics VPC, and isolated subnets have no NAT egress. The handler hangs on the first such call, hits its 30s
-timeout, and Chime retries the Lex fulfillment until it posts `{"Code":429}`. The drift / ingestion Lambdas
+timeout, and Amazon Chime SDK retries the Lex fulfillment until it posts `{"Code":429}`. The drift / ingestion Lambdas
 survive from the same subnets because they only need Bedrock + Secrets + Aurora, which DO have endpoints.
 `createVpcEndpoints=true` does NOT fix this: it only creates the same five endpoints (no SSM/Cognito/Lambda).
 

@@ -127,7 +127,7 @@ routing key, not identity content, so it doesn't break "never persist email/name
 
 ### Resolving a task assignee (no `iss` on the task)
 
-A task's `assigneeUserSub` is the assignee's **`fed_` Chime/AppInstanceUser id** (the `user-tasks`
+A task's `assigneeUserSub` is the assignee's **`fed_` Amazon Chime SDK/AppInstanceUser id** (the `user-tasks`
 partition key), produced by `deriveFederatedSub(iss, sub)` - a one-way hash, so the raw `(sub, iss)`
 can't be recovered from it. We deliberately do **not** copy `iss` onto the task (that would be a
 second, drift-prone IDP pointer). Instead, to email an assignee, the notifier **reverse-matches** the

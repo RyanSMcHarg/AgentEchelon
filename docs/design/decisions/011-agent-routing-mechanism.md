@@ -30,12 +30,12 @@ should cite financials) because nothing invokes the tier-scoped retrieval.
 Today's path (full diagram in [Appendix C](#appendix-c--flow-diagrams)):
 
 ```
-Chime → Lex (FallbackIntent) → router-agent-handler
+Amazon Chime SDK → Lex (FallbackIntent) → router-agent-handler
         (classify intent → delivery option + task tracking + per-intent model)
       → tier async-processor → invokeBedrock = Converse(chosen model)   ← no tools
 ```
 
-**Fixed premise - Chime SDK Messaging.** This ADR takes Chime SDK Messaging as
+**Fixed premise - Amazon Chime SDK Messaging.** This ADR takes Amazon Chime SDK Messaging as
 fixed: it is AE's message transport *and* conversation store. AE's app-instance bot
 participates as a channel member and replies **asynchronously** by editing a
 placeholder message - there is no synchronous user request/response. That is
@@ -185,7 +185,7 @@ memory for you.**
 
 | | `bedrock-runtime:Converse` | `bedrock-agent-runtime:InvokeAgent` |
 |---|---|---|
-| **What you pass** | System prompt + a bounded recent-history window + inference config, each call. `loadChannelHistory` (`async-processor-core.ts`) fetches the last 20 Chime messages and caps to ~5 turns (`slice(-10)`) - not the full channel | `agentId` + `aliasId` + the user's input text + a `sessionId` |
+| **What you pass** | System prompt + a bounded recent-history window + inference config, each call. `loadChannelHistory` (`async-processor-core.ts`) fetches the last 20 Amazon Chime SDK messages and caps to ~5 turns (`slice(-10)`) - not the full channel | `agentId` + `aliasId` + the user's input text + a `sessionId` |
 | **Where orchestration lives** | In *our* Lambda: we assemble the prompt and run any tool loop (see [Appendix F](#appendix-f--efficiency--cost-levers) for how to do this efficiently) | In the *agent* (server-side): instruction, tools, and the decide→call→observe loop are configured on the agent |
 | **Tools / action groups** | Run **if** we pass `toolConfig` and run the loop ourselves in the `async-processor` Lambda (server-side). They don't run today only because `toolConfig` isn't wired - this is Option D | Run automatically; the agent calls `load_company_context`, reads the result, answers |
 | **Guardrails** | Applied if we call `ApplyGuardrail` (out-of-band) | Attached to the agent → always enforced |
@@ -260,7 +260,7 @@ only if AE decides to cede orchestration.
 
 ### Flow A - today (direct Converse). Orchestration intact; tools never fire.
 ```
-user ─► Chime ─► channel-flow ─► Lex (FallbackIntent)
+user ─► Amazon Chime SDK ─► channel-flow ─► Lex (FallbackIntent)
                                       │
   router-agent-handler  ── ORCHESTRATION ROUTER ──────────────┐
     classifyIntent (Haiku: std/prem) | keyword (basic)        │
@@ -401,7 +401,7 @@ dispatches to the `min(userTier, channelTier)` tier processor, which invokes
 
 ### State & memory
 Two concerns, deliberately separated. **Conversation history** is a derived
-cache: we re-load a bounded window from **Chime (the fixed store)** each turn,
+cache: we re-load a bounded window from **Amazon Chime SDK (the fixed store)** each turn,
 so the terminal model call is stateless and nothing is lost if no warm cache
 exists. **Application state** (active task IDs, routing / decline flags) lives
 in **DynamoDB** (`AgentTasks` / `UserTasks`), never in a model session. A
@@ -473,7 +473,7 @@ whole docs. Use **tool-use retrieval** (fetch only when the model asks),
 ## Open questions
 
 1. **History window vs. agent session memory** - moot under Option D: we keep
-   our explicit recent-history window (Chime is the durable source of truth);
+   our explicit recent-history window (Amazon Chime SDK is the durable source of truth);
    no agent session to reconcile.
 2. **Tool-loop resilience** - wrap the Converse tool loop in the existing
    retry/circuit-breaker; on tool-Lambda failure, answer without the tool

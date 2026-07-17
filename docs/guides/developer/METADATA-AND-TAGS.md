@@ -1,6 +1,6 @@
 # Metadata and Tags: What Goes Where
 
-This guide is the rule for storing data on Chime channels and users, and for using
+This guide is the rule for storing data on Amazon Chime SDK channels and users, and for using
 resource tags. It exists because the wrong choice leaks information to other users or
 silently weakens the tier boundary. Read it before you add a field to a channel, a user,
 or a tag.
@@ -19,7 +19,7 @@ The channel-metadata relocation design (`SPEC-CHANNEL-METADATA-MINIMIZATION`) is
 
 ## 1. Channel metadata is readable by every member
 
-Chime channel `Metadata` is a single JSON blob returned by `DescribeChannel`, and
+Amazon Chime SDK channel `Metadata` is a single JSON blob returned by `DescribeChannel`, and
 `DescribeChannel` is part of the default `view` capability every channel member holds.
 **Anything you write into channel metadata is disclosed to every member of that channel** -
 including members added later by a share, and federated guests. In a 1:1 channel that is

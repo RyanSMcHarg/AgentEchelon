@@ -4,7 +4,7 @@
 
 ## Context
 
-Chime caps a message's `Metadata` at 1024 **encoded** characters. That one field is the single source of truth for two independent consumers: the frontend (reads model/intent/feedback + the experiment join keys off each message) and the Aurora archival pipeline (`backend/lambda/src/analytics-aurora/kinesis-archival.ts` reads the same `Metadata` off the Kinesis record). There is no separate analytics emission (verified: no `PutRecord`/Firehose in `async-processor-core.ts`).
+Amazon Chime SDK caps a message's `Metadata` at 1024 **encoded** characters. That one field is the single source of truth for two independent consumers: the frontend (reads model/intent/feedback + the experiment join keys off each message) and the Aurora archival pipeline (`backend/lambda/src/analytics-aurora/kinesis-archival.ts` reads the same `Metadata` off the Kinesis record). There is no separate analytics emission (verified: no `PutRecord`/Firehose in `async-processor-core.ts`).
 
 So when a heavy turn overflows the cap, `safeMetadataString` drops the whole blob and BOTH consumers silently lose everything - analytics and the experiment thumbs-join included. Measured: a premium experiment turn + config identity sits at 1022/1024; add an active task → 1195 (dropped); add an attachment → ~1647. The inefficiency is storing long human-readable strings for values drawn from small, known sets (`assignmentMode`, `intent`, `bedrockModel`, `deliveryOption`, …).
 
@@ -13,7 +13,7 @@ So when a heavy turn overflows the cap, `safeMetadataString` drops the whole blo
 Adopt two complementary techniques, governed by an append-only codebook contract:
 
 1. **Code the bounded state fields.** Any field whose domain is a finite, known set is emitted as an integer index into a versioned **codebook**; only genuinely open values (UUIDs, token counts, hashes, ARNs, S3 keys) stay literal.
-2. **Move heavy analytics out of band, keyed by the existing `MessageId`.** The bulky analytics-only fields (tokens, latencies, config-identity fingerprint, intent confidence, free-form fallback message, **and per-step telemetry `steps[]`**) have exactly one consumer (archival) and leave the messaging metadata entirely; archival joins them by the message id that already exists on both sides. No new id is minted. The no-cap store is also what makes `steps[]` persistable at all - one record per Converse iteration of the self-hosted tool loop, which never fit the 1024 Chime Metadata budget (the original "steps[] is a Phase-2 concern" deferral).
+2. **Move heavy analytics out of band, keyed by the existing `MessageId`.** The bulky analytics-only fields (tokens, latencies, config-identity fingerprint, intent confidence, free-form fallback message, **and per-step telemetry `steps[]`**) have exactly one consumer (archival) and leave the messaging metadata entirely; archival joins them by the message id that already exists on both sides. No new id is minted. The no-cap store is also what makes `steps[]` persistable at all - one record per Converse iteration of the self-hosted tool loop, which never fit the 1024 Amazon Chime SDK Metadata budget (the original "steps[] is a Phase-2 concern" deferral).
 
 Contract rules:
 

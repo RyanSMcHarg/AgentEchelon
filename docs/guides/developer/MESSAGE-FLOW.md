@@ -4,12 +4,12 @@
 > moment a user sends it to the moment an assistant reply lands back in the
 > channel - through the **channel flow**, **Lex**, the **fulfillment handler**,
 > and the **async processor** - and says *why* each hop exists and *where each
-> enforcement layer sits*. For how the reply is *sized/chunked* onto Chime, see
+> enforcement layer sits*. For how the reply is *sized/chunked* onto Amazon Chime SDK, see
 > [`MESSAGE-DELIVERY-GUIDE.md`](MESSAGE-DELIVERY-GUIDE.md); for the security
 > layers named here, see [`IDENTITY-AND-ACCESS-MODEL.md`](../../specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md)
 > §6b; for the model-selection detail, [`SPEC-CONTEXT-AWARE-MODEL-ROUTING.md`](../../design/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md).
 
-AgentEchelon is a **multiparty** substrate: humans and assistants share Chime SDK
+AgentEchelon is a **multiparty** substrate: humans and assistants share Amazon Chime SDK
 channels. The flow below is what lets a channel be a plain human-to-human room, a
 1:1 human↔assistant chat, or a mixed room where the assistant answers only when
 addressed - all with the same primitives, differing only in **bot configuration**
@@ -24,9 +24,9 @@ An assistant is not a special channel feature - it is an `AppInstanceBot` that i
 
 | Layer | What it is | Why it exists |
 |---|---|---|
-| **1. Lex bot** | A Lex V2 bot with two intents - `WelcomeIntent` (fires when the bot joins) and `FallbackIntent` (the catch-all that carries every real user turn) - both with a **fulfillment code hook** pointing at the tier's handler Lambda | Lex is the **entry trigger + session**. AgentEchelon does *not* use Lex for NLU beyond "something was said"; the real request classification happens downstream (see §4). Lex gives us the managed Chime→Lambda bridge and per-turn session. |
-| **2. Chime `AppInstanceBot` `InvokedBy`** | `StandardMessages: AUTO \| NONE` and `TargetedMessages: ALL` on the bot | This is the **routing policy** - it decides which messages Chime forwards to Lex (see §3). It is the single switch between "answer everything in this room" and "answer only when addressed." |
-| **3. Channel membership** | The bot is added to the channel (`CreateChannelMembership`) as the tier-matched bot | A bot only receives messages for channels it belongs to. **Order matters:** the `InvokedBy` config must be set *before* the bot joins, or Chime may not route standard messages for that channel until the membership is re-created. |
+| **1. Lex bot** | A Lex V2 bot with two intents - `WelcomeIntent` (fires when the bot joins) and `FallbackIntent` (the catch-all that carries every real user turn) - both with a **fulfillment code hook** pointing at the tier's handler Lambda | Lex is the **entry trigger + session**. AgentEchelon does *not* use Lex for NLU beyond "something was said"; the real request classification happens downstream (see §4). Lex gives us the managed Amazon Chime SDK→Lambda bridge and per-turn session. |
+| **2. Amazon Chime SDK `AppInstanceBot` `InvokedBy`** | `StandardMessages: AUTO \| NONE` and `TargetedMessages: ALL` on the bot | This is the **routing policy** - it decides which messages Amazon Chime SDK forwards to Lex (see §3). It is the single switch between "answer everything in this room" and "answer only when addressed." |
+| **3. Channel membership** | The bot is added to the channel (`CreateChannelMembership`) as the tier-matched bot | A bot only receives messages for channels it belongs to. **Order matters:** the `InvokedBy` config must be set *before* the bot joins, or Amazon Chime SDK may not route standard messages for that channel until the membership is re-created. |
 
 **Per-tier bots.** AgentEchelon runs one bot per tier (Basic/Standard/Premium),
 each with its own Lex bot, model, guardrail, and `context/{tier}/` scope. Channel
@@ -37,14 +37,14 @@ creation binds the **tier-matched** bot to the channel (`create-conversation`), 
 
 ## 2. The two parallel paths: Channel Flow and Lex
 
-When a message is sent, Chime hands it to **two independent consumers at once**:
+When a message is sent, Amazon Chime SDK hands it to **two independent consumers at once**:
 
 ```
         User sends a message
                 │
                 ▼
     ┌───────────────────────┐
-    │   Chime SDK Channel     │  (message persisted, tagged classification)
+    │   Amazon Chime SDK Channel     │  (message persisted, tagged classification)
     └───────────┬────────────┘
                 │  fan-out (parallel, non-blocking)
         ┌───────┴─────────────────────────┐
@@ -62,7 +62,7 @@ When a message is sent, Chime hands it to **two independent consumers at once**:
 **Why two paths?** They do different jobs:
 
 - **Channel Flow Processor** (`channel-flow-processor.ts`) runs on **every** message
- - human-to-human included - *before* it is delivered. It is Chime's synchronous
+ - human-to-human included - *before* it is delivered. It is Amazon Chime SDK's synchronous
   message interceptor: it **must call `ChannelFlowCallback`** to release each
   message (`callbackAllow`) or hold/deny it (`callbackDeny`). This is the
   conversation-level layer that exists **whether or not an assistant is involved**
@@ -84,9 +84,9 @@ Three cases, decided by `InvokedBy` + how the message is addressed:
 
 | Case | Config | What happens | Why |
 |---|---|---|---|
-| **1:1 human↔assistant** | `StandardMessages: AUTO` | Chime routes **every** message to Lex → fulfillment | In a private assistant chat every turn is for the assistant; no addressing needed. |
-| **Multi-user, `@assistant`** | `TargetedMessages: ALL` + the frontend stamps `CHIME.mentions` with the bot ARN on `@assistant` | Chime routes only the **addressed** message to Lex → a **targeted** reply back to the sender | In a shared room the assistant must stay silent unless spoken to. `@assistant` is a real Chime mention, so **AUTO + native routing** handles it - no processor code. |
-| **Multi-user, `@all`** | processor-side bypass | Channel Flow **detects `@all`**, releases the original message to everyone, strips `@all`, and **invokes the async processor DIRECTLY - bypassing Lex** - then broadcasts the reply | `@all` is *not* a Chime `CHIME.mentions` value, so AUTO/Lex would not route it. The processor invokes the assistant itself and broadcasts. This is the **only** processor-side routing bypass. |
+| **1:1 human↔assistant** | `StandardMessages: AUTO` | Amazon Chime SDK routes **every** message to Lex → fulfillment | In a private assistant chat every turn is for the assistant; no addressing needed. |
+| **Multi-user, `@assistant`** | `TargetedMessages: ALL` + the frontend stamps `CHIME.mentions` with the bot ARN on `@assistant` | Amazon Chime SDK routes only the **addressed** message to Lex → a **targeted** reply back to the sender | In a shared room the assistant must stay silent unless spoken to. `@assistant` is a real Amazon Chime SDK mention, so **AUTO + native routing** handles it - no processor code. |
+| **Multi-user, `@all`** | processor-side bypass | Channel Flow **detects `@all`**, releases the original message to everyone, strips `@all`, and **invokes the async processor DIRECTLY - bypassing Lex** - then broadcasts the reply | `@all` is *not* an Amazon Chime SDK `CHIME.mentions` value, so AUTO/Lex would not route it. The processor invokes the assistant itself and broadcasts. This is the **only** processor-side routing bypass. |
 | **Multi-user, no mention** | - | The message is released to members; **no assistant turn** | Silence by default in shared rooms - the assistant does not answer un-addressed chatter. |
 
 So the `@all` path and the Lex path both end at the **same per-tier async
@@ -142,7 +142,7 @@ The **async processor** (`{tier}-async-processor.ts` → `async-processor-core.t
 is where the model actually runs: it builds the Converse messages, runs the
 **self-hosted tool loop** (reason → `load_company_context` → observe → answer),
 applies the **guardrails**, and sends the reply via `handleLongResponse`
-(chunked to the Chime size caps - see MESSAGE-DELIVERY-GUIDE).
+(chunked to the Amazon Chime SDK size caps - see MESSAGE-DELIVERY-GUIDE).
 
 ---
 
@@ -191,7 +191,7 @@ tokens × cost × outcome) is what makes A/B tests, per-tier cost, and quality
 
 **Two rules keep the measurement trustworthy:**
 - **Decoupled from delivery.** The heavy analytics (tokens, latencies, per-step
-  cost, config fingerprint, experiment join) do **not** ride the size-capped Chime
+  cost, config fingerprint, experiment join) do **not** ride the size-capped Amazon Chime SDK
   `Metadata`. The processor writes the full blob to `MESSAGE_ANALYTICS_TABLE`
   keyed by message id; only the small fields the surface renders
   (`pickFrontendMetadata`) go on the message. So an over-budget reply never drops
@@ -216,11 +216,11 @@ authoritative event record plus purpose-built read models, joined by a transport
 
 | Store | What it holds | Its role | Why it is separate |
 |---|---|---|---|
-| **Chime SDK channel** | the live message and current membership | the operational messaging plane: delivery, ordering, membership enforcement | real-time, but Chime has no cross-channel history API and no single identity sees every channel, so it cannot answer "show me any conversation's full history" |
+| **Amazon Chime SDK channel** | the live message and current membership | the operational messaging plane: delivery, ordering, membership enforcement | real-time, but Amazon Chime SDK has no cross-channel history API and no single identity sees every channel, so it cannot answer "show me any conversation's full history" |
 | **Kinesis stream** | every channel event, in flight | transport and fan-out to independent consumers | decouples the producer from consumers so the archive, the membership audit, and analytics each read the same stream without coupling to each other (at-least-once) |
 | **Conversation event archive** (append-only log; by default S3 + Glue read via Athena) | the raw event stream: messages (create/update/redact/delete), membership, moderator, and channel events | the **system of record** for history and the audit trail; the retention and erasure-to-archive endpoint | durable, cheap, complete, and immutable, so it is the one faithful history the admin console reads for cross-conversation review and that Legal and HR audit |
 | **Aurora Postgres** (Aurora analytics mode) | derived tables: messages and exchanges, evaluations, conversation summaries, cross-conversation context, drift and embeddings, per-turn steps, current membership, client events | the analytics and **live-context** read model | relational joins and pgvector search that S3 and Athena cannot do interactively; it powers the dashboards and the context the assistant is actually given (summary, cross-conversation retrieval, drift) |
-| **Per-message analytics** (`MESSAGE_ANALYTICS_TABLE`, DynamoDB, TTL) | the full per-turn analytics blob keyed by message id | measurement decoupled from delivery | it cannot ride the size-capped Chime metadata (§6.2), and a fast point write means an over-budget reply never drops its analytics or experiment join |
+| **Per-message analytics** (`MESSAGE_ANALYTICS_TABLE`, DynamoDB, TTL) | the full per-turn analytics blob keyed by message id | measurement decoupled from delivery | it cannot ride the size-capped Amazon Chime SDK metadata (§6.2), and a fast point write means an over-budget reply never drops its analytics or experiment join |
 | **Operational stores** (DynamoDB: user feedback, battle outcomes, membership-audit findings and enforce toggle) | per-feature current state | fast key-value state for one feature | point read and write of "what is true now", which is neither history nor analytics |
 
 **The organizing rule.** The event archive is authoritative and immutable; every
@@ -256,7 +256,7 @@ The `InvokedBy` switch is what makes one substrate serve many use cases. Example
 |---|---|---|
 | Private AI assistant (1:1) | `AUTO` | Assistant answers every turn |
 | Shared team room | `AUTO` + `@assistant` mentions | Assistant answers only when addressed; humans talk freely |
-| Announcement / comment thread (read-mostly) | `NONE` | Assistant stays silent unless a user explicitly `@mentions` it (Chime `TargetedMessages: ALL` still routes a mention) |
+| Announcement / comment thread (read-mostly) | `NONE` | Assistant stays silent unless a user explicitly `@mentions` it (Amazon Chime SDK `TargetedMessages: ALL` still routes a mention) |
 
 Nothing else in the flow changes - the channel flow, fulfillment, async processor,
 and enforcement layers are identical.
@@ -277,7 +277,7 @@ and enforcement layers are identical.
 
 ## 9. Related
 
-- [`MESSAGE-DELIVERY-GUIDE.md`](MESSAGE-DELIVERY-GUIDE.md) - sizing/chunking the reply onto Chime.
+- [`MESSAGE-DELIVERY-GUIDE.md`](MESSAGE-DELIVERY-GUIDE.md) - sizing/chunking the reply onto Amazon Chime SDK.
 - [`SPEC-INTERACTION-LAYER.md`](../../specs/conversation-messaging/SPEC-INTERACTION-LAYER.md) - the interaction-layer feature set this flow powers.
 - [`SPEC-PER-TIER-OWNERSHIP.md`](../../specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md) - per-tier bots/processors.
 - [`IDENTITY-AND-ACCESS-MODEL.md`](../../specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md) §6b - the enforcement layers referenced in §6.
