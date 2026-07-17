@@ -10,6 +10,7 @@ import StepsTab from './StepsTab';
 import FlaggedResponsesTab from './FlaggedResponsesTab';
 import GroundTruthTab from './GroundTruthTab';
 import TasksTab from './TasksTab';
+import EffectivenessTab from './EffectivenessTab';
 import ConversationsTab from './ConversationsTab';
 import LatencyTab from './LatencyTab';
 import UserManagementTab from './UserManagementTab';
@@ -21,7 +22,7 @@ import type { AnalyticsDateRange, AnalyticsResult, QueryType } from '../../types
 import './AdminDashboard.css';
 import MembershipAuditTab from './MembershipAuditTab';
 
-type TabId = 'overview' | 'models' | 'strategy' | 'steps' | 'experiments' | 'evaluations' | 'latency' | 'flows' | 'flagged' | 'ground_truth' | 'tasks' | 'conversations' | 'users' | 'user_management' | 'security';
+type TabId = 'overview' | 'models' | 'strategy' | 'steps' | 'experiments' | 'evaluations' | 'latency' | 'flows' | 'flagged' | 'ground_truth' | 'tasks' | 'effectiveness' | 'conversations' | 'users' | 'user_management' | 'security';
 
 interface AdminDashboardProps {
   onBack: () => void;
@@ -51,7 +52,7 @@ function getDateRange(preset: string): AnalyticsDateRange {
 
 // Tabs available only in Aurora mode (hidden in Athena). Sub-view labels are
 // resolved from i18n at render time via the tab id → admin.tabs.<camelCase> key.
-const AURORA_TAB_IDS: TabId[] = ['flows', 'flagged', 'ground_truth', 'tasks', 'steps'];
+const AURORA_TAB_IDS: TabId[] = ['flows', 'flagged', 'ground_truth', 'tasks', 'steps', 'effectiveness'];
 
 // Two-level navigation: 6 top-level SECTIONS, each grouping one or more
 // sub-views (the per-tab components). activeTab (TabId) remains the source of
@@ -60,7 +61,9 @@ interface AdminSection { id: string; label: string; tabs: TabId[]; }
 const SECTIONS: AdminSection[] = [
   { id: 'overview', label: 'Overview', tabs: ['overview', 'latency'] },
   { id: 'conversations', label: 'Conversations', tabs: ['conversations'] },
-  { id: 'quality', label: 'Quality', tabs: ['evaluations', 'flows', 'flagged', 'ground_truth', 'tasks'] },
+  // Effectiveness is the intent-anchored landing (SPEC-ADMIN-CONSOLE-EFFECTIVENESS); the artifact-type
+  // tabs remain as sub-views for now (the spec's full retire-into-drill-depths is a later, separate step).
+  { id: 'quality', label: 'Effectiveness', tabs: ['effectiveness', 'evaluations', 'flows', 'flagged', 'ground_truth', 'tasks'] },
   { id: 'models', label: 'Models', tabs: ['models', 'strategy', 'steps'] },
   { id: 'experiments', label: 'Experiments', tabs: ['experiments'] },
   { id: 'users', label: 'Users', tabs: ['users', 'user_management'] },
@@ -113,6 +116,7 @@ const QUERIES_BY_TAB: Partial<Record<TabId, QueryType[]>> = {
   flagged: ['flagged_responses'],
   ground_truth: ['ground_truth'],
   tasks: ['task_metrics', 'task_details' as QueryType],
+  effectiveness: ['intent_effectiveness' as QueryType],
   conversations: ['conversation_summaries', 'drift_events'],
   users: [
     'user_activity', // partition-only fallback
@@ -469,6 +473,13 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
           <TasksTab
             metricsData={results.task_metrics ?? null}
             detailData={results.task_details ?? null}
+            isLoading={isLoading}
+          />
+        )}
+        {activeTab === 'effectiveness' && (
+          <EffectivenessTab
+            data={results.intent_effectiveness ?? null}
+            dateRange={getDateRange(datePreset)}
             isLoading={isLoading}
           />
         )}

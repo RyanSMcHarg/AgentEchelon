@@ -371,20 +371,75 @@ async function getTaskDetails(
 ): Promise<APIGatewayProxyResult> {
   const days = parseInt(params.days || '7', 10);
   const limit = Math.min(parseInt(params.limit || '50', 10), 200);
+  // Optional intent filter — this is also the Effectiveness L2 task list (drill from an intent to its
+  // tasks). `$3 IS NULL` keeps the unfiltered Quality>Tasks behavior; set it for the L2 drill.
+  const intent = params.intent || null;
   const result = await query(
     `SELECT task_id,
             COALESCE(MAX(intent), 'unknown') AS type,
             MAX(task_status) AS status,
+            -- Machine state as of the latest turn (SPEC-TASK-STATE-TRANSITIONS §6). Distinct from
+            -- status (the lifecycle): the declared-graph state the task reached. Alphabetical MAX is
+            -- meaningless for states, so take the most-recent turn's value.
+            (ARRAY_AGG(task_state ORDER BY created_at DESC))[1] AS task_state,
             MIN(created_at) AS started_at,
             MAX(created_at) AS last_at,
-            COUNT(*) AS exchange_count
+            COUNT(*) AS exchange_count,
+            -- How many turns actually advanced the machine (a transition was recorded).
+            COUNT(task_transition) AS transition_count
        FROM exchanges
       WHERE task_id IS NOT NULL
         AND created_at >= NOW() - INTERVAL '1 day' * $1
+        AND ($3::varchar IS NULL OR intent = $3)
       GROUP BY task_id
       ORDER BY MAX(created_at) DESC
       LIMIT $2`,
-    [days, limit]
+    [days, limit, intent]
+  );
+  return success({ data: result.rows });
+}
+
+/**
+ * Effectiveness L3 (SPEC-ADMIN-CONSOLE-EFFECTIVENESS §5): the turn-by-turn machine-state timeline for
+ * ONE task. Each row is a turn (exchange) in order, carrying the state it reached (`task_state`) and
+ * the edge it traversed (`task_transition`) — the per-exchange projection of the agent-tasks
+ * `stateHistory`. Latency + `agent_message_id` ride along so the drill can join per-turn score, tokens,
+ * and the tool loop (steps) downstream. Empty (honest) when `taskId` is absent or the task has no turns.
+ */
+async function getTaskTimeline(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const taskId = params.taskId;
+  if (!taskId) return success({ data: [] });
+  const result = await query(
+    `SELECT e.id AS exchange_id,
+            e.agent_message_id,
+            e.intent,
+            e.task_status,
+            e.task_state,
+            e.task_transition,
+            e.response_latency_ms,
+            e.created_at,
+            er.relevance_score,
+            m.total_ms,
+            m.input_tokens,
+            m.output_tokens,
+            m.bedrock_model,
+            -- The turn's tool loop (L4, reached in context): the ConverseStep array carries per-step
+            -- model/tokens/cost + the P2 tools[] outcomes, so a timeline row expands to its steps
+            -- without a second query.
+            COALESCE(m.metadata->'steps', '[]'::jsonb) AS steps
+       FROM exchanges e
+       LEFT JOIN messages m ON e.agent_message_id = m.id
+       LEFT JOIN (
+         SELECT exchange_id, AVG(relevance_score) AS relevance_score
+           FROM evaluation_results
+          WHERE evaluation_type = 'exchange'
+          GROUP BY exchange_id
+       ) er ON er.exchange_id = e.id
+      WHERE e.task_id = $1
+      ORDER BY e.created_at ASC`,
+    [taskId]
   );
   return success({ data: result.rows });
 }
@@ -406,6 +461,9 @@ const POST_DISPATCH: Record<
   ground_truth: { fn: getGroundTruth, dataKey: 'data' },
   task_metrics: { fn: getTaskMetrics, dataKey: 'data' },
   task_details: { fn: getTaskDetails, dataKey: 'data' },
+  task_timeline: { fn: getTaskTimeline, dataKey: 'data' },
+  intent_effectiveness: { fn: getIntentEffectiveness, dataKey: 'data' },
+  intent_exchanges: { fn: getIntentExchanges, dataKey: 'data' },
   cross_conversation_context: { fn: getConversationContext, dataKey: 'contexts' },
   latency_metrics: { fn: getLatencyMetrics, dataKey: 'data' },
   model_effectiveness: { fn: getModelEffectiveness, dataKey: 'data' },
@@ -439,7 +497,7 @@ function buildParamsFromBody(body: Record<string, unknown>): Record<string, stri
     if (Number.isFinite(ms) && ms > 0) p.days = String(Math.max(1, Math.ceil(ms / 86_400_000)));
   }
   for (const k of [
-    'limit', 'offset', 'channelArn', 'userSub', 'experimentId', 'unresolved', 'agentType', 'includeBattle',
+    'limit', 'offset', 'channelArn', 'userSub', 'experimentId', 'unresolved', 'agentType', 'includeBattle', 'taskId', 'intent',
     // Quality-tab write actions (ground_truth submit / flagged review) — #33/#35.
     'action', 'exchangeId', 'score', 'classification', 'reasoning', 'reviewAction', 'notes', 'scorerId',
   ]) {
@@ -1281,6 +1339,202 @@ async function getModelEffectiveness(
       'poor_count',
     ],
   });
+}
+
+/**
+ * Resolve a per-reply USD cost estimate from a row's average token counts + its dominant model
+ * (SPEC-ADMIN-CONSOLE-EFFECTIVENESS L0 "Cost" column, decision D4: derived from tokens × the model
+ * rate, not billing). Exported + pure so it's unit-testable without a database. `null` (never 0) when
+ * the rate table can't price the model — the honesty contract from model-rate-table.ts. pg returns
+ * numeric aggregates as strings, so coerce.
+ */
+export function resolveReplyCostUsd(row: {
+  dominant_model?: string | null;
+  avg_input_tokens?: string | number | null;
+  avg_output_tokens?: string | number | null;
+}): number | null {
+  const modelId = row.dominant_model || undefined;
+  if (!modelId) return null;
+  const toNum = (v: string | number | null | undefined): number | undefined =>
+    v === null || v === undefined ? undefined : Number(v);
+  return estimateStepCostUsd({
+    modelId,
+    tokensIn: toNum(row.avg_input_tokens),
+    tokensOut: toNum(row.avg_output_tokens),
+  });
+}
+
+/**
+ * Effectiveness L0 dashboard (SPEC-ADMIN-CONSOLE-EFFECTIVENESS §5): one row per intent, the two-stage
+ * quality split plus latency, cost, and the tool lens — the "how effective is each capability" question
+ * the artifact-type tabs cannot answer. Columns:
+ *  - Classification: `avg_confidence` (high/medium/low → 100/50/0) + `reroute_rate` (was_rerouted share).
+ *  - Execution: DIRECT → `direct_relevance` (Pass A); Task → `task_completion_rate` × `flow_composite`
+ *    (the documented 30/25/15/15/15 weighting over intent_flows).
+ *  - Latency: `avg_total_ms`, `p95_total_ms`.
+ *  - Cost: token averages + `dominant_model`; `cost_per_reply_usd` resolved in JS (D4).
+ *  - Tools (P2): `tool_calls`, `tool_errors`, `tool_error_rate` from steps[].tools[] in message metadata.
+ *
+ * Ranking (worst-first) and status colors are the frontend's job via metricTargets; this returns the
+ * raw metrics. Eval scores are pre-aggregated to ONE relevance per exchange so multiple Pass-A runs
+ * never multiply the exchange counts.
+ *
+ * Serves BOTH L0 and L1 (§5): with no `intent` param it returns every intent (the dashboard); with
+ * `intent` set it returns that one intent's row (the drill). `$2` is the intent-or-NULL filter — the
+ * `$2 IS NULL OR col = $2` idiom keeps it one query with a fixed param list, no dynamic SQL.
+ */
+async function getIntentEffectiveness(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const days = Math.min(parseInt(params.days || '30', 10), 180);
+  const intent = params.intent || null; // null => L0 (all intents); set => L1 (one intent)
+
+  const result = await query(
+    `WITH ex_agg AS (
+       SELECT e.intent,
+              COUNT(DISTINCT e.id) AS exchange_count,
+              COUNT(DISTINCT e.id) FILTER (WHERE e.task_id IS NULL) AS direct_count,
+              COUNT(DISTINCT e.task_id) AS task_count,
+              ROUND(AVG(CASE e.intent_confidence
+                          WHEN 'high' THEN 100 WHEN 'medium' THEN 50 WHEN 'low' THEN 0 END)::numeric, 1)
+                AS avg_confidence,
+              ROUND((COUNT(DISTINCT e.id) FILTER (WHERE e.was_rerouted) * 100.0
+                     / NULLIF(COUNT(DISTINCT e.id), 0))::numeric, 1) AS reroute_rate,
+              ROUND(AVG(er.relevance_score) FILTER (WHERE e.task_id IS NULL)::numeric, 1) AS direct_relevance,
+              ROUND(AVG(m.total_ms)::numeric, 0) AS avg_total_ms,
+              ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.total_ms)::numeric, 0) AS p95_total_ms,
+              ROUND(AVG(m.input_tokens)::numeric, 0) AS avg_input_tokens,
+              ROUND(AVG(m.output_tokens)::numeric, 0) AS avg_output_tokens,
+              MODE() WITHIN GROUP (ORDER BY m.bedrock_model) AS dominant_model
+         FROM exchanges e
+         LEFT JOIN messages m ON e.agent_message_id = m.id
+         -- One relevance per exchange (a re-scored exchange has multiple evaluation_results rows;
+         -- averaging them here keeps the LEFT JOIN 1:1 so exchange_count is not inflated).
+         LEFT JOIN (
+           SELECT exchange_id, AVG(relevance_score) AS relevance_score
+             FROM evaluation_results
+            WHERE evaluation_type = 'exchange'
+            GROUP BY exchange_id
+         ) er ON er.exchange_id = e.id
+        WHERE e.created_at >= NOW() - INTERVAL '1 day' * $1
+          AND e.intent IS NOT NULL
+          AND ($2::varchar IS NULL OR e.intent = $2)
+        GROUP BY e.intent
+     ),
+     flow_agg AS (
+       SELECT f.intent,
+              ROUND((COUNT(*) FILTER (WHERE f.status = 'completed') * 100.0
+                     / NULLIF(COUNT(*), 0))::numeric, 1) AS task_completion_rate,
+              ROUND(AVG( COALESCE(f.outcome_score,0) * 0.30
+                       + COALESCE(f.information_score,0) * 0.25
+                       + COALESCE(f.efficiency_score,0) * 0.15
+                       + COALESCE(f.context_retention_score,0) * 0.15
+                       + COALESCE(f.ux_score,0) * 0.15 )::numeric, 1) AS flow_composite
+         FROM intent_flows f
+        WHERE f.created_at >= NOW() - INTERVAL '1 day' * $1
+          AND ($2::varchar IS NULL OR f.intent = $2)
+        GROUP BY f.intent
+     ),
+     tool_agg AS (
+       SELECT e.intent,
+              COUNT(*) AS tool_calls,
+              COUNT(*) FILTER (WHERE (t->>'ok') = 'false') AS tool_errors
+         FROM exchanges e
+         JOIN messages m ON e.agent_message_id = m.id
+         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(m.metadata->'steps', '[]'::jsonb)) s
+         CROSS JOIN LATERAL jsonb_array_elements(COALESCE(s->'tools', '[]'::jsonb)) t
+        WHERE e.created_at >= NOW() - INTERVAL '1 day' * $1
+          AND e.intent IS NOT NULL
+          AND ($2::varchar IS NULL OR e.intent = $2)
+        GROUP BY e.intent
+     )
+     SELECT ex_agg.intent,
+            ex_agg.exchange_count,
+            ex_agg.direct_count,
+            ex_agg.task_count,
+            ex_agg.avg_confidence,
+            ex_agg.reroute_rate,
+            ex_agg.direct_relevance,
+            COALESCE(fa.task_completion_rate, 0) AS task_completion_rate,
+            fa.flow_composite,
+            ex_agg.avg_total_ms,
+            ex_agg.p95_total_ms,
+            ex_agg.avg_input_tokens,
+            ex_agg.avg_output_tokens,
+            ex_agg.dominant_model,
+            COALESCE(ta.tool_calls, 0) AS tool_calls,
+            COALESCE(ta.tool_errors, 0) AS tool_errors,
+            ROUND(COALESCE(ta.tool_errors * 100.0 / NULLIF(ta.tool_calls, 0), 0)::numeric, 1) AS tool_error_rate
+       FROM ex_agg
+       LEFT JOIN flow_agg fa ON fa.intent = ex_agg.intent
+       LEFT JOIN tool_agg ta ON ta.intent = ex_agg.intent
+      ORDER BY ex_agg.exchange_count DESC`,
+    [days, intent]
+  );
+
+  // Cost column (D4): resolve tokens × model rate to a per-reply USD estimate in JS (the rate table is
+  // TS), keeping the null-honesty contract. The raw token averages + dominant_model stay on the row.
+  const rows = (result.rows as Array<Record<string, unknown>>).map((r) => ({
+    ...r,
+    cost_per_reply_usd: resolveReplyCostUsd(r as Parameters<typeof resolveReplyCostUsd>[0]),
+  }));
+
+  return success({
+    data: rows,
+    columns: [
+      'intent', 'exchange_count', 'direct_count', 'task_count',
+      'avg_confidence', 'reroute_rate',
+      'direct_relevance', 'task_completion_rate', 'flow_composite',
+      'avg_total_ms', 'p95_total_ms',
+      'avg_input_tokens', 'avg_output_tokens', 'dominant_model', 'cost_per_reply_usd',
+      'tool_calls', 'tool_errors', 'tool_error_rate',
+    ],
+  });
+}
+
+/**
+ * Effectiveness L2 for a DIRECT intent (§5): the exchange list for one intent — each single-turn
+ * exchange with its Pass A relevance, latency, tokens, and model, so the drill goes L1 → the exchanges
+ * that made up its numbers. One relevance per exchange (same 1:1 pre-aggregation as L0). Ordered newest
+ * first, bounded. Honest-empty without an `intent`. (Task intents drill to the task list via
+ * `task_details?intent=`; a task's turns then open via `task_timeline`.)
+ */
+async function getIntentExchanges(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const intent = params.intent;
+  if (!intent) return success({ data: [] });
+  const days = Math.min(parseInt(params.days || '30', 10), 180);
+  const limit = Math.min(parseInt(params.limit || '100', 10), 500);
+
+  const result = await query(
+    `SELECT e.id AS exchange_id,
+            e.agent_message_id,
+            e.task_id,
+            e.intent_confidence,
+            e.was_rerouted,
+            e.delivery_option,
+            er.relevance_score,
+            m.total_ms,
+            m.input_tokens,
+            m.output_tokens,
+            m.bedrock_model,
+            e.created_at
+       FROM exchanges e
+       LEFT JOIN messages m ON e.agent_message_id = m.id
+       LEFT JOIN (
+         SELECT exchange_id, AVG(relevance_score) AS relevance_score
+           FROM evaluation_results
+          WHERE evaluation_type = 'exchange'
+          GROUP BY exchange_id
+       ) er ON er.exchange_id = e.id
+      WHERE e.intent = $1
+        AND e.created_at >= NOW() - INTERVAL '1 day' * $2
+      ORDER BY e.created_at DESC
+      LIMIT $3`,
+    [intent, days, limit]
+  );
+  return success({ data: result.rows });
 }
 
 /**

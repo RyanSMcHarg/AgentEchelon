@@ -125,6 +125,10 @@ interface MessageRecord {
   delivery_option: string | null;
   task_id: string | null;
   task_status: string | null;
+  // Task MACHINE state (SPEC-TASK-STATE-TRANSITIONS §6), distinct from task_status (the lifecycle):
+  // task_state = the declared-graph state after this turn; task_transition = the edge it applied.
+  task_state: string | null;
+  task_transition: { from: string; to: string } | null;
   experiment_id: string | null;
   variant_id: string | null;
   was_fallback: boolean;
@@ -466,6 +470,13 @@ async function transformToMessageRecord(
   const deliveryOption = analytics.deliveryOption || null;
   const taskId = analytics.activeTask?.taskId || null;
   const taskStatus = analytics.activeTask?.status || null;
+  // Machine state (§6): stamped per turn by buildAnalyticsMetadata. taskTransition is absent on a
+  // turn that advanced nothing; kept structured ({from,to}) for the JSONB column.
+  const taskState = analytics.taskState || null;
+  const taskTransition =
+    analytics.taskTransition && analytics.taskTransition.from && analytics.taskTransition.to
+      ? { from: analytics.taskTransition.from, to: analytics.taskTransition.to }
+      : null;
 
   return {
     event_type: EventType,
@@ -495,6 +506,8 @@ async function transformToMessageRecord(
     delivery_option: deliveryOption,
     task_id: taskId,
     task_status: taskStatus,
+    task_state: taskState,
+    task_transition: taskTransition,
     experiment_id: analytics.experimentId || null,
     variant_id: analytics.variantId || null,
     was_fallback: analytics.wasFallback === true,
@@ -537,6 +550,8 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
     'persistence',
     'task_id',
     'task_status',
+    'task_state',
+    'task_transition',
     'experiment_id',
     'variant_id',
     'was_fallback',
@@ -564,6 +579,9 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
     persistence: r.persistence,
     task_id: r.task_id,
     task_status: r.task_status,
+    task_state: r.task_state,
+    // JSONB column — stringify the {from,to} object (NULL stays NULL for a no-transition turn).
+    task_transition: r.task_transition ? JSON.stringify(r.task_transition) : null,
     experiment_id: r.experiment_id,
     variant_id: r.variant_id,
     was_fallback: r.was_fallback,
@@ -661,6 +679,8 @@ async function createExchangesFromRecords(
           updateRecord?.delivery_option || botRecord.delivery_option;
         const taskId = updateRecord?.task_id || botRecord.task_id;
         const taskStatus = updateRecord?.task_status || botRecord.task_status;
+        const taskState = updateRecord?.task_state || botRecord.task_state;
+        const taskTransition = updateRecord?.task_transition || botRecord.task_transition;
 
         try {
           await query(
@@ -669,7 +689,7 @@ async function createExchangesFromRecords(
                channel_arn, user_type, agent_type,
                response_latency_ms, user_message_at, agent_response_at,
                intent, intent_confidence, original_intent, was_rerouted,
-               delivery_option, task_id, task_status
+               delivery_option, task_id, task_status, task_state, task_transition
              )
              SELECT
                c.id,
@@ -686,7 +706,7 @@ async function createExchangesFromRecords(
                EXTRACT(EPOCH FROM (am.created_at - um.created_at)) * 1000,
                um.created_at,
                am.created_at,
-               $6, $7, $8, $9, $10, $11, $12
+               $6, $7, $8, $9, $10, $11, $12, $13, $14
              FROM conversations c
              JOIN messages um ON um.message_id = $4 AND um.channel_arn = $1
              JOIN messages am ON am.message_id = $5 AND am.channel_arn = $1
@@ -707,6 +727,9 @@ async function createExchangesFromRecords(
               deliveryOption,
               taskId,
               taskStatus,
+              taskState,
+              // JSONB param: stringify the {from,to} object; NULL for a no-transition turn.
+              taskTransition ? JSON.stringify(taskTransition) : null,
             ]
           );
           exchangeCount++;
@@ -737,7 +760,7 @@ async function createExchangesFromDatabase(
          conversation_id, user_message_id, agent_message_id,
          channel_arn, user_type, agent_type,
          response_latency_ms, user_message_at, agent_response_at,
-         intent, task_id, task_status
+         intent, task_id, task_status, task_state, task_transition
        )
        SELECT
          c.id,
@@ -751,7 +774,9 @@ async function createExchangesFromDatabase(
          am.created_at,
          COALESCE(am_upd.metadata->>'intent', am.metadata->>'intent'),
          COALESCE(am_upd.task_id, am.task_id),
-         COALESCE(am_upd.task_status, am.task_status)
+         COALESCE(am_upd.task_status, am.task_status),
+         COALESCE(am_upd.task_state, am.task_state),
+         COALESCE(am_upd.task_transition, am.task_transition)
        FROM messages um
        JOIN messages am ON am.channel_arn = um.channel_arn
          AND am.is_bot = true
@@ -865,7 +890,9 @@ export async function backfillFromUpdateEvents(
                 task_status       = COALESCE($8, ex.task_status),
                 experiment_id     = COALESCE($9, ex.experiment_id),
                 variant_id        = COALESCE($10, ex.variant_id),
-                was_fallback      = COALESCE(ex.was_fallback, FALSE) OR $11
+                was_fallback      = COALESCE(ex.was_fallback, FALSE) OR $11,
+                task_state        = COALESCE($14, ex.task_state),
+                task_transition   = COALESCE($15, ex.task_transition)
            FROM messages am
           WHERE ex.agent_message_id = am.id
             AND am.message_id = $12
@@ -884,6 +911,9 @@ export async function backfillFromUpdateEvents(
           upd.was_fallback,
           createMessageId,
           upd.channel_arn,
+          upd.task_state,
+          // JSONB param — stringify {from,to}; NULL when the update carried no transition.
+          upd.task_transition ? JSON.stringify(upd.task_transition) : null,
         ]
       );
     } catch (error) {

@@ -1632,3 +1632,23 @@
   .exp-metric-row--headline .exp-metric-val { font-size: 18px; }
   .exp-reco-tag { margin-left: 0; flex-basis: 100%; }
 }
+
+/* Effectiveness drill (SPEC-ADMIN-CONSOLE-EFFECTIVENESS): inline-link buttons + breadcrumb. */
+.admin-link-btn {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--accent, #2f6fed);
+  cursor: pointer;
+  font: inherit;
+  text-align: left;
+}
+.admin-link-btn:hover { text-decoration: underline; }
+.admin-breadcrumb {
+  font-size: 13px;
+  color: var(--status-neutral, #8a8a8a);
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  flex-wrap: wrap;
+}

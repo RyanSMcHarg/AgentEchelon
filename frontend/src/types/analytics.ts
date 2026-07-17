@@ -35,7 +35,12 @@ export type QueryType =
   | 'page_load_metrics'
   | 'connection_health_daily'
   // Per-message step telemetry (SPEC-MESSAGE-METADATA-CODEBOOK.md / ADR-016) — Aurora.
-  | 'execution_steps';
+  | 'execution_steps'
+  // Effectiveness drill (SPEC-ADMIN-CONSOLE-EFFECTIVENESS) — Aurora. L0/L1 per-intent rollup,
+  // L2 direct-exchange list, L3 per-task turn timeline (with L4 steps inline).
+  | 'intent_effectiveness'
+  | 'intent_exchanges'
+  | 'task_timeline';
 
 export interface AnalyticsResult {
   data: Record<string, string | number>[];

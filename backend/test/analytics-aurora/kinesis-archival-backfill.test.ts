@@ -71,6 +71,8 @@ function updateRecord(overrides: Record<string, any> = {}): any {
     delivery_option: 'inline',
     task_id: null,
     task_status: null,
+    task_state: null,
+    task_transition: null,
     experiment_id: null,
     variant_id: null,
     was_fallback: false,
@@ -116,6 +118,30 @@ describe('kinesis-archival backfillFromUpdateEvents', () => {
     expect(params[0]).toBe('BUSINESS_QUERY');
     expect(params[11]).toBe('msg-123');
     expect(params[12]).toBe('arn:aws:chime:...:channel/abc');
+  });
+
+  it('folds task machine state (task_state + JSONB task_transition) onto the exchange', async () => {
+    await backfillFromUpdateEvents([
+      updateRecord({ task_state: 'generating', task_transition: { from: 'drafting_outline', to: 'generating' } }),
+    ]);
+
+    const exchangeCall = mockedQuery.mock.calls.find(([sql]) =>
+      /UPDATE exchanges/.test(sql as string),
+    );
+    const [sql, params] = exchangeCall as [string, any[]];
+    expect(sql).toMatch(/task_state\s*=\s*COALESCE\(\$14, ex\.task_state\)/);
+    expect(sql).toMatch(/task_transition\s*=\s*COALESCE\(\$15, ex\.task_transition\)/);
+    expect(params[13]).toBe('generating');
+    // $15 is the JSONB param — the {from,to} object stringified.
+    expect(params[14]).toBe(JSON.stringify({ from: 'drafting_outline', to: 'generating' }));
+  });
+
+  it('leaves task_transition NULL when the turn advanced nothing', async () => {
+    await backfillFromUpdateEvents([updateRecord({ task_state: 'generating', task_transition: null })]);
+    const exchangeCall = mockedQuery.mock.calls.find(([sql]) => /UPDATE exchanges/.test(sql as string));
+    const [, params] = exchangeCall as [string, any[]];
+    expect(params[13]).toBe('generating');
+    expect(params[14]).toBeNull();
   });
 
   it('skips a record whose id does not carry the -UPD suffix', async () => {

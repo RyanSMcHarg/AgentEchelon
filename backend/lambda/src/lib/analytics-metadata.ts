@@ -35,6 +35,22 @@ export type AssignmentMode = 'deterministic' | 'probabilistic' | 'battle';
  * (SPEC-BATTLE.md §"Battle Scoring & Per-Step Telemetry", Scope
  * Revision decision 4).
  */
+/** Bounded tool-error classification (SPEC-ADMIN-CONSOLE-EFFECTIVENESS P2). NEVER raw error text —
+ *  a fixed vocabulary so tool-error rate is queryable without persisting any tool input/output/PII. */
+export type ToolErrorClass = 'timeout' | 'not_found' | 'unauthorized' | 'bad_input' | 'error';
+
+/**
+ * Per-tool outcome for one Converse iteration (P2). A single iteration can invoke several tools
+ * (`stepLabel` shows `tool:a+b`), so outcome is per-tool, not one boolean for the step — tool-error
+ * rate must attribute to the right tool. `name` is the tool, `ok` its success, `errorClass` the bounded
+ * failure class (absent when ok). No payloads: name + success + class only (decision D3).
+ */
+export interface ToolStepOutcome {
+  name: string;
+  ok: boolean;
+  errorClass?: ToolErrorClass;
+}
+
 export interface ConverseStep {
   /** e.g. 'round1-generate', 'task:report-section-2', 'round2-rebuttal', 'image-gen' */
   stepLabel: string;
@@ -45,6 +61,12 @@ export interface ConverseStep {
   tokensIn?: number;
   tokensOut?: number;
   imageCount?: number; // generation-out only
+  /**
+   * Structured tool outcomes for a tool-use iteration (P2), so tool identity + success/failure are
+   * queryable instead of buried in `stepLabel`. Absent on a pure generation step. `stepLabel` is kept
+   * for display; this is the machine-readable projection.
+   */
+  tools?: ToolStepOutcome[];
   /**
    * USD estimate from MODEL_RATE_TABLE. `null` (NOT 0) when no real
    * estimate is possible — the scorecard renders "—". Honesty contract,
@@ -118,9 +140,14 @@ export function makeConverseStep(input: {
   tokensIn?: number;
   tokensOut?: number;
   imageCount?: number;
+  tools?: ToolStepOutcome[];
 }): ConverseStep {
+  // Pull `tools` out of the base spread so an empty/absent array doesn't land as `tools: []`.
+  const { tools, ...rest } = input;
   return {
-    ...input,
+    ...rest,
+    // Include tools only when at least one tool ran, so a pure-generation step stays clean.
+    ...(tools && tools.length ? { tools } : {}),
     estCostUsd: estimateStepCostUsd({
       modelId: input.modelId,
       tokensIn: input.tokensIn,
@@ -128,6 +155,21 @@ export function makeConverseStep(input: {
       imageCount: input.imageCount,
     }),
   };
+}
+
+/**
+ * Map a tool error payload to a bounded ToolErrorClass (P2). Heuristic over the error MESSAGE only,
+ * and only the CLASS is retained — the raw text is never persisted. Unknown shapes fall to 'error'.
+ */
+export function classifyToolError(message: unknown): ToolErrorClass {
+  const m = (typeof message === 'string' ? message : '').toLowerCase();
+  if (!m) return 'error';
+  if (m.includes('timeout') || m.includes('timed out')) return 'timeout';
+  if (m.includes('not found') || m.includes('not_found') || m.includes('no such')) return 'not_found';
+  if (m.includes('unauthor') || m.includes('forbidden') || m.includes('denied') || m.includes('access')) return 'unauthorized';
+  // Bad input covers validation failures and the model calling a tool that doesn't exist.
+  if (m.includes('invalid') || m.includes('required') || m.includes('missing') || m.includes('bad ') || m.includes('unknown tool')) return 'bad_input';
+  return 'error';
 }
 
 /**

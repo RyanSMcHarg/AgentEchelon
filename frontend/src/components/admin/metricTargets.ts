@@ -90,6 +90,33 @@ export const METRIC_TARGETS: Record<string, MetricTarget> = {
     description:
       'Automated 0–100 relevance score averaged across evaluated exchanges. Each turn is scored context-aware (with its preceding turns), so a correct contextual reply is not penalised as if isolated. Good ≥75, acceptable ≥50.',
   },
+  // Effectiveness dashboard (SPEC-ADMIN-CONSOLE-EFFECTIVENESS §5) — per-intent quality axes. Defaults;
+  // tune per deployment via this registry.
+  intent_confidence: {
+    label: 'Classification confidence', direction: 'higher', target: 80, warn: 50, format: (v) => v.toFixed(0),
+    description:
+      'Average classifier confidence for this intent, mapped high/medium/low → 100/50/0. Low confidence means the router is unsure it routed the traffic correctly — a taxonomy or classifier signal, distinct from whether the work then succeeded.',
+  },
+  task_completion_rate: {
+    label: 'Task completion rate', direction: 'higher', target: 80, warn: 60, unit: '%', format: fmtPct,
+    description:
+      'Share of this intent’s multi-step tasks that reached a success terminal state. The execution-quality signal for task-delivery intents (paired with the flow composite).',
+  },
+  intent_reroute_rate: {
+    label: 'Reroute rate', direction: 'lower', target: 10, warn: 25, unit: '%', format: fmtPct,
+    description:
+      'Share of this intent’s exchanges the router re-classified away from the original intent. A high rate points at a taxonomy overlap or a weak classifier boundary, not a runtime failure.',
+  },
+  cost_per_reply: {
+    label: 'Cost per reply', direction: 'lower', target: 0.01, warn: 0.05, format: (v) => `$${v.toFixed(4)}`,
+    description:
+      'Estimated USD per bot reply, derived from average tokens × the model’s published rate (not billing reconciliation). A decision column alongside quality: a cheap-but-wrong and an expensive-but-excellent intent are different problems.',
+  },
+  tool_error_rate: {
+    label: 'Tool error rate', direction: 'lower', target: 5, warn: 15, unit: '%', format: fmtPct,
+    description:
+      'Share of this intent’s tool calls that failed (per the structured per-tool step outcome). Tool use is the mechanism that produces the outcome, so a high tool-error rate is a distinct, actionable failure mode.',
+  },
   // Engagement (higher is better) — defaults; tune.
   signup_conversion: {
     label: 'Signup conversion', direction: 'higher', target: 60, warn: 40, unit: '%', format: fmtPct,

@@ -22,7 +22,7 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
   getClient: jest.fn(),
 }));
 
-import { handler } from '../../lambda/src/analytics-aurora/analytics-query';
+import { handler, resolveReplyCostUsd } from '../../lambda/src/analytics-aurora/analytics-query';
 
 function postEvent(body: unknown): APIGatewayProxyEvent {
   return {
@@ -67,6 +67,126 @@ describe('Aurora analytics-query — conversation_volumes is served natively', (
     expect(body.unsupported).toBe(true);
     expect(typeof body.reason).toBe('string');
     expect(mockDbQuery).not.toHaveBeenCalled();
+  });
+});
+
+describe('Aurora analytics-query — task_timeline (Effectiveness L3, SPEC-TASK-STATE-TRANSITIONS §6)', () => {
+  it('task_timeline with a taskId → 200 with the per-turn state timeline', async () => {
+    mockDbQuery.mockResolvedValueOnce({
+      rows: [
+        { task_state: 'collecting_requirements', task_transition: null },
+        { task_state: 'generating', task_transition: { from: 'drafting_outline', to: 'generating' } },
+      ],
+    });
+
+    const res = await handler(postEvent({ queryType: 'task_timeline', taskId: 'task-abc', dateRange: VALID_RANGE }));
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.unsupported).toBeUndefined();
+    expect(body.data).toHaveLength(2);
+    // Ordered by created_at, scoped to the requested task.
+    const [sql, args] = mockDbQuery.mock.calls[0];
+    expect(sql).toMatch(/WHERE e\.task_id = \$1/);
+    expect(sql).toMatch(/ORDER BY e\.created_at ASC/);
+    expect(sql).toMatch(/metadata->'steps'/); // L4 steps ride the L3 row
+    expect(args).toEqual(['task-abc']);
+  });
+
+  it('task_timeline without a taskId → honest empty, no DB call', async () => {
+    const res = await handler(postEvent({ queryType: 'task_timeline', dateRange: VALID_RANGE }));
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.data).toEqual([]);
+    expect(mockDbQuery).not.toHaveBeenCalled();
+  });
+});
+
+describe('resolveReplyCostUsd (L0 cost column, D4) — null-honesty + coercion', () => {
+  it('returns null when there is no model to price against', () => {
+    expect(resolveReplyCostUsd({ dominant_model: null, avg_input_tokens: '100', avg_output_tokens: '50' })).toBeNull();
+    expect(resolveReplyCostUsd({ avg_input_tokens: 100, avg_output_tokens: 50 })).toBeNull();
+  });
+
+  it('returns null for a model the rate table cannot price (never a guessed 0)', () => {
+    expect(resolveReplyCostUsd({ dominant_model: 'not-a-real-model', avg_input_tokens: '100', avg_output_tokens: '50' })).toBeNull();
+  });
+});
+
+describe('Aurora analytics-query — intent_effectiveness (Effectiveness L0)', () => {
+  it('runs the per-intent rollup and stamps cost_per_reply_usd on every row', async () => {
+    mockDbQuery.mockResolvedValueOnce({
+      rows: [
+        { intent: 'report_generation', exchange_count: '12', dominant_model: null, avg_input_tokens: '800', avg_output_tokens: '400', tool_error_rate: '0.0' },
+        { intent: 'general_query', exchange_count: '30', dominant_model: 'not-a-real-model', avg_input_tokens: '200', avg_output_tokens: '120', tool_error_rate: '5.0' },
+      ],
+    });
+
+    const res = await handler(postEvent({ queryType: 'intent_effectiveness', dateRange: VALID_RANGE }));
+
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+    expect(body.unsupported).toBeUndefined();
+    expect(body.data).toHaveLength(2);
+    // Cost resolved (null-honest here since neither model is priceable) and present on every row.
+    for (const row of body.data) expect(row).toHaveProperty('cost_per_reply_usd', null);
+
+    // The query is the documented spine: exchange rollup + flow composite (30/25/15/15/15) + tool lens.
+    const [sql, args] = mockDbQuery.mock.calls[0];
+    expect(sql).toMatch(/WITH ex_agg AS/);
+    expect(sql).toMatch(/flow_agg AS/);
+    expect(sql).toMatch(/tool_agg AS/);
+    expect(sql).toMatch(/\* 0\.30/); // outcome weight in the flow composite
+    expect(sql).toMatch(/WHEN 'high' THEN 100 WHEN 'medium' THEN 50 WHEN 'low' THEN 0/);
+    expect(sql).toMatch(/NOW\(\) - INTERVAL '1 day' \* \$1/);
+    // L0 = no intent filter → $2 is NULL (7-day window from VALID_RANGE).
+    expect(args).toEqual([7, null]);
+  });
+
+  it('L1: an intent param drills to one intent via the $2 IS NULL OR filter', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [{ intent: 'report_generation', exchange_count: '12', dominant_model: null }] });
+
+    const res = await handler(postEvent({ queryType: 'intent_effectiveness', intent: 'report_generation', dateRange: VALID_RANGE }));
+
+    expect(res.statusCode).toBe(200);
+    const [sql, args] = mockDbQuery.mock.calls[0];
+    expect(sql).toMatch(/\$2::varchar IS NULL OR e\.intent = \$2/);
+    expect(args).toEqual([7, 'report_generation']);
+    expect(JSON.parse(res.body).data[0]).toHaveProperty('cost_per_reply_usd', null);
+  });
+});
+
+describe('Aurora analytics-query — L2 drills (intent_exchanges + task_details filter)', () => {
+  it('intent_exchanges with an intent → 200 with the per-exchange list, scoped + bounded', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [{ exchange_id: 'ex-1', relevance_score: '88', total_ms: '1200' }] });
+
+    const res = await handler(postEvent({ queryType: 'intent_exchanges', intent: 'general_query', dateRange: VALID_RANGE }));
+
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).data).toHaveLength(1);
+    const [sql, args] = mockDbQuery.mock.calls[0];
+    expect(sql).toMatch(/WHERE e\.intent = \$1/);
+    expect(sql).toMatch(/ORDER BY e\.created_at DESC/);
+    expect(sql).toMatch(/LIMIT \$3/);
+    expect(args).toEqual(['general_query', 7, 100]); // intent, window, default limit
+  });
+
+  it('intent_exchanges without an intent → honest empty, no DB call', async () => {
+    const res = await handler(postEvent({ queryType: 'intent_exchanges', dateRange: VALID_RANGE }));
+    expect(JSON.parse(res.body).data).toEqual([]);
+    expect(mockDbQuery).not.toHaveBeenCalled();
+  });
+
+  it('task_details accepts an intent filter (L2 task list) as $3', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [{ task_id: 'task-1', type: 'report_generation', task_state: 'generating' }] });
+
+    const res = await handler(postEvent({ queryType: 'task_details', intent: 'report_generation', dateRange: VALID_RANGE }));
+
+    expect(res.statusCode).toBe(200);
+    const [sql, args] = mockDbQuery.mock.calls[0];
+    expect(sql).toMatch(/\$3::varchar IS NULL OR intent = \$3/);
+    expect(args[2]).toBe('report_generation');
   });
 });
 

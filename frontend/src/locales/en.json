@@ -290,6 +290,7 @@
       "flagged": "Flagged",
       "groundTruth": "Ground Truth",
       "tasks": "Tasks",
+      "effectiveness": "Dashboard",
       "security": "Membership Audit"
     },
     "tablistAria": "Admin console sections",

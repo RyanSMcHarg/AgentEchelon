@@ -381,6 +381,19 @@ async function upsertFlow(flow: TaskFlow, turns: PriorTurn[], s: FlowScore): Pro
       JSON.stringify({ reasoning: s.reasoning, composite: flowComposite(s) }),
     ],
   );
+
+  // P1 backfill: Pass A rows scored before this flow existed carry task_id but a NULL flow_id. Now that
+  // the flow row exists, stamp its id onto them so the score->flow join needs no round-trip through
+  // exchanges. Forward-looking: rows predating the Pass A task_id write (task_id NULL) are not touched.
+  await query(
+    `UPDATE evaluation_results er
+        SET flow_id = f.id
+       FROM intent_flows f
+      WHERE f.task_id = $1
+        AND er.task_id = $1
+        AND er.flow_id IS NULL`,
+    [flow.task_id],
+  );
 }
 
 /** Pass B: score task flows into intent_flows. Returns count scored. */
@@ -423,12 +436,17 @@ export async function handler(
     for (const ex of exchanges) {
       try {
         const r = await scoreExchange(ex);
+        // P1 (SPEC-ADMIN-CONSOLE-EFFECTIVENESS): stamp the flow join keys at write time so a per-exchange
+        // score reaches its flow directly. task_id is copied from the exchange; flow_id is resolved to
+        // the intent_flows row for that task WHEN one exists (Pass B may run after Pass A, so it's
+        // set-if-present and backfilled by Pass B's upsert otherwise). Both NULL for a single-turn exchange.
         await query(
           `INSERT INTO evaluation_results
              (exchange_id, run_id, evaluator_model, relevance_score, classification,
-              reasoning, agent_type, intent, evaluation_type)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'exchange')`,
-          [ex.id, runId, EVALUATOR_MODEL, r.relevanceScore, r.classification, r.reasoning, ex.agent_type, ex.intent],
+              reasoning, agent_type, intent, task_id, flow_id, evaluation_type)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
+                   (SELECT id FROM intent_flows WHERE task_id = $9), 'exchange')`,
+          [ex.id, runId, EVALUATOR_MODEL, r.relevanceScore, r.classification, r.reasoning, ex.agent_type, ex.intent, ex.task_id],
         );
         scored += 1;
       } catch (err) {

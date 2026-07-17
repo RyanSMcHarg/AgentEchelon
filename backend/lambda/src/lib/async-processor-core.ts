@@ -31,7 +31,7 @@ import {
 } from '@aws-sdk/client-bedrock-runtime';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { LambdaClient, InvokeCommand, InvocationType } from '@aws-sdk/client-lambda';
-import { buildAnalyticsMetadata, pickFrontendMetadata, makeConverseStep, type ConverseStep } from './analytics-metadata.js';
+import { buildAnalyticsMetadata, pickFrontendMetadata, makeConverseStep, classifyToolError, type ConverseStep, type ToolStepOutcome } from './analytics-metadata.js';
 import { writeMessageAnalytics, messageAnalyticsEnabled } from './message-analytics.js';
 import { estimateStepCostUsd } from './model-rate-table.js';
 import { loadCompanyContext, loadPlatformInfo, loadContextDigest, buildDigestHint } from './company-context.js';
@@ -1220,7 +1220,7 @@ export async function invokeBedrock(
       | undefined;
     // Label this step by what the model did: a generation that answers vs. a
     // tool-use round. Refined below once we know which branch we take.
-    const pushStep = (stepLabel: string) =>
+    const pushStep = (stepLabel: string, tools?: ToolStepOutcome[]) =>
       steps.push(makeConverseStep({
         stepLabel,
         modelId: config.model,
@@ -1228,6 +1228,7 @@ export async function invokeBedrock(
         endedAt: new Date(iterEnd).toISOString(),
         tokensIn: callIn,
         tokensOut: callOut,
+        tools,
       }));
 
     if (useTools && bedrockResponse.stopReason === 'tool_use' && iter < MAX_TOOL_ITERATIONS) {
@@ -1253,6 +1254,9 @@ export async function invokeBedrock(
       // tool call with a toolResult and let the model continue.
       convMessages.push(bedrockResponse.output!.message as unknown as Record<string, unknown>);
       const toolResults: Array<Record<string, unknown>> = [];
+      // P2 (SPEC-ADMIN-CONSOLE-EFFECTIVENESS): per-tool outcome for this iteration — name + success +
+      // bounded error class, no payloads — so tool-error rate is queryable off the step, not greppable.
+      const toolOutcomes: ToolStepOutcome[] = [];
       for (const block of outMessage?.content ?? []) {
         const toolUse = (block as { toolUse?: { toolUseId?: string; name?: string } }).toolUse;
         if (!toolUse) continue;
@@ -1296,6 +1300,12 @@ export async function invokeBedrock(
           tiersAccessible: (payload as { tiersAccessible?: unknown }).tiersAccessible,
           error: (payload as { error?: string }).error,
         });
+        const toolError = (payload as { error?: string }).error;
+        toolOutcomes.push({
+          name: toolUse.name ?? 'unknown',
+          ok: !toolError,
+          ...(toolError ? { errorClass: classifyToolError(toolError) } : {}),
+        });
         toolResults.push({
           toolResult: { toolUseId: toolUse.toolUseId, content: [{ json: payload }] },
         });
@@ -1304,7 +1314,7 @@ export async function invokeBedrock(
       const toolNames = (outMessage?.content ?? [])
         .map((b) => (b as { toolUse?: { name?: string } }).toolUse?.name)
         .filter(Boolean) as string[];
-      pushStep(toolNames.length ? `tool:${toolNames.join('+')}` : 'tool-use');
+      pushStep(toolNames.length ? `tool:${toolNames.join('+')}` : 'tool-use', toolOutcomes);
       continue;
     }
 
