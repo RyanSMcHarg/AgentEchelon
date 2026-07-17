@@ -690,7 +690,7 @@ echo "Report:  npx playwright show-report"
 
 - **Frontend**: React 19, Vite, TypeScript
 - **Backend**: AWS CDK (TypeScript), Lambda (Node.js 20)
-- **AI**: Amazon Bedrock (model-agnostic and configurable per tier - Anthropic Claude, Amazon Nova, OpenAI GPT-OSS; external HTTP providers also supported)
+- **AI**: Amazon Bedrock - model-agnostic, configurable per tier and per intent (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS); image generation additionally supports external HTTP providers
 - **Messaging**: Amazon Chime SDK Messaging (WebSocket)
 - **Auth**: Amazon Cognito (SAML/OIDC) with automatic token refresh
 - **Storage**: Amazon S3 (presigned URLs)

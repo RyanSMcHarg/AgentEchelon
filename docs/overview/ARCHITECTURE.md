@@ -34,13 +34,22 @@ For deployment instructions, see [README.md](../../README.md). For Aurora-specif
  └──────┬───────┘                              │    │     │    │
         │ Channel message event                │    │     │    │
         ▼                                      │    │     │    │
+ ┌──────────────┐                              │    │     │    │
+ │ Channel Flow │                              │    │     │    │
+ │  Processor   │                              │    │     │    │
+ └──────┬───────┘                              │    │     │    │
+        │ runs FIRST: @assistant/@human/@all   │    │     │    │
+        │  mention rules + filtering (@all     │    │     │    │
+        │  bypasses Lex, invoking the async    │    │     │    │
+        │  processor directly)                 │    │     │    │
+        ▼                                      │    │     │    │
  ┌──────────────┐    ┌─────────────────────────┘    │     │    │
  │  Amazon Lex  │    │ create-conversation          │     │    │
  │  V2 Bot      │    │ add-agent                    │     │    │
- │  (intent     │    │ share-conversation           │     │    │
- │  classifier) │    └──────────────────────────────┘     │    │
+ │  (entry      │    │ share-conversation           │     │    │
+ │  trigger)    │    └──────────────────────────────┘     │    │
  └──────┬───────┘                                         │    │
-        │ Lex fulfillment                                 │    │
+        │ Lex fulfillment (Dialog Code Hook)              │    │
         ▼                                                 │    │
  ┌──────────────────────────────────────────────┐         │    │
  │  Lambda Handlers (tier-selected)             │         │    │
@@ -81,6 +90,8 @@ For deployment instructions, see [README.md](../../README.md). For Aurora-specif
               │   Aurora mode)    │
               └───────────────────┘
 ```
+
+**Reading the flow:** the **Channel Flow Processor** runs first on every message (mention rules, filtering, marker stripping); `@all` bypasses Lex and invokes the async processor directly. **Amazon Lex is only the entry trigger** - a Chime-to-Lambda passthrough via its Dialog Code Hook - not a classifier or router. Each tier's Lex bot fulfils into that tier's **own handler Lambda**: all run the shared `router-agent-handler.ts` code but are deployed one per tier (per-tier ownership, ADR-011), not a single shared router. The models shown per tier are **defaults**; model selection is configurable per tier and per intent via `model-strategy` (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS), so the platform is model-agnostic, not Anthropic-only.
 
 ---
 
