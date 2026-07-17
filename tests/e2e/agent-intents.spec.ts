@@ -189,6 +189,9 @@ test.describe.serial('Agent Intents — Standard Tier', () => {
     consoleMonitor.assertNoErrors();
   });
 
+  // NOTE: this is a UI smoke check (the task indicator is optional). The AUTHORITATIVE task-state
+  // assertion — persisted taskState + a well-formed §6 stateHistory read from the source-of-truth
+  // agent-tasks row — lives in task-state-machine.spec.ts (TASKS_E2E-gated, SPEC-TASK-STATE-TRANSITIONS).
   test('task tracking — should show task indicator for complex request', async ({ page }) => {
     // Complex-prompt Sonnet turns regularly stretch past Playwright's
     // default 120s test budget on cold start (the placeholder lands in 2-3s
