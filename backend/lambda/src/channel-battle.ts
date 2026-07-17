@@ -52,6 +52,7 @@ import {
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { parseJsonBody } from './lib/auth.js';
+import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
 
 const messagingClient = new ChimeSDKMessagingClient({});
 const ssmClient = new SSMClient({});
@@ -61,12 +62,6 @@ const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
 const CHANNEL_BATTLE_CONFIG_TABLE = process.env.CHANNEL_BATTLE_CONFIG_TABLE || '';
 const EXPERIMENTS_TABLE = process.env.EXPERIMENTS_TABLE || '';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || 'http://localhost:5173').split(',');
-// Which channel tiers may enable /battle (default 'premium'). Premium-gated by
-// default but tier-configurable via the deployer's allowedBattleTiers.
-const ALLOWED_BATTLE_TIERS = (process.env.ALLOWED_BATTLE_TIERS || 'premium')
-  .split(',')
-  .map((t) => t.trim())
-  .filter(Boolean);
 
 function corsHeaders(origin?: string): Record<string, string> {
   const allowed = origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
@@ -142,19 +137,18 @@ async function readChannelMetadata(channelArn: string, botArn: string): Promise<
 // The battle tier gate keys on the IMMUTABLE `classification` tag, NOT `metadata.modelTier`.
 // Metadata is mutable via the owner rename cap (chime:UpdateChannel), so trusting it would let
 // a moderator tamper the tier up to open premium battles on a lower-tier channel. The tag cannot
-// be changed by UpdateChannel. Fail-closed to basic (which is not in ALLOWED_BATTLE_TIERS), so a
+// be changed by UpdateChannel. Fail-closed to the floor classification (not battle-eligible), so a
 // missing/unreadable tag denies the battle rather than opening it.
 async function resolveChannelClassification(channelArn: string): Promise<string> {
-  const VALID_TIERS = new Set(['basic', 'standard', 'premium']);
   try {
     const resp = await messagingClient.send(new ListTagsForResourceCommand({ ResourceARN: channelArn }));
     const tag = (resp.Tags || []).find((t) => t.Key === 'classification')?.Value;
-    if (tag && VALID_TIERS.has(tag)) return tag;
-    console.warn('[channel-battle][SecurityEvent] channel missing/invalid classification tag; failing closed to basic', { channelArn, tag });
-    return 'basic';
+    if (profiles.isKnownClassification(tag)) return profiles.resolveClassification(tag);
+    console.warn('[channel-battle][SecurityEvent] channel missing/invalid classification tag; failing closed', { channelArn, tag, failClosedTo: profiles.failClosedValue });
+    return profiles.failClosedValue;
   } catch (err) {
-    console.warn('[channel-battle] failed to read channel classification tag; failing closed to basic:', err);
-    return 'basic';
+    console.warn('[channel-battle] failed to read channel classification tag; failing closed:', err);
+    return profiles.failClosedValue;
   }
 }
 
@@ -276,11 +270,9 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
   }
   // Access confirmed above (caller could DescribeChannel). Tier comes from the tag.
   const channelTier = await resolveChannelClassification(channelArn);
-  if (!ALLOWED_BATTLE_TIERS.includes(channelTier)) {
+  if (!profiles.profileFor(channelTier).battleEligible) {
     return respond(403, {
-      error: ALLOWED_BATTLE_TIERS.length === 1 && ALLOWED_BATTLE_TIERS[0] === 'premium'
-        ? 'Battle Mode is only available on premium-tier channels'
-        : `Battle Mode is only available on these channel tiers: ${ALLOWED_BATTLE_TIERS.join(', ')}`,
+      error: `Battle Mode is not available on ${channelTier}-classification channels`,
       code: 'TIER_FORBIDDEN',
       tier: channelTier,
     }, origin);

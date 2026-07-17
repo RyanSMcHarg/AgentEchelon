@@ -62,6 +62,7 @@ import {
 import { planBattleTaskDelivery, DeliveryOption } from './lib/delivery-options.js';
 import { createBattleTask, getTask } from './lib/task-tracking.js';
 import { parseNotifyDirective, fanOutChannelNotification } from './lib/channel-notify.js';
+import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
 
 const messagingClient = new ChimeSDKMessagingClient({});
 const lambdaClient = new LambdaClient({});
@@ -91,18 +92,17 @@ const NOTIFY_ALLOWED_POOL_IDS = (process.env.NOTIFY_ALLOWED_POOL_IDS || '')
 // assistant respond or open premium battles on a lower-tier channel. The tag cannot be
 // changed by UpdateChannel. Fail-closed to basic. (bearerArn is unused for a tag read.)
 async function getChannelTier(channelArn: string, _bearerArn: string): Promise<string> {
-  const VALID_TIERS = new Set(['basic', 'standard', 'premium']);
   try {
     const resp = await messagingClient.send(
       new ListTagsForResourceCommand({ ResourceARN: channelArn }),
     );
     const tag = (resp.Tags || []).find((t) => t.Key === 'classification')?.Value;
-    if (tag && VALID_TIERS.has(tag)) return tag;
-    console.warn('[ChannelFlow][SecurityEvent] channel missing/invalid classification tag; failing closed to basic', { channelArn, tag });
-    return 'basic';
+    if (profiles.isKnownClassification(tag)) return profiles.resolveClassification(tag);
+    console.warn('[ChannelFlow][SecurityEvent] channel missing/invalid classification tag; failing closed', { channelArn, tag, failClosedTo: profiles.failClosedValue });
+    return profiles.failClosedValue;
   } catch (err) {
-    console.warn('[ChannelFlow] Failed to read channel classification tag; defaulting basic:', err);
-    return 'basic';
+    console.warn('[ChannelFlow] Failed to read channel classification tag; failing closed:', err);
+    return profiles.failClosedValue;
   }
 }
 

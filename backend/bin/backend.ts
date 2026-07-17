@@ -23,6 +23,7 @@ import {
   INSTANCE_NAME,
 } from '../lib/stacks/agent-tier-common';
 import { getModelCatalog, parseTierModelSelection } from '../lib/config/model-strategy';
+import { DEFAULT_PROFILES_CONFIG, validateProfilesConfig } from '../lib/config/profiles';
 import { applyStandardTags } from '../lib/tagging';
 
 /**
@@ -49,6 +50,11 @@ function parseWafAllowedIps(raw: unknown): string[] {
 }
 
 const app = new cdk.App();
+
+// SPEC-CAPABILITY-PROFILES Phase 0: fail the synth loudly on a malformed classifications/profiles
+// config (unique ranks, failClosedTo is the floor, profile refs resolve, no alias collisions).
+// Validates the shipped default today; the per-deployment config source replaces it in a later phase.
+validateProfilesConfig(DEFAULT_PROFILES_CONFIG);
 
 // Environment configuration
 const env = {

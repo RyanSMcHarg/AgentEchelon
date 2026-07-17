@@ -606,12 +606,13 @@ describe('CDK Synthesis', () => {
       expect(policies).toContain('aws:ResourceTag/classification');
     });
 
-    it('wires abuse controls (SPEC-ABUSE-CONTROLS): table env + rate limit + length cap on both Lambdas, DynamoDB grant', () => {
+    it('wires abuse controls (SPEC-ABUSE-CONTROLS): table env + length cap on both Lambdas, DynamoDB grant (rate limit is config-driven)', () => {
       const app = new cdk.App();
       const stack = new BasicTierStack(app, 'AgentEchelonTier-Basic', { ...tierBaseProps });
       const template = Template.fromStack(stack);
-      // Both the processor AND the handler carry the abuse env: the shared table, the tier rate
-      // limit (default on), and the length cap. (Two functions match — assert at least the pair.)
+      // Both the processor AND the handler carry the abuse env: the shared table and the length cap.
+      // (The rate-limit ceiling moved to the profile config — profiles.ts rateLimitPerHour, read at
+      // runtime by the router via the registry — so it is no longer a per-tier env var.)
       const fns = Object.values(template.findResources('AWS::Lambda::Function')) as Array<{
         Properties?: { Environment?: { Variables?: Record<string, unknown> } };
       }>;
@@ -619,7 +620,7 @@ describe('CDK Synthesis', () => {
       expect(withAbuse.length).toBeGreaterThanOrEqual(2); // processor + handler
       for (const f of withAbuse) {
         const v = f.Properties!.Environment!.Variables!;
-        expect(v.RATE_LIMIT_BASIC).toBe('60'); // default-on per-tier ceiling
+        expect(v.RATE_LIMIT_BASIC).toBeUndefined(); // rate limit is config-driven now, not env
         expect(v.MAX_USER_MESSAGE_LENGTH).toBe('16000'); // AE default (not CH's 2000)
       }
       // The dedup/budget/rate-limit counters need DynamoDB write on the control table.

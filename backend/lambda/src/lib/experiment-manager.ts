@@ -14,6 +14,7 @@ import type { BackendModelDefinition, BackendModelKey, ModelTier } from '../../.
 import { bedrockInvokeId } from '../../../lib/config/model-strategy.js';
 import { IMAGE_GEN_MODELS, type ImageGenModelKey } from './image-gen-models.js';
 import { intentTypeToRouteKey } from './model-resolver.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
 
 // removeUndefinedValues: createExperiment persists the validated record
 // directly, and validateAndSanitizeExperiment leaves optional fields
@@ -504,22 +505,17 @@ export function validateAndSanitizeExperiment(input: Experiment): Experiment {
   const objective = validateObjective(input.objective, experimentType);
 
   if (input.battleEnabled) {
-    // /battle is premium-gated BY DEFAULT but tier-configurable: the deployer's
-    // `allowedBattleTiers` (surfaced as ALLOWED_BATTLE_TIERS, default 'premium')
-    // is the source of truth for which channel tiers may run a battle. A
-    // battle-enabled experiment must target exactly ONE allowed tier — never a
-    // mixed set — so it can never arm a battle on a disallowed channel. (Error
+    // Battle eligibility is a per-profile flag (`AssistantProfile.battleEligible`, config) — the
+    // source of truth for which classifications may run a battle (premium-only by default). A
+    // battle-enabled experiment must target exactly ONE battle-eligible classification — never a
+    // mixed set — so it can never arm a battle on an ineligible channel. (Error
     // code kept as BATTLE_TIER_PREMIUM_ONLY for the API/UI contract; with the
     // default premium-only config this is exactly the old premium-only guard.)
-    const allowedBattleTiers = (process.env.ALLOWED_BATTLE_TIERS || 'premium')
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean) as ModelTier[];
     const tiers = input.tiers || [];
-    if (tiers.length !== 1 || !allowedBattleTiers.includes(tiers[0])) {
+    if (tiers.length !== 1 || !profiles.profileFor(tiers[0]).battleEligible) {
       throw new ExperimentValidationError(
-        `battleEnabled experiments must target exactly one battle-allowed tier `
-          + `(allowed: [${allowedBattleTiers.join(', ')}]; got [${tiers.join(', ')}])`,
+        `battleEnabled experiments must target exactly one battle-eligible classification `
+          + `(got [${tiers.join(', ')}])`,
         'BATTLE_TIER_PREMIUM_ONLY',
       );
     }

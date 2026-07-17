@@ -345,11 +345,6 @@ export function abuseControlsWiring(
     return v === undefined || v === null ? dflt : String(v);
   };
   const cannedCtx = scope.node.tryGetContext('budgetCannedResponse');
-  // Per-tier hourly rate-limit ceilings. Default to the spec's reference values (basic 60 /
-  // standard 120 / premium 240) so rate limiting is ON at parity with CH; a deploy overrides with
-  // -c rateLimit<Tier>=N, or 0 to disable.
-  const rateLimitDefaults: Record<Tier, string> = { basic: '60', standard: '120', premium: '240' };
-  const tierCap = tier.charAt(0).toUpperCase() + tier.slice(1); // basic -> Basic
   // Circuit-trip SSM param (edge-shedding signal). One shared per-instance param; flipped when the
   // global model-call count crosses the trip threshold. Wired only when a global budget is set
   // (the trip is meaningless otherwise); the grant + env follow the same condition.
@@ -360,7 +355,8 @@ export function abuseControlsWiring(
     ABUSE_CONTROLS_TABLE: abuseControlsName,
     BEDROCK_USER_HOURLY_BUDGET: ctxNum('bedrockUserHourlyBudget'),
     BEDROCK_GLOBAL_HOURLY_BUDGET: globalBudget,
-    [`RATE_LIMIT_${tier.toUpperCase()}`]: ctxNum(`rateLimit${tierCap}`, rateLimitDefaults[tier]),
+    // Rate-limit ceiling moved to the profile config (profiles.ts rateLimitPerHour), read at runtime
+    // by the router — no longer a per-tier env var / -c rateLimit<Tier> knob.
     // Inbound length cap. Defaulted generously (16000 chars ~ 4k tokens) rather than CH's 2000:
     // CH is a portfolio widget, AE is an enterprise assistant where report/extraction prompts and
     // pasted content are legitimately long, so a 2000 cap would degrade real use (superset tenet).

@@ -34,6 +34,7 @@ import {
 } from '@aws-sdk/client-bedrock-runtime';
 import { query } from './db-client.js';
 import { emitDriftCounter, newCorrelationId } from '../lib/emf-metrics.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
 
 const s3 = new S3Client({});
 const bedrock = new BedrockRuntimeClient({});
@@ -67,12 +68,13 @@ function deriveSourceType(s3Key: string): string {
 // so untagged content is never exposed to a lower tier; tag content `basic` to
 // publish it to all tiers. Retrieval filters `metadata->>'tier' = ANY(scope)`
 // where a user's scope is their tier and below (router-agent-handler.ts).
-const RAG_TIERS = new Set(['basic', 'standard', 'premium']);
 export function deriveTier(s3Key: string): string {
   const seg = s3Key.match(/^rag\/[^/]+\/([^/]+)\//)?.[1];
-  if (seg && RAG_TIERS.has(seg)) return seg;
-  const dflt = (process.env.RAG_DEFAULT_TIER || 'premium').trim();
-  return RAG_TIERS.has(dflt) ? dflt : 'premium';
+  if (seg && profiles.isKnownClassification(seg)) return profiles.resolveClassification(seg);
+  // Untagged content defaults to the MOST restrictive classification (fail-closed) so it is never
+  // exposed to a lower one; an env override applies only if it names a known classification.
+  const dflt = (process.env.RAG_DEFAULT_TIER || '').trim();
+  return profiles.isKnownClassification(dflt) ? dflt : profiles.mostRestrictiveValue;
 }
 
 // Title derivation: first non-empty H1 line if present, else filename

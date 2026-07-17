@@ -54,7 +54,7 @@ export interface RetrieveContextInput {
    * metadata.tier is in this list (or has no tier set, treated as
    * available to all). Implements ADR-007 (KB permission filters).
    */
-  tierScope?: Array<'basic' | 'standard' | 'premium'>;
+  tierScope?: string[];
 }
 
 export interface RetrievedChunk {

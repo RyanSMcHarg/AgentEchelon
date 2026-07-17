@@ -41,6 +41,9 @@ import {
 } from './lib/delivery-options.js';
 import { createTask, getActiveTask, TRIP_TASK_TTL_SECONDS, type TaskCreateOptions } from './lib/task-tracking.js';
 import { checkAndConsumeBudget, budgetCannedResponse, checkRateLimit, rateLimitMessage } from './lib/abuse-controls.js';
+// SPEC-CAPABILITY-PROFILES: the single interpreter of classification tags + group clearance.
+// Replaces the local TIER_RANK / TIER_GROUPS / minTier / isAdvancedTier / tierScope constants.
+import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
 // Retrieval runs in the VPC-attached data-plane Lambda (project decision 018);
 // this handler stays non-VPC and invokes it via the client seam. Same signature.
 import { retrieveContext, getLatestSummary, type RetrieveContextResult } from './lib/data-plane-client.js';
@@ -94,11 +97,8 @@ const channelTierCache = new Map<string, string>();
 const userTierCache = new Map<string, { tier: string; expires: number }>();
 const USER_TIER_CACHE_TTL_MS = 5 * 60_000;
 
-const TIER_RANK: Record<string, number> = { basic: 1, standard: 2, premium: 3 };
-const TIER_GROUPS = ['basic', 'standard', 'premium'] as const;
-
 function minTier(a: string, b: string): string {
-  return TIER_RANK[a] <= TIER_RANK[b] ? a : b;
+  return profiles.min(a, b);
 }
 
 async function resolveUserTier(userSub: string): Promise<string> {
@@ -112,17 +112,10 @@ async function resolveUserTier(userSub: string): Promise<string> {
       Username: userSub,
     }));
     const groups = (resp.Groups || []).map((g) => g.GroupName || '');
-    let tier: string = 'basic';
-    for (const candidate of TIER_GROUPS) {
-      if (groups.includes(candidate)) tier = candidate;
-    }
-    // In case of multi-group, prefer the highest tier they're in.
-    // (Precedence on the groups resource controls the cognito:groups claim,
-    // but this Lambda uses the raw list so we pick the max ourselves.)
-    if (groups.includes('premium')) tier = 'premium';
-    else if (groups.includes('standard')) tier = 'standard';
-    else if (groups.includes('basic')) tier = 'basic';
-    else tier = 'basic';
+    // Highest classification the user's Cognito groups clear for (fail-closed floor if none).
+    // The Lambda reads the raw group list, so the registry picks the max — group-resource
+    // precedence controls the cognito:groups claim, which this path does not use.
+    const tier = profiles.clearanceForGroups(groups);
 
     userTierCache.set(userSub, { tier, expires: Date.now() + USER_TIER_CACHE_TTL_MS });
     return tier;
@@ -183,9 +176,9 @@ async function resolveChannelClassificationTag(channelArn: string): Promise<stri
   try {
     const resp = await chimeClient.send(new ListTagsForResourceCommand({ ResourceARN: channelArn }));
     const tag = (resp.Tags || []).find((t) => t.Key === 'classification')?.Value || '';
-    if (tag && TIER_RANK[tag]) return tag;
-    console.warn('[Router][SecurityEvent] channel missing/invalid classification tag; failing closed to basic', { channelArn, tag });
-    return 'basic';
+    if (profiles.isKnownClassification(tag)) return profiles.resolveClassification(tag);
+    console.warn('[Router][SecurityEvent] channel missing/invalid classification tag; failing closed', { channelArn, tag, failClosedTo: profiles.failClosedValue });
+    return profiles.failClosedValue;
   } catch (err) {
     console.warn('[Router] Failed to read channel classification tag; failing closed to basic:', err);
     return 'basic';
@@ -506,7 +499,10 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     }
 
     const asyncProcessorArn = await resolveAsyncProcessorArn(tier);
-    const isAdvancedTier = tier === 'standard' || tier === 'premium';
+    // Does this classification's profile use the LLM intent classifier? True for all default
+    // profiles (basic included — a deliberate change from the legacy keyword path); a deployment
+    // can still set classifierMode:'keyword' on a cheap profile.
+    const usesLlmClassifier = profiles.profileFor(tier).classifierMode === 'llm';
 
     console.log('[Router] Resolved', {
       tier,
@@ -555,7 +551,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     let classifierModelId: string | undefined;
     let classifierExperimentId: string | undefined;
     let classifierVariantId: string | undefined;
-    if (isAdvancedTier && channelArn) {
+    if (usesLlmClassifier && channelArn) {
       try {
         const catalog = getModelCatalog(AWS_REGION, process.env.AWS_ACCOUNT_ID || '');
         const cls = await resolveClassificationExperiment(tier as 'basic' | 'standard' | 'premium', channelArn, catalog);
@@ -572,8 +568,9 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
       }
     }
 
-    // Classify intent — keyword-only for basic, LLM for standard/premium
-    const classification = isAdvancedTier
+    // Classify intent via the profile's classifierMode — 'llm' for all default profiles (basic
+    // included), 'keyword' (classifyIntentBasic) only if a deployment selects it for a cheap profile.
+    const classification = usesLlmClassifier
       ? await classifyIntent(userMessage, { modelId: classifierModelId })
       : classifyIntentBasic(userMessage);
 
@@ -661,10 +658,12 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     // message id is absent (synthetic/test events).
     const correlationId = event.requestAttributes?.['CHIME.message.id'] || randomUUID();
 
-    // Per-user rate limit (SPEC-ABUSE-CONTROLS): enforce the tier's hourly ceiling before any
-    // budget spend or dispatch. Over limit -> short "try again in N min" reply, no Bedrock. The
-    // ceiling is env-driven per tier (RATE_LIMIT_<TIER>); 0/unset disables it. Fails open.
-    const tierRateLimit = parseInt(process.env[`RATE_LIMIT_${String(tier).toUpperCase()}`] || '0', 10);
+    // Per-user rate limit (SPEC-ABUSE-CONTROLS): enforce the EFFECTIVE classification's hourly
+    // ceiling before any budget spend or dispatch. Over limit -> short "try again in N min" reply,
+    // no Bedrock. The ceiling is the profile's rateLimitPerHour (config, always defined for a known
+    // classification); 0/undefined disables it. Counter is per-user; the effective classification is
+    // min(channel, user), so a user is capped at the more restrictive of the two.
+    const tierRateLimit = profiles.profileFor(tier).rateLimitPerHour ?? 0;
     const rate = await checkRateLimit(userSub, tierRateLimit);
     if (!rate.allowed) {
       console.warn('[Router] Rate limit exceeded; serving limit notice', { tier, userSub: userSub.slice(0, 8) });
@@ -909,12 +908,9 @@ async function maybeRetrieveContext(
   }
 
   try {
-    // Tier-scope: basic + standard see only non-premium-restricted
-    // content; premium sees everything. ADR-007 metadata-filter pattern.
-    const tierScope: Array<'basic' | 'standard' | 'premium'> =
-      tier === 'premium' ? ['basic', 'standard', 'premium']
-      : tier === 'standard' ? ['basic', 'standard']
-      : ['basic'];
+    // Tier-scope: a classification sees content at its rank and below (own-rank-and-below),
+    // the fail-closed SQL metadata filter (ADR-007). Ladder derived from config via the registry.
+    const tierScope = profiles.scopeAtOrBelow(tier);
 
     // 'company' is the tier-gated business/financial corpus (ADR-017): company
     // documents are embedded under rag/company/{tier}/ and retrieved here by
