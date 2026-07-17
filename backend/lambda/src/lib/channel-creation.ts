@@ -82,7 +82,7 @@ export async function createConversationFromDrift(
         modelId: input.modelId,
         modelName: input.modelName,
         modelTier: input.modelTier,
-        // No `createdBy`: owner derived from Chime membership, not copied (Tenet 10).
+        // No `createdBy`: owner derived from Chime membership, not copied (Tenet 6).
         createdViaDrift: true,
         parentChannelArn: input.parentChannelArn,
         originatingMessageId: input.originatingMessageId,

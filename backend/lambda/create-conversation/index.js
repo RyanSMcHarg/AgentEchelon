@@ -334,7 +334,7 @@ exports.handler = async (event) => {
           modelName,
           modelTier: requestedTier,
           // No `createdBy`: the owner is derived from Chime membership (the sole human
-          // member of a 1:1), not copied into member-readable metadata (Tenet 10).
+          // member of a 1:1), not copied into member-readable metadata (Tenet 6).
           // topic + triggerContext — read by the router on WelcomeIntent
           // (docs/SPEC-WELCOME-AND-CONTEXT.md). Both bounded to keep
           // Chime's 1KB Metadata cap headroom for everything else.

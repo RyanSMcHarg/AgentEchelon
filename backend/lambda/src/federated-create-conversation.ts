@@ -147,7 +147,7 @@ export const handler = async (event: Evt): Promise<{ statusCode: number; headers
     return JSON.stringify({
       modelTier: TIER,
       // No `createdBy`: the owner is the sole human member (read from Chime membership),
-      // not copied into member-readable metadata (Tenet 10).
+      // not copied into member-readable metadata (Tenet 6).
       contextType: contextType.slice(0, 64),
       contextId: contextId.slice(0, 128),
       topic: title,
