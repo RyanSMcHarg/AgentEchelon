@@ -106,6 +106,12 @@ export class ProfileRegistry {
     return p;
   }
 
+  /** The Cognito group -> highest-classification-it-clears-for map (a copy). Group names are a
+   *  deployment choice; used to create the groups and attach each to its classification's role. */
+  get groupClearance(): Record<string, string> {
+    return { ...this.config.groupClearance };
+  }
+
   /** All declared classification values, ascending by rank. */
   classificationValues(): string[] {
     return [...this.config.classifications].sort((a, b) => a.rank - b.rank).map((c) => c.value);

@@ -25,6 +25,7 @@ import {
   INSTANCE_SSM,
   SHARED_SSM,
 } from './agent-tier-common';
+import { defaultProfileRegistry as profiles } from '../profile-registry';
 
 export interface CognitoAuthStackProps extends cdk.StackProps {
   appInstanceArn: string;
@@ -110,14 +111,19 @@ export class CognitoAuthStack extends cdk.Stack {
       removalPolicy: cdk.RemovalPolicy.RETAIN, // Protect user data in production
     });
 
-    // Define tier groups. Precedence matters: if a user ends up in multiple
-    // groups (shouldn't happen, but belt-and-suspenders), the lowest number
-    // wins in the cognito:groups claim.
+    // Groups: 'admins' (the app-admin identity, not a classification) + one per clearance group from
+    // config. Precedence derives from the group's classification rank (higher rank -> lower precedence
+    // number -> wins the cognito:groups claim); admins always wins. Group names are a deployment
+    // choice (profiles.ts groupClearance) — an enterprise deploy names them after its directory groups.
+    const clearance = profiles.groupClearance;
+    const maxRank = Math.max(...profiles.classificationValues().map((c) => profiles.rank(c)));
     const groupDefinitions: Array<{ name: string; description: string; precedence: number }> = [
       { name: 'admins', description: 'Administrators with access to user management and moderation', precedence: 0 },
-      { name: 'premium', description: 'Premium tier — Opus, full features', precedence: 1 },
-      { name: 'standard', description: 'Standard tier — Sonnet and Titan', precedence: 2 },
-      { name: 'basic', description: 'Basic tier — Haiku only', precedence: 3 },
+      ...Object.entries(clearance).map(([group, classification]) => ({
+        name: group,
+        description: `${classification} classification — ${profiles.profileFor(classification).modelKey}`,
+        precedence: maxRank - profiles.rank(classification) + 1,
+      })),
     ];
 
     // Captured so the per-tier authenticated IAM roles (created after the
@@ -345,16 +351,24 @@ export class CognitoAuthStack extends cdk.Stack {
     const makeTierRole = (logicalId: string): iam.Role =>
       new iam.Role(this, logicalId, { assumedBy: authTrust });
 
-    this.authenticatedRole = makeTierRole('AuthenticatedRole'); // basic + default (ambiguous-role fallback)
-    const standardAuthRole = makeTierRole('StandardAuthenticatedRole');
-    const premiumAuthRole = makeTierRole('PremiumAuthenticatedRole');
+    // One Identity-Pool role per classification (+ admin). They are structurally identical (auth
+    // trust only, Chime-powerless — real authority is the credential-exchange), so they are generated
+    // from config. The FLOOR classification's role keeps the 'AuthenticatedRole' logical id: it is
+    // public and doubles as the ambiguous-role default.
+    const capitalize = (s: string): string => s.charAt(0).toUpperCase() + s.slice(1);
+    const classificationRoles: Record<string, iam.Role> = {};
+    for (const c of profiles.classificationValues()) {
+      const logicalId = c === profiles.failClosedValue ? 'AuthenticatedRole' : `${capitalize(c)}AuthenticatedRole`;
+      classificationRoles[c] = makeTierRole(logicalId);
+    }
+    this.authenticatedRole = classificationRoles[profiles.failClosedValue];
     const adminAuthRole = makeTierRole('AdminAuthenticatedRole');
 
-    // Attach each role to its Cognito group so the ID token carries
-    // `cognito:preferred_role` (lowest-precedence group with a roleArn wins).
-    tierGroupResources['basic'].roleArn = this.authenticatedRole.roleArn;
-    tierGroupResources['standard'].roleArn = standardAuthRole.roleArn;
-    tierGroupResources['premium'].roleArn = premiumAuthRole.roleArn;
+    // Attach each group to its classification's role so the ID token carries `cognito:preferred_role`
+    // (lowest-precedence group with a roleArn wins); admins -> the admin role.
+    for (const [group, classification] of Object.entries(clearance)) {
+      tierGroupResources[group].roleArn = classificationRoles[classification].roleArn;
+    }
     tierGroupResources['admins'].roleArn = adminAuthRole.roleArn;
 
     // Token-based role selection: the Identity Pool hands each authenticated
