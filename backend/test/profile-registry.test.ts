@@ -59,7 +59,7 @@ describe('profile-registry (default config = legacy behavior)', () => {
     expect(basic.modelKey).toBe('haiku');
     expect(basic.classifierMode).toBe('llm'); // DEVIATION: legacy basic was 'keyword'
     expect(basic.timeoutSeconds).toBe(30);
-    expect(basic.taskSupport).toBe('lightweight');
+    expect(basic.taskSupport).toBe('full'); // basic gets full task support (the unified processor wires the task loop for every profile)
     expect(basic.rateLimitPerHour).toBe(60);
     expect(basic.battleEligible).toBe(false);
 

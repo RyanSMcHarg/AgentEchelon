@@ -33,6 +33,7 @@ import { createHash } from 'node:crypto';
 import * as path from 'path';
 import { AgentGuardrails } from '../constructs/bedrock-guardrails';
 import { getModelCatalog, TierModelSelection } from '../config/model-strategy';
+import { defaultProfileRegistry } from '../profile-registry';
 import {
   tierChannelScopedAllow,
   classificationsAllowedFor,
@@ -191,7 +192,7 @@ export class BasicTierStack extends cdk.Stack {
 
     // ── Async-processor Lambda (the assistant) ──────────────
     const asyncProcessor = new lambdaNodeJs.NodejsFunction(this, 'AsyncProcessor', {
-      entry: path.join(__dirname, '../../lambda/src/basic-async-processor.ts'),
+      entry: path.join(__dirname, '../../lambda/src/assistant-async-processor.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
       timeout: cdk.Duration.seconds(30),
@@ -200,6 +201,13 @@ export class BasicTierStack extends cdk.Stack {
       role: processorRole,
       environment: {
         APP_INSTANCE_ARN: props.appInstanceArn,
+        // SPEC-CAPABILITY-PROFILES: config-driven unified processor. See PremiumTierStack for the
+        // PROFILE_NAME / BATTLE_ELIGIBLE / MAX_TOKENS contract. Basic keeps the tight 1024 ceiling and
+        // sets no ATTACHMENTS_BUCKET / battle / context-routing env, so those union code paths self-gate
+        // off — its execution stays within basic's narrow IAM role.
+        PROFILE_NAME: tier,
+        BATTLE_ELIGIBLE: String(defaultProfileRegistry.profileFor(tier).battleEligible ?? false),
+        MAX_TOKENS: '1024',
         MODEL_ID: tierModel.bedrockModelId,
         MODEL_NAME: tierModel.displayName,
         AWS_ACCOUNT_ID: this.account,

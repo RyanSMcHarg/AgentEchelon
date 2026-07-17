@@ -35,6 +35,7 @@ import { createHash } from 'node:crypto';
 import * as path from 'path';
 import { AgentGuardrails } from '../constructs/bedrock-guardrails';
 import { getModelCatalog, TierModelSelection } from '../config/model-strategy';
+import { defaultProfileRegistry } from '../profile-registry';
 import {
   tierChannelScopedAllow,
   classificationsAllowedFor,
@@ -325,7 +326,7 @@ export class StandardTierStack extends cdk.Stack {
     }
 
     const asyncProcessor = new lambdaNodeJs.NodejsFunction(this, 'AsyncProcessor', {
-      entry: path.join(__dirname, '../../lambda/src/standard-async-processor.ts'),
+      entry: path.join(__dirname, '../../lambda/src/assistant-async-processor.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
       timeout: cdk.Duration.seconds(60),
@@ -334,6 +335,11 @@ export class StandardTierStack extends cdk.Stack {
       role: processorRole,
       environment: {
         APP_INSTANCE_ARN: props.appInstanceArn,
+        // SPEC-CAPABILITY-PROFILES: config-driven unified processor. See PremiumTierStack for the
+        // PROFILE_NAME / BATTLE_ELIGIBLE / MAX_TOKENS contract.
+        PROFILE_NAME: tier,
+        BATTLE_ELIGIBLE: String(defaultProfileRegistry.profileFor(tier).battleEligible ?? false),
+        MAX_TOKENS: '4096',
         MODEL_ID: tierModel.bedrockModelId,
         MODEL_NAME: tierModel.displayName,
         // Per-deployment persona (empty ⇒ AE generic default). Stored in SSM (param name passed

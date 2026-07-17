@@ -25,9 +25,10 @@ describe('Lambda handler entry points', () => {
     // The former per-tier {basic,standard,premium}-agent-handler.ts were divergent copies —
     // basic's was actually deployed (a bug: no tasks), the other two pure dead code. Retired.
     'src/router-agent-handler.ts',
-    'src/basic-async-processor.ts',
-    'src/standard-async-processor.ts',
-    'src/premium-async-processor.ts',
+    // One config-driven async processor for every profile (SPEC-CAPABILITY-PROFILES). The former
+    // per-tier {basic,standard,premium}-async-processor.ts were a divergent union — collapsed here,
+    // with /battle gated by profile.battleEligible and the task loop wired for every profile.
+    'src/assistant-async-processor.ts',
     'src/analytics-aurora/analytics-query.ts',
     'src/analytics-aurora/kinesis-archival.ts',
     'src/analytics-aurora/schema-init.ts',

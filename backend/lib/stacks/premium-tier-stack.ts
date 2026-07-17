@@ -35,6 +35,7 @@ import * as path from 'path';
 import { AgentGuardrails } from '../constructs/bedrock-guardrails';
 import { BattleImageGuardrails } from '../constructs/battle-image-guardrails';
 import { getModelCatalog, TierModelSelection } from '../config/model-strategy';
+import { defaultProfileRegistry } from '../profile-registry';
 import {
   tierChannelScopedAllow,
   classificationsAllowedFor,
@@ -270,6 +271,12 @@ export class PremiumTierStack extends cdk.Stack {
     const processorEnv: Record<string, string> = {
       APP_INSTANCE_ARN: props.appInstanceArn,
       BOT_ARN_PARAM: tierBotArnKey(tier),
+      // SPEC-CAPABILITY-PROFILES: the unified assistant-async-processor is config-driven. PROFILE_NAME
+      // selects the persona default + model-strategy key; BATTLE_ELIGIBLE (from profile.battleEligible)
+      // gates the /battle code paths; MAX_TOKENS is the profile's response ceiling.
+      PROFILE_NAME: tier,
+      BATTLE_ELIGIBLE: String(defaultProfileRegistry.profileFor(tier).battleEligible ?? false),
+      MAX_TOKENS: '4096',
       MODEL_ID: tierModel.bedrockModelId,
       MODEL_NAME: tierModel.displayName,
       AWS_ACCOUNT_ID: this.account,
@@ -334,7 +341,7 @@ export class PremiumTierStack extends cdk.Stack {
     if (igRegion) processorEnv.IMAGE_GEN_REGION = igRegion;
 
     const asyncProcessor = new lambdaNodeJs.NodejsFunction(this, 'AsyncProcessor', {
-      entry: path.join(__dirname, '../../lambda/src/premium-async-processor.ts'),
+      entry: path.join(__dirname, '../../lambda/src/assistant-async-processor.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
       timeout: cdk.Duration.seconds(90),
