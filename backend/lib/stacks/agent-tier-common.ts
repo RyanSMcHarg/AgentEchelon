@@ -18,12 +18,12 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import type { BackendModelDefinition, BackendModelKey } from '../config/model-strategy';
+import { defaultProfileRegistry as profiles } from '../profile-registry';
 
 export type Tier = 'basic' | 'standard' | 'premium';
 export type TierModelCatalog = Record<BackendModelKey, BackendModelDefinition>;
 
 /** Tier ordering, lowest → highest. */
-export const TIER_ORDER: Tier[] = ['basic', 'standard', 'premium'];
 
 /**
  * Chime actions whose IAM resource is purely a CHANNEL (so it carries the
@@ -53,39 +53,11 @@ export const TIER_GATED_CHANNEL_ACTIONS = [
   'chime:ListChannelMemberships',
 ];
 
-/** The classification tag values a tier may act on: itself and every tier below. */
-export function classificationsAllowedFor(tier: Tier): Tier[] {
-  return TIER_ORDER.slice(0, TIER_ORDER.indexOf(tier) + 1);
-}
-
-/**
- * Parse the deployer's `allowedBattleTiers` context into a validated Tier[].
- *
- * /battle is **premium-gated by default but not architecturally premium-only**.
- * This is the single source of truth for which channel tiers may run a battle.
- * Accepts a JSON array (`["premium","standard"]`),
- * a comma list (`premium,standard`), or a single value; unknown tokens are dropped;
- * empty/absent → `['premium']`.
- */
-export function parseAllowedBattleTiers(raw: unknown): Tier[] {
-  if (raw == null || raw === '') return ['premium'];
-  let list: unknown[];
-  if (Array.isArray(raw)) {
-    list = raw;
-  } else if (typeof raw === 'string') {
-    const s = raw.trim();
-    try {
-      list = s.startsWith('[') ? JSON.parse(s) : s.split(',');
-    } catch {
-      list = s.split(',');
-    }
-  } else {
-    list = [raw];
-  }
-  const valid = list
-    .map((t) => String(t).trim().toLowerCase())
-    .filter((t): t is Tier => (TIER_ORDER as string[]).includes(t));
-  return valid.length ? Array.from(new Set(valid)) : ['premium'];
+/** The classification tag values a classification may act on: itself and every one below (by rank).
+ *  Config-driven via the profile registry (SPEC-CAPABILITY-PROFILES) — the same at-or-below set the
+ *  runtime uses for RAG scope, so the IAM boundary and retrieval scope can never drift. */
+export function classificationsAllowedFor(tier: Tier): string[] {
+  return profiles.scopeAtOrBelow(tier);
 }
 
 /**
