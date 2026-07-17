@@ -1,6 +1,6 @@
 # Agent Echelon
 
-**Agent Echelon is a self-hosted agent control plane: a governed, multi-party agentic AI platform that runs entirely in your own AWS account and serves your internal and customer-facing use cases from one place.** It is the governed layer between your agents and everything they touch (the harness around your models), deciding who may act, which model answers, where the context lives, and what gets recorded. It does not bolt a new policy engine and a separate agent-identity service onto your stack: it enforces with the cloud's own primitives - every user and every conversation is an AWS resource with an ARN, so access is an IAM decision, and each agent acts under a bearer-pinned identity, never a shared backend credential. Self-hosted, model-agnostic, MIT-licensed.
+**Agent Echelon is a self-hosted agent control plane: a governed, multi-party agentic AI platform that runs entirely in your own AWS account and serves your internal and customer-facing use cases from one place.** It is the governed layer between your agents and everything they touch (the harness around your models), deciding who may act, which model answers, where the context lives, and what gets recorded. It does not bolt a new policy engine and a separate agent-identity service onto your stack: it enforces with the cloud's own primitives. Every user, assistant, and conversation is an AWS resource with an ARN; every actor holds a bearer-pinned identity, never a shared backend credential; access is an IAM decision keyed on an immutable classification tag: fail-closed, evaluated before any request runs, and provable with a deny test rather than a code review. Classifications are your labels (`internal`, `confidential`, `restricted`, whatever your data taxonomy already says), and each is served by a capability profile that fixes which model answers, at what depth, with what reach. Self-hosted, model-agnostic, MIT-licensed.
 
 The point is centralization. Instead of standing up a separate tool for each use case (a support assistant here, an internal assistant there, each with its own login, data store, bill, and security review), you run one governed platform that serves them all - and a new experience is configuration over the same substrate rather than a new system.
 
@@ -410,17 +410,17 @@ VITE_CLIENT_ID=your-client-id
 VITE_IDENTITY_POOL_ID=your-identity-pool-id
 
 # Amazon Chime SDK Configuration
-# No bot ARN is needed — channels enroll the per-tier assistant server-side.
+# No bot ARN is needed - channels enroll the per-tier assistant server-side.
 VITE_APP_INSTANCE_ARN=your-app-instance-arn
 
 # API Endpoints
-# REQUIRED — the credential exchange is the sole source of Amazon Chime SDK credentials
+# REQUIRED - the credential exchange is the sole source of Amazon Chime SDK credentials
 # (bearer-pinned, classification-capped). Unset means the frontend cannot reach Amazon Chime SDK.
 VITE_CREDENTIAL_EXCHANGE_API_URL=your-credential-exchange-api-url
 VITE_CREATE_CONVERSATION_API_URL=your-create-conversation-api-url
 VITE_PRESIGNED_URL_API_URL=your-presigned-url-api-url
 VITE_ANALYTICS_API_URL=your-analytics-api-url
-# Optional — client-events ingestion endpoint. If unset, frontend
+# Optional - client-events ingestion endpoint. If unset, frontend
 # event tracking (signup/signin/session funnels, DAU, web vitals,
 # error rate) silently no-ops. Source: CDK output
 # AgentEchelonAnalytics.ClientEventsApiUrl.
@@ -675,22 +675,22 @@ cd tests
 npm ci --silent
 npx playwright install chromium --with-deps 2>/dev/null
 
-echo "1. GREETING — Testing greeting responses..."
+echo "1. GREETING - Testing greeting responses..."
 npx playwright test agent-intents.spec.ts -g "greeting" --reporter=list 2>&1 | tail -3
 
-echo "2. ACKNOWLEDGMENT — Testing acknowledgment handling..."
+echo "2. ACKNOWLEDGMENT - Testing acknowledgment handling..."
 npx playwright test agent-intents.spec.ts -g "context" --reporter=list 2>&1 | tail -3
 
-echo "3. GUIDED_TROUBLESHOOTING — Testing analysis/troubleshooting..."
+echo "3. GUIDED_TROUBLESHOOTING - Testing analysis/troubleshooting..."
 npx playwright test agent-intents.spec.ts -g "analysis" --reporter=list 2>&1 | tail -3
 
-echo "4. DATA_EXTRACTION — Testing data extraction..."
+echo "4. DATA_EXTRACTION - Testing data extraction..."
 npx playwright test agent-intents.spec.ts -g "code generation" --reporter=list 2>&1 | tail -3
 
-echo "5. REPORT_GENERATION — Testing task tracking (multi-step)..."
+echo "5. REPORT_GENERATION - Testing task tracking (multi-step)..."
 npx playwright test agent-intents.spec.ts -g "task" --reporter=list 2>&1 | tail -3
 
-echo "6. GENERAL — Testing general Q&A..."
+echo "6. GENERAL - Testing general Q&A..."
 npx playwright test agent-intents.spec.ts -g "question" --reporter=list 2>&1 | tail -3
 
 echo ""
