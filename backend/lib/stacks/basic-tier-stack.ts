@@ -35,6 +35,7 @@ import { AgentGuardrails } from '../constructs/bedrock-guardrails';
 import { getModelCatalog, TierModelSelection } from '../config/model-strategy';
 import {
   tierChannelScopedAllow,
+  classificationsAllowedFor,
   modelArnsForTier,
   resolveSharedSSM,
   adminErrorAlertWiring,
@@ -152,12 +153,12 @@ export class BasicTierStack extends cdk.Stack {
               resources: [props.attachmentsBucketArn],
               // platform-knowledge/* is the AgentEchelon self-knowledge (load_platform_info);
               // every tier may read it (it is not tier-scoped company data).
-              conditions: { StringLike: { 's3:prefix': ['context/basic/*', 'platform-knowledge/*'] } },
+              conditions: { StringLike: { 's3:prefix': [...classificationsAllowedFor(tier).map((c) => `context/${c}/*`), 'platform-knowledge/*'] } },
             }),
             new iam.PolicyStatement({
               actions: ['s3:GetObject'],
               resources: [
-                `${props.attachmentsBucketArn}/context/basic/*`,
+                ...classificationsAllowedFor(tier).map((c) => `${props.attachmentsBucketArn}/context/${c}/*`),
                 `${props.attachmentsBucketArn}/platform-knowledge/*`,
               ],
             }),

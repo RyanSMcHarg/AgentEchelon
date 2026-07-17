@@ -37,6 +37,7 @@ import { BattleImageGuardrails } from '../constructs/battle-image-guardrails';
 import { getModelCatalog, TierModelSelection } from '../config/model-strategy';
 import {
   tierChannelScopedAllow,
+  classificationsAllowedFor,
   modelArnsForTier,
   resolveSharedSSM,
   adminErrorAlertWiring,
@@ -170,16 +171,14 @@ export class PremiumTierStack extends cdk.Stack {
               conditions: {
                 StringLike: {
                   // platform-knowledge/* (load_platform_info) is readable by every tier.
-                  's3:prefix': ['context/basic/*', 'context/standard/*', 'context/premium/*', 'platform-knowledge/*'],
+                  's3:prefix': [...classificationsAllowedFor(tier).map((c) => `context/${c}/*`), 'platform-knowledge/*'],
                 },
               },
             }),
             new iam.PolicyStatement({
               actions: ['s3:GetObject'],
               resources: [
-                `${props.attachmentsBucketArn}/context/basic/*`,
-                `${props.attachmentsBucketArn}/context/standard/*`,
-                `${props.attachmentsBucketArn}/context/premium/*`,
+                ...classificationsAllowedFor(tier).map((c) => `${props.attachmentsBucketArn}/context/${c}/*`),
                 `${props.attachmentsBucketArn}/platform-knowledge/*`,
               ],
             }),

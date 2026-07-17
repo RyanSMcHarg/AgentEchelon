@@ -37,6 +37,7 @@ import { AgentGuardrails } from '../constructs/bedrock-guardrails';
 import { getModelCatalog, TierModelSelection } from '../config/model-strategy';
 import {
   tierChannelScopedAllow,
+  classificationsAllowedFor,
   modelArnsForTier,
   resolveSharedSSM,
   adminErrorAlertWiring,
@@ -169,13 +170,12 @@ export class StandardTierStack extends cdk.Stack {
               actions: ['s3:ListBucket'],
               resources: [props.attachmentsBucketArn],
               // platform-knowledge/* (load_platform_info) is readable by every tier.
-              conditions: { StringLike: { 's3:prefix': ['context/basic/*', 'context/standard/*', 'platform-knowledge/*'] } },
+              conditions: { StringLike: { 's3:prefix': [...classificationsAllowedFor(tier).map((c) => `context/${c}/*`), 'platform-knowledge/*'] } },
             }),
             new iam.PolicyStatement({
               actions: ['s3:GetObject'],
               resources: [
-                `${props.attachmentsBucketArn}/context/basic/*`,
-                `${props.attachmentsBucketArn}/context/standard/*`,
+                ...classificationsAllowedFor(tier).map((c) => `${props.attachmentsBucketArn}/context/${c}/*`),
                 `${props.attachmentsBucketArn}/platform-knowledge/*`,
               ],
             }),
