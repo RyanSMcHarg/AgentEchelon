@@ -44,6 +44,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dynamodb';
 import { randomUUID } from 'crypto';
 import { fanOutChannelNotification } from './lib/channel-notify.js';
+import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const USER_POOL_ID = process.env.USER_POOL_ID || '';
@@ -54,8 +55,6 @@ const ENFORCE_DEFAULT = process.env.MEMBERSHIP_AUDIT_ENFORCE === 'true';
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
 const AUDIT_TABLE = process.env.AUDIT_TABLE || '';
 
-export const TIER_RANK: Record<string, number> = { basic: 1, standard: 2, premium: 3 };
-const TIER_GROUPS = ['basic', 'standard', 'premium'] as const;
 export const AUDITED_EVENT_TYPES = new Set(['CREATE_CHANNEL_MEMBERSHIP', 'UPDATE_CHANNEL_MEMBERSHIP']);
 
 interface ChimeKinesisEvent {
@@ -91,8 +90,10 @@ export function classifyMember(
 /** Pure: is the member's tier below the channel's classification? Unknown tiers fail safe
  *  (member defaults to the lowest rank, channel to `basic`). */
 export function isTierViolation(memberTier: string, channelTier: string): boolean {
-  const m = TIER_RANK[memberTier] ?? 0;
-  const c = TIER_RANK[channelTier] ?? TIER_RANK.basic;
+  // Unknown member clearance ranks BELOW everything (0) so it always over-reports (fail-safe);
+  // unknown channel classification defaults to the fail-closed floor. Ranks come from the registry.
+  const m = profiles.isKnownClassification(memberTier) ? profiles.rank(memberTier) : 0;
+  const c = profiles.isKnownClassification(channelTier) ? profiles.rank(channelTier) : profiles.rank(profiles.failClosedValue);
   return m < c;
 }
 
@@ -153,9 +154,7 @@ async function resolveMemberTier(sub: string): Promise<string | null> {
       new AdminListGroupsForUserCommand({ UserPoolId: USER_POOL_ID, Username: sub }),
     );
     const groups = (resp.Groups || []).map((g) => g.GroupName || '');
-    let tier = 'basic';
-    for (const candidate of TIER_GROUPS) if (groups.includes(candidate)) tier = candidate;
-    return tier;
+    return profiles.clearanceForGroups(groups);
   } catch (err: unknown) {
     const name = (err as { name?: string })?.name;
     if (name === 'UserNotFoundException') return null; // unresolvable — skip, do not act
@@ -173,12 +172,12 @@ async function resolveChannelTier(channelArn: string, _bearerArn: string): Promi
   try {
     const resp = await chime.send(new ListTagsForResourceCommand({ ResourceARN: channelArn }));
     const tag = (resp.Tags || []).find((t) => t.Key === 'classification')?.Value;
-    if (tag && TIER_RANK[tag]) return tag;
-    console.warn('[MembershipAudit] channel missing/invalid classification tag; defaulting basic', { channelArn, tag });
-    return 'basic';
+    if (profiles.isKnownClassification(tag)) return profiles.resolveClassification(tag);
+    console.warn('[MembershipAudit] channel missing/invalid classification tag; failing closed', { channelArn, tag, failClosedTo: profiles.failClosedValue });
+    return profiles.failClosedValue;
   } catch (err) {
-    console.warn('[MembershipAudit] failed to read channel classification tag; defaulting basic:', err);
-    return 'basic';
+    console.warn('[MembershipAudit] failed to read channel classification tag; failing closed:', err);
+    return profiles.failClosedValue;
   }
 }
 
@@ -189,7 +188,7 @@ let botTierMap: Map<string, string> | null = null;
 async function loadBotTierMap(): Promise<Map<string, string>> {
   if (botTierMap) return botTierMap;
   const map = new Map<string, string>();
-  for (const tier of TIER_GROUPS) {
+  for (const tier of profiles.classificationValues()) {
     try {
       const resp = await ssm.send(new GetParameterCommand({ Name: `${SSM_ROOT}/tier/${tier}/bot-arn` }));
       if (resp.Parameter?.Value) map.set(resp.Parameter.Value, tier);
@@ -322,7 +321,11 @@ export async function handler(event: KinesisStreamEvent, _context?: Context): Pr
         const botTier = await resolveBotTier(memberArn);
         if (!botTier) continue;
         const channelTier = await resolveChannelTier(channelArn, adminArn);
-        if ((TIER_RANK[botTier] ?? 0) > (TIER_RANK[channelTier] ?? TIER_RANK.basic)) {
+        // Over-tier assistant: its classification ranks ABOVE the channel's. Unknown bot ranks 0,
+        // unknown channel the fail-closed floor — same fail-safe direction as isTierViolation.
+        const botRank = profiles.isKnownClassification(botTier) ? profiles.rank(botTier) : 0;
+        const chRank = profiles.isKnownClassification(channelTier) ? profiles.rank(channelTier) : profiles.rank(profiles.failClosedValue);
+        if (botRank > chRank) {
           await handleViolation('assistant', channelArn, memberArn, botTier, botTier, channelTier);
         }
       }
