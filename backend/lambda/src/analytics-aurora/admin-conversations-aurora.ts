@@ -130,7 +130,7 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
     sender_arn: string | null; created_at: string; is_bot: boolean | null;
     bedrock_model: string | null; input_tokens: number | null; output_tokens: number | null;
     total_ms: number | null; redacted: boolean | null; deleted: boolean | null;
-    metadata: Record<string, unknown> | null;
+    metadata: Record<string, unknown> | null; intent: string | null;
   }>(
     // Moderation (redact + delete) is archived as a sibling row, NOT a column on
     // the CREATE row: kinesis-archival suffixes the event's MessageId (`-RED` for
@@ -145,6 +145,12 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
             COALESCE(m.updated_content, m.content) AS content,
             m.sender_name, m.sender_arn, m.created_at, m.is_bot, m.bedrock_model,
             m.input_tokens, m.output_tokens, m.total_ms, m.metadata,
+            -- Intent lives ONLY on the exchange (there is no messages.intent column, and it is
+            -- NOT folded into messages.metadata). Pull it from the exchange this message belongs
+            -- to — as either the user prompt or the agent reply — so both turns show the intent.
+            (SELECT ex.intent FROM exchanges ex
+              WHERE ex.agent_message_id = m.id OR ex.user_message_id = m.id
+              LIMIT 1) AS intent,
             (red.message_id IS NOT NULL) AS redacted,
             (del.message_id IS NOT NULL) AS deleted
        FROM messages m
@@ -180,7 +186,7 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
       redacted,
       deleted,
       modelId: r.bedrock_model || undefined,
-      intent: typeof metadata.intent === 'string' ? (metadata.intent as string) : undefined,
+      intent: r.intent || undefined,
       metadata,
       // Inspect-drawer payload: the faithful stored projection of this message.
       raw: {

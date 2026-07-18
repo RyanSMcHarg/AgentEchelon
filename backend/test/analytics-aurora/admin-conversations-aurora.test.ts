@@ -50,13 +50,18 @@ describe('admin-conversations-aurora', () => {
         content: 'Done.<!--corr:abc--> NAVIGATE_CHANNEL:arn:x|Follow-up',
         sender_name: 'Assistant', sender_arn: 'a/bot/1', created_at: '2026-07-15T00:01:00Z',
         is_bot: true, bedrock_model: 'anthropic.claude-3-haiku', input_tokens: 5, output_tokens: 9,
-        total_ms: 1200, metadata: { intent: 'general' },
+        // intent is projected from the exchange (SELECT ... AS intent), NOT read from
+        // metadata — the messages row has no intent, so metadata.intent was always blank.
+        total_ms: 1200, intent: 'general', metadata: {},
       }],
       rowCount: 1,
     } as any);
     const out = await adminListMessages('c1');
     const [sql] = mockedQuery.mock.calls[0] as [string];
     expect(sql).toMatch(/event_type = 'CREATE_CHANNEL_MESSAGE'/);
+    // Intent must come from the exchange, keyed by either side of the pair.
+    expect(sql).toMatch(/exchanges/);
+    expect(sql).toMatch(/agent_message_id|user_message_id/);
     expect(out[0].content).toBe('Done.'); // markers stripped
     expect(out[0].isBot).toBe(true);
     expect(out[0].modelId).toBe('anthropic.claude-3-haiku');
