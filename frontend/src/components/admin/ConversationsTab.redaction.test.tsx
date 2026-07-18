@@ -77,4 +77,22 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
     expect(screen.queryByText(/\[redacted by moderator\]/)).toBeNull();
     expect(screen.queryByText(/\[deleted by moderator\]/)).toBeNull();
   });
+
+  it('still renders messages when the live members call fails (resilient detail load)', async () => {
+    // A delete-only / abandoned channel can 4xx on the live Chime members read. That must
+    // NOT reject the whole detail load and blank the messages — the deleted tombstone must
+    // still render. (Regression: Promise.all with an unguarded members call blanked it.)
+    vi.mocked(svc.listAdminConversationMembers).mockRejectedValue(new Error('Chime 403'));
+    vi.mocked(svc.listAdminConversationMessages).mockResolvedValue([MESSAGES[2]]); // the deleted one
+    render(
+      <ConversationsTab
+        summaryData={null}
+        driftData={null}
+        isLoading={false}
+        deepLinkChannelArn={CHANNEL}
+      />,
+    );
+    expect(await screen.findByText(/\[deleted by moderator\]/)).toBeTruthy();
+    expect(screen.queryByText(/No messages loaded/)).toBeNull();
+  });
 });

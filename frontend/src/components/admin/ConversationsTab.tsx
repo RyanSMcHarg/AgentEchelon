@@ -115,9 +115,13 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
     setIsRefreshing(true);
     try {
       setActionError(null);
+      // Each read degrades independently: the messages are the point of this view, so a
+      // failing live members call (Chime can 4xx on an abandoned/odd channel) or history
+      // read must NOT reject the whole load and blank the messages. Members + history each
+      // fall back to empty; only a messages failure surfaces as an error.
       const [nextMessages, nextMembers, nextHistory] = await Promise.all([
         listAdminConversationMessages(channelArn, 100),
-        listAdminConversationMembers(channelArn),
+        listAdminConversationMembers(channelArn).catch(() => [] as AdminConversationMember[]),
         getAdminMembershipHistory(channelArn).catch(() => [] as AdminMembershipEvent[]),
       ]);
       if (signal?.aborted) return;
