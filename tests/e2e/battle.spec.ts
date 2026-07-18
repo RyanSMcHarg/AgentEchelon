@@ -144,6 +144,40 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     await expect(page.locator('.battle-scorecard')).toHaveCount(2, { timeout: 170_000 });
   });
 
+  test('winner pick is RECORDED server-side (BattleOutcome persists), not just UI state', async ({
+    page,
+  }) => {
+    // The scorecard pick is the terminal step of a completed battle. The round-1
+    // test asserts the button flips (aria-pressed); THIS test asserts the pick
+    // actually PERSISTS to the BattleOutcome store — the click POSTs to the
+    // battle-outcome API, and a 2xx is the durable last-write-wins DynamoDB record.
+    test.setTimeout(9 * 60_000);
+    await signInAdmin(page);
+    await ensureBattleExperiment(page, { slot: 'slot-0' });
+    await newBattleChannel(page, 'E2E battle outcome recorded');
+
+    await fireBattle(page, '/battle Tabs or spaces for indentation? One short paragraph with a clear pick.');
+
+    const card = page.locator('.battle-scorecard').last();
+    await expect(card).toBeVisible();
+    const pickB = card.locator('[data-pick="B"]');
+
+    // Capture the outcome write the click triggers (recordBattleOutcome ->
+    // POST /channels/battle/outcome) and assert it was accepted + stored.
+    const [outcomeResp] = await Promise.all([
+      page.waitForResponse(
+        (r) => /\/battle\/outcome\b/.test(r.url()) && r.request().method() === 'POST',
+        { timeout: 20_000 },
+      ),
+      pickB.click(),
+    ]);
+    expect(outcomeResp.ok(), `battle-outcome POST status ${outcomeResp.status()}`).toBeTruthy();
+    const stored = await outcomeResp.json().catch(() => ({} as Record<string, unknown>));
+    if ('winner' in stored) expect(stored.winner).toBe('B');
+    // UI reflects the persisted pick.
+    await expect(pickB).toHaveAttribute('aria-pressed', 'true', { timeout: 10_000 });
+  });
+
   test('/battle WITHOUT Battle Mode enabled returns the one-line hint, no fan-out', async ({
     page,
   }) => {

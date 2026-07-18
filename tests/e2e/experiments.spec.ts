@@ -96,4 +96,103 @@ suite('A/B experiment produces experiment_results', () => {
       await api.dispose();
     }
   });
+
+  // The FULL A/B lifecycle end to end (the "smoke" test above only proves ONE row
+  // lands). Drives enough premium turns that BOTH weighted variants get assigned,
+  // asserts the head-to-head `experiment_results` carries both arms, exercises the
+  // LLM ship-recommendation, then completes the experiment and confirms the
+  // lifecycle transition. This is the "run an A/B test to completion" coverage.
+  test('drives both variants, reads head-to-head results + recommendation, and completes', async ({ page }) => {
+    // ~8 premium turns (haiku/sonnet variants) + archival + LLM recommendation.
+    test.setTimeout(12 * 60_000);
+
+    await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
+    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    expect(idToken, 'admin idToken in localStorage').toBeTruthy();
+    const api = await pwRequest.newContext({ extraHTTPHeaders: { Authorization: `Bearer ${idToken}` } });
+
+    const draft = draftExperiment();
+    const created = await api.post(EXPERIMENTS_API, { data: draft });
+    expect(created.ok(), `create experiment: ${created.status()} ${await created.text()}`).toBeTruthy();
+
+    try {
+      // 1. Drive enough premium traffic that BOTH 50/50 variants are assigned.
+      // 8 independent turns → P(a variant is never picked) = 0.5^8 ≈ 0.4%.
+      // A fresh premium conversation per turn keeps each an independent assignment.
+      const prompts = [
+        'In one sentence, what is a feature flag?',
+        'One sentence: what is a canary deploy?',
+        'One sentence: what is a blue-green deploy?',
+        'One sentence: what is a rollback?',
+        'One sentence: what is idempotency?',
+        'One sentence: what is a circuit breaker?',
+        'One sentence: what is exponential backoff?',
+        'One sentence: what is a p95 latency?',
+      ];
+      for (let i = 0; i < prompts.length; i++) {
+        await createConversation(page, `AB full ${i} ${Date.now()}`, 'Premium');
+        const resp = await sendAndWaitForResponse(page, prompts[i], 120_000);
+        expect(resp.text && resp.text.length, `turn ${i} produced a reply`).toBeTruthy();
+      }
+
+      // 2. Poll experiment_results until BOTH variants (control + treatment) have a row.
+      const end = new Date();
+      const start = new Date(end.getTime() - 1 * 86_400_000);
+      const variantOf = (x: any): string => x.variant_id ?? x.variantId ?? '';
+      let variants = new Set<string>();
+      for (let i = 0; i < 12 && variants.size < 2; i++) {
+        const r = await api.post(ANALYTICS_API, {
+          data: { queryType: 'experiment_results', dateRange: { start: start.toISOString(), end: end.toISOString() } },
+        });
+        const j = await r.json();
+        variants = new Set(
+          (j.data || [])
+            .filter((x: any) => (x.experiment_id ?? x.experimentId) === draft.experimentId)
+            .map(variantOf)
+            .filter(Boolean),
+        );
+        if (variants.size < 2) await page.waitForTimeout(5000); // archival + pairing lag
+      }
+      expect(
+        Array.from(variants).sort(),
+        `both variants should appear in experiment_results for ${draft.experimentId}`,
+      ).toEqual(['control', 'treatment']);
+
+      // 3. Ship recommendation — the LLM verdict over the collapsed per-variant rows.
+      // It is advisory + descriptive (never reroutes); assert it returns a structured
+      // recommendation, not a specific verdict (which is non-deterministic / may be
+      // "needs more data" at this sample size).
+      const recRes = await api.post(ANALYTICS_API, {
+        data: {
+          queryType: 'experiment_recommendation',
+          experimentId: draft.experimentId,
+          dateRange: { start: start.toISOString(), end: end.toISOString() },
+        },
+      });
+      expect(recRes.ok(), `recommendation query: ${recRes.status()} ${await recRes.text()}`).toBeTruthy();
+      const recJson = await recRes.json();
+      // Tolerant: the recommendation payload shape varies (a per-variant `variants`
+      // breakdown plus a verdict, or a needs-more-data signal at this sample size).
+      // Assert it returns a structured, non-empty payload rather than a specific verdict.
+      expect(
+        recJson && typeof recJson === 'object' && Object.keys(recJson).length > 0,
+        `recommendation returns a structured payload (got ${JSON.stringify(recJson).slice(0, 200)})`,
+      ).toBeTruthy();
+
+      // 4. Complete the lifecycle and confirm the transition (a completed experiment
+      // stops assigning traffic).
+      const done = await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(draft.experimentId)}/status`, { data: { status: 'completed' } });
+      expect(done.ok(), `complete experiment: ${done.status()}`).toBeTruthy();
+      const listed = await api.get(EXPERIMENTS_API);
+      expect(listed.ok(), `list experiments: ${listed.status()}`).toBeTruthy();
+      const experiments = (await listed.json()).data ?? (await listed.json());
+      const mine = (Array.isArray(experiments) ? experiments : []).find(
+        (e: any) => (e.experimentId ?? e.experiment_id ?? e.id) === draft.experimentId,
+      );
+      expect(mine?.status, `experiment ${draft.experimentId} is completed`).toBe('completed');
+    } finally {
+      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(draft.experimentId)}/status`, { data: { status: 'completed' } }).catch(() => {});
+      await api.dispose();
+    }
+  });
 });
