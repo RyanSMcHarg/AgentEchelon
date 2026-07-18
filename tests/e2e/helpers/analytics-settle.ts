@@ -26,7 +26,9 @@ export const SECTION_QUERIES: Record<string, string[]> = {
     'error_rate_daily',
   ],
   Conversations: ['conversation_summaries', 'drift_events'],
-  Quality: ['evaluation_scores'],
+  // The Effectiveness section opens on its default 'effectiveness' tab, which fires
+  // intent_effectiveness (not evaluation_scores — that's the Evaluations sub-tab).
+  Effectiveness: ['intent_effectiveness'],
   Models: ['model_usage', 'model_effectiveness'],
   Experiments: ['experiment_results'],
   Users: [

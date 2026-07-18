@@ -62,7 +62,7 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     const rail = page.locator('.admin-section-rail');
     await expect(rail.locator('button:has-text("Overview")')).toBeVisible();
     await expect(rail.locator('button:has-text("Conversations")')).toBeVisible();
-    await expect(rail.locator('button:has-text("Quality")')).toBeVisible();
+    await expect(rail.locator('button:has-text("Effectiveness")')).toBeVisible();
     await expect(rail.locator('button:has-text("Models")')).toBeVisible();
     await expect(rail.locator('button:has-text("Experiments")')).toBeVisible();
     await expect(rail.locator('button:has-text("Users")').first()).toBeVisible();
@@ -111,12 +111,16 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     // Every top-level section must render without a broken-view banner
     // ("Analytics API unavailable", .admin-error). "Not implemented in this
     // mode" / "no data" notices are surfaced (logged) but allowed.
-    for (const section of ['Overview', 'Conversations', 'Quality', 'Models', 'Experiments', 'Users']) {
+    for (const section of ['Overview', 'Conversations', 'Effectiveness', 'Models', 'Experiments', 'Users']) {
       // Arm response waiters BEFORE the click that triggers the load, so we
       // deterministically wait for the section's analytics queries to SETTLE
       // instead of racing a fixed 2.5s timeout (one real query runs ~3.4s
       // server-side, which the fixed wait lost to — mis-flagging the banner).
-      const waiters = section === 'Overview' ? overviewWaiters : armSettle(page, SECTION_QUERIES[section]);
+      // Cap the per-section settle at 10s: the dashboard serves section data from
+      // cache on switch (the analytics POST does not always re-fire), so a hard
+      // 25s wait per section would sum past the test timeout. 10s still lets a real
+      // query (~3.4s) settle; the banner check below is what actually validates.
+      const waiters = section === 'Overview' ? overviewWaiters : armSettle(page, SECTION_QUERIES[section], 10000);
       await rail.locator(`button:has-text("${section}")`).first().click();
       await expect(page.locator(`.admin-section-btn.active:has-text("${section}")`)).toBeVisible();
       // Wait for every expected analytics response, then let React flush the
@@ -153,9 +157,9 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     await expect(page.locator('.admin-filter-btn:has-text("Browser")')).toBeVisible();
     await expect(page.locator('.admin-filter-btn:has-text("Drift Detection")')).toBeVisible();
 
-    // Quality section → Evaluations is the (only, in Athena) sub-view
-    await rail.locator('button:has-text("Quality")').click();
-    await expect(page.locator('.admin-section-btn.active:has-text("Quality")')).toBeVisible();
+    // Effectiveness section → Evaluations is the (only, in Athena) sub-view
+    await rail.locator('button:has-text("Effectiveness")').click();
+    await expect(page.locator('.admin-section-btn.active:has-text("Effectiveness")')).toBeVisible();
 
     // Overview section → Latency sub-tab
     await rail.locator('button:has-text("Overview")').click();
@@ -220,7 +224,7 @@ test.describe('Admin Dashboard - Base Tabs', () => {
 
 test.describe('Admin Dashboard - Aurora Tabs', () => {
   // These tests run against a deployment with analyticsMode=aurora. The Aurora
-  // Quality sub-tabs (Flows/Flagged/Ground Truth/Tasks) are gated on the admins
+  // Effectiveness sub-tabs (Flows/Flagged/Ground Truth/Tasks) are gated on the admins
   // Cognito group: analyticsMode is resolved by probing the analytics API, which
   // 403s for a premium-but-not-admin user and falls back to 'athena', hiding the
   // Aurora tabs. So we sign in as testAdmin (premium tier AND admins group).
@@ -230,19 +234,19 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
 
   // Open the console and confirm Aurora mode is live (the badge only renders when
   // analyticsMode === 'aurora'). The two-level nav groups the Aurora analytics
-  // views as sub-tabs under the "Quality" section.
+  // views as sub-tabs under the "Effectiveness" section.
   async function openAdmin(page: import('@playwright/test').Page) {
     await page.locator('[data-testid="admin-button"], button:has-text("Admin")').click();
     await expect(page.locator('.status-badge--live')).toBeVisible({ timeout: 20000 });
   }
-  async function openQuality(page: import('@playwright/test').Page) {
-    await page.locator('.admin-section-btn:has-text("Quality")').click();
+  async function openEffectiveness(page: import('@playwright/test').Page) {
+    await page.locator('.admin-section-btn:has-text("Effectiveness")').click();
     await expect(page.locator('.admin-subtabs')).toBeVisible();
   }
 
-  test('should show the Aurora Quality sub-tabs when Aurora is deployed', async ({ page }) => {
+  test('should show the Aurora Effectiveness sub-tabs when Aurora is deployed', async ({ page }) => {
     await openAdmin(page);
-    await openQuality(page);
+    await openEffectiveness(page);
     // Sub-tab buttons carry stable ids (admin-tab-<tabId>).
     await expect(page.locator('#admin-tab-flows')).toBeVisible();
     await expect(page.locator('#admin-tab-flagged')).toBeVisible();
@@ -252,14 +256,14 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
 
   test('should display Flows tab with multi-turn evaluation', async ({ page }) => {
     await openAdmin(page);
-    await openQuality(page);
+    await openEffectiveness(page);
     await page.locator('#admin-tab-flows').click();
     await expect(page.locator('h3:has-text("Intent Flows")')).toBeVisible();
   });
 
   test('should display Flagged tab with review queue', async ({ page }) => {
     await openAdmin(page);
-    await openQuality(page);
+    await openEffectiveness(page);
     await page.locator('#admin-tab-flagged').click();
     await expect(page.locator('h3:has-text("Flagged Responses")')).toBeVisible();
 
@@ -270,14 +274,14 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
 
   test('should display Ground Truth tab with calibration metrics', async ({ page }) => {
     await openAdmin(page);
-    await openQuality(page);
+    await openEffectiveness(page);
     await page.locator('#admin-tab-ground_truth').click();
     await expect(page.locator('h3:has-text("Ground Truth Calibration")')).toBeVisible();
   });
 
   test('should display Tasks tab with metrics and detail views', async ({ page }) => {
     await openAdmin(page);
-    await openQuality(page);
+    await openEffectiveness(page);
     await page.locator('#admin-tab-tasks').click();
     await expect(page.locator('h3:has-text("Task Tracking")')).toBeVisible();
 
