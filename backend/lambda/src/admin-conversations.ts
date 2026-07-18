@@ -27,7 +27,7 @@ import {
   QueryExecutionState,
 } from '@aws-sdk/client-athena';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { callerIsAdmin } from './lib/auth.js';
+import { callerIsAdmin, callerCanReadArchive } from './lib/auth.js';
 // Aurora-mode read path: when the data-plane ARN is wired (analyticsMode=aurora),
 // read conversations from Aurora via the VPC data-plane Lambda instead of Athena
 // (the Athena archive query is too slow — 15-27s > API Gateway's 29s cap — and
@@ -176,6 +176,12 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
   if (!isAllowedOrigin(origin)) return respond(403, { error: 'Origin not allowed' }, origin);
   const authError = requireAdmin(event);
   if (authError) return respond(403, { error: authError }, origin);
+  // Every endpoint here reads conversation ARCHIVE content, a SEPARABLE authorization from base
+  // admin so a future role can be denied archive access. Interim group gate (callerCanReadArchive,
+  // default = the admin groups); the IAM-enforceable capability is the tracked follow-up.
+  if (!callerCanReadArchive(event)) {
+    return respond(403, { error: 'Archive-view permission required' }, origin);
+  }
 
   // Resolve the Aurora data-plane ARN (once) before the read functions branch.
   await ensureDataPlaneArn();

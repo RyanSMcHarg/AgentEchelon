@@ -275,6 +275,60 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
   });
 }
 
+export interface AdminConvEvent {
+  eventType: string;
+  messageId: string | null;
+  senderName: string | null;
+  senderArn: string | null;
+  targetArn: string | null;
+  content: string | null;
+  createdAt: string;
+  isBot: boolean;
+  metadata: Record<string, unknown> | null;
+}
+
+/**
+ * The COMPLETE archived event log for a channel — every event_type (message
+ * create/update/redact/delete, membership create/update/delete, channel create/update/delete)
+ * ordered by time. For the dev-persona "all events" view. A moderated message's CREATE-row
+ * content is blanked here too, so the raw archive can't leak redacted/deleted text.
+ */
+export async function adminListEvents(channelArn: string): Promise<AdminConvEvent[]> {
+  const res = await query<{
+    event_type: string; message_id: string | null; sender_name: string | null;
+    sender_arn: string | null; target_arn: string | null; content: string | null;
+    created_at: string; is_bot: boolean | null; metadata: Record<string, unknown> | null;
+    moderated: boolean | null;
+  }>(
+    `SELECT m.event_type, m.message_id, m.sender_name, m.sender_arn, m.target_arn,
+            COALESCE(m.updated_content, m.content) AS content, m.created_at, m.is_bot, m.metadata,
+            EXISTS (
+              SELECT 1 FROM messages x
+               WHERE x.channel_arn = m.channel_arn
+                 AND x.event_type IN ('REDACT_CHANNEL_MESSAGE','DELETE_CHANNEL_MESSAGE')
+                 AND x.message_id IN (m.message_id || '-RED', m.message_id || '-DEL')
+            ) AS moderated
+       FROM messages m
+      WHERE m.channel_arn = $1
+      ORDER BY m.created_at ASC, m.event_type ASC`,
+    [channelArn],
+  );
+  return res.rows.map((r) => {
+    const moderatedCreate = r.moderated === true && r.event_type === 'CREATE_CHANNEL_MESSAGE';
+    return {
+      eventType: r.event_type,
+      messageId: r.message_id,
+      senderName: r.sender_name,
+      senderArn: r.sender_arn,
+      targetArn: r.target_arn,
+      content: moderatedCreate ? '' : r.content ? stripMessageMarkers(r.content) : r.content,
+      createdAt: r.created_at,
+      isBot: r.is_bot === true,
+      metadata: (r.metadata as Record<string, unknown>) || null,
+    };
+  });
+}
+
 const MEMBERSHIP_ACTION: Record<string, string> = {
   CREATE_CHANNEL_MEMBERSHIP: 'joined',
   DELETE_CHANNEL_MEMBERSHIP: 'left',

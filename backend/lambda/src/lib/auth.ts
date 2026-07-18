@@ -176,6 +176,31 @@ export function callerIsAdmin(event: APIGatewayProxyEvent): boolean {
   return parseGroups(claims['cognito:groups']).some((g) => ADMIN_GROUPS.has(g));
 }
 
+/**
+ * Reading conversation ARCHIVE content — the conversation/message reads and the complete raw
+ * event log — is a **separable** authorization from base admin, so a deployer can build a role
+ * that is admin for other functions yet is DENIED archive access.
+ *
+ * INTERIM (this seam): a distinct, configurable Cognito group `ARCHIVE_VIEW_GROUP_NAMES`,
+ * defaulting to the admin groups so current admins keep access; narrow it to deny a role.
+ * The IAM-ENFORCEABLE version (a credential-exchange `view-archive` capability, like redact/
+ * delete) is the tracked follow-up — this group gate is the placeholder for that action, NOT
+ * the final control. See memory `admin-actions-iam-enforceable` + PLAN-NEXT-STEPS.
+ */
+const ARCHIVE_VIEW_GROUPS = new Set<string>(
+  (process.env.ARCHIVE_VIEW_GROUP_NAMES || process.env.ADMIN_GROUP_NAMES || 'admins')
+    .split(',')
+    .map((g) => g.trim())
+    .filter(Boolean),
+);
+
+export function callerCanReadArchive(event: APIGatewayProxyEvent): boolean {
+  if (isServiceAdminCall(event)) return true;
+  const claims = event.requestContext?.authorizer?.claims as Record<string, unknown> | undefined;
+  if (!claims) return false;
+  return parseGroups(claims['cognito:groups']).some((g) => ARCHIVE_VIEW_GROUPS.has(g));
+}
+
 /** Standard CORS headers for API Gateway responses. */
 export function corsHeaders(origin?: string): Record<string, string> {
   return {

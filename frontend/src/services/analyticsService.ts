@@ -54,6 +54,13 @@ export async function detectAnalyticsMode(): Promise<'athena' | 'aurora'> {
  * admin identity (from the JWT) into moderation_actions — the client only names the target, never
  * the actor. Best-effort: the Chime redact/delete already succeeded, so callers ignore failures.
  */
+/** The COMPLETE archived event log for a channel (every event_type) — the dev-persona view.
+ *  Served by the analytics API's channel_events query. */
+export async function listChannelEvents(channelArn: string): Promise<import('../types').AdminConversationEvent[]> {
+  const res = await queryAnalytics('channel_events' as QueryType, { start: '', end: '' }, { channelArn });
+  return ((res.data as unknown) as import('../types').AdminConversationEvent[]) || [];
+}
+
 export async function recordModeration(
   channelArn: string,
   messageId: string,

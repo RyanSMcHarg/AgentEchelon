@@ -14,9 +14,10 @@ import {
 } from '../../services/adminConversationService';
 import MessageInspectDrawer from './MessageInspectDrawer';
 import MembershipTimeline from './MembershipTimeline';
-import { recordModeration } from '../../services/analyticsService';
+import { recordModeration, listChannelEvents } from '../../services/analyticsService';
 import type { AnalyticsResult } from '../../types/analytics';
 import type {
+  AdminConversationEvent,
   AdminConversationMember,
   AdminConversationMessage,
   AdminConversationSummary,
@@ -83,6 +84,11 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
   // actions) so we can tell loading / load-error / genuinely-empty apart.
   const [listError, setListError] = useState<string | null>(null);
   const [hasLoadedList, setHasLoadedList] = useState(false);
+  // Complete raw event log (dev-persona view) — lazy-loaded on demand per conversation.
+  const [events, setEvents] = useState<AdminConversationEvent[]>([]);
+  const [showEvents, setShowEvents] = useState(false);
+  const [eventsLoading, setEventsLoading] = useState(false);
+  const [eventsError, setEventsError] = useState<string | null>(null);
 
   const driftEvents = driftData?.data ?? [];
 
@@ -137,6 +143,20 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
     }
   }
 
+  async function loadEvents(channelArn: string) {
+    setEventsLoading(true);
+    setEventsError(null);
+    try {
+      setEvents(await listChannelEvents(channelArn));
+    } catch (e) {
+      setEvents([]);
+      // A role without archive-view permission gets a 403 here — surface it, don't crash.
+      setEventsError(e instanceof Error ? e.message : 'Failed to load events');
+    } finally {
+      setEventsLoading(false);
+    }
+  }
+
   useEffect(() => {
     loadConversationList();
   }, []);
@@ -165,6 +185,9 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
   useEffect(() => {
     if (!selectedConversation?.channelArn) return;
 
+    // Collapse the raw event log when switching conversations (lazy-load again on demand).
+    setShowEvents(false);
+    setEvents([]);
     const controller = new AbortController();
     loadConversationDetail(selectedConversation.channelArn, controller.signal);
 
@@ -395,6 +418,50 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
               <h4 style={{ marginTop: 'var(--space-4)' }}>Membership history</h4>
               <MembershipTimeline events={membershipHistory} />
             </div>
+          </div>
+
+          {/* Complete raw event log — dev-persona view of EVERY archived event for this channel
+              (message create/update/redact/delete, membership create/update/delete, channel). Lazy. */}
+          <div className="admin-section">
+            <div className="admin-tab-header" style={{ marginBottom: 'var(--space-2)' }}>
+              <h4 style={{ margin: 0 }}>All events (raw log)</h4>
+              <button
+                className="admin-filter-btn"
+                onClick={() => {
+                  const next = !showEvents;
+                  setShowEvents(next);
+                  if (next && selectedConversation && events.length === 0) {
+                    loadEvents(selectedConversation.channelArn);
+                  }
+                }}
+              >
+                {showEvents ? 'Hide' : eventsLoading ? 'Loading…' : 'Show all events'}
+              </button>
+            </div>
+            {showEvents && (
+              <DataTable
+                columns={[
+                  { key: 'createdAt', label: 'Time', render: (v) => new Date(String(v)).toLocaleString() },
+                  { key: 'eventType', label: 'Event' },
+                  {
+                    key: 'senderName',
+                    label: 'Actor',
+                    render: (v, row) => String(v ?? (row as AdminConversationEvent).senderArn ?? ''),
+                  },
+                  { key: 'targetArn', label: 'Target', render: (v) => (v ? String(v).split('/').pop() : '') },
+                  {
+                    key: 'content',
+                    label: 'Detail',
+                    render: (v) => {
+                      const s = v == null ? '' : String(v);
+                      return s.length > 120 ? `${s.slice(0, 120)}…` : s;
+                    },
+                  },
+                ]}
+                data={events}
+                emptyMessage={eventsError || (eventsLoading ? 'Loading events…' : 'No events')}
+              />
+            )}
           </div>
         </div>
 

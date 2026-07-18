@@ -208,6 +208,19 @@ export interface AdminConversationMessage {
   raw?: Record<string, unknown>;
 }
 
+/** One raw archived event (any event_type) for the complete dev-persona event log. */
+export interface AdminConversationEvent {
+  eventType: string;
+  messageId: string | null;
+  senderName: string | null;
+  senderArn: string | null;
+  targetArn: string | null;
+  content: string | null;
+  createdAt: string;
+  isBot: boolean;
+  metadata?: Record<string, unknown> | null;
+}
+
 /** One membership-change event (join/leave/moderator) from the archive — audit timeline. */
 export interface AdminMembershipEvent {
   action: 'joined' | 'left' | 'granted_moderator' | 'revoked_moderator' | string;

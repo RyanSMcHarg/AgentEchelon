@@ -19,8 +19,8 @@ import { DynamoDBDocumentClient, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { stripMessageMarkers } from '../lib/message-markers.js';
 import { query, ensureSchema } from './db-client.js';
 import { estimateStepCostUsd, bedrockModelIdToKey } from '../lib/model-rate-table.js';
-import { callerIsAdmin } from '../lib/auth.js';
-import { recordModerationAction } from './admin-conversations-aurora.js';
+import { callerIsAdmin, callerCanReadArchive } from '../lib/auth.js';
+import { recordModerationAction, adminListEvents } from './admin-conversations-aurora.js';
 import {
   aggregateVariantFeedback,
   aggregateBattleWins,
@@ -176,6 +176,12 @@ export async function handler(
       // the client body — so attribution can't be spoofed. Intercepted before query dispatch.
       const mod = await maybeRecordModeration(event.body, callerSub, claims);
       if (mod) return mod;
+      // The complete raw event log reads conversation ARCHIVE content — a SEPARABLE authorization
+      // from base admin (a future role can be denied it). Interim group gate; IAM-enforceable
+      // capability is the tracked follow-up. See callerCanReadArchive.
+      if (isArchiveReadBody(event.body) && !callerCanReadArchive(event)) {
+        return error(403, 'Archive-view permission required');
+      }
       return handlePostQuery(event.body);
     }
 
@@ -468,6 +474,7 @@ const POST_DISPATCH: Record<
   task_details: { fn: getTaskDetails, dataKey: 'data' },
   task_timeline: { fn: getTaskTimeline, dataKey: 'data' },
   intent_effectiveness: { fn: getIntentEffectiveness, dataKey: 'data' },
+  channel_events: { fn: getChannelEvents, dataKey: 'events' },
   intent_exchanges: { fn: getIntentExchanges, dataKey: 'data' },
   cross_conversation_context: { fn: getConversationContext, dataKey: 'contexts' },
   latency_metrics: { fn: getLatencyMetrics, dataKey: 'data' },
@@ -542,6 +549,26 @@ async function maybeRecordModeration(
     return error(500, 'Failed to record moderation');
   }
   return success({ recorded: true });
+}
+
+/** Complete archived event log for one channel (dev-persona view). POST { queryType:
+ *  'channel_events', channelArn }. Admin-gated like every POST here. */
+/** True when the POST body requests the complete raw event log (archive-read gated). */
+function isArchiveReadBody(rawBody: string | null): boolean {
+  try {
+    return JSON.parse(rawBody || '{}').queryType === 'channel_events';
+  } catch {
+    return false;
+  }
+}
+
+async function getChannelEvents(
+  params: Record<string, string | undefined>,
+): Promise<APIGatewayProxyResult> {
+  const channelArn = params.channelArn || '';
+  if (!channelArn) return error(400, 'channelArn is required');
+  const events = await adminListEvents(channelArn);
+  return success({ events });
 }
 
 async function handlePostQuery(rawBody: string | null): Promise<APIGatewayProxyResult> {
