@@ -134,6 +134,32 @@ a "paused" banner instead of database timeouts. As an operator:
 - Sleep/wake events are emailed to `sleepRecipients` via SNS (delivered even
   while asleep). Nothing is torn down; wake is a fast, reversible capacity change.
 
+## Admin notifications - where audit and error alerts land
+
+The platform raises admin-facing alerts - Layer 6 membership-audit findings (over-tier
+memberships) and admin-error alerts - and delivers them into a dedicated **Admin
+Notifications** conversation, in-app plus email. Enable it at deploy time:
+
+- **Turn it on:** deploy with `-c enableAdminNotificationChannel=true`. When it is off,
+  those alerts fall back to **log-only** (CloudWatch) - they are not lost, but no human is
+  paged. (You can instead point the audit at an existing channel with
+  `-c membershipAuditAlertChannelArn=<arn>`, but the managed channel is the simpler path.)
+- **Who owns it and who receives it.** The channel is created and owned by the **admin
+  agent** (an AgentEchelon assistant, defined by a capability profile), which is also the
+  identity that posts every alert. Its **members are the `admins` Cognito group**, and they
+  are the in-app + email recipients. The service app-instance-admin identity is deliberately
+  **never a member** - it is the cross-channel moderation identity and stays out of channel
+  rosters; the admin agent, not the service admin, posts.
+- **Adding an admin later.** Membership is synced when the channel is provisioned. A person
+  added to the `admins` group after the last deploy is not a recipient until the channel is
+  re-provisioned - either redeploy, or run the repair script below.
+- **Provision or repair without a deploy:** from `backend/`,
+  `AWS_REGION=<region> node scripts/provision-admin-channel.mjs`. It finds-or-creates the
+  channel, re-syncs the `admins` roster, and prints the channel ARN. Idempotent and safe to
+  re-run.
+
+Design and identity model: `docs/specs/identity-access/SPEC-ADMIN-AGENT-NOTIFICATIONS.md`.
+
 ## Related docs
 - [`LATENCY-TARGETS.md`](../developer/LATENCY-TARGETS.md) - the industry basis for the latency targets and where the time goes in the message flow.
 - [`MESSAGE-FLOW.md`](../developer/MESSAGE-FLOW.md) - how a message travels, the tool loop, and the placeholder/update delivery that makes TTFF the perceived metric.
@@ -142,4 +168,5 @@ a "paused" banner instead of database timeouts. As an operator:
   inference-layer Guardrails, near-real-time Kinesis tap, admin console,
   client-side validation - an open set) + the app-instance-admin.
 - `docs/specs/admin-console/SPEC-ADMIN-CONSOLE.md` - the design behind this console.
+- `docs/specs/identity-access/SPEC-ADMIN-AGENT-NOTIFICATIONS.md` - the admin agent + admin notification channel (where audit/error alerts land, and the bot-owns-the-channel identity model).
 - `docs/guides/admin/AURORA-MODE-GUIDE.md` - enabling Aurora mode + its extra views.
