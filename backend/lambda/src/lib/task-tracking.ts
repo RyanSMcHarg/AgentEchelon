@@ -94,8 +94,10 @@ export const TASK_STATE_MACHINES: Record<string, string[]> = {
     'collecting_requirements',
     'drafting_outline',
     'generating',
-    'revising',
     'completed',
+    // 'revising' is a user-requested rework branch (see task-state-machines.ts), not part of the
+    // linear deliver-on-generation happy path; the authoritative graph governs it.
+    'revising',
   ],
   // Place-an-item task. place_item gathers WHERE a new item
   // goes (position + what it involves) then proposes a placed add_item. The advance is driven by the

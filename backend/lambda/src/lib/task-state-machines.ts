@@ -53,7 +53,8 @@ export class TaskMachineValidationError extends Error {
  *  - guided_troubleshooting: `diagnosing -> collecting_symptoms` (need more info) and
  *    `awaiting_result -> {resolved | diagnosing | escalated}` (worked / didn't / give up).
  *  - data_extraction: `extracting -> collecting_requirements` regression.
- *  - report_generation: `revising -> generating` loop edge.
+ *  - report_generation: `generating -> completed` delivers on generation (default); `revising` is a
+ *    user-requested rework only, with `revising -> {completed | generating}`.
  *  - place_item: advanced by the propose_item tool's success side-effect (collecting -> confirming).
  *  - action_item: options_presented entered by the model's own tool call.
  */
@@ -84,8 +85,12 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
     states: {
       collecting_requirements: { transitions: ['drafting_outline'] },
       drafting_outline: { transitions: ['generating'] },
-      generating: { transitions: ['revising'] },
-      revising: { transitions: ['generating', 'completed'] }, // loop: another revision pass, or finish
+      // Deliver the report on generation: generating -> completed is the DEFAULT path. A generated
+      // report is a finished deliverable; the user is never forced to run a revision pass. `revising`
+      // is entered ONLY when the user explicitly asks for changes (generating -> revising, then apply
+      // and re-deliver via revising -> completed, or regenerate).
+      generating: { transitions: ['completed', 'revising'] },
+      revising: { transitions: ['completed', 'generating'] }, // apply the requested changes -> deliver, or regenerate
       completed: { transitions: [], terminal: 'success' },
     },
   },

@@ -393,17 +393,16 @@ Present a report outline for approval:
 
     case 'generating':
       return `\n\n## CURRENT TASK: Report Generation - Generating
-Generate the report content:
-- Follow the approved outline
-- Include relevant data and analysis
-- Use appropriate formatting (headers, tables, etc.)`;
+Generate the full report and DELIVER it:
+- Follow the approved outline; include relevant data and analysis; use appropriate formatting (headers, tables, etc.).
+- The report is a finished deliverable. When you present it, mark the task done: advance_task_state to \`completed\`.
+- Do NOT make the user run a revision pass. Only if the user later asks for changes, advance to \`revising\`.`;
 
     case 'revising':
-      return `\n\n## CURRENT TASK: Report Generation - Revising
-Revise the report based on user feedback:
-- Make requested changes
-- Highlight what was modified
-- Ask if further revisions are needed`;
+      return `\n\n## CURRENT TASK: Report Generation - Revising (user-requested changes)
+The user asked for changes to a report you already delivered. Apply them:
+- Make the requested changes and briefly highlight what you modified.
+- Re-deliver: advance_task_state back to \`completed\`. Stay in revising only if the user asks for further changes.`;
 
     default:
       return '\n\n## CURRENT TASK: Report Generation\nHelp the user create their report.';
