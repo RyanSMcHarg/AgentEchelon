@@ -70,7 +70,7 @@ This deploys ~14 stacks in Aurora mode with `/battle` default-on (the base featu
 On first deploy, the stack automatically:
 
 1. Creates the VPC and Aurora cluster
-2. Runs every schema migration in `schema/` in order (currently `001-initial` through `011-eval-task-join-key`)
+2. Runs every schema migration in `schema/` in order (currently `001-initial` through `012-moderation-actions`)
 3. Sets up IAM authentication on the database user
 4. Creates the RDS Proxy and wires all Lambdas
 
@@ -117,6 +117,7 @@ SQL migrations live in `backend/lambda/src/analytics-aurora/schema/` and run in 
 | `009-drift-reasoning-decision.sql` | `drift_events` reasoning-decision columns: LLM verdict + human-auditable rationale; cosine similarity retained only for retrieval |
 | `010-task-state-machine.sql` | `task_state` + `task_transition` (JSONB) on `messages` and `exchanges`: the declared-graph machine state per turn (distinct from `task_status`), for the Effectiveness turn timeline |
 | `011-eval-task-join-key.sql` | `evaluation_results.task_id`: the flow join key Pass A stamps at write time (paired with the existing `flow_id`) |
+| `012-moderation-actions.sql` | `moderation_actions`: who redacted/deleted which message and when, stamped with the server-verified admin identity (the Chime redact/delete event keeps the original author, so this table is the source for admin-console attribution) |
 
 Migrations are idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE EXTENSION IF NOT EXISTS`). Adding a new migration:
 

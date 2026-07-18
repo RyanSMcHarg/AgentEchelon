@@ -56,6 +56,9 @@ section 6 extends.
 | C7 | Add / remove members, grant moderator | Chime | `chime:CreateChannelMembership`, `chime:DeleteChannelMembership`, `chime:CreateChannelModerator` | High | Full | None | None | None |
 | C8 | Update / delete a channel | Chime | `chime:UpdateChannel`, `chime:DeleteChannel` | High | Full | None | None | None |
 
+The `view` capability also grants `chime:ListChannelMembershipsForAppInstanceUser` (the caller's own
+conversation-list discovery), which is out of scope for this admin-channel table.
+
 ### 3b. Archive and analytics plane (IAM enforcement proposed here)
 
 Today group-gated (`callerIsAdmin` / `callerCanReadArchive`), NOT IAM. The IAM-action column is the
@@ -65,26 +68,28 @@ target `execute-api:Invoke` resource (section 6); wiring it is the work this spe
 |---|---|---|---|---|---|---|---|---|
 | A1 | Conversation list (channels, tiers, counts) | Aurora + Athena | `execute-api` `POST /admin/conversations` | Low | Full | Full | Scoped | Scoped |
 | A2 | Message content, full history incl. redacted/deleted (PII) | Aurora + Athena | `execute-api` `GET /admin/messages` | High | Full | Scoped | Scoped | Scoped |
-| A3 | Complete raw event log (all event types) | Aurora + Athena | `execute-api` `POST /admin/events` | Med | Full | Full | Scoped | Scoped |
+| A3 | Complete raw event log (all event types) | Aurora + Athena | `execute-api` `POST /admin/events` | Med | Full | Full | Scoped | None |
 | A4 | Membership history (joins / leaves / moderator grants) | Aurora + Athena | `execute-api` `GET /admin/membership-history` | Low-Med | Full | Full | Scoped | Scoped |
-| A5 | Moderation-action audit (who redacted / deleted, when) | Aurora only | `execute-api` `POST /admin/moderation-audit` | Med | Full | Scoped | None | Scoped |
-| A6 | Intent classification + distribution | Aurora + Athena | `execute-api` `POST /admin/quality` | Low | Full | Full | Full | Scoped |
+| A5 | Moderation-action audit (who redacted / deleted, when) | Aurora (`moderation_actions`); events also in Athena archive | `execute-api` `POST /admin/moderation-audit` | Med | Full | Scoped | None | Scoped |
+| A6 | Intent classification + distribution | Aurora + Athena | `execute-api` `POST /admin/quality` | Low | Full | Full | Full | None |
 | A7 | Evaluations (Pass A relevance, Pass B flow scores) | Aurora only | `execute-api` `POST /admin/quality` | Low | Full | Scoped | Full | None |
 | A8 | Tool usage / execution steps (ConverseStep tools) | Aurora only | `execute-api` `POST /admin/quality` | Low-Med | Full | Full | Full | None |
-| A9 | Model attribution / cost / latency | Aurora + Athena | `execute-api` `POST /admin/analytics` | Low | Full | Full | Full | Scoped |
-| A10 | Drift events (topic drift, embeddings) | Aurora only (pgvector) | `execute-api` `POST /admin/quality` | Low | Full | Full | Full | Scoped |
+| A9 | Model attribution / cost / latency | Aurora + Athena | `execute-api` `POST /admin/analytics` | Low | Full | Full | Full | None |
+| A10 | Drift events (topic drift, embeddings) | Aurora only (pgvector) | `execute-api` `POST /admin/quality` | Low | Full | Full | Full | None |
 | A11 | Experiments (A/B results) | DynamoDB + Aurora | `execute-api` `POST /admin/analytics` | Low | Full | Scoped | Full | None |
-| A12 | Feedback (thumbs) | DynamoDB + Aurora | `execute-api` `POST /admin/analytics` | Low | Full | Scoped | Full | Scoped |
-| A13 | User activity / signup + signin funnels (identities) | Aurora + Athena | `execute-api` `POST /admin/analytics` | Med (PII) | Full | Scoped | None | Scoped |
+| A12 | Feedback (thumbs) | DynamoDB + Aurora | `execute-api` `POST /admin/analytics` | Low | Full | Scoped | Full | None |
+| A13 | User activity / signup + signin funnels (identities) | Aurora + Athena | `execute-api` `POST /admin/user-activity` | Med (PII) | Full | Scoped | None | None |
 | A14 | Flagged responses / ground truth | Aurora only | `execute-api` `POST /admin/quality` | Low | Full | Scoped | Full | None |
-| A15 | Task tracking / flows (task_state, intent_flows) | Aurora only | `execute-api` `POST /admin/quality` | Low | Full | Full | Full | Scoped |
+| A15 | Task tracking / flows (task_state, intent_flows) | Aurora only | `execute-api` `POST /admin/quality` | Low | Full | Full | Full | None |
 | A16 | Configuration (profiles, classifications, connectors, tiers) | Deploy config / SSM | `execute-api` `POST /admin/config` | High | Full | Read | Scoped | None |
 | A17 | Security / access audit (who could act) | Logs + Aurora | `execute-api` `POST /admin/security` | High | Full | Scoped | None | None |
 | A18 | Infra health (RDS, cost, sleep mode) | CloudWatch / CDK | native IAM (`cloudwatch:*`) | Med | Full | Full | None | None |
 
 Notes:
-- **Aurora-only** rows (A5, A7, A8, A10, A14, A15) have no data in Athena mode; the console shows a
-  "requires Aurora" notice. The capability still exists; only the data differs by mode.
+- **Aurora-only** rows (A7, A8, A10, A14, A15) have no data in Athena mode; the console shows a
+  "requires Aurora" notice. The capability still exists; only the data differs by mode. A5's
+  queryable `moderation_actions` view is Aurora-only, though the redact/delete events themselves also
+  flow to the Athena archive (the moderation tap, `SPEC-ACCESS-AND-CONTROLS-AUDITING.md`).
 - **C1 vs A2.** Chime C1 is the live channel (current, non-deleted) and is already IAM-enforced. A2
   is the archive: the full history including redacted/deleted, the sensitivity pivot, and the surface
   this spec makes IAM-enforceable.
@@ -93,24 +98,35 @@ Notes:
 
 ## 4. Capabilities derived from the matrix
 
-Each persona is a set of capabilities; each row is reachable by exactly the personas the matrix
-grants it. `view-live`, `moderate`, `manage-membership`, `manage-channel` are the **existing** Chime
-capabilities (`chime:*`); the rest are new (`execute-api`, section 6).
+Each persona is a set of capabilities. `view`, `redact`, `delete`, `manage-membership`,
+`manage-channel` are the **existing** Chime capability keys (`credential-exchange.ts`
+`CAPABILITY_ACTIONS`); the rest are new (`execute-api`, section 6). **A capability grants a persona
+only if the matrix grants that persona every row in the capability** (the safe intersection: bundling
+never loosens a per-row denial). Where that intersection is coarser than a persona deserves, split
+the capability finer (section 12.1); this is why the PII row A13 is its own capability rather than
+bundled into analytics.
 
 | Capability | Rows | Enforcement | IT super | Plat dev | AI dev | Mgr |
 |---|---|---|---|---|---|---|
-| `view-live` | C1-C4 | `chime:*` (exists) | Full | Scoped | Scoped | Scoped |
-| `moderate` | C5, C6 | `chime:Redact/DeleteChannelMessage` (exists) | Full | None | None | Scoped (redact only) |
-| `manage-membership` | C7 | `chime:*` (exists) | Full | None | None | None |
-| `manage-channel` | C8 | `chime:*` (exists) | Full | None | None | None |
+| `view` (live channel) | C1-C4 | `chime:*` (existing key) | Full | Scoped | Scoped | Scoped |
+| `redact` | C5 | `chime:RedactChannelMessage` (existing) | Full | None | None | Scoped |
+| `delete` | C6 | `chime:DeleteChannelMessage` (existing) | Full | None | None | None |
+| `manage-membership` | C7 | `chime:*` (existing) | Full | None | None | None |
+| `manage-channel` | C8 | `chime:*` (existing) | Full | None | None | None |
 | `view-conversations` | A1, A4 | `execute-api` (new) | Full | Full | Scoped | Scoped |
-| `view-messages` | A2 | `execute-api` (new) | Full | Scoped | Scoped | Scoped |
-| `view-events` | A3 | `execute-api` (new) | Full | Full | Scoped | Scoped |
+| `view-messages` | A2 | exchange vend (new) | Full | Scoped | Scoped | Scoped |
+| `view-events` | A3 | `execute-api` (new) | Full | Full | Scoped | None |
 | `view-moderation-audit` | A5 | `execute-api` (new) | Full | Scoped | None | Scoped |
 | `view-quality` | A6-A8, A10, A14, A15 | `execute-api` (new) | Full | Scoped | Full | None |
-| `view-analytics` | A9, A11-A13 | `execute-api` (new) | Full | Scoped | Full | Scoped |
+| `view-analytics` | A9, A11, A12 | `execute-api` (new) | Full | Scoped | Full | None |
+| `view-user-activity` (PII) | A13 | `execute-api` (new) | Full | Scoped | None | None |
 | `view-config` / `manage-config` | A16 | `execute-api` (new) | Full | Read | Scoped | None |
 | `view-security` | A17, A18 | `execute-api` / native (new) | Full | Scoped | None | None |
+
+**Enforcement path (section 6).** `view-messages` (A2) and the Chime capabilities (`view`, `redact`,
+`delete`, `manage-membership`, `manage-channel`) are vended per use by the credential exchange
+(short-lived, audited). Every other capability here is granted on the persona's **sign-on group
+role**.
 
 ## 5. What is and is not IAM-enforced today
 
@@ -143,11 +159,14 @@ the role grants nothing). The design gives that structure teeth:
 4. **Scope** (the `Scoped` cells): the role uses IAM conditions on the caller's claims passed as
    session/principal tags (tier, ownership), the same per-classification structure the tier roles
    already use; the read also filters on the verified identity.
-5. **Keep the most sensitive surfaces on-demand.** Message content (A2) and moderation (C5-C8) stay
-   on the credential exchange's short-lived, per-use, **audited** vend (Chime already does), so a
-   standing sign-on role never carries them and every use leaves an `admin_scoped_credential_vend`
-   record. Lower-sensitivity reads ride the sign-on role directly. Which surfaces sit on which path
-   is a decision (section 12).
+5. **The cut line (drawn).** The sign-on group role carries every archive/analytics read **except
+   customer message content (A2)**. **A2 and the Chime plane (C1-C8)** use the credential exchange's
+   short-lived, per-use, **audited** vend. So a standing role never holds customer PII or a mutation,
+   and every content read (once A2 is on the exchange) and every moderation emits an
+   `admin_scoped_credential_vend` log line (section 11). The
+   rationale: message content is the only high-sensitivity PII read, and per-conversation auditing of
+   "who read this customer's messages" is worth the round-trip; everything else is metadata,
+   structure, or aggregate. Revisitable (section 12.6).
 6. **Result.** A group whose role omits a capability's resource is denied at the gateway, decided by
    IAM at sign-on, with no per-read exchange round-trip.
 
@@ -171,8 +190,11 @@ to a role is a single `execute-api` statement omitted from its policy.
   archive/analytics calls, mirroring `chimeService`.
 - **Roles and policies** (CDK): the persona role definitions and per-capability IAM policies, wired to
   the `adminAuthMode` helper.
-- **Docs:** fold sections 2-4 into `SPEC-ADMIN-IDENTITY.md`; record the archive capabilities in
-  `SPEC-ACCESS-AND-CONTROLS-AUDITING.md`; note the Aurora/Athena split in `AURORA-MODE-GUIDE.md`.
+- **Docs:** `SPEC-ADMIN-IDENTITY.md` (fold sections 2-4 into the capability-ceiling table, and update
+  the "gated by `requireAdmin`" and "not yet shipped" notes to point here); `SPEC-ACCESS-AND-CONTROLS-AUDITING.md`
+  (the archive-capability extension of the vend log line); `AURORA-MODE-GUIDE.md` (the Aurora/Athena
+  source split, and fix the migrations table which stops at `011` though `012-moderation-actions.sql`
+  ships); `ADMIN-INTEGRATION-GUIDE.md` (the per-resource IAM authorizer generalizing service mode).
 
 ## 9. The `ae-cognito`-mode question (decision needed)
 
@@ -191,9 +213,13 @@ in `ae-cognito` mode and require the IAM plane only in `service` / `federated` m
 
 ## 11. Audit tie-in
 
-Each archive-capability vend extends `admin_scoped_credential_vend`, so "who could read the archive,
-the event log, or a customer conversation" is auditable next to "who could moderate", the same
-short-lived, attributable record (`SPEC-ACCESS-AND-CONTROLS-AUDITING.md`).
+Today the credential exchange emits a CloudWatch **structured log line** (`admin_scoped_credential_vend`,
+`console.log(JSON.stringify(...))` in `credential-exchange.ts`) on every admin-plane **Chime** vend,
+queryable via Logs Insights (it is a log line, not a database table, and it is emitted only for the
+Chime plane, not for any archive read today). This spec extends that emission to the archive-capability
+vends (message content A2 and any other surface on the exchange path), so "who could read a customer
+conversation" becomes auditable next to "who could moderate", with the same short-lived, attributable
+record (`SPEC-ACCESS-AND-CONTROLS-AUDITING.md`).
 
 ## 12. Open decisions
 
@@ -204,8 +230,7 @@ short-lived, attributable record (`SPEC-ACCESS-AND-CONTROLS-AUDITING.md`).
 4. Whether the moderation-audit write is its own capability or rides on `moderate`.
 5. Interaction with plan item D (a separate admin app), whose distribution is a natural place to
    require these capabilities per persona.
-6. **Which surfaces ride the sign-on group role vs the on-demand exchange vend** (section 6.5). The
-   sign-on role is simpler and needs no per-read round-trip, but the credentials are standing (until
-   token refresh) and per-use auditing is coarser. The exchange vend is short-lived and audited per
-   use. Proposed default: lower-sensitivity reads on the sign-on role; message content (A2) and
-   moderation (C5-C8) on the exchange. Confirm the cut line.
+6. **Sign-on group role vs on-demand exchange vend.** RESOLVED (section 6.5): the sign-on role
+   carries every archive/analytics read except customer message content (A2); A2 and the Chime plane
+   use the per-use audited vend. Open only to revisit if the per-conversation vend for A2 proves too
+   chatty in practice (fallback: A2 on the role with a per-read audit-log write instead of a vend).
