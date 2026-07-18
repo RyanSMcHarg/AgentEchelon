@@ -9,6 +9,8 @@ import {
   statusGlyph,
   type TargetStatus,
 } from './metricTargets';
+import { InfoTooltip, DocLink } from './AdminHelp';
+import { DOC_LINKS } from '../../config/docLinks';
 import type { AnalyticsDateRange, AnalyticsResult } from '../../types/analytics';
 
 /**
@@ -109,6 +111,11 @@ const L0Dashboard: React.FC<{ rows: Row[]; onPick: (intent: string) => void }> =
     [rows],
   );
 
+  // Column header with an inline "what is this / how to use it" tooltip.
+  const hdr = (label: string, tip: string) => (
+    <span>{label} <InfoTooltip content={tip} label={`About ${label}`} /></span>
+  );
+
   return (
     <DataTable
       data={ranked}
@@ -116,17 +123,17 @@ const L0Dashboard: React.FC<{ rows: Row[]; onPick: (intent: string) => void }> =
       columns={[
         {
           key: 'intent',
-          label: 'Intent',
+          label: hdr('Intent', 'A category of request (e.g. report_generation). Click it to drill into this intent’s exchanges or tasks, its turn timeline, and the tool-loop steps.'),
           render: (v) => (
             <button className="admin-link-btn" onClick={() => onPick(String(v))} style={{ fontWeight: 600 }}>
               {String(v)}
             </button>
           ),
         },
-        { key: 'exchange_count', label: 'Volume', sortable: true },
+        { key: 'exchange_count', label: hdr('Volume', 'Number of exchanges (a user message + the assistant’s reply) classified to this intent in the selected window.'), sortable: true },
         {
           key: 'avg_confidence',
-          label: 'Classification',
+          label: hdr('Classification', 'Did routing send the right traffic here? Average classifier confidence (high/medium/low → 100/50/0), plus the share of exchanges re-routed away from this intent. A low score is a taxonomy or classifier problem — distinct from whether the work then succeeded.'),
           sortable: true,
           render: (v, row) => (
             <span>
@@ -137,18 +144,18 @@ const L0Dashboard: React.FC<{ rows: Row[]; onPick: (intent: string) => void }> =
         },
         {
           key: 'execution',
-          label: 'Execution',
+          label: hdr('Execution', 'Given correct routing, did the work succeed? For single-turn (DIRECT) intents this is the automated relevance score; for task intents it is the completion rate. The cell label (Relevance / Completion) tells you which applies.'),
           render: (_v, row) => {
             const ax = executionAxis(row);
             return <span>{ax.label} <StatusValue value={ax.value} targetKey={ax.targetKey} /></span>;
           },
         },
-        { key: 'avg_total_ms', label: 'Latency (avg)', sortable: true, render: (v) => <StatusValue value={v} targetKey="avg_total_ms" fallback="—" /> },
-        { key: 'p95_total_ms', label: 'P95', sortable: true, render: (v) => fmtMs(v) },
-        { key: 'cost_per_reply_usd', label: 'Cost/reply', sortable: true, render: (v) => <StatusValue value={v} targetKey="cost_per_reply" /> },
+        { key: 'avg_total_ms', label: hdr('Latency (avg)', 'Mean end-to-end time to the completed reply. Agentic tool loops make several model calls, so multi-second totals are normal.'), sortable: true, render: (v) => <StatusValue value={v} targetKey="avg_total_ms" fallback="—" /> },
+        { key: 'p95_total_ms', label: hdr('P95', '95th-percentile end-to-end latency (the tail). More sensitive than the average to cold starts and long tool loops.'), sortable: true, render: (v) => fmtMs(v) },
+        { key: 'cost_per_reply_usd', label: hdr('Cost/reply', 'Estimated USD per reply: average tokens × the model’s published rate. An estimate, not your AWS bill — see the note above the table. Use it to compare intents, not as an exact charge.'), sortable: true, render: (v) => <StatusValue value={v} targetKey="cost_per_reply" /> },
         {
           key: 'tool_error_rate',
-          label: 'Tools',
+          label: hdr('Tools', 'Tool-error rate for this intent (share of tool calls that failed), with the total tool-call count in parentheses. “—” means the intent made no tool calls in the window.'),
           sortable: true,
           render: (v, row) => {
             const calls = num(row.tool_calls) || 0;
@@ -309,7 +316,27 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
       </div>
 
       {drill.level === 0 && (
-        <L0Dashboard rows={l0Rows} onPick={(intent) => setDrill({ level: 1, intent })} />
+        <>
+          <p className="admin-tab-description">
+            Each row is one <strong>intent</strong> (a category of request), ranked <strong>worst-first</strong> so
+            the capabilities needing attention sit at the top. Quality is split into two axes so you can tell
+            different problems apart: <strong>Classification</strong> asks whether routing sent the right traffic
+            here (average classifier confidence and how often requests were re-routed away);{' '}
+            <strong>Execution</strong> asks whether, given correct routing, the work then succeeded (single-turn:
+            the automated relevance score; task: completion rate). A red Classification with a green Execution is a
+            taxonomy or router problem; the reverse is a runtime problem; a red Tools cell is a tool-dependency
+            problem. <strong>Latency</strong>, <strong>Cost/reply</strong>, and <strong>Tool error rate</strong> are
+            independently sortable decision columns. <strong>Click an intent</strong> to drill into its exchanges or
+            tasks, then a task's turn-by-turn timeline, then that turn's tool-loop steps.{' '}
+            <DocLink href={DOC_LINKS.evaluation}>How quality is measured</DocLink>
+          </p>
+          <p className="admin-tab-description" style={{ fontStyle: 'italic', opacity: 0.85 }}>
+            Note: <strong>Cost/reply is an estimate</strong> — average tokens × each model's published rate, not your
+            AWS bill. It is not yet reconciled against billing, so it will not match your invoice exactly; treat it
+            as a relative signal for comparing intents, not an exact charge.
+          </p>
+          <L0Dashboard rows={l0Rows} onPick={(intent) => setDrill({ level: 1, intent })} />
+        </>
       )}
 
       {drill.level === 1 && (() => {

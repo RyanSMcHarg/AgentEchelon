@@ -82,7 +82,7 @@ just groups the sub-views. Aurora-only sub-views are filtered out in Athena mode
 |---|---|
 | Overview | Overview, Latency |
 | Conversations | Conversations (moderation surface) |
-| Effectiveness | Dashboard (the L0 intent-anchored drill entry; Evaluations/Flows/Tasks are its drill depths) + Steps, Flagged, Ground Truth in Aurora |
+| Effectiveness | Dashboard (the L0 intent-anchored drill; the consolidation target) + Evaluations, Flows, Tasks, Steps, Flagged, Ground Truth in Aurora |
 | Models | Models, Model Strategy, Steps (Steps is Aurora-only) |
 | Experiments | Experiments |
 | Users | Users, Manage Users |
@@ -194,10 +194,11 @@ and Tool-error rate (from the per-step `tools[]` outcomes) as independently sort
 all coloured against `metricTargets.ts`. Clicking an intent drills L1 (its metric cards) -> L2 (its
 exchange list via `intent_exchanges`, or its task list via `task_details?intent`) -> L3 (a task's
 turn-by-turn state timeline via `task_timeline`) -> L4 (that turn's tool-loop steps, inline). The
-Evaluations, Flows, and Tasks are retired as top-level tabs and re-enter only as those drill depths
-(L2 exchanges, L2 tasks, L3 timeline). Steps moves in from Models as a standalone sub-tab (and the L4
-leaf); Flagged and Ground Truth stay as standalone human-action sub-tabs (§7). (The backing SQL is
-unit-tested at the query-dispatch layer.)
+The Dashboard is the consolidation target: the detail from Evaluations, Flows, and Tasks folds into its
+drill (L2 exchanges, L2 tasks, L3 timeline), and Steps into L4. Each keeps its own sub-tab (Steps grouped
+here rather than under Models) until its detail is fully in the drill, so no information is lost during
+the transition; Flagged and Ground Truth stay as standalone human-action sub-tabs (§7). (The backing SQL
+is unit-tested at the query-dispatch layer.)
 
 #### Evaluations tab (`EvaluationsTab.tsx`)
 
