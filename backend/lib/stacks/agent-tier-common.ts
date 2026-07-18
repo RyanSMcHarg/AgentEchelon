@@ -512,6 +512,10 @@ export function driftChannelCreateStatements(
         'chime:CreateChannelMembership',
         'chime:CreateChannelModerator',
         'chime:AssociateChannelFlow',
+        // The spawned drift channel is given a TTL via PutChannelExpirationSettings; without this the
+        // confirm ("yes") path throws AccessDenied after CreateChannel, is caught, and silently falls
+        // back to a normal reply — so "yes" never creates/navigates to the channel (drift-confirm bug).
+        'chime:PutChannelExpirationSettings',
       ],
       resources: [`${appInstanceArn}/*`],
     }),
