@@ -490,7 +490,10 @@ async function transformToMessageRecord(
     user_type: analytics.userType || null,
     agent_type:
       analytics.agentType || (isBot && senderArn ? extractAgentType(senderArn) : null),
-    bedrock_model: analytics.model || null,
+    // The analytics metadata stores the model under `bedrockModel` (buildAnalyticsMetadata), NOT
+    // `model` — reading the wrong key left bedrock_model NULL on every archived message, which zeroed
+    // out model_usage + the Effectiveness cost/reply estimate (tokens landed because their keys matched).
+    bedrock_model: analytics.bedrockModel || analytics.model || null,
     input_tokens: analytics.inputTokens || null,
     output_tokens: analytics.outputTokens || null,
     latency_ms: analytics.latencyMs || analytics.bedrockLatencyMs || null,
