@@ -23,6 +23,7 @@ import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import { fileURLToPath } from 'node:url';
+import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BACKEND = path.resolve(__dirname, '..');
@@ -57,12 +58,25 @@ const PHASES = [
     cmd: PW('e2e/experiments.spec.ts'), env: { EXPERIMENTS_E2E: '1' }, optional: true },
   { id: 'tasks', label: 'Task e2e: a report request opens a tracked task (→ #32/#35 task_id + Flows)', cwd: TESTS,
     cmd: PW('e2e/tasks.spec.ts'), env: { TASKS_E2E: '1' }, optional: true },
+  // Score the exchanges/flows the e2e just produced BEFORE the admin phase reads the dashboard, so the
+  // Effectiveness views verify against real relevance/completion instead of an unscored backlog.
+  { id: 'evaluate', label: 'Evaluate: run the scorer on the e2e-produced exchanges/flows', fn: triggerEvaluation, optional: true },
   { id: 'admin', label: 'Admin e2e: verify the full dashboard against the real data', cwd: TESTS,
     cmd: PW('e2e/admin-dashboard.spec.ts') },
 ];
 
-function run(phase) {
+async function run(phase) {
   console.log(`\n=== [${phase.id}] ${phase.label} ===`);
+  // A phase can be an in-process step (phase.fn) instead of a shell command.
+  if (phase.fn) {
+    try {
+      await phase.fn();
+      return true;
+    } catch (err) {
+      console.error(`\n[validate] FAILED at phase "${phase.id}": ${err?.message || err}`);
+      return false;
+    }
+  }
   console.log(`    $ ${phase.cmd}   (cwd: ${path.relative(process.cwd(), phase.cwd) || '.'})`);
   const res = spawnSync(phase.cmd, {
     cwd: phase.cwd,
@@ -76,6 +90,26 @@ function run(phase) {
     return false;
   }
   return true;
+}
+
+/**
+ * Score the exchanges/flows the e2e just produced by invoking the evaluation runner synchronously,
+ * so the admin phase verifies the dashboard against REAL scores instead of an empty backlog (the
+ * scheduled run is only every 30 min). Best-effort: needs Aurora mode + EVAL_LAMBDA_NAME resolved.
+ */
+async function triggerEvaluation() {
+  const name = process.env.EVAL_LAMBDA_NAME;
+  if (!name) {
+    console.warn('[validate] EVAL_LAMBDA_NAME not resolved (Athena mode, or the output is missing) — skipping on-demand evaluation.');
+    return;
+  }
+  const client = new LambdaClient({ region: process.env.AWS_REGION || 'us-east-1' });
+  const res = await client.send(new InvokeCommand({
+    FunctionName: name,
+    Payload: Buffer.from(JSON.stringify({ action: 'post-e2e' })),
+  }));
+  const body = res.Payload ? Buffer.from(res.Payload).toString('utf8') : '';
+  console.log(`[validate] evaluation runner result: ${body.slice(0, 300)}`);
 }
 
 // Resolve the credential-exchange endpoint from CDK outputs and export it, so
@@ -133,6 +167,35 @@ for (const key of ['VITE_USER_FEEDBACK_API_URL', 'VITE_EXPERIMENTS_API_URL', 'VI
   } catch { /* frontend/.env absent — the gated phase will report the missing URL */ }
 }
 
+// Resolve the evaluation runner Lambda name (Aurora mode only) so the "evaluate" phase can score the
+// e2e-produced exchanges on demand. Absent in Athena mode / older deploys → that phase self-skips.
+if (!process.env.EVAL_LAMBDA_NAME) {
+  const region = process.env.AWS_REGION || 'us-east-1';
+  const q = "Stacks[0].Outputs[?OutputKey=='EvaluationLambdaName'].OutputValue";
+  const res = spawnSync(
+    `aws cloudformation describe-stacks --stack-name AgentEchelonAnalyticsAurora --region ${region} --query "${q}" --output text`,
+    { shell: true, encoding: 'utf8' },
+  );
+  let name = (res.stdout || '').trim();
+  if (name === 'None') name = '';
+  // Fallback: the EvaluationLambdaName output ships in a newer analytics-stack version; until that
+  // stack is redeployed, resolve the runner by its function-name prefix instead.
+  if (!name) {
+    const lf = spawnSync(
+      `aws lambda list-functions --region ${region} --query "Functions[?contains(FunctionName,'AnalyticsAuro') && contains(FunctionName,'EvaluationLambda')].FunctionName | [0]" --output text`,
+      { shell: true, encoding: 'utf8' },
+    );
+    const byPrefix = (lf.stdout || '').trim();
+    if (byPrefix && byPrefix !== 'None') name = byPrefix;
+  }
+  if (name) {
+    process.env.EVAL_LAMBDA_NAME = name;
+    console.log(`[validate] evaluation Lambda resolved: ${name}`);
+  } else {
+    console.warn('[validate] NOTE: could not resolve the evaluation Lambda — the post-e2e evaluate step will skip (Athena mode / analytics stack not deployed).');
+  }
+}
+
 let phases = PHASES;
 if (only) phases = PHASES.filter((p) => p.id === only);
 if (skipBattle) phases = phases.filter((p) => p.id !== 'battle');
@@ -144,7 +207,7 @@ if (phases.length === 0) {
 
 console.log(`[validate] running phases: ${phases.map((p) => p.id).join(' -> ')}`);
 for (const phase of phases) {
-  const ok = run(phase);
+  const ok = await run(phase);
   if (!ok) {
     if (phase.optional) {
       console.warn(`[validate] phase "${phase.id}" is optional (needs a battle-enabled deploy); continuing. Use --skip-battle to silence.`);

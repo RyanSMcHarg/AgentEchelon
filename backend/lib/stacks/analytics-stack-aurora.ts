@@ -983,16 +983,27 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
 
     evaluationLambda.node.addDependency(iamAuthSetup);
 
-    // Daily evaluation schedule (2am UTC)
+    // Evaluation schedule — every 30 min (was daily 2am UTC). Frequent runs are cheap: the EventBridge
+    // rule is ~free, a run with nothing to score exits in ~1s, and the Bedrock evaluator cost is
+    // per-EXCHANGE (each scored once via getUnscoredExchanges), not per-run — so cadence barely affects
+    // cost, it just lowers the latency from "message sent" to "score visible". (Construct id kept to
+    // avoid replacing the rule.)
     new events.Rule(this, 'DailyEvaluationSchedule', {
-      schedule: events.Schedule.cron({ minute: '0', hour: '2' }),
+      schedule: events.Schedule.rate(cdk.Duration.minutes(30)),
       targets: [
         new targets.LambdaFunction(evaluationLambda, {
           event: events.RuleTargetInput.fromObject({
-            action: 'daily-evaluation',
+            action: 'scheduled-evaluation',
           }),
         }),
       ],
+    });
+
+    // Expose the evaluation runner so validate.mjs can invoke it on demand at the end of an e2e run
+    // (score the freshly-generated exchanges immediately instead of waiting for the next schedule tick).
+    new cdk.CfnOutput(this, 'EvaluationLambdaName', {
+      value: evaluationLambda.functionName,
+      description: 'Evaluation runner Lambda — invoke to score unscored exchanges/flows on demand.',
     });
 
     // =====================================================
