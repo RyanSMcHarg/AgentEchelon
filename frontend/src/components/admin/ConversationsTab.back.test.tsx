@@ -62,4 +62,28 @@ describe('ConversationsTab — global Back closes the detail first', () => {
     // And the parent is told there is no longer a detail to close.
     expect(registerBack.mock.calls.at(-1)?.[0]).toBeNull();
   });
+
+  it('notifies onConversationChange with the channelArn on open and null on close (URL deep-link sync)', async () => {
+    const registerBack = vi.fn();
+    const onConversationChange = vi.fn();
+    render(
+      <ConversationsTab
+        summaryData={null}
+        driftData={null}
+        isLoading={false}
+        deepLinkChannelArn={CHANNEL}
+        registerBack={registerBack}
+        onConversationChange={onConversationChange}
+      />,
+    );
+
+    // Opening the detail reports the channel ARN (parent writes ?conv=<id>).
+    await screen.findByText('← Back to conversations');
+    await waitFor(() => expect(onConversationChange).toHaveBeenCalledWith(CHANNEL));
+
+    // Closing reports null (parent clears ?conv).
+    const closer = registerBack.mock.calls.at(-1)![0] as () => void;
+    act(() => closer());
+    await waitFor(() => expect(onConversationChange).toHaveBeenLastCalledWith(null));
+  });
 });

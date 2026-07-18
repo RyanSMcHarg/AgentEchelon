@@ -81,6 +81,17 @@ function tabFromUrl(): TabId | null {
   return v && (ALL_TAB_IDS as string[]).includes(v) ? (v as TabId) : null;
 }
 
+// Deep link to a specific conversation detail: `?conv=<channelId>`. A single app
+// instance backs every conversation, so the short channel id is enough — we
+// reconstruct the full ARN the read path needs. Accepts a full ARN too (defensive).
+function convFromUrl(): string | null {
+  const id = new URLSearchParams(window.location.search).get('conv');
+  if (!id) return null;
+  if (id.includes(':')) return id;
+  const appInstance = import.meta.env.VITE_APP_INSTANCE_ARN as string | undefined;
+  return appInstance ? `${appInstance}/channel/${id}` : null;
+}
+
 /** Map a TabId to its i18n key under admin.tabs.* */
 function tabI18nKey(id: TabId): string {
   const camelCase = id.replace(/_([a-z])/g, (_, c) => c.toUpperCase());
@@ -134,7 +145,7 @@ const QUERIES_BY_TAB: Partial<Record<TabId, QueryType[]>> = {
 
 const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode = 'athena' }) => {
   const { t } = useTranslation();
-  const [activeTab, setActiveTab] = useState<TabId>(() => tabFromUrl() ?? 'overview');
+  const [activeTab, setActiveTab] = useState<TabId>(() => tabFromUrl() ?? (convFromUrl() ? 'conversations' : 'overview'));
   const [datePreset, setDatePreset] = useState('7d');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -142,7 +153,8 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
   // Cross-tab deep-link: a Flagged/Ground-Truth row's "conversation" link sets the
   // target channel and jumps to the Conversations tab, which opens that channel's
   // detail page and clears the link (via onDeepLinkConsumed) so it fires once.
-  const [conversationDeepLink, setConversationDeepLink] = useState<string | null>(null);
+  // Initialized from `?conv=` so a shared link opens straight to the conversation detail.
+  const [conversationDeepLink, setConversationDeepLink] = useState<string | null>(() => convFromUrl());
 
   // Aurora-only sub-views are hidden in Athena mode (their content would just
   // honest-empty). activeTab drives content; activeSection groups the sub-tabs.
@@ -197,6 +209,19 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
     }
   }, [onBack]);
 
+  // Reflect the open conversation detail in the URL (`?conv=<channelId>`), so a detail
+  // is deep-linkable and browser Back/forward steps through it. The sync guard (current
+  // === next) keeps a popstate-driven change from pushing a redundant history entry.
+  const updateConvUrl = useCallback((channelArn: string | null) => {
+    const url = new URL(window.location.href);
+    const current = url.searchParams.get('conv');
+    const next = channelArn ? channelArn.split('/').pop() ?? null : null;
+    if (current === next) return;
+    if (next) url.searchParams.set('conv', next);
+    else url.searchParams.delete('conv');
+    window.history.pushState({}, '', url);
+  }, []);
+
   // On open, normalize the URL to the active tab (App.tsx opens with `?admin=1`) without
   // adding a history entry, so the URL is deep-linkable and Back is consistent.
   useEffect(() => {
@@ -214,6 +239,11 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
     const onPop = () => {
       const t = tabFromUrl();
       if (t) setActiveTab(t);
+      // Sync the conversation detail with the URL: forward to a `?conv` opens it,
+      // Back (conv removed) closes the open detail via the registered drill-back.
+      const arn = convFromUrl();
+      if (arn) setConversationDeepLink(arn);
+      else if (drillBackRef.current) drillBackRef.current();
     };
     window.addEventListener('popstate', onPop);
     return () => window.removeEventListener('popstate', onPop);
@@ -507,6 +537,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             deepLinkChannelArn={conversationDeepLink}
             onDeepLinkConsumed={() => setConversationDeepLink(null)}
             registerBack={registerDrillBack}
+            onConversationChange={updateConvUrl}
           />
         )}
         {activeTab === 'users' && (

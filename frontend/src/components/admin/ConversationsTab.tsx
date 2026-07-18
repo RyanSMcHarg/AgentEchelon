@@ -37,6 +37,11 @@ interface ConversationsTabProps {
    * and null when back on the list.
    */
   registerBack?: (close: (() => void) | null) => void;
+  /**
+   * Notify the parent when the open conversation detail changes (channelArn, or null
+   * when back on the list), so it can reflect it in the URL for deep-linking.
+   */
+  onConversationChange?: (channelArn: string | null) => void;
 }
 
 // Tier badge for the conversations list (basic/standard/premium) — the channel's
@@ -62,7 +67,7 @@ function driftBadge(score: number): React.ReactNode {
   );
 }
 
-const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoading, deepLinkChannelArn, onDeepLinkConsumed, registerBack }) => {
+const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoading, deepLinkChannelArn, onDeepLinkConsumed, registerBack, onConversationChange }) => {
   const [view, setView] = useState<'browser' | 'drift'>('browser');
   const [conversations, setConversations] = useState<AdminConversationSummary[]>([]);
   const [selectedConversation, setSelectedConversation] = useState<AdminConversationSummary | null>(null);
@@ -162,11 +167,13 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
   }, [selectedConversation?.channelArn]);
 
   // Let the console's global Back close an open detail (→ list) before it walks the
-  // tab history. Registered while a conversation is selected; cleared otherwise.
+  // tab history, and mirror the open detail into the URL (deep-linking). Both react to
+  // the selected conversation; registered/cleared as it opens and closes.
   useEffect(() => {
     registerBack?.(selectedConversation ? () => setSelectedConversation(null) : null);
+    onConversationChange?.(selectedConversation?.channelArn ?? null);
     return () => registerBack?.(null);
-  }, [selectedConversation, registerBack]);
+  }, [selectedConversation, registerBack, onConversationChange]);
 
   async function handleMembershipJoin(type: 'DEFAULT' | 'HIDDEN') {
     if (!selectedConversation) return;
