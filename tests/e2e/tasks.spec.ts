@@ -73,6 +73,24 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
       const resp = await sendAndWaitForResponse(page, REPORT_PROMPT, 180_000);
       expect(resp.text && resp.text.length, `[${tc.tier}] the report turn must return a response`).toBeTruthy();
 
+      // Regression guards for two live-found bugs (this is a 1:1 conversation with a report task):
+      //  1. Doc-gen: the FIRST/clarifying turn of a report task is conversational text, NOT a
+      //     downloadable file. The gate used to key off isDocumentRequest(userMessage), which matches
+      //     the user's "...report..." request on every turn, so the clarifying questions were wrongly
+      //     sent as an attachment. The report attachment must appear only on the delivery turn.
+      const lastBotMsg = page.locator('.assistant-message').last();
+      await expect(
+        lastBotMsg.locator('.attachment-display'),
+        `[${tc.tier}] a report task's clarifying turn must be a chat message, not an attachment`,
+      ).toHaveCount(0);
+      //  2. Sticky @-mention: in a 1:1 the assistant's reply is untargeted (AUTO delivery), so the
+      //     sticky "replying to @assistant" chip must NOT appear (it did when the reply was wrongly
+      //     stamped targetedSender). It should only set on a genuinely targeted, multi-party @-mention.
+      await expect(
+        page.locator('.message-input-sticky-target'),
+        `[${tc.tier}] no sticky @-mention chip should appear after a 1:1 assistant reply`,
+      ).toHaveCount(0);
+
       const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
       const api = await pwRequest.newContext({ extraHTTPHeaders: { Authorization: `Bearer ${idToken}` } });
 
@@ -103,4 +121,66 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
       // evaluation_flows (intent_flows grouped by task_id) should then score this flow.
     });
   }
+
+  // OUTPUT VALIDITY (live-hardening): a DELIVERED report must be a real, substantial, on-topic report
+  // document — not empty, not a conversational/clarifying turn wrongly saved as a file, not encoding
+  // garbage. This drives the report task to delivery, downloads the attachment, and validates its
+  // CONTENT (the plumbing tests above only prove a task row landed, not that the deliverable is valid).
+  test('[premium] a delivered report is a valid, on-topic report document (content validated)', async ({ page }) => {
+    test.setTimeout(600_000); // multi-turn report flow (collect -> outline -> generate) + download
+
+    await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
+    await createConversation(page, `Report validity ${Date.now()}`, 'Premium');
+
+    // Kick off, then approve/answer each step until the model DELIVERS a downloadable document.
+    await sendAndWaitForResponse(
+      page,
+      'Compile a concise 1-page report on the pros and cons of a monorepo vs multi-repo setup for a 5-team engineering org.',
+      180_000,
+    );
+    const attachment = page.locator('.assistant-message .attachment-display').last();
+    const approvals = [
+      'Audience is engineering leadership. Focus on delivery velocity, code ownership, and CI cost. Keep it concise.',
+      'The outline looks good — generate the full report now and deliver it as a downloadable document.',
+      'Yes, generate and attach the report as a file.',
+    ];
+    let delivered = await attachment.isVisible({ timeout: 2000 }).catch(() => false);
+    for (const a of approvals) {
+      if (delivered) break;
+      await sendAndWaitForResponse(page, a, 180_000);
+      delivered = await attachment.isVisible({ timeout: 3000 }).catch(() => false);
+    }
+    expect(delivered, 'the report task must DELIVER a downloadable report document').toBe(true);
+
+    // It must be a document (markdown/txt/pdf), not a spurious file type.
+    const name = ((await attachment.locator('.attachment-name').textContent()) || '').trim();
+    expect(name, `attachment name: "${name}"`).toMatch(/\.(md|markdown|txt|pdf)$/i);
+
+    // Download (handleDownload → window.open the presigned S3 URL as a popup) and fetch the bytes.
+    const [popup] = await Promise.all([
+      page.context().waitForEvent('page', { timeout: 30_000 }),
+      attachment.locator('.attachment-file, .attachment-download-btn').first().click(),
+    ]);
+    await popup.waitForLoadState('domcontentloaded').catch(() => {});
+    const fileUrl = popup.url();
+    await popup.close();
+    expect(fileUrl, 'the download must open the presigned file URL').toMatch(/^https?:\/\//);
+    const fileApi = await pwRequest.newContext();
+    const fileResp = await fileApi.get(fileUrl);
+    expect(fileResp.ok(), `presigned download must succeed (got ${fileResp.status()})`).toBeTruthy();
+    const content = await fileResp.text();
+    await fileApi.dispose();
+
+    // Validate the CONTENT is a real report — this is what catches an empty/garbage report or a
+    // conversational turn saved as a file (the reported bug), regardless of the plumbing being green.
+    expect(content.length, 'the report document must be substantial (not empty/near-empty)').toBeGreaterThan(400);
+    expect(content, 'the report must have markdown structure (headings / bullets / numbered sections)')
+      .toMatch(/(^|\n)#{1,3}\s|\n\s*[-*]\s|\n\s*\d+\.\s/);
+    expect(content.toLowerCase(), 'the report must be ON-TOPIC (mono/multi-repo)')
+      .toMatch(/mono-?repo|multi-?repo|repositor/);
+    // Not the clarifying questions saved as a file; and valid UTF-8 (no replacement/garbage chars).
+    expect(content.toLowerCase(), 'the report must not be the clarifying questions')
+      .not.toMatch(/a few quick questions|what should the report focus on|let me know your preferences/);
+    expect(content, 'the report text must be valid UTF-8 (no replacement/garbage chars)').not.toContain('�');
+  });
 });
