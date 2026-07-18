@@ -288,15 +288,10 @@ exports.handler = async (event) => {
           modelId,
           modelName,
           modelTier: requestedTier,
-          // welcomeUserSub — the creator's sub, stamped so the WelcomeIntent can personalize the
-          // greeting. This is a DELIBERATE, scoped exception to Tenet 6 (don't copy the owner into
-          // metadata): the Chime WelcomeIntent fires on the bot's CHANNEL_MEMBERSHIP at channel
-          // creation, BEFORE the user's membership is visible to a ListChannelMemberships read — so
-          // membership-derivation races and the router sees humanMembers=0 (verified empirically).
-          // Metadata is set atomically at creation and always readable, so it is the only race-free
-          // way to give the welcome the user's identity. The router resolves the display NAME from
-          // this sub via Cognito (router-agent-handler.resolveUserName), so no name is stored here.
-          welcomeUserSub: sub,
+          // NOTE: the creator's sub is intentionally NOT stamped here. Name personalization moved off
+          // the WelcomeIntent (it fired before membership/metadata settled, so the name raced) and onto
+          // the user's FIRST real turn, where the async processor resolves the sender's name directly.
+          // So the welcome needs no owner identity in metadata (keeps Tenet 6 intact). [A3]
           // topic + triggerContext — read by the router on WelcomeIntent
           // (docs/SPEC-WELCOME-AND-CONTEXT.md). Both bounded to keep
           // Chime's 1KB Metadata cap headroom for everything else.
@@ -321,9 +316,9 @@ exports.handler = async (event) => {
     // creator (ChimeBearer=botArn) is auto-added as a channel member at CreateChannel, but that
     // auto-membership does NOT fire the welcome — only this explicit CreateChannelMembership does; it
     // also (idempotently) ensures ListChannelMemberships returns the bot, which @mention routing needs.
-    // NOTE: the welcome fires here, before/independent of the user's membership, which is why the
-    // user's identity for the greeting is carried in channel metadata (welcomeUserSub), not membership.
-    // Non-fatal on ConflictException (the bot is already a member from creation).
+    // NOTE: the welcome fires here, before/independent of the user's membership — which is exactly why
+    // the welcome is generic (no name) and the assistant greets the user by name on their first real
+    // turn instead. Non-fatal on ConflictException (the bot is already a member from creation).
     try {
       await messagingClient.send(
         new CreateChannelMembershipCommand({

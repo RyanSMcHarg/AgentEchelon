@@ -427,20 +427,12 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
       const channelMeta = channelArn
         ? await resolveChannelMetadata(channelArn, botArn)
         : ({} as Record<string, unknown>);
-      const humanMembers = channelArn ? await countHumanMembers(channelArn, botArn) : 1;
-      // The Chime WelcomeIntent fires on the BOT's CHANNEL_MEMBERSHIP at channel creation, BEFORE the
-      // creator's membership is visible to a ListChannelMemberships read — so membership-derivation
-      // races and the router routinely sees humanMembers=0 (verified empirically against live Chime).
-      // create-conversation therefore stamps the creator's sub into channel metadata (welcomeUserSub),
-      // which is written atomically in the CreateChannel call and always readable at welcome time.
-      // Prefer it; fall back to membership for channels created before the stamp existed / shared channels.
-      const stampedSub = typeof channelMeta.welcomeUserSub === 'string' ? channelMeta.welcomeUserSub.trim() : '';
-      const ownerSub = stampedSub || (channelArn ? await soleHumanMemberSub(channelArn, botArn) : '');
-      const welcomeSub = stampedSub || (humanMembers <= 1 ? (userSub || ownerSub) : userSub);
-      // A federated (`fed_`) user isn't in the AE Cognito pool, so a host may also stamp `userName`
-      // directly; prefer that, else resolve the display name from the sub via Cognito (cached).
-      const stampedName = typeof channelMeta.userName === 'string' ? channelMeta.userName.trim() : '';
-      const userName = stampedName || await resolveUserName(welcomeSub);
+      // Name personalization is intentionally NOT done here. The Chime WelcomeIntent fires on the
+      // BOT's CHANNEL_MEMBERSHIP at channel creation, BEFORE the creator's membership AND before the
+      // channel Metadata are reliably readable (both eventually consistent, verified empirically against
+      // live Chime) — so any name resolved here races and is routinely wrong or missing. The welcome
+      // stays generic; the assistant greets the user by name on their FIRST real turn instead (see the
+      // async processor's first-turn greeting, driven by the resolved senderDisplayName). [A3]
       const triggerContext = typeof channelMeta.triggerContext === 'string' ? channelMeta.triggerContext : undefined;
       const topic = typeof channelMeta.topic === 'string' ? channelMeta.topic : undefined;
 
@@ -458,11 +450,8 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
       }
 
       const orientation = await loadWelcomeOrientation();
-      const content = composeWelcomeMessage({ userName, triggerContext, topic, orientation });
+      const content = composeWelcomeMessage({ triggerContext, topic, orientation });
       console.log('[Router][WelcomeIntent]', {
-        userName,
-        humanMembers,
-        derivedSubFromMetadata: !userSub && !!welcomeSub,
         hasTriggerContext: !!triggerContext,
         hasTopic: !!topic,
       });

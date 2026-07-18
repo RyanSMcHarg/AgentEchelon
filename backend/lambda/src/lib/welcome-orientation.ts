@@ -65,13 +65,16 @@ function hasOrientation(o?: WelcomeOrientation | null): o is WelcomeOrientation 
  * generic platform welcome. Static-shaped (no model call) so the welcome stays instant and predictable.
  */
 export function composeWelcomeMessage(args: {
-  userName: string;
   orientation?: WelcomeOrientation | null;
   triggerContext?: string;
   topic?: string;
 }): string {
-  const { userName, orientation, triggerContext, topic } = args;
-  const greeting = userName && userName !== 'there' ? `Hi ${userName}` : 'Hi';
+  const { orientation, triggerContext, topic } = args;
+  // The welcome is intentionally NOT name-personalized. The Chime WelcomeIntent fires on the bot's
+  // membership at channel creation, before the user's membership/metadata are reliably readable, so a
+  // name here races and is often wrong or missing. The assistant greets the user by name on their
+  // FIRST real turn instead (see the async processor's first-turn greeting).
+  const greeting = 'Hi';
 
   // Drift-redirect / explicit trigger: name what brought us here so the user doesn't retype it.
   if (triggerContext && triggerContext.trim().length > 0) {

@@ -46,29 +46,32 @@ describe('parseWelcomeOrientation', () => {
 });
 
 describe('composeWelcomeMessage', () => {
-  it('falls back to the generic welcome when no orientation (unchanged historical greeting)', () => {
-    const msg = composeWelcomeMessage({ userName: 'Sam' });
-    expect(msg).toBe("Hi Sam - I'm your assistant for this conversation. I can answer questions, draft documents, analyse data, help with code, or work through a plan with you. What would you like to start with?");
+  it('falls back to the generic, name-less welcome when no orientation', () => {
+    const msg = composeWelcomeMessage({});
+    expect(msg).toBe("Hi - I'm your assistant for this conversation. I can answer questions, draft documents, analyse data, help with code, or work through a plan with you. What would you like to start with?");
   });
 
-  it('uses "Hi" (no name) when userName is the "there" sentinel', () => {
-    expect(composeWelcomeMessage({ userName: 'there' }).startsWith('Hi -')).toBe(true);
+  it('is always name-less (name personalization moved to the first turn)', () => {
+    // The welcome must never carry a user name: the WelcomeIntent races membership/metadata at
+    // creation, so the assistant greets by name on the first real turn instead (see the processor).
+    expect(composeWelcomeMessage({}).startsWith('Hi -')).toBe(true);
+    expect(composeWelcomeMessage({ orientation: { companyName: 'Acme' } }).startsWith('Hi -')).toBe(true);
   });
 
   it('short-circuits on a drift triggerContext', () => {
-    const msg = composeWelcomeMessage({ userName: 'Sam', triggerContext: 'quarterly revenue forecasting', orientation: STRATUM });
+    const msg = composeWelcomeMessage({ triggerContext: 'quarterly revenue forecasting', orientation: STRATUM });
     expect(msg).toContain('continuing from your earlier message');
     expect(msg).toContain('quarterly revenue forecasting');
   });
 
   it('short-circuits on a create-conversation topic', () => {
-    const msg = composeWelcomeMessage({ userName: 'Sam', topic: 'onboarding a new customer' });
+    const msg = composeWelcomeMessage({ topic: 'onboarding a new customer' });
     expect(msg).toContain('I can help with onboarding a new customer');
   });
 
   it('renders the oriented welcome: company + access + example bullets + platform note', () => {
-    const msg = composeWelcomeMessage({ userName: 'Sam', orientation: STRATUM });
-    expect(msg).toContain("Hi Sam - I'm your assistant at Stratum Technologies, an enterprise SaaS company");
+    const msg = composeWelcomeMessage({ orientation: STRATUM });
+    expect(msg).toContain("Hi - I'm your assistant at Stratum Technologies, an enterprise SaaS company");
     expect(msg).toContain('You have standard access');
     expect(msg).toContain('A few things you can try:');
     expect(msg).toContain('- Who leads the Platform Core team?');
@@ -77,7 +80,7 @@ describe('composeWelcomeMessage', () => {
   });
 
   it('renders a minimal orientation (company only, no access/examples)', () => {
-    const msg = composeWelcomeMessage({ userName: 'Sam', orientation: { companyName: 'Acme' } });
-    expect(msg).toBe("Hi Sam - I'm your assistant at Acme.");
+    const msg = composeWelcomeMessage({ orientation: { companyName: 'Acme' } });
+    expect(msg).toBe("Hi - I'm your assistant at Acme.");
   });
 });
