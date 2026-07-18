@@ -1461,7 +1461,10 @@ async function getIntentEffectiveness(
             ex_agg.avg_confidence,
             ex_agg.reroute_rate,
             ex_agg.direct_relevance,
-            COALESCE(fa.task_completion_rate, 0) AS task_completion_rate,
+            -- NULL (not 0) when the flow evaluator has not scored this intent's tasks yet, so the UI
+            -- renders "—" rather than a misleading red 0%. A genuine 0% (flows exist, none completed)
+            -- still comes through as 0 from flow_agg. Distinguishes "no data yet" from "actually failing".
+            fa.task_completion_rate,
             fa.flow_composite,
             ex_agg.avg_total_ms,
             ex_agg.p95_total_ms,

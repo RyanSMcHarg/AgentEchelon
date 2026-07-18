@@ -440,12 +440,16 @@ export async function handler(
         // score reaches its flow directly. task_id is copied from the exchange; flow_id is resolved to
         // the intent_flows row for that task WHEN one exists (Pass B may run after Pass A, so it's
         // set-if-present and backfilled by Pass B's upsert otherwise). Both NULL for a single-turn exchange.
+        // $9 (task_id) is used twice — the VALUES position AND the flow_id subquery's WHERE — and
+        // Postgres deduces its type independently in each, erroring with "inconsistent types deduced
+        // for parameter $9" (which failed EVERY Pass A insert). Cast both uses to varchar so the type
+        // is unambiguous. (task_id / intent_flows.task_id are both VARCHAR(64).)
         await query(
           `INSERT INTO evaluation_results
              (exchange_id, run_id, evaluator_model, relevance_score, classification,
               reasoning, agent_type, intent, task_id, flow_id, evaluation_type)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9,
-                   (SELECT id FROM intent_flows WHERE task_id = $9), 'exchange')`,
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::varchar,
+                   (SELECT id FROM intent_flows WHERE task_id = $9::varchar), 'exchange')`,
           [ex.id, runId, EVALUATOR_MODEL, r.relevanceScore, r.classification, r.reasoning, ex.agent_type, ex.intent, ex.task_id],
         );
         scored += 1;
