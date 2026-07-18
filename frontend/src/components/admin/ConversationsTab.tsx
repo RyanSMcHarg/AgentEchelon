@@ -14,6 +14,7 @@ import {
 } from '../../services/adminConversationService';
 import MessageInspectDrawer from './MessageInspectDrawer';
 import MembershipTimeline from './MembershipTimeline';
+import { recordModeration } from '../../services/analyticsService';
 import type { AnalyticsResult } from '../../types/analytics';
 import type {
   AdminConversationMember,
@@ -195,6 +196,8 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
     try {
       setActionError(null);
       await redactAdminConversationMessage(selectedConversation.channelArn, messageId);
+      // Attribution: record WHO did it (server-verified). Best-effort — never fail the moderation.
+      await recordModeration(selectedConversation.channelArn, messageId, 'redact').catch(() => {});
       await loadConversationDetail(selectedConversation.channelArn);
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'Failed to redact message');
@@ -208,6 +211,7 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
     try {
       setActionError(null);
       await deleteAdminConversationMessage(selectedConversation.channelArn, messageId);
+      await recordModeration(selectedConversation.channelArn, messageId, 'delete').catch(() => {});
       await loadConversationDetail(selectedConversation.channelArn);
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'Failed to delete message');
@@ -302,13 +306,13 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
                       if (m.deleted)
                         return (
                           <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>
-                            Deleted by an admin
+                            {m.moderatedByName ? `Deleted by ${m.moderatedByName}` : 'Deleted by an admin'}
                           </span>
                         );
                       if (m.redacted)
                         return (
                           <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>
-                            Redacted by a moderator
+                            {m.moderatedByName ? `Redacted by ${m.moderatedByName}` : 'Redacted by a moderator'}
                           </span>
                         );
                       return String(value ?? '');
@@ -318,23 +322,32 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
                     key: 'moderate',
                     label: 'Moderate',
                     sortable: false,
-                    render: (_value, row) => (
-                      <div className="admin-inline-actions">
-                        <button
-                          className="admin-inline-btn"
-                          title="Inspect — all fields + metadata"
-                          onClick={() => setInspectMessage(row as unknown as AdminConversationMessage)}
-                        >
-                          ⓘ Info
-                        </button>
-                        <button className="admin-inline-btn" onClick={() => handleRedact(String(row.id))}>
-                          Redact
-                        </button>
-                        <button className="admin-inline-btn danger" onClick={() => handleDelete(String(row.id))}>
-                          Delete
-                        </button>
-                      </div>
-                    ),
+                    render: (_value, row) => {
+                      const m = row as unknown as AdminConversationMessage;
+                      return (
+                        <div className="admin-inline-actions">
+                          <button
+                            className="admin-inline-btn"
+                            title="Inspect — all fields + metadata"
+                            onClick={() => setInspectMessage(m)}
+                          >
+                            ⓘ Info
+                          </button>
+                          {/* A redacted message can't be re-redacted; a deleted one can't be
+                              moderated at all. Redact hides once redacted OR deleted; Delete once deleted. */}
+                          {!m.redacted && !m.deleted && (
+                            <button className="admin-inline-btn" onClick={() => handleRedact(String(row.id))}>
+                              Redact
+                            </button>
+                          )}
+                          {!m.deleted && (
+                            <button className="admin-inline-btn danger" onClick={() => handleDelete(String(row.id))}>
+                              Delete
+                            </button>
+                          )}
+                        </div>
+                      );
+                    },
                   },
                 ]}
                 data={selectedMessages}

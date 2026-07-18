@@ -20,6 +20,7 @@ import { stripMessageMarkers } from '../lib/message-markers.js';
 import { query, ensureSchema } from './db-client.js';
 import { estimateStepCostUsd, bedrockModelIdToKey } from '../lib/model-rate-table.js';
 import { callerIsAdmin } from '../lib/auth.js';
+import { recordModerationAction } from './admin-conversations-aurora.js';
 import {
   aggregateVariantFeedback,
   aggregateBattleWins,
@@ -171,6 +172,10 @@ export async function handler(
     // POST hit no method on the API root). Admin-gated like every other endpoint.
     if (event.httpMethod === 'POST') {
       if (!isAdmin) return error(403, 'Admin access required');
+      // Moderation audit: the actor is the SERVER-VERIFIED admin (callerSub + claims), never
+      // the client body — so attribution can't be spoofed. Intercepted before query dispatch.
+      const mod = await maybeRecordModeration(event.body, callerSub, claims);
+      if (mod) return mod;
       return handlePostQuery(event.body);
     }
 
@@ -505,6 +510,38 @@ function buildParamsFromBody(body: Record<string, unknown>): Record<string, stri
     if (v !== undefined && v !== null) p[k] = String(v);
   }
   return p;
+}
+
+/**
+ * Moderation audit write: POST { queryType: 'record_moderation', channelArn, messageId, moderation }.
+ * The actor is taken from the verified JWT (actorSub + claims), NEVER the body, so it can't be
+ * spoofed. Returns null when the body isn't a record_moderation request (normal dispatch continues).
+ */
+async function maybeRecordModeration(
+  rawBody: string | null,
+  actorSub: string,
+  claims: Record<string, unknown>,
+): Promise<APIGatewayProxyResult | null> {
+  let body: Record<string, unknown>;
+  try {
+    body = JSON.parse(rawBody || '{}');
+  } catch {
+    return null;
+  }
+  if (body.queryType !== 'record_moderation') return null;
+  const channelArn = String(body.channelArn || '');
+  const messageId = String(body.messageId || '');
+  const action = body.moderation === 'delete' ? 'delete' : 'redact';
+  if (!channelArn || !messageId) return error(400, 'channelArn and messageId are required');
+  const actorName =
+    (claims.name as string) || (claims.email as string) || (claims['cognito:username'] as string) || undefined;
+  try {
+    await recordModerationAction({ channelArn, messageId, action, actorSub, actorName });
+  } catch (e) {
+    console.error('[analytics-aurora] record_moderation failed', e);
+    return error(500, 'Failed to record moderation');
+  }
+  return success({ recorded: true });
 }
 
 async function handlePostQuery(rawBody: string | null): Promise<APIGatewayProxyResult> {

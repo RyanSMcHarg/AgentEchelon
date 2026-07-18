@@ -95,4 +95,30 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
     expect(await screen.findByText(/Deleted by an admin/)).toBeTruthy();
     expect(screen.queryByText(/No messages loaded/)).toBeNull();
   });
+
+  it('attributes to the actual actor when the moderation is audited', async () => {
+    vi.mocked(svc.listAdminConversationMessages).mockResolvedValue([
+      { ...MESSAGES[2], moderatedByName: 'Alice Admin' }, // deleted + audited actor
+    ]);
+    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    expect(await screen.findByText('Deleted by Alice Admin')).toBeTruthy();
+    expect(screen.queryByText('Deleted by an admin')).toBeNull(); // the role fallback is not used
+  });
+
+  it('hides Redact once redacted, and both actions once deleted', async () => {
+    // Redacted → Redact gone, Delete stays.
+    vi.mocked(svc.listAdminConversationMessages).mockResolvedValue([MESSAGES[1]]);
+    const view = render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    await screen.findByText(/Redacted by/);
+    expect(screen.queryByRole('button', { name: 'Redact' })).toBeNull();
+    expect(screen.getByRole('button', { name: 'Delete' })).toBeTruthy();
+    view.unmount();
+
+    // Deleted → neither action.
+    vi.mocked(svc.listAdminConversationMessages).mockResolvedValue([MESSAGES[2]]);
+    render(<ConversationsTab summaryData={null} driftData={null} isLoading={false} deepLinkChannelArn={CHANNEL} />);
+    await screen.findByText(/Deleted by/);
+    expect(screen.queryByRole('button', { name: 'Redact' })).toBeNull();
+    expect(screen.queryByRole('button', { name: 'Delete' })).toBeNull();
+  });
 });

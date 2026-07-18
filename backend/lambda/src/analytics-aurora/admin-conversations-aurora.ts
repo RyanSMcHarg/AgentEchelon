@@ -40,6 +40,11 @@ export interface AdminConvMessage {
   deleted?: boolean;
   modelId?: string;
   intent?: string;
+  /** Who performed the moderation + when — taken from the -RED/-DEL sibling EVENT's own
+   *  sender (the actor who redacted/deleted), not the original author. Undefined if not moderated. */
+  moderatedByName?: string;
+  moderatedByArn?: string;
+  moderatedAt?: string;
   metadata: Record<string, unknown>;
   raw?: Record<string, unknown>;
 }
@@ -124,13 +129,56 @@ export async function adminListConversations(limit = 50): Promise<AdminConvSumma
   }));
 }
 
+// moderation_actions holds WHO redacted/deleted WHICH message, stamped by the analytics API at
+// action time with the SERVER-VERIFIED admin identity (the Chime redact/delete event keeps the
+// original author, so it can't attribute the moderator). The live DB won't re-bootstrap
+// (schema-init is Create-only), so ensure the table at runtime; migration 012 covers fresh
+// bootstraps. Memoized per container.
+let moderationTableReady = false;
+async function ensureModerationTable(): Promise<void> {
+  if (moderationTableReady) return;
+  await query(
+    `CREATE TABLE IF NOT EXISTS moderation_actions (
+       id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+       channel_arn VARCHAR(512) NOT NULL,
+       message_id  VARCHAR(128) NOT NULL,
+       action      VARCHAR(16)  NOT NULL,
+       actor_sub   VARCHAR(128) NOT NULL,
+       actor_name  VARCHAR(256),
+       actor_arn   VARCHAR(512),
+       created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
+     )`,
+  );
+  await query(
+    `CREATE INDEX IF NOT EXISTS idx_moderation_actions_msg ON moderation_actions(channel_arn, message_id)`,
+  );
+  moderationTableReady = true;
+}
+
+/** Record a moderation action with the server-verified actor. The analytics API's
+ *  record-moderation handler is the ONLY writer (it derives the actor from the JWT, never
+ *  the client body). Best-effort: the Chime redact/delete already succeeded client-side. */
+export async function recordModerationAction(input: {
+  channelArn: string; messageId: string; action: 'redact' | 'delete';
+  actorSub: string; actorName?: string; actorArn?: string;
+}): Promise<void> {
+  await ensureModerationTable();
+  await query(
+    `INSERT INTO moderation_actions (channel_arn, message_id, action, actor_sub, actor_name, actor_arn)
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [input.channelArn, input.messageId, input.action, input.actorSub, input.actorName || null, input.actorArn || null],
+  );
+}
+
 export async function adminListMessages(channelArn: string): Promise<AdminConvMessage[]> {
+  await ensureModerationTable();
   const res = await query<{
     message_id: string; content: string | null; sender_name: string | null;
     sender_arn: string | null; created_at: string; is_bot: boolean | null;
     bedrock_model: string | null; input_tokens: number | null; output_tokens: number | null;
     total_ms: number | null; redacted: boolean | null; deleted: boolean | null;
     metadata: Record<string, unknown> | null; intent: string | null;
+    moderated_by_name: string | null; moderated_by_arn: string | null; moderated_at: string | null;
   }>(
     // Moderation (redact + delete) is archived as a sibling row, NOT a column on
     // the CREATE row: kinesis-archival suffixes the event's MessageId (`-RED` for
@@ -152,7 +200,11 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
               WHERE ex.agent_message_id = m.id OR ex.user_message_id = m.id
               LIMIT 1) AS intent,
             (red.message_id IS NOT NULL) AS redacted,
-            (del.message_id IS NOT NULL) AS deleted
+            (del.message_id IS NOT NULL) AS deleted,
+            -- Attribution: the ACTUAL actor comes from moderation_actions, written by the analytics
+            -- API at action time with the server-verified admin identity. The Chime redact/delete
+            -- event keeps the original author, so it can't attribute the moderator; this can.
+            ma.actor_name AS moderated_by_name, ma.actor_arn AS moderated_by_arn, ma.created_at AS moderated_at
        FROM messages m
        LEFT JOIN messages red
               ON red.channel_arn = m.channel_arn
@@ -162,6 +214,12 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
               ON del.channel_arn = m.channel_arn
              AND del.event_type = 'DELETE_CHANNEL_MESSAGE'
              AND del.message_id = m.message_id || '-DEL'
+       LEFT JOIN LATERAL (
+              SELECT actor_name, actor_arn, created_at
+                FROM moderation_actions
+               WHERE channel_arn = m.channel_arn AND message_id = m.message_id
+               ORDER BY created_at DESC LIMIT 1
+            ) ma ON true
       WHERE m.channel_arn = $1 AND m.event_type = 'CREATE_CHANNEL_MESSAGE'
       ORDER BY m.created_at ASC`,
     [channelArn],
@@ -176,6 +234,12 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
     // superseding REDACT/DELETE row carries empty Content). `redacted` stays the
     // distinct flag the UI renders; `deleted` blanks content the same way.
     const content = redacted || deleted ? '' : stripMessageMarkers(r.content);
+    // Attribution from the moderation_actions audit (server-verified actor). Null when no
+    // audit row exists (bot self-delete, or a moderation before audit logging) → the UI
+    // falls back to the role ("by an admin" / "by a moderator").
+    const moderatedByName = r.moderated_by_name;
+    const moderatedByArn = r.moderated_by_arn;
+    const moderatedAt = r.moderated_at;
     return {
       id: r.message_id,
       content,
@@ -187,6 +251,9 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
       deleted,
       modelId: r.bedrock_model || undefined,
       intent: r.intent || undefined,
+      moderatedByName: moderatedByName || undefined,
+      moderatedByArn: moderatedByArn || undefined,
+      moderatedAt: moderatedAt || undefined,
       metadata,
       // Inspect-drawer payload: the faithful stored projection of this message.
       raw: {
@@ -194,6 +261,8 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
         Content: redacted || deleted ? '' : r.content,
         Redacted: redacted,
         Deleted: deleted,
+        ModeratedBy: moderatedByArn ? { Arn: moderatedByArn, Name: moderatedByName } : undefined,
+        ModeratedAt: moderatedAt || undefined,
         Sender: { Arn: senderArn, Name: r.sender_name },
         CreatedTimestamp: r.created_at,
         BedrockModel: r.bedrock_model,

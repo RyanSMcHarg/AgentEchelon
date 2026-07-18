@@ -49,6 +49,23 @@ export async function detectAnalyticsMode(): Promise<'athena' | 'aurora'> {
   return cachedMode;
 }
 
+/**
+ * Record a moderation action for attribution. The analytics Lambda stamps the SERVER-VERIFIED
+ * admin identity (from the JWT) into moderation_actions — the client only names the target, never
+ * the actor. Best-effort: the Chime redact/delete already succeeded, so callers ignore failures.
+ */
+export async function recordModeration(
+  channelArn: string,
+  messageId: string,
+  moderation: 'redact' | 'delete'
+): Promise<void> {
+  await queryAnalytics('record_moderation' as QueryType, { start: '', end: '' }, {
+    channelArn,
+    messageId,
+    moderation,
+  });
+}
+
 export async function queryAnalytics(
   queryType: QueryType,
   dateRange: AnalyticsDateRange,

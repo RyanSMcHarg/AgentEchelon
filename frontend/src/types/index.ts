@@ -196,6 +196,11 @@ export interface AdminConversationMessage {
   redacted?: boolean;
   /** True when a moderator DELETE removed the message (content blanked, like redacted but distinct). Aurora mode only. */
   deleted?: boolean;
+  /** WHO redacted/deleted this message + when — from the moderation_actions audit (server-verified
+   *  actor). Undefined when no audit row exists (bot self-delete, or pre-audit moderation). */
+  moderatedByName?: string;
+  moderatedByArn?: string;
+  moderatedAt?: string;
   modelId?: string;
   intent?: string;
   metadata?: Record<string, unknown>;
