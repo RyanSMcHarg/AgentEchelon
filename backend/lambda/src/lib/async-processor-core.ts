@@ -266,6 +266,12 @@ export interface AsyncProcessorEvent {
   correlationId: string;
   userMessage: string;
   userName?: string;
+  /**
+   * The sender's resolved display name, forwarded by the router (Cognito, cached). Used ONLY for the
+   * first-turn greeting (see firstTurnGreetingDirective); distinct from `userName`, which is a
+   * host-stamped metadata field carrying a "do not address by name in normal replies" instruction.
+   */
+  senderDisplayName?: string;
   userType: 'basic' | 'standard' | 'premium';
   /**
    * Attachment-in (image OR document) on the current turn, from the triggering message
@@ -641,6 +647,26 @@ export function formatDomainContextForPrompt(event: {
       `at most an occasional first greeting.`
     : '';
   return `\n\n<work_items>\n${parts.join('\n\n')}${who}\n</work_items>`;
+}
+
+/**
+ * First-turn greeting directive. On the user's FIRST message in a conversation, tell the model to open
+ * with a warm, one-time greeting BY NAME, then answer. Name personalization lives HERE, not in the
+ * creation-time welcome: the WelcomeIntent fires before the user's membership/metadata settle, so a
+ * name there races (see welcome-orientation + the router WelcomeIntent branch). This runs on the first
+ * real turn, when the sender's identity is settled and the router has resolved their display name.
+ * Returns '' when there is no usable name (empty, or the router's 'there' fallback) so a normal turn,
+ * or an unresolved name, adds nothing. Distinct from `event.userName`, which carries a "do NOT address
+ * by name in normal replies" instruction for host-stamped plan channels.
+ */
+export function firstTurnGreetingDirective(senderDisplayName?: string): string {
+  const name = (senderDisplayName || '').trim();
+  if (!name || name === 'there') return '';
+  return (
+    `\n\nThis is the user's FIRST message in this conversation. Open your reply by greeting them warmly ` +
+    `by name exactly once ("Hi ${name}, ..."), then answer their message directly. Use their name only ` +
+    `in this opening greeting, not again.`
+  );
 }
 
 /** Render the participant's profile (free-text preferences/working style) so replies are pre-tuned to
@@ -1676,6 +1702,8 @@ export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
    * moment the handler resolves, so an un-awaited rename often never lands.
    */
   titleRename?: Promise<unknown>;
+  /** True when this is the user's first message in the channel (drives the first-turn greeting). */
+  isFirstUserTurn: boolean;
 } | null> {
   const startTime = Date.now();
   const { channelArn, correlationId, userMessage, botArn } = event;
@@ -1732,8 +1760,9 @@ export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
   // execution environment once the handler resolves, so a purely
   // fire-and-forget rename races and is often suspended before the
   // UpdateChannel lands. See lambda/src/lib/channel-title.ts.
+  const isFirstUserTurn = conversationHistory.filter(m => m.role === 'user').length === 0;
   let titleRename: Promise<unknown> | undefined;
-  if (conversationHistory.filter(m => m.role === 'user').length === 0) {
+  if (isFirstUserTurn) {
     titleRename = (async () => {
       try {
         const { maybeDeriveAndRenameChannel } = await import('./channel-title.js');
@@ -1773,6 +1802,7 @@ export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
     bedrockMessages,
     userSub,
     titleRename,
+    isFirstUserTurn,
   };
 }
 

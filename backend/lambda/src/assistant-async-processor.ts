@@ -30,6 +30,7 @@ import {
   AsyncProcessorConfig,
   GeneratedDocument,
   runSharedPipeline,
+  firstTurnGreetingDirective,
   handleProcessingError,
   finalizePlaceholderResponse,
   generateAndUploadDocument,
@@ -441,7 +442,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       return;
     }
 
-    const { messageId, pollTime, consolidatedHistory, priorAgentContext, bedrockMessages } = pipeline;
+    const { messageId, pollTime, consolidatedHistory, priorAgentContext, bedrockMessages, isFirstUserTurn } = pipeline;
 
     // Build system prompt with the resolved persona + host per-turn context (domain grounding + i18n
     // + participant profile), assembled via the resolver registry + defensive composer. Each resolver
@@ -464,6 +465,14 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // in the uncached suffix). On /battle turns systemPrompt is reassembled below but still leads with
     // this same stable base, so the prefix remains a valid front slice.
     let cacheableSystemPrefixLength = systemPrompt.length;
+
+    // First-turn greeting (A3): on the user's first message, greet them by name once. Appended AFTER
+    // the cache-prefix capture so it sits in the dynamic (uncached) suffix, like the task appends
+    // below. No-ops when the name is unresolved or this is not the first turn. Name personalization
+    // lives here (not the creation-time welcome, which races membership/metadata).
+    if (isFirstUserTurn) {
+      systemPrompt += firstTurnGreetingDirective(event.senderDisplayName);
+    }
 
     // Load task context if task-based: fold the standing per-state guidance + the task's own context
     // into the prompt, and stamp activeTaskInfo (with taskId) so the reply archives with task_id.

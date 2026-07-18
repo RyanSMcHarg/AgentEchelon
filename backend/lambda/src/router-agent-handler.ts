@@ -695,6 +695,14 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     // 'default'). The processor combines it with the persona it resolves into the turn's `configId`.
     const intentPackVersion = componentVersion(activeIntentPackRaw());
 
+    // First-turn greeting (A3): resolve the sender's display name (Cognito, cached) and forward it so
+    // the async processor greets the user by name on their FIRST turn — where the identity is settled,
+    // unlike the racy channel-creation WelcomeIntent. Cached per warm container; a federated or
+    // unresolvable sender falls back to 'there', which the processor treats as "no name".
+    const senderDisplayName = await resolveUserName(
+      (event.requestAttributes?.['CHIME.sender.arn'] || '').split('/user/').pop() || '',
+    );
+
     // Task tracking runs on EVERY classification. The router is the single Lex entry point for all
     // classifications (deployed per-classification via STATIC_CLASSIFICATION); tasks are a platform
     // capability, not a standard/premium-only one. getActiveTask/createTask are classification-agnostic, and basic's
@@ -793,6 +801,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
             botArn,
             isTaskContinuation: !isNewTask,
             senderArn: event.requestAttributes?.['CHIME.sender.arn'],
+            senderDisplayName,
             // Reply visibility (targeted vs broadcast) is derived from the
             // placeholder's actual Target in the async processor, not passed
             // here - the router cannot see the inbound message's Target.
@@ -835,6 +844,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
         userType: effectiveClassification,
         botArn,
         senderArn: event.requestAttributes?.['CHIME.sender.arn'],
+        senderDisplayName,
         // Reply visibility is derived from the placeholder's actual Target in
         // the async processor (see the task-continuation invoke above).
         intent: classification.intent,
