@@ -30,6 +30,13 @@ interface ConversationsTabProps {
   deepLinkChannelArn?: string | null;
   /** Called once the deep link has been opened, so the parent can clear it. */
   onDeepLinkConsumed?: () => void;
+  /**
+   * Register a "close the open conversation detail" handler with the parent, so the
+   * console's global Back button returns to the LIST first (one level) instead of
+   * walking the tab history past it. Called with the closer when a detail is open,
+   * and null when back on the list.
+   */
+  registerBack?: (close: (() => void) | null) => void;
 }
 
 // Tier badge for the conversations list (basic/standard/premium) — the channel's
@@ -55,7 +62,7 @@ function driftBadge(score: number): React.ReactNode {
   );
 }
 
-const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoading, deepLinkChannelArn, onDeepLinkConsumed }) => {
+const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoading, deepLinkChannelArn, onDeepLinkConsumed, registerBack }) => {
   const [view, setView] = useState<'browser' | 'drift'>('browser');
   const [conversations, setConversations] = useState<AdminConversationSummary[]>([]);
   const [selectedConversation, setSelectedConversation] = useState<AdminConversationSummary | null>(null);
@@ -153,6 +160,13 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
 
     return () => controller.abort();
   }, [selectedConversation?.channelArn]);
+
+  // Let the console's global Back close an open detail (→ list) before it walks the
+  // tab history. Registered while a conversation is selected; cleared otherwise.
+  useEffect(() => {
+    registerBack?.(selectedConversation ? () => setSelectedConversation(null) : null);
+    return () => registerBack?.(null);
+  }, [selectedConversation, registerBack]);
 
   async function handleMembershipJoin(type: 'DEFAULT' | 'HIDDEN') {
     if (!selectedConversation) return;

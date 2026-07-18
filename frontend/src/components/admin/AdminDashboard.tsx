@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useCallback } from 'react';
+import React, { useState, useEffect, useCallback, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
 import { queryAnalytics } from '../../services/analyticsService';
 import OverviewTab from './OverviewTab';
@@ -170,13 +170,26 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
     selectTab('conversations');
   }, [selectTab]);
 
-  // In-app "Back": walk the browser history we've been pushing, so Back steps to
-  // the previously-viewed admin tab (popstate syncs it), and popping past the first
-  // admin tab returns to the app (App.tsx exits the console). Admin is auth-gated, so
-  // there is always an app/login entry behind it; if somehow there is nothing behind
-  // (admin was the very first page), fall back to the in-app exit so we never leave
-  // the site.
+  // A tab can register a "close the drill-down first" handler (e.g. the Conversations
+  // tab's open conversation detail). Opening that detail is React state, not a history
+  // entry, so without this the global Back would walk the TAB history and skip past the
+  // list — jumping "too far". When a detail is open, Back closes it (→ list) first.
+  const drillBackRef = useRef<(() => void) | null>(null);
+  const registerDrillBack = useCallback((fn: (() => void) | null) => {
+    drillBackRef.current = fn;
+  }, []);
+
+  // In-app "Back": if a tab has an open drill-down, close that one level first.
+  // Otherwise walk the browser history we've been pushing, so Back steps to the
+  // previously-viewed admin tab (popstate syncs it), and popping past the first admin
+  // tab returns to the app (App.tsx exits the console). Admin is auth-gated, so there
+  // is always an app/login entry behind it; if somehow there is nothing behind (admin
+  // was the very first page), fall back to the in-app exit so we never leave the site.
   const handleBack = useCallback(() => {
+    if (drillBackRef.current) {
+      drillBackRef.current();
+      return;
+    }
     if (window.history.length > 1) {
       window.history.back();
     } else {
@@ -493,6 +506,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             isLoading={isLoading}
             deepLinkChannelArn={conversationDeepLink}
             onDeepLinkConsumed={() => setConversationDeepLink(null)}
+            registerBack={registerDrillBack}
           />
         )}
         {activeTab === 'users' && (
