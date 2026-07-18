@@ -22,7 +22,7 @@ type AuthView = 'login' | 'register' | 'verify' | 'success' | 'forgot';
 
 function AppContent() {
   const {
-    isAuthenticated, isLoading, login, register, passwordChallenge, completeNewPassword,
+    user, isAuthenticated, isLoading, login, register, passwordChallenge, completeNewPassword,
     mfaChallenge, completeMfa, forgotPassword, confirmForgotPassword, resendCode,
   } = useAuth();
   const { isInitialized } = useAwsClient();
@@ -180,7 +180,12 @@ function AppContent() {
     );
   }
 
-  if (isAdminView) {
+  // The admin console renders ONLY for a member of the `admins` group. `isAdminView`
+  // tracks the `?admin` URL param (deep-link/Back support), but the URL alone must never
+  // reveal the console: any authenticated user could set `?admin=1`, so the render is gated
+  // on `user?.isAdmin` here. The backend independently enforces `requireAdmin` on every admin
+  // API, so this is the UI-affordance gate, not the authorization boundary.
+  if (isAdminView && user?.isAdmin) {
     return (
       <div className="app">
         <Header onAdminToggle={goHome} isAdminView={true} onHome={goHome} />

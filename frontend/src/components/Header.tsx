@@ -36,7 +36,7 @@ const Header: React.FC<HeaderProps> = ({ onAdminToggle, isAdminView, onHome }) =
           <ConnectionStatus />
         </div>
         <div className="header-actions">
-          {user?.tier === 'premium' && onAdminToggle && (
+          {user?.isAdmin && onAdminToggle && (
             <button
               className={`header-admin-btn${isAdminView ? ' is-active' : ''}`}
               onClick={onAdminToggle}
