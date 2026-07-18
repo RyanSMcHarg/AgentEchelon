@@ -295,18 +295,20 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
                     label: 'Message',
                     render: (value, row) => {
                       const m = row as unknown as AdminConversationMessage;
-                      // Deleted takes precedence over redacted (a delete is the stronger action).
-                      // A tombstone, not a blank cell: the reviewer must see content existed + was removed.
+                      // A tombstone (not a blank cell) so the reviewer sees content existed and was
+                      // removed. Wording tracks the authority model (SPEC-ADMIN-IDENTITY): a redact is
+                      // a moderator-level action, a delete requires app-instance-admin. Delete takes
+                      // precedence over redact (the stronger action).
                       if (m.deleted)
                         return (
                           <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>
-                            🗑 [deleted by moderator]
+                            Deleted by an admin
                           </span>
                         );
                       if (m.redacted)
                         return (
                           <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>
-                            ⊘ [redacted by moderator]
+                            Redacted by a moderator
                           </span>
                         );
                       return String(value ?? '');

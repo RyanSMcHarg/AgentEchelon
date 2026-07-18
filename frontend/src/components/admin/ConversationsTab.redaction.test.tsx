@@ -52,11 +52,11 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
     expect(await screen.findByText(/the quarterly revenue was up/)).toBeTruthy();
 
     // A redacted message must show the redacted tombstone — NOT a blank cell, NOT "deleted".
-    const redacted = await screen.findByText(/\[redacted by moderator\]/);
+    const redacted = await screen.findByText(/Redacted by a moderator/);
     expect(redacted).toBeTruthy();
 
     // A deleted message must show the DISTINCT deleted tombstone.
-    const deleted = await screen.findByText(/\[deleted by moderator\]/);
+    const deleted = await screen.findByText(/Deleted by an admin/);
     expect(deleted).toBeTruthy();
 
     // The original (now-blanked) content of the moderated messages must never leak.
@@ -74,8 +74,8 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
       />,
     );
     expect(await screen.findByText(/the quarterly revenue was up/)).toBeTruthy();
-    expect(screen.queryByText(/\[redacted by moderator\]/)).toBeNull();
-    expect(screen.queryByText(/\[deleted by moderator\]/)).toBeNull();
+    expect(screen.queryByText(/Redacted by a moderator/)).toBeNull();
+    expect(screen.queryByText(/Deleted by an admin/)).toBeNull();
   });
 
   it('still renders messages when the live members call fails (resilient detail load)', async () => {
@@ -92,7 +92,7 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
         deepLinkChannelArn={CHANNEL}
       />,
     );
-    expect(await screen.findByText(/\[deleted by moderator\]/)).toBeTruthy();
+    expect(await screen.findByText(/Deleted by an admin/)).toBeTruthy();
     expect(screen.queryByText(/No messages loaded/)).toBeNull();
   });
 });
