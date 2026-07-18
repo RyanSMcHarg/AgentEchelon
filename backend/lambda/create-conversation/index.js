@@ -90,7 +90,7 @@ const tierBotArnCache = {};
  * Full per-tier isolation (no shared cross-tier identity): a conversation of a
  * given tier is created by, owned by, and answered by that tier's own assistant
  * (its name, WelcomeIntent greeting, Bedrock guardrail, and tier-scoped IAM).
- * Resolved formulaically from SSM `/agent-echelon/tier/{tier}/bot-arn` (written
+ * Resolved formulaically from SSM `/agent-echelon/assistant/{tier}/bot-arn` (written
  * by each tier stack), so adding a tier needs no change here. There is NO shared
  * cross-tier bot fallback: if the per-tier key is missing the request errors
  * rather than silently binding a wrong-tier assistant. `tier` is the ENFORCED
@@ -98,13 +98,17 @@ const tierBotArnCache = {};
  * an authorized tier).
  */
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
+// Whether to surface internal error detail (IAM ARNs, resource paths, stack traces) in the HTTP
+// response. OFF by default: production returns a generic message and logs the full error server-side
+// (CloudWatch). Set DEBUG_ERRORS=true on the Lambda to echo the detail to the client while debugging.
+const DEBUG_ERRORS = process.env.DEBUG_ERRORS === 'true';
 async function getBotArnForTier(tier) {
   const t = tier || 'basic';
   if (tierBotArnCache[t]) return tierBotArnCache[t];
-  const arn = await getSsmParam(`${SSM_ROOT}/tier/${t}/bot-arn`);
+  const arn = await getSsmParam(`${SSM_ROOT}/assistant/${t}/bot-arn`);
   if (!arn) {
     throw new Error(
-      `[CreateChannel] per-tier bot ARN ${SSM_ROOT}/tier/${t}/bot-arn is empty; ` +
+      `[CreateChannel] per-tier bot ARN ${SSM_ROOT}/assistant/${t}/bot-arn is empty; ` +
         `cannot create a ${t} conversation without its tier assistant.`,
     );
   }
@@ -463,7 +467,9 @@ exports.handler = async (event) => {
         'Access-Control-Allow-Headers': '*',
       },
       body: JSON.stringify({
-        error: error.message,
+        // Never leak internal detail (IAM role ARNs, resource paths) to the web client; the full
+        // error is logged above (CloudWatch). DEBUG_ERRORS=true echoes it here while debugging.
+        error: DEBUG_ERRORS ? error.message : 'Could not create the conversation. Please try again; if it persists, contact an administrator.',
         code: 'CONVERSATION_CREATION_FAILED',
       }),
     };

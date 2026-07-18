@@ -54,10 +54,12 @@ const EMAIL_RE = /^[^\s"@]+@[^\s"@]+\.[^\s"@]+$/;
 // no shared cross-tier bot fallback: a missing
 // per-tier SSM key is an error (the tier stack publishes it on deploy).
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
+// Gate internal error detail out of the HTTP response by default (logged server-side); DEBUG_ERRORS=true echoes it.
+const DEBUG_ERRORS = process.env.DEBUG_ERRORS === 'true';
 const tierBotArnCache = {};
 async function resolveTierBotArn(tier) {
   if (tierBotArnCache[tier]) return tierBotArnCache[tier];
-  const key = `${SSM_ROOT}/tier/${tier}/bot-arn`;
+  const key = `${SSM_ROOT}/assistant/${tier}/bot-arn`;
   const resp = await ssmClient.send(new GetParameterCommand({ Name: key }));
   const arn = resp.Parameter?.Value;
   if (!arn) {
@@ -462,7 +464,7 @@ exports.handler = async (event) => {
   } catch (error) {
     console.error('Error sharing conversation:', error);
     return respond(500, {
-      error: error.message,
+      error: DEBUG_ERRORS ? error.message : 'Could not share the conversation. Please try again; if it persists, contact an administrator.',
       code: 'SHARE_FAILED',
     });
   }

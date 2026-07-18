@@ -10,6 +10,8 @@ const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
 const messagingClient = new ChimeSDKMessagingClient({});
 const ssmClient = new SSMClient({});
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
+// Gate internal error detail out of the HTTP response by default (logged server-side); DEBUG_ERRORS=true echoes it.
+const DEBUG_ERRORS = process.env.DEBUG_ERRORS === 'true';
 
 // Per-tier AppInstanceBot ARNs, resolved once per (tier, cold start). There is
 // NO shared cross-tier bot fallback: a conversation of a given tier is answered
@@ -21,11 +23,11 @@ async function getBotArnForTier(tier) {
   const t = tier || 'basic';
   if (tierBotArnCache[t]) return tierBotArnCache[t];
   const response = await ssmClient.send(
-    new GetParameterCommand({ Name: `${SSM_ROOT}/tier/${t}/bot-arn` })
+    new GetParameterCommand({ Name: `${SSM_ROOT}/assistant/${t}/bot-arn` })
   );
   const arn = response.Parameter?.Value;
   if (!arn) {
-    throw new Error(`per-tier bot ARN ${SSM_ROOT}/tier/${t}/bot-arn is empty`);
+    throw new Error(`per-tier bot ARN ${SSM_ROOT}/assistant/${t}/bot-arn is empty`);
   }
   tierBotArnCache[t] = arn;
   return arn;
@@ -166,7 +168,7 @@ exports.handler = async (event) => {
         'Access-Control-Allow-Headers': '*',
       },
       body: JSON.stringify({
-        error: error.message,
+        error: DEBUG_ERRORS ? error.message : 'Could not add the assistant to the conversation. Please try again; if it persists, contact an administrator.',
         code: 'AGENT_ADDITION_FAILED'
       }),
     };
