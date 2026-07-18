@@ -689,8 +689,8 @@ Deployment model overrides are selected in CDK with `basicModelKey`, `standardMo
 
 The admin console groups its views into **7 sections** (section rail + sub-tabs):
 Overview (Overview + Latency), Conversations, Effectiveness (the intent-anchored
-Effectiveness dashboard + the Aurora-only Evaluations/Flows/Flagged/Ground Truth/Tasks
-as drill depths), Models (Models + Model Strategy + Steps), Experiments,
+Dashboard drill - Evaluations/Flows/Tasks are its drill depths - plus the standalone
+Steps, Flagged, and Ground Truth sub-tabs), Models (Models + Model Strategy), Experiments,
 Users (Users + Manage Users), and Security (Membership Audit). Aurora-only views
 are hidden in Athena mode. (Usage: [ADMIN-GUIDE.md](../guides/admin/ADMIN-GUIDE.md); design:
 [SPEC-ADMIN-CONSOLE.md](../specs/admin-console/SPEC-ADMIN-CONSOLE.md).) The individual views:

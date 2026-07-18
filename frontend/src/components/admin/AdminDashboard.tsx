@@ -61,10 +61,12 @@ interface AdminSection { id: string; label: string; tabs: TabId[]; }
 const SECTIONS: AdminSection[] = [
   { id: 'overview', label: 'Overview', tabs: ['overview', 'latency'] },
   { id: 'conversations', label: 'Conversations', tabs: ['conversations'] },
-  // Effectiveness is the intent-anchored landing (SPEC-ADMIN-CONSOLE-EFFECTIVENESS); the artifact-type
-  // tabs remain as sub-views for now (the spec's full retire-into-drill-depths is a later, separate step).
-  { id: 'quality', label: 'Effectiveness', tabs: ['effectiveness', 'evaluations', 'flows', 'flagged', 'ground_truth', 'tasks'] },
-  { id: 'models', label: 'Models', tabs: ['models', 'strategy', 'steps'] },
+  // Effectiveness is the intent-anchored spine (SPEC-ADMIN-CONSOLE-EFFECTIVENESS §9). Evaluations,
+  // Flows, and Tasks retire as top-level tabs and re-enter as drill depths of the Dashboard (L2
+  // exchanges / L2 tasks / L3 turn timeline). Steps moves here from Models (D1) as the standalone
+  // tool-loop view + the L4 leaf; Flagged and Ground Truth stay as standalone human-action tabs (§7).
+  { id: 'quality', label: 'Effectiveness', tabs: ['effectiveness', 'steps', 'flagged', 'ground_truth'] },
+  { id: 'models', label: 'Models', tabs: ['models', 'strategy'] },
   { id: 'experiments', label: 'Experiments', tabs: ['experiments'] },
   { id: 'users', label: 'Users', tabs: ['users', 'user_management'] },
   { id: 'security', label: 'Security', tabs: ['security'] },
