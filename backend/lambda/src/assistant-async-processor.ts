@@ -906,11 +906,21 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // Generate document attachment — on report tasks or explicit user request.
     let attachment: GeneratedDocument | undefined;
     if (process.env.ATTACHMENTS_BUCKET) {
-      let generate = isDocumentRequest(event.userMessage || '');
-
-      if (!generate && event.taskType === 'report_generation' && event.taskId) {
-        const task = await getTask(event.taskId, event.channelArn);
-        generate = task?.taskState === 'generating' || task?.taskState === 'revising';
+      let generate;
+      if (event.taskType === 'report_generation' && event.taskId) {
+        // Task-driven report: attach a document ONLY on the turn that DELIVERS the report — the turn
+        // that STARTED in 'generating' (the model produces the report) or 'revising' (a user-requested
+        // rework). Use the turn's START state (activeTaskInfo.status, captured before the tool loop),
+        // because the loop may have already advanced the task to 'completed' by now. A clarifying turn
+        // (collecting_requirements) or an outline turn (drafting_outline) is short conversational text
+        // and must NEVER be turned into an attachment. Do NOT use isDocumentRequest here: the user's
+        // original "write a report" matches it on EVERY turn, which is exactly what attached the
+        // clarifying questions as a file (the reported bug).
+        const startState = activeTaskInfo?.status;
+        generate = startState === 'generating' || startState === 'revising';
+      } else {
+        // Ad-hoc (no report task): the user explicitly asked to save THIS response as a document.
+        generate = isDocumentRequest(event.userMessage || '');
       }
 
       // In a /battle, the long-form prompt told the model the deliverable would be delivered as a
