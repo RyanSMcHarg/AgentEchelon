@@ -99,6 +99,27 @@ describe('EffectivenessTab', () => {
     expect(screen.getByText(/Directly answered the question/)).toBeTruthy();
   });
 
+  it('L1 tool lens aggregates per-tool usage (calls + errors) from execution_steps for the intent', async () => {
+    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} />);
+    // Queue the L1 tool-lens fetch (execution_steps) BEFORE the click that fires it.
+    mockQuery.mockResolvedValueOnce(result([
+      { intent: 'report_generation', steps: [
+        { tools: [{ name: 'load_company_context', ok: true }, { name: 'advance_task_state', ok: false }] },
+        { tools: [{ name: 'load_company_context', ok: true }] },
+      ] },
+      { intent: 'general_query', steps: [{ tools: [{ name: 'search', ok: true }] }] }, // other intent — must be ignored
+    ]));
+
+    fireEvent.click(screen.getByRole('button', { name: 'report_generation' }));
+    await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('execution_steps', range, { limit: '200' }));
+
+    // report_generation's tools only: load_company_context (2 calls), advance_task_state (1 call, 1 error).
+    expect(await screen.findByText('load_company_context')).toBeTruthy();
+    expect(screen.getByText('advance_task_state')).toBeTruthy();
+    // The other intent's tool must not appear.
+    expect(screen.queryByText('search')).toBeNull();
+  });
+
   it('shows a loading state', () => {
     render(<EffectivenessTab data={null} dateRange={range} isLoading={true} />);
     expect(screen.getByText(/Loading effectiveness/i)).toBeTruthy();
