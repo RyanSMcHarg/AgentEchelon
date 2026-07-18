@@ -25,12 +25,18 @@ import {
   AdminAddUserToGroupCommand,
   AdminConfirmSignUpCommand,
   AdminListGroupsForUserCommand,
+  ListUserPoolClientsCommand,
 } from '@aws-sdk/client-cognito-identity-provider';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import {
   CloudFormationClient,
   DescribeStacksCommand,
 } from '@aws-sdk/client-cloudformation';
+import {
+  SecretsManagerClient,
+  PutSecretValueCommand,
+  CreateSecretCommand,
+} from '@aws-sdk/client-secrets-manager';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -38,8 +44,13 @@ const region = process.env.AWS_REGION || 'us-east-1';
 const cognitoClient = new CognitoIdentityProviderClient({ region });
 const s3Client = new S3Client({ region });
 const cfnClient = new CloudFormationClient({ region });
+const smClient = new SecretsManagerClient({ region });
 
 const DEMO_PASSWORD = 'StratumDemo2026!';
+// The e2e suite reads its users + pool/client from this secret (tests/e2e/helpers/test-credentials.ts).
+// seed-demo now WRITES it, so a fresh deploy (new pool) never leaves it stale — which is what made
+// every UI sign-in in the suite time out (wrong pool + wrong emails/passwords).
+const TEST_SECRET_NAME = process.env.TEST_SECRET_NAME || 'agent-interface/test-credentials';
 
 interface StackOutputs {
   userPoolId: string;
@@ -184,6 +195,41 @@ async function createDemoUser(
     }
   }
   console.log(`  ✓ ${email} groups: ${groups.join(', ')}`);
+}
+
+/**
+ * Sync the e2e test-credentials secret with the users this seed just provisioned + the live pool.
+ * testAdmin maps to the premium demo user (createDemoUser also puts it in the `admins` group).
+ */
+async function writeTestCredentialsSecret(
+  userPoolId: string,
+  users: { email: string; tier: string }[],
+): Promise<void> {
+  const clients = await cognitoClient.send(
+    new ListUserPoolClientsCommand({ UserPoolId: userPoolId, MaxResults: 10 }),
+  );
+  const clientId = clients.UserPoolClients?.[0]?.ClientId || '';
+  const emailFor = (t: string) => users.find((u) => u.tier === t)?.email || '';
+  const u = (tier: string) => ({ email: emailFor(tier), password: DEMO_PASSWORD, tier });
+  const payload = {
+    testAdmin: u('premium'), // the premium demo user is also in the `admins` group
+    basicUser: u('basic'),
+    standardUser: u('standard'),
+    premiumUser: u('premium'),
+    cognitoUserPoolId: userPoolId,
+    cognitoClientId: clientId,
+  };
+  const SecretString = JSON.stringify(payload);
+  try {
+    await smClient.send(new PutSecretValueCommand({ SecretId: TEST_SECRET_NAME, SecretString }));
+  } catch (err: any) {
+    if (err?.name === 'ResourceNotFoundException') {
+      await smClient.send(new CreateSecretCommand({ Name: TEST_SECRET_NAME, SecretString }));
+    } else {
+      throw err;
+    }
+  }
+  console.log(`  ✓ wrote ${TEST_SECRET_NAME} (pool ${userPoolId}, client ${clientId || 'NONE'})`);
 }
 
 async function uploadContextFiles(bucketName: string): Promise<void> {
@@ -357,6 +403,12 @@ async function main(): Promise<void> {
   for (const user of users) {
     await createDemoUser(userPoolId, user.email, user.tier, user.name);
   }
+  console.log('');
+
+  // Step 2b: keep the e2e test-credentials secret in sync with these users + this pool, so the
+  // Playwright suite (which reads the secret) can actually sign in after a fresh deploy.
+  console.log('Step 2b: Syncing e2e test-credentials secret...');
+  await writeTestCredentialsSecret(userPoolId, users);
   console.log('');
 
   // Step 3: Upload context files
