@@ -11,3 +11,8 @@ node_modules
 cdk.out
 # Synth-generated context cache (embeds account-specific AZ/lookups — not portable)
 cdk.context.json
+
+# Cognito trigger handlers are hand-written JS SOURCE (not compiled TS output); the blanket *.js
+# rule above drops them from the Lambda asset on a clean-checkout deploy (which ships an empty
+# handler and breaks ALL auth). Keep them tracked.
+!lambda/cognito-triggers/*.js
