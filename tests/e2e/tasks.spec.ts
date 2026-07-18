@@ -183,4 +183,96 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
       .not.toMatch(/a few quick questions|what should the report focus on|let me know your preferences/);
     expect(content, 'the report text must be valid UTF-8 (no replacement/garbage chars)').not.toContain('�');
   });
+
+  // OUTPUT VALIDITY — data_extraction: an extraction task must hand back a real, structured, on-topic
+  // data document (a markdown table of the requested records), delivered as a downloadable file — not a
+  // conversational summary. Grounded in the seeded Stratum customer records (churn-risk accounts), so
+  // it also proves tier-scoped RAG feeds the extraction. Same deterministic delivery path as reports.
+  test('[premium] a data extraction delivers a valid, structured data document (content validated)', async ({ page }) => {
+    test.setTimeout(600_000); // multi-turn extract -> format flow + download
+
+    await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
+    await createConversation(page, `Extraction validity ${Date.now()}`, 'Premium');
+
+    await sendAndWaitForResponse(
+      page,
+      'Extract our enterprise customer accounts currently flagged as churn risk. Include the account '
+        + 'name, ARR, and the reason each is at risk. Give it to me as a downloadable table.',
+      180_000,
+    );
+    const attachment = page.locator('.assistant-message .attachment-display').last();
+    const approvals = [
+      'Pull from the customer accounts I have access to. Include every at-risk enterprise account, sorted by ARR descending.',
+      'The results look right — format the final table and deliver it as a downloadable document.',
+      'Yes, attach the extracted table as a file.',
+    ];
+    let delivered = await attachment.isVisible({ timeout: 2000 }).catch(() => false);
+    for (const a of approvals) {
+      if (delivered) break;
+      await sendAndWaitForResponse(page, a, 180_000);
+      delivered = await attachment.isVisible({ timeout: 3000 }).catch(() => false);
+    }
+    expect(delivered, 'the extraction task must DELIVER a downloadable data document').toBe(true);
+
+    const name = ((await attachment.locator('.attachment-name').textContent()) || '').trim();
+    expect(name, `attachment name: "${name}"`).toMatch(/\.(md|markdown|txt|csv)$/i);
+
+    const [popup] = await Promise.all([
+      page.context().waitForEvent('page', { timeout: 30_000 }),
+      attachment.locator('.attachment-file, .attachment-download-btn').first().click(),
+    ]);
+    await popup.waitForLoadState('domcontentloaded').catch(() => {});
+    const fileUrl = popup.url();
+    await popup.close();
+    expect(fileUrl, 'the download must open the presigned file URL').toMatch(/^https?:\/\//);
+    const fileApi = await pwRequest.newContext();
+    const fileResp = await fileApi.get(fileUrl);
+    expect(fileResp.ok(), `presigned download must succeed (got ${fileResp.status()})`).toBeTruthy();
+    const content = await fileResp.text();
+    await fileApi.dispose();
+
+    // Validate the CONTENT is a real structured extraction — a markdown table with the requested fields,
+    // on-topic (churn / at-risk accounts), not a conversational summary, valid UTF-8.
+    expect(content.length, 'the data document must be substantial (not empty/near-empty)').toBeGreaterThan(200);
+    expect(content, 'the extraction must be a markdown table (header row + separator rule)')
+      .toMatch(/\|.*\|\s*\n\s*\|[-:\s|]+\|/);
+    expect(content.toLowerCase(), 'the extraction must be ON-TOPIC (churn / at-risk accounts)')
+      .toMatch(/churn|at.risk|risk/);
+    expect(content, 'the extraction text must be valid UTF-8 (no replacement/garbage chars)').not.toContain('�');
+  });
+
+  // guided_troubleshooting is an INTERACTIVE diagnostic task, NOT a document-producing one. It must
+  // return a substantive diagnostic response (ask for symptoms / propose steps) and must NOT attach a
+  // file — the regression guard that the downloadable-document gate is scoped to report/extraction only
+  // and a troubleshooting turn is never wrongly saved as a file.
+  test('[standard] a troubleshooting request gives a diagnostic response and attaches no file', async ({ page }) => {
+    test.setTimeout(300_000);
+    await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
+    await createConversation(page, `Troubleshoot ${Date.now()}`, 'Standard');
+
+    const resp = await sendAndWaitForResponse(
+      page,
+      'Help me troubleshoot: a customer reports their StratumFlow workflow is broken and stopped '
+        + 'running after they added a new connector. Where do we start?',
+      180_000,
+    );
+    expect(resp.text && resp.text.length, 'the troubleshooting turn must return a response').toBeTruthy();
+
+    // Diagnostic, not a document: NO downloadable attachment on a troubleshooting turn.
+    const lastBot = page.locator('.assistant-message').last();
+    await expect(
+      lastBot.locator('.attachment-display'),
+      'a troubleshooting turn must not attach a file (doc gate is report/extraction only)',
+    ).toHaveCount(0);
+
+    // Reads like an on-topic diagnostic — asks a question, proposes a step/check, or engages the
+    // reported problem domain (workflow / connector / trigger). Lenient by design: the strict guard is
+    // the no-file assertion above; here we only confirm the reply is a substantive, on-topic diagnostic
+    // and not a generic deflection.
+    expect(resp.text.length, 'the diagnostic reply should be substantive').toBeGreaterThan(60);
+    expect(
+      resp.text.toLowerCase(),
+      'the response should be an on-topic diagnostic (question / step / engages the problem)',
+    ).toMatch(/\?|step|check|first|which|confirm|log|reproduce|when|workflow|connector|trigger|running|issue|happen|start|gather|understand|diagnos|stratumflow/);
+  });
 });

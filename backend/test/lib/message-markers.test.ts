@@ -2,7 +2,7 @@
  * message-markers — the canonical deterministic marker stripper.
  * Mirrors the SPA parser's marker set so analytics/eval never sees a raw marker.
  */
-import { stripMessageMarkers } from '../../lambda/src/lib/message-markers';
+import { stripMessageMarkers, stripReasoningTags } from '../../lambda/src/lib/message-markers';
 
 describe('stripMessageMarkers', () => {
   it('strips the NAVIGATE_CHANNEL drift-redirect marker (the leak the judge scored)', () => {
@@ -40,5 +40,36 @@ describe('stripMessageMarkers', () => {
   it('leaves ordinary content (incl. markdown) untouched', () => {
     const md = '**Spaces** — they render identically. Here is `code` and a [link](http://x).';
     expect(stripMessageMarkers(md)).toBe(md);
+  });
+});
+
+describe('stripReasoningTags', () => {
+  it('removes a whole <thinking> block, content included', () => {
+    const raw = '<thinking>\nIt appears there was an error transitioning the task.\n</thinking>\n\nTo ensure the report meets your needs, please provide the audience.';
+    expect(stripReasoningTags(raw)).toBe('To ensure the report meets your needs, please provide the audience.');
+  });
+
+  it('unwraps a <result> wrapper but keeps the inner answer (the live drift leak)', () => {
+    expect(stripReasoningTags('<result>Yes — created a new conversation.</result>')).toBe('Yes — created a new conversation.');
+    // The exact fragment the drift confirm test captured mid-stream.
+    expect(stripReasoningTags('<result>')).toBe('');
+  });
+
+  it('tolerates an unclosed <thinking> (strips to end) and orphaned closing tags', () => {
+    expect(stripReasoningTags('Here is the report.\n<thinking>still reasoning, never closed')).toBe('Here is the report.');
+    expect(stripReasoningTags('Done.</thinking>')).toBe('Done.');
+  });
+
+  it('keeps a real report body intact (does not touch markdown headings)', () => {
+    const report = '# Monorepo vs. Multi-Repo\n\n## Executive Summary\n\n- Delivery velocity\n- CI cost';
+    expect(stripReasoningTags(report)).toBe(report);
+  });
+
+  it('is idempotent and null-safe', () => {
+    const once = stripReasoningTags('<thinking>x</thinking>Answer.');
+    expect(once).toBe('Answer.');
+    expect(stripReasoningTags(once)).toBe('Answer.');
+    expect(stripReasoningTags(null)).toBe('');
+    expect(stripReasoningTags(undefined)).toBe('');
   });
 });

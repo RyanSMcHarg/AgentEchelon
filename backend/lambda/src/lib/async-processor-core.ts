@@ -2284,6 +2284,33 @@ export function isDocumentRequest(userMessage: string): boolean {
   return patterns.some(p => lower.includes(p));
 }
 
+/**
+ * Deterministic check: is THIS assistant response an actual deliverable document (a finished report
+ * or a formatted data extraction) — as opposed to a short clarifying question or an outline-for-approval?
+ *
+ * File delivery for document-producing tasks (report_generation, data_extraction) is gated on THIS
+ * (the output), not on the task's machine state, because the model reliably PRODUCES the deliverable
+ * but does NOT reliably advance the state machine to its delivery state on the turn it writes it
+ * (verified live: reports frequently emit in full while the task is still in `drafting_outline`, so a
+ * start-state gate silently dropped the file). Keying on the output makes delivery reliable. A short
+ * clarifying/outline turn fails the substance+structure bar, so a few-line follow-up is never turned
+ * into a file (the originally reported bug).
+ *
+ * A deliverable document is SUBSTANTIAL (a clarifying question is never this long) AND STRUCTURED like a
+ * document: a markdown heading, a markdown table (an extraction's natural shape), or several list items
+ * in a long body.
+ */
+export function isDeliverableDocument(response: string | null | undefined): boolean {
+  const text = (response || '').trim();
+  if (text.length < 500) return false; // a clarifying question / one-liner never reaches this
+  const hasHeading = /(^|\n)#{1,6}\s+\S/.test(text); // "# Title" / "## Section"
+  const hasTable = /(^|\n)\s*\|.+\|\s*\n\s*\|[-:\s|]+\|/.test(text); // markdown table w/ header rule
+  const listItems = (text.match(/(^|\n)\s*(?:[-*]\s+|\d+\.\s+)\S/g) || []).length;
+  // A heading or a table is a strong document signal; a plain list needs several items AND a long
+  // body so a 3-bullet answer doesn't masquerade as a deliverable.
+  return hasHeading || hasTable || (listItems >= 4 && text.length >= 800);
+}
+
 export interface GeneratedDocument {
   fileKey: string;
   name: string;
@@ -2305,7 +2332,9 @@ export async function generateAndUploadDocument(
 ): Promise<GeneratedDocument> {
   const channelId = channelArn.split('/').pop() || 'unknown';
   const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-  const fileName = `report-${timestamp}.md`;
+  // Name the file for the task that produced it (report-*, extract-*), else a neutral document-*.
+  const prefix = taskType === 'data_extraction' ? 'extract' : taskType === 'report_generation' ? 'report' : 'document';
+  const fileName = `${prefix}-${timestamp}.md`;
   const fileKey = `generated-docs/${channelId}/${fileName}`;
 
   const bodyBuffer = Buffer.from(content, 'utf-8');

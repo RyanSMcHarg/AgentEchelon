@@ -34,6 +34,7 @@ import {
   finalizePlaceholderResponse,
   generateAndUploadDocument,
   isDocumentRequest,
+  isDeliverableDocument,
   getTaskLabel,
   applyOutputGuardrail,
   WORK_ITEM_OPENAI_TOOLS,
@@ -53,6 +54,7 @@ import {
   type BedrockDocumentInput,
 } from './lib/async-processor-core.js';
 import { fetchAttachmentBytes, senderOwnsAttachmentKey } from './lib/attachment-bytes.js';
+import { stripReasoningTags } from './lib/message-markers.js';
 import type { RosterParticipant } from './lib/channel-notify.js';
 import { buildConfigIdentity, componentVersion } from './lib/config-identity.js';
 import { buildSystemPrompt } from './lib/context-framework.js';
@@ -351,8 +353,10 @@ Understand what data the user needs:
     case 'extracting':
       return `\n\n## CURRENT TASK: Data Extraction - Extracting
 Process the extraction based on collected requirements:
-- Explain what you're extracting and from where
-- Show progress or intermediate results if applicable`;
+- Explain briefly what you're extracting and from where.
+- Present the extracted records as a **markdown table** — one row per record, a column per field —
+  when the data is tabular; use a titled list only when it genuinely isn't. Include every matching
+  record, not a sample. This result is delivered to the user as a downloadable document.`;
 
     case 'validating':
       return `\n\n## CURRENT TASK: Data Extraction - Validating
@@ -363,10 +367,11 @@ Validate the extracted data:
 
     case 'formatting':
       return `\n\n## CURRENT TASK: Data Extraction - Formatting
-Format the validated data for delivery:
-- Apply the requested output format
-- Add any requested calculations or transformations
-- Present the final results clearly`;
+Format the validated data for delivery as a downloadable document:
+- Default to a clean **markdown table** for tabular data (add a short title line above it); apply the
+  user's requested format if they named one.
+- Add any requested calculations or transformations (totals, sorting, derived columns).
+- Present the complete, final result — this is the deliverable the user downloads.`;
 
     default:
       return '\n\n## CURRENT TASK: Data Extraction\nHelp the user extract the data they need.';
@@ -872,9 +877,12 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // On plan conversations, extract any ```suggestions JSON block the model emitted into a
     // `<!--suggestions:-->` marker (model-agnostic — works for R1, which can't use tools). The
     // visible prose is unchanged; the widget renders cards from the marker.
-    const response = event.domainContext
-      ? extractSuggestions(bedrockResult.response)
-      : bedrockResult.response;
+    // Strip any leaked reasoning scaffolding (`<thinking>…</thinking>`, `<result>` wrappers) the model
+    // sometimes emits in its FINAL answer — never intended for the human, and it also poisons the
+    // generated report file if left in. Not a control marker, so stripMessageMarkers wouldn't catch it.
+    const response = stripReasoningTags(
+      event.domainContext ? extractSuggestions(bedrockResult.response) : bedrockResult.response,
+    );
 
     // SPEC-TASK-STATE-TRANSITIONS §8: task state advances ONLY via the authorized advance_task_state
     // tool inside the loop. The legacy keyword detector runs in SHADOW mode (log-only, to measure the
@@ -907,17 +915,30 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     let attachment: GeneratedDocument | undefined;
     if (process.env.ATTACHMENTS_BUCKET) {
       let generate;
-      if (event.taskType === 'report_generation' && event.taskId) {
-        // Task-driven report: attach a document ONLY on the turn that DELIVERS the report — the turn
-        // that STARTED in 'generating' (the model produces the report) or 'revising' (a user-requested
-        // rework). Use the turn's START state (activeTaskInfo.status, captured before the tool loop),
-        // because the loop may have already advanced the task to 'completed' by now. A clarifying turn
-        // (collecting_requirements) or an outline turn (drafting_outline) is short conversational text
-        // and must NEVER be turned into an attachment. Do NOT use isDocumentRequest here: the user's
-        // original "write a report" matches it on EVERY turn, which is exactly what attached the
-        // clarifying questions as a file (the reported bug).
+      // Document-producing tasks and the machine states on which they DELIVER a file. Keyed on
+      // taskType so report_generation and data_extraction both hand back a real downloadable
+      // document; guided_troubleshooting / work-item tasks are interactive and never attach.
+      const DOC_DELIVERY_STATES: Record<string, string[]> = {
+        report_generation: ['generating', 'revising'],
+        data_extraction: ['extracting', 'validating', 'formatting'],
+      };
+      if (event.taskType && event.taskId && DOC_DELIVERY_STATES[event.taskType]) {
+        // Deliver the document (a finished report, or a formatted data extraction) as a downloadable
+        // file on the turn the model actually PRODUCES it, detected DETERMINISTICALLY from the OUTPUT
+        // (isDeliverableDocument: substantial + structured) — NOT from the task's machine state. The
+        // model reliably writes the deliverable but does NOT reliably advance the state machine to its
+        // delivery state on that turn (reports often emit while still in 'drafting_outline'), so a
+        // state-based gate silently dropped the file. A short clarifying/outline turn fails
+        // isDeliverableDocument, so a few-line follow-up is never turned into a file (the original
+        // "clarifying-text-as-attachment" bug stays fixed). Belt-and-suspenders fallback: the task
+        // clearly entered a delivery state this turn (or started there) and produced non-trivial
+        // content. Do NOT use isDocumentRequest here: it matches the user's original ask on EVERY turn.
         const startState = activeTaskInfo?.status;
-        generate = startState === 'generating' || startState === 'revising';
+        const deliveryStates = DOC_DELIVERY_STATES[event.taskType];
+        const inDeliveryState =
+          (startState !== undefined && deliveryStates.includes(startState)) ||
+          (taskContext?.transitions ?? []).some((t) => deliveryStates.includes(t.to));
+        generate = isDeliverableDocument(response) || (inDeliveryState && response.trim().length >= 400);
       } else {
         // Ad-hoc (no report task): the user explicitly asked to save THIS response as a document.
         generate = isDocumentRequest(event.userMessage || '');

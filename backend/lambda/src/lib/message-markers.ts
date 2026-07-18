@@ -39,3 +39,27 @@ export function stripMessageMarkers(content: string | null | undefined): string 
   // Collapse whitespace the stripping left behind (trailing spaces, blank runs).
   return s.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
 }
+
+/**
+ * Reasoning-tag scaffolding a model sometimes leaks into its FINAL answer — a
+ * `<thinking>…</thinking>` block, or a `<result>…</result>` wrapper around the
+ * real answer. These are internal scaffolding, never intended for the human, but
+ * they are NOT control markers (no UI semantics), so stripMessageMarkers leaves
+ * them. Seen live: a report task's stored result carried a `<thinking>` block, and
+ * a drift reply surfaced a bare `<result>` fragment. Strip the whole thinking
+ * block (content included — it's private reasoning) and unwrap `<result>` tags
+ * (keep the inner answer). Tolerant of an unclosed `<thinking>` (strip to end) and
+ * stray closing tags. Idempotent; safe on null/undefined.
+ */
+export function stripReasoningTags(content: string | null | undefined): string {
+  let s = content || '';
+  // Whole <thinking>…</thinking> blocks (private reasoning) — drop content too.
+  s = s.replace(/<thinking>[\s\S]*?<\/thinking>/gi, '');
+  // Unclosed <thinking> with no matching close: strip from the tag to end.
+  s = s.replace(/<thinking>[\s\S]*$/i, '');
+  // <result> wrappers: keep the inner answer, drop the tags (either or both).
+  s = s.replace(/<\/?result>/gi, '');
+  // Any orphaned </thinking> left behind.
+  s = s.replace(/<\/thinking>/gi, '');
+  return s.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
+}
