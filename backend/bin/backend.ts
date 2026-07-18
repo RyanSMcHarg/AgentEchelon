@@ -4,6 +4,7 @@ import { ChimeMessagingStack } from '../lib/stacks/chime-messaging-stack';
 import { FoundationsStack } from '../lib/stacks/foundations-stack';
 import { S3StorageStack } from '../lib/stacks/s3-storage-stack';
 import { CognitoAuthStack } from '../lib/stacks/cognito-auth-stack';
+import { AdminNotificationStack } from '../lib/stacks/admin-notification-stack';
 import { AnalyticsStack } from '../lib/stacks/analytics-stack';
 import { AnalyticsStackAurora } from '../lib/stacks/analytics-stack-aurora';
 import { IAnalyticsStackOutputs } from '../lib/interfaces/analytics-stack-interface';
@@ -202,6 +203,32 @@ const cognitoStack = new CognitoAuthStack(app, `${STACK_PREFIX}CognitoAuth`, {
   description: 'Cognito authentication with SAML/OIDC support',
 });
 
+// Admin notification channel (A6): auto-provision a dedicated admin channel that the membership-audit
+// (Layer 6) and admin-error alert paths post to (in-app message + email fan-out). OPT-IN; when off,
+// those alerts stay log-only unless an operator hand-passes `-c membershipAuditAlertChannelArn`. When
+// on, a custom resource creates the channel as the app-instance-admin, adds the `admins` group as
+// members, and stamps them into the participant roster (the email fan-out reads the roster).
+const enableAdminNotificationChannel: boolean =
+  app.node.tryGetContext('enableAdminNotificationChannel') === true ||
+  app.node.tryGetContext('enableAdminNotificationChannel') === 'true';
+let adminNotificationChannelArn: string | undefined;
+if (enableAdminNotificationChannel) {
+  const adminNotificationStack = new AdminNotificationStack(app, `${STACK_PREFIX}AdminNotification`, {
+    env,
+    appInstanceArn: chimeStack.appInstanceArn,
+    appInstanceAdminArn: chimeStack.appInstanceAdminArn,
+    userPoolId: cognitoStack.userPool.userPoolId,
+    userPoolArn: cognitoStack.userPool.userPoolArn,
+    // Honor a host-owned admin group name (ADMIN-INTEGRATION-GUIDE `adminGroupNames`); default 'admins'.
+    adminGroupName:
+      ((app.node.tryGetContext('adminGroupNames') as string | undefined) || '').split(',')[0].trim() || undefined,
+    description: 'AgentEchelon admin notification channel (membership-audit + admin-error alerts)',
+  });
+  adminNotificationStack.addDependency(chimeStack);
+  adminNotificationStack.addDependency(cognitoStack);
+  adminNotificationChannelArn = adminNotificationStack.channelArn;
+}
+
 // Cost sleep mode (docs/SPEC-COST-SLEEP-MODE.md): auto-pause Aurora Serverless
 // v2 after configurable inactivity, with an admin wake + app maintenance flag.
 // Opt-in and Aurora-mode only (that is where the idle cost lives). Warns + is
@@ -236,9 +263,12 @@ const enableMembershipAudit: boolean =
 const membershipAuditEnforce: boolean =
   app.node.tryGetContext('membershipAuditEnforce') === true ||
   app.node.tryGetContext('membershipAuditEnforce') === 'true';
-const membershipAuditAlertChannelArn = app.node.tryGetContext('membershipAuditAlertChannelArn') as
-  | string
-  | undefined;
+// Prefer an explicitly-passed channel ARN; otherwise use the auto-provisioned admin notification
+// channel (A6, above). Both alert paths (membership-audit + admin-error) share this one ARN, so this
+// single value flows to the analytics stack (membership-audit) and the tier stacks (adminErrorAlertWiring).
+const membershipAuditAlertChannelArn =
+  (app.node.tryGetContext('membershipAuditAlertChannelArn') as string | undefined)
+  || adminNotificationChannelArn;
 
 // 3. Analytics Stack - conditionally Athena or Aurora mode
 let analyticsStack: IAnalyticsStackOutputs & cdk.Stack;
