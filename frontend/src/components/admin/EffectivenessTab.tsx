@@ -170,11 +170,12 @@ const L0Dashboard: React.FC<{ rows: Row[]; onPick: (intent: string) => void }> =
 
 // ---- L1 tool lens: per-tool usage folded in (the Steps aggregate, intent-scoped) ------------------
 type ToolAgg = { name: string; calls: number; errors: number; errorRate: number };
-/** Aggregate per-tool usage for one intent from execution_steps rows (steps[].tools[]), client-side. */
-function aggregateTools(stepRows: Row[], intent: string): ToolAgg[] {
+/** Aggregate per-tool usage from execution_steps rows (steps[].tools[]), client-side. Pass an intent to
+ *  scope to that intent (the L1 lens), or null to span every intent (the L0 system-wide view). */
+function aggregateTools(stepRows: Row[], intent: string | null): ToolAgg[] {
   const map = new Map<string, { calls: number; errors: number }>();
   for (const r of stepRows) {
-    if (String(r.intent) !== intent) continue;
+    if (intent !== null && String(r.intent) !== intent) continue;
     const steps = Array.isArray(r.steps) ? (r.steps as Array<Record<string, unknown>>) : [];
     for (const s of steps) {
       const tools = Array.isArray(s.tools) ? (s.tools as Array<{ name?: string; ok?: boolean }>) : [];
@@ -192,22 +193,21 @@ function aggregateTools(stepRows: Row[], intent: string): ToolAgg[] {
     .sort((a, b) => b.calls - a.calls);
 }
 
-const ToolLensPanel: React.FC<{ tools: ToolAgg[] | null }> = ({ tools }) => (
+const ToolLensPanel: React.FC<{ tools: ToolAgg[] | null; title?: string; tip?: string; emptyText?: string }> = ({
+  tools,
+  title = 'Tool lens',
+  tip = "Which tools this intent's assistant actually invoked in the window, how often, and each tool's error rate (from the per-step tool outcomes). Tool use is the mechanism that produces the outcome, so a high per-tool error rate is a distinct, actionable failure mode. Aggregated across this intent's multi-step turns.",
+  emptyText = 'No tool calls recorded for this intent in the window (the assistant answered without tools, or these turns predate per-tool telemetry).',
+}) => (
   <div style={{ marginTop: 16 }}>
     <h4 style={{ margin: '0 0 6px' }}>
-      Tool lens{' '}
-      <InfoTooltip
-        content="Which tools this intent's assistant actually invoked in the window, how often, and each tool's error rate (from the per-step tool outcomes). Tool use is the mechanism that produces the outcome, so a high per-tool error rate is a distinct, actionable failure mode. Aggregated across this intent's multi-step turns."
-        label="About Tool lens"
-      />
+      {title}{' '}
+      <InfoTooltip content={tip} label={`About ${title}`} />
     </h4>
     {tools === null ? (
       <p className="admin-tab-description">Loading tool usage…</p>
     ) : tools.length === 0 ? (
-      <p className="admin-tab-description" style={{ fontStyle: 'italic', opacity: 0.8 }}>
-        No tool calls recorded for this intent in the window (the assistant answered without tools, or these
-        turns predate per-tool telemetry).
-      </p>
+      <p className="admin-tab-description" style={{ fontStyle: 'italic', opacity: 0.8 }}>{emptyText}</p>
     ) : (
       <DataTable
         data={tools as unknown as Row[]}
@@ -359,6 +359,8 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
   const [flowSummary, setFlowSummary] = useState<Row | null>(null);
   // L1 only: per-tool usage aggregated from execution_steps for the intent (the tool lens). null = loading.
   const [toolLens, setToolLens] = useState<ToolAgg[] | null>([]);
+  // L0 only: the same aggregate across ALL intents (the system-wide tool view). null = loading.
+  const [l0Tools, setL0Tools] = useState<ToolAgg[] | null>([]);
   const [drillLoading, setDrillLoading] = useState(false);
 
   const intentRow = useCallback(
@@ -373,6 +375,18 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
   useEffect(() => {
     let cancelled = false;
     async function run() {
+      // L0: the intent table comes from the `data` prop; asynchronously load the system-wide tool
+      // view (aggregate execution_steps across every intent).
+      if (drill.level === 0) {
+        setDrillData(null); setFlowSummary(null); setToolLens([]); setL0Tools(null);
+        try {
+          const steps = await queryAnalytics('execution_steps', dateRange, { limit: '200' });
+          if (!cancelled) setL0Tools(aggregateTools((steps?.data ?? []) as Row[], null));
+        } catch {
+          if (!cancelled) setL0Tools([]);
+        }
+        return;
+      }
       // L1: the metric cards come from the L0 row; asynchronously load the per-intent tool lens
       // (aggregate execution_steps client-side). null = loading.
       if (drill.level === 1) {
@@ -465,6 +479,12 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
             as a relative signal for comparing intents, not an exact charge.
           </p>
           <L0Dashboard rows={l0Rows} onPick={(intent) => setDrill({ level: 1, intent })} />
+          <ToolLensPanel
+            tools={l0Tools}
+            title="Tool usage (all intents)"
+            tip="Every tool the assistants invoked across all intents in the window, with per-tool call counts and error rate — the system-wide view of the same per-step tool outcomes shown per intent in the L1 tool lens. Use it to spot a tool that is failing platform-wide, independent of any one intent."
+            emptyText="No tool calls recorded across any intent in the window (or these turns predate per-tool telemetry)."
+          />
         </>
       )}
 

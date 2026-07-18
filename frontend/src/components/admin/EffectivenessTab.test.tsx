@@ -120,6 +120,21 @@ describe('EffectivenessTab', () => {
     expect(screen.queryByText('search')).toBeNull();
   });
 
+  it('L0 shows a system-wide tool view aggregated across every intent', async () => {
+    // Queued before render so the L0 mount fetch (execution_steps) consumes it.
+    mockQuery.mockResolvedValueOnce(result([
+      { intent: 'report_generation', steps: [{ tools: [{ name: 'load_company_context', ok: true }] }] },
+      { intent: 'general_query', steps: [{ tools: [{ name: 'load_company_context', ok: false }, { name: 'web_search', ok: true }] }] },
+    ]));
+    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} />);
+
+    await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('execution_steps', range, { limit: '200' }));
+    // Spans both intents: load_company_context (2 calls) + web_search (1 call, from a different intent).
+    expect(await screen.findByText('Tool usage (all intents)')).toBeTruthy();
+    expect(screen.getByText('web_search')).toBeTruthy();
+    expect(screen.getByText('load_company_context')).toBeTruthy();
+  });
+
   it('shows a loading state', () => {
     render(<EffectivenessTab data={null} dateRange={range} isLoading={true} />);
     expect(screen.getByText(/Loading effectiveness/i)).toBeTruthy();
