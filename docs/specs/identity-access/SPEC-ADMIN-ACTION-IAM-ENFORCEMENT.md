@@ -125,19 +125,31 @@ capabilities (`chime:*`); the rest are new (`execute-api`, section 6).
 
 ## 6. Enforcement mechanism (bringing 3b up to 3a)
 
-1. **IAM-authorize the archive/analytics endpoints, per resource** (the section 3b IAM-action
-   column), generalizing service mode from all-or-nothing to per-resource.
-2. **Vend a scoped, capability-named credential.** The credential exchange checks entitlement, then
-   vends a short-lived credential whose session policy grants `execute-api:Invoke` on exactly the
-   capability's resources, intersected with the plane role ceiling. Same pattern as the `chime:*`
-   vend in 3a.
-3. **Sign the request.** The console SigV4-signs archive/analytics calls with the vended credential
-   (the way it already reaches Chime, `chimeService.ts`); API Gateway allows or denies; the Lambda
-   derives the actor from the principal.
-4. **Scope** (the `Scoped` cells): the session policy carries the caller's tier / ownership /
-   membership as a condition, and the read filters on it, the same way classification caps chat.
-5. **Result.** A role whose policy omits a capability's resource is denied at the gateway, for the
-   archive plane exactly as it already is for the Chime plane.
+Reuse the sign-on role mapping AE already has. The Identity Pool maps each Cognito group to an IAM
+role at sign-on (`IdentityPoolRoleAttachment` `roleMappings`, so the ID token carries
+`cognito:preferred_role`) and vends signed credentials for it. The `AdminAuthenticatedRole` is
+**empty today** (Chime goes through the exchange; the archive/analytics APIs are JWT-authorized, so
+the role grants nothing). The design gives that structure teeth:
+
+1. **Per-persona group roles.** Give each admin persona (section 2) its own group and IAM role via
+   the existing role mapping. The role's policy carries the `execute-api:Invoke` statements for
+   exactly that persona's capabilities (section 4). **The grant is assigned at sign-on**, so a
+   member's signed Identity-Pool credentials already encode their access.
+2. **IAM-authorize the archive/analytics endpoints, per resource** (the 3b IAM-action column),
+   generalizing service mode from all-or-nothing to per-resource.
+3. **Sign the request.** The console SigV4-signs archive/analytics calls with the sign-on
+   credentials; API Gateway allows or denies per the group role's policy; the Lambda derives the
+   actor from the principal.
+4. **Scope** (the `Scoped` cells): the role uses IAM conditions on the caller's claims passed as
+   session/principal tags (tier, ownership), the same per-classification structure the tier roles
+   already use; the read also filters on the verified identity.
+5. **Keep the most sensitive surfaces on-demand.** Message content (A2) and moderation (C5-C8) stay
+   on the credential exchange's short-lived, per-use, **audited** vend (Chime already does), so a
+   standing sign-on role never carries them and every use leaves an `admin_scoped_credential_vend`
+   record. Lower-sensitivity reads ride the sign-on role directly. Which surfaces sit on which path
+   is a decision (section 12).
+6. **Result.** A group whose role omits a capability's resource is denied at the gateway, decided by
+   IAM at sign-on, with no per-read exchange round-trip.
 
 ## 7. Example roles map straight to the personas
 
@@ -192,3 +204,8 @@ short-lived, attributable record (`SPEC-ACCESS-AND-CONTROLS-AUDITING.md`).
 4. Whether the moderation-audit write is its own capability or rides on `moderate`.
 5. Interaction with plan item D (a separate admin app), whose distribution is a natural place to
    require these capabilities per persona.
+6. **Which surfaces ride the sign-on group role vs the on-demand exchange vend** (section 6.5). The
+   sign-on role is simpler and needs no per-read round-trip, but the credentials are standing (until
+   token refresh) and per-use auditing is coarser. The exchange vend is short-lived and audited per
+   use. Proposed default: lower-sensitivity reads on the sign-on role; message content (A2) and
+   moderation (C5-C8) on the exchange. Confirm the cut line.
