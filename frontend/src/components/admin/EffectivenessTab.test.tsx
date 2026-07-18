@@ -56,21 +56,47 @@ describe('EffectivenessTab', () => {
     await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('task_details', range, { intent: 'report_generation' }));
     const taskLink = await screen.findByRole('button', { name: /task-abc/ });
 
-    // L3: the task timeline is fetched by taskId; a transition row + its steps render.
-    mockQuery.mockResolvedValueOnce(result([
-      {
-        exchange_id: 'ex-1', task_transition: { from: 'drafting_outline', to: 'generating' }, task_state: 'generating',
-        relevance_score: 88, total_ms: 1500, input_tokens: 800, output_tokens: 400,
-        steps: [{ stepLabel: 'tool:advance_task_state', modelId: 'm', tokensIn: 10, tokensOut: 5, estCostUsd: 0.0001, tools: [{ name: 'advance_task_state', ok: true }] }],
-      },
-    ]));
+    // L3: timeline (by taskId) + the flow's 5-dimension score (evaluation_flows), folded in.
+    mockQuery
+      .mockResolvedValueOnce(result([
+        {
+          exchange_id: 'ex-1', task_transition: { from: 'drafting_outline', to: 'generating' }, task_state: 'generating',
+          relevance_score: 88, total_ms: 1500, input_tokens: 800, output_tokens: 400,
+          steps: [{ stepLabel: 'tool:advance_task_state', modelId: 'm', tokensIn: 10, tokensOut: 5, estCostUsd: 0.0001, tools: [{ name: 'advance_task_state', ok: true }] }],
+        },
+      ]))
+      .mockResolvedValueOnce(result([
+        { task_id: 'task-abc12345', status: 'completed', outcome: 'report delivered', outcome_score: 90, information_score: 80, efficiency_score: 70, context_retention_score: 85, ux_score: 75 },
+      ]));
     fireEvent.click(taskLink);
     await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('task_timeline', range, { taskId: 'task-abc12345' }));
     expect(await screen.findByText('drafting_outline → generating')).toBeTruthy();
 
+    // The Flows detail (5-dimension flow score) is folded into L3.
+    expect(await screen.findByText('Flow score')).toBeTruthy();
+    expect(screen.getByText('Outcome')).toBeTruthy();
+
     // L4 inline: expand the turn to reveal its step + tool outcome.
     fireEvent.click(screen.getByRole('button', { name: /1 step/ }));
     expect(screen.getByText('tool:advance_task_state')).toBeTruthy();
+  });
+
+  it('L2 (DIRECT intent) folds the per-exchange judge verdict into the exchange list', async () => {
+    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} />);
+    // general_query is a DIRECT intent (task_count 0) → an Exchanges drill.
+    fireEvent.click(screen.getByRole('button', { name: 'general_query' }));
+    const exBtn = screen.getByRole('button', { name: /Exchanges \(500\)/ });
+
+    // L2-direct fetches intent_exchanges + evaluation_exchanges, merged by exchange id.
+    mockQuery
+      .mockResolvedValueOnce(result([{ exchange_id: 'ex-9', relevance_score: 88, total_ms: 500, input_tokens: 100, output_tokens: 50, bedrock_model: 'm', created_at: '2026-05-20T00:00:00Z' }]))
+      .mockResolvedValueOnce(result([{ id: 'ex-9', intent: 'general_query', classification: 'excellent', is_compliant: true, reasoning: 'Directly answered the question.' }]));
+    fireEvent.click(exBtn);
+    await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('intent_exchanges', range, { intent: 'general_query' }));
+
+    // The judge verdict (classification + reasoning) renders inline on the exchange row.
+    expect(await screen.findByText('excellent')).toBeTruthy();
+    expect(screen.getByText(/Directly answered the question/)).toBeTruthy();
   });
 
   it('shows a loading state', () => {

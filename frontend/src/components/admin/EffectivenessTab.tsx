@@ -252,11 +252,55 @@ const L3Timeline: React.FC<{ rows: Row[] }> = ({ rows }) => {
   );
 };
 
+// ---- L3 flow score (the Flows detail, folded into the drill) ---------------------------------------
+const FLOW_DIMS: Array<{ key: string; label: string; weight: number }> = [
+  { key: 'outcome_score', label: 'Outcome', weight: 0.30 },
+  { key: 'information_score', label: 'Information', weight: 0.25 },
+  { key: 'efficiency_score', label: 'Efficiency', weight: 0.15 },
+  { key: 'context_retention_score', label: 'Context', weight: 0.15 },
+  { key: 'ux_score', label: 'UX', weight: 0.15 },
+];
+/** 0-100 quality bands shared across the console (good >= 75, warn >= 50). */
+function scoreColor(n: number): string {
+  if (!Number.isFinite(n)) return 'var(--status-neutral)';
+  return n >= 75 ? 'var(--status-good)' : n >= 50 ? 'var(--status-warn)' : 'var(--status-bad)';
+}
+const FlowScorePanel: React.FC<{ flow: Row }> = ({ flow }) => {
+  const composite = FLOW_DIMS.reduce((s, d) => s + (num(flow[d.key]) || 0) * d.weight, 0);
+  return (
+    <div className="admin-metrics-row" style={{ marginBottom: 12 }}>
+      <div className="metric-card">
+        <div className="metric-card-title">
+          Flow score
+          <InfoTooltip
+            content="The holistic multi-turn quality of this task from the flow evaluator - five weighted dimensions (Outcome 30%, Information 25%, Efficiency 15%, Context 15%, UX 15%). This is the Flows detail, folded into the drill. Good >= 75, acceptable >= 50."
+            label="About Flow score"
+          />
+        </div>
+        <div className="metric-card-value" style={{ color: scoreColor(composite) }}>{Number.isFinite(composite) ? composite.toFixed(0) : '—'}</div>
+        {Boolean(flow.outcome || flow.status) && <div className="metric-card-subtitle">{String(flow.outcome || flow.status)}</div>}
+      </div>
+      {FLOW_DIMS.map((d) => {
+        const n = num(flow[d.key]);
+        return (
+          <div className="metric-card" key={d.key}>
+            <div className="metric-card-title">{d.label} <span style={{ color: 'var(--status-neutral)', fontSize: 11 }}>{Math.round(d.weight * 100)}%</span></div>
+            <div className="metric-card-value" style={{ color: scoreColor(n) }}>{Number.isFinite(n) ? n.toFixed(0) : '—'}</div>
+          </div>
+        );
+      })}
+    </div>
+  );
+};
+
 // ---- the tab: L0 dashboard + drill state -----------------------------------------------------------
 const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, isLoading }) => {
   const l0Rows = useMemo(() => (data?.data ?? []) as Row[], [data]);
   const [drill, setDrill] = useState<Drill>({ level: 0 });
   const [drillData, setDrillData] = useState<AnalyticsResult | null>(null);
+  // L3 only: the task's holistic flow score (evaluation_flows) — the 5 weighted dimensions folded into
+  // the drill so the Flows detail lives here instead of a separate tab.
+  const [flowSummary, setFlowSummary] = useState<Row | null>(null);
   const [drillLoading, setDrillLoading] = useState(false);
 
   const intentRow = useCallback(
@@ -265,23 +309,37 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
   );
 
   // Fetch the drill's data when it needs a query (L2/L3). L0/L1 are served from the loaded L0 rows.
+  // L2/L3 also pull the existing evaluation queries so the per-exchange judge verdict (reasoning,
+  // classification, compliance) and the per-flow 5-dimension score fold INTO the drill (frontend-only,
+  // no new backend queries): the Evaluations and Flows detail lives here rather than in separate tabs.
   useEffect(() => {
     let cancelled = false;
     async function run() {
-      if (drill.level !== 2 && drill.level !== 3) { setDrillData(null); return; }
+      if (drill.level !== 2 && drill.level !== 3) { setDrillData(null); setFlowSummary(null); return; }
       setDrillLoading(true);
+      setFlowSummary(null);
       try {
-        let res: AnalyticsResult;
         if (drill.level === 2 && drill.delivery === 'direct') {
-          res = await queryAnalytics('intent_exchanges', dateRange, { intent: drill.intent });
+          const [ex, ev] = await Promise.all([
+            queryAnalytics('intent_exchanges', dateRange, { intent: drill.intent }),
+            queryAnalytics('evaluation_exchanges', dateRange, { limit: '200' }),
+          ]);
+          const evalById = new Map(((ev?.data ?? []) as Row[]).map((r) => [String(r.id ?? r.exchange_id), r]));
+          const merged = ((ex?.data ?? []) as Row[]).map((r) => ({ ...r, _eval: evalById.get(String(r.exchange_id)) ?? null }));
+          if (!cancelled) setDrillData({ data: merged as unknown as AnalyticsResult['data'], columns: [] });
         } else if (drill.level === 2) {
-          res = await queryAnalytics('task_details', dateRange, { intent: drill.intent });
-        } else {
-          res = await queryAnalytics('task_timeline', dateRange, { taskId: drill.taskId });
+          const res = await queryAnalytics('task_details', dateRange, { intent: drill.intent });
+          if (!cancelled) setDrillData(res ?? null);
+        } else if (drill.level === 3) {
+          const [tl, flows] = await Promise.all([
+            queryAnalytics('task_timeline', dateRange, { taskId: drill.taskId }),
+            queryAnalytics('evaluation_flows', dateRange, { limit: '200' }),
+          ]);
+          const flow = ((flows?.data ?? []) as Row[]).find((f) => String(f.task_id) === drill.taskId) ?? null;
+          if (!cancelled) { setDrillData(tl ?? null); setFlowSummary(flow); }
         }
-        if (!cancelled) setDrillData(res);
       } catch {
-        if (!cancelled) setDrillData(null);
+        if (!cancelled) { setDrillData(null); setFlowSummary(null); }
       } finally {
         if (!cancelled) setDrillLoading(false);
       }
@@ -367,11 +425,14 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
             columns={[
               { key: 'created_at', label: 'When', render: (v) => (v ? new Date(String(v)).toLocaleString() : '—') },
               { key: 'relevance_score', label: 'Relevance', sortable: true, render: (v) => <StatusValue value={v} targetKey="relevance_score" /> },
+              // Per-exchange judge verdict (the Evaluations detail), folded in from evaluation_exchanges.
+              { key: 'classification', label: 'Class', render: (_v, row) => { const ev = (row as { _eval?: Row })._eval; return ev?.classification ? String(ev.classification) : '—'; } },
+              { key: 'is_compliant', label: 'OK', render: (_v, row) => { const ev = (row as { _eval?: Row })._eval; if (!ev || ev.is_compliant == null) return '—'; return <span style={{ color: ev.is_compliant ? 'var(--status-good)' : 'var(--status-bad)' }}>{ev.is_compliant ? '✓' : '✗'}</span>; } },
+              { key: 'reasoning', label: 'Why (judge)', render: (_v, row) => { const ev = (row as { _eval?: Row })._eval; const t = ev?.reasoning ? String(ev.reasoning) : ''; return t ? <span title={t}>{t.length > 90 ? t.slice(0, 90) + '…' : t}</span> : '—'; } },
               { key: 'total_ms', label: 'Latency', sortable: true, render: (v) => fmtMs(v) },
               { key: 'input_tokens', label: 'In', sortable: true },
               { key: 'output_tokens', label: 'Out', sortable: true },
               { key: 'bedrock_model', label: 'Model', render: (v) => (v ? String(v) : '—') },
-              { key: 'was_rerouted', label: 'Rerouted', render: (v) => (v ? 'yes' : '') },
             ]}
           />
         )
@@ -379,7 +440,12 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
 
       {drill.level === 3 && (
         drillLoading ? <div className="admin-tab-loading">Loading…</div> :
-        <L3Timeline rows={(drillData?.data ?? []) as Row[]} />
+        <>
+          {flowSummary
+            ? <FlowScorePanel flow={flowSummary} />
+            : <p className="admin-tab-description" style={{ fontStyle: 'italic', opacity: 0.8 }}>No holistic flow score for this task yet (the flow evaluator scores a multi-turn task once it has accumulated turns).</p>}
+          <L3Timeline rows={(drillData?.data ?? []) as Row[]} />
+        </>
       )}
     </div>
   );
