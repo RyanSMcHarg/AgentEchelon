@@ -64,6 +64,51 @@ describe('admin-conversations-aurora', () => {
     expect(out[0].raw?.MessageId).toBe('m1');
   });
 
+  it('derives redaction from the -RED sibling row: flag set, content + raw blanked', async () => {
+    mockedQuery.mockResolvedValueOnce({
+      rows: [{
+        message_id: 'm1',
+        content: 'my SSN is 123-45-6789',
+        sender_name: 'Ada', sender_arn: 'a/user/1', created_at: '2026-07-15T00:01:00Z',
+        is_bot: false, bedrock_model: null, input_tokens: null, output_tokens: null,
+        total_ms: null, metadata: {}, redacted: true,
+      }],
+      rowCount: 1,
+    } as any);
+    const out = await adminListMessages('c1');
+    const [sql] = mockedQuery.mock.calls[0] as [string];
+    // Redaction is derived by joining the sibling REDACT event, not a column.
+    expect(sql).toMatch(/event_type = 'REDACT_CHANNEL_MESSAGE'/);
+    expect(sql).toMatch(/\|\| '-RED'/);
+    expect(out[0].redacted).toBe(true);
+    expect(out[0].content).toBe(''); // original content must not leak
+    expect(out[0].raw?.Content).toBe('');
+    expect(out[0].raw?.Redacted).toBe(true);
+  });
+
+  it('derives deletion from the -DEL sibling row: content + raw blanked, deleted flag set', async () => {
+    mockedQuery.mockResolvedValueOnce({
+      rows: [{
+        message_id: 'm2',
+        content: 'sensitive text the moderator removed',
+        sender_name: 'Ada', sender_arn: 'a/user/1', created_at: '2026-07-15T00:02:00Z',
+        is_bot: false, bedrock_model: null, input_tokens: null, output_tokens: null,
+        total_ms: null, metadata: {}, redacted: false, deleted: true,
+      }],
+      rowCount: 1,
+    } as any);
+    const out = await adminListMessages('c1');
+    const [sql] = mockedQuery.mock.calls[0] as [string];
+    // Deletion is derived by joining the sibling DELETE event, not a column.
+    expect(sql).toMatch(/event_type = 'DELETE_CHANNEL_MESSAGE'/);
+    expect(sql).toMatch(/\|\| '-DEL'/);
+    expect(out[0].deleted).toBe(true);
+    expect(out[0].redacted).toBe(false);
+    expect(out[0].content).toBe(''); // deleted content must not leak
+    expect(out[0].raw?.Content).toBe('');
+    expect(out[0].raw?.Deleted).toBe(true);
+  });
+
   it('maps membership events to actions with member/inviter names', async () => {
     mockedQuery.mockResolvedValueOnce({
       rows: [

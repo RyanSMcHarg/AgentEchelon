@@ -35,6 +35,9 @@ export interface AdminConvMessage {
   timestamp: string;
   isBot: boolean;
   redacted: boolean;
+  /** True when a DELETE_CHANNEL_MESSAGE sibling exists — content is blanked like a
+   *  redaction. Optional: the Athena path does not derive it (undefined → falsy). */
+  deleted?: boolean;
   modelId?: string;
   intent?: string;
   metadata: Record<string, unknown>;
@@ -126,35 +129,65 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
     message_id: string; content: string | null; sender_name: string | null;
     sender_arn: string | null; created_at: string; is_bot: boolean | null;
     bedrock_model: string | null; input_tokens: number | null; output_tokens: number | null;
-    total_ms: number | null; redacted: boolean | null; metadata: Record<string, unknown> | null;
+    total_ms: number | null; redacted: boolean | null; deleted: boolean | null;
+    metadata: Record<string, unknown> | null;
   }>(
-    `SELECT message_id,
-            COALESCE(updated_content, content) AS content,
-            sender_name, sender_arn, created_at, is_bot, bedrock_model,
-            input_tokens, output_tokens, total_ms, metadata
-       FROM messages
-      WHERE channel_arn = $1 AND event_type = 'CREATE_CHANNEL_MESSAGE'
-      ORDER BY created_at ASC`,
+    // Moderation (redact + delete) is archived as a sibling row, NOT a column on
+    // the CREATE row: kinesis-archival suffixes the event's MessageId (`-RED` for
+    // REDACT_CHANNEL_MESSAGE, `-DEL` for DELETE_CHANNEL_MESSAGE), so the moderated
+    // state lands on a separate row the plain CREATE read never sees. Both are
+    // derived here by LEFT JOIN. This mirrors the Athena path, where the REDACT /
+    // DELETE event (same MessageId, blanked Content) supersedes the CREATE via
+    // latest-per-id, yielding an empty message. Deriving at read time (rather than
+    // a `messages.redacted` column) needs no migration, so it takes effect on the
+    // already-bootstrapped live DB — schema-init is create-only (no-op on Update).
+    `SELECT m.message_id,
+            COALESCE(m.updated_content, m.content) AS content,
+            m.sender_name, m.sender_arn, m.created_at, m.is_bot, m.bedrock_model,
+            m.input_tokens, m.output_tokens, m.total_ms, m.metadata,
+            (red.message_id IS NOT NULL) AS redacted,
+            (del.message_id IS NOT NULL) AS deleted
+       FROM messages m
+       LEFT JOIN messages red
+              ON red.channel_arn = m.channel_arn
+             AND red.event_type = 'REDACT_CHANNEL_MESSAGE'
+             AND red.message_id = m.message_id || '-RED'
+       LEFT JOIN messages del
+              ON del.channel_arn = m.channel_arn
+             AND del.event_type = 'DELETE_CHANNEL_MESSAGE'
+             AND del.message_id = m.message_id || '-DEL'
+      WHERE m.channel_arn = $1 AND m.event_type = 'CREATE_CHANNEL_MESSAGE'
+      ORDER BY m.created_at ASC`,
     [channelArn],
   );
   return res.rows.map((r) => {
     const metadata = (r.metadata as Record<string, unknown>) || {};
     const senderArn = r.sender_arn || '';
+    const redacted = r.redacted === true;
+    const deleted = r.deleted === true;
+    // A redacted OR deleted message must not leak its original content through the
+    // admin read or the raw inspect payload — blank it, matching Athena (whose
+    // superseding REDACT/DELETE row carries empty Content). `redacted` stays the
+    // distinct flag the UI renders; `deleted` blanks content the same way.
+    const content = redacted || deleted ? '' : stripMessageMarkers(r.content);
     return {
       id: r.message_id,
-      content: stripMessageMarkers(r.content),
+      content,
       senderArn,
       senderName: r.sender_name || 'Unknown',
       timestamp: r.created_at,
       isBot: r.is_bot === true || senderArn.includes('/bot/'),
-      redacted: false, // not tracked in the Aurora projection
+      redacted,
+      deleted,
       modelId: r.bedrock_model || undefined,
       intent: typeof metadata.intent === 'string' ? (metadata.intent as string) : undefined,
       metadata,
       // Inspect-drawer payload: the faithful stored projection of this message.
       raw: {
         MessageId: r.message_id,
-        Content: r.content,
+        Content: redacted || deleted ? '' : r.content,
+        Redacted: redacted,
+        Deleted: deleted,
         Sender: { Arn: senderArn, Name: r.sender_name },
         CreatedTimestamp: r.created_at,
         BedrockModel: r.bedrock_model,
