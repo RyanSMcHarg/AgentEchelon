@@ -55,6 +55,25 @@ deploy is not battle-enabled).
 - **Company/context:** replace the JSON under `backend/demo/context/{basic,standard,premium}/` with
   your own tiered data. Files in a tier's folder plus every lower tier are readable by that tier
   (enforced by per-tier S3-prefix IAM); put all-tier content in `basic/`.
+- **Welcome orientation (what a first-time user sees):** the assistant opens each new conversation
+  with a config-driven orientation - the company, the signed-in user's access level, a few grounded
+  example prompts, and a pointer to learn about the platform. It is not hardcoded: `seed-demo.ts`
+  (`writeWelcomeOrientation`) writes a per-tier JSON to the SSM param
+  `${SSM_ROOT}/assistant/{tier}/welcome-orientation`, and the router reads it on the WelcomeIntent path
+  (`backend/lambda/src/lib/welcome-orientation.ts`). Edit the `WELCOME_ORIENTATION` map in
+  `seed-demo.ts` (or write the param directly) to change it. The schema is
+  `{ companyName, companyBlurb, accessBlurb, examples[], platformNote }`; absent the param, the
+  assistant falls back to a generic welcome. This is the smallest end-to-end customization example -
+  one config value, no code change.
+- **Task examples and deliverables:** the demo showcases the platform task types. `report_generation`
+  and `data_extraction` hand back a real downloadable document (a Markdown report or a data table);
+  delivery is gated on the model actually producing a substantial, structured document
+  (`isDeliverableDocument` in `backend/lambda/src/lib/async-processor-core.ts`), not a brittle
+  state-machine step, so it is reliable. Ground the examples in your own data by editing the seeded
+  `context/` files and the `examples` in the welcome orientation. To add a task type, add an intent to
+  the pack (`backend/lambda/src/lib/intent-pack.ts`, or per-deployment via `ASSISTANT_INTENT_PACK`)
+  and its state machine (`backend/lambda/src/lib/task-state-machines.ts`). To add or reorder tiers,
+  see [`HOW-TO-ADD-OR-MANAGE-A-TIER.md`](../developer/HOW-TO-ADD-OR-MANAGE-A-TIER.md).
 - **Assistant knowledge of the platform:** `npm run sync-knowledge` indexes `README.md` + `docs/*.md`
   (and public blog posts if `AE_BLOG_VAULT_PATH` is set) into `backend/demo/platform-knowledge/agentechelon-about.json`.
   This is **platform self-knowledge**, kept OUTSIDE the company `context/` tree and uploaded to the
@@ -69,9 +88,11 @@ deploy is not battle-enabled).
   This uploads the full docs + public blog to `rag/agentechelon/basic/` (tier=basic = all tiers); the
   DocumentIngestion Lambda chunks + embeds + stores them (see [`RAG.md`](../developer/RAG.md)). Idempotent - safe
   to re-run after editing docs.
-- **Tests:** the per-tier conversations live in `tests/e2e/agent-intents.spec.ts`; the dashboard
-  checks in `tests/e2e/admin-dashboard.spec.ts`; the duel in `tests/e2e/battle.spec.ts`. Edit the
-  questions/assertions to match your context.
+- **Tests:** the per-tier conversations live in `tests/e2e/agent-intents.spec.ts`; the task
+  deliverables (a report and a data extraction are driven to a downloaded file and their CONTENT is
+  validated) in `tests/e2e/tasks.spec.ts`; the welcome orientation in `tests/e2e/welcome.spec.ts`; the
+  dashboard checks in `tests/e2e/admin-dashboard.spec.ts`; the duel in `tests/e2e/battle.spec.ts`. Edit
+  the questions/assertions to match your context. `npm run validate` runs them as gated phases.
 
 ## Related
 
