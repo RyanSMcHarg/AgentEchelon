@@ -4,9 +4,7 @@ const {
   CreateChannelMembershipCommand,
   CreateChannelModeratorCommand,
   AssociateChannelFlowCommand,
-  SendChannelMessageCommand,
 } = require('@aws-sdk/client-chime-sdk-messaging');
-const { BedrockRuntimeClient, InvokeModelCommand } = require('@aws-sdk/client-bedrock-runtime');
 const crypto = require('crypto');
 const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
 // Tier comes from the JWT `cognito:groups` claim, so no Cognito Identity Provider
@@ -14,59 +12,12 @@ const { SSMClient, GetParameterCommand } = require('@aws-sdk/client-ssm');
 
 const messagingClient = new ChimeSDKMessagingClient({});
 const ssmClient = new SSMClient({});
-const bedrockClient = new BedrockRuntimeClient({});
 
-const WELCOME_PROMPT_TOPICAL = `You are the assistant in a new conversation. The
-user just created this chat with the topic provided below. Write a
-SHORT welcome (2-3 sentences, no emoji) that:
-- briefly introduces yourself by role for this topic (concrete capability
-  framed by the topic, not "Hi, I am an AI"),
-- restates the topic in your own words to confirm understanding, and
-- ends with one concrete first move the user can take.
-
-Topic: {{topic}}
-
-Respond with the welcome message body only. No preamble.`;
-
-/** Fallback when no topic is provided. Static so it lands instantly with
- *  no Bedrock dependency — fast, free, and predictable for tests. The
- *  assistant should always welcome the user; without a topic to ground
- *  the intro, a generic prompt-to-start works better than silence. */
-const WELCOME_GENERIC =
-  "Hi — I'm your assistant for this conversation. " +
-  "I can answer questions, draft documents, analyse data, help with code, or work through a plan with you. " +
-  "What would you like to start with?";
-
-/** Generate the channel's opening message. When a topic was supplied, ask
- *  Haiku 3 to produce a contextual welcome grounded in it; otherwise fall
- *  back to a static generic prompt. Best-effort on the Bedrock path: any
- *  failure logs and falls back to the generic copy so the channel always
- *  greets the user. */
-async function buildWelcome(topic) {
-  if (!topic || typeof topic !== 'string') return WELCOME_GENERIC;
-  try {
-    const resp = await bedrockClient.send(new InvokeModelCommand({
-      modelId: 'anthropic.claude-3-haiku-20240307-v1:0',
-      contentType: 'application/json',
-      accept: 'application/json',
-      body: JSON.stringify({
-        anthropic_version: 'bedrock-2023-05-31',
-        max_tokens: 200,
-        temperature: 0.3,
-        messages: [{
-          role: 'user',
-          content: WELCOME_PROMPT_TOPICAL.replace('{{topic}}', String(topic).slice(0, 500)),
-        }],
-      }),
-    }));
-    const body = JSON.parse(new TextDecoder().decode(resp.body));
-    const text = (body?.content?.[0]?.text || '').trim();
-    return text || WELCOME_GENERIC;
-  } catch (err) {
-    console.warn('[CreateChannel] Contextual welcome generation failed; using generic:', err);
-    return WELCOME_GENERIC;
-  }
-}
+// NOTE: this handler posts NO synchronous/automated welcome. The assistant greets the user through
+// the bot's WelcomeIntent (Lex → router), which fires when the user JOINS the channel the bot is
+// already a member of — see the membership order below and lib/welcome-orientation.ts. That path is
+// personalized (userName + per-tier orientation); a hardcoded message here would duplicate it and
+// bypass the personalization, so the earlier `buildWelcome` helper was removed.
 
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN;
 const CHANNEL_FLOW_ARN_PARAM = process.env.CHANNEL_FLOW_ARN_PARAM;
@@ -337,8 +288,15 @@ exports.handler = async (event) => {
           modelId,
           modelName,
           modelTier: requestedTier,
-          // No `createdBy`: the owner is derived from Chime membership (the sole human
-          // member of a 1:1), not copied into member-readable metadata (Tenet 6).
+          // welcomeUserSub — the creator's sub, stamped so the WelcomeIntent can personalize the
+          // greeting. This is a DELIBERATE, scoped exception to Tenet 6 (don't copy the owner into
+          // metadata): the Chime WelcomeIntent fires on the bot's CHANNEL_MEMBERSHIP at channel
+          // creation, BEFORE the user's membership is visible to a ListChannelMemberships read — so
+          // membership-derivation races and the router sees humanMembers=0 (verified empirically).
+          // Metadata is set atomically at creation and always readable, so it is the only race-free
+          // way to give the welcome the user's identity. The router resolves the display NAME from
+          // this sub via Cognito (router-agent-handler.resolveUserName), so no name is stored here.
+          welcomeUserSub: sub,
           // topic + triggerContext — read by the router on WelcomeIntent
           // (docs/SPEC-WELCOME-AND-CONTEXT.md). Both bounded to keep
           // Chime's 1KB Metadata cap headroom for everything else.
@@ -357,13 +315,15 @@ exports.handler = async (event) => {
 
     console.log('Conversation created by bot:', conversationArn);
 
-    // Step 1b: Enroll the bot as a DEFAULT channel member BEFORE adding the
-    // user. Chime fires the bot's WelcomeIntent when a user JOINS a channel
-    // that ALREADY has the bot present — so the bot must be a member first, or
-    // the on-join greeting never fires. (CreateChannel with ChimeBearer=botArn
-    // gives the bot creator authority but NOT a membership record, so it must
-    // be enrolled explicitly; this also makes ListChannelMemberships return the
-    // bot, which @mention routing depends on.) Non-fatal on ConflictException.
+    // Step 1b: Explicitly enroll the bot as a DEFAULT channel member. This is what FIRES the bot's
+    // Lex WelcomeIntent: Chime invokes it on the bot's CHANNEL_MEMBERSHIP event (verified against live
+    // Chime + AWS docs — https://docs.aws.amazon.com/chime-sdk/latest/dg/welcome-intent.html). The
+    // creator (ChimeBearer=botArn) is auto-added as a channel member at CreateChannel, but that
+    // auto-membership does NOT fire the welcome — only this explicit CreateChannelMembership does; it
+    // also (idempotently) ensures ListChannelMemberships returns the bot, which @mention routing needs.
+    // NOTE: the welcome fires here, before/independent of the user's membership, which is why the
+    // user's identity for the greeting is carried in channel metadata (welcomeUserSub), not membership.
+    // Non-fatal on ConflictException (the bot is already a member from creation).
     try {
       await messagingClient.send(
         new CreateChannelMembershipCommand({

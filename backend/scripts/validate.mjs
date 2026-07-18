@@ -58,6 +58,8 @@ const PHASES = [
     cmd: PW('e2e/experiments.spec.ts'), env: { EXPERIMENTS_E2E: '1' }, optional: true },
   { id: 'tasks', label: 'Task e2e: a report request opens a tracked task (→ #32/#35 task_id + Flows)', cwd: TESTS,
     cmd: PW('e2e/tasks.spec.ts'), env: { TASKS_E2E: '1' }, optional: true },
+  { id: 'welcome', label: 'Welcome e2e: a new conversation opens with the seeded tier-aware orientation', cwd: TESTS,
+    cmd: PW('e2e/welcome.spec.ts'), env: { WELCOME_E2E: '1' }, optional: true },
   // Score the exchanges/flows the e2e just produced BEFORE the admin phase reads the dashboard, so the
   // Effectiveness views verify against real relevance/completion instead of an unscored backlog.
   { id: 'evaluate', label: 'Evaluate: run the scorer on the e2e-produced exchanges/flows', fn: triggerEvaluation, optional: true },

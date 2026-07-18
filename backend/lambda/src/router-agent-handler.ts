@@ -51,6 +51,7 @@ import { resolveExperimentModel, resolveClassificationExperiment } from './lib/e
 import { getModelCatalog } from '../../lib/config/model-strategy.js';
 import { randomUUID } from 'crypto';
 import { runLiveDriftFlow } from './lib/live-drift-flow.js';
+import { parseWelcomeOrientation, composeWelcomeMessage, type WelcomeOrientation } from './lib/welcome-orientation.js';
 import {
   loadIntakeConfig,
   isOnboardingEnabled,
@@ -284,38 +285,22 @@ async function resolveUserName(userSub: string): Promise<string> {
   }
 }
 
-/** Compose the WelcomeIntent reply with whatever context is available.
- *  Required: userName. Optional: a triggerContext stored on channel
- *  metadata when create-conversation was called from a drift-redirect or
- *  similar flow (the prompt that triggered the new channel). The reply
- *  is intentionally static-shaped — no Bedrock call on the welcome path
- *  keeps it instant and predictable. */
-function composeWelcome(args: {
-  userName: string;
-  triggerContext?: string;
-  topic?: string;
-}): string {
-  const { userName, triggerContext, topic } = args;
-  const greeting = userName && userName !== 'there' ? `Hi ${userName}` : 'Hi';
+// Welcome orientation is CONFIG-DRIVEN (SPEC: config not code). A deployment may point
+// ASSISTANT_WELCOME_PARAM at an SSM param holding per-assistant orientation JSON (company, access
+// blurb, example prompts, platform note) that the demo seeds; absent it, the welcome is the generic
+// platform greeting. Hydrated once per container (the welcome path stays instant) — a fetch failure
+// falls back to generic rather than erroring the greeting.
+const WELCOME_PARAM = process.env.ASSISTANT_WELCOME_PARAM || '';
+// Cache only a SUCCESSFUL load — never pin an absent/null result, so a welcome that fires before the
+// param is written doesn't lock the container into the generic greeting for its whole lifetime.
+let welcomeOrientationCache: WelcomeOrientation | null = null;
 
-  // Drift-redirect / explicit trigger: name what brought us here so the
-  // user doesn't have to retype it; the next turn picks up the thread.
-  if (triggerContext && triggerContext.trim().length > 0) {
-    const cleaned = triggerContext.trim().slice(0, 240);
-    return `${greeting} — continuing from your earlier message: "${cleaned}". I'll pick up the thread; what would you like to dig into first?`;
-  }
-
-  // Caller-provided topic (kept for parity with the optional `topic`
-  // create-conversation path); same idea — ground the welcome in it.
-  if (topic && topic.trim().length > 0) {
-    const cleaned = topic.trim().slice(0, 200);
-    return `${greeting} — I can help with ${cleaned}. Where would you like to start?`;
-  }
-
-  // Generic fallback. Same content as the static create-conversation
-  // welcome so the experience is consistent regardless of which path
-  // produced the greeting; userName makes it personal.
-  return `${greeting} — I'm your assistant for this conversation. I can answer questions, draft documents, analyse data, help with code, or work through a plan with you. What would you like to start with?`;
+async function loadWelcomeOrientation(): Promise<WelcomeOrientation | null> {
+  if (welcomeOrientationCache) return welcomeOrientationCache;
+  if (!WELCOME_PARAM) return null;
+  const parsed = parseWelcomeOrientation(await getSsmParam(WELCOME_PARAM));
+  if (parsed) welcomeOrientationCache = parsed;
+  return parsed;
 }
 
 function envAsyncProcessorArn(tier: string): string {
@@ -441,13 +426,17 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
         ? await resolveChannelMetadata(channelArn, botArn)
         : ({} as Record<string, unknown>);
       const humanMembers = channelArn ? await countHumanMembers(channelArn, botArn) : 1;
-      // Single human → safe to personalise for the owner, derived from Chime membership
-      // (the authoritative source), not a `createdBy` copy in channel metadata. A shared
-      // channel (2+ humans) names no joiner in the system event, so greet generically.
-      const ownerSub = channelArn ? await soleHumanMemberSub(channelArn, botArn) : '';
-      const welcomeSub = humanMembers <= 1 ? (userSub || ownerSub) : userSub;
-      // Prefer the userName the host stamped into channel metadata: a federated (`fed_`) user
-      // isn't in the AE Cognito pool, so resolveUserName would fail and fall back to "there".
+      // The Chime WelcomeIntent fires on the BOT's CHANNEL_MEMBERSHIP at channel creation, BEFORE the
+      // creator's membership is visible to a ListChannelMemberships read — so membership-derivation
+      // races and the router routinely sees humanMembers=0 (verified empirically against live Chime).
+      // create-conversation therefore stamps the creator's sub into channel metadata (welcomeUserSub),
+      // which is written atomically in the CreateChannel call and always readable at welcome time.
+      // Prefer it; fall back to membership for channels created before the stamp existed / shared channels.
+      const stampedSub = typeof channelMeta.welcomeUserSub === 'string' ? channelMeta.welcomeUserSub.trim() : '';
+      const ownerSub = stampedSub || (channelArn ? await soleHumanMemberSub(channelArn, botArn) : '');
+      const welcomeSub = stampedSub || (humanMembers <= 1 ? (userSub || ownerSub) : userSub);
+      // A federated (`fed_`) user isn't in the AE Cognito pool, so a host may also stamp `userName`
+      // directly; prefer that, else resolve the display name from the sub via Cognito (cached).
       const stampedName = typeof channelMeta.userName === 'string' ? channelMeta.userName.trim() : '';
       const userName = stampedName || await resolveUserName(welcomeSub);
       const triggerContext = typeof channelMeta.triggerContext === 'string' ? channelMeta.triggerContext : undefined;
@@ -466,7 +455,8 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
         return formatLexResponse(event, [{ contentType: 'PlainText', content: step.reply }], writeIntakeState(step.state));
       }
 
-      const content = composeWelcome({ userName, triggerContext, topic });
+      const orientation = await loadWelcomeOrientation();
+      const content = composeWelcomeMessage({ userName, triggerContext, topic, orientation });
       console.log('[Router][WelcomeIntent]', {
         userName,
         humanMembers,

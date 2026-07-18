@@ -206,9 +206,10 @@ export async function createConversation(
   // Wait for conversation to load
   await page.waitForSelector('.conversation-header', { timeout: 15000 });
 
-  // Confirm the assistant's welcome before returning. The bot greets when it
-  // is added to the channel (Chime fires the per-tier bot's WelcomeIntent on
-  // the creator's join) — correct product behaviour, but the greeting can land
+  // Confirm the assistant's welcome before returning. The bot greets when the
+  // ASSISTANT joins the channel (Chime fires the per-tier bot's WelcomeIntent on
+  // the assistant being added, NOT on the creator's join) — correct product
+  // behaviour, but the greeting can land
   // a beat AFTER the conversation view renders (cold Lambda + context lookup).
   // Waiting for it here means a test's first real message and its answer are
   // never conflated with the separate, earlier welcome. Best-effort: a 30s

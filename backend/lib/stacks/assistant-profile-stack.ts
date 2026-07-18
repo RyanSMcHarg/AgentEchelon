@@ -456,6 +456,11 @@ export class AssistantProfileStack extends cdk.Stack {
     const intentPackParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${intentPackParamName}`;
     const onboardingIntakeParamName = `${SSM_ROOT}/assistant/${tier}/onboarding-intake`;
     const onboardingIntakeParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${onboardingIntakeParamName}`;
+    // Welcome orientation (all profiles): optional per-assistant SSM param the deployment writes
+    // (company/access/examples) to give a first-time user context. Absent ⇒ generic welcome. The
+    // handler reads it on the WelcomeIntent path; the demo seed writes it (see seed-demo.ts).
+    const welcomeParamName = `${SSM_ROOT}/assistant/${tier}/welcome-orientation`;
+    const welcomeParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${welcomeParamName}`;
     if (topo.intentPackParam) {
       const intentPackJson = (this.node.tryGetContext('assistantIntentPack') as string) || '';
       // Only systemPromptParam profiles (standard) warn on an empty pack — basic ships the generic
@@ -548,7 +553,7 @@ export class AssistantProfileStack extends cdk.Stack {
     handlerRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ['ssm:GetParameter'],
-        resources: [onboardingIntakeParamArn, ...(topo.intentPackParam ? [intentPackParamArn] : [])],
+        resources: [onboardingIntakeParamArn, welcomeParamArn, ...(topo.intentPackParam ? [intentPackParamArn] : [])],
       }),
     );
 
@@ -558,6 +563,7 @@ export class AssistantProfileStack extends cdk.Stack {
       ...(drift ? { CHANNEL_FLOW_ARN_PARAM: CHANNEL_FLOW_ARN_SSM_KEY } : {}),
       SSM_ROOT,
       ONBOARDING_INTAKE_PARAM: onboardingIntakeParamName,
+      ASSISTANT_WELCOME_PARAM: welcomeParamName,
       BOT_ARN_PARAM: tierBotArnKey(tier),
       [`${tier.toUpperCase()}_ASYNC_PROCESSOR_ARN`]: asyncProcessor.functionArn,
       APP_INSTANCE_ARN: props.appInstanceArn,

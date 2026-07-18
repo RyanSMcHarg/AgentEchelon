@@ -42,6 +42,7 @@ import {
   PutSecretValueCommand,
   CreateSecretCommand,
 } from '@aws-sdk/client-secrets-manager';
+import { SSMClient, PutParameterCommand } from '@aws-sdk/client-ssm';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -51,6 +52,12 @@ const s3Client = new S3Client({ region });
 const cfnClient = new CloudFormationClient({ region });
 const smClient = new SecretsManagerClient({ region });
 const chimeIdentityClient = new ChimeSDKIdentityClient({ region });
+const ssmClient = new SSMClient({ region });
+
+// SSM root for this instance's params. MUST match the CDK's SSM_ROOT (agent-tier-common.ts:
+// `/${AE_INSTANCE_NAME || 'agent-echelon'}`) — the handler reads the welcome orientation from
+// `${SSM_ROOT}/assistant/{tier}/welcome-orientation`, so a case/name mismatch means it never loads.
+const SSM_ROOT = `/${(process.env.AE_INSTANCE_NAME || 'agent-echelon').trim()}`;
 
 const DEMO_PASSWORD = 'StratumDemo2026!';
 // The e2e suite reads its users + pool/client from this secret (tests/e2e/helpers/test-credentials.ts).
@@ -260,6 +267,63 @@ async function writeTestCredentialsSecret(
   console.log(`  ✓ wrote ${TEST_SECRET_NAME} (pool ${userPoolId}, client ${clientId || 'NONE'})`);
 }
 
+// Per-tier welcome orientation — the config-driven copy the assistant opens a NEW conversation with
+// (router-agent-handler reads it from `${SSM_ROOT}/assistant/{tier}/welcome-orientation` via the
+// welcome-orientation module). Grounded in the seeded Stratum context and scoped to each tier's
+// access, so a first-time user immediately knows who they are and what to try. Absent this param the
+// platform shows a generic welcome — writing it here is itself a worked customization example.
+const PLATFORM_NOTE =
+  'I also know the AgentEchelon platform that powers this demo - ask me "how does AgentEchelon work?" or "how do I customize it?"';
+const STRATUM_BLURB = 'an enterprise SaaS company (workflow automation, ~280 people, based in Austin)';
+const WELCOME_ORIENTATION: Record<'basic' | 'standard' | 'premium', unknown> = {
+  basic: {
+    companyName: 'Stratum Technologies',
+    companyBlurb: STRATUM_BLURB,
+    accessBlurb: "You're exploring with public access: products, pricing, and support information.",
+    examples: [
+      "What's included in the StratumFlow Professional plan?",
+      'Compile a one-page overview of the StratumFlow product',
+      'Which integrations does Stratum support?',
+    ],
+    platformNote: PLATFORM_NOTE,
+  },
+  standard: {
+    companyName: 'Stratum Technologies',
+    companyBlurb: STRATUM_BLURB,
+    accessBlurb: 'You have standard (internal) access: the employee directory, internal processes, and the product roadmap.',
+    examples: [
+      'Who leads the Platform Core engineering team?',
+      'Extract the engineering roster by location as a table',
+      'Compile a report on the Q3 product roadmap',
+    ],
+    platformNote: PLATFORM_NOTE,
+  },
+  premium: {
+    companyName: 'Stratum Technologies',
+    companyBlurb: STRATUM_BLURB,
+    accessBlurb: 'You have leadership access: financials, team metrics, customer accounts, the board summary, and competitive intel.',
+    examples: [
+      'Compile a board-ready report on our Q2 ARR performance',
+      'Extract the enterprise accounts flagged as churn risk as a table',
+      "What's our current net revenue retention?",
+    ],
+    platformNote: PLATFORM_NOTE,
+  },
+};
+
+async function writeWelcomeOrientation(): Promise<void> {
+  for (const tier of ['basic', 'standard', 'premium'] as const) {
+    const name = `${SSM_ROOT}/assistant/${tier}/welcome-orientation`;
+    await ssmClient.send(new PutParameterCommand({
+      Name: name,
+      Value: JSON.stringify(WELCOME_ORIENTATION[tier]),
+      Type: 'String',
+      Overwrite: true,
+    }));
+    console.log(`  ✓ ${tier} welcome orientation → ${name}`);
+  }
+}
+
 async function uploadContextFiles(bucketName: string): Promise<void> {
   const contextDir = path.join(__dirname, '..', 'demo', 'context');
 
@@ -437,6 +501,11 @@ async function main(): Promise<void> {
   // Playwright suite (which reads the secret) can actually sign in after a fresh deploy.
   console.log('Step 2b: Syncing e2e test-credentials secret...');
   await writeTestCredentialsSecret(userPoolId, users);
+  console.log('');
+
+  // Step 2c: per-tier welcome orientation (what a first-time user sees + can try).
+  console.log('Step 2c: Writing per-tier welcome orientation to SSM...');
+  await writeWelcomeOrientation();
   console.log('');
 
   // Step 3: Upload context files
