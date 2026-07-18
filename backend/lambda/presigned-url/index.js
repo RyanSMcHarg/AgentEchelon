@@ -165,10 +165,20 @@ exports.handler = async (event) => {
           code: 'MISSING_FILE_KEY',
         }, origin);
       }
-      const expectedPrefix = `attachments/${conversationId}/${callerSub}/`;
-      if (!conversationId || !fileKey.startsWith(expectedPrefix)) {
+      // Two download-able shapes, both scoped to the conversation the caller names:
+      //  - attachments/<conversationId>/<callerSub>/...  a file the CALLER uploaded (per-user prefix);
+      //  - generated-docs/<conversationId>/...           an assistant-GENERATED doc (report) for the
+      //    channel (generateAndUploadDocument writes generated-docs/<channelId>/...). These have no
+      //    user sub in the key (they belong to the conversation, not one uploader), so any member can
+      //    download them. The channelId is an unguessable UUID a non-member never sees, so requiring an
+      //    exact conversationId + fileKey match ties the download to the caller's own conversation.
+      //    FOLLOW-UP (defense in depth): additionally verify Chime channel membership for the
+      //    generated-docs path, so a former member who kept an old channelId cannot re-fetch.
+      const ownUploadPrefix = `attachments/${conversationId}/${callerSub}/`;
+      const generatedDocPrefix = `generated-docs/${conversationId}/`;
+      if (!conversationId || !(fileKey.startsWith(ownUploadPrefix) || fileKey.startsWith(generatedDocPrefix))) {
         return respond(403, {
-          error: 'fileKey must belong to the caller (attachments/<conversationId>/<callerSub>/...)',
+          error: 'fileKey must belong to the caller (own upload) or the named conversation (generated doc)',
           code: 'FILE_KEY_NOT_OWNED',
         }, origin);
       }

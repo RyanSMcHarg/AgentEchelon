@@ -1880,6 +1880,26 @@ export async function finalizePlaceholderResponse(params: {
     return;
   }
 
+  // Sticky-mention signal. The frontend's sticky @-mention chip keys off metadata.targetedSender
+  // (Chime's WebSocket CREATE does not reliably echo the message Target). Derive it from the
+  // placeholder's ACTUAL Chime Target — the SAME authoritative signal handleLongResponse mirrors onto
+  // continuation chunks — so it can never drift from the reply's real visibility. A 1:1 AUTO reply is
+  // untargeted (the placeholder has no Target) and must NOT be stamped, so no sticky chip appears; a
+  // targeted @-mention reply in a multi-party channel is stamped and the chip sets. The signal is
+  // DERIVED from the placeholder, never set independently, so it is not mutable out from under the reply.
+  let replyIsTargeted = false;
+  try {
+    const phForTarget = await messagingClient.send(new GetChannelMessageCommand({
+      ChannelArn: event.channelArn,
+      MessageId: messageId,
+      ChimeBearer: event.botArn,
+    }));
+    const phTarget = phForTarget.ChannelMessage?.Target;
+    replyIsTargeted = Array.isArray(phTarget) && phTarget.length > 0;
+  } catch (err) {
+    console.warn('[AsyncProcessor] Could not read placeholder Target for the sticky-mention signal; treating the reply as untargeted:', err);
+  }
+
   // D: when the deliverable is an attachment, do NOT chunk the full
   // report inline (duplicated wall). Inline = a bounded lede; the full
   // content lives only in the attachment chip.
@@ -2046,13 +2066,13 @@ export async function finalizePlaceholderResponse(params: {
 
   // Build final metadata with optional attachment.
   //
-  // `targetedSender`: the frontend's sticky-mention auto-set keys off
-  // either payload.Target (which Chime's WebSocket CREATE event does NOT
-  // reliably echo) or metadata.targetedSender (which we control). Always
-  // stamp the original sender's ARN: for targeted replies (1:1, AUTO-via-
-  // mention multi-user) the frontend match fires and the chip sets; for
-  // broadcast replies (@all) only the original sender's currentUserArn
-  // matches, so other recipients' sticky stays untouched -- still correct.
+  // `targetedSender`: the frontend's sticky-mention auto-set keys off metadata.targetedSender
+  // (Chime's WebSocket CREATE event does NOT reliably echo payload.Target). Stamp it ONLY when the
+  // reply is genuinely targeted (replyIsTargeted, derived above from the placeholder's real Target):
+  // a 1:1 AUTO reply is untargeted, so it is NOT stamped and no sticky chip appears; a targeted
+  // @-mention reply in a multi-party channel is stamped and the chip sets. An @all broadcast
+  // placeholder is untargeted too, so nothing is stamped -- correct, a broadcast is not a directed
+  // reply to any one member. (This is the piece the earlier Target-mirroring fix missed.)
   // Out-of-band analytics (SPEC-MESSAGE-METADATA-CODEBOOK.md Phase 1; ADR-016).
   // The full analytics blob is the durable record; the Chime Metadata only needs
   // the small set the frontend renders. When the out-of-band store is
@@ -2067,7 +2087,7 @@ export async function finalizePlaceholderResponse(params: {
   const messageMetadata: Record<string, unknown> = {
     ...(messageAnalyticsEnabled() ? pickFrontendMetadata(fullAnalytics) : fullAnalytics),
     ...(attachment && { attachment }),
-    ...(event.senderArn && { targetedSender: event.senderArn }),
+    ...(replyIsTargeted && event.senderArn && { targetedSender: event.senderArn }),
   };
 
   // /battle round-1 clarification (SPEC-BATTLE.md "Clarification
