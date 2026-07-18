@@ -20,6 +20,7 @@
 import {
   CognitoIdentityProviderClient,
   AdminCreateUserCommand,
+  AdminGetUserCommand,
   AdminSetUserPasswordCommand,
   AdminUpdateUserAttributesCommand,
   AdminAddUserToGroupCommand,
@@ -27,6 +28,10 @@ import {
   AdminListGroupsForUserCommand,
   ListUserPoolClientsCommand,
 } from '@aws-sdk/client-cognito-identity-provider';
+import {
+  ChimeSDKIdentityClient,
+  CreateAppInstanceUserCommand,
+} from '@aws-sdk/client-chime-sdk-identity';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import {
   CloudFormationClient,
@@ -45,6 +50,7 @@ const cognitoClient = new CognitoIdentityProviderClient({ region });
 const s3Client = new S3Client({ region });
 const cfnClient = new CloudFormationClient({ region });
 const smClient = new SecretsManagerClient({ region });
+const chimeIdentityClient = new ChimeSDKIdentityClient({ region });
 
 const DEMO_PASSWORD = 'StratumDemo2026!';
 // The e2e suite reads its users + pool/client from this secret (tests/e2e/helpers/test-credentials.ts).
@@ -127,6 +133,7 @@ async function getStackOutputs(): Promise<StackOutputs> {
 
 async function createDemoUser(
   userPoolId: string,
+  appInstanceArn: string,
   email: string,
   tier: string,
   displayName: string
@@ -195,6 +202,27 @@ async function createDemoUser(
     }
   }
   console.log(`  ✓ ${email} groups: ${groups.join(', ')}`);
+
+  // Chime AppInstanceUser — the messaging identity. Admin-created + admin-set-password users do NOT
+  // fire the Cognito post-confirmation trigger that provisions this for a normal sign-up, so without
+  // it the user has a valid login but no messaging identity: the app connects, fails to open a Chime
+  // session, and sits on "Reconnecting…". Create it here (mirrors create-admin-user.sh). Idempotent.
+  try {
+    const got = await cognitoClient.send(new AdminGetUserCommand({ UserPoolId: userPoolId, Username: email }));
+    const sub = got.UserAttributes?.find((a) => a.Name === 'sub')?.Value;
+    if (sub) {
+      await chimeIdentityClient.send(
+        new CreateAppInstanceUserCommand({ AppInstanceArn: appInstanceArn, AppInstanceUserId: sub, Name: email }),
+      );
+      console.log(`  ✓ ${email} Chime AppInstanceUser created (${sub})`);
+    }
+  } catch (err: any) {
+    if (err?.name === 'ConflictException') {
+      console.log(`  - ${email} Chime AppInstanceUser already exists`);
+    } else {
+      console.warn(`  ! could not create Chime AppInstanceUser for ${email}: ${err?.name || err}`);
+    }
+  }
 }
 
 /**
@@ -401,7 +429,7 @@ async function main(): Promise<void> {
   ];
 
   for (const user of users) {
-    await createDemoUser(userPoolId, user.email, user.tier, user.name);
+    await createDemoUser(userPoolId, appInstanceArn, user.email, user.tier, user.name);
   }
   console.log('');
 
