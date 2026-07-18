@@ -194,6 +194,8 @@ export interface AdminConversationMessage {
   timestamp: string;
   isBot: boolean;
   redacted?: boolean;
+  /** True when a moderator DELETE removed the message (content blanked, like redacted but distinct). Aurora mode only. */
+  deleted?: boolean;
   modelId?: string;
   intent?: string;
   metadata?: Record<string, unknown>;

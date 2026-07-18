@@ -73,12 +73,14 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
 
   const driftEvents = driftData?.data ?? [];
 
+  // The backend blanks content for a redacted OR deleted message, so `content` is
+  // empty in both cases. The distinct `redacted` / `deleted` flags carry which one;
+  // the preview column renders a visible tombstone from them (see below) rather than
+  // showing an empty cell, so a reviewer sees that content EXISTED and was removed.
   const selectedMessages = useMemo(
     () => messages.map((message) => ({
       ...message,
-      preview: message.redacted
-        ? '⊘ [redacted]'
-        : message.content.length > 140 ? `${message.content.slice(0, 140)}...` : message.content,
+      preview: message.content.length > 140 ? `${message.content.slice(0, 140)}...` : message.content,
     })),
     [messages]
   );
@@ -263,7 +265,28 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
                   { key: 'senderName', label: 'Sender' },
                   { key: 'intent', label: 'Intent' },
                   { key: 'modelId', label: 'Model' },
-                  { key: 'preview', label: 'Message' },
+                  {
+                    key: 'preview',
+                    label: 'Message',
+                    render: (value, row) => {
+                      const m = row as unknown as AdminConversationMessage;
+                      // Deleted takes precedence over redacted (a delete is the stronger action).
+                      // A tombstone, not a blank cell: the reviewer must see content existed + was removed.
+                      if (m.deleted)
+                        return (
+                          <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>
+                            🗑 [deleted by moderator]
+                          </span>
+                        );
+                      if (m.redacted)
+                        return (
+                          <span style={{ color: 'var(--text-muted)', fontStyle: 'italic' }}>
+                            ⊘ [redacted by moderator]
+                          </span>
+                        );
+                      return String(value ?? '');
+                    },
+                  },
                   {
                     key: 'moderate',
                     label: 'Moderate',
