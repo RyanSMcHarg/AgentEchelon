@@ -30,9 +30,9 @@
  * publishes). The dependency graph is acyclic — the alt-slots' own-Lex is what
  * avoids a battle↔premium deploy cycle.
  *
- * **Classification-configurable, premium by default.** `allowedBattleTiers` (default
- * `['premium']`) is surfaced to channel-battle.ts so /battle can be opened to
- * other channel tiers without code changes.
+ * **Classification-configurable, premium by default.** A profile's `battleEligible`
+ * flag (default true only for premium) is what channel-battle.ts checks, so /battle
+ * can be opened to other classifications by config without code changes.
  */
 import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';

@@ -4,8 +4,8 @@
  *
  * **Intentionally thin.** The per-classification ownership model (ADR-011) targets
  * independently-owned *code* per classification — a basic-team change must not
- * review-couple the standard or premium tiers. So this file holds only what
- * the tiers MUST agree on (the SSM contract keys, the shared bot key, and a
+ * review-couple the standard or premium classifications. So this file holds only what
+ * the classifications MUST agree on (the SSM contract keys, the shared bot key, and a
  * couple of pure helpers) and deliberately stops short of building any classification
  * stack's resources. Each classification's file owns its own IAM, Lambda, Lex bot, and
  * AppInstanceBot wiring even when those happen to look similar — that is
@@ -243,7 +243,7 @@ export const ANALYTICS_DB_NAME = ANALYTICS_PREFIX.replace(/-/g, '_');
 /**
  * The platform's shared SSM contract — published by the feature stacks
  * (AgentEchelonFoundations, AgentEchelonExperiments, AgentEchelonBattle) and
- * resolved by Standard/Premium tiers at deploy time via
+ * resolved by Standard/Premium classifications at deploy time via
  * `valueForStringParameter` (a dynamic SSM ref, NOT Fn::importValue). Basic
  * does not need any of these — it has no tasks, no /battle.
  * **All paths derive from SSM_ROOT — never hardcode `/agent-echelon/...`.**
@@ -268,8 +268,8 @@ export const SHARED_SSM = {
   battleOutcomeName: `${SSM_ROOT}/shared/tables/battle-outcome-name`,
   battleOutcomeArn: `${SSM_ROOT}/shared/tables/battle-outcome-arn`,
   battleOrchestratorArn: `${SSM_ROOT}/shared/battle-orchestrator-arn`,
-  // Cognito user-pool id — standard/premium tiers run the per-classification handler
-  // (router code) which does per-message classification enforcement (min(senderTier,
+  // Cognito user-pool id — standard/premium classifications run the per-classification handler
+  // (router code) which does per-message classification enforcement (min(senderClearance,
   // channelClassification)) via AdminListGroupsForUser.
   cognitoUserPoolId: `${SSM_ROOT}/shared/cognito-user-pool-id`,
   // Aurora data-plane Lambda ARN. Published by AgentEchelonAnalyticsAurora;
@@ -399,7 +399,7 @@ export function processorArnKey(classification: Classification): string {
  * (tasks tables + experiments table + Cognito pool id). Published by
  * AgentEchelonFoundations/AgentEchelonExperiments, which deploy regardless of whether
  * /battle is enabled. Returns the dynamic SSM refs the classification's role and
- * processor env use. Only used by the Standard + Premium tiers; Basic
+ * processor env use. Only used by the Standard + Premium classifications; Basic
  * doesn't call this.
  *
  * The /battle-specific params (battle-state, channel-battle-config,
@@ -601,7 +601,7 @@ export function wireMessageAnalytics(
  */
 export function auroraDriftWiring(
   scope: Construct,
-  _tier: Classification,
+  _classification: Classification,
   hookup: AuroraDriftHookup,
 ): {
   env: Record<string, string>;

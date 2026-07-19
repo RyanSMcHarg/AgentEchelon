@@ -59,15 +59,16 @@ function deriveSourceType(s3Key: string): string {
   return m ? m[1] : 'doc';
 }
 
-// Tier derivation for per-tier retrieval (schema 008: `metadata` holds `{tier}`).
-// Without this, no chunk was tagged and the retrieval tier-filter was a no-op —
-// ALL KB content was returned to ALL tiers (cross-tier leak). Convention: an
-// optional tier segment right after the source-type — `rag/{sourceType}/{tier}/…`
-// where `{tier}` ∈ basic|standard|premium. Content with NO tier segment defaults
-// to `RAG_DEFAULT_CLASSIFICATION` (default `premium` = most-restrictive, **fail-closed**),
-// so untagged content is never exposed to a lower tier; tag content `basic` to
-// publish it to all tiers. Retrieval filters `metadata->>'tier' = ANY(scope)`
-// where a user's scope is their tier and below (router-agent-handler.ts).
+// Classification derivation for per-classification retrieval (schema 008: `metadata` holds the
+// `tier` key). Without this, no chunk was tagged and the retrieval classification-filter was a
+// no-op — ALL KB content was returned to ALL classifications (cross-classification leak).
+// Convention: an optional classification segment right after the source-type —
+// `rag/{sourceType}/{classification}/…` where `{classification}` ∈ basic|standard|premium.
+// Content with NO classification segment defaults to `RAG_DEFAULT_CLASSIFICATION` (default
+// `premium` = most-restrictive, **fail-closed**), so untagged content is never exposed to a
+// lower classification; tag content `basic` to publish it to all classifications. Retrieval
+// filters `metadata->>'tier' = ANY(scope)` where a user's scope is their classification and
+// below (router-agent-handler.ts).
 export function deriveClearance(s3Key: string): string {
   const seg = s3Key.match(/^rag\/[^/]+\/([^/]+)\//)?.[1];
   if (seg && profiles.isKnownClassification(seg)) return profiles.resolveClassification(seg);
@@ -299,7 +300,8 @@ export async function ingestObject(
       filename: key.split('/').pop(),
       sourceKey: key,
       chunkStart: chunk.start,
-      // Per-tier retrieval gate (fail-closed default). See deriveClearance.
+      // Per-classification retrieval gate (fail-closed default). See deriveClearance.
+      // The stored metadata key stays `tier` (schema 008); the value is the classification.
       tier: deriveClearance(key),
     };
 

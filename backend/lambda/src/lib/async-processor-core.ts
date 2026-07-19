@@ -1,7 +1,7 @@
 /**
  * Async Processor Core
  *
- * Shared utilities for the tier-specific async processors
+ * Shared utilities for the classification-specific async processors
  * (basic, standard, premium). Extracts common pipeline steps:
  * - Placeholder polling
  * - Channel history loading
@@ -10,9 +10,9 @@
  * - Message updates with analytics metadata
  * - Error handling
  *
- * Each tier-specific processor imports these functions and
+ * Each classification-specific processor imports these functions and
  * composes them with its own system prompt, model config, and
- * tier-specific post-processing.
+ * classification-specific post-processing.
  */
 
 import {
@@ -103,7 +103,7 @@ function encodedLen(s: string): number {
 // Bedrock prompt caching (system-prompt prefix)
 // ============================================================
 //
-// The tier processors build `systemPrompt` as a STABLE base (persona +
+// The classification processors build `systemPrompt` as a STABLE base (persona +
 // standing policy from buildSystemPrompt/BASE_SYSTEM_PROMPT) followed by
 // DYNAMIC per-turn appends (retrieved-context hint, conversation summary,
 // task hints, the "do NOT repeat" priorAgent note, and — inside
@@ -326,7 +326,7 @@ export interface AsyncProcessorEvent {
   deliveryOption?: string;
 
   // Per-intent response shaping. Forwarded by the router from the
-  // intent pack; the processor clamps `maxTokens` to the tier ceiling + reasoning floor. Absent ⇒
+  // intent pack; the processor clamps `maxTokens` to the classification ceiling + reasoning floor. Absent ⇒
   // the processor's default budget.
   responseSettings?: { maxTokens?: number; verbosity?: 'tight' | 'normal' | 'long' };
 
@@ -799,10 +799,10 @@ const COMPANY_CONTEXT_TOOL_CONFIG = {
       toolSpec: {
         name: 'load_company_context',
         description:
-          'Retrieve the company, product, pricing, plan/FAQ, and (tier-permitting) ' +
+          'Retrieve the company, product, pricing, plan/FAQ, and (classification-permitting) ' +
           'financial documents this assistant is allowed to read. Call this before ' +
           'answering ANY question about the company, its products, pricing, plans, or ' +
-          'financials. Returns only the documents this tier is permitted to access.',
+          'financials. Returns only the documents this classification is permitted to access.',
         inputSchema: {
           json: {
             type: 'object',
@@ -1116,7 +1116,7 @@ export async function applyInputGuardrail(text: string): Promise<{ blocked: bool
  * `enableCompanyContextTool` (ADR-011) exposes the
  * `load_company_context` tool and runs a self-hosted, in-Lambda tool loop
  * (reason → tool_use → observe → answer). Only normal text turns enable it;
- * vision and /battle turns leave it off. Tier isolation is enforced by the
+ * vision and /battle turns leave it off. Classification isolation is enforced by the
  * caller Lambda's S3 IAM via `loadCompanyContext`.
  */
 export async function invokeBedrock(
@@ -1132,15 +1132,15 @@ export async function invokeBedrock(
 ): Promise<{ response: string; inputTokens: number; outputTokens: number; bedrockTime: number; steps: ConverseStep[] }> {
   const bedrockStart = Date.now();
   const convMessages = buildConverseMessages(messages, imageInput, documentInput) as Array<Record<string, unknown>>;
-  // ADR-011: company-context bucket (attachments bucket, context/{tier}/);
-  // tier isolation is enforced by this Lambda's own scoped S3 IAM. Read at call
+  // ADR-011: company-context bucket (attachments bucket, context/{classification}/);
+  // classification isolation is enforced by this Lambda's own scoped S3 IAM. Read at call
   // time so the env is always current (and testable).
   const companyContextBucket = process.env.CONTEXT_BUCKET || '';
   const companyToolOn = enableCompanyContextTool && !!companyContextBucket;
   // Company-context DIGEST (ADR-017): when the company-context tool is on, prepend
-  // the always-present per-tier manifest (titles + one-line descriptions of the
-  // documents this tier may read) so the model knows WHAT company context exists
-  // and can fetch specifics, instead of guessing. Warm-cached + tier-scoped like
+  // the always-present per-classification manifest (titles + one-line descriptions of the
+  // documents this classification may read) so the model knows WHAT company context exists
+  // and can fetch specifics, instead of guessing. Warm-cached + classification-scoped like
   // the documents themselves; empty string when no digest is present.
   if (companyToolOn) {
     try {
@@ -1609,7 +1609,7 @@ export async function handleProcessingError(
  * default), so a deployment opts in by pointing them at an admin conversation channel and
  * the app-instance-admin ARN (same bearer the membership audit uses). The `notify` directive
  * in Metadata is what the channel flow fans out to email; `analytics.userType=admin` keeps
- * the alert out of tier metrics.
+ * the alert out of classification metrics.
  */
 export async function sendProcessorErrorAlert(
   event: AsyncProcessorEvent,
@@ -1659,7 +1659,7 @@ export async function sendProcessorErrorAlert(
 
 /**
  * Shared pipeline: validate event, poll placeholder, load history, consolidate.
- * Returns the common context needed by all tier processors.
+ * Returns the common context needed by all classification processors.
  */
 export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
   messageId: string | null;
@@ -1670,7 +1670,7 @@ export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
   userSub: string;
   /**
    * First-turn channel rename (title derivation) promise, or undefined when
-   * this is not the first user turn. The tier handler MUST await this after
+   * this is not the first user turn. The classification handler MUST await this after
    * posting the reply: it's a separate chain of network calls (DescribeChannel
    * + Haiku InvokeModel + UpdateChannel), and an async Lambda freezes the
    * moment the handler resolves, so an un-awaited rename often never lands.
@@ -1726,7 +1726,7 @@ export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
 
   // Step 2b: Title rename on the first user turn into a channel still named
   // "New conversation" (no-ops otherwise). Kicked off HERE so it runs
-  // concurrently with inference, but the promise is RETURNED so the tier
+  // concurrently with inference, but the promise is RETURNED so the classification
   // handler can await it after the reply is posted. It must not block the
   // reply, but it must also outlive the reply: an async Lambda freezes the
   // execution environment once the handler resolves, so a purely
@@ -1997,7 +1997,7 @@ export async function finalizePlaceholderResponse(params: {
           },
         }
       // A present experimentId means an active experiment assigned the model, so the turn
-      // is probabilistic; otherwise the model came deterministically from tier+intent resolution.
+      // is probabilistic; otherwise the model came deterministically from classification+intent resolution.
       // Don't mislabel a deterministic turn as an experiment (there may be none on this deployment).
       : { assignmentMode: event.experimentId ? 'probabilistic' : 'deterministic' }),
   });
@@ -2603,7 +2603,7 @@ You may rebut, build on, or concede to the rival's reply. You may also choose no
  * Assemble the system prompt for a battle invocation using the 3-layer
  * ordering from SPEC-BATTLE.md "Prompt Addendum Sanitization":
  *
- *   1. Tier base system prompt
+ *   1. Classification base system prompt
  *   2. <persona_addendum>{sanitized variant.systemPromptAddendum}</persona_addendum>
  *   3. Battle-mode constraints (LAST, so they override any contradictory
  *      addendum)
@@ -2635,7 +2635,7 @@ export async function prepareBattleInvocation(args: {
   // displayName + addendum) so /battle is a faithful head-to-head of the
   // two configured variants (SPEC-BATTLE Design Anchor; generalizes the
   // stale §413). When the battle/variant can't be resolved, the fields
-  // stay unset and the caller keeps its normal tier+intent resolution
+  // stay unset and the caller keeps its normal classification+intent resolution
   // (graceful fall-back to the old §413 behavior).
   let variantModelKey: string | undefined;
   let addendum: string | undefined;
@@ -2674,7 +2674,7 @@ export async function prepareBattleInvocation(args: {
 /**
  * Phase-3 vision-in: consolidate "which model is this battle variant +
  * does the turn have a usable image + can the model read it" into one
- * pure decision, so the in-flight tier processor just branches on the
+ * pure decision, so the in-flight classification processor just branches on the
  * result. Pure (catalog via placeholder region/account — visionCapable
  * is region-independent).
  *
