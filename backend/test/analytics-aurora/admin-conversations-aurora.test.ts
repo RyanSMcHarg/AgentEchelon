@@ -39,8 +39,26 @@ describe('admin-conversations-aurora', () => {
     expect(out[0]).toEqual({
       channelArn: 'c1', name: 'Q3 Forecast', messageCount: 12,
       lastMessageAt: '2026-07-15T00:05:00Z', memberCount: 0,
+      state: 'live',
       metadata: { modelTier: 'premium' },
     });
+  });
+
+  it('derives lifecycle state: deleted wins over archived, else archived, else live', async () => {
+    mockedQuery.mockResolvedValueOnce({
+      rows: [
+        { channel_arn: 'c1', tier: 'premium', name: 'Live one', message_count: '4', last_message_at: '2026-07-15T00:05:00Z', member_count: '2', is_deleted: false, is_archived: false },
+        { channel_arn: 'c2', tier: 'standard', name: 'Archived one', message_count: '9', last_message_at: '2026-07-14T00:00:00Z', member_count: '0', is_deleted: false, is_archived: true },
+        { channel_arn: 'c3', tier: 'premium', name: 'Deleted one', message_count: '3', last_message_at: '2026-07-13T00:00:00Z', member_count: '0', is_deleted: true, is_archived: true },
+      ],
+      rowCount: 3,
+    } as any);
+    const out = await adminListConversations();
+    const [sql] = mockedQuery.mock.calls[0] as [string];
+    // State is derived from the archived channel events, not a live Chime read.
+    expect(sql).toMatch(/DELETE_CHANNEL/);
+    expect(sql).toMatch(/metadata->>'archived' = 'true'/);
+    expect(out.map((c) => c.state)).toEqual(['live', 'archived', 'deleted']); // deleted wins over archived on c3
   });
 
   it('falls back to "Untitled Conversation" when no channel name row exists', async () => {

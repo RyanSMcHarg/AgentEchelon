@@ -47,6 +47,18 @@ interface ChimeKinesisEvent {
     LastUpdatedTimestamp?: string;
     Type?: string;
     Persistence?: string;
+    // Channel-lifecycle events (CREATE/UPDATE/DELETE_CHANNEL) stream the channel
+    // fields at the TOP LEVEL of Payload (verified against the live stream), not
+    // nested under `Channel`. These mirror the DescribeChannel shape.
+    Name?: string;
+    Mode?: string;
+    Privacy?: string;
+    CreatedBy?: {
+      Arn: string;
+      Name?: string;
+    };
+    // Legacy/defensive: some SDK docs show a nested Channel object. Kept as a
+    // fallback so both shapes parse.
     Channel?: {
       ChannelArn: string;
       Name?: string;
@@ -320,7 +332,7 @@ function parseKinesisRecord(
 /**
  * Transform any Chime event into unified MessageRecord format
  */
-async function transformToMessageRecord(
+export async function transformToMessageRecord(
   event: ChimeKinesisEvent
 ): Promise<MessageRecord | null> {
   const { EventType, Payload } = event;
@@ -389,8 +401,16 @@ async function transformToMessageRecord(
       }
     }
   } else if (CHANNEL_EVENT_TYPES.includes(EventType)) {
-    const channel = Payload.Channel;
-    if (!channel?.ChannelArn) {
+    // Chime streams CREATE/UPDATE/DELETE_CHANNEL with the channel fields at the TOP
+    // LEVEL of Payload (verified against the live stream), NOT nested under
+    // Payload.Channel. Reading Payload.Channel dropped every channel event as
+    // "missing Channel payload", so Aurora held no channel name or lifecycle rows:
+    // conversation titles fell back to the first user message, and archived/deleted
+    // state could not be derived. Read top-level, keeping Payload.Channel as a
+    // defensive fallback so both shapes parse.
+    const channel = Payload.Channel ?? Payload;
+    const chArn = channel.ChannelArn || Payload.ChannelArn;
+    if (!chArn) {
       console.warn(`Channel event ${EventType} missing Channel payload`);
       return null;
     }
@@ -398,18 +418,34 @@ async function transformToMessageRecord(
     const crypto = require('crypto');
     const hash = crypto
       .createHash('md5')
-      .update(channel.ChannelArn)
+      .update(chArn)
       .digest('hex')
       .substring(0, 16);
-    messageId = `${EventType.substring(0, 20)}-${hash}-${Date.now()}`;
-    channelArn = channel.ChannelArn;
+    // UPDATE events (rename + the archived-metadata mirror) must sort AFTER the
+    // CREATE so the latest name/metadata wins in the read-path DISTINCT ON; a
+    // rename leaves CreatedTimestamp fixed, so prefer LastUpdatedTimestamp.
+    createdAt =
+      channel.LastUpdatedTimestamp ||
+      channel.CreatedTimestamp ||
+      new Date().toISOString();
+    // Deterministic, collision-free id. Previously `${EventType}-${hash}-${Date.now()}`
+    // meant two channel events of the SAME type for the same channel in one archival
+    // batch shared Date.now() → identical (message_id, channel_arn) → the second was
+    // dropped by `ON CONFLICT (message_id, channel_arn) DO NOTHING`. That silently lost
+    // the archived-metadata UPDATE_CHANNEL when it followed a rename UPDATE_CHANNEL in
+    // the same batch. Keying off the event's own timestamp + a content hash keeps
+    // distinct events distinct AND makes Kinesis redeliveries idempotent (Date.now()
+    // made every replay a new duplicate row).
+    const evtDisc = crypto
+      .createHash('md5')
+      .update(`${createdAt}|${channel.Name || ''}|${channel.Metadata || ''}`)
+      .digest('hex')
+      .substring(0, 12);
+    messageId = `${EventType.substring(0, 20)}-${hash}-${evtDisc}`;
+    channelArn = chArn;
     senderArn = channel.CreatedBy?.Arn || null;
     senderName = channel.CreatedBy?.Name || null;
     content = channel.Name || null;
-    createdAt =
-      channel.CreatedTimestamp ||
-      channel.LastUpdatedTimestamp ||
-      new Date().toISOString();
 
     metadata = {};
     if (channel.Metadata) {

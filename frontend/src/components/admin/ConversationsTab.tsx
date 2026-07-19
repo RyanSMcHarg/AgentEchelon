@@ -59,6 +59,17 @@ function tierBadge(tier: string): React.ReactNode {
   );
 }
 
+function stateBadge(state?: 'live' | 'archived' | 'deleted'): React.ReactNode {
+  const s = state || 'live';
+  const color =
+    s === 'deleted' ? 'var(--status-bad)' : s === 'archived' ? 'var(--status-warn)' : 'var(--status-good)';
+  return (
+    <span style={{ backgroundColor: `${color}20`, color, padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 600, textTransform: 'capitalize' }}>
+      {s}
+    </span>
+  );
+}
+
 function driftBadge(score: number): React.ReactNode {
   const color = score >= 0.7 ? 'var(--status-bad)' : score >= 0.4 ? 'var(--status-warn)' : 'var(--status-good)';
   const label = score >= 0.7 ? 'High Drift' : score >= 0.4 ? 'Moderate' : 'On Topic';
@@ -508,8 +519,8 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
       {view === 'browser' ? (
         <>
           <p className="admin-tab-description">
-            Browse live conversations, inspect recent messages, add yourself as a visible or hidden member,
-            and redact or delete messages when moderation is needed.
+            Browse conversations (live, archived, or deleted), inspect recent messages, add yourself as a
+            visible or hidden member, and redact or delete messages when moderation is needed.
           </p>
 
           <div className="admin-section">
@@ -537,6 +548,11 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
                       label: 'Tier',
                       render: (_value, row) =>
                         tierBadge(String((row as AdminConversationSummary).metadata?.modelTier ?? '')),
+                    },
+                    {
+                      key: 'state',
+                      label: 'State',
+                      render: (_value, row) => stateBadge((row as AdminConversationSummary).state),
                     },
                     { key: 'memberCount', label: 'Members' },
                     { key: 'lastMessageAt', label: 'Last Activity', render: (value) => value ? new Date(String(value)).toLocaleString() : '--' },

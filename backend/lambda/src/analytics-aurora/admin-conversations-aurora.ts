@@ -24,6 +24,11 @@ export interface AdminConvSummary {
   messageCount: number;
   lastMessageAt?: string;
   memberCount: number;
+  /** Lifecycle state derived from the archived channel events: 'deleted' when a
+   *  DELETE_CHANNEL row exists, else 'archived' when a channel event carries the
+   *  archived metadata mirror (conversation-management.ts), else 'live'. Deleted
+   *  wins over archived. */
+  state: 'live' | 'archived' | 'deleted';
   metadata: { modelTier: string };
 }
 
@@ -63,6 +68,7 @@ export async function adminListConversations(limit = 50): Promise<AdminConvSumma
   const res = await query<{
     channel_arn: string; tier: string | null; name: string | null;
     message_count: string; last_message_at: string | null; member_count: string;
+    is_deleted: boolean; is_archived: boolean;
   }>(
     `WITH names AS (
        SELECT DISTINCT ON (channel_arn) channel_arn, content AS name
@@ -89,6 +95,20 @@ export async function adminListConversations(limit = 50): Promise<AdminConvSumma
          FROM messages
         GROUP BY channel_arn
      ),
+     lifecycle AS (
+       -- Channel lifecycle from the archived channel events. A DELETE_CHANNEL row
+       -- means the Chime channel was deleted (the archive rows persist). The
+       -- archived state is mirrored into channel Metadata by conversation-management
+       -- (the tag is authoritative but tags are not streamed to Kinesis; the
+       -- UpdateChannel metadata mirror IS), captured onto the row's metadata column.
+       -- There is no un-archive path, so presence is authoritative. Deleted wins.
+       SELECT channel_arn,
+              bool_or(event_type = 'DELETE_CHANNEL') AS is_deleted,
+              bool_or(metadata->>'archived' = 'true') AS is_archived
+         FROM messages
+        WHERE event_type IN ('CREATE_CHANNEL','UPDATE_CHANNEL','DELETE_CHANNEL')
+        GROUP BY channel_arn
+     ),
      members AS (
        -- Current member count from the archived membership events (humans + bots):
        -- a member is present iff their most-recent membership event is a join, not a
@@ -109,11 +129,14 @@ export async function adminListConversations(limit = 50): Promise<AdminConvSumma
      )
      SELECT a.channel_arn, a.tier, COALESCE(n.name, fm.name) AS name,
             a.message_count::text AS message_count, a.last_message_at,
-            COALESCE(mem.member_count, 0)::text AS member_count
+            COALESCE(mem.member_count, 0)::text AS member_count,
+            COALESCE(lc.is_deleted, false) AS is_deleted,
+            COALESCE(lc.is_archived, false) AS is_archived
        FROM agg a
        LEFT JOIN names n ON n.channel_arn = a.channel_arn
        LEFT JOIN first_msg fm ON fm.channel_arn = a.channel_arn
        LEFT JOIN members mem ON mem.channel_arn = a.channel_arn
+       LEFT JOIN lifecycle lc ON lc.channel_arn = a.channel_arn
       WHERE a.message_count > 0
       ORDER BY a.last_message_at DESC NULLS LAST
       LIMIT $1`,
@@ -125,6 +148,7 @@ export async function adminListConversations(limit = 50): Promise<AdminConvSumma
     messageCount: Number(r.message_count || 0),
     lastMessageAt: r.last_message_at || undefined,
     memberCount: Number(r.member_count || 0),
+    state: r.is_deleted ? 'deleted' : r.is_archived ? 'archived' : 'live',
     metadata: { modelTier: r.tier || '' },
   }));
 }

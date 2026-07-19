@@ -176,6 +176,10 @@ export interface AdminConversationSummary {
   memberCount: number;
   lastMessageAt?: string;
   createdAt?: string;
+  /** Lifecycle state derived from the archive: 'live', 'archived' (conversation
+   *  archived, read-only), or 'deleted' (the Chime channel was deleted; archive
+   *  rows persist). Absent on the Athena path → treat as 'live'. */
+  state?: 'live' | 'archived' | 'deleted';
   metadata?: Record<string, unknown>;
 }
 
