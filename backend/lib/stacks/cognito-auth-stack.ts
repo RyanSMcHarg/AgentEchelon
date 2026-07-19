@@ -303,6 +303,38 @@ export class CognitoAuthStack extends cdk.Stack {
       },
     });
 
+    // Dedicated ADMIN app-client (P3, SPEC-SEPARATE-ADMIN-APP.md). On the SAME
+    // user pool as the chat client — one pool, authority = `admins` group; this
+    // is a second CLIENT, NOT a second pool. It isolates the admin session/token
+    // from the chat session and scopes its hosted-UI callbacks to the admin
+    // origin only. Opt-in with the admin app (`-c enableAdminApp=true`); a
+    // deployer who prefers REUSING the shared client sets `-c adminAppClient=shared`
+    // to skip it — the admin app then falls back to VITE_CLIENT_ID (one code path,
+    // no extra test matrix).
+    const enableAdminApp = this.node.tryGetContext('enableAdminApp') === true
+      || this.node.tryGetContext('enableAdminApp') === 'true';
+    const useDedicatedAdminClient = enableAdminApp
+      && this.node.tryGetContext('adminAppClient') !== 'shared';
+    if (useDedicatedAdminClient) {
+      const adminAppUrl = adminOrigin(this);
+      const adminOAuthOrigins = [adminAppUrl].filter((o) => o.startsWith('https://'));
+      const adminClient = this.userPool.addClient('AdminWebClient', {
+        userPoolClientName: 'admin-client',
+        authFlows: { userPassword: true, userSrp: true, custom: true },
+        oAuth: {
+          flows: { authorizationCodeGrant: true },
+          scopes: [cognito.OAuthScope.EMAIL, cognito.OAuthScope.OPENID, cognito.OAuthScope.PROFILE],
+          callbackUrls: ['http://localhost:5174/callback', ...adminOAuthOrigins.map((o) => `${o}/callback`)],
+          logoutUrls: ['http://localhost:5174/', ...adminOAuthOrigins.map((o) => `${o}/`)],
+        },
+      });
+      new cdk.CfnOutput(this, 'AdminUserPoolClientId', {
+        value: adminClient.userPoolClientId,
+        description: 'Dedicated admin console app-client id — VITE_ADMIN_CLIENT_ID (admin package .env)',
+        exportName: `${this.stackName}-AdminUserPoolClientId`,
+      });
+    }
+
     // Create Cognito Identity Pool for AWS credentials
     this.identityPool = new cognito.CfnIdentityPool(this, 'IdentityPool', {
       identityPoolName: `${STACK_PREFIX}IdentityPool`,

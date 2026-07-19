@@ -506,7 +506,8 @@ const adminFrontendStack = enableAdminApp
       enableManagedWaf,
       wafRateLimit,
       wafAllowedIps,
-      rootDocument: 'admin.html',
+      // The admin app is its own workspace package (@ae/admin) and builds a
+      // standard index.html, so the default root document applies.
       outputPrefix: 'Admin',
       description: 'CloudFront + S3 hosting for the standalone AgentEchelon admin console',
     })

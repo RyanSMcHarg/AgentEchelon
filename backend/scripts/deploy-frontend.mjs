@@ -20,7 +20,7 @@
  *   node scripts/deploy-frontend.mjs --no-build # publish an existing build
  *
  * The --admin target builds the standalone admin app (`npm run build:admin` →
- * dist-admin/admin.html) and syncs it to the AgentEchelonAdminFrontend origin.
+ * packages/admin/dist) and syncs it to the AgentEchelonAdminFrontend origin.
  * The default (chat) target additionally asserts the chat bundle carries no admin
  * code (SPEC-SEPARATE-ADMIN-APP.md).
  *
@@ -55,15 +55,17 @@ const isAdmin = process.argv.includes('--admin');
 const OUT_PREFIX = isAdmin ? 'Admin' : '';
 const STACK_NAME = process.env.FRONTEND_STACK_NAME
   || `${STACK_PREFIX}${isAdmin ? 'AdminFrontend' : 'Frontend'}`;
-const BUILD_SCRIPT = isAdmin ? 'npm run build:admin' : 'npm run build';
-// The admin app's Vite entry emits admin.html (not index.html) into dist-admin/.
-const ROOT_DOC = isAdmin ? 'admin.html' : 'index.html';
+// Frontend is an npm-workspaces monorepo: @ae/chat and @ae/admin are separate
+// packages, each a Vite app that builds its own index.html into its own dist/.
+const BUILD_SCRIPT = isAdmin ? 'npm run build:admin' : 'npm run build:chat';
+const ROOT_DOC = 'index.html';
 const skipBuild = process.argv.includes('--no-build');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');
+// The workspace root (where the build:chat / build:admin / assert scripts live).
 const frontendDir = path.join(repoRoot, 'frontend');
-const distDir = path.join(frontendDir, isAdmin ? 'dist-admin' : 'dist');
+const distDir = path.join(frontendDir, 'packages', isAdmin ? 'admin' : 'chat', 'dist');
 
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -182,7 +184,7 @@ async function sync(bucket) {
   } catch {
     fail(
       `No build found at ${distDir} (${ROOT_DOC} missing).\n` +
-        `   Run without --no-build, or build first: npm --prefix ../frontend run ${isAdmin ? 'build:admin' : 'build'}`,
+        `   Run without --no-build, or build first: npm --prefix ../frontend run ${isAdmin ? 'build:admin' : 'build:chat'}`,
     );
   }
   files = await walk(distDir);

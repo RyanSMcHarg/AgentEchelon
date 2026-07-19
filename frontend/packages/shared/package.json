@@ -1,0 +1,25 @@
+{
+  "name": "@ae/shared",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "main": "src/index.ts",
+  "types": "src/index.ts",
+  "exports": {
+    ".": "./src/index.ts",
+    "./i18n": "./src/i18n/index.ts",
+    "./types": "./src/types/index.ts",
+    "./styles/*": "./src/styles/*",
+    "./*": "./src/*"
+  },
+  "dependencies": {
+    "@aws-sdk/client-chime-sdk-messaging": "^3.972.0",
+    "@aws-sdk/client-cognito-identity": "^3.972.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.972.0",
+    "@aws-sdk/credential-provider-cognito-identity": "^3.972.0",
+    "i18next": "^26.0.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-i18next": "^17.0.2"
+  }
+}

@@ -1,13 +1,22 @@
 #!/usr/bin/env node
 /**
  * assert-no-admin-in-chat.mjs — the security-relevant invariant of the admin/chat
- * split (SPEC-SEPARATE-ADMIN-APP.md): the CHAT entry (src/main.tsx) must import
- * NOTHING under src/components/admin/ and no admin-only service. If it did, the
+ * split (SPEC-SEPARATE-ADMIN-APP.md): the CHAT entry (packages/chat/src/main.tsx)
+ * must never resolve a module physically under packages/admin/. If it did, the
  * public chat bundle would ship operator code again.
+ *
+ * Post-monorepo-split update: @ae/chat and @ae/admin are now separate npm
+ * workspace packages (packages/chat, packages/admin) sharing @ae/shared
+ * (packages/shared) — there is no longer a single `src/components/admin/`
+ * tree to blocklist by path prefix. The invariant is now simply "the chat
+ * entry's import graph never lands inside packages/admin/", checked by
+ * walking chat's REAL module graph, including through the `@ae/shared`
+ * package import (resolved to its source, mirroring @ae/shared's `exports`
+ * map) so a future admin-only addition smuggled into shared is also caught.
  *
  * We assert on the SOURCE import graph, not the minified bundle: minification
  * mangles identifiers and drops module paths, so grepping the built JS for
- * "components/admin" is unreliable. Walking the static import graph from the chat
+ * "packages/admin" is unreliable. Walking the static import graph from the chat
  * entry is deterministic and fails a re-coupling refactor at build time.
  *
  * Usage (from frontend/):  node scripts/assert-no-admin-in-chat.mjs
@@ -18,19 +27,14 @@ import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
-const srcDir = path.resolve(__dirname, '..', 'src');
-const ENTRY = path.join(srcDir, 'main.tsx');
+const workspaceRoot = path.resolve(__dirname, '..');
+const chatSrcDir = path.join(workspaceRoot, 'packages', 'chat', 'src');
+const sharedSrcDir = path.join(workspaceRoot, 'packages', 'shared', 'src');
+const adminDir = path.join(workspaceRoot, 'packages', 'admin');
+const ENTRY = path.join(chatSrcDir, 'main.tsx');
 
-// Any import resolving under these (relative to src/) taints the chat bundle.
-const FORBIDDEN_PREFIXES = [
-  path.join(srcDir, 'components', 'admin'),
-];
-// Admin-only services that live outside components/admin/ but must not be in chat.
-const FORBIDDEN_FILES = new Set(
-  ['adminConversationService', 'membershipAuditService'].map((n) =>
-    path.join(srcDir, 'services', n),
-  ),
-);
+// Any resolved import physically under this directory taints the chat bundle.
+const FORBIDDEN_PREFIX = adminDir;
 
 const CANDIDATE_EXTS = ['', '.ts', '.tsx', '.js', '.jsx', '.mjs'];
 const INDEX_EXTS = ['index.ts', 'index.tsx', 'index.js', 'index.jsx'];
@@ -39,11 +43,7 @@ async function exists(p) {
   try { await access(p); return true; } catch { return false; }
 }
 
-// Resolve a relative import specifier to a concrete on-disk module path, trying
-// the usual TS/JS extension + index-file combinations.
-async function resolveImport(fromFile, spec) {
-  if (!spec.startsWith('.')) return null; // bare/package import — not our source graph
-  const base = path.resolve(path.dirname(fromFile), spec);
+async function resolveWithExtensions(base) {
   for (const ext of CANDIDATE_EXTS) {
     const cand = base + ext;
     if (!(await exists(cand))) continue;
@@ -58,6 +58,31 @@ async function resolveImport(fromFile, spec) {
   return null;
 }
 
+// @ae/shared's package.json `exports` map, mirrored here so the walker follows
+// the bare `@ae/shared` import into real source instead of stopping at the
+// package boundary — the whole point being to also catch an admin-only module
+// smuggled into shared (belt-and-suspenders on top of the packages/admin/ prefix
+// check).
+function resolveSharedSpecifier(spec) {
+  if (spec === '@ae/shared') return path.join(sharedSrcDir, 'index.ts');
+  if (spec === '@ae/shared/i18n') return path.join(sharedSrcDir, 'i18n', 'index.ts');
+  const rest = spec.slice('@ae/shared/'.length);
+  return path.join(sharedSrcDir, rest);
+}
+
+// Resolve an import specifier (relative, or the `@ae/shared` workspace package)
+// to a concrete on-disk module path, trying the usual TS/JS extension +
+// index-file combinations. Any other bare/package import (react, aws-sdk, …)
+// is out of our source graph and returns null.
+async function resolveImport(fromFile, spec) {
+  if (spec === '@ae/shared' || spec.startsWith('@ae/shared/')) {
+    return resolveWithExtensions(resolveSharedSpecifier(spec));
+  }
+  if (!spec.startsWith('.')) return null; // other bare/package import — not our source graph
+  const base = path.resolve(path.dirname(fromFile), spec);
+  return resolveWithExtensions(base);
+}
+
 // Match static `from '...'`, side-effect `import '...'`, and dynamic `import('...')`.
 const IMPORT_RE = /(?:import\s[^'"]*from\s*|import\s*|import\s*\()\s*['"]([^'"]+)['"]/g;
 
@@ -69,18 +94,14 @@ function specifiersOf(source) {
 }
 
 function taints(resolved) {
-  if (FORBIDDEN_PREFIXES.some((p) => resolved.startsWith(p + path.sep) || resolved === p)) return true;
-  for (const f of FORBIDDEN_FILES) {
-    if (resolved === f || CANDIDATE_EXTS.some((e) => resolved === f + e)) return true;
-  }
-  return false;
+  return resolved === FORBIDDEN_PREFIX || resolved.startsWith(FORBIDDEN_PREFIX + path.sep);
 }
 
 async function main() {
   const visited = new Set();
   const violations = [];
-  // BFS over the chat entry's static import graph. Track the path so a violation
-  // reports HOW the admin module got pulled in.
+  // BFS over the chat entry's static import graph (through @ae/shared too).
+  // Track the path so a violation reports HOW the admin module got pulled in.
   const queue = [{ file: ENTRY, chain: ['main.tsx'] }];
   while (queue.length) {
     const { file, chain } = queue.shift();
@@ -97,11 +118,14 @@ async function main() {
     for (const spec of specifiersOf(source)) {
       const resolved = await resolveImport(file, spec);
       if (!resolved) continue;
+      const label = resolved.startsWith(workspaceRoot)
+        ? path.relative(workspaceRoot, resolved)
+        : resolved;
       if (taints(resolved)) {
-        violations.push(`${chain.join(' -> ')} -> ${path.relative(srcDir, resolved)}`);
+        violations.push(`${chain.join(' -> ')} -> ${label}`);
         continue; // don't descend into admin code
       }
-      queue.push({ file: resolved, chain: [...chain, path.relative(srcDir, resolved)] });
+      queue.push({ file: resolved, chain: [...chain, label] });
     }
   }
 

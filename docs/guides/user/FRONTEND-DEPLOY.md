@@ -76,32 +76,40 @@ extended with `domainNames` + `certificate` for that.
 ## Deploying the standalone admin console (optional)
 
 The operator console is a **separate app on its own origin**, not a route in the
-chat SPA (see `docs/specs/admin-console/SPEC-SEPARATE-ADMIN-APP.md`). The chat
-bundle carries no admin code or admin endpoint URLs. Deploying an admin UI is
+chat SPA (see `docs/specs/admin-console/SPEC-SEPARATE-ADMIN-APP.md`). The frontend
+is an npm-workspaces monorepo - `@ae/chat` and `@ae/admin` are separate packages
+sharing `@ae/shared`, each building its own `index.html` into its own `dist/`. The
+chat bundle carries no admin code or admin endpoint URLs. Deploying an admin UI is
 opt-in - a deployment may run headless or host its own console - and when present
-it is always the separate app.
+it is always the separate app. Under the hood both apps run against the **same**
+Chime app instance, Cognito pool, users, and credential-exchange (one pool;
+authority = `admins` group); only the build and origin are separate.
 
 It is layer 4 of the deploy ordering (core foundations, admin foundations, chat
 interface, admin interface), so deploy it last, as two steps of its own:
 
 ```bash
-# 1. Create the admin hosting (opt-in): its own S3 + CloudFront origin serving
-#    admin.html. Prefixed outputs (AdminDistributionUrl / AdminDistributionBucketName
-#    / AdminDistributionId) so they don't collide with the chat stack's.
+# 1. Create the admin hosting (opt-in): its own S3 + CloudFront origin.
+#    Prefixed outputs (AdminDistributionUrl / AdminDistributionBucketName /
+#    AdminDistributionId) so they don't collide with the chat stack's. This also
+#    provisions a dedicated admin Cognito app-client on the same pool (P3); add
+#    `--context adminAppClient=shared` to reuse the chat app-client instead.
 cd backend
-npx cdk deploy AgentEchelonAdminFrontend --context enableAdminApp=true
+npx cdk deploy AgentEchelonAdminFrontend AgentEchelonCognitoAuth --context enableAdminApp=true
 
-# 2. Regenerate the env files. gen-frontend-env now writes TWO files:
-#      frontend/.env        chat SPA + shared vars (no admin endpoint URLs)
-#      frontend/.env.admin  admin-only vars (analytics, user-management,
-#                           admin-conversations, analytics mode)
+# 2. Regenerate the env files. gen-frontend-env writes one .env PER PACKAGE:
+#      frontend/packages/chat/.env    chat + shared vars (no admin endpoint URLs)
+#      frontend/packages/admin/.env   shared auth + admin-only vars (analytics,
+#                                     user-management, admin-conversations, mode,
+#                                     and VITE_ADMIN_CLIENT_ID when dedicated)
 node scripts/gen-frontend-env.mjs
 
-# 3. Build + publish the admin app (npm run build:admin -> dist-admin/admin.html).
+# 3. Build + publish the admin app (npm run build:admin -> packages/admin/dist).
 npm run deploy-frontend -- --admin
 
 # 4. Close the admin CORS loop: point the admin APIs' CORS at the admin origin.
 npx cdk deploy --all \
+  --context enableAdminApp=true \
   --context appUrl=https://<chat-dist>.cloudfront.net \
   --context adminAppUrl=https://<admin-dist>.cloudfront.net
 ```

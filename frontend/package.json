@@ -1,33 +1,20 @@
 {
   "name": "agentechelon-frontend",
-  "description": "React admin console for AgentEchelon — conversational AI on AWS",
+  "description": "AgentEchelon frontend monorepo — @ae/shared, @ae/chat (chat SPA), @ae/admin (admin console)",
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "workspaces": [
+    "packages/*"
+  ],
   "scripts": {
-    "dev": "vite",
-    "build": "tsc -b && vite build",
-    "build:admin": "tsc -b && vite build --mode admin",
+    "build:chat": "npm -w @ae/chat run build",
+    "build:admin": "npm -w @ae/admin run build",
+    "dev:chat": "npm -w @ae/chat run dev",
+    "dev:admin": "npm -w @ae/admin run dev",
     "assert-no-admin-in-chat": "node scripts/assert-no-admin-in-chat.mjs",
     "lint": "eslint .",
-    "preview": "vite preview",
-    "test": "vitest run",
-    "test:watch": "vitest"
-  },
-  "dependencies": {
-    "@aws-sdk/client-chime-sdk-identity": "^3.972.0",
-    "@aws-sdk/client-chime-sdk-messaging": "^3.972.0",
-    "@aws-sdk/client-cognito-identity": "^3.972.0",
-    "@aws-sdk/client-cognito-identity-provider": "^3.972.0",
-    "@aws-sdk/credential-provider-cognito-identity": "^3.972.0",
-    "amazon-chime-sdk-js": "^3.31.0",
-    "i18next": "^26.0.4",
-    "react": "^19.2.0",
-    "react-dom": "^19.2.0",
-    "react-i18next": "^17.0.2",
-    "react-markdown": "10.1.0",
-    "remark-gfm": "4.0.1",
-    "web-vitals": "^5.2.0"
+    "test": "npm -ws --if-present run test"
   },
   "overrides": {
     "fast-xml-parser": "^5.8.0",
