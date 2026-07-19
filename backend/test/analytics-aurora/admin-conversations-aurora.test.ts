@@ -9,12 +9,22 @@ import { query } from '../../lambda/src/analytics-aurora/db-client';
 import {
   adminListConversations,
   adminListMessages,
+  adminListEvents,
   adminMembershipHistory,
 } from '../../lambda/src/analytics-aurora/admin-conversations-aurora';
 
 const mockedQuery = query as jest.MockedFunction<typeof query>;
 
 describe('admin-conversations-aurora', () => {
+  beforeAll(async () => {
+    // adminListMessages calls a memoized ensureModerationTable() (two DDL queries) on first use.
+    // Warm it once here with a benign default so each test's mockResolvedValueOnce maps to the real
+    // read query, not the DDL. After this, moderationTableReady stays true for the rest of the file.
+    mockedQuery.mockResolvedValue({ rows: [], rowCount: 0 } as any);
+    await adminListMessages('warmup');
+    mockedQuery.mockReset();
+  });
+
   beforeEach(() => jest.clearAllMocks());
 
   it('lists conversations grouped by channel with name + tier', async () => {
@@ -128,5 +138,28 @@ describe('admin-conversations-aurora', () => {
     expect(sql).toMatch(/content\s+AS member_name/);
     expect(out[0]).toEqual({ action: 'joined', memberArn: 'u/user/1', memberName: 'Ada', invitedBy: 'Admin', timestamp: '2026-07-15T00:00:00Z', isBot: false });
     expect(out[1]).toMatchObject({ action: 'revoked_moderator', memberName: 'Bot', isBot: true });
+  });
+
+  it('event log blanks moderated content on EVERY message-content row incl. the -UPD finalized row', async () => {
+    // A redacted bot reply: CREATE (placeholder), UPDATE (`-UPD`, the finalized text), and the REDACT
+    // event. `moderated` is true for the message-content rows (the base has a -RED sibling). Content
+    // must be blanked on BOTH the CREATE and the -UPD row; a NON-moderated update still shows content.
+    mockedQuery.mockResolvedValueOnce({
+      rows: [
+        { event_type: 'CREATE_CHANNEL_MESSAGE', message_id: 'm1', sender_name: 'Bot', sender_arn: 'a/bot/1', target_arn: null, content: 'One moment…', created_at: '2026-07-18T00:00:00Z', is_bot: true, metadata: {}, moderated: true },
+        { event_type: 'UPDATE_CHANNEL_MESSAGE', message_id: 'm1-UPD', sender_name: 'Bot', sender_arn: 'a/bot/1', target_arn: null, content: 'the SECRET final answer', created_at: '2026-07-18T00:00:01Z', is_bot: true, metadata: {}, moderated: true },
+        { event_type: 'REDACT_CHANNEL_MESSAGE', message_id: 'm1-RED', sender_name: 'Bot', sender_arn: 'a/bot/1', target_arn: null, content: '', created_at: '2026-07-18T00:01:00Z', is_bot: true, metadata: {}, moderated: true },
+        { event_type: 'UPDATE_CHANNEL_MESSAGE', message_id: 'm2-UPD', sender_name: 'Bot', sender_arn: 'a/bot/1', target_arn: null, content: 'a normal visible answer', created_at: '2026-07-18T00:02:00Z', is_bot: true, metadata: {}, moderated: false },
+      ],
+      rowCount: 4,
+    } as any);
+    const out = await adminListEvents('c1');
+    const [sql] = mockedQuery.mock.calls[0] as [string];
+    // The moderation check must key off the BASE id (strip the -UPD/-RED/-DEL suffix), not the row id.
+    expect(sql).toMatch(/regexp_replace\(m\.message_id, '-\(UPD\|RED\|DEL\)\$'/);
+    expect(out[0].content).toBe(''); // CREATE placeholder blanked
+    expect(out.find((e) => e.messageId === 'm1-UPD')!.content).toBe(''); // the finalized text must NOT leak
+    expect(out.find((e) => e.messageId === 'm2-UPD')!.content).toBe('a normal visible answer'); // non-moderated shows
+    expect(out.some((e) => (e.content || '').includes('SECRET'))).toBe(false); // nothing leaks the secret
   });
 });

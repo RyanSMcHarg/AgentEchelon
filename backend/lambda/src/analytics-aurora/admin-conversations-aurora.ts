@@ -290,8 +290,10 @@ export interface AdminConvEvent {
 /**
  * The COMPLETE archived event log for a channel — every event_type (message
  * create/update/redact/delete, membership create/update/delete, channel create/update/delete)
- * ordered by time. For the dev-persona "all events" view. A moderated message's CREATE-row
- * content is blanked here too, so the raw archive can't leak redacted/deleted text.
+ * ordered by time. For the dev-persona "all events" view. A redacted/deleted message must not leak
+ * content through ANY of its rows: the finalized text lives on the `-UPD` row (a bot reply is a
+ * placeholder finalized via UpdateChannelMessage), so blank the content of every message-content row
+ * (CREATE and UPDATE) whose BASE message has a `-RED`/`-DEL` sibling, not just the CREATE row.
  */
 export async function adminListEvents(channelArn: string): Promise<AdminConvEvent[]> {
   const res = await query<{
@@ -300,13 +302,19 @@ export async function adminListEvents(channelArn: string): Promise<AdminConvEven
     created_at: string; is_bot: boolean | null; metadata: Record<string, unknown> | null;
     moderated: boolean | null;
   }>(
+    // The `-RED`/`-DEL` sibling keys off the BASE Chime MessageId. A row is a CREATE (`<base>`), an
+    // UPDATE (`<base>-UPD`), or a moderation event (`<base>-RED`/`-DEL`); strip any suffix to the base
+    // before checking, so the finalized-content `-UPD` row is caught too (the earlier version keyed
+    // on the row's own id and missed it).
     `SELECT m.event_type, m.message_id, m.sender_name, m.sender_arn, m.target_arn,
             COALESCE(m.updated_content, m.content) AS content, m.created_at, m.is_bot, m.metadata,
             EXISTS (
               SELECT 1 FROM messages x
                WHERE x.channel_arn = m.channel_arn
                  AND x.event_type IN ('REDACT_CHANNEL_MESSAGE','DELETE_CHANNEL_MESSAGE')
-                 AND x.message_id IN (m.message_id || '-RED', m.message_id || '-DEL')
+                 AND x.message_id IN (
+                       regexp_replace(m.message_id, '-(UPD|RED|DEL)$', '') || '-RED',
+                       regexp_replace(m.message_id, '-(UPD|RED|DEL)$', '') || '-DEL')
             ) AS moderated
        FROM messages m
       WHERE m.channel_arn = $1
@@ -314,14 +322,18 @@ export async function adminListEvents(channelArn: string): Promise<AdminConvEven
     [channelArn],
   );
   return res.rows.map((r) => {
-    const moderatedCreate = r.moderated === true && r.event_type === 'CREATE_CHANNEL_MESSAGE';
+    // Blank content for ANY message-content row (CREATE or the finalized UPDATE) of a moderated
+    // message, so a redact/delete cannot leak the original or final text through this view.
+    const isMessageContent =
+      r.event_type === 'CREATE_CHANNEL_MESSAGE' || r.event_type === 'UPDATE_CHANNEL_MESSAGE';
+    const blank = r.moderated === true && isMessageContent;
     return {
       eventType: r.event_type,
       messageId: r.message_id,
       senderName: r.sender_name,
       senderArn: r.sender_arn,
       targetArn: r.target_arn,
-      content: moderatedCreate ? '' : r.content ? stripMessageMarkers(r.content) : r.content,
+      content: blank ? '' : r.content ? stripMessageMarkers(r.content) : r.content,
       createdAt: r.created_at,
       isBot: r.is_bot === true,
       metadata: (r.metadata as Record<string, unknown>) || null,
