@@ -52,7 +52,7 @@ export function intentTypeToRouteKey(intent: string | undefined): RouteKey {
 // Used to enforce the classification floor: never resolve below the classification's default model.
 const COST_RANK: Record<'low' | 'medium' | 'high', number> = { low: 0, medium: 1, high: 2 };
 
-// Trivial intents that should stay on the cheapest capable model for ALL tiers —
+// Trivial intents that should stay on the cheapest capable model for ALL classifications —
 // a greeting or "thanks" does not warrant a premium-grade invoke. Everything else
 // is subject to the classification floor below.
 const TRIVIAL_INTENTS = new Set<string>(['greeting', 'acknowledgment']);
@@ -110,7 +110,7 @@ export function resolveModelForIntent(
     // that classification's default model (e.g. general_qa → haiku, which IS allowed for
     // premium). For any non-trivial intent, never resolve below the classification default,
     // so a premium user gets a premium-grade response instead of silently
-    // dropping to Haiku. Lower tiers still degrade to their own (cheaper) floor;
+    // dropping to Haiku. Lower classifications still degrade to their own (cheaper) floor;
     // greetings/acknowledgments bypass the floor and stay on Haiku for everyone.
     const belowFloor = COST_RANK[primaryDef.costClass] < COST_RANK[defaultModel.costClass];
     if (intent && !TRIVIAL_INTENTS.has(intent) && belowFloor) {

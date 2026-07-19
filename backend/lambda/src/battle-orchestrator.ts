@@ -48,10 +48,10 @@ const messagingClient = new ChimeSDKMessagingClient({});
 const lambdaClient = new LambdaClient({});
 const ssmClient = new SSMClient({});
 
-// The premium tier processor ARN is resolved at RUNTIME from SSM (the
+// The premium classification processor ARN is resolved at RUNTIME from SSM (the
 // AgentEchelonTier-Premium stack publishes it). Resolving here — not at deploy via
 // valueForStringParameter — keeps this orchestrator decoupled from the premium
-// tier stack at deploy time (no fresh-deploy ordering cycle). A literal env
+// classification stack at deploy time (no fresh-deploy ordering cycle). A literal env
 // override is honored first for tests / special wiring.
 const PREMIUM_PROCESSOR_ARN_PARAM = process.env.PREMIUM_PROCESSOR_ARN_PARAM;
 const PREMIUM_ASYNC_PROCESSOR_ARN_ENV = process.env.PREMIUM_ASYNC_PROCESSOR_ARN;

@@ -2,7 +2,7 @@
  * Profile registry (SPEC-CAPABILITY-PROFILES §3) — the ONLY place that interprets a
  * classification tag value or maps groups to clearance. Runtime sites (channel-flow,
  * router, RAG, abuse, battle, membership-audit) migrate to read through this in Phase 1,
- * replacing hardcoded VALID_CLASSIFICATIONS / CLASSIFICATION_RANK / CLEARANCE_GROUPS / minRank / isAdvancedTier.
+ * replacing hardcoded VALID_CLASSIFICATIONS / CLASSIFICATION_RANK / CLEARANCE_GROUPS / minRank / isAdvancedClassification.
  *
  * Phase 0 guarantee: constructed from DEFAULT_PROFILES_CONFIG, every method returns the
  * SAME answer the legacy constants did — proven by profile-registry.test.ts. No behavior

@@ -32,7 +32,7 @@ type DriftCounter =
   | 'drift_signal_disagreement';
 
 interface DriftEmitOpts {
-  /** Tier of the requesting user; adds a UserClearance dimension when set */
+  /** Clearance of the requesting user; adds a UserClearance dimension when set */
   userClearance?: 'basic' | 'standard' | 'premium';
   /** Classified intent at fire time; adds an Intent dimension when set */
   intent?: string;

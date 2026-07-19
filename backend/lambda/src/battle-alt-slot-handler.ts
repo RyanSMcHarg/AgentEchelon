@@ -6,16 +6,16 @@
  * exists ONLY so the alt-slot has a valid Lex fulfillment — it is intentionally
  * a no-op that closes the intent with NO message.
  *
- * Why a dedicated, silent handler (rather than reusing a tier router):
+ * Why a dedicated, silent handler (rather than reusing a classification router):
  *   - During an active battle, alt-slot replies are produced by the channel-flow
  *     processor direct-invoking the PREMIUM async-processor. Lex is NOT on the
  *     battle reply path; it is only the alt-slot's formal `InvokedBy` handle,
  *     fired when the bot is added to a channel (WelcomeIntent).
  *   - A battle announcement is sent separately by `channel-battle.ts` via the
- *     channel's real per-tier bot, so the alt-slot must stay silent on join to
+ *     channel's real per-classification bot, so the alt-slot must stay silent on join to
  *     avoid a duplicate/confusing greeting.
- *   - Keeping this handler inside AgentEchelonBattle (not the premium tier stack)
- *     lets the alt-slots run on a battle-OWNED Lex, independent of any tier's Lex.
+ *   - Keeping this handler inside AgentEchelonBattle (not the premium classification stack)
+ *     lets the alt-slots run on a battle-OWNED Lex, independent of any classification's Lex.
  */
 
 interface LexEvent {

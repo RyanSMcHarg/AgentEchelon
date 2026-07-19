@@ -2,7 +2,7 @@
  * Assistant Async Processor (unified) — SPEC-CAPABILITY-PROFILES.
  *
  * ONE config-driven async processor for every assistant profile. It replaces the former
- * per-tier {basic,standard,premium}-async-processor.ts, which were a DIVERGENT UNION rather
+ * per-classification {basic,standard,premium}-async-processor.ts, which were a DIVERGENT UNION rather
  * than a clean hierarchy:
  *   - standard carried the richest text path (context-framework host grounding, config-identity
  *     attribution, cross-channel task awareness, RAG, context-aware model routing / external LLM,
@@ -109,7 +109,7 @@ const hostContextRegistry = createHostContextRegistry();
 // Per-profile persona (default) + SSM/env override
 // ============================================================
 //
-// The shipped defaults are the legacy per-tier prose, verbatim (keyed by profile name so the merge
+// The shipped defaults are the legacy per-classification prose, verbatim (keyed by profile name so the merge
 // is behavior-preserving); MODEL_NAME is interpolated from env. A deployment overrides the persona
 // per profile via ASSISTANT_SYSTEM_PROMPT_PARAM (SSM — a rich persona can exceed Lambda's 4 KB env
 // cap) or ASSISTANT_SYSTEM_PROMPT (inline env). Falls back to the profile default, then a generic
@@ -175,7 +175,7 @@ const DEFAULT_PROMPTS: Record<string, string> = {
   premium: PREMIUM_PROMPT,
 };
 
-/** The profile's default persona (legacy per-tier prose), or a generic template for an unknown
+/** The profile's default persona (legacy per-classification prose), or a generic template for an unknown
  *  profile so a new deployment-defined profile still gets a sensible persona out of the box. */
 function defaultPersonaFor(profile: string): string {
   return (

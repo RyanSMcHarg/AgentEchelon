@@ -11,7 +11,7 @@
  * Drift is **conversation-level + ALL-classification (basic/standard/premium) + ON BY
  * DEFAULT** in Aurora mode — NOT premium-only. This flow is shared so the
  * router (deployed per-classification, including basic) runs the identical drift flow
- * with no `isAdvancedTier` gate. See the handler-neutral design in
+ * with no `isAdvancedClassification` gate. See the handler-neutral design in
  * SPEC-DRIFT-CONVERGENCE §"runs on all AE tiers".
  *
  * Requires `analyticsMode=aurora` (pgvector + Titan). The wiring helper
@@ -140,7 +140,7 @@ export interface LiveDriftResponse {
  * Gated on ENABLE_LIVE_DRIFT + HAS_AURORA + a real channel, and suppressed in
  * battle-enabled channels (battle is an intentionally divergent comparison mode;
  * drift suggestions would be constant false positives there — SPEC-BATTLE.md
- * "Drift Detection Interaction"). Runs on ALL tiers (no isAdvancedTier gate).
+ * "Drift Detection Interaction"). Runs on ALL classifications (no isAdvancedClassification gate).
  */
 export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveDriftResponse | null> {
   const { event, channelArn, userMessage, userSub, classification, botArn, intent } = input;

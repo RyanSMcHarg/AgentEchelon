@@ -5,11 +5,11 @@
  * which does not create any admin. The admin CONSOLE needs an identity with
  * cross-channel moderation authority — redact AND delete — which only an
  * AppInstanceAdmin has (a channel moderator can redact but not delete, and the
- * per-tier bots are only moderators of their own channels). This creates a
+ * per-classification bots are only moderators of their own channels). This creates a
  * dedicated service AppInstanceUser and registers it as an AppInstanceAdmin,
  * returning its ARN for publication to SSM (`/agent-echelon/app-instance-admin-arn`).
  *
- * NOT used by the conversation/bot layer — per-tier bots still operate as
+ * NOT used by the conversation/bot layer — per-classification bots still operate as
  * themselves (see project_per_tier_ownership_architecture). This admin identity
  * is exclusively for the admin dashboard's moderation actions.
  *

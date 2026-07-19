@@ -4,7 +4,7 @@
  * A *conversation type* is a named, configurable profile that decides how a
  * conversation behaves: which agents are enrolled by default, which
  * communication channels are available, whether live drift detection runs, and
- * what security classification it maps to. Today's tiers (`basic` /
+ * what security classification it maps to. Today's classifications (`basic` /
  * `standard` / `premium`) are simply the conversation types that ship; further
  * types (`guest`, `authenticated`, `engagement`, `support`, …) are additional
  * types a deployer can add HERE without touching handler code.
@@ -29,7 +29,7 @@ import type { ConnectorRef } from './connectors';
 
 /** A conversation-type key. Open-ended (string) by design — deployers add types
  *  to {@link CONVERSATION_TYPES} without a type-system change. The shipped set
- *  happens to mirror the tiers. */
+ *  happens to mirror the classifications. */
 export type ConversationTypeKey = string;
 
 /** What starts a conversation of this type. Default `'user'` (someone opens a

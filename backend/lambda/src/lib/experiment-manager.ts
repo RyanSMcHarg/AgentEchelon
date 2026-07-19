@@ -47,7 +47,7 @@ export interface ExperimentVariant {
    * iff BOTH variants set it (validated both-or-neither). Locked #1's
    * recommended config is `titan_image` vs `nova_canvas` — a genuine
    * head-to-head. Kept off `modelKey` deliberately (locked #2: image
-   * models are NOT `BackendModelKey`s — no resolver/tier/token ripple).
+   * models are NOT `BackendModelKey`s — no resolver/classification/token ripple).
    */
   imageGenModelKey?: ImageGenModelKey;
 }
@@ -70,7 +70,7 @@ export interface ExperimentObjective {
  * Absent ⇒ 'intent', so every record with no type is an intent experiment and behavior
  * is unchanged. All three types resolve: 'intent' and 'base_model' via
  * `resolveExperimentModel` (an intent-specific experiment wins; 'base_model' applies to
- * any intent on the tier), and 'classification' via `resolveClassificationExperiment`
+ * any intent on the classification), and 'classification' via `resolveClassificationExperiment`
  * (it swaps the intent-classifier model).
  */
 export type ExperimentType = 'intent' | 'base_model' | 'classification';
@@ -195,24 +195,24 @@ export function assignVariant(experimentId: string, channelArn: string, variants
 // ============================================================
 
 /**
- * Find an active experiment matching this tier + intent, assign a variant,
+ * Find an active experiment matching this classification + intent, assign a variant,
  * and return the model to use. Returns null if no experiment applies.
  */
 export async function resolveExperimentModel(
-  tier: Classification,
+  classification: Classification,
   intent: string,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
 ): Promise<ExperimentResolution | null> {
   const experiments = await loadExperiments();
   const now = new Date();
-  const isLiveForTier = (exp: Experiment): boolean =>
+  const isLiveForClassification = (exp: Experiment): boolean =>
     exp.status === 'active' &&
-    exp.tiers.includes(tier) &&
+    exp.tiers.includes(classification) &&
     (!exp.endDate || new Date(exp.endDate) > now);
 
   // Resolution order: an intent-specific experiment wins over a base-model
-  // experiment when both apply. A base-model experiment swaps the tier default
+  // experiment when both apply. A base-model experiment swaps the classification default
   // for ANY intent (no intent match). Absent type ⇒ 'intent', so existing
   // behavior is unchanged when no
   // base-model experiments exist. Classification experiments resolve separately
@@ -226,26 +226,26 @@ export async function resolveExperimentModel(
   const routeKey = intentTypeToRouteKey(intent);
   const experiment =
     experiments.find(
-      (exp) => (exp.experimentType ?? 'intent') === 'intent' && exp.intent === routeKey && isLiveForTier(exp),
+      (exp) => (exp.experimentType ?? 'intent') === 'intent' && exp.intent === routeKey && isLiveForClassification(exp),
     ) ??
-    experiments.find((exp) => exp.experimentType === 'base_model' && isLiveForTier(exp));
+    experiments.find((exp) => exp.experimentType === 'base_model' && isLiveForClassification(exp));
 
   if (!experiment) return null;
 
-  return resolveVariantForProfile(experiment, tier, channelArn, catalog);
+  return resolveVariantForProfile(experiment, classification, channelArn, catalog);
 }
 
 /**
- * Resolve a classification A/B experiment for this tier.
+ * Resolve a classification A/B experiment for this classification.
  * Classification experiments swap the intent-classifier model and are
- * intent-agnostic, so this matches on type + tier only. Returns the resolved
+ * intent-agnostic, so this matches on type + classification only. Returns the resolved
  * classifier model, or null when no classification experiment applies. Called
  * by the router BEFORE classifyIntent; the §11.1 mutual-exclusion rule
  * guarantees a classification experiment never coexists with another type on
- * the tier, so this resolution and resolveExperimentModel never both fire.
+ * the classification, so this resolution and resolveExperimentModel never both fire.
  */
 export async function resolveClassificationExperiment(
-  tier: Classification,
+  classification: Classification,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
 ): Promise<ExperimentResolution | null> {
@@ -255,21 +255,21 @@ export async function resolveClassificationExperiment(
     (exp) =>
       exp.experimentType === 'classification' &&
       exp.status === 'active' &&
-      exp.tiers.includes(tier) &&
+      exp.tiers.includes(classification) &&
       (!exp.endDate || new Date(exp.endDate) > now),
   );
   if (!experiment) return null;
-  return resolveVariantForProfile(experiment, tier, channelArn, catalog);
+  return resolveVariantForProfile(experiment, classification, channelArn, catalog);
 }
 
 /**
  * Shared tail for experiment resolution: deterministically assign a variant,
- * look up its catalog model, enforce tier safety, and return the invoke id.
- * Returns null on an unknown model key or a tier-disallowed model.
+ * look up its catalog model, enforce classification safety, and return the invoke id.
+ * Returns null on an unknown model key or a classification-disallowed model.
  */
 function resolveVariantForProfile(
   experiment: Experiment,
-  tier: Classification,
+  classification: Classification,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
 ): ExperimentResolution | null {
@@ -281,9 +281,9 @@ function resolveVariantForProfile(
     return null;
   }
 
-  // Enforce tier safety — experiment can't assign a model not allowed for this tier
-  if (!model.allowedClassifications.includes(tier)) {
-    console.warn(`[ExperimentManager] Model ${variant.modelKey} not allowed for tier ${tier}, skipping experiment`);
+  // Enforce classification safety — experiment can't assign a model not allowed for this classification
+  if (!model.allowedClassifications.includes(classification)) {
+    console.warn(`[ExperimentManager] Model ${variant.modelKey} not allowed for classification ${classification}, skipping experiment`);
     return null;
   }
 
@@ -620,10 +620,10 @@ export function validateObjective(
 
 /**
  * Mutual-exclusion rule: a classification
- * experiment cannot be active on a tier while any other type is active on that
- * tier, and vice versa — changing the classifier shifts routing for every
+ * experiment cannot be active on a classification while any other type is active on that
+ * classification, and vice versa — changing the classifier shifts routing for every
  * intent and confounds the other tests. Returns the active experiments that
- * conflict with the candidate over any shared tier (empty ⇒ no conflict).
+ * conflict with the candidate over any shared classification (empty ⇒ no conflict).
  * DB-backed (mirrors findBattleSlotConflicts); the admin write path calls it
  * and converts a non-empty result to 409.
  */
@@ -639,8 +639,8 @@ export async function findTypeExclusionConflicts(args: {
     if (e.status !== 'active') return false;
     if (e.experimentId === args.excludeExperimentId) return false;
     const otherType = e.experimentType ?? 'intent';
-    const sharesTier = (e.tiers || []).some((t) => tiers.has(t));
-    if (!sharesTier) return false;
+    const sharesClassification = (e.tiers || []).some((t) => tiers.has(t));
+    if (!sharesClassification) return false;
     // Conflict iff exactly one side is a classification experiment.
     return (candidateType === 'classification') !== (otherType === 'classification');
   });
@@ -693,7 +693,7 @@ export async function resolveBattleVariantBySlotArn(
  * displayName + addendum) makes `/battle` a faithful head-to-head of
  * the two configured variants — the Design Anchor in SPEC-BATTLE.md.
  * This generalizes the older SPEC-BATTLE §413 ("control = normal
- * tier+intent resolution"): callers fall back to tier+intent resolution
+ * classification+intent resolution"): callers fall back to classification+intent resolution
  * only when there is no bound experiment or it pins no control modelKey
  * (treated as `null` here → caller keeps its existing default).
  *

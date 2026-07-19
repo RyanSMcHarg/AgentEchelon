@@ -1,7 +1,7 @@
 /**
  * Welcome orientation - the copy the assistant opens a new conversation with.
  *
- * CONFIG-DRIVEN by design: the PLATFORM ships a generic, tier-neutral welcome, and a DEPLOYMENT
+ * CONFIG-DRIVEN by design: the PLATFORM ships a generic, classification-neutral welcome, and a DEPLOYMENT
  * (e.g. the Stratum demo) supplies company-specific orientation via SSM (`ASSISTANT_WELCOME_PARAM`)
  * with NO code change - which is itself a worked customization example. Absent config ⇒ the generic
  * welcome (byte-for-byte the historical greeting, so un-configured deployments are unaffected).

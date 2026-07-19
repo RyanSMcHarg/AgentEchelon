@@ -699,11 +699,11 @@ async function createExchangesFromRecords(
                um.id,
                am.id,
                $1,
-               -- Fall back to the conversation's tier when the message itself carries no
+               -- Fall back to the conversation's classification when the message itself carries no
                -- user/agent type. DIRECT quick-responses (greetings/acks posted by the router
                -- via Lex) and legacy rows archive without analytics, so without this they land as
-               -- 'unknown' in the admin tabs. The conversation has a tier from any analytics-bearing
-               -- message in the channel.
+               -- 'unknown' in the admin tabs. The conversation has a classification from any
+               -- analytics-bearing message in the channel.
                COALESCE($2, c.user_type, 'unknown'),
                COALESCE($3, c.agent_type),
                EXTRACT(EPOCH FROM (am.created_at - um.created_at)) * 1000,
@@ -718,7 +718,7 @@ async function createExchangesFromRecords(
             [
               channelArn,
               // Pass raw (may be null) so the SQL COALESCE above can fall back to the
-              // conversation tier; 'unknown' is only the final SQL fallback.
+              // conversation classification; 'unknown' is only the final SQL fallback.
               userRecord.user_type || null,
               agentType,
               userRecord.message_id,

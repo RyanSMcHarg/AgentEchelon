@@ -56,8 +56,8 @@ export interface DetectDriftInput {
    */
   correlationId?: string;
   /**
-   * Optional caller-supplied tier dimension for EMF. When omitted, metrics
-   * aggregate across tiers.
+   * Optional caller-supplied clearance dimension for EMF. When omitted, metrics
+   * aggregate across clearances.
    */
   userClearance?: 'basic' | 'standard' | 'premium';
   /**

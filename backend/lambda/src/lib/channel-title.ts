@@ -132,7 +132,7 @@ export async function maybeDeriveAndRenameChannel(
     if (!newTitle || newTitle === PLACEHOLDER_TITLE) return null;
 
     // Preserve existing Metadata + Mode so we don't trample fields
-    // other subsystems set (model tier, battle config flag, etc.).
+    // other subsystems set (modelTier, battle config flag, etc.).
     await messagingClient.send(new UpdateChannelCommand({
       ChannelArn: channelArn,
       Name: newTitle,
