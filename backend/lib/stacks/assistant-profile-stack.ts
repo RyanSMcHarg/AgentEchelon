@@ -196,7 +196,7 @@ export class AssistantProfileStack extends cdk.Stack {
             }),
           ],
         }),
-        // Tier-scoped company-context read (ADR-011): ONLY context/{classifications-at-or-below}/* +
+        // Classification-scoped company-context read (ADR-011): ONLY context/{classifications-at-or-below}/* +
         // the platform-knowledge/* self-knowledge (readable by every profile). S3 AccessDenies any
         // other prefix — this is the actual isolation boundary.
         ContextS3Read: new iam.PolicyDocument({
