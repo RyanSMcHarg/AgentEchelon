@@ -45,7 +45,7 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
-import { SHARED_SSM, SSM_ROOT, STACK_PREFIX, INSTANCE_SSM, tierProcessorArnKey } from './agent-tier-common';
+import { SHARED_SSM, SSM_ROOT, STACK_PREFIX, INSTANCE_SSM, processorArnKey } from './agent-tier-common';
 
 export interface BattleStackProps extends cdk.StackProps {
   /** Shared Chime AppInstance ARN (from AgentEchelonChimeMessaging). */
@@ -340,7 +340,7 @@ export class BattleStack extends cdk.Stack {
           statements: [
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
-              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${tierProcessorArnKey('premium')}`],
+              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${processorArnKey('premium')}`],
             }),
           ],
         }),
@@ -365,7 +365,7 @@ export class BattleStack extends cdk.Stack {
       role: battleOrchestratorRole,
       environment: {
         BATTLE_STATE_TABLE: battleStateTable.tableName,
-        PREMIUM_PROCESSOR_ARN_PARAM: tierProcessorArnKey('premium'),
+        PREMIUM_PROCESSOR_ARN_PARAM: processorArnKey('premium'),
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
@@ -438,7 +438,7 @@ export class BattleStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
               resources: [
-                // The per-tier bot keys channel-battle.ts resolves (resolveTierBotArn).
+                // The per-tier bot keys channel-battle.ts resolves (resolveBotArn).
                 // Every tier owns its own bot; there is no shared /agent-echelon/bot-arn.
                 `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],

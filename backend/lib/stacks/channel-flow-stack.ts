@@ -19,7 +19,7 @@ import {
   SSM_ROOT,
   STACK_PREFIX,
   INSTANCE_SSM,
-  tierProcessorArnKey,
+  processorArnKey,
   CHANNEL_FLOW_ARN_SSM_KEY,
 } from './agent-tier-common';
 
@@ -58,9 +58,9 @@ export class ChannelFlowStack extends cdk.Stack {
     // (AgentEchelonTier-{Standard,Premium}), resolved at deploy from the SSM
     // contract those stacks publish (dynamic ref, not Fn::importValue).
     const standardProcessorArn = ssm.StringParameter.valueForStringParameter(
-      this, tierProcessorArnKey('standard'));
+      this, processorArnKey('standard'));
     const premiumProcessorArn = ssm.StringParameter.valueForStringParameter(
-      this, tierProcessorArnKey('premium'));
+      this, processorArnKey('premium'));
 
     // ============================================================
     // Channel Flow Processor Lambda

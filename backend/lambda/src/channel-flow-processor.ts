@@ -110,16 +110,16 @@ async function getChannelClassification(channelArn: string, _bearerArn: string):
 // for every bot-attributed action here (@all broadcast, member count, /battle
 // default combatant). There is no shared cross-tier bot fallback: a missing
 // per-tier SSM key is an error (the tier stack publishes it on deploy).
-const tierBotArnCache: Record<string, string> = {};
-async function resolveTierBotArn(tier: string): Promise<string> {
-  if (tierBotArnCache[tier]) return tierBotArnCache[tier];
+const botArnCache: Record<string, string> = {};
+async function resolveBotArn(tier: string): Promise<string> {
+  if (botArnCache[tier]) return botArnCache[tier];
   const key = `${SSM_ROOT}/assistant/${tier}/bot-arn`;
   const resp = await ssmClient.send(new GetParameterCommand({ Name: key }));
   const arn = resp.Parameter?.Value;
   if (!arn) {
     throw new Error(`[ChannelFlow] per-tier bot param ${key} is empty`);
   }
-  tierBotArnCache[tier] = arn;
+  botArnCache[tier] = arn;
   return arn;
 }
 
@@ -258,7 +258,7 @@ export async function handler(event: ChannelFlowEvent): Promise<void> {
   // member); for a /battle channel that
   // resolves to the premium bot, the correct default combatant.
   const channelClassification = await getChannelClassification(channelArn, senderArn);
-  const botArn = await resolveTierBotArn(channelClassification);
+  const botArn = await resolveBotArn(channelClassification);
 
   // ═══════════════════════════════════════════════════════════════
   // /battle continuation: a reply Target-addressed to a bot that is

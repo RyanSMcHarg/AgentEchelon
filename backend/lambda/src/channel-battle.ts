@@ -84,15 +84,15 @@ function respond(statusCode: number, body: unknown, origin?: string): APIGateway
 // practice this is the premium bot. There is NO shared-bot fallback — a missing
 // per-tier key returns '' and the caller surfaces "bot ARN not configured".
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-const tierBotArnCache: Record<string, string> = {};
-async function resolveTierBotArn(tier: string): Promise<string> {
-  if (tierBotArnCache[tier]) return tierBotArnCache[tier];
+const botArnCache: Record<string, string> = {};
+async function resolveBotArn(tier: string): Promise<string> {
+  if (botArnCache[tier]) return botArnCache[tier];
   try {
     const resp = await ssmClient.send(
       new GetParameterCommand({ Name: `${SSM_ROOT}/assistant/${tier}/bot-arn` }),
     );
-    tierBotArnCache[tier] = resp.Parameter?.Value || '';
-    return tierBotArnCache[tier];
+    botArnCache[tier] = resp.Parameter?.Value || '';
+    return botArnCache[tier];
   } catch (err) {
     console.warn(`[channel-battle] per-tier bot param for ${tier} missing:`, (err as Error).name);
     return '';
@@ -280,7 +280,7 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
   // Act as the channel's per-tier bot (its creator+member) for the alt-bot
   // membership add + announcement. Premium by default; the channel's own tier
   // when /battle is opened to other tiers.
-  const botArn = await resolveTierBotArn(channelClassification);
+  const botArn = await resolveBotArn(channelClassification);
   if (!botArn) {
     return respond(500, { error: `${channelClassification} bot ARN not configured` }, origin);
   }
@@ -420,7 +420,7 @@ async function handleDisable(event: APIGatewayProxyEvent, origin?: string): Prom
   if (!meta) {
     return respond(404, { error: 'Channel not found or inaccessible' }, origin);
   }
-  const botArn = await resolveTierBotArn(await resolveChannelClassification(channelArn));
+  const botArn = await resolveBotArn(await resolveChannelClassification(channelArn));
   // See handleEnable — live moderator list.
   if (!(await callerIsModerator(channelArn, callerArn))) {
     return respond(403, {

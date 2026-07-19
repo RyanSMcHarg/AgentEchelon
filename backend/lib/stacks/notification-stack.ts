@@ -10,7 +10,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
-import { SSM_ROOT, tierBotArnKey } from './agent-tier-common';
+import { SSM_ROOT, botArnKey } from './agent-tier-common';
 
 export interface NotificationStackProps extends cdk.StackProps {
   appInstanceArn: string;
@@ -337,7 +337,7 @@ export class NotificationStack extends cdk.Stack {
           // channel's `classification` tag or the fail-closed Layer 1 IAM would
           // block the assistant. Future: select a per-tier assistant per
           // recipient.
-          BOT_ARN_PARAM: tierBotArnKey('standard'),
+          BOT_ARN_PARAM: botArnKey('standard'),
           REPORT_BUCKET: briefingsBucket.bucketName,
           APP_URL: appUrl,
           SENDER_EMAIL: props.senderEmail,

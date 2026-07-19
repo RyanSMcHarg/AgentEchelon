@@ -387,10 +387,10 @@ export function adminErrorAlertWiring(
  * and the tier's own handler/processor. There is no shared-bot key; every tier
  * owns its own bot.
  */
-export function tierBotArnKey(tier: Tier): string {
+export function botArnKey(tier: Tier): string {
   return `${SSM_ROOT}/assistant/${tier}/bot-arn`;
 }
-export function tierProcessorArnKey(tier: Tier): string {
+export function processorArnKey(tier: Tier): string {
   return `${SSM_ROOT}/assistant/${tier}/processor-arn`;
 }
 

@@ -523,7 +523,7 @@ describe('POST /channels/battle/disable', () => {
     mockMessagingSend.mockResolvedValueOnce({
       Channel: { Metadata: JSON.stringify({ modelTier: 'premium', createdBy: CALLER_ARN }) },
     });
-    queueClassificationTag('premium'); // disable resolves the tag too (resolveTierBotArn)
+    queueClassificationTag('premium'); // disable resolves the tag too (resolveBotArn)
     // moderator-list pass-through.
     mockMessagingSend.mockResolvedValueOnce({
       ChannelModerators: [{ Moderator: { Arn: CALLER_ARN } }],

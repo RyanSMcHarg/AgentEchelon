@@ -42,8 +42,8 @@ import {
   adminErrorAlertWiring,
   abuseControlsWiring,
   resolveBattleSSM,
-  tierBotArnKey,
-  tierProcessorArnKey,
+  botArnKey,
+  processorArnKey,
   Tier,
   auroraDriftWiring,
   AuroraDriftHookup,
@@ -281,7 +281,7 @@ export class AssistantProfileStack extends cdk.Stack {
       processorRole.addToPolicy(new iam.PolicyStatement({ actions: ['s3:PutObject', 's3:GetObject'], resources: [`${props.attachmentsBucketArn}/battle-images/*`] }));
       // Default-bot ARN read (battle default-bot resolution).
       processorRole.addToPolicy(
-        new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${tierBotArnKey(tier)}`] }),
+        new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${botArnKey(tier)}`] }),
       );
     }
 
@@ -388,7 +388,7 @@ export class AssistantProfileStack extends cdk.Stack {
       processorEnv.DEEPSEEK_API_KEY_SECRET = deepseekSecret!.secretArn;
     }
     if (topo.imageGen) {
-      processorEnv.BOT_ARN_PARAM = tierBotArnKey(tier);
+      processorEnv.BOT_ARN_PARAM = botArnKey(tier);
       processorEnv.BATTLE_IMAGE_GUARDRAIL_ID = imageGuardrail!.guardrailId;
       processorEnv.BATTLE_IMAGE_GUARDRAIL_VERSION = imageGuardrail!.guardrailVersion;
       const maxImages = this.node.tryGetContext('battleImageMaxImages');
@@ -446,7 +446,7 @@ export class AssistantProfileStack extends cdk.Stack {
     }
 
     new ssm.StringParameter(this, 'ProcessorArnParam', {
-      parameterName: tierProcessorArnKey(tier),
+      parameterName: processorArnKey(tier),
       stringValue: asyncProcessor.functionArn,
       description: `Async-processor ARN for ${tier} tier`,
     });
@@ -521,7 +521,7 @@ export class AssistantProfileStack extends cdk.Stack {
           new iam.PolicyStatement({ actions: ['bedrock:InvokeModel'], resources: classificationModelArns }),
         ] }),
         SSMPolicy: new iam.PolicyDocument({ statements: [
-          new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${tierBotArnKey(tier)}`] }),
+          new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${botArnKey(tier)}`] }),
         ] }),
         DynamoDBPolicy: new iam.PolicyDocument({ statements: [
           new iam.PolicyStatement({
@@ -564,7 +564,7 @@ export class AssistantProfileStack extends cdk.Stack {
       SSM_ROOT,
       ONBOARDING_INTAKE_PARAM: onboardingIntakeParamName,
       ASSISTANT_WELCOME_PARAM: welcomeParamName,
-      BOT_ARN_PARAM: tierBotArnKey(tier),
+      BOT_ARN_PARAM: botArnKey(tier),
       [`${tier.toUpperCase()}_ASYNC_PROCESSOR_ARN`]: asyncProcessor.functionArn,
       APP_INSTANCE_ARN: props.appInstanceArn,
       AWS_ACCOUNT_ID: this.account,
@@ -695,7 +695,7 @@ export class AssistantProfileStack extends cdk.Stack {
     this.appInstanceBotArn = botResource.getAtt('AppInstanceBotArn').toString();
 
     new ssm.StringParameter(this, 'TierBotArnParam', {
-      parameterName: tierBotArnKey(tier),
+      parameterName: botArnKey(tier),
       stringValue: this.appInstanceBotArn,
       description: `AppInstanceBot ARN for ${tier} tier — read by create-conversation`,
     });
