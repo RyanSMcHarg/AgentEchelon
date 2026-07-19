@@ -10,7 +10,7 @@ import * as s3 from 'aws-cdk-lib/aws-s3';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
-import { SSM_ROOT, botArnKey } from './agent-tier-common';
+import { SSM_ROOT, botArnKey } from './agent-classification-common';
 
 export interface NotificationStackProps extends cdk.StackProps {
   appInstanceArn: string;

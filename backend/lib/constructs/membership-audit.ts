@@ -18,7 +18,7 @@ import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as path from 'path';
-import { SSM_ROOT } from '../stacks/agent-tier-common';
+import { SSM_ROOT } from '../stacks/agent-classification-common';
 
 export interface MembershipAuditProps {
   /** The Chime -> Kinesis message stream (carries CREATE/UPDATE_CHANNEL_MEMBERSHIP events). */

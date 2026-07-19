@@ -165,7 +165,7 @@ async function resolveChannelClassification(channelArn: string, botArn: string):
 
 /**
  * The served tier keys on the channel's IMMUTABLE `classification` TAG — the same
- * signal the IAM Layer-1 boundary enforces (agent-tier-common.classificationChannelScopedAllow,
+ * signal the IAM Layer-1 boundary enforces (agent-classification-common.classificationChannelScopedAllow,
  * `aws:ResourceTag/classification`). We deliberately do NOT trust `metadata.modelTier`:
  * channel Metadata is mutable via `chime:UpdateChannel` (the owner `rename` cap), so
  * keying the served tier on it would let a channel moderator raise the tier a FEDERATED

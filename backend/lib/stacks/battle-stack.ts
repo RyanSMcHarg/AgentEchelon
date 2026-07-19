@@ -45,7 +45,7 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
-import { SHARED_SSM, SSM_ROOT, STACK_PREFIX, INSTANCE_SSM, processorArnKey } from './agent-tier-common';
+import { SHARED_SSM, SSM_ROOT, STACK_PREFIX, INSTANCE_SSM, processorArnKey } from './agent-classification-common';
 
 export interface BattleStackProps extends cdk.StackProps {
   /** Shared Chime AppInstance ARN (from AgentEchelonChimeMessaging). */

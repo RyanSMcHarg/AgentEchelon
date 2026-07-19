@@ -12,7 +12,7 @@ import { Construct } from 'constructs';
 import * as cdk from 'aws-cdk-lib';
 import { ProfileModelSelection } from '../config/model-strategy';
 import { AssistantProfileStack, ProfileTopology } from './assistant-profile-stack';
-import { AuroraDriftHookup, MessageAnalyticsWiring } from './agent-tier-common';
+import { AuroraDriftHookup, MessageAnalyticsWiring } from './agent-classification-common';
 
 const BASIC_TOPOLOGY: ProfileTopology = {
   name: 'basic',

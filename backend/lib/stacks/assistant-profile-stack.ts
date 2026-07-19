@@ -53,7 +53,7 @@ import {
   CHANNEL_FLOW_ARN_SSM_KEY,
   RES_PREFIX,
   SSM_ROOT,
-} from './agent-tier-common';
+} from './agent-classification-common';
 
 /** The per-profile capability shape that drives the shared body. */
 export interface ProfileTopology {
@@ -118,7 +118,7 @@ export class AssistantProfileStack extends cdk.Stack {
     super(scope, id, props);
 
     const topo = props.topology;
-    // The agent-tier-common helpers are typed to the built-in Tier union. The default profiles ARE
+    // The agent-classification-common helpers are typed to the built-in Tier union. The default profiles ARE
     // that union; a deployment-defined profile name would widen this (a follow-up when custom
     // profiles ship). Cast keeps the shared boundary helpers strongly typed for the shipped set.
     const tier = topo.name as Classification;

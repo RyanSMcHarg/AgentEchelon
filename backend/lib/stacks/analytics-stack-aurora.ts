@@ -46,7 +46,7 @@ import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mo
 import * as path from 'path';
 import { Construct } from 'constructs';
 import { IAnalyticsStackOutputs } from '../interfaces/analytics-stack-interface.js';
-import { ANALYTICS_PREFIX, INSTANCE_NAME, SHARED_SSM, STACK_PREFIX, INSTANCE_SSM } from './agent-tier-common';
+import { ANALYTICS_PREFIX, INSTANCE_NAME, SHARED_SSM, STACK_PREFIX, INSTANCE_SSM } from './agent-classification-common';
 import { MembershipAuditConstruct } from '../constructs/membership-audit';
 import { ConversationArchive } from '../constructs/conversation-archive';
 
@@ -177,7 +177,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
   public readonly dbClientSecurityGroup: ec2.ISecurityGroup;
 
   // Cross-stack outputs for the router-agent-handler's live-drift VPC attachment
-  // and IAM grants (see agent-tier-common.ts `auroraDriftWiring`).
+  // and IAM grants (see agent-classification-common.ts `auroraDriftWiring`).
   public readonly dbProxyArn: string;
   public readonly dbClusterResourceId: string;
   // ARN of the retrieval + drift data-plane Lambda (project decision 018): the
@@ -1345,7 +1345,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     // pgvector via the RDS Proxy + Bedrock for query embedding. Those
     // Lambdas live in the per-tier AgentEchelonTier-* stacks and are wired
     // into the VPC separately when enableLiveDrift=true — the same path also
-    // gives them the embeddings table access (see agent-tier-common.ts
+    // gives them the embeddings table access (see agent-classification-common.ts
     // `auroraDriftWiring`).
 
     // =====================================================

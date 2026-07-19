@@ -26,7 +26,7 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
-import { SHARED_SSM, INSTANCE_SSM } from './agent-tier-common';
+import { SHARED_SSM, INSTANCE_SSM } from './agent-classification-common';
 
 export interface ExperimentsStackProps extends cdk.StackProps {
   appInstanceArn: string;

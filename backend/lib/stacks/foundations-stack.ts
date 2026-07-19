@@ -10,7 +10,7 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
-import { SSM_ROOT, SHARED_SSM, CHANNEL_FLOW_ARN_SSM_KEY, INSTANCE_SSM } from './agent-tier-common';
+import { SSM_ROOT, SHARED_SSM, CHANNEL_FLOW_ARN_SSM_KEY, INSTANCE_SSM } from './agent-classification-common';
 import { getConversationTypeConfig, DEFAULT_CONVERSATION_TYPE } from '../config/conversation-types';
 
 export interface FoundationsStackProps extends cdk.StackProps {

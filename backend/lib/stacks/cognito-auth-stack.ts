@@ -24,7 +24,7 @@ import {
   ANALYTICS_DB_NAME,
   INSTANCE_SSM,
   SHARED_SSM,
-} from './agent-tier-common';
+} from './agent-classification-common';
 import { defaultProfileRegistry as profiles } from '../profile-registry';
 
 export interface CognitoAuthStackProps extends cdk.StackProps {

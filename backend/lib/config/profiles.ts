@@ -69,7 +69,7 @@ export interface ProfilesConfig {
  *  - classifierMode: 'llm' for all (DEVIATION: legacy basic used the keyword classifier;
  *    the new default classifies basic with the LLM too — surfaces when Phase 1 wires the router)
  *  - timeoutSeconds: per-classification async processor Lambda timeout (30/60/90; classification stacks)
- *  - rateLimitPerHour: rateLimitDefaults {60,120,240} (agent-tier-common.ts)
+ *  - rateLimitPerHour: rateLimitDefaults {60,120,240} (agent-classification-common.ts)
  *  - battleEligible: allowedBattleTiers default ['premium']
  *  - failClosedTo / groupClearance: resolveUserClearance + getChannelClassification fail-closed to 'basic'
  */

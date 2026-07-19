@@ -10,7 +10,7 @@ import * as cdk from 'aws-cdk-lib';
 import * as bedrock from 'aws-cdk-lib/aws-bedrock';
 import { Construct } from 'constructs';
 import * as crypto from 'crypto';
-import { RES_PREFIX } from '../stacks/agent-tier-common';
+import { RES_PREFIX } from '../stacks/agent-classification-common';
 
 export interface AgentGuardrailsProps {
   /** Descriptive name for the guardrail */

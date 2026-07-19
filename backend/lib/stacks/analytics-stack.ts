@@ -37,7 +37,7 @@ import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as snsSubs from 'aws-cdk-lib/aws-sns-subscriptions';
 import { Construct } from 'constructs';
-import { ANALYTICS_PREFIX, ATHENA_WORKGROUP_NAME, ANALYTICS_DB_NAME, INSTANCE_SSM } from './agent-tier-common';
+import { ANALYTICS_PREFIX, ATHENA_WORKGROUP_NAME, ANALYTICS_DB_NAME, INSTANCE_SSM } from './agent-classification-common';
 import { MembershipAuditConstruct } from '../constructs/membership-audit';
 
 export interface AnalyticsStackProps extends cdk.StackProps {

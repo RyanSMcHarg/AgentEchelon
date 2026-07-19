@@ -54,7 +54,7 @@ const smClient = new SecretsManagerClient({ region });
 const chimeIdentityClient = new ChimeSDKIdentityClient({ region });
 const ssmClient = new SSMClient({ region });
 
-// SSM root for this instance's params. MUST match the CDK's SSM_ROOT (agent-tier-common.ts:
+// SSM root for this instance's params. MUST match the CDK's SSM_ROOT (agent-classification-common.ts:
 // `/${AE_INSTANCE_NAME || 'agent-echelon'}`) — the handler reads the welcome orientation from
 // `${SSM_ROOT}/assistant/{tier}/welcome-orientation`, so a case/name mismatch means it never loads.
 const SSM_ROOT = `/${(process.env.AE_INSTANCE_NAME || 'agent-echelon').trim()}`;

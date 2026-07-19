@@ -28,7 +28,7 @@ import type * as kms from 'aws-cdk-lib/aws-kms';
 import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
-import { ANALYTICS_PREFIX, ANALYTICS_DB_NAME, ATHENA_WORKGROUP_NAME } from '../stacks/agent-tier-common';
+import { ANALYTICS_PREFIX, ANALYTICS_DB_NAME, ATHENA_WORKGROUP_NAME } from '../stacks/agent-classification-common';
 
 export interface ConversationArchiveProps {
   /** The Chime message event stream (Kinesis) to archive. */

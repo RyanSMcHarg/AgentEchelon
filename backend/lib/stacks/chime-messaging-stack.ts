@@ -5,7 +5,7 @@ import * as iam from 'aws-cdk-lib/aws-iam';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { MessagingAppInstance } from 'cdk-amazon-chime-resources';
 import { Construct } from 'constructs';
-import { SSM_ROOT, RES_PREFIX } from './agent-tier-common';
+import { SSM_ROOT, RES_PREFIX } from './agent-classification-common';
 
 export interface ChimeMessagingStackProps extends cdk.StackProps {
   appInstanceName: string;

@@ -21,7 +21,7 @@ import {
   INSTANCE_SSM,
   processorArnKey,
   CHANNEL_FLOW_ARN_SSM_KEY,
-} from './agent-tier-common';
+} from './agent-classification-common';
 
 /** SSM parameter key for the channel flow ARN. Read at runtime by create-conversation
  *  so we avoid a circular stack dependency with FoundationsStack. Re-exported from the
