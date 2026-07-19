@@ -5,15 +5,15 @@
  * `CreateChannelMembership`: that action authorizes against the bearer/user resource,
  * which carries no `classification` tag, so a tag condition would fail closed and break
  * legitimate membership. A membership added out of band (a direct Chime API call by a
- * moderator, a script, or compromised creds) can therefore place an under-tier member on
- * a higher-tier channel. Layer 1 still makes that member INERT (their tag-capped creds
- * cannot read or send on the higher-tier channel), so this audit closes the residual
+ * moderator, a script, or compromised creds) can therefore place an under-cleared member on
+ * a higher-classification channel. Layer 1 still makes that member INERT (their tag-capped creds
+ * cannot read or send on the higher-classification channel), so this audit closes the residual
  * VISIBILITY gap, not a write-leak.
  *
  * WHAT IT DOES. Consumes the same Chime -> Kinesis stream the archival pipeline uses,
  * filters CREATE/UPDATE_CHANNEL_MEMBERSHIP, resolves the member's authoritative
- * Cognito-group tier, compares it to the channel's `modelTier`, and on an over-tier
- * member:
+ * Cognito-group clearance, compares it to the channel's classification (the immutable tag),
+ * and on an over-reaching member:
  *   1. logs a `[MembershipAudit][SecurityEvent]` plus a structured `_auditEvent` line;
  *   2. alerts the admin conversation (an in-app message + an email fan-out through the
  *      notification bridge, `lib/channel-notify.fanOutChannelNotification`);
@@ -22,11 +22,11 @@
  *
  * Report-only by default (enforce is opt-in) so a false positive alerts rather than
  * removing a legitimate member. Two subjects are audited: a HUMAN member below the channel
- * tier (they would see content above their clearance) and an ASSISTANT (`/bot/`) above the
- * channel tier (it answers with its own tier's model + context to lower-clearance users,
- * which Layer 1 does not stop). The admin service user and federated (`fed_`) members are
+ * classification (they would see content above their clearance) and an ASSISTANT (`/bot/`) above the
+ * channel classification (it answers with its own classification's model + context to lower-clearance
+ * users, which Layer 1 does not stop). The admin service user and federated (`fed_`) members are
  * skipped: the admin is the service moderator, and federated subs are not resolvable via
- * `AdminListGroupsForUser`. A `/battle` alt-slot bot (not a tier assistant) is left alone.
+ * `AdminListGroupsForUser`. A `/battle` alt-slot bot (not a classification assistant) is left alone.
  */
 import { KinesisStreamEvent, KinesisStreamRecord, Context } from 'aws-lambda';
 import {
@@ -69,8 +69,8 @@ interface ChimeKinesisEvent {
 
 export type MemberKind = 'user' | 'bot' | 'admin' | 'federated' | 'unknown';
 
-/** Pure: classify a channel-member ARN. Only `user` members are tier-audited. `bot` (not a
- *  tier-capped identity), `admin` (the service moderator), and `federated` (derived sub, not
+/** Pure: classify a channel-member ARN. Only `user` members are clearance-audited. `bot` (not a
+ *  Cognito-group identity), `admin` (the service moderator), and `federated` (derived sub, not
  *  resolvable via Cognito) are skipped. */
 export function classifyMember(
   memberArn: string | undefined,
@@ -87,7 +87,7 @@ export function classifyMember(
   return { kind: 'user', sub };
 }
 
-/** Pure: is the member's tier below the channel's classification? Unknown tiers fail safe
+/** Pure: is the member's clearance below the channel's classification? Unknown values fail safe
  *  (member defaults to the lowest rank, channel to `basic`). */
 export function isClassificationViolation(memberClearance: string, channelClassification: string): boolean {
   // Unknown member clearance ranks BELOW everything (0) so it always over-reports (fail-safe);
@@ -144,10 +144,10 @@ async function getAdminArn(): Promise<string> {
   return cachedAdminArn;
 }
 
-/** Resolve a member's authoritative tier from their Cognito groups. Returns null when the
+/** Resolve a member's authoritative clearance from their Cognito groups. Returns null when the
  *  identity cannot be resolved (e.g. UserNotFound) so the caller skips rather than risking a
  *  false-positive revocation of an unresolvable identity. */
-async function resolveMemberTier(sub: string): Promise<string | null> {
+async function resolveMemberClearance(sub: string): Promise<string | null> {
   if (!USER_POOL_ID) return null;
   try {
     const resp = await cognito.send(
@@ -158,12 +158,12 @@ async function resolveMemberTier(sub: string): Promise<string | null> {
   } catch (err: unknown) {
     const name = (err as { name?: string })?.name;
     if (name === 'UserNotFoundException') return null; // unresolvable — skip, do not act
-    console.warn('[MembershipAudit] failed to resolve member tier; skipping:', err);
+    console.warn('[MembershipAudit] failed to resolve member clearance; skipping:', err);
     return null;
   }
 }
 
-// The channel's tier for the violation comparison comes from the IMMUTABLE
+// The channel's classification for the violation comparison comes from the IMMUTABLE
 // `classification` tag, NOT `metadata.modelTier`. Reading mutable metadata here would let a
 // moderator who adds an over-tier assistant also tamper `modelTier` up to match it, blinding
 // this detector (botClassification > channelClassification would go false). The tag cannot be changed by
@@ -182,18 +182,18 @@ async function resolveChannelClassification(channelArn: string, _bearerArn: stri
 }
 
 let botClassificationMap: Map<string, string> | null = null;
-/** Map each per-tier assistant's bot ARN (`${SSM_ROOT}/assistant/{tier}/bot-arn`) to its tier.
- *  Cached for the Lambda's warm life. A bot ARN not in this map is not one of the default
- *  tier assistants (e.g. a `/battle` alt-slot bot), so it is left alone. */
+/** Map each per-classification assistant's bot ARN (`${SSM_ROOT}/assistant/{classification}/bot-arn`)
+ *  to its classification. Cached for the Lambda's warm life. A bot ARN not in this map is not one of
+ *  the default classification assistants (e.g. a `/battle` alt-slot bot), so it is left alone. */
 async function loadBotClassificationMap(): Promise<Map<string, string>> {
   if (botClassificationMap) return botClassificationMap;
   const map = new Map<string, string>();
-  for (const tier of profiles.classificationValues()) {
+  for (const classification of profiles.classificationValues()) {
     try {
-      const resp = await ssm.send(new GetParameterCommand({ Name: `${SSM_ROOT}/assistant/${tier}/bot-arn` }));
-      if (resp.Parameter?.Value) map.set(resp.Parameter.Value, tier);
+      const resp = await ssm.send(new GetParameterCommand({ Name: `${SSM_ROOT}/assistant/${classification}/bot-arn` }));
+      if (resp.Parameter?.Value) map.set(resp.Parameter.Value, classification);
     } catch {
-      /* a tier without a published bot ARN is simply not mapped */
+      /* a classification without a published bot ARN is simply not mapped */
     }
   }
   botClassificationMap = map;
@@ -306,18 +306,18 @@ export async function handler(event: KinesisStreamEvent, _context?: Context): Pr
     try {
       const adminArn = await getAdminArn();
       if (kind === 'user' && sub) {
-        // A human BELOW the channel's tier is the leak (they would see content above their clearance).
-        const memberClearance = await resolveMemberTier(sub);
+        // A human BELOW the channel's classification is the leak (they would see content above their clearance).
+        const memberClearance = await resolveMemberClearance(sub);
         if (!memberClearance) continue; // unresolvable identity — skip
         const channelClassification = await resolveChannelClassification(channelArn, adminArn);
         if (isClassificationViolation(memberClearance, channelClassification)) {
           await handleViolation('member', channelArn, memberArn, sub, memberClearance, channelClassification);
         }
       } else if (kind === 'bot') {
-        // An assistant ABOVE the channel's tier is the leak: it answers with its own tier's model
-        // and context to users below that clearance. Layer 1 does NOT stop this, because the bot's
-        // own creds already cover its tier and below. A bot not matching any tier assistant (a
-        // `/battle` alt-slot) is left alone.
+        // An assistant ABOVE the channel's classification is the leak: it answers with its own
+        // classification's model and context to users below that clearance. Layer 1 does NOT stop this,
+        // because the bot's own creds already cover its classification and below. A bot not matching any
+        // classification assistant (a `/battle` alt-slot) is left alone.
         const botClassification = await resolveBotClassification(memberArn);
         if (!botClassification) continue;
         const channelClassification = await resolveChannelClassification(channelArn, adminArn);

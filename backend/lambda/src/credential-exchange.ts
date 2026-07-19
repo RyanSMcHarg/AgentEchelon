@@ -6,7 +6,7 @@
  * Approach 2). It exists for two reasons that are really one piece of work:
  *
  *   1. **Closes the ChimeBearer impersonation vector.** It `AssumeRole`s the
- *      caller's per-tier role **with a `sub` session tag**, so that role's policy
+ *      caller's per-clearance role **with a `sub` session tag**, so that role's policy
  *      can pin the bearer to `…/user/${aws:PrincipalTag/sub}` — the caller can only
  *      act as their OWN AppInstanceUser. (AE's Identity-Pool path grants `…/user/*`
  *      unconditioned. memory
@@ -38,10 +38,10 @@ const SESSION_DURATION_SECONDS = Number(process.env.EXCHANGE_SESSION_SECONDS || 
 // (STS minimum is 900s). Bounds the window in which an elevated cred exists at all.
 const MODERATION_SESSION_SECONDS = Number(process.env.EXCHANGE_MODERATION_SESSION_SECONDS || '1800');
 
-// Per-tier exchange role ARNs (the bearer-pinned roles assumed-by THIS Lambda with
+// Per-clearance exchange role ARNs (the bearer-pinned roles assumed-by THIS Lambda with
 // a `sub` session tag). Resolved from the caller's authoritative Cognito groups.
 // The `admin` rung is the admin's CHAT identity (pinned to `${sub}`, never an
-// app-instance-admin, no moderation) — the same membership-gated surface as any tier.
+// app-instance-admin, no moderation) — the same membership-gated surface as any clearance.
 const EXCHANGE_ROLE_ARNS: Record<string, string> = {
   basic: process.env.EXCHANGE_ROLE_BASIC || '',
   standard: process.env.EXCHANGE_ROLE_STANDARD || '',
@@ -111,7 +111,7 @@ export function parseGroups(raw: unknown): string[] {
   return [];
 }
 
-/** Authoritative tier from Cognito groups (admins win; else highest tier; else
+/** Authoritative clearance from Cognito groups (admins win; else highest clearance; else
  *  basic — the fail-safe floor). Mirrors router-agent-handler's resolution. */
 export function resolveRoleKey(groups: string[]): 'basic' | 'standard' | 'premium' | 'admin' {
   if (groups.includes('admins')) return 'admin';
@@ -241,7 +241,7 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
   const roleKey = resolveRoleKey(groups);
 
   // Two planes.
-  //  - CHAT (default): the caller's OWN identity `${sub}` on their tier/admin rung. Never
+  //  - CHAT (default): the caller's OWN identity `${sub}` on their clearance/admin rung. Never
   //    an app-instance-admin, so Chime membership-gates it; long-lived, may be `channel/*`.
   //  - ADMIN: the SEPARATE `${sub}-admin` identity — a STANDING app-instance-admin that
   //    only ever receives a channel-scoped, short-lived, AUDITED cred. Cross-channel admin
@@ -267,8 +267,8 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
     console.error('[CredentialExchange] No exchange role ARN configured for', adminPlane ? 'admin-plane' : roleKey);
     return { statusCode: 500, headers: cors(), body: JSON.stringify({ error: 'Exchange misconfigured' }) };
   }
-  // Reported access class: admins report 'admin', tiers report their tier.
-  const tier = roleKey === 'admin' ? 'admin' : roleKey;
+  // Reported access class: admins report 'admin', otherwise the caller's clearance.
+  const accessClass = roleKey === 'admin' ? 'admin' : roleKey;
 
   try {
     // AppInstanceUserId == sub (AE convention). Display name, best-first: a real name claim; else
@@ -360,7 +360,7 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
         Expiration: c.Expiration ? new Date(c.Expiration).toISOString() : undefined,
       },
       userArn: bearerArn,
-      tier,
+      tier: accessClass, // wire field stays `tier` (frontend reads response.tier); value is the caller's clearance/admin class
       identity: requestedIdentity,
       scopedTo: scopeChannelArn || null,
     };
