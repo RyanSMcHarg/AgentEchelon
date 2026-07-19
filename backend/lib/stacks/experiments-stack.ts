@@ -3,13 +3,13 @@
  * independently-deployable stack.
  *
  * Owns:
- *   - The `experiments` DynamoDB table (all-tier A/B DATA — shared, carries no
+ *   - The `experiments` DynamoDB table (all-classification A/B DATA — shared, carries no
  *     agent identity, so a shared table is consistent with the separation posture).
  *   - The `admin-experiments` API (`/admin/experiments` GET/POST + `{id}/status`)
  *     behind a Cognito authorizer; the handler additionally requires the `admins`
  *     group. Output `ExperimentsApiUrl` → frontend `VITE_EXPERIMENTS_API_URL`.
  *   - Publishes the shared SSM contract `/agent-echelon/shared/tables/experiments-{arn,name}`
- *     that the per-tier processors/handlers resolve for runtime A/B variant lookup.
+ *     that the per-classification processors/handlers resolve for runtime A/B variant lookup.
  *
  * A deployer who doesn't want A/B experiments can still deploy it (cheap: one
  * on-demand table + one Lambda); battle-enabled experiments additionally require
@@ -59,7 +59,7 @@ export class ExperimentsStack extends cdk.Stack {
     this.experimentsTableName = experimentsTable.tableName;
     this.experimentsTableArn = experimentsTable.tableArn;
 
-    // Shared SSM contract — the per-tier processors/handlers resolve these at
+    // Shared SSM contract — the per-classification processors/handlers resolve these at
     // deploy time for runtime A/B variant lookup.
     new ssm.StringParameter(this, 'SharedExperimentsArnParam', {
       parameterName: SHARED_SSM.experimentsArn,

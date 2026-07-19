@@ -74,7 +74,7 @@ export class ProfileRegistry {
 
   /**
    * Highest classification the caller's Cognito groups clear for; fail-closed floor when none match.
-   * Legacy: resolveUserClearance — highest matching tier group, default 'basic'.
+   * Legacy: resolveUserClearance — highest matching clearance group, default 'basic'.
    */
   clearanceForGroups(groups: string[]): string {
     let best = this.config.failClosedTo;

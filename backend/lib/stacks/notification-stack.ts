@@ -83,8 +83,8 @@ export class NotificationStack extends cdk.Stack {
                 // Verifies the caller is already a member of the conversation
                 // before allowing them to share it with someone else.
                 'chime:DescribeChannelMembership',
-                // Reads the channel's tier from the IMMUTABLE `classification` tag
-                // (not mutable metadata) for the over-tier-invite gate + bot-tier
+                // Reads the channel's classification from the IMMUTABLE `classification` tag
+                // (not mutable metadata) for the over-classification-invite gate + bot-classification
                 // binding, so a moderator cannot tamper metadata to weaken admission.
                 'chime:ListTagsForResource',
               ],
@@ -121,8 +121,8 @@ export class NotificationStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
               resources: [
-                // Resolve the channel's per-tier bot (the real creator+member)
-                // to add members + send as the assistant. No shared cross-tier
+                // Resolve the channel's per-classification bot (the real creator+member)
+                // to add members + send as the assistant. No shared cross-classification
                 // bot.
                 `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
@@ -280,8 +280,8 @@ export class NotificationStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
               resources: [
-                // Resolve the channel's per-tier bot (the real creator+member)
-                // to add members + send as the assistant. No shared cross-tier
+                // Resolve the channel's per-classification bot (the real creator+member)
+                // to add members + send as the assistant. No shared cross-classification
                 // bot.
                 `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
@@ -331,11 +331,11 @@ export class NotificationStack extends cdk.Stack {
         role: briefingRole,
         environment: {
           APP_INSTANCE_ARN: props.appInstanceArn,
-          // The proactive briefing creates a STANDARD-tier conversation (its
-          // metadata + classification tag) and runs as the STANDARD tier
-          // assistant — no shared cross-tier bot. The tier must match the
+          // The proactive briefing creates a STANDARD-classification conversation (its
+          // metadata + classification tag) and runs as the STANDARD classification
+          // assistant — no shared cross-classification bot. The classification must match the
           // channel's `classification` tag or the fail-closed Layer 1 IAM would
-          // block the assistant. Future: select a per-tier assistant per
+          // block the assistant. Future: select a per-classification assistant per
           // recipient.
           BOT_ARN_PARAM: botArnKey('standard'),
           REPORT_BUCKET: briefingsBucket.bucketName,

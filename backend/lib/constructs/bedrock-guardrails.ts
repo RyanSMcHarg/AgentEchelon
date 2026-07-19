@@ -67,10 +67,10 @@ export class AgentGuardrails extends Construct {
       },
 
       // No topic-DENY policy. AgentEchelon is open source AND the assistant's
-      // knowledge is the tier-seeded company context we provide (plus general
+      // knowledge is the classification-seeded company context we provide (plus general
       // knowledge) — it never holds the deployment's AWS account id, tokens, or
       // credentials, so there is nothing secret for a topic filter to protect.
-      // The real data boundary is the tier-scoped S3 IAM on context/{tier}/, and
+      // The real data boundary is the classification-scoped S3 IAM on context/{classification}/, and
       // the rule is simply: don't seed secrets. A topic-DENY here only produced
       // false positives (blocking legitimate technical answers). Production
       // deployers can add their own topics (OSS: deployer-owned security).

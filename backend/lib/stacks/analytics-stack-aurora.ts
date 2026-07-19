@@ -97,7 +97,7 @@ export interface AnalyticsStackAuroraProps extends cdk.StackProps {
    */
   vpcId?: string;
   /**
-   * Which subnet tier of the IMPORTED VPC hosts the data plane (Aurora, RDS
+   * Which subnet type of the IMPORTED VPC hosts the data plane (Aurora, RDS
    * Proxy, the in-VPC Lambdas). Ignored when creating a new VPC (always
    * isolated). Default 'isolated'.
    */
@@ -167,10 +167,10 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
 
   /**
    * Pre-authorized DB-client security group for cross-stack consumers (the
-   * per-tier agent handlers that run LIVE drift). Its ingress on 5432 is added
+   * per-classification agent handlers that run LIVE drift). Its ingress on 5432 is added
    * to `dbSecurityGroup` INSIDE this stack, so consumers ATTACH to it read-only
    * (`securityGroups: [dbClientSecurityGroup]`) without mutating the Aurora DB
-   * SG — that mutation-from-a-tier is what created the synth CYCLE
+   * SG — that mutation-from-a-classification is what created the synth CYCLE
    * (AnalyticsAurora ⇄ AgentEchelonTier-*). Same one-SG-per-consumer pattern the
    * in-stack Lambdas (schema-init / setup / archival) already use, but shared.
    */
@@ -188,8 +188,8 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
   public readonly analyticsApiUrl: string;
 
   // Out-of-band per-message analytics table (SPEC-MESSAGE-METADATA-CODEBOOK.md
-  // Phase 1; ADR-016). The archival Lambda (this stack) reads it; the per-tier
-  // async processors write it — bin passes these to the tier stacks, which are
+  // Phase 1; ADR-016). The archival Lambda (this stack) reads it; the per-classification
+  // async processors write it — bin passes these to the classification stacks, which are
   // created after this stack, so a direct prop reference is clean.
   public readonly messageAnalyticsTableName: string;
   public readonly messageAnalyticsTableArn: string;
@@ -240,7 +240,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
 
     // Subnet selection for the data plane (Aurora, RDS Proxy, in-VPC Lambdas).
     // A created VPC only has isolated subnets; an imported VPC lets the operator
-    // pick which tier hosts the data resources (default: isolated).
+    // pick which subnet type hosts the data resources (default: isolated).
     const dbSubnets: ec2.SubnetSelection = {
       subnetType: importedVpc
         ? subnetTypeFor(props.vpcSubnetType ?? 'isolated')
@@ -303,9 +303,9 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
 
     this.dbSecurityGroup = dbSecurityGroup;
 
-    // Shared DB-client SG for cross-stack consumers (per-tier live-drift
+    // Shared DB-client SG for cross-stack consumers (per-classification live-drift
     // handlers). Authorize its ingress to Aurora HERE, inside the Aurora stack,
-    // so the tier stacks only REFERENCE it (read-only attach) — no tier→DB-SG
+    // so the classification stacks only REFERENCE it (read-only attach) — no classification→DB-SG
     // mutation, hence no AnalyticsAurora ⇄ AgentEchelonTier-* cycle. The in-stack
     // Lambdas keep their own per-consumer SGs (below); this one is for
     // out-of-stack consumers.
@@ -316,7 +316,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
       // "->" arrow glyph) AND the plain ASCII '>' / '<'. A disallowed char fails
       // CREATE (InvalidParameterValue) and rolls back the whole Aurora stack.
       // Keep this to plain words.
-      description: 'Cross-stack DB-client SG: per-tier live-drift handlers to Aurora',
+      description: 'Cross-stack DB-client SG: per-classification live-drift handlers to Aurora',
     });
     dbSecurityGroup.addIngressRule(
       dbClientSecurityGroup,
@@ -1343,7 +1343,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
 
     // The premium + standard async processors need read access to
     // pgvector via the RDS Proxy + Bedrock for query embedding. Those
-    // Lambdas live in the per-tier AgentEchelonTier-* stacks and are wired
+    // Lambdas live in the per-classification AgentEchelonTier-* stacks and are wired
     // into the VPC separately when enableLiveDrift=true — the same path also
     // gives them the embeddings table access (see agent-classification-common.ts
     // `auroraDriftWiring`).

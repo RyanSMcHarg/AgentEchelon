@@ -70,7 +70,7 @@ export class ConversationArchive extends Construct {
     });
     this.archiveBucket = archiveBucket;
 
-    // Firehose: Kinesis stream -> S3, partitioned by tier and date.
+    // Firehose: Kinesis stream -> S3, partitioned by classification and date.
     const firehoseLogGroup = new logs.LogGroup(this, 'FirehoseLogGroup', {
       logGroupName: `/aws/kinesisfirehose/${ANALYTICS_PREFIX}-message-archive`,
       retention: logs.RetentionDays.TWO_WEEKS,

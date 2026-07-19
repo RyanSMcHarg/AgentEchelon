@@ -54,7 +54,7 @@ export class ChannelFlowStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ChannelFlowStackProps) {
     super(scope, id, props);
 
-    // @all fan-out and /battle target the per-tier async-processors
+    // @all fan-out and /battle target the per-classification async-processors
     // (AgentEchelonTier-{Standard,Premium}), resolved at deploy from the SSM
     // contract those stacks publish (dynamic ref, not Fn::importValue).
     const standardProcessorArn = ssm.StringParameter.valueForStringParameter(
@@ -76,11 +76,11 @@ export class ChannelFlowStack extends cdk.Stack {
                 'chime:ChannelFlowCallback',
                 'chime:SendChannelMessage',
                 'chime:ListChannelMemberships',
-                // The tier decision (which assistant responds + the /battle premium
+                // The classification decision (which assistant responds + the /battle premium
                 // gate) reads the IMMUTABLE `classification` tag via ListTagsForResource,
-                // NOT mutable metadata, so a moderator cannot tamper the tier up. Without
+                // NOT mutable metadata, so a moderator cannot tamper the classification up. Without
                 // this grant the catch fails closed to 'basic'. DescribeChannel is no
-                // longer needed here (the tier no longer comes from channel metadata).
+                // longer needed here (the classification no longer comes from channel metadata).
                 'chime:ListTagsForResource',
               ],
               resources: [`${props.appInstanceArn}/*`],
@@ -109,15 +109,15 @@ export class ChannelFlowStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
               resources: [
-                // The processor resolves the channel's per-tier bot (the real
+                // The processor resolves the channel's per-classification bot (the real
                 // member) to send @all broadcasts + member counts. No shared
-                // cross-tier bot.
+                // cross-classification bot.
                 `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
             }),
           ],
         }),
-        // @all fan-out → tier standard processor; /battle fan-out → tier
+        // @all fan-out → classification standard processor; /battle fan-out → classification
         // premium processor. Both are ${STACK_PREFIX}Tier-* functions.
         LambdaInvokePolicy: new iam.PolicyDocument({
           statements: [
@@ -197,7 +197,7 @@ export class ChannelFlowStack extends cdk.Stack {
       reservedConcurrentExecutions: 50,
       role: processorRole,
       environment: {
-        // @all fan-out (standard) + /battle fan-out (premium) → tier processors,
+        // @all fan-out (standard) + /battle fan-out (premium) → classification processors,
         // resolved from SSM at deploy. lib/battle-state.ts fails open if these
         // are absent, so a partial rollout never throws at runtime.
         SSM_ROOT,

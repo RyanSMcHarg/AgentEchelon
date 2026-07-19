@@ -33,7 +33,7 @@ export class ChimeMessagingStack extends cdk.Stack {
     // AppInstanceAdmin — the identity the admin CONSOLE uses for level-2
     // moderation (manual/automated action across conversations: redact AND
     // delete; a channel moderator can only redact). This is NOT the bot layer:
-    // per-tier bots still operate as themselves for conversation work. See
+    // per-classification bots still operate as themselves for conversation work. See
     // docs/SPEC-MODERATION.md (two-level moderation model).
     const adminCreatorRole = new iam.Role(this, 'CreateAppInstanceAdminRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
