@@ -64,10 +64,10 @@ async function getAdminArn(): Promise<string | null> {
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || 'http://localhost:5173').split(',');
 
 const CLEARANCE_GROUPS = ['basic', 'standard', 'premium'] as const;
-type Tier = typeof CLEARANCE_GROUPS[number];
+type Clearance = typeof CLEARANCE_GROUPS[number];
 
 /** Make sure the user is in exactly one tier group. Idempotent. */
-async function syncTierGroup(username: string, tier: Tier): Promise<void> {
+async function syncTierGroup(username: string, tier: Clearance): Promise<void> {
   let existing: string[] = [];
   try {
     const res = await cognitoClient.send(new AdminListGroupsForUserCommand({
@@ -245,7 +245,7 @@ async function listUsers(): Promise<{ users: UserRecord[] }> {
 
 async function approveUser(username: string, tier: string): Promise<void> {
   const effectiveClearance = (CLEARANCE_GROUPS as readonly string[]).includes(tier)
-    ? (tier as Tier)
+    ? (tier as Clearance)
     : 'basic';
 
   // Set approved + tier
@@ -317,7 +317,7 @@ async function changeTier(username: string, tier: string): Promise<void> {
       { Name: 'custom:tier', Value: tier },
     ],
   }));
-  await syncTierGroup(username, tier as Tier);
+  await syncTierGroup(username, tier as Clearance);
 }
 
 /**

@@ -15,7 +15,7 @@ import { Construct } from 'constructs';
 import {
   classificationChannelScopedAllow,
   archivedChannelReadOnlyDeny,
-  Tier,
+  Classification,
   SSM_ROOT,
   STACK_PREFIX,
   RES_PREFIX,
@@ -429,7 +429,7 @@ export class CognitoAuthStack extends cdk.Stack {
       'chime:CreateChannelMembership', 'chime:DeleteChannelMembership', 'chime:CreateChannelModerator',
       'chime:UpdateChannel', 'chime:DeleteChannel',
     ];
-    type Rung = 'restricted' | Tier | 'admin';
+    type Rung = 'restricted' | Classification | 'admin';
 
     // Grant the bearer-PINNED, minimal permission set for a rung
     // (docs/SPEC-CREDENTIAL-EXCHANGE.md §5a restriction spectrum). Every rung is

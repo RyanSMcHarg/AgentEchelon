@@ -10,7 +10,7 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, ScanCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { createHash } from 'crypto';
-import type { BackendModelDefinition, BackendModelKey, ModelTier } from '../../../lib/config/model-strategy.js';
+import type { BackendModelDefinition, BackendModelKey, Classification } from '../../../lib/config/model-strategy.js';
 import { bedrockInvokeId } from '../../../lib/config/model-strategy.js';
 import { IMAGE_GEN_MODELS, type ImageGenModelKey } from './image-gen-models.js';
 import { intentTypeToRouteKey } from './model-resolver.js';
@@ -81,7 +81,7 @@ export interface Experiment {
   /** Defaults to 'intent' when absent. */
   experimentType?: ExperimentType;
   intent: string;
-  tiers: ModelTier[];
+  tiers: Classification[];
   variants: ExperimentVariant[];
   startDate: string;
   endDate?: string;
@@ -199,7 +199,7 @@ export function assignVariant(experimentId: string, channelArn: string, variants
  * and return the model to use. Returns null if no experiment applies.
  */
 export async function resolveExperimentModel(
-  tier: ModelTier,
+  tier: Classification,
   intent: string,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
@@ -245,7 +245,7 @@ export async function resolveExperimentModel(
  * the tier, so this resolution and resolveExperimentModel never both fire.
  */
 export async function resolveClassificationExperiment(
-  tier: ModelTier,
+  tier: Classification,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
 ): Promise<ExperimentResolution | null> {
@@ -269,7 +269,7 @@ export async function resolveClassificationExperiment(
  */
 function resolveVariantForProfile(
   experiment: Experiment,
-  tier: ModelTier,
+  tier: Classification,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
 ): ExperimentResolution | null {
@@ -629,7 +629,7 @@ export function validateObjective(
  */
 export async function findTypeExclusionConflicts(args: {
   experimentType: ExperimentType;
-  tiers: ModelTier[];
+  tiers: Classification[];
   excludeExperimentId?: string;
 }): Promise<Experiment[]> {
   const candidateType = args.experimentType ?? 'intent';

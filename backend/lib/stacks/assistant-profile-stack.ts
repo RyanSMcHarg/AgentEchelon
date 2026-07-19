@@ -44,7 +44,7 @@ import {
   resolveBattleSSM,
   botArnKey,
   processorArnKey,
-  Tier,
+  Classification,
   auroraDriftWiring,
   AuroraDriftHookup,
   MessageAnalyticsWiring,
@@ -121,7 +121,7 @@ export class AssistantProfileStack extends cdk.Stack {
     // The agent-tier-common helpers are typed to the built-in Tier union. The default profiles ARE
     // that union; a deployment-defined profile name would widen this (a follow-up when custom
     // profiles ship). Cast keeps the shared boundary helpers strongly typed for the shipped set.
-    const tier = topo.name as Tier;
+    const tier = topo.name as Classification;
     const modelCatalog = getModelCatalog(this.region, this.account);
     const profileModel = modelCatalog[props.profileModelSelection[topo.modelSelectionKey]];
 

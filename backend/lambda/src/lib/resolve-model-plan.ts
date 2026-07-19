@@ -17,7 +17,7 @@ import type {
   BackendModelDefinition,
   BackendModelKey,
   IntentRouteDefinition,
-  ModelTier,
+  Classification,
   ProfileModelSelection,
 } from '../../../lib/config/model-strategy.js';
 import { resolveModelForIntent } from './model-resolver.js';
@@ -48,7 +48,7 @@ export interface ModelPlan {
 }
 
 export interface RoutingContext {
-  tier: ModelTier;
+  tier: Classification;
   intent?: string;
   /** Experiment override already resolved upstream (router `resolveExperimentModel`). Rule #1. */
   experimentModelId?: string;

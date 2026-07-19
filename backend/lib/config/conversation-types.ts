@@ -24,7 +24,7 @@
  * docs/SPEC-CONVERSATION-SECURITY.md §4.
  */
 
-import type { ModelTier } from './model-strategy';
+import type { Classification } from './model-strategy';
 import type { ConnectorRef } from './connectors';
 
 /** A conversation-type key. Open-ended (string) by design — deployers add types
@@ -83,7 +83,7 @@ export interface ConversationTypeConfig {
    * `demo` could both be `basic`-classified). This is the ONLY closed/ordered
    * field; everything else is open/composable (forward-compat contract).
    */
-  classification: ModelTier;
+  classification: Classification;
   /**
    * Whether the USER-FACING live drift flow (lib/live-drift-flow.ts) runs for
    * conversations of this type. Drift is conversation-level, so its on/off is a

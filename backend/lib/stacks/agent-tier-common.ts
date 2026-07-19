@@ -20,10 +20,10 @@ import { Construct } from 'constructs';
 import type { BackendModelDefinition, BackendModelKey } from '../config/model-strategy';
 import { defaultProfileRegistry as profiles } from '../profile-registry';
 
-export type Tier = 'basic' | 'standard' | 'premium';
+export type Classification = 'basic' | 'standard' | 'premium';
 export type ClassificationModelCatalog = Record<BackendModelKey, BackendModelDefinition>;
 
-/** Tier ordering, lowest → highest. */
+/** Classification ordering, lowest → highest. */
 
 /**
  * Chime actions whose IAM resource is purely a CHANNEL (so it carries the
@@ -56,7 +56,7 @@ export const CLASSIFICATION_GATED_CHANNEL_ACTIONS = [
 /** The classification tag values a classification may act on: itself and every one below (by rank).
  *  Config-driven via the profile registry (SPEC-CAPABILITY-PROFILES) — the same at-or-below set the
  *  runtime uses for RAG scope, so the IAM boundary and retrieval scope can never drift. */
-export function classificationsAllowedFor(tier: Tier): string[] {
+export function classificationsAllowedFor(tier: Classification): string[] {
   return profiles.scopeAtOrBelow(tier);
 }
 
@@ -85,7 +85,7 @@ export function classificationsAllowedFor(tier: Tier): string[] {
  * existing ones are covered by `scripts/backfill-channel-classification-tags.mjs`.
  */
 export function classificationChannelScopedAllow(
-  tier: Tier,
+  tier: Classification,
   appInstanceArn: string,
   actions: string[] = CLASSIFICATION_GATED_CHANNEL_ACTIONS,
   opts?: {
@@ -308,7 +308,7 @@ export function abuseControlsWiring(
   scope: Construct,
   abuseControlsArn: string,
   abuseControlsName: string,
-  tier: Tier,
+  tier: Classification,
   region: string,
   account: string,
 ): { env: Record<string, string>; grant: (role: iam.IRole) => void } {
@@ -328,7 +328,7 @@ export function abuseControlsWiring(
     BEDROCK_USER_HOURLY_BUDGET: ctxNum('bedrockUserHourlyBudget'),
     BEDROCK_GLOBAL_HOURLY_BUDGET: globalBudget,
     // Rate-limit ceiling moved to the profile config (profiles.ts rateLimitPerHour), read at runtime
-    // by the router — no longer a per-tier env var / -c rateLimit<Tier> knob.
+    // by the router — no longer a per-tier env var / -c rateLimit<Classification> knob.
     // Inbound length cap. Defaulted generously (16000 chars ~ 4k tokens) rather than CH's 2000:
     // CH is a portfolio widget, AE is an enterprise assistant where report/extraction prompts and
     // pasted content are legitimately long, so a 2000 cap would degrade real use (superset tenet).
@@ -387,10 +387,10 @@ export function adminErrorAlertWiring(
  * and the tier's own handler/processor. There is no shared-bot key; every tier
  * owns its own bot.
  */
-export function botArnKey(tier: Tier): string {
+export function botArnKey(tier: Classification): string {
   return `${SSM_ROOT}/assistant/${tier}/bot-arn`;
 }
-export function processorArnKey(tier: Tier): string {
+export function processorArnKey(tier: Classification): string {
   return `${SSM_ROOT}/assistant/${tier}/processor-arn`;
 }
 
@@ -461,7 +461,7 @@ export function resolveBattleSSM(scope: Construct): {
  * models only — image-gen ARNs are hardcoded inline in Premium since they
  * are premium-exclusive).
  */
-export function modelArnsForClassification(tier: Tier, catalog: ClassificationModelCatalog): string[] {
+export function modelArnsForClassification(tier: Classification, catalog: ClassificationModelCatalog): string[] {
   const arns: string[] = [];
   for (const model of Object.values(catalog)) {
     if (model.allowedClassifications.includes(tier)) {
@@ -497,7 +497,7 @@ export const CHANNEL_FLOW_ARN_SSM_KEY = `${SSM_ROOT}/channel-flow-arn`;
  *   stays intact even though the handler can now create channels.
  */
 export function driftChannelCreateStatements(
-  tier: Tier,
+  tier: Classification,
   appInstanceArn: string,
   region: string,
   account: string,
@@ -601,7 +601,7 @@ export function wireMessageAnalytics(
  */
 export function auroraDriftWiring(
   scope: Construct,
-  _tier: Tier,
+  _tier: Classification,
   hookup: AuroraDriftHookup,
 ): {
   env: Record<string, string>;

@@ -14,13 +14,13 @@ import type {
   BackendModelKey,
   RouteKey,
   IntentRouteDefinition,
-  ModelTier,
+  Classification,
   ProfileModelSelection,
 } from '../../../lib/config/model-strategy.js';
 import { bedrockInvokeId } from '../../../lib/config/model-strategy.js';
 
 // Re-export for convenience
-export type { BackendModelKey, ModelTier };
+export type { BackendModelKey, Classification };
 
 /**
  * Map from coarse IntentType (classifier output) to fine-grained RouteKey
@@ -77,7 +77,7 @@ export interface ModelResolution {
  */
 export function resolveModelForIntent(
   intent: string | undefined,
-  tier: ModelTier,
+  tier: Classification,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
   strategy: IntentRouteDefinition[],
   profileDefaults: ProfileModelSelection,
@@ -201,7 +201,7 @@ export function visionRejectMessage(modelKey: string): string {
  * Used by CDK to generate IAM policies from the catalog rather than hardcoding.
  */
 export function collectArnsForTier(
-  tier: ModelTier,
+  tier: Classification,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
 ): string[] {
   const arns: string[] = [];

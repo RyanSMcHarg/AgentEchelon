@@ -1,4 +1,4 @@
-export type ModelTier = 'basic' | 'standard' | 'premium';
+export type Classification = 'basic' | 'standard' | 'premium';
 export type ProviderKey = 'anthropic' | 'amazon' | 'openai' | 'deepseek';
 export type BackendModelKey =
   | 'haiku'
@@ -24,7 +24,7 @@ export interface BackendModelDefinition {
   bedrockModelId: string;
   foundationModelArns: string[];
   inferenceProfileArns?: string[];
-  allowedClassifications: ModelTier[];
+  allowedClassifications: Classification[];
   strengths: string[];
   costClass: 'low' | 'medium' | 'high';
   latencyClass: 'fast' | 'balanced' | 'deep';
@@ -54,7 +54,7 @@ export interface IntentRouteDefinition {
   label: string;
   primaryModel: BackendModelKey;
   fallbackModel: BackendModelKey;
-  preferredClearance: ModelTier;
+  preferredClearance: Classification;
   rationale: string;
 }
 
@@ -257,12 +257,12 @@ export const DEFAULT_PROFILE_MODEL_SELECTION: ProfileModelSelection = {
 };
 
 export function parseProfileModelSelection(
-  requested: Partial<Record<ModelTier, string | undefined>>,
+  requested: Partial<Record<Classification, string | undefined>>,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
 ): ProfileModelSelection {
   const selection: ProfileModelSelection = { ...DEFAULT_PROFILE_MODEL_SELECTION };
 
-  for (const tier of Object.keys(selection) as ModelTier[]) {
+  for (const tier of Object.keys(selection) as Classification[]) {
     const requestedKey = requested[tier] as BackendModelKey | undefined;
     if (!requestedKey) continue;
 

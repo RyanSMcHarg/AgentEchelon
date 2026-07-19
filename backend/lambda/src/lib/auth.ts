@@ -18,7 +18,7 @@ import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 
 /** The four Cognito groups, most-privileged first. */
 export const CLASSIFICATION_ORDER = ['admins', 'premium', 'standard', 'basic'] as const;
-export type Tier = (typeof CLASSIFICATION_ORDER)[number];
+export type Classification = (typeof CLASSIFICATION_ORDER)[number];
 
 export interface AuthorizedClaims {
   /** Cognito user sub (UUID). */
@@ -26,7 +26,7 @@ export interface AuthorizedClaims {
   /** Email if present in claims (premium+admin pools typically have it). */
   email: string | null;
   /** Most-privileged group the user holds. */
-  tier: Tier | 'unknown';
+  tier: Classification | 'unknown';
   /** All groups the user holds. */
   groups: string[];
 }
@@ -68,7 +68,7 @@ export function extractClaims(event: APIGatewayProxyEvent): AuthorizedClaims | n
 
   const groups = parseGroups(claims['cognito:groups']);
 
-  const tier = (CLASSIFICATION_ORDER.find((t) => groups.includes(t)) as Tier) || 'unknown';
+  const tier = (CLASSIFICATION_ORDER.find((t) => groups.includes(t)) as Classification) || 'unknown';
 
   return {
     sub,
@@ -259,7 +259,7 @@ export function requireAuth(
  */
 export function requireGroup(
   event: APIGatewayProxyEvent,
-  group: Tier,
+  group: Classification,
 ): { claims: AuthorizedClaims } | APIGatewayProxyResult {
   const auth = requireAuth(event);
   if ('statusCode' in auth) return auth;
