@@ -22,13 +22,29 @@ plane is not. This spec closes that gap, and grounds the boundaries in real pers
 
 ## 2. Personas
 
-- **IT super admin.** Platform operator and security owner. The break-glass, full-access level.
+- **Platform admin.** Platform operator and security owner. The break-glass, full-access level.
 - **Platform developer.** Builds and debugs AgentEchelon itself. Needs technical telemetry and the
   raw event structure; does not need customer message bodies by default (scoped, opt-in, audited).
 - **AI developer.** Builds and tunes the assistants. Needs quality signals (intent, evaluations,
   tools, model, drift, ground truth) and prompt/reply pairs, scoped to the assistants and tiers they own.
 - **Manager.** Monitors the use case: interactions between their team and customers. Needs the
-  conversation content and moderation for their scope, and none of the platform internals or config.
+  conversation content and the redact (moderation-level) capability for their scope, and none of the
+  platform internals or config.
+
+> **Implementer note - these are a starting point, not a prescription.** The four personas above, the
+> capabilities each holds (section 4), and the `Scoped` boundaries are all **deployment choices**.
+> Deployers should **review them and define their own roles** for their organization; nothing here
+> ships enabled as a default.
+>
+> **Scope can and should be tightened further, in many places.** IAM capability gating is one layer,
+> not the whole story. Beyond it, restrict access by: exposing only **purpose-built, minimal views**
+> (for example a redacted or aggregate view rather than raw message content) so a role sees only what
+> it needs; requiring **peer approval and a recorded request, based on demonstrated need**, before
+> sensitive access is granted (the just-in-time, requested-recorded-temporary model in
+> [`SPEC-ADMIN-IDENTITY.md`](SPEC-ADMIN-IDENTITY.md) section 10, plus the archive proof-of-need decrypt
+> gate); **time-boxing** and auto-expiring elevated access; and **separating duties** so the role that
+> grants access is not the role that uses it. Treat this matrix as the ceiling to narrow, not the
+> access to hand out.
 
 ## 3. Data-access matrix (this drives the design)
 
@@ -45,7 +61,7 @@ The credential exchange vends these as `chime:*` session policies (`credential-e
 `CAPABILITY_ACTIONS`), so a plane role whose policy omits the action is denied. This is the model
 section 6 extends.
 
-| ID | Data / action | Source | IAM action(s) | Sens. | IT super | Plat dev | AI dev | Mgr |
+| ID | Data / action | Source | IAM action(s) | Sens. | Plat admin | Plat dev | AI dev | Mgr |
 |---|---|---|---|---|---|---|---|---|
 | C1 | Live channel messages (current, non-deleted) | Chime | `chime:GetChannelMessage`, `chime:ListChannelMessages` | High | Full | Scoped | Scoped | Scoped |
 | C2 | Channel description (name, mode, privacy) | Chime | `chime:DescribeChannel` | Low | Full | Full | Scoped | Scoped |
@@ -64,7 +80,7 @@ conversation-list discovery), which is out of scope for this admin-channel table
 Today group-gated (`callerIsAdmin` / `callerCanReadArchive`), NOT IAM. The IAM-action column is the
 target `execute-api:Invoke` resource (section 6); wiring it is the work this spec proposes.
 
-| ID | Data | Source | Target IAM action | Sens. | IT super | Plat dev | AI dev | Mgr |
+| ID | Data | Source | Target IAM action | Sens. | Plat admin | Plat dev | AI dev | Mgr |
 |---|---|---|---|---|---|---|---|---|
 | A1 | Conversation list (channels, tiers, counts) | Aurora + Athena | `execute-api` `POST /admin/conversations` | Low | Full | Full | Scoped | Scoped |
 | A2 | Message content, full history incl. redacted/deleted (PII) | Aurora + Athena | `execute-api` `GET /admin/messages` | High | Full | Scoped | Scoped | Scoped |
@@ -106,7 +122,7 @@ never loosens a per-row denial). Where that intersection is coarser than a perso
 the capability finer (section 12.1); this is why the PII row A13 is its own capability rather than
 bundled into analytics.
 
-| Capability | Rows | Enforcement | IT super | Plat dev | AI dev | Mgr |
+| Capability | Rows | Enforcement | Plat admin | Plat dev | AI dev | Mgr |
 |---|---|---|---|---|---|---|
 | `view` (live channel) | C1-C4 | `chime:*` (existing key) | Full | Scoped | Scoped | Scoped |
 | `redact` | C5 | `chime:RedactChannelMessage` (existing) | Full | None | None | Scoped |
