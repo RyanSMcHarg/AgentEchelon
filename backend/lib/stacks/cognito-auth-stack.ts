@@ -13,7 +13,7 @@ import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
 import {
-  tierChannelScopedAllow,
+  classificationChannelScopedAllow,
   archivedChannelReadOnlyDeny,
   Tier,
   SSM_ROOT,
@@ -462,7 +462,7 @@ export class CognitoAuthStack extends cdk.Stack {
         }));
         // SPEC-CONVERSATION-ARCHIVE (ADR-017): archived channels are read-only for
         // every CHAT-plane identity — including the admin's own chat identity here
-        // (the tier rungs get this Deny via tierChannelScopedAllow). The exemption is
+        // (the tier rungs get this Deny via classificationChannelScopedAllow). The exemption is
         // the SEPARATE admin-PLANE role (`exchangeRoleAdminPlane`, built directly, not
         // via this helper) + the app-instance-admin bearer the archive Lambda uses; a
         // Deny is global for the principal, so scoping it to `archived=true` leaves
@@ -475,7 +475,7 @@ export class CognitoAuthStack extends cdk.Stack {
       } else {
         // basic/standard/premium: tag-gated channel (≤ tier) + pinned bearer —
         // the SAME fail-closed boundary, with the bearer now pinned.
-        for (const s of tierChannelScopedAllow(rung, props.appInstanceArn, EXCHANGE_MSG_ACTIONS, {
+        for (const s of classificationChannelScopedAllow(rung, props.appInstanceArn, EXCHANGE_MSG_ACTIONS, {
           bearerResources: [PINNED_USER_ARN],
         })) role.addToPolicy(s);
       }

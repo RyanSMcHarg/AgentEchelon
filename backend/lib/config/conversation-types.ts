@@ -14,8 +14,8 @@
  * orthogonal platform concept; this registry is OUR policy layer.
  *
  * **Conversation type ≠ classification (deliberately).** The IAM Layer-1
- * channel-join boundary (`agent-tier-common.tierChannelScopedAllow` +
- * `min(userTier, channelTier)`) is fail-closed and depends on a TOTAL ORDER of
+ * channel-join boundary (`agent-tier-common.classificationChannelScopedAllow` +
+ * `min(userTier, channelClassification)`) is fail-closed and depends on a TOTAL ORDER of
  * classifications (`basic < standard < premium`). Conversation types are meant
  * to proliferate and need NOT be totally ordered (what's the order of `guest`
  * vs `engagement`?). So each type *carries* a `classification` — the small,

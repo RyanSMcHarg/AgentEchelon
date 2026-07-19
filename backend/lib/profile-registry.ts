@@ -2,7 +2,7 @@
  * Profile registry (SPEC-CAPABILITY-PROFILES §3) — the ONLY place that interprets a
  * classification tag value or maps groups to clearance. Runtime sites (channel-flow,
  * router, RAG, abuse, battle, membership-audit) migrate to read through this in Phase 1,
- * replacing hardcoded VALID_TIERS / TIER_RANK / TIER_GROUPS / minTier / isAdvancedTier.
+ * replacing hardcoded VALID_CLASSIFICATIONS / TIER_RANK / TIER_GROUPS / minTier / isAdvancedTier.
  *
  * Phase 0 guarantee: constructed from DEFAULT_PROFILES_CONFIG, every method returns the
  * SAME answer the legacy constants did — proven by profile-registry.test.ts. No behavior
@@ -40,7 +40,7 @@ export class ProfileRegistry {
   /**
    * Resolve a raw tag value to a declared classification value. Primary match wins; else an
    * alias maps onto its successor classification; else fail-closed to `failClosedTo`.
-   * Legacy equivalent: `VALID_TIERS.has(tag) ? tag : 'basic'` (getChannelTier), now with aliases.
+   * Legacy equivalent: `VALID_CLASSIFICATIONS.has(tag) ? tag : 'basic'` (getChannelClassification), now with aliases.
    */
   resolveClassification(tagValue: string | null | undefined): string {
     if (tagValue) {
@@ -87,7 +87,7 @@ export class ProfileRegistry {
 
   /**
    * RAG scope for `contextScope: 'own-rank-and-below'`: every classification value at or below the
-   * given classification's rank, ascending by rank. Legacy: the hardcoded tierScope ladders
+   * given classification's rank, ascending by rank. Legacy: the hardcoded classificationScope ladders
    * (premium -> [basic,standard,premium], standard -> [basic,standard], basic -> [basic]).
    */
   scopeAtOrBelow(classification: string): string[] {
@@ -119,7 +119,7 @@ export class ProfileRegistry {
 
   /** The MOST-restrictive (highest-rank) classification value. Note this is the opposite end from
    *  `failClosedValue` (the lowest). RAG ingestion defaults untagged content here so it is never
-   *  exposed to a lower classification (legacy `RAG_DEFAULT_TIER='premium'`, fail-closed). */
+   *  exposed to a lower classification (legacy `RAG_DEFAULT_CLASSIFICATION='premium'`, fail-closed). */
   get mostRestrictiveValue(): string {
     return this.config.classifications.reduce((hi, c) => (c.rank > hi.rank ? c : hi)).value;
   }

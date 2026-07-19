@@ -27,7 +27,7 @@ jest.mock('@aws-sdk/client-chime-sdk-messaging', () => {
   class SendChannelMessageCommand { _t = 'send'; constructor(public input: unknown) {} }
   // The handler resolves the channel's tier from the IMMUTABLE `classification`
   // tag (ListTagsForResource), NOT mutable `metadata.modelTier` — see
-  // membership-audit.ts resolveChannelTier(). So the mock must serve the tag.
+  // membership-audit.ts resolveChannelClassification(). So the mock must serve the tag.
   class ListTagsForResourceCommand { _t = 'listtags'; constructor(public input: unknown) {} }
   return {
     ChimeSDKMessagingClient: jest.fn(() => ({
@@ -130,14 +130,14 @@ describe('pure helpers', () => {
     expect(audit.classifyMember(userArn('')).kind).toBe('unknown');
   });
 
-  it('isTierViolation flags lower-on-higher only, failing safe on unknown tiers', () => {
-    expect(audit.isTierViolation('basic', 'premium')).toBe(true);
-    expect(audit.isTierViolation('standard', 'premium')).toBe(true);
-    expect(audit.isTierViolation('basic', 'standard')).toBe(true);
-    expect(audit.isTierViolation('premium', 'basic')).toBe(false);
-    expect(audit.isTierViolation('premium', 'premium')).toBe(false);
-    expect(audit.isTierViolation('basic', 'basic')).toBe(false);
-    expect(audit.isTierViolation('mystery', 'premium')).toBe(true);
+  it('isClassificationViolation flags lower-on-higher only, failing safe on unknown tiers', () => {
+    expect(audit.isClassificationViolation('basic', 'premium')).toBe(true);
+    expect(audit.isClassificationViolation('standard', 'premium')).toBe(true);
+    expect(audit.isClassificationViolation('basic', 'standard')).toBe(true);
+    expect(audit.isClassificationViolation('premium', 'basic')).toBe(false);
+    expect(audit.isClassificationViolation('premium', 'premium')).toBe(false);
+    expect(audit.isClassificationViolation('basic', 'basic')).toBe(false);
+    expect(audit.isClassificationViolation('mystery', 'premium')).toBe(true);
   });
 
   it('audits only membership create/update events', () => {

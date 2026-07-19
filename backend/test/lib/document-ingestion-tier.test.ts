@@ -5,14 +5,14 @@
  * filter (`metadata->>'tier' = ANY(scope)`) matched nothing and ALL KB content
  * was returned to ALL tiers. These pin the fail-closed contract: an explicit
  * `rag/{type}/{tier}/` segment wins; anything else defaults to the
- * most-restrictive tier (or RAG_DEFAULT_TIER) so untagged content never leaks
+ * most-restrictive tier (or RAG_DEFAULT_CLASSIFICATION) so untagged content never leaks
  * down to a lower tier. See docs/IDENTITY-AND-ACCESS-MODEL.md §8 (row 5).
  */
 import { deriveTier } from '../../lambda/src/analytics-aurora/document-ingestion';
 
 describe('deriveTier (KB per-tier gate, fail-closed)', () => {
   afterEach(() => {
-    delete process.env.RAG_DEFAULT_TIER;
+    delete process.env.RAG_DEFAULT_CLASSIFICATION;
   });
 
   it('uses an explicit tier segment: rag/{type}/{tier}/...', () => {
@@ -32,15 +32,15 @@ describe('deriveTier (KB per-tier gate, fail-closed)', () => {
     expect(deriveTier('rag/wiki/handbook/page.md')).toBe('premium');
   });
 
-  it('honors RAG_DEFAULT_TIER when set to a valid tier', () => {
-    process.env.RAG_DEFAULT_TIER = 'basic';
+  it('honors RAG_DEFAULT_CLASSIFICATION when set to a valid tier', () => {
+    process.env.RAG_DEFAULT_CLASSIFICATION = 'basic';
     expect(deriveTier('rag/wiki/onboarding.md')).toBe('basic');
     // an explicit segment still wins over the default
     expect(deriveTier('rag/wiki/premium/secret.md')).toBe('premium');
   });
 
-  it('ignores an invalid RAG_DEFAULT_TIER and stays fail-closed (premium)', () => {
-    process.env.RAG_DEFAULT_TIER = 'public';
+  it('ignores an invalid RAG_DEFAULT_CLASSIFICATION and stays fail-closed (premium)', () => {
+    process.env.RAG_DEFAULT_CLASSIFICATION = 'public';
     expect(deriveTier('rag/wiki/onboarding.md')).toBe('premium');
   });
 });

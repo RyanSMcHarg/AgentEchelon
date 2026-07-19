@@ -50,6 +50,6 @@ export function resolveFederatedTier(
 }
 
 /** The effective ceiling = the LOWER of the IdP-derived tier and the channel's classification. */
-export function classificationCeiling(idpTier: Classification, channelTier: Classification): Classification {
-  return ORDER[idpTier] <= ORDER[channelTier] ? idpTier : channelTier;
+export function classificationCeiling(idpTier: Classification, channelClassification: Classification): Classification {
+  return ORDER[idpTier] <= ORDER[channelClassification] ? idpTier : channelClassification;
 }

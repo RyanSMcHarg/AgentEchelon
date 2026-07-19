@@ -71,7 +71,7 @@ export interface ProfilesConfig {
  *  - timeoutSeconds: per-tier async processor Lambda timeout (30/60/90; tier stacks)
  *  - rateLimitPerHour: rateLimitDefaults {60,120,240} (agent-tier-common.ts)
  *  - battleEligible: allowedBattleTiers default ['premium']
- *  - failClosedTo / groupClearance: resolveUserTier + getChannelTier fail-closed to 'basic'
+ *  - failClosedTo / groupClearance: resolveUserTier + getChannelClassification fail-closed to 'basic'
  */
 export const DEFAULT_PROFILES_CONFIG: ProfilesConfig = {
   classifications: [

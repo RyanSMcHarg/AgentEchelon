@@ -282,7 +282,7 @@ function resolveVariantForTier(
   }
 
   // Enforce tier safety — experiment can't assign a model not allowed for this tier
-  if (!model.allowedTiers.includes(tier)) {
+  if (!model.allowedClassifications.includes(tier)) {
     console.warn(`[ExperimentManager] Model ${variant.modelKey} not allowed for tier ${tier}, skipping experiment`);
     return null;
   }

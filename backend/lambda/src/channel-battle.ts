@@ -269,20 +269,20 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
     return respond(404, { error: 'Channel not found or inaccessible' }, origin);
   }
   // Access confirmed above (caller could DescribeChannel). Tier comes from the tag.
-  const channelTier = await resolveChannelClassification(channelArn);
-  if (!profiles.profileFor(channelTier).battleEligible) {
+  const channelClassification = await resolveChannelClassification(channelArn);
+  if (!profiles.profileFor(channelClassification).battleEligible) {
     return respond(403, {
-      error: `Battle Mode is not available on ${channelTier}-classification channels`,
+      error: `Battle Mode is not available on ${channelClassification}-classification channels`,
       code: 'TIER_FORBIDDEN',
-      tier: channelTier,
+      tier: channelClassification,
     }, origin);
   }
   // Act as the channel's per-tier bot (its creator+member) for the alt-bot
   // membership add + announcement. Premium by default; the channel's own tier
   // when /battle is opened to other tiers.
-  const botArn = await resolveTierBotArn(channelTier);
+  const botArn = await resolveTierBotArn(channelClassification);
   if (!botArn) {
-    return respond(500, { error: `${channelTier} bot ARN not configured` }, origin);
+    return respond(500, { error: `${channelClassification} bot ARN not configured` }, origin);
   }
   // Verify against the live channel moderator list rather than
   // channel.Metadata.createdBy. The metadata is trustworthy on creation, but

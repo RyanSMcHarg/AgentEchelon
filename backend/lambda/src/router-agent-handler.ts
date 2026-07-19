@@ -42,7 +42,7 @@ import {
 import { createTask, getActiveTask, TRIP_TASK_TTL_SECONDS, type TaskCreateOptions } from './lib/task-tracking.js';
 import { checkAndConsumeBudget, budgetCannedResponse, checkRateLimit, rateLimitMessage } from './lib/abuse-controls.js';
 // SPEC-CAPABILITY-PROFILES: the single interpreter of classification tags + group clearance.
-// Replaces the local TIER_RANK / TIER_GROUPS / minTier / isAdvancedTier / tierScope constants.
+// Replaces the local TIER_RANK / TIER_GROUPS / minTier / isAdvancedTier / classificationScope constants.
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
 // Retrieval runs in the VPC-attached data-plane Lambda (project decision 018);
 // this handler stays non-VPC and invokes it via the client seam. Same signature.
@@ -94,7 +94,7 @@ const cognitoClient = new CognitoIdentityProviderClient({ region: AWS_REGION });
 // ============================================================
 
 let cachedBotArn: string | null = null;
-const channelTierCache = new Map<string, string>();
+const channelClassificationCache = new Map<string, string>();
 const userTierCache = new Map<string, { tier: string; expires: number }>();
 const USER_TIER_CACHE_TTL_MS = 5 * 60_000;
 
@@ -152,24 +152,24 @@ async function getSsmParam(name: string): Promise<string | undefined> {
   }
 }
 
-async function resolveChannelTier(channelArn: string, botArn: string): Promise<string> {
+async function resolveChannelClassification(channelArn: string, botArn: string): Promise<string> {
   // Per-tier deployment: the handler IS the tier — no discovery needed. This is the
   // LIVE topology (every tier stack sets TIER), so the tag read below is only reached
   // in a hypothetical single-handler multi-tier deployment.
   if (STATIC_TIER) return STATIC_TIER;
-  if (channelTierCache.has(channelArn)) return channelTierCache.get(channelArn)!;
+  if (channelClassificationCache.has(channelArn)) return channelClassificationCache.get(channelArn)!;
   const tier = await resolveChannelClassificationTag(channelArn);
-  channelTierCache.set(channelArn, tier);
+  channelClassificationCache.set(channelArn, tier);
   return tier;
 }
 
 /**
  * The served tier keys on the channel's IMMUTABLE `classification` TAG — the same
- * signal the IAM Layer-1 boundary enforces (agent-tier-common.tierChannelScopedAllow,
+ * signal the IAM Layer-1 boundary enforces (agent-tier-common.classificationChannelScopedAllow,
  * `aws:ResourceTag/classification`). We deliberately do NOT trust `metadata.modelTier`:
  * channel Metadata is mutable via `chime:UpdateChannel` (the owner `rename` cap), so
  * keying the served tier on it would let a channel moderator raise the tier a FEDERATED
- * user is served at (the federated path takes `userTier = channelTier` with no min-cap).
+ * user is served at (the federated path takes `userTier = channelClassification` with no min-cap).
  * The `classification` tag cannot be changed by UpdateChannel, so it is tamper-proof.
  * Fail-closed to 'basic' when the tag is absent, invalid, or unreadable.
  */
@@ -396,7 +396,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
 
   try {
     const botArn = await getBotArn();
-    const channelTier = channelArn ? await resolveChannelTier(channelArn, botArn) : 'basic';
+    const channelClassification = channelArn ? await resolveChannelClassification(channelArn, botArn) : 'basic';
 
     // Defense in depth: never trust channel metadata alone. Pull the sender's
     // real tier from Cognito group membership and use the minimum of the two.
@@ -475,14 +475,14 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     // channel tier IS authoritative for them — trust it and skip the Cognito lookup. Without
     // this, every turn downgrades to basic and the standard processor is never invoked.
     const isFederated = userSub.startsWith('fed_');
-    const userTier = isFederated ? channelTier : await resolveUserTier(userSub);
-    const tier = isFederated ? channelTier : minTier(channelTier, userTier);
+    const userTier = isFederated ? channelClassification : await resolveUserTier(userSub);
+    const tier = isFederated ? channelClassification : minTier(channelClassification, userTier);
 
-    if (!isFederated && channelTier !== userTier) {
+    if (!isFederated && channelClassification !== userTier) {
       console.warn('[Router][SecurityEvent] Tier mismatch', {
         userSub,
         channelArn,
-        channelTier,
+        channelClassification,
         userTier,
         effectiveTier: tier,
       });
@@ -496,7 +496,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
 
     console.log('[Router] Resolved', {
       tier,
-      channelTier,
+      channelClassification,
       userTier,
       asyncProcessorArn: asyncProcessorArn.split(':').pop(),
     });
@@ -900,7 +900,7 @@ async function maybeRetrieveContext(
   try {
     // Tier-scope: a classification sees content at its rank and below (own-rank-and-below),
     // the fail-closed SQL metadata filter (ADR-007). Ladder derived from config via the registry.
-    const tierScope = profiles.scopeAtOrBelow(tier);
+    const classificationScope = profiles.scopeAtOrBelow(tier);
 
     // 'company' is the tier-gated business/financial corpus (ADR-017): company
     // documents are embedded under rag/company/{tier}/ and retrieved here by
@@ -911,7 +911,7 @@ async function maybeRetrieveContext(
       query: userMessage,
       sourceTypes: ['wiki', 'doc', 'company'],
       topK: 6,
-      tierScope,
+      classificationScope,
     });
 
     // Honest empty — no matches above the similarity threshold.

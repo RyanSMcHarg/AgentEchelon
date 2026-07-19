@@ -24,7 +24,7 @@ export interface BackendModelDefinition {
   bedrockModelId: string;
   foundationModelArns: string[];
   inferenceProfileArns?: string[];
-  allowedTiers: ModelTier[];
+  allowedClassifications: ModelTier[];
   strengths: string[];
   costClass: 'low' | 'medium' | 'high';
   latencyClass: 'fast' | 'balanced' | 'deep';
@@ -125,7 +125,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0`,
       ],
-      allowedTiers: ['basic', 'standard', 'premium'],
+      allowedClassifications: ['basic', 'standard', 'premium'],
       strengths: ['fast replies', 'low-cost triage', 'simple extraction'],
       costClass: 'low',
       latencyClass: 'fast',
@@ -144,7 +144,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       inferenceProfileArns: [
         `arn:aws:bedrock:${region}:${account}:inference-profile/us.anthropic.claude-sonnet-4-6`,
       ],
-      allowedTiers: ['standard', 'premium'],
+      allowedClassifications: ['standard', 'premium'],
       strengths: ['coding tasks', 'reasoning', 'tool reliability'],
       costClass: 'medium',
       latencyClass: 'balanced',
@@ -163,7 +163,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       inferenceProfileArns: [
         `arn:aws:bedrock:${region}:${account}:inference-profile/us.anthropic.claude-opus-4-6-v1`,
       ],
-      allowedTiers: ['premium'],
+      allowedClassifications: ['premium'],
       strengths: ['deep analysis', 'complex architecture', 'high-stakes reasoning'],
       costClass: 'high',
       latencyClass: 'deep',
@@ -183,7 +183,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/amazon.nova-pro-v1:0`,
       ],
-      allowedTiers: ['standard', 'premium'],
+      allowedClassifications: ['standard', 'premium'],
       strengths: ['summaries', 'structured drafting', 'bedrock-native fallback'],
       costClass: 'medium',
       latencyClass: 'balanced',
@@ -198,7 +198,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/openai.gpt-oss-20b-1:0`,
       ],
-      allowedTiers: ['standard', 'premium'],
+      allowedClassifications: ['standard', 'premium'],
       strengths: ['low-cost coding support', 'fast drafting', 'OpenAI-on-Bedrock option'],
       costClass: 'medium',
       latencyClass: 'balanced',
@@ -213,7 +213,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/openai.gpt-oss-120b-1:0`,
       ],
-      allowedTiers: ['premium'],
+      allowedClassifications: ['premium'],
       strengths: ['deeper coding analysis', 'larger open-weight reasoning', 'OpenAI-on-Bedrock experimentation'],
       costClass: 'high',
       latencyClass: 'deep',
@@ -240,7 +240,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/deepseek.v3.2`,
       ],
-      allowedTiers: ['standard', 'premium'],
+      allowedClassifications: ['standard', 'premium'],
       strengths: ['Chinese fluency', 'strong reasoning', 'low-cost open-weight'],
       costClass: 'low',
       latencyClass: 'balanced',
@@ -270,7 +270,7 @@ export function parseTierModelSelection(
     if (!model) {
       throw new Error(`Unknown model key "${requestedKey}" for tier "${tier}"`);
     }
-    if (!model.allowedTiers.includes(tier)) {
+    if (!model.allowedClassifications.includes(tier)) {
       throw new Error(`Model "${requestedKey}" is not allowed for tier "${tier}"`);
     }
 

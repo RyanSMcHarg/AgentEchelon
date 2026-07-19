@@ -18,7 +18,7 @@ describe('profile-registry (default config = legacy behavior)', () => {
     expect(reg.resolveClassification('basic')).toBe('basic');
     expect(reg.resolveClassification('standard')).toBe('standard');
     expect(reg.resolveClassification('premium')).toBe('premium');
-    expect(reg.resolveClassification('bogus')).toBe('basic'); // legacy VALID_TIERS fail-closed
+    expect(reg.resolveClassification('bogus')).toBe('basic'); // legacy VALID_CLASSIFICATIONS fail-closed
     expect(reg.resolveClassification('')).toBe('basic');
     expect(reg.resolveClassification(null)).toBe('basic');
     expect(reg.resolveClassification(undefined)).toBe('basic');
@@ -48,7 +48,7 @@ describe('profile-registry (default config = legacy behavior)', () => {
     expect(reg.clearanceForGroups(['admins'])).toBe('basic'); // 'admins' not a clearance group (legacy)
   });
 
-  it('scopeAtOrBelow reproduces the hardcoded tierScope ladders', () => {
+  it('scopeAtOrBelow reproduces the hardcoded classificationScope ladders', () => {
     expect(reg.scopeAtOrBelow('premium')).toEqual(['basic', 'standard', 'premium']);
     expect(reg.scopeAtOrBelow('standard')).toEqual(['basic', 'standard']);
     expect(reg.scopeAtOrBelow('basic')).toEqual(['basic']);

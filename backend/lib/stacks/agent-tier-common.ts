@@ -21,7 +21,7 @@ import type { BackendModelDefinition, BackendModelKey } from '../config/model-st
 import { defaultProfileRegistry as profiles } from '../profile-registry';
 
 export type Tier = 'basic' | 'standard' | 'premium';
-export type TierModelCatalog = Record<BackendModelKey, BackendModelDefinition>;
+export type ClassificationModelCatalog = Record<BackendModelKey, BackendModelDefinition>;
 
 /** Tier ordering, lowest → highest. */
 
@@ -40,7 +40,7 @@ export type TierModelCatalog = Record<BackendModelKey, BackendModelDefinition>;
  *   model + the app-layer share/create gates. (ListChannelMemberships IS
  *   channel-scoped, so it stays here.)
  */
-export const TIER_GATED_CHANNEL_ACTIONS = [
+export const CLASSIFICATION_GATED_CHANNEL_ACTIONS = [
   'chime:SendChannelMessage',
   'chime:UpdateChannelMessage',
   'chime:RedactChannelMessage',
@@ -84,10 +84,10 @@ export function classificationsAllowedFor(tier: Tier): string[] {
  * every legitimate channel MUST be tagged; new channels are tagged at creation and
  * existing ones are covered by `scripts/backfill-channel-classification-tags.mjs`.
  */
-export function tierChannelScopedAllow(
+export function classificationChannelScopedAllow(
   tier: Tier,
   appInstanceArn: string,
-  actions: string[] = TIER_GATED_CHANNEL_ACTIONS,
+  actions: string[] = CLASSIFICATION_GATED_CHANNEL_ACTIONS,
   opts?: {
     /**
      * Override the BEARER resources (statement 2). Default is the unconditioned
@@ -158,7 +158,7 @@ export const ARCHIVE_DENIED_ACTIONS = new Set<string>([
  * NEVER attach this to the admin plane / app-instance-admin bearer: that
  * principal posts the archive system message and must stay exempt. A Deny is
  * global for the principal, so it is scoped to `archived=true` channels only and
- * affects no other channel. `tierChannelScopedAllow` attaches it automatically
+ * affects no other channel. `classificationChannelScopedAllow` attaches it automatically
  * for any send/update grant; the admin rung does not go through that function,
  * so it is exempt by construction.
  */
@@ -270,7 +270,7 @@ export const SHARED_SSM = {
   battleOrchestratorArn: `${SSM_ROOT}/shared/battle-orchestrator-arn`,
   // Cognito user-pool id — standard/premium tiers run the per-tier handler
   // (router code) which does per-message tier enforcement (min(senderTier,
-  // channelTier)) via AdminListGroupsForUser.
+  // channelClassification)) via AdminListGroupsForUser.
   cognitoUserPoolId: `${SSM_ROOT}/shared/cognito-user-pool-id`,
   // Aurora data-plane Lambda ARN. Published by AgentEchelonAnalyticsAurora;
   // consumed at RUNTIME (not deploy — that would be a circular stack dependency,
@@ -461,10 +461,10 @@ export function resolveBattleSSM(scope: Construct): {
  * models only — image-gen ARNs are hardcoded inline in Premium since they
  * are premium-exclusive).
  */
-export function modelArnsForTier(tier: Tier, catalog: TierModelCatalog): string[] {
+export function modelArnsForClassification(tier: Tier, catalog: ClassificationModelCatalog): string[] {
   const arns: string[] = [];
   for (const model of Object.values(catalog)) {
-    if (model.allowedTiers.includes(tier)) {
+    if (model.allowedClassifications.includes(tier)) {
       arns.push(...model.foundationModelArns);
       if (model.inferenceProfileArns) arns.push(...model.inferenceProfileArns);
     }
@@ -492,7 +492,7 @@ export const CHANNEL_FLOW_ARN_SSM_KEY = `${SSM_ROOT}/channel-flow-arn`;
  *   role — they either target a not-yet-existing channel or authorize against the
  *   user resource, so they can't be channel-tag-gated.
  * - `SendChannelMessage` is granted SEPARATELY and TAG-GATED via
- *   `tierChannelScopedAllow`, so the handler can message the new (own-classification)
+ *   `classificationChannelScopedAllow`, so the handler can message the new (own-classification)
  *   channel but NEVER a higher-tier one. The deny-tested Layer-1 send boundary
  *   stays intact even though the handler can now create channels.
  */
@@ -523,7 +523,7 @@ export function driftChannelCreateStatements(
     // and below), NOT app-wide, so the handler can't message a higher-tier channel.
     // Bearer pinned to bots only (the handler sends AS the tier bot, never as a
     // user).
-    ...tierChannelScopedAllow(tier, appInstanceArn, ['chime:SendChannelMessage'], {
+    ...classificationChannelScopedAllow(tier, appInstanceArn, ['chime:SendChannelMessage'], {
       bearerResources: [`${appInstanceArn}/bot/*`],
     }),
     new iam.PolicyStatement({

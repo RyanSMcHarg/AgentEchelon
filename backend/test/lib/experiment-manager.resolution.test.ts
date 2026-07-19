@@ -132,10 +132,10 @@ describe('resolveExperimentModel — type ordering', () => {
 
   it('skips a model the tier may not use (tier safety)', async () => {
     // Config-driven: pick a model the 'standard' tier is NOT allowed to use per the actual
-    // catalog (allowedTiers), rather than hardcoding a model presumed premium-only. A standard
+    // catalog (allowedClassifications), rather than hardcoding a model presumed premium-only. A standard
     // experiment pinning that model must be skipped.
     const restrictedKey = Object.keys(catalog).find(
-      (k) => !catalog[k as keyof typeof catalog].allowedTiers.includes('standard'),
+      (k) => !catalog[k as keyof typeof catalog].allowedClassifications.includes('standard'),
     );
     if (!restrictedKey) throw new Error('tier-safety test needs a model not allowed for the standard tier');
     mockSend.mockResolvedValueOnce({

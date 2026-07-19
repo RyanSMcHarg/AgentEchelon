@@ -72,7 +72,7 @@ describe('retrieveContext', () => {
     const { retrieveContext } = await import('../../lambda/src/analytics-aurora/document-retrieval');
     await retrieveContext({
       query: 'deploy',
-      tierScope: ['basic', 'standard'],
+      classificationScope: ['basic', 'standard'],
     });
 
     const [sql, params] = mockDbQuery.mock.calls[0];
@@ -81,7 +81,7 @@ describe('retrieveContext', () => {
     expect(params[2]).toEqual(['basic', 'standard']);
   });
 
-  it('omits tier filter clause when tierScope is not provided', async () => {
+  it('omits tier filter clause when classificationScope is not provided', async () => {
     mockEmbedSuccess();
     mockDbQuery.mockResolvedValueOnce(mockRows([]));
     const { retrieveContext } = await import('../../lambda/src/analytics-aurora/document-retrieval');

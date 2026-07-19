@@ -344,7 +344,7 @@ const notificationStack = new NotificationStack(app, `${STACK_PREFIX}Notificatio
 // 7. (removed) The per-tier IAMPolicies stack was inert scaffolding — its policies gated on
 // aws:PrincipalTag/tier (never populated) with a non-IAM `chime-sdk-messaging:` action prefix, and
 // were attached to no principal. The LIVE Layer-1 boundary is aws:ResourceTag/classification on the
-// per-tier processor + credential-exchange roles (agent-tier-common.tierChannelScopedAllow); the
+// per-tier processor + credential-exchange roles (agent-tier-common.classificationChannelScopedAllow); the
 // model allowlist is the processor role's own Bedrock grant. Deleted per SPEC-CAPABILITY-PROFILES §D-2.
 
 // 8b. Per-tier stacks (docs/SPEC-PER-TIER-OWNERSHIP.md, ADR-011) — each tier is

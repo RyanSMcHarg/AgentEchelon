@@ -89,11 +89,11 @@ export function classifyMember(
 
 /** Pure: is the member's tier below the channel's classification? Unknown tiers fail safe
  *  (member defaults to the lowest rank, channel to `basic`). */
-export function isTierViolation(memberTier: string, channelTier: string): boolean {
+export function isClassificationViolation(memberTier: string, channelClassification: string): boolean {
   // Unknown member clearance ranks BELOW everything (0) so it always over-reports (fail-safe);
   // unknown channel classification defaults to the fail-closed floor. Ranks come from the registry.
   const m = profiles.isKnownClassification(memberTier) ? profiles.rank(memberTier) : 0;
-  const c = profiles.isKnownClassification(channelTier) ? profiles.rank(channelTier) : profiles.rank(profiles.failClosedValue);
+  const c = profiles.isKnownClassification(channelClassification) ? profiles.rank(channelClassification) : profiles.rank(profiles.failClosedValue);
   return m < c;
 }
 
@@ -122,7 +122,7 @@ async function isEnforcing(): Promise<boolean> {
 
 /** Persist each finding so the admin dashboard can review it and take manual action. Best-effort. */
 async function writeFinding(f: {
-  kind: string; channelArn: string; memberArn: string; subjectTier: string; channelTier: string; action: string;
+  kind: string; channelArn: string; memberArn: string; subjectTier: string; channelClassification: string; action: string;
 }): Promise<void> {
   if (!ddb) return;
   const ts = new Date().toISOString();
@@ -166,9 +166,9 @@ async function resolveMemberTier(sub: string): Promise<string | null> {
 // The channel's tier for the violation comparison comes from the IMMUTABLE
 // `classification` tag, NOT `metadata.modelTier`. Reading mutable metadata here would let a
 // moderator who adds an over-tier assistant also tamper `modelTier` up to match it, blinding
-// this detector (botTier > channelTier would go false). The tag cannot be changed by
+// this detector (botTier > channelClassification would go false). The tag cannot be changed by
 // UpdateChannel. Fail-closed to basic so an unreadable tag over-reports rather than misses.
-async function resolveChannelTier(channelArn: string, _bearerArn: string): Promise<string> {
+async function resolveChannelClassification(channelArn: string, _bearerArn: string): Promise<string> {
   try {
     const resp = await chime.send(new ListTagsForResourceCommand({ ResourceARN: channelArn }));
     const tag = (resp.Tags || []).find((t) => t.Key === 'classification')?.Value;
@@ -241,7 +241,7 @@ async function handleViolation(
   memberArn: string,
   subjectId: string,
   subjectTier: string,
-  channelTier: string,
+  channelClassification: string,
 ): Promise<void> {
   const adminArn = await getAdminArn();
   const enforcing = await isEnforcing();
@@ -252,19 +252,19 @@ async function handleViolation(
     memberArn,
     subject: subjectId,
     subjectTier,
-    channelTier,
+    channelClassification,
     action: enforcing ? 'revoked' : 'reported',
   });
-  await writeFinding({ kind, channelArn, memberArn, subjectTier, channelTier, action: enforcing ? 'revoked' : 'reported' });
+  await writeFinding({ kind, channelArn, memberArn, subjectTier, channelClassification, action: enforcing ? 'revoked' : 'reported' });
 
   const verb = enforcing ? 'was removed from' : 'was found on';
   const tail = enforcing
     ? 'The membership has been revoked.'
     : 'Enforcement is off; the membership was left in place. Flip the enforce toggle in the admin dashboard (or set MEMBERSHIP_AUDIT_ENFORCE) to auto-revoke.';
   const text =
-    `Security audit: a ${subjectTier}-tier ${noun} ${verb} a ${channelTier}-tier conversation.\n` +
+    `Security audit: a ${subjectTier}-tier ${noun} ${verb} a ${channelClassification}-tier conversation.\n` +
     `Channel: ${channelArn}\n${kind === 'assistant' ? 'Assistant' : 'Member'}: ${memberArn}\n${tail}`;
-  await alertAdmins(adminArn, text, `[Security] Over-tier ${noun} on a ${channelTier} conversation`);
+  await alertAdmins(adminArn, text, `[Security] Over-tier ${noun} on a ${channelClassification} conversation`);
 
   if (!enforcing) return;
   try {
@@ -309,9 +309,9 @@ export async function handler(event: KinesisStreamEvent, _context?: Context): Pr
         // A human BELOW the channel's tier is the leak (they would see content above their clearance).
         const memberTier = await resolveMemberTier(sub);
         if (!memberTier) continue; // unresolvable identity — skip
-        const channelTier = await resolveChannelTier(channelArn, adminArn);
-        if (isTierViolation(memberTier, channelTier)) {
-          await handleViolation('member', channelArn, memberArn, sub, memberTier, channelTier);
+        const channelClassification = await resolveChannelClassification(channelArn, adminArn);
+        if (isClassificationViolation(memberTier, channelClassification)) {
+          await handleViolation('member', channelArn, memberArn, sub, memberTier, channelClassification);
         }
       } else if (kind === 'bot') {
         // An assistant ABOVE the channel's tier is the leak: it answers with its own tier's model
@@ -320,13 +320,13 @@ export async function handler(event: KinesisStreamEvent, _context?: Context): Pr
         // `/battle` alt-slot) is left alone.
         const botTier = await resolveBotTier(memberArn);
         if (!botTier) continue;
-        const channelTier = await resolveChannelTier(channelArn, adminArn);
+        const channelClassification = await resolveChannelClassification(channelArn, adminArn);
         // Over-tier assistant: its classification ranks ABOVE the channel's. Unknown bot ranks 0,
-        // unknown channel the fail-closed floor — same fail-safe direction as isTierViolation.
+        // unknown channel the fail-closed floor — same fail-safe direction as isClassificationViolation.
         const botRank = profiles.isKnownClassification(botTier) ? profiles.rank(botTier) : 0;
-        const chRank = profiles.isKnownClassification(channelTier) ? profiles.rank(channelTier) : profiles.rank(profiles.failClosedValue);
+        const chRank = profiles.isKnownClassification(channelClassification) ? profiles.rank(channelClassification) : profiles.rank(profiles.failClosedValue);
         if (botRank > chRank) {
-          await handleViolation('assistant', channelArn, memberArn, botTier, botTier, channelTier);
+          await handleViolation('assistant', channelArn, memberArn, botTier, botTier, channelClassification);
         }
       }
     } catch (err) {

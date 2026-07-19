@@ -35,9 +35,9 @@ import { BattleImageGuardrails } from '../constructs/battle-image-guardrails';
 import { getModelCatalog, TierModelSelection } from '../config/model-strategy';
 import { defaultProfileRegistry } from '../profile-registry';
 import {
-  tierChannelScopedAllow,
+  classificationChannelScopedAllow,
   classificationsAllowedFor,
-  modelArnsForTier,
+  modelArnsForClassification,
   resolveSharedSSM,
   adminErrorAlertWiring,
   abuseControlsWiring,
@@ -147,7 +147,7 @@ export class AssistantProfileStack extends cdk.Stack {
           ]
         : [];
     }
-    const tierModelArns = [...modelArnsForTier(tier, modelCatalog), ...cnBedrockArns];
+    const tierModelArns = [...modelArnsForClassification(tier, modelCatalog), ...cnBedrockArns];
 
     const shared = resolveSharedSSM(this);
     const errAlert = adminErrorAlertWiring(this, props.appInstanceArn, props.adminErrorAlertChannelArn);
@@ -172,7 +172,7 @@ export class AssistantProfileStack extends cdk.Stack {
         // act ONLY on channels tagged classification ∈ {this profile's rank and below}. Untagged / a
         // higher classification → no Allow → implicit deny (a tagging gap never silently grants access).
         ChimePolicy: new iam.PolicyDocument({
-          statements: tierChannelScopedAllow(tier, props.appInstanceArn, [
+          statements: classificationChannelScopedAllow(tier, props.appInstanceArn, [
             'chime:SendChannelMessage',
             'chime:ListChannelMessages',
             'chime:GetChannelMessage',
@@ -511,7 +511,7 @@ export class AssistantProfileStack extends cdk.Stack {
         // The handler only READS channel classification metadata + member count; it does not send.
         ChimePolicy: new iam.PolicyDocument({
           statements: [
-            ...tierChannelScopedAllow(tier, props.appInstanceArn, ['chime:DescribeChannel', 'chime:ListChannelMemberships'], { bearerResources: [`${props.appInstanceArn}/bot/*`] }),
+            ...classificationChannelScopedAllow(tier, props.appInstanceArn, ['chime:DescribeChannel', 'chime:ListChannelMemberships'], { bearerResources: [`${props.appInstanceArn}/bot/*`] }),
             // Read the immutable `classification` tag to resolve the served profile. A tag-READ cannot
             // itself be gated (it is how the profile is learned) — read-only, discloses only the tag.
             new iam.PolicyStatement({ actions: ['chime:ListTagsForResource'], resources: [`${props.appInstanceArn}/channel/*`] }),

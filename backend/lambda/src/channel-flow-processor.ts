@@ -91,7 +91,7 @@ const NOTIFY_ALLOWED_POOL_IDS = (process.env.NOTIFY_ALLOWED_POOL_IDS || '')
 // (chime:UpdateChannel), so a moderator could tamper it up to make a higher-tier
 // assistant respond or open premium battles on a lower-tier channel. The tag cannot be
 // changed by UpdateChannel. Fail-closed to basic. (bearerArn is unused for a tag read.)
-async function getChannelTier(channelArn: string, _bearerArn: string): Promise<string> {
+async function getChannelClassification(channelArn: string, _bearerArn: string): Promise<string> {
   try {
     const resp = await messagingClient.send(
       new ListTagsForResourceCommand({ ResourceARN: channelArn }),
@@ -257,8 +257,8 @@ export async function handler(event: ChannelFlowEvent): Promise<void> {
   // per-tier bot can read the channel and send. Tier is read as the SENDER (a
   // member); for a /battle channel that
   // resolves to the premium bot, the correct default combatant.
-  const channelTier = await getChannelTier(channelArn, senderArn);
-  const botArn = await resolveTierBotArn(channelTier);
+  const channelClassification = await getChannelClassification(channelArn, senderArn);
+  const botArn = await resolveTierBotArn(channelClassification);
 
   // ═══════════════════════════════════════════════════════════════
   // /battle continuation: a reply Target-addressed to a bot that is
@@ -744,9 +744,9 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
 
   // 1. Tier gate. Resolve tier from the immutable `classification` tag (not mutable
   //    metadata) so a tampered modelTier cannot open premium battles on a lower channel.
-  const channelTier = await getChannelTier(channelArn, defaultBotArn);
+  const channelClassification = await getChannelClassification(channelArn, defaultBotArn);
 
-  if (channelTier !== 'premium') {
+  if (channelClassification !== 'premium') {
     await sendBotMessage(
       channelArn,
       defaultBotArn,

@@ -49,7 +49,7 @@ export interface CompanyDoc {
 
 export interface CompanyContextResult {
   documentCount: number;
-  tiersAccessible: Array<CompanyDoc['tier']>;
+  classificationsAccessible: Array<CompanyDoc['tier']>;
   documents: CompanyDoc[];
 }
 
@@ -131,7 +131,7 @@ async function loadDocsFromPrefixes(
   }
   return {
     documentCount: docs.length,
-    tiersAccessible: Array.from(new Set(docs.map((d) => d.tier))),
+    classificationsAccessible: Array.from(new Set(docs.map((d) => d.tier))),
     documents: docs,
   };
 }

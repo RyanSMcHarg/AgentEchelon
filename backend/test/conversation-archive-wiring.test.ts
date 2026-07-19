@@ -60,7 +60,7 @@ describe('archived read-only IAM Deny (CognitoAuth)', () => {
 
   it('denies Send/Update on archived channels across the chat-plane exchange roles', () => {
     const denies = allStatements(cognitoTemplate()).filter(isArchivedDeny);
-    // One per tier rung (basic/standard/premium via tierChannelScopedAllow) + the
+    // One per tier rung (basic/standard/premium via classificationChannelScopedAllow) + the
     // restricted/admin chat rung. So multiple — assert it is present and covers
     // BOTH message-write actions.
     expect(denies.length).toBeGreaterThanOrEqual(2);

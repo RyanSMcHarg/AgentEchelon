@@ -54,7 +54,7 @@ export interface RetrieveContextInput {
    * metadata.tier is in this list (or has no tier set, treated as
    * available to all). Implements ADR-007 (KB permission filters).
    */
-  tierScope?: string[];
+  classificationScope?: string[];
 }
 
 export interface RetrievedChunk {
@@ -111,13 +111,13 @@ export async function retrieveContext(
   // content to ALL tiers. Ingestion now stamps `tier` (document-ingestion.ts,
   // fail-closed default); legacy rows written before that must be re-ingested
   // (re-put the S3 object under `rag/`) to become visible again.
-  const tierClause = input.tierScope && input.tierScope.length > 0
+  const tierClause = input.classificationScope && input.classificationScope.length > 0
     ? `AND metadata->>'tier' = ANY($3::text[])`
     : '';
 
   const params: unknown[] = [vectorLiteral, sourceTypes];
-  if (input.tierScope && input.tierScope.length > 0) {
-    params.push(input.tierScope);
+  if (input.classificationScope && input.classificationScope.length > 0) {
+    params.push(input.classificationScope);
   }
 
   const result = await query<{

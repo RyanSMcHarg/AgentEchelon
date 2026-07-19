@@ -1292,12 +1292,12 @@ export async function invokeBedrock(
           payload = { error: err instanceof Error ? err.message : 'tool execution failed' };
         }
         // Observability: which tool the model chose and what it returned (documentCount +
-        // tiersAccessible for the context tools). Tool decisions previously lived only in
+        // classificationsAccessible for the context tools). Tool decisions previously lived only in
         // the analytics steps; this makes them visible in the Lambda logs for diagnosis.
         console.log('[AsyncProcessor] tool call', {
           tool: toolUse.name,
           documentCount: (payload as { documentCount?: number }).documentCount,
-          tiersAccessible: (payload as { tiersAccessible?: unknown }).tiersAccessible,
+          classificationsAccessible: (payload as { classificationsAccessible?: unknown }).classificationsAccessible,
           error: (payload as { error?: string }).error,
         });
         const toolError = (payload as { error?: string }).error;

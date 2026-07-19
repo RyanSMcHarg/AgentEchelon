@@ -64,7 +64,7 @@ function deriveSourceType(s3Key: string): string {
 // ALL KB content was returned to ALL tiers (cross-tier leak). Convention: an
 // optional tier segment right after the source-type — `rag/{sourceType}/{tier}/…`
 // where `{tier}` ∈ basic|standard|premium. Content with NO tier segment defaults
-// to `RAG_DEFAULT_TIER` (default `premium` = most-restrictive, **fail-closed**),
+// to `RAG_DEFAULT_CLASSIFICATION` (default `premium` = most-restrictive, **fail-closed**),
 // so untagged content is never exposed to a lower tier; tag content `basic` to
 // publish it to all tiers. Retrieval filters `metadata->>'tier' = ANY(scope)`
 // where a user's scope is their tier and below (router-agent-handler.ts).
@@ -73,7 +73,7 @@ export function deriveTier(s3Key: string): string {
   if (seg && profiles.isKnownClassification(seg)) return profiles.resolveClassification(seg);
   // Untagged content defaults to the MOST restrictive classification (fail-closed) so it is never
   // exposed to a lower one; an env override applies only if it names a known classification.
-  const dflt = (process.env.RAG_DEFAULT_TIER || '').trim();
+  const dflt = (process.env.RAG_DEFAULT_CLASSIFICATION || '').trim();
   return profiles.isKnownClassification(dflt) ? dflt : profiles.mostRestrictiveValue;
 }
 

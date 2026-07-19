@@ -105,7 +105,7 @@ export function resolveModelForIntent(
   let primaryModelId: string;
   let primaryModelKey: BackendModelKey;
 
-  if (primaryDef && primaryDef.allowedTiers.includes(tier)) {
+  if (primaryDef && primaryDef.allowedClassifications.includes(tier)) {
     // Tier floor: a strategy primary can be allowed for a tier yet weaker than
     // that tier's default model (e.g. general_qa → haiku, which IS allowed for
     // premium). For any non-trivial intent, never resolve below the tier default,
@@ -131,7 +131,7 @@ export function resolveModelForIntent(
   let fallbackModelKey: BackendModelKey | null = null;
 
   const fallbackDef = catalog[route.fallbackModel];
-  if (fallbackDef && fallbackDef.allowedTiers.includes(tier) && fallbackDef.key !== primaryModelKey) {
+  if (fallbackDef && fallbackDef.allowedClassifications.includes(tier) && fallbackDef.key !== primaryModelKey) {
     fallbackModelId = bedrockInvokeId(fallbackDef);
     fallbackModelKey = fallbackDef.key;
   }
@@ -206,7 +206,7 @@ export function collectArnsForTier(
 ): string[] {
   const arns: string[] = [];
   for (const model of Object.values(catalog)) {
-    if (model.allowedTiers.includes(tier)) {
+    if (model.allowedClassifications.includes(tier)) {
       arns.push(...model.foundationModelArns);
       if (model.inferenceProfileArns) {
         arns.push(...model.inferenceProfileArns);
