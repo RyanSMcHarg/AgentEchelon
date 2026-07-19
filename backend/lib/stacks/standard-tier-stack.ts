@@ -9,7 +9,7 @@
 
 import { Construct } from 'constructs';
 import * as cdk from 'aws-cdk-lib';
-import { TierModelSelection } from '../config/model-strategy';
+import { ProfileModelSelection } from '../config/model-strategy';
 import { AssistantProfileStack, ProfileTopology } from './assistant-profile-stack';
 import { AuroraDriftHookup, MessageAnalyticsWiring } from './agent-tier-common';
 
@@ -35,7 +35,7 @@ export interface StandardTierStackProps extends cdk.StackProps {
   appInstanceArn: string;
   attachmentsBucketName: string;
   attachmentsBucketArn: string;
-  tierModelSelection: TierModelSelection;
+  profileModelSelection: ProfileModelSelection;
   enableBattle?: boolean;
   auroraDriftHookup?: AuroraDriftHookup;
   messageAnalytics?: MessageAnalyticsWiring;

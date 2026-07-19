@@ -20,7 +20,7 @@ import {
   APP_INSTANCE_NAME,
   INSTANCE_NAME,
 } from '../lib/stacks/agent-tier-common';
-import { getModelCatalog, parseTierModelSelection } from '../lib/config/model-strategy';
+import { getModelCatalog, parseProfileModelSelection } from '../lib/config/model-strategy';
 import { DEFAULT_PROFILES_CONFIG, validateProfilesConfig } from '../lib/config/profiles';
 import { applyStandardTags } from '../lib/tagging';
 
@@ -165,7 +165,7 @@ const wafRateLimitCtx = app.node.tryGetContext('wafRateLimit');
 const wafRateLimit = wafRateLimitCtx ? Number(wafRateLimitCtx) : undefined;
 const wafAllowedIps = parseWafAllowedIps(app.node.tryGetContext('wafAllowedIps'));
 const modelCatalog = getModelCatalog(env.region, env.account ?? '');
-const tierModelSelection = parseTierModelSelection({
+const profileModelSelection = parseProfileModelSelection({
   basic: app.node.tryGetContext('basicModelKey') || process.env.BASIC_MODEL_KEY,
   standard: app.node.tryGetContext('standardModelKey') || process.env.STANDARD_MODEL_KEY,
   premium: app.node.tryGetContext('premiumModelKey') || process.env.PREMIUM_MODEL_KEY,
@@ -370,7 +370,7 @@ const tierSharedProps = {
   appInstanceArn: chimeStack.appInstanceArn,
   attachmentsBucketName: s3Stack.attachmentsBucket.bucketName,
   attachmentsBucketArn: s3Stack.attachmentsBucket.bucketArn,
-  tierModelSelection,
+  profileModelSelection,
   // Admin error-alert channel (CH parity): the async processor posts a failure here and the
   // channel flow emails the admin roster. Reuses the same admin conversation as the membership
   // audit. Undefined/empty ⇒ processor error alerting is log-only.

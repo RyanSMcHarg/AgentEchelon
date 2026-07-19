@@ -58,7 +58,7 @@ export interface IntentRouteDefinition {
   rationale: string;
 }
 
-export interface TierModelSelection {
+export interface ProfileModelSelection {
   basic: BackendModelKey;
   standard: BackendModelKey;
   premium: BackendModelKey;
@@ -250,17 +250,17 @@ export function getModelCatalog(region: string, account: string): Record<Backend
   };
 }
 
-export const DEFAULT_TIER_MODEL_SELECTION: TierModelSelection = {
+export const DEFAULT_PROFILE_MODEL_SELECTION: ProfileModelSelection = {
   basic: 'haiku',
   standard: 'sonnet',
   premium: 'opus',
 };
 
-export function parseTierModelSelection(
+export function parseProfileModelSelection(
   requested: Partial<Record<ModelTier, string | undefined>>,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
-): TierModelSelection {
-  const selection: TierModelSelection = { ...DEFAULT_TIER_MODEL_SELECTION };
+): ProfileModelSelection {
+  const selection: ProfileModelSelection = { ...DEFAULT_PROFILE_MODEL_SELECTION };
 
   for (const tier of Object.keys(selection) as ModelTier[]) {
     const requestedKey = requested[tier] as BackendModelKey | undefined;

@@ -16,7 +16,7 @@ import { BasicTierStack } from '../lib/stacks/basic-tier-stack';
 import { StandardTierStack } from '../lib/stacks/standard-tier-stack';
 import { PremiumTierStack } from '../lib/stacks/premium-tier-stack';
 import { BattleStack } from '../lib/stacks/battle-stack';
-import { DEFAULT_TIER_MODEL_SELECTION } from '../lib/config/model-strategy';
+import { DEFAULT_PROFILE_MODEL_SELECTION } from '../lib/config/model-strategy';
 
 describe('CDK Synthesis', () => {
   const env = { account: '123456789012', region: 'us-east-1' };
@@ -422,7 +422,7 @@ describe('CDK Synthesis', () => {
       appInstanceArn,
       attachmentsBucketName: 'agent-echelon-attachments-test',
       attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
-      tierModelSelection: DEFAULT_TIER_MODEL_SELECTION,
+      profileModelSelection: DEFAULT_PROFILE_MODEL_SELECTION,
     };
 
     it('should synthesize AgentEchelonTier-Basic as an Option-D processor (no Bedrock Agent)', () => {
@@ -516,7 +516,7 @@ describe('CDK Synthesis', () => {
       appInstanceArn,
       attachmentsBucketName: 'agent-echelon-attachments-test',
       attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
-      tierModelSelection: DEFAULT_TIER_MODEL_SELECTION,
+      profileModelSelection: DEFAULT_PROFILE_MODEL_SELECTION,
     };
 
     /** Build a synthetic AuroraDriftHookup: just the data-plane Lambda ARN the
@@ -747,7 +747,7 @@ describe('CDK Synthesis', () => {
       appInstanceArn,
       attachmentsBucketName: 'agent-echelon-attachments-test',
       attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
-      tierModelSelection: DEFAULT_TIER_MODEL_SELECTION,
+      profileModelSelection: DEFAULT_PROFILE_MODEL_SELECTION,
     };
 
     // Pull every IAM policy statement out of the synthesized template.

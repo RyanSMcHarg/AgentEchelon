@@ -65,7 +65,7 @@ export interface ProfilesConfig {
  * The shipped default IS the current triple, verbatim — so Phase 0 changes zero behavior.
  * Values captured from the legacy code:
  *  - ranks/ordering: CLASSIFICATION_RANK {basic:1,standard:2,premium:3} (router-agent-handler.ts)
- *  - modelKey: DEFAULT_TIER_MODEL_SELECTION {haiku,sonnet,opus} (model-strategy.ts)
+ *  - modelKey: DEFAULT_PROFILE_MODEL_SELECTION {haiku,sonnet,opus} (model-strategy.ts)
  *  - classifierMode: 'llm' for all (DEVIATION: legacy basic used the keyword classifier;
  *    the new default classifies basic with the LLM too — surfaces when Phase 1 wires the router)
  *  - timeoutSeconds: per-tier async processor Lambda timeout (30/60/90; tier stacks)

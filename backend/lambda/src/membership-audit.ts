@@ -166,7 +166,7 @@ async function resolveMemberTier(sub: string): Promise<string | null> {
 // The channel's tier for the violation comparison comes from the IMMUTABLE
 // `classification` tag, NOT `metadata.modelTier`. Reading mutable metadata here would let a
 // moderator who adds an over-tier assistant also tamper `modelTier` up to match it, blinding
-// this detector (botTier > channelClassification would go false). The tag cannot be changed by
+// this detector (botClassification > channelClassification would go false). The tag cannot be changed by
 // UpdateChannel. Fail-closed to basic so an unreadable tag over-reports rather than misses.
 async function resolveChannelClassification(channelArn: string, _bearerArn: string): Promise<string> {
   try {
@@ -181,12 +181,12 @@ async function resolveChannelClassification(channelArn: string, _bearerArn: stri
   }
 }
 
-let botTierMap: Map<string, string> | null = null;
+let botClassificationMap: Map<string, string> | null = null;
 /** Map each per-tier assistant's bot ARN (`${SSM_ROOT}/assistant/{tier}/bot-arn`) to its tier.
  *  Cached for the Lambda's warm life. A bot ARN not in this map is not one of the default
  *  tier assistants (e.g. a `/battle` alt-slot bot), so it is left alone. */
-async function loadBotTierMap(): Promise<Map<string, string>> {
-  if (botTierMap) return botTierMap;
+async function loadBotClassificationMap(): Promise<Map<string, string>> {
+  if (botClassificationMap) return botClassificationMap;
   const map = new Map<string, string>();
   for (const tier of profiles.classificationValues()) {
     try {
@@ -196,11 +196,11 @@ async function loadBotTierMap(): Promise<Map<string, string>> {
       /* a tier without a published bot ARN is simply not mapped */
     }
   }
-  botTierMap = map;
+  botClassificationMap = map;
   return map;
 }
-async function resolveBotTier(botArn: string): Promise<string | null> {
-  return (await loadBotTierMap()).get(botArn) ?? null;
+async function resolveBotClassification(botArn: string): Promise<string | null> {
+  return (await loadBotClassificationMap()).get(botArn) ?? null;
 }
 
 /** Post the alert into the admin conversation (in-app surface) and fan it out to the admin
@@ -318,15 +318,15 @@ export async function handler(event: KinesisStreamEvent, _context?: Context): Pr
         // and context to users below that clearance. Layer 1 does NOT stop this, because the bot's
         // own creds already cover its tier and below. A bot not matching any tier assistant (a
         // `/battle` alt-slot) is left alone.
-        const botTier = await resolveBotTier(memberArn);
-        if (!botTier) continue;
+        const botClassification = await resolveBotClassification(memberArn);
+        if (!botClassification) continue;
         const channelClassification = await resolveChannelClassification(channelArn, adminArn);
         // Over-tier assistant: its classification ranks ABOVE the channel's. Unknown bot ranks 0,
         // unknown channel the fail-closed floor — same fail-safe direction as isClassificationViolation.
-        const botRank = profiles.isKnownClassification(botTier) ? profiles.rank(botTier) : 0;
+        const botRank = profiles.isKnownClassification(botClassification) ? profiles.rank(botClassification) : 0;
         const chRank = profiles.isKnownClassification(channelClassification) ? profiles.rank(channelClassification) : profiles.rank(profiles.failClosedValue);
         if (botRank > chRank) {
-          await handleViolation('assistant', channelArn, memberArn, botTier, botTier, channelClassification);
+          await handleViolation('assistant', channelArn, memberArn, botClassification, botClassification, channelClassification);
         }
       }
     } catch (err) {

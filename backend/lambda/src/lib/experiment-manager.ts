@@ -232,7 +232,7 @@ export async function resolveExperimentModel(
 
   if (!experiment) return null;
 
-  return resolveVariantForTier(experiment, tier, channelArn, catalog);
+  return resolveVariantForProfile(experiment, tier, channelArn, catalog);
 }
 
 /**
@@ -259,7 +259,7 @@ export async function resolveClassificationExperiment(
       (!exp.endDate || new Date(exp.endDate) > now),
   );
   if (!experiment) return null;
-  return resolveVariantForTier(experiment, tier, channelArn, catalog);
+  return resolveVariantForProfile(experiment, tier, channelArn, catalog);
 }
 
 /**
@@ -267,7 +267,7 @@ export async function resolveClassificationExperiment(
  * look up its catalog model, enforce tier safety, and return the invoke id.
  * Returns null on an unknown model key or a tier-disallowed model.
  */
-function resolveVariantForTier(
+function resolveVariantForProfile(
   experiment: Experiment,
   tier: ModelTier,
   channelArn: string,
@@ -470,7 +470,7 @@ export function validateAndSanitizeExperiment(input: Experiment): Experiment {
     systemPromptAddendum: sanitizePromptAddendum(v.systemPromptAddendum),
   }));
 
-  // Every resolution path (resolveVariantForTier + the battle resolvers) keys the
+  // Every resolution path (resolveVariantForProfile + the battle resolvers) keys the
   // catalog by `modelKey` (a short key like 'haiku'/'sonnet'), so a missing modelKey
   // resolves to catalog[undefined] → null and the experiment silently never assigns.
   // Reject it at create time (400) instead of producing a mystery 0-row result.

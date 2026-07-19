@@ -15,7 +15,7 @@ import type {
   RouteKey,
   IntentRouteDefinition,
   ModelTier,
-  TierModelSelection,
+  ProfileModelSelection,
 } from '../../../lib/config/model-strategy.js';
 import { bedrockInvokeId } from '../../../lib/config/model-strategy.js';
 
@@ -80,9 +80,9 @@ export function resolveModelForIntent(
   tier: ModelTier,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
   strategy: IntentRouteDefinition[],
-  tierDefaults: TierModelSelection,
+  profileDefaults: ProfileModelSelection,
 ): ModelResolution {
-  const defaultModel = catalog[tierDefaults[tier]];
+  const defaultModel = catalog[profileDefaults[tier]];
   const defaultResolution: ModelResolution = {
     primaryModelId: bedrockInvokeId(defaultModel),
     primaryModelKey: defaultModel.key,

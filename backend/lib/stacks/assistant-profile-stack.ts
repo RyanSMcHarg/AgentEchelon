@@ -32,7 +32,7 @@ import { createHash } from 'node:crypto';
 import * as path from 'path';
 import { AgentGuardrails } from '../constructs/bedrock-guardrails';
 import { BattleImageGuardrails } from '../constructs/battle-image-guardrails';
-import { getModelCatalog, TierModelSelection } from '../config/model-strategy';
+import { getModelCatalog, ProfileModelSelection } from '../config/model-strategy';
 import { defaultProfileRegistry } from '../profile-registry';
 import {
   classificationChannelScopedAllow,
@@ -59,8 +59,8 @@ import {
 export interface ProfileTopology {
   /** Profile name = classification value = SSM segment (basic/standard/premium). */
   name: string;
-  /** Key into TierModelSelection for this profile's default model. */
-  modelSelectionKey: keyof TierModelSelection;
+  /** Key into ProfileModelSelection for this profile's default model. */
+  modelSelectionKey: keyof ProfileModelSelection;
   /** async-processor Lambda sizing. */
   timeoutSeconds: number;
   memorySize: number;
@@ -98,8 +98,8 @@ export interface AssistantProfileStackProps extends cdk.StackProps {
   /** Shared attachments bucket holding context/{classification}/*.json (from AgentEchelonS3Storage). */
   attachmentsBucketName: string;
   attachmentsBucketArn: string;
-  /** Model selection (the profile team picks tierModelSelection[topology.modelSelectionKey]). */
-  tierModelSelection: TierModelSelection;
+  /** Model selection (the profile team picks profileModelSelection[topology.modelSelectionKey]). */
+  profileModelSelection: ProfileModelSelection;
   /** Wire /battle plumbing (only meaningful when topology.battleCapable). False ⇒ no battle plumbing. */
   enableBattle?: boolean;
   /** Aurora hookup for LIVE drift (conversation-level, all-profile, on-by-default in Aurora mode). */
@@ -123,7 +123,7 @@ export class AssistantProfileStack extends cdk.Stack {
     // profiles ship). Cast keeps the shared boundary helpers strongly typed for the shipped set.
     const tier = topo.name as Tier;
     const modelCatalog = getModelCatalog(this.region, this.account);
-    const tierModel = modelCatalog[props.tierModelSelection[topo.modelSelectionKey]];
+    const profileModel = modelCatalog[props.profileModelSelection[topo.modelSelectionKey]];
 
     // External/CN model routing (SPEC-CONTEXT-AWARE-MODEL-ROUTING). In-AWS DeepSeek-on-Bedrock,
     // intent-routed (reasoning → R1 inference profile, rest → V3). Active only at runtime when
@@ -147,7 +147,7 @@ export class AssistantProfileStack extends cdk.Stack {
           ]
         : [];
     }
-    const tierModelArns = [...modelArnsForClassification(tier, modelCatalog), ...cnBedrockArns];
+    const classificationModelArns = [...modelArnsForClassification(tier, modelCatalog), ...cnBedrockArns];
 
     const shared = resolveSharedSSM(this);
     const errAlert = adminErrorAlertWiring(this, props.appInstanceArn, props.adminErrorAlertChannelArn);
@@ -188,7 +188,7 @@ export class AssistantProfileStack extends cdk.Stack {
               actions: topo.streaming
                 ? ['bedrock:InvokeModel', 'bedrock:InvokeModelWithResponseStream']
                 : ['bedrock:InvokeModel'],
-              resources: tierModelArns,
+              resources: classificationModelArns,
             }),
             new iam.PolicyStatement({
               actions: ['bedrock:ApplyGuardrail'],
@@ -355,8 +355,8 @@ export class AssistantProfileStack extends cdk.Stack {
       PROFILE_NAME: tier,
       BATTLE_ELIGIBLE: String(defaultProfileRegistry.profileFor(tier).battleEligible ?? false),
       MAX_TOKENS: String(topo.maxTokens),
-      MODEL_ID: tierModel.bedrockModelId,
-      MODEL_NAME: tierModel.displayName,
+      MODEL_ID: profileModel.bedrockModelId,
+      MODEL_NAME: profileModel.displayName,
       AWS_ACCOUNT_ID: this.account,
       CONTEXT_BUCKET: props.attachmentsBucketName,
       GUARDRAIL_ID: guardrail.guardrailId,
@@ -518,7 +518,7 @@ export class AssistantProfileStack extends cdk.Stack {
           ],
         }),
         BedrockPolicy: new iam.PolicyDocument({ statements: [
-          new iam.PolicyStatement({ actions: ['bedrock:InvokeModel'], resources: tierModelArns }),
+          new iam.PolicyStatement({ actions: ['bedrock:InvokeModel'], resources: classificationModelArns }),
         ] }),
         SSMPolicy: new iam.PolicyDocument({ statements: [
           new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${tierBotArnKey(tier)}`] }),

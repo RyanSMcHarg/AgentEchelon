@@ -76,7 +76,7 @@ import {
 } from './lib/task-tracking.js';
 import { resolveModelForIntent } from './lib/model-resolver.js';
 import { clampResponseMaxTokens } from './lib/intent-pack.js';
-import { getModelCatalog, INTENT_ROUTE_STRATEGY, DEFAULT_TIER_MODEL_SELECTION, bedrockInvokeId } from '../../lib/config/model-strategy.js';
+import { getModelCatalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION, bedrockInvokeId } from '../../lib/config/model-strategy.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 
@@ -563,7 +563,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       CONFIG.userType,
       catalog,
       INTENT_ROUTE_STRATEGY,
-      DEFAULT_TIER_MODEL_SELECTION,
+      DEFAULT_PROFILE_MODEL_SELECTION,
     );
     const variantDef = battleVariantModelKey
       ? catalog[battleVariantModelKey as keyof typeof catalog]
@@ -605,7 +605,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
             {
               catalog,
               strategy: INTENT_ROUTE_STRATEGY,
-              tierDefaults: DEFAULT_TIER_MODEL_SELECTION,
+              profileDefaults: DEFAULT_PROFILE_MODEL_SELECTION,
               enabled: true,
               cnBedrock,
               cnProvider: cnCfg ? { provider: cnCfg.provider, modelId: cnCfg.model } : null,

@@ -18,7 +18,7 @@ import type {
   BackendModelKey,
   IntentRouteDefinition,
   ModelTier,
-  TierModelSelection,
+  ProfileModelSelection,
 } from '../../../lib/config/model-strategy.js';
 import { resolveModelForIntent } from './model-resolver.js';
 
@@ -62,7 +62,7 @@ export interface RoutingContext {
 export interface ResolveModelPlanDeps {
   catalog: Record<BackendModelKey, BackendModelDefinition>;
   strategy: IntentRouteDefinition[];
-  tierDefaults: TierModelSelection;
+  profileDefaults: ProfileModelSelection;
   /** Context-aware routing master flag (`ENABLE_CONTEXT_ROUTING`). When false/absent, only rules
    *  1/3/4 apply — i.e. today's behavior, no context rules. */
   enabled?: boolean;
@@ -93,10 +93,10 @@ export interface ResolveModelPlanDeps {
  *   4. tier default
  */
 export function resolveModelPlan(ctx: RoutingContext, deps: ResolveModelPlanDeps): ModelPlan {
-  const { catalog, strategy, tierDefaults } = deps;
+  const { catalog, strategy, profileDefaults } = deps;
 
   // Rules 3 + 4: today's intent→tier resolution (with tier safety) is the baseline.
-  const base = resolveModelForIntent(ctx.intent, ctx.tier, catalog, strategy, tierDefaults);
+  const base = resolveModelForIntent(ctx.intent, ctx.tier, catalog, strategy, profileDefaults);
 
   // Rule 1: experiment override wins on the primary model id — identical to today's
   // `event.resolvedModel || resolution.primaryModelId`.

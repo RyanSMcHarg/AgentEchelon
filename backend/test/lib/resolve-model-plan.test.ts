@@ -7,13 +7,13 @@
 import {
   getModelCatalog,
   INTENT_ROUTE_STRATEGY,
-  DEFAULT_TIER_MODEL_SELECTION,
+  DEFAULT_PROFILE_MODEL_SELECTION,
 } from '../../lib/config/model-strategy';
 import { resolveModelForIntent } from '../../lambda/src/lib/model-resolver';
 import { resolveModelPlan } from '../../lambda/src/lib/resolve-model-plan';
 
 const catalog = getModelCatalog('us-east-1', '123456789012');
-const deps = { catalog, strategy: INTENT_ROUTE_STRATEGY, tierDefaults: DEFAULT_TIER_MODEL_SELECTION };
+const deps = { catalog, strategy: INTENT_ROUTE_STRATEGY, profileDefaults: DEFAULT_PROFILE_MODEL_SELECTION };
 
 const TIERS = ['basic', 'standard', 'premium'] as const;
 const INTENTS = [
@@ -30,7 +30,7 @@ describe('resolveModelPlan — backward compatibility (empty context)', () => {
   for (const tier of TIERS) {
     for (const intent of INTENTS) {
       it(`tier=${tier} intent=${intent ?? 'none'} → matches resolveModelForIntent`, () => {
-        const today = resolveModelForIntent(intent, tier, catalog, INTENT_ROUTE_STRATEGY, DEFAULT_TIER_MODEL_SELECTION);
+        const today = resolveModelForIntent(intent, tier, catalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION);
         const plan = resolveModelPlan({ tier, intent }, deps);
 
         // The invocation input (model id) is the thing that must be identical.
@@ -53,7 +53,7 @@ describe('resolveModelPlan — experiment override (rule 1)', () => {
     const plan = resolveModelPlan({ tier: 'standard', intent: 'general', experimentModelId }, deps);
     expect(plan.ref.modelId).toBe(experimentModelId);
     // Fallback still comes from the intent/tier resolution (unchanged).
-    const today = resolveModelForIntent('general', 'standard', catalog, INTENT_ROUTE_STRATEGY, DEFAULT_TIER_MODEL_SELECTION);
+    const today = resolveModelForIntent('general', 'standard', catalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION);
     expect(plan.fallback?.modelId ?? null).toBe(today.fallbackModelId);
   });
 });
