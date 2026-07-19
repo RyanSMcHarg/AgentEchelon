@@ -15,6 +15,8 @@ import { bedrockInvokeId } from '../../../lib/config/model-strategy.js';
 import { IMAGE_GEN_MODELS, type ImageGenModelKey } from './image-gen-models.js';
 import { intentTypeToRouteKey } from './model-resolver.js';
 import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
+import { SSMClient } from '@aws-sdk/client-ssm';
+import { lookupProfileVersionModelKey } from './profile-version-lookup.js';
 
 // removeUndefinedValues: createExperiment persists the validated record
 // directly, and validateAndSanitizeExperiment leaves optional fields
@@ -25,6 +27,10 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
 });
 const EXPERIMENTS_TABLE = process.env.EXPERIMENTS_TABLE || '';
+// SPEC-PORTABLE-VERSIONED-PROFILES §6: a profileRef variant resolves its model from the referenced
+// profile version's SSM definition. Own client (like the ddb one above); read-only + fail-safe.
+const ssmClient = new SSMClient({});
+const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
 
 // ============================================================
 // Types
@@ -32,7 +38,16 @@ const EXPERIMENTS_TABLE = process.env.EXPERIMENTS_TABLE || '';
 
 export interface ExperimentVariant {
   variantId: string;
-  modelKey: BackendModelKey;
+  /** The model this variant runs. MUTUALLY EXCLUSIVE with `profileRef` (validated) — a variant
+   *  varies either a bare model (+ optional prompt-addendum) OR an entire profile version, not both. */
+  modelKey?: BackendModelKey;
+  /**
+   * SPEC-PORTABLE-VERSIONED-PROFILES §6: run an ENTIRE profile version as the variant. The variant's
+   * model (and, once the AssistantConfig unification lands, its prompt/pack/tools/guardrail) come from
+   * that version's definition. Resolved at runtime via lookupProfileVersionModelKey. Mutually exclusive
+   * with `modelKey`.
+   */
+  profileRef?: { profileName: string; version?: number };
   weight: number; // 0-100, all variants should sum to 100
   /** Display name surfaced to users + in the rival prompt during a battle. Required when the parent experiment.battleEnabled is true. Max ~16 chars. */
   displayName?: string;
@@ -267,30 +282,54 @@ export async function resolveClassificationExperiment(
  * look up its catalog model, enforce classification safety, and return the invoke id.
  * Returns null on an unknown model key or a classification-disallowed model.
  */
-function resolveVariantForProfile(
+/**
+ * The model a variant runs: its `modelKey`, or — for a profileRef variant (§6) — the referenced profile
+ * version's modelKey, read from SSM at runtime. null when neither resolves (fail-safe: the caller skips).
+ */
+async function effectiveModelKeyOf(variant: ExperimentVariant): Promise<BackendModelKey | null> {
+  if (variant.profileRef) {
+    const mk = await lookupProfileVersionModelKey(ssmClient, SSM_ROOT, variant.profileRef);
+    if (!mk) {
+      console.warn(`[ExperimentManager] profileRef ${variant.profileRef.profileName}@${variant.profileRef.version ?? 'active'} unresolved`);
+      return null;
+    }
+    return mk as BackendModelKey;
+  }
+  return variant.modelKey ?? null;
+}
+
+async function resolveVariantForProfile(
   experiment: Experiment,
   classification: Classification,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
-): ExperimentResolution | null {
+): Promise<ExperimentResolution | null> {
   const variant = assignVariant(experiment.experimentId, channelArn, experiment.variants);
-  const model = catalog[variant.modelKey];
 
-  if (!model) {
-    console.error(`[ExperimentManager] Unknown model key in experiment: ${variant.modelKey}`);
+  // §6: a profileRef variant runs an entire profile version — its model comes from that version's
+  // definition. Fail-safe: an unresolvable variant skips the experiment (deterministic default holds).
+  const effectiveModelKey = await effectiveModelKeyOf(variant);
+  if (!effectiveModelKey) {
+    console.error('[ExperimentManager] variant has neither modelKey nor a resolvable profileRef; skipping');
     return null;
   }
 
-  // Enforce classification safety — experiment can't assign a model not allowed for this classification
+  const model = catalog[effectiveModelKey];
+  if (!model) {
+    console.error(`[ExperimentManager] Unknown model key in experiment: ${effectiveModelKey}`);
+    return null;
+  }
+
+  // Classification ceiling still binds — a version can never exceed the channel's classification (§6, min-cap).
   if (!model.allowedClassifications.includes(classification)) {
-    console.warn(`[ExperimentManager] Model ${variant.modelKey} not allowed for classification ${classification}, skipping experiment`);
+    console.warn(`[ExperimentManager] Model ${effectiveModelKey} not allowed for classification ${classification}, skipping experiment`);
     return null;
   }
 
   return {
     experimentId: experiment.experimentId,
     variantId: variant.variantId,
-    modelKey: variant.modelKey,
+    modelKey: effectiveModelKey,
     bedrockModelId: bedrockInvokeId(model),
   };
 }
@@ -470,16 +509,21 @@ export function validateAndSanitizeExperiment(input: Experiment): Experiment {
     systemPromptAddendum: sanitizePromptAddendum(v.systemPromptAddendum),
   }));
 
-  // Every resolution path (resolveVariantForProfile + the battle resolvers) keys the
-  // catalog by `modelKey` (a short key like 'haiku'/'sonnet'), so a missing modelKey
-  // resolves to catalog[undefined] → null and the experiment silently never assigns.
-  // Reject it at create time (400) instead of producing a mystery 0-row result.
+  // Each variant runs EITHER a bare model OR an entire profile version (SPEC-PORTABLE-VERSIONED-PROFILES
+  // §6) — exactly one of modelKey / profileRef, never both, never neither. A bare modelKey is a catalog
+  // key ('haiku'/'sonnet'); a profileRef {profileName, version?} runs that version's definition. Reject a
+  // mis-specified variant at create time (400) instead of producing a mystery 0-row result.
   variants.forEach((v, i) => {
-    if (typeof v.modelKey !== 'string' || !v.modelKey.trim()) {
+    const hasModel = typeof v.modelKey === 'string' && v.modelKey.trim().length > 0;
+    const hasRef = !!v.profileRef && typeof v.profileRef.profileName === 'string' && v.profileRef.profileName.trim().length > 0;
+    if (hasModel === hasRef) {
       throw new ExperimentValidationError(
-        `variant index ${i} requires a non-empty modelKey (a catalog key such as 'haiku'/'sonnet', not a Bedrock model id)`,
+        `variant index ${i} requires EXACTLY ONE of modelKey (a catalog key like 'haiku'/'sonnet') or profileRef {profileName, version?} — not both, not neither`,
         'VARIANT_MODEL_KEY_REQUIRED',
       );
+    }
+    if (hasRef && v.profileRef!.version !== undefined && (!Number.isInteger(v.profileRef!.version) || v.profileRef!.version < 1)) {
+      throw new ExperimentValidationError(`variant index ${i} profileRef.version must be a positive integer (omit for the active version)`, 'VARIANT_PROFILE_REF_VERSION');
     }
   });
 
@@ -505,19 +549,21 @@ export function validateAndSanitizeExperiment(input: Experiment): Experiment {
   const objective = validateObjective(input.objective, experimentType);
 
   if (input.battleEnabled) {
-    // Battle eligibility is a per-profile flag (`AssistantProfile.battleEligible`, config) — the
-    // source of truth for which classifications may run a battle (premium-only by default). A
-    // battle-enabled experiment must target exactly ONE battle-eligible classification — never a
-    // mixed set — so it can never arm a battle on an ineligible channel. (Error
-    // code kept as BATTLE_TIER_PREMIUM_ONLY for the API/UI contract; with the
-    // default premium-only config this is exactly the old premium-only guard.)
+    // A battle runs head-to-head in ONE channel, so it must target exactly one classification — never a
+    // mixed set (structural). But `battleEligible` is now a HINT, not a gate (SPEC-PORTABLE-VERSIONED-
+    // PROFILES §1/§6): an OPERATOR-driven comparison may battle any profile/version at any classification.
+    // The classification CEILING still binds — resolveVariantForProfile rejects a model not allowed for
+    // the channel's classification (min-cap) — so allowing a non-"battleEligible" target never escalates.
+    // (Error code kept as BATTLE_TIER_PREMIUM_ONLY for the API/UI contract.)
     const tiers = input.tiers || [];
-    if (tiers.length !== 1 || !profiles.profileFor(tiers[0]).battleEligible) {
+    if (tiers.length !== 1) {
       throw new ExperimentValidationError(
-        `battleEnabled experiments must target exactly one battle-eligible classification `
-          + `(got [${tiers.join(', ')}])`,
+        `battleEnabled experiments must target exactly one classification (got [${tiers.join(', ')}])`,
         'BATTLE_TIER_PREMIUM_ONLY',
       );
+    }
+    if (!profiles.profileFor(tiers[0]).battleEligible) {
+      console.log('[ExperimentManager] operator-driven battle on a non-battleEligible classification (battleEligible is now a hint):', tiers[0]);
     }
     if (variants.length !== 2) {
       throw new ExperimentValidationError(
@@ -673,10 +719,12 @@ export async function resolveBattleVariantBySlotArn(
   // variants[0] = control (default bot); variants[1] = treatment (alt slot).
   const treatment = exp.variants[1];
   if (!treatment) return null;
+  const treatmentModelKey = await effectiveModelKeyOf(treatment); // §6: resolves a profileRef variant
+  if (!treatmentModelKey) return null;
   return {
     experimentId: exp.experimentId,
     variantId: treatment.variantId,
-    modelKey: treatment.modelKey,
+    modelKey: treatmentModelKey,
     displayName: treatment.displayName ?? treatment.variantId,
     systemPromptAddendum: treatment.systemPromptAddendum,
     longFormMode: exp.longFormMode,
@@ -720,10 +768,12 @@ export async function resolveBattleControlVariantByAltSlotArn(
   // variants[0] = control (default bot); variants[1] = treatment (alt slot).
   const control = exp.variants[0];
   if (!control) return null;
+  const controlModelKey = await effectiveModelKeyOf(control); // §6: resolves a profileRef variant
+  if (!controlModelKey) return null;
   return {
     experimentId: exp.experimentId,
     variantId: control.variantId,
-    modelKey: control.modelKey,
+    modelKey: controlModelKey,
     displayName: control.displayName ?? control.variantId,
     systemPromptAddendum: control.systemPromptAddendum,
     longFormMode: exp.longFormMode,

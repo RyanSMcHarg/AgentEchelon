@@ -4,7 +4,7 @@
  * and rejects anything the target does not provision (model/identity) — never escalates.
  */
 import { getModelCatalog } from '../../lib/config/model-strategy';
-import { exportManifest, importManifest, ProfileManifestError, MANIFEST_SCHEMA_VERSION } from '../../lambda/src/lib/profile-manifest';
+import { exportManifest, importManifest, ProfileManifestError, MANIFEST_SCHEMA_VERSION, signManifest } from '../../lambda/src/lib/profile-manifest';
 import { createDraft, editDraft, activateDraft, getDraft, listProfile, isKnownProfile } from '../../lambda/src/lib/profile-lifecycle';
 import { fakeSsmStore } from '../helpers/fake-ssm-store';
 
@@ -97,5 +97,62 @@ describe('profile manifest P3', () => {
     const draft = await importManifest(client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, actor: ACTOR, targetProfileName: 'standard' });
     expect(draft.profileName).toBe('standard');
     expect((await getDraft(client, ROOT, 'standard'))!.modelKey).toBe('opus');
+  });
+});
+
+describe('P4 — optional manifest signing', () => {
+  const SECRET = 'test-signing-secret';
+  afterEach(() => {
+    delete process.env.MANIFEST_SIGNING_SECRET;
+    delete process.env.MANIFEST_REQUIRE_SIGNATURE;
+  });
+
+  it('exports a SIGNED manifest when a secret is configured; the secret never travels', async () => {
+    process.env.MANIFEST_SIGNING_SECRET = SECRET;
+    const { client } = fakeSsmStore();
+    await seedActiveVersion(client, 'standard', 'opus');
+    const manifest = await exportManifest(client, ROOT, 'standard');
+    expect(manifest.signature).toMatch(/^[0-9a-f]{64}$/);
+    expect(JSON.stringify(manifest)).not.toContain(SECRET);
+  });
+
+  it('imports a validly-signed manifest and REJECTS a tampered one', async () => {
+    process.env.MANIFEST_SIGNING_SECRET = SECRET;
+    const src = fakeSsmStore();
+    await seedActiveVersion(src.client, 'premium', 'opus');
+    const manifest = await exportManifest(src.client, ROOT, 'premium');
+
+    const b = fakeSsmStore();
+    await expect(importManifest(b.client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, actor: ACTOR })).resolves.toBeTruthy();
+
+    const tampered = { ...manifest, body: { ...manifest.body, modelKey: 'sonnet' } }; // signature no longer matches
+    await expect(importManifest(b.client, ROOT, tampered, { catalog: CATALOG, knownProfile: known, actor: ACTOR }))
+      .rejects.toMatchObject({ errors: expect.arrayContaining([expect.stringMatching(/signature does not match/)]) });
+  });
+
+  it('rejects an unsigned manifest when the target REQUIRES a signature', async () => {
+    process.env.MANIFEST_SIGNING_SECRET = SECRET;
+    process.env.MANIFEST_REQUIRE_SIGNATURE = 'true';
+    const { client } = fakeSsmStore();
+    const unsigned = {
+      schemaVersion: MANIFEST_SCHEMA_VERSION, kind: 'assistant-profile', profileName: 'standard',
+      body: { modelKey: 'sonnet', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'full' },
+      provenance: { sourceProfileName: 'standard', sourceVersion: 'active', exportedConfigId: 'x' }, contentHash: 'x',
+    };
+    await expect(importManifest(client, ROOT, unsigned, { catalog: CATALOG, knownProfile: known, actor: ACTOR }))
+      .rejects.toMatchObject({ errors: expect.arrayContaining([expect.stringMatching(/unsigned/)]) });
+  });
+
+  it('rejects a signed manifest when this instance has no secret to verify with', async () => {
+    // exporter signed with a secret; importer has none configured → cannot verify → reject (never trust).
+    const signed = {
+      schemaVersion: MANIFEST_SCHEMA_VERSION, kind: 'assistant-profile', profileName: 'standard',
+      body: { modelKey: 'sonnet', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'full' },
+      provenance: { sourceProfileName: 'standard', sourceVersion: 'active', exportedConfigId: 'x' }, contentHash: 'x',
+      signature: signManifest({ profileName: 'standard' }, SECRET),
+    };
+    const { client } = fakeSsmStore();
+    await expect(importManifest(client, ROOT, signed, { catalog: CATALOG, knownProfile: known, actor: ACTOR }))
+      .rejects.toMatchObject({ errors: expect.arrayContaining([expect.stringMatching(/no MANIFEST_SIGNING_SECRET/)]) });
   });
 });

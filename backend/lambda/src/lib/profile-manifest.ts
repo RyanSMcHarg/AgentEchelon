@@ -19,7 +19,7 @@
  * authoritative) but degenerate to "the named profile exists on the target" until those fields are data.
  */
 import { SSMClient, GetParameterCommand, GetParameterHistoryCommand, PutParameterCommand } from '@aws-sdk/client-ssm';
-import { createHash } from 'node:crypto';
+import { createHash, createHmac, timingSafeEqual } from 'node:crypto';
 import type { BackendModelDefinition, BackendModelKey } from '../../../lib/config/model-strategy.js';
 import {
   ProfileDefinition,
@@ -51,6 +51,13 @@ export interface ProfileManifest {
   };
   /** sha256 of the canonical body — carried through import as `createdFrom.contentHash` (audit chain). */
   contentHash: string;
+  /**
+   * P4 OPTIONAL manifest signing (§8): an HMAC-SHA256 over the canonical manifest (this field excluded),
+   * present only when the exporter has MANIFEST_SIGNING_SECRET set. Import verifies it when a shared
+   * secret is configured, and can REQUIRE it (MANIFEST_REQUIRE_SIGNATURE) — a supply-chain guard for
+   * cross-instance transfer. Absent by default: signing is opt-in, not a gate on the common case.
+   */
+  signature?: string;
 }
 
 export class ProfileManifestError extends Error {
@@ -63,6 +70,30 @@ export class ProfileManifestError extends Error {
 function contentHashOf(body: ProfileDefinitionBody): string {
   const ordered = Object.fromEntries(Object.entries(body).sort(([a], [b]) => a.localeCompare(b)));
   return createHash('sha256').update(JSON.stringify(ordered), 'utf8').digest('hex');
+}
+
+/** Stable JSON of a manifest with the `signature` field removed — the signing/verification basis. */
+function canonicalForSigning(m: Partial<ProfileManifest>): string {
+  const { signature: _omit, ...rest } = m;
+  const stable = (v: unknown): unknown =>
+    v && typeof v === 'object' && !Array.isArray(v)
+      ? Object.fromEntries(Object.entries(v as Record<string, unknown>).sort(([a], [b]) => a.localeCompare(b)).map(([k, val]) => [k, stable(val)]))
+      : v;
+  return JSON.stringify(stable(rest));
+}
+
+/** P4: HMAC-SHA256 signature of a manifest under a shared secret. */
+export function signManifest(m: Partial<ProfileManifest>, secret: string): string {
+  return createHmac('sha256', secret).update(canonicalForSigning(m), 'utf8').digest('hex');
+}
+
+/** Constant-time verify of a manifest's `signature` against the recomputed HMAC. */
+export function verifyManifestSignature(m: Partial<ProfileManifest>, secret: string): boolean {
+  if (!m.signature) return false;
+  const expected = signManifest(m, secret);
+  const a = Buffer.from(expected, 'utf8');
+  const b = Buffer.from(m.signature, 'utf8');
+  return a.length === b.length && timingSafeEqual(a, b);
 }
 
 /** Read a specific definition version's value (from history), or the active/seed when version is omitted. */
@@ -94,7 +125,7 @@ async function readDefinition(
 export async function exportManifest(ssm: SSMClient, ssmRoot: string, profileName: string, version?: number): Promise<ProfileManifest> {
   const { def, sourceVersion } = await readDefinition(ssm, ssmRoot, profileName, version);
   const body = bodyFrom(def);
-  return {
+  const manifest: ProfileManifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
     kind: 'assistant-profile',
     profileName,
@@ -107,6 +138,10 @@ export async function exportManifest(ssm: SSMClient, ssmRoot: string, profileNam
     },
     contentHash: contentHashOf(body),
   };
+  // P4: sign only when a shared secret is configured (opt-in). The secret NEVER travels in the manifest.
+  const secret = process.env.MANIFEST_SIGNING_SECRET;
+  if (secret) manifest.signature = signManifest(manifest, secret);
+  return manifest;
 }
 
 export interface ImportOptions {
@@ -143,6 +178,17 @@ export async function importManifest(
   if (m?.schemaVersion !== MANIFEST_SCHEMA_VERSION) errors.push(`unsupported schemaVersion '${m?.schemaVersion}' (expected ${MANIFEST_SCHEMA_VERSION})`);
   if (!m?.body || typeof m.body !== 'object') errors.push('manifest.body missing');
   if (errors.length) throw new ProfileManifestError('manifest rejected', errors);
+
+  // 1b. P4 OPTIONAL signature (supply-chain guard). Require it if the target policy demands one; verify
+  // it whenever present + a secret is configured. Reject a bad/unverifiable signature — never silently
+  // trust one. Absent signature + no requirement ⇒ the common unsigned path (opt-in feature).
+  const secret = process.env.MANIFEST_SIGNING_SECRET;
+  const requireSig = process.env.MANIFEST_REQUIRE_SIGNATURE === 'true';
+  if (requireSig && !m.signature) throw new ProfileManifestError('manifest signature required by policy', ['MANIFEST_REQUIRE_SIGNATURE is set but the manifest is unsigned']);
+  if (m.signature) {
+    if (!secret) throw new ProfileManifestError('cannot verify manifest signature', ['manifest is signed but no MANIFEST_SIGNING_SECRET is configured on this instance']);
+    if (!verifyManifestSignature(m, secret)) throw new ProfileManifestError('manifest signature invalid', ['signature does not match (tampered or wrong signing key)']);
+  }
 
   const body = bodyFrom(m.body as Partial<ProfileDefinitionBody>);
   errors.push(...validateDefinitionBody(body));

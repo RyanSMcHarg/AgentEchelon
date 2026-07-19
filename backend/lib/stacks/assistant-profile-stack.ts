@@ -430,12 +430,13 @@ export class AssistantProfileStack extends cdk.Stack {
       // Read the persona from SSM at cold start (always — the param may exist from a preserved prior deploy).
       asyncProcessor.addToRolePolicy(new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [systemPromptParamArn] }));
     }
-    // SPEC-PORTABLE-VERSIONED-PROFILES P0/§7: the processor resolves its active profile VERSION from
-    // this param at runtime. READ-ONLY — the boundary keeps the async-processor role off the write path
-    // (`ssm:PutParameter`/label ops on /assistant/* belong only to the future manage-profiles role); the
-    // `:active` label read uses the same parameter ARN. Absent param ⇒ the resolver fails closed to the seed.
-    const definitionParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/${classification}/definition`;
-    asyncProcessor.addToRolePolicy(new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [definitionParamArn] }));
+    // SPEC-PORTABLE-VERSIONED-PROFILES P0/P2/§7: the processor resolves its OWN active profile version
+    // (P0), and — for a /battle profileRef variant — reads OTHER profiles' versions (P2), so grant read
+    // across the whole assistant-definition namespace. READ-ONLY: the write path (PutParameter/label on
+    // /assistant/*) belongs ONLY to the manage-profiles role; reading a definition is behavior, not a
+    // boundary (§7), so a broad read never escalates. Absent param ⇒ the resolver fails closed to the seed.
+    const definitionsReadArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/definition`;
+    asyncProcessor.addToRolePolicy(new iam.PolicyStatement({ actions: ['ssm:GetParameter', 'ssm:GetParameterHistory'], resources: [definitionsReadArn] }));
     if (topo.imageGen) {
       // External-HTTP image-gen provider keys (OpenAI / FAL) — PREFERRED: a Secrets Manager secret the
       // processor fetches + caches at runtime, so nothing sensitive sits in the Lambda config.
@@ -528,6 +529,10 @@ export class AssistantProfileStack extends cdk.Stack {
         ] }),
         SSMPolicy: new iam.PolicyDocument({ statements: [
           new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${botArnKey(classification)}`] }),
+          // SPEC-PORTABLE-VERSIONED-PROFILES P2/§6: the router resolves an A/B profileRef variant to the
+          // referenced profile version's model — READ-ONLY on the assistant-definition namespace (reading a
+          // definition is behavior, not a boundary, §7). Writes stay exclusive to the manage-profiles role.
+          new iam.PolicyStatement({ actions: ['ssm:GetParameter', 'ssm:GetParameterHistory'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/definition`] }),
         ] }),
         DynamoDBPolicy: new iam.PolicyDocument({ statements: [
           new iam.PolicyStatement({
