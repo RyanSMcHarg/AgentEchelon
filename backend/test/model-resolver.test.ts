@@ -114,7 +114,7 @@ const strategy: IntentRouteDefinition[] = [
     label: 'Code Gen',
     primaryModel: 'sonnet',
     fallbackModel: 'haiku',
-    preferredTier: 'standard',
+    preferredClearance: 'standard',
     rationale: 'Sonnet is good at code',
   },
   {
@@ -122,7 +122,7 @@ const strategy: IntentRouteDefinition[] = [
     label: 'Strategy',
     primaryModel: 'opus',
     fallbackModel: 'sonnet',
-    preferredTier: 'premium',
+    preferredClearance: 'premium',
     rationale: 'Opus for deep thinking',
   },
   {
@@ -130,7 +130,7 @@ const strategy: IntentRouteDefinition[] = [
     label: 'General',
     primaryModel: 'haiku',
     fallbackModel: 'titan',
-    preferredTier: 'basic',
+    preferredClearance: 'basic',
     rationale: 'Fast and cheap',
   },
 ];
@@ -222,7 +222,7 @@ describe('resolveModelForIntent', () => {
         label: 'General',
         primaryModel: 'opus',
         fallbackModel: 'sonnet',
-        preferredTier: 'premium',
+        preferredClearance: 'premium',
         rationale: 'test',
       },
     ];
@@ -239,7 +239,7 @@ describe('resolveModelForIntent', () => {
         label: 'General',
         primaryModel: 'opus',
         fallbackModel: 'sonnet',
-        preferredTier: 'premium',
+        preferredClearance: 'premium',
         rationale: 'test',
       },
     ];

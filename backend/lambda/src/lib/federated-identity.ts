@@ -38,18 +38,18 @@ export function isFederatedSub(id: string): boolean {
 
 /**
  * Resolve an external IdP group claim to an AE classification — FAIL-CLOSED.
- * `groupToTier` is per-issuer deploy config; an absent/unmapped group → the lowest tier.
+ * `groupToClearance` is per-issuer deploy config; an absent/unmapped group → the lowest tier.
  */
 export function resolveFederatedTier(
   group: string | undefined,
-  groupToTier: Record<string, Classification>,
+  groupToClearance: Record<string, Classification>,
   lowest: Classification = 'basic',
 ): Classification {
   if (!group) return lowest;
-  return groupToTier[group] ?? lowest;
+  return groupToClearance[group] ?? lowest;
 }
 
 /** The effective ceiling = the LOWER of the IdP-derived tier and the channel's classification. */
-export function classificationCeiling(idpTier: Classification, channelClassification: Classification): Classification {
-  return ORDER[idpTier] <= ORDER[channelClassification] ? idpTier : channelClassification;
+export function classificationCeiling(idpClearance: Classification, channelClassification: Classification): Classification {
+  return ORDER[idpClearance] <= ORDER[channelClassification] ? idpClearance : channelClassification;
 }

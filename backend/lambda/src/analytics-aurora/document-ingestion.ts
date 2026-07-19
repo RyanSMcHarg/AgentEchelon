@@ -68,7 +68,7 @@ function deriveSourceType(s3Key: string): string {
 // so untagged content is never exposed to a lower tier; tag content `basic` to
 // publish it to all tiers. Retrieval filters `metadata->>'tier' = ANY(scope)`
 // where a user's scope is their tier and below (router-agent-handler.ts).
-export function deriveTier(s3Key: string): string {
+export function deriveClearance(s3Key: string): string {
   const seg = s3Key.match(/^rag\/[^/]+\/([^/]+)\//)?.[1];
   if (seg && profiles.isKnownClassification(seg)) return profiles.resolveClassification(seg);
   // Untagged content defaults to the MOST restrictive classification (fail-closed) so it is never
@@ -299,8 +299,8 @@ export async function ingestObject(
       filename: key.split('/').pop(),
       sourceKey: key,
       chunkStart: chunk.start,
-      // Per-tier retrieval gate (fail-closed default). See deriveTier.
-      tier: deriveTier(key),
+      // Per-tier retrieval gate (fail-closed default). See deriveClearance.
+      tier: deriveClearance(key),
     };
 
     try {

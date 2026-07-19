@@ -59,12 +59,12 @@ describe('emf-metrics', () => {
       emitEmfMetric({
         namespace: 'AgentEchelon/Test',
         metrics: [{ name: 'Latency', unit: 'Milliseconds' }],
-        dimensionSets: [['Stage'], ['Stage', 'UserTier']],
-        properties: { Stage: 'embed', UserTier: 'premium', Latency: 42 },
+        dimensionSets: [['Stage'], ['Stage', 'UserClearance']],
+        properties: { Stage: 'embed', UserClearance: 'premium', Latency: 42 },
       });
 
       const aws = lastLog()._aws as { CloudWatchMetrics: Array<{ Dimensions: string[][] }> };
-      expect(aws.CloudWatchMetrics[0].Dimensions).toEqual([['Stage'], ['Stage', 'UserTier']]);
+      expect(aws.CloudWatchMetrics[0].Dimensions).toEqual([['Stage'], ['Stage', 'UserClearance']]);
     });
   });
 
@@ -82,12 +82,12 @@ describe('emf-metrics', () => {
       expect(out.CorrelationId).toBe('corr-1');
     });
 
-    it('adds UserTier dimension when supplied', () => {
-      emitDriftTiming('total', 99, 'c2', { userTier: 'premium' });
+    it('adds UserClearance dimension when supplied', () => {
+      emitDriftTiming('total', 99, 'c2', { userClearance: 'premium' });
       const out = lastLog();
       const aws = out._aws as { CloudWatchMetrics: Array<{ Dimensions: string[][] }> };
-      expect(aws.CloudWatchMetrics[0].Dimensions).toContainEqual(['Stage', 'UserTier']);
-      expect(out.UserTier).toBe('premium');
+      expect(aws.CloudWatchMetrics[0].Dimensions).toContainEqual(['Stage', 'UserClearance']);
+      expect(out.UserClearance).toBe('premium');
     });
 
     it('adds Intent dimension when supplied', () => {
@@ -103,7 +103,7 @@ describe('emf-metrics', () => {
       const out = lastLog();
       const aws = out._aws as { CloudWatchMetrics: Array<{ Dimensions: string[][] }> };
       expect(aws.CloudWatchMetrics[0].Dimensions).toEqual([['Stage']]);
-      expect(out.UserTier).toBeUndefined();
+      expect(out.UserClearance).toBeUndefined();
       expect(out.Intent).toBeUndefined();
     });
   });

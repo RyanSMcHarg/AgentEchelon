@@ -295,7 +295,7 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
       messageId: event.requestAttributes?.['CHIME.message.id'] || randomUUID(),
       latestMessage: userMessage,
       intent: driftIntent,
-      userTier: tier,
+      userClearance: tier,
       declinedDistances: routing.declinedDistances,
     });
 

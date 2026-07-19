@@ -170,7 +170,7 @@ describe('basic-tier drift path (basic had no drift before the re-home)', () => 
     expect(mockDetectDrift).toHaveBeenCalledTimes(1);
     // detectDrift gets the tier as its EMF dimension and the uppercased intent.
     expect(mockDetectDrift).toHaveBeenCalledWith(
-      expect.objectContaining({ channelArn: CHANNEL, userTier: 'basic', intent: 'GENERAL' }),
+      expect.objectContaining({ channelArn: CHANNEL, userClearance: 'basic', intent: 'GENERAL' }),
     );
     expect(mockRecordDriftFire).toHaveBeenCalledTimes(1);
     expect(mockSavePending).toHaveBeenCalledTimes(1);

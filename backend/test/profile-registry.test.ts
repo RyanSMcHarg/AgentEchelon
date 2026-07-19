@@ -39,7 +39,7 @@ describe('profile-registry (default config = legacy behavior)', () => {
     expect(reg.min('standard', 'standard')).toBe('standard'); // tie -> first arg
   });
 
-  it('clearanceForGroups reproduces resolveUserTier (highest match; default basic)', () => {
+  it('clearanceForGroups reproduces resolveUserClearance (highest match; default basic)', () => {
     expect(reg.clearanceForGroups(['premium'])).toBe('premium');
     expect(reg.clearanceForGroups(['basic', 'premium'])).toBe('premium'); // highest wins
     expect(reg.clearanceForGroups(['standard'])).toBe('standard');

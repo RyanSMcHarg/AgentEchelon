@@ -89,10 +89,10 @@ export function classifyMember(
 
 /** Pure: is the member's tier below the channel's classification? Unknown tiers fail safe
  *  (member defaults to the lowest rank, channel to `basic`). */
-export function isClassificationViolation(memberTier: string, channelClassification: string): boolean {
+export function isClassificationViolation(memberClearance: string, channelClassification: string): boolean {
   // Unknown member clearance ranks BELOW everything (0) so it always over-reports (fail-safe);
   // unknown channel classification defaults to the fail-closed floor. Ranks come from the registry.
-  const m = profiles.isKnownClassification(memberTier) ? profiles.rank(memberTier) : 0;
+  const m = profiles.isKnownClassification(memberClearance) ? profiles.rank(memberClearance) : 0;
   const c = profiles.isKnownClassification(channelClassification) ? profiles.rank(channelClassification) : profiles.rank(profiles.failClosedValue);
   return m < c;
 }
@@ -122,7 +122,7 @@ async function isEnforcing(): Promise<boolean> {
 
 /** Persist each finding so the admin dashboard can review it and take manual action. Best-effort. */
 async function writeFinding(f: {
-  kind: string; channelArn: string; memberArn: string; subjectTier: string; channelClassification: string; action: string;
+  kind: string; channelArn: string; memberArn: string; subjectClearance: string; channelClassification: string; action: string;
 }): Promise<void> {
   if (!ddb) return;
   const ts = new Date().toISOString();
@@ -240,7 +240,7 @@ async function handleViolation(
   channelArn: string,
   memberArn: string,
   subjectId: string,
-  subjectTier: string,
+  subjectClearance: string,
   channelClassification: string,
 ): Promise<void> {
   const adminArn = await getAdminArn();
@@ -251,18 +251,18 @@ async function handleViolation(
     channelArn,
     memberArn,
     subject: subjectId,
-    subjectTier,
+    subjectClearance,
     channelClassification,
     action: enforcing ? 'revoked' : 'reported',
   });
-  await writeFinding({ kind, channelArn, memberArn, subjectTier, channelClassification, action: enforcing ? 'revoked' : 'reported' });
+  await writeFinding({ kind, channelArn, memberArn, subjectClearance, channelClassification, action: enforcing ? 'revoked' : 'reported' });
 
   const verb = enforcing ? 'was removed from' : 'was found on';
   const tail = enforcing
     ? 'The membership has been revoked.'
     : 'Enforcement is off; the membership was left in place. Flip the enforce toggle in the admin dashboard (or set MEMBERSHIP_AUDIT_ENFORCE) to auto-revoke.';
   const text =
-    `Security audit: a ${subjectTier}-tier ${noun} ${verb} a ${channelClassification}-tier conversation.\n` +
+    `Security audit: a ${subjectClearance}-tier ${noun} ${verb} a ${channelClassification}-tier conversation.\n` +
     `Channel: ${channelArn}\n${kind === 'assistant' ? 'Assistant' : 'Member'}: ${memberArn}\n${tail}`;
   await alertAdmins(adminArn, text, `[Security] Over-tier ${noun} on a ${channelClassification} conversation`);
 
@@ -307,11 +307,11 @@ export async function handler(event: KinesisStreamEvent, _context?: Context): Pr
       const adminArn = await getAdminArn();
       if (kind === 'user' && sub) {
         // A human BELOW the channel's tier is the leak (they would see content above their clearance).
-        const memberTier = await resolveMemberTier(sub);
-        if (!memberTier) continue; // unresolvable identity — skip
+        const memberClearance = await resolveMemberTier(sub);
+        if (!memberClearance) continue; // unresolvable identity — skip
         const channelClassification = await resolveChannelClassification(channelArn, adminArn);
-        if (isClassificationViolation(memberTier, channelClassification)) {
-          await handleViolation('member', channelArn, memberArn, sub, memberTier, channelClassification);
+        if (isClassificationViolation(memberClearance, channelClassification)) {
+          await handleViolation('member', channelArn, memberArn, sub, memberClearance, channelClassification);
         }
       } else if (kind === 'bot') {
         // An assistant ABOVE the channel's tier is the leak: it answers with its own tier's model

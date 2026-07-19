@@ -2,7 +2,7 @@
  * Profile registry (SPEC-CAPABILITY-PROFILES §3) — the ONLY place that interprets a
  * classification tag value or maps groups to clearance. Runtime sites (channel-flow,
  * router, RAG, abuse, battle, membership-audit) migrate to read through this in Phase 1,
- * replacing hardcoded VALID_CLASSIFICATIONS / TIER_RANK / TIER_GROUPS / minTier / isAdvancedTier.
+ * replacing hardcoded VALID_CLASSIFICATIONS / TIER_RANK / CLEARANCE_GROUPS / minTier / isAdvancedTier.
  *
  * Phase 0 guarantee: constructed from DEFAULT_PROFILES_CONFIG, every method returns the
  * SAME answer the legacy constants did — proven by profile-registry.test.ts. No behavior
@@ -74,7 +74,7 @@ export class ProfileRegistry {
 
   /**
    * Highest classification the caller's Cognito groups clear for; fail-closed floor when none match.
-   * Legacy: resolveUserTier — highest matching tier group, default 'basic'.
+   * Legacy: resolveUserClearance — highest matching tier group, default 'basic'.
    */
   clearanceForGroups(groups: string[]): string {
     let best = this.config.failClosedTo;

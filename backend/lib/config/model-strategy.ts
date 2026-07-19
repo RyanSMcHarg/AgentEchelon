@@ -54,7 +54,7 @@ export interface IntentRouteDefinition {
   label: string;
   primaryModel: BackendModelKey;
   fallbackModel: BackendModelKey;
-  preferredTier: ModelTier;
+  preferredClearance: ModelTier;
   rationale: string;
 }
 
@@ -286,7 +286,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'General Q&A',
     primaryModel: 'haiku',
     fallbackModel: 'sonnet',
-    preferredTier: 'basic',
+    preferredClearance: 'basic',
     rationale: 'Fast, low-cost answers default to the cheapest capable model; fall back within Anthropic (Sonnet) rather than cross-provider. Basic tier (Sonnet not allowed) simply gets no fallback.',
   },
   {
@@ -294,7 +294,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Code Generation',
     primaryModel: 'sonnet',
     fallbackModel: 'gpt_oss_20b',
-    preferredTier: 'standard',
+    preferredClearance: 'standard',
     rationale: 'Coding work should support both Anthropic and OpenAI-on-Bedrock paths without forcing a premium-only default.',
   },
   {
@@ -302,7 +302,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Code Review',
     primaryModel: 'gpt_oss_20b',
     fallbackModel: 'sonnet',
-    preferredTier: 'standard',
+    preferredClearance: 'standard',
     rationale: 'Detailed review should expose an OpenAI-on-Bedrock option while keeping a strong Anthropic fallback at the same tier.',
   },
   {
@@ -310,7 +310,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Document Extraction',
     primaryModel: 'haiku',
     fallbackModel: 'sonnet',
-    preferredTier: 'basic',
+    preferredClearance: 'basic',
     rationale: 'Extraction and parsing optimize for throughput and cost; fall back within Anthropic (Sonnet) rather than cross-provider.',
   },
   {
@@ -318,7 +318,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Report Generation',
     primaryModel: 'titan',
     fallbackModel: 'sonnet',
-    preferredTier: 'standard',
+    preferredClearance: 'standard',
     rationale: 'Structured drafting and summaries benefit from a stable drafting model with a stronger reasoning fallback.',
   },
   {
@@ -326,7 +326,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Strategic Analysis',
     primaryModel: 'opus',
     fallbackModel: 'sonnet',
-    preferredTier: 'premium',
+    preferredClearance: 'premium',
     rationale: 'Executive and strategic work should route to the deepest reasoning model available.',
   },
   {
@@ -334,7 +334,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Workflow Actions',
     primaryModel: 'sonnet',
     fallbackModel: 'haiku',
-    preferredTier: 'standard',
+    preferredClearance: 'standard',
     rationale: 'Tool-heavy workflows prefer the strongest action-group model; fall back within Anthropic (Haiku) rather than cross-provider.',
   },
 ];

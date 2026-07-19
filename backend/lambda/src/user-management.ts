@@ -63,8 +63,8 @@ async function getAdminArn(): Promise<string | null> {
 }
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || 'http://localhost:5173').split(',');
 
-const TIER_GROUPS = ['basic', 'standard', 'premium'] as const;
-type Tier = typeof TIER_GROUPS[number];
+const CLEARANCE_GROUPS = ['basic', 'standard', 'premium'] as const;
+type Tier = typeof CLEARANCE_GROUPS[number];
 
 /** Make sure the user is in exactly one tier group. Idempotent. */
 async function syncTierGroup(username: string, tier: Tier): Promise<void> {
@@ -80,7 +80,7 @@ async function syncTierGroup(username: string, tier: Tier): Promise<void> {
   }
 
   // Remove from other tier groups so the user holds exactly one tier.
-  for (const other of TIER_GROUPS) {
+  for (const other of CLEARANCE_GROUPS) {
     if (other !== tier && existing.includes(other)) {
       try {
         await cognitoClient.send(new AdminRemoveUserFromGroupCommand({
@@ -244,7 +244,7 @@ async function listUsers(): Promise<{ users: UserRecord[] }> {
 }
 
 async function approveUser(username: string, tier: string): Promise<void> {
-  const effectiveTier = (TIER_GROUPS as readonly string[]).includes(tier)
+  const effectiveTier = (CLEARANCE_GROUPS as readonly string[]).includes(tier)
     ? (tier as Tier)
     : 'basic';
 
@@ -307,7 +307,7 @@ async function enableUser(username: string): Promise<void> {
 }
 
 async function changeTier(username: string, tier: string): Promise<void> {
-  if (!(TIER_GROUPS as readonly string[]).includes(tier)) {
+  if (!(CLEARANCE_GROUPS as readonly string[]).includes(tier)) {
     throw new Error(`Invalid tier: ${tier}`);
   }
   await cognitoClient.send(new AdminUpdateUserAttributesCommand({

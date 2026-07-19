@@ -42,7 +42,7 @@ import {
 import { createTask, getActiveTask, TRIP_TASK_TTL_SECONDS, type TaskCreateOptions } from './lib/task-tracking.js';
 import { checkAndConsumeBudget, budgetCannedResponse, checkRateLimit, rateLimitMessage } from './lib/abuse-controls.js';
 // SPEC-CAPABILITY-PROFILES: the single interpreter of classification tags + group clearance.
-// Replaces the local TIER_RANK / TIER_GROUPS / minTier / isAdvancedTier / classificationScope constants.
+// Replaces the local TIER_RANK / CLEARANCE_GROUPS / minTier / isAdvancedTier / classificationScope constants.
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
 // Retrieval runs in the VPC-attached data-plane Lambda (project decision 018);
 // this handler stays non-VPC and invokes it via the client seam. Same signature.
@@ -102,7 +102,7 @@ function minTier(a: string, b: string): string {
   return profiles.min(a, b);
 }
 
-async function resolveUserTier(userSub: string): Promise<string> {
+async function resolveUserClearance(userSub: string): Promise<string> {
   if (!userSub || !USER_POOL_ID) return 'basic';
   const cached = userTierCache.get(userSub);
   if (cached && cached.expires > Date.now()) return cached.tier;
@@ -169,7 +169,7 @@ async function resolveChannelClassification(channelArn: string, botArn: string):
  * `aws:ResourceTag/classification`). We deliberately do NOT trust `metadata.modelTier`:
  * channel Metadata is mutable via `chime:UpdateChannel` (the owner `rename` cap), so
  * keying the served tier on it would let a channel moderator raise the tier a FEDERATED
- * user is served at (the federated path takes `userTier = channelClassification` with no min-cap).
+ * user is served at (the federated path takes `userClearance = channelClassification` with no min-cap).
  * The `classification` tag cannot be changed by UpdateChannel, so it is tamper-proof.
  * Fail-closed to 'basic' when the tag is absent, invalid, or unreadable.
  */
@@ -414,7 +414,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     // human); in a multi-member channel the event names no joiner, so greeting
     // `createdBy` would address the wrong person — fall back to a generic
     // welcome. Handled BEFORE the async-processor resolution: the welcome needs
-    // no processor and must not hinge on a defaulted userTier.
+    // no processor and must not hinge on a defaulted userClearance.
     // WelcomeIntent must mean the assistant/user was just ADDED to the channel —
     // a Chime SYSTEM event with NO inputTranscript. Lex sometimes misclassifies a
     // short real reply ("yes"/"no") as WelcomeIntent WITH a transcript; greeting
@@ -475,15 +475,15 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     // channel tier IS authoritative for them — trust it and skip the Cognito lookup. Without
     // this, every turn downgrades to basic and the standard processor is never invoked.
     const isFederated = userSub.startsWith('fed_');
-    const userTier = isFederated ? channelClassification : await resolveUserTier(userSub);
-    const tier = isFederated ? channelClassification : minTier(channelClassification, userTier);
+    const userClearance = isFederated ? channelClassification : await resolveUserClearance(userSub);
+    const tier = isFederated ? channelClassification : minTier(channelClassification, userClearance);
 
-    if (!isFederated && channelClassification !== userTier) {
+    if (!isFederated && channelClassification !== userClearance) {
       console.warn('[Router][SecurityEvent] Tier mismatch', {
         userSub,
         channelArn,
         channelClassification,
-        userTier,
+        userClearance,
         effectiveTier: tier,
       });
     }
@@ -497,7 +497,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     console.log('[Router] Resolved', {
       tier,
       channelClassification,
-      userTier,
+      userClearance,
       asyncProcessorArn: asyncProcessorArn.split(':').pop(),
     });
 
