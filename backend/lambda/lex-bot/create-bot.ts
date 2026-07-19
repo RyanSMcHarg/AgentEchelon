@@ -11,7 +11,7 @@ const { AWS_REGION, APP_INSTANCE_ARN, APP_INSTANCE_ADMIN_ARN, BOT_HANDLER_LAMBDA
 // Alt-bot slots (per SPEC-BATTLE.md) override with names like 'AltSlot0'.
 const BOT_NAME = process.env.BOT_NAME || 'Assistant';
 // The Chime Lex `WelcomeIntent` fires when the bot is ADDED to a channel. Default bots
-// want it (the tier router greets on join). Alt-slot battle bots set WELCOME_INTENT=''
+// want it (the classification router greets on join). Alt-slot battle bots set WELCOME_INTENT=''
 // to OMIT it: they must stay silent on join (their real battle replies come from the
 // channel-flow → premium async-processor, not Lex), and their silent Lex fulfillment
 // returns no message — which made Chime post a `{"Code":500}` system message on join.

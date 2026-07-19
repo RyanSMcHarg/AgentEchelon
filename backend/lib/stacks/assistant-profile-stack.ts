@@ -1,6 +1,6 @@
 /**
  * AssistantProfileStack — the ONE parametrized, independently-deployable stack for an assistant
- * profile (SPEC-CAPABILITY-PROFILES). It replaces the former per-tier {basic,standard,premium}-tier
+ * profile (SPEC-CAPABILITY-PROFILES). It replaces the former per-classification {basic,standard,premium}-tier
  * stacks, which were ~1787 lines of near-duplicated topology diverging only in capability.
  *
  * A `ProfileTopology` descriptor makes the divergence DATA, not three code copies:
@@ -10,11 +10,11 @@
  *     experiments + attachment-in), `imageGen` (/battle image generation-out + image guardrail),
  *     `streaming`, `battleCapable`.
  * Each profile's thin stack (basic/standard/premium-tier-stack.ts) supplies its topology; the shared
- * body here is authored once. Construct ids match the legacy per-tier stacks, so a fresh deploy mints
+ * body here is authored once. Construct ids match the legacy per-classification stacks, so a fresh deploy mints
  * the same logical resources.
  *
- * Per-profile ownership (was ADR-011's per-tier stack): a profile team now owns its topology
- * descriptor (its thin stack file), and the shared body is reviewed platform-side. Tier isolation is
+ * Per-profile ownership (was ADR-011's per-classification stack): a profile team now owns its topology
+ * descriptor (its thin stack file), and the shared body is reviewed platform-side. Classification isolation is
  * unchanged — the processor role's S3 IAM is scoped to `context/{classifications-at-or-below}/`, the
  * boundary is IAM, not Lambda logic. Shared platform contract (tasks tables, experiments, /battle
  * state) still resolves via SSM dynamic refs (NOT Fn::importValue), so profiles deploy decoupled.
@@ -84,7 +84,7 @@ export interface ProfileTopology {
   /** Standard + Premium: /battle round participation is wire-able (opt-in via props.enableBattle). */
   battleCapable: boolean;
   /** Basic only: the handler role also grants Query on the experiments GSI (experiments/index/*).
-   *  Preserved verbatim from the per-tier stacks; standard/premium query experiments by primary key. */
+   *  Preserved verbatim from the per-classification stacks; standard/premium query experiments by primary key. */
   handlerExperimentsIndex: boolean;
   /** CloudFormation Component tag value (e.g. 'Tier-Basic'). */
   componentTag: string;
@@ -118,10 +118,10 @@ export class AssistantProfileStack extends cdk.Stack {
     super(scope, id, props);
 
     const topo = props.topology;
-    // The agent-classification-common helpers are typed to the built-in Tier union. The default profiles ARE
-    // that union; a deployment-defined profile name would widen this (a follow-up when custom
+    // The agent-classification-common helpers are typed to the built-in Classification union. The default
+    // profiles ARE that union; a deployment-defined profile name would widen this (a follow-up when custom
     // profiles ship). Cast keeps the shared boundary helpers strongly typed for the shipped set.
-    const tier = topo.name as Classification;
+    const classification = topo.name as Classification;
     const modelCatalog = getModelCatalog(this.region, this.account);
     const profileModel = modelCatalog[props.profileModelSelection[topo.modelSelectionKey]];
 
@@ -147,21 +147,21 @@ export class AssistantProfileStack extends cdk.Stack {
           ]
         : [];
     }
-    const classificationModelArns = [...modelArnsForClassification(tier, modelCatalog), ...cnBedrockArns];
+    const classificationModelArns = [...modelArnsForClassification(classification, modelCatalog), ...cnBedrockArns];
 
     const shared = resolveSharedSSM(this);
     const errAlert = adminErrorAlertWiring(this, props.appInstanceArn, props.adminErrorAlertChannelArn);
-    const abuse = abuseControlsWiring(this, shared.abuseControlsArn, shared.abuseControlsName, tier, this.region, this.account);
+    const abuse = abuseControlsWiring(this, shared.abuseControlsArn, shared.abuseControlsName, classification, this.region, this.account);
     // /battle plumbing — only resolved when the profile is battle-capable AND /battle is deployed.
     const battle = topo.battleCapable && props.enableBattle ? resolveBattleSSM(this) : undefined;
 
     // ── Content guardrail (text) ────────────────────────────────────────────
     const guardrail = new AgentGuardrails(this, 'AssistantGuardrail', {
-      name: `${RES_PREFIX}-${tier}-guardrail`,
+      name: `${RES_PREFIX}-${classification}-guardrail`,
     });
     // ── Image-output guardrail (imageGen profiles only, for /battle generation-out) ──
     const imageGuardrail = topo.imageGen
-      ? new BattleImageGuardrails(this, 'BattleImageGuardrails', { name: `${RES_PREFIX}-${tier}-battle-image-guardrail` })
+      ? new BattleImageGuardrails(this, 'BattleImageGuardrails', { name: `${RES_PREFIX}-${classification}-battle-image-guardrail` })
       : undefined;
 
     // ── Async-processor execution role (the profile isolation boundary) ─────
@@ -172,7 +172,7 @@ export class AssistantProfileStack extends cdk.Stack {
         // act ONLY on channels tagged classification ∈ {this profile's rank and below}. Untagged / a
         // higher classification → no Allow → implicit deny (a tagging gap never silently grants access).
         ChimePolicy: new iam.PolicyDocument({
-          statements: classificationChannelScopedAllow(tier, props.appInstanceArn, [
+          statements: classificationChannelScopedAllow(classification, props.appInstanceArn, [
             'chime:SendChannelMessage',
             'chime:ListChannelMessages',
             'chime:GetChannelMessage',
@@ -204,12 +204,12 @@ export class AssistantProfileStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['s3:ListBucket'],
               resources: [props.attachmentsBucketArn],
-              conditions: { StringLike: { 's3:prefix': [...classificationsAllowedFor(tier).map((c) => `context/${c}/*`), 'platform-knowledge/*'] } },
+              conditions: { StringLike: { 's3:prefix': [...classificationsAllowedFor(classification).map((c) => `context/${c}/*`), 'platform-knowledge/*'] } },
             }),
             new iam.PolicyStatement({
               actions: ['s3:GetObject'],
               resources: [
-                ...classificationsAllowedFor(tier).map((c) => `${props.attachmentsBucketArn}/context/${c}/*`),
+                ...classificationsAllowedFor(classification).map((c) => `${props.attachmentsBucketArn}/context/${c}/*`),
                 `${props.attachmentsBucketArn}/platform-knowledge/*`,
               ],
             }),
@@ -281,7 +281,7 @@ export class AssistantProfileStack extends cdk.Stack {
       processorRole.addToPolicy(new iam.PolicyStatement({ actions: ['s3:PutObject', 's3:GetObject'], resources: [`${props.attachmentsBucketArn}/battle-images/*`] }));
       // Default-bot ARN read (battle default-bot resolution).
       processorRole.addToPolicy(
-        new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${botArnKey(tier)}`] }),
+        new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${botArnKey(classification)}`] }),
       );
     }
 
@@ -303,7 +303,7 @@ export class AssistantProfileStack extends cdk.Stack {
     const useParamWriter =
       this.node.tryGetContext('assistantParamWriter') === 'true' ||
       this.node.tryGetContext('assistantParamWriter') === true;
-    const systemPromptParamName = `${SSM_ROOT}/assistant/${tier}/assistant-system-prompt`;
+    const systemPromptParamName = `${SSM_ROOT}/assistant/${classification}/assistant-system-prompt`;
     const systemPromptParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${systemPromptParamName}`;
     if (topo.systemPromptParam) {
       // CONFIG GUARD: an empty persona silently falls back to the generic default (off-brand). Warn
@@ -311,7 +311,7 @@ export class AssistantProfileStack extends cdk.Stack {
       const systemPromptValue = (this.node.tryGetContext('assistantSystemPrompt') as string) || '';
       if (!systemPromptValue.trim()) {
         cdk.Annotations.of(this).addWarning(
-          `[${tier}] assistantSystemPrompt is EMPTY - the assistant will use the generic default persona ` +
+          `[${classification}] assistantSystemPrompt is EMPTY - the assistant will use the generic default persona ` +
           `(off-brand, no host grounding). Pass -c assistantSystemPrompt to set a persona.`,
         );
       }
@@ -352,8 +352,8 @@ export class AssistantProfileStack extends cdk.Stack {
       // BATTLE_ELIGIBLE (from profile.battleEligible) gates the /battle code paths; MAX_TOKENS is the
       // profile's response ceiling. Capabilities self-gate on the env below, which is set only when
       // the matching IAM is granted — so the profile's execution stays within its role.
-      PROFILE_NAME: tier,
-      BATTLE_ELIGIBLE: String(defaultProfileRegistry.profileFor(tier).battleEligible ?? false),
+      PROFILE_NAME: classification,
+      BATTLE_ELIGIBLE: String(defaultProfileRegistry.profileFor(classification).battleEligible ?? false),
       MAX_TOKENS: String(topo.maxTokens),
       MODEL_ID: profileModel.bedrockModelId,
       MODEL_NAME: profileModel.displayName,
@@ -388,7 +388,7 @@ export class AssistantProfileStack extends cdk.Stack {
       processorEnv.DEEPSEEK_API_KEY_SECRET = deepseekSecret!.secretArn;
     }
     if (topo.imageGen) {
-      processorEnv.BOT_ARN_PARAM = botArnKey(tier);
+      processorEnv.BOT_ARN_PARAM = botArnKey(classification);
       processorEnv.BATTLE_IMAGE_GUARDRAIL_ID = imageGuardrail!.guardrailId;
       processorEnv.BATTLE_IMAGE_GUARDRAIL_VERSION = imageGuardrail!.guardrailVersion;
       const maxImages = this.node.tryGetContext('battleImageMaxImages');
@@ -446,20 +446,20 @@ export class AssistantProfileStack extends cdk.Stack {
     }
 
     new ssm.StringParameter(this, 'ProcessorArnParam', {
-      parameterName: processorArnKey(tier),
+      parameterName: processorArnKey(classification),
       stringValue: asyncProcessor.functionArn,
-      description: `Async-processor ARN for ${tier} tier`,
+      description: `Async-processor ARN for ${classification} classification`,
     });
 
     // ── Per-deployment intent taxonomy (intentPackParam profiles) + onboarding-intake (all) ──
-    const intentPackParamName = `${SSM_ROOT}/assistant/${tier}/assistant-intent-pack`;
+    const intentPackParamName = `${SSM_ROOT}/assistant/${classification}/assistant-intent-pack`;
     const intentPackParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${intentPackParamName}`;
-    const onboardingIntakeParamName = `${SSM_ROOT}/assistant/${tier}/onboarding-intake`;
+    const onboardingIntakeParamName = `${SSM_ROOT}/assistant/${classification}/onboarding-intake`;
     const onboardingIntakeParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${onboardingIntakeParamName}`;
     // Welcome orientation (all profiles): optional per-assistant SSM param the deployment writes
     // (company/access/examples) to give a first-time user context. Absent ⇒ generic welcome. The
     // handler reads it on the WelcomeIntent path; the demo seed writes it (see seed-demo.ts).
-    const welcomeParamName = `${SSM_ROOT}/assistant/${tier}/welcome-orientation`;
+    const welcomeParamName = `${SSM_ROOT}/assistant/${classification}/welcome-orientation`;
     const welcomeParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${welcomeParamName}`;
     if (topo.intentPackParam) {
       const intentPackJson = (this.node.tryGetContext('assistantIntentPack') as string) || '';
@@ -467,7 +467,7 @@ export class AssistantProfileStack extends cdk.Stack {
       // default intents silently (keyword task intents already emit).
       if (!intentPackJson.trim() && topo.systemPromptParam) {
         cdk.Annotations.of(this).addWarning(
-          `[${tier}] assistantIntentPack is EMPTY - the classifier will use the generic default intents. ` +
+          `[${classification}] assistantIntentPack is EMPTY - the classifier will use the generic default intents. ` +
           `Pass -c assistantIntentPack to set the pack.`,
         );
       }
@@ -503,7 +503,7 @@ export class AssistantProfileStack extends cdk.Stack {
     // classification discovery (it IS the profile), act as this profile's bot, enforce
     // min(senderClearance, profile) via Cognito, resolve experiments, create/continue tasks, and
     // dispatch to THIS profile's async-processor. Live drift (Aurora) is wired in Aurora mode (all-profile).
-    const drift = props.auroraDriftHookup ? auroraDriftWiring(this, tier, props.auroraDriftHookup) : undefined;
+    const drift = props.auroraDriftHookup ? auroraDriftWiring(this, classification, props.auroraDriftHookup) : undefined;
 
     const handlerRole = new iam.Role(this, 'AgentHandlerRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
@@ -511,7 +511,7 @@ export class AssistantProfileStack extends cdk.Stack {
         // The handler only READS channel classification metadata + member count; it does not send.
         ChimePolicy: new iam.PolicyDocument({
           statements: [
-            ...classificationChannelScopedAllow(tier, props.appInstanceArn, ['chime:DescribeChannel', 'chime:ListChannelMemberships'], { bearerResources: [`${props.appInstanceArn}/bot/*`] }),
+            ...classificationChannelScopedAllow(classification, props.appInstanceArn, ['chime:DescribeChannel', 'chime:ListChannelMemberships'], { bearerResources: [`${props.appInstanceArn}/bot/*`] }),
             // Read the immutable `classification` tag to resolve the served profile. A tag-READ cannot
             // itself be gated (it is how the profile is learned) — read-only, discloses only the tag.
             new iam.PolicyStatement({ actions: ['chime:ListTagsForResource'], resources: [`${props.appInstanceArn}/channel/*`] }),
@@ -521,7 +521,7 @@ export class AssistantProfileStack extends cdk.Stack {
           new iam.PolicyStatement({ actions: ['bedrock:InvokeModel'], resources: classificationModelArns }),
         ] }),
         SSMPolicy: new iam.PolicyDocument({ statements: [
-          new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${botArnKey(tier)}`] }),
+          new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${botArnKey(classification)}`] }),
         ] }),
         DynamoDBPolicy: new iam.PolicyDocument({ statements: [
           new iam.PolicyStatement({
@@ -543,7 +543,7 @@ export class AssistantProfileStack extends cdk.Stack {
     });
     if (drift) {
       drift.grantTo(handlerRole);
-      for (const stmt of driftChannelCreateStatements(tier, props.appInstanceArn, this.region, this.account)) {
+      for (const stmt of driftChannelCreateStatements(classification, props.appInstanceArn, this.region, this.account)) {
         handlerRole.addToPolicy(stmt);
       }
     }
@@ -558,14 +558,14 @@ export class AssistantProfileStack extends cdk.Stack {
     );
 
     const handlerEnv: Record<string, string> = {
-      TIER: tier,
+      TIER: classification,
       ...(drift?.env ?? {}),
       ...(drift ? { CHANNEL_FLOW_ARN_PARAM: CHANNEL_FLOW_ARN_SSM_KEY } : {}),
       SSM_ROOT,
       ONBOARDING_INTAKE_PARAM: onboardingIntakeParamName,
       ASSISTANT_WELCOME_PARAM: welcomeParamName,
-      BOT_ARN_PARAM: botArnKey(tier),
-      [`${tier.toUpperCase()}_ASYNC_PROCESSOR_ARN`]: asyncProcessor.functionArn,
+      BOT_ARN_PARAM: botArnKey(classification),
+      [`${classification.toUpperCase()}_ASYNC_PROCESSOR_ARN`]: asyncProcessor.functionArn,
       APP_INSTANCE_ARN: props.appInstanceArn,
       AWS_ACCOUNT_ID: this.account,
       USER_POOL_ID: shared.cognitoUserPoolId,
@@ -657,7 +657,7 @@ export class AssistantProfileStack extends cdk.Stack {
     const lexResource = new cdk.CustomResource(this, 'CreateLexBotResource', {
       serviceToken: lexProvider.serviceToken,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
-      properties: { tier, botName: `Assistant-${tier}` },
+      properties: { tier: classification, botName: `Assistant-${classification}` }, // `tier` property key is the create-lex-bot custom-resource contract (PR5b)
     });
     const lexBotAliasArn = lexResource.getAtt('LexBotAliasArn').toString();
 
@@ -677,7 +677,7 @@ export class AssistantProfileStack extends cdk.Stack {
         APP_INSTANCE_ARN: props.appInstanceArn,
         BOT_HANDLER_LAMBDA_ARN: handlerArn,
         LEX_BOT_ALIAS_ARN: lexBotAliasArn,
-        BOT_NAME: `Assistant-${tier}`,
+        BOT_NAME: `Assistant-${classification}`,
       },
       handler: 'handler',
       role: createBotRole,
@@ -695,15 +695,15 @@ export class AssistantProfileStack extends cdk.Stack {
     this.appInstanceBotArn = botResource.getAtt('AppInstanceBotArn').toString();
 
     new ssm.StringParameter(this, 'TierBotArnParam', {
-      parameterName: botArnKey(tier),
+      parameterName: botArnKey(classification),
       stringValue: this.appInstanceBotArn,
-      description: `AppInstanceBot ARN for ${tier} tier — read by create-conversation`,
+      description: `AppInstanceBot ARN for ${classification} classification — read by create-conversation`,
     });
 
     new cdk.CfnOutput(this, 'TierAsyncProcessorArn', { value: asyncProcessor.functionArn });
     new cdk.CfnOutput(this, 'TierAppInstanceBotArn', { value: this.appInstanceBotArn });
 
     cdk.Tags.of(this).add('Component', topo.componentTag);
-    cdk.Tags.of(this).add('Tier', tier);
+    cdk.Tags.of(this).add('Tier', classification);
   }
 }
