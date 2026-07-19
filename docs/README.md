@@ -21,7 +21,7 @@ Design-only specs live under [`design/`](design/).
 
 ## Operate it (run a deployment day to day)
 
-- [`guides/admin/ADMIN-GUIDE.md`](guides/admin/ADMIN-GUIDE.md) - the admin console: sections, moderation surface, Athena-vs-Aurora behavior.
+- [`guides/admin/ADMIN-GUIDE.md`](guides/admin/ADMIN-GUIDE.md) - the admin console: sections, administration surface, Athena-vs-Aurora behavior.
 - [`guides/admin/ADMIN-INTEGRATION-GUIDE.md`](guides/admin/ADMIN-INTEGRATION-GUIDE.md) - run the operator surface behind your own admin console and admin auth.
 - [`guides/admin/AURORA-MODE-GUIDE.md`](guides/admin/AURORA-MODE-GUIDE.md) - deploy and operate the opt-in Aurora mode (RAG, drift, evaluation).
 - [`guides/admin/GUIDE-AB-TESTING-AND-BATTLES.md`](guides/admin/GUIDE-AB-TESTING-AND-BATTLES.md) - run an A/B experiment and the `/battle` head-to-head flow.

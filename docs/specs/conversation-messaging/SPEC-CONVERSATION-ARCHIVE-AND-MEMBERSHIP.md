@@ -14,7 +14,7 @@ Design anchors (verified against the code):
 
 ## The capability reality (why this needs a backend path)
 
-The credential-exchange model draws a hard line between the **chat plane** (the user's own `${sub}` identity, least-privilege) and the **admin plane** (`${sub}-admin`, moderation caps, per-channel and audited). See `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md` and `SPEC-CREDENTIAL-EXCHANGE.md`.
+The credential-exchange model draws a hard line between the **chat plane** (the user's own `${sub}` identity, least-privilege) and the **admin plane** (`${sub}-admin`, admin caps incl. per-channel redact, audited). See `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md` and `SPEC-CREDENTIAL-EXCHANGE.md`.
 
 - **Self-leave is almost reachable but not vendable.** The chat-plane IAM ceiling already permits `chime:DeleteChannelMembership` pinned to the caller's own ARN (`cognito-auth-stack.ts:472`, `grantPinnedExchangePermissions`). But no `CAPABILITY_ACTIONS` entry vends it: the only capability containing `DeleteChannelMembership` is `manage-membership`, which is a `MODERATION_CAP` (admin-plane only, `credential-exchange.ts:79,93`). So a chat user cannot currently request a "leave" cred.
 - **Removing another member is not reachable on the chat plane at all.** The chat-plane grant pins the membership resource to `${sub}` (`PINNED_USER_ARN`), so a chat cred can only ever delete the caller's own membership, never another member's. Removing someone else, or archiving-for-all, is fundamentally an admin-plane / app-instance-admin action.
@@ -71,7 +71,7 @@ UI: **"Archive"** for the conversation-level action and **"Remove"** for a singl
 ## Out of scope / non-goals
 - Channel deletion (`chime:DeleteChannel`) - never, it would destroy the admin archive too.
 - Un-archive / restore for the user - archive is defined as permanent loss of the user's access; only an admin re-add could restore membership, which is an admin action, not part of this feature.
-- Message-level deletion/redaction - separate (moderation) concern.
+- Message-level deletion/redaction - separate (moderation/administration) concern.
 
 ## Resolved decisions
 1. **Archive scope:** whole-conversation - all members, read-only for everyone (not a per-user hide).

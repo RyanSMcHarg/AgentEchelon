@@ -91,7 +91,7 @@ Retention is set across two domains - live conversations and the archive - with 
 - **← Identity & Access:** the identities and bearer-pinned roles the credential exchange vends are exactly what auditing records acting and joining. Because every actor is an AWS resource and every action an IAM-authenticated call, **AWS CloudTrail is the infrastructure-level complement** to the app-level archive - the deployer gets a second, independent audit substrate for free.
 - **← Conversation Configuration:** the conversation (channel) is the audit unit; its `classification` tags the sensitivity of the records it produces, which drives how the audit store must be protected (§6).
 - **← Connectors:** an externally-resolved participant admitted via a connector is audited like any other member - admission is backend, so the membership event is captured the same way.
-- **↔ Moderation (`SPEC-MODERATION.md`):** auditing and moderation share this capture. Moderation's near-real-time Kinesis tap and the admin console's after-the-fact membership view are two reads of the same stream; this spec owns the *retention and integrity* of the record, moderation owns *acting on* it.
+- **↔ Moderation (`SPEC-MODERATION.md`):** auditing and moderation share this capture. the content-moderation near-real-time Kinesis tap and the admin console's after-the-fact membership view are two reads of the same stream; this spec owns the *retention and integrity* of the record, administration (the admin console) owns *acting on* it.
 
 ## 6. Security & integrity (what must stay true)
 

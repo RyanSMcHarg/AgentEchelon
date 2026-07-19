@@ -134,7 +134,7 @@ deny. (A deny-on-higher fails OPEN on untagged/legacy channels - a real hole.)
 | Basic (user role + assistant) | `{basic}` |
 | Standard | `{basic, standard}` |
 | Premium | `{basic, standard, premium}` |
-| Admin (user role) | any (unconditioned - moderation spans tiers) |
+| Admin (user role) | any (unconditioned - administration spans tiers) |
 
 Per-member membership actions (`CreateChannelMembership` / `DeleteChannelMembership`
 / `DescribeChannelMembership`) authorize against the **AppInstanceUser** resource
@@ -185,9 +185,9 @@ tier, Team is set at creation, Open = `basic`). Levels: **RW** = read + write,
 | Premium assistant | RW | RW | RW | - |
 | HIDDEN observer / admin-console² | RO | RO | RO | RO |
 
-¹ Admins are unconditioned (moderation spans tiers), so they also reach untagged
+¹ Admins are unconditioned (administration spans tiers), so they also reach untagged
 channels - the only role that does. ² **Read-only** is Amazon Chime SDK-enforced for `HIDDEN`
-members (spec §10) and for the app-instance-admin moderation surface (archive-backed
+members (spec §10) and for the app-instance-admin administration surface (archive-backed
 viewing); they observe without a send capability.
 
 ### Per-action breakdown (what "RW" decomposes into, and how each is gated)

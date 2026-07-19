@@ -1,11 +1,13 @@
-# SPEC - Moderation Model (surfaces)
+# SPEC - Content Moderation Model (surfaces)
 
-**Status:** Partial (the built moderation surfaces plus the can-work design; assistant-neutral)
+**Status:** Partial (the built content-moderation surfaces plus the can-work design; assistant-neutral)
 
 
 > **Scope.** How content moderation works (and *can* work) in AgentEchelon, and
 > how the admin console operates. Assistant-neutral; OSS deployers can read this
 > regardless of tooling.
+
+> **Two axes, do not conflate them.** This document is about **content moderation** - filtering or reviewing message *content* at several lifecycle surfaces. That is separate from the **identity distinction** owned by [`SPEC-ADMIN-IDENTITY.md`](SPEC-ADMIN-IDENTITY.md): a channel-scoped Amazon Chime SDK **`ChannelModerator`** (moderation - redact within one channel) versus a cross-conversation **`AppInstanceAdmin`** (administration - delete, act on any conversation). The **admin console is an administration surface**; it appears below only because it is where an operator *acts on* the archive, not because it is content moderation.
 
 AgentEchelon moderates content at **several distinct surfaces** - each at a different point in the message lifecycle, with a different identity and different powers. The principal surfaces are below. **This is not a closed set of exactly N**: surfaces can be added (another stream consumer, a richer client-side gate, a per-tier policy hook) without disturbing the others. Keep them distinct - do not conflate the bot / inference / stream layers with the admin layer.
 
@@ -14,7 +16,7 @@ AgentEchelon moderates content at **several distinct surfaces** - each at a diff
 | **Real-time** (channel flow) | synchronous, *before* delivery | the channel-flow processor / default assistant | inspect, block, rewrite a message in-flight | hook exists, minimal use today |
 | **Inference-layer** (Bedrock Guardrails) | at model invocation, on prompt **and** completion | the per-tier agent's attached Guardrail | anonymize / block PII, prompt-injection, and metadata markers in model input + output | active on every agent turn |
 | **Near-real-time** (Kinesis tap) | async, just after delivery | a dedicated stream consumer | observe + react (flag, notify, auto-act) without blocking delivery | **possible, not wired today** |
-| **Admin console** | out-of-band, any time | the operator's own **`${sub}-admin`** identity (client-side) | review the archive + take manual/automated action across conversations (redact, **delete**) | active surface for operators |
+| **Admin console** (administration) | out-of-band, any time | the operator's own **`${sub}-admin`** app-instance-admin identity (client-side) | review the archive + take manual/automated action across conversations (redact, **delete**) | active surface for operators |
 | **Client-side pre-send** (lightweight) | before send, in the composer | the user's own session | validate/block malformed sends (e.g. multi-target `@mention`) before they reach Amazon Chime SDK | active, advisory |
 
 The five above are today's surfaces; the model is deliberately open. New moderation foci slot in by lifecycle point + identity without renumbering the others - which is why this spec names surfaces rather than relying on a fixed ordinal.
@@ -28,12 +30,12 @@ Each per-tier agent has a **Bedrock Guardrail** (`backend/lib/constructs/bedrock
 ## Near-real-time moderation - Kinesis tap (extension point)
 Amazon Chime SDK messages already stream to **Kinesis** (the archival pipeline: Amazon Chime SDK → Kinesis → Firehose → S3 → Athena; Aurora in Aurora mode). A moderation consumer can subscribe to the **same Kinesis stream** to react to messages asynchronously - flagging, alerting, or invoking the admin service user to act - **without** adding latency to delivery (unlike the channel-flow surface). This is **not wired today**, but the stream is the integration point; document it so it isn't reinvented. (AE's stream is currently archival-only; a richer real-time stream processor is the natural extension here.)
 
-## Admin console: archive read + client-side moderation
+## Admin console: archive read + admin actions (administration)
 The admin console (admin dashboard **Conversations** tab, backed by `backend/lambda/src/admin-conversations.ts` for reads) is how an operator checks operational health, sees how assistants are performing, and takes manual action across conversations.
 
 **Viewing reads the ARCHIVE, not live Amazon Chime SDK.** Conversations and messages come from the analytics archive - Athena over the `conversations` Glue table (`conversations/user_type={tier}/year=/month=/day=/` on S3) in Athena mode, or the Postgres `messages`/`exchanges` tables in Aurora mode. Rebuilding the list by enumerating live Amazon Chime SDK channels is wrong: with per-tier ownership no single bot sees every channel, and the archive is the system of record for history anyway.
 
-**Action runs client-side, as the operator's own admin identity.** Moderation is NOT server-side. The admin console requests an `identity:'admin'` credential from the Credential-Exchange (scoped to the target channel, short-lived, audited) and calls Amazon Chime SDK directly with the operator's own `${sub}-admin` bearer (`chimeService.ts`; see `SPEC-ADMIN-IDENTITY.md`):
+**Action runs client-side, as the operator's own admin identity.** These admin actions are NOT server-side. The admin console requests an `identity:'admin'` credential from the Credential-Exchange (scoped to the target channel, short-lived, audited) and calls Amazon Chime SDK directly with the operator's own `${sub}-admin` bearer (`chimeService.ts`; see `SPEC-ADMIN-IDENTITY.md`):
 - **Redact:** blanks a message's content. A channel **moderator** (who must also be a member) can redact; so can the operator's `${sub}-admin` identity, membership-free.
 - **Delete:** removes the message. **Requires an app-instance-admin**, so a moderator or per-tier bot CANNOT delete; the operator's `${sub}-admin` identity holds that authority.
 
@@ -43,7 +45,7 @@ Each admin has a separate `${sub}-admin` `AppInstanceUser`, registered as an `Ap
 `frontend/src/utils/mentionParser.ts` (`parseMentions`) validates the composer's outgoing message before it reaches Amazon Chime SDK - e.g. it rejects multi-target mentions (`Target` is fixed at 1 by the AWS API) and `@all` mixed with explicit mentions, surfacing the error in the composer and blocking the send. This is advisory, not a security boundary (a determined client can bypass it), but it is a real moderation focus at the earliest point in the lifecycle. Authoritative enforcement lives server-side (channel flow, Guardrails, tier IAM).
 
 ### Why the admin ARN is narrowly scoped
-A common pattern is to use an app-instance-admin ARN **broadly** as the bearer for elevated operations (adding members, meetings, attachments, channel creation). **AE deliberately does NOT.** Per per-tier ownership (`docs/specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md`, tenet "the bot operates as itself"), conversation creation, membership, and sends run as the **per-tier bot** that owns the channel - never a shared admin. AE scopes the app-instance-admin to **admin-console moderation only** (redact/delete + archive viewing). This keeps tenant isolation intact while still giving operators a real moderation lever.
+A common pattern is to use an app-instance-admin ARN **broadly** as the bearer for elevated operations (adding members, meetings, attachments, channel creation). **AE deliberately does NOT.** Per per-tier ownership (`docs/specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md`, tenet "the bot operates as itself"), conversation creation, membership, and sends run as the **per-tier bot** that owns the channel - never a shared admin. AE scopes the app-instance-admin to **admin-console actions only** (redact/delete + archive viewing). This keeps tenant isolation intact while still giving operators a real administrative lever.
 
 ## Authority quick-reference
 | Action | Per-tier bot (channel moderator) | App-instance-admin |

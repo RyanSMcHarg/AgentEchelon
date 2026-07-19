@@ -1,14 +1,14 @@
 # Bringing Your Own Admin Console & Admin Auth
 
 This guide explains how to run AgentEchelon's operator surface - analytics,
-moderation, evaluations, experiments - **behind your own application's admin
+administration, evaluations, experiments - **behind your own application's admin
 console and admin authentication**, instead of AgentEchelon's built-in Cognito
 `admins` group and React dashboard.
 
 It is the **operator-plane twin** of
 [IDENTITY-PROVIDER-GUIDE.md](../user/IDENTITY-PROVIDER-GUIDE.md). That guide covers the
 **user plane** (who can chat, at which tier). This one covers the **admin plane**
-(who can see analytics and moderate). The two are independent - you can swap one,
+(who can see analytics and administer conversations). The two are independent - you can swap one,
 both, or neither.
 
 > **TL;DR.** AgentEchelon ships standalone with its own admin (a Cognito `admins`
@@ -26,7 +26,7 @@ A standalone AgentEchelon deployment owns both planes with Cognito:
 | Plane | What it gates | Standalone default | Host-owned option |
 |-------|---------------|--------------------|-------------------|
 | **User** | Who can chat, at which tier | AE Cognito user pool + tier groups | Your IdP - [IDENTITY-PROVIDER-GUIDE.md](../user/IDENTITY-PROVIDER-GUIDE.md) |
-| **Admin** | Who can see analytics / moderate | AE Cognito `admins` group + AE dashboard | **This guide** |
+| **Admin** | Who can see analytics / administer | AE Cognito `admins` group + AE dashboard | **This guide** |
 
 The same principle from the IdP guide - *the access-control model is
 identity-provider-agnostic* - applies here: **admin is a claim you choose, not
@@ -51,7 +51,7 @@ The authorizers that gate the operator plane:
 | Analytics query (Athena) | `backend/lib/stacks/analytics-stack.ts` (`AnalyticsAuthorizer`) |
 | Analytics query (Aurora) | `backend/lib/stacks/analytics-stack-aurora.ts` |
 | User management | `backend/lib/stacks/cognito-auth-stack.ts` (`UserMgmtAuthorizer`) |
-| Admin conversations / moderation | `backend/lib/stacks/cognito-auth-stack.ts` (`AdminConversationAuthorizer`) |
+| Admin conversations / administration | `backend/lib/stacks/cognito-auth-stack.ts` (`AdminConversationAuthorizer`) |
 | User feedback (admin GET summary) | `backend/lib/stacks/cognito-auth-stack.ts` |
 
 To host-own the admin plane you change **two things**: the *claim* that
@@ -128,7 +128,7 @@ and its own admin pool can be removed.
   YOUR backend proxies to AE admin/analytics endpoint
           │  signed with a service credential (IAM SigV4 / shared secret)
           ▼
-  AE endpoint trusts the service principal  →  returns analytics / performs moderation
+  AE endpoint trusts the service principal  →  returns analytics / performs conversation administration
 ```
 
 **What to change:**
@@ -152,14 +152,18 @@ this is the recommended path when "AE = infrastructure, my app = identity."
 
 ---
 
-## Moderation identity is already portable
+## Admin identity is already portable
 
-Whichever approach you choose, **moderation actions don't depend on which pool
-authenticated the operator.** Redact / delete / add-member run as the service
-**app-instance-admin** identity (resolved from SSM) and are audit-logged to
-CloudWatch (`_auditEvent: admin_redact | admin_delete | admin_add_member | …`).
-So you keep the full moderation audit trail no matter who owns admin auth - you
-are only changing *who is allowed to ask*, not *who the action runs as*.
+Whichever approach you choose, **admin actions don't depend on which pool
+authenticated the operator.** Redact / delete / add-member run as the operator's
+own `${sub}-admin` app-instance-admin identity, vended per action via the
+credential-exchange admin plane (the dedicated **service** app-instance-admin is
+used only for no-human automation, e.g. membership-audit auto-revoke), and are
+audit-logged to CloudWatch (`_auditEvent: admin_redact | admin_delete |
+admin_add_member | …`). So you keep the full admin audit trail no matter who owns
+admin auth - the operator's admin claim resolves to an AE-side `${sub}-admin`, so
+you are only changing *who is allowed to ask*, not the AE app-instance identity the
+action runs as.
 
 ---
 

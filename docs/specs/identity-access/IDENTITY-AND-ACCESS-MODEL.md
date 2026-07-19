@@ -14,9 +14,9 @@
 - **"Admin" is three distinct things** ([§3](#3-the-three-admins)):
   1. the Cognito **`admins` group** (a claim) - gates the admin console/API and unlocks the cross-tier rung of the credential exchange;
   2. the **`AdminAuthenticatedRole`** IAM role - **empty and powerless**, kept only so the Identity Pool can resolve a principal;
-  3. the Amazon Chime SDK **`app-instance-admin`** identities that hold cross-channel redact+delete: a dedicated **service** identity (not a human) for automated moderation, plus each human admin's own **separate `${sub}-admin`** `AppInstanceUser` (their chat identity `${sub}` is never registered), whose scoped credential the admin wields client-side.
+  3. the Amazon Chime SDK **`app-instance-admin`** identities that hold cross-channel redact+delete: a dedicated **service** identity (not a human) for automated administration, plus each human admin's own **separate `${sub}-admin`** `AppInstanceUser` (their chat identity `${sub}` is never registered), whose scoped credential the admin wields client-side.
 - **The frontend reaches Amazon Chime SDK *only* through the credential exchange** (bearer-pinned, classification-capped). The Identity-Pool tier roles grant **nothing** for Amazon Chime SDK - there is no Identity-Pool fallback.
-- **Human admins moderate CLIENT-SIDE as their own `${sub}-admin` identity.** The credential exchange vends a per-channel, short-lived, audited cred (`identity:'admin'`) pinned to `${sub}-admin`; the console calls Amazon Chime SDK redact/delete/membership directly, attributed to the human at the Amazon Chime SDK layer and in an audit event (`admin_scoped_credential_vend`). The chat identity `${sub}` is never elevated. The dedicated service identity handles automated, no-human paths.
+- **Human admins administer CLIENT-SIDE as their own `${sub}-admin` identity.** The credential exchange vends a per-channel, short-lived, audited cred (`identity:'admin'`) pinned to `${sub}-admin`; the console calls Amazon Chime SDK redact/delete/membership directly, attributed to the human at the Amazon Chime SDK layer and in an audit event (`admin_scoped_credential_vend`). The chat identity `${sub}` is never elevated. The dedicated service identity handles automated, no-human paths.
 
 ---
 
@@ -29,7 +29,7 @@
 | **App-layer AuthZ**     | API Gateway Cognito authorizer + `auth.ts` guards       | Gate admin/tier APIs on the group claim                         | `requireAdmin`/`callerIsAdmin`/`requireGroup`                                                                     |
 | **Data-plane creds**    | **Credential exchange** (STS rung roles, bearer-pinned) | The *only* way the SPA gets Amazon Chime SDK creds; caps by classification | `cognito-auth-stack.ts` `grantPinnedExchangePermissions`, `credential-exchange.ts`, `SPEC-CREDENTIAL-EXCHANGE.md` |
 | **Identity-Pool roles** | `AuthenticatedRole` + per-tier roles                    | **Empty** - principal resolution only, no Amazon Chime SDK power           | `cognito-auth-stack.ts` `makeTierRole`                                                                            |
-| **Moderation identity** | Per-human `${sub}-admin` (client-side) + service `app-instance-admin` (automation) | Cross-channel redact **and** delete                             | `credential-exchange.ts`, `SPEC-ADMIN-IDENTITY.md`, `SPEC-MODERATION.md`                                          |
+| **Administration identity** | Per-human `${sub}-admin` (client-side) + service `app-instance-admin` (automation) | Cross-channel redact **and** delete                             | `credential-exchange.ts`, `SPEC-ADMIN-IDENTITY.md`, `SPEC-MODERATION.md`                                          |
 | **Channel boundary**    | IAM `aws:ResourceTag/classification` on channel actions | min(userTier, channelTier), fail-closed ALLOW                   | `agent-tier-common.tierChannelScopedAllow`                                                                        |
 
 Two facts most readers get wrong, both verified in code:
@@ -59,16 +59,16 @@ They share a word and nothing else. Keep them separate or the model won't make s
 ### 3.3 Amazon Chime SDK `app-instance-admin` - service AND per-human identities
 
 See `SPEC-ADMIN-IDENTITY.md` for the full model. Two kinds of app-instance-admin exist:
-- **The service app-instance-admin:** a single dedicated **service** `AppInstanceUser` (`AppInstanceUserId = agent-echelon-admin`), created and registered as an `AppInstanceAdmin` by the `create-app-instance-admin.ts` custom resource; ARN in SSM (`/agent-echelon/app-instance-admin-arn`). Not a human, not tied to any Cognito user. It is used for **automated, no-human** moderation (for example membership-audit auto-revoke).
+- **The service app-instance-admin:** a single dedicated **service** `AppInstanceUser` (`AppInstanceUserId = agent-echelon-admin`), created and registered as an `AppInstanceAdmin` by the `create-app-instance-admin.ts` custom resource; ARN in SSM (`/agent-echelon/app-instance-admin-arn`). Not a human, not tied to any Cognito user. It is used for **automated, no-human** administration (for example membership-audit auto-revoke).
 - **Per-human admin identities:** each human admin has a SEPARATE `${sub}-admin` `AppInstanceUser` registered as an `AppInstanceAdmin` (their chat identity `${sub}` is never registered). Human-initiated moderation runs **client-side** from the admin's own browser, using the `${sub}-admin` bearer, vended per-channel, short-lived, and audited by the Credential-Exchange (`identity:'admin'`; see `SPEC-ADMIN-IDENTITY.md`). It is attributed to the human at the Amazon Chime SDK layer and revoked per person.
 
 **What either holds:** cross-channel **redact AND delete**, authority a channel moderator (redact-only) and the per-tier bots (moderators of their own channels only) do **not** have.
 
-**The admin identity's cred is a browser credential; the service one is not.** The Credential-Exchange vends the `${sub}-admin` moderation cred to the admin's browser only on an `identity:'admin'` request: scoped to one channel, short-lived, and recorded as `admin_scoped_credential_vend`. The admin console then calls Amazon Chime SDK redact / delete / membership directly (`chimeService.ts`). The chat identity `${sub}` is never vended moderation creds. The service app-instance-admin is used only for no-human automation. Attribution is native at the Amazon Chime SDK layer (the human's own `${sub}-admin` ARN) **and** in the audit trail.
+**The admin identity's cred is a browser credential; the service one is not.** The Credential-Exchange vends the `${sub}-admin` admin-plane cred to the admin's browser only on an `identity:'admin'` request: scoped to one channel, short-lived, and recorded as `admin_scoped_credential_vend`. The admin console then calls Amazon Chime SDK redact / delete / membership directly (`chimeService.ts`). The chat identity `${sub}` is never vended admin-plane creds. The service app-instance-admin is used only for no-human automation. Attribution is native at the Amazon Chime SDK layer (the human's own `${sub}-admin` ARN) **and** in the audit trail.
 
 ### 3.4 The Amazon Chime SDK implicit-role model (the layer beneath admin #3)
 
-The three "admins" above are AgentEchelon's constructs. Underneath, Amazon Chime SDK Messaging enforces its **own** authorization model - the "implicit roles" - that operates *in addition to* IAM. Understanding it is what makes §3.3 precise, and it is why a **service** `app-instance-admin` is the right (and necessary) tool for cross-channel moderation.
+The three "admins" above are AgentEchelon's constructs. Underneath, Amazon Chime SDK Messaging enforces its **own** authorization model - the "implicit roles" - that operates *in addition to* IAM. Understanding it is what makes §3.3 precise, and it is why a **service** `app-instance-admin` is the right (and necessary) tool for cross-channel administration.
 
 **Implicit roles are a second, independent gate.** Authority is a function of the caller's **role relative to the channel** (AppInstanceAdmin / ChannelModerator / Member / Non-member), enforced by the Amazon Chime SDK back end regardless of what IAM says. From the AWS authorization-by-role reference ([`chime-sdk/.../auth-by-role.html`](https://docs.aws.amazon.com/chime-sdk/latest/dg/auth-by-role.html)), the meaning of a **Denied** cell is explicit:
 
@@ -94,7 +94,7 @@ Two channel properties shape the Member rows: **`Mode`** (`RESTRICTED` → only 
 - `RedactChannelMessage` → **tombstone**: the message "exists in the back end, but the action returns null content, and the state shows as redacted" (`Redacted=true`). **Moderator or admin** can redact any message; a member can redact their **own**.
 - `DeleteChannelMessage` → **removal**: "Deletes a channel message. **Only admins can perform this action.** … A background process deletes any revisions created by `UpdateChannelMessage`." **AppInstanceAdmin-only** - `ChannelModerator` and `Member` are both **Denied**.
 
-**Why this forces the service-admin design.** AE's admin console reviews **every** conversation across all tiers. To act on an arbitrary channel it needs an identity that (a) can `DeleteChannelMessage` at all - which **only** an AppInstanceAdmin can - and (b) can redact/manage a channel **without first being added to it** (admins moderate membership-free; only *sending* would require a join). A per-tier bot is only a moderator of its **own** channels; a human admin promoted to per-channel moderator would still be **delete-incapable** and would have to be added to each channel first. The service `app-instance-admin` satisfies both for automated paths, and each human admin has a separate `${sub}-admin` identity registered as an `AppInstanceAdmin` so their own client-side moderation satisfies both as themselves, each an auditable Amazon Chime SDK identity (§3.3). An `AppInstanceAdmin` is required for delete regardless of who acts.
+**Why this forces the service-admin design.** AE's admin console reviews **every** conversation across all tiers. To act on an arbitrary channel it needs an identity that (a) can `DeleteChannelMessage` at all - which **only** an AppInstanceAdmin can - and (b) can redact/manage a channel **without first being added to it** (admins moderate membership-free; only *sending* would require a join). A per-tier bot is only a moderator of its **own** channels; a human admin promoted to per-channel moderator would still be **delete-incapable** and would have to be added to each channel first. The service `app-instance-admin` satisfies both for automated paths, and each human admin has a separate `${sub}-admin` identity registered as an `AppInstanceAdmin` so their own client-side administration satisfies both as themselves, each an auditable Amazon Chime SDK identity (§3.3). An `AppInstanceAdmin` is required for delete regardless of who acts.
 
 ---
 
@@ -120,7 +120,7 @@ Groups are **additive**, and that is the intended model:
 A common question is why AgentEchelon does not put admins on a fully separate Cognito pool with a stricter admin/user split. The shipped answer, and the reasoning:
 
 - **One pool, group as authority.** Admin power is a *claim* (`admins` group) evaluated at the API layer, not a pool boundary. This keeps a single identity for a person who is both a user and an operator, and lets host-app integrations map their own admin role in via `ADMIN_GROUP_NAMES` / federation (`ADMIN-INTEGRATION-GUIDE.md`) without provisioning a second pool.
-- **The strong separation is at the *identity plane*.** An admin's ordinary (chat) browser credential can never moderate: it is pinned to `${sub}`, which is **not** an app-instance-admin, and the exchange never vends it a delete/redact action. Moderation authority lives on a SEPARATE `${sub}-admin` identity, and the exchange vends its cred only on an explicit `identity:'admin'` request: scoped to one channel, short-lived, and recorded (`admin_scoped_credential_vend`). So the blast radius of a stolen admin browser session is bounded to what the exchange vends per request, one channel at a time and each vend audited, and moderation is attributed per human at the Amazon Chime SDK layer (the `${sub}-admin` ARN), not only in the app audit trail.
+- **The strong separation is at the *identity plane*.** An admin's ordinary (chat) browser credential can never act as an admin: it is pinned to `${sub}`, which is **not** an app-instance-admin, and the exchange never vends it a delete/redact action. Admin authority lives on a SEPARATE `${sub}-admin` identity, and the exchange vends its cred only on an explicit `identity:'admin'` request: scoped to one channel, short-lived, and recorded (`admin_scoped_credential_vend`). So the blast radius of a stolen admin browser session is bounded to what the exchange vends per request, one channel at a time and each vend audited, and admin actions are attributed per human at the Amazon Chime SDK layer (the `${sub}-admin` ARN), not only in the app audit trail.
 
 ---
 
@@ -143,9 +143,9 @@ The at-a-glance the rest of the doc supports. **Enforced by** names the primitiv
 | **Delete** another user's message        | - | - | - |  ✅ *client-side*   | ✅ (automated paths) | Exchange `identity:'admin'` vends a scoped, audited cred; admin's own `${sub}-admin` bearer |
 | Add/remove **another** member            | - | - | - |  ✅ *client-side*   |     (moderator authority)      | Exchange `identity:'admin'` (manage-membership), scoped + audited; Amazon Chime SDK moderator model |
 | Remove **own** membership (leave)        |       ✅       |       ✅       |      ✅       |          ✅          |              n/a               | Exchange rung (DeleteChannelMembership pinned to self)     |
-| Hold **scoped** moderation creds in browser | - | - | - | ✅ *(one channel, short-lived)* |     n/a        | Exchange vends only on `identity:'admin'`, per channel + audited |
+| Hold **scoped admin** creds in browser | - | - | - | ✅ *(one channel, short-lived)* |     n/a        | Exchange vends only on `identity:'admin'`, per channel + audited |
 
-Reading the two admin columns together is the whole model: an **admin (group)** moderates client-side as their own `${sub}-admin` identity, using a per-channel, short-lived, audited cred the exchange vends only on an `identity:'admin'` request; the service identity covers automated, no-human paths. The admin's *chat* credential never holds moderation power.
+Reading the two admin columns together is the whole model: an **admin (group)** performs admin actions client-side as their own `${sub}-admin` identity, using a per-channel, short-lived, audited cred the exchange vends only on an `identity:'admin'` request; the service identity covers automated, no-human paths. The admin's *chat* credential never holds admin power.
 
 ---
 
@@ -232,7 +232,7 @@ The operator's *chat* credential never held delete power (step 2): the authority
 ## 8. Related docs
 
 - `SPEC-CREDENTIAL-EXCHANGE.md` - the bearer-pinned, classification-capped rung model; the *only* source of frontend Amazon Chime SDK creds.
-- `SPEC-MODERATION.md` - the three moderation surfaces and the service app-instance-admin identity (redact vs delete authority).
+- `SPEC-MODERATION.md` - the content-moderation surfaces; `SPEC-ADMIN-IDENTITY.md` - the `${sub}-admin`/service app-instance-admin identity (redact vs delete authority).
 - `SPEC-CONVERSATION-SECURITY.md` - the seven-layer isolation model.
 - `ADMIN-INTEGRATION-GUIDE.md` - the three admin-auth modes (`ae-cognito` / `service` / `federated`) and `ADMIN_GROUP_NAMES` for host-app admin identity.
 - `ADMIN-GUIDE.md` - using the console, and the admin-conversation + email notification pattern.

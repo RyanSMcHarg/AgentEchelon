@@ -3,13 +3,13 @@
 **Status:** Design (the admin-console design; for using it, see the admin guide)
 
 > The design behind the admin dashboard. For *using* it, see `docs/guides/admin/ADMIN-GUIDE.md`;
-> for the moderation identity model, `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md` and
+> for the admin identity model, `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md` and
 > `docs/specs/identity-access/SPEC-MODERATION.md`; for the analytics data sources, `docs/specs/identity-access/SPEC-ACCESS-AND-CONTROLS-AUDITING.md`.
 
 ## Personas
 
 - **Platform Administrator** - Administers an Agent Echelon instance. Owns platform
-  configuration, troubleshooting, monitoring, moderation, and user management.
+  configuration, troubleshooting, monitoring, conversation administration, and user management.
 - **Platform Engineer** - Builds and maintains the AgentEchelon implementation for their
   organization. Uses the console to debug the runtime and read raw records.
 - **AI Engineer** - Builds assistants inside the AgentEchelon project for their organization.
@@ -30,7 +30,7 @@ accountability-logging calibration noted there.
 |---|---|---|
 | Platform Administrator | View overall platform health at a glance (traffic volume, active users, error rate) | Overview > Overview |
 | Platform Administrator | Track response-latency SLOs, page web-vitals, and WebSocket connection health | Overview > Latency |
-| Platform Administrator | Moderate any conversation across tiers: view history, add or remove members, redact, delete | Conversations |
+| Platform Administrator | Administer any conversation across tiers: view history, add or remove members, redact, delete | Conversations |
 | Platform Administrator | Detect cross-tier membership leaks and revoke over-tier access | Security > Membership Audit |
 | Platform Administrator | Manage users: approve, set tier, disable, delete | Users > Manage Users |
 | Platform Administrator | Understand acquisition and engagement (DAU, messaging DAU, sign-up and sign-in funnels) | Users > Users |
@@ -55,9 +55,9 @@ accountability-logging calibration noted there.
 
 ## Design principles
 
-1. **Own-bearer moderation, archive-backed viewing.** The console *views* conversations
+1. **Own-bearer administration, archive-backed viewing.** The console *views* conversations
    from the **archive** (the system of record for history) and *acts* through the operator's
-   **own `${sub}-admin` identity**. Each live moderation action vends a per-channel,
+   **own `${sub}-admin` identity**. Each live admin action vends a per-channel,
    short-lived, audited credential from the Credential-Exchange (`identity:'admin'`) and calls
    Amazon Chime SDK directly from the browser. No server-side component holds or swaps a bearer. The
    dedicated **service** app-instance-admin exists only for no-human automation (the
@@ -81,7 +81,7 @@ just groups the sub-views. Aurora-only sub-views are filtered out in Athena mode
 | Section | Sub-views |
 |---|---|
 | Overview | Overview, Latency |
-| Conversations | Conversations (moderation surface) |
+| Conversations | Conversations (administration surface) |
 | Effectiveness | Dashboard (the L0 intent-anchored drill; the consolidation target) + Evaluations, Flows, Tasks, Steps, Flagged, Ground Truth in Aurora |
 | Models | Models, Model Strategy, Steps (Steps is Aurora-only) |
 | Experiments | Experiments |
@@ -147,7 +147,7 @@ threshold; web vitals per `WEB_VITAL_META`). See [`LATENCY-TARGETS.md`](../../gu
 
 #### Conversations tab (`ConversationsTab.tsx`, `MembershipTimeline.tsx`, `MessageInspectDrawer.tsx`)
 
-The moderation surface. It has a **Browser** view (conversation list, messages, live members,
+The conversation administration surface. It has a **Browser** view (conversation list, messages, live members,
 membership history) and a **Drift Detection** view. Viewing reads the archive through
 `admin-conversations.ts` (Athena over the `conversations` Glue table); that handler holds
 **no Amazon Chime SDK bearer**. Live members and every mutation run client-side under the operator's own
@@ -162,14 +162,14 @@ answers which question, is the multi-store rationale in
 
 | Data element | What it is for | How it is derived | Mode |
 |---|---|---|---|
-| Conversation list (name, tier, last activity) | Pick a channel to moderate | `admin-conversations.ts` `listConversations`: latest name per `ChannelArn`, `MAX(CreatedTimestamp)` as last activity, tier from the archive partition, ordered by recency. | Browser |
+| Conversation list (name, tier, last activity) | Pick a channel to administer | `admin-conversations.ts` `listConversations`: latest name per `ChannelArn`, `MAX(CreatedTimestamp)` as last activity, tier from the archive partition, ordered by recency. | Browser |
 | Messages (time, sender, intent, model, body, redacted flag) | Read a conversation | `listMessages`: per `MessageId` keep the latest row; body is decoded and unwrapped from the Lex envelope so raw Lex JSON is never shown; redacted rows render as redacted. | Browser |
 | Live members (name, type, is-bot) | Current membership before an action | Amazon Chime SDK `ListChannelMemberships` called client-side as the `${sub}-admin` identity, not the archive. | Browser (live) |
 | Membership history timeline | Audit who joined, left, or held moderator, and when | `membershipHistory`: archive events (create/delete membership, create/delete moderator) mapped to joined / left / granted-moderator / revoked-moderator, with `invitedBy`. Amazon Chime SDK has no history API, so the archive is the system of record. | Browser (audit) |
 | Inspect drawer (content, sender ARN, timestamps, metadata, full raw payload) | Faithful per-message record for troubleshooting | Renders every stored field plus the raw archived `Payload`. | Inspect drawer |
 | Drift events (detected-at, topics, drift score, suggested action, resolved) | Review topic drift in a conversation | `drift_events` from the pgvector drift store. Drift score is the cosine distance between the latest user-message embedding and the running conversation-summary embedding (Titan v2, 1024-dim); a distance over the threshold (default 0.35) is drift. An explicit routing request scores 1.0. Suggested action is continue, confirm, or redirect. | Aurora only |
 
-**Moderation actions and identity.** Every action vends a fresh, single-channel-scoped,
+**Admin actions and identity.** Every action vends a fresh, single-channel-scoped,
 short-lived credential via the Credential-Exchange (`identity:'admin'`, plus the requested
 `capabilities`), which returns the operator's `${sub}-admin` ARN as the `ChimeBearer`.
 Authorization resolves against the operator's own standing app-instance-admin identity; there
@@ -351,7 +351,7 @@ admins manage them.
 | Delete | Full offboard | `POST /delete`: best-effort channel-membership cleanup (as the service app-instance-admin bearer), then delete the app-instance-user and the Cognito user. Idempotent. |
 
 Notes: this handler manages the three **tier** groups only. Admin status is the Cognito
-`admins` group and is not changed here. The per-human `${sub}-admin` moderation identity is
+`admins` group and is not changed here. The per-human `${sub}-admin` admin identity is
 provisioned at the identity path defined in `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md`, not by this tab.
 
 ### Security section
@@ -433,9 +433,9 @@ conversion).
 ## Related
 
 - `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md` - who an admin is, the two-plane `${sub}` / `${sub}-admin`
-  identity model, and how moderation authority is vended and audited. The console's moderation
+  identity model, and how admin authority is vended and audited. The console's admin
   actions are the client-side realization of that model.
-- `docs/specs/identity-access/SPEC-MODERATION.md` - the moderation surface and action semantics.
+- `docs/specs/identity-access/SPEC-MODERATION.md` - the content-moderation surfaces (admin-action semantics live in `SPEC-ADMIN-IDENTITY.md`).
 - `docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md` - the layered access model; the Security tab is Layer 6.
 - `docs/specs/identity-access/SPEC-ACCESS-AND-CONTROLS-AUDITING.md` - the analytics data sources and audit events.
 - `docs/guides/admin/ADMIN-GUIDE.md` - operator-facing usage.

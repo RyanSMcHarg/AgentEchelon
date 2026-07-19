@@ -13,7 +13,7 @@ The synthesized statements shown are what CDK emits from the constructs cited; v
 
 One relationship underlies every example here:
 
-- **Your identity provider** (Cognito by default, or a federated SAML/OIDC IdP) authenticates a person. That identity maps 1:1 to a **Amazon Chime SDK AppInstanceUser** of the same id (the Cognito `sub`). Assistants are **AppInstanceBots**; moderation runs as a single **AppInstanceAdmin** service identity (see Category 4).
+- **Your identity provider** (Cognito by default, or a federated SAML/OIDC IdP) authenticates a person. That identity maps 1:1 to a **Amazon Chime SDK AppInstanceUser** of the same id (the Cognito `sub`). Assistants are **AppInstanceBots**; administration runs as a single AppInstanceAdmin service identity (see Category 4).
 - **Users, assistants, and channels are all AWS resources with ARNs** (`<appInstance>/user/<id>`, `<appInstance>/bot/<id>`, `<appInstance>/channel/<id>`). Because they are ARN-able resources, "who may act on what" is an **IAM and resource-policy decision**, not application logic.
 - **IAM policies** over those ARNs, plus the channel's immutable `classification` tag, allow or deny each action. On top of IAM, the Amazon Chime SDK enforces its own membership and bearer rules (the next section).
 
@@ -158,13 +158,13 @@ The tag gate above is a *conditional* denial. Some denials are *absolute*: the a
              "chime:ListChannelMemberships", "chime:UpdateChannelReadMarker"] }
 ```
 
-**Result: denied on the chat rung, including an admin's chat identity.** No chat credential can redact or delete another user's message, because the action is not on the chat rungs and the chat identity `${sub}` is not an app-instance-admin. This holds even for an admin: their *chat* credential is powerless to moderate.
+**Result: denied on the chat rung, including an admin's chat identity.** No chat credential can redact or delete another user's message, because the action is not on the chat rungs and the chat identity `${sub}` is not an app-instance-admin. This holds even for an admin: their *chat* credential is powerless to act as an admin.
 
-**User experience.** Moderation is a deliberate, separate step. The admin console requests an `identity:'admin'` credential (a distinct rung, `ExchangeRoleAdminPlane`) scoped to one channel, short-lived and audited, and calls Amazon Chime SDK redact/delete client-side as the admin's own `${sub}-admin` bearer (the next example). No server-side component wields the bearer.
+**User experience.** This is a deliberate, separate **admin** step. The admin console requests an `identity:'admin'` credential (a distinct rung, `ExchangeRoleAdminPlane`) scoped to one channel, short-lived and audited, and calls Amazon Chime SDK redact/delete client-side as the admin's own `${sub}-admin` bearer (the next example). No server-side component wields the bearer.
 
 **Assistant experience.** Unaffected; assistants do not delete or redact.
 
-**To customize.** Keep destructive message actions off the CHAT rungs. Moderation lives on the separate admin-plane role, vended only on an `identity:'admin'` request (`SPEC-ADMIN-IDENTITY.md`); do not add delete or redact to `EXCHANGE_MSG_ACTIONS`.
+**To customize.** Keep destructive message actions off the CHAT rungs. Administration lives on the separate admin-plane role, vended only on an `identity:'admin'` request (`SPEC-ADMIN-IDENTITY.md`); do not add delete or redact to `EXCHANGE_MSG_ACTIONS`.
 
 ## A prompt injection tries to make the assistant act as a user
 
@@ -242,7 +242,7 @@ Beyond channels, an assistant is bounded in *which model* it may invoke and *wha
 
 # Category 4. Human admin and the admin service user
 
-"Admin" is more than one thing. The full three meanings are in [`IDENTITY-AND-ACCESS-MODEL.md`](IDENTITY-AND-ACCESS-MODEL.md); the two that act are the **human admin** (a claim, acting as themselves) and the **admin service user** (a machine identity for moderation).
+"Admin" is more than one thing. The full three meanings are in [`IDENTITY-AND-ACCESS-MODEL.md`](IDENTITY-AND-ACCESS-MODEL.md); the two that act are the **human admin** (a claim, acting as themselves) and the **admin service user** (a machine identity for administration).
 
 ## An admin reads channels across every tier (admin is not a tier)
 
@@ -254,15 +254,15 @@ Beyond channels, an assistant is bounded in *which model* it may invoke and *wha
 
 **Result: allowed across every tier, as themselves.** Because the admin rung is not tag-gated, an admin reads and participates in any tier's channel. The Amazon Chime SDK layer still applies: the admin acts as their own AppInstanceUser (their `sub` on every action for the audit trail), and Amazon Chime SDK's membership rules still govern message read and send at the app-instance layer. Because the `admin` (chat) rung uses `EXCHANGE_MSG_ACTIONS`, the admin still cannot redact or delete with their CHAT credential (Category 2); moderation uses the separate `${sub}-admin` identity (next section).
 
-**User experience.** An admin gets cross-tier oversight as themselves, not through a shared or elevated account, so every action is attributable. Moderation runs client-side as the admin's own `${sub}-admin` identity (next section).
+**User experience.** An admin gets cross-tier oversight as themselves, not through a shared or elevated account, so every action is attributable. Admin actions run client-side as the admin's own `${sub}-admin` identity (next section).
 
 **To customize.** Membership in the admin group is the switch; the group name is `admins` by default and overridable via `ADMIN_GROUP_NAMES` for host-app or federated admins (`auth.ts` `ADMIN_GROUPS`, `ADMIN-INTEGRATION-GUIDE.md`). The `rung === 'admin'` branch is where cross-tier reach is defined.
 
-## The admin identity: client-side moderation (redact and delete)
+## The admin identity: client-side administration (redact and delete)
 
-The human admin above participates through the `admin` (chat) rung as their chat identity `${sub}`, which cannot moderate. Destructive moderation, redacting and deleting others' messages, runs as a SEPARATE per-human identity: the admin's own `${sub}-admin` `AppInstanceUser`, registered as an `AppInstanceAdmin`, which holds cross-channel redact and delete.
+The human admin above participates through the `admin` (chat) rung as their chat identity `${sub}`, which holds no admin authority. Destructive administration, redacting and deleting others' messages, runs as a SEPARATE per-human identity: the admin's own `${sub}-admin` `AppInstanceUser`, registered as an `AppInstanceAdmin`, which holds cross-channel redact and delete.
 
-The admin console requests this identity's credential from the Credential-Exchange on an `identity:'admin'` request (the `ExchangeRoleAdminPlane` role): scoped to one channel, short-lived, and recorded (`admin_scoped_credential_vend`). The SPA then calls Amazon Chime SDK redact/delete directly with the `${sub}-admin` bearer, so the action is the human acting as themselves, not a server-side bearer swap. This is why the CHAT rungs, admin included, never hold redact or delete (the absolute denial in Category 2): those capabilities live only on the separate `${sub}-admin` identity, vended per request. A dedicated SERVICE `app-instance-admin` (created by `create-app-instance-admin.ts`, ARN in SSM) still exists but only for no-human automation; see `SPEC-ADMIN-IDENTITY.md` for the two-identity model and `SPEC-MODERATION.md` for the moderation surfaces.
+The admin console requests this identity's credential from the Credential-Exchange on an `identity:'admin'` request (the `ExchangeRoleAdminPlane` role): scoped to one channel, short-lived, and recorded (`admin_scoped_credential_vend`). The SPA then calls Amazon Chime SDK redact/delete directly with the `${sub}-admin` bearer, so the action is the human acting as themselves, not a server-side bearer swap. This is why the CHAT rungs, admin included, never hold redact or delete (the absolute denial in Category 2): those capabilities live only on the separate `${sub}-admin` identity, vended per request. A dedicated SERVICE `app-instance-admin` (created by `create-app-instance-admin.ts`, ARN in SSM) still exists but only for no-human automation; see `SPEC-ADMIN-IDENTITY.md` for the two-identity model and `SPEC-MODERATION.md` for the content-moderation surfaces.
 
 ---
 

@@ -1,7 +1,7 @@
 # Admin Console Guide
 
 How operators use the AgentEchelon admin dashboard to check platform health,
-review how the assistants are performing, and moderate conversations. Written
+review how the assistants are performing, and administer conversations. Written
 to be portable - it describes behaviour, not any specific AWS account.
 
 ## Getting started - the decisions that shape your deployment
@@ -47,15 +47,15 @@ selector** (7 / 30 / 90 days) in the header scopes the analytics.
 | Section | Sub-views | What it's for |
 |---------|-----------|---------------|
 | **Overview** | Overview, Latency | Platform health at a glance: message volume, active users (sign-in DAU vs messaging DAU), error rate; response-latency breakdown (Bedrock / polling / delivery), web-vitals, WebSocket connection health. |
-| **Conversations** | - | The moderation surface (see below). |
+| **Conversations** | - | The conversation administration surface (see below). |
 | **Effectiveness** | Dashboard (the intent drill) + Evaluations, Flows, Tasks, Steps, Flagged, Ground Truth (Aurora mode) | How well each capability performs, with the **intent as the spine**. The Effectiveness dashboard ranks intents worst-first on two quality axes kept separate - Classification (did routing send the right traffic here) and Execution (given routing, did the work succeed) - with Latency, Cost/reply, and Tool-error rate as independently sortable decision columns, all coloured against `metricTargets.ts`. Clicking an intent drills to its exchanges or tasks, then a task's turn-by-turn state timeline, then that turn's tool-loop steps. The **Dashboard is the consolidation target**: the full detail from Evaluations, Flows, Tasks, and Steps is being folded into its drill, and each keeps its own sub-tab until its detail is fully in the drill (so no information is lost during the transition). Flagged and Ground Truth are standalone human-action tabs. |
 | **Models** | Models, Model Strategy (+ Steps in Aurora mode) | Model telemetry (usage, effectiveness, feedback), the routing/strategy reference (provider posture, intent routing, fallbacks), and **per-step execution telemetry** (Steps: each Converse tool-loop iteration for a message - tool calls, tokens, latency - persisted out of band and surfaced via `/analytics/execution-steps`). |
 | **Experiments** | - | A/B experiments: create/pause/resume/complete, compare model variants, arm `/battle`. Per-variant results fold in **real human signals** - thumbs approval-rate + head-to-head `/battle` wins - *alongside* the automated evaluator score, never blended; the live battle scorecard reports per-round outcomes. |
 | **Users** | Users, Manage Users | Engagement (DAU, per-user leaderboard, signup/signin funnels by tier) and the approval workflow (approve/reject, set tier, enable/disable). |
 
-## Conversations - moderation surface
+## Conversations - administration surface
 
-This is the **admin-console surface** of the moderation model (see
+This is the **conversation-administration surface of the admin console** (see
 `docs/specs/identity-access/SPEC-MODERATION.md`, which describes the full open set of surfaces). Two
 halves, deliberately separate:
 
@@ -75,15 +75,18 @@ audit/debug view.
 below it is a timeline of joins / leaves / moderator grants, sourced from the
 archive - the audit trail (Amazon Chime SDK exposes only the *current* members, not history).
 
-**Moderate a message:**
+**Administer a message:**
 - **Redact** blanks a message's content (recoverable concept: the message stays,
   content removed). A channel **moderator** can redact; so can the admin.
 - **Delete** removes the message entirely. **Delete requires the app-instance
   admin** - a moderator cannot delete. It is **irreversible** (you'll confirm).
 
-All moderation actions run as the service **app-instance-admin** identity and are
-**audit-logged** to CloudWatch (`_auditEvent: admin_redact | admin_delete |
-admin_add_member | admin_remove_member | admin_self_add`).
+All admin actions run as the operator's own `${sub}-admin` app-instance-admin
+identity, vended per action via the credential-exchange admin plane; the dedicated
+**service** app-instance-admin is used only for no-human automation (e.g.
+membership-audit auto-revoke). Every action is **audit-logged** to CloudWatch
+(`_auditEvent: admin_redact | admin_delete | admin_add_member | admin_remove_member |
+admin_self_add`).
 
 **Drift Detection** (toggle in the Conversations header) lists conversations
 that drifted from their topic - Aurora-mode only (honest-empty banner in Athena).
@@ -116,7 +119,7 @@ analyticsMode=aurora`). Aurora-only views (the Effectiveness dashboard + its dri
 Flows, Ground Truth, Tasks, Flagged, drift detection) are **hidden** in Athena mode;
 where a base view depends on
 Aurora-only data it shows an honest **"Aurora-only - enable Aurora mode"** banner
-rather than a silently empty table. Moderation (redact/delete/members) is
+rather than a silently empty table. Admin actions (redact/delete/members) are
 **mode-independent**. Archive-backed Conversations viewing uses the Athena archive.
 
 ## Cost sleep mode (sleep / wake)
@@ -164,9 +167,9 @@ Design and identity model: `docs/specs/identity-access/SPEC-ADMIN-AGENT-NOTIFICA
 - [`LATENCY-TARGETS.md`](../developer/LATENCY-TARGETS.md) - the industry basis for the latency targets and where the time goes in the message flow.
 - [`MESSAGE-FLOW.md`](../developer/MESSAGE-FLOW.md) - how a message travels, the tool loop, and the placeholder/update delivery that makes TTFF the perceived metric.
 - `docs/specs/analytics-eval/SPEC-COST-SLEEP-MODE.md` - cost sleep mode (auto-pause / admin wake).
-- `docs/specs/identity-access/SPEC-MODERATION.md` - the moderation surfaces (real-time channel-flow,
-  inference-layer Guardrails, near-real-time Kinesis tap, admin console,
-  client-side validation - an open set) + the app-instance-admin.
+- `docs/specs/identity-access/SPEC-MODERATION.md` - the content-moderation surfaces (real-time
+  channel-flow, inference-layer Guardrails, near-real-time Kinesis tap, client-side validation -
+  an open set) plus the admin console (an administration surface, via the app-instance-admin).
 - `docs/specs/admin-console/SPEC-ADMIN-CONSOLE.md` - the design behind this console.
 - `docs/specs/identity-access/SPEC-ADMIN-AGENT-NOTIFICATIONS.md` - the admin agent + admin notification channel (where audit/error alerts land, and the bot-owns-the-channel identity model).
 - `docs/guides/admin/AURORA-MODE-GUIDE.md` - enabling Aurora mode + its extra views.

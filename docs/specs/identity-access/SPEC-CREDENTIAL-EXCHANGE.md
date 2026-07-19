@@ -51,7 +51,7 @@ Every rung is bearer-pinned; the action set and channel scope grow with trust:
 | **basic / standard / premium** | tiered users | classification ≤ tier (the IAM tag-gate) | the above + leave (`DeleteChannelMembership` own) + own-profile read/update |
 | **admin** | admins | cross-tier channel actions, still **bearer-pinned to own** identity | the above |
 
-**Never on any end-user rung** (backend operations, not user credentials): `CreateChannel`, `CreateChannelMembership`, `CreateAppInstanceUser`, `UpdateChannelMessage`, `RedactChannelMessage`, `UpdateChannel`, `DeleteChannel` - channel creation / member admission / moderation flow through the create-conversation, share, and admin paths (their own roles). The exchange selects the rung by the caller's **lifecycle state** (§6), not just their group.
+**Never on any end-user rung** (backend operations, not user credentials): `CreateChannel`, `CreateChannelMembership`, `CreateAppInstanceUser`, `UpdateChannelMessage`, `RedactChannelMessage`, `UpdateChannel`, `DeleteChannel` - channel creation / member admission / administration flow through the create-conversation, share, and admin paths (their own roles). The exchange selects the rung by the caller's **lifecycle state** (§6), not just their group.
 
 ## 6. Full user lifecycle (create → promote → role-change → offboard)
 
