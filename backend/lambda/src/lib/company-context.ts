@@ -1,14 +1,14 @@
 /**
  * Company-context retrieval (shared)
  *
- * Tier-scoped company/product/pricing/FAQ/financial document retrieval from
+ * Classification-scoped company/product/pricing/FAQ/financial document retrieval from
  * the attachments bucket under `context/{basic,standard,premium}/*`.
  *
  * **Defense-in-depth is enforced at IAM, not here.** The caller's execution
- * role grants `s3:GetObject` only for the prefixes its tier may read (basic →
+ * role grants `s3:GetObject` only for the prefixes its classification may read (basic →
  * context/basic/*; standard → +standard; premium → all three). This module
  * walks every known prefix and returns whatever it could read — an
- * AccessDenied on a higher tier's prefix is the boundary working, and that
+ * AccessDenied on a higher classification's prefix is the boundary working, and that
  * document is silently omitted.
  *
  * Used by both the Bedrock-Agent action-group Lambda
@@ -25,11 +25,11 @@ import {
 
 const s3 = new S3Client({});
 
-// Every known tier prefix, MOST-SPECIFIC-FIRST (premium → standard → basic) so
-// that if the total-chars cap is ever hit, the caller's OWN tier documents load
+// Every known classification prefix, MOST-SPECIFIC-FIRST (premium → standard → basic) so
+// that if the total-chars cap is ever hit, the caller's OWN classification documents load
 // first and survive rather than being dropped last. IAM decides which are
-// readable; a lower tier simply gets AccessDenied on the higher prefixes.
-export const TIER_PREFIXES = ['context/premium/', 'context/standard/', 'context/basic/'];
+// readable; a lower-clearance caller simply gets AccessDenied on the higher prefixes.
+export const CLASSIFICATION_PREFIXES = ['context/premium/', 'context/standard/', 'context/basic/'];
 // Platform self-knowledge (about the AgentEchelon product itself) lives OUTSIDE
 // the company `context/` tree so a company/business question never loads it.
 // Retrieved separately via loadPlatformInfo (exposed as the load_platform_info
@@ -42,18 +42,18 @@ const MAX_TOTAL_CHARS = 24_000;
 
 export interface CompanyDoc {
   source: string;
-  tier: 'basic' | 'standard' | 'premium' | 'unknown';
+  classification: 'basic' | 'standard' | 'premium' | 'unknown';
   content: string;
   truncated: boolean;
 }
 
 export interface CompanyContextResult {
   documentCount: number;
-  classificationsAccessible: Array<CompanyDoc['tier']>;
+  classificationsAccessible: Array<CompanyDoc['classification']>;
   documents: CompanyDoc[];
 }
 
-function tierFromKey(key: string): CompanyDoc['tier'] {
+function classificationFromKey(key: string): CompanyDoc['classification'] {
   if (key.startsWith('context/basic/')) return 'basic';
   if (key.startsWith('context/standard/')) return 'standard';
   if (key.startsWith('context/premium/')) return 'premium';
@@ -71,16 +71,16 @@ async function listAccessibleKeys(bucket: string, prefixes: string[]): Promise<s
     try {
       const resp = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix }));
       for (const obj of resp.Contents || []) {
-        // Skip `_`-prefixed files (e.g. `_digest.json`, the per-tier context
+        // Skip `_`-prefixed files (e.g. `_digest.json`, the per-classification context
         // digest). They are metadata about the corpus, not corpus documents, so
         // they must not be loaded as company content.
         if (obj.Key && !(obj.Key.split('/').pop() || '').startsWith('_')) keys.push(obj.Key);
       }
     } catch (err: unknown) {
-      // AccessDenied on a prefix this tier shouldn't see is the boundary
+      // AccessDenied on a prefix this clearance shouldn't see is the boundary
       // working — log and continue. Other errors: warn and continue.
       if (isAccessDenied(err)) {
-        console.log(`[company-context] tier scope: ${Prefix} not accessible (expected for lower tiers)`);
+        console.log(`[company-context] classification scope: ${Prefix} not accessible (expected for lower clearances)`);
         continue;
       }
       console.warn(`[company-context] ListObjectsV2 failed for ${Prefix}:`, err);
@@ -98,7 +98,7 @@ async function fetchDoc(bucket: string, key: string): Promise<CompanyDoc | null>
     const content = truncated
       ? body.slice(0, MAX_DOC_CHARS) + '\n[truncated — document exceeds per-doc cap]'
       : body;
-    return { source: key, tier: tierFromKey(key), content, truncated };
+    return { source: key, classification: classificationFromKey(key), content, truncated };
   } catch (err: unknown) {
     if (isAccessDenied(err)) return null; // boundary in action
     console.warn(`[company-context] GetObject failed for ${key}:`, err);
@@ -131,7 +131,7 @@ async function loadDocsFromPrefixes(
   }
   return {
     documentCount: docs.length,
-    classificationsAccessible: Array.from(new Set(docs.map((d) => d.tier))),
+    classificationsAccessible: Array.from(new Set(docs.map((d) => d.classification))),
     documents: docs,
   };
 }
@@ -139,7 +139,7 @@ async function loadDocsFromPrefixes(
 // Warm result cache — company docs are static (they change only on seed/ingest),
 // so re-Listing + Getting S3 on every tool call/turn is wasted work
 // (docs/GUIDE-ASSISTANT-CONTEXT.md: "do not re-gather unchanged context"). Cache the
-// result per bucket for the Lambda's warm life; the IAM tier is fixed per Lambda
+// result per bucket for the Lambda's warm life; the IAM classification is fixed per Lambda
 // instance, so the readable document set is stable for that instance.
 const companyContextCache = new Map<string, { result: CompanyContextResult; at: number }>();
 const COMPANY_CONTEXT_CACHE_TTL_MS = 5 * 60 * 1000;
@@ -151,16 +151,16 @@ export function __clearCompanyContextCache(): void {
 
 /**
  * Load every company/business document the caller's IAM role can read
- * (`context/{tier}/*`). Does NOT include platform self-knowledge — that is a
+ * (`context/{classification}/*`). Does NOT include platform self-knowledge — that is a
  * separate retrieval (loadPlatformInfo), so a company question never spends the
  * budget on AgentEchelon platform docs. Result is warm-cached per bucket
- * (COMPANY_CONTEXT_CACHE_TTL_MS) so the same tier context is not re-fetched from
+ * (COMPANY_CONTEXT_CACHE_TTL_MS) so the same classification context is not re-fetched from
  * S3 every turn.
  */
 export async function loadCompanyContext(bucket: string): Promise<CompanyContextResult> {
   const cached = companyContextCache.get(bucket);
   if (cached && Date.now() - cached.at < COMPANY_CONTEXT_CACHE_TTL_MS) return cached.result;
-  const result = await loadDocsFromPrefixes(bucket, TIER_PREFIXES, 'company-context');
+  const result = await loadDocsFromPrefixes(bucket, CLASSIFICATION_PREFIXES, 'company-context');
   companyContextCache.set(bucket, { result, at: Date.now() });
   return result;
 }
@@ -176,14 +176,14 @@ export async function loadPlatformInfo(bucket: string): Promise<CompanyContextRe
 }
 
 // ---------------------------------------------------------------------------
-// Company-context DIGEST (ADR-017). A small, always-present per-tier manifest of
-// the company documents the tier may read (title + one-line description). It
+// Company-context DIGEST (ADR-017). A small, always-present per-classification manifest of
+// the company documents the classification may read (title + one-line description). It
 // tells the assistant WHAT company context exists so it can fetch the right
 // document (via load_company_context) or rely on the deterministic router
 // retrieval, rather than guessing or dumping the whole corpus. The digest is
-// precomputed at seed/ingestion time and stored at `context/{tier}/_digest.json`
+// precomputed at seed/ingestion time and stored at `context/{classification}/_digest.json`
 // (cumulative: premium includes standard + basic); the caller reads only its own
-// tier's file, so the IAM prefix boundary scopes the digest exactly like the
+// classification's file, so the IAM prefix boundary scopes the digest exactly like the
 // documents it describes.
 // ---------------------------------------------------------------------------
 
@@ -192,35 +192,35 @@ export interface DigestEntry {
   title: string;
   /** One-line description of what the document contains. */
   description: string;
-  /** The tier that owns the document (basic|standard|premium). */
-  tier: 'basic' | 'standard' | 'premium';
+  /** The classification that owns the document (basic|standard|premium). */
+  classification: 'basic' | 'standard' | 'premium';
 }
 
 /** Warm-container cache: the digest is static per deployment, so read it once
- *  per tier and reuse it, rather than re-fetching from S3 every turn. */
+ *  per classification and reuse it, rather than re-fetching from S3 every turn. */
 const digestCache = new Map<string, DigestEntry[]>();
 
-/** Load the caller tier's context digest (`context/{tier}/_digest.json`).
+/** Load the caller classification's context digest (`context/{classification}/_digest.json`).
  *  Returns [] if none is present (older seed, or no company docs). Cached warm. */
 export async function loadContextDigest(
   bucket: string,
-  tier: 'basic' | 'standard' | 'premium',
+  classification: 'basic' | 'standard' | 'premium',
 ): Promise<DigestEntry[]> {
-  const cached = digestCache.get(tier);
+  const cached = digestCache.get(classification);
   if (cached) return cached;
-  const key = `context/${tier}/_digest.json`;
+  const key = `context/${classification}/_digest.json`;
   try {
     const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     const body = await resp.Body?.transformToString('utf-8');
     const entries = body ? (JSON.parse(body) as DigestEntry[]) : [];
     const valid = Array.isArray(entries) ? entries : [];
-    digestCache.set(tier, valid);
+    digestCache.set(classification, valid);
     return valid;
   } catch (err: unknown) {
     if (!isAccessDenied(err)) {
       console.warn(`[company-context] digest load failed for ${key}:`, err);
     }
-    digestCache.set(tier, []);
+    digestCache.set(classification, []);
     return [];
   }
 }

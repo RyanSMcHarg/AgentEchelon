@@ -115,7 +115,7 @@ describe('invokeBedrock Converse tool loop (ADR-011)', () => {
     mockLoadContext.mockResolvedValueOnce({
       documentCount: 1,
       classificationsAccessible: ['basic'],
-      documents: [{ source: 'context/basic/a.json', tier: 'basic', content: 'x', truncated: false }],
+      documents: [{ source: 'context/basic/a.json', classification: 'basic', content: 'x', truncated: false }],
     });
 
     const r = await invokeBedrock('sys', [{ role: 'user', content: 'what products?' }], config, undefined, true);
