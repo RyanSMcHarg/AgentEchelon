@@ -11,7 +11,7 @@
  *   - Cognito-authenticated
  *   - Caller must be the channel's moderator (the creator, stored in
  *     channel.Metadata.createdBy)
- *   - Only premium-tier channels accept enable
+ *   - Only premium-classification channels accept enable
  *
  * Side effects on enable:
  *   - Verifies the experiment exists, is battle-enabled, and has an
@@ -78,23 +78,23 @@ function respond(statusCode: number, body: unknown, origin?: string): APIGateway
   return { statusCode, headers: corsHeaders(origin), body: JSON.stringify(body) };
 }
 
-// Resolve the channel's PER-TIER bot (its real creator+member). Each tier owns
+// Resolve the channel's PER-CLASSIFICATION bot (its real creator+member). Each classification owns
 // its own bot; no shared bot is a channel member, so bot-attributed sends (add
-// alt-bot, announce) must run as the per-tier bot. Battle is premium-only, so in
+// alt-bot, announce) must run as the per-classification bot. Battle is premium-only, so in
 // practice this is the premium bot. There is NO shared-bot fallback — a missing
-// per-tier key returns '' and the caller surfaces "bot ARN not configured".
+// per-classification key returns '' and the caller surfaces "bot ARN not configured".
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
 const botArnCache: Record<string, string> = {};
-async function resolveBotArn(tier: string): Promise<string> {
-  if (botArnCache[tier]) return botArnCache[tier];
+async function resolveBotArn(classification: string): Promise<string> {
+  if (botArnCache[classification]) return botArnCache[classification];
   try {
     const resp = await ssmClient.send(
-      new GetParameterCommand({ Name: `${SSM_ROOT}/assistant/${tier}/bot-arn` }),
+      new GetParameterCommand({ Name: `${SSM_ROOT}/assistant/${classification}/bot-arn` }),
     );
-    botArnCache[tier] = resp.Parameter?.Value || '';
-    return botArnCache[tier];
+    botArnCache[classification] = resp.Parameter?.Value || '';
+    return botArnCache[classification];
   } catch (err) {
-    console.warn(`[channel-battle] per-tier bot param for ${tier} missing:`, (err as Error).name);
+    console.warn(`[channel-battle] per-classification bot param for ${classification} missing:`, (err as Error).name);
     return '';
   }
 }
@@ -134,9 +134,9 @@ async function readChannelMetadata(channelArn: string, botArn: string): Promise<
   }
 }
 
-// The battle tier gate keys on the IMMUTABLE `classification` tag, NOT `metadata.modelTier`.
+// The battle classification gate keys on the IMMUTABLE `classification` tag, NOT `metadata.modelTier`.
 // Metadata is mutable via the owner rename cap (chime:UpdateChannel), so trusting it would let
-// a moderator tamper the tier up to open premium battles on a lower-tier channel. The tag cannot
+// a moderator tamper the classification up to open premium battles on a lower-classification channel. The tag cannot
 // be changed by UpdateChannel. Fail-closed to the floor classification (not battle-eligible), so a
 // missing/unreadable tag denies the battle rather than opening it.
 async function resolveChannelClassification(channelArn: string): Promise<string> {
@@ -263,12 +263,12 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
   const callerArn = callerUserArn(event);
 
   // Channel access + moderator check. Read metadata as the CALLER (a member):
-  // no shared bot is a channel member, so the per-tier bot can't DescribeChannel.
+  // no shared bot is a channel member, so the per-classification bot can't DescribeChannel.
   const meta = await readChannelMetadata(channelArn, callerArn);
   if (!meta) {
     return respond(404, { error: 'Channel not found or inaccessible' }, origin);
   }
-  // Access confirmed above (caller could DescribeChannel). Tier comes from the tag.
+  // Access confirmed above (caller could DescribeChannel). Classification comes from the tag.
   const channelClassification = await resolveChannelClassification(channelArn);
   if (!profiles.profileFor(channelClassification).battleEligible) {
     return respond(403, {
@@ -277,8 +277,8 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
       tier: channelClassification,
     }, origin);
   }
-  // Act as the channel's per-tier bot (its creator+member) for the alt-bot
-  // membership add + announcement. Premium by default; the channel's own tier
+  // Act as the channel's per-classification bot (its creator+member) for the alt-bot
+  // membership add + announcement. Premium by default; the channel's own classification
   // when /battle is opened to other tiers.
   const botArn = await resolveBotArn(channelClassification);
   if (!botArn) {
@@ -414,7 +414,7 @@ async function handleDisable(event: APIGatewayProxyEvent, origin?: string): Prom
   const callerArn = callerUserArn(event);
 
   // Read metadata as the CALLER (a member); no shared bot is a channel member.
-  // Then resolve the channel's per-tier bot for the bot-attributed delete +
+  // Then resolve the channel's per-classification bot for the bot-attributed delete +
   // announcement.
   const meta = await readChannelMetadata(channelArn, callerArn);
   if (!meta) {
