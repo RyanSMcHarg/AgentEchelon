@@ -1,7 +1,7 @@
 # How to add or manage an assistant profile
 
 A practical guide for two adjacent tasks the capability-profiles model
-([SPEC-PER-TIER-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md))
+([SPEC-PER-PROFILE-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md))
 makes routine:
 
 1. **Add a brand-new profile** (e.g. `enterprise`) alongside the shipped
@@ -27,7 +27,7 @@ profile and self-gates its capabilities on the profile's env. A profile-team cha
 edits its descriptor and ships exactly that profile.
 
 > The architectural rationale, SSM contract, and phasing live in
-> [SPEC-PER-TIER-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md). This file
+> [SPEC-PER-PROFILE-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md). This file
 > is the **how**.
 
 ---
@@ -369,5 +369,5 @@ cd backend && npx jest cdk-synth
   profile reads. Adding a shared resource means publishing another SSM key there AND
   adding it to `resolveSharedSSM` AND granting it in each profile that needs it.
 
-See [SPEC-PER-TIER-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md) for the
+See [SPEC-PER-PROFILE-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md) for the
 full architectural contract.

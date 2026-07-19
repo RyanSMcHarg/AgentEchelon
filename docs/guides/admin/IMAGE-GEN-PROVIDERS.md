@@ -88,7 +88,7 @@ Provision (the image-gen invocations are made from the shared `assistant-async-p
    **Option A (quick, single-deployer):** AWS Lambda env var, set via CLI:
    ```bash
    aws lambda update-function-configuration \
-     --function-name <PremiumAsyncProcessor-function-name> \
+     --function-name <Tier-Premium-AsyncProcessor-function-name> \
      --environment "Variables={OPENAI_API_KEY=sk-...,FAL_KEY=...,...existing vars}"
    ```
    ⚠️ Replace the entire Variables map - this command overwrites, doesn't merge. Capture existing vars first via `aws lambda get-function-configuration`.
@@ -148,7 +148,7 @@ This is acceptable for single-owner deployments where every principal that can r
 // CDK example using Secrets Manager — preferred for any non-trivial deployment
 import * as secrets from 'aws-cdk-lib/aws-secretsmanager';
 const openaiSecret = secrets.Secret.fromSecretNameV2(this, 'OpenAIKey', 'agent-echelon/openai-key');
-new lambdaNodeJs.NodejsFunction(this, 'PremiumAsyncProcessor', {
+new lambdaNodeJs.NodejsFunction(this, 'AsyncProcessor', { // shared construct id in assistant-profile-stack.ts
   environment: {
     // Pass the secret ARN; have the Lambda fetch the value at cold start.
     OPENAI_API_KEY_SECRET_ARN: openaiSecret.secretArn,

@@ -88,7 +88,7 @@ The assistant is the one actor that lives in **two** pillars at once: it is an *
 ## 7. Two doc tiers
 
 - **Design specs** (this doc + the four pillar specs) - *why it's architected this way.* For contributors and evaluators.
-- **Deployer guides** - *how do I add/edit one.* Task-oriented, portable, **gated on shipped capability** (a how-to implies the feature works). Extend `IDENTITY-PROVIDER-GUIDE.md` (access model) + `HOW-TO-ADD-OR-MANAGE-A-TIER.md` (assistant/tier); add a conversation-type guide and a connector guide as those pillars ship.
+- **Deployer guides** - *how do I add/edit one.* Task-oriented, portable, **gated on shipped capability** (a how-to implies the feature works). Extend `IDENTITY-PROVIDER-GUIDE.md` (access model) + `HOW-TO-ADD-OR-MANAGE-A-PROFILE.md` (assistant/tier); add a conversation-type guide and a connector guide as those pillars ship.
 
 ## 8. Current state: live, wired, and design-only
 

@@ -24,7 +24,9 @@ Consumers of `AgentEchelon` should be able to opt into the Aurora mode at deploy
 
 ## What the mode does
 
-Aurora mode is an **optional deployment mode** selectable via CDK context. When enabled, the library provisions a full Aurora cluster, RDS Proxy, VPC with endpoints, schema migrations, IAM auth setup, and rewires the analytics/evaluation Lambdas to use Aurora instead of Athena. When disabled (the default), behavior is unchanged - the library ships serverless Athena-based analytics.
+Aurora mode is an **optional deployment mode** selectable via CDK context. When enabled, the library provisions a full Aurora cluster, RDS Proxy, VPC with endpoints, schema migrations, IAM auth setup, and rewires the analytics and evaluation Lambdas to query Aurora instead of Athena. When disabled (the default), behavior is unchanged and the library ships serverless Athena-based analytics.
+
+**The conversation event archive is not part of this swap.** The append-only audit trail of every channel event (Kinesis to Firehose to S3 to Glue to an Athena workgroup) is the system of record, and it runs in **both** modes: it is embedded in the default Athena stack, and it is stood up by the always-on `ConversationArchive` construct (`lib/constructs/conversation-archive.ts`) in Aurora mode. What the mode selects is only the analytics and evaluation **query engine** (Athena SQL over the archive, or Aurora PostgreSQL over its own projection), not whether conversation history is durably archived. The Aurora projection is intentionally lossy (it collapses membership to current state and does not capture moderator events); the archive remains the faithful record and the source the admin console's Conversations tab and Legal/HR audit read.
 
 ## Properties
 
@@ -38,7 +40,7 @@ Aurora mode is an **optional deployment mode** selectable via CDK context. When 
 ## Non-Goals
 
 - **Not** a migration path from existing Athena data to Aurora (consumers who switch modes start fresh; historical Athena data remains in S3)
-- **Not** a hybrid mode where both Athena and Aurora run simultaneously (deploy-time choice, not runtime)
+- **Not** a hybrid analytics *query* engine: analytics and evaluation queries are answered from either Athena or Aurora, chosen at deploy time, not both at runtime. (The conversation event archive itself, Kinesis to Firehose to S3 to Glue to an Athena workgroup, is always-on in **both** modes and is independent of this choice; see [What the mode does](#what-the-mode-does).)
 - **Not** Aurora Provisioned clusters (Serverless v2 only; provisioned is a further extension)
 - **Not** multi-region Aurora (single region; multi-region is a future extension)
 - **Not** pgvector RAG integration at the application layer (schema supports it, application code for RAG retrieval is Phase 2)
@@ -68,17 +70,23 @@ Amazon Chime SDK → Kinesis Data Stream → Firehose → S3 → Glue Catalog �
 ### Aurora Mode (Opt-In)
 
 ```
-Amazon Chime SDK → Kinesis Data Stream → ArchivalLambda (VPC) → Aurora PostgreSQL Serverless v2
-                                           ↓                      ↑
-                                    (via RDS Proxy)       (via RDS Proxy, IAM auth)
-                                                                  ↑
-                                                    EvaluationLambda (VPC)
-                                                    AnalyticsQueryLambda (VPC)
-                                                    SummaryUpdaterLambda (VPC)
-                                                    ClientEventsLambda (VPC)
-                                                                  ↓
-                                                         Admin Dashboard (frontend)
+                                        ┌─► Firehose → S3 → Glue → Athena workgroup
+                                        │   (ConversationArchive construct: the always-on,
+Amazon Chime SDK → Kinesis Data Stream ─┤    append-only system of record / audit trail)
+                                        │
+                                        └─► ArchivalLambda (VPC) → Aurora PostgreSQL Serverless v2
+                                                   ↓                      ↑
+                                            (via RDS Proxy)       (via RDS Proxy, IAM auth)
+                                                                          ↑
+                                                            EvaluationLambda (VPC)
+                                                            AnalyticsQueryLambda (VPC)
+                                                            SummaryUpdaterLambda (VPC)
+                                                            ClientEventsLambda (VPC)
+                                                                          ↓
+                                                                 Admin Dashboard (frontend)
 ```
+
+The Kinesis stream fans out to **two** independent sinks. The top branch (`ConversationArchive`) is the same raw archive as the default Athena mode and is always-on; it is the durable system of record. The bottom branch is the Aurora analytics projection that this mode adds. The admin console reads conversation history from the archive and the analytics views from Aurora.
 
 **Characteristics:**
 - Private VPC with 2 AZs, PRIVATE_ISOLATED subnets only (no NAT)
@@ -94,7 +102,7 @@ Amazon Chime SDK → Kinesis Data Stream → ArchivalLambda (VPC) → Aurora Pos
 
 ### New CDK Stack: `AnalyticsStackAurora`
 
-Replaces (via conditional instantiation) the existing `AnalyticsStack` when `analyticsMode: 'aurora'`.
+Replaces (via conditional instantiation) the existing `AnalyticsStack` when `analyticsMode: 'aurora'`. This swaps the analytics query engine only; the conversation event archive is carried into the Aurora stack by the shared `ConversationArchive` construct, so the audit trail is present either way.
 
 ```typescript
 // backend/bin/backend.ts (abbreviated)

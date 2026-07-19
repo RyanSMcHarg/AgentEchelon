@@ -42,7 +42,7 @@ S3 bucket: rag/<source_type>/<file>            ← deployer uploads here
               ▼
        ┌─────────────────────┐
        │ Async Processor     │  ← buildRetrievedContextHint folds chunks
-       │ (Premium/Standard)  │    + citations into the system prompt
+       │ (shared)            │    + citations into the system prompt
        └─────────────────────┘    before invoking the LLM
 ```
 

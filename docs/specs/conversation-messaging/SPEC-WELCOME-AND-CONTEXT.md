@@ -274,10 +274,10 @@ regardless.
 ## Related docs
 
 - `docs/guides/developer/GUIDE-ASSISTANT-CONTEXT.md` - the developer/admin how-to for building and operating assistant context.
-- `docs/specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md` - the per-tier ownership model that hosts
+- `docs/specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md` - the per-tier ownership model that hosts
   the tier-specific async-processors the FallbackIntent path
   dispatches to.
 - `docs/specs/analytics-eval/SPEC-DRIFT-CONVERGENCE.md` - the drift feature whose confirm
   flow is the `triggerContext` producer.
-- `docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-TIER.md` - the practical guide a
+- `docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md` - the practical guide a
   tier-team uses; per-tier welcome copy files fit here.

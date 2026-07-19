@@ -117,11 +117,9 @@ ChimeMessaging                    (foundation — no dependencies)
      │
      ├──► Notifications           (references User Pool for email)
      │
-     ├──► IAMPolicies             (tier-based model access; depends on CognitoAuth)
-     │
      ├──► Battle                  (default-on; /battle tables + orchestrator; depends on Experiments)
      │
-     ├──► Tier-{Basic,Standard,Premium}   (per-tier async processor + Lex bot + AppInstanceBot;
+     ├──► Tier-{Basic,Standard,Premium}   (the shared async processor + Lex bot + AppInstanceBot, one instance per profile;
      │                                     depend on Foundations + Experiments; Standard/Premium also on Battle)
      │
      ├──► ChannelFlow             (@all routing + message filtering; depends on Foundations + the tier stacks)
@@ -129,7 +127,7 @@ ChimeMessaging                    (foundation — no dependencies)
      └──► Frontend                (CloudFront + private S3 origin for the SPA)
 ```
 
-Twelve stacks deploy in both modes (ChimeMessaging, CognitoAuth, S3Storage, Foundations, Experiments, the three `Tier-*` stacks, Notifications, IAMPolicies, ChannelFlow, Frontend). `Battle` is default-on (opt out with `-c enableBattle=false`), and one analytics stack is added - `Analytics` in Athena mode or `AnalyticsAurora` in Aurora mode.
+Eleven stacks deploy in both modes (ChimeMessaging, CognitoAuth, S3Storage, Foundations, Experiments, the three `Tier-*` stacks, Notifications, ChannelFlow, Frontend). `Battle` is default-on (opt out with `-c enableBattle=false`), and one analytics stack is added - `Analytics` in Athena mode or `AnalyticsAurora` in Aurora mode.
 
 **Stack outputs flow:** Each stack exports values (ARNs, URLs) as CloudFormation outputs; the per-tier stacks instead publish their processor/bot ARNs to SSM. The frontend `.env` file is populated from these outputs. See `.env.example` for the mapping.
 
@@ -322,7 +320,7 @@ This is the core flow: user sends a message and receives an AI response.
 - `frontend/src/utils/messageParser.ts` - Strip metadata markers before display
 - `backend/lambda/src/router-agent-handler.ts` - Shared Lex fulfillment: tier resolution (`min(userTier, channelTier)`), intent classification, delivery selection, dispatch to the per-tier processor (ARN from SSM)
 - `backend/lambda/src/channel-flow-processor.ts` - Runs first on every message; `@all`/`@everyone` invokes the async processor directly (bypassing Lex)
-- `backend/lambda/src/{basic,standard,premium}-async-processor.ts` - Per-tier processor entry points (thin wrappers over the shared core)
+- `backend/lambda/src/assistant-async-processor.ts` - The single config-driven assistant processor (one instance deployed per profile; self-gates its capabilities on the profile env)
 - `backend/lambda/src/lib/intent-classifier.ts` - Fast-path keywords + a configurable LLM classifier (`CLASSIFIER_MODEL_ID`, default Haiku); Basic tier is keyword-only
 - `backend/lambda/src/lib/delivery-options.ts` - Intent → delivery option mapping
 - `backend/lambda/src/lib/model-resolver.ts` + `backend/lib/config/model-strategy.ts` - Intent → model routing (`INTENT_ROUTE_STRATEGY`: primary + fallback per intent, capped to the tier's allowed models)
@@ -532,6 +530,30 @@ check it. See `docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md`.
 
 > Both the Athena and Aurora analytics pipelines are wired into the admin console. The base console includes model effectiveness, user feedback, and live conversation operations; Aurora adds the deeper evaluation, drift, and task-analysis views when that stack is deployed.
 
+### Why two data sources (raw archive + curated views)
+
+Every Amazon Chime SDK event lands on one Kinesis stream, and from there it fans out to two
+sinks that do different jobs. This split is deliberate, not redundancy:
+
+1. **Raw archive (S3): the absolute system of record.** An append-only copy of every event
+   exactly as Chime emitted it (channel create/update/delete, membership, message
+   create/update/redact/delete). It is never rewritten. Its jobs are durability, replay and
+   backfill, and debugging: it is the one place that stays true when a derived view is wrong.
+   When a curated view has a bug (drops, mis-parses, or curates away an event), the raw archive
+   is what you read to see what actually happened and to rebuild the view from.
+
+2. **Curated query store (Glue/Athena or Aurora): fast, sometimes mutable views.** A derived
+   store shaped for querying, not for durability. It groups messages into conversations and
+   exchanges, folds placeholder-then-final edits onto one row, derives conversation state
+   (live / archived / deleted), applies redaction-aware reads, and (in Aurora) serves
+   sub-second dashboards, evaluation scoring, drift, and pgvector context. Because the raw
+   archive holds the truth, this layer is free to curate, re-derive, and be rebuilt.
+
+The two roles cannot collapse into one store: an immutable raw log cannot serve sub-second
+mutable dashboards, and a curated store that rewrites or drops rows cannot be the system of
+record. The raw S3 archive is the constant across both modes; the analytics mode selects only
+the curated engine (Glue/Athena by default, Aurora when richer real-time analysis is needed).
+
 ### Athena Mode (Default)
 
 ```
@@ -567,7 +589,8 @@ check it. See `docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md`.
           ├──────────────────────────────────────────────┐
           ▼                                              ▼
   Kinesis Firehose → S3                    Archival Lambda (VPC)
-  (backup archive)                                │
+  (raw absolute archive,                          │
+   system of record)                              │
                                                    ▼
                                            RDS Proxy (IAM auth)
                                                    │
@@ -650,7 +673,7 @@ If a provider fails to initialize, everything below it is unavailable. The `Conn
 
 | "I want to..." | Start here |
 |-----------------|-----------|
-| Change the AI system prompt | `backend/lambda/src/<tier>-async-processor.ts` |
+| Change the AI system prompt | `backend/lambda/src/assistant-async-processor.ts` (the profile's `DEFAULT_PROMPTS` entry, or the SSM persona param) |
 | Add a new intent | `backend/lambda/src/lib/intent-classifier.ts` → `delivery-options.ts`; for its model route, `backend/lib/config/model-strategy.ts` (`INTENT_ROUTE_STRATEGY`) |
 | Add a new user tier | [Customization Guide in README](../../README.md#adding-a-new-user-tier) |
 | Change the auth flow | `frontend/src/providers/AuthProvider.tsx` + `backend/lib/stacks/cognito-auth-stack.ts` |
@@ -673,15 +696,15 @@ Access to AI models is enforced at the IAM level. Deployments can choose Anthrop
 
 | Tier | Models Available | Handler Timeout | Task Tracking | File Access |
 |------|-----------------|----------------|---------------|-------------|
-| Basic | Configurable basic model (default: Claude Haiku) | 30s | DynamoDB tasks | `/basic/*` prefix |
-| Standard | Configurable standard model plus standard-safe fallbacks (default: Sonnet) | 60s | DynamoDB tasks | `/standard/*` prefix |
-| Premium | Configurable premium model with full catalog access (default: Opus) | 90s | DynamoDB tasks | `/premium/*` prefix |
+| Basic | Configurable basic model (default: Claude Haiku) | 30s | DynamoDB tasks | `context/basic/*` prefix |
+| Standard | Configurable standard model plus standard-safe fallbacks (default: Sonnet) | 60s | DynamoDB tasks | `context/standard/*` prefix |
+| Premium | Configurable premium model with full catalog access (default: Opus) | 90s | DynamoDB tasks | `context/premium/*` prefix |
 
 Deployment model overrides are selected in CDK with `basicModelKey`, `standardModelKey`, and `premiumModelKey`.
 
-**How tier is determined:** User tier is stored as a Cognito custom attribute (`custom:tier`), set during admin approval. The fulfillment handler (`router-agent-handler.ts`) reads the tier and resolves the effective tier as `min(userTier, channelTier)`, then dispatches to that tier's async processor. Lex is only the entry trigger; it performs no routing or tier logic.
+**How tier is determined:** User tier is stored as a Cognito custom attribute (`custom:tier`), set during admin approval. The fulfillment handler (`router-agent-handler.ts`) reads the tier and resolves the effective tier as `min(userTier, channelTier)`, then dispatches to that profile's async processor (the shared `assistant-async-processor.ts`, deployed once per profile). Lex is only the entry trigger; it performs no routing or tier logic.
 
-**How tier is enforced:** Each handler Lambda has its own IAM role with Bedrock `InvokeModel` permissions scoped to specific model ARNs. The IAMPolicies stack adds Cognito Identity Pool role mappings so frontend SDK clients also have tier-appropriate permissions.
+**How tier is enforced:** Each profile's processor Lambda has its own IAM role with Bedrock `InvokeModel` permissions scoped to that profile's model ARNs (`modelArnsForTier`). The Cognito Identity Pool authenticated roles (one per classification, generated from config in `cognito-auth-stack.ts`) give frontend SDK clients their classification-appropriate permissions; the former standalone IAMPolicies stack has been removed.
 
 ---
 
@@ -746,7 +769,7 @@ This section summarizes security controls.
 - Tier-based IAM policies scope Bedrock model access per user role
 - Each Lambda handler has its own IAM role with least-privilege permissions
 - Lambda invoke permissions scoped to each handler's own async processor (no cross-tier invocation)
-- S3 file access scoped by tier prefix (`/basic/*`, `/standard/*`, `/premium/*`)
+- S3 file access scoped by tier prefix (`context/basic/*`, `context/standard/*`, `context/premium/*`)
 
 **Input handling:**
 - React escapes all rendered content (no `dangerouslySetInnerHTML`)

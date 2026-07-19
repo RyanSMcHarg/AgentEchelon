@@ -354,7 +354,7 @@ Both `@all` and `/battle` are processor-side bypasses (not native Amazon Chime S
 When `/battle` is detected:
 
 1. Strip the leading `/battle` command token from the message (`/^\s*\/battle\b/i`) to produce `cleanMessage`. `/battle` is parsed only at message start - it is a command, not an inline mention.
-2. Tier gate: read channel metadata; if `modelTier !== 'premium'`, post a targeted bot reply to the sender explaining "battles are premium-only" and return.
+2. Tier gate: resolve the channel's classification from its immutable `classification` tag (never the mutable `modelTier` metadata); if it is not battle-eligible (premium by default, per `profile.battleEligible`), post a targeted bot reply to the sender explaining that battles are not enabled for this conversation and return.
 3. **Battle-enabled gate:** `isBattleEnabled(channelArn)` (reads `ChannelBattleConfig`). If `false`, post the targeted one-line "not enabled here - ask a moderator" hint and return (Goal #6 / delivered-scope item 1). No `@all` fallback.
 4. List channel memberships via `ListChannelMembershipsCommand` (with the default bot as `ChimeBearer`, since it's always present).
 5. Filter to bot ARNs (members whose ARN contains `/bot/`).
@@ -587,7 +587,7 @@ When a channel has ≥2 bot members, the existing routing tokens carry these sem
 
 A battle is up to **4 model invocations per `/battle` token** (2 personas × 2 rounds). To protect against runaway cost:
 
-- `/battle` requires `modelTier === 'premium'`. Enforced in the channel-flow-processor.
+- `/battle` requires a battle-eligible classification (premium by default, per `profile.battleEligible`), resolved from the immutable `classification` tag. Enforced in the channel-flow-processor.
 - A simple per-channel rate limit: max 1 active battle at a time (the `BattleStateTable` doubles as a lock). A second `/battle` while one is in flight gets a targeted bot reply: "A battle is already in progress; please wait."
 - `bedrock-resilience.ts` already covers retries and circuit breaking; no battle-specific resilience needed.
 

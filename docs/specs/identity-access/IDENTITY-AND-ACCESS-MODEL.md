@@ -206,7 +206,7 @@ A recurring mis-read is to treat Bedrock Guardrails as *the* enforcement. They a
 
 | Layer | Protects | Runs on | Mechanism | Status |
 |---|---|---|---|---|
-| **IAM + `classification` tag** | Which conversations a principal may read/send in | **every** Amazon Chime SDK call | Fail-closed ALLOW on `aws:ResourceTag/classification`; provable with a deny-test | Built (§4a) |
+| **IAM + `classification` tag** | Which conversations a principal may read/send in | **every** Amazon Chime SDK call | Fail-closed ALLOW on `aws:ResourceTag/classification`; provable with a deny-test | Built (§2) |
 | **Credential exchange (bearer pin)** | Impersonation - a caller acts only as **itself** | every user Amazon Chime SDK session | STS `sub` session-tag pins the bearer to `…/user/${sub}` | Built (§2) |
 | **Bedrock Guardrails** | **Assistant** turns: input (prompt-injection, content) + output (PII, content, markers) | assistant turns **only** | `ApplyGuardrail` `source:'INPUT'` before the call **and** `source:'OUTPUT'` after; fail-open | Built |
 | **Channel flow** | Conversation-level message handling - **runs on every message, including human-to-human with no assistant** | every message in a channel (before Lex) | Amazon Chime SDK `CHANNEL_FLOW` processor; must `ChannelFlowCallback` to release, so it can hold/modify/deny any message | Built (mention/`@all` routing, battle orchestration, notify directives, idempotency; also the conversation-level interception point where content rules can run) |
@@ -214,7 +214,7 @@ A recurring mis-read is to treat Bedrock Guardrails as *the* enforcement. They a
 
 Two things this makes explicit:
 - **Guardrails only see assistant turns.** A human-to-human message in a shared channel is not guardrailed - but it *is* subject to the IAM/classification boundary, passes through the channel flow, and is archived for proactive analysis. So "no assistant involved" ≠ "no enforcement."
-- **The provable boundary is IAM**, not the model layer. Guardrails and the channel flow are content/behaviour defenses on top of the data boundary; the thing that *cannot* be bypassed by an application bug is the fail-closed IAM tag gate (§4a), and the archival layer is the independent backstop that catches anything the inline layers miss.
+- **The provable boundary is IAM**, not the model layer. Guardrails and the channel flow are content/behaviour defenses on top of the data boundary; the thing that *cannot* be bypassed by an application bug is the fail-closed IAM tag gate (§2), and the archival layer is the independent backstop that catches anything the inline layers miss.
 
 ## 7. End-to-end: an admin deletes an off-tier message
 

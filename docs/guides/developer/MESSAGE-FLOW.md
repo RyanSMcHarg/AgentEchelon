@@ -144,7 +144,7 @@ managed Lex round-trip:
 | **`PLACEHOLDER_UPDATE`** | Send a "One moment…" placeholder, invoke the **async processor**, then UPDATE the placeholder in place with the real answer | Normal model turns (5 - 30s) - Lex can't wait that long |
 | **`TASK` / multi-step** | Placeholder + a longer orchestration (e.g. `/battle`) that streams step updates | `/battle`, long multi-step work |
 
-The **async processor** (`{tier}-async-processor.ts` → `async-processor-core.ts`)
+The **async processor** (`assistant-async-processor.ts` → `async-processor-core.ts`)
 is where the model actually runs: it builds the Converse messages, runs the
 **self-hosted tool loop** (reason → `load_company_context` → observe → answer),
 applies the **guardrails**, and sends the reply via `handleLongResponse`
@@ -224,7 +224,7 @@ authoritative event record plus purpose-built read models, joined by a transport
 |---|---|---|---|
 | **Amazon Chime SDK channel** | the live message and current membership | the operational messaging plane: delivery, ordering, membership enforcement | real-time, but Amazon Chime SDK has no cross-channel history API and no single identity sees every channel, so it cannot answer "show me any conversation's full history" |
 | **Kinesis stream** | every channel event, in flight | transport and fan-out to independent consumers | decouples the producer from consumers so the archive, the membership audit, and analytics each read the same stream without coupling to each other (at-least-once) |
-| **Conversation event archive** (append-only log; by default S3 + Glue read via Athena) | the raw event stream: messages (create/update/redact/delete), membership, moderator, and channel events | the **system of record** for history and the audit trail; the retention and erasure-to-archive endpoint | durable, cheap, complete, and immutable, so it is the one faithful history the admin console reads for cross-conversation review and that Legal and HR audit |
+| **Conversation event archive** (append-only log; S3 + Glue read via an Athena workgroup, in every analytics mode) | the raw event stream: messages (create/update/redact/delete), membership, moderator, and channel events | the **system of record** for history and the audit trail; the retention and erasure-to-archive endpoint | durable, cheap, complete, and immutable, so it is the one faithful history the admin console reads for cross-conversation review and that Legal and HR audit |
 | **Aurora Postgres** (Aurora analytics mode) | derived tables: messages and exchanges, evaluations, conversation summaries, cross-conversation context, drift and embeddings, per-turn steps, current membership, client events | the analytics and **live-context** read model | relational joins and pgvector search that S3 and Athena cannot do interactively; it powers the dashboards and the context the assistant is actually given (summary, cross-conversation retrieval, drift) |
 | **Per-message analytics** (`MESSAGE_ANALYTICS_TABLE`, DynamoDB, TTL) | the full per-turn analytics blob keyed by message id | measurement decoupled from delivery | it cannot ride the size-capped Amazon Chime SDK metadata (§6.2), and a fast point write means an over-budget reply never drops its analytics or experiment join |
 | **Operational stores** (DynamoDB: user feedback, battle outcomes, membership-audit findings and enforce toggle) | per-feature current state | fast key-value state for one feature | point read and write of "what is true now", which is neither history nor analytics |
@@ -237,6 +237,16 @@ table), and operational feature state (DynamoDB). They answer different question
 (Aurora), *what did this turn cost* (analytics table), *what is the current state of
 this feature* (operational). Rebuilding any one from another would be slow or
 impossible, which is exactly why the record fans out.
+
+**The archive does not depend on the analytics mode.** The conversation event archive
+(Kinesis to Firehose to S3 to Glue to an Athena workgroup) is always-on in **both**
+Athena and Aurora modes: in the default mode it is part of the Athena analytics stack,
+and in Aurora mode it is stood up by the shared, always-on `ConversationArchive`
+construct (`lib/constructs/conversation-archive.ts`). Choosing Aurora mode selects the
+analytics *query engine* (Athena SQL over the archive, or Aurora Postgres over its own
+projection); it does not change whether events are archived. The Aurora projection is
+intentionally lossy (it collapses membership to current state and does not capture
+moderator events), which is why the archive, not the projection, is the system of record.
 
 **Data-protection consequence.** This shape also gives erasure and retention a
 defined home: the archive is the controlled retention endpoint, and an erasure
@@ -275,8 +285,7 @@ and enforcement layers are identical.
 |---|---|
 | `backend/lambda/src/channel-flow-processor.ts` | Channel flow: runs first on every message; `@all` direct-invoke bypass, `/battle`, notify, idempotency |
 | `backend/lambda/src/router-agent-handler.ts` | Lex fulfillment / shared router: `min(tier)`, intent classification, model resolution, delivery selection, dispatch |
-| `backend/lambda/src/{basic,standard,premium}-agent-handler.ts` | Per-tier Lex fulfillment entry (`WelcomeIntent` + `FallbackIntent`) |
-| `backend/lambda/src/{basic,standard,premium}-async-processor.ts` | Per-tier model turn (tier-pinned) |
+| `backend/lambda/src/assistant-async-processor.ts` | The shared model-turn processor (one instance per profile, profile-pinned via env) |
 | `backend/lambda/src/lib/async-processor-core.ts` | The Converse tool loop, `applyInputGuardrail`/`applyOutputGuardrail`, `handleLongResponse` |
 | `backend/lambda/src/lib/intent-classifier.ts` | The separate request-category classifier |
 | Bot/Lex CDK wiring | `{tier}-tier-stack.ts` (Lex bot, `AppInstanceBot` `InvokedBy`, channel-flow association) |
@@ -285,5 +294,5 @@ and enforcement layers are identical.
 
 - [`MESSAGE-DELIVERY-GUIDE.md`](MESSAGE-DELIVERY-GUIDE.md) - sizing/chunking the reply onto Amazon Chime SDK.
 - [`SPEC-INTERACTION-LAYER.md`](../../specs/conversation-messaging/SPEC-INTERACTION-LAYER.md) - the interaction-layer feature set this flow powers.
-- [`SPEC-PER-TIER-OWNERSHIP.md`](../../specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md) - per-tier bots/processors.
+- [`SPEC-PER-PROFILE-OWNERSHIP.md`](../../specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md) - per-tier bots/processors.
 - [`IDENTITY-AND-ACCESS-MODEL.md`](../../specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md) §6b - the enforcement layers referenced in §6.

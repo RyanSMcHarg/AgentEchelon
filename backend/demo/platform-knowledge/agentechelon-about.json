@@ -82,8 +82,8 @@
     },
     {
       "title": "How to add or manage an assistant profile",
-      "summary": "A practical guide for two adjacent tasks the capability-profiles model ([SPEC-PER-TIER-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md)) makes routine:",
-      "path": "docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-TIER.md"
+      "summary": "A practical guide for two adjacent tasks the capability-profiles model ([SPEC-PER-PROFILE-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md)) makes routine:",
+      "path": "docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md"
     },
     {
       "title": "Latency targets (industry-sourced)",
@@ -203,7 +203,7 @@
     {
       "title": "SPEC: Per-tier ownership (`AgentEchelonTier-*`)",
       "summary": "**Status:** Implemented",
-      "path": "docs/specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md"
+      "path": "docs/specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md"
     },
     {
       "title": "Cross-Channel Task Continuity",

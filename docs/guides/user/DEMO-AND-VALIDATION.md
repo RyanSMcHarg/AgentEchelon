@@ -73,7 +73,7 @@ deploy is not battle-enabled).
   `context/` files and the `examples` in the welcome orientation. To add a task type, add an intent to
   the pack (`backend/lambda/src/lib/intent-pack.ts`, or per-deployment via `ASSISTANT_INTENT_PACK`)
   and its state machine (`backend/lambda/src/lib/task-state-machines.ts`). To add or reorder tiers,
-  see [`HOW-TO-ADD-OR-MANAGE-A-TIER.md`](../developer/HOW-TO-ADD-OR-MANAGE-A-TIER.md).
+  see [`HOW-TO-ADD-OR-MANAGE-A-PROFILE.md`](../developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md).
 - **Assistant knowledge of the platform:** `npm run sync-knowledge` indexes `README.md` + `docs/*.md`
   (and public blog posts if `AE_BLOG_VAULT_PATH` is set) into `backend/demo/platform-knowledge/agentechelon-about.json`.
   This is **platform self-knowledge**, kept OUTSIDE the company `context/` tree and uploaded to the

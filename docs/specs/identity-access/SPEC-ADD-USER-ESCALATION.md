@@ -103,7 +103,7 @@ gate and the SAME email-with-deep-link delivery; they differ only in who initiat
   This path is net-new work, not a reuse: it needs (a) a UI change (replace the free-text
   email field with a dropdown), and (b) a new SERVER-side endpoint that lists eligible
   users from Cognito (`ListUsers`) filtered to those whose `custom:tier` ranks at or above
-  the conversation's tier (same `TIER_RANK` ordering as the guardrail), returning only the
+  the conversation's tier (same rank ordering, via the `ProfileRegistry`), returning only the
   eligible set so the full directory is never exposed to the client. Open design points to
   settle: whether it fully replaces or coexists with email entry (email may still be needed
   for federated / not-yet-registered invitees), directory-privacy scoping (who may see whom),
@@ -204,7 +204,7 @@ The allowlist mirrors the onboarding-intake config plumbing
 |---|---|---|
 | Inline env | `ONBOARDING_INTAKE` | `ADD_USER_ALLOWLIST` |
 | SSM param name env | `ONBOARDING_INTAKE_PARAM` | `ADD_USER_ALLOWLIST_PARAM` |
-| SSM key | `/agent-echelon/assistant/{tier}/onboarding-intake` | `/agent-echelon/tier/{tier}/add-user-allowlist` |
+| SSM key | `/agent-echelon/assistant/{tier}/onboarding-intake` | `/agent-echelon/assistant/{profile}/add-user-allowlist` |
 | Loader | `loadIntakeConfig(ssmGet)` (cached warm, null when absent/malformed) | `loadAddUserAllowlist(ssmGet)` (same contract) |
 | Default | absent ⇒ onboarding OFF | absent ⇒ escalation OFF |
 
@@ -349,7 +349,7 @@ uses. The role mirrors `FederatedShareMemberRole` in `foundations-stack.ts`:
   creates one.
 - **SSM (`ssm:GetParameter`):** the per-tier bot ARN
   (`/agent-echelon/assistant/*/bot-arn`, the membership bearer) and the allowlist
-  param (`/agent-echelon/tier/{tier}/add-user-allowlist`).
+  param (`/agent-echelon/assistant/{profile}/add-user-allowlist`).
 - **Cognito (`cognito-idp:AdminListGroupsForUser`, `AdminGetUser`):** resolve the
   added human's authoritative tier for the eligibility check, and the requester's
   display name for the briefing. Scoped to the primary user pool ARN.
@@ -383,7 +383,7 @@ checked BEFORE `CreateChannelMembership`, and an ineligible result is a hard
 no-op (nothing is created).
 
 - **AgentEchelon eligibility = tier / membership.** The conversation carries an
-  enforced tier (`Channel.Metadata.modelTier`, tag `classification=<tier>`). The
+  enforced tier (the immutable `classification` tag, `classification=<tier>`; the `Channel.Metadata.modelTier` mirror is non-authoritative). The
   added human's authoritative tier comes from their Cognito groups. The add is
   refused unless the human's tier is at least the channel's tier. This reuses the
   membership-audit (Layer 6) tier logic: `isTierViolation(memberTier,
@@ -453,7 +453,7 @@ that brings humans into conversations is reviewable rather than silent.
 For a given tier, escalation is live only when ALL FOUR line up. If any is
 missing the capability is inert (fail closed), which is the intended default.
 
-1. **SSM allowlist exists.** `/agent-echelon/tier/{tier}/add-user-allowlist`
+1. **SSM allowlist exists.** `/agent-echelon/assistant/{profile}/add-user-allowlist`
    holds valid JSON with at least one entry. Absent/empty/malformed ⇒ disabled.
 2. **System-prompt guidance references the keys.** The tier's system prompt
    renders the `whenToAdd` guidance for each KEY, so the model knows the keys
@@ -544,13 +544,13 @@ These do NOT exist and are net-new work:
    fork, not a function to call.
 3. **The allowlist loader + SSM param + tier-stack wiring**: net-new, but a
    direct copy of the onboarding-intake plumbing (`ADD_USER_ALLOWLIST` /
-   `ADD_USER_ALLOWLIST_PARAM` / `/agent-echelon/tier/{tier}/add-user-allowlist`).
+   `ADD_USER_ALLOWLIST_PARAM` / `/agent-echelon/assistant/{profile}/add-user-allowlist`).
 4. **Pre-add eligibility helpers are not exported.** In `membership-audit.ts`
    the two AWS-lookup helpers `resolveMemberTier` (Cognito groups) and
-   `resolveChannelTier` (`DescribeChannel` ⇒ `Metadata.modelTier`) are
+   `resolveChannelTier` (`DescribeChannel` ⇒ the immutable `classification` tag) are
    module-private and wired to the reactive Kinesis path. What IS exported are
-   the pure predicates (`classifyMember`, `isTierViolation`) AND the `TIER_RANK`
-   / `AUDITED_EVENT_TYPES` constants. Escalation needs the SAME lookups PRE-add,
+   the pure predicates (`classifyMember`, `isTierViolation`) AND the `AUDITED_EVENT_TYPES`
+   constant (rank comparisons now go through the `ProfileRegistry`). Escalation needs the SAME lookups PRE-add,
    so either those two helpers are extracted into a shared module and exported,
    or the add-user Lambda re-implements the two AWS lookups. Extracting them is
    the cleaner delta and keeps one source of truth for "what tier is this

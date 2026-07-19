@@ -5,7 +5,7 @@
 
 The purpose of this document is to define the identity implementation for administrator and moderator actions in AgentEchelon: how admin identity is decided at deploy time, the levels of admin, how an admin's authority is provisioned, how admin actions are permitted and enforced, and how they are audited. Admin identity is configured with `adminAuthMode` and the related context flags in section 1.
 
-Related: `ADMIN-INTEGRATION-GUIDE.md` (the two planes), `ADMIN-GUIDE.md` (deploy-time choices), `SPEC-ADMIN-CONSOLE.md` (dashboard actions), `IDENTITY-PROVIDER-GUIDE.md` (user IdP, post-authentication trigger), `SPEC-CREDENTIAL-EXCHANGE.md` (bearer-pinned Amazon Chime SDK creds), `SPEC-PER-TIER-OWNERSHIP.md` (tier-level assistants), `SPEC-NOTIFICATION-BRIDGE.md` (notification fan-out), `SPEC-ACCESS-AND-CONTROLS-AUDITING.md` (audit trail), `ACCESS-CONTROL-BY-EXAMPLE.md` (user-side enforcement matrix).
+Related: `ADMIN-INTEGRATION-GUIDE.md` (the two planes), `ADMIN-GUIDE.md` (deploy-time choices), `SPEC-ADMIN-CONSOLE.md` (dashboard actions), `IDENTITY-PROVIDER-GUIDE.md` (user IdP, post-authentication trigger), `SPEC-CREDENTIAL-EXCHANGE.md` (bearer-pinned Amazon Chime SDK creds), `SPEC-PER-PROFILE-OWNERSHIP.md` (tier-level assistants), `SPEC-NOTIFICATION-BRIDGE.md` (notification fan-out), `SPEC-ACCESS-AND-CONTROLS-AUDITING.md` (audit trail), `ACCESS-CONTROL-BY-EXAMPLE.md` (user-side enforcement matrix).
 
 ## 
 
@@ -82,7 +82,7 @@ These are scoped to a single conversation (channel). Two levels apply:
 | Action                                                           | Moderator (channels they moderate)      | Admin (any channel)                                         | Amazon Chime SDK authority / note                                                          |
 | ---------------------------------------------------------------- | --------------------------------------- | ----------------------------------------------------------- | ------------------------------------------------------------------------------- |
 | Change conversation configuration (title, non-security metadata) | Yes                     | Yes | `UpdateChannel`                                                                 |
-| Change classification / tier of a conversation                   | No (security-affecting)  | Yes | Alters tier gating; admin-level only                                            |
+| Change classification / tier of a conversation                   | No (security-affecting)  | No (immutable by design) | The `classification` tag is set once at creation and cannot be changed (no role holds `chime:TagResource`/`UntagResource`); a conversation cannot be reclassified                                            |
 | Add or remove members                                            | Yes                     | Yes | `CreateChannelMembership` / `DeleteChannelMembership`                           |
 | Promote a member to moderator                                    | Yes                     | Yes | `CreateChannelModerator`                                                        |
 | Join as a non-visible (HIDDEN) observer                          | No                      | Yes | Observe or moderate a channel without being a visible member                    |
@@ -160,7 +160,7 @@ There is a service identity, and human admins at graded capability levels. Level
 
 - **The elevation lives on a SEPARATE `${sub}-admin` identity, never the chat identity `${sub}`.** That identity only ever receives channel-scoped, short-lived, audited creds, so its standing elevation can never attach to a broad chat credential (section 4). A restricted admin gets a `${sub}-admin` only if its subset needs cross-channel authority.
 - **Multiple app-instance-admins, not one shared credential.** Per-human identities make revocation real: de-provisioning a person's `${sub}-admin` (section 9) stops their Amazon Chime SDK authority. A single shared credential could not be revoked per person.
-- **Backend processes run as the tier-level assistants** (`SPEC-PER-TIER-OWNERSHIP.md`), not the service admin, which is reserved for no-human automation (e.g. membership-audit auto-revoke). This keeps the powerful identities off the default path.
+- **Backend processes run as the tier-level assistants** (`SPEC-PER-PROFILE-OWNERSHIP.md`), not the service admin, which is reserved for no-human automation (e.g. membership-audit auto-revoke). This keeps the powerful identities off the default path.
 
 ---
 

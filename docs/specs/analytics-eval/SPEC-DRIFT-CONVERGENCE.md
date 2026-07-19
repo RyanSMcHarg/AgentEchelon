@@ -265,9 +265,9 @@ Threshold alerting reuses the existing admin-notification pattern (post to admin
 
 AE owns the canonical fixture at `tests/e2e/fixtures/drift-detection-cases.json`. CI gates on its SHA so the curated dataset can't drift unnoticed.
 
-### Tier Scope
+### Scope
 
-Drift runs on **all AE tiers (Basic, Standard, Premium)** that have Aurora mode enabled. Drift does not run in Athena-mode deployments - the module gates on `analyticsMode === 'aurora'` at the call-site level. This is a documentation/operational decision, not a code branch; Athena-mode just doesn't have the `summary_embeddings` table or the embedding writer Lambda.
+Drift is a **per-conversation-type** property (`driftEnabled` / `isDriftEnabledForType` in `backend/lib/config/conversation-types.ts`), not a per-user-tier property; the shipped types mirror the basic/standard/premium set, so drift effectively runs across them, provided Aurora mode is enabled. Drift does not run in Athena-mode deployments - the module gates on `analyticsMode === 'aurora'` at the call-site level. This is a documentation/operational decision, not a code branch; Athena-mode just doesn't have the `summary_embeddings` table or the embedding writer Lambda.
 
 ### Interaction with `/battle` (suppression)
 

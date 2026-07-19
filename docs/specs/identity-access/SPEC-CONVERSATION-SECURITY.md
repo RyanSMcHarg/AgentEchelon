@@ -162,10 +162,8 @@ caller's own `.../user/${aws:PrincipalTag/sub}`) and the **per-tier assistant ro
 (`*-tier-stack.ts`). It is not on the per-tier Cognito Identity-Pool user roles:
 those are intentionally empty (`makeTierRole`), because the frontend reaches Amazon Chime SDK
 only through the exchange (there is no Identity-Pool Amazon Chime SDK fallback). See
-`docs/specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md` §8 (row 2). The `iam-policies-stack.ts` per-tier
-managed policies are **legacy and unattached** (they use a non-IAM
-`chime-sdk-messaging:` prefix + an unset `aws:PrincipalTag/tier`);
-`tierChannelScopedAllow` is the enforced boundary.
+`docs/specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md` §8 (row 2). `tierChannelScopedAllow` is the sole enforced boundary; the former
+inert `iam-policies-stack.ts` per-tier managed policies have been removed.
 
 ## 4a. Access Matrix (actions × roles × conversation classification)
 
@@ -213,7 +211,7 @@ classification - *not* silently added and then locked out by Layer 1. Two gates:
 - **Synchronous (app layer) - the user-facing error.** Every path that adds a
   *human* validates `memberTier ≥ channelClassification` and refuses:
   - `share-conversation/index.js` (the invite-by-email path): reads the recipient's
-    authoritative Cognito-group tier, compares to the channel's `modelTier`, and on
+    authoritative Cognito-group tier, compares to the channel's immutable `classification` tag, and on
     a shortfall returns **403 `TIER_FORBIDDEN`** - *"This user cannot be added to
     this conversation; their access level does not meet the conversation's tier."*
   - `create-conversation` adds only the creator (already tier-authorized - over-tier
@@ -262,10 +260,12 @@ Channel metadata stores `classification` and `conversationType` as a JSON string
 
 ### Enforcement in Lambda Handlers
 
-Every function that modifies membership reads metadata first:
+Every function that modifies membership resolves the conversation's classification first. The authoritative source is the immutable `classification` tag (Layer 1); the metadata mirror below is the application-level view. The rank comparison is illustrative:
 
 ```typescript
-const TIER_RANK: Record<string, number> = { basic: 0, standard: 1, premium: 2 };
+// Ranks are resolved through the ProfileRegistry (backend/lib/config/profiles.ts),
+// not a hardcoded map; the shipped default is basic:1, standard:2, premium:3.
+const rankOf = (c: string) => profiles.rank(c);
 
 async function validateMembership(channelArn: string, memberTier: string): Promise<void> {
   const channel = await messagingClient.send(
@@ -274,7 +274,7 @@ async function validateMembership(channelArn: string, memberTier: string): Promi
   const metadata = JSON.parse(channel.Channel?.Metadata || '{}');
   const classification = metadata.classification || 'basic';
 
-  if (TIER_RANK[memberTier] < TIER_RANK[classification]) {
+  if (rankOf(memberTier) < rankOf(classification)) {
     throw new Error(
       `Membership denied: conversation requires ${classification} (user has ${memberTier})`
     );
@@ -286,7 +286,7 @@ Applied in:
 - `manage-conversation.ts` → `addMember()`
 - `share-conversation/index.js` → before `CreateChannelMembership`
 - `create-conversation/index.js` → validates creator's tier >= requested classification
-- `router-agent-handler.ts` → enforces tier from the channel's `modelTier` metadata before routing
+- `router-agent-handler.ts` → resolves the served classification from the channel's immutable `classification` tag (never the mutable `modelTier` metadata) before routing
 
 ## 6. Layer 3: User Tier from Cognito Groups
 
@@ -316,12 +316,13 @@ higher-tier context into a lower-tier conversation.
 
 Each tier's assistant role has S3 access scoped to its tier's prefix. The assistant literally cannot read higher-tier context files.
 
-The live enforcement is `ContextS3Read` on the per-tier async-processor roles (the per-tier assistants) in each tier stack. It scopes `s3:GetObject` and `s3:ListBucket` to that tier's prefixes: basic reads `context/basic/*`; standard reads `context/basic/*` and `context/standard/*`; premium reads all of `context/*`. Premium knowledge-base context is denied to basic and standard by the absence of the prefix grant, not by an explicit Deny. The per-tier policies below illustrate the shape.
+The live enforcement is `ContextS3Read` on each profile stack's processor role (the shared `assistant-async-processor.ts`, deployed once per profile stack), with the allowed prefixes generated from config (`classificationsAllowedFor`, which delegates to `ProfileRegistry.scopeAtOrBelow`). It scopes `s3:GetObject` and `s3:ListBucket` to that tier's prefixes: basic reads `context/basic/*`; standard reads `context/basic/*` and `context/standard/*`; premium reads all of `context/*`. Premium knowledge-base context is denied to basic and standard by the absence of the prefix grant, not by an explicit Deny. The per-tier policies below illustrate the shape.
 
 ### Per-Tier S3 Policies
 
 ```typescript
-// In bedrock-agent-stack.ts
+// Illustrative shape; the live policies are in assistant-profile-stack.ts,
+// with prefixes generated from ProfileRegistry.scopeAtOrBelow (not hand-written per tier).
 
 // Basic agent: can only read basic/ context
 const basicS3Policy = new iam.PolicyStatement({
@@ -425,7 +426,7 @@ async function auditMembershipEvent(record: MessageRecord): Promise<void> {
     const classification = await getChannelClassification(channel_arn);
     const memberTier = await getUserTier(target_arn);
 
-    if (TIER_RANK[memberTier] < TIER_RANK[classification]) {
+    if (profiles.rank(memberTier) < profiles.rank(classification)) {
       console.error('SECURITY: Tier violation in membership event', {
         event_type, channel_arn, target_arn, memberTier, classification,
       });
@@ -653,9 +654,9 @@ The assistant embeds machine-readable control markers in a message's Content so 
 | `create-conversation/index.js` | Set `classification` in metadata AND channel tag |
 | `manage-conversation.ts` | Read metadata, validate tier before `CreateChannelMembership` |
 | `share-conversation/index.js` | Read metadata, validate recipient tier |
-| `agent-tier-common.ts` / `*-tier-stack.ts` / `cognito-auth-stack.ts` | The enforced tag-gate is `tierChannelScopedAllow` (fail-closed **Allow** on the global `aws:ResourceTag/classification`) attached to the exchange rung roles + per-tier assistant roles. `iam-policies-stack.ts` is legacy and unattached |
+| `agent-tier-common.ts` / `*-tier-stack.ts` / `cognito-auth-stack.ts` | The enforced tag-gate is `tierChannelScopedAllow` (fail-closed **Allow** on the global `aws:ResourceTag/classification`) attached to the exchange rung roles + per-profile assistant roles. |
 | `cognito-auth-stack.ts` | Define per-tier Cognito groups; mirror `custom:tier` into the matching group at post-confirmation |
-| `bedrock-agent-stack.ts` | Per-tier IAM roles with S3 prefix scoping. Per-tier guardrails. Tier-drift instructions. |
+| `assistant-profile-stack.ts` | Per-profile processor IAM roles with S3 prefix scoping (prefixes generated from config). Per-profile guardrails. |
 | `channel-flow-processor.ts` | Enforce mention-required responses in multi-user conversations (@assistant / @all) |
 | `kinesis-archival.ts` | Add membership audit on `CREATE_CHANNEL_MEMBERSHIP` events |
 | Frontend `NewConversationModal` | Classification picker |

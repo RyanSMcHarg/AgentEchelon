@@ -118,7 +118,7 @@ only small tags in Metadata, precisely because of the limits above).
   intents/states.
 - `docs/overview/ARCHITECTURE.md` / `backend/ARCHITECTURE.md` - the Lex->Lambda->Amazon Chime SDK
   message flow and the direct-send pattern these helpers implement.
-- `docs/specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md` - the per-tier async-processors that call
+- `docs/specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md` - the shared async processor that calls
   `handleLongResponse` on every reply.
 - `docs/specs/assistant-context/SPEC-BILINGUAL-CONVERSATIONS.md` - first feature to extend output and
   the reason this guide exists.

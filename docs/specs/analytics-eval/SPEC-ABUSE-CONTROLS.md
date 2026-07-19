@@ -92,14 +92,14 @@ Truncate any user message longer than `MAX_USER_MESSAGE_LENGTH` before it reache
 - **Router (`router-agent-handler.ts`):** derive the stable correlation id; enforce the per-user rate limit before opening a task or invoking a processor.
 - **Shared pipeline (`async-processor-core.ts:runSharedPipeline`):** claim the dedup key first; check the spend budget before the Bedrock call; apply the length cap to the outgoing messages.
 
-Keeping the checks in the shared pipeline means all three tiers inherit them from one code path, consistent with the per-tier ownership model ([`../assistant-context/SPEC-PER-TIER-OWNERSHIP.md`](../assistant-context/SPEC-PER-TIER-OWNERSHIP.md)) and the reuse tenet in [`../../overview/TENETS.md`](../../overview/TENETS.md).
+Keeping the checks in the shared pipeline means all three tiers inherit them from one code path, consistent with the per-tier ownership model ([`../assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md`](../assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md)) and the reuse tenet in [`../../overview/TENETS.md`](../../overview/TENETS.md).
 
 ## Configuration
 
-All controls are env-driven with fail-open defaults so a misconfiguration never blocks legitimate traffic:
+Most controls are env-driven with fail-open defaults so a misconfiguration never blocks legitimate traffic (the per-profile request-rate ceiling is config-driven, see below):
 
 - `ABUSE_CONTROLS_TABLE` - table name (from the shared SSM contract).
-- `RATE_LIMIT_<TIER>` - hourly per-user request ceiling per tier (see defaults above).
+- Per-user hourly request ceiling: the `rateLimitPerHour` field on each assistant profile (`backend/lib/config/profiles.ts`), which replaced the former `RATE_LIMIT_<TIER>` env.
 - `BEDROCK_USER_HOURLY_BUDGET`, `BEDROCK_GLOBAL_HOURLY_BUDGET` - hourly model-call ceilings.
 - `BEDROCK_CIRCUIT_TRIP_THRESHOLD` - global count that flips the intake circuit.
 - `BUDGET_CANNED_RESPONSE` - the high-demand reply text.

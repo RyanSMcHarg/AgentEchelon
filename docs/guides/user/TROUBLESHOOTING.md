@@ -320,7 +320,7 @@ premium-only and returns before fan-out.
 ChannelFlowProcessor role ⇒ this bug.
 
 **Root Cause** - `handleBattleMessage`'s tier gate calls `DescribeChannel` to
-read the channel `modelTier`. The role granted
+read the channel's immutable `classification` tag. The role granted
 `ChannelFlowCallback`/`SendChannelMessage`/`ListChannelMemberships` but **not
 `chime:DescribeChannel`**; the `catch` defaulted `channelTier='basic'` →
 rejected every battle.

@@ -66,7 +66,7 @@ So three boundaries do three different jobs: the IAM **tag condition** is the ti
 
 **Assistant experience.** The premium assistant never receives the message, so no turn is generated. Nothing to filter after the fact, because the message never enters the channel.
 
-**To customize.** The allowed set is `classificationsAllowedFor(tier)` (`agent-tier-common.ts:57`), which is `TIER_ORDER` up to and including the tier. Add or reorder tiers by editing `TIER_ORDER`, then add the matching Cognito group and exchange rung. The tag itself is stamped immutably at channel creation by `create-conversation`.
+**To customize.** The allowed set is `classificationsAllowedFor(tier)` (`agent-tier-common.ts`), which delegates to `ProfileRegistry.scopeAtOrBelow` over the classification ladder declared in `backend/lib/config/profiles.ts`. Add or reorder classifications by editing `classifications` + `groupClearance` in `profiles.ts` (that single edit also drives the Cognito group and the exchange rung). The tag itself is stamped immutably at channel creation by `create-conversation`.
 
 ## A guest tries to read a channel they were not invited to
 
@@ -270,7 +270,7 @@ The admin console requests this identity's credential from the Credential-Exchan
 
 | You want to change | Edit | Effect |
 |---|---|---|
-| Tiers and their ordering | `TIER_ORDER` + `classificationsAllowedFor` (`agent-tier-common.ts`), plus a Cognito group and an exchange rung | Defines the classification ladder the channel gate evaluates |
+| Tiers and their ordering | `classifications` + `groupClearance` in `backend/lib/config/profiles.ts` (interpreted by `ProfileRegistry`; `classificationsAllowedFor` delegates to `scopeAtOrBelow`) | Defines the classification ladder the channel gate evaluates |
 | Which models a tier may invoke | `modelArnsForTier` + model catalog (`model-strategy.ts`), `tierModelSelection` | The per-tier `bedrock:InvokeModel` resource list |
 | What context a tier's assistant may read | `ContextS3Read` `s3:prefix` list in each tier stack | The per-tier S3 read scope |
 | What the browser may do | `EXCHANGE_MSG_ACTIONS` (`cognito-auth-stack.ts`) | The action set on every user rung; keep destructive actions off it |

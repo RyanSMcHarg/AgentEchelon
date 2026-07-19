@@ -11,14 +11,14 @@ read [`../../overview/ARCHITECTURE.md`](../../overview/ARCHITECTURE.md) and
 
 - [`../../overview/ARCHITECTURE.md`](../../overview/ARCHITECTURE.md) - the whole system end to end.
 - [`../../overview/TENETS.md`](../../overview/TENETS.md) - the principles a change must not break.
-- [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md) - how a message travels: channel flow, tier router, intent
-  classifier, per-tier async processor, guardrails, Bedrock.
+- [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md) - how a message travels: channel flow, shared router, intent
+  classifier, the shared async processor, guardrails, Bedrock.
 - [`CHIME_SDK_INTEGRATION.md`](CHIME_SDK_INTEGRATION.md) - the messaging-substrate integration.
 
 ## Common extensions
 
 - **Add or change a tier** (model, prompt, guardrail, context scope, second assistant):
-  [`HOW-TO-ADD-OR-MANAGE-A-TIER.md`](HOW-TO-ADD-OR-MANAGE-A-TIER.md).
+  [`HOW-TO-ADD-OR-MANAGE-A-PROFILE.md`](HOW-TO-ADD-OR-MANAGE-A-PROFILE.md).
 - **Change model routing** (which intent uses which model, and how tier access is enforced):
   [`MODEL_STRATEGY.md`](MODEL_STRATEGY.md).
 - **Assistant context and retrieval** (what the assistant is allowed to see; RAG):

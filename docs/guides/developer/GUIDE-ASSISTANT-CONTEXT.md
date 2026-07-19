@@ -219,4 +219,4 @@ endpoints (project decision 018; see [`RAG.md`](RAG.md)).
 - [`INFRASTRUCTURE-COST.md`](../admin/INFRASTRUCTURE-COST.md) - per-piece infrastructure cost model.
 - [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md) - where context enters the message path.
 - [`SPEC-CONVERSATION-SECURITY.md`](../../specs/identity-access/SPEC-CONVERSATION-SECURITY.md) - tier isolation guarantees.
-- [`HOW-TO-ADD-OR-MANAGE-A-TIER.md`](HOW-TO-ADD-OR-MANAGE-A-TIER.md) - per-tier assistant management.
+- [`HOW-TO-ADD-OR-MANAGE-A-PROFILE.md`](HOW-TO-ADD-OR-MANAGE-A-PROFILE.md) - per-tier assistant management.

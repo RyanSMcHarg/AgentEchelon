@@ -368,7 +368,7 @@ one DynamoDB table; the admin API (`membership-audit-admin.ts`) is admin-gated b
 | When | Detection time of the violation | Timestamp set when the finding is written. |
 | Type | Whether the flagged subject is a human member or an assistant | `member` (a human below the channel tier) or `assistant` (a tier bot above the channel tier). |
 | Subject tier | The member's or assistant's authoritative tier | Member: highest Cognito tier group. Assistant: the tier whose per-tier bot ARN matches (`resolveBotTier`). |
-| Channel tier | The channel's clearance classification | From the channel metadata `modelTier`. |
+| Channel tier | The channel's clearance classification | From the channel's immutable `classification` tag (not the mutable `modelTier` metadata). |
 | Member and channel | Which principal and which conversation | ARNs from the Kinesis membership event. |
 
 A **member** violation is a human whose tier ranks below the channel's (they could see content

@@ -65,8 +65,8 @@ Reply-in-user-language works on the federated path, end to end:
 Two properties worth calling out:
 
 - **Shared, not per-tier.** The instruction lives in the shared
-  `async-processor-core.ts` prompt builder, so every tier processor inherits it
- - no per-tier duplication.
+  `async-processor-core.ts` prompt builder, so the shared processor applies it for
+ every profile - no per-tier duplication.
 - **Untrusted tag → closed map.** `userLanguage` is never interpolated raw; the
   language *name* comes from the fixed `LANG_NAMES` map (`zh`/`en`), and unknown
   tags fall through to a generic phrasing. A crafted `userLanguage` cannot
@@ -100,7 +100,7 @@ message path:
 User → Amazon Chime SDK channel → Lex (AUTO) → router-agent-handler (one fulfillment)
    • resolveUserName / resolveChannelMetadata / resolveUserTier
    ├─ WelcomeIntent → composeWelcome(...)          (static, no Bedrock)
-   └─ FallbackIntent → classifyIntent → per-tier async-processor
+   └─ FallbackIntent → classifyIntent → shared async-processor
           → formatDomainContextForPrompt (Level 1 lang instruction)
           → Bedrock Converse tool loop → handleLongResponse → Amazon Chime SDK
 ```
@@ -283,4 +283,4 @@ admin analytics surface without a new pipeline.
   translation step and `workingLanguage` plug into.
 - The context-grounding path that supplies per-conversation context carries
   `userLanguage` (`formatDomainContextForPrompt`).
-- `docs/specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md` - the per-tier async-processors.
+- `docs/specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md` - the shared async processor (one instance per profile).

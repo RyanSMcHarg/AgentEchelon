@@ -200,8 +200,7 @@ agentechelon/
 │   │   ├── presigned-url/
 │   │   └── src/
 │   │       ├── router-agent-handler.ts         # Lex fulfillment: classify + dispatch
-│   │       ├── {basic,standard,premium}-agent-handler.ts   # per-tier handlers
-│   │       ├── {basic,standard,premium}-async-processor.ts # per-tier Converse loop
+│   │       ├── assistant-async-processor.ts    # shared Converse loop (one instance per profile)
 │   │       ├── analytics-aurora/     # Aurora mode (optional)
 │   │       │   ├── db-client.ts      # pg client + IAM auth + pooling
 │   │       │   ├── kinesis-archival.ts  # Kinesis → Aurora consumer
@@ -436,7 +435,7 @@ Backend config is set at deploy time via CDK context (`-c key=value` on `cdk dep
 | `analyticsMode` | `athena` | `athena` (serverless, cheap) or `aurora` (VPC + Aurora + pgvector; adds evaluation, drift, RAG). |
 | `enableRdsProxy` | `false` | Aurora-only, opt-in RDS Proxy connection pooling (~$86/mo floor). Default is direct writer-endpoint IAM auth. |
 | `enableLiveDrift` | `false` | Aurora-only, opt-in live drift suggestions in the message path. |
-| `enableBattle` | `true` | `/battle` alt-bot slot pool + orchestrator; `-c enableBattle=false` omits the Battle stack. `allowedBattleTiers` (default `['premium']`) gates which tiers may use it. |
+| `enableBattle` | `true` | `/battle` alt-bot slot pool + orchestrator; `-c enableBattle=false` omits the Battle stack. Battle eligibility is the per-profile `battleEligible` field in `profiles.ts` (premium by default). |
 | `analyticsVpcId` / `createVpcEndpoints` | create / `true` | Aurora-only: import an existing VPC instead of creating one; skip interface/gateway endpoints when the imported VPC already egresses. |
 | `sleepMode` | `false` | Aurora-only auto-pause to 0 ACU when idle (`sleepAfterIdle` default `2h`, `sleepCheckRate` default `rate(15 minutes)`). |
 | `enableMembershipAudit` | `false` | Layer-6 over-tier membership audit. `membershipAuditEnforce` (default `false`) = report-only vs auto-revoke; `membershipAuditAlertChannelArn` routes findings. See [ADMIN-GUIDE](docs/guides/admin/ADMIN-GUIDE.md). |
@@ -546,7 +545,7 @@ A low-volume Athena-mode deployment runs roughly **$30-50/month** (dominated by 
 
 ## Customization Guide
 
-Extending AgentEchelon, adding or changing a tier, adding a tool or intent, configuring image-generation providers, and replacing prompts, is covered in the **[Developer Guide](docs/guides/developer/DEVELOPER-GUIDE.md)** and the docs it links (for example [docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-TIER.md](docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-TIER.md) and [docs/guides/admin/IMAGE-GEN-PROVIDERS.md](docs/guides/admin/IMAGE-GEN-PROVIDERS.md)).
+Extending AgentEchelon, adding or changing a tier, adding a tool or intent, configuring image-generation providers, and replacing prompts, is covered in the **[Developer Guide](docs/guides/developer/DEVELOPER-GUIDE.md)** and the docs it links (for example [docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md](docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md) and [docs/guides/admin/IMAGE-GEN-PROVIDERS.md](docs/guides/admin/IMAGE-GEN-PROVIDERS.md)).
 
 ## Troubleshooting
 

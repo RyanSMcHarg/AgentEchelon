@@ -5,7 +5,7 @@
 ## Context
 
 The per-tier assistant **persona** and **intent pack** live in SSM
-(`${SSM_ROOT}/tier/{tier}/assistant-{system-prompt,intent-pack}`) because a rich persona + pack exceed
+(`${SSM_ROOT}/assistant/{tier}/assistant-{system-prompt,intent-pack}`) because a rich persona + pack exceed
 the Lambda 4 KB env cap (the processor/handler hydrate them by name at cold start).
 
 They were written by CFN-managed `ssm.StringParameter` constructs whose value came from
@@ -49,8 +49,8 @@ a personaless deploy is loud, not silent.
   admin API/console) with **admin authz + audit** - preserve-on-absent makes the *deploy* path
   safe, but an operator still needs a deploy to change the persona until that lands.
 - Teardown: the params are now orphaned from the tier stack (not CFN-deleted on stack destroy) - a tier
-  teardown must delete `${SSM_ROOT}/tier/{tier}/assistant-*` explicitly (documented in
-  HOW-TO-ADD-OR-MANAGE-A-TIER).
+  teardown must delete `${SSM_ROOT}/assistant/{tier}/assistant-*` explicitly (documented in
+  HOW-TO-ADD-OR-MANAGE-A-PROFILE).
 
 ## Migration (2-step RETAIN - one-time)
 

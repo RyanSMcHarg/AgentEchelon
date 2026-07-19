@@ -86,22 +86,21 @@ The backend is composed of independently-deployable feature stacks rather than o
 (owning its async processor, Lex bot, and AppInstanceBot); experiments are
 `AgentEchelonExperiments`; shared task tables plus create-conversation/add-agent are
 `AgentEchelonFoundations`. Each tier's code is independently owned. See
-`docs/specs/assistant-context/SPEC-PER-TIER-OWNERSHIP.md`.
+`docs/specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md`.
 
 **Always deployed (both modes):**
 1. `AgentEchelonChimeMessaging`, Amazon Chime SDK AppInstance (foundation)
-2. `AgentEchelonCognitoAuth`, User Pool, Identity Pool, Cognito triggers, per-tier Identity-Pool roles
+2. `AgentEchelonCognitoAuth`, User Pool, Identity Pool, Cognito triggers, per-classification Identity-Pool roles (generated from config)
 3. `AgentEchelonS3Storage`, file attachment bucket with presigned URLs
 4. `AgentEchelonFoundations`, shared task-tracking tables (`agent-tasks` + `user-tasks`) + the abuse-controls table (rate limit / spend budget / request dedup) + the conversation-actions audit table + create-conversation/add-agent + conversation-management (archive / remove-member / leave) APIs + their SSM contract (hosts no bot)
 5. `AgentEchelonExperiments`, A/B experiments table + admin-experiments API (`/admin/experiments`); publishes the experiments SSM contract
-6. `AgentEchelonTier-{Basic,Standard,Premium}`, per-tier assistant stacks: each owns its async-processor (self-hosted Converse tool loop, no Bedrock Agent) + tier-scoped context IAM + content guardrail + per-tier Lex bot + AppInstanceBot
+6. `AgentEchelonTier-{Basic,Standard,Premium}`, per-profile assistant stacks: each is a thin subclass of the shared `AssistantProfileStack` supplying a `ProfileTopology`; the one shared `assistant-async-processor.ts` (self-hosted Converse tool loop, no Bedrock Agent) serves every profile, with per-profile context IAM + content guardrail + Lex bot + AppInstanceBot
 7. `AgentEchelonNotifications`, SES email identity + conversation sharing + proactive-briefing EventBridge workflow (`lambda/src/proactive-briefing.ts`; recipients/schedule via `briefingRecipients`/`briefingScheduleRate` context)
-8. `AgentEchelonIAMPolicies`, tier-based model access policies
-9. `AgentEchelonChannelFlow`, Channel Flow Processor for @all + /battle routing + message filtering
-10. `AgentEchelonFrontend`, the default production frontend hosting: private S3 origin + CloudFront (OAC, SPA error mapping, security response headers, managed-rules WAF on by default). Provisions an EMPTY bucket + distribution; the Vite build is synced out-of-band by `npm run deploy-frontend` (it bakes in CDK outputs, so a BucketDeployment cannot run inside the stack). After first deploy, set `--context appUrl=https://<DistributionUrl>` and redeploy so backend CORS allows the app origin. See `docs/guides/user/FRONTEND-DEPLOY.md`.
+8. `AgentEchelonChannelFlow`, Channel Flow Processor for @all + /battle routing + message filtering
+9. `AgentEchelonFrontend`, the default production frontend hosting: private S3 origin + CloudFront (OAC, SPA error mapping, security response headers, managed-rules WAF on by default). Provisions an EMPTY bucket + distribution; the Vite build is synced out-of-band by `npm run deploy-frontend` (it bakes in CDK outputs, so a BucketDeployment cannot run inside the stack). After first deploy, set `--context appUrl=https://<DistributionUrl>` and redeploy so backend CORS allows the app origin. See `docs/guides/user/FRONTEND-DEPLOY.md`.
 
 **Opt-in:**
-- `AgentEchelonBattle` (default-on; `-c enableBattle=false` to omit), /battle alt-bot slot pool + battle-owned Lex + orchestrator + battle tables + channel-battle/outcome APIs; `allowedBattleTiers` (default `['premium']`)
+- `AgentEchelonBattle` (default-on; `-c enableBattle=false` to omit), /battle alt-bot slot pool + battle-owned Lex + orchestrator + battle tables + channel-battle/outcome APIs; battle eligibility is the per-profile `battleEligible` field in `profiles.ts` (premium by default)
 
 **Athena mode (default):**
 - `AgentEchelonAnalytics`, Kinesis to Firehose to S3 to Glue to Athena pipeline + client-events `/events` API

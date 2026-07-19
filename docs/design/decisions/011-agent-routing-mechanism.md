@@ -2,7 +2,7 @@
 title: "ADR-011: Agent routing mechanism - self-hosted vs managed agent runtime"
 status: Accepted - Option D (Converse + native tool use)
 related:
-  - SPEC-PER-TIER-OWNERSHIP.md
+  - SPEC-PER-PROFILE-OWNERSHIP.md
   - ../../backend/lib/stacks/basic-tier-stack.ts
   - ../../backend/lib/stacks/standard-tier-stack.ts
   - ../../backend/lib/stacks/premium-tier-stack.ts
