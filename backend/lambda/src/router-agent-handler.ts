@@ -2,11 +2,12 @@
  * Router Agent Handler
  *
  * Single entry point for all Lex fulfillment. Reads channel metadata
- * to determine the conversation's tier, then routes to the correct
- * async processor (Basic/Standard/Premium) and applies tier-appropriate
+ * to determine the conversation's classification, then routes to the correct
+ * async processor (Basic/Standard/Premium) and applies classification-appropriate
  * intent classification and task tracking.
  *
- * Tier routing (single entry point for ALL tiers; deployed per-tier via TIER):
+ * Classification routing (single entry point for ALL classifications; deployed
+ * per-classification, keyed by the TIER env var):
  * - basic    → classifyIntentBasic() + BASIC_ASYNC_PROCESSOR_ARN (Haiku, tasks: lightweight)
  * - standard → classifyIntent()      + STANDARD_ASYNC_PROCESSOR_ARN (Sonnet, tasks: full)
  * - premium  → classifyIntent()      + PREMIUM_ASYNC_PROCESSOR_ARN (Opus, tasks: full)
@@ -42,7 +43,7 @@ import {
 import { createTask, getActiveTask, TRIP_TASK_TTL_SECONDS, type TaskCreateOptions } from './lib/task-tracking.js';
 import { checkAndConsumeBudget, budgetCannedResponse, checkRateLimit, rateLimitMessage } from './lib/abuse-controls.js';
 // SPEC-CAPABILITY-PROFILES: the single interpreter of classification tags + group clearance.
-// Replaces the local CLASSIFICATION_RANK / CLEARANCE_GROUPS / minRank / isAdvancedTier / classificationScope constants.
+// Replaces the local CLASSIFICATION_RANK / CLEARANCE_GROUPS / minRank / isAdvancedClassification / classificationScope constants.
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
 // Retrieval runs in the VPC-attached data-plane Lambda (project decision 018);
 // this handler stays non-VPC and invokes it via the client seam. Same signature.
@@ -63,16 +64,17 @@ import {
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-// Per-tier bot SSM key (= /agent-echelon/assistant/{tier}/bot-arn), always set by the
-// deploying tier stack. There is no shared '/agent-echelon/bot-arn' fallback.
+// Per-classification bot SSM key (= /agent-echelon/assistant/{classification}/bot-arn),
+// always set by the deploying classification stack. There is no shared
+// '/agent-echelon/bot-arn' fallback.
 const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || '';
 const USER_POOL_ID = process.env.USER_POOL_ID || '';
-// Per-tier deployment (ADR-011 reversal / bot-layer isolation): when this
-// handler is deployed per-tier, TIER is set statically and BOT_ARN_PARAM points
-// at that tier's bot key. With TIER set the handler skips channel-tier discovery
-// (it IS the tier) and acts as the per-tier bot — no shared router, no shared
-// bot. Unset = legacy shared-router behavior (back-compat).
-const STATIC_TIER = process.env.TIER || '';
+// Per-classification deployment (ADR-011 reversal / bot-layer isolation): when this
+// handler is deployed per-classification, TIER is set statically and BOT_ARN_PARAM points
+// at that classification's bot key. With TIER set the handler skips channel-classification
+// discovery (it IS the classification) and acts as the per-classification bot — no shared
+// router, no shared bot. Unset = legacy shared-router behavior (back-compat).
+const STATIC_CLASSIFICATION = process.env.TIER || '';
 
 const BASIC_ASYNC_PROCESSOR_ARN = process.env.BASIC_ASYNC_PROCESSOR_ARN || '';
 const STANDARD_ASYNC_PROCESSOR_ARN = process.env.STANDARD_ASYNC_PROCESSOR_ARN || '';
@@ -80,8 +82,8 @@ const PREMIUM_ASYNC_PROCESSOR_ARN = process.env.PREMIUM_ASYNC_PROCESSOR_ARN || '
 
 // Live drift detection — feature-flagged via ENABLE_LIVE_DRIFT (set by the
 // auroraDriftWiring helper in Aurora mode). The flow itself lives in
-// `lib/live-drift-flow.ts` (shared; this router runs on every tier so all tiers
-// run it). The RAG-retrieval gate below still reads ENABLE_LIVE_DRIFT directly
+// `lib/live-drift-flow.ts` (shared; this router runs on every classification so all
+// classifications run it). The RAG-retrieval gate below still reads ENABLE_LIVE_DRIFT directly
 // because RAG piggybacks on the same Aurora hookup.
 
 const lambdaClient = new LambdaClient({ region: AWS_REGION });
@@ -95,8 +97,8 @@ const cognitoClient = new CognitoIdentityProviderClient({ region: AWS_REGION });
 
 let cachedBotArn: string | null = null;
 const channelClassificationCache = new Map<string, string>();
-const userTierCache = new Map<string, { tier: string; expires: number }>();
-const USER_TIER_CACHE_TTL_MS = 5 * 60_000;
+const userClearanceCache = new Map<string, { clearance: string; expires: number }>();
+const USER_CLEARANCE_CACHE_TTL_MS = 5 * 60_000;
 
 function minRank(a: string, b: string): string {
   return profiles.min(a, b);
@@ -104,8 +106,8 @@ function minRank(a: string, b: string): string {
 
 async function resolveUserClearance(userSub: string): Promise<string> {
   if (!userSub || !USER_POOL_ID) return 'basic';
-  const cached = userTierCache.get(userSub);
-  if (cached && cached.expires > Date.now()) return cached.tier;
+  const cached = userClearanceCache.get(userSub);
+  if (cached && cached.expires > Date.now()) return cached.clearance;
 
   try {
     const resp = await cognitoClient.send(new AdminListGroupsForUserCommand({
@@ -116,12 +118,12 @@ async function resolveUserClearance(userSub: string): Promise<string> {
     // Highest classification the user's Cognito groups clear for (fail-closed floor if none).
     // The Lambda reads the raw group list, so the registry picks the max — group-resource
     // precedence controls the cognito:groups claim, which this path does not use.
-    const tier = profiles.clearanceForGroups(groups);
+    const clearance = profiles.clearanceForGroups(groups);
 
-    userTierCache.set(userSub, { tier, expires: Date.now() + USER_TIER_CACHE_TTL_MS });
-    return tier;
+    userClearanceCache.set(userSub, { clearance, expires: Date.now() + USER_CLEARANCE_CACHE_TTL_MS });
+    return clearance;
   } catch (err) {
-    console.warn('[Router] Failed to resolve user tier from groups:', err);
+    console.warn('[Router] Failed to resolve user clearance from groups:', err);
     return 'basic';
   }
 }
@@ -153,23 +155,23 @@ async function getSsmParam(name: string): Promise<string | undefined> {
 }
 
 async function resolveChannelClassification(channelArn: string, botArn: string): Promise<string> {
-  // Per-tier deployment: the handler IS the tier — no discovery needed. This is the
-  // LIVE topology (every tier stack sets TIER), so the tag read below is only reached
-  // in a hypothetical single-handler multi-tier deployment.
-  if (STATIC_TIER) return STATIC_TIER;
+  // Per-classification deployment: the handler IS the classification — no discovery needed. This
+  // is the LIVE topology (every classification stack sets TIER), so the tag read below is only
+  // reached in a hypothetical single-handler multi-classification deployment.
+  if (STATIC_CLASSIFICATION) return STATIC_CLASSIFICATION;
   if (channelClassificationCache.has(channelArn)) return channelClassificationCache.get(channelArn)!;
-  const tier = await resolveChannelClassificationTag(channelArn);
-  channelClassificationCache.set(channelArn, tier);
-  return tier;
+  const classification = await resolveChannelClassificationTag(channelArn);
+  channelClassificationCache.set(channelArn, classification);
+  return classification;
 }
 
 /**
- * The served tier keys on the channel's IMMUTABLE `classification` TAG — the same
+ * The served classification keys on the channel's IMMUTABLE `classification` TAG — the same
  * signal the IAM Layer-1 boundary enforces (agent-classification-common.classificationChannelScopedAllow,
  * `aws:ResourceTag/classification`). We deliberately do NOT trust `metadata.modelTier`:
  * channel Metadata is mutable via `chime:UpdateChannel` (the owner `rename` cap), so
- * keying the served tier on it would let a channel moderator raise the tier a FEDERATED
- * user is served at (the federated path takes `userClearance = channelClassification` with no min-cap).
+ * keying the served classification on it would let a channel moderator raise the classification a
+ * FEDERATED user is served at (the federated path takes `userClearance = channelClassification` with no min-cap).
  * The `classification` tag cannot be changed by UpdateChannel, so it is tamper-proof.
  * Fail-closed to 'basic' when the tag is absent, invalid, or unreadable.
  */
@@ -189,7 +191,7 @@ async function resolveChannelClassificationTag(channelArn: string): Promise<stri
 /** Pull the channel's full Metadata JSON (modelTier, topic, triggerContext,
  *  createdBy, etc.). Cached per-channel for the Lambda's warm life so the
  *  WelcomeIntent path doesn't double the Chime calls already done for
- *  tier resolution. Returns {} on error -- the caller must default. */
+ *  classification resolution. Returns {} on error -- the caller must default. */
 const channelMetaCache = new Map<string, Record<string, unknown>>();
 async function resolveChannelMetadata(channelArn: string, botArn: string, forceRefresh = false): Promise<Record<string, unknown>> {
   if (!forceRefresh && channelMetaCache.has(channelArn)) return channelMetaCache.get(channelArn)!;
@@ -303,37 +305,37 @@ async function loadWelcomeOrientation(): Promise<WelcomeOrientation | null> {
   return parsed;
 }
 
-function envAsyncProcessorArn(tier: string): string {
-  switch (tier) {
+function envAsyncProcessorArn(classification: string): string {
+  switch (classification) {
     case 'premium': return PREMIUM_ASYNC_PROCESSOR_ARN;
     case 'standard': return STANDARD_ASYNC_PROCESSOR_ARN;
     default: return BASIC_ASYNC_PROCESSOR_ARN;
   }
 }
 
-// Resolved tier → processor ARN (only SSM hits are cached, so once a tier
-// resolves to its per-tier processor it stays cached for the life of the warm
-// container; a tier without a published SSM param re-checks SSM each turn and
+// Resolved classification → processor ARN (only SSM hits are cached, so once a classification
+// resolves to its per-classification processor it stays cached for the life of the warm
+// container; a classification without a published SSM param re-checks SSM each turn and
 // thus picks up its AgentEchelonTier-* processor the moment that stack is
 // deployed — no router redeploy).
 const processorArnCache = new Map<string, string>();
 
 /**
- * Resolve the tier's async-processor ARN, preferring the per-tier stack's
- * SSM-published value (/agent-echelon/assistant/{tier}/processor-arn) and falling
- * back to the *_ASYNC_PROCESSOR_ARN env var. A tier routes to its
+ * Resolve the classification's async-processor ARN, preferring the per-classification stack's
+ * SSM-published value (/agent-echelon/assistant/{classification}/processor-arn) and falling
+ * back to the *_ASYNC_PROCESSOR_ARN env var. A classification routes to its
  * AgentEchelonTier-* processor as soon as that stack publishes its SSM param.
  */
-async function resolveAsyncProcessorArn(tier: string): Promise<string> {
-  const cached = processorArnCache.get(tier);
+async function resolveAsyncProcessorArn(classification: string): Promise<string> {
+  const cached = processorArnCache.get(classification);
   if (cached) return cached;
 
-  const fromSsm = await getSsmValue(`${SSM_ROOT}/assistant/${tier}/processor-arn`);
+  const fromSsm = await getSsmValue(`${SSM_ROOT}/assistant/${classification}/processor-arn`);
   if (fromSsm) {
-    processorArnCache.set(tier, fromSsm);
+    processorArnCache.set(classification, fromSsm);
     return fromSsm;
   }
-  return envAsyncProcessorArn(tier);
+  return envAsyncProcessorArn(classification);
 }
 
 // ============================================================
@@ -399,8 +401,8 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     const channelClassification = channelArn ? await resolveChannelClassification(channelArn, botArn) : 'basic';
 
     // Defense in depth: never trust channel metadata alone. Pull the sender's
-    // real tier from Cognito group membership and use the minimum of the two.
-    // If someone was added to a premium channel they don't have the tier for,
+    // real clearance from Cognito group membership and use the minimum of the two.
+    // If someone was added to a premium channel they don't have the clearance for,
     // they get downgraded (not errored) and we log a security event.
     const userSub = extractUserSub(event);
 
@@ -468,34 +470,34 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     }
 
     // Federated users (a `fed_` AppInstanceUser from the embedded-widget exchange) do NOT
-    // exist in the AE Cognito pool, so a group-based tier lookup always throws
+    // exist in the AE Cognito pool, so a group-based clearance lookup always throws
     // UserNotFoundException and would wrongly downgrade them to basic. Their entitlement is
     // fixed by the channel they were provisioned into (federated-create-conversation creates
     // the channel at ASSISTANT_CLASSIFICATION and they can only ever be a member of that channel), so the
-    // channel tier IS authoritative for them — trust it and skip the Cognito lookup. Without
+    // channel classification IS authoritative for them — trust it and skip the Cognito lookup. Without
     // this, every turn downgrades to basic and the standard processor is never invoked.
     const isFederated = userSub.startsWith('fed_');
     const userClearance = isFederated ? channelClassification : await resolveUserClearance(userSub);
-    const tier = isFederated ? channelClassification : minRank(channelClassification, userClearance);
+    const effectiveClassification = isFederated ? channelClassification : minRank(channelClassification, userClearance);
 
     if (!isFederated && channelClassification !== userClearance) {
-      console.warn('[Router][SecurityEvent] Tier mismatch', {
+      console.warn('[Router][SecurityEvent] Classification mismatch', {
         userSub,
         channelArn,
         channelClassification,
         userClearance,
-        effectiveClassification: tier,
+        effectiveClassification,
       });
     }
 
-    const asyncProcessorArn = await resolveAsyncProcessorArn(tier);
+    const asyncProcessorArn = await resolveAsyncProcessorArn(effectiveClassification);
     // Does this classification's profile use the LLM intent classifier? True for all default
     // profiles (basic included — a deliberate change from the legacy keyword path); a deployment
     // can still set classifierMode:'keyword' on a cheap profile.
-    const usesLlmClassifier = profiles.profileFor(tier).classifierMode === 'llm';
+    const usesLlmClassifier = profiles.profileFor(effectiveClassification).classifierMode === 'llm';
 
     console.log('[Router] Resolved', {
-      tier,
+      effectiveClassification,
       channelClassification,
       userClearance,
       asyncProcessorArn: asyncProcessorArn.split(':').pop(),
@@ -532,11 +534,11 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     // keyword fallback reflect the deployment's taxonomy. See lib/intent-pack.ts.
     await hydrateIntentPackFromSsm();
 
-    // Classification A/B: resolve a classifier-model experiment for this tier
+    // Classification A/B: resolve a classifier-model experiment for this classification
     // BEFORE classifying, so the variant's model does the classification.
     // Best-effort — any failure falls back to the deployment-default classifier.
     // The mutual-exclusion rule guarantees a classification experiment never
-    // coexists with a base/intent experiment on the tier, so this never
+    // coexists with a base/intent experiment on the classification, so this never
     // double-resolves with the response-model experiment.
     let classifierModelId: string | undefined;
     let classifierExperimentId: string | undefined;
@@ -544,7 +546,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     if (usesLlmClassifier && channelArn) {
       try {
         const catalog = getModelCatalog(AWS_REGION, process.env.AWS_ACCOUNT_ID || '');
-        const cls = await resolveClassificationExperiment(tier as 'basic' | 'standard' | 'premium', channelArn, catalog);
+        const cls = await resolveClassificationExperiment(effectiveClassification as 'basic' | 'standard' | 'premium', channelArn, catalog);
         if (cls) {
           classifierModelId = cls.bedrockModelId;
           classifierExperimentId = cls.experimentId;
@@ -580,8 +582,8 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
 
     // ============================================================
     // Live drift detection (feature-flagged via ENABLE_LIVE_DRIFT).
-    // The flow is shared (lib/live-drift-flow.ts) so every tier runs the
-    // identical logic — this router is the handler for all tiers. It
+    // The flow is shared (lib/live-drift-flow.ts) so every classification runs the
+    // identical logic — this router is the handler for all classifications. It
     // gates internally on ENABLE_LIVE_DRIFT + HAS_AURORA + a real channel,
     // and suppresses itself in battle-enabled channels. A non-null result
     // short-circuits the turn (drift suggestion, or confirm/navigate); a
@@ -593,7 +595,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
       channelArn,
       userMessage,
       userSub,
-      classification: tier as 'basic' | 'standard' | 'premium',
+      classification: effectiveClassification as 'basic' | 'standard' | 'premium',
       botArn,
       intent: classification.intent,
     });
@@ -603,7 +605,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
 
     const deliveryOptionName = intentToDeliveryOption(classification.intent);
 
-    // Resolve A/B experiment (if any active experiment matches this tier + intent)
+    // Resolve A/B experiment (if any active experiment matches this classification + intent)
     let experimentId: string | undefined;
     let variantId: string | undefined;
     let resolvedModel: string | undefined;
@@ -611,7 +613,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     if (channelArn && classification.intent !== IntentType.GREETING && classification.intent !== IntentType.ACKNOWLEDGMENT) {
       try {
         const catalog = getModelCatalog(AWS_REGION, process.env.AWS_ACCOUNT_ID || '');
-        const experiment = await resolveExperimentModel(tier as 'basic' | 'standard' | 'premium', classification.intent, channelArn, catalog);
+        const experiment = await resolveExperimentModel(effectiveClassification as 'basic' | 'standard' | 'premium', classification.intent, channelArn, catalog);
         if (experiment) {
           experimentId = experiment.experimentId;
           variantId = experiment.variantId;
@@ -624,7 +626,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     }
 
     console.log('[Router]', {
-      tier,
+      effectiveClassification,
       classifiedIntent: classification.intent,
       confidence: classification.confidence,
       deliveryOption: deliveryOptionName,
@@ -632,7 +634,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
       variantId,
     });
 
-    // DIRECT delivery for greetings/acknowledgments (all tiers)
+    // DIRECT delivery for greetings/acknowledgments (all classifications)
     if (classification.intent === IntentType.GREETING ||
         classification.intent === IntentType.ACKNOWLEDGMENT) {
       const quickResponse = getQuickResponse(lexIntentName, userMessage);
@@ -653,10 +655,10 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     // no Bedrock. The ceiling is the profile's rateLimitPerHour (config, always defined for a known
     // classification); 0/undefined disables it. Counter is per-user; the effective classification is
     // min(channel, user), so a user is capped at the more restrictive of the two.
-    const tierRateLimit = profiles.profileFor(tier).rateLimitPerHour ?? 0;
-    const rate = await checkRateLimit(userSub, tierRateLimit);
+    const classificationRateLimit = profiles.profileFor(effectiveClassification).rateLimitPerHour ?? 0;
+    const rate = await checkRateLimit(userSub, classificationRateLimit);
     if (!rate.allowed) {
-      console.warn('[Router] Rate limit exceeded; serving limit notice', { tier, userSub: userSub.slice(0, 8) });
+      console.warn('[Router] Rate limit exceeded; serving limit notice', { effectiveClassification, userSub: userSub.slice(0, 8) });
       return formatLexResponse(event, [{ contentType: 'PlainText', content: rateLimitMessage(rate.resetInMinutes) }]);
     }
 
@@ -704,9 +706,9 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     // 'default'). The processor combines it with the persona it resolves into the turn's `configId`.
     const intentPackVersion = componentVersion(activeIntentPackRaw());
 
-    // Task tracking runs on EVERY tier. The router is the single Lex entry point for all
-    // tiers (deployed per-tier via STATIC_TIER); tasks are a platform capability, not a
-    // standard/premium-only one. getActiveTask/createTask are tier-agnostic, and basic's
+    // Task tracking runs on EVERY classification. The router is the single Lex entry point for all
+    // classifications (deployed per-classification via STATIC_CLASSIFICATION); tasks are a platform
+    // capability, not a standard/premium-only one. getActiveTask/createTask are classification-agnostic, and basic's
     // async processor gives lightweight task support (grounds the prompt + stamps task_id).
     // Basic keeps keyword classification (classifyIntentBasic above), whose pack keywords
     // already emit task intents (report_generation/data_extraction/…), so no per-turn LLM
@@ -745,7 +747,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
       // adding summary-as-context costs no extra wall-clock. Both are best-effort
       // and null when unavailable (ADR-017).
       const [retrievedContext, conversationSummary] = await Promise.all([
-        maybeRetrieveContext(userMessage, tier, classification.intent),
+        maybeRetrieveContext(userMessage, effectiveClassification, classification.intent),
         maybeGetSummary(channelArn, classification.intent),
       ]);
 
@@ -796,7 +798,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
             channelArn,
             correlationId,
             userMessage,
-            userType: tier,
+            userType: effectiveClassification,
             taskId,
             taskType,
             botArn,
@@ -827,21 +829,21 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
       }
     }
 
-    // RAG retrieval + summary for the PLACEHOLDER_UPDATE path. Tier comes from
-    // the basic-tier short-circuit above; classification has the intent.
+    // RAG retrieval + summary for the PLACEHOLDER_UPDATE path. The effective classification
+    // comes from the basic short-circuit above; the intent classifier has the intent.
     // Skipped automatically when ENABLE_LIVE_DRIFT is off (no Aurora). Parallel.
     const [placeholderRetrievedContext, placeholderSummary] = await Promise.all([
-      maybeRetrieveContext(userMessage, tier, classification.intent),
+      maybeRetrieveContext(userMessage, effectiveClassification, classification.intent),
       maybeGetSummary(channelArn, classification.intent),
     ]);
 
-    // PLACEHOLDER_UPDATE: General questions (all tiers)
+    // PLACEHOLDER_UPDATE: General questions (all classifications)
     if (asyncProcessorArn && channelArn) {
       await invokeAsync(asyncProcessorArn, {
         channelArn,
         correlationId,
         userMessage,
-        userType: tier,
+        userType: effectiveClassification,
         botArn,
         senderArn: event.requestAttributes?.['CHIME.sender.arn'],
         // Reply visibility is derived from the placeholder's actual Target in
@@ -887,7 +889,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
  */
 async function maybeRetrieveContext(
   userMessage: string,
-  tier: string,
+  classification: string,
   intent: string,
 ): Promise<RetrieveContextResult | null> {
   if (process.env.ENABLE_LIVE_DRIFT !== 'true') return null;
@@ -898,14 +900,14 @@ async function maybeRetrieveContext(
   }
 
   try {
-    // Tier-scope: a classification sees content at its rank and below (own-rank-and-below),
+    // Classification-scope: a classification sees content at its rank and below (own-rank-and-below),
     // the fail-closed SQL metadata filter (ADR-007). Ladder derived from config via the registry.
-    const classificationScope = profiles.scopeAtOrBelow(tier);
+    const classificationScope = profiles.scopeAtOrBelow(classification);
 
-    // 'company' is the tier-gated business/financial corpus (ADR-017): company
-    // documents are embedded under rag/company/{tier}/ and retrieved here by
-    // relevance, deterministically (router pre-fetch), so a tier's own facts reach
-    // the model without depending on the model electing to call a tool. Tier scope
+    // 'company' is the classification-gated business/financial corpus (ADR-017): company
+    // documents are embedded under rag/company/{classification}/ and retrieved here by
+    // relevance, deterministically (router pre-fetch), so a classification's own facts reach
+    // the model without depending on the model electing to call a tool. Classification scope
     // is the same fail-closed SQL metadata filter used for wiki/doc.
     const result = await retrieveContext({
       query: userMessage,
