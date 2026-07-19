@@ -73,7 +73,7 @@ describe('admin auth — service mode (IAM-signed)', () => {
     expect('claims' in guard).toBe(true);
     if ('claims' in guard) {
       expect(guard.claims.sub).toBe('arn:aws:iam::111:role/host-proxy');
-      expect(guard.claims.tier).toBe('admins');
+      expect(guard.claims.clearance).toBe('admins');
     }
   });
 

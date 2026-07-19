@@ -1,7 +1,7 @@
 import {
   deriveFederatedSub,
   isFederatedSub,
-  resolveFederatedTier,
+  resolveFederatedClearance,
   classificationCeiling,
   type Classification,
 } from '../lambda/src/lib/federated-identity';
@@ -32,22 +32,22 @@ describe('deriveFederatedSub', () => {
   });
 });
 
-describe('resolveFederatedTier (fail-closed)', () => {
+describe('resolveFederatedClearance (fail-closed)', () => {
   const map: Record<string, Classification> = { 'partner-premium': 'premium', 'partner-basic': 'basic' };
 
   it('maps a known group', () => {
-    expect(resolveFederatedTier('partner-premium', map)).toBe('premium');
+    expect(resolveFederatedClearance('partner-premium', map)).toBe('premium');
   });
 
-  it('falls closed to the lowest tier on absent/unknown group', () => {
-    expect(resolveFederatedTier(undefined, map)).toBe('basic');
-    expect(resolveFederatedTier('not-a-group', map)).toBe('basic');
-    expect(resolveFederatedTier('x', map, 'basic')).toBe('basic');
+  it('falls closed to the lowest clearance on absent/unknown group', () => {
+    expect(resolveFederatedClearance(undefined, map)).toBe('basic');
+    expect(resolveFederatedClearance('not-a-group', map)).toBe('basic');
+    expect(resolveFederatedClearance('x', map, 'basic')).toBe('basic');
   });
 });
 
 describe('classificationCeiling', () => {
-  it('returns the lower of idp tier and channel tier', () => {
+  it('returns the lower of idp clearance and channel classification', () => {
     expect(classificationCeiling('premium', 'basic')).toBe('basic');
     expect(classificationCeiling('basic', 'premium')).toBe('basic');
     expect(classificationCeiling('standard', 'standard')).toBe('standard');

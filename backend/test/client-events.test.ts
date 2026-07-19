@@ -73,9 +73,9 @@ describe('VALID_EVENT_TYPES — allow-list', () => {
 });
 
 describe('extractClaims', () => {
-  it('returns userId/email/tier from the most privileged group', () => {
+  it('returns userId/email/clearance from the most privileged group', () => {
     const claims = extractClaims(authedEvent({}, { sub: 'u1', email: 'a@b', 'cognito:groups': 'basic,premium' }));
-    expect(claims).toEqual({ userId: 'u1', email: 'a@b', tier: 'premium' });
+    expect(claims).toEqual({ userId: 'u1', email: 'a@b', clearance: 'premium' });
   });
 
   it('handles array-shaped cognito:groups', () => {
@@ -83,12 +83,12 @@ describe('extractClaims', () => {
     // Authorizer can rehydrate cognito:groups as an array; verify path.
     (evt.requestContext!.authorizer as { claims: Record<string, unknown> }).claims['cognito:groups'] = ['standard'];
     const claims = extractClaims(evt);
-    expect(claims?.tier).toBe('standard');
+    expect(claims?.clearance).toBe('standard');
   });
 
-  it('defaults tier to unknown when no group matches', () => {
+  it('defaults clearance to unknown when no group matches', () => {
     const claims = extractClaims(authedEvent({}, { sub: 'u', email: 'a@b', 'cognito:groups': 'misc' }));
-    expect(claims?.tier).toBe('unknown');
+    expect(claims?.clearance).toBe('unknown');
   });
 
   it('returns null when no claims present', () => {
@@ -98,7 +98,7 @@ describe('extractClaims', () => {
 });
 
 describe('normalize', () => {
-  const claims = { userId: 'sub-1', email: 'u@e', tier: 'premium' };
+  const claims = { userId: 'sub-1', email: 'u@e', clearance: 'premium' };
 
   it('accepts allow-listed events and stamps identity', () => {
     const out = normalize(
