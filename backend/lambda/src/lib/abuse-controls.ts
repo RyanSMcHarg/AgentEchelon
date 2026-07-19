@@ -141,7 +141,7 @@ export interface RateLimitDecision {
 
 /**
  * Per-user hourly rate limit (CH parity). Admin-exempt. `limit <= 0` (or unset) disables it.
- * Atomically increments `ratelimit#<userSub>#<hour>` and blocks once the count exceeds the tier
+ * Atomically increments `ratelimit#<userSub>#<hour>` and blocks once the count exceeds the classification
  * ceiling. Fails OPEN on error (a control-plane hiccup must not lock a user out). The reset window
  * is the remainder of the current UTC hour.
  */

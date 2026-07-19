@@ -2,7 +2,7 @@
  * BattleStack (`AgentEchelonBattle`) — the /battle head-to-head feature, an
  * independently-deployable, **opt-in** stack. A deployer who doesn't want
  * /battle simply doesn't deploy this stack (and sets `-c enableBattle=false`);
- * the tier processors + channel-flow then run with no battle plumbing and fail
+ * the classification processors + channel-flow then run with no battle plumbing and fail
  * open.
  *
  * Owns end-to-end:
@@ -17,22 +17,22 @@
  *     model/prompt each serves is read at runtime from the bound experiment
  *     variant) + per-slot + roster SSM.
  *   - The battle orchestrator Lambda (drives round-2 fan-out; invokes the
- *     premium tier processor resolved at runtime from SSM).
+ *     premium classification processor resolved at runtime from SSM).
  *   - The channel-battle admin API (`/channels/battle` GET/enable/disable) and
  *     the battle-outcome API (`/channels/battle/outcome` GET/POST).
- *   - Publishes the shared SSM contract the per-tier processors/handlers
+ *   - Publishes the shared SSM contract the per-classification processors/handlers
  *     resolve: `/agent-echelon/shared/tables/{battle-state-arn,battle-state-name,
  *     channel-battle-config-name}` + `/agent-echelon/shared/battle-orchestrator-arn`.
  *
  * Reads (does not own) the experiments table via the shared SSM contract that
  * AgentEchelonExperiments publishes, so this stack deploys AFTER the experiments
- * owner and BEFORE the per-tier stacks (which consume the battle SSM this stack
+ * owner and BEFORE the per-classification stacks (which consume the battle SSM this stack
  * publishes). The dependency graph is acyclic — the alt-slots' own-Lex is what
  * avoids a battle↔premium deploy cycle.
  *
- * **Tier-configurable, premium by default.** `allowedBattleTiers` (default
- * `['premium']`) is surfaced to channel-battle.ts so /battle can be opened to
- * other channel tiers without code changes.
+ * **Classification-configurable, premium by default.** A profile's `battleEligible`
+ * flag (default true only for premium) is what channel-battle.ts checks, so /battle
+ * can be opened to other classifications by config without code changes.
  */
 import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
@@ -45,7 +45,7 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import * as path from 'path';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
-import { SHARED_SSM, SSM_ROOT, STACK_PREFIX, INSTANCE_SSM, tierProcessorArnKey } from './agent-tier-common';
+import { SHARED_SSM, SSM_ROOT, STACK_PREFIX, INSTANCE_SSM, processorArnKey } from './agent-classification-common';
 
 export interface BattleStackProps extends cdk.StackProps {
   /** Shared Chime AppInstance ARN (from AgentEchelonChimeMessaging). */
@@ -125,7 +125,7 @@ export class BattleStack extends cdk.Stack {
     // ============================================================
     //
     // The alt-slots need a valid Lex `InvokedBy`. We mint a battle-owned Lex
-    // (NOT a per-tier one) so battle stays self-contained and we avoid a
+    // (NOT a per-classification one) so battle stays self-contained and we avoid a
     // battle↔premium deploy cycle (premium consumes battle SSM at deploy; if
     // battle consumed premium's Lex at deploy, neither could go first). The
     // handler is intentionally silent — battle replies are driven by
@@ -305,8 +305,8 @@ export class BattleStack extends cdk.Stack {
     //
     // Coordinates round-2 fan-out after both bots reach round-1 terminal state.
     // Invoked async from the premium async processor on the last transition.
-    // Sends per-bot round-2 placeholders, invokes the premium tier processor
-    // (AgentEchelonTier-Premium) — resolved at RUNTIME from SSM (param NAME passed in
+    // Sends per-bot round-2 placeholders, invokes the premium classification processor
+    // (AgentEchelonClassification-Premium) — resolved at RUNTIME from SSM (param NAME passed in
     // env) so there is no deploy-time ordering cycle with the premium stack.
     const battleOrchestratorRole = new iam.Role(this, 'BattleOrchestratorRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
@@ -331,8 +331,8 @@ export class BattleStack extends cdk.Stack {
           statements: [
             new iam.PolicyStatement({
               actions: ['lambda:InvokeFunction'],
-              // Invokes the premium tier processor (AgentEchelonTier-Premium) for round-2.
-              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Tier-*`],
+              // Invokes the premium classification processor (AgentEchelonClassification-Premium) for round-2.
+              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Classification-*`],
             }),
           ],
         }),
@@ -340,7 +340,7 @@ export class BattleStack extends cdk.Stack {
           statements: [
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
-              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${tierProcessorArnKey('premium')}`],
+              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${processorArnKey('premium')}`],
             }),
           ],
         }),
@@ -349,8 +349,8 @@ export class BattleStack extends cdk.Stack {
     });
 
     // Deterministic name so the ARN can be published to SSM as a constructed
-    // string (the tier processors resolve it via /agent-echelon/shared/
-    // battle-orchestrator-arn). The orchestrator itself invokes the premium tier
+    // string (the classification processors resolve it via /agent-echelon/shared/
+    // battle-orchestrator-arn). The orchestrator itself invokes the premium classification
     // processor via an SSM dynamic ref, so there is no GetAtt cycle to break.
     const battleOrchestratorName = `${this.stackName}-BattleOrchestrator`;
     const battleOrchestratorArn = `arn:aws:lambda:${this.region}:${this.account}:function:${battleOrchestratorName}`;
@@ -365,17 +365,17 @@ export class BattleStack extends cdk.Stack {
       role: battleOrchestratorRole,
       environment: {
         BATTLE_STATE_TABLE: battleStateTable.tableName,
-        PREMIUM_PROCESSOR_ARN_PARAM: tierProcessorArnKey('premium'),
+        PREMIUM_PROCESSOR_ARN_PARAM: processorArnKey('premium'),
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
     this.battleOrchestratorFunctionArn = battleOrchestrator.functionArn;
 
     // ============================================================
-    // Shared SSM contract for the per-tier stacks (SPEC-PER-TIER-OWNERSHIP.md).
-    // AgentEchelonTier-{Standard,Premium} resolve these at DEPLOY time via
+    // Shared SSM contract for the per-classification stacks (SPEC-PER-TIER-OWNERSHIP.md).
+    // AgentEchelonClassification-{Standard,Premium} resolve these at DEPLOY time via
     // valueForStringParameter (dynamic ref, NOT Fn::importValue) — but ONLY when
-    // their own `enableBattle` is set, so a tier can deploy with battle off.
+    // their own `enableBattle` is set, so a classification can deploy with battle off.
     // ============================================================
     const sharedParams: Array<[string, string, string]> = [
       ['SharedBattleStateArnParam', SHARED_SSM.battleStateArn, battleStateTable.tableArn],
@@ -405,7 +405,7 @@ export class BattleStack extends cdk.Stack {
                 'chime:CreateChannelMembership',
                 'chime:DeleteChannelMembership',
                 // DescribeChannel: caller-scoped access check (is the caller a member).
-                // ListTagsForResource: the tier gate reads the IMMUTABLE `classification`
+                // ListTagsForResource: the classification gate reads the IMMUTABLE `classification`
                 // tag, not mutable metadata, so a tampered modelTier cannot open battles.
                 'chime:DescribeChannel',
                 'chime:ListTagsForResource',
@@ -438,8 +438,8 @@ export class BattleStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
               resources: [
-                // The per-tier bot keys channel-battle.ts resolves (resolveTierBotArn).
-                // Every tier owns its own bot; there is no shared /agent-echelon/bot-arn.
+                // The per-classification bot keys channel-battle.ts resolves (resolveBotArn).
+                // Every classification owns its own bot; there is no shared /agent-echelon/bot-arn.
                 `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
             }),

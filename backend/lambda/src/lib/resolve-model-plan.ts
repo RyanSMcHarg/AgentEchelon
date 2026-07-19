@@ -1,7 +1,7 @@
 /**
  * Context-aware model routing — resolveModelPlan (SPEC-CONTEXT-AWARE-MODEL-ROUTING.md).
  *
- * Generalises model resolution from the closed set (intent, tier, experiment) to an OPEN
+ * Generalises model resolution from the closed set (intent, classification, experiment) to an OPEN
  * RoutingContext, so new signals (request-segment geography, data-sensitivity, …) route without
  * new call sites.
  *
@@ -17,8 +17,8 @@ import type {
   BackendModelDefinition,
   BackendModelKey,
   IntentRouteDefinition,
-  ModelTier,
-  TierModelSelection,
+  Classification,
+  ProfileModelSelection,
 } from '../../../lib/config/model-strategy.js';
 import { resolveModelForIntent } from './model-resolver.js';
 
@@ -48,7 +48,7 @@ export interface ModelPlan {
 }
 
 export interface RoutingContext {
-  tier: ModelTier;
+  classification: Classification;
   intent?: string;
   /** Experiment override already resolved upstream (router `resolveExperimentModel`). Rule #1. */
   experimentModelId?: string;
@@ -62,7 +62,7 @@ export interface RoutingContext {
 export interface ResolveModelPlanDeps {
   catalog: Record<BackendModelKey, BackendModelDefinition>;
   strategy: IntentRouteDefinition[];
-  tierDefaults: TierModelSelection;
+  profileDefaults: ProfileModelSelection;
   /** Context-aware routing master flag (`ENABLE_CONTEXT_ROUTING`). When false/absent, only rules
    *  1/3/4 apply — i.e. today's behavior, no context rules. */
   enabled?: boolean;
@@ -86,17 +86,17 @@ export interface ResolveModelPlanDeps {
 
 /**
  * Resolve a model PLAN from a routing context. Rule order (first match wins; every rule
- * inherits the tier safety enforced by `resolveModelForIntent`):
+ * inherits the classification safety enforced by `resolveModelForIntent`):
  *   1. experiment override (unchanged)
  *   2. context rules (segment, signals) — extension point, none in phase 1
  *   3. intent route
- *   4. tier default
+ *   4. classification default
  */
 export function resolveModelPlan(ctx: RoutingContext, deps: ResolveModelPlanDeps): ModelPlan {
-  const { catalog, strategy, tierDefaults } = deps;
+  const { catalog, strategy, profileDefaults } = deps;
 
-  // Rules 3 + 4: today's intent→tier resolution (with tier safety) is the baseline.
-  const base = resolveModelForIntent(ctx.intent, ctx.tier, catalog, strategy, tierDefaults);
+  // Rules 3 + 4: today's intent→classification resolution (with classification safety) is the baseline.
+  const base = resolveModelForIntent(ctx.intent, ctx.classification, catalog, strategy, profileDefaults);
 
   // Rule 1: experiment override wins on the primary model id — identical to today's
   // `event.resolvedModel || resolution.primaryModelId`.

@@ -32,8 +32,8 @@ type DriftCounter =
   | 'drift_signal_disagreement';
 
 interface DriftEmitOpts {
-  /** Tier of the requesting user; adds a UserTier dimension when set */
-  userTier?: 'basic' | 'standard' | 'premium';
+  /** Clearance of the requesting user; adds a UserClearance dimension when set */
+  userClearance?: 'basic' | 'standard' | 'premium';
   /** Classified intent at fire time; adds an Intent dimension when set */
   intent?: string;
 }
@@ -84,7 +84,7 @@ export function emitDriftTiming(
   opts: DriftEmitOpts = {}
 ): void {
   const dimensionSets: string[][] = [['Stage']];
-  if (opts.userTier) dimensionSets.push(['Stage', 'UserTier']);
+  if (opts.userClearance) dimensionSets.push(['Stage', 'UserClearance']);
   if (opts.intent) dimensionSets.push(['Stage', 'Intent']);
 
   const properties: Record<string, string | number> = {
@@ -92,7 +92,7 @@ export function emitDriftTiming(
     DriftStageLatency: latencyMs,
     CorrelationId: correlationId,
   };
-  if (opts.userTier) properties.UserTier = opts.userTier;
+  if (opts.userClearance) properties.UserClearance = opts.userClearance;
   if (opts.intent) properties.Intent = opts.intent;
 
   emitEmfMetric({
@@ -115,7 +115,7 @@ export function emitDriftCounter(
   opts: DriftEmitOpts = {}
 ): void {
   const dimensionSets: string[][] = [['Counter']];
-  if (opts.userTier) dimensionSets.push(['Counter', 'UserTier']);
+  if (opts.userClearance) dimensionSets.push(['Counter', 'UserClearance']);
   if (opts.intent) dimensionSets.push(['Counter', 'Intent']);
 
   const properties: Record<string, string | number> = {
@@ -123,7 +123,7 @@ export function emitDriftCounter(
     [counter]: 1,
     CorrelationId: correlationId,
   };
-  if (opts.userTier) properties.UserTier = opts.userTier;
+  if (opts.userClearance) properties.UserClearance = opts.userClearance;
   if (opts.intent) properties.Intent = opts.intent;
 
   emitEmfMetric({

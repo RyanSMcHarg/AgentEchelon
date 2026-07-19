@@ -18,13 +18,13 @@ import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as path from 'path';
-import { SSM_ROOT } from '../stacks/agent-tier-common';
+import { SSM_ROOT } from '../stacks/agent-classification-common';
 
 export interface MembershipAuditProps {
   /** The Chime -> Kinesis message stream (carries CREATE/UPDATE_CHANNEL_MEMBERSHIP events). */
   stream: kinesis.IStream;
   appInstanceArn: string;
-  /** Primary Cognito user pool: member-tier resolution + recipient contact lookup. */
+  /** Primary Cognito user pool: member-clearance resolution + recipient contact lookup. */
   userPoolId: string;
   userPoolArn: string;
   /** SSM parameter NAME holding the app-instance-admin ARN (the cross-channel moderator bearer). */
@@ -34,7 +34,7 @@ export interface MembershipAuditProps {
   alertChannelArn?: string;
   /** Verified SES sender for the email leg. Optional; the email fan-out degrades gracefully. */
   senderEmail?: string;
-  /** When true, over-tier memberships are auto-revoked. Default false (report-only). */
+  /** When true, memberships exceeding the member's clearance are auto-revoked. Default false (report-only). */
   enforce?: boolean;
 }
 
@@ -86,10 +86,10 @@ export class MembershipAuditConstruct extends Construct {
     );
     this.auditTable.grantReadWriteData(this.fn);
 
-    // Chime: read channel tier from the immutable `classification` tag, revoke membership, post
+    // Chime: read channel classification from the immutable `classification` tag, revoke membership, post
     // the admin-conversation alert. Authorizes against the channel resource AND the admin bearer
     // identity (`/user/*`). ListTagsForResource replaces the old DescribeChannel metadata read so
-    // the tier comparison keys on the tamper-proof tag, not mutable channel metadata.
+    // the clearance-vs-classification comparison keys on the tamper-proof tag, not mutable channel metadata.
     this.fn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['chime:ListTagsForResource', 'chime:DeleteChannelMembership', 'chime:SendChannelMessage'],
@@ -97,7 +97,7 @@ export class MembershipAuditConstruct extends Construct {
       }),
     );
 
-    // Cognito: authoritative member tier (AdminListGroupsForUser) + recipient contact (AdminGetUser).
+    // Cognito: authoritative member clearance (AdminListGroupsForUser) + recipient contact (AdminGetUser).
     this.fn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['cognito-idp:AdminListGroupsForUser', 'cognito-idp:AdminGetUser'],
@@ -115,7 +115,7 @@ export class MembershipAuditConstruct extends Construct {
             resource: 'parameter',
             resourceName: props.adminArnParam.replace(/^\//, ''),
           }),
-          // Per-tier assistant bot ARNs, to resolve a bot member's tier.
+          // Per-classification assistant bot ARNs, to resolve a bot member's classification.
           cdk.Stack.of(this).formatArn({
             service: 'ssm',
             resource: 'parameter',

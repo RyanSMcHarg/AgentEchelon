@@ -43,6 +43,7 @@ import {
   CreateSecretCommand,
 } from '@aws-sdk/client-secrets-manager';
 import { SSMClient, PutParameterCommand } from '@aws-sdk/client-ssm';
+import { seedAllProfileDefinitions } from '../lambda/src/lib/seed-profile-definitions.js';
 import * as fs from 'fs';
 import * as path from 'path';
 
@@ -54,7 +55,7 @@ const smClient = new SecretsManagerClient({ region });
 const chimeIdentityClient = new ChimeSDKIdentityClient({ region });
 const ssmClient = new SSMClient({ region });
 
-// SSM root for this instance's params. MUST match the CDK's SSM_ROOT (agent-tier-common.ts:
+// SSM root for this instance's params. MUST match the CDK's SSM_ROOT (agent-classification-common.ts:
 // `/${AE_INSTANCE_NAME || 'agent-echelon'}`) — the handler reads the welcome orientation from
 // `${SSM_ROOT}/assistant/{tier}/welcome-orientation`, so a case/name mismatch means it never loads.
 const SSM_ROOT = `/${(process.env.AE_INSTANCE_NAME || 'agent-echelon').trim()}`;
@@ -506,6 +507,16 @@ async function main(): Promise<void> {
   // Step 2c: per-tier welcome orientation (what a first-time user sees + can try).
   console.log('Step 2c: Writing per-tier welcome orientation to SSM...');
   await writeWelcomeOrientation();
+  console.log('');
+
+  // Step 2d: seed each profile's ACTIVE version (SPEC-PORTABLE-VERSIONED-PROFILES P0). Writes the
+  // compiled default as version 1 of /assistant/{name}/definition and labels it `active`, so the
+  // async-processor resolves its base model from the versioned definition (byte-identical to the
+  // deploy default here) and the P1 lifecycle has a v1 to build on. Idempotent + fail-closed.
+  console.log('Step 2d: Seeding active profile definitions to SSM...');
+  for (const r of await seedAllProfileDefinitions(ssmClient, SSM_ROOT)) {
+    console.log(`  ✓ ${r.profileName} definition v${r.version} labeled active`);
+  }
   console.log('');
 
   // Step 3: Upload context files

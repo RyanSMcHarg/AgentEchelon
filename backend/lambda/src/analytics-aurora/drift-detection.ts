@@ -56,10 +56,10 @@ export interface DetectDriftInput {
    */
   correlationId?: string;
   /**
-   * Optional caller-supplied tier dimension for EMF. When omitted, metrics
-   * aggregate across tiers.
+   * Optional caller-supplied clearance dimension for EMF. When omitted, metrics
+   * aggregate across clearances.
    */
-  userTier?: 'basic' | 'standard' | 'premium';
+  userClearance?: 'basic' | 'standard' | 'premium';
   /**
    * Set of `(distance ± 0.05)` cosine values the user has recently declined.
    * When the current distance falls inside any band, drift is suppressed.
@@ -123,7 +123,7 @@ export async function detectDrift(input: DetectDriftInput): Promise<DriftResult>
     correlationId,
   };
 
-  const emfOpts = { userTier: input.userTier, intent: input.intent };
+  const emfOpts = { userClearance: input.userClearance, intent: input.intent };
 
   // Skip: intent-based short-circuits.
   if (input.intent === 'GREETING' || input.intent === 'ACKNOWLEDGMENT' || input.intent === 'OFF_TOPIC') {

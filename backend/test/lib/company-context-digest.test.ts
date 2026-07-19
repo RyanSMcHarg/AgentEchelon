@@ -3,7 +3,7 @@
  *   - buildDigestHint renders the always-present manifest (or empty).
  *   - loadCompanyContext SKIPS `_`-prefixed keys, so `_digest.json` is never
  *     loaded as a company document (that would pollute the corpus).
- *   - loadContextDigest reads + parses the per-tier digest and caches it warm.
+ *   - loadContextDigest reads + parses the per-classification digest and caches it warm.
  */
 
 const mockS3Send = jest.fn();
@@ -36,8 +36,8 @@ describe('buildDigestHint', () => {
 
   it('renders titles + descriptions under an AVAILABLE COMPANY CONTEXT header', () => {
     const entries: DigestEntry[] = [
-      { title: 'Financial data', description: 'Quarterly ARR and churn', tier: 'premium' },
-      { title: 'Company overview', description: 'Profile and products', tier: 'basic' },
+      { title: 'Financial data', description: 'Quarterly ARR and churn', classification: 'premium' },
+      { title: 'Company overview', description: 'Profile and products', classification: 'basic' },
     ];
     const hint = buildDigestHint(entries);
     expect(hint).toContain('## AVAILABLE COMPANY CONTEXT');
@@ -81,9 +81,9 @@ describe('loadCompanyContext skips `_`-prefixed files', () => {
 });
 
 describe('loadContextDigest', () => {
-  it('reads + parses the per-tier digest and caches it warm', async () => {
+  it('reads + parses the per-classification digest and caches it warm', async () => {
     const digest: DigestEntry[] = [
-      { title: 'Financial data', description: 'ARR', tier: 'premium' },
+      { title: 'Financial data', description: 'ARR', classification: 'premium' },
     ];
     mockS3Send.mockResolvedValue({
       Body: { transformToString: async () => JSON.stringify(digest) },

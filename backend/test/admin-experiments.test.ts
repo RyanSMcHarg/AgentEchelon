@@ -167,17 +167,16 @@ describe('admin-experiments handler', () => {
     expect(mockDdbSend).not.toHaveBeenCalled();
   });
 
-  it('POST create (battle) → 400 BATTLE_TIER_PREMIUM_ONLY when tiers are not exactly [premium]', async () => {
-    // Full-separation: /battle is premium-only. A battle experiment scoped to
-    // standard (or a mixed set) must be rejected so it can never arm a battle
-    // on a non-premium channel. The slot resolves (so we exercise the tier
-    // rule, not the slot guard), then validation rejects on tier.
+  it('POST create (battle) → 400 BATTLE_TIER_PREMIUM_ONLY when it targets a MIXED classification set', async () => {
+    // SPEC-PORTABLE-VERSIONED-PROFILES §1/§6: `battleEligible` is now a HINT, so an operator-driven
+    // battle may target any SINGLE classification (the ceiling still binds at resolution). What stays
+    // rejected is a MIXED set — a battle runs head-to-head in ONE channel, so exactly one classification.
     mockSsmSend.mockResolvedValueOnce({
       Parameter: { Value: JSON.stringify([{ slotId: 'slot-0', botArn: 'arn:bot/0' }]) },
     });
     const bad = {
       ...baseExp,
-      tiers: ['standard'],
+      tiers: ['standard', 'premium'],
       battleEnabled: true,
       altBotSlotId: 'slot-0',
       variants: [
@@ -189,6 +188,25 @@ describe('admin-experiments handler', () => {
     expect(r.statusCode).toBe(400);
     expect(JSON.parse(r.body).code).toBe('BATTLE_TIER_PREMIUM_ONLY');
     expect(mockDdbSend.mock.calls.find((c) => c[0].__t === 'Put')).toBeUndefined();
+  });
+
+  it('POST create (battle) → 200 on a single NON-premium classification (battleEligible demoted to a hint)', async () => {
+    mockSsmSend.mockResolvedValueOnce({
+      Parameter: { Value: JSON.stringify([{ slotId: 'slot-0', botArn: 'arn:bot/0' }]) },
+    });
+    const ok = {
+      ...baseExp,
+      tiers: ['standard'],
+      battleEnabled: true,
+      altBotSlotId: 'slot-0',
+      boundBy: 'admin-sub',
+      variants: [
+        { variantId: 'control', modelKey: 'sonnet', weight: 50, displayName: 'Atlas' },
+        { variantId: 'treatment', modelKey: 'opus', weight: 50, displayName: 'Echo' },
+      ],
+    };
+    const r = await handler(evt({ httpMethod: 'POST', body: ok }));
+    expect(r.statusCode).toBe(200);
   });
 
   it('POST create → 400 with code when validation fails (one-sided imageGenModelKey)', async () => {

@@ -4,10 +4,10 @@
  *
  * Generation-out is a **net-new modality with zero precedent** in the
  * codebase. It is deliberately kept OUT of the central text model
- * catalog (`lib/config/model-strategy.ts`): image models have no tier
+ * catalog (`lib/config/model-strategy.ts`): image models have no classification
  * gating, no intent routing, no token rates, and use Bedrock
  * `InvokeModel` (not Converse). Threading them through `BackendModelKey`
- * would ripple into the resolver, tier selection, intent routing and
+ * would ripple into the resolver, classification selection, intent routing and
  * the rate-parity test for no benefit. This self-contained registry is
  * the single source for the image-gen battle.
  *

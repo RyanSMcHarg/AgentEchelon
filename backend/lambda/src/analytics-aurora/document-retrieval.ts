@@ -3,7 +3,7 @@
  *
  * Companion to `document-ingestion.ts`. Embeds a query, runs a
  * pgvector cosine-NN against the `embeddings` table (schema migration
- * 008), filters by `source_type` and (optionally) tier metadata, and
+ * 008), filters by `source_type` and (optionally) classification metadata, and
  * returns top-K chunks plus citations in a shape the async processor
  * can fold into the system prompt.
  *
@@ -50,11 +50,11 @@ export interface RetrieveContextInput {
    */
   minSimilarity?: number;
   /**
-   * Optional tier filter — restricts chunks to those whose
-   * metadata.tier is in this list (or has no tier set, treated as
+   * Optional classification filter — restricts chunks to those whose
+   * metadata.tier is in this list (or has no value set, treated as
    * available to all). Implements ADR-007 (KB permission filters).
    */
-  tierScope?: string[];
+  classificationScope?: string[];
 }
 
 export interface RetrievedChunk {
@@ -103,21 +103,21 @@ export async function retrieveContext(
   // pgvector cosine-distance NN. `<=>` is the cosine-distance operator;
   // similarity = 1 - distance. Filter by source_type at SQL level (not
   // post-filter) so the HNSW index can prune correctly. Optionally
-  // filter by tier metadata.
-  // FAIL-CLOSED tier gate: a chunk is returned only if its `metadata.tier` is in
-  // the caller's scope (their tier and below). An untagged chunk (`tier IS NULL`)
+  // filter by classification metadata.
+  // FAIL-CLOSED classification gate: a chunk is returned only if its `metadata.tier` is in
+  // the caller's scope (their classification and below). An untagged chunk (`tier IS NULL`)
   // is NOT returned — the previous `IS NULL OR …` made every untagged chunk
-  // visible to every tier, and since ingestion tagged nothing, that leaked ALL KB
-  // content to ALL tiers. Ingestion now stamps `tier` (document-ingestion.ts,
-  // fail-closed default); legacy rows written before that must be re-ingested
-  // (re-put the S3 object under `rag/`) to become visible again.
-  const tierClause = input.tierScope && input.tierScope.length > 0
+  // visible to every classification, and since ingestion tagged nothing, that leaked ALL KB
+  // content to ALL classifications. Ingestion now stamps the `tier` metadata key
+  // (document-ingestion.ts, fail-closed default); legacy rows written before that must be
+  // re-ingested (re-put the S3 object under `rag/`) to become visible again.
+  const classificationClause = input.classificationScope && input.classificationScope.length > 0
     ? `AND metadata->>'tier' = ANY($3::text[])`
     : '';
 
   const params: unknown[] = [vectorLiteral, sourceTypes];
-  if (input.tierScope && input.tierScope.length > 0) {
-    params.push(input.tierScope);
+  if (input.classificationScope && input.classificationScope.length > 0) {
+    params.push(input.classificationScope);
   }
 
   const result = await query<{
@@ -136,7 +136,7 @@ export async function retrieveContext(
             1 - (embedding <=> $1::vector) AS similarity
        FROM embeddings
       WHERE source_type = ANY($2::text[])
-        ${tierClause}
+        ${classificationClause}
       ORDER BY embedding <=> $1::vector
       LIMIT ${topK}`,
     params,

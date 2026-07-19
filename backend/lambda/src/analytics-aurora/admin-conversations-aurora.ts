@@ -66,7 +66,7 @@ export interface AdminMembershipEvent {
 export async function adminListConversations(limit = 50): Promise<AdminConvSummary[]> {
   const lim = Math.min(Math.max(1, limit), 200);
   const res = await query<{
-    channel_arn: string; tier: string | null; name: string | null;
+    channel_arn: string; classification: string | null; name: string | null;
     message_count: string; last_message_at: string | null; member_count: string;
     is_deleted: boolean; is_archived: boolean;
   }>(
@@ -89,7 +89,7 @@ export async function adminListConversations(limit = 50): Promise<AdminConvSumma
      ),
      agg AS (
        SELECT channel_arn,
-              MAX(user_type) AS tier,
+              MAX(user_type) AS classification,
               COUNT(*) FILTER (WHERE event_type = 'CREATE_CHANNEL_MESSAGE') AS message_count,
               MAX(created_at) FILTER (WHERE event_type = 'CREATE_CHANNEL_MESSAGE') AS last_message_at
          FROM messages
@@ -127,7 +127,7 @@ export async function adminListConversations(limit = 50): Promise<AdminConvSumma
         WHERE event_type = 'CREATE_CHANNEL_MEMBERSHIP'
         GROUP BY channel_arn
      )
-     SELECT a.channel_arn, a.tier, COALESCE(n.name, fm.name) AS name,
+     SELECT a.channel_arn, a.classification, COALESCE(n.name, fm.name) AS name,
             a.message_count::text AS message_count, a.last_message_at,
             COALESCE(mem.member_count, 0)::text AS member_count,
             COALESCE(lc.is_deleted, false) AS is_deleted,
@@ -149,7 +149,7 @@ export async function adminListConversations(limit = 50): Promise<AdminConvSumma
     lastMessageAt: r.last_message_at || undefined,
     memberCount: Number(r.member_count || 0),
     state: r.is_deleted ? 'deleted' : r.is_archived ? 'archived' : 'live',
-    metadata: { modelTier: r.tier || '' },
+    metadata: { modelTier: r.classification || '' },
   }));
 }
 

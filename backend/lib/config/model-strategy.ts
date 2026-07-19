@@ -1,4 +1,4 @@
-export type ModelTier = 'basic' | 'standard' | 'premium';
+export type Classification = 'basic' | 'standard' | 'premium';
 export type ProviderKey = 'anthropic' | 'amazon' | 'openai' | 'deepseek';
 export type BackendModelKey =
   | 'haiku'
@@ -24,7 +24,7 @@ export interface BackendModelDefinition {
   bedrockModelId: string;
   foundationModelArns: string[];
   inferenceProfileArns?: string[];
-  allowedTiers: ModelTier[];
+  allowedClassifications: Classification[];
   strengths: string[];
   costClass: 'low' | 'medium' | 'high';
   latencyClass: 'fast' | 'balanced' | 'deep';
@@ -54,11 +54,11 @@ export interface IntentRouteDefinition {
   label: string;
   primaryModel: BackendModelKey;
   fallbackModel: BackendModelKey;
-  preferredTier: ModelTier;
+  preferredClearance: Classification;
   rationale: string;
 }
 
-export interface TierModelSelection {
+export interface ProfileModelSelection {
   basic: BackendModelKey;
   standard: BackendModelKey;
   premium: BackendModelKey;
@@ -105,7 +105,7 @@ export const US_CROSS_REGION_PROFILE_REGIONS = [
  * Foundation-model ARNs for a model invoked through a `us.` cross-region
  * inference profile: the deploy region plus every profile member region,
  * deduped. Consumed by the catalog so the IAM grant
- * (`collectArnsForTier` → `foundationModelArns`) covers every region the
+ * (`collectArnsForClassification` → `foundationModelArns`) covers every region the
  * profile can fan out to. A non-US deploy region is unioned in defensively
  * (the catalog still hardcodes `us.` profiles — a true non-US deployment
  * is out of scope and documented elsewhere).
@@ -125,7 +125,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0`,
       ],
-      allowedTiers: ['basic', 'standard', 'premium'],
+      allowedClassifications: ['basic', 'standard', 'premium'],
       strengths: ['fast replies', 'low-cost triage', 'simple extraction'],
       costClass: 'low',
       latencyClass: 'fast',
@@ -144,7 +144,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       inferenceProfileArns: [
         `arn:aws:bedrock:${region}:${account}:inference-profile/us.anthropic.claude-sonnet-4-6`,
       ],
-      allowedTiers: ['standard', 'premium'],
+      allowedClassifications: ['standard', 'premium'],
       strengths: ['coding tasks', 'reasoning', 'tool reliability'],
       costClass: 'medium',
       latencyClass: 'balanced',
@@ -163,7 +163,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       inferenceProfileArns: [
         `arn:aws:bedrock:${region}:${account}:inference-profile/us.anthropic.claude-opus-4-6-v1`,
       ],
-      allowedTiers: ['premium'],
+      allowedClassifications: ['premium'],
       strengths: ['deep analysis', 'complex architecture', 'high-stakes reasoning'],
       costClass: 'high',
       latencyClass: 'deep',
@@ -183,7 +183,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/amazon.nova-pro-v1:0`,
       ],
-      allowedTiers: ['standard', 'premium'],
+      allowedClassifications: ['standard', 'premium'],
       strengths: ['summaries', 'structured drafting', 'bedrock-native fallback'],
       costClass: 'medium',
       latencyClass: 'balanced',
@@ -198,7 +198,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/openai.gpt-oss-20b-1:0`,
       ],
-      allowedTiers: ['standard', 'premium'],
+      allowedClassifications: ['standard', 'premium'],
       strengths: ['low-cost coding support', 'fast drafting', 'OpenAI-on-Bedrock option'],
       costClass: 'medium',
       latencyClass: 'balanced',
@@ -213,7 +213,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/openai.gpt-oss-120b-1:0`,
       ],
-      allowedTiers: ['premium'],
+      allowedClassifications: ['premium'],
       strengths: ['deeper coding analysis', 'larger open-weight reasoning', 'OpenAI-on-Bedrock experimentation'],
       costClass: 'high',
       latencyClass: 'deep',
@@ -228,7 +228,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
     //
     // Access: this is a Bedrock Marketplace model. The FIRST invocation auto-accepts the
     // marketplace offer (a confirmation email arrives) — there is no manual console "request
-    // access" step. Subscription is account-level, but the tier Lambda's least-privilege role has
+    // access" step. Subscription is account-level, but the classification Lambda's least-privilege role has
     // `bedrock:InvokeModel` and NOT `aws-marketplace:Subscribe`, so the account must be subscribed
     // once by a principal that can accept the offer (admin creds — done in dev us-east-1). After
     // that one-time acceptance the Lambda invokes freely.
@@ -240,7 +240,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/deepseek.v3.2`,
       ],
-      allowedTiers: ['standard', 'premium'],
+      allowedClassifications: ['standard', 'premium'],
       strengths: ['Chinese fluency', 'strong reasoning', 'low-cost open-weight'],
       costClass: 'low',
       latencyClass: 'balanced',
@@ -250,31 +250,31 @@ export function getModelCatalog(region: string, account: string): Record<Backend
   };
 }
 
-export const DEFAULT_TIER_MODEL_SELECTION: TierModelSelection = {
+export const DEFAULT_PROFILE_MODEL_SELECTION: ProfileModelSelection = {
   basic: 'haiku',
   standard: 'sonnet',
   premium: 'opus',
 };
 
-export function parseTierModelSelection(
-  requested: Partial<Record<ModelTier, string | undefined>>,
+export function parseProfileModelSelection(
+  requested: Partial<Record<Classification, string | undefined>>,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
-): TierModelSelection {
-  const selection: TierModelSelection = { ...DEFAULT_TIER_MODEL_SELECTION };
+): ProfileModelSelection {
+  const selection: ProfileModelSelection = { ...DEFAULT_PROFILE_MODEL_SELECTION };
 
-  for (const tier of Object.keys(selection) as ModelTier[]) {
-    const requestedKey = requested[tier] as BackendModelKey | undefined;
+  for (const classification of Object.keys(selection) as Classification[]) {
+    const requestedKey = requested[classification] as BackendModelKey | undefined;
     if (!requestedKey) continue;
 
     const model = catalog[requestedKey];
     if (!model) {
-      throw new Error(`Unknown model key "${requestedKey}" for tier "${tier}"`);
+      throw new Error(`Unknown model key "${requestedKey}" for classification "${classification}"`);
     }
-    if (!model.allowedTiers.includes(tier)) {
-      throw new Error(`Model "${requestedKey}" is not allowed for tier "${tier}"`);
+    if (!model.allowedClassifications.includes(classification)) {
+      throw new Error(`Model "${requestedKey}" is not allowed for classification "${classification}"`);
     }
 
-    selection[tier] = requestedKey;
+    selection[classification] = requestedKey;
   }
 
   return selection;
@@ -286,15 +286,15 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'General Q&A',
     primaryModel: 'haiku',
     fallbackModel: 'sonnet',
-    preferredTier: 'basic',
-    rationale: 'Fast, low-cost answers default to the cheapest capable model; fall back within Anthropic (Sonnet) rather than cross-provider. Basic tier (Sonnet not allowed) simply gets no fallback.',
+    preferredClearance: 'basic',
+    rationale: 'Fast, low-cost answers default to the cheapest capable model; fall back within Anthropic (Sonnet) rather than cross-provider. Basic classification (Sonnet not allowed) simply gets no fallback.',
   },
   {
     intent: 'code_generation',
     label: 'Code Generation',
     primaryModel: 'sonnet',
     fallbackModel: 'gpt_oss_20b',
-    preferredTier: 'standard',
+    preferredClearance: 'standard',
     rationale: 'Coding work should support both Anthropic and OpenAI-on-Bedrock paths without forcing a premium-only default.',
   },
   {
@@ -302,15 +302,15 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Code Review',
     primaryModel: 'gpt_oss_20b',
     fallbackModel: 'sonnet',
-    preferredTier: 'standard',
-    rationale: 'Detailed review should expose an OpenAI-on-Bedrock option while keeping a strong Anthropic fallback at the same tier.',
+    preferredClearance: 'standard',
+    rationale: 'Detailed review should expose an OpenAI-on-Bedrock option while keeping a strong Anthropic fallback at the same classification.',
   },
   {
     intent: 'document_extraction',
     label: 'Document Extraction',
     primaryModel: 'haiku',
     fallbackModel: 'sonnet',
-    preferredTier: 'basic',
+    preferredClearance: 'basic',
     rationale: 'Extraction and parsing optimize for throughput and cost; fall back within Anthropic (Sonnet) rather than cross-provider.',
   },
   {
@@ -318,7 +318,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Report Generation',
     primaryModel: 'titan',
     fallbackModel: 'sonnet',
-    preferredTier: 'standard',
+    preferredClearance: 'standard',
     rationale: 'Structured drafting and summaries benefit from a stable drafting model with a stronger reasoning fallback.',
   },
   {
@@ -326,7 +326,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Strategic Analysis',
     primaryModel: 'opus',
     fallbackModel: 'sonnet',
-    preferredTier: 'premium',
+    preferredClearance: 'premium',
     rationale: 'Executive and strategic work should route to the deepest reasoning model available.',
   },
   {
@@ -334,7 +334,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Workflow Actions',
     primaryModel: 'sonnet',
     fallbackModel: 'haiku',
-    preferredTier: 'standard',
+    preferredClearance: 'standard',
     rationale: 'Tool-heavy workflows prefer the strongest action-group model; fall back within Anthropic (Haiku) rather than cross-provider.',
   },
 ];

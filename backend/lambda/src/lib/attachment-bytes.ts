@@ -11,7 +11,7 @@ import { GetObjectCommand } from '@aws-sdk/client-s3';
 /**
  * Object-level authorization for attachment-in reads. The fileKey arrives on user-controlled
  * message Metadata, so a caller MUST gate the S3 GetObject on this before reading — otherwise a
- * crafted key could read another user's uploaded file (the tier's `s3:GetObject` grant spans the
+ * crafted key could read another user's uploaded file (the classification's `s3:GetObject` grant spans the
  * whole `attachments/*` prefix). Uploads are keyed `attachments/<conversationId>/<senderSub>/...`
  * (see presigned-url), so we require the key's 3rd segment to equal the sender's own sub. S3 keys
  * are not path-normalized, so a literal '..' cannot traverse out of the sender's segment. Mirrors

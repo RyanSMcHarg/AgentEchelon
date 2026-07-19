@@ -18,20 +18,20 @@ describe('profile-registry (default config = legacy behavior)', () => {
     expect(reg.resolveClassification('basic')).toBe('basic');
     expect(reg.resolveClassification('standard')).toBe('standard');
     expect(reg.resolveClassification('premium')).toBe('premium');
-    expect(reg.resolveClassification('bogus')).toBe('basic'); // legacy VALID_TIERS fail-closed
+    expect(reg.resolveClassification('bogus')).toBe('basic'); // legacy VALID_CLASSIFICATIONS fail-closed
     expect(reg.resolveClassification('')).toBe('basic');
     expect(reg.resolveClassification(null)).toBe('basic');
     expect(reg.resolveClassification(undefined)).toBe('basic');
   });
 
-  it('rank reproduces TIER_RANK {basic:1,standard:2,premium:3}', () => {
+  it('rank reproduces CLASSIFICATION_RANK {basic:1,standard:2,premium:3}', () => {
     expect(reg.rank('basic')).toBe(1);
     expect(reg.rank('standard')).toBe(2);
     expect(reg.rank('premium')).toBe(3);
     expect(reg.rank('bogus')).toBe(1); // fail-closed rank
   });
 
-  it('min reproduces minTier (lower rank wins; tie returns first arg)', () => {
+  it('min reproduces minRank (lower rank wins; tie returns first arg)', () => {
     expect(reg.min('premium', 'basic')).toBe('basic');
     expect(reg.min('standard', 'premium')).toBe('standard');
     expect(reg.min('premium', 'standard')).toBe('standard');
@@ -39,7 +39,7 @@ describe('profile-registry (default config = legacy behavior)', () => {
     expect(reg.min('standard', 'standard')).toBe('standard'); // tie -> first arg
   });
 
-  it('clearanceForGroups reproduces resolveUserTier (highest match; default basic)', () => {
+  it('clearanceForGroups reproduces resolveUserClearance (highest match; default basic)', () => {
     expect(reg.clearanceForGroups(['premium'])).toBe('premium');
     expect(reg.clearanceForGroups(['basic', 'premium'])).toBe('premium'); // highest wins
     expect(reg.clearanceForGroups(['standard'])).toBe('standard');
@@ -48,7 +48,7 @@ describe('profile-registry (default config = legacy behavior)', () => {
     expect(reg.clearanceForGroups(['admins'])).toBe('basic'); // 'admins' not a clearance group (legacy)
   });
 
-  it('scopeAtOrBelow reproduces the hardcoded tierScope ladders', () => {
+  it('scopeAtOrBelow reproduces the hardcoded classificationScope ladders', () => {
     expect(reg.scopeAtOrBelow('premium')).toEqual(['basic', 'standard', 'premium']);
     expect(reg.scopeAtOrBelow('standard')).toEqual(['basic', 'standard']);
     expect(reg.scopeAtOrBelow('basic')).toEqual(['basic']);

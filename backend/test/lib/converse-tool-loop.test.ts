@@ -114,8 +114,8 @@ describe('invokeBedrock Converse tool loop (ADR-011)', () => {
       .mockResolvedValueOnce(endTurn('Stratum offers X.', 200, 30));
     mockLoadContext.mockResolvedValueOnce({
       documentCount: 1,
-      tiersAccessible: ['basic'],
-      documents: [{ source: 'context/basic/a.json', tier: 'basic', content: 'x', truncated: false }],
+      classificationsAccessible: ['basic'],
+      documents: [{ source: 'context/basic/a.json', classification: 'basic', content: 'x', truncated: false }],
     });
 
     const r = await invokeBedrock('sys', [{ role: 'user', content: 'what products?' }], config, undefined, true);
@@ -155,7 +155,7 @@ describe('invokeBedrock Converse tool loop (ADR-011)', () => {
 
   it('caps a runaway tool loop at MAX_TOOL_ITERATIONS', async () => {
     mockBedrockSend.mockResolvedValue(toolUse('t', 10, 1)); // model never stops tool-calling
-    mockLoadContext.mockResolvedValue({ documentCount: 0, tiersAccessible: [], documents: [] });
+    mockLoadContext.mockResolvedValue({ documentCount: 0, classificationsAccessible: [], documents: [] });
 
     const r = await invokeBedrock('sys', [{ role: 'user', content: 'loop' }], config, undefined, true);
 

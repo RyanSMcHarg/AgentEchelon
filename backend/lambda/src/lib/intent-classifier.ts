@@ -162,7 +162,7 @@ Category:`;
 }
 
 /**
- * Keyword-only classification for Basic tier (no LLM call to save cost)
+ * Keyword-only classification for the basic classification (no LLM call to save cost)
  */
 export function classifyIntentBasic(userMessage: string): IntentClassification {
   const message = userMessage.trim().toLowerCase();
@@ -185,7 +185,7 @@ export function classifyIntentBasic(userMessage: string): IntentClassification {
 }
 
 /**
- * Fallback keyword-based classification (LLM failure or Basic tier).
+ * Fallback keyword-based classification (LLM failure or the basic classification).
  * Domain keywords come from the active intent pack; only greeting/ack are handled by the callers
  * before this point, so here we match domain keywords then default to GENERAL.
  */

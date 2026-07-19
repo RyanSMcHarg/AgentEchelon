@@ -1,5 +1,5 @@
 /**
- * StandardTierStack — the STANDARD assistant profile. A thin wrapper that supplies the standard
+ * StandardClassificationStack — the STANDARD assistant profile. A thin wrapper that supplies the standard
  * ProfileTopology to the shared AssistantProfileStack (SPEC-CAPABILITY-PROFILES).
  *
  * Standard = Sonnet, full multi-turn tasks, generated docs, experiments, attachment-in, a
@@ -9,9 +9,9 @@
 
 import { Construct } from 'constructs';
 import * as cdk from 'aws-cdk-lib';
-import { TierModelSelection } from '../config/model-strategy';
+import { ProfileModelSelection } from '../config/model-strategy';
 import { AssistantProfileStack, ProfileTopology } from './assistant-profile-stack';
-import { AuroraDriftHookup, MessageAnalyticsWiring } from './agent-tier-common';
+import { AuroraDriftHookup, MessageAnalyticsWiring } from './agent-classification-common';
 
 const STANDARD_TOPOLOGY: ProfileTopology = {
   name: 'standard',
@@ -28,22 +28,22 @@ const STANDARD_TOPOLOGY: ProfileTopology = {
   richProcessor: true,
   battleCapable: true,
   handlerExperimentsIndex: false,
-  componentTag: 'Tier-Standard',
+  componentTag: 'Classification-Standard',
 };
 
-export interface StandardTierStackProps extends cdk.StackProps {
+export interface StandardClassificationStackProps extends cdk.StackProps {
   appInstanceArn: string;
   attachmentsBucketName: string;
   attachmentsBucketArn: string;
-  tierModelSelection: TierModelSelection;
+  profileModelSelection: ProfileModelSelection;
   enableBattle?: boolean;
   auroraDriftHookup?: AuroraDriftHookup;
   messageAnalytics?: MessageAnalyticsWiring;
   adminErrorAlertChannelArn?: string;
 }
 
-export class StandardTierStack extends AssistantProfileStack {
-  constructor(scope: Construct, id: string, props: StandardTierStackProps) {
+export class StandardClassificationStack extends AssistantProfileStack {
+  constructor(scope: Construct, id: string, props: StandardClassificationStackProps) {
     super(scope, id, { ...props, topology: STANDARD_TOPOLOGY });
   }
 }

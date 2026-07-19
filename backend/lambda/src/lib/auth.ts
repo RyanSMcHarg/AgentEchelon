@@ -7,7 +7,7 @@
  * Cognito groups are authoritative. This centralises the contract.
  *
  * Use the helpers below in every handler that needs to verify identity,
- * tier, or admin status. They normalise the cognito:groups shape
+ * clearance, or admin status. They normalise the cognito:groups shape
  * (sometimes a comma-separated string, sometimes an array depending on
  * how the API Gateway authorizer rehydrates the JWT), pull `userArn`
  * from authoritative sources (Chime AppInstance + JWT sub), and return
@@ -17,16 +17,16 @@
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 
 /** The four Cognito groups, most-privileged first. */
-export const TIER_ORDER = ['admins', 'premium', 'standard', 'basic'] as const;
-export type Tier = (typeof TIER_ORDER)[number];
+export const CLASSIFICATION_ORDER = ['admins', 'premium', 'standard', 'basic'] as const;
+export type Classification = (typeof CLASSIFICATION_ORDER)[number];
 
 export interface AuthorizedClaims {
   /** Cognito user sub (UUID). */
   sub: string;
   /** Email if present in claims (premium+admin pools typically have it). */
   email: string | null;
-  /** Most-privileged group the user holds. */
-  tier: Tier | 'unknown';
+  /** Most-privileged group the user holds (their clearance). */
+  clearance: Classification | 'unknown';
   /** All groups the user holds. */
   groups: string[];
 }
@@ -43,7 +43,7 @@ export interface AuthorizedClaims {
  *  - a **bracketed, space-separated** string (e.g. `"[admins premium]"`) — this
  *    is how API Gateway serializes a *multi-group* claim. Splitting on commas
  *    only would return the single token `"[admins premium]"`, so a user who
- *    holds `admins` in addition to a tier (the additive-admin design) would fail
+ *    holds `admins` in addition to a clearance (the additive-admin design) would fail
  *    every group check. Strip surrounding brackets and split on whitespace OR
  *    commas so all three shapes parse. Cognito group names never contain
  *    whitespace, so this is unambiguous.
@@ -68,12 +68,12 @@ export function extractClaims(event: APIGatewayProxyEvent): AuthorizedClaims | n
 
   const groups = parseGroups(claims['cognito:groups']);
 
-  const tier = (TIER_ORDER.find((t) => groups.includes(t)) as Tier) || 'unknown';
+  const clearance = (CLASSIFICATION_ORDER.find((t) => groups.includes(t)) as Classification) || 'unknown';
 
   return {
     sub,
     email: (claims.email as string) ?? null,
-    tier,
+    clearance,
     groups,
   };
 }
@@ -152,7 +152,7 @@ function serviceAdminClaims(event: APIGatewayProxyEvent): AuthorizedClaims {
     | { userArn?: string | null; caller?: string | null; accountId?: string | null }
     | undefined;
   const sub = id?.userArn || id?.caller || id?.accountId || 'service';
-  return { sub, email: null, tier: 'admins', groups: ['admins'] };
+  return { sub, email: null, clearance: 'admins', groups: ['admins'] };
 }
 
 /**
@@ -201,6 +201,31 @@ export function callerCanReadArchive(event: APIGatewayProxyEvent): boolean {
   return parseGroups(claims['cognito:groups']).some((g) => ARCHIVE_VIEW_GROUPS.has(g));
 }
 
+/**
+ * `manage-profiles` capability — versioning/import lifecycle for assistant profiles
+ * (SPEC-PORTABLE-VERSIONED-PROFILES §7, plan item A14). A DISTINCT capability from `view-*`: who may
+ * version/activate/import an assistant is separately denyable, not "any admin".
+ *
+ * INTERIM (this seam, same shape as `callerCanReadArchive`): a configurable Cognito group
+ * `MANAGE_PROFILES_GROUP_NAMES`, defaulting to the admin groups so current admins keep access; narrow
+ * it to deny a role. The IAM-ENFORCEABLE version (an `execute-api:Invoke` capability on the
+ * profile-management routes, §7) is A14's tracked work — this group gate is the placeholder, NOT the
+ * final control. See memory `admin-actions-iam-enforceable`.
+ */
+const MANAGE_PROFILES_GROUPS = new Set<string>(
+  (process.env.MANAGE_PROFILES_GROUP_NAMES || process.env.ADMIN_GROUP_NAMES || 'admins')
+    .split(',')
+    .map((g) => g.trim())
+    .filter(Boolean),
+);
+
+export function callerCanManageProfiles(event: APIGatewayProxyEvent): boolean {
+  if (isServiceAdminCall(event)) return true;
+  const claims = event.requestContext?.authorizer?.claims as Record<string, unknown> | undefined;
+  if (!claims) return false;
+  return parseGroups(claims['cognito:groups']).some((g) => MANAGE_PROFILES_GROUPS.has(g));
+}
+
 /** Standard CORS headers for API Gateway responses. */
 export function corsHeaders(origin?: string): Record<string, string> {
   return {
@@ -233,7 +258,7 @@ export function requireAdmin(
   const claims = extractClaims(event);
   if (!claims) return respond(401, { error: 'Unauthorized' });
   if (!isAdmin(claims)) {
-    // Don't leak whether the user exists or what tier they hold.
+    // Don't leak whether the user exists or what clearance they hold.
     console.warn('[auth] requireAdmin denied', { sub: claims.sub, groups: claims.groups });
     return respond(403, { error: 'Admin access required' });
   }
@@ -254,12 +279,12 @@ export function requireAuth(
 
 /**
  * Guard: returns claims if the caller is in the given Cognito group OR
- * is admin (admins implicitly satisfy every tier check); otherwise the
+ * is admin (admins implicitly satisfy every clearance check); otherwise the
  * 403 response.
  */
 export function requireGroup(
   event: APIGatewayProxyEvent,
-  group: Tier,
+  group: Classification,
 ): { claims: AuthorizedClaims } | APIGatewayProxyResult {
   const auth = requireAuth(event);
   if ('statusCode' in auth) return auth;

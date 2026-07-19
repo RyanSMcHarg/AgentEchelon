@@ -81,17 +81,18 @@ async function waitForBotLocaleBuild(botId: string, localeId: string, maxAttempt
 export const handler = async (event: CloudFormationCustomResourceEvent) => {
   console.log('CreateLexBot event:', JSON.stringify(event, null, 2));
 
-  // Tier this Lex bot is created for. Read from CloudFormation
-  // ResourceProperties so the same Lambda code can back per-tier Custom
-  // Resources without spinning up 3 Lambda functions. Defaults to
-  // 'standard' for back-compat with the original single-bot deploy.
+  // Classification this Lex bot is created for. Read from CloudFormation
+  // ResourceProperties (the `tier` property is the stack↔custom-resource contract)
+  // so the same Lambda code can back per-classification Custom Resources without
+  // spinning up 3 Lambda functions. Defaults to 'standard' for back-compat with
+  // the original single-bot deploy.
   const props = (event as { ResourceProperties?: Record<string, string> }).ResourceProperties || {};
-  const tier = (props.tier || process.env.DEFAULT_AGENT_TIER || 'standard') as
+  const classification = (props.tier || process.env.DEFAULT_AGENT_TIER || 'standard') as
     | 'basic'
     | 'standard'
     | 'premium';
   const customBotName = props.botName;
-  // botName naming: per-tier Custom Resources pass an explicit base name
+  // botName naming: per-classification Custom Resources pass an explicit base name
   // like 'Assistant-basic'; the legacy default-bot CR uses 'Assistant'.
   const baseBotName = customBotName || DEFAULT_BOT_NAME;
 
@@ -100,7 +101,7 @@ export const handler = async (event: CloudFormationCustomResourceEvent) => {
     try {
       // Step 1: Create a new bot
       const botName = `${baseBotName}-${Date.now()}`;
-      console.log('Creating new Lex bot:', botName, 'tier:', tier);
+      console.log('Creating new Lex bot:', botName, 'classification:', classification);
       const createBotResponse = await lexClient.send(
         new CreateBotCommand({
           botName,
@@ -165,7 +166,7 @@ export const handler = async (event: CloudFormationCustomResourceEvent) => {
       // (the SDK's CreateIntent has no bedrockAgentIntentConfiguration field —
       // ADR-011), so it can't be created via IaC. Per ADR-011 the bot is just
       // WelcomeIntent + FallbackIntent → router; the router (not the bot)
-      // invokes the tier's Bedrock Agent via InvokeAgent.
+      // invokes the classification's Bedrock Agent via InvokeAgent.
 
       // Step 4: Enable fulfillment on FallbackIntent so the alias Lambda handles it
       console.log('Enabling fulfillment on FallbackIntent...');

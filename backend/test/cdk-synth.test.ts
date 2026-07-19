@@ -12,11 +12,11 @@ import { Template, Match } from 'aws-cdk-lib/assertions';
 import { ChimeMessagingStack } from '../lib/stacks/chime-messaging-stack';
 import { AnalyticsStack } from '../lib/stacks/analytics-stack';
 import { CognitoAuthStack } from '../lib/stacks/cognito-auth-stack';
-import { BasicTierStack } from '../lib/stacks/basic-tier-stack';
-import { StandardTierStack } from '../lib/stacks/standard-tier-stack';
-import { PremiumTierStack } from '../lib/stacks/premium-tier-stack';
+import { BasicClassificationStack } from '../lib/stacks/basic-classification-stack';
+import { StandardClassificationStack } from '../lib/stacks/standard-classification-stack';
+import { PremiumClassificationStack } from '../lib/stacks/premium-classification-stack';
 import { BattleStack } from '../lib/stacks/battle-stack';
-import { DEFAULT_TIER_MODEL_SELECTION } from '../lib/config/model-strategy';
+import { DEFAULT_PROFILE_MODEL_SELECTION } from '../lib/config/model-strategy';
 
 describe('CDK Synthesis', () => {
   const env = { account: '123456789012', region: 'us-east-1' };
@@ -417,17 +417,17 @@ describe('CDK Synthesis', () => {
     // Plain-string platform inputs (no cross-stack tokens) so the tier stack
     // synthesizes standalone — mirroring the SSM-only/decoupled-deploy goal.
     const appInstanceArn = 'arn:aws:chime:us-east-1:123456789012:app-instance/test';
-    const tierBasicProps = {
+    const classificationBasicProps = {
       env,
       appInstanceArn,
       attachmentsBucketName: 'agent-echelon-attachments-test',
       attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
-      tierModelSelection: DEFAULT_TIER_MODEL_SELECTION,
+      profileModelSelection: DEFAULT_PROFILE_MODEL_SELECTION,
     };
 
-    it('should synthesize AgentEchelonTier-Basic as an Option-D processor (no Bedrock Agent)', () => {
+    it('should synthesize AgentEchelonClassification-Basic as an Option-D processor (no Bedrock Agent)', () => {
       const app = new cdk.App();
-      const stack = new BasicTierStack(app, 'AgentEchelonTier-Basic', tierBasicProps);
+      const stack = new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', classificationBasicProps);
 
       const template = Template.fromStack(stack);
 
@@ -452,9 +452,9 @@ describe('CDK Synthesis', () => {
       });
     });
 
-    it('should synthesize AgentEchelonTier-Standard resolving the shared SSM contract (no Bedrock Agent, no Fn::importValue)', () => {
+    it('should synthesize AgentEchelonClassification-Standard resolving the shared SSM contract (no Bedrock Agent, no Fn::importValue)', () => {
       const app = new cdk.App();
-      const stack = new StandardTierStack(app, 'AgentEchelonTier-Standard', tierBasicProps);
+      const stack = new StandardClassificationStack(app, 'AgentEchelonClassification-Standard', classificationBasicProps);
 
       const template = Template.fromStack(stack);
       template.resourceCountIs('AWS::Bedrock::Agent', 0);
@@ -480,8 +480,8 @@ describe('CDK Synthesis', () => {
 
     it('should resolve the battle SSM contract ONLY when enableBattle is set (opt-in /battle)', () => {
       const app = new cdk.App();
-      const stack = new StandardTierStack(app, 'AgentEchelonTier-Standard', {
-        ...tierBasicProps,
+      const stack = new StandardClassificationStack(app, 'AgentEchelonClassification-Standard', {
+        ...classificationBasicProps,
         enableBattle: true,
       });
 
@@ -496,9 +496,9 @@ describe('CDK Synthesis', () => {
       expect(ssmDefaults).toContain('/agent-echelon/shared/battle-orchestrator-arn');
     });
 
-    it('should synthesize AgentEchelonTier-Premium with text + image guardrails (no Bedrock Agent)', () => {
+    it('should synthesize AgentEchelonClassification-Premium with text + image guardrails (no Bedrock Agent)', () => {
       const app = new cdk.App();
-      const stack = new PremiumTierStack(app, 'AgentEchelonTier-Premium', tierBasicProps);
+      const stack = new PremiumClassificationStack(app, 'AgentEchelonClassification-Premium', classificationBasicProps);
 
       const template = Template.fromStack(stack);
       template.resourceCountIs('AWS::Bedrock::Agent', 0);
@@ -511,12 +511,12 @@ describe('CDK Synthesis', () => {
   //    Aurora/Titan IAM + the drift-confirm create-flow IAM, on ALL tiers.
   describe('Live drift wiring (Aurora hookup)', () => {
     const appInstanceArn = 'arn:aws:chime:us-east-1:123456789012:app-instance/test';
-    const tierBaseProps = {
+    const classificationBaseProps = {
       env,
       appInstanceArn,
       attachmentsBucketName: 'agent-echelon-attachments-test',
       attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
-      tierModelSelection: DEFAULT_TIER_MODEL_SELECTION,
+      profileModelSelection: DEFAULT_PROFILE_MODEL_SELECTION,
     };
 
     /** Build a synthetic AuroraDriftHookup: just the data-plane Lambda ARN the
@@ -556,8 +556,8 @@ describe('CDK Synthesis', () => {
 
     it('wires the basic handler to the data-plane Lambda (NO VPC) + create-flow IAM (drift is all-tier)', () => {
       const app = new cdk.App();
-      const stack = new BasicTierStack(app, 'AgentEchelonTier-Basic', {
-        ...tierBaseProps,
+      const stack = new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', {
+        ...classificationBaseProps,
         auroraDriftHookup: makeHookup(app),
       });
       const template = Template.fromStack(stack);
@@ -576,8 +576,8 @@ describe('CDK Synthesis', () => {
 
     it('wires the premium handler to the data-plane Lambda (NO VPC) + create-flow IAM', () => {
       const app = new cdk.App();
-      const stack = new PremiumTierStack(app, 'AgentEchelonTier-Premium', {
-        ...tierBaseProps,
+      const stack = new PremiumClassificationStack(app, 'AgentEchelonClassification-Premium', {
+        ...classificationBaseProps,
         auroraDriftHookup: makeHookup(app),
       });
       const template = Template.fromStack(stack);
@@ -595,8 +595,8 @@ describe('CDK Synthesis', () => {
 
     it('the SendChannelMessage grant is TAG-GATED on classification (Layer-1 send boundary intact)', () => {
       const app = new cdk.App();
-      const stack = new BasicTierStack(app, 'AgentEchelonTier-Basic', {
-        ...tierBaseProps,
+      const stack = new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', {
+        ...classificationBaseProps,
         auroraDriftHookup: makeHookup(app),
       });
       const template = Template.fromStack(stack);
@@ -608,7 +608,7 @@ describe('CDK Synthesis', () => {
 
     it('wires abuse controls (SPEC-ABUSE-CONTROLS): table env + length cap on both Lambdas, DynamoDB grant (rate limit is config-driven)', () => {
       const app = new cdk.App();
-      const stack = new BasicTierStack(app, 'AgentEchelonTier-Basic', { ...tierBaseProps });
+      const stack = new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', { ...classificationBaseProps });
       const template = Template.fromStack(stack);
       // Both the processor AND the handler carry the abuse env: the shared table and the length cap.
       // (The rate-limit ceiling moved to the profile config — profiles.ts rateLimitPerHour, read at
@@ -633,14 +633,14 @@ describe('CDK Synthesis', () => {
       // Default context (no bedrockGlobalHourlyBudget): budgets are 0/off and the circuit param is
       // NOT wired (no ssm:PutParameter grant for the circuit).
       const app = new cdk.App();
-      const stack = new BasicTierStack(app, 'AgentEchelonTier-Basic', { ...tierBaseProps });
+      const stack = new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', { ...classificationBaseProps });
       const template = Template.fromStack(stack);
       const policies = JSON.stringify(template.findResources('AWS::IAM::Policy'));
       expect(policies).not.toContain('/agent-echelon/abuse/circuit'); // circuit unwired without a global budget
 
       // With a global budget set, the circuit SSM param + its PutParameter grant appear.
       const app2 = new cdk.App({ context: { bedrockGlobalHourlyBudget: '800' } });
-      const stack2 = new BasicTierStack(app2, 'AgentEchelonTier-Basic', { ...tierBaseProps });
+      const stack2 = new BasicClassificationStack(app2, 'AgentEchelonClassification-Basic', { ...classificationBaseProps });
       const template2 = Template.fromStack(stack2);
       const policies2 = JSON.stringify(template2.findResources('AWS::IAM::Policy'));
       expect(policies2).toContain('ssm:PutParameter');
@@ -649,8 +649,8 @@ describe('CDK Synthesis', () => {
 
     it('assistant/handler roles bear BOTS only — no /user/* bearer ', () => {
       const app = new cdk.App();
-      const stack = new PremiumTierStack(app, 'AgentEchelonTier-Premium', {
-        ...tierBaseProps,
+      const stack = new PremiumClassificationStack(app, 'AgentEchelonClassification-Premium', {
+        ...classificationBaseProps,
         auroraDriftHookup: makeHookup(app),
         enableBattle: true,
       });
@@ -677,7 +677,7 @@ describe('CDK Synthesis', () => {
 
     it('Athena mode (no hookup) leaves the handler with NO VPC and NO drift/create IAM', () => {
       const app = new cdk.App();
-      const stack = new BasicTierStack(app, 'AgentEchelonTier-Basic', { ...tierBaseProps });
+      const stack = new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', { ...classificationBaseProps });
       const template = Template.fromStack(stack);
       // No Lambda has a VpcConfig.
       const fns = template.findResources('AWS::Lambda::Function');
@@ -747,7 +747,7 @@ describe('CDK Synthesis', () => {
       appInstanceArn,
       attachmentsBucketName: 'agent-echelon-attachments-test',
       attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
-      tierModelSelection: DEFAULT_TIER_MODEL_SELECTION,
+      profileModelSelection: DEFAULT_PROFILE_MODEL_SELECTION,
     };
 
     // Pull every IAM policy statement out of the synthesized template.
@@ -800,7 +800,7 @@ describe('CDK Synthesis', () => {
 
     it('basic assistant: SendChannelMessage allowed ONLY on classification=basic (fail-closed)', () => {
       const app = new cdk.App();
-      const template = Template.fromStack(new BasicTierStack(app, 'AgentEchelonTier-Basic', props));
+      const template = Template.fromStack(new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', props));
       const allows = tierGatedAllows(template);
       expect(allows.length).toBeGreaterThanOrEqual(1);
       expect(allows[0].Condition.StringEquals['aws:ResourceTag/classification']).toEqual(['basic']);
@@ -811,7 +811,7 @@ describe('CDK Synthesis', () => {
 
     it('standard assistant: channel actions allowed on classification ∈ {basic, standard}', () => {
       const app = new cdk.App();
-      const template = Template.fromStack(new StandardTierStack(app, 'AgentEchelonTier-Standard', props));
+      const template = Template.fromStack(new StandardClassificationStack(app, 'AgentEchelonClassification-Standard', props));
       const allows = tierGatedAllows(template);
       expect(allows.length).toBeGreaterThanOrEqual(1);
       expect(allows[0].Condition.StringEquals['aws:ResourceTag/classification']).toEqual([
@@ -823,7 +823,7 @@ describe('CDK Synthesis', () => {
 
     it('premium assistant: channel actions allowed on classification ∈ {basic, standard, premium}, still fail-closed', () => {
       const app = new cdk.App();
-      const template = Template.fromStack(new PremiumTierStack(app, 'AgentEchelonTier-Premium', props));
+      const template = Template.fromStack(new PremiumClassificationStack(app, 'AgentEchelonClassification-Premium', props));
       const allows = tierGatedAllows(template);
       expect(allows.length).toBeGreaterThanOrEqual(1);
       expect(allows[0].Condition.StringEquals['aws:ResourceTag/classification']).toEqual([

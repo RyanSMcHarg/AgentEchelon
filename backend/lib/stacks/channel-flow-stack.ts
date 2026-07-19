@@ -19,9 +19,9 @@ import {
   SSM_ROOT,
   STACK_PREFIX,
   INSTANCE_SSM,
-  tierProcessorArnKey,
+  processorArnKey,
   CHANNEL_FLOW_ARN_SSM_KEY,
-} from './agent-tier-common';
+} from './agent-classification-common';
 
 /** SSM parameter key for the channel flow ARN. Read at runtime by create-conversation
  *  so we avoid a circular stack dependency with FoundationsStack. Re-exported from the
@@ -54,13 +54,13 @@ export class ChannelFlowStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: ChannelFlowStackProps) {
     super(scope, id, props);
 
-    // @all fan-out and /battle target the per-tier async-processors
-    // (AgentEchelonTier-{Standard,Premium}), resolved at deploy from the SSM
+    // @all fan-out and /battle target the per-classification async-processors
+    // (AgentEchelonClassification-{Standard,Premium}), resolved at deploy from the SSM
     // contract those stacks publish (dynamic ref, not Fn::importValue).
     const standardProcessorArn = ssm.StringParameter.valueForStringParameter(
-      this, tierProcessorArnKey('standard'));
+      this, processorArnKey('standard'));
     const premiumProcessorArn = ssm.StringParameter.valueForStringParameter(
-      this, tierProcessorArnKey('premium'));
+      this, processorArnKey('premium'));
 
     // ============================================================
     // Channel Flow Processor Lambda
@@ -76,11 +76,11 @@ export class ChannelFlowStack extends cdk.Stack {
                 'chime:ChannelFlowCallback',
                 'chime:SendChannelMessage',
                 'chime:ListChannelMemberships',
-                // The tier decision (which assistant responds + the /battle premium
+                // The classification decision (which assistant responds + the /battle premium
                 // gate) reads the IMMUTABLE `classification` tag via ListTagsForResource,
-                // NOT mutable metadata, so a moderator cannot tamper the tier up. Without
+                // NOT mutable metadata, so a moderator cannot tamper the classification up. Without
                 // this grant the catch fails closed to 'basic'. DescribeChannel is no
-                // longer needed here (the tier no longer comes from channel metadata).
+                // longer needed here (the classification no longer comes from channel metadata).
                 'chime:ListTagsForResource',
               ],
               resources: [`${props.appInstanceArn}/*`],
@@ -109,21 +109,21 @@ export class ChannelFlowStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
               resources: [
-                // The processor resolves the channel's per-tier bot (the real
+                // The processor resolves the channel's per-classification bot (the real
                 // member) to send @all broadcasts + member counts. No shared
-                // cross-tier bot.
+                // cross-classification bot.
                 `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
             }),
           ],
         }),
-        // @all fan-out → tier standard processor; /battle fan-out → tier
-        // premium processor. Both are ${STACK_PREFIX}Tier-* functions.
+        // @all fan-out → classification standard processor; /battle fan-out → classification
+        // premium processor. Both are ${STACK_PREFIX}Classification-* functions.
         LambdaInvokePolicy: new iam.PolicyDocument({
           statements: [
             new iam.PolicyStatement({
               actions: ['lambda:InvokeFunction'],
-              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Tier-*`],
+              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Classification-*`],
             }),
           ],
         }),
@@ -197,7 +197,7 @@ export class ChannelFlowStack extends cdk.Stack {
       reservedConcurrentExecutions: 50,
       role: processorRole,
       environment: {
-        // @all fan-out (standard) + /battle fan-out (premium) → tier processors,
+        // @all fan-out (standard) + /battle fan-out (premium) → classification processors,
         // resolved from SSM at deploy. lib/battle-state.ts fails open if these
         // are absent, so a partial rollout never throws at runtime.
         SSM_ROOT,

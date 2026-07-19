@@ -44,12 +44,12 @@ describe('parseGroups — claim shapes', () => {
 describe('extractClaims — tier from most-privileged group', () => {
   it('picks admins over a tier when both are held (bracketed form)', () => {
     const claims = extractClaims(eventWithGroups('[admins premium]'));
-    expect(claims?.tier).toBe('admins');
+    expect(claims?.clearance).toBe('admins');
     expect(claims?.groups).toEqual(['admins', 'premium']);
   });
 
   it('picks the tier when no admin group is held', () => {
-    expect(extractClaims(eventWithGroups('standard'))?.tier).toBe('standard');
+    expect(extractClaims(eventWithGroups('standard'))?.clearance).toBe('standard');
   });
 });
 

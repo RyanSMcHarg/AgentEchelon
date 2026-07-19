@@ -11,7 +11,7 @@
 // this adds the target as a DEFAULT member — an enrolled member is never handed a moderator
 // seat. Identity: the target's host-pool {iss, sub} map (via deriveFederatedSub) to the same
 // disjoint fed_ AppInstanceUser the credential exchange vends. Channel is create-or-get
-// (idempotent on the deterministic, tier-scoped ChannelId) so a share works even before the
+// (idempotent on the deterministic, classification-scoped ChannelId) so a share works even before the
 // owner has opened the assistant.
 
 import {
@@ -30,12 +30,12 @@ const ssm = new SSMClient({});
 
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN!;
 const CHANNEL_FLOW_ARN_PARAM = process.env.CHANNEL_FLOW_ARN_PARAM || '';
-// The classification this federated assistant is provisioned at (env renamed from ASSISTANT_TIER
-// per SPEC-CAPABILITY-PROFILES; the channel is created at this classification and membership is
-// confined to it, so it is authoritative for federated users).
-const TIER = (process.env.ASSISTANT_CLASSIFICATION || 'basic').trim();
+// The classification this federated assistant is provisioned at (SPEC-CAPABILITY-PROFILES;
+// the channel is created at this classification and membership is confined to it, so it is
+// authoritative for federated users).
+const CLASSIFICATION = (process.env.ASSISTANT_CLASSIFICATION || 'basic').trim();
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/assistant/${TIER}/bot-arn`;
+const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/assistant/${CLASSIFICATION}/bot-arn`;
 const META_CAP = 1000;
 
 let cachedBotArn: string | null = null;
@@ -47,7 +47,7 @@ async function ssmGet(name: string): Promise<string> {
 async function getBotArn(): Promise<string> {
   if (cachedBotArn !== null) return cachedBotArn;
   cachedBotArn = await ssmGet(BOT_ARN_PARAM);
-  if (!cachedBotArn) throw new Error(`per-tier bot ARN ${BOT_ARN_PARAM} is empty`);
+  if (!cachedBotArn) throw new Error(`per-classification bot ARN ${BOT_ARN_PARAM} is empty`);
   return cachedBotArn;
 }
 async function getFlowArn(): Promise<string> {
@@ -58,9 +58,9 @@ async function getFlowArn(): Promise<string> {
   return cachedFlowArn;
 }
 
-// Deterministic, charset-safe, TIER-scoped ChannelId (parity with create-conversation).
+// Deterministic, charset-safe, classification-scoped ChannelId (parity with create-conversation).
 function channelIdFor(contextType: string, contextId: string): string {
-  return `fed-${TIER}-${contextType}-${contextId}`.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64);
+  return `fed-${CLASSIFICATION}-${contextType}-${contextId}`.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64);
 }
 
 interface WorkItem { title?: string; status?: string; assignee?: string; start?: string; end?: string }
@@ -122,7 +122,7 @@ export const handler = async (event: AddMemberEvent) => {
       ? { ...domainContext, items: Array.isArray(domainContext.items) ? domainContext.items.slice(0, itemBudget) : [] }
       : undefined;
     return JSON.stringify({
-      modelTier: TIER,
+      modelTier: CLASSIFICATION,
       contextType: contextType.slice(0, 64),
       contextId: contextId.slice(0, 128),
       topic: title,
@@ -153,7 +153,7 @@ export const handler = async (event: AddMemberEvent) => {
         Privacy: 'PRIVATE',
         ChimeBearer: botArn,
         Tags: [
-          { Key: 'classification', Value: TIER },
+          { Key: 'classification', Value: CLASSIFICATION },
           { Key: 'conversationType', Value: 'private' },
           { Key: 'contextType', Value: contextType.slice(0, 128) },
         ],

@@ -7,7 +7,7 @@
  * outcome) is stamped with a stable `configId` computed HERE — a single deterministic algorithm so a
  * record produced by the processor, the eval runner, or a battle is comparable.
  *
- * STABILITY CONTRACT — `configId` is a *deployment/tier* fingerprint, not a per-turn value. It is
+ * STABILITY CONTRACT — `configId` is a *deployment/classification* fingerprint, not a per-turn value. It is
  * derived ONLY from config inputs that change on a (re)deploy:
  *   - persona     : the configured persona/system-prompt value (the SSM param), default-aware.
  *   - intentPack  : the raw pack JSON. NB this ALREADY contains each intent's `maxTokens`/`verbosity`

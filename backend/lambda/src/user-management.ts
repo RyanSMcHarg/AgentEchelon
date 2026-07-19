@@ -63,11 +63,11 @@ async function getAdminArn(): Promise<string | null> {
 }
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || 'http://localhost:5173').split(',');
 
-const TIER_GROUPS = ['basic', 'standard', 'premium'] as const;
-type Tier = typeof TIER_GROUPS[number];
+const CLEARANCE_GROUPS = ['basic', 'standard', 'premium'] as const;
+type Clearance = typeof CLEARANCE_GROUPS[number];
 
-/** Make sure the user is in exactly one tier group. Idempotent. */
-async function syncTierGroup(username: string, tier: Tier): Promise<void> {
+/** Make sure the user is in exactly one clearance group. Idempotent. */
+async function syncClearanceGroup(username: string, clearance: Clearance): Promise<void> {
   let existing: string[] = [];
   try {
     const res = await cognitoClient.send(new AdminListGroupsForUserCommand({
@@ -79,9 +79,9 @@ async function syncTierGroup(username: string, tier: Tier): Promise<void> {
     console.warn('[UserManagement] listGroups failed:', (err as Error).name);
   }
 
-  // Remove from other tier groups so the user holds exactly one tier.
-  for (const other of TIER_GROUPS) {
-    if (other !== tier && existing.includes(other)) {
+  // Remove from other clearance groups so the user holds exactly one clearance.
+  for (const other of CLEARANCE_GROUPS) {
+    if (other !== clearance && existing.includes(other)) {
       try {
         await cognitoClient.send(new AdminRemoveUserFromGroupCommand({
           UserPoolId: USER_POOL_ID,
@@ -94,13 +94,13 @@ async function syncTierGroup(username: string, tier: Tier): Promise<void> {
     }
   }
 
-  if (!existing.includes(tier)) {
+  if (!existing.includes(clearance)) {
     await cognitoClient.send(new AdminAddUserToGroupCommand({
       UserPoolId: USER_POOL_ID,
       Username: username,
-      GroupName: tier,
+      GroupName: clearance,
     }));
-    console.log(`[UserManagement] Added ${username} to ${tier}`);
+    console.log(`[UserManagement] Added ${username} to ${clearance}`);
   }
 }
 
@@ -178,14 +178,14 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return respond(200, { message: `User ${username} disabled` }, origin);
     }
 
-    // POST /users/tier
+    // POST /users/tier  (wire field stays `tier`; it is the user's clearance)
     if (method === 'POST' && path.endsWith('/tier')) {
-      const { tier } = body;
-      if (!tier || !['basic', 'standard', 'premium'].includes(tier)) {
+      const { tier: clearance } = body;
+      if (!clearance || !['basic', 'standard', 'premium'].includes(clearance)) {
         return respond(400, { error: 'tier must be basic, standard, or premium' }, origin);
       }
-      await changeTier(username, tier);
-      return respond(200, { message: `User ${username} tier changed to ${tier}` }, origin);
+      await changeClearance(username, clearance);
+      return respond(200, { message: `User ${username} tier changed to ${clearance}` }, origin);
     }
 
     // POST /users/enable
@@ -243,23 +243,23 @@ async function listUsers(): Promise<{ users: UserRecord[] }> {
   return { users };
 }
 
-async function approveUser(username: string, tier: string): Promise<void> {
-  const effectiveTier = (TIER_GROUPS as readonly string[]).includes(tier)
-    ? (tier as Tier)
+async function approveUser(username: string, clearance: string): Promise<void> {
+  const effectiveClearance = (CLEARANCE_GROUPS as readonly string[]).includes(clearance)
+    ? (clearance as Clearance)
     : 'basic';
 
-  // Set approved + tier
+  // Set approved + clearance
   await cognitoClient.send(new AdminUpdateUserAttributesCommand({
     UserPoolId: USER_POOL_ID,
     Username: username,
     UserAttributes: [
       { Name: 'custom:approved', Value: 'true' },
-      { Name: 'custom:tier', Value: effectiveTier },
+      { Name: 'custom:tier', Value: effectiveClearance },
     ],
   }));
 
   // Mirror into Cognito group so authorization checks trust it
-  await syncTierGroup(username, effectiveTier);
+  await syncClearanceGroup(username, effectiveClearance);
 
   // Enable the user if disabled
   await cognitoClient.send(new AdminEnableUserCommand({
@@ -306,18 +306,18 @@ async function enableUser(username: string): Promise<void> {
   }));
 }
 
-async function changeTier(username: string, tier: string): Promise<void> {
-  if (!(TIER_GROUPS as readonly string[]).includes(tier)) {
-    throw new Error(`Invalid tier: ${tier}`);
+async function changeClearance(username: string, clearance: string): Promise<void> {
+  if (!(CLEARANCE_GROUPS as readonly string[]).includes(clearance)) {
+    throw new Error(`Invalid clearance: ${clearance}`);
   }
   await cognitoClient.send(new AdminUpdateUserAttributesCommand({
     UserPoolId: USER_POOL_ID,
     Username: username,
     UserAttributes: [
-      { Name: 'custom:tier', Value: tier },
+      { Name: 'custom:tier', Value: clearance },
     ],
   }));
-  await syncTierGroup(username, tier as Tier);
+  await syncClearanceGroup(username, clearance as Clearance);
 }
 
 /**

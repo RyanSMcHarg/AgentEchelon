@@ -4,7 +4,7 @@
  * A *conversation type* is a named, configurable profile that decides how a
  * conversation behaves: which agents are enrolled by default, which
  * communication channels are available, whether live drift detection runs, and
- * what security classification it maps to. Today's tiers (`basic` /
+ * what security classification it maps to. Today's classifications (`basic` /
  * `standard` / `premium`) are simply the conversation types that ship; further
  * types (`guest`, `authenticated`, `engagement`, `support`, …) are additional
  * types a deployer can add HERE without touching handler code.
@@ -14,8 +14,8 @@
  * orthogonal platform concept; this registry is OUR policy layer.
  *
  * **Conversation type ≠ classification (deliberately).** The IAM Layer-1
- * channel-join boundary (`agent-tier-common.tierChannelScopedAllow` +
- * `min(userTier, channelTier)`) is fail-closed and depends on a TOTAL ORDER of
+ * channel-join boundary (`agent-classification-common.classificationChannelScopedAllow` +
+ * `min(userClearance, channelClassification)`) is fail-closed and depends on a TOTAL ORDER of
  * classifications (`basic < standard < premium`). Conversation types are meant
  * to proliferate and need NOT be totally ordered (what's the order of `guest`
  * vs `engagement`?). So each type *carries* a `classification` — the small,
@@ -24,12 +24,12 @@
  * docs/SPEC-CONVERSATION-SECURITY.md §4.
  */
 
-import type { ModelTier } from './model-strategy';
+import type { Classification } from './model-strategy';
 import type { ConnectorRef } from './connectors';
 
 /** A conversation-type key. Open-ended (string) by design — deployers add types
  *  to {@link CONVERSATION_TYPES} without a type-system change. The shipped set
- *  happens to mirror the tiers. */
+ *  happens to mirror the classifications. */
 export type ConversationTypeKey = string;
 
 /** What starts a conversation of this type. Default `'user'` (someone opens a
@@ -83,11 +83,11 @@ export interface ConversationTypeConfig {
    * `demo` could both be `basic`-classified). This is the ONLY closed/ordered
    * field; everything else is open/composable (forward-compat contract).
    */
-  classification: ModelTier;
+  classification: Classification;
   /**
    * Whether the USER-FACING live drift flow (lib/live-drift-flow.ts) runs for
    * conversations of this type. Drift is conversation-level, so its on/off is a
-   * property of the conversation type — NOT of the user's tier. (Requires
+   * property of the conversation type — NOT of the user's clearance. (Requires
    * Aurora mode regardless; this gate is layered on top of the Aurora hookup.)
    */
   driftEnabled: boolean;
@@ -99,7 +99,7 @@ export interface ConversationTypeConfig {
 
   /** What initiates this conversation. Default `'user'`. */
   initiation?: Initiation;
-  /** Default agent handle(s) to enroll. Absent ⇒ the per-tier AppInstanceBot. */
+  /** Default agent handle(s) to enroll. Absent ⇒ the per-classification AppInstanceBot. */
   defaultAgents?: string[];
   /** Transports available to this type. Absent ⇒ `['chat']`. */
   commsChannels?: CommsChannel[];
@@ -132,9 +132,9 @@ export interface ConversationTypeConfig {
 }
 
 /**
- * The shipped conversation types. Mirrors the tiers today (so behavior is
- * unchanged: every tier had drift on-by-default). To turn drift off for a type,
- * add a non-tier type, or wire default agents/channels, edit THIS map — no
+ * The shipped conversation types. Mirrors the classifications today (so behavior
+ * is unchanged: every classification had drift on-by-default). To turn drift off
+ * for a type, add a non-classification type, or wire default agents/channels, edit THIS map — no
  * handler change. Keys are matched against the channel's resolved conversation
  * type (see {@link resolveConversationTypeKey}).
  */
@@ -150,25 +150,26 @@ export const CONVERSATION_TYPES: Record<ConversationTypeKey, ConversationTypeCon
 
 /**
  * The conversation type assumed when a channel carries no explicit type. We
- * default the type to the conversation's TIER (the `classification` axis), so
- * a channel with no explicit type behaves as its tier dictates. `standard` is
- * the registry fallback only if even the tier is unknown.
+ * default the type to the conversation's CLASSIFICATION axis, so a channel with
+ * no explicit type behaves as its classification dictates. `standard` is
+ * the registry fallback only if even the classification is unknown.
  */
 export const DEFAULT_CONVERSATION_TYPE: ConversationTypeKey = 'standard';
 
 /**
  * Resolve the conversation-type key for a turn. Prefers an explicit type
- * stamped on the channel (metadata/tag); otherwise falls back to the tier
- * (type ≡ tier today). An explicit type that isn't in the registry is ignored
- * (fall back to tier) so a typo can't silently disable policy.
+ * stamped on the channel (metadata/tag); otherwise falls back to the
+ * classification (type ≡ classification today). An explicit type that isn't in
+ * the registry is ignored (fall back to classification) so a typo can't
+ * silently disable policy.
  */
 export function resolveConversationTypeKey(opts: {
   explicitType?: string;
-  tier: string;
+  classification: string;
 }): ConversationTypeKey {
-  const { explicitType, tier } = opts;
+  const { explicitType, classification } = opts;
   if (explicitType && CONVERSATION_TYPES[explicitType]) return explicitType;
-  if (CONVERSATION_TYPES[tier]) return tier;
+  if (CONVERSATION_TYPES[classification]) return classification;
   return DEFAULT_CONVERSATION_TYPE;
 }
 

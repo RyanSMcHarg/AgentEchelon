@@ -9,7 +9,7 @@
  * placeholder text (which Lex posts in prod); here we post it ourselves right
  * after, and the processor's poll-with-retries finds it.
  *
- *   APP_INSTANCE_ARN=… BOT_ARN=… ROUTER_FN=… TIER=basic \
+ *   APP_INSTANCE_ARN=… BOT_ARN=… ROUTER_FN=… CLASSIFICATION=basic \
  *     AWS_PROFILE=… npx ts-node scripts/e2e-router-dispatch.ts
  */
 
@@ -28,7 +28,7 @@ const region = process.env.AWS_REGION || 'us-east-1';
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN!;
 const BOT_ARN = process.env.BOT_ARN!;
 const ROUTER_FN = process.env.ROUTER_FN!;
-const TIER = process.env.TIER || 'basic';
+const CLASSIFICATION = process.env.CLASSIFICATION || 'basic';
 const QUESTION = 'What products does the company offer? Keep it to 2 sentences.';
 
 const chime = new ChimeSDKMessagingClient({ region });
@@ -40,12 +40,12 @@ async function main(): Promise<void> {
   if (!APP_INSTANCE_ARN || !BOT_ARN || !ROUTER_FN) {
     throw new Error('Set APP_INSTANCE_ARN, BOT_ARN, ROUTER_FN');
   }
-  console.log(`E2E router dispatch — tier=${TIER}\nQ: ${QUESTION}`);
+  console.log(`E2E router dispatch — classification=${CLASSIFICATION}\nQ: ${QUESTION}`);
 
   const ch = await chime.send(new CreateChannelCommand({
     AppInstanceArn: APP_INSTANCE_ARN,
-    Name: `e2e-router-${TIER}-${Date.now()}`,
-    Metadata: JSON.stringify({ modelTier: TIER }),
+    Name: `e2e-router-${CLASSIFICATION}-${Date.now()}`,
+    Metadata: JSON.stringify({ modelTier: CLASSIFICATION }),
     Mode: 'RESTRICTED',
     Privacy: 'PRIVATE',
     ChimeBearer: BOT_ARN,
@@ -105,7 +105,7 @@ async function main(): Promise<void> {
   }
 
   if (reply) {
-    console.log(`\nbot reply (via router → ${TIER} tier processor → channel):\n${reply}\n`);
+    console.log(`\nbot reply (via router → ${CLASSIFICATION} tier processor → channel):\n${reply}\n`);
     console.log('EXPECTED: router dispatched to the tier processor and it replied in-channel ✓');
   } else {
     console.log('\nUNEXPECTED: placeholder never updated — router→processor dispatch may be broken ✗');

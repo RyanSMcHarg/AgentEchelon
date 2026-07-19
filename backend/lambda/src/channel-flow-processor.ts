@@ -69,7 +69,7 @@ const lambdaClient = new LambdaClient({});
 const ssmClient = new SSMClient({});
 
 const ASYNC_PROCESSOR_ARN = process.env.ASYNC_PROCESSOR_ARN;
-// /battle (SPEC-BATTLE.md): premium-tier fan-out routes through
+// /battle (SPEC-BATTLE.md): premium-classification fan-out routes through
 // the premium async processor; the alt-bot slot roster lists which channel
 // members are alt-slot bots vs the default bot.
 const PREMIUM_ASYNC_PROCESSOR_ARN = process.env.PREMIUM_ASYNC_PROCESSOR_ARN;
@@ -84,14 +84,14 @@ const NOTIFY_ALLOWED_POOL_IDS = (process.env.NOTIFY_ALLOWED_POOL_IDS || '')
   .map((s) => s.trim())
   .filter(Boolean);
 
-// Read the channel's tier from its IMMUTABLE `classification` tag. This is a SHARED
-// flow (one processor for all channels), so it discovers the tier per message and that
-// choice decides which per-tier assistant responds and whether premium battles run. We
+// Read the channel's classification from its IMMUTABLE `classification` tag. This is a SHARED
+// flow (one processor for all channels), so it discovers the classification per message and that
+// choice decides which per-classification assistant responds and whether premium battles run. We
 // must NOT read `metadata.modelTier`: metadata is mutable via the owner rename cap
-// (chime:UpdateChannel), so a moderator could tamper it up to make a higher-tier
-// assistant respond or open premium battles on a lower-tier channel. The tag cannot be
+// (chime:UpdateChannel), so a moderator could tamper it up to make a higher-classification
+// assistant respond or open premium battles on a lower-classification channel. The tag cannot be
 // changed by UpdateChannel. Fail-closed to basic. (bearerArn is unused for a tag read.)
-async function getChannelTier(channelArn: string, _bearerArn: string): Promise<string> {
+async function getChannelClassification(channelArn: string, _bearerArn: string): Promise<string> {
   try {
     const resp = await messagingClient.send(
       new ListTagsForResourceCommand({ ResourceARN: channelArn }),
@@ -106,20 +106,20 @@ async function getChannelTier(channelArn: string, _bearerArn: string): Promise<s
   }
 }
 
-// Resolve the channel's PER-TIER bot (its real creator+member) — the ChimeBearer
+// Resolve the channel's PER-CLASSIFICATION bot (its real creator+member) — the ChimeBearer
 // for every bot-attributed action here (@all broadcast, member count, /battle
-// default combatant). There is no shared cross-tier bot fallback: a missing
-// per-tier SSM key is an error (the tier stack publishes it on deploy).
-const tierBotArnCache: Record<string, string> = {};
-async function resolveTierBotArn(tier: string): Promise<string> {
-  if (tierBotArnCache[tier]) return tierBotArnCache[tier];
-  const key = `${SSM_ROOT}/assistant/${tier}/bot-arn`;
+// default combatant). There is no shared cross-classification bot fallback: a missing
+// per-classification SSM key is an error (the classification stack publishes it on deploy).
+const botArnCache: Record<string, string> = {};
+async function resolveBotArn(classification: string): Promise<string> {
+  if (botArnCache[classification]) return botArnCache[classification];
+  const key = `${SSM_ROOT}/assistant/${classification}/bot-arn`;
   const resp = await ssmClient.send(new GetParameterCommand({ Name: key }));
   const arn = resp.Parameter?.Value;
   if (!arn) {
-    throw new Error(`[ChannelFlow] per-tier bot param ${key} is empty`);
+    throw new Error(`[ChannelFlow] per-classification bot param ${key} is empty`);
   }
-  tierBotArnCache[tier] = arn;
+  botArnCache[classification] = arn;
   return arn;
 }
 
@@ -251,14 +251,14 @@ export async function handler(event: ChannelFlowEvent): Promise<void> {
     decHead: JSON.stringify(decodedContent).slice(0, 64),
   });
 
-  // Resolve the channel's per-tier bot (its real member) for every
+  // Resolve the channel's per-classification bot (its real member) for every
   // bot-attributed action below — @all broadcast, member count, and the
   // /battle default combatant. No shared bot is a channel member, so only the
-  // per-tier bot can read the channel and send. Tier is read as the SENDER (a
+  // per-classification bot can read the channel and send. Classification is read as the SENDER (a
   // member); for a /battle channel that
   // resolves to the premium bot, the correct default combatant.
-  const channelTier = await getChannelTier(channelArn, senderArn);
-  const botArn = await resolveTierBotArn(channelTier);
+  const channelClassification = await getChannelClassification(channelArn, senderArn);
+  const botArn = await resolveBotArn(channelClassification);
 
   // ═══════════════════════════════════════════════════════════════
   // /battle continuation: a reply Target-addressed to a bot that is
@@ -316,7 +316,7 @@ export async function handler(event: ChannelFlowEvent): Promise<void> {
 
   // ═══════════════════════════════════════════════════════════════
   // /battle: per-bot fan-out for adversarial replies (SPEC-BATTLE.md).
-  // Premium-tier only. If Battle Mode isn't enabled on the channel the
+  // Premium-classification only. If Battle Mode isn't enabled on the channel the
   // user gets a one-line "not enabled here" hint (handleBattleMessage) —
   // a no-op command should explain itself, not silently broadcast.
   // ═══════════════════════════════════════════════════════════════
@@ -723,7 +723,7 @@ interface HandleBattleParams {
  * Handle a `/battle` slash command.
  *
  * Flow:
- * 1. Tier gate — premium-tier channels only. Non-premium gets a targeted
+ * 1. Classification gate — premium channels only. Non-premium gets a targeted
  *    bot reply explaining the requirement.
  * 2. Battle-enabled check (ChannelBattleConfig). If Battle Mode is off for
  *    this channel, reply with a one-line "not enabled here — ask a
@@ -742,15 +742,15 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
   const { channelArn, userMessageId, content, senderArn, defaultBotArn, imageAttachment } = params;
   console.log('[ChannelFlow][battle] Detected', { channelArn, senderArn });
 
-  // 1. Tier gate. Resolve tier from the immutable `classification` tag (not mutable
+  // 1. Classification gate. Resolve classification from the immutable `classification` tag (not mutable
   //    metadata) so a tampered modelTier cannot open premium battles on a lower channel.
-  const channelTier = await getChannelTier(channelArn, defaultBotArn);
+  const channelClassification = await getChannelClassification(channelArn, defaultBotArn);
 
-  if (channelTier !== 'premium') {
+  if (channelClassification !== 'premium') {
     await sendBotMessage(
       channelArn,
       defaultBotArn,
-      "Battles are only available on premium-tier channels. Reply normally and I'll respond as usual.",
+      "Battles are only available on premium channels. Reply normally and I'll respond as usual.",
       [senderArn],
     );
     return;

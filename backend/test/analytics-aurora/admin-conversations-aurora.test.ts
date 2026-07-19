@@ -27,9 +27,9 @@ describe('admin-conversations-aurora', () => {
 
   beforeEach(() => jest.clearAllMocks());
 
-  it('lists conversations grouped by channel with name + tier', async () => {
+  it('lists conversations grouped by channel with name + classification', async () => {
     mockedQuery.mockResolvedValueOnce({
-      rows: [{ channel_arn: 'c1', tier: 'premium', name: 'Q3 Forecast', message_count: '12', last_message_at: '2026-07-15T00:05:00Z' }],
+      rows: [{ channel_arn: 'c1', classification: 'premium', name: 'Q3 Forecast', message_count: '12', last_message_at: '2026-07-15T00:05:00Z' }],
       rowCount: 1,
     } as any);
     const out = await adminListConversations(50);
@@ -47,9 +47,9 @@ describe('admin-conversations-aurora', () => {
   it('derives lifecycle state: deleted wins over archived, else archived, else live', async () => {
     mockedQuery.mockResolvedValueOnce({
       rows: [
-        { channel_arn: 'c1', tier: 'premium', name: 'Live one', message_count: '4', last_message_at: '2026-07-15T00:05:00Z', member_count: '2', is_deleted: false, is_archived: false },
-        { channel_arn: 'c2', tier: 'standard', name: 'Archived one', message_count: '9', last_message_at: '2026-07-14T00:00:00Z', member_count: '0', is_deleted: false, is_archived: true },
-        { channel_arn: 'c3', tier: 'premium', name: 'Deleted one', message_count: '3', last_message_at: '2026-07-13T00:00:00Z', member_count: '0', is_deleted: true, is_archived: true },
+        { channel_arn: 'c1', classification: 'premium', name: 'Live one', message_count: '4', last_message_at: '2026-07-15T00:05:00Z', member_count: '2', is_deleted: false, is_archived: false },
+        { channel_arn: 'c2', classification: 'standard', name: 'Archived one', message_count: '9', last_message_at: '2026-07-14T00:00:00Z', member_count: '0', is_deleted: false, is_archived: true },
+        { channel_arn: 'c3', classification: 'premium', name: 'Deleted one', message_count: '3', last_message_at: '2026-07-13T00:00:00Z', member_count: '0', is_deleted: true, is_archived: true },
       ],
       rowCount: 3,
     } as any);
@@ -63,7 +63,7 @@ describe('admin-conversations-aurora', () => {
 
   it('falls back to "Untitled Conversation" when no channel name row exists', async () => {
     mockedQuery.mockResolvedValueOnce({
-      rows: [{ channel_arn: 'c2', tier: null, name: null, message_count: '3', last_message_at: null }],
+      rows: [{ channel_arn: 'c2', classification: null, name: null, message_count: '3', last_message_at: null }],
       rowCount: 1,
     } as any);
     const out = await adminListConversations();

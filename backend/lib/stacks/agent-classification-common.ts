@@ -1,15 +1,15 @@
 /**
- * Shared constants + thin helpers for the per-tier stacks
- * (BasicTierStack / StandardTierStack / PremiumTierStack).
+ * Shared constants + thin helpers for the per-classification stacks
+ * (BasicClassificationStack / StandardClassificationStack / PremiumClassificationStack).
  *
- * **Intentionally thin.** The per-tier ownership model (ADR-011) targets
- * independently-owned *code* per tier — a basic-team change must not
- * review-couple the standard or premium tiers. So this file holds only what
- * the tiers MUST agree on (the SSM contract keys, the shared bot key, and a
- * couple of pure helpers) and deliberately stops short of building any tier
- * stack's resources. Each tier's file owns its own IAM, Lambda, Lex bot, and
+ * **Intentionally thin.** The per-classification ownership model (ADR-011) targets
+ * independently-owned *code* per classification — a basic-team change must not
+ * review-couple the standard or premium classifications. So this file holds only what
+ * the classifications MUST agree on (the SSM contract keys, the shared bot key, and a
+ * couple of pure helpers) and deliberately stops short of building any classification
+ * stack's resources. Each classification's file owns its own IAM, Lambda, Lex bot, and
  * AppInstanceBot wiring even when those happen to look similar — that is
- * what "per-tier ownership" means.
+ * what "per-classification ownership" means.
  */
 
 import * as cdk from 'aws-cdk-lib';
@@ -20,14 +20,14 @@ import { Construct } from 'constructs';
 import type { BackendModelDefinition, BackendModelKey } from '../config/model-strategy';
 import { defaultProfileRegistry as profiles } from '../profile-registry';
 
-export type Tier = 'basic' | 'standard' | 'premium';
-export type TierModelCatalog = Record<BackendModelKey, BackendModelDefinition>;
+export type Classification = 'basic' | 'standard' | 'premium';
+export type ClassificationModelCatalog = Record<BackendModelKey, BackendModelDefinition>;
 
-/** Tier ordering, lowest → highest. */
+/** Classification ordering, lowest → highest. */
 
 /**
  * Chime actions whose IAM resource is purely a CHANNEL (so it carries the
- * `classification` tag) and that must be tier-gated.
+ * `classification` tag) and that must be classification-gated.
  *
  * EXCLUDES:
  * - app/user-scoped actions (CreateChannel, ListChannels, Connect,
@@ -40,7 +40,7 @@ export type TierModelCatalog = Record<BackendModelKey, BackendModelDefinition>;
  *   model + the app-layer share/create gates. (ListChannelMemberships IS
  *   channel-scoped, so it stays here.)
  */
-export const TIER_GATED_CHANNEL_ACTIONS = [
+export const CLASSIFICATION_GATED_CHANNEL_ACTIONS = [
   'chime:SendChannelMessage',
   'chime:UpdateChannelMessage',
   'chime:RedactChannelMessage',
@@ -56,15 +56,15 @@ export const TIER_GATED_CHANNEL_ACTIONS = [
 /** The classification tag values a classification may act on: itself and every one below (by rank).
  *  Config-driven via the profile registry (SPEC-CAPABILITY-PROFILES) — the same at-or-below set the
  *  runtime uses for RAG scope, so the IAM boundary and retrieval scope can never drift. */
-export function classificationsAllowedFor(tier: Tier): string[] {
-  return profiles.scopeAtOrBelow(tier);
+export function classificationsAllowedFor(classification: Classification): string[] {
+  return profiles.scopeAtOrBelow(classification);
 }
 
 /**
  * SPEC-CONVERSATION-SECURITY Layer 1 — the channel-join boundary, **fail-closed**.
  *
  * Returns an IAM **Allow** that grants the channel-scoped Chime actions ONLY on
- * channels tagged `classification ∈ {this tier and every tier below}` (the
+ * channels tagged `classification ∈ {this classification and every classification below}` (the
  * immutable tag create-conversation stamps). This is the FAIL-CLOSED inverse of a
  * deny-on-higher: an **untagged** channel, or one with an unexpected tag value,
  * carries no matching `aws:ResourceTag/classification`, so the condition is false,
@@ -79,15 +79,15 @@ export function classificationsAllowedFor(tier: Tier): string[] {
  * context — verified the hard way by a live deny-test (the `chime:` form let a
  * basic member send into a premium channel; the `aws:` form returns AccessDenied).
  *
- * Used for BOTH the per-tier assistant (async-processor) roles and the per-tier
+ * Used for BOTH the per-classification assistant (async-processor) roles and the per-classification
  * Cognito user roles — the same boundary, one definition. Because it's fail-closed,
  * every legitimate channel MUST be tagged; new channels are tagged at creation and
  * existing ones are covered by `scripts/backfill-channel-classification-tags.mjs`.
  */
-export function tierChannelScopedAllow(
-  tier: Tier,
+export function classificationChannelScopedAllow(
+  classification: Classification,
   appInstanceArn: string,
-  actions: string[] = TIER_GATED_CHANNEL_ACTIONS,
+  actions: string[] = CLASSIFICATION_GATED_CHANNEL_ACTIONS,
   opts?: {
     /**
      * Override the BEARER resources (statement 2). Default is the unconditioned
@@ -108,21 +108,21 @@ export function tierChannelScopedAllow(
   // AND the caller's bearer identity resource (the AWS messaging IAM example
   // policy lists `.../user/<id>` AND `.../channel/*`). So we need two grants:
   //
-  // (1) CHANNEL resource — tag-gated. THIS is the tier boundary: the channel
-  //     is only granted when its `classification` tag ∈ {this tier and below}.
-  //     An untagged / higher-tier channel → no grant → implicit deny (fail-closed).
+  // (1) CHANNEL resource — tag-gated. THIS is the classification boundary: the channel
+  //     is only granted when its `classification` tag ∈ {this classification and below}.
+  //     An untagged / higher-classification channel → no grant → implicit deny (fail-closed).
   // (2) BEARER resource (`/user/*` + `/bot/*`) — UNCONDITIONED. The bearer has no
   //     classification tag, and Chime restricts the ChimeBearer to the caller's
   //     own authenticated identity, so this grants nothing cross-identity and
   //     never widens channel access (channels are `/channel/*`, gated by (1)).
   const statements = [
     new iam.PolicyStatement({
-      sid: 'AllowOwnAndLowerTierChannelActions',
+      sid: 'AllowOwnAndLowerClassificationChannelActions',
       effect: iam.Effect.ALLOW,
       actions,
       resources: [`${appInstanceArn}/channel/*`],
       conditions: {
-        StringEquals: { 'aws:ResourceTag/classification': classificationsAllowedFor(tier) },
+        StringEquals: { 'aws:ResourceTag/classification': classificationsAllowedFor(classification) },
       },
     }),
     new iam.PolicyStatement({
@@ -135,7 +135,7 @@ export function tierChannelScopedAllow(
   // SPEC-CONVERSATION-ARCHIVE (ADR-017): if this grant includes a message
   // write, layer the archived-channel read-only Deny on top. A Deny overrides
   // the Allow above, so once a channel is tagged `archived=true` neither the
-  // per-tier assistant nor a tier user can send/edit — the channel is read-only
+  // per-classification assistant nor a classification user can send/edit — the channel is read-only
   // by IAM. Callers that grant only reads (e.g. DescribeChannel) get no Deny.
   if (actions.some((a) => ARCHIVE_DENIED_ACTIONS.has(a))) {
     statements.push(archivedChannelReadOnlyDeny(appInstanceArn));
@@ -158,7 +158,7 @@ export const ARCHIVE_DENIED_ACTIONS = new Set<string>([
  * NEVER attach this to the admin plane / app-instance-admin bearer: that
  * principal posts the archive system message and must stay exempt. A Deny is
  * global for the principal, so it is scoped to `archived=true` channels only and
- * affects no other channel. `tierChannelScopedAllow` attaches it automatically
+ * affects no other channel. `classificationChannelScopedAllow` attaches it automatically
  * for any send/update grant; the admin rung does not go through that function,
  * so it is exempt by construction.
  */
@@ -204,7 +204,7 @@ function pascal(s: string): string {
 /**
  * CloudFormation stack-ID prefix — the PascalCase form of the instance name.
  * The default instance yields `AgentEchelon` (`AgentEchelonFoundations`,
- * `AgentEchelonTier-Basic`, …); a host instance gets its own PascalCase prefix
+ * `AgentEchelonClassification-Basic`, …); a host instance gets its own PascalCase prefix
  * (`acme` → `Acme…`), so two instances never update each other's stacks.
  * Override with `AE_STACK_PREFIX`.
  */
@@ -243,7 +243,7 @@ export const ANALYTICS_DB_NAME = ANALYTICS_PREFIX.replace(/-/g, '_');
 /**
  * The platform's shared SSM contract — published by the feature stacks
  * (AgentEchelonFoundations, AgentEchelonExperiments, AgentEchelonBattle) and
- * resolved by Standard/Premium tiers at deploy time via
+ * resolved by Standard/Premium classifications at deploy time via
  * `valueForStringParameter` (a dynamic SSM ref, NOT Fn::importValue). Basic
  * does not need any of these — it has no tasks, no /battle.
  * **All paths derive from SSM_ROOT — never hardcode `/agent-echelon/...`.**
@@ -268,9 +268,9 @@ export const SHARED_SSM = {
   battleOutcomeName: `${SSM_ROOT}/shared/tables/battle-outcome-name`,
   battleOutcomeArn: `${SSM_ROOT}/shared/tables/battle-outcome-arn`,
   battleOrchestratorArn: `${SSM_ROOT}/shared/battle-orchestrator-arn`,
-  // Cognito user-pool id — standard/premium tiers run the per-tier handler
-  // (router code) which does per-message tier enforcement (min(senderTier,
-  // channelTier)) via AdminListGroupsForUser.
+  // Cognito user-pool id — standard/premium classifications run the per-classification handler
+  // (router code) which does per-message classification enforcement (min(senderClearance,
+  // channelClassification)) via AdminListGroupsForUser.
   cognitoUserPoolId: `${SSM_ROOT}/shared/cognito-user-pool-id`,
   // Aurora data-plane Lambda ARN. Published by AgentEchelonAnalyticsAurora;
   // consumed at RUNTIME (not deploy — that would be a circular stack dependency,
@@ -297,7 +297,7 @@ export const INSTANCE_SSM = {
  * the processor needs no runtime SSM read.
  */
 /**
- * Wire the abuse-controls plane (SPEC-ABUSE-CONTROLS) into a tier's handler + processor. Returns
+ * Wire the abuse-controls plane (SPEC-ABUSE-CONTROLS) into a classification's handler + processor. Returns
  * the env + an IAM grant on the shared control table. Request DEDUP is active whenever the table
  * is present (which it always is here) - it fixes the duplicate-fulfillment task clobber and is
  * always safe. The spend BUDGET is opt-in: the ceilings default to 0 (off) and a deployment turns
@@ -308,7 +308,7 @@ export function abuseControlsWiring(
   scope: Construct,
   abuseControlsArn: string,
   abuseControlsName: string,
-  tier: Tier,
+  classification: Classification,
   region: string,
   account: string,
 ): { env: Record<string, string>; grant: (role: iam.IRole) => void } {
@@ -328,7 +328,7 @@ export function abuseControlsWiring(
     BEDROCK_USER_HOURLY_BUDGET: ctxNum('bedrockUserHourlyBudget'),
     BEDROCK_GLOBAL_HOURLY_BUDGET: globalBudget,
     // Rate-limit ceiling moved to the profile config (profiles.ts rateLimitPerHour), read at runtime
-    // by the router — no longer a per-tier env var / -c rateLimit<Tier> knob.
+    // by the router — no longer a per-classification env var / -c rateLimit<Classification> knob.
     // Inbound length cap. Defaulted generously (16000 chars ~ 4k tokens) rather than CH's 2000:
     // CH is a portfolio widget, AE is an enterprise assistant where report/extraction prompts and
     // pasted content are legitimately long, so a 2000 cap would degrade real use (superset tenet).
@@ -383,30 +383,30 @@ export function adminErrorAlertWiring(
 }
 
 /**
- * SSM keys this tier PUBLISHES — read by create-conversation (per-tier bot member)
- * and the tier's own handler/processor. There is no shared-bot key; every tier
+ * SSM keys this classification PUBLISHES — read by create-conversation (per-classification bot member)
+ * and the classification's own handler/processor. There is no shared-bot key; every classification
  * owns its own bot.
  */
-export function tierBotArnKey(tier: Tier): string {
-  return `${SSM_ROOT}/assistant/${tier}/bot-arn`;
+export function botArnKey(classification: Classification): string {
+  return `${SSM_ROOT}/assistant/${classification}/bot-arn`;
 }
-export function tierProcessorArnKey(tier: Tier): string {
-  return `${SSM_ROOT}/assistant/${tier}/processor-arn`;
+export function processorArnKey(classification: Classification): string {
+  return `${SSM_ROOT}/assistant/${classification}/processor-arn`;
 }
 
 /**
  * Resolve the platform's ALWAYS-PRESENT shared SSM contract at deploy time
  * (tasks tables + experiments table + Cognito pool id). Published by
  * AgentEchelonFoundations/AgentEchelonExperiments, which deploy regardless of whether
- * /battle is enabled. Returns the dynamic SSM refs the tier's role and
- * processor env use. Only used by the Standard + Premium tiers; Basic
+ * /battle is enabled. Returns the dynamic SSM refs the classification's role and
+ * processor env use. Only used by the Standard + Premium classifications; Basic
  * doesn't call this.
  *
  * The /battle-specific params (battle-state, channel-battle-config,
  * battle-orchestrator) are resolved SEPARATELY via `resolveBattleSSM`, and
- * only when the tier wires battle — because AgentEchelonBattle is opt-in, those
+ * only when the classification wires battle — because AgentEchelonBattle is opt-in, those
  * params may not exist, and `valueForStringParameter` fails the deploy on a
- * missing param. Keeping them out of here lets a tier deploy with battle off.
+ * missing param. Keeping them out of here lets a classification deploy with battle off.
  */
 export function resolveSharedSSM(scope: Construct): {
   agentTasksArn: string;
@@ -435,10 +435,10 @@ export function resolveSharedSSM(scope: Construct): {
 
 /**
  * Resolve the /battle-only shared SSM contract (published by the opt-in
- * AgentEchelonBattle stack). Call ONLY when the tier actually wires battle
+ * AgentEchelonBattle stack). Call ONLY when the classification actually wires battle
  * (`enableBattle` true) — otherwise the params may be absent and the deploy
  * would fail on the dynamic SSM ref. Keyed by the SHARED_SSM names that
- * AgentEchelonBattle publishes, so a battle-enabled tier resolves the same
+ * AgentEchelonBattle publishes, so a battle-enabled classification resolves the same
  * plumbing.
  */
 export function resolveBattleSSM(scope: Construct): {
@@ -457,14 +457,14 @@ export function resolveBattleSSM(scope: Construct): {
 }
 
 /**
- * Collect every Bedrock model ARN this tier is allowed to invoke (text
+ * Collect every Bedrock model ARN this classification is allowed to invoke (text
  * models only — image-gen ARNs are hardcoded inline in Premium since they
  * are premium-exclusive).
  */
-export function modelArnsForTier(tier: Tier, catalog: TierModelCatalog): string[] {
+export function modelArnsForClassification(classification: Classification, catalog: ClassificationModelCatalog): string[] {
   const arns: string[] = [];
   for (const model of Object.values(catalog)) {
-    if (model.allowedTiers.includes(tier)) {
+    if (model.allowedClassifications.includes(classification)) {
       arns.push(...model.foundationModelArns);
       if (model.inferenceProfileArns) arns.push(...model.inferenceProfileArns);
     }
@@ -481,7 +481,7 @@ export function modelArnsForTier(tier: Tier, catalog: TierModelCatalog): string[
 export const CHANNEL_FLOW_ARN_SSM_KEY = `${SSM_ROOT}/channel-flow-arn`;
 
 /**
- * IAM the per-tier agent handler needs so the LIVE-drift confirm path can
+ * IAM the per-classification agent handler needs so the LIVE-drift confirm path can
  * create a follow-up channel (`createConversationFromDrift`). Attached ONLY in
  * Aurora mode (when drift is wired) — keeps the handler read-only on Chime
  * otherwise.
@@ -492,12 +492,12 @@ export const CHANNEL_FLOW_ARN_SSM_KEY = `${SSM_ROOT}/channel-flow-arn`;
  *   role — they either target a not-yet-existing channel or authorize against the
  *   user resource, so they can't be channel-tag-gated.
  * - `SendChannelMessage` is granted SEPARATELY and TAG-GATED via
- *   `tierChannelScopedAllow`, so the handler can message the new (own-classification)
- *   channel but NEVER a higher-tier one. The deny-tested Layer-1 send boundary
+ *   `classificationChannelScopedAllow`, so the handler can message the new (own-classification)
+ *   channel but NEVER a higher-classification one. The deny-tested Layer-1 send boundary
  *   stays intact even though the handler can now create channels.
  */
 export function driftChannelCreateStatements(
-  tier: Tier,
+  classification: Classification,
   appInstanceArn: string,
   region: string,
   account: string,
@@ -519,11 +519,11 @@ export function driftChannelCreateStatements(
       ],
       resources: [`${appInstanceArn}/*`],
     }),
-    // SendChannelMessage to the freshly-created channel — tag-gated (own tier
-    // and below), NOT app-wide, so the handler can't message a higher-tier channel.
-    // Bearer pinned to bots only (the handler sends AS the tier bot, never as a
+    // SendChannelMessage to the freshly-created channel — tag-gated (own classification
+    // and below), NOT app-wide, so the handler can't message a higher-classification channel.
+    // Bearer pinned to bots only (the handler sends AS the classification bot, never as a
     // user).
-    ...tierChannelScopedAllow(tier, appInstanceArn, ['chime:SendChannelMessage'], {
+    ...classificationChannelScopedAllow(classification, appInstanceArn, ['chime:SendChannelMessage'], {
       bearerResources: [`${appInstanceArn}/bot/*`],
     }),
     new iam.PolicyStatement({
@@ -536,14 +536,14 @@ export function driftChannelCreateStatements(
 }
 
 /**
- * Aurora hookup a per-tier agent handler needs to run LIVE drift detection
+ * Aurora hookup a per-classification agent handler needs to run LIVE drift detection
  * (SPEC-DRIFT-CONVERGENCE.md). Mirrors the fields AnalyticsStackAurora exports.
- * Only present in Aurora mode; in Athena mode the tier wires no drift.
+ * Only present in Aurora mode; in Athena mode the classification wires no drift.
  */
 export interface AuroraDriftHookup {
   /**
    * ARN of the retrieval + drift data-plane Lambda exposed by
-   * AnalyticsStackAurora (project decision 018). The tier's agent handler is
+   * AnalyticsStackAurora (project decision 018). The classification's agent handler is
    * granted `lambda:InvokeFunction` on it and invokes it for retrieval + drift,
    * instead of being VPC-attached to Aurora itself. This keeps the Lex-facing
    * handler off the VPC path, where it would hang on SSM / Cognito /
@@ -554,8 +554,8 @@ export interface AuroraDriftHookup {
 
 /**
  * Out-of-band per-message analytics table (SPEC-MESSAGE-METADATA-CODEBOOK.md
- * Phase 1; ADR-016). Passed from the Aurora stack (the consumer) to each tier
- * stack so the tier's async processor can WRITE the full analytics blob there
+ * Phase 1; ADR-016). Passed from the Aurora stack (the consumer) to each classification
+ * stack so the classification's async processor can WRITE the full analytics blob there
  * keyed by message id (and slim the Chime Metadata). Present in Aurora mode
  * only; undefined in Athena mode ⇒ the processor keeps full inline metadata.
  */
@@ -565,7 +565,7 @@ export interface MessageAnalyticsWiring {
 }
 
 /**
- * Wire a tier async processor to the out-of-band analytics table: set the env
+ * Wire a classification async processor to the out-of-band analytics table: set the env
  * var the shared lib reads (`MESSAGE_ANALYTICS_TABLE`) and grant write-only
  * access scoped to that table. No-op when the wiring is absent (Athena mode).
  * Write-only: the processor never reads analytics back (only the Aurora archival
@@ -583,16 +583,16 @@ export function wireMessageAnalytics(
 }
 
 /**
- * Wire LIVE drift detection + RAG retrieval onto a per-tier agent handler.
+ * Wire LIVE drift detection + RAG retrieval onto a per-classification agent handler.
  * Returns the env + the IAM the handler role needs to INVOKE the retrieval +
  * drift data-plane Lambda (project decision 018). The handler is NOT
  * VPC-attached; the data-plane Lambda owns the Aurora + Titan-embed access.
- * Wired on EVERY tier (basic/standard/premium) so each can run drift + RAG.
- * Drift is conversation-level + all-tier + on-by-default in Aurora mode (NOT
+ * Wired on EVERY classification (basic/standard/premium) so each can run drift + RAG.
+ * Drift is conversation-level + all-classification + on-by-default in Aurora mode (NOT
  * premium-only — see docs/SPEC-DRIFT-CONVERGENCE.md §"runs on all AE tiers").
  *
- * Usage in a tier stack (only when `hookup` is provided, i.e. Aurora mode):
- *   const drift = auroraDriftWiring(this, tier, hookup);
+ * Usage in a classification stack (only when `hookup` is provided, i.e. Aurora mode):
+ *   const drift = auroraDriftWiring(this, classification, hookup);
  *   new lambdaNodeJs.NodejsFunction(this, 'AgentHandler', {
  *     environment: { ...baseEnv, ...drift.env },   // NO VPC props
  *     ...
@@ -601,13 +601,13 @@ export function wireMessageAnalytics(
  */
 export function auroraDriftWiring(
   scope: Construct,
-  _tier: Tier,
+  _classification: Classification,
   hookup: AuroraDriftHookup,
 ): {
   env: Record<string, string>;
   grantTo: (role: iam.IRole) => void;
 } {
-  // scope is retained for signature stability with the tier stacks; the
+  // scope is retained for signature stability with the classification stacks; the
   // data-plane model needs no stack-scoped constructs here.
   void scope;
 
@@ -622,7 +622,7 @@ export function auroraDriftWiring(
       ENABLE_LIVE_DRIFT: 'true',
     },
     grantTo: (role: iam.IRole) => {
-      // The only privilege the tier handler needs for retrieval + drift: invoke
+      // The only privilege the classification handler needs for retrieval + drift: invoke
       // the data-plane Lambda. All DB / RDS-IAM / Titan-embed access lives on the
       // data-plane Lambda's own role in AnalyticsStackAurora.
       role.addToPrincipalPolicy(

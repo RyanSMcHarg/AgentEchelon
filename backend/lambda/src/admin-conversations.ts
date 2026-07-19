@@ -217,11 +217,11 @@ async function listConversations(event: APIGatewayProxyEvent, origin?: string): 
   }
   // One pass over the archive: group by channel. Channel events carry Name;
   // message events carry MessageId/CreatedTimestamp. `user_type` is the S3
-  // partition (= tier). MAX() picks the non-null Name across the group.
+  // partition (= classification). MAX() picks the non-null Name across the group.
   const query = `
     SELECT
       json_extract_scalar(line, '$.Payload.ChannelArn') AS channel_arn,
-      arbitrary(user_type) AS tier,
+      arbitrary(user_type) AS classification,
       -- Channels are created as "New conversation" then auto-titled via
       -- UPDATE_CHANNEL; take the name from the LATEST channel event (rows with a
       -- Name), not the alphabetical MAX.
@@ -249,15 +249,15 @@ async function listConversations(event: APIGatewayProxyEvent, origin?: string): 
   }
   const idx = (name: string) => result.columns.indexOf(name);
   const conversations = result.rows.map((r) => {
-    const tier = r[idx('tier')] || '';
+    const classification = r[idx('classification')] || '';
     return {
       channelArn: r[idx('channel_arn')] || '',
       name: r[idx('name')] || 'Untitled Conversation',
       messageCount: Number(r[idx('message_count')] || 0),
       lastMessageAt: r[idx('last_message_at')] || undefined,
       memberCount: 0, // populated on demand via the client-side admin member list
-      // Frontend (AdminConversationSummary) reads the tier from metadata.modelTier.
-      metadata: { modelTier: tier },
+      // Frontend (AdminConversationSummary) reads the classification from metadata.modelTier.
+      metadata: { modelTier: classification },
     };
   }).filter((c) => c.channelArn);
 

@@ -30,7 +30,7 @@ export interface CreateConversationFromDriftInput {
   appInstanceArn: string;
   botArn: string;
   userArn: string;
-  /** Tier the new channel inherits — should not exceed the parent channel's tier */
+  /** Classification the new channel inherits — should not exceed the parent channel's classification */
   modelTier: 'basic' | 'standard' | 'premium';
   /** modelId/modelName for the channel metadata; usually inherited from the parent */
   modelId: string;
@@ -75,8 +75,8 @@ export async function createConversationFromDrift(
         : {}),
       // SPEC-CONVERSATION-SECURITY Layer 1: the immutable `classification` tag
       // the IAM channel-join boundary keys on (aws:ResourceTag/classification).
-      // MUST be set on every channel — the per-tier roles are fail-closed, so an
-      // untagged channel is unreachable by any tier identity.
+      // MUST be set on every channel — the per-classification roles are fail-closed, so an
+      // untagged channel is unreachable by any classification identity.
       Tags: [{ Key: 'classification', Value: input.modelTier }],
       Metadata: JSON.stringify({
         modelId: input.modelId,

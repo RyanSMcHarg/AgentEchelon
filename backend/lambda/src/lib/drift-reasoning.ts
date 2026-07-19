@@ -36,7 +36,7 @@ import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-r
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 
 // Same cheap, deterministic model the intent classifier uses. Model-independent
-// of the conversation's tier model, so the basic tier gets the same drift rigor
+// of the conversation's classification model, so the basic classification gets the same drift rigor
 // as premium (ADR-013).
 const REASONING_MODEL = process.env.DRIFT_REASONING_MODEL_ID
   || process.env.CLASSIFIER_MODEL_ID

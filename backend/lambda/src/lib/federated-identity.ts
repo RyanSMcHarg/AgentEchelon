@@ -1,7 +1,7 @@
 // Federated identity helpers for the external-IdP credential exchange.
 //
 // The native exchange (credential-exchange.ts) keys on the Cognito `sub`: it is the
-// AppInstanceUser id AND the `sub` session tag the per-tier role pins the bearer on
+// AppInstanceUser id AND the `sub` session tag the per-classification role pins the bearer on
 // (`resources: [${appInstanceArn}/user/${aws:PrincipalTag/sub}]`). For a FOREIGN IdP
 // token, the issuer's `sub` could collide with a native sub, so we derive a disjoint,
 // charset-safe id and use it for BOTH — keeping the bearer pin semantics unchanged.
@@ -13,7 +13,7 @@
 
 import { createHash } from 'node:crypto';
 
-/** AE classification tiers, ordered lowest → highest. */
+/** AE classifications, ordered lowest → highest. */
 export type Classification = 'basic' | 'standard' | 'premium' | 'admin';
 
 const ORDER: Record<Classification, number> = { basic: 0, standard: 1, premium: 2, admin: 3 };
@@ -38,18 +38,18 @@ export function isFederatedSub(id: string): boolean {
 
 /**
  * Resolve an external IdP group claim to an AE classification — FAIL-CLOSED.
- * `groupToTier` is per-issuer deploy config; an absent/unmapped group → the lowest tier.
+ * `groupToClearance` is per-issuer deploy config; an absent/unmapped group → the lowest clearance.
  */
-export function resolveFederatedTier(
+export function resolveFederatedClearance(
   group: string | undefined,
-  groupToTier: Record<string, Classification>,
+  groupToClearance: Record<string, Classification>,
   lowest: Classification = 'basic',
 ): Classification {
   if (!group) return lowest;
-  return groupToTier[group] ?? lowest;
+  return groupToClearance[group] ?? lowest;
 }
 
-/** The effective ceiling = the LOWER of the IdP-derived tier and the channel's classification. */
-export function classificationCeiling(idpTier: Classification, channelTier: Classification): Classification {
-  return ORDER[idpTier] <= ORDER[channelTier] ? idpTier : channelTier;
+/** The effective ceiling = the LOWER of the IdP-derived clearance and the channel's classification. */
+export function classificationCeiling(idpClearance: Classification, channelClassification: Classification): Classification {
+  return ORDER[idpClearance] <= ORDER[channelClassification] ? idpClearance : channelClassification;
 }

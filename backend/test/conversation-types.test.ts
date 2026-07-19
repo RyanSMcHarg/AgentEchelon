@@ -17,15 +17,15 @@ import {
 } from '../lib/config/conversation-types';
 
 describe('conversation-types registry', () => {
-  it('ships the three tier types, each carrying a matching classification', () => {
-    for (const tier of ['basic', 'standard', 'premium'] as const) {
-      expect(CONVERSATION_TYPES[tier]).toBeDefined();
-      // type ≡ tier today: the shipped types map to the same classification.
-      expect(CONVERSATION_TYPES[tier].classification).toBe(tier);
+  it('ships the three classification types, each carrying a matching classification', () => {
+    for (const classification of ['basic', 'standard', 'premium'] as const) {
+      expect(CONVERSATION_TYPES[classification]).toBeDefined();
+      // type ≡ classification today: the shipped types map to the same classification.
+      expect(CONVERSATION_TYPES[classification].classification).toBe(classification);
     }
   });
 
-  it('has drift ON by default for every shipped type (all-tier, on-by-default)', () => {
+  it('has drift ON by default for every shipped type (all-classification, on-by-default)', () => {
     for (const key of Object.keys(CONVERSATION_TYPES)) {
       expect(CONVERSATION_TYPES[key].driftEnabled).toBe(true);
     }
@@ -37,20 +37,20 @@ describe('conversation-types registry', () => {
 });
 
 describe('resolveConversationTypeKey', () => {
-  it('prefers an explicit, registered type over the tier', () => {
-    expect(resolveConversationTypeKey({ explicitType: 'premium', tier: 'basic' })).toBe('premium');
+  it('prefers an explicit, registered type over the classification', () => {
+    expect(resolveConversationTypeKey({ explicitType: 'premium', classification: 'basic' })).toBe('premium');
   });
 
-  it('falls back to the tier when no explicit type is given (non-breaking: type ≡ tier)', () => {
-    expect(resolveConversationTypeKey({ tier: 'standard' })).toBe('standard');
+  it('falls back to the classification when no explicit type is given (non-breaking: type ≡ classification)', () => {
+    expect(resolveConversationTypeKey({ classification: 'standard' })).toBe('standard');
   });
 
   it('ignores an explicit type that is not in the registry (typo cannot silently disable policy)', () => {
-    expect(resolveConversationTypeKey({ explicitType: 'engagment', tier: 'premium' })).toBe('premium');
+    expect(resolveConversationTypeKey({ explicitType: 'engagment', classification: 'premium' })).toBe('premium');
   });
 
-  it('falls back to the default type when even the tier is unknown', () => {
-    expect(resolveConversationTypeKey({ tier: 'enterprise' })).toBe(DEFAULT_CONVERSATION_TYPE);
+  it('falls back to the default type when even the classification is unknown', () => {
+    expect(resolveConversationTypeKey({ classification: 'enterprise' })).toBe(DEFAULT_CONVERSATION_TYPE);
   });
 });
 
@@ -59,12 +59,12 @@ describe('getConversationTypeConfig / isDriftEnabledForType', () => {
     expect(getConversationTypeConfig('nope')).toBe(CONVERSATION_TYPES[DEFAULT_CONVERSATION_TYPE]);
   });
 
-  it('reports drift enabled for the shipped tier types', () => {
+  it('reports drift enabled for the shipped classification types', () => {
     expect(isDriftEnabledForType('basic')).toBe(true);
     expect(isDriftEnabledForType('premium')).toBe(true);
   });
 
-  it('honours a driftEnabled:false override (drift is a per-type property, not per-tier)', () => {
+  it('honours a driftEnabled:false override (drift is a per-type property, not per-classification)', () => {
     const original = CONVERSATION_TYPES['basic'].driftEnabled;
     try {
       CONVERSATION_TYPES['basic'].driftEnabled = false;

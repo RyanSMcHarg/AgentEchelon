@@ -17,7 +17,7 @@
  *   POST /conversations/leave          { channelArn }           - any member, self only
  *
  * Read-only enforcement is IAM on the `archived` tag (set here); see Phase 2 in
- * cognito-auth-stack.ts / agent-tier-common.ts. This handler only SETS the tag +
+ * cognito-auth-stack.ts / agent-classification-common.ts. This handler only SETS the tag +
  * removes moderators; it never blocks sends itself.
  */
 

@@ -2,7 +2,7 @@
  * Profile registry (SPEC-CAPABILITY-PROFILES §3) — the ONLY place that interprets a
  * classification tag value or maps groups to clearance. Runtime sites (channel-flow,
  * router, RAG, abuse, battle, membership-audit) migrate to read through this in Phase 1,
- * replacing hardcoded VALID_TIERS / TIER_RANK / TIER_GROUPS / minTier / isAdvancedTier.
+ * replacing hardcoded VALID_CLASSIFICATIONS / CLASSIFICATION_RANK / CLEARANCE_GROUPS / minRank / isAdvancedClassification.
  *
  * Phase 0 guarantee: constructed from DEFAULT_PROFILES_CONFIG, every method returns the
  * SAME answer the legacy constants did — proven by profile-registry.test.ts. No behavior
@@ -40,7 +40,7 @@ export class ProfileRegistry {
   /**
    * Resolve a raw tag value to a declared classification value. Primary match wins; else an
    * alias maps onto its successor classification; else fail-closed to `failClosedTo`.
-   * Legacy equivalent: `VALID_TIERS.has(tag) ? tag : 'basic'` (getChannelTier), now with aliases.
+   * Legacy equivalent: `VALID_CLASSIFICATIONS.has(tag) ? tag : 'basic'` (getChannelClassification), now with aliases.
    */
   resolveClassification(tagValue: string | null | undefined): string {
     if (tagValue) {
@@ -53,12 +53,12 @@ export class ProfileRegistry {
 
   /** True if the value is a declared classification (primary or alias). Lets callers distinguish
    *  a legitimately-floor-tagged channel from an unknown tag that fell back — preserving the
-   *  fail-closed SecurityEvent warning. Legacy equivalent: `!!TIER_RANK[tag]`. */
+   *  fail-closed SecurityEvent warning. Legacy equivalent: `!!CLASSIFICATION_RANK[tag]`. */
   isKnownClassification(value: string | null | undefined): boolean {
     return !!value && (this.byValue.has(value) || this.byAlias.has(value));
   }
 
-  /** Rank of a classification value; unknown values resolve fail-closed first. Legacy: TIER_RANK. */
+  /** Rank of a classification value; unknown values resolve fail-closed first. Legacy: CLASSIFICATION_RANK. */
   rank(classification: string): number {
     const c = this.byValue.get(classification) ?? this.byValue.get(this.config.failClosedTo)!;
     return c.rank;
@@ -66,7 +66,7 @@ export class ProfileRegistry {
 
   /**
    * The lower-privilege (lower-rank) of two classifications — the min-cap downgrade.
-   * Legacy: `minTier(a,b) = TIER_RANK[a] <= TIER_RANK[b] ? a : b` (ties return the first arg).
+   * Legacy: `minRank(a,b) = CLASSIFICATION_RANK[a] <= CLASSIFICATION_RANK[b] ? a : b` (ties return the first arg).
    */
   min(a: string, b: string): string {
     return this.rank(a) <= this.rank(b) ? a : b;
@@ -74,7 +74,7 @@ export class ProfileRegistry {
 
   /**
    * Highest classification the caller's Cognito groups clear for; fail-closed floor when none match.
-   * Legacy: resolveUserTier — highest matching tier group, default 'basic'.
+   * Legacy: resolveUserClearance — highest matching clearance group, default 'basic'.
    */
   clearanceForGroups(groups: string[]): string {
     let best = this.config.failClosedTo;
@@ -87,7 +87,7 @@ export class ProfileRegistry {
 
   /**
    * RAG scope for `contextScope: 'own-rank-and-below'`: every classification value at or below the
-   * given classification's rank, ascending by rank. Legacy: the hardcoded tierScope ladders
+   * given classification's rank, ascending by rank. Legacy: the hardcoded classificationScope ladders
    * (premium -> [basic,standard,premium], standard -> [basic,standard], basic -> [basic]).
    */
   scopeAtOrBelow(classification: string): string[] {
@@ -106,6 +106,14 @@ export class ProfileRegistry {
     return p;
   }
 
+  /** The compiled-in (seed) profile by its NAME, or undefined if none is declared. This is the
+   *  fail-closed fallback the runtime active-version resolver reverts to when the SSM definition is
+   *  absent/corrupt (SPEC-PORTABLE-VERSIONED-PROFILES §3 "fail-closed: ... falls back to the seed").
+   *  Unlike profileFor(classification), this keys on the profile name (the /assistant/{name} segment). */
+  profileByName(name: string): AssistantProfile | undefined {
+    return this.profilesByName.get(name);
+  }
+
   /** The Cognito group -> highest-classification-it-clears-for map (a copy). Group names are a
    *  deployment choice; used to create the groups and attach each to its classification's role. */
   get groupClearance(): Record<string, string> {
@@ -119,7 +127,7 @@ export class ProfileRegistry {
 
   /** The MOST-restrictive (highest-rank) classification value. Note this is the opposite end from
    *  `failClosedValue` (the lowest). RAG ingestion defaults untagged content here so it is never
-   *  exposed to a lower classification (legacy `RAG_DEFAULT_TIER='premium'`, fail-closed). */
+   *  exposed to a lower classification (legacy `RAG_DEFAULT_CLASSIFICATION='premium'`, fail-closed). */
   get mostRestrictiveValue(): string {
     return this.config.classifications.reduce((hi, c) => (c.rank > hi.rank ? c : hi)).value;
   }

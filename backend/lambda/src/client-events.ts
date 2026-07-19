@@ -21,7 +21,7 @@
  * Design notes:
  *   - Accepts a batched payload and puts to Firehose so it works in Athena mode (the default).
  *   - Events all originate post-auth, so this Lambda hard-requires Cognito claims
- *     (`event.requestContext.authorizer.claims`) and pulls userId / tier from there.
+ *     (`event.requestContext.authorizer.claims`) and pulls userId / clearance from there.
  *   - Allow-list is the relevant event slice.
  */
 
@@ -132,7 +132,7 @@ function partitionDateParts(iso: string): { year: string; month: string; day: st
 interface AuthorizedClaims {
   userId: string;
   email: string | null;
-  tier: string;
+  clearance: string;
 }
 
 function extractClaims(event: APIGatewayProxyEvent): AuthorizedClaims | null {
@@ -142,7 +142,7 @@ function extractClaims(event: APIGatewayProxyEvent): AuthorizedClaims | null {
   if (!userId) return null;
   // Group claim shape varies: 'cognito:groups' is a comma-separated string in
   // the JWT or a JSON array when the authorizer rehydrates it. Pick the most
-  // privileged tier the user holds; default to unknown.
+  // privileged clearance the user holds; default to unknown.
   const rawGroups = claims['cognito:groups'];
   let groups: string[] = [];
   if (Array.isArray(rawGroups)) {
@@ -150,9 +150,9 @@ function extractClaims(event: APIGatewayProxyEvent): AuthorizedClaims | null {
   } else if (typeof rawGroups === 'string') {
     groups = rawGroups.split(',').map((g) => g.trim()).filter(Boolean);
   }
-  const tierOrder = ['admins', 'premium', 'standard', 'basic'];
-  const tier = tierOrder.find((t) => groups.includes(t)) || 'unknown';
-  return { userId, email: claims.email ?? null, tier };
+  const classificationOrder = ['admins', 'premium', 'standard', 'basic'];
+  const clearance = classificationOrder.find((t) => groups.includes(t)) || 'unknown';
+  return { userId, email: claims.email ?? null, clearance };
 }
 
 interface NormalizedEvent {
@@ -199,7 +199,7 @@ function normalize(
         event_type: e.name,
         user_id: claims.userId,
         user_email: claims.email,
-        user_tier: claims.tier,
+        user_tier: claims.clearance,
         session_id: safeSessionId(e.sessionId),
         timestamp: ts,
         properties: props,
@@ -228,7 +228,7 @@ function normalize(
         event_type: p.metric,
         user_id: claims.userId,
         user_email: claims.email,
-        user_tier: claims.tier,
+        user_tier: claims.clearance,
         session_id: safeSessionId(p.sessionId),
         timestamp: ts,
         properties: null,

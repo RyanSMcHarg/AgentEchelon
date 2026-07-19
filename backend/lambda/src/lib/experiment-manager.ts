@@ -10,11 +10,13 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, ScanCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { createHash } from 'crypto';
-import type { BackendModelDefinition, BackendModelKey, ModelTier } from '../../../lib/config/model-strategy.js';
+import type { BackendModelDefinition, BackendModelKey, Classification } from '../../../lib/config/model-strategy.js';
 import { bedrockInvokeId } from '../../../lib/config/model-strategy.js';
 import { IMAGE_GEN_MODELS, type ImageGenModelKey } from './image-gen-models.js';
 import { intentTypeToRouteKey } from './model-resolver.js';
 import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
+import { SSMClient } from '@aws-sdk/client-ssm';
+import { lookupProfileVersionModelKey } from './profile-version-lookup.js';
 
 // removeUndefinedValues: createExperiment persists the validated record
 // directly, and validateAndSanitizeExperiment leaves optional fields
@@ -25,6 +27,10 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
 });
 const EXPERIMENTS_TABLE = process.env.EXPERIMENTS_TABLE || '';
+// SPEC-PORTABLE-VERSIONED-PROFILES §6: a profileRef variant resolves its model from the referenced
+// profile version's SSM definition. Own client (like the ddb one above); read-only + fail-safe.
+const ssmClient = new SSMClient({});
+const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
 
 // ============================================================
 // Types
@@ -32,7 +38,16 @@ const EXPERIMENTS_TABLE = process.env.EXPERIMENTS_TABLE || '';
 
 export interface ExperimentVariant {
   variantId: string;
-  modelKey: BackendModelKey;
+  /** The model this variant runs. MUTUALLY EXCLUSIVE with `profileRef` (validated) — a variant
+   *  varies either a bare model (+ optional prompt-addendum) OR an entire profile version, not both. */
+  modelKey?: BackendModelKey;
+  /**
+   * SPEC-PORTABLE-VERSIONED-PROFILES §6: run an ENTIRE profile version as the variant. The variant's
+   * model (and, once the AssistantConfig unification lands, its prompt/pack/tools/guardrail) come from
+   * that version's definition. Resolved at runtime via lookupProfileVersionModelKey. Mutually exclusive
+   * with `modelKey`.
+   */
+  profileRef?: { profileName: string; version?: number };
   weight: number; // 0-100, all variants should sum to 100
   /** Display name surfaced to users + in the rival prompt during a battle. Required when the parent experiment.battleEnabled is true. Max ~16 chars. */
   displayName?: string;
@@ -47,7 +62,7 @@ export interface ExperimentVariant {
    * iff BOTH variants set it (validated both-or-neither). Locked #1's
    * recommended config is `titan_image` vs `nova_canvas` — a genuine
    * head-to-head. Kept off `modelKey` deliberately (locked #2: image
-   * models are NOT `BackendModelKey`s — no resolver/tier/token ripple).
+   * models are NOT `BackendModelKey`s — no resolver/classification/token ripple).
    */
   imageGenModelKey?: ImageGenModelKey;
 }
@@ -70,7 +85,7 @@ export interface ExperimentObjective {
  * Absent ⇒ 'intent', so every record with no type is an intent experiment and behavior
  * is unchanged. All three types resolve: 'intent' and 'base_model' via
  * `resolveExperimentModel` (an intent-specific experiment wins; 'base_model' applies to
- * any intent on the tier), and 'classification' via `resolveClassificationExperiment`
+ * any intent on the classification), and 'classification' via `resolveClassificationExperiment`
  * (it swaps the intent-classifier model).
  */
 export type ExperimentType = 'intent' | 'base_model' | 'classification';
@@ -81,7 +96,7 @@ export interface Experiment {
   /** Defaults to 'intent' when absent. */
   experimentType?: ExperimentType;
   intent: string;
-  tiers: ModelTier[];
+  tiers: Classification[];
   variants: ExperimentVariant[];
   startDate: string;
   endDate?: string;
@@ -195,24 +210,24 @@ export function assignVariant(experimentId: string, channelArn: string, variants
 // ============================================================
 
 /**
- * Find an active experiment matching this tier + intent, assign a variant,
+ * Find an active experiment matching this classification + intent, assign a variant,
  * and return the model to use. Returns null if no experiment applies.
  */
 export async function resolveExperimentModel(
-  tier: ModelTier,
+  classification: Classification,
   intent: string,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
 ): Promise<ExperimentResolution | null> {
   const experiments = await loadExperiments();
   const now = new Date();
-  const isLiveForTier = (exp: Experiment): boolean =>
+  const isLiveForClassification = (exp: Experiment): boolean =>
     exp.status === 'active' &&
-    exp.tiers.includes(tier) &&
+    exp.tiers.includes(classification) &&
     (!exp.endDate || new Date(exp.endDate) > now);
 
   // Resolution order: an intent-specific experiment wins over a base-model
-  // experiment when both apply. A base-model experiment swaps the tier default
+  // experiment when both apply. A base-model experiment swaps the classification default
   // for ANY intent (no intent match). Absent type ⇒ 'intent', so existing
   // behavior is unchanged when no
   // base-model experiments exist. Classification experiments resolve separately
@@ -226,26 +241,26 @@ export async function resolveExperimentModel(
   const routeKey = intentTypeToRouteKey(intent);
   const experiment =
     experiments.find(
-      (exp) => (exp.experimentType ?? 'intent') === 'intent' && exp.intent === routeKey && isLiveForTier(exp),
+      (exp) => (exp.experimentType ?? 'intent') === 'intent' && exp.intent === routeKey && isLiveForClassification(exp),
     ) ??
-    experiments.find((exp) => exp.experimentType === 'base_model' && isLiveForTier(exp));
+    experiments.find((exp) => exp.experimentType === 'base_model' && isLiveForClassification(exp));
 
   if (!experiment) return null;
 
-  return resolveVariantForTier(experiment, tier, channelArn, catalog);
+  return resolveVariantForProfile(experiment, classification, channelArn, catalog);
 }
 
 /**
- * Resolve a classification A/B experiment for this tier.
+ * Resolve a classification A/B experiment for this classification.
  * Classification experiments swap the intent-classifier model and are
- * intent-agnostic, so this matches on type + tier only. Returns the resolved
+ * intent-agnostic, so this matches on type + classification only. Returns the resolved
  * classifier model, or null when no classification experiment applies. Called
  * by the router BEFORE classifyIntent; the §11.1 mutual-exclusion rule
  * guarantees a classification experiment never coexists with another type on
- * the tier, so this resolution and resolveExperimentModel never both fire.
+ * the classification, so this resolution and resolveExperimentModel never both fire.
  */
 export async function resolveClassificationExperiment(
-  tier: ModelTier,
+  classification: Classification,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
 ): Promise<ExperimentResolution | null> {
@@ -255,42 +270,66 @@ export async function resolveClassificationExperiment(
     (exp) =>
       exp.experimentType === 'classification' &&
       exp.status === 'active' &&
-      exp.tiers.includes(tier) &&
+      exp.tiers.includes(classification) &&
       (!exp.endDate || new Date(exp.endDate) > now),
   );
   if (!experiment) return null;
-  return resolveVariantForTier(experiment, tier, channelArn, catalog);
+  return resolveVariantForProfile(experiment, classification, channelArn, catalog);
 }
 
 /**
  * Shared tail for experiment resolution: deterministically assign a variant,
- * look up its catalog model, enforce tier safety, and return the invoke id.
- * Returns null on an unknown model key or a tier-disallowed model.
+ * look up its catalog model, enforce classification safety, and return the invoke id.
+ * Returns null on an unknown model key or a classification-disallowed model.
  */
-function resolveVariantForTier(
+/**
+ * The model a variant runs: its `modelKey`, or — for a profileRef variant (§6) — the referenced profile
+ * version's modelKey, read from SSM at runtime. null when neither resolves (fail-safe: the caller skips).
+ */
+async function effectiveModelKeyOf(variant: ExperimentVariant): Promise<BackendModelKey | null> {
+  if (variant.profileRef) {
+    const mk = await lookupProfileVersionModelKey(ssmClient, SSM_ROOT, variant.profileRef);
+    if (!mk) {
+      console.warn(`[ExperimentManager] profileRef ${variant.profileRef.profileName}@${variant.profileRef.version ?? 'active'} unresolved`);
+      return null;
+    }
+    return mk as BackendModelKey;
+  }
+  return variant.modelKey ?? null;
+}
+
+async function resolveVariantForProfile(
   experiment: Experiment,
-  tier: ModelTier,
+  classification: Classification,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
-): ExperimentResolution | null {
+): Promise<ExperimentResolution | null> {
   const variant = assignVariant(experiment.experimentId, channelArn, experiment.variants);
-  const model = catalog[variant.modelKey];
 
-  if (!model) {
-    console.error(`[ExperimentManager] Unknown model key in experiment: ${variant.modelKey}`);
+  // §6: a profileRef variant runs an entire profile version — its model comes from that version's
+  // definition. Fail-safe: an unresolvable variant skips the experiment (deterministic default holds).
+  const effectiveModelKey = await effectiveModelKeyOf(variant);
+  if (!effectiveModelKey) {
+    console.error('[ExperimentManager] variant has neither modelKey nor a resolvable profileRef; skipping');
     return null;
   }
 
-  // Enforce tier safety — experiment can't assign a model not allowed for this tier
-  if (!model.allowedTiers.includes(tier)) {
-    console.warn(`[ExperimentManager] Model ${variant.modelKey} not allowed for tier ${tier}, skipping experiment`);
+  const model = catalog[effectiveModelKey];
+  if (!model) {
+    console.error(`[ExperimentManager] Unknown model key in experiment: ${effectiveModelKey}`);
+    return null;
+  }
+
+  // Classification ceiling still binds — a version can never exceed the channel's classification (§6, min-cap).
+  if (!model.allowedClassifications.includes(classification)) {
+    console.warn(`[ExperimentManager] Model ${effectiveModelKey} not allowed for classification ${classification}, skipping experiment`);
     return null;
   }
 
   return {
     experimentId: experiment.experimentId,
     variantId: variant.variantId,
-    modelKey: variant.modelKey,
+    modelKey: effectiveModelKey,
     bedrockModelId: bedrockInvokeId(model),
   };
 }
@@ -470,16 +509,21 @@ export function validateAndSanitizeExperiment(input: Experiment): Experiment {
     systemPromptAddendum: sanitizePromptAddendum(v.systemPromptAddendum),
   }));
 
-  // Every resolution path (resolveVariantForTier + the battle resolvers) keys the
-  // catalog by `modelKey` (a short key like 'haiku'/'sonnet'), so a missing modelKey
-  // resolves to catalog[undefined] → null and the experiment silently never assigns.
-  // Reject it at create time (400) instead of producing a mystery 0-row result.
+  // Each variant runs EITHER a bare model OR an entire profile version (SPEC-PORTABLE-VERSIONED-PROFILES
+  // §6) — exactly one of modelKey / profileRef, never both, never neither. A bare modelKey is a catalog
+  // key ('haiku'/'sonnet'); a profileRef {profileName, version?} runs that version's definition. Reject a
+  // mis-specified variant at create time (400) instead of producing a mystery 0-row result.
   variants.forEach((v, i) => {
-    if (typeof v.modelKey !== 'string' || !v.modelKey.trim()) {
+    const hasModel = typeof v.modelKey === 'string' && v.modelKey.trim().length > 0;
+    const hasRef = !!v.profileRef && typeof v.profileRef.profileName === 'string' && v.profileRef.profileName.trim().length > 0;
+    if (hasModel === hasRef) {
       throw new ExperimentValidationError(
-        `variant index ${i} requires a non-empty modelKey (a catalog key such as 'haiku'/'sonnet', not a Bedrock model id)`,
+        `variant index ${i} requires EXACTLY ONE of modelKey (a catalog key like 'haiku'/'sonnet') or profileRef {profileName, version?} — not both, not neither`,
         'VARIANT_MODEL_KEY_REQUIRED',
       );
+    }
+    if (hasRef && v.profileRef!.version !== undefined && (!Number.isInteger(v.profileRef!.version) || v.profileRef!.version < 1)) {
+      throw new ExperimentValidationError(`variant index ${i} profileRef.version must be a positive integer (omit for the active version)`, 'VARIANT_PROFILE_REF_VERSION');
     }
   });
 
@@ -505,19 +549,21 @@ export function validateAndSanitizeExperiment(input: Experiment): Experiment {
   const objective = validateObjective(input.objective, experimentType);
 
   if (input.battleEnabled) {
-    // Battle eligibility is a per-profile flag (`AssistantProfile.battleEligible`, config) — the
-    // source of truth for which classifications may run a battle (premium-only by default). A
-    // battle-enabled experiment must target exactly ONE battle-eligible classification — never a
-    // mixed set — so it can never arm a battle on an ineligible channel. (Error
-    // code kept as BATTLE_TIER_PREMIUM_ONLY for the API/UI contract; with the
-    // default premium-only config this is exactly the old premium-only guard.)
+    // A battle runs head-to-head in ONE channel, so it must target exactly one classification — never a
+    // mixed set (structural). But `battleEligible` is now a HINT, not a gate (SPEC-PORTABLE-VERSIONED-
+    // PROFILES §1/§6): an OPERATOR-driven comparison may battle any profile/version at any classification.
+    // The classification CEILING still binds — resolveVariantForProfile rejects a model not allowed for
+    // the channel's classification (min-cap) — so allowing a non-"battleEligible" target never escalates.
+    // (Error code kept as BATTLE_TIER_PREMIUM_ONLY for the API/UI contract.)
     const tiers = input.tiers || [];
-    if (tiers.length !== 1 || !profiles.profileFor(tiers[0]).battleEligible) {
+    if (tiers.length !== 1) {
       throw new ExperimentValidationError(
-        `battleEnabled experiments must target exactly one battle-eligible classification `
-          + `(got [${tiers.join(', ')}])`,
+        `battleEnabled experiments must target exactly one classification (got [${tiers.join(', ')}])`,
         'BATTLE_TIER_PREMIUM_ONLY',
       );
+    }
+    if (!profiles.profileFor(tiers[0]).battleEligible) {
+      console.log('[ExperimentManager] operator-driven battle on a non-battleEligible classification (battleEligible is now a hint):', tiers[0]);
     }
     if (variants.length !== 2) {
       throw new ExperimentValidationError(
@@ -620,16 +666,16 @@ export function validateObjective(
 
 /**
  * Mutual-exclusion rule: a classification
- * experiment cannot be active on a tier while any other type is active on that
- * tier, and vice versa — changing the classifier shifts routing for every
+ * experiment cannot be active on a classification while any other type is active on that
+ * classification, and vice versa — changing the classifier shifts routing for every
  * intent and confounds the other tests. Returns the active experiments that
- * conflict with the candidate over any shared tier (empty ⇒ no conflict).
+ * conflict with the candidate over any shared classification (empty ⇒ no conflict).
  * DB-backed (mirrors findBattleSlotConflicts); the admin write path calls it
  * and converts a non-empty result to 409.
  */
 export async function findTypeExclusionConflicts(args: {
   experimentType: ExperimentType;
-  tiers: ModelTier[];
+  tiers: Classification[];
   excludeExperimentId?: string;
 }): Promise<Experiment[]> {
   const candidateType = args.experimentType ?? 'intent';
@@ -639,8 +685,8 @@ export async function findTypeExclusionConflicts(args: {
     if (e.status !== 'active') return false;
     if (e.experimentId === args.excludeExperimentId) return false;
     const otherType = e.experimentType ?? 'intent';
-    const sharesTier = (e.tiers || []).some((t) => tiers.has(t));
-    if (!sharesTier) return false;
+    const sharesClassification = (e.tiers || []).some((t) => tiers.has(t));
+    if (!sharesClassification) return false;
     // Conflict iff exactly one side is a classification experiment.
     return (candidateType === 'classification') !== (otherType === 'classification');
   });
@@ -673,10 +719,12 @@ export async function resolveBattleVariantBySlotArn(
   // variants[0] = control (default bot); variants[1] = treatment (alt slot).
   const treatment = exp.variants[1];
   if (!treatment) return null;
+  const treatmentModelKey = await effectiveModelKeyOf(treatment); // §6: resolves a profileRef variant
+  if (!treatmentModelKey) return null;
   return {
     experimentId: exp.experimentId,
     variantId: treatment.variantId,
-    modelKey: treatment.modelKey,
+    modelKey: treatmentModelKey,
     displayName: treatment.displayName ?? treatment.variantId,
     systemPromptAddendum: treatment.systemPromptAddendum,
     longFormMode: exp.longFormMode,
@@ -693,7 +741,7 @@ export async function resolveBattleVariantBySlotArn(
  * displayName + addendum) makes `/battle` a faithful head-to-head of
  * the two configured variants — the Design Anchor in SPEC-BATTLE.md.
  * This generalizes the older SPEC-BATTLE §413 ("control = normal
- * tier+intent resolution"): callers fall back to tier+intent resolution
+ * classification+intent resolution"): callers fall back to classification+intent resolution
  * only when there is no bound experiment or it pins no control modelKey
  * (treated as `null` here → caller keeps its existing default).
  *
@@ -720,10 +768,12 @@ export async function resolveBattleControlVariantByAltSlotArn(
   // variants[0] = control (default bot); variants[1] = treatment (alt slot).
   const control = exp.variants[0];
   if (!control) return null;
+  const controlModelKey = await effectiveModelKeyOf(control); // §6: resolves a profileRef variant
+  if (!controlModelKey) return null;
   return {
     experimentId: exp.experimentId,
     variantId: control.variantId,
-    modelKey: control.modelKey,
+    modelKey: controlModelKey,
     displayName: control.displayName ?? control.variantId,
     systemPromptAddendum: control.systemPromptAddendum,
     longFormMode: exp.longFormMode,

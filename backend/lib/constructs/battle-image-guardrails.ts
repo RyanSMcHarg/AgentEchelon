@@ -22,7 +22,7 @@
 import * as cdk from 'aws-cdk-lib';
 import * as bedrock from 'aws-cdk-lib/aws-bedrock';
 import { Construct } from 'constructs';
-import { RES_PREFIX } from '../stacks/agent-tier-common';
+import { RES_PREFIX } from '../stacks/agent-classification-common';
 
 export interface BattleImageGuardrailsProps {
   /** Descriptive name for the guardrail. */

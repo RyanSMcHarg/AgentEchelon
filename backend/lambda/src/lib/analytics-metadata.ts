@@ -18,7 +18,7 @@ export type AgentType = 'basic' | 'standard' | 'premium';
  * must be able to filter battle invocations BEFORE per-variant
  * aggregation. See docs/SPEC-BATTLE.md §Analytics.
  *
- * - 'deterministic': the model came straight from tier+intent resolution (no experiment, no battle).
+ * - 'deterministic': the model came straight from classification+intent resolution (no experiment, no battle).
  *   This is the normal case on a deployment that runs no experiments.
  * - 'probabilistic': an active experiment (router resolveExperimentModel → experimentId) assigned it.
  * - 'battle': a /battle turn.

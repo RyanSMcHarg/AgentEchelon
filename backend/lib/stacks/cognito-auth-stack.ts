@@ -13,9 +13,9 @@ import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
 import {
-  tierChannelScopedAllow,
+  classificationChannelScopedAllow,
   archivedChannelReadOnlyDeny,
-  Tier,
+  Classification,
   SSM_ROOT,
   STACK_PREFIX,
   RES_PREFIX,
@@ -24,7 +24,7 @@ import {
   ANALYTICS_DB_NAME,
   INSTANCE_SSM,
   SHARED_SSM,
-} from './agent-tier-common';
+} from './agent-classification-common';
 import { defaultProfileRegistry as profiles } from '../profile-registry';
 
 export interface CognitoAuthStackProps extends cdk.StackProps {
@@ -48,13 +48,13 @@ export class CognitoAuthStack extends cdk.Stack {
     super(scope, id, props);
 
     // ============================================================
-    // Tier groups (basic / standard / premium / admins)
+    // Clearance groups (basic / standard / premium / admins)
     //
     // The app treats Cognito group membership — NOT the custom:tier
     // attribute — as the authoritative signal for what a user is
     // allowed to do. custom:tier is set by the admin UI as a hint,
     // and a sync step (post-confirmation + user-management) mirrors
-    // it into the matching group. Defense in depth: tier checks in
+    // it into the matching group. Defense in depth: clearance checks in
     // create-conversation, share-conversation, and router-agent-
     // handler all look up groups, not the attribute.
     //
@@ -126,10 +126,10 @@ export class CognitoAuthStack extends cdk.Stack {
       })),
     ];
 
-    // Captured so the per-tier authenticated IAM roles (created after the
+    // Captured so the per-classification authenticated IAM roles (created after the
     // Identity Pool below) can be attached to each group via `roleArn` —
-    // Token-based role selection then hands each user their tier's role.
-    const tierGroupResources: Record<string, cognito.CfnUserPoolGroup> = {};
+    // Token-based role selection then hands each user their clearance group's role.
+    const clearanceGroupResources: Record<string, cognito.CfnUserPoolGroup> = {};
     for (const g of groupDefinitions) {
       // Logical ID must match the deployed name ({name}Group) so
       // CloudFormation adopts existing resources in place instead of trying
@@ -142,7 +142,7 @@ export class CognitoAuthStack extends cdk.Stack {
       });
       // Groups must be created after the user pool itself
       groupResource.addDependency(this.userPool.node.defaultChild as cognito.CfnUserPool);
-      tierGroupResources[g.name] = groupResource;
+      clearanceGroupResources[g.name] = groupResource;
     }
 
     // Create IAM role for Lambda functions with wildcard permissions to avoid circular dependency
@@ -305,20 +305,20 @@ export class CognitoAuthStack extends cdk.Stack {
     });
 
     // ============================================================
-    // Per-tier authenticated IAM roles (SPEC-CONVERSATION-SECURITY Layer 1,
-    // user-side). One IAM role PER tier group, selected by
+    // Per-classification authenticated IAM roles (SPEC-CONVERSATION-SECURITY Layer 1,
+    // user-side). One IAM role per classification (attached to its Cognito group), selected by
     // Cognito Token-based role mapping on the authoritative `cognito:groups`
     // claim (NOT the user-writable `custom:tier` attribute). Each role grants
-    // the SAME Chime base permissions (tier isolation is NOT achieved by
+    // the SAME Chime base permissions (classification isolation is NOT achieved by
     // withholding base messaging — it's achieved by the channel-tag Deny
     // below + the app-layer create/share gates), then layers a pure-IAM Deny
-    // on channels tagged with a HIGHER tier's `classification`. So a basic
+    // on channels tagged with a HIGHER `classification`. So a basic
     // user's own credentials physically cannot SendChannelMessage / join /
     // read a premium-tagged channel — enforced by IAM before any app logic.
     //
-    // Safe-by-construction: legitimate same-or-lower-tier access is a strict
+    // Safe-by-construction: legitimate same-or-lower-classification access is a strict
     // superset of the old single-role behaviour; the only new restriction is
-    // cross-tier, which the live app layer (Layers 2-3) already blocked.
+    // cross-classification, which the live app layer (Layers 2-3) already blocked.
     // ============================================================
     const authTrust = new iam.FederatedPrincipal(
       'cognito-identity.amazonaws.com',
@@ -348,7 +348,7 @@ export class CognitoAuthStack extends cdk.Stack {
     // `VITE_CREDENTIAL_EXCHANGE_API_URL` is REQUIRED — there is no Identity-Pool
     // Chime fallback. `AuthenticatedRole` keeps its logical id (adopted in place)
     // and doubles as the ambiguous-role fallback.
-    const makeTierRole = (logicalId: string): iam.Role =>
+    const makeClassificationRole = (logicalId: string): iam.Role =>
       new iam.Role(this, logicalId, { assumedBy: authTrust });
 
     // One Identity-Pool role per classification (+ admin). They are structurally identical (auth
@@ -359,17 +359,17 @@ export class CognitoAuthStack extends cdk.Stack {
     const classificationRoles: Record<string, iam.Role> = {};
     for (const c of profiles.classificationValues()) {
       const logicalId = c === profiles.failClosedValue ? 'AuthenticatedRole' : `${capitalize(c)}AuthenticatedRole`;
-      classificationRoles[c] = makeTierRole(logicalId);
+      classificationRoles[c] = makeClassificationRole(logicalId);
     }
     this.authenticatedRole = classificationRoles[profiles.failClosedValue];
-    const adminAuthRole = makeTierRole('AdminAuthenticatedRole');
+    const adminAuthRole = makeClassificationRole('AdminAuthenticatedRole');
 
     // Attach each group to its classification's role so the ID token carries `cognito:preferred_role`
     // (lowest-precedence group with a roleArn wins); admins -> the admin role.
     for (const [group, classification] of Object.entries(clearance)) {
-      tierGroupResources[group].roleArn = classificationRoles[classification].roleArn;
+      clearanceGroupResources[group].roleArn = classificationRoles[classification].roleArn;
     }
-    tierGroupResources['admins'].roleArn = adminAuthRole.roleArn;
+    clearanceGroupResources['admins'].roleArn = adminAuthRole.roleArn;
 
     // Token-based role selection: the Identity Pool hands each authenticated
     // user the role from their group's roleArn; ambiguous/absent → the default
@@ -429,7 +429,7 @@ export class CognitoAuthStack extends cdk.Stack {
       'chime:CreateChannelMembership', 'chime:DeleteChannelMembership', 'chime:CreateChannelModerator',
       'chime:UpdateChannel', 'chime:DeleteChannel',
     ];
-    type Rung = 'restricted' | Tier | 'admin';
+    type Rung = 'restricted' | Classification | 'admin';
 
     // Grant the bearer-PINNED, minimal permission set for a rung
     // (docs/SPEC-CREDENTIAL-EXCHANGE.md §5a restriction spectrum). Every rung is
@@ -449,7 +449,7 @@ export class CognitoAuthStack extends cdk.Stack {
       // Channel messaging — bearer pinned in both halves.
       if (rung === 'restricted' || rung === 'admin') {
         // restricted: scoped by ADMISSION (member of one channel; Chime enforces
-        // membership). admin: cross-tier. Both: no classification tag condition.
+        // membership). admin: cross-classification. Both: no classification tag condition.
         role.addToPolicy(new iam.PolicyStatement({
           effect: iam.Effect.ALLOW,
           actions: EXCHANGE_MSG_ACTIONS,
@@ -462,20 +462,20 @@ export class CognitoAuthStack extends cdk.Stack {
         }));
         // SPEC-CONVERSATION-ARCHIVE (ADR-017): archived channels are read-only for
         // every CHAT-plane identity — including the admin's own chat identity here
-        // (the tier rungs get this Deny via tierChannelScopedAllow). The exemption is
+        // (the classification rungs get this Deny via classificationChannelScopedAllow). The exemption is
         // the SEPARATE admin-PLANE role (`exchangeRoleAdminPlane`, built directly, not
         // via this helper) + the app-instance-admin bearer the archive Lambda uses; a
         // Deny is global for the principal, so scoping it to `archived=true` leaves
         // every non-archived channel untouched.
         role.addToPolicy(archivedChannelReadOnlyDeny(props.appInstanceArn));
-        // NOTE: the admin rung is the admin's CHAT identity — cross-tier messaging pinned
+        // NOTE: the admin rung is the admin's CHAT identity — cross-classification messaging pinned
         // to `${sub}`, and NEVER an app-instance-admin. The moderation ceiling lives on the
         // SEPARATE admin-plane role (pinned to `${sub}-admin`) below, so a chat cred can
         // never carry moderation authority nor read a channel the admin is not a member of.
       } else {
-        // basic/standard/premium: tag-gated channel (≤ tier) + pinned bearer —
+        // basic/standard/premium: tag-gated channel (≤ classification) + pinned bearer —
         // the SAME fail-closed boundary, with the bearer now pinned.
-        for (const s of tierChannelScopedAllow(rung, props.appInstanceArn, EXCHANGE_MSG_ACTIONS, {
+        for (const s of classificationChannelScopedAllow(rung, props.appInstanceArn, EXCHANGE_MSG_ACTIONS, {
           bearerResources: [PINNED_USER_ARN],
         })) role.addToPolicy(s);
       }
@@ -1089,9 +1089,9 @@ export class CognitoAuthStack extends cdk.Stack {
       exportName: `${this.stackName}-UserPoolId`,
     });
 
-    // Shared SSM contract: the per-tier handlers (router code deployed per-tier)
-    // resolve this for message-time tier enforcement (AdminListGroupsForUser).
-    // Published here so the per-tier stacks can resolve it without a deploy-order
+    // Shared SSM contract: the per-classification handlers (router code deployed per-classification)
+    // resolve this for message-time classification enforcement (AdminListGroupsForUser).
+    // Published here so the per-classification stacks can resolve it without a deploy-order
     // cycle.
     new ssm.StringParameter(this, 'SharedCognitoUserPoolIdParam', {
       parameterName: SHARED_SSM.cognitoUserPoolId,

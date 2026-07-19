@@ -10,12 +10,12 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
-import { SSM_ROOT, SHARED_SSM, CHANNEL_FLOW_ARN_SSM_KEY, INSTANCE_SSM } from './agent-tier-common';
+import { SSM_ROOT, SHARED_SSM, CHANNEL_FLOW_ARN_SSM_KEY, INSTANCE_SSM } from './agent-classification-common';
 import { getConversationTypeConfig, DEFAULT_CONVERSATION_TYPE } from '../config/conversation-types';
 
 export interface FoundationsStackProps extends cdk.StackProps {
   appInstanceArn: string;
-  /** User Pool ID for the create-conversation tier gate. */
+  /** User Pool ID for the create-conversation classification gate. */
   userPoolId: string;
 }
 
@@ -24,17 +24,17 @@ export interface FoundationsStackProps extends cdk.StackProps {
  * plane the rest of the platform is built on. Owns the task-tracking tables
  * (`agent-tasks` + `user-tasks`) + the create-conversation / add-agent API, and
  * publishes their shared SSM contract. It hosts no bot — it's the foundation the
- * feature stacks build on: /battle in AgentEchelonBattle, the per-tier assistants
- * in AgentEchelonTier-*, and experiments in AgentEchelonExperiments.
+ * feature stacks build on: /battle in AgentEchelonBattle, the per-classification assistants
+ * in AgentEchelonClassification-*, and experiments in AgentEchelonExperiments.
  */
 export class FoundationsStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: FoundationsStackProps) {
     super(scope, id, props);
 
-    // Per-tier company-context S3 scoping + per-tier model selection live in the
-    // AgentEchelonTier-* stacks alongside the processors (ADR-011).
+    // Per-classification company-context S3 scoping + per-classification model selection live in the
+    // AgentEchelonClassification-* stacks alongside the processors (ADR-011).
 
-    // Every tier owns its own Lex + AppInstanceBot + router (AgentEchelonTier-*),
+    // Every classification owns its own Lex + AppInstanceBot + router (AgentEchelonClassification-*),
     // /battle owns its alt-slot Lex (AgentEchelonBattle), and experiments live in
     // AgentEchelonExperiments — so there is no shared Lex/AppInstanceBot/router here.
 
@@ -103,10 +103,10 @@ export class FoundationsStack extends cdk.Stack {
     // battle-OWNED Lex, so this stack needs no shared Lex/router.
 
     // ============================================================
-    // Shared SSM contract for the per-tier stacks (SPEC-PER-TIER-OWNERSHIP.md).
-    // AgentEchelonTier-{Standard,Premium} resolve these at DEPLOY time via
+    // Shared SSM contract for the per-classification stacks (SPEC-PER-TIER-OWNERSHIP.md).
+    // AgentEchelonClassification-{Standard,Premium} resolve these at DEPLOY time via
     // valueForStringParameter (an SSM dynamic ref, NOT Fn::importValue), so a
-    // tier deploys decoupled from this stack while still pointing at the shared
+    // classification deploys decoupled from this stack while still pointing at the shared
     // TASK tables. The experiments SSM keys are published by AgentEchelonExperiments
     // and the /battle SSM keys by the opt-in AgentEchelonBattle stack.
     // ============================================================
@@ -137,9 +137,9 @@ export class FoundationsStack extends cdk.Stack {
             new iam.PolicyStatement({
               // DescribeChannelMembership verifies the caller is a member of the
               // target channel before adding the bot. ListTagsForResource reads the
-              // channel's enforced tier from the IMMUTABLE `classification` tag (not
-              // mutable metadata) so we bind THAT tier's assistant and a moderator
-              // cannot tamper metadata to attract a higher-tier bot. DescribeChannel
+              // channel's enforced classification from the IMMUTABLE `classification` tag (not
+              // mutable metadata) so we bind THAT classification's assistant and a moderator
+              // cannot tamper metadata to attract a higher-classification bot. DescribeChannel
               // remains for the membership/name reads.
               actions: [
                 'chime:CreateChannelMembership',
@@ -156,9 +156,9 @@ export class FoundationsStack extends cdk.Stack {
           statements: [
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
-              // Per-tier AppInstanceBot ARNs published by the AgentEchelonTier-*
-              // stacks; add-agent binds the channel's own-tier assistant. No
-              // shared cross-tier bot.
+              // Per-classification AppInstanceBot ARNs published by the AgentEchelonClassification-*
+              // stacks; add-agent binds the channel's own-classification assistant. No
+              // shared cross-classification bot.
               resources: [
                 `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
@@ -248,7 +248,7 @@ export class FoundationsStack extends cdk.Stack {
                 // welcome as a real bot message via SendChannelMessage.
                 'chime:SendChannelMessage',
                 // SPEC-CONVERSATION-SECURITY Layer 1: tag every channel
-                // `classification=<tier>` at creation. CreateChannel with Tags
+                // `classification=<classification>` at creation. CreateChannel with Tags
                 // requires chime:TagResource on the new channel resource.
                 'chime:TagResource',
                 // Conversation archive (SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP):
@@ -262,7 +262,7 @@ export class FoundationsStack extends cdk.Stack {
           ],
         }),
         // Haiku 3 is the cheapest available model and is universally
-        // tier-permitted; we use it both for the contextual welcome
+        // classification-permitted; we use it both for the contextual welcome
         // (topic-seeded creates) and as a fallback.
         BedrockPolicy: new iam.PolicyDocument({
           statements: [
@@ -280,17 +280,17 @@ export class FoundationsStack extends cdk.Stack {
               actions: ['ssm:GetParameter'],
               resources: [
                 channelFlowArnParamArn,
-                // Per-tier AppInstanceBot ARNs published by the AgentEchelonTier-*
-                // stacks; create-conversation adds the right tier bot to a new
-                // channel. No shared cross-tier bot — a missing per-tier key
+                // Per-classification AppInstanceBot ARNs published by the AgentEchelonClassification-*
+                // stacks; create-conversation adds the right classification bot to a new
+                // channel. No shared cross-classification bot — a missing per-classification key
                 // is an error, not a silent fallback.
                 `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
               ],
             }),
           ],
         }),
-        // Tier gate reads the creator's tier from the validated `cognito:groups` JWT
-        // claim (see create-conversation/index.js), so no cognito-idp:AdminListGroupsForUser
+        // The create-conversation gate reads the creator's clearance from the validated
+        // `cognito:groups` JWT claim (see create-conversation/index.js), so no cognito-idp:AdminListGroupsForUser
         // grant is needed here.
       },
       managedPolicies: [

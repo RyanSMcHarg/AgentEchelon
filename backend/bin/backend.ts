@@ -8,9 +8,9 @@ import { AnalyticsStack } from '../lib/stacks/analytics-stack';
 import { AnalyticsStackAurora } from '../lib/stacks/analytics-stack-aurora';
 import { IAnalyticsStackOutputs } from '../lib/interfaces/analytics-stack-interface';
 import { NotificationStack } from '../lib/stacks/notification-stack';
-import { BasicTierStack } from '../lib/stacks/basic-tier-stack';
-import { StandardTierStack } from '../lib/stacks/standard-tier-stack';
-import { PremiumTierStack } from '../lib/stacks/premium-tier-stack';
+import { BasicClassificationStack } from '../lib/stacks/basic-classification-stack';
+import { StandardClassificationStack } from '../lib/stacks/standard-classification-stack';
+import { PremiumClassificationStack } from '../lib/stacks/premium-classification-stack';
 import { ChannelFlowStack } from '../lib/stacks/channel-flow-stack';
 import { BattleStack } from '../lib/stacks/battle-stack';
 import { ExperimentsStack } from '../lib/stacks/experiments-stack';
@@ -19,8 +19,8 @@ import {
   STACK_PREFIX,
   APP_INSTANCE_NAME,
   INSTANCE_NAME,
-} from '../lib/stacks/agent-tier-common';
-import { getModelCatalog, parseTierModelSelection } from '../lib/config/model-strategy';
+} from '../lib/stacks/agent-classification-common';
+import { getModelCatalog, parseProfileModelSelection } from '../lib/config/model-strategy';
 import { DEFAULT_PROFILES_CONFIG, validateProfilesConfig } from '../lib/config/profiles';
 import { applyStandardTags } from '../lib/tagging';
 
@@ -165,7 +165,7 @@ const wafRateLimitCtx = app.node.tryGetContext('wafRateLimit');
 const wafRateLimit = wafRateLimitCtx ? Number(wafRateLimitCtx) : undefined;
 const wafAllowedIps = parseWafAllowedIps(app.node.tryGetContext('wafAllowedIps'));
 const modelCatalog = getModelCatalog(env.region, env.account ?? '');
-const tierModelSelection = parseTierModelSelection({
+const profileModelSelection = parseProfileModelSelection({
   basic: app.node.tryGetContext('basicModelKey') || process.env.BASIC_MODEL_KEY,
   standard: app.node.tryGetContext('standardModelKey') || process.env.STANDARD_MODEL_KEY,
   premium: app.node.tryGetContext('premiumModelKey') || process.env.PREMIUM_MODEL_KEY,
@@ -303,7 +303,7 @@ const s3Stack = new S3StorageStack(app, `${STACK_PREFIX}S3Storage`, {
 });
 
 // 5. Foundations Stack — the shared task data plane + create-conversation/add-agent.
-// It hosts no bot; the assistants live in the per-tier AgentEchelonTier-* stacks,
+// It hosts no bot; the assistants live in the per-tier AgentEchelonClassification-* stacks,
 // /battle in AgentEchelonBattle, and experiments in AgentEchelonExperiments.
 //
 // NOTE: live-drift (Aurora pgvector) runs in the per-tier user-message path for
@@ -344,7 +344,7 @@ const notificationStack = new NotificationStack(app, `${STACK_PREFIX}Notificatio
 // 7. (removed) The per-tier IAMPolicies stack was inert scaffolding — its policies gated on
 // aws:PrincipalTag/tier (never populated) with a non-IAM `chime-sdk-messaging:` action prefix, and
 // were attached to no principal. The LIVE Layer-1 boundary is aws:ResourceTag/classification on the
-// per-tier processor + credential-exchange roles (agent-tier-common.tierChannelScopedAllow); the
+// per-tier processor + credential-exchange roles (agent-classification-common.classificationChannelScopedAllow); the
 // model allowlist is the processor role's own Bedrock grant. Deleted per SPEC-CAPABILITY-PROFILES §D-2.
 
 // 8b. Per-tier stacks (docs/SPEC-PER-TIER-OWNERSHIP.md, ADR-011) — each tier is
@@ -361,16 +361,16 @@ const notificationStack = new NotificationStack(app, `${STACK_PREFIX}Notificatio
 // self-resolves at deploy via valueForStringParameter — an SSM dynamic ref, NOT
 // Fn::importValue), so each tier deploys decoupled.
 //
-// Tier-as-class, not tier-as-parameter — each tier is its own file
-// (basic-tier-stack.ts / standard-tier-stack.ts / premium-tier-stack.ts), so a
-// tier-team change reviews + ships only that tier. Shared constants live in
-// lib/stacks/agent-tier-common.ts.
-const tierSharedProps = {
+// Classification-as-class, not classification-as-parameter — each classification is its own file
+// (basic-classification-stack.ts / standard-classification-stack.ts / premium-classification-stack.ts),
+// so a classification-team change reviews + ships only that classification. Shared constants live in
+// lib/stacks/agent-classification-common.ts.
+const classificationSharedProps = {
   env,
   appInstanceArn: chimeStack.appInstanceArn,
   attachmentsBucketName: s3Stack.attachmentsBucket.bucketName,
   attachmentsBucketArn: s3Stack.attachmentsBucket.bucketArn,
-  tierModelSelection,
+  profileModelSelection,
   // Admin error-alert channel (CH parity): the async processor posts a failure here and the
   // channel flow emails the admin roster. Reuses the same admin conversation as the membership
   // audit. Undefined/empty ⇒ processor error alerting is log-only.
@@ -378,12 +378,12 @@ const tierSharedProps = {
   // standard/premium resolve the battle SSM contract AgentEchelonBattle publishes
   // ONLY when /battle is deployed; basic ignores this. False ⇒ no battle plumbing.
   enableBattle,
-  // Live drift (Aurora mode, on-by-default, all-tier). Undefined in Athena mode ⇒
-  // the tier wires no drift. Each tier VPC-attaches its handler to Aurora.
+  // Live drift (Aurora mode, on-by-default, all-classification). Undefined in Athena mode ⇒
+  // the classification wires no drift. Each classification VPC-attaches its handler to Aurora.
   auroraDriftHookup,
   // Out-of-band per-message analytics (SPEC-MESSAGE-METADATA-CODEBOOK.md Phase 1).
   // Aurora mode only — the table lives in the Aurora stack (its archival Lambda is
-  // the sole consumer); each tier's async processor writes the full analytics blob
+  // the sole consumer); each classification's async processor writes the full analytics blob
   // there keyed by message id and slims the Chime Metadata. Undefined in Athena
   // mode ⇒ the processor keeps the full inline metadata (no consumer for these
   // fields there) plus the Phase-0 shedding backstop.
@@ -395,26 +395,26 @@ const tierSharedProps = {
     : undefined,
 };
 
-const tierBasicStack = new BasicTierStack(app, `${STACK_PREFIX}Tier-Basic`, {
-  ...tierSharedProps,
-  description: 'AgentEchelon basic-tier assistant — async-processor + Lex bot + tier context IAM + guardrail',
+const classificationBasicStack = new BasicClassificationStack(app, `${STACK_PREFIX}Classification-Basic`, {
+  ...classificationSharedProps,
+  description: 'AgentEchelon basic-classification assistant — async-processor + Lex bot + classification context IAM + guardrail',
 });
-const tierStandardStack = new StandardTierStack(app, `${STACK_PREFIX}Tier-Standard`, {
-  ...tierSharedProps,
-  description: 'AgentEchelon standard-tier assistant — async-processor + Lex bot + tier context IAM + guardrail',
+const classificationStandardStack = new StandardClassificationStack(app, `${STACK_PREFIX}Classification-Standard`, {
+  ...classificationSharedProps,
+  description: 'AgentEchelon standard-classification assistant — async-processor + Lex bot + classification context IAM + guardrail',
 });
-const tierPremiumStack = new PremiumTierStack(app, `${STACK_PREFIX}Tier-Premium`, {
-  ...tierSharedProps,
-  description: 'AgentEchelon premium-tier assistant — async-processor (+/battle) + Lex bot + tier context IAM + guardrails',
+const classificationPremiumStack = new PremiumClassificationStack(app, `${STACK_PREFIX}Classification-Premium`, {
+  ...classificationSharedProps,
+  description: 'AgentEchelon premium-classification assistant — async-processor (+/battle) + Lex bot + classification context IAM + guardrails',
 });
 
 // Deploy-ordering only: standard/premium consume the shared /agent-echelon/
 // shared/* SSM params — TASK tables from AgentEchelonFoundations, experiments from
 // AgentEchelonExperiments — so both must deploy first. No Fn::importValue on the
 // shared params; these explicit dependencies just guarantee they exist at deploy.
-for (const tierStack of [tierBasicStack, tierStandardStack, tierPremiumStack]) {
-  tierStack.addDependency(foundationsStack);
-  tierStack.addDependency(experimentsStack);
+for (const classificationStack of [classificationBasicStack, classificationStandardStack, classificationPremiumStack]) {
+  classificationStack.addDependency(foundationsStack);
+  classificationStack.addDependency(experimentsStack);
 }
 
 // 8c. Battle Stack (opt-in) — /battle alt-slots, orchestrator, tables, APIs.
@@ -434,8 +434,8 @@ if (battleStack) {
   battleStack.addDependency(cognitoStack); // channel-battle API authorizer
   battleStack.addDependency(experimentsStack); // channel-battle resolves experiments SSM at deploy
   // Per-tier stacks consume the battle SSM this stack publishes.
-  tierStandardStack.addDependency(battleStack);
-  tierPremiumStack.addDependency(battleStack);
+  classificationStandardStack.addDependency(battleStack);
+  classificationPremiumStack.addDependency(battleStack);
   // Aurora analytics resolves the BattleOutcome table NAME from the battle SSM
   // contract at DEPLOY time for the battle-wins join — so battle must deploy
   // first. (No cycle: battle depends only on chime/cognito/experiments, none of
@@ -498,8 +498,8 @@ channelFlowStack.addDependency(chimeStack);
 channelFlowStack.addDependency(foundationsStack); // create-conversation channel-flow ARN + bot ARN in SSM
 // @all + /battle fan-out resolve the standard/premium tier processor ARNs from
 // SSM at deploy, so those tier stacks must publish first.
-channelFlowStack.addDependency(tierStandardStack);
-channelFlowStack.addDependency(tierPremiumStack);
+channelFlowStack.addDependency(classificationStandardStack);
+channelFlowStack.addDependency(classificationPremiumStack);
 // The battle tables ChannelFlow reads come from AgentEchelonBattle (cross-stack token
 // reference already implies this edge; explicit for clarity).
 if (battleStack) {

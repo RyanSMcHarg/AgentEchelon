@@ -269,7 +269,7 @@ export const handler = async (
         }
 
         // Type-exclusion rule: a classification experiment cannot be active
-        // alongside any other type on a shared tier (and vice versa).
+        // alongside any other type on a shared classification (and vice versa).
         const typeConflicts = await findTypeExclusionConflicts({
           experimentType: sanitized.experimentType ?? 'intent',
           tiers: sanitized.tiers || [],
@@ -278,7 +278,7 @@ export const handler = async (
         if (typeConflicts.length > 0) {
           return respond(409, {
             error:
-              'A classification experiment cannot run alongside another experiment type on the same tier. '
+              'A classification experiment cannot run alongside another experiment type on the same classification. '
               + 'Complete or pause the conflicting experiment(s) first.',
             code: 'EXPERIMENT_TYPE_CONFLICT',
             conflictingExperimentIds: typeConflicts.map((e) => e.experimentId),

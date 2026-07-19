@@ -5,11 +5,11 @@
 // AppInstanceUser id the federated credential exchange vends (deriveFederatedSub), so
 // the member this adds is exactly the bearer the embedded widget operates as.
 //
-// The channel is created by the tier bot (its ChimeBearer), classification-tagged, and
+// The channel is created by the classification bot (its ChimeBearer), classification-tagged, and
 // bound to {contextType, contextId} in metadata. The ChannelId is DETERMINISTIC from
 // the context, so a repeat call is idempotent — Chime returns ConflictException and we
-// reconstruct the (deterministic) ARN. No modelId / tier-gate: federated users get a
-// fixed tier (the configured assistant), so there is no Cognito group lookup.
+// reconstruct the (deterministic) ARN. No modelId / classification-gate: federated users get a
+// fixed classification (the configured assistant), so there is no Cognito group lookup.
 
 import {
   ChimeSDKMessagingClient,
@@ -28,11 +28,11 @@ const ssm = new SSMClient({});
 
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN!;
 const CHANNEL_FLOW_ARN_PARAM = process.env.CHANNEL_FLOW_ARN_PARAM || '';
-// Classification this federated assistant is provisioned at (env renamed from ASSISTANT_TIER per
-// SPEC-CAPABILITY-PROFILES). Authoritative for federated users — the channel is created at it.
-const TIER = (process.env.ASSISTANT_CLASSIFICATION || 'basic').trim();
+// Classification this federated assistant is provisioned at (SPEC-CAPABILITY-PROFILES).
+// Authoritative for federated users — the channel is created at it.
+const CLASSIFICATION = (process.env.ASSISTANT_CLASSIFICATION || 'basic').trim();
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/assistant/${TIER}/bot-arn`;
+const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/assistant/${CLASSIFICATION}/bot-arn`;
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
 
 function cors(): Record<string, string> {
@@ -51,7 +51,7 @@ async function ssmGet(name: string): Promise<string> {
 async function getBotArn(): Promise<string> {
   if (cachedBotArn !== null) return cachedBotArn;
   cachedBotArn = await ssmGet(BOT_ARN_PARAM);
-  if (!cachedBotArn) throw new Error(`per-tier bot ARN ${BOT_ARN_PARAM} is empty`);
+  if (!cachedBotArn) throw new Error(`per-classification bot ARN ${BOT_ARN_PARAM} is empty`);
   return cachedBotArn;
 }
 async function getFlowArn(): Promise<string> {
@@ -64,12 +64,13 @@ async function getFlowArn(): Promise<string> {
 
 // Chime ChannelId allows [A-Za-z0-9_-], length 1-64. Make a stable, charset-safe id
 // from the context so the same plan always maps to the same channel (idempotency).
-// TIER-scoped so a tier change (e.g. basic→standard) creates a FRESH channel owned by the
-// current tier's bot, instead of colliding with a channel created+moderated by a different bot
-// (which the current bot can't add members to → ForbiddenException). Pre-tier-scope channels
-// (`fed-<ctx>-<id>`) are orphaned by design; the host re-creates under the new id.
+// Classification-scoped so a classification change (e.g. basic→standard) creates a FRESH channel
+// owned by the current classification's bot, instead of colliding with a channel created+moderated
+// by a different bot (which the current bot can't add members to → ForbiddenException).
+// Pre-classification-scope channels (`fed-<ctx>-<id>`) are orphaned by design; the host re-creates
+// under the new id.
 function channelIdFor(contextType: string, contextId: string): string {
-  const raw = `fed-${TIER}-${contextType}-${contextId}`.replace(/[^A-Za-z0-9_-]/g, '-');
+  const raw = `fed-${CLASSIFICATION}-${contextType}-${contextId}`.replace(/[^A-Za-z0-9_-]/g, '-');
   return raw.slice(0, 64);
 }
 
@@ -94,7 +95,7 @@ export const handler = async (event: Evt): Promise<{ statusCode: number; headers
 
   // Grounding context: the host app passes the
   // user's name, a compact current-plan summary, and a title-only list of their other plans/contexts.
-  // We stamp these into channel Metadata so the per-tier handler can render them into the
+  // We stamp these into channel Metadata so the per-classification handler can render them into the
   // assistant's system prompt (current plan = primary grounding; other contexts = disambiguation).
   const userName = String(body.userName || '').slice(0, 80);
   // The host's i18n: the user's chosen site language (e.g. "en"/"zh"). Stamped so the assistant can
@@ -147,7 +148,7 @@ export const handler = async (event: Evt): Promise<{ statusCode: number; headers
       ? { ...domainContext, items: Array.isArray(domainContext.items) ? domainContext.items.slice(0, itemBudget) : [] }
       : undefined;
     return JSON.stringify({
-      modelTier: TIER,
+      modelTier: CLASSIFICATION,
       // No `createdBy`: the owner is the sole human member (read from Chime membership),
       // not copied into member-readable metadata (Tenet 6).
       contextType: contextType.slice(0, 64),
@@ -176,7 +177,7 @@ export const handler = async (event: Evt): Promise<{ statusCode: number; headers
     // 1. Create the channel (bot is creator/moderator). Idempotent on ChannelId.
     let conversationArn = deterministicArn;
     try {
-      const fedExp = getConversationTypeConfig(TIER).expiration;
+      const fedExp = getConversationTypeConfig(CLASSIFICATION).expiration;
       const created = await messaging.send(new CreateChannelCommand({
         AppInstanceArn: APP_INSTANCE_ARN,
         ChannelId: channelId,
@@ -185,7 +186,7 @@ export const handler = async (event: Evt): Promise<{ statusCode: number; headers
         Privacy: 'PRIVATE',
         ChimeBearer: botArn,
         Tags: [
-          { Key: 'classification', Value: TIER },
+          { Key: 'classification', Value: CLASSIFICATION },
           { Key: 'conversationType', Value: 'private' },
           { Key: 'contextType', Value: contextType.slice(0, 128) },
         ],
