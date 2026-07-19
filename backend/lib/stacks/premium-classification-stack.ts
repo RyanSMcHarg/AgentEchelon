@@ -1,5 +1,5 @@
 /**
- * PremiumTierStack — the PREMIUM assistant profile. A thin wrapper that supplies the premium
+ * PremiumClassificationStack — the PREMIUM assistant profile. A thin wrapper that supplies the premium
  * ProfileTopology to the shared AssistantProfileStack (SPEC-CAPABILITY-PROFILES).
  *
  * Premium = Opus (with response streaming), full multi-turn tasks, generated docs, experiments,
@@ -29,10 +29,10 @@ const PREMIUM_TOPOLOGY: ProfileTopology = {
   richProcessor: true,
   battleCapable: true,
   handlerExperimentsIndex: false,
-  componentTag: 'Tier-Premium',
+  componentTag: 'Classification-Premium',
 };
 
-export interface PremiumTierStackProps extends cdk.StackProps {
+export interface PremiumClassificationStackProps extends cdk.StackProps {
   appInstanceArn: string;
   attachmentsBucketName: string;
   attachmentsBucketArn: string;
@@ -43,8 +43,8 @@ export interface PremiumTierStackProps extends cdk.StackProps {
   adminErrorAlertChannelArn?: string;
 }
 
-export class PremiumTierStack extends AssistantProfileStack {
-  constructor(scope: Construct, id: string, props: PremiumTierStackProps) {
+export class PremiumClassificationStack extends AssistantProfileStack {
+  constructor(scope: Construct, id: string, props: PremiumClassificationStackProps) {
     super(scope, id, { ...props, topology: PREMIUM_TOPOLOGY });
   }
 }

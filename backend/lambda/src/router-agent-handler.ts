@@ -7,7 +7,7 @@
  * intent classification and task tracking.
  *
  * Classification routing (single entry point for ALL classifications; deployed
- * per-classification, keyed by the TIER env var):
+ * per-classification, keyed by the CLASSIFICATION env var):
  * - basic    → classifyIntentBasic() + BASIC_ASYNC_PROCESSOR_ARN (Haiku, tasks: lightweight)
  * - standard → classifyIntent()      + STANDARD_ASYNC_PROCESSOR_ARN (Sonnet, tasks: full)
  * - premium  → classifyIntent()      + PREMIUM_ASYNC_PROCESSOR_ARN (Opus, tasks: full)
@@ -70,11 +70,11 @@ const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
 const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || '';
 const USER_POOL_ID = process.env.USER_POOL_ID || '';
 // Per-classification deployment (ADR-011 reversal / bot-layer isolation): when this
-// handler is deployed per-classification, TIER is set statically and BOT_ARN_PARAM points
-// at that classification's bot key. With TIER set the handler skips channel-classification
+// handler is deployed per-classification, CLASSIFICATION is set statically and BOT_ARN_PARAM points
+// at that classification's bot key. With CLASSIFICATION set the handler skips channel-classification
 // discovery (it IS the classification) and acts as the per-classification bot — no shared
 // router, no shared bot. Unset = legacy shared-router behavior (back-compat).
-const STATIC_CLASSIFICATION = process.env.TIER || '';
+const STATIC_CLASSIFICATION = process.env.CLASSIFICATION || '';
 
 const BASIC_ASYNC_PROCESSOR_ARN = process.env.BASIC_ASYNC_PROCESSOR_ARN || '';
 const STANDARD_ASYNC_PROCESSOR_ARN = process.env.STANDARD_ASYNC_PROCESSOR_ARN || '';
@@ -156,7 +156,7 @@ async function getSsmParam(name: string): Promise<string | undefined> {
 
 async function resolveChannelClassification(channelArn: string, botArn: string): Promise<string> {
   // Per-classification deployment: the handler IS the classification — no discovery needed. This
-  // is the LIVE topology (every classification stack sets TIER), so the tag read below is only
+  // is the LIVE topology (every classification stack sets CLASSIFICATION), so the tag read below is only
   // reached in a hypothetical single-handler multi-classification deployment.
   if (STATIC_CLASSIFICATION) return STATIC_CLASSIFICATION;
   if (channelClassificationCache.has(channelArn)) return channelClassificationCache.get(channelArn)!;
@@ -316,7 +316,7 @@ function envAsyncProcessorArn(classification: string): string {
 // Resolved classification → processor ARN (only SSM hits are cached, so once a classification
 // resolves to its per-classification processor it stays cached for the life of the warm
 // container; a classification without a published SSM param re-checks SSM each turn and
-// thus picks up its AgentEchelonTier-* processor the moment that stack is
+// thus picks up its AgentEchelonClassification-* processor the moment that stack is
 // deployed — no router redeploy).
 const processorArnCache = new Map<string, string>();
 
@@ -324,7 +324,7 @@ const processorArnCache = new Map<string, string>();
  * Resolve the classification's async-processor ARN, preferring the per-classification stack's
  * SSM-published value (/agent-echelon/assistant/{classification}/processor-arn) and falling
  * back to the *_ASYNC_PROCESSOR_ARN env var. A classification routes to its
- * AgentEchelonTier-* processor as soon as that stack publishes its SSM param.
+ * AgentEchelonClassification-* processor as soon as that stack publishes its SSM param.
  */
 async function resolveAsyncProcessorArn(classification: string): Promise<string> {
   const cached = processorArnCache.get(classification);

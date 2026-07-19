@@ -25,16 +25,16 @@ export interface FoundationsStackProps extends cdk.StackProps {
  * (`agent-tasks` + `user-tasks`) + the create-conversation / add-agent API, and
  * publishes their shared SSM contract. It hosts no bot — it's the foundation the
  * feature stacks build on: /battle in AgentEchelonBattle, the per-classification assistants
- * in AgentEchelonTier-*, and experiments in AgentEchelonExperiments.
+ * in AgentEchelonClassification-*, and experiments in AgentEchelonExperiments.
  */
 export class FoundationsStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: FoundationsStackProps) {
     super(scope, id, props);
 
     // Per-classification company-context S3 scoping + per-classification model selection live in the
-    // AgentEchelonTier-* stacks alongside the processors (ADR-011).
+    // AgentEchelonClassification-* stacks alongside the processors (ADR-011).
 
-    // Every classification owns its own Lex + AppInstanceBot + router (AgentEchelonTier-*),
+    // Every classification owns its own Lex + AppInstanceBot + router (AgentEchelonClassification-*),
     // /battle owns its alt-slot Lex (AgentEchelonBattle), and experiments live in
     // AgentEchelonExperiments — so there is no shared Lex/AppInstanceBot/router here.
 
@@ -104,7 +104,7 @@ export class FoundationsStack extends cdk.Stack {
 
     // ============================================================
     // Shared SSM contract for the per-classification stacks (SPEC-PER-TIER-OWNERSHIP.md).
-    // AgentEchelonTier-{Standard,Premium} resolve these at DEPLOY time via
+    // AgentEchelonClassification-{Standard,Premium} resolve these at DEPLOY time via
     // valueForStringParameter (an SSM dynamic ref, NOT Fn::importValue), so a
     // classification deploys decoupled from this stack while still pointing at the shared
     // TASK tables. The experiments SSM keys are published by AgentEchelonExperiments
@@ -156,7 +156,7 @@ export class FoundationsStack extends cdk.Stack {
           statements: [
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
-              // Per-classification AppInstanceBot ARNs published by the AgentEchelonTier-*
+              // Per-classification AppInstanceBot ARNs published by the AgentEchelonClassification-*
               // stacks; add-agent binds the channel's own-classification assistant. No
               // shared cross-classification bot.
               resources: [
@@ -280,7 +280,7 @@ export class FoundationsStack extends cdk.Stack {
               actions: ['ssm:GetParameter'],
               resources: [
                 channelFlowArnParamArn,
-                // Per-classification AppInstanceBot ARNs published by the AgentEchelonTier-*
+                // Per-classification AppInstanceBot ARNs published by the AgentEchelonClassification-*
                 // stacks; create-conversation adds the right classification bot to a new
                 // channel. No shared cross-classification bot — a missing per-classification key
                 // is an error, not a silent fallback.

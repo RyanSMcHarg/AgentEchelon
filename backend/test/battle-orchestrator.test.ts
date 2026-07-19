@@ -293,7 +293,7 @@ describe('battle-orchestrator handler', () => {
 });
 
 // The premium processor ARN is not held at deploy time (that would couple
-// the orchestrator to AgentEchelonTier-Premium and reintroduce a fresh-deploy
+// the orchestrator to AgentEchelonClassification-Premium and reintroduce a fresh-deploy
 // ordering cycle). The orchestrator resolves the ARN at runtime from SSM
 // (PREMIUM_PROCESSOR_ARN_PARAM), with a literal env override honored first.
 // These tests pin that resolution order + the unresolved guard.

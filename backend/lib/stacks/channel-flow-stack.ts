@@ -55,7 +55,7 @@ export class ChannelFlowStack extends cdk.Stack {
     super(scope, id, props);
 
     // @all fan-out and /battle target the per-classification async-processors
-    // (AgentEchelonTier-{Standard,Premium}), resolved at deploy from the SSM
+    // (AgentEchelonClassification-{Standard,Premium}), resolved at deploy from the SSM
     // contract those stacks publish (dynamic ref, not Fn::importValue).
     const standardProcessorArn = ssm.StringParameter.valueForStringParameter(
       this, processorArnKey('standard'));
@@ -118,12 +118,12 @@ export class ChannelFlowStack extends cdk.Stack {
           ],
         }),
         // @all fan-out → classification standard processor; /battle fan-out → classification
-        // premium processor. Both are ${STACK_PREFIX}Tier-* functions.
+        // premium processor. Both are ${STACK_PREFIX}Classification-* functions.
         LambdaInvokePolicy: new iam.PolicyDocument({
           statements: [
             new iam.PolicyStatement({
               actions: ['lambda:InvokeFunction'],
-              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Tier-*`],
+              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Classification-*`],
             }),
           ],
         }),

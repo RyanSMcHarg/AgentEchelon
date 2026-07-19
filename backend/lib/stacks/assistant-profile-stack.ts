@@ -86,7 +86,7 @@ export interface ProfileTopology {
   /** Basic only: the handler role also grants Query on the experiments GSI (experiments/index/*).
    *  Preserved verbatim from the per-classification stacks; standard/premium query experiments by primary key. */
   handlerExperimentsIndex: boolean;
-  /** CloudFormation Component tag value (e.g. 'Tier-Basic'). */
+  /** CloudFormation Component tag value (e.g. 'Classification-Basic'). */
   componentTag: string;
 }
 
@@ -499,7 +499,7 @@ export class AssistantProfileStack extends cdk.Stack {
     }
 
     // ── Per-profile agent handler (Lex fulfillment) ─────────────────────────
-    // The SHARED router (router-agent-handler.ts) is deployed PER PROFILE. TIER=<profile> makes it skip
+    // The SHARED router (router-agent-handler.ts) is deployed PER PROFILE. CLASSIFICATION=<profile> makes it skip
     // classification discovery (it IS the profile), act as this profile's bot, enforce
     // min(senderClearance, profile) via Cognito, resolve experiments, create/continue tasks, and
     // dispatch to THIS profile's async-processor. Live drift (Aurora) is wired in Aurora mode (all-profile).
@@ -558,7 +558,7 @@ export class AssistantProfileStack extends cdk.Stack {
     );
 
     const handlerEnv: Record<string, string> = {
-      TIER: classification,
+      CLASSIFICATION: classification,
       ...(drift?.env ?? {}),
       ...(drift ? { CHANNEL_FLOW_ARN_PARAM: CHANNEL_FLOW_ARN_SSM_KEY } : {}),
       SSM_ROOT,
@@ -694,16 +694,16 @@ export class AssistantProfileStack extends cdk.Stack {
     botResource.node.addDependency(lexResource);
     this.appInstanceBotArn = botResource.getAtt('AppInstanceBotArn').toString();
 
-    new ssm.StringParameter(this, 'TierBotArnParam', {
+    new ssm.StringParameter(this, 'ClassificationBotArnParam', {
       parameterName: botArnKey(classification),
       stringValue: this.appInstanceBotArn,
       description: `AppInstanceBot ARN for ${classification} classification — read by create-conversation`,
     });
 
-    new cdk.CfnOutput(this, 'TierAsyncProcessorArn', { value: asyncProcessor.functionArn });
-    new cdk.CfnOutput(this, 'TierAppInstanceBotArn', { value: this.appInstanceBotArn });
+    new cdk.CfnOutput(this, 'ClassificationAsyncProcessorArn', { value: asyncProcessor.functionArn });
+    new cdk.CfnOutput(this, 'ClassificationAppInstanceBotArn', { value: this.appInstanceBotArn });
 
     cdk.Tags.of(this).add('Component', topo.componentTag);
-    cdk.Tags.of(this).add('Tier', classification);
+    cdk.Tags.of(this).add('Classification', classification);
   }
 }

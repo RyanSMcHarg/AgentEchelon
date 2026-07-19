@@ -1,5 +1,5 @@
 /**
- * BasicTierStack — the BASIC assistant profile. A thin wrapper that supplies the basic
+ * BasicClassificationStack — the BASIC assistant profile. A thin wrapper that supplies the basic
  * ProfileTopology to the shared AssistantProfileStack (SPEC-CAPABILITY-PROFILES).
  *
  * Basic = Haiku, lightweight tasks (grounds the prompt + stamps task_id), a per-deployment intent
@@ -29,10 +29,10 @@ const BASIC_TOPOLOGY: ProfileTopology = {
   richProcessor: false,
   battleCapable: false,
   handlerExperimentsIndex: true,
-  componentTag: 'Tier-Basic',
+  componentTag: 'Classification-Basic',
 };
 
-export interface BasicTierStackProps extends cdk.StackProps {
+export interface BasicClassificationStackProps extends cdk.StackProps {
   appInstanceArn: string;
   attachmentsBucketName: string;
   attachmentsBucketArn: string;
@@ -42,8 +42,8 @@ export interface BasicTierStackProps extends cdk.StackProps {
   adminErrorAlertChannelArn?: string;
 }
 
-export class BasicTierStack extends AssistantProfileStack {
-  constructor(scope: Construct, id: string, props: BasicTierStackProps) {
+export class BasicClassificationStack extends AssistantProfileStack {
+  constructor(scope: Construct, id: string, props: BasicClassificationStackProps) {
     super(scope, id, { ...props, topology: BASIC_TOPOLOGY });
   }
 }

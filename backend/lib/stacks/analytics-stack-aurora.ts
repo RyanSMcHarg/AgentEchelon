@@ -171,7 +171,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
    * to `dbSecurityGroup` INSIDE this stack, so consumers ATTACH to it read-only
    * (`securityGroups: [dbClientSecurityGroup]`) without mutating the Aurora DB
    * SG — that mutation-from-a-classification is what created the synth CYCLE
-   * (AnalyticsAurora ⇄ AgentEchelonTier-*). Same one-SG-per-consumer pattern the
+   * (AnalyticsAurora ⇄ AgentEchelonClassification-*). Same one-SG-per-consumer pattern the
    * in-stack Lambdas (schema-init / setup / archival) already use, but shared.
    */
   public readonly dbClientSecurityGroup: ec2.ISecurityGroup;
@@ -306,7 +306,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     // Shared DB-client SG for cross-stack consumers (per-classification live-drift
     // handlers). Authorize its ingress to Aurora HERE, inside the Aurora stack,
     // so the classification stacks only REFERENCE it (read-only attach) — no classification→DB-SG
-    // mutation, hence no AnalyticsAurora ⇄ AgentEchelonTier-* cycle. The in-stack
+    // mutation, hence no AnalyticsAurora ⇄ AgentEchelonClassification-* cycle. The in-stack
     // Lambdas keep their own per-consumer SGs (below); this one is for
     // out-of-stack consumers.
     const dbClientSecurityGroup = new ec2.SecurityGroup(this, 'DbClientSg', {
@@ -1343,7 +1343,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
 
     // The premium + standard async processors need read access to
     // pgvector via the RDS Proxy + Bedrock for query embedding. Those
-    // Lambdas live in the per-classification AgentEchelonTier-* stacks and are wired
+    // Lambdas live in the per-classification AgentEchelonClassification-* stacks and are wired
     // into the VPC separately when enableLiveDrift=true — the same path also
     // gives them the embeddings table access (see agent-classification-common.ts
     // `auroraDriftWiring`).

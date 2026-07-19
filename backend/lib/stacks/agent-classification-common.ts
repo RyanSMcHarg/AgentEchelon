@@ -1,6 +1,6 @@
 /**
  * Shared constants + thin helpers for the per-classification stacks
- * (BasicTierStack / StandardTierStack / PremiumTierStack).
+ * (BasicClassificationStack / StandardClassificationStack / PremiumClassificationStack).
  *
  * **Intentionally thin.** The per-classification ownership model (ADR-011) targets
  * independently-owned *code* per classification — a basic-team change must not
@@ -204,7 +204,7 @@ function pascal(s: string): string {
 /**
  * CloudFormation stack-ID prefix — the PascalCase form of the instance name.
  * The default instance yields `AgentEchelon` (`AgentEchelonFoundations`,
- * `AgentEchelonTier-Basic`, …); a host instance gets its own PascalCase prefix
+ * `AgentEchelonClassification-Basic`, …); a host instance gets its own PascalCase prefix
  * (`acme` → `Acme…`), so two instances never update each other's stacks.
  * Override with `AE_STACK_PREFIX`.
  */

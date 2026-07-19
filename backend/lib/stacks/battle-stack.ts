@@ -306,7 +306,7 @@ export class BattleStack extends cdk.Stack {
     // Coordinates round-2 fan-out after both bots reach round-1 terminal state.
     // Invoked async from the premium async processor on the last transition.
     // Sends per-bot round-2 placeholders, invokes the premium classification processor
-    // (AgentEchelonTier-Premium) — resolved at RUNTIME from SSM (param NAME passed in
+    // (AgentEchelonClassification-Premium) — resolved at RUNTIME from SSM (param NAME passed in
     // env) so there is no deploy-time ordering cycle with the premium stack.
     const battleOrchestratorRole = new iam.Role(this, 'BattleOrchestratorRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
@@ -331,8 +331,8 @@ export class BattleStack extends cdk.Stack {
           statements: [
             new iam.PolicyStatement({
               actions: ['lambda:InvokeFunction'],
-              // Invokes the premium classification processor (AgentEchelonTier-Premium) for round-2.
-              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Tier-*`],
+              // Invokes the premium classification processor (AgentEchelonClassification-Premium) for round-2.
+              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Classification-*`],
             }),
           ],
         }),
@@ -373,7 +373,7 @@ export class BattleStack extends cdk.Stack {
 
     // ============================================================
     // Shared SSM contract for the per-classification stacks (SPEC-PER-TIER-OWNERSHIP.md).
-    // AgentEchelonTier-{Standard,Premium} resolve these at DEPLOY time via
+    // AgentEchelonClassification-{Standard,Premium} resolve these at DEPLOY time via
     // valueForStringParameter (dynamic ref, NOT Fn::importValue) — but ONLY when
     // their own `enableBattle` is set, so a classification can deploy with battle off.
     // ============================================================

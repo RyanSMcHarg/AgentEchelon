@@ -49,7 +49,7 @@ const lambdaClient = new LambdaClient({});
 const ssmClient = new SSMClient({});
 
 // The premium classification processor ARN is resolved at RUNTIME from SSM (the
-// AgentEchelonTier-Premium stack publishes it). Resolving here — not at deploy via
+// AgentEchelonClassification-Premium stack publishes it). Resolving here — not at deploy via
 // valueForStringParameter — keeps this orchestrator decoupled from the premium
 // classification stack at deploy time (no fresh-deploy ordering cycle). A literal env
 // override is honored first for tests / special wiring.

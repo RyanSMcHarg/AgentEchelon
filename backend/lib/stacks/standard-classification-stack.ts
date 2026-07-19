@@ -1,5 +1,5 @@
 /**
- * StandardTierStack — the STANDARD assistant profile. A thin wrapper that supplies the standard
+ * StandardClassificationStack — the STANDARD assistant profile. A thin wrapper that supplies the standard
  * ProfileTopology to the shared AssistantProfileStack (SPEC-CAPABILITY-PROFILES).
  *
  * Standard = Sonnet, full multi-turn tasks, generated docs, experiments, attachment-in, a
@@ -28,10 +28,10 @@ const STANDARD_TOPOLOGY: ProfileTopology = {
   richProcessor: true,
   battleCapable: true,
   handlerExperimentsIndex: false,
-  componentTag: 'Tier-Standard',
+  componentTag: 'Classification-Standard',
 };
 
-export interface StandardTierStackProps extends cdk.StackProps {
+export interface StandardClassificationStackProps extends cdk.StackProps {
   appInstanceArn: string;
   attachmentsBucketName: string;
   attachmentsBucketArn: string;
@@ -42,8 +42,8 @@ export interface StandardTierStackProps extends cdk.StackProps {
   adminErrorAlertChannelArn?: string;
 }
 
-export class StandardTierStack extends AssistantProfileStack {
-  constructor(scope: Construct, id: string, props: StandardTierStackProps) {
+export class StandardClassificationStack extends AssistantProfileStack {
+  constructor(scope: Construct, id: string, props: StandardClassificationStackProps) {
     super(scope, id, { ...props, topology: STANDARD_TOPOLOGY });
   }
 }
