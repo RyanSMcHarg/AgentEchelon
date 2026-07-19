@@ -2,7 +2,7 @@
  * Profile registry (SPEC-CAPABILITY-PROFILES §3) — the ONLY place that interprets a
  * classification tag value or maps groups to clearance. Runtime sites (channel-flow,
  * router, RAG, abuse, battle, membership-audit) migrate to read through this in Phase 1,
- * replacing hardcoded VALID_CLASSIFICATIONS / TIER_RANK / CLEARANCE_GROUPS / minTier / isAdvancedTier.
+ * replacing hardcoded VALID_CLASSIFICATIONS / CLASSIFICATION_RANK / CLEARANCE_GROUPS / minRank / isAdvancedTier.
  *
  * Phase 0 guarantee: constructed from DEFAULT_PROFILES_CONFIG, every method returns the
  * SAME answer the legacy constants did — proven by profile-registry.test.ts. No behavior
@@ -53,12 +53,12 @@ export class ProfileRegistry {
 
   /** True if the value is a declared classification (primary or alias). Lets callers distinguish
    *  a legitimately-floor-tagged channel from an unknown tag that fell back — preserving the
-   *  fail-closed SecurityEvent warning. Legacy equivalent: `!!TIER_RANK[tag]`. */
+   *  fail-closed SecurityEvent warning. Legacy equivalent: `!!CLASSIFICATION_RANK[tag]`. */
   isKnownClassification(value: string | null | undefined): boolean {
     return !!value && (this.byValue.has(value) || this.byAlias.has(value));
   }
 
-  /** Rank of a classification value; unknown values resolve fail-closed first. Legacy: TIER_RANK. */
+  /** Rank of a classification value; unknown values resolve fail-closed first. Legacy: CLASSIFICATION_RANK. */
   rank(classification: string): number {
     const c = this.byValue.get(classification) ?? this.byValue.get(this.config.failClosedTo)!;
     return c.rank;
@@ -66,7 +66,7 @@ export class ProfileRegistry {
 
   /**
    * The lower-privilege (lower-rank) of two classifications — the min-cap downgrade.
-   * Legacy: `minTier(a,b) = TIER_RANK[a] <= TIER_RANK[b] ? a : b` (ties return the first arg).
+   * Legacy: `minRank(a,b) = CLASSIFICATION_RANK[a] <= CLASSIFICATION_RANK[b] ? a : b` (ties return the first arg).
    */
   min(a: string, b: string): string {
     return this.rank(a) <= this.rank(b) ? a : b;

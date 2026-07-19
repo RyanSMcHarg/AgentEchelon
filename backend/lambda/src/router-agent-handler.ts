@@ -42,7 +42,7 @@ import {
 import { createTask, getActiveTask, TRIP_TASK_TTL_SECONDS, type TaskCreateOptions } from './lib/task-tracking.js';
 import { checkAndConsumeBudget, budgetCannedResponse, checkRateLimit, rateLimitMessage } from './lib/abuse-controls.js';
 // SPEC-CAPABILITY-PROFILES: the single interpreter of classification tags + group clearance.
-// Replaces the local TIER_RANK / CLEARANCE_GROUPS / minTier / isAdvancedTier / classificationScope constants.
+// Replaces the local CLASSIFICATION_RANK / CLEARANCE_GROUPS / minRank / isAdvancedTier / classificationScope constants.
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
 // Retrieval runs in the VPC-attached data-plane Lambda (project decision 018);
 // this handler stays non-VPC and invokes it via the client seam. Same signature.
@@ -98,7 +98,7 @@ const channelClassificationCache = new Map<string, string>();
 const userTierCache = new Map<string, { tier: string; expires: number }>();
 const USER_TIER_CACHE_TTL_MS = 5 * 60_000;
 
-function minTier(a: string, b: string): string {
+function minRank(a: string, b: string): string {
   return profiles.min(a, b);
 }
 
@@ -476,7 +476,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     // this, every turn downgrades to basic and the standard processor is never invoked.
     const isFederated = userSub.startsWith('fed_');
     const userClearance = isFederated ? channelClassification : await resolveUserClearance(userSub);
-    const tier = isFederated ? channelClassification : minTier(channelClassification, userClearance);
+    const tier = isFederated ? channelClassification : minRank(channelClassification, userClearance);
 
     if (!isFederated && channelClassification !== userClearance) {
       console.warn('[Router][SecurityEvent] Tier mismatch', {
@@ -484,7 +484,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
         channelArn,
         channelClassification,
         userClearance,
-        effectiveTier: tier,
+        effectiveClassification: tier,
       });
     }
 

@@ -244,7 +244,7 @@ async function listUsers(): Promise<{ users: UserRecord[] }> {
 }
 
 async function approveUser(username: string, tier: string): Promise<void> {
-  const effectiveTier = (CLEARANCE_GROUPS as readonly string[]).includes(tier)
+  const effectiveClearance = (CLEARANCE_GROUPS as readonly string[]).includes(tier)
     ? (tier as Tier)
     : 'basic';
 
@@ -254,12 +254,12 @@ async function approveUser(username: string, tier: string): Promise<void> {
     Username: username,
     UserAttributes: [
       { Name: 'custom:approved', Value: 'true' },
-      { Name: 'custom:tier', Value: effectiveTier },
+      { Name: 'custom:tier', Value: effectiveClearance },
     ],
   }));
 
   // Mirror into Cognito group so authorization checks trust it
-  await syncTierGroup(username, effectiveTier);
+  await syncTierGroup(username, effectiveClearance);
 
   // Enable the user if disabled
   await cognitoClient.send(new AdminEnableUserCommand({

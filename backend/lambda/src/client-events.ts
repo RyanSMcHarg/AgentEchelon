@@ -150,8 +150,8 @@ function extractClaims(event: APIGatewayProxyEvent): AuthorizedClaims | null {
   } else if (typeof rawGroups === 'string') {
     groups = rawGroups.split(',').map((g) => g.trim()).filter(Boolean);
   }
-  const tierOrder = ['admins', 'premium', 'standard', 'basic'];
-  const tier = tierOrder.find((t) => groups.includes(t)) || 'unknown';
+  const classificationOrder = ['admins', 'premium', 'standard', 'basic'];
+  const tier = classificationOrder.find((t) => groups.includes(t)) || 'unknown';
   return { userId, email: claims.email ?? null, tier };
 }
 

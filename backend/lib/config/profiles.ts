@@ -16,7 +16,7 @@
  *
  * The enforcement mechanism is unchanged: the tag key stays `classification`, immutable-by-policy,
  * IAM keyed on `aws:ResourceTag/classification`, resolution fail-closed. Classifications now
- * declare their rank order explicitly instead of inheriting it from a hardcoded `TIER_RANK`.
+ * declare their rank order explicitly instead of inheriting it from a hardcoded `CLASSIFICATION_RANK`.
  */
 
 /** A deployment-defined data/sensitivity label (the channel `classification` tag value). */
@@ -64,7 +64,7 @@ export interface ProfilesConfig {
 /**
  * The shipped default IS the current triple, verbatim — so Phase 0 changes zero behavior.
  * Values captured from the legacy code:
- *  - ranks/ordering: TIER_RANK {basic:1,standard:2,premium:3} (router-agent-handler.ts)
+ *  - ranks/ordering: CLASSIFICATION_RANK {basic:1,standard:2,premium:3} (router-agent-handler.ts)
  *  - modelKey: DEFAULT_TIER_MODEL_SELECTION {haiku,sonnet,opus} (model-strategy.ts)
  *  - classifierMode: 'llm' for all (DEVIATION: legacy basic used the keyword classifier;
  *    the new default classifies basic with the LLM too — surfaces when Phase 1 wires the router)

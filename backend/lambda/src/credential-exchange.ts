@@ -95,7 +95,7 @@ const MODERATION_CAPS = new Set(['redact', 'delete', 'manage-membership', 'manag
 const sts = new STSClient({ region: AWS_REGION });
 const chimeIdentity = new ChimeSDKIdentityClient({ region: AWS_REGION });
 
-const TIER_RANK: Record<string, number> = { basic: 1, standard: 2, premium: 3 };
+const CLASSIFICATION_RANK: Record<string, number> = { basic: 1, standard: 2, premium: 3 };
 
 /** Parse the `cognito:groups` claim, which arrives from the REST API Cognito
  *  authorizer as an array, a JSON-ish `[a b]` string, or a comma/space list. */
@@ -117,7 +117,7 @@ export function resolveRoleKey(groups: string[]): 'basic' | 'standard' | 'premiu
   if (groups.includes('admins')) return 'admin';
   let best: 'basic' | 'standard' | 'premium' = 'basic';
   for (const g of groups) {
-    if ((g === 'standard' || g === 'premium') && TIER_RANK[g] > TIER_RANK[best]) best = g;
+    if ((g === 'standard' || g === 'premium') && CLASSIFICATION_RANK[g] > CLASSIFICATION_RANK[best]) best = g;
   }
   return best;
 }

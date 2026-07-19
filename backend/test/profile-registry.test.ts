@@ -24,14 +24,14 @@ describe('profile-registry (default config = legacy behavior)', () => {
     expect(reg.resolveClassification(undefined)).toBe('basic');
   });
 
-  it('rank reproduces TIER_RANK {basic:1,standard:2,premium:3}', () => {
+  it('rank reproduces CLASSIFICATION_RANK {basic:1,standard:2,premium:3}', () => {
     expect(reg.rank('basic')).toBe(1);
     expect(reg.rank('standard')).toBe(2);
     expect(reg.rank('premium')).toBe(3);
     expect(reg.rank('bogus')).toBe(1); // fail-closed rank
   });
 
-  it('min reproduces minTier (lower rank wins; tie returns first arg)', () => {
+  it('min reproduces minRank (lower rank wins; tie returns first arg)', () => {
     expect(reg.min('premium', 'basic')).toBe('basic');
     expect(reg.min('standard', 'premium')).toBe('standard');
     expect(reg.min('premium', 'standard')).toBe('standard');

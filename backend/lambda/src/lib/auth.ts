@@ -17,8 +17,8 @@
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 
 /** The four Cognito groups, most-privileged first. */
-export const TIER_ORDER = ['admins', 'premium', 'standard', 'basic'] as const;
-export type Tier = (typeof TIER_ORDER)[number];
+export const CLASSIFICATION_ORDER = ['admins', 'premium', 'standard', 'basic'] as const;
+export type Tier = (typeof CLASSIFICATION_ORDER)[number];
 
 export interface AuthorizedClaims {
   /** Cognito user sub (UUID). */
@@ -68,7 +68,7 @@ export function extractClaims(event: APIGatewayProxyEvent): AuthorizedClaims | n
 
   const groups = parseGroups(claims['cognito:groups']);
 
-  const tier = (TIER_ORDER.find((t) => groups.includes(t)) as Tier) || 'unknown';
+  const tier = (CLASSIFICATION_ORDER.find((t) => groups.includes(t)) as Tier) || 'unknown';
 
   return {
     sub,
