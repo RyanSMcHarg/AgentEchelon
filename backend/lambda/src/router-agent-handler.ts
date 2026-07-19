@@ -593,7 +593,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
       channelArn,
       userMessage,
       userSub,
-      tier: tier as 'basic' | 'standard' | 'premium',
+      classification: tier as 'basic' | 'standard' | 'premium',
       botArn,
       intent: classification.intent,
     });

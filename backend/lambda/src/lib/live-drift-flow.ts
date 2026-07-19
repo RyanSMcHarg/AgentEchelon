@@ -1,5 +1,5 @@
 /**
- * Live drift flow — shared across the per-tier agent handlers.
+ * Live drift flow — shared across the per-classification agent handlers.
  *
  * This is the USER-FACING drift feature (SPEC-DRIFT-CONVERGENCE.md): when a
  * conversation's latest message has semantically drifted from the established
@@ -8,14 +8,14 @@
  * creates the new channel. It is distinct from the async/archival drift path
  * (`analytics-aurora/kinesis-archival.ts`), which is telemetry-only.
  *
- * Drift is **conversation-level + ALL-tier (basic/standard/premium) + ON BY
+ * Drift is **conversation-level + ALL-classification (basic/standard/premium) + ON BY
  * DEFAULT** in Aurora mode — NOT premium-only. This flow is shared so the
- * router (deployed per-tier, including basic) runs the identical drift flow
+ * router (deployed per-classification, including basic) runs the identical drift flow
  * with no `isAdvancedTier` gate. See the handler-neutral design in
  * SPEC-DRIFT-CONVERGENCE §"runs on all AE tiers".
  *
  * Requires `analyticsMode=aurora` (pgvector + Titan). The wiring helper
- * `auroraDriftWiring` (lib/stacks/agent-tier-common.ts) VPC-attaches the
+ * `auroraDriftWiring` (lib/stacks/agent-classification-common.ts) VPC-attaches the
  * handler and sets DB_* + ENABLE_LIVE_DRIFT=true. In Athena mode the gate
  * (`ENABLE_LIVE_DRIFT && HAS_AURORA`) is false and this is a no-op.
  */
@@ -87,7 +87,7 @@ async function getSsmValue(paramName: string): Promise<string | null> {
 }
 
 /** Minimal shape of the Lex fulfillment event the drift flow reads. The shared
- *  router-agent-handler event (every tier) satisfies it. */
+ *  router-agent-handler event (every classification) satisfies it. */
 export interface LiveDriftEvent {
   inputTranscript?: string;
   sessionState: {
@@ -105,15 +105,15 @@ export interface LiveDriftFlowInput {
   channelArn: string;
   userMessage: string;
   userSub: string;
-  tier: 'basic' | 'standard' | 'premium';
+  classification: 'basic' | 'standard' | 'premium';
   botArn: string;
   /** The classified intent (IntentType value). Uppercased for detectDrift. */
   intent: string;
   /**
    * Explicit conversation-type key for this channel (from metadata/tag), if the
    * caller has it. Drift on/off is a property of the conversation TYPE, not the
-   * tier (lib/config/conversation-types.ts). Omitted ⇒ the type defaults to the
-   * tier, so behavior is unchanged for un-migrated channels.
+   * classification (lib/config/conversation-types.ts). Omitted ⇒ the type defaults to the
+   * classification, so behavior is unchanged for un-migrated channels.
    */
   conversationType?: string;
 }
@@ -143,17 +143,17 @@ export interface LiveDriftResponse {
  * "Drift Detection Interaction"). Runs on ALL tiers (no isAdvancedTier gate).
  */
 export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveDriftResponse | null> {
-  const { event, channelArn, userMessage, userSub, tier, botArn, intent } = input;
+  const { event, channelArn, userMessage, userSub, classification, botArn, intent } = input;
 
   // Infra gate: the Aurora hookup must be wired (auroraDriftWiring sets these).
   if (!ENABLE_LIVE_DRIFT || !HAS_AURORA || !channelArn) return null;
 
   // Policy gate: drift on/off is a property of the CONVERSATION TYPE, not the
-  // tier. Resolve the type (explicit metadata type if present, else the tier)
+  // classification. Resolve the type (explicit metadata type if present, else the classification)
   // and consult the registry. Today every shipped type has drift on, so this
   // is a no-op until a deployer turns it off for a type or adds a drift-off
   // type — at which point no handler code changes.
-  const typeKey = resolveConversationTypeKey({ explicitType: input.conversationType, tier });
+  const typeKey = resolveConversationTypeKey({ explicitType: input.conversationType, classification });
   const typeConfig = getConversationTypeConfig(typeKey);
   if (!typeConfig.driftEnabled) return null;
 
@@ -206,7 +206,7 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
             botArn,
             userArn: senderArn,
             // The spawned channel inherits the conversation type's security
-            // classification (== the parent's tier today). IAM Layer-1 gates
+            // classification (== the parent's classification today). IAM Layer-1 gates
             // the new channel on this tag, so it must match what the user can
             // reach.
             modelTier: typeConfig.classification,
@@ -295,7 +295,7 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
       messageId: event.requestAttributes?.['CHIME.message.id'] || randomUUID(),
       latestMessage: userMessage,
       intent: driftIntent,
-      userClearance: tier,
+      userClearance: classification,
       declinedDistances: routing.declinedDistances,
     });
 

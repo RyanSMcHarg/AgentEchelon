@@ -68,7 +68,7 @@ export interface ProfilesConfig {
  *  - modelKey: DEFAULT_PROFILE_MODEL_SELECTION {haiku,sonnet,opus} (model-strategy.ts)
  *  - classifierMode: 'llm' for all (DEVIATION: legacy basic used the keyword classifier;
  *    the new default classifies basic with the LLM too — surfaces when Phase 1 wires the router)
- *  - timeoutSeconds: per-tier async processor Lambda timeout (30/60/90; tier stacks)
+ *  - timeoutSeconds: per-classification async processor Lambda timeout (30/60/90; classification stacks)
  *  - rateLimitPerHour: rateLimitDefaults {60,120,240} (agent-tier-common.ts)
  *  - battleEligible: allowedBattleTiers default ['premium']
  *  - failClosedTo / groupClearance: resolveUserClearance + getChannelClassification fail-closed to 'basic'

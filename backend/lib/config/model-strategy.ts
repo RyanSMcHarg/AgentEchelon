@@ -228,7 +228,7 @@ export function getModelCatalog(region: string, account: string): Record<Backend
     //
     // Access: this is a Bedrock Marketplace model. The FIRST invocation auto-accepts the
     // marketplace offer (a confirmation email arrives) — there is no manual console "request
-    // access" step. Subscription is account-level, but the tier Lambda's least-privilege role has
+    // access" step. Subscription is account-level, but the classification Lambda's least-privilege role has
     // `bedrock:InvokeModel` and NOT `aws-marketplace:Subscribe`, so the account must be subscribed
     // once by a principal that can accept the offer (admin creds — done in dev us-east-1). After
     // that one-time acceptance the Lambda invokes freely.
@@ -262,19 +262,19 @@ export function parseProfileModelSelection(
 ): ProfileModelSelection {
   const selection: ProfileModelSelection = { ...DEFAULT_PROFILE_MODEL_SELECTION };
 
-  for (const tier of Object.keys(selection) as Classification[]) {
-    const requestedKey = requested[tier] as BackendModelKey | undefined;
+  for (const classification of Object.keys(selection) as Classification[]) {
+    const requestedKey = requested[classification] as BackendModelKey | undefined;
     if (!requestedKey) continue;
 
     const model = catalog[requestedKey];
     if (!model) {
-      throw new Error(`Unknown model key "${requestedKey}" for tier "${tier}"`);
+      throw new Error(`Unknown model key "${requestedKey}" for classification "${classification}"`);
     }
-    if (!model.allowedClassifications.includes(tier)) {
-      throw new Error(`Model "${requestedKey}" is not allowed for tier "${tier}"`);
+    if (!model.allowedClassifications.includes(classification)) {
+      throw new Error(`Model "${requestedKey}" is not allowed for classification "${classification}"`);
     }
 
-    selection[tier] = requestedKey;
+    selection[classification] = requestedKey;
   }
 
   return selection;
@@ -287,7 +287,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     primaryModel: 'haiku',
     fallbackModel: 'sonnet',
     preferredClearance: 'basic',
-    rationale: 'Fast, low-cost answers default to the cheapest capable model; fall back within Anthropic (Sonnet) rather than cross-provider. Basic tier (Sonnet not allowed) simply gets no fallback.',
+    rationale: 'Fast, low-cost answers default to the cheapest capable model; fall back within Anthropic (Sonnet) rather than cross-provider. Basic classification (Sonnet not allowed) simply gets no fallback.',
   },
   {
     intent: 'code_generation',
@@ -303,7 +303,7 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     primaryModel: 'gpt_oss_20b',
     fallbackModel: 'sonnet',
     preferredClearance: 'standard',
-    rationale: 'Detailed review should expose an OpenAI-on-Bedrock option while keeping a strong Anthropic fallback at the same tier.',
+    rationale: 'Detailed review should expose an OpenAI-on-Bedrock option while keeping a strong Anthropic fallback at the same classification.',
   },
   {
     intent: 'document_extraction',

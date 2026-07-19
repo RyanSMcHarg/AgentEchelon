@@ -1,12 +1,12 @@
 /**
  * Unit tests for the shared live-drift flow (lambda/src/lib/live-drift-flow.ts).
  *
- * This is the flow EVERY tier now runs (extracted from the Stage-4-deleted
+ * This is the flow EVERY classification now runs (extracted from the Stage-4-deleted
  * shared router). The tests pin the gates that decide whether drift runs:
  *   - infra gate  (ENABLE_LIVE_DRIFT + AURORA_DATA_PLANE_ARN present — the Aurora hookup)
- *   - policy gate (the CONVERSATION TYPE's driftEnabled — NOT the tier)
+ *   - policy gate (the CONVERSATION TYPE's driftEnabled — NOT the classification)
  *   - battle suppression
- * and the basic-tier path specifically (basic had no drift code before).
+ * and the basic-classification path specifically (basic had no drift code before).
  *
  * The module reads ENABLE_LIVE_DRIFT/AURORA_DATA_PLANE_ARN at load, so each scenario
  * re-requires it under the right env via `loadFlow`.
@@ -56,7 +56,7 @@ jest.mock('../../lambda/src/lib/routing-state', () => ({
   classifyConfirmDeclineReply: (...a: unknown[]) => mockClassifyReply(...a),
 }));
 jest.mock('../../lib/config/conversation-types', () => ({
-  resolveConversationTypeKey: (o: { explicitType?: string; tier: string }) => o.explicitType || o.tier,
+  resolveConversationTypeKey: (o: { explicitType?: string; classification: string }) => o.explicitType || o.classification,
   getConversationTypeConfig: (k: string) => ({
     classification: k === 'premium' ? 'premium' : k === 'standard' ? 'standard' : 'basic',
     driftEnabled: mockDriftEnabled,
@@ -92,7 +92,7 @@ const baseInput = {
   channelArn: CHANNEL,
   userMessage: 'tell me about quantum tunneling',
   userSub: 'u1',
-  tier: 'basic' as const,
+  classification: 'basic' as const,
   botArn: 'arn:aws:chime:us-east-1:111:app-instance/i/bot/basic',
   intent: 'general',
 };
@@ -152,7 +152,7 @@ describe('battle suppression', () => {
   });
 });
 
-describe('basic-tier drift path (basic had no drift before the re-home)', () => {
+describe('basic-classification drift path (basic had no drift before the re-home)', () => {
   it('runs detectDrift and emits the suggestion template when drift fires', async () => {
     mockDetectDrift.mockResolvedValue({
       isDrift: true,
@@ -165,10 +165,10 @@ describe('basic-tier drift path (basic had no drift before the re-home)', () => 
     mockSavePending.mockResolvedValue({ taskId: 'task-1' });
 
     const flow = loadFlow(ENABLED);
-    const result = await flow.runLiveDriftFlow({ ...baseInput, tier: 'basic' });
+    const result = await flow.runLiveDriftFlow({ ...baseInput, classification: 'basic' });
 
     expect(mockDetectDrift).toHaveBeenCalledTimes(1);
-    // detectDrift gets the tier as its EMF dimension and the uppercased intent.
+    // detectDrift gets the classification as its EMF dimension and the uppercased intent.
     expect(mockDetectDrift).toHaveBeenCalledWith(
       expect.objectContaining({ channelArn: CHANNEL, userClearance: 'basic', intent: 'GENERAL' }),
     );
@@ -202,7 +202,7 @@ describe('confirm path creates a channel at the type classification', () => {
     mockCreateConversationFromDrift.mockResolvedValue({ channelArn: 'arn:new:channel', channelId: 'cid' });
 
     const flow = loadFlow(ENABLED);
-    const result = await flow.runLiveDriftFlow({ ...baseInput, tier: 'premium' });
+    const result = await flow.runLiveDriftFlow({ ...baseInput, classification: 'premium' });
 
     expect(mockCreateConversationFromDrift).toHaveBeenCalledTimes(1);
     // The spawned channel inherits the conversation type's classification.
@@ -234,7 +234,7 @@ describe('confirm path creates a channel at the type classification', () => {
     mockCreateConversationFromDrift.mockResolvedValue({ channelArn: 'arn:new:from-durable', channelId: 'cid7' });
 
     const flow = loadFlow(ENABLED);
-    const result = await flow.runLiveDriftFlow({ ...baseInput, tier: 'premium', userMessage: 'yes' });
+    const result = await flow.runLiveDriftFlow({ ...baseInput, classification: 'premium', userMessage: 'yes' });
 
     // The durable task was consulted (session had nothing)...
     expect(mockReadPending).toHaveBeenCalledWith({ userSub: 'u1', channelArn: CHANNEL });
@@ -279,7 +279,7 @@ describe('confirm path creates a channel at the type classification', () => {
 
     const flow = loadFlow(ENABLED);
     const ackText = 'yes please';
-    await flow.runLiveDriftFlow({ ...baseInput, tier: 'premium', userMessage: ackText });
+    await flow.runLiveDriftFlow({ ...baseInput, classification: 'premium', userMessage: ackText });
 
     expect(mockCreateConversationFromDrift).toHaveBeenCalledTimes(1);
     const createArgs = mockCreateConversationFromDrift.mock.calls[0][0] as Record<string, unknown>;
