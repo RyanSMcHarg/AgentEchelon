@@ -105,7 +105,7 @@ export const US_CROSS_REGION_PROFILE_REGIONS = [
  * Foundation-model ARNs for a model invoked through a `us.` cross-region
  * inference profile: the deploy region plus every profile member region,
  * deduped. Consumed by the catalog so the IAM grant
- * (`collectArnsForTier` → `foundationModelArns`) covers every region the
+ * (`collectArnsForClassification` → `foundationModelArns`) covers every region the
  * profile can fan out to. A non-US deploy region is unioned in defensively
  * (the catalog still hardcodes `us.` profiles — a true non-US deployment
  * is out of scope and documented elsewhere).

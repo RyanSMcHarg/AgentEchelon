@@ -2,8 +2,8 @@
  * Model Resolver
  *
  * Maps classified intents to specific Bedrock models using the
- * INTENT_ROUTE_STRATEGY from model-strategy.ts. Enforces tier-based
- * access control at the code level — a basic-tier request will never
+ * INTENT_ROUTE_STRATEGY from model-strategy.ts. Enforces classification-based
+ * access control at the code level — a basic-classification request will never
  * resolve to a premium-only model even if the strategy says so.
  *
  * Used by async processors to select the right model per intent.
@@ -49,12 +49,12 @@ export function intentTypeToRouteKey(intent: string | undefined): RouteKey {
 }
 
 // Ordinal capability/cost ranking, reusing each catalog entry's `costClass`.
-// Used to enforce the tier floor: never resolve below the tier's default model.
+// Used to enforce the classification floor: never resolve below the classification's default model.
 const COST_RANK: Record<'low' | 'medium' | 'high', number> = { low: 0, medium: 1, high: 2 };
 
 // Trivial intents that should stay on the cheapest capable model for ALL tiers —
 // a greeting or "thanks" does not warrant a premium-grade invoke. Everything else
-// is subject to the tier floor below.
+// is subject to the classification floor below.
 const TRIVIAL_INTENTS = new Set<string>(['greeting', 'acknowledgment']);
 
 export interface ModelResolution {
@@ -67,22 +67,22 @@ export interface ModelResolution {
 }
 
 /**
- * Resolve the best model for a given intent and tier.
+ * Resolve the best model for a given intent and classification.
  *
  * 1. Maps the classifier's IntentType string to an RouteKey
  * 2. Looks up the INTENT_ROUTE_STRATEGY for that key
- * 3. Checks that the strategy's primaryModel is allowed for this tier
- * 4. Falls back to the tier's default model if not allowed
+ * 3. Checks that the strategy's primaryModel is allowed for this classification
+ * 4. Falls back to the classification's default model if not allowed
  * 5. Same logic for fallbackModel
  */
 export function resolveModelForIntent(
   intent: string | undefined,
-  tier: Classification,
+  classification: Classification,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
   strategy: IntentRouteDefinition[],
   profileDefaults: ProfileModelSelection,
 ): ModelResolution {
-  const defaultModel = catalog[profileDefaults[tier]];
+  const defaultModel = catalog[profileDefaults[classification]];
   const defaultResolution: ModelResolution = {
     primaryModelId: bedrockInvokeId(defaultModel),
     primaryModelKey: defaultModel.key,
@@ -100,15 +100,15 @@ export function resolveModelForIntent(
   const route = strategy.find((r) => r.intent === routeKey);
   if (!route) return { ...defaultResolution, routeKey };
 
-  // Resolve primary model — must be allowed for this tier
+  // Resolve primary model — must be allowed for this classification
   const primaryDef = catalog[route.primaryModel];
   let primaryModelId: string;
   let primaryModelKey: BackendModelKey;
 
-  if (primaryDef && primaryDef.allowedClassifications.includes(tier)) {
-    // Tier floor: a strategy primary can be allowed for a tier yet weaker than
-    // that tier's default model (e.g. general_qa → haiku, which IS allowed for
-    // premium). For any non-trivial intent, never resolve below the tier default,
+  if (primaryDef && primaryDef.allowedClassifications.includes(classification)) {
+    // Classification floor: a strategy primary can be allowed for a classification yet weaker than
+    // that classification's default model (e.g. general_qa → haiku, which IS allowed for
+    // premium). For any non-trivial intent, never resolve below the classification default,
     // so a premium user gets a premium-grade response instead of silently
     // dropping to Haiku. Lower tiers still degrade to their own (cheaper) floor;
     // greetings/acknowledgments bypass the floor and stay on Haiku for everyone.
@@ -121,17 +121,17 @@ export function resolveModelForIntent(
       primaryModelKey = primaryDef.key;
     }
   } else {
-    // Primary not allowed for this tier — use tier default
+    // Primary not allowed for this classification — use classification default
     primaryModelId = bedrockInvokeId(defaultModel);
     primaryModelKey = defaultModel.key;
   }
 
-  // Resolve fallback model — must be allowed for this tier and different from primary
+  // Resolve fallback model — must be allowed for this classification and different from primary
   let fallbackModelId: string | null = null;
   let fallbackModelKey: BackendModelKey | null = null;
 
   const fallbackDef = catalog[route.fallbackModel];
-  if (fallbackDef && fallbackDef.allowedClassifications.includes(tier) && fallbackDef.key !== primaryModelKey) {
+  if (fallbackDef && fallbackDef.allowedClassifications.includes(classification) && fallbackDef.key !== primaryModelKey) {
     fallbackModelId = bedrockInvokeId(fallbackDef);
     fallbackModelKey = fallbackDef.key;
   }
@@ -197,16 +197,16 @@ export function visionRejectMessage(modelKey: string): string {
 }
 
 /**
- * Collect all Bedrock ARNs that a given tier might need access to.
+ * Collect all Bedrock ARNs that a given classification might need access to.
  * Used by CDK to generate IAM policies from the catalog rather than hardcoding.
  */
-export function collectArnsForTier(
-  tier: Classification,
+export function collectArnsForClassification(
+  classification: Classification,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
 ): string[] {
   const arns: string[] = [];
   for (const model of Object.values(catalog)) {
-    if (model.allowedClassifications.includes(tier)) {
+    if (model.allowedClassifications.includes(classification)) {
       arns.push(...model.foundationModelArns);
       if (model.inferenceProfileArns) {
         arns.push(...model.inferenceProfileArns);

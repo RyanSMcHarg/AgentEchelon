@@ -1,10 +1,10 @@
 /**
  * Unit tests for model-resolver
  *
- * Tests intent → model mapping with tier-based access control.
+ * Tests intent → model mapping with classification-based access control.
  */
 
-import { resolveModelForIntent, collectArnsForTier } from '../lambda/src/lib/model-resolver';
+import { resolveModelForIntent, collectArnsForClassification } from '../lambda/src/lib/model-resolver';
 import type {
   BackendModelDefinition,
   BackendModelKey,
@@ -169,16 +169,16 @@ describe('resolveModelForIntent', () => {
     expect(result.resolvedFromStrategy).toBe(false);
   });
 
-  it('applies the tier floor: a strategy primary weaker than the tier default is raised to the floor', () => {
+  it('applies the classification floor: a strategy primary weaker than the classification default is raised to the floor', () => {
     // general_qa → haiku, but standard's floor is sonnet — a non-trivial question
-    // must not drop below the tier default.
+    // must not drop below the classification default.
     const result = resolveModelForIntent('general', 'standard', catalog, strategy, profileDefaults);
     expect(result.primaryModelKey).toBe('sonnet');
     expect(result.primaryModelId).toBe('arn:aws:bedrock:us-east-1:123:inference-profile/sonnet');
     expect(result.resolvedFromStrategy).toBe(true);
   });
 
-  it('applies the tier floor for premium: a general question resolves to Opus, not Haiku', () => {
+  it('applies the classification floor for premium: a general question resolves to Opus, not Haiku', () => {
     // The core bug this fixes: general_qa → haiku IS allowed for premium, so without
     // a floor a premium user silently got Haiku. Premium permission ⇒ premium response.
     const result = resolveModelForIntent('general', 'premium', catalog, strategy, profileDefaults);
@@ -187,7 +187,7 @@ describe('resolveModelForIntent', () => {
     expect(result.resolvedFromStrategy).toBe(true);
   });
 
-  it('leaves basic at Haiku (its tier floor IS Haiku — lower tiers may degrade)', () => {
+  it('leaves basic at Haiku (its classification floor IS Haiku — lower tiers may degrade)', () => {
     const result = resolveModelForIntent('general', 'basic', catalog, strategy, profileDefaults);
     expect(result.primaryModelKey).toBe('haiku');
   });
@@ -198,8 +198,8 @@ describe('resolveModelForIntent', () => {
     expect(result.primaryModelId).toBe('anthropic.claude-3-haiku');
   });
 
-  it('downgrades primary model when tier does not allow it', () => {
-    // strategic_analysis → opus, but basic tier can't use opus
+  it('downgrades primary model when classification does not allow it', () => {
+    // strategic_analysis → opus, but basic classification can't use opus
     const result = resolveModelForIntent('general', 'basic', catalog, strategy, profileDefaults);
     expect(result.primaryModelId).toBe('anthropic.claude-3-haiku');
     expect(result.primaryModelKey).toBe('haiku');
@@ -213,9 +213,9 @@ describe('resolveModelForIntent', () => {
     expect(result.fallbackModelKey).toBe('titan');
   });
 
-  it('nulls fallback when tier does not allow it', () => {
-    // strategic_analysis → opus/sonnet, basic tier can't use either
-    // So primary falls to tier default (haiku), fallback (sonnet) not allowed for basic
+  it('nulls fallback when classification does not allow it', () => {
+    // strategic_analysis → opus/sonnet, basic classification can't use either
+    // So primary falls to classification default (haiku), fallback (sonnet) not allowed for basic
     const customStrategy: IntentRouteDefinition[] = [
       {
         intent: 'general_qa',
@@ -232,7 +232,7 @@ describe('resolveModelForIntent', () => {
     expect(result.fallbackModelId).toBeNull(); // sonnet not allowed for basic
   });
 
-  it('premium tier gets full strategy resolution', () => {
+  it('premium classification gets full strategy resolution', () => {
     const customStrategy: IntentRouteDefinition[] = [
       {
         intent: 'general_qa',
@@ -254,9 +254,9 @@ describe('resolveModelForIntent', () => {
   });
 });
 
-describe('collectArnsForTier', () => {
-  it('returns only ARNs for models the tier can access', () => {
-    const basicArns = collectArnsForTier('basic', catalog);
+describe('collectArnsForClassification', () => {
+  it('returns only ARNs for models the classification can access', () => {
+    const basicArns = collectArnsForClassification('basic', catalog);
     expect(basicArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/haiku');
     expect(basicArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/titan');
     expect(basicArns).not.toContain('arn:aws:bedrock:us-east-1::foundation-model/opus');
@@ -264,12 +264,12 @@ describe('collectArnsForTier', () => {
   });
 
   it('includes inference profile ARNs', () => {
-    const standardArns = collectArnsForTier('standard', catalog);
+    const standardArns = collectArnsForClassification('standard', catalog);
     expect(standardArns).toContain('arn:aws:bedrock:us-east-1:123:inference-profile/sonnet');
   });
 
-  it('premium tier gets all models', () => {
-    const premiumArns = collectArnsForTier('premium', catalog);
+  it('premium classification gets all models', () => {
+    const premiumArns = collectArnsForClassification('premium', catalog);
     expect(premiumArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/haiku');
     expect(premiumArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/sonnet');
     expect(premiumArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/opus');

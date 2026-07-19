@@ -35,14 +35,14 @@ export interface IntentDef {
   key: string;
   /** One line the LLM classifier sees describing when this intent applies. */
   description: string;
-  /** Lowercase substrings for the no-LLM keyword fallback (basic tier / LLM failure). */
+  /** Lowercase substrings for the no-LLM keyword fallback (basic classification / LLM failure). */
   keywords: string[];
   /** How a turn of this intent is delivered. Domain intents are usually PLACEHOLDER_UPDATE
    *  (one generated reply, updated in place) or TASK_MULTI_STEP (a tracked multi-step task). */
   delivery: IntentDeliveryClass;
   /** Optional per-intent response shaping. Forwarded in the event to
    *  the processor (D2). Omitted ⇒ the processor's default budget. `maxTokens` is clamped to the
-   *  per-tier ceiling and the reasoning-turn floor at resolve time. */
+   *  per-classification ceiling and the reasoning-turn floor at resolve time. */
   maxTokens?: number;
   verbosity?: ResponseVerbosity;
 }
@@ -166,7 +166,7 @@ function coerceIntentDef(raw: unknown): IntentDef | null {
   const delivery: IntentDeliveryClass =
     r.delivery === 'DIRECT' || r.delivery === 'TASK_MULTI_STEP' ? r.delivery : 'PLACEHOLDER_UPDATE';
   // Per-intent response shaping (optional). A positive integer maxTokens + a known verbosity are
-  // kept; anything else is dropped (not silently lost). Clamping to tier ceiling / reasoning
+  // kept; anything else is dropped (not silently lost). Clamping to classification ceiling / reasoning
   // floor happens at resolve time in the processor, not here.
   const maxTokens =
     typeof r.maxTokens === 'number' && Number.isFinite(r.maxTokens) && r.maxTokens > 0
@@ -303,7 +303,7 @@ export function deliveryClassForIntent(intent: string, pack: IntentPack = getInt
 /**
  * Per-intent response shaping for a classified intent key (P3 / D2). Domain intents read their
  * `maxTokens`/`verbosity` from the pack; universal keys (greeting/acknowledgment/general) have no
- * override here. The AgentHandler forwards this in the event; the processor clamps it to the tier
+ * override here. The AgentHandler forwards this in the event; the processor clamps it to the classification
  * ceiling + reasoning floor. Empty object ⇒ the processor uses its default budget.
  */
 export function responseSettingsForIntent(
@@ -319,8 +319,8 @@ export function responseSettingsForIntent(
 }
 
 /**
- * Clamp a requested per-intent `maxTokens` to the tier ceiling and reasoning floor (P3, pure). The
- * forwarded per-intent budget WINS but can never exceed the tier ceiling; absent ⇒ the ceiling
+ * Clamp a requested per-intent `maxTokens` to the classification ceiling and reasoning floor (P3, pure). The
+ * forwarded per-intent budget WINS but can never exceed the classification ceiling; absent ⇒ the ceiling
  * (today's default). Reasoning turns keep a higher floor (the chain-of-thought eats the budget).
  */
 export function clampResponseMaxTokens(

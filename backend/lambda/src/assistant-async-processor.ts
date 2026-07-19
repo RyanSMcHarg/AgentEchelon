@@ -594,7 +594,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       cnBedrock || cnCfg
         ? resolveModelPlan(
             {
-              tier: CONFIG.userType,
+              classification: CONFIG.userType,
               intent: event.intent,
               experimentModelId: event.resolvedModel,
               userLanguage: event.userLanguage,
