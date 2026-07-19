@@ -32,7 +32,13 @@ import {
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+// Dual-plane CORS: chat and admin origins both call this endpoint, so
+// ALLOWED_ORIGIN is a comma list and we echo the matching request Origin
+// (SPEC-SEPARATE-ADMIN-APP.md). '*' short-circuits to allow-all (dev/federated).
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '*')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 const SESSION_DURATION_SECONDS = Number(process.env.EXCHANGE_SESSION_SECONDS || '3600');
 // Moderation creds are shorter-lived: enough to perform the action, then they expire
 // (STS minimum is 900s). Bounds the window in which an elevated cred exists at all.
@@ -130,9 +136,15 @@ interface ExchangeResult {
   scopedTo?: string | null;
 }
 
-function cors() {
+function corsOrigin(event: any): string {
+  if (ALLOWED_ORIGINS.includes('*')) return '*';
+  const origin = event?.headers?.origin || event?.headers?.Origin;
+  return origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+}
+
+function cors(event: any) {
   return {
-    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+    'Access-Control-Allow-Origin': corsOrigin(event),
     'Access-Control-Allow-Headers': 'Authorization,Content-Type',
     'Access-Control-Allow-Methods': 'POST,OPTIONS',
     'Content-Type': 'application/json',
@@ -195,14 +207,14 @@ async function ensureAdminIdentity(sub: string, displayName: string): Promise<st
 }
 export const handler = async (event: any): Promise<{ statusCode: number; headers: Record<string, string>; body: string }> => {
   if (event?.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: cors(), body: '' };
+    return { statusCode: 204, headers: cors(event), body: '' };
   }
 
   // Identity comes ONLY from the validated Cognito-authorizer claims — never the body.
   const claims = event?.requestContext?.authorizer?.claims || {};
   const sub: string = claims.sub || '';
   if (!sub) {
-    return { statusCode: 401, headers: cors(), body: JSON.stringify({ error: 'Unauthenticated' }) };
+    return { statusCode: 401, headers: cors(event), body: JSON.stringify({ error: 'Unauthenticated' }) };
   }
 
   // Per-request scope: the client names the capabilities it needs (default: the
@@ -224,7 +236,7 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
   if (scopeChannelArn && !scopeChannelArn.startsWith(`${APP_INSTANCE_ARN}/channel/`)) {
     return {
       statusCode: 400,
-      headers: cors(),
+      headers: cors(event),
       body: JSON.stringify({ error: 'channelArn must be a channel of this app instance' }),
     };
   }
@@ -232,7 +244,7 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
   if (unknownCaps.length) {
     return {
       statusCode: 400,
-      headers: cors(),
+      headers: cors(event),
       body: JSON.stringify({ error: `unknown capabilities: ${unknownCaps.join(', ')}` }),
     };
   }
@@ -251,21 +263,21 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
   const adminPlane = requestedIdentity === 'admin';
   if (adminPlane) {
     if (roleKey !== 'admin') {
-      return { statusCode: 403, headers: cors(), body: JSON.stringify({ error: 'admin plane requires the admins group' }) };
+      return { statusCode: 403, headers: cors(event), body: JSON.stringify({ error: 'admin plane requires the admins group' }) };
     }
     if (!scopeChannelArn) {
-      return { statusCode: 400, headers: cors(), body: JSON.stringify({ error: 'admin plane requires a channelArn scope' }) };
+      return { statusCode: 400, headers: cors(event), body: JSON.stringify({ error: 'admin plane requires a channelArn scope' }) };
     }
   } else if (requestsModeration) {
     // Moderation is never on the chat plane: the chat identity carries no moderation
     // authority. It must be requested on the admin plane, which is always channel-scoped.
-    return { statusCode: 400, headers: cors(), body: JSON.stringify({ error: 'moderation capabilities require plane:admin with a channelArn scope' }) };
+    return { statusCode: 400, headers: cors(event), body: JSON.stringify({ error: 'moderation capabilities require plane:admin with a channelArn scope' }) };
   }
 
   const roleArn = adminPlane ? EXCHANGE_ROLE_ADMIN_PLANE : EXCHANGE_ROLE_ARNS[roleKey];
   if (!roleArn) {
     console.error('[CredentialExchange] No exchange role ARN configured for', adminPlane ? 'admin-plane' : roleKey);
-    return { statusCode: 500, headers: cors(), body: JSON.stringify({ error: 'Exchange misconfigured' }) };
+    return { statusCode: 500, headers: cors(event), body: JSON.stringify({ error: 'Exchange misconfigured' }) };
   }
   // Reported access class: admins report 'admin', otherwise the caller's clearance.
   const accessClass = roleKey === 'admin' ? 'admin' : roleKey;
@@ -364,9 +376,9 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
       identity: requestedIdentity,
       scopedTo: scopeChannelArn || null,
     };
-    return { statusCode: 200, headers: cors(), body: JSON.stringify(result) };
+    return { statusCode: 200, headers: cors(event), body: JSON.stringify(result) };
   } catch (err) {
     console.error('[CredentialExchange] failed:', err);
-    return { statusCode: 500, headers: cors(), body: JSON.stringify({ error: 'Credential exchange failed' }) };
+    return { statusCode: 500, headers: cors(event), body: JSON.stringify({ error: 'Credential exchange failed' }) };
   }
 };

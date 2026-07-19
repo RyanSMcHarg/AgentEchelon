@@ -32,6 +32,14 @@ export interface FrontendDistributionProps {
    * `enableManagedWaf` is false.
    */
   wafAllowedIps?: string[];
+  /**
+   * Root/SPA-fallback document served by the distribution. Default `index.html`
+   * (the chat SPA). The standalone admin app builds its entry to `admin.html`
+   * (its own Vite entry, `dist-admin/admin.html`), so the admin distribution
+   * passes `admin.html` here — used for both `defaultRootObject` and the
+   * 403/404 SPA fallback so deep links resolve on the admin origin too.
+   */
+  rootDocument?: string;
 }
 
 /**
@@ -128,6 +136,7 @@ export class FrontendDistribution extends Construct {
     //   • Optional IP allowlist (private mode): a leading rule that blocks any
     //     source IP not in `wafAllowedIps`. Evaluated FIRST, so non-listed IPs
     //     are blocked outright; listed IPs still pass through the managed rules.
+    const rootDocument = props.rootDocument ?? 'index.html';
     const stackName = cdk.Stack.of(this).stackName;
     const wafAllowedIps = props.wafAllowedIps ?? [];
     const enableManagedWaf = props.enableManagedWaf ?? true;
@@ -220,7 +229,7 @@ export class FrontendDistribution extends Construct {
         cachePolicy: cloudfront.CachePolicy.CACHING_OPTIMIZED,
         responseHeadersPolicy,
       },
-      defaultRootObject: 'index.html',
+      defaultRootObject: rootDocument,
       // SPA routing: client-side routes (and refreshes / email deep links) hit
       // S3 keys that don't exist → S3 returns 403 (OAC) / 404. Serve the app
       // shell with a 200 so the router can resolve the path.
@@ -228,13 +237,13 @@ export class FrontendDistribution extends Construct {
         {
           httpStatus: 403,
           responseHttpStatus: 200,
-          responsePagePath: '/index.html',
+          responsePagePath: `/${rootDocument}`,
           ttl: cdk.Duration.minutes(5),
         },
         {
           httpStatus: 404,
           responseHttpStatus: 200,
-          responsePagePath: '/index.html',
+          responsePagePath: `/${rootDocument}`,
           ttl: cdk.Duration.minutes(5),
         },
       ],

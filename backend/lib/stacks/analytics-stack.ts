@@ -16,6 +16,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
+import { adminOrigin, sharedOrigins } from '../config/app-origins';
 import { ALL_PARTITION_VALUES } from '../../lambda/src/lib/client-event-types';
 import * as kinesis from 'aws-cdk-lib/aws-kinesis';
 import * as firehose from 'aws-cdk-lib/aws-kinesisfirehose';
@@ -550,6 +551,9 @@ export class AnalyticsStack extends cdk.Stack {
     // ============================================================
 
     const appUrl = this.node.tryGetContext('appUrl') || 'http://localhost:5173';
+    // The analytics query API is admin-only → the admin console origin. (The
+    // client-events ingestion API below stays chat-facing on appUrl.)
+    const adminAppUrl = adminOrigin(this);
 
     const analyticsQueryFn = new lambdaNodeJs.NodejsFunction(this, 'AnalyticsQueryFunction', {
       entry: './lambda/src/analytics-query.ts',
@@ -562,7 +566,7 @@ export class AnalyticsStack extends cdk.Stack {
         ...adminAuthEnv(this),
         ATHENA_WORKGROUP: ATHENA_WORKGROUP_NAME,
         ATHENA_DATABASE: ANALYTICS_DB_NAME,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: adminAppUrl,
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
@@ -571,7 +575,11 @@ export class AnalyticsStack extends cdk.Stack {
       restApiName: 'Agent Echelon Analytics',
       description: 'Analytics query API for admin dashboard',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        // Co-hosts the admin analytics query routes AND the chat-facing /events
+        // ingestion route, so the shared preflight allows both origins; each
+        // Lambda echoes only its own origin (analytics -> adminAppUrl, events ->
+        // appUrl) in the actual response.
+        allowOrigins: sharedOrigins(this),
         allowMethods: ['POST', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },

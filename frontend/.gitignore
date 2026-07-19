@@ -9,9 +9,14 @@ lerna-debug.log*
 
 node_modules
 dist
+dist-admin
 dist-widget
 dist-ssr
 *.local
+
+# Generated admin-console env (SPEC-SEPARATE-ADMIN-APP.md) — deployment URLs, not
+# committed. `.env` is ignored via the root .gitignore; mirror that for .env.admin.
+.env.admin
 
 # Editor directories and files
 .vscode/*

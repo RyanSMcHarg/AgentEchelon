@@ -5,7 +5,9 @@ import './LoginScreen.css';
 
 interface LoginScreenProps {
   onLogin: (email: string, password: string) => Promise<void>;
-  onSwitchToRegister: () => void;
+  /** Switch to the self-service registration screen. Omitted on surfaces that do
+   *  not allow self-registration (e.g. the admin console), which hides the link. */
+  onSwitchToRegister?: () => void;
   /** Non-null when sign-in hit a NEW_PASSWORD_REQUIRED challenge (admin first
    *  login with a temporary password). Switches the form to "set a new password". */
   passwordChallenge?: { email: string } | null;
@@ -231,7 +233,7 @@ export function LoginScreen({
         </form>
         )}
 
-        {!passwordChallenge && !mfaChallenge && (
+        {!passwordChallenge && !mfaChallenge && onSwitchToRegister && (
         <div className="login-register-link">
           {t('auth.login.noAccountPrompt')}{' '}
           <button onClick={onSwitchToRegister} className="link-button">

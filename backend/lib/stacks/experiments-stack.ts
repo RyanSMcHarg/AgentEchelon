@@ -26,6 +26,7 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
+import { adminOrigin, sharedOrigins } from '../config/app-origins';
 import { SHARED_SSM, INSTANCE_SSM, SSM_ROOT } from './agent-classification-common';
 
 export interface ExperimentsStackProps extends cdk.StackProps {
@@ -46,7 +47,13 @@ export class ExperimentsStack extends cdk.Stack {
 
     const isProduction = this.node.tryGetContext('isProduction') === 'true';
     const dataRemovalPolicy = isProduction ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY;
-    const appUrl = this.node.tryGetContext('appUrl') || props.appUrl || 'http://localhost:5173';
+    // Experiments is dual-plane: the admin console does CRUD and the chat client
+    // reads a channel's assignment (ChannelMembersPanel), so its API + Lambda
+    // trust BOTH origins (admin-experiments.ts echoes the matching request Origin
+    // from the comma list). manage-profiles (/admin/profiles) is admin-only.
+    // SPEC-SEPARATE-ADMIN-APP.md.
+    const experimentsOrigins = sharedOrigins(this);
+    const adminAppUrl = adminOrigin(this);
     // AgentEchelonBattle owns + publishes this roster; admin-experiments only READS it
     // (by name) to denormalize altBotSlotId → altBotSlotArn for battle experiments.
     const altBotRosterParamName = INSTANCE_SSM.altBotSlotsRoster;
@@ -109,7 +116,7 @@ export class ExperimentsStack extends cdk.Stack {
         EXPERIMENTS_TABLE: experimentsTable.tableName,
         APP_INSTANCE_ARN: props.appInstanceArn,
         ALT_BOT_SLOTS_ROSTER_PARAM: altBotRosterParamName,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: experimentsOrigins.join(','),
         // Battle eligibility is per-profile config now (AssistantProfile.battleEligible), read by
         // experiment-manager.ts via the registry — no longer an ALLOWED_BATTLE_TIERS env var.
       },
@@ -120,7 +127,7 @@ export class ExperimentsStack extends cdk.Stack {
       restApiName: 'AI Agent Experiments API',
       description: 'Admin A/B experiments CRUD',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        allowOrigins: experimentsOrigins,
         allowMethods: ['GET', 'POST', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },
@@ -182,7 +189,7 @@ export class ExperimentsStack extends cdk.Stack {
         ...adminAuthEnv(this),
         SSM_ROOT,
         AWS_ACCOUNT_ID: this.account,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: adminAppUrl,
         // MANAGE_PROFILES_GROUP_NAMES (optional) narrows who holds the capability; defaults to admins.
       },
       bundling: { minify: false, forceDockerBundling: false },

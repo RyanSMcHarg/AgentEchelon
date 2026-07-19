@@ -12,8 +12,6 @@ import ConversationList from './components/ConversationList';
 import ConversationInterface from './components/ConversationInterface';
 import MessageInput from './components/MessageInput';
 import NewConversationModal from './components/NewConversationModal';
-import AdminDashboard from './components/admin/AdminDashboard';
-import { detectAnalyticsMode } from './services/analyticsService';
 import ErrorBoundary from './components/ErrorBoundary';
 import DeploymentStatusBanner from './components/DeploymentStatusBanner';
 import './App.css';
@@ -22,7 +20,7 @@ type AuthView = 'login' | 'register' | 'verify' | 'success' | 'forgot';
 
 function AppContent() {
   const {
-    user, isAuthenticated, isLoading, login, register, passwordChallenge, completeNewPassword,
+    isAuthenticated, isLoading, login, register, passwordChallenge, completeNewPassword,
     mfaChallenge, completeMfa, forgotPassword, confirmForgotPassword, resendCode,
   } = useAuth();
   const { isInitialized } = useAwsClient();
@@ -30,12 +28,6 @@ function AppContent() {
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [authView, setAuthView] = useState<AuthView>('login');
   const [registeredEmail, setRegisteredEmail] = useState('');
-  const [isAdminView, setIsAdminView] = useState(false);
-  // Which analytics backend this deployment runs (env-first, then a backend
-  // probe). Drives the admin dashboard's mode-specific banners; without it the
-  // dashboard defaults to 'athena' and an Aurora deployment mis-tells the
-  // operator to "redeploy with analyticsMode=aurora".
-  const [analyticsMode, setAnalyticsMode] = useState<'athena' | 'aurora'>('athena');
 
   // Deep link: auto-select conversation from the `?conversation=<id>` query
   // param (share + proactive-briefing emails). selectConversation resolves the
@@ -55,48 +47,6 @@ function AppContent() {
       window.history.replaceState({}, '', window.location.pathname);
     });
   }, [isAuthenticated, isInitialized, selectConversation]);
-
-  // Resolve the analytics mode once authenticated (the backend probe needs a
-  // token). Env var short-circuits the probe when set.
-  useEffect(() => {
-    if (!isAuthenticated) return;
-    let cancelled = false;
-    void detectAnalyticsMode().then((mode) => {
-      if (!cancelled) setAnalyticsMode(mode);
-    });
-    return () => {
-      cancelled = true;
-    };
-  }, [isAuthenticated]);
-
-  // The admin console is URL-addressable via `?admin` so it can be deep-linked
-  // (a foundation for automated reporting) and so the browser Back button
-  // returns to the app instead of leaving the site (#44). Opening admin pushes a
-  // history entry; Back/popstate syncs the view from the URL. Sub-tab-level deep
-  // links (`?admin=<tab>`) are handled in AdminDashboard, which owns the tab VALUE
-  // in the query param; this effect owns the `?admin` PRESENCE (console open/closed).
-  useEffect(() => {
-    const sync = () => setIsAdminView(new URLSearchParams(window.location.search).has('admin'));
-    sync();
-    window.addEventListener('popstate', sync);
-    return () => window.removeEventListener('popstate', sync);
-  }, []);
-
-  const openAdmin = () => {
-    const url = new URL(window.location.href);
-    url.searchParams.set('admin', '1');
-    window.history.pushState({}, '', url);
-    setIsAdminView(true);
-  };
-
-  const goHome = () => {
-    const url = new URL(window.location.href);
-    if (url.searchParams.has('admin')) {
-      url.searchParams.delete('admin');
-      window.history.replaceState({}, '', url);
-    }
-    setIsAdminView(false);
-  };
 
   if (isLoading) {
     return (
@@ -180,27 +130,13 @@ function AppContent() {
     );
   }
 
-  // The admin console renders ONLY for a member of the `admins` group. `isAdminView`
-  // tracks the `?admin` URL param (deep-link/Back support), but the URL alone must never
-  // reveal the console: any authenticated user could set `?admin=1`, so the render is gated
-  // on `user?.isAdmin` here. The backend independently enforces `requireAdmin` on every admin
-  // API, so this is the UI-affordance gate, not the authorization boundary.
-  if (isAdminView && user?.isAdmin) {
-    return (
-      <div className="app">
-        <Header onAdminToggle={goHome} isAdminView={true} onHome={goHome} />
-        <AdminDashboard onBack={goHome} analyticsMode={analyticsMode} />
-      </div>
-    );
-  }
-
+  // The admin console is a SEPARATE app (AgentEchelonAdminFrontend, admin.html /
+  // admin-main.tsx) served from its own origin — it is NOT a route in this chat
+  // SPA. The chat bundle therefore carries no operator code or admin endpoints;
+  // assert-no-admin-in-chat.mjs pins that invariant. See SPEC-SEPARATE-ADMIN-APP.md.
   return (
     <div className="app">
-      <Header
-        onAdminToggle={openAdmin}
-        isAdminView={false}
-        onHome={goHome}
-      />
+      <Header />
       <div className="app-content">
         <div className="app-sidebar">
           <div className="app-sidebar-header">

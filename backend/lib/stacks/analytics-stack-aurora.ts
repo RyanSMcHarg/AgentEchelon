@@ -43,6 +43,7 @@ import * as sns from 'aws-cdk-lib/aws-sns';
 import * as snsSubs from 'aws-cdk-lib/aws-sns-subscriptions';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
+import { adminOrigin, sharedOrigins } from '../config/app-origins';
 import * as path from 'path';
 import { Construct } from 'constructs';
 import { IAnalyticsStackOutputs } from '../interfaces/analytics-stack-interface.js';
@@ -1393,7 +1394,8 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
         environment: {
           ...adminAuthEnv(this),
           ...dbEnvironment,
-          ALLOWED_ORIGINS: this.node.tryGetContext('appUrl') || 'http://localhost:5173',
+          // Admin-only analytics query API → the admin console origin.
+          ALLOWED_ORIGINS: adminOrigin(this),
           // Thumbs per-variant join. Empty => join skipped.
           ...(props.feedbackTableName ? { FEEDBACK_TABLE: props.feedbackTableName } : {}),
           // Battle-wins join. The
@@ -1464,6 +1466,10 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     // a defense-in-depth admin-group check too — the gateway authorizer is the
     // outer ring.
     const appUrl = this.node.tryGetContext('appUrl') || 'http://localhost:5173';
+    // The analytics + membership-audit APIs are admin-only → the admin console
+    // origin. (The client-events ingestion + deployment-state APIs below stay
+    // chat-facing on appUrl.) SPEC-SEPARATE-ADMIN-APP.md.
+    const adminAppUrl = adminOrigin(this);
     // Admin-plane auth mode (ae-cognito default / federated / service) — see
     // docs/ADMIN-INTEGRATION-GUIDE.md. In ae-cognito mode this uses a Cognito
     // authorizer on AE's own user pool.
@@ -1483,17 +1489,23 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
         ...apiAccessLogConfig(this, 'AuroraAnalyticsApiAccessLogs'),
       },
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        // This RestApi co-hosts admin routes (/analytics/*, /audit/*) AND the
+        // chat-facing /events ingestion route, so the shared OPTIONS preflight
+        // must allow BOTH origins. Each Lambda still echoes only its own origin
+        // in the actual response (analytics/audit -> adminAppUrl; events -> appUrl).
+        allowOrigins: sharedOrigins(this),
         allowMethods: ['GET', 'POST', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },
     });
 
-    // Gateway CORS for error responses (incl. 401 from the new authorizer)
+    // Gateway CORS for error responses (incl. 401 from the analytics authorizer).
+    // Static single-origin: these primarily surface analytics-query/authorizer
+    // errors to the admin console, so they carry the admin origin.
     analyticsApi.addGatewayResponse('GatewayResponse4XX', {
       type: apigateway.ResponseType.DEFAULT_4XX,
       responseHeaders: {
-        'Access-Control-Allow-Origin': `'${appUrl}'`,
+        'Access-Control-Allow-Origin': `'${adminAppUrl}'`,
         'Access-Control-Allow-Headers': "'Content-Type,Authorization'",
         'Access-Control-Allow-Methods': "'GET,POST,OPTIONS'",
       },
@@ -1501,7 +1513,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     analyticsApi.addGatewayResponse('GatewayResponse5XX', {
       type: apigateway.ResponseType.DEFAULT_5XX,
       responseHeaders: {
-        'Access-Control-Allow-Origin': `'${appUrl}'`,
+        'Access-Control-Allow-Origin': `'${adminAppUrl}'`,
         'Access-Control-Allow-Headers': "'Content-Type,Authorization'",
         'Access-Control-Allow-Methods': "'GET,POST,OPTIONS'",
       },
@@ -1551,7 +1563,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           ...adminAuthEnv(this),
           AUDIT_TABLE: membershipAudit.auditTable.tableName,
           ADMIN_ARN_PARAM: INSTANCE_SSM.appInstanceAdminArn,
-          ALLOWED_ORIGINS: appUrl,
+          ALLOWED_ORIGINS: adminAppUrl,
         },
         bundling: { externalModules: ['@aws-sdk/*'], minify: true, sourceMap: true },
       });

@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
+import { adminOrigin, sharedOrigins } from '../config/app-origins';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -264,6 +265,10 @@ export class CognitoAuthStack extends cdk.Stack {
       sourceArn: this.userPool.userPoolArn,
     });
 
+    // Hosted-UI callback/logout origins: the real https interface origins (chat +
+    // admin), if configured. Localhost is added unconditionally below.
+    const oauthOrigins = sharedOrigins(this).filter((o) => o.startsWith('https://'));
+
     // Create User Pool Client for frontend
     this.userPoolClient = this.userPool.addClient('WebClient', {
       userPoolClientName: 'web-client',
@@ -281,13 +286,19 @@ export class CognitoAuthStack extends cdk.Stack {
           cognito.OAuthScope.OPENID,
           cognito.OAuthScope.PROFILE,
         ],
+        // The app authenticates with the raw Cognito SDK (USER_PASSWORD/SRP), not
+        // the hosted-UI authorization-code redirect, so these are only used if a
+        // deployer adopts the hosted UI. Both interface origins are registered so
+        // that path works from either app: the chat SPA (appUrl) and the standalone
+        // admin console (adminAppUrl). Localhost stays for development.
+        // SPEC-SEPARATE-ADMIN-APP.md.
         callbackUrls: [
-          'http://localhost:5173/callback', // Development
-          // Add production CloudFront URL here
+          'http://localhost:5173/callback',
+          ...oauthOrigins.map((o) => `${o}/callback`),
         ],
         logoutUrls: [
-          'http://localhost:5173/', // Development
-          // Add production CloudFront URL here
+          'http://localhost:5173/',
+          ...oauthOrigins.map((o) => `${o}/`),
         ],
       },
     });
@@ -397,7 +408,12 @@ export class CognitoAuthStack extends cdk.Stack {
     // the end-user over-grant cluster, and laying the federation substrate.
     // These are separate roles from the Identity-Pool roles above.
     // ============================================================
-    const appUrlForExchange = this.node.tryGetContext('appUrl') || 'http://localhost:5173';
+    // Credential-exchange is dual-plane: the chat SPA vends chat creds and the
+    // admin console vends `${sub}-admin` creds, both against this one endpoint. So
+    // its CORS must trust BOTH origins (credential-exchange.ts echoes the matching
+    // request Origin from the comma list). SPEC-SEPARATE-ADMIN-APP.md.
+    const exchangeOrigins = sharedOrigins(this);
+    const appUrlForExchange = exchangeOrigins.join(',');
     // The bearer pinned to the caller's own AppInstanceUser via the session tag.
     // NOTE: built by concatenation so the `${aws:PrincipalTag/sub}` IAM policy
     // variable is emitted literally (a template literal would try to interpolate it).
@@ -617,7 +633,7 @@ export class CognitoAuthStack extends cdk.Stack {
       restApiName: `${RES_PREFIX}-credential-exchange`,
       description: 'Vends bearer-pinned, classification-capped Chime creds (SPEC-CREDENTIAL-EXCHANGE)',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrlForExchange],
+        allowOrigins: exchangeOrigins,
         allowMethods: ['POST', 'OPTIONS'],
         allowHeaders: ['Authorization', 'Content-Type'],
       },
@@ -675,7 +691,13 @@ export class CognitoAuthStack extends cdk.Stack {
     // User Management API (admin-only)
     // ============================================================
 
-    const appUrl = this.node.tryGetContext('appUrl') || 'http://localhost:5173';
+    // CORS origins for this stack's admin-plane APIs after the console split
+    // (SPEC-SEPARATE-ADMIN-APP.md). User-management + admin-conversations are
+    // admin-only → the admin console origin. Feedback is dual-plane (chat POSTs
+    // thumbs, admin GETs the summary) → both origins (user-feedback.ts echoes the
+    // matching request Origin from the comma list).
+    const adminAppUrl = adminOrigin(this);
+    const feedbackOrigins = sharedOrigins(this);
 
     const userMgmtRole = new iam.Role(this, 'UserManagementRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
@@ -753,7 +775,7 @@ export class CognitoAuthStack extends cdk.Stack {
         SSM_ROOT,
         USER_POOL_ID: this.userPool.userPoolId,
         APP_INSTANCE_ARN: props.appInstanceArn,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: adminAppUrl,
         ADMIN_ARN_PARAM: INSTANCE_SSM.appInstanceAdminArn,
       },
       bundling: { minify: false, forceDockerBundling: false },
@@ -768,7 +790,7 @@ export class CognitoAuthStack extends cdk.Stack {
     const userMgmtApi = new apigateway.RestApi(this, 'UserManagementApi', {
       restApiName: 'Agent Echelon User Management',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        allowOrigins: [adminAppUrl],
         allowMethods: ['GET', 'POST', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },
@@ -864,7 +886,7 @@ export class CognitoAuthStack extends cdk.Stack {
         APP_INSTANCE_ARN: props.appInstanceArn,
         ATHENA_WORKGROUP: ATHENA_WORKGROUP_NAME,
         ATHENA_DATABASE: ANALYTICS_DB_NAME,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: adminAppUrl,
         // Aurora mode: the handler resolves this SSM param at cold start to get the
         // data-plane Lambda ARN and reads conversations from Aurora instead of the
         // slow Athena archive (BUG #21). Static param name (no cross-stack dep — a
@@ -903,7 +925,7 @@ export class CognitoAuthStack extends cdk.Stack {
     const adminConversationApi = new apigateway.RestApi(this, 'AdminConversationApi', {
       restApiName: 'Agent Echelon Admin Conversations',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        allowOrigins: [adminAppUrl],
         allowMethods: ['GET', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },
@@ -984,7 +1006,7 @@ export class CognitoAuthStack extends cdk.Stack {
       role: feedbackRole,
       environment: {
         FEEDBACK_TABLE: feedbackTable.tableName,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: feedbackOrigins.join(','),
         // M4: needed for the channel-membership check before recording feedback.
         APP_INSTANCE_ARN: props.appInstanceArn,
         // The GET summary is admin-gated via callerIsAdmin; give the handler the
@@ -1001,7 +1023,7 @@ export class CognitoAuthStack extends cdk.Stack {
     const feedbackApi = new apigateway.RestApi(this, 'UserFeedbackApi', {
       restApiName: 'Agent Echelon User Feedback',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        allowOrigins: feedbackOrigins,
         allowMethods: ['GET', 'POST', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },

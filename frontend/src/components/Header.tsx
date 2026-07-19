@@ -5,13 +5,11 @@ import ConnectionStatus from './ConnectionStatus';
 import './Header.css';
 
 interface HeaderProps {
-  onAdminToggle?: () => void;
-  isAdminView?: boolean;
-  /** Return to the app home (also exits the admin view). */
+  /** Return to the app home (brand click). */
   onHome?: () => void;
 }
 
-const Header: React.FC<HeaderProps> = ({ onAdminToggle, isAdminView, onHome }) => {
+const Header: React.FC<HeaderProps> = ({ onHome }) => {
   const { t } = useTranslation();
   const { user, logout } = useAuth();
 
@@ -36,15 +34,6 @@ const Header: React.FC<HeaderProps> = ({ onAdminToggle, isAdminView, onHome }) =
           <ConnectionStatus />
         </div>
         <div className="header-actions">
-          {user?.isAdmin && onAdminToggle && (
-            <button
-              className={`header-admin-btn${isAdminView ? ' is-active' : ''}`}
-              onClick={onAdminToggle}
-              aria-pressed={isAdminView}
-            >
-              {isAdminView ? t('header.conversations') : t('header.admin')}
-            </button>
-          )}
           {user && (
             <button
               className="header-logout-btn"

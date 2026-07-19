@@ -164,6 +164,12 @@ const enableManagedWaf = app.node.tryGetContext('frontendWaf') !== false
 const wafRateLimitCtx = app.node.tryGetContext('wafRateLimit');
 const wafRateLimit = wafRateLimitCtx ? Number(wafRateLimitCtx) : undefined;
 const wafAllowedIps = parseWafAllowedIps(app.node.tryGetContext('wafAllowedIps'));
+// Standalone admin console hosting (SPEC-SEPARATE-ADMIN-APP.md). OPT-IN: a
+// deployment may run headless or host its own console, so the AgentEchelonAdminFrontend
+// stack (its own S3 + CloudFront origin, serving admin.html) is only created with
+// `--context enableAdminApp=true`. The chat SPA never carries admin code either way.
+const enableAdminApp = app.node.tryGetContext('enableAdminApp') === true
+  || app.node.tryGetContext('enableAdminApp') === 'true';
 const modelCatalog = getModelCatalog(env.region, env.account ?? '');
 const profileModelSelection = parseProfileModelSelection({
   basic: app.node.tryGetContext('basicModelKey') || process.env.BASIC_MODEL_KEY,
@@ -486,6 +492,26 @@ const frontendStack = new FrontendStack(app, `${STACK_PREFIX}Frontend`, {
   description: 'CloudFront + S3 hosting for the AgentEchelon SPA',
 });
 void frontendStack;
+
+// Admin console hosting — the separate operator-interface origin (layer 4 of the
+// four-layer deploy ordering; SPEC-SEPARATE-ADMIN-APP.md). Opt-in and independent:
+// its own S3 + CloudFront serving admin.html (dist-admin/), 'Admin*'-prefixed
+// outputs so they don't collide with the chat stack's. The admin UI is synced
+// separately (deploy-frontend.mjs, admin target); after it deploys, redeploy the
+// backend with `--context adminAppUrl=<AdminDistributionUrl>` so the admin APIs'
+// CORS trusts the admin origin.
+const adminFrontendStack = enableAdminApp
+  ? new FrontendStack(app, `${STACK_PREFIX}AdminFrontend`, {
+      env,
+      enableManagedWaf,
+      wafRateLimit,
+      wafAllowedIps,
+      rootDocument: 'admin.html',
+      outputPrefix: 'Admin',
+      description: 'CloudFront + S3 hosting for the standalone AgentEchelon admin console',
+    })
+  : undefined;
+void adminFrontendStack;
 
 // Add stack dependencies
 analyticsStack.addDependency(chimeStack);

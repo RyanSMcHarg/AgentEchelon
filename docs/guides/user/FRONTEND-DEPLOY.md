@@ -73,6 +73,55 @@ skip this round-trip. Point the domain at the distribution and attach an
 ACM certificate (us-east-1) to it; the `AgentEchelonFrontend` construct can be
 extended with `domainNames` + `certificate` for that.
 
+## Deploying the standalone admin console (optional)
+
+The operator console is a **separate app on its own origin**, not a route in the
+chat SPA (see `docs/specs/admin-console/SPEC-SEPARATE-ADMIN-APP.md`). The chat
+bundle carries no admin code or admin endpoint URLs. Deploying an admin UI is
+opt-in - a deployment may run headless or host its own console - and when present
+it is always the separate app.
+
+It is layer 4 of the deploy ordering (core foundations, admin foundations, chat
+interface, admin interface), so deploy it last, as two steps of its own:
+
+```bash
+# 1. Create the admin hosting (opt-in): its own S3 + CloudFront origin serving
+#    admin.html. Prefixed outputs (AdminDistributionUrl / AdminDistributionBucketName
+#    / AdminDistributionId) so they don't collide with the chat stack's.
+cd backend
+npx cdk deploy AgentEchelonAdminFrontend --context enableAdminApp=true
+
+# 2. Regenerate the env files. gen-frontend-env now writes TWO files:
+#      frontend/.env        chat SPA + shared vars (no admin endpoint URLs)
+#      frontend/.env.admin  admin-only vars (analytics, user-management,
+#                           admin-conversations, analytics mode)
+node scripts/gen-frontend-env.mjs
+
+# 3. Build + publish the admin app (npm run build:admin -> dist-admin/admin.html).
+npm run deploy-frontend -- --admin
+
+# 4. Close the admin CORS loop: point the admin APIs' CORS at the admin origin.
+npx cdk deploy --all \
+  --context appUrl=https://<chat-dist>.cloudfront.net \
+  --context adminAppUrl=https://<admin-dist>.cloudfront.net
+```
+
+### The two-origin CORS model
+
+Each admin/analytics API trusts exactly the origin(s) that legitimately call it:
+
+- **Admin-only** (analytics query, user-management, admin-conversations,
+  membership-audit): trust `adminAppUrl` only.
+- **Consumed by both apps** (feedback, experiments, credential-exchange): trust
+  **both** `appUrl` and `adminAppUrl` (the handlers echo the matching request
+  origin from a comma list).
+- **Chat-only** (client-events, deployment-state, messaging): keep `appUrl`.
+
+`adminAppUrl` defaults to `appUrl` until you set it, so the admin origin is simply
+untrusted until step 4 - the same two-phase bootstrap `appUrl` already uses. The
+admin console gates its own entry on the `admins` group; `requireAdmin` remains the
+authorization boundary on every admin API regardless of origin.
+
 ## Running locally vs. on CloudFront
 
 There are two ways to run the app, and the backend's CORS allowlist decides
