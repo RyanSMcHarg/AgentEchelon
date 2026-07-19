@@ -26,7 +26,7 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
-import { SHARED_SSM, INSTANCE_SSM } from './agent-classification-common';
+import { SHARED_SSM, INSTANCE_SSM, SSM_ROOT } from './agent-classification-common';
 
 export interface ExperimentsStackProps extends cdk.StackProps {
   appInstanceArn: string;
@@ -39,6 +39,7 @@ export class ExperimentsStack extends cdk.Stack {
   public readonly experimentsTableName: string;
   public readonly experimentsTableArn: string;
   public readonly experimentsApiUrl: string;
+  public readonly manageProfilesApiUrl: string;
 
   constructor(scope: Construct, id: string, props: ExperimentsStackProps) {
     super(scope, id, props);
@@ -148,6 +149,57 @@ export class ExperimentsStack extends cdk.Stack {
       .addMethod('POST', integration, experimentsAuthOptions);
 
     this.experimentsApiUrl = `${api.url}admin/experiments`;
+
+    // ── manage-profiles API (SPEC-PORTABLE-VERSIONED-PROFILES P1/P3) ────────────
+    // The versioning + import/export lifecycle for assistant profiles, on the SAME admin API (no new
+    // gateway, §3). This role is the ONLY sanctioned WRITE path to the profile SSM namespace (§7): the
+    // async-processor role stays read-only on /assistant/*; here we grant read + write + label, scoped
+    // to this instance's assistant namespace. The handler additionally gates on the `manage-profiles`
+    // capability (distinct from view-*, A14).
+    const manageProfilesRole = new iam.Role(this, 'ManageProfilesRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      inlinePolicies: {
+        ProfileDefinitionsSSM: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['ssm:GetParameter', 'ssm:GetParameterHistory', 'ssm:PutParameter', 'ssm:LabelParameterVersion'],
+              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*`],
+            }),
+          ],
+        }),
+      },
+      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')],
+    });
+
+    const manageProfilesFn = new lambdaNodeJs.NodejsFunction(this, 'ManageProfilesFunction', {
+      entry: './lambda/src/manage-profiles.ts',
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: cdk.Duration.seconds(20),
+      memorySize: 256,
+      role: manageProfilesRole,
+      environment: {
+        ...adminAuthEnv(this),
+        SSM_ROOT,
+        AWS_ACCOUNT_ID: this.account,
+        ALLOWED_ORIGIN: appUrl,
+        // MANAGE_PROFILES_GROUP_NAMES (optional) narrows who holds the capability; defaults to admins.
+      },
+      bundling: { minify: false, forceDockerBundling: false },
+    });
+
+    const manageProfilesIntegration = new apigateway.LambdaIntegration(manageProfilesFn);
+    const profilesResource = adminRoot.addResource('profiles');
+    profilesResource.addMethod('GET', manageProfilesIntegration, experimentsAuthOptions); // list
+    for (const action of ['version', 'draft', 'validate', 'activate', 'rollback', 'export', 'import']) {
+      profilesResource.addResource(action).addMethod('POST', manageProfilesIntegration, experimentsAuthOptions);
+    }
+    this.manageProfilesApiUrl = `${api.url}admin/profiles`;
+    new cdk.CfnOutput(this, 'ManageProfilesApiUrl', {
+      value: this.manageProfilesApiUrl,
+      description: 'Profile versioning admin API (VITE_MANAGE_PROFILES_API_URL)',
+      exportName: `${this.stackName}-ManageProfilesApiUrl`,
+    });
 
     new cdk.CfnOutput(this, 'ExperimentsApiUrl', {
       value: this.experimentsApiUrl,

@@ -201,6 +201,31 @@ export function callerCanReadArchive(event: APIGatewayProxyEvent): boolean {
   return parseGroups(claims['cognito:groups']).some((g) => ARCHIVE_VIEW_GROUPS.has(g));
 }
 
+/**
+ * `manage-profiles` capability — versioning/import lifecycle for assistant profiles
+ * (SPEC-PORTABLE-VERSIONED-PROFILES §7, plan item A14). A DISTINCT capability from `view-*`: who may
+ * version/activate/import an assistant is separately denyable, not "any admin".
+ *
+ * INTERIM (this seam, same shape as `callerCanReadArchive`): a configurable Cognito group
+ * `MANAGE_PROFILES_GROUP_NAMES`, defaulting to the admin groups so current admins keep access; narrow
+ * it to deny a role. The IAM-ENFORCEABLE version (an `execute-api:Invoke` capability on the
+ * profile-management routes, §7) is A14's tracked work — this group gate is the placeholder, NOT the
+ * final control. See memory `admin-actions-iam-enforceable`.
+ */
+const MANAGE_PROFILES_GROUPS = new Set<string>(
+  (process.env.MANAGE_PROFILES_GROUP_NAMES || process.env.ADMIN_GROUP_NAMES || 'admins')
+    .split(',')
+    .map((g) => g.trim())
+    .filter(Boolean),
+);
+
+export function callerCanManageProfiles(event: APIGatewayProxyEvent): boolean {
+  if (isServiceAdminCall(event)) return true;
+  const claims = event.requestContext?.authorizer?.claims as Record<string, unknown> | undefined;
+  if (!claims) return false;
+  return parseGroups(claims['cognito:groups']).some((g) => MANAGE_PROFILES_GROUPS.has(g));
+}
+
 /** Standard CORS headers for API Gateway responses. */
 export function corsHeaders(origin?: string): Record<string, string> {
   return {

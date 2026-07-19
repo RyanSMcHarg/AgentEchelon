@@ -79,6 +79,45 @@ export function profileDefinitionConfigId(body: ProfileDefinitionBody): string {
   return createHash('sha256').update(canonicalBody(body), 'utf8').digest('hex').slice(0, 12);
 }
 
+/**
+ * Validate a runtime-editable body. Returns a list of human-readable errors (empty ⇒ valid). The
+ * §7 model-ARN boundary (modelKey within the deployment's InvokeModel allowlist) is NOT checked here —
+ * it needs the model catalog and is enforced by the write path (profile-lifecycle validate); this is
+ * the schema/shape check shared by the runtime parse and the lifecycle validate.
+ */
+export function validateDefinitionBody(body: Partial<ProfileDefinitionBody>): string[] {
+  const errs: string[] = [];
+  if (typeof body.modelKey !== 'string' || !body.modelKey) errs.push('modelKey required');
+  if (body.classifierMode !== 'keyword' && body.classifierMode !== 'llm') errs.push('classifierMode must be keyword|llm');
+  if (typeof body.timeoutSeconds !== 'number' || body.timeoutSeconds <= 0) errs.push('timeoutSeconds must be a positive number');
+  if (body.taskSupport !== 'lightweight' && body.taskSupport !== 'full') errs.push('taskSupport must be lightweight|full');
+  if (body.rateLimitPerHour !== undefined && (typeof body.rateLimitPerHour !== 'number' || body.rateLimitPerHour < 0)) errs.push('rateLimitPerHour must be a non-negative number');
+  if (body.battleEligible !== undefined && typeof body.battleEligible !== 'boolean') errs.push('battleEligible must be a boolean');
+  return errs;
+}
+
+/** Assemble a stored definition from a name + a (validated) body, stamping schemaVersion + configId. */
+export function buildDefinition(profileName: string, body: ProfileDefinitionBody): ProfileDefinition {
+  return {
+    schemaVersion: PROFILE_DEFINITION_SCHEMA_VERSION,
+    profileName,
+    ...body,
+    configId: profileDefinitionConfigId(body),
+  };
+}
+
+/** Narrow a full/partial object down to just the runtime-editable body keys (drops name/scope/etc.). */
+export function bodyFrom(obj: Partial<ProfileDefinitionBody>): ProfileDefinitionBody {
+  return {
+    modelKey: obj.modelKey as string,
+    classifierMode: obj.classifierMode as 'keyword' | 'llm',
+    timeoutSeconds: obj.timeoutSeconds as number,
+    taskSupport: obj.taskSupport as 'lightweight' | 'full',
+    ...(obj.rateLimitPerHour !== undefined ? { rateLimitPerHour: obj.rateLimitPerHour } : {}),
+    ...(obj.battleEligible !== undefined ? { battleEligible: obj.battleEligible } : {}),
+  };
+}
+
 /** Extract the runtime-editable body from a full (seed) AssistantProfile. */
 function bodyOf(profile: AssistantProfile): ProfileDefinitionBody {
   return {
@@ -126,12 +165,8 @@ function parseDefinition(raw: string, expectedName: string): ProfileDefinition {
   if (d.profileName !== expectedName) {
     throw new Error(`definition profileName '${d.profileName}' != segment '${expectedName}'`);
   }
-  if (typeof d.modelKey !== 'string' || !d.modelKey) throw new Error('definition: modelKey required');
-  if (d.classifierMode !== 'keyword' && d.classifierMode !== 'llm') throw new Error('definition: bad classifierMode');
-  if (typeof d.timeoutSeconds !== 'number' || d.timeoutSeconds <= 0) throw new Error('definition: bad timeoutSeconds');
-  if (d.taskSupport !== 'lightweight' && d.taskSupport !== 'full') throw new Error('definition: bad taskSupport');
-  if (d.rateLimitPerHour !== undefined && typeof d.rateLimitPerHour !== 'number') throw new Error('definition: bad rateLimitPerHour');
-  if (d.battleEligible !== undefined && typeof d.battleEligible !== 'boolean') throw new Error('definition: bad battleEligible');
+  const errs = validateDefinitionBody(d);
+  if (errs.length) throw new Error(`definition invalid: ${errs.join('; ')}`);
   return d as ProfileDefinition;
 }
 
