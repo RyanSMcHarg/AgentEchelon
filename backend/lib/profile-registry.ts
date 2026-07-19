@@ -106,6 +106,14 @@ export class ProfileRegistry {
     return p;
   }
 
+  /** The compiled-in (seed) profile by its NAME, or undefined if none is declared. This is the
+   *  fail-closed fallback the runtime active-version resolver reverts to when the SSM definition is
+   *  absent/corrupt (SPEC-PORTABLE-VERSIONED-PROFILES §3 "fail-closed: ... falls back to the seed").
+   *  Unlike profileFor(classification), this keys on the profile name (the /assistant/{name} segment). */
+  profileByName(name: string): AssistantProfile | undefined {
+    return this.profilesByName.get(name);
+  }
+
   /** The Cognito group -> highest-classification-it-clears-for map (a copy). Group names are a
    *  deployment choice; used to create the groups and attach each to its classification's role. */
   get groupClearance(): Record<string, string> {
