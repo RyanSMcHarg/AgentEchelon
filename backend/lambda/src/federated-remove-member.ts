@@ -14,22 +14,22 @@ const messaging = new ChimeSDKMessagingClient({});
 const ssm = new SSMClient({});
 
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN!;
-// Classification this federated assistant is provisioned at (env renamed from ASSISTANT_TIER).
-const TIER = (process.env.ASSISTANT_CLASSIFICATION || 'basic').trim();
+// Classification this federated assistant is provisioned at (SPEC-CAPABILITY-PROFILES).
+const CLASSIFICATION = (process.env.ASSISTANT_CLASSIFICATION || 'basic').trim();
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/assistant/${TIER}/bot-arn`;
+const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || `${SSM_ROOT}/assistant/${CLASSIFICATION}/bot-arn`;
 
 let cachedBotArn: string | null = null;
 async function getBotArn(): Promise<string> {
   if (cachedBotArn !== null) return cachedBotArn;
   const r = await ssm.send(new GetParameterCommand({ Name: BOT_ARN_PARAM }));
   cachedBotArn = r.Parameter?.Value || '';
-  if (!cachedBotArn) throw new Error(`per-tier bot ARN ${BOT_ARN_PARAM} is empty`);
+  if (!cachedBotArn) throw new Error(`per-classification bot ARN ${BOT_ARN_PARAM} is empty`);
   return cachedBotArn;
 }
 
 function channelIdFor(contextType: string, contextId: string): string {
-  return `fed-${TIER}-${contextType}-${contextId}`.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64);
+  return `fed-${CLASSIFICATION}-${contextType}-${contextId}`.replace(/[^A-Za-z0-9_-]/g, '-').slice(0, 64);
 }
 
 interface RemoveMemberEvent {

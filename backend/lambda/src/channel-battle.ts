@@ -279,7 +279,7 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
   }
   // Act as the channel's per-classification bot (its creator+member) for the alt-bot
   // membership add + announcement. Premium by default; the channel's own classification
-  // when /battle is opened to other tiers.
+  // when /battle is opened to other classifications.
   const botArn = await resolveBotArn(channelClassification);
   if (!botArn) {
     return respond(500, { error: `${channelClassification} bot ARN not configured` }, origin);
