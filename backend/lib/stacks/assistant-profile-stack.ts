@@ -430,6 +430,12 @@ export class AssistantProfileStack extends cdk.Stack {
       // Read the persona from SSM at cold start (always — the param may exist from a preserved prior deploy).
       asyncProcessor.addToRolePolicy(new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [systemPromptParamArn] }));
     }
+    // SPEC-PORTABLE-VERSIONED-PROFILES P0/§7: the processor resolves its active profile VERSION from
+    // this param at runtime. READ-ONLY — the boundary keeps the async-processor role off the write path
+    // (`ssm:PutParameter`/label ops on /assistant/* belong only to the future manage-profiles role); the
+    // `:active` label read uses the same parameter ARN. Absent param ⇒ the resolver fails closed to the seed.
+    const definitionParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/${classification}/definition`;
+    asyncProcessor.addToRolePolicy(new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [definitionParamArn] }));
     if (topo.imageGen) {
       // External-HTTP image-gen provider keys (OpenAI / FAL) — PREFERRED: a Secrets Manager secret the
       // processor fetches + caches at runtime, so nothing sensitive sits in the Lambda config.

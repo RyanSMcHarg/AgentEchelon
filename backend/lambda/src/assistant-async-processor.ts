@@ -77,8 +77,11 @@ import {
 import { resolveModelForIntent } from './lib/model-resolver.js';
 import { clampResponseMaxTokens } from './lib/intent-pack.js';
 import { getModelCatalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION, bedrockInvokeId } from '../../lib/config/model-strategy.js';
+import { resolveActiveProfile } from './lib/active-profile.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
+// SPEC-PORTABLE-VERSIONED-PROFILES P0: root for the per-profile SSM namespace (/{root}/assistant/{name}/…).
+const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
 
 // The serving profile (= the classification's profile name, e.g. 'basic'/'standard'/'premium').
 // Set by the assistant-profile stack; drives the persona default + the model-strategy userType key.
@@ -558,12 +561,23 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // Resolve model for this intent (respects classification boundaries). When the bot is an alt-slot
     // in a battle, the variant's modelKey wins.
     const catalog = getModelCatalog(process.env.AWS_REGION || 'us-east-1', process.env.AWS_ACCOUNT_ID || '');
+    // P0 (SPEC-PORTABLE-VERSIONED-PROFILES): the profile's BASE model comes from the ACTIVE version in
+    // SSM, not the deploy-time default — so activating a new profile version re-models the assistant
+    // with NO redeploy. Fail-closed to the compiled seed (== today's deploy default), so a deployment
+    // that never versions behaves byte-identically. A version whose modelKey is not in this catalog is
+    // ignored here (the deploy-time default holds) — the §7 model-ARN boundary is deploy-owned; a
+    // version selects WITHIN it, never beyond. Battle/experiment models still win over this base below.
+    const active = await resolveActiveProfile(PROFILE_NAME, { ssm: ssmClient, ssmRoot: SSM_ROOT });
+    const activeModelKey = active.profile.modelKey;
+    const baseModelSelection = (catalog as Record<string, unknown>)[activeModelKey]
+      ? { ...DEFAULT_PROFILE_MODEL_SELECTION, [CONFIG.userType]: activeModelKey }
+      : DEFAULT_PROFILE_MODEL_SELECTION;
     const resolution = resolveModelForIntent(
       event.intent || event.resolvedModel,
       CONFIG.userType,
       catalog,
       INTENT_ROUTE_STRATEGY,
-      DEFAULT_PROFILE_MODEL_SELECTION,
+      baseModelSelection,
     );
     const variantDef = battleVariantModelKey
       ? catalog[battleVariantModelKey as keyof typeof catalog]
@@ -571,6 +585,14 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     const variantBedrockModelId = variantDef ? bedrockInvokeId(variantDef) : undefined;
     const effectiveModel = variantBedrockModelId || event.resolvedModel || resolution.primaryModelId;
     const invokeConfig = { ...CONFIG, model: effectiveModel };
+    // P0 attribution: which profile VERSION served this turn's base model ('seed' = the compiled
+    // default, i.e. no active version). Battle/experiment overrides still take precedence above.
+    console.log('[AssistantAsyncProcessor] active profile', {
+      profile: PROFILE_NAME,
+      profileConfigId: active.configId,
+      baseModelKey: activeModelKey,
+      effectiveModel,
+    });
 
     // Context-aware model routing (SPEC-CONTEXT-AWARE-MODEL-ROUTING), flag-gated + battle-exclusive.
     // When ENABLE_CONTEXT_ROUTING is off (or this is a /battle turn), `plan` is null and the Bedrock
@@ -605,7 +627,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
             {
               catalog,
               strategy: INTENT_ROUTE_STRATEGY,
-              profileDefaults: DEFAULT_PROFILE_MODEL_SELECTION,
+              profileDefaults: baseModelSelection,
               enabled: true,
               cnBedrock,
               cnProvider: cnCfg ? { provider: cnCfg.provider, modelId: cnCfg.model } : null,

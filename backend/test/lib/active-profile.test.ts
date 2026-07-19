@@ -15,6 +15,7 @@ import {
   PROFILE_DEFINITION_SCHEMA_VERSION,
 } from '../../lambda/src/lib/active-profile';
 import { defaultProfileRegistry } from '../../lib/profile-registry';
+import { DEFAULT_PROFILE_MODEL_SELECTION } from '../../lib/config/model-strategy';
 
 const SSM_ROOT = '/agent-echelon';
 
@@ -123,6 +124,18 @@ describe('active-profile P0 resolution', () => {
     clock += 200; // TTL expired
     await resolveActiveProfile('standard', opts);
     expect((ssm.send as jest.Mock).mock.calls.length).toBe(2);
+  });
+
+  it('DECOUPLE is behavior-neutral on the seed: each seed modelKey == the deploy-default selection', () => {
+    // The async-processor overrides the base model selection with the active version's modelKey. On the
+    // seed (fail-closed), that override must equal DEFAULT_PROFILE_MODEL_SELECTION so the resolved base
+    // model is byte-identical to today. This is the P0 "behavior diff empty on the seed" acceptance.
+    for (const name of ['basic', 'standard', 'premium'] as const) {
+      const seedModelKey = defaultProfileRegistry.profileByName(name)!.modelKey;
+      expect(seedModelKey).toBe(DEFAULT_PROFILE_MODEL_SELECTION[name]);
+      const baseSelection = { ...DEFAULT_PROFILE_MODEL_SELECTION, [name]: seedModelKey };
+      expect(baseSelection).toEqual(DEFAULT_PROFILE_MODEL_SELECTION);
+    }
   });
 
   it('configId is stable and body-derived (order-independent)', () => {
