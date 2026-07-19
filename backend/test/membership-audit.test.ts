@@ -25,10 +25,15 @@ jest.mock('@aws-sdk/client-chime-sdk-messaging', () => {
   class DescribeChannelCommand { _t = 'describe'; constructor(public input: unknown) {} }
   class DeleteChannelMembershipCommand { _t = 'delete'; constructor(public input: unknown) {} }
   class SendChannelMessageCommand { _t = 'send'; constructor(public input: unknown) {} }
+  // The handler resolves the channel's tier from the IMMUTABLE `classification`
+  // tag (ListTagsForResource), NOT mutable `metadata.modelTier` — see
+  // membership-audit.ts resolveChannelTier(). So the mock must serve the tag.
+  class ListTagsForResourceCommand { _t = 'listtags'; constructor(public input: unknown) {} }
   return {
     ChimeSDKMessagingClient: jest.fn(() => ({
       send: async (cmd: { _t: string; input: unknown }) => {
         chimeSends.push(cmd);
+        if (cmd._t === 'listtags') return { Tags: [{ Key: 'classification', Value: channelModelTier }] };
         if (cmd._t === 'describe') return { Channel: { Metadata: JSON.stringify({ modelTier: channelModelTier }) } };
         return {};
       },
@@ -36,6 +41,7 @@ jest.mock('@aws-sdk/client-chime-sdk-messaging', () => {
     DescribeChannelCommand,
     DeleteChannelMembershipCommand,
     SendChannelMessageCommand,
+    ListTagsForResourceCommand,
   };
 });
 
@@ -55,8 +61,10 @@ jest.mock('@aws-sdk/client-ssm', () => {
     SSMClient: jest.fn(() => ({
       send: async (cmd: { input: { Name: string } }) => {
         const name = cmd.input?.Name || '';
-        if (name.includes('/tier/')) {
-          const tier = name.split('/tier/')[1].split('/')[0]; // basic | standard | premium
+        // Per-assistant bot-arn keys are `${SSM_ROOT}/assistant/{tier}/bot-arn`
+        // (migrated from the legacy `/tier/{tier}/…` path).
+        if (name.includes('/assistant/')) {
+          const tier = name.split('/assistant/')[1].split('/')[0]; // basic | standard | premium
           return { Parameter: { Value: `${APP}/bot/${tier}` } };
         }
         return { Parameter: { Value: `${APP}/user/agent-echelon-admin` } };
@@ -144,7 +152,7 @@ describe('handler (report-only default)', () => {
   it('alerts but does NOT revoke a basic member on a premium channel', async () => {
     await audit.handler(kinesisEvent(`${APP}/user/basic-sub`));
     const kinds = chimeSends.map((c) => c._t);
-    expect(kinds).toContain('describe'); // resolved channel tier
+    expect(kinds).toContain('listtags'); // resolved channel classification from the immutable tag
     expect(kinds).toContain('send'); // posted the admin-conversation alert
     expect(kinds).not.toContain('delete'); // report-only: no revocation
     expect(mockFanOut).toHaveBeenCalledTimes(1); // email fan-out attempted

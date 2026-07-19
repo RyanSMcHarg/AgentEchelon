@@ -33,6 +33,9 @@ jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   DescribeChannelCommand: jest.fn().mockImplementation((args) => ({ __type: 'DescribeChannel', input: args })),
   DescribeChannelMembershipCommand: jest.fn().mockImplementation((args) => ({ __type: 'DescribeChannelMembership', input: args })),
   ListChannelModeratorsCommand: jest.fn().mockImplementation((args) => ({ __type: 'ListModerators', input: args })),
+  // The tier gate keys on the IMMUTABLE `classification` tag (ListTagsForResource),
+  // NOT mutable `metadata.modelTier` — see channel-battle.ts resolveChannelClassification().
+  ListTagsForResourceCommand: jest.fn().mockImplementation((args) => ({ __type: 'ListTags', input: args })),
   SendChannelMessageCommand: jest.fn().mockImplementation((args) => ({ __type: 'SendMessage', input: args })),
   ChannelMessageType: { STANDARD: 'STANDARD' },
   ChannelMessagePersistenceType: { PERSISTENT: 'PERSISTENT' },
@@ -84,6 +87,13 @@ function makeEvent(args: {
   } as unknown as APIGatewayProxyEvent;
 }
 
+// Queue the classification-tag read (ListTagsForResource). The handler resolves
+// the channel's tier from this immutable tag, called AFTER DescribeChannel
+// (createdBy) and BEFORE ListChannelModerators — so queue it in that order.
+function queueClassificationTag(tier: string) {
+  mockMessagingSend.mockResolvedValueOnce({ Tags: [{ Key: 'classification', Value: tier }] });
+}
+
 async function loadHandler() {
   jest.resetModules();
   jest.doMock('@aws-sdk/client-chime-sdk-messaging', () => ({
@@ -98,6 +108,8 @@ async function loadHandler() {
     // stub the response so
     // the caller is/is-not a moderator as the case under test requires.
     ListChannelModeratorsCommand: jest.fn().mockImplementation((args) => ({ __type: 'ListModerators', input: args })),
+    // Tier gate reads the immutable `classification` tag, not metadata.modelTier.
+    ListTagsForResourceCommand: jest.fn().mockImplementation((args) => ({ __type: 'ListTags', input: args })),
     SendChannelMessageCommand: jest.fn().mockImplementation((args) => ({ __type: 'SendMessage', input: args })),
     ChannelMessageType: { STANDARD: 'STANDARD' },
     ChannelMessagePersistenceType: { PERSISTENT: 'PERSISTENT' },
@@ -194,13 +206,15 @@ describe('POST /channels/battle/enable', () => {
   //   2. ScanCommand → findSlotConflicts (no conflicts)
   //   3. PutCommand → write ChannelBattleConfig row
   function mockSuccessfulEnable() {
-    // 1. DescribeChannel → premium-tier, created by caller
+    // 1. DescribeChannel → created by caller (createdBy read from metadata)
     mockMessagingSend.mockResolvedValueOnce({
       Channel: {
         Metadata: JSON.stringify({ modelTier: 'premium', createdBy: CALLER_ARN }),
       },
     });
-    // moderator-list check post-DescribeChannel
+    // 1b. classification tag → premium (battle-eligible); the real tier gate
+    queueClassificationTag('premium');
+    // moderator-list check post-tier-gate
     mockModeratorOk();
     // 2. loadExperiment GetCommand
     mockDdbSend.mockResolvedValueOnce({
@@ -285,6 +299,7 @@ describe('POST /channels/battle/enable', () => {
       mockMessagingSend.mockResolvedValueOnce({
         Channel: { Metadata: JSON.stringify({ modelTier: 'basic', createdBy: CALLER_ARN }) },
       });
+      queueClassificationTag('basic'); // the tag, not metadata, gates the tier
       const handler = await loadHandler();
       const res = await handler(makeEvent({
         method: 'POST',
@@ -299,6 +314,7 @@ describe('POST /channels/battle/enable', () => {
       mockMessagingSend.mockResolvedValueOnce({
         Channel: { Metadata: JSON.stringify({ modelTier: 'standard', createdBy: CALLER_ARN }) },
       });
+      queueClassificationTag('standard'); // the tag, not metadata, gates the tier
       const handler = await loadHandler();
       const res = await handler(makeEvent({
         method: 'POST',
@@ -313,6 +329,7 @@ describe('POST /channels/battle/enable', () => {
       mockMessagingSend.mockResolvedValueOnce({
         Channel: { Metadata: JSON.stringify({ modelTier: 'premium', createdBy: OTHER_ARN }) },
       });
+      queueClassificationTag('premium'); // passes the tier gate, so the moderator check runs
       // moderator list does NOT include CALLER_ARN
       mockMessagingSend.mockResolvedValueOnce({
         ChannelModerators: [{ Moderator: { Arn: OTHER_ARN } }],
@@ -358,6 +375,7 @@ describe('POST /channels/battle/enable', () => {
       mockMessagingSend.mockResolvedValueOnce({
         Channel: { Metadata: JSON.stringify({ modelTier: 'premium', createdBy: CALLER_ARN }) },
       });
+      queueClassificationTag('premium'); // battle-eligible tier from the tag
       // moderator-list pass-through.
       mockMessagingSend.mockResolvedValueOnce({
         ChannelModerators: [{ Moderator: { Arn: CALLER_ARN } }],
@@ -462,6 +480,7 @@ describe('POST /channels/battle/enable', () => {
       mockMessagingSend.mockResolvedValueOnce({
         Channel: { Metadata: JSON.stringify({ modelTier: 'premium', createdBy: CALLER_ARN }) },
       });
+      queueClassificationTag('premium');
       // moderator-list pass-through.
       mockMessagingSend.mockResolvedValueOnce({
         ChannelModerators: [{ Moderator: { Arn: CALLER_ARN } }],
@@ -504,6 +523,7 @@ describe('POST /channels/battle/disable', () => {
     mockMessagingSend.mockResolvedValueOnce({
       Channel: { Metadata: JSON.stringify({ modelTier: 'premium', createdBy: CALLER_ARN }) },
     });
+    queueClassificationTag('premium'); // disable resolves the tag too (resolveTierBotArn)
     // moderator-list pass-through.
     mockMessagingSend.mockResolvedValueOnce({
       ChannelModerators: [{ Moderator: { Arn: CALLER_ARN } }],
@@ -535,6 +555,7 @@ describe('POST /channels/battle/disable', () => {
     mockMessagingSend.mockResolvedValueOnce({
       Channel: { Metadata: JSON.stringify({ modelTier: 'premium', createdBy: OTHER_ARN }) },
     });
+    queueClassificationTag('premium');
     // moderator list does NOT include CALLER_ARN
     mockMessagingSend.mockResolvedValueOnce({
       ChannelModerators: [{ Moderator: { Arn: OTHER_ARN } }],
@@ -553,6 +574,7 @@ describe('POST /channels/battle/disable', () => {
     mockMessagingSend.mockResolvedValueOnce({
       Channel: { Metadata: JSON.stringify({ modelTier: 'premium', createdBy: CALLER_ARN }) },
     });
+    queueClassificationTag('premium');
     // moderator-list pass-through.
     mockMessagingSend.mockResolvedValueOnce({
       ChannelModerators: [{ Moderator: { Arn: CALLER_ARN } }],
