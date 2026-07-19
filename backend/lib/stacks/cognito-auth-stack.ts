@@ -950,10 +950,6 @@ export class CognitoAuthStack extends cdk.Stack {
       }),
     );
 
-    const adminConversationAuthOptions = adminApiMethodOptions(this, 'AdminConversationAuthorizer', {
-      userPool: this.userPool,
-    });
-
     const adminConversationApi = new apigateway.RestApi(this, 'AdminConversationApi', {
       restApiName: 'Agent Echelon Admin Conversations',
       defaultCorsPreflightOptions: {
@@ -969,16 +965,56 @@ export class CognitoAuthStack extends cdk.Stack {
       },
     });
 
+    // A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): optionally IAM-authorize the
+    // archive endpoints. Default OFF (the current Cognito JWT authorizer). When
+    // `-c adminIamEnforcement=true`, these resources require SigV4 - the console
+    // signs view-conversations with its sign-on Identity-Pool creds and the A2
+    // message read with an exchange-vended execute-api cred. Additive + reversible;
+    // the coordinated frontend signing lands with the same flag.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
+      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    // Only create the Cognito authorizer when it is actually used (CDK requires
+    // every authorizer be attached to a method); in IAM mode the methods are
+    // AWS_IAM-authorized instead.
+    const archiveAuthOptions: apigateway.MethodOptions = adminIamEnforcement
+      ? { authorizationType: apigateway.AuthorizationType.IAM }
+      : adminApiMethodOptions(this, 'AdminConversationAuthorizer', { userPool: this.userPool });
+
     const adminConversationIntegration = new apigateway.LambdaIntegration(adminConversationFn);
     const adminRoot = adminConversationApi.root.addResource('admin');
     const conversationsResource = adminRoot.addResource('conversations');
-    conversationsResource.addMethod('GET', adminConversationIntegration, adminConversationAuthOptions);
+    conversationsResource.addMethod('GET', adminConversationIntegration, archiveAuthOptions);
     conversationsResource
       .addResource('messages')
-      .addMethod('GET', adminConversationIntegration, adminConversationAuthOptions);
+      .addMethod('GET', adminConversationIntegration, archiveAuthOptions);
     conversationsResource
       .addResource('membership-history')
-      .addMethod('GET', adminConversationIntegration, adminConversationAuthOptions);
+      .addMethod('GET', adminConversationIntegration, archiveAuthOptions);
+
+    // A14 sign-on-role plane (view-conversations, A1/A4): the AdminAuthenticatedRole
+    // (the `admins` group's sign-on Identity-Pool role, empty until now) carries
+    // execute-api:Invoke for the conversation-list + membership-history resources,
+    // so a console signing with its sign-on creds is allowed at the gateway while a
+    // finer role that omits the statement is denied. view-messages (A2) is NOT here
+    // - it is exchange-vended below.
+    for (const p of ['/admin/conversations', '/admin/conversations/membership-history']) {
+      adminAuthRole.addToPolicy(new iam.PolicyStatement({
+        actions: ['execute-api:Invoke'],
+        resources: [adminConversationApi.arnForExecuteApi('GET', p)],
+      }));
+    }
+
+    // A14 exchange-vend plane (view-messages / A2, customer message content): the
+    // admin-plane exchange role's CEILING includes execute-api:Invoke on the
+    // messages resource, so the exchange can assume it with a session policy scoped
+    // to exactly that resource (short-lived, audited). The resource ARN is handed to
+    // the exchange Lambda so it can build that session policy.
+    const messagesExecuteApiArn = adminConversationApi.arnForExecuteApi('GET', '/admin/conversations/messages');
+    exchangeRoleAdminPlane.addToPolicy(new iam.PolicyStatement({
+      actions: ['execute-api:Invoke'],
+      resources: [messagesExecuteApiArn],
+    }));
+    credentialExchangeFn.addEnvironment('EXCHANGE_EXECUTE_API_MESSAGES_ARN', messagesExecuteApiArn);
     // Live-Chime actions (members list, add-self/add-member, redact, delete) are NOT
     // here: they run client-side as the admin's own `${sub}-admin` identity
     // (docs/SPEC-ADMIN-IDENTITY.md). This API is read-only over the archive.
