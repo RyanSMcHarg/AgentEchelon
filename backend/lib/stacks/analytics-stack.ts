@@ -600,10 +600,13 @@ export class AnalyticsStack extends cdk.Stack {
     // authorizer on AE's own user pool.
     // A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): under adminIamEnforcement the
     // analytics query is AWS_IAM-authorized (the console SigV4-signs). Athena mode
-    // enforces at the coarse analytics-read level (the per-capability resource
-    // split — user-activity / events / moderation-audit — is Aurora-first, since
-    // those surfaces are Aurora-only; the handler's queryType guard is a no-op on
-    // the single /query path here). Default = the Cognito authorizer, unchanged.
+    // enforces at the COARSE analytics-read level: this API is a single POST /query
+    // (no per-capability sub-path split), so the handler's per-resource queryType
+    // guard is a no-op here. This is a stack gap, NOT a data limitation — the
+    // S3/Athena `conversations` archive is the system of record for the event log
+    // and holds the user-activity data (Aurora is a lossy projection). Bringing
+    // Athena to parity = the sub-path split here + the `channel_events` queryType in
+    // the Athena Lambda. Default = the Cognito authorizer, unchanged.
     const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
       || this.node.tryGetContext('adminIamEnforcement') === 'true';
     const analyticsAuthOptions: apigateway.MethodOptions = adminIamEnforcement

@@ -260,8 +260,18 @@ in `ae-cognito` mode and require the IAM plane only in `service` / `federated` m
   channel or assistant" model, so a deployer defines it.
 - **`view-security` A18** (deployment sleep/wake, infra health) keeps its Cognito authorizer - cost-ops,
   not security-sensitive data. A17 (membership audit) is IAM-authorized.
-- **Athena analytics** enforces at the coarse analytics-read level (the sensitive sub-resources are
-  Aurora-only features).
+- **Athena analytics** enforces at the coarse analytics-read level. NOT because the sensitive data is
+  Aurora-only - the S3/Athena `conversations` archive is the always-on **system of record** for the raw
+  event log (`view-events`, A3) and holds the user-activity data (`view-user-activity`, A13); Aurora is a
+  lossy projection of it (`athena-absolute-aurora-views`, `AURORA-MODE-GUIDE.md`). The reason is a
+  handler + stack gap: the Athena analytics API is a single `POST /query` (no per-capability sub-path
+  split), and its Lambda does not yet expose the `channel_events` queryType (the Aurora Lambda does), so
+  "Show all events" is Aurora-mode-only at the API layer even though the events live in the Athena
+  archive (`admin-conversations.ts` already queries them for membership history). Wiring the Athena
+  `channel_events` query (the membership-history query without the `EventType` filter) + adding the
+  `/events-log` and `/user-activity` sub-paths to the Athena stack brings both modes to parity; only A5's
+  `moderation_actions` attribution table is genuinely Aurora-specific (though the redact/delete events
+  themselves are in the Athena archive too).
 - The on-flag runtime path is verified on deploy.
 
 ## 11. Audit tie-in
