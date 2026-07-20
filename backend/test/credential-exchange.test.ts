@@ -30,6 +30,8 @@ function loadHandler() {
   process.env.EXCHANGE_ROLE_PREMIUM = 'arn:aws:iam::111:role/ex-premium';
   process.env.EXCHANGE_ROLE_ADMIN = 'arn:aws:iam::111:role/ex-admin';
   process.env.EXCHANGE_ROLE_ADMIN_PLANE = 'arn:aws:iam::111:role/ex-admin-plane';
+  process.env.EXCHANGE_EXECUTE_API_MESSAGES_ARN =
+    'arn:aws:execute-api:us-east-1:111:api123/*/GET/admin/conversations/messages';
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   return require('../lambda/src/credential-exchange');
 }
@@ -168,6 +170,70 @@ describe('admin identity — two-plane model', () => {
     const policy = JSON.parse(input.Policy);
     const requested = policy.Statement.find((s: { Sid: string }) => s.Sid === 'RequestedActions');
     expect(requested.Resource).toContain(CHANNEL);
+  });
+});
+
+// A14 archive plane (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6.5): reading
+// customer message content (A2) is vended as a short-lived, audited `execute-api`
+// session policy on the admin-plane role — NOT a Chime session policy — so a
+// standing sign-on role never holds a customer-PII read.
+describe('A14 archive vend — view-messages (execute-api plane)', () => {
+  const CHANNEL = `${APP}/channel/room-1`;
+  const MESSAGES_ARN = 'arn:aws:execute-api:us-east-1:111:api123/*/GET/admin/conversations/messages';
+
+  it('vends an execute-api:Invoke session policy on the admin-plane role', async () => {
+    const { handler } = loadHandler();
+    const res = await handler(event(
+      { sub: 'adm', 'cognito:groups': 'admins' },
+      { identity: 'admin', channelArn: CHANNEL, capabilities: ['view-messages'] },
+    ));
+    expect(res.statusCode).toBe(200);
+    const input = mockStsSend.mock.calls[0][0].input;
+    // Assumed on the admin-plane role with the human's sub tag.
+    expect(input.RoleArn).toBe('arn:aws:iam::111:role/ex-admin-plane');
+    expect(input.Tags).toEqual([{ Key: 'sub', Value: 'adm' }]);
+    // Session policy is execute-api on exactly the messages resource — no chime:* actions.
+    const policy = JSON.parse(input.Policy);
+    const stmt = policy.Statement.find((s: { Sid: string }) => s.Sid === 'ArchiveApiInvoke');
+    expect(stmt.Action).toEqual(['execute-api:Invoke']);
+    expect(stmt.Resource).toEqual([MESSAGES_ARN]);
+    expect(JSON.stringify(policy)).not.toContain('chime:');
+    // No Chime identity provisioned for an execute-api vend.
+    expect(mockChimeSend).not.toHaveBeenCalled();
+    const out = JSON.parse(res.body);
+    expect(out.userArn).toBe(`${APP}/user/adm-admin`);
+    expect(out.identity).toBe('admin');
+  });
+
+  it('rejects view-messages on the CHAT plane (403/400 — admin-plane only)', async () => {
+    const { handler } = loadHandler();
+    // identity defaults to chat; an admin caller but no plane:admin.
+    const res = await handler(event(
+      { sub: 'adm', 'cognito:groups': 'admins' },
+      { channelArn: CHANNEL, capabilities: ['view-messages'] },
+    ));
+    expect(res.statusCode).toBe(400);
+    expect(mockStsSend).not.toHaveBeenCalled();
+  });
+
+  it('refuses to mix archive (execute-api) and Chime capabilities', async () => {
+    const { handler } = loadHandler();
+    const res = await handler(event(
+      { sub: 'adm', 'cognito:groups': 'admins' },
+      { identity: 'admin', channelArn: CHANNEL, capabilities: ['view-messages', 'view'] },
+    ));
+    expect(res.statusCode).toBe(400);
+    expect(mockStsSend).not.toHaveBeenCalled();
+  });
+
+  it('a non-admin cannot vend an archive cred (admin plane requires admins)', async () => {
+    const { handler } = loadHandler();
+    const res = await handler(event(
+      { sub: 'u1', 'cognito:groups': 'premium' },
+      { identity: 'admin', channelArn: CHANNEL, capabilities: ['view-messages'] },
+    ));
+    expect(res.statusCode).toBe(403);
+    expect(mockStsSend).not.toHaveBeenCalled();
   });
 });
 

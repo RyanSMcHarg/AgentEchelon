@@ -4,7 +4,7 @@ import type {
   AdminConversationSummary,
   AdminMembershipEvent,
 } from '@ae/shared';
-import { apiCall } from '@ae/shared';
+import { apiCall, ADMIN_IAM_ENFORCEMENT, CREDENTIAL_EXCHANGE_API_URL, exchangeCredentials } from '@ae/shared';
 import {
   adminListMembers,
   adminAddMember,
@@ -13,6 +13,7 @@ import {
   adminRedactMessage,
   adminDeleteMessage,
 } from './adminChime';
+import { identityPoolCredentials, sigv4GetJson } from './sigv4Fetch';
 
 function getApiUrl(): string {
   const url = import.meta.env.VITE_ADMIN_CONVERSATIONS_API_URL;
@@ -20,7 +21,42 @@ function getApiUrl(): string {
   return url;
 }
 
+/**
+ * A14: vend a short-lived, audited `execute-api` credential for the message-content
+ * read (A2). The exchange assumes the admin-plane role with a session policy scoped to
+ * exactly the messages resource and logs an `admin_scoped_credential_vend` line, so
+ * "who read this customer's conversation" is attributable. Same shared exchange
+ * primitive the moderation plane uses — a different request body.
+ */
+async function vendMessagesReadCredential(channelArn: string): Promise<{
+  accessKeyId: string;
+  secretAccessKey: string;
+  sessionToken?: string;
+}> {
+  if (!CREDENTIAL_EXCHANGE_API_URL) {
+    throw new Error('Signed message reads require VITE_CREDENTIAL_EXCHANGE_API_URL');
+  }
+  const idToken = localStorage.getItem('idToken');
+  if (!idToken) throw new Error('Not authenticated');
+  const { credentials } = await exchangeCredentials(
+    { identity: 'admin', channelArn, capabilities: ['view-messages'] },
+    idToken,
+  );
+  return credentials;
+}
+
 export async function listAdminConversations(limit = 25, token?: string): Promise<AdminConversationSummary[]> {
+  if (ADMIN_IAM_ENFORCEMENT) {
+    // Sign-on plane (view-conversations): the operator's own Identity-Pool creds,
+    // which resolve to their group role; the gateway denies a role that omits the resource.
+    const creds = await identityPoolCredentials();
+    const result = await sigv4GetJson<{ conversations?: AdminConversationSummary[] }>(
+      getApiUrl(),
+      { limit },
+      creds,
+    );
+    return result.conversations || [];
+  }
   const result = await apiCall<{ conversations?: AdminConversationSummary[] }>(getApiUrl(), '', {
     query: { limit },
     token,
@@ -29,6 +65,16 @@ export async function listAdminConversations(limit = 25, token?: string): Promis
 }
 
 export async function listAdminConversationMessages(channelArn: string, limit = 100, token?: string): Promise<AdminConversationMessage[]> {
+  if (ADMIN_IAM_ENFORCEMENT) {
+    // Message content (A2) rides the exchange-vended, audited execute-api credential.
+    const creds = await vendMessagesReadCredential(channelArn);
+    const result = await sigv4GetJson<{ messages?: AdminConversationMessage[] }>(
+      `${getApiUrl().replace(/\/$/, '')}/messages`,
+      { channelArn, limit },
+      creds,
+    );
+    return result.messages || [];
+  }
   const result = await apiCall<{ messages?: AdminConversationMessage[] }>(getApiUrl(), '/messages', {
     query: { channelArn, limit },
     token,
@@ -42,6 +88,16 @@ export async function listAdminConversationMembers(channelArn: string): Promise<
 }
 
 export async function getAdminMembershipHistory(channelArn: string, token?: string): Promise<AdminMembershipEvent[]> {
+  if (ADMIN_IAM_ENFORCEMENT) {
+    // Membership history (A4) is on the sign-on plane alongside view-conversations.
+    const creds = await identityPoolCredentials();
+    const result = await sigv4GetJson<{ history?: AdminMembershipEvent[] }>(
+      `${getApiUrl().replace(/\/$/, '')}/membership-history`,
+      { channelArn },
+      creds,
+    );
+    return result.history || [];
+  }
   const result = await apiCall<{ history?: AdminMembershipEvent[] }>(getApiUrl(), '/membership-history', {
     query: { channelArn },
     token,

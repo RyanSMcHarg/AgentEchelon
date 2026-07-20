@@ -98,6 +98,19 @@ const CAPABILITY_ACTIONS: Record<string, string[]> = {
 // is always confined to one channel (enforced in the handler).
 const MODERATION_CAPS = new Set(['redact', 'delete', 'manage-membership', 'manage-channel']);
 
+// A14 archive plane (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6.5). The `execute-api`
+// analogue of CAPABILITY_ACTIONS: a capability maps to the API Gateway resource ARN it
+// authorizes, and the exchange vends a SESSION POLICY of `execute-api:Invoke` on exactly
+// that resource (intersected with the admin-plane role ceiling, which carries the same
+// ARN). Customer message content (A2) is the sole exchange-vended archive capability -
+// short-lived + audited - so a standing role never holds a customer-PII read (every other
+// archive read rides the sign-on group role). New resources land here as their per-
+// capability API split is wired (view-events, etc.).
+const EXECUTE_API_CAPABILITY_RESOURCES: Record<string, string> = {
+  'view-messages': process.env.EXCHANGE_EXECUTE_API_MESSAGES_ARN || '',
+};
+const EXECUTE_API_CAPS = new Set(Object.keys(EXECUTE_API_CAPABILITY_RESOURCES));
+
 const sts = new STSClient({ region: AWS_REGION });
 const chimeIdentity = new ChimeSDKIdentityClient({ region: AWS_REGION });
 
@@ -240,7 +253,7 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
       body: JSON.stringify({ error: 'channelArn must be a channel of this app instance' }),
     };
   }
-  const unknownCaps = requestedCaps.filter((c) => !(c in CAPABILITY_ACTIONS));
+  const unknownCaps = requestedCaps.filter((c) => !(c in CAPABILITY_ACTIONS) && !EXECUTE_API_CAPS.has(c));
   if (unknownCaps.length) {
     return {
       statusCode: 400,
@@ -248,6 +261,19 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
       body: JSON.stringify({ error: `unknown capabilities: ${unknownCaps.join(', ')}` }),
     };
   }
+  // A14: an archive vend (execute-api plane) and a Chime vend need DIFFERENT session
+  // policies (execute-api:Invoke on an API resource vs chime:* on a channel), so a single
+  // request is one plane or the other, never a mix.
+  const archiveCaps = requestedCaps.filter((c) => EXECUTE_API_CAPS.has(c));
+  const chimeCaps = requestedCaps.filter((c) => c in CAPABILITY_ACTIONS);
+  if (archiveCaps.length && chimeCaps.length) {
+    return {
+      statusCode: 400,
+      headers: cors(event),
+      body: JSON.stringify({ error: 'cannot mix archive (execute-api) and Chime capabilities in one request' }),
+    };
+  }
+  const archiveVend = archiveCaps.length > 0;
   const requestsModeration = requestedCaps.some((c) => MODERATION_CAPS.has(c));
   const groups = parseGroups(claims['cognito:groups']);
   const roleKey = resolveRoleKey(groups);
@@ -272,6 +298,10 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
     // Moderation is never on the chat plane: the chat identity carries no moderation
     // authority. It must be requested on the admin plane, which is always channel-scoped.
     return { statusCode: 400, headers: cors(event), body: JSON.stringify({ error: 'moderation capabilities require plane:admin with a channelArn scope' }) };
+  } else if (archiveVend) {
+    // A14: reading customer message content (A2) is an admin-plane action — the standing
+    // `${sub}-admin` authority, short-lived + audited — never the chat identity.
+    return { statusCode: 400, headers: cors(event), body: JSON.stringify({ error: 'archive capabilities require plane:admin with a channelArn scope' }) };
   }
 
   const roleArn = adminPlane ? EXCHANGE_ROLE_ADMIN_PLANE : EXCHANGE_ROLE_ARNS[roleKey];
@@ -283,6 +313,62 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
   const accessClass = roleKey === 'admin' ? 'admin' : roleKey;
 
   try {
+    // ── A14 archive vend (execute-api plane) ──────────────────────────────────
+    // Customer message content (A2). Vend a SESSION POLICY of `execute-api:Invoke`
+    // on exactly the requested archive resource(s), assumed on the admin-plane role
+    // (its ceiling carries the same ARN), short-lived + audited. No Chime identity is
+    // provisioned - this cred signs an API Gateway GET, not a Chime call. The console
+    // SigV4-signs the archive read with it; the gateway's IAM authorizer allows it.
+    if (archiveVend) {
+      const resources = archiveCaps.map((c) => EXECUTE_API_CAPABILITY_RESOURCES[c]);
+      if (resources.some((r) => !r)) {
+        console.error('[CredentialExchange] No execute-api resource ARN configured for', archiveCaps);
+        return { statusCode: 500, headers: cors(event), body: JSON.stringify({ error: 'Archive vend misconfigured' }) };
+      }
+      const sessionPolicy = JSON.stringify({
+        Version: '2012-10-17',
+        Statement: [
+          { Sid: 'ArchiveApiInvoke', Effect: 'Allow', Action: ['execute-api:Invoke'], Resource: resources },
+        ],
+      });
+      const assumed = await sts.send(new AssumeRoleCommand({
+        RoleArn: roleArn, // EXCHANGE_ROLE_ADMIN_PLANE (adminPlane is required above)
+        RoleSessionName: `archive-${sub}`.slice(0, 64),
+        DurationSeconds: MODERATION_SESSION_SECONDS,
+        Tags: [{ Key: 'sub', Value: sub }],
+        Policy: sessionPolicy,
+      }));
+      const ac = assumed.Credentials;
+      if (!ac?.AccessKeyId || !ac.SecretAccessKey || !ac.SessionToken) {
+        throw new Error('AssumeRole returned no credentials');
+      }
+      const adminArn = `${APP_INSTANCE_ARN}/user/${sub}-admin`;
+      // Same audit trail as a Chime admin vend: who read which customer's conversation, when.
+      console.log(JSON.stringify({
+        _auditEvent: 'admin_scoped_credential_vend',
+        timestamp: new Date().toISOString(),
+        adminSub: sub,
+        adminIdentity: adminArn,
+        channelArn: scopeChannelArn,
+        capabilities: archiveCaps,
+        plane: 'archive',
+        ttlSeconds: MODERATION_SESSION_SECONDS,
+      }));
+      const archiveResult: ExchangeResult = {
+        credentials: {
+          AccessKeyId: ac.AccessKeyId,
+          SecretAccessKey: ac.SecretAccessKey,
+          SessionToken: ac.SessionToken,
+          Expiration: ac.Expiration ? new Date(ac.Expiration).toISOString() : undefined,
+        },
+        userArn: adminArn,
+        tier: 'admin',
+        identity: 'admin',
+        scopedTo: scopeChannelArn || null,
+      };
+      return { statusCode: 200, headers: cors(event), body: JSON.stringify(archiveResult) };
+    }
+
     // AppInstanceUserId == sub (AE convention). Display name, best-first: a real name claim; else
     // the email LOCAL part (e.g. "ryan" — name-like, far better than a GUID in the @mention menu);
     // else cognito:username if it isn't a UUID; else the sub.

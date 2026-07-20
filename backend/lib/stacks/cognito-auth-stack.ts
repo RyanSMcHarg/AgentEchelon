@@ -979,6 +979,14 @@ export class CognitoAuthStack extends cdk.Stack {
     const archiveAuthOptions: apigateway.MethodOptions = adminIamEnforcement
       ? { authorizationType: apigateway.AuthorizationType.IAM }
       : adminApiMethodOptions(this, 'AdminConversationAuthorizer', { userPool: this.userPool });
+    // Tell the handler the archive methods are IAM-authorized, so it trusts the
+    // gateway-vetted signed principal (which already proved it holds the archive
+    // capability) and derives the actor from it instead of a Cognito JWT. Set
+    // ONLY here, so other (still Cognito-authorized) admin Lambdas never trust an
+    // IAM identity — the `ae-cognito` group gate stays their control (auth.ts).
+    if (adminIamEnforcement) {
+      adminConversationFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+    }
 
     const adminConversationIntegration = new apigateway.LambdaIntegration(adminConversationFn);
     const adminRoot = adminConversationApi.root.addResource('admin');

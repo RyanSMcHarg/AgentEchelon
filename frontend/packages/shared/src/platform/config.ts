@@ -31,3 +31,17 @@ export const USER_POOL_CLIENT_ID =
  * plane (chat, admin, rename) — see `services/credentialExchange.ts`.
  */
 export const CREDENTIAL_EXCHANGE_API_URL = import.meta.env.VITE_CREDENTIAL_EXCHANGE_API_URL;
+
+/**
+ * A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): when `true`, the admin console
+ * reaches the archive endpoints with SigV4-signed, IAM-authorized requests
+ * instead of a Cognito JWT — `view-conversations`/`membership-history` signed
+ * with the operator's sign-on Identity-Pool creds, and the `view-messages` (A2)
+ * read signed with a short-lived, audited execute-api credential vended by the
+ * credential exchange. MUST match the backend's `-c adminIamEnforcement` (the
+ * archive API's authorizer). Default OFF (JWT path), so the console is unchanged
+ * until the backend flips the authorizer.
+ */
+export const ADMIN_IAM_ENFORCEMENT =
+  import.meta.env.VITE_ADMIN_IAM_ENFORCEMENT === 'true' ||
+  import.meta.env.VITE_ADMIN_IAM_ENFORCEMENT === true;
