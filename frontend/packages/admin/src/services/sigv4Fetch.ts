@@ -118,3 +118,41 @@ export async function sigv4GetJson<T>(
   }
   return res.json() as Promise<T>;
 }
+
+/**
+ * SigV4-sign a POST (JSON body) to an `execute-api` URL and fetch it. Used for the
+ * analytics query plane (the frontend's queryType contract is a POST) under A14
+ * IAM enforcement — the body is signed, so it cannot be tampered in flight.
+ */
+export async function sigv4PostJson<T>(
+  url: string,
+  body: unknown,
+  credentials: SigV4Credentials,
+): Promise<T> {
+  const u = new URL(url);
+  const payload = JSON.stringify(body ?? {});
+
+  const signer = new SignatureV4({ service: 'execute-api', region: REGION, credentials, sha256: Sha256 });
+  const signed = await signer.sign({
+    method: 'POST',
+    protocol: u.protocol,
+    hostname: u.hostname,
+    port: u.port ? Number(u.port) : undefined,
+    path: u.pathname,
+    headers: { host: u.host, 'content-type': 'application/json' },
+    body: payload,
+  });
+
+  const res = await fetch(url, { method: 'POST', headers: signed.headers as Record<string, string>, body: payload });
+  if (!res.ok) {
+    let be: string | undefined;
+    try {
+      be = (await res.clone().json())?.error;
+    } catch {
+      /* non-JSON error body */
+    }
+    throw new ApiError(res.status, be ?? `Signed admin request failed: ${res.status}`);
+  }
+  if (res.status === 204) return undefined as T;
+  return res.json() as Promise<T>;
+}
