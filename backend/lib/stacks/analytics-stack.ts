@@ -44,6 +44,8 @@ import { MembershipAuditConstruct } from '../constructs/membership-audit';
 export interface AnalyticsStackProps extends cdk.StackProps {
   appInstanceArn: string;
   userPool?: cognito.IUserPool;
+  /** A14: the `admins` sign-on role ARN (execute-api teeth on the analytics API under adminIamEnforcement). */
+  adminSignOnRoleArn?: string;
   /** Layer 6 membership audit (SPEC-CONVERSATION-SECURITY). Opt-in; report-only unless enforce. */
   enableMembershipAudit?: boolean;
   membershipAuditEnforce?: boolean;
@@ -596,12 +598,33 @@ export class AnalyticsStack extends cdk.Stack {
     // Admin-plane auth mode (ae-cognito default / federated / service) — see
     // docs/ADMIN-INTEGRATION-GUIDE.md. In ae-cognito mode this uses a Cognito
     // authorizer on AE's own user pool.
-    const analyticsAuthOptions = adminApiMethodOptions(this, 'AnalyticsAuthorizer', {
-      userPool: props.userPool,
-    });
+    // A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): under adminIamEnforcement the
+    // analytics query is AWS_IAM-authorized (the console SigV4-signs). Athena mode
+    // enforces at the coarse analytics-read level (the per-capability resource
+    // split — user-activity / events / moderation-audit — is Aurora-first, since
+    // those surfaces are Aurora-only; the handler's queryType guard is a no-op on
+    // the single /query path here). Default = the Cognito authorizer, unchanged.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
+      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    const analyticsAuthOptions: apigateway.MethodOptions = adminIamEnforcement
+      ? { authorizationType: apigateway.AuthorizationType.IAM }
+      : adminApiMethodOptions(this, 'AnalyticsAuthorizer', { userPool: props.userPool });
+    if (adminIamEnforcement) {
+      analyticsQueryFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+    }
     analyticsApi.root
       .addResource('query')
       .addMethod('POST', analyticsIntegration, analyticsAuthOptions);
+
+    // A14 sign-on-role teeth: the `admins` role gets execute-api on the analytics
+    // API (admins = Full). Finer persona roles get per-capability grants (Aurora).
+    if (adminIamEnforcement && props.adminSignOnRoleArn) {
+      const adminRole = iam.Role.fromRoleArn(this, 'ImportedAdminSignOnRole', props.adminSignOnRoleArn, { mutable: true });
+      adminRole.addToPrincipalPolicy(new iam.PolicyStatement({
+        actions: ['execute-api:Invoke'],
+        resources: [analyticsApi.arnForExecuteApi()],
+      }));
+    }
 
     new cdk.CfnOutput(this, 'AnalyticsApiUrl', {
       value: `${analyticsApi.url}query`,

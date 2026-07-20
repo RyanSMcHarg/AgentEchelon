@@ -124,7 +124,9 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
     enforcement: 'signOnRole',
     resources: [{ api: 'analytics', method: 'GET', path: 'membership-audit/findings' }],
     personas: ADMIN_DEV, // Full / Scoped / None / None
-    wired: true,
+    // The membership-audit + deployment routes keep their Cognito authorizer for
+    // now; IAM-authorizing them (view-security) is the tracked next slice.
+    wired: false,
   },
   // ── experiments API (Experiments stack) — the profile write surface ──────
   'manage-profiles': {

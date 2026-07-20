@@ -249,6 +249,9 @@ if (analyticsMode === 'aurora') {
     env,
     appInstanceArn: chimeStack.appInstanceArn,
     userPoolId: cognitoStack.userPool.userPoolId,
+    // A14: the admins sign-on role that gets execute-api teeth on the analytics
+    // read plane when adminIamEnforcement is on.
+    adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
     // Thumbs per-variant join: the analytics Lambda scans the feedback table at
     // read time over the VPC DynamoDB endpoint.
     feedbackTableName: cognitoStack.feedbackTable.tableName,
@@ -281,6 +284,7 @@ if (analyticsMode === 'aurora') {
     env,
     appInstanceArn: chimeStack.appInstanceArn,
     userPool: cognitoStack.userPool,
+    adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
     enableMembershipAudit,
     membershipAuditEnforce,
     membershipAuditAlertChannelArn,
@@ -331,6 +335,7 @@ const experimentsStack = new ExperimentsStack(app, `${STACK_PREFIX}Experiments`,
   appInstanceArn: chimeStack.appInstanceArn,
   userPoolId: cognitoStack.userPool.userPoolId,
   appUrl,
+  adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
   description: 'A/B experiments table + admin-experiments API (VITE_EXPERIMENTS_API_URL)',
 });
 experimentsStack.addDependency(chimeStack);

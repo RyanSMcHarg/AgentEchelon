@@ -38,6 +38,12 @@ export class CognitoAuthStack extends cdk.Stack {
   public readonly identityPool: cognito.CfnIdentityPool;
   public readonly authenticatedRole: iam.Role;
   /**
+   * The `admins` group's sign-on Identity-Pool role (A14). Exposed so cross-stack
+   * admin APIs (analytics, experiments) can attach `execute-api:Invoke` teeth for
+   * their capabilities onto it (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6).
+   */
+  public readonly adminSignOnRoleArn: string;
+  /**
    * UserFeedback (thumbs) table. Exposed so the Aurora analytics stack can
    * read it for the per-variant thumbs join.
    * CognitoAuth is created before AnalyticsAurora in bin/backend.ts, so this is
@@ -406,6 +412,7 @@ export class CognitoAuthStack extends cdk.Stack {
     }
     this.authenticatedRole = classificationRoles[profiles.failClosedValue];
     const adminAuthRole = makeClassificationRole('AdminAuthenticatedRole');
+    this.adminSignOnRoleArn = adminAuthRole.roleArn;
 
     // Attach each group to its classification's role so the ID token carries `cognito:preferred_role`
     // (lowest-precedence group with a roleArn wins); admins -> the admin role.

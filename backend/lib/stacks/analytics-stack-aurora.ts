@@ -50,6 +50,7 @@ import { IAnalyticsStackOutputs } from '../interfaces/analytics-stack-interface.
 import { ANALYTICS_PREFIX, INSTANCE_NAME, SHARED_SSM, STACK_PREFIX, INSTANCE_SSM } from './agent-classification-common';
 import { MembershipAuditConstruct } from '../constructs/membership-audit';
 import { ConversationArchive } from '../constructs/conversation-archive';
+import { ANALYTICS_CAPABILITY_SUBPATHS } from '../../lambda/src/lib/admin-capability-map';
 
 /**
  * esbuild commandHooks that copy the RDS CA bundle (`analytics-aurora/certs/*.pem`)
@@ -82,6 +83,14 @@ export interface AnalyticsStackAuroraProps extends cdk.StackProps {
   userPoolId: string;
   /** Cognito User Pool ARN (Layer 6 membership audit: AdminListGroupsForUser + AdminGetUser). */
   userPoolArn?: string;
+  /**
+   * A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): the `admins` group's sign-on role
+   * ARN. When `-c adminIamEnforcement=true`, the analytics read resources are
+   * AWS_IAM-authorized and this role is granted `execute-api:Invoke` on them, so
+   * a signing admin is allowed while a finer persona role that omits a capability
+   * is denied at the gateway.
+   */
+  adminSignOnRoleArn?: string;
   /** Layer 6 membership audit (SPEC-CONVERSATION-SECURITY). Opt-in; report-only unless enforce. */
   enableMembershipAudit?: boolean;
   membershipAuditEnforce?: boolean;
@@ -1473,9 +1482,22 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     // Admin-plane auth mode (ae-cognito default / federated / service) — see
     // docs/ADMIN-INTEGRATION-GUIDE.md. In ae-cognito mode this uses a Cognito
     // authorizer on AE's own user pool.
-    const authMethodOptions = adminApiMethodOptions(this, 'AuroraAnalyticsAuthorizer', {
-      userPoolId: props.userPoolId,
-    });
+    // A14: when adminIamEnforcement is on, the analytics READ plane is
+    // AWS_IAM-authorized (the console SigV4-signs with its sign-on creds and the
+    // per-resource split gates each capability). Default = the Cognito authorizer,
+    // unchanged. Flipping the shared options flips every analytics-query method at
+    // once and (like the admin-conversations API) avoids creating an unused Cognito
+    // authorizer in IAM mode.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
+      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    const authMethodOptions: apigateway.MethodOptions = adminIamEnforcement
+      ? { authorizationType: apigateway.AuthorizationType.IAM }
+      : adminApiMethodOptions(this, 'AuroraAnalyticsAuthorizer', { userPoolId: props.userPoolId });
+    if (adminIamEnforcement) {
+      // Trust the gateway-vetted signed principal + enforce queryType->capability
+      // per resource (analytics-query.ts). Set only here — other Lambdas stay Cognito.
+      analyticsLambda.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+    }
 
     // API Gateway
     const analyticsApi = new apigateway.RestApi(this, 'AnalyticsApi', {
@@ -1548,6 +1570,29 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
 
     const modelEffectivenessResource = analyticsResource.addResource('model-effectiveness');
     modelEffectivenessResource.addMethod('GET', analyticsIntegration, authMethodOptions);
+
+    // A14 per-capability resources: the SENSITIVE queryTypes get their own POST
+    // resource so a persona role can be denied one at the gateway without losing
+    // the low-sensitivity analytics bundle (which stays on the root POST). The
+    // handler enforces that a queryType only runs on its capability's path
+    // (admin-capability-map.ts). Created in both modes (harmless + unused under
+    // Cognito, where the frontend posts everything to the root); IAM-authorized +
+    // frontend-routed under the flag.
+    for (const { path: subPath } of ANALYTICS_CAPABILITY_SUBPATHS) {
+      analyticsApi.root.addResource(subPath).addMethod('POST', analyticsIntegration, authMethodOptions);
+    }
+
+    // A14 sign-on-role teeth: the `admins` group's role gets execute-api:Invoke on
+    // the whole analytics API (admins = Full on every capability, SPEC section 4).
+    // Finer persona roles get per-capability grants (see the persona wiring); a
+    // role that omits a capability's resource is denied at the gateway.
+    if (adminIamEnforcement && props.adminSignOnRoleArn) {
+      const adminRole = iam.Role.fromRoleArn(this, 'ImportedAdminSignOnRole', props.adminSignOnRoleArn, { mutable: true });
+      adminRole.addToPrincipalPolicy(new iam.PolicyStatement({
+        actions: ['execute-api:Invoke'],
+        resources: [analyticsApi.arnForExecuteApi()],
+      }));
+    }
 
     // Membership-audit review surface (Layer 6): admin API for the flagged-memberships panel and
     // the runtime enforce toggle. NON-VPC (DynamoDB + Chime + SSM only), like the sleep API. Only

@@ -34,6 +34,8 @@ export interface ExperimentsStackProps extends cdk.StackProps {
   userPoolId: string;
   /** Frontend URL for CORS (defaults to the `appUrl` context / localhost). */
   appUrl?: string;
+  /** A14: the `admins` sign-on role ARN (execute-api teeth on the profile routes under adminIamEnforcement). */
+  adminSignOnRoleArn?: string;
 }
 
 export class ExperimentsStack extends cdk.Stack {
@@ -195,13 +197,39 @@ export class ExperimentsStack extends cdk.Stack {
       bundling: { minify: false, forceDockerBundling: false },
     });
 
+    // A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): manage-profiles is an
+    // IAM-enforceable capability. Under adminIamEnforcement the profile routes are
+    // AWS_IAM-authorized (the console SigV4-signs) and the `admins` sign-on role
+    // gets execute-api teeth on them; a finer role that omits manage-profiles is
+    // denied at the gateway. Only the /admin/profiles routes flip — /admin/experiments
+    // stays on the Cognito authorizer. Default = Cognito, unchanged.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
+      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    const manageProfilesAuthOptions: apigateway.MethodOptions = adminIamEnforcement
+      ? { authorizationType: apigateway.AuthorizationType.IAM }
+      : experimentsAuthOptions;
+    if (adminIamEnforcement) {
+      manageProfilesFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+    }
+
     const manageProfilesIntegration = new apigateway.LambdaIntegration(manageProfilesFn);
     const profilesResource = adminRoot.addResource('profiles');
-    profilesResource.addMethod('GET', manageProfilesIntegration, experimentsAuthOptions); // list
+    profilesResource.addMethod('GET', manageProfilesIntegration, manageProfilesAuthOptions); // list
     for (const action of ['version', 'draft', 'validate', 'activate', 'rollback', 'export', 'import']) {
-      profilesResource.addResource(action).addMethod('POST', manageProfilesIntegration, experimentsAuthOptions);
+      profilesResource.addResource(action).addMethod('POST', manageProfilesIntegration, manageProfilesAuthOptions);
     }
     this.manageProfilesApiUrl = `${api.url}admin/profiles`;
+
+    if (adminIamEnforcement && props.adminSignOnRoleArn) {
+      const adminRole = iam.Role.fromRoleArn(this, 'ImportedAdminSignOnRole', props.adminSignOnRoleArn, { mutable: true });
+      adminRole.addToPrincipalPolicy(new iam.PolicyStatement({
+        actions: ['execute-api:Invoke'],
+        resources: [
+          api.arnForExecuteApi('GET', '/admin/profiles'),
+          api.arnForExecuteApi('POST', '/admin/profiles/*'),
+        ],
+      }));
+    }
     new cdk.CfnOutput(this, 'ManageProfilesApiUrl', {
       value: this.manageProfilesApiUrl,
       description: 'Profile versioning admin API (VITE_MANAGE_PROFILES_API_URL)',
