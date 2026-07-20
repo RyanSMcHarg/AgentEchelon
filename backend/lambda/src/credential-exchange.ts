@@ -325,6 +325,16 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
         console.error('[CredentialExchange] No execute-api resource ARN configured for', archiveCaps);
         return { statusCode: 500, headers: cors(event), body: JSON.stringify({ error: 'Archive vend misconfigured' }) };
       }
+      // NB: the session policy pins the messages RESOURCE, not the channel. The read is
+      // `GET /admin/conversations/messages?channelArn=...` and IAM cannot condition
+      // `execute-api:Invoke` on a query parameter, so - unlike the Chime plane, whose
+      // session policy pins the channel ARN as the action's resource - this cred is not
+      // bound to the single vended channel for its TTL. The `channelArn` audited below is
+      // the channel the operator REQUESTED, not a hard binding. Per-channel scope is still
+      // enforced downstream: admin-conversations.ts `channelClassificationAllowed` denies a
+      // scoped caller a channel above their tier, and the API Gateway access log captures
+      // the actual per-channel reads. A full admin (entitled to every channel) is not
+      // narrowed by design. See SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 11.
       const sessionPolicy = JSON.stringify({
         Version: '2012-10-17',
         Statement: [

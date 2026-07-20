@@ -292,6 +292,13 @@ async function channelClassificationAllowed(channelArn: string, ceiling: Classif
   let cls: string | undefined;
   if (hasDataPlane()) {
     try {
+      // KNOWN LIMITATION: the Aurora scope-check resolves the channel's classification
+      // from the 500 most-recent conversations. A scoped (non-full) caller reading a
+      // channel OLDER than that window resolves `cls = undefined` and is denied (403)
+      // below, even when the channel is within their tier - a fail-CLOSED miss, never a
+      // leak. Acceptable for the scoped personas today; if it bites, resolve the single
+      // channel's classification directly (targeted data-plane lookup) instead of scanning
+      // the recent list. Full admins never reach here (short-circuited above).
       const list = await auroraListConversations(500);
       cls = (list as Array<{ channelArn?: string; metadata?: { modelTier?: string } }>)
         .find((c) => c.channelArn === channelArn)?.metadata?.modelTier;

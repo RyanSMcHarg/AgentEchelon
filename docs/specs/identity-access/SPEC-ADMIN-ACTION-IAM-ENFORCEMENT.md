@@ -190,7 +190,8 @@ the role grants nothing). The design gives that structure teeth:
    customer message content (A2)**. **A2 and the Chime plane (C1-C8)** use the credential exchange's
    short-lived, per-use, **audited** vend. So a standing role never holds customer PII or a mutation,
    and every content read (once A2 is on the exchange) and every moderation emits an
-   `admin_scoped_credential_vend` log line (section 11). The
+   `admin_scoped_credential_vend` log line (section 11; the A2 vend scopes to the messages
+   *resource*, not the single channel - see section 11 for how per-channel attribution is preserved). The
    rationale: message content is the only high-sensitivity PII read, and per-conversation auditing of
    "who read this customer's messages" is worth the round-trip; everything else is metadata,
    structure, or aggregate. Revisitable (section 12.6).
@@ -283,6 +284,20 @@ Chime plane, not for any archive read today). This spec extends that emission to
 vends (message content A2 and any other surface on the exchange path), so "who could read a customer
 conversation" becomes auditable next to "who could moderate", with the same short-lived, attributable
 record (`SPEC-ACCESS-AND-CONTROLS-AUDITING.md`).
+
+**Vend scope vs read scope (an asymmetry vs the Chime plane).** The Chime plane's session policy pins
+the *channel* - a Chime action takes the channel ARN as its IAM resource - so a moderation cred literally
+cannot touch another channel. The A2 archive cred cannot be pinned that way: the read is
+`GET /admin/conversations/messages?channelArn=...`, and IAM cannot condition `execute-api:Invoke` on a
+query parameter, so the vended session policy scopes to the messages *resource* for its TTL, not to the
+one channel. The `channelArn` on the `admin_scoped_credential_vend` line therefore records the channel
+the operator *requested*, not a hard binding. Two mechanisms close the gap: for a *scoped* persona the
+handler enforces the classification ceiling per channel (`admin-conversations.ts`
+`channelClassificationAllowed`, fail-closed), so a scoped operator still cannot read above their tier with
+the cred; and the actual per-channel reads are captured independently by the API Gateway access log on the
+messages resource. A full admin - entitled to every channel - is not narrowed by the cred, by design. If a
+deployment needs the cred itself bound to a single conversation, carry the channel as a session tag and
+re-check it in the handler (a follow-up, not wired today).
 
 ## 12. Open decisions
 

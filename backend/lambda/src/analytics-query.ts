@@ -493,6 +493,14 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
     // as the capability of THIS resource path; reject a queryType belonging to a
     // different capability (e.g. an A13 user-activity query on the low-sensitivity
     // analytics resource). No-op in Cognito mode (single root resource).
+    // KNOWN LIMITATION (Athena mode): this stack exposes a SINGLE `POST /query` with no
+    // per-capability sub-paths (unlike the Aurora analytics stack), so `capabilityForPath`
+    // always resolves to `view-analytics`. Under enforcement, any queryType mapped to a
+    // finer capability (events-log / user-activity / moderation-audit) is therefore DENIED
+    // here - coarser than the section-3b matrix, fail-CLOSED. Athena reaches parity by
+    // splitting these sub-paths on the stack + exposing the queryTypes; the data itself is
+    // in the Athena archive (the system of record). See SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md
+    // section 10.
     if (isAdminIamEnforcedCall(event) && !queryTypeAllowedOnPath(queryType, event.path || '')) {
       return respond(403, { error: 'queryType not permitted on this resource' });
     }
