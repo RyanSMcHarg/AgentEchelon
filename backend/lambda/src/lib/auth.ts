@@ -123,6 +123,16 @@ export function isAdmin(claims: AuthorizedClaims): boolean {
   return claims.groups.some((g) => ADMIN_GROUPS.has(g));
 }
 
+/** The IAM principal on an `AWS_IAM`-authorized request (null on a
+ *  Cognito-authorized one). API Gateway populates `requestContext.identity`
+ *  with the signing principal for SigV4-signed calls; it is empty otherwise. */
+function iamPrincipal(event: APIGatewayProxyEvent): string | null {
+  const id = event.requestContext?.identity as
+    | { userArn?: string | null; caller?: string | null; accountId?: string | null }
+    | undefined;
+  return id?.userArn || id?.caller || id?.accountId || null;
+}
+
 /**
  * True when the deployment runs in `adminAuthMode=service` AND this request
  * arrived as an IAM-signed (SigV4) call — i.e. the admin/analytics API is
@@ -140,19 +150,61 @@ export function isAdmin(claims: AuthorizedClaims): boolean {
  */
 export function isServiceAdminCall(event: APIGatewayProxyEvent): boolean {
   if (process.env.ADMIN_AUTH_MODE !== 'service') return false;
-  const id = event.requestContext?.identity as
-    | { userArn?: string | null; caller?: string | null; accountId?: string | null }
-    | undefined;
-  return Boolean(id?.userArn || id?.caller || id?.accountId);
+  return iamPrincipal(event) !== null;
 }
 
-/** Synthesize admin claims for an IAM-signed service call (service mode). */
-function serviceAdminClaims(event: APIGatewayProxyEvent): AuthorizedClaims {
-  const id = event.requestContext?.identity as
-    | { userArn?: string | null; caller?: string | null; accountId?: string | null }
-    | undefined;
-  const sub = id?.userArn || id?.caller || id?.accountId || 'service';
-  return { sub, email: null, clearance: 'admins', groups: ['admins'] };
+/**
+ * The caller's Cognito `sub` on an IAM-authorized (Identity-Pool-signed) request.
+ * API Gateway sets `identity.cognitoAuthenticationProvider` to
+ * `cognito-idp.<region>.amazonaws.com/<poolId>:CognitoSignIn:<sub>` (the sub is the
+ * segment after the last `:CognitoSignIn:`), so a SigV4-signed admin call still
+ * carries the *verified* human identity even though there is no JWT. A14 uses this
+ * to resolve the caller's classification ceiling for the `Scoped` cells (the read
+ * "filters on the verified identity", spec section 6.4). Returns null on a
+ * Cognito-JWT call (no IAM identity) or an unparseable provider string.
+ */
+export function iamCallerSub(event: APIGatewayProxyEvent): string | null {
+  const provider = (event.requestContext?.identity as { cognitoAuthenticationProvider?: string | null } | undefined)
+    ?.cognitoAuthenticationProvider;
+  if (!provider) return null;
+  const marker = ':CognitoSignIn:';
+  const i = provider.lastIndexOf(marker);
+  if (i === -1) return null;
+  // The sub can be followed by nothing; guard against a trailing comma/space.
+  const sub = provider.slice(i + marker.length).split(/[,\s]/)[0].trim();
+  return sub || null;
+}
+
+/**
+ * True when A14 fine-grained IAM enforcement is on for this handler
+ * (`ADMIN_IAM_ENFORCEMENT=true`, set by the CDK only on the resources whose API
+ * Gateway method is `AWS_IAM`-authorized under `-c adminIamEnforcement=true`)
+ * AND the request arrived IAM-signed. Unlike service mode (all-or-nothing), the
+ * gateway has already enforced `execute-api:Invoke` on the SPECIFIC resource —
+ * so reaching this handler proves the signed principal holds that capability
+ * (its sign-on group role, or an exchange-vended per-use cred). The handler
+ * therefore trusts the principal and derives the actor from it
+ * (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6). Fails closed the same way:
+ * no env → false; no IAM identity → false. See {@link iamPrincipal}.
+ */
+export function isAdminIamEnforcedCall(event: APIGatewayProxyEvent): boolean {
+  if (process.env.ADMIN_IAM_ENFORCEMENT !== 'true') return false;
+  return iamPrincipal(event) !== null;
+}
+
+/**
+ * An IAM-signed admin call the handler may trust because a gateway IAM
+ * authorizer already vetted it — either service mode (a trusted upstream proxy)
+ * or A14 per-resource enforcement (the signed principal held the capability).
+ */
+function isTrustedIamAdminCall(event: APIGatewayProxyEvent): boolean {
+  return isServiceAdminCall(event) || isAdminIamEnforcedCall(event);
+}
+
+/** Synthesize admin claims for a trusted IAM-signed call (service or A14 mode),
+ *  deriving the actor from the signed principal. */
+function iamPrincipalClaims(event: APIGatewayProxyEvent): AuthorizedClaims {
+  return { sub: iamPrincipal(event) || 'iam-principal', email: null, clearance: 'admins', groups: ['admins'] };
 }
 
 /**
@@ -167,7 +219,7 @@ function serviceAdminClaims(event: APIGatewayProxyEvent): AuthorizedClaims {
  * `groups.includes('admins')` checks under the default `ae-cognito` mode.
  */
 export function callerIsAdmin(event: APIGatewayProxyEvent): boolean {
-  if (isServiceAdminCall(event)) return true;
+  if (isTrustedIamAdminCall(event)) return true;
   // Group-only check, independent of `sub` — matches the legacy inline
   // `cognito:groups.includes('admins')` gates exactly (some authorizer configs
   // omit sub but always carry groups for an admin).
@@ -195,7 +247,11 @@ const ARCHIVE_VIEW_GROUPS = new Set<string>(
 );
 
 export function callerCanReadArchive(event: APIGatewayProxyEvent): boolean {
-  if (isServiceAdminCall(event)) return true;
+  // A14: under per-resource IAM enforcement the gateway already proved the
+  // signed principal holds this archive capability (its `execute-api:Invoke`
+  // on the specific resource), so the group gate is no longer the control —
+  // it stays as the `ae-cognito` fallback for Cognito-JWT calls.
+  if (isTrustedIamAdminCall(event)) return true;
   const claims = event.requestContext?.authorizer?.claims as Record<string, unknown> | undefined;
   if (!claims) return false;
   return parseGroups(claims['cognito:groups']).some((g) => ARCHIVE_VIEW_GROUPS.has(g));
@@ -220,7 +276,10 @@ const MANAGE_PROFILES_GROUPS = new Set<string>(
 );
 
 export function callerCanManageProfiles(event: APIGatewayProxyEvent): boolean {
-  if (isServiceAdminCall(event)) return true;
+  // A14: under per-resource IAM enforcement the gateway proved the signed
+  // principal holds `manage-profiles` (execute-api on the profile routes); the
+  // group gate stays as the ae-cognito fallback.
+  if (isTrustedIamAdminCall(event)) return true;
   const claims = event.requestContext?.authorizer?.claims as Record<string, unknown> | undefined;
   if (!claims) return false;
   return parseGroups(claims['cognito:groups']).some((g) => MANAGE_PROFILES_GROUPS.has(g));
@@ -253,8 +312,9 @@ export function respond(statusCode: number, body: unknown, origin?: string): API
 export function requireAdmin(
   event: APIGatewayProxyEvent,
 ): { claims: AuthorizedClaims } | APIGatewayProxyResult {
-  // Service mode: an IAM-signed call from a trusted backend principal is admin.
-  if (isServiceAdminCall(event)) return { claims: serviceAdminClaims(event) };
+  // A trusted IAM-signed call (service mode, or A14 per-resource enforcement)
+  // derives its actor from the signed principal — the gateway already vetted it.
+  if (isTrustedIamAdminCall(event)) return { claims: iamPrincipalClaims(event) };
   const claims = extractClaims(event);
   if (!claims) return respond(401, { error: 'Unauthorized' });
   if (!isAdmin(claims)) {

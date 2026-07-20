@@ -16,6 +16,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
+import { adminOrigin, sharedOrigins } from '../config/app-origins';
 import { ALL_PARTITION_VALUES } from '../../lambda/src/lib/client-event-types';
 import * as kinesis from 'aws-cdk-lib/aws-kinesis';
 import * as firehose from 'aws-cdk-lib/aws-kinesisfirehose';
@@ -43,6 +44,8 @@ import { MembershipAuditConstruct } from '../constructs/membership-audit';
 export interface AnalyticsStackProps extends cdk.StackProps {
   appInstanceArn: string;
   userPool?: cognito.IUserPool;
+  /** A14: the `admins` sign-on role ARN (execute-api teeth on the analytics API under adminIamEnforcement). */
+  adminSignOnRoleArn?: string;
   /** Layer 6 membership audit (SPEC-CONVERSATION-SECURITY). Opt-in; report-only unless enforce. */
   enableMembershipAudit?: boolean;
   membershipAuditEnforce?: boolean;
@@ -550,6 +553,9 @@ export class AnalyticsStack extends cdk.Stack {
     // ============================================================
 
     const appUrl = this.node.tryGetContext('appUrl') || 'http://localhost:5173';
+    // The analytics query API is admin-only → the admin console origin. (The
+    // client-events ingestion API below stays chat-facing on appUrl.)
+    const adminAppUrl = adminOrigin(this);
 
     const analyticsQueryFn = new lambdaNodeJs.NodejsFunction(this, 'AnalyticsQueryFunction', {
       entry: './lambda/src/analytics-query.ts',
@@ -562,7 +568,7 @@ export class AnalyticsStack extends cdk.Stack {
         ...adminAuthEnv(this),
         ATHENA_WORKGROUP: ATHENA_WORKGROUP_NAME,
         ATHENA_DATABASE: ANALYTICS_DB_NAME,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: adminAppUrl,
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
@@ -571,7 +577,11 @@ export class AnalyticsStack extends cdk.Stack {
       restApiName: 'Agent Echelon Analytics',
       description: 'Analytics query API for admin dashboard',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        // Co-hosts the admin analytics query routes AND the chat-facing /events
+        // ingestion route, so the shared preflight allows both origins; each
+        // Lambda echoes only its own origin (analytics -> adminAppUrl, events ->
+        // appUrl) in the actual response.
+        allowOrigins: sharedOrigins(this),
         allowMethods: ['POST', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },
@@ -588,12 +598,44 @@ export class AnalyticsStack extends cdk.Stack {
     // Admin-plane auth mode (ae-cognito default / federated / service) — see
     // docs/ADMIN-INTEGRATION-GUIDE.md. In ae-cognito mode this uses a Cognito
     // authorizer on AE's own user pool.
-    const analyticsAuthOptions = adminApiMethodOptions(this, 'AnalyticsAuthorizer', {
-      userPool: props.userPool,
-    });
+    // A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): under adminIamEnforcement the
+    // analytics query is AWS_IAM-authorized (the console SigV4-signs). Athena mode
+    // enforces at the COARSE analytics-read level: this API is a single POST /query
+    // (no per-capability sub-path split), so the handler's per-resource queryType
+    // guard is a no-op here. This is a stack gap, NOT a data limitation — the
+    // S3/Athena `conversations` archive is the system of record for the event log
+    // and holds the user-activity data (Aurora is a lossy projection). Bringing
+    // Athena to parity = the sub-path split here + the `channel_events` queryType in
+    // the Athena Lambda. Default = the Cognito authorizer, unchanged.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
+      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    const analyticsAuthOptions: apigateway.MethodOptions = adminIamEnforcement
+      ? { authorizationType: apigateway.AuthorizationType.IAM }
+      : adminApiMethodOptions(this, 'AnalyticsAuthorizer', { userPool: props.userPool });
+    if (adminIamEnforcement) {
+      analyticsQueryFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+      // A14 Scoped: resolve the caller's classification ceiling from Cognito groups.
+      if (props.userPool) {
+        analyticsQueryFn.addEnvironment('USER_POOL_ID', props.userPool.userPoolId);
+        analyticsQueryFn.addToRolePolicy(new iam.PolicyStatement({
+          actions: ['cognito-idp:ListUsers', 'cognito-idp:AdminListGroupsForUser'],
+          resources: [props.userPool.userPoolArn],
+        }));
+      }
+    }
     analyticsApi.root
       .addResource('query')
       .addMethod('POST', analyticsIntegration, analyticsAuthOptions);
+
+    // A14 sign-on-role teeth: the `admins` role gets execute-api on the analytics
+    // API (admins = Full). Finer persona roles get per-capability grants (Aurora).
+    if (adminIamEnforcement && props.adminSignOnRoleArn) {
+      const adminRole = iam.Role.fromRoleArn(this, 'ImportedAdminSignOnRole', props.adminSignOnRoleArn, { mutable: true });
+      adminRole.addToPrincipalPolicy(new iam.PolicyStatement({
+        actions: ['execute-api:Invoke'],
+        resources: [analyticsApi.arnForExecuteApi()],
+      }));
+    }
 
     new cdk.CfnOutput(this, 'AnalyticsApiUrl', {
       value: `${analyticsApi.url}query`,

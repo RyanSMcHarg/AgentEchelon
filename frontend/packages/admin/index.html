@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      Admin console entry — the @ae/admin package, a SEPARATE Vite app/build/deploy
+      target from @ae/chat: its own entry (src/main.tsx), its own build output
+      (dist/), and its own CloudFront origin (AgentEchelonAdminFrontend). It carries
+      only the operator surface (analytics, conversation administration, experiments,
+      user management) and gates on the `admins` group. Both apps run against the
+      SAME Chime app instance + Cognito pool via @ae/shared. See
+      docs/specs/admin-console/SPEC-SEPARATE-ADMIN-APP.md.
+
+      Same baseline CSP + companion headers as the chat app; production deployers
+      should ALSO set these as CloudFront response headers.
+    -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; connect-src 'self' https://*.amazonaws.com wss://*.chime.aws https://*.execute-api.us-east-1.amazonaws.com; img-src 'self' data: https://*.amazonaws.com; font-src 'self' data:; object-src 'none'; frame-src 'none'; base-uri 'self'; form-action 'self';" />
+    <meta http-equiv="X-Content-Type-Options" content="nosniff" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <meta http-equiv="Permissions-Policy" content="camera=(), microphone=(), geolocation=(), payment=()" />
+    <link rel="icon" type="image/svg+xml" href="/brand-mark.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AgentEchelon Admin</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/main.tsx"></script>
+  </body>
+</html>

@@ -29,6 +29,15 @@ import { getTestCredentials } from './helpers/test-credentials';
 import { assertNoErrorBanners } from './helpers/banner-check';
 import { armSettle, SECTION_QUERIES } from './helpers/analytics-settle';
 
+// Post D-split (SPEC-SEPARATE-ADMIN-APP.md): the admin console is its OWN app on
+// its OWN origin. Point these specs at it via E2E_ADMIN_BASE_URL (the admin
+// CloudFront URL when running against a deployment, or the admin dev server
+// locally). The admin app renders the dashboard at root for an authenticated
+// admin — there is no "Admin" button and no `?admin` presence toggle anymore
+// (that was the old chat-embedded model).
+const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
+test.use({ baseURL: ADMIN_BASE_URL });
+
 let credentials: Awaited<ReturnType<typeof getTestCredentials>>;
 
 test.beforeAll(async () => {
@@ -37,25 +46,21 @@ test.beforeAll(async () => {
 
 test.describe('Admin Dashboard - Base Tabs', () => {
   test.beforeEach(async ({ page }) => {
-    // Sign in as the ADMIN user, not a plain premium user. The admin console
-    // BUTTON shows for any premium user, but the analytics API is gated on the
-    // `admins` Cognito group: a premium-but-not-admin user gets 403 on every
-    // query, which the dashboard surfaces as "Analytics API unavailable". Only
-    // an actual admin exercises the rendered analytics. testAdmin is premium
-    // tier AND in the admins group, so every base-tab assertion still holds.
+    // Sign in as the ADMIN user on the admin app. The admin app renders the
+    // dashboard ONLY for a user in the `admins` group (AdminApp.tsx); the analytics
+    // API is independently gated on the same group. testAdmin is premium tier AND
+    // in admins, so every base-tab assertion holds. After sign-in the dashboard is
+    // at root — no button click.
     await signIn(page, credentials.testAdmin.email, credentials.testAdmin.password);
-
   });
 
-  test('should show admin button for premium users', async ({ page }) => {
-    const adminButton = page.locator('[data-testid="admin-button"], button:has-text("Admin")');
-    await expect(adminButton).toBeVisible({ timeout: 10000 });
+  test('admin app renders the dashboard for an admin (no button, separate app)', async ({ page }) => {
+    // The console renders directly for an authenticated admin — the section rail is
+    // the proof the dashboard mounted (replaces the old chat-app "Admin button" test).
+    await expect(page.locator('.admin-section-rail')).toBeVisible({ timeout: 15000 });
   });
 
   test('should open admin dashboard and show base sections', async ({ page }) => {
-    const adminButton = page.locator('[data-testid="admin-button"], button:has-text("Admin")');
-    await adminButton.click();
-
     // Two-level nav: the section rail holds the 6 top-level sections; the
     // former per-tab buttons (Models/Strategy/Evaluations/Latency/Manage Users)
     // are now sub-tabs within a section.
@@ -70,8 +75,7 @@ test.describe('Admin Dashboard - Base Tabs', () => {
   });
 
   test('Security section (Membership Audit) renders', async ({ page }) => {
-    const adminButton = page.locator('[data-testid="admin-button"], button:has-text("Admin")');
-    await adminButton.click();
+    // Admin app: the dashboard is at root after sign-in (no Admin button).
 
     const rail = page.locator('.admin-section-rail');
     await rail.locator('button:has-text("Security")').click();
@@ -85,8 +89,7 @@ test.describe('Admin Dashboard - Base Tabs', () => {
   });
 
   test('should display Overview tab with date range selector', async ({ page }) => {
-    const adminButton = page.locator('[data-testid="admin-button"], button:has-text("Admin")');
-    await adminButton.click();
+    // Admin app: the dashboard is at root after sign-in (no Admin button).
 
     // Overview section is active by default
     await expect(page.locator('.admin-section-btn.active:has-text("Overview")')).toBeVisible();
@@ -104,8 +107,7 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     // not re-fire the queries).
     const overviewWaiters = armSettle(page, SECTION_QUERIES.Overview);
 
-    const adminButton = page.locator('[data-testid="admin-button"], button:has-text("Admin")');
-    await adminButton.click();
+    // Admin app: the dashboard is at root after sign-in (no Admin button).
 
     const rail = page.locator('.admin-section-rail');
     // Every top-level section must render without a broken-view banner
@@ -132,8 +134,7 @@ test.describe('Admin Dashboard - Base Tabs', () => {
   });
 
   test('should switch between sections and sub-tabs', async ({ page }) => {
-    const adminButton = page.locator('[data-testid="admin-button"], button:has-text("Admin")');
-    await adminButton.click();
+    // Admin app: the dashboard is at root after sign-in (no Admin button).
 
     const rail = page.locator('.admin-section-rail');
 
@@ -171,21 +172,16 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     await page.locator('.admin-subtab-btn:has-text("Manage Users")').click();
   });
 
-  test('should navigate back from admin dashboard', async ({ page }) => {
-    const adminButton = page.locator('[data-testid="admin-button"], button:has-text("Admin")');
-    await adminButton.click();
-
-    // Click back button
-    const backButton = page.locator('.admin-back-btn, button:has-text("Back")');
-    await backButton.click();
-
-    // Should be back in the main conversation view
+  test('in-app Back from the dashboard root signs the operator out (standalone app)', async ({ page }) => {
+    // The standalone admin app has no chat surface to return to (AdminApp
+    // `onBack={logout}`); from the root (no tab history to walk) the in-app Back
+    // signs out, so the dashboard unmounts.
+    await page.locator('.admin-back-btn, button:has-text("Back")').click();
     await expect(page.locator('.admin-dashboard')).not.toBeVisible();
   });
 
   test('should change date range and reload data', async ({ page }) => {
-    const adminButton = page.locator('[data-testid="admin-button"], button:has-text("Admin")');
-    await adminButton.click();
+    // Admin app: the dashboard is at root after sign-in (no Admin button).
 
     // Click 30 days
     await page.locator('button:has-text("Last 30 days")').click();
@@ -197,8 +193,7 @@ test.describe('Admin Dashboard - Base Tabs', () => {
   });
 
   test('should display Experiments tab with create form', async ({ page }) => {
-    const adminButton = page.locator('[data-testid="admin-button"], button:has-text("Admin")');
-    await adminButton.click();
+    // Admin app: the dashboard is at root after sign-in (no Admin button).
 
     // Navigate to the Experiments section
     await page.locator('.admin-section-rail button:has-text("Experiments")').click();
@@ -236,7 +231,7 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
   // analyticsMode === 'aurora'). The two-level nav groups the Aurora analytics
   // views as sub-tabs under the "Effectiveness" section.
   async function openAdmin(page: import('@playwright/test').Page) {
-    await page.locator('[data-testid="admin-button"], button:has-text("Admin")').click();
+    // Admin app renders the dashboard at root; just confirm Aurora is live.
     await expect(page.locator('.status-badge--live')).toBeVisible({ timeout: 20000 });
   }
   async function openEffectiveness(page: import('@playwright/test').Page) {
@@ -291,8 +286,7 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
   });
 
   test('should display Conversations tab with live browser and drift analytics', async ({ page }) => {
-    const adminButton = page.locator('[data-testid="admin-button"], button:has-text("Admin")');
-    await adminButton.click();
+    // Admin app: the dashboard is at root after sign-in (no Admin button).
 
     const convTab = page.locator('.admin-section-rail button:has-text("Conversations")');
     await convTab.click();

@@ -19,7 +19,12 @@ import { DynamoDBDocumentClient, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { stripMessageMarkers } from '../lib/message-markers.js';
 import { query, ensureSchema } from './db-client.js';
 import { estimateStepCostUsd, bedrockModelIdToKey } from '../lib/model-rate-table.js';
-import { callerIsAdmin, callerCanReadArchive } from '../lib/auth.js';
+import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall } from '../lib/auth.js';
+import { queryTypeAllowedOnPath } from '../lib/admin-capability-map.js';
+import { ceilingForRequest, scopeAnalyticsRows, type ClassificationCeiling } from '../lib/caller-scope.js';
+
+// A14 Scoped: the pool the caller's classification ceiling is resolved against.
+const USER_POOL_ID = process.env.USER_POOL_ID || '';
 import { recordModerationAction, adminListEvents } from './admin-conversations-aurora.js';
 import {
   aggregateVariantFeedback,
@@ -172,6 +177,17 @@ export async function handler(
     // POST hit no method on the API root). Admin-gated like every other endpoint.
     if (event.httpMethod === 'POST') {
       if (!isAdmin) return error(403, 'Admin access required');
+      // A14: under per-resource IAM enforcement the gateway authorized this
+      // request as the capability of THIS resource path; reject a queryType that
+      // belongs to a different capability, so a caller allowed the low-sensitivity
+      // analytics resource cannot read A13 PII (or the event log / moderation
+      // audit) by naming its queryType on the wrong path.
+      if (isAdminIamEnforcedCall(event)) {
+        const qt = parsePostQueryType(event.body);
+        if (!queryTypeAllowedOnPath(qt, event.path || '')) {
+          return error(403, 'queryType not permitted on this resource');
+        }
+      }
       // Moderation audit: the actor is the SERVER-VERIFIED admin (callerSub + claims), never
       // the client body — so attribution can't be spoofed. Intercepted before query dispatch.
       const mod = await maybeRecordModeration(event.body, callerSub, claims);
@@ -182,7 +198,13 @@ export async function handler(
       if (isArchiveReadBody(event.body) && !callerCanReadArchive(event)) {
         return error(403, 'Archive-view permission required');
       }
-      return handlePostQuery(event.body);
+      // A14 Scoped: resolve the caller's classification ceiling and narrow the
+      // result rows. Full (null) only on a Cognito-JWT call; an enforced call fails
+      // closed to the floor if the caller cannot be identified (ceilingForRequest).
+      const ceiling: ClassificationCeiling = isAdminIamEnforcedCall(event)
+        ? await ceilingForRequest(event, USER_POOL_ID)
+        : null;
+      return handlePostQuery(event.body, ceiling);
     }
 
     const path = event.path || '';
@@ -562,6 +584,16 @@ function isArchiveReadBody(rawBody: string | null): boolean {
   }
 }
 
+/** The queryType named in a POST body (empty if absent/malformed) — for the A14
+ *  per-resource capability check. */
+function parsePostQueryType(rawBody: string | null): string {
+  try {
+    return String(JSON.parse(rawBody || '{}').queryType || '');
+  } catch {
+    return '';
+  }
+}
+
 async function getChannelEvents(
   params: Record<string, string | undefined>,
 ): Promise<APIGatewayProxyResult> {
@@ -571,7 +603,7 @@ async function getChannelEvents(
   return success({ events });
 }
 
-async function handlePostQuery(rawBody: string | null): Promise<APIGatewayProxyResult> {
+async function handlePostQuery(rawBody: string | null, ceiling: ClassificationCeiling = null): Promise<APIGatewayProxyResult> {
   let body: Record<string, unknown>;
   try {
     body = JSON.parse(rawBody || '{}');
@@ -596,8 +628,10 @@ async function handlePostQuery(rawBody: string | null): Promise<APIGatewayProxyR
     return error(500, 'Malformed analytics result');
   }
   const arr = Array.isArray(parsed[entry.dataKey]) ? parsed[entry.dataKey] : [];
+  // A14 Scoped: narrow rows with a tier dimension to the caller's ceiling.
+  const scoped = scopeAnalyticsRows(arr as unknown[], ceiling);
   // Normalize to { data: [...] }; keep the rest (stats/pagination/totals) at top level.
-  return success({ ...parsed, data: arr });
+  return success({ ...parsed, data: scoped });
 }
 
 /**

@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="AgentEchelon">
+  <rect x="2" y="2" width="28" height="28" rx="7" fill="#1f2937"/>
+  <!-- Echelon: three ascending bars in a stepped formation. -->
+  <rect x="8" y="19" width="4" height="6" rx="1.2" fill="#818cf8"/>
+  <rect x="14" y="14" width="4" height="11" rx="1.2" fill="#a5b4fc"/>
+  <rect x="20" y="9" width="4" height="16" rx="1.2" fill="#e0e7ff"/>
+</svg>

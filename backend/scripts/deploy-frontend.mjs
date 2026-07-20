@@ -15,11 +15,17 @@
  *      VITE_* from it). See frontend/.env.example + CLAUDE.md.
  *
  * Usage (from backend/, with AWS creds in the environment):
- *   node scripts/deploy-frontend.mjs            # build, then sync + invalidate
- *   node scripts/deploy-frontend.mjs --no-build # publish an existing dist/
+ *   node scripts/deploy-frontend.mjs            # chat SPA: build, sync + invalidate
+ *   node scripts/deploy-frontend.mjs --admin    # admin console (AgentEchelonAdminFrontend)
+ *   node scripts/deploy-frontend.mjs --no-build # publish an existing build
  *
- * Env overrides: AWS_REGION (default us-east-1), FRONTEND_STACK_NAME
- * (default AgentEchelonFrontend).
+ * The --admin target builds the standalone admin app (`npm run build:admin` →
+ * packages/admin/dist) and syncs it to the AgentEchelonAdminFrontend origin.
+ * The default (chat) target additionally asserts the chat bundle carries no admin
+ * code (SPEC-SEPARATE-ADMIN-APP.md).
+ *
+ * Env overrides: AWS_REGION (default us-east-1), STACK_PREFIX (default
+ * AgentEchelon), FRONTEND_STACK_NAME (default <prefix>[Admin]Frontend).
  */
 import { spawnSync } from 'node:child_process';
 import { createReadStream } from 'node:fs';
@@ -42,13 +48,24 @@ import {
 } from '@aws-sdk/client-cloudfront';
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
-const STACK_NAME = process.env.FRONTEND_STACK_NAME || 'AgentEchelonFrontend';
+const STACK_PREFIX = process.env.STACK_PREFIX || 'AgentEchelon';
+const isAdmin = process.argv.includes('--admin');
+// Distinct CloudFormation output keys per target (the admin stack prefixes its
+// outputs 'Admin*'; see FrontendStack.outputPrefix).
+const OUT_PREFIX = isAdmin ? 'Admin' : '';
+const STACK_NAME = process.env.FRONTEND_STACK_NAME
+  || `${STACK_PREFIX}${isAdmin ? 'AdminFrontend' : 'Frontend'}`;
+// Frontend is an npm-workspaces monorepo: @ae/chat and @ae/admin are separate
+// packages, each a Vite app that builds its own index.html into its own dist/.
+const BUILD_SCRIPT = isAdmin ? 'npm run build:admin' : 'npm run build:chat';
+const ROOT_DOC = 'index.html';
 const skipBuild = process.argv.includes('--no-build');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const repoRoot = path.resolve(__dirname, '..', '..');
+// The workspace root (where the build:chat / build:admin / assert scripts live).
 const frontendDir = path.join(repoRoot, 'frontend');
-const distDir = path.join(frontendDir, 'dist');
+const distDir = path.join(frontendDir, 'packages', isAdmin ? 'admin' : 'chat', 'dist');
 
 const CONTENT_TYPES = {
   '.html': 'text/html; charset=utf-8',
@@ -119,11 +136,11 @@ async function getOutputs() {
   }
   const outputs = res.Stacks?.[0]?.Outputs ?? [];
   const get = (k) => outputs.find((o) => o.OutputKey === k)?.OutputValue;
-  const bucket = get('DistributionBucketName');
-  const distributionId = get('DistributionId');
-  const url = get('DistributionUrl');
+  const bucket = get(`${OUT_PREFIX}DistributionBucketName`);
+  const distributionId = get(`${OUT_PREFIX}DistributionId`);
+  const url = get(`${OUT_PREFIX}DistributionUrl`);
   if (!bucket || !distributionId) {
-    fail(`Stack "${STACK_NAME}" is missing DistributionBucketName/DistributionId outputs.`);
+    fail(`Stack "${STACK_NAME}" is missing ${OUT_PREFIX}DistributionBucketName/${OUT_PREFIX}DistributionId outputs.`);
   }
   return { bucket, distributionId, url };
 }
@@ -133,27 +150,41 @@ function build() {
     console.log('• Skipping build (--no-build); publishing existing dist/');
     return;
   }
-  console.log('• Building frontend (npm run build)…');
+  console.log(`• Building frontend (${BUILD_SCRIPT})…`);
   // Single command string (not an args array) with shell:true so npm resolves
   // to npm.cmd on Windows AND we avoid the DEP0190 unescaped-args warning. The
   // command is a fixed literal — no interpolation, no injection surface.
-  const res = spawnSync('npm run build', {
+  const res = spawnSync(BUILD_SCRIPT, {
     cwd: frontendDir,
     stdio: 'inherit',
     shell: true,
   });
   if (res.status !== 0) fail('Frontend build failed — fix the errors above and retry.');
+
+  // Security invariant: the public chat bundle must carry no admin code
+  // (SPEC-SEPARATE-ADMIN-APP.md). Assert it before publishing the chat origin.
+  if (!isAdmin) {
+    console.log('• Asserting chat bundle is admin-free…');
+    const assert = spawnSync('npm run assert-no-admin-in-chat', {
+      cwd: frontendDir,
+      stdio: 'inherit',
+      shell: true,
+    });
+    if (assert.status !== 0) {
+      fail('Chat bundle contains admin code — refusing to publish. See the offending import chain above.');
+    }
+  }
 }
 
 async function sync(bucket) {
   let files;
   try {
-    const st = await stat(path.join(distDir, 'index.html'));
+    const st = await stat(path.join(distDir, ROOT_DOC));
     if (!st.isFile()) throw new Error('not a file');
   } catch {
     fail(
-      `No build found at ${distDir} (index.html missing).\n` +
-        `   Run without --no-build, or build first: npm --prefix ../frontend run build`,
+      `No build found at ${distDir} (${ROOT_DOC} missing).\n` +
+        `   Run without --no-build, or build first: npm --prefix ../frontend run ${isAdmin ? 'build:admin' : 'build:chat'}`,
     );
   }
   files = await walk(distDir);
@@ -216,11 +247,12 @@ async function main() {
   build();
   await sync(bucket);
   await invalidate(distributionId);
-  console.log(`\n✅ Deployed. App: ${url || `https://<distribution>`}\n`);
+  console.log(`\n✅ Deployed. ${isAdmin ? 'Admin console' : 'App'}: ${url || `https://<distribution>`}\n`);
+  const corsCtx = isAdmin ? 'adminAppUrl' : 'appUrl';
   console.log(
     '   If the API rejects requests with CORS errors, redeploy the backend with\n' +
-      `   --context appUrl=${url || 'https://<DistributionUrl>'}  so its CORS allowlist\n` +
-      '   includes the app origin.\n',
+      `   --context ${corsCtx}=${url || 'https://<DistributionUrl>'}  so its CORS allowlist\n` +
+      `   includes the ${isAdmin ? 'admin console' : 'app'} origin.\n`,
   );
 }
 

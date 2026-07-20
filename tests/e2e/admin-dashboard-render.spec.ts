@@ -20,6 +20,11 @@ import { signIn } from './helpers/agent-helpers';
 import { getAdminUser } from './helpers/test-credentials';
 import { collectBanners } from './helpers/banner-check';
 
+// The admin console is its own app on its own origin (SPEC-SEPARATE-ADMIN-APP.md).
+// Point at it via E2E_ADMIN_BASE_URL (admin CloudFront URL, or the admin dev server).
+const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
+test.use({ baseURL: ADMIN_BASE_URL });
+
 // The analytics API the built frontend POSTs every queryType to. Match by host
 // so we don't couple to the trailing path/stage.
 const ANALYTICS_HOST = 'h1bu974mq6.execute-api.us-east-1.amazonaws.com';
@@ -140,12 +145,10 @@ test.describe('Admin Dashboard - render validation (live)', () => {
     const overviewWaiters = settleWaiters(page, SECTION_QUERIES.Overview);
 
     await signIn(page, admin.email, admin.password);
-    const adminButton = page.locator('[data-testid="admin-button"], button:has-text("Admin")');
-    await expect(adminButton).toBeVisible({ timeout: 15000 });
-    await adminButton.click();
-
+    // Admin app renders the dashboard at root for an admin (no Admin button since
+    // the D split); the section rail is the proof the console mounted.
     const rail = page.locator('.admin-section-rail');
-    await expect(rail).toBeVisible({ timeout: 10000 });
+    await expect(rail).toBeVisible({ timeout: 15000 });
     // Report Aurora vs Athena mode (drives which queries return unsupported).
     const mode = (await page.locator('.status-badge--live:has-text("Aurora")').isVisible().catch(() => false))
       ? 'aurora'

@@ -1,0 +1,119 @@
+/* ========================================
+   App Header (Dark Chrome)
+   ======================================== */
+
+.app-header {
+  background: var(--chrome-bg);
+  border-bottom: 1px solid var(--chrome-border);
+  position: sticky;
+  top: 0;
+  z-index: var(--z-sticky);
+  flex-shrink: 0;
+}
+
+.header-content {
+  max-width: 100%;
+  padding: var(--space-3) var(--space-5);
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  min-height: 52px;
+  gap: var(--space-4);
+}
+
+.header-left {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  min-width: 0;
+}
+
+/* Wordmark — monospace tracking for the "technical product" tone */
+.header-title {
+  font-size: var(--text-md);
+  font-weight: 600;
+  color: var(--chrome-text-bright);
+  margin: 0;
+  letter-spacing: var(--tracking-tight);
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  white-space: nowrap;
+}
+
+/* Brand emblem leads the wordmark (replaces the former accent dot).
+   Now a button that returns to the app home; reset native button styling. */
+.header-brand {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-width: 0;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  cursor: pointer;
+  border-radius: var(--radius-sm);
+  transition: opacity var(--duration-fast) var(--ease-in-out);
+}
+.header-brand:hover {
+  opacity: 0.85;
+}
+.header-mark {
+  width: 22px;
+  height: 22px;
+  flex: 0 0 auto;
+  color: var(--chrome-text-bright);
+}
+
+.header-actions {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.header-admin-btn,
+.header-admin-link,
+.header-logout-btn {
+  background: transparent;
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--radius-md);
+  padding: 6px var(--space-3);
+  font-size: var(--text-base);
+  font-family: var(--font-sans);
+  font-weight: 500;
+  color: var(--chrome-text);
+  cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-in-out),
+    border-color var(--duration-fast) var(--ease-in-out),
+    color var(--duration-fast) var(--ease-in-out);
+  letter-spacing: var(--tracking-tight);
+}
+
+/* The admin link-out is an anchor styled as a button. */
+.header-admin-link {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
+.header-admin-btn:hover,
+.header-admin-link:hover,
+.header-logout-btn:hover {
+  background: var(--chrome-hover);
+  border-color: var(--accent-500);
+  color: var(--chrome-text-bright);
+}
+
+.header-logout-btn:active {
+  background: var(--chrome-active);
+}
+
+/* When admin view is active, the admin button gets an amber outline */
+.header-admin-btn.is-active {
+  background: color-mix(in srgb, var(--accent-500) 12%, transparent);
+  border-color: var(--accent-500);
+  color: var(--accent-200);
+}

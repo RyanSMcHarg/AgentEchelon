@@ -8,20 +8,38 @@ This guide covers when to switch, how to deploy, and what to expect.
 
 ## When to use Aurora mode
 
+> **Athena/S3 is the system of record; Aurora is a fast projection of it.** Both modes write the same
+> append-only S3 conversation archive (the Kinesis stream fans out to S3 in either mode), and that archive
+> is the **complete, durable Chime event stream** partitioned by classification. Aurora mode adds a
+> Postgres/pgvector copy for sub-second queries and features Athena cannot serve (evaluation, drift,
+> cross-conversation search), but that copy is a **lossy real-time projection** (it collapses membership
+> to current state and drops some events). Switching modes does not change what is retained; it changes
+> what is queryable and how fast. So "not available in Athena" below means *the query path or derived
+> table is not built for Athena mode*, never that the underlying events are missing from the archive.
+
 | Consideration | Athena (default) | Aurora |
 |---------------|-----------------|--------|
+| Conversation / event archive (system of record) | **Yes** - S3, always on, the durable source | Same S3 archive **plus** a Postgres projection |
+| Raw event log ("Show all events") | Data is in the S3 archive (system of record); the analytics API's `channel_events` query is **not yet wired** for Athena mode, so the console view is Aurora-only today (a handler gap, not a data gap) | Served (`channel_events` -> `adminListEvents`) |
+| Membership / moderation history | Queried straight from the S3 archive (`admin-conversations.ts`) | Queried from Aurora (fast) + the `moderation_actions` attribution table (Aurora-only) |
+| User activity / signup + signin funnels | Available (Athena queries the archive + `client_events`) | Available (fast) |
 | Dashboard query latency | Seconds (pay-per-query) | Sub-second (persistent DB) |
 | Multi-turn evaluation scoring | Basic (flat Athena queries) | Full two-pass screening with pgvector |
-| Drift detection | Not available | pgvector cosine similarity over Titan v2 embeddings |
-| Cross-conversation context | Not available | Per-user context search (keyword + pgvector) |
+| Drift detection | Not available (needs pgvector) | pgvector cosine similarity over Titan v2 embeddings |
+| Cross-conversation context | Not available (needs pgvector) | Per-user context search (keyword + pgvector) |
 | Materialized views | Not available | Pre-computed daily metrics |
 | Monthly cost (baseline, rough estimate) | ~$30-50 (Kinesis-dominated) | ~$50-95 (proxy off by default; see INFRASTRUCTURE-COST.md) |
 | VPC required | No | Yes (auto-provisioned) |
 | Schema migrations | None | Automated via custom resource |
 
-**Use Athena** when cost matters more than query speed and you don't need evaluation, drift detection, or cross-conversation features.
+**Use Athena** when cost matters more than query speed and you don't need evaluation, drift detection, or cross-conversation features. You still have the full, durable event archive - it is the system of record in both modes.
 
 **Use Aurora** when you need real-time admin dashboards, automated evaluation pipelines, drift detection, or cross-conversation context.
+
+> **A14 note (IAM enforcement).** Under `-c adminIamEnforcement=true`, Aurora mode splits the analytics
+> API into per-capability resources (so a persona role can be denied, say, `view-user-activity` at the
+> gateway). Athena mode's analytics API is a single `POST /query`, so it enforces at the coarse
+> analytics-read level - a stack gap, not a data one. See `SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md`.
 
 ---
 

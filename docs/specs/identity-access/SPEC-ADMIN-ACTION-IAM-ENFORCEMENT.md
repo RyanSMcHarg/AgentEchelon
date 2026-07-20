@@ -1,8 +1,13 @@
 # Making admin-console actions IAM-enforceable
 
-**Status:** Proposed (design). Not yet built. An interim Cognito-group gate ships today
-(`callerCanReadArchive`); this spec replaces it with an IAM-enforceable capability set, driven by
-the persona/data matrix in section 3.
+**Status:** Built, flag-gated (opt-in), pending deploy validation. The enforcement is off by default;
+`-c adminIamEnforcement=true` (backend) plus `VITE_ADMIN_IAM_ENFORCEMENT=true` (admin app) turns it on,
+and the interim Cognito-group gate (`callerCanReadArchive`) stays as the `ae-cognito` fallback. The
+example personas (section 2) are opt-in behind `-c enableAdminPersonas=true`. What is wired: the
+admin-conversations reads (`view-conversations` on the sign-on role, `view-messages` exchange-vended),
+the analytics plane per capability (`view-events`, `view-user-activity`, `view-moderation-audit` on their
+own resources; `view-quality`+`view-analytics` bundled on the root), and `manage-profiles`. See section 5
+for the current split and section 10 for what remains.
 
 **Related:** [`SPEC-ADMIN-IDENTITY.md`](SPEC-ADMIN-IDENTITY.md) (admin identity + capability table),
 [`SPEC-MODERATION.md`](SPEC-MODERATION.md) (moderation surfaces),
@@ -149,11 +154,17 @@ role**.
 - **IAM-enforced (3a).** The credential exchange maps each Chime capability to `chime:*` actions and
   vends a session policy scoped to exactly those, intersected with the plane role ceiling. A role
   whose policy omits `chime:RedactChannelMessage` cannot redact.
-- **NOT IAM-enforced (3b).** The archive and analytics reads and the moderation-audit write are
-  Cognito-JWT authorized with an application group check (`callerIsAdmin`, and the interim
-  `callerCanReadArchive`). Any admin holds all of them.
+- **IAM-enforced (3b), under the flag.** With `adminIamEnforcement`, the archive and analytics read
+  resources (and the moderation-audit write) are `AWS_IAM`-authorized per resource; the sign-on role
+  (and the opt-in persona roles) carry `execute-api:Invoke` for exactly their capabilities; the handler
+  trusts the gateway-vetted principal (`isAdminIamEnforcedCall`) and, for the analytics plane, rejects a
+  queryType that does not belong to the resource's capability. A role that omits a capability's resource
+  is denied at the gateway. Default (flag off): the Cognito-JWT + group-check path below, unchanged.
+- **Fallback (flag off, or a Cognito-JWT call).** The reads stay Cognito-JWT authorized with an
+  application group check (`callerIsAdmin`, `callerCanReadArchive`, `callerCanManageProfiles`).
 - **Precedent.** `adminAuthMode=service` already runs the admin and analytics API behind an IAM
-  authorizer; `isServiceAdminCall` / `serviceAdminClaims` derive the actor from the signed principal.
+  authorizer; `isServiceAdminCall` / `iamPrincipalClaims` derive the actor from the signed principal, and
+  A14 generalizes that to per-resource enforcement.
 
 ## 6. Enforcement mechanism (bringing 3b up to 3a)
 
@@ -179,7 +190,8 @@ the role grants nothing). The design gives that structure teeth:
    customer message content (A2)**. **A2 and the Chime plane (C1-C8)** use the credential exchange's
    short-lived, per-use, **audited** vend. So a standing role never holds customer PII or a mutation,
    and every content read (once A2 is on the exchange) and every moderation emits an
-   `admin_scoped_credential_vend` log line (section 11). The
+   `admin_scoped_credential_vend` log line (section 11; the A2 vend scopes to the messages
+   *resource*, not the single channel - see section 11 for how per-channel attribution is preserved). The
    rationale: message content is the only high-sensitivity PII read, and per-conversation auditing of
    "who read this customer's messages" is worth the round-trip; everything else is metadata,
    structure, or aggregate. Revisitable (section 12.6).
@@ -221,11 +233,47 @@ in `ae-cognito` mode and require the IAM plane only in `service` / `federated` m
 
 ## 10. Migration and phasing
 
-- **P0.** This matrix + capability catalog; IAM authorizer on `POST /admin/events`; exchange vend for
-  `view-events`; frontend signing for the event view (plan item A13). Proves the pattern.
-- **P1.** `view-conversations` + `view-messages` with the scope condition.
-- **P2.** `view-quality` + `view-analytics` + the persona roles and IAM policies; docs.
-- **P3.** Retire the interim `callerCanReadArchive` group gate (or demote to the `ae-cognito` fallback).
+- **P0 (built).** The capability catalog (`backend/lib/config/admin-capabilities.ts`) + the analytics
+  queryType partition (`backend/lambda/src/lib/admin-capability-map.ts`); the flag-gated `AWS_IAM`
+  authorizer on the admin-conversations reads; the sign-on role teeth.
+- **P1 (built).** `view-conversations` on the sign-on role; `view-messages` (A2) exchange-vended, short
+  lived + audited; frontend SigV4 signing (`frontend/packages/admin/src/services/sigv4Fetch.ts`).
+- **P2 (built).** `view-events`, `view-user-activity`, `view-moderation-audit` on their own analytics
+  resources; `view-quality`+`view-analytics` bundled on the analytics root; `manage-profiles` on the
+  profile routes; the four example persona roles + their per-capability IAM policies (opt-in).
+- **P3 (built).** The interim `callerCanReadArchive` and `callerCanManageProfiles` group gates are
+  demoted to the `ae-cognito` fallback: under IAM enforcement the gateway is the control and the handler
+  trusts the signed principal; a Cognito-JWT call still resolves through the group gate.
+
+**Remaining (by design or deploy-validated):**
+
+- **The `Scoped` cells.** Two axes: (a) **tier-ceiling** is BUILT for both the admin-conversations plane
+  and the analytics plane. Under IAM authorization the handler reads the caller's `sub` from
+  `event.requestContext.identity.cognitoAuthenticationProvider` (`iamCallerSub`) and resolves their
+  classification ceiling from their Cognito groups (`lib/caller-scope.ts`: highest classification group;
+  `admins`/`platform-admins` are Full; a persona with no classification group is fail-closed to the
+  floor). Conversations: the list is filtered and the per-channel message / membership-history reads are
+  guarded (fail-closed). Analytics: `scopeAnalyticsRows` drops result rows whose classification dimension
+  exceeds the ceiling (a global aggregate with no tier column is not narrowed - a deployer choice). The
+  runtime Cognito lookup is deploy-verified; the ceiling/filter logic is unit tested. (b) **ownership /
+  membership** (an AI developer's "own assistants", a manager's "own use-case channels") stays a
+  **deployment choice** per the section 2 implementer note - the platform has no generic "who owns which
+  channel or assistant" model, so a deployer defines it.
+- **`view-security` A18** (deployment sleep/wake, infra health) keeps its Cognito authorizer - cost-ops,
+  not security-sensitive data. A17 (membership audit) is IAM-authorized.
+- **Athena analytics** enforces at the coarse analytics-read level. NOT because the sensitive data is
+  Aurora-only - the S3/Athena `conversations` archive is the always-on **system of record** for the raw
+  event log (`view-events`, A3) and holds the user-activity data (`view-user-activity`, A13); Aurora is a
+  lossy projection of it (`athena-absolute-aurora-views`, `AURORA-MODE-GUIDE.md`). The reason is a
+  handler + stack gap: the Athena analytics API is a single `POST /query` (no per-capability sub-path
+  split), and its Lambda does not yet expose the `channel_events` queryType (the Aurora Lambda does), so
+  "Show all events" is Aurora-mode-only at the API layer even though the events live in the Athena
+  archive (`admin-conversations.ts` already queries them for membership history). Wiring the Athena
+  `channel_events` query (the membership-history query without the `EventType` filter) + adding the
+  `/events-log` and `/user-activity` sub-paths to the Athena stack brings both modes to parity; only A5's
+  `moderation_actions` attribution table is genuinely Aurora-specific (though the redact/delete events
+  themselves are in the Athena archive too).
+- The on-flag runtime path is verified on deploy.
 
 ## 11. Audit tie-in
 
@@ -236,6 +284,20 @@ Chime plane, not for any archive read today). This spec extends that emission to
 vends (message content A2 and any other surface on the exchange path), so "who could read a customer
 conversation" becomes auditable next to "who could moderate", with the same short-lived, attributable
 record (`SPEC-ACCESS-AND-CONTROLS-AUDITING.md`).
+
+**Vend scope vs read scope (an asymmetry vs the Chime plane).** The Chime plane's session policy pins
+the *channel* - a Chime action takes the channel ARN as its IAM resource - so a moderation cred literally
+cannot touch another channel. The A2 archive cred cannot be pinned that way: the read is
+`GET /admin/conversations/messages?channelArn=...`, and IAM cannot condition `execute-api:Invoke` on a
+query parameter, so the vended session policy scopes to the messages *resource* for its TTL, not to the
+one channel. The `channelArn` on the `admin_scoped_credential_vend` line therefore records the channel
+the operator *requested*, not a hard binding. Two mechanisms close the gap: for a *scoped* persona the
+handler enforces the classification ceiling per channel (`admin-conversations.ts`
+`channelClassificationAllowed`, fail-closed), so a scoped operator still cannot read above their tier with
+the cred; and the actual per-channel reads are captured independently by the API Gateway access log on the
+messages resource. A full admin - entitled to every channel - is not narrowed by the cred, by design. If a
+deployment needs the cred itself bound to a single conversation, carry the channel as a session tag and
+re-check it in the handler (a follow-up, not wired today).
 
 ## 12. Open decisions
 

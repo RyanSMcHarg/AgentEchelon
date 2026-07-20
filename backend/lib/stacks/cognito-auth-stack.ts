@@ -1,6 +1,12 @@
 import * as cdk from 'aws-cdk-lib';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
+import { adminOrigin, sharedOrigins } from '../config/app-origins';
+import {
+  ADMIN_PERSONAS,
+  ADMIN_PERSONA_GROUP,
+  personaExecuteApiResources,
+} from '../config/admin-capabilities';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -36,6 +42,18 @@ export class CognitoAuthStack extends cdk.Stack {
   public readonly userPoolClient: cognito.UserPoolClient;
   public readonly identityPool: cognito.CfnIdentityPool;
   public readonly authenticatedRole: iam.Role;
+  /**
+   * The `admins` group's sign-on Identity-Pool role (A14). Exposed so cross-stack
+   * admin APIs (analytics, experiments) can attach `execute-api:Invoke` teeth for
+   * their capabilities onto it (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6).
+   */
+  public readonly adminSignOnRoleArn: string;
+  /**
+   * A14 persona sign-on role ARNs by persona key, populated only when
+   * `-c enableAdminPersonas=true`. Passed to the analytics + experiments stacks
+   * so each persona role gets execute-api teeth for exactly its capability set.
+   */
+  public readonly adminPersonaRoleArns: Record<string, string> = {};
   /**
    * UserFeedback (thumbs) table. Exposed so the Aurora analytics stack can
    * read it for the per-variant thumbs join.
@@ -264,6 +282,10 @@ export class CognitoAuthStack extends cdk.Stack {
       sourceArn: this.userPool.userPoolArn,
     });
 
+    // Hosted-UI callback/logout origins: the real https interface origins (chat +
+    // admin), if configured. Localhost is added unconditionally below.
+    const oauthOrigins = sharedOrigins(this).filter((o) => o.startsWith('https://'));
+
     // Create User Pool Client for frontend
     this.userPoolClient = this.userPool.addClient('WebClient', {
       userPoolClientName: 'web-client',
@@ -281,16 +303,54 @@ export class CognitoAuthStack extends cdk.Stack {
           cognito.OAuthScope.OPENID,
           cognito.OAuthScope.PROFILE,
         ],
+        // The app authenticates with the raw Cognito SDK (USER_PASSWORD/SRP), not
+        // the hosted-UI authorization-code redirect, so these are only used if a
+        // deployer adopts the hosted UI. Both interface origins are registered so
+        // that path works from either app: the chat SPA (appUrl) and the standalone
+        // admin console (adminAppUrl). Localhost stays for development.
+        // SPEC-SEPARATE-ADMIN-APP.md.
         callbackUrls: [
-          'http://localhost:5173/callback', // Development
-          // Add production CloudFront URL here
+          'http://localhost:5173/callback',
+          ...oauthOrigins.map((o) => `${o}/callback`),
         ],
         logoutUrls: [
-          'http://localhost:5173/', // Development
-          // Add production CloudFront URL here
+          'http://localhost:5173/',
+          ...oauthOrigins.map((o) => `${o}/`),
         ],
       },
     });
+
+    // Dedicated ADMIN app-client (P3, SPEC-SEPARATE-ADMIN-APP.md). On the SAME
+    // user pool as the chat client — one pool, authority = `admins` group; this
+    // is a second CLIENT, NOT a second pool. It isolates the admin session/token
+    // from the chat session and scopes its hosted-UI callbacks to the admin
+    // origin only. Opt-in with the admin app (`-c enableAdminApp=true`); a
+    // deployer who prefers REUSING the shared client sets `-c adminAppClient=shared`
+    // to skip it — the admin app then falls back to VITE_CLIENT_ID (one code path,
+    // no extra test matrix).
+    const enableAdminApp = this.node.tryGetContext('enableAdminApp') === true
+      || this.node.tryGetContext('enableAdminApp') === 'true';
+    const useDedicatedAdminClient = enableAdminApp
+      && this.node.tryGetContext('adminAppClient') !== 'shared';
+    if (useDedicatedAdminClient) {
+      const adminAppUrl = adminOrigin(this);
+      const adminOAuthOrigins = [adminAppUrl].filter((o) => o.startsWith('https://'));
+      const adminClient = this.userPool.addClient('AdminWebClient', {
+        userPoolClientName: 'admin-client',
+        authFlows: { userPassword: true, userSrp: true, custom: true },
+        oAuth: {
+          flows: { authorizationCodeGrant: true },
+          scopes: [cognito.OAuthScope.EMAIL, cognito.OAuthScope.OPENID, cognito.OAuthScope.PROFILE],
+          callbackUrls: ['http://localhost:5174/callback', ...adminOAuthOrigins.map((o) => `${o}/callback`)],
+          logoutUrls: ['http://localhost:5174/', ...adminOAuthOrigins.map((o) => `${o}/`)],
+        },
+      });
+      new cdk.CfnOutput(this, 'AdminUserPoolClientId', {
+        value: adminClient.userPoolClientId,
+        description: 'Dedicated admin console app-client id — VITE_ADMIN_CLIENT_ID (admin package .env)',
+        exportName: `${this.stackName}-AdminUserPoolClientId`,
+      });
+    }
 
     // Create Cognito Identity Pool for AWS credentials
     this.identityPool = new cognito.CfnIdentityPool(this, 'IdentityPool', {
@@ -363,6 +423,7 @@ export class CognitoAuthStack extends cdk.Stack {
     }
     this.authenticatedRole = classificationRoles[profiles.failClosedValue];
     const adminAuthRole = makeClassificationRole('AdminAuthenticatedRole');
+    this.adminSignOnRoleArn = adminAuthRole.roleArn;
 
     // Attach each group to its classification's role so the ID token carries `cognito:preferred_role`
     // (lowest-precedence group with a roleArn wins); admins -> the admin role.
@@ -397,7 +458,12 @@ export class CognitoAuthStack extends cdk.Stack {
     // the end-user over-grant cluster, and laying the federation substrate.
     // These are separate roles from the Identity-Pool roles above.
     // ============================================================
-    const appUrlForExchange = this.node.tryGetContext('appUrl') || 'http://localhost:5173';
+    // Credential-exchange is dual-plane: the chat SPA vends chat creds and the
+    // admin console vends `${sub}-admin` creds, both against this one endpoint. So
+    // its CORS must trust BOTH origins (credential-exchange.ts echoes the matching
+    // request Origin from the comma list). SPEC-SEPARATE-ADMIN-APP.md.
+    const exchangeOrigins = sharedOrigins(this);
+    const appUrlForExchange = exchangeOrigins.join(',');
     // The bearer pinned to the caller's own AppInstanceUser via the session tag.
     // NOTE: built by concatenation so the `${aws:PrincipalTag/sub}` IAM policy
     // variable is emitted literally (a template literal would try to interpolate it).
@@ -617,7 +683,7 @@ export class CognitoAuthStack extends cdk.Stack {
       restApiName: `${RES_PREFIX}-credential-exchange`,
       description: 'Vends bearer-pinned, classification-capped Chime creds (SPEC-CREDENTIAL-EXCHANGE)',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrlForExchange],
+        allowOrigins: exchangeOrigins,
         allowMethods: ['POST', 'OPTIONS'],
         allowHeaders: ['Authorization', 'Content-Type'],
       },
@@ -675,7 +741,13 @@ export class CognitoAuthStack extends cdk.Stack {
     // User Management API (admin-only)
     // ============================================================
 
-    const appUrl = this.node.tryGetContext('appUrl') || 'http://localhost:5173';
+    // CORS origins for this stack's admin-plane APIs after the console split
+    // (SPEC-SEPARATE-ADMIN-APP.md). User-management + admin-conversations are
+    // admin-only → the admin console origin. Feedback is dual-plane (chat POSTs
+    // thumbs, admin GETs the summary) → both origins (user-feedback.ts echoes the
+    // matching request Origin from the comma list).
+    const adminAppUrl = adminOrigin(this);
+    const feedbackOrigins = sharedOrigins(this);
 
     const userMgmtRole = new iam.Role(this, 'UserManagementRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
@@ -753,7 +825,7 @@ export class CognitoAuthStack extends cdk.Stack {
         SSM_ROOT,
         USER_POOL_ID: this.userPool.userPoolId,
         APP_INSTANCE_ARN: props.appInstanceArn,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: adminAppUrl,
         ADMIN_ARN_PARAM: INSTANCE_SSM.appInstanceAdminArn,
       },
       bundling: { minify: false, forceDockerBundling: false },
@@ -768,7 +840,7 @@ export class CognitoAuthStack extends cdk.Stack {
     const userMgmtApi = new apigateway.RestApi(this, 'UserManagementApi', {
       restApiName: 'Agent Echelon User Management',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        allowOrigins: [adminAppUrl],
         allowMethods: ['GET', 'POST', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },
@@ -862,9 +934,11 @@ export class CognitoAuthStack extends cdk.Stack {
       environment: {
         ...adminAuthEnv(this),
         APP_INSTANCE_ARN: props.appInstanceArn,
+        // A14 Scoped: the pool the caller's classification ceiling is resolved against.
+        USER_POOL_ID: this.userPool.userPoolId,
         ATHENA_WORKGROUP: ATHENA_WORKGROUP_NAME,
         ATHENA_DATABASE: ANALYTICS_DB_NAME,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: adminAppUrl,
         // Aurora mode: the handler resolves this SSM param at cold start to get the
         // data-plane Lambda ARN and reads conversations from Aurora instead of the
         // slow Athena archive (BUG #21). Static param name (no cross-stack dep — a
@@ -887,6 +961,15 @@ export class CognitoAuthStack extends cdk.Stack {
         ],
       }),
     );
+    // A14 Scoped: resolve the caller's classification ceiling from their Cognito
+    // groups (email is a sign-in alias, so the username is a distinct UUID: find
+    // the user by sub, then list their groups). Read-only, this pool only.
+    adminConversationFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['cognito-idp:ListUsers', 'cognito-idp:AdminListGroupsForUser'],
+        resources: [this.userPool.userPoolArn],
+      }),
+    );
     adminConversationFn.addToRolePolicy(
       new iam.PolicyStatement({
         actions: ['lambda:InvokeFunction'],
@@ -896,14 +979,10 @@ export class CognitoAuthStack extends cdk.Stack {
       }),
     );
 
-    const adminConversationAuthOptions = adminApiMethodOptions(this, 'AdminConversationAuthorizer', {
-      userPool: this.userPool,
-    });
-
     const adminConversationApi = new apigateway.RestApi(this, 'AdminConversationApi', {
       restApiName: 'Agent Echelon Admin Conversations',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        allowOrigins: [adminAppUrl],
         allowMethods: ['GET', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },
@@ -915,16 +994,97 @@ export class CognitoAuthStack extends cdk.Stack {
       },
     });
 
+    // A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): optionally IAM-authorize the
+    // archive endpoints. Default OFF (the current Cognito JWT authorizer). When
+    // `-c adminIamEnforcement=true`, these resources require SigV4 - the console
+    // signs view-conversations with its sign-on Identity-Pool creds and the A2
+    // message read with an exchange-vended execute-api cred. Additive + reversible;
+    // the coordinated frontend signing lands with the same flag.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
+      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    // Only create the Cognito authorizer when it is actually used (CDK requires
+    // every authorizer be attached to a method); in IAM mode the methods are
+    // AWS_IAM-authorized instead.
+    const archiveAuthOptions: apigateway.MethodOptions = adminIamEnforcement
+      ? { authorizationType: apigateway.AuthorizationType.IAM }
+      : adminApiMethodOptions(this, 'AdminConversationAuthorizer', { userPool: this.userPool });
+    // Tell the handler the archive methods are IAM-authorized, so it trusts the
+    // gateway-vetted signed principal (which already proved it holds the archive
+    // capability) and derives the actor from it instead of a Cognito JWT. Set
+    // ONLY here, so other (still Cognito-authorized) admin Lambdas never trust an
+    // IAM identity — the `ae-cognito` group gate stays their control (auth.ts).
+    if (adminIamEnforcement) {
+      adminConversationFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+    }
+
     const adminConversationIntegration = new apigateway.LambdaIntegration(adminConversationFn);
     const adminRoot = adminConversationApi.root.addResource('admin');
     const conversationsResource = adminRoot.addResource('conversations');
-    conversationsResource.addMethod('GET', adminConversationIntegration, adminConversationAuthOptions);
+    conversationsResource.addMethod('GET', adminConversationIntegration, archiveAuthOptions);
     conversationsResource
       .addResource('messages')
-      .addMethod('GET', adminConversationIntegration, adminConversationAuthOptions);
+      .addMethod('GET', adminConversationIntegration, archiveAuthOptions);
     conversationsResource
       .addResource('membership-history')
-      .addMethod('GET', adminConversationIntegration, adminConversationAuthOptions);
+      .addMethod('GET', adminConversationIntegration, archiveAuthOptions);
+
+    // A14 sign-on-role plane (view-conversations, A1/A4): the AdminAuthenticatedRole
+    // (the `admins` group's sign-on Identity-Pool role, empty until now) carries
+    // execute-api:Invoke for the conversation-list + membership-history resources,
+    // so a console signing with its sign-on creds is allowed at the gateway while a
+    // finer role that omits the statement is denied. view-messages (A2) is NOT here
+    // - it is exchange-vended below.
+    for (const p of ['/admin/conversations', '/admin/conversations/membership-history']) {
+      adminAuthRole.addToPolicy(new iam.PolicyStatement({
+        actions: ['execute-api:Invoke'],
+        resources: [adminConversationApi.arnForExecuteApi('GET', p)],
+      }));
+    }
+
+    // A14 personas (opt-in, SPEC section 2): four example admin roles, each a
+    // group -> sign-on role holding execute-api teeth for EXACTLY its capability
+    // set — so a persona that omits a capability is denied that resource at the
+    // gateway (real fine-grained denial, not just admins-Full). Off by default
+    // (`-c enableAdminPersonas=true`); the spec ships them as a reviewable
+    // starting point, not enabled infra. Their analytics + profile teeth are
+    // granted cross-stack (those stacks read `adminPersonaRoleArns`). Message
+    // content (view-messages, A2) is exchange-vended (admins-only) and not part
+    // of these standing grants.
+    const enableAdminPersonas = this.node.tryGetContext('enableAdminPersonas') === true
+      || this.node.tryGetContext('enableAdminPersonas') === 'true';
+    if (enableAdminPersonas) {
+      for (const persona of ADMIN_PERSONAS) {
+        const groupName = ADMIN_PERSONA_GROUP[persona];
+        const pascal = groupName.split('-').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join('');
+        const personaRole = makeClassificationRole(`${pascal}PersonaRole`);
+        this.adminPersonaRoleArns[persona] = personaRole.roleArn;
+        new cognito.CfnUserPoolGroup(this, `${pascal}Group`, {
+          userPoolId: this.userPool.userPoolId,
+          groupName,
+          description: `A14 admin persona (${persona}) — execute-api teeth for its capability set`,
+          precedence: 1,
+          roleArn: personaRole.roleArn,
+        }).addDependency(this.userPool.node.defaultChild as cognito.CfnUserPool);
+        for (const r of personaExecuteApiResources(persona, 'admin-conversations')) {
+          personaRole.addToPolicy(new iam.PolicyStatement({
+            actions: ['execute-api:Invoke'],
+            resources: [adminConversationApi.arnForExecuteApi(r.method, r.path)],
+          }));
+        }
+      }
+    }
+
+    // A14 exchange-vend plane (view-messages / A2, customer message content): the
+    // admin-plane exchange role's CEILING includes execute-api:Invoke on the
+    // messages resource, so the exchange can assume it with a session policy scoped
+    // to exactly that resource (short-lived, audited). The resource ARN is handed to
+    // the exchange Lambda so it can build that session policy.
+    const messagesExecuteApiArn = adminConversationApi.arnForExecuteApi('GET', '/admin/conversations/messages');
+    exchangeRoleAdminPlane.addToPolicy(new iam.PolicyStatement({
+      actions: ['execute-api:Invoke'],
+      resources: [messagesExecuteApiArn],
+    }));
+    credentialExchangeFn.addEnvironment('EXCHANGE_EXECUTE_API_MESSAGES_ARN', messagesExecuteApiArn);
     // Live-Chime actions (members list, add-self/add-member, redact, delete) are NOT
     // here: they run client-side as the admin's own `${sub}-admin` identity
     // (docs/SPEC-ADMIN-IDENTITY.md). This API is read-only over the archive.
@@ -984,7 +1144,7 @@ export class CognitoAuthStack extends cdk.Stack {
       role: feedbackRole,
       environment: {
         FEEDBACK_TABLE: feedbackTable.tableName,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: feedbackOrigins.join(','),
         // M4: needed for the channel-membership check before recording feedback.
         APP_INSTANCE_ARN: props.appInstanceArn,
         // The GET summary is admin-gated via callerIsAdmin; give the handler the
@@ -1001,7 +1161,7 @@ export class CognitoAuthStack extends cdk.Stack {
     const feedbackApi = new apigateway.RestApi(this, 'UserFeedbackApi', {
       restApiName: 'Agent Echelon User Feedback',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        allowOrigins: feedbackOrigins,
         allowMethods: ['GET', 'POST', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },

@@ -32,7 +32,13 @@ import {
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
-const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || '*';
+// Dual-plane CORS: chat and admin origins both call this endpoint, so
+// ALLOWED_ORIGIN is a comma list and we echo the matching request Origin
+// (SPEC-SEPARATE-ADMIN-APP.md). '*' short-circuits to allow-all (dev/federated).
+const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '*')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
 const SESSION_DURATION_SECONDS = Number(process.env.EXCHANGE_SESSION_SECONDS || '3600');
 // Moderation creds are shorter-lived: enough to perform the action, then they expire
 // (STS minimum is 900s). Bounds the window in which an elevated cred exists at all.
@@ -92,6 +98,19 @@ const CAPABILITY_ACTIONS: Record<string, string[]> = {
 // is always confined to one channel (enforced in the handler).
 const MODERATION_CAPS = new Set(['redact', 'delete', 'manage-membership', 'manage-channel']);
 
+// A14 archive plane (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6.5). The `execute-api`
+// analogue of CAPABILITY_ACTIONS: a capability maps to the API Gateway resource ARN it
+// authorizes, and the exchange vends a SESSION POLICY of `execute-api:Invoke` on exactly
+// that resource (intersected with the admin-plane role ceiling, which carries the same
+// ARN). Customer message content (A2) is the sole exchange-vended archive capability -
+// short-lived + audited - so a standing role never holds a customer-PII read (every other
+// archive read rides the sign-on group role). New resources land here as their per-
+// capability API split is wired (view-events, etc.).
+const EXECUTE_API_CAPABILITY_RESOURCES: Record<string, string> = {
+  'view-messages': process.env.EXCHANGE_EXECUTE_API_MESSAGES_ARN || '',
+};
+const EXECUTE_API_CAPS = new Set(Object.keys(EXECUTE_API_CAPABILITY_RESOURCES));
+
 const sts = new STSClient({ region: AWS_REGION });
 const chimeIdentity = new ChimeSDKIdentityClient({ region: AWS_REGION });
 
@@ -130,9 +149,15 @@ interface ExchangeResult {
   scopedTo?: string | null;
 }
 
-function cors() {
+function corsOrigin(event: any): string {
+  if (ALLOWED_ORIGINS.includes('*')) return '*';
+  const origin = event?.headers?.origin || event?.headers?.Origin;
+  return origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
+}
+
+function cors(event: any) {
   return {
-    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
+    'Access-Control-Allow-Origin': corsOrigin(event),
     'Access-Control-Allow-Headers': 'Authorization,Content-Type',
     'Access-Control-Allow-Methods': 'POST,OPTIONS',
     'Content-Type': 'application/json',
@@ -195,14 +220,14 @@ async function ensureAdminIdentity(sub: string, displayName: string): Promise<st
 }
 export const handler = async (event: any): Promise<{ statusCode: number; headers: Record<string, string>; body: string }> => {
   if (event?.httpMethod === 'OPTIONS') {
-    return { statusCode: 204, headers: cors(), body: '' };
+    return { statusCode: 204, headers: cors(event), body: '' };
   }
 
   // Identity comes ONLY from the validated Cognito-authorizer claims — never the body.
   const claims = event?.requestContext?.authorizer?.claims || {};
   const sub: string = claims.sub || '';
   if (!sub) {
-    return { statusCode: 401, headers: cors(), body: JSON.stringify({ error: 'Unauthenticated' }) };
+    return { statusCode: 401, headers: cors(event), body: JSON.stringify({ error: 'Unauthenticated' }) };
   }
 
   // Per-request scope: the client names the capabilities it needs (default: the
@@ -224,18 +249,31 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
   if (scopeChannelArn && !scopeChannelArn.startsWith(`${APP_INSTANCE_ARN}/channel/`)) {
     return {
       statusCode: 400,
-      headers: cors(),
+      headers: cors(event),
       body: JSON.stringify({ error: 'channelArn must be a channel of this app instance' }),
     };
   }
-  const unknownCaps = requestedCaps.filter((c) => !(c in CAPABILITY_ACTIONS));
+  const unknownCaps = requestedCaps.filter((c) => !(c in CAPABILITY_ACTIONS) && !EXECUTE_API_CAPS.has(c));
   if (unknownCaps.length) {
     return {
       statusCode: 400,
-      headers: cors(),
+      headers: cors(event),
       body: JSON.stringify({ error: `unknown capabilities: ${unknownCaps.join(', ')}` }),
     };
   }
+  // A14: an archive vend (execute-api plane) and a Chime vend need DIFFERENT session
+  // policies (execute-api:Invoke on an API resource vs chime:* on a channel), so a single
+  // request is one plane or the other, never a mix.
+  const archiveCaps = requestedCaps.filter((c) => EXECUTE_API_CAPS.has(c));
+  const chimeCaps = requestedCaps.filter((c) => c in CAPABILITY_ACTIONS);
+  if (archiveCaps.length && chimeCaps.length) {
+    return {
+      statusCode: 400,
+      headers: cors(event),
+      body: JSON.stringify({ error: 'cannot mix archive (execute-api) and Chime capabilities in one request' }),
+    };
+  }
+  const archiveVend = archiveCaps.length > 0;
   const requestsModeration = requestedCaps.some((c) => MODERATION_CAPS.has(c));
   const groups = parseGroups(claims['cognito:groups']);
   const roleKey = resolveRoleKey(groups);
@@ -251,26 +289,96 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
   const adminPlane = requestedIdentity === 'admin';
   if (adminPlane) {
     if (roleKey !== 'admin') {
-      return { statusCode: 403, headers: cors(), body: JSON.stringify({ error: 'admin plane requires the admins group' }) };
+      return { statusCode: 403, headers: cors(event), body: JSON.stringify({ error: 'admin plane requires the admins group' }) };
     }
     if (!scopeChannelArn) {
-      return { statusCode: 400, headers: cors(), body: JSON.stringify({ error: 'admin plane requires a channelArn scope' }) };
+      return { statusCode: 400, headers: cors(event), body: JSON.stringify({ error: 'admin plane requires a channelArn scope' }) };
     }
   } else if (requestsModeration) {
     // Moderation is never on the chat plane: the chat identity carries no moderation
     // authority. It must be requested on the admin plane, which is always channel-scoped.
-    return { statusCode: 400, headers: cors(), body: JSON.stringify({ error: 'moderation capabilities require plane:admin with a channelArn scope' }) };
+    return { statusCode: 400, headers: cors(event), body: JSON.stringify({ error: 'moderation capabilities require plane:admin with a channelArn scope' }) };
+  } else if (archiveVend) {
+    // A14: reading customer message content (A2) is an admin-plane action — the standing
+    // `${sub}-admin` authority, short-lived + audited — never the chat identity.
+    return { statusCode: 400, headers: cors(event), body: JSON.stringify({ error: 'archive capabilities require plane:admin with a channelArn scope' }) };
   }
 
   const roleArn = adminPlane ? EXCHANGE_ROLE_ADMIN_PLANE : EXCHANGE_ROLE_ARNS[roleKey];
   if (!roleArn) {
     console.error('[CredentialExchange] No exchange role ARN configured for', adminPlane ? 'admin-plane' : roleKey);
-    return { statusCode: 500, headers: cors(), body: JSON.stringify({ error: 'Exchange misconfigured' }) };
+    return { statusCode: 500, headers: cors(event), body: JSON.stringify({ error: 'Exchange misconfigured' }) };
   }
   // Reported access class: admins report 'admin', otherwise the caller's clearance.
   const accessClass = roleKey === 'admin' ? 'admin' : roleKey;
 
   try {
+    // ── A14 archive vend (execute-api plane) ──────────────────────────────────
+    // Customer message content (A2). Vend a SESSION POLICY of `execute-api:Invoke`
+    // on exactly the requested archive resource(s), assumed on the admin-plane role
+    // (its ceiling carries the same ARN), short-lived + audited. No Chime identity is
+    // provisioned - this cred signs an API Gateway GET, not a Chime call. The console
+    // SigV4-signs the archive read with it; the gateway's IAM authorizer allows it.
+    if (archiveVend) {
+      const resources = archiveCaps.map((c) => EXECUTE_API_CAPABILITY_RESOURCES[c]);
+      if (resources.some((r) => !r)) {
+        console.error('[CredentialExchange] No execute-api resource ARN configured for', archiveCaps);
+        return { statusCode: 500, headers: cors(event), body: JSON.stringify({ error: 'Archive vend misconfigured' }) };
+      }
+      // NB: the session policy pins the messages RESOURCE, not the channel. The read is
+      // `GET /admin/conversations/messages?channelArn=...` and IAM cannot condition
+      // `execute-api:Invoke` on a query parameter, so - unlike the Chime plane, whose
+      // session policy pins the channel ARN as the action's resource - this cred is not
+      // bound to the single vended channel for its TTL. The `channelArn` audited below is
+      // the channel the operator REQUESTED, not a hard binding. Per-channel scope is still
+      // enforced downstream: admin-conversations.ts `channelClassificationAllowed` denies a
+      // scoped caller a channel above their tier, and the API Gateway access log captures
+      // the actual per-channel reads. A full admin (entitled to every channel) is not
+      // narrowed by design. See SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 11.
+      const sessionPolicy = JSON.stringify({
+        Version: '2012-10-17',
+        Statement: [
+          { Sid: 'ArchiveApiInvoke', Effect: 'Allow', Action: ['execute-api:Invoke'], Resource: resources },
+        ],
+      });
+      const assumed = await sts.send(new AssumeRoleCommand({
+        RoleArn: roleArn, // EXCHANGE_ROLE_ADMIN_PLANE (adminPlane is required above)
+        RoleSessionName: `archive-${sub}`.slice(0, 64),
+        DurationSeconds: MODERATION_SESSION_SECONDS,
+        Tags: [{ Key: 'sub', Value: sub }],
+        Policy: sessionPolicy,
+      }));
+      const ac = assumed.Credentials;
+      if (!ac?.AccessKeyId || !ac.SecretAccessKey || !ac.SessionToken) {
+        throw new Error('AssumeRole returned no credentials');
+      }
+      const adminArn = `${APP_INSTANCE_ARN}/user/${sub}-admin`;
+      // Same audit trail as a Chime admin vend: who read which customer's conversation, when.
+      console.log(JSON.stringify({
+        _auditEvent: 'admin_scoped_credential_vend',
+        timestamp: new Date().toISOString(),
+        adminSub: sub,
+        adminIdentity: adminArn,
+        channelArn: scopeChannelArn,
+        capabilities: archiveCaps,
+        plane: 'archive',
+        ttlSeconds: MODERATION_SESSION_SECONDS,
+      }));
+      const archiveResult: ExchangeResult = {
+        credentials: {
+          AccessKeyId: ac.AccessKeyId,
+          SecretAccessKey: ac.SecretAccessKey,
+          SessionToken: ac.SessionToken,
+          Expiration: ac.Expiration ? new Date(ac.Expiration).toISOString() : undefined,
+        },
+        userArn: adminArn,
+        tier: 'admin',
+        identity: 'admin',
+        scopedTo: scopeChannelArn || null,
+      };
+      return { statusCode: 200, headers: cors(event), body: JSON.stringify(archiveResult) };
+    }
+
     // AppInstanceUserId == sub (AE convention). Display name, best-first: a real name claim; else
     // the email LOCAL part (e.g. "ryan" — name-like, far better than a GUID in the @mention menu);
     // else cognito:username if it isn't a UUID; else the sub.
@@ -364,9 +472,9 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
       identity: requestedIdentity,
       scopedTo: scopeChannelArn || null,
     };
-    return { statusCode: 200, headers: cors(), body: JSON.stringify(result) };
+    return { statusCode: 200, headers: cors(event), body: JSON.stringify(result) };
   } catch (err) {
     console.error('[CredentialExchange] failed:', err);
-    return { statusCode: 500, headers: cors(), body: JSON.stringify({ error: 'Credential exchange failed' }) };
+    return { statusCode: 500, headers: cors(event), body: JSON.stringify({ error: 'Credential exchange failed' }) };
   }
 };

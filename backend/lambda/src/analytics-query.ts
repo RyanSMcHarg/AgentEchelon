@@ -26,12 +26,16 @@ import {
   QueryExecutionState,
 } from '@aws-sdk/client-athena';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { parseJsonBody, requireAdmin } from './lib/auth';
+import { parseJsonBody, requireAdmin, isAdminIamEnforcedCall } from './lib/auth';
+import { queryTypeAllowedOnPath } from './lib/admin-capability-map';
+import { ceilingForRequest, scopeAnalyticsRows } from './lib/caller-scope';
 
 const athena = new AthenaClient({});
 const WORKGROUP = process.env.ATHENA_WORKGROUP || 'agent-echelon-analytics';
 const DATABASE = process.env.ATHENA_DATABASE || 'agent_echelon';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
+// A14 Scoped: the pool the caller's classification ceiling is resolved against.
+const USER_POOL_ID = process.env.USER_POOL_ID || '';
 
 // ---------------------------------------------------------------------------
 // Query-type categorisation
@@ -485,6 +489,22 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return respond(400, { error: 'queryType (string) required' });
     }
 
+    // A14: under per-resource IAM enforcement the gateway authorized this request
+    // as the capability of THIS resource path; reject a queryType belonging to a
+    // different capability (e.g. an A13 user-activity query on the low-sensitivity
+    // analytics resource). No-op in Cognito mode (single root resource).
+    // KNOWN LIMITATION (Athena mode): this stack exposes a SINGLE `POST /query` with no
+    // per-capability sub-paths (unlike the Aurora analytics stack), so `capabilityForPath`
+    // always resolves to `view-analytics`. Under enforcement, any queryType mapped to a
+    // finer capability (events-log / user-activity / moderation-audit) is therefore DENIED
+    // here - coarser than the section-3b matrix, fail-CLOSED. Athena reaches parity by
+    // splitting these sub-paths on the stack + exposing the queryTypes; the data itself is
+    // in the Athena archive (the system of record). See SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md
+    // section 10.
+    if (isAdminIamEnforcedCall(event) && !queryTypeAllowedOnPath(queryType, event.path || '')) {
+      return respond(403, { error: 'queryType not permitted on this resource' });
+    }
+
     const start = validateDate(dateRange?.start);
     const end = validateDate(dateRange?.end);
     if (!start || !end) {
@@ -525,6 +545,13 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
     }
 
     const result = await runQuery(sql);
+    // A14 Scoped: narrow rows to the caller's classification ceiling (rows with a
+    // tier dimension; global aggregates pass through). Full on a Cognito-JWT call;
+    // an enforced call fails closed to the floor if the caller is unidentifiable.
+    if (isAdminIamEnforcedCall(event)) {
+      const ceiling = await ceilingForRequest(event, USER_POOL_ID);
+      result.data = scopeAnalyticsRows(result.data, ceiling);
+    }
     return respond(200, result);
 
   } catch (error) {

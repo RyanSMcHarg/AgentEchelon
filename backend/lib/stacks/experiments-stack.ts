@@ -26,6 +26,8 @@ import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
+import { adminOrigin, sharedOrigins } from '../config/app-origins';
+import { personaExecuteApiResources, AdminPersona } from '../config/admin-capabilities';
 import { SHARED_SSM, INSTANCE_SSM, SSM_ROOT } from './agent-classification-common';
 
 export interface ExperimentsStackProps extends cdk.StackProps {
@@ -33,6 +35,10 @@ export interface ExperimentsStackProps extends cdk.StackProps {
   userPoolId: string;
   /** Frontend URL for CORS (defaults to the `appUrl` context / localhost). */
   appUrl?: string;
+  /** A14: the `admins` sign-on role ARN (execute-api teeth on the profile routes under adminIamEnforcement). */
+  adminSignOnRoleArn?: string;
+  /** A14 personas (opt-in): persona key -> sign-on role ARN. Personas holding manage-profiles get its teeth. */
+  adminPersonaRoleArns?: Record<string, string>;
 }
 
 export class ExperimentsStack extends cdk.Stack {
@@ -46,7 +52,13 @@ export class ExperimentsStack extends cdk.Stack {
 
     const isProduction = this.node.tryGetContext('isProduction') === 'true';
     const dataRemovalPolicy = isProduction ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY;
-    const appUrl = this.node.tryGetContext('appUrl') || props.appUrl || 'http://localhost:5173';
+    // Experiments is dual-plane: the admin console does CRUD and the chat client
+    // reads a channel's assignment (ChannelMembersPanel), so its API + Lambda
+    // trust BOTH origins (admin-experiments.ts echoes the matching request Origin
+    // from the comma list). manage-profiles (/admin/profiles) is admin-only.
+    // SPEC-SEPARATE-ADMIN-APP.md.
+    const experimentsOrigins = sharedOrigins(this);
+    const adminAppUrl = adminOrigin(this);
     // AgentEchelonBattle owns + publishes this roster; admin-experiments only READS it
     // (by name) to denormalize altBotSlotId → altBotSlotArn for battle experiments.
     const altBotRosterParamName = INSTANCE_SSM.altBotSlotsRoster;
@@ -109,7 +121,7 @@ export class ExperimentsStack extends cdk.Stack {
         EXPERIMENTS_TABLE: experimentsTable.tableName,
         APP_INSTANCE_ARN: props.appInstanceArn,
         ALT_BOT_SLOTS_ROSTER_PARAM: altBotRosterParamName,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: experimentsOrigins.join(','),
         // Battle eligibility is per-profile config now (AssistantProfile.battleEligible), read by
         // experiment-manager.ts via the registry — no longer an ALLOWED_BATTLE_TIERS env var.
       },
@@ -120,7 +132,7 @@ export class ExperimentsStack extends cdk.Stack {
       restApiName: 'AI Agent Experiments API',
       description: 'Admin A/B experiments CRUD',
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        allowOrigins: experimentsOrigins,
         allowMethods: ['GET', 'POST', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },
@@ -182,19 +194,53 @@ export class ExperimentsStack extends cdk.Stack {
         ...adminAuthEnv(this),
         SSM_ROOT,
         AWS_ACCOUNT_ID: this.account,
-        ALLOWED_ORIGIN: appUrl,
+        ALLOWED_ORIGIN: adminAppUrl,
         // MANAGE_PROFILES_GROUP_NAMES (optional) narrows who holds the capability; defaults to admins.
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
 
+    // A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): manage-profiles is an
+    // IAM-enforceable capability. Under adminIamEnforcement the profile routes are
+    // AWS_IAM-authorized (the console SigV4-signs) and the `admins` sign-on role
+    // gets execute-api teeth on them; a finer role that omits manage-profiles is
+    // denied at the gateway. Only the /admin/profiles routes flip — /admin/experiments
+    // stays on the Cognito authorizer. Default = Cognito, unchanged.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
+      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    const manageProfilesAuthOptions: apigateway.MethodOptions = adminIamEnforcement
+      ? { authorizationType: apigateway.AuthorizationType.IAM }
+      : experimentsAuthOptions;
+    if (adminIamEnforcement) {
+      manageProfilesFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+    }
+
     const manageProfilesIntegration = new apigateway.LambdaIntegration(manageProfilesFn);
     const profilesResource = adminRoot.addResource('profiles');
-    profilesResource.addMethod('GET', manageProfilesIntegration, experimentsAuthOptions); // list
+    profilesResource.addMethod('GET', manageProfilesIntegration, manageProfilesAuthOptions); // list
     for (const action of ['version', 'draft', 'validate', 'activate', 'rollback', 'export', 'import']) {
-      profilesResource.addResource(action).addMethod('POST', manageProfilesIntegration, experimentsAuthOptions);
+      profilesResource.addResource(action).addMethod('POST', manageProfilesIntegration, manageProfilesAuthOptions);
     }
     this.manageProfilesApiUrl = `${api.url}admin/profiles`;
+
+    const profileTeeth = [
+      api.arnForExecuteApi('GET', '/admin/profiles'),
+      api.arnForExecuteApi('POST', '/admin/profiles/*'),
+    ];
+    if (adminIamEnforcement && props.adminSignOnRoleArn) {
+      const adminRole = iam.Role.fromRoleArn(this, 'ImportedAdminSignOnRole', props.adminSignOnRoleArn, { mutable: true });
+      adminRole.addToPrincipalPolicy(new iam.PolicyStatement({ actions: ['execute-api:Invoke'], resources: profileTeeth }));
+    }
+    // A14 persona teeth: a persona that holds manage-profiles (platform-admin,
+    // platform-dev, ai-dev) gets execute-api on the profile routes; a manager role
+    // (no manage-profiles) is denied at the gateway.
+    if (adminIamEnforcement && props.adminPersonaRoleArns) {
+      for (const [persona, roleArn] of Object.entries(props.adminPersonaRoleArns)) {
+        if (!personaExecuteApiResources(persona as AdminPersona, 'experiments').length) continue;
+        iam.Role.fromRoleArn(this, `ImportedPersonaRole-${persona}`, roleArn, { mutable: true })
+          .addToPrincipalPolicy(new iam.PolicyStatement({ actions: ['execute-api:Invoke'], resources: profileTeeth }));
+      }
+    }
     new cdk.CfnOutput(this, 'ManageProfilesApiUrl', {
       value: this.manageProfilesApiUrl,
       description: 'Profile versioning admin API (VITE_MANAGE_PROFILES_API_URL)',

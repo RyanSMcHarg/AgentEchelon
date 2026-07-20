@@ -1,0 +1,26 @@
+{
+  "name": "@ae/admin",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@ae/shared": "*",
+    "@aws-crypto/sha256-js": "^2.0.2",
+    "@aws-sdk/client-chime-sdk-messaging": "^3.972.0",
+    "@aws-sdk/client-cognito-identity": "^3.972.0",
+    "@aws-sdk/client-cognito-identity-provider": "^3.972.0",
+    "@aws-sdk/credential-provider-cognito-identity": "^3.972.0",
+    "@smithy/signature-v4": "^5.0.0",
+    "i18next": "^26.0.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-i18next": "^17.0.2"
+  }
+}

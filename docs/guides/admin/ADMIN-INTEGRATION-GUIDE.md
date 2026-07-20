@@ -224,6 +224,17 @@ reads `adminAuthMode` and attaches the right authorizer; `adminAuthEnv()` stamps
 honors the same mode. `ae-cognito` reproduces the standalone authorizers exactly,
 so it is the default.
 
+> **Fine-grained IAM (`adminIamEnforcement`).** Where `service` mode puts the
+> *whole* admin API behind one IAM authorizer, `-c adminIamEnforcement=true`
+> generalizes that to **per resource**: each privileged action is its own
+> `AWS_IAM`-authorized API resource, and a sign-on group role (or the opt-in
+> example personas, `-c enableAdminPersonas=true`) carries `execute-api:Invoke`
+> for exactly the capabilities it holds, so a role can be denied a *specific*
+> action at the gateway. The admin console SigV4-signs those calls with its
+> sign-on creds (customer message content is exchange-vended, short-lived +
+> audited). Off by default; see `SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md`. Set
+> `VITE_ADMIN_IAM_ENFORCEMENT=true` on the admin app to match.
+
 > **Coverage.** `adminAuthMode` is wired into the **Analytics**
 > (Athena + Aurora), **User Management**, **Admin Conversations**, and
 > **Experiments** APIs, and the admin handlers share one `callerIsAdmin` gate

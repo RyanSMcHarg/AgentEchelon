@@ -43,12 +43,15 @@ import * as sns from 'aws-cdk-lib/aws-sns';
 import * as snsSubs from 'aws-cdk-lib/aws-sns-subscriptions';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
+import { adminOrigin, sharedOrigins } from '../config/app-origins';
 import * as path from 'path';
 import { Construct } from 'constructs';
 import { IAnalyticsStackOutputs } from '../interfaces/analytics-stack-interface.js';
 import { ANALYTICS_PREFIX, INSTANCE_NAME, SHARED_SSM, STACK_PREFIX, INSTANCE_SSM } from './agent-classification-common';
 import { MembershipAuditConstruct } from '../constructs/membership-audit';
 import { ConversationArchive } from '../constructs/conversation-archive';
+import { ANALYTICS_CAPABILITY_SUBPATHS } from '../../lambda/src/lib/admin-capability-map';
+import { personaExecuteApiResources, AdminPersona } from '../config/admin-capabilities';
 
 /**
  * esbuild commandHooks that copy the RDS CA bundle (`analytics-aurora/certs/*.pem`)
@@ -81,6 +84,17 @@ export interface AnalyticsStackAuroraProps extends cdk.StackProps {
   userPoolId: string;
   /** Cognito User Pool ARN (Layer 6 membership audit: AdminListGroupsForUser + AdminGetUser). */
   userPoolArn?: string;
+  /**
+   * A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): the `admins` group's sign-on role
+   * ARN. When `-c adminIamEnforcement=true`, the analytics read resources are
+   * AWS_IAM-authorized and this role is granted `execute-api:Invoke` on them, so
+   * a signing admin is allowed while a finer persona role that omits a capability
+   * is denied at the gateway.
+   */
+  adminSignOnRoleArn?: string;
+  /** A14 personas (opt-in): persona key -> sign-on role ARN. Each gets execute-api
+   *  teeth for exactly the analytics capabilities it holds (SPEC section 4). */
+  adminPersonaRoleArns?: Record<string, string>;
   /** Layer 6 membership audit (SPEC-CONVERSATION-SECURITY). Opt-in; report-only unless enforce. */
   enableMembershipAudit?: boolean;
   membershipAuditEnforce?: boolean;
@@ -1393,7 +1407,8 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
         environment: {
           ...adminAuthEnv(this),
           ...dbEnvironment,
-          ALLOWED_ORIGINS: this.node.tryGetContext('appUrl') || 'http://localhost:5173',
+          // Admin-only analytics query API → the admin console origin.
+          ALLOWED_ORIGINS: adminOrigin(this),
           // Thumbs per-variant join. Empty => join skipped.
           ...(props.feedbackTableName ? { FEEDBACK_TABLE: props.feedbackTableName } : {}),
           // Battle-wins join. The
@@ -1464,12 +1479,37 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     // a defense-in-depth admin-group check too — the gateway authorizer is the
     // outer ring.
     const appUrl = this.node.tryGetContext('appUrl') || 'http://localhost:5173';
+    // The analytics + membership-audit APIs are admin-only → the admin console
+    // origin. (The client-events ingestion + deployment-state APIs below stay
+    // chat-facing on appUrl.) SPEC-SEPARATE-ADMIN-APP.md.
+    const adminAppUrl = adminOrigin(this);
     // Admin-plane auth mode (ae-cognito default / federated / service) — see
     // docs/ADMIN-INTEGRATION-GUIDE.md. In ae-cognito mode this uses a Cognito
     // authorizer on AE's own user pool.
-    const authMethodOptions = adminApiMethodOptions(this, 'AuroraAnalyticsAuthorizer', {
-      userPoolId: props.userPoolId,
-    });
+    // A14: when adminIamEnforcement is on, the analytics READ plane is
+    // AWS_IAM-authorized (the console SigV4-signs with its sign-on creds and the
+    // per-resource split gates each capability). Default = the Cognito authorizer,
+    // unchanged. Flipping the shared options flips every analytics-query method at
+    // once and (like the admin-conversations API) avoids creating an unused Cognito
+    // authorizer in IAM mode.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
+      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    const authMethodOptions: apigateway.MethodOptions = adminIamEnforcement
+      ? { authorizationType: apigateway.AuthorizationType.IAM }
+      : adminApiMethodOptions(this, 'AuroraAnalyticsAuthorizer', { userPoolId: props.userPoolId });
+    if (adminIamEnforcement) {
+      // Trust the gateway-vetted signed principal + enforce queryType->capability
+      // per resource (analytics-query.ts). Set only here — other Lambdas stay Cognito.
+      analyticsLambda.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+      // A14 Scoped: resolve the caller's classification ceiling from Cognito groups.
+      analyticsLambda.addEnvironment('USER_POOL_ID', props.userPoolId);
+      if (props.userPoolArn) {
+        analyticsLambda.addToRolePolicy(new iam.PolicyStatement({
+          actions: ['cognito-idp:ListUsers', 'cognito-idp:AdminListGroupsForUser'],
+          resources: [props.userPoolArn],
+        }));
+      }
+    }
 
     // API Gateway
     const analyticsApi = new apigateway.RestApi(this, 'AnalyticsApi', {
@@ -1483,17 +1523,23 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
         ...apiAccessLogConfig(this, 'AuroraAnalyticsApiAccessLogs'),
       },
       defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
+        // This RestApi co-hosts admin routes (/analytics/*, /audit/*) AND the
+        // chat-facing /events ingestion route, so the shared OPTIONS preflight
+        // must allow BOTH origins. Each Lambda still echoes only its own origin
+        // in the actual response (analytics/audit -> adminAppUrl; events -> appUrl).
+        allowOrigins: sharedOrigins(this),
         allowMethods: ['GET', 'POST', 'OPTIONS'],
         allowHeaders: ['Content-Type', 'Authorization'],
       },
     });
 
-    // Gateway CORS for error responses (incl. 401 from the new authorizer)
+    // Gateway CORS for error responses (incl. 401 from the analytics authorizer).
+    // Static single-origin: these primarily surface analytics-query/authorizer
+    // errors to the admin console, so they carry the admin origin.
     analyticsApi.addGatewayResponse('GatewayResponse4XX', {
       type: apigateway.ResponseType.DEFAULT_4XX,
       responseHeaders: {
-        'Access-Control-Allow-Origin': `'${appUrl}'`,
+        'Access-Control-Allow-Origin': `'${adminAppUrl}'`,
         'Access-Control-Allow-Headers': "'Content-Type,Authorization'",
         'Access-Control-Allow-Methods': "'GET,POST,OPTIONS'",
       },
@@ -1501,7 +1547,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     analyticsApi.addGatewayResponse('GatewayResponse5XX', {
       type: apigateway.ResponseType.DEFAULT_5XX,
       responseHeaders: {
-        'Access-Control-Allow-Origin': `'${appUrl}'`,
+        'Access-Control-Allow-Origin': `'${adminAppUrl}'`,
         'Access-Control-Allow-Headers': "'Content-Type,Authorization'",
         'Access-Control-Allow-Methods': "'GET,POST,OPTIONS'",
       },
@@ -1537,6 +1583,42 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     const modelEffectivenessResource = analyticsResource.addResource('model-effectiveness');
     modelEffectivenessResource.addMethod('GET', analyticsIntegration, authMethodOptions);
 
+    // A14 per-capability resources: the SENSITIVE queryTypes get their own POST
+    // resource so a persona role can be denied one at the gateway without losing
+    // the low-sensitivity analytics bundle (which stays on the root POST). The
+    // handler enforces that a queryType only runs on its capability's path
+    // (admin-capability-map.ts). Created in both modes (harmless + unused under
+    // Cognito, where the frontend posts everything to the root); IAM-authorized +
+    // frontend-routed under the flag.
+    for (const { path: subPath } of ANALYTICS_CAPABILITY_SUBPATHS) {
+      analyticsApi.root.addResource(subPath).addMethod('POST', analyticsIntegration, authMethodOptions);
+    }
+
+    // A14 sign-on-role teeth: the `admins` group's role gets execute-api:Invoke on
+    // the whole analytics API (admins = Full on every capability, SPEC section 4).
+    // Finer persona roles get per-capability grants (see the persona wiring); a
+    // role that omits a capability's resource is denied at the gateway.
+    if (adminIamEnforcement && props.adminSignOnRoleArn) {
+      const adminRole = iam.Role.fromRoleArn(this, 'ImportedAdminSignOnRole', props.adminSignOnRoleArn, { mutable: true });
+      adminRole.addToPrincipalPolicy(new iam.PolicyStatement({
+        actions: ['execute-api:Invoke'],
+        resources: [analyticsApi.arnForExecuteApi()],
+      }));
+    }
+    // A14 persona teeth: each persona role gets execute-api on ONLY the analytics
+    // resources its capabilities cover (SPEC section 4) — so e.g. an ai-dev role
+    // (view-analytics + view-events, NOT view-user-activity) is denied /user-activity
+    // at the gateway while the admins role holds everything.
+    if (adminIamEnforcement && props.adminPersonaRoleArns) {
+      for (const [persona, roleArn] of Object.entries(props.adminPersonaRoleArns)) {
+        const resources = personaExecuteApiResources(persona as AdminPersona, 'analytics')
+          .map((r) => analyticsApi.arnForExecuteApi(r.method, r.path));
+        if (!resources.length) continue;
+        iam.Role.fromRoleArn(this, `ImportedPersonaRole-${persona}`, roleArn, { mutable: true })
+          .addToPrincipalPolicy(new iam.PolicyStatement({ actions: ['execute-api:Invoke'], resources }));
+      }
+    }
+
     // Membership-audit review surface (Layer 6): admin API for the flagged-memberships panel and
     // the runtime enforce toggle. NON-VPC (DynamoDB + Chime + SSM only), like the sleep API. Only
     // wired when the audit is enabled, and hangs off the same admin-authed analytics API.
@@ -1551,7 +1633,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           ...adminAuthEnv(this),
           AUDIT_TABLE: membershipAudit.auditTable.tableName,
           ADMIN_ARN_PARAM: INSTANCE_SSM.appInstanceAdminArn,
-          ALLOWED_ORIGINS: appUrl,
+          ALLOWED_ORIGINS: adminAppUrl,
         },
         bundling: { externalModules: ['@aws-sdk/*'], minify: true, sourceMap: true },
       });
@@ -1572,7 +1654,14 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
       }));
 
       const auditIntegration = new apigateway.LambdaIntegration(auditAdminFn, { allowTestInvoke: false });
-      const auditOpts = adminApiMethodOptions(this, 'MembershipAuditAdminAuthorizer', { userPoolId: props.userPoolId });
+      // A14 view-security (A17): flip the membership-audit surface to AWS_IAM under
+      // the flag; the admins role (whole-API teeth) + view-security personas hold it.
+      const auditOpts: apigateway.MethodOptions = adminIamEnforcement
+        ? { authorizationType: apigateway.AuthorizationType.IAM }
+        : adminApiMethodOptions(this, 'MembershipAuditAdminAuthorizer', { userPoolId: props.userPoolId });
+      if (adminIamEnforcement) {
+        auditAdminFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+      }
       const auditRes = analyticsApi.root.addResource('membership-audit');
       auditRes.addResource('findings').addMethod('GET', auditIntegration, auditOpts);
       const enforceRes = auditRes.addResource('enforce');

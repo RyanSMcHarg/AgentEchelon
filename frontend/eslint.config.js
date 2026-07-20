@@ -15,7 +15,7 @@ import globals from 'globals';
 
 export default tseslint.config(
   {
-    ignores: ['dist', 'build', 'coverage', 'node_modules', '*.config.js', '*.config.ts'],
+    ignores: ['**/dist/**', '**/build/**', '**/coverage/**', '**/node_modules/**', '**/*.config.js', '**/*.config.ts'],
   },
   js.configs.recommended,
   ...tseslint.configs.recommended,
@@ -59,6 +59,15 @@ export default tseslint.config(
       // Empty catch blocks are common in defensive code (tracking, optional
       // features). Allow with a comment-only exception.
       'no-empty': ['error', { allowEmptyCatch: true }],
+    },
+  },
+  // Node build scripts (e.g. scripts/*.mjs) run under Node, not the browser.
+  {
+    files: ['**/*.{mjs,cjs,js}'],
+    languageOptions: {
+      ecmaVersion: 2022,
+      sourceType: 'module',
+      globals: { ...globals.node },
     },
   },
   // Test files lean on globals from vitest; loosen unused-vars and any-types.

@@ -373,27 +373,8 @@ test.describe.serial('Agent Intents — Premium Tier', () => {
     consoleMonitor.assertNoErrors();
   });
 
-  test('admin dashboard — should be accessible for premium users', async ({ page }) => {
-    // Click admin button if visible
-    const adminButton = page.locator('button:has-text("Admin"), .admin-button');
-    const adminVisible = await adminButton.isVisible({ timeout: 5000 }).catch(() => false);
-
-    if (!adminVisible) {
-      console.log('\n--- admin-dashboard ---');
-      console.log('Admin button not visible -- skipping');
-      test.skip();
-      return;
-    }
-
-    await adminButton.click();
-
-    // Dashboard should appear
-    const dashboard = page.locator('.admin-dashboard');
-    await expect(dashboard).toBeVisible({ timeout: 10000 });
-
-    console.log('\n--- admin-dashboard ---');
-    console.log('Admin dashboard loaded successfully');
-
-    consoleMonitor.assertNoErrors();
-  });
+  // (Removed) "admin dashboard — accessible for premium users" tested reaching the
+  // admin console from INSIDE the chat app (the old embedded `?admin` model). The
+  // admin console is now its own app (SPEC-SEPARATE-ADMIN-APP.md) and is covered by
+  // admin-dashboard.spec.ts / admin-dashboard-render.spec.ts against the admin origin.
 });
