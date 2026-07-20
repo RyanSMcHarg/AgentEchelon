@@ -246,14 +246,17 @@ in `ae-cognito` mode and require the IAM plane only in `service` / `federated` m
 
 **Remaining (by design or deploy-validated):**
 
-- **The `Scoped` cells.** A persona that holds a capability holds it fully, not narrowed. Two axes, two
-  reasons: (a) **ownership / membership** (an AI developer's "own assistants", a manager's "own use-case
-  channels") is a **deployment choice** by the section 2 implementer note - the platform has no generic
-  "who owns which channel or assistant" model, so there is nothing generic to enforce; a deployer defines
-  it. (b) **tier-ceiling** is the one generic axis and is achievable: under IAM authorization the handler
-  can read the caller's `sub` from `event.requestContext.identity.cognitoAuthenticationProvider`, resolve
-  their clearance, and filter rows. It is unbuilt because it needs a per-request identity lookup + a
-  per-query filter, is only verifiable on deploy, and applies only to the opt-in personas.
+- **The `Scoped` cells.** Two axes: (a) **tier-ceiling** is BUILT for the admin-conversations plane. Under
+  IAM authorization the handler reads the caller's `sub` from
+  `event.requestContext.identity.cognitoAuthenticationProvider` (`iamCallerSub`), resolves their
+  classification ceiling from their Cognito groups (`lib/caller-scope.ts`: highest classification group;
+  `admins`/`platform-admins` are Full; a persona with no classification group is fail-closed to the
+  floor), filters the conversation list to it, and guards the per-channel message / membership-history
+  reads (fail-closed). The runtime Cognito lookup is deploy-verified; the ceiling/filter logic is unit
+  tested. The **analytics plane** follows the same helper and is the tracked next slice (each query gains
+  a classification filter). (b) **ownership / membership** (an AI developer's "own assistants", a manager's
+  "own use-case channels") stays a **deployment choice** per the section 2 implementer note - the platform
+  has no generic "who owns which channel or assistant" model, so a deployer defines it.
 - **`view-security` A18** (deployment sleep/wake, infra health) keeps its Cognito authorizer - cost-ops,
   not security-sensitive data. A17 (membership audit) is IAM-authorized.
 - **Athena analytics** enforces at the coarse analytics-read level (the sensitive sub-resources are
