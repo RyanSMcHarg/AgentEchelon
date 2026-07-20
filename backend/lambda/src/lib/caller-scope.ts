@@ -98,3 +98,28 @@ export async function resolveCallerCeiling(sub: string, userPoolId: string): Pro
 export function __clearCeilingCache(): void {
   cache.clear();
 }
+
+// A14 Scoped for the ANALYTICS plane: drop result rows whose classification
+// DIMENSION exceeds the ceiling. Generic (no per-query SQL) — a row is filtered
+// only if it carries a field that both names a classification axis AND holds a real
+// tier value, so a global aggregate (no tier column) passes through unscoped, and a
+// field literally named `classification` that holds a quality grade
+// (excellent/good/...) is NOT mistaken for a tier. Documented limitation: cross-tier
+// aggregates with no tier column are not narrowed (a deployer choice).
+const TIER_VALUES = new Set(['basic', 'standard', 'premium']);
+const CLASSIFICATION_FIELDS = new Set([
+  'classification', 'tier', 'user_type', 'channel_tier', 'channeltier', 'modeltier', 'channelclassification',
+]);
+
+export function scopeAnalyticsRows<T>(rows: T[], ceiling: ClassificationCeiling): T[] {
+  if (ceiling === null || !Array.isArray(rows)) return rows;
+  return rows.filter((row) => {
+    if (!row || typeof row !== 'object') return true;
+    for (const [k, v] of Object.entries(row as Record<string, unknown>)) {
+      if (typeof v === 'string' && CLASSIFICATION_FIELDS.has(k.toLowerCase()) && TIER_VALUES.has(v)) {
+        return classificationAllowed(v, ceiling);
+      }
+    }
+    return true; // no tier dimension -> global aggregate, not narrowed
+  });
+}

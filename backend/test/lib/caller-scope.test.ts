@@ -4,7 +4,7 @@
  * The Cognito lookup itself is exercised on deploy; these pin the decision logic.
  */
 import type { APIGatewayProxyEvent } from 'aws-lambda';
-import { ceilingFromGroups, classificationAllowed, classificationRank } from '../../lambda/src/lib/caller-scope';
+import { ceilingFromGroups, classificationAllowed, classificationRank, scopeAnalyticsRows } from '../../lambda/src/lib/caller-scope';
 import { iamCallerSub } from '../../lambda/src/lib/auth';
 
 describe('ceilingFromGroups', () => {
@@ -46,6 +46,30 @@ describe('classificationAllowed', () => {
 function iamEvent(provider: string | null): APIGatewayProxyEvent {
   return { requestContext: { identity: { cognitoAuthenticationProvider: provider } } } as unknown as APIGatewayProxyEvent;
 }
+
+describe('scopeAnalyticsRows', () => {
+  it('null ceiling (Full) returns rows unchanged', () => {
+    const rows = [{ tier: 'premium', n: 1 }];
+    expect(scopeAnalyticsRows(rows, null)).toBe(rows);
+  });
+  it('drops rows whose tier dimension exceeds the ceiling', () => {
+    const rows = [{ tier: 'basic' }, { tier: 'standard' }, { tier: 'premium' }];
+    expect(scopeAnalyticsRows(rows, 'standard')).toEqual([{ tier: 'basic' }, { tier: 'standard' }]);
+  });
+  it('recognizes the classification-axis field names (user_type, channel_tier, modelTier)', () => {
+    expect(scopeAnalyticsRows([{ user_type: 'premium' }], 'basic')).toEqual([]);
+    expect(scopeAnalyticsRows([{ modelTier: 'basic' }], 'basic')).toEqual([{ modelTier: 'basic' }]);
+  });
+  it('does NOT treat a quality-grade `classification` (excellent/good) as a tier', () => {
+    const rows = [{ classification: 'excellent', n: 5 }, { classification: 'good', n: 3 }];
+    // No tier value present -> global aggregate, unfiltered.
+    expect(scopeAnalyticsRows(rows, 'basic')).toEqual(rows);
+  });
+  it('passes through global aggregates with no tier column', () => {
+    const rows = [{ date: '2026-07-01', total: 42 }];
+    expect(scopeAnalyticsRows(rows, 'basic')).toEqual(rows);
+  });
+});
 
 describe('iamCallerSub', () => {
   it('extracts the sub after the last :CognitoSignIn: segment', () => {

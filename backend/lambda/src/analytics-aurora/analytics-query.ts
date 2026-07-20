@@ -19,8 +19,12 @@ import { DynamoDBDocumentClient, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { stripMessageMarkers } from '../lib/message-markers.js';
 import { query, ensureSchema } from './db-client.js';
 import { estimateStepCostUsd, bedrockModelIdToKey } from '../lib/model-rate-table.js';
-import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall } from '../lib/auth.js';
+import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall, iamCallerSub } from '../lib/auth.js';
 import { queryTypeAllowedOnPath } from '../lib/admin-capability-map.js';
+import { resolveCallerCeiling, scopeAnalyticsRows, type ClassificationCeiling } from '../lib/caller-scope.js';
+
+// A14 Scoped: the pool the caller's classification ceiling is resolved against.
+const USER_POOL_ID = process.env.USER_POOL_ID || '';
 import { recordModerationAction, adminListEvents } from './admin-conversations-aurora.js';
 import {
   aggregateVariantFeedback,
@@ -194,7 +198,14 @@ export async function handler(
       if (isArchiveReadBody(event.body) && !callerCanReadArchive(event)) {
         return error(403, 'Archive-view permission required');
       }
-      return handlePostQuery(event.body);
+      // A14 Scoped: resolve the caller's classification ceiling (Full on a
+      // Cognito-JWT call or a full-access caller) and narrow the result rows.
+      let ceiling: ClassificationCeiling = null;
+      if (isAdminIamEnforcedCall(event) && USER_POOL_ID) {
+        const sub = iamCallerSub(event);
+        if (sub) ceiling = await resolveCallerCeiling(sub, USER_POOL_ID);
+      }
+      return handlePostQuery(event.body, ceiling);
     }
 
     const path = event.path || '';
@@ -593,7 +604,7 @@ async function getChannelEvents(
   return success({ events });
 }
 
-async function handlePostQuery(rawBody: string | null): Promise<APIGatewayProxyResult> {
+async function handlePostQuery(rawBody: string | null, ceiling: ClassificationCeiling = null): Promise<APIGatewayProxyResult> {
   let body: Record<string, unknown>;
   try {
     body = JSON.parse(rawBody || '{}');
@@ -618,8 +629,10 @@ async function handlePostQuery(rawBody: string | null): Promise<APIGatewayProxyR
     return error(500, 'Malformed analytics result');
   }
   const arr = Array.isArray(parsed[entry.dataKey]) ? parsed[entry.dataKey] : [];
+  // A14 Scoped: narrow rows with a tier dimension to the caller's ceiling.
+  const scoped = scopeAnalyticsRows(arr as unknown[], ceiling);
   // Normalize to { data: [...] }; keep the rest (stats/pagination/totals) at top level.
-  return success({ ...parsed, data: arr });
+  return success({ ...parsed, data: scoped });
 }
 
 /**

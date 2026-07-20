@@ -611,6 +611,14 @@ export class AnalyticsStack extends cdk.Stack {
       : adminApiMethodOptions(this, 'AnalyticsAuthorizer', { userPool: props.userPool });
     if (adminIamEnforcement) {
       analyticsQueryFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+      // A14 Scoped: resolve the caller's classification ceiling from Cognito groups.
+      if (props.userPool) {
+        analyticsQueryFn.addEnvironment('USER_POOL_ID', props.userPool.userPoolId);
+        analyticsQueryFn.addToRolePolicy(new iam.PolicyStatement({
+          actions: ['cognito-idp:ListUsers', 'cognito-idp:AdminListGroupsForUser'],
+          resources: [props.userPool.userPoolArn],
+        }));
+      }
     }
     analyticsApi.root
       .addResource('query')

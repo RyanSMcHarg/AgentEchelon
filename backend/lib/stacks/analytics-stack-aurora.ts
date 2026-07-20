@@ -1501,6 +1501,14 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
       // Trust the gateway-vetted signed principal + enforce queryType->capability
       // per resource (analytics-query.ts). Set only here — other Lambdas stay Cognito.
       analyticsLambda.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+      // A14 Scoped: resolve the caller's classification ceiling from Cognito groups.
+      analyticsLambda.addEnvironment('USER_POOL_ID', props.userPoolId);
+      if (props.userPoolArn) {
+        analyticsLambda.addToRolePolicy(new iam.PolicyStatement({
+          actions: ['cognito-idp:ListUsers', 'cognito-idp:AdminListGroupsForUser'],
+          resources: [props.userPoolArn],
+        }));
+      }
     }
 
     // API Gateway
