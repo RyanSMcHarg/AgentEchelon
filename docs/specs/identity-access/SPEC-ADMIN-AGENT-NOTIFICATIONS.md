@@ -10,10 +10,10 @@
 - `backend/lib/config/profiles.ts:36-53` - `AssistantProfile` (the capability bundle the admin agent is defined as); `:76-92` - `DEFAULT_PROFILES_CONFIG` (where the admin-agent profile is added)
 - `backend/lib/stacks/assistant-profile-stack.ts:664-704` - the per-profile `CreateAppInstanceBot` custom resource + `…/assistant/{name}/bot-arn` SSM publish (`:697`); `:605` - the Lex bot; `:153` - the `adminErrorAlertWiring` call site
 - `backend/lambda/lex-bot/create-bot.ts` - `CreateAppInstanceBot` (Identity API, no ChimeBearer)
-- `backend/lib/stacks/agent-tier-common.ts:362-383` - `adminErrorAlertWiring` (today sets `ADMIN_ALERT_BEARER_ARN` to the service admin, `:369`); `:391` - the `…/assistant/{name}/bot-arn` SSM key; `:284` - `INSTANCE_SSM`
+- `backend/lib/stacks/agent-classification-common.ts:362-383` - `adminErrorAlertWiring` (today sets `ADMIN_ALERT_BEARER_ARN` to the service admin, `:369`); `:391` - the `…/assistant/{name}/bot-arn` SSM key; `:284` - `INSTANCE_SSM`
 - `backend/lambda/src/membership-audit.ts:209-236` - `alertAdmins` (posts + email fan-out; today bears the service admin); `backend/lib/constructs/membership-audit.ts:70,93-98` - its env + Chime IAM
 - `backend/lambda/src/lib/channel-notify.ts` - `fanOutChannelNotification` (resolves email recipients from the channel `Metadata.participants` roster)
-- `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md` - the two credential planes; the service app-instance-admin's role (cross-channel moderation, no membership)
+- `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md` - the two credential planes; the service app-instance-admin's role (cross-channel administration, no membership)
 - `docs/specs/admin-console/SPEC-ADMIN-CONSOLE.md` - the Security (Membership Audit) tab whose findings this delivers
 - `docs/specs/conversation-messaging/SPEC-NOTIFICATION-BRIDGE.md` - the conversation-as-hub email/notify fan-out this rides
 - `docs/guides/admin/ADMIN-GUIDE.md` - operator-facing usage (the admin notification channel section)
@@ -24,7 +24,7 @@ Two facts, one empirically verified against the live instance, force this design
 
 1. **AE has admin alerts but nowhere to send them.** The Layer 6 membership audit and the admin-error path both post a finding into an admin conversation and fan it out to admins over email (`membership-audit.ts:209-236`), but the channel ARN is unset by default, so both degrade to log-only. The admin has no notification channel.
 
-2. **The service app-instance-admin cannot be the sender, and must never be a channel member.** The shipped wiring posts as the service admin: `adminErrorAlertWiring` sets `ADMIN_ALERT_BEARER_ARN` to `INSTANCE_SSM.appInstanceAdminArn` (`agent-tier-common.ts:369`), and membership-audit bears the same service-admin ARN. But a `SendChannelMessage` by the service admin to a RESTRICTED, PRIVATE channel it is not a member of is rejected. Verified on the live instance: with the service admin removed from a test channel's membership, `SendChannelMessage` as that identity returns `ForbiddenException: You do not have sufficient access to perform this action`. Making the service admin a member to work around this is not an option: the service admin is the cross-channel moderation identity (it reads and moderates any channel WITHOUT membership, `SPEC-ADMIN-IDENTITY.md`), and putting it in a channel roster is both a privilege smell and, for email fan-out, wrong (it would be a recipient). So the sender must be a different identity that legitimately owns the channel.
+2. **The service app-instance-admin cannot be the sender, and must never be a channel member.** The shipped wiring posts as the service admin: `adminErrorAlertWiring` sets `ADMIN_ALERT_BEARER_ARN` to `INSTANCE_SSM.appInstanceAdminArn` (`agent-classification-common.ts:369`), and membership-audit bears the same service-admin ARN. But a `SendChannelMessage` by the service admin to a RESTRICTED, PRIVATE channel it is not a member of is rejected. Verified on the live instance: with the service admin removed from a test channel's membership, `SendChannelMessage` as that identity returns `ForbiddenException: You do not have sufficient access to perform this action`. Making the service admin a member to work around this is not an option: the service admin is the cross-channel administration identity (it reads and moderates any channel WITHOUT membership, `SPEC-ADMIN-IDENTITY.md`), and putting it in a channel roster is both a privilege smell and, for email fan-out, wrong (it would be a recipient). So the sender must be a different identity that legitimately owns the channel.
 
 The correct owner and sender is a bot. A bot that creates a channel is its moderator and can post to it, and bot-sent messages are the trusted trigger for the notify/email fan-out. AgentEchelon already provisions bots for every assistant profile; the admin agent is simply one more profile.
 
@@ -47,9 +47,9 @@ Three identities, kept distinct:
 
 ## The admin agent (a capability profile)
 
-The admin agent is added to `DEFAULT_PROFILES_CONFIG.profiles` (`profiles.ts:82-89`) as a new profile, e.g. `{ name: 'admin-agent', modelKey: 'haiku', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'lightweight', contextScope: 'own-rank-and-below' }`. Unlike the tier profiles, it is NOT bound to a channel classification (no `DeploymentClassification.profile` points at it): it does not serve user conversations by clearance. It exists to own the admin-plane channel and to be the sender identity for alerts. Its persona and model matter only if and when the admin agent is later given a conversational role (the multi-agent support/admin-assistant direction); for notifications, only its bot identity is used.
+The admin agent is added to `DEFAULT_PROFILES_CONFIG.profiles` (`profiles.ts:82-89`) as a new profile, e.g. `{ name: 'admin-agent', modelKey: 'haiku', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'lightweight', contextScope: 'own-rank-and-below' }`. Unlike the per-classification profiles, it is NOT bound to a channel classification (no `DeploymentClassification.profile` points at it): it does not serve user conversations by clearance. It exists to own the admin-plane channel and to be the sender identity for alerts. Its persona and model matter only if and when the admin agent is later given a conversational role (the multi-agent support/admin-assistant direction); for notifications, only its bot identity is used.
 
-The profile stack provisions it identically to a tier assistant: the Lex bot (`assistant-profile-stack.ts:605+`), the `CreateAppInstanceBot` custom resource (`:664-704`), and the SSM publish of `…/assistant/admin-agent/bot-arn` (`:697`, via the key helper `agent-tier-common.ts:391`). Provisioning the admin agent through the same path is the "profile plus config, not a hardcoded ARN" difference from communication-hub, and it means the admin agent inherits AE's persona-override, model-selection, and config-identity machinery for free.
+The profile stack provisions it identically to a classification assistant: the Lex bot (`assistant-profile-stack.ts:605+`), the `CreateAppInstanceBot` custom resource (`:664-704`), and the SSM publish of `…/assistant/admin-agent/bot-arn` (`:697`, via the key helper `agent-classification-common.ts:391`). Provisioning the admin agent through the same path is the "profile plus config, not a hardcoded ARN" difference from communication-hub, and it means the admin agent inherits AE's persona-override, model-selection, and config-identity machinery for free.
 
 ## The admin notification channel
 
@@ -65,7 +65,7 @@ Idempotent, matching the initial A6: the custom resource's `PhysicalResourceId` 
 
 Both alert paths change their ChimeBearer from the service admin to the admin agent bot:
 
-- **Admin-error alerts.** `adminErrorAlertWiring` (`agent-tier-common.ts:362-383`) stamps `ADMIN_ALERT_BEARER_ARN`; today it is `INSTANCE_SSM.appInstanceAdminArn` (`:369`). It becomes the admin-agent bot ARN (read from `…/assistant/admin-agent/bot-arn`). The IAM grant (`:371-381`) shifts to `chime:SendChannelMessage` on the bot resource (`…/bot/*`) plus the channel.
+- **Admin-error alerts.** `adminErrorAlertWiring` (`agent-classification-common.ts:362-383`) stamps `ADMIN_ALERT_BEARER_ARN`; today it is `INSTANCE_SSM.appInstanceAdminArn` (`:369`). It becomes the admin-agent bot ARN (read from `…/assistant/admin-agent/bot-arn`). The IAM grant (`:371-381`) shifts to `chime:SendChannelMessage` on the bot resource (`…/bot/*`) plus the channel.
 - **Membership-audit alerts.** `alertAdmins` (`membership-audit.ts:209-236`) posts with the bearer resolved from `ADMIN_ARN_PARAM` (today the service admin). It reads the admin-agent bot ARN instead. The construct's Chime IAM (`membership-audit.ts:93-98`) already spans `…/channel/*` and adds `…/bot/*` for the bot bearer.
 
 Why the bot works where the service admin does not: a bot posting to its own channel is a member-equivalent (moderator) send, and bot-sent messages are the trusted trigger for the notify/email fan-out (the fan-out honors `notify` metadata only from a `/bot/` sender). The service admin, by contrast, is not a member and is rejected on `SendChannelMessage` to a RESTRICTED, PRIVATE channel (the verified `ForbiddenException`).
@@ -85,9 +85,9 @@ Human admins receive an alert two ways, both keyed on the participant roster the
 
 ## IAM
 
-- **Admin-agent bot creation:** `chime:CreateAppInstanceBot` on the app-instance and `…/bot/*` (the profile stack already grants this for tier bots, `assistant-profile-stack.ts:668`), plus the Lex creation actions.
+- **Admin-agent bot creation:** `chime:CreateAppInstanceBot` on the app-instance and `…/bot/*` (the profile stack already grants this for classification bots, `assistant-profile-stack.ts:668`), plus the Lex creation actions.
 - **Channel provisioning role:** `chime:CreateChannel` on the app-instance; `chime:CreateChannelMembership` / `chime:UpdateChannel` / `chime:DeleteChannel` / `chime:TagResource` / `chime:CreateChannelModerator` on `…/channel/*` and `…/user/*` (the admin-user bearer) and `…/bot/*` (the bot bearer); `cognito-idp:ListUsersInGroup` on the user-pool; `ssm:GetParameter` on the admin-agent bot and service-admin ARNs.
-- **Alert posters:** `chime:SendChannelMessage` on `…/bot/*` (the bot bearer) and the channel, on the tier-processor roles (`adminErrorAlertWiring`) and the membership-audit role.
+- **Alert posters:** `chime:SendChannelMessage` on `…/bot/*` (the bot bearer) and the channel, on the classification-processor roles (`adminErrorAlertWiring`) and the membership-audit role.
 
 ## What this supersedes and how to migrate
 

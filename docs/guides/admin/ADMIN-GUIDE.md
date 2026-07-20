@@ -151,7 +151,7 @@ Notifications** conversation, in-app plus email. Enable it at deploy time:
   agent** (an AgentEchelon assistant, defined by a capability profile), which is also the
   identity that posts every alert. Its **members are the `admins` Cognito group**, and they
   are the in-app + email recipients. The service app-instance-admin identity is deliberately
-  **never a member** - it is the cross-channel moderation identity and stays out of channel
+  **never a member** - it is the cross-channel administration identity and stays out of channel
   rosters; the admin agent, not the service admin, posts.
 - **Adding an admin later.** Membership is synced when the channel is provisioned. A person
   added to the `admins` group after the last deploy is not a recipient until the channel is
