@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import { AuthProvider, useAuth, LoginScreen, ForgotPasswordScreen, ErrorBoundary } from '@ae/shared';
 import { AwsClientProvider, useAwsClient } from './providers/AwsClientProvider';
 import { MessagingProvider } from './providers/MessagingProvider';
@@ -21,7 +22,8 @@ function AppContent() {
     mfaChallenge, completeMfa, forgotPassword, confirmForgotPassword, resendCode,
   } = useAuth();
   const { isInitialized } = useAwsClient();
-  const { activeConversation, selectConversation } = useConversations();
+  const { t } = useTranslation();
+  const { activeConversation, selectConversation, clearActiveConversation } = useConversations();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [authView, setAuthView] = useState<AuthView>('login');
   const [registeredEmail, setRegisteredEmail] = useState('');
@@ -134,7 +136,10 @@ function AppContent() {
   return (
     <div className="app">
       <Header />
-      <div className="app-content">
+      {/* `has-active` drives the mobile master-detail swap: below the breakpoint the
+          list is shown until a conversation is active, then the detail pane takes over
+          (the two panes stay side by side on desktop). */}
+      <div className={`app-content${activeConversation ? ' has-active' : ''}`}>
         <div className="app-sidebar">
           <div className="app-sidebar-header">
             <button className="app-new-conversation-btn" onClick={() => setIsModalOpen(true)}>
@@ -145,6 +150,14 @@ function AppContent() {
         </div>
 
         <div className="app-main">
+          <button
+            type="button"
+            className="app-mobile-back"
+            onClick={clearActiveConversation}
+            aria-label={t('header.conversations')}
+          >
+            <span aria-hidden="true">&#8592;</span> {t('header.conversations')}
+          </button>
           <ConversationInterface />
           {activeConversation && <MessageInput />}
         </div>

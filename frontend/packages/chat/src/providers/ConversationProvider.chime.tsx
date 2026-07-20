@@ -35,6 +35,9 @@ interface ConversationContextType {
   isConversationUnread: (conv: Conversation) => boolean;
   createConversation: (title: string, modelId: string, modelName: string, topic?: string) => Promise<void>;
   selectConversation: (conversationId: string) => Promise<void>;
+  /** Deselect the active conversation (return to the list) without removing it.
+   *  Drives the mobile master-detail Back affordance. */
+  clearActiveConversation: () => void;
   sendMessage: (
     content: string,
     attachment?: Attachment,
@@ -707,6 +710,17 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     return Array.from(byBot.values());
   }, [messages]);
 
+  // Deselect the active conversation (return to the list) without removing it —
+  // the mobile Back affordance. Unlike deleteConversation it deletes nothing; it
+  // just unsubscribes the live view and clears the detail pane, matching the
+  // deselect half of the delete/select flows. Re-selecting re-subscribes.
+  const clearActiveConversation = useCallback(() => {
+    const current = activeConversationRef.current;
+    if (current) unsubscribe(current.conversationArn);
+    setActiveConversation(null);
+    setMessages([]);
+  }, [unsubscribe]);
+
   const value: ConversationContextType = useMemo(() => ({
     conversations,
     activeConversation,
@@ -720,6 +734,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     isConversationUnread,
     createConversation,
     selectConversation,
+    clearActiveConversation,
     sendMessage,
     shareConversation,
     deleteConversation,
@@ -734,7 +749,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     conversations, activeConversation, messages, isLoadingMessages,
     isInitializing, isSending, isBotTyping, sendError, channelMembers,
     isConversationUnread,
-    createConversation, selectConversation, sendMessage, shareConversation,
+    createConversation, selectConversation, clearActiveConversation, sendMessage, shareConversation,
     deleteConversation, archiveConversation, leaveConversation, renameConversation, clearSendError,
     stickyTarget,
     battleWaitingBots,

@@ -455,6 +455,27 @@
     max-height: calc(100vh - var(--space-16));
     border-radius: var(--radius-lg);
   }
+
+  /* Master-detail: show ONE pane at a time on narrow screens. The conversation
+     list is the default view; opening a conversation (`.app-content.has-active`,
+     set in App.tsx when a conversation is active) swaps to the detail pane, and
+     the in-pane Back control (`.app-mobile-back`) returns to the list. On desktop
+     both panes stay side by side, so none of this applies above the breakpoint. */
+  .app-content .app-sidebar {
+    width: 100%;
+  }
+
+  .app-content.has-active .app-sidebar {
+    display: none;
+  }
+
+  .app-content:not(.has-active) .app-main {
+    display: none;
+  }
+
+  .app-content.has-active .app-mobile-back {
+    display: flex;
+  }
 }
 
 @media (max-width: 480px) {
