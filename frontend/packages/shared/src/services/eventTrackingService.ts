@@ -58,6 +58,11 @@ type EventName =
   | 'file_uploaded'
   | 'tab_switched'
   | 'admin_tab_viewed'
+  // Admin actions (emitted by the admin console, adminChime.ts)
+  | 'admin_message_redacted'
+  | 'admin_message_deleted'
+  | 'admin_member_added'
+  | 'admin_member_removed'
   // Operational
   | 'error';
 
