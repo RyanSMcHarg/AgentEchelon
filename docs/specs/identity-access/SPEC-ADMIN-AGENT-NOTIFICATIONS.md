@@ -51,6 +51,14 @@ The admin agent is added to `DEFAULT_PROFILES_CONFIG.profiles` (`profiles.ts:82-
 
 The profile stack provisions it identically to a classification assistant: the Lex bot (`assistant-profile-stack.ts:605+`), the `CreateAppInstanceBot` custom resource (`:664-704`), and the SSM publish of `…/assistant/admin-agent/bot-arn` (`:697`, via the key helper `agent-classification-common.ts:391`). Provisioning the admin agent through the same path is the "profile plus config, not a hardcoded ARN" difference from communication-hub, and it means the admin agent inherits AE's persona-override, model-selection, and config-identity machinery for free.
 
+**Security boundary (normative).** The admin agent participates ONLY in admin conversations, and admin conversations are accessible ONLY to admins. Concretely:
+
+1. **Never in a user conversation.** The admin agent's bot is never added to, and never responds in, a user/classification channel. It is bound to no `DeploymentClassification.profile`, so no channel classification maps to it and the router never routes a user turn to it. There is no code path that invokes the admin agent from a non-admin channel.
+2. **Admin-only membership.** Every channel the admin agent owns or joins is `RESTRICTED` + `PRIVATE`, with membership limited to the `admins` Cognito group (plus the admin agent bot itself). A non-admin can neither read nor post; the service app-instance-admin is not a member either (it is only the member-add bearer).
+3. **The boundary binds the future conversational role too.** If the admin agent later gains a conversational role (the multi-agent support / admin-assistant direction), the same two rules hold unchanged: admin-only membership, and no presence in user conversations. Admin-plane content and the admin assistant stay strictly inside the admin trust boundary.
+
+This is the same trust separation as the two credential planes (`SPEC-ADMIN-IDENTITY.md`): the admin agent is an admin-plane identity and must never cross into the chat plane.
+
 ## The admin notification channel
 
 A custom resource (the reworked `admin-notification-stack.ts`) provisions ONE channel, ordered so the bot owns it:
