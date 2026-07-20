@@ -19,9 +19,9 @@ import { DynamoDBDocumentClient, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { stripMessageMarkers } from '../lib/message-markers.js';
 import { query, ensureSchema } from './db-client.js';
 import { estimateStepCostUsd, bedrockModelIdToKey } from '../lib/model-rate-table.js';
-import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall, iamCallerSub } from '../lib/auth.js';
+import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall } from '../lib/auth.js';
 import { queryTypeAllowedOnPath } from '../lib/admin-capability-map.js';
-import { resolveCallerCeiling, scopeAnalyticsRows, type ClassificationCeiling } from '../lib/caller-scope.js';
+import { ceilingForRequest, scopeAnalyticsRows, type ClassificationCeiling } from '../lib/caller-scope.js';
 
 // A14 Scoped: the pool the caller's classification ceiling is resolved against.
 const USER_POOL_ID = process.env.USER_POOL_ID || '';
@@ -198,13 +198,12 @@ export async function handler(
       if (isArchiveReadBody(event.body) && !callerCanReadArchive(event)) {
         return error(403, 'Archive-view permission required');
       }
-      // A14 Scoped: resolve the caller's classification ceiling (Full on a
-      // Cognito-JWT call or a full-access caller) and narrow the result rows.
-      let ceiling: ClassificationCeiling = null;
-      if (isAdminIamEnforcedCall(event) && USER_POOL_ID) {
-        const sub = iamCallerSub(event);
-        if (sub) ceiling = await resolveCallerCeiling(sub, USER_POOL_ID);
-      }
+      // A14 Scoped: resolve the caller's classification ceiling and narrow the
+      // result rows. Full (null) only on a Cognito-JWT call; an enforced call fails
+      // closed to the floor if the caller cannot be identified (ceilingForRequest).
+      const ceiling: ClassificationCeiling = isAdminIamEnforcedCall(event)
+        ? await ceilingForRequest(event, USER_POOL_ID)
+        : null;
       return handlePostQuery(event.body, ceiling);
     }
 

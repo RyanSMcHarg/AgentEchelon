@@ -27,8 +27,8 @@ import {
   QueryExecutionState,
 } from '@aws-sdk/client-athena';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall, iamCallerSub } from './lib/auth.js';
-import { resolveCallerCeiling, classificationAllowed, type ClassificationCeiling } from './lib/caller-scope.js';
+import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall } from './lib/auth.js';
+import { ceilingForRequest, classificationAllowed, type ClassificationCeiling } from './lib/caller-scope.js';
 // Aurora-mode read path: when the data-plane ARN is wired (analyticsMode=aurora),
 // read conversations from Aurora via the VPC data-plane Lambda instead of Athena
 // (the Athena archive query is too slow — 15-27s > API Gateway's 29s cap — and
@@ -191,14 +191,12 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
   await ensureDataPlaneArn();
 
   // A14 Scoped: under IAM enforcement, narrow the reads to the caller's
-  // classification ceiling (resolved from the verified sub). Full (null) on a
-  // Cognito-JWT call or a full-access caller (admins / platform-admins), so the
-  // default path is unchanged.
-  let ceiling: ClassificationCeiling = null;
-  if (isAdminIamEnforcedCall(event) && USER_POOL_ID) {
-    const sub = iamCallerSub(event);
-    if (sub) ceiling = await resolveCallerCeiling(sub, USER_POOL_ID);
-  }
+  // classification ceiling (resolved from the verified sub). Full (null) only on a
+  // Cognito-JWT call (the default path is unchanged); an enforced call FAILS CLOSED
+  // to the floor if the caller cannot be identified (ceilingForRequest).
+  const ceiling: ClassificationCeiling = isAdminIamEnforcedCall(event)
+    ? await ceilingForRequest(event, USER_POOL_ID)
+    : null;
 
   try {
     const path = event.path;

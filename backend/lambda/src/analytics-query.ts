@@ -26,9 +26,9 @@ import {
   QueryExecutionState,
 } from '@aws-sdk/client-athena';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { parseJsonBody, requireAdmin, isAdminIamEnforcedCall, iamCallerSub } from './lib/auth';
+import { parseJsonBody, requireAdmin, isAdminIamEnforcedCall } from './lib/auth';
 import { queryTypeAllowedOnPath } from './lib/admin-capability-map';
-import { resolveCallerCeiling, scopeAnalyticsRows } from './lib/caller-scope';
+import { ceilingForRequest, scopeAnalyticsRows } from './lib/caller-scope';
 
 const athena = new AthenaClient({});
 const WORKGROUP = process.env.ATHENA_WORKGROUP || 'agent-echelon-analytics';
@@ -538,13 +538,11 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
     const result = await runQuery(sql);
     // A14 Scoped: narrow rows to the caller's classification ceiling (rows with a
-    // tier dimension; global aggregates pass through). Full on a Cognito-JWT call.
-    if (isAdminIamEnforcedCall(event) && USER_POOL_ID) {
-      const sub = iamCallerSub(event);
-      if (sub) {
-        const ceiling = await resolveCallerCeiling(sub, USER_POOL_ID);
-        result.data = scopeAnalyticsRows(result.data, ceiling);
-      }
+    // tier dimension; global aggregates pass through). Full on a Cognito-JWT call;
+    // an enforced call fails closed to the floor if the caller is unidentifiable.
+    if (isAdminIamEnforcedCall(event)) {
+      const ceiling = await ceilingForRequest(event, USER_POOL_ID);
+      result.data = scopeAnalyticsRows(result.data, ceiling);
     }
     return respond(200, result);
 

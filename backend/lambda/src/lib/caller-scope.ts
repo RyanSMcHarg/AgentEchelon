@@ -13,11 +13,13 @@
  * Active ONLY under IAM enforcement (the handler passes the verified sub from
  * `iamCallerSub`). Cognito-JWT calls keep the existing behavior.
  */
+import type { APIGatewayProxyEvent } from 'aws-lambda';
 import {
   CognitoIdentityProviderClient,
   ListUsersCommand,
   AdminListGroupsForUserCommand,
 } from '@aws-sdk/client-cognito-identity-provider';
+import { iamCallerSub } from './auth.js';
 
 const cognito = new CognitoIdentityProviderClient({});
 
@@ -92,6 +94,28 @@ export async function resolveCallerCeiling(sub: string, userPoolId: string): Pro
   }
   cache.set(sub, { ceiling, at: now });
   return ceiling;
+}
+
+/**
+ * The classification ceiling to enforce for a request. Call ONLY when the request
+ * is IAM-enforced (`isAdminIamEnforcedCall`). FAIL-CLOSED: if the verified sub
+ * cannot be extracted from the signed principal (an unexpected
+ * `cognitoAuthenticationProvider` shape, or a non-Identity-Pool principal), return
+ * the floor rather than `null` (Full) - a control that cannot identify the caller
+ * must narrow, never widen. This is the single seam so the fail-open cannot be
+ * reintroduced at a call site.
+ */
+export async function ceilingForRequest(event: APIGatewayProxyEvent, userPoolId: string): Promise<ClassificationCeiling> {
+  if (!userPoolId) {
+    console.warn('[caller-scope] no USER_POOL_ID configured under enforcement -> fail-closed to floor');
+    return FLOOR_CLASSIFICATION;
+  }
+  const sub = iamCallerSub(event);
+  if (!sub) {
+    console.warn('[caller-scope] IAM-enforced call with no resolvable sub -> fail-closed to floor');
+    return FLOOR_CLASSIFICATION;
+  }
+  return resolveCallerCeiling(sub, userPoolId);
 }
 
 /** Test-only: clear the module cache. */

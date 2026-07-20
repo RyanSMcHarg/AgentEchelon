@@ -4,7 +4,7 @@
  * The Cognito lookup itself is exercised on deploy; these pin the decision logic.
  */
 import type { APIGatewayProxyEvent } from 'aws-lambda';
-import { ceilingFromGroups, classificationAllowed, classificationRank, scopeAnalyticsRows } from '../../lambda/src/lib/caller-scope';
+import { ceilingFromGroups, classificationAllowed, classificationRank, scopeAnalyticsRows, ceilingForRequest } from '../../lambda/src/lib/caller-scope';
 import { iamCallerSub } from '../../lambda/src/lib/auth';
 
 describe('ceilingFromGroups', () => {
@@ -68,6 +68,18 @@ describe('scopeAnalyticsRows', () => {
   it('passes through global aggregates with no tier column', () => {
     const rows = [{ date: '2026-07-01', total: 42 }];
     expect(scopeAnalyticsRows(rows, 'basic')).toEqual(rows);
+  });
+});
+
+describe('ceilingForRequest — fail-closed (no fail-open)', () => {
+  it('an enforced call with NO resolvable sub fails closed to the floor (never null/Full)', async () => {
+    // Unparseable provider string -> iamCallerSub null -> must NOT be Full.
+    const ev = iamEvent('not-a-cognito-provider');
+    await expect(ceilingForRequest(ev, 'us-east-1_POOL')).resolves.toBe('basic');
+  });
+  it('a missing USER_POOL_ID fails closed to the floor', async () => {
+    const ev = iamEvent('cognito-idp.us-east-1.amazonaws.com/p:CognitoSignIn:abc');
+    await expect(ceilingForRequest(ev, '')).resolves.toBe('basic');
   });
 });
 
