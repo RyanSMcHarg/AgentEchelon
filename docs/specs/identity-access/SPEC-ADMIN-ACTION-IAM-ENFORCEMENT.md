@@ -244,11 +244,21 @@ in `ae-cognito` mode and require the IAM plane only in `service` / `federated` m
   demoted to the `ae-cognito` fallback: under IAM enforcement the gateway is the control and the handler
   trusts the signed principal; a Cognito-JWT call still resolves through the group gate.
 
-**Remaining (deploy-validated, tracked):** the `Scoped` cells (tier / assistant-ownership / membership
-conditions) are not yet expressed as IAM conditions; a persona that holds a capability holds it fully,
-not scoped. `view-security` (the membership-audit + deployment routes, A17/A18) keeps its Cognito
-authorizer for now. The Athena analytics stack enforces at the coarse analytics-read level (the sensitive
-sub-resources are Aurora-only). The on-flag runtime path is verified on deploy.
+**Remaining (by design or deploy-validated):**
+
+- **The `Scoped` cells.** A persona that holds a capability holds it fully, not narrowed. Two axes, two
+  reasons: (a) **ownership / membership** (an AI developer's "own assistants", a manager's "own use-case
+  channels") is a **deployment choice** by the section 2 implementer note - the platform has no generic
+  "who owns which channel or assistant" model, so there is nothing generic to enforce; a deployer defines
+  it. (b) **tier-ceiling** is the one generic axis and is achievable: under IAM authorization the handler
+  can read the caller's `sub` from `event.requestContext.identity.cognitoAuthenticationProvider`, resolve
+  their clearance, and filter rows. It is unbuilt because it needs a per-request identity lookup + a
+  per-query filter, is only verifiable on deploy, and applies only to the opt-in personas.
+- **`view-security` A18** (deployment sleep/wake, infra health) keeps its Cognito authorizer - cost-ops,
+  not security-sensitive data. A17 (membership audit) is IAM-authorized.
+- **Athena analytics** enforces at the coarse analytics-read level (the sensitive sub-resources are
+  Aurora-only features).
+- The on-flag runtime path is verified on deploy.
 
 ## 11. Audit tie-in
 
