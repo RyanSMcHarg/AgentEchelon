@@ -40,7 +40,7 @@ Placeholders used below - resolve each **once** and reuse:
 | `<USER_POOL_ID>` | Cognito user pool | CDK output `AgentEchelonCognitoAuth.UserPoolId` / `.env` `VITE_USER_POOL_ID` |
 | `<APP_INSTANCE_ARN>` | Amazon Chime SDK app instance | CDK output `AgentEchelonChimeMessaging.AppInstanceArn` / `.env` `VITE_APP_INSTANCE_ARN` |
 | `<DEMO_EMAIL>` | A seeded test identity | Whatever `backend/scripts/seed-demo.ts` created in *your* pool (reference seed uses `*@stratum.example.com`) |
-| `<STACK>` | A CDK stack | `AgentEchelonTier-Premium`, `AgentEchelonChannelFlow`, `AgentEchelonCognitoAuth`, … |
+| `<STACK>` | A CDK stack | `AgentEchelonClassification-Premium`, `AgentEchelonChannelFlow`, `AgentEchelonCognitoAuth`, … |
 | `<LOGICAL_ID>` | A construct's CFN logical id | Stable across accounts for the same CDK code (e.g. `AsyncProcessor`, `ChannelFlowProcessor`, `ExperimentsTable`, `ChannelBattleConfigTable`) |
 
 ### Resolve a physical resource name from its logical id
@@ -64,7 +64,7 @@ Examples (used throughout this guide):
 
 ```bash
 res AgentEchelonExperiments ExperimentsTable          # → the experiments table name
-fnlog AgentEchelonTier-Premium AsyncProcessor 25m
+fnlog AgentEchelonClassification-Premium AsyncProcessor 25m
 fnlog AgentEchelonChannelFlow ChannelFlowProcessor 20m
 ```
 
@@ -113,7 +113,7 @@ Work them in order.
 
 3. **Read the premium async processor (generates each bot's reply)**
    ```bash
-   fnlog AgentEchelonTier-Premium AsyncProcessor 25m > /tmp/pap.log
+   fnlog AgentEchelonClassification-Premium AsyncProcessor 25m > /tmp/pap.log
    grep -niE 'ValidationException|ResourceNotFound|AccessDenied|substring|BedrockResilience|Round-1 clarification|Model resolution' /tmp/pap.log
    ```
    | Log signature | Section |
@@ -151,7 +151,7 @@ it, so single-turn shows no final answer on that side. By design.
 caller ARN from `useAwsClient().userArn` (the canonical chimeService ARN), and
 the create-conversation API response must include `createdByArn`; otherwise
 `isCurrentUserModerator` is permanently false and the panel never shows. Files:
-`frontend/src/components/ChannelMembersPanel.tsx`,
+`frontend/packages/chat/src/components/ChannelMembersPanel.tsx`,
 `backend/lambda/create-conversation/index.js` (response body).
 
 ### Resolution - three independent defects, not a threading bug
@@ -367,7 +367,7 @@ varies by account/region - verify in *yours*.
 
 **Diagnosis**
 ```bash
-fnlog AgentEchelonTier-Premium AsyncProcessor 30m | grep -i "end of its life"
+fnlog AgentEchelonClassification-Premium AsyncProcessor 30m | grep -i "end of its life"
 # List live successors from the same provider:
 aws bedrock list-foundation-models --by-provider <provider> \
   --query "modelSummaries[?modelLifecycle.status=='ACTIVE' && contains(outputModalities,'TEXT')].modelId"
@@ -445,7 +445,7 @@ error bubble.
 ### Diagnosis
 
 ```bash
-fnlog AgentEchelonTier-Premium AsyncProcessor 25m | grep -A2 -i AccessDenied
+fnlog AgentEchelonClassification-Premium AsyncProcessor 25m | grep -A2 -i AccessDenied
 # Which regions does the profile fan out to?
 aws bedrock get-inference-profile \
   --inference-profile-identifier us.anthropic.claude-opus-4-6-v1 \
@@ -481,10 +481,10 @@ the `us.` profile (deploy region unioned in defensively), via
 `collectArnsForTier` reads `foundationModelArns`, so the IAM grant
 auto-covers all member regions on the next deploy. A catalog change touches
 IAM + the lambda bundle in **each per-tier stack**, so redeploy the affected
-`AgentEchelonTier-*` stack(s).
+`AgentEchelonClassification-*` stack(s).
 
 ```bash
-cd backend && npx cdk deploy AgentEchelonTier-Basic AgentEchelonTier-Standard AgentEchelonTier-Premium --require-approval never
+cd backend && npx cdk deploy AgentEchelonClassification-Basic AgentEchelonClassification-Standard AgentEchelonClassification-Premium --require-approval never
 ```
 
 ### Prevention
@@ -589,7 +589,7 @@ failing the post (the battle scorecard/name ride the Content marker, not
 Amazon Chime SDK Metadata; analytics also flows via the archival pipeline). Pinned
 by tests in `backend/test/lib/async-processor-battle.test.ts`.
 `async-processor-core.ts` is bundled into every tier's async processor, so
-redeploy the affected `AgentEchelonTier-*` stack(s).
+redeploy the affected `AgentEchelonClassification-*` stack(s).
 
 ### Prevention
 
@@ -684,7 +684,7 @@ re-created.
 #    Count router invocations vs. any "Welcome"/real-work log lines.
 MSYS_NO_PATHCONV=1 aws logs filter-log-events \
   --log-group-name "$(aws logs describe-log-groups \
-    --log-group-name-prefix /aws/lambda/AgentEchelonTier-Premium-AgentHandler \
+    --log-group-name-prefix /aws/lambda/AgentEchelonClassification-Premium-AgentHandler \
     --query 'logGroups[0].logGroupName' --output text)" \
   --start-time $(( ($(date +%s) - 600) * 1000 )) \
   --filter-pattern START --query 'length(events)'
@@ -774,7 +774,7 @@ greeting - `create-conversation` enrolls it explicitly, before the user joins.
 
 ## CDK / deploy notes
 
-- **Single-stack deploy:** `cd backend && npx cdk deploy <STACK> --require-approval never`. The ChannelFlowProcessor is in **`AgentEchelonChannelFlow`**; the experiments table + admin-experiments lambda in **`AgentEchelonExperiments`**; the battle tables + orchestrator in **`AgentEchelonBattle`**; each tier's async-processor + agent-handler lambdas in its own **`AgentEchelonTier-{Basic,Standard,Premium}`** stack. A model-catalog change touches IAM (via `collectArnsForTier`) **and** bundles into lambdas in every per-tier stack → redeploy the affected `AgentEchelonTier-*` stack(s).
+- **Single-stack deploy:** `cd backend && npx cdk deploy <STACK> --require-approval never`. The ChannelFlowProcessor is in **`AgentEchelonChannelFlow`**; the experiments table + admin-experiments lambda in **`AgentEchelonExperiments`**; the battle tables + orchestrator in **`AgentEchelonBattle`**; each tier's async-processor + agent-handler lambdas in its own **`AgentEchelonClassification-{Basic,Standard,Premium}`** stack. A model-catalog change touches IAM (via `collectArnsForTier`) **and** bundles into lambdas in every per-tier stack → redeploy the affected `AgentEchelonClassification-*` stack(s).
 - **Verify the deploy actually applied:** a stack can be `UPDATE_COMPLETE` yet stale. Confirm the Lambda's `LastModified` advanced past "now":
   ```bash
   aws lambda get-function-configuration \
@@ -825,9 +825,9 @@ is not.
 
 ```bash
 # 1. Confirm the handler never ran (0 START events = it never reached Bedrock).
-fnlog AgentEchelonTier-Premium AgentHandler 10m   # expect near-zero events
+fnlog AgentEchelonClassification-Premium AgentHandler 10m   # expect near-zero events
 # 2. Is the handler VPC-attached? A non-empty VpcId is the smoking gun.
-aws lambda get-function-configuration --function-name "$(res AgentEchelonTier-Premium AgentHandler)" \
+aws lambda get-function-configuration --function-name "$(res AgentEchelonClassification-Premium AgentHandler)" \
   --query '{Vpc:VpcConfig.VpcId,LiveDrift:Environment.Variables.ENABLE_LIVE_DRIFT}'
 # 3. What endpoints does the VPC actually have?
 aws ec2 describe-vpc-endpoints --filters Name=vpc-id,Values=<VPC_ID> \
@@ -878,7 +878,7 @@ premium AgentHandler / AsyncProcessor log groups show ZERO events for the turn; 
 ```bash
 # Which tier's handler actually ran? Compare event counts per tier log group.
 for T in Basic Standard Premium; do
-  echo -n "$T: "; fnlog "AgentEchelonTier-$T" AgentHandler 6m | grep -c "START RequestId"
+  echo -n "$T: "; fnlog "AgentEchelonClassification-$T" AgentHandler 6m | grep -c "START RequestId"
 done
 ```
 

@@ -159,7 +159,7 @@ declined / abandoned), not the raw signal.
   the fire-time signal, plus `outcome` (`accepted` / `declined` /
   `rejected_in_new_channel` / `abandoned`), `rival_conversation_arn`,
   `was_explicit`, `correlation_id`.
-- Admin console: `frontend/src/components/admin/ConversationsTab.tsx` has a
+- Admin console: `frontend/packages/admin/src/components/admin/ConversationsTab.tsx` has a
   "Drift Detection" view; `driftBadge(score)` buckets the **cosine score**
   (>=0.7 High Drift / >=0.4 Moderate / else On Topic) and an unresolved-count
   badge. So the UI is coupled to a cosine number that the reasoning gate no

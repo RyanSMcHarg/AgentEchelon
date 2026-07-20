@@ -78,7 +78,7 @@ Two tag families exist, for two different jobs.
   the tag and not on metadata.
 - IAM enforces it: `tierChannelScopedAllow` grants channel actions only where
   `aws:ResourceTag/classification` is the caller's tier or below, fail-closed on an
-  untagged or higher-tier channel (`lib/stacks/agent-tier-common.ts`).
+  untagged or higher-tier channel (`lib/stacks/agent-classification-common.ts`).
 - Every channel-creation path must apply it (native, drift, federated, briefing). A channel
   created without it is inert to tier-capped callers by design; that is a bug in the
   creation path, not a safe default to rely on.

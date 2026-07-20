@@ -1,7 +1,7 @@
 # AgentEchelon Design System
 
 The design tokens and shared component classes described here are implemented in
-`frontend/src/styles/`. Some component CSS is still being migrated onto them - the
+`frontend/packages/shared/src/styles/`. Some component CSS is still being migrated onto them - the
 [Migration Guide](#migration-guide) below is the reference for bringing a component
 onto the system.
 
@@ -11,7 +11,7 @@ Enterprise AI platform that feels like Linear meets Vercel. Engineered precision
 
 ## Design Tokens
 
-All tokens are CSS custom properties defined in `frontend/src/styles/design-tokens.css`.
+All tokens are CSS custom properties defined in `frontend/packages/shared/src/styles/design-tokens.css`.
 
 ### Color System
 
@@ -46,7 +46,7 @@ All tokens are CSS custom properties defined in `frontend/src/styles/design-toke
 
 ## Shared Components
 
-Defined in `frontend/src/styles/components.css`:
+Defined in `frontend/packages/shared/src/styles/components.css`:
 
 ### Buttons
 

@@ -112,11 +112,11 @@ const analytics = analyticsMode === 'aurora'
   ? new AnalyticsStackAurora(app, 'Analytics', { chime, cognito })
   : new AnalyticsStack(app, 'Analytics', { chime, cognito });
 
-// Downstream stacks (e.g. the per-tier AgentEchelonTier-* stacks) take the
+// Downstream stacks (e.g. the per-tier AgentEchelonClassification-* stacks) take the
 // analytics stack as a dependency and use its exported interface
 // (kinesisStreamArn, summaryUpdaterLambdaArn, etc.). The interface is the same
 // for both modes; the implementation differs.
-const tierStack = new StandardTierStack(app, 'AgentEchelonTier-Standard', { chime, cognito, analytics });
+const tierStack = new StandardTierStack(app, 'AgentEchelonClassification-Standard', { chime, cognito, analytics });
 ```
 
 Both stacks implement a common `IAnalyticsStack` interface so downstream stacks (the per-tier assistant stacks, NotificationStack) don't need to know which mode is active.
@@ -416,14 +416,14 @@ AgentEchelon/
 │               ├── 001-initial.sql              # Core tables + indexes
 │               ├── 002-pgvector.sql             # Embeddings table + HNSW index
 │               └── 003-materialized-views.sql   # Daily metrics + agent performance
-├── frontend/src/components/admin/
+├── frontend/packages/admin/src/components/admin/
 │   ├── AdminDashboard.tsx                       # Aurora mode tabs
 │   ├── FlowsTab.tsx                             # Multi-turn flow evaluation
 │   ├── FlaggedResponsesTab.tsx                  # Review queue + approve/reject
 │   ├── GroundTruthTab.tsx                       # Human scoring + calibration
 │   ├── TasksTab.tsx                             # Task metrics + detail list
 │   └── ConversationsTab.tsx                     # Summaries + drift detection
-└── frontend/src/types/analytics.ts             # Full type system
+└── frontend/packages/shared/src/types/analytics.ts             # Full type system
 ```
 
 ### README Additions

@@ -1,6 +1,6 @@
 # Latency targets (industry-sourced)
 
-The admin console's latency targets (`frontend/src/components/admin/metricTargets.ts` and
+The admin console's latency targets (`frontend/packages/admin/src/components/admin/metricTargets.ts` and
 `LatencyTab.latencyColor`) are set to published industry standards, not to a self-imposed
 ceiling. This doc records the standards and how they map onto AgentEchelon so the numbers are
 defensible and reviewable.

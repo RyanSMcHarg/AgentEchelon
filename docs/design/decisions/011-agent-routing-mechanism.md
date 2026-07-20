@@ -3,10 +3,10 @@ title: "ADR-011: Agent routing mechanism - self-hosted vs managed agent runtime"
 status: Accepted - Option D (Converse + native tool use)
 related:
   - SPEC-PER-PROFILE-OWNERSHIP.md
-  - ../../backend/lib/stacks/basic-tier-stack.ts
-  - ../../backend/lib/stacks/standard-tier-stack.ts
-  - ../../backend/lib/stacks/premium-tier-stack.ts
-  - ../../backend/lib/stacks/agent-tier-common.ts
+  - ../../backend/lib/stacks/basic-classification-stack.ts
+  - ../../backend/lib/stacks/standard-classification-stack.ts
+  - ../../backend/lib/stacks/premium-classification-stack.ts
+  - ../../backend/lib/stacks/agent-classification-common.ts
   - ../../backend/lambda/src/router-agent-handler.ts
   - ../../backend/lambda/src/lib/async-processor-core.ts
 ---
@@ -467,7 +467,7 @@ whole docs. Use **tool-use retrieval** (fetch only when the model asks),
 - History window: `async-processor-core.ts` (`loadChannelHistory`)
 - Orchestration router: `router-agent-handler.ts` (lines cited in [Appendix D](#appendix-d--spike-results--code-evidence))
 - Resilience: `bedrock-resilience.ts` (`invokeBedrockWithFallback`)
-- Agent-role IAM: the per-tier stacks (`lib/stacks/{basic,standard,premium}-tier-stack.ts` + `agent-tier-common.ts`); guardrail ARN: `lib/constructs/bedrock-guardrails.ts`
+- Agent-role IAM: the per-tier stacks (`lib/stacks/{basic,standard,premium}-classification-stack.ts` + `agent-classification-common.ts`); guardrail ARN: `lib/constructs/bedrock-guardrails.ts`
 - Measurement script: `backend/scripts/spike-invoke-agent.ts`
 
 ## Open questions

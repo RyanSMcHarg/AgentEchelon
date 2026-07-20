@@ -191,7 +191,7 @@ AgentEchelon's dashboard tabs are plain React + custom SVG charts (no charting
 dependency) that fetch JSON from the analytics/admin endpoints with a bearer
 token. There are two ways to reuse them:
 
-- **Port the tabs.** Copy `frontend/src/components/admin/*` into your app and make
+- **Port the tabs.** Copy `frontend/packages/admin/src/components/admin/*` into your app and make
   two things injectable: the **API base URL** (today `VITE_*_API_URL`) and the
   **token/credential provider** (today `localStorage.idToken`). Point them at your
   proxy (Approach 2) or directly at AE (Approach 1). The chart/table primitives

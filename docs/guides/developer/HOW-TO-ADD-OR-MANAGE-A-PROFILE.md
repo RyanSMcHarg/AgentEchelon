@@ -21,7 +21,7 @@ The shipped platform separates the word "tier" into three config concepts
 The stack topology is **profile-as-data**: one shared
 `AssistantProfileStack` is parametrized by a `ProfileTopology` descriptor, and each
 profile lives in a thin subclass
-(`backend/lib/stacks/{basic,standard,premium}-tier-stack.ts`) that supplies its
+(`backend/lib/stacks/{basic,standard,premium}-classification-stack.ts`) that supplies its
 descriptor. One shared assistant Lambda (`assistant-async-processor.ts`) serves every
 profile and self-gates its capabilities on the profile's env. A profile-team change
 edits its descriptor and ships exactly that profile.
@@ -44,10 +44,10 @@ backend/
 │   ├── profile-registry.ts               ← the ONLY interpreter of a classification tag / clearance
 │   └── stacks/
 │       ├── assistant-profile-stack.ts    ← AssistantProfileStack + ProfileTopology (the shared body)
-│       ├── basic-tier-stack.ts           ← BasicTierStack: a thin ProfileTopology wrapper
-│       ├── standard-tier-stack.ts        ← StandardTierStack
-│       ├── premium-tier-stack.ts         ← PremiumTierStack
-│       └── agent-tier-common.ts          ← shared SSM keys + thin helpers (no class)
+│       ├── basic-classification-stack.ts           ← BasicTierStack: a thin ProfileTopology wrapper
+│       ├── standard-classification-stack.ts        ← StandardTierStack
+│       ├── premium-classification-stack.ts         ← PremiumTierStack
+│       └── agent-classification-common.ts          ← shared SSM keys + thin helpers (no class)
 └── lambda/src/
     ├── assistant-async-processor.ts      ← the ONE config-driven assistant (entry for every profile)
     └── lib/
@@ -55,9 +55,9 @@ backend/
         └── company-context.ts            ← classification-scoped S3 retrieval
 ```
 
-Ownership: a profile team owns its thin `*-tier-stack.ts` descriptor. The shared
+Ownership: a profile team owns its thin `*-classification-stack.ts` descriptor. The shared
 `assistant-profile-stack.ts` body, `assistant-async-processor.ts`,
-`async-processor-core.ts`, and `agent-tier-common.ts` change rarely; PRs touching them
+`async-processor-core.ts`, and `agent-classification-common.ts` change rarely; PRs touching them
 should ping every profile owner.
 
 ---
@@ -113,14 +113,14 @@ export const DEFAULT_TIER_MODEL_SELECTION: TierModelSelection = {
 
 For every model in `getModelCatalog`, decide whether `enterprise` is in its
 `allowedTiers`. By default it is a strict superset of premium. Also add `enterprise`
-to the `Tier` union in `agent-tier-common.ts` and the `ModelTier` union in
+to the `Tier` union in `agent-classification-common.ts` and the `ModelTier` union in
 `model-strategy.ts`.
 
 ### 1.3 Add the ProfileTopology descriptor + thin stack
 
 There is no per-profile processor to copy: the one `assistant-async-processor.ts`
-serves every profile. Create `backend/lib/stacks/enterprise-tier-stack.ts` mirroring
-`premium-tier-stack.ts`, and supply the descriptor:
+serves every profile. Create `backend/lib/stacks/enterprise-classification-stack.ts` mirroring
+`premium-classification-stack.ts`, and supply the descriptor:
 
 ```ts
 const ENTERPRISE_TOPOLOGY: ProfileTopology = {
@@ -153,7 +153,7 @@ env leaves those paths off, so its execution stays inside its own IAM role).
 ### 1.4 Wire the stack in `bin/backend.ts`
 
 ```ts
-import { EnterpriseTierStack } from '../lib/stacks/enterprise-tier-stack';
+import { EnterpriseTierStack } from '../lib/stacks/enterprise-classification-stack';
 
 const tierEnterpriseStack = new EnterpriseTierStack(app, `${STACK_PREFIX}Tier-Enterprise`, {
   ...tierSharedProps,
@@ -173,8 +173,8 @@ instance-derived: `AgentEchelon` for the default instance, and (e.g.) `Acme` for
 In `backend/test/cdk-synth.test.ts`, mirror the existing per-profile block:
 
 ```ts
-it('should synthesize AgentEchelonTier-Enterprise (no Bedrock Agent)', () => {
-  const stack = new EnterpriseTierStack(new cdk.App(), 'AgentEchelonTier-Enterprise', tierBasicProps);
+it('should synthesize AgentEchelonClassification-Enterprise (no Bedrock Agent)', () => {
+  const stack = new EnterpriseTierStack(new cdk.App(), 'AgentEchelonClassification-Enterprise', tierBasicProps);
   const template = Template.fromStack(stack);
   template.resourceCountIs('AWS::Bedrock::Agent', 0);
   template.hasResourceProperties('AWS::SSM::Parameter', { Name: '/agent-echelon/assistant/enterprise/processor-arn' });
@@ -357,7 +357,7 @@ cd backend && npx jest cdk-synth
 
 ## What NOT to touch from a profile file
 
-- `agent-tier-common.ts` (the SSM contract keys). Changing a key here silently breaks
+- `agent-classification-common.ts` (the SSM contract keys). Changing a key here silently breaks
   every profile and the shared router. Add a key if you genuinely need one; never rename
   or remove.
 - `assistant-profile-stack.ts` (the shared stack body) and `assistant-async-processor.ts`

@@ -82,7 +82,7 @@ measure - never `s.length`.
 
 The producing side guarantees each message is within the encoded caps and
 tags multi-part output with `responseGroup`. The consuming side
-(`frontend/src/utils/messageParser.ts` in the SPA; the embeddable widget for
+(`frontend/packages/shared/src/utils/messageParser.ts` in the SPA; the embeddable widget for
 host deployments) is responsible for: stripping `<!--...-->` markers, unwrapping
 the Lex `{"Messages":[...]}` envelope, the placeholder->final UPDATE in place, and
 regrouping `responseGroup` continuation parts. A new surface that renders
@@ -90,7 +90,7 @@ channel messages must honour all four or it will show raw markers, JSON
 envelopes, or split walls.
 
 **Rendering.** In the SPA, assistant replies render as **GFM Markdown**
-(`react-markdown` + `remark-gfm`, in `frontend/src/components/CollapsibleText.tsx`):
+(`react-markdown` + `remark-gfm`, in `frontend/packages/chat/src/components/CollapsibleText.tsx`):
 headings, lists, tables, fenced/inline code, and links. Raw HTML is escaped/ignored by
 default, so rendering is XSS-safe without a separate sanitizer. User messages stay plain
 text. A new surface should render assistant output as Markdown (and keep raw HTML off) for

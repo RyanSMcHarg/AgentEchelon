@@ -79,7 +79,7 @@ The current state of the art for prompt adherence and typography. External-HTTP 
 
 **API surface caveat (verify against current OpenAI docs).** The current shaper passes `response_format: 'b64_json'`. That field is documented for DALL-E 3 but **may not be honored by `gpt-image-1`**, which is OpenAI's post-2024 image model and returns base64 by default. OpenAI's APIs generally tolerate extra fields, but if a future surface change starts returning hosted URLs instead of inline base64, the parser will currently return empty. The parser would need a URL-handling branch (the FAL parser already does this pattern) - small change, not yet implemented. Watch the first live invocation against `gpt-image-1` and confirm the response shape.
 
-Provision (the image-gen invocations are made from the shared `assistant-async-processor` Lambda - the premium profile's instance, whose topology is defined in `backend/lib/stacks/premium-tier-stack.ts` and wired by `backend/lib/stacks/assistant-profile-stack.ts`):
+Provision (the image-gen invocations are made from the shared `assistant-async-processor` Lambda - the premium profile's instance, whose topology is defined in `backend/lib/stacks/premium-classification-stack.ts` and wired by `backend/lib/stacks/assistant-profile-stack.ts`):
 
 1. Create an OpenAI account + API key at <https://platform.openai.com/api-keys>.
 2. Set the spend limit on the OpenAI side (separate from your AWS billing).

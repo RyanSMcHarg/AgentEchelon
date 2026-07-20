@@ -73,7 +73,7 @@ The implementation is Bedrock-native and multi-provider: OpenAI GPT-OSS, Amazon 
 
 The frontend mirrors this strategy in:
 
-- `frontend/src/config/modelStrategy.ts`
+- `frontend/packages/shared/src/config/modelStrategy.ts`
 
 That mirrored config powers the `Model Strategy` tab in the admin dashboard. It is currently read-only, but it gives admins a clear view of:
 

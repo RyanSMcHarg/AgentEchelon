@@ -303,9 +303,9 @@ The post-hoc analytics path (kinesis-archival's `detectDrift` call) does *not* s
 | `backend/lambda/src/lex-fulfillment.ts` (new) | Custom Lex fulfillment Lambda for the user-message path. Classifies intent → checks for explicit-routing fast-path → calls `detectDrift()` if not skipped → on drift, emits suggestion + persists `routingState` → on confirm/decline next turn, completes the flow → otherwise dispatches to the per-tier async processor via the shared router (`router-agent-handler.ts`). Feature-flagged by `enableLiveDrift` CDK context (default `false`; flip to `true` after dev validation). |
 | `backend/lambda/src/analytics-aurora/abandonment-detector.ts` (new) | Scheduled Lambda (EventBridge every 5 min) that writes `outcome='abandoned'` to stale `drift_events` rows. |
 | `backend/lib/stacks/analytics-aurora-stack.ts` | Wire the new Lambdas + scheduled rule + IAM grants. |
-| `backend/lib/stacks/{basic,standard,premium}-tier-stack.ts` | Wire the custom Lex intent + fulfillment Lambda into each tier's Lex bot (the FallbackIntent → shared router path), gated by the `enableLiveDrift` flag. |
-| `frontend/src/utils/messageParser.ts` | Parse `NAVIGATE_CHANNEL:<arn>\|<name>` marker for redirect suggestions. |
-| `frontend/src/providers/ConversationProvider.chime.tsx` | On a message carrying a NAVIGATE_CHANNEL marker, switch the active conversation when the user confirms. |
+| `backend/lib/stacks/{basic,standard,premium}-classification-stack.ts` | Wire the custom Lex intent + fulfillment Lambda into each tier's Lex bot (the FallbackIntent → shared router path), gated by the `enableLiveDrift` flag. |
+| `frontend/packages/shared/src/utils/messageParser.ts` | Parse `NAVIGATE_CHANNEL:<arn>\|<name>` marker for redirect suggestions. |
+| `frontend/packages/chat/src/providers/ConversationProvider.chime.tsx` | On a message carrying a NAVIGATE_CHANNEL marker, switch the active conversation when the user confirms. |
 
 ### Tests
 

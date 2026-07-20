@@ -40,8 +40,8 @@ The key insight: **Cognito Identity Pools don't care where the token comes from.
 
 | File | Role | What changes per approach |
 |------|------|--------------------------|
-| `frontend/src/providers/AuthProvider.tsx` | User login, token management, refresh | Approach 1: minor changes. Approach 2: significant rewrite. |
-| `frontend/src/services/chimeService.ts` | Exchanges IdToken for AWS credentials via Identity Pool | Approach 1: change login key only. Approach 2: replace credential provider entirely. |
+| `frontend/packages/shared/src/providers/AuthProvider.tsx` | User login, token management, refresh | Approach 1: minor changes. Approach 2: significant rewrite. |
+| `frontend/packages/chat/src/services/chimeService.ts` | Exchanges IdToken for AWS credentials via Identity Pool | Approach 1: change login key only. Approach 2: replace credential provider entirely. |
 | `backend/lib/stacks/cognito-auth-stack.ts` | CDK stack: User Pool, Identity Pool, IAM roles | Approach 1: add OIDC/SAML provider to Identity Pool. Approach 2: replace User Pool with custom auth stack. |
 | `backend/lambda/cognito-triggers/post-confirmation.js` | Creates Amazon Chime SDK AppInstanceUser on signup | Both: adapt to your IdP's user lifecycle events. |
 
@@ -201,7 +201,7 @@ This trust policy already works for any IdP federated through Cognito Identity P
 
 ### Step 3: Update the frontend credential exchange
 
-In `frontend/src/services/chimeService.ts`, update the `logins` key to match your IdP:
+In `frontend/packages/chat/src/services/chimeService.ts`, update the `logins` key to match your IdP:
 
 ```typescript
 async initialize(idToken: string, userId: string): Promise<void> {
@@ -243,7 +243,7 @@ The login key format depends on your IdP type:
 
 ### Step 4: Update AuthProvider for your IdP's login flow
 
-Replace the Cognito-specific auth logic in `frontend/src/providers/AuthProvider.tsx` with your IdP's SDK. The key contract AuthProvider must fulfill:
+Replace the Cognito-specific auth logic in `frontend/packages/shared/src/providers/AuthProvider.tsx` with your IdP's SDK. The key contract AuthProvider must fulfill:
 
 ```typescript
 interface AuthContract {

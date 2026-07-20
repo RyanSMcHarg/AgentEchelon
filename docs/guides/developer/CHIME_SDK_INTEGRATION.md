@@ -25,7 +25,7 @@ ID, and the API URLs. See `frontend/.env.example` for the full list.
 
 ### Amazon Chime SDK service layer
 
-`frontend/src/services/chimeService.ts` wraps the SDK:
+`frontend/packages/chat/src/services/chimeService.ts` wraps the SDK:
 
 - **Initialize** - sets up the SDK clients with Cognito-vended credentials
 - **Create Conversation** - creates Amazon Chime SDK channels with model metadata

@@ -288,7 +288,7 @@ and enforcement layers are identical.
 | `backend/lambda/src/assistant-async-processor.ts` | The shared model-turn processor (one instance per profile, profile-pinned via env) |
 | `backend/lambda/src/lib/async-processor-core.ts` | The Converse tool loop, `applyInputGuardrail`/`applyOutputGuardrail`, `handleLongResponse` |
 | `backend/lambda/src/lib/intent-classifier.ts` | The separate request-category classifier |
-| Bot/Lex CDK wiring | `{tier}-tier-stack.ts` (Lex bot, `AppInstanceBot` `InvokedBy`, channel-flow association) |
+| Bot/Lex CDK wiring | `{tier}-classification-stack.ts` (Lex bot, `AppInstanceBot` `InvokedBy`, channel-flow association) |
 
 ## 9. Related
 

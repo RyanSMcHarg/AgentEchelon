@@ -1,4 +1,4 @@
-# SPEC: Per-profile ownership (`AgentEchelonTier-*`)
+# SPEC: Per-profile ownership (`AgentEchelonClassification-*`)
 
 **Status:** Implemented
 
@@ -7,7 +7,7 @@
 > body (`AssistantProfileStack`) is parametrized by a `ProfileTopology`, and each
 > profile lives in a thin subclass (`BasicTierStack` / `StandardTierStack` /
 > `PremiumTierStack`, one per file) that supplies its topology, with shared
-> constants in `agent-tier-common.ts`. This gives both independently-deployable
+> constants in `agent-classification-common.ts`. This gives both independently-deployable
 > *stacks* and independently-owned *config* - a change to one profile touches only
 > that profile's thin descriptor, not the shared body.
 >
@@ -16,18 +16,19 @@
 > **processor** (the shared `assistant-async-processor.ts`, one instance per
 > profile), not an agent.
 
-> Several code symbols keep the word `tier` for continuity (`*-tier-stack.ts`,
-> the `AgentEchelonTier-*` stack names, `agent-tier-common.ts`, `modelArnsForTier`,
-> the `context/{tier}/` S3 prefix); the concept they name is a **profile** /
-> **classification**. That code-level rename is tracked separately and does not
-> change any behavior described here.
+> The stacks, stack names, and shared-constants module are renamed to classification
+> (`*-classification-stack.ts`, the `AgentEchelonClassification-*` stack names,
+> `agent-classification-common.ts`). A few internal helper symbols and one storage prefix still read
+> `tier` for continuity (`modelArnsForTier`, `tierChannelScopedAllow`, the `context/{tier}/` S3
+> prefix); the concept they name is a **profile** / **classification**. Any remaining symbol rename
+> is tracked separately and does not change any behavior described here.
 
 ## Purpose
 
 Let each profile be an **independently-deployable, independently-ownable** unit.
-A team owns `AgentEchelonTier-Standard` end-to-end - its model choice, system
+A team owns `AgentEchelonClassification-Standard` end-to-end - its model choice, system
 prompt, tools, guardrail, Lex bot - and ships with `cdk deploy
-AgentEchelonTier-Standard` without touching basic, premium, or the shared platform,
+AgentEchelonClassification-Standard` without touching basic, premium, or the shared platform,
 and without read/write access to other profiles' resources. A single-account
 demo deployer still gets everything with one `cdk deploy --all`.
 
@@ -58,7 +59,7 @@ processor.
 | **Shared router** (`router-agent-handler`: classify intent → dispatch by `min(userTier,channelTier)`) | Holds the tier-comparison + intent→delivery/task logic; the router code is shared and deployed as one Lambda per profile stack |
 | `create-conversation`, DDB (`AgentTasks`/`UserTasks`/`BattleState`/`Experiments`), battle orchestrator | Cross-profile runtime + state |
 
-### Per-profile (`AgentEchelonTier-{Basic,Standard,Premium}`)
+### Per-profile (`AgentEchelonClassification-{Basic,Standard,Premium}`)
 
 | What | Why per-profile |
 |---|---|
@@ -113,20 +114,20 @@ backend/
 ├─ lib/config/profiles.ts                  the config: classifications + profiles + groupClearance
 ├─ lib/profile-registry.ts                 the ONLY interpreter of a classification tag / clearance
 └─ lib/stacks/
-   ├─ agent-tier-common.ts                 SHARED: SSM contract keys + thin helpers
+   ├─ agent-classification-common.ts                 SHARED: SSM contract keys + thin helpers
    │                                       (resolveSharedSSM, modelArnsForTier,
    │                                        tierBotArnKey, tierProcessorArnKey). No class.
    ├─ assistant-profile-stack.ts  class AssistantProfileStack   ← the SHARED body, parametrized
    │                                                              by a ProfileTopology descriptor.
-   ├─ basic-tier-stack.ts      class BasicTierStack     ← thin wrapper: supplies the profile's
-   ├─ standard-tier-stack.ts   class StandardTierStack     ProfileTopology; team-owned.
-   └─ premium-tier-stack.ts    class PremiumTierStack
+   ├─ basic-classification-stack.ts      class BasicTierStack     ← thin wrapper: supplies the profile's
+   ├─ standard-classification-stack.ts   class StandardTierStack     ProfileTopology; team-owned.
+   └─ premium-classification-stack.ts    class PremiumTierStack
 ```
 
 One shared stack body, one thin descriptor file per profile. The divergence
 (model, sizing, guardrails, context routing, persona/pack params, image gen,
 streaming, battle) is DATA in the `ProfileTopology`, not three code copies. A
-basic-team change touches exactly its descriptor in `basic-tier-stack.ts`;
+basic-team change touches exactly its descriptor in `basic-classification-stack.ts`;
 standard / premium / the shared body / the platform are untouched. One shared
 `assistant-async-processor.ts` serves every profile and self-gates its
 capabilities on the env each topology flag sets.
@@ -134,7 +135,7 @@ capabilities on the env each topology flag sets.
 ### What each profile stack instantiates
 
 ```
-AgentEchelonTier-{Basic|Standard|Premium}        driven by that profile's ProfileTopology
+AgentEchelonClassification-{Basic|Standard|Premium}        driven by that profile's ProfileTopology
 ├─ AsyncProcessor Lambda  (entry: lambda/src/assistant-async-processor.ts - shared)
 │   env: PROFILE_NAME, BATTLE_ELIGIBLE, MAX_TOKENS, CONTEXT_BUCKET, MODEL_ID/NAME,
 │        GUARDRAIL_ID/VERSION, APP_INSTANCE_ARN, *_TABLE (richProcessor), CN/battle env (per flag)
@@ -177,7 +178,7 @@ verifies tier isolation. Premium is the trickiest coupling because it carries th
 
 ## Design decisions
 
-- **`AgentEchelonTier-*` are separate stacks**, not a single shared stack, so
+- **`AgentEchelonClassification-*` are separate stacks**, not a single shared stack, so
   ownership is independent per tier.
 - **Cognito stays shared and decoupled from bots/assistants** - added auth
   methods (SAML/OIDC/custom) don't touch profile stacks.

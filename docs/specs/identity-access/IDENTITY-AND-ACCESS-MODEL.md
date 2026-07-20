@@ -30,7 +30,7 @@
 | **Data-plane creds**    | **Credential exchange** (STS rung roles, bearer-pinned) | The *only* way the SPA gets Amazon Chime SDK creds; caps by classification | `cognito-auth-stack.ts` `grantPinnedExchangePermissions`, `credential-exchange.ts`, `SPEC-CREDENTIAL-EXCHANGE.md` |
 | **Identity-Pool roles** | `AuthenticatedRole` + per-tier roles                    | **Empty** - principal resolution only, no Amazon Chime SDK power           | `cognito-auth-stack.ts` `makeTierRole`                                                                            |
 | **Administration identity** | Per-human `${sub}-admin` (client-side) + service `app-instance-admin` (automation) | Cross-channel redact **and** delete                             | `credential-exchange.ts`, `SPEC-ADMIN-IDENTITY.md`, `SPEC-MODERATION.md`                                          |
-| **Channel boundary**    | IAM `aws:ResourceTag/classification` on channel actions | min(userTier, channelTier), fail-closed ALLOW                   | `agent-tier-common.tierChannelScopedAllow`                                                                        |
+| **Channel boundary**    | IAM `aws:ResourceTag/classification` on channel actions | min(userTier, channelTier), fail-closed ALLOW                   | `agent-classification-common.tierChannelScopedAllow`                                                                        |
 
 Two facts most readers get wrong, both verified in code:
 
@@ -178,18 +178,18 @@ Per-tier assistant (the async-processor / handler role, acting as the tier's **b
 
 | Capability / resource | Basic asst | Standard asst | Premium asst | Enforced by |
 |---|:--:|:--:|:--:|---|
-| Send/read on channels **≤ its tier** (bot bearer, tag-gated) | basic | basic, standard | basic, standard, premium | `tierChannelScopedAllow` on the tier role (`agent-tier-common.ts:115`); bearer pinned to `/bot/*` |
+| Send/read on channels **≤ its tier** (bot bearer, tag-gated) | basic | basic, standard | basic, standard, premium | `tierChannelScopedAllow` on the tier role (`agent-classification-common.ts:115`); bearer pinned to `/bot/*` |
 | **Redact** messages in its own channels (moderator) | ✅ | ✅ | ✅ | Amazon Chime SDK moderator (bot is channel creator) + `RedactChannelMessage` in tier role |
 | **Delete** a message | - | - | - | `DeleteChannelMessage` is AppInstanceAdmin-only; assistants are not admins |
-| Create channel / add members / set moderator | ✅ | ✅ | ✅ | tier role grant on `appInstance/*` (`agent-tier-common.ts:395-401`) |
-| Read `context/basic/*` | ✅ | ✅ | ✅ | `ContextS3Read` (`*-tier-stack.ts`) |
+| Create channel / add members / set moderator | ✅ | ✅ | ✅ | tier role grant on `appInstance/*` (`agent-classification-common.ts:395-401`) |
+| Read `context/basic/*` | ✅ | ✅ | ✅ | `ContextS3Read` (`*-classification-stack.ts`) |
 | Read `context/standard/*` | - | ✅ | ✅ | `ContextS3Read` prefix scoping |
 | Read `context/premium/*` | - | - | ✅ | `ContextS3Read` prefix scoping |
 | Read `attachments/*` - **the sender's own only** | - | ✅ | ✅ | IAM prefix grant **+** app-layer `senderOwnsAttachmentKey` (per-user object authz) |
 | Write `generated-docs/*` (document mode) | - | ✅ | ✅ | tier role `s3:PutObject` |
 | Read/write `battle-images/*` (`/battle` image gen) | - | - | ✅ | premium role only |
 | KB retrieval - Aurora pgvector, **tier-filtered** | ✅¹ | ✅¹ | ✅¹ | SQL `metadata->>'tier' = ANY(tierScope)` (`document-retrieval.ts`); router builds `tierScope` |
-| Embeddings (`amazon.titan-embed-text-v2`) | ✅ | ✅ | ✅ | `bedrock:InvokeModel` scoped to titan-embed (`agent-tier-common.ts:524`) |
+| Embeddings (`amazon.titan-embed-text-v2`) | ✅ | ✅ | ✅ | `bedrock:InvokeModel` scoped to titan-embed (`agent-classification-common.ts:524`) |
 
 **Users, by contrast (data plane), in this deployment:** **no** direct `context/*`, `attachments/*`, `generated-docs/*`, `battle-images/*`, or KB read; users see context only as prose the assistant writes back into the channel. **This is deployment-specific, not a law of the design** - see the shared-knowledge note above: a use case whose context is a wiki or published posts grants users direct, role-gated read of the same source. The service `app-instance-admin` also has **no** context/KB grant - it reviews history through the analytics **archive** (Athena/Aurora), a separate admin-only role, not the context store.
 

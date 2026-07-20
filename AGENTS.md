@@ -82,7 +82,7 @@ state.
 ### Backend CDK Stacks
 
 The backend is composed of independently-deployable feature stacks rather than one monolith:
-`/battle` is `AgentEchelonBattle`; each assistant tier is its own `AgentEchelonTier-*` stack
+`/battle` is `AgentEchelonBattle`; each assistant tier is its own `AgentEchelonClassification-*` stack
 (owning its async processor, Lex bot, and AppInstanceBot); experiments are
 `AgentEchelonExperiments`; shared task tables plus create-conversation/add-agent are
 `AgentEchelonFoundations`. Each tier's code is independently owned. See
@@ -94,7 +94,7 @@ The backend is composed of independently-deployable feature stacks rather than o
 3. `AgentEchelonS3Storage`, file attachment bucket with presigned URLs
 4. `AgentEchelonFoundations`, shared task-tracking tables (`agent-tasks` + `user-tasks`) + the abuse-controls table (rate limit / spend budget / request dedup) + the conversation-actions audit table + create-conversation/add-agent + conversation-management (archive / remove-member / leave) APIs + their SSM contract (hosts no bot)
 5. `AgentEchelonExperiments`, A/B experiments table + admin-experiments API (`/admin/experiments`); publishes the experiments SSM contract
-6. `AgentEchelonTier-{Basic,Standard,Premium}`, per-profile assistant stacks: each is a thin subclass of the shared `AssistantProfileStack` supplying a `ProfileTopology`; the one shared `assistant-async-processor.ts` (self-hosted Converse tool loop, no Bedrock Agent) serves every profile, with per-profile context IAM + content guardrail + Lex bot + AppInstanceBot
+6. `AgentEchelonClassification-{Basic,Standard,Premium}`, per-profile assistant stacks: each is a thin subclass of the shared `AssistantProfileStack` supplying a `ProfileTopology`; the one shared `assistant-async-processor.ts` (self-hosted Converse tool loop, no Bedrock Agent) serves every profile, with per-profile context IAM + content guardrail + Lex bot + AppInstanceBot
 7. `AgentEchelonNotifications`, SES email identity + conversation sharing + proactive-briefing EventBridge workflow (`lambda/src/proactive-briefing.ts`; recipients/schedule via `briefingRecipients`/`briefingScheduleRate` context)
 8. `AgentEchelonChannelFlow`, Channel Flow Processor for @all + /battle routing + message filtering
 9. `AgentEchelonFrontend`, the default production frontend hosting: private S3 origin + CloudFront (OAC, SPA error mapping, security response headers, managed-rules WAF on by default). Provisions an EMPTY bucket + distribution; the Vite build is synced out-of-band by `npm run deploy-frontend` (it bakes in CDK outputs, so a BucketDeployment cannot run inside the stack). After first deploy, set `--context appUrl=https://<DistributionUrl>` and redeploy so backend CORS allows the app origin. See `docs/guides/user/FRONTEND-DEPLOY.md`.
@@ -112,12 +112,12 @@ The backend is composed of independently-deployable feature stacks rather than o
 
 | Path | Contents |
 |------|----------|
-| `frontend/src/components/` | React UI components |
-| `frontend/src/components/admin/` | Admin dashboard sections including Overview, Conversations, Quality, Models, Experiments, Users, and Membership Audit (Layer 6 review plus the report-only vs auto-revoke toggle). See `docs/guides/admin/ADMIN-GUIDE.md`, `docs/specs/admin-console/SPEC-ADMIN-CONSOLE.md`, `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md`, `docs/specs/identity-access/SPEC-MODERATION.md`. |
-| `frontend/src/providers/` | Context providers (auth, messaging, conversations) |
-| `frontend/src/services/` | Backend integration (Amazon Chime SDK, S3, analytics) |
-| `frontend/src/types/` | TypeScript types (including full Aurora analytics types) |
-| `frontend/src/utils/` | Message parsing utilities |
+| `frontend/packages/chat/src/components/` | React UI components |
+| `frontend/packages/admin/src/components/admin/` | Admin dashboard sections including Overview, Conversations, Quality, Models, Experiments, Users, and Membership Audit (Layer 6 review plus the report-only vs auto-revoke toggle). See `docs/guides/admin/ADMIN-GUIDE.md`, `docs/specs/admin-console/SPEC-ADMIN-CONSOLE.md`, `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md`, `docs/specs/identity-access/SPEC-MODERATION.md`. |
+| `frontend/packages/{chat,shared}/src/providers/` | Context providers (auth, messaging, conversations) |
+| `frontend/packages/{admin,chat,shared}/src/services/` | Backend integration (Amazon Chime SDK, S3, analytics) |
+| `frontend/packages/shared/src/types/` | TypeScript types (including full Aurora analytics types) |
+| `frontend/packages/{chat,shared}/src/utils/` | Message parsing utilities |
 | `backend/lib/stacks/` | CDK stack definitions |
 | `backend/lib/interfaces/` | Shared interfaces (IAnalyticsStackOutputs) |
 | `backend/lambda/` | Lambda handlers (3-tier agents, Cognito triggers, presigned URL) |

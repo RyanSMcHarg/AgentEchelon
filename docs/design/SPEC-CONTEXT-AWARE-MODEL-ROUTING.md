@@ -250,9 +250,9 @@ it. No new transport.
 
 ## Admin console & testing impacts
 
-**AE operator console** (`frontend/src/components/admin/*` - Overview / Conversations / Quality /
+**AE operator console** (`frontend/packages/admin/src/components/admin/*` - Overview / Conversations / Quality /
 Models / Experiments / Users):
-- **Models / Model Strategy tab** (read-only mirror `frontend/src/config/modelStrategy.ts`): add
+- **Models / Model Strategy tab** (read-only mirror `frontend/packages/shared/src/config/modelStrategy.ts`): add
   **provider posture** (which catalog entries are external / non-AWS), `workingLanguage`, and the
   new **context rules** (e.g. `segment.country === 'CN'` → plan). Read-only is fine for v1; the
   mirror config gains `provider` / `workingLanguage` / `external` / `costRateCard` fields to match

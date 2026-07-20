@@ -187,7 +187,7 @@ agentechelon/
 │   ├── lib/stacks/           # Modular CDK stacks
 │   │   ├── chime-messaging-stack.ts
 │   │   ├── foundations-stack.ts
-│   │   ├── {basic,standard,premium}-tier-stack.ts
+│   │   ├── {basic,standard,premium}-classification-stack.ts
 │   │   ├── experiments-stack.ts
 │   │   ├── battle-stack.ts
 │   │   ├── cognito-auth-stack.ts

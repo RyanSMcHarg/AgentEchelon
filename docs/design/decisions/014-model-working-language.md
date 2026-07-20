@@ -67,7 +67,7 @@ spec, not this ADR - this ADR is only about the per-model attribute.
   already-resolved model definition; no new lookup path. This is what lets a
   deployment optimise model-per-locale in context (the accuracy benefit in the
   spec's "User benefits").
-- **Frontend mirror.** `frontend/src/config/modelStrategy.ts` mirrors the catalog
+- **Frontend mirror.** `frontend/packages/shared/src/config/modelStrategy.ts` mirrors the catalog
   for the admin "Model Strategy" tab; it gains the field too (read-only display),
   consistent with how the mirror already shows strengths/tiers.
 

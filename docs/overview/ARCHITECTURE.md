@@ -205,8 +205,8 @@ Eleven stacks deploy in both modes (ChimeMessaging, CognitoAuth, S3Storage, Foun
 | Refresh token expired (30 days) | `REFRESH_TOKEN_AUTH` returns `NotAuthorizedException` → user must re-login |
 
 **Key files:**
-- `frontend/src/providers/AuthProvider.tsx` - Cognito auth, token management, refresh logic
-- `frontend/src/providers/AwsClientProvider.tsx` - Identity Pool → IAM credentials → SDK clients
+- `frontend/packages/shared/src/providers/AuthProvider.tsx` - Cognito auth, token management, refresh logic
+- `frontend/packages/chat/src/providers/AwsClientProvider.tsx` - Identity Pool → IAM credentials → SDK clients
 - `backend/lib/stacks/cognito-auth-stack.ts` - User Pool, Identity Pool, Lambda triggers
 - `backend/lambda/cognito-triggers/post-confirmation.js` - Creates Amazon Chime SDK AppInstanceUser on signup
 
@@ -314,10 +314,10 @@ This is the core flow: user sends a message and receives an AI response.
 | Async processor fails | Placeholder message stays as-is (user sees "One moment..." indefinitely - no automatic error recovery) |
 
 **Key files:**
-- `frontend/src/components/MessageInput.tsx` - User input, file attachment, send button
-- `frontend/src/providers/ConversationProvider.chime.tsx` - `sendMessage()`, message state
-- `frontend/src/providers/MessagingProvider.tsx` - WebSocket session, message callbacks
-- `frontend/src/utils/messageParser.ts` - Strip metadata markers before display
+- `frontend/packages/chat/src/components/MessageInput.tsx` - User input, file attachment, send button
+- `frontend/packages/chat/src/providers/ConversationProvider.chime.tsx` - `sendMessage()`, message state
+- `frontend/packages/chat/src/providers/MessagingProvider.tsx` - WebSocket session, message callbacks
+- `frontend/packages/shared/src/utils/messageParser.ts` - Strip metadata markers before display
 - `backend/lambda/src/router-agent-handler.ts` - Shared Lex fulfillment: tier resolution (`min(userTier, channelTier)`), intent classification, delivery selection, dispatch to the per-tier processor (ARN from SSM)
 - `backend/lambda/src/channel-flow-processor.ts` - Runs first on every message; `@all`/`@everyone` invokes the async processor directly (bypassing Lex)
 - `backend/lambda/src/assistant-async-processor.ts` - The single config-driven assistant processor (one instance deployed per profile; self-gates its capabilities on the profile env)
@@ -450,9 +450,9 @@ A classification experiment cannot run alongside an intent or base-model experim
 ```
 
 **Key files:**
-- `frontend/src/services/attachmentService.ts` - Upload/download via presigned URLs
-- `frontend/src/components/FileUploadPreview.tsx` - Drag-and-drop preview
-- `frontend/src/components/AttachmentDisplay.tsx` - Renders attachment in message
+- `frontend/packages/chat/src/services/attachmentService.ts` - Upload/download via presigned URLs
+- `frontend/packages/chat/src/components/FileUploadPreview.tsx` - Drag-and-drop preview
+- `frontend/packages/chat/src/components/AttachmentDisplay.tsx` - Renders attachment in message
 - `backend/lambda/presigned-url/index.js` - Generates S3 presigned URLs
 - `backend/lib/stacks/s3-storage-stack.ts` - S3 bucket + CORS + presigned URL API
 
@@ -514,8 +514,8 @@ Lambda, `create-conversation`, and `router-agent-handler` all independently
 check it. See `docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md`.
 
 **Key files:**
-- `frontend/src/components/ShareConversationModal.tsx` - Share UI + emailSent warning
-- `frontend/src/App.tsx` - `?conversation=X` deep-link handler
+- `frontend/packages/chat/src/components/ShareConversationModal.tsx` - Share UI + emailSent warning
+- `frontend/packages/chat/src/App.tsx` - `?conversation=X` deep-link handler
 - `backend/lambda/share-conversation/index.js` - tier gate + announce + summary + SES
 - `backend/lib/stacks/notification-stack.ts` - SES identity + IAM + API Gateway
 - `backend/lambda/src/router-agent-handler.ts` - `min(userTier, channelTier)` enforcement
@@ -633,8 +633,8 @@ reuses the existing Bedrock and Secrets endpoints, adding no new VPC endpoints (
 - `backend/lambda/src/analytics-aurora/analytics-query.ts` - Dashboard query API
 - `backend/lambda/src/analytics-aurora/drift-detection.ts` - Topic drift detection
 - `backend/lambda/src/analytics-aurora/cross-conversation-context.ts` - pgvector search
-- `frontend/src/components/admin/AdminDashboard.tsx` - Dashboard shell (tab routing)
-- `frontend/src/services/analyticsService.ts` - Analytics API client
+- `frontend/packages/admin/src/components/admin/AdminDashboard.tsx` - Dashboard shell (tab routing)
+- `frontend/packages/admin/src/services/analyticsService.ts` - Analytics API client
 
 **Aurora-mode add-ons (opt-in, same stack):**
 - **Out-of-band message analytics (A/B + metadata-cap decoupling).** Heavy per-message analytics - per-step execution telemetry and the full analytics blob - are written to a `MessageAnalytics` DynamoDB table keyed by message id (keeping the Amazon Chime SDK `Metadata` under its ~1 KB cap), and the archival Lambda merges them back on ingest; surfaced via `/analytics/execution-steps` (admin **Steps** tab). Per-variant experiment results also fold in **real human signals** - thumbs (from the feedback table) and `/battle` wins (from the BattleOutcome table) - via read-time scans over the VPC DynamoDB gateway endpoint. See `docs/specs/conversation-messaging/SPEC-MESSAGE-METADATA-CODEBOOK.md`.
@@ -676,17 +676,17 @@ If a provider fails to initialize, everything below it is unavailable. The `Conn
 | Change the AI system prompt | `backend/lambda/src/assistant-async-processor.ts` (the profile's `DEFAULT_PROMPTS` entry, or the SSM persona param) |
 | Add a new intent | `backend/lambda/src/lib/intent-classifier.ts` → `delivery-options.ts`; for its model route, `backend/lib/config/model-strategy.ts` (`INTENT_ROUTE_STRATEGY`) |
 | Add a new user tier | [Customization Guide in README](../../README.md#adding-a-new-user-tier) |
-| Change the auth flow | `frontend/src/providers/AuthProvider.tsx` + `backend/lib/stacks/cognito-auth-stack.ts` |
-| Add an admin dashboard tab | `frontend/src/components/admin/` + `AdminDashboard.tsx` |
+| Change the auth flow | `frontend/packages/shared/src/providers/AuthProvider.tsx` + `backend/lib/stacks/cognito-auth-stack.ts` |
+| Add an admin dashboard tab | `frontend/packages/admin/src/components/admin/` + `AdminDashboard.tsx` |
 | Modify the analytics pipeline | `backend/lib/stacks/analytics-stack.ts` (Athena) or `analytics-stack-aurora.ts` (Aurora) |
-| Change file upload limits | `frontend/src/services/attachmentService.ts` |
+| Change file upload limits | `frontend/packages/chat/src/services/attachmentService.ts` |
 | Debug message delivery | `backend/lambda/src/lib/async-processor-core.ts` → CloudWatch Logs |
-| Debug auth token issues | `frontend/src/providers/AuthProvider.tsx` → browser console |
+| Debug auth token issues | `frontend/packages/shared/src/providers/AuthProvider.tsx` → browser console |
 | Understand the database schema | `backend/lambda/src/analytics-aurora/schema/001-initial.sql` |
 | Run E2E tests | `tests/e2e/` → `npm test` (requires deployed backend) |
 | Run backend unit tests | `backend/test/` → `npm test` |
 | Review security posture | Security Model section below + `docs/guides/developer/SECURITY-NPM-SUPPLY-CHAIN.md` |
-| Apply design tokens | `frontend/src/styles/design-tokens.css` → [DESIGN-SYSTEM.md](../guides/developer/DESIGN-SYSTEM.md) |
+| Apply design tokens | `frontend/packages/shared/src/styles/design-tokens.css` → [DESIGN-SYSTEM.md](../guides/developer/DESIGN-SYSTEM.md) |
 
 ---
 
@@ -841,7 +841,7 @@ This is a significant gap for production use.
 
 ## Frontend Styling
 
-All UI components use CSS custom properties (design tokens) defined in `frontend/src/styles/design-tokens.css`. Component-specific styles live in co-located `.css` files (e.g., `MessageInput.css` next to `MessageInput.tsx`).
+All UI components use CSS custom properties (design tokens) defined in `frontend/packages/shared/src/styles/design-tokens.css`. Component-specific styles live in co-located `.css` files (e.g., `MessageInput.css` next to `MessageInput.tsx`).
 
 Status colors in admin dashboard tabs use `var(--status-good)`, `var(--status-warn)`, `var(--status-bad)`, `var(--status-info)`, and `var(--status-neutral)` tokens rather than hardcoded hex values.
 

@@ -7,11 +7,11 @@
 **Author:** Ryan McHarg
 
 **Related:**
-- `frontend/src/App.tsx:15` - `AdminDashboard` is statically imported; `App.tsx:78-99,183-190` - the `?admin` URL state and the inline admin-vs-chat branch that bundles both into one SPA
-- `frontend/src/components/Header.tsx` - the Admin button (a chat-app component); the chat app drops it entirely after the split
-- `frontend/src/components/admin/AdminDashboard.tsx` - the console container (7 sections, 17 sub-tabs, `QUERIES_BY_TAB` fan-out)
-- `frontend/src/providers/AuthProvider.tsx:211-218` - `isAdmin` decoded from `cognito:groups` (present but unused as a UI gate)
-- `frontend/src/services/chimeService.ts:82-125,777-837` - `vendAdminCreds` / `adminClientFor` / the client-side admin-action ops (admin plane) sharing the chat client module
+- `frontend/packages/chat/src/App.tsx:15` - `AdminDashboard` is statically imported; `App.tsx:78-99,183-190` - the `?admin` URL state and the inline admin-vs-chat branch that bundles both into one SPA
+- `frontend/packages/chat/src/components/Header.tsx` - the Admin button (a chat-app component); the chat app drops it entirely after the split
+- `frontend/packages/admin/src/components/admin/AdminDashboard.tsx` - the console container (7 sections, 17 sub-tabs, `QUERIES_BY_TAB` fan-out)
+- `frontend/packages/shared/src/providers/AuthProvider.tsx:211-218` - `isAdmin` decoded from `cognito:groups` (present but unused as a UI gate)
+- `frontend/packages/chat/src/services/chimeService.ts:82-125,777-837` - `vendAdminCreds` / `adminClientFor` / the client-side admin-action ops (admin plane) sharing the chat client module
 - `backend/lib/stacks/frontend-stack.ts`, `backend/lib/constructs/frontend-distribution.ts` - the single S3 plus CloudFront origin the split is modeled on
 - `backend/lib/constructs/admin-auth-mode.ts` - `adminApiMethodOptions()` / `adminAuthEnv()`; the `adminAuthMode` front-door flag (`ae-cognito` | `federated` | `service`)
 - `backend/lambda/src/lib/auth.ts:170,204` - the shared `callerIsAdmin` / `requireAdmin` gate every admin endpoint already routes through
@@ -51,7 +51,7 @@ What this spec adds is entirely on the frontend and deploy side: a second build 
 
 The split serves a larger goal: **AgentEchelon deploys in four ordered layers - foundations before interfaces, and admin separable from user at both - so the platform stands on its own and each interface is a pluggable, independently deployable (and replaceable) surface on top.** The intended deploy order is:
 
-1. **Core foundations (the AE platform).** The shared backend every conversation needs, independent of any interface: `AgentEchelonChimeMessaging`, `AgentEchelonCognitoAuth`, `AgentEchelonS3Storage`, `AgentEchelonFoundations` (task tables, abuse-controls, create-conversation and conversation-management APIs + their SSM contract), the per-profile assistant stacks (`AgentEchelonTier-*`), `AgentEchelonChannelFlow`, and the analytics / experiments / notifications backends. Nothing in this layer assumes a chat UI or an admin UI exists.
+1. **Core foundations (the AE platform).** The shared backend every conversation needs, independent of any interface: `AgentEchelonChimeMessaging`, `AgentEchelonCognitoAuth`, `AgentEchelonS3Storage`, `AgentEchelonFoundations` (task tables, abuse-controls, create-conversation and conversation-management APIs + their SSM contract), the per-profile assistant stacks (`AgentEchelonClassification-*`), `AgentEchelonChannelFlow`, and the analytics / experiments / notifications backends. Nothing in this layer assumes a chat UI or an admin UI exists.
 2. **Admin foundations (the admin backend plane).** The operator plane that is already separable today (see Design Anchor): the admin APIs (analytics query, admin-conversations, user-management, experiments), the `adminAuthMode` front door and its authorizers, the shared `requireAdmin` gate, and the `plane:'admin'` credential-exchange that vends the `${sub}-admin` admin identity. It depends only on core foundations and is fully usable with no AE frontend at all - a host can drive it from its own console.
 3. **User-facing chat interface.** The chat SPA (`AgentEchelonFrontend`), a pluggable surface over the core foundations. It carries zero admin code or endpoints (the outcome of this split) and can be swapped for any interface that speaks the same platform seams.
 4. **Admin interface.** The standalone admin console (`AgentEchelonAdminFrontend`, this spec), a pluggable surface over the admin foundations, gated on the `admins` group at its own origin, deployed last as its own step.
@@ -64,7 +64,7 @@ The split serves a larger goal: **AgentEchelon deploys in four ordered layers - 
 2. **`appUrl` is the single CORS `ALLOWED_ORIGIN`.** `appUrl` (`bin/backend.ts:140`) is threaded to every API Lambda's `ALLOWED_ORIGIN` (for example `analytics-stack-aurora.ts` around line 1597). A second origin is rejected by CORS until the allowlist is widened.
 3. **Shared `AuthProvider` plus `localStorage.idToken`.** Every admin service reads `localStorage.getItem('idToken')` directly (`analyticsService.ts`, `adminConversationService.ts`, `experimentService.ts`, `membershipAuditService.ts`, `feedbackService.ts`). The whole app is wrapped in one provider tree (`App.tsx:220-234`).
 4. **`chimeService.ts` mixes chat and admin.** The admin-action ops (`vendAdminCreds`, `adminClientFor`, `adminRedactMessage` / `adminDeleteMessage` / `adminRemoveMember` / `adminAddMember` / `adminListMembers`, `chimeService.ts:82-125,777-837`) live in the same module as chat messaging.
-5. **Shared types and i18n.** `frontend/src/types/analytics.ts` (imported by roughly 15 admin files) and `frontend/src/types/index.ts` are shared with chat; `frontend/src/locales/en.json` holds both chat and `admin.*` strings.
+5. **Shared types and i18n.** `frontend/packages/shared/src/types/analytics.ts` (imported by roughly 15 admin files) and `frontend/packages/shared/src/types/index.ts` are shared with chat; `frontend/packages/shared/src/locales/en.json` holds both chat and `admin.*` strings.
 6. **Admin entry gating lives in the chat app's Header.** The Admin button is a chat-app component; the standalone admin app must establish its own `admins`-group gate at its entry rather than inherit the chat Header.
 
 ## Target architecture

@@ -91,7 +91,7 @@ aws chime create-channel \
 ### IAM Policy Conditions: fail-closed ALLOW
 
 > **Two properties of this enforcement design - see
-> `agent-tier-common.tierChannelScopedAllow`:**
+> `agent-classification-common.tierChannelScopedAllow`:**
 >
 > 1. **Condition key is the GLOBAL `aws:ResourceTag/classification`, NOT
 >    `chime:ResourceTag`.** Amazon Chime exposes **no service-specific condition
@@ -155,11 +155,11 @@ tagged).
 
 ### CDK Implementation
 
-The boundary is defined once in `agent-tier-common.tierChannelScopedAllow(tier,
+The boundary is defined once in `agent-classification-common.tierChannelScopedAllow(tier,
 appInstanceArn, actions?)` and attached to the **credential-exchange rung roles**
 (`grantPinnedExchangePermissions` in `cognito-auth-stack.ts`, bearer-pinned to the
 caller's own `.../user/${aws:PrincipalTag/sub}`) and the **per-tier assistant roles**
-(`*-tier-stack.ts`). It is not on the per-tier Cognito Identity-Pool user roles:
+(`*-classification-stack.ts`). It is not on the per-tier Cognito Identity-Pool user roles:
 those are intentionally empty (`makeTierRole`), because the frontend reaches Amazon Chime SDK
 only through the exchange (there is no Identity-Pool Amazon Chime SDK fallback). See
 `docs/specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md` §8 (row 2). `tierChannelScopedAllow` is the sole enforced boundary; the former
@@ -235,7 +235,7 @@ mechanism as Layer 1 - the AWS-documented read-only-channel pattern (the blog re
 Approach 2). On archive, the backend sets an immutable `archived` tag on the channel, and a **Deny**
 on `chime:SendChannelMessage` + `chime:UpdateChannelMessage` conditioned on
 `aws:ResourceTag/archived == "true"` is layered onto both the per-tier assistant send grant and the
-user exchange creds (`agent-tier-common.archivedChannelReadOnlyDeny`). A Deny overrides the tag-gated
+user exchange creds (`agent-classification-common.archivedChannelReadOnlyDeny`). A Deny overrides the tag-gated
 ALLOW, so once the tag is set neither a member nor the assistant can send or edit - the channel is
 read-only by IAM, not by application logic. The app-instance-admin (admin-plane) bearer is
 deliberately un-tag-gated and stays exempt, so it can post the "archived by ..." system message.
@@ -638,7 +638,7 @@ The assistant embeds machine-readable control markers in a message's Content so 
 
 | Where | Mechanism | Effect on an injected marker |
 |-------|-----------|------------------------------|
-| Display (every client) | `frontend/src/utils/messageParser.ts` parses and strips known markers before render | Never shown as UI to another member |
+| Display (every client) | `frontend/packages/shared/src/utils/messageParser.ts` parses and strips known markers before render | Never shown as UI to another member |
 | Backend reads | `lambda/src/lib/message-markers.ts` strips ALL `<!--...-->` comments on every non-UI read (analytics, the LLM relevance judge, the admin conversation browser) | Never scored, never leaked into a prompt or an admin view |
 | Action path | Side-effect actions are keyed off assistant/model OUTPUT, not raw user input | A marker in a user message is never the trigger for an action |
 | Input filter | The tier Bedrock guardrail runs the `PROMPT_ATTACK` filter on user input (`async-processor-core.ts`) | Prompt-injection attempts are filtered before the model sees them |
@@ -654,7 +654,7 @@ The assistant embeds machine-readable control markers in a message's Content so 
 | `create-conversation/index.js` | Set `classification` in metadata AND channel tag |
 | `manage-conversation.ts` | Read metadata, validate tier before `CreateChannelMembership` |
 | `share-conversation/index.js` | Read metadata, validate recipient tier |
-| `agent-tier-common.ts` / `*-tier-stack.ts` / `cognito-auth-stack.ts` | The enforced tag-gate is `tierChannelScopedAllow` (fail-closed **Allow** on the global `aws:ResourceTag/classification`) attached to the exchange rung roles + per-profile assistant roles. |
+| `agent-classification-common.ts` / `*-classification-stack.ts` / `cognito-auth-stack.ts` | The enforced tag-gate is `tierChannelScopedAllow` (fail-closed **Allow** on the global `aws:ResourceTag/classification`) attached to the exchange rung roles + per-profile assistant roles. |
 | `cognito-auth-stack.ts` | Define per-tier Cognito groups; mirror `custom:tier` into the matching group at post-confirmation |
 | `assistant-profile-stack.ts` | Per-profile processor IAM roles with S3 prefix scoping (prefixes generated from config). Per-profile guardrails. |
 | `channel-flow-processor.ts` | Enforce mention-required responses in multi-user conversations (@assistant / @all) |

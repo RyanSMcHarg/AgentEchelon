@@ -46,7 +46,7 @@ So three boundaries do three different jobs: the IAM **tag condition** is the ti
 
 **Acting role.** The user's `basic` credential-exchange rung role, bearer-pinned to their own AppInstanceUser (`grantPinnedExchangePermissions`, `cognito-auth-stack.ts:403`). The SPA reaches Amazon Chime SDK only through this exchange; the Cognito Identity-Pool tier roles are empty (`makeTierRole`, `cognito-auth-stack.ts:342`).
 
-**Deciding policy** (`tierChannelScopedAllow('basic', …)`, `agent-tier-common.ts:115`):
+**Deciding policy** (`tierChannelScopedAllow('basic', …)`, `agent-classification-common.ts:115`):
 
 ```json
 {
@@ -66,7 +66,7 @@ So three boundaries do three different jobs: the IAM **tag condition** is the ti
 
 **Assistant experience.** The premium assistant never receives the message, so no turn is generated. Nothing to filter after the fact, because the message never enters the channel.
 
-**To customize.** The allowed set is `classificationsAllowedFor(tier)` (`agent-tier-common.ts`), which delegates to `ProfileRegistry.scopeAtOrBelow` over the classification ladder declared in `backend/lib/config/profiles.ts`. Add or reorder classifications by editing `classifications` + `groupClearance` in `profiles.ts` (that single edit also drives the Cognito group and the exchange rung). The tag itself is stamped immutably at channel creation by `create-conversation`.
+**To customize.** The allowed set is `classificationsAllowedFor(tier)` (`agent-classification-common.ts`), which delegates to `ProfileRegistry.scopeAtOrBelow` over the classification ladder declared in `backend/lib/config/profiles.ts`. Add or reorder classifications by editing `classifications` + `groupClearance` in `profiles.ts` (that single edit also drives the Cognito group and the exchange rung). The tag itself is stamped immutably at channel creation by `create-conversation`.
 
 ## A guest tries to read a channel they were not invited to
 
@@ -90,7 +90,7 @@ So three boundaries do three different jobs: the IAM **tag condition** is the ti
 
 **Attempt.** A `basic` user is added as a member of a `premium` channel, either by invite or by a direct Amazon Chime SDK API call.
 
-**Why IAM tags cannot fully prevent this.** `CreateChannelMembership` and `DeleteChannelMembership` authorize against the **bearer/user** resource (`<appInstance>/user/<id>`), which carries no `classification` tag. A tag condition on them would fail closed and break legitimate membership, so they are granted unconditioned (see the tag-gated-actions section and `agent-tier-common.ts:38-41`). Membership is therefore governed by three other mechanisms, not by the tag gate. This is the honest edge: the tier boundary on *messages* is provable IAM, but the boundary on *membership* is not, so it is defended in depth.
+**Why IAM tags cannot fully prevent this.** `CreateChannelMembership` and `DeleteChannelMembership` authorize against the **bearer/user** resource (`<appInstance>/user/<id>`), which carries no `classification` tag. A tag condition on them would fail closed and break legitimate membership, so they are granted unconditioned (see the tag-gated-actions section and `agent-classification-common.ts:38-41`). Membership is therefore governed by three other mechanisms, not by the tag gate. This is the honest edge: the tier boundary on *messages* is provable IAM, but the boundary on *membership* is not, so it is defended in depth.
 
 **Gate 1, synchronous app-layer admission (live).** Every path that adds a human validates `memberTier ≥ channelClassification` and refuses. The invite-by-email path (`share-conversation/index.js`) reads the recipient's authoritative Cognito-group tier, compares it to the channel's `modelTier`, and returns **403 `TIER_FORBIDDEN`** on a shortfall. `create-conversation` adds only the creator (over-tier creation already 403s), and the assistant-add paths add only the tier-matched bot, so no in-app path adds an under-tier human. This is application code, so it is defense in depth, not the provable IAM boundary.
 
@@ -112,7 +112,7 @@ Category 1 was about *being on* a channel. This category is about *what actions*
 
 ## The complete set of tag-gated actions (conditional denials)
 
-The `aws:ResourceTag/classification` condition applies to **channel-resource** actions only. The helper `tierChannelScopedAllow` (`agent-tier-common.ts:115`) can gate any of the ten actions in `TIER_GATED_CHANNEL_ACTIONS` (`agent-tier-common.ts:43`). This is the complete set of actions denied on a channel whose classification is above the caller's tier:
+The `aws:ResourceTag/classification` condition applies to **channel-resource** actions only. The helper `tierChannelScopedAllow` (`agent-classification-common.ts:115`) can gate any of the ten actions in `TIER_GATED_CHANNEL_ACTIONS` (`agent-classification-common.ts:43`). This is the complete set of actions denied on a channel whose classification is above the caller's tier:
 
 ```
 chime:SendChannelMessage
@@ -135,7 +135,7 @@ That list is the helper's full capability. Each principal is granted only the su
 | **Per-profile assistant** (processor role) | `SendChannelMessage`, `ListChannelMessages`, `GetChannelMessage`, `UpdateChannelMessage`, `DescribeChannel`, `UpdateChannel`. No `Redact` or `Delete`. | `assistant-profile-stack.ts` (`ProcessorRole` `ChimePolicy`) |
 | **Admin / guest rungs** | none tag-gated (the admin and `restricted` rungs are deliberately not tag-conditioned; see Category 4 and the guest example) | `cognito-auth-stack.ts:416-428` |
 
-**Deliberately not tag-gated, and why.** Actions that authorize against the **bearer** resource (`<appInstance>/user/<id>` or `<appInstance>/bot/<id>`) carry no classification tag, so adding a tag condition to them would fail closed and break them. These are membership management (`CreateChannelMembership`, `DeleteChannelMembership`), `DescribeChannelMembership`, and the profile and discovery actions. They are governed instead by Amazon Chime SDK's membership and moderator model plus the app-layer share and create gates. `ListChannelMemberships` is the exception that stays tag-gated because it is channel-scoped, not bearer-scoped (`agent-tier-common.ts:38-41`).
+**Deliberately not tag-gated, and why.** Actions that authorize against the **bearer** resource (`<appInstance>/user/<id>` or `<appInstance>/bot/<id>`) carry no classification tag, so adding a tag condition to them would fail closed and break them. These are membership management (`CreateChannelMembership`, `DeleteChannelMembership`), `DescribeChannelMembership`, and the profile and discovery actions. They are governed instead by Amazon Chime SDK's membership and moderator model plus the app-layer share and create gates. `ListChannelMemberships` is the exception that stays tag-gated because it is channel-scoped, not bearer-scoped (`agent-classification-common.ts:38-41`).
 
 ## Absolute denials: actions a rung simply never holds
 
@@ -170,7 +170,7 @@ The tag gate above is a *conditional* denial. Some denials are *absolute*: the a
 
 **Attempt.** A crafted message tries to get the premium assistant to act as a user, or as another user's identity (a confused-deputy or impersonation attempt). In AWS the generic way to become another identity is `sts:AssumeRole`, so the real question is not only "can the credentials name another bearer" but "can this actor obtain different credentials at all."
 
-**Acting role.** The premium `ProcessorRole`. Its channel grant pins the bearer to a **bot** resource, never a user (`bearerResources: ['<appInstance>/bot/*']`, `premium-tier-stack.ts:129`); user rungs pin the other way, to `<appInstance>/user/${aws:PrincipalTag/sub}` (`cognito-auth-stack.ts:387`). At the Amazon Chime SDK layer, Amazon Chime SDK binds `x-amz-chime-bearer` to the caller's authenticated identity, so an AppInstanceBot and an AppInstanceUser are distinct principals that cannot be swapped.
+**Acting role.** The premium `ProcessorRole`. Its channel grant pins the bearer to a **bot** resource, never a user (`bearerResources: ['<appInstance>/bot/*']`, `premium-classification-stack.ts:129`); user rungs pin the other way, to `<appInstance>/user/${aws:PrincipalTag/sub}` (`cognito-auth-stack.ts:387`). At the Amazon Chime SDK layer, Amazon Chime SDK binds `x-amz-chime-bearer` to the caller's authenticated identity, so an AppInstanceBot and an AppInstanceUser are distinct principals that cannot be swapped.
 
 **Deciding policy.** Two things have to hold, and both do:
 - **The bearer is pinned.** With the credentials it holds, the assistant can bear only its own bot identity, and a user can bear only their own `sub`. Neither names the other, and Amazon Chime SDK enforces the same binding.
@@ -182,7 +182,7 @@ The tag gate above is a *conditional* denial. Some denials are *absolute*: the a
 
 **Assistant experience.** The assistant always acts as its own bot identity; nothing it is told changes whose credentials it holds or lets it acquire different ones.
 
-**To customize.** Bearer pinning is set via the `bearerResources` option (`agent-tier-common.ts:128`); keep user rungs pinned to `sub` and assistant roles pinned to a bot. Do **not** grant `sts:AssumeRole` to the rung roles, and do **not** widen a rung role's trust policy beyond the exchange Lambda. The required `sub` tag on assumption is what keeps every minted session pinned.
+**To customize.** Bearer pinning is set via the `bearerResources` option (`agent-classification-common.ts:128`); keep user rungs pinned to `sub` and assistant roles pinned to a bot. Do **not** grant `sts:AssumeRole` to the rung roles, and do **not** widen a rung role's trust policy beyond the exchange Lambda. The required `sub` tag on assumption is what keeps every minted session pinned.
 
 ---
 
@@ -206,7 +206,7 @@ Beyond channels, an assistant is bounded in *which model* it may invoke and *wha
 }
 ```
 
-**Result: denied.** `modelArnsForTier('basic')` (`agent-tier-common.ts`, called from `assistant-profile-stack.ts`) resolves only the basic profile's model ARNs. A premium model ARN is not in the list, so `InvokeModel` on it is denied.
+**Result: denied.** `modelArnsForTier('basic')` (`agent-classification-common.ts`, called from `assistant-profile-stack.ts`) resolves only the basic profile's model ARNs. A premium model ARN is not in the list, so `InvokeModel` on it is denied.
 
 **User experience.** A basic user only ever receives answers from the basic model; the model selector in the console is scoped to their tier, so a higher model is not even offered.
 
@@ -275,7 +275,7 @@ The admin console requests this identity's credential from the Credential-Exchan
 | What context a tier's assistant may read | `ContextS3Read` `s3:prefix` list in each tier stack | The per-tier S3 read scope |
 | What the browser may do | `EXCHANGE_MSG_ACTIONS` (`cognito-auth-stack.ts`) | The action set on every user rung; keep destructive actions off it |
 | Who is an admin | `admins` group, `ADMIN_GROUP_NAMES` | Unlocks the cross-tier admin rung and the admin API |
-| Identity pinning | `bearerResources` (`agent-tier-common.ts`) | Which identity a role may bear; keep pinned |
+| Identity pinning | `bearerResources` (`agent-classification-common.ts`) | Which identity a role may bear; keep pinned |
 | Who can join a channel (guest admission) | channel membership via create-conversation / invite path | The Amazon Chime SDK-membership boundary for guests and shared channels |
 | Cross-tier membership control | `share-conversation` / `create-conversation` tier check, plus the Layer 6 Kinesis audit consumer | App gate refuses over-tier invites; the tag gate makes any out-of-band add inert; the audit revokes |
 | Preventing role escalation | rung-role trust policy + no `sts:AssumeRole` on rungs (`cognito-auth-stack.ts`) | Only the exchange Lambda may assume rung roles, always `sub`-pinned |
