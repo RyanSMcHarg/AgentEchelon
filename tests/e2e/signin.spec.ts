@@ -100,13 +100,17 @@ test.describe.serial('Sign In Flow', () => {
     await signIn(page, user.email, user.password);
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
 
-    // Premium users should see admin button
-    const adminButton = page.locator('button:has-text("Admin"), .admin-button');
-    const adminVisible = await adminButton.isVisible({ timeout: 5000 }).catch(() => false);
+    // A non-admin premium user must NOT see an admin affordance. Post the D split
+    // the chat app has no embedded admin console; the only admin affordance is an
+    // admin-ONLY link-out to the separate console (`.header-admin-link`, shown when
+    // VITE_ADMIN_APP_URL is set and user.isAdmin). A premium-but-not-admin user
+    // sees neither the old button nor the link.
+    const adminLink = page.locator('.header-admin-link');
+    const adminVisible = await adminLink.isVisible({ timeout: 5000 }).catch(() => false);
+    expect(adminVisible).toBe(false);
 
     console.log(`\n--- signin-premium ---`);
-    console.log(`Signed in as premium user: ${user.email}`);
-    console.log(`Admin button visible: ${adminVisible}`);
+    console.log(`Signed in as premium user: ${user.email} (no admin affordance, as expected)`);
   });
 
   test('should sign out successfully', async ({ page }) => {

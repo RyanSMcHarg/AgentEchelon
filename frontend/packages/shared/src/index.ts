@@ -38,6 +38,7 @@ export {
   USER_POOL_CLIENT_ID,
   CREDENTIAL_EXCHANGE_API_URL,
   ADMIN_IAM_ENFORCEMENT,
+  ADMIN_APP_URL,
 } from './platform/config';
 
 export { trackEvent, setAuthToken, trackPerformance, startTimer, endTimer, flushEvents } from './services/eventTrackingService';

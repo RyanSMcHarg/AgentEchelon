@@ -33,6 +33,16 @@ export const USER_POOL_CLIENT_ID =
 export const CREDENTIAL_EXCHANGE_API_URL = import.meta.env.VITE_CREDENTIAL_EXCHANGE_API_URL;
 
 /**
+ * The admin console's URL (the SEPARATE admin app, `AgentEchelonAdminFrontend`).
+ * The admin console is not a route in the chat SPA (SPEC-SEPARATE-ADMIN-APP.md);
+ * when this is set, the chat app shows an admin a LINK OUT to it (a plain URL, no
+ * operator code — `assert-no-admin-in-chat.mjs` stays satisfied). A deployer can
+ * point it at ANY admin surface they run (AE's own console, or one they build on
+ * the same admin APIs), so the operator interface stays pluggable. Unset = no link.
+ */
+export const ADMIN_APP_URL = import.meta.env.VITE_ADMIN_APP_URL || '';
+
+/**
  * A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): when `true`, the admin console
  * reaches the archive endpoints with SigV4-signed, IAM-authorized requests
  * instead of a Cognito JWT — `view-conversations`/`membership-history` signed

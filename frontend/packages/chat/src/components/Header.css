@@ -74,6 +74,7 @@
 }
 
 .header-admin-btn,
+.header-admin-link,
 .header-logout-btn {
   background: transparent;
   border: 1px solid var(--chrome-border);
@@ -91,7 +92,15 @@
   letter-spacing: var(--tracking-tight);
 }
 
+/* The admin link-out is an anchor styled as a button. */
+.header-admin-link {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+
 .header-admin-btn:hover,
+.header-admin-link:hover,
 .header-logout-btn:hover {
   background: var(--chrome-hover);
   border-color: var(--accent-500);

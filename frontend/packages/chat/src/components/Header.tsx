@@ -1,6 +1,6 @@
 import React from 'react';
 import { useTranslation } from 'react-i18next';
-import { useAuth } from '@ae/shared';
+import { useAuth, ADMIN_APP_URL } from '@ae/shared';
 import ConnectionStatus from './ConnectionStatus';
 import './Header.css';
 
@@ -34,6 +34,24 @@ const Header: React.FC<HeaderProps> = ({ onHome }) => {
           <ConnectionStatus />
         </div>
         <div className="header-actions">
+          {/*
+            Configurable LINK OUT to the admin console (SPEC-SEPARATE-ADMIN-APP.md).
+            The admin console is a separate app; this is only a URL, so the chat
+            bundle carries no operator code (assert-no-admin-in-chat.mjs). Shown to
+            admins when VITE_ADMIN_APP_URL is set; a deployer can point it at their
+            own admin surface. Opens in a new tab; the admin app enforces its own auth.
+          */}
+          {user?.isAdmin && ADMIN_APP_URL && (
+            <a
+              className="header-admin-link"
+              href={ADMIN_APP_URL}
+              target="_blank"
+              rel="noopener noreferrer"
+              title={t('header.admin')}
+            >
+              {t('header.admin')}
+            </a>
+          )}
           {user && (
             <button
               className="header-logout-btn"

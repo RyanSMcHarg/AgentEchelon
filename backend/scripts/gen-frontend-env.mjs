@@ -60,6 +60,11 @@ const OUTPUT_TO_VITE = {
   ChannelBattleApiUrl: 'VITE_CHANNEL_BATTLE_API_URL',
   BattleOutcomeApiUrl: 'VITE_BATTLE_OUTCOME_API_URL',
   ExperimentsApiUrl: 'VITE_EXPERIMENTS_API_URL',
+  // The separate admin console's URL (AgentEchelonAdminFrontend, prefix 'Admin').
+  // The CHAT app reads it to show admins a link OUT to the console (a URL only, no
+  // operator code). Absent until the admin frontend deploys (two-phase bootstrap);
+  // a deployer can also override VITE_ADMIN_APP_URL to point at their own console.
+  AdminDistributionUrl: 'VITE_ADMIN_APP_URL',
 };
 
 // Admin-ONLY Vite vars: the standalone admin console consumes these; the chat
@@ -88,6 +93,9 @@ const CHAT_ONLY = new Set([
   'VITE_ADD_BOT_API_URL',
   'VITE_SHARE_CONVERSATION_API_URL',
   'VITE_PRESIGNED_URL_API_URL',
+  // The admin-console LINK-OUT target: chat-only (the admin app does not link to
+  // itself). A URL string, not an admin endpoint, so it is safe in the chat .env.
+  'VITE_ADMIN_APP_URL',
   'VITE_SLEEP_MODE_ENABLED',
   'VITE_CLIENT_EVENTS_API_URL',
   'VITE_CHANNEL_BATTLE_API_URL',

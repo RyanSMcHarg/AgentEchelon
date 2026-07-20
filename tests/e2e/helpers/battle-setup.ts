@@ -40,21 +40,39 @@ export async function signInAdmin(page: Page): Promise<void> {
   await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
 }
 
+// The admin console is its own app on its own origin (SPEC-SEPARATE-ADMIN-APP.md).
+// Experiment SETUP happens on the admin origin; the battle DUEL runs on the chat
+// origin. That makes this a CROSS-ORIGIN flow with per-origin auth.
+// >>> DEPLOY-VERIFY REQUIRED: this cross-origin path (admin-origin setup + chat-origin
+//     duel + a sign-in on each origin) has not been run end-to-end; confirm on a
+//     battle-enabled deploy with BATTLE_E2E=1. The old-structure selectors
+//     (admin-button, admin-back-btn) are removed; the two-origin handling below is
+//     the intended shape, pending that verification.
+const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
+const CHAT_BASE_URL = process.env.E2E_BASE_URL || 'http://localhost:5173';
+
 async function openAdminExperiments(page: Page): Promise<void> {
-  await page.locator('[data-testid="admin-button"], button:has-text("Admin")').first().click();
-  await page.waitForSelector('.admin-section-rail, .admin-dashboard', { timeout: 15_000 });
-  // The admin console is a section-rail + sub-tabs layout (AdminDashboard.tsx):
-  // Experiments is a top-level section button, not a `.admin-tabs` tab.
-  await page
-    .locator('.admin-section-rail button.admin-section-btn:has-text("Experiments")')
+  // Deep-link straight to the Experiments tab on the admin app; auth is per-origin,
+  // so sign in here if the login screen shows (the section rail is the mounted proof).
+  await page.goto(new URL('/?admin=experiments', ADMIN_BASE_URL).toString());
+  const needsLogin = await page
+    .locator('input[type="password"]')
     .first()
-    .click();
+    .isVisible({ timeout: 5_000 })
+    .catch(() => false);
+  if (needsLogin) {
+    const creds = await getTestCredentials();
+    await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
+    await page.goto(new URL('/?admin=experiments', ADMIN_BASE_URL).toString());
+  }
+  await page.waitForSelector('.admin-section-rail', { timeout: 15_000 });
   await expect(page.locator('h3:has-text("A/B Experiments")')).toBeVisible({ timeout: 15_000 });
 }
 
 async function leaveAdmin(page: Page): Promise<void> {
-  await page.locator('.admin-back-btn, button:has-text("Back")').first().click();
-  await expect(page.locator('.admin-dashboard')).toBeHidden({ timeout: 10_000 }).catch(() => {});
+  // The standalone admin app has no "close console"; the duel runs on the chat
+  // origin, so navigate there (a chat-origin sign-in happens in the duel flow).
+  await page.goto(CHAT_BASE_URL);
 }
 
 /**
