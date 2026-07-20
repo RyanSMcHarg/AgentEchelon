@@ -254,7 +254,10 @@ const MANAGE_PROFILES_GROUPS = new Set<string>(
 );
 
 export function callerCanManageProfiles(event: APIGatewayProxyEvent): boolean {
-  if (isServiceAdminCall(event)) return true;
+  // A14: under per-resource IAM enforcement the gateway proved the signed
+  // principal holds `manage-profiles` (execute-api on the profile routes); the
+  // group gate stays as the ae-cognito fallback.
+  if (isTrustedIamAdminCall(event)) return true;
   const claims = event.requestContext?.authorizer?.claims as Record<string, unknown> | undefined;
   if (!claims) return false;
   return parseGroups(claims['cognito:groups']).some((g) => MANAGE_PROFILES_GROUPS.has(g));

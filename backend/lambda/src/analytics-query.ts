@@ -26,7 +26,8 @@ import {
   QueryExecutionState,
 } from '@aws-sdk/client-athena';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { parseJsonBody, requireAdmin } from './lib/auth';
+import { parseJsonBody, requireAdmin, isAdminIamEnforcedCall } from './lib/auth';
+import { queryTypeAllowedOnPath } from './lib/admin-capability-map';
 
 const athena = new AthenaClient({});
 const WORKGROUP = process.env.ATHENA_WORKGROUP || 'agent-echelon-analytics';
@@ -483,6 +484,14 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
     if (typeof queryType !== 'string' || !queryType) {
       return respond(400, { error: 'queryType (string) required' });
+    }
+
+    // A14: under per-resource IAM enforcement the gateway authorized this request
+    // as the capability of THIS resource path; reject a queryType belonging to a
+    // different capability (e.g. an A13 user-activity query on the low-sensitivity
+    // analytics resource). No-op in Cognito mode (single root resource).
+    if (isAdminIamEnforcedCall(event) && !queryTypeAllowedOnPath(queryType, event.path || '')) {
+      return respond(403, { error: 'queryType not permitted on this resource' });
     }
 
     const start = validateDate(dateRange?.start);

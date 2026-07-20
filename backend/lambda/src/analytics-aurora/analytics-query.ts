@@ -19,7 +19,8 @@ import { DynamoDBDocumentClient, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { stripMessageMarkers } from '../lib/message-markers.js';
 import { query, ensureSchema } from './db-client.js';
 import { estimateStepCostUsd, bedrockModelIdToKey } from '../lib/model-rate-table.js';
-import { callerIsAdmin, callerCanReadArchive } from '../lib/auth.js';
+import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall } from '../lib/auth.js';
+import { queryTypeAllowedOnPath } from '../lib/admin-capability-map.js';
 import { recordModerationAction, adminListEvents } from './admin-conversations-aurora.js';
 import {
   aggregateVariantFeedback,
@@ -172,6 +173,17 @@ export async function handler(
     // POST hit no method on the API root). Admin-gated like every other endpoint.
     if (event.httpMethod === 'POST') {
       if (!isAdmin) return error(403, 'Admin access required');
+      // A14: under per-resource IAM enforcement the gateway authorized this
+      // request as the capability of THIS resource path; reject a queryType that
+      // belongs to a different capability, so a caller allowed the low-sensitivity
+      // analytics resource cannot read A13 PII (or the event log / moderation
+      // audit) by naming its queryType on the wrong path.
+      if (isAdminIamEnforcedCall(event)) {
+        const qt = parsePostQueryType(event.body);
+        if (!queryTypeAllowedOnPath(qt, event.path || '')) {
+          return error(403, 'queryType not permitted on this resource');
+        }
+      }
       // Moderation audit: the actor is the SERVER-VERIFIED admin (callerSub + claims), never
       // the client body — so attribution can't be spoofed. Intercepted before query dispatch.
       const mod = await maybeRecordModeration(event.body, callerSub, claims);
@@ -559,6 +571,16 @@ function isArchiveReadBody(rawBody: string | null): boolean {
     return JSON.parse(rawBody || '{}').queryType === 'channel_events';
   } catch {
     return false;
+  }
+}
+
+/** The queryType named in a POST body (empty if absent/malformed) — for the A14
+ *  per-resource capability check. */
+function parsePostQueryType(rawBody: string | null): string {
+  try {
+    return String(JSON.parse(rawBody || '{}').queryType || '');
+  } catch {
+    return '';
   }
 }
 
