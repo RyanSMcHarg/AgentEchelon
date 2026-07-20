@@ -7,8 +7,8 @@
 - `backend/lambda/src/channel-flow-processor.ts` - existing `@all` / `@assistant` fan-out + the `/battle` branch
 - `backend/lambda/src/lib/async-processor-core.ts` - placeholder + update pattern
 - `backend/lambda/src/lib/experiment-manager.ts` - A/B testing variant resolver (extended for battle)
-- `frontend/src/components/admin/ExperimentsTab.tsx` - admin UI with the battle controls
-- `backend/lib/stacks/{basic,standard,premium}-tier-stack.ts` - each tier provisions its own `CfnAppInstanceBot`; `backend/lib/stacks/battle-stack.ts` provisions the alt-bot slot pool
+- `frontend/packages/admin/src/components/admin/ExperimentsTab.tsx` - admin UI with the battle controls
+- `backend/lib/stacks/{basic,standard,premium}-classification-stack.ts` - each classification provisions its own `CfnAppInstanceBot`; `backend/lib/stacks/battle-stack.ts` provisions the alt-bot slot pool
 - `backend/lambda/create-conversation/index.js` - channel creation + flow association
 - `docs/guides/admin/GUIDE-AB-TESTING-AND-BATTLES.md` - deployer/operator guide
 - `docs/specs/analytics-eval/SPEC-DRIFT-CONVERGENCE.md` - battle messages bypass the live-suggestion path; the drift-detection schema carries a `battle_id` tag
@@ -135,7 +135,7 @@ After this spec is implemented:
 
 ## Provisioning baseline
 
-**Per-tier default bots.** Each per-tier stack (`backend/lib/stacks/{basic,standard,premium}-tier-stack.ts`) provisions its own tier's `CfnAppInstanceBot` and publishes its ARN via that tier's SSM contract; `channel-flow-processor.ts`, `create-conversation/index.js`, and `add-agent-to-conversation/index.js` resolve the tier's default bot from that contract. The alt-bot slot pool that `/battle` fans out to is owned by `backend/lib/stacks/battle-stack.ts` (see the Alt-Bot Slot Pool section).
+**Per-classification default bots.** Each per-classification stack (`backend/lib/stacks/{basic,standard,premium}-classification-stack.ts`) provisions its own classification's `CfnAppInstanceBot` and publishes its ARN via that classification's SSM contract; `channel-flow-processor.ts`, `create-conversation/index.js`, and `add-agent-to-conversation/index.js` resolve the classification's default bot from that contract. The alt-bot slot pool that `/battle` fans out to is owned by `backend/lib/stacks/battle-stack.ts` (see the Alt-Bot Slot Pool section).
 
 **Channel membership.** `create-conversation/index.js` creates the channel with the bot as moderator and adds the human user. `add-agent-to-conversation/index.js` adds the same bot (idempotent) on demand.
 
@@ -531,7 +531,7 @@ Two metadata markers participate:
 
 ### Admin UI - Experiments Tab Extension
 
-The existing `frontend/src/components/admin/ExperimentsTab.tsx` gets three new fields on the create/edit form:
+The existing `frontend/packages/admin/src/components/admin/ExperimentsTab.tsx` gets three new fields on the create/edit form:
 
 1. **`Battle Enabled` checkbox** (experiment-level). Disabled when `variants.length !== 2`.
 2. **Per-variant `Display Name`** (max ~16 chars, defaults to model name). What end users see ("Atlas" vs "Echo").
@@ -727,7 +727,7 @@ selection** - see the Non-Goal.
 > processor invocation, so it already emits its own per-message step record.
 > Design + rationale: `docs/specs/conversation-messaging/SPEC-MESSAGE-METADATA-CODEBOOK.md` (Phase 1).
 > **Admin steps table.** The admin console surfaces the
-> per-step breakdown: `frontend/src/components/admin/StepsTab.tsx` (Models section,
+> per-step breakdown: `frontend/packages/admin/src/components/admin/StepsTab.tsx` (Models section,
 > Aurora-only) lists recent bot turns that carry steps and expands each into the
 > full per-step table (label, model, duration, tokens, est. cost). Backed by
 > `getExecutionSteps` (GET `/analytics/execution-steps` + the `execution_steps`
@@ -768,11 +768,11 @@ pick-the-winner start both; the live tally (Objective 2) closes the gap. Compani
 **Objective 2 - a real-time, tangible decision experience.**
 
 - **Running tally tied to the objective.** - implemented. `BattleTallyBar`
-  (`frontend/src/components/BattleTallyBar.tsx`) renders a sticky per-conversation
+  (`frontend/packages/chat/src/components/BattleTallyBar.tsx`) renders a sticky per-conversation
   tally above the message stream that updates live as rounds are answered and the
   user picks: per-side wins, the speed/cost/preferred leaders, ties, and an "N / target
   picks toward a confident call" progress nudge. The aggregation is a pure,
-  unit-tested helper (`frontend/src/utils/battleTally.ts` `computeBattleTally`,
+  unit-tested helper (`frontend/packages/chat/src/utils/battleTally.ts` `computeBattleTally`,
   keyed by stable bot label so a flipped per-round A/B order can't mix the sides);
   each `BattleScorecard` reports its pick up via `onOutcomeChange` so the bar is
   live, not a post-hoc report. The soft confidence target (`BATTLE_CONFIDENCE_TARGET`,
@@ -875,14 +875,14 @@ onward, so every stage of the progression shows time/cost/quality.
 | `backend/lambda/src/battle-orchestrator.ts` (new) | Reads `BattleStateTable`, fires round 2 for each bot member once both round-1 replies are in |
 | `backend/lambda/src/channel-battle.ts` (new) | API handler for `POST /channels/battle/enable`, `POST /channels/battle/disable`, `GET /channels/battle` (channel ARN in the request body for POST, query string for GET); writes `ChannelBattleConfigTable`; calls Amazon Chime SDK `CreateChannelMembership` / `DeleteChannelMembership` for the alt-slot ARN |
 | `backend/lambda/user-management.ts` (or `cognito-auth-stack.ts` API) | Wire the new channel-battle endpoints into the existing admin API Gateway |
-| `frontend/src/services/experimentService.ts` | Extend `Experiment` + `Variant` types with the new fields; add `setBattleBinding` call |
-| `frontend/src/services/channelService.ts` (new or existing) | Add `enableBattle(channelArn, experimentId)` and `disableBattle(channelArn)` |
-| `frontend/src/components/admin/ExperimentsTab.tsx` | Add Battle Enabled checkbox, per-variant Display Name + System Prompt Addendum, Alt-Bot Slot picker |
-| `frontend/src/utils/messageParser.ts` | Parse `<!--battle:...-->` marker into a `battle` field on `Message` |
-| `frontend/src/types/index.ts` (or wherever `Message` lives) | Add optional `battle: { round, rivalBotArn, rivalReplyMsgId? }` field |
-| `frontend/src/components/MessageList.tsx` (or equivalent) | Render round divider + variant avatar/color |
-| `frontend/src/components/MessageComposer.tsx` (or equivalent) | Add `/battle` to mention autocomplete; gate on premium-tier + battle-enabled |
-| `frontend/src/components/MembersPanel.tsx` | "Battle Mode" toggle for moderators of premium channels; picker when multiple battle experiments match |
+| `frontend/packages/shared/src/services/experimentService.ts` | Extend `Experiment` + `Variant` types with the new fields; add `setBattleBinding` call |
+| `frontend/packages/chat/src/services/channelService.ts` (new or existing) | Add `enableBattle(channelArn, experimentId)` and `disableBattle(channelArn)` |
+| `frontend/packages/admin/src/components/admin/ExperimentsTab.tsx` | Add Battle Enabled checkbox, per-variant Display Name + System Prompt Addendum, Alt-Bot Slot picker |
+| `frontend/packages/shared/src/utils/messageParser.ts` | Parse `<!--battle:...-->` marker into a `battle` field on `Message` |
+| `frontend/packages/shared/src/types/index.ts` (or wherever `Message` lives) | Add optional `battle: { round, rivalBotArn, rivalReplyMsgId? }` field |
+| `frontend/packages/chat/src/components/MessageList.tsx` (or equivalent) | Render round divider + variant avatar/color |
+| `frontend/packages/chat/src/components/MessageComposer.tsx` (or equivalent) | Add `/battle` to mention autocomplete; gate on premium-classification + battle-enabled |
+| `frontend/packages/chat/src/components/MembersPanel.tsx` | "Battle Mode" toggle for moderators of premium channels; picker when multiple battle experiments match |
 
 ### Documentation
 
@@ -991,5 +991,5 @@ The E2E suite (`tests/e2e/battle.spec.ts`) covers the full `/battle` round-trip:
 - `backend/lambda/src/channel-flow-processor.ts` - hosts the `/battle` branch
 - `backend/lambda/src/lib/async-processor-core.ts` - accepts the `battleContext` payload
 - `backend/lib/stacks/battle-stack.ts` - provisions the alt-bot slot pool + battle state/config tables
-- `frontend/src/utils/messageParser.ts` - strips the battle marker and exposes round info
+- `frontend/packages/shared/src/utils/messageParser.ts` - strips the battle marker and exposes round info
 - `docs/guides/admin/GUIDE-AB-TESTING-AND-BATTLES.md` - deployer/operator guide
