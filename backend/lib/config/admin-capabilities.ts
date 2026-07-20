@@ -122,10 +122,31 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
     key: 'view-security',
     rows: ['A17', 'A18'],
     enforcement: 'signOnRole',
-    resources: [{ api: 'analytics', method: 'GET', path: 'membership-audit/findings' }],
+    // A17: the membership-audit surface (who could act / access-drift findings +
+    // the enforce toggle + revoke). A18 infra health (deployment sleep/wake) keeps
+    // its Cognito authorizer — it is cost-ops, not security-sensitive data.
+    resources: [
+      { api: 'analytics', method: 'GET', path: 'membership-audit/findings' },
+      { api: 'analytics', method: 'GET', path: 'membership-audit/enforce' },
+      { api: 'analytics', method: 'POST', path: 'membership-audit/enforce' },
+      { api: 'analytics', method: 'POST', path: 'membership-audit/revoke' },
+    ],
     personas: ADMIN_DEV, // Full / Scoped / None / None
-    // The membership-audit + deployment routes keep their Cognito authorizer for
-    // now; IAM-authorizing them (view-security) is the tracked next slice.
+    wired: true,
+  },
+  // A16 (view-config / manage-config): the ASSISTANT config a deployer reads/writes
+  // at runtime is the profile registry, already IAM-enforced under `manage-profiles`
+  // (GET /admin/profiles lists it; the action POSTs write it). The rest of A16
+  // (classifications, connectors, tiers) is DEPLOY-time config with no runtime admin
+  // API to gate, so there is no separate resource to IAM-authorize — `view-config`
+  // has no wiring beyond what `manage-profiles` already covers. Kept here for
+  // traceability against the section-3b matrix; unwired by design (no API surface).
+  'view-config': {
+    key: 'view-config',
+    rows: ['A16'],
+    enforcement: 'signOnRole',
+    resources: [],
+    personas: ADMIN_DEV_AI, // Full / Read / Scoped / None
     wired: false,
   },
   // ── experiments API (Experiments stack) — the profile write surface ──────

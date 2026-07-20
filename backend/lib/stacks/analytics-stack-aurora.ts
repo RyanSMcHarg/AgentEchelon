@@ -1646,7 +1646,14 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
       }));
 
       const auditIntegration = new apigateway.LambdaIntegration(auditAdminFn, { allowTestInvoke: false });
-      const auditOpts = adminApiMethodOptions(this, 'MembershipAuditAdminAuthorizer', { userPoolId: props.userPoolId });
+      // A14 view-security (A17): flip the membership-audit surface to AWS_IAM under
+      // the flag; the admins role (whole-API teeth) + view-security personas hold it.
+      const auditOpts: apigateway.MethodOptions = adminIamEnforcement
+        ? { authorizationType: apigateway.AuthorizationType.IAM }
+        : adminApiMethodOptions(this, 'MembershipAuditAdminAuthorizer', { userPoolId: props.userPoolId });
+      if (adminIamEnforcement) {
+        auditAdminFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+      }
       const auditRes = analyticsApi.root.addResource('membership-audit');
       auditRes.addResource('findings').addMethod('GET', auditIntegration, auditOpts);
       const enforceRes = auditRes.addResource('enforce');
