@@ -27,6 +27,7 @@ import { Construct } from 'constructs';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
 import { adminOrigin, sharedOrigins } from '../config/app-origins';
+import { personaExecuteApiResources, AdminPersona } from '../config/admin-capabilities';
 import { SHARED_SSM, INSTANCE_SSM, SSM_ROOT } from './agent-classification-common';
 
 export interface ExperimentsStackProps extends cdk.StackProps {
@@ -36,6 +37,8 @@ export interface ExperimentsStackProps extends cdk.StackProps {
   appUrl?: string;
   /** A14: the `admins` sign-on role ARN (execute-api teeth on the profile routes under adminIamEnforcement). */
   adminSignOnRoleArn?: string;
+  /** A14 personas (opt-in): persona key -> sign-on role ARN. Personas holding manage-profiles get its teeth. */
+  adminPersonaRoleArns?: Record<string, string>;
 }
 
 export class ExperimentsStack extends cdk.Stack {
@@ -220,15 +223,23 @@ export class ExperimentsStack extends cdk.Stack {
     }
     this.manageProfilesApiUrl = `${api.url}admin/profiles`;
 
+    const profileTeeth = [
+      api.arnForExecuteApi('GET', '/admin/profiles'),
+      api.arnForExecuteApi('POST', '/admin/profiles/*'),
+    ];
     if (adminIamEnforcement && props.adminSignOnRoleArn) {
       const adminRole = iam.Role.fromRoleArn(this, 'ImportedAdminSignOnRole', props.adminSignOnRoleArn, { mutable: true });
-      adminRole.addToPrincipalPolicy(new iam.PolicyStatement({
-        actions: ['execute-api:Invoke'],
-        resources: [
-          api.arnForExecuteApi('GET', '/admin/profiles'),
-          api.arnForExecuteApi('POST', '/admin/profiles/*'),
-        ],
-      }));
+      adminRole.addToPrincipalPolicy(new iam.PolicyStatement({ actions: ['execute-api:Invoke'], resources: profileTeeth }));
+    }
+    // A14 persona teeth: a persona that holds manage-profiles (platform-admin,
+    // platform-dev, ai-dev) gets execute-api on the profile routes; a manager role
+    // (no manage-profiles) is denied at the gateway.
+    if (adminIamEnforcement && props.adminPersonaRoleArns) {
+      for (const [persona, roleArn] of Object.entries(props.adminPersonaRoleArns)) {
+        if (!personaExecuteApiResources(persona as AdminPersona, 'experiments').length) continue;
+        iam.Role.fromRoleArn(this, `ImportedPersonaRole-${persona}`, roleArn, { mutable: true })
+          .addToPrincipalPolicy(new iam.PolicyStatement({ actions: ['execute-api:Invoke'], resources: profileTeeth }));
+      }
     }
     new cdk.CfnOutput(this, 'ManageProfilesApiUrl', {
       value: this.manageProfilesApiUrl,

@@ -153,3 +153,23 @@ export function exchangeVendCapabilities(): AdminCapability[] {
 export function capabilitiesForPersona(persona: AdminPersona): AdminCapability[] {
   return Object.values(ADMIN_CAPABILITIES).filter((c) => c.wired && c.personas.includes(persona));
 }
+
+/**
+ * The `execute-api` resources a persona holds ON a given API, for the CDK to
+ * grant the persona's sign-on role. Only `signOnRole` capabilities produce teeth
+ * (message content, A2, is exchange-vended, not a standing grant). Each entry is
+ * `{ method, path }` with a leading-slash path ready for `arnForExecuteApi`.
+ */
+export function personaExecuteApiResources(
+  persona: AdminPersona,
+  api: AdminApiResource['api'],
+): Array<{ method: string; path: string }> {
+  const out: Array<{ method: string; path: string }> = [];
+  for (const cap of capabilitiesForPersona(persona)) {
+    if (cap.enforcement !== 'signOnRole') continue;
+    for (const r of cap.resources) {
+      if (r.api === api) out.push({ method: r.method, path: `/${r.path}`.replace(/\/$/, '') || '/' });
+    }
+  }
+  return out;
+}

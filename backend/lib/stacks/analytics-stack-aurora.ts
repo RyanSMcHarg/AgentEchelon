@@ -51,6 +51,7 @@ import { ANALYTICS_PREFIX, INSTANCE_NAME, SHARED_SSM, STACK_PREFIX, INSTANCE_SSM
 import { MembershipAuditConstruct } from '../constructs/membership-audit';
 import { ConversationArchive } from '../constructs/conversation-archive';
 import { ANALYTICS_CAPABILITY_SUBPATHS } from '../../lambda/src/lib/admin-capability-map';
+import { personaExecuteApiResources, AdminPersona } from '../config/admin-capabilities';
 
 /**
  * esbuild commandHooks that copy the RDS CA bundle (`analytics-aurora/certs/*.pem`)
@@ -91,6 +92,9 @@ export interface AnalyticsStackAuroraProps extends cdk.StackProps {
    * is denied at the gateway.
    */
   adminSignOnRoleArn?: string;
+  /** A14 personas (opt-in): persona key -> sign-on role ARN. Each gets execute-api
+   *  teeth for exactly the analytics capabilities it holds (SPEC section 4). */
+  adminPersonaRoleArns?: Record<string, string>;
   /** Layer 6 membership audit (SPEC-CONVERSATION-SECURITY). Opt-in; report-only unless enforce. */
   enableMembershipAudit?: boolean;
   membershipAuditEnforce?: boolean;
@@ -1592,6 +1596,19 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
         actions: ['execute-api:Invoke'],
         resources: [analyticsApi.arnForExecuteApi()],
       }));
+    }
+    // A14 persona teeth: each persona role gets execute-api on ONLY the analytics
+    // resources its capabilities cover (SPEC section 4) — so e.g. an ai-dev role
+    // (view-analytics + view-events, NOT view-user-activity) is denied /user-activity
+    // at the gateway while the admins role holds everything.
+    if (adminIamEnforcement && props.adminPersonaRoleArns) {
+      for (const [persona, roleArn] of Object.entries(props.adminPersonaRoleArns)) {
+        const resources = personaExecuteApiResources(persona as AdminPersona, 'analytics')
+          .map((r) => analyticsApi.arnForExecuteApi(r.method, r.path));
+        if (!resources.length) continue;
+        iam.Role.fromRoleArn(this, `ImportedPersonaRole-${persona}`, roleArn, { mutable: true })
+          .addToPrincipalPolicy(new iam.PolicyStatement({ actions: ['execute-api:Invoke'], resources }));
+      }
     }
 
     // Membership-audit review surface (Layer 6): admin API for the flagged-memberships panel and

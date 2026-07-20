@@ -2,6 +2,11 @@ import * as cdk from 'aws-cdk-lib';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
 import { adminOrigin, sharedOrigins } from '../config/app-origins';
+import {
+  ADMIN_PERSONAS,
+  ADMIN_PERSONA_GROUP,
+  personaExecuteApiResources,
+} from '../config/admin-capabilities';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
@@ -43,6 +48,12 @@ export class CognitoAuthStack extends cdk.Stack {
    * their capabilities onto it (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6).
    */
   public readonly adminSignOnRoleArn: string;
+  /**
+   * A14 persona sign-on role ARNs by persona key, populated only when
+   * `-c enableAdminPersonas=true`. Passed to the analytics + experiments stacks
+   * so each persona role gets execute-api teeth for exactly its capability set.
+   */
+  public readonly adminPersonaRoleArns: Record<string, string> = {};
   /**
    * UserFeedback (thumbs) table. Exposed so the Aurora analytics stack can
    * read it for the per-variant thumbs join.
@@ -1017,6 +1028,39 @@ export class CognitoAuthStack extends cdk.Stack {
         actions: ['execute-api:Invoke'],
         resources: [adminConversationApi.arnForExecuteApi('GET', p)],
       }));
+    }
+
+    // A14 personas (opt-in, SPEC section 2): four example admin roles, each a
+    // group -> sign-on role holding execute-api teeth for EXACTLY its capability
+    // set — so a persona that omits a capability is denied that resource at the
+    // gateway (real fine-grained denial, not just admins-Full). Off by default
+    // (`-c enableAdminPersonas=true`); the spec ships them as a reviewable
+    // starting point, not enabled infra. Their analytics + profile teeth are
+    // granted cross-stack (those stacks read `adminPersonaRoleArns`). Message
+    // content (view-messages, A2) is exchange-vended (admins-only) and not part
+    // of these standing grants.
+    const enableAdminPersonas = this.node.tryGetContext('enableAdminPersonas') === true
+      || this.node.tryGetContext('enableAdminPersonas') === 'true';
+    if (enableAdminPersonas) {
+      for (const persona of ADMIN_PERSONAS) {
+        const groupName = ADMIN_PERSONA_GROUP[persona];
+        const pascal = groupName.split('-').map((s) => s.charAt(0).toUpperCase() + s.slice(1)).join('');
+        const personaRole = makeClassificationRole(`${pascal}PersonaRole`);
+        this.adminPersonaRoleArns[persona] = personaRole.roleArn;
+        new cognito.CfnUserPoolGroup(this, `${pascal}Group`, {
+          userPoolId: this.userPool.userPoolId,
+          groupName,
+          description: `A14 admin persona (${persona}) — execute-api teeth for its capability set`,
+          precedence: 1,
+          roleArn: personaRole.roleArn,
+        }).addDependency(this.userPool.node.defaultChild as cognito.CfnUserPool);
+        for (const r of personaExecuteApiResources(persona, 'admin-conversations')) {
+          personaRole.addToPolicy(new iam.PolicyStatement({
+            actions: ['execute-api:Invoke'],
+            resources: [adminConversationApi.arnForExecuteApi(r.method, r.path)],
+          }));
+        }
+      }
     }
 
     // A14 exchange-vend plane (view-messages / A2, customer message content): the
