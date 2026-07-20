@@ -21,7 +21,7 @@
  *
  * Usage:
  *   node backend/scripts/sync-project-knowledge.mjs
- *   AE_BLOG_VAULT_PATH="/path/to/mcharg-site/McHarg Site/Blog/Posts" node backend/scripts/sync-project-knowledge.mjs
+ *   AE_BLOG_VAULT_PATH="/path/to/your/blog-vault" node backend/scripts/sync-project-knowledge.mjs
  *
  * The blog vault is external (not in this repo); it is OPTIONAL and skipped when the
  * path is unset or missing - OSS users just get the repo-docs knowledge.

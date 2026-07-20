@@ -15,8 +15,8 @@
  * test credentials secret the e2e reads (test-credentials.ts / provision-test-users).
  *
  * Usage:
- *   AWS_PROFILE=mcharg-dev node backend/scripts/validate.mjs
- *   AWS_PROFILE=mcharg-dev node backend/scripts/validate.mjs --skip-battle
+ *   AWS_PROFILE=<your-profile> node backend/scripts/validate.mjs
+ *   AWS_PROFILE=<your-profile> node backend/scripts/validate.mjs --skip-battle
  *   node backend/scripts/validate.mjs --only=admin        # one phase
  */
 import { spawnSync } from 'node:child_process';

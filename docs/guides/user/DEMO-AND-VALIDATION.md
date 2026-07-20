@@ -34,7 +34,7 @@ genuine data.
 #    (+ public blog if you point at the vault). seed-demo uploads it for you, so this
 #    is only needed if you changed the docs.
 cd backend
-AE_BLOG_VAULT_PATH="/path/to/mcharg-site/McHarg Site/Blog/Posts" npm run sync-knowledge   # blog path optional
+AE_BLOG_VAULT_PATH="/path/to/your/blog-vault" npm run sync-knowledge   # blog path optional
 
 # 2. seed the demo: 3 tier users + per-tier context (incl. the all-tier project knowledge)
 AWS_PROFILE=<your-profile> npx ts-node scripts/seed-demo.ts

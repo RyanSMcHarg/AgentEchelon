@@ -13,7 +13,7 @@ import { Page, Response } from '@playwright/test';
 
 // The analytics API the built frontend POSTs every queryType to. Match by host
 // so the tests don't couple to the trailing stage/path.
-export const ANALYTICS_HOST = 'h1bu974mq6.execute-api.us-east-1.amazonaws.com';
+export const ANALYTICS_HOST = process.env.E2E_ANALYTICS_HOST || '<analytics-api-id>.execute-api.us-east-1.amazonaws.com';
 
 // queryTypes each top-level SECTION fires on its default (first) sub-tab.
 // Mirrors QUERIES_BY_TAB in AdminDashboard.tsx for each section's default tab.

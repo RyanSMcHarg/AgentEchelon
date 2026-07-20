@@ -98,7 +98,7 @@ export const DEFAULT_PROFILES_CONFIG: ProfilesConfig = {
  * `failClosedTo: 'guest'` so an absent/invalid tag lands on the MOST restrictive profile.
  * The min-cap guarantees a guest in any higher-classified conversation resolves to guest.
  *
- * Reference model — communication-hub throttles guests on TWO layers:
+ * Reference model — a sibling messaging project throttles guests on TWO layers:
  *   1. Per-message ceiling (messages/hour): guest 10 vs customer 100 vs staff 200 vs admin ∞.
  *      -> This maps directly onto `AssistantProfile.rateLimitPerHour` (guest = 10).
  *   2. Anonymous credential-vend throttle: 5 vends/hour PER SOURCE IP + captcha, enforced pre-auth

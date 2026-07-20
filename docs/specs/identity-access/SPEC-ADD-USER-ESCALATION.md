@@ -25,11 +25,10 @@ tier / membership eligibility gate and the SAME email-with-deep-link delivery:
   greeting them with a targeted, private briefing (who is asking, why, and the running
   context) instead of telling the user to find someone out of band.
 
-The reference implementation for the escalation shape is the communication-hub
-`add-ryan` design (`auth-agent-handler.ts` `addRyanToChannel`): the model emits an
-`<!--ADD_RYAN-->` marker, the backend runs `CreateChannelMembership` under an admin
-AppInstanceUser bearer (Amazon Chime SDK requires an `AppInstanceUser`, not the bot, for that
-call), and posts a targeted briefing to Ryan. The target there is **hardcoded** to a
+The reference implementation for the escalation shape is a sibling project's "add a specific
+person" design: the model emits an add-member marker, the backend runs `CreateChannelMembership`
+under an admin AppInstanceUser bearer (Amazon Chime SDK requires an `AppInstanceUser`, not the
+bot, for that call), and posts a targeted briefing to that person. The target there is **hardcoded** to a
 single Cognito sub as the abuse control: even a prompt injection can only ever add one
 specific person. AgentEchelon generalizes that single hardcoded target to a **per-tier
 allowlist** the model selects from by KEY (never by raw ARN or sub), keeping the same
@@ -63,7 +62,7 @@ pre-approved KEY, and the dedicated Lambda enforces eligibility before any write
   under GUARDRAILS): the added human must be entitled to the conversation's
   classification and is never escalated above their own tier.
 - **Account manager / sales engagement: bring in a named human on a live
-  request.** Generalizing the communication-hub "add a specific person" shape, a
+  request.** Generalizing the "add a specific person" shape, a
   deployment can allowlist an account manager or sales engineer, so the assistant
   can pull them into a conversation when a request warrants human sales
   engagement. The identity still comes from config by KEY, never from the model.
@@ -305,7 +304,7 @@ for the assistant (dedicated-Lambda) path:
 6. **Targeted private welcome**: a `SendChannelMessage` with
    `Target:[{ MemberArn }]` and "Only you can see this message" framing. Content
    is composed from `welcomeCopy` plus a **who / why / context** briefing built
-   the same way `addRyanToChannel` builds Ryan's briefing:
+   the same way the sibling project builds the invitee's briefing:
    - **who**: the requesting user's display name/profile (best-effort lookup;
      any failure degrades to "A user"),
    - **why**: the `contextHint` the assistant passed with the marker. This is

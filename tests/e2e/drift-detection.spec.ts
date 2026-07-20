@@ -145,7 +145,7 @@ const DRIFT_TRIGGER = "let's start a new conversation about quarterly revenue fo
 const SUGGESTION_MARKER = 'start a separate conversation for this';
 const E2E_RUNNABLE = hasTestCredentials();
 
-/** Resolve the AgentEchelon (NOT the look-alike Youji) ChannelBattleConfig
+/** Resolve the AgentEchelon (NOT a look-alike instance in the same account) ChannelBattleConfig
  *  table name from DynamoDB. Returns null if it can't be found. */
 function resolveBattleConfigTable(): string | null {
   try {

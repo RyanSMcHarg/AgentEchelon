@@ -27,7 +27,7 @@ test.use({ baseURL: ADMIN_BASE_URL });
 
 // The analytics API the built frontend POSTs every queryType to. Match by host
 // so we don't couple to the trailing path/stage.
-const ANALYTICS_HOST = 'h1bu974mq6.execute-api.us-east-1.amazonaws.com';
+const ANALYTICS_HOST = process.env.E2E_ANALYTICS_HOST || '<analytics-api-id>.execute-api.us-east-1.amazonaws.com';
 
 // The queryTypes each top-level SECTION fires on its default (first) sub-tab.
 // Mirrors QUERIES_BY_TAB in AdminDashboard.tsx for the section's default tab.

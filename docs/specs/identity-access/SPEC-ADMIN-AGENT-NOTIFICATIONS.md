@@ -2,7 +2,7 @@
 
 **Status:** DESIGN (not yet built). This spec supersedes the initial admin-notification-channel attempt (the stack at `backend/lib/stacks/admin-notification-stack.ts` and its handler `backend/lambda/src/admin-notification-channel-provision.ts`), which created and posted to the channel as the service app-instance-admin. That is wrong (see Why) and is being reworked to the model below.
 
-**Scope:** Give AgentEchelon a first-class **admin agent** - an assistant, defined by a capability profile like every other AE assistant - that OWNS an **admin notification channel** and POSTS the platform's admin-facing alerts into it (Layer 6 membership-audit findings, admin-error alerts, and future admin notifications), delivered in-app plus email. The channel's owner and message sender is the admin agent's AppInstanceBot; the service app-instance-admin is never a channel member. The pattern is ported from communication-hub's ADR-015 "the bot owns the channel", made AE-native by expressing the admin agent as a profile plus config rather than a hardcoded identity.
+**Scope:** Give AgentEchelon a first-class **admin agent** - an assistant, defined by a capability profile like every other AE assistant - that OWNS an **admin notification channel** and POSTS the platform's admin-facing alerts into it (Layer 6 membership-audit findings, admin-error alerts, and future admin notifications), delivered in-app plus email. The channel's owner and message sender is the admin agent's AppInstanceBot; the service app-instance-admin is never a channel member. The pattern is ported from a sibling messaging project's "the bot owns the channel" design, made AE-native by expressing the admin agent as a profile plus config rather than a hardcoded identity.
 
 **Author:** Ryan McHarg
 
@@ -32,9 +32,9 @@ The correct owner and sender is a bot. A bot that creates a channel is its moder
 
 **The admin agent is an AgentEchelon assistant profile whose AppInstanceBot creates, owns, and posts to the admin notification channel. The service app-instance-admin is borrowed only as the bearer for the one operation a bot cannot perform - adding members - and is never itself a member.**
 
-This is communication-hub's ADR-015 ("the bot creates the channel; the bot becomes creator and moderator and can post; the app-instance-admin user is used only as a bearer for CreateChannelMembership, which bots cannot call, and is kept out of the roster"), expressed in AE's terms:
+This is the sibling project's bot-owns-the-channel pattern ("the bot creates the channel; the bot becomes creator and moderator and can post; the app-instance-admin user is used only as a bearer for CreateChannelMembership, which bots cannot call, and is kept out of the roster"), expressed in AE's terms:
 
-- **communication-hub** hardcodes the admin agent's bot ARN as a static config value (`adminBotArn`) bootstrapped out of band.
+- **The sibling project** hardcodes the admin agent's bot ARN as a static config value (`adminBotArn`) bootstrapped out of band.
 - **AgentEchelon** defines the admin agent as a capability **profile** (`AssistantProfile`, `profiles.ts:36-53`). The profile stack provisions its Lex bot + AppInstanceBot and publishes the ARN to SSM exactly as it does for `basic`/`standard`/`premium` (`assistant-profile-stack.ts:664-704`). The admin agent is config, not a hardcoded identity.
 
 Three identities, kept distinct:
@@ -49,7 +49,7 @@ Three identities, kept distinct:
 
 The admin agent is added to `DEFAULT_PROFILES_CONFIG.profiles` (`profiles.ts:82-89`) as a new profile, e.g. `{ name: 'admin-agent', modelKey: 'haiku', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'lightweight', contextScope: 'own-rank-and-below' }`. Unlike the per-classification profiles, it is NOT bound to a channel classification (no `DeploymentClassification.profile` points at it): it does not serve user conversations by clearance. It exists to own the admin-plane channel and to be the sender identity for alerts. Its persona and model matter only if and when the admin agent is later given a conversational role (the multi-agent support/admin-assistant direction); for notifications, only its bot identity is used.
 
-The profile stack provisions it identically to a classification assistant: the Lex bot (`assistant-profile-stack.ts:605+`), the `CreateAppInstanceBot` custom resource (`:664-704`), and the SSM publish of `…/assistant/admin-agent/bot-arn` (`:697`, via the key helper `agent-classification-common.ts:391`). Provisioning the admin agent through the same path is the "profile plus config, not a hardcoded ARN" difference from communication-hub, and it means the admin agent inherits AE's persona-override, model-selection, and config-identity machinery for free.
+The profile stack provisions it identically to a classification assistant: the Lex bot (`assistant-profile-stack.ts:605+`), the `CreateAppInstanceBot` custom resource (`:664-704`), and the SSM publish of `…/assistant/admin-agent/bot-arn` (`:697`, via the key helper `agent-classification-common.ts:391`). Provisioning the admin agent through the same path is the "profile plus config, not a hardcoded ARN" difference from the sibling project, and it means the admin agent inherits AE's persona-override, model-selection, and config-identity machinery for free.
 
 **Security boundary (normative).** The admin agent participates ONLY in admin conversations, and admin conversations are accessible ONLY to admins. Concretely:
 
@@ -104,12 +104,12 @@ Human admins receive an alert two ways, both keyed on the participant roster the
 - The shipped `adminErrorAlertWiring` and membership-audit bearer (`ADMIN_ALERT_BEARER_ARN` / `ADMIN_ARN_PARAM` = the service admin) are corrected to the admin-agent bot. This fixes a latent defect: those paths cannot post today even when a channel ARN is supplied, because the service admin is not a member.
 - The manual repair script `backend/scripts/provision-admin-channel.mjs` is updated the same way (create + post as the bot; add members as the admin-user bearer), so an operator can provision or repair the channel without a deploy.
 
-## Difference from communication-hub
+## Difference from the sibling project
 
-| Concern | communication-hub | AgentEchelon |
+| Concern | Sibling project | AgentEchelon |
 |---|---|---|
 | Admin agent identity | Static `adminBotArn` config, bootstrapped out of band | A capability **profile** (`profiles.ts`); the profile stack provisions the bot + publishes the SSM ARN |
-| Channel owner | The bot (ADR-015) | The bot (same) |
+| Channel owner | The bot | The bot (same) |
 | Member-add bearer | The app-instance-admin user | The service app-instance-admin user (same) |
 | Alert sender | The bot | The bot (same) |
 | Service admin as member | Never | Never |
@@ -132,7 +132,7 @@ The ownership and identity rules are ported verbatim; only the way the admin age
 3. **Admin roster upkeep.** Admins are synced at provision/Update time. A new admin added between deploys is not a member until the next provision run. A future hook (the admin-user provisioning path) could add new admins to the channel on the fly.
 4. **Host-owned admin (ADMIN-INTEGRATION-GUIDE).** When a host owns admin auth, the admin agent still owns the channel, but recipient resolution keys on the host's admin claim; document the interaction.
 
-## Empirical validation (live, mcharg-dev)
+## Empirical validation (live instance)
 
 Recorded so the rework is verified against reality, not just synthesis:
 
