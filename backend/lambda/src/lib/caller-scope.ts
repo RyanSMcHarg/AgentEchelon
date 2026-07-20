@@ -1,0 +1,100 @@
+/**
+ * A14 `Scoped` cells (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6.4) — resolve
+ * the caller's CLASSIFICATION CEILING from their verified identity, so an admin
+ * read can be narrowed to the classification tier the caller is entitled to (the
+ * one generic scope axis; ownership/membership scoping is deployment-specific).
+ *
+ * The ceiling is the caller's highest classification group. A caller in a
+ * full-access group (the `admins` group, or the `platform-admins` persona) has NO
+ * ceiling (Full). A caller with a persona but no classification group is
+ * fail-closed to the floor, so a scope is a grant a deployer adds (a classification
+ * group on the role's members), never an accident.
+ *
+ * Active ONLY under IAM enforcement (the handler passes the verified sub from
+ * `iamCallerSub`). Cognito-JWT calls keep the existing behavior.
+ */
+import {
+  CognitoIdentityProviderClient,
+  ListUsersCommand,
+  AdminListGroupsForUserCommand,
+} from '@aws-sdk/client-cognito-identity-provider';
+
+const cognito = new CognitoIdentityProviderClient({});
+
+const CLASSIFICATION_RANK: Record<string, number> = { basic: 1, standard: 2, premium: 3 };
+const CLASSIFICATION_ORDER = ['basic', 'standard', 'premium'];
+const FLOOR_CLASSIFICATION = 'basic';
+// Groups that read everything, unnarrowed.
+const FULL_ACCESS_GROUPS = new Set(['admins', 'platform-admins']);
+
+export function classificationRank(c: string): number {
+  return CLASSIFICATION_RANK[c] ?? 0;
+}
+
+/**
+ * A ceiling: a classification string (the caller sees that tier and below), or
+ * `null` = Full (no narrowing). `undefined`/empty item classifications are treated
+ * as the floor so an untagged row is never hidden from a floor-ceiling caller and
+ * never leaked to one above it by being unclassified.
+ */
+export type ClassificationCeiling = string | null;
+
+export function classificationAllowed(itemClassification: string | undefined, ceiling: ClassificationCeiling): boolean {
+  if (ceiling === null) return true; // Full
+  const item = classificationRank(itemClassification || FLOOR_CLASSIFICATION);
+  return item <= classificationRank(ceiling);
+}
+
+/** The ceiling implied by a set of Cognito groups (pure; unit-tested). */
+export function ceilingFromGroups(groups: string[]): ClassificationCeiling {
+  if (groups.some((g) => FULL_ACCESS_GROUPS.has(g))) return null; // Full
+  let best: string | null = null;
+  for (const g of groups) {
+    if (CLASSIFICATION_ORDER.includes(g) && (!best || classificationRank(g) > classificationRank(best))) best = g;
+  }
+  // A persona with no classification group is fail-closed to the floor.
+  return best ?? FLOOR_CLASSIFICATION;
+}
+
+// Short-lived cache: the ceiling is stable for a session and the resolution costs
+// two Cognito calls. Keyed by sub, TTL-bounded so a group change takes effect soon.
+const TTL_MS = 5 * 60 * 1000;
+const cache = new Map<string, { ceiling: ClassificationCeiling; at: number }>();
+
+/** The caller's Cognito groups, resolved from their sub (the pool aliases email, so
+ *  the username is a distinct UUID: find the user by sub, then list their groups). */
+async function groupsForSub(sub: string, userPoolId: string): Promise<string[]> {
+  const found = await cognito.send(new ListUsersCommand({
+    UserPoolId: userPoolId,
+    Filter: `sub = "${sub}"`,
+    Limit: 1,
+  }));
+  const username = found.Users?.[0]?.Username;
+  if (!username) return [];
+  const g = await cognito.send(new AdminListGroupsForUserCommand({ UserPoolId: userPoolId, Username: username }));
+  return (g.Groups || []).map((x) => x.GroupName || '').filter(Boolean);
+}
+
+/**
+ * The caller's classification ceiling. `null` = Full. Cached per sub. On any Cognito
+ * error, fail-closed to the floor (never widen access on a lookup failure).
+ */
+export async function resolveCallerCeiling(sub: string, userPoolId: string): Promise<ClassificationCeiling> {
+  const hit = cache.get(sub);
+  const now = Date.now();
+  if (hit && now - hit.at < TTL_MS) return hit.ceiling;
+  let ceiling: ClassificationCeiling;
+  try {
+    ceiling = ceilingFromGroups(await groupsForSub(sub, userPoolId));
+  } catch (err) {
+    console.warn('[caller-scope] ceiling lookup failed, fail-closed to floor:', err);
+    ceiling = FLOOR_CLASSIFICATION;
+  }
+  cache.set(sub, { ceiling, at: now });
+  return ceiling;
+}
+
+/** Test-only: clear the module cache. */
+export function __clearCeilingCache(): void {
+  cache.clear();
+}

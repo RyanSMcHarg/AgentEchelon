@@ -154,6 +154,28 @@ export function isServiceAdminCall(event: APIGatewayProxyEvent): boolean {
 }
 
 /**
+ * The caller's Cognito `sub` on an IAM-authorized (Identity-Pool-signed) request.
+ * API Gateway sets `identity.cognitoAuthenticationProvider` to
+ * `cognito-idp.<region>.amazonaws.com/<poolId>:CognitoSignIn:<sub>` (the sub is the
+ * segment after the last `:CognitoSignIn:`), so a SigV4-signed admin call still
+ * carries the *verified* human identity even though there is no JWT. A14 uses this
+ * to resolve the caller's classification ceiling for the `Scoped` cells (the read
+ * "filters on the verified identity", spec section 6.4). Returns null on a
+ * Cognito-JWT call (no IAM identity) or an unparseable provider string.
+ */
+export function iamCallerSub(event: APIGatewayProxyEvent): string | null {
+  const provider = (event.requestContext?.identity as { cognitoAuthenticationProvider?: string | null } | undefined)
+    ?.cognitoAuthenticationProvider;
+  if (!provider) return null;
+  const marker = ':CognitoSignIn:';
+  const i = provider.lastIndexOf(marker);
+  if (i === -1) return null;
+  // The sub can be followed by nothing; guard against a trailing comma/space.
+  const sub = provider.slice(i + marker.length).split(/[,\s]/)[0].trim();
+  return sub || null;
+}
+
+/**
  * True when A14 fine-grained IAM enforcement is on for this handler
  * (`ADMIN_IAM_ENFORCEMENT=true`, set by the CDK only on the resources whose API
  * Gateway method is `AWS_IAM`-authorized under `-c adminIamEnforcement=true`)

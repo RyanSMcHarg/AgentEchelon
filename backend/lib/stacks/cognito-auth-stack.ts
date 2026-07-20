@@ -934,6 +934,8 @@ export class CognitoAuthStack extends cdk.Stack {
       environment: {
         ...adminAuthEnv(this),
         APP_INSTANCE_ARN: props.appInstanceArn,
+        // A14 Scoped: the pool the caller's classification ceiling is resolved against.
+        USER_POOL_ID: this.userPool.userPoolId,
         ATHENA_WORKGROUP: ATHENA_WORKGROUP_NAME,
         ATHENA_DATABASE: ANALYTICS_DB_NAME,
         ALLOWED_ORIGIN: adminAppUrl,
@@ -957,6 +959,15 @@ export class CognitoAuthStack extends cdk.Stack {
         resources: [
           `arn:aws:ssm:${this.region}:${this.account}:parameter${SHARED_SSM.auroraDataPlaneArn}`,
         ],
+      }),
+    );
+    // A14 Scoped: resolve the caller's classification ceiling from their Cognito
+    // groups (email is a sign-in alias, so the username is a distinct UUID: find
+    // the user by sub, then list their groups). Read-only, this pool only.
+    adminConversationFn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: ['cognito-idp:ListUsers', 'cognito-idp:AdminListGroupsForUser'],
+        resources: [this.userPool.userPoolArn],
       }),
     );
     adminConversationFn.addToRolePolicy(

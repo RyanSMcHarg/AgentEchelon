@@ -27,7 +27,8 @@ import {
   QueryExecutionState,
 } from '@aws-sdk/client-athena';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { callerIsAdmin, callerCanReadArchive } from './lib/auth.js';
+import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall, iamCallerSub } from './lib/auth.js';
+import { resolveCallerCeiling, classificationAllowed, type ClassificationCeiling } from './lib/caller-scope.js';
 // Aurora-mode read path: when the data-plane ARN is wired (analyticsMode=aurora),
 // read conversations from Aurora via the VPC data-plane Lambda instead of Athena
 // (the Athena archive query is too slow — 15-27s > API Gateway's 29s cap — and
@@ -66,6 +67,9 @@ async function ensureDataPlaneArn(): Promise<void> {
 }
 
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
+// A14 Scoped: the pool the caller's classification ceiling is resolved against
+// (same stack, so this is always set on the admin-conversations Lambda).
+const USER_POOL_ID = process.env.USER_POOL_ID || '';
 const ATHENA_WORKGROUP = process.env.ATHENA_WORKGROUP || 'agent-echelon-analytics';
 const ATHENA_DATABASE = process.env.ATHENA_DATABASE || 'agent_echelon';
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || 'http://localhost:5173').split(',');
@@ -186,13 +190,23 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
   // Resolve the Aurora data-plane ARN (once) before the read functions branch.
   await ensureDataPlaneArn();
 
+  // A14 Scoped: under IAM enforcement, narrow the reads to the caller's
+  // classification ceiling (resolved from the verified sub). Full (null) on a
+  // Cognito-JWT call or a full-access caller (admins / platform-admins), so the
+  // default path is unchanged.
+  let ceiling: ClassificationCeiling = null;
+  if (isAdminIamEnforcedCall(event) && USER_POOL_ID) {
+    const sub = iamCallerSub(event);
+    if (sub) ceiling = await resolveCallerCeiling(sub, USER_POOL_ID);
+  }
+
   try {
     const path = event.path;
     const method = event.httpMethod;
 
-    if (method === 'GET' && path.endsWith('/conversations')) return listConversations(event, origin);
-    if (method === 'GET' && path.endsWith('/messages')) return listMessages(event, origin);
-    if (method === 'GET' && path.endsWith('/membership-history')) return membershipHistory(event, origin);
+    if (method === 'GET' && path.endsWith('/conversations')) return listConversations(event, origin, ceiling);
+    if (method === 'GET' && path.endsWith('/messages')) return listMessages(event, origin, ceiling);
+    if (method === 'GET' && path.endsWith('/membership-history')) return membershipHistory(event, origin, ceiling);
 
     return respond(404, { error: 'Not found' }, origin);
   } catch (error) {
@@ -203,13 +217,16 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
 // ── VIEW: read the archive (Athena) ──────────────────────────────────────────
 
-async function listConversations(event: APIGatewayProxyEvent, origin?: string): Promise<APIGatewayProxyResult> {
+async function listConversations(event: APIGatewayProxyEvent, origin?: string, ceiling: ClassificationCeiling = null): Promise<APIGatewayProxyResult> {
   const limit = Math.min(Number(event.queryStringParameters?.limit || '50'), 200);
+  // A14 Scoped: keep only conversations at/below the caller's classification ceiling.
+  const scope = (list: AdminConversationSummaryLike[]) =>
+    ceiling === null ? list : list.filter((c) => classificationAllowed(c?.metadata?.modelTier, ceiling));
   // Aurora mode: read from Aurora via the data-plane Lambda (sub-second) instead
   // of the slow Athena archive (see BUG #21).
   if (hasDataPlane()) {
     try {
-      return respond(200, { conversations: await auroraListConversations(limit) }, origin);
+      return respond(200, { conversations: scope(await auroraListConversations(limit)) }, origin);
     } catch (err) {
       console.error('[AdminConversations] Aurora list failed:', err);
       return respond(200, { conversations: [], archiveError: (err as Error).message }, origin);
@@ -261,13 +278,47 @@ async function listConversations(event: APIGatewayProxyEvent, origin?: string): 
     };
   }).filter((c) => c.channelArn);
 
-  return respond(200, { conversations }, origin);
+  return respond(200, { conversations: scope(conversations) }, origin);
 }
 
-async function listMessages(event: APIGatewayProxyEvent, origin?: string): Promise<APIGatewayProxyResult> {
+// Minimal shape the classification scope reads (both the Aurora data-plane summary
+// and the Athena-built summary carry metadata.modelTier = the channel classification).
+type AdminConversationSummaryLike = { metadata?: { modelTier?: string } };
+
+// A14 Scoped guard for a SINGLE channel (messages / membership-history take a
+// channelArn directly, so the caller could replay an ARN outside their scoped
+// list). Resolve the channel's classification and deny if it exceeds the ceiling.
+// Fail-CLOSED: if the classification cannot be determined, deny.
+async function channelClassificationAllowed(channelArn: string, ceiling: ClassificationCeiling): Promise<boolean> {
+  if (ceiling === null) return true; // Full
+  let cls: string | undefined;
+  if (hasDataPlane()) {
+    try {
+      const list = await auroraListConversations(500);
+      cls = (list as Array<{ channelArn?: string; metadata?: { modelTier?: string } }>)
+        .find((c) => c.channelArn === channelArn)?.metadata?.modelTier;
+    } catch { cls = undefined; }
+  } else {
+    const safeArn = channelArn.replace(/'/g, "''");
+    try {
+      const r = await runAthena(
+        `SELECT arbitrary(user_type) AS classification FROM conversations
+         WHERE json_extract_scalar(line, '$.Payload.ChannelArn') = '${safeArn}' LIMIT 1`,
+      );
+      cls = r.rows[0]?.[r.columns.indexOf('classification')];
+    } catch { cls = undefined; }
+  }
+  if (cls === undefined) return false; // cannot determine -> fail closed
+  return classificationAllowed(cls, ceiling);
+}
+
+async function listMessages(event: APIGatewayProxyEvent, origin?: string, ceiling: ClassificationCeiling = null): Promise<APIGatewayProxyResult> {
   const channelArn = event.queryStringParameters?.channelArn || '';
   if (!channelArn || !isValidChannelArn(channelArn)) {
     return respond(400, { error: 'Valid channelArn query parameter required' }, origin);
+  }
+  if (!(await channelClassificationAllowed(channelArn, ceiling))) {
+    return respond(403, { error: 'Conversation is outside your classification scope' }, origin);
   }
   // Aurora mode: fast Aurora read via the data-plane (BUG #21).
   if (hasDataPlane()) {
@@ -356,10 +407,13 @@ async function listMessages(event: APIGatewayProxyEvent, origin?: string): Promi
 // Chime has no membership-history API; the archive captures CREATE/DELETE
 // channel-membership + moderator events, so this is the system of record for
 // "who joined/left when". Required for audits.
-async function membershipHistory(event: APIGatewayProxyEvent, origin?: string): Promise<APIGatewayProxyResult> {
+async function membershipHistory(event: APIGatewayProxyEvent, origin?: string, ceiling: ClassificationCeiling = null): Promise<APIGatewayProxyResult> {
   const channelArn = event.queryStringParameters?.channelArn || '';
   if (!channelArn || !isValidChannelArn(channelArn)) {
     return respond(400, { error: 'Valid channelArn query parameter required' }, origin);
+  }
+  if (!(await channelClassificationAllowed(channelArn, ceiling))) {
+    return respond(403, { error: 'Conversation is outside your classification scope' }, origin);
   }
   // Aurora mode: fast Aurora read via the data-plane (BUG #21).
   if (hasDataPlane()) {
