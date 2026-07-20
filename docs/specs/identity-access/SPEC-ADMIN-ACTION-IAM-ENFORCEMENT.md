@@ -1,8 +1,13 @@
 # Making admin-console actions IAM-enforceable
 
-**Status:** Proposed (design). Not yet built. An interim Cognito-group gate ships today
-(`callerCanReadArchive`); this spec replaces it with an IAM-enforceable capability set, driven by
-the persona/data matrix in section 3.
+**Status:** Built, flag-gated (opt-in), pending deploy validation. The enforcement is off by default;
+`-c adminIamEnforcement=true` (backend) plus `VITE_ADMIN_IAM_ENFORCEMENT=true` (admin app) turns it on,
+and the interim Cognito-group gate (`callerCanReadArchive`) stays as the `ae-cognito` fallback. The
+example personas (section 2) are opt-in behind `-c enableAdminPersonas=true`. What is wired: the
+admin-conversations reads (`view-conversations` on the sign-on role, `view-messages` exchange-vended),
+the analytics plane per capability (`view-events`, `view-user-activity`, `view-moderation-audit` on their
+own resources; `view-quality`+`view-analytics` bundled on the root), and `manage-profiles`. See section 5
+for the current split and section 10 for what remains.
 
 **Related:** [`SPEC-ADMIN-IDENTITY.md`](SPEC-ADMIN-IDENTITY.md) (admin identity + capability table),
 [`SPEC-MODERATION.md`](SPEC-MODERATION.md) (moderation surfaces),
@@ -149,11 +154,17 @@ role**.
 - **IAM-enforced (3a).** The credential exchange maps each Chime capability to `chime:*` actions and
   vends a session policy scoped to exactly those, intersected with the plane role ceiling. A role
   whose policy omits `chime:RedactChannelMessage` cannot redact.
-- **NOT IAM-enforced (3b).** The archive and analytics reads and the moderation-audit write are
-  Cognito-JWT authorized with an application group check (`callerIsAdmin`, and the interim
-  `callerCanReadArchive`). Any admin holds all of them.
+- **IAM-enforced (3b), under the flag.** With `adminIamEnforcement`, the archive and analytics read
+  resources (and the moderation-audit write) are `AWS_IAM`-authorized per resource; the sign-on role
+  (and the opt-in persona roles) carry `execute-api:Invoke` for exactly their capabilities; the handler
+  trusts the gateway-vetted principal (`isAdminIamEnforcedCall`) and, for the analytics plane, rejects a
+  queryType that does not belong to the resource's capability. A role that omits a capability's resource
+  is denied at the gateway. Default (flag off): the Cognito-JWT + group-check path below, unchanged.
+- **Fallback (flag off, or a Cognito-JWT call).** The reads stay Cognito-JWT authorized with an
+  application group check (`callerIsAdmin`, `callerCanReadArchive`, `callerCanManageProfiles`).
 - **Precedent.** `adminAuthMode=service` already runs the admin and analytics API behind an IAM
-  authorizer; `isServiceAdminCall` / `serviceAdminClaims` derive the actor from the signed principal.
+  authorizer; `isServiceAdminCall` / `iamPrincipalClaims` derive the actor from the signed principal, and
+  A14 generalizes that to per-resource enforcement.
 
 ## 6. Enforcement mechanism (bringing 3b up to 3a)
 
@@ -221,11 +232,23 @@ in `ae-cognito` mode and require the IAM plane only in `service` / `federated` m
 
 ## 10. Migration and phasing
 
-- **P0.** This matrix + capability catalog; IAM authorizer on `POST /admin/events`; exchange vend for
-  `view-events`; frontend signing for the event view (plan item A13). Proves the pattern.
-- **P1.** `view-conversations` + `view-messages` with the scope condition.
-- **P2.** `view-quality` + `view-analytics` + the persona roles and IAM policies; docs.
-- **P3.** Retire the interim `callerCanReadArchive` group gate (or demote to the `ae-cognito` fallback).
+- **P0 (built).** The capability catalog (`backend/lib/config/admin-capabilities.ts`) + the analytics
+  queryType partition (`backend/lambda/src/lib/admin-capability-map.ts`); the flag-gated `AWS_IAM`
+  authorizer on the admin-conversations reads; the sign-on role teeth.
+- **P1 (built).** `view-conversations` on the sign-on role; `view-messages` (A2) exchange-vended, short
+  lived + audited; frontend SigV4 signing (`frontend/packages/admin/src/services/sigv4Fetch.ts`).
+- **P2 (built).** `view-events`, `view-user-activity`, `view-moderation-audit` on their own analytics
+  resources; `view-quality`+`view-analytics` bundled on the analytics root; `manage-profiles` on the
+  profile routes; the four example persona roles + their per-capability IAM policies (opt-in).
+- **P3 (built).** The interim `callerCanReadArchive` and `callerCanManageProfiles` group gates are
+  demoted to the `ae-cognito` fallback: under IAM enforcement the gateway is the control and the handler
+  trusts the signed principal; a Cognito-JWT call still resolves through the group gate.
+
+**Remaining (deploy-validated, tracked):** the `Scoped` cells (tier / assistant-ownership / membership
+conditions) are not yet expressed as IAM conditions; a persona that holds a capability holds it fully,
+not scoped. `view-security` (the membership-audit + deployment routes, A17/A18) keeps its Cognito
+authorizer for now. The Athena analytics stack enforces at the coarse analytics-read level (the sensitive
+sub-resources are Aurora-only). The on-flag runtime path is verified on deploy.
 
 ## 11. Audit tie-in
 
