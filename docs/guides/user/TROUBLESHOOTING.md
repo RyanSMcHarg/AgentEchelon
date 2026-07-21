@@ -854,7 +854,7 @@ The handler no longer VPC-attaches (project decision 018). Retrieval and drift r
 wires the handler with `AURORA_DATA_PLANE_ARN` + `lambda:InvokeFunction`, not a VpcConfig. Verify the handler
 shows `Vpc=""` and `AURORA_DATA_PLANE_ARN` set. If you are on an older build that still VPC-attaches the
 handler, either roll back `enableLiveDrift` (redeploy the 3 tier stacks without it, plus `-c appUrl` to avoid
-the CORS trap in §... credential reset) or add `ssm` + `cognito-idp` + `lambda` interface endpoints. See
+the CORS trap in §18b) or add `ssm` + `cognito-idp` + `lambda` interface endpoints. See
 `docs/guides/developer/RAG.md` and `docs/guides/admin/INFRASTRUCTURE-COST.md`.
 
 ### Prevention
@@ -907,8 +907,80 @@ retrieval. The conversation's assistant is a real tier boundary, not just a mode
 
 ---
 
+## 18. Deploy landmines: stale bundles, single-stack context, CORS, Windows
+
+These bite any deployment (not just the reference one). The one-command `npm run deploy`
+avoids all of them; they show up when you run `cdk deploy` by hand or target a single stack.
+
+### 18a. Edited a Lambda but the deploy shipped nothing ("no changes" / identical bundle hash)
+
+**Symptom.** You change a `.ts` module a Lambda imports, `cdk deploy`, and CloudFormation
+reports no change to that function (or it deploys but the old behavior persists).
+
+**Root cause.** CDK's `NodejsFunction` esbuild bundles the on-disk **compiled `.js`** of imported
+modules, not the `.ts` source. Without a fresh compile it bundles a stale `.js`, so the edit
+never ships and the bundle hash is unchanged.
+
+**Fix.** `npm run build` (in `backend/`) before `cdk deploy`, or use `npm run deploy` (its step 0
+compiles first). Verify by confirming the function's asset hash changed in the deploy output.
+
+### 18b. A single-stack `cdk deploy <Stack>` reverts feature flags or breaks CORS
+
+**Symptom.** After deploying ONE stack by hand, previously-enabled features turn off (admin
+IAM enforcement, admin personas, membership audit, ...), or the live app suddenly shows
+"Failed to fetch" / CORS errors on every request.
+
+**Root cause.** Context-gated behavior reads `cdk` context. The persisted per-instance context
+lives in `backend/deploy.config.json` and is normally forwarded by `npm run deploy`. A bare
+`cdk deploy <Stack>` passes NONE of it, so every `-c`-gated flag falls back to its default (often
+OFF), and `appUrl` defaults to `http://localhost:5173`, which sets the APIs' `ALLOWED_ORIGIN` to
+localhost and breaks CORS for the real CloudFront origin.
+
+**Fix.** Never deploy a stack without the full context and a real `appUrl`:
+
+```bash
+# Prefer the one-command path (forwards deploy.config.json + resolves appUrl live):
+npm run deploy
+
+# If you MUST target specific stacks, pass EVERY deploy.config.json key plus the live appUrl,
+# and --exclusively so CDK does not pull unrelated stacks into the deploy:
+APP_URL=$(MSYS_NO_PATHCONV=1 aws cloudformation describe-stacks --stack-name AgentEchelonFrontend \
+  --query "Stacks[0].Outputs[?OutputKey=='DistributionUrl'].OutputValue" --output text)
+npx cdk deploy AgentEchelonCognitoAuth AgentEchelonS3Storage --exclusively --require-approval never \
+  $(node -e "const c=require('./backend/deploy.config.json');for(const[k,v]of Object.entries(c)){if(!k.startsWith('_')&&v!==''&&v!=null)process.stdout.write(' --context '+k+'='+v)}") \
+  --context appUrl=$APP_URL
+```
+
+**Prevention.** Treat `deploy.config.json` as required input to every backend deploy. Build the
+`--context` flags programmatically (as above) rather than as one shell string: a value with a
+space, split by the shell, reaches `cdk` as a bare token and fails with `assignment.split is not
+a function`.
+
+### 18c. Windows / Git-Bash: mangled ARNs and an AWS CLI emoji crash
+
+**Symptom.** ARNs or `/`-paths in a deploy/CLI command become `C:/Program Files/Git/...`; or the
+AWS CLI aborts printing a resource with a `UnicodeEncodeError: 'charmap'` on emoji output.
+
+**Fix.** Prefix commands that carry ARNs or absolute paths with `MSYS_NO_PATHCONV=1`. For CLI
+output that may include emoji, set `PYTHONIOENCODING=utf-8 PYTHONUTF8=1`.
+
+### 18d. `SignatureDoesNotMatch` at deploy time
+
+**Symptom.** CDK/CLI calls fail `SignatureDoesNotMatch` even though `aws sts get-caller-identity`
+worked earlier.
+
+**Root cause.** Stale static credentials in the environment (`AWS_ACCESS_KEY_ID` /
+`AWS_SECRET_ACCESS_KEY` / `AWS_SESSION_TOKEN`) shadow, and conflict with, the profile you intend
+to use.
+
+**Fix.** Use the profile and clear the static vars so they cannot shadow it:
+`unset AWS_ACCESS_KEY_ID AWS_SECRET_ACCESS_KEY AWS_SESSION_TOKEN; export AWS_PROFILE=<profile>`.
+
+---
+
 ## See also
 
 - `docs/specs/experiments-battle/SPEC-BATTLE.md` - battle design; clarification as a measured dimension
 - `CLAUDE.md` - tier authorization, post-deploy backfill steps
 - `README.md` "Setup" - where CDK outputs / `.env` values come from
+- §18 - deploy landmines (stale bundles, single-stack context, CORS, Windows)
