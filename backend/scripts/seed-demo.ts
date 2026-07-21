@@ -46,6 +46,7 @@ import { SSMClient, PutParameterCommand } from '@aws-sdk/client-ssm';
 import { seedAllProfileDefinitions } from '../lambda/src/lib/seed-profile-definitions.js';
 import * as fs from 'fs';
 import * as path from 'path';
+import { randomBytes } from 'crypto';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const cognitoClient = new CognitoIdentityProviderClient({ region });
@@ -60,7 +61,19 @@ const ssmClient = new SSMClient({ region });
 // `${SSM_ROOT}/assistant/{tier}/welcome-orientation`, so a case/name mismatch means it never loads.
 const SSM_ROOT = `/${(process.env.AE_INSTANCE_NAME || 'agent-echelon').trim()}`;
 
-const DEMO_PASSWORD = 'StratumDemo2026!';
+/**
+ * The demo-user password. Overridable via the `DEMO_PASSWORD` env var (set it to a known value if you
+ * want stable demo logins across re-seeds); otherwise a strong RANDOM password is generated per run, so
+ * NO default credential ships in the repo. Either way it is written to the e2e credentials secret and
+ * printed at the end, and every seed run RE-SETS it on existing users too (see below), so the users and
+ * the secret always match — the e2e suite reads the password from that secret, never a hardcoded value.
+ */
+function generateDemoPassword(): string {
+  // Cognito-valid by construction: upper (`D`) + lower + digit (`7`) + symbol (`!`), plus ~16 chars of
+  // entropy from a URL-safe random string (stripped to alphanumerics).
+  return `Demo${randomBytes(12).toString('base64url').replace(/[^A-Za-z0-9]/g, '')}7!`;
+}
+const DEMO_PASSWORD = process.env.DEMO_PASSWORD || generateDemoPassword();
 // The e2e suite reads its users + pool/client from this secret (tests/e2e/helpers/test-credentials.ts).
 // seed-demo now WRITES it, so a fresh deploy (new pool) never leaves it stale — which is what made
 // every UI sign-in in the suite time out (wrong pool + wrong emails/passwords).
@@ -178,7 +191,7 @@ async function createDemoUser(
     console.log(`  ✓ ${email} created with tier=${tier}`);
   } catch (error: any) {
     if (error.name === 'UsernameExistsException') {
-      console.log(`  - ${email} already exists, updating tier...`);
+      console.log(`  - ${email} already exists, updating tier + password...`);
       await cognitoClient.send(
         new AdminUpdateUserAttributesCommand({
           UserPoolId: userPoolId,
@@ -187,6 +200,16 @@ async function createDemoUser(
             { Name: 'custom:tier', Value: tier },
             { Name: 'custom:approved', Value: 'true' },
           ],
+        })
+      );
+      // Re-set the (possibly newly-generated) password so an existing user still matches the secret
+      // written below — otherwise a random-default re-seed would desync the users from the e2e creds.
+      await cognitoClient.send(
+        new AdminSetUserPasswordCommand({
+          UserPoolId: userPoolId,
+          Username: email,
+          Password: DEMO_PASSWORD,
+          Permanent: true,
         })
       );
     } else {
