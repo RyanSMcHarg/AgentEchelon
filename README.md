@@ -10,7 +10,7 @@ The point is centralization. Instead of standing up a separate tool for each use
 
 ## Why Agent Echelon
 
-Most agentic systems are a model, tools, memory, and an orchestration loop. Agent Echelon ships each of those and lets you customize or swap them, then wraps them in the enterprise layers - governed multi-party conversation, omnichannel surfaces, and access enforced in the cloud's own IAM. It is organized as four layers, each running on the one below:
+Most agentic systems are a model, tools, memory, and an orchestration loop. Agent Echelon ships each of those and lets you customize or swap them, then wraps them in the enterprise layers - governed multi-party conversation and access enforced in the cloud's own IAM (with an omnichannel edge designed and seamed, below). It is organized as four layers, each running on the one below:
 
 - **Interface layer.** The surfaces a participant meets: a web console for users and an admin console today; an embedded widget, phone/voice (PSTN), SMS, and integration into existing third-party tools are designed and seamed.
 - **Communication layer.** The connectivity that moves messages and keeps context: a durable conversation that *is* the memory, a server-side hook on every message, and event capture with per-message metadata - each transport on a provider you choose.
