@@ -29,6 +29,8 @@ import {
   validateDefinitionBody,
   definitionParamName,
   serializeSeedDefinition,
+  ensureModelsBundle,
+  DEFAULT_MODEL,
 } from './active-profile.js';
 
 export const MANIFEST_SCHEMA_VERSION = 1 as const;
@@ -124,7 +126,10 @@ async function readDefinition(
 /** Export a version as an instance-agnostic manifest (§5). */
 export async function exportManifest(ssm: SSMClient, ssmRoot: string, profileName: string, version?: number): Promise<ProfileManifest> {
   const { def, sourceVersion } = await readDefinition(ssm, ssmRoot, profileName, version);
-  const body = bodyFrom(def);
+  // Backfill a complete `models` bundle so a LEGACY (pre-U2) definition exports its actual editable values
+  // (base + classifier + per-intent), not a bare modelKey — otherwise the manifest is a hash with nothing to
+  // edit. The contentHash is computed over this same (backfilled) body so a verbatim re-import still matches.
+  const body = ensureModelsBundle(bodyFrom(def));
   const manifest: ProfileManifest = {
     schemaVersion: MANIFEST_SCHEMA_VERSION,
     kind: 'assistant-profile',
@@ -193,9 +198,23 @@ export async function importManifest(
   const body = bodyFrom(m.body as Partial<ProfileDefinitionBody>);
   errors.push(...validateDefinitionBody(body));
 
-  // 2. Model — must be in the TARGET's catalog (its InvokeModel allowlist). Never widen (§7).
-  if (body.modelKey && !(body.modelKey in opts.catalog)) {
-    errors.push(`model '${body.modelKey}' is not in the target's model catalog (allowlist); reject or remap`);
+  // 2. Models — EVERY model the imported version selects (base, classifier, complex, per-intent
+  //    primary/fallback) must be in the TARGET's catalog (its InvokeModel allowlist). Never widen (§7);
+  //    an unresolvable model is a reject-or-remap, never a silently-broadened boundary.
+  const checkTargetModel = (mk: string | undefined, label: string) => {
+    // The `'default'` sentinel resolves to the TARGET's classification default, so it is always valid on
+    // import (it names no source-specific model) — skip the allowlist check for it.
+    if (mk && mk !== DEFAULT_MODEL && !(mk in opts.catalog)) errors.push(`${label} '${mk}' is not in the target's model catalog (allowlist); reject or remap`);
+  };
+  checkTargetModel(body.modelKey, 'model');
+  if (body.models) {
+    checkTargetModel(body.models.default, 'models.default');
+    checkTargetModel(body.models.classifier, 'models.classifier');
+    checkTargetModel(body.models.complex, 'models.complex');
+    for (const [intent, route] of Object.entries(body.models.byIntent ?? {})) {
+      checkTargetModel(route.primary, `models.byIntent['${intent}'].primary`);
+      checkTargetModel(route.fallback, `models.byIntent['${intent}'].fallback`);
+    }
   }
 
   // 3. Target identity — the named profile (or the remap) must be a provisioned assistant identity on
@@ -204,8 +223,15 @@ export async function importManifest(
   if (!targetName) errors.push('no target profileName');
   else if (!opts.knownProfile(targetName)) errors.push(`target profile '${targetName}' is not provisioned on this instance`);
 
-  // 4. contentHash integrity (best-effort tamper check — recompute vs the carried hash).
-  if (m.contentHash && m.contentHash !== contentHashOf(body)) errors.push('contentHash does not match body (tampered manifest)');
+  // 4. contentHash is a best-effort PROVENANCE stamp, NOT an edit lock. Hand-editing the exported manifest
+  //    (change a model, add a tool) then re-importing is the intended workflow (§5), so a mismatch must NOT
+  //    block it: the landed draft re-derives its own configId from the edited body, staying self-consistent.
+  //    Integrity for cross-instance transfer is the OPTIONAL P4 SIGNATURE (verified above), not this hash —
+  //    a signed manifest whose body was altered already fails the signature check. So here we only LOG a
+  //    mismatch (it just means "hand-edited since export"); we never reject on it.
+  if (m.contentHash && m.contentHash !== contentHashOf(body)) {
+    console.log('[profile-manifest] contentHash differs from body — hand-edited since export; accepting (draft re-hashes from the edited body)');
+  }
 
   if (errors.length) throw new ProfileManifestError('manifest failed target validation', errors);
 

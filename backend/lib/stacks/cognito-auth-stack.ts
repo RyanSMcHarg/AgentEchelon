@@ -5,7 +5,6 @@ import { adminOrigin, sharedOrigins } from '../config/app-origins';
 import {
   ADMIN_PERSONAS,
   ADMIN_PERSONA_GROUP,
-  personaExecuteApiResources,
 } from '../config/admin-capabilities';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as iam from 'aws-cdk-lib/aws-iam';
@@ -35,6 +34,13 @@ import { defaultProfileRegistry as profiles } from '../profile-registry';
 
 export interface CognitoAuthStackProps extends cdk.StackProps {
   appInstanceArn: string;
+  /**
+   * SSM parameter NAME (a plain string, so no circular stack dep) that the S3 storage
+   * stack publishes the attachments-bucket ARN to. The credential exchange resolves it at
+   * cold start to build the S3 attachment session policy (admin conversation attachment
+   * review). Absent ⇒ the S3 attachment vend is unavailable.
+   */
+  attachmentsBucketArnParam?: string;
 }
 
 export class CognitoAuthStack extends cdk.Stack {
@@ -49,11 +55,27 @@ export class CognitoAuthStack extends cdk.Stack {
    */
   public readonly adminSignOnRoleArn: string;
   /**
+   * The admin-PLANE exchange role ARN (`${sub}-admin`, standing app-instance-admin). Exposed
+   * so the S3 storage stack can grant it `s3:GetObject` on the attachments bucket (the ceiling
+   * the exchange's per-channel session policy intersects), keeping the bucket grant with the
+   * bucket and out of a circular stack dependency.
+   */
+  public readonly exchangeRoleAdminPlaneArn: string;
+  /**
    * A14 persona sign-on role ARNs by persona key, populated only when
    * `-c enableAdminPersonas=true`. Passed to the analytics + experiments stacks
    * so each persona role gets execute-api teeth for exactly its capability set.
    */
   public readonly adminPersonaRoleArns: Record<string, string> = {};
+  /**
+   * A14 Scoped: the caller's classification ceiling is resolved from their assumed-role ARN
+   * (`lib/caller-scope.ts`), so the analytics + admin-conversations Lambdas need a role -> ceiling
+   * map. A JSON array of `{ role: <arn>, ceiling: <classification | 'full'> }` built from the
+   * per-clearance Identity-Pool roles, passed to those stacks as the `CLASSIFICATION_ROLE_CEILINGS`
+   * env. No Cognito call is made at read time, so the VPC-attached analytics Lambda needs no path
+   * to the Cognito API.
+   */
+  public readonly classificationRoleCeilings: string;
   /**
    * UserFeedback (thumbs) table. Exposed so the Aurora analytics stack can
    * read it for the per-variant thumbs join.
@@ -432,6 +454,11 @@ export class CognitoAuthStack extends cdk.Stack {
     }
     clearanceGroupResources['admins'].roleArn = adminAuthRole.roleArn;
 
+    // A14 Scoped: `this.classificationRoleCeilings` (the role -> ceiling map the analytics +
+    // admin-conversations handlers use) is assembled LATER in this constructor — it must also include
+    // the credential-exchange ADMIN + ADMIN-PLANE roles, which aren't created until below. See the
+    // assignment after the exchange roles are defined.
+
     // Token-based role selection: the Identity Pool hands each authenticated
     // user the role from their group's roleArn; ambiguous/absent → the default
     // `authenticated` role (basic, most-restrictive).
@@ -645,6 +672,8 @@ export class CognitoAuthStack extends cdk.Stack {
       actions: ['sts:TagSession'],
       conditions: { StringLike: { 'aws:RequestTag/sub': '*' } },
     }));
+    // Exposed for the S3 storage stack's attachment-read grant (see props docs).
+    this.exchangeRoleAdminPlaneArn = exchangeRoleAdminPlane.roleArn;
 
     // The exchange Lambda may assume those rung roles (with TagSession).
     credentialExchangeRole.addToPolicy(new iam.PolicyStatement({
@@ -655,6 +684,24 @@ export class CognitoAuthStack extends cdk.Stack {
         exchangeRolePremium.roleArn, exchangeRoleAdmin.roleArn, exchangeRoleAdminPlane.roleArn,
       ],
     }));
+
+    // A14 Scoped: the role -> ceiling map the analytics + admin-conversations handlers use to resolve
+    // the caller's classification ceiling from their assumed-role ARN (no Cognito call, so it works from
+    // an isolated VPC). Admin Identity-Pool role -> Full; each per-classification role -> its tier. CRUCIALLY
+    // it must ALSO include the credential-exchange ADMIN + ADMIN-PLANE roles: admin conversation/archive
+    // reads deliberately run under the elevated admin-plane exchange identity (read ANY channel without
+    // membership), so requests arrive bearing `ExchangeRoleAdminPlane`, NOT the Identity-Pool admin role.
+    // Omitting them made a full admin's conversation read fail-closed to the floor ("outside your
+    // classification scope"). Both elevated admin identities -> Full (they are only ever vended to admins).
+    this.classificationRoleCeilings = this.toJsonString([
+      { role: adminAuthRole.roleArn, ceiling: 'full' },
+      { role: exchangeRoleAdmin.roleArn, ceiling: 'full' },
+      { role: exchangeRoleAdminPlane.roleArn, ceiling: 'full' },
+      ...Object.entries(classificationRoles).map(([classification, role]) => ({
+        role: role.roleArn,
+        ceiling: classification,
+      })),
+    ]);
 
     const credentialExchangeFn = new lambdaNodeJs.NodejsFunction(this, 'CredentialExchangeFunction', {
       entry: './lambda/src/credential-exchange.ts',
@@ -868,179 +915,6 @@ export class CognitoAuthStack extends cdk.Stack {
       exportName: `${this.stackName}-UserManagementApiUrl`,
     });
 
-    // ============================================================
-    // Admin Conversation API
-    // ============================================================
-
-    const adminConversationRole = new iam.Role(this, 'AdminConversationRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      inlinePolicies: {
-        // READ-ONLY over the archive. Live Chime moderation (list members, add-self,
-        // add/remove member, redact, delete) moved CLIENT-SIDE to the admin's own
-        // `${sub}-admin` identity (docs/SPEC-ADMIN-IDENTITY.md), so this role holds NO
-        // Chime bearer permissions.
-        // Archive-backed viewing: query the `conversations` Glue table over the
-        // S3 archive (mirrors AgentEchelonAnalytics' analytics-query Lambda grants).
-        AthenaQuery: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({
-              actions: ['athena:StartQueryExecution', 'athena:GetQueryExecution', 'athena:GetQueryResults'],
-              resources: [`arn:aws:athena:${this.region}:${this.account}:workgroup/${ATHENA_WORKGROUP_NAME}`],
-            }),
-            new iam.PolicyStatement({
-              actions: ['glue:GetTable', 'glue:GetPartitions', 'glue:GetDatabase'],
-              resources: [
-                `arn:aws:glue:${this.region}:${this.account}:catalog`,
-                `arn:aws:glue:${this.region}:${this.account}:database/${ANALYTICS_DB_NAME}`,
-                `arn:aws:glue:${this.region}:${this.account}:table/${ANALYTICS_DB_NAME}/*`,
-              ],
-            }),
-            new iam.PolicyStatement({
-              // Archive bucket is both the query source and the Athena results
-              // location. Name is deterministic (analytics-stack).
-              actions: ['s3:GetBucketLocation', 's3:GetObject', 's3:ListBucket', 's3:PutObject'],
-              resources: [
-                `arn:aws:s3:::${ANALYTICS_PREFIX}-conversation-archive-${this.account}-${this.region}`,
-                `arn:aws:s3:::${ANALYTICS_PREFIX}-conversation-archive-${this.account}-${this.region}/*`,
-              ],
-            }),
-            // In Athena mode the archive bucket is SSE-KMS on the analytics stack's
-            // customer CMK. This stack is created BEFORE the analytics stack, so the key
-            // ARN cannot be imported; scope decrypt to KMS-via-S3 instead. Combined with
-            // the S3 statement above (archive bucket only), this is effectively
-            // archive-scoped. Dead-but-harmless in Aurora mode (no Athena there).
-            new iam.PolicyStatement({
-              actions: ['kms:Decrypt', 'kms:GenerateDataKey'],
-              resources: ['*'],
-              conditions: {
-                StringEquals: { 'kms:ViaService': `s3.${this.region}.amazonaws.com` },
-              },
-            }),
-          ],
-        }),
-      },
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
-      ],
-    });
-
-    const adminConversationFn = new lambdaNodeJs.NodejsFunction(this, 'AdminConversationFunction', {
-      entry: './lambda/src/admin-conversations.ts',
-      handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: cdk.Duration.seconds(20),
-      memorySize: 512,
-      role: adminConversationRole,
-      environment: {
-        ...adminAuthEnv(this),
-        APP_INSTANCE_ARN: props.appInstanceArn,
-        // A14 Scoped: the pool the caller's classification ceiling is resolved against.
-        USER_POOL_ID: this.userPool.userPoolId,
-        ATHENA_WORKGROUP: ATHENA_WORKGROUP_NAME,
-        ATHENA_DATABASE: ANALYTICS_DB_NAME,
-        ALLOWED_ORIGIN: adminAppUrl,
-        // Aurora mode: the handler resolves this SSM param at cold start to get the
-        // data-plane Lambda ARN and reads conversations from Aurora instead of the
-        // slow Athena archive (BUG #21). Static param name (no cross-stack dep — a
-        // direct ARN prop would be circular); absent param in Athena mode → the
-        // handler falls back to Athena.
-        AURORA_DATA_PLANE_ARN_PARAM: SHARED_SSM.auroraDataPlaneArn,
-      },
-      bundling: { minify: false, forceDockerBundling: false },
-    });
-
-    // Read the data-plane ARN param at runtime, and invoke that Lambda. The exact
-    // function ARN is unknown at synth (it lives in the Aurora stack, which depends
-    // on THIS stack), so the invoke grant is name-pattern-scoped to the data-plane
-    // function. Both are no-ops in Athena mode (the param is absent).
-    adminConversationFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ['ssm:GetParameter'],
-        resources: [
-          `arn:aws:ssm:${this.region}:${this.account}:parameter${SHARED_SSM.auroraDataPlaneArn}`,
-        ],
-      }),
-    );
-    // A14 Scoped: resolve the caller's classification ceiling from their Cognito
-    // groups (email is a sign-in alias, so the username is a distinct UUID: find
-    // the user by sub, then list their groups). Read-only, this pool only.
-    adminConversationFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ['cognito-idp:ListUsers', 'cognito-idp:AdminListGroupsForUser'],
-        resources: [this.userPool.userPoolArn],
-      }),
-    );
-    adminConversationFn.addToRolePolicy(
-      new iam.PolicyStatement({
-        actions: ['lambda:InvokeFunction'],
-        resources: [
-          `arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}AnalyticsAuror*DataPlaneLambda*`,
-        ],
-      }),
-    );
-
-    const adminConversationApi = new apigateway.RestApi(this, 'AdminConversationApi', {
-      restApiName: 'Agent Echelon Admin Conversations',
-      defaultCorsPreflightOptions: {
-        allowOrigins: [adminAppUrl],
-        allowMethods: ['GET', 'OPTIONS'],
-        allowHeaders: ['Content-Type', 'Authorization'],
-      },
-      deployOptions: {
-        throttlingBurstLimit: 20,
-        throttlingRateLimit: 10,
-        // Access logging.
-        ...apiAccessLogConfig(this, 'AdminConversationApiAccessLogs'),
-      },
-    });
-
-    // A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): optionally IAM-authorize the
-    // archive endpoints. Default OFF (the current Cognito JWT authorizer). When
-    // `-c adminIamEnforcement=true`, these resources require SigV4 - the console
-    // signs view-conversations with its sign-on Identity-Pool creds and the A2
-    // message read with an exchange-vended execute-api cred. Additive + reversible;
-    // the coordinated frontend signing lands with the same flag.
-    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
-      || this.node.tryGetContext('adminIamEnforcement') === 'true';
-    // Only create the Cognito authorizer when it is actually used (CDK requires
-    // every authorizer be attached to a method); in IAM mode the methods are
-    // AWS_IAM-authorized instead.
-    const archiveAuthOptions: apigateway.MethodOptions = adminIamEnforcement
-      ? { authorizationType: apigateway.AuthorizationType.IAM }
-      : adminApiMethodOptions(this, 'AdminConversationAuthorizer', { userPool: this.userPool });
-    // Tell the handler the archive methods are IAM-authorized, so it trusts the
-    // gateway-vetted signed principal (which already proved it holds the archive
-    // capability) and derives the actor from it instead of a Cognito JWT. Set
-    // ONLY here, so other (still Cognito-authorized) admin Lambdas never trust an
-    // IAM identity — the `ae-cognito` group gate stays their control (auth.ts).
-    if (adminIamEnforcement) {
-      adminConversationFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
-    }
-
-    const adminConversationIntegration = new apigateway.LambdaIntegration(adminConversationFn);
-    const adminRoot = adminConversationApi.root.addResource('admin');
-    const conversationsResource = adminRoot.addResource('conversations');
-    conversationsResource.addMethod('GET', adminConversationIntegration, archiveAuthOptions);
-    conversationsResource
-      .addResource('messages')
-      .addMethod('GET', adminConversationIntegration, archiveAuthOptions);
-    conversationsResource
-      .addResource('membership-history')
-      .addMethod('GET', adminConversationIntegration, archiveAuthOptions);
-
-    // A14 sign-on-role plane (view-conversations, A1/A4): the AdminAuthenticatedRole
-    // (the `admins` group's sign-on Identity-Pool role, empty until now) carries
-    // execute-api:Invoke for the conversation-list + membership-history resources,
-    // so a console signing with its sign-on creds is allowed at the gateway while a
-    // finer role that omits the statement is denied. view-messages (A2) is NOT here
-    // - it is exchange-vended below.
-    for (const p of ['/admin/conversations', '/admin/conversations/membership-history']) {
-      adminAuthRole.addToPolicy(new iam.PolicyStatement({
-        actions: ['execute-api:Invoke'],
-        resources: [adminConversationApi.arnForExecuteApi('GET', p)],
-      }));
-    }
-
     // A14 personas (opt-in, SPEC section 2): four example admin roles, each a
     // group -> sign-on role holding execute-api teeth for EXACTLY its capability
     // set — so a persona that omits a capability is denied that resource at the
@@ -1065,12 +939,10 @@ export class CognitoAuthStack extends cdk.Stack {
           precedence: 1,
           roleArn: personaRole.roleArn,
         }).addDependency(this.userPool.node.defaultChild as cognito.CfnUserPool);
-        for (const r of personaExecuteApiResources(persona, 'admin-conversations')) {
-          personaRole.addToPolicy(new iam.PolicyStatement({
-            actions: ['execute-api:Invoke'],
-            resources: [adminConversationApi.arnForExecuteApi(r.method, r.path)],
-          }));
-        }
+        // The admin-conversations execute-api teeth for this persona are granted in AdminPlaneStack (D1):
+        // it imports this role by ARN (via adminPersonaRoleArns) and attaches the teeth there, so the API
+        // can live outside the IdP stack with no circular dependency — the same cross-stack teeth pattern
+        // already used for the analytics + profile grants.
       }
     }
 
@@ -1079,7 +951,10 @@ export class CognitoAuthStack extends cdk.Stack {
     // messages resource, so the exchange can assume it with a session policy scoped
     // to exactly that resource (short-lived, audited). The resource ARN is handed to
     // the exchange Lambda so it can build that session policy.
-    const messagesExecuteApiArn = adminConversationApi.arnForExecuteApi('GET', '/admin/conversations/messages');
+    // The admin-conversations API now lives in AdminPlaneStack (D1); to avoid a circular stack dep back
+    // to it, scope by a wildcard-api-id ARN with the EXACT method+path — the vended cred can reach only
+    // GET /admin/conversations/messages (the only API exposing that path), staying scoped + audited.
+    const messagesExecuteApiArn = `arn:aws:execute-api:${this.region}:${this.account}:*/*/GET/admin/conversations/messages`;
     exchangeRoleAdminPlane.addToPolicy(new iam.PolicyStatement({
       actions: ['execute-api:Invoke'],
       resources: [messagesExecuteApiArn],
@@ -1088,6 +963,20 @@ export class CognitoAuthStack extends cdk.Stack {
     // Live-Chime actions (members list, add-self/add-member, redact, delete) are NOT
     // here: they run client-side as the admin's own `${sub}-admin` identity
     // (docs/SPEC-ADMIN-IDENTITY.md). This API is read-only over the archive.
+
+    // S3 attachment vend (admin conversation attachment review). The exchange resolves the
+    // attachments-bucket ARN from this SSM param at cold start (the S3 stack publishes it; a
+    // CDK prop would be circular), then vends an `s3:GetObject` session policy scoped to the
+    // named channel's keys. Grant the exchange Lambda read on ONLY that param. The bucket-key
+    // ceiling itself is granted onto exchangeRoleAdminPlane by the S3 stack.
+    if (props.attachmentsBucketArnParam) {
+      credentialExchangeFn.addEnvironment('EXCHANGE_ATTACHMENTS_BUCKET_ARN_PARAM', props.attachmentsBucketArnParam);
+      credentialExchangeRole.addToPolicy(new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['ssm:GetParameter'],
+        resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${props.attachmentsBucketArnParam}`],
+      }));
+    }
 
     // ============================================================
     // User Feedback API
@@ -1231,11 +1120,7 @@ export class CognitoAuthStack extends cdk.Stack {
       targets: [new targets.LambdaFunction(adminConvSyncFn)],
     });
 
-    new cdk.CfnOutput(this, 'AdminConversationApiUrl', {
-      value: `${adminConversationApi.url}admin/conversations`,
-      description: 'Admin conversation API URL',
-      exportName: `${this.stackName}-AdminConversationApiUrl`,
-    });
+    // AdminConversationApiUrl output moved to AdminPlaneStack (D1).
 
     new cdk.CfnOutput(this, 'UserFeedbackApiUrl', {
       value: `${feedbackApi.url}feedback`,

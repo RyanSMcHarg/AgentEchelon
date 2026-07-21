@@ -44,6 +44,7 @@ import {
   resolveBattleSSM,
   botArnKey,
   processorArnKey,
+  routerArnKey,
   Classification,
   auroraDriftWiring,
   AuroraDriftHookup,
@@ -540,6 +541,10 @@ export class AssistantProfileStack extends cdk.Stack {
             resources: [
               shared.agentTasksArn, `${shared.agentTasksArn}/index/*`,
               shared.userTasksArn, `${shared.userTasksArn}/index/*`,
+              // Per-user profile store: the router reads it on WelcomeIntent (once-per-user onboarding
+              // gate) and writes it when the intake completes. Built-in stand-in; unused when an
+              // implementer swaps in their own store via USER_PROFILE_SERVICE_ARN.
+              shared.userProfileArn,
               shared.experimentsArn,
               ...(topo.handlerExperimentsIndex ? [`${shared.experimentsArn}/index/*`] : []),
               ...(battle ? [battle.battleStateArn, `arn:aws:dynamodb:${this.region}:${this.account}:table/${battle.channelBattleConfigName}`] : []),
@@ -585,6 +590,10 @@ export class AssistantProfileStack extends cdk.Stack {
       CLASSIFIER_MODEL_ID: modelCatalog['haiku'].bedrockModelId,
       TASKS_TABLE: shared.agentTasksName,
       USER_TASKS_TABLE: shared.userTasksName,
+      // Built-in per-user profile store (once-per-user onboarding gate + durable facts). An implementer
+      // can leave this and instead set USER_PROFILE_SERVICE_ARN to reach their own store; the client
+      // prefers the ARN when present. See SPEC-USER-PROFILE-AND-ONBOARDING.md.
+      USER_PROFILE_TABLE: shared.userProfileName,
       EXPERIMENTS_TABLE: shared.experimentsName,
       ...abuse.env,
     };
@@ -612,6 +621,14 @@ export class AssistantProfileStack extends cdk.Stack {
       principal: 'lexv2.amazonaws.com',
     });
     const handlerArn = agentHandler.functionArn;
+
+    // Publish the router/AgentHandler ARN (like processor-arn) so the admin console can deep-link to this
+    // classification's Lex-fulfillment/classification Lambda for troubleshooting (SPEC-ASSISTANT-CONFIG).
+    new ssm.StringParameter(this, 'RouterArnParam', {
+      parameterName: routerArnKey(classification),
+      stringValue: agentHandler.functionArn,
+      description: `Router/AgentHandler ARN for ${classification} classification`,
+    });
 
     // ── Lex bot + AppInstanceBot (per profile) ──────────────────────────────
     const lexBotRole = new iam.Role(this, 'LexBotRole', {

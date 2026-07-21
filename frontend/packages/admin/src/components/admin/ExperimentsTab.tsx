@@ -2,6 +2,7 @@ import React, { useEffect, useMemo, useState } from 'react';
 import DataTable from './DataTable';
 import UnsupportedAnalyticsBanner from './UnsupportedAnalyticsBanner';
 import { InfoTooltip } from './AdminHelp';
+import { listProfiles, type ProfileListing } from '../../services/profileService';
 import {
   listExperiments,
   createExperiment,
@@ -23,6 +24,9 @@ import type {
 interface ExperimentsTabProps {
   resultsData: AnalyticsResult | null;
   isLoading: boolean;
+  /** Register a "close the results detail first" handler so global/browser Back steps out of a focused
+   *  experiment's results before walking tab history. */
+  registerBack?: (close: (() => void) | null) => void;
 }
 
 const INTENT_OPTIONS = [
@@ -60,7 +64,7 @@ const IMAGE_GEN_MODEL_OPTIONS = [
 
 const TIER_OPTIONS = ['basic', 'standard', 'premium'] as const;
 
-const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading: _isLoading }) => {
+const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading: _isLoading, registerBack }) => {
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [showCreate, setShowCreate] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -68,17 +72,25 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
   // #8 drill-down: null = show every experiment's comparison; an id = focus that
   // one experiment's results (with a "← All experiments" control to clear it).
   const [selectedExperimentId, setSelectedExperimentId] = useState<string | null>(null);
+  // Available assistant profiles + versions, for profile-vs-profile experiments (SPEC-PORTABLE §6).
+  const [profileOptions, setProfileOptions] = useState<ProfileListing[]>([]);
+  useEffect(() => { listProfiles().then(setProfileOptions).catch(() => setProfileOptions([])); }, []);
 
   // Create form state
   const [newExperiment, setNewExperiment] = useState({
     experimentId: '',
-    // 'intent' is the shipped path; base_model + classification are accepted
-    // by the backend and resolve in a later phase.
-    experimentType: 'intent' as 'intent' | 'base_model' | 'classification',
+    // 'intent'/'base_model'/'classification' vary a MODEL; 'profile' pits two whole assistant PROFILE
+    // versions against each other (SPEC-PORTABLE-VERSIONED-PROFILES §6 — profileRef variants).
+    experimentType: 'intent' as 'intent' | 'base_model' | 'classification' | 'profile',
     intent: 'general_qa',
     tiers: ['standard'] as string[],
     controlModel: 'sonnet',
     treatmentModel: 'gpt_oss_20b',
+    // Profile-vs-profile variants (experimentType === 'profile'): name + optional version (blank ⇒ active).
+    controlProfile: '',
+    controlProfileVersion: '',
+    treatmentProfile: '',
+    treatmentProfileVersion: '',
     controlWeight: 50,
     description: '',
     // Advisory objective (optional). Empty
@@ -117,6 +129,12 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
     loadExperiments();
   }, []);
 
+  // Let global/browser Back close the focused-experiment results detail before walking tab history.
+  useEffect(() => {
+    registerBack?.(selectedExperimentId ? () => setSelectedExperimentId(null) : null);
+    return () => registerBack?.(null);
+  }, [selectedExperimentId, registerBack]);
+
   async function handleCreate() {
     if (!newExperiment.experimentId.trim()) {
       setActionError('Experiment ID is required');
@@ -134,10 +152,22 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
       return;
     }
 
+    // A variant runs either a MODEL (modelKey) or a whole PROFILE version (profileRef) — mutually
+    // exclusive (backend-validated). SPEC-PORTABLE-VERSIONED-PROFILES §6.
+    const isProfileExp = newExperiment.experimentType === 'profile';
+    if (isProfileExp && (!newExperiment.controlProfile || !newExperiment.treatmentProfile)) {
+      setActionError('Profile experiment: pick a profile for both the control and treatment variants.');
+      return;
+    }
+    const runFor = (model: string, profile: string, version: string) =>
+      isProfileExp
+        ? { profileRef: { profileName: profile, ...(version ? { version: Number(version) } : {}) } }
+        : { modelKey: model };
+
     const variants: ExperimentVariant[] = [
       {
         variantId: 'control',
-        modelKey: newExperiment.controlModel,
+        ...runFor(newExperiment.controlModel, newExperiment.controlProfile, newExperiment.controlProfileVersion),
         weight: newExperiment.controlWeight,
         ...(newExperiment.battleEnabled && {
           displayName: newExperiment.controlDisplayName,
@@ -149,7 +179,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
       },
       {
         variantId: 'treatment',
-        modelKey: newExperiment.treatmentModel,
+        ...runFor(newExperiment.treatmentModel, newExperiment.treatmentProfile, newExperiment.treatmentProfileVersion),
         weight: 100 - newExperiment.controlWeight,
         ...(newExperiment.battleEnabled && {
           displayName: newExperiment.treatmentDisplayName,
@@ -202,6 +232,10 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
         tiers: ['standard'],
         controlModel: 'sonnet',
         treatmentModel: 'gpt_oss_20b',
+        controlProfile: '',
+        controlProfileVersion: '',
+        treatmentProfile: '',
+        treatmentProfileVersion: '',
         controlWeight: 50,
         description: '',
         endDate: '',
@@ -240,6 +274,32 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
         ? prev.tiers.filter((t) => t !== tier)
         : [...prev.tiers, tier],
     }));
+  }
+
+  // Detail view: a focused experiment's results open as their own PAGE within the tab (not an inline
+  // scroll below the list), with a Back control; global/browser Back steps out of it too (B8/D2).
+  if (selectedExperimentId) {
+    return (
+      <div className="admin-tab">
+        <div className="admin-tab-header">
+          <nav className="admin-breadcrumb" aria-label="Experiment path">
+            <button className="admin-link-btn" onClick={() => setSelectedExperimentId(null)}>← All experiments</button>
+            <span> / </span>
+            <span>{selectedExperimentId}</span>
+          </nav>
+        </div>
+        {resultsData?.unsupported ? (
+          <UnsupportedAnalyticsBanner result={resultsData} />
+        ) : (
+          <ExperimentResults
+            resultsData={resultsData}
+            experiments={experiments}
+            selectedExperimentId={selectedExperimentId}
+            onClearSelection={() => setSelectedExperimentId(null)}
+          />
+        )}
+      </div>
+    );
   }
 
   return (
@@ -285,7 +345,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
               <select
                 value={newExperiment.experimentType}
                 onChange={(e) => setNewExperiment((p) => {
-                  const experimentType = e.target.value as 'intent' | 'base_model' | 'classification';
+                  const experimentType = e.target.value as 'intent' | 'base_model' | 'classification' | 'profile';
                   // Keep the objective metric valid for the new type: accuracy is
                   // classification-only; quality is base_model/intent-only.
                   let objectiveMetric = p.objectiveMetric;
@@ -295,8 +355,9 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                 })}
               >
                 <option value="intent">Intent (shipped)</option>
-                <option value="base_model">Base Model (planned)</option>
+                <option value="base_model">Base Model (shipped)</option>
                 <option value="classification">Classification (shipped)</option>
+                <option value="profile">Profile vs Profile (shipped)</option>
               </select>
             </label>
             {newExperiment.experimentType === 'intent' && (
@@ -312,28 +373,55 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                 </select>
               </label>
             )}
-            <label>
-              Control Model
-              <select
-                value={newExperiment.controlModel}
-                onChange={(e) => setNewExperiment((p) => ({ ...p, controlModel: e.target.value }))}
-              >
-                {MODEL_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
-            </label>
-            <label>
-              Treatment Model
-              <select
-                value={newExperiment.treatmentModel}
-                onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentModel: e.target.value }))}
-              >
-                {MODEL_OPTIONS.map((opt) => (
-                  <option key={opt.value} value={opt.value}>{opt.label}</option>
-                ))}
-              </select>
-            </label>
+            {newExperiment.experimentType === 'profile' ? (
+              <>
+                {(() => {
+                  const ctrl = profileOptions.find((p) => p.profileName === newExperiment.controlProfile);
+                  const trt = profileOptions.find((p) => p.profileName === newExperiment.treatmentProfile);
+                  return (
+                    <>
+                      <label>
+                        Control Profile
+                        <select value={newExperiment.controlProfile} onChange={(e) => setNewExperiment((p) => ({ ...p, controlProfile: e.target.value, controlProfileVersion: '' }))}>
+                          <option value="">Select a profile…</option>
+                          {profileOptions.map((p) => <option key={p.profileName} value={p.profileName}>{p.profileName}</option>)}
+                        </select>
+                        <select value={newExperiment.controlProfileVersion} onChange={(e) => setNewExperiment((p) => ({ ...p, controlProfileVersion: e.target.value }))} style={{ marginTop: 'var(--space-1)' }}>
+                          <option value="">Active version{ctrl?.activeVersion != null ? ` (v${ctrl.activeVersion})` : ''}</option>
+                          {(ctrl?.versions ?? []).map((v) => <option key={v.version} value={String(v.version)}>v{v.version}{v.active ? ' (active)' : ''}</option>)}
+                        </select>
+                      </label>
+                      <label>
+                        Treatment Profile
+                        <select value={newExperiment.treatmentProfile} onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentProfile: e.target.value, treatmentProfileVersion: '' }))}>
+                          <option value="">Select a profile…</option>
+                          {profileOptions.map((p) => <option key={p.profileName} value={p.profileName}>{p.profileName}</option>)}
+                        </select>
+                        <select value={newExperiment.treatmentProfileVersion} onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentProfileVersion: e.target.value }))} style={{ marginTop: 'var(--space-1)' }}>
+                          <option value="">Active version{trt?.activeVersion != null ? ` (v${trt.activeVersion})` : ''}</option>
+                          {(trt?.versions ?? []).map((v) => <option key={v.version} value={String(v.version)}>v{v.version}{v.active ? ' (active)' : ''}</option>)}
+                        </select>
+                      </label>
+                    </>
+                  );
+                })()}
+              </>
+            ) : (
+              <>
+                <label>
+                  Control Model
+                  <select value={newExperiment.controlModel} onChange={(e) => setNewExperiment((p) => ({ ...p, controlModel: e.target.value }))}>
+                    {MODEL_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                  </select>
+                </label>
+                <label>
+                  Treatment Model
+                  <select value={newExperiment.treatmentModel} onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentModel: e.target.value }))}>
+                    {MODEL_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                  </select>
+                </label>
+              </>
+            )}
             <label>
               Traffic Split (Control %)
               <input
@@ -576,14 +664,8 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                   <div className="admin-inline-actions">
                     <button
                       className="admin-inline-btn"
-                      title="Focus this experiment's results below"
-                      onClick={() => {
-                        setSelectedExperimentId(exp.experimentId);
-                        // Bring the (filtered) results section into view.
-                        requestAnimationFrame(() =>
-                          document.querySelector('.exp-results')?.scrollIntoView({ behavior: 'smooth', block: 'start' }),
-                        );
-                      }}
+                      title="Open this experiment's results"
+                      onClick={() => setSelectedExperimentId(exp.experimentId)}
                     >
                       View results
                     </button>

@@ -18,6 +18,9 @@ interface LoginScreenProps {
   onCompleteMfa?: (code: string) => Promise<void>;
   /** Switch to the self-service password-reset screen. */
   onForgotPassword?: () => void;
+  /** Visual surface. 'admin' applies the operator (amber) treatment plus an
+   *  "Admin Console" badge so admin sign-in is unmistakable from the chat login. */
+  variant?: 'chat' | 'admin';
 }
 
 export function LoginScreen({
@@ -28,6 +31,7 @@ export function LoginScreen({
   mfaChallenge,
   onCompleteMfa,
   onForgotPassword,
+  variant = 'chat',
 }: LoginScreenProps) {
   const { t } = useTranslation();
   const [email, setEmail] = useState('');
@@ -108,20 +112,25 @@ export function LoginScreen({
   };
 
   return (
-    <div className="login-screen">
+    <div className={`login-screen${variant === 'admin' ? ' login-screen--admin' : ''}`}>
       <div className="login-container">
         <div className="auth-mark" aria-hidden="true">
           <span className="auth-mark-glyph">⟁</span>
           <span className="auth-mark-version">v0.2</span>
         </div>
         <div className="login-header">
+          {variant === 'admin' && (
+            <span className="admin-console-badge">{t('auth.login.adminBadge')}</span>
+          )}
           <h1 className="login-title">{t('app.brandName')}</h1>
           <p className="login-subtitle">
             {passwordChallenge
               ? 'Set a new password to finish signing in'
               : mfaChallenge
                 ? t('auth.mfa.subtitle')
-                : t('auth.login.subtitle')}
+                : variant === 'admin'
+                  ? t('auth.login.adminSubtitle')
+                  : t('auth.login.subtitle')}
           </p>
         </div>
 

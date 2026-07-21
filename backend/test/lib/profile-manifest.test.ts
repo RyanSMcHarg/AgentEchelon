@@ -98,6 +98,29 @@ describe('profile manifest P3', () => {
     expect(draft.profileName).toBe('standard');
     expect((await getDraft(client, ROOT, 'standard'))!.modelKey).toBe('opus');
   });
+
+  it('export carries a COMPLETE editable models bundle (not just a hash) so the manifest can be hand-edited', async () => {
+    const { client } = fakeSsmStore();
+    await seedActiveVersion(client, 'standard', 'sonnet');
+    const manifest = await exportManifest(client, ROOT, 'standard');
+    expect(manifest.body.models?.default).toBe('sonnet');
+    expect(manifest.body.models?.classifier).toBeDefined(); // explicit (the 'default' sentinel), not absent
+    expect(Object.keys(manifest.body.models?.byIntent ?? {}).length).toBeGreaterThan(0);
+  });
+
+  it('ACCEPTS a hand-edited (contentHash-mismatched) UNSIGNED manifest — export→edit→import is the workflow', async () => {
+    const src = fakeSsmStore();
+    await seedActiveVersion(src.client, 'premium', 'opus');
+    const manifest = await exportManifest(src.client, ROOT, 'premium');
+    // Operator hand-edits a model in the exported body WITHOUT recomputing contentHash.
+    manifest.body.models!.default = 'sonnet';
+    manifest.body.modelKey = 'sonnet';
+    const { client } = fakeSsmStore();
+    const draft = await importManifest(client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, actor: ACTOR });
+    expect(draft.modelKey).toBe('sonnet'); // the edit landed
+    // The draft re-derives its own configId from the edited body (self-consistent), no rejection.
+    expect(draft.configId).toMatch(/^[0-9a-f]{12}$/);
+  });
 });
 
 describe('P4 — optional manifest signing', () => {

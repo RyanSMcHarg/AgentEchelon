@@ -84,6 +84,20 @@ export class FoundationsStack extends cdk.Stack {
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
+    // Per-user profile: the durable per-END-USER record (onboarded flag + collected onboarding facts
+    // like company/role). One item per Cognito sub. No TTL — this is durable user memory, not transient
+    // state (contrast AbuseControlsTable, which self-expires). This built-in table is a REFERENCE
+    // STAND-IN: an implementer can point the router at their own profile store via
+    // USER_PROFILE_SERVICE_ARN and this table goes unused. See SPEC-USER-PROFILE-AND-ONBOARDING.md.
+    const userProfileTable = new dynamodb.Table(this, 'UserProfileTable', {
+      partitionKey: { name: 'userSub', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: dataRemovalPolicy,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+    });
+
     // Abuse-controls control plane (docs/specs/analytics-eval/SPEC-ABUSE-CONTROLS.md). One
     // generic pk+ttl table backs request dedup (`dedup#<corr>`), spend budgets
     // (`budget#user#…`, `budget#global#…`), and later rate limits. Every entry is short-lived
@@ -115,6 +129,8 @@ export class FoundationsStack extends cdk.Stack {
       ['SharedAgentTasksNameParam', SHARED_SSM.agentTasksName, agentTasksTable.tableName],
       ['SharedUserTasksArnParam', SHARED_SSM.userTasksArn, userTasksTable.tableArn],
       ['SharedUserTasksNameParam', SHARED_SSM.userTasksName, userTasksTable.tableName],
+      ['SharedUserProfileArnParam', SHARED_SSM.userProfileArn, userProfileTable.tableArn],
+      ['SharedUserProfileNameParam', SHARED_SSM.userProfileName, userProfileTable.tableName],
       ['SharedAbuseControlsArnParam', SHARED_SSM.abuseControlsArn, abuseControlsTable.tableArn],
       ['SharedAbuseControlsNameParam', SHARED_SSM.abuseControlsName, abuseControlsTable.tableName],
       // NOTE: cognito pool id is published by AgentEchelonCognitoAuth (not here) to
@@ -577,6 +593,11 @@ export class FoundationsStack extends cdk.Stack {
     new cdk.CfnOutput(this, 'UserTasksTableName', {
       value: userTasksTable.tableName,
       description: 'DynamoDB table for user tasks',
+    });
+
+    new cdk.CfnOutput(this, 'UserProfileTableName', {
+      value: userProfileTable.tableName,
+      description: 'DynamoDB table for per-user profiles (onboarding state + facts); reference stand-in',
     });
 
     new cdk.CfnOutput(this, 'AddAgentApiUrl', {

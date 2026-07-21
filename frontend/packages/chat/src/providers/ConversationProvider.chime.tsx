@@ -521,6 +521,24 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       const prevConv = activeConversationRef.current;
       if (prevConv) unsubscribe(prevConv.conversationArn);
 
+      // Mask the swap window exactly like selectConversation: clear the
+      // outgoing conversation's messages and raise the loading flag BEFORE
+      // swapping active. Without this, the previous conversation's messages
+      // (and its welcome) keep rendering until listMessages() below resolves —
+      // a visible flash, and worse, a window where a caller acting on the
+      // "loaded" view (e.g. an e2e that waits for a welcome, then types) binds
+      // its input to the stale conversation and the first message is routed to
+      // the wrong channel. The loading spinner replaces the stale list, so the
+      // new conversation's own welcome is the first assistant message anyone
+      // sees or acts on.
+      setMessages([]);
+      setIsLoadingMessages(true);
+      setIsBotTyping(false);
+      if (botTypingTimeoutRef.current) {
+        clearTimeout(botTypingTimeoutRef.current);
+        botTypingTimeoutRef.current = undefined;
+      }
+
       setConversations((prev) => [newConversation, ...prev]);
       setActiveConversation(newConversation);
 
@@ -559,6 +577,10 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     } catch (error) {
       console.error('Failed to create conversation:', error);
       throw error;
+    } finally {
+      // Drop the loading mask once the fresh (usually empty) message list has
+      // been applied, so the client-side greeting empty-state renders.
+      setIsLoadingMessages(false);
     }
   }, [user, subscribe, unsubscribe, handleMessageCreate, handleMessageUpdate, handleMessageDelete, handleMembershipChange]);
 

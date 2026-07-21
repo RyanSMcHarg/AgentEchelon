@@ -1,6 +1,32 @@
 # Assistant Configuration - what the assistant *is*, per experience
 
-**Status:** Partial (the per-tier config seams ship; the unified `AssistantConfig` bundle is the design target)
+**Status:** In progress (unification underway). The per-classification config seams shipped; the unified
+`AssistantConfig` bundle is now landing on the **versioned profile definition** (SPEC-PORTABLE-VERSIONED-PROFILES).
+As of U1 the versioned definition carries a per-profile **`models` bundle** (`default` + optional
+`classifier` / `complex` / `byIntent` overrides), a per-profile **`tools`** surface, and a **`guardrailId`**
+selection - so **model selection is PROFILE-level, not a global strategy table**. U1 landed the schema
+additively and byte-identically (the seed sets `models.default` = the base model; resolution still reads
+the legacy path); U2 migrates resolution to read `models.byIntent` / `models.classifier` from the active
+profile version and seeds `byIntent` from the retiring global `model-strategy` table.
+
+> **Model selection is per-profile, with classification-level DEFAULTS.** The former global
+> `IntentRouteDefinition[]` table (one strategy shared by every profile) gave the wrong level of control:
+> a portable, versioned assistant must decide its OWN per-intent models. So **per-intent routing +
+> classifier + base override live on the profile version** (`models.byIntent` / `models.classifier` /
+> `models.default`), bounded by the classification's `bedrock:InvokeModel` allowlist (the security
+> ceiling). What stays at the CLASSIFICATION level are the **defaults**: the default base model per
+> classification (`DEFAULT_PROFILE_MODEL_SELECTION`) and the default classifier model (Haiku /
+> `CLASSIFIER_MODEL`). A profile that wants a default records it **explicitly** as the sentinel value
+> `'default'` rather than leaving the field absent. The distinction is deliberate: `'default'` is a
+> visible, self-documenting choice to **follow the classification-set model as it changes over time**,
+> whereas materializing today's concrete key would silently pin the profile to a snapshot. So the seed
+> writes `models.classifier: 'default'` (never the bare Haiku key); resolution treats `'default'` exactly
+> like unset (falls back to the classification default) and the write-path allowlist check skips it, since
+> it names no catalog model. A per-intent override falls back to the base; a per-intent `'default'` primary
+> means "use the base for this intent". Consequence: the admin
+> **Model Strategy** surface is NOT retired but **repurposed** - it shows the *available* model catalog
+> and the *per-classification defaults* (the fallback values); everything profile-specific (per-intent,
+> classifier, base override, tools, guardrail) is seen and edited at the profile level.
 
 
 **What's built:** the per-tier assistant capabilities (model strategy, per-tier guardrail/context scope, the Converse tool loop) and the two externalised config seams - persona (`ASSISTANT_SYSTEM_PROMPT`) and intent taxonomy (`ASSISTANT_INTENT_PACK`) - plus the `configId` fingerprint (`buildConfigIdentity`, `lib/config-identity.ts`) that hashes the running config for quality attribution. The **unified `AssistantConfig` bundle** a conversation type selects is the **design target**. The **Assistant Configuration** pillar of the interaction layer (`docs/specs/conversation-messaging/SPEC-INTERACTION-LAYER.md` is the map). Today the settings live across `model-strategy.ts` and the per-tier stacks; this spec gives them a home.
@@ -32,7 +58,14 @@ An assistant configuration is the bundle a conversation type's `defaultAgents` r
 ```ts
 interface AssistantConfig {
   id: string;
-  model: { default: string; complex?: string; classifier?: string };  // per-intent model selection
+  model: {
+    default?: string;                      // base model; blank or 'default' => the classification default
+    classifier?: string;                   // LLM intent-classifier model; seeded as the 'default' sentinel
+                                           //   (explicit choice to follow the classification-set classifier)
+    complex?: string;                      // heavier model for complex turns
+    byIntent?: Record<string, { primary: string; fallback?: string }>; // PER-PROFILE per-intent overrides
+                                           //   (replaces the global strategy table; carries the fallback too)
+  };
   systemPrompt: string;          // S3 key or inline template (kept out of code)
   tools: string[];               // the Converse tool surface (e.g. load_context, schedule, syncRecord)
   guardrailId: string;           // the content guardrail applied out-of-band on the final reply
@@ -68,3 +101,4 @@ Each assistant runs the **self-hosted Converse tool loop** (`async-processor-cor
 - Where the config lives (a registry in code like `conversation-types.ts`, or deploy-time config) and how the system prompt is stored (S3 vs inline) + versioned.
 - Whether multiple assistants can be enrolled in one conversation (e.g. an internal-assist alongside the customer-facing one) - and how their identities/visibility separate.
 - How per-assistant tool grants reconcile with the conversation type's `connectors[]` (the tool surface must be a subset of what the type makes available).
+- **Per-classification channel flows (roadmap).** The Amazon Chime SDK `AssociateChannelFlow` primitive is per-channel, but the deployment provisions ONE shared app-instance channel flow (`/channel-flow-arn`) and associates it with every channel at creation. That shared flow is load-bearing routing infrastructure (it fans out `@all`, routes `/battle`, and reads the immutable classification tag), so it MUST remain - the roadmap is NOT to swap it per classification (that would break those routing flows) but to slim it to a MINIMAL routing flow and layer ADDITIONAL per-classification or per-profile flows on top for experience-specific pre/post-processing. Making that added flow a selection the unified bundle owns (alongside model/tools/guardrail) is the config axis to explore.

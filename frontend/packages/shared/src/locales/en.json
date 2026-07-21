@@ -37,6 +37,8 @@
   "auth": {
     "login": {
       "subtitle": "Sign in to your account",
+      "adminSubtitle": "Sign in to the admin console",
+      "adminBadge": "Admin Console",
       "emailLabel": "Email address",
       "emailPlaceholder": "you@example.com",
       "passwordLabel": "Password",
@@ -47,7 +49,7 @@
       "noAccountPrompt": "Don't have an account?",
       "createAccountLink": "Create account",
       "failureFallback": "Login failed",
-      "footerNote": "Authentication runs on Amazon Cognito. Sign in with a Cognito user directory or federate to your corporate identity provider (SAML/OIDC) — both are supported in production."
+      "footerNote": "This deployment signs in with an Amazon Cognito user directory. AgentEchelon also supports federating a SAML/OIDC identity provider, which isn't enabled on this instance."
     },
     "register": {
       "title": "Create Your Account",
@@ -86,7 +88,7 @@
       "step3Title": "Access Granted",
       "step3Body": "Once approved, you'll receive a notification and can sign in with your credentials.",
       "noteTitle": "About Authentication",
-      "noteBody": "AgentEchelon authenticates with Amazon Cognito. You can use a Cognito user directory directly, or federate to any standards-based identity provider (SAML, OIDC) for single sign-on with your corporate authentication system — both are production-ready options.",
+      "noteBody": "AgentEchelon authenticates with Amazon Cognito. This deployment uses a Cognito user directory. AgentEchelon also supports federating a standards-based identity provider (SAML, OIDC) for single sign-on with your corporate authentication system, though that isn't enabled on this instance.",
       "learnMoreLink": "Learn more about enterprise identity integration →"
     },
     "verify": {
@@ -277,8 +279,10 @@
     },
     "tabs": {
       "overview": "Overview",
+      "alerts": "Alerts",
       "models": "Models",
       "strategy": "Model Strategy",
+      "profiles": "Profiles",
       "steps": "Execution Steps",
       "experiments": "Experiments",
       "conversations": "Conversations",

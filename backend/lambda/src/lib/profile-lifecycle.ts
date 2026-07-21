@@ -31,6 +31,8 @@ import {
   definitionParamName,
   serializeSeedDefinition,
   profileDefinitionConfigId,
+  ensureModelsBundle,
+  DEFAULT_MODEL,
 } from './active-profile.js';
 
 const ACTIVE_LABEL = 'active';
@@ -144,10 +146,18 @@ async function activeOrSeedBody(ssm: SSMClient, ssmRoot: string, profileName: st
   return bodyFrom(JSON.parse(seed) as ProfileDefinition);
 }
 
+/** As {@link activeOrSeedBody}, but with a COMPLETE `models` bundle backfilled — a legacy (pre-U2) active
+ *  definition has only a bare modelKey, so a version cloned from it would inherit an empty models surface
+ *  (nothing to edit). Backfilling here means a NEW version persists the full base/classifier/per-intent
+ *  bundle, so activating it heals the stored definition. */
+async function activeOrSeedBodyComplete(ssm: SSMClient, ssmRoot: string, profileName: string): Promise<ProfileDefinitionBody> {
+  return ensureModelsBundle(await activeOrSeedBody(ssm, ssmRoot, profileName));
+}
+
 /** Clone the active version into a fresh draft (§4 create-version). Returns the draft definition. */
 export async function createDraft(ssm: SSMClient, ssmRoot: string, profileName: string, actor: string): Promise<ProfileDefinition> {
   if (!isKnownProfile(profileName)) throw new Error(`unknown profile '${profileName}'`);
-  const body = await activeOrSeedBody(ssm, ssmRoot, profileName);
+  const body = await activeOrSeedBodyComplete(ssm, ssmRoot, profileName);
   const def = buildDefinition(profileName, body);
   await ssm.send(new PutParameterCommand({ Name: draftParamName(ssmRoot, profileName), Type: 'String', Value: JSON.stringify(def), Overwrite: true, Tier: 'Standard' }));
   audit('create-version', actor, profileName, { configId: def.configId });
@@ -165,6 +175,14 @@ export async function editDraft(
   const existing = (await getDraft(ssm, ssmRoot, profileName)) ?? buildDefinition(profileName, await activeOrSeedBody(ssm, ssmRoot, profileName));
   // Only runtime-editable keys from the patch are honored; unknown/boundary keys are ignored (§7).
   const mergedBody: ProfileDefinitionBody = bodyFrom({ ...bodyFrom(existing), ...patch });
+  // The transitional top-level `modelKey` and `models.default` are the SAME "base model" — keep them
+  // consistent so resolution (`models.default ?? modelKey`) is unambiguous. A patch to either syncs both,
+  // whether the editor edits the legacy `modelKey` or the new `models.default`.
+  if (patch.modelKey !== undefined) {
+    mergedBody.models = { ...(mergedBody.models ?? {}), default: patch.modelKey };
+  } else if (patch.models?.default !== undefined) {
+    mergedBody.modelKey = patch.models.default;
+  }
   const errs = validateDefinitionBody(mergedBody);
   if (errs.length) throw new ProfileValidationError(errs);
   const def = buildDefinition(profileName, mergedBody);
@@ -186,8 +204,26 @@ export class ProfileValidationError extends Error {
  */
 export function validateBody(body: Partial<ProfileDefinitionBody>, catalog: Record<BackendModelKey, BackendModelDefinition>): string[] {
   const errs = validateDefinitionBody(body);
-  if (body.modelKey && !(body.modelKey in catalog)) {
-    errs.push(`modelKey '${body.modelKey}' is not in the deployment's model catalog (InvokeModel allowlist boundary, §7)`);
+  // §7 model-ARN boundary: EVERY model a version selects — base, classifier, complex, and each per-intent
+  // primary/fallback — must resolve within the deployment's InvokeModel allowlist (the catalog). A version
+  // picks WITHIN the boundary, never beyond it; an out-of-catalog model is a reject here, not an
+  // AccessDenied at inference.
+  // The `'default'` sentinel names no catalog model (it means "follow the classification default"), so it
+  // is always in-bounds — skip the allowlist check for it.
+  const checkModel = (mk: string | undefined, label: string) => {
+    if (mk && mk !== DEFAULT_MODEL && !(mk in catalog)) {
+      errs.push(`${label} '${mk}' is not in the deployment's model catalog (InvokeModel allowlist boundary, §7)`);
+    }
+  };
+  checkModel(body.modelKey, 'modelKey');
+  if (body.models) {
+    checkModel(body.models.default, 'models.default');
+    checkModel(body.models.classifier, 'models.classifier');
+    checkModel(body.models.complex, 'models.complex');
+    for (const [intent, route] of Object.entries(body.models.byIntent ?? {})) {
+      checkModel(route.primary, `models.byIntent['${intent}'].primary`);
+      checkModel(route.fallback, `models.byIntent['${intent}'].fallback`);
+    }
   }
   return errs;
 }

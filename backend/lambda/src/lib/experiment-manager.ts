@@ -88,7 +88,11 @@ export interface ExperimentObjective {
  * any intent on the classification), and 'classification' via `resolveClassificationExperiment`
  * (it swaps the intent-classifier model).
  */
-export type ExperimentType = 'intent' | 'base_model' | 'classification';
+// 'profile' (SPEC-PORTABLE-VERSIONED-PROFILES §6) pits two whole assistant PROFILE versions against each
+// other via profileRef variants. It swaps the assistant's base model across every intent, so it matches
+// and conflicts exactly like 'base_model' — the difference is provenance (a versioned profile, not a bare
+// model key), which the variant's profileRef carries.
+export type ExperimentType = 'intent' | 'base_model' | 'classification' | 'profile';
 
 export interface Experiment {
   experimentId: string;
@@ -243,7 +247,11 @@ export async function resolveExperimentModel(
     experiments.find(
       (exp) => (exp.experimentType ?? 'intent') === 'intent' && exp.intent === routeKey && isLiveForClassification(exp),
     ) ??
-    experiments.find((exp) => exp.experimentType === 'base_model' && isLiveForClassification(exp));
+    experiments.find(
+      (exp) =>
+        (exp.experimentType === 'base_model' || exp.experimentType === 'profile') &&
+        isLiveForClassification(exp),
+    );
 
   if (!experiment) return null;
 
@@ -617,7 +625,7 @@ export function validateAndSanitizeExperiment(input: Experiment): Experiment {
 }
 
 /** Canonical experiment types. */
-export const EXPERIMENT_TYPES: ExperimentType[] = ['intent', 'base_model', 'classification'];
+export const EXPERIMENT_TYPES: ExperimentType[] = ['intent', 'base_model', 'classification', 'profile'];
 
 const OBJECTIVE_METRICS: ExperimentObjectiveMetric[] = ['cost', 'accuracy', 'quality', 'latency'];
 

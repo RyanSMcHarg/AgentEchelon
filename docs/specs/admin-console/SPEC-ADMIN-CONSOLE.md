@@ -29,6 +29,7 @@ accountability-logging calibration noted there.
 | Persona | Use case | Served by |
 |---|---|---|
 | Platform Administrator | View overall platform health at a glance (traffic volume, active users, error rate) | Overview > Overview |
+| Platform Administrator | See what is wrong right now - runtime errors, missed latency SLOs, and intent/model quality regressions - in one place, each linking to its drill | Overview > Alerts panel (see Alerts model) |
 | Platform Administrator | Track response-latency SLOs, page web-vitals, and WebSocket connection health | Overview > Latency |
 | Platform Administrator | Administer any conversation across tiers: view history, add or remove members, redact, delete | Conversations |
 | Platform Administrator | Detect cross-tier membership leaks and revoke over-tier access | Security > Membership Audit |
@@ -36,17 +37,17 @@ accountability-logging calibration noted there.
 | Platform Administrator | Understand acquisition and engagement (DAU, messaging DAU, sign-up and sign-in funnels) | Users > Users |
 | Platform Administrator | Monitor model usage, cost, latency, and human feedback | Models > Models |
 | Platform Administrator | Configure and run A/B experiments and `/battle` match-ups, then read results | Experiments |
-| Platform Engineer | Trace an assistant turn step by step (tool loop, tokens, cost, per-step latency) to debug it | Models > Steps |
+| Platform Engineer | Trace an assistant turn step by step (tool loop, tokens, cost, per-step latency) to debug it | Effectiveness drill L4 (a turn's tool-loop steps, inline) |
 | Platform Engineer | Inspect the full raw stored message payload and metadata for troubleshooting | Conversations > Inspect drawer |
 | Platform Engineer | Read a full conversation with its history and the context the assistant had (running summary, cross-conversation context) to debug a turn | Conversations; Models > Steps |
 | Platform Engineer | Watch error rate, web vitals, and reconnect spikes as early-warning signals | Overview > Latency |
 | Platform Engineer | See the documented model-routing strategy and capability catalog | Models > Model Strategy |
-| AI Engineer | Review automated evaluation scores (relevance, compliance) by agent and intent | Effectiveness > Evaluations |
-| AI Engineer | Analyze multi-turn conversation flow quality across weighted dimensions | Effectiveness > Flows |
+| AI Engineer | Review automated evaluation scores (relevance, compliance) by agent and intent | Effectiveness drill L2 (per-exchange judge verdict) |
+| AI Engineer | Analyze multi-turn conversation flow quality across weighted dimensions | Effectiveness drill L3 (flow score panel) |
 | AI Engineer | Triage flagged low-quality responses and approve or reject them | Effectiveness > Flagged |
 | AI Engineer | Submit human ground-truth scores to calibrate the automated evaluator | Effectiveness > Ground Truth |
 | AI Engineer | Compare two models head-to-head and read a ship recommendation | Experiments; Models > Models (effectiveness) |
-| AI Engineer | See the full conversation context and history behind an evaluated turn (preceding turns, running summary, cross-conversation context) | Conversations; Effectiveness > Evaluations, Flows; Models > Steps |
+| AI Engineer | See the full conversation context and history behind an evaluated turn (preceding turns, running summary, cross-conversation context) | Conversations; Effectiveness drill (L2 exchanges, L3 timeline + steps) |
 | Legal Team Member | Review a conversation's message history and redact or delete specific messages | Conversations |
 | Legal Team Member | Establish who accessed a conversation and when (membership and moderator timeline) | Conversations > Membership history; Security |
 | Legal Team Member | Confirm cross-tier isolation is enforced | Security > Membership Audit |
@@ -82,8 +83,8 @@ just groups the sub-views. Aurora-only sub-views are filtered out in Athena mode
 |---|---|
 | Overview | Overview, Latency |
 | Conversations | Conversations (administration surface) |
-| Effectiveness | Dashboard (the L0 intent-anchored drill; the consolidation target) + Evaluations, Flows, Tasks, Steps, Flagged, Ground Truth in Aurora |
-| Models | Models, Model Strategy, Steps (Steps is Aurora-only) |
+| Effectiveness | Dashboard (the L0 intent-anchored drill) + Flagged, Ground Truth in Aurora. Evaluations, Flows, Tasks, and Steps are RETIRED as standalone sub-tabs - their detail now lives inside the Dashboard drill (L2 exchanges carry the per-exchange judge verdict = Evaluations; L2 tasks + L3 timeline = Tasks; L3 flow score = Flows; L4 inline steps = Steps). Only the two human-ACTION views (Flagged, Ground Truth) remain their own sub-tabs. |
+| Models | Models, Model Strategy |
 | Experiments | Experiments |
 | Users | Users, Manage Users |
 | Security | Membership Audit |
@@ -95,10 +96,42 @@ just groups the sub-views. Aurora-only sub-views are filtered out in Athena mode
   minus N days); the Aurora POST shim converts the span to a `days` integer. The backend
   validates ISO dates, requires `start <= end`, and caps the window at 365 days.
 - **Analytics mode badge** appears in Aurora mode. Aurora-only sub-tabs
-  (`effectiveness`, `flows`, `flagged`, `ground_truth`, `tasks`, `steps`) are hidden in Athena mode.
-- **Targets.** Measurement surfaces show a documented target from `metricTargets.ts`
-  (see "Targets" below). `MetricCard` renders good/warn/bad; `LineChart` draws target
-  reference lines. Targets are display-only; alerting is a separate, later concern.
+  (`effectiveness`, `flagged`, `ground_truth`) are hidden in Athena mode.
+- **Targets and alerts.** Measurement surfaces show a documented target from `metricTargets.ts`
+  (see "Targets" below). `MetricCard` renders good/warn/bad; `LineChart` draws target reference
+  lines. A metric sitting in **bad** status is not just coloured red: it is an **alert** (see the
+  Alerts model below), surfaced in a consolidated health view rather than left for the operator to
+  find tab by tab.
+- **Row-level drill and mobile.** `DataTable` supports whole-ROW click (`onRowClick`), so a drill is a
+  tap on the row, not on a small inline link - essential on touch. On narrow screens (<=640px) the
+  table renders as a stacked card per row (label:value pairs) instead of a wide horizontally-scrolling
+  grid, and the whole card is the tap target.
+
+## Alerts (what "error" means)
+
+"Error" in the console is broader than a thrown exception. An operator asking "what is wrong right now"
+needs three kinds of condition surfaced together, and all three are the same thing underneath: **a
+measured value in `bad` status against its `metricTargets.ts` threshold**, plus literal error rows.
+
+| Alert category | What it is | Source (all already loaded client-side) |
+|---|---|---|
+| **Runtime error** | A sent/thrown error, failed delivery, `error_response`-classified reply, or tool-call failure | `flagged_responses` (`classification = 'error_response'`); intent rows with `tool_error_rate` in `bad`; `error_rate_daily` over target |
+| **Latency SLA breach** | The perceived-latency SLO is missed | TTFF over its target; P95 / avg total over target (`latency_metrics`) |
+| **Quality breach** | An intent's or a model's evaluated quality dropped below threshold | `intent_effectiveness` rows where Execution (relevance / completion) or Classification confidence is `bad`; `model_effectiveness` rows below the score band |
+
+An **alert** is therefore any metric the target registry marks `bad` (an error) or `warn` (a lower-
+severity "approaching threshold" tier), assembled by scanning the results the dashboard already holds -
+no new backend query. The pure assembler is `alerts.ts` `computeAlerts(sources)` (unit-tested in
+`alerts.test.ts`).
+
+The surface is the **Alerts sub-tab** in the Overview section (`AlertsTab.tsx`): errors first then
+warnings, each row stating the value vs its target and **linking to its drill** - a quality alert opens
+the Effectiveness tab, a latency alert the Latency tab, a runtime error-response alert the Flagged tab,
+the error-rate alert the Overview. It loads `intent_effectiveness`, `latency_metrics`,
+`model_effectiveness`, `flagged_responses`, and `error_rate_daily` and reads them entirely client-side.
+This supersedes the earlier posture where targets were display-only and alerting was "a separate, later
+concern"; the target colours (bad/warn) on each surface remain the inline signal. (A compact "N active
+issues" count on the Overview landing that links here is a natural follow-on.)
 
 ---
 
@@ -132,7 +165,7 @@ Configuration: shared date preset. Error percent card carries the `error_rate` t
 
 | Data element | What it is for | How it is calculated | Mode |
 |---|---|---|---|
-| Avg total, avg Bedrock, avg polling, p95 total (+ distribution rail and per-row table) | Response-latency breakdown across the message journey | `latency_metrics`. Aurora: over `messages` joined to `exchanges` where bot and `total_ms>0`, grouped by day, agent, delivery: `AVG(total_ms)`, `AVG(latency_ms)` (Bedrock), `AVG(poll_ms)`, `PERCENTILE_CONT(0.95)` on `total_ms`, `COUNT(*)`. Athena: count-only. | both (Aurora full) |
+| Avg total, avg Bedrock, avg polling, p95 total (+ distribution rail and per-row table) | Response-latency breakdown across the message journey, for PERCEIVED single-reply latency | `latency_metrics`. Aurora: over `messages` joined to `exchanges` where bot and `total_ms>0`, grouped by day, agent, delivery: `AVG(total_ms)`, `AVG(latency_ms)` (Bedrock), `AVG(poll_ms)`, `PERCENTILE_CONT(0.95)` on `total_ms`, `COUNT(*)`. Athena: count-only. The headline cards **exclude multi-step TASK deliveries** (a task's `total_ms`/`poll_ms` spans the whole task, seconds to minutes, so mixing it in made Avg Polling and P95 read absurdly high) and are **traffic-weighted by `exchange_count`** (the old P95 was `Math.max` over per-group rows, so one low-traffic slow group defined "the" P95). Task end-to-end time is measured per intent under Effectiveness. | both (Aurora full) |
 | Page-load web vitals (p50/p95/p99/avg per metric) | Real-user web-vital percentiles | `page_load_metrics`: over `client_events` where `record_type='performance'`, `APPROX_PERCENTILE(perf_value, ...)` grouped by metric. | both |
 | WebSocket connects, disconnects, reconnects (+ per-day table) | Amazon Chime SDK/WebSocket stability; reconnect spikes as early warning | `connection_health_daily`: `SUM(CASE ...)` over `client_events` connection events, per day. | both |
 
@@ -191,16 +224,24 @@ per intent, ranked worst-first on two quality axes kept separate - Classificatio
 average confidence + reroute rate) and Execution (DIRECT intents by Pass A relevance, task intents by
 completion rate) - with Latency (avg / p95), Cost per reply (tokens times the model rate, null-honest),
 and Tool-error rate (from the per-step `tools[]` outcomes) as independently sortable decision columns,
-all coloured against `metricTargets.ts`. Clicking an intent drills L1 (its metric cards) -> L2 (its
-exchange list via `intent_exchanges`, or its task list via `task_details?intent`) -> L3 (a task's
-turn-by-turn state timeline via `task_timeline`) -> L4 (that turn's tool-loop steps, inline). The
-The Dashboard is the consolidation target: the detail from Evaluations, Flows, and Tasks folds into its
-drill (L2 exchanges, L2 tasks, L3 timeline), and Steps into L4. Each keeps its own sub-tab (Steps grouped
-here rather than under Models) until its detail is fully in the drill, so no information is lost during
-the transition; Flagged and Ground Truth stay as standalone human-action sub-tabs (§7). (The backing SQL
+all coloured against `metricTargets.ts`. A row is drillable by clicking anywhere on it (the whole row,
+not just the intent link - see "Row-level drill and mobile"): L1 (its metric cards) -> L2 (its exchange
+list via `intent_exchanges`, or its task list via `task_details?intent`) -> L3 (a task's turn-by-turn
+state timeline via `task_timeline`) -> L4 (that turn's tool-loop steps, inline).
+
+The Dashboard is now the **completed** consolidation surface: the detail from Evaluations, Flows, Tasks,
+and Steps lives entirely inside its drill (L2 exchanges carry the per-exchange judge verdict = Evaluations;
+L2 tasks + L3 timeline = Tasks; L3 `FlowScorePanel` = Flows; L4 inline steps = Steps), so those four
+standalone sub-tabs are **retired from the nav** - no information is lost, it moved into the drill. Only
+the two human-ACTION views, Flagged and Ground Truth, remain their own sub-tabs (§7). The per-tab
+reference below still documents each folded-in detail (Evaluations / Flows / Tasks / Steps) because it
+describes data now reached through the drill, and their components still back that drill. (The backing SQL
 is unit-tested at the query-dispatch layer.)
 
-#### Evaluations tab (`EvaluationsTab.tsx`)
+#### Evaluations detail (`EvaluationsTab.tsx`) - folded into the drill (L2)
+
+> Retired as a standalone sub-tab; the per-exchange judge verdict now renders in the Effectiveness drill
+> L2 exchange list. This documents that folded-in detail; the component still backs it.
 
 | Data element | What it is for | How it is calculated | Mode |
 |---|---|---|---|
@@ -220,7 +261,10 @@ deterministic stripper the SPA uses (`stripMessageMarkers`), so the console neve
 `NAVIGATE_CHANNEL`/`<!--...-->` marker and the judge scores exactly what the human saw. See
 `SPEC-AURORA-VPC-MODE.md` §7 Pass A.
 
-#### Flows tab (`FlowsTab.tsx`)
+#### Flows detail (`FlowsTab.tsx`) - folded into the drill (L3)
+
+> Retired as a standalone sub-tab; the multi-turn flow score now renders as the `FlowScorePanel` at
+> Effectiveness drill L3. This documents that folded-in detail.
 
 Multi-turn task-flow quality. Rows come from the `intent_flows` table, which the evaluation
 runner's flow pass (`SPEC-AURORA-VPC-MODE.md` §7 Pass B) populates by grouping a conversation's
@@ -241,7 +285,7 @@ opens the dimension breakdown from data already in memory. Read-only.
 
 | Data element | What it is for | How it is calculated | Mode |
 |---|---|---|---|
-| Flagged responses (flagged-at, agent, intent, relevance score, classification, flags, review status) and expanded context (user message, agent response, reasoning, compliance categories) | Triage low-quality or non-compliant responses | Intended source is the flagged-response store; the backing query is not yet served in either analytics mode, so the tab renders its empty state until it is. | (backing query not yet served) |
+| Flagged responses (flagged-at, agent, intent, relevance score, classification, flags, review status) and expanded context (user message, agent response, reasoning, compliance categories) | Triage low-quality or non-compliant responses | `flagged_responses` (Aurora, `getFlaggedResponses`): evaluated exchanges whose classification is poor / irrelevant / `error_response`, newest first. The tab renders its empty state only when nothing was flagged in the window (a genuinely clean window, not a missing query). | Aurora only |
 
 Configuration: shared date preset. Client-side filter (pending / reviewed / all, default
 pending, with a pending count badge); severity and status color maps. **Review action**:
@@ -251,14 +295,17 @@ approve or reject with optional notes (`onReview`), which posts a review for the
 
 | Data element | What it is for | How it is calculated | Mode |
 |---|---|---|---|
-| Human scores count, mean absolute error, agreement rate (within 10 points) | Calibrate the automated evaluator against human labels | Client-side over scored rows: MAE is the mean absolute score delta; agreement is the share within 10 points. Source is the `ground_truth_scores` store; the read query is not yet served, so the tab renders its empty state until it is. | (backing query not yet served) |
+| Human scores count, mean absolute error, agreement rate (within 10 points) | Calibrate the automated evaluator against human labels | Client-side over scored rows: MAE is the mean absolute score delta; agreement is the share within 10 points. Source is the `ground_truth_scores` store, read by `ground_truth` (`getGroundTruth`); the tab renders its empty state only when no human labels exist yet. | Aurora only |
 | Per-row: scored-at, exchange, classification, human vs automated score, delta, scorer | Individual calibration samples | As above. | (as above) |
 
 Configuration: shared date preset. Delta and agreement color bands. **Submit-score form**
 (`onSubmitScore`): exchange id, score (0-100), classification, and required reasoning; posts a
 human ground-truth label for the exchange.
 
-#### Tasks tab (`TasksTab.tsx`)
+#### Tasks detail (`TasksTab.tsx`) - folded into the drill (L2 tasks + L3 timeline)
+
+> Retired as a standalone sub-tab; a task list renders at Effectiveness drill L2 (`task_details?intent`)
+> and a task's turn-by-turn timeline at L3 (`task_timeline`). This documents that folded-in detail.
 
 | Data element | What it is for | How it is calculated | Mode |
 |---|---|---|---|
@@ -291,7 +338,10 @@ feedback is fixed to the last 30 days.
 Configuration: none. Presentational reference; nothing is editable here. Reflects
 `docs/guides/developer/MODEL_STRATEGY.md`.
 
-#### Steps tab (`StepsTab.tsx`)
+#### Steps detail (`StepsTab.tsx`) - folded into the Effectiveness drill (L4)
+
+> Retired as a standalone sub-tab (and no longer under Models); a turn's tool-loop steps render inline at
+> Effectiveness drill L4. Documented here as the tool-loop reference; the component still backs the L4 view.
 
 | Data element | What it is for | How it is calculated | Mode |
 |---|---|---|---|

@@ -65,6 +65,30 @@ describe('getActiveTask — channel scope option (P2.4)', () => {
     expect(mockSend).not.toHaveBeenCalled();
   });
 
+  it('DUPLICATE-TASK GUARD: when the GSI misses a just-written task, a STRONGLY-CONSISTENT base-table read finds it', async () => {
+    // First call = GSI (eventually consistent) → empty (the recent write has not propagated).
+    mockSend.mockResolvedValueOnce({ Items: [] });
+    // Second call = strongly-consistent base-table query → the recent task IS visible.
+    mockSend.mockResolvedValueOnce({
+      Items: [
+        { userSub: USER_SUB, taskId: 't-recent', taskType: 'data_extraction', channelArn: CHANNEL_A, status: 'in_progress', createdAt: '2026-07-20T22:00:00Z' },
+      ],
+    });
+    const { getActiveTask } = await import('../../lambda/src/lib/task-tracking');
+    const result = await getActiveTask(USER_SUB, 'data_extraction', { channelArn: CHANNEL_A });
+    expect(result?.taskId).toBe('t-recent'); // found via the consistent fallback → no duplicate created
+
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    const gsiCall = mockSend.mock.calls[0][0];
+    const consistentCall = mockSend.mock.calls[1][0];
+    expect(gsiCall.input.IndexName).toBe('userSub-taskType-index');
+    expect(gsiCall.input.ConsistentRead).toBeUndefined();
+    // The fallback is the base table (no index) with a strongly-consistent read + taskType in the filter.
+    expect(consistentCall.input.IndexName).toBeUndefined();
+    expect(consistentCall.input.ConsistentRead).toBe(true);
+    expect(consistentCall.input.FilterExpression).toContain('taskType = :taskType');
+  });
+
   it('returns null and does not throw when the DDB query errors', async () => {
     mockSend.mockRejectedValueOnce(new Error('connection blip'));
     const errSpy = jest.spyOn(console, 'error').mockImplementation(() => {});

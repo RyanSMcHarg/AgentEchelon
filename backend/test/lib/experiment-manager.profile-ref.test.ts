@@ -48,4 +48,16 @@ describe('ExperimentVariant modelKey XOR profileRef (P2)', () => {
       { variantId: 'a', profileRef: { profileName: 'premium', version: 0 }, weight: 100 },
     ]))).toThrow(/positive integer/);
   });
+
+  it('accepts a profile-vs-profile experiment (type "profile", no intent, two profileRefs)', () => {
+    const out = validateAndSanitizeExperiment({
+      ...exp([
+        { variantId: 'control', profileRef: { profileName: 'premium' }, weight: 50 },
+        { variantId: 'treatment', profileRef: { profileName: 'premium', version: 3 }, weight: 50 },
+      ]),
+      experimentType: 'profile',
+      intent: '', // profile experiments apply across intents (like base_model)
+    } as Experiment);
+    expect(out.experimentType).toBe('profile');
+  });
 });

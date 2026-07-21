@@ -325,6 +325,33 @@ async function writeWelcomeOrientation(): Promise<void> {
   }
 }
 
+// Standard-tier onboarding intake — the opt-in first-conversation questionnaire the router runs
+// when a NEW conversation opens (router-agent-handler reads it from
+// `${SSM_ROOT}/assistant/standard/onboarding-intake` via ONBOARDING_INTAKE_PARAM; the schema shape is
+// lib/onboarding-intake.ts IntakeConfig). Onboarding is OFF by default (absent param ⇒ disabled), so
+// only the standard classification is seeded here — leaving basic/premium absent keeps their plain
+// welcome flow. This is the schema the `onboarding-intake.spec.ts` e2e is written against; seeding it
+// makes that test reproducible on a fresh deploy instead of depending on a hand-written SSM param.
+const ONBOARDING_INTAKE_STANDARD = {
+  greeting: 'Welcome! Let me collect a couple of details before we begin.',
+  fields: [
+    { key: 'company', prompt: 'What company are you with?' },
+    { key: 'role', prompt: 'And what is your role there?' },
+  ],
+  completion: "Great, you're all set. How can I help?",
+};
+
+async function writeOnboardingIntake(): Promise<void> {
+  const name = `${SSM_ROOT}/assistant/standard/onboarding-intake`;
+  await ssmClient.send(new PutParameterCommand({
+    Name: name,
+    Value: JSON.stringify(ONBOARDING_INTAKE_STANDARD),
+    Type: 'String',
+    Overwrite: true,
+  }));
+  console.log(`  ✓ standard onboarding intake → ${name}`);
+}
+
 async function uploadContextFiles(bucketName: string): Promise<void> {
   const contextDir = path.join(__dirname, '..', 'demo', 'context');
 
@@ -378,7 +405,8 @@ async function uploadContextFiles(bucketName: string): Promise<void> {
     for (const tier of ['basic', 'standard', 'premium'] as const) {
       const entries = manifest.documents
         .filter((d) => scope[tier].includes(d.tier))
-        .map((d) => ({ title: d.title, description: d.description, tier: d.tier }));
+        // `file` lets the assistant name the exact document(s) to load (SPEC-ASSISTANT-CONTEXT selective load).
+        .map((d) => ({ file: d.file, title: d.title, description: d.description, classification: d.tier }));
       await s3Client.send(
         new PutObjectCommand({
           Bucket: bucketName,
@@ -507,6 +535,11 @@ async function main(): Promise<void> {
   // Step 2c: per-tier welcome orientation (what a first-time user sees + can try).
   console.log('Step 2c: Writing per-tier welcome orientation to SSM...');
   await writeWelcomeOrientation();
+  console.log('');
+
+  // Step 2c-i: standard-tier onboarding intake schema (opt-in first-conversation questionnaire).
+  console.log('Step 2c-i: Writing standard onboarding intake schema to SSM...');
+  await writeOnboardingIntake();
   console.log('');
 
   // Step 2d: seed each profile's ACTIVE version (SPEC-PORTABLE-VERSIONED-PROFILES P0). Writes the

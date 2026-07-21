@@ -605,6 +605,28 @@ npm run test:headed
 npm run test:report
 ```
 
+### Gated live-data suites
+
+A few suites drive the live deployment and produce real data, so they stay OFF by default and turn on
+with a gate flag: `EXPERIMENTS_E2E=1` (A/B experiments), `BATTLE_E2E=1` (`/battle` duels),
+`ONBOARDING_E2E=1` (standard-tier intake), `TASKS_E2E=1` (task lifecycle). Point them at a deployed
+origin with `E2E_BASE_URL` (chat) and `E2E_ADMIN_BASE_URL` (admin console).
+
+The analytics read plane is IAM-enforced (`adminIamEnforcement`), so the experiments and tasks suites
+SigV4-sign their analytics calls instead of sending a Bearer JWT (see
+`tests/e2e/helpers/signed-analytics.ts`). That signing exchanges the admin id token for Identity Pool
+credentials, so both of these must be set to the deployed pool ids:
+
+| Var | Purpose | Source |
+|-----|---------|--------|
+| `VITE_USER_POOL_ID` | Cognito User Pool that mints the id token | `AgentEchelonCognitoAuth` output `UserPoolId` |
+| `VITE_IDENTITY_POOL_ID` | Identity Pool the id token is exchanged at for signing credentials | `AgentEchelonCognitoAuth` output `IdentityPoolId` |
+| `VITE_ANALYTICS_API_URL` | Signed analytics endpoint | analytics stack output `AnalyticsApiUrl` |
+| `VITE_EXPERIMENTS_API_URL` | Admin experiments API (arming/listing) | experiments stack output |
+
+`backend/scripts/gen-frontend-env.mjs` writes all of these into the per-package `.env` files from the
+live CloudFormation outputs, so the simplest setup is to run it and export the same values for the suite.
+
 ### Test Credentials
 
 The Playwright suite signs in as four tier users (basic / standard / premium /

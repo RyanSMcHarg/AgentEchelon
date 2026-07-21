@@ -4,6 +4,7 @@ import { ChimeMessagingStack } from '../lib/stacks/chime-messaging-stack';
 import { FoundationsStack } from '../lib/stacks/foundations-stack';
 import { S3StorageStack } from '../lib/stacks/s3-storage-stack';
 import { CognitoAuthStack } from '../lib/stacks/cognito-auth-stack';
+import { AdminPlaneStack } from '../lib/stacks/admin-plane-stack';
 import { AdminNotificationStack } from '../lib/stacks/admin-notification-stack';
 import { AnalyticsStack } from '../lib/stacks/analytics-stack';
 import { AnalyticsStackAurora } from '../lib/stacks/analytics-stack-aurora';
@@ -196,12 +197,34 @@ const chimeStack = new ChimeMessagingStack(app, `${STACK_PREFIX}ChimeMessaging`,
   description: 'Chime SDK Messaging for AgentEchelon',
 });
 
+// SSM param the S3 stack publishes the attachments-bucket ARN to, and the credential exchange
+// (in cognito-auth, created before the S3 stack) resolves at runtime. A plain-string contract
+// between the two stacks, so neither takes a circular CDK dependency on the other.
+const attachmentsBucketArnParam = `/${STACK_PREFIX.toLowerCase()}/shared/attachments-bucket-arn`;
+
 // 2. Cognito Auth Stack - Authentication & Authorization
 const cognitoStack = new CognitoAuthStack(app, `${STACK_PREFIX}CognitoAuth`, {
   env,
   appInstanceArn: chimeStack.appInstanceArn,
+  attachmentsBucketArnParam,
   description: 'Cognito authentication with SAML/OIDC support',
 });
+
+// Admin conversation READ plane (list / messages / membership-history over the archive). Moved OUT of
+// cognito-auth-stack (BUGS-ADMIN-CONSOLE D1): it is an admin-plane DATA api, not identity infra. It
+// imports the Identity-Pool sign-on + persona roles by ARN and attaches its execute-api teeth here, so
+// there is no circular dependency (admin-plane → cognito-auth only).
+const adminPlaneStack = new AdminPlaneStack(app, `${STACK_PREFIX}AdminPlane`, {
+  env,
+  appInstanceArn: chimeStack.appInstanceArn,
+  userPool: cognitoStack.userPool,
+  classificationRoleCeilings: cognitoStack.classificationRoleCeilings,
+  adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
+  adminPersonaRoleArns: cognitoStack.adminPersonaRoleArns,
+  description: 'AgentEchelon admin conversation read plane (archive list/messages/membership-history)',
+});
+adminPlaneStack.addDependency(chimeStack);
+adminPlaneStack.addDependency(cognitoStack);
 
 // Admin notification channel (A6): auto-provision a dedicated admin channel that the membership-audit
 // (Layer 6) and admin-error alert paths post to (in-app message + email fan-out). OPT-IN; when off,
@@ -283,6 +306,9 @@ if (analyticsMode === 'aurora') {
     // read plane when adminIamEnforcement is on, plus the opt-in persona roles.
     adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
     adminPersonaRoleArns: cognitoStack.adminPersonaRoleArns,
+    // A14 Scoped: role -> ceiling map so the analytics handler resolves the caller's ceiling
+    // from their assumed-role ARN (no Cognito call from the isolated VPC).
+    classificationRoleCeilings: cognitoStack.classificationRoleCeilings,
     // Thumbs per-variant join: the analytics Lambda scans the feedback table at
     // read time over the VPC DynamoDB endpoint.
     feedbackTableName: cognitoStack.feedbackTable.tableName,
@@ -316,6 +342,7 @@ if (analyticsMode === 'aurora') {
     appInstanceArn: chimeStack.appInstanceArn,
     userPool: cognitoStack.userPool,
     adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
+    classificationRoleCeilings: cognitoStack.classificationRoleCeilings,
     enableMembershipAudit,
     membershipAuditEnforce,
     membershipAuditAlertChannelArn,
@@ -340,6 +367,8 @@ const s3Stack = new S3StorageStack(app, `${STACK_PREFIX}S3Storage`, {
   env,
   appInstanceArn: chimeStack.appInstanceArn,
   userPool: cognitoStack.userPool,
+  exchangeRoleAdminPlaneArn: cognitoStack.exchangeRoleAdminPlaneArn,
+  attachmentsBucketArnParam,
   description: 'S3 storage for file attachments with Cognito-authorized API',
 });
 

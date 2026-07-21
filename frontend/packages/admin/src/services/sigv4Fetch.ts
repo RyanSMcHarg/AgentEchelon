@@ -18,7 +18,7 @@ import { SignatureV4 } from '@smithy/signature-v4';
 import { Sha256 } from '@aws-crypto/sha256-js';
 import { CognitoIdentityClient } from '@aws-sdk/client-cognito-identity';
 import { fromCognitoIdentityPool } from '@aws-sdk/credential-provider-cognito-identity';
-import { REGION, IDENTITY_POOL_ID, USER_POOL_ID, ApiError } from '@ae/shared';
+import { REGION, IDENTITY_POOL_ID, USER_POOL_ID, ApiError, ensureFreshIdToken } from '@ae/shared';
 
 export interface SigV4Credentials {
   accessKeyId: string;
@@ -33,19 +33,20 @@ export interface SigV4Credentials {
  * pool's role mapping resolves to the caller's group role (`cognito:preferred_role`).
  */
 let signOnProvider: (() => Promise<SigV4Credentials>) | null = null;
+// The idToken the cached provider was built with. The Cognito-Identity provider refreshes the STS creds
+// itself, but NOT the idToken baked into its `logins` map — so once that idToken expires the provider keeps
+// sending a stale one and GetCredentialsForIdentity fails "Invalid login token. Token expired". We therefore
+// recreate the provider whenever the (freshly-ensured) idToken changes.
+let signOnToken: string | null = null;
 
-function idTokenOrThrow(): string {
-  const idToken = localStorage.getItem('idToken');
-  if (!idToken) throw new Error('Not authenticated');
-  return idToken;
-}
-
-export function identityPoolCredentials(): Promise<SigV4Credentials> {
+export async function identityPoolCredentials(): Promise<SigV4Credentials> {
   if (!IDENTITY_POOL_ID || !USER_POOL_ID) {
     throw new Error('Signed admin reads require VITE_IDENTITY_POOL_ID + VITE_USER_POOL_ID');
   }
-  if (!signOnProvider) {
-    const idToken = idTokenOrThrow();
+  // Always sign with a LIVE idToken — refreshes on demand (the AuthProvider timer can miss in a bg tab).
+  const idToken = await ensureFreshIdToken();
+  if (!signOnProvider || signOnToken !== idToken) {
+    signOnToken = idToken;
     signOnProvider = fromCognitoIdentityPool({
       client: new CognitoIdentityClient({ region: REGION }) as unknown as Parameters<
         typeof fromCognitoIdentityPool
@@ -57,9 +58,10 @@ export function identityPoolCredentials(): Promise<SigV4Credentials> {
   return signOnProvider();
 }
 
-/** Drop the cached sign-on provider (call on sign-out / token refresh). */
+/** Drop the cached sign-on provider (call on sign-out). */
 export function resetSignOnCredentials(): void {
   signOnProvider = null;
+  signOnToken = null;
 }
 
 /**

@@ -7,7 +7,12 @@ export type ImageGenModelKey = 'titan_image' | 'nova_canvas';
 
 export interface ExperimentVariant {
   variantId: string;
-  modelKey: string;
+  /** The model this variant runs. MUTUALLY EXCLUSIVE with `profileRef` (backend-validated). */
+  modelKey?: string;
+  /** SPEC-PORTABLE-VERSIONED-PROFILES §6: run an ENTIRE assistant profile version as the variant (its
+   *  model/prompt/tools/… come from that version's definition). Omit `version` to track the active one.
+   *  Mutually exclusive with `modelKey`. */
+  profileRef?: { profileName: string; version?: number };
   weight: number;
   /** v0.2.0 (/battle): per-variant display name shown to users + in rival prompts. Max 16 chars. */
   displayName?: string;
@@ -21,7 +26,7 @@ export interface ExperimentVariant {
 }
 
 /** Experiment type. Absent ⇒ 'intent' (the default). */
-export type ExperimentType = 'intent' | 'base_model' | 'classification';
+export type ExperimentType = 'intent' | 'base_model' | 'classification' | 'profile';
 
 /** Advisory objective target. */
 export type ExperimentObjectiveMetric = 'cost' | 'accuracy' | 'quality' | 'latency';

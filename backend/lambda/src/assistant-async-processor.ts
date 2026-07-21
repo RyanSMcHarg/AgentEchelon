@@ -77,8 +77,10 @@ import {
 } from './lib/task-tracking.js';
 import { resolveModelForIntent } from './lib/model-resolver.js';
 import { clampResponseMaxTokens } from './lib/intent-pack.js';
+import { legalTransitionsFrom } from './lib/task-state-machines.js';
+import { taskHasMachine } from './lib/task-tools.js';
 import { getModelCatalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION, bedrockInvokeId } from '../../lib/config/model-strategy.js';
-import { resolveActiveProfile } from './lib/active-profile.js';
+import { resolveActiveProfile, buildIntentStrategy } from './lib/active-profile.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 // SPEC-PORTABLE-VERSIONED-PROFILES P0: root for the per-profile SSM namespace (/{root}/assistant/{name}/…).
@@ -237,20 +239,43 @@ async function loadDefaultBotArn(): Promise<string> {
 // cover the full task-type set (troubleshooting, data extraction, report generation, place_item,
 // action_item) — the superset the standard processor carried.
 function buildTaskSystemPrompt(taskType: string, taskState: string, task?: Task | null): string {
+  let base: string;
   switch (taskType) {
     case 'guided_troubleshooting':
-      return getGuidedTroubleshootingPrompt(taskState);
+      base = getGuidedTroubleshootingPrompt(taskState);
+      break;
     case 'data_extraction':
-      return getDataExtractionPrompt(taskState);
+      base = getDataExtractionPrompt(taskState);
+      break;
     case 'report_generation':
-      return getReportGenerationPrompt(taskState);
+      base = getReportGenerationPrompt(taskState);
+      break;
     case 'place_item':
-      return getPlaceItemPrompt(taskState);
+      base = getPlaceItemPrompt(taskState);
+      break;
     case 'action_item':
-      return getActionItemPrompt(taskState, task);
+      base = getActionItemPrompt(taskState, task);
+      break;
     default:
-      return '';
+      base = '';
   }
+  // Append the machine's EXACT legal next-state names. The per-state prose above says what to do but
+  // not always the precise state to advance TO, so the model would guess a to_state that isn't in the
+  // declared graph — advance_task_state then errors (unknown_state/illegal_transition) and the machine
+  // stalls mid-flow (e.g. data_extraction stuck in `extracting` while the reply is delivered). Naming the
+  // valid targets verbatim removes the guesswork.
+  if (base && taskHasMachine(taskType)) base += taskAdvanceHint(taskType, taskState);
+  return base;
+}
+
+/** The exact legal next states for the model's advance_task_state call, verbatim (no guessing). */
+function taskAdvanceHint(taskType: string, taskState: string): string {
+  const legal = legalTransitionsFrom(taskType, taskState);
+  if (legal.length === 0) {
+    return `\n\n**Task state machine:** the task is in \`${taskState}\` — a terminal state. Do not call advance_task_state.`;
+  }
+  const names = legal.map((s) => `\`${s}\``).join(', ');
+  return `\n\n**Task state machine:** the task is currently in \`${taskState}\`. When the conversation has actually reached the next milestone, call the **advance_task_state** tool with \`to_state\` set to EXACTLY one of these declared next states (copy the name verbatim): ${names}. These are the ONLY valid targets from here — do not invent or paraphrase a state name. If no milestone has been reached yet, do not call the tool.`;
 }
 
 // Action item. A tracked, assignable real-world action. The assistant never completes it in-app — it
@@ -581,11 +606,16 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     const baseModelSelection = (catalog as Record<string, unknown>)[activeModelKey]
       ? { ...DEFAULT_PROFILE_MODEL_SELECTION, [CONFIG.userType]: activeModelKey }
       : DEFAULT_PROFILE_MODEL_SELECTION;
+    // U2 (SPEC-ASSISTANT-CONFIG §4): per-intent model routing comes from THIS profile version's
+    // `models.byIntent`, not the global strategy table. The seed copies the global strategy per-profile,
+    // so this is byte-identical until an operator edits a version; fail-closed to the global strategy
+    // when a version carries no per-intent routing.
+    const profileStrategy = buildIntentStrategy(active.models) ?? INTENT_ROUTE_STRATEGY;
     const resolution = resolveModelForIntent(
       event.intent || event.resolvedModel,
       CONFIG.userType,
       catalog,
-      INTENT_ROUTE_STRATEGY,
+      profileStrategy,
       baseModelSelection,
     );
     const variantDef = battleVariantModelKey
@@ -593,7 +623,10 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       : undefined;
     const variantBedrockModelId = variantDef ? bedrockInvokeId(variantDef) : undefined;
     const effectiveModel = variantBedrockModelId || event.resolvedModel || resolution.primaryModelId;
-    const invokeConfig = { ...CONFIG, model: effectiveModel };
+    // SPEC-ASSISTANT-CONFIG §4 — per-profile tool allowlist: the active version's `tools` gate which tools
+    // the Converse loop may offer (undefined ⇒ all available, byte-identical to before). Flows into
+    // bedrockInvokeConfig below (which spreads invokeConfig).
+    const invokeConfig = { ...CONFIG, model: effectiveModel, tools: active.tools };
     // P0 attribution: which profile VERSION served this turn's base model ('seed' = the compiled
     // default, i.e. no active version). Battle/experiment overrides still take precedence above.
     console.log('[AssistantAsyncProcessor] active profile', {
@@ -635,7 +668,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
             },
             {
               catalog,
-              strategy: INTENT_ROUTE_STRATEGY,
+              strategy: profileStrategy,
               profileDefaults: baseModelSelection,
               enabled: true,
               cnBedrock,
@@ -1018,6 +1051,9 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       fallbackReason: bedrockResult.fallbackReason,
       retryCount: bedrockResult.retryCount,
       configIdentity,
+      // Attribute this turn to the exact assistant/profile + version that served it (SPEC-ASSISTANT-CONFIG §4)
+      // — not just its classification. `active.configId` is the portable-profile VERSION fingerprint.
+      profileAttribution: { profileName: PROFILE_NAME, profileConfigId: active.configId },
       ...(battleImageCount != null && { imageCount: battleImageCount }),
       ...(battleSelfDisplayName && { battleSelfDisplayName }),
       steps: bedrockResult.steps,

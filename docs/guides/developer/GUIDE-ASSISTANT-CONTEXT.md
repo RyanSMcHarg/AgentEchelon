@@ -34,7 +34,8 @@ content, not by habit:
 | **Live external facts** (ticket status, inventory) | Connector tool (`fetchContext`) *(target)* | The connector's own auth | On demand only |
 | **Always-present small context** (persona, standing policy) | System prompt; prompt caching (built) via a Bedrock cachePoint on supporting models | n/a | Cached prefix, billed once |
 | **This conversation so far** | Conversation history (recent turns); running **summary** folded in for older turns | Channel membership | History every turn; summary only when long |
-| **Greeting / onboarding** | Welcome composition (static default; opt-in multi-step onboarding intake, built) | Channel metadata; intake state in sessionAttributes | No model call on either path |
+| **Greeting / onboarding** | Welcome composition (static default; opt-in multi-step onboarding intake, once per user, built) | Channel metadata; in-intake state in sessionAttributes; durable onboarded flag + facts in the per-user profile store | No model call on either path |
+| **Durable per-user facts** (onboarding answers, e.g. company/role) | Per-user profile store (reference stand-in; swappable via `USER_PROFILE_SERVICE_ARN`) | Keyed by Cognito sub | Read on WelcomeIntent + first turn; written on intake completion |
 
 ## Building context for a new assistant
 
@@ -60,19 +61,29 @@ The mechanisms are shared; a new use case is configuration, not a forked agent l
 
 ## Loading company context (admin/deployer)
 
-**Built today.** Drop tier documents under `context/{tier}/`. Two paths read them, each with its own tier
-boundary:
+**Built today.** Drop tier documents under `context/{tier}/`. Two DIFFERENT paths read them, each with its own
+tier boundary. These are frequently confused, so be precise about which does what:
 
-- The **company-context tool** and the always-present **per-tier digest** (`context/{tier}/_digest.json`, a
-  manifest of document titles and one-line descriptions) are scoped by the physical **IAM** prefix boundary, so
-  a lower tier's role cannot read a higher tier's prefix.
-- **Company RAG:** the same documents are embedded into the pgvector store (stamped with their tier, under
-  `rag/company/{tier}/`) and retrieved per turn by relevance, scoped by the fail-closed **SQL** tier filter.
-  This surfaces the right facts deterministically (router pre-fetch) without the whole-corpus re-read.
+- The **company-context tool** (`load_company_context`) returns WHOLE documents from `context/{tier}/*`,
+  scoped by the physical **IAM** prefix boundary. It is **selective, not whole-corpus**: the always-present
+  **per-tier digest** (`context/{tier}/_digest.json`) lists each document's **filename** + title + one-line
+  description, and the model names the specific file(s) it needs in the tool's `documents` argument, so it
+  loads only those. It falls back to loading all permitted docs only for a genuinely broad question (or when a
+  legacy digest has no filenames). Use it when the assistant needs a **complete document** (for example a
+  data-extraction task pulling a full table).
+- **Company RAG (retrieval):** the same documents are embedded into the pgvector store (under
+  `rag/company/{tier}/`) and the router pre-fetches the top-K relevant **chunks** per turn by semantic
+  relevance, scoped by the fail-closed **SQL** tier filter, and passes them in on the payload. Use it (it runs
+  automatically) when the assistant needs the **relevant facts**, not a whole document. Requires Aurora mode.
 
-The digest is the lightweight, always-present signal (it tells the assistant what company context exists);
-retrieval and the tool supply the detail. The digest is precomputed at ingestion/seed time and warm-cached, so
-it is not rebuilt from the corpus every turn.
+So: **digest = the menu** (always present, names what exists); **tool = fetch a whole named document**;
+**RAG = semantically retrieve the relevant chunks**. Because the router already pre-fetches relevant chunks,
+the tool is for the whole-document case, not a redundant "load everything." The digest is precomputed at
+ingestion/seed time and warm-cached, so it is not rebuilt from the corpus every turn.
+
+> **The digest must carry each document's `file`** (its filename) for the tool's selective load to work — the
+> seed writes it from `demo/context-digest-manifest.json`. A digest without `file` degrades safely to the tool
+> loading all permitted docs.
 
 **Isolation posture (read this before embedding sensitive data).** With company RAG active, a document's tier is
 now enforced by **two** mechanisms: IAM (tool + digest) and the fail-closed SQL filter (retrieval). The SQL
@@ -115,9 +126,18 @@ a short, context-gathering intake before the assistant proper. Choose the patter
   user can skip optional ones.
 
   Like the static welcome it is **deterministic (no Bedrock call)** on any intake turn, so it is instant and
-  predictable. Progress rides in Lex `sessionAttributes` across turns (no per-turn store); the questions and
-  answers land as normal channel messages, so once the intake confirms, the working assistant sees the
-  collected inputs in its recent-history window with nothing extra to wire.
+  predictable. Progress within a single intake rides in Lex `sessionAttributes` across turns (no per-turn
+  store); the questions and answers land as normal channel messages, so once the intake confirms, the working
+  assistant sees the collected inputs in its recent-history window with nothing extra to wire.
+
+  **Onboarding fires ONCE per user.** The intake is not per-conversation: the router records that a user
+  completed onboarding (and the collected facts) in a durable per-user profile, and every later conversation
+  for that user skips the intake and answers directly. On WelcomeIntent it resolves the creator (channel
+  membership, falling back to the `createdBy` metadata stamp because the welcome fires before the creator's
+  membership settles) and starts the intake only when that user has no `onboardedAt`; on completion it writes
+  `onboardedAt` plus the facts. Reads fail open (a profile-store outage degrades to starting the intake, never
+  to a broken welcome). The profile store is a reference stand-in an implementer swaps for their own via
+  `USER_PROFILE_SERVICE_ARN`. Full design: [`SPEC-USER-PROFILE-AND-ONBOARDING.md`](../../specs/assistant-context/SPEC-USER-PROFILE-AND-ONBOARDING.md).
 
   **Enabling it.** Onboarding is off by default (the generic assistant answers the first turn cold). A
   deployment turns it on by supplying an intake schema as JSON, either inline via the `ONBOARDING_INTAKE`
@@ -185,7 +205,7 @@ not have them.
 
 | Capability | Athena (default) | Aurora |
 |---|---|---|
-| Company context | `load_company_context` tool (whole corpus, tier-scoped by IAM), plus the digest | Plus RAG relevance retrieval, deterministic router pre-fetch |
+| Company context | `load_company_context` tool (loads the specific doc(s) the model names from the digest, tier-scoped by IAM), plus the digest | Plus RAG relevance retrieval, deterministic router pre-fetch |
 | Project docs (wiki, runbooks) | Not retrievable | RAG retrieval |
 | Conversation summary | Not available | Consumed for long conversations |
 | Drift / cross-conversation | Not available | Available |

@@ -29,6 +29,9 @@
  */
 import { test, expect } from '@playwright/test';
 import { execSync } from 'child_process';
+import { writeFileSync, mkdtempSync } from 'fs';
+import { tmpdir } from 'os';
+import { join } from 'path';
 import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
 import { getBasicUser, getStandardUser, getPremiumUser, type TestUser } from './helpers/test-credentials';
 
@@ -61,6 +64,18 @@ function aws(args: string): any {
     env: { ...process.env, AWS_PROFILE },
   }).trim();
   return out ? JSON.parse(out) : null;
+}
+
+// AWS CLI JSON args (--expression-attribute-values, --key) must NOT be inlined as a
+// single-quoted string: on Windows execSync runs via cmd.exe, where '...' is not a string
+// delimiter, so the inner double-quotes are stripped and the JSON is mangled (ParamValidation:
+// "Expected '='"). Write the JSON to a temp file and pass it as file:// — robust on every platform.
+let _ddbTmp: string | undefined;
+function jsonArg(obj: unknown): string {
+  if (!_ddbTmp) _ddbTmp = mkdtempSync(join(tmpdir(), 'ae-ddb-'));
+  const f = join(_ddbTmp, `arg-${process.hrtime.bigint()}.json`);
+  writeFileSync(f, JSON.stringify(obj), 'utf8');
+  return `file://${f.replace(/\\/g, '/')}`;
 }
 
 /** Resolve a shared table name from an explicit env override, else the shared SSM parameter. */
@@ -140,26 +155,35 @@ suite('Task machine state persists to the source of truth (SPEC-TASK-STATE-TRANS
       // Correlate THIS run's task: the newest report_generation row for this user, created after
       // runStart (a task is created synchronously at send time; a short poll covers write visibility).
       let userRow: Record<string, any> | undefined;
+      let runRows: Array<Record<string, any>> = [];
       for (let i = 0; i < 20 && !userRow; i++) {
         const q = aws(
           `dynamodb query --table-name "${userTable}" ` +
             `--key-condition-expression "userSub = :u" ` +
-            `--expression-attribute-values '${JSON.stringify({ ':u': { S: sub } })}'`,
+            `--expression-attribute-values ${jsonArg({ ':u': { S: sub } })}`,
         );
-        const rows = ((q?.Items ?? []) as Array<Record<string, any>>)
+        runRows = ((q?.Items ?? []) as Array<Record<string, any>>)
           .map(unmarshalItem)
           .filter((r) => r.taskType === 'report_generation')
           .filter((r) => new Date(r.createdAt || 0).getTime() >= runStart)
           .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
-        userRow = rows[0];
+        userRow = runRows[0];
         if (!userRow) await page.waitForTimeout(3000);
       }
       expect(userRow, `[${tc.tier}] a report_generation task row for this run should exist (sub=${sub})`).toBeTruthy();
 
+      // NO DUPLICATE TASKS at the SOURCE OF TRUTH (T1): this single ask, by this user, in this window must
+      // have created EXACTLY ONE report_generation task row — not a duplicate from the getActiveTask
+      // eventual-consistency race. Stronger than the analytics-side check (reads user-tasks directly).
+      expect(
+        runRows.length,
+        `[${tc.tier}] exactly ONE report_generation task should exist for this run (no duplicate tasks per ask), found ${runRows.length}`,
+      ).toBe(1);
+
       // Read the source-of-truth agent-tasks row (keyed by taskId + channelArn).
       const got = aws(
         `dynamodb get-item --table-name "${agentTable}" ` +
-          `--key '${JSON.stringify({ taskId: { S: userRow!.taskId }, channelArn: { S: userRow!.channelArn } })}'`,
+          `--key ${jsonArg({ taskId: { S: userRow!.taskId }, channelArn: { S: userRow!.channelArn } })}`,
       );
       expect(got?.Item, `[${tc.tier}] agent-tasks row for ${userRow!.taskId} should exist`).toBeTruthy();
       const task = unmarshalItem(got.Item);

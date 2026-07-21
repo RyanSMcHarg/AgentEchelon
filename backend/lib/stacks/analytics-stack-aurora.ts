@@ -95,6 +95,9 @@ export interface AnalyticsStackAuroraProps extends cdk.StackProps {
   /** A14 personas (opt-in): persona key -> sign-on role ARN. Each gets execute-api
    *  teeth for exactly the analytics capabilities it holds (SPEC section 4). */
   adminPersonaRoleArns?: Record<string, string>;
+  /** A14 Scoped: role -> ceiling map (JSON) from the CognitoAuth stack. The handler resolves the
+   *  caller's classification ceiling from their assumed-role ARN with no Cognito call. */
+  classificationRoleCeilings?: string;
   /** Layer 6 membership audit (SPEC-CONVERSATION-SECURITY). Opt-in; report-only unless enforce. */
   enableMembershipAudit?: boolean;
   membershipAuditEnforce?: boolean;
@@ -1501,14 +1504,14 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
       // Trust the gateway-vetted signed principal + enforce queryType->capability
       // per resource (analytics-query.ts). Set only here — other Lambdas stay Cognito.
       analyticsLambda.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
-      // A14 Scoped: resolve the caller's classification ceiling from Cognito groups.
-      analyticsLambda.addEnvironment('USER_POOL_ID', props.userPoolId);
-      if (props.userPoolArn) {
-        analyticsLambda.addToRolePolicy(new iam.PolicyStatement({
-          actions: ['cognito-idp:ListUsers', 'cognito-idp:AdminListGroupsForUser'],
-          resources: [props.userPoolArn],
-        }));
+      // A14 Scoped: resolve the caller's classification ceiling from their ASSUMED-ROLE ARN via
+      // this role -> ceiling map (lib/caller-scope.ts). No Cognito call, so this VPC-isolated Lambda
+      // needs no path to the Cognito API and no `cognito-idp` grant (the Identity Pool already
+      // mapped groups -> role at vend time). USER_POOL_ID kept for any other admin lookups.
+      if (props.classificationRoleCeilings) {
+        analyticsLambda.addEnvironment('CLASSIFICATION_ROLE_CEILINGS', props.classificationRoleCeilings);
       }
+      analyticsLambda.addEnvironment('USER_POOL_ID', props.userPoolId);
     }
 
     // API Gateway
@@ -1529,7 +1532,10 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
         // in the actual response (analytics/audit -> adminAppUrl; events -> appUrl).
         allowOrigins: sharedOrigins(this),
         allowMethods: ['GET', 'POST', 'OPTIONS'],
-        allowHeaders: ['Content-Type', 'Authorization'],
+        // Under A14 IAM enforcement the admin app SIGNS these requests (SigV4), so the browser
+        // preflight must allow the signing headers, not just Authorization/Content-Type. Without
+        // X-Amz-* here the signed request is CORS-blocked -> "Analytics API unavailable".
+        allowHeaders: ['Content-Type', 'Authorization', 'X-Amz-Date', 'X-Amz-Security-Token', 'X-Amz-Content-Sha256'],
       },
     });
 
@@ -1751,6 +1757,15 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     new cdk.CfnOutput(this, 'SleepModeEnabled', {
       value: String(!!props.sleepMode),
       description: 'Whether cost sleep mode (GET /deployment/state) is deployed.',
+    });
+
+    // A14: gen-frontend-env maps this to VITE_ADMIN_IAM_ENFORCEMENT so the admin console
+    // SIGNS its requests (SigV4) iff the backend enforces IAM on the read plane — the two
+    // flags are DERIVED from one deployed value and can't drift (an off-frontend against an
+    // on-backend 403s every admin read). See SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md.
+    new cdk.CfnOutput(this, 'AdminIamEnforcement', {
+      value: String(adminIamEnforcement),
+      description: 'Whether admin read APIs require AWS_IAM (SigV4) auth; drives admin-app request signing.',
     });
 
     // --- Cost sleep mode (opt-in; docs/SPEC-COST-SLEEP-MODE.md) --------------

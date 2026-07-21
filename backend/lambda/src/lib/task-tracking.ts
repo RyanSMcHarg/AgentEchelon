@@ -121,6 +121,23 @@ export const TASK_STATE_MACHINES: Record<string, string[]> = {
   ],
 };
 
+/**
+ * Should a task turn mark the LIFECYCLE status 'completed'? Keeps the lifecycle status in step with the
+ * MACHINE state (AT6): a machine-backed task is only 'completed' once its machine actually reaches a
+ * TERMINAL state (the authoritative graph marks it), never force-completed mid-flow — so the admin Tasks
+ * view never shows status=Completed while the machine is still `extracting`. A task WITHOUT a state
+ * machine (lightweight/single-turn) has nothing to progress, so it completes on its turn as before.
+ */
+export function shouldMarkTaskCompleted(
+  taskType: string | undefined,
+  machineState: string | undefined,
+  machines: Record<string, TaskStateMachine> = DEFAULT_TASK_STATE_MACHINES,
+): boolean {
+  const machine = taskType ? machines[taskType] : undefined;
+  if (!machine) return true; // no machine → nothing to progress; completes per turn (unchanged)
+  return !!(machineState && machine.states?.[machineState]?.terminal);
+}
+
 export interface Task {
   taskId: string;
   channelArn: string;
@@ -422,32 +439,60 @@ export async function getActiveTask(
   opts: { channelArn?: string } = {},
 ): Promise<UserTask | null> {
   if (!USER_TASKS_TABLE) return null;
+  // Fast path: the userSub-taskType GSI (eventually consistent, cheap).
+  const viaGsi = await queryActiveTask(userSub, taskType, opts, false);
+  if (viaGsi) return viaGsi;
+  // Recent-write path (COST-CRITICAL): a task created moments ago by an earlier turn of the SAME
+  // multi-step flow may not yet be visible on the eventually-consistent GSI. A rapid follow-up turn
+  // (e.g. the details reply ~2s after a clarify) would then miss it and create a DUPLICATE task — a second
+  // full run of an expensive data_extraction / report_generation, doubling cost. Re-check with a
+  // STRONGLY-CONSISTENT read of the base table (PK=userSub) so the follow-up continues the existing task.
+  return queryActiveTask(userSub, taskType, opts, true);
+}
 
+/** Look up the most recent active task of a type. `consistent` chooses a strongly-consistent base-table
+ *  query (PK=userSub) over the eventually-consistent GSI — the base table supports ConsistentRead; a GSI
+ *  never does. See getActiveTask for why the consistent fallback matters (duplicate-task prevention). */
+async function queryActiveTask(
+  userSub: string,
+  taskType: string,
+  opts: { channelArn?: string },
+  consistent: boolean,
+): Promise<UserTask | null> {
   try {
-    const expressionAttributeValues: Record<string, string> = {
+    const values: Record<string, string> = {
       ':userSub': userSub,
       ':taskType': taskType,
       ':pending': 'pending',
       ':inProgress': 'in_progress',
     };
+    // The GSI pre-filters by taskType via its key; the base-table query filters taskType alongside status.
     const filterParts: string[] = ['#status IN (:pending, :inProgress)'];
+    if (consistent) filterParts.push('taskType = :taskType');
     if (opts.channelArn) {
       filterParts.push('channelArn = :channelArn');
-      expressionAttributeValues[':channelArn'] = opts.channelArn;
+      values[':channelArn'] = opts.channelArn;
     }
 
     const result = await dynamoClient.send(new QueryCommand({
       TableName: USER_TASKS_TABLE,
-      IndexName: 'userSub-taskType-index',
-      KeyConditionExpression: 'userSub = :userSub AND taskType = :taskType',
+      ...(consistent ? { ConsistentRead: true } : { IndexName: 'userSub-taskType-index' }),
+      KeyConditionExpression: consistent
+        ? 'userSub = :userSub'
+        : 'userSub = :userSub AND taskType = :taskType',
       FilterExpression: filterParts.join(' AND '),
       ExpressionAttributeNames: { '#status': 'status' },
-      ExpressionAttributeValues: expressionAttributeValues,
+      ExpressionAttributeValues: values,
       ScanIndexForward: false,
-      Limit: 1,
+      // A GSI query is pre-filtered so Limit:1 is safe; a filtered base-table query must not Limit:1
+      // (the Limit applies BEFORE the filter and could drop the match), so bound it modestly instead.
+      ...(consistent ? { Limit: 25 } : { Limit: 1 }),
     }));
 
-    return (result.Items?.[0] as UserTask) || null;
+    const items = (result.Items as UserTask[] | undefined) ?? [];
+    if (!consistent) return items[0] ?? null;
+    // Base-table result isn't ordered by recency across the whole partition; pick the newest match.
+    return items.sort((a, b) => String(b.updatedAt ?? b.createdAt).localeCompare(String(a.updatedAt ?? a.createdAt)))[0] ?? null;
   } catch (error) {
     console.error('Error getting active task:', error);
     return null;

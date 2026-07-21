@@ -46,6 +46,9 @@ export interface AnalyticsStackProps extends cdk.StackProps {
   userPool?: cognito.IUserPool;
   /** A14: the `admins` sign-on role ARN (execute-api teeth on the analytics API under adminIamEnforcement). */
   adminSignOnRoleArn?: string;
+  /** A14 Scoped: role -> ceiling map (JSON) from the CognitoAuth stack; the handler resolves the
+   *  caller's classification ceiling from their assumed-role ARN with no Cognito call. */
+  classificationRoleCeilings?: string;
   /** Layer 6 membership audit (SPEC-CONVERSATION-SECURITY). Opt-in; report-only unless enforce. */
   enableMembershipAudit?: boolean;
   membershipAuditEnforce?: boolean;
@@ -583,7 +586,9 @@ export class AnalyticsStack extends cdk.Stack {
         // appUrl) in the actual response.
         allowOrigins: sharedOrigins(this),
         allowMethods: ['POST', 'OPTIONS'],
-        allowHeaders: ['Content-Type', 'Authorization'],
+        // A14 IAM enforcement: the admin app SIGNS these requests (SigV4); the preflight must
+        // allow the signing headers or the browser CORS-blocks them ("Analytics API unavailable").
+        allowHeaders: ['Content-Type', 'Authorization', 'X-Amz-Date', 'X-Amz-Security-Token', 'X-Amz-Content-Sha256'],
       },
       deployOptions: {
         throttlingBurstLimit: 20,
@@ -614,13 +619,13 @@ export class AnalyticsStack extends cdk.Stack {
       : adminApiMethodOptions(this, 'AnalyticsAuthorizer', { userPool: props.userPool });
     if (adminIamEnforcement) {
       analyticsQueryFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
-      // A14 Scoped: resolve the caller's classification ceiling from Cognito groups.
+      // A14 Scoped: resolve the caller's classification ceiling from their assumed-role ARN via
+      // this role -> ceiling map (lib/caller-scope.ts) — no Cognito call, no `cognito-idp` grant.
+      if (props.classificationRoleCeilings) {
+        analyticsQueryFn.addEnvironment('CLASSIFICATION_ROLE_CEILINGS', props.classificationRoleCeilings);
+      }
       if (props.userPool) {
         analyticsQueryFn.addEnvironment('USER_POOL_ID', props.userPool.userPoolId);
-        analyticsQueryFn.addToRolePolicy(new iam.PolicyStatement({
-          actions: ['cognito-idp:ListUsers', 'cognito-idp:AdminListGroupsForUser'],
-          resources: [props.userPool.userPoolArn],
-        }));
       }
     }
     analyticsApi.root
@@ -641,6 +646,14 @@ export class AnalyticsStack extends cdk.Stack {
       value: `${analyticsApi.url}query`,
       description: 'Analytics query API URL',
       exportName: `${this.stackName}-AnalyticsApiUrl`,
+    });
+
+    // A14: gen-frontend-env maps this to VITE_ADMIN_IAM_ENFORCEMENT so the admin console
+    // signs its requests iff the backend enforces IAM — the two flags are derived from one
+    // deployed value and can't drift. See SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md.
+    new cdk.CfnOutput(this, 'AdminIamEnforcement', {
+      value: String(adminIamEnforcement),
+      description: 'Whether admin read APIs require AWS_IAM (SigV4) auth; drives admin-app request signing.',
     });
 
     // ============================================================

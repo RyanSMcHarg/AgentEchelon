@@ -32,6 +32,8 @@
 import { test, expect, request as pwRequest } from '@playwright/test';
 import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
+import { signedAnalyticsPost } from './helpers/signed-analytics';
+import { assertNoDuplicateTasks, openAndValidateAttachment } from './helpers/task-validation';
 
 const RUN = process.env.TASKS_E2E === '1';
 const suite = RUN ? test.describe : test.describe.skip;
@@ -68,6 +70,8 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
       await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
       await createConversation(page, `Task e2e ${tc.tier} ${Date.now()}`, tc.classification);
 
+      // T1 regression window: tasks opened from this point on belong to THIS single ask.
+      const testStart = Date.now() - 60_000; // 60s skew buffer (task is created slightly before the reply lands)
       // Send the report prompt. A TASK_MULTI_STEP turn posts progress then the
       // deliverable; we just need the turn to complete so the task is archived.
       const resp = await sendAndWaitForResponse(page, REPORT_PROMPT, 180_000);
@@ -96,9 +100,10 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
 
       const end = new Date();
       const start = new Date(end.getTime() - 1 * 86_400_000);
+      // Analytics API is IAM-enforced (adminIamEnforcement) — sign the request; Bearer JWT 403s.
       const q = async (queryType: string) => {
-        const r = await api.post(ANALYTICS_API, { data: { queryType, dateRange: { start: start.toISOString(), end: end.toISOString() } } });
-        return (await r.json()).data || [];
+        const j = await signedAnalyticsPost(ANALYTICS_API, idToken!, { queryType, dateRange: { start: start.toISOString(), end: end.toISOString() } });
+        return j.data || [];
       };
 
       // Poll task_details until the task lands. The exchange reaches Aurora via
@@ -111,6 +116,15 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
         if (tasks.length === 0) await page.waitForTimeout(6000);
       }
       expect(tasks.length, `[${tc.tier}] task_details should have >=1 task after a report request`).toBeGreaterThan(0);
+
+      // T1 REGRESSION (no duplicate tasks per ask): a single report request must open exactly ONE task in
+      // its conversation, not a duplicate (the getActiveTask strongly-consistent fallback). Scope to tasks
+      // opened during THIS test (started_at >= testStart) of this type, grouped by conversation channel.
+      assertNoDuplicateTasks(tasks as Array<Record<string, unknown>>, {
+        type: 'report_generation',
+        since: testStart,
+        label: `[${tc.tier}]`,
+      });
 
       // task_metrics should now roll it up too.
       const metrics = await q('task_metrics');
@@ -152,36 +166,19 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     }
     expect(delivered, 'the report task must DELIVER a downloadable report document').toBe(true);
 
-    // It must be a document (markdown/txt/pdf), not a spurious file type.
-    const name = ((await attachment.locator('.attachment-name').textContent()) || '').trim();
-    expect(name, `attachment name: "${name}"`).toMatch(/\.(md|markdown|txt|pdf)$/i);
-
-    // Download (handleDownload → window.open the presigned S3 URL as a popup) and fetch the bytes.
-    const [popup] = await Promise.all([
-      page.context().waitForEvent('page', { timeout: 30_000 }),
-      attachment.locator('.attachment-file, .attachment-download-btn').first().click(),
-    ]);
-    await popup.waitForLoadState('domcontentloaded').catch(() => {});
-    const fileUrl = popup.url();
-    await popup.close();
-    expect(fileUrl, 'the download must open the presigned file URL').toMatch(/^https?:\/\//);
-    const fileApi = await pwRequest.newContext();
-    const fileResp = await fileApi.get(fileUrl);
-    expect(fileResp.ok(), `presigned download must succeed (got ${fileResp.status()})`).toBeTruthy();
-    const content = await fileResp.text();
-    await fileApi.dispose();
-
-    // Validate the CONTENT is a real report — this is what catches an empty/garbage report or a
-    // conversational turn saved as a file (the reported bug), regardless of the plumbing being green.
-    expect(content.length, 'the report document must be substantial (not empty/near-empty)').toBeGreaterThan(400);
-    expect(content, 'the report must have markdown structure (headings / bullets / numbered sections)')
-      .toMatch(/(^|\n)#{1,3}\s|\n\s*[-*]\s|\n\s*\d+\.\s/);
-    expect(content.toLowerCase(), 'the report must be ON-TOPIC (mono/multi-repo)')
-      .toMatch(/mono-?repo|multi-?repo|repositor/);
-    // Not the clarifying questions saved as a file; and valid UTF-8 (no replacement/garbage chars).
-    expect(content.toLowerCase(), 'the report must not be the clarifying questions')
-      .not.toMatch(/a few quick questions|what should the report focus on|let me know your preferences/);
-    expect(content, 'the report text must be valid UTF-8 (no replacement/garbage chars)').not.toContain('�');
+    // Open the presigned download and validate the CONTENT is a real report — catches an empty/garbage
+    // report or a conversational turn saved as a file (the reported bug), regardless of plumbing being green.
+    await openAndValidateAttachment(page, attachment, {
+      namePattern: /\.(md|markdown|txt|pdf)$/i,
+      minLength: 400,
+      mustMatch: [
+        {
+          re: /(^|\n)#{1,3}\s|\n\s*[-*]\s|\n\s*\d+\.\s/,
+          because: 'the report must have markdown structure (headings / bullets / numbered sections)',
+        },
+        { re: /mono-?repo|multi-?repo|repositor/, because: 'the report must be ON-TOPIC (mono/multi-repo)', lower: true },
+      ],
+    });
   });
 
   // OUTPUT VALIDITY — data_extraction: an extraction task must hand back a real, structured, on-topic
@@ -214,31 +211,16 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     }
     expect(delivered, 'the extraction task must DELIVER a downloadable data document').toBe(true);
 
-    const name = ((await attachment.locator('.attachment-name').textContent()) || '').trim();
-    expect(name, `attachment name: "${name}"`).toMatch(/\.(md|markdown|txt|csv)$/i);
-
-    const [popup] = await Promise.all([
-      page.context().waitForEvent('page', { timeout: 30_000 }),
-      attachment.locator('.attachment-file, .attachment-download-btn').first().click(),
-    ]);
-    await popup.waitForLoadState('domcontentloaded').catch(() => {});
-    const fileUrl = popup.url();
-    await popup.close();
-    expect(fileUrl, 'the download must open the presigned file URL').toMatch(/^https?:\/\//);
-    const fileApi = await pwRequest.newContext();
-    const fileResp = await fileApi.get(fileUrl);
-    expect(fileResp.ok(), `presigned download must succeed (got ${fileResp.status()})`).toBeTruthy();
-    const content = await fileResp.text();
-    await fileApi.dispose();
-
-    // Validate the CONTENT is a real structured extraction — a markdown table with the requested fields,
-    // on-topic (churn / at-risk accounts), not a conversational summary, valid UTF-8.
-    expect(content.length, 'the data document must be substantial (not empty/near-empty)').toBeGreaterThan(200);
-    expect(content, 'the extraction must be a markdown table (header row + separator rule)')
-      .toMatch(/\|.*\|\s*\n\s*\|[-:\s|]+\|/);
-    expect(content.toLowerCase(), 'the extraction must be ON-TOPIC (churn / at-risk accounts)')
-      .toMatch(/churn|at.risk|risk/);
-    expect(content, 'the extraction text must be valid UTF-8 (no replacement/garbage chars)').not.toContain('�');
+    // Open the presigned download and validate the CONTENT is a real structured extraction — a markdown
+    // table with the requested fields, on-topic (churn / at-risk accounts), not a conversational summary.
+    await openAndValidateAttachment(page, attachment, {
+      namePattern: /\.(md|markdown|txt|csv)$/i,
+      minLength: 200,
+      mustMatch: [
+        { re: /\|.*\|\s*\n\s*\|[-:\s|]+\|/, because: 'the extraction must be a markdown table (header row + separator rule)' },
+        { re: /churn|at.risk|risk/, because: 'the extraction must be ON-TOPIC (churn / at-risk accounts)', lower: true },
+      ],
+    });
   });
 
   // guided_troubleshooting is an INTERACTIVE diagnostic task, NOT a document-producing one. It must

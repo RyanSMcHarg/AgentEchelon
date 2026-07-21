@@ -50,6 +50,10 @@ const OUTPUT_TO_VITE = {
   ShareConversationApiUrl: 'VITE_SHARE_CONVERSATION_API_URL',
   PresignedUrlApiUrl: 'VITE_PRESIGNED_URL_API_URL',
   AnalyticsApiUrl: 'VITE_ANALYTICS_API_URL',
+  // A14: whether the backend enforces AWS_IAM on the admin read plane. When 'true' the
+  // admin app SigV4-signs its requests; derived from the deployed backend so the two
+  // flags can't drift (an unsigned admin app against an IAM-enforced backend 403s).
+  AdminIamEnforcement: 'VITE_ADMIN_IAM_ENFORCEMENT',
   // Gates the DeploymentStatusBanner probe: only poll GET /deployment/state when sleep
   // mode is actually deployed. Absent (Athena mode) or 'false' ⇒ the banner never probes.
   SleepModeEnabled: 'VITE_SLEEP_MODE_ENABLED',
@@ -60,6 +64,9 @@ const OUTPUT_TO_VITE = {
   ChannelBattleApiUrl: 'VITE_CHANNEL_BATTLE_API_URL',
   BattleOutcomeApiUrl: 'VITE_BATTLE_OUTCOME_API_URL',
   ExperimentsApiUrl: 'VITE_EXPERIMENTS_API_URL',
+  // SPEC-PORTABLE-VERSIONED-PROFILES: the manage-profiles lifecycle API (list/version/activate/
+  // rollback/import/export). Admin-only. Co-hosted with the experiments API.
+  ManageProfilesApiUrl: 'VITE_MANAGE_PROFILES_API_URL',
   // The separate admin console's URL (AgentEchelonAdminFrontend, prefix 'Admin').
   // The CHAT app reads it to show admins a link OUT to the console (a URL only, no
   // operator code). Absent until the admin frontend deploys (two-phase bootstrap);
@@ -78,9 +85,12 @@ const ADMIN_ONLY = new Set([
   'VITE_ANALYTICS_MODE',
   'VITE_USER_MANAGEMENT_API_URL',
   'VITE_ADMIN_CONVERSATIONS_API_URL',
+  'VITE_MANAGE_PROFILES_API_URL',
   // P3 (optional): a dedicated admin Cognito app-client. Absent ⇒ the admin app
   // falls back to VITE_CLIENT_ID (reuse of the shared client). Admin package only.
   'VITE_ADMIN_CLIENT_ID',
+  // A14: only the admin console signs requests; the chat app never does.
+  'VITE_ADMIN_IAM_ENFORCEMENT',
 ]);
 
 // Chat-ONLY Vite vars: the chat SPA consumes these; the admin console does not.
@@ -112,6 +122,9 @@ const OPTIONAL = new Set([
   'VITE_BATTLE_OUTCOME_API_URL',
   'VITE_EXPERIMENTS_API_URL',
   'VITE_ADMIN_CLIENT_ID',
+  // Absent on stacks deployed before this output existed ⇒ omit (admin app treats
+  // a missing flag as 'not enforced', matching the pre-A14 default).
+  'VITE_ADMIN_IAM_ENFORCEMENT',
 ]);
 
 async function collectOutputs() {

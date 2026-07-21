@@ -1,4 +1,5 @@
 import { CREDENTIAL_EXCHANGE_API_URL } from '../platform/config';
+import { ensureFreshIdToken } from './ensureFreshToken';
 
 /**
  * The Credential Exchange (SPEC-CREDENTIAL-EXCHANGE) is ONE reused primitive:
@@ -59,14 +60,20 @@ export async function exchangeCredentials(
  * Credential Exchange with an empty body (chat plane — the caller's own
  * `${sub}` identity, no channel scoping). Returns a provider (not static
  * creds) so the SDK auto-refreshes by re-calling the exchange when the
- * session nears expiry; the `idToken` is the Cognito ID token the exchange's
- * API-GW authorizer validates.
+ * session nears expiry. On each (re)call it fetches a FRESH idToken via
+ * `ensureFreshIdToken` rather than reusing the one captured at creation, so a
+ * refresh that fires after the idToken expired (e.g. a backgrounded tab whose
+ * AuthProvider timer was throttled) still authorizes — instead of replaying a
+ * stale token and failing "Invalid login token. Token expired". The `idToken`
+ * arg is a fallback for the first call before any refresh machinery is ready.
  */
-export function exchangeCredentialsProvider(idToken: string): () => Promise<VendedCredentials> {
+export function exchangeCredentialsProvider(idToken?: string): () => Promise<VendedCredentials> {
   return async () => {
+    const token = await ensureFreshIdToken().catch(() => idToken);
+    if (!token) throw new Error('Not authenticated');
     const resp = await fetch(exchangeUrl(), {
       method: 'POST',
-      headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: '{}', // identity comes from the validated token, never the body (IDOR guard)
     });
     if (!resp.ok) throw new Error(`Credential exchange failed: ${resp.status}`);

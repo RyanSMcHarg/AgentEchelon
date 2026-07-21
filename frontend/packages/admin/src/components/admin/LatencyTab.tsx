@@ -68,22 +68,30 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
     );
   }
 
-  const rows = data?.data ?? [];
+  const rows = (data?.data ?? []) as Array<Record<string, unknown>>;
 
-  // Aggregate metrics across all rows
-  const withLatency = rows.filter((r) => r.avg_total_ms != null && Number(r.avg_total_ms) > 0);
-  const avgTotal = withLatency.length > 0
-    ? withLatency.reduce((sum, r) => sum + Number(r.avg_total_ms), 0) / withLatency.length
-    : 0;
-  const avgBedrock = withLatency.length > 0
-    ? withLatency.reduce((sum, r) => sum + Number(r.avg_bedrock_ms || 0), 0) / withLatency.length
-    : 0;
-  const avgPoll = withLatency.length > 0
-    ? withLatency.reduce((sum, r) => sum + Number(r.avg_poll_ms || 0), 0) / withLatency.length
-    : 0;
-  const p95Total = withLatency.length > 0
-    ? Math.max(...withLatency.map((r) => Number(r.p95_total_ms || 0)))
-    : 0;
+  // Aggregate metrics across rows. Two corrections vs. the naive version:
+  //  1) EXCLUDE multi-step TASK deliveries. A task's total_ms / poll_ms spans the WHOLE task (a report or
+  //     extraction runs 20s–minutes), so mixing it into the perceived-latency headline made Avg Polling
+  //     and P95 read absurdly high. A task's end-to-end time is measured per-intent in Effectiveness;
+  //     these cards are the PERCEIVED single-reply latency (direct + placeholder-update deliveries).
+  //  2) VOLUME-WEIGHT the averages and P95 by exchange_count. The old P95 was Math.max over per-group
+  //     rows, so one low-traffic slow group defined "the" P95. Weighting by traffic gives a
+  //     representative number. (A true overall p95 is not recoverable from per-group p95 values; the
+  //     traffic-weighted mean is the honest single-number summary — see the tooltip.)
+  const isTaskDelivery = (r: Record<string, unknown>) => String(r.delivery_option || '').toUpperCase().startsWith('TASK');
+  const withLatency = rows.filter((r) => r.avg_total_ms != null && Number(r.avg_total_ms) > 0 && !isTaskDelivery(r));
+  const totalExchanges = withLatency.reduce((s, r) => s + (Number(r.exchange_count) || 0), 0);
+  const wavg = (field: string): number => {
+    if (totalExchanges <= 0) {
+      return withLatency.length > 0 ? withLatency.reduce((s, r) => s + Number(r[field] || 0), 0) / withLatency.length : 0;
+    }
+    return withLatency.reduce((s, r) => s + Number(r[field] || 0) * (Number(r.exchange_count) || 0), 0) / totalExchanges;
+  };
+  const avgTotal = wavg('avg_total_ms');
+  const avgBedrock = wavg('avg_bedrock_ms');
+  const avgPoll = wavg('avg_poll_ms');
+  const p95Total = wavg('p95_total_ms');
 
   // Time to first feedback (TTFF) is the PRIMARY perceived-latency metric: the
   // placeholder-update delivery makes it the latency the user actually waits on
@@ -137,7 +145,9 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
         primary, perceived-latency metric (the placeholder shows in under a second); total is the
         time to the completed answer and includes placeholder polling, Bedrock inference, and
         delivery, with Bedrock typically dominant. Cold Lambda starts add one-off seconds; warm
-        invocations are much faster.{' '}
+        invocations are much faster. These cards cover single-reply (direct / placeholder-update)
+        latency and <strong>exclude multi-step tasks</strong>, whose end-to-end time runs seconds to
+        minutes by design and is measured per intent under Effectiveness. Values are traffic-weighted.{' '}
         <DocLink href={DOC_LINKS.messageFlow}>Message flow</DocLink>
         {' · '}
         <DocLink href={DOC_LINKS.latencyTargets}>Latency targets</DocLink>
@@ -176,9 +186,9 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
         <MetricCard
           title="Avg Polling"
           value={formatMs(avgPoll)}
-          tooltip="Mean time the async processor spent polling for the completed answer before swapping it in for the placeholder. Part of total latency, distinct from model inference."
+          tooltip="Mean time the async processor spent polling for the completed answer before swapping it in for the placeholder, for single-reply deliveries only (multi-step tasks are excluded — their polling spans the whole task). Part of total latency, distinct from model inference."
         />
-        <MetricCard title="P95 Total" value={formatMs(p95Total)} target={METRIC_TARGETS.p95_total_ms} rawValue={p95Total} />
+        <MetricCard title="P95 Total" value={formatMs(p95Total)} target={METRIC_TARGETS.p95_total_ms} rawValue={p95Total} tooltip="95th-percentile single-reply latency, traffic-weighted across groups (excludes multi-step tasks). Not the exact global p95 — a per-group tail summary — but a stable headline rather than the single worst group." />
       </div>
 
       {latencyTrendDates.length >= 2 && (

@@ -115,8 +115,16 @@ async function loadDocsFromPrefixes(
   bucket: string,
   prefixes: string[],
   logLabel: string,
+  docFilter?: Set<string>,
 ): Promise<CompanyContextResult> {
-  const keys = await listAccessibleKeys(bucket, prefixes);
+  const allKeys = await listAccessibleKeys(bucket, prefixes);
+  // SELECTIVE load (SPEC-ASSISTANT-CONTEXT): when the model named the document(s) it needs (by filename,
+  // from the digest), fetch ONLY those instead of the whole corpus — the cost win. An empty/unmatched
+  // filter falls through to loading everything (recall-safe: a broad question still gets the full set).
+  const filtered = docFilter && docFilter.size
+    ? allKeys.filter((k) => docFilter.has(k.split('/').pop() || ''))
+    : [];
+  const keys = filtered.length ? filtered : allKeys;
   const docs: CompanyDoc[] = [];
   let totalChars = 0;
   for (const key of keys) {
@@ -157,11 +165,20 @@ export function __clearCompanyContextCache(): void {
  * (COMPANY_CONTEXT_CACHE_TTL_MS) so the same classification context is not re-fetched from
  * S3 every turn.
  */
-export async function loadCompanyContext(bucket: string): Promise<CompanyContextResult> {
-  const cached = companyContextCache.get(bucket);
+export async function loadCompanyContext(
+  bucket: string,
+  opts?: { documents?: string[] },
+): Promise<CompanyContextResult> {
+  // The model names the specific documents it needs (filenames from the digest). Only those are fetched —
+  // scoping ingestion to the task instead of dumping every doc each turn. No selection ⇒ load-all (bounded).
+  const docFilter = opts?.documents?.length
+    ? new Set(opts.documents.map((d) => d.split('/').pop() || d))
+    : undefined;
+  const cacheKey = `${bucket}::${docFilter ? [...docFilter].sort().join(',') : 'ALL'}`;
+  const cached = companyContextCache.get(cacheKey);
   if (cached && Date.now() - cached.at < COMPANY_CONTEXT_CACHE_TTL_MS) return cached.result;
-  const result = await loadDocsFromPrefixes(bucket, CLASSIFICATION_PREFIXES, 'company-context');
-  companyContextCache.set(bucket, { result, at: Date.now() });
+  const result = await loadDocsFromPrefixes(bucket, CLASSIFICATION_PREFIXES, 'company-context', docFilter);
+  companyContextCache.set(cacheKey, { result, at: Date.now() });
   return result;
 }
 
@@ -188,6 +205,10 @@ export async function loadPlatformInfo(bucket: string): Promise<CompanyContextRe
 // ---------------------------------------------------------------------------
 
 export interface DigestEntry {
+  /** The document's FILENAME (e.g. "financial-data.json") — the stable id the model names in the
+   *  load_company_context `documents` arg to fetch this doc specifically. Absent on legacy digests ⇒ the
+   *  tool falls back to loading all docs (recall-safe). */
+  file?: string;
   /** Human-readable document title, e.g. "Financial data". */
   title: string;
   /** One-line description of what the document contains. */
@@ -229,13 +250,14 @@ export async function loadContextDigest(
  *  when there is no digest, so callers can append unconditionally. */
 export function buildDigestHint(entries: DigestEntry[]): string {
   if (!entries.length) return '';
-  const lines = entries.map((e) => `- ${e.title}: ${e.description}`).join('\n');
+  // Show the FILENAME so the model can request exactly the doc(s) it needs.
+  const lines = entries.map((e) => (e.file ? `- ${e.file} — ${e.title}: ${e.description}` : `- ${e.title}: ${e.description}`)).join('\n');
   return (
     '\n\n## AVAILABLE COMPANY CONTEXT\n' +
-    'These company documents are available to you for this conversation. When a '
-    + 'question needs specifics from one, retrieve it (the load_company_context '
-    + 'tool) rather than guessing; relevant details are also folded in '
-    + 'automatically when available.\n' +
+    'These company documents are available to you for this conversation. When a question needs specifics '
+    + 'from one, call load_company_context with the `documents` list set to ONLY the filename(s) you need '
+    + '(shown at the start of each line below) — do not request documents you do not need. Relevant details '
+    + 'are also folded in automatically when available.\n' +
     lines
   );
 }

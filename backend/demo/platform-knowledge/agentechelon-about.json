@@ -27,12 +27,12 @@
     },
     {
       "title": "Admin Console Guide",
-      "summary": "How operators use the AgentEchelon admin dashboard to check platform health, review how the assistants are performing, and moderate conversations. Written to be portable - it describes behaviour, not any specific AWS account.",
+      "summary": "How operators use the AgentEchelon admin dashboard to check platform health, review how the assistants are performing, and administer conversations. Written to be portable - it describes behaviour, not any specific AWS account.",
       "path": "docs/guides/admin/ADMIN-GUIDE.md"
     },
     {
       "title": "Bringing Your Own Admin Console & Admin Auth",
-      "summary": "This guide explains how to run AgentEchelon's operator surface - analytics, moderation, evaluations, experiments - **behind your own application's admin console and admin authentication**, instead of AgentEchelon's built-in Cognito `admins` group and React dashboard.",
+      "summary": "This guide explains how to run AgentEchelon's operator surface - analytics, administration, evaluations, experiments - **behind your own application's admin console and admin authentication**, instead of AgentEchelon's built-in Cognito `admins` group and React dashboard.",
       "path": "docs/guides/admin/ADMIN-INTEGRATION-GUIDE.md"
     },
     {
@@ -67,7 +67,7 @@
     },
     {
       "title": "AgentEchelon Design System",
-      "summary": "The design tokens and shared component classes described here are implemented in `frontend/src/styles/`. Some component CSS is still being migrated onto them - the [Migration Guide](#migration-guide) below is the reference for bringing a component onto the system.",
+      "summary": "The design tokens and shared component classes described here are implemented in `frontend/packages/shared/src/styles/`. Some component CSS is still being migrated onto them - the [Migration Guide](#migration-guide) below is the reference for bringing a component onto the system.",
       "path": "docs/guides/developer/DESIGN-SYSTEM.md"
     },
     {
@@ -87,7 +87,7 @@
     },
     {
       "title": "Latency targets (industry-sourced)",
-      "summary": "The admin console's latency targets (`frontend/src/components/admin/metricTargets.ts` and `LatencyTab.latencyColor`) are set to published industry standards, not to a self-imposed ceiling. This doc records the standards and how they map onto AgentEchelon so the numbers are defensible and reviewable.",
+      "summary": "The admin console's latency targets (`frontend/packages/admin/src/components/admin/metricTargets.ts` and `LatencyTab.latencyColor`) are set to published industry standards, not to a self-imposed ceiling. This doc records the standards and how they map onto AgentEchelon so the numbers are defensible and reviewable.",
       "path": "docs/guides/developer/LATENCY-TARGETS.md"
     },
     {
@@ -166,8 +166,13 @@
       "path": "docs/specs/admin-console/SPEC-ADMIN-CONSOLE.md"
     },
     {
+      "title": "SPEC: Separate Admin Console App",
+      "summary": "**Status:** P0-P3 BUILT. P0-P1: the standalone admin app + the chat-app cutover. P2: the frontend is an npm-workspaces monorepo (`@ae/shared`, `@ae/chat`, `@ae/admin`) - shared code (types, apiCall with an injectable token provider, AuthProvider, the reused credential-exchange client, i18n) factored into `@ae/shared`, `chimeService` split into chat messaging (`@ae/chat`) + admin actions (`@ae/admi",
+      "path": "docs/specs/admin-console/SPEC-SEPARATE-ADMIN-APP.md"
+    },
+    {
       "title": "SPEC: Abuse Controls (rate limiting, spend budgets, request dedup)",
-      "summary": "**Status:** Implemented (all phases). `lib/abuse-controls.ts` holds the logic, wired into all three tiers via `agent-tier-common.abuseControlsWiring`: request dedup (guard in `runSharedPipeline` + stable `correlationId` from `CHIME.message.id`), per-user/global spend budget with a fail-safe global ceiling, an SSM circuit trip, a per-tier hourly rate limit, and an inbound length cap. Active by defa",
+      "summary": "**Status:** Implemented (all phases). `lib/abuse-controls.ts` holds the logic, wired into all three tiers via `agent-classification-common.abuseControlsWiring`: request dedup (guard in `runSharedPipeline` + stable `correlationId` from `CHIME.message.id`), per-user/global spend budget with a fail-safe global ceiling, an SSM circuit trip, a per-tier hourly rate limit, and an inbound length cap. Acti",
       "path": "docs/specs/analytics-eval/SPEC-ABUSE-CONTROLS.md"
     },
     {
@@ -201,9 +206,14 @@
       "path": "docs/specs/assistant-context/SPEC-CONFIGURABLE-INTENT-PACK.md"
     },
     {
-      "title": "SPEC: Per-tier ownership (`AgentEchelonTier-*`)",
+      "title": "SPEC: Per-profile ownership (`AgentEchelonClassification-*`)",
       "summary": "**Status:** Implemented",
       "path": "docs/specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md"
+    },
+    {
+      "title": "SPEC: User profile store and once-per-user onboarding",
+      "summary": "**Status:** Implemented (pending live deploy + e2e validation)",
+      "path": "docs/specs/assistant-context/SPEC-USER-PROFILE-AND-ONBOARDING.md"
     },
     {
       "title": "Cross-Channel Task Continuity",
@@ -266,6 +276,16 @@
       "path": "docs/specs/identity-access/SPEC-ADD-USER-ESCALATION.md"
     },
     {
+      "title": "Making admin-console actions IAM-enforceable",
+      "summary": "**Status:** Built, flag-gated (opt-in), pending deploy validation. The enforcement is off by default; `-c adminIamEnforcement=true` (backend) plus `VITE_ADMIN_IAM_ENFORCEMENT=true` (admin app) turns it on, and the interim Cognito-group gate (`callerCanReadArchive`) stays as the `ae-cognito` fallback. The example personas (section 2) are opt-in behind `-c enableAdminPersonas=true`. What is wired: t",
+      "path": "docs/specs/identity-access/SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md"
+    },
+    {
+      "title": "SPEC: Admin Agent and Admin Notification Channel",
+      "summary": "**Status:** DESIGN (not yet built). This spec supersedes the initial admin-notification-channel attempt (the stack at `backend/lib/stacks/admin-notification-stack.ts` and its handler `backend/lambda/src/admin-notification-channel-provision.ts`), which created and posted to the channel as the service app-instance-admin. That is wrong (see Why) and is being reworked to the model below.",
+      "path": "docs/specs/identity-access/SPEC-ADMIN-AGENT-NOTIFICATIONS.md"
+    },
+    {
       "title": "SPEC: Admin Identity",
       "summary": "**Status:** Implemented",
       "path": "docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md"
@@ -281,14 +301,14 @@
       "path": "docs/specs/identity-access/SPEC-CREDENTIAL-EXCHANGE.md"
     },
     {
-      "title": "SPEC - Moderation Model (surfaces)",
-      "summary": "**Status:** Partial (the built moderation surfaces plus the can-work design; assistant-neutral)",
+      "title": "SPEC - Content Moderation Model (surfaces)",
+      "summary": "**Status:** Partial (the built content-moderation surfaces plus the can-work design; assistant-neutral)",
       "path": "docs/specs/identity-access/SPEC-MODERATION.md"
     }
   ],
   "blog": [],
   "generated_from": {
-    "repo_docs": 56,
+    "repo_docs": 60,
     "public_blog_posts": 0,
     "blog_vault_used": false
   }

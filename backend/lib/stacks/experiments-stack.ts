@@ -134,7 +134,11 @@ export class ExperimentsStack extends cdk.Stack {
       defaultCorsPreflightOptions: {
         allowOrigins: experimentsOrigins,
         allowMethods: ['GET', 'POST', 'OPTIONS'],
-        allowHeaders: ['Content-Type', 'Authorization'],
+        // The manage-profiles routes (/admin/profiles) are AWS_IAM (SigV4) under adminIamEnforcement, so
+        // the console SIGNS them — the browser preflight must allow the X-Amz-* signing headers or the
+        // signed request is CORS-blocked (net::ERR_FAILED → "Failed to fetch"). Experiments' own routes
+        // stay Cognito-Bearer; the extra allowed headers are harmless there. Mirrors the analytics API.
+        allowHeaders: ['Content-Type', 'Authorization', 'X-Amz-Date', 'X-Amz-Security-Token', 'X-Amz-Content-Sha256'],
       },
       deployOptions: {
         throttlingBurstLimit: 50,
@@ -176,6 +180,19 @@ export class ExperimentsStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter', 'ssm:GetParameterHistory', 'ssm:PutParameter', 'ssm:LabelParameterVersion'],
               resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*`],
+            }),
+            // Read-only: the shared channel-flow ARN param (classification-level infra deep link). It lives
+            // outside /assistant/*, so it needs its own read grant.
+            new iam.PolicyStatement({
+              actions: ['ssm:GetParameter'],
+              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/channel-flow-arn`],
+            }),
+            // Read-only: resolve each profile's live processor Lambda config (its execution role + the
+            // GUARDRAIL_ID it applies) so the admin console can deep-link to the actual guardrail / IAM
+            // role / function for troubleshooting. GetFunctionConfiguration is metadata-only (no invoke).
+            new iam.PolicyStatement({
+              actions: ['lambda:GetFunctionConfiguration'],
+              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:*`],
             }),
           ],
         }),

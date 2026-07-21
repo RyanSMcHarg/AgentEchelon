@@ -49,7 +49,8 @@ import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.j
 // this handler stays non-VPC and invokes it via the client seam. Same signature.
 import { retrieveContext, getLatestSummary, type RetrieveContextResult } from './lib/data-plane-client.js';
 import { resolveExperimentModel, resolveClassificationExperiment } from './lib/experiment-manager.js';
-import { getModelCatalog } from '../../lib/config/model-strategy.js';
+import { getModelCatalog, bedrockInvokeId } from '../../lib/config/model-strategy.js';
+import { resolveActiveProfile, concreteModel } from './lib/active-profile.js';
 import { randomUUID } from 'crypto';
 import { runLiveDriftFlow } from './lib/live-drift-flow.js';
 import { parseWelcomeOrientation, composeWelcomeMessage, type WelcomeOrientation } from './lib/welcome-orientation.js';
@@ -61,6 +62,7 @@ import {
   readIntakeState,
   writeIntakeState,
 } from './lib/onboarding-intake.js';
+import { hasOnboarded, markOnboarded } from './lib/user-profile-client.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
@@ -256,6 +258,38 @@ async function soleHumanMemberSub(channelArn: string, bearerArn: string): Promis
   return arns.length === 1 ? (arns[0].split('/user/').pop() || '') : '';
 }
 
+/** Resolve the conversation CREATOR's sub for the once-per-user onboarding gate
+ *  (SPEC-USER-PROFILE-AND-ONBOARDING). Membership is authoritative and tried first, but the
+ *  WelcomeIntent fires on the BOT's membership — before the creator's membership settles — so it
+ *  falls back to the durable `createdBy` (…/user/<sub>) stamped in channel metadata at creation.
+ *  Returns '' when neither resolves (the caller then fails open to starting the intake). */
+function subFromCreatedBy(channelMeta: Record<string, unknown>): string {
+  const createdBy = typeof channelMeta.createdBy === 'string' ? channelMeta.createdBy : '';
+  return createdBy.split('/user/').pop() || '';
+}
+async function resolveCreatorSub(
+  channelArn: string,
+  bearerArn: string,
+  channelMeta: Record<string, unknown>,
+): Promise<string> {
+  // `createdBy` is stamped ATOMICALLY into channel metadata at CreateChannel, so it is the most
+  // reliable creator source; channel membership is the secondary (Tenet-6 authoritative) signal. BOTH
+  // Chime reads (DescribeChannel metadata AND ListChannelMemberships) are eventually consistent in the
+  // brief window right after CreateChannel, and the WelcomeIntent fires INSIDE that window — so a single
+  // read intermittently misses the creator (~30% observed), which would fail open and RE-ONBOARD an
+  // already-onboarded user. Retry with a fresh read (force-refresh both caches) until one resolves; the
+  // atomic createdBy settles well within this budget. The welcome is a background bot post, so the small
+  // added latency in the racy case is invisible to the user.
+  let sub = subFromCreatedBy(channelMeta) || (await soleHumanMemberSub(channelArn, bearerArn));
+  for (let attempt = 0; !sub && attempt < 5; attempt++) {
+    await new Promise((resolve) => setTimeout(resolve, 500));
+    humanMembersCache.delete(channelArn); // force ListChannelMemberships to re-read
+    const freshMeta = await resolveChannelMetadata(channelArn, bearerArn, /* forceRefresh */ true);
+    sub = subFromCreatedBy(freshMeta) || (await soleHumanMemberSub(channelArn, bearerArn));
+  }
+  return sub;
+}
+
 /** Best-effort fetch of the user's display name from Cognito (custom:name
  *  → name → email-local-part → 'there'). Cached for the Lambda's warm
  *  life. Used for the WelcomeIntent context so the bot greets users by
@@ -444,9 +478,19 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
       // null) unless ONBOARDING_INTAKE / ONBOARDING_INTAKE_PARAM is set.
       const intakeConfig = await loadIntakeConfig(getSsmParam);
       if (isOnboardingEnabled(intakeConfig)) {
-        const step = startIntake(intakeConfig);
-        console.log('[Router][WelcomeIntent] onboarding intake started', { fields: intakeConfig.fields.length });
-        return formatLexResponse(event, [{ contentType: 'PlainText', content: step.reply }], writeIntakeState(step.state));
+        // Once-per-user (SPEC-USER-PROFILE-AND-ONBOARDING): only onboard a user who has not been
+        // onboarded before. Resolve the creator (membership primary; createdBy metadata backup, since
+        // this event fires before the creator's membership settles) and skip the intake for a returning
+        // user, falling through to the normal welcome. Fail-open: if the creator or profile can't be
+        // resolved, start the intake (prior behavior) rather than risk never onboarding.
+        const creatorSub = await resolveCreatorSub(channelArn, botArn, channelMeta);
+        if (creatorSub && await hasOnboarded(creatorSub)) {
+          console.log('[Router][WelcomeIntent] creator already onboarded; skipping intake');
+        } else {
+          const step = startIntake(intakeConfig);
+          console.log('[Router][WelcomeIntent] onboarding intake started', { fields: intakeConfig.fields.length });
+          return formatLexResponse(event, [{ contentType: 'PlainText', content: step.reply }], writeIntakeState(step.state));
+        }
       }
 
       const orientation = await loadWelcomeOrientation();
@@ -507,13 +551,21 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     const intakeConfig = await loadIntakeConfig(getSsmParam);
     if (isOnboardingEnabled(intakeConfig)) {
       const prior = readIntakeState(event.sessionState.sessionAttributes);
-      if (!prior || prior.phase !== 'done') {
+      // Once-per-user (SPEC-USER-PROFILE-AND-ONBOARDING): if there is NO in-progress intake in this
+      // conversation and this user was already onboarded before, do NOT re-onboard — fall through so
+      // their message is answered directly. An in-progress `prior` is always continued (the user is
+      // mid-intake in THIS conversation), so an already-onboarded flag never interrupts a live intake.
+      const skipForOnboarded = !prior && (await hasOnboarded(userSub));
+      if (!skipForOnboarded && (!prior || prior.phase !== 'done')) {
         // No prior state ⇒ this is the first answer (the WelcomeIntent greeting
         // already showed the first question); start at the first field.
         const state = prior ?? { cursor: 0, collected: {}, phase: 'collecting' as const };
         const intakeName = await resolveUserName(userSub);
         const step = advanceIntake(intakeConfig, state, userMessage, intakeName);
         console.log('[Router][Onboarding]', { phase: step.state.phase, cursor: step.state.cursor, done: step.done });
+        // On completion, persist the once-per-user flag + collected facts so no future conversation
+        // re-onboards this user (and the assistant keeps the facts as durable context).
+        if (step.done) await markOnboarded(userSub, step.state.collected);
         return formatLexResponse(event, [{ contentType: 'PlainText', content: step.reply }], writeIntakeState(step.state));
       }
     }
@@ -546,6 +598,26 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
         }
       } catch (error) {
         console.error('[Router] Classification experiment resolution failed (using default classifier):', error);
+      }
+    }
+
+    // U2b (SPEC-ASSISTANT-CONFIG §4): when no classification A/B overrides it, the CLASSIFIER model comes
+    // from THIS profile version's `models.classifier` (per-profile — the classifier model is no longer a
+    // single global default). Byte-identical until a version names a CONCRETE model: the seed carries the
+    // `'default'` sentinel, which `concreteModel` skips, so this stays undefined and `classifyIntent` uses
+    // the deployment-default CLASSIFIER_MODEL (the profile's recorded choice to track the platform default).
+    if (usesLlmClassifier && !classifierModelId) {
+      try {
+        const profileName = profiles.profileFor(effectiveClassification).name;
+        const active = await resolveActiveProfile(profileName, { ssm: ssmClient, ssmRoot: SSM_ROOT });
+        const classifierKey = concreteModel(active.models?.classifier);
+        if (classifierKey) {
+          const catalog = getModelCatalog(AWS_REGION, process.env.AWS_ACCOUNT_ID || '');
+          const def = (catalog as Record<string, unknown>)[classifierKey];
+          if (def) classifierModelId = bedrockInvokeId(def as Parameters<typeof bedrockInvokeId>[0]);
+        }
+      } catch (error) {
+        console.error('[Router] profile classifier resolution failed (using default classifier):', error);
       }
     }
 
@@ -785,7 +857,10 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
               : taskType === 'action_item'
                 ? { contextId, ttlSeconds: TRIP_TASK_TTL_SECONDS, assigneeUserSub: requesterSub }
                 : undefined;
-          const task = await createTask(event, deliveryOption, taskType, undefined, taskOpts);
+          // Pass the STABLE turn id (correlationId = CHIME.message.id) as the task's messageId: it records
+          // which message opened the task (surfaced in the admin conversation view) and gives task creation a
+          // provenance key. The primary duplicate-task guard is getActiveTask's strongly-consistent recheck.
+          const task = await createTask(event, deliveryOption, taskType, correlationId, taskOpts);
           taskId = task.taskId;
           taskState = task.taskState;
         }

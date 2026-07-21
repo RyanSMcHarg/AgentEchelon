@@ -441,14 +441,18 @@ describe('CDK Synthesis', () => {
       // Lex bot + AppInstanceBot custom resources.
       template.resourceCountIs('AWS::CloudFormation::CustomResource', 2);
 
-      // SSM contract: processor-arn + bot-arn published for the shared router
-      // and create-conversation to discover.
-      template.resourceCountIs('AWS::SSM::Parameter', 2);
+      // SSM contract: processor-arn + bot-arn published for the shared router and
+      // create-conversation to discover, plus router-arn (per-classification router
+      // Lambda) for the profile infra resolver (ProfilesTab Infrastructure section).
+      template.resourceCountIs('AWS::SSM::Parameter', 3);
       template.hasResourceProperties('AWS::SSM::Parameter', {
         Name: '/agent-echelon/assistant/basic/processor-arn',
       });
       template.hasResourceProperties('AWS::SSM::Parameter', {
         Name: '/agent-echelon/assistant/basic/bot-arn',
+      });
+      template.hasResourceProperties('AWS::SSM::Parameter', {
+        Name: '/agent-echelon/assistant/basic/router-arn',
       });
     });
 

@@ -9,20 +9,24 @@
  *
  *   AWS_PROFILE=<p> ADMIN_EMAIL=you@example.com node backend/scripts/provision-admin.mjs
  *
- * Password: pass ADMIN_PASSWORD to set your own; otherwise a strong random one is
- * generated. Either way the credentials are written to a Secrets Manager secret
- * (agent-echelon/admin-users/<localpart>) rather than printed — read it back with:
- *   aws secretsmanager get-secret-value --secret-id <arn> --query SecretString --output text
+ * DEFAULT (no ADMIN_PASSWORD): the user is created through the standard Cognito invitation —
+ * Cognito emails a ONE-TIME temporary password and forces the user to set their own permanent
+ * password on first sign-in (the SPA handles NEW_PASSWORD_REQUIRED). Nothing is stored; the
+ * human owns their password and this script never sees it.
  *
- * Idempotent: re-running updates the existing user's password + group membership.
+ * ADMIN_PASSWORD=<pw> (automation only): sets that permanent password directly (user CONFIRMED,
+ * no email). Secrets Manager is deliberately NOT used here — that pattern is for TEST/automation
+ * accounts a script must read back (see seed-demo's test-credentials), not a human admin.
+ *
+ * Idempotent: re-running updates attributes + group membership; without ADMIN_PASSWORD it
+ * re-sends the invitation while the user is still pending a first sign-in.
  *
  * Env:
  *   ADMIN_EMAIL     (required) the admin's email = Cognito username
- *   ADMIN_PASSWORD  (optional) set a specific permanent password; else random
+ *   ADMIN_PASSWORD  (optional) set a specific permanent password (automation); else invite by email
  *   ADMIN_TIER      (optional) model tier group to also grant (default: premium)
  *   ADMIN_NAME      (optional) display name (default: derived from email)
  */
-import { randomBytes } from 'node:crypto';
 import {
   CognitoIdentityProviderClient,
   AdminCreateUserCommand,
@@ -37,11 +41,6 @@ import {
   DescribeAppInstanceUserCommand,
 } from '@aws-sdk/client-chime-sdk-identity';
 import { CloudFormationClient, DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
-import {
-  SecretsManagerClient,
-  PutSecretValueCommand,
-  CreateSecretCommand,
-} from '@aws-sdk/client-secrets-manager';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const EMAIL = process.env.ADMIN_EMAIL;
@@ -51,20 +50,14 @@ if (!EMAIL) {
   process.exit(2);
 }
 const NAME = process.env.ADMIN_NAME || EMAIL.split('@')[0];
-// A strong random password that satisfies a default Cognito policy (upper/lower/
-// digit/symbol) when none is supplied.
-function strongPassword() {
-  const b = randomBytes(18).toString('base64').replace(/[^A-Za-z0-9]/g, '');
-  return `Ae!${b}9`;
-}
-const PASSWORD = process.env.ADMIN_PASSWORD || strongPassword();
-const LOCALPART = EMAIL.split('@')[0].replace(/[^A-Za-z0-9._-]/g, '');
-const SECRET_NAME = `agent-echelon/admin-users/${LOCALPART}`;
+// When set, the operator chose a specific permanent password (automation/self). When unset,
+// the user is invited: Cognito generates + emails a one-time temporary password and forces a
+// reset on first sign-in. This script never generates or stores a password.
+const PASSWORD = process.env.ADMIN_PASSWORD || null;
 
 const cognito = new CognitoIdentityProviderClient({ region });
 const chimeIdentity = new ChimeSDKIdentityClient({ region });
 const cfn = new CloudFormationClient({ region });
-const secrets = new SecretsManagerClient({ region });
 
 async function outputs(stack) {
   const resp = await cfn.send(new DescribeStacksCommand({ StackName: stack }));
@@ -91,20 +84,6 @@ async function ensureChimeUser(appInstanceArn, userPoolId) {
   return sub;
 }
 
-async function writeSecret(payload) {
-  const SecretString = JSON.stringify(payload, null, 2);
-  try {
-    const r = await secrets.send(new PutSecretValueCommand({ SecretId: SECRET_NAME, SecretString }));
-    return r.ARN;
-  } catch (err) {
-    if (err.name === 'ResourceNotFoundException') {
-      const r = await secrets.send(new CreateSecretCommand({ Name: SECRET_NAME, SecretString }));
-      return r.ARN;
-    }
-    throw err;
-  }
-}
-
 async function main() {
   console.log(`Provisioning admin ${EMAIL} (tier=${TIER}, groups=admins+${TIER})...`);
   const cog = await outputs('AgentEchelonCognitoAuth');
@@ -123,19 +102,42 @@ async function main() {
     { Name: 'given_name', Value: NAME.split(/[.\s]/)[0] || NAME },
     { Name: 'family_name', Value: NAME.split(/[.\s]/).slice(1).join(' ') || 'Admin' },
   ];
+  let invited = false;
   try {
-    await cognito.send(new AdminCreateUserCommand({ UserPoolId: userPoolId, Username: EMAIL, UserAttributes: attrs, MessageAction: 'SUPPRESS' }));
-    console.log(`  + created ${EMAIL}`);
+    // No ADMIN_PASSWORD -> omit MessageAction so Cognito EMAILS a one-time temporary
+    // password (the standard invitation). With ADMIN_PASSWORD -> SUPPRESS; we set it below.
+    await cognito.send(new AdminCreateUserCommand({
+      UserPoolId: userPoolId,
+      Username: EMAIL,
+      UserAttributes: attrs,
+      ...(PASSWORD ? { MessageAction: 'SUPPRESS' } : {}),
+    }));
+    invited = !PASSWORD;
+    console.log(`  + created ${EMAIL}${invited ? ' (invitation email sent)' : ''}`);
   } catch (err) {
     if (err.name === 'UsernameExistsException') {
       await cognito.send(new AdminUpdateUserAttributesCommand({ UserPoolId: userPoolId, Username: EMAIL, UserAttributes: attrs }));
       console.log(`  ~ updated existing ${EMAIL}`);
+      if (!PASSWORD) {
+        // Re-send the invitation — only succeeds while the user is still pending a first
+        // sign-in. A user who already set a password can't be re-invited.
+        try {
+          await cognito.send(new AdminCreateUserCommand({ UserPoolId: userPoolId, Username: EMAIL, MessageAction: 'RESEND' }));
+          invited = true;
+          console.log('  + invitation re-sent');
+        } catch (e) {
+          console.warn(`  ! could not re-send invitation (${e.name || e.message}); the user has likely already set a password. Pass ADMIN_PASSWORD to reset it, or delete + re-run for a fresh invite.`);
+        }
+      }
     } else throw err;
   }
 
-  // Permanent password moves the user to CONFIRMED (no FORCE_CHANGE challenge the
-  // SPA sign-in doesn't handle).
-  await cognito.send(new AdminSetUserPasswordCommand({ UserPoolId: userPoolId, Username: EMAIL, Password: PASSWORD, Permanent: true }));
+  // Only set a password when the operator supplied one. Otherwise the emailed temporary
+  // password stands and the user must set their own on first sign-in (the SPA handles
+  // NEW_PASSWORD_REQUIRED). Nothing is stored either way.
+  if (PASSWORD) {
+    await cognito.send(new AdminSetUserPasswordCommand({ UserPoolId: userPoolId, Username: EMAIL, Password: PASSWORD, Permanent: true }));
+  }
 
   for (const group of ['admins', TIER]) {
     try {
@@ -148,23 +150,17 @@ async function main() {
 
   await ensureChimeUser(appInstanceArn, userPoolId);
 
-  const arn = await writeSecret({
-    email: EMAIL,
-    password: PASSWORD,
-    tier: TIER,
-    groups: ['admins', TIER],
-    cognitoUserPoolId: userPoolId,
-    cognitoClientId: clientId,
-    note: 'Admin console credentials. Rotate after first sign-in.',
-  });
-
   console.log('');
   console.log(`Done. ${EMAIL} is an admin (groups: admins, ${TIER}).`);
-  console.log(`Credentials stored in Secrets Manager (NOT printed here):`);
-  console.log(`  ${arn}`);
-  console.log(`Read the password with:`);
-  console.log(`  aws secretsmanager get-secret-value --secret-id ${SECRET_NAME} --query SecretString --output text`);
-  console.log(`Then sign in at the app URL with ${EMAIL}.`);
+  if (PASSWORD) {
+    console.log(`Set the ADMIN_PASSWORD you supplied; the user is CONFIRMED. Sign in at the app URL with ${EMAIL}.`);
+  } else if (invited) {
+    console.log(`Cognito emailed ${EMAIL} a one-time temporary password. On first sign-in the app prompts`);
+    console.log(`them to set their own permanent password. This script stored nothing.`);
+  } else {
+    console.log(`Existing user: no email sent and no password changed. Pass ADMIN_PASSWORD to set one, or`);
+    console.log(`delete the user and re-run for a fresh invitation email.`);
+  }
 }
 
 main().catch((err) => {

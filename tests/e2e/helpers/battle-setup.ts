@@ -62,7 +62,18 @@ async function openAdminExperiments(page: Page): Promise<void> {
     .catch(() => false);
   if (needsLogin) {
     const creds = await getTestCredentials();
-    await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
+    // Sign in ON THE ADMIN ORIGIN — the login form is already on screen (we just
+    // navigated here and detected it). Do NOT delegate to the shared signIn(),
+    // which navigates via page.goto('/') → the CHAT baseURL: that origin is
+    // already authenticated (the duel-side sign-in ran first), so its login form
+    // never renders and the helper times out waiting for the email field. Auth is
+    // per-origin (localStorage), so the admin origin must be signed into here,
+    // directly against the form in front of us.
+    await page.locator('input[type="email"]').fill(creds.testAdmin.email);
+    await page.locator('input[type="password"]').fill(creds.testAdmin.password);
+    await page.locator('button[type="submit"]').click();
+    // Admin auth lands on the dashboard shell; then re-deep-link to Experiments.
+    await page.waitForSelector('.admin-dashboard, .admin-section-rail', { timeout: 30_000 });
     await page.goto(new URL('/?admin=experiments', ADMIN_BASE_URL).toString());
   }
   await page.waitForSelector('.admin-section-rail', { timeout: 15_000 });

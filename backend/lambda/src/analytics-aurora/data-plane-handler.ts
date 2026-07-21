@@ -36,6 +36,7 @@ import {
   backfillPlaceholders,
   type BackfillOptions,
 } from './placeholder-backfill.js';
+import { backfillProfileAttribution, type ProfileBackfillInput } from './profile-backfill.js';
 // Admin Conversations read path (Aurora): the Athena archive query is too slow
 // (15-27s > API Gateway's 29s cap), so in Aurora mode the admin handler reads
 // these via this Lambda instead. Aurora work → runs here (ADR-018). See BUG #21.
@@ -60,6 +61,7 @@ export interface DataPlaneRequest {
     | 'readPendingSuggestion'
     | 'resolvePendingSuggestion'
     | 'backfillPlaceholders'
+    | 'backfillProfileAttribution'
     | 'adminListConversations'
     | 'adminListMessages'
     | 'adminMembershipHistory'
@@ -102,6 +104,8 @@ export async function handler(req: DataPlaneRequest): Promise<unknown> {
       return { ok: true };
     case 'backfillPlaceholders':
       return backfillPlaceholders((req.input as BackfillOptions) || {});
+    case 'backfillProfileAttribution':
+      return backfillProfileAttribution((req.input as ProfileBackfillInput) || { attribution: {} });
     case 'adminListConversations':
       return adminListConversations((req.input as { limit?: number })?.limit);
     case 'adminListMessages':

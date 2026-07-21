@@ -29,6 +29,7 @@ import {
   UpdateAppInstanceUserCommand,
   CreateAppInstanceAdminCommand,
 } from '@aws-sdk/client-chime-sdk-identity';
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
@@ -111,8 +112,54 @@ const EXECUTE_API_CAPABILITY_RESOURCES: Record<string, string> = {
 };
 const EXECUTE_API_CAPS = new Set(Object.keys(EXECUTE_API_CAPABILITY_RESOURCES));
 
+// S3 attachment plane (admin conversation review). Like the archive plane, this is an
+// admin-plane-only, channel-scoped, short-lived, AUDITED vend — but for S3, whose ARNs
+// CAN be conditioned on the object-key prefix, so the session policy is genuinely
+// least-privilege: `s3:GetObject` on ONLY the named channel's attachment keys. A
+// capability maps to the key PREFIX it authorizes:
+//   - attachment-read          → generated-docs/<channelId>/*  (assistant DELIVERABLES:
+//                                 reports/extractions. Reviewing these is the effectiveness
+//                                 need; archive-read grade.)
+//   - attachment-read-uploads  → attachments/<channelId>/*     (USER-UPLOADED input, may
+//                                 carry user PII. Moderation-grade: audited distinctly.)
+// The admin-plane role ceiling (cognito-auth-stack) carries s3:GetObject on the same
+// bucket keys; the session policy intersects to one channel. A future restricted admin
+// role that omits a prefix from its ceiling is denied that prefix at the IAM layer — the
+// split is IAM-enforceable, not a code-only gate (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md).
+const S3_ATTACHMENT_CAP_PREFIXES: Record<string, string> = {
+  'attachment-read': 'generated-docs',
+  'attachment-read-uploads': 'attachments',
+};
+const S3_ATTACHMENT_CAPS = new Set(Object.keys(S3_ATTACHMENT_CAP_PREFIXES));
+// User-uploaded content is more sensitive than assistant output; these caps are flagged
+// in the audit record so an operator reading a customer's uploaded file is distinctly logged.
+const SENSITIVE_ATTACHMENT_CAPS = new Set(['attachment-read-uploads']);
+
+// The attachments bucket ARN is resolved at cold start from SSM (the S3 stack publishes it;
+// a CDK prop would be circular — s3-storage depends on this stack for the user pool). Absent
+// param ⇒ the S3 attachment plane is unavailable and its vends 500 (misconfigured), never leak.
+const ATTACHMENTS_BUCKET_ARN_PARAM = process.env.EXCHANGE_ATTACHMENTS_BUCKET_ARN_PARAM || '';
+let attachmentsBucketArn: string | null = null;
+async function resolveAttachmentsBucketArn(): Promise<string> {
+  if (attachmentsBucketArn !== null) return attachmentsBucketArn;
+  if (process.env.EXCHANGE_ATTACHMENTS_BUCKET_ARN) {
+    attachmentsBucketArn = process.env.EXCHANGE_ATTACHMENTS_BUCKET_ARN;
+    return attachmentsBucketArn;
+  }
+  if (!ATTACHMENTS_BUCKET_ARN_PARAM) { attachmentsBucketArn = ''; return ''; }
+  try {
+    const r = await ssm.send(new GetParameterCommand({ Name: ATTACHMENTS_BUCKET_ARN_PARAM }));
+    attachmentsBucketArn = r.Parameter?.Value || '';
+  } catch (err) {
+    console.error('[CredentialExchange] attachments-bucket-arn SSM resolve failed:', err);
+    attachmentsBucketArn = '';
+  }
+  return attachmentsBucketArn;
+}
+
 const sts = new STSClient({ region: AWS_REGION });
 const chimeIdentity = new ChimeSDKIdentityClient({ region: AWS_REGION });
+const ssm = new SSMClient({ region: AWS_REGION });
 
 const CLASSIFICATION_RANK: Record<string, number> = { basic: 1, standard: 2, premium: 3 };
 
@@ -147,6 +194,11 @@ interface ExchangeResult {
   tier: string;
   identity: 'chat' | 'admin';
   scopedTo?: string | null;
+  // S3 attachment vend only: the bucket + region the client needs to presign the scoped
+  // GetObject with the vended creds. The vended session policy already confines the read to
+  // this channel's keys, so surfacing the bucket name is not itself a grant.
+  bucket?: string;
+  region?: string;
 }
 
 function corsOrigin(event: any): string {
@@ -253,7 +305,9 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
       body: JSON.stringify({ error: 'channelArn must be a channel of this app instance' }),
     };
   }
-  const unknownCaps = requestedCaps.filter((c) => !(c in CAPABILITY_ACTIONS) && !EXECUTE_API_CAPS.has(c));
+  const unknownCaps = requestedCaps.filter(
+    (c) => !(c in CAPABILITY_ACTIONS) && !EXECUTE_API_CAPS.has(c) && !S3_ATTACHMENT_CAPS.has(c),
+  );
   if (unknownCaps.length) {
     return {
       statusCode: 400,
@@ -261,19 +315,22 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
       body: JSON.stringify({ error: `unknown capabilities: ${unknownCaps.join(', ')}` }),
     };
   }
-  // A14: an archive vend (execute-api plane) and a Chime vend need DIFFERENT session
-  // policies (execute-api:Invoke on an API resource vs chime:* on a channel), so a single
-  // request is one plane or the other, never a mix.
+  // Each vend plane needs a DIFFERENT session policy (execute-api:Invoke on an API resource,
+  // chime:* on a channel, or s3:GetObject on an object-key prefix), so a single request is
+  // exactly ONE plane — never a mix.
   const archiveCaps = requestedCaps.filter((c) => EXECUTE_API_CAPS.has(c));
   const chimeCaps = requestedCaps.filter((c) => c in CAPABILITY_ACTIONS);
-  if (archiveCaps.length && chimeCaps.length) {
+  const s3Caps = requestedCaps.filter((c) => S3_ATTACHMENT_CAPS.has(c));
+  const planesRequested = [archiveCaps.length > 0, chimeCaps.length > 0, s3Caps.length > 0].filter(Boolean).length;
+  if (planesRequested > 1) {
     return {
       statusCode: 400,
       headers: cors(event),
-      body: JSON.stringify({ error: 'cannot mix archive (execute-api) and Chime capabilities in one request' }),
+      body: JSON.stringify({ error: 'cannot mix archive (execute-api), Chime, and S3 attachment capabilities in one request' }),
     };
   }
   const archiveVend = archiveCaps.length > 0;
+  const s3Vend = s3Caps.length > 0;
   const requestsModeration = requestedCaps.some((c) => MODERATION_CAPS.has(c));
   const groups = parseGroups(claims['cognito:groups']);
   const roleKey = resolveRoleKey(groups);
@@ -302,6 +359,10 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
     // A14: reading customer message content (A2) is an admin-plane action — the standing
     // `${sub}-admin` authority, short-lived + audited — never the chat identity.
     return { statusCode: 400, headers: cors(event), body: JSON.stringify({ error: 'archive capabilities require plane:admin with a channelArn scope' }) };
+  } else if (s3Vend) {
+    // Reading a conversation's attachments is likewise an admin-plane action — scoped,
+    // short-lived, audited — never the chat identity.
+    return { statusCode: 400, headers: cors(event), body: JSON.stringify({ error: 'attachment capabilities require plane:admin with a channelArn scope' }) };
   }
 
   const roleArn = adminPlane ? EXCHANGE_ROLE_ADMIN_PLANE : EXCHANGE_ROLE_ARNS[roleKey];
@@ -377,6 +438,76 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
         scopedTo: scopeChannelArn || null,
       };
       return { statusCode: 200, headers: cors(event), body: JSON.stringify(archiveResult) };
+    }
+
+    // ── S3 attachment vend (admin conversation review) ────────────────────────
+    // Vend a SESSION POLICY of `s3:GetObject` scoped to EXACTLY the named channel's
+    // attachment keys (generated-docs/<channelId>/* and/or attachments/<channelId>/*),
+    // assumed on the admin-plane role (its ceiling carries the same bucket keys), short-
+    // lived + audited. No Chime identity is provisioned — the client presigns a GetObject
+    // with this cred and opens it. Because S3 ARNs condition on the key prefix, the cred is
+    // hard-bound to this one channel for its TTL (unlike the execute-api plane).
+    if (s3Vend) {
+      const bucketArn = await resolveAttachmentsBucketArn();
+      if (!bucketArn) {
+        console.error('[CredentialExchange] attachments bucket ARN unresolved (SSM param missing)');
+        return { statusCode: 500, headers: cors(event), body: JSON.stringify({ error: 'Attachment vend misconfigured' }) };
+      }
+      // channelId is the segment after `${APP_INSTANCE_ARN}/channel/` (validated as a channel
+      // of this app instance above). It composes the object-key prefix the read is confined to.
+      const channelId = scopeChannelArn.slice(`${APP_INSTANCE_ARN}/channel/`.length);
+      if (!/^[a-zA-Z0-9-]+$/.test(channelId)) {
+        return { statusCode: 400, headers: cors(event), body: JSON.stringify({ error: 'channelArn is not a valid channel of this app instance' }) };
+      }
+      const resources = s3Caps.map((c) => `${bucketArn}/${S3_ATTACHMENT_CAP_PREFIXES[c]}/${channelId}/*`);
+      const sessionPolicy = JSON.stringify({
+        Version: '2012-10-17',
+        Statement: [
+          { Sid: 'AttachmentGet', Effect: 'Allow', Action: ['s3:GetObject'], Resource: resources },
+        ],
+      });
+      const assumed = await sts.send(new AssumeRoleCommand({
+        RoleArn: roleArn, // EXCHANGE_ROLE_ADMIN_PLANE (adminPlane is required above)
+        RoleSessionName: `attach-${sub}`.slice(0, 64),
+        DurationSeconds: MODERATION_SESSION_SECONDS,
+        Tags: [{ Key: 'sub', Value: sub }],
+        Policy: sessionPolicy,
+      }));
+      const ac = assumed.Credentials;
+      if (!ac?.AccessKeyId || !ac.SecretAccessKey || !ac.SessionToken) {
+        throw new Error('AssumeRole returned no credentials');
+      }
+      const adminArn = `${APP_INSTANCE_ARN}/user/${sub}-admin`;
+      // Audit trail: who read which channel's attachments, when, and whether a SENSITIVE
+      // (user-uploaded) prefix was among them.
+      console.log(JSON.stringify({
+        _auditEvent: 'admin_scoped_credential_vend',
+        timestamp: new Date().toISOString(),
+        adminSub: sub,
+        adminIdentity: adminArn,
+        channelArn: scopeChannelArn,
+        capabilities: s3Caps,
+        plane: 's3-attachment',
+        sensitive: s3Caps.some((c) => SENSITIVE_ATTACHMENT_CAPS.has(c)),
+        ttlSeconds: MODERATION_SESSION_SECONDS,
+      }));
+      // `arn:aws:s3:::<name>` → <name> (bucket name the client needs to address the GetObject).
+      const bucketName = bucketArn.replace(/^arn:aws:s3:::/, '');
+      const s3Result: ExchangeResult = {
+        credentials: {
+          AccessKeyId: ac.AccessKeyId,
+          SecretAccessKey: ac.SecretAccessKey,
+          SessionToken: ac.SessionToken,
+          Expiration: ac.Expiration ? new Date(ac.Expiration).toISOString() : undefined,
+        },
+        userArn: adminArn,
+        tier: 'admin',
+        identity: 'admin',
+        scopedTo: scopeChannelArn || null,
+        bucket: bucketName,
+        region: AWS_REGION,
+      };
+      return { statusCode: 200, headers: cors(event), body: JSON.stringify(s3Result) };
     }
 
     // AppInstanceUserId == sub (AE convention). Display name, best-first: a real name claim; else

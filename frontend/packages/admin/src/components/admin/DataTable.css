@@ -92,6 +92,66 @@
   color: var(--text-primary);
 }
 
+/* Clickable rows (drill-down). The whole row is a tap target — essential on touch/mobile where an
+   inline link is too small to hit reliably. */
+.data-table-row--clickable {
+  cursor: pointer;
+}
+.data-table-row--clickable:hover {
+  background: var(--surface-100);
+}
+.data-table-row--clickable:focus-visible {
+  outline: 2px solid var(--accent-500);
+  outline-offset: -2px;
+}
+/* Affordance: a chevron on the last cell of a clickable row. */
+.data-table--rows-clickable tbody tr td:last-child::after {
+  content: '\203A'; /* › */
+  color: var(--text-tertiary);
+  margin-left: var(--space-2);
+  font-weight: 700;
+}
+
+/* Stacked-card layout on narrow screens: a wide, horizontally-scrolling table is unusable on a phone,
+   and the row-drill needs a real tap target. Each row becomes a card of "Label: value" pairs (the
+   label comes from each cell's data-label), and the whole card is tappable when the row is clickable. */
+@media (max-width: 640px) {
+  .data-table-wrapper { overflow-x: visible; }
+  .data-table { font-size: var(--text-sm); }
+  .data-table thead { display: none; }
+  .data-table, .data-table tbody, .data-table tr, .data-table td { display: block; width: 100%; }
+  .data-table tbody tr {
+    border: 1px solid var(--surface-200);
+    border-radius: var(--radius-md);
+    margin: var(--space-2) var(--space-2);
+    padding: var(--space-1) var(--space-2);
+    background: var(--surface-0);
+  }
+  .data-table tbody tr:last-child td { border-bottom: 1px solid var(--surface-100); }
+  .data-table td {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    gap: var(--space-3);
+    padding: var(--space-2) 0;
+    border-bottom: 1px solid var(--surface-100);
+    text-align: right;
+  }
+  .data-table td:last-child { border-bottom: none; }
+  .data-table td::before {
+    content: attr(data-label);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-wide);
+    color: var(--text-secondary);
+    text-align: left;
+    flex: 0 0 auto;
+  }
+  /* The drill chevron reads oddly as a trailing card row; hide it in the stacked layout. */
+  .data-table--rows-clickable tbody tr td:last-child::after { content: none; }
+}
+
 /* Empty state */
 .data-table-empty {
   text-align: center;

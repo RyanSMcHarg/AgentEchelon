@@ -5,12 +5,11 @@ import OverviewTab from './OverviewTab';
 import ModelsTab from './ModelsTab';
 import EvaluationsTab from './EvaluationsTab';
 import UsersTab from './UsersTab';
-import FlowsTab from './FlowsTab';
-import StepsTab from './StepsTab';
+import AlertsTab from './AlertsTab';
 import FlaggedResponsesTab from './FlaggedResponsesTab';
 import GroundTruthTab from './GroundTruthTab';
-import TasksTab from './TasksTab';
-import EffectivenessTab from './EffectivenessTab';
+import EffectivenessTab, { type Drill as EffectivenessDrill } from './EffectivenessTab';
+import ProfilesTab from './ProfilesTab';
 import ConversationsTab from './ConversationsTab';
 import LatencyTab from './LatencyTab';
 import UserManagementTab from './UserManagementTab';
@@ -22,7 +21,7 @@ import type { AnalyticsDateRange, AnalyticsResult, QueryType } from '@ae/shared'
 import './AdminDashboard.css';
 import MembershipAuditTab from './MembershipAuditTab';
 
-type TabId = 'overview' | 'models' | 'strategy' | 'steps' | 'experiments' | 'evaluations' | 'latency' | 'flows' | 'flagged' | 'ground_truth' | 'tasks' | 'effectiveness' | 'conversations' | 'users' | 'user_management' | 'security';
+type TabId = 'overview' | 'alerts' | 'models' | 'strategy' | 'profiles' | 'experiments' | 'evaluations' | 'latency' | 'flagged' | 'ground_truth' | 'effectiveness' | 'conversations' | 'users' | 'user_management' | 'security';
 
 interface AdminDashboardProps {
   onBack: () => void;
@@ -52,22 +51,30 @@ function getDateRange(preset: string): AnalyticsDateRange {
 
 // Tabs available only in Aurora mode (hidden in Athena). Sub-view labels are
 // resolved from i18n at render time via the tab id → admin.tabs.<camelCase> key.
-const AURORA_TAB_IDS: TabId[] = ['flows', 'flagged', 'ground_truth', 'tasks', 'steps', 'effectiveness'];
+// Aurora-only sub-views still reachable from the nav. (evaluations/flows/tasks/steps were retired from
+// SECTIONS — their detail folded into the Effectiveness drill — so they no longer appear here.) Alerts
+// leans on the Aurora-only effectiveness/model-effectiveness data, so it is Aurora-only too.
+const AURORA_TAB_IDS: TabId[] = ['flagged', 'ground_truth', 'effectiveness', 'alerts'];
 
 // Two-level navigation: 6 top-level SECTIONS, each grouping one or more
 // sub-views (the per-tab components). activeTab (TabId) remains the source of
 // truth for content + data loading; the section rail just groups the sub-tabs.
 interface AdminSection { id: string; label: string; tabs: TabId[]; }
 const SECTIONS: AdminSection[] = [
-  { id: 'overview', label: 'Overview', tabs: ['overview', 'latency'] },
+  { id: 'overview', label: 'Overview', tabs: ['overview', 'alerts', 'latency'] },
   { id: 'conversations', label: 'Conversations', tabs: ['conversations'] },
-  // Effectiveness is the intent-anchored spine (SPEC-ADMIN-CONSOLE-EFFECTIVENESS). The Dashboard is the
-  // consolidation target: over successive iterations the full detail from Evaluations / Flows / Tasks /
-  // Steps folds INTO its drill (L2 exchanges, L2 tasks, L3 timeline, L4 steps). Until each view's detail
-  // is fully in the drill, its tab stays here so NO information is lost. Steps is grouped here (not
-  // Models) since it is the tool-loop detail + the L4 leaf. Flagged / Ground Truth are human-action tabs.
-  { id: 'quality', label: 'Effectiveness', tabs: ['effectiveness', 'evaluations', 'flows', 'tasks', 'steps', 'flagged', 'ground_truth'] },
+  // Effectiveness is the intent-anchored spine (SPEC-ADMIN-CONSOLE-EFFECTIVENESS) and the consolidation
+  // target: the full detail from Evaluations / Flows / Tasks / Steps now lives INSIDE its drill (L2
+  // exchanges carry the per-exchange judge verdict = Evaluations; L2 tasks + L3 timeline = Tasks; L3
+  // FlowScorePanel = Flows; L4 inline steps = Steps). Those standalone tabs are therefore RETIRED from
+  // the nav — no information is lost, it just moved into the drill. Only the two human-ACTION views stay
+  // as their own tabs: Flagged (the review queue) and Ground Truth (eval labeling).
+  { id: 'quality', label: 'Effectiveness', tabs: ['effectiveness', 'flagged', 'ground_truth'] },
   { id: 'models', label: 'Models', tabs: ['models', 'strategy'] },
+  // Assistant profiles as versioned, portable artifacts (SPEC-PORTABLE-VERSIONED-PROFILES): version /
+  // activate / rollback / import / export the assistant definition, no redeploy. The retiring global
+  // "Model Strategy" surface (per-intent routing) is moving onto the profile here.
+  { id: 'assistants', label: 'Assistants', tabs: ['profiles'] },
   { id: 'experiments', label: 'Experiments', tabs: ['experiments'] },
   { id: 'users', label: 'Users', tabs: ['users', 'user_management'] },
   { id: 'security', label: 'Security', tabs: ['security'] },
@@ -116,8 +123,16 @@ const QUERIES_BY_TAB: Partial<Record<TabId, QueryType[]>> = {
     'active_messaging_users_daily' as QueryType,
     'error_rate_daily' as QueryType,
   ],
+  // Alerts scans everything that carries a target: per-intent quality, latency, per-model quality,
+  // literal error-response rows, and the platform error rate. All assembled client-side (see alerts.ts).
+  alerts: [
+    'intent_effectiveness' as QueryType,
+    'latency_metrics' as QueryType,
+    'model_effectiveness' as QueryType,
+    'flagged_responses' as QueryType,
+    'error_rate_daily' as QueryType,
+  ],
   models: ['model_usage', 'model_effectiveness'],
-  steps: ['execution_steps' as QueryType],
   experiments: ['experiment_results' as QueryType],
   evaluations: ['evaluation_scores'],
   latency: [
@@ -126,10 +141,8 @@ const QUERIES_BY_TAB: Partial<Record<TabId, QueryType[]>> = {
     'page_load_metrics' as QueryType,
     'connection_health_daily' as QueryType,
   ],
-  flows: ['evaluation_flows'],
   flagged: ['flagged_responses'],
   ground_truth: ['ground_truth'],
-  tasks: ['task_metrics', 'task_details' as QueryType],
   effectiveness: ['intent_effectiveness' as QueryType],
   conversations: ['conversation_summaries', 'drift_events'],
   users: [
@@ -155,6 +168,12 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
   // detail page and clears the link (via onDeepLinkConsumed) so it fires once.
   // Initialized from `?conv=` so a shared link opens straight to the conversation detail.
   const [conversationDeepLink, setConversationDeepLink] = useState<string | null>(() => convFromUrl());
+  // Owned here (not in EffectivenessTab) so the drill position survives the tab unmounting on a tab
+  // switch — e.g. "View conversation" jumps to Conversations and Back returns to the SAME drill (C2).
+  const [effectivenessDrill, setEffectivenessDrill] = useState<EffectivenessDrill>({ level: 0 });
+  // Optional classification filter for the Effectiveness view — set by the "view this assistant's
+  // effectiveness" link from the Assistants/Profiles tab (profiles are 1:1 with a classification).
+  const [effectivenessClassification, setEffectivenessClassification] = useState<string | null>(null);
 
   // Aurora-only sub-views are hidden in Athena mode (their content would just
   // honest-empty). activeTab drives content; activeSection groups the sub-tabs.
@@ -176,11 +195,16 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
   // Open a specific conversation's detail from another tab (Flagged / Ground Truth).
   // Sets the deep-link target, then switches to the Conversations tab; that tab reads
   // deepLinkChannelArn, opens the detail page, and calls onDeepLinkConsumed.
+  // When a conversation is opened from ANOTHER tab (Effectiveness/Flagged/Ground-Truth), remember that
+  // origin so Back returns THERE (with its drill state, which is lifted) instead of dropping onto the
+  // Conversations list. AT4.
+  const [conversationOrigin, setConversationOrigin] = useState<TabId | null>(null);
   const openConversation = useCallback((channelArn: string) => {
     if (!channelArn) return;
+    setConversationOrigin(activeTab !== 'conversations' ? activeTab : null);
     setConversationDeepLink(channelArn);
     selectTab('conversations');
-  }, [selectTab]);
+  }, [selectTab, activeTab]);
 
   // A tab can register a "close the drill-down first" handler (e.g. the Conversations
   // tab's open conversation detail). Opening that detail is React state, not a history
@@ -198,6 +222,15 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
   // is always an app/login entry behind it; if somehow there is nothing behind (admin
   // was the very first page), fall back to the in-app exit so we never leave the site.
   const handleBack = useCallback(() => {
+    // AT4: viewing a conversation opened from another tab → Back returns to that origin tab (drill preserved),
+    // not to the Conversations list. One press gets you back where you were.
+    if (conversationOrigin && activeTab === 'conversations') {
+      const origin = conversationOrigin;
+      setConversationOrigin(null);
+      setConversationDeepLink(null);
+      selectTab(origin);
+      return;
+    }
     if (drillBackRef.current) {
       drillBackRef.current();
       return;
@@ -207,7 +240,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
     } else {
       onBack();
     }
-  }, [onBack]);
+  }, [onBack, conversationOrigin, activeTab, selectTab]);
 
   // Reflect the open conversation detail in the URL (`?conv=<channelId>`), so a detail
   // is deep-linkable and browser Back/forward steps through it. The sync guard (current
@@ -237,6 +270,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
   // pops past the console entirely (no `?admin`), App.tsx exits the console (unmounts us).
   useEffect(() => {
     const onPop = () => {
+      setConversationOrigin(null); // browser Back uses URL history, not the in-app origin shortcut
       const t = tabFromUrl();
       if (t) setActiveTab(t);
       // Sync the conversation detail with the URL: forward to a `?conv` opens it,
@@ -265,7 +299,11 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
       const queryResults = await Promise.all(
         queries.map(async (q) => {
           try {
-            return { key: q, result: await queryAnalytics(q, dateRange) };
+            // Scope the intent-effectiveness L0 to a specific assistant (agent_type) when the filter is set.
+            const extra = q === 'intent_effectiveness' && effectivenessClassification
+              ? { agentType: effectivenessClassification }
+              : undefined;
+            return { key: q, result: await queryAnalytics(q, dateRange, extra) };
           } catch {
             return { key: q, result: null };
           }
@@ -282,7 +320,14 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
     } finally {
       setIsLoading(false);
     }
-  }, [activeTab, datePreset, analyticsMode]);
+  }, [activeTab, datePreset, analyticsMode, effectivenessClassification]);
+
+  // Jump to the Effectiveness tab scoped to one assistant's classification (from the Assistants tab).
+  const openEffectiveness = useCallback((classification: string) => {
+    setEffectivenessClassification(classification);
+    setEffectivenessDrill({ level: 0 });
+    setActiveTab('effectiveness');
+  }, []);
 
   useEffect(() => {
     loadData();
@@ -372,7 +417,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
               role="tab"
               aria-selected={active}
               className={`admin-section-btn ${active ? 'active' : ''}`}
-              onClick={() => { if (!section.tabs.includes(activeTab)) selectTab(tabs[0]); }}
+              onClick={() => { setConversationOrigin(null); if (!section.tabs.includes(activeTab)) selectTab(tabs[0]); }}
             >
               {section.label}
             </button>
@@ -390,7 +435,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
               aria-controls={`admin-tabpanel-${tabId}`}
               id={`admin-tab-${tabId}`}
               className={`admin-subtab-btn ${activeTab === tabId ? 'active' : ''}`}
-              onClick={() => selectTab(tabId)}
+              onClick={() => { setConversationOrigin(null); selectTab(tabId); }}
             >
               {t(tabI18nKey(tabId))}
             </button>
@@ -468,6 +513,17 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             isLoading={isLoading}
           />
         )}
+        {activeTab === 'alerts' && (
+          <AlertsTab
+            intentEffectiveness={results.intent_effectiveness ?? null}
+            latency={results.latency_metrics ?? null}
+            modelEffectiveness={results.model_effectiveness ?? null}
+            flagged={results.flagged_responses ?? null}
+            errorRate={results.error_rate_daily ?? null}
+            isLoading={isLoading}
+            onNavigate={(tab) => selectTab(tab as TabId)}
+          />
+        )}
         {activeTab === 'models' && (
           <ModelsTab
             data={results.model_usage ?? null}
@@ -480,7 +536,11 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
           <ExperimentsTab
             resultsData={results.experiment_results ?? null}
             isLoading={isLoading}
+            registerBack={registerDrillBack}
           />
+        )}
+        {activeTab === 'profiles' && (
+          <ProfilesTab registerBack={registerDrillBack} onOpenEffectiveness={openEffectiveness} />
         )}
         {activeTab === 'evaluations' && (
           <EvaluationsTab data={results.evaluation_scores ?? null} isLoading={isLoading} />
@@ -493,18 +553,13 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             isLoading={isLoading}
           />
         )}
-        {activeTab === 'flows' && (
-          <FlowsTab data={results.evaluation_flows ?? null} isLoading={isLoading} />
-        )}
-        {activeTab === 'steps' && (
-          <StepsTab data={results.execution_steps ?? null} isLoading={isLoading} />
-        )}
         {activeTab === 'flagged' && (
           <FlaggedResponsesTab
             data={results.flagged_responses ?? null}
             isLoading={isLoading}
             onReview={handleReviewResponse}
             onOpenConversation={openConversation}
+            registerBack={registerDrillBack}
           />
         )}
         {activeTab === 'ground_truth' && (
@@ -515,18 +570,17 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             onOpenConversation={openConversation}
           />
         )}
-        {activeTab === 'tasks' && (
-          <TasksTab
-            metricsData={results.task_metrics ?? null}
-            detailData={results.task_details ?? null}
-            isLoading={isLoading}
-          />
-        )}
         {activeTab === 'effectiveness' && (
           <EffectivenessTab
             data={results.intent_effectiveness ?? null}
             dateRange={getDateRange(datePreset)}
             isLoading={isLoading}
+            onOpenConversation={openConversation}
+            registerBack={registerDrillBack}
+            drill={effectivenessDrill}
+            onDrillChange={setEffectivenessDrill}
+            classification={effectivenessClassification}
+            onClearClassification={() => setEffectivenessClassification(null)}
           />
         )}
         {activeTab === 'conversations' && (

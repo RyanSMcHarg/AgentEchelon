@@ -239,21 +239,57 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
     await expect(page.locator('.admin-subtabs')).toBeVisible();
   }
 
-  test('should show the Aurora Effectiveness sub-tabs when Aurora is deployed', async ({ page }) => {
+  test('the Effectiveness section folds Tasks/Flows/Steps into the drill (merged sub-tabs)', async ({ page }) => {
     await openAdmin(page);
     await openEffectiveness(page);
-    // Sub-tab buttons carry stable ids (admin-tab-<tabId>).
-    await expect(page.locator('#admin-tab-flows')).toBeVisible();
+    // The merged sub-tab set: Effectiveness | Flagged | Ground Truth. Sub-tab buttons carry stable
+    // ids (admin-tab-<tabId>).
+    await expect(page.locator('#admin-tab-effectiveness')).toBeVisible();
     await expect(page.locator('#admin-tab-flagged')).toBeVisible();
     await expect(page.locator('#admin-tab-ground_truth')).toBeVisible();
-    await expect(page.locator('#admin-tab-tasks')).toBeVisible();
+    // Tasks/Flows/Steps/Evaluations are no longer standalone sub-tabs — their detail is folded into the
+    // Effectiveness drill (L2 task list, L3 turn timeline + flow score). Assert they are gone as tabs.
+    await expect(page.locator('#admin-tab-flows')).toHaveCount(0);
+    await expect(page.locator('#admin-tab-tasks')).toHaveCount(0);
+    await expect(page.locator('#admin-tab-steps')).toHaveCount(0);
+    await expect(page.locator('#admin-tab-evaluations')).toHaveCount(0);
   });
 
-  test('should display Flows tab with multi-turn evaluation', async ({ page }) => {
+  test('flow + task detail is reachable via the Effectiveness drill (folded in, not standalone tabs)', async ({ page }) => {
+    test.setTimeout(120000);
     await openAdmin(page);
     await openEffectiveness(page);
-    await page.locator('#admin-tab-flows').click();
-    await expect(page.locator('h3:has-text("Intent Flows")')).toBeVisible();
+    await page.locator('#admin-tab-effectiveness').click();
+    // Wait for the async analytics query to settle (the intent table or its empty state) before probing —
+    // counting too early reads 0 and skips a populated window. Skip ONLY on a genuinely empty window.
+    await page.locator('.data-table-row--clickable, .data-table-empty').first().waitFor({ timeout: 20000 });
+    if (await page.locator('.data-table-empty').first().isVisible().catch(() => false)) {
+      test.skip(true, 'no effectiveness data in window'); return;
+    }
+
+    // L0 -> L1: click report_generation — the deterministic task-bearing intent the tasks e2e produces,
+    // so a "Tasks (N)" drill is guaranteed.
+    const intentLink = page.locator('.data-table-row--clickable .admin-link-btn', { hasText: 'report_generation' }).first();
+    await expect(intentLink).toBeVisible({ timeout: 10000 });
+    await intentLink.click();
+    await expect(page.locator('.admin-breadcrumb')).toBeVisible({ timeout: 10000 });
+
+    // L1 -> L2: the task intent exposes a "Tasks (N)" drill; clicking it opens the task list (formerly the
+    // standalone Tasks tab, now drill detail). Reaching that list under the Tasks breadcrumb is the firm
+    // proof the former tab is now folded into the drill.
+    const tasksDrill = page.locator('.admin-filter-btn', { hasText: /Tasks \(/ }).first();
+    await expect(tasksDrill).toBeVisible({ timeout: 10000 });
+    await tasksDrill.click();
+    await expect(page.locator('.admin-breadcrumb')).toContainText(/Tasks/i, { timeout: 15000 });
+    const taskLink = page.locator('.data-table-row--clickable .admin-link-btn').first();
+    await expect(taskLink).toBeVisible({ timeout: 20000 }); // wait for the L2 task list to render
+
+    // L2 -> L3: the task timeline + (when the flow was scored) the multi-turn flow score fold in here.
+    // The flow score depends on the evaluate phase, so accept it OR the deepened breadcrumb as proof of L3.
+    await taskLink.click();
+    await expect(
+      page.getByText(/Flow score/i).or(page.locator('.admin-breadcrumb .admin-link-btn').nth(2)),
+    ).toBeVisible({ timeout: 25000 });
   });
 
   test('should display Flagged tab with review queue', async ({ page }) => {
@@ -274,27 +310,56 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
     await expect(page.locator('h3:has-text("Ground Truth Calibration")')).toBeVisible();
   });
 
-  test('should display Tasks tab with metrics and detail views', async ({ page }) => {
-    await openAdmin(page);
-    await openEffectiveness(page);
-    await page.locator('#admin-tab-tasks').click();
-    await expect(page.locator('h3:has-text("Task Tracking")')).toBeVisible();
+  // (Removed) "should display Tasks tab" tested the OLD standalone Tasks sub-tab. Tasks are now drill
+  // detail (L2 of the Effectiveness drill); coverage moved to "flow + task detail is reachable via the
+  // Effectiveness drill" above and EffectivenessTab.test.tsx (deterministic L0->L3 unit drill).
 
-    // Toggle between metrics and detail views
-    await expect(page.locator('.admin-filter-btn:has-text("Metrics")')).toBeVisible();
-    await expect(page.locator('.admin-filter-btn:has-text("Task List")')).toBeVisible();
-  });
-
-  test('should display Conversations tab with live browser and drift analytics', async ({ page }) => {
-    // Admin app: the dashboard is at root after sign-in (no Admin button).
-
+  test('Conversations tab actually LOADS the conversation list (not just the shell)', async ({ page }) => {
+    test.setTimeout(60000);
+    // Capture why the list load fails (CORS vs dead endpoint vs 4xx) — the shell-only test saw nothing.
+    page.on('requestfailed', (r) => {
+      if (/execute-api|amazonaws/.test(r.url()) && /conversation/i.test(r.url())) {
+        console.log('[net] REQUESTFAILED', r.method(), r.url(), '::', r.failure()?.errorText);
+      }
+    });
+    page.on('response', (r) => {
+      if (/conversation/i.test(r.url())) console.log('[net] RESPONSE', r.status(), r.request().method(), r.url());
+    });
     const convTab = page.locator('.admin-section-rail button:has-text("Conversations")');
     await convTab.click();
     await expect(page.locator('h3:has-text("Conversations")')).toBeVisible();
 
-    // Toggle between browser and drift views
+    // Shell controls.
     await expect(page.locator('.admin-filter-btn:has-text("Browser")')).toBeVisible();
     await expect(page.locator('.admin-filter-btn:has-text("Drift Detection")')).toBeVisible();
     await expect(page.locator('button:has-text("Refresh")')).toBeVisible();
+
+    // Wait for the list load to settle (the "Loading conversations…" spinner clears).
+    await expect(page.locator('.admin-tab-loading')).toHaveCount(0, { timeout: 25000 });
+
+    // If the list failed to load, surface the actual error (the reason, e.g. "Failed to fetch") before
+    // asserting — a shell-only check would have missed this entirely (tracker C3).
+    const failed = page.getByText(/Couldn't load conversations/i);
+    if (await failed.count()) {
+      console.log('[conversations] LOAD FAILED:', (await failed.first().innerText()).replace(/\s+/g, ' ').trim());
+    }
+    await expect(failed, 'the conversation list must load, not show the failure state').toHaveCount(0);
+
+    // Real outcome: the list rendered actual rows, or the explicit empty state — not a blank shell.
+    const rows = page.locator('.admin-content table tbody tr');
+    const empty = page.getByText('No conversations available');
+    await expect(rows.first().or(empty)).toBeVisible({ timeout: 10000 });
+    // The validate context creates conversations, so a populated window must show rows.
+    expect(await rows.count(), 'the conversation list should have loaded rows in a populated window').toBeGreaterThan(0);
+
+    // C1: opening a conversation must LOAD its detail (messages endpoint = exchange-vended creds, a
+    // distinct path from the list). Assert the detail panel renders and there is no "failed to fetch".
+    await rows.first().locator('.admin-inline-btn:has-text("View")').click();
+    await expect(page.locator('.admin-conversation-panel')).toBeVisible({ timeout: 20000 });
+    await expect(page.getByText(/failed to fetch/i)).toHaveCount(0);
+    // Messages either render or show the honest empty — not an error state.
+    const msgRows = page.locator('.admin-conversation-panel table tbody tr');
+    const noMsgs = page.getByText(/No messages loaded/i);
+    await expect(msgRows.first().or(noMsgs)).toBeVisible({ timeout: 15000 });
   });
 });

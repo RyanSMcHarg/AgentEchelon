@@ -253,6 +253,11 @@ export const SHARED_SSM = {
   agentTasksName: `${SSM_ROOT}/shared/tables/agent-tasks-name`,
   userTasksArn: `${SSM_ROOT}/shared/tables/user-tasks-arn`,
   userTasksName: `${SSM_ROOT}/shared/tables/user-tasks-name`,
+  // Per-user profile store (durable per-END-USER record: onboarded flag + collected facts). The
+  // built-in table is a reference stand-in an implementer can swap for their own profile service via
+  // USER_PROFILE_SERVICE_ARN. See SPEC-USER-PROFILE-AND-ONBOARDING.md.
+  userProfileArn: `${SSM_ROOT}/shared/tables/user-profile-arn`,
+  userProfileName: `${SSM_ROOT}/shared/tables/user-profile-name`,
   // Abuse-controls control plane (dedup / spend budget / rate limit). SPEC-ABUSE-CONTROLS.
   abuseControlsArn: `${SSM_ROOT}/shared/tables/abuse-controls-arn`,
   abuseControlsName: `${SSM_ROOT}/shared/tables/abuse-controls-name`,
@@ -393,6 +398,11 @@ export function botArnKey(classification: Classification): string {
 export function processorArnKey(classification: Classification): string {
   return `${SSM_ROOT}/assistant/${classification}/processor-arn`;
 }
+/** The classification's router/AgentHandler (Lex fulfillment) Lambda ARN — surfaced for the admin console's
+ *  classification-level troubleshooting deep links (SPEC-ASSISTANT-CONFIG). */
+export function routerArnKey(classification: Classification): string {
+  return `${SSM_ROOT}/assistant/${classification}/router-arn`;
+}
 
 /**
  * Resolve the platform's ALWAYS-PRESENT shared SSM contract at deploy time
@@ -413,6 +423,8 @@ export function resolveSharedSSM(scope: Construct): {
   agentTasksName: string;
   userTasksArn: string;
   userTasksName: string;
+  userProfileArn: string;
+  userProfileName: string;
   abuseControlsArn: string;
   abuseControlsName: string;
   experimentsArn: string;
@@ -425,6 +437,8 @@ export function resolveSharedSSM(scope: Construct): {
     agentTasksName: v(SHARED_SSM.agentTasksName),
     userTasksArn: v(SHARED_SSM.userTasksArn),
     userTasksName: v(SHARED_SSM.userTasksName),
+    userProfileArn: v(SHARED_SSM.userProfileArn),
+    userProfileName: v(SHARED_SSM.userProfileName),
     abuseControlsArn: v(SHARED_SSM.abuseControlsArn),
     abuseControlsName: v(SHARED_SSM.abuseControlsName),
     experimentsArn: v(SHARED_SSM.experimentsArn),

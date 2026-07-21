@@ -1652,3 +1652,30 @@
   gap: 2px;
   flex-wrap: wrap;
 }
+
+/* Profile Configuration view (ProfilesTab) — read-only value list + AWS troubleshooting links. */
+.admin-muted {
+  color: var(--text-secondary);
+}
+.admin-config-list dt {
+  color: var(--text-secondary);
+  font-weight: 500;
+}
+.admin-config-list dd {
+  margin: 0;
+}
+.admin-config-list a {
+  color: var(--accent-600, #2563eb);
+  text-decoration: none;
+}
+.admin-config-list a:hover {
+  text-decoration: underline;
+}
+.admin-chip {
+  display: inline-block;
+  padding: 1px var(--space-2);
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--surface-200);
+  background: var(--surface-50, var(--surface-0));
+  font-size: 0.85em;
+}

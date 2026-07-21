@@ -42,6 +42,7 @@ export {
 } from './platform/config';
 
 export { trackEvent, setAuthToken, trackPerformance, startTimer, endTimer, flushEvents } from './services/eventTrackingService';
+export { ensureFreshIdToken } from './services/ensureFreshToken';
 
 export { listExperiments, createExperiment, updateExperimentStatus } from './services/experimentService';
 export type {

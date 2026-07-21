@@ -15,6 +15,7 @@ import {
 import MessageInspectDrawer from './MessageInspectDrawer';
 import MembershipTimeline from './MembershipTimeline';
 import { recordModeration, listChannelEvents } from '../../services/analyticsService';
+import { getAdminAttachmentDownloadUrl, isUserUploadedAttachment } from '../../services/adminAttachmentService';
 import type { AnalyticsResult } from '@ae/shared';
 import type {
   AdminConversationEvent,
@@ -88,6 +89,8 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
   const [members, setMembers] = useState<AdminConversationMember[]>([]);
   const [membershipHistory, setMembershipHistory] = useState<AdminMembershipEvent[]>([]);
   const [inspectMessage, setInspectMessage] = useState<AdminConversationMessage | null>(null);
+  // fileKey currently being vended/opened, so its button can show a pending state.
+  const [openingAttachment, setOpeningAttachment] = useState<string | null>(null);
   const [newMemberArn, setNewMemberArn] = useState('');
   const [actionError, setActionError] = useState<string | null>(null);
   const [isRefreshing, setIsRefreshing] = useState(false);
@@ -249,6 +252,26 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
       await loadConversationDetail(selectedConversation.channelArn);
     } catch (error) {
       setActionError(error instanceof Error ? error.message : 'Failed to delete message');
+    }
+  }
+
+  // Open a conversation attachment. Vends channel-scoped, short-lived, AUDITED S3 creds via the
+  // exchange (plane:'admin') and opens the presigned GET in a new tab. User-uploaded files (PII)
+  // are confirmed first, since opening one is a moderation-grade access that is distinctly logged.
+  async function handleOpenAttachment(fileKey: string, name: string) {
+    if (!selectedConversation) return;
+    if (isUserUploadedAttachment(fileKey)) {
+      if (!window.confirm(`"${name}" is a user-uploaded file and may contain personal data. Opening it is an audited action. Continue?`)) return;
+    }
+    try {
+      setActionError(null);
+      setOpeningAttachment(fileKey);
+      const url = await getAdminAttachmentDownloadUrl(selectedConversation.channelArn, fileKey);
+      window.open(url, '_blank', 'noopener,noreferrer');
+    } catch (error) {
+      setActionError(error instanceof Error ? error.message : 'Failed to open attachment');
+    } finally {
+      setOpeningAttachment(null);
     }
   }
 
@@ -477,7 +500,12 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
         </div>
 
         {inspectMessage && (
-          <MessageInspectDrawer message={inspectMessage} onClose={() => setInspectMessage(null)} />
+          <MessageInspectDrawer
+            message={inspectMessage}
+            onClose={() => setInspectMessage(null)}
+            onOpenAttachment={handleOpenAttachment}
+            openingAttachment={openingAttachment}
+          />
         )}
       </div>
     );
@@ -487,24 +515,28 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
     <div className="admin-tab">
       <div className="admin-tab-header">
         <h3>Conversations</h3>
-        <div className="admin-filter-group">
-          <button
-            className={`admin-filter-btn ${view === 'browser' ? 'active' : ''}`}
-            onClick={() => setView('browser')}
-          >
-            Browser
-          </button>
-          <button
-            className={`admin-filter-btn ${view === 'drift' ? 'active' : ''}`}
-            onClick={() => setView('drift')}
-          >
-            Drift Detection
-            {driftEvents.filter((d) => d.outcome === 'abandoned').length > 0 && (
-              <span className="admin-badge">{driftEvents.filter((d) => d.outcome === 'abandoned').length}</span>
-            )}
-          </button>
-          <button className="admin-filter-btn" onClick={() => loadConversationList()}>
-            {isRefreshing ? 'Refreshing...' : 'Refresh'}
+        {/* The two VIEW toggles are grouped together; Refresh is a distinct ACTION (not a third view),
+            set apart so it doesn't read as another toggle. */}
+        <div style={{ display: 'flex', gap: 'var(--space-4)', alignItems: 'center', flexWrap: 'wrap' }}>
+          <div className="admin-filter-group">
+            <button
+              className={`admin-filter-btn ${view === 'browser' ? 'active' : ''}`}
+              onClick={() => setView('browser')}
+            >
+              Browser
+            </button>
+            <button
+              className={`admin-filter-btn ${view === 'drift' ? 'active' : ''}`}
+              onClick={() => setView('drift')}
+            >
+              Drift Detection
+              {driftEvents.filter((d) => d.outcome === 'abandoned').length > 0 && (
+                <span className="admin-badge">{driftEvents.filter((d) => d.outcome === 'abandoned').length}</span>
+              )}
+            </button>
+          </div>
+          <button className="admin-inline-btn" onClick={() => loadConversationList()} title="Reload the conversation list">
+            {isRefreshing ? 'Refreshing…' : '↻ Refresh'}
           </button>
         </div>
       </div>

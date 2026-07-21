@@ -21,6 +21,7 @@
 import { test, expect, request as pwRequest } from '@playwright/test';
 import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
+import { signedAnalyticsPost } from './helpers/signed-analytics';
 
 const RUN = process.env.EXPERIMENTS_E2E === '1';
 const suite = RUN ? test.describe : test.describe.skip;
@@ -72,8 +73,11 @@ suite('A/B experiment produces experiment_results', () => {
     expect(created.ok(), `create experiment: ${created.status()} ${await created.text()}`).toBeTruthy();
 
     try {
-      // 2. Drive a premium-tier conversation so a turn is assigned to a variant.
-      await createConversation(page, `Exp e2e ${Date.now()}`);
+      // 2. Drive a premium-tier conversation so a turn is assigned to a variant. The
+      //    experiment targets tiers:['premium'], so the conversation MUST be the Premium
+      //    classification — createConversation defaults to 'Open' (basic), which the premium
+      //    experiment never assigns, so pass 'Premium' explicitly.
+      await createConversation(page, `Exp e2e ${Date.now()}`, 'Premium');
       const resp = await sendAndWaitForResponse(page, 'In one sentence, what is a feature flag?');
       expect(resp.text && resp.text.length).toBeTruthy();
 
@@ -82,10 +86,11 @@ suite('A/B experiment produces experiment_results', () => {
       const start = new Date(end.getTime() - 1 * 86_400_000);
       let row: unknown | undefined;
       for (let i = 0; i < 8 && !row; i++) {
-        const r = await api.post(ANALYTICS_API, {
-          data: { queryType: 'experiment_results', dateRange: { start: start.toISOString(), end: end.toISOString() } },
+        // The analytics API is IAM-enforced (adminIamEnforcement) — sign the request with the
+        // admin's Identity-Pool creds; a Bearer JWT is rejected (403).
+        const j = await signedAnalyticsPost(ANALYTICS_API, idToken!, {
+          queryType: 'experiment_results', dateRange: { start: start.toISOString(), end: end.toISOString() },
         });
-        const j = await r.json();
         row = (j.data || []).find((x: any) => x.experiment_id === draft.experimentId || x.experimentId === draft.experimentId);
         if (!row) await page.waitForTimeout(4000); // archival + pairing lag
       }
@@ -141,10 +146,9 @@ suite('A/B experiment produces experiment_results', () => {
       const variantOf = (x: any): string => x.variant_id ?? x.variantId ?? '';
       let variants = new Set<string>();
       for (let i = 0; i < 12 && variants.size < 2; i++) {
-        const r = await api.post(ANALYTICS_API, {
-          data: { queryType: 'experiment_results', dateRange: { start: start.toISOString(), end: end.toISOString() } },
+        const j = await signedAnalyticsPost(ANALYTICS_API, idToken!, {
+          queryType: 'experiment_results', dateRange: { start: start.toISOString(), end: end.toISOString() },
         });
-        const j = await r.json();
         variants = new Set(
           (j.data || [])
             .filter((x: any) => (x.experiment_id ?? x.experimentId) === draft.experimentId)
@@ -162,15 +166,11 @@ suite('A/B experiment produces experiment_results', () => {
       // It is advisory + descriptive (never reroutes); assert it returns a structured
       // recommendation, not a specific verdict (which is non-deterministic / may be
       // "needs more data" at this sample size).
-      const recRes = await api.post(ANALYTICS_API, {
-        data: {
-          queryType: 'experiment_recommendation',
-          experimentId: draft.experimentId,
-          dateRange: { start: start.toISOString(), end: end.toISOString() },
-        },
+      const recJson = await signedAnalyticsPost(ANALYTICS_API, idToken!, {
+        queryType: 'experiment_recommendation',
+        experimentId: draft.experimentId,
+        dateRange: { start: start.toISOString(), end: end.toISOString() },
       });
-      expect(recRes.ok(), `recommendation query: ${recRes.status()} ${await recRes.text()}`).toBeTruthy();
-      const recJson = await recRes.json();
       // Tolerant: the recommendation payload shape varies (a per-variant `variants`
       // breakdown plus a verdict, or a needs-more-data signal at this sample size).
       // Assert it returns a structured, non-empty payload rather than a specific verdict.
@@ -185,7 +185,11 @@ suite('A/B experiment produces experiment_results', () => {
       expect(done.ok(), `complete experiment: ${done.status()}`).toBeTruthy();
       const listed = await api.get(EXPERIMENTS_API);
       expect(listed.ok(), `list experiments: ${listed.status()}`).toBeTruthy();
-      const experiments = (await listed.json()).data ?? (await listed.json());
+      // GET /admin/experiments returns { experiments: [...] } (admin-experiments.ts).
+      // Read that first; tolerate a bare array or a `data` envelope too. (Read the
+      // body ONCE — Playwright's APIResponse.json() must not be double-awaited.)
+      const listBody = await listed.json();
+      const experiments = listBody.experiments ?? listBody.data ?? listBody;
       const mine = (Array.isArray(experiments) ? experiments : []).find(
         (e: any) => (e.experimentId ?? e.experiment_id ?? e.id) === draft.experimentId,
       );

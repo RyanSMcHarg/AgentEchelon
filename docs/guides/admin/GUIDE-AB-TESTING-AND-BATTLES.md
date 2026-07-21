@@ -28,11 +28,13 @@ Channel Flow Processor ──▶ Tier router  (picks the per-tier assistant: Bas
         model)             └─ generate step (image-gen model)        → default (base) model
 ```
 
-The flow exposes three levers, and each is one of the experiment types in Part 1:
+The flow exposes three levers, and each is one of the single-model experiment types in Part 1:
 
 - **Classification** - the single low-cost model that reads a message and routes it to an intent.
 - **Default (base) model** - the fallthrough model that answers any request not pinned to a specific intent. It differs per tier.
 - **Intent** - the model used for one specific intent, including a specific sub-step of a multi-step intent (for example, the model that generates the image, distinct from the default model that clarifies what image to generate).
+
+A fourth experiment type, **Profile vs Profile**, sits above these three: instead of moving one lever it swaps the whole assistant (all three levers, plus the tool surface and limits) by pitting two versioned profiles against each other. Part 1 covers when to use each.
 
 Given this flow, administrators have levers they can pull at different levels to achieve the goals they desire.
 
@@ -63,8 +65,8 @@ Focused goals are used when you want to optimize a specific intent or process, o
 ## Concepts
 
 - **Experiment.** A named comparison with a **control** variant (A) and a **treatment** variant (B), the tiers it applies to, a traffic split, and a type (below). A battle is the same experiment's two variants compared head to head in a single conversation, instead of being split probabilistically across many conversations.
-- **Experiment type.** What the experiment swaps: the **Classification** model, the **Base** (default) model, or the model for one **Intent**. See Part 1.
-- **Variant.** One side of the comparison: a model plus, for battles, a display name and optional prompt addendum.
+- **Experiment type.** What the experiment swaps. Three types swap a single model at one lever: the **Classification** model, the **Base** (default) model, or the model for one **Intent**. A fourth, **Profile vs Profile**, swaps the whole assistant profile version at once. See Part 1.
+- **Variant.** One side of the comparison. For the single-model types it is a model (plus, for battles, a display name and optional prompt addendum). For a Profile experiment it is a **profile version reference** (a profile name and an optional version) rather than a bare model; a variant is exactly one of the two, never both.
 - **Traffic split.** The percentage of conversations assigned to each variant. You set the control percentage; the treatment (the alt) gets the rest.
 - **Sticky assignment.** A conversation is assigned a variant deterministically (a hash of the channel and the experiment identifier) and keeps it for the life of the conversation, so you compare conversations rather than turn-by-turn flip-flops.
 - **Objective.** The target the experiment is trying to move: a cost, quality, or latency goal, used to frame the result. Advisory only: it informs the recommendation, never an automatic routing change. (The **accuracy** objective is *(not available)*: it needs the classifier-accuracy measurement, which is not available, so it always reads as pending.)
@@ -79,11 +81,17 @@ Everything below lives in the admin console under the **Experiments** section, e
 
 Open the admin console, go to **Experiments**, and choose **New Experiment**.
 
-First choose a **Type** (Intent, Base Model, or Classification):
+First choose a **Type** (Intent, Base Model, Classification, or Profile).
 
-- **Classification** - experiment with different models for intent classification. A classification test cannot run while any other type of test is running on the targeted tier(s), because changing the classifier shifts routing for every intent and would confound the other tests.
-- **Base Model** - experiment with different default models for one tier or across multiple tiers.
-- **Intent** - experiment with the model for one specific intent.
+The first three are the established, targeted tests: each **swaps one model at one point in the flow** of your *current* assistant and holds everything else constant, so the result isolates that single change. In practice these are the fast, mostly model-and-prompt-driven experiments you reach for to tune an assistant you already run. They differ only in *which* lever they move (the three levers from the flow above):
+
+- **Classification** - swaps only the low-cost intent-classifier model. Everything downstream (base and per-intent models) is unchanged. A classification test cannot run while any other type of test is running on the targeted tier(s), because changing the classifier shifts routing for every intent and would confound the other tests.
+- **Base Model** - swaps only the default (fallthrough) model for a tier, across every intent that is not pinned to its own model. The classifier and any per-intent models are unchanged.
+- **Intent** - swaps only the model for one specific intent (for example code generation, or the image-generation step). The classifier, the base model, and every other intent are unchanged.
+
+The fourth type is different in kind: it does not tweak your current assistant, it compares **two whole, separately-built assistants**.
+
+- **Profile vs Profile** - compares two assistant **profile versions**, not a single model. This is the type to use when you are testing **new profiles** you have built, rather than tuning a model in the assistant you already run. A profile version is a portable, versioned artifact that bundles ALL of the above at once (base model, every per-intent model, the classifier, the tool surface, and limits) plus its identity (see [How to add or manage a profile](../developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md)). Both variants are profiles: you pick a profile version for control and a profile version for treatment (typically your current profile versus a new candidate). Because many things change at once, a Profile result tells you which *configuration* wins overall, not which single model or prompt caused it; reach for one of the three single-lever tests above when you want to attribute the win to one change. Like a base-model test it applies across intents, and each variant's effective model resolves from the referenced version at runtime.
 
 Then fill in the fields. Most are common to every type; the type-specific fields are noted.
 
@@ -91,7 +99,7 @@ Then fill in the fields. Most are common to every type; the type-specific fields
 
 - **Experiment ID** - a short stable name, for example `exp-codegen-sonnet-vs-opus`.
 - **Description** - the hypothesis in one line, for example "Does Opus actually beat Sonnet for our code questions?"
-- **Control Model** and **Treatment Model** - the two models you are comparing. The available models come from your deployment's model catalog, which can include Bedrock and external (non-Bedrock) models. Control is variant A; treatment is variant B (the alt). See the [Model Strategy guide](../developer/MODEL_STRATEGY.md) for the catalog. *(The form does not read the live catalog; the model list is a fixed set, and admin management of the catalog is design-only.)*
+- **Control Model** and **Treatment Model** - the two models you are comparing. The available models come from your deployment's model catalog, which can include Bedrock and external (non-Bedrock) models. Control is variant A; treatment is variant B (the alt). See the [Model Strategy guide](../developer/MODEL_STRATEGY.md) for the catalog. *(The form does not read the live catalog; the model list is a fixed set, and admin management of the catalog is design-only.)* For a **Profile vs Profile** experiment these two fields become **Control Profile** and **Treatment Profile** pickers instead: choose a profile name and, for each, a specific version or leave it on the active version. The rest of the form is the same.
 - **Tiers** - the user tiers the experiment applies to (Basic, Standard, Premium). A model that a tier is not allowed to use is skipped for that tier, so the experiment never grants more access than the tier already has.
 - **Start Date** - defaults to today, starting the test as soon as it is saved. *(A future-dated start is not honored; an experiment is live whenever its status is active, regardless of a later start date.)*
 - **End Date** - when the test ends; defaults to 30 days after the start date. Once past the end date the experiment stops being resolved and routing falls back to the default for that intent and tier.
@@ -149,11 +157,12 @@ When a treatment wins, you make it the standard model for that intent (or, for a
 
 To promote a winner:
 
-1. Update the deployment's **model strategy** configuration so the winning model becomes the default for that intent (and tier). This is the centralized routing config that defines the default model per intent; change the intent's primary model to the winner.
-2. Redeploy the backend so the new default takes effect.
-3. **Complete** the experiment in the Experiments section. With no active experiment for that intent and tier, all conversations now route to the new default you just set.
+1. Make the winning model the default. Two paths, depending on how your deployment manages assistants:
+   - **Profile version (no redeploy, preferred).** In the admin **Assistants > Profiles** tab, create a new version of the affected profile, set the winning model (base, per-intent, or classifier as appropriate) on it, validate, and **activate** it. Activation takes effect at runtime with no redeploy, and the previous version stays available for one-click rollback. For a **Profile vs Profile** experiment this is the whole promotion: activate the treatment profile version that won. See [How to add or manage a profile](../developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md).
+   - **Model strategy config (deploy-time default).** Alternatively, update the deployment's centralized **model strategy** so the winning model becomes the classification-level default for that intent and tier, then redeploy the backend. This is the fallback path and sets the default a blank profile inherits.
+2. **Complete** the experiment in the Experiments section. With no active experiment for that intent and tier, all conversations now route to the new default you just set.
 
-There is intentionally **no one-click promote and no automatic promotion** of a winning variant today; the decision and the configuration change are deliberate operator actions. Objectives are advisory for the same reason: hitting a target produces a recommendation, never an automatic routing change. Automatic promotion of a proven winner is not current behavior, so do not expect a successful test to change routing by itself.
+There is intentionally **no one-click promote and no automatic promotion** of a winning variant today; the decision and the configuration change (activating the new version, or editing config and redeploying) are deliberate operator actions. Objectives are advisory for the same reason: hitting a target produces a recommendation, never an automatic routing change. Automatic promotion of a proven winner is not current behavior, so do not expect a successful test to change routing by itself.
 
 ## Battles
 
@@ -171,6 +180,8 @@ In the experiment's form, tick **Enable for /battle** (battles are premium-only 
 - **Long-form mode** - for report or document battles, choose **one-shot** (each side produces the complete deliverable in round one as an attachment) or **outline-first** (round one is just the approach, so you can compare directions before a full report is generated).
 
 For an image-generation battle, set an **image-gen model** on both variants (set it on neither for a normal text battle); the form enforces both-or-neither. Choose **Create and Activate**.
+
+Any experiment type can be armed for battle, including **Profile vs Profile**: the two profile versions then answer side by side in one conversation, so you can feel the difference between two whole assistant configurations before you promote one.
 
 ### Part 2: Run a battle
 

@@ -228,6 +228,12 @@ export interface AnalyticsMetadata {
   intentPackVersion?: string;
   systemPromptHash?: string;
 
+  // Portable-profile attribution (SPEC-ASSISTANT-CONFIG §4): the assistant/profile + version that served
+  // this turn, so analytics can slice by the EXACT assistant and version, not just its classification.
+  profileName?: string;
+  profileConfigId?: string;
+  profileVersion?: number;
+
   // /battle tracking (SPEC-BATTLE.md §Analytics). assignmentMode is
   // top-level on purpose so variant rollups can filter battle traffic
   // before aggregating.
@@ -282,6 +288,11 @@ export interface AnalyticsContext {
     intentPackVersion: string;
     systemPromptHash: string;
   };
+  /** Portable-profile attribution (SPEC-ASSISTANT-CONFIG §4): the ASSISTANT/PROFILE that answered this turn
+   *  and its VERSION. Distinct from `configIdentity` (a persona/intent-pack hash) and from `agentType` (the
+   *  classification/tier) — so a turn attributes to the EXACT profile version, not just its tier. This is
+   *  what makes analytics per-assistant + per-version once multiple assistants serve one classification. */
+  profileAttribution?: { profileName: string; profileConfigId: string; profileVersion?: number };
   assignmentMode?: AssignmentMode;
   battleContext?: AnalyticsBattleContext;
 }
@@ -367,6 +378,14 @@ export function buildAnalyticsMetadata(context: AnalyticsContext): AnalyticsMeta
     metadata.personaVersion = context.configIdentity.personaVersion;
     metadata.intentPackVersion = context.configIdentity.intentPackVersion;
     metadata.systemPromptHash = context.configIdentity.systemPromptHash;
+  }
+
+  // Portable-profile attribution — stamp the assistant/profile + version that served the turn, so analytics
+  // attributes to the exact profile version (not just its classification / persona-pack hash).
+  if (context.profileAttribution) {
+    metadata.profileName = context.profileAttribution.profileName;
+    metadata.profileConfigId = context.profileAttribution.profileConfigId;
+    if (context.profileAttribution.profileVersion !== undefined) metadata.profileVersion = context.profileAttribution.profileVersion;
   }
 
   // /battle: a battleContext implies the model was chosen by fan-out,

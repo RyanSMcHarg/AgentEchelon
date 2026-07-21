@@ -7,6 +7,7 @@
 
 const mockStsSend = jest.fn();
 const mockChimeSend = jest.fn();
+const mockSsmSend = jest.fn();
 
 jest.mock('@aws-sdk/client-sts', () => ({
   STSClient: jest.fn(() => ({ send: mockStsSend })),
@@ -17,6 +18,10 @@ jest.mock('@aws-sdk/client-chime-sdk-identity', () => ({
   CreateAppInstanceUserCommand: jest.fn((input: unknown) => ({ __type: 'CreateAppInstanceUser', input })),
   UpdateAppInstanceUserCommand: jest.fn((input: unknown) => ({ __type: 'UpdateAppInstanceUser', input })),
   CreateAppInstanceAdminCommand: jest.fn((input: unknown) => ({ __type: 'CreateAppInstanceAdmin', input })),
+}));
+jest.mock('@aws-sdk/client-ssm', () => ({
+  SSMClient: jest.fn(() => ({ send: mockSsmSend })),
+  GetParameterCommand: jest.fn((input: unknown) => ({ __type: 'GetParameter', input })),
 }));
 
 const APP = 'arn:aws:chime:us-east-1:111:app-instance/abc';
@@ -32,6 +37,8 @@ function loadHandler() {
   process.env.EXCHANGE_ROLE_ADMIN_PLANE = 'arn:aws:iam::111:role/ex-admin-plane';
   process.env.EXCHANGE_EXECUTE_API_MESSAGES_ARN =
     'arn:aws:execute-api:us-east-1:111:api123/*/GET/admin/conversations/messages';
+  process.env.EXCHANGE_ATTACHMENTS_BUCKET_ARN_PARAM = '/agentechelon/shared/attachments-bucket-arn';
+  delete process.env.EXCHANGE_ATTACHMENTS_BUCKET_ARN; // force the SSM resolve path in tests
   // eslint-disable-next-line @typescript-eslint/no-var-requires
   return require('../lambda/src/credential-exchange');
 }
@@ -46,6 +53,7 @@ beforeEach(() => {
   jest.clearAllMocks();
   mockStsSend.mockResolvedValue(goodCreds);
   mockChimeSend.mockResolvedValue({});
+  mockSsmSend.mockResolvedValue({ Parameter: { Value: 'arn:aws:s3:::my-attach-bucket' } });
 });
 
 describe('parseGroups', () => {
@@ -233,6 +241,104 @@ describe('A14 archive vend — view-messages (execute-api plane)', () => {
       { identity: 'admin', channelArn: CHANNEL, capabilities: ['view-messages'] },
     ));
     expect(res.statusCode).toBe(403);
+    expect(mockStsSend).not.toHaveBeenCalled();
+  });
+});
+
+// S3 attachment vend (admin conversation attachment review): a short-lived, audited
+// `s3:GetObject` session policy on the admin-plane role, scoped to EXACTLY the named
+// channel's key prefix. The generated-doc vs user-upload split is two capabilities, so a
+// future restricted role can be denied the user-upload prefix at the IAM layer.
+describe('S3 attachment vend — attachment-read (execute nothing but s3:GetObject)', () => {
+  const CHANNEL = `${APP}/channel/room-1`;
+  const BUCKET = 'arn:aws:s3:::my-attach-bucket';
+
+  it('attachment-read vends s3:GetObject scoped to generated-docs/<channelId>/*, admin-plane, no Chime', async () => {
+    const { handler } = loadHandler();
+    const res = await handler(event(
+      { sub: 'adm', 'cognito:groups': 'admins' },
+      { identity: 'admin', channelArn: CHANNEL, capabilities: ['attachment-read'] },
+    ));
+    expect(res.statusCode).toBe(200);
+    const input = mockStsSend.mock.calls[0][0].input;
+    expect(input.RoleArn).toBe('arn:aws:iam::111:role/ex-admin-plane');
+    expect(input.Tags).toEqual([{ Key: 'sub', Value: 'adm' }]);
+    const policy = JSON.parse(input.Policy);
+    const stmt = policy.Statement.find((s: { Sid: string }) => s.Sid === 'AttachmentGet');
+    expect(stmt.Action).toEqual(['s3:GetObject']);
+    // Confined to THIS channel's DELIVERABLES prefix — not the whole bucket, not user uploads.
+    expect(stmt.Resource).toEqual([`${BUCKET}/generated-docs/room-1/*`]);
+    expect(JSON.stringify(policy)).not.toContain('/attachments/');
+    // An S3 vend provisions no Chime identity.
+    expect(mockChimeSend).not.toHaveBeenCalled();
+    const out = JSON.parse(res.body);
+    expect(out.userArn).toBe(`${APP}/user/adm-admin`);
+    expect(out.identity).toBe('admin');
+    expect(out.bucket).toBe('my-attach-bucket'); // name (not ARN) for the client to address GetObject
+    expect(out.region).toBe('us-east-1');
+  });
+
+  it('attachment-read-uploads scopes to the USER-UPLOAD prefix (attachments/<channelId>/*)', async () => {
+    const { handler } = loadHandler();
+    const res = await handler(event(
+      { sub: 'adm', 'cognito:groups': 'admins' },
+      { identity: 'admin', channelArn: CHANNEL, capabilities: ['attachment-read-uploads'] },
+    ));
+    expect(res.statusCode).toBe(200);
+    const policy = JSON.parse(mockStsSend.mock.calls[0][0].input.Policy);
+    const stmt = policy.Statement.find((s: { Sid: string }) => s.Sid === 'AttachmentGet');
+    expect(stmt.Resource).toEqual([`${BUCKET}/attachments/room-1/*`]);
+    expect(JSON.stringify(policy)).not.toContain('/generated-docs/');
+  });
+
+  it('rejects an attachment vend on the CHAT plane (admin-plane only)', async () => {
+    const { handler } = loadHandler();
+    const res = await handler(event(
+      { sub: 'adm', 'cognito:groups': 'admins' },
+      { channelArn: CHANNEL, capabilities: ['attachment-read'] }, // no identity:admin
+    ));
+    expect(res.statusCode).toBe(400);
+    expect(mockStsSend).not.toHaveBeenCalled();
+  });
+
+  it('a non-admin cannot vend an attachment cred (admin plane requires admins)', async () => {
+    const { handler } = loadHandler();
+    const res = await handler(event(
+      { sub: 'u1', 'cognito:groups': 'premium' },
+      { identity: 'admin', channelArn: CHANNEL, capabilities: ['attachment-read'] },
+    ));
+    expect(res.statusCode).toBe(403);
+    expect(mockStsSend).not.toHaveBeenCalled();
+  });
+
+  it('refuses to mix S3 attachment and Chime capabilities', async () => {
+    const { handler } = loadHandler();
+    const res = await handler(event(
+      { sub: 'adm', 'cognito:groups': 'admins' },
+      { identity: 'admin', channelArn: CHANNEL, capabilities: ['attachment-read', 'view'] },
+    ));
+    expect(res.statusCode).toBe(400);
+    expect(mockStsSend).not.toHaveBeenCalled();
+  });
+
+  it('refuses to mix S3 attachment and archive (execute-api) capabilities', async () => {
+    const { handler } = loadHandler();
+    const res = await handler(event(
+      { sub: 'adm', 'cognito:groups': 'admins' },
+      { identity: 'admin', channelArn: CHANNEL, capabilities: ['attachment-read', 'view-messages'] },
+    ));
+    expect(res.statusCode).toBe(400);
+    expect(mockStsSend).not.toHaveBeenCalled();
+  });
+
+  it('500s (never leaks) when the attachments bucket ARN is unresolved', async () => {
+    const { handler } = loadHandler();
+    mockSsmSend.mockResolvedValueOnce({ Parameter: { Value: '' } }); // param present but empty
+    const res = await handler(event(
+      { sub: 'adm', 'cognito:groups': 'admins' },
+      { identity: 'admin', channelArn: CHANNEL, capabilities: ['attachment-read'] },
+    ));
+    expect(res.statusCode).toBe(500);
     expect(mockStsSend).not.toHaveBeenCalled();
   });
 });

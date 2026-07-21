@@ -86,11 +86,19 @@ export const DEFAULT_INTENT_PACK: IntentPack = {
     },
     {
       key: 'data_extraction',
+      // Reserve this for STRUCTURED / BULK extraction that is genuinely multi-step work (a table, list,
+      // spreadsheet, or dataset). A request for a SINGLE fact or figure the assistant can state in a
+      // sentence ("what was our Q2 ARR?") is GENERAL, answered inline — routing it to a TASK_MULTI_STEP
+      // defers the answer behind a task instead of just stating it (the premium-ARR failure mode). See
+      // docs/design/decisions/018-company-context-tool-and-extraction-boundary.md.
       description:
-        'User wants to extract, transform, query, or pull specific data from sources, databases, APIs, or documents',
+        'User wants to extract or export MULTIPLE records or STRUCTURED data — a table, list, spreadsheet, ' +
+        'or dataset — from sources, databases, APIs, or documents (e.g. "extract the churn-risk accounts as a ' +
+        'table", "export the roster"). A request for a SINGLE fact or figure that can be answered in a ' +
+        'sentence (e.g. "what was our Q2 ARR?") is GENERAL, not data_extraction.',
       keywords: [
-        'extract', 'pull data', 'query', 'get data', 'fetch',
-        'export data', 'data from', 'retrieve', 'look up',
+        'extract', 'export data', 'as a table', 'as a spreadsheet', 'as a csv',
+        'list all', 'pull the', 'data from', 'dataset',
       ],
       delivery: 'TASK_MULTI_STEP',
     },

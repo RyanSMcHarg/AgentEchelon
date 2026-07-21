@@ -5,11 +5,22 @@ import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
+import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 
 export interface S3StorageStackProps extends cdk.StackProps {
   appInstanceArn: string;
   userPool: cognito.IUserPool;
+  /**
+   * The admin-PLANE credential-exchange role ARN. Granted `s3:GetObject` on the assistant-
+   * generated-doc and user-upload key prefixes so the exchange can vend a per-channel-scoped
+   * attachment-read session policy for admin conversation review (the ceiling that policy
+   * intersects). The grant lives here (with the bucket) to avoid a circular stack dep, mirroring
+   * the execute-api teeth pattern.
+   */
+  exchangeRoleAdminPlaneArn?: string;
+  /** SSM parameter NAME to publish the bucket ARN to, for the exchange to resolve at runtime. */
+  attachmentsBucketArnParam?: string;
 }
 
 export class S3StorageStack extends cdk.Stack {
@@ -51,6 +62,35 @@ export class S3StorageStack extends cdk.Stack {
         },
       ],
     });
+
+    // Admin conversation attachment review (SPEC-ADMIN-IDENTITY / SPEC-CREDENTIAL-EXCHANGE):
+    // grant the admin-plane exchange role `s3:GetObject` on the two attachment key families —
+    //   generated-docs/*  the assistant's DELIVERABLES (reports/extractions), archive-read grade
+    //   attachments/*      USER-UPLOADED input (may carry PII), moderation grade
+    // This is the CEILING; the exchange's per-request session policy narrows to a single channel's
+    // keys and picks the prefix per capability (attachment-read vs attachment-read-uploads), so the
+    // generated-vs-uploaded split is IAM-enforceable. Publish the bucket ARN to SSM so the exchange
+    // (created before this stack, so no CDK prop) resolves it at cold start.
+    if (props.exchangeRoleAdminPlaneArn) {
+      const adminPlaneRole = iam.Role.fromRoleArn(this, 'ImportedExchangeAdminPlaneRole', props.exchangeRoleAdminPlaneArn, {
+        mutable: true,
+      });
+      adminPlaneRole.addToPrincipalPolicy(new iam.PolicyStatement({
+        effect: iam.Effect.ALLOW,
+        actions: ['s3:GetObject'],
+        resources: [
+          this.attachmentsBucket.arnForObjects('generated-docs/*'),
+          this.attachmentsBucket.arnForObjects('attachments/*'),
+        ],
+      }));
+    }
+    if (props.attachmentsBucketArnParam) {
+      new ssm.StringParameter(this, 'AttachmentsBucketArnParam', {
+        parameterName: props.attachmentsBucketArnParam,
+        stringValue: this.attachmentsBucket.bucketArn,
+        description: 'Attachments bucket ARN — resolved by the credential exchange for the S3 attachment-read session policy',
+      });
+    }
 
     // Lambda function to generate presigned URLs
     this.presignedUrlFunction = new lambda.Function(this, 'PresignedUrlFunction', {

@@ -41,6 +41,19 @@ describe('buildAnalyticsMetadata — assignmentMode rollup-safety invariant', ()
     expect(md.battleContext).toBeUndefined();
   });
 
+  it('stamps portable-profile attribution (assistant + profile version) when provided', () => {
+    const md = buildAnalyticsMetadata(baseCtx({ profileAttribution: { profileName: 'premium', profileConfigId: 'abc123def456', profileVersion: 4 } }));
+    expect(md.profileName).toBe('premium');
+    expect(md.profileConfigId).toBe('abc123def456'); // the VERSION fingerprint, distinct from configId
+    expect(md.profileVersion).toBe(4);
+  });
+
+  it('omits profile attribution when not provided (no silent default)', () => {
+    const md = buildAnalyticsMetadata(baseCtx());
+    expect(md.profileName).toBeUndefined();
+    expect(md.profileConfigId).toBeUndefined();
+  });
+
   it('leaves assignmentMode unset when neither is provided (no silent default)', () => {
     const md = buildAnalyticsMetadata(baseCtx());
     expect(md.assignmentMode).toBeUndefined();

@@ -1,27 +1,21 @@
 /**
- * A14 `Scoped` cells (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6.4) — resolve
+ * A14 `Scoped` cells (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 10) — resolve
  * the caller's CLASSIFICATION CEILING from their verified identity, so an admin
  * read can be narrowed to the classification tier the caller is entitled to (the
  * one generic scope axis; ownership/membership scoping is deployment-specific).
  *
- * The ceiling is the caller's highest classification group. A caller in a
- * full-access group (the `admins` group, or the `platform-admins` persona) has NO
- * ceiling (Full). A caller with a persona but no classification group is
- * fail-closed to the floor, so a scope is a grant a deployer adds (a classification
- * group on the role's members), never an accident.
+ * Resolved from the caller's ASSUMED-ROLE ARN (`event.requestContext.identity.userArn`):
+ * the Identity Pool already mapped the caller's Cognito groups to a per-clearance role at
+ * credential-vend time (outside the VPC), so the assumed role is itself the authoritative,
+ * already-resolved clearance. This mirrors how `credential-exchange` bakes clearance into the
+ * assumed role rather than re-querying Cognito, and lets the VPC-attached analytics Lambda run
+ * with NO network path to the Cognito API (no `cognito-idp` VPC endpoint or NAT needed).
  *
- * Active ONLY under IAM enforcement (the handler passes the verified sub from
- * `iamCallerSub`). Cognito-JWT calls keep the existing behavior.
+ * The role -> ceiling map is supplied by the CognitoAuth stack (it owns the per-clearance role
+ * ARNs) via the `CLASSIFICATION_ROLE_CEILINGS` env. Active ONLY under IAM enforcement; Cognito-JWT
+ * calls keep the existing group-gate behavior.
  */
 import type { APIGatewayProxyEvent } from 'aws-lambda';
-import {
-  CognitoIdentityProviderClient,
-  ListUsersCommand,
-  AdminListGroupsForUserCommand,
-} from '@aws-sdk/client-cognito-identity-provider';
-import { iamCallerSub } from './auth.js';
-
-const cognito = new CognitoIdentityProviderClient({});
 
 const CLASSIFICATION_RANK: Record<string, number> = { basic: 1, standard: 2, premium: 3 };
 const CLASSIFICATION_ORDER = ['basic', 'standard', 'premium'];
@@ -47,7 +41,12 @@ export function classificationAllowed(itemClassification: string | undefined, ce
   return item <= classificationRank(ceiling);
 }
 
-/** The ceiling implied by a set of Cognito groups (pure; unit-tested). */
+/**
+ * The ceiling implied by a set of Cognito groups (pure; unit-tested). This is the reference
+ * semantics the CognitoAuth stack mirrors when it builds the role -> ceiling map: a full-access
+ * group maps its role to Full, a classification group maps its role to that tier, and a persona
+ * with no classification group maps to the floor.
+ */
 export function ceilingFromGroups(groups: string[]): ClassificationCeiling {
   if (groups.some((g) => FULL_ACCESS_GROUPS.has(g))) return null; // Full
   let best: string | null = null;
@@ -58,69 +57,61 @@ export function ceilingFromGroups(groups: string[]): ClassificationCeiling {
   return best ?? FLOOR_CLASSIFICATION;
 }
 
-// Short-lived cache: the ceiling is stable for a session and the resolution costs
-// two Cognito calls. Keyed by sub, TTL-bounded so a group change takes effect soon.
-const TTL_MS = 5 * 60 * 1000;
-const cache = new Map<string, { ceiling: ClassificationCeiling; at: number }>();
-
-/** The caller's Cognito groups, resolved from their sub (the pool aliases email, so
- *  the username is a distinct UUID: find the user by sub, then list their groups). */
-async function groupsForSub(sub: string, userPoolId: string): Promise<string[]> {
-  const found = await cognito.send(new ListUsersCommand({
-    UserPoolId: userPoolId,
-    Filter: `sub = "${sub}"`,
-    Limit: 1,
-  }));
-  const username = found.Users?.[0]?.Username;
-  if (!username) return [];
-  const g = await cognito.send(new AdminListGroupsForUserCommand({ UserPoolId: userPoolId, Username: username }));
-  return (g.Groups || []).map((x) => x.GroupName || '').filter(Boolean);
+/** The IAM role NAME from an IAM role ARN or an STS assumed-role ARN.
+ *   iam:  arn:aws:iam::<acct>:role/<name>
+ *   sts:  arn:aws:sts::<acct>:assumed-role/<name>/<session> */
+function roleNameFromArn(arn: string): string | null {
+  const m = /:(?:role|assumed-role)\/([^/]+)/.exec(arn);
+  return m ? m[1] : null;
 }
 
-/**
- * The caller's classification ceiling. `null` = Full. Cached per sub. On any Cognito
- * error, fail-closed to the floor (never widen access on a lookup failure).
- */
-export async function resolveCallerCeiling(sub: string, userPoolId: string): Promise<ClassificationCeiling> {
-  const hit = cache.get(sub);
-  const now = Date.now();
-  if (hit && now - hit.at < TTL_MS) return hit.ceiling;
-  let ceiling: ClassificationCeiling;
+// Role name -> ceiling, parsed once from CLASSIFICATION_ROLE_CEILINGS (JSON array of
+// { role: <arn>, ceiling: <classification | 'full'> }, emitted by the CognitoAuth stack).
+// 'full' -> null (Full). Absent/malformed -> empty map, so every caller fail-closes to the floor.
+type RoleCeilingEntry = { role: string; ceiling: string };
+let roleCeilingByName: Map<string, ClassificationCeiling> | undefined;
+function roleCeilings(): Map<string, ClassificationCeiling> {
+  if (roleCeilingByName) return roleCeilingByName;
+  const map = new Map<string, ClassificationCeiling>();
   try {
-    ceiling = ceilingFromGroups(await groupsForSub(sub, userPoolId));
+    const arr = JSON.parse(process.env.CLASSIFICATION_ROLE_CEILINGS || '[]') as RoleCeilingEntry[];
+    for (const { role, ceiling } of arr) {
+      const name = roleNameFromArn(role);
+      if (name) map.set(name, ceiling === 'full' ? null : ceiling);
+    }
   } catch (err) {
-    console.warn('[caller-scope] ceiling lookup failed, fail-closed to floor:', err);
-    ceiling = FLOOR_CLASSIFICATION;
+    console.warn('[caller-scope] CLASSIFICATION_ROLE_CEILINGS parse failed -> callers fail-closed to floor:', err);
   }
-  cache.set(sub, { ceiling, at: now });
-  return ceiling;
+  roleCeilingByName = map;
+  return map;
 }
 
 /**
- * The classification ceiling to enforce for a request. Call ONLY when the request
- * is IAM-enforced (`isAdminIamEnforcedCall`). FAIL-CLOSED: if the verified sub
- * cannot be extracted from the signed principal (an unexpected
- * `cognitoAuthenticationProvider` shape, or a non-Identity-Pool principal), return
- * the floor rather than `null` (Full) - a control that cannot identify the caller
- * must narrow, never widen. This is the single seam so the fail-open cannot be
- * reintroduced at a call site.
+ * The classification ceiling to enforce for a request. Call ONLY when the request is IAM-enforced
+ * (`isAdminIamEnforcedCall`). Resolved from the caller's assumed-role ARN with NO network call.
+ * FAIL-CLOSED: if the role cannot be extracted or is not in the map, return the floor rather than
+ * `null` (Full) - a control that cannot identify the caller must narrow, never widen. This is the
+ * single seam so the fail-open cannot be reintroduced at a call site. Synchronous (no I/O); callers
+ * may `await` it harmlessly.
  */
-export async function ceilingForRequest(event: APIGatewayProxyEvent, userPoolId: string): Promise<ClassificationCeiling> {
-  if (!userPoolId) {
-    console.warn('[caller-scope] no USER_POOL_ID configured under enforcement -> fail-closed to floor');
+export function ceilingForRequest(event: APIGatewayProxyEvent, _userPoolId?: string): ClassificationCeiling {
+  const userArn = (event.requestContext?.identity as { userArn?: string | null } | undefined)?.userArn;
+  const roleName = userArn ? roleNameFromArn(userArn) : null;
+  if (!roleName) {
+    console.warn('[caller-scope] IAM-enforced call with no resolvable role ARN -> fail-closed to floor');
     return FLOOR_CLASSIFICATION;
   }
-  const sub = iamCallerSub(event);
-  if (!sub) {
-    console.warn('[caller-scope] IAM-enforced call with no resolvable sub -> fail-closed to floor');
+  const map = roleCeilings();
+  if (!map.has(roleName)) {
+    console.warn(`[caller-scope] role "${roleName}" not in the ceiling map -> fail-closed to floor`);
     return FLOOR_CLASSIFICATION;
   }
-  return resolveCallerCeiling(sub, userPoolId);
+  return map.get(roleName)!;
 }
 
-/** Test-only: clear the module cache. */
+/** Test-only: reset the parsed role-ceiling map so a test can re-set the env. */
 export function __clearCeilingCache(): void {
-  cache.clear();
+  roleCeilingByName = undefined;
 }
 
 // A14 Scoped for the ANALYTICS plane: drop result rows whose classification

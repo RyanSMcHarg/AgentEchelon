@@ -165,8 +165,10 @@ export async function signIn(
   await page.locator('input[type="password"]').fill(password);
   await page.locator('button[type="submit"]').click();
 
-  // Wait for authenticated UI
-  await page.waitForSelector('.app-header', { timeout: 30000 });
+  // Wait for authenticated UI. Post the admin/chat split (SPEC-SEPARATE-ADMIN-APP.md) this helper
+  // signs into EITHER app: the chat SPA lands on `.app-header`, the admin console on
+  // `.admin-dashboard`. Accept whichever renders.
+  await page.waitForSelector('.app-header, .admin-dashboard', { timeout: 30000 });
 }
 
 /**
@@ -202,6 +204,22 @@ export async function createConversation(
 
   // Submit
   await page.locator('button:has-text("Create Conversation")').click();
+
+  // Wait for the NEW conversation to actually become active before doing
+  // anything else. The modal (NewConversationModal.handleSubmit) `await`s the
+  // provider's createConversation — which creates the channel AND calls
+  // setActiveConversation — and only THEN calls onClose(). So the modal
+  // detaching is the authoritative "the new conversation is now active" signal.
+  //
+  // Without this wait the helper races: `.conversation-header` and the welcome
+  // it checks next are BOTH still satisfied by the PREVIOUS conversation (its
+  // header/messages linger until the new channel finishes creating), so the
+  // helper would return and the caller's first `sendAndWaitForResponse` would
+  // fill+Enter while the old conversation is still active — sending the message
+  // to the WRONG channel (confirmed via trace: the Chime SendChannelMessage
+  // POST targeted the prior channel's ARN). Gating on the modal close makes the
+  // active-conversation swap a happens-before for the send.
+  await page.locator('.ncm-modal').waitFor({ state: 'hidden', timeout: 20000 });
 
   // Wait for conversation to load
   await page.waitForSelector('.conversation-header', { timeout: 15000 });
@@ -248,7 +266,8 @@ function looksLikeWelcomeOrEnvelope(text: string): boolean {
   return (
     /"Messages"\s*:\s*\[\s*\{\s*"Content"/.test(text) || // raw Lex-fulfillment JSON envelope
     text.includes('your assistant for this conversation') || // router/tier welcome (parsed)
-    text.includes("I'm your AI assistant") // basic welcome (parsed)
+    text.includes("I'm your AI assistant") || // basic welcome (parsed)
+    text.includes("I'm your assistant at") // config-driven orientation welcome ("…assistant at <company>…")
   );
 }
 

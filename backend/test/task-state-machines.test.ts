@@ -17,6 +17,25 @@ import {
   type TaskStateMachine,
 } from '../lambda/src/lib/task-state-machines.js';
 import { getIntentPack, taskStateMachines, _resetIntentPackCache } from '../lambda/src/lib/intent-pack.js';
+import { shouldMarkTaskCompleted } from '../lambda/src/lib/task-tracking.js';
+
+describe('shouldMarkTaskCompleted — lifecycle status follows the machine terminal (AT6)', () => {
+  it('is FALSE for a machine-backed task in a non-terminal state (no more Completed-vs-extracting)', () => {
+    expect(shouldMarkTaskCompleted('data_extraction', 'extracting')).toBe(false);
+    expect(shouldMarkTaskCompleted('data_extraction', 'collecting_requirements')).toBe(false);
+    expect(shouldMarkTaskCompleted('report_generation', 'generating')).toBe(false);
+  });
+  it('is TRUE once the machine reaches a terminal state', () => {
+    expect(shouldMarkTaskCompleted('data_extraction', 'completed')).toBe(true);
+    expect(shouldMarkTaskCompleted('report_generation', 'completed')).toBe(true);
+    expect(shouldMarkTaskCompleted('guided_troubleshooting', 'resolved')).toBe(true);
+    expect(shouldMarkTaskCompleted('guided_troubleshooting', 'escalated')).toBe(true);
+  });
+  it('is TRUE for a task with NO state machine (lightweight/single-turn completes as before)', () => {
+    expect(shouldMarkTaskCompleted('general', 'anything')).toBe(true);
+    expect(shouldMarkTaskCompleted(undefined, undefined)).toBe(true);
+  });
+});
 
 describe('task state machine graphs', () => {
   it('the DEFAULT machines all validate', () => {

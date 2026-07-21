@@ -407,8 +407,12 @@ async function getTaskDetails(
   // Optional intent filter — this is also the Effectiveness L2 task list (drill from an intent to its
   // tasks). `$3 IS NULL` keeps the unfiltered Quality>Tasks behavior; set it for the L2 drill.
   const intent = params.intent || null;
+  const agentType = params.agentType || null; // Effectiveness "one assistant" scope (agent_type = responder).
   const result = await query(
     `SELECT task_id,
+            -- One task lives in one channel, so MAX picks that channel_arn for the "view conversation"
+            -- deep-link (the Effectiveness drill jumps from a task to its raw conversation log).
+            MAX(channel_arn) AS channel_arn,
             COALESCE(MAX(intent), 'unknown') AS type,
             MAX(task_status) AS status,
             -- Machine state as of the latest turn (SPEC-TASK-STATE-TRANSITIONS §6). Distinct from
@@ -424,10 +428,11 @@ async function getTaskDetails(
       WHERE task_id IS NOT NULL
         AND created_at >= NOW() - INTERVAL '1 day' * $1
         AND ($3::varchar IS NULL OR intent = $3)
+        AND ($4::varchar IS NULL OR agent_type = $4)
       GROUP BY task_id
       ORDER BY MAX(created_at) DESC
       LIMIT $2`,
-    [days, limit, intent]
+    [days, limit, intent, agentType]
   );
   return success({ data: result.rows });
 }
@@ -447,6 +452,7 @@ async function getTaskTimeline(
   const result = await query(
     `SELECT e.id AS exchange_id,
             e.agent_message_id,
+            e.channel_arn,
             e.intent,
             e.task_status,
             e.task_state,
@@ -1486,6 +1492,12 @@ async function getIntentEffectiveness(
 ): Promise<APIGatewayProxyResult> {
   const days = Math.min(parseInt(params.days || '30', 10), 180);
   const intent = params.intent || null; // null => L0 (all intents); set => L1 (one intent)
+  // Optional ASSISTANT filter ($3) — scope the whole view to the exchanges/flows a SPECIFIC ASSISTANT
+  // answered, via `agent_type` (the responder's identity), NOT `user_type` (the conversation's tier). They
+  // coincide today (agent_type is written as the classification, AgentType = basic|standard|premium), but
+  // agent_type is the correct, future-proof handle for "this assistant" once multiple assistants serve one
+  // classification. Null ⇒ all assistants. Used by the "view this assistant's effectiveness" link.
+  const agentType = params.agentType || null;
 
   const result = await query(
     `WITH ex_agg AS (
@@ -1503,7 +1515,12 @@ async function getIntentEffectiveness(
               ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.total_ms)::numeric, 0) AS p95_total_ms,
               ROUND(AVG(m.input_tokens)::numeric, 0) AS avg_input_tokens,
               ROUND(AVG(m.output_tokens)::numeric, 0) AS avg_output_tokens,
-              MODE() WITHIN GROUP (ORDER BY m.bedrock_model) AS dominant_model
+              MODE() WITHIN GROUP (ORDER BY m.bedrock_model) AS dominant_model,
+              -- Portable-profile attribution (which assistant + version served this intent's traffic),
+              -- read from the per-turn metadata stamped by the async processor. NULL on pre-attribution rows.
+              MODE() WITHIN GROUP (ORDER BY m.metadata->>'profileName') AS assistant,
+              MODE() WITHIN GROUP (ORDER BY m.metadata->>'profileVersion') AS profile_version,
+              MODE() WITHIN GROUP (ORDER BY m.metadata->>'profileConfigId') AS profile_config_id
          FROM exchanges e
          LEFT JOIN messages m ON e.agent_message_id = m.id
          -- One relevance per exchange (a re-scored exchange has multiple evaluation_results rows;
@@ -1517,6 +1534,7 @@ async function getIntentEffectiveness(
         WHERE e.created_at >= NOW() - INTERVAL '1 day' * $1
           AND e.intent IS NOT NULL
           AND ($2::varchar IS NULL OR e.intent = $2)
+          AND ($3::varchar IS NULL OR e.agent_type = $3)
         GROUP BY e.intent
      ),
      flow_agg AS (
@@ -1531,6 +1549,14 @@ async function getIntentEffectiveness(
          FROM intent_flows f
         WHERE f.created_at >= NOW() - INTERVAL '1 day' * $1
           AND ($2::varchar IS NULL OR f.intent = $2)
+          AND ($3::varchar IS NULL OR f.agent_type = $3)
+          -- Completion measures MULTI-STEP tasks. A one-shot request that opened a flow but was
+          -- answered in a single exchange (and so never reached 'completed') is a direct answer, not a
+          -- failed task; counting it dragged the rate to a misleading red 0%. Count a flow only when it
+          -- is genuinely multi-step (exchange_count > 1) OR it actually completed (a legitimately
+          -- one-turn-completed task still counts). An intent with only single-exchange, non-completed
+          -- flows then yields NO row here → task_completion_rate is NULL → the UI renders "—".
+          AND (f.exchange_count > 1 OR f.status = 'completed')
         GROUP BY f.intent
      ),
      tool_agg AS (
@@ -1550,6 +1576,7 @@ async function getIntentEffectiveness(
         WHERE e.created_at >= NOW() - INTERVAL '1 day' * $1
           AND e.intent IS NOT NULL
           AND ($2::varchar IS NULL OR e.intent = $2)
+          AND ($3::varchar IS NULL OR e.agent_type = $3)
         GROUP BY e.intent
      )
      SELECT ex_agg.intent,
@@ -1569,6 +1596,9 @@ async function getIntentEffectiveness(
             ex_agg.avg_input_tokens,
             ex_agg.avg_output_tokens,
             ex_agg.dominant_model,
+            ex_agg.assistant,
+            ex_agg.profile_version,
+            ex_agg.profile_config_id,
             COALESCE(ta.tool_calls, 0) AS tool_calls,
             COALESCE(ta.tool_errors, 0) AS tool_errors,
             ROUND(COALESCE(ta.tool_errors * 100.0 / NULLIF(ta.tool_calls, 0), 0)::numeric, 1) AS tool_error_rate
@@ -1576,7 +1606,7 @@ async function getIntentEffectiveness(
        LEFT JOIN flow_agg fa ON fa.intent = ex_agg.intent
        LEFT JOIN tool_agg ta ON ta.intent = ex_agg.intent
       ORDER BY ex_agg.exchange_count DESC`,
-    [days, intent]
+    [days, intent, agentType]
   );
 
   // Cost column (D4): resolve tokens × model rate to a per-reply USD estimate in JS (the rate table is
@@ -1613,11 +1643,13 @@ async function getIntentExchanges(
   if (!intent) return success({ data: [] });
   const days = Math.min(parseInt(params.days || '30', 10), 180);
   const limit = Math.min(parseInt(params.limit || '100', 10), 500);
+  const agentType = params.agentType || null; // Effectiveness "one assistant" scope (agent_type = responder).
 
   const result = await query(
     `SELECT e.id AS exchange_id,
             e.agent_message_id,
             e.task_id,
+            e.channel_arn,
             e.intent_confidence,
             e.was_rerouted,
             e.delivery_option,
@@ -1637,9 +1669,10 @@ async function getIntentExchanges(
        ) er ON er.exchange_id = e.id
       WHERE e.intent = $1
         AND e.created_at >= NOW() - INTERVAL '1 day' * $2
+        AND ($4::varchar IS NULL OR e.agent_type = $4)
       ORDER BY e.created_at DESC
       LIMIT $3`,
-    [intent, days, limit]
+    [intent, days, limit, agentType]
   );
   return success({ data: result.rows });
 }

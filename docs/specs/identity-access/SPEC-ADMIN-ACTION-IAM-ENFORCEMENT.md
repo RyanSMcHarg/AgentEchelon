@@ -248,14 +248,19 @@ in `ae-cognito` mode and require the IAM plane only in `service` / `federated` m
 **Remaining (by design or deploy-validated):**
 
 - **The `Scoped` cells.** Two axes: (a) **tier-ceiling** is BUILT for both the admin-conversations plane
-  and the analytics plane. Under IAM authorization the handler reads the caller's `sub` from
-  `event.requestContext.identity.cognitoAuthenticationProvider` (`iamCallerSub`) and resolves their
-  classification ceiling from their Cognito groups (`lib/caller-scope.ts`: highest classification group;
-  `admins`/`platform-admins` are Full; a persona with no classification group is fail-closed to the
-  floor). Conversations: the list is filtered and the per-channel message / membership-history reads are
-  guarded (fail-closed). Analytics: `scopeAnalyticsRows` drops result rows whose classification dimension
-  exceeds the ceiling (a global aggregate with no tier column is not narrowed - a deployer choice). The
-  runtime Cognito lookup is deploy-verified; the ceiling/filter logic is unit tested. (b) **ownership /
+  and the analytics plane. Under IAM authorization the handler resolves the caller's classification
+  ceiling from the **assumed-role ARN** the request already carries
+  (`event.requestContext.identity.userArn`, read in `lib/caller-scope.ts`). The Identity Pool mapped the
+  caller's Cognito groups to a per-clearance role at credential-vend time, outside the VPC, so the role
+  is itself the authoritative, already-resolved clearance: an admin / full-access role is Full, each
+  per-classification role is that tier, and an unrecognized or floor role is fail-closed to the floor.
+  This mirrors how `credential-exchange` bakes clearance into the assumed role rather than re-querying
+  Cognito, so the VPC-attached analytics Lambda needs no network path to the Cognito API (no `cognito-idp`
+  VPC endpoint or NAT). Conversations: the list is filtered and the per-channel message /
+  membership-history reads are guarded (fail-closed). Analytics: `scopeAnalyticsRows` drops result rows
+  whose classification dimension exceeds the ceiling (a global aggregate with no tier column is not
+  narrowed, a deployer choice). The role-to-ceiling map is supplied by the CognitoAuth stack (it owns the
+  per-clearance role ARNs); the ceiling/filter logic is unit tested. (b) **ownership /
   membership** (an AI developer's "own assistants", a manager's "own use-case channels") stays a
   **deployment choice** per the section 2 implementer note - the platform has no generic "who owns which
   channel or assistant" model, so a deployer defines it.

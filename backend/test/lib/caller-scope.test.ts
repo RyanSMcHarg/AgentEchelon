@@ -1,10 +1,10 @@
 /**
- * A14 Scoped (tier-ceiling) — the pure classification-ceiling logic
- * (lib/caller-scope.ts) + the IAM sub extraction (lib/auth.ts iamCallerSub).
- * The Cognito lookup itself is exercised on deploy; these pin the decision logic.
+ * A14 Scoped (tier-ceiling) — the pure classification-ceiling logic (lib/caller-scope.ts) + the
+ * IAM sub extraction (lib/auth.ts iamCallerSub). `ceilingForRequest` resolves the caller's ceiling
+ * from their assumed-role ARN against the CDK-supplied role -> ceiling map (no Cognito call).
  */
 import type { APIGatewayProxyEvent } from 'aws-lambda';
-import { ceilingFromGroups, classificationAllowed, classificationRank, scopeAnalyticsRows, ceilingForRequest } from '../../lambda/src/lib/caller-scope';
+import { ceilingFromGroups, classificationAllowed, classificationRank, scopeAnalyticsRows, ceilingForRequest, __clearCeilingCache } from '../../lambda/src/lib/caller-scope';
 import { iamCallerSub } from '../../lambda/src/lib/auth';
 
 describe('ceilingFromGroups', () => {
@@ -71,15 +71,37 @@ describe('scopeAnalyticsRows', () => {
   });
 });
 
-describe('ceilingForRequest — fail-closed (no fail-open)', () => {
-  it('an enforced call with NO resolvable sub fails closed to the floor (never null/Full)', async () => {
-    // Unparseable provider string -> iamCallerSub null -> must NOT be Full.
-    const ev = iamEvent('not-a-cognito-provider');
-    await expect(ceilingForRequest(ev, 'us-east-1_POOL')).resolves.toBe('basic');
+describe('ceilingForRequest — role-ARN resolution (fail-closed, no fail-open)', () => {
+  const ADMIN_ROLE = 'arn:aws:iam::111122223333:role/App-AdminAuthenticatedRole-abc';
+  const STD_ROLE = 'arn:aws:iam::111122223333:role/App-StandardRole-def';
+  const assumed = (name: string) => `arn:aws:sts::111122223333:assumed-role/${name}/CognitoIdentityCredentials`;
+  const roleEvent = (userArn: string | null): APIGatewayProxyEvent =>
+    ({ requestContext: { identity: { userArn } } } as unknown as APIGatewayProxyEvent);
+
+  beforeEach(() => {
+    process.env.CLASSIFICATION_ROLE_CEILINGS = JSON.stringify([
+      { role: ADMIN_ROLE, ceiling: 'full' },
+      { role: STD_ROLE, ceiling: 'standard' },
+    ]);
+    __clearCeilingCache();
   });
-  it('a missing USER_POOL_ID fails closed to the floor', async () => {
-    const ev = iamEvent('cognito-idp.us-east-1.amazonaws.com/p:CognitoSignIn:abc');
-    await expect(ceilingForRequest(ev, '')).resolves.toBe('basic');
+  afterEach(() => {
+    delete process.env.CLASSIFICATION_ROLE_CEILINGS;
+    __clearCeilingCache();
+  });
+
+  it('an admin / full-access role => Full (null)', () => {
+    expect(ceilingForRequest(roleEvent(assumed('App-AdminAuthenticatedRole-abc')))).toBeNull();
+  });
+  it('a per-classification role => that tier', () => {
+    expect(ceilingForRequest(roleEvent(assumed('App-StandardRole-def')))).toBe('standard');
+  });
+  it('a role NOT in the map fails closed to the floor (never null/Full)', () => {
+    expect(ceilingForRequest(roleEvent(assumed('App-SomeOtherRole-xyz')))).toBe('basic');
+  });
+  it('no resolvable role ARN fails closed to the floor', () => {
+    expect(ceilingForRequest(roleEvent(null))).toBe('basic');
+    expect(ceilingForRequest(roleEvent('garbage'))).toBe('basic');
   });
 });
 

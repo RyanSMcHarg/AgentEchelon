@@ -40,7 +40,9 @@ const SECTION_QUERIES: Record<string, string[]> = {
     'error_rate_daily',
   ],
   Conversations: ['conversation_summaries', 'drift_events'],
-  Quality: ['evaluation_scores'],
+  // Section label is "Effectiveness" (SECTIONS id `quality`); its default sub-tab is
+  // `effectiveness` → queryType `intent_effectiveness` (AdminDashboard.tsx QUERIES_BY_TAB).
+  Effectiveness: ['intent_effectiveness'],
   Models: ['model_usage', 'model_effectiveness'],
   Experiments: ['experiment_results'],
   Users: [
@@ -155,7 +157,7 @@ test.describe('Admin Dashboard - render validation (live)', () => {
       : 'athena';
     console.log(`[render] analytics mode (per badge): ${mode}`);
 
-    const sections = ['Overview', 'Conversations', 'Quality', 'Models', 'Experiments', 'Users'];
+    const sections = ['Overview', 'Conversations', 'Effectiveness', 'Models', 'Experiments', 'Users'];
     const perSection: Record<string, { banners: { errors: string[]; notices: string[] }; metrics: Record<string, string>; headings: string[]; tableRows: number }> = {};
 
     for (const section of sections) {

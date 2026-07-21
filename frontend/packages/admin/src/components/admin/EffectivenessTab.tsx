@@ -30,11 +30,28 @@ interface EffectivenessTabProps {
   data: AnalyticsResult | null; // L0 intent_effectiveness
   dateRange: AnalyticsDateRange;
   isLoading: boolean;
+  /** Open a conversation's detail (messages + raw event log) from a drilled exchange/task/turn. Deep-
+   *  links into the Conversations tab (AdminDashboard.openConversation). Lets an admin jump from an
+   *  analytics row to the actual conversation to see what the exchange really looked like. */
+  onOpenConversation?: (channelArn: string) => void;
+  /** Register a "close one drill level first" handler so the console's global Back steps L3→L2→L1→L0
+   *  through the drill before it walks the tab history (mirrors ConversationsTab). null at L0. */
+  registerBack?: (close: (() => void) | null) => void;
+  /** The drill position, LIFTED to the parent so it survives this tab unmounting on a tab switch — e.g.
+   *  "View conversation" navigates to the Conversations tab and Back returns you to the SAME drill level
+   *  instead of resetting to L0. Optional: falls back to internal state when the parent doesn't own it. */
+  drill?: Drill;
+  onDrillChange?: React.Dispatch<React.SetStateAction<Drill>>;
+  /** When set, the whole view is scoped to ONE assistant's classification (basic/standard/premium) —
+   *  arrived at via the Assistants tab's "view this assistant's effectiveness" link. Shows a filter banner
+   *  and scopes the drill queries. Null ⇒ all classifications. */
+  classification?: string | null;
+  onClearClassification?: () => void;
 }
 
 type Row = Record<string, unknown>;
 
-type Drill =
+export type Drill =
   | { level: 0 }
   | { level: 1; intent: string }
   | { level: 2; intent: string; delivery: 'direct' | 'task' }
@@ -74,6 +91,23 @@ const fmtUsd = (v: unknown): string => {
   return Number.isFinite(n) ? `$${n.toFixed(4)}` : '—';
 };
 const shortId = (v: unknown): string => (v == null ? '—' : String(v).slice(0, 8) + '…');
+
+/** A "view raw conversation log" link for a drilled row carrying a channel_arn. Clicking it deep-links
+ *  into the Conversations tab detail (messages + raw event log) so an admin can see the actual exchange.
+ *  stopPropagation keeps a row-level click (the drill) from also firing. */
+function ConvLink({ channelArn, onOpen }: { channelArn: unknown; onOpen?: (arn: string) => void }) {
+  const arn = channelArn ? String(channelArn) : '';
+  if (!arn || !onOpen) return <span style={{ color: 'var(--status-neutral)' }}>—</span>;
+  return (
+    <button
+      className="admin-link-btn"
+      title="Open the raw conversation log for this exchange"
+      onClick={(e) => { e.stopPropagation(); onOpen(arn); }}
+    >
+      View conversation
+    </button>
+  );
+}
 /** Format a value through its metricTargets formatter (MetricCard colors via rawValue+target). */
 const fmtBy = (v: unknown, key: string): string => {
   const t = METRIC_TARGETS[key];
@@ -120,6 +154,7 @@ const L0Dashboard: React.FC<{ rows: Row[]; onPick: (intent: string) => void }> =
     <DataTable
       data={ranked}
       emptyMessage="No intent activity for this period"
+      onRowClick={(row) => onPick(String(row.intent))}
       columns={[
         {
           key: 'intent',
@@ -138,7 +173,9 @@ const L0Dashboard: React.FC<{ rows: Row[]; onPick: (intent: string) => void }> =
           render: (v, row) => (
             <span>
               <StatusValue value={v} targetKey="intent_confidence" />
-              <span style={{ color: 'var(--status-neutral)', fontSize: 12 }}> · reroute <StatusValue value={row.reroute_rate} targetKey="intent_reroute_rate" /></span>
+              <span style={{ color: 'var(--status-neutral)', fontSize: 12 }}> · rerouted away <StatusValue value={row.reroute_rate} targetKey="intent_reroute_rate" />
+                <InfoTooltip label="About rerouted-away" content="Share of exchanges the classifier first assigned to THIS intent but then re-routed to a different one — i.e. this intent was over-triggered and corrected away. High = a taxonomy/classifier boundary problem here, distinct from whether the work then succeeded." />
+              </span>
             </span>
           ),
         },
@@ -230,9 +267,17 @@ const L1Intent: React.FC<{ row: Row; toolLens: ToolAgg[] | null; onDrill: (deliv
   const hasDirect = (num(row.direct_count) || 0) > 0;
   return (
     <div>
+      {row.assistant != null && (
+        <p className="admin-tab-description" style={{ fontSize: '0.9em', marginBottom: 8 }}>
+          Served by assistant <strong>{String(row.assistant)}</strong>
+          {row.profile_version != null && <> · profile <strong>v{String(row.profile_version)}</strong></>}
+          {row.profile_config_id != null && <> <span className="admin-muted">(config {String(row.profile_config_id).slice(0, 12)})</span></>}
+          {' '}— the portable profile version that produced this intent's traffic in the window.
+        </p>
+      )}
       <div className="admin-metrics-row">
         <MetricCard title="Classification confidence" value={fmtBy(row.avg_confidence, 'intent_confidence')} rawValue={num(row.avg_confidence)} target={METRIC_TARGETS.intent_confidence} />
-        <MetricCard title="Reroute rate" value={fmtBy(row.reroute_rate, 'intent_reroute_rate')} rawValue={num(row.reroute_rate)} target={METRIC_TARGETS.intent_reroute_rate} />
+        <MetricCard title="Rerouted away" value={fmtBy(row.reroute_rate, 'intent_reroute_rate')} rawValue={num(row.reroute_rate)} target={METRIC_TARGETS.intent_reroute_rate} tooltip="Share of exchanges the classifier first assigned to this intent but then re-routed to a different one (this intent was over-triggered and corrected away). High = a classifier/taxonomy boundary problem for this intent." />
         <MetricCard title={ax.label} value={fmtBy(ax.value, ax.targetKey)} rawValue={ax.value} target={METRIC_TARGETS[ax.targetKey]} />
         <MetricCard title="Avg latency" value={fmtMs(row.avg_total_ms)} subtitle={`p95 ${fmtMs(row.p95_total_ms)}`} rawValue={num(row.avg_total_ms)} target={METRIC_TARGETS.avg_total_ms} />
         <MetricCard title="Cost / reply" value={fmtUsd(row.cost_per_reply_usd)} subtitle={row.dominant_model ? String(row.dominant_model) : undefined} rawValue={num(row.cost_per_reply_usd)} target={METRIC_TARGETS.cost_per_reply} />
@@ -242,6 +287,15 @@ const L1Intent: React.FC<{ row: Row; toolLens: ToolAgg[] | null; onDrill: (deliv
         {hasDirect && <button className="admin-filter-btn" onClick={() => onDrill('direct')}>Exchanges ({num(row.direct_count) || 0})</button>}
         {hasTasks && <button className="admin-filter-btn" onClick={() => onDrill('task')}>Tasks ({num(row.task_count) || 0})</button>}
       </div>
+      <p className="admin-tab-description" style={{ fontSize: '0.9em', marginTop: 12 }}>
+        <strong>How tools relate to tasks here.</strong> Each turn runs a <em>tool loop</em>: the assistant
+        reasons, optionally calls one or more tools, observes their results, then answers. A multi-step
+        <strong> task</strong> (e.g. <code>data_extraction</code>) is several such turns, each advancing the
+        task's machine state. The panel below <em>aggregates</em> which tools this intent's assistant invoked
+        across all its turns (and each tool's error rate). To see <strong>which tool ran in which task turn</strong>,
+        open <strong>Tasks</strong> above → a task's turn-by-turn <strong>timeline</strong> → expand a turn to its
+        <strong> tool-loop steps</strong> (each step shows its model and the tools it called, ✓ / ✗ with the error class).
+      </p>
       <ToolLensPanel tools={toolLens} />
     </div>
   );
@@ -350,9 +404,12 @@ const FlowScorePanel: React.FC<{ flow: Row }> = ({ flow }) => {
 };
 
 // ---- the tab: L0 dashboard + drill state -----------------------------------------------------------
-const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, isLoading }) => {
+const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, isLoading, onOpenConversation, registerBack, drill: drillProp, onDrillChange, classification, onClearClassification }) => {
   const l0Rows = useMemo(() => (data?.data ?? []) as Row[], [data]);
-  const [drill, setDrill] = useState<Drill>({ level: 0 });
+  // Use the parent-owned drill when provided (survives tab-switch unmounts — C2); else internal state.
+  const [internalDrill, setInternalDrill] = useState<Drill>({ level: 0 });
+  const drill = drillProp ?? internalDrill;
+  const setDrill = onDrillChange ?? setInternalDrill;
   const [drillData, setDrillData] = useState<AnalyticsResult | null>(null);
   // L3 only: the task's holistic flow score (evaluation_flows) — the 5 weighted dimensions folded into
   // the drill so the Flows detail lives here instead of a separate tab.
@@ -404,16 +461,18 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
       setDrillLoading(true);
       setFlowSummary(null);
       try {
+        // Scope the drill to the same assistant (agent_type) as the L0 view when the filter is set.
+        const clsExtra = classification ? { agentType: classification } : {};
         if (drill.level === 2 && drill.delivery === 'direct') {
           const [ex, ev] = await Promise.all([
-            queryAnalytics('intent_exchanges', dateRange, { intent: drill.intent }),
+            queryAnalytics('intent_exchanges', dateRange, { intent: drill.intent, ...clsExtra }),
             queryAnalytics('evaluation_exchanges', dateRange, { limit: '200' }),
           ]);
           const evalById = new Map(((ev?.data ?? []) as Row[]).map((r) => [String(r.id ?? r.exchange_id), r]));
           const merged = ((ex?.data ?? []) as Row[]).map((r) => ({ ...r, _eval: evalById.get(String(r.exchange_id)) ?? null }));
           if (!cancelled) setDrillData({ data: merged as unknown as AnalyticsResult['data'], columns: [] });
         } else if (drill.level === 2) {
-          const res = await queryAnalytics('task_details', dateRange, { intent: drill.intent });
+          const res = await queryAnalytics('task_details', dateRange, { intent: drill.intent, ...clsExtra });
           if (!cancelled) setDrillData(res ?? null);
         } else if (drill.level === 3) {
           const [tl, flows] = await Promise.all([
@@ -431,7 +490,23 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
     }
     run();
     return () => { cancelled = true; };
-  }, [drill, dateRange]);
+  }, [drill, dateRange, classification]);
+
+  // Back integration (issue: global Back skipped the drill). Register a closer that pops ONE drill level
+  // so the console's in-app Back and browser Back step L3→L2→L1→L0 through the drill before walking the
+  // tab history. At L0 there is nothing to close, so register null and let Back move between tabs.
+  useEffect(() => {
+    if (!registerBack) return;
+    if (drill.level === 0) { registerBack(null); return; }
+    registerBack(() => {
+      setDrill((d) => {
+        if (d.level === 3) return { level: 2, intent: d.intent, delivery: 'task' };
+        if (d.level === 2) return { level: 1, intent: d.intent };
+        return { level: 0 };
+      });
+    });
+    return () => registerBack(null);
+  }, [drill, registerBack]);
 
   if (isLoading) return <div className="admin-tab-loading">Loading effectiveness…</div>;
 
@@ -457,6 +532,15 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
         <h3>Effectiveness</h3>
         {drill.level > 0 && <nav className="admin-breadcrumb" aria-label="Drill path">{crumbs}</nav>}
       </div>
+
+      {classification && (
+        <div className="admin-filter-banner" style={{ display: 'flex', alignItems: 'center', gap: 'var(--space-2)', padding: 'var(--space-2) var(--space-3)', marginBottom: 'var(--space-3)', border: '1px solid var(--surface-200)', borderRadius: 'var(--radius-md)', background: 'var(--surface-50, var(--surface-0))' }}>
+          <span>Scoped to the <strong>{classification}</strong> assistant. Every row, drill, and tool count below is only this classification's traffic.</span>
+          {onClearClassification && (
+            <button className="admin-inline-btn" style={{ marginLeft: 'auto' }} onClick={onClearClassification}>Clear filter ✕</button>
+          )}
+        </div>
+      )}
 
       {drill.level === 0 && (
         <>
@@ -497,18 +581,30 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
       {drill.level === 2 && (
         drillLoading ? <div className="admin-tab-loading">Loading…</div> :
         drill.delivery === 'task' ? (
+          <>
+          <p className="admin-tab-description" style={{ fontSize: '0.9em' }}>
+            Two different things track a task, side by side: <strong>Status</strong> is the <em>lifecycle</em> — is the
+            work done? (<code>in_progress → completed / failed / cancelled</code>, set by the processor).{' '}
+            <strong>Machine state</strong> is the task's position in its <em>declared flow</em>
+            (<code>collecting_requirements → extracting → validating → formatting → completed</code>), advanced by the
+            assistant via its <code>advance_task_state</code> tool. A task now reads Status=<em>completed</em> only once
+            its machine reaches a terminal state, so the two no longer contradict each other.
+          </p>
           <DataTable
             data={(drillData?.data ?? []) as Row[]}
             emptyMessage="No tasks for this intent"
+            onRowClick={(row) => setDrill({ level: 3, intent: drill.intent, taskId: String(row.task_id) })}
             columns={[
               { key: 'task_id', label: 'Task', render: (v) => <button className="admin-link-btn" onClick={() => setDrill({ level: 3, intent: drill.intent, taskId: String(v) })}>{shortId(v)}</button> },
-              { key: 'status', label: 'Status' },
-              { key: 'task_state', label: 'Machine state', render: (v) => (v ? String(v) : '—') },
+              { key: 'status', label: 'Status (lifecycle)' },
+              { key: 'task_state', label: 'Machine state (flow)', render: (v) => (v ? String(v) : '—') },
               { key: 'exchange_count', label: 'Turns', sortable: true },
               { key: 'transition_count', label: 'Transitions', sortable: true },
               { key: 'last_at', label: 'Last', render: (v) => (v ? new Date(String(v)).toLocaleString() : '—') },
+              { key: 'channel_arn', label: 'Conversation', sortable: false, render: (v) => <ConvLink channelArn={v} onOpen={onOpenConversation} /> },
             ]}
           />
+          </>
         ) : (
           <DataTable
             data={(drillData?.data ?? []) as Row[]}
@@ -524,6 +620,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
               { key: 'input_tokens', label: 'In', sortable: true },
               { key: 'output_tokens', label: 'Out', sortable: true },
               { key: 'bedrock_model', label: 'Model', render: (v) => (v ? String(v) : '—') },
+              { key: 'channel_arn', label: 'Conversation', sortable: false, render: (v) => <ConvLink channelArn={v} onOpen={onOpenConversation} /> },
             ]}
           />
         )
@@ -532,6 +629,16 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
       {drill.level === 3 && (
         drillLoading ? <div className="admin-tab-loading">Loading…</div> :
         <>
+          {/* The whole task lives in one conversation; a single link opens its raw log (all turns below). */}
+          {onOpenConversation && (() => {
+            const arn = String(((drillData?.data ?? [])[0] as Row | undefined)?.channel_arn ?? '');
+            return arn ? (
+              <p className="admin-tab-description" style={{ marginBottom: 'var(--space-2)' }}>
+                <ConvLink channelArn={arn} onOpen={onOpenConversation} />{' '}
+                <span style={{ color: 'var(--text-secondary)' }}>— see the actual messages for this task</span>
+              </p>
+            ) : null;
+          })()}
           {flowSummary
             ? <FlowScorePanel flow={flowSummary} />
             : <p className="admin-tab-description" style={{ fontStyle: 'italic', opacity: 0.8 }}>No holistic flow score for this task yet (the flow evaluator scores a multi-turn task once it has accumulated turns).</p>}

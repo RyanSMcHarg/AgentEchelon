@@ -111,6 +111,9 @@ Lex - is where the real work is decided:
 Lex dialog code hook ──► Fulfillment handler (tier-pinned)
    │
    ├─ WelcomeIntent (bot just joined)     → compose welcome + inject context, done
+   │                                        (opt-in: if an onboarding intake is configured AND this
+   │                                         user has not onboarded before, start the once-per-user
+   │                                         intake instead; see GUIDE-ASSISTANT-CONTEXT.md)
    └─ FallbackIntent (a real user turn):
         1. Resolve tier   = min(userTier, channelTier)   ← downgrade enforcement
         2. Classify intent (separate Haiku classifier; configurable)

@@ -288,10 +288,17 @@ exports.handler = async (event) => {
           modelId,
           modelName,
           modelTier: requestedTier,
-          // NOTE: the creator's sub is intentionally NOT stamped here. Name personalization moved off
-          // the WelcomeIntent (it fired before membership/metadata settled, so the name raced) and onto
-          // the user's FIRST real turn, where the async processor resolves the sender's name directly.
-          // So the welcome needs no owner identity in metadata (keeps Tenet 6 intact). [A3]
+          // createdBy — the creator's AppInstanceUser ARN (…/user/<sub>), server-set from the JWT
+          // callerSub (never the request body). This is the DURABLE welcome-time identity BACKUP for the
+          // once-per-user onboarding gate (SPEC-USER-PROFILE-AND-ONBOARDING.md): the WelcomeIntent fires
+          // on the bot's membership, BEFORE the creator's membership settles, so the router cannot always
+          // resolve the human from ListChannelMemberships at that instant. This value is written
+          // atomically with CreateChannel and is already read by the router on WelcomeIntent, so it is
+          // present with no race. It stays authoritative-by-membership at runtime (this is a read-only,
+          // immutable, creator-at-creation copy — it is never used to GRANT anything), so it does not
+          // reintroduce mutable-owner-copy staleness. The router prefers membership and falls back to
+          // this only when the human member has not propagated yet.
+          createdBy: userArn,
           // topic + triggerContext — read by the router on WelcomeIntent
           // (docs/SPEC-WELCOME-AND-CONTEXT.md). Both bounded to keep
           // Chime's 1KB Metadata cap headroom for everything else.
@@ -310,34 +317,15 @@ exports.handler = async (event) => {
 
     console.log('Conversation created by bot:', conversationArn);
 
-    // Step 1b: Explicitly enroll the bot as a DEFAULT channel member. This is what FIRES the bot's
-    // Lex WelcomeIntent: Chime invokes it on the bot's CHANNEL_MEMBERSHIP event (verified against live
-    // Chime + AWS docs — https://docs.aws.amazon.com/chime-sdk/latest/dg/welcome-intent.html). The
-    // creator (ChimeBearer=botArn) is auto-added as a channel member at CreateChannel, but that
-    // auto-membership does NOT fire the welcome — only this explicit CreateChannelMembership does; it
-    // also (idempotently) ensures ListChannelMemberships returns the bot, which @mention routing needs.
-    // NOTE: the welcome fires here, before/independent of the user's membership — which is exactly why
-    // the welcome is generic (no name) and the assistant greets the user by name on their first real
-    // turn instead. Non-fatal on ConflictException (the bot is already a member from creation).
-    try {
-      await messagingClient.send(
-        new CreateChannelMembershipCommand({
-          ChannelArn: conversationArn,
-          MemberArn: botArn,
-          Type: 'DEFAULT',
-          ChimeBearer: botArn,
-        })
-      );
-      console.log('Bot enrolled as channel member');
-    } catch (botMembershipErr) {
-      if (botMembershipErr.name === 'ConflictException') {
-        console.log('Bot already a member, continuing');
-      } else {
-        console.warn('[CreateChannel] Failed to enroll bot as member (non-fatal):', botMembershipErr);
-      }
-    }
-
-    // Step 2: Add the user as a member and moderator
+    // Step 1b: Add the USER as a member + moderator FIRST — BEFORE the bot membership that fires the
+    // welcome (step 1c). Ordering matters: the WelcomeIntent handler resolves the creator to gate
+    // once-per-user onboarding (SPEC-USER-PROFILE-AND-ONBOARDING), and it does so most reliably by
+    // reading the channel's human membership. If the user is added AFTER the welcome-firing bot
+    // membership, that membership has not settled when the welcome runs and the creator sometimes fails
+    // to resolve, re-onboarding an already-onboarded user (observed ~30% of the time). Adding the user
+    // first makes the creator present the instant the welcome fires. (The bot is already a member/
+    // moderator from CreateChannel via ChimeBearer=botArn, so the user-add does not depend on the
+    // explicit bot membership below.)
     try {
       await messagingClient.send(
         new CreateChannelMembershipCommand({
@@ -360,6 +348,33 @@ exports.handler = async (event) => {
     } catch (userError) {
       console.error('Failed to add user to conversation:', userError);
       throw new Error(`User could not be added to conversation: ${userError.message}`);
+    }
+
+    // Step 1c: Explicitly enroll the bot as a DEFAULT channel member. This is what FIRES the bot's
+    // Lex WelcomeIntent: Chime invokes it on the bot's CHANNEL_MEMBERSHIP event (verified against live
+    // Chime + AWS docs — https://docs.aws.amazon.com/chime-sdk/latest/dg/welcome-intent.html). The
+    // creator (ChimeBearer=botArn) is auto-added as a channel member at CreateChannel, but that
+    // auto-membership does NOT fire the welcome — only this explicit CreateChannelMembership does; it
+    // also (idempotently) ensures ListChannelMemberships returns the bot, which @mention routing needs.
+    // The user is now already a member (step 1b), so the WelcomeIntent's creator resolution is reliable.
+    // The welcome copy stays generic (the assistant still greets by name on the first real turn). Non-
+    // fatal on ConflictException (the bot is already a member from creation).
+    try {
+      await messagingClient.send(
+        new CreateChannelMembershipCommand({
+          ChannelArn: conversationArn,
+          MemberArn: botArn,
+          Type: 'DEFAULT',
+          ChimeBearer: botArn,
+        })
+      );
+      console.log('Bot enrolled as channel member');
+    } catch (botMembershipErr) {
+      if (botMembershipErr.name === 'ConflictException') {
+        console.log('Bot already a member, continuing');
+      } else {
+        console.warn('[CreateChannel] Failed to enroll bot as member (non-fatal):', botMembershipErr);
+      }
     }
 
     // Step 3: Associate the channel flow so the processor runs on every message.

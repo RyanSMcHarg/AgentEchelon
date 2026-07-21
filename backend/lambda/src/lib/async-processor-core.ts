@@ -46,7 +46,7 @@ import {
   IMAGE_GEN_MODELS,
   type ImageGenModelKey,
 } from './image-gen-models.js';
-import { updateTaskStatus, getTask, recordNoTransitionTurn, TASK_STATE_MACHINES, type TaskStatus, type Task } from './task-tracking.js';
+import { updateTaskStatus, getTask, recordNoTransitionTurn, shouldMarkTaskCompleted, TASK_STATE_MACHINES, type TaskStatus, type Task } from './task-tracking.js';
 import {
   ADVANCE_TASK_STATE_TOOL_NAME,
   taskToolSpecsFor,
@@ -406,6 +406,10 @@ export interface AsyncProcessorConfig {
   maxTokens: number;
   temperature?: number;
   userType: 'basic' | 'standard' | 'premium';
+  /** Per-profile tool ALLOWLIST (the active version's `tools`). Gates WHICH registered tools this
+   *  assistant may use, intersected with each tool's runtime availability. `undefined` ⇒ all available
+   *  tools (legacy/unset — byte-identical to the pre-allowlist behavior). SPEC-ASSISTANT-CONFIG §4. */
+  tools?: string[];
 }
 
 export interface LongResponseResult {
@@ -825,15 +829,21 @@ const COMPANY_CONTEXT_TOOL_CONFIG = {
       toolSpec: {
         name: 'load_company_context',
         description:
-          'Retrieve the company, product, pricing, plan/FAQ, and (classification-permitting) ' +
-          'financial documents this assistant is allowed to read. Call this before ' +
-          'answering ANY question about the company, its products, pricing, plans, or ' +
-          'financials. Returns only the documents this classification is permitted to access.',
+          'Retrieve specific company/product/pricing/plan/financial document(s) this assistant is allowed ' +
+          'to read, to answer a question about the company. Prefer naming the exact document(s) you need in ' +
+          '`documents` (filenames from the AVAILABLE COMPANY CONTEXT list) so you load only what the task ' +
+          'needs, not the whole corpus. Omit `documents` only for a genuinely broad question that spans many ' +
+          'docs. Returns only the documents this classification is permitted to access.',
         inputSchema: {
           json: {
             type: 'object',
             properties: {
               query: { type: 'string', description: 'What the user is asking about.' },
+              documents: {
+                type: 'array',
+                items: { type: 'string' },
+                description: 'The specific document FILENAME(s) to load (from AVAILABLE COMPANY CONTEXT), e.g. ["financial-data.json"]. Omit to load all permitted docs (broad questions only).',
+              },
             },
             required: [],
           },
@@ -879,6 +889,23 @@ const PLATFORM_INFO_TOOL_CONFIG = {
 export const WORK_ITEM_TOOL_NAMES = new Set([
   'add_item', 'update_item', 'remove_item', 'reorder_items', 'assign_item',
 ]);
+
+/** The tool name out of a Bedrock Converse `toolSpec` wrapper (for per-profile allowlist filtering). */
+function toolSpecName(spec: unknown): string {
+  return (spec as { toolSpec?: { name?: string } })?.toolSpec?.name ?? '';
+}
+
+/**
+ * Restrict runtime-available Converse toolSpecs to a profile's tool ALLOWLIST (SPEC-ASSISTANT-CONFIG §4).
+ * `undefined` allowlist ⇒ all available (legacy/unset — byte-identical to the pre-allowlist path); otherwise
+ * only specs whose tool name is in the allowlist survive. This is the INTERSECTION of "runtime available"
+ * (the caller already gated `specs` by availability) and "profile permits". Exported for unit testing.
+ */
+export function filterToolSpecsByProfile<T>(specs: T[], allow: string[] | undefined): T[] {
+  if (allow === undefined) return specs;
+  const permitted = new Set(allow);
+  return specs.filter((t) => permitted.has(toolSpecName(t)));
+}
 const WORK_ITEM_STATUS_ENUM = ['open', 'in_progress', 'blocked', 'done'];
 const WORK_ITEM_TOOL_CONFIG = {
   tools: [
@@ -1186,19 +1213,23 @@ export async function invokeBedrock(
   // active (one fewer distractor tool off-task). The tool result is the ONLY thing that changes
   // task state — the loop authorizes it against the graph and persists in-loop.
   const taskToolSpecs = taskContext ? taskToolSpecsFor(taskContext.task.taskType, taskContext.machines) : [];
-  const taskToolsOn = taskToolSpecs.length > 0;
-  const useTools = companyToolOn || enableEditTools || travelToolOn || taskToolsOn;
-  // Combined tool config: company-context + corporate-travel (both executed in-loop) +
-  // work-item tools (intercepted as proposals, never executed here) + task tools. Each defaults off.
-  const toolConfig = useTools
-    ? { tools: [
-        ...(companyToolOn ? COMPANY_CONTEXT_TOOL_CONFIG.tools : []),
-        ...(companyToolOn ? PLATFORM_INFO_TOOL_CONFIG.tools : []),
-        ...(travelToolOn ? [CORPORATE_TRAVEL_TOOL_SPEC] : []),
-        ...(enableEditTools ? WORK_ITEM_TOOL_CONFIG.tools : []),
-        ...taskToolSpecs,
-      ] }
-    : undefined;
+  // Combined tool surface: company-context + corporate-travel (both executed in-loop) + work-item tools
+  // (intercepted as proposals, never executed here) + task tools. Each is gated by its RUNTIME availability
+  // (companyToolOn / travelToolOn / enableEditTools / an active task).
+  const rawToolSpecs = [
+    ...(companyToolOn ? COMPANY_CONTEXT_TOOL_CONFIG.tools : []),
+    ...(companyToolOn ? PLATFORM_INFO_TOOL_CONFIG.tools : []),
+    ...(travelToolOn ? [CORPORATE_TRAVEL_TOOL_SPEC] : []),
+    ...(enableEditTools ? WORK_ITEM_TOOL_CONFIG.tools : []),
+    ...taskToolSpecs,
+  ];
+  // SPEC-ASSISTANT-CONFIG §4 — tools are PER-PROFILE: the active version's `tools` allowlist gates which of
+  // the runtime-available tools this assistant may actually use. The allowlist INTERSECTS availability (a
+  // tool the profile permits is still only offered when its precondition holds). `undefined` ⇒ all available
+  // (legacy/unset), so an unconfigured profile behaves exactly as before.
+  const offeredToolSpecs = filterToolSpecsByProfile(rawToolSpecs, config.tools);
+  const useTools = offeredToolSpecs.length > 0;
+  const toolConfig = useTools ? { tools: offeredToolSpecs } : undefined;
 
   let inputTokens = 0;
   let outputTokens = 0;
@@ -1290,7 +1321,9 @@ export async function invokeBedrock(
         try {
           const toolInput = (block as { toolUse?: { input?: Record<string, unknown> } }).toolUse?.input ?? {};
           if (toolUse.name === 'load_company_context') {
-            payload = (await loadCompanyContext(companyContextBucket)) as unknown as Record<string, unknown>;
+            // Honor the model's document selection (filenames) so we load only what the task needs.
+            const docs = Array.isArray(toolInput.documents) ? (toolInput.documents as unknown[]).filter((d): d is string => typeof d === 'string') : undefined;
+            payload = (await loadCompanyContext(companyContextBucket, docs?.length ? { documents: docs } : undefined)) as unknown as Record<string, unknown>;
           } else if (toolUse.name === 'load_platform_info') {
             payload = (await loadPlatformInfo(companyContextBucket)) as unknown as Record<string, unknown>;
           } else if (toolUse.name === 'search_corporate_travel') {
@@ -1859,6 +1892,8 @@ export async function finalizePlaceholderResponse(params: {
     intentPackVersion: string;
     systemPromptHash: string;
   };
+  /** Portable-profile attribution: the assistant/profile + version that served this turn (SPEC-ASSISTANT-CONFIG §4). */
+  profileAttribution?: { profileName: string; profileConfigId: string; profileVersion?: number };
   /**
    * Per-step telemetry for this turn (one ConverseStep per Converse iteration),
    * from invokeBedrock. Persisted into the out-of-band analytics record ONLY
@@ -1969,8 +2004,12 @@ export async function finalizePlaceholderResponse(params: {
   // 'completed' rather than the intermediate state. Battle tasks keep their state-machine
   // progression (the force-complete is skipped for a battle mid-chain), so they are excluded here.
   if (activeTaskInfo && event.taskId && !event.battleContext) {
-    activeTaskInfo.status = 'completed';
-    activeTaskInfo.label = getTaskLabel(activeTaskInfo.type, 'completed');
+    // AT6: only mark 'completed' once the MACHINE reached a terminal state (or there is no machine); a
+    // machine-backed task mid-flow stays 'in_progress' so status never contradicts task_state (e.g.
+    // Completed vs still-extracting). Mirrors the DB update below.
+    const done = shouldMarkTaskCompleted(activeTaskInfo.type, params.taskContext?.task.taskState);
+    activeTaskInfo.status = done ? 'completed' : 'in_progress';
+    activeTaskInfo.label = getTaskLabel(activeTaskInfo.type, activeTaskInfo.status);
   }
 
   // SPEC-TASK-STATE-TRANSITIONS §6: stamp the machine state after this turn + the net transition
@@ -2010,6 +2049,7 @@ export async function finalizePlaceholderResponse(params: {
     ...(event.variantId && { variantId: event.variantId }),
     // P4 config attribution — stamp the config fingerprint resolved by the caller.
     ...(params.configIdentity && { configIdentity: params.configIdentity }),
+    ...(params.profileAttribution && { profileAttribution: params.profileAttribution }),
     // /battle: pass the typed AnalyticsBattleContext.
     // buildAnalyticsMetadata enforces the rollup-safety invariant
     // (battleContext present ⇒ assignmentMode='battle'), so we do NOT
@@ -2248,11 +2288,14 @@ export async function finalizePlaceholderResponse(params: {
   }
   const battleRoundDone = !roundComplete || isBattleRound1Complete(roundComplete);
 
-  // Update task status to completed if task-based — EXCEPT a battle
-  // TASK_* task mid-chain: don't force-complete it; let the state
-  // machine progress across turns until it's genuinely terminal.
+  // Update task status if task-based — but NEVER force-complete a machine-backed task mid-flow (AT6):
+  // like a battle task, a non-battle task only becomes 'completed' once its state machine reaches a
+  // TERMINAL state; before that it stays 'in_progress' so the lifecycle status never contradicts the
+  // machine state. Battle mid-chain is still excluded by the existing round guard.
   if (event.taskId && !(isBattleTaskInvocation && !battleRoundDone)) {
-    await updateTaskStatus(event.taskId, event.channelArn, 'completed', response.substring(0, 500));
+    const machineState = params.taskContext?.task.taskState;
+    const status: TaskStatus = shouldMarkTaskCompleted(event.taskType ?? params.taskContext?.task.taskType, machineState) ? 'completed' : 'in_progress';
+    await updateTaskStatus(event.taskId, event.channelArn, status, response.substring(0, 500));
   }
 
   // /battle: record the per-bot terminal state row. On the LAST writer's

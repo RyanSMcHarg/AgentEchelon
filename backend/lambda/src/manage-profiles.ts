@@ -18,6 +18,8 @@
  */
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { SSMClient } from '@aws-sdk/client-ssm';
+import { LambdaClient } from '@aws-sdk/client-lambda';
+import { resolveProfileInfra } from './lib/profile-infra.js';
 import { parseJsonBody, callerCanManageProfiles, respond as authRespond } from './lib/auth.js';
 import { getModelCatalog } from '../../lib/config/model-strategy.js';
 import type { ProfileDefinitionBody } from './lib/active-profile.js';
@@ -37,13 +39,20 @@ import { exportManifest, importManifest, ProfileManifestError } from './lib/prof
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
 const ssm = new SSMClient({ region: AWS_REGION });
+const lambdaClient = new LambdaClient({ region: AWS_REGION });
 
 function catalog() {
   return getModelCatalog(AWS_REGION, process.env.AWS_ACCOUNT_ID || '');
 }
 function callerSub(event: APIGatewayProxyEvent): string | null {
   const claims = (event.requestContext?.authorizer?.claims || {}) as Record<string, string>;
-  return claims.sub || null;
+  if (claims.sub) return claims.sub;
+  // A14: under AWS_IAM enforcement there is no Cognito authorizer, so `claims` is empty — but the
+  // gateway already vetted the signed principal's `manage-profiles` teeth (callerCanManageProfiles →
+  // isTrustedIamAdminCall). Derive the actor from the IAM principal so the audit has a real subject and
+  // the handler doesn't 401 a legitimately-signed admin call. (Mirrors the admin-conversations trust.)
+  const identity = event.requestContext?.identity;
+  return identity?.userArn || identity?.caller || null;
 }
 
 export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
@@ -65,7 +74,14 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
   try {
     if (method === 'GET') {
-      const profiles = await Promise.all(allProfileNames().map((n) => listProfile(ssm, SSM_ROOT, n)));
+      // Each listing is augmented with `resolved` — the live infra identifiers (processor Lambda, its role,
+      // its guardrail) for the console's AWS deep links. Best-effort; a resolve failure just omits the links.
+      const profiles = await Promise.all(
+        allProfileNames().map(async (n) => ({
+          ...(await listProfile(ssm, SSM_ROOT, n)),
+          resolved: await resolveProfileInfra(ssm, lambdaClient, SSM_ROOT, n, AWS_REGION),
+        })),
+      );
       return respond(200, { profiles });
     }
 

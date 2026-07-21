@@ -60,6 +60,7 @@ function AdminAppContent() {
     }
     return (
       <LoginScreen
+        variant="admin"
         onLogin={login}
         passwordChallenge={passwordChallenge}
         onSetNewPassword={completeNewPassword}
