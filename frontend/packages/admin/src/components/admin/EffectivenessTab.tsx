@@ -465,14 +465,17 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
         const clsExtra = classification ? { agentType: classification } : {};
         if (drill.level === 2 && drill.delivery === 'direct') {
           const [ex, ev] = await Promise.all([
-            queryAnalytics('intent_exchanges', dateRange, { intent: drill.intent, ...clsExtra }),
+            // Fetch the full window (backend caps at 500) so DataTable can paginate it; a small default
+            // would silently hide older exchanges behind the first page.
+            queryAnalytics('intent_exchanges', dateRange, { intent: drill.intent, limit: '500', ...clsExtra }),
             queryAnalytics('evaluation_exchanges', dateRange, { limit: '200' }),
           ]);
           const evalById = new Map(((ev?.data ?? []) as Row[]).map((r) => [String(r.id ?? r.exchange_id), r]));
           const merged = ((ex?.data ?? []) as Row[]).map((r) => ({ ...r, _eval: evalById.get(String(r.exchange_id)) ?? null }));
           if (!cancelled) setDrillData({ data: merged as unknown as AnalyticsResult['data'], columns: [] });
         } else if (drill.level === 2) {
-          const res = await queryAnalytics('task_details', dateRange, { intent: drill.intent, ...clsExtra });
+          // Full task window (backend caps at 200) for client-side pagination in the L2 task list.
+          const res = await queryAnalytics('task_details', dateRange, { intent: drill.intent, limit: '200', ...clsExtra });
           if (!cancelled) setDrillData(res ?? null);
         } else if (drill.level === 3) {
           const [tl, flows] = await Promise.all([

@@ -45,7 +45,10 @@ async function vendMessagesReadCredential(channelArn: string): Promise<{
   return credentials;
 }
 
-export async function listAdminConversations(limit = 25, token?: string): Promise<AdminConversationSummary[]> {
+// Fetch a generous window (the backend caps at 200) and let DataTable paginate it client-side, so the
+// list is fully navigable rather than silently truncated at a tiny page. (Server-side cursoring is the
+// follow-up if a deployment ever exceeds this window.)
+export async function listAdminConversations(limit = 200, token?: string): Promise<AdminConversationSummary[]> {
   if (ADMIN_IAM_ENFORCEMENT) {
     // Sign-on plane (view-conversations): the operator's own Identity-Pool creds,
     // which resolve to their group role; the gateway denies a role that omits the resource.
@@ -64,7 +67,7 @@ export async function listAdminConversations(limit = 25, token?: string): Promis
   return result.conversations || [];
 }
 
-export async function listAdminConversationMessages(channelArn: string, limit = 100, token?: string): Promise<AdminConversationMessage[]> {
+export async function listAdminConversationMessages(channelArn: string, limit = 300, token?: string): Promise<AdminConversationMessage[]> {
   if (ADMIN_IAM_ENFORCEMENT) {
     // Message content (A2) rides the exchange-vended, audited execute-api credential.
     const creds = await vendMessagesReadCredential(channelArn);

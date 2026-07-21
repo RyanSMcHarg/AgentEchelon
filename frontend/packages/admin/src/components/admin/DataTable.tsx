@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import './DataTable.css';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -28,11 +28,22 @@ interface DataTableProps<T extends AnyRow = AnyRow> {
    *  also honours Enter/Space when focused. Give such tables an inline link (e.g. the id/name cell) as
    *  the accessible drill control. */
   onRowClick?: (row: T) => void;
+  /**
+   * Rows per page. Every table paginates by default (keeps long lists navigable and the DOM light);
+   * the page controls only appear when there are more rows than this. Pass `0` to disable paging and
+   * render every row (small fixed tables that should never split). Default 25.
+   */
+  pageSize?: number;
 }
 
-function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No data available', onRowClick }: DataTableProps<T>) {
+function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No data available', onRowClick, pageSize = 25 }: DataTableProps<T>) {
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
+  const [page, setPage] = useState(0);
+
+  // A new result set (row count changed) starts at the first page rather than stranding the viewer on
+  // a now-out-of-range page. Sorting also returns to the first page (see handleSort).
+  useEffect(() => setPage(0), [data.length]);
 
   const handleSort = (key: string) => {
     if (sortKey === key) {
@@ -41,6 +52,7 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
       setSortKey(key);
       setSortDir('desc');
     }
+    setPage(0);
   };
 
   const sortedData = sortKey
@@ -57,6 +69,14 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
   if (data.length === 0) {
     return <div className="data-table-empty">{emptyMessage}</div>;
   }
+
+  // Client-side pagination over the (sorted) rows. `pageSize={0}` renders everything.
+  const paginate = pageSize > 0 && sortedData.length > pageSize;
+  const pageCount = paginate ? Math.ceil(sortedData.length / pageSize) : 1;
+  const currentPage = Math.min(page, pageCount - 1);
+  const start = paginate ? currentPage * pageSize : 0;
+  const end = paginate ? Math.min(start + pageSize, sortedData.length) : sortedData.length;
+  const pageRows = paginate ? sortedData.slice(start, end) : sortedData;
 
   const labelFor = (col: Column<T>): string =>
     col.mobileLabel ?? (typeof col.label === 'string' ? col.label : col.key);
@@ -81,9 +101,9 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
           </tr>
         </thead>
         <tbody>
-          {sortedData.map((row, i) => (
+          {pageRows.map((row, i) => (
             <tr
-              key={i}
+              key={start + i}
               className={onRowClick ? 'data-table-row--clickable' : ''}
               onClick={onRowClick
                 ? (e) => {
@@ -110,6 +130,36 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
           ))}
         </tbody>
       </table>
+      {paginate && (
+        <div className="data-table-pagination">
+          <span className="data-table-pagination-info">
+            {start + 1}&ndash;{end} of {sortedData.length}
+          </span>
+          <div className="data-table-pagination-controls">
+            <button
+              type="button"
+              className="data-table-page-btn"
+              onClick={() => setPage(currentPage - 1)}
+              disabled={currentPage === 0}
+              aria-label="Previous page"
+            >
+              &larr; Prev
+            </button>
+            <span className="data-table-pagination-page">
+              Page {currentPage + 1} of {pageCount}
+            </span>
+            <button
+              type="button"
+              className="data-table-page-btn"
+              onClick={() => setPage(currentPage + 1)}
+              disabled={currentPage >= pageCount - 1}
+              aria-label="Next page"
+            >
+              Next &rarr;
+            </button>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

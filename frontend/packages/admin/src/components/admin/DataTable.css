@@ -175,3 +175,49 @@
   color: var(--text-tertiary);
   letter-spacing: var(--tracking-wide);
 }
+
+/* Client-side pagination controls (DataTable). Appears only when rows exceed the page size. */
+.data-table-pagination {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  flex-wrap: wrap;
+  padding: var(--space-2) var(--space-4);
+  background: var(--surface-50);
+  border-top: 1px solid var(--surface-100);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  letter-spacing: var(--tracking-wide);
+}
+.data-table-pagination-controls {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+}
+.data-table-pagination-page {
+  color: var(--text-secondary);
+  min-width: 9ch;
+  text-align: center;
+}
+.data-table-page-btn {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--tracking-wide);
+  color: var(--text-primary);
+  background: var(--surface-0);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  padding: var(--space-1) var(--space-3);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease-in-out), border-color var(--duration-fast) var(--ease-in-out);
+}
+.data-table-page-btn:hover:not(:disabled) {
+  background: var(--surface-100);
+  border-color: var(--accent-500);
+}
+.data-table-page-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
