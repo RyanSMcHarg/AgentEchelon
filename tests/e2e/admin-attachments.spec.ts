@@ -14,7 +14,7 @@
  * this exercises fully; on a clean window it note-skips rather than failing.
  *
  * Runs against the admin origin:
- *   cd tests && AWS_PROFILE=mcharg-dev \
+ *   cd tests && AWS_PROFILE=<your-profile> \
  *     E2E_ADMIN_BASE_URL=https://<admin-dist>.cloudfront.net \
  *     npx playwright test e2e/admin-attachments.spec.ts --reporter=list
  */

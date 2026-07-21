@@ -19,7 +19,7 @@
  * the data is present, so they exercise fully.
  *
  * Run:
- *   cd tests && AWS_PROFILE=mcharg-dev \
+ *   cd tests && AWS_PROFILE=<your-profile> \
  *     E2E_ADMIN_BASE_URL=https://<admin-dist>.cloudfront.net \
  *     npx playwright test e2e/admin-flow.spec.ts --reporter=list
  */

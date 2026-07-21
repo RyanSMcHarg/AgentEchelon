@@ -6,6 +6,8 @@ The point is centralization. Instead of standing up a separate tool for each use
 
 > **Status: reference implementation.** Agent Echelon is a starter application that demonstrates a governed agent architecture on AWS. It is a foundation to build on, not a turnkey production system. Every deployment should evaluate the features against its own security, privacy, and compliance needs and modify the project to meet them. Nothing here is legal advice.
 
+> **Not affiliated with AWS.** Agent Echelon is an independent, personal open-source project by Ryan McHarg. It is **not affiliated with, endorsed by, sponsored by, or an official product of** Amazon Web Services, Inc. or Amazon.com, Inc., and the author does not speak for or represent AWS. "AWS", "Amazon Chime SDK", "Amazon Bedrock", "Amazon Cognito", and related names are trademarks of Amazon.com, Inc. or its affiliates; they are used here only to identify the AWS services this project runs on. Any linked AWS blog posts (including ones the author wrote) are cited for attribution and technical reference only and do not imply any current or past affiliation or endorsement.
+
 ## Why Agent Echelon
 
 Most agentic systems are a model, tools, memory, and an orchestration loop. Agent Echelon ships each of those and lets you customize or swap them, then wraps them in the enterprise layers - governed multi-party conversation, omnichannel surfaces, and access enforced in the cloud's own IAM. It is organized as four layers, each running on the one below:
