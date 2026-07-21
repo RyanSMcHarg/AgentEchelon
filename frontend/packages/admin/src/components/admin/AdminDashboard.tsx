@@ -51,16 +51,34 @@ function getDateRange(preset: string): AnalyticsDateRange {
 
 // Tabs available only in Aurora mode (hidden in Athena). Sub-view labels are
 // resolved from i18n at render time via the tab id → admin.tabs.<camelCase> key.
-// Aurora-only sub-views still reachable from the nav. (evaluations/flows/tasks/steps were retired from
-// SECTIONS — their detail folded into the Effectiveness drill — so they no longer appear here.) Alerts
-// leans on the Aurora-only effectiveness/model-effectiveness data, so it is Aurora-only too.
+// Aurora-only sub-views still reachable from the nav. (flows/tasks/steps were retired from SECTIONS —
+// their detail folded into the Effectiveness drill — so they no longer appear here.) Alerts leans on
+// the Aurora-only effectiveness/model-effectiveness data, so it is Aurora-only too.
 const AURORA_TAB_IDS: TabId[] = ['flagged', 'ground_truth', 'effectiveness', 'alerts'];
+
+// Tabs available only in ATHENA mode (hidden in Aurora). `evaluations` is the basic daily
+// evaluation-score view; in Aurora the richer per-intent Effectiveness drill supersedes it, but Athena
+// has no drill, so it stays the reachable eval surface there. (Without this, retiring `evaluations`
+// from the nav left Athena mode with NO evaluation UI even though evaluation_scores is still served —
+// the B6 regression from 8f143e3.)
+const ATHENA_ONLY_TAB_IDS: TabId[] = ['evaluations'];
+
+/**
+ * Whether a sub-tab is available in the given analytics mode (pure, exported for testing). Aurora-only
+ * tabs are hidden in Athena; Athena-only tabs (the basic evaluation view) are hidden in Aurora; every
+ * other tab is available in both. A section with no available tab is hidden entirely, so this is what
+ * decides whether the Effectiveness section (hence any evaluation UI) shows in Athena mode (B6).
+ */
+export function isTabAvailableIn(id: TabId, mode: 'athena' | 'aurora'): boolean {
+  if (ATHENA_ONLY_TAB_IDS.includes(id)) return mode !== 'aurora';
+  return mode === 'aurora' || !AURORA_TAB_IDS.includes(id);
+}
 
 // Two-level navigation: 6 top-level SECTIONS, each grouping one or more
 // sub-views (the per-tab components). activeTab (TabId) remains the source of
 // truth for content + data loading; the section rail just groups the sub-tabs.
 interface AdminSection { id: string; label: string; tabs: TabId[]; }
-const SECTIONS: AdminSection[] = [
+export const SECTIONS: AdminSection[] = [
   { id: 'overview', label: 'Overview', tabs: ['overview', 'alerts', 'latency'] },
   { id: 'conversations', label: 'Conversations', tabs: ['conversations'] },
   // Effectiveness is the intent-anchored spine (SPEC-ADMIN-CONSOLE-EFFECTIVENESS) and the consolidation
@@ -69,7 +87,9 @@ const SECTIONS: AdminSection[] = [
   // FlowScorePanel = Flows; L4 inline steps = Steps). Those standalone tabs are therefore RETIRED from
   // the nav — no information is lost, it just moved into the drill. Only the two human-ACTION views stay
   // as their own tabs: Flagged (the review queue) and Ground Truth (eval labeling).
-  { id: 'quality', label: 'Effectiveness', tabs: ['effectiveness', 'flagged', 'ground_truth'] },
+  // `evaluations` is Athena-only (ATHENA_ONLY_TAB_IDS): in Aurora it is hidden and the effectiveness
+  // drill is the eval surface; in Athena (no drill) it is the reachable basic evaluation view.
+  { id: 'quality', label: 'Effectiveness', tabs: ['effectiveness', 'evaluations', 'flagged', 'ground_truth'] },
   { id: 'models', label: 'Models', tabs: ['models', 'strategy'] },
   // Assistant profiles as versioned, portable artifacts (SPEC-PORTABLE-VERSIONED-PROFILES): version /
   // activate / rollback / import / export the assistant definition, no redeploy. The retiring global
@@ -177,7 +197,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
 
   // Aurora-only sub-views are hidden in Athena mode (their content would just
   // honest-empty). activeTab drives content; activeSection groups the sub-tabs.
-  const isTabAvailable = (id: TabId) => analyticsMode === 'aurora' || !AURORA_TAB_IDS.includes(id);
+  const isTabAvailable = (id: TabId) => isTabAvailableIn(id, analyticsMode);
   const activeSection = SECTIONS.find((s) => s.tabs.includes(activeTab)) ?? SECTIONS[0];
   const subTabs = activeSection.tabs.filter(isTabAvailable);
 
