@@ -29,20 +29,36 @@ interface DataTableProps<T extends AnyRow = AnyRow> {
    *  the accessible drill control. */
   onRowClick?: (row: T) => void;
   /**
-   * Rows per page. Every table paginates by default (keeps long lists navigable and the DOM light);
-   * the page controls only appear when there are more rows than this. Pass `0` to disable paging and
-   * render every row (small fixed tables that should never split). Default 25.
+   * Rows per page for CLIENT-side pagination (slices the already-fetched `data`). Every table
+   * paginates by default (keeps long lists navigable and the DOM light); the page controls only
+   * appear when there are more rows than this. Pass `0` to disable paging and render every row
+   * (small fixed tables that should never split). Default 25. Ignored when `serverPagination` is set.
    */
   pageSize?: number;
+  /**
+   * SERVER-side pagination. When set, `data` is treated as ONE already-fetched page (not sliced),
+   * and the controls are driven by the parent: `total` rows exist across all pages, the parent owns
+   * `page`, and clicking Prev/Next calls `onPageChange` to fetch the next page. Use this for lists
+   * that can grow past a single fetch window (conversations, exchanges, tasks) so nothing is hidden
+   * behind a client-only cap. `loading` disables the controls during the fetch.
+   */
+  serverPagination?: {
+    page: number;
+    pageSize: number;
+    total: number;
+    onPageChange: (page: number) => void;
+    loading?: boolean;
+  };
 }
 
-function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No data available', onRowClick, pageSize = 25 }: DataTableProps<T>) {
+function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No data available', onRowClick, pageSize = 25, serverPagination }: DataTableProps<T>) {
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [page, setPage] = useState(0);
 
-  // A new result set (row count changed) starts at the first page rather than stranding the viewer on
-  // a now-out-of-range page. Sorting also returns to the first page (see handleSort).
+  // A new client-side result set (row count changed) starts at the first page rather than stranding the
+  // viewer on a now-out-of-range page. Sorting also returns to the first page (see handleSort). In
+  // server mode the parent owns the page, so this local reset is inert.
   useEffect(() => setPage(0), [data.length]);
 
   const handleSort = (key: string) => {
@@ -55,6 +71,8 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
     setPage(0);
   };
 
+  // NOTE: sorting is client-side over the rows currently in `data`. In server mode that is one page,
+  // so a sort orders only the visible page (the server's ORDER BY is the authoritative overall order).
   const sortedData = sortKey
     ? [...data].sort((a, b) => {
         const aVal = (a as AnyRow)[sortKey];
@@ -70,13 +88,45 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
     return <div className="data-table-empty">{emptyMessage}</div>;
   }
 
-  // Client-side pagination over the (sorted) rows. `pageSize={0}` renders everything.
-  const paginate = pageSize > 0 && sortedData.length > pageSize;
-  const pageCount = paginate ? Math.ceil(sortedData.length / pageSize) : 1;
-  const currentPage = Math.min(page, pageCount - 1);
-  const start = paginate ? currentPage * pageSize : 0;
-  const end = paginate ? Math.min(start + pageSize, sortedData.length) : sortedData.length;
-  const pageRows = paginate ? sortedData.slice(start, end) : sortedData;
+  // Unified pager: SERVER mode (parent-driven, `data` is one page) OR CLIENT mode (slice `data`).
+  let showPagination: boolean;
+  let pageRows: T[];
+  let infoStart: number; // 1-indexed first row shown
+  let infoEnd: number;   // 1-indexed last row shown
+  let infoTotal: number;
+  let curPage: number;   // 0-indexed
+  let totalPages: number;
+  let goPrev: () => void;
+  let goNext: () => void;
+  let controlsDisabled: boolean;
+
+  if (serverPagination) {
+    const { page: sp, pageSize: sps, total, onPageChange, loading } = serverPagination;
+    pageRows = sortedData; // the fetched page, in the server's order (client sort applies within it)
+    totalPages = Math.max(1, Math.ceil(total / sps));
+    curPage = Math.min(sp, totalPages - 1);
+    infoTotal = total;
+    infoStart = curPage * sps + 1;
+    infoEnd = curPage * sps + data.length;
+    showPagination = totalPages > 1;
+    controlsDisabled = !!loading;
+    goPrev = () => onPageChange(curPage - 1);
+    goNext = () => onPageChange(curPage + 1);
+  } else {
+    const paginate = pageSize > 0 && sortedData.length > pageSize;
+    totalPages = paginate ? Math.ceil(sortedData.length / pageSize) : 1;
+    curPage = Math.min(page, totalPages - 1);
+    const start = paginate ? curPage * pageSize : 0;
+    const end = paginate ? Math.min(start + pageSize, sortedData.length) : sortedData.length;
+    pageRows = paginate ? sortedData.slice(start, end) : sortedData;
+    infoStart = start + 1;
+    infoEnd = end;
+    infoTotal = sortedData.length;
+    showPagination = paginate;
+    controlsDisabled = false;
+    goPrev = () => setPage(curPage - 1);
+    goNext = () => setPage(curPage + 1);
+  }
 
   const labelFor = (col: Column<T>): string =>
     col.mobileLabel ?? (typeof col.label === 'string' ? col.label : col.key);
@@ -103,7 +153,7 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
         <tbody>
           {pageRows.map((row, i) => (
             <tr
-              key={start + i}
+              key={`${curPage}_${i}`}
               className={onRowClick ? 'data-table-row--clickable' : ''}
               onClick={onRowClick
                 ? (e) => {
@@ -130,29 +180,29 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
           ))}
         </tbody>
       </table>
-      {paginate && (
+      {showPagination && (
         <div className="data-table-pagination">
           <span className="data-table-pagination-info">
-            {start + 1}&ndash;{end} of {sortedData.length}
+            {infoStart}&ndash;{infoEnd} of {infoTotal}
           </span>
           <div className="data-table-pagination-controls">
             <button
               type="button"
               className="data-table-page-btn"
-              onClick={() => setPage(currentPage - 1)}
-              disabled={currentPage === 0}
+              onClick={goPrev}
+              disabled={controlsDisabled || curPage === 0}
               aria-label="Previous page"
             >
               &larr; Prev
             </button>
             <span className="data-table-pagination-page">
-              Page {currentPage + 1} of {pageCount}
+              {controlsDisabled ? 'Loading…' : `Page ${curPage + 1} of ${totalPages}`}
             </span>
             <button
               type="button"
               className="data-table-page-btn"
-              onClick={() => setPage(currentPage + 1)}
-              disabled={currentPage >= pageCount - 1}
+              onClick={goNext}
+              disabled={controlsDisabled || curPage >= totalPages - 1}
               aria-label="Next page"
             >
               Next &rarr;

@@ -53,7 +53,7 @@ describe('EffectivenessTab', () => {
       { task_id: 'task-abc12345', status: 'completed', task_state: 'completed', exchange_count: 3, transition_count: 2, last_at: '2026-05-20T00:00:00Z' },
     ]));
     fireEvent.click(tasksBtn);
-    await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('task_details', range, { intent: 'report_generation', limit: '200' }));
+    await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('task_details', range, { intent: 'report_generation', limit: '25', offset: '0' }));
     const taskLink = await screen.findByRole('button', { name: /task-abc/ });
 
     // L3: timeline (by taskId) + the flow's 5-dimension score (evaluation_flows), folded in.
@@ -92,7 +92,7 @@ describe('EffectivenessTab', () => {
       .mockResolvedValueOnce(result([{ exchange_id: 'ex-9', relevance_score: 88, total_ms: 500, input_tokens: 100, output_tokens: 50, bedrock_model: 'm', created_at: '2026-05-20T00:00:00Z' }]))
       .mockResolvedValueOnce(result([{ id: 'ex-9', intent: 'general_query', classification: 'excellent', is_compliant: true, reasoning: 'Directly answered the question.' }]));
     fireEvent.click(exBtn);
-    await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('intent_exchanges', range, { intent: 'general_query', limit: '500' }));
+    await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('intent_exchanges', range, { intent: 'general_query', limit: '25', offset: '0' }));
 
     // The judge verdict (classification + reasoning) renders inline on the exchange row.
     expect(await screen.findByText('excellent')).toBeTruthy();

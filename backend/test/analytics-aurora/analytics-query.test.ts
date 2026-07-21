@@ -140,8 +140,8 @@ describe('Aurora analytics-query — intent_effectiveness (Effectiveness L0)', (
     expect(sql).toMatch(/\* 0\.30/); // outcome weight in the flow composite
     expect(sql).toMatch(/WHEN 'high' THEN 100 WHEN 'medium' THEN 50 WHEN 'low' THEN 0/);
     expect(sql).toMatch(/NOW\(\) - INTERVAL '1 day' \* \$1/);
-    // L0 = no intent filter → $2 is NULL (7-day window from VALID_RANGE).
-    expect(args).toEqual([7, null]);
+    // L0 = no intent filter → $2 is NULL (7-day window from VALID_RANGE); $3 agentType NULL (unscoped).
+    expect(args).toEqual([7, null, null]);
   });
 
   it('L1: an intent param drills to one intent via the $2 IS NULL OR filter', async () => {
@@ -152,7 +152,7 @@ describe('Aurora analytics-query — intent_effectiveness (Effectiveness L0)', (
     expect(res.statusCode).toBe(200);
     const [sql, args] = mockDbQuery.mock.calls[0];
     expect(sql).toMatch(/\$2::varchar IS NULL OR e\.intent = \$2/);
-    expect(args).toEqual([7, 'report_generation']);
+    expect(args).toEqual([7, 'report_generation', null]);
     expect(JSON.parse(res.body).data[0]).toHaveProperty('cost_per_reply_usd', null);
   });
 });
@@ -168,8 +168,9 @@ describe('Aurora analytics-query — L2 drills (intent_exchanges + task_details 
     const [sql, args] = mockDbQuery.mock.calls[0];
     expect(sql).toMatch(/WHERE e\.intent = \$1/);
     expect(sql).toMatch(/ORDER BY e\.created_at DESC/);
-    expect(sql).toMatch(/LIMIT \$3/);
-    expect(args).toEqual(['general_query', 7, 100]); // intent, window, default limit
+    expect(sql).toMatch(/LIMIT \$3 OFFSET \$5/);
+    // intent, window, default limit, agentType (unscoped), offset (page 0)
+    expect(args).toEqual(['general_query', 7, 100, null, 0]);
   });
 
   it('intent_exchanges without an intent → honest empty, no DB call', async () => {

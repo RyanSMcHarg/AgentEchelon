@@ -36,12 +36,16 @@ describe('admin-conversations-aurora', () => {
     const [sql] = mockedQuery.mock.calls[0] as [string];
     expect(sql).toMatch(/event_type IN \('CREATE_CHANNEL','UPDATE_CHANNEL'\)/); // name source
     expect(sql).toMatch(/CREATE_CHANNEL_MESSAGE/);
-    expect(out[0]).toEqual({
+    expect(out.conversations[0]).toEqual({
       channelArn: 'c1', name: 'Q3 Forecast', messageCount: 12,
       lastMessageAt: '2026-07-15T00:05:00Z', memberCount: 0,
       state: 'live',
       metadata: { modelTier: 'premium' },
     });
+    // Server-side pagination: total falls back to the page length when the mock omits total_count.
+    expect(out.total).toBe(1);
+    // The paginated query pushes LIMIT/OFFSET (page window).
+    expect(sql).toMatch(/LIMIT \$1 OFFSET \$2/);
   });
 
   it('derives lifecycle state: deleted wins over archived, else archived, else live', async () => {
@@ -58,7 +62,7 @@ describe('admin-conversations-aurora', () => {
     // State is derived from the archived channel events, not a live Chime read.
     expect(sql).toMatch(/DELETE_CHANNEL/);
     expect(sql).toMatch(/metadata->>'archived' = 'true'/);
-    expect(out.map((c) => c.state)).toEqual(['live', 'archived', 'deleted']); // deleted wins over archived on c3
+    expect(out.conversations.map((c) => c.state)).toEqual(['live', 'archived', 'deleted']); // deleted wins over archived on c3
   });
 
   it('falls back to "Untitled Conversation" when no channel name row exists', async () => {
@@ -67,8 +71,8 @@ describe('admin-conversations-aurora', () => {
       rowCount: 1,
     } as any);
     const out = await adminListConversations();
-    expect(out[0].name).toBe('Untitled Conversation');
-    expect(out[0].metadata.modelTier).toBe('');
+    expect(out.conversations[0].name).toBe('Untitled Conversation');
+    expect(out.conversations[0].metadata.modelTier).toBe('');
   });
 
   it('lists messages, strips markers, exposes model/intent + inspect raw', async () => {

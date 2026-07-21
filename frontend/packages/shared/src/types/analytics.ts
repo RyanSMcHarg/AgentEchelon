@@ -55,6 +55,15 @@ export interface AnalyticsResult {
   unsupported?: boolean;
   /** Human-readable reason; pair with `unsupported`. */
   reason?: string;
+  /**
+   * Server-side pagination (paginated list queries only, e.g. intent_exchanges / task_details):
+   * the TOTAL number of matching rows across all pages (from the query's COUNT(*) OVER()), so the
+   * console can render "Page X of N" and drive Prev/Next without a second round-trip. `data` is the
+   * current page; `limit`/`offset` echo the window served.
+   */
+  total?: number;
+  limit?: number;
+  offset?: number;
 }
 
 // Overview metrics

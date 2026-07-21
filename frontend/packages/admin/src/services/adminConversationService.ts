@@ -45,26 +45,32 @@ async function vendMessagesReadCredential(channelArn: string): Promise<{
   return credentials;
 }
 
-// Fetch a generous window (the backend caps at 200) and let DataTable paginate it client-side, so the
-// list is fully navigable rather than silently truncated at a tiny page. (Server-side cursoring is the
-// follow-up if a deployment ever exceeds this window.)
-export async function listAdminConversations(limit = 200, token?: string): Promise<AdminConversationSummary[]> {
+export interface AdminConversationPage {
+  conversations: AdminConversationSummary[];
+  /** Total matching conversations across all pages (server-side pagination). */
+  total: number;
+}
+
+// Server-side pagination: fetch ONE page (limit/offset) plus the total match count, so the list scales
+// past any single fetch window instead of silently truncating. The backend pushes the caller's
+// classification-ceiling scope into SQL, so the page and total are consistent for scoped admins.
+export async function listAdminConversations(limit = 25, offset = 0, token?: string): Promise<AdminConversationPage> {
   if (ADMIN_IAM_ENFORCEMENT) {
     // Sign-on plane (view-conversations): the operator's own Identity-Pool creds,
     // which resolve to their group role; the gateway denies a role that omits the resource.
     const creds = await identityPoolCredentials();
-    const result = await sigv4GetJson<{ conversations?: AdminConversationSummary[] }>(
+    const result = await sigv4GetJson<{ conversations?: AdminConversationSummary[]; total?: number }>(
       getApiUrl(),
-      { limit },
+      { limit, offset },
       creds,
     );
-    return result.conversations || [];
+    return { conversations: result.conversations || [], total: result.total ?? (result.conversations?.length || 0) };
   }
-  const result = await apiCall<{ conversations?: AdminConversationSummary[] }>(getApiUrl(), '', {
-    query: { limit },
+  const result = await apiCall<{ conversations?: AdminConversationSummary[]; total?: number }>(getApiUrl(), '', {
+    query: { limit, offset },
     token,
   });
-  return result.conversations || [];
+  return { conversations: result.conversations || [], total: result.total ?? (result.conversations?.length || 0) };
 }
 
 export async function listAdminConversationMessages(channelArn: string, limit = 300, token?: string): Promise<AdminConversationMessage[]> {

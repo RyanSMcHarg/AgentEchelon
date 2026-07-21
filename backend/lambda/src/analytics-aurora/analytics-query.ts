@@ -404,10 +404,13 @@ async function getTaskDetails(
 ): Promise<APIGatewayProxyResult> {
   const days = parseInt(params.days || '7', 10);
   const limit = Math.min(parseInt(params.limit || '50', 10), 200);
+  const offset = Math.max(parseInt(params.offset || '0', 10), 0);
   // Optional intent filter — this is also the Effectiveness L2 task list (drill from an intent to its
   // tasks). `$3 IS NULL` keeps the unfiltered Quality>Tasks behavior; set it for the L2 drill.
   const intent = params.intent || null;
   const agentType = params.agentType || null; // Effectiveness "one assistant" scope (agent_type = responder).
+  // total = number of DISTINCT tasks matching (COUNT(*) OVER() runs over the grouped result set), so the
+  // console can page server-side. LIMIT/OFFSET apply after grouping (the page is a page of tasks).
   const result = await query(
     `SELECT task_id,
             -- One task lives in one channel, so MAX picks that channel_arn for the "view conversation"
@@ -423,7 +426,8 @@ async function getTaskDetails(
             MAX(created_at) AS last_at,
             COUNT(*) AS exchange_count,
             -- How many turns actually advanced the machine (a transition was recorded).
-            COUNT(task_transition) AS transition_count
+            COUNT(task_transition) AS transition_count,
+            COUNT(*) OVER() AS total_count
        FROM exchanges
       WHERE task_id IS NOT NULL
         AND created_at >= NOW() - INTERVAL '1 day' * $1
@@ -431,10 +435,11 @@ async function getTaskDetails(
         AND ($4::varchar IS NULL OR agent_type = $4)
       GROUP BY task_id
       ORDER BY MAX(created_at) DESC
-      LIMIT $2`,
-    [days, limit, intent, agentType]
+      LIMIT $2 OFFSET $5`,
+    [days, limit, intent, agentType, offset]
   );
-  return success({ data: result.rows });
+  const total = result.rows[0]?.total_count != null ? Number(result.rows[0].total_count) : result.rows.length;
+  return success({ data: result.rows, total, limit, offset });
 }
 
 /**
@@ -1640,11 +1645,14 @@ async function getIntentExchanges(
   params: Record<string, string | undefined>
 ): Promise<APIGatewayProxyResult> {
   const intent = params.intent;
-  if (!intent) return success({ data: [] });
+  if (!intent) return success({ data: [], total: 0 });
   const days = Math.min(parseInt(params.days || '30', 10), 180);
   const limit = Math.min(parseInt(params.limit || '100', 10), 500);
+  const offset = Math.max(parseInt(params.offset || '0', 10), 0);
   const agentType = params.agentType || null; // Effectiveness "one assistant" scope (agent_type = responder).
 
+  // COUNT(*) OVER() returns the full match count alongside the page, so the admin console can render
+  // "Page X of N" and page server-side without a second round-trip (SPEC-ADMIN-CONSOLE pagination).
   const result = await query(
     `SELECT e.id AS exchange_id,
             e.agent_message_id,
@@ -1658,7 +1666,8 @@ async function getIntentExchanges(
             m.input_tokens,
             m.output_tokens,
             m.bedrock_model,
-            e.created_at
+            e.created_at,
+            COUNT(*) OVER() AS total_count
        FROM exchanges e
        LEFT JOIN messages m ON e.agent_message_id = m.id
        LEFT JOIN (
@@ -1671,10 +1680,11 @@ async function getIntentExchanges(
         AND e.created_at >= NOW() - INTERVAL '1 day' * $2
         AND ($4::varchar IS NULL OR e.agent_type = $4)
       ORDER BY e.created_at DESC
-      LIMIT $3`,
-    [intent, days, limit, agentType]
+      LIMIT $3 OFFSET $5`,
+    [intent, days, limit, agentType, offset]
   );
-  return success({ data: result.rows });
+  const total = result.rows[0]?.total_count != null ? Number(result.rows[0].total_count) : result.rows.length;
+  return success({ data: result.rows, total, limit, offset });
 }
 
 /**

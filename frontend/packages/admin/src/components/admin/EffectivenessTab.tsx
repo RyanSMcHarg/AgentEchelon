@@ -419,6 +419,14 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
   // L0 only: the same aggregate across ALL intents (the system-wide tool view). null = loading.
   const [l0Tools, setL0Tools] = useState<ToolAgg[] | null>([]);
   const [drillLoading, setDrillLoading] = useState(false);
+  // Server-side pagination for the L2 list (exchanges / tasks): the backend returns one page + the
+  // total match count, so the list scales past any single-fetch window instead of silently truncating.
+  const DRILL_PAGE_SIZE = 25;
+  const [drillPage, setDrillPage] = useState(0);
+  const [drillTotal, setDrillTotal] = useState(0);
+  // A fresh drill TARGET restarts at page 0 (drill identity changes on any level/intent/task change);
+  // the fetch effect below depends on drillPage, so paging within a target refetches just that page.
+  useEffect(() => { setDrillPage(0); }, [drill]);
 
   const intentRow = useCallback(
     (intent: string): Row | undefined => l0Rows.find((r) => String(r.intent) === intent),
@@ -463,20 +471,20 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
       try {
         // Scope the drill to the same assistant (agent_type) as the L0 view when the filter is set.
         const clsExtra = classification ? { agentType: classification } : {};
+        // Server-paginated L2 window: one page of rows + the total, so nothing is hidden past a cap.
+        const pageWin = { limit: String(DRILL_PAGE_SIZE), offset: String(drillPage * DRILL_PAGE_SIZE) };
         if (drill.level === 2 && drill.delivery === 'direct') {
           const [ex, ev] = await Promise.all([
-            // Fetch the full window (backend caps at 500) so DataTable can paginate it; a small default
-            // would silently hide older exchanges behind the first page.
-            queryAnalytics('intent_exchanges', dateRange, { intent: drill.intent, limit: '500', ...clsExtra }),
+            queryAnalytics('intent_exchanges', dateRange, { intent: drill.intent, ...pageWin, ...clsExtra }),
+            // The judge-verdict merge is best-effort over recent evaluations; a deep page may show '—'.
             queryAnalytics('evaluation_exchanges', dateRange, { limit: '200' }),
           ]);
           const evalById = new Map(((ev?.data ?? []) as Row[]).map((r) => [String(r.id ?? r.exchange_id), r]));
           const merged = ((ex?.data ?? []) as Row[]).map((r) => ({ ...r, _eval: evalById.get(String(r.exchange_id)) ?? null }));
-          if (!cancelled) setDrillData({ data: merged as unknown as AnalyticsResult['data'], columns: [] });
+          if (!cancelled) { setDrillData({ data: merged as unknown as AnalyticsResult['data'], columns: [] }); setDrillTotal(Number(ex?.total ?? merged.length)); }
         } else if (drill.level === 2) {
-          // Full task window (backend caps at 200) for client-side pagination in the L2 task list.
-          const res = await queryAnalytics('task_details', dateRange, { intent: drill.intent, limit: '200', ...clsExtra });
-          if (!cancelled) setDrillData(res ?? null);
+          const res = await queryAnalytics('task_details', dateRange, { intent: drill.intent, ...pageWin, ...clsExtra });
+          if (!cancelled) { setDrillData(res ?? null); setDrillTotal(Number(res?.total ?? (res?.data?.length ?? 0))); }
         } else if (drill.level === 3) {
           const [tl, flows] = await Promise.all([
             queryAnalytics('task_timeline', dateRange, { taskId: drill.taskId }),
@@ -493,7 +501,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
     }
     run();
     return () => { cancelled = true; };
-  }, [drill, dateRange, classification]);
+  }, [drill, dateRange, classification, drillPage]);
 
   // Back integration (issue: global Back skipped the drill). Register a closer that pops ONE drill level
   // so the console's in-app Back and browser Back step L3→L2→L1→L0 through the drill before walking the
@@ -596,6 +604,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
           <DataTable
             data={(drillData?.data ?? []) as Row[]}
             emptyMessage="No tasks for this intent"
+            serverPagination={{ page: drillPage, pageSize: DRILL_PAGE_SIZE, total: drillTotal, onPageChange: setDrillPage, loading: drillLoading }}
             onRowClick={(row) => setDrill({ level: 3, intent: drill.intent, taskId: String(row.task_id) })}
             columns={[
               { key: 'task_id', label: 'Task', render: (v) => <button className="admin-link-btn" onClick={() => setDrill({ level: 3, intent: drill.intent, taskId: String(v) })}>{shortId(v)}</button> },
@@ -612,6 +621,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
           <DataTable
             data={(drillData?.data ?? []) as Row[]}
             emptyMessage="No exchanges for this intent"
+            serverPagination={{ page: drillPage, pageSize: DRILL_PAGE_SIZE, total: drillTotal, onPageChange: setDrillPage, loading: drillLoading }}
             columns={[
               { key: 'created_at', label: 'When', render: (v) => (v ? new Date(String(v)).toLocaleString() : '—') },
               { key: 'relevance_score', label: 'Relevance', sortable: true, render: (v) => <StatusValue value={v} targetKey="relevance_score" /> },

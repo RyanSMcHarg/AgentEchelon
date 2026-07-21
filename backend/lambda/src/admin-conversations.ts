@@ -217,14 +217,20 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 
 async function listConversations(event: APIGatewayProxyEvent, origin?: string, ceiling: ClassificationCeiling = null): Promise<APIGatewayProxyResult> {
   const limit = Math.min(Number(event.queryStringParameters?.limit || '50'), 200);
-  // A14 Scoped: keep only conversations at/below the caller's classification ceiling.
+  const offset = Math.max(Number(event.queryStringParameters?.offset || '0'), 0);
+  // A14 Scoped: the classifications at/below the caller's ceiling. Pushed INTO the SQL (below) so
+  // server-side LIMIT/OFFSET/total stay consistent for a scoped admin; null = full access (no filter).
+  const allowed = ceiling === null ? null : ['basic', 'standard', 'premium'].filter((c) => classificationAllowed(c, ceiling));
+  // Belt-and-suspenders: also filter the returned page (a no-op once SQL filters, but guards the
+  // Athena path and any classification value outside the known set).
   const scope = (list: AdminConversationSummaryLike[]) =>
     ceiling === null ? list : list.filter((c) => classificationAllowed(c?.metadata?.modelTier, ceiling));
   // Aurora mode: read from Aurora via the data-plane Lambda (sub-second) instead
   // of the slow Athena archive (see BUG #21).
   if (hasDataPlane()) {
     try {
-      return respond(200, { conversations: scope(await auroraListConversations(limit)) }, origin);
+      const { conversations, total } = await auroraListConversations(limit, offset, allowed);
+      return respond(200, { conversations: scope(conversations), total, limit, offset }, origin);
     } catch (err) {
       console.error('[AdminConversations] Aurora list failed:', err);
       return respond(200, { conversations: [], archiveError: (err as Error).message }, origin);
@@ -233,6 +239,9 @@ async function listConversations(event: APIGatewayProxyEvent, origin?: string, c
   // One pass over the archive: group by channel. Channel events carry Name;
   // message events carry MessageId/CreatedTimestamp. `user_type` is the S3
   // partition (= classification). MAX() picks the non-null Name across the group.
+  // Classification-ceiling scope in SQL (values are from the fixed {basic,standard,premium} set, so
+  // this interpolation is safe) so server-side OFFSET/LIMIT/total match what a scoped admin sees.
+  const clsFilter = allowed ? `AND user_type IN (${allowed.map((c) => `'${c}'`).join(',')})` : '';
   const query = `
     SELECT
       json_extract_scalar(line, '$.Payload.ChannelArn') AS channel_arn,
@@ -248,12 +257,13 @@ async function listConversations(event: APIGatewayProxyEvent, origin?: string, c
         END
       ) AS name,
       COUNT(json_extract_scalar(line, '$.Payload.MessageId')) AS message_count,
-      MAX(json_extract_scalar(line, '$.Payload.CreatedTimestamp')) AS last_message_at
+      MAX(json_extract_scalar(line, '$.Payload.CreatedTimestamp')) AS last_message_at,
+      COUNT(*) OVER() AS total_count
     FROM conversations
-    WHERE json_extract_scalar(line, '$.Payload.ChannelArn') IS NOT NULL
+    WHERE json_extract_scalar(line, '$.Payload.ChannelArn') IS NOT NULL ${clsFilter}
     GROUP BY json_extract_scalar(line, '$.Payload.ChannelArn')
     ORDER BY last_message_at DESC
-    LIMIT ${limit}
+    OFFSET ${offset} LIMIT ${limit}
   `;
   let result;
   try {
@@ -263,6 +273,7 @@ async function listConversations(event: APIGatewayProxyEvent, origin?: string, c
     return respond(200, { conversations: [], archiveError: (err as Error).message }, origin);
   }
   const idx = (name: string) => result.columns.indexOf(name);
+  const total = result.rows[0]?.[idx('total_count')] != null ? Number(result.rows[0][idx('total_count')]) : result.rows.length;
   const conversations = result.rows.map((r) => {
     const classification = r[idx('classification')] || '';
     return {
@@ -276,7 +287,7 @@ async function listConversations(event: APIGatewayProxyEvent, origin?: string, c
     };
   }).filter((c) => c.channelArn);
 
-  return respond(200, { conversations: scope(conversations) }, origin);
+  return respond(200, { conversations: scope(conversations), total, limit, offset }, origin);
 }
 
 // Minimal shape the classification scope reads (both the Aurora data-plane summary
@@ -299,7 +310,7 @@ async function channelClassificationAllowed(channelArn: string, ceiling: Classif
       // leak. Acceptable for the scoped personas today; if it bites, resolve the single
       // channel's classification directly (targeted data-plane lookup) instead of scanning
       // the recent list. Full admins never reach here (short-circuited above).
-      const list = await auroraListConversations(500);
+      const { conversations: list } = await auroraListConversations(500);
       cls = (list as Array<{ channelArn?: string; metadata?: { modelTier?: string } }>)
         .find((c) => c.channelArn === channelArn)?.metadata?.modelTier;
     } catch { cls = undefined; }

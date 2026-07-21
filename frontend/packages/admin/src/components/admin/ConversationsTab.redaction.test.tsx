@@ -31,7 +31,7 @@ const MESSAGES: AdminConversationMessage[] = [
 
 describe('ConversationsTab — redacted/deleted tombstones', () => {
   beforeEach(() => {
-    vi.mocked(svc.listAdminConversations).mockResolvedValue([]);
+    vi.mocked(svc.listAdminConversations).mockResolvedValue({ conversations: [], total: 0 });
     vi.mocked(svc.listAdminConversationMembers).mockResolvedValue([]);
     vi.mocked(svc.getAdminMembershipHistory).mockResolvedValue([]);
     vi.mocked(svc.listAdminConversationMessages).mockResolvedValue(MESSAGES);

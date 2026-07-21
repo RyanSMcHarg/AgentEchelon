@@ -224,8 +224,16 @@ export async function resolvePendingSuggestion(input: {
 // Admin Conversations reads (Aurora mode). Unlike the drift/retrieval wrappers
 // these PROPAGATE errors so the admin handler can surface an archiveError to the
 // console rather than silently returning empty (a read failure is user-visible).
-export async function adminListConversations(limit?: number): Promise<AdminConvSummary[]> {
-  return invoke<AdminConvSummary[]>('adminListConversations', { limit });
+export interface AdminConvPage {
+  conversations: AdminConvSummary[];
+  total: number;
+}
+export async function adminListConversations(
+  limit?: number,
+  offset?: number,
+  allowedClassifications?: string[] | null,
+): Promise<AdminConvPage> {
+  return invoke<AdminConvPage>('adminListConversations', { limit, offset, allowedClassifications });
 }
 export async function adminListMessages(channelArn: string): Promise<AdminConvMessage[]> {
   return invoke<AdminConvMessage[]>('adminListMessages', { channelArn });

@@ -106,8 +106,10 @@ export async function handler(req: DataPlaneRequest): Promise<unknown> {
       return backfillPlaceholders((req.input as BackfillOptions) || {});
     case 'backfillProfileAttribution':
       return backfillProfileAttribution((req.input as ProfileBackfillInput) || { attribution: {} });
-    case 'adminListConversations':
-      return adminListConversations((req.input as { limit?: number })?.limit);
+    case 'adminListConversations': {
+      const i = (req.input as { limit?: number; offset?: number; allowedClassifications?: string[] | null }) || {};
+      return adminListConversations(i.limit, i.offset, i.allowedClassifications ?? null);
+    }
     case 'adminListMessages':
       return adminListMessages((req.input as { channelArn: string }).channelArn);
     case 'adminMembershipHistory':

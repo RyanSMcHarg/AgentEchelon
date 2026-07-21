@@ -24,7 +24,7 @@ const MSG: AdminConversationMessage = {
 
 describe('ConversationsTab — global Back closes the detail first', () => {
   beforeEach(() => {
-    vi.mocked(svc.listAdminConversations).mockResolvedValue([]);
+    vi.mocked(svc.listAdminConversations).mockResolvedValue({ conversations: [], total: 0 });
     vi.mocked(svc.listAdminConversationMembers).mockResolvedValue([]);
     vi.mocked(svc.getAdminMembershipHistory).mockResolvedValue([]);
     vi.mocked(svc.listAdminConversationMessages).mockResolvedValue([MSG]);

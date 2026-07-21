@@ -84,6 +84,11 @@ function driftBadge(score: number): React.ReactNode {
 const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoading, deepLinkChannelArn, onDeepLinkConsumed, registerBack, onConversationChange }) => {
   const [view, setView] = useState<'browser' | 'drift'>('browser');
   const [conversations, setConversations] = useState<AdminConversationSummary[]>([]);
+  // Server-side pagination for the conversation list (it can grow unbounded): fetch one page + the
+  // total from the backend rather than a truncated window.
+  const CONV_PAGE_SIZE = 25;
+  const [convPage, setConvPage] = useState(0);
+  const [convTotal, setConvTotal] = useState(0);
   const [selectedConversation, setSelectedConversation] = useState<AdminConversationSummary | null>(null);
   const [messages, setMessages] = useState<AdminConversationMessage[]>([]);
   const [members, setMembers] = useState<AdminConversationMember[]>([]);
@@ -118,18 +123,25 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
     [messages]
   );
 
-  async function loadConversationList() {
+  async function loadConversationList(page = convPage) {
     setIsRefreshing(true);
     try {
       setListError(null);
-      const results = await listAdminConversations(40);
-      setConversations(results);
+      const { conversations: rows, total } = await listAdminConversations(CONV_PAGE_SIZE, page * CONV_PAGE_SIZE);
+      setConversations(rows);
+      setConvTotal(total);
     } catch (error) {
       setListError(error instanceof Error ? error.message : 'Failed to load conversations');
     } finally {
       setIsRefreshing(false);
       setHasLoadedList(true);
     }
+  }
+
+  // Fetch a specific page (server-side) and remember it as the current page.
+  function goToConvPage(page: number) {
+    setConvPage(page);
+    loadConversationList(page);
   }
 
   async function loadConversationDetail(channelArn: string, signal?: AbortSignal) {
@@ -604,6 +616,7 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
                   ]}
                   data={conversations}
                   emptyMessage="No conversations available"
+                  serverPagination={{ page: convPage, pageSize: CONV_PAGE_SIZE, total: convTotal, onPageChange: goToConvPage, loading: isRefreshing }}
                 />
               </>
             )}

@@ -63,12 +63,29 @@ export interface AdminMembershipEvent {
   isBot: boolean;
 }
 
-export async function adminListConversations(limit = 50): Promise<AdminConvSummary[]> {
+export interface AdminConvPage {
+  conversations: AdminConvSummary[];
+  total: number;
+}
+
+/**
+ * One page of the admin conversation list, plus the TOTAL match count (server-side pagination).
+ * `allowedClassifications` pushes the caller's classification-ceiling scope INTO the SQL so the
+ * page and total are consistent for a scoped admin (null = full access, no filter). COUNT(*) OVER()
+ * returns the total in the same round-trip.
+ */
+export async function adminListConversations(
+  limit = 50,
+  offset = 0,
+  allowedClassifications: string[] | null = null,
+): Promise<AdminConvPage> {
   const lim = Math.min(Math.max(1, limit), 200);
+  const off = Math.max(0, offset);
+  const allowed = allowedClassifications && allowedClassifications.length ? allowedClassifications : null;
   const res = await query<{
     channel_arn: string; classification: string | null; name: string | null;
     message_count: string; last_message_at: string | null; member_count: string;
-    is_deleted: boolean; is_archived: boolean;
+    is_deleted: boolean; is_archived: boolean; total_count: string;
   }>(
     `WITH names AS (
        SELECT DISTINCT ON (channel_arn) channel_arn, content AS name
@@ -131,26 +148,31 @@ export async function adminListConversations(limit = 50): Promise<AdminConvSumma
             a.message_count::text AS message_count, a.last_message_at,
             COALESCE(mem.member_count, 0)::text AS member_count,
             COALESCE(lc.is_deleted, false) AS is_deleted,
-            COALESCE(lc.is_archived, false) AS is_archived
+            COALESCE(lc.is_archived, false) AS is_archived,
+            COUNT(*) OVER()::text AS total_count
        FROM agg a
        LEFT JOIN names n ON n.channel_arn = a.channel_arn
        LEFT JOIN first_msg fm ON fm.channel_arn = a.channel_arn
        LEFT JOIN members mem ON mem.channel_arn = a.channel_arn
        LEFT JOIN lifecycle lc ON lc.channel_arn = a.channel_arn
       WHERE a.message_count > 0
+        -- Classification-ceiling scope in SQL, so LIMIT/OFFSET/total match what a scoped admin sees.
+        AND ($3::text[] IS NULL OR a.classification = ANY($3))
       ORDER BY a.last_message_at DESC NULLS LAST
-      LIMIT $1`,
-    [lim],
+      LIMIT $1 OFFSET $2`,
+    [lim, off, allowed],
   );
-  return res.rows.map((r) => ({
+  const total = res.rows[0]?.total_count != null ? Number(res.rows[0].total_count) : res.rows.length;
+  const conversations = res.rows.map((r) => ({
     channelArn: r.channel_arn,
     name: r.name || 'Untitled Conversation',
     messageCount: Number(r.message_count || 0),
     lastMessageAt: r.last_message_at || undefined,
     memberCount: Number(r.member_count || 0),
-    state: r.is_deleted ? 'deleted' : r.is_archived ? 'archived' : 'live',
+    state: (r.is_deleted ? 'deleted' : r.is_archived ? 'archived' : 'live') as 'live' | 'archived' | 'deleted',
     metadata: { modelTier: r.classification || '' },
   }));
+  return { conversations, total };
 }
 
 // moderation_actions holds WHO redacted/deleted WHICH message, stamped by the analytics API at
