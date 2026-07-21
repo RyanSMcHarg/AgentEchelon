@@ -49,55 +49,22 @@ The key insight: **Cognito Identity Pools don't care where the token comes from.
 
 ## The access-control model is identity-provider-agnostic (read this first)
 
-This is the foundational principle that makes IdP integration - and tier
-enforcement - work cleanly, and it dictates *where* access is enforced.
+This is the foundational principle that makes IdP integration - and tier enforcement - work cleanly, and it dictates *where* access is enforced.
 
-**Amazon Chime SDK messaging authorizes every channel action at two native
-layers, neither of which knows or cares which IdP a user came from:**
+**Amazon Chime SDK messaging authorizes every channel action at two native layers, neither of which knows or cares which IdP a user came from:**
 
-1. **The AppInstanceUser** (the `ChimeBearer`) - Amazon Chime SDK's own model: channel
-   membership, `RESTRICTED` mode, moderator status, `HIDDEN` membership. This
-   decides whether *this principal* may act on *this channel*.
-2. **The IAM role the caller assumes** - via the Identity Pool (or, in Approach
-   2, via STS directly). This decides whether the API call is permitted at all,
-   and to which model/data ARNs.
+1. **The AppInstanceUser** (the `ChimeBearer`) - Amazon Chime SDK's own model: channel membership, `RESTRICTED` mode, moderator status, `HIDDEN` membership. This decides whether *this principal* may act on *this channel*.
+2. **The IAM role the caller assumes** - via the Identity Pool (or, in Approach 2, via STS directly). This decides whether the API call is permitted at all, and to which model/data ARNs.
 
-Both layers are reached the same way no matter how the user authenticated:
-**every principal - a Cognito user, an external OIDC/SAML user, or an
-*unauthenticated guest* - resolves to (a) an AppInstanceUser and (b) an assumed
-role.** The *access level* (which tier, read-only, guest) is something **we
-choose** by which AppInstanceUser we create and which role we map the principal
-to. It is **not** a property of the IdP.
+Both layers are reached the same way no matter how the user authenticated: **every principal - a Cognito user, an external OIDC/SAML user, or an *unauthenticated guest* - resolves to (a) an AppInstanceUser and (b) an assumed role.** The *access level* (which tier, read-only, guest) is something **we choose** by which AppInstanceUser we create and which role we map the principal to. It is **not** a property of the IdP.
 
 **Consequences - design to these, not around them:**
 
-- **Enforce at the AppInstanceUser + assumed-role layer, never on
-  Cognito-specific signals.** Cognito groups / `custom:tier` are just *one* way
-  to drive the role-and-membership mapping. An external IdP drives the same
-  mapping from its own claims; a guest gets a default guest role + restricted
-  membership. If you enforced on `cognito:groups` directly, you'd lock out every
-  non-Cognito user. (This is also why tier→role selection in **Step 8** keys on
-  a *claim* that any IdP can emit, and why the channel-join boundary is expressed
-  as "who may be a channel member" + "what the assumed role may call" - both
-  IdP-neutral - rather than a Cognito construct.)
-- **Unauthenticated / guest access is a first-class, *controlled* level.** Amazon Chime SDK
-  supports unauthenticated Identity Pool identities (a guest role) and guest
-  AppInstanceUsers. AgentEchelon ships with `allowUnauthenticatedIdentities:
-  false`, but the model is designed so a deployer can grant guests a deliberate,
-  bounded access level - e.g. a `guest` role limited to a public/basic
-  classification, added to channels only as `HIDDEN` or to `basic`-classified
-  channels - using the **same** two enforcement layers. You are always granting
-  guests *a level of access you control*, never an accident of the IdP.
-- **The strongest tier boundaries are the IdP-agnostic ones.** The per-tier
-  *model* IAM (what models a role may invoke) and the *channel membership* gate
-  (who may be added to a higher-tier channel - enforced today in
-  `create-conversation`/`share-conversation`) hold for every IdP and for guests,
-  because they live on the role and the AppInstanceUser. Anything that depends on
-  a Cognito-only signal is, by definition, not portable - keep it as a
-  convenience layer above the portable enforcement, not as the enforcement.
+- **Enforce at the AppInstanceUser + assumed-role layer, never on Cognito-specific signals.** Cognito groups / `custom:tier` are just *one* way to drive the role-and-membership mapping. An external IdP drives the same mapping from its own claims; a guest gets a default guest role + restricted membership. If you enforced on `cognito:groups` directly, you'd lock out every non-Cognito user. (This is also why tier→role selection in **Step 8** keys on a *claim* that any IdP can emit, and why the channel-join boundary is expressed as "who may be a channel member" + "what the assumed role may call" - both IdP-neutral - rather than a Cognito construct.)
+- **Unauthenticated / guest access is a first-class, *controlled* level.** Amazon Chime SDK supports unauthenticated Identity Pool identities (a guest role) and guest AppInstanceUsers. AgentEchelon ships with `allowUnauthenticatedIdentities: false`, but the model is designed so a deployer can grant guests a deliberate, bounded access level - e.g. a `guest` role limited to a public/basic classification, added to channels only as `HIDDEN` or to `basic`-classified channels - using the **same** two enforcement layers. You are always granting guests *a level of access you control*, never an accident of the IdP.
+- **The strongest tier boundaries are the IdP-agnostic ones.** The per-tier *model* IAM (what models a role may invoke) and the *channel membership* gate (who may be added to a higher-tier channel - enforced today in `create-conversation`/`share-conversation`) hold for every IdP and for guests, because they live on the role and the AppInstanceUser. Anything that depends on a Cognito-only signal is, by definition, not portable - keep it as a convenience layer above the portable enforcement, not as the enforcement.
 
-See also `docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md` (the channel-join boundary +
-membership model) and **Step 8** below (claim-driven tier→role mapping).
+See also `docs/specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md` (the channel-join boundary + membership model) and **Step 8** below (claim-driven tier→role mapping).
 
 ---
 
@@ -310,7 +277,7 @@ async function ensureChimeUser(userId: string, displayName: string) {
       Name: displayName,
     }));
   } catch (error: any) {
-    // 409 Conflict means user already exists — that's fine
+    // 409 Conflict means user already exists - that's fine
     if (error.name !== 'ConflictException') throw error;
   }
 }
@@ -333,7 +300,7 @@ AgentEchelon uses a `custom:tier` attribute on Cognito users to control model ac
 
 ### Step 7: Sync the tier attribute into a Cognito group (extension point)
 
-**Background - why this step exists.** AgentEchelon's authorization checks trust **Cognito group membership**, not the `custom:tier` attribute. The group is the authoritative signal; the attribute is just a hint that gets mirrored into the matching group at sign-up time. Three places read groups: `router-agent-handler.ts`, `share-conversation/index.js`, and `create-conversation/index.js`. Two places write them: `post-confirmation.js` (runs at self-signup) and `user-management.ts` (runs when an admin approves or changes a user's tier). See [SPEC-CONVERSATION-SECURITY.md](../../specs/identity-access/SPEC-CONVERSATION-SECURITY.md) for the full rationale.
+**Background - why this step exists.** AgentEchelon's authorization checks trust **Cognito group membership**, not the `custom:tier` attribute. The group is the authoritative signal; the attribute is just a hint that gets mirrored into the matching group at sign-up time. Three places read groups: `router-agent-handler.ts`, `share-conversation/index.js`, and `create-conversation/index.js`. Two places write them: `post-confirmation.js` (runs at self-signup) and `user-management.ts` (runs when an admin approves or changes a user's tier). See [SPEC-CONVERSATION-SECURITY.md](../../specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md) for the full rationale.
 
 **The gap for federated users.** Cognito's `PostConfirmation_ConfirmSignUp` trigger **does not fire** for users created via federated IdPs (SAML / OIDC). It fires only for the native username-and-password sign-up flow. A SAML user therefore lands in the pool with `custom:tier` possibly populated (via your attribute mapping) but no group membership. Every reader in the system falls through to `basic` in that case - no crashes, no security bypass, just the conservative floor until an admin elevates them via the user-management UI.
 
@@ -402,11 +369,11 @@ const postAuthenticationFn = new lambda.Function(this, 'PostAuthenticationFn', {
   handler: 'post-authentication.handler',
   code: lambda.Code.fromAsset('lambda/cognito-triggers'),
   timeout: cdk.Duration.seconds(10),
-  role: lambdaRole, // Same role — it already has AdminAddUserToGroup etc.
+  role: lambdaRole, // Same role - it already has AdminAddUserToGroup etc.
   description: 'Mirrors custom:tier into a Cognito group on every sign-in (IdP-safe)',
 });
 
-// Wire the trigger alongside the existing ones — L1 to avoid circular deps
+// Wire the trigger alongside the existing ones - L1 to avoid circular deps
 cfnUserPool.lambdaConfig = {
   postConfirmation: postConfirmationFn.functionArn,
   preAuthentication: preAuthenticationFn.functionArn,
@@ -547,7 +514,7 @@ async function ensureChimeUser(user: UserInfo): Promise<string> {
     }));
   } catch (error: any) {
     if (error.name !== 'ConflictException') throw error;
-    // User already exists — fine
+    // User already exists - fine
   }
 
   return userArn;
@@ -679,7 +646,7 @@ useEffect(() => {
     try {
       await chimeService.initialize(currentToken, userId);
     } catch {
-      // Credential refresh failed — redirect to login
+      // Credential refresh failed - redirect to login
       logout();
     }
   }, CREDENTIAL_REFRESH_MS);

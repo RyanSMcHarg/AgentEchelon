@@ -13,21 +13,15 @@ related:
 
 ## Context
 
-SPEC-DRIFT-CONVERGENCE.md establishes the hardened drift design (path C).
-The eval-suite fixture (`tests/e2e/fixtures/drift-detection-cases.json`) is the CI gate that
-keeps drift behaviour stable across refactors.
+SPEC-DRIFT-CONVERGENCE.md establishes the hardened drift design (path C). The eval-suite fixture (`tests/e2e/fixtures/drift-detection-cases.json`) is the CI gate that keeps drift behavior stable across refactors.
 
-For the eval suite to stay stable, **the `DriftResult` shape must be stable**. This ADR pins
-the interface so a consumer can depend on the drift module without translation overhead, and so
-a future refactor can't silently desync the shape the eval suite asserts against.
+For the eval suite to stay stable, **the `DriftResult` shape must be stable**. This ADR pins the interface so a consumer can depend on the drift module without translation overhead, and so a future refactor can't silently desync the shape the eval suite asserts against.
 
-This is not a design decision in the "which approach do we take" sense - the design is already
-locked in the spec. This ADR exists to prevent drift (heh) in the *interface*.
+This is not a design decision in the "which approach do we take" sense - the design is already locked in the spec. This ADR exists to prevent drift (heh) in the *interface*.
 
 ## Decision
 
-The contract is the `DriftResult` interface in
-`backend/lambda/src/analytics-aurora/drift-detection.ts`:
+The contract is the `DriftResult` interface in `backend/lambda/src/analytics-aurora/drift-detection.ts`:
 
 ```typescript
 export interface DriftResult {
@@ -39,7 +33,7 @@ export interface DriftResult {
    * conversation summary embedding. Range 0-2 (lower = more similar).
    * `NaN` when `signalAvailable` is false (no embedding could be
    * computed). When the explicit-routing fast-path matched, this is
-   * the sentinel value `1.0` — drift is not "scored" in that path.
+   * the sentinel value `1.0` - drift is not "scored" in that path.
    */
   driftScore: number;
 
@@ -79,7 +73,7 @@ export interface DriftResult {
 
   /**
    * Templated suggestion text. Present only when `suggestedAction !==
-   * 'continue'`. The consumer SHOULD emit this verbatim — no string
+   * 'continue'`. The consumer SHOULD emit this verbatim - no string
    * interpolation of user-derived content (no topic name, no entity
    * extraction) per the by-reference principle.
    */
@@ -128,44 +122,27 @@ export interface DetectDriftInput {
 
 ## Stability boundary
 
-The fields above are **stable**. Adding new optional fields is allowed; renaming, removing, or
-changing the semantics of existing fields is a breaking change to the interface and requires a
-documented note explaining the divergence and its migration.
+The fields above are **stable**. Adding new optional fields is allowed; renaming, removing, or changing the semantics of existing fields is a breaking change to the interface and requires a documented note explaining the divergence and its migration.
 
-Changes to `DriftResult` MUST update the eval-suite fixture's `$schema` field accordingly so
-version drift is caught by CI.
+Changes to `DriftResult` MUST update the eval-suite fixture's `$schema` field accordingly so version drift is caught by CI.
 
 ## What is NOT part of the contract
 
 These are AE-internal and may change without coordination:
 
-- **Bedrock model id** for embedding (currently `amazon.titan-embed-text-v2:0`).
-  The contract assumes 1024-dim cosine-comparable embeddings; the specific
-  model is an implementation detail.
-- **Threshold values** (`DRIFT_DISTANCE_THRESHOLD` default 0.35,
-  `REROUTE_SIMILARITY_THRESHOLD` default 0.80). Both are SSM-tunable and
-  expected to vary between deployments; the eval suite converges them.
-- **EMF namespace** (currently `AgentEchelon/Drift`). The *dimension* names and metric shapes
-  per the SPEC observability section are what stays stable, not the namespace string.
-- **Internal Lambda boundaries**. The logic currently lives in a single
-  `analytics-aurora/drift-detection.ts` module, but may be split or merged across Lambdas. The
-  function-level signature above is what crosses the wire.
+- **Bedrock model id** for embedding (currently `amazon.titan-embed-text-v2:0`). The contract assumes 1024-dim cosine-comparable embeddings; the specific model is an implementation detail.
+- **Threshold values** (`DRIFT_DISTANCE_THRESHOLD` default 0.35, `REROUTE_SIMILARITY_THRESHOLD` default 0.80). Both are SSM-tunable and expected to vary between deployments; the eval suite converges them.
+- **EMF namespace** (currently `AgentEchelon/Drift`). The *dimension* names and metric shapes per the SPEC observability section are what stays stable, not the namespace string.
+- **Internal Lambda boundaries**. The logic currently lives in a single `analytics-aurora/drift-detection.ts` module, but may be split or merged across Lambdas. The function-level signature above is what crosses the wire.
 
 ## Why this is a separate ADR (not just a SPEC pointer)
 
-The SPEC describes design intent. This ADR describes the *commitment* that the result shape is a
-stable interface. The eval-suite SHA check is the enforcement mechanism, but it only catches
-behavioral drift after the fact. This ADR is the declaration that lets a future contributor look
-at the file and know that changing the `DriftResult` shape is a breaking interface change, not a
-unilateral refactor.
+The SPEC describes design intent. This ADR describes the *commitment* that the result shape is a stable interface. The eval-suite SHA check is the enforcement mechanism, but it only catches behavioral drift after the fact. This ADR is the declaration that lets a future contributor look at the file and know that changing the `DriftResult` shape is a breaking interface change, not a unilateral refactor.
 
 ## Consequences
 
-- The type lives in TypeScript source as the single source of truth. Any PR touching
-  `DriftResult` needs an entry in this ADR's revision history below.
-- A consumer's `DriftResult` declaration MUST match the canonical interface block in this file.
-  A simple `diff` in CI is sufficient - the comparison runs on the canonical interface block
-  only, identified by fenced code markers.
+- The type lives in TypeScript source as the single source of truth. Any PR touching `DriftResult` needs an entry in this ADR's revision history below.
+- A consumer's `DriftResult` declaration MUST match the canonical interface block in this file. A simple `diff` in CI is sufficient - the comparison runs on the canonical interface block only, identified by fenced code markers.
 
 ## Revision history
 

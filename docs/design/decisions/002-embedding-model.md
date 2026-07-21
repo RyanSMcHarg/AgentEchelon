@@ -12,9 +12,9 @@ blocks:
 
 ## Context
 
-Bedrock Knowledge Base supports several embedding models. Our existing dormant pgvector schemas declare 1536-dim columns (consistent with OpenAI `text-embedding-3-small` defaults). None of the Bedrock-native options match 1536; we will need to alter or drop the existing schema, or run two parallel embedding spaces.
+The RAG capability a deployer wants (ADR-001) only answers well if the embedding model behind it gives good-enough retrieval quality at a cost that does not surprise them - and without forcing them to sign up for a separate embedding provider. So the user problem is **affordable, decent-quality semantic search over a team's own content**, with multilingual reach available to those who need it. Bedrock Knowledge Base supports several embedding models that trade quality, cost, dimensionality, and language coverage against each other; the choice also shapes downstream compatibility (cross-conversation context analytics in Phase 3 should use the same model for consistency).
 
-The choice affects retrieval quality, cost, dim, and downstream compatibility (cross-conversation context analytics in Phase 3 should use the same model for consistency).
+Current state qualifies the answer: AE's dormant pgvector schemas declare 1536-dim columns (consistent with OpenAI `text-embedding-3-small` defaults), and none of the Bedrock-native options match 1536 - so whichever model wins, the empty schema is altered, dropped, or paired with a second embedding space.
 
 ## Options
 

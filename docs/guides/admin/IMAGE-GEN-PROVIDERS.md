@@ -85,21 +85,21 @@ Provision (the image-gen invocations are made from the shared `assistant-async-p
 2. Set the spend limit on the OpenAI side (separate from your AWS billing).
 3. Store the key - pick one of:
 
-   **Option A (quick, single-deployer):** AWS Lambda env var, set via CLI:
+ **Option A (quick, single-deployer):** AWS Lambda env var, set via CLI:
    ```bash
    aws lambda update-function-configuration \
      --function-name <Tier-Premium-AsyncProcessor-function-name> \
      --environment "Variables={OPENAI_API_KEY=sk-...,FAL_KEY=...,...existing vars}"
    ```
-   ⚠️ Replace the entire Variables map - this command overwrites, doesn't merge. Capture existing vars first via `aws lambda get-function-configuration`.
+ ⚠️ Replace the entire Variables map - this command overwrites, doesn't merge. Capture existing vars first via `aws lambda get-function-configuration`.
 
-   **Option B (preferred for production):** AWS Secrets Manager + a cold-start fetch:
+ **Option B (preferred for production):** AWS Secrets Manager + a cold-start fetch:
    ```bash
    aws secretsmanager create-secret \
      --name agent-echelon/openai-key \
      --secret-string '{"OPENAI_API_KEY":"sk-..."}'
    ```
-   Then reference in CDK and grant `secretsmanager:GetSecretValue` to the PremiumAsyncProcessor role; have the Lambda load the secret into `process.env` at module init. Adds ~$0.40/month per secret + ~$0.05 per 10K reads.
+ Then reference in CDK and grant `secretsmanager:GetSecretValue` to the PremiumAsyncProcessor role; have the Lambda load the secret into `process.env` at module init. Adds ~$0.40/month per secret + ~$0.05 per 10K reads.
 
 **Never** put the literal key string into the CDK source file as `environment: { OPENAI_API_KEY: 'sk-...' }` - it ends up in the synthesized CloudFormation template in your bootstrap S3 bucket.
 
@@ -145,7 +145,7 @@ This is acceptable for single-owner deployments where every principal that can r
 **Never put the literal key in CDK source code.** Writing `environment: { OPENAI_API_KEY: 'sk-...' }` in the CDK stack file looks ergonomic but ships the secret into the synthesized CloudFormation template - which is stored in the CDK bootstrap S3 bucket. Anyone with read access to that bucket (broader than you think) can extract the key. Concrete patterns:
 
 ```ts
-// CDK example using Secrets Manager — preferred for any non-trivial deployment
+// CDK example using Secrets Manager - preferred for any non-trivial deployment
 import * as secrets from 'aws-cdk-lib/aws-secretsmanager';
 const openaiSecret = secrets.Secret.fromSecretNameV2(this, 'OpenAIKey', 'agent-echelon/openai-key');
 new lambdaNodeJs.NodejsFunction(this, 'AsyncProcessor', { // shared construct id in assistant-profile-stack.ts
@@ -214,7 +214,7 @@ If both bots in a battle target the same provider, parallel fan-out doubles the 
 
 **Cold start.** The Bedrock SDK client is a module-level singleton (`defaultSendClient()`) reused across warm invocations. The external-HTTP path has no client to instantiate - `fetch` is a built-in. Cold start cost is essentially the Lambda + module-load cost, not the network client.
 
-**Cost ceiling.** The registry's `maxImages` + `maxDimension` are HARD caps the shaper clamps to. The deployer's `battleImageMaxImages` / `battleImageMaxDimension` CDK context can only *lower* them further - fat-fingering a higher cap can never raise the ceiling. See [SPEC-BATTLE.md](../../specs/experiments-battle/SPEC-BATTLE.md) for the per-battle cost guard math.
+**Cost ceiling.** The registry's `maxImages` + `maxDimension` are HARD caps the shaper clamps to. The deployer's `battleImageMaxImages` / `battleImageMaxDimension` CDK context can only *lower* them further - fat-fingering a higher cap can never raise the ceiling. See [SPEC-BATTLE.md](../../specs/capabilities/SPEC-BATTLE.md) for the per-battle cost guard math.
 
 ### Cost picture: how this layers on top of the existing modes
 
@@ -277,4 +277,4 @@ That's the surface - no other module changes needed. The exhaustiveness check in
 - `backend/lambda/src/lib/image-gen-models.ts` - registry + shapers + invokers
 - `backend/test/lib/image-gen-models.test.ts` - Titan/Nova back-compat tests
 - `backend/test/lib/image-gen-models-providers.test.ts` - Stability, OpenAI, FAL, lifecycle, external-HTTP routing tests
-- `docs/specs/experiments-battle/SPEC-BATTLE.md` - `/battle` generation-out spec, cost guards, scorecard math
+- `docs/specs/capabilities/SPEC-BATTLE.md` - `/battle` generation-out spec, cost guards, scorecard math

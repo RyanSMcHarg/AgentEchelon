@@ -10,9 +10,9 @@ blocks:
 
 ## Context
 
-Bedrock Knowledge Base requires a vector store. AWS-supported options are Aurora PostgreSQL (pgvector), OpenSearch Serverless, OpenSearch Service (managed), Pinecone, and a few others. We're choosing between the two AWS-managed options that fit our existing stack.
+A team deploying AE wants their assistant to answer from their own documents - retrieval-augmented generation (RAG) - without standing up and paying for a separate vector-search service they would otherwise buy or self-host. The user problem is **cost-effective RAG**: grounded answers over a low-thousands-of-documents corpus at a price that does not deter an evaluator. Bedrock Knowledge Base needs a vector store to make that work, and the AWS-supported options are Aurora PostgreSQL (pgvector), OpenSearch Serverless, OpenSearch Service (managed), Pinecone, and a few others.
 
-AE has Aurora as opt-in (`--context analyticsMode=aurora`), with a dormant pgvector schema already in place.
+The answer then takes current state into account: AE already offers Aurora as an opt-in analytics backend (`--context analyticsMode=aurora`) with a dormant pgvector schema in place, so the practical choice is between the two AWS-managed options that fit the stack a deployer may already run.
 
 ## Options
 

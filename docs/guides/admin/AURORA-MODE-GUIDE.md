@@ -8,14 +8,7 @@ This guide covers when to switch, how to deploy, and what to expect.
 
 ## When to use Aurora mode
 
-> **Athena/S3 is the system of record; Aurora is a fast projection of it.** Both modes write the same
-> append-only S3 conversation archive (the Kinesis stream fans out to S3 in either mode), and that archive
-> is the **complete, durable Chime event stream** partitioned by classification. Aurora mode adds a
-> Postgres/pgvector copy for sub-second queries and features Athena cannot serve (evaluation, drift,
-> cross-conversation search), but that copy is a **lossy real-time projection** (it collapses membership
-> to current state and drops some events). Switching modes does not change what is retained; it changes
-> what is queryable and how fast. So "not available in Athena" below means *the query path or derived
-> table is not built for Athena mode*, never that the underlying events are missing from the archive.
+> **Athena/S3 is the system of record; Aurora is a fast projection of it.** Both modes write the same append-only S3 conversation archive (the Kinesis stream fans out to S3 in either mode), and that archive is the **complete, durable Amazon Chime SDK Messaging event stream** partitioned by classification. Aurora mode adds a Postgres/pgvector copy for sub-second queries and features Athena cannot serve (evaluation, drift, cross-conversation search), but that copy is a **lossy real-time projection** (it collapses membership to current state and drops some events). Switching modes does not change what is retained; it changes what is queryable and how fast. So "not available in Athena" below means *the query path or derived table is not built for Athena mode*, never that the underlying events are missing from the archive.
 
 | Consideration | Athena (default) | Aurora |
 |---------------|-----------------|--------|
@@ -36,10 +29,7 @@ This guide covers when to switch, how to deploy, and what to expect.
 
 **Use Aurora** when you need real-time admin dashboards, automated evaluation pipelines, drift detection, or cross-conversation context.
 
-> **A14 note (IAM enforcement).** Under `-c adminIamEnforcement=true`, Aurora mode splits the analytics
-> API into per-capability resources (so a persona role can be denied, say, `view-user-activity` at the
-> gateway). Athena mode's analytics API is a single `POST /query`, so it enforces at the coarse
-> analytics-read level - a stack gap, not a data one. See `SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md`.
+> **A14 note (IAM enforcement).** Under `-c adminIamEnforcement=true`, Aurora mode splits the analytics API into per-capability resources (so a persona role can be denied, say, `view-user-activity` at the gateway). Athena mode's analytics API is a single `POST /query`, so it enforces at the coarse analytics-read level - a stack gap, not a data one. See `SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md`.
 
 ---
 
@@ -135,12 +125,12 @@ SQL migrations live in `backend/lambda/src/analytics-aurora/schema/` and run in 
 | `009-drift-reasoning-decision.sql` | `drift_events` reasoning-decision columns: LLM verdict + human-auditable rationale; cosine similarity retained only for retrieval |
 | `010-task-state-machine.sql` | `task_state` + `task_transition` (JSONB) on `messages` and `exchanges`: the declared-graph machine state per turn (distinct from `task_status`), for the Effectiveness turn timeline |
 | `011-eval-task-join-key.sql` | `evaluation_results.task_id`: the flow join key Pass A stamps at write time (paired with the existing `flow_id`) |
-| `012-moderation-actions.sql` | `moderation_actions`: who redacted/deleted which message and when, stamped with the server-verified admin identity (the Chime redact/delete event keeps the original author, so this table is the source for admin-console attribution) |
+| `012-moderation-actions.sql` | `moderation_actions`: who redacted/deleted which message and when, stamped with the server-verified admin identity (the Amazon Chime SDK Messaging redact/delete event keeps the original author, so this table is the source for admin-console attribution) |
 
 Migrations are idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE EXTENSION IF NOT EXISTS`). Adding a new migration:
 
 1. Create `012-your-feature.sql` in the schema directory
-2. Redeploy -- the custom resource picks up new files automatically
+2. Redeploy - the custom resource picks up new files automatically
 
 ### Why the cluster amortizes across multiple workloads
 
@@ -230,16 +220,15 @@ The evaluator model is configured via the `EVALUATOR_MODEL` environment variable
 
 Drift detection is **exclusively an Aurora-mode capability.** It depends on pgvector cosine similarity over Titan v2 embeddings stored in Aurora; there is no Athena-mode equivalent. Deploying with the default Athena mode silently disables the feature - no errors, just no live drift suggestions.
 
-**Design summary** (full detail in `docs/specs/analytics-eval/SPEC-DRIFT-CONVERGENCE.md`):
+**Design summary** (full detail in `docs/specs/capabilities/SPEC-DRIFT-CONVERGENCE.md`):
 
 1. **Summary updater Lambda** runs every 30 minutes (EventBridge scheduled), finds channels with messages newer than their newest summary, generates a fresh summary via Bedrock Haiku at temperature 0, and stores it in `conversation_summaries`.
 2. **Embedding writer** (inline in the summary updater) generates a Titan v2 1024-dim embedding of the new summary and UPSERTs into `summary_embeddings` with a version guard.
-3. **`detectDrift()`** runs on the live user-message path (when `enableLiveDrift` CDK context is `true`),
-   executing inside the retrieval **data-plane Lambda** that the non-VPC router invokes (project decision 018):
-   - Embeds the user message via Titan v2 (500ms hard timeout)
-   - Computes cosine distance against the channel's summary embedding
-   - If distance > threshold (default 0.35), drift fires
-   - Optionally upgrades `confirm` → `redirect` via cosine-NN against the user's other channels (scoped by multi-member intersection)
+3. **`detectDrift()`** runs on the live user-message path (when `enableLiveDrift` CDK context is `true`), executing inside the retrieval **data-plane Lambda** that the non-VPC router invokes (project decision 018):
+ - Embeds the user message via Titan v2 (500ms hard timeout)
+ - Computes cosine distance against the channel's summary embedding
+ - If distance > threshold (default 0.35), drift fires
+ - Optionally upgrades `confirm` → `redirect` via cosine-NN against the user's other channels (scoped by multi-member intersection)
 4. **On embedding failure**, drift skips for the turn - there is no string-matching fallback (intentional, per the spec).
 5. **`drift_events`** table records every fire by reference (originating message id only; never the message body). Outcomes: `accepted`, `declined`, `rejected_in_new_channel`, `abandoned` (last written by a scheduled detector Lambda).
 6. **Decline-suppression:** if the user declined a drift at cosine distance `d`, drift won't re-fire within `d ± 0.05` for the next 3 turns.
@@ -255,23 +244,13 @@ npx cdk deploy --all \
 
 Both flags are required for live drift. `enableLiveDrift=true` without `analyticsMode=aurora` is a misconfiguration - the router has no Aurora to query and drift will silently skip every turn (with a CloudWatch warn log).
 
-**How `enableLiveDrift` wires the path (project decision 018).** It does **not** VPC-attach the agent handler.
-The handler stays non-VPC; retrieval and drift run in a dedicated VPC-attached **data-plane Lambda** (in the
-Aurora stack), and `enableLiveDrift` grants the handler `lambda:InvokeFunction` on that Lambda plus its ARN.
-This avoids the failure where a VPC-attached handler cannot reach SSM, Cognito, or Lambda-invoke from the
-isolated subnets. The data-plane Lambda reuses the existing Bedrock and Secrets endpoints, so it adds no new
-VPC endpoints. Per-piece costs are in `docs/guides/admin/INFRASTRUCTURE-COST.md`.
+**How `enableLiveDrift` wires the path (project decision 018).** It does **not** VPC-attach the agent handler. The handler stays non-VPC; retrieval and drift run in a dedicated VPC-attached **data-plane Lambda** (in the Aurora stack), and `enableLiveDrift` grants the handler `lambda:InvokeFunction` on that Lambda plus its ARN. This avoids the failure where a VPC-attached handler cannot reach SSM, Cognito, or Lambda-invoke from the isolated subnets. The data-plane Lambda reuses the existing Bedrock and Secrets endpoints, so it adds no new VPC endpoints. Per-piece costs are in `docs/guides/admin/INFRASTRUCTURE-COST.md`.
 
 ---
 
 ## Cost breakdown
 
-The full per-component cost model lives in the single source of truth,
-[INFRASTRUCTURE-COST.md](INFRASTRUCTURE-COST.md). In summary: Aurora mode's at-rest baseline is roughly
-~$50/month when importing a VPC (no interface endpoints) or ~$95/month on a stack-created VPC, dominated by
-the Aurora cluster at its ACU floor; it scales to 4 ACU under load. Kinesis is shared with Athena mode and
-is not an incremental Aurora cost. The RDS Proxy is off by default (+~$86/month when enabled; see
-[Connection pooling](#connection-pooling-rds-proxy-optional-for-scale) below).
+The full per-component cost model lives in the single source of truth, [INFRASTRUCTURE-COST.md](INFRASTRUCTURE-COST.md). In summary: Aurora mode's at-rest baseline is roughly ~$50/month when importing a VPC (no interface endpoints) or ~$95/month on a stack-created VPC, dominated by the Aurora cluster at its ACU floor; it scales to 4 ACU under load. Kinesis is shared with Athena mode and is not an incremental Aurora cost. The RDS Proxy is off by default (+~$86/month when enabled; see [Connection pooling](#connection-pooling-rds-proxy-optional-for-scale) below).
 
 ---
 
@@ -315,6 +294,6 @@ Enabling the proxy adds ~$86/month (the 8-ACU floor) and re-points the Lambdas' 
 
 ### Analytics API returns empty results
 
-- The database starts empty -- data accumulates as users chat
+- The database starts empty - data accumulates as users chat
 - Materialized views refresh on a schedule; initial results may be stale
 - Check the archival Lambda logs to confirm Kinesis events are being processed

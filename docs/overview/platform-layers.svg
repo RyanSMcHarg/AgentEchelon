@@ -1,0 +1,43 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="720" viewBox="0 0 720 408" role="img" aria-labelledby="pl-title pl-desc">
+<title id="pl-title">AgentEchelon architectural stack</title>
+<desc id="pl-desc">Four layers, each running on the one below. Interface: the client surfaces - an end-user app (a web chat client today, built) and the operator admin app (built), with mobile and phone on the roadmap and email partially built. Communication: the connectivity that wires each client to the engine - WebSocket and REST for messaging (built), WebRTC (roadmap), email (partially built - outbound only), and voice over PSTN (roadmap). Interaction: the engine - AgentEchelon's own code (assistants, memory, routing, the IAM policy and tags it authors, config, auditing) over the AWS services it composes (Amazon Chime SDK Messaging, Amazon Lex, Amazon Bedrock, Amazon Cognito / STS, and AWS IAM, which enforces the access decision). Foundations: deployment and management. Colour key: teal = AgentEchelon-built, grey = AWS service, beige = partially built, dashed = roadmap.</desc>
+<style>
+text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Arial,sans-serif}
+.h{font-size:14px;font-weight:600}.s{font-size:11.5px;font-weight:400}.plain{fill:#5F5E5A}
+.lbl{font-size:11px;font-weight:700;letter-spacing:.05em;fill:#5F5E5A}.subl{font-size:9px;font-weight:600;fill:#8A8880}
+.teal rect{fill:#E1F5EE;stroke:#0F6E56;stroke-width:.6}.teal .h{fill:#085041}.teal .s{fill:#0F6E56}
+.amber rect{fill:#FAEEDA;stroke:#854F0B;stroke-width:.6}.amber .h{fill:#633806}.amber .s{fill:#854F0B}
+.rm rect{fill:none;stroke:#8A8880;stroke-width:1;stroke-dasharray:4 3}.rm .h{fill:#6B6A64}.rm .s{fill:#6B6A64}
+.gray rect{fill:#F1EFE8;stroke:#5F5E5A;stroke-width:.6}.gray .h{fill:#444441}.gray .s{fill:#5F5E5A}
+.kt{fill:#E1F5EE;stroke:#0F6E56;stroke-width:.8}.kg{fill:#F1EFE8;stroke:#5F5E5A;stroke-width:.8}.ka{fill:#FAEEDA;stroke:#854F0B;stroke-width:.8}.kr{fill:none;stroke:#8A8880;stroke-width:1;stroke-dasharray:4 3}
+@media(prefers-color-scheme:dark){
+.plain{fill:#B4B2A9}.lbl{fill:#B4B2A9}.subl{fill:#8A8880}
+.teal rect{fill:#085041;stroke:#5DCAA5}.teal .h{fill:#9FE1CB}.teal .s{fill:#5DCAA5}
+.amber rect{fill:#633806;stroke:#EF9F27}.amber .h{fill:#FAC775}.amber .s{fill:#EF9F27}
+.rm rect{stroke:#8A8880}.rm .h{fill:#9C9A92}.rm .s{fill:#9C9A92}
+.gray rect{fill:#444441;stroke:#B4B2A9}.gray .h{fill:#D3D1C7}.gray .s{fill:#B4B2A9}
+.kt{fill:#085041;stroke:#5DCAA5}.kg{fill:#444441;stroke:#B4B2A9}.ka{fill:#633806;stroke:#EF9F27}.kr{stroke:#8A8880}
+}
+</style>
+<text class="lbl" x="126" y="61" text-anchor="end">INTERFACE</text><text class="subl" x="126" y="75" text-anchor="end">clients</text>
+<g class="teal"><rect x="138" y="40" width="106" height="50" rx="8"/><text class="h" x="191" y="62" text-anchor="middle">End User app</text><text class="s" x="191" y="80" text-anchor="middle">web chat</text></g>
+<g class="rm"><rect x="252" y="40" width="106" height="50" rx="8"/><text class="h" x="305" y="70" text-anchor="middle">Mobile</text></g>
+<g class="rm"><rect x="366" y="40" width="106" height="50" rx="8"/><text class="h" x="419" y="70" text-anchor="middle">Phone</text></g>
+<g class="amber"><rect x="480" y="40" width="106" height="50" rx="8"/><text class="h" x="533" y="70" text-anchor="middle">Email</text></g>
+<g class="teal"><rect x="594" y="40" width="106" height="50" rx="8"/><text class="h" x="647" y="70" text-anchor="middle">Admin app</text></g>
+<text class="lbl" x="126" y="133" text-anchor="end">COMMUNICATION</text><text class="subl" x="126" y="147" text-anchor="end">connectivity</text>
+<g class="teal"><rect x="138" y="112" width="134" height="50" rx="7"/><text class="h" x="205" y="134" text-anchor="middle">WebSocket + REST</text><text class="s" x="205" y="151" text-anchor="middle">messaging</text></g>
+<g class="rm"><rect x="282" y="112" width="134" height="50" rx="7"/><text class="h" x="349" y="134" text-anchor="middle">WebRTC</text><text class="s" x="349" y="151" text-anchor="middle">real-time</text></g>
+<g class="amber"><rect x="426" y="112" width="134" height="50" rx="7"/><text class="h" x="493" y="134" text-anchor="middle">Email</text><text class="s" x="493" y="151" text-anchor="middle">outbound only</text></g>
+<g class="rm"><rect x="570" y="112" width="134" height="50" rx="7"/><text class="h" x="637" y="134" text-anchor="middle">Voice / phone</text><text class="s" x="637" y="151" text-anchor="middle">PSTN</text></g>
+<text class="lbl" x="126" y="270" text-anchor="end">INTERACTION</text><text class="subl" x="126" y="284" text-anchor="end">the engine</text>
+<g class="teal"><rect x="138" y="224" width="566" height="42" rx="8"/><text class="h" x="421" y="243" text-anchor="middle">AgentEchelon's own code</text><text class="s" x="421" y="260" text-anchor="middle">assistants · memory · routing · the IAM policy + tags it authors · config · auditing</text></g>
+<g class="gray"><rect x="138" y="274" width="566" height="54" rx="8"/><text class="h" x="421" y="292" text-anchor="middle">The AWS services it composes</text><text class="s" x="421" y="310" text-anchor="middle">Amazon Chime SDK Messaging (conversations · identity · roles · retention · channel flows)</text><text class="s" x="421" y="326" text-anchor="middle">Amazon Lex · Amazon Bedrock · Amazon Cognito / STS · AWS IAM, which enforces the access decision</text></g>
+<text class="lbl" x="126" y="344" text-anchor="end">FOUNDATIONS</text><text class="subl" x="126" y="358" text-anchor="end">deploy + manage</text>
+<g class="gray"><rect x="138" y="342" width="566" height="42" rx="8"/><text class="h" x="421" y="360" text-anchor="middle">Deployment and management</text><text class="s" x="421" y="377" text-anchor="middle">AWS CloudFormation (CDK) · resource tagging + cost · monitoring and observability</text></g>
+<text class="lbl" x="138" y="401">KEY</text>
+<rect class="kt" x="178" y="392" width="18" height="11" rx="2"/><text class="s plain" x="202" y="401">AgentEchelon</text>
+<rect class="kg" x="290" y="392" width="18" height="11" rx="2"/><text class="s plain" x="314" y="401">AWS service</text>
+<rect class="ka" x="396" y="392" width="18" height="11" rx="2"/><text class="s plain" x="420" y="401">partially built</text>
+<rect class="kr" x="512" y="392" width="18" height="11" rx="2"/><text class="s plain" x="536" y="401">roadmap</text>
+</svg>

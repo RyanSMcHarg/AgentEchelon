@@ -12,7 +12,7 @@ blocks:
 
 ## Context
 
-The deployment has pgvector schemas defined but no embedding pipeline running. As a result:
+Two user-facing behaviors depend on the assistant *understanding* meaning rather than matching keywords: noticing when a conversation has genuinely drifted to a new topic, and surfacing "similar past discussions" that are actually related. Delivering those well is the user problem here - the kind of semantic recall a team would otherwise expect from a dedicated search or memory product. The question this ADR settles is *when* to build it, and current state shapes the answer: the deployment has pgvector schemas defined but no embedding pipeline running, so today -
 
 - `cross-conversation-context` Lambda doesn't actually use semantic similarity (despite the name suggesting it should)
 - `drift-detection` uses keyword-Jaccard scoring instead of cosine distance

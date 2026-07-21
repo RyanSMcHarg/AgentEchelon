@@ -96,14 +96,7 @@ At runtime, `backend/lambda/src/lib/model-resolver.ts` bridges the intent classi
 
 This enforces IAM safety at the code level - a basic-tier request will never resolve to a premium-only model even if the strategy says so.
 
-> **The classified-intent set is per-deployment configurable** (`docs/specs/assistant-context/SPEC-CONFIGURABLE-INTENT-PACK.md`).
-> The classifier emits the universal three
-> (`greeting`/`acknowledgment`/`general`) plus whatever *domain* intents the deployment's
-> `ASSISTANT_INTENT_PACK` defines (the `DEFAULT_INTENT_PACK` is the default enterprise set). An
-> intent key not present in `INTENT_TYPE_TO_KEY` simply falls to the tier default here (step 4) - so
-> a custom deployment's `find_recipe` resolves the tier default model unless `INTENT_TYPE_TO_KEY` /
-> `INTENT_ROUTE_STRATEGY` are extended for it. The intent is **rule 3** of `resolveModelPlan`;
-> geography (`segment`) and language run ahead of it (`docs/design/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md`).
+> **The classified-intent set is per-deployment configurable** (`docs/specs/interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md`). The classifier emits the universal three (`greeting`/`acknowledgment`/`general`) plus whatever *domain* intents the deployment's `ASSISTANT_INTENT_PACK` defines (the `DEFAULT_INTENT_PACK` is the default enterprise set). An intent key not present in `INTENT_TYPE_TO_KEY` simply falls to the tier default here (step 4) - so a custom deployment's `find_recipe` resolves the tier default model unless `INTENT_TYPE_TO_KEY` / `INTENT_ROUTE_STRATEGY` are extended for it. The intent is **rule 3** of `resolveModelPlan`; geography (`segment`) and language run ahead of it (`docs/design/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md`).
 
 ## Bedrock Resilience
 

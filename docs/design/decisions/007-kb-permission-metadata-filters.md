@@ -12,9 +12,9 @@ blocks:
 
 ## Context
 
-Bedrock Knowledge Base supports per-document metadata that can be used as a retrieval filter at query time. AE's permission model needs to map onto these filters: Cognito groups (`basic` / `standard` / `premium` / `admins`).
+A team giving an assistant access to its documents needs the assistant to respect *who is allowed to see what* - a basic-tier user must not retrieve a restricted doc just because the assistant can read the whole corpus. The user problem is **access-controlled RAG**: grounded answers that never leak content above the asker's clearance, the kind of permission boundary an org would otherwise enforce with a search product's ACLs. Bedrock Knowledge Base supports per-document metadata usable as a retrieval filter at query time, and AE's permission model - Cognito groups (`basic` / `standard` / `premium` / `admins`) - needs to map onto those filters.
 
-AE doesn't yet have a documented document-permission model. The metadata schema we settle on must map cleanly onto the Cognito-tier model and leave room for a future multi-party privacy intersection rule for cross-conversation context.
+Current state qualifies the answer: AE doesn't yet have a documented document-permission model, so the metadata schema settled here must map cleanly onto the Cognito-tier model and leave room for a future multi-party privacy intersection rule for cross-conversation context.
 
 ## Options
 

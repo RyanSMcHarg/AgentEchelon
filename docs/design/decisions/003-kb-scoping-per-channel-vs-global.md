@@ -12,12 +12,12 @@ blocks:
 
 ## Context
 
-When the agent retrieves, what corpus does it search? Two ends of a spectrum:
+A team wants the assistant to search the *right* knowledge for the conversation it is in - the Sales room should not surface Engineering wikis, and a Legal room mixing in unrelated docs is noise at best, leakage at worst. This is the scoping problem an org would otherwise solve by carving Notion / Confluence / SharePoint into separate spaces; here it decides what corpus the agent retrieves from. When the agent retrieves, what corpus does it search? Two ends of a spectrum:
 
 - **Global**: one KB per deployment; every channel sees everything (subject to user permissions).
 - **Per-channel**: each channel binds to a specific subset of KBs; the Sales channel doesn't see Engineering wikis even if the user has access.
 
-Most enterprises will want some scoping - a Legal channel mixing in Engineering docs is noise at best, leakage at worst. Per-channel scoping costs setup complexity and adds metadata to manage.
+Per-channel scoping costs setup complexity and adds metadata to manage, so the answer balances that isolation need against operational simplicity.
 
 ## Options
 

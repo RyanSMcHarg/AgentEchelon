@@ -43,11 +43,11 @@ text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 <line class="ln" x1="160" y1="192" x2="160" y2="232" marker-end="url(#ag)"/>
 <line class="ln" x1="300" y1="192" x2="300" y2="232" marker-end="url(#ag)"/>
 <g class="teal"><rect x="40" y="236" width="380" height="144" rx="14"/>
-<text class="h" x="230" y="265" text-anchor="middle">Conversation — the live context</text>
+<text class="h" x="230" y="265" text-anchor="middle">Conversation - the live context</text>
 <text class="s" x="230" y="287" text-anchor="middle">arn:…:channel/… · classification tag</text>
 <text class="s" x="230" y="318" text-anchor="middle">Messages · memberships · attachments</text>
 <text class="s" x="230" y="340" text-anchor="middle">Targeted scopes, people or assistants</text>
-<text class="s" x="230" y="362" text-anchor="middle">Durable — the memory is the channel</text></g>
+<text class="s" x="230" y="362" text-anchor="middle">Durable - the memory is the channel</text></g>
 <rect class="frame" x="444" y="236" width="200" height="144" rx="12"/>
 <text class="h plain" x="540" y="257" text-anchor="middle">Governed resources</text>
 <g class="gray"><rect x="456" y="266" width="172" height="28" rx="6"/><text class="s" x="542" y="284" text-anchor="middle">Models</text></g>
@@ -56,11 +56,11 @@ text{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,Helvetica,Ar
 <g class="redb"><rect x="440" y="204" width="168" height="24" rx="6"/><text class="s" x="524" y="220" text-anchor="middle">Assistant A: AccessDenied</text></g>
 <path class="deny" d="M620 192 L620 296" marker-end="url(#ar)"/>
 <line class="ln" x1="230" y1="380" x2="230" y2="420" marker-end="url(#ag)"/>
-<g class="gray"><rect x="40" y="424" width="380" height="56" rx="8"/><text class="h" x="230" y="447" text-anchor="middle">Kinesis-fed archive — system of record</text><text class="s" x="230" y="467" text-anchor="middle">Every event: messages, memberships, redactions</text></g>
+<g class="gray"><rect x="40" y="424" width="380" height="56" rx="8"/><text class="h" x="230" y="447" text-anchor="middle">Kinesis-fed archive - system of record</text><text class="s" x="230" y="467" text-anchor="middle">Every event: messages, memberships, redactions</text></g>
 <line class="ln" x1="420" y1="452" x2="440" y2="452" marker-end="url(#ag)"/>
 <g class="gray"><rect x="444" y="424" width="200" height="56" rx="8"/><text class="h" x="544" y="447" text-anchor="middle">Athena or Aurora</text><text class="s" x="544" y="467" text-anchor="middle">Analytics · evaluation</text></g>
 <path class="dash" d="M644 452 L652 452 L652 316 L634 316" marker-end="url(#ag)"/>
 <text class="s plain" x="530" y="404" text-anchor="middle">Derived context returns</text>
-<text class="s plain" x="40" y="514">Summaries and embeddings re-enter as a classification-scoped resource — the loop is governed end to end</text>
+<text class="s plain" x="40" y="514">Summaries and embeddings re-enter as a classification-scoped resource - the loop is governed end to end</text>
 <text class="s plain" x="40" y="538">Purple = people · coral and pink = assistants · every box above the plane is a principal</text>
 </svg>

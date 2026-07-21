@@ -2,7 +2,7 @@
 
 This document explains how AgentEchelon works end-to-end. It covers every major flow, how the CDK stacks connect, and where to look when extending or debugging the system.
 
-For deployment instructions, see [README.md](../../README.md). For Aurora-specific architecture, see [SPEC-AURORA-VPC-MODE.md](../specs/analytics-eval/SPEC-AURORA-VPC-MODE.md).
+For deployment instructions, see [README.md](../../README.md). For Aurora-specific architecture, see [SPEC-AURORA-VPC-MODE.md](../specs/ops/SPEC-AURORA-VPC-MODE.md).
 
 ---
 
@@ -91,7 +91,7 @@ For deployment instructions, see [README.md](../../README.md). For Aurora-specif
               └───────────────────┘
 ```
 
-**Reading the flow:** the **Channel Flow Processor** runs first on every message (mention rules, filtering, marker stripping); `@all` bypasses Lex and invokes the async processor directly. **Amazon Lex is only the entry trigger** - an Amazon Chime SDK-to-Lambda passthrough via its Dialog Code Hook - not a classifier or router. Each tier's Lex bot fulfils into that tier's **own handler Lambda**: all run the shared `router-agent-handler.ts` code but are deployed one per tier (per-tier ownership, ADR-011), not a single shared router. The models shown per tier are **defaults**; model selection is configurable per tier and per intent via `model-strategy` (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS), so the platform is model-agnostic, not Anthropic-only.
+**Reading the flow:** the **Channel Flow Processor** runs first on every message (mention rules, filtering, marker stripping); `@all` bypasses Lex and invokes the async processor directly. **Amazon Lex is only the entry trigger** - an Amazon Chime SDK-to-Lambda passthrough via its Dialog Code Hook - not a classifier or router. Each tier's Lex bot fulfills into that tier's **own handler Lambda**: all run the shared `router-agent-handler.ts` code but are deployed one per tier (per-tier ownership, ADR-011), not a single shared router. The models shown per tier are **defaults**; model selection is configurable per tier and per intent via `model-strategy` (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS), so the platform is model-agnostic, not Anthropic-only.
 
 ---
 
@@ -100,9 +100,11 @@ For deployment instructions, see [README.md](../../README.md). For Aurora-specif
 Stacks must be deployed in dependency order. `cdk deploy --all` handles this automatically.
 
 ```
-ChimeMessaging                    (foundation — no dependencies)
+ChimeMessaging                    (foundation - no dependencies)
      │
      ├──► CognitoAuth             (references AppInstance ARN)
+     │
+     ├──► AdminPlane              (admin conversation read plane over the archive; depends on CognitoAuth)
      │
      ├──► S3Storage               (attachments bucket)
      │
@@ -119,28 +121,33 @@ ChimeMessaging                    (foundation — no dependencies)
      │
      ├──► Battle                  (default-on; /battle tables + orchestrator; depends on Experiments)
      │
-     ├──► Tier-{Basic,Standard,Premium}   (the shared async processor + Lex bot + AppInstanceBot, one instance per profile;
-     │                                     depend on Foundations + Experiments; Standard/Premium also on Battle)
+     ├──► Classification-{Basic,Standard,Premium}   (the shared async processor + Lex bot + AppInstanceBot, one instance per profile;
+     │                                               depend on Foundations + Experiments; Standard/Premium also on Battle)
      │
-     ├──► ChannelFlow             (@all routing + message filtering; depends on Foundations + the tier stacks)
+     ├──► ChannelFlow             (@all routing + message filtering; depends on Foundations + the classification stacks)
      │
-     └──► Frontend                (CloudFront + private S3 origin for the SPA)
+     ├──► Frontend                (CloudFront + private S3 origin for the chat SPA)
+     │
+     ├──► AdminFrontend           (opt-in, -c enableAdminApp=true: separate CloudFront + S3 origin for the admin console SPA)
+     │
+     └──► AdminNotification       (opt-in, -c enableAdminNotificationChannel=true: dedicated admin alert channel; depends on CognitoAuth)
 ```
 
-Eleven stacks deploy in both modes (ChimeMessaging, CognitoAuth, S3Storage, Foundations, Experiments, the three `Tier-*` stacks, Notifications, ChannelFlow, Frontend). `Battle` is default-on (opt out with `-c enableBattle=false`), and one analytics stack is added - `Analytics` in Athena mode or `AnalyticsAurora` in Aurora mode.
+Twelve stacks deploy in both modes (ChimeMessaging, CognitoAuth, AdminPlane, S3Storage, Foundations, Experiments, the three `Classification-*` stacks, Notifications, ChannelFlow, Frontend). `Battle` is default-on (opt out with `-c enableBattle=false`), and one analytics stack is added - `Analytics` in Athena mode or `AnalyticsAurora` in Aurora mode. Two operator-console stacks are opt-in: `AdminFrontend` (`-c enableAdminApp=true`) hosts the separate admin SPA, and `AdminNotification` (`-c enableAdminNotificationChannel=true`) provisions the admin alert channel.
 
-**Stack outputs flow:** Each stack exports values (ARNs, URLs) as CloudFormation outputs; the per-tier stacks instead publish their processor/bot ARNs to SSM. The frontend `.env` file is populated from these outputs. See `.env.example` for the mapping.
+**Stack outputs flow:** Each stack exports values (ARNs, URLs) as CloudFormation outputs; the per-classification stacks instead publish their processor/bot ARNs to SSM. The frontend `.env` file is populated from these outputs. See `.env.example` for the mapping.
 
 | Stack                         | Key Outputs                                                                                                                                             |
 | ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | ChimeMessaging                | `AppInstanceArn`                                                                                                                                        |
-| CognitoAuth                   | `UserPoolId`, `UserPoolClientId`, `IdentityPoolId`, `CredentialExchangeApiUrl`, `UserManagementApiUrl`, `AdminConversationApiUrl`, `UserFeedbackApiUrl` |
+| CognitoAuth                   | `UserPoolId`, `UserPoolClientId`, `IdentityPoolId`, `CredentialExchangeApiUrl`, `UserManagementApiUrl`, `UserFeedbackApiUrl`                             |
+| AdminPlane                    | `AdminConversationApiUrl`                                                                                                                               |
 | S3Storage                     | `PresignedUrlApiUrl`, `AttachmentBucketArn`                                                                                                             |
 | Foundations                   | `CreateConversationApiUrl`, `AddAgentApiUrl`                                                                                                            |
 | Experiments                   | `ExperimentsApiUrl`                                                                                                                                     |
 | Notifications                 | `ShareApiUrl`                                                                                                                                           |
 | Battle                        | `BattleOutcomeApiUrl`                                                                                                                                   |
-| Tier-{Basic,Standard,Premium} | SSM: `/agent-echelon/assistant/{tier}/{processor-arn,bot-arn}`                                                                                               |
+| Classification-{Basic,Standard,Premium} | SSM: `/agent-echelon/assistant/{classification}/{processor-arn,bot-arn}`                                                                       |
 | ChannelFlow                   | `ChannelFlowArn`, `ProcessorFunctionArn`                                                                                                                |
 | Analytics / AnalyticsAurora   | `AnalyticsApiUrl`, `ClientEventsApiUrl` (Athena)                                                                                                        |
 
@@ -216,9 +223,7 @@ Eleven stacks deploy in both modes (ChimeMessaging, CognitoAuth, S3Storage, Foun
 
 This is the core flow: user sends a message and receives an AI response.
 
-> **Full walkthrough:** [`docs/guides/developer/MESSAGE-FLOW.md`](../guides/developer/MESSAGE-FLOW.md) traces every hop
-> (channel flow, Lex, `@assistant`/`@all` routing, fulfillment, async processor),
-> says *why* each exists, and maps where each enforcement layer acts.
+> **Full walkthrough:** [`docs/guides/developer/MESSAGE-FLOW.md`](../guides/developer/MESSAGE-FLOW.md) traces every hop (channel flow, Lex, `@assistant`/`@all` routing, fulfillment, async processor), says *why* each exists, and maps where each enforcement layer acts.
 
 ```
  User types message
@@ -276,7 +281,7 @@ This is the core flow: user sends a message and receives an AI response.
  │                    ├── Runs the self-hosted Converse tool loop        │
  │                    │   (`async-processor-core.ts` `invokeBedrock`):   │
  │                    │   Bedrock Converse + tier-scoped context tool,   │
- │                    │   out-of-band guardrail on output — no Agent     │
+ │                    │   out-of-band guardrail on output - no Agent     │
  │                    ├── Parses response markers (task status, etc.)    │
  │                    ├── Updates placeholder via UpdateChannelMessage   │
  │                    │   OR sends new message via SendChannelMessage    │
@@ -397,7 +402,7 @@ The same classified intent also selects the model, through two layers:
 | `strategic_analysis` | opus | sonnet |
 | `workflow_actions` | sonnet | haiku |
 
-How the default intent pack maps onto those keys: `general` / `greeting` / `acknowledgment` to `general_qa`, `data_extraction` to `document_extraction`, `report_generation` to `report_generation`, `guided_troubleshooting` to `workflow_actions`. A deployment that ships its own intent pack (`ASSISTANT_INTENT_PACK`) supplies its own categories; see [SPEC-CONFIGURABLE-INTENT-PACK.md](../specs/assistant-context/SPEC-CONFIGURABLE-INTENT-PACK.md). The resolved model then runs through the Bedrock resilience layer (retry, model fallback, circuit breaker) inside the async processor.
+How the default intent pack maps onto those keys: `general` / `greeting` / `acknowledgment` to `general_qa`, `data_extraction` to `document_extraction`, `report_generation` to `report_generation`, `guided_troubleshooting` to `workflow_actions`. A deployment that ships its own intent pack (`ASSISTANT_INTENT_PACK`) supplies its own categories; see [SPEC-CONFIGURABLE-INTENT-PACK.md](../specs/interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md). The resolved model then runs through the Bedrock resilience layer (retry, model fallback, circuit breaker) inside the async processor.
 
 ### A/B experiments over the routing
 
@@ -494,24 +499,16 @@ A classification experiment cannot run alongside an intent or base-model experim
           │
           ▼
   Frontend surfaces emailSent=false as a yellow warning in the share modal
-  (the user is still added to the channel — only the email delivery failed)
+  (the user is still added to the channel - only the email delivery failed)
           │
           ▼
   Recipient opens ?conversation=<id> link → App.tsx reads the query param,
   calls selectConversation() once conversations load, strips the param.
 ```
 
-**Why this matters:** the share flow returns an explicit `emailSent` flag
-rather than reporting success when SES rejects the sender email, so the
-frontend warns the user instead of silently swallowing the failure. The mention
-hint + targeted summary land in multi-user channels so a dropped-in user
-(a) sees that the dynamic changed and (b) has context to jump in.
+**Why this matters:** the share flow returns an explicit `emailSent` flag rather than reporting success when SES rejects the sender email, so the frontend warns the user instead of silently swallowing the failure. The mention hint + targeted summary land in multi-user channels so a dropped-in user (a) sees that the dynamic changed and (b) has context to jump in.
 
-**Tier enforcement (defense in depth):** Channel metadata alone is not a
-security boundary - it's self-asserted by whoever created the channel. The
-authoritative signal is the user's Cognito group membership. The share
-Lambda, `create-conversation`, and `router-agent-handler` all independently
-check it. See `docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md`.
+**Tier enforcement (defense in depth):** Channel metadata alone is not a security boundary - it's self-asserted by whoever created the channel. The authoritative signal is the user's Cognito group membership. The share Lambda, `create-conversation`, and `router-agent-handler` all independently check it. See `docs/specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md`.
 
 **Key files:**
 - `frontend/packages/chat/src/components/ShareConversationModal.tsx` - Share UI + emailSent warning
@@ -532,27 +529,13 @@ check it. See `docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md`.
 
 ### Why two data sources (raw archive + curated views)
 
-Every Amazon Chime SDK event lands on one Kinesis stream, and from there it fans out to two
-sinks that do different jobs. This split is deliberate, not redundancy:
+Every Amazon Chime SDK event lands on one Kinesis stream, and from there it fans out to two sinks that do different jobs. This split is deliberate, not redundancy:
 
-1. **Raw archive (S3): the absolute system of record.** An append-only copy of every event
-   exactly as Chime emitted it (channel create/update/delete, membership, message
-   create/update/redact/delete). It is never rewritten. Its jobs are durability, replay and
-   backfill, and debugging: it is the one place that stays true when a derived view is wrong.
-   When a curated view has a bug (drops, mis-parses, or curates away an event), the raw archive
-   is what you read to see what actually happened and to rebuild the view from.
+1. **Raw archive (S3): the absolute system of record.** An append-only copy of every event exactly as Amazon Chime SDK Messaging emitted it (channel create/update/delete, membership, message create/update/redact/delete). It is never rewritten. Its jobs are durability, replay and backfill, and debugging: it is the one place that stays true when a derived view is wrong. When a curated view has a bug (drops, mis-parses, or curates away an event), the raw archive is what you read to see what actually happened and to rebuild the view from.
 
-2. **Curated query store (Glue/Athena or Aurora): fast, sometimes mutable views.** A derived
-   store shaped for querying, not for durability. It groups messages into conversations and
-   exchanges, folds placeholder-then-final edits onto one row, derives conversation state
-   (live / archived / deleted), applies redaction-aware reads, and (in Aurora) serves
-   sub-second dashboards, evaluation scoring, drift, and pgvector context. Because the raw
-   archive holds the truth, this layer is free to curate, re-derive, and be rebuilt.
+2. **Curated query store (Glue/Athena or Aurora): fast, sometimes mutable views.** A derived store shaped for querying, not for durability. It groups messages into conversations and exchanges, folds placeholder-then-final edits onto one row, derives conversation state (live / archived / deleted), applies redaction-aware reads, and (in Aurora) serves sub-second dashboards, evaluation scoring, drift, and pgvector context. Because the raw archive holds the truth, this layer is free to curate, re-derive, and be rebuilt.
 
-The two roles cannot collapse into one store: an immutable raw log cannot serve sub-second
-mutable dashboards, and a curated store that rewrites or drops rows cannot be the system of
-record. The raw S3 archive is the constant across both modes; the analytics mode selects only
-the curated engine (Glue/Athena by default, Aurora when richer real-time analysis is needed).
+The two roles cannot collapse into one store: an immutable raw log cannot serve sub-second mutable dashboards, and a curated store that rewrites or drops rows cannot be the system of record. The raw S3 archive is the constant across both modes; the analytics mode selects only the curated engine (Glue/Athena by default, Aurora when richer real-time analysis is needed).
 
 ### Athena Mode (Default)
 
@@ -619,12 +602,7 @@ the curated engine (Glue/Athena by default, Aurora when richer real-time analysi
                                        + supporting views, Aurora mode)
 ```
 
-The diagram above is the **archival/analytics** path (asynchronous, off the request path). The **live
-request path** reaches Aurora separately: the non-VPC agent handler invokes a VPC-attached **retrieval
-data-plane Lambda** that runs RAG retrieval and drift detection (embed + pgvector) and returns results. The
-handler stays out of the VPC so it can still reach SSM, Cognito, and Lambda-invoke; the data-plane Lambda
-reuses the existing Bedrock and Secrets endpoints, adding no new VPC endpoints (project decision 018). See
-[RAG.md](../guides/developer/RAG.md) and, for per-piece costs, [INFRASTRUCTURE-COST.md](../guides/admin/INFRASTRUCTURE-COST.md).
+The diagram above is the **archival/analytics** path (asynchronous, off the request path). The **live request path** reaches Aurora separately: the non-VPC agent handler invokes a VPC-attached **retrieval data-plane Lambda** that runs RAG retrieval and drift detection (embed + pgvector) and returns results. The handler stays out of the VPC so it can still reach SSM, Cognito, and Lambda-invoke; the data-plane Lambda reuses the existing Bedrock and Secrets endpoints, adding no new VPC endpoints (project decision 018). See [RAG.md](../guides/developer/RAG.md) and, for per-piece costs, [INFRASTRUCTURE-COST.md](../guides/admin/INFRASTRUCTURE-COST.md).
 
 **Key files:**
 - `backend/lib/stacks/analytics-stack.ts` - Athena mode (Kinesis → Firehose → S3 → Glue → Athena)
@@ -637,8 +615,8 @@ reuses the existing Bedrock and Secrets endpoints, adding no new VPC endpoints (
 - `frontend/packages/admin/src/services/analyticsService.ts` - Analytics API client
 
 **Aurora-mode add-ons (opt-in, same stack):**
-- **Out-of-band message analytics (A/B + metadata-cap decoupling).** Heavy per-message analytics - per-step execution telemetry and the full analytics blob - are written to a `MessageAnalytics` DynamoDB table keyed by message id (keeping the Amazon Chime SDK `Metadata` under its ~1 KB cap), and the archival Lambda merges them back on ingest; surfaced via `/analytics/execution-steps` (admin **Steps** tab). Per-variant experiment results also fold in **real human signals** - thumbs (from the feedback table) and `/battle` wins (from the BattleOutcome table) - via read-time scans over the VPC DynamoDB gateway endpoint. See `docs/specs/conversation-messaging/SPEC-MESSAGE-METADATA-CODEBOOK.md`.
-- **Cost sleep mode (`-c sleepMode=true`).** The same stack conditionally adds a `deployment-state` table, an EventBridge idle checker, an admin sleep/wake API (`/deployment/{state,sleep,wake}`), and an SNS topic. The checker pauses Aurora Serverless v2 (`ModifyDBCluster` → MinCapacity 0) after `sleepAfterIdle` of inactivity; an admin wake restores it, and users see a paused-state banner meanwhile. See `docs/specs/analytics-eval/SPEC-COST-SLEEP-MODE.md`.
+- **Out-of-band message analytics (A/B + metadata-cap decoupling).** Heavy per-message analytics - per-step execution telemetry and the full analytics blob - are written to a `MessageAnalytics` DynamoDB table keyed by message id (keeping the Amazon Chime SDK `Metadata` under its ~1 KB cap), and the archival Lambda merges them back on ingest; surfaced via `/analytics/execution-steps` (admin **Steps** tab). Per-variant experiment results also fold in **real human signals** - thumbs (from the feedback table) and `/battle` wins (from the BattleOutcome table) - via read-time scans over the VPC DynamoDB gateway endpoint. See `docs/specs/communication/SPEC-MESSAGE-METADATA-CODEBOOK.md`.
+- **Cost sleep mode (`-c sleepMode=true`).** The same stack conditionally adds a `deployment-state` table, an EventBridge idle checker, an admin sleep/wake API (`/deployment/{state,sleep,wake}`), and an SNS topic. The checker pauses Aurora Serverless v2 (`ModifyDBCluster` → MinCapacity 0) after `sleepAfterIdle` of inactivity; an admin wake restores it, and users see a paused-state banner meanwhile. See `docs/specs/ops/SPEC-COST-SLEEP-MODE.md`.
 
 **Cost attribution (tagging).** Every stack self-tags at the app root via `applyStandardTags` (`backend/lib/tagging.ts`): `Project` is **derived from the deployment identity** (`STACK_PREFIX`), never hardcoded, so several instances in one AWS account bill apart in Cost Explorer. See `docs/guides/admin/TAGGING.md`.
 
@@ -675,7 +653,7 @@ If a provider fails to initialize, everything below it is unavailable. The `Conn
 |-----------------|-----------|
 | Change the AI system prompt | `backend/lambda/src/assistant-async-processor.ts` (the profile's `DEFAULT_PROMPTS` entry, or the SSM persona param) |
 | Add a new intent | `backend/lambda/src/lib/intent-classifier.ts` → `delivery-options.ts`; for its model route, `backend/lib/config/model-strategy.ts` (`INTENT_ROUTE_STRATEGY`) |
-| Add a new user tier | [Customization Guide in README](../../README.md#adding-a-new-user-tier) |
+| Add a new user tier | [How to add or manage a profile](../guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md) |
 | Change the auth flow | `frontend/packages/shared/src/providers/AuthProvider.tsx` + `backend/lib/stacks/cognito-auth-stack.ts` |
 | Add an admin dashboard tab | `frontend/packages/admin/src/components/admin/` + `AdminDashboard.tsx` |
 | Modify the analytics pipeline | `backend/lib/stacks/analytics-stack.ts` (Athena) or `analytics-stack-aurora.ts` (Aurora) |
@@ -710,14 +688,7 @@ Deployment model overrides are selected in CDK with `basicModelKey`, `standardMo
 
 ## Admin Dashboard
 
-The admin console groups its views into **7 sections** (section rail + sub-tabs):
-Overview (Overview + Latency), Conversations, Effectiveness (the intent-anchored
-Dashboard drill - the consolidation target that Evaluations/Flows/Tasks/Steps fold into -
-plus those detail sub-tabs and the Flagged and Ground Truth action tabs), Models (Models +
-Model Strategy), Experiments,
-Users (Users + Manage Users), and Security (Membership Audit). Aurora-only views
-are hidden in Athena mode. (Usage: [ADMIN-GUIDE.md](../guides/admin/ADMIN-GUIDE.md); design:
-[SPEC-ADMIN-CONSOLE.md](../specs/admin-console/SPEC-ADMIN-CONSOLE.md).) The individual views:
+The admin console groups its views into **7 sections** (section rail + sub-tabs): Overview (Overview + Latency), Conversations, Effectiveness (the intent-anchored Dashboard drill - the consolidation target that Evaluations/Flows/Tasks/Steps fold into - plus those detail sub-tabs and the Flagged and Ground Truth action tabs), Models (Models + Model Strategy), Experiments, Users (Users + Manage Users), and Security (Membership Audit). Aurora-only views are hidden in Athena mode. (Usage: [ADMIN-GUIDE.md](../guides/admin/ADMIN-GUIDE.md); design: [SPEC-ADMIN-CONSOLE.md](../specs/interface/admin/SPEC-ADMIN-CONSOLE.md).) The individual views:
 
 | Tab | Mode | Data Source | Shows |
 |-----|------|------------|-------|
@@ -807,8 +778,7 @@ This section summarizes security controls.
 - **Amazon Chime SDK:** Messages are stored in the Amazon Chime SDK AppInstance within your AWS account. Amazon Chime SDK is an AWS-managed service subject to the [AWS Data Processing Addendum](https://d1.awsstatic.com/legal/aws-dpa/aws-dpa.pdf).
 - **Amazon SES:** Recipient email addresses are sent to SES for conversation sharing. SES is subject to the AWS DPA.
 
-**PII in analytics:**
-The analytics pipeline stores user identifiers in queryable tables. Admin users can query conversation history, evaluation scores, and cross-conversation context by `user_sub`. Organizations with GDPR/CCPA requirements should implement data subject access/deletion procedures against these tables.
+**PII in analytics:** The analytics pipeline stores user identifiers in queryable tables. Admin users can query conversation history, evaluation scores, and cross-conversation context by `user_sub`. Organizations with GDPR/CCPA requirements should implement data subject access/deletion procedures against these tables.
 
 ---
 
@@ -872,7 +842,7 @@ All dependencies are permissive (MIT or Apache 2.0). No GPL-licensed dependencie
 |----------|---------------|
 | [README.md](../../README.md) | Setup, configuration, cost estimates, customization guide |
 | [CLAUDE.md](../../CLAUDE.md) | Quick reference for development sessions |
-| [SPEC-AURORA-VPC-MODE.md](../specs/analytics-eval/SPEC-AURORA-VPC-MODE.md) | Full Aurora mode spec (VPC, RDS Proxy, schema, costs, risks) |
+| [SPEC-AURORA-VPC-MODE.md](../specs/ops/SPEC-AURORA-VPC-MODE.md) | Full Aurora mode spec (VPC, RDS Proxy, schema, costs, risks) |
 | [CHIME_SDK_INTEGRATION.md](../guides/developer/CHIME_SDK_INTEGRATION.md) | Amazon Chime SDK integration details and Lex event format |
 | [SECURITY-NPM-SUPPLY-CHAIN.md](../guides/developer/SECURITY-NPM-SUPPLY-CHAIN.md) | npm supply-chain hardening (install-script blocking, lockfile pinning, audit practices) |
 | [DESIGN-SYSTEM.md](../guides/developer/DESIGN-SYSTEM.md) | CSS design tokens, component patterns, typography |

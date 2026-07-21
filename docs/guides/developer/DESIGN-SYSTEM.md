@@ -1,9 +1,6 @@
 # AgentEchelon Design System
 
-The design tokens and shared component classes described here are implemented in
-`frontend/packages/shared/src/styles/`. Some component CSS is still being migrated onto them - the
-[Migration Guide](#migration-guide) below is the reference for bringing a component
-onto the system.
+The design tokens and shared component classes described here are implemented in `frontend/packages/shared/src/styles/`. Some component CSS is still being migrated onto them - the [Migration Guide](#migration-guide) below is the reference for bringing a component onto the system.
 
 ## Aesthetic Direction: Precision Engineering
 

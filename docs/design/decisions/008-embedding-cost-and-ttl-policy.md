@@ -12,11 +12,9 @@ blocks:
 
 ## Context
 
-Static documents (resume, blog posts, response-guidance) embed once and are cheap. Meeting transcripts grow unbounded - a 30-minute meeting can produce 5 - 15K tokens, and a busy deployment may produce dozens of meetings per week. Without a policy, the KB grows forever and re-indexing on schema changes becomes prohibitively expensive.
+A team's RAG corpus is not static - meeting transcripts pile up week over week - and the user wants two things as it grows: the cost to stay predictable, and answers to stay *fresh* rather than dredging up a stale meeting note from a year ago. Keeping RAG affordable and current at scale is the user problem this policy serves. Static documents (resume, blog posts, response-guidance) embed once and are cheap; meeting transcripts grow unbounded - a 30-minute meeting can produce 5 - 15K tokens, and a busy deployment may produce dozens of meetings per week - so without a policy the KB grows forever and re-indexing on schema changes becomes prohibitively expensive.
 
-Two cost vectors: (1) initial embedding ($0.00002 / 1K tokens for Titan v2 → ~$2/month at 100 meetings if all transcripts indexed), (2) retrieval (per-query, much smaller).
-
-The bigger concern is *staleness* - old meeting transcripts may not deserve to be retrieved indefinitely.
+Two cost vectors: (1) initial embedding ($0.00002 / 1K tokens for Titan v2 → ~$2/month at 100 meetings if all transcripts indexed), (2) retrieval (per-query, much smaller). The bigger concern is *staleness* - old meeting transcripts may not deserve to be retrieved indefinitely.
 
 ## Options
 

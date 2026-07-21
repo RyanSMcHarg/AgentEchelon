@@ -58,8 +58,7 @@ Each maps to real value, but the README can only have one headline.
 
 ## Decision
 
-**v0.2.x headline: B (multi-user chat with shared agent).**
-**v0.3+ headline: E (collaborative requirements drafting with RAG).**
+**v0.2.x headline: B (multi-user chat with shared agent).** **v0.3+ headline: E (collaborative requirements drafting with RAG).**
 
 Both phases share the supporting story: "tier-based cost control, mention-based privacy, observability, A/B experiments built in" - those are differentiators that ride along regardless of which use case is on the cover.
 

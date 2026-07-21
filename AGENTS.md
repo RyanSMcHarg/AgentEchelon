@@ -86,7 +86,7 @@ The backend is composed of independently-deployable feature stacks rather than o
 (owning its async processor, Lex bot, and AppInstanceBot); experiments are
 `AgentEchelonExperiments`; shared task tables plus create-conversation/add-agent are
 `AgentEchelonFoundations`. Each tier's code is independently owned. See
-`docs/specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md`.
+`docs/specs/interaction/assistant-config/SPEC-PER-PROFILE-OWNERSHIP.md`.
 
 **Always deployed (both modes):**
 1. `AgentEchelonChimeMessaging`, Amazon Chime SDK AppInstance (foundation)
@@ -113,7 +113,7 @@ The backend is composed of independently-deployable feature stacks rather than o
 | Path | Contents |
 |------|----------|
 | `frontend/packages/chat/src/components/` | React UI components |
-| `frontend/packages/admin/src/components/admin/` | Admin dashboard sections including Overview, Conversations, Quality, Models, Experiments, Users, and Membership Audit (Layer 6 review plus the report-only vs auto-revoke toggle). See `docs/guides/admin/ADMIN-GUIDE.md`, `docs/specs/admin-console/SPEC-ADMIN-CONSOLE.md`, `docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md`, `docs/specs/identity-access/SPEC-MODERATION.md`. |
+| `frontend/packages/admin/src/components/admin/` | Admin dashboard sections including Overview, Conversations, Quality, Models, Experiments, Users, and Membership Audit (Layer 6 review plus the report-only vs auto-revoke toggle). See `docs/guides/admin/ADMIN-GUIDE.md`, `docs/specs/interface/admin/SPEC-ADMIN-CONSOLE.md`, `docs/specs/interaction/identity-access/admin/SPEC-ADMIN-IDENTITY.md`, `docs/specs/interaction/identity-access/core/SPEC-MODERATION.md`. |
 | `frontend/packages/{chat,shared}/src/providers/` | Context providers (auth, messaging, conversations) |
 | `frontend/packages/{admin,chat,shared}/src/services/` | Backend integration (Amazon Chime SDK, S3, analytics) |
 | `frontend/packages/shared/src/types/` | TypeScript types (including full Aurora analytics types) |
@@ -128,7 +128,7 @@ The backend is composed of independently-deployable feature stacks rather than o
 | `backend/lib/constructs/` | Reusable CDK constructs (bedrock-guardrails) |
 | `backend/test/` | Jest unit tests (CDK synth, Aurora modules) |
 | `tests/e2e/` | Playwright E2E tests (auth, agents, admin dashboard) |
-| `docs/` | Specs and reference docs (see `docs/README.md` for the index) |
+| `docs/` | Specs and reference docs (see `docs/DOCUMENTATION.md` for the index) |
 
 ### Message Flow
 
@@ -150,11 +150,11 @@ and the Aurora archival path in full.
 - **Message delivery and size (read before producing or extending any channel message)**: Amazon Chime SDK caps are on the encoded length (`encodeURIComponent`): `Content` 4096, `Metadata` 1024, and CJK encodes ~9x per char. Long replies MUST go through `handleLongResponse`/`splitIntoChunks`. Full guide: `docs/guides/developer/MESSAGE-DELIVERY-GUIDE.md`. Canonical code: `backend/lambda/src/lib/async-processor-core.ts`.
 - Bedrock Guardrails filter PII, prompt injection, and metadata markers on all agents.
 - **Model routing**: `model-resolver.ts` maps a classified request to a model from a configurable strategy, enforcing tier-based access control. Defaults are per-deployment configurable and specific request categories can use different models. See `docs/overview/ARCHITECTURE.md` and `docs/guides/developer/MODEL_STRATEGY.md`.
-- **Configurable classification taxonomy (per deployment)**: `lib/intent-pack.ts` loads the taxonomy from the `ASSISTANT_INTENT_PACK` env var (CDK context `assistantIntentPack`). Full design: `docs/specs/assistant-context/SPEC-CONFIGURABLE-INTENT-PACK.md`.
+- **Configurable classification taxonomy (per deployment)**: `lib/intent-pack.ts` loads the taxonomy from the `ASSISTANT_INTENT_PACK` env var (CDK context `assistantIntentPack`). Full design: `docs/specs/interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md`.
 - Bedrock resilience: `bedrock-resilience.ts` provides retry (exponential backoff), model fallback, and a circuit breaker (5 failures / 60s window).
 - A/B experiments: `experiment-manager.ts` uses a deterministic MD5 hash of `channelArn + experimentId` for sticky conversation-level variant assignment.
 - **Cross-channel task continuity**: tasks are tracked in `AgentTasksTable` (keyed by `taskId, channelArn`) and `UserTasksTable` (keyed by `userSub`). Resume is channel-scoped; cross-channel awareness is prompt-only (a brief hint, never an auto-resume, never a channel ARN leak).
-- **Building or changing assistant context / RAG?** Read `docs/guides/developer/GUIDE-ASSISTANT-CONTEXT.md`, `docs/specs/conversation-messaging/SPEC-WELCOME-AND-CONTEXT.md`, and `docs/guides/developer/RAG.md` first. The context model (tier-scoped company context, pgvector RAG, conversation history + summary, welcome/personalization, participant/domain context) spans several docs and is easy to miss and reinvent.
+- **Building or changing assistant context / RAG?** Read `docs/guides/developer/GUIDE-ASSISTANT-CONTEXT.md`, `docs/specs/interaction/assistant-config/SPEC-WELCOME-AND-CONTEXT.md`, and `docs/guides/developer/RAG.md` first. The context model (tier-scoped company context, pgvector RAG, conversation history + summary, welcome/personalization, participant/domain context) spans several docs and is easy to miss and reinvent.
 
 ## Configuration
 
@@ -181,7 +181,7 @@ AWS_PROFILE=<your-profile> node backend/scripts/backfill-channel-flow.mjs
 ### Admin identity and membership enforcement (deploy-time choices)
 
 Two admin-facing choices, both defaulting to the safe option. Full model in
-`docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md`; operating guidance in `docs/guides/admin/ADMIN-GUIDE.md`.
+`docs/specs/interaction/identity-access/admin/SPEC-ADMIN-IDENTITY.md`; operating guidance in `docs/guides/admin/ADMIN-GUIDE.md`.
 
 **1. Which IdP authenticates admins** (`-c adminAuthMode`, default `ae-cognito`). This is a
 separate decision from the user IdP: the user population can widen (federation, guests) while
@@ -198,7 +198,7 @@ npx cdk deploy --all -c adminAuthMode=federated -c hostAdminPoolId=us-east-1_XXX
 ```
 
 **2. How over-tier memberships are handled** (`-c enableMembershipAudit`, `-c membershipAuditEnforce`).
-The near-real-time membership audit (`docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md` Layer 6) watches Amazon Chime SDK
+The near-real-time membership audit (`docs/specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md` Layer 6) watches Amazon Chime SDK
 membership changes and flags any member or assistant placed on a channel above their tier.
 - Off by default. Enable with `-c enableMembershipAudit=true`.
 - **Report-only (default) vs auto-revoke of member access:** `-c membershipAuditEnforce=false` (default)
@@ -228,7 +228,7 @@ aws rds describe-db-proxies --query 'DBProxies[?starts_with(DBProxyName, `agent-
 
 ## Documentation
 
-`README.md` is the comprehensive entry point; `docs/README.md` is the index of specs and guides.
+`README.md` is the comprehensive entry point; `docs/DOCUMENTATION.md` is the index of specs and guides.
 Start with `README.md`, `docs/overview/ARCHITECTURE.md`, and `docs/guides/user/TROUBLESHOOTING.md`, then follow the
 index into the relevant deep-dive. `docs/overview/TENETS.md` holds the canonical project tenets that
 every architectural decision traces back to.

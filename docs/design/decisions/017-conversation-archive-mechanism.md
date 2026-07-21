@@ -1,10 +1,10 @@
 # ADR-017: Conversation archive mechanism (mark vs. delete vs. de-member)
 
-> **Status:** Accepted - **Option 1 (mark archived + read-only via tag)**, composed with the conversation type's Amazon Chime SDK expiration TTL. Governs `docs/specs/conversation-messaging/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md`. Records the choice of how a moderator "archives" a conversation so members lose the ability to write and the conversation leaves their active list, while the durable archive persists and the channel eventually hard-expires.
+> **Status:** Accepted - **Option 1 (mark archived + read-only via tag)**, composed with the conversation type's Amazon Chime SDK expiration TTL. Governs `docs/specs/communication/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md`. Records the choice of how a moderator "archives" a conversation so members lose the ability to write and the conversation leaves their active list, while the durable archive persists and the channel eventually hard-expires.
 
 ## Context
 
-Users cannot currently remove a conversation (`ConversationProvider.chime.tsx` `deleteConversation` is in-memory only; it reappears on reload). We want a moderator (the creator is a `ChannelModerator` of their own channel) to **archive** a conversation: members permanently lose access, an archived copy persists for administrators.
+A user wants to retire a conversation they are done with - have it drop out of their active list and become unwritable - while the organization keeps a durable, admin-only archive of what was said. That pairing of a clean user-facing "archive" with a compliance-grade retained record is what a team would otherwise reach for a records-retention feature to get. Today neither half is real: users cannot actually remove a conversation (`ConversationProvider.chime.tsx` `deleteConversation` is in-memory only; it reappears on reload). We want a moderator (the creator is a `ChannelModerator` of their own channel) to **archive** a conversation: members permanently lose access, an archived copy persists for administrators.
 
 **The archive is the Aurora/Athena data plane, not Amazon Chime SDK.** This is the key fact that frames every option:
 - The Kinesis archival pipeline (`analytics-aurora/kinesis-archival.ts`) writes each message's **content** (`:365-373,474`) plus analytics into the Aurora `messages` / `exchanges` tables (and, in Athena mode, S3). This is independent of Amazon Chime SDK's own channel storage.

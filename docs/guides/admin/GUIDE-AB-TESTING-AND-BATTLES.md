@@ -4,7 +4,7 @@ How to run real A/B model experiments on your own traffic, measure which model w
 
 This guide is for operators (an admin running a single AgentEchelon deployment). It describes behavior, not any specific account or environment.
 
-> **Feature availability.** Everything described in this guide is available except lines marked *(not available)*. The *(not available)* items are: the **accuracy** objective and its classifier-accuracy measurement, future-dated start-date gating, and reading the live model catalog into the form. Battles are documented in `docs/specs/experiments-battle/SPEC-BATTLE.md`.
+> **Feature availability.** Everything described in this guide is available except lines marked *(not available)*. The *(not available)* items are: the **accuracy** objective and its classifier-accuracy measurement, future-dated start-date gating, and reading the live model catalog into the form. Battles are documented in `docs/specs/capabilities/SPEC-BATTLE.md`.
 
 ## Why this exists
 
@@ -104,10 +104,10 @@ Then fill in the fields. Most are common to every type; the type-specific fields
 - **Start Date** - defaults to today, starting the test as soon as it is saved. *(A future-dated start is not honored; an experiment is live whenever its status is active, regardless of a later start date.)*
 - **End Date** - when the test ends; defaults to 30 days after the start date. Once past the end date the experiment stops being resolved and routing falls back to the default for that intent and tier.
 - **Objective** - the target the test is trying to move; one of:
-  - **Cost** - a target percentage decrease in cost.
-  - **Quality** (Base Model, Intent) - a target percentage, measured by AgentEchelon's evaluator and by user thumbs up / thumbs down. The evaluator and user signals are entered and reported separately so you can weight user input more heavily, and results flag when too few user ratings have been collected to be confident.
-  - **Latency** - a target percentage decrease in time, measured by the evaluator. For Classification this is the classification step specifically; for Base Model and Intent it is response time for the affected intents.
-  - **Accuracy** (Classification) *(not available)* - a target percentage for classifier correctness. The classifier-accuracy measurement is not available, so an accuracy objective always reads as pending.
+ - **Cost** - a target percentage decrease in cost.
+ - **Quality** (Base Model, Intent) - a target percentage, measured by AgentEchelon's evaluator and by user thumbs up / thumbs down. The evaluator and user signals are entered and reported separately so you can weight user input more heavily, and results flag when too few user ratings have been collected to be confident.
+ - **Latency** - a target percentage decrease in time, measured by the evaluator. For Classification this is the classification step specifically; for Base Model and Intent it is response time for the affected intents.
+ - **Accuracy** (Classification) *(not available)* - a target percentage for classifier correctness. The classifier-accuracy measurement is not available, so an accuracy objective always reads as pending.
 
 **Type-specific field**
 

@@ -46,17 +46,9 @@ S3 bucket: rag/<source_type>/<file>            ← deployer uploads here
        └─────────────────────┘    before invoking the LLM
 ```
 
-**Execution model (project decision 018).** Retrieval and drift detection both need Aurora (pgvector) and
-Bedrock (embeddings), so both run inside a dedicated VPC-attached **data-plane Lambda**. The router agent
-handler stays **non-VPC** and invokes that Lambda synchronously. This keeps the Lex-facing handler off the
-VPC path, where it would otherwise hang on SSM, Cognito, and Lambda-invoke calls that have no endpoint in the
-isolated subnets. The data-plane Lambda's own dependencies (Bedrock embed, Secrets, the in-VPC Aurora proxy)
-are all covered by existing endpoints, so it adds **no new VPC endpoints**.
+**Execution model (project decision 018).** Retrieval and drift detection both need Aurora (pgvector) and Bedrock (embeddings), so both run inside a dedicated VPC-attached **data-plane Lambda**. The router agent handler stays **non-VPC** and invokes that Lambda synchronously. This keeps the Lex-facing handler off the VPC path, where it would otherwise hang on SSM, Cognito, and Lambda-invoke calls that have no endpoint in the isolated subnets. The data-plane Lambda's own dependencies (Bedrock embed, Secrets, the in-VPC Aurora proxy) are all covered by existing endpoints, so it adds **no new VPC endpoints**.
 
-The Aurora cluster, the Titan v2 embedding model, the pgvector extension, and the HNSW index are all **shared
-with drift detection**. RAG adds effectively zero incremental infrastructure cost: just the per-call Titan
-embed (about $0.0001 per turn) and one warm Lambda hop. Full per-piece figures are in
-[`INFRASTRUCTURE-COST.md`](../admin/INFRASTRUCTURE-COST.md).
+The Aurora cluster, the Titan v2 embedding model, the pgvector extension, and the HNSW index are all **shared with drift detection**. RAG adds effectively zero incremental infrastructure cost: just the per-call Titan embed (about $0.0001 per turn) and one warm Lambda hop. Full per-piece figures are in [`INFRASTRUCTURE-COST.md`](../admin/INFRASTRUCTURE-COST.md).
 
 ## Source of truth
 
@@ -83,7 +75,7 @@ embed (about $0.0001 per turn) and one warm Lambda hop. Full per-piece figures a
 Find your archive bucket name (CDK output `ArchiveBucketName` from `AgentEchelonAnalyticsAurora`), then:
 
 ```bash
-# wiki/ as the source_type — anything you upload under rag/wiki/ becomes
+# wiki/ as the source_type - anything you upload under rag/wiki/ becomes
 # searchable with source_type='wiki' filtering. runbooks/, docs/, faq/
 # all work the same way; the first path segment under rag/ is the type.
 aws s3 cp ./local-docs/ s3://<archive-bucket>/rag/wiki/ --recursive \
@@ -164,7 +156,7 @@ aws s3 rm s3://<archive-bucket>/rag/wiki/old-doc.md
 
 **Verify corpus contents:**
 ```bash
-# Via the analytics-query API (if exposed) — count chunks per source_type
+# Via the analytics-query API (if exposed) - count chunks per source_type
 # Or via psql + RDS Proxy IAM auth:
 SELECT source_type, COUNT(DISTINCT source_id) AS docs, COUNT(*) AS chunks
 FROM embeddings WHERE source_type IN ('wiki', 'doc')
@@ -183,7 +175,7 @@ GROUP BY source_type;
 
 ## See also
 
-- `docs/specs/analytics-eval/SPEC-DRIFT-CONVERGENCE.md` - drift detection, shares the Aurora pgvector cluster
+- `docs/specs/capabilities/SPEC-DRIFT-CONVERGENCE.md` - drift detection, shares the Aurora pgvector cluster
 - `docs/guides/admin/AURORA-MODE-GUIDE.md` - Aurora mode setup + cost detail
 - `docs/guides/admin/INFRASTRUCTURE-COST.md` - per-piece infrastructure cost model, including the data-plane Lambda
 - Project decision 018 (retrieval and drift data-plane Lambda) - the execution model and why the router stays non-VPC

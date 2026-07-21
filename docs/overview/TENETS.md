@@ -2,13 +2,13 @@
 
 The non-negotiables. Every architectural decision in the project traces back to one of these, and where two designs competed, the tenet broke the tie.
 
-The platform **invariants** in `docs/specs/conversation-messaging/SPEC-INTERACTION-LAYER.md` §6 elaborate the governance, forward-compatibility, and integration tenets (4, 3, and 6); the remaining tenets (shared control plane, context, fine-grained control) are design commitments these invariants sit beneath rather than restate.
+The platform **invariants** in `docs/specs/interaction/SPEC-INTERACTION-LAYER.md` §6 elaborate the governance, forward-compatibility, and integration tenets (4, 3, and 6); the remaining tenets (shared control plane, context, fine-grained control) are design commitments these invariants sit beneath rather than restate.
 
 ---
 
-1. **Humans and assistants share one control plane** - People from any surface (chat, email, voice, and more) and configurable assistants with their agents are managed in the same conversations through the same access model utilizing repeatable configuration. 
+1. **Humans and assistants share one control plane** - People from any surface (chat, email, voice, and more) and configurable assistants with their agents are managed in the same conversations through the same access model utilizing repeatable configuration.
 
-2. **Context compounds, is shared, but bounded** -  A conversation is the unit of context: it builds across every turn and, per user, across their conversations, so no participant starts from zero. Everyone in it: the external user, the internal member who joins, and the assistant works from the same live picture, and that is the efficiency. Users never repeats themselves, whoever steps in is already caught up, and the assistant answers with full awareness. 
+2. **Context compounds, is shared, but bounded** - A conversation is the unit of context: it builds across every turn and, per user, across their conversations, so no participant starts from zero. Everyone in it: the external user, the internal member who joins, and the assistant works from the same live picture, and that is the efficiency. Users never repeats themselves, whoever steps in is already caught up, and the assistant answers with full awareness.
 
 3. **The harness outlives the model** - Build the infrastructure once and treat the reasoning model as a replaceable function call, pulled in per step and per experience as the builder needs. The hard parts - context, access, action, observation, delivery - are model-agnostic, and forward-compatibility is by contract (a conversation snapshots its policy, behavior keys are open registries, schema evolves additively), so the catalog of experiences grows without breaking a deployed conversation.
 

@@ -1,25 +1,13 @@
 # Infrastructure and cost model
 
-**Audience:** deployers and operators sizing an AgentEchelon instance, and anyone reviewing what each
-piece of infrastructure is for and what it costs to run.
+**Audience:** deployers and operators sizing an AgentEchelon instance, and anyone reviewing what each piece of infrastructure is for and what it costs to run.
 
-> **⚠️ Estimates only - validate your own costs.** Every figure in this project's docs is a rough
-> **estimate** at us-east-1 on-demand rates (a published unit price times a stated usage assumption),
-> provided for orientation, not budgeting. AWS pricing changes, and your actual cost depends on your
-> region, traffic, retention, and the capacity floors you configure. **Do not rely on these numbers** -
-> validate against the [AWS Pricing Calculator](https://calculator.aws) and your own bills before you
-> commit to any spend. Where a line is highly usage-driven (Bedrock inference) or rate-uncertain (RDS
-> Proxy floors), it is flagged as such rather than presented as precise.
+> **⚠️ Estimates only - validate your own costs.** Every figure in this project's docs is a rough **estimate** at us-east-1 on-demand rates (a published unit price times a stated usage assumption), provided for orientation, not budgeting. AWS pricing changes, and your actual cost depends on your region, traffic, retention, and the capacity floors you configure. **Do not rely on these numbers** - validate against the [AWS Pricing Calculator](https://calculator.aws) and your own bills before you commit to any spend. Where a line is highly usage-driven (Bedrock inference) or rate-uncertain (RDS Proxy floors), it is flagged as such rather than presented as precise.
 
 Two deployment modes have very different cost shapes:
 
-- **Athena mode (default):** almost nothing runs at rest. Analytics is pay-per-query (Athena scans S3). There
-  is no Aurora cluster, no RDS Proxy, no VPC interface endpoints. Retrieval (RAG), live drift, and the
-  conversation summary are **not available** in this mode.
-- **Aurora mode:** an Aurora Serverless v2 cluster (with pgvector) backs RAG, drift, the summary store, and
-  evaluation. This adds an hourly baseline (cluster, proxy, endpoints) in exchange for the retrieval and
-  drift capabilities. See [`AURORA-MODE-GUIDE.md`](AURORA-MODE-GUIDE.md) and
-  [`SPEC-AURORA-VPC-MODE.md`](../../specs/analytics-eval/SPEC-AURORA-VPC-MODE.md).
+- **Athena mode (default):** almost nothing runs at rest. Analytics is pay-per-query (Athena scans S3). There is no Aurora cluster, no RDS Proxy, no VPC interface endpoints. Retrieval (RAG), live drift, and the conversation summary are **not available** in this mode.
+- **Aurora mode:** an Aurora Serverless v2 cluster (with pgvector) backs RAG, drift, the summary store, and evaluation. This adds an hourly baseline (cluster, proxy, endpoints) in exchange for the retrieval and drift capabilities. See [`AURORA-MODE-GUIDE.md`](AURORA-MODE-GUIDE.md) and [`SPEC-AURORA-VPC-MODE.md`](../../specs/ops/SPEC-AURORA-VPC-MODE.md).
 
 ---
 
@@ -37,8 +25,7 @@ Two deployment modes have very different cost shapes:
 | **Amazon Chime SDK messaging** | The messaging backbone: channels, memberships, app-instance bots, channel flows. Billed per active user and per message. | Per-message + per-active-user | **usage-driven**; low at demo scale |
 | **Bedrock model inference** | The dominant variable cost. Per-tier models: basic Haiku, standard Sonnet, premium Opus (see [`MODEL_STRATEGY.md`](../developer/MODEL_STRATEGY.md)). | Per M input/output tokens (confirm current Bedrock pricing) | **usage-driven** (see below) |
 
-**Bedrock inference, per-turn order of magnitude** (representative token sizes; confirm current per-model
-rates on the Bedrock pricing page, they change):
+**Bedrock inference, per-turn order of magnitude** (representative token sizes; confirm current per-model rates on the Bedrock pricing page, they change):
 
 | Tier / model | Typical turn (in / out tokens) | Rough per-turn cost |
 |---|---|---|
@@ -46,9 +33,7 @@ rates on the Bedrock pricing page, they change):
 | standard / Sonnet | ~3k / ~400 | ~$0.02 |
 | premium / Opus | ~4k / ~500 | ~$0.08 to 0.12 |
 
-Trivial turns (greeting, acknowledgment) route to Haiku and skip retrieval, so they cost a fraction of the
-above. This is why the tier-floor routing and the retrieval skip on trivial intents matter for cost, not just
-latency.
+Trivial turns (greeting, acknowledgment) route to Haiku and skip retrieval, so they cost a fraction of the above. This is why the tier-floor routing and the retrieval skip on trivial intents matter for cost, not just latency.
 
 ### Aurora mode only (the RAG / drift / summary baseline)
 
@@ -64,23 +49,13 @@ latency.
 | **Analytics / drift / summary / ingestion Lambdas** | VPC-attached Lambdas doing embedding + Aurora reads/writes: document ingestion, evaluation, summary updater, abandonment, archival, and the retrieval data-plane (below). | $0.20 / M requests + GB-s | **$1 to 5**, usage-driven |
 | **Titan Text Embeddings v2** | Embeds documents at ingestion and each retrieval/drift query (1024-dim). | $0.00002 / 1k tokens | **< $1**; negligible per query |
 
-**Aurora-mode baseline at rest** (no traffic, capacity floors only, RDS Proxy off which is the default):
-roughly **$50 / month** when importing a VPC that provides egress (no interface endpoints), or **~$95 /
-month** on a stack-created NAT-free VPC (with the ~$44 interface endpoints). Both are dominated by the
-Aurora cluster at its ACU floor. Two things raise it: enabling the optional RDS Proxy adds **~$86 / month**
-(the 8-ACU floor), and sustained load raises the Aurora ACU line. Sleep mode (see
-[`SPEC-COST-SLEEP-MODE.md`](../../specs/analytics-eval/SPEC-COST-SLEEP-MODE.md)) can reduce the idle cluster
-cost for non-production instances.
+**Aurora-mode baseline at rest** (no traffic, capacity floors only, RDS Proxy off which is the default): roughly **$50 / month** when importing a VPC that provides egress (no interface endpoints), or **~$95 / month** on a stack-created NAT-free VPC (with the ~$44 interface endpoints). Both are dominated by the Aurora cluster at its ACU floor. Two things raise it: enabling the optional RDS Proxy adds **~$86 / month** (the 8-ACU floor), and sustained load raises the Aurora ACU line. Sleep mode (see [`SPEC-COST-SLEEP-MODE.md`](../../specs/ops/SPEC-COST-SLEEP-MODE.md)) can reduce the idle cluster cost for non-production instances.
 
 ---
 
 ## The retrieval data-plane Lambda (Aurora mode)
 
-RAG retrieval and live drift both need to reach Aurora (pgvector) and Bedrock (embeddings). Rather than
-VPC-attaching the synchronous, Lex-facing agent handler (which also calls SSM, Cognito, and Lambda-invoke,
-none of which have endpoints in the isolated subnets, so attaching it there makes it hang), a single
-**data-plane Lambda** owns the Aurora + Bedrock work and the agent handler invokes it. See the design in
-[`RAG.md`](../developer/RAG.md) and the decision record (project decision 018).
+RAG retrieval and live drift both need to reach Aurora (pgvector) and Bedrock (embeddings). Rather than VPC-attaching the synchronous, Lex-facing agent handler (which also calls SSM, Cognito, and Lambda-invoke, none of which have endpoints in the isolated subnets, so attaching it there makes it hang), a single **data-plane Lambda** owns the Aurora + Bedrock work and the agent handler invokes it. See the design in [`RAG.md`](../developer/RAG.md) and the decision record (project decision 018).
 
 **Cost impact: effectively zero new infrastructure.**
 
@@ -90,9 +65,7 @@ none of which have endpoints in the isolated subnets, so attaching it there make
 | Data-plane Lambda invocations | One synchronous invoke per non-trivial turn (retrieve, and drift when enabled). | **< $1**, usage-driven |
 | Added latency | One warm Lambda-to-Lambda hop (~10 to 50 ms) per non-trivial turn. | n/a |
 
-The alternative (adding SSM, Cognito, and Lambda interface endpoints so the handler itself could be
-VPC-attached) would have added roughly **$44 / month** (3 services x 2 AZ) and kept the Lex-facing handler on
-the VPC path. The data-plane split avoids both.
+The alternative (adding SSM, Cognito, and Lambda interface endpoints so the handler itself could be VPC-attached) would have added roughly **$44 / month** (3 services x 2 AZ) and kept the Lex-facing handler on the VPC path. The data-plane split avoids both.
 
 ---
 
@@ -106,18 +79,15 @@ the VPC path. The data-plane split avoids both.
 | Live drift + summary | Not available | Included |
 | Best for | Low-traffic or cost-sensitive instances that do not need retrieval | Any instance whose assistants must answer from a non-trivial or growing document corpus |
 
-**Recommendation.** Deploy Aurora mode for production instances that rely on retrieval; the incremental cost of
-RAG, drift, and summary is small once the cluster is running, and retrieval is what keeps answers accurate and
-bounded as a corpus grows. For low-traffic or purely conversational instances, Athena mode avoids the hourly
-baseline. This mirrors the capability guidance in [`GUIDE-ASSISTANT-CONTEXT.md`](../developer/GUIDE-ASSISTANT-CONTEXT.md).
+**Recommendation.** Deploy Aurora mode for production instances that rely on retrieval; the incremental cost of RAG, drift, and summary is small once the cluster is running, and retrieval is what keeps answers accurate and bounded as a corpus grows. For low-traffic or purely conversational instances, Athena mode avoids the hourly baseline. This mirrors the capability guidance in [`GUIDE-ASSISTANT-CONTEXT.md`](../developer/GUIDE-ASSISTANT-CONTEXT.md).
 
 ---
 
 ## Related
 
 - [`AURORA-MODE-GUIDE.md`](AURORA-MODE-GUIDE.md) - deploying and operating Aurora mode.
-- [`SPEC-AURORA-VPC-MODE.md`](../../specs/analytics-eval/SPEC-AURORA-VPC-MODE.md) - the VPC, subnets, and endpoint model.
-- [`SPEC-COST-SLEEP-MODE.md`](../../specs/analytics-eval/SPEC-COST-SLEEP-MODE.md) - reducing idle cost on non-production instances.
+- [`SPEC-AURORA-VPC-MODE.md`](../../specs/ops/SPEC-AURORA-VPC-MODE.md) - the VPC, subnets, and endpoint model.
+- [`SPEC-COST-SLEEP-MODE.md`](../../specs/ops/SPEC-COST-SLEEP-MODE.md) - reducing idle cost on non-production instances.
 - [`RAG.md`](../developer/RAG.md) - the retrieval path and the data-plane Lambda.
 - [`ARCHITECTURE.md`](../../overview/ARCHITECTURE.md) - the full component map.
 - [`MODEL_STRATEGY.md`](../developer/MODEL_STRATEGY.md) - per-tier model selection (the main variable cost).

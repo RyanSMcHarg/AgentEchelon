@@ -8,13 +8,14 @@ The point is centralization. Instead of standing up a separate tool for each use
 
 ## Why Agent Echelon
 
-Most agentic systems are a model plus tools, memory, and an orchestration loop. Agent Echelon assumes you have those and supplies the enterprise runtime around them, as three platform layers on a foundation of AWS managed primitives:
+Most agentic systems are a model, tools, memory, and an orchestration loop. Agent Echelon ships each of those and lets you customize or swap them, then wraps them in the enterprise layers - governed multi-party conversation, omnichannel surfaces, and access enforced in the cloud's own IAM. It is organized as four layers, each running on the one below:
 
 - **Interface layer.** The surfaces a participant meets: a web console for users and an admin console today; an embedded widget, phone/voice (PSTN), SMS, and integration into existing third-party tools are designed and seamed.
-- **Communication layer.** The substrate that moves messages and keeps context: a durable conversation that *is* the memory, a server-side hook on every message, and event capture with per-message metadata.
-- **Interaction layer.** Who may act, as whom, at what capability, with which assistant, reaching which systems - governance enforced in IAM. Its composition root is the *conversation type*; five pillars (identity and access, assistant configuration, conversation configuration, connectors, auditing) compose every experience.
+- **Communication layer.** The connectivity that moves messages and keeps context: a durable conversation that *is* the memory, a server-side hook on every message, and event capture with per-message metadata - each transport on a provider you choose.
+- **Interaction layer.** The engine: Agent Echelon's own code composed over the AWS services it uses, expressing who may act, as whom, at what capability, with which assistant, reaching which systems. That code writes the policy; AWS IAM enforces it. Its composition root is the *conversation type*; five pillars (identity and access, assistant configuration, conversation configuration, connectors, auditing) compose every experience.
+- **Foundations layer.** How the platform is deployed and operated: the AWS CloudFormation stacks (CDK) that provision every resource, resource tagging for cost allocation, and the monitoring that keeps it running. The tags that attribute cost are the same ones the interaction layer's IAM decisions read, so cost and governance ride one mechanism.
 
-All three sit on AWS managed primitives (Amazon Chime SDK Messaging, Bedrock, S3, Cognito/STS, IAM, Kinesis), so inference, moderation, message delivery, and retention are AWS's to operate, not yours to build. The platform integrates your identity provider (Cognito by default, or your SSO/SAML/OIDC) rather than replacing it. Real workflows span sales, a scheduled service visit, and a support case - across business units, internal employees, and outside partners - so the same platform expresses a 1:1 tiered chat, a routed support case, a masked service call, or an alert-triggered incident-triage room by **configuration, not new code**. (Pluggable connectors to external systems of record are a designed, opt-in seam, not yet a shipped runtime path.)
+The engine composes AWS managed primitives (Amazon Chime SDK Messaging, Bedrock, S3, Cognito/STS, IAM, Kinesis), so inference, moderation, message delivery, and retention are AWS's to operate, not yours to build. The platform integrates your identity provider (Cognito by default, or your SSO/SAML/OIDC) rather than replacing it. Real workflows span sales, a scheduled service visit, and a support case - across business units, internal employees, and outside partners - so the same platform expresses a 1:1 tiered chat, a routed support case, a masked service call, or an alert-triggered incident-triage room by **configuration, not new code**. (Pluggable connectors to external systems of record are a designed, opt-in seam, not yet a shipped runtime path.)
 
 **Security** - Every conversation runs inside your AWS account on infrastructure you own. Cognito handles authentication with corporate IdP support. Bedrock Guardrails filter PII, prompt injection, and sensitive content. IAM - keyed on each channel's immutable `classification` tag and bearer-pinned to each user's *own* identity - enforces not just which models a tier may use but which conversations a user (or an assistant) can read or send in: fail-closed, evaluated before any request is processed, and provable with a deny-test rather than a code review. Admins can browse, moderate, redact, or delete any message.
 
@@ -33,7 +34,7 @@ Built with React 19 and AWS CDK, Agent Echelon combines real-time messaging, dur
 - **Intent-Based Model Routing** - Automatic model selection per intent (e.g., Haiku for Q&A, Sonnet for code, Opus for analysis) with configurable fallback chains
 - **Bedrock Resilience** - Exponential backoff retry on throttling, automatic model fallback on quota exhaustion, and circuit breaker to protect against cascading failures
 - **A/B Model Testing** - DynamoDB-backed experiment framework for comparing models per intent with deterministic conversation-level variant assignment and side-by-side analytics
-- **Cost and Abuse Controls** - Per-user and global hourly Bedrock spend budgets, per-tier request rate limiting, request dedup, an inbound length cap, and a global circuit trip - distinct from the model-fallback resilience above (see [SPEC-ABUSE-CONTROLS](docs/specs/analytics-eval/SPEC-ABUSE-CONTROLS.md))
+- **Cost and Abuse Controls** - Per-user and global hourly Bedrock spend budgets, per-tier request rate limiting, request dedup, an inbound length cap, and a global circuit trip - distinct from the model-fallback resilience above (see [SPEC-ABUSE-CONTROLS](docs/specs/ops/SPEC-ABUSE-CONTROLS.md))
 
 **Collaboration and access control:**
 - **AWS-Native Persistent Messaging** - Real-time WebSocket delivery with durable conversation history using AWS-managed messaging infrastructure
@@ -41,7 +42,7 @@ Built with React 19 and AWS CDK, Agent Echelon combines real-time messaging, dur
 - **Corporate Identity** - SAML/OIDC integration via Amazon Cognito (see [Identity Provider Guide](docs/guides/user/IDENTITY-PROVIDER-GUIDE.md))
 - **File Attachments** - S3-based secure upload/download with presigned URLs, drag-and-drop support
 - **Multi-Step Task Workflows** - Guided troubleshooting, data extraction, and report generation with state tracking across conversation turns
-- **Conversation Archive, Leave & Remove** - A moderator can archive a conversation (read-only + hidden from the active list; membership retained, so members keep read-only access until the 90-day expiry) or remove a member; any member can leave (see [SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP](docs/specs/conversation-messaging/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md))
+- **Conversation Archive, Leave & Remove** - A moderator can archive a conversation (read-only + hidden from the active list; membership retained, so members keep read-only access until the 90-day expiry) or remove a member; any member can leave (see [SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP](docs/specs/communication/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md))
 
 **Admin operations and analytics:**
 - **Admin Analytics Console** - Conversation volumes, model usage, model-by-intent effectiveness, evaluation scores, user activity, and user feedback summaries
@@ -87,7 +88,7 @@ Agent Echelon deploys in **Athena mode** by default (lower cost, simpler). Auror
 
 ## Documentation
 
-The full documentation lives under [`docs/`](docs/README.md), organized by what you are doing: **deploy it** (user guides), **operate it** (admin guides), **extend it** (the [Developer Guide](docs/guides/developer/DEVELOPER-GUIDE.md)), and **understand it** (specs by domain plus the decision records). Start at the map: **[docs/README.md](docs/README.md)**.
+The full documentation lives under [`docs/`](docs/DOCUMENTATION.md), organized by what you are doing: **deploy it** (user guides), **operate it** (admin guides), **extend it** (the [Developer Guide](docs/guides/developer/DEVELOPER-GUIDE.md)), and **understand it** (specs by domain plus the decision records). Start at the map: **[docs/DOCUMENTATION.md](docs/DOCUMENTATION.md)**.
 
 ## Architecture
 
@@ -371,7 +372,7 @@ IPs. Full guide, including teardown and the security headers applied:
 > empty IAM *role*, and an Amazon Chime SDK *service* principal), and the tier boundary lives
 > on the credential exchange rather than the Identity-Pool roles. The full,
 > code-grounded account - with a capability matrix and a spec-drift table - is
-> **[docs/specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md](docs/specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md)**.
+> **[docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md](docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md)**.
 > Read it before reasoning about who can do what.
 
 New deployments have no users. Run the setup script to create the first admin:
@@ -439,8 +440,8 @@ Backend config is set at deploy time via CDK context (`-c key=value` on `cdk dep
 | `analyticsVpcId` / `createVpcEndpoints` | create / `true` | Aurora-only: import an existing VPC instead of creating one; skip interface/gateway endpoints when the imported VPC already egresses. |
 | `sleepMode` | `false` | Aurora-only auto-pause to 0 ACU when idle (`sleepAfterIdle` default `2h`, `sleepCheckRate` default `rate(15 minutes)`). |
 | `enableMembershipAudit` | `false` | Layer-6 over-tier membership audit. `membershipAuditEnforce` (default `false`) = report-only vs auto-revoke; `membershipAuditAlertChannelArn` routes findings. See [ADMIN-GUIDE](docs/guides/admin/ADMIN-GUIDE.md). |
-| `adminAuthMode` | `ae-cognito` | Which IdP authenticates admins: `ae-cognito` / `federated` (`hostAdminPoolId`, `adminGroupNames`) / `service`. See [SPEC-ADMIN-IDENTITY](docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md). |
-| `bedrockUserHourlyBudget` / `bedrockGlobalHourlyBudget` | (unset) | Per-user / global hourly spend ceilings (abuse controls). See [SPEC-ABUSE-CONTROLS](docs/specs/analytics-eval/SPEC-ABUSE-CONTROLS.md). |
+| `adminAuthMode` | `ae-cognito` | Which IdP authenticates admins: `ae-cognito` / `federated` (`hostAdminPoolId`, `adminGroupNames`) / `service`. See [SPEC-ADMIN-IDENTITY](docs/specs/interaction/identity-access/admin/SPEC-ADMIN-IDENTITY.md). |
+| `bedrockUserHourlyBudget` / `bedrockGlobalHourlyBudget` | (unset) | Per-user / global hourly spend ceilings (abuse controls). See [SPEC-ABUSE-CONTROLS](docs/specs/ops/SPEC-ABUSE-CONTROLS.md). |
 | `basicModelKey` / `standardModelKey` / `premiumModelKey` | (tier default) | Override the default model per tier (any key in the model catalog). |
 | `assistantIntentPack` | (default pack) | The request-classification taxonomy (per deployment). |
 | `senderEmail` | (required for email) | SES sender for notifications / conversation sharing. |
@@ -484,19 +485,19 @@ Access to AI models is controlled by user tier:
 
 ## Aurora Mode Deployment (Optional)
 
-Aurora mode adds RAG, live drift detection, cross-conversation context, and the full evaluation suite, backed by a VPC + Aurora Serverless v2 cluster with pgvector. Deploy it with `--context analyticsMode=aurora`. Full operator guide: [docs/guides/admin/AURORA-MODE-GUIDE.md](docs/guides/admin/AURORA-MODE-GUIDE.md); design and reference (VPC, endpoints, teardown, cost): [docs/specs/analytics-eval/SPEC-AURORA-VPC-MODE.md](docs/specs/analytics-eval/SPEC-AURORA-VPC-MODE.md).
+Aurora mode adds RAG, live drift detection, cross-conversation context, and the full evaluation suite, backed by a VPC + Aurora Serverless v2 cluster with pgvector. Deploy it with `--context analyticsMode=aurora`. Full operator guide: [docs/guides/admin/AURORA-MODE-GUIDE.md](docs/guides/admin/AURORA-MODE-GUIDE.md); design and reference (VPC, endpoints, teardown, cost): [docs/specs/ops/SPEC-AURORA-VPC-MODE.md](docs/specs/ops/SPEC-AURORA-VPC-MODE.md).
 
 ## Drift Detection (Aurora-only)
 
-When a message diverges from a conversation's running topic, the assistant offers to split or switch the conversation (Aurora mode; live path behind `--context enableLiveDrift=true`). Design and operation: [docs/specs/analytics-eval/SPEC-DRIFT-CONVERGENCE.md](docs/specs/analytics-eval/SPEC-DRIFT-CONVERGENCE.md).
+When a message diverges from a conversation's running topic, the assistant offers to split or switch the conversation (Aurora mode; live path behind `--context enableLiveDrift=true`). Design and operation: [docs/specs/capabilities/SPEC-DRIFT-CONVERGENCE.md](docs/specs/capabilities/SPEC-DRIFT-CONVERGENCE.md).
 
 ## Cost Sleep Mode (Aurora-only)
 
-Sleep mode auto-pauses the Aurora data plane after a configurable idle period and exposes an admin wake/sleep API, so an idle instance stops paying for the cluster. Design: [docs/specs/analytics-eval/SPEC-COST-SLEEP-MODE.md](docs/specs/analytics-eval/SPEC-COST-SLEEP-MODE.md).
+Sleep mode auto-pauses the Aurora data plane after a configurable idle period and exposes an admin wake/sleep API, so an idle instance stops paying for the cluster. Design: [docs/specs/ops/SPEC-COST-SLEEP-MODE.md](docs/specs/ops/SPEC-COST-SLEEP-MODE.md).
 
 ## Admin Dashboard
 
-The admin console groups analytics, conversation moderation (redact/delete), model strategy, A/B experiments, evaluation, and user management into a sectioned dashboard (Aurora-only tabs are hidden in Athena mode). Using it: [docs/guides/admin/ADMIN-GUIDE.md](docs/guides/admin/ADMIN-GUIDE.md). Design: [docs/specs/admin-console/SPEC-ADMIN-CONSOLE.md](docs/specs/admin-console/SPEC-ADMIN-CONSOLE.md). Running it behind your own admin console/auth: [docs/guides/admin/ADMIN-INTEGRATION-GUIDE.md](docs/guides/admin/ADMIN-INTEGRATION-GUIDE.md).
+The admin console groups analytics, conversation moderation (redact/delete), model strategy, A/B experiments, evaluation, and user management into a sectioned dashboard (Aurora-only tabs are hidden in Athena mode). Using it: [docs/guides/admin/ADMIN-GUIDE.md](docs/guides/admin/ADMIN-GUIDE.md). Design: [docs/specs/interface/admin/SPEC-ADMIN-CONSOLE.md](docs/specs/interface/admin/SPEC-ADMIN-CONSOLE.md). Running it behind your own admin console/auth: [docs/guides/admin/ADMIN-INTEGRATION-GUIDE.md](docs/guides/admin/ADMIN-INTEGRATION-GUIDE.md).
 
 ## API Endpoints
 
