@@ -2,6 +2,12 @@
 
 A runbook for standing up the **Stratum Technologies** demo and running the end-to-end validation that exercises every tier flow with real (measured, recorded) conversations, then verifies the admin dashboard. This is the POC surface: read it to understand how the platform behaves, and modify the demo data / tests for your own use case. For the demo company design, see [`SPEC-DEMO-COMPANY.md`](../../specs/applications/SPEC-DEMO-COMPANY.md).
 
+> **⚠️ Running this costs money.** The validation drives REAL conversations, so it is not free: every
+> tier flow and the `/battle` duel is a billed **Amazon Bedrock** model invocation (per token), and the
+> battle image-generation test calls a **paid external image-gen provider** (OpenAI / FAL) when
+> configured. A full run is on the order of a few dollars of inference. Run it to validate a deployment
+> and to seed realistic data; do not leave it looping.
+
 ## What gets validated
 
 Real user-to-assistant messages only - nothing is faked. Each turn is measured (TTFF, total latency, tokens, cost) and recorded to the archive/analytics, so the admin dashboard verification runs against genuine data.

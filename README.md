@@ -562,6 +562,13 @@ The project includes Playwright E2E tests with video recording covering sign up,
 > deployment end-to-end is the demo seed + one-command validation: it seeds three tier users and
 > the tiered demo context, then exercises every tier flow with real (measured, recorded)
 > conversations and verifies the admin dashboard against that real data - nothing faked.
+>
+> **⚠️ Running this costs money.** Because the conversations are real, every tier flow and the
+> battle duel is a billed **Amazon Bedrock** model invocation (priced per token), and the battle
+> image-generation test calls a **paid external image-gen provider** (OpenAI / FAL) when configured.
+> A full run is on the order of a few dollars of inference, not free - run it to validate a fresh
+> deployment, but do not leave it looping. (It also seeds the demo users/context, so it doubles as
+> "populate the deployment with realistic data.")
 > ```bash
 > cd backend
 > AWS_PROFILE=<your-profile> npx ts-node scripts/seed-demo.ts   # users + tier context + identity check
