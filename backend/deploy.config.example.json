@@ -10,5 +10,7 @@
   "_features": "On/off toggles.",
   "enableMembershipAudit": false,
   "membershipAuditEnforce": false,
+  "_imageGen": "REQUIRED for /battle image generation-out with EXTERNAL providers (OpenAI, FAL): the ARN of a Secrets Manager secret holding a JSON object of provider keys ({\"OPENAI_API_KEY\":\"...\",\"FAL_KEY\":\"...\"}). Without it the premium (imageGen:true) processor still gets the image guardrail but CANNOT authenticate to a provider, so image battles silently honest-empty. Alternatively export OPENAI_API_KEY / FAL_KEY in the deploy shell.",
+  "imageGenKeysSecretArn": "",
   "environment": "dev"
 }

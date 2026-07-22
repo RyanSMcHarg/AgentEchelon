@@ -451,6 +451,18 @@ export class AssistantProfileStack extends cdk.Stack {
       // Fallback: a deployer who prefers plain env vars can export the key at deploy time.
       if (process.env.OPENAI_API_KEY) asyncProcessor.addEnvironment('OPENAI_API_KEY', process.env.OPENAI_API_KEY);
       if (process.env.FAL_KEY) asyncProcessor.addEnvironment('FAL_KEY', process.env.FAL_KEY);
+      // Footgun guard: imageGen wires the guardrail + bucket UNCONDITIONALLY above, but external providers
+      // (OpenAI/FAL) need a key. If none is wired at synth, /battle image generation-out with an external
+      // model silently honest-empties (no auth). Warn loudly so an image-enabled deploy can't quietly ship
+      // without the keys (the exact way external image battles broke: guardrail present, keys dropped).
+      if (!igKeysSecretArn && !process.env.OPENAI_API_KEY && !process.env.FAL_KEY) {
+        cdk.Annotations.of(this).addWarning(
+          `imageGen is enabled for '${classification}' but no external image-gen provider key is wired. ` +
+            `Set -c imageGenKeysSecretArn=<secret-arn> (JSON of {OPENAI_API_KEY, FAL_KEY}) or export ` +
+            `OPENAI_API_KEY / FAL_KEY at deploy time — otherwise /battle image generation-out with an ` +
+            `external provider cannot authenticate and produces no image (Bedrock image models still work).`,
+        );
+      }
     }
 
     new ssm.StringParameter(this, 'ProcessorArnParam', {
