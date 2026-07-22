@@ -65,6 +65,24 @@ interface ConversationContextType {
 
 const ConversationContext = createContext<ConversationContextType | undefined>(undefined);
 
+/**
+ * Reflect (or clear) the open conversation in the URL as `?conversation=<id>`, so the current
+ * conversation is shareable / bookmarkable and a reload reopens it (App.tsx reads this param on load —
+ * the inbound deep-link path). Previously the URL only fed IN (a share link opened a conversation) and
+ * never updated OUT when one was opened. `replaceState` keeps conversation switches out of the history
+ * stack; a null id clears the param when the detail pane is closed.
+ */
+function reflectConversationInUrl(conversationId: string | null): void {
+  try {
+    const url = new URL(window.location.href);
+    if (conversationId) url.searchParams.set('conversation', conversationId);
+    else url.searchParams.delete('conversation');
+    window.history.replaceState(window.history.state, '', url.toString());
+  } catch {
+    /* non-browser / malformed URL — URL reflection is a nicety, never fatal */
+  }
+}
+
 export function ConversationProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const { isInitialized } = useAwsClient();
@@ -436,6 +454,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         botTypingTimeoutRef.current = undefined;
       }
       setActiveConversation(conversation);
+      reflectConversationInUrl(conversation.id); // shareable/bookmarkable URL; reload reopens it
       setStickyTarget(null);
 
       // Mark as read: local viewedAt stamp (immediate) + Chime read
@@ -640,6 +659,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         unsubscribe(activeConversationRef.current.conversationArn);
       }
       setActiveConversation(null);
+      reflectConversationInUrl(null); // the open conversation was deleted — drop it from the URL
       setMessages([]);
     }
   }, [unsubscribe]);
@@ -740,6 +760,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     const current = activeConversationRef.current;
     if (current) unsubscribe(current.conversationArn);
     setActiveConversation(null);
+    reflectConversationInUrl(null); // back to the list — clear the conversation from the URL
     setMessages([]);
   }, [unsubscribe]);
 
