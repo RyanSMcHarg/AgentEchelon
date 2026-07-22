@@ -64,6 +64,27 @@ export interface AnalyticsResult {
   total?: number;
   limit?: number;
   offset?: number;
+  /**
+   * experiment_results only: the battle-scoped effectiveness view (SPEC-BATTLE). Per-variant metrics
+   * from a battle-enabled experiment's BATTLE turns ONLY, kept OUT of the probabilistic A/B `data`
+   * rollup so a hand-picked battle prompt never biases the A/B averages. The ExperimentsTab renders
+   * this as a separate "Battle results" section, additional to (never replacing) the A/B table.
+   */
+  battleEffectiveness?: { data: BattleEffectivenessRow[]; columns: string[] };
+}
+
+// Battle-scoped effectiveness: one row per (experiment, variant), from BATTLE turns only.
+export interface BattleEffectivenessRow {
+  experiment_id: string;
+  variant_id: string;
+  model_name: string;
+  turn_count: number;
+  /** Avg relevance/quality where scored; null when no battle turn is scored yet (honest "no signal"). */
+  avg_score: number | null;
+  /** Image-aware per-reply cost estimate; null when the model/usage can't be priced. */
+  avg_cost_usd: number | null;
+  /** Head-to-head /battle picks this variant won; null when none. */
+  battle_wins: number | null;
 }
 
 // Overview metrics

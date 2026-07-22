@@ -12,12 +12,28 @@
  * Trigger: EventBridge daily schedule (or a manual invoke). No Athena, no S3.
  */
 
-import { BedrockRuntimeClient, InvokeModelCommand } from '@aws-sdk/client-bedrock-runtime';
+import {
+  BedrockRuntimeClient,
+  InvokeModelCommand,
+  ConverseCommand,
+  type ConverseCommandInput,
+} from '@aws-sdk/client-bedrock-runtime';
+import { S3Client } from '@aws-sdk/client-s3';
 import { query } from './db-client.js';
 import { stripMessageMarkers } from '../lib/message-markers.js';
+import { fetchAttachmentBytes } from '../lib/attachment-bytes.js';
+import { extractAttachment } from '../lib/battle-attachment.js';
+import { imageFormatFromContentType } from '../lib/async-processor-core.js';
 
 const region = process.env.AWS_REGION_NAME || process.env.AWS_REGION || 'us-east-1';
 const EVALUATOR_MODEL = process.env.EVALUATOR_MODEL || 'anthropic.claude-3-haiku-20240307-v1:0';
+// Vision judge for image_generation turns (the generated image is scored, not its caption). Reuse
+// EVALUATOR_MODEL when it can read images, else an operator-set VISION_EVALUATOR_MODEL; if neither is
+// vision-capable, image turns are skipped (never scored on the caption). See resolveVisionJudgeModel.
+const VISION_EVALUATOR_MODEL = process.env.VISION_EVALUATOR_MODEL || '';
+// Generated images live in the attachments bucket under battle-images/<channelId>/...png
+// (image-gen-output persists them there and rides the fileKey on the agent message Metadata).
+const ATTACHMENTS_BUCKET = process.env.ATTACHMENTS_BUCKET || '';
 // Cap per run so a backlog can't exceed the Lambda timeout; the next run picks up the rest.
 const MAX_PER_RUN = Number(process.env.EVAL_MAX_PER_RUN || 200);
 const MAX_FLOWS_PER_RUN = Number(process.env.EVAL_MAX_FLOWS_PER_RUN || 100);
@@ -28,6 +44,7 @@ const FLOW_WEIGHTS = { outcome: 0.30, information: 0.25, efficiency: 0.15, conte
 const FLOW_STATUSES = ['completed', 'in_progress', 'abandoned', 'failed'] as const;
 
 const bedrockClient = new BedrockRuntimeClient({ region });
+const s3Client = new S3Client({ region });
 
 const RELEVANCE_PROMPT = `You are an expert evaluator assessing whether an AI agent's response is relevant to a user's request.
 
@@ -89,6 +106,9 @@ interface UnscoredExchange {
   created_at: string;
   user_message: string | null;
   agent_response: string | null;
+  // Agent message metadata JSONB — carries `attachment.{fileKey,type}` for an image_generation turn,
+  // so the generated image can be judged instead of its caption. Parsed object (pg JSONB) or string.
+  agent_metadata: unknown;
 }
 
 interface PriorTurn {
@@ -110,11 +130,11 @@ interface Relevance {
 // so the judge never scores a raw marker like "…NAVIGATE_CHANNEL:arn:…".
 const stripMarkers = stripMessageMarkers;
 
-/** Exchanges with no evaluation_results row yet (the unscored backlog). */
-// TODO(metrics): image-appropriate eval rubric or skip intent=image_generation. Scoring an
-// image turn's caption text against the prompt with the text-relevance rubric is semantically
-// wrong (the artifact is the image, not the caption); this needs a dedicated rubric or an
-// explicit skip of intent='image_generation' here. Separate rubric decision, out of scope now.
+/**
+ * Exchanges with no evaluation_results row yet (the unscored backlog). `agent_metadata` rides along
+ * so an image_generation turn can be routed to the vision judge (the generated image is the artifact,
+ * not the caption text) in the handler; text turns are scored exactly as before.
+ */
 async function getUnscoredExchanges(limit: number): Promise<UnscoredExchange[]> {
   const res = await query<UnscoredExchange>(
     `SELECT e.id,
@@ -125,7 +145,8 @@ async function getUnscoredExchanges(limit: number): Promise<UnscoredExchange[]> 
             e.task_id,
             e.created_at,
             COALESCE(mu.updated_content, mu.content) AS user_message,
-            COALESCE(ma.updated_content, ma.content) AS agent_response
+            COALESCE(ma.updated_content, ma.content) AS agent_response,
+            ma.metadata AS agent_metadata
        FROM exchanges e
        JOIN messages mu ON e.user_message_id = mu.id
        JOIN messages ma ON e.agent_message_id = ma.id
@@ -206,6 +227,161 @@ async function scoreExchange(ex: UnscoredExchange): Promise<Relevance> {
     };
   } catch {
     return { relevanceScore: 50, classification: 'partial', reasoning: 'Evaluation parse error' };
+  }
+}
+
+// ============================================================================
+// Image-generation turns — judge the GENERATED IMAGE, not its caption text.
+// ============================================================================
+
+const IMAGE_RELEVANCE_PROMPT = `You are an expert evaluator judging whether an AI-GENERATED IMAGE matches the user's request. The image is attached to this message.
+
+## Context
+
+Agent Type: {{agentType}}
+User Type: {{userType}}
+
+## The user's request (what the image was meant to depict)
+
+{{userMessage}}
+
+## Evaluation Criteria
+
+Score how well the ATTACHED IMAGE satisfies the request from 0-100:
+
+1. **Subject match (0-40 points)**: Does the image depict the requested subject, scene, or objects?
+2. **Attribute fidelity (0-25 points)**: Are requested attributes present (style, colours, count, setting, mood)?
+3. **Image quality (0-20 points)**: Is it coherent and well-formed (not garbled, artifacted, or broken)?
+4. **Focus (0-15 points)**: Is it on-topic, without unrequested or contradictory content?
+
+Judge the IMAGE ITSELF, not any caption or surrounding text. If the request is vague, score by a reasonable interpretation of it.
+
+## Scoring Guidelines
+
+- **90-100 (Excellent)**: Clearly and fully depicts the request at high quality
+- **75-89 (Good)**: Depicts the main request with minor gaps
+- **50-74 (Partial)**: Partially matches but misses key elements
+- **25-49 (Poor)**: Weak relation to the request
+- **0-24 (Irrelevant)**: Does not depict what was asked
+
+## Output Format
+
+Respond with JSON only, no markdown code blocks:
+
+{
+  "relevanceScore": <0-100>,
+  "classification": "<excellent|good|partial|poor|irrelevant>",
+  "reasoning": "<brief explanation>"
+}`;
+
+/**
+ * Is this Bedrock model id a vision-capable judge? Every Claude judge reads images EXCEPT Claude 3.5
+ * Haiku (text-only). Conservative: an unknown / non-Claude id returns false so we never send an image
+ * to a text-only judge (a 400) and never mis-route an image turn to a caption-only score.
+ */
+export function isVisionCapableJudgeId(modelId: string | undefined): boolean {
+  const id = (modelId || '').toLowerCase();
+  if (!id.includes('claude')) return false;
+  if (id.includes('claude-3-5-haiku') || id.includes('claude-3.5-haiku')) return false;
+  return true;
+}
+
+/**
+ * The vision judge to use, or null if none is available (→ skip the image turn). An explicit
+ * VISION_EVALUATOR_MODEL is trusted as operator config; otherwise reuse EVALUATOR_MODEL only when it
+ * can read images. Never falls back to scoring the caption with the text judge.
+ */
+function resolveVisionJudgeModel(): string | null {
+  if (VISION_EVALUATOR_MODEL) return VISION_EVALUATOR_MODEL;
+  return isVisionCapableJudgeId(EVALUATOR_MODEL) ? EVALUATOR_MODEL : null;
+}
+
+/** Pull the image attachment ({fileKey, contentType}) off a message's metadata (JSONB object or raw string). */
+function attachmentFromMetadata(metadata: unknown): { fileKey: string; contentType: string } | undefined {
+  if (!metadata) return undefined;
+  const json = typeof metadata === 'string' ? metadata : JSON.stringify(metadata);
+  const att = extractAttachment(json);
+  return att ? { fileKey: att.fileKey, contentType: att.contentType } : undefined;
+}
+
+interface ImageScore {
+  relevance: Relevance;
+  model: string;
+}
+
+/**
+ * Score an image_generation turn by judging the GENERATED IMAGE (not its caption) against the prompt
+ * with a vision-capable Bedrock judge (Converse image block). Returns null to SKIP the turn (leaving
+ * it unscored, retried next run) whenever the image can't be judged — no vision judge, no attachments
+ * bucket, no or unusable image, a fetch failure, or a judge-call failure — so a caption-based
+ * (misleading) score is never written. Bounded to ONE image and one judge call per turn.
+ */
+async function scoreImageExchange(ex: UnscoredExchange): Promise<ImageScore | null> {
+  const model = resolveVisionJudgeModel();
+  if (!model) {
+    console.warn(`[eval] skip image exchange ${ex.id}: no vision-capable judge model configured`);
+    return null;
+  }
+  if (!ATTACHMENTS_BUCKET) {
+    console.warn(`[eval] skip image exchange ${ex.id}: ATTACHMENTS_BUCKET unset`);
+    return null;
+  }
+
+  const att = attachmentFromMetadata(ex.agent_metadata);
+  if (!att?.fileKey) {
+    console.warn(`[eval] skip image exchange ${ex.id}: no image attachment on the agent message`);
+    return null;
+  }
+  const format = imageFormatFromContentType(att.contentType);
+  if (!format) {
+    console.warn(`[eval] skip image exchange ${ex.id}: attachment type '${att.contentType}' is not a Converse image format`);
+    return null;
+  }
+
+  let bytes: Uint8Array;
+  try {
+    bytes = await fetchAttachmentBytes(s3Client, ATTACHMENTS_BUCKET, att.fileKey);
+  } catch (err) {
+    console.warn(`[eval] skip image exchange ${ex.id}: image fetch failed (${att.fileKey}):`, err instanceof Error ? err.message : String(err));
+    return null;
+  }
+
+  const prompt = IMAGE_RELEVANCE_PROMPT
+    .replace('{{agentType}}', ex.agent_type || 'unknown')
+    .replace('{{userType}}', ex.user_type || 'unknown')
+    .replace('{{userMessage}}', stripMarkers(ex.user_message || ''));
+
+  let text: string;
+  try {
+    const messages = [
+      { role: 'user', content: [{ text: prompt }, { image: { format, source: { bytes } } }] },
+    ] as unknown as ConverseCommandInput['messages'];
+    const response = await bedrockClient.send(
+      new ConverseCommand({ modelId: model, messages, inferenceConfig: { maxTokens: 1024, temperature: 0 } }),
+    );
+    const content = (response as { output?: { message?: { content?: Array<{ text?: string }> } } }).output?.message?.content;
+    text = (content?.map((b) => b.text || '').join('') || '{}').trim() || '{}';
+  } catch (err) {
+    console.warn(`[eval] skip image exchange ${ex.id}: vision judge call failed:`, err instanceof Error ? err.message : String(err));
+    return null;
+  }
+
+  // Same score shape/columns as the text judge, so the dashboards read image and text scores uniformly.
+  const match = text.match(/\{[\s\S]*\}/);
+  try {
+    const parsed = JSON.parse(match ? match[0] : text);
+    return {
+      model,
+      relevance: {
+        relevanceScore: Math.max(0, Math.min(100, Number(parsed.relevanceScore) || 0)),
+        classification: String(parsed.classification || 'partial'),
+        reasoning: String(parsed.reasoning || ''),
+      },
+    };
+  } catch {
+    // The judge DID view the image but returned malformed JSON; a middling score (not a caption score)
+    // avoids re-judging the same image every run. Rare.
+    return { model, relevance: { relevanceScore: 50, classification: 'partial', reasoning: 'Vision evaluation parse error' } };
   }
 }
 
@@ -436,10 +612,25 @@ export async function handler(
     else console.log(`Scoring ${exchanges.length} unscored exchange(s) [run ${runId}].`);
 
     let scored = 0;
+    let imageSkipped = 0;
     const errors: string[] = [];
     for (const ex of exchanges) {
       try {
-        const r = await scoreExchange(ex);
+        // image_generation turns are judged on the GENERATED IMAGE (vision judge), never the caption
+        // text. An un-judgeable image is SKIPPED (left unscored) rather than mis-scored on its caption.
+        let r: Relevance;
+        let evaluatorModel = EVALUATOR_MODEL;
+        if (ex.intent === 'image_generation') {
+          const img = await scoreImageExchange(ex);
+          if (!img) {
+            imageSkipped += 1;
+            continue;
+          }
+          r = img.relevance;
+          evaluatorModel = img.model;
+        } else {
+          r = await scoreExchange(ex);
+        }
         // P1 (SPEC-ADMIN-CONSOLE-EFFECTIVENESS): stamp the flow join keys at write time so a per-exchange
         // score reaches its flow directly. task_id is copied from the exchange; flow_id is resolved to
         // the intent_flows row for that task WHEN one exists (Pass B may run after Pass A, so it's
@@ -454,7 +645,7 @@ export async function handler(
               reasoning, agent_type, intent, task_id, flow_id, evaluation_type)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::varchar,
                    (SELECT id FROM intent_flows WHERE task_id = $9::varchar), 'exchange')`,
-          [ex.id, runId, EVALUATOR_MODEL, r.relevanceScore, r.classification, r.reasoning, ex.agent_type, ex.intent, ex.task_id],
+          [ex.id, runId, evaluatorModel, r.relevanceScore, r.classification, r.reasoning, ex.agent_type, ex.intent, ex.task_id],
         );
         scored += 1;
       } catch (err) {
@@ -468,11 +659,11 @@ export async function handler(
       return { scored: 0, errors: 1 };
     });
 
-    console.log(`Evaluation complete: exchanges ${scored} (errors ${errors.length}); flows ${flows.scored} (errors ${flows.errors}).`);
+    console.log(`Evaluation complete: exchanges ${scored} (errors ${errors.length}, image-skipped ${imageSkipped}); flows ${flows.scored} (errors ${flows.errors}).`);
     if (errors.length) console.warn('Eval errors:', errors.slice(0, 5));
     return {
       statusCode: 200,
-      body: JSON.stringify({ evaluated: scored, errors: errors.length, flowsScored: flows.scored, flowErrors: flows.errors, runId }),
+      body: JSON.stringify({ evaluated: scored, errors: errors.length, imageSkipped, flowsScored: flows.scored, flowErrors: flows.errors, runId }),
     };
   } catch (err) {
     console.error('Evaluation runner error:', err);

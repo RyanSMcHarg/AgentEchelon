@@ -140,6 +140,69 @@ describe('resolveReplyCostUsd (L0 cost column, D4) — null-honesty + coercion',
   });
 });
 
+describe('Aurora analytics-query: experiment_results carries a battle-scoped effectiveness view (SPEC-BATTLE)', () => {
+  it('returns the A/B rollup in `data` AND a separate, battle-only `battleEffectiveness` section (image-aware cost)', async () => {
+    // Call 1: the probabilistic A/B rollup (fetchExperimentRows).
+    mockDbQuery.mockResolvedValueOnce({
+      rows: [
+        {
+          experiment_id: 'exp-battle', variant_id: 'control', model_name: 'anthropic.claude-sonnet-4-6',
+          intent: 'general_qa', agent_type: 'premium', exchange_count: '40', avg_score: '82',
+          avg_total_ms: '1200', p95_total_ms: '1800', avg_input_tokens: '1000', avg_output_tokens: '500',
+          avg_tokens: '1500', avg_image_count: null, compliance_rate: '100', fallback_count: '0',
+          task_count: '0', task_completed_count: '0',
+        },
+      ],
+    });
+    // Call 2: the battle-scoped rows (fetchBattleEffectivenessRows): a text variant + an image variant.
+    mockDbQuery.mockResolvedValueOnce({
+      rows: [
+        {
+          experiment_id: 'exp-battle', variant_id: 'control', model_name: 'anthropic.claude-sonnet-4-6',
+          turn_count: '6', avg_score: '84', avg_input_tokens: '1000', avg_output_tokens: '500', avg_image_count: null,
+        },
+        {
+          experiment_id: 'exp-battle', variant_id: 'treatment', model_name: 'gpt-image-1',
+          turn_count: '4', avg_score: null, avg_input_tokens: '0', avg_output_tokens: '0', avg_image_count: '2',
+        },
+      ],
+    });
+
+    const res = await handler(postEvent({ queryType: 'experiment_results', dateRange: VALID_RANGE }));
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+
+    // The probabilistic A/B rollup is unchanged and stays in `data`.
+    expect(body.data).toHaveLength(1);
+    expect(body.data[0]).toMatchObject({ experiment_id: 'exp-battle', variant_id: 'control' });
+
+    // Two DB queries: the A/B rollup (battle EXCLUDED), then the battle-scoped one (filter INVERTED),
+    // keyed by (experiment, variant) with the variant's dominant model via MODE().
+    expect(mockDbQuery).toHaveBeenCalledTimes(2);
+    const abSql = String(mockDbQuery.mock.calls[0][0]);
+    const battleSql = String(mockDbQuery.mock.calls[1][0]);
+    expect(abSql).toMatch(/= 'probabilistic'/);
+    expect(battleSql).toMatch(/= 'battle'/);
+    expect(battleSql).not.toMatch(/= 'probabilistic'/);
+    expect(battleSql).toMatch(/GROUP BY m\.experiment_id, m\.variant_id/);
+    expect(battleSql).toMatch(/MODE\(\) WITHIN GROUP/);
+
+    // The battle-scoped section rides ALONGSIDE `data`, never folded into it.
+    const be = body.battleEffectiveness;
+    expect(Array.isArray(be.data)).toBe(true);
+    expect(be.data).toHaveLength(2);
+    const ctrl = be.data.find((r: { variant_id: string }) => r.variant_id === 'control');
+    const trt = be.data.find((r: { variant_id: string }) => r.variant_id === 'treatment');
+    // Text variant: priced on tokens (non-null, positive); relevance passes through.
+    expect(ctrl).toMatchObject({ turn_count: 6, avg_score: 84 });
+    expect(ctrl.avg_cost_usd).toBeGreaterThan(0);
+    // Image variant: PER-IMAGE cost from avg_image_count (gpt-image-1 @ $0.04 × 2 = $0.08, 0 tokens),
+    // and an unscored variant reports a null quality (honesty contract), not 0.
+    expect(trt.avg_score).toBeNull();
+    expect(trt.avg_cost_usd).toBeCloseTo(0.08, 6);
+  });
+});
+
 describe('Aurora analytics-query — intent_effectiveness (Effectiveness L0)', () => {
   it('runs the per-intent rollup and stamps cost_per_reply_usd on every row', async () => {
     mockDbQuery.mockResolvedValueOnce({

@@ -183,3 +183,43 @@ export function battleColumnsFor(
   const wins = map.get(feedbackKey(variantId, intent));
   return { battle_wins: wins == null ? null : wins };
 }
+
+// ---------------------------------------------------------------------------
+// Battle-scoped effectiveness join key. The probabilistic A/B rollup folds wins
+// at the (variant, intent) grain (feedbackKey). The battle-scoped effectiveness
+// view instead reports ONE row per (experiment, variant): battle turns are keyed
+// by experiment because a live scorecard sums a variant's wins across all of its
+// intents, and 'control'/'treatment' variantIds collide across experiments when
+// picks from every experiment are scanned at once.
+// ---------------------------------------------------------------------------
+
+/** Join key for the battle-scoped effectiveness view: one bucket per (experiment, variant). */
+export function battleWinKey(experimentId: string, variantId: string): string {
+  return `${experimentId}::${variantId}`;
+}
+
+/**
+ * Bucket battle picks by `experimentId::variantId` (wins summed across intents),
+ * for the battle-scoped effectiveness view. Same crediting + date-window rules as
+ * aggregateBattleWins: ties (no variantId) and picks without an experiment are
+ * dropped. Pure so the bucketing is unit-testable without DynamoDB.
+ *
+ * @param items   scanned BattleOutcome records (already projected)
+ * @param sinceMs epoch ms floor; picks older than this are dropped
+ */
+export function aggregateBattleWinsByVariant(items: BattleOutcomeItem[], sinceMs: number): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const item of items) {
+    const experimentId = (item.experimentId ?? '').trim();
+    const variantId = (item.variantId ?? '').trim();
+    // Only experiment-attributed, side-crediting picks join (ties have no variantId).
+    if (!experimentId || !variantId) continue;
+
+    const chosen = Date.parse(String(item.chosenAt ?? ''));
+    if (!Number.isFinite(chosen) || chosen < sinceMs) continue;
+
+    const key = battleWinKey(experimentId, variantId);
+    map.set(key, (map.get(key) || 0) + 1);
+  }
+  return map;
+}

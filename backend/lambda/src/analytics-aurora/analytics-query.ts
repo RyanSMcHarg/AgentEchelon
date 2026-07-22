@@ -30,9 +30,11 @@ import { recordModerationAction, adminListEvents } from './admin-conversations-a
 import {
   aggregateVariantFeedback,
   aggregateBattleWins,
+  aggregateBattleWinsByVariant,
   feedbackColumnsFor,
   battleColumnsFor,
   feedbackKey,
+  battleWinKey,
   type FeedbackItem,
   type VariantFeedback,
   type BattleOutcomeItem,
@@ -1774,16 +1776,14 @@ async function scanVariantFeedback(
 }
 
 /**
- * Scan the BattleOutcome table for head-to-head picks and bucket wins per
- * (variant, intent). Paginated; fails OPEN — unset table (/battle off) or a
- * scan error yields an empty map and the results render without battle wins.
+ * Scan the BattleOutcome table for head-to-head picks (projected to the join
+ * columns). Paginated; fails OPEN: an unset table (/battle off) or a scan error
+ * yields an empty list and every caller renders without battle picks. Shared by
+ * the probabilistic (variant,intent) rollup and the battle-scoped effectiveness
+ * view, which bucket the same items on different keys.
  */
-async function scanBattleWins(
-  days: number,
-  experimentId: string | undefined,
-): Promise<Map<string, number>> {
-  if (!BATTLE_OUTCOME_TABLE) return new Map();
-  const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
+async function scanBattleOutcomeItems(experimentId: string | undefined): Promise<BattleOutcomeItem[]> {
+  if (!BATTLE_OUTCOME_TABLE) return [];
   const items: BattleOutcomeItem[] = [];
   try {
     let exclusiveStartKey: Record<string, any> | undefined;
@@ -1810,9 +1810,22 @@ async function scanBattleWins(
       exclusiveStartKey = res.LastEvaluatedKey;
     } while (exclusiveStartKey);
   } catch (err) {
-    console.warn('[experiment-feedback] battle-wins scan failed (rendering without battle wins):', err);
-    return new Map();
+    console.warn('[experiment-feedback] battle-outcome scan failed (rendering without battle picks):', err);
+    return [];
   }
+  return items;
+}
+
+/**
+ * Bucket battle wins per (variant, intent) for the probabilistic A/B rollup.
+ * Fails OPEN via scanBattleOutcomeItems.
+ */
+async function scanBattleWins(
+  days: number,
+  experimentId: string | undefined,
+): Promise<Map<string, number>> {
+  const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
+  const items = await scanBattleOutcomeItems(experimentId);
   return aggregateBattleWins(items, sinceMs);
 }
 
@@ -1826,9 +1839,10 @@ async function fetchExperimentRows(
        AND e.created_at >= NOW() - INTERVAL '1 day' * $1`;
 
   if (!includeBattle) {
-    // TODO(metrics): battle-scoped effectiveness view — battle turns are intentionally
-    // excluded from the probabilistic experiment-variant rollup (SPEC-BATTLE rollup-safety
-    // invariant); a dedicated battle-scoped view would surface their metrics separately.
+    // Battle turns are intentionally excluded from the probabilistic experiment-variant
+    // rollup (SPEC-BATTLE rollup-safety invariant): folding a hand-picked battle prompt into
+    // the A/B averages would bias them. Their metrics are surfaced separately, with the filter
+    // INVERTED, by fetchBattleEffectivenessRows (the battle-scoped effectiveness view).
     where += ` AND COALESCE(m.metadata->'analytics'->>'assignmentMode', m.metadata->>'assignmentMode', 'probabilistic') = 'probabilistic'`;
   }
   if (experimentId) {
@@ -1927,6 +1941,107 @@ async function fetchExperimentRows(
   });
 }
 
+/** One battle-scoped effectiveness row: a variant's metrics from its BATTLE turns only. */
+interface BattleEffectivenessRow {
+  experiment_id: string;
+  variant_id: string;
+  model_name: string;
+  turn_count: number;
+  avg_score: number | null; // avg relevance where scored; null when no battle turn is scored yet
+  avg_cost_usd: number | null; // image-aware; null when the model/usage can't be priced
+  battle_wins: number | null; // head-to-head picks this variant won; null when none
+}
+
+const BATTLE_EFFECTIVENESS_COLUMNS = [
+  'experiment_id', 'variant_id', 'model_name', 'turn_count', 'avg_score', 'avg_cost_usd', 'battle_wins',
+];
+
+/**
+ * Battle-scoped effectiveness view (SPEC-BATTLE): per-variant metrics from the BATTLE turns ONLY,
+ * kept OUT of the probabilistic A/B rollup (fetchExperimentRows) so a hand-picked battle prompt never
+ * biases the A/B averages. Mirrors the fetchExperimentRows SQL shape but with the assignmentMode filter
+ * INVERTED (battle turns only) and keyed by (experiment, variant): one row per variant, its dominant
+ * model via MODE(), so the view answers "how is each battle contender doing" at a glance.
+ *
+ * Cost is image-aware, resolved by the SAME estimateStepCostUsd path the probabilistic + L0 views use
+ * (via resolveReplyCostUsd) so an image turn prices per-image, not as 0-token text. No schema change:
+ * the battle discriminator + imageCount ride messages.metadata JSONB, exactly like the image-cost fix.
+ *
+ * turn_count is COUNT(DISTINCT e.id) and relevance is pre-aggregated to one score per exchange, so a
+ * re-scored exchange (multiple evaluation_results rows) can neither inflate the count nor double-weight
+ * the average. avg_score is NULL (not 0) when no battle turn has been scored yet (the honesty contract).
+ * The per-variant win tally is joined from the same BattleOutcome scan the A/B rollup reads, bucketed by
+ * (experiment, variant). Fails OPEN: no BattleOutcome table => battle_wins is null, metrics still render.
+ */
+async function fetchBattleEffectivenessRows(
+  days: number,
+  experimentId: string | undefined,
+): Promise<BattleEffectivenessRow[]> {
+  const queryParams: any[] = [days];
+  let where = `WHERE m.experiment_id IS NOT NULL
+       AND e.created_at >= NOW() - INTERVAL '1 day' * $1
+       AND COALESCE(m.metadata->'analytics'->>'assignmentMode', m.metadata->>'assignmentMode', 'probabilistic') = 'battle'`;
+  if (experimentId) {
+    queryParams.push(experimentId);
+    where += ` AND m.experiment_id = $${queryParams.length}`;
+  }
+
+  const result = await query(
+    `SELECT
+       m.experiment_id,
+       m.variant_id,
+       COALESCE(MODE() WITHIN GROUP (ORDER BY m.bedrock_model), 'unknown') AS model_name,
+       COUNT(DISTINCT e.id) AS turn_count,
+       ROUND(AVG(er.relevance_score)::numeric, 1) AS avg_score,
+       ROUND(AVG(COALESCE(m.input_tokens, 0))::numeric, 0) AS avg_input_tokens,
+       ROUND(AVG(COALESCE(m.output_tokens, 0))::numeric, 0) AS avg_output_tokens,
+       -- Image (generation-out) turns: per-turn image count so cost prices per-image (an image model
+       -- reports 0 tokens). Regex-guarded cast so a malformed value never errors the whole query.
+       ROUND(AVG(CASE WHEN m.metadata->>'imageCount' ~ '^[0-9]+$'
+                      THEN (m.metadata->>'imageCount')::int END)::numeric, 2) AS avg_image_count
+     FROM exchanges e
+     JOIN messages m ON e.agent_message_id = m.id
+     -- One relevance per exchange (a re-scored exchange has multiple evaluation_results rows; averaging
+     -- them here keeps the LEFT JOIN 1:1 so turn_count is not inflated). NULL when never scored.
+     LEFT JOIN (
+       SELECT exchange_id, AVG(relevance_score) AS relevance_score
+         FROM evaluation_results
+        WHERE evaluation_type = 'exchange'
+        GROUP BY exchange_id
+     ) er ON er.exchange_id = e.id
+     ${where}
+     GROUP BY m.experiment_id, m.variant_id
+     ORDER BY m.experiment_id, m.variant_id`,
+    queryParams
+  );
+
+  // Per-variant win tally from the BattleOutcome table, bucketed by (experiment, variant)
+  // (wins summed across intents). Fails OPEN: no table => empty map => battle_wins null.
+  const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
+  const winsByVariant = aggregateBattleWinsByVariant(await scanBattleOutcomeItems(experimentId), sinceMs);
+
+  return result.rows.map((r: any): BattleEffectivenessRow => {
+    const avgScore = r.avg_score == null ? null : Number(r.avg_score);
+    const wins = winsByVariant.get(battleWinKey(r.experiment_id, r.variant_id));
+    return {
+      experiment_id: r.experiment_id,
+      variant_id: r.variant_id,
+      model_name: r.model_name || 'unknown',
+      turn_count: Number(r.turn_count) || 0,
+      avg_score: avgScore,
+      // Image-aware cost via the shared resolver (never a duplicated rate table): an image variant
+      // prices per-image from avg_image_count; a text variant prices on tokens. null when unpriceable.
+      avg_cost_usd: resolveReplyCostUsd({
+        dominant_model: r.model_name,
+        avg_input_tokens: r.avg_input_tokens,
+        avg_output_tokens: r.avg_output_tokens,
+        avg_image_count: r.avg_image_count,
+      }),
+      battle_wins: wins == null ? null : wins,
+    };
+  });
+}
+
 const EXPERIMENT_COLUMNS = [
   'experiment_id', 'variant_id', 'model_name', 'intent', 'agent_type',
   'exchange_count', 'avg_score', 'avg_total_ms', 'p95_total_ms',
@@ -1946,8 +2061,19 @@ async function getExperimentResults(
   params: Record<string, string | undefined>
 ): Promise<APIGatewayProxyResult> {
   const days = Math.min(parseInt(params.days || '30', 10), 180);
-  const rows = await fetchExperimentRows(days, params.experimentId, params.includeBattle === 'true');
-  return success({ data: rows, columns: EXPERIMENT_COLUMNS });
+  // The probabilistic A/B rows (battle EXCLUDED unless includeBattle) plus the battle-scoped
+  // effectiveness rows (battle ONLY) ride the SAME response, so the ExperimentsTab renders both and
+  // the battle contenders' metrics are visible without folding them into the A/B rollup. The extra
+  // field passes through handlePostQuery's { ...parsed } normalization; no new endpoint/stack wiring.
+  const [rows, battleEffectiveness] = await Promise.all([
+    fetchExperimentRows(days, params.experimentId, params.includeBattle === 'true'),
+    fetchBattleEffectivenessRows(days, params.experimentId),
+  ]);
+  return success({
+    data: rows,
+    columns: EXPERIMENT_COLUMNS,
+    battleEffectiveness: { data: battleEffectiveness, columns: BATTLE_EFFECTIVENESS_COLUMNS },
+  });
 }
 
 /**

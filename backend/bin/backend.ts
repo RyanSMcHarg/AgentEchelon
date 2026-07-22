@@ -318,6 +318,8 @@ if (analyticsMode === 'aurora') {
     // contract; bin adds the battle-stack dependency below so it exists first.
     userPoolArn: cognitoStack.userPool.userPoolArn,
     enableBattleJoin: enableBattle,
+    // Eval runner scores image turns by fetching the generated image from the attachments bucket.
+    attachmentsBucketArnParam,
     enableMembershipAudit,
     membershipAuditEnforce,
     membershipAuditAlertChannelArn,
@@ -514,6 +516,9 @@ if (battleStack) {
   // which depend on Aurora.)
   if (auroraStackForDrift) {
     auroraStackForDrift.addDependency(battleStack);
+    // The eval runner reads generated battle images from the attachments bucket; it resolves that
+    // bucket's ARN from the SSM param the S3 stack publishes, so S3 must deploy first (fresh deploys).
+    auroraStackForDrift.addDependency(s3Stack);
   }
 }
 

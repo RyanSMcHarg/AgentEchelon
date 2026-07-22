@@ -9,9 +9,11 @@
 import {
   aggregateVariantFeedback,
   aggregateBattleWins,
+  aggregateBattleWinsByVariant,
   feedbackColumnsFor,
   battleColumnsFor,
   feedbackKey,
+  battleWinKey,
   type FeedbackItem,
   type BattleOutcomeItem,
 } from '../../lambda/src/analytics-aurora/variant-feedback';
@@ -173,5 +175,46 @@ describe('battleColumnsFor', () => {
   it('returns the win count when present', () => {
     const map = aggregateBattleWins([pick(), pick()], Date.now() - 30 * DAY);
     expect(battleColumnsFor(map, 'control', 'research')).toEqual({ battle_wins: 2 });
+  });
+});
+
+describe('aggregateBattleWinsByVariant (battle-scoped effectiveness key)', () => {
+  const since = () => Date.now() - 30 * DAY;
+
+  it('sums wins per (experiment, variant) ACROSS intents (not split by intent)', () => {
+    const map = aggregateBattleWinsByVariant(
+      [
+        pick({ variantId: 'control', intent: 'research' }),
+        pick({ variantId: 'control', intent: 'action_item' }),
+        pick({ variantId: 'treatment', intent: 'research' }),
+      ],
+      since(),
+    );
+    // Both control picks collapse into ONE bucket (unlike the (variant,intent)-grained A/B tally).
+    expect(map.get(battleWinKey('exp1', 'control'))).toBe(2);
+    expect(map.get(battleWinKey('exp1', 'treatment'))).toBe(1);
+  });
+
+  it('keeps experiments separate even when variantIds collide (control/treatment)', () => {
+    const map = aggregateBattleWinsByVariant(
+      [pick({ experimentId: 'exp1', variantId: 'control' }), pick({ experimentId: 'exp2', variantId: 'control' })],
+      since(),
+    );
+    expect(map.get(battleWinKey('exp1', 'control'))).toBe(1);
+    expect(map.get(battleWinKey('exp2', 'control'))).toBe(1);
+  });
+
+  it('drops ties (no variantId), picks without an experiment, and out-of-window picks', () => {
+    const map = aggregateBattleWinsByVariant(
+      [
+        pick({ winner: 'tie', variantId: null }),
+        pick({ experimentId: null }),
+        pick({ chosenAt: ISO(90 * DAY) }),
+        pick({ variantId: 'control' }),
+      ],
+      since(),
+    );
+    expect(map.get(battleWinKey('exp1', 'control'))).toBe(1);
+    expect(map.size).toBe(1);
   });
 });

@@ -155,6 +155,14 @@ export interface AnalyticsStackAuroraProps extends cdk.StackProps {
    */
   enableBattleJoin?: boolean;
   /**
+   * SSM param name holding the attachments-bucket ARN. The eval runner scores an image-generation turn
+   * by fetching its generated image from that bucket (battle-images/...) and judging it with a vision
+   * model. Resolved at DEPLOY time via an SSM dynamic reference (the VPC has no SSM endpoint); bin adds a
+   * dependency on the S3 stack so the param exists first. Absent => image turns are skipped (unscored),
+   * never mis-scored on their caption text.
+   */
+  attachmentsBucketArnParam?: string;
+  /**
    * Cost sleep mode (docs/SPEC-COST-SLEEP-MODE.md). When true, this stack also
    * provisions the deployment-state table, the idle checker + EventBridge rule,
    * the admin sleep/wake API, and the SNS notification topic. Auto-sleep pauses
@@ -913,6 +921,15 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
       }
     );
 
+    // Attachments-bucket ARN/name for the eval runner's image scoring (resolved at deploy via SSM; the
+    // VPC has no SSM endpoint so it must be a build-time dynamic reference, not a runtime read).
+    const evalAttachmentsBucketArn = props.attachmentsBucketArnParam
+      ? ssm.StringParameter.valueForStringParameter(this, props.attachmentsBucketArnParam)
+      : undefined;
+    const evalAttachmentsBucketName = evalAttachmentsBucketArn
+      ? cdk.Fn.select(5, cdk.Fn.split(':', evalAttachmentsBucketArn))
+      : undefined;
+
     dbSecurityGroup.addIngressRule(
       evaluationLambdaSg,
       ec2.Port.tcp(5432),
@@ -983,6 +1000,9 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           ...dbEnvironment,
           ARCHIVE_BUCKET: archiveBucket.bucketName,
           EVALUATOR_MODEL: 'anthropic.claude-3-haiku-20240307-v1:0',
+          // Image-generation turns are judged by fetching the generated image from the attachments
+          // bucket (battle-images/...). Absent => image turns are skipped, never mis-scored.
+          ...(evalAttachmentsBucketName ? { ATTACHMENTS_BUCKET: evalAttachmentsBucketName } : {}),
         },
         bundling: {
           externalModules: ['@aws-sdk/*'],
@@ -999,6 +1019,17 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     );
 
     evaluationLambda.node.addDependency(iamAuthSetup);
+
+    // Image scoring: the eval runner fetches the generated image from the attachments bucket. Grant
+    // read-only GetObject (the attachments bucket is SSE-AES256, so no KMS key grant is needed).
+    if (evalAttachmentsBucketArn) {
+      evaluationLambdaRole.addToPolicy(
+        new iam.PolicyStatement({
+          actions: ['s3:GetObject'],
+          resources: [evalAttachmentsBucketArn, `${evalAttachmentsBucketArn}/*`],
+        }),
+      );
+    }
 
     // Evaluation schedule — every 30 min (was daily 2am UTC). Frequent runs are cheap: the EventBridge
     // rule is ~free, a run with nothing to score exits in ~1s, and the Bedrock evaluator cost is
