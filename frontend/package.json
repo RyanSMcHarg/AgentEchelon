@@ -8,6 +8,7 @@
     "packages/*"
   ],
   "scripts": {
+    "build": "npm run build:chat && npm run build:admin",
     "build:chat": "npm -w @ae/chat run build",
     "build:admin": "npm -w @ae/admin run build",
     "dev:chat": "npm -w @ae/chat run dev",
