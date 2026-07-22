@@ -37,7 +37,7 @@
     },
     {
       "title": "Image Generation Providers",
-      "summary": "**Audience:** Deployers configuring `/battle` generation-out (and any future feature that calls `invokeImageGenModel`).",
+      "summary": "**Audience:** Deployers configuring image generation. Image generation is a normal profile capability - the `image_generation` intent, served by a profile's `models.image` on ordinary turns - and the image A/B experiments and battles are built on top of it. Anything that calls `invokeImageGenModel`.",
       "path": "docs/guides/admin/IMAGE-GEN-PROVIDERS.md"
     },
     {
@@ -179,6 +179,11 @@
       "title": "DESIGN: Multi-Agent Orchestration",
       "summary": "**Status:** Design (alignment doc). This proposes a recommended structure and a set of explicit decisions to confirm. It is not a finalized build; every \"Recommendation\" below is a starting position pending sign-off, not a committed design.",
       "path": "docs/specs/capabilities/DESIGN-MULTI-AGENT-ORCHESTRATION.md"
+    },
+    {
+      "title": "DESIGN: Multi-Assistant Turn Engine",
+      "summary": "Status: Draft (design-target). Anchors the redesign of `/battle` into a general multi-assistant turn-taking engine. Unifies the two \"orchestrator\" notions that [DESIGN-MULTI-AGENT-ORCHESTRATION.md](DESIGN-MULTI-AGENT-ORCHESTRATION.md) (hierarchical fan-out-collate) and [DESIGN-BATTLE.md](DESIGN-BATTLE.md) (peer round-scheduler) describe",
+      "path": "docs/specs/capabilities/DESIGN-MULTI-ASSISTANT-TURN-ENGINE.md"
     },
     {
       "title": "SPEC: Battle Mode (`/battle`) - Product Specification",
@@ -368,7 +373,7 @@
   ],
   "blog": [],
   "generated_from": {
-    "repo_docs": 72,
+    "repo_docs": 73,
     "public_blog_posts": 0,
     "blog_vault_used": false
   }
