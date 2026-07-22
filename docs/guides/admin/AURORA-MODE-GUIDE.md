@@ -40,7 +40,7 @@ Aurora mode provisions:
 - **VPC** with 2 AZs, `PRIVATE_ISOLATED` subnets, 0 NAT gateways
 - **VPC Endpoints**: Kinesis (interface), S3 (gateway), Secrets Manager (interface), Bedrock Runtime (interface)
 - **Aurora PostgreSQL Serverless v2**: 0.5-4 ACU, IAM auth, encrypted at rest, Performance Insights
-- **RDS Proxy**: IAM authentication, connection pooling
+- **RDS Proxy** (opt-in, OFF by default): connection pooling + IAM auth in front of Aurora, enabled with `enableRdsProxy=true`. Off by default because on Serverless v2 it bills a fixed ~8-ACU floor (~$86/month) regardless of load; the default path is direct writer-endpoint IAM auth (see Connection pooling below)
 - **Schema Init**: Custom resource Lambda runs SQL migrations on deploy
 - **IAM Auth Setup**: Custom resource grants `rds_iam` role to DB user
 - **Kinesis Stream**: 2 shards, 24h retention (same as Athena mode)
@@ -50,7 +50,7 @@ Aurora mode provisions:
 - **Retrieval Data-Plane Lambda**: VPC-attached, runs RAG retrieval + drift detection (embed + pgvector) so the non-VPC agent handler can invoke it (project decision 018)
 - **S3 Archive Bucket**: Backwards-compatible with Athena mode (90-day lifecycle)
 
-All Lambdas connect to Aurora via RDS Proxy with IAM authentication (no hardcoded passwords).
+By default the Lambdas connect DIRECTLY to the Aurora writer endpoint using IAM database authentication (no hardcoded passwords). RDS Proxy is opt-in (`enableRdsProxy`, off by default); when enabled, the Lambdas connect through the proxy instead. See Connection pooling below.
 
 ---
 
@@ -80,7 +80,7 @@ On first deploy, the stack automatically:
 1. Creates the VPC and Aurora cluster
 2. Runs every schema migration in `schema/` in order (currently `001-initial` through `012-moderation-actions`)
 3. Sets up IAM authentication on the database user
-4. Creates the RDS Proxy and wires all Lambdas
+4. Wires all Lambdas to the Aurora writer endpoint with IAM auth (RDS Proxy is opt-in and OFF by default; enable `enableRdsProxy=true` only for high Lambda-concurrency workloads that need pooling)
 
 No manual steps required. The schema init custom resource runs idempotently on each deploy.
 
