@@ -11,8 +11,7 @@ import { chimeService } from '../services/chimeService';
 import { CollapsibleText } from './CollapsibleText';
 import BattleScorecard, { type ScorecardVariant } from './BattleScorecard';
 import BattleTallyBar from './BattleTallyBar';
-import { getBattleConfig, type ChannelBattleConfig } from '../services/channelBattleService';
-import { computeBattleTally, type BattleRoundInput, type BattleWinner } from '../utils/battleTally';
+import { computeBattleTally, type BattleRoundInput, type BattleWinner, type BattleTally } from '../utils/battleTally';
 import { submitMessageFeedback } from '@ae/shared';
 import { shortenModelId } from '../utils/modelLabel';
 import { getModelGreeting } from '../utils/greeting';
@@ -117,21 +116,6 @@ const ConversationInterface: React.FC = () => {
     return () => { cancelled = true; };
   }, [activeConversation?.conversationArn, currentUserArn]);
 
-  // Battle-mode enabled state for the active conversation. The running tally bar shows ONLY
-  // while battle mode is on and disappears when it is turned off (disable deletes the config
-  // row, so getBattleConfig then reports enabled=false). Refetched when the members panel
-  // (where enable/disable happens) opens or closes so the bar reacts to the toggle.
-  const [battleConfig, setBattleConfig] = useState<ChannelBattleConfig | null>(null);
-  useEffect(() => {
-    const arn = activeConversation?.conversationArn;
-    if (!arn) { setBattleConfig(null); return; }
-    let cancelled = false;
-    void getBattleConfig(arn)
-      .then((cfg) => { if (!cancelled) setBattleConfig(cfg); })
-      .catch(() => { if (!cancelled) setBattleConfig(null); });
-    return () => { cancelled = true; };
-  }, [activeConversation?.conversationArn, isMembersPanelOpen]);
-
   // Archive runs from the in-app confirmation modal (ArchiveConversationModal),
   // which owns the busy/error UI; this just performs the persisting archive and
   // lets the modal surface any failure inline.
@@ -177,10 +161,19 @@ const ConversationInterface: React.FC = () => {
     return rounds;
   }, [messages]);
 
-  const battleTally = useMemo(
-    () => computeBattleTally(battleRounds.map((r) => ({ ...r, winner: battleWinners[r.battleId] ?? null }))),
-    [battleRounds, battleWinners],
-  );
+  // One STANDALONE tally per battle: each /battle prompt is scored on its own (A vs B
+  // for THAT prompt, both rounds including the rebuttal), and the next prompt starts a
+  // fresh tally - no running total is carried across battles. Rendered inline at the end
+  // of each battle, so the stream reads as a sequence of independent battle results.
+  // Replaces the old single sticky bar that floated over the whole view and aggregated
+  // every battle into one ambiguous running count.
+  const battleTallyByBattleId = useMemo(() => {
+    const map = new Map<string, BattleTally>();
+    for (const r of battleRounds) {
+      map.set(r.battleId, computeBattleTally([{ ...r, winner: battleWinners[r.battleId] ?? null }]));
+    }
+    return map;
+  }, [battleRounds, battleWinners]);
 
   const humanMemberCount = channelMembers.filter((m) => !m.isBot).length;
   const isMultiUser = humanMemberCount >= 2;
@@ -418,7 +411,6 @@ const ConversationInterface: React.FC = () => {
           )}
         </header>
       <div className="messages-container" ref={containerRef} onScroll={handleScroll}>
-        {battleConfig?.enabled && battleRounds.length > 0 && <BattleTallyBar tally={battleTally} />}
         {isLoadingMessages ? (
           <div className="messages-loading">
             <div className="message-skeleton">
@@ -668,6 +660,12 @@ const ConversationInterface: React.FC = () => {
                 variantB={scorecard.variantB}
                 onOutcomeChange={handleBattleOutcome}
               />
+            )}
+            {/* One running-tally snapshot inline at the end of each battle (cumulative
+                through this battle), so the record grows down the stream and the newest
+                one marks the battle being scored now. */}
+            {scorecard && battleTallyByBattleId.get(scorecard.battleId) && (
+              <BattleTallyBar inline tally={battleTallyByBattleId.get(scorecard.battleId)!} />
             )}
             </React.Fragment>
             );

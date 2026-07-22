@@ -11,6 +11,17 @@
   backdrop-filter: blur(6px);
 }
 
+/* Inline variant: a per-battle snapshot that flows in the message stream at the
+   end of each battle (under its scorecard), instead of floating over the view.
+   No sticky/blur; a left accent rule ties it visually to the battle above it. */
+.battle-tally--inline {
+  position: static;
+  z-index: auto;
+  backdrop-filter: none;
+  margin: var(--space-2) 0 var(--space-4);
+  border-left: 3px solid var(--accent-500, #4f46e5);
+}
+
 .battle-tally-head {
   display: flex;
   align-items: baseline;
@@ -27,6 +38,20 @@
 .battle-tally-rounds {
   color: var(--text-secondary, var(--text-muted, #888));
   font-size: 0.85em;
+}
+
+/* Pick decided: emphasize the "You picked X" status. */
+.battle-tally-rounds--decided {
+  color: var(--accent-600, var(--accent-500, #4f46e5));
+  font-weight: var(--font-weight-semibold);
+}
+
+/* "◄ your pick" tag on the winning side's label. */
+.battle-tally-side-pick {
+  font-size: 0.78em;
+  font-weight: var(--font-weight-semibold);
+  color: var(--accent-600, var(--accent-500, #4f46e5));
+  white-space: nowrap;
 }
 
 .battle-tally-sides {

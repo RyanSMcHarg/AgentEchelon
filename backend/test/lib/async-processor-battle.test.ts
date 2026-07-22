@@ -147,7 +147,11 @@ describe('buildRebuttalContext (round-2 rebuttal note)', () => {
     expect(note.toLowerCase()).toContain('where yours is stronger');
     // Not gratuitously hostile, and not a mere restatement.
     expect(note.toLowerCase()).toContain('fair');
-    expect(note.toLowerCase()).toContain('do not just restate');
+    expect(note.toLowerCase()).toContain('do not restate yours');
+    // A rebuttal turn must never produce a fresh answer / new generation (the image-battle
+    // "I can't generate images" confusion fix): the instruction says so explicitly.
+    expect(note.toLowerCase()).toContain('do not produce a fresh answer');
+    expect(note.toLowerCase()).toContain('do not run any tools or generate anything new');
   });
 
   it('falls back gracefully when the rival name or reply is empty', () => {
@@ -172,6 +176,15 @@ describe('buildRebuttalImageNote (image-battle round-2 addendum)', () => {
     expect(note.toLowerCase()).toContain('conversation');
     // Appends cleanly to a system prompt.
     expect(note.startsWith('\n\n')).toBe(true);
+  });
+
+  it('anti-confusion: points at the RIVAL image and forbids re-generating / "cannot generate" (bug fix)', () => {
+    const note = buildRebuttalImageNote('Echo').toLowerCase();
+    // Directs the model at the rival's image, not its own.
+    expect(note).toContain('echo');
+    // Does not think it must generate a new image, and does not claim it is unable to.
+    expect(note).toContain('already generated');
+    expect(note).toMatch(/do not generate another|do not say you are unable/);
   });
 
   it('is separate from buildRebuttalContext (its competitive wording is not modified)', () => {

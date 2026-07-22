@@ -17,6 +17,7 @@ import { queryAnalytics, getExperimentRecommendation } from '../../services/anal
 import type {
   AnalyticsDateRange,
   AnalyticsResult,
+  BattleEffectivenessRow,
   ExperimentRecommendation,
   ExperimentResultRow,
   ExperimentVerdict,
@@ -36,6 +37,7 @@ const INTENT_OPTIONS = [
   { value: 'code_review', label: 'Code Review' },
   { value: 'document_extraction', label: 'Document Extraction' },
   { value: 'report_generation', label: 'Report Generation' },
+  { value: 'image_generation', label: 'Image Generation' },
   { value: 'strategic_analysis', label: 'Strategic Analysis' },
   { value: 'workflow_actions', label: 'Workflow Actions' },
 ];
@@ -64,6 +66,16 @@ const IMAGE_GEN_MODEL_OPTIONS = [
 ];
 
 const TIER_OPTIONS = ['basic', 'standard', 'premium'] as const;
+
+// An image (generation-out) battle only makes sense when the experiment is about
+// generating images. For an intent-scoped experiment that means the intent is
+// `image_generation`; base_model / classification / profile experiments are not
+// pinned to one intent, so they may opt into an image battle explicitly. When this
+// is false the per-variant image-gen selectors are hidden (a text intent must never
+// display an image model) and the battle is always a text battle.
+function isImageBattleEligible(experimentType: string, intent: string): boolean {
+  return experimentType !== 'intent' || intent === 'image_generation';
+}
 
 const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading: _isLoading, registerBack }) => {
   const [experiments, setExperiments] = useState<Experiment[]>([]);
@@ -140,11 +152,18 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
       setActionError('Experiment ID is required');
       return;
     }
+    // Image (generation-out) models only apply when the experiment is about image
+    // generation; for any other intent the selectors are hidden, so drop any stale
+    // key rather than shipping "OpenAI for code generation".
+    const imageBattleEligible = isImageBattleEligible(newExperiment.experimentType, newExperiment.intent);
+    const controlImageGenModelKey = imageBattleEligible ? newExperiment.controlImageGenModelKey : '';
+    const treatmentImageGenModelKey = imageBattleEligible ? newExperiment.treatmentImageGenModelKey : '';
+
     // Generation-out is both-or-neither (server enforces too —
     // this just fails fast locally with a clear message).
     if (
       newExperiment.battleEnabled &&
-      !!newExperiment.controlImageGenModelKey !== !!newExperiment.treatmentImageGenModelKey
+      !!controlImageGenModelKey !== !!treatmentImageGenModelKey
     ) {
       setActionError(
         'Generation-out battle: set an image-gen model on BOTH variants, or neither (for a text battle).',
@@ -172,8 +191,8 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
         ...(newExperiment.battleEnabled && {
           displayName: newExperiment.controlDisplayName,
           systemPromptAddendum: newExperiment.controlAddendum || undefined,
-          ...(newExperiment.controlImageGenModelKey && {
-            imageGenModelKey: newExperiment.controlImageGenModelKey as ImageGenModelKey,
+          ...(controlImageGenModelKey && {
+            imageGenModelKey: controlImageGenModelKey as ImageGenModelKey,
           }),
         }),
       },
@@ -184,8 +203,8 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
         ...(newExperiment.battleEnabled && {
           displayName: newExperiment.treatmentDisplayName,
           systemPromptAddendum: newExperiment.treatmentAddendum || undefined,
-          ...(newExperiment.treatmentImageGenModelKey && {
-            imageGenModelKey: newExperiment.treatmentImageGenModelKey as ImageGenModelKey,
+          ...(treatmentImageGenModelKey && {
+            imageGenModelKey: treatmentImageGenModelKey as ImageGenModelKey,
           }),
         }),
       },
@@ -299,6 +318,11 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
       </div>
     );
   }
+
+  // Only surface the per-variant image-gen selectors when an image battle is coherent:
+  // an image-generation intent, or a non-intent experiment that opts in explicitly. A text
+  // intent (e.g. Code Generation) never displays an image model.
+  const showImageGenSelectors = isImageBattleEligible(newExperiment.experimentType, newExperiment.intent);
 
   return (
     <div className="admin-tab">
@@ -511,8 +535,12 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
               <span className="status-badge">premium-only</span>
             </label>
             <p className="experiment-battle-toggle-help">
-              Battle Mode runs both variants in parallel on the same prompt + a round-2 rebuttal,
-              instead of probabilistically picking one. Channel moderators opt in per channel.
+              Battle is an engagement option on this A/B experiment, not a separate path: both variants
+              answer every /battle prompt through the same request engine users hit (same intents, profile
+              models, and tools) instead of the experiment probabilistically serving one. Round 1 races both
+              answers at once; in round 2 each variant posts a short rebuttal on the other's answer, and an
+              inline scorecard closes each battle. Battle stays on until an admin or the experiment owner turns
+              it off, and channel moderators opt a channel in.
             </p>
           </div>
 
@@ -543,17 +571,19 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                     maxLength={500}
                     rows={3}
                   />
-                  <select
-                    className="select input experiment-battle-variant-imagegen"
-                    aria-label="Control image-gen model"
-                    value={newExperiment.controlImageGenModelKey}
-                    onChange={(e) => setNewExperiment((p) => ({ ...p, controlImageGenModelKey: e.target.value }))}
-                  >
-                    <option value="">Text battle (no image generation)</option>
-                    {IMAGE_GEN_MODEL_OPTIONS.map((o) => (
-                      <option key={o.value} value={o.value}>{o.label}</option>
-                    ))}
-                  </select>
+                  {showImageGenSelectors && (
+                    <select
+                      className="select input experiment-battle-variant-imagegen"
+                      aria-label="Control image-gen model"
+                      value={newExperiment.controlImageGenModelKey}
+                      onChange={(e) => setNewExperiment((p) => ({ ...p, controlImageGenModelKey: e.target.value }))}
+                    >
+                      <option value="">Text battle (no image generation)</option>
+                      {IMAGE_GEN_MODEL_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>{o.label}</option>
+                      ))}
+                    </select>
+                  )}
                 </div>
 
                 <div className="experiment-battle-vs" aria-hidden="true">VS</div>
@@ -577,19 +607,29 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                     maxLength={500}
                     rows={3}
                   />
-                  <select
-                    className="select input experiment-battle-variant-imagegen"
-                    aria-label="Treatment image-gen model"
-                    value={newExperiment.treatmentImageGenModelKey}
-                    onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentImageGenModelKey: e.target.value }))}
-                  >
-                    <option value="">Text battle (no image generation)</option>
-                    {IMAGE_GEN_MODEL_OPTIONS.map((o) => (
-                      <option key={o.value} value={o.value}>{o.label}</option>
-                    ))}
-                  </select>
+                  {showImageGenSelectors && (
+                    <select
+                      className="select input experiment-battle-variant-imagegen"
+                      aria-label="Treatment image-gen model"
+                      value={newExperiment.treatmentImageGenModelKey}
+                      onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentImageGenModelKey: e.target.value }))}
+                    >
+                      <option value="">Text battle (no image generation)</option>
+                      {IMAGE_GEN_MODEL_OPTIONS.map((o) => (
+                        <option key={o.value} value={o.value}>{o.label}</option>
+                      ))}
+                    </select>
+                  )}
                 </div>
               </div>
+
+              {showImageGenSelectors && (
+                <p className="experiment-battle-toggle-help">
+                  Image battle: set an image-gen model on BOTH variants and each one generates an
+                  image in round 1, then critiques the rival's image in the round-2 rebuttal. Leave
+                  both empty for a text battle (the server requires both or neither).
+                </p>
+              )}
 
               <div className="experiment-battle-slot">
                 <label className="label" htmlFor="alt-bot-slot-select">Alt-bot slot</label>
@@ -873,6 +913,27 @@ function ExperimentResults({
     ? allGroups.filter((g) => g.experimentId === selectedExperimentId)
     : allGroups;
 
+  // Battle-scoped effectiveness (SPEC-BATTLE): the backend returns per-variant metrics from the
+  // BATTLE turns ONLY, alongside (and kept out of) the probabilistic A/B `data` rollup. Bucket
+  // them by experiment so each comparison can render its own "Battle results" section. Always read
+  // from the base response (independent of the include-battle A/B toggle, which only re-fetches `data`).
+  const battleByExp = useMemo(() => {
+    const rowsIn = resultsData?.battleEffectiveness?.data ?? [];
+    const m = new Map<string, BattleEffectivenessRow[]>();
+    for (const r of rowsIn) {
+      const arr = m.get(r.experiment_id) || [];
+      arr.push(r);
+      m.set(r.experiment_id, arr);
+    }
+    return m;
+  }, [resultsData]);
+  const expById = useMemo(() => new Map(experiments.map((e) => [e.experimentId, e])), [experiments]);
+  // A battle-only experiment (battle turns, no probabilistic traffic yet) has no A/B group, so its
+  // battle metrics would otherwise never render; surface those as standalone battle blocks too.
+  const orphanBattleIds = Array.from(battleByExp.keys())
+    .filter((id) => !allGroups.some((g) => g.experimentId === id))
+    .filter((id) => !selectedExperimentId || id === selectedExperimentId);
+
   async function toggleBattle(next: boolean) {
     setIncludeBattle(next);
     if (!next) {
@@ -941,7 +1002,22 @@ function ExperimentResults({
           objective={objectivesById.get(g.experimentId) ?? undefined}
           reco={recos[g.experimentId]}
           onRecommend={() => loadReco(g.experimentId)}
+          battleRows={battleByExp.get(g.experimentId) ?? []}
+          experiment={expById.get(g.experimentId)}
         />
+      ))}
+
+      {/* Battle-only experiments (no probabilistic A/B group yet) still get their battle scorecard. */}
+      {orphanBattleIds.map((id) => (
+        <div className="exp-compare" key={`battle-${id}`}>
+          <div className="exp-compare-head">
+            <div className="exp-compare-title">
+              <span className="exp-compare-id">{id}</span>
+              <span className="exp-compare-meta">battle turns only · no probabilistic traffic yet</span>
+            </div>
+          </div>
+          <BattleResults rows={battleByExp.get(id) ?? []} experiment={expById.get(id)} />
+        </div>
       ))}
     </div>
   );
@@ -1030,11 +1106,15 @@ function ExperimentComparison({
   objective,
   reco,
   onRecommend,
+  battleRows,
+  experiment,
 }: {
   group: ExperimentGroup;
   objective?: ExperimentObjective;
   reco?: { loading: boolean; data?: ExperimentRecommendation; error?: string };
   onRecommend: () => void;
+  battleRows?: BattleEffectivenessRow[];
+  experiment?: Experiment;
 }) {
   const { control, treatment } = group;
   const totalN = (control?.exchange_count ?? 0) + (treatment?.exchange_count ?? 0);
@@ -1111,6 +1191,60 @@ function ExperimentComparison({
 
       {reco?.error && <div className="admin-error"><span>{reco.error}</span></div>}
       {reco?.data && <RecommendationCard reco={reco.data} />}
+
+      {/* Battle-scoped effectiveness: /battle turns only, kept separate from the A/B table above. */}
+      <BattleResults rows={battleRows ?? []} experiment={experiment} />
+    </div>
+  );
+}
+
+/**
+ * Battle-scoped effectiveness (SPEC-BATTLE): a variant-by-variant scorecard computed from the
+ * experiment's BATTLE turns ONLY. Deliberately separate from, and additional to, the probabilistic
+ * A/B comparison, so a hand-picked battle prompt never biases the A/B averages. Renders nothing when
+ * the experiment has no battle turns.
+ */
+function BattleResults({ rows, experiment }: { rows: BattleEffectivenessRow[]; experiment?: Experiment }) {
+  if (!rows.length) return null;
+  const nameFor = (variantId: string) =>
+    experiment?.variants.find((v) => v.variantId === variantId)?.displayName || variantId;
+  return (
+    <div className="exp-battle">
+      <div className="exp-battle-head">
+        <span className="status-badge status-badge--live">Battle results</span>
+        <span className="exp-battle-sub">
+          From /battle turns only, kept separate from the probabilistic A/B table above.
+        </span>
+      </div>
+      <div className="exp-battle-table-wrap">
+        <table className="exp-battle-table">
+          <thead>
+            <tr>
+              <th>Variant</th>
+              <th>Model</th>
+              <th className="num">Turns</th>
+              <th className="num">Quality</th>
+              <th className="num">Est. cost / reply</th>
+              <th className="num">Battle wins</th>
+            </tr>
+          </thead>
+          <tbody>
+            {rows.map((r) => (
+              <tr key={r.variant_id}>
+                <td>
+                  <span className="exp-battle-variant-name">{nameFor(r.variant_id)}</span>
+                  <span className="exp-battle-variant-id"> · {r.variant_id}</span>
+                </td>
+                <td>{modelDisplayName(r.model_name)}</td>
+                <td className="num">{r.turn_count.toLocaleString()}</td>
+                <td className="num">{r.avg_score == null ? '—' : r.avg_score}</td>
+                <td className="num">{r.avg_cost_usd == null ? '—' : `$${r.avg_cost_usd.toFixed(4)}`}</td>
+                <td className="num">{r.battle_wins == null ? '—' : r.battle_wins}</td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }

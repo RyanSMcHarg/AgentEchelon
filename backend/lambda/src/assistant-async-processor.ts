@@ -828,7 +828,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
             // Additive one-liner (buildRebuttalContext wording unchanged): point the model at the image
             // it now sees in the conversation. Appended to the END, after the cache-prefix point, so it
             // does not disturb systemPrompt caching.
-            systemPrompt += buildRebuttalImageNote();
+            systemPrompt += buildRebuttalImageNote(event.battleContext?.rivalDisplayName);
             console.log('[AssistantAsyncProcessor][battle] round-2 rebuttal sees rival image(s) via conversation', { attached });
           }
         } catch (e) {

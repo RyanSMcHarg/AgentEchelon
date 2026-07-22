@@ -2808,7 +2808,7 @@ const BATTLE_ORCHESTRATOR_ARN = process.env.BATTLE_ORCHESTRATOR_ARN;
 export function buildRebuttalContext(rivalDisplayName: string, rivalReply: string): string {
   const rival = rivalDisplayName || 'the other assistant';
   const reply = rivalReply || '(no reply)';
-  return `\n\n[You are in a head-to-head battle. Below is ${rival}'s answer to the SAME prompt. Write a SHORT rebuttal: comment on ${rival}'s answer and make the case for why YOUR answer is the better one - be specific about where yours is stronger, more accurate, or more useful, and where theirs falls short or missed something. Be pointed but fair; do not just restate your answer, and do not be gratuitously dismissive. If ${rival}'s answer is genuinely better or equal and you have nothing to add, respond with the single token NO_REBUTTAL.]\n<other_reply>\n${reply}\n</other_reply>`;
+  return `\n\n[This is your REBUTTAL turn in a head-to-head battle. You and ${rival} have ALREADY answered the same prompt - your answer is above in the conversation, and ${rival}'s answer is shown below. This turn is a short written rebuttal ABOUT the two answers: do NOT produce a fresh answer, do NOT restate yours, and do NOT run any tools or generate anything new. Make the case for why YOUR answer is the better one - be specific about where yours is stronger, more accurate, or more useful, and where ${rival}'s falls short or missed something. Be pointed but fair; do not be gratuitously dismissive. If ${rival}'s answer is genuinely better or equal and you have nothing to add, respond with the single token NO_REBUTTAL.]\n<other_reply>\n${reply}\n</other_reply>`;
 }
 
 /**
@@ -2817,8 +2817,9 @@ export function buildRebuttalContext(rivalDisplayName: string, rivalReply: strin
  * model can actually see it). Points the assistant at the image it now perceives in the shared
  * conversation. buildRebuttalContext's wording is unchanged; this is an additive one-liner. Pure.
  */
-export function buildRebuttalImageNote(): string {
-  return `\n\n[The image(s) produced in this battle are shown to you above in the conversation. Look at the other assistant's image and critique it specifically - be concrete about what yours does better.]`;
+export function buildRebuttalImageNote(rivalDisplayName?: string): string {
+  const rival = rivalDisplayName || 'the other assistant';
+  return `\n\n[This is an IMAGE battle. You have ALREADY generated your own image - do NOT generate another one and do NOT say you are unable to generate images. ${rival}'s image is shown to you above in the conversation. Look at ${rival}'s image and critique it specifically, then argue why YOUR image answered the prompt better - be concrete about what theirs gets wrong or leaves out.]`;
 }
 
 /**
