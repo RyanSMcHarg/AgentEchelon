@@ -1,8 +1,8 @@
 # Image Generation Providers
 
-**Audience:** Deployers configuring `/battle` generation-out (and any future feature that calls `invokeImageGenModel`).
+**Audience:** Deployers configuring image generation. Image generation is a normal profile capability - the `image_generation` intent, served by a profile's `models.image` on ordinary turns - and the image A/B experiments and battles are built on top of it. Anything that calls `invokeImageGenModel`.
 
-**Scope:** `/battle` generation-out supports multiple image providers across two hosting modes (AWS Bedrock and external HTTP APIs). The active providers are Stability (Bedrock), OpenAI, and FAL; Amazon Titan Image v2 and Nova Canvas remain in the registry but are LEGACY-locked by AWS for accounts without recent usage, with no self-serve unblock.
+**Scope:** Image generation supports multiple providers across two hosting modes (AWS Bedrock and external HTTP APIs). A profile's `models.image` selects the provider for ordinary `image_generation` turns; an Image Generation intent experiment (or a Profile vs Profile experiment) can pit two providers against each other on live traffic, and a battle runs both side by side and scores them. The active providers are Stability (Bedrock), OpenAI, and FAL; Amazon Titan Image v2 and Nova Canvas remain in the registry but are LEGACY-locked by AWS for accounts without recent usage, with no self-serve unblock.
 
 ## TL;DR
 
@@ -232,13 +232,13 @@ The NAT Gateway line is **not introduced by this project** - it's the cost of ru
 
 ## Agentic integration - where image-gen sits in the architecture
 
-AgentEchelon's fulfillment path is the **self-hosted Converse tool loop** - see CLAUDE.md > Architecture. The shared `assistant-async-processor.ts` (via `async-processor-core.ts`) runs a Converse `toolConfig` loop under the serving profile's own IAM role; there is no Bedrock Agent and no Action Group. Image generation is called directly from `assistant-async-processor.ts` during the `/battle` fan-out, and only for battle-eligible profiles (premium by default).
+AgentEchelon's fulfillment path is the **self-hosted Converse tool loop** - see CLAUDE.md > Architecture. The shared `assistant-async-processor.ts` (via `async-processor-core.ts`) runs a Converse `toolConfig` loop under the serving profile's own IAM role; there is no Bedrock Agent and no Action Group. Image generation is a normal capability of this path, not a battle-only branch: on an `image_generation` turn the worker resolves the image model with `resolveTurnImageGenModelId` (a battle variant's image model, then a non-battle experiment variant's image model, then the profile's `models.image`) and calls `invokeImageGenModel` directly instead of running the text loop. A battle resolves the same way and just runs both variants. The turn needs `ATTACHMENTS_BUCKET` and the image guardrail wired on it - the battle-eligible profile (premium by default) has these; other profiles that set `models.image` degrade to a text turn until the same env is wired on their processor.
 
-**Why call it directly rather than as a tool?** Image generation is slow (5-20s per call). Folding a 15-second image-gen into the synchronous Converse tool loop would: (a) push the text reply's latency well past acceptable bounds, (b) couple the text reply timing to the image timing in a way that prevents the user from seeing the text-side response first.
+**Why call it directly rather than as a Converse tool?** Image generation is slow (5-20s per call). Folding a 15-second image-gen into the synchronous Converse text loop would push a turn's latency well past acceptable bounds and couple the text timing to the image timing. So an `image_generation` turn takes the direct-invocation branch instead of the text loop.
 
-Today's split: the text side runs through the Converse tool loop → produces the text reply → the `/battle` orchestrator (after the text battle settles) fires `invokeImageGenModel` separately for each bot's image-gen variant. The image arrives as an out-of-band Amazon Chime SDK message with a `<!--battleimage:-->` marker, decoupled from the text reply.
+**Delivery.** The generated image is persisted to the attachments bucket and delivered as a message **attachment** - metadata `{ fileKey, name, size, type }` on the message - which the frontend renders inline as an `<img>` through `AttachmentDisplay`, fetching a fresh presigned URL on demand. It is no longer embedded in the message text: the earlier `<!--battleimage:-->` content marker (which carried a large presigned URL and did not render in the browser) is no longer used for delivery, though the marker is still recognized and stripped defensively.
 
-This decoupled, direct-invocation pattern is the correct shape for any slow generation step that must not block the text turn.
+This direct-invocation, attachment-delivery pattern is the correct shape for any slow generation step that must not block the text turn.
 
 ## Common-practice notes for calling external models from AWS
 

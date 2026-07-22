@@ -111,7 +111,7 @@ Then fill in the fields. Most are common to every type; the type-specific fields
 
 **Type-specific field**
 
-- **Intent** (Intent type only) - which kind of request this experiment applies to (General Q&A, Code Generation, Code Review, Document Extraction, Report Generation, Strategic Analysis, or Workflow Actions). The experiment only affects conversation messages routed to this intent.
+- **Intent** (Intent type only) - which kind of request this experiment applies to (General Q&A, Code Generation, Code Review, Document Extraction, Report Generation, Image Generation, Strategic Analysis, or Workflow Actions). The experiment only affects conversation messages routed to this intent. For **Image Generation** the two variant fields become **Control Image Model** and **Treatment Image Model** (Stability Core / Ultra, OpenAI, FAL), because the thing being compared for an image request is the image model, not a text model; both are required. Image generation is a normal capability, so the assigned variant's image model serves ordinary image requests on the traffic split - a battle is not required (it only adds the side-by-side UI and scoring). Image comparison is meaningful for an Image Generation intent experiment or a Profile vs Profile experiment (each profile carries its own image model); a Base Model or Classification experiment varies a text model, so an image prompt there runs the same image model on both sides.
 
 Choose **Create and Activate**. The experiment starts immediately with a status of **active**.
 
@@ -177,9 +177,8 @@ In the experiment's form, tick **Enable for /battle** (battles are premium-only 
 - **Display name** per variant (for example, control = Atlas, treatment = Echo), up to sixteen characters. This is what users see, so they read two distinct assistants rather than two model identifiers.
 - **System prompt addendum** per variant (optional, up to 500 characters), a short style or persona instruction layered on top of the tier's base prompt. It shapes voice, not capability; the models remain the real comparison.
 - **Alt-bot slot** - the pre-provisioned seat the treatment occupies when it joins a channel. Each slot can be bound to one active battle experiment at a time.
-- **Long-form mode** - for report or document battles, choose **one-shot** (each side produces the complete deliverable in round one as an attachment) or **outline-first** (round one is just the approach, so you can compare directions before a full report is generated).
 
-For an image-generation battle, set an **image-gen model** on both variants (set it on neither for a normal text battle); the form enforces both-or-neither. Choose **Create and Activate**.
+An **image battle** is just an Image Generation intent experiment (its two variant image models, set above) with battle enabled: both sides generate an image in round one, then each critiques the other's image in the round-two rebuttal. Battle adds no image setup of its own; the model choice lives on the experiment, and battle only layers the side-by-side UI and scoring on top of the same flow. A Profile vs Profile experiment can also be an image battle when the two profiles carry different image models. Choose **Create and Activate**.
 
 Any experiment type can be armed for battle, including **Profile vs Profile**: the two profile versions then answer side by side in one conversation, so you can feel the difference between two whole assistant configurations before you promote one.
 
@@ -199,7 +198,7 @@ In a battle-enabled channel, start any prompt with the `/battle` command:
 
 Both assistants answer the same prompt in parallel (round one). A scorecard renders under the pair with three independent axes, never folded into a single number: **response time**, **estimated cost** (tokens times the model rate, an estimate for comparison and not a bill), and **quality**, which is your call (pick **A better**, **Tie**, or **B better**). A **Show steps** expander reveals the per-step rows (step label, model, duration), the same detail admins see.
 
-The quality pick is the point: it is direct human feedback. In Aurora mode each pick is credited to the winning variant and surfaces as the **Battle wins** column in the per-variant Experiment Results. *(Not included: feeding that signal into an experiment objective and recommendation, a one-tap thumbs prompt after a round, and a running "N picks collected toward a confident call" tally.)*
+The quality pick is the point: it is direct human feedback. In Aurora mode each pick is credited to the winning variant and surfaces as the **Battle wins** column in the per-variant Experiment Results. At the end of each battle an inline result card summarizes that prompt's outcome (each side's response time and estimated cost, and which side you picked); the next `/battle` gets its own fresh card. *(Not included: feeding that pick into an experiment objective and recommendation, and a one-tap thumbs prompt after a round.)*
 
 After both answers land, a divider marks **round two**: each assistant receives the other's answer, knows it is in a battle, and may rebut, build on it, or stay silent. Round two is commentary; the deliverable is round one.
 
