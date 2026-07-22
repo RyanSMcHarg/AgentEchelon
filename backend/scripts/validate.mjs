@@ -141,10 +141,9 @@ if (!process.env.VITE_CREDENTIAL_EXCHANGE_API_URL && !process.env.EXCHANGE_API_U
 // and battle-setup falls back to the chat URL when E2E_ADMIN_BASE_URL is unset (that origin has no
 // admin UI, so the arm step times out on .admin-section-rail). Resolve both here so a plain
 // `validate.mjs` run is self-contained. Absent stack / unset → the phase uses the localhost default.
-const ADMIN_FRONTEND_STACK = FRONTEND_STACK.replace(/Frontend$/, 'AdminFrontend');
 for (const [envVar, stack, key] of [
-  ['E2E_BASE_URL', FRONTEND_STACK, 'DistributionUrl'],
-  ['E2E_ADMIN_BASE_URL', ADMIN_FRONTEND_STACK, 'AdminDistributionUrl'],
+  ['E2E_BASE_URL', 'AgentEchelonFrontend', 'DistributionUrl'],
+  ['E2E_ADMIN_BASE_URL', 'AgentEchelonAdminFrontend', 'AdminDistributionUrl'],
 ]) {
   if (process.env[envVar]) continue;
   const region = process.env.AWS_REGION || 'us-east-1';
