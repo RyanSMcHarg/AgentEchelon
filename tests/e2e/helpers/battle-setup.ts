@@ -100,11 +100,16 @@ async function leaveAdmin(page: Page): Promise<void> {
  */
 async function pauseBattleExperimentIfActive(page: Page, expId: string): Promise<void> {
   const row = page.locator(`tr:has-text("${expId}")`).first();
-  if (!(await row.isVisible({ timeout: 3_000 }).catch(() => false))) return; // not present -> nothing to pause
+  // The experiments DataTable loads async after openAdminExperiments returns (which only waits for the
+  // section heading). Give the row a REAL window (15s, matching the create/reuse check) - a 3s wait
+  // silently no-oped on a slow list load, leaving the sibling active and the enable hitting SLOT_BOUND.
+  if (!(await row.isVisible({ timeout: 15_000 }).catch(() => false))) return; // not present -> nothing to pause
   const pause = row.locator('button:has-text("Pause")').first();
-  if (await pause.isVisible({ timeout: 1_500 }).catch(() => false)) {
+  if (await pause.isVisible({ timeout: 3_000 }).catch(() => false)) {
     await pause.click();
-    await expect(row).toContainText('paused', { timeout: 10_000 }).catch(() => {});
+    // Verify the write landed (status cell flips to 'paused'); it's the whole point of the call, so
+    // surface a stuck status rather than swallowing it.
+    await expect(row).toContainText('paused', { timeout: 10_000 });
   }
 }
 
@@ -116,11 +121,11 @@ async function pauseBattleExperimentIfActive(page: Page, expId: string): Promise
  */
 async function resumeBattleExperimentIfPaused(page: Page, expId: string): Promise<void> {
   const row = page.locator(`tr:has-text("${expId}")`).first();
-  if (!(await row.isVisible({ timeout: 3_000 }).catch(() => false))) return; // not present -> nothing to resume
+  if (!(await row.isVisible({ timeout: 15_000 }).catch(() => false))) return; // not present -> nothing to resume
   const resume = row.locator('button:has-text("Resume")').first();
-  if (await resume.isVisible({ timeout: 1_500 }).catch(() => false)) {
+  if (await resume.isVisible({ timeout: 3_000 }).catch(() => false)) {
     await resume.click();
-    await expect(row).toContainText('active', { timeout: 10_000 }).catch(() => {});
+    await expect(row).toContainText('active', { timeout: 10_000 });
   }
 }
 

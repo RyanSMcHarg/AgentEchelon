@@ -211,8 +211,10 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
   }) => {
     test.setTimeout(4 * 60_000);
 
-    // A premium channel with Battle Mode OFF (no enable step). Auth comes from
-    // the shared storageState (no per-test sign-in); no experiment needed here.
+    // A premium channel with Battle Mode OFF (no enable step). Auth comes from the shared storageState,
+    // but this test does no admin round-trip, so nothing has navigated to the chat app yet - land on it
+    // first (the removed per-test signInAdmin used to do this).
+    await page.goto('/');
     await page.locator('button.app-new-conversation-btn').click();
     await page.waitForSelector('.ncm-modal', { timeout: 8000 });
     const premiumCard = page.locator('.ncm-class-card:has-text("Premium")').first();
@@ -240,7 +242,9 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
   test('/battle is a start-of-message command, not a mid-sentence mention', async ({ page }) => {
     test.setTimeout(4 * 60_000);
 
-    // Auth comes from the shared storageState (no per-test sign-in).
+    // Auth comes from the shared storageState; this test does no admin round-trip, so navigate to the
+    // chat app first (nothing else lands here).
+    await page.goto('/');
     await page.locator('button.app-new-conversation-btn').click();
     await page.waitForSelector('.ncm-modal', { timeout: 8000 });
     await page.locator('.ncm-class-card').first().click();
