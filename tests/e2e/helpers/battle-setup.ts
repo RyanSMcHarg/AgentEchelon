@@ -151,8 +151,19 @@ export async function ensureBattleExperimentExists(
   await page.locator('button:has-text("New Experiment")').click();
   await expect(page.locator('h4:has-text("Create Experiment")')).toBeVisible();
   await page.locator('label:has-text("Experiment ID") input').fill(expId);
-  await page.locator('label:has-text("Control Model") select').selectOption({ value: opts.control ?? 'sonnet' }).catch(() => {});
-  await page.locator('label:has-text("Treatment Model") select').selectOption({ value: opts.treatment ?? 'opus' }).catch(() => {});
+  // Variant models. An IMAGE battle is an `image_generation` INTENT experiment (image generation is a
+  // normal per-variant capability now, not a battle-card toggle): set the intent FIRST — that switches
+  // the Control/Treatment "Model" dropdowns to IMAGE models — then pick an image model on each (option 0
+  // is the "Select an image model…" placeholder; option 1 is the first active image model, robust to the
+  // deploy). A text battle keeps the text-model dropdowns.
+  if (opts.image) {
+    await page.locator('select:has(option[value="image_generation"])').selectOption({ value: 'image_generation' }).catch(() => {});
+    await page.locator('label:has-text("Control Image Model") select').selectOption({ index: 1 });
+    await page.locator('label:has-text("Treatment Image Model") select').selectOption({ index: 1 });
+  } else {
+    await page.locator('label:has-text("Control Model") select').selectOption({ value: opts.control ?? 'sonnet' }).catch(() => {});
+    await page.locator('label:has-text("Treatment Model") select').selectOption({ value: opts.treatment ?? 'opus' }).catch(() => {});
+  }
   await page.locator('label:has-text("Description") input').fill('E2E battle: Sonnet (Atlas) vs Opus (Echo).');
 
   // A battle-enabled experiment must target EXACTLY ['premium'] (the backend
@@ -172,13 +183,8 @@ export async function ensureBattleExperimentExists(
   const names = page.locator('.experiment-battle-variant-name');
   await names.nth(0).fill('Atlas');
   await names.nth(1).fill('Echo');
-  // Generation-out duel: set an image-gen model on BOTH variants (the form requires both-or-neither).
-  // Pick the first real option (index 0 is "Text battle (no image generation)"), so this is robust to
-  // whichever image models are active in the deploy.
-  if (opts.image) {
-    await page.locator('select[aria-label="Control image-gen model"]').selectOption({ index: 1 });
-    await page.locator('select[aria-label="Treatment image-gen model"]').selectOption({ index: 1 });
-  }
+  // (Image models are set above, on the intent=image_generation variant dropdowns — no battle-card
+  // image selectors anymore.)
   await page.locator('#alt-bot-slot-select').selectOption(slot).catch(() => {});
   await page.locator('button:has-text("Create & Activate")').click();
   await expect(page.locator(`text=${expId}`).first()).toBeVisible({ timeout: 15_000 });
