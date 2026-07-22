@@ -560,6 +560,12 @@ export async function loadChannelHistory(
       if (!content.trim()) continue;
 
       const isBot = senderArn.includes('/bot/') || senderArn === botArn;
+      // Perspective-based role: assistants are first-class PEERS, so from the model's own vantage only
+      // ITS OWN prior turns are `assistant`; every OTHER participant - the human AND any other assistant
+      // (e.g. a battle rival) - is the `user` side. This is what lets another assistant's image ride a
+      // valid `user` turn (Bedrock permits image blocks only on user turns) and be perceived naturally,
+      // rather than being an invalid image block on an `assistant` turn.
+      const isSelfBot = senderArn === botArn;
 
       // Skip the current user message (it's added separately)
       if (!isBot && content.trim() === currentMessage.trim()) continue;
@@ -578,7 +584,7 @@ export async function loadChannelHistory(
           : undefined;
 
       history.push({
-        role: isBot ? 'assistant' : 'user',
+        role: isSelfBot ? 'assistant' : 'user',
         content,
         ...(images && { images }),
       });
@@ -856,22 +862,27 @@ export function buildConverseMessages(
   imageInput?: BedrockImageInput,
   documentInput?: BedrockDocumentInput,
 ): Array<{ role: 'user' | 'assistant'; content: Array<Record<string, unknown>> }> {
+  // Vision-through-conversation: render each RESOLVED image attachment carried on a history message as a
+  // Converse image block. Bedrock permits image blocks ONLY on USER turns - and with perspective-based
+  // roles (loadChannelHistory) a USER turn is any OTHER participant (the human OR another assistant, e.g.
+  // a battle rival), while an ASSISTANT turn is THIS model's own prior output (it need not re-perceive
+  // its own image). So images render on user turns only; an image on an assistant turn is skipped, never
+  // a malformed block.
   const out = messages.map(msg => {
     const content: Array<Record<string, unknown>> = [{ text: msg.content }];
-    // Vision-through-conversation: render each RESOLVED image attachment carried on this history
-    // message (bytes filled by resolveHistoryImageBlocks) as a Converse image block, so the assistant
-    // sees images shared earlier in the channel. Entries without bytes or an unusable format are
-    // skipped (never a malformed block).
-    for (const img of msg.images ?? []) {
-      const fmt = img.bytes ? imageFormatFromContentType(img.contentType) : undefined;
-      if (img.bytes && fmt) {
-        content.push({ image: { format: fmt, source: { bytes: img.bytes } } });
+    const role = msg.role as 'user' | 'assistant';
+    if (role === 'user') {
+      for (const img of msg.images ?? []) {
+        const fmt = img.bytes ? imageFormatFromContentType(img.contentType) : undefined;
+        if (img.bytes && fmt) {
+          content.push({ image: { format: fmt, source: { bytes: img.bytes } } });
+        }
       }
     }
-    return { role: msg.role as 'user' | 'assistant', content };
+    return { role, content };
   });
-  // Append the attachment block to the LAST user message (the current turn). Image OR document;
-  // if there's no user message it's dropped rather than sent malformed.
+  // Append the current-turn attachment (image OR document) to the LAST user message. If there is no user
+  // message it is dropped rather than sent malformed.
   const block = imageInput
     ? { image: { format: imageInput.format, source: { bytes: imageInput.bytes } } }
     : documentInput

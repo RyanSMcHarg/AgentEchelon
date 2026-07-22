@@ -66,27 +66,34 @@ describe('buildConverseMessages', () => {
     expect(out).toEqual([{ role: 'assistant', content: [{ text: 'only assistant' }] }]);
   });
 
-  // Vision-through-conversation: a RESOLVED image on a history message (e.g. a rival's round-1
-  // generated image on its assistant turn) is rendered as a Converse image block on THAT message, so
-  // the assistant sees images shared earlier in the shared channel.
-  it('renders a resolved image block on the history message that carries it', () => {
-    const bytes = new Uint8Array([7, 8, 9]);
+  // Vision-through-conversation with perspective-based roles: another participant (human OR another
+  // assistant, e.g. a battle rival) is a USER turn, so its image renders inline (Bedrock permits image
+  // blocks only on user turns). The model's OWN prior turn is an ASSISTANT turn - its image is skipped
+  // (it need not re-perceive its own output, and an assistant-turn image block is invalid).
+  it('renders an image inline on a user turn (other participant) and skips an assistant-turn image', () => {
+    const selfBytes = new Uint8Array([7, 8, 9]);
+    const rivalBytes = new Uint8Array([4, 5, 6]);
     const out = buildConverseMessages([
       { role: 'user', content: 'prompt' },
       {
         role: 'assistant',
-        content: 'Generated an image with Titan.',
-        images: [{ fileKey: 'battle-images/c/ts-0.png', contentType: 'image/png', bytes }],
+        content: 'my answer',
+        images: [{ fileKey: 'battle-images/c/self-0.png', contentType: 'image/png', bytes: selfBytes }],
       },
-      { role: 'user', content: 'now rebut' },
+      {
+        role: 'user',
+        content: 'rival answer',
+        images: [{ fileKey: 'battle-images/c/rival-0.png', contentType: 'image/png', bytes: rivalBytes }],
+      },
     ]);
-    expect(out[1].content).toEqual([
-      { text: 'Generated an image with Titan.' },
-      { image: { format: 'png', source: { bytes } } },
+    // Self (assistant) turn keeps only its text.
+    expect(out[1].content).toEqual([{ text: 'my answer' }]);
+    // The other participant's (user turn) image renders inline.
+    expect(out[2].content).toEqual([
+      { text: 'rival answer' },
+      { image: { format: 'png', source: { bytes: rivalBytes } } },
     ]);
-    // Other messages untouched.
     expect(out[0].content).toEqual([{ text: 'prompt' }]);
-    expect(out[2].content).toEqual([{ text: 'now rebut' }]);
   });
 
   it('skips an unresolved (no-bytes) or unusable-format history image (never a malformed block)', () => {
@@ -106,12 +113,18 @@ describe('buildConverseMessages', () => {
     expect(out[1].content).toEqual([{ text: 'bad format' }]);
   });
 
-  it('renders MULTIPLE images on one merged message (both battle images)', () => {
+  it('renders MULTIPLE images inline on a user turn (other participant); assistant-turn images skipped', () => {
     const a = new Uint8Array([1]);
     const b = new Uint8Array([2]);
+    const selfImg = new Uint8Array([9]);
     const out = buildConverseMessages([
       {
         role: 'assistant',
+        content: 'my image',
+        images: [{ fileKey: 'k0', contentType: 'image/png', bytes: selfImg }],
+      },
+      {
+        role: 'user',
         content: 'two images',
         images: [
           { fileKey: 'k1', contentType: 'image/png', bytes: a },
@@ -119,7 +132,8 @@ describe('buildConverseMessages', () => {
         ],
       },
     ]);
-    expect(out[0].content).toEqual([
+    expect(out[0].content).toEqual([{ text: 'my image' }]);
+    expect(out[1].content).toEqual([
       { text: 'two images' },
       { image: { format: 'png', source: { bytes: a } } },
       { image: { format: 'jpeg', source: { bytes: b } } },
