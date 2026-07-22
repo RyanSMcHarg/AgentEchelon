@@ -134,6 +134,34 @@ if (!process.env.VITE_CREDENTIAL_EXCHANGE_API_URL && !process.env.EXCHANGE_API_U
   }
 }
 
+// Resolve the deployed app ORIGINS so the browser e2e runs against the live CloudFront
+// distributions instead of the localhost dev-server defaults. E2E_BASE_URL is the CHAT app
+// (playwright baseURL); E2E_ADMIN_BASE_URL is the standalone ADMIN app. These are DIFFERENT origins
+// since the admin-app split — the battle/experiments/admin phases arm experiments on the admin origin,
+// and battle-setup falls back to the chat URL when E2E_ADMIN_BASE_URL is unset (that origin has no
+// admin UI, so the arm step times out on .admin-section-rail). Resolve both here so a plain
+// `validate.mjs` run is self-contained. Absent stack / unset → the phase uses the localhost default.
+const ADMIN_FRONTEND_STACK = FRONTEND_STACK.replace(/Frontend$/, 'AdminFrontend');
+for (const [envVar, stack, key] of [
+  ['E2E_BASE_URL', FRONTEND_STACK, 'DistributionUrl'],
+  ['E2E_ADMIN_BASE_URL', ADMIN_FRONTEND_STACK, 'AdminDistributionUrl'],
+]) {
+  if (process.env[envVar]) continue;
+  const region = process.env.AWS_REGION || 'us-east-1';
+  const q = `Stacks[0].Outputs[?OutputKey=='${key}'].OutputValue`;
+  const res = spawnSync(
+    `aws cloudformation describe-stacks --stack-name ${stack} --region ${region} --query "${q}" --output text`,
+    { shell: true, encoding: 'utf8' },
+  );
+  const url = (res.stdout || '').trim();
+  if (url && url !== 'None') {
+    process.env[envVar] = url;
+    console.log(`[validate] ${envVar} resolved from ${stack}: ${url}`);
+  } else {
+    console.warn(`[validate] WARNING: could not resolve ${envVar} from ${stack} — browser e2e falls back to localhost (the LIVE app is not tested). Deploy ${stack} or set ${envVar}.`);
+  }
+}
+
 // Resolve the image-gen-keys secret ARN so the image-gen phase can hit the real
 // external providers exactly as the deployed processor does. Without it the live
 // suite has no keys to load; surface that rather than let it fail opaquely.
