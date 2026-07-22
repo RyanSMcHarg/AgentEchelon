@@ -36,6 +36,12 @@ export interface ChannelFlowStackProps extends cdk.StackProps {
   /** ChannelBattleConfigTable for reading whether a channel has /battle enabled */
   channelBattleConfigTableName?: string;
   channelBattleConfigTableArn?: string;
+  /** ExperimentsTable name + ARN. The /battle fan-out reads it (Scan) to resolve a
+   *  generation-out battle's per-variant image-gen models (resolveBattleImageGenPair).
+   *  Without it, loadExperiments() returns [] inside channel-flow and every image
+   *  battle silently falls through to a text battle. */
+  experimentsTableName?: string;
+  experimentsTableArn?: string;
   /** PRIMARY IDP user pool — the processor resolves participant emails by sub (AdminGetUser) when
    *  fanning a notify-tagged channel message out over email, for targets without an explicit issuer.
    *  Identity is never persisted; it is the single source of truth resolved at send time. */
@@ -143,6 +149,19 @@ export class ChannelFlowStack extends cdk.Stack {
             ],
           }),
         }),
+        // /battle generation-out: read the ExperimentsTable to resolve a battle's
+        // per-variant image-gen models (loadExperiments does a Scan). Without this,
+        // an image battle can't resolve its models in the fan-out and falls to text.
+        ...(props.experimentsTableArn && {
+          ExperimentsReadPolicy: new iam.PolicyDocument({
+            statements: [
+              new iam.PolicyStatement({
+                actions: ['dynamodb:Scan', 'dynamodb:GetItem'],
+                resources: [props.experimentsTableArn],
+              }),
+            ],
+          }),
+        }),
         // SSM lookup for the alt-bot slot roster (channel-flow needs to know
         // which channel members are alt-slot bots when fanning out /battle).
         SSMRosterPolicy: new iam.PolicyDocument({
@@ -208,6 +227,11 @@ export class ChannelFlowStack extends cdk.Stack {
         }),
         ...(props.channelBattleConfigTableName && {
           CHANNEL_BATTLE_CONFIG_TABLE: props.channelBattleConfigTableName,
+        }),
+        // /battle generation-out: lets loadExperiments() resolve a battle's image-gen
+        // models in the fan-out. Absent ⇒ loadExperiments returns [] ⇒ text battle.
+        ...(props.experimentsTableName && {
+          EXPERIMENTS_TABLE: props.experimentsTableName,
         }),
         ALT_BOT_SLOTS_ROSTER_PARAM: INSTANCE_SSM.altBotSlotsRoster,
         // Notification bridge (P1): resolve participant emails by (iss, sub) + send via SES.

@@ -43,6 +43,10 @@ import {
   botRowsOnly,
   type BattleStateRow,
 } from './lib/battle-state.js';
+import {
+  resolveBattleVariantBySlotArn,
+  resolveBattleControlVariantByAltSlotArn,
+} from './lib/experiment-manager.js';
 
 const messagingClient = new ChimeSDKMessagingClient({});
 const lambdaClient = new LambdaClient({});
@@ -125,12 +129,36 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
     bots: bots.length,
   });
 
+  // Resolve-once (DESIGN-MULTI-ASSISTANT-TURN-ENGINE, "Battle delegates to the
+  // normal engine"): resolve each side's experiment variant ONCE here and stamp
+  // it into the round-2 battleContext, so the worker runs a normal request for
+  // the variant with no second resolution. The alt-slot bot is whichever row
+  // resolves via the slot-keyed resolver; the other row is the default/control
+  // side. control = variants[0]; treatment = variants[1]. Best-effort: a
+  // resolver hiccup leaves the fields unset and the worker resolves normally.
+  let altSlotArn = '';
+  for (const row of bots) {
+    if (await resolveBattleVariantBySlotArn(row.botArn)) {
+      altSlotArn = row.botArn;
+      break;
+    }
+  }
+  const [controlVariant, treatmentVariant] = altSlotArn
+    ? await Promise.all([
+        resolveBattleControlVariantByAltSlotArn(altSlotArn),
+        resolveBattleVariantBySlotArn(altSlotArn),
+      ])
+    : [null, null];
+
   // 4. For each bot, send round-2 placeholder + invoke async with rival reply.
   await Promise.all(
     bots.map(async (selfRow) => {
       const rivalRow = bots.find((r) => r.botArn !== selfRow.botArn);
       const rivalReply = rivalRow?.round1Reply || '';
       const rivalReplyMsgId = rivalRow?.round1MessageId;
+      const isAltSlot = selfRow.botArn === altSlotArn;
+      const selfVariant = isAltSlot ? treatmentVariant : controlVariant;
+      const rivalVariant = isAltSlot ? controlVariant : treatmentVariant;
 
       const correlationId = `battle-r2-${selfRow.botArn.split('/').pop()}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
 
@@ -171,6 +199,16 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
                 rivalReply,
                 rivalReplyMsgId,
                 originatingMessageId,
+                // Resolve-once: this side's variant + the rival's display name
+                // (woven into the rebuttal note). Unset fields fall back to the
+                // worker's normal resolution.
+                ...(selfVariant?.modelKey && { variantModelKey: selfVariant.modelKey }),
+                ...(selfVariant?.systemPromptAddendum && { variantAddendum: selfVariant.systemPromptAddendum }),
+                ...(selfVariant?.displayName && { selfDisplayName: selfVariant.displayName }),
+                // Phase-2: this side's image model, so the round-2 rebuttal also runs the normal image
+                // path for an image battle (each side does its normal thing). Unset for a text battle.
+                ...(selfVariant?.imageGenModelKey && { variantImageModelKey: selfVariant.imageGenModelKey }),
+                ...(rivalVariant?.displayName && { rivalDisplayName: rivalVariant.displayName }),
               },
             })),
           }),

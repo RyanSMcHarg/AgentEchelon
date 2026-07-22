@@ -174,11 +174,21 @@ exports.handler = async (event) => {
       //    exact conversationId + fileKey match ties the download to the caller's own conversation.
       //    FOLLOW-UP (defense in depth): additionally verify Chime channel membership for the
       //    generated-docs path, so a former member who kept an old channelId cannot re-fetch.
+      //  - battle-images/<conversationId>/...            an assistant-GENERATED image (image_generation
+      //    intent / battle generation-out). Like generated docs it belongs to the conversation, not one
+      //    uploader (persistImageGenOutput writes battle-images/<channelId>/..., and channelId is the
+      //    conversation id), so any member downloads it; the unguessable conversationId + exact fileKey
+      //    match ties the download to the caller's own conversation.
       const ownUploadPrefix = `attachments/${conversationId}/${callerSub}/`;
       const generatedDocPrefix = `generated-docs/${conversationId}/`;
-      if (!conversationId || !(fileKey.startsWith(ownUploadPrefix) || fileKey.startsWith(generatedDocPrefix))) {
+      const battleImagePrefix = `battle-images/${conversationId}/`;
+      if (!conversationId || !(
+        fileKey.startsWith(ownUploadPrefix)
+        || fileKey.startsWith(generatedDocPrefix)
+        || fileKey.startsWith(battleImagePrefix)
+      )) {
         return respond(403, {
-          error: 'fileKey must belong to the caller (own upload) or the named conversation (generated doc)',
+          error: 'fileKey must belong to the caller (own upload) or the named conversation (generated doc/image)',
           code: 'FILE_KEY_NOT_OWNED',
         }, origin);
       }

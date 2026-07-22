@@ -99,8 +99,30 @@ export const DEFAULT_INTENT_PACK: IntentPack = {
       keywords: [
         'extract', 'export data', 'as a table', 'as a spreadsheet', 'as a csv',
         'list all', 'pull the', 'data from', 'dataset',
+        // Bulk-retrieval verbs scoped with "the" so they match "retrieve the logs" / "fetch the
+        // records" (structured/bulk) but NOT a single-fact question ("what was our Q2 ARR?"), keeping
+        // the ADR-018 boundary (docs/design/decisions/018-company-context-tool-and-extraction-boundary.md).
+        'query the', 'fetch the', 'retrieve the',
       ],
       delivery: 'TASK_MULTI_STEP',
+    },
+    {
+      // Image generation as a NORMAL capability + intent (DESIGN-MULTI-ASSISTANT-TURN-ENGINE,
+      // "image generation must become a normal capability"): an assistant whose profile grants an
+      // image model produces an IMAGE on a request that asks for one — in a battle or not. Declared
+      // BEFORE report_generation so its keywords WIN for an image ask: "generate an image" contains
+      // report_generation's 'generate', and classifyByPackKeywords returns the first-listed match.
+      // delivery PLACEHOLDER_UPDATE (one generated reply, updated in place — not a multi-step task).
+      key: 'image_generation',
+      description:
+        'User wants the assistant to GENERATE, create, draw, or produce an IMAGE / picture / ' +
+        'illustration / logo from a text description (e.g. "generate an image of a mountain lake", ' +
+        '"draw a robot", "make a picture of ..."). NOT a request to analyze or describe an existing image.',
+      keywords: [
+        'generate an image', 'create an image', 'make an image', 'draw ',
+        'generate a picture', 'make a picture', 'an image of', 'picture of', 'image of a',
+      ],
+      delivery: 'PLACEHOLDER_UPDATE',
     },
     {
       key: 'report_generation',

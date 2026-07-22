@@ -529,6 +529,11 @@ const channelFlowStack = new ChannelFlowStack(app, `${STACK_PREFIX}ChannelFlow`,
   battleStateTableArn: battleStack?.battleStateTableArn,
   channelBattleConfigTableName: battleStack?.channelBattleConfigTableName,
   channelBattleConfigTableArn: battleStack?.channelBattleConfigTableArn,
+  // /battle generation-out: the fan-out reads the ExperimentsTable (Scan) to resolve a
+  // battle's per-variant image-gen models. Without it, loadExperiments() returns [] inside
+  // channel-flow and every image battle silently falls through to a text battle.
+  experimentsTableName: experimentsStack.experimentsTableName,
+  experimentsTableArn: experimentsStack.experimentsTableArn,
   // Notification bridge (SPEC-NOTIFICATION-BRIDGE P1, outbound): the processor resolves
   // participant emails from the IDP by sub and fans a notify-tagged message out over SES.
   // Federated users live in the HOST pool (federatedUserPoolId), not the AE platform pool —
@@ -544,6 +549,9 @@ const channelFlowStack = new ChannelFlowStack(app, `${STACK_PREFIX}ChannelFlow`,
   senderEmail,
   description: 'Channel Flow Processor for @all and /battle routing',
 });
+// The /battle generation-out fan-out reads the ExperimentsTable at runtime; ensure the
+// table exists before ChannelFlow deploys (env var + read grant reference its name/ARN).
+channelFlowStack.addDependency(experimentsStack);
 
 // Frontend hosting — the DEFAULT production path for the SPA (CloudFront + S3).
 // Independent of every other stack: it provisions an empty bucket + CloudFront

@@ -102,7 +102,6 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
     // power Battle Mode. Requires displayName on each variant + a slot id.
     battleEnabled: false,
     altBotSlotId: 'slot-0',
-    longFormMode: 'one-shot',
     controlDisplayName: 'Atlas',
     treatmentDisplayName: 'Echo',
     controlAddendum: '',
@@ -221,7 +220,6 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
         ...(newExperiment.battleEnabled && {
           battleEnabled: true,
           altBotSlotId: newExperiment.altBotSlotId,
-          longFormMode: newExperiment.longFormMode,
         }),
       });
       setShowCreate(false);
@@ -243,7 +241,6 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
         objectiveTarget: '',
         battleEnabled: false,
         altBotSlotId: 'slot-0',
-        longFormMode: 'one-shot',
         controlDisplayName: 'Atlas',
         treatmentDisplayName: 'Echo',
         controlAddendum: '',
@@ -607,22 +604,6 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                 <p className="experiment-battle-slot-help">
                   Pre-provisioned alt-bot principal that will join battle-enabled channels as a member.
                   Each slot can be bound to at most one active battle experiment at a time.
-                </p>
-              </div>
-
-              <div className="experiment-battle-slot">
-                <label className="label" htmlFor="long-form-mode-select">Long-form mode</label>
-                <select
-                  id="long-form-mode-select"
-                  className="select input"
-                  value={newExperiment.longFormMode}
-                  onChange={(e) => setNewExperiment((p) => ({ ...p, longFormMode: e.target.value as 'one-shot' | 'outline-first' }))}
-                >
-                  <option value="one-shot">one-shot (full deliverable in round-1)</option>
-                  <option value="outline-first">outline-first (round-1 = approach only; user steers)</option>
-                </select>
-                <p className="experiment-battle-slot-help">
-                  Controls how a long-form (report/document) battle delivers its content. one-shot produces the COMPLETE deliverable in round-1 as an attachment; outline-first produces only a concise approach/outline in round-1 so you can compare directions before any full report is generated.
                 </p>
               </div>
             </div>

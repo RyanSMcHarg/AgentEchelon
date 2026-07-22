@@ -32,9 +32,19 @@ import type { AssistantProfile } from '../../../lib/config/profiles.js';
 import { INTENT_ROUTE_STRATEGY } from '../../../lib/config/model-strategy.js';
 import type { IntentRouteDefinition, RouteKey, BackendModelKey } from '../../../lib/config/model-strategy.js';
 import { ALL_TOOL_NAMES, unknownTools } from './tool-registry.js';
+import { IMAGE_GEN_MODELS, type ImageGenModelKey } from './image-gen-models.js';
 
 /** Current definition schema version. Bumped when the serialized shape changes (import migrations, §5). */
 export const PROFILE_DEFINITION_SCHEMA_VERSION = 1 as const;
+
+/**
+ * Default per-profile image-generation model (an `ImageGenModelKey`). `stability_image_core` is an
+ * `aws-bedrock`, `active` model that needs NO external API key, so image generation works out of the
+ * box (DESIGN-MULTI-ASSISTANT-TURN-ENGINE, "image generation must become a normal capability"). Kept
+ * off `models.default` deliberately: image keys are NOT `BackendModelKey`s (no resolver/classification/
+ * token ripple — see image-gen-models.ts), so `models.image` is a SEPARATE, registry-validated field.
+ */
+export const DEFAULT_IMAGE_MODEL: ImageGenModelKey = 'stability_image_core';
 
 /**
  * The RUNTIME-EDITABLE behavioral fields a version may carry (§7). Deliberately a SUBSET of
@@ -85,6 +95,15 @@ export interface ProfileModels {
    *  per-intent FALLBACK — not just the primary — moves per-profile too; a bare-string form would lose
    *  the graceful-degrade model the global strategy carried.) */
   byIntent?: Record<string, { primary: string; fallback?: string }>;
+  /**
+   * Per-profile IMAGE-generation model (an `ImageGenModelKey` from the self-contained IMAGE_GEN_MODELS
+   * registry, e.g. `stability_image_core`). Grants this profile the image-generation CAPABILITY: on an
+   * `image_generation` intent the worker produces an image with this model. Absent ⇒ the profile has no
+   * image capability (an image ask degrades to a normal text turn). Validated against IMAGE_GEN_MODELS
+   * keys in a SEPARATE branch — deliberately NOT a `BackendModelKey`, so it never rides the text-catalog
+   * `byIntent`/resolveModelForIntent path (those assume Converse text models). See image-gen-models.ts.
+   */
+  image?: string;
 }
 
 export interface ProfileDefinitionBody {
@@ -192,6 +211,18 @@ export function validateDefinitionBody(body: Partial<ProfileDefinitionBody>): st
           }
         }
       }
+      // The image-generation model is validated in a SEPARATE branch against the IMAGE_GEN_MODELS
+      // registry — NEVER through the text-catalog checkModel allowlist (profile-lifecycle / profile-
+      // manifest), which would reject it because image keys are not BackendModelKeys. The registry is a
+      // static enum, so this is a schema/enum check (safe to enforce at parse time), not the §7
+      // deployment-allowlist boundary the write path owns for text models.
+      if (m.image !== undefined) {
+        if (typeof m.image !== 'string' || !m.image) {
+          errs.push('models.image must be a non-empty ImageGenModelKey');
+        } else if (!(m.image in IMAGE_GEN_MODELS)) {
+          errs.push(`models.image '${m.image}' is not a known image model (expected one of ${Object.keys(IMAGE_GEN_MODELS).join(', ')})`);
+        }
+      }
     }
   }
   if (body.tools !== undefined) {
@@ -284,6 +315,9 @@ export function ensureModelsBundle(body: ProfileDefinitionBody): ProfileDefiniti
       classifier: models.classifier ?? DEFAULT_MODEL,
       ...(models.complex !== undefined ? { complex: models.complex } : {}),
       byIntent: hasByIntent ? models.byIntent : seedByIntentFromGlobalStrategy(),
+      // Backfill the default image model so a legacy body gains the image-generation capability + a real,
+      // editable value on export (an operator clears models.image to remove it). Preserve an explicit key.
+      image: models.image ?? DEFAULT_IMAGE_MODEL,
     },
     // A legacy body carries no `tools`; backfill the full registry set so export/edit shows the real,
     // editable tool surface (an all-tools body resolves byte-identically to unset). Preserve an explicit list.
@@ -301,7 +335,9 @@ function bodyOf(profile: AssistantProfile): ProfileDefinitionBody {
     // the profile records "follow the classification-set classifier" as a choice that tracks the platform
     // default over time. Resolution treats `'default'` == unset ⇒ CLASSIFIER_MODEL, so this is byte-behaviour-
     // identical to leaving it off.
-    models: { default: profile.modelKey, classifier: DEFAULT_MODEL, byIntent: seedByIntentFromGlobalStrategy() },
+    // image is seeded to the default aws-bedrock image model (no external key needed) so every profile
+    // has the image-generation capability out of the box (DESIGN-MULTI-ASSISTANT-TURN-ENGINE).
+    models: { default: profile.modelKey, classifier: DEFAULT_MODEL, byIntent: seedByIntentFromGlobalStrategy(), image: DEFAULT_IMAGE_MODEL },
     // Tools are seeded EXPLICITLY as the full registry set (visible + editable per profile). All-tools-allowed
     // intersected with runtime availability == the pre-allowlist behavior, so seeding is byte-behaviour-identical
     // while making the surface concrete (an operator removes a tool to restrict this profile). SPEC-ASSISTANT-CONFIG §4.
@@ -359,6 +395,7 @@ interface CacheEntry {
   configId: string;
   models?: ProfileModels;
   tools?: string[];
+  imageModelKey?: string;
   expires: number;
 }
 const cache = new Map<string, CacheEntry>();
@@ -375,6 +412,10 @@ export interface ResolvedActiveProfile {
   /** The active version's per-profile tool ALLOWLIST. Undefined when it fell back to the seed (no active
    *  version) — the loop then offers all runtime-available tools (byte-identical to the pre-allowlist path). */
   tools?: string[];
+  /** The active version's IMAGE-generation model key (`models.image`), or undefined when unset / on the
+   *  seed fallback. The worker maps it to a Bedrock image-gen id (via IMAGE_GEN_MODELS) on an
+   *  `image_generation` turn. Convenience projection of `models.image` so the worker need not reach in. */
+  imageModelKey?: string;
 }
 
 export interface ResolveActiveProfileOptions {
@@ -405,10 +446,14 @@ export async function resolveActiveProfile(
 
   const cached = cache.get(profileName);
   if (cached && cached.expires > now()) {
-    return { profile: cached.profile, configId: cached.configId, models: cached.models, tools: cached.tools };
+    return { profile: cached.profile, configId: cached.configId, models: cached.models, tools: cached.tools, imageModelKey: cached.imageModelKey };
   }
 
-  let resolved: ResolvedActiveProfile = { profile: seedProfile, configId: 'seed' };
+  // On the seed fallback (no activated version) the image model defaults to the seed's image capability
+  // (== what serializeSeedDefinition would produce) so image generation works OUT OF THE BOX. This is
+  // purely additive — image had no normal-path behavior before — so the "behavior diff empty on the seed"
+  // text invariant (models/tools stay undefined ⇒ global text strategy) is untouched.
+  let resolved: ResolvedActiveProfile = { profile: seedProfile, configId: 'seed', imageModelKey: DEFAULT_IMAGE_MODEL };
   try {
     const resp = await opts.ssm.send(
       new GetParameterCommand({ Name: `${definitionParamName(opts.ssmRoot, profileName)}:active` }),
@@ -430,7 +475,7 @@ export async function resolveActiveProfile(
         rateLimitPerHour: def.rateLimitPerHour,
         battleEligible: def.battleEligible,
       };
-      resolved = { profile: merged, configId: def.configId, models: def.models, tools: def.tools };
+      resolved = { profile: merged, configId: def.configId, models: def.models, tools: def.tools, imageModelKey: def.models?.image };
     }
   } catch (err) {
     // Absent label/param (nothing activated yet) is the COMMON, expected path — log at debug volume;
@@ -441,7 +486,7 @@ export async function resolveActiveProfile(
     }
   }
 
-  cache.set(profileName, { profile: resolved.profile, configId: resolved.configId, models: resolved.models, tools: resolved.tools, expires: now() + ttlMs });
+  cache.set(profileName, { profile: resolved.profile, configId: resolved.configId, models: resolved.models, tools: resolved.tools, imageModelKey: resolved.imageModelKey, expires: now() + ttlMs });
   return resolved;
 }
 

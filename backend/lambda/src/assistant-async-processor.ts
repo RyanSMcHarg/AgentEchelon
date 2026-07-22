@@ -45,9 +45,11 @@ import {
   postTaskHandoffNotice,
   imageFormatFromContentType,
   docFormatFromContentType,
-  prepareBattleInvocation,
+  buildRebuttalContext,
+  buildBattleAwareness,
   resolveBattleVisionPlan,
-  resolveBattleGenerationOutPlan,
+  resolveGenerationOutPlan,
+  resolveTurnImageGenModelId,
   buildTaskLoopContext,
   shadowKeywordTransition,
   recordStallIfNoTransition,
@@ -65,8 +67,7 @@ import { makeConverseStep, type ConverseStep } from './lib/analytics-metadata.js
 import { resolveModelPlan } from './lib/resolve-model-plan.js';
 import { externalProviderFromEnv, invokeExternalLlm } from './lib/providers/external-llm.js';
 import { invokeImageGenModel } from './lib/image-gen-models.js';
-import { persistImageGenOutput, buildBattleImageContent } from './lib/image-gen-output.js';
-import { resolveBotDisplayName } from './lib/experiment-manager.js';
+import { persistImageGenOutput, buildBattleImageContent, buildImageGenAttachment } from './lib/image-gen-output.js';
 import { buildRetrievedContextHint, buildConversationSummaryHint } from './analytics-aurora/document-retrieval.js';
 import {
   getTask,
@@ -92,9 +93,6 @@ const PROFILE_NAME = (process.env.PROFILE_NAME || 'basic') as AsyncProcessorConf
 // profile.battleEligible, forwarded as an env string. /battle assembly + image paths are gated on it.
 const BATTLE_ELIGIBLE = process.env.BATTLE_ELIGIBLE === 'true';
 const MODEL_NAME = process.env.MODEL_NAME || 'Claude';
-// Per-profile bot SSM key (= /agent-echelon/assistant/{profile}/bot-arn). Used only on the /battle
-// path to resolve the default-bot ARN; empty on non-battle profiles.
-const BOT_ARN_PARAM = process.env.BOT_ARN_PARAM || '';
 
 const s3Client = new S3Client({ region: AWS_REGION });
 const ssmClient = new SSMClient({ region: AWS_REGION });
@@ -212,22 +210,6 @@ async function resolveBaseSystemPrompt(): Promise<string> {
   }
   cachedSystemPrompt = process.env.ASSISTANT_SYSTEM_PROMPT?.trim() || defaultPersonaFor(PROFILE_NAME);
   return cachedSystemPrompt;
-}
-
-// ============================================================
-// /battle default-bot ARN (only loaded on battle-eligible profiles)
-// ============================================================
-let cachedDefaultBotArn: string | null = null;
-async function loadDefaultBotArn(): Promise<string> {
-  if (cachedDefaultBotArn) return cachedDefaultBotArn;
-  try {
-    const resp = await ssmClient.send(new GetParameterCommand({ Name: BOT_ARN_PARAM }));
-    cachedDefaultBotArn = resp.Parameter?.Value || '';
-    return cachedDefaultBotArn;
-  } catch (err) {
-    console.warn('[AssistantAsyncProcessor] BOT_ARN SSM lookup failed:', err);
-    return '';
-  }
 }
 
 // ============================================================
@@ -544,50 +526,47 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       systemPrompt += `\n\n[You already said the following — do NOT repeat it. Use completely different wording.]\n${priorAgentContext.trim()}`;
     }
 
-    // /battle: reassemble the system prompt with the 3-layer ordering (base -> <persona_addendum> ->
-    // battle constraints LAST so they win) and resolve the variant's model override. Only battle-
-    // eligible profiles participate; only when event.battleContext is set. All other invocations
-    // proceed normally.
+    // /battle (DESIGN-MULTI-ASSISTANT-TURN-ENGINE, "Battle delegates to the normal engine"): a
+    // battle turn is a NORMAL request for this bot's assigned experiment variant. The variant is
+    // resolved ONCE in the fan-out (channel-flow / battle-orchestrator) and passed in via
+    // battleContext, so there is no second resolution here (this removes the two-Lambda divergence).
+    // We layer the variant's persona addendum as normal persona (not a battle constraint), and on
+    // round 2 append the rival's round-1 reply as a minimal, non-adversarial rebuttal note. Round 1
+    // is fully normal: no length cap, no adversarial framing. Only battle-eligible profiles
+    // participate; only when event.battleContext is set. All other invocations proceed normally.
     let battleVariantModelKey: string | undefined;
     let battleSelfDisplayName: string | undefined;
-    let battleLongFormMode: 'one-shot' | 'outline-first' = 'one-shot';
     const battleOn = BATTLE_ELIGIBLE && !!event.battleContext;
     if (battleOn && event.battleContext) {
-      const defaultBotArn = await loadDefaultBotArn();
-      // The experiment is keyed by the alt-slot ARN — whichever of {self, rival} is NOT the default
-      // bot — so the control side can resolve variants[0]'s displayName for the rival name + scorecard.
-      const altSlotArn =
-        [event.battleContext.selfBotArn, event.battleContext.rivalBotArn].find(
-          (a) => a !== defaultBotArn,
-        ) || event.battleContext.rivalBotArn;
-      const rivalDisplayName = await resolveBotDisplayName({
-        thisBotArn: event.battleContext.rivalBotArn,
-        defaultBotArn,
-        altSlotArn,
-      });
-      // Intent-aware length: a battle whose deliverable is sent as an attachment (report_generation
-      // task or an explicit document request) must NOT be capped to the conversational ~150-word budget.
-      const battleLongForm =
-        event.taskType === 'report_generation' ||
-        isDocumentRequest(event.userMessage || '');
-      const assembled = await prepareBattleInvocation({
-        baseSystemPrompt: systemPrompt,
-        battleContext: event.battleContext,
-        defaultBotArn,
-        selfBotArn: event.botArn,
-        rivalDisplayName,
-        longForm: battleLongForm,
-      });
-      systemPrompt = assembled.systemPrompt;
-      battleVariantModelKey = assembled.variantModelKey;
-      battleSelfDisplayName = assembled.selfDisplayName;
-      battleLongFormMode = assembled.longFormMode;
-      // systemPrompt changed; the stable base is still its leading slice but the length shifted.
+      // TODO(phase1b): profileRef variants. `variantModelKey` is a resolved modelKey today (the
+      // fan-out resolvers resolve a profileRef variant to its modelKey upstream). If a variant ever
+      // arrives unresolved, this stays undefined and the model application below falls back to the
+      // profile's normal resolution rather than crashing.
+      battleVariantModelKey = event.battleContext.variantModelKey;
+      battleSelfDisplayName = event.battleContext.selfDisplayName;
+      // Normal persona layering: <persona_addendum> is the SAME mechanism the normal engine uses,
+      // NOT a battle-mode constraint block.
+      if (event.battleContext.variantAddendum) {
+        systemPrompt += `\n\n<persona_addendum>${event.battleContext.variantAddendum}</persona_addendum>`;
+      }
+      // Battle awareness: round 1 gets a light "you are in battle mode" note; round 2 gets the
+      // rival's round-1 reply as the thing to respond to (which is itself battle-aware).
+      if (event.battleContext.round === 2) {
+        systemPrompt += buildRebuttalContext(
+          event.battleContext.rivalDisplayName || 'the other assistant',
+          event.battleContext.rivalReply || '',
+        );
+      } else {
+        systemPrompt += buildBattleAwareness(
+          event.battleContext.rivalDisplayName || 'the other assistant',
+        );
+      }
+      // systemPrompt may have changed; the stable base is still its leading slice but the length shifted.
       cacheableSystemPrefixLength = Math.min(cacheableSystemPrefixLength, systemPrompt.length);
-      console.log('[AssistantAsyncProcessor][battle] Prompt assembled', {
+      console.log('[AssistantAsyncProcessor][battle] Normal-engine battle turn', {
         round: event.battleContext.round,
-        self: assembled.selfDisplayName,
-        rival: rivalDisplayName,
+        self: battleSelfDisplayName,
+        rival: event.battleContext.rivalDisplayName,
         variantModelKey: battleVariantModelKey,
       });
     }
@@ -762,26 +741,58 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       console.warn('[AssistantAsyncProcessor] attachment fileKey not under the sender prefix; ignoring (possible cross-user reference)');
     }
 
-    // ── /battle generation-out: a battle variant bound to an image-gen model (Titan v2 / Nova
-    // Canvas) produces an IMAGE from the prompt instead of text. Evaluated FIRST and mutually
-    // exclusive with vision-in. Absent/unknown id => 'text' (normal battle); a present-but-unknown id
-    // is surfaced visibly, never silently string-matched away.
+    // ── Generation-out: produce an IMAGE from the prompt instead of text. This is now a NORMAL
+    // capability (DESIGN-MULTI-ASSISTANT-TURN-ENGINE, "image generation must become a normal
+    // capability"), not a battle-only branch. Evaluated FIRST and mutually exclusive with vision-in.
+    // Resolve the image-gen model id, in precedence:
+    //   1. the battle variant's image model (battleContext.variantImageModelKey) — image battle;
+    //   2. the legacy battle imageGenModelId (resolveBattleImageGenPair path) — kept working;
+    //   3. the active profile's models.image, ONLY on an `image_generation` turn — the normal path.
+    // Absent/unknown id => 'text'; a present-but-unknown id is surfaced visibly, never string-matched away.
     let battleImageCount: number | undefined;
-    const genOutModelId = battleOn ? event.battleContext?.imageGenModelId : undefined;
-    const genOutPlan = resolveBattleGenerationOutPlan({ imageGenModelId: genOutModelId });
+    // Delivered message attachment (a generated image here, or a generated document below). Declared
+    // once and shared: a generation-out turn sets an image attachment; the doc-generation block only
+    // runs when no attachment is set yet, so the two paths never clobber each other.
+    let attachment: GeneratedDocument | undefined;
+    const genOutModelId = resolveTurnImageGenModelId({
+      battleOn,
+      intent: event.intent,
+      variantImageModelKey: event.battleContext?.variantImageModelKey,
+      battleImageGenModelId: event.battleContext?.imageGenModelId,
+      profileImageModelKey: active.imageModelKey,
+    });
+    const genOutPlan = resolveGenerationOutPlan({ imageGenModelId: genOutModelId });
     if (genOutModelId && genOutPlan.action !== 'generation') {
       console.warn(
-        '[AssistantAsyncProcessor][battle] imageGenModelId set but not a registered image model — ' +
-          'falling through to text battle',
+        '[AssistantAsyncProcessor] image model id set but not a registered image model — ' +
+          'falling through to a text turn',
         { imageGenModelId: genOutModelId },
+      );
+    }
+    // Honest degrade (no crash): image generation needs the attachments bucket (to persist the PNG).
+    // The guardrail + cost-cap env (BATTLE_IMAGE_GUARDRAIL_ID, BATTLE_IMAGE_MAX_IMAGES/DIMENSION,
+    // IMAGE_GEN_KEYS_SECRET_ARN) are wired on the PREMIUM processor, so normal image gen works there. A
+    // non-premium profile that sets models.image but whose processor lacks the bucket degrades to a
+    // normal text turn rather than throwing in persistImageGenOutput.
+    // TODO(phase2b): wire the image env (ATTACHMENTS_BUCKET + BATTLE_IMAGE_* guardrail/caps +
+    // IMAGE_GEN_KEYS_SECRET_ARN) on the non-premium processors so they can generate images too.
+    const canGenerateImage = genOutPlan.action === 'generation' && !!process.env.ATTACHMENTS_BUCKET;
+    if (genOutPlan.action === 'generation' && !canGenerateImage) {
+      console.warn(
+        '[AssistantAsyncProcessor] resolved an image model but ATTACHMENTS_BUCKET is unset on this ' +
+          'processor; degrading to a text turn. TODO(phase2b): wire image env on non-premium processors.',
+        { modelId: genOutPlan.modelId, profile: PROFILE_NAME },
       );
     }
     const imgAtt = battleOn ? event.battleContext?.imageAttachment : undefined;
 
-    if (genOutPlan.action === 'generation') {
-      // No Bedrock text call: invoke the image model, persist to S3, hand back a marker the frontend
-      // renders. Honest empty path — a generation failure or guardrail block persists nothing and
-      // yields an honest line with NO marker (never a fabricated image).
+    if (canGenerateImage) {
+      // No Bedrock text call: invoke the image model, persist to S3, deliver the image as a message
+      // ATTACHMENT (like a generated document) so the frontend AttachmentDisplay renders an <img> that
+      // fetches a fresh presigned URL on demand — no giant presigned URL embedded in the content, no
+      // STS-token expiry, and it renders in the browser (the old inline <!--battleimage:--> marker did
+      // not). Honest empty path: a generation failure or guardrail block persists nothing, attaches
+      // nothing, and yields an honest text line (never a fabricated image).
       const genStart = Date.now();
       // Phase-4D deployer cost cap (env-sourced; only ever lowers the registry hard cap).
       const envInt = (v: string | undefined): number | undefined => {
@@ -802,6 +813,11 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
         s3: s3Client,
       });
       battleImageCount = out.persisted.length;
+      // Deliver the first persisted image as the message attachment (the required minimum). Nothing
+      // persisted (failure / guardrail block) => no attachment, only the honest text line below.
+      if (out.persisted.length > 0) {
+        attachment = buildImageGenAttachment({ persisted: out.persisted });
+      }
       bedrockResult = {
         response: buildBattleImageContent({
           persisted: out.persisted,
@@ -975,9 +991,9 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       }
     }
 
-    // Generate document attachment — on report tasks or explicit user request.
-    let attachment: GeneratedDocument | undefined;
-    if (process.env.ATTACHMENTS_BUCKET) {
+    // Generate document attachment — on report tasks or explicit user request. Skipped when a
+    // generation-out turn already attached an image (attachment is shared; never clobber it).
+    if (!attachment && process.env.ATTACHMENTS_BUCKET) {
       let generate;
       // Document-producing tasks and the machine states on which they DELIVER a file. Keyed on
       // taskType so report_generation and data_extraction both hand back a real downloadable
@@ -1008,15 +1024,13 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
         generate = isDocumentRequest(event.userMessage || '');
       }
 
-      // In a /battle, the long-form prompt told the model the deliverable would be delivered as a
-      // downloadable attachment, so honor that promise deterministically on round-1 of a report
-      // battle in ONE-SHOT mode (bypassing the multi-step state-machine gate — battles are one-shot
-      // per round). OUTLINE-FIRST round-1 is a short approach/outline only, so no attachment yet;
-      // round-2 is the concise rebuttal turn. Non-battle multi-step report tasks are unaffected.
+      // In a /battle, round-1 of a report battle produces its deliverable in one shot (there is no
+      // multi-step state machine across rounds), so deliver it as a downloadable attachment
+      // deterministically, bypassing the state-machine delivery gate. Round-2 is the rebuttal turn.
+      // Non-battle multi-step report tasks are unaffected.
       if (!generate
         && event.battleContext?.round === 1
-        && event.taskType === 'report_generation'
-        && battleLongFormMode !== 'outline-first') {
+        && event.taskType === 'report_generation') {
         generate = true;
       }
 

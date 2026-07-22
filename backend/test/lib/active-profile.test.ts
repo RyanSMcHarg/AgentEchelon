@@ -16,6 +16,7 @@ import {
   ensureModelsBundle,
   validateDefinitionBody,
   DEFAULT_MODEL,
+  DEFAULT_IMAGE_MODEL,
   __clearActiveProfileCache,
   PROFILE_DEFINITION_SCHEMA_VERSION,
 } from '../../lambda/src/lib/active-profile';
@@ -287,5 +288,53 @@ describe('tools are PER-PROFILE (SPEC-ASSISTANT-CONFIG §4)', () => {
     __clearActiveProfileCache();
     const noVersion = await resolveActiveProfile('standard', { ssm: fakeSsm(() => notFound()), ssmRoot: SSM_ROOT });
     expect(noVersion.tools).toBeUndefined(); // ⇒ loop offers all runtime-available tools (legacy behavior)
+  });
+});
+
+describe('image generation is a per-profile capability (models.image, DESIGN-MULTI-ASSISTANT-TURN-ENGINE)', () => {
+  const base = { modelKey: 'sonnet', classifierMode: 'llm' as const, timeoutSeconds: 60, taskSupport: 'full' as const };
+
+  it('every seed carries the default image model (works out of the box)', () => {
+    for (const name of ['basic', 'standard', 'premium']) {
+      const def = JSON.parse(serializeSeedDefinition(name)!);
+      expect(def.models.image).toBe(DEFAULT_IMAGE_MODEL);
+    }
+    // The default is an aws-bedrock, active model needing NO external key.
+    expect(DEFAULT_IMAGE_MODEL).toBe('stability_image_core');
+  });
+
+  it('accepts a known image key and REJECTS an unknown / non-string one (separate registry branch)', () => {
+    expect(validateDefinitionBody({ ...base, models: { default: 'sonnet', image: 'stability_image_ultra' } })).toEqual([]);
+    expect(validateDefinitionBody({ ...base, models: { default: 'sonnet', image: 'titan_image' } })).toEqual([]);
+    const unknown = validateDefinitionBody({ ...base, models: { default: 'sonnet', image: 'sonnet' } });
+    expect(unknown.some((e) => /models\.image/.test(e) && /not a known image model/.test(e))).toBe(true);
+    const empty = validateDefinitionBody({ ...base, models: { default: 'sonnet', image: '' } as never });
+    expect(empty.some((e) => /models\.image must be a non-empty/.test(e))).toBe(true);
+  });
+
+  it('an image key is NOT run through the text-catalog allowlist (image keys are not BackendModelKeys)', () => {
+    // A valid image key that is deliberately NOT a text model key must still pass shape validation here —
+    // the §7 text-catalog boundary (profile-lifecycle/manifest checkModel) never sees models.image.
+    expect(validateDefinitionBody({ ...base, models: { default: 'sonnet', image: 'stability_image_core' } })).toEqual([]);
+  });
+
+  it('resolveActiveProfile surfaces imageModelKey — the version value, and the seed default on fallback', async () => {
+    const raw = serializeSeedDefinition('premium')!;
+    const ssm = fakeSsm((name) => (name.endsWith(':active') ? { Parameter: { Value: raw } } : notFound()));
+    const active = await resolveActiveProfile('premium', { ssm, ssmRoot: SSM_ROOT });
+    expect(active.imageModelKey).toBe(DEFAULT_IMAGE_MODEL);
+    expect(active.models?.image).toBe(DEFAULT_IMAGE_MODEL);
+
+    // Seed fallback (no activated version): still image-capable out of the box.
+    __clearActiveProfileCache();
+    const noVersion = await resolveActiveProfile('premium', { ssm: fakeSsm(() => notFound()), ssmRoot: SSM_ROOT });
+    expect(noVersion.imageModelKey).toBe(DEFAULT_IMAGE_MODEL);
+  });
+
+  it('ensureModelsBundle backfills the default image onto a legacy body, preserving an explicit key', () => {
+    const legacy = { modelKey: 'sonnet', classifierMode: 'llm' as const, timeoutSeconds: 60, taskSupport: 'full' as const };
+    expect(ensureModelsBundle(legacy).models?.image).toBe(DEFAULT_IMAGE_MODEL);
+    const explicit = ensureModelsBundle({ ...legacy, models: { default: 'sonnet', image: 'titan_image' } });
+    expect(explicit.models?.image).toBe('titan_image');
   });
 });

@@ -327,6 +327,19 @@ export class BattleStack extends cdk.Stack {
             }),
           ],
         }),
+        // Resolve-once (DESIGN-MULTI-ASSISTANT-TURN-ENGINE): the orchestrator now
+        // resolves each side's experiment variant once for the round-2 fan-out
+        // (loadExperiments does a Scan), so the worker runs a normal request with
+        // no second resolution. Without this read grant the resolvers fall back
+        // to null and the worker resolves normally (degraded, not broken).
+        ExperimentsReadPolicy: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['dynamodb:Scan', 'dynamodb:GetItem'],
+              resources: [experimentsTableArn],
+            }),
+          ],
+        }),
         LambdaInvokePolicy: new iam.PolicyDocument({
           statements: [
             new iam.PolicyStatement({
@@ -366,6 +379,8 @@ export class BattleStack extends cdk.Stack {
       environment: {
         BATTLE_STATE_TABLE: battleStateTable.tableName,
         PREMIUM_PROCESSOR_ARN_PARAM: processorArnKey('premium'),
+        // Resolve-once round-2 variant resolution (loadExperiments reads this table).
+        EXPERIMENTS_TABLE: experimentsTableName,
       },
       bundling: { minify: false, forceDockerBundling: false },
     });

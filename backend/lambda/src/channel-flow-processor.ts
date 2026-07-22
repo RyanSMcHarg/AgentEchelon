@@ -853,31 +853,37 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
     console.warn('[ChannelFlow][battle] resolveBattleImageGenPair failed; text battle:', err);
   }
 
-  // A: working-state placeholders. Resolve variant displayNames (Atlas/
-  // Echo) once so each per-bot placeholder marker can carry name= and
-  // the frontend can render "<name> is drafting..." instead of a static
-  // "One moment...". Best-effort: a resolver hiccup must never block
-  // the fan-out - placeholders just fall back to the bot's Chime name.
-  let controlName: string | undefined;
-  let treatmentName: string | undefined;
+  // Resolve-once (DESIGN-MULTI-ASSISTANT-TURN-ENGINE, "Battle delegates to the
+  // normal engine"): resolve each side's experiment variant ONCE here and stamp
+  // it into that bot's battleContext, so the worker runs a normal request for
+  // the variant with no second resolution (this removes the two-Lambda
+  // divergence). control = default bot (variants[0]); treatment = alt slot
+  // (variants[1]). displayName also feeds the working-state placeholder marker
+  // (name=) so the frontend can render "<name> is drafting...". Best-effort: a
+  // resolver hiccup must never block the fan-out - the fields stay unset and the
+  // worker keeps its normal classification+intent resolution.
+  let controlVariant: Awaited<ReturnType<typeof resolveBattleControlVariantByAltSlotArn>> = null;
+  let treatmentVariant: Awaited<ReturnType<typeof resolveBattleVariantBySlotArn>> = null;
   try {
     if (altSlotArn) {
-      const [ctrl, treat] = await Promise.all([
+      [controlVariant, treatmentVariant] = await Promise.all([
         resolveBattleControlVariantByAltSlotArn(altSlotArn),
         resolveBattleVariantBySlotArn(altSlotArn),
       ]);
-      controlName = ctrl?.displayName;
-      treatmentName = treat?.displayName;
     }
   } catch (err) {
-    console.warn('[ChannelFlow][battle] displayName lookup failed; placeholders use generic name:', err);
+    console.warn('[ChannelFlow][battle] variant resolution failed; placeholders use generic name, worker resolves normally:', err);
   }
 
   await Promise.all(
     botMembers.map(async (thisBotArn) => {
       const rivalBotArn = botMembers.find((arn) => arn !== thisBotArn) || '';
       const correlationId = `battle-r1-${thisBotArn.split('/').pop()}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-      const variantName = thisBotArn === defaultBotArn ? controlName : treatmentName;
+      const isDefault = thisBotArn === defaultBotArn;
+      // This bot answers as its own variant; the rival is the other side.
+      const selfVariant = isDefault ? controlVariant : treatmentVariant;
+      const rivalVariant = isDefault ? treatmentVariant : controlVariant;
+      const variantName = selfVariant?.displayName;
       const namePart = variantName ? `,name=${encodeURIComponent(variantName)}` : '';
 
       // Per-bot placeholder. Sent as that bot (ChimeBearer: thisBotArn) so
@@ -959,11 +965,20 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
                 // Generation-out: control = default bot, treatment =
                 // alt slot. Unset for a text battle (imageGenPair null).
                 ...(imageGenPair && {
-                  imageGenModelId:
-                    thisBotArn === defaultBotArn
-                      ? imageGenPair.controlModelId
-                      : imageGenPair.treatmentModelId,
+                  imageGenModelId: isDefault
+                    ? imageGenPair.controlModelId
+                    : imageGenPair.treatmentModelId,
                 }),
+                // Resolve-once: this side's variant, resolved above. Unset
+                // fields fall back to the worker's normal resolution.
+                ...(selfVariant?.modelKey && { variantModelKey: selfVariant.modelKey }),
+                ...(selfVariant?.systemPromptAddendum && { variantAddendum: selfVariant.systemPromptAddendum }),
+                ...(selfVariant?.displayName && { selfDisplayName: selfVariant.displayName }),
+                ...(rivalVariant?.displayName && { rivalDisplayName: rivalVariant.displayName }),
+                // Phase-2: this side's image model (from the variant's imageGenModelKey). The worker
+                // prefers it over the profile image model, so an image battle runs the normal image path
+                // for each variant. Unset for a text battle.
+                ...(selfVariant?.imageGenModelKey && { variantImageModelKey: selfVariant.imageGenModelKey }),
               },
             })),
           }),

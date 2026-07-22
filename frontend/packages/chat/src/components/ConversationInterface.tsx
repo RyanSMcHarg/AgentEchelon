@@ -11,6 +11,7 @@ import { chimeService } from '../services/chimeService';
 import { CollapsibleText } from './CollapsibleText';
 import BattleScorecard, { type ScorecardVariant } from './BattleScorecard';
 import BattleTallyBar from './BattleTallyBar';
+import { getBattleConfig, type ChannelBattleConfig } from '../services/channelBattleService';
 import { computeBattleTally, type BattleRoundInput, type BattleWinner } from '../utils/battleTally';
 import { submitMessageFeedback } from '@ae/shared';
 import { shortenModelId } from '../utils/modelLabel';
@@ -115,6 +116,21 @@ const ConversationInterface: React.FC = () => {
     }).catch(() => { if (!cancelled) setIsModerator(false); });
     return () => { cancelled = true; };
   }, [activeConversation?.conversationArn, currentUserArn]);
+
+  // Battle-mode enabled state for the active conversation. The running tally bar shows ONLY
+  // while battle mode is on and disappears when it is turned off (disable deletes the config
+  // row, so getBattleConfig then reports enabled=false). Refetched when the members panel
+  // (where enable/disable happens) opens or closes so the bar reacts to the toggle.
+  const [battleConfig, setBattleConfig] = useState<ChannelBattleConfig | null>(null);
+  useEffect(() => {
+    const arn = activeConversation?.conversationArn;
+    if (!arn) { setBattleConfig(null); return; }
+    let cancelled = false;
+    void getBattleConfig(arn)
+      .then((cfg) => { if (!cancelled) setBattleConfig(cfg); })
+      .catch(() => { if (!cancelled) setBattleConfig(null); });
+    return () => { cancelled = true; };
+  }, [activeConversation?.conversationArn, isMembersPanelOpen]);
 
   // Archive runs from the in-app confirmation modal (ArchiveConversationModal),
   // which owns the busy/error UI; this just performs the persisting archive and
@@ -402,7 +418,7 @@ const ConversationInterface: React.FC = () => {
           )}
         </header>
       <div className="messages-container" ref={containerRef} onScroll={handleScroll}>
-        {battleRounds.length > 0 && <BattleTallyBar tally={battleTally} />}
+        {battleConfig?.enabled && battleRounds.length > 0 && <BattleTallyBar tally={battleTally} />}
         {isLoadingMessages ? (
           <div className="messages-loading">
             <div className="message-skeleton">

@@ -101,9 +101,13 @@ export async function ensureBattleExperiment(
   const expId = opts.expId ?? BATTLE_EXP_ID;
   await openAdminExperiments(page);
 
-  // Already armed from a prior run? Reuse it (avoids duplicate-id create error).
+  // Already armed from a prior run? Reuse it (avoids duplicate-id create error
+  // AND avoids clobbering a hand-tuned config — a re-create resets both variants
+  // to the form defaults). openAdminExperiments already waited for the list
+  // heading, but the row itself can lag the initial render; give it a real
+  // window (not 3s) so a slow list never forces a spurious re-create.
   const existing = page.locator(`text=${expId}`).first();
-  if (await existing.isVisible({ timeout: 3000 }).catch(() => false)) {
+  if (await existing.isVisible({ timeout: 15_000 }).catch(() => false)) {
     await leaveAdmin(page);
     return;
   }
@@ -198,16 +202,16 @@ export async function newBattleChannel(page: Page, title: string, expId: string 
  * empty-dash scorecard render immediately, so bubble count alone lies).
  */
 /**
- * Type a /battle prompt into the composer and send it — no readiness wait. Use when the caller
- * asserts a NON-scorecard outcome first (e.g. the clarification waiting-state) rather than a resolved
- * duel. Explicit fill timeout so a blocked composer (an overlay) fails fast with a clear error.
+ * Type a /battle prompt into the composer and send it — no readiness wait. The building block behind
+ * fireBattle (which layers the resolved-duel wait on top). Explicit fill timeout so a blocked composer
+ * (an overlay) fails fast with a clear error.
  */
-export async function fireBattleRaw(page: Page, prompt: string): Promise<void> {
+async function fireBattleRaw(page: Page, prompt: string): Promise<void> {
   await page.locator('.message-textarea').fill(prompt, { timeout: 30_000 });
   await page.keyboard.press('Enter');
 }
 
-export async function fireBattle(page: Page, prompt: string, timeoutMs = 170_000): Promise<number> {
+export async function fireBattle(page: Page, prompt: string, timeoutMs = 260_000): Promise<number> {
   await fireBattleRaw(page, prompt);
   await expect
     .poll(async () => page.locator('.message.battle-message').count(), { timeout: timeoutMs })

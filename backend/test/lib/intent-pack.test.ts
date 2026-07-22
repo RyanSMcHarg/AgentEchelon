@@ -64,6 +64,27 @@ describe('intent pack — back-compat (DEFAULT)', () => {
     expect(classifyByPackKeywords('generate a report')).toBe('report_generation');
     expect(classifyByPackKeywords('what is the capital of France')).toBeNull();
   });
+
+  test('image_generation is a first-class DEFAULT intent (PLACEHOLDER_UPDATE)', () => {
+    _resetIntentPackCache();
+    expect(knownIntentKeys().has('image_generation')).toBe(true);
+    // A generated image is one reply updated in place — not a multi-step task.
+    expect(deliveryClassForIntent('image_generation')).toBe('PLACEHOLDER_UPDATE');
+    expect(intentPackCategoryLines()).toContain('- IMAGE_GENERATION:');
+  });
+
+  test('image_generation keywords BEAT report_generation for an image ask (declared first)', () => {
+    _resetIntentPackCache();
+    // "generate an image" contains report_generation's 'generate'; image_generation must win because it
+    // is listed first and classifyByPackKeywords returns the first-listed match.
+    expect(classifyByPackKeywords('generate an image of a mountain lake')).toBe('image_generation');
+    expect(classifyByPackKeywords('create an image of a robot')).toBe('image_generation');
+    expect(classifyByPackKeywords('make a picture of a sunset')).toBe('image_generation');
+    expect(classifyByPackKeywords('draw a cat wearing a hat')).toBe('image_generation');
+    expect(classifyByPackKeywords('please generate an image of a graph')).toBe('image_generation');
+    // A plain report ask still classifies as report_generation (no image keyword present).
+    expect(classifyByPackKeywords('generate a report on Q2 sales')).toBe('report_generation');
+  });
 });
 
 describe('intent pack — deployment override (custom domain)', () => {

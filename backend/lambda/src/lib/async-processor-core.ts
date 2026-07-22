@@ -66,10 +66,6 @@ import {
   computeActiveResponseMs,
 } from './battle-state.js';
 import {
-  resolveBattleVariantBySlotArn,
-  resolveBattleControlVariantByAltSlotArn,
-} from './experiment-manager.js';
-import {
   resolveVisionBattleAction,
   visionRejectMessage,
   type VisionBattleAction,
@@ -258,6 +254,35 @@ export interface BattleContextPayload {
    * image): the generation branch is evaluated first.
    */
   imageGenModelId?: string;
+  /**
+   * Phase-1 resolve-once fields (DESIGN-MULTI-ASSISTANT-TURN-ENGINE, "Battle
+   * delegates to the normal engine"). The fan-out resolves THIS side's
+   * experiment variant exactly once and stamps it here, so the worker runs a
+   * normal request for the variant with no second resolution (this removes the
+   * two-Lambda divergence the redesign was triggered by). All optional: when a
+   * field is unset the worker keeps its normal classification+intent
+   * resolution.
+   *   - variantModelKey: the resolved model override (a profileRef variant is
+   *     already resolved to its modelKey upstream).
+   *   - variantAddendum: the variant's persona addendum, layered as NORMAL
+   *     persona (not a battle constraint).
+   *   - selfDisplayName: this variant's name (drives the scorecard).
+   *   - rivalDisplayName: the rival variant's name (woven into the round-2
+   *     rebuttal note).
+   */
+  variantModelKey?: string;
+  variantAddendum?: string;
+  selfDisplayName?: string;
+  rivalDisplayName?: string;
+  /**
+   * Phase-2 (image generation as a normal capability): this side's IMAGE-generation model key
+   * (an `ImageGenModelKey`), stamped by the fan-out from the experiment variant's `imageGenModelKey`.
+   * The worker maps it to a Bedrock image-gen id (IMAGE_GEN_MODELS) and PREFERS it over the profile's
+   * own `models.image` — so an image battle compares the two variants' image models. Unset ⇒ the worker
+   * falls back to the legacy `imageGenModelId` path, then to the profile image model. Because a battle
+   * turn now runs the normal image path, there is no battle-specific image branch to keep in sync.
+   */
+  variantImageModelKey?: string;
 }
 
 export interface AsyncProcessorEvent {
@@ -1873,7 +1898,8 @@ export async function finalizePlaceholderResponse(params: {
   imageCount?: number;
   /**
    * /battle: this bot's resolved variant displayName (e.g. "Atlas" /
-   * "Echo"), from prepareBattleInvocation. Rides the <!--battlestats:-->
+   * "Echo"), resolved once in the fan-out and passed via
+   * battleContext.selfDisplayName. Rides the <!--battlestats:-->
    * marker as `name=` so the frontend scorecard + variant chip show the
    * configured variant name rather than the bot's generic Chime
    * AppInstanceUser name ("Assistant" / "AltSlot0"). Absent on the
@@ -2653,93 +2679,38 @@ const NEED_CLARIFICATION_LINE = /^[ \t]*NEED[_ \t]?CLARIFICATION[ \t]*[.!:]*[ \t
 const lambdaClient = new LambdaClient({ region: AWS_REGION });
 const BATTLE_ORCHESTRATOR_ARN = process.env.BATTLE_ORCHESTRATOR_ARN;
 
-// SPEC-BATTLE.md "Clarification Routing": clarification is a MEASURED
-// dimension (project-battle-clarification-measured-dimension), so the
-// prompt PERMITS exactly one sentinel-gated question rather than
-// forbidding it — but does not encourage it (we measure genuine
-// ask-vs-forge-ahead behavior). Round 2 still forbids it (rebuttal
-// turn; round-2 WAITING is not wired). The NEED_CLARIFICATION sentinel
-// is what parseBattleClarification detects to drive WAITING_FOR_USER.
-const BATTLE_CONSTRAINTS_ROUND1 = (rivalName: string, longForm = false, outlineFirst = false) => `\n\nYou are in a battle with ${rivalName}. If the user's request is genuinely ambiguous in a way that materially changes your answer, you may ask exactly ONE concise clarifying question — and only then; otherwise state your assumptions clearly and produce your best answer in a single reply. ${longForm ? (outlineFirst ? 'Produce a CONCISE 3-5 sentence APPROACH/OUTLINE only describing what you would cover in the full deliverable. Do NOT write the full report yet - the user will review your approach side-by-side with the rival and steer before the full deliverable is generated. Keep the outline focused so it is easy to compare with the rival.' : 'Produce the COMPLETE deliverable in full: it will be delivered to the user as a downloadable attachment, so do not abbreviate, summarize, or drop sections to save length. Open with a one or two sentence summary of your approach so the side-by-side comparison stays scannable, then give the full content.') : 'Be concise and high-signal: the human is comparing your reply side by side with the rival, so give a focused answer of roughly 150 words (a tight paragraph or a short list) and stop. Do not pad or exhaustively cover every angle; prefer the single strongest recommendation.'} When you do ask, put the token NEED_CLARIFICATION on its own line. Do not propose starting a separate conversation or suggest the user is off-topic — the user invoked /battle intentionally; divergence is the point.`;
-
-const BATTLE_CONSTRAINTS_ROUND2 = (rivalName: string, rivalReply: string) => `\n\nYou are in a battle with ${rivalName}. This is the rebuttal turn. The original user prompt is above. Your own round-1 reply has been posted to the channel. Your rival ${rivalName} replied with:
-
-<rival_reply>
-${rivalReply}
-</rival_reply>
-
-You may rebut, build on, or concede to the rival's reply. You may also choose not to add anything — respond with the single token NO_REBUTTAL if so. The human is reading both replies; they do not need filler. Keep your rebuttal to a few sentences focused on the single most important point of difference. Do not ask clarifying questions or suggest starting a separate conversation.`;
+// SPEC-BATTLE.md "Clarification Routing": whether a model asks vs. forges
+// ahead is a MEASURED dimension (project-battle-clarification-measured-
+// dimension), detected from an explicit model signal, NOT keyword/substring
+// inference. The NEED_CLARIFICATION sentinel above is what
+// parseBattleClarification detects to drive WAITING_FOR_USER; a round-1 turn is
+// now a fully normal request (no battle-specific prompt constraints), so a
+// model that genuinely needs input still emits the sentinel and is routed.
 
 /**
- * Assemble the system prompt for a battle invocation using the 3-layer
- * ordering from SPEC-BATTLE.md "Prompt Addendum Sanitization":
- *
- *   1. Classification base system prompt
- *   2. <persona_addendum>{sanitized variant.systemPromptAddendum}</persona_addendum>
- *   3. Battle-mode constraints (LAST, so they override any contradictory
- *      addendum)
- *
- * Returns the assembled prompt + the variant's modelKey override (or
- * undefined when this is the default-bot side of the battle).
+ * Round-2 rebuttal context (DESIGN-MULTI-ASSISTANT-TURN-ENGINE, "Battle
+ * delegates to the normal engine"). A battle round-2 turn is a NORMAL request
+ * with a minimal, non-adversarial note appended: the rival's round-1 reply plus
+ * an invitation to build on / correct / extend it, or opt out with the
+ * NO_REBUTTAL sentinel (still detected by isNoRebuttal). This is coordination
+ * context the worker cannot derive itself, not a battle prompt constraint.
+ * Pure.
  */
-export async function prepareBattleInvocation(args: {
-  baseSystemPrompt: string;
-  battleContext: BattleContextPayload;
-  defaultBotArn: string;
-  selfBotArn: string;
-  rivalDisplayName?: string;
-  /** Conversational battles cap to ~150 words for a fast, readable
-   *  side-by-side; long-form battles (report/document, delivered as an
-   *  attachment) must NOT be capped. Set by the caller from taskType. */
-  longForm?: boolean;
-  /** B: outline-first overrides the one-shot long-form clause with a propose-outline-only clause (round-1); the full deliverable is gated to a subsequent steered turn. */
-  longFormMode?: 'one-shot' | 'outline-first';
-}): Promise<{ systemPrompt: string; variantModelKey?: string; selfDisplayName: string; longFormMode: 'one-shot' | 'outline-first' }> {
-  const isAltSlot = args.selfBotArn !== args.defaultBotArn;
+export function buildRebuttalContext(rivalDisplayName: string, rivalReply: string): string {
+  const rival = rivalDisplayName || 'another assistant';
+  const reply = rivalReply || '(no reply)';
+  return `\n\n[Another assistant, ${rival}, answered the same prompt below. Read it and respond: build on it, correct it, or add what is missing. You may respond with the single token NO_REBUTTAL if you have nothing to add.]\n<other_reply>\n${reply}\n</other_reply>`;
+}
 
-  // Resolve this bot's bound variant config:
-  //  - alt-slot side  → treatment (variants[1]), keyed by its own ARN.
-  //  - default-bot side → control (variants[0]); the experiment is keyed
-  //    by the alt-slot ARN, which from the default bot's invocation is
-  //    battleContext.rivalBotArn.
-  // Both sides now honor the experiment's configured variant (model +
-  // displayName + addendum) so /battle is a faithful head-to-head of the
-  // two configured variants (SPEC-BATTLE Design Anchor; generalizes the
-  // stale §413). When the battle/variant can't be resolved, the fields
-  // stay unset and the caller keeps its normal classification+intent resolution
-  // (graceful fall-back to the old §413 behavior).
-  let variantModelKey: string | undefined;
-  let addendum: string | undefined;
-  let selfDisplayName = 'the default assistant';
-  // B: experiment-row longFormMode (one-shot default). When set to
-  // outline-first, ROUND1 produces an approach/outline only.
-  let longFormMode: 'one-shot' | 'outline-first' = args.longFormMode ?? 'one-shot';
-  try {
-    const variant = isAltSlot
-      ? await resolveBattleVariantBySlotArn(args.selfBotArn)
-      : await resolveBattleControlVariantByAltSlotArn(args.battleContext.rivalBotArn);
-    if (variant) {
-      variantModelKey = variant.modelKey;
-      addendum = variant.systemPromptAddendum;
-      selfDisplayName = variant.displayName;
-      if (variant.longFormMode) longFormMode = variant.longFormMode;
-    }
-  } catch (err) {
-    console.warn('[battle-core] battle variant resolution failed:', err);
-  }
-
-  const rivalName = args.rivalDisplayName || 'the other assistant';
-  const constraints = args.battleContext.round === 1
-    ? BATTLE_CONSTRAINTS_ROUND1(rivalName, !!args.longForm, longFormMode === 'outline-first')
-    : BATTLE_CONSTRAINTS_ROUND2(rivalName, args.battleContext.rivalReply || '(no reply)');
-
-  let systemPrompt = args.baseSystemPrompt;
-  if (addendum) {
-    systemPrompt += `\n\n<persona_addendum>${addendum}</persona_addendum>`;
-  }
-  systemPrompt += constraints;
-
-  return { systemPrompt, variantModelKey, selfDisplayName, longFormMode };
+/**
+ * Round-1 battle awareness. A light note so the assistant knows it is in
+ * battle mode and that a rebuttal turn follows, WITHOUT the old adversarial
+ * constraints or length caps (round-1 content and length stay normal). The
+ * rebuttal turn itself is coached separately by buildRebuttalContext.
+ */
+export function buildBattleAwareness(rivalDisplayName: string): string {
+  const rival = rivalDisplayName || 'another assistant';
+  return `\n\n[You are in battle mode: ${rival} is answering the same prompt at the same time. Answer normally, in your own style. After both replies are posted you will get a turn to respond to theirs.]`;
 }
 
 /**
@@ -2808,15 +2779,19 @@ export function resolveBattleVisionPlan(input: {
 }
 
 /**
- * Phase-4 generation-out plan (pure; the gen-out analogue of
- * resolveBattleVisionPlan). `'generation'` ONLY when `imageGenModelId`
- * resolves to a registered image model (Titan v2 / Nova Canvas);
- * absent or unknown → `'text'` so the turn proceeds as a normal text
- * battle rather than fabricating or crashing. The unknown-but-present
- * case is a deployer misconfig — the planner stays pure; the processor
- * logs that visibly (no silent string-matching inference).
+ * Generation-out plan (pure; the gen-out analogue of resolveBattleVisionPlan).
+ * `'generation'` ONLY when `imageGenModelId` resolves to a registered image model
+ * (IMAGE_GEN_MODELS); absent or unknown → `'text'` so the turn proceeds as a
+ * normal text turn rather than fabricating or crashing. The unknown-but-present
+ * case is a deployer misconfig — the planner stays pure; the processor logs that
+ * visibly (no silent string-matching inference).
+ *
+ * Source-agnostic (DESIGN-MULTI-ASSISTANT-TURN-ENGINE, "image generation must become a normal
+ * capability"): the caller resolves `imageGenModelId` from EITHER a battle variant's image model OR
+ * the active profile's `models.image` on an `image_generation` turn, then hands the resolved id here.
+ * This function only validates the id against the registry — it does not know or care about the source.
  */
-export interface BattleGenerationOutPlan {
+export interface GenerationOutPlan {
   action: 'generation' | 'text';
   /** The validated Bedrock image-gen model id (generation only). */
   modelId?: string;
@@ -2824,9 +2799,9 @@ export interface BattleGenerationOutPlan {
   displayName?: string;
 }
 
-export function resolveBattleGenerationOutPlan(input: {
+export function resolveGenerationOutPlan(input: {
   imageGenModelId?: string;
-}): BattleGenerationOutPlan {
+}): GenerationOutPlan {
   const key = imageGenModelIdToKey(input.imageGenModelId);
   if (!key) return { action: 'text' };
   const def = IMAGE_GEN_MODELS[key];
@@ -2836,6 +2811,44 @@ export function resolveBattleGenerationOutPlan(input: {
     modelKey: key,
     displayName: def.displayName,
   };
+}
+
+/** Back-compat alias (the plan is no longer battle-specific — image gen is a normal capability now).
+ *  Kept so existing callers/tests importing the old name keep working. */
+export const resolveBattleGenerationOutPlan = resolveGenerationOutPlan;
+/** @deprecated Use {@link GenerationOutPlan}. */
+export type BattleGenerationOutPlan = GenerationOutPlan;
+
+/** Map an `ImageGenModelKey` to its Bedrock image-gen id, or undefined for an absent/unknown key. */
+function imageGenKeyToBedrockId(key: string | undefined): string | undefined {
+  const k = key as ImageGenModelKey | undefined;
+  return k && IMAGE_GEN_MODELS[k] ? IMAGE_GEN_MODELS[k].bedrockModelId : undefined;
+}
+
+/**
+ * Pure. Resolve the Bedrock image-gen model id for THIS turn (the normal-turn generation trigger), in
+ * precedence (DESIGN-MULTI-ASSISTANT-TURN-ENGINE "Modality follows the profile"):
+ *   1. the battle variant's image model (`variantImageModelKey`) — an image battle compares the two
+ *      variants' image models; preferred over the profile so each side runs its assigned image model;
+ *   2. the legacy battle `imageGenModelId` (resolveBattleImageGenPair path) — kept working, unchanged;
+ *   3. the active profile's `models.image` (`profileImageModelKey`), ONLY on an `image_generation` turn
+ *      — this is the NORMAL, non-battle image path.
+ * Battle-sourced ids (1, 2) apply only when `battleOn`; the profile path is intent-gated. Returns
+ * undefined ⇒ a text turn. The caller feeds the result to {@link resolveGenerationOutPlan} for registry
+ * validation, so an unknown key here still resolves to a `'text'` plan (honest, never fabricated).
+ */
+export function resolveTurnImageGenModelId(input: {
+  battleOn: boolean;
+  intent?: string;
+  variantImageModelKey?: string;
+  battleImageGenModelId?: string;
+  profileImageModelKey?: string;
+}): string | undefined {
+  const variantId = input.battleOn ? imageGenKeyToBedrockId(input.variantImageModelKey) : undefined;
+  const legacyBattleId = input.battleOn ? input.battleImageGenModelId : undefined;
+  const profileId =
+    input.intent === 'image_generation' ? imageGenKeyToBedrockId(input.profileImageModelKey) : undefined;
+  return variantId ?? legacyBattleId ?? profileId;
 }
 
 /**

@@ -125,7 +125,9 @@ describe('invokeBedrock Converse tool loop (ADR-011)', () => {
     expect(r.outputTokens).toBe(50);
     expect(mockBedrockSend).toHaveBeenCalledTimes(2);
     expect(mockLoadContext).toHaveBeenCalledTimes(1);
-    expect(mockLoadContext).toHaveBeenCalledWith('test-context-bucket');
+    // loadCompanyContext takes an optional second `documents` arg (undefined when the turn
+    // carries no attachments); assert both so the call signature stays pinned.
+    expect(mockLoadContext).toHaveBeenCalledWith('test-context-bucket', undefined);
 
     // the second Converse call carried a user toolResult for t1
     const secondMessages = mockBedrockSend.mock.calls[1][0].input.messages;

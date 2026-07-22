@@ -1,7 +1,11 @@
 /**
- * Persist `/battle` generation-out images to S3 and hand back a
- * presigned GET URL the frontend can render (SPEC-BATTLE.md §"Image
- * Battles — Generation-Out", Phase 4C-ii).
+ * Persist generation-out images to S3 and hand back the object key +
+ * byte size the caller delivers as a message ATTACHMENT (rendered by the
+ * frontend AttachmentDisplay as an `<img>` that fetches a fresh presigned
+ * URL on demand, exactly like a generated document). A presigned GET is
+ * also returned for callers that still want a direct URL. Used by both a
+ * `/battle` generation-out turn and a normal `image_generation` turn
+ * (SPEC-BATTLE.md §"Image Battles — Generation-Out", Phase 4C-ii).
  *
  * Honest contract (mirrors `parseImageGenResponse` / the no-fabrication
  * rule): `invokeImageGenModel` returning `images: []` — a generation
@@ -48,6 +52,8 @@ export interface PersistImageGenOutputArgs {
 export interface PersistedImage {
   key: string;
   url: string;
+  /** Decoded PNG byte length — feeds the delivered attachment's `size`. */
+  size: number;
 }
 
 export interface PersistImageGenOutputResult {
@@ -56,20 +62,13 @@ export interface PersistImageGenOutputResult {
 }
 
 /**
- * Battle generation-out message marker. JSON-in-marker (mirrors
- * `<!--ACTIVE_TASK:{json}-->`) — NOT the `key=val,key=val` battle field
- * form, because presigned S3 URLs are full of `=`, `&`, `,` that would
- * shred field parsing. The 4C-iv frontend renderer parses this with a
- * non-greedy regex + JSON.parse (no fragile substring matching —
- * feedback-no-string-matching).
- */
-export const BATTLE_IMAGE_MARKER_PREFIX = '<!--battleimage:';
-
-/**
- * Pure. Build the battle message content for a generation-out turn.
- * With images: a short human-readable line (so non-rendering clients
- * still show something honest) + the structured marker. With none: an
- * honest failure/withheld line and **NO marker** — the scorecard still
+ * Pure. Build the message CONTENT line for a generation-out turn. This is
+ * a short human-readable lede only — the image itself is delivered as a
+ * message ATTACHMENT (see buildImageGenAttachment), rendered by the
+ * frontend AttachmentDisplay as an `<img>` that fetches a fresh presigned
+ * URL on demand. No presigned URL is embedded in content (no giant URL,
+ * no STS-token expiry). With images: a short "Generated ... with <model>."
+ * line. With none: an honest failure/withheld line — the scorecard still
  * records responseMs/cost (imageCount 0), the user never sees a broken
  * `<img>` or a fabricated image.
  */
@@ -84,18 +83,35 @@ export function buildBattleImageContent(input: {
   if (persisted.length === 0) {
     return guardrailIntervened
       ? 'The generated image was withheld by the content filter.'
-      : 'Image generation failed for this prompt — no image was produced.';
+      : 'Image generation failed for this prompt; no image was produced.';
   }
   const label = displayName || modelId;
-  const human = `Generated ${
+  return `Generated ${
     persisted.length === 1 ? 'an image' : `${persisted.length} images`
   } with ${label}.`;
-  const marker = `${BATTLE_IMAGE_MARKER_PREFIX}${JSON.stringify({
-    urls: persisted.map((p) => p.url),
-    modelId,
-    count: persisted.length,
-  })}-->`;
-  return `${human}${marker}`;
+}
+
+/**
+ * Pure. Build the message ATTACHMENT for a successful generation-out turn.
+ * Shape mirrors a generated document (`{ fileKey, name, size, type }`) so
+ * the same finalize/metadata path and the frontend AttachmentDisplay carry
+ * the image: an `image/*` attachment renders as an `<img>` via
+ * getDownloadUrl(fileKey, conversationId). Attaches the FIRST persisted
+ * image (the required minimum). Returns `undefined` for the honest
+ * no-image path (nothing persisted), so the caller attaches nothing.
+ */
+export function buildImageGenAttachment(input: {
+  persisted: PersistedImage[];
+  name?: string;
+}): { fileKey: string; name: string; size: number; type: string } | undefined {
+  const first = input.persisted[0];
+  if (!first) return undefined;
+  return {
+    fileKey: first.key,
+    name: input.name || 'generated-image.png',
+    size: first.size,
+    type: 'image/png',
+  };
 }
 
 // Lazy real S3Client for the default presigner — constructed once,
@@ -136,11 +152,14 @@ export async function persistImageGenOutput(
   const persisted: PersistedImage[] = [];
   for (let i = 0; i < pngs.length; i++) {
     const key = `battle-images/${channelId}/${ts}-${i}.png`;
+    // Decode once: the same buffer is the PutObject body AND the byte size
+    // the delivered attachment reports.
+    const body = Buffer.from(pngs[i], 'base64');
     await s3.send(
       new PutObjectCommand({
         Bucket: bucket,
         Key: key,
-        Body: Buffer.from(pngs[i], 'base64'),
+        Body: body,
         ContentType: 'image/png',
         ServerSideEncryption: 'AES256',
         Metadata: {
@@ -150,7 +169,7 @@ export async function persistImageGenOutput(
         },
       }),
     );
-    persisted.push({ key, url: await presign(bucket, key, ttl) });
+    persisted.push({ key, url: await presign(bucket, key, ttl), size: body.length });
   }
   return { persisted };
 }

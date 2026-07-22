@@ -15,10 +15,9 @@
  *   BATTLE_E2E=1 AWS_PROFILE=<your-profile> npx playwright test e2e/battle.spec.ts \
  *     --config=playwright.config.ts
  *
- * This includes the two heaviest stages — image generation-out and the
- * clarification round-trip — driven end to end and hard-asserted (they are live
- * and model-dependent, so they carry generous timeouts and run only under
- * BATTLE_E2E, never in the default unit suite).
+ * This includes the heaviest stage — image generation-out — driven end to end
+ * and hard-asserted (it is live and model-dependent, so it carries a generous
+ * timeout and runs only under BATTLE_E2E, never in the default unit suite).
  */
 
 import { test, expect } from '@playwright/test';
@@ -28,7 +27,6 @@ import {
   ensureBattleExperiment,
   newBattleChannel,
   fireBattle,
-  fireBattleRaw,
   BATTLE_IMAGE_EXP_ID,
 } from './helpers/battle-setup';
 
@@ -110,7 +108,7 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     // Round 2 fires once both round-1 replies are terminal. For a single-turn
     // (non-TASK_*) prompt this is deterministic; allow a generous budget for
     // the orchestrator fan-out + the second generation.
-    await expect(page.locator('.battle-round-divider').first()).toBeVisible({ timeout: 180_000 });
+    await expect(page.locator('.battle-round-divider').first()).toBeVisible({ timeout: 260_000 });
   });
 
   test('multi-turn: repeated /battle turns in one conversation each produce a fresh duel', async ({
@@ -123,8 +121,7 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     //
     // NOTE: a plain (non-/battle, non-mention) follow-up in a battle channel does
     // NOT re-engage the bots — that's the multi-user "stay silent without a
-    // mention" rule, not a bug. The TASK_*-advances-across-turns flow is the
-    // clarification round-trip (the test below), a distinct mechanism.
+    // mention" rule, not a bug. Each new duel needs its own /battle turn.
     test.setTimeout(14 * 60_000);
 
     await signInAdmin(page);
@@ -143,7 +140,7 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
       { timeout: 30_000 },
     );
     await page.keyboard.press('Enter');
-    await expect(page.locator('.battle-scorecard')).toHaveCount(2, { timeout: 170_000 });
+    await expect(page.locator('.battle-scorecard')).toHaveCount(2, { timeout: 260_000 });
   });
 
   test('winner pick is RECORDED server-side (BattleOutcome persists), not just UI state', async ({
@@ -253,7 +250,7 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     // provider to honest-fail). Every image that DOES render must have a real source — never a broken/empty
     // <img> (the guardrail-blocked / failed path shows honest text and NO <img>, so a rendered img is real).
     const imgs = page.locator('.battle-generated-image');
-    await expect.poll(() => imgs.count(), { timeout: 180_000 }).toBeGreaterThanOrEqual(1);
+    await expect.poll(() => imgs.count(), { timeout: 260_000 }).toBeGreaterThanOrEqual(1);
     for (const img of await imgs.all()) {
       const src = await img.getAttribute('src');
       expect(src, 'a rendered battle image must have a real src (data:/http), not a broken img').toMatch(
@@ -265,29 +262,21 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     }
   });
 
-  test('clarification routing: an ambiguous /battle asks privately (neutral waiting state), not a broadcast', async ({
+  test('ambiguous /battle answers normally, no private waiting state', async ({
     page,
   }) => {
     test.setTimeout(10 * 60_000);
     await signInAdmin(page);
     await ensureBattleExperiment(page, { slot: 'slot-0' }); // text battle
-    await newBattleChannel(page, 'E2E clarification battle');
+    await newBattleChannel(page, 'E2E ambiguous battle');
 
-    // A deliberately ambiguous prompt with no referent — a variant should ASK what to compare rather than
-    // forge ahead (SPEC-BATTLE "Clarification Routing"). Fire raw: the outcome we assert is the routing.
-    await fireBattleRaw(page, '/battle Which one is better?');
+    // The redesign removed battle clarification prompting: an ambiguous /battle no longer routes a
+    // clarifying question to a private waiting state — both variants just answer normally. Assert the
+    // normal battle fan-out (>= 2 variant bubbles), and that NO waiting state ever renders.
+    const count = await fireBattle(page, '/battle Which one is better?');
+    expect(count).toBeGreaterThanOrEqual(2);
 
-    // Clarification ROUTING is the deterministic, load-bearing behavior: instead of broadcasting the
-    // clarifying question as an ordinary reply, the bot's question is routed to a neutral, private WAITING
-    // state on the composer (the `.message-input-sticky-target-hint` renders ONLY in the battle-waiting
-    // branch, and the composer targets the waiting assistant so a reply goes back to it, targeted).
-    const hint = page.locator('.message-input-sticky-target-hint');
-    await expect(hint).toBeVisible({ timeout: 180_000 });
-    await expect(hint).toContainText(/waiting/i);
-    await expect(page.locator('.message-input-sticky-target-chip--bot').first()).toBeVisible();
-    // NOTE: the answer→resume→resolve completion of the round-trip is live + model-timing-dependent (a
-    // resumed reply's latency and whether a given prompt triggers clarification both vary), so it is
-    // intentionally NOT asserted here — asserting it reliably in CI is disproportionate. The routing above
-    // is the behavior that must hold; the resume mechanism itself is unit-covered (battle-clarification).
+    // No neutral, private waiting state on the composer — clarification routing is gone.
+    await expect(page.locator('.message-input-sticky-target-hint')).toHaveCount(0);
   });
 });

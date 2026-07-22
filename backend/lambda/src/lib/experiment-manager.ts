@@ -716,6 +716,9 @@ export async function resolveBattleVariantBySlotArn(
   modelKey: BackendModelKey;
   displayName: string;
   systemPromptAddendum?: string;
+  /** Phase-2: the variant's IMAGE-generation model, stamped into battleContext.variantImageModelKey so
+   *  the worker runs its normal image path for an image battle (no battle-specific image branch). */
+  imageGenModelKey?: ImageGenModelKey;
   longFormMode?: 'one-shot' | 'outline-first';
 } | null> {
   if (!slotArn) return null;
@@ -735,6 +738,7 @@ export async function resolveBattleVariantBySlotArn(
     modelKey: treatmentModelKey,
     displayName: treatment.displayName ?? treatment.variantId,
     systemPromptAddendum: treatment.systemPromptAddendum,
+    ...(treatment.imageGenModelKey && { imageGenModelKey: treatment.imageGenModelKey }),
     longFormMode: exp.longFormMode,
   };
 }
@@ -765,6 +769,8 @@ export async function resolveBattleControlVariantByAltSlotArn(
   modelKey: BackendModelKey;
   displayName: string;
   systemPromptAddendum?: string;
+  /** Phase-2: the control variant's IMAGE-generation model (see resolveBattleVariantBySlotArn). */
+  imageGenModelKey?: ImageGenModelKey;
   longFormMode?: 'one-shot' | 'outline-first';
 } | null> {
   if (!altSlotArn) return null;
@@ -784,6 +790,7 @@ export async function resolveBattleControlVariantByAltSlotArn(
     modelKey: controlModelKey,
     displayName: control.displayName ?? control.variantId,
     systemPromptAddendum: control.systemPromptAddendum,
+    ...(control.imageGenModelKey && { imageGenModelKey: control.imageGenModelKey }),
     longFormMode: exp.longFormMode,
   };
 }

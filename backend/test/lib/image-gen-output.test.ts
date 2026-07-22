@@ -25,7 +25,7 @@ jest.mock(
 import {
   persistImageGenOutput,
   buildBattleImageContent,
-  BATTLE_IMAGE_MARKER_PREFIX,
+  buildImageGenAttachment,
 } from '../../lambda/src/lib/image-gen-output';
 
 const s3 = { send: mockS3Send };
@@ -70,7 +70,8 @@ describe('persistImageGenOutput', () => {
     });
 
     const key = `battle-images/chan-1/${TS}-0.png`;
-    expect(out).toEqual({ persisted: [{ key, url: `signed:${key}:900` }] });
+    // `size` is the decoded PNG byte length — feeds the delivered attachment's size.
+    expect(out).toEqual({ persisted: [{ key, url: `signed:${key}:900`, size: 8 }] });
 
     const cmd = mockS3Send.mock.calls[0][0];
     expect(cmd.__t).toBe('Put');
@@ -80,6 +81,7 @@ describe('persistImageGenOutput', () => {
     expect(cmd.input.ServerSideEncryption).toBe('AES256');
     expect(Buffer.isBuffer(cmd.input.Body)).toBe(true);
     expect((cmd.input.Body as Buffer).toString()).toBe('PNGBYTES'); // base64-decoded
+    expect(out.persisted[0].size).toBe(Buffer.from('PNGBYTES').length);
     expect(cmd.input.Metadata).toMatchObject({
       channelArn: ARN,
       modelId: 'amazon.nova-canvas-v1:0',
@@ -131,44 +133,32 @@ describe('persistImageGenOutput', () => {
 });
 
 describe('buildBattleImageContent', () => {
-  it('persisted image → human line + JSON marker (urls/modelId/count)', () => {
+  // The image is delivered as a message ATTACHMENT (buildImageGenAttachment), so the content line is
+  // now a short lede only — it must NEVER carry the old <!--battleimage:--> marker or any presigned URL.
+  it('persisted image → short human line, NO marker, NO presigned URL', () => {
     const content = buildBattleImageContent({
-      persisted: [{ key: 'k', url: 'https://s3/signed?X-Amz-Signature=ab=cd&y,z' }],
+      persisted: [{ key: 'k', url: 'https://s3/signed?X-Amz-Signature=ab=cd&y,z', size: 3 }],
       modelId: 'amazon.nova-canvas-v1:0',
       displayName: 'Amazon Nova Canvas',
       guardrailIntervened: false,
     });
-    expect(content).toContain('Generated an image with Amazon Nova Canvas.');
-    expect(content).toContain(BATTLE_IMAGE_MARKER_PREFIX);
-
-    // URL has =,&, — only a JSON-in-marker (not key=val) survives this.
-    const json = content.slice(
-      content.indexOf(BATTLE_IMAGE_MARKER_PREFIX) + BATTLE_IMAGE_MARKER_PREFIX.length,
-      content.lastIndexOf('-->'),
-    );
-    expect(JSON.parse(json)).toEqual({
-      urls: ['https://s3/signed?X-Amz-Signature=ab=cd&y,z'],
-      modelId: 'amazon.nova-canvas-v1:0',
-      count: 1,
-    });
+    expect(content).toBe('Generated an image with Amazon Nova Canvas.');
+    expect(content).not.toContain('<!--battleimage:');
+    expect(content).not.toContain('X-Amz-Signature');
   });
 
-  it('pluralises and counts multiple images', () => {
+  it('pluralises and counts multiple images (still no marker)', () => {
     const content = buildBattleImageContent({
       persisted: [
-        { key: 'a', url: 'u1' },
-        { key: 'b', url: 'u2' },
+        { key: 'a', url: 'u1', size: 1 },
+        { key: 'b', url: 'u2', size: 2 },
       ],
       modelId: 'm',
       displayName: 'Titan',
       guardrailIntervened: false,
     });
-    expect(content).toContain('Generated 2 images with Titan.');
-    const json = content.slice(
-      content.indexOf(BATTLE_IMAGE_MARKER_PREFIX) + BATTLE_IMAGE_MARKER_PREFIX.length,
-      content.lastIndexOf('-->'),
-    );
-    expect(JSON.parse(json).count).toBe(2);
+    expect(content).toBe('Generated 2 images with Titan.');
+    expect(content).not.toContain('<!--battleimage:');
   });
 
   it('no images + guardrail intervened → honest withheld line, NO marker', () => {
@@ -178,7 +168,7 @@ describe('buildBattleImageContent', () => {
       guardrailIntervened: true,
     });
     expect(content).toMatch(/withheld by the content filter/i);
-    expect(content).not.toContain(BATTLE_IMAGE_MARKER_PREFIX);
+    expect(content).not.toContain('<!--battleimage:');
   });
 
   it('no images + no guardrail → honest failure line, NO marker (never fabricated)', () => {
@@ -188,6 +178,35 @@ describe('buildBattleImageContent', () => {
       guardrailIntervened: false,
     });
     expect(content).toMatch(/generation failed/i);
-    expect(content).not.toContain(BATTLE_IMAGE_MARKER_PREFIX);
+    expect(content).not.toContain('<!--battleimage:');
+  });
+});
+
+describe('buildImageGenAttachment', () => {
+  it('nothing persisted → undefined (honest no-image path attaches nothing)', () => {
+    expect(buildImageGenAttachment({ persisted: [] })).toBeUndefined();
+  });
+
+  it('attaches the first persisted image as an image/png {fileKey,name,size,type}', () => {
+    const att = buildImageGenAttachment({
+      persisted: [
+        { key: 'battle-images/chan-1/x-0.png', url: 'signed:0', size: 42 },
+        { key: 'battle-images/chan-1/x-1.png', url: 'signed:1', size: 99 },
+      ],
+    });
+    expect(att).toEqual({
+      fileKey: 'battle-images/chan-1/x-0.png',
+      name: 'generated-image.png',
+      size: 42,
+      type: 'image/png',
+    });
+  });
+
+  it('honours a custom name', () => {
+    const att = buildImageGenAttachment({
+      persisted: [{ key: 'k', url: 'u', size: 7 }],
+      name: 'my-render.png',
+    });
+    expect(att?.name).toBe('my-render.png');
   });
 });
