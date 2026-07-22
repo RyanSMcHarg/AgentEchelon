@@ -30,9 +30,8 @@ jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn().mockImplementation(() => ({ send: mockMessagingSend })),
   ListChannelMessagesCommand: jest.fn(),
-  UpdateChannelMessageCommand: jest.fn(),
+  UpdateChannelMessageCommand: jest.fn().mockImplementation((args) => ({ __type: 'Update', input: args })),
   SendChannelMessageCommand: jest.fn(),
-  DeleteChannelMessageCommand: jest.fn().mockImplementation((args) => ({ __type: 'Delete', input: args })),
 }), { virtual: true });
 
 jest.mock('@aws-sdk/client-s3', () => ({
@@ -60,12 +59,12 @@ jest.mock('@aws-sdk/client-dynamodb', () => ({
 }), { virtual: true });
 
 import type { BattleContextPayload } from '../../lambda/src/lib/async-processor-core';
-// Static import for pure helpers (isNoRebuttal, deleteRound2Placeholder).
+// Static import for pure helpers (isNoRebuttal, updateMessage).
 // prepareBattleInvocation is loaded dynamically per-test because it reads
 // from the experiments cache; we resetModules before each call.
 import {
   isNoRebuttal,
-  deleteRound2Placeholder,
+  updateMessage,
   splitIntoChunks,
 } from '../../lambda/src/lib/async-processor-core';
 
@@ -133,20 +132,20 @@ describe('isNoRebuttal', () => {
   });
 });
 
-describe('deleteRound2Placeholder', () => {
-  it('issues a DeleteChannelMessage with the right channel + message + bearer', async () => {
+// Round-2 NO_REBUTTAL resolves the placeholder by UPDATING it to a "No rebuttal." state (reusing
+// UpdateChannelMessage), NOT by deleting it — so it needs no chime:DeleteChannelMessage grant and the
+// opt-out is shown honestly instead of a bubble that appears then vanishes.
+describe('NO_REBUTTAL placeholder resolution (update, not delete)', () => {
+  it('updateMessage issues an UpdateChannelMessage with URL-encoded content + the bot bearer', async () => {
     mockMessagingSend.mockResolvedValueOnce({});
-    await deleteRound2Placeholder({
-      channelArn: 'arn:channel',
-      messageId: 'msg-id-X',
-      botArn: ALT_SLOT,
-    });
+    await updateMessage('arn:channel', 'msg-id-X', 'No rebuttal.', ALT_SLOT);
     expect(mockMessagingSend).toHaveBeenCalledTimes(1);
     const cmd = mockMessagingSend.mock.calls[0][0];
-    expect(cmd.__type).toBe('Delete');
+    expect(cmd.__type).toBe('Update'); // NOT Delete — no chime:DeleteChannelMessage dependency
     expect(cmd.input.ChannelArn).toBe('arn:channel');
     expect(cmd.input.MessageId).toBe('msg-id-X');
     expect(cmd.input.ChimeBearer).toBe(ALT_SLOT);
+    expect(decodeURIComponent(cmd.input.Content)).toBe('No rebuttal.');
   });
 });
 

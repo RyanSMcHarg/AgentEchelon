@@ -21,7 +21,6 @@ import {
   GetChannelMessageCommand,
   UpdateChannelMessageCommand,
   SendChannelMessageCommand,
-  DeleteChannelMessageCommand,
 } from '@aws-sdk/client-chime-sdk-messaging';
 import {
   BedrockRuntimeClient,
@@ -1910,23 +1909,22 @@ export async function finalizePlaceholderResponse(params: {
   // ============================================================
   // /battle: round-2 NO_REBUTTAL short-circuit
   // ============================================================
-  // Per SPEC-BATTLE.md: when a bot opts out of round 2 by emitting
-  // the NO_REBUTTAL sentinel, we delete its placeholder rather than
-  // updating it. The state transition still records terminal status so
-  // analytics has the opt-out signal.
+  // Per SPEC-BATTLE.md: when a bot opts out of round 2 by emitting the NO_REBUTTAL sentinel, RESOLVE its
+  // placeholder to a clear "No rebuttal." state — an UPDATE, not a delete. Updating (via the already-held
+  // chime:UpdateChannelMessage) means the opt-out is shown honestly, nothing appears-then-vanishes, and
+  // there is NO dependency on chime:DeleteChannelMessage (which the processor role isn't granted — a
+  // delete here failed silently and left the placeholder orphaned as a stale "waiting" bubble). The state
+  // transition still records terminal status so analytics has the opt-out signal.
   if (event.battleContext?.round === 2 && isNoRebuttal(response)) {
-    console.log('[AsyncProcessor][battle] Round-2 NO_REBUTTAL — deleting placeholder', {
+    console.log('[AsyncProcessor][battle] Round-2 NO_REBUTTAL — resolving placeholder to a no-rebuttal state', {
       battleId: event.battleContext.battleId,
       botArn: event.botArn,
     });
     try {
-      await deleteRound2Placeholder({
-        channelArn: event.channelArn,
-        messageId,
-        botArn: event.botArn,
-      });
+      await updateMessage(event.channelArn, messageId, 'No rebuttal.', event.botArn);
     } catch (err) {
-      console.warn('[AsyncProcessor][battle] DeleteChannelMessage failed:', err);
+      // Loud: a silently-swallowed failure here is exactly what hid the orphaned-placeholder bug.
+      console.error('[AsyncProcessor][battle] Failed to resolve the NO_REBUTTAL placeholder:', err);
     }
     // Record terminal state so analytics has the opt-out signal. No
     // orchestrator fire on round-2 transitions.
@@ -3093,20 +3091,6 @@ export function planBattleClarificationDelivery(args: {
       ? { content: question, targetMemberArn: args.senderArn }
       : null,
   };
-}
-
-export async function deleteRound2Placeholder(args: {
-  channelArn: string;
-  messageId: string;
-  botArn: string;
-}): Promise<void> {
-  await messagingClient.send(
-    new DeleteChannelMessageCommand({
-      ChannelArn: args.channelArn,
-      MessageId: args.messageId,
-      ChimeBearer: args.botArn,
-    }),
-  );
 }
 
 // ============================================================

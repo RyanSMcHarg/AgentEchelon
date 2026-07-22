@@ -13,9 +13,9 @@
  *   BATTLE_E2E=1 AWS_PROFILE=<your-profile> npx playwright test e2e/battle.spec.ts \
  *     --config=playwright.config.ts
  *
- * These reuse the exact admin-arm → enable → fire flow the post2 demo driver
- * proves (post2-abtest-battle.demo.spec.ts), but hard-assert instead of
- * honest-degrading. The selectors are the real frontend ones.
+ * These arm an experiment on the admin origin, enable Battle Mode on a premium
+ * channel, and fire a real duel — hard-asserting the UX. The selectors are the
+ * real frontend ones.
  */
 import { Page, expect, test } from '@playwright/test';
 import { signIn } from './agent-helpers';
@@ -33,6 +33,8 @@ export function requireBattleE2E(): void {
 
 /** A stable battle experiment id the suite arms once and reuses. */
 export const BATTLE_EXP_ID = 'e2e-battle-sonnet-vs-opus';
+/** A separate experiment for the image generation-out duel (both variants carry an image-gen model). */
+export const BATTLE_IMAGE_EXP_ID = 'e2e-battle-image-genout';
 
 /** Sign in as the admin test user (admin tab for arming + premium for the duel). */
 export async function signInAdmin(page: Page): Promise<void> {
@@ -93,13 +95,14 @@ async function leaveAdmin(page: Page): Promise<void> {
  */
 export async function ensureBattleExperiment(
   page: Page,
-  opts: { slot?: string; control?: string; treatment?: string } = {},
+  opts: { slot?: string; control?: string; treatment?: string; expId?: string; image?: boolean } = {},
 ): Promise<void> {
   const slot = opts.slot ?? 'slot-0';
+  const expId = opts.expId ?? BATTLE_EXP_ID;
   await openAdminExperiments(page);
 
   // Already armed from a prior run? Reuse it (avoids duplicate-id create error).
-  const existing = page.locator(`text=${BATTLE_EXP_ID}`).first();
+  const existing = page.locator(`text=${expId}`).first();
   if (await existing.isVisible({ timeout: 3000 }).catch(() => false)) {
     await leaveAdmin(page);
     return;
@@ -107,7 +110,7 @@ export async function ensureBattleExperiment(
 
   await page.locator('button:has-text("New Experiment")').click();
   await expect(page.locator('h4:has-text("Create Experiment")')).toBeVisible();
-  await page.locator('label:has-text("Experiment ID") input').fill(BATTLE_EXP_ID);
+  await page.locator('label:has-text("Experiment ID") input').fill(expId);
   await page.locator('label:has-text("Control Model") select').selectOption({ value: opts.control ?? 'sonnet' }).catch(() => {});
   await page.locator('label:has-text("Treatment Model") select').selectOption({ value: opts.treatment ?? 'opus' }).catch(() => {});
   await page.locator('label:has-text("Description") input').fill('E2E battle: Sonnet (Atlas) vs Opus (Echo).');
@@ -129,9 +132,16 @@ export async function ensureBattleExperiment(
   const names = page.locator('.experiment-battle-variant-name');
   await names.nth(0).fill('Atlas');
   await names.nth(1).fill('Echo');
+  // Generation-out duel: set an image-gen model on BOTH variants (the form requires both-or-neither).
+  // Pick the first real option (index 0 is "Text battle (no image generation)"), so this is robust to
+  // whichever image models are active in the deploy.
+  if (opts.image) {
+    await page.locator('select[aria-label="Control image-gen model"]').selectOption({ index: 1 });
+    await page.locator('select[aria-label="Treatment image-gen model"]').selectOption({ index: 1 });
+  }
   await page.locator('#alt-bot-slot-select').selectOption(slot).catch(() => {});
   await page.locator('button:has-text("Create & Activate")').click();
-  await expect(page.locator(`text=${BATTLE_EXP_ID}`).first()).toBeVisible({ timeout: 15_000 });
+  await expect(page.locator(`text=${expId}`).first()).toBeVisible({ timeout: 15_000 });
 
   await leaveAdmin(page);
 }
@@ -141,7 +151,7 @@ export async function ensureBattleExperiment(
  * Throws (fails the test) if the alt-bot slot pool / battle API is unreachable —
  * that IS the regression signal for the AgentEchelonBattle relocation.
  */
-export async function newBattleChannel(page: Page, title: string): Promise<void> {
+export async function newBattleChannel(page: Page, title: string, expId: string = BATTLE_EXP_ID): Promise<void> {
   await page.locator('button.app-new-conversation-btn').click();
   await page.waitForSelector('.ncm-modal', { timeout: 8000 });
   const premiumCard = page.locator('.ncm-class-card:has-text("Premium")').first();
@@ -160,7 +170,7 @@ export async function newBattleChannel(page: Page, title: string): Promise<void>
   await expect(section).toBeVisible({ timeout: 10_000 });
   const expSelect = section.locator('#battle-experiment-select');
   await expSelect.waitFor({ state: 'visible', timeout: 25_000 });
-  await expSelect.selectOption(BATTLE_EXP_ID);
+  await expSelect.selectOption(expId);
   await section.locator('.channel-members-panel-battle-btn--enable').click();
 
   const live = section.locator('.status-badge--live');
@@ -187,11 +197,18 @@ export async function newBattleChannel(page: Page, title: string): Promise<void>
  * first response-time cell carrying a digit (the per-bot placeholders + an
  * empty-dash scorecard render immediately, so bubble count alone lies).
  */
-export async function fireBattle(page: Page, prompt: string, timeoutMs = 170_000): Promise<number> {
-  // Explicit fill timeout: if the composer is ever blocked (e.g. an overlay),
-  // fail in 30s with a clear error instead of hanging to the test timeout.
+/**
+ * Type a /battle prompt into the composer and send it — no readiness wait. Use when the caller
+ * asserts a NON-scorecard outcome first (e.g. the clarification waiting-state) rather than a resolved
+ * duel. Explicit fill timeout so a blocked composer (an overlay) fails fast with a clear error.
+ */
+export async function fireBattleRaw(page: Page, prompt: string): Promise<void> {
   await page.locator('.message-textarea').fill(prompt, { timeout: 30_000 });
   await page.keyboard.press('Enter');
+}
+
+export async function fireBattle(page: Page, prompt: string, timeoutMs = 170_000): Promise<number> {
+  await fireBattleRaw(page, prompt);
   await expect
     .poll(async () => page.locator('.message.battle-message').count(), { timeout: timeoutMs })
     .toBeGreaterThanOrEqual(2);
