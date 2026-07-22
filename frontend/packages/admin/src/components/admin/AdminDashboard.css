@@ -1626,6 +1626,55 @@
   color: var(--text-secondary, var(--zinc-700, #3f3f46));
 }
 
+/* Battle-scoped effectiveness (SPEC-BATTLE): a per-variant scorecard from /battle turns only,
+   visually distinct from the 1fr-auto-1fr A/B comparison above (a plain table, amber-accented). */
+.exp-battle {
+  margin-top: var(--space-4, 16px);
+  padding-top: var(--space-4, 16px);
+  border-top: 1px dashed var(--surface-200, var(--zinc-200, #e4e4e7));
+}
+.exp-battle-head {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3, 12px);
+  flex-wrap: wrap;
+  margin-bottom: var(--space-3, 12px);
+}
+.exp-battle-sub {
+  font-size: 11px;
+  font-style: italic;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+}
+.exp-battle-table-wrap { overflow-x: auto; }
+.exp-battle-table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+.exp-battle-table th,
+.exp-battle-table td {
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--surface-100, var(--zinc-100, #f4f4f5));
+  white-space: nowrap;
+}
+.exp-battle-table th {
+  font-family: var(--font-mono, monospace);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+  font-weight: 600;
+}
+.exp-battle-table td.num,
+.exp-battle-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
+.exp-battle-variant-name { font-weight: 600; color: var(--text-primary, var(--zinc-900, #18181b)); }
+.exp-battle-variant-id {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+}
+
 @media (max-width: 640px) {
   .exp-variant-row,
   .exp-metric-row { gap: var(--space-2, 8px); }
