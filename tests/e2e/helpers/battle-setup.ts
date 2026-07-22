@@ -109,11 +109,29 @@ async function pauseBattleExperimentIfActive(page: Page, expId: string): Promise
 }
 
 /**
- * Ensure a battle-enabled premium experiment exists + is active, bound to an
- * alt-bot slot. Idempotent: if BATTLE_EXP_ID already shows in the list, reuse it.
- * Returns with the admin dashboard closed.
+ * RESUME a battle experiment by id if it is currently paused. The slot binds and the channel enable
+ * auto-resolves ONLY an `active` experiment, so a sibling-test may have paused this one (exclusivity)
+ * and its own test must re-activate it. No-op when the row or its Resume button is absent (already
+ * active). Assumes the Experiments list is open.
  */
-export async function ensureBattleExperiment(
+async function resumeBattleExperimentIfPaused(page: Page, expId: string): Promise<void> {
+  const row = page.locator(`tr:has-text("${expId}")`).first();
+  if (!(await row.isVisible({ timeout: 3_000 }).catch(() => false))) return; // not present -> nothing to resume
+  const resume = row.locator('button:has-text("Resume")').first();
+  if (await resume.isVisible({ timeout: 1_500 }).catch(() => false)) {
+    await resume.click();
+    await expect(row).toContainText('active', { timeout: 10_000 }).catch(() => {});
+  }
+}
+
+/**
+ * Ensure a battle-enabled premium experiment EXISTS (create-if-missing) — the expensive form-fill create
+ * paid ONCE, not per test. Idempotent: if `expId` already shows in the list, this is a no-op reuse
+ * (avoids the duplicate-id create error AND avoids clobbering a hand-tuned config — a re-create resets
+ * both variants to the form defaults). Does NOT enforce active/paused exclusivity — that is
+ * activateBattleExperiment's job, called per test. Returns with admin left (chat origin).
+ */
+export async function ensureBattleExperimentExists(
   page: Page,
   opts: { slot?: string; control?: string; treatment?: string; expId?: string; image?: boolean } = {},
 ): Promise<void> {
@@ -121,26 +139,11 @@ export async function ensureBattleExperiment(
   const expId = opts.expId ?? BATTLE_EXP_ID;
   await openAdminExperiments(page);
 
-  // Exclusivity: only ONE battle experiment may be active for the classification at a time (the enable
-  // auto-resolves the single active one, and the slot binds only an active one). Pause the OTHER e2e
-  // battle experiment so `expId` becomes the sole active battle experiment before we arm/enable it.
-  const sibling = expId === BATTLE_EXP_ID ? BATTLE_IMAGE_EXP_ID : BATTLE_EXP_ID;
-  await pauseBattleExperimentIfActive(page, sibling);
-
-  // Already armed from a prior run? Reuse it (avoids duplicate-id create error
-  // AND avoids clobbering a hand-tuned config — a re-create resets both variants
-  // to the form defaults). openAdminExperiments already waited for the list
-  // heading, but the row itself can lag the initial render; give it a real
-  // window (not 3s) so a slow list never forces a spurious re-create.
+  // Already armed (this or a prior run)? Reuse it. openAdminExperiments already waited for the list
+  // heading, but the row itself can lag the initial render; give it a real window (not 3s) so a slow
+  // list never forces a spurious re-create.
   const existing = page.locator(`tr:has-text("${expId}")`).first();
   if (await existing.isVisible({ timeout: 15_000 }).catch(() => false)) {
-    // A prior test may have PAUSED this one for its own exclusivity; Resume it so it is active again
-    // (the slot binds and the enable resolves only an active experiment).
-    const resume = existing.locator('button:has-text("Resume")').first();
-    if (await resume.isVisible({ timeout: 1_500 }).catch(() => false)) {
-      await resume.click();
-      await expect(existing).toContainText('active', { timeout: 10_000 }).catch(() => {});
-    }
     await leaveAdmin(page);
     return;
   }
@@ -180,6 +183,24 @@ export async function ensureBattleExperiment(
   await page.locator('button:has-text("Create & Activate")').click();
   await expect(page.locator(`text=${expId}`).first()).toBeVisible({ timeout: 15_000 });
 
+  await leaveAdmin(page);
+}
+
+/**
+ * Make `expId` the SOLE ACTIVE battle experiment for its classification — the cheap per-test step
+ * (no form fill; the row already exists from the beforeAll create). Preserves the exclusivity
+ * invariant: only ONE battle experiment may be active at a time (the channel enable auto-resolves the
+ * single active one, and the alt-bot slot binds only an active one), so this PAUSES the sibling e2e
+ * battle experiment and RESUMES `expId` if it was paused. Idempotent + independent per test: a test
+ * that ran before may have paused this one for its own exclusivity, so re-activating here keeps each
+ * test self-contained (one failure never leaves the wrong experiment active for the next). Returns
+ * with admin left (chat origin).
+ */
+export async function activateBattleExperiment(page: Page, expId: string = BATTLE_EXP_ID): Promise<void> {
+  await openAdminExperiments(page);
+  const sibling = expId === BATTLE_EXP_ID ? BATTLE_IMAGE_EXP_ID : BATTLE_EXP_ID;
+  await pauseBattleExperimentIfActive(page, sibling);
+  await resumeBattleExperimentIfPaused(page, expId);
   await leaveAdmin(page);
 }
 

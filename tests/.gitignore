@@ -1,0 +1,3 @@
+# Playwright storageState written by the setup-battle project (per-origin auth
+# tokens for the admin test user) — never commit auth material.
+playwright/.auth/

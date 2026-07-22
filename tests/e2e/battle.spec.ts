@@ -23,12 +23,17 @@
 import { test, expect } from '@playwright/test';
 import {
   requireBattleE2E,
-  signInAdmin,
-  ensureBattleExperiment,
+  BATTLE_E2E_ENABLED,
+  ensureBattleExperimentExists,
+  activateBattleExperiment,
   newBattleChannel,
   fireBattle,
+  BATTLE_EXP_ID,
   BATTLE_IMAGE_EXP_ID,
 } from './helpers/battle-setup';
+// From the config, NOT from e2e/battle.setup.ts: Playwright forbids one test file
+// importing another (battle.setup.ts is a test file); the config is the shared home.
+import { BATTLE_AUTH_FILE } from '../playwright.config';
 
 test.describe('/battle — Phase 0 verified invariant', () => {
   test('marker-survival contract is documented at the merge site', () => {
@@ -47,10 +52,38 @@ test.describe('/battle — Phase 0 verified invariant', () => {
 });
 
 test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
-  // Independent tests (each does its own sign-in + idempotent arm + fresh
-  // channel), so NOT .serial — one failure must not skip the others. The config
-  // runs them sequentially (single worker); real duels are slow.
+  // Independent tests (NOT .serial — one failure must not skip the others). Auth
+  // is shared, not re-paid per test: the `battle` project loads a storageState
+  // (BATTLE_AUTH_FILE) that the setup-battle project pre-authed on BOTH origins
+  // (chat + admin), so no test signs in. The expensive experiment CREATE (form
+  // fill) is also paid ONCE in beforeAll (create-if-missing for both text +
+  // image). Each test then keeps only the CHEAP per-test step —
+  // activateBattleExperiment — which makes its experiment the sole ACTIVE one
+  // (resume it + pause the sibling), preserving both exclusivity (one active
+  // battle experiment per classification) AND failure-independence (each test
+  // re-asserts the right experiment is active, so one test's leftover state
+  // never breaks the next). The config runs them sequentially (single worker);
+  // real duels are slow.
   test.beforeEach(() => requireBattleE2E());
+
+  // Create BOTH experiments once (create-if-missing) so no individual test pays
+  // the form-fill create cost. Needs an authed page; storageState pre-auths both
+  // origins. Guarded so the default (non-live) run never touches the auth file.
+  test.beforeAll(async ({ browser }) => {
+    if (!BATTLE_E2E_ENABLED) return;
+    const ctx = await browser.newContext({ storageState: BATTLE_AUTH_FILE });
+    const page = await ctx.newPage();
+    try {
+      await ensureBattleExperimentExists(page, { slot: 'slot-0' }); // text
+      await ensureBattleExperimentExists(page, {
+        slot: 'slot-0',
+        expId: BATTLE_IMAGE_EXP_ID,
+        image: true,
+      });
+    } finally {
+      await ctx.close();
+    }
+  });
 
   test('round-1: two variant replies, chips SURVIVE the reply update, + scorecard pick works', async ({
     page,
@@ -58,8 +91,7 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     // A real duel + round-2 wait can take minutes; the config 120s cap is too tight.
     test.setTimeout(9 * 60_000);
 
-    await signInAdmin(page);
-    await ensureBattleExperiment(page, { slot: 'slot-0' });
+    await activateBattleExperiment(page, BATTLE_EXP_ID);
     await newBattleChannel(page, 'E2E caching battle');
 
     // A single-turn opinion prompt (not a TASK_*) so round-2 is completion-
@@ -100,8 +132,7 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     page,
   }) => {
     test.setTimeout(9 * 60_000);
-    await signInAdmin(page);
-    await ensureBattleExperiment(page, { slot: 'slot-0' });
+    await activateBattleExperiment(page, BATTLE_EXP_ID);
     await newBattleChannel(page, 'E2E round-2 battle');
 
     await fireBattle(page, '/battle Is REST or GraphQL the better default for a new internal API? One paragraph.');
@@ -124,8 +155,7 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     // mention" rule, not a bug. Each new duel needs its own /battle turn.
     test.setTimeout(14 * 60_000);
 
-    await signInAdmin(page);
-    await ensureBattleExperiment(page, { slot: 'slot-0' });
+    await activateBattleExperiment(page, BATTLE_EXP_ID);
     await newBattleChannel(page, 'E2E multi-turn battle');
 
     await fireBattle(page, '/battle Tabs or spaces for indentation? One short paragraph with a clear pick.');
@@ -151,8 +181,7 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     // actually PERSISTS to the BattleOutcome store — the click POSTs to the
     // battle-outcome API, and a 2xx is the durable last-write-wins DynamoDB record.
     test.setTimeout(9 * 60_000);
-    await signInAdmin(page);
-    await ensureBattleExperiment(page, { slot: 'slot-0' });
+    await activateBattleExperiment(page, BATTLE_EXP_ID);
     await newBattleChannel(page, 'E2E battle outcome recorded');
 
     await fireBattle(page, '/battle Tabs or spaces for indentation? One short paragraph with a clear pick.');
@@ -181,9 +210,9 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     page,
   }) => {
     test.setTimeout(4 * 60_000);
-    await signInAdmin(page);
 
-    // A premium channel with Battle Mode OFF (no enable step).
+    // A premium channel with Battle Mode OFF (no enable step). Auth comes from
+    // the shared storageState (no per-test sign-in); no experiment needed here.
     await page.locator('button.app-new-conversation-btn').click();
     await page.waitForSelector('.ncm-modal', { timeout: 8000 });
     const premiumCard = page.locator('.ncm-class-card:has-text("Premium")').first();
@@ -210,8 +239,8 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
 
   test('/battle is a start-of-message command, not a mid-sentence mention', async ({ page }) => {
     test.setTimeout(4 * 60_000);
-    await signInAdmin(page);
 
+    // Auth comes from the shared storageState (no per-test sign-in).
     await page.locator('button.app-new-conversation-btn').click();
     await page.waitForSelector('.ncm-modal', { timeout: 8000 });
     await page.locator('.ncm-class-card').first().click();
@@ -238,9 +267,8 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     // battle path; give it a wide budget.
     test.setTimeout(14 * 60_000);
 
-    await signInAdmin(page);
     // Its own experiment with an image-gen model on BOTH variants (SPEC-BATTLE generation-out).
-    await ensureBattleExperiment(page, { slot: 'slot-0', expId: BATTLE_IMAGE_EXP_ID, image: true });
+    await activateBattleExperiment(page, BATTLE_IMAGE_EXP_ID);
     await newBattleChannel(page, 'E2E image battle', BATTLE_IMAGE_EXP_ID);
 
     const count = await fireBattle(page, '/battle Generate an image of a serene mountain lake at sunrise.');
@@ -266,8 +294,7 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     page,
   }) => {
     test.setTimeout(10 * 60_000);
-    await signInAdmin(page);
-    await ensureBattleExperiment(page, { slot: 'slot-0' }); // text battle
+    await activateBattleExperiment(page, BATTLE_EXP_ID); // text battle
     await newBattleChannel(page, 'E2E ambiguous battle');
 
     // The redesign removed battle clarification prompting: an ambiguous /battle no longer routes a
