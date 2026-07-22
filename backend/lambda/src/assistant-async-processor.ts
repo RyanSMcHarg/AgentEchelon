@@ -769,6 +769,9 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       intent: event.intent,
       variantImageModelKey: event.battleContext?.variantImageModelKey,
       battleImageGenModelId: event.battleContext?.imageGenModelId,
+      // Non-battle image experiment: the resolved variant's image model (router → event) wins over the
+      // profile default on an image_generation turn, so normal traffic A/Bs the variants' image models.
+      experimentImageModelKey: event.resolvedImageModelKey,
       profileImageModelKey: active.imageModelKey,
     });
     const genOutPlan = resolveGenerationOutPlan({ imageGenModelId: genOutModelId });

@@ -371,6 +371,11 @@ export interface AsyncProcessorEvent {
   resolvedModel?: string;
   fallbackModel?: string;
 
+  // The resolved experiment variant's IMAGE model (ImageGenModelKey), when an image_generation
+  // experiment binds this turn. Serves the variant's image model in the NORMAL (non-battle) flow,
+  // parallel to `resolvedModel` for text. Absent ⇒ the profile's models.image is used.
+  resolvedImageModelKey?: string;
+
   // A/B experiment tracking
   experimentId?: string;
   variantId?: string;
@@ -2951,24 +2956,31 @@ function imageGenKeyToBedrockId(key: string | undefined): string | undefined {
  *   1. the battle variant's image model (`variantImageModelKey`) — an image battle compares the two
  *      variants' image models; preferred over the profile so each side runs its assigned image model;
  *   2. the legacy battle `imageGenModelId` (resolveBattleImageGenPair path) — kept working, unchanged;
- *   3. the active profile's `models.image` (`profileImageModelKey`), ONLY on an `image_generation` turn
- *      — this is the NORMAL, non-battle image path.
- * Battle-sourced ids (1, 2) apply only when `battleOn`; the profile path is intent-gated. Returns
- * undefined ⇒ a text turn. The caller feeds the result to {@link resolveGenerationOutPlan} for registry
- * validation, so an unknown key here still resolves to a `'text'` plan (honest, never fabricated).
+ *   3. the NON-battle experiment variant's image model (`experimentImageModelKey`), ONLY on an
+ *      `image_generation` turn — an image experiment A/Bs its variants' image models on normal traffic,
+ *      so the assigned variant's image model wins over the profile default (battle is just UI+scoring on
+ *      top; the resolved model is the same either way);
+ *   4. the active profile's `models.image` (`profileImageModelKey`), ONLY on an `image_generation` turn
+ *      — this is the NORMAL, no-experiment image path.
+ * Battle-sourced ids (1, 2) apply only when `battleOn`; the experiment and profile paths are
+ * intent-gated. Returns undefined ⇒ a text turn. The caller feeds the result to
+ * {@link resolveGenerationOutPlan} for registry validation, so an unknown key here still resolves to a
+ * `'text'` plan (honest, never fabricated).
  */
 export function resolveTurnImageGenModelId(input: {
   battleOn: boolean;
   intent?: string;
   variantImageModelKey?: string;
   battleImageGenModelId?: string;
+  experimentImageModelKey?: string;
   profileImageModelKey?: string;
 }): string | undefined {
   const variantId = input.battleOn ? imageGenKeyToBedrockId(input.variantImageModelKey) : undefined;
   const legacyBattleId = input.battleOn ? input.battleImageGenModelId : undefined;
-  const profileId =
-    input.intent === 'image_generation' ? imageGenKeyToBedrockId(input.profileImageModelKey) : undefined;
-  return variantId ?? legacyBattleId ?? profileId;
+  const isImageTurn = input.intent === 'image_generation';
+  const experimentId = isImageTurn ? imageGenKeyToBedrockId(input.experimentImageModelKey) : undefined;
+  const profileId = isImageTurn ? imageGenKeyToBedrockId(input.profileImageModelKey) : undefined;
+  return variantId ?? legacyBattleId ?? experimentId ?? profileId;
 }
 
 /**

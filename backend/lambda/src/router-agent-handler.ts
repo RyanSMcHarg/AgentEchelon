@@ -670,6 +670,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     let experimentId: string | undefined;
     let variantId: string | undefined;
     let resolvedModel: string | undefined;
+    let resolvedImageModelKey: string | undefined;
 
     if (channelArn && classification.intent !== IntentType.GREETING && classification.intent !== IntentType.ACKNOWLEDGMENT) {
       try {
@@ -679,7 +680,10 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
           experimentId = experiment.experimentId;
           variantId = experiment.variantId;
           resolvedModel = experiment.bedrockModelId;
-          console.log('[Router] Experiment resolved', { experimentId, variantId, modelKey: experiment.modelKey });
+          // Image experiment: the variant's image model serves the image_generation turn in the normal
+          // flow (the worker's resolveTurnImageGenModelId honors it above the profile's models.image).
+          resolvedImageModelKey = experiment.imageGenModelKey;
+          console.log('[Router] Experiment resolved', { experimentId, variantId, modelKey: experiment.modelKey, imageGenModelKey: experiment.imageGenModelKey });
         }
       } catch (error) {
         console.error('[Router] Experiment resolution failed (continuing without):', error);
@@ -884,6 +888,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
             intentConfidence: classification.confidence,
             deliveryOption,
             ...(resolvedModel && { resolvedModel }),
+            ...(resolvedImageModelKey && { resolvedImageModelKey }),
             ...(experimentId && { experimentId }),
             ...(variantId && { variantId }),
             ...(retrievedContext && { retrievedContext }),
@@ -928,6 +933,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
         ...(placeholderSummary && { conversationSummary: placeholderSummary }),
         deliveryOption: deliveryOptionName,
         ...(resolvedModel && { resolvedModel }),
+        ...(resolvedImageModelKey && { resolvedImageModelKey }),
         ...(experimentId && { experimentId }),
         ...(variantId && { variantId }),
         ...(hasResponseSettings && { responseSettings }),

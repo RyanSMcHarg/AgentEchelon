@@ -59,6 +59,29 @@ describe('resolveExperimentModel — type ordering', () => {
     expect(res?.modelKey).toBe('sonnet');
   });
 
+  it('resolves an image_generation experiment on the RAW intent and carries the variant image model', async () => {
+    // image_generation is NOT a text RouteKey (it normalizes to general_qa), so the resolver must match
+    // it on the raw intent string. The assigned variant's imageGenModelKey rides the resolution so the
+    // NORMAL flow serves the variant's image model (non-battle image A/B).
+    mockSend.mockResolvedValueOnce({
+      Items: [
+        {
+          experimentId: 'exp-img', status: 'active', experimentType: 'intent', intent: 'image_generation',
+          tiers: ['premium'],
+          variants: [
+            { variantId: 'control', modelKey: 'sonnet', imageGenModelKey: 'stability_image_core', weight: 100 },
+            { variantId: 'treatment', modelKey: 'sonnet', imageGenModelKey: 'stability_image_ultra', weight: 0 },
+          ],
+        },
+      ],
+    } as unknown as QueryCommandOutput);
+    const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
+    const res = await resolveExperimentModel('premium', 'image_generation', 'arn:chan', catalog);
+    expect(res?.experimentId).toBe('exp-img');
+    expect(res?.variantId).toBe('control');
+    expect(res?.imageGenModelKey).toBe('stability_image_core');
+  });
+
   it('matches an intent experiment when the router passes the RAW classifier intent', async () => {
     // Regression (#9): the router calls resolveExperimentModel with the coarse
     // classifier intent ('general'), but the admin stores experiments with the

@@ -136,6 +136,13 @@ export interface ExperimentResolution {
   variantId: string;
   modelKey: BackendModelKey;
   bedrockModelId: string;
+  /**
+   * The assigned variant's IMAGE-generation model (`imageGenModelKey`), when set. Lets the NORMAL
+   * (non-battle) flow serve a variant's image model on an `image_generation` turn - so an image
+   * experiment A/Bs its variants' image models exactly like a text experiment A/Bs their text models,
+   * and battle is just the extra UI+scoring on top. Undefined for a text-only variant.
+   */
+  imageGenModelKey?: ImageGenModelKey;
 }
 
 // ============================================================
@@ -245,7 +252,13 @@ export async function resolveExperimentModel(
   const routeKey = intentTypeToRouteKey(intent);
   const experiment =
     experiments.find(
-      (exp) => (exp.experimentType ?? 'intent') === 'intent' && exp.intent === routeKey && isLiveForClassification(exp),
+      // Text intents match via the normalized route key; `image_generation` is NOT a text RouteKey
+      // (it isn't in INTENT_TYPE_TO_ROUTE_KEY, so routeKey falls through to general_qa), so it matches
+      // on the raw intent string instead - letting an image_generation experiment bind an image turn.
+      (exp) =>
+        (exp.experimentType ?? 'intent') === 'intent' &&
+        (exp.intent === routeKey || exp.intent === intent) &&
+        isLiveForClassification(exp),
     ) ??
     experiments.find(
       (exp) =>
@@ -339,6 +352,9 @@ async function resolveVariantForProfile(
     variantId: variant.variantId,
     modelKey: effectiveModelKey,
     bedrockModelId: bedrockInvokeId(model),
+    // Carry the variant's image model so an image_generation turn serves it in the normal flow
+    // (a profileRef variant carries its image model via its profile's models.image, not here).
+    ...(variant.imageGenModelKey && { imageGenModelKey: variant.imageGenModelKey }),
   };
 }
 

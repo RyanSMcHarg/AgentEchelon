@@ -67,14 +67,15 @@ const IMAGE_GEN_MODEL_OPTIONS = [
 
 const TIER_OPTIONS = ['basic', 'standard', 'premium'] as const;
 
-// An image (generation-out) battle only makes sense when the experiment is about
-// generating images. For an intent-scoped experiment that means the intent is
-// `image_generation`; base_model / classification / profile experiments are not
-// pinned to one intent, so they may opt into an image battle explicitly. When this
-// is false the per-variant image-gen selectors are hidden (a text intent must never
-// display an image model) and the battle is always a text battle.
-function isImageBattleEligible(experimentType: string, intent: string): boolean {
-  return experimentType !== 'intent' || intent === 'image_generation';
+// Per-variant image-gen model selection applies ONLY to an intent experiment whose intent is
+// `image_generation` - there each variant is a DIFFERENT image model, which is the real comparison, and
+// the normal (non-battle) flow serves the assigned variant's image model. Base-model and classification
+// experiments vary a text model, so an image prompt would run the SAME image model on both sides
+// (same-vs-same, useless). Profile-vs-Profile carries each side's image model via its profile's
+// models.image, so it needs no explicit selector here. Battle is just extra UI + scoring on top - it
+// does not change WHERE image models are relevant.
+function isImageIntentExperiment(experimentType: string, intent: string): boolean {
+  return experimentType === 'intent' && intent === 'image_generation';
 }
 
 const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading: _isLoading, registerBack }) => {
@@ -152,22 +153,16 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
       setActionError('Experiment ID is required');
       return;
     }
-    // Image (generation-out) models only apply when the experiment is about image
-    // generation; for any other intent the selectors are hidden, so drop any stale
-    // key rather than shipping "OpenAI for code generation".
-    const imageBattleEligible = isImageBattleEligible(newExperiment.experimentType, newExperiment.intent);
-    const controlImageGenModelKey = imageBattleEligible ? newExperiment.controlImageGenModelKey : '';
-    const treatmentImageGenModelKey = imageBattleEligible ? newExperiment.treatmentImageGenModelKey : '';
+    // Per-variant image models apply only to an image_generation intent experiment; for any other
+    // experiment they are hidden, so drop any stale key rather than shipping "OpenAI for code generation".
+    const isImageIntent = isImageIntentExperiment(newExperiment.experimentType, newExperiment.intent);
+    const controlImageGenModelKey = isImageIntent ? newExperiment.controlImageGenModelKey : '';
+    const treatmentImageGenModelKey = isImageIntent ? newExperiment.treatmentImageGenModelKey : '';
 
-    // Generation-out is both-or-neither (server enforces too —
-    // this just fails fast locally with a clear message).
-    if (
-      newExperiment.battleEnabled &&
-      !!controlImageGenModelKey !== !!treatmentImageGenModelKey
-    ) {
-      setActionError(
-        'Generation-out battle: set an image-gen model on BOTH variants, or neither (for a text battle).',
-      );
+    // An image_generation experiment compares the two variants' image models, so BOTH are required
+    // (the image model IS the variant here, battle or not). Fail fast locally with a clear message.
+    if (isImageIntent && (!controlImageGenModelKey || !treatmentImageGenModelKey)) {
+      setActionError('Image experiment: pick an image-gen model for BOTH variants.');
       return;
     }
 
@@ -178,34 +173,40 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
       setActionError('Profile experiment: pick a profile for both the control and treatment variants.');
       return;
     }
+    // For an image_generation experiment the compared model is the IMAGE model; the text modelKey is only
+    // the base/rebuttal model (a battle round-2 rebuttal is text). The variant's text dropdown is hidden,
+    // so pin it to a universally tier-allowed model ('haiku') - otherwise a default like sonnet would fail
+    // the tier-safety check on basic and silently drop the whole image experiment.
+    const textModelFor = (m: string) => (isImageIntent ? 'haiku' : m);
     const runFor = (model: string, profile: string, version: string) =>
       isProfileExp
         ? { profileRef: { profileName: profile, ...(version ? { version: Number(version) } : {}) } }
-        : { modelKey: model };
+        : { modelKey: textModelFor(model) };
 
     const variants: ExperimentVariant[] = [
       {
         variantId: 'control',
         ...runFor(newExperiment.controlModel, newExperiment.controlProfile, newExperiment.controlProfileVersion),
         weight: newExperiment.controlWeight,
+        // Image model is a NORMAL variant property (served in the non-battle flow too), not battle-only.
+        ...(controlImageGenModelKey && {
+          imageGenModelKey: controlImageGenModelKey as ImageGenModelKey,
+        }),
         ...(newExperiment.battleEnabled && {
           displayName: newExperiment.controlDisplayName,
           systemPromptAddendum: newExperiment.controlAddendum || undefined,
-          ...(controlImageGenModelKey && {
-            imageGenModelKey: controlImageGenModelKey as ImageGenModelKey,
-          }),
         }),
       },
       {
         variantId: 'treatment',
         ...runFor(newExperiment.treatmentModel, newExperiment.treatmentProfile, newExperiment.treatmentProfileVersion),
         weight: 100 - newExperiment.controlWeight,
+        ...(treatmentImageGenModelKey && {
+          imageGenModelKey: treatmentImageGenModelKey as ImageGenModelKey,
+        }),
         ...(newExperiment.battleEnabled && {
           displayName: newExperiment.treatmentDisplayName,
           systemPromptAddendum: newExperiment.treatmentAddendum || undefined,
-          ...(treatmentImageGenModelKey && {
-            imageGenModelKey: treatmentImageGenModelKey as ImageGenModelKey,
-          }),
         }),
       },
     ];
@@ -319,10 +320,10 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
     );
   }
 
-  // Only surface the per-variant image-gen selectors when an image battle is coherent:
-  // an image-generation intent, or a non-intent experiment that opts in explicitly. A text
-  // intent (e.g. Code Generation) never displays an image model.
-  const showImageGenSelectors = isImageBattleEligible(newExperiment.experimentType, newExperiment.intent);
+  // Per-variant image-gen model is a NORMAL variant control, shown only for an image_generation intent
+  // experiment (each variant is a different image model). It lives with the variant models, NOT inside
+  // the battle card, because the normal flow serves it too - battle just adds scoring on top.
+  const showImageGenModels = isImageIntentExperiment(newExperiment.experimentType, newExperiment.intent);
 
   return (
     <div className="admin-tab">
@@ -431,17 +432,38 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
             ) : (
               <>
                 <label>
-                  Control Model
-                  <select value={newExperiment.controlModel} onChange={(e) => setNewExperiment((p) => ({ ...p, controlModel: e.target.value }))}>
-                    {MODEL_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-                  </select>
+                  Control {showImageGenModels ? 'Image Model' : 'Model'}
+                  {showImageGenModels ? (
+                    <select value={newExperiment.controlImageGenModelKey} onChange={(e) => setNewExperiment((p) => ({ ...p, controlImageGenModelKey: e.target.value }))}>
+                      <option value="">Select an image model…</option>
+                      {IMAGE_GEN_MODEL_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                    </select>
+                  ) : (
+                    <select value={newExperiment.controlModel} onChange={(e) => setNewExperiment((p) => ({ ...p, controlModel: e.target.value }))}>
+                      {MODEL_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                    </select>
+                  )}
                 </label>
                 <label>
-                  Treatment Model
-                  <select value={newExperiment.treatmentModel} onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentModel: e.target.value }))}>
-                    {MODEL_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
-                  </select>
+                  Treatment {showImageGenModels ? 'Image Model' : 'Model'}
+                  {showImageGenModels ? (
+                    <select value={newExperiment.treatmentImageGenModelKey} onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentImageGenModelKey: e.target.value }))}>
+                      <option value="">Select an image model…</option>
+                      {IMAGE_GEN_MODEL_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                    </select>
+                  ) : (
+                    <select value={newExperiment.treatmentModel} onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentModel: e.target.value }))}>
+                      {MODEL_OPTIONS.map((opt) => <option key={opt.value} value={opt.value}>{opt.label}</option>)}
+                    </select>
+                  )}
                 </label>
+                {showImageGenModels && (
+                  <p className="admin-field-hint" style={{ gridColumn: '1 / -1' }}>
+                    Each variant is a different image model; normal traffic serves the assigned variant's
+                    image model, and a battle runs both and scores them. Text turns and any battle rebuttal
+                    use the profile's normal model.
+                  </p>
+                )}
               </>
             )}
             <label>
@@ -562,7 +584,9 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                     placeholder="Display name (e.g. Atlas)"
                     maxLength={16}
                   />
-                  <span className="experiment-battle-variant-model">{newExperiment.controlModel}</span>
+                  <span className="experiment-battle-variant-model">
+                    {showImageGenModels ? (newExperiment.controlImageGenModelKey || 'no image model') : newExperiment.controlModel}
+                  </span>
                   <textarea
                     className="textarea input experiment-battle-variant-addendum"
                     value={newExperiment.controlAddendum}
@@ -571,19 +595,6 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                     maxLength={500}
                     rows={3}
                   />
-                  {showImageGenSelectors && (
-                    <select
-                      className="select input experiment-battle-variant-imagegen"
-                      aria-label="Control image-gen model"
-                      value={newExperiment.controlImageGenModelKey}
-                      onChange={(e) => setNewExperiment((p) => ({ ...p, controlImageGenModelKey: e.target.value }))}
-                    >
-                      <option value="">Text battle (no image generation)</option>
-                      {IMAGE_GEN_MODEL_OPTIONS.map((o) => (
-                        <option key={o.value} value={o.value}>{o.label}</option>
-                      ))}
-                    </select>
-                  )}
                 </div>
 
                 <div className="experiment-battle-vs" aria-hidden="true">VS</div>
@@ -598,7 +609,9 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                     placeholder="Display name (e.g. Echo)"
                     maxLength={16}
                   />
-                  <span className="experiment-battle-variant-model">{newExperiment.treatmentModel}</span>
+                  <span className="experiment-battle-variant-model">
+                    {showImageGenModels ? (newExperiment.treatmentImageGenModelKey || 'no image model') : newExperiment.treatmentModel}
+                  </span>
                   <textarea
                     className="textarea input experiment-battle-variant-addendum"
                     value={newExperiment.treatmentAddendum}
@@ -607,27 +620,13 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
                     maxLength={500}
                     rows={3}
                   />
-                  {showImageGenSelectors && (
-                    <select
-                      className="select input experiment-battle-variant-imagegen"
-                      aria-label="Treatment image-gen model"
-                      value={newExperiment.treatmentImageGenModelKey}
-                      onChange={(e) => setNewExperiment((p) => ({ ...p, treatmentImageGenModelKey: e.target.value }))}
-                    >
-                      <option value="">Text battle (no image generation)</option>
-                      {IMAGE_GEN_MODEL_OPTIONS.map((o) => (
-                        <option key={o.value} value={o.value}>{o.label}</option>
-                      ))}
-                    </select>
-                  )}
                 </div>
               </div>
 
-              {showImageGenSelectors && (
+              {showImageGenModels && (
                 <p className="experiment-battle-toggle-help">
-                  Image battle: set an image-gen model on BOTH variants and each one generates an
-                  image in round 1, then critiques the rival's image in the round-2 rebuttal. Leave
-                  both empty for a text battle (the server requires both or neither).
+                  Image battle: this experiment's two image models (set above) run head to head - each
+                  generates an image in round 1, then critiques the rival's image in the round-2 rebuttal.
                 </p>
               )}
 

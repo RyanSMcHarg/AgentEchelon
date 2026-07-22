@@ -131,4 +131,36 @@ describe('resolveTurnImageGenModelId — the normal-turn generation trigger', ()
     expect(id).toBeUndefined();
     expect(resolveGenerationOutPlan({ imageGenModelId: id }).action).toBe('text');
   });
+
+  // A non-battle image experiment: the resolved variant's image model serves the turn in the NORMAL
+  // flow, so probabilistic traffic A/Bs the variants' image models (battle is just UI+scoring on top).
+  it("a NON-battle experiment image model WINS over the profile's models.image", () => {
+    expect(
+      resolveTurnImageGenModelId({
+        battleOn: false,
+        intent: 'image_generation',
+        experimentImageModelKey: 'stability_image_ultra',
+        profileImageModelKey: 'stability_image_core',
+      }),
+    ).toBe(STABILITY_ULTRA);
+  });
+
+  it('the experiment image model only fires on an image_generation turn', () => {
+    for (const intent of ['general', 'report_generation', undefined]) {
+      expect(
+        resolveTurnImageGenModelId({ battleOn: false, intent, experimentImageModelKey: 'stability_image_ultra' }),
+      ).toBeUndefined();
+    }
+  });
+
+  it('a battle variant image model still wins over a non-battle experiment image model', () => {
+    expect(
+      resolveTurnImageGenModelId({
+        battleOn: true,
+        intent: 'image_generation',
+        variantImageModelKey: 'stability_image_core',
+        experimentImageModelKey: 'stability_image_ultra',
+      }),
+    ).toBe(STABILITY_CORE);
+  });
 });
