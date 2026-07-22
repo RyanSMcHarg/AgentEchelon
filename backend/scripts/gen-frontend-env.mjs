@@ -122,6 +122,11 @@ const OPTIONAL = new Set([
   'VITE_BATTLE_OUTCOME_API_URL',
   'VITE_EXPERIMENTS_API_URL',
   'VITE_ADMIN_CLIENT_ID',
+  // The standalone admin console is OPT-IN (`-c enableAdminApp=true`): without it there is no
+  // AgentEchelonAdminFrontend stack, so its `AdminDistributionUrl` output does not exist (see the
+  // OUTPUT_TO_VITE comment). A default `cdk deploy --all` must NOT hard-fail env generation over a
+  // console the deployer didn't ask for — omit the var (the chat app just hides the admin-console link).
+  'VITE_ADMIN_APP_URL',
   // Absent on stacks deployed before this output existed ⇒ omit (admin app treats
   // a missing flag as 'not enforced', matching the pre-A14 default).
   'VITE_ADMIN_IAM_ENFORCEMENT',
