@@ -2,7 +2,7 @@
   "project": "AgentEchelon",
   "license": "MIT",
   "purpose": "AgentEchelon is a governed, multi-party, multi-channel AI platform you deploy into your own AWS account. This context lets the assistant answer questions about the platform itself - what it is, how it works, and where a topic is documented.",
-  "overview": "**AgentEchelon is a governed, multi-party agentic AI platform that runs entirely in your own AWS account and serves internal and customer-facing use cases from one place.** A core feature is that agent governance can be enforced with the cloud's own primitives instead of a bolted-on policy engine. Every user, assistant, and conversation is an AWS resource with an ARN; every actor holds a bearer-pi",
+  "overview": "AgentEchelon is a governed, multi-party agentic AI platform that runs in your own AWS account and serves internal and customer-facing use cases from one place. A core feature is that agent governance can be enforced with AWS's own identity primitives instead of a bolted-on policy engine. Every user, assistant, and conversation is an AWS resource with an ARN; every actor holds a bearer-pinned ident",
   "answering_guidance": "Answer from these summaries and, when deployed in Aurora mode, from the retrieved full docs. Point the user at the named doc path for detail. Do not fabricate; if it is not here, say so.",
   "docs": [
     {
@@ -11,23 +11,13 @@
       "path": "README.md"
     },
     {
-      "title": "SPEC: Context-aware model routing (RoutingContext + provider adapter)",
-      "summary": "**Status:** Partial (`RoutingContext` runs on the standard profile; the provider-adapter seam is design)",
-      "path": "docs/design/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md"
-    },
-    {
-      "title": "Demo Company Spec: Stratum Technologies",
-      "summary": "**Status:** Implemented (the demo dataset and seed script ship)",
-      "path": "docs/design/SPEC-DEMO-COMPANY.md"
-    },
-    {
-      "title": "Federated Participants - bring external people in, safely, from any identity provider",
-      "summary": "**Status:** Design (a wired, opt-in seam; not the shipped experience)",
-      "path": "docs/design/SPEC-FEDERATED-PARTICIPANTS.md"
+      "title": "AgentEchelon Documentation",
+      "summary": "The map of everything under `docs/`. For what AgentEchelon is and why, start at the root [`README.md`](../README.md) and [`overview/PLATFORM-OVERVIEW.md`](overview/PLATFORM-OVERVIEW.md) - this page does not repeat the overview, it points you to the right document for a task.",
+      "path": "docs/DOCUMENTATION.md"
     },
     {
       "title": "Admin Console Guide",
-      "summary": "How operators use the AgentEchelon admin dashboard to check platform health, review how the assistants are performing, and administer conversations. Written to be portable - it describes behaviour, not any specific AWS account.",
+      "summary": "How operators use the AgentEchelon admin dashboard to check platform health, review how the assistants are performing, and administer conversations. Written to be portable - it describes behavior, not any specific AWS account.",
       "path": "docs/guides/admin/ADMIN-GUIDE.md"
     },
     {
@@ -82,7 +72,7 @@
     },
     {
       "title": "How to add or manage an assistant profile",
-      "summary": "A practical guide for two adjacent tasks the capability-profiles model ([SPEC-PER-PROFILE-OWNERSHIP.md](../../specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md)) makes routine:",
+      "summary": "A practical guide for two adjacent tasks the capability-profiles model ([SPEC-PER-PROFILE-OWNERSHIP.md](../../specs/interaction/assistant-config/SPEC-PER-PROFILE-OWNERSHIP.md)) makes routine:",
       "path": "docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md"
     },
     {
@@ -97,7 +87,7 @@
     },
     {
       "title": "Message flow - how a message travels, who touches it, and why",
-      "summary": "AgentEchelon is a **multiparty** substrate: humans and assistants share Amazon Chime SDK channels. The flow below is what lets a channel be a plain human-to-human room, a 1:1 human↔assistant chat, or a mixed room where the assistant answers only when addressed - all with the same primitives, differing only in **bot configuration**",
+      "summary": "AgentEchelon is a **multiparty** substrate: humans and assistants share Amazon Chime SDK channels. The flow below is what lets a channel be a plain human-to-human room, a 1:1 human↔assistant chat, or a mixed room where the assistant answers only when addressed - all with the same primitives, differing only in **bot configuration** and **who is addressed**.",
       "path": "docs/guides/developer/MESSAGE-FLOW.md"
     },
     {
@@ -122,7 +112,7 @@
     },
     {
       "title": "Demo setup and post-deploy validation",
-      "summary": "A runbook for standing up the **Stratum Technologies** demo and running the end-to-end validation that exercises every tier flow with real (measured, recorded) conversations, then verifies the admin dashboard. This is the POC surface: read it to understand how the platform behaves, and modify the demo data / tests for your own use case. For the demo company design, see",
+      "summary": "A runbook for standing up the **Stratum Technologies** demo and running the end-to-end validation that exercises every tier flow with real (measured, recorded) conversations, then verifies the admin dashboard. This is the POC surface: read it to understand how the platform behaves, and modify the demo data / tests for your own use case. For the demo company design, see [`SPEC-DEMO-COMPANY.md`](../",
       "path": "docs/guides/user/DEMO-AND-VALIDATION.md"
     },
     {
@@ -146,9 +136,19 @@
       "path": "docs/overview/ARCHITECTURE.md"
     },
     {
+      "title": "Personas",
+      "summary": "The canonical people AgentEchelon serves. Specs reference these by name and link here; they do NOT re-define personas inline. This is the single source of truth for who the product is for.",
+      "path": "docs/overview/PERSONAS.md"
+    },
+    {
       "title": "AgentEchelon Overview",
-      "summary": "**AgentEchelon is a governed, multi-party agentic AI platform that runs entirely in your own AWS account and serves internal and customer-facing use cases from one place.** A core feature is that agent governance can be enforced with the cloud's own primitives instead of a bolted-on policy engine. Every user, assistant, and conversation is an AWS resource with an ARN; every actor holds a bearer-pi",
+      "summary": "AgentEchelon is a governed, multi-party agentic AI platform that runs in your own AWS account and serves internal and customer-facing use cases from one place. A core feature is that agent governance can be enforced with AWS's own identity primitives instead of a bolted-on policy engine. Every user, assistant, and conversation is an AWS resource with an ARN; every actor holds a bearer-pinned ident",
       "path": "docs/overview/PLATFORM-OVERVIEW.md"
+    },
+    {
+      "title": "Site map: product surfaces to the specs behind them",
+      "summary": "Every surface a participant actually touches, mapped to the spec that defines it and the platform layer underneath. The layer tree it mirrors is in [`../DOCUMENTATION.md`](../DOCUMENTATION.md); the composition model is [`../specs/interaction/SPEC-INTERACTION-LAYER.md`](../specs/interaction/SPEC-INTERACTION-LAYER.md). Personas are defined once in [`PERSONAS.md`](PERSONAS.md).",
+      "path": "docs/overview/SITE-MAP.md"
     },
     {
       "title": "AgentEchelon Tenets",
@@ -156,159 +156,219 @@
       "path": "docs/overview/TENETS.md"
     },
     {
-      "title": "AgentEchelon documentation",
-      "summary": "The navigable map of everything under `docs/`, organized by **what you are trying to do**. The authoritative project overview and quickstart live in the root [`README.md`](../README.md); start there if you have not.",
-      "path": "docs/README.md"
+      "title": "DESIGN-ASSISTANT: Meetings assistant",
+      "summary": "**Status:** Draft / planning - the design is not finalized and nothing is built.",
+      "path": "docs/specs/applications/DESIGN-ASSISTANT-MEETINGS.md"
     },
     {
-      "title": "SPEC - Admin Console (design)",
-      "summary": "**Status:** Design (the admin-console design; for using it, see the admin guide)",
-      "path": "docs/specs/admin-console/SPEC-ADMIN-CONSOLE.md"
+      "title": "SPEC-ASSISTANT: Meetings assistant",
+      "summary": "**Status:** Draft / planning - the design is not finalized and nothing is built.",
+      "path": "docs/specs/applications/SPEC-ASSISTANT-MEETINGS.md"
     },
     {
-      "title": "SPEC: Separate Admin Console App",
-      "summary": "**Status:** P0-P3 BUILT. P0-P1: the standalone admin app + the chat-app cutover. P2: the frontend is an npm-workspaces monorepo (`@ae/shared`, `@ae/chat`, `@ae/admin`) - shared code (types, apiCall with an injectable token provider, AuthProvider, the reused credential-exchange client, i18n) factored into `@ae/shared`, `chimeService` split into chat messaging (`@ae/chat`) + admin actions (`@ae/admi",
-      "path": "docs/specs/admin-console/SPEC-SEPARATE-ADMIN-APP.md"
+      "title": "Demo Company Spec: Stratum Technologies",
+      "summary": "**Status:** Implemented (the demo dataset and seed script ship)",
+      "path": "docs/specs/applications/SPEC-DEMO-COMPANY.md"
     },
     {
-      "title": "SPEC: Abuse Controls (rate limiting, spend budgets, request dedup)",
-      "summary": "**Status:** Implemented (all phases). `lib/abuse-controls.ts` holds the logic, wired into all three tiers via `agent-classification-common.abuseControlsWiring`: request dedup (guard in `runSharedPipeline` + stable `correlationId` from `CHIME.message.id`), per-user/global spend budget with a fail-safe global ceiling, an SSM circuit trip, a per-tier hourly rate limit, and an inbound length cap. Acti",
-      "path": "docs/specs/analytics-eval/SPEC-ABUSE-CONTROLS.md"
+      "title": "DESIGN: Battle Mode (`/battle`) - Technical Design",
+      "summary": "**Status:** Implemented (premium-gated) **Layer:** Core platform (capability - a platform feature, not an interaction pillar; its MECHANISM lives here, its variant CONFIG is assistant-config, pillar 2) **Plane:** core **Product spec:** [SPEC-BATTLE.md](./SPEC-BATTLE.md)",
+      "path": "docs/specs/capabilities/DESIGN-BATTLE.md"
     },
     {
-      "title": "SPEC: Optional Aurora PostgreSQL + VPC Deployment Mode",
-      "summary": "**Status:** Implemented (opt-in deployment mode)",
-      "path": "docs/specs/analytics-eval/SPEC-AURORA-VPC-MODE.md"
+      "title": "DESIGN: Multi-Agent Orchestration",
+      "summary": "**Status:** Design (alignment doc). This proposes a recommended structure and a set of explicit decisions to confirm. It is not a finalized build; every \"Recommendation\" below is a starting position pending sign-off, not a committed design.",
+      "path": "docs/specs/capabilities/DESIGN-MULTI-AGENT-ORCHESTRATION.md"
     },
     {
-      "title": "SPEC: Cost Sleep Mode (auto-sleep / wake)",
-      "summary": "**Status:** Implemented (Aurora-mode, opt-in `-c sleepMode=true`). Wired in `bin/backend.ts` (reads the `sleepMode` / `sleepAfterIdle` / `sleepCheckRate` / `sleepRecipients` context), provisioned by `analytics-stack-aurora.ts`, with the runtime in `lambda/src/deployment-sleep.ts` + `lib/sleep-mode.ts`. **Scope:** A deploy-time opt-in that auto-pauses the Aurora data plane after a configurable idle",
-      "path": "docs/specs/analytics-eval/SPEC-COST-SLEEP-MODE.md"
+      "title": "SPEC: Battle Mode (`/battle`) - Product Specification",
+      "summary": "**Status:** Implemented (premium-gated) **Layer:** Core platform (capability - a platform feature, not an interaction pillar; its MECHANISM lives here, its variant CONFIG is assistant-config, pillar 2) **Plane:** core **Technical design:** [DESIGN-BATTLE.md](./DESIGN-BATTLE.md)",
+      "path": "docs/specs/capabilities/SPEC-BATTLE.md"
     },
     {
       "title": "SPEC: Drift Detection",
-      "summary": "**Status:** Implemented (Aurora mode; the live-suggestion path is behind `enableLiveDrift`)",
-      "path": "docs/specs/analytics-eval/SPEC-DRIFT-CONVERGENCE.md"
+      "summary": "**Status:** Implemented (Aurora mode; the live-suggestion path is behind `enableLiveDrift`).",
+      "path": "docs/specs/capabilities/SPEC-DRIFT-CONVERGENCE.md"
+    },
+    {
+      "title": "Cross-Channel Task Continuity",
+      "summary": "**Status:** Implemented.",
+      "path": "docs/specs/communication/CROSS-CHANNEL-TASKS.md"
+    },
+    {
+      "title": "SPEC: Conversation Archive and Member Removal (moderator)",
+      "summary": "**Status:** Implemented.",
+      "path": "docs/specs/communication/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md"
+    },
+    {
+      "title": "SPEC: Compact message metadata - a coded codebook + out-of-band lookup",
+      "summary": "**Status:** Partial (out-of-band lookup and the cap-shedding backstop ship; the coded-state codebook is design).",
+      "path": "docs/specs/communication/SPEC-MESSAGE-METADATA-CODEBOOK.md"
+    },
+    {
+      "title": "SPEC: Conversation ↔ transport notification bridge (email now; SMS + voice/PSTN next)",
+      "summary": "**Status:** Implemented (outbound email hand-off); inbound reply loop Planned.",
+      "path": "docs/specs/communication/SPEC-NOTIFICATION-BRIDGE.md"
     },
     {
       "title": "Assistant Configuration - what the assistant *is*, per experience",
-      "summary": "**Status:** Partial (the per-tier config seams ship; the unified `AssistantConfig` bundle is the design target)",
-      "path": "docs/specs/assistant-context/SPEC-ASSISTANT-CONFIG.md"
+      "summary": "**Status:** In progress (unification underway). The per-classification config seams ship; the unified `AssistantConfig` bundle is now landing on the versioned profile definition ([`SPEC-PORTABLE-PROFILES.md`](SPEC-PORTABLE-PROFILES.md)). The versioned definition carries a per-profile **`models` bundle** (`default` plus optional `classifier` / `complex` / `byIntent` overrides), a per-profile **`too",
+      "path": "docs/specs/interaction/assistant-config/SPEC-ASSISTANT-CONFIG.md"
     },
     {
       "title": "SPEC: Bilingual conversations (reply-language, pivot, dual delivery)",
-      "summary": "**Status:** Partial (reply-language ships; the inference pivot and dual delivery are design)",
-      "path": "docs/specs/assistant-context/SPEC-BILINGUAL-CONVERSATIONS.md"
+      "summary": "**Status:** Partial (reply-language ships; the inference pivot and dual delivery are design).",
+      "path": "docs/specs/interaction/assistant-config/SPEC-BILINGUAL-CONVERSATIONS.md"
     },
     {
       "title": "SPEC: Configurable intent pack (per-deployment intent taxonomy)",
-      "summary": "**Status:** Implemented (the taxonomy mechanism; the domain taxonomy is per-deployment config)",
-      "path": "docs/specs/assistant-context/SPEC-CONFIGURABLE-INTENT-PACK.md"
+      "summary": "**Status:** Implemented (the taxonomy mechanism; the domain taxonomy is per-deployment config).",
+      "path": "docs/specs/interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md"
+    },
+    {
+      "title": "SPEC: Context-aware model routing (RoutingContext + provider adapter)",
+      "summary": "**Status:** Partial (`RoutingContext` runs on the standard profile; the provider-adapter seam is design)",
+      "path": "docs/specs/interaction/assistant-config/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md"
     },
     {
       "title": "SPEC: Per-profile ownership (`AgentEchelonClassification-*`)",
-      "summary": "**Status:** Implemented",
-      "path": "docs/specs/assistant-context/SPEC-PER-PROFILE-OWNERSHIP.md"
+      "summary": "**Status:** Implemented.",
+      "path": "docs/specs/interaction/assistant-config/SPEC-PER-PROFILE-OWNERSHIP.md"
+    },
+    {
+      "title": "SPEC: Portable, versioned assistant profiles",
+      "summary": "**Status:** Implemented and deployed. The versioning lifecycle (create / edit / activate / rollback), A/B and battle over any profile version (`profileRef`), and export / import with manifest signing are built - `lib/profile-lifecycle.ts`, `lib/profile-manifest.ts`, `lib/profile-version-lookup.ts`, `manage-profiles.ts`, and the admin Profiles tab. Extends `SPEC-PER-PROFILE-OWNERSHIP.md` and `SPEC-",
+      "path": "docs/specs/interaction/assistant-config/SPEC-PORTABLE-PROFILES.md"
     },
     {
       "title": "SPEC: User profile store and once-per-user onboarding",
       "summary": "**Status:** Implemented (pending live deploy + e2e validation)",
-      "path": "docs/specs/assistant-context/SPEC-USER-PROFILE-AND-ONBOARDING.md"
+      "path": "docs/specs/interaction/assistant-config/SPEC-USER-PROFILE-AND-ONBOARDING.md"
     },
     {
-      "title": "Cross-Channel Task Continuity",
-      "summary": "**Status:** Implemented",
-      "path": "docs/specs/conversation-messaging/CROSS-CHANNEL-TASKS.md"
+      "title": "SPEC: Welcome flow and assistant context",
+      "summary": "**Status:** Partial (the welcome wiring ships; later context phases are design).",
+      "path": "docs/specs/interaction/assistant-config/SPEC-WELCOME-AND-CONTEXT.md"
     },
     {
-      "title": "SPEC: Conversation Archive and Member Removal (moderator)",
-      "summary": "**Status:** Implemented. Archive mechanism per [ADR-017](../../design/decisions/017-conversation-archive-mechanism.md) - Option 1 (mark archived + read-only via an immutable tag), composed with the conversation-type 90-day Amazon Chime SDK expiration TTL. This spec details the behavior and the identity/credential model.",
-      "path": "docs/specs/conversation-messaging/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md"
+      "title": "Access & Controls Auditing - an append-only record of who could act, and what changed",
+      "summary": "**Status:** Implemented (audit capture and the membership-history view; forward extensions noted inline).",
+      "path": "docs/specs/interaction/auditing/SPEC-ACCESS-AND-CONTROLS-AUDITING.md"
+    },
+    {
+      "title": "SPEC: Connectors - integrate with the business's systems, don't replace them",
+      "summary": "**Status:** Design (the schema seam ships; the runtime path is not built). The connector schema lives in config today (`conversation-types.ts` + `connectors.ts`); this spec is the contract those seams point at, promoted out of `../conversation-config/SPEC-CONVERSATION-TYPES.md` section 6.",
+      "path": "docs/specs/interaction/connectors/SPEC-CONNECTORS.md"
     },
     {
       "title": "Conversation Configuration - a conversation is a configurable experience",
-      "summary": "**Status:** Partial (the `classification` type seam and the dimension/connector schemas ship and default to the tier today; the full conversation-type flexibility is the design target)",
-      "path": "docs/specs/conversation-messaging/SPEC-CONVERSATION-TYPES.md"
+      "summary": "**Status:** Partial (the `classification` type seam and the dimension/connector schemas ship and default to the profile today; the full conversation-type flexibility is the design target).",
+      "path": "docs/specs/interaction/conversation-config/SPEC-CONVERSATION-TYPES.md"
+    },
+    {
+      "title": "DESIGN: Admin-Action IAM Enforcement",
+      "summary": "**Status:** Built, flag-gated (opt-in), deployed and validated on the on-flag path. **Layer:** Interaction **Pillar:** Identity & Access **Plane:** admin **Product spec:** [`SPEC-ADMIN-IDENTITY.md`](SPEC-ADMIN-IDENTITY.md) (the capability model, personas, and fail-closed requirement this implements). **Summary:** Every privileged archive/analytics admin action is expressed as a named capability ma",
+      "path": "docs/specs/interaction/identity-access/admin/DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md"
+    },
+    {
+      "title": "DESIGN: Admin Agent and Admin Notification Channel",
+      "summary": "**Status:** Design (not yet built). This design supersedes an initial admin-notification-channel attempt (the stack at `backend/lib/stacks/admin-notification-stack.ts` and its handler `admin-notification-channel-provision.ts`), which created and posted to the channel as the service app-instance-admin. That identity cannot legitimately post to the channel (section 4), so it is being reworked to the",
+      "path": "docs/specs/interaction/identity-access/admin/DESIGN-ADMIN-AGENT-NOTIFICATIONS.md"
+    },
+    {
+      "title": "SPEC: Admin Identity",
+      "summary": "**Status:** Implemented (with a small set of tracked gaps, section 6) **Layer:** Interaction **Pillar:** Identity & Access **Plane:** admin **Summary:** A capability model that decides who may perform a privileged action, proves who performed it, and never over-grants, by splitting every operator into a membership-gated chat identity and a separate, just-in-time admin identity. **Technical designs",
+      "path": "docs/specs/interaction/identity-access/admin/SPEC-ADMIN-IDENTITY.md"
+    },
+    {
+      "title": "Access control by example: blocked interactions, the policy that blocks them, and the experience",
+      "summary": "**Status:** Implemented (reference: worked examples of the live IAM enforcement).",
+      "path": "docs/specs/interaction/identity-access/core/ACCESS-CONTROL-BY-EXAMPLE.md"
+    },
+    {
+      "title": "Identity & Access Model",
+      "summary": "**Status:** Implemented (reference: the live identity and access model).",
+      "path": "docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md"
+    },
+    {
+      "title": "SPEC: Add a user to a conversation (eligible-member invite and assistant escalation)",
+      "summary": "**Status:** DESIGN (not yet built).",
+      "path": "docs/specs/interaction/identity-access/core/SPEC-ADD-USER-ESCALATION.md"
+    },
+    {
+      "title": "Conversation Security, Membership, and Information Isolation",
+      "summary": "**Status:** Implemented (Layers 1-6 are live; Layer 7 mixed-trust visibility is partial).",
+      "path": "docs/specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md"
+    },
+    {
+      "title": "Identity & Access - anyone participates at the right capability, only as themselves",
+      "summary": "**Status:** Implemented.",
+      "path": "docs/specs/interaction/identity-access/core/SPEC-CREDENTIAL-EXCHANGE.md"
+    },
+    {
+      "title": "Federated Participants - bring external people in, safely, from any identity provider",
+      "summary": "**Status:** Design (a wired, opt-in seam; not the shipped experience)",
+      "path": "docs/specs/interaction/identity-access/core/SPEC-FEDERATED-PARTICIPANTS.md"
+    },
+    {
+      "title": "SPEC - Content Moderation Model (surfaces)",
+      "summary": "**Status:** Partial (the built content-moderation surfaces plus the can-work design; assistant-neutral).",
+      "path": "docs/specs/interaction/identity-access/core/SPEC-MODERATION.md"
     },
     {
       "title": "The AgentEchelon Interaction Layer - platform composition model",
       "summary": "**Audience:** anyone deciding *whether* AgentEchelon fits their use case and gives them the right level of security, plus contributors who need to see how the interaction layer and security model is built before diving into a new use case or editing an existing use case. (Deployers who want *how do I add or edit one* want the **guides** in §7; this doc is the model behind them.)",
-      "path": "docs/specs/conversation-messaging/SPEC-INTERACTION-LAYER.md"
+      "path": "docs/specs/interaction/SPEC-INTERACTION-LAYER.md"
     },
     {
-      "title": "SPEC: Compact message metadata - a coded codebook + out-of-band lookup",
-      "summary": "**Status:** Partial (out-of-band lookup and the cap-shedding backstop ship; the coded-state codebook is design)",
-      "path": "docs/specs/conversation-messaging/SPEC-MESSAGE-METADATA-CODEBOOK.md"
+      "title": "DESIGN: Admin Console",
+      "summary": "**Status:** Partial (8 sections built; Aurora-only quality views ship their scoring passes incrementally) **Layer:** Interface (admin interface - reference client) **Plane:** admin **Product spec:** [`SPEC-ADMIN-CONSOLE.md`](SPEC-ADMIN-CONSOLE.md) **Summary:** A standalone React app (`@ae/admin`) whose `AdminDashboard` fans out per-tab analytics queries to admin-gated APIs, reads conversation hist",
+      "path": "docs/specs/interface/admin/DESIGN-ADMIN-CONSOLE.md"
     },
     {
-      "title": "SPEC: Conversation ↔ transport notification bridge (email now; SMS + voice/PSTN next)",
-      "summary": "The **conversation channel is the hub**; each transport is bridged to it, both directions, so the assistant is transport-agnostic.",
-      "path": "docs/specs/conversation-messaging/SPEC-NOTIFICATION-BRIDGE.md"
+      "title": "DESIGN: Separate Admin App",
+      "summary": "**Status:** Partial (frontend workspace split and CORS/env split built through P3; further docs and hardening remain) **Layer:** Interface (admin interface - reference client) **Plane:** admin **Product spec:** [`SPEC-ADMIN-CONSOLE.md`](SPEC-ADMIN-CONSOLE.md) **Summary:** An operator wants the privileged admin surface - its code and its endpoint URLs - kept out of the public chat app that any visi",
+      "path": "docs/specs/interface/admin/DESIGN-SEPARATE-ADMIN-APP.md"
     },
     {
-      "title": "SPEC: Welcome flow and assistant context",
-      "summary": "**Status:** Partial (the welcome wiring ships; later context phases are design)",
-      "path": "docs/specs/conversation-messaging/SPEC-WELCOME-AND-CONTEXT.md"
+      "title": "SPEC: Admin Console",
+      "summary": "**Status:** Partial (8 sections built; Aurora-only quality views and several operator affordances are opt-in or roadmap) **Layer:** Interface (admin interface - reference client) **Plane:** admin **Summary:** A single internal operator surface for reading conversations, moderating and administering them, managing assistant profiles, and watching platform health, assistant effectiveness, experiment",
+      "path": "docs/specs/interface/admin/SPEC-ADMIN-CONSOLE.md"
     },
     {
-      "title": "SPEC: `/battle` - Multi-Assistant Adversarial Reply",
-      "summary": "**Status:** Implemented (premium-gated). Covers single-turn, `TASK_*`, and image (vision-in + generation-out) battles, the three-axis scorecard, and per-step telemetry. **Image-output safety:** ships as a basic default; production-grade moderation is the deployer's responsibility (open-source posture), not an internal sign-off gate.",
-      "path": "docs/specs/experiments-battle/SPEC-BATTLE.md"
+      "title": "DESIGN: Chat Application",
+      "summary": "**Status:** Implemented **Layer:** Interface (chat interface - reference client) **Plane:** core **Product spec:** [`SPEC-CHAT-APP.md`](SPEC-CHAT-APP.md) **Summary:** A standalone React SPA (`@ae/chat`) whose provider stack (auth, AWS clients, messaging, conversations) drives an Amazon Chime SDK Messaging-backed real-time conversation surface, sharing `@ae/shared` with the admin app but carrying z",
+      "path": "docs/specs/interface/chat/DESIGN-CHAT-APP.md"
     },
     {
-      "title": "Access control by example: blocked interactions, the policy that blocks them, and the experience",
-      "summary": "**Status:** Implemented (reference: worked examples of the live IAM enforcement)",
-      "path": "docs/specs/identity-access/ACCESS-CONTROL-BY-EXAMPLE.md"
+      "title": "SPEC: Chat Application",
+      "summary": "**Status:** Implemented **Layer:** Interface (chat interface - reference client) **Plane:** core **Summary:** The end-user surface for conversing with tier-capped assistants in real time, across devices, in one coherent app. **Technical design:** [`DESIGN-CHAT-APP.md`](DESIGN-CHAT-APP.md) **Site section(s):** Chat application (the public end-user SPA; the counterpart to the standalone Admin Consol",
+      "path": "docs/specs/interface/chat/SPEC-CHAT-APP.md"
     },
     {
-      "title": "Identity & Access Model",
-      "summary": "**Status:** Implemented (reference: the live identity and access model)",
-      "path": "docs/specs/identity-access/IDENTITY-AND-ACCESS-MODEL.md"
+      "title": "SPEC: Abuse Controls (rate limiting, spend budgets, request dedup)",
+      "summary": "**Status:** Implemented (all phases).",
+      "path": "docs/specs/ops/SPEC-ABUSE-CONTROLS.md"
     },
     {
-      "title": "Access & Controls Auditing - an append-only record of who could act, and what changed",
-      "summary": "**Status:** Implemented (audit capture and the membership-history view; forward extensions noted inline)",
-      "path": "docs/specs/identity-access/SPEC-ACCESS-AND-CONTROLS-AUDITING.md"
+      "title": "SPEC: Optional Aurora PostgreSQL + VPC Deployment Mode",
+      "summary": "**Status:** Implemented (opt-in deployment mode).",
+      "path": "docs/specs/ops/SPEC-AURORA-VPC-MODE.md"
     },
     {
-      "title": "SPEC: Add a user to a conversation (eligible-member invite and assistant escalation)",
-      "summary": "Adding another human to a conversation should be safe by construction: the person added must be entitled to the conversation's tier, and no one should be able to email an arbitrary address or pull in someone who cannot actually access the thread. AgentEchelon supports two ways to add a user, and both pass through the SAME",
-      "path": "docs/specs/identity-access/SPEC-ADD-USER-ESCALATION.md"
+      "title": "SPEC: Cost Sleep Mode (auto-sleep / wake)",
+      "summary": "**Status:** Implemented (Aurora-mode, opt-in `-c sleepMode=true`).",
+      "path": "docs/specs/ops/SPEC-COST-SLEEP-MODE.md"
     },
     {
-      "title": "Making admin-console actions IAM-enforceable",
-      "summary": "**Status:** Built, flag-gated (opt-in), pending deploy validation. The enforcement is off by default; `-c adminIamEnforcement=true` (backend) plus `VITE_ADMIN_IAM_ENFORCEMENT=true` (admin app) turns it on, and the interim Cognito-group gate (`callerCanReadArchive`) stays as the `ae-cognito` fallback. The example personas (section 2) are opt-in behind `-c enableAdminPersonas=true`. What is wired: t",
-      "path": "docs/specs/identity-access/SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md"
-    },
-    {
-      "title": "SPEC: Admin Agent and Admin Notification Channel",
-      "summary": "**Status:** DESIGN (not yet built). This spec supersedes the initial admin-notification-channel attempt (the stack at `backend/lib/stacks/admin-notification-stack.ts` and its handler `backend/lambda/src/admin-notification-channel-provision.ts`), which created and posted to the channel as the service app-instance-admin. That is wrong (see Why) and is being reworked to the model below.",
-      "path": "docs/specs/identity-access/SPEC-ADMIN-AGENT-NOTIFICATIONS.md"
-    },
-    {
-      "title": "SPEC: Admin Identity",
-      "summary": "**Status:** Implemented",
-      "path": "docs/specs/identity-access/SPEC-ADMIN-IDENTITY.md"
-    },
-    {
-      "title": "Conversation Security, Membership, and Information Isolation",
-      "summary": "**Status:** Implemented (Layers 1-6 are live; Layer 7 mixed-trust visibility is partial)",
-      "path": "docs/specs/identity-access/SPEC-CONVERSATION-SECURITY.md"
-    },
-    {
-      "title": "Identity & Access - anyone participates at the right capability, only as themselves",
-      "summary": "**Status:** Implemented. The **Identity & Access** pillar of the interaction layer (`docs/specs/conversation-messaging/SPEC-INTERACTION-LAYER.md` is the map), built as a backend **Credential Exchange Service** (see §9).",
-      "path": "docs/specs/identity-access/SPEC-CREDENTIAL-EXCHANGE.md"
-    },
-    {
-      "title": "SPEC - Content Moderation Model (surfaces)",
-      "summary": "**Status:** Partial (the built content-moderation surfaces plus the can-work design; assistant-neutral)",
-      "path": "docs/specs/identity-access/SPEC-MODERATION.md"
+      "title": "SPEC: Per-Page Frontend Observability",
+      "summary": "**Status:** Proposed **Layer:** Core platform (ops - cross-cutting telemetry, not an interaction pillar) **Plane:** core **Scope:** `frontend/packages/chat`, `frontend/packages/admin`, `frontend/packages/shared` **Related:** [`../interface/admin/DESIGN-SEPARATE-ADMIN-APP.md`](../interface/admin/DESIGN-SEPARATE-ADMIN-APP.md), `docs/LATENCY-TARGETS.md`",
+      "path": "docs/specs/ops/SPEC-FRONTEND-OBSERVABILITY.md"
     }
   ],
   "blog": [],
   "generated_from": {
-    "repo_docs": 60,
+    "repo_docs": 72,
     "public_blog_posts": 0,
     "blog_vault_used": false
   }
