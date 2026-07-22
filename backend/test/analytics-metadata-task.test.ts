@@ -42,3 +42,40 @@ describe('task-state analytics metadata', () => {
     expect(slim.taskTransition).toBeUndefined();
   });
 });
+
+describe('image-generation analytics metadata (per-image cost is priceable)', () => {
+  it('carries imageCount when provided (an image turn reports 0 tokens)', () => {
+    const m = buildAnalyticsMetadata({
+      messageNumber: 2,
+      userType: 'premium',
+      role: 'assistant',
+      intent: 'image_generation',
+      bedrockResponse: { model: 'gpt-image-1', inputTokens: 0, outputTokens: 0 },
+      imageCount: 3,
+    });
+    expect(m.imageCount).toBe(3);
+    expect(m.bedrockModel).toBe('gpt-image-1');
+  });
+
+  it('omits imageCount on a text turn (undefined, not 0)', () => {
+    const m = buildAnalyticsMetadata({
+      messageNumber: 1,
+      userType: 'standard',
+      role: 'assistant',
+      bedrockResponse: { model: 'anthropic.claude-sonnet-4-6', inputTokens: 100, outputTokens: 50 },
+    });
+    expect(m.imageCount).toBeUndefined();
+  });
+
+  it('keeps imageCount in the slim frontend Metadata (survives Aurora-mode slimming)', () => {
+    const m = buildAnalyticsMetadata({
+      messageNumber: 2,
+      userType: 'premium',
+      role: 'assistant',
+      bedrockResponse: { model: 'gpt-image-1', inputTokens: 0, outputTokens: 0 },
+      imageCount: 1,
+    });
+    const slim = pickFrontendMetadata(m as unknown as Record<string, unknown>);
+    expect(slim.imageCount).toBe(1);
+  });
+});

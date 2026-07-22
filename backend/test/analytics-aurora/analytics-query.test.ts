@@ -112,6 +112,32 @@ describe('resolveReplyCostUsd (L0 cost column, D4) — null-honesty + coercion',
   it('returns null for a model the rate table cannot price (never a guessed 0)', () => {
     expect(resolveReplyCostUsd({ dominant_model: 'not-a-real-model', avg_input_tokens: '100', avg_output_tokens: '50' })).toBeNull();
   });
+
+  it('prices an image-gen turn per-image (0 tokens) from avg_image_count', () => {
+    // gpt-image-1 has no text-catalog rate; the image path prices it per image
+    // (IMAGE_GEN_RATE_USD_PER_IMAGE.openai_gpt_image_1 = 0.04). avg 2 images => 0.08.
+    expect(
+      resolveReplyCostUsd({
+        dominant_model: 'gpt-image-1',
+        avg_input_tokens: '0',
+        avg_output_tokens: '0',
+        avg_image_count: '2',
+      }),
+    ).toBeCloseTo(0.08, 6);
+  });
+
+  it('ignores a stray avg_image_count when the dominant model is a text model (no image-path null)', () => {
+    // A text intent that happened to record an imageCount on a stray row must still
+    // price on tokens, not route the text model into the null-returning image path.
+    const cost = resolveReplyCostUsd({
+      dominant_model: 'anthropic.claude-sonnet-4-6',
+      avg_input_tokens: '1000',
+      avg_output_tokens: '500',
+      avg_image_count: '1',
+    });
+    expect(cost).not.toBeNull();
+    expect(cost!).toBeGreaterThan(0);
+  });
 });
 
 describe('Aurora analytics-query — intent_effectiveness (Effectiveness L0)', () => {

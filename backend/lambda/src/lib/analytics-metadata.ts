@@ -193,6 +193,12 @@ export interface AnalyticsMetadata {
   outputTokens?: number;
   latencyMs?: number;
 
+  // Generation-out (image) turns: how many images this turn produced. An image
+  // model reports 0 input/output tokens, so per-image cost can only be priced
+  // (estimateStepCostUsd) when the count is persisted here — the frontend battle
+  // scorecard also carries it in the Content marker, but that is not queryable.
+  imageCount?: number;
+
   // End-to-end pipeline timing (assistant messages only)
   totalMs?: number;
   pollMs?: number;
@@ -264,6 +270,10 @@ export interface AnalyticsContext {
     latencyMs?: number;
   };
 
+  /** Generation-out (image) turns: images produced this turn, so the Effectiveness
+   *  cost path can price per-image (token counts are 0 on an image model). */
+  imageCount?: number;
+
   totalMs?: number;
   pollMs?: number;
 
@@ -320,6 +330,9 @@ export const FRONTEND_METADATA_KEYS = [
   'variantId',
   'assignmentMode',
   'activeTask',
+  // imageCount rides the slim frontend Metadata too, so an image turn's per-image
+  // cost survives Aurora-mode slimming (kept even if the out-of-band write fails open).
+  'imageCount',
 ] as const;
 
 /**
@@ -355,6 +368,10 @@ export function buildAnalyticsMetadata(context: AnalyticsContext): AnalyticsMeta
     metadata.outputTokens = context.bedrockResponse.outputTokens;
     metadata.latencyMs = context.bedrockResponse.latencyMs;
   }
+
+  // Image (generation-out) turns: persist the image count so per-image cost is
+  // priceable at query time (the model reports 0 tokens).
+  if (context.imageCount !== undefined) metadata.imageCount = context.imageCount;
 
   if (context.totalMs !== undefined) metadata.totalMs = context.totalMs;
   if (context.pollMs !== undefined) metadata.pollMs = context.pollMs;

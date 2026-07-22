@@ -19,6 +19,7 @@ import { DynamoDBDocumentClient, ScanCommand } from '@aws-sdk/lib-dynamodb';
 import { stripMessageMarkers } from '../lib/message-markers.js';
 import { query, ensureSchema } from './db-client.js';
 import { estimateStepCostUsd, bedrockModelIdToKey } from '../lib/model-rate-table.js';
+import { imageGenModelIdToKey } from '../lib/image-gen-models.js';
 import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall } from '../lib/auth.js';
 import { queryTypeAllowedOnPath } from '../lib/admin-capability-map.js';
 import { ceilingForRequest, scopeAnalyticsRows, type ClassificationCeiling } from '../lib/caller-scope.js';
@@ -1461,15 +1462,24 @@ export function resolveReplyCostUsd(row: {
   dominant_model?: string | null;
   avg_input_tokens?: string | number | null;
   avg_output_tokens?: string | number | null;
+  avg_image_count?: string | number | null;
 }): number | null {
   const modelId = row.dominant_model || undefined;
   if (!modelId) return null;
   const toNum = (v: string | number | null | undefined): number | undefined =>
     v === null || v === undefined ? undefined : Number(v);
+  // Image (generation-out) turns price per-image, not per-token: an image model
+  // reports 0 tokens, so estimateStepCostUsd routes on imageCount when it is
+  // present and > 0 (per-image rate). Only forward imageCount when the DOMINANT
+  // model is itself an image model — otherwise a text intent with a stray image
+  // turn (imageCount averaged from the image rows) would route a text model into
+  // the image path and return null instead of its real token cost.
+  const isImageModel = imageGenModelIdToKey(modelId) != null;
   return estimateStepCostUsd({
     modelId,
     tokensIn: toNum(row.avg_input_tokens),
     tokensOut: toNum(row.avg_output_tokens),
+    imageCount: isImageModel ? toNum(row.avg_image_count) : undefined,
   });
 }
 
@@ -1520,6 +1530,14 @@ async function getIntentEffectiveness(
               ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.total_ms)::numeric, 0) AS p95_total_ms,
               ROUND(AVG(m.input_tokens)::numeric, 0) AS avg_input_tokens,
               ROUND(AVG(m.output_tokens)::numeric, 0) AS avg_output_tokens,
+              -- Image (generation-out) turns: the per-reply image count, averaged over the
+              -- turns that carry it, so cost can be priced per-image (an image model reports 0
+              -- tokens). The ~ regex guard casts only well-formed integer values so a malformed
+              -- metadata value can never error the whole dashboard query (a scalar/non-int is
+              -- treated as absent). NULL on token-only intents → resolveReplyCostUsd stays on
+              -- the token path.
+              ROUND(AVG(CASE WHEN m.metadata->>'imageCount' ~ '^[0-9]+$'
+                             THEN (m.metadata->>'imageCount')::int END)::numeric, 2) AS avg_image_count,
               MODE() WITHIN GROUP (ORDER BY m.bedrock_model) AS dominant_model,
               -- Portable-profile attribution (which assistant + version served this intent's traffic),
               -- read from the per-turn metadata stamped by the async processor. NULL on pre-attribution rows.
@@ -1600,6 +1618,7 @@ async function getIntentEffectiveness(
             ex_agg.p95_total_ms,
             ex_agg.avg_input_tokens,
             ex_agg.avg_output_tokens,
+            ex_agg.avg_image_count,
             ex_agg.dominant_model,
             ex_agg.assistant,
             ex_agg.profile_version,
@@ -1807,6 +1826,9 @@ async function fetchExperimentRows(
        AND e.created_at >= NOW() - INTERVAL '1 day' * $1`;
 
   if (!includeBattle) {
+    // TODO(metrics): battle-scoped effectiveness view — battle turns are intentionally
+    // excluded from the probabilistic experiment-variant rollup (SPEC-BATTLE rollup-safety
+    // invariant); a dedicated battle-scoped view would surface their metrics separately.
     where += ` AND COALESCE(m.metadata->'analytics'->>'assignmentMode', m.metadata->>'assignmentMode', 'probabilistic') = 'probabilistic'`;
   }
   if (experimentId) {
@@ -1828,6 +1850,11 @@ async function fetchExperimentRows(
        ROUND(AVG(COALESCE(m.input_tokens, 0))::numeric, 0) AS avg_input_tokens,
        ROUND(AVG(COALESCE(m.output_tokens, 0))::numeric, 0) AS avg_output_tokens,
        ROUND(AVG(COALESCE(m.input_tokens, 0) + COALESCE(m.output_tokens, 0))::numeric, 0) AS avg_tokens,
+       -- Image (generation-out) variants: per-reply image count so cost prices per-image (an
+       -- image model reports 0 tokens). Regex-guarded cast so a malformed value never errors
+       -- the whole query; NULL on token-only variants.
+       ROUND(AVG(CASE WHEN m.metadata->>'imageCount' ~ '^[0-9]+$'
+                      THEN (m.metadata->>'imageCount')::int END)::numeric, 2) AS avg_image_count,
        ROUND(
          (COUNT(*) FILTER (WHERE COALESCE(er.is_compliant, true)) * 100.0 / NULLIF(COUNT(*), 0))::numeric,
          1
@@ -1866,10 +1893,18 @@ async function fetchExperimentRows(
     const n = Number(r.exchange_count) || 0;
     const taskCount = Number(r.task_count) || 0;
     const taskCompleted = Number(r.task_completed_count) || 0;
+    // Pass modelId too (not just modelKey): image-gen models are excluded from the text
+    // catalog so bedrockModelIdToKey() is null for them, but estimateStepCostUsd routes on
+    // imageCount → imageGenModelIdToKey(modelId) for the per-image rate. Only forward
+    // imageCount when the model IS an image model, so a text variant with a stray image row
+    // never routes a text model into the null-returning image path.
+    const isImageModel = imageGenModelIdToKey(r.model_name) != null;
     const avgCostUsd = estimateStepCostUsd({
+      modelId: r.model_name,
       modelKey: bedrockModelIdToKey(r.model_name),
       tokensIn: Number(r.avg_input_tokens) || 0,
       tokensOut: Number(r.avg_output_tokens) || 0,
+      imageCount: isImageModel ? Number(r.avg_image_count) || 0 : 0,
     });
     const dedupKey = feedbackKey(r.variant_id, r.intent);
     const firstForKey = !thumbsAttached.has(dedupKey);

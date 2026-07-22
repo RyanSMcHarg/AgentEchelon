@@ -11,7 +11,7 @@ import {
 } from './metricTargets';
 import { InfoTooltip, DocLink } from './AdminHelp';
 import { DOC_LINKS } from '../../config/docLinks';
-import type { AnalyticsDateRange, AnalyticsResult } from '@ae/shared';
+import { modelDisplayName, type AnalyticsDateRange, type AnalyticsResult } from '@ae/shared';
 
 /**
  * Effectiveness section (SPEC-ADMIN-CONSOLE-EFFECTIVENESS). The intent is the spine: one dashboard
@@ -280,7 +280,7 @@ const L1Intent: React.FC<{ row: Row; toolLens: ToolAgg[] | null; onDrill: (deliv
         <MetricCard title="Rerouted away" value={fmtBy(row.reroute_rate, 'intent_reroute_rate')} rawValue={num(row.reroute_rate)} target={METRIC_TARGETS.intent_reroute_rate} tooltip="Share of exchanges the classifier first assigned to this intent but then re-routed to a different one (this intent was over-triggered and corrected away). High = a classifier/taxonomy boundary problem for this intent." />
         <MetricCard title={ax.label} value={fmtBy(ax.value, ax.targetKey)} rawValue={ax.value} target={METRIC_TARGETS[ax.targetKey]} />
         <MetricCard title="Avg latency" value={fmtMs(row.avg_total_ms)} subtitle={`p95 ${fmtMs(row.p95_total_ms)}`} rawValue={num(row.avg_total_ms)} target={METRIC_TARGETS.avg_total_ms} />
-        <MetricCard title="Cost / reply" value={fmtUsd(row.cost_per_reply_usd)} subtitle={row.dominant_model ? String(row.dominant_model) : undefined} rawValue={num(row.cost_per_reply_usd)} target={METRIC_TARGETS.cost_per_reply} />
+        <MetricCard title="Cost / reply" value={fmtUsd(row.cost_per_reply_usd)} subtitle={row.dominant_model ? modelDisplayName(String(row.dominant_model)) : undefined} rawValue={num(row.cost_per_reply_usd)} target={METRIC_TARGETS.cost_per_reply} />
         <MetricCard title="Tool error rate" value={fmtBy(row.tool_error_rate, 'tool_error_rate')} subtitle={`${num(row.tool_calls) || 0} calls`} rawValue={num(row.tool_error_rate)} target={METRIC_TARGETS.tool_error_rate} />
       </div>
       <div className="admin-filter-group" style={{ marginTop: 12 }}>
@@ -331,7 +331,7 @@ const L3Timeline: React.FC<{ rows: Row[] }> = ({ rows }) => {
                 emptyMessage="No steps"
                 columns={[
                   { key: 'stepLabel', label: 'Step' },
-                  { key: 'modelId', label: 'Model', render: (v) => (v ? String(v) : '—') },
+                  { key: 'modelId', label: 'Model', render: (v) => (v ? modelDisplayName(String(v)) : '—') },
                   { key: 'tokensIn', label: 'In' },
                   { key: 'tokensOut', label: 'Out' },
                   { key: 'estCostUsd', label: 'Cost', render: (v) => (v == null ? '—' : `$${Number(v).toFixed(6)}`) },
@@ -632,7 +632,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
               { key: 'total_ms', label: 'Latency', sortable: true, render: (v) => fmtMs(v) },
               { key: 'input_tokens', label: 'In', sortable: true },
               { key: 'output_tokens', label: 'Out', sortable: true },
-              { key: 'bedrock_model', label: 'Model', render: (v) => (v ? String(v) : '—') },
+              { key: 'bedrock_model', label: 'Model', render: (v) => (v ? modelDisplayName(String(v)) : '—') },
               { key: 'channel_arn', label: 'Conversation', sortable: false, render: (v) => <ConvLink channelArn={v} onOpen={onOpenConversation} /> },
             ]}
           />

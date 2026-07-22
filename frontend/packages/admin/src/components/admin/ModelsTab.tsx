@@ -1,6 +1,6 @@
 import React from 'react';
 import DataTable from './DataTable';
-import { getFeedbackSummary, type FeedbackSummaryRow } from '@ae/shared';
+import { getFeedbackSummary, modelDisplayName, type FeedbackSummaryRow } from '@ae/shared';
 import type { AnalyticsResult } from '@ae/shared';
 
 interface ModelsTabProps {
@@ -36,7 +36,7 @@ const ModelsTab: React.FC<ModelsTabProps> = ({ data, effectivenessData, isLoadin
         <h3>Model Usage</h3>
         <DataTable
           columns={[
-            { key: 'model_name', label: 'Model' },
+            { key: 'model_name', label: 'Model', render: (v) => modelDisplayName(v as string) || '—' },
             { key: 'message_count', label: 'Messages' },
             { key: 'avg_latency_ms', label: 'Avg Latency (ms)', render: (v) => `${Number(v).toFixed(0)}` },
             { key: 'total_tokens', label: 'Total Tokens', render: (v) => Number(v).toLocaleString() },
@@ -50,7 +50,7 @@ const ModelsTab: React.FC<ModelsTabProps> = ({ data, effectivenessData, isLoadin
         <h3>Intent x Model Effectiveness</h3>
         <DataTable
           columns={[
-            { key: 'model_name', label: 'Model' },
+            { key: 'model_name', label: 'Model', render: (v) => modelDisplayName(v as string) || '—' },
             { key: 'intent', label: 'Intent' },
             { key: 'exchange_count', label: 'Exchanges' },
             { key: 'avg_score', label: 'Avg Score', render: (v) => Number(v).toFixed(1) },
@@ -67,7 +67,7 @@ const ModelsTab: React.FC<ModelsTabProps> = ({ data, effectivenessData, isLoadin
         <h3>User Feedback</h3>
         <DataTable
           columns={[
-            { key: 'model_name', label: 'Model' },
+            { key: 'model_name', label: 'Model', render: (v) => modelDisplayName(v as string) || '—' },
             { key: 'intent', label: 'Intent' },
             { key: 'thumbs_up', label: 'Helpful' },
             { key: 'thumbs_down', label: 'Needs work' },

@@ -7,6 +7,7 @@ import {
   listExperiments,
   createExperiment,
   updateExperimentStatus,
+  modelDisplayName,
   type Experiment,
   type ExperimentVariant,
   type ExperimentObjective,
@@ -1118,7 +1119,7 @@ function VariantHeader({ variant, side }: { variant: VariantAgg; side: 'A' | 'B'
   return (
     <div className="exp-variant-head">
       <span className="exp-variant-side">{side} · {variant.variant_id}</span>
-      <span className="exp-variant-model">{variant.model_name}</span>
+      <span className="exp-variant-model">{modelDisplayName(variant.model_name)}</span>
     </div>
   );
 }

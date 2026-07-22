@@ -183,6 +183,38 @@ export function getModelStrategyLookup(): Record<ModelStrategyKey, ModelStrategy
   return Object.fromEntries(MODEL_STRATEGY_MODELS.map((model) => [model.key, model])) as Record<ModelStrategyKey, ModelStrategyCard>;
 }
 
+/**
+ * Friendly display names for the image-generation (generation-out) models. These
+ * live in the backend registry (lib/image-gen-models.ts) and are deliberately kept
+ * OUT of the text model catalog, so the admin dashboard has no text-catalog entry
+ * to name them by. This small map lets the analytics tables render "Stability Image
+ * Core (Bedrock)" instead of the raw id "stability.stable-image-core-v1:1". Keyed by
+ * the model id the analytics rows carry (bedrock_model / dominant_model). Kept minimal
+ * and display-only; the backend registry stays the source of truth for behavior.
+ */
+const IMAGE_GEN_MODEL_DISPLAY_NAMES: Record<string, string> = {
+  'amazon.titan-image-generator-v2:0': 'Amazon Titan Image G1 v2 (legacy)',
+  'amazon.nova-canvas-v1:0': 'Amazon Nova Canvas (legacy)',
+  'stability.stable-image-core-v1:1': 'Stability Image Core (Bedrock)',
+  'stability.stable-image-ultra-v1:1': 'Stability Image Ultra (Bedrock)',
+  'gpt-image-1': 'OpenAI gpt-image-1',
+  'fal-ai/flux-pro/v1.1': 'Black Forest Labs FLUX 1.1 Pro (via FAL)',
+};
+
+/**
+ * Resolve a raw model id (as recorded on analytics rows) to a friendly display name.
+ * Prefers the text model catalog, then the image-gen display map, and falls back to
+ * the raw id unchanged (honest — never a fabricated name) so an unrecognised or empty
+ * id still renders as-is. Image turns record an image model id that the text catalog
+ * cannot name, so this is what keeps them from showing a raw id in the dashboard.
+ */
+export function modelDisplayName(modelId: string | null | undefined): string {
+  if (!modelId) return '';
+  const text = MODEL_STRATEGY_MODELS.find((m) => m.bedrockModelId === modelId);
+  if (text) return text.displayName;
+  return IMAGE_GEN_MODEL_DISPLAY_NAMES[modelId] ?? modelId;
+}
+
 export function getTierModelSelection(): Record<ModelTier, ModelStrategyCard> {
   const lookup = getModelStrategyLookup();
   const resolve = (tier: ModelTier): ModelStrategyCard => {

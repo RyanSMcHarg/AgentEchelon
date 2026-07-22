@@ -111,6 +111,10 @@ interface Relevance {
 const stripMarkers = stripMessageMarkers;
 
 /** Exchanges with no evaluation_results row yet (the unscored backlog). */
+// TODO(metrics): image-appropriate eval rubric or skip intent=image_generation. Scoring an
+// image turn's caption text against the prompt with the text-relevance rubric is semantically
+// wrong (the artifact is the image, not the caption); this needs a dedicated rubric or an
+// explicit skip of intent='image_generation' here. Separate rubric decision, out of scope now.
 async function getUnscoredExchanges(limit: number): Promise<UnscoredExchange[]> {
   const res = await query<UnscoredExchange>(
     `SELECT e.id,

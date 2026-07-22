@@ -2061,6 +2061,9 @@ export async function finalizePlaceholderResponse(params: {
       outputTokens,
       latencyMs: bedrockTime,
     },
+    // Image (generation-out) turns: persist the image count so the Effectiveness
+    // cost path can price per-image (an image model reports 0 tokens).
+    ...(params.imageCount != null && { imageCount: params.imageCount }),
     totalMs: totalTime,
     pollMs: pollTime,
     ...(activeTaskInfo && { activeTask: activeTaskInfo }),
