@@ -283,7 +283,79 @@ describe('POST /channels/battle/enable', () => {
       expect(res.statusCode).toBe(400);
     });
 
-    it('rejects missing experimentId (400)', async () => {
+  });
+
+  // experimentId is optional: there is one active battle-enabled experiment per
+  // classification, so an omitted id auto-resolves the channel classification's
+  // single battle rather than forcing the caller to pick it.
+  describe('auto-resolve (no experimentId)', () => {
+    // Queue channel access + classification (premium) + moderator OK, matching
+    // the successful-enable prelude but without an explicit experimentId.
+    function queueEnablePrelude() {
+      mockMessagingSend.mockResolvedValueOnce({
+        Channel: { Metadata: JSON.stringify({ modelTier: 'premium', createdBy: CALLER_ARN }) },
+      });
+      queueClassificationTag('premium');
+      mockMessagingSend.mockResolvedValueOnce({
+        ChannelModerators: [{ Moderator: { Arn: CALLER_ARN } }],
+      });
+    }
+
+    it('auto-resolves the single battle-enabled experiment when experimentId is omitted', async () => {
+      queueEnablePrelude();
+      // resolveActiveBattleExperimentForClassification → loadExperiments Scan
+      // (active-only in prod; the mock returns the one battle-enabled experiment).
+      mockDdbSend.mockResolvedValueOnce({
+        Items: [
+          {
+            experimentId: EXP_ID,
+            status: 'active',
+            battleEnabled: true,
+            tiers: ['premium'],
+            altBotSlotId: 'slot-0',
+            altBotSlotArn: ALT_SLOT,
+            variants: [
+              { variantId: 'control', displayName: 'Atlas' },
+              { variantId: 'treatment', displayName: 'Echo' },
+            ],
+          },
+        ],
+      });
+      // loadExperiment GetCommand (re-load by the resolved id for validation)
+      mockDdbSend.mockResolvedValueOnce({
+        Item: {
+          experimentId: EXP_ID,
+          status: 'active',
+          battleEnabled: true,
+          altBotSlotId: 'slot-0',
+          altBotSlotArn: ALT_SLOT,
+          variants: [
+            { variantId: 'control', displayName: 'Atlas' },
+            { variantId: 'treatment', displayName: 'Echo' },
+          ],
+        },
+      });
+      mockDdbSend.mockResolvedValueOnce({ Items: [] }); // findSlotConflicts — none
+      mockMessagingSend.mockResolvedValueOnce({}); // CreateChannelMembership
+      mockDdbSend.mockResolvedValueOnce({}); // PutCommand config
+      mockMessagingSend.mockResolvedValueOnce({}); // announce
+
+      const handler = await loadHandler();
+      const res = await handler(makeEvent({
+        method: 'POST',
+        path: '/channels/battle/enable',
+        body: { channelArn: CHANNEL },
+      }));
+      expect(res.statusCode).toBe(200);
+      const body = JSON.parse(res.body);
+      expect(body.enabled).toBe(true);
+      expect(body.experimentId).toBe(EXP_ID);
+    });
+
+    it('returns 400 NO_BATTLE_EXPERIMENT when none is battle-enabled for the classification', async () => {
+      queueEnablePrelude();
+      // loadExperiments Scan returns no battle-enabled experiment.
+      mockDdbSend.mockResolvedValueOnce({ Items: [] });
       const handler = await loadHandler();
       const res = await handler(makeEvent({
         method: 'POST',
@@ -291,6 +363,7 @@ describe('POST /channels/battle/enable', () => {
         body: { channelArn: CHANNEL },
       }));
       expect(res.statusCode).toBe(400);
+      expect(JSON.parse(res.body).code).toBe('NO_BATTLE_EXPERIMENT');
     });
   });
 

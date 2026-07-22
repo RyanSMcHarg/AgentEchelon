@@ -7,6 +7,9 @@
 import {
   imageFormatFromContentType,
   buildConverseMessages,
+  consolidateConsecutiveMessages,
+  resolveHistoryImageBlocks,
+  type ConversationMessage,
 } from '../../lambda/src/lib/async-processor-core';
 
 describe('imageFormatFromContentType', () => {
@@ -61,5 +64,160 @@ describe('buildConverseMessages', () => {
       { format: 'jpeg', bytes: new Uint8Array([9]) },
     );
     expect(out).toEqual([{ role: 'assistant', content: [{ text: 'only assistant' }] }]);
+  });
+
+  // Vision-through-conversation: a RESOLVED image on a history message (e.g. a rival's round-1
+  // generated image on its assistant turn) is rendered as a Converse image block on THAT message, so
+  // the assistant sees images shared earlier in the shared channel.
+  it('renders a resolved image block on the history message that carries it', () => {
+    const bytes = new Uint8Array([7, 8, 9]);
+    const out = buildConverseMessages([
+      { role: 'user', content: 'prompt' },
+      {
+        role: 'assistant',
+        content: 'Generated an image with Titan.',
+        images: [{ fileKey: 'battle-images/c/ts-0.png', contentType: 'image/png', bytes }],
+      },
+      { role: 'user', content: 'now rebut' },
+    ]);
+    expect(out[1].content).toEqual([
+      { text: 'Generated an image with Titan.' },
+      { image: { format: 'png', source: { bytes } } },
+    ]);
+    // Other messages untouched.
+    expect(out[0].content).toEqual([{ text: 'prompt' }]);
+    expect(out[2].content).toEqual([{ text: 'now rebut' }]);
+  });
+
+  it('skips an unresolved (no-bytes) or unusable-format history image (never a malformed block)', () => {
+    const out = buildConverseMessages([
+      {
+        role: 'assistant',
+        content: 'no bytes yet',
+        images: [{ fileKey: 'k1', contentType: 'image/png' }], // not fetched
+      },
+      {
+        role: 'assistant',
+        content: 'bad format',
+        images: [{ fileKey: 'k2', contentType: 'application/pdf', bytes: new Uint8Array([1]) }],
+      },
+    ]);
+    expect(out[0].content).toEqual([{ text: 'no bytes yet' }]);
+    expect(out[1].content).toEqual([{ text: 'bad format' }]);
+  });
+
+  it('renders MULTIPLE images on one merged message (both battle images)', () => {
+    const a = new Uint8Array([1]);
+    const b = new Uint8Array([2]);
+    const out = buildConverseMessages([
+      {
+        role: 'assistant',
+        content: 'two images',
+        images: [
+          { fileKey: 'k1', contentType: 'image/png', bytes: a },
+          { fileKey: 'k2', contentType: 'image/jpeg', bytes: b },
+        ],
+      },
+    ]);
+    expect(out[0].content).toEqual([
+      { text: 'two images' },
+      { image: { format: 'png', source: { bytes: a } } },
+      { image: { format: 'jpeg', source: { bytes: b } } },
+    ]);
+  });
+});
+
+// consolidateConsecutiveMessages must preserve image attachments from EVERY merged message, so an
+// image battle (both bots' round-1 image messages are consecutive assistant turns) does not lose one
+// side's image when the turns are combined into a single Bedrock-legal assistant block.
+describe('consolidateConsecutiveMessages preserves images across merges', () => {
+  it('concatenates image arrays from consecutive same-role messages', () => {
+    const merged = consolidateConsecutiveMessages([
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'A', images: [{ fileKey: 'kA', contentType: 'image/png' }] },
+      { role: 'assistant', content: 'B', images: [{ fileKey: 'kB', contentType: 'image/png' }] },
+    ]);
+    expect(merged).toHaveLength(2);
+    expect(merged[1].content).toBe('A\n\nB');
+    expect(merged[1].images).toEqual([
+      { fileKey: 'kA', contentType: 'image/png' },
+      { fileKey: 'kB', contentType: 'image/png' },
+    ]);
+  });
+
+  it('does not mutate the original message image arrays', () => {
+    const first = { role: 'assistant' as const, content: 'A', images: [{ fileKey: 'kA', contentType: 'image/png' }] };
+    consolidateConsecutiveMessages([
+      first,
+      { role: 'assistant', content: 'B', images: [{ fileKey: 'kB', contentType: 'image/png' }] },
+    ]);
+    expect(first.images).toHaveLength(1); // untouched (copied, not aliased)
+  });
+});
+
+// resolveHistoryImageBlocks: the bounded fetch that turns history image METADATA into resolved bytes
+// (so buildConverseMessages can render them). Fetch is guarded and bounded for cost/latency.
+describe('resolveHistoryImageBlocks', () => {
+  function fakeS3(bytesByKey: Record<string, Uint8Array | Error>) {
+    return {
+      send: jest.fn(async (cmd: { input?: { Key?: string } } | unknown) => {
+        // GetObjectCommand is mocked as identity elsewhere; read the key defensively.
+        const key = (cmd as { Key?: string; input?: { Key?: string } }).Key
+          ?? (cmd as { input?: { Key?: string } }).input?.Key
+          ?? '';
+        const v = bytesByKey[key];
+        if (v instanceof Error) throw v;
+        return { Body: { transformToByteArray: async () => v } };
+      }),
+    };
+  }
+
+  it('attaches bytes to a recent history image and returns the count', async () => {
+    const bytes = new Uint8Array([5, 5, 5]);
+    const messages: ConversationMessage[] = [
+      { role: 'user', content: 'go' },
+      { role: 'assistant', content: 'img', images: [{ fileKey: 'battle-images/c/ts-0.png', contentType: 'image/png' }] },
+      { role: 'user', content: 'rebut' },
+    ];
+    const s3 = fakeS3({ 'battle-images/c/ts-0.png': bytes });
+    const n = await resolveHistoryImageBlocks({ messages, s3: s3 as never, bucket: 'attach-bucket' });
+    expect(n).toBe(1);
+    expect(messages[1].images![0].bytes).toBe(bytes);
+  });
+
+  it('caps the number of images attached (cost/latency guard)', async () => {
+    const messages: ConversationMessage[] = [
+      {
+        role: 'assistant',
+        content: 'three',
+        images: [
+          { fileKey: 'k1', contentType: 'image/png' },
+          { fileKey: 'k2', contentType: 'image/png' },
+          { fileKey: 'k3', contentType: 'image/png' },
+        ],
+      },
+    ];
+    const s3 = fakeS3({ k1: new Uint8Array([1]), k2: new Uint8Array([2]), k3: new Uint8Array([3]) });
+    const n = await resolveHistoryImageBlocks({ messages, s3: s3 as never, bucket: 'b', maxImages: 2 });
+    expect(n).toBe(2);
+    expect(messages[0].images![2].bytes).toBeUndefined(); // 3rd never fetched
+  });
+
+  it('degrades (skips) on a fetch failure without throwing', async () => {
+    const messages: ConversationMessage[] = [
+      { role: 'assistant', content: 'img', images: [{ fileKey: 'boom', contentType: 'image/png' }] },
+    ];
+    const s3 = fakeS3({ boom: new Error('s3 down') });
+    const n = await resolveHistoryImageBlocks({ messages, s3: s3 as never, bucket: 'b' });
+    expect(n).toBe(0);
+    expect(messages[0].images![0].bytes).toBeUndefined();
+  });
+
+  it('is a no-op with no bucket or no images', async () => {
+    const s3 = fakeS3({});
+    expect(await resolveHistoryImageBlocks({ messages: [], s3: s3 as never, bucket: '' })).toBe(0);
+    const noImg = [{ role: 'user' as const, content: 'hi' }];
+    expect(await resolveHistoryImageBlocks({ messages: noImg, s3: s3 as never, bucket: 'b' })).toBe(0);
+    expect(s3.send).not.toHaveBeenCalled();
   });
 });

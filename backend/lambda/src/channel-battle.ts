@@ -3,9 +3,13 @@
  *
  * Per SPEC-BATTLE.md "Per-Channel Battle Enablement":
  *
- *   POST /channels/battle/enable   { channelArn, experimentId }
+ *   POST /channels/battle/enable   { channelArn, experimentId? }
  *   POST /channels/battle/disable  { channelArn }
  *   GET  /channels/battle?channelArn=...
+ *
+ * experimentId is optional: there is at most one active battle-enabled
+ * experiment per classification, so when it is omitted the handler
+ * auto-resolves the single battle for the channel's classification.
  *
  * Authorization:
  *   - Cognito-authenticated
@@ -53,6 +57,7 @@ import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { parseJsonBody } from './lib/auth.js';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
+import { resolveActiveBattleExperimentForClassification } from './lib/experiment-manager.js';
 
 const messagingClient = new ChimeSDKMessagingClient({});
 const ssmClient = new SSMClient({});
@@ -252,9 +257,10 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
   if (!channelArn || !isValidChannelArn(channelArn)) {
     return respond(400, { error: 'Invalid or missing channelArn' }, origin);
   }
-  if (!experimentId) {
-    return respond(400, { error: 'Missing experimentId' }, origin);
-  }
+  // experimentId is OPTIONAL. There is at most one active battle-enabled
+  // experiment per classification, so when the caller omits it we auto-resolve
+  // the channel classification's single battle below. An explicit id is still
+  // honored (back-compat) and takes precedence.
 
   const callerSub = getCallerSub(event);
   if (!callerSub) {
@@ -295,8 +301,23 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
     }, origin);
   }
 
+  // Resolve which experiment to bind. When the caller supplied one, use it
+  // (back-compat). Otherwise auto-resolve the single active battle-enabled
+  // experiment for this channel's classification.
+  let resolvedExperimentId = experimentId;
+  if (!resolvedExperimentId) {
+    const auto = await resolveActiveBattleExperimentForClassification(channelClassification);
+    if (!auto) {
+      return respond(400, {
+        error: 'No active battle-enabled experiment for this classification',
+        code: 'NO_BATTLE_EXPERIMENT',
+      }, origin);
+    }
+    resolvedExperimentId = auto.experimentId;
+  }
+
   // Experiment validation.
-  const exp = await loadExperiment(experimentId);
+  const exp = await loadExperiment(resolvedExperimentId);
   if (!exp) {
     return respond(404, { error: 'Experiment not found' }, origin);
   }

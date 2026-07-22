@@ -172,10 +172,17 @@ export async function newBattleChannel(page: Page, title: string, expId: string 
   await page.locator('button[aria-label="Show channel members"]').click();
   const section = page.locator('section.channel-members-panel-battle');
   await expect(section).toBeVisible({ timeout: 10_000 });
+  // Battle enable is a plain ON/OFF toggle: the backend auto-resolves the
+  // single battle-enabled experiment for the channel's classification, so there
+  // is no experiment picker. Stay tolerant of an older build that still renders
+  // #battle-experiment-select (select it if present); either way, click Enable.
   const expSelect = section.locator('#battle-experiment-select');
-  await expSelect.waitFor({ state: 'visible', timeout: 25_000 });
-  await expSelect.selectOption(expId);
-  await section.locator('.channel-members-panel-battle-btn--enable').click();
+  if (await expSelect.isVisible({ timeout: 3_000 }).catch(() => false)) {
+    await expSelect.selectOption(expId).catch(() => {});
+  }
+  const enableBtn = section.locator('.channel-members-panel-battle-btn--enable');
+  await enableBtn.waitFor({ state: 'visible', timeout: 25_000 });
+  await enableBtn.click();
 
   const live = section.locator('.status-badge--live');
   const err = section.locator('.channel-members-panel-battle-error');

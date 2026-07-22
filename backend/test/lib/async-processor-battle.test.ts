@@ -67,6 +67,7 @@ import {
   updateMessage,
   splitIntoChunks,
   buildRebuttalContext,
+  buildRebuttalImageNote,
   buildBattleAwareness,
 } from '../../lambda/src/lib/async-processor-core';
 
@@ -126,10 +127,9 @@ describe('NO_REBUTTAL placeholder resolution (update, not delete)', () => {
   });
 });
 
-// Phase 1: the round-2 rebuttal is injected as a minimal, non-adversarial note
-// (buildRebuttalContext), NOT a battle-mode constraint block. Round 1 is a fully
-// normal request, so there is nothing to assert there (no length cap, no
-// adversarial framing) — the absence is the point.
+// The round-2 rebuttal is a COMPETITIVE note (buildRebuttalContext): comment on the
+// rival's answer and argue why THIS assistant's answer is better. Round 1 is a fully
+// normal request (no length cap), plus a light battle-awareness note.
 describe('buildRebuttalContext (round-2 rebuttal note)', () => {
   it('embeds the rival name and the rival reply inside <other_reply> tags', () => {
     const note = buildRebuttalContext('Echo', 'The rival argued for option B');
@@ -139,24 +139,44 @@ describe('buildRebuttalContext (round-2 rebuttal note)', () => {
     expect(note).toContain('</other_reply>');
   });
 
-  it('offers the NO_REBUTTAL opt-out and stays non-adversarial (build/correct/add)', () => {
+  it('is competitive: argue why YOUR answer is better, and offers the NO_REBUTTAL opt-out', () => {
     const note = buildRebuttalContext('Echo', 'reply text');
     expect(note).toContain('NO_REBUTTAL');
-    expect(note).toMatch(/build on it, correct it, or add what is missing/);
-    // No adversarial framing / length cap / "you are in a battle" constraints.
-    expect(note.toLowerCase()).not.toContain('you are in a battle');
-    expect(note).not.toContain('roughly 150 words');
-    expect(note).not.toContain('rebut');
+    // Competitive framing: make the case that this assistant's own answer is better.
+    expect(note).toMatch(/why YOUR answer is the better one/);
+    expect(note.toLowerCase()).toContain('where yours is stronger');
+    // Not gratuitously hostile, and not a mere restatement.
+    expect(note.toLowerCase()).toContain('fair');
+    expect(note.toLowerCase()).toContain('do not just restate');
   });
 
   it('falls back gracefully when the rival name or reply is empty', () => {
     const note = buildRebuttalContext('', '');
-    expect(note).toContain('another assistant');
+    expect(note).toContain('the other assistant');
     expect(note).toContain('(no reply)');
   });
 
   it('is prefixed with blank lines so it appends cleanly to a system prompt', () => {
     expect(buildRebuttalContext('Echo', 'x').startsWith('\n\n')).toBe(true);
+  });
+});
+
+// Image-battle round-2: an additive one-liner appended AFTER buildRebuttalContext (whose wording is
+// unchanged) ONLY when the rival's round-1 image has been resolved into a vision block on the
+// conversation. It points the model at the image it now perceives in the shared channel.
+describe('buildRebuttalImageNote (image-battle round-2 addendum)', () => {
+  it('tells the assistant to look at and critique the image shown in the conversation', () => {
+    const note = buildRebuttalImageNote();
+    expect(note.toLowerCase()).toContain('image');
+    expect(note.toLowerCase()).toMatch(/critique|look at/);
+    expect(note.toLowerCase()).toContain('conversation');
+    // Appends cleanly to a system prompt.
+    expect(note.startsWith('\n\n')).toBe(true);
+  });
+
+  it('is separate from buildRebuttalContext (its competitive wording is not modified)', () => {
+    // The base rebuttal note stands alone; the image note is strictly additive.
+    expect(buildRebuttalContext('Echo', 'x')).not.toContain('shown to you above');
   });
 });
 

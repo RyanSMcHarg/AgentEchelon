@@ -35,6 +35,7 @@ import { LambdaClient, InvokeCommand, InvocationType } from '@aws-sdk/client-lam
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import {
   deriveBattleId,
+  tryClaimRound1Fanout,
   initBotState,
   isBattleEnabled,
   setActiveBattle,
@@ -810,6 +811,15 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
   // 4. Per-bot fan-out. Deterministic battleId from (channelArn, userMessageId)
   //    so retries are idempotent.
   const battleId = deriveBattleId(channelArn, userMessageId);
+
+  // Idempotency: claim the round-1 fan-out exactly once. Chime channel flows are
+  // at-least-once, so the SAME /battle message can re-enter here; deriveBattleId
+  // gives it the same battleId, and without this claim we would fan out a second
+  // time and post duplicate round-1 replies. Only the first delivery proceeds.
+  if (!(await tryClaimRound1Fanout(battleId))) {
+    console.log('[ChannelFlow][battle] round-1 fan-out already claimed; skipping duplicate delivery', { battleId });
+    return;
+  }
 
   // Classify the prompt once (same for every bot) → decide whether this
   // is a TASK_* battle. Fail-safe to a normal PLACEHOLDER battle so a

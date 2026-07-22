@@ -74,6 +74,23 @@ describe('enableBattle', () => {
     expect(options.method).toBe('POST');
     expect(JSON.parse(options.body)).toEqual({ channelArn: 'c1', experimentId: 'exp-9' });
   });
+
+  it('POSTs /enable with { channelArn } only when experimentId is omitted (backend auto-resolves)', async () => {
+    mockFetch.mockResolvedValueOnce(jsonOk({
+      enabled: true,
+      channelArn: 'c1',
+      experimentId: 'auto-resolved',
+      altBotSlotArn: 'arn:bot/Alt0',
+      altBotDisplayName: 'Challenger',
+    }));
+
+    await enableBattle('c1');
+
+    const [url, options] = mockFetch.mock.calls[0];
+    expect(url).toBe(`${API_URL}/enable`);
+    expect(options.method).toBe('POST');
+    expect(JSON.parse(options.body)).toEqual({ channelArn: 'c1' });
+  });
 });
 
 describe('disableBattle', () => {

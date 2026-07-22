@@ -61,10 +61,15 @@ export async function getBattleConfig(channelArn: string): Promise<ChannelBattle
   return apiCall<ChannelBattleConfig>(`?channelArn=${encodeURIComponent(channelArn)}`);
 }
 
-export async function enableBattle(channelArn: string, experimentId: string): Promise<EnableBattleResult> {
+/**
+ * Enable Battle Mode on a channel. experimentId is optional: there is one
+ * battle per classification, so omitting it lets the backend auto-resolve the
+ * single active battle-enabled experiment for the channel's classification.
+ */
+export async function enableBattle(channelArn: string, experimentId?: string): Promise<EnableBattleResult> {
   return apiCall<EnableBattleResult>('/enable', {
     method: 'POST',
-    body: JSON.stringify({ channelArn, experimentId }),
+    body: JSON.stringify(experimentId ? { channelArn, experimentId } : { channelArn }),
   });
 }
 

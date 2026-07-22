@@ -830,6 +830,38 @@ export async function resolveBattleImageGenPair(
 }
 
 /**
+ * Resolve the single active, battle-enabled experiment for a classification.
+ *
+ * The system holds at most one active experiment per classification (the
+ * §11.1 type-exclusion rule), so a channel of a given classification has
+ * exactly one battle to turn on. This lets the channel-battle enable path
+ * auto-resolve that experiment instead of making the user pick it.
+ *
+ * Reads from the 60s-cached, active-only experiments scan (loadExperiments).
+ * Returns null when no active battle-enabled experiment targets the
+ * classification. If more than one somehow matches (should not happen given
+ * the exclusion rule), returns the first and warns.
+ */
+export async function resolveActiveBattleExperimentForClassification(
+  classification: string,
+): Promise<Experiment | null> {
+  const experiments = await loadExperiments();
+  const matches = experiments.filter(
+    (e) =>
+      e.status === 'active'
+      && e.battleEnabled === true
+      && (e.tiers || []).includes(classification as Classification),
+  );
+  if (matches.length === 0) return null;
+  if (matches.length > 1) {
+    console.warn(
+      `[ExperimentManager] multiple active battle-enabled experiments for classification ${classification}; using ${matches[0].experimentId} (${matches.map((m) => m.experimentId).join(', ')})`,
+    );
+  }
+  return matches[0];
+}
+
+/**
  * Find any other active battle-enabled experiments bound to the same
  * altBotSlotId. Used by the admin-API enable path to enforce the "one
  * experiment per slot" rule (returns conflicts as 409).

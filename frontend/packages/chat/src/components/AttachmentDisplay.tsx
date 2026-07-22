@@ -1,4 +1,4 @@
-import React, { useState } from 'react';
+import React, { useEffect, useState } from 'react';
 import type { Attachment } from '@ae/shared';
 import { getDownloadUrl } from '../services/attachmentService';
 import { useAuth } from '@ae/shared';
@@ -31,8 +31,34 @@ function getFileIcon(type: string): string {
 
 const AttachmentDisplay: React.FC<AttachmentDisplayProps> = ({ attachment }) => {
   const [isDownloading, setIsDownloading] = useState(false);
+  const [imageUrl, setImageUrl] = useState<string | null>(null);
+  const [imageFailed, setImageFailed] = useState(false);
   const { user } = useAuth();
   const { activeConversation } = useConversations();
+
+  const isImage = isImageType(attachment.type);
+
+  // For image attachments, resolve the presigned URL up front so the picture
+  // can render inline rather than as a click-to-open chip.
+  useEffect(() => {
+    if (!isImage || !user || !activeConversation) return;
+
+    let cancelled = false;
+    setImageFailed(false);
+
+    getDownloadUrl(attachment.fileKey, activeConversation.id, user.id)
+      .then((url) => {
+        if (!cancelled) setImageUrl(url);
+      })
+      .catch((error) => {
+        console.error('Failed to resolve image URL:', error);
+        if (!cancelled) setImageFailed(true);
+      });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [isImage, attachment.fileKey, user, activeConversation]);
 
   const handleDownload = async () => {
     if (!user || !activeConversation) return;
@@ -55,13 +81,27 @@ const AttachmentDisplay: React.FC<AttachmentDisplayProps> = ({ attachment }) => 
     }
   };
 
+  // A failed URL fetch or a broken image falls back to the click-to-open chip
+  // so the user never sees a dead box.
+  const showImageChipFallback = isImage && imageFailed;
+
   return (
     <div className="attachment-display">
-      {isImageType(attachment.type) ? (
+      {isImage && !showImageChipFallback ? (
         <div className="attachment-image-preview" onClick={handleDownload}>
-          <div className="attachment-image-placeholder">
-            <span className="attachment-file-icon">img</span>
-          </div>
+          {imageUrl ? (
+            <img
+              src={imageUrl}
+              className="attachment-image"
+              loading="lazy"
+              alt={attachment.name}
+              onError={() => setImageFailed(true)}
+            />
+          ) : (
+            <div className="attachment-image-placeholder">
+              <span className="attachment-image-spinner" />
+            </div>
+          )}
           <span className="attachment-name">{attachment.name}</span>
         </div>
       ) : (

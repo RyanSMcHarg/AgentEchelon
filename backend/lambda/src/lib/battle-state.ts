@@ -554,9 +554,45 @@ export async function tryClaimOrchestratorFire(battleId: string): Promise<boolea
   }
 }
 
-/** Returns rows excluding the orchestrator sentinel. Useful for "all bots done?" checks. */
+/**
+ * Claim the round-1 fan-out for a battleId exactly once, so a Chime channel-flow
+ * REDELIVERY of the same /battle message cannot fan out (placeholders + worker
+ * invokes) a second time and produce duplicate replies. Mirrors
+ * tryClaimOrchestratorFire: a conditional-write sentinel row; only the first
+ * caller returns true. deriveBattleId keys this on channelArn+userMessageId, so
+ * the same message always claims the same battleId.
+ */
+export async function tryClaimRound1Fanout(battleId: string): Promise<boolean> {
+  if (!BATTLE_STATE_TABLE) return true; // no state table: cannot dedupe, fan out (dev/athena)
+  const ttl = Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS;
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: BATTLE_STATE_TABLE,
+        Item: {
+          battleId,
+          botArn: '__round1__',
+          state: 'COMPLETED',
+          enteredStateAt: new Date().toISOString(),
+          ttl,
+        },
+        ConditionExpression: 'attribute_not_exists(botArn)',
+      }),
+    );
+    return true;
+  } catch (err) {
+    if ((err as { name?: string }).name === 'ConditionalCheckFailedException') {
+      return false; // a prior delivery already fanned out round 1
+    }
+    console.warn('[battle-state] tryClaimRound1Fanout failed:', err);
+    return true; // fail-open: a state-table blip should not swallow the battle
+  }
+}
+
+/** Returns rows excluding the sentinel rows (`__orchestrator__`, `__round1__`, ...).
+ *  Useful for "all bots done?" checks. Sentinels are the `__`-prefixed SKs. */
 export function botRowsOnly(rows: BattleStateRow[]): BattleStateRow[] {
-  return rows.filter((r) => r.botArn !== '__orchestrator__');
+  return rows.filter((r) => !r.botArn.startsWith('__'));
 }
 
 /** True iff every bot row is in a terminal state (COMPLETED or FAILED). */

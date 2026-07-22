@@ -70,10 +70,14 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
   const showBattleSection = isPremium && isCurrentUserModerator;
 
   const [battleConfig, setBattleConfig] = useState<ChannelBattleConfig | null>(null);
+  // The single battle-enabled experiment for this classification, when we can
+  // list it (admins only). Used ONLY to show its name read-only; enable no
+  // longer needs an id (the backend auto-resolves the one battle per classification).
   const [battleExperiments, setBattleExperiments] = useState<Experiment[]>([]);
-  const [selectedExperimentId, setSelectedExperimentId] = useState<string>('');
   const [battleBusy, setBattleBusy] = useState(false);
   const [battleError, setBattleError] = useState<string | null>(null);
+  // The resolved battle experiment for display, if listing surfaced one.
+  const resolvedBattleExperiment = battleExperiments[0] ?? null;
 
   useEffect(() => {
     if (!showBattleSection || !activeConversation) {
@@ -107,9 +111,6 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
             && e.status === 'active',
         );
         setBattleExperiments(eligible);
-        if (eligible.length > 0 && !selectedExperimentId) {
-          setSelectedExperimentId(eligible[0].experimentId);
-        }
       } catch {
         // Non-fatal; section just shows the off state with no experiments
       }
@@ -120,11 +121,13 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
   }, [activeConversation, showBattleSection, user?.isAdmin]);
 
   const handleEnableBattle = async () => {
-    if (!activeConversation || !selectedExperimentId) return;
+    if (!activeConversation) return;
     setBattleBusy(true);
     setBattleError(null);
     try {
-      await enableBattle(activeConversation.conversationArn, selectedExperimentId);
+      // No experiment id: the backend auto-resolves the single active
+      // battle-enabled experiment for this channel's classification.
+      await enableBattle(activeConversation.conversationArn);
       const refreshed = await getBattleConfig(activeConversation.conversationArn);
       setBattleConfig(refreshed);
     } catch (err) {
@@ -264,39 +267,22 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
             </button>
           ) : (
             <div className="channel-members-panel-battle-controls">
-              {battleExperiments.length === 0 ? (
-                <p className="channel-members-panel-battle-empty">
-                  No battle-eligible experiments configured. Ask an admin to mark one as battle-enabled in the Experiments tab.
+              {resolvedBattleExperiment && (
+                <p className="channel-members-panel-battle-experiment">
+                  Experiment:{' '}
+                  <strong>
+                    {resolvedBattleExperiment.description || resolvedBattleExperiment.experimentId}
+                  </strong>
                 </p>
-              ) : (
-                <>
-                  <label htmlFor="battle-experiment-select" className="channel-members-panel-battle-label">
-                    Experiment
-                  </label>
-                  <select
-                    id="battle-experiment-select"
-                    className="channel-members-panel-battle-select"
-                    value={selectedExperimentId}
-                    onChange={(e) => setSelectedExperimentId(e.target.value)}
-                    disabled={battleBusy}
-                  >
-                    {battleExperiments.map((exp) => (
-                      <option key={exp.experimentId} value={exp.experimentId}>
-                        {exp.experimentId}
-                        {exp.description ? ` — ${exp.description}` : ''}
-                      </option>
-                    ))}
-                  </select>
-                  <button
-                    type="button"
-                    className="channel-members-panel-battle-btn channel-members-panel-battle-btn--enable"
-                    onClick={handleEnableBattle}
-                    disabled={battleBusy || !selectedExperimentId}
-                  >
-                    {battleBusy ? 'Working…' : 'Turn on Battle Mode'}
-                  </button>
-                </>
               )}
+              <button
+                type="button"
+                className="channel-members-panel-battle-btn channel-members-panel-battle-btn--enable"
+                onClick={handleEnableBattle}
+                disabled={battleBusy}
+              >
+                {battleBusy ? 'Working…' : 'Turn on Battle Mode'}
+              </button>
             </div>
           )}
         </section>

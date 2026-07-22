@@ -75,6 +75,8 @@ import {
   getModelCatalog,
   type BackendModelKey,
 } from '../../../lib/config/model-strategy.js';
+import { extractAttachment } from './battle-attachment.js';
+import { fetchAttachmentBytes, type S3GetClient } from './attachment-bytes.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 // Chime SDK Messaging hard limits apply to the request parameter length
@@ -442,7 +444,20 @@ export interface LongResponseResult {
   totalParts?: number;
 }
 
-export type ConversationMessage = { role: 'user' | 'assistant'; content: string };
+export type ConversationMessage = {
+  role: 'user' | 'assistant';
+  content: string;
+  /**
+   * Vision-through-conversation: image attachments carried on THIS message (from the Chime message
+   * Metadata's `attachment`), captured by loadChannelHistory and preserved across consolidation. Each
+   * entry's `bytes` is filled in later by a bounded fetch (resolveHistoryImageBlocks);
+   * buildConverseMessages then renders each as a Converse image block on this message, so the assistant
+   * genuinely SEES images shared earlier in the shared channel (e.g. a rival's generated image in an
+   * /battle round-2 rebuttal) by reading the conversation itself. Absent on text turns -> byte-identical
+   * to before.
+   */
+  images?: Array<{ fileKey: string; contentType: string; bytes?: Uint8Array }>;
+};
 
 // ============================================================
 // Placeholder Polling
@@ -547,9 +562,20 @@ export async function loadChannelHistory(
       // Skip placeholder messages
       if (isBot && (content.includes('thinking') || content.includes('...'))) continue;
 
+      // Vision-through-conversation: capture an IMAGE attachment carried on this message (from the
+      // message Metadata's `attachment` - the same shape a generated image rides on, see
+      // buildImageGenAttachment). Metadata-only here (no S3 fetch): a later bounded step resolves the
+      // bytes. Non-image attachments (documents) are ignored. Best-effort - a parse miss just omits it.
+      const att = extractAttachment(msg.Metadata);
+      const images =
+        att && imageFormatFromContentType(att.contentType)
+          ? [{ fileKey: att.fileKey, contentType: att.contentType }]
+          : undefined;
+
       history.push({
         role: isBot ? 'assistant' : 'user',
         content,
+        ...(images && { images }),
       });
     }
 
@@ -728,8 +754,12 @@ export function consolidateConsecutiveMessages(
     const last = consolidated[consolidated.length - 1];
     if (last && last.role === msg.role) {
       last.content += '\n\n' + msg.content;
+      // Preserve image attachments from every merged message (e.g. both bots' round-1 images in an
+      // image battle are consecutive assistant messages that consolidate into one block), so no
+      // shared-conversation image is lost when consecutive same-role turns are combined.
+      if (msg.images?.length) last.images = [...(last.images ?? []), ...msg.images];
     } else {
-      consolidated.push({ ...msg });
+      consolidated.push({ ...msg, ...(msg.images ? { images: [...msg.images] } : {}) });
     }
   }
 
@@ -821,10 +851,20 @@ export function buildConverseMessages(
   imageInput?: BedrockImageInput,
   documentInput?: BedrockDocumentInput,
 ): Array<{ role: 'user' | 'assistant'; content: Array<Record<string, unknown>> }> {
-  const out = messages.map(msg => ({
-    role: msg.role as 'user' | 'assistant',
-    content: [{ text: msg.content }] as Array<Record<string, unknown>>,
-  }));
+  const out = messages.map(msg => {
+    const content: Array<Record<string, unknown>> = [{ text: msg.content }];
+    // Vision-through-conversation: render each RESOLVED image attachment carried on this history
+    // message (bytes filled by resolveHistoryImageBlocks) as a Converse image block, so the assistant
+    // sees images shared earlier in the channel. Entries without bytes or an unusable format are
+    // skipped (never a malformed block).
+    for (const img of msg.images ?? []) {
+      const fmt = img.bytes ? imageFormatFromContentType(img.contentType) : undefined;
+      if (img.bytes && fmt) {
+        content.push({ image: { format: fmt, source: { bytes: img.bytes } } });
+      }
+    }
+    return { role: msg.role as 'user' | 'assistant', content };
+  });
   // Append the attachment block to the LAST user message (the current turn). Image OR document;
   // if there's no user message it's dropped rather than sent malformed.
   const block = imageInput
@@ -841,6 +881,51 @@ export function buildConverseMessages(
     }
   }
   return out;
+}
+
+/**
+ * Vision-through-conversation: resolve image attachments carried on RECENT history messages into
+ * Converse image blocks, by fetching their bytes from the attachments bucket. This is how an assistant
+ * perceives an image shared earlier in the SHARED channel (e.g. a rival's round-1 generated image in an
+ * /battle round-2 rebuttal) - the image is read straight from the conversation, not an out-of-band side
+ * channel. Mutates the passed messages in place (sets `bytes` on each resolved image entry) so
+ * buildConverseMessages then renders them.
+ *
+ * Bounded for cost/latency: only the last `windowSize` messages are considered and at most `maxImages`
+ * images are attached, newest-first (so the most recent images - the rival's round-1 output - win the
+ * cap). Each fetch is guarded: a miss is skipped, never thrown, so a fetch failure degrades to a
+ * text-only turn rather than crashing. Returns the number of images actually attached.
+ */
+export async function resolveHistoryImageBlocks(args: {
+  messages: ConversationMessage[];
+  s3: S3GetClient;
+  bucket: string;
+  /** How many trailing messages to scan for images. Default 6. */
+  windowSize?: number;
+  /** Hard cap on images attached (cost/latency guard). Default 2. */
+  maxImages?: number;
+}): Promise<number> {
+  const { messages, s3, bucket } = args;
+  if (!bucket) return 0;
+  const windowSize = args.windowSize ?? 6;
+  const maxImages = args.maxImages ?? 2;
+  const start = Math.max(0, messages.length - windowSize);
+  let attached = 0;
+  // Newest-first so the most recent images win the cap.
+  for (let i = messages.length - 1; i >= start && attached < maxImages; i--) {
+    for (const img of messages[i].images ?? []) {
+      if (attached >= maxImages) break;
+      if (img.bytes) continue; // already resolved
+      if (!imageFormatFromContentType(img.contentType)) continue; // unusable format
+      try {
+        img.bytes = await fetchAttachmentBytes(s3, bucket, img.fileKey);
+        attached++;
+      } catch (err) {
+        console.warn('[AsyncProcessor] history image fetch failed (skipping):', err);
+      }
+    }
+  }
+  return attached;
 }
 
 // Guards a runaway tool loop; a normal company question resolves in 1 round.
@@ -1749,7 +1834,7 @@ export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
   pollTime: number;
   consolidatedHistory: ConversationMessage[];
   priorAgentContext: string;
-  bedrockMessages: Array<{ role: 'user' | 'assistant'; content: string }>;
+  bedrockMessages: ConversationMessage[];
   userSub: string;
   /**
    * First-turn channel rename (title derivation) promise, or undefined when
@@ -2700,9 +2785,19 @@ const BATTLE_ORCHESTRATOR_ARN = process.env.BATTLE_ORCHESTRATOR_ARN;
  * Pure.
  */
 export function buildRebuttalContext(rivalDisplayName: string, rivalReply: string): string {
-  const rival = rivalDisplayName || 'another assistant';
+  const rival = rivalDisplayName || 'the other assistant';
   const reply = rivalReply || '(no reply)';
-  return `\n\n[Another assistant, ${rival}, answered the same prompt below. Read it and respond: build on it, correct it, or add what is missing. You may respond with the single token NO_REBUTTAL if you have nothing to add.]\n<other_reply>\n${reply}\n</other_reply>`;
+  return `\n\n[You are in a head-to-head battle. Below is ${rival}'s answer to the SAME prompt. Write a SHORT rebuttal: comment on ${rival}'s answer and make the case for why YOUR answer is the better one - be specific about where yours is stronger, more accurate, or more useful, and where theirs falls short or missed something. Be pointed but fair; do not just restate your answer, and do not be gratuitously dismissive. If ${rival}'s answer is genuinely better or equal and you have nothing to add, respond with the single token NO_REBUTTAL.]\n<other_reply>\n${reply}\n</other_reply>`;
+}
+
+/**
+ * Image-battle round-2 addendum. Appended to buildRebuttalContext ONLY when the rival's round-1
+ * output was an image that has been resolved into a Converse vision block on the conversation (so the
+ * model can actually see it). Points the assistant at the image it now perceives in the shared
+ * conversation. buildRebuttalContext's wording is unchanged; this is an additive one-liner. Pure.
+ */
+export function buildRebuttalImageNote(): string {
+  return `\n\n[The image(s) produced in this battle are shown to you above in the conversation. Look at the other assistant's image and critique it specifically - be concrete about what yours does better.]`;
 }
 
 /**

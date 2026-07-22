@@ -46,8 +46,10 @@ import {
   imageFormatFromContentType,
   docFormatFromContentType,
   buildRebuttalContext,
+  buildRebuttalImageNote,
   buildBattleAwareness,
   resolveBattleVisionPlan,
+  resolveHistoryImageBlocks,
   resolveGenerationOutPlan,
   resolveTurnImageGenModelId,
   buildTaskLoopContext,
@@ -776,8 +778,14 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // normal text turn rather than throwing in persistImageGenOutput.
     // TODO(phase2b): wire the image env (ATTACHMENTS_BUCKET + BATTLE_IMAGE_* guardrail/caps +
     // IMAGE_GEN_KEYS_SECRET_ARN) on the non-premium processors so they can generate images too.
-    const canGenerateImage = genOutPlan.action === 'generation' && !!process.env.ATTACHMENTS_BUCKET;
-    if (genOutPlan.action === 'generation' && !canGenerateImage) {
+    // A round-2 battle turn is always a VERBAL rebuttal (a grounded critique of the rival's round-1
+    // output), never a fresh image generation - even in an image battle. So suppress gen-out on round 2
+    // and let the normal Bedrock text path run, with the rival's round-1 image attached as a vision
+    // block (resolved from the conversation below). Round-1 image battles are unaffected.
+    const isRebuttalTurn = battleOn && event.battleContext?.round === 2;
+    const canGenerateImage =
+      genOutPlan.action === 'generation' && !!process.env.ATTACHMENTS_BUCKET && !isRebuttalTurn;
+    if (genOutPlan.action === 'generation' && !canGenerateImage && !isRebuttalTurn) {
       console.warn(
         '[AssistantAsyncProcessor] resolved an image model but ATTACHMENTS_BUCKET is unset on this ' +
           'processor; degrading to a text turn. TODO(phase2b): wire image env on non-premium processors.',
@@ -785,6 +793,43 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       );
     }
     const imgAtt = battleOn ? event.battleContext?.imageAttachment : undefined;
+
+    // ── /battle round-2 image rebuttal (perceive-through-conversation): if the rival's round-1 output
+    // was a GENERATED IMAGE, it rides its round-1 message as a Chime attachment - already captured onto
+    // the loaded history by loadChannelHistory. Resolve those recent history image attachments into
+    // Converse vision blocks (bytes fetched from ATTACHMENTS_BUCKET, bounded for cost) so the rebuttal
+    // critiques the rival's ACTUAL image read from the shared channel, not just its caption. Gated to a
+    // vision-capable model; degrades to a text-only rebuttal on any miss (never crashes). The rebuttal
+    // then runs the normal Bedrock text path below, which renders the attached image blocks. A text
+    // battle has no history images, so this is a no-op there.
+    if (isRebuttalTurn && process.env.ATTACHMENTS_BUCKET) {
+      const rebuttalVisionPlan = resolveBattleVisionPlan({
+        variantModelKey: battleVariantModelKey,
+        baseModelId: effectiveModel,
+        hasImageAttachment: true,
+        imageContentType: 'image/png', // generated battle images are always PNG
+      });
+      if (rebuttalVisionPlan.action === 'vision') {
+        try {
+          const attached = await resolveHistoryImageBlocks({
+            messages: bedrockMessages,
+            s3: s3Client,
+            bucket: process.env.ATTACHMENTS_BUCKET,
+          });
+          if (attached > 0) {
+            // Additive one-liner (buildRebuttalContext wording unchanged): point the model at the image
+            // it now sees in the conversation. Appended to the END, after the cache-prefix point, so it
+            // does not disturb systemPrompt caching.
+            systemPrompt += buildRebuttalImageNote();
+            console.log('[AssistantAsyncProcessor][battle] round-2 rebuttal sees rival image(s) via conversation', { attached });
+          }
+        } catch (e) {
+          console.warn('[AssistantAsyncProcessor][battle] rival image resolution failed; text-only rebuttal:', e);
+        }
+      } else {
+        console.log('[AssistantAsyncProcessor][battle] round-2 model not vision-capable; text-only rebuttal');
+      }
+    }
 
     if (canGenerateImage) {
       // No Bedrock text call: invoke the image model, persist to S3, deliver the image as a message

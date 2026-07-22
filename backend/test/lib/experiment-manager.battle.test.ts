@@ -371,6 +371,52 @@ describe('resolveBattleVariantBySlotArn (hot-path lookup)', () => {
   });
 });
 
+describe('resolveActiveBattleExperimentForClassification (single-battle auto-resolve)', () => {
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.EXPERIMENTS_TABLE = 'experiments-test';
+    jest.resetModules();
+  });
+
+  it('returns null when no active battle-enabled experiment targets the classification', async () => {
+    // Only a non-battle experiment on premium exists.
+    mockSend.mockResolvedValueOnce({
+      Items: [
+        { experimentId: 'exp-plain', status: 'active', battleEnabled: false, tiers: ['premium'] },
+      ],
+    } as unknown as QueryCommandOutput);
+    const { resolveActiveBattleExperimentForClassification: resolve } = await import('../../lambda/src/lib/experiment-manager');
+    expect(await resolve('premium')).toBeNull();
+  });
+
+  it('returns the single battle-enabled experiment for the classification', async () => {
+    mockSend.mockResolvedValueOnce({
+      Items: [
+        { experimentId: 'exp-other', status: 'active', battleEnabled: true, tiers: ['standard'] },
+        { experimentId: 'exp-battle', status: 'active', battleEnabled: true, tiers: ['premium'] },
+      ],
+    } as unknown as QueryCommandOutput);
+    const { resolveActiveBattleExperimentForClassification: resolve } = await import('../../lambda/src/lib/experiment-manager');
+    const result = await resolve('premium');
+    expect(result?.experimentId).toBe('exp-battle');
+  });
+
+  it('returns the first match and warns when more than one somehow matches', async () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    mockSend.mockResolvedValueOnce({
+      Items: [
+        { experimentId: 'exp-a', status: 'active', battleEnabled: true, tiers: ['premium'] },
+        { experimentId: 'exp-b', status: 'active', battleEnabled: true, tiers: ['premium'] },
+      ],
+    } as unknown as QueryCommandOutput);
+    const { resolveActiveBattleExperimentForClassification: resolve } = await import('../../lambda/src/lib/experiment-manager');
+    const result = await resolve('premium');
+    expect(result?.experimentId).toBe('exp-a');
+    expect(warn).toHaveBeenCalled();
+    warn.mockRestore();
+  });
+});
+
 describe('resolveBattleControlVariantByAltSlotArn (default-bot control side)', () => {
   beforeEach(() => {
     jest.clearAllMocks();

@@ -305,20 +305,10 @@
   gap: var(--space-2);
 }
 
-.channel-members-panel-battle-label {
+.channel-members-panel-battle-experiment {
+  margin: 0;
   font-size: var(--font-size-xs);
-  font-weight: var(--font-weight-medium);
   color: var(--text-secondary);
-}
-
-.channel-members-panel-battle-select {
-  width: 100%;
-  padding: var(--space-2);
-  border: 1px solid var(--surface-300);
-  border-radius: var(--radius-sm);
-  background: var(--surface-0);
-  font-size: var(--font-size-sm);
-  color: var(--text-primary);
 }
 
 .channel-members-panel-battle-btn {
@@ -354,14 +344,4 @@
 .channel-members-panel-battle-btn:disabled {
   opacity: 0.6;
   cursor: not-allowed;
-}
-
-.channel-members-panel-battle-empty {
-  margin: 0;
-  padding: var(--space-2);
-  background: var(--surface-100);
-  border-radius: var(--radius-sm);
-  font-size: var(--font-size-xs);
-  color: var(--text-tertiary);
-  line-height: 1.4;
 }
