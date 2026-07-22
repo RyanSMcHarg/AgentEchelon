@@ -43,5 +43,7 @@ test('Assistants → Profiles LOADS the profile list from the live manage-profil
   // Drill into a profile → its version list (active pointer visible).
   await rows.first().click();
   await expect(page.locator('.admin-breadcrumb')).toBeVisible({ timeout: 10000 });
-  await expect(page.getByText(/Active version/i)).toBeVisible();
+  // The version view renders "Active version" in more than one place (label + the active row), so scope
+  // to the first match — the assertion is "the version detail loaded", not "exactly one such string".
+  await expect(page.getByText(/Active version/i).first()).toBeVisible();
 });
