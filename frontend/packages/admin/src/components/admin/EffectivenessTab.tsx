@@ -288,13 +288,22 @@ const L1Intent: React.FC<{ row: Row; toolLens: ToolAgg[] | null; onDrill: (deliv
         {hasTasks && <button className="admin-filter-btn" onClick={() => onDrill('task')}>Tasks ({num(row.task_count) || 0})</button>}
       </div>
       <p className="admin-tab-description" style={{ fontSize: '0.9em', marginTop: 12 }}>
-        <strong>How tools relate to tasks here.</strong> Each turn runs a <em>tool loop</em>: the assistant
-        reasons, optionally calls one or more tools, observes their results, then answers. A multi-step
-        <strong> task</strong> (e.g. <code>data_extraction</code>) is several such turns, each advancing the
-        task's machine state. The panel below <em>aggregates</em> which tools this intent's assistant invoked
-        across all its turns (and each tool's error rate). To see <strong>which tool ran in which task turn</strong>,
-        open <strong>Tasks</strong> above → a task's turn-by-turn <strong>timeline</strong> → expand a turn to its
-        <strong> tool-loop steps</strong> (each step shows its model and the tools it called, ✓ / ✗ with the error class).
+        <strong>How tools relate to this intent.</strong> Each turn runs a <em>tool loop</em>: the assistant
+        reasons, optionally calls one or more tools, observes their results, then answers. An intent's traffic
+        takes one of two shapes — a single-turn <strong>Exchange</strong> (one request, one answer) or a
+        multi-step <strong>Task</strong> (several turns advancing a tracked machine state, e.g.{' '}
+        <code>report_generation</code> or <code>data_extraction</code>). Which shape depends on the work: a
+        self-contained request is answered directly; work that needs staged steps becomes a task.{' '}
+        {hasTasks && hasDirect
+          ? <>This intent has both in this window.</>
+          : hasTasks
+            ? <>This intent ran as multi-step <strong>tasks</strong> in this window; it has no single-turn exchanges here.</>
+            : <>This intent is answered in single-turn <strong>exchanges</strong>, so it has no multi-step tasks in this window — which is why only <strong>Exchanges</strong> appears above.</>}
+        {' '}The tool lens below <em>aggregates</em> which tools this intent's assistant invoked across all its
+        turns (and each tool's error rate). To see <strong>which tool ran in which turn</strong>, open{' '}
+        {hasTasks && !hasDirect ? 'a Task' : 'an Exchange'}{hasTasks && hasDirect ? ' or Task' : ''} above →
+        its turn-by-turn <strong>timeline</strong> → expand a turn to its <strong>tool-loop steps</strong>{' '}
+        (each step shows its model and the tools it called, ✓ / ✗ with the error class).
       </p>
       <ToolLensPanel tools={toolLens} />
     </div>
@@ -565,7 +574,7 @@ const EffectivenessTab: React.FC<EffectivenessTabProps> = ({ data, dateRange, is
             taxonomy or router problem; the reverse is a runtime problem; a red Tools cell is a tool-dependency
             problem. <strong>Latency</strong>, <strong>Cost/reply</strong>, and <strong>Tool error rate</strong> are
             independently sortable decision columns. <strong>Click an intent</strong> to drill into its exchanges or
-            tasks, then a task's turn-by-turn timeline, then that turn's tool-loop steps.{' '}
+            tasks, then a turn-by-turn timeline, then that turn's tool-loop steps.{' '}
             <DocLink href={DOC_LINKS.evaluation}>How quality is measured</DocLink>
           </p>
           <p className="admin-tab-description" style={{ fontStyle: 'italic', opacity: 0.85 }}>
