@@ -436,6 +436,11 @@ export interface AsyncProcessorConfig {
    *  assistant may use, intersected with each tool's runtime availability. `undefined` ⇒ all available
    *  tools (legacy/unset — byte-identical to the pre-allowlist behavior). SPEC-ASSISTANT-CONFIG §4. */
   tools?: string[];
+  /** Skip the INPUT guardrail for this turn. Set only for orchestrator-triggered follow-on turns that
+   *  carry NO NEW user input (a /battle round-2 rebuttal): the user's prompt was already vetted on the
+   *  round-1 turn, and re-guarding the re-sent history would inconsistently block a rebuttal whose prompt
+   *  round-1 already allowed. The OUTPUT guardrail still runs. Never set for a real user turn. */
+  skipInputGuardrail?: boolean;
 }
 
 export interface LongResponseResult {
@@ -1355,7 +1360,12 @@ export async function invokeBedrock(
   // OPEN on a guardrail outage. Pairs with applyOutputGuardrail below (input +
   // output = full coverage). See docs/IDENTITY-AND-ACCESS-MODEL.md §8.
   const latestUserText = [...messages].reverse().find((m) => m.role === 'user')?.content ?? '';
-  const inputGuard = await applyInputGuardrail(latestUserText);
+  // A /battle round-2 rebuttal is orchestrator-triggered with no new user input (the prompt was already
+  // guardrail-checked on round 1), so skipping the INPUT guardrail here avoids inconsistently blocking a
+  // rebuttal whose prompt round-1 already allowed. The output guardrail still runs. See AsyncProcessorConfig.
+  const inputGuard = config.skipInputGuardrail
+    ? { blocked: false, message: '' }
+    : await applyInputGuardrail(latestUserText);
   if (inputGuard.blocked) {
     console.warn('[AsyncProcessor] input guardrail intervened; blocking turn before model call');
     return { response: inputGuard.message, inputTokens: 0, outputTokens: 0, bedrockTime: Date.now() - bedrockStart, steps };

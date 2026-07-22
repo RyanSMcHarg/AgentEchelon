@@ -607,7 +607,15 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // SPEC-ASSISTANT-CONFIG §4 — per-profile tool allowlist: the active version's `tools` gate which tools
     // the Converse loop may offer (undefined ⇒ all available, byte-identical to before). Flows into
     // bedrockInvokeConfig below (which spreads invokeConfig).
-    const invokeConfig = { ...CONFIG, model: effectiveModel, tools: active.tools };
+    // A /battle round-2 rebuttal carries no new user input (the prompt was guarded on round 1), so skip the
+    // INPUT guardrail on it - otherwise a rebuttal whose prompt round-1 already allowed gets blocked. Output
+    // guardrail still runs.
+    const invokeConfig = {
+      ...CONFIG,
+      model: effectiveModel,
+      tools: active.tools,
+      skipInputGuardrail: battleOn && event.battleContext?.round === 2,
+    };
     // P0 attribution: which profile VERSION served this turn's base model ('seed' = the compiled
     // default, i.e. no active version). Battle/experiment overrides still take precedence above.
     console.log('[AssistantAsyncProcessor] active profile', {
