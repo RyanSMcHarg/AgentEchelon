@@ -58,7 +58,7 @@ Personas are defined once in [`../../overview/PERSONAS.md`](../../overview/PERSO
 
 **FR6 - Three-axis scorecard, no composite.** After both round-1 replies land, the user sees a scorecard with three independent axes shown side by side and never folded into one number: response time, estimated cost, and quality (an explicit human pick: A better, tie, or B better). Cost is labeled an estimate, not a bill. A "Show steps" expander reveals which model ran each step and how long it took. *Done when:* the three axes render separately; the pick records a per-battle outcome; re-picking overwrites; cost carries a "not a bill" caveat.
 
-**FR7 - Live tally and per-variant credit.** Picks accumulate live in the conversation (a running tally of wins per side and the speed, cost, and preferred leaders) and, in Aurora mode, are credited per variant as a "Battle wins" column in the same experiment results as probabilistic traffic. *Done when:* the tally updates as the user picks; each pick maps A->control, B->treatment, tie->both, and surfaces in per-variant results.
+**FR7 - Per-battle result and per-variant credit.** Each battle ends with its own inline result card for that prompt (each side's response time and estimated cost, and which side the user picked); the next `/battle` gets a fresh card, so the conversation reads as a sequence of independent battle results rather than one running total. In Aurora mode each pick is credited per variant as a "Battle wins" column in the same experiment results as probabilistic traffic. *Done when:* each battle shows its own result card at its end; each pick maps A->control, B->treatment, tie->both, and surfaces in per-variant results.
 
 **FR8 - Unify with A/B, never auto-route.** A battle is the same experiment's two variants compared head-to-head instead of split probabilistically. Battle results are descriptive: a leading variant produces a recommendation, and promotion stays a deliberate manual config change. *Done when:* no battle outcome changes routing on its own; promotion requires an explicit operator action.
 
@@ -76,7 +76,6 @@ Personas are defined once in [`../../overview/PERSONAS.md`](../../overview/PERSO
 
 ## 7. Open Product Questions
 
-- Should the confidence nudge ("N picks toward a confident call") be bound to a specific declared experiment objective, or stay a generic all-axes prompt? (Currently generic; the objective lives on the experiment, not the conversation.)
 - Should the end-of-battle summary retain the verbatim clarifying-question Q&A text, not just the quantitative "how often did each side ask" metric? (Currently the metric is captured, the verbatim text is not.)
 - For report and document battles, is one-shot (full deliverable in round 1) or outline-first the better default for comparing directions?
 - Which image-generation model should ship as the baseline for generation-out battles, and what default image-output guardrail is reasonable before a deployer tunes it?

@@ -99,7 +99,7 @@ const ENTERPRISE_TOPOLOGY: ProfileTopology = {
   modelSelectionKey: 'enterprise',
   timeoutSeconds: 90, memorySize: 1024, reservedConcurrency: 20, maxTokens: 4096,
   streaming: true,          // InvokeModelWithResponseStream
-  imageGen: true,           // /battle image generation-out + image guardrail (drop if not in scope)
+  imageGen: true,           // image_generation capability: models.image on normal turns + experiments/battles + image guardrail (drop if not in scope)
   contextRouting: false,    // external/CN routing (standard only, by default)
   systemPromptParam: true,  // per-deployment persona in SSM
   intentPackParam: true,    // per-deployment intent taxonomy in SSM
