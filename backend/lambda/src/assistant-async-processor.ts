@@ -705,6 +705,8 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       fallbackReason?: string;
       retryCount?: number;
       steps?: ConverseStep[];
+      modelMs?: number;
+      toolMs?: number;
     };
 
     // SPEC-TASK-STATE-TRANSITIONS: active-task context for the in-loop advance_task_state tool
@@ -1127,6 +1129,8 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       ...(battleImageCount != null && { imageCount: battleImageCount }),
       ...(battleSelfDisplayName && { battleSelfDisplayName }),
       steps: bedrockResult.steps,
+      modelMs: bedrockResult.modelMs,
+      toolMs: bedrockResult.toolMs,
     });
 
     // Reply is posted; now let the first-turn title rename finish before the Lambda execution

@@ -61,9 +61,14 @@ function updateRecord(overrides: Record<string, any> = {}): any {
     latency_ms: 900,
     total_ms: 1800,
     poll_ms: 50,
+    model_ms: 700,
+    tool_ms: 200,
+    processor_entry_ms: 1752537600000,
     persistence: 'PERSISTENT',
     metadata: {},
     created_at: '2026-07-15T00:00:00.000Z',
+    // The UPDATE event's own Chime timestamp (final answer posted 2s after the placeholder).
+    last_updated_at: '2026-07-15T00:00:02.000Z',
     intent: 'BUSINESS_QUERY',
     intent_confidence: 'high',
     original_intent: null,
@@ -118,6 +123,34 @@ describe('kinesis-archival backfillFromUpdateEvents', () => {
     expect(params[0]).toBe('BUSINESS_QUERY');
     expect(params[11]).toBe('msg-123');
     expect(params[12]).toBe('arn:aws:chime:...:channel/abc');
+  });
+
+  it('derives agent_final_at from the update timestamp (gated on total_ms) and e2e_ms on the exchange', async () => {
+    await backfillFromUpdateEvents([updateRecord()]);
+
+    // agent_final_at is the Chime update time ($14), set only when this update carries completion
+    // telemetry ($7 total_ms) and frozen by COALESCE so a later moderation/battle update cannot move it.
+    const messageCall = mockedQuery.mock.calls.find(([sql]) => /UPDATE messages/.test(sql as string));
+    const [msgSql, msgParams] = messageCall as [string, any[]];
+    expect(msgSql).toMatch(
+      /agent_final_at\s*=\s*COALESCE\(agent_final_at, CASE WHEN \$7 IS NOT NULL THEN \$14::timestamptz END\)/,
+    );
+    expect(msgParams[13]).toBe('2026-07-15T00:00:02.000Z');
+    // Bedrock latency split folded onto the message: model_ms ($15), tool_ms ($16).
+    expect(msgSql).toMatch(/model_ms\s*=\s*COALESCE\(\$15, model_ms\)/);
+    expect(msgSql).toMatch(/tool_ms\s*=\s*COALESCE\(\$16, tool_ms\)/);
+    expect(msgParams[14]).toBe(700);
+    expect(msgParams[15]).toBe(200);
+
+    // e2e_ms = agent_final_at - user_message_at (both Chime, skew-free); inbound_ms = processor entry
+    // ($16) - user_message_at (cross-clock), clamped >= 0. Both guarded and idempotent.
+    const exchangeCall = mockedQuery.mock.calls.find(([sql]) => /UPDATE exchanges/.test(sql as string));
+    const [exSql, exParams] = exchangeCall as [string, any[]];
+    expect(exSql).toMatch(/e2e_ms\s*=\s*COALESCE\(ex\.e2e_ms,/);
+    expect(exSql).toContain('am.agent_final_at - ex.user_message_at');
+    expect(exSql).toMatch(/inbound_ms\s*=\s*COALESCE\(ex\.inbound_ms,/);
+    expect(exSql).toContain('GREATEST(0,');
+    expect(exParams[15]).toBe(1752537600000); // $16 processor_entry_ms
   });
 
   it('folds task machine state (task_state + JSONB task_transition) onto the exchange', async () => {

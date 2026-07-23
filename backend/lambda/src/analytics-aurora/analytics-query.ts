@@ -1342,7 +1342,19 @@ async function getLatencyMetrics(
        -- distinct from total_ms). response_latency_ms already records
        -- placeholder_created_at - user_message_at; null on unpaired/DIRECT rows.
        ROUND(AVG(e.response_latency_ms)) AS avg_ttff_ms,
-       ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY e.response_latency_ms)) AS p95_ttff_ms
+       ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY e.response_latency_ms)) AS p95_ttff_ms,
+       -- E2E = user message -> FINAL answer (exchanges.e2e_ms = agent_final_at - user_message_at),
+       -- the full user-perceived wait. Distinct from total_ms (server compute from processor entry)
+       -- and from TTFF (time to the placeholder). Null on rows whose final-answer update has not been
+       -- folded yet, and on DIRECT/unpaired rows. LATENCY-TARGETS.md.
+       ROUND(AVG(e.e2e_ms)) AS avg_e2e_ms,
+       ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY e.e2e_ms)) AS p95_e2e_ms,
+       -- Bedrock (latency_ms) split into model inference (model_ms) vs in-loop tool execution (tool_ms),
+       -- plus the inbound hop (user message -> processor entry; cross-clock, approximate). Null until
+       -- the completion update is folded. LATENCY-TARGETS.md.
+       ROUND(AVG(m.model_ms)) AS avg_model_ms,
+       ROUND(AVG(m.tool_ms)) AS avg_tool_ms,
+       ROUND(AVG(e.inbound_ms)) AS avg_inbound_ms
      FROM messages m
      LEFT JOIN exchanges e ON e.agent_message_id = m.id
      LEFT JOIN conversations c ON e.conversation_id = c.id
@@ -1363,6 +1375,8 @@ async function getLatencyMetrics(
       'p95_total_ms', 'p95_bedrock_ms',
       'min_total_ms', 'max_total_ms',
       'avg_ttff_ms', 'p95_ttff_ms',
+      'avg_e2e_ms', 'p95_e2e_ms',
+      'avg_model_ms', 'avg_tool_ms', 'avg_inbound_ms',
     ],
   });
 }

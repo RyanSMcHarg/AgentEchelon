@@ -53,7 +53,14 @@ export const METRIC_TARGETS: Record<string, MetricTarget> = {
   avg_total_ms: {
     label: 'Avg total latency', direction: 'lower', target: 10000, warn: 30000, format: fmtMs,
     description:
-      'Mean end-to-end time to the completed answer: placeholder polling + Bedrock inference + delivery. Agentic tool loops make multiple model calls, so multi-second totals are normal. Cold starts inflate the average when traffic is low.',
+      'Mean SERVER compute for the turn, from processor entry to the answer being posted (history load + tool loop + guardrail + post). NOT the user wall-clock wait: it excludes the inbound hop, cold start, and delivery — see E2E for the full wait. Agentic tool loops make multiple model calls, so multi-second values are normal.',
+  },
+  // The true user-perceived wait (user message -> final answer). Includes the inbound hop + cold start
+  // that total omits. Nielsen 10s attention limit (good), ~30s abandon (warn). docs/LATENCY-TARGETS.md.
+  avg_e2e_ms: {
+    label: 'Avg end-to-end latency', direction: 'lower', target: 10000, warn: 30000, format: fmtMs,
+    description:
+      'Mean user-perceived wait from the message to the FINAL answer (agent_final_at − user_message_at, both on the Chime clock, so skew-free). Unlike total (server compute), it includes the inbound hop and cold start — the real latency an SLA is about.',
   },
   p95_total_ms: {
     label: 'P95 total latency', direction: 'lower', target: 15000, warn: 30000, format: fmtMs,

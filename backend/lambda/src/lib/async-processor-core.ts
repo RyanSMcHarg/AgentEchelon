@@ -1312,7 +1312,7 @@ export async function invokeBedrock(
   documentInput?: BedrockDocumentInput,
   cacheableSystemPrefixLength?: number,
   taskContext?: TaskLoopContext,
-): Promise<{ response: string; inputTokens: number; outputTokens: number; bedrockTime: number; steps: ConverseStep[] }> {
+): Promise<{ response: string; inputTokens: number; outputTokens: number; bedrockTime: number; modelMs: number; toolMs: number; steps: ConverseStep[] }> {
   const bedrockStart = Date.now();
   const convMessages = buildConverseMessages(messages, imageInput, documentInput) as Array<Record<string, unknown>>;
   // ADR-011: company-context bucket (attachments bucket, context/{classification}/);
@@ -1384,9 +1384,14 @@ export async function invokeBedrock(
     : await applyInputGuardrail(latestUserText);
   if (inputGuard.blocked) {
     console.warn('[AsyncProcessor] input guardrail intervened; blocking turn before model call');
-    return { response: inputGuard.message, inputTokens: 0, outputTokens: 0, bedrockTime: Date.now() - bedrockStart, steps };
+    return { response: inputGuard.message, inputTokens: 0, outputTokens: 0, bedrockTime: Date.now() - bedrockStart, modelMs: 0, toolMs: 0, steps };
   }
 
+  // model_ms / tool_ms split (LATENCY-TARGETS.md): iterStart->iterEnd brackets ONLY the Converse
+  // model call; tool execution runs after iterEnd and is timed separately below. Their sum plus the
+  // guardrails reconciles to bedrockTime (latency_ms).
+  let modelMs = 0;
+  let toolMs = 0;
   for (let iter = 0; ; iter++) {
     const iterStart = Date.now();
     const bedrockResponse = await bedrockClient.send(new ConverseCommand({
@@ -1402,6 +1407,7 @@ export async function invokeBedrock(
         : {}),
     }));
     const iterEnd = Date.now();
+    modelMs += iterEnd - iterStart; // this iteration's model-inference time (the ConverseCommand)
 
     const callIn = bedrockResponse.usage?.inputTokens ?? 0;
     const callOut = bedrockResponse.usage?.outputTokens ?? 0;
@@ -1449,6 +1455,7 @@ export async function invokeBedrock(
       // P2 (SPEC-ADMIN-CONSOLE-EFFECTIVENESS): per-tool outcome for this iteration — name + success +
       // bounded error class, no payloads — so tool-error rate is queryable off the step, not greppable.
       const toolOutcomes: ToolStepOutcome[] = [];
+      const toolExecStart = Date.now(); // time the tool-execution block (runs after the model call)
       for (const block of outMessage?.content ?? []) {
         const toolUse = (block as { toolUse?: { toolUseId?: string; name?: string } }).toolUse;
         if (!toolUse) continue;
@@ -1504,6 +1511,7 @@ export async function invokeBedrock(
           toolResult: { toolUseId: toolUse.toolUseId, content: [{ json: payload }] },
         });
       }
+      toolMs += Date.now() - toolExecStart; // accumulate this iteration's tool-execution time
       convMessages.push({ role: 'user', content: toolResults });
       const toolNames = (outMessage?.content ?? [])
         .map((b) => (b as { toolUse?: { name?: string } }).toolUse?.name)
@@ -1531,7 +1539,7 @@ export async function invokeBedrock(
     toolsEnabled: useTools,
   });
 
-  return { response, inputTokens, outputTokens, bedrockTime, steps };
+  return { response, inputTokens, outputTokens, bedrockTime, modelMs, toolMs, steps };
 }
 
 // ============================================================
@@ -2036,6 +2044,10 @@ export async function finalizePlaceholderResponse(params: {
    * (never the size-capped Chime Metadata) — SPEC-MESSAGE-METADATA-CODEBOOK.md.
    */
   steps?: ConverseStep[];
+  /** model_ms / tool_ms split from invokeBedrock (LATENCY-TARGETS.md). Out-of-band only; archival
+   *  folds them onto messages.model_ms / messages.tool_ms. Absent on paths that don't run the loop. */
+  modelMs?: number;
+  toolMs?: number;
 }): Promise<void> {
   const {
     event, response, model, inputTokens, outputTokens, bedrockTime,
@@ -2392,7 +2404,15 @@ export async function finalizePlaceholderResponse(params: {
   await writeMessageAnalytics({
     messageId,
     channelArn: event.channelArn,
-    analytics: { ...fullAnalytics, ...(params.steps?.length ? { steps: params.steps } : {}) },
+    // steps + the latency split (model_ms/tool_ms) + processorEntryMs (server-clock handler entry, for
+    // inbound_ms) ride the out-of-band record only, never the size-capped Chime Metadata (LATENCY-TARGETS.md).
+    analytics: {
+      ...fullAnalytics,
+      ...(params.steps?.length ? { steps: params.steps } : {}),
+      ...(params.modelMs !== undefined ? { modelMs: params.modelMs } : {}),
+      ...(params.toolMs !== undefined ? { toolMs: params.toolMs } : {}),
+      processorEntryMs: startTime,
+    },
   });
 
   // Update the placeholder message (non-clarification path)

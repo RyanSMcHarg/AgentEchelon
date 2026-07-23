@@ -127,9 +127,20 @@ interface MessageRecord {
   latency_ms: number | null;
   total_ms: number | null;
   poll_ms: number | null;
+  /** Latency split (LATENCY-TARGETS.md), from the out-of-band analytics record: model_ms = Converse
+   *  inference time, tool_ms = in-loop tool execution. Folded onto messages.model_ms / tool_ms. */
+  model_ms: number | null;
+  tool_ms: number | null;
+  /** Server-clock processor-entry epoch ms (analytics.processorEntryMs). Transient (NOT a column):
+   *  used to derive exchanges.inbound_ms against the Chime user_message_at. */
+  processor_entry_ms: number | null;
   persistence: string | null;
   metadata: Record<string, any> | null;
   created_at: string;
+  /** The Chime `LastUpdatedTimestamp` of THIS event (an UPDATE event's own time, distinct from
+   *  `created_at` which prefers the original CreatedTimestamp). Used to derive `agent_final_at` /
+   *  `e2e_ms` from the final-answer update. Null on events that carry no update timestamp. */
+  last_updated_at: string | null;
   intent: string | null;
   intent_confidence: string | null;
   original_intent: string | null;
@@ -350,6 +361,10 @@ export async function transformToMessageRecord(
   let persistence: string | null = null;
   let metadata: Record<string, any> | null = null;
   let createdAt: string;
+  // The event's own LastUpdatedTimestamp (Chime clock). For an UPDATE event this is when the update
+  // happened (the final answer being posted), which `createdAt` does NOT capture (it prefers the fixed
+  // original CreatedTimestamp). Drives agent_final_at / e2e_ms. Null when absent.
+  let lastUpdatedAt: string | null = null;
   // Raw Chime MessageId (no archival suffix) — the key the out-of-band analytics
   // row is stored under (Phase 1). Only set for MESSAGE events.
   let rawChimeMessageId: string | null = null;
@@ -377,6 +392,9 @@ export async function transformToMessageRecord(
       Payload.CreatedTimestamp ||
       Payload.LastUpdatedTimestamp ||
       new Date().toISOString();
+    // The UPDATE event's own timestamp (when the final answer replaced the placeholder), kept
+    // separately from createdAt so agent_final_at reflects the answer time, not the placeholder time.
+    lastUpdatedAt = Payload.LastUpdatedTimestamp || null;
 
     content = Payload.Content || null;
     if (content) {
@@ -535,9 +553,13 @@ export async function transformToMessageRecord(
     latency_ms: analytics.latencyMs || analytics.bedrockLatencyMs || null,
     total_ms: analytics.totalMs || null,
     poll_ms: analytics.pollMs || null,
+    model_ms: typeof analytics.modelMs === 'number' ? analytics.modelMs : null,
+    tool_ms: typeof analytics.toolMs === 'number' ? analytics.toolMs : null,
+    processor_entry_ms: typeof analytics.processorEntryMs === 'number' ? analytics.processorEntryMs : null,
     persistence,
     metadata,
     created_at: createdAt,
+    last_updated_at: lastUpdatedAt,
     intent,
     intent_confidence: intentConfidence,
     original_intent: originalIntent,
@@ -892,7 +914,20 @@ export async function backfillFromUpdateEvents(
                 poll_ms         = COALESCE($8, poll_ms),
                 experiment_id   = COALESCE($9, experiment_id),
                 variant_id      = COALESCE($10, variant_id),
-                was_fallback    = COALESCE(was_fallback, FALSE) OR $11
+                was_fallback    = COALESCE(was_fallback, FALSE) OR $11,
+                -- agent_final_at: the Chime update time of the FINAL answer, for e2e_ms (LATENCY-TARGETS.md).
+                -- Two independent guards. (1) The $7 (total_ms) gate excludes PRE-completion updates that
+                -- carry no telemetry - e.g. the battle round-1 waiting-state update, which posts BEFORE the
+                -- out-of-band analytics are written, so it arrives with total_ms NULL. (2) COALESCE freezes
+                -- the FIRST completion so a later edit cannot move it - a moderation content-edit re-reads the
+                -- SAME out-of-band record (same MessageId), so its total_ms is NOT null and it PASSES the gate;
+                -- COALESCE, not the gate, is what protects the timestamp there. (Redactions are -RED rows,
+                -- skipped upstream, and never reach here.)
+                agent_final_at  = COALESCE(agent_final_at, CASE WHEN $7 IS NOT NULL THEN $14::timestamptz END),
+                -- Latency split (LATENCY-TARGETS.md): model_ms = Converse inference, tool_ms = in-loop
+                -- tool execution. Folded like latency_ms; COALESCE keeps them idempotent.
+                model_ms        = COALESCE($15, model_ms),
+                tool_ms         = COALESCE($16, tool_ms)
           WHERE message_id = $12
             AND channel_arn = $13
             AND event_type = 'CREATE_CHANNEL_MESSAGE'`,
@@ -910,6 +945,9 @@ export async function backfillFromUpdateEvents(
           upd.was_fallback,
           createMessageId,
           upd.channel_arn,
+          upd.last_updated_at,
+          upd.model_ms,
+          upd.tool_ms,
         ]
       );
 
@@ -931,7 +969,23 @@ export async function backfillFromUpdateEvents(
                 variant_id        = COALESCE($10, ex.variant_id),
                 was_fallback      = COALESCE(ex.was_fallback, FALSE) OR $11,
                 task_state        = COALESCE($14, ex.task_state),
-                task_transition   = COALESCE($15, ex.task_transition)
+                task_transition   = COALESCE($15, ex.task_transition),
+                -- e2e_ms: user message -> final answer. am.agent_final_at was set by the UPDATE above,
+                -- ex.user_message_at is the paired user message time (both on the Chime clock, so this is
+                -- skew-free). The greater-than guard clamps out any anomaly; COALESCE keeps it idempotent. Null
+                -- until agent_final_at is present. LATENCY-TARGETS.md.
+                e2e_ms            = COALESCE(ex.e2e_ms,
+                                      CASE WHEN am.agent_final_at IS NOT NULL
+                                            AND am.agent_final_at > ex.user_message_at
+                                           THEN (EXTRACT(EPOCH FROM (am.agent_final_at - ex.user_message_at)) * 1000)::integer
+                                      END),
+                -- inbound_ms (LATENCY-TARGETS.md): user message -> processor entry (routing/queue/cold
+                -- start). CROSS-CLOCK ($16 server-clock entry vs ex.user_message_at Chime); GREATEST
+                -- clamps the skew to >= 0. Approximate by design.
+                inbound_ms        = COALESCE(ex.inbound_ms,
+                                      CASE WHEN $16 IS NOT NULL
+                                           THEN GREATEST(0, ($16 - EXTRACT(EPOCH FROM ex.user_message_at) * 1000)::integer)
+                                      END)
            FROM messages am
           WHERE ex.agent_message_id = am.id
             AND am.message_id = $12
@@ -953,6 +1007,7 @@ export async function backfillFromUpdateEvents(
           upd.task_state,
           // JSONB param — stringify {from,to}; NULL when the update carried no transition.
           upd.task_transition ? JSON.stringify(upd.task_transition) : null,
+          upd.processor_entry_ms,
         ]
       );
     } catch (error) {

@@ -123,6 +123,10 @@ export interface ResilientInvokeResult {
    * persisted out-of-band by finalizePlaceholderResponse (SPEC-MESSAGE-METADATA-CODEBOOK.md).
    */
   steps?: ConverseStep[];
+  /** model_ms / tool_ms latency split from invokeBedrock (LATENCY-TARGETS.md). Flows through via
+   *  `...result`; persisted out-of-band by finalizePlaceholderResponse. */
+  modelMs?: number;
+  toolMs?: number;
 }
 
 interface ResilientInvokeOptions {
