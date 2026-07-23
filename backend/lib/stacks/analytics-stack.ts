@@ -611,9 +611,9 @@ export class AnalyticsStack extends cdk.Stack {
     // S3/Athena `conversations` archive is the system of record for the event log
     // and holds the user-activity data (Aurora is a lossy projection). Bringing
     // Athena to parity = the sub-path split here + the `channel_events` queryType in
-    // the Athena Lambda. Default = the Cognito authorizer, unchanged.
-    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
-      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    // the Athena Lambda. Default ON; opt out with `-c adminIamEnforcement=false` for the Cognito authorizer.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') !== false
+      && this.node.tryGetContext('adminIamEnforcement') !== 'false';
     const analyticsAuthOptions: apigateway.MethodOptions = adminIamEnforcement
       ? { authorizationType: apigateway.AuthorizationType.IAM }
       : adminApiMethodOptions(this, 'AnalyticsAuthorizer', { userPool: props.userPool });

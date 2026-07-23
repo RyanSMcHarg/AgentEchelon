@@ -2,7 +2,7 @@
  * Intent Classifier Unit Tests
  *
  * Tests fast-path keyword matching and keyword fallback classification.
- * Tests classifyIntentBasic (no LLM) and intentToDeliveryOption mapping.
+ * Tests classifyIntentByKeyword (no LLM) and intentToDeliveryOption mapping.
  *
  * Note: classifyIntent (LLM-based) is not tested here because it requires
  * the Bedrock SDK which is only available at Lambda runtime (bundled by CDK).
@@ -15,29 +15,29 @@ jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
 }), { virtual: true });
 
 import {
-  classifyIntentBasic,
+  classifyIntentByKeyword,
   IntentType,
   intentToDeliveryOption,
 } from '../lambda/src/lib/intent-classifier';
 
-describe('classifyIntentBasic', () => {
+describe('classifyIntentByKeyword', () => {
   describe('greetings (fast-path)', () => {
     it.each(['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening'])(
       'classifies "%s" as GREETING with high confidence',
       (msg) => {
-        const result = classifyIntentBasic(msg);
+        const result = classifyIntentByKeyword(msg);
         expect(result.intent).toBe(IntentType.GREETING);
         expect(result.confidence).toBe('high');
       }
     );
 
     it('classifies empty string as GREETING', () => {
-      const result = classifyIntentBasic('');
+      const result = classifyIntentByKeyword('');
       expect(result.intent).toBe(IntentType.GREETING);
     });
 
     it('classifies very short messages as GREETING', () => {
-      const result = classifyIntentBasic('ab');
+      const result = classifyIntentByKeyword('ab');
       expect(result.intent).toBe(IntentType.GREETING);
     });
   });
@@ -48,7 +48,7 @@ describe('classifyIntentBasic', () => {
     it.each(['thanks', 'thank you', 'okay', 'got it', 'great', 'perfect', 'cool', 'bye', 'goodbye'])(
       'classifies "%s" as ACKNOWLEDGMENT with high confidence',
       (msg) => {
-        const result = classifyIntentBasic(msg);
+        const result = classifyIntentByKeyword(msg);
         expect(result.intent).toBe(IntentType.ACKNOWLEDGMENT);
         expect(result.confidence).toBe('high');
       }
@@ -65,7 +65,7 @@ describe('classifyIntentBasic', () => {
       'Help me with this problem',
       'The application keeps crashing',
     ])('classifies "%s" as GUIDED_TROUBLESHOOTING', (msg) => {
-      const result = classifyIntentBasic(msg);
+      const result = classifyIntentByKeyword(msg);
       expect(result.intent).toBe(IntentType.GUIDED_TROUBLESHOOTING);
       expect(result.confidence).toBe('medium');
     });
@@ -79,7 +79,7 @@ describe('classifyIntentBasic', () => {
       'Can you fetch the user records?',
       'Retrieve the logs from yesterday',
     ])('classifies "%s" as DATA_EXTRACTION', (msg) => {
-      const result = classifyIntentBasic(msg);
+      const result = classifyIntentByKeyword(msg);
       expect(result.intent).toBe(IntentType.DATA_EXTRACTION);
       expect(result.confidence).toBe('medium');
     });
@@ -92,7 +92,7 @@ describe('classifyIntentBasic', () => {
       'I need an analysis of the data',
       'Compile the quarterly results',
     ])('classifies "%s" as REPORT_GENERATION', (msg) => {
-      const result = classifyIntentBasic(msg);
+      const result = classifyIntentByKeyword(msg);
       expect(result.intent).toBe(IntentType.REPORT_GENERATION);
       expect(result.confidence).toBe('medium');
     });
@@ -104,7 +104,7 @@ describe('classifyIntentBasic', () => {
       'Tell me about React hooks',
       'How does photosynthesis work?',
     ])('classifies "%s" as GENERAL with low confidence', (msg) => {
-      const result = classifyIntentBasic(msg);
+      const result = classifyIntentByKeyword(msg);
       expect(result.intent).toBe(IntentType.GENERAL);
       expect(result.confidence).toBe('low');
     });
@@ -112,21 +112,21 @@ describe('classifyIntentBasic', () => {
 
   describe('case insensitivity', () => {
     it('handles uppercase greetings', () => {
-      expect(classifyIntentBasic('HELLO').intent).toBe(IntentType.GREETING);
+      expect(classifyIntentByKeyword('HELLO').intent).toBe(IntentType.GREETING);
     });
 
     it('handles mixed case acknowledgments', () => {
-      expect(classifyIntentBasic('Thank You').intent).toBe(IntentType.ACKNOWLEDGMENT);
+      expect(classifyIntentByKeyword('Thank You').intent).toBe(IntentType.ACKNOWLEDGMENT);
     });
 
     it('handles uppercase keywords', () => {
-      expect(classifyIntentBasic('I have an ERROR').intent).toBe(IntentType.GUIDED_TROUBLESHOOTING);
+      expect(classifyIntentByKeyword('I have an ERROR').intent).toBe(IntentType.GUIDED_TROUBLESHOOTING);
     });
   });
 
   describe('whitespace handling', () => {
     it('trims leading/trailing whitespace', () => {
-      expect(classifyIntentBasic('  hello  ').intent).toBe(IntentType.GREETING);
+      expect(classifyIntentByKeyword('  hello  ').intent).toBe(IntentType.GREETING);
     });
   });
 });

@@ -17,8 +17,9 @@
  * Runs as the TIER USER (not testAdmin) so correlation is clean: the chat AppInstanceUser id == the
  * Cognito `sub` (AE convention, credential-exchange.ts), so this run's task is the newest
  * report_generation row under that sub in `user-tasks`, created after the run start (rules out legacy
- * rows). Basic is lightweight (status-only) — it legitimately persists just the INITIAL state with no
- * tool transitions; standard/premium MAY advance. Both shapes satisfy the assertions above.
+ * rows). Basic runs the full task loop too (taskSupport: 'full'), but on Haiku it often persists just
+ * the INITIAL state with no tool transitions; standard/premium MAY advance. Both shapes satisfy the
+ * assertions above.
  *
  * Gated by TASKS_E2E=1 (a validate.mjs phase). Reads DynamoDB + SSM via the AWS CLI (AWS_PROFILE),
  * exactly like helpers/test-credentials.ts. Table names resolve from env (AGENT_TASKS_TABLE /
@@ -214,8 +215,8 @@ suite('Task machine state persists to the source of truth (SPEC-TASK-STATE-TRANS
         );
       }
 
-      // Basic is lightweight (status-only) → typically the initial state with no tool transitions, which
-      // is a valid pass. Standard/premium MAY have advanced. Log the observed shape for the shadow burn-in.
+      // Basic runs the full task loop too, but on Haiku it typically stays at the initial state with no
+      // tool transitions, which is a valid pass. Standard/premium MAY have advanced. Log the observed shape.
       console.log(`[${tc.tier}] taskState=${task.taskState} transitions=${history.length}`);
     });
   }

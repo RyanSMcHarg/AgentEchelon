@@ -238,7 +238,7 @@ async function createDemoUser(
   // Chime AppInstanceUser — the messaging identity. Admin-created + admin-set-password users do NOT
   // fire the Cognito post-confirmation trigger that provisions this for a normal sign-up, so without
   // it the user has a valid login but no messaging identity: the app connects, fails to open a Chime
-  // session, and sits on "Reconnecting…". Create it here (mirrors create-admin-user.sh). Idempotent.
+  // session, and sits on "Reconnecting…". Create it here (mirrors provision-admin.mjs). Idempotent.
   try {
     const got = await cognitoClient.send(new AdminGetUserCommand({ UserPoolId: userPoolId, Username: email }));
     const sub = got.UserAttributes?.find((a) => a.Name === 'sub')?.Value;
@@ -396,32 +396,134 @@ How to answer:
 - If asked about "this tool", "this app", or the platform itself, explain that you run on AgentEchelon, a tiered enterprise assistant platform, and offer to explain how it works.`;
 
 /**
- * Seed the standard-tier assistant persona + intent pack (SSM) so the demo is self-grounding without the
- * operator authoring one. WRITE-IF-ABSENT: if the parameter already exists we leave it untouched, so an
- * operator's explicit `-c assistantSystemPrompt` (which the CDK then owns as a RETAIN resource) is never
- * clobbered. In the default (no-flag) demo the CDK creates NO persona resource, so seeding here is the
- * source of truth and there is nothing to conflict with. The intent pack mirrors the platform DEFAULT
- * (imported, always valid + in sync), so classification behavior is unchanged; writing it makes the
- * customization explicit and silences the empty-pack synth warning. If an operator later wants a
- * CDK-managed persona over a seeded one, that is the documented `-c assistantParamWriter` migration path.
+ * Stratum DOMAIN intent pack (per tier). Beyond the universal greeting/acknowledgment/general and the
+ * platform DEFAULT task intents (guided_troubleshooting / data_extraction / image_generation /
+ * report_generation, reused verbatim so they never drift from the platform), the demo adds Stratum's
+ * everyday questions as their OWN intents so the admin console segments them into meaningful buckets
+ * instead of one fat `general` bar.
+ *
+ * KEY DESIGN POINT (ADR-018): intent and DELIVERY are separate axes. These inline intents carry
+ * `delivery: 'PLACEHOLDER_UPDATE'` (one grounded reply, answered in the turn) — NOT `TASK_MULTI_STEP`.
+ * So a single-fact revenue/account/product question is bucketed AND answered inline (no deferral behind
+ * a task), which is exactly what ADR-018 wanted; collapsing it to `general` (and losing the signal) was
+ * never required — the per-intent delivery field is the real lever. Genuinely multi-step work stays on
+ * the DEFAULT task intents (report_generation / data_extraction, both TASK_MULTI_STEP), which the
+ * per-tier packs keep so existing task flows + e2e + taskType routing are unchanged.
+ *
+ * Scoped per tier to match each tier's data access (basic sees product info; standard the directory /
+ * processes; premium financials / accounts / competitive intel), so a tier's classifier only offers the
+ * intents that tier can actually satisfy.
+ */
+type InlineIntent = { key: string; description: string; keywords: string[]; delivery: 'PLACEHOLDER_UPDATE' };
+const STRATUM_INLINE_INTENTS: Record<'basic' | 'standard' | 'premium', InlineIntent[]> = {
+  basic: [
+    {
+      key: 'product_info',
+      description:
+        'User asks about Stratum products, plans, pricing, features, integrations, or the public FAQ — '
+        + 'answerable inline from the company overview (e.g. "what is in the StratumFlow Professional plan?", '
+        + '"which integrations are supported?"). A single-turn answer, not a compiled report.',
+      keywords: ['plan', 'pricing', 'price', 'how much', 'feature', 'integration', 'integrations', 'stratumflow', 'product', 'faq', 'edition'],
+      delivery: 'PLACEHOLDER_UPDATE',
+    },
+  ],
+  standard: [
+    {
+      key: 'directory_lookup',
+      description:
+        'User asks who someone is, who leads or owns a team, a person\'s role or manager, or how to reach a '
+        + 'team — answerable inline from the employee directory (e.g. "who leads Platform Core?"). Exporting the '
+        + 'whole roster as a table is data_extraction, not this.',
+      keywords: ['who leads', 'who is', 'who owns', 'who manages', 'manager of', 'team lead', 'reports to', 'head of', 'contact for', 'directory'],
+      delivery: 'PLACEHOLDER_UPDATE',
+    },
+    {
+      key: 'process_lookup',
+      description:
+        'User asks about an internal process, runbook, escalation path, response-time SLA, or operating '
+        + 'procedure — answerable inline from internal processes (e.g. "what is the escalation path for a Sev-1?").',
+      keywords: ['process', 'procedure', 'runbook', 'escalation', 'escalate', 'sla', 'response time', 'policy', 'on-call', 'sev-1', 'sev 1'],
+      delivery: 'PLACEHOLDER_UPDATE',
+    },
+  ],
+  premium: [
+    {
+      key: 'financial_metric',
+      description:
+        'User asks for a SINGLE financial figure or SaaS metric, stated inline — ARR, NRR / net revenue '
+        + 'retention, churn rate, revenue by plan, gross margin, a specific quarter\'s number (e.g. "what was our '
+        + 'Q2 ARR?", "current net revenue retention?"). Answer the figure directly in one turn. Compiling these '
+        + 'into a written report is report_generation; exporting many rows is data_extraction.',
+      keywords: ['arr', 'nrr', 'net revenue retention', 'churn', 'mrr', 'revenue', 'gross margin', 'burn', 'runway', 'ltv', 'cac', 'what was our'],
+      delivery: 'PLACEHOLDER_UPDATE',
+    },
+    {
+      key: 'account_status',
+      description:
+        'User asks about ONE customer account\'s health, renewal, ARR, or churn risk, stated inline (e.g. "is '
+        + 'Acme at risk?", "when does Globex renew?"). Exporting all at-risk accounts as a table is data_extraction.',
+      keywords: ['account', 'customer', 'at risk', 'churn risk', 'renewal', 'renew', 'account health', 'expansion', 'upsell', 'contract'],
+      delivery: 'PLACEHOLDER_UPDATE',
+    },
+    {
+      key: 'competitive_intel',
+      description:
+        'User asks how Stratum compares to a competitor, competitor positioning / pricing, or win/loss reasons — '
+        + 'answerable inline from competitive intelligence (e.g. "how do we compare to Competitor X?", "why do we '
+        + 'lose deals to Y?").',
+      keywords: ['competitor', 'competitive', 'compare to', 'win rate', 'win/loss', 'win loss', 'positioning', 'differentiat', 'why do we lose'],
+      delivery: 'PLACEHOLDER_UPDATE',
+    },
+  ],
+};
+
+/** A tier's full pack: its Stratum inline intents, then the platform DEFAULT task intents (reused so
+ *  they stay in sync). Universal greeting/acknowledgment/general are added implicitly by the classifier. */
+function stratumIntentPack(tier: 'basic' | 'standard' | 'premium'): { intents: unknown[] } {
+  return { intents: [...STRATUM_INLINE_INTENTS[tier], ...DEFAULT_INTENT_PACK.intents] };
+}
+
+/** Write an SSM param only if it does not already exist (protects an operator's `-c` value / prior seed). */
+async function putParamIfAbsent(name: string, value: string, label: string): Promise<void> {
+  try {
+    await ssmClient.send(new GetParameterCommand({ Name: name }));
+    console.log(`  - ${label} already set (${name}) - leaving it`);
+  } catch (err: any) {
+    if (err?.name === 'ParameterNotFound') {
+      await ssmClient.send(new PutParameterCommand({ Name: name, Value: value, Type: 'String', Overwrite: false }));
+      console.log(`  ✓ ${label} → ${name}`);
+    } else {
+      throw err;
+    }
+  }
+}
+
+/**
+ * Seed the standard-tier assistant PERSONA (SSM) so the demo is self-grounding without the operator
+ * authoring one. WRITE-IF-ABSENT: if the parameter already exists we leave it untouched, so an operator's
+ * explicit `-c assistantSystemPrompt` (which the CDK then owns as a RETAIN resource) is never clobbered.
+ * In the default (no-flag) demo the CDK creates NO persona resource, so seeding here is the source of
+ * truth. If an operator later wants a CDK-managed persona over a seeded one, that is the documented
+ * `-c assistantParamWriter` migration path. (The intent pack is seeded separately, per tier, below.)
  */
 async function writeStandardAssistantConfig(): Promise<void> {
-  const entries = [
-    { name: `${SSM_ROOT}/assistant/standard/assistant-system-prompt`, value: STANDARD_PERSONA, label: 'persona' },
-    { name: `${SSM_ROOT}/assistant/standard/assistant-intent-pack`, value: JSON.stringify(DEFAULT_INTENT_PACK), label: 'intent pack' },
-  ];
-  for (const { name, value, label } of entries) {
-    try {
-      await ssmClient.send(new GetParameterCommand({ Name: name }));
-      console.log(`  - standard ${label} already set (${name}) - leaving it`);
-    } catch (err: any) {
-      if (err?.name === 'ParameterNotFound') {
-        await ssmClient.send(new PutParameterCommand({ Name: name, Value: value, Type: 'String', Overwrite: false }));
-        console.log(`  ✓ standard ${label} → ${name}`);
-      } else {
-        throw err;
-      }
-    }
+  await putParamIfAbsent(`${SSM_ROOT}/assistant/standard/assistant-system-prompt`, STANDARD_PERSONA, 'standard persona');
+}
+
+/**
+ * Seed the per-tier Stratum intent pack (SSM), write-if-absent. Each classification stack that carries
+ * `intentPackParam: true` (basic, standard, premium) reads its own
+ * `${SSM_ROOT}/assistant/{tier}/assistant-intent-pack`; absent ⇒ the platform DEFAULT pack. Seeding the
+ * Stratum pack here makes the demo's admin console show domain intents (financial_metric, account_status,
+ * directory_lookup, …) instead of an all-`general` breakdown. Write-if-absent, so an operator's
+ * `-c assistantIntentPack` is never clobbered. NOTE: premium only reads this once its classification
+ * stack is deployed with `intentPackParam: true` (premium-classification-stack.ts) — a redeploy, not just
+ * a re-seed, is required for premium to pick up its pack.
+ */
+async function writeStratumIntentPacks(): Promise<void> {
+  for (const tier of ['basic', 'standard', 'premium'] as const) {
+    const name = `${SSM_ROOT}/assistant/${tier}/assistant-intent-pack`;
+    await putParamIfAbsent(name, JSON.stringify(stratumIntentPack(tier)), `${tier} intent pack`);
   }
 }
 
@@ -615,11 +717,20 @@ async function main(): Promise<void> {
   await writeOnboardingIntake();
   console.log('');
 
-  // Step 2c-ii: standard-tier persona + intent pack, so the demo is self-grounding without an operator
+  // Step 2c-ii: standard-tier persona, so the demo is self-grounding without an operator
   // -c assistantSystemPrompt (standard is the only per-deployment-persona tier; absent it the assistant
   // is terse/off-brand — the standard-tier validation gap). Write-if-absent, never clobbers an operator's.
-  console.log('Step 2c-ii: Writing standard assistant persona + intent pack to SSM...');
+  console.log('Step 2c-ii: Writing standard assistant persona to SSM...');
   await writeStandardAssistantConfig();
+  console.log('');
+
+  // Step 2c-iii: per-tier Stratum DOMAIN intent packs, so the admin console shows domain intents
+  // (financial_metric, account_status, directory_lookup, product_info, …) instead of an all-`general`
+  // breakdown. Inline intents deliver in one turn (PLACEHOLDER_UPDATE) per ADR-018; the DEFAULT task
+  // intents are kept so multi-step flows are unchanged. Write-if-absent. (Premium needs its stack
+  // deployed with intentPackParam: true to read its pack — a redeploy, not just a re-seed.)
+  console.log('Step 2c-iii: Writing per-tier Stratum intent packs to SSM...');
+  await writeStratumIntentPacks();
   console.log('');
 
   // Step 2d: seed each profile's ACTIVE version (SPEC-PORTABLE-VERSIONED-PROFILES P0). Writes the

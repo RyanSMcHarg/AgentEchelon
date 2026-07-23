@@ -222,9 +222,9 @@ export class ExperimentsStack extends cdk.Stack {
     // AWS_IAM-authorized (the console SigV4-signs) and the `admins` sign-on role
     // gets execute-api teeth on them; a finer role that omits manage-profiles is
     // denied at the gateway. Only the /admin/profiles routes flip — /admin/experiments
-    // stays on the Cognito authorizer. Default = Cognito, unchanged.
-    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
-      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    // stays on the Cognito authorizer. Default ON; opt out with `-c adminIamEnforcement=false`.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') !== false
+      && this.node.tryGetContext('adminIamEnforcement') !== 'false';
     const manageProfilesAuthOptions: apigateway.MethodOptions = adminIamEnforcement
       ? { authorizationType: apigateway.AuthorizationType.IAM }
       : experimentsAuthOptions;

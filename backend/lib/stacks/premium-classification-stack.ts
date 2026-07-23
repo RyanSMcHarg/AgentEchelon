@@ -25,7 +25,11 @@ const PREMIUM_TOPOLOGY: ProfileTopology = {
   imageGen: true,
   contextRouting: false,
   systemPromptParam: false,
-  intentPackParam: false,
+  // Premium reads a per-deployment intent pack too (like basic/standard). Backward-compatible: with no
+  // pack seeded or -c assistantIntentPack passed, the router hydrates nothing and uses DEFAULT_INTENT_PACK
+  // unchanged. It only takes effect once a pack exists at ${SSM_ROOT}/assistant/premium/assistant-intent-pack
+  // — which is where the demo seeds premium's domain intents (financial_metric / account_status / …).
+  intentPackParam: true,
   richProcessor: true,
   battleCapable: true,
   handlerExperimentsIndex: false,

@@ -9,23 +9,27 @@
  *
  *   AWS_PROFILE=<p> ADMIN_EMAIL=you@example.com node backend/scripts/provision-admin.mjs
  *
- * DEFAULT (no ADMIN_PASSWORD): the user is created through the standard Cognito invitation —
- * Cognito emails a ONE-TIME temporary password and forces the user to set their own permanent
- * password on first sign-in (the SPA handles NEW_PASSWORD_REQUIRED). Nothing is stored; the
- * human owns their password and this script never sees it.
+ * The admin ALWAYS sets their own password on first sign-in — this script never establishes a
+ * permanent password. Two ways to deliver the one-time TEMPORARY password:
  *
- * ADMIN_PASSWORD=<pw> (automation only): sets that permanent password directly (user CONFIRMED,
- * no email). Secrets Manager is deliberately NOT used here — that pattern is for TEST/automation
- * accounts a script must read back (see seed-demo's test-credentials), not a human admin.
+ * DEFAULT (no ADMIN_TEMP_PASSWORD): the user is created through the standard Cognito invitation —
+ * Cognito EMAILS a one-time temporary password. On first sign-in the SPA forces a reset
+ * (NEW_PASSWORD_REQUIRED). Nothing is stored; this script never sees the password.
  *
- * Idempotent: re-running updates attributes + group membership; without ADMIN_PASSWORD it
- * re-sends the invitation while the user is still pending a first sign-in.
+ * ADMIN_TEMP_PASSWORD=<pw> (no email, e.g. a local bootstrap): creates the user in
+ * FORCE_CHANGE_PASSWORD state with THIS temporary password (email suppressed), so you can hand it
+ * over directly. First sign-in still forces a reset. It is a TEMPORARY password, never permanent.
+ *
+ * Idempotent: re-running updates attributes + group membership. Without ADMIN_TEMP_PASSWORD it
+ * re-sends the invitation (while the user is still pending a first sign-in); with it, it resets the
+ * user back to the given temporary password (forcing a fresh first-login reset).
  *
  * Env:
- *   ADMIN_EMAIL     (required) the admin's email = Cognito username
- *   ADMIN_PASSWORD  (optional) set a specific permanent password (automation); else invite by email
- *   ADMIN_TIER      (optional) model tier group to also grant (default: premium)
- *   ADMIN_NAME      (optional) display name (default: derived from email)
+ *   ADMIN_EMAIL          (required) the admin's email = Cognito username
+ *   ADMIN_TEMP_PASSWORD  (optional) a one-time temp password to set (no email); else invite by email.
+ *                        Either way the admin must set their own password on first sign-in.
+ *   ADMIN_TIER           (optional) model tier group to also grant (default: premium)
+ *   ADMIN_NAME           (optional) display name (default: derived from email)
  */
 import {
   CognitoIdentityProviderClient,
@@ -50,10 +54,11 @@ if (!EMAIL) {
   process.exit(2);
 }
 const NAME = process.env.ADMIN_NAME || EMAIL.split('@')[0];
-// When set, the operator chose a specific permanent password (automation/self). When unset,
-// the user is invited: Cognito generates + emails a one-time temporary password and forces a
-// reset on first sign-in. This script never generates or stores a password.
-const PASSWORD = process.env.ADMIN_PASSWORD || null;
+// A one-time TEMPORARY password to set directly (email suppressed) so it can be handed over for a
+// local bootstrap. When unset, Cognito emails the temp password instead. Either way the user is in
+// FORCE_CHANGE_PASSWORD and must set their own password on first sign-in; this script never sets a
+// permanent password.
+const TEMP_PASSWORD = process.env.ADMIN_TEMP_PASSWORD || null;
 
 const cognito = new CognitoIdentityProviderClient({ region });
 const chimeIdentity = new ChimeSDKIdentityClient({ region });
@@ -104,21 +109,27 @@ async function main() {
   ];
   let invited = false;
   try {
-    // No ADMIN_PASSWORD -> omit MessageAction so Cognito EMAILS a one-time temporary
-    // password (the standard invitation). With ADMIN_PASSWORD -> SUPPRESS; we set it below.
+    // With ADMIN_TEMP_PASSWORD: create in FORCE_CHANGE_PASSWORD state with that temporary password
+    // and SUPPRESS the email. Without it: omit both so Cognito EMAILS a one-time temporary password
+    // (the standard invitation). Either path forces a permanent-password reset on first sign-in.
     await cognito.send(new AdminCreateUserCommand({
       UserPoolId: userPoolId,
       Username: EMAIL,
       UserAttributes: attrs,
-      ...(PASSWORD ? { MessageAction: 'SUPPRESS' } : {}),
+      ...(TEMP_PASSWORD ? { TemporaryPassword: TEMP_PASSWORD, MessageAction: 'SUPPRESS' } : {}),
     }));
-    invited = !PASSWORD;
-    console.log(`  + created ${EMAIL}${invited ? ' (invitation email sent)' : ''}`);
+    invited = !TEMP_PASSWORD;
+    console.log(`  + created ${EMAIL}${invited ? ' (invitation email sent)' : ' (temporary password set)'}`);
   } catch (err) {
     if (err.name === 'UsernameExistsException') {
       await cognito.send(new AdminUpdateUserAttributesCommand({ UserPoolId: userPoolId, Username: EMAIL, UserAttributes: attrs }));
       console.log(`  ~ updated existing ${EMAIL}`);
-      if (!PASSWORD) {
+      if (TEMP_PASSWORD) {
+        // Reset the existing user to the given TEMPORARY password (Permanent:false -> back to
+        // FORCE_CHANGE_PASSWORD, so first sign-in forces a fresh reset).
+        await cognito.send(new AdminSetUserPasswordCommand({ UserPoolId: userPoolId, Username: EMAIL, Password: TEMP_PASSWORD, Permanent: false }));
+        console.log('  + reset to the given temporary password (must reset on next sign-in)');
+      } else {
         // Re-send the invitation — only succeeds while the user is still pending a first
         // sign-in. A user who already set a password can't be re-invited.
         try {
@@ -126,17 +137,10 @@ async function main() {
           invited = true;
           console.log('  + invitation re-sent');
         } catch (e) {
-          console.warn(`  ! could not re-send invitation (${e.name || e.message}); the user has likely already set a password. Pass ADMIN_PASSWORD to reset it, or delete + re-run for a fresh invite.`);
+          console.warn(`  ! could not re-send invitation (${e.name || e.message}); the user has likely already set a password. Pass ADMIN_TEMP_PASSWORD to reset it to a temporary password, or delete + re-run for a fresh invite.`);
         }
       }
     } else throw err;
-  }
-
-  // Only set a password when the operator supplied one. Otherwise the emailed temporary
-  // password stands and the user must set their own on first sign-in (the SPA handles
-  // NEW_PASSWORD_REQUIRED). Nothing is stored either way.
-  if (PASSWORD) {
-    await cognito.send(new AdminSetUserPasswordCommand({ UserPoolId: userPoolId, Username: EMAIL, Password: PASSWORD, Permanent: true }));
   }
 
   for (const group of ['admins', TIER]) {
@@ -152,14 +156,15 @@ async function main() {
 
   console.log('');
   console.log(`Done. ${EMAIL} is an admin (groups: admins, ${TIER}).`);
-  if (PASSWORD) {
-    console.log(`Set the ADMIN_PASSWORD you supplied; the user is CONFIRMED. Sign in at the app URL with ${EMAIL}.`);
+  if (TEMP_PASSWORD) {
+    console.log(`Temporary password set (email suppressed). Sign in with it at the app URL as ${EMAIL};`);
+    console.log(`the app forces a permanent-password reset on first sign-in (NEW_PASSWORD_REQUIRED).`);
   } else if (invited) {
-    console.log(`Cognito emailed ${EMAIL} a one-time temporary password. On first sign-in the app prompts`);
+    console.log(`Cognito emailed ${EMAIL} a one-time temporary password. On first sign-in the app forces`);
     console.log(`them to set their own permanent password. This script stored nothing.`);
   } else {
-    console.log(`Existing user: no email sent and no password changed. Pass ADMIN_PASSWORD to set one, or`);
-    console.log(`delete the user and re-run for a fresh invitation email.`);
+    console.log(`Existing user: attributes/groups synced, no password changed. Pass ADMIN_TEMP_PASSWORD to`);
+    console.log(`reset it, or delete the user and re-run for a fresh invitation email.`);
   }
 }
 

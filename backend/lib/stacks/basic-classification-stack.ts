@@ -2,10 +2,12 @@
  * BasicClassificationStack — the BASIC assistant profile. A thin wrapper that supplies the basic
  * ProfileTopology to the shared AssistantProfileStack (SPEC-CAPABILITY-PROFILES).
  *
- * Basic = Haiku, lightweight tasks (grounds the prompt + stamps task_id), a per-deployment intent
- * pack, and the tightest response ceiling. No /battle, image gen, generated docs, context routing, or
- * persona SSM param — those union code paths in the shared async processor self-gate off because this
- * profile sets none of their env, so execution stays inside basic's narrow IAM role.
+ * Basic = Haiku, the full task loop (taskSupport: 'full', like every profile — the router classifies
+ * task intents and the shared processor wires advance_task_state uniformly), a per-deployment intent
+ * pack, and the tightest response ceiling. What basic does NOT get is the RICH processor output
+ * (richProcessor: false): no /battle, image gen, generated docs, context routing, or persona SSM param
+ * — those union code paths in the shared async processor self-gate off because this profile sets none
+ * of their env, so execution stays inside basic's narrow IAM role.
  */
 
 import { Construct } from 'constructs';

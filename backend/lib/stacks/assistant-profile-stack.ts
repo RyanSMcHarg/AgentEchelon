@@ -242,7 +242,10 @@ export class AssistantProfileStack extends cdk.Stack {
       // attach a Converse image/document block (same grant across rich profiles).
       processorRole.addToPolicy(new iam.PolicyStatement({ actions: ['s3:GetObject'], resources: [`${props.attachmentsBucketArn}/attachments/*`] }));
     } else {
-      // Lightweight task support only: getTask grounds the prompt; the shared core updates status.
+      // Non-rich profile (richProcessor:false): the SAME DynamoDB task grants as above (read/create/
+      // advance task state — taskSupport is still 'full'), but WITHOUT the rich-output grants (no
+      // generated-docs S3 write, no attachment-in read). So basic tracks and advances tasks; it just
+      // does not produce downloadable documents.
       processorRole.addToPolicy(
         new iam.PolicyStatement({
           actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:Query'],

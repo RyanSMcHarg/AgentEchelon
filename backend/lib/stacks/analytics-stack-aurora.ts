@@ -1522,12 +1522,12 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     // authorizer on AE's own user pool.
     // A14: when adminIamEnforcement is on, the analytics READ plane is
     // AWS_IAM-authorized (the console SigV4-signs with its sign-on creds and the
-    // per-resource split gates each capability). Default = the Cognito authorizer,
-    // unchanged. Flipping the shared options flips every analytics-query method at
-    // once and (like the admin-conversations API) avoids creating an unused Cognito
-    // authorizer in IAM mode.
-    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
-      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    // per-resource split gates each capability). Default ON; opt out with
+    // `-c adminIamEnforcement=false` for the Cognito authorizer. Flipping the shared
+    // options flips every analytics-query method at once and (like the admin-conversations
+    // API) avoids creating an unused Cognito authorizer in IAM mode.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') !== false
+      && this.node.tryGetContext('adminIamEnforcement') !== 'false';
     const authMethodOptions: apigateway.MethodOptions = adminIamEnforcement
       ? { authorizationType: apigateway.AuthorizationType.IAM }
       : adminApiMethodOptions(this, 'AuroraAnalyticsAuthorizer', { userPoolId: props.userPoolId });

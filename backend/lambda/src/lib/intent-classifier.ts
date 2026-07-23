@@ -162,9 +162,12 @@ Category:`;
 }
 
 /**
- * Keyword-only classification for the basic classification (no LLM call to save cost)
+ * Keyword-only intent classification (no LLM/Bedrock call). This is the `classifierMode: 'keyword'`
+ * path — an opt-in a deployment can select on a cheap profile to skip the per-turn classifier cost.
+ * It is NOT tied to any classification: every default profile (basic included) uses the LLM
+ * classifier (`classifyIntent`); this runs only when a profile explicitly sets keyword mode.
  */
-export function classifyIntentBasic(userMessage: string): IntentClassification {
+export function classifyIntentByKeyword(userMessage: string): IntentClassification {
   const message = userMessage.trim().toLowerCase();
 
   if (!message || message.length < 3) {
@@ -185,7 +188,7 @@ export function classifyIntentBasic(userMessage: string): IntentClassification {
 }
 
 /**
- * Fallback keyword-based classification (LLM failure or the basic classification).
+ * Fallback keyword-based classification (used on an LLM classifier failure, or by a keyword-mode profile).
  * Domain keywords come from the active intent pack; only greeting/ack are handled by the callers
  * before this point, so here we match domain keywords then default to GENERAL.
  */

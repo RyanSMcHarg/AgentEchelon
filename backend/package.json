@@ -16,6 +16,7 @@
     "sync-knowledge": "node scripts/sync-project-knowledge.mjs",
     "validate": "node scripts/validate.mjs",
     "provision-test-users": "node scripts/provision-test-users.mjs",
+    "provision-admin": "node scripts/provision-admin.mjs",
     "deploy": "node scripts/deploy.mjs",
     "deploy-frontend": "node scripts/deploy-frontend.mjs"
   },

@@ -35,7 +35,7 @@ export interface IntentDef {
   key: string;
   /** One line the LLM classifier sees describing when this intent applies. */
   description: string;
-  /** Lowercase substrings for the no-LLM keyword fallback (basic classification / LLM failure). */
+  /** Lowercase substrings for the no-LLM keyword classifier (a keyword-mode profile / LLM-classifier failure). */
   keywords: string[];
   /** How a turn of this intent is delivered. Domain intents are usually PLACEHOLDER_UPDATE
    *  (one generated reply, updated in place) or TASK_MULTI_STEP (a tracked multi-step task). */

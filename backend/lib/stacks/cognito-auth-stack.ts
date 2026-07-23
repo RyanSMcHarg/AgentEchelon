@@ -109,6 +109,11 @@ export class CognitoAuthStack extends cdk.Stack {
       signInAliases: {
         email: true,
       },
+      // Case-INSENSITIVE usernames/email: `Admin@x.com` and `admin@x.com` resolve to the SAME user,
+      // so sign-in never fails on capitalization. Maps to UsernameConfiguration.CaseSensitive=false.
+      // IMMUTABLE after pool creation — changing this on an existing pool REPLACES the pool (all users
+      // are lost + must be re-provisioned/re-seeded); it applies cleanly only to a fresh deployment.
+      signInCaseSensitive: false,
       autoVerify: {
         email: true, // Auto-verify email addresses
       },

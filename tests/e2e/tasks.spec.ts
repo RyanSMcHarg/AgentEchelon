@@ -10,10 +10,11 @@
  *
  * ALL THREE TIERS run tasks. The router is the single Lex entry point for every
  * tier (deployed per-tier via TIER); tasks are a platform capability, not a
- * standard/premium-only one. Basic gets lightweight task support (its async
- * processor grounds the prompt + stamps task_id; the rich multi-step task-type
- * prompts stay a standard/premium enhancement). This suite exercises the task
- * path on basic, standard, AND premium.
+ * standard/premium-only one. Basic runs the FULL task loop too (taskSupport: 'full',
+ * like every profile); what it lacks is the RICH processor output (richProcessor:
+ * false) — no generated-document delivery — so a basic task tracks state and
+ * grounds the reply inline rather than attaching a produced file. This suite
+ * exercises the task path on basic, standard, AND premium.
  *
  * WHY testAdmin drives every tier: the analytics API is ADMIN-gated, so the
  * task_details read needs an admin token. testAdmin is premium AND in the admins

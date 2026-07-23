@@ -5,19 +5,37 @@
  * exercised with REAL user->assistant messages (measured + recorded), then the admin
  * dashboard is verified against that real data. Nothing is faked.
  *
- *   1. sync-knowledge  - regenerate the project self-knowledge context (offline)
- *   2. seed-demo       - demo users + tier context + identity provisioning
- *   3. user e2e        - real per-tier conversations, mentions, drift, identity/exchange
- *   4. battle e2e      - a real /battle duel (needs a battle-enabled deploy)
- *   5. admin e2e       - verify the full dashboard, LAST, so it has the real data above
+ * Phases (all run by default, in order; admin is LAST so it verifies against the real data above):
+ *   1. knowledge     - regenerate the project self-knowledge context (offline)
+ *   2. seed          - demo users + tier context + identity provisioning
+ *   3. user          - real per-tier conversations, mentions, drift, identity/exchange
+ *                      (agent-intents is general-heavy by design — the DOMAIN-intent + multi-step-task
+ *                       traffic that populates the admin console comes from the data-producing phases below)
+ *   4. battle        - a real /battle duel (needs a battle-enabled deploy)          [optional]
+ *   5. image-gen     - real external image providers return persistable PNGs         [optional]
+ *   6. feedback      - a thumbs rating persists (→ feedback data)                     [optional]
+ *   7. experiments   - create an A/B experiment + run a turn (→ experiment_results)   [optional]
+ *   8. tasks         - report/extraction/troubleshooting across ALL THREE tiers, driven to real
+ *                      task rows + downloaded deliverables (→ Tasks/Flows admin data) [optional]
+ *   9. welcome       - a new conversation opens with the seeded tier-aware orientation [optional]
+ *  10. evaluate      - score the exchanges/flows the e2e just produced (Aurora only)  [optional]
+ *  11. admin         - verify the full dashboard against all of the above
  *
- * Prereqs: a deployed stack + valid creds (`aws sso login --profile <p>`), and the
- * test credentials secret the e2e reads (test-credentials.ts / provision-test-users).
+ * The [optional] data-producing phases are what fill the admin console with variety (domain intents,
+ * multi-step tasks, experiments, feedback). They SELF-SKIP when their deployed dependency is not
+ * resolved (an app-API URL from CDK outputs, Aurora mode, a battle-enabled deploy). A self-skip exits
+ * 0, so this script cannot tell "ran" from "skipped" per se — instead it prints a DATA READINESS
+ * preflight (below) and an END-OF-RUN SUMMARY so a sparse admin console is VISIBLE, not silent.
+ *
+ * Prereqs: a deployed stack + valid creds (`aws sso login --profile <p>`), the test credentials secret
+ * the e2e reads (test-credentials.ts / provision-test-users), and `frontend/.env` generated from CDK
+ * outputs (gen-frontend-env) so the data-producing phases can reach the live app APIs.
  *
  * Usage:
  *   AWS_PROFILE=<your-profile> node backend/scripts/validate.mjs
  *   AWS_PROFILE=<your-profile> node backend/scripts/validate.mjs --skip-battle
- *   node backend/scripts/validate.mjs --only=admin        # one phase
+ *   node backend/scripts/validate.mjs --only=tasks        # one phase
+ *   (valid --only ids: knowledge seed user battle image-gen feedback experiments tasks welcome evaluate admin)
  */
 import { spawnSync } from 'node:child_process';
 import path from 'node:path';
@@ -186,8 +204,14 @@ if (!process.env.IMAGE_GEN_KEYS_SECRET_ARN) {
 // The data-producing e2e specs (feedback/experiments/tasks) read the app API URLs
 // from VITE_* env. They live in frontend/.env (generated from CDK outputs); load
 // any that aren't already set so the phases can reach the live APIs.
+// VITE_USER_POOL_ID + VITE_IDENTITY_POOL_ID are also loaded here: the admin/tasks/experiments phases
+// SigV4-sign their analytics reads (helpers/signed-analytics.ts), which exchanges the id token for
+// Identity-Pool creds — without these two, those signed reads fail and the admin verification is empty.
 const FRONTEND_ENV = path.join(BACKEND, '..', 'frontend', '.env');
-for (const key of ['VITE_USER_FEEDBACK_API_URL', 'VITE_EXPERIMENTS_API_URL', 'VITE_ANALYTICS_API_URL']) {
+for (const key of [
+  'VITE_USER_FEEDBACK_API_URL', 'VITE_EXPERIMENTS_API_URL', 'VITE_ANALYTICS_API_URL',
+  'VITE_USER_POOL_ID', 'VITE_IDENTITY_POOL_ID',
+]) {
   if (process.env[key]) continue;
   try {
     const envText = fs.readFileSync(FRONTEND_ENV, 'utf8');
@@ -234,15 +258,57 @@ if (phases.length === 0) {
   process.exit(2);
 }
 
-console.log(`[validate] running phases: ${phases.map((p) => p.id).join(' -> ')}`);
+// DATA READINESS preflight. The data-producing phases self-skip (exit 0) when their deployed
+// dependency is unresolved, which silently yields a sparse admin console. Surface it up front:
+// map each rich-data dependency to whether it resolved above and which phase(s) it gates.
+const readiness = [
+  ['live chat origin (E2E_BASE_URL)', !!process.env.E2E_BASE_URL, 'all browser e2e (else localhost — the live app is NOT tested)'],
+  ['live admin origin (E2E_ADMIN_BASE_URL)', !!process.env.E2E_ADMIN_BASE_URL, 'battle, experiments, admin'],
+  ['credential-exchange URL', !!(process.env.VITE_CREDENTIAL_EXCHANGE_API_URL || process.env.EXCHANGE_API_URL), 'user (identity/exchange)'],
+  ['analytics API (VITE_ANALYTICS_API_URL)', !!process.env.VITE_ANALYTICS_API_URL, 'tasks (Tasks/Flows admin data)'],
+  ['SigV4 pools (VITE_USER_POOL_ID + VITE_IDENTITY_POOL_ID)', !!(process.env.VITE_USER_POOL_ID && process.env.VITE_IDENTITY_POOL_ID), 'admin/tasks/experiments signed reads (signed-analytics.ts)'],
+  ['experiments API (VITE_EXPERIMENTS_API_URL)', !!process.env.VITE_EXPERIMENTS_API_URL, 'experiments'],
+  ['feedback API (VITE_USER_FEEDBACK_API_URL)', !!process.env.VITE_USER_FEEDBACK_API_URL, 'feedback'],
+  ['evaluation Lambda (Aurora only)', !!process.env.EVAL_LAMBDA_NAME, 'evaluate (quality scoring)'],
+  ['image-gen keys secret', !!process.env.IMAGE_GEN_KEYS_SECRET_ARN, 'image-gen'],
+];
+console.log('\n[validate] DATA READINESS (unresolved ⇒ the gated phase self-skips ⇒ that admin data will be missing):');
+for (const [dep, ok, gates] of readiness) {
+  console.log(`    ${ok ? 'OK  ' : 'MISS'}  ${dep}  →  gates: ${gates}`);
+}
+const misses = readiness.filter(([, ok]) => !ok).length;
+if (misses > 0) {
+  console.log(`    ${misses} dependency(ies) unresolved. To get a FULL admin console, deploy the missing stack(s)`);
+  console.log('    and regenerate frontend/.env (gen-frontend-env), then re-run. See docs/guides/user/DEMO-AND-VALIDATION.md.');
+}
+
+console.log(`\n[validate] running phases: ${phases.map((p) => p.id).join(' -> ')}`);
+const results = [];
 for (const phase of phases) {
   const ok = await run(phase);
   if (!ok) {
     if (phase.optional) {
-      console.warn(`[validate] phase "${phase.id}" is optional (needs a battle-enabled deploy); continuing. Use --skip-battle to silence.`);
+      console.warn(`[validate] phase "${phase.id}" is optional (needs its deployed dependency, e.g. a battle-enabled deploy); continuing.`);
+      results.push([phase.id, 'FAILED (optional — continued)']);
       continue;
     }
+    results.push([phase.id, 'FAILED']);
+    printSummary(results);
     process.exit(1);
   }
+  results.push([phase.id, 'passed']);
 }
-console.log('\n[validate] all phases passed.');
+printSummary(results);
+console.log('\n[validate] all required phases passed.');
+
+/**
+ * End-of-run summary. Prints each phase's result. NOTE: a data-producing phase that SELF-SKIPPED
+ * (missing URL / non-Aurora) still reports "passed" here because it exits 0 — cross-reference the
+ * DATA READINESS block above to know whether it actually produced admin data.
+ */
+function printSummary(rows) {
+  console.log('\n[validate] ============ PHASE SUMMARY ============');
+  for (const [id, status] of rows) console.log(`    ${status.startsWith('FAILED') ? '✗' : '✓'}  ${id.padEnd(12)} ${status}`);
+  console.log('    (a data-producing phase can report "passed" yet have self-skipped — see DATA READINESS above.)');
+  console.log('[validate] ========================================');
+}

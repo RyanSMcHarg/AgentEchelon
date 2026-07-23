@@ -158,11 +158,12 @@ export class AdminPlaneStack extends cdk.Stack {
       },
     });
 
-    // A14: optionally IAM-authorize the archive endpoints. Default OFF (Cognito JWT authorizer). When
-    // `-c adminIamEnforcement=true` the routes require SigV4 (the console signs them); the coordinated
-    // frontend signing lands with the same flag.
-    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') === true
-      || this.node.tryGetContext('adminIamEnforcement') === 'true';
+    // A14: IAM-authorize the archive endpoints. Default ON — the routes require SigV4 (the console signs
+    // them; the coordinated frontend signing lands via the AdminIamEnforcement CFN output). Opt OUT with
+    // `-c adminIamEnforcement=false` to fall back to the Cognito JWT authorizer (weaker: group-gated,
+    // not per-capability IAM-enforced). It was never meant to be a toggle you must remember to set.
+    const adminIamEnforcement = this.node.tryGetContext('adminIamEnforcement') !== false
+      && this.node.tryGetContext('adminIamEnforcement') !== 'false';
     const archiveAuthOptions: apigateway.MethodOptions = adminIamEnforcement
       ? { authorizationType: apigateway.AuthorizationType.IAM }
       : adminApiMethodOptions(this, 'AdminConversationAuthorizer', { userPool: props.userPool });

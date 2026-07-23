@@ -152,13 +152,15 @@ fi
 
 [[ -n "$ADMIN_EMAIL" ]] || fail "Email required."
 
-# Temporary password — the operator sets a permanent one on first sign-in
-# (NEW_PASSWORD_REQUIRED). create-admin-user.sh creates the Cognito user, adds
-# it to the premium + admins groups (the authoritative signal), and creates the
-# Chime AppInstance User. Idempotent-ish: a re-run on an existing user just warns.
-ADMIN_PASSWORD="Tmp$(date +%s | tail -c 6)Aa1!"
-AWS_REGION="$AWS_REGION" USER_POOL_ID="$USER_POOL_ID" APP_INSTANCE_ARN="$APP_INSTANCE_ARN" \
-  bash scripts/create-admin-user.sh "$ADMIN_EMAIL" "$ADMIN_PASSWORD" \
+# provision-admin.mjs creates the Cognito user, adds it to the premium + admins
+# groups (the authoritative signal), and creates the Chime AppInstance User. It is
+# idempotent and resolves the user pool + app instance from CFN outputs itself. For a
+# local quickstart we hand you a TEMPORARY password (ADMIN_TEMP_PASSWORD, email
+# suppressed); you set your own permanent one on first sign-in. A real deployment omits
+# it to email a Cognito invite instead.
+ADMIN_TEMP_PASSWORD="Tmp$(date +%s | tail -c 6)Aa1!"
+( cd backend && AWS_REGION="$AWS_REGION" ADMIN_EMAIL="$ADMIN_EMAIL" ADMIN_TEMP_PASSWORD="$ADMIN_TEMP_PASSWORD" \
+    node scripts/provision-admin.mjs ) \
   || warn "Admin creation reported an issue (the user may already exist)."
 
 info "Admin user ready: $ADMIN_EMAIL"
@@ -168,7 +170,7 @@ header "AgentEchelon is ready"
 
 echo -e "  ${BOLD}Frontend:${NC}  cd frontend && npm run dev"
 echo -e "  ${BOLD}Login:${NC}     $ADMIN_EMAIL"
-echo -e "  ${BOLD}Temp password:${NC}  $ADMIN_PASSWORD  ${BOLD}(you'll set a permanent one on first sign-in)${NC}"
+echo -e "  ${BOLD}Temp password:${NC}  $ADMIN_TEMP_PASSWORD  ${BOLD}(you'll set a permanent one on first sign-in)${NC}"
 echo -e "  ${BOLD}Tier:${NC}      premium (admin)"
 echo ""
 echo -e "  Open ${BOLD}http://localhost:5173${NC} after starting the dev server."

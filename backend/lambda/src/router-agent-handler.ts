@@ -7,10 +7,14 @@
  * intent classification and task tracking.
  *
  * Classification routing (single entry point for ALL classifications; deployed
- * per-classification, keyed by the CLASSIFICATION env var):
- * - basic    → classifyIntentBasic() + BASIC_ASYNC_PROCESSOR_ARN (Haiku, tasks: lightweight)
- * - standard → classifyIntent()      + STANDARD_ASYNC_PROCESSOR_ARN (Sonnet, tasks: full)
- * - premium  → classifyIntent()      + PREMIUM_ASYNC_PROCESSOR_ARN (Opus, tasks: full)
+ * per-classification, keyed by the CLASSIFICATION env var). Intent classification
+ * mode is per-profile (`AssistantProfile.classifierMode`); ALL default profiles —
+ * basic included — use the LLM classifier (`classifyIntent`). `classifyIntentByKeyword`
+ * (no-LLM keyword) runs ONLY for a profile a deployment explicitly sets to
+ * `classifierMode: 'keyword'`, so it is not on the default path for any classification.
+ * - basic    → classifyIntent() + BASIC_ASYNC_PROCESSOR_ARN (Haiku, tasks: full)
+ * - standard → classifyIntent() + STANDARD_ASYNC_PROCESSOR_ARN (Sonnet, tasks: full)
+ * - premium  → classifyIntent() + PREMIUM_ASYNC_PROCESSOR_ARN (Opus, tasks: full)
  */
 
 import { LambdaClient, InvokeCommand, InvocationType } from '@aws-sdk/client-lambda';
@@ -28,7 +32,7 @@ import {
 } from '@aws-sdk/client-cognito-identity-provider';
 import {
   classifyIntent,
-  classifyIntentBasic,
+  classifyIntentByKeyword,
   IntentType,
   intentToDeliveryOption,
 } from './lib/intent-classifier.js';
@@ -622,10 +626,10 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     }
 
     // Classify intent via the profile's classifierMode — 'llm' for all default profiles (basic
-    // included), 'keyword' (classifyIntentBasic) only if a deployment selects it for a cheap profile.
+    // included), 'keyword' (classifyIntentByKeyword) only if a deployment selects it for a cheap profile.
     const classification = usesLlmClassifier
       ? await classifyIntent(userMessage, { modelId: classifierModelId })
-      : classifyIntentBasic(userMessage);
+      : classifyIntentByKeyword(userMessage);
 
     // Classifier-step instrumentation — logged for now; threading classifier
     // experiment/variant + latency/tokens into the analytics record lands with
@@ -781,11 +785,13 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
 
     // Task tracking runs on EVERY classification. The router is the single Lex entry point for all
     // classifications (deployed per-classification via STATIC_CLASSIFICATION); tasks are a platform
-    // capability, not a standard/premium-only one. getActiveTask/createTask are classification-agnostic, and basic's
-    // async processor gives lightweight task support (grounds the prompt + stamps task_id).
-    // Basic keeps keyword classification (classifyIntentBasic above), whose pack keywords
-    // already emit task intents (report_generation/data_extraction/…), so no per-turn LLM
-    // classifier cost is added. A bare block keeps taskId/taskType scoping local.
+    // capability, not a standard/premium-only one. getActiveTask/createTask are classification-agnostic, and basic
+    // tracks tasks in DynamoDB too (grounds the prompt + stamps task_id + advances state, taskSupport:'full');
+    // richProcessor:false only omits basic's rich OUTPUT (generated docs), not its task tracking.
+    // The `classification.intent` used for task-type routing came from the profile's classifier above
+    // (LLM by default for every classification, basic included; the keyword path only for a
+    // keyword-mode profile), so task intents (report_generation/data_extraction/…) are resolved
+    // the same way at every classification. A bare block keeps taskId/taskType scoping local.
     {
       // Check for active task to handle continuations. Scope the lookup
       // to the CURRENT channel (P2.4) — resuming a task from a different
