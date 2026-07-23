@@ -177,7 +177,7 @@ A single message or event is deliberately written to more than one place. This i
 
 ## 7. Multi-use-case: the same flow, different bot configs
 
-The `InvokedBy` switch is what makes one substrate serve many use cases. Examples (the last two mirror the Communication Hub deployment this pattern generalizes):
+The `InvokedBy` switch is what makes one substrate serve many use cases. Examples (the last two mirror a sibling deployment this pattern generalizes):
 
 | Use case | `StandardMessages` | Effect |
 |---|---|---|
