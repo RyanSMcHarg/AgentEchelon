@@ -150,6 +150,10 @@ describe('kinesis-archival backfillFromUpdateEvents', () => {
     expect(exSql).toContain('am.agent_final_at - ex.user_message_at');
     expect(exSql).toMatch(/inbound_ms\s*=\s*COALESCE\(ex\.inbound_ms,/);
     expect(exSql).toContain('GREATEST(0,');
+    // $16 is explicitly cast: used only in `IS NOT NULL` + arithmetic, an uncast param makes Postgres
+    // fail at execution with "could not determine data type of parameter $16" (caught in live validation,
+    // not by this mock-level assertion). The cast is the fix.
+    expect(exSql).toContain('$16::bigint');
     expect(exParams[15]).toBe(1752537600000); // $16 processor_entry_ms
   });
 

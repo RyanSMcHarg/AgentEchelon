@@ -983,8 +983,8 @@ export async function backfillFromUpdateEvents(
                 -- start). CROSS-CLOCK ($16 server-clock entry vs ex.user_message_at Chime); GREATEST
                 -- clamps the skew to >= 0. Approximate by design.
                 inbound_ms        = COALESCE(ex.inbound_ms,
-                                      CASE WHEN $16 IS NOT NULL
-                                           THEN GREATEST(0, ($16 - EXTRACT(EPOCH FROM ex.user_message_at) * 1000)::integer)
+                                      CASE WHEN $16::bigint IS NOT NULL
+                                           THEN GREATEST(0, ($16::bigint - (EXTRACT(EPOCH FROM ex.user_message_at) * 1000)::bigint)::integer)
                                       END)
            FROM messages am
           WHERE ex.agent_message_id = am.id
