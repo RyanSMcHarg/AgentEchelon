@@ -98,6 +98,10 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
   const scopeIsSingle = !anyTaskSelected; // single-reply targets apply only when no task type is selected
   const scopeMatch = (r: Record<string, unknown>) => activeTypes.has(String(r.delivery_option || 'unknown'));
   const withLatency = rows.filter((r) => r.avg_total_ms != null && Number(r.avg_total_ms) > 0 && scopeMatch(r));
+  // Rows for the breakdown table: respect the response-type filter (so the table matches the headline
+  // scope the copy claims), but keep rows even when a latency field is absent so the raw daily groups
+  // still show. Toggling the filter now updates the table alongside the cards and chart.
+  const scopedRows = rows.filter(scopeMatch);
   const totalExchanges = withLatency.reduce((s, r) => s + (Number(r.exchange_count) || 0), 0);
   const wavg = (field: string): number => {
     if (totalExchanges <= 0) {
@@ -117,9 +121,15 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
   // only pre-answer signal distinct from total time. The latency query derives it
   // from the exchange's response_latency_ms (placeholder_at - user_message_at).
   const withTtff = rows.filter((r) => r.avg_ttff_ms != null && Number(r.avg_ttff_ms) > 0 && scopeMatch(r));
-  const avgTtff = withTtff.length > 0
-    ? withTtff.reduce((sum, r) => sum + Number(r.avg_ttff_ms), 0) / withTtff.length
-    : 0;
+  // Traffic-weight TTFF by exchange_count, consistent with wavg/favg and the "traffic-weighted" note,
+  // so a low-volume slow group does not skew the PRIMARY perceived-latency headline. Plain-mean fallback
+  // when no exchange counts are present (same shape as wavg/favg).
+  const ttffWeight = withTtff.reduce((s, r) => s + (Number(r.exchange_count) || 0), 0);
+  const avgTtff = ttffWeight > 0
+    ? withTtff.reduce((s, r) => s + Number(r.avg_ttff_ms) * (Number(r.exchange_count) || 0), 0) / ttffWeight
+    : withTtff.length > 0
+      ? withTtff.reduce((s, r) => s + Number(r.avg_ttff_ms), 0) / withTtff.length
+      : 0;
   const ttffCaptured = avgTtff > 0;
 
   // Full latency set (docs/LATENCY-TARGETS.md). Same two corrections as wavg — EXCLUDE multi-step
@@ -281,7 +291,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
           tooltip="End-to-end: the full wait from the user's message to the FINAL answer replacing the placeholder (agent_final_at − user_message_at, on the Chime clock, so skew-free). The real user-perceived latency — it includes the inbound hop and cold start that Worker compute (async-processor only) omits."
         />
         <MetricCard title="Worker compute" value={formatMs(avgTotal)} target={scopeIsSingle ? METRIC_TARGETS.avg_total_ms : undefined} rawValue={avgTotal} tooltip="The async processor's server compute for the turn, from processor entry to the answer being posted (history load + tool loop + guardrail + post). NOT the user's wall-clock wait: it excludes the inbound hop (router + classifier + invoke), cold start, and browser delivery, so it is always less than E2E — see E2E for the full wait." />
-        <MetricCard title="Avg Model" value={formatMs(avgModel)} target={scopeIsSingle ? METRIC_TARGETS.avg_bedrock_ms : undefined} rawValue={avgModel} tooltip="Model-inference time: the sum of the Converse (Bedrock) call durations in the tool loop — the pure model-inference share of the turn, distinct from tool execution (see Avg Tool)." />
+        <MetricCard title="Avg Model" value={formatMs(avgModel)} rawValue={avgModel} tooltip="Model-inference time: the sum of the Converse (Bedrock) call durations in the tool loop — the pure model-inference share of the turn, distinct from tool execution (see Avg Tool). Shown without a target: the published bands cover the whole model loop (model + tool), not model inference alone." />
         <MetricCard title="Avg Tool" value={avgTool > 0 ? formatMs(avgTool) : 'n/a'} rawValue={avgTool > 0 ? avgTool : undefined} tooltip="In-loop tool-execution time (RAG / S3 company-context reads) — the non-inference share of the model loop. A RAG-heavy turn shows here, not as slow model inference." />
         <MetricCard title="Inbound" value={avgInbound > 0 ? formatMs(avgInbound) : 'n/a'} rawValue={avgInbound > 0 ? avgInbound : undefined} tooltip="Front-of-turn hop: user message → async worker entry, the part Worker compute omits. NOT a single cold start — it covers the Lex/router fulfillment Lambda, the intent-classification round-trip (a Bedrock call on the default LLM classifier), and the invoke of the async worker: two VPC Lambdas plus a model call. On an idle deployment both Lambdas pay full cold-init, stacking to several seconds; under steady traffic they stay warm and this collapses toward the classifier call alone (~1s). Cross-clock/approximate (Chime send-time vs server entry-time), clamped to ≥ 0." />
         <MetricCard
@@ -399,7 +409,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
             ),
           },
         ]}
-        data={rows}
+        data={scopedRows}
         emptyMessage="No latency data available for this period. Latency is recorded when assistants respond via the async processor."
         />
       </div>
