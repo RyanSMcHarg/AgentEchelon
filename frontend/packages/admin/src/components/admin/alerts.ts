@@ -7,7 +7,7 @@
  * analytics results the dashboard already holds — no new backend query.
  *
  *  - runtime  : sent/thrown errors, failed deliveries, error_response replies, tool-call failures
- *  - latency  : perceived-latency SLO missed (TTFF / P95 over target)
+ *  - latency  : perceived-latency SLO missed (TTFF / E2E over target, plus the P95 worker-compute tail)
  *  - quality  : an intent's or a model's evaluated quality below threshold
  *
  * Pure + deterministic so it is unit-tested (alerts.test.ts).
@@ -83,12 +83,18 @@ export function computeAlerts(sources: AlertSources): Alert[] {
   // --- Latency SLA (perceived: exclude multi-step tasks, traffic-weighted; mirrors LatencyTab) -------
   const latRows = (sources.latency ?? []).filter((r) => !isTaskDelivery(r));
   if (latRows.length) {
+    // Perceived-latency SLOs the user actually feels: TTFF (time to placeholder) and E2E (user message
+    // to final answer, incl. the inbound hop + cold start). P95 worker-compute is the server-side tail
+    // signal — it excludes the inbound hop, so it is secondary to E2E for a user-facing SLA.
     const ttff = weightedMean(latRows.filter((r) => Number(r.avg_ttff_ms) > 0), 'avg_ttff_ms');
+    const e2e = weightedMean(latRows.filter((r) => Number(r.avg_e2e_ms) > 0), 'avg_e2e_ms');
     const p95 = weightedMean(latRows.filter((r) => Number(r.p95_total_ms) > 0), 'p95_total_ms');
     const a1 = metricAlert(ttff, 'ttff_ms', { id: 'lat-ttff', category: 'latency', title: 'Time to first feedback above target', tab: 'latency' });
     if (a1) alerts.push(a1);
-    const a2 = metricAlert(p95, 'p95_total_ms', { id: 'lat-p95', category: 'latency', title: 'P95 response latency above target', tab: 'latency' });
+    const a2 = metricAlert(e2e, 'avg_e2e_ms', { id: 'lat-e2e', category: 'latency', title: 'End-to-end latency above target', tab: 'latency' });
     if (a2) alerts.push(a2);
+    const a3 = metricAlert(p95, 'p95_total_ms', { id: 'lat-p95', category: 'latency', title: 'P95 worker-compute latency above target', tab: 'latency' });
+    if (a3) alerts.push(a3);
   }
 
   // --- Per-intent quality + tool errors ------------------------------------------------------------

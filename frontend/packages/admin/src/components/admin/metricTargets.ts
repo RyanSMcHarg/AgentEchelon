@@ -51,21 +51,21 @@ export const METRIC_TARGETS: Record<string, MetricTarget> = {
   // Time to COMPLETE response (secondary). Nielsen NNG: 10s attention limit (good),
   // ~30s abandon threshold (warn). Agentic tool loops legitimately take seconds.
   avg_total_ms: {
-    label: 'Avg total latency', direction: 'lower', target: 10000, warn: 30000, format: fmtMs,
+    label: 'Avg worker-compute latency', direction: 'lower', target: 10000, warn: 30000, format: fmtMs,
     description:
-      'Mean SERVER compute for the turn, from processor entry to the answer being posted (history load + tool loop + guardrail + post). NOT the user wall-clock wait: it excludes the inbound hop, cold start, and delivery — see E2E for the full wait. Agentic tool loops make multiple model calls, so multi-second values are normal.',
+      'Mean async-processor compute for the turn, from processor entry to the answer being posted (history load + tool loop + guardrail + post). NOT the user wall-clock wait: it excludes the inbound hop (router + classifier + invoke), cold start, and delivery, so it is always less than E2E — see E2E for the full wait. Agentic tool loops make multiple model calls, so multi-second values are normal.',
   },
   // The true user-perceived wait (user message -> final answer). Includes the inbound hop + cold start
   // that total omits. Nielsen 10s attention limit (good), ~30s abandon (warn). docs/LATENCY-TARGETS.md.
   avg_e2e_ms: {
     label: 'Avg end-to-end latency', direction: 'lower', target: 10000, warn: 30000, format: fmtMs,
     description:
-      'Mean user-perceived wait from the message to the FINAL answer (agent_final_at − user_message_at, both on the Chime clock, so skew-free). Unlike total (server compute), it includes the inbound hop and cold start — the real latency an SLA is about.',
+      'Mean user-perceived wait from the message to the FINAL answer (agent_final_at − user_message_at, both on the Chime clock, so skew-free). Unlike worker compute, it includes the inbound hop and cold start — the real latency an SLA is about.',
   },
   p95_total_ms: {
-    label: 'P95 total latency', direction: 'lower', target: 15000, warn: 30000, format: fmtMs,
+    label: 'P95 worker-compute latency', direction: 'lower', target: 15000, warn: 30000, format: fmtMs,
     description:
-      '95th-percentile end-to-end latency: 95% of responses complete at or under this value. More sensitive than the average to cold starts, long tool loops, and outliers, so it is the better tail-latency signal.',
+      '95th-percentile async-processor compute latency per turn: 95% of individual turns finish computing at or under this. By default multi-step tasks are excluded; when the response-type filter includes them, each task TURN counts individually (per-turn), never the whole multi-turn task cycle. More sensitive than the average to cold starts, long tool loops, and outliers, so it is the better tail signal.',
   },
   avg_bedrock_ms: {
     label: 'Avg Bedrock latency', direction: 'lower', target: 6000, warn: 12000, format: fmtMs,

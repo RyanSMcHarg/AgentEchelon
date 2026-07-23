@@ -176,12 +176,26 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
   return (
     <div className="admin-tab">
       <h3>Response Latency</h3>
+      <div
+        className="admin-info-banner"
+        style={{
+          borderLeft: '3px solid var(--status-warn)',
+          padding: 'var(--space-2) var(--space-4)',
+          fontSize: '0.85em',
+          marginBottom: 'var(--space-3)',
+        }}
+      >
+        AgentEchelon does not ship with full performance optimization, in order to reduce cost.
+        Production deployments should consider{' '}
+        <DocLink href={DOC_LINKS.performanceOptimization}>Performance Optimization</DocLink>{' '}
+        (eliminating Lambda cold starts, RDS Proxy, and more).
+      </div>
       <p className="admin-tab-description">
         Latency breakdown across the message journey. <strong>TTFF</strong> (time to first feedback)
         is the delay to the "One moment…" placeholder; <strong>E2E</strong> is the full user wait to
-        the final answer, the real perceived latency. <strong>Total</strong> is server compute only
-        (processor entry to answer posted) and excludes the inbound hop, cold start, and delivery, so
-        it is a lower bound on the wait. Bedrock time is split into <strong>Model</strong> (inference)
+        the final answer, the real perceived latency. <strong>Worker compute</strong> is the async
+        processor's server time only (processor entry to answer posted) and excludes the inbound hop,
+        cold start, and delivery, so it is always less than E2E. Model-loop time is split into <strong>Model</strong> (inference)
         and <strong>Tool</strong> (in-loop RAG / context reads). Use the response-type filter to include
         or exclude delivery types; the default excludes multi-step tasks (whose per-turn latency on a
         heavy generation step is much larger). Task turns show <strong>per-turn</strong> reply latency,
@@ -233,7 +247,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
       {avgTotal > 0 && (
         <div className="admin-tab-banner" style={{ alignItems: 'stretch', flexDirection: 'column' }}>
           <div className="admin-tab-banner-label" style={{ marginBottom: 'var(--space-1)' }}>
-            <span className="admin-tab-banner-label-text">Total latency · distribution</span>
+            <span className="admin-tab-banner-label-text">Worker compute · distribution</span>
           </div>
           <DistributionBar
             min={0}
@@ -256,7 +270,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
           subtitle={ttffCaptured ? 'time to placeholder' : 'no paired exchanges yet'}
           target={scopeIsSingle ? METRIC_TARGETS.ttff_ms : undefined}
           rawValue={ttffCaptured ? avgTtff : undefined}
-          tooltip="Time to first feedback: the delay from the user's message to the assistant's placeholder appearing. There is no token streaming, so this acknowledgment latency is the perceived wait — distinct from total time (the completed answer)."
+          tooltip="Time to first feedback: the wait from the user sending the message — the client shows a typing indicator — to the assistant's 'One moment…' placeholder appearing. With no token streaming, this acknowledgment latency is the perceived wait, distinct from the completed answer."
         />
         <MetricCard
           title="E2E"
@@ -264,32 +278,39 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
           subtitle={e2eCaptured ? 'user → final answer' : 'no completed answers yet'}
           target={scopeIsSingle ? METRIC_TARGETS.avg_e2e_ms : undefined}
           rawValue={e2eCaptured ? avgE2e : undefined}
-          tooltip="End-to-end: the full wait from the user's message to the FINAL answer replacing the placeholder (agent_final_at − user_message_at, on the Chime clock, so skew-free). The real user-perceived latency — it includes the inbound hop and cold start that Total (server compute only) omits."
+          tooltip="End-to-end: the full wait from the user's message to the FINAL answer replacing the placeholder (agent_final_at − user_message_at, on the Chime clock, so skew-free). The real user-perceived latency — it includes the inbound hop and cold start that Worker compute (async-processor only) omits."
         />
-        <MetricCard title="Avg Total" value={formatMs(avgTotal)} target={scopeIsSingle ? METRIC_TARGETS.avg_total_ms : undefined} rawValue={avgTotal} tooltip="Server compute for the turn, from processor entry to the answer being posted (history load + tool loop + guardrail + post). NOT the user's wall-clock wait: it excludes the inbound hop, cold start, and browser delivery, so it is a lower bound on perceived latency — see E2E for the full wait." />
-        <MetricCard title="Avg Model" value={formatMs(avgModel)} target={scopeIsSingle ? METRIC_TARGETS.avg_bedrock_ms : undefined} rawValue={avgModel} tooltip="Model-inference time: the sum of the Converse (Bedrock) call durations in the tool loop. The pure model share of the former 'Bedrock' number, distinct from tool execution (see Avg Tool)." />
-        <MetricCard title="Avg Tool" value={avgTool > 0 ? formatMs(avgTool) : 'n/a'} rawValue={avgTool > 0 ? avgTool : undefined} tooltip="In-loop tool-execution time (RAG / S3 company-context reads). The other half of the former 'Bedrock' number — a RAG-heavy turn shows here, not as slow model inference." />
-        <MetricCard title="Inbound" value={avgInbound > 0 ? formatMs(avgInbound) : 'n/a'} rawValue={avgInbound > 0 ? avgInbound : undefined} tooltip="User message → async processor entry (routing / queue / cold start). Cross-clock and approximate (Chime start vs server-clock entry), clamped to ≥ 0. The front-of-turn latency that Total omits." />
+        <MetricCard title="Worker compute" value={formatMs(avgTotal)} target={scopeIsSingle ? METRIC_TARGETS.avg_total_ms : undefined} rawValue={avgTotal} tooltip="The async processor's server compute for the turn, from processor entry to the answer being posted (history load + tool loop + guardrail + post). NOT the user's wall-clock wait: it excludes the inbound hop (router + classifier + invoke), cold start, and browser delivery, so it is always less than E2E — see E2E for the full wait." />
+        <MetricCard title="Avg Model" value={formatMs(avgModel)} target={scopeIsSingle ? METRIC_TARGETS.avg_bedrock_ms : undefined} rawValue={avgModel} tooltip="Model-inference time: the sum of the Converse (Bedrock) call durations in the tool loop — the pure model-inference share of the turn, distinct from tool execution (see Avg Tool)." />
+        <MetricCard title="Avg Tool" value={avgTool > 0 ? formatMs(avgTool) : 'n/a'} rawValue={avgTool > 0 ? avgTool : undefined} tooltip="In-loop tool-execution time (RAG / S3 company-context reads) — the non-inference share of the model loop. A RAG-heavy turn shows here, not as slow model inference." />
+        <MetricCard title="Inbound" value={avgInbound > 0 ? formatMs(avgInbound) : 'n/a'} rawValue={avgInbound > 0 ? avgInbound : undefined} tooltip="Front-of-turn hop: user message → async worker entry, the part Worker compute omits. NOT a single cold start — it covers the Lex/router fulfillment Lambda, the intent-classification round-trip (a Bedrock call on the default LLM classifier), and the invoke of the async worker: two VPC Lambdas plus a model call. On an idle deployment both Lambdas pay full cold-init, stacking to several seconds; under steady traffic they stay warm and this collapses toward the classifier call alone (~1s). Cross-clock/approximate (Chime send-time vs server entry-time), clamped to ≥ 0." />
         <MetricCard
           title="Avg Polling"
           value={formatMs(avgPoll)}
           tooltip="Mean time the async processor spent polling for the completed answer before swapping it in for the placeholder, for single-reply deliveries only (multi-step tasks are excluded — their polling spans the whole task). Part of total latency, distinct from model inference."
         />
-        <MetricCard title="P95 Total" value={formatMs(p95Total)} target={scopeIsSingle ? METRIC_TARGETS.p95_total_ms : undefined} rawValue={p95Total} tooltip="95th-percentile single-reply latency, traffic-weighted across groups (excludes multi-step tasks). Not the exact global p95 — a per-group tail summary — but a stable headline rather than the single worst group." />
+        <MetricCard title="P95 worker compute" value={formatMs(p95Total)} target={scopeIsSingle ? METRIC_TARGETS.p95_total_ms : undefined} rawValue={p95Total} tooltip="95th-percentile async-processor compute latency, traffic-weighted across groups. Follows the response-type filter above: by default multi-step tasks are excluded; add them back and each task TURN counts individually (per-turn compute), never the whole multi-turn task cycle (that lives on Tasks / Effectiveness). A per-group tail summary — not the exact global p95 — so it's a stable headline rather than the single worst group." />
       </div>
 
       {latencyTrendDates.length >= 2 && (
         <div className="admin-section">
-          <div className="admin-tab-banner-label" style={{ marginBottom: 'var(--space-2)' }}>
-            <span className="admin-tab-banner-label-text">Latency vs target · trend</span>
+          <div className="admin-tab-banner-label" style={{ marginBottom: 'var(--space-1)' }}>
+            <span className="admin-tab-banner-label-text">Worker-compute latency vs target · trend</span>
           </div>
+          <p className="admin-tab-description">
+            Both lines are worker-compute time (the <strong>Worker compute</strong> metric — the async
+            processor only), trended daily. P95 sits well above the average by design: the average is
+            pulled down by the many fast warm turns, while P95 tracks the slow tail (cold starts, long
+            tool loops). A wide gap is healthy — it means most turns are fast with only a heavier tail;
+            the two lines converging upward is the signal to watch.
+          </p>
           <LineChart
-            label="Latency trend against SLO targets"
+            label="Worker-compute latency trend against SLO targets"
             categories={latencyTrendDates.map((d) => d.slice(5))}
             formatY={formatMs}
             series={[
-              { label: 'P95 total', points: p95Series, color: 'var(--accent-500)' },
-              { label: 'Avg total', points: avgSeries, color: 'var(--status-good)' },
+              { label: 'P95 worker', points: p95Series, color: 'var(--accent-500)' },
+              { label: 'Avg worker', points: avgSeries, color: 'var(--status-good)' },
             ]}
             referenceLines={[
               { value: METRIC_TARGETS.p95_total_ms.target, label: `P95 target ${formatMs(METRIC_TARGETS.p95_total_ms.target)}`, color: 'var(--status-bad)' },
@@ -297,20 +318,29 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
             ]}
           />
           <div className="admin-latency-legend">
-            <span style={{ color: 'var(--accent-500)' }}>● P95 total</span>
-            <span style={{ color: 'var(--status-good)' }}>● Avg total</span>
+            <span style={{ color: 'var(--accent-500)' }}>● P95 worker</span>
+            <span style={{ color: 'var(--status-good)' }}>● Avg worker</span>
             <span style={{ color: 'var(--status-bad)' }}>--- targets (good is below)</span>
           </div>
         </div>
       )}
 
-      <div className="admin-latency-legend">
-        <span style={{ color: 'var(--status-good)' }}>Good (&lt;2s)</span>
-        <span style={{ color: 'var(--status-warn)' }}>Acceptable (2-5s)</span>
-        <span style={{ color: 'var(--status-bad)' }}>Slow (&gt;5s)</span>
-      </div>
-
-      <DataTable
+      <div className="admin-section">
+        <h3>Latency by assistant + delivery · daily breakdown</h3>
+        <p className="admin-tab-description">
+          The per-day, per-assistant, per-delivery rows behind the metrics above — the raw
+          groups the headline numbers aggregate from. Read-only: rows highlight on hover for
+          readability but are not drill-downs. Sort any column by clicking its header. The
+          <strong> Worker</strong> and <strong>P95 worker</strong> columns are colour-coded
+          by the key below.
+        </p>
+        <div className="admin-latency-legend" role="note" aria-label="Worker-compute colour key">
+          <span style={{ color: 'var(--text-secondary, #666)', fontWeight: 600 }}>Worker-compute colour key:</span>
+          <span style={{ color: 'var(--status-good)' }}>Good (≤10s)</span>
+          <span style={{ color: 'var(--status-warn)' }}>Acceptable (10–30s)</span>
+          <span style={{ color: 'var(--status-bad)' }}>Slow (&gt;30s)</span>
+        </div>
+        <DataTable
         columns={[
           { key: 'date', label: 'Date' },
           { key: 'agent_type', label: 'Assistant' },
@@ -342,7 +372,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
           },
           {
             key: 'avg_total_ms',
-            label: 'Avg Total',
+            label: 'Worker',
             render: (v) => (
               <span style={{ color: latencyColor(Number(v)), fontWeight: 600 }}>
                 {formatMs(Number(v))}
@@ -361,7 +391,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
           },
           {
             key: 'p95_total_ms',
-            label: 'P95 Total',
+            label: 'P95 worker',
             render: (v) => (
               <span style={{ color: latencyColor(Number(v)), fontWeight: 600 }}>
                 {formatMs(Number(v))}
@@ -371,7 +401,8 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
         ]}
         data={rows}
         emptyMessage="No latency data available for this period. Latency is recorded when assistants respond via the async processor."
-      />
+        />
+      </div>
 
       {/* ---------- Page-load (web-vitals) ---------- */}
       <div className="admin-section">

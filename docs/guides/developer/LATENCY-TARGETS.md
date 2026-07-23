@@ -19,7 +19,7 @@ Source of truth: the processor stamps deltas into the Chime message Metadata fie
 - **Why it matters:** with no streaming, this acknowledgment is the only "the system is alive" signal before the answer, so it is the **perceived-responsiveness** SLO (target <= 1s). A regression means the UI feels dead on send.
 - **What it does NOT tell you:** how long until a real answer. It is time-to-spinner, not time-to-content.
 
-### Total - `total_ms` (dashboard cards: "Avg Total", "P95 Total")
+### Worker compute - `total_ms` (dashboard cards: "Worker compute", "P95 worker compute")
 - **Definition:** server-side wall-clock to produce and post the answer, inside one processor invocation.
 - **Measures:** placeholder resolution + history/context load + the Converse tool loop + the output guardrail + posting the reply. Starts at process-fn **entry**; ends right after the final `UpdateChannelMessage` returns.
 - **Stamp:** `totalTime = Date.now() - startTime`, stamped `totalMs` -> `messages.total_ms`.
@@ -30,12 +30,12 @@ Source of truth: the processor stamps deltas into the Chime message Metadata fie
 - **Definition:** duration of the self-hosted Converse tool loop.
 - **Measures:** ALL Converse iterations + in-loop **tool execution** (RAG, S3 company context) + the **output guardrail**. Excludes placeholder resolution, history load, and delivery.
 - **Stamp:** `bedrockTime = Date.now() - bedrockStart`, stamped `latencyMs` -> `messages.latency_ms`.
-- **Why it matters:** the **dominant component of Total** on most turns and the lever for model comparison - where the turn's time actually goes.
+- **Why it matters:** the **dominant component of Worker compute** on most turns and the lever for model comparison - where the turn's time actually goes.
 - **Now split:** `latency_ms` alone conflated model and tool time (a RAG-heavy turn inflated "Bedrock" without the model being slow). The dashboard now shows it split into **`model_ms`** (Avg Model) and **`tool_ms`** (Avg Tool) - see below. `latency_ms` remains the combined loop time.
 
 ### Polling - `poll_ms` (dashboard card: "Avg Polling")
 - **Definition:** time spent at the start locating/confirming the placeholder message the router just created.
-- **Measures:** Chime polling with retries until the placeholder id resolves. A **sub-interval of Total**. `0` when the placeholder id is passed directly (e.g. /battle resume).
+- **Measures:** Amazon Chime SDK polling with retries until the placeholder id resolves. A **sub-interval of Worker compute**. `0` when the placeholder id is passed directly (e.g. /battle resume).
 - **Stamp:** `pollTime = Date.now() - startTime`, stamped `pollMs` -> `messages.poll_ms`.
 - **Why it matters:** a **handshake artifact, not compute**. Near-zero normally; a spike points at Chime message-propagation trouble, not a slow model.
 
@@ -78,13 +78,13 @@ Each latency metric maps onto a hop in the message journey (see [`MESSAGE-FLOW.m
 The Latency tab renders the full set as distinct cards, each with a tooltip stating exactly what it brackets, so no card is left to be misread:
 
 - **TTFF** - "time to placeholder" (acknowledgment latency), not the answer.
-- **E2E** - the full user wait to the final answer (the real perceived latency); includes the inbound hop and cold start that Total omits.
-- **Avg Total** - server compute only (processor entry -> answer posted), labeled as a lower bound on the wait, NOT the user's wall-clock time.
-- **Avg Model** / **Avg Tool** - the former single "Bedrock" number split into model inference vs in-loop tool execution, so a RAG-heavy turn no longer reads as a slow model.
+- **E2E** - the full user wait to the final answer (the real perceived latency); includes the inbound hop and cold start that Worker compute omits.
+- **Worker compute** - the async processor's server compute only (processor entry -> answer posted); always less than E2E, NOT the user's wall-clock time.
+- **Avg Model** / **Avg Tool** - the model-loop time split into model inference vs in-loop tool execution, so a RAG-heavy turn no longer reads as a slow model.
 - **Inbound** - the front-of-turn routing / cold-start hop (approximate, cross-clock).
-- **Avg Polling**, **P95 Total** - the placeholder handshake and the tail.
+- **Avg Polling**, **P95 worker compute** - the placeholder handshake and the tail.
 
-The header prose and the distribution rail describe the same framing, so an operator is not left to infer that Total is server-only or that Bedrock bundled tool time.
+The header prose and the distribution rail describe the same framing, so an operator is not left to infer that Worker compute is server-only or that the model-loop number bundled tool time.
 
 ## Response-time standards
 
@@ -125,7 +125,7 @@ Note: **tune from observed data, within the standard.** Once traffic flows, set 
 
 ## Remaining gaps
 
-The user->final-answer metric (former G1), the model/tool split (G2), the Total relabel (G3), the inbound hop (G4), and the metadata-cap concern (G7 - latency rides the out-of-band store, not the capped field) are BUILT; see the metric definitions and "How the full set is captured." What remains:
+The user->final-answer metric (former G1), the model/tool split (G2), the worker-compute relabel (G3), the inbound hop (G4), and the metadata-cap concern (G7 - latency rides the out-of-band store, not the capped field) are BUILT; see the metric definitions and "How the full set is captured." What remains:
 
 | # | Gap | Why it matters | How to fill |
 |---|-----|----------------|-------------|
@@ -161,7 +161,7 @@ It brackets a Chime-stamped start against a server-clock entry with no shared cl
 2. **Emit** - `finalizePlaceholderResponse` writes `modelMs`, `toolMs`, and `processorEntryMs` (the handler-entry `Date.now()`) to the out-of-band analytics record. `agent_final_at` needs no emit: archival reads it from the UPDATE event itself.
 3. **Archival** (`kinesis-archival.ts` `backfillFromUpdateEvents`) - folds `model_ms` / `tool_ms` onto the message row and derives `agent_final_at`, `e2e_ms`, and `inbound_ms` on the exchange, all COALESCE-idempotent.
 4. **Query** (`getLatencyMetrics`) - adds `avg_e2e_ms` / `p95_e2e_ms` (from `e.e2e_ms`), `avg_model_ms` / `avg_tool_ms` (from `m`), and `avg_inbound_ms` (from `e.inbound_ms`) to the SELECT and the columns contract, keeping `AND m.total_ms > 0`.
-5. **Frontend** (`LatencyTab`) - E2E, Avg Model, Avg Tool, and Inbound cards, the Total/Bedrock relabels + tooltips, and the `avg_e2e_ms` target in `metricTargets.ts`. Targets there are display-only; the Alerts tab keys on its own set, so a new metric does not misfire an SLA.
+5. **Frontend** (`LatencyTab`) - E2E, Avg Model, Avg Tool, and Inbound cards, the worker-compute / model-loop relabels + tooltips, and the `avg_e2e_ms` target in `metricTargets.ts`. The Alerts tab reads the same `METRIC_TARGETS` registry, so a new target key only fires an alert once a matching `metricAlert` call is added in `alerts.ts` (TTFF, E2E, and P95 worker-compute are wired; all exclude task-delivery rows).
 
 ### Correctness and rollout
 

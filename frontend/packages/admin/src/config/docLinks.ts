@@ -9,6 +9,8 @@
  */
 
 const DOCS_BASE = 'https://mcharg.site/blog';
+// Repo docs that have no curated blog post yet link straight to GitHub (source of truth).
+const REPO_BASE = 'https://github.com/RyanSMcHarg/AgentEchelon/blob/main';
 
 export const DOC_LINKS = {
   /** End-to-end message journey (latency steps, delivery). */
@@ -17,6 +19,8 @@ export const DOC_LINKS = {
   messageDelivery: `${DOCS_BASE}/ai-assistant-response-patterns`,
   /** Basis for the latency targets shown on the Latency tab. */
   latencyTargets: `${DOCS_BASE}/ai-assistant-latency-testing`,
+  /** How to reduce latency (cold starts, RDS Proxy, classifier hop). Repo doc; no blog post yet. */
+  performanceOptimization: `${REPO_BASE}/docs/guides/developer/PERFORMANCE-OPTIMIZATION.md`,
   /** Aurora analytics mode: two-pass evaluation + multi-turn scoring. */
   evaluation: `${DOCS_BASE}/ai-assistant-evaluation-implementation`,
   /** Aurora vs Athena analytics capabilities. */

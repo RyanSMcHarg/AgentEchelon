@@ -158,7 +158,7 @@ test.describe('Admin console — operator flows (live)', () => {
 
     // TTFF is the PRIMARY perceived-latency metric (the placeholder appearing); P95 is the tail.
     const ttff = await cardValue(page, 'TTFF');
-    const p95 = await cardValue(page, 'P95 Total');
+    const p95 = await cardValue(page, 'P95 worker compute');
     expect(msOf(ttff), `TTFF renders a real time value (got "${ttff}")`).toBeGreaterThan(0);
     const p95ms = msOf(p95);
     expect(p95ms, `P95 renders a real time value (got "${p95}")`).toBeGreaterThan(0);
