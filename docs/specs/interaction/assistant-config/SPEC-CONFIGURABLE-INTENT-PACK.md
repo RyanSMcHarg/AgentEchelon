@@ -22,7 +22,7 @@ The fix mirrors the persona seam (`ASSISTANT_SYSTEM_PROMPT`): make the **domain 
 interface IntentDef {
   key: string;          // stable id - the classified value + INTENT_ROUTE_STRATEGY key (e.g. 'find_recipe')
   description: string;  // one line the LLM classifier sees ("when does this intent apply")
-  keywords: string[];   // lowercase substrings for the no-LLM fallback (basic tier / LLM failure)
+  keywords: string[];   // lowercase substrings for the no-LLM keyword classifier (a keyword-mode profile / LLM-classifier failure)
   delivery: 'DIRECT' | 'PLACEHOLDER_UPDATE' | 'TASK_MULTI_STEP';
   // Per-intent response shaping (P3, optional). Tune answer size per intent via config, no code.
   maxTokens?: number;                          // positive int; clamped to the tier ceiling + reasoning floor
@@ -47,7 +47,7 @@ A domain intent may carry `maxTokens` (a positive integer) and a coarse `verbosi
 ### How a pack drives the three decisions
 
 1. **Classification (LLM).** `intentPackCategoryLines()` renders the pack as the category list in the Haiku classifier prompt (universal three + domain intents). The model returns a category name; it's matched against `knownIntentKeys()` (universal + pack); unknown ⇒ `general`.
-2. **Classification (fallback).** Basic tier and LLM-failure paths use `classifyByPackKeywords()` - first domain intent whose keyword appears in the message, else `general`.
+2. **Classification (fallback).** The LLM-failure path, and any profile that opts into `classifierMode: 'keyword'`, use `classifyByPackKeywords()` - first domain intent whose keyword appears in the message, else `general`. (All default profiles, basic included, use the LLM classifier; the keyword path is not a per-tier behavior.)
 3. **Delivery.** `deliveryClassForIntent(key)` maps the classified key → `DIRECT` / `PLACEHOLDER_UPDATE` / `TASK_MULTI_STEP` via the pack (universal: greeting/ack ⇒ DIRECT, general ⇒ PLACEHOLDER_UPDATE). `selectDeliveryOption` and `planBattleTaskDelivery` read this.
 
 The classified `intent` is also a **`RoutingContext` signal (rule 3, `INTENT_ROUTE_STRATEGY`)**, so a deployment's own intents can drive model resolution. Unknown-to-the-strategy keys fall to the tier default in `resolveModelForIntent` (no crash) - a deployment that wants per-intent model routing extends `INTENT_TYPE_TO_KEY` / `INTENT_ROUTE_STRATEGY`; absent that, all its intents use the tier default model, which is correct for v1. A per-profile deployment can instead set per-intent model overrides on the profile version itself (`models.byIntent`, seeded from `INTENT_ROUTE_STRATEGY` so resolution is unchanged until edited - `SPEC-PORTABLE-PROFILES.md`).
@@ -98,7 +98,7 @@ A small pack *may* still be passed inline (`-c assistantIntentPack='[…]'` / Po
 
 `DEFAULT_INTENT_PACK` mirrors the default enterprise intents exactly. **A deployment that does not set `ASSISTANT_INTENT_PACK` uses the default** - same categories, same keyword fallback, same delivery mapping, same default task-state-machine keys (`guided_troubleshooting` / `data_extraction` / `report_generation` / `place_item` / `action_item`).
 
-Pinned by `test/lib/intent-pack.test.ts` (the pack primitives + keyword fallback + delivery map for DEFAULT) and the existing routing/delivery suites (45 tests) staying green. **Scope of the regression:** it asserts the pack-level primitives, not the LLM classifier prompt assembly or `classifyIntentBasic`'s full return (the LLM path needs a Bedrock `Converse` mock) - a classifier integration test is a recommended follow-up.
+Pinned by `test/lib/intent-pack.test.ts` (the pack primitives + keyword fallback + delivery map for DEFAULT) and the existing routing/delivery suites (45 tests) staying green. **Scope of the regression:** it asserts the pack-level primitives, not the LLM classifier prompt assembly or `classifyIntentByKeyword`'s full return (the LLM path needs a Bedrock `Converse` mock) - a classifier integration test is a recommended follow-up.
 
 ## Host (deployment) vs AgentEchelon split
 

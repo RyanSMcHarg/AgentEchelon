@@ -28,3 +28,24 @@ Failure mode 2 is the current one on the live deploy: logs show `intent: data_ex
 - A leadership user's financial-figure question is answered inline. Bulk/structured extraction still becomes a tracked task (the `data_extraction` / task-state-machine flows are unaffected - they use table/export phrasing).
 - Intent classification is an LLM call and remains probabilistic; the narrowed `data_extraction` description plus temperature-0 classification make the single-fact-vs-bulk split reliable, but premium-ARR remains the canary to watch, and the `load_platform_info` split stays a suspect if tool selection regresses.
 - This ADR is the durable public record of a finding previously captured only in a private working plan.
+
+## Amendment: intent and delivery are separate axes (do NOT collapse domain intents to `general`)
+
+Decision 2 ("a single fact is `GENERAL`, not `data_extraction`") solved a **delivery** problem - a one-sentence answer was being deferred behind a `TASK_MULTI_STEP` task - by changing the **intent**. Read narrowly that is correct: a single fact must not route to the bulk-extraction task. Read broadly it is a trap: pushing every single-turn business question into `general` throws away the classification signal (a revenue figure and "what is the capital of France?" land in the same bucket), which degrades the admin console's intent analytics and per-intent model routing.
+
+These are two independent axes:
+
+- **Intent** - what the request is about. The analytics bucket + the `INTENT_ROUTE_STRATEGY` routing signal.
+- **Delivery** - how the turn is returned. The per-intent `delivery` field: `DIRECT` / `PLACEHOLDER_UPDATE` (one inline turn) / `TASK_MULTI_STEP` (tracked multi-step).
+
+The intent pack already carries `delivery` per `IntentDef`, so a domain intent can be answered inline: give it `delivery: 'PLACEHOLDER_UPDATE'`. The correct rule is therefore:
+
+- A single-turn business question (a revenue figure, one account's status, a product-plan detail) is its **own domain intent with `delivery: 'PLACEHOLDER_UPDATE'`** - bucketed for analytics AND answered inline. It is NOT `general`.
+- `general` stays for genuinely generic questions with no domain bucket.
+- Only genuinely multi-step work (a compiled report, a bulk table export) is `TASK_MULTI_STEP` (`report_generation`, `data_extraction`).
+
+`general` was only reached for single facts because the DEFAULT `data_extraction` / `report_generation` are hardwired to `TASK_MULTI_STEP` - so the general bucket was the only way to avoid the task. The per-intent `delivery` field is the real lever; `general` is not.
+
+The Stratum demo intent pack (`seed-demo.ts`) is the worked example: `financial_metric`, `account_status`, `competitive_intel`, `directory_lookup`, `process_lookup`, and `product_info` are all `PLACEHOLDER_UPDATE` domain intents (answered inline, still bucketed), while `report_generation` and `data_extraction` remain the `TASK_MULTI_STEP` keys for compiled reports and bulk exports. The premium-ARR canary still passes - the figure is stated inline - and it now lands in `financial_metric` instead of `general`.
+
+Open follow-up: a report or extraction that is genuinely answerable in one turn still cannot be delivered inline under its own key, because `delivery` is static per intent key. Expressing "this key is usually multi-step but inline when the answer fits one turn" would need a runtime delivery decision where `deliveryClassForIntent` is consumed (a small, additive change), rather than a second intent key. Deferred until a use case needs it.

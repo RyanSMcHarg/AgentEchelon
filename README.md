@@ -379,15 +379,18 @@ IPs. Full guide, including teardown and the security headers applied:
 > **[docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md](docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md)**.
 > Read it before reasoning about who can do what.
 
-New deployments have no users. Run the setup script to create the first admin:
+New deployments have no users. Provision the first admin (from `backend/`):
 
 ```bash
-# Usage: ./scripts/create-admin-user.sh <email> [temporary-password]
-# Omit the password to auto-generate one; it's printed at the end.
-AWS_PROFILE=your-profile ./scripts/create-admin-user.sh admin@example.com
+# Default: Cognito emails a one-time temporary password; the app forces a permanent-
+# password reset on first sign-in (NEW_PASSWORD_REQUIRED). To skip email (e.g. a local
+# bootstrap), set ADMIN_TEMP_PASSWORD to a temporary password of your choice - the
+# forced reset on first sign-in still applies. No permanent password is ever set here.
+cd backend
+AWS_PROFILE=your-profile ADMIN_EMAIL=admin@example.com npm run provision-admin
 ```
 
-This creates a premium-tier user, adds it to the `premium` + `admins` Cognito groups (the authoritative tier/admin signal), and creates the Amazon Chime SDK AppInstance User required for messaging. The account uses a **temporary password** - on first sign-in the app prompts you to set a permanent one (`NEW_PASSWORD_REQUIRED`). Sign in at http://localhost:5173.
+This creates a premium-tier user, adds it to the `premium` + `admins` Cognito groups (the authoritative tier/admin signal), and creates the Amazon Chime SDK AppInstance User required for messaging. It resolves the user pool and app instance from the deployed stack outputs, and is idempotent (re-running updates the user and re-sends the invite). Sign in at http://localhost:5173.
 
 **Password requirements:** 8+ characters, uppercase, lowercase, digit, symbol.
 
@@ -483,7 +486,7 @@ Access to AI models is controlled by user tier:
 
 | Tier | Models | Agent Handler |
 |------|--------|---------------|
-| Basic | Configurable basic model (default: Claude Haiku) | Single response, 30s timeout |
+| Basic | Configurable basic model (default: Claude Haiku) | Task tracking + DynamoDB, 30s timeout |
 | Standard | Configurable standard model plus standard-safe fallbacks | Task tracking + DynamoDB, 60s timeout |
 | Premium | Configurable premium model with full catalog access | Full capabilities + analytics, 90s timeout |
 
@@ -574,11 +577,16 @@ The project includes Playwright E2E tests with video recording covering sign up,
 > ```bash
 > cd backend
 > AWS_PROFILE=<your-profile> npx ts-node scripts/seed-demo.ts   # users + tier context + identity check
-> AWS_PROFILE=<your-profile> npm run validate                   # tier flows -> battle -> admin dashboard
+> AWS_PROFILE=<your-profile> npm run validate                   # ALL phases: tier flows + tasks/experiments/feedback + battle -> admin
 > ```
-> Full runbook (prerequisites, per-tier scenarios, RAG ingestion, how to adapt it to your own
-> use case): **[docs/guides/user/DEMO-AND-VALIDATION.md](docs/guides/user/DEMO-AND-VALIDATION.md)**. The sections below
-> document the raw Playwright suite the validator drives.
+> Run the FULL `npm run validate`, not the Playwright suite directly: the data-producing phases
+> (tasks, experiments, feedback, welcome) are what drive DOMAIN intents and multi-step tasks across
+> every tier, so the admin console shows real breadth instead of an all-`general` bar. The validator
+> prints a **DATA READINESS** preflight and a **PHASE SUMMARY** so a sparse dashboard is visible, not
+> silent (a phase self-skips when its deployed dependency is absent). Full runbook (prerequisites, the
+> data-readiness gating, per-tier scenarios, RAG ingestion, adapting it to your own use case):
+> **[docs/guides/user/DEMO-AND-VALIDATION.md](docs/guides/user/DEMO-AND-VALIDATION.md)**. The sections below document the
+> raw Playwright suite the validator drives.
 
 ### Test Structure
 

@@ -326,7 +326,7 @@ This is the core flow: user sends a message and receives an AI response.
 - `backend/lambda/src/router-agent-handler.ts` - Shared Lex fulfillment: tier resolution (`min(userTier, channelTier)`), intent classification, delivery selection, dispatch to the per-tier processor (ARN from SSM)
 - `backend/lambda/src/channel-flow-processor.ts` - Runs first on every message; `@all`/`@everyone` invokes the async processor directly (bypassing Lex)
 - `backend/lambda/src/assistant-async-processor.ts` - The single config-driven assistant processor (one instance deployed per profile; self-gates its capabilities on the profile env)
-- `backend/lambda/src/lib/intent-classifier.ts` - Fast-path keywords + a configurable LLM classifier (`CLASSIFIER_MODEL_ID`, default Haiku); Basic tier is keyword-only
+- `backend/lambda/src/lib/intent-classifier.ts` - Greeting/acknowledgment fast-path + a configurable LLM classifier (`CLASSIFIER_MODEL_ID`, default Haiku) used for every tier by default; a keyword-only classifier is opt-in per profile (`classifierMode: 'keyword'`)
 - `backend/lambda/src/lib/delivery-options.ts` - Intent → delivery option mapping
 - `backend/lambda/src/lib/model-resolver.ts` + `backend/lib/config/model-strategy.ts` - Intent → model routing (`INTENT_ROUTE_STRATEGY`: primary + fallback per intent, capped to the tier's allowed models)
 - `backend/lambda/src/lib/async-processor-core.ts` - the self-hosted Converse tool loop (terminal Bedrock call `invokeBedrock`), marker parsing, response delivery
@@ -358,8 +358,8 @@ A message is classified once, and that single classification drives **two indepe
   ┌─────────────────────────────────────────┐
   │ LLM classifier for unmatched messages   │
   │ (model set by CLASSIFIER_MODEL_ID;      │
-  │  default Haiku). Basic tier is keyword- │
-  │  only. Categories from the intent pack. │
+  │  default Haiku), used for every tier by │
+  │  default. Categories from the pack.     │
   └────────────┬────────────────────────────┘
                │
                ▼

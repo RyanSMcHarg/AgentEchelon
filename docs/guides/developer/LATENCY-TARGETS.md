@@ -1,16 +1,55 @@
-# Latency targets (industry-sourced)
+# Latency: metric definitions, targets, and the end-to-end gap
 
-The admin console's latency targets (`frontend/packages/admin/src/components/admin/metricTargets.ts` and `LatencyTab.latencyColor`) are set to published industry standards, not to a self-imposed ceiling. This doc records the standards and how they map onto AgentEchelon so the numbers are defensible and reviewable.
+The admin console's Latency tab reports several latency numbers, and its targets (`frontend/packages/admin/src/components/admin/metricTargets.ts` and `LatencyTab.latencyColor`) are set to published industry standards, not a self-imposed ceiling. This doc (a) defines each metric precisely - what it measures, where it is stamped, and why it matters - (b) records the targets and their basis, (c) states where the dashboard's framing misleads, and (d) specifies the missing user-to-final-answer metric.
 
 ## The metric that matters: time to first feedback (TTFF)
 
-AgentEchelon delivers a reply in two phases (see [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md) section 5): a placeholder ("One moment...") is sent within about a second, then the real answer updates that message in place. So the latency a user actually perceives is **TTFF**, not the total time to the finished answer. TTFF is the primary latency SLO; total time is a secondary throughput and cost signal.
+AgentEchelon delivers a reply in two phases (see [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md) section 5): a placeholder ("One moment...") is sent within about a second, then the real answer updates that message in place. There is **no token streaming**: between placeholder and final answer the user sees nothing new. So the latency a user actually perceives up front is **TTFF** (time to the placeholder), not the total time to the finished answer. TTFF is the primary latency SLO; total time is a secondary throughput and cost signal.
 
 This is why judging the console red on a 2-second total-latency target was wrong: an agentic turn runs a self-hosted tool loop (reason, call `load_company_context`, answer) with input and output guardrails, which is two or more Bedrock calls plus a retrieval. Completion in seconds is expected; the user is not waiting on it blind because the placeholder already landed.
 
+## Metric definitions (what each number means and why it matters)
+
+Source of truth: the processor stamps deltas into the Chime message Metadata field via `buildAnalyticsMetadata` (`async-processor-core.ts`); the archival Lambda (`kinesis-archival.ts`) writes them to `messages.*` and derives `exchanges.response_latency_ms` from message timestamps; `getLatencyMetrics` (`analytics-query.ts`) aggregates them for the tab. There are two clock domains: **server wall-clock** (`Date.now()` inside one Lambda - exact deltas, no skew: `latency_ms`, `total_ms`, `poll_ms`) and **Chime message timestamps** (one shared clock across messages: `response_latency_ms`).
+
+### TTFF - `response_latency_ms` (dashboard card: "TTFF")
+- **Definition:** time from the user's message to the assistant's **placeholder** appearing.
+- **Measures:** the full inbound path - Chime ingest, ChannelFlow, Lex, router classify, async invoke, placeholder post - **including cold start**. Stops at the placeholder, not the answer.
+- **Stamp:** derived at archival, `EXTRACT(EPOCH FROM (am.created_at - um.created_at)) * 1000` (`am` = placeholder message, `um` = user message). Single Chime clock, skew-free. `NULL` on DIRECT/unpaired rows.
+- **Why it matters:** with no streaming, this acknowledgment is the only "the system is alive" signal before the answer, so it is the **perceived-responsiveness** SLO (target <= 1s). A regression means the UI feels dead on send.
+- **What it does NOT tell you:** how long until a real answer. It is time-to-spinner, not time-to-content.
+
+### Total - `total_ms` (dashboard cards: "Avg Total", "P95 Total")
+- **Definition:** server-side wall-clock to produce and post the answer, inside one processor invocation.
+- **Measures:** placeholder resolution + history/context load + the Converse tool loop + the output guardrail + posting the reply. Starts at process-fn **entry**; ends right after the final `UpdateChannelMessage` returns.
+- **Stamp:** `totalTime = Date.now() - startTime`, stamped `totalMs` -> `messages.total_ms`.
+- **Why it matters:** the **cost/efficiency of the turn** - the number to watch for slow turns, RAG-heavy turns, and model regressions. The closest existing proxy for answer latency.
+- **What it does NOT tell you (the trap):** it is NOT the user's wall-clock wait. It EXCLUDES the inbound hop, the processor's own cold-start init (before handler entry), and browser delivery. So it **understates** perceived wait, and it is stamped server-side, not tied to when the message actually updated in Chime.
+
+### Bedrock - `latency_ms` (dashboard card: "Avg Bedrock")
+- **Definition:** duration of the self-hosted Converse tool loop.
+- **Measures:** ALL Converse iterations + in-loop **tool execution** (RAG, S3 company context) + the **output guardrail**. Excludes placeholder resolution, history load, and delivery.
+- **Stamp:** `bedrockTime = Date.now() - bedrockStart`, stamped `latencyMs` -> `messages.latency_ms`.
+- **Why it matters:** the **dominant component of Total** on most turns and the lever for model comparison - where the turn's time actually goes.
+- **What it does NOT tell you (the trap):** it is NOT pure inference. It wraps tool I/O and the guardrail, so a RAG-heavy turn inflates "Bedrock" without the model being slow. You cannot separate model time from tool time from this number alone (see gap G2).
+
+### Polling - `poll_ms` (dashboard card: "Avg Polling")
+- **Definition:** time spent at the start locating/confirming the placeholder message the router just created.
+- **Measures:** Chime polling with retries until the placeholder id resolves. A **sub-interval of Total**. `0` when the placeholder id is passed directly (e.g. /battle resume).
+- **Stamp:** `pollTime = Date.now() - startTime`, stamped `pollMs` -> `messages.poll_ms`.
+- **Why it matters:** a **handshake artifact, not compute**. Near-zero normally; a spike points at Chime message-propagation trouble, not a slow model.
+
+### E2E - `e2e_ms` (PROPOSED - not built; see "The missing end-to-end metric")
+- **Definition:** time from the user's message to the **final answer** replacing the placeholder. `e2e_ms = agent_final_at - user_message_at`.
+- **Why it matters:** this is **the number operators actually want** - the real answer wait, the one an SLA or a UX complaint is about. The only metric that spans the whole journey the user experiences.
+- **Status:** does not exist. There is no `agent_final_at` column; the completion `UPDATE` folds `total_ms` onto the placeholder row and stamps no final timestamp.
+
+### Off this surface: client web-vitals
+The frontend emits web-vitals (TTFB, FCP, LCP, INP, CLS) via `/events` -> `client_events` (Firehose -> S3), the only **browser-perceived** timing. It lands in a different store than the `messages` latency query and is not joined to it (gap G5). See [`SPEC-FRONTEND-OBSERVABILITY.md`](../../specs/ops/SPEC-FRONTEND-OBSERVABILITY.md).
+
 ## Where the time goes: the numbers explained by the message flow
 
-Each latency metric maps onto a hop in the message journey (see [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md)). This is what the numbers mean and why they land where they do.
+Each latency metric maps onto a hop in the message journey (see [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md)).
 
 | Phase (MESSAGE-FLOW) | What happens | Contributes to |
 |---|---|---|
@@ -19,9 +58,22 @@ Each latency metric maps onto a hop in the message journey (see [`MESSAGE-FLOW.m
 | Async processor tool loop (section 6.1) | Input guardrail, then the self-hosted loop: Bedrock call (reason), `load_company_context` retrieval, Bedrock call (answer), output guardrail | **avg / p95 total** and **avg Bedrock** |
 | Delivery (section 5) | `UpdateChannelMessage` swaps the placeholder for the answer | tail of total |
 
-**Why TTFF is small and total is seconds.** The fulfillment handler returns the placeholder before any answer-generation work, so TTFF is a fast path: a tier and intent resolve plus one lightweight classification. The answer, by contrast, runs an **agentic tool loop**: two or more Bedrock calls plus a retrieval plus two guardrail passes. That is inherently seconds, and Bedrock generation dominates it. So a 2s total target was never reachable for an answer that reasons and calls a tool; the honest target is the Nielsen 10s attention limit, held acceptable by the placeholder.
+**Why TTFF is small and total is seconds.** The fulfillment handler returns the placeholder before any answer-generation work, so TTFF is a fast path: a tier and intent resolve plus one lightweight classification. The answer runs an **agentic tool loop**: two or more Bedrock calls plus a retrieval plus two guardrail passes. That is inherently seconds, and Bedrock generation dominates it. So a 2s total target was never reachable for an answer that reasons and calls a tool; the honest target is the Nielsen 10s attention limit, held acceptable by the placeholder.
 
-**Why this is the right trade.** The delivery design (`MESSAGE-FLOW.md` section 5, `PLACEHOLDER_UPDATE`) deliberately trades total time for reliability and perceived speed: the user sees feedback in under a second and the answer fills in. Optimizing the total number at the expense of that pattern would make the product feel worse, not better, which is why TTFF is the SLO and total is a throughput and cost signal.
+## Reading the dashboard: what is accurate and what misleads
+
+The Latency tab is partly self-documenting; the inaccuracies are specific, not wholesale.
+
+**Accurate today:**
+- The **TTFF** card labels itself "time to placeholder" and its tooltip explains it is acknowledgment latency, distinct from total time (the completed answer).
+- **Polling** is presented as a secondary sub-interval.
+
+**Misleading today:**
+1. **"Total" reads as end-to-end and as including delivery.** The tab header calls Total "time to the completed answer and includes placeholder polling, Bedrock inference, and delivery." But `total_ms` is stamped server-side after the update returns: it excludes the inbound hop, cold start, and browser delivery. It reads as the user's wait but is server compute from processor entry, and is systematically **low**.
+2. **"Bedrock" reads as inference.** The header says "with Bedrock typically dominant"; the card is titled "Avg Bedrock." But `latency_ms` includes in-loop tool execution and the output guardrail, so it **mis-attributes tool/RAG time to the model**.
+3. **No end-to-end card exists.** The closest number an operator can point at for "how long did the user wait" is Total, the understated server-compute proxy above.
+
+**Corrective actions (small):** retitle/re-tooltip Total as server compute from processor entry to answer-posted (a lower bound on perceived wait, excludes inbound hop + cold start + delivery); retitle Bedrock as "model + tools" or split it (G2); and ship E2E, rendering E2E, TTFF, and Total as visibly distinct.
 
 ## Response-time standards
 
@@ -59,10 +111,40 @@ Rule: past 1s, show a progress indicator; past 10s, show percent-done. AgentEche
 
 Note: **tune from observed data, within the standard.** Once traffic flows, set the target near a p50 you are happy with and the warn near p90, but keep both inside the Nielsen 10s / 30s envelope. The standard is the ceiling of acceptability, not the goal.
 
-## Not yet implemented
+## Gaps and how to fill them
 
-- **TTFF capture.** The Latency tab now shows a **TTFF card** as the first, primary metric, wired to the `<= 1s` target. The pipeline does not yet record `ttff_ms` (the moment the placeholder is sent), so the card reads **"not captured yet"** until that field is emitted. Capturing it is the highest-value latency improvement: the fulfillment handler (or the client, measuring send to first bot message) should record the time from the user message to the placeholder and write it alongside the other latency fields. The card and its target are already wired and populate automatically once `ttff_ms` is present.
-- **Per-tier targets and metrics.** Latency is currently aggregated and targeted **globally**. Premium runs a larger model over more context, so its completion time is legitimately higher than basic; a single global target flatters basic and unfairly reds premium. Per-tier latency metrics and per-tier targets are the more honest model, and the data is already there (the `latency_metrics` query carries `agent_type` per row). Not yet implemented: the console aggregates across tiers, and `metricTargets.ts` holds one target per metric rather than one per tier. When added, each tier gets its own good/warn bands (a premium turn legitimately sits higher in the Nielsen 10s envelope than a basic turn).
+| # | Gap | Why it matters | How to fill |
+|---|-----|----------------|-------------|
+| **G1** | **No user->final-answer metric.** `agent_response_at = am.created_at` is the placeholder time, so `agent_response_at - user_message_at` is TTFF, not end-to-end. `messages` has only `created_at` (placeholder) + `archived_at` (Kinesis-late). | The single number operators want does not exist. | The design below - add `agent_final_at` + denormalized `e2e_ms`. |
+| **G2** | **"Bedrock" over-attributes to the model** - `latency_ms` wraps tool I/O + the output guardrail, not just inference. | A RAG-heavy turn makes the model look slow; you cannot tell model time from tool time. | The loop already brackets each iteration (`makeConverseStep`). Sum only Converse deltas -> `model_ms`; sum tool execution -> `tool_ms`; emit both. |
+| **G3** | **`total_ms` is read as end-to-end** but excludes the inbound hop + cold-start init + delivery. | Understates true wait; diverges from TTFF and E2E with no explanation. | Relabel (above); ship E2E. Optionally add an inbound-hop metric (G4). |
+| **G4** | **Inbound hop is unmeasured** (user_message_at -> processor entry). | The routing/queue/cold-start portion is invisible. | Stamp processor-entry wall-clock; `inbound_ms = processor_entry - user_message_at` (cross-clock, NTP skew). |
+| **G5** | **Server and client latency are not joined** - `messages.*_ms` vs `client_events` web-vitals live in separate stores. | No single view of server compute vs what the browser saw. | Correlate by `message_id`/`correlationId`; surface client TTFR beside server metrics. |
+| **G6** | **DIRECT fast-path excluded** (`AND m.total_ms > 0`) - greetings/acks never counted. | Averages skew toward slow LLM turns; not "all responses." | Report DIRECT separately (count + its TTFF-based latency) so the exclusion is explicit. |
+| **G7** | **Metadata size cap / drop** - analytics rides the Chime Metadata field (<=1024B; a field whitelist). CJK encodes ~9x. Truncation -> `total_ms` null -> row excluded. | Silent survivorship bias if drops are non-random. | Emit a drop/oversize counter; if real, move bulky analytics to a side-channel keyed by message id. |
+| **G8** | **Aurora-only + lossy projection** - no latency query in Athena mode; dropped archival events are not counted. | Coverage differs by deployment mode. | Document the mode difference; monitor archival drop rate. |
+| **G9** | **P95 noise at low volume** + cold start shows in TTFF but not `total_ms`. | Early numbers unstable; TTFF/Total legitimately diverge. | Show sample counts next to P95; annotate the divergence as cold-start, not error. |
+| **G10** | **Per-tier targets and metrics.** Latency is aggregated and targeted **globally**; premium runs a larger model over more context, so a single global target flatters basic and unfairly reds premium. | A basic turn and a premium turn are held to the same band though their budgets differ. | The `latency_metrics` query already carries `agent_type` per row; add per-tier good/warn bands in `metricTargets.ts` and aggregate per tier. |
+
+## The missing end-to-end metric (design - fills G1)
+
+`messages` has no final-answer timestamp, and the completion `UPDATE` (`kinesis-archival.ts`, folds `updated_content`/`total_ms` onto the placeholder row) stamps none. So E2E needs a new timestamp; it cannot be derived from existing columns.
+
+Let `e2e_ms = agent_final_at - user_message_at`, where `agent_final_at` = the instant the final answer replaced the placeholder.
+
+- **Option A (skew-free, recommended target):** source `agent_final_at` from the Chime `UpdateChannelMessage.LastUpdatedTimestamp`. Both endpoints are Chime timestamps, so single clock, no skew.
+- **Option B (pragmatic first ship):** the processor emits `completedAtMs: Date.now()` on the existing completion analytics record. Simpler through the current Kinesis path; carries the same NTP-scale skew TTFF already tolerates.
+
+**Changes.** (1) Migration (idempotent, schema-init): `messages.agent_final_at TIMESTAMPTZ`; `exchanges.e2e_ms INTEGER`. (2) Emit (Option B): `buildAnalyticsMetadata` adds `completedAtMs` after the final `UpdateChannelMessage` returns (add to the field whitelist). (3) Archival: completion `UPDATE` sets `agent_final_at = COALESCE($n, agent_final_at)`; exchange INSERT computes `e2e_ms` when present, else `NULL`. (4) Query (`getLatencyMetrics`), guarded on non-null, keeping `AND m.total_ms > 0` for consistency:
+```sql
+ROUND(AVG(m.e2e_ms))                                          AS avg_e2e_ms,
+ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.e2e_ms)) AS p95_e2e_ms
+```
+Add both to the `columns` contract. (5) Frontend: extend the Latency tab + shared analytics types with `avgE2eMs`/`p95E2eMs`; render E2E, TTFF, and Total as visibly distinct, and apply the Total/Bedrock relabels above. (6) Docs: add `agent_final_at`/`e2e_ms` (and `model_ms`/`tool_ms` if G2 is taken) to `SPEC-MESSAGE-METADATA-CODEBOOK.md`.
+
+**Accuracy and rollout.** Option A is skew-free; Option B carries ~single-digit-ms skew (negligible vs multi-second answers, identical in kind to today's TTFF). E2E **includes** the inbound hop + cold start (both fall between `user_message_at` and `agent_final_at`) - exactly what `total_ms` misses - and excludes only final browser delivery (sub-ms on an established socket). New nullable columns; absent-`completedAtMs` rows are `NULL`, so they are skipped by AVG/PERCENTILE, never wrong-valued. No backfill. Aurora-only. One-pass deploy.
+
+**Testing.** Unit: archival computes `e2e_ms` from a synthetic completion event; `NULL` when `completedAtMs` absent. E2E: send a slow (tool-using) turn; assert `e2e_ms > ttff_ms > 0` in `/analytics/latency`, proving the brackets are distinct on real traffic.
 
 ## References
 
@@ -75,3 +157,5 @@ Note: **tune from observed data, within the standard.** Once traffic flows, set 
 
 - [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md) section 5 - the placeholder/update delivery pattern that makes TTFF the perceived metric.
 - [`SPEC-ADMIN-CONSOLE.md`](../../specs/interface/admin/SPEC-ADMIN-CONSOLE.md) - the Latency tab and the metric-target registry.
+- [`SPEC-FRONTEND-OBSERVABILITY.md`](../../specs/ops/SPEC-FRONTEND-OBSERVABILITY.md) - client-side web-vitals (the browser-perceived timing, gap G5).
+- [`SPEC-MESSAGE-METADATA-CODEBOOK.md`](../../specs/communication/SPEC-MESSAGE-METADATA-CODEBOOK.md) - the Metadata field the latency deltas ride.

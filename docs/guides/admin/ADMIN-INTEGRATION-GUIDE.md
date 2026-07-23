@@ -119,7 +119,7 @@ When your app owns admin auth, some AE features become redundant - they manage *
 |---------|-----------|------------|
 | Analytics, evaluations, latency, experiments | AE | **Stays in AE** (consume via API) |
 | Conversation moderation (redact/delete/members) | AE | **Stays in AE** (runs as app-instance-admin) |
-| `scripts/create-admin-user.sh` | Bootstraps first admin | **Skip** - your app provisions admins |
+| `npm run provision-admin` (`backend/scripts/provision-admin.mjs`) | Bootstraps first admin | **Skip** - your app provisions admins |
 | "Manage Users" tab / user-management API (approve, tier, enable) | AE | **Disable / ignore** - your app owns user lifecycle |
 
 If you've also moved the **user** plane to your IdP (per the IdP guide) and removed AE's user pool, the user-management API has no pool to act on - disable those routes or leave them unused.

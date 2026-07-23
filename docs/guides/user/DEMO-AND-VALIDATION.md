@@ -10,13 +10,33 @@ A runbook for standing up the **Stratum Technologies** demo and running the end-
 
 ## What gets validated
 
-Real user-to-assistant messages only - nothing is faked. Each turn is measured (TTFF, total latency, tokens, cost) and recorded to the archive/analytics, so the admin dashboard verification runs against genuine data.
+Real user-to-assistant messages only - nothing is faked. Each turn is measured (TTFF, total latency, tokens, cost) and recorded to the archive/analytics, so the admin dashboard verification runs against genuine data. `npm run validate` runs ALL of the phases below in order (the admin phase is last on purpose); several are optional and self-skip when their deployed dependency is absent.
 
-1. **Per-tier flows** - Basic / Standard / Premium each answer real questions; tiered context and the `load_company_context` IAM boundary behave per tier.
+1. **Per-tier flows** - Basic / Standard / Premium each answer real questions; tiered context and the `load_company_context` IAM boundary behave per tier. Note these are general-heavy by design (factual and "explain X" questions, which classify as `general`).
 2. **Identity** - the credential exchange vends the caller's own chat and admin-plane identities.
 3. **Mentions and drift** - targeting/sticky behavior and drift detection.
-4. **`/battle`** - a real head-to-head duel (needs a battle-enabled deploy).
-5. **Admin dashboard** - runs LAST, so every tab is verified against the real data produced above.
+4. **Data-producing phases (what fills the admin console with variety)** - these drive the DOMAIN intents and multi-step work the general questions above do NOT, so the admin console shows real breadth instead of an all-`general` bar:
+   - **tasks** - report generation, data extraction, and troubleshooting driven across ALL THREE tiers to real task rows + downloaded deliverables (Tasks / Flows tabs).
+   - **experiments** - creates an A/B experiment and runs a turn (Experiments tab / `experiment_results`).
+   - **feedback** - a thumbs rating persists (feedback data).
+   - **welcome** - a new conversation opens with the seeded tier-aware orientation.
+   - **image-gen** - real external image providers return persistable PNGs (needs keys).
+   - **evaluate** - scores the exchanges/flows just produced so Effectiveness verifies against real relevance/completion (Aurora only).
+5. **`/battle`** - a real head-to-head duel (needs a battle-enabled deploy).
+6. **Admin dashboard** - runs LAST, so every tab is verified against the real data produced above.
+
+> **Why an earlier run may have looked all-`general`.** If you run the Playwright suite directly (or only the per-tier flows), you exercise the general-heavy conversations and NONE of the data-producing phases, so the admin intent breakdown is all `general` - an accurate reflection of that traffic, not a broken classifier. Run the full `npm run validate` to get domain intents (`report_generation`, `data_extraction`, `guided_troubleshooting`) and multi-step task data across every tier.
+
+### Prerequisites for the rich data (so nothing self-skips)
+
+The data-producing phases reach the LIVE app the same way the frontend does, via URLs emitted as CDK outputs. `validate.mjs` auto-resolves them and prints a **DATA READINESS** block at the start plus a **PHASE SUMMARY** at the end; a phase whose dependency is `MISS` self-skips (exits 0) and leaves that admin tab empty. To get a full console:
+
+- Generate `frontend/.env` from CDK outputs (`gen-frontend-env`) so `VITE_ANALYTICS_API_URL` / `VITE_EXPERIMENTS_API_URL` / `VITE_USER_FEEDBACK_API_URL` resolve (tasks / experiments / feedback).
+- Deploy the **admin** frontend so `E2E_ADMIN_BASE_URL` resolves (battle, experiments, admin arm on that origin).
+- **Aurora mode** for the evaluate phase and the Tasks/Flows reads (`EVAL_LAMBDA_NAME`, analytics API).
+- A **battle-enabled** deploy for the battle and image-gen phases (else pass `--skip-battle`).
+
+Read the DATA READINESS lines before assuming a full run - `MISS` there tells you exactly which admin data will be absent and why.
 
 ## Prerequisites
 
@@ -36,13 +56,16 @@ AE_BLOG_VAULT_PATH="/path/to/your/blog-vault" npm run sync-knowledge   # blog pa
 # 2. seed the demo: 3 tier users + per-tier context (incl. the all-tier project knowledge)
 AWS_PROFILE=<your-profile> npx ts-node scripts/seed-demo.ts
 
-# 3. run the full post-deploy validation (seed -> user e2e -> battle -> admin e2e)
+# 3. run the FULL post-deploy validation (all phases, incl. the data-producing ones)
 AWS_PROFILE=<your-profile> npm run validate
 #    --skip-battle       skip the /battle phase (if not battle-enabled)
-#    --only=admin        run one phase (knowledge | seed | user | battle | admin)
+#    --only=tasks        run one phase. Valid ids:
+#                        knowledge seed user battle image-gen feedback experiments tasks welcome evaluate admin
 ```
 
-`npm run validate` is the orchestrator (`backend/scripts/validate.mjs`). It runs the phases in order and fails loudly on the first failure; the admin phase is last on purpose so the dashboard has the real conversation data to verify. The `/battle` phase is optional (skipped-with-a-warning if the deploy is not battle-enabled).
+`npm run validate` is the orchestrator (`backend/scripts/validate.mjs`). It runs every phase in order (`knowledge -> seed -> user -> battle -> image-gen -> feedback -> experiments -> tasks -> welcome -> evaluate -> admin`) and fails loudly on the first REQUIRED-phase failure; the admin phase is last on purpose so the dashboard has the real data to verify. The data-producing phases (battle, image-gen, feedback, experiments, tasks, welcome, evaluate) are optional: each self-skips (or continues-with-a-warning) when its deployed dependency is absent. Watch the **DATA READINESS** preflight and the end-of-run **PHASE SUMMARY** to confirm the rich data actually landed - a phase can report `passed` yet have self-skipped.
+
+**Confirm the admin console is populated.** After a full run, open the admin dashboard: the intent breakdown (Overview / Models) should show `report_generation`, `data_extraction`, and `guided_troubleshooting` alongside `general`; Tasks / Flows should list the report and extraction runs; Experiments should show the A/B run. If any is empty, re-check the DATA READINESS block for a `MISS`.
 
 ## Modifying it for your own use (POC)
 

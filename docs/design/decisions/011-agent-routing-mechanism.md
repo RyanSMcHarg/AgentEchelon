@@ -140,7 +140,7 @@ A supervisor agent routes by topic to specialist collaborator agents, each with 
 user ─► Amazon Chime SDK ─► channel-flow ─► Lex (FallbackIntent)
                                       │
   router-agent-handler  ── ORCHESTRATION ROUTER ──────────────┐
-    classifyIntent (Haiku: std/prem) | keyword (basic)        │
+    classifyIntent (Haiku by default, every tier)             │
     intent ┬─► delivery option                                │ bespoke
            ├─► task create / resume (taskType)                │ AE logic
            ├─► context retrieval                              │ (the
@@ -206,7 +206,7 @@ user ─► Amazon Chime SDK ─► channel-flow ─► Lex (FallbackIntent)
 
 Model is just one consumer; the per-intent classification is the orchestration router (not "just" a model picker).
 
-**Why a per-turn classifier instead of letting the main model self-route?** Its output drives the task state machine, delivery option, and the (multi-provider) model map - folding that into the primary model would couple those decisions to one model's output format and forfeit per-intent provider choice. The hop is cheap and bounded - Haiku, sub-second, cacheable - and the basic tier skips it entirely (keyword-only, no model call).
+**Why a per-turn classifier instead of letting the main model self-route?** Its output drives the task state machine, delivery option, and the (multi-provider) model map - folding that into the primary model would couple those decisions to one model's output format and forfeit per-intent provider choice. The hop is cheap and bounded - Haiku, sub-second, cacheable - and runs for every classification by default (basic included); a profile can opt into a keyword-only classifier with no model call by setting `classifierMode: 'keyword'`.
 
 ### InvokeAgent measurement (basic agent)
 
