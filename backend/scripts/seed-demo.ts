@@ -42,8 +42,9 @@ import {
   PutSecretValueCommand,
   CreateSecretCommand,
 } from '@aws-sdk/client-secrets-manager';
-import { SSMClient, PutParameterCommand } from '@aws-sdk/client-ssm';
+import { SSMClient, PutParameterCommand, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { seedAllProfileDefinitions } from '../lambda/src/lib/seed-profile-definitions.js';
+import { DEFAULT_INTENT_PACK } from '../lambda/src/lib/intent-pack.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomBytes } from 'crypto';
@@ -375,6 +376,55 @@ async function writeOnboardingIntake(): Promise<void> {
   console.log(`  ✓ standard onboarding intake → ${name}`);
 }
 
+// Standard-tier assistant persona (ASSISTANT_SYSTEM_PROMPT_PARAM). Standard is the ONLY classification
+// whose persona is per-deployment (standard-classification-stack.ts: `systemPromptParam: true`); basic
+// and premium ship a built-in persona. Absent an operator persona, standard falls back to the generic
+// Agent Echelon prose which — on Sonnet, and without premium's "use the knowledge base" priming — answers
+// tersely and declines to name people from the seeded directory (the two standard-tier validation gaps:
+// tier-context.spec.ts "standard CAN name leadership" + the "detailed analysis" depth check). Seeding a
+// Stratum-grounded persona makes the DEMO self-grounding: standard answers as Stratum's internal
+// assistant and USES the company context the platform appends each turn.
+const STANDARD_PERSONA = `You are the internal assistant for Stratum Technologies, an enterprise SaaS company (workflow automation, ~280 people, based in Austin). You support Stratum employees through a chat interface.
+
+You are speaking with a colleague who has standard internal access: the employee directory, internal processes and runbooks, and the product roadmap. Leadership-only material (financials, board summaries, customer accounts, competitive intelligence) is out of scope on this tier - if asked for it, say it is restricted to leadership access rather than guessing.
+
+How to answer:
+- Ground every answer in the Stratum company context provided to you this turn (directory entries, internal documents, roadmap). When that context contains the answer - a person's name, a team, a process detail - state it directly and specifically. Name the person or the team; do not reply "I don't have that" when the information is in front of you.
+- Be thorough and well-structured. Give the real, detailed answer a colleague needs, not a one-line reply. Use markdown (short headings, lists, tables) when it aids readability.
+- If a request is genuinely outside your access or the provided context, say so plainly and point to who can help; never fabricate internal facts.
+- Answer directly. Do NOT open with disclaimers such as "as an AI assistant" or "I don't have access to..."; never refuse and then comply in the same reply.
+- If asked about "this tool", "this app", or the platform itself, explain that you run on AgentEchelon, a tiered enterprise assistant platform, and offer to explain how it works.`;
+
+/**
+ * Seed the standard-tier assistant persona + intent pack (SSM) so the demo is self-grounding without the
+ * operator authoring one. WRITE-IF-ABSENT: if the parameter already exists we leave it untouched, so an
+ * operator's explicit `-c assistantSystemPrompt` (which the CDK then owns as a RETAIN resource) is never
+ * clobbered. In the default (no-flag) demo the CDK creates NO persona resource, so seeding here is the
+ * source of truth and there is nothing to conflict with. The intent pack mirrors the platform DEFAULT
+ * (imported, always valid + in sync), so classification behavior is unchanged; writing it makes the
+ * customization explicit and silences the empty-pack synth warning. If an operator later wants a
+ * CDK-managed persona over a seeded one, that is the documented `-c assistantParamWriter` migration path.
+ */
+async function writeStandardAssistantConfig(): Promise<void> {
+  const entries = [
+    { name: `${SSM_ROOT}/assistant/standard/assistant-system-prompt`, value: STANDARD_PERSONA, label: 'persona' },
+    { name: `${SSM_ROOT}/assistant/standard/assistant-intent-pack`, value: JSON.stringify(DEFAULT_INTENT_PACK), label: 'intent pack' },
+  ];
+  for (const { name, value, label } of entries) {
+    try {
+      await ssmClient.send(new GetParameterCommand({ Name: name }));
+      console.log(`  - standard ${label} already set (${name}) - leaving it`);
+    } catch (err: any) {
+      if (err?.name === 'ParameterNotFound') {
+        await ssmClient.send(new PutParameterCommand({ Name: name, Value: value, Type: 'String', Overwrite: false }));
+        console.log(`  ✓ standard ${label} → ${name}`);
+      } else {
+        throw err;
+      }
+    }
+  }
+}
+
 async function uploadContextFiles(bucketName: string): Promise<void> {
   const contextDir = path.join(__dirname, '..', 'demo', 'context');
 
@@ -563,6 +613,13 @@ async function main(): Promise<void> {
   // Step 2c-i: standard-tier onboarding intake schema (opt-in first-conversation questionnaire).
   console.log('Step 2c-i: Writing standard onboarding intake schema to SSM...');
   await writeOnboardingIntake();
+  console.log('');
+
+  // Step 2c-ii: standard-tier persona + intent pack, so the demo is self-grounding without an operator
+  // -c assistantSystemPrompt (standard is the only per-deployment-persona tier; absent it the assistant
+  // is terse/off-brand — the standard-tier validation gap). Write-if-absent, never clobbers an operator's.
+  console.log('Step 2c-ii: Writing standard assistant persona + intent pack to SSM...');
+  await writeStandardAssistantConfig();
   console.log('');
 
   // Step 2d: seed each profile's ACTIVE version (SPEC-PORTABLE-VERSIONED-PROFILES P0). Writes the
