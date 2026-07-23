@@ -64,7 +64,7 @@ The two biggest wins are `bedrockModel` (a ~45 - 60 char id becomes one or two c
 
 ### What stays literal
 
-Open-valued fields are not coded: `inputTokens` / `outputTokens` / `latencyMs` / `totalMs` / `pollMs` (unbounded numbers), `configId` / `personaVersion` / `intentPackVersion` / `systemPromptHash` (content-addressed), `targetedSender` (an ARN), `attachment.fileKey` (an S3 key). Most of these are analytics-only and are handled by Technique B.
+Open-valued fields are not coded: `inputTokens` / `outputTokens` / `latencyMs` / `totalMs` / `pollMs` / `modelMs` / `toolMs` / `processorEntryMs` (unbounded numbers - the last three are the latency split + server-clock processor-entry stamp for the E2E/model/tool/inbound metrics, see `LATENCY-TARGETS.md`), `configId` / `personaVersion` / `intentPackVersion` / `systemPromptHash` (content-addressed), `targetedSender` (an ARN), `attachment.fileKey` (an S3 key). Most of these are analytics-only and are handled by Technique B.
 
 `experimentId` is a borderline case. It is technically codeable - experiments are a finite, per-deployment domain (rows in the experiments table), so it could be an append-ordered codebook field exactly like `intent`. This spec keeps it **literal inline** anyway: it is the join key the frontend reads synchronously, it is only present on the small fraction of turns served by an experiment, and a UUID is ~38 encoded characters - cheap enough that coding it trades real cross-version stability (a stable UUID survives any `cbv` change) for a marginal byte saving. A deployment running many concurrent experiments on CJK-heavy traffic could revisit and code it; the codebook mechanism already supports it.
 

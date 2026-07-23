@@ -31,7 +31,7 @@ Source of truth: the processor stamps deltas into the Chime message Metadata fie
 - **Measures:** ALL Converse iterations + in-loop **tool execution** (RAG, S3 company context) + the **output guardrail**. Excludes placeholder resolution, history load, and delivery.
 - **Stamp:** `bedrockTime = Date.now() - bedrockStart`, stamped `latencyMs` -> `messages.latency_ms`.
 - **Why it matters:** the **dominant component of Total** on most turns and the lever for model comparison - where the turn's time actually goes.
-- **What it does NOT tell you (the trap):** it is NOT pure inference. It wraps tool I/O and the guardrail, so a RAG-heavy turn inflates "Bedrock" without the model being slow. You cannot separate model time from tool time from this number alone (see gap G2).
+- **Now split:** `latency_ms` alone conflated model and tool time (a RAG-heavy turn inflated "Bedrock" without the model being slow). The dashboard now shows it split into **`model_ms`** (Avg Model) and **`tool_ms`** (Avg Tool) - see below. `latency_ms` remains the combined loop time.
 
 ### Polling - `poll_ms` (dashboard card: "Avg Polling")
 - **Definition:** time spent at the start locating/confirming the placeholder message the router just created.
@@ -39,10 +39,23 @@ Source of truth: the processor stamps deltas into the Chime message Metadata fie
 - **Stamp:** `pollTime = Date.now() - startTime`, stamped `pollMs` -> `messages.poll_ms`.
 - **Why it matters:** a **handshake artifact, not compute**. Near-zero normally; a spike points at Chime message-propagation trouble, not a slow model.
 
-### E2E - `e2e_ms` (PROPOSED - not built; see "The missing end-to-end metric")
+### Model / Tool - `model_ms` / `tool_ms` (dashboard cards: "Avg Model", "Avg Tool")
+- **Definition:** the Bedrock tool-loop time split into model inference vs in-loop tool execution.
+- **Measures:** `model_ms` = the sum of the Converse (Bedrock) call durations across the loop; `tool_ms` = the time executing in-loop tools (RAG / S3 company context). `model_ms + tool_ms` is a **lower bound** on `latency_ms` - the remainder is the input/output guardrails plus loop setup/glue not attributed to either - and it reconciles only **within the successful attempt** (on a retry/fallback only the final attempt's timings are reported, the same property `latency_ms` already has).
+- **Stamp:** accumulated in `invokeBedrock` (model = each `iterStart -> iterEnd`; tool = the tool-execution block), emitted out-of-band, folded onto `messages.model_ms` / `messages.tool_ms`.
+- **Why it matters:** separates model time from tool time - a RAG-heavy turn shows in Tool, not as a slow model.
+
+### E2E - `e2e_ms` (dashboard card: "E2E")
 - **Definition:** time from the user's message to the **final answer** replacing the placeholder. `e2e_ms = agent_final_at - user_message_at`.
-- **Why it matters:** this is **the number operators actually want** - the real answer wait, the one an SLA or a UX complaint is about. The only metric that spans the whole journey the user experiences.
-- **Status:** does not exist. There is no `agent_final_at` column; the completion `UPDATE` folds `total_ms` onto the placeholder row and stamps no final timestamp.
+- **Measures:** the whole journey the user experiences - inbound hop + cold start + the full turn - up to the final answer. Excludes only browser delivery (sub-ms on an established socket).
+- **Stamp:** `agent_final_at` is derived at archival from the Chime UPDATE event's `LastUpdatedTimestamp` (same clock as the user message, so **skew-free**). Two guards keep it on the final-answer update: the `total_ms`-present gate excludes PRE-completion updates (the battle round-1 waiting-state update carries no `total_ms`), and COALESCE freezes the first completion so a LATER edit cannot move it (a moderation content-edit re-reads the same record and passes the gate, so COALESCE is what protects it). `e2e_ms` is computed on the exchange.
+- **Why it matters:** **the number operators actually want** - the real answer wait an SLA or a UX complaint is about. The only metric that spans the whole user journey.
+
+### Inbound - `inbound_ms` (dashboard card: "Inbound")
+- **Definition:** user message -> async processor entry (routing / queue / cold start). `inbound_ms = processor_entry - user_message_at`.
+- **Measures:** the front-of-turn hop that `total_ms` omits.
+- **Stamp:** the processor emits its entry `Date.now()` out-of-band; archival computes the delta on the exchange, clamped `>= 0`.
+- **Why it matters:** surfaces the routing / cold-start portion that was previously invisible. **The one metric that is not skew-free** - a server-clock entry vs a Chime start, so it carries NTP skew and is approximate by design.
 
 ### Off this surface: client web-vitals
 The frontend emits web-vitals (TTFB, FCP, LCP, INP, CLS) via `/events` -> `client_events` (Firehose -> S3), the only **browser-perceived** timing. It lands in a different store than the `messages` latency query and is not joined to it (gap G5). See [`SPEC-FRONTEND-OBSERVABILITY.md`](../../specs/ops/SPEC-FRONTEND-OBSERVABILITY.md).
@@ -60,20 +73,18 @@ Each latency metric maps onto a hop in the message journey (see [`MESSAGE-FLOW.m
 
 **Why TTFF is small and total is seconds.** The fulfillment handler returns the placeholder before any answer-generation work, so TTFF is a fast path: a tier and intent resolve plus one lightweight classification. The answer runs an **agentic tool loop**: two or more Bedrock calls plus a retrieval plus two guardrail passes. That is inherently seconds, and Bedrock generation dominates it. So a 2s total target was never reachable for an answer that reasons and calls a tool; the honest target is the Nielsen 10s attention limit, held acceptable by the placeholder.
 
-## Reading the dashboard: what is accurate and what misleads
+## Reading the dashboard
 
-The Latency tab is partly self-documenting; the inaccuracies are specific, not wholesale.
+The Latency tab renders the full set as distinct cards, each with a tooltip stating exactly what it brackets, so no card is left to be misread:
 
-**Accurate today:**
-- The **TTFF** card labels itself "time to placeholder" and its tooltip explains it is acknowledgment latency, distinct from total time (the completed answer).
-- **Polling** is presented as a secondary sub-interval.
+- **TTFF** - "time to placeholder" (acknowledgment latency), not the answer.
+- **E2E** - the full user wait to the final answer (the real perceived latency); includes the inbound hop and cold start that Total omits.
+- **Avg Total** - server compute only (processor entry -> answer posted), labeled as a lower bound on the wait, NOT the user's wall-clock time.
+- **Avg Model** / **Avg Tool** - the former single "Bedrock" number split into model inference vs in-loop tool execution, so a RAG-heavy turn no longer reads as a slow model.
+- **Inbound** - the front-of-turn routing / cold-start hop (approximate, cross-clock).
+- **Avg Polling**, **P95 Total** - the placeholder handshake and the tail.
 
-**Misleading today:**
-1. **"Total" reads as end-to-end and as including delivery.** The tab header calls Total "time to the completed answer and includes placeholder polling, Bedrock inference, and delivery." But `total_ms` is stamped server-side after the update returns: it excludes the inbound hop, cold start, and browser delivery. It reads as the user's wait but is server compute from processor entry, and is systematically **low**.
-2. **"Bedrock" reads as inference.** The header says "with Bedrock typically dominant"; the card is titled "Avg Bedrock." But `latency_ms` includes in-loop tool execution and the output guardrail, so it **mis-attributes tool/RAG time to the model**.
-3. **No end-to-end card exists.** The closest number an operator can point at for "how long did the user wait" is Total, the understated server-compute proxy above.
-
-**Corrective actions (small):** retitle/re-tooltip Total as server compute from processor entry to answer-posted (a lower bound on perceived wait, excludes inbound hop + cold start + delivery); retitle Bedrock as "model + tools" or split it (G2); and ship E2E, rendering E2E, TTFF, and Total as visibly distinct.
+The header prose and the distribution rail describe the same framing, so an operator is not left to infer that Total is server-only or that Bedrock bundled tool time.
 
 ## Response-time standards
 
@@ -104,47 +115,63 @@ Rule: past 1s, show a progress indicator; past 10s, show percent-done. AgentEche
 | Console metric | Good | Warn | Basis |
 |---|---|---|---|
 | `ttff_ms` (time to first feedback) | <= 1s | <= 2s | Nielsen 1s focus limit. The primary UX SLO. |
-| `avg_total_ms` (avg time to complete) | <= 10s | <= 30s | Nielsen 10s attention limit / 30s abandon. |
-| `p95_total_ms` (tail time to complete) | <= 15s | <= 30s | Tail kept under the 30s abandon threshold. |
-| `avg_bedrock_ms` (model time) | <= 6s | <= 12s | Dominant share of the completion budget (Bedrock processing dominates a turn). |
+| `avg_e2e_ms` (user -> final answer) | <= 10s | <= 30s | Nielsen 10s attention limit / 30s abandon. The true perceived wait (includes inbound + cold start). |
+| `avg_total_ms` (server compute) | <= 10s | <= 30s | Nielsen 10s attention limit / 30s abandon. Server compute only; a lower bound on the wait. |
+| `p95_total_ms` (tail) | <= 15s | <= 30s | Tail kept under the 30s abandon threshold. |
+| `avg_bedrock_ms` (Avg Model - inference) | <= 6s | <= 12s | Dominant share of the completion budget. Now shown split as Model + Tool. |
 | `LatencyTab.latencyColor` (table cells) | <= 10s | <= 30s | Same Nielsen time-to-complete bands. |
 
 Note: **tune from observed data, within the standard.** Once traffic flows, set the target near a p50 you are happy with and the warn near p90, but keep both inside the Nielsen 10s / 30s envelope. The standard is the ceiling of acceptability, not the goal.
 
-## Gaps and how to fill them
+## Remaining gaps
+
+The user->final-answer metric (former G1), the model/tool split (G2), the Total relabel (G3), the inbound hop (G4), and the metadata-cap concern (G7 - latency rides the out-of-band store, not the capped field) are BUILT; see the metric definitions and "How the full set is captured." What remains:
 
 | # | Gap | Why it matters | How to fill |
 |---|-----|----------------|-------------|
-| **G1** | **No user->final-answer metric.** `agent_response_at = am.created_at` is the placeholder time, so `agent_response_at - user_message_at` is TTFF, not end-to-end. `messages` has only `created_at` (placeholder) + `archived_at` (Kinesis-late). | The single number operators want does not exist. | The design below - add `agent_final_at` + denormalized `e2e_ms`. |
-| **G2** | **"Bedrock" over-attributes to the model** - `latency_ms` wraps tool I/O + the output guardrail, not just inference. | A RAG-heavy turn makes the model look slow; you cannot tell model time from tool time. | The loop already brackets each iteration (`makeConverseStep`). Sum only Converse deltas -> `model_ms`; sum tool execution -> `tool_ms`; emit both. |
-| **G3** | **`total_ms` is read as end-to-end** but excludes the inbound hop + cold-start init + delivery. | Understates true wait; diverges from TTFF and E2E with no explanation. | Relabel (above); ship E2E. Optionally add an inbound-hop metric (G4). |
-| **G4** | **Inbound hop is unmeasured** (user_message_at -> processor entry). | The routing/queue/cold-start portion is invisible. | Stamp processor-entry wall-clock; `inbound_ms = processor_entry - user_message_at` (cross-clock, NTP skew). |
-| **G5** | **Server and client latency are not joined** - `messages.*_ms` vs `client_events` web-vitals live in separate stores. | No single view of server compute vs what the browser saw. | Correlate by `message_id`/`correlationId`; surface client TTFR beside server metrics. |
+| **G5** | **Server and client latency are not joined** - `messages.*_ms` vs `client_events` web-vitals live in separate stores. | No single view of server compute vs what the browser saw. | Correlate by `message_id` / `correlationId`; surface client TTFR beside server metrics. |
 | **G6** | **DIRECT fast-path excluded** (`AND m.total_ms > 0`) - greetings/acks never counted. | Averages skew toward slow LLM turns; not "all responses." | Report DIRECT separately (count + its TTFF-based latency) so the exclusion is explicit. |
-| **G7** | **Metadata size cap / drop** - analytics rides the Chime Metadata field (<=1024B; a field whitelist). CJK encodes ~9x. Truncation -> `total_ms` null -> row excluded. | Silent survivorship bias if drops are non-random. | Emit a drop/oversize counter; if real, move bulky analytics to a side-channel keyed by message id. |
-| **G8** | **Aurora-only + lossy projection** - no latency query in Athena mode; dropped archival events are not counted. | Coverage differs by deployment mode. | Document the mode difference; monitor archival drop rate. |
-| **G9** | **P95 noise at low volume** + cold start shows in TTFF but not `total_ms`. | Early numbers unstable; TTFF/Total legitimately diverge. | Show sample counts next to P95; annotate the divergence as cold-start, not error. |
-| **G10** | **Per-tier targets and metrics.** Latency is aggregated and targeted **globally**; premium runs a larger model over more context, so a single global target flatters basic and unfairly reds premium. | A basic turn and a premium turn are held to the same band though their budgets differ. | The `latency_metrics` query already carries `agent_type` per row; add per-tier good/warn bands in `metricTargets.ts` and aggregate per tier. |
+| **G8** | **Aurora-only** - no latency query in Athena mode; dropped archival events are not counted. | Coverage differs by deployment mode. | Document the mode difference; monitor archival drop rate. |
+| **G9** | **P95 noise at low volume**; cold start shows in TTFF but not `total_ms`. | Early numbers unstable; TTFF/Total legitimately diverge. | Show sample counts next to P95; annotate the divergence as cold-start, not error. |
+| **G10** | **Per-tier targets and metrics** - latency is targeted globally, so a premium turn (larger model, more context) is held to the same band as basic. | A basic and a premium turn have different budgets. | The `latency_metrics` query already carries `agent_type`; add per-tier bands in `metricTargets.ts` and aggregate per tier. |
 
-## The missing end-to-end metric (design - fills G1)
+## How the full set is captured (as built)
 
-`messages` has no final-answer timestamp, and the completion `UPDATE` (`kinesis-archival.ts`, folds `updated_content`/`total_ms` onto the placeholder row) stamps none. So E2E needs a new timestamp; it cannot be derived from existing columns.
+The complete set is captured, so the console is stable and no deployment migrates late. Two properties keep it contained:
 
-Let `e2e_ms = agent_final_at - user_message_at`, where `agent_final_at` = the instant the final answer replaced the placeholder.
+- **Full schema up front.** All columns are in the base schema (`lambda/src/analytics-aurora/schema/013-latency.sql`), applied in order on a fresh Aurora Create: `messages.agent_final_at / model_ms / tool_ms` and `exchanges.e2e_ms / inbound_ms`, all nullable. Every deployment gets the whole set on stand-up; there is no follow-up migration. (An already-bootstrapped cluster applies it out-of-band or is re-stood-up - the same schema-init Update caveat as migrations 010-012.)
+- **Out-of-band, off the response path.** Latency telemetry rides the out-of-band DynamoDB analytics store (`message-analytics.ts`; `async-processor-core.ts` writes it, `kinesis-archival.ts` joins it onto Aurora rows), NOT the size-capped Chime messaging Metadata. Added fields cost nothing against the 1024B budget and add no user-perceived latency (measure on-path with `Date.now()`, emit off-path).
 
-- **Option A (skew-free, recommended target):** source `agent_final_at` from the Chime `UpdateChannelMessage.LastUpdatedTimestamp`. Both endpoints are Chime timestamps, so single clock, no skew.
-- **Option B (pragmatic first ship):** the processor emits `completedAtMs: Date.now()` on the existing completion analytics record. Simpler through the current Kinesis path; carries the same NTP-scale skew TTFF already tolerates.
+### How each is derived
 
-**Changes.** (1) Migration (idempotent, schema-init): `messages.agent_final_at TIMESTAMPTZ`; `exchanges.e2e_ms INTEGER`. (2) Emit (Option B): `buildAnalyticsMetadata` adds `completedAtMs` after the final `UpdateChannelMessage` returns (add to the field whitelist). (3) Archival: completion `UPDATE` sets `agent_final_at = COALESCE($n, agent_final_at)`; exchange INSERT computes `e2e_ms` when present, else `NULL`. (4) Query (`getLatencyMetrics`), guarded on non-null, keeping `AND m.total_ms > 0` for consistency:
-```sql
-ROUND(AVG(m.e2e_ms))                                          AS avg_e2e_ms,
-ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.e2e_ms)) AS p95_e2e_ms
-```
-Add both to the `columns` contract. (5) Frontend: extend the Latency tab + shared analytics types with `avgE2eMs`/`p95E2eMs`; render E2E, TTFF, and Total as visibly distinct, and apply the Total/Bedrock relabels above. (6) Docs: add `agent_final_at`/`e2e_ms` (and `model_ms`/`tool_ms` if G2 is taken) to `SPEC-MESSAGE-METADATA-CODEBOOK.md`.
+| Column | Derivation | Skew |
+|---|---|---|
+| `exchanges.e2e_ms` (`= agent_final_at - user_message_at`) | `agent_final_at` is derived at ARCHIVAL from the Chime UPDATE event's `LastUpdatedTimestamp` (the final-answer post), gated to the completion update (`total_ms` present) and frozen by COALESCE so a later moderation/battle update cannot move it. No processor emit or re-fetch. | **skew-free** (both Chime) |
+| `messages.model_ms` | `invokeBedrock` sums each Converse call's `iterStart -> iterEnd`. | single-invocation server clock |
+| `messages.tool_ms` | `invokeBedrock` times the in-loop tool-execution block. `model_ms + tool_ms + guardrails` reconciles to `latency_ms`. | single-invocation server clock |
+| `exchanges.inbound_ms` | the processor emits its entry `Date.now()`; archival computes `entry - user_message_at` on the exchange, clamped `>= 0`. | **cross-clock** (server vs Chime; approximate) |
 
-**Accuracy and rollout.** Option A is skew-free; Option B carries ~single-digit-ms skew (negligible vs multi-second answers, identical in kind to today's TTFF). E2E **includes** the inbound hop + cold start (both fall between `user_message_at` and `agent_final_at`) - exactly what `total_ms` misses - and excludes only final browser delivery (sub-ms on an established socket). New nullable columns; absent-`completedAtMs` rows are `NULL`, so they are skipped by AVG/PERCENTILE, never wrong-valued. No backfill. Aurora-only. One-pass deploy.
+### `inbound_ms` is the one metric that is not skew-free
 
-**Testing.** Unit: archival computes `e2e_ms` from a synthetic completion event; `NULL` when `completedAtMs` absent. E2E: send a slow (tool-using) turn; assert `e2e_ms > ttff_ms > 0` in `/analytics/latency`, proving the brackets are distinct on real traffic.
+It brackets a Chime-stamped start against a server-clock entry with no shared clock between them, so it carries NTP skew and could compute slightly negative; archival clamps it to `>= 0` and it is approximate by design. Everything else in the set is a single clock and exact.
+
+### Capture path (as built)
+
+1. **Schema** `013-latency.sql` - the five nullable columns above.
+2. **Emit** - `finalizePlaceholderResponse` writes `modelMs`, `toolMs`, and `processorEntryMs` (the handler-entry `Date.now()`) to the out-of-band analytics record. `agent_final_at` needs no emit: archival reads it from the UPDATE event itself.
+3. **Archival** (`kinesis-archival.ts` `backfillFromUpdateEvents`) - folds `model_ms` / `tool_ms` onto the message row and derives `agent_final_at`, `e2e_ms`, and `inbound_ms` on the exchange, all COALESCE-idempotent.
+4. **Query** (`getLatencyMetrics`) - adds `avg_e2e_ms` / `p95_e2e_ms` (from `e.e2e_ms`), `avg_model_ms` / `avg_tool_ms` (from `m`), and `avg_inbound_ms` (from `e.inbound_ms`) to the SELECT and the columns contract, keeping `AND m.total_ms > 0`.
+5. **Frontend** (`LatencyTab`) - E2E, Avg Model, Avg Tool, and Inbound cards, the Total/Bedrock relabels + tooltips, and the `avg_e2e_ms` target in `metricTargets.ts`. Targets there are display-only; the Alerts tab keys on its own set, so a new metric does not misfire an SLA.
+
+### Correctness and rollout
+
+`e2e_ms` and the model/tool split are skew-free (a single clock each); `inbound_ms` is the sole cross-clock metric (handled above). New columns are nullable, so absent values are skipped by AVG/PERCENTILE and never wrong-valued during first traffic. No backfill. Aurora-only. Because the whole set is in the base schema, a fresh deploy gets it on Create and no operator or downstream deployer migrates later.
+
+### Testing
+
+**Automated (contract, mock-level).** `test/analytics-aurora/kinesis-archival-backfill.test.ts` pins the archival derivation against a MOCKED `query`: it asserts the SQL and the param positions - `agent_final_at` gated on the completion update (`total_ms` present) and frozen by COALESCE, the `e2e_ms` and clamped `inbound_ms` expressions, and the `model_ms` / `tool_ms` fold. It does NOT execute SQL, so the computed VALUES and the `model_ms + tool_ms` reconciliation are not value-tested here, and the loop-timing accumulation in `invokeBedrock` is not yet unit-covered.
+
+**Not yet automated (pre-deploy validation).** On a live deployment, drive one slow, tool-using turn and confirm in `/analytics/latency` that `e2e_ms > total_ms > 0`, `ttff_ms > 0`, and `model_ms` / `tool_ms` are both `> 0` - the brackets distinct on real traffic. Run this as a validation step until an automated end-to-end assertion is added.
 
 ## References
 
