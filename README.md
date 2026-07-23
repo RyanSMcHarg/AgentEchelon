@@ -14,16 +14,16 @@ The point is centralization. Instead of standing up a separate tool for each use
 
 Most agentic systems are a model, tools, memory, and an orchestration loop. Agent Echelon ships each of those and lets you customize or swap them, then wraps them in the enterprise layers - governed multi-party conversation and access enforced in the cloud's own IAM (with an omnichannel edge designed and seamed, below). It is organized as four layers, each running on the one below:
 
-- **Interface layer.** The surfaces a participant meets: a web console for users and an admin console today; an embedded widget, phone/voice (PSTN), SMS, and integration into existing third-party tools are designed and seamed.
-- **Communication layer.** The connectivity that moves messages and keeps context: a durable conversation that *is* the memory, a server-side hook on every message, and event capture with per-message metadata - each transport on a provider you choose.
+- **Interface layer.** The client surfaces people use: a web chat client for users and the operator admin app today, with mobile, phone (PSTN), email, and integration into existing third-party tools designed and seamed. A client renders, holds a bearer-pinned identity, and reaches the engine through the connectivity layer below.
+- **Communication layer.** The connectivity that wires each client to the engine: WebSocket and REST for messaging today, with WebRTC for real-time next, and email handing off outbound already. Each transport runs on a provider you choose rather than one the platform hard-codes, and adding connectivity never changes the engine.
 - **Interaction layer.** The engine: Agent Echelon's own code composed over the AWS services it uses, expressing who may act, as whom, at what capability, with which assistant, reaching which systems. That code writes the policy; AWS IAM enforces it. Its composition root is the *conversation type*; five pillars (identity and access, assistant configuration, conversation configuration, connectors, auditing) compose every experience.
 - **Foundations layer.** How the platform is deployed and operated: the AWS CloudFormation stacks (CDK) that provision every resource, resource tagging for cost allocation, and the monitoring that keeps it running. The tags that attribute cost are the same ones the interaction layer's IAM decisions read, so cost and governance ride one mechanism.
 
 The engine composes AWS managed primitives (Amazon Chime SDK Messaging, Bedrock, S3, Cognito/STS, IAM, Kinesis), so inference, moderation, message delivery, and retention are AWS's to operate, not yours to build. The platform integrates your identity provider (Cognito by default, or your SSO/SAML/OIDC) rather than replacing it. Real workflows span sales, a scheduled service visit, and a support case - across business units, internal employees, and outside partners - so the same platform expresses a 1:1 tiered chat, a routed support case, a masked service call, or an alert-triggered incident-triage room by **configuration, not new code**. (Pluggable connectors to external systems of record are a designed, opt-in seam, not yet a shipped runtime path.)
 
-**Security** - Every conversation runs inside your AWS account on infrastructure you own. Cognito handles authentication with corporate IdP support. Bedrock Guardrails filter PII, prompt injection, and sensitive content. IAM - keyed on each channel's immutable `classification` tag and bearer-pinned to each user's *own* identity - enforces not just which models a tier may use but which conversations a user (or an assistant) can read or send in: fail-closed, evaluated before any request is processed, and provable with a deny-test rather than a code review. Admins can browse, moderate, redact, or delete any message.
+**Security** - Every conversation runs inside your AWS account on infrastructure you own, and enforcement is the cloud's own, not a bolted-on policy engine. IAM - keyed on each channel's immutable `classification` tag and bearer-pinned to each user's *own* identity - decides not just which models a classification may use but which conversations a user (or an assistant) can read or send in: fail-closed, evaluated before any request is processed, and provable with a deny-test rather than a code review. This does not hinge on the identity provider: authentication plugs into yours (Amazon Cognito by default, or your SSO/SAML/OIDC), while the frontend obtains Amazon Chime SDK credentials *only* through the bearer-pinned, classification-capped credential exchange, never a shared backend credential. Bedrock Guardrails filter PII, prompt injection, and sensitive content on every model turn. Admins can browse, moderate, redact, or delete any message.
 
-**Cost control** - Three user tiers (Basic, Standard, Premium) gate access to progressively more capable (and expensive) models. Intent-based routing automatically selects the cheapest model that fits the task - Haiku for Q&A, Sonnet for code, Opus only when deep reasoning is needed. A/B experiments let you prove whether a cheaper model performs just as well before switching. Circuit breakers and fallback chains protect against runaway quota spend.
+**Cost control** - Each classification is served by a capability profile that fixes which model answers, so access to progressively more capable (and expensive) models is governed per classification (the sample deployment ships `basic`/`standard`/`premium`, a tiered-chat example - rename them for your own taxonomy). Intent-based routing sends each request to the model you assign it, so the default keeps cost down by using the cheapest model that fits (Haiku for Q&A, Sonnet for code, Opus only when deep reasoning is needed) - and you can change any of it. A/B experiments let you prove whether a cheaper model performs just as well before switching. Circuit breakers and fallback chains protect against runaway quota spend.
 
 **Quality of output** - Every response is tracked with model, latency, token count, intent classification, and optional human evaluation scores. The admin dashboard shows model effectiveness by intent, flagged response review queues, [drift detection](#drift-detection-aurora-only), and side-by-side A/B experiment results. You measure what you ship.
 
@@ -34,31 +34,32 @@ Built with React 19 and AWS CDK, Agent Echelon combines real-time messaging, dur
 ### Key Features
 
 **Model routing and resilience:**
-- **Multiple Bedrock Model Families** - Anthropic Claude, Amazon Nova, and OpenAI GPT-OSS selectable per tier at deploy time (the provider layer also supports external HTTP APIs, proven by the image-generation path)
-- **Intent-Based Model Routing** - Automatic model selection per intent (e.g., Haiku for Q&A, Sonnet for code, Opus for analysis) with configurable fallback chains
+- **Multiple Bedrock Model Families** - Anthropic Claude, Amazon Nova, OpenAI GPT-OSS, and DeepSeek V3.2 selectable per classification at deploy time (the provider layer also supports external HTTP APIs, proven by the image-generation path)
+- **Intent-Based Model Routing** - You control which model handles each intent (e.g., Haiku for Q&A, Sonnet for code, Opus for analysis) via a configurable per-classification routing strategy, with configurable fallback chains. 
 - **Bedrock Resilience** - Exponential backoff retry on throttling, automatic model fallback on quota exhaustion, and circuit breaker to protect against cascading failures
-- **A/B Model Testing** - DynamoDB-backed experiment framework for comparing models per intent with deterministic conversation-level variant assignment and side-by-side analytics
-- **Cost and Abuse Controls** - Per-user and global hourly Bedrock spend budgets, per-tier request rate limiting, request dedup, an inbound length cap, and a global circuit trip - distinct from the model-fallback resilience above (see [SPEC-ABUSE-CONTROLS](docs/specs/ops/SPEC-ABUSE-CONTROLS.md))
+- **A/B Model Testing** - Experiment framework for comparing models per intent with deterministic conversation-level variant assignment and side-by-side analytics
+- **Cost and Abuse Controls** - Per-user and global hourly Bedrock spend budgets, per-classification request rate limiting, request dedup, an inbound length cap, and a global circuit trip - distinct from the model-fallback resilience above (see [SPEC-ABUSE-CONTROLS](docs/specs/ops/SPEC-ABUSE-CONTROLS.md))
 
 **Collaboration and access control:**
 - **AWS-Native Persistent Messaging** - Real-time WebSocket delivery with durable conversation history using AWS-managed messaging infrastructure
-- **Role-Based Access** - Control model access by user tier (Basic, Standard, Premium) via Cognito + IAM policies
+- **Role-Based Access** - Control model access by classification (the sample deployment's `basic`/`standard`/`premium`) via Cognito + IAM policies
 - **Corporate Identity** - SAML/OIDC integration via Amazon Cognito (see [Identity Provider Guide](docs/guides/user/IDENTITY-PROVIDER-GUIDE.md))
 - **File Attachments** - S3-based secure upload/download with presigned URLs, drag-and-drop support
 - **Multi-Step Task Workflows** - Guided troubleshooting, data extraction, and report generation with state tracking across conversation turns
 - **Conversation Archive, Leave & Remove** - A moderator can archive a conversation (read-only + hidden from the active list; membership retained, so members keep read-only access until the 90-day expiry) or remove a member; any member can leave (see [SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP](docs/specs/communication/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md))
 
 **Admin operations and analytics:**
+- **IAM-Enforced Admin Actions** - Every privileged admin action (view-all-events, moderation, redact / delete, archive and attachment reads) gates on an IAM-enforceable capability, not `admins`-group membership alone. For each operation the console obtains a short-lived, bearer-pinned, action-scoped credential from the credential exchange, so a role can be denied a specific action, the vend is auditable, and isolation is provable with a deny-test (see [SPEC-ADMIN-IDENTITY](docs/specs/interaction/identity-access/admin/SPEC-ADMIN-IDENTITY.md))
 - **Admin Analytics Console** - Conversation volumes, model usage, model-by-intent effectiveness, evaluation scores, user activity, and user feedback summaries
 - **Conversation Operations** - Browse conversations from the analytics archive, per-message inspect (all fields + metadata), member add/remove, membership-history timeline, and redact / delete - acting as the service app-instance-admin
 - **Model Strategy Console** - Intent-to-model routing visibility with provider posture, fallback pairings, cost/latency classes
 - **Experiments Console** - Create, pause, and complete A/B model experiments with side-by-side variant results (score, latency, tokens, compliance, fallback rate)
-- **User Management** - Approve, reject, change tier, and enable/disable users from the admin dashboard
+- **User Management** - Approve, reject, change classification, and enable/disable users from the admin dashboard
 - **Evaluation Suite** (Aurora mode) - Multi-turn flow evaluation, flagged response review, ground truth human scoring, task completion tracking
 - **Live Drift Detection** (Aurora mode only, see [section below](#drift-detection-aurora-only)) - Cosine-similarity drift detection over Titan v2 embeddings, with a live user-facing suggestion to split or switch the conversation when topics shift
 
 **Infrastructure:**
-- **Per-tier assistant stacks** - Each tier runs a self-hosted Bedrock Converse tool loop with its own model, content guardrail, in-Lambda tools, and channel-flow routing (no managed Bedrock Agent)
+- **Per-classification assistant stacks** - Each classification's profile runs a self-hosted Bedrock Converse tool loop with its own model, content guardrail, in-Lambda tools, and channel-flow routing (no managed Bedrock Agent)
 - **Centralized Model Strategy** - Model IDs, IAM allowlists, and routing config derive from a single shared config
 - **Optional Aurora Mode** - Aurora PostgreSQL + VPC for advanced analytics (deploy with `--context analyticsMode=aurora`)
 
@@ -71,7 +72,7 @@ Agent Echelon deploys in **Athena mode** by default (lower cost, simpler). Auror
 | Message archiving (Kinesis -> S3) | Yes | Yes |
 | Admin dashboard: Overview, Models, Conversations, Users, Latency | Yes | Yes |
 | Admin dashboard: Evaluations (basic scores) | Yes | Yes |
-| User management (approve/reject/tier) | Yes | Yes |
+| User management (approve/reject/classification) | Yes | Yes |
 | **Multi-turn flow evaluation** | -- | Yes |
 | **Flagged response review queue** | -- | Yes |
 | **Ground truth human calibration** | -- | Yes |
@@ -84,11 +85,11 @@ Agent Echelon deploys in **Athena mode** by default (lower cost, simpler). Auror
 **Athena mode limitations:**
 - No real-time per-message analytics - data is available after Firehose buffering (5 min)
 - No cross-conversation context (each conversation is isolated)
-- **No drift detection.** Drift requires Aurora's pgvector cosine similarity and the summary-updater Lambda; neither exists in Athena mode. Deploying with `enableLiveDrift=true` in Athena mode is a misconfiguration - the feature silently skips every turn.
+- No drift detection. Drift requires Aurora's pgvector cosine similarity and the summary-updater Lambda; neither exists in Athena mode. Deploying with `enableLiveDrift=true` in Athena mode is a misconfiguration - the feature silently skips every turn.
 - Admin dashboard shows only aggregate metrics from S3/Athena, not per-exchange detail
 - Aurora-only tabs (Flows, Flagged, Ground Truth, Tasks) are hidden
 
-**Graceful degradation:** The app is designed to run fully in Athena mode without errors. Aurora-only admin tabs are hidden (not shown as broken). Task tracking in async processors silently skips DynamoDB writes when `TASKS_TABLE` is not configured - the bot still generates responses, just without multi-turn state. The premium tier's S3 knowledge base context is optional - if `CONTEXT_BUCKET` is empty, responses are generated without enrichment. The admin dashboard shows an informational banner when no analytics data has been archived yet, explaining the pipeline delay and suggesting Aurora mode for advanced features. Cross-conversation context and drift detection are never referenced in Athena mode.
+**Graceful degradation:** The app is designed to run fully in Athena mode without errors. Aurora-only admin tabs are hidden (not shown as broken). Task tracking in async processors silently skips DynamoDB writes when `TASKS_TABLE` is not configured - the bot still generates responses, just without multi-turn state. The premium classification's S3 knowledge base context is optional - if `CONTEXT_BUCKET` is empty, responses are generated without enrichment. The admin dashboard shows an informational banner when no analytics data has been archived yet, explaining the pipeline delay and suggesting Aurora mode for advanced features. Cross-conversation context and drift detection are never referenced in Athena mode.
 
 ## Documentation
 
@@ -99,52 +100,59 @@ The full documentation lives under [`docs/`](docs/DOCUMENTATION.md), organized b
 > **Full architecture guide:** [docs/overview/ARCHITECTURE.md](docs/overview/ARCHITECTURE.md) covers all flows end-to-end: authentication, message routing, intent classification, file attachments, conversation sharing, analytics pipelines, and CDK stack dependencies.
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                        React Frontend                           │
-│                   (Vite + TypeScript + React 19)                │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-                              ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                     Amazon Cognito                              │
-│              (User Pool + Identity Pool)                        │
-└─────────────────────────────────────────────────────────────────┘
-                              │
-              ┌───────────────┼───────────────┐
-              ▼               ▼               ▼
-┌──────────────────┐ ┌───────────────┐ ┌─────────────┐
-│  Amazon Chime SDK       │ │  API Gateway  │ │  Amazon S3  │
-│  Messaging       │ │               │ │             │
-│  (WebSocket)     │ │               │ │             │
-└────────┬─────────┘ └───────────────┘ └─────────────┘
-         │
-         ├── Channel Flow Processor (@all routing, filtering)
-         │
-         ▼
-┌──────────────────┐
-│  Amazon Lex V2   │
-│  (per-tier bot)  │
-└────────┬─────────┘
-         │
-         ▼
-┌──────────────────────────────────────────────────┐
-│  Per-tier async processors (3 tiers)             │
-│  ┌──────────┐ ┌───────────┐ ┌──────────────┐    │
-│  │  Basic   │ │  Standard │ │   Premium    │    │
-│  │ (Haiku)  │ │  (Sonnet) │ │   (Opus)     │    │
-│  └────┬─────┘ └─────┬─────┘ └──────┬───────┘    │
-│       └──────────────┼──────────────┘            │
-│                      ▼                           │
-│   Self-hosted Converse tool loop                 │
-│   (in-Lambda tools) + content guardrail          │
-└──────────────────────────────────────────────────┘
-                      │
-                      ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                      Amazon Bedrock                             │
-│         (Claude Opus, Sonnet, Haiku, Amazon Nova)               │
-└─────────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                         React Frontend                           │
+│   AuthProvider -> AwsClientProvider -> MessagingProvider ->       │
+│   ConversationProvider          (Vite + TypeScript + React 19)    │
+└───────────────┬───────────────────────────────┬──────────────────┘
+        WebSocket│                           REST │
+                 ▼                                ▼
+┌───────────────────────────┐   ┌───────────────────────────────────┐
+│      Amazon Cognito       │   │            API Gateway            │
+│   User Pool + Identity     │   │  credential-exchange (the SOLE    │
+│   Pool  -> IAM credentials │   │  source of Amazon Chime SDK       │
+└────────────┬──────────────┘   │  creds) . create-conversation .   │
+             │ IAM creds        │  share . presigned-url . analytics │
+             ▼                  └───────────────────────────────────┘
+┌───────────────────────────┐
+│    Amazon Chime SDK        │
+│    Messaging (WebSocket +  │
+│    durable message store)  │
+└────────────┬──────────────┘
+             │ channel message event
+             ▼
+┌───────────────────────────┐   runs FIRST on every message: mention
+│   Channel Flow Processor   │   rules + filtering. @all / @everyone
+└────────────┬──────────────┘   bypass Lex and invoke the async
+             │ (otherwise)       processor directly.
+             ▼
+┌───────────────────────────┐   entry trigger only (Dialog Code
+│    Amazon Lex V2 Bot       │   Hook): not a classifier or router.
+│    (one per classification)│
+└────────────┬──────────────┘
+             │ Lex fulfillment -> shared router-agent-handler.ts
+             ▼
+┌──────────────────────────────────────────────────────────────────┐
+│  Per-classification handler + async processor (one per profile)   │
+│  ┌─────────┐  ┌──────────┐  ┌──────────┐   sample models shown -   │
+│  │  basic  │  │ standard │  │ premium  │   configurable per        │
+│  │ (Haiku) │  │ (Sonnet) │  │  (Opus)  │   classification + intent │
+│  └────┬────┘  └────┬─────┘  └────┬─────┘                          │
+│       └────────────┼─────────────┘                                │
+│                    ▼                                               │
+│   Self-hosted Bedrock Converse tool loop (in-Lambda tools) +      │
+│   content guardrail; intent -> model routing with fallback        │
+└──────────────────────────┬───────────────────────────────────────┘
+             ┌─────────────┼──────────────┐
+             ▼             ▼               ▼
+   ┌──────────────────┐ ┌─────────┐ ┌────────────────────┐
+   │  Amazon Bedrock  │ │  Amazon │ │     Analytics      │
+   │ (Claude . Nova . │ │   S3    │ │  (Athena or Aurora │
+   │   GPT-OSS)       │ │ (files) │ │   mode)            │
+   └──────────────────┘ └─────────┘ └────────────────────┘
 ```
+
+**Reading the flow:** the **Channel Flow Processor** runs first on every message (mention rules, filtering, marker stripping); `@all` bypasses Lex and invokes the async processor directly. **Amazon Lex is only the entry trigger** (an Amazon Chime SDK-to-Lambda passthrough via its Dialog Code Hook), not a classifier or router. Each classification's Lex bot fulfills into that classification's own handler Lambda: all run the shared `router-agent-handler.ts` code but are deployed one per classification (per-classification ownership, ADR-011). The models shown are the sample **defaults**; model selection is configurable per classification and per intent via `model-strategy` (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS), so the platform is model-agnostic. The full diagram, with the REST lanes and every enforcement point, is in [docs/overview/ARCHITECTURE.md](docs/overview/ARCHITECTURE.md).
 
 ### Provider Hierarchy
 
@@ -161,32 +169,26 @@ AuthProvider → AwsClientProvider → MessagingProvider → ConversationProvide
 
 ```
 agentechelon/
-├── frontend/                 # React application
-│   ├── src/
-│   │   ├── components/       # UI components
-│   │   │   ├── admin/        # Admin analytics dashboard
-│   │   │   ├── AttachmentDisplay.tsx
-│   │   │   ├── ConnectionStatus.tsx
-│   │   │   ├── ConversationInterface.tsx
-│   │   │   ├── ConversationList.tsx
-│   │   │   ├── ErrorBoundary.tsx
-│   │   │   ├── FileUploadPreview.tsx
-│   │   │   ├── Header.tsx
-│   │   │   ├── MessageInput.tsx
-│   │   │   ├── TaskStatusIndicator.tsx
-│   │   │   └── ...auth screens
-│   │   ├── providers/        # React context providers
-│   │   │   ├── AuthProvider.tsx
-│   │   │   ├── AwsClientProvider.tsx
-│   │   │   ├── MessagingProvider.tsx
-│   │   │   └── ConversationProvider.chime.tsx
-│   │   ├── services/         # Backend integration
-│   │   │   ├── chimeService.ts
-│   │   │   ├── attachmentService.ts
-│   │   │   └── analyticsService.ts
-│   │   ├── types/            # TypeScript definitions
-│   │   └── utils/            # Message parsing utilities
-│   └── package.json
+├── frontend/                 # npm-workspaces monorepo (Vite + TypeScript + React 19)
+│   ├── package.json          # workspace root (scripts: dev:chat / dev:admin / build:*)
+│   ├── tsconfig.base.json
+│   └── packages/
+│       ├── shared/           # @ae/shared - code both apps import
+│       │   └── src/          # providers (AuthProvider: Cognito auth + token refresh),
+│       │                     #   components, services, api, config, i18n, types, utils
+│       ├── chat/             # @ae/chat - the end-user chat app
+│       │   ├── .env.example
+│       │   └── src/
+│       │       ├── components/   # conversation UI, attachments, auth screens
+│       │       ├── providers/    # AwsClientProvider, MessagingProvider,
+│       │       │                 #   ConversationProvider.chime
+│       │       └── services/     # chime / attachment / analytics clients
+│       └── admin/            # @ae/admin - the standalone admin console
+│           ├── .env.example
+│           └── src/
+│               ├── components/admin/   # analytics dashboard tabs
+│               ├── config/
+│               └── services/
 │
 ├── backend/                  # AWS CDK infrastructure
 │   ├── lib/stacks/           # Modular CDK stacks
@@ -232,7 +234,7 @@ agentechelon/
 
 ### Prerequisites
 
-- Node.js 18+
+- Node.js 20+ (matches the Lambda runtime)
 - AWS CLI configured with appropriate credentials
 - AWS CDK CLI (`npm install -g aws-cdk`)
 - Access to Amazon Bedrock models in your AWS account
@@ -320,9 +322,9 @@ Request model access in AWS Console:
 
 1. Navigate to **Bedrock > Model access > Manage model access**
 2. Enable the following models:
-   - `anthropic.claude-opus-4-6-v1` (Premium tier)
-   - `anthropic.claude-sonnet-4-6` (Standard tier)
-   - `anthropic.claude-3-haiku-20240307-v1:0` (Basic tier + intent classification)
+   - `anthropic.claude-opus-4-6-v1` (premium classification)
+   - `anthropic.claude-sonnet-4-6` (standard classification)
+   - `anthropic.claude-3-haiku-20240307-v1:0` (basic classification + intent classifier)
    - `amazon.nova-pro-v1:0` (Amazon Nova Pro - the `titan` catalog key)
 
 ### Run Frontend (local development)
@@ -331,11 +333,15 @@ Request model access in AWS Console:
 cd frontend
 npm ci   # exact, lockfile-pinned install (not `npm install`)
 
-# Copy environment template and update with CDK outputs
-cp .env.example .env
+# Copy the per-package env template and update with CDK outputs
+# (frontend is a workspaces monorepo - each app has its own .env)
+cp packages/chat/.env.example packages/chat/.env     # chat app
+cp packages/admin/.env.example packages/admin/.env   # admin console (optional)
+# ...or generate both from stack outputs: node ../backend/scripts/gen-frontend-env.mjs
 
-# Start development server
-npm run dev
+# Start a development server (per app)
+npm run dev:chat     # end-user chat app
+npm run dev:admin    # admin console
 ```
 
 ### Deploy Frontend (production - CloudFront + S3)
@@ -346,11 +352,13 @@ provisions the hosting; a build-and-publish step uploads the app:
 
 ```bash
 cd backend
-npm run deploy-frontend     # builds frontend, syncs frontend/dist to S3, invalidates the CDN
+npm run deploy-frontend            # chat app: builds packages/chat/dist, syncs to S3, invalidates the CDN
+npm run deploy-frontend -- --admin # admin console (its own CloudFront + S3 origin)
 ```
 
-The build bakes in CDK outputs, so populate `frontend/.env` from the stack
-outputs first, then - because the public URL is only known after the first
+The build bakes in CDK outputs, so populate each app's `.env`
+(`frontend/packages/{chat,admin}/.env`, e.g. via `backend/scripts/gen-frontend-env.mjs`) from the
+stack outputs first, then - because the public URL is only known after the first
 deploy - set `--context appUrl=https://<DistributionUrl>` and redeploy so the
 backend CORS allowlist includes the app origin (a custom domain avoids this
 round-trip). An optional `wafAllowedIps` context locks the distribution to known
@@ -369,11 +377,11 @@ IPs. Full guide, including teardown and the security headers applied:
 >
 > | Plane | Standalone default | Host-owned option |
 > |-------|--------------------|-------------------|
-> | **User** (who can chat, at which tier) | AE Cognito user pool | Your IdP - [IDENTITY-PROVIDER-GUIDE](docs/guides/user/IDENTITY-PROVIDER-GUIDE.md) |
+> | **User** (who can chat, at which classification) | AE Cognito user pool | Your IdP - [IDENTITY-PROVIDER-GUIDE](docs/guides/user/IDENTITY-PROVIDER-GUIDE.md) |
 > | **Admin** (who sees analytics / moderates) | AE `admins` group + AE dashboard | Your console - [ADMIN-INTEGRATION-GUIDE](docs/guides/admin/ADMIN-INTEGRATION-GUIDE.md) |
 >
 > **"Admin" means three distinct things** in this system (a Cognito *group*, an
-> empty IAM *role*, and an Amazon Chime SDK *service* principal), and the tier boundary lives
+> empty IAM *role*, and an Amazon Chime SDK *service* principal), and the classification boundary lives
 > on the credential exchange rather than the Identity-Pool roles. The full,
 > code-grounded account - with a capability matrix and a spec-drift table - is
 > **[docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md](docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md)**.
@@ -390,7 +398,7 @@ cd backend
 AWS_PROFILE=your-profile ADMIN_EMAIL=admin@example.com npm run provision-admin
 ```
 
-This creates a premium-tier user, adds it to the `premium` + `admins` Cognito groups (the authoritative tier/admin signal), and creates the Amazon Chime SDK AppInstance User required for messaging. It resolves the user pool and app instance from the deployed stack outputs, and is idempotent (re-running updates the user and re-sends the invite). Sign in at http://localhost:5173.
+This creates a user in the `premium` classification, adds it to the `premium` + `admins` Cognito groups (the authoritative classification/admin signal), and creates the Amazon Chime SDK AppInstance User required for messaging. It resolves the user pool and app instance from the deployed stack outputs, and is idempotent (re-running updates the user and re-sends the invite). Then sign in at your deployed frontend URL - the `AgentEchelonFrontend` CloudFront distribution from the stack outputs (or http://localhost:5173 if you are running the app locally).
 
 **Password requirements:** 8+ characters, uppercase, lowercase, digit, symbol.
 
@@ -405,7 +413,7 @@ aws cognito-idp admin-update-user-attributes \
 
 ## Configuration
 
-Create a `.env` file in the frontend directory:
+Create a `.env` file in each frontend package (`frontend/packages/chat/.env`, and `frontend/packages/admin/.env` for the admin console) - or generate them from the stack outputs with `backend/scripts/gen-frontend-env.mjs`:
 
 ```env
 # AWS Configuration
@@ -417,7 +425,7 @@ VITE_CLIENT_ID=your-client-id
 VITE_IDENTITY_POOL_ID=your-identity-pool-id
 
 # Amazon Chime SDK Configuration
-# No bot ARN is needed - channels enroll the per-tier assistant server-side.
+# No bot ARN is needed - channels enroll the per-classification assistant server-side.
 VITE_APP_INSTANCE_ARN=your-app-instance-arn
 
 # API Endpoints
@@ -446,10 +454,10 @@ Backend config is set at deploy time via CDK context (`-c key=value` on `cdk dep
 | `enableBattle` | `true` | `/battle` alt-bot slot pool + orchestrator; `-c enableBattle=false` omits the Battle stack. Battle eligibility is the per-profile `battleEligible` field in `profiles.ts` (premium by default). |
 | `analyticsVpcId` / `createVpcEndpoints` | create / `true` | Aurora-only: import an existing VPC instead of creating one; skip interface/gateway endpoints when the imported VPC already egresses. |
 | `sleepMode` | `false` | Aurora-only auto-pause to 0 ACU when idle (`sleepAfterIdle` default `2h`, `sleepCheckRate` default `rate(15 minutes)`). |
-| `enableMembershipAudit` | `false` | Layer-6 over-tier membership audit. `membershipAuditEnforce` (default `false`) = report-only vs auto-revoke; `membershipAuditAlertChannelArn` routes findings. See [ADMIN-GUIDE](docs/guides/admin/ADMIN-GUIDE.md). |
+| `enableMembershipAudit` | `false` | Layer-6 over-classification membership audit. `membershipAuditEnforce` (default `false`) = report-only vs auto-revoke; `membershipAuditAlertChannelArn` routes findings. See [ADMIN-GUIDE](docs/guides/admin/ADMIN-GUIDE.md). |
 | `adminAuthMode` | `ae-cognito` | Which IdP authenticates admins: `ae-cognito` / `federated` (`hostAdminPoolId`, `adminGroupNames`) / `service`. See [SPEC-ADMIN-IDENTITY](docs/specs/interaction/identity-access/admin/SPEC-ADMIN-IDENTITY.md). |
 | `bedrockUserHourlyBudget` / `bedrockGlobalHourlyBudget` | (unset) | Per-user / global hourly spend ceilings (abuse controls). See [SPEC-ABUSE-CONTROLS](docs/specs/ops/SPEC-ABUSE-CONTROLS.md). |
-| `basicModelKey` / `standardModelKey` / `premiumModelKey` | (tier default) | Override the default model per tier (any key in the model catalog). |
+| `basicModelKey` / `standardModelKey` / `premiumModelKey` | (classification default) | Override the default model per classification (any catalog key whose `allowedClassifications` includes that classification). |
 | `assistantIntentPack` | (default pack) | The request-classification taxonomy (per deployment). |
 | `senderEmail` | (required for email) | SES sender for notifications / conversation sharing. |
 | `appUrl` | `http://localhost:5173` | Frontend origin for the backend CORS allowlist; set to the CloudFront URL after the first deploy. |
@@ -458,18 +466,18 @@ Backend config is set at deploy time via CDK context (`-c key=value` on `cdk dep
 
 ## Model Strategy
 
-Model routing is capability-first rather than tier-first. The canonical backend strategy lives in:
+Model routing is capability-first rather than classification-first. The canonical backend strategy lives in:
 
 - `backend/lib/config/model-strategy.ts`
 
 That file defines:
 
 - the current Bedrock model catalog
-- tier availability for each model
+- classification availability for each model
 - the IAM allowlist inputs
 - intent-level preferred and fallback routing
 
-At runtime, the **model resolver** (`backend/lambda/src/lib/model-resolver.ts`) uses this strategy to select the optimal model per intent while enforcing tier-based access control. If a model fails, the **resilience layer** (`backend/lambda/src/lib/bedrock-resilience.ts`) retries with exponential backoff then falls back to the strategy's fallback model. A **circuit breaker** prevents hammering a consistently failing model.
+At runtime, the **model resolver** (`backend/lambda/src/lib/model-resolver.ts`) uses this strategy to select the optimal model per intent while enforcing classification-based access control. If a model fails, the **resilience layer** (`backend/lambda/src/lib/bedrock-resilience.ts`) retries with exponential backoff then falls back to the strategy's fallback model. A **circuit breaker** prevents hammering a consistently failing model.
 
 The admin console exposes:
 
@@ -482,7 +490,7 @@ Implementation details for the shared routing metadata live in [docs/guides/deve
 
 ## User Tiers
 
-Access to AI models is controlled by user tier:
+The sample deployment is a **tiered chat**: three example classifications (`basic`/`standard`/`premium`) surfaced to users as tiers, each gating access to progressively more capable models. This is one example taxonomy, not the platform's model - rename or replace the classifications for your own data taxonomy (see [PLATFORM-OVERVIEW](docs/overview/PLATFORM-OVERVIEW.md)). In this sample:
 
 | Tier | Models | Agent Handler |
 |------|--------|---------------|
@@ -553,7 +561,7 @@ A low-volume Athena-mode deployment runs roughly **$30-50/month** (dominated by 
 
 ## Customization Guide
 
-Extending AgentEchelon, adding or changing a tier, adding a tool or intent, configuring image-generation providers, and replacing prompts, is covered in the **[Developer Guide](docs/guides/developer/DEVELOPER-GUIDE.md)** and the docs it links (for example [docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md](docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md) and [docs/guides/admin/IMAGE-GEN-PROVIDERS.md](docs/guides/admin/IMAGE-GEN-PROVIDERS.md)).
+Extending AgentEchelon, adding or changing a classification (and its profile), adding a tool or intent, configuring image-generation providers, and replacing prompts, is covered in the **[Developer Guide](docs/guides/developer/DEVELOPER-GUIDE.md)** and the docs it links (for example [docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md](docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md) and [docs/guides/admin/IMAGE-GEN-PROVIDERS.md](docs/guides/admin/IMAGE-GEN-PROVIDERS.md)).
 
 ## Troubleshooting
 
@@ -760,7 +768,7 @@ echo "Report:  npx playwright show-report"
 
 - **Frontend**: React 19, Vite, TypeScript
 - **Backend**: AWS CDK (TypeScript), Lambda (Node.js 20)
-- **AI**: Provider-open, not Bedrock-locked - model-agnostic and configurable per tier and per intent. The assistant runs on Bedrock model families (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS); the provider layer also supports **external HTTP APIs**, proven today by the image-generation path (Stability on Bedrock plus external providers), so adding a non-AWS model provider is an architecture the platform already demonstrates
+- **AI**: Provider-open, not Bedrock-locked - model-agnostic and configurable per classification and per intent. The assistant runs on Bedrock model families (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS, DeepSeek V3.2); the provider layer also supports **external HTTP APIs**, proven today by the image-generation path (Stability on Bedrock plus external providers), so adding a non-AWS model provider is an architecture the platform already demonstrates
 - **Messaging**: Amazon Chime SDK Messaging (WebSocket)
 - **Auth**: Amazon Cognito (SAML/OIDC) with automatic token refresh
 - **Storage**: Amazon S3 (presigned URLs)
