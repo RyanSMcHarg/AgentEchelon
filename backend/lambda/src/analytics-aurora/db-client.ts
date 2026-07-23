@@ -313,65 +313,85 @@ export async function batchInsert<T extends Record<string, any>>(
 }
 
 /**
- * Ensure database schema is initialized.
- * Reads and executes SQL files from the schema directory in order.
- * Uses a _migrations table to track which files have been applied.
+ * Ensure the database schema is up to date by applying any PENDING migrations.
+ *
+ * Incremental + idempotent: reads `schema/*.sql` in order and applies only the files not yet recorded
+ * in the `_migrations` table, recording each as it applies. Crucially this runs on the RUNTIME (IAM-auth)
+ * connection, so unlike the CDK `schema-init` Custom Resource - which bootstraps on Create with PASSWORD
+ * auth and then can never reconnect (IamAuthSetup grants rds_iam, which disables password auth) - it DOES
+ * pick up a migration added AFTER the initial bootstrap on an already-running cluster. So a new migration
+ * file auto-applies on the next deploy for every deployment, fresh or existing, with no manual step.
+ *
+ * Memoized per Lambda instance. A transaction-scoped advisory lock serializes concurrent cold starts so
+ * two instances cannot both apply the same file. Runtime-applied migrations MUST be idempotent
+ * (IF NOT EXISTS) and transaction-safe (no CREATE INDEX CONCURRENTLY etc.), since they run in one
+ * transaction here; the initial bootstrap of the base schema still happens via `schema-init` on Create.
  */
 let schemaInitialized = false;
 
+// Fixed key for the pg advisory lock that serializes migration application across Lambda instances.
+const MIGRATION_ADVISORY_LOCK_KEY = 4242042013;
+
 export async function ensureSchema(): Promise<void> {
   if (schemaInitialized) return;
-
   try {
-    // Check if messages table exists (quick check for initialized state)
-    const tableResult = await query(`
-      SELECT EXISTS (
-        SELECT FROM information_schema.tables
-        WHERE table_schema = 'public' AND table_name = 'messages'
-      ) as has_messages
-    `);
-
-    if (tableResult.rows[0].has_messages) {
-      schemaInitialized = true;
-      return;
-    }
-
-    // Schema not initialized -- run migration files
-    console.log('Schema not found, running migrations...');
-    await runMigrations();
+    await applyPendingMigrations();
     schemaInitialized = true;
   } catch (error) {
-    console.error('Schema check failed:', error);
+    console.error('Schema migration failed:', error);
     throw error;
   }
 }
 
 /**
- * Run all SQL migration files from the schema directory in order.
+ * Apply any `schema/*.sql` files not yet in `_migrations`, in order, under an advisory lock so
+ * concurrent Lambda cold starts cannot double-apply. No-op when nothing is pending (the common case).
  */
-async function runMigrations(): Promise<void> {
+async function applyPendingMigrations(): Promise<void> {
   const schemaDir = path.join(__dirname, 'schema');
-
   if (!fs.existsSync(schemaDir)) {
     console.warn('Schema directory not found:', schemaDir);
     return;
   }
+  const files = fs.readdirSync(schemaDir).filter((f: string) => f.endsWith('.sql')).sort();
 
-  const files = fs.readdirSync(schemaDir)
-    .filter((f: string) => f.endsWith('.sql'))
-    .sort();
+  await transaction(async (client) => {
+    // Serialize the whole check-then-apply so two cold-starting Lambdas do not both apply the same file.
+    // The xact-scoped lock releases automatically on COMMIT/ROLLBACK.
+    await client.query('SELECT pg_advisory_xact_lock($1)', [MIGRATION_ADVISORY_LOCK_KEY]);
 
-  for (const file of files) {
-    const filePath = path.join(schemaDir, file);
-    const sql = fs.readFileSync(filePath, 'utf-8');
-    console.log(`Executing migration: ${file}`);
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS _migrations (
+        id SERIAL PRIMARY KEY,
+        filename VARCHAR(256) NOT NULL UNIQUE,
+        applied_at TIMESTAMPTZ DEFAULT NOW(),
+        checksum VARCHAR(64)
+      )
+    `);
 
-    try {
-      await query(sql);
+    const appliedRows = await client.query('SELECT filename FROM _migrations');
+    const applied = new Set<string>(appliedRows.rows.map((r: { filename: string }) => r.filename));
+
+    for (const file of files) {
+      if (applied.has(file)) continue;
+      const sql = fs.readFileSync(path.join(schemaDir, file), 'utf-8');
+      console.log(`Applying migration: ${file} (${sql.length} bytes)`);
+      await client.query(sql);
+      await client.query(
+        `INSERT INTO _migrations (filename, checksum) VALUES ($1, $2)
+         ON CONFLICT (filename) DO UPDATE SET applied_at = NOW(), checksum = $2`,
+        [file, migrationChecksum(sql)],
+      );
       console.log(`Migration complete: ${file}`);
-    } catch (error) {
-      console.error(`Migration failed: ${file}`, error);
-      throw error;
     }
+  });
+}
+
+/** Small non-crypto checksum for tracking migration file content (parity with schema-init.ts). */
+function migrationChecksum(content: string): string {
+  let hash = 0;
+  for (let i = 0; i < content.length; i++) {
+    hash = ((hash << 5) - hash + content.charCodeAt(i)) | 0;
   }
+  return Math.abs(hash).toString(16);
 }

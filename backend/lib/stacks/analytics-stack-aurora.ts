@@ -54,19 +54,35 @@ import { ANALYTICS_CAPABILITY_SUBPATHS } from '../../lambda/src/lib/admin-capabi
 import { personaExecuteApiResources, AdminPersona } from '../config/admin-capabilities';
 
 /**
- * esbuild commandHooks that copy the RDS CA bundle (`analytics-aurora/certs/*.pem`)
- * into a DB Lambda's asset, so `db-client.ts` can verify the DIRECT Aurora cluster
- * TLS connection after RDS-Proxy removal (the cluster's RDS-CA cert is not in
- * Node's default trust store). Applied to every Lambda that talks to the DB.
+ * esbuild commandHooks for a DB Lambda's asset. Copies:
+ *  - the RDS CA bundle (`analytics-aurora/certs/*.pem`), so `db-client.ts` can verify the DIRECT Aurora
+ *    cluster TLS connection (the cluster's RDS-CA cert is not in Node's default trust store); and
+ *  - the schema migration files (`analytics-aurora/schema/*.sql`), so `db-client.ensureSchema` can apply
+ *    any PENDING migration at runtime over the IAM connection (the `schema-init` Custom Resource only
+ *    bootstraps on Create and cannot reconnect afterwards - see ensureSchema).
+ * Applied to every Lambda that talks to the DB.
  */
-function rdsCertCommandHooks(): lambdaNodeJs.ICommandHooks {
+function dbLambdaCommandHooks(): lambdaNodeJs.ICommandHooks {
   return {
     beforeBundling(inputDir: string, outputDir: string): string[] {
-      const certSrc = path.join(inputDir, 'lambda', 'src', 'analytics-aurora', 'certs');
+      const aa = path.join(inputDir, 'lambda', 'src', 'analytics-aurora');
+      const certSrc = path.join(aa, 'certs');
       const certDest = path.join(outputDir, 'certs');
+      const schemaSrc = path.join(aa, 'schema');
+      const schemaDest = path.join(outputDir, 'schema');
       return process.platform === 'win32'
-        ? [`if not exist "${certDest}" mkdir "${certDest}"`, `copy /Y "${certSrc}\\*.pem" "${certDest}\\"`]
-        : [`mkdir -p "${certDest}"`, `cp "${certSrc}"/*.pem "${certDest}"/`];
+        ? [
+            `if not exist "${certDest}" mkdir "${certDest}"`,
+            `copy /Y "${certSrc}\\*.pem" "${certDest}\\"`,
+            `if not exist "${schemaDest}" mkdir "${schemaDest}"`,
+            `copy /Y "${schemaSrc}\\*.sql" "${schemaDest}\\"`,
+          ]
+        : [
+            `mkdir -p "${certDest}"`,
+            `cp "${certSrc}"/*.pem "${certDest}"/`,
+            `mkdir -p "${schemaDest}"`,
+            `cp "${schemaSrc}"/*.sql "${schemaDest}"/`,
+          ];
     },
     afterBundling: (): string[] => [],
     beforeInstall: (): string[] => [],
@@ -888,7 +904,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           externalModules: ['@aws-sdk/*'],
           minify: true,
           sourceMap: true,
-          commandHooks: rdsCertCommandHooks(), // RDS CA for direct cluster TLS
+          commandHooks: dbLambdaCommandHooks(), // RDS CA for direct cluster TLS
         },
       }
     );
@@ -1013,7 +1029,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           // Every other Aurora-connecting Lambda has this; the eval runner was
           // missed in that migration, so it failed TLS ("unable to get local
           // issuer certificate") on every daily run.
-          commandHooks: rdsCertCommandHooks(),
+          commandHooks: dbLambdaCommandHooks(),
         },
       }
     );
@@ -1122,7 +1138,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           externalModules: ['@aws-sdk/*'],
           minify: true,
           sourceMap: true,
-          commandHooks: rdsCertCommandHooks(), // RDS CA for direct cluster TLS
+          commandHooks: dbLambdaCommandHooks(), // RDS CA for direct cluster TLS
         },
       },
     );
@@ -1188,7 +1204,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           externalModules: ['@aws-sdk/*'],
           minify: true,
           sourceMap: true,
-          commandHooks: rdsCertCommandHooks(), // RDS CA for direct cluster TLS
+          commandHooks: dbLambdaCommandHooks(), // RDS CA for direct cluster TLS
         },
       },
     );
@@ -1291,7 +1307,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           sourceMap: true,
           // Ship the RDS CA bundle so db-client verifies the DIRECT cluster TLS
           // connection after RDS-Proxy removal (see rdsCertCommandHooks).
-          commandHooks: rdsCertCommandHooks(),
+          commandHooks: dbLambdaCommandHooks(),
         },
       },
     );
@@ -1372,7 +1388,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           sourceMap: true,
           // Ship the RDS CA bundle so db-client verifies the DIRECT cluster TLS
           // connection after RDS-Proxy removal (see rdsCertCommandHooks).
-          commandHooks: rdsCertCommandHooks(),
+          commandHooks: dbLambdaCommandHooks(),
         },
       },
     );
@@ -1457,7 +1473,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           externalModules: [],
           minify: true,
           sourceMap: true,
-          commandHooks: rdsCertCommandHooks(), // RDS CA for direct cluster TLS
+          commandHooks: dbLambdaCommandHooks(), // RDS CA for direct cluster TLS
         },
       }
     );
