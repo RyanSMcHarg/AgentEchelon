@@ -135,8 +135,8 @@ The assistant-profile management surface (profiles are versioned, portable artif
 | Feature | Why it matters | Status |
 |---|---|---|
 | Membership-audit findings (member and assistant cross-classification leaks) | Detect over-classification access | Yes (always deployed; report-only or `-c membershipAuditEnforce=true` for auto-revoke) |
-| Report-only vs auto-revoke toggle | Runtime enforcement switch, no redeploy | Partial (opt-in) |
-| Per-finding revoke | Remove a flagged membership and close the finding | Partial (opt-in) |
+| Report-only vs auto-revoke toggle | Runtime enforcement switch, no redeploy | Yes (runtime toggle) |
+| Per-finding revoke | Remove a flagged membership and close the finding | Yes |
 
 ### Auth / session
 
