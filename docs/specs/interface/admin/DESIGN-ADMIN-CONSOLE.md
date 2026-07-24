@@ -47,7 +47,7 @@ The console is read-mostly and holds no store of its own. It reads:
 
 **Attachment-review vend** (`adminAttachmentService.ts`, credential-exchange `identity:'admin'`): to open a conversation attachment the console vends short-lived, channel-scoped, audited S3 credentials whose session policy permits `s3:GetObject` on only the named channel's attachment keys, then presigns the GET client-side and opens it as a top-level navigation. Two capabilities split by key prefix so the sensitivity boundary is IAM-enforceable: `attachment-read` (`generated-docs/…`, assistant deliverables, archive grade) and `attachment-read-uploads` (`attachments/…`, user uploads / PII, moderation grade + sensitive audit). A key under neither prefix is rejected. No standing server-side S3 bearer.
 
-**Membership-audit API** (`membership-audit-admin.ts`, admin-gated by `requireAdmin`): `GET`/`POST /membership-audit/enforce` (report-only vs auto-revoke, reads/writes the DynamoDB `config/enforce` item), `POST /membership-audit/revoke` (`DeleteChannelMembership` as the service app-instance-admin, marks the finding revoked; idempotent). Returns 503 when the Layer-6 construct is not deployed (`enableMembershipAudit`).
+**Membership-audit API** (`membership-audit-admin.ts`, admin-gated by `requireAdmin`): `GET`/`POST /membership-audit/enforce` (report-only vs auto-revoke, reads/writes the DynamoDB `config/enforce` item), `POST /membership-audit/revoke` (`DeleteChannelMembership` as the service app-instance-admin, marks the finding revoked; idempotent). The Layer-6 construct is always deployed (in whichever analytics mode), so this surface is always present.
 
 **Credential-exchange API** (`plane:'admin'`): vends a fresh, single-channel-scoped, short-lived, audited credential returning the operator's `${sub}-admin` ARN as the `ChimeBearer`, plus the requested `capabilities`. Called client-side per administration action. Dual-plane (both apps call it), so its CORS allows both origins.
 
@@ -104,7 +104,7 @@ The console is read-mostly and holds no store of its own. It reads:
 ## 7. Migration / phasing / rollout
 
 - **Analytics mode.** Athena is the default; Aurora is opt-in (`--context analyticsMode=aurora`). Aurora is a strict superset - every Athena view is served in Aurora, and Aurora adds the quality views; Aurora-only sub-tabs are hidden in Athena mode.
-- **Layer-6 opt-in.** The membership audit is off by default (`enableMembershipAudit`); the enforce default is off (`membershipAuditEnforce`) and is overridden at runtime by the `config/enforce` toggle.
+- **Layer-6 always on.** The membership audit is always deployed; the enforce default is off (`membershipAuditEnforce`, report-only) and is overridden at runtime by the `config/enforce` toggle.
 - **App split.** The console ships as a standalone app; deploy phasing and stack ordering are in [`DESIGN-SEPARATE-ADMIN-APP.md`](DESIGN-SEPARATE-ADMIN-APP.md).
 - **Consolidation (complete).** Evaluations, Flows, Tasks, and Steps have folded into the Effectiveness drill (L2 exchanges / L3 `FlowScorePanel` / L2 tasks + L3 timeline / L4 inline steps) and are retired from the nav; their components still back the drill. Only Flagged and Ground Truth remain standalone human-action sub-tabs.
 

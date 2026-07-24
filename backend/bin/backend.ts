@@ -277,12 +277,10 @@ if (app.node.tryGetContext('sleepMode') && analyticsMode !== 'aurora') {
   );
 }
 
-// Layer 6 membership audit (SPEC-CONVERSATION-SECURITY): opt-in near-real-time backstop
-// that flags (and, when enforcing, revokes) over-tier channel memberships. Runs in both
-// analytics modes; report-only unless `-c membershipAuditEnforce=true`.
-const enableMembershipAudit: boolean =
-  app.node.tryGetContext('enableMembershipAudit') === true ||
-  app.node.tryGetContext('enableMembershipAudit') === 'true';
+// Layer 6 membership audit (SPEC-CONVERSATION-SECURITY): an ALWAYS-ON near-real-time backstop that
+// flags over-classification channel memberships for review - a standing security guarantee, deployed in
+// both analytics modes. It is NOT opt-in; the only knob is enforcement mode: report-only (flag for
+// review, the default) unless `-c membershipAuditEnforce=true` (auto-revoke the over-tier membership).
 const membershipAuditEnforce: boolean =
   app.node.tryGetContext('membershipAuditEnforce') === true ||
   app.node.tryGetContext('membershipAuditEnforce') === 'true';
@@ -320,7 +318,6 @@ if (analyticsMode === 'aurora') {
     enableBattleJoin: enableBattle,
     // Eval runner scores image turns by fetching the generated image from the attachments bucket.
     attachmentsBucketArnParam,
-    enableMembershipAudit,
     membershipAuditEnforce,
     membershipAuditAlertChannelArn,
     senderEmail: app.node.tryGetContext('senderEmail') as string | undefined,
@@ -345,7 +342,6 @@ if (analyticsMode === 'aurora') {
     userPool: cognitoStack.userPool,
     adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
     classificationRoleCeilings: cognitoStack.classificationRoleCeilings,
-    enableMembershipAudit,
     membershipAuditEnforce,
     membershipAuditAlertChannelArn,
     senderEmail: app.node.tryGetContext('senderEmail') as string | undefined,

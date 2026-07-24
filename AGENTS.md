@@ -197,19 +197,19 @@ admins stay in one IdP.
 npx cdk deploy --all -c adminAuthMode=federated -c hostAdminPoolId=us-east-1_XXXX -c adminGroupNames=admins
 ```
 
-**2. How over-tier memberships are handled** (`-c enableMembershipAudit`, `-c membershipAuditEnforce`).
+**2. How over-tier memberships are handled** (`-c membershipAuditEnforce`).
 The near-real-time membership audit (`docs/specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md` Layer 6) watches Amazon Chime SDK
 membership changes and flags any member or assistant placed on a channel above their tier.
-- Off by default. Enable with `-c enableMembershipAudit=true`.
+- **Always deployed** - flagging over-tier members for review is a standing security guarantee, not opt-in.
 - **Report-only (default) vs auto-revoke of member access:** `-c membershipAuditEnforce=false` (default)
-  flags and alerts only; `=true` auto-removes the offending membership. This is ALSO a runtime toggle in
-  the admin dashboard's Membership Audit tab (report-only vs auto-revoke), which overrides the deploy
-  default, so operators switch between manual removal and auto-revocation without redeploying.
+  flags and alerts only; `=true` auto-removes the offending membership. This is the ONLY knob, and it is
+  ALSO a runtime toggle in the admin dashboard's Membership Audit tab (report-only vs auto-revoke), which
+  overrides the deploy default, so operators switch between manual removal and auto-revocation without redeploying.
 - Optional `-c membershipAuditAlertChannelArn=<arn>` routes findings to an admin conversation (in-app plus
   email via the notification bridge); without it, findings are log-only.
 ```bash
-# audit on, start in report-only (recommended), then flip to auto-revoke in the dashboard when confident
-npx cdk deploy --all -c enableMembershipAudit=true -c membershipAuditEnforce=false
+# audit runs by default in report-only; flip to auto-revoke in the dashboard (or at deploy) when confident
+npx cdk deploy --all -c membershipAuditEnforce=false
 ```
 
 ## Deployment Verification

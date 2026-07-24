@@ -2,8 +2,9 @@
  * MembershipAuditConstruct — SPEC-CONVERSATION-SECURITY Layer 6.
  *
  * Wires the near-real-time membership-audit consumer to a Chime -> Kinesis message stream.
- * Instantiated by BOTH analytics stacks (Athena and Aurora) behind `enableMembershipAudit`,
- * so the audit runs in whichever analytics mode is deployed. The Lambda is intentionally
+ * ALWAYS instantiated by BOTH analytics stacks (Athena and Aurora) - flagging over-classification
+ * memberships for review is a standing security guarantee, not opt-in (the only knob is
+ * `membershipAuditEnforce`: report-only vs auto-revoke). The Lambda is intentionally
  * NOT in a VPC: it only calls Chime, Cognito, SSM, and SES (all public AWS APIs), so it
  * needs no Aurora/VPC access even in Aurora mode.
  *

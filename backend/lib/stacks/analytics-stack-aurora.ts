@@ -114,8 +114,8 @@ export interface AnalyticsStackAuroraProps extends cdk.StackProps {
   /** A14 Scoped: role -> ceiling map (JSON) from the CognitoAuth stack. The handler resolves the
    *  caller's classification ceiling from their assumed-role ARN with no Cognito call. */
   classificationRoleCeilings?: string;
-  /** Layer 6 membership audit (SPEC-CONVERSATION-SECURITY). Opt-in; report-only unless enforce. */
-  enableMembershipAudit?: boolean;
+  /** Layer 6 membership audit (SPEC-CONVERSATION-SECURITY): ALWAYS deployed. `membershipAuditEnforce`
+   *  is the only knob - report-only (flag for review, default) vs auto-revoke. */
   membershipAuditEnforce?: boolean;
   membershipAuditAlertChannelArn?: string;
   senderEmail?: string;
@@ -504,10 +504,13 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
       encryptionKey: archiveKey,
     });
 
-    // Layer 6: near-real-time membership audit (SPEC-CONVERSATION-SECURITY). Opt-in.
-    // Non-VPC (only Chime/Cognito/SSM/SES), so it needs no Aurora access even here.
+    // Layer 6: near-real-time membership audit (SPEC-CONVERSATION-SECURITY). ALWAYS deployed - flagging
+    // over-classification members for review is a standing security guarantee, not opt-in. The only knob
+    // is enforcement mode (membershipAuditEnforce: report-only flag-for-review vs auto-revoke). Non-VPC
+    // (only Chime/Cognito/SSM/SES), so it needs no Aurora access even here. Requires the user pool (to
+    // resolve member tiers), so it is skipped only when no pool is wired.
     let membershipAudit: MembershipAuditConstruct | undefined;
-    if (props.enableMembershipAudit && props.userPoolArn) {
+    if (props.userPoolArn) {
       membershipAudit = new MembershipAuditConstruct(this, 'MembershipAudit', {
         stream: messageStream,
         appInstanceArn: props.appInstanceArn,

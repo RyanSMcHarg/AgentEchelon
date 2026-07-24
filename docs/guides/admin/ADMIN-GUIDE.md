@@ -36,7 +36,7 @@ The dashboard uses a two-level nav - a **section rail** across the top, and **su
 | **Assistants** | Profiles | Manage assistant profiles as **versioned, portable artifacts**: read a profile's resolved config (models, per-intent and classifier routing, tools, guardrail, timeouts), create a version, edit its models and tools, validate, activate, roll back, and export/import - no redeploy. Infrastructure deep links jump to the profile's live AWS resources; a link opens that assistant's Effectiveness. Every mutation is gated on the `manage-profiles` capability and audited. |
 | **Experiments** | - | A/B experiments: create/pause/resume/complete, compare model **or profile** variants, arm `/battle`. Per-variant results fold in **real human signals** - thumbs approval-rate + head-to-head `/battle` wins - *alongside* the automated evaluator score, never blended; the live battle scorecard reports per-round outcomes. |
 | **Users** | Users, Manage Users | Engagement (DAU, per-user leaderboard, signup/signin funnels by tier) and the approval workflow (approve/reject, set tier, enable/disable). |
-| **Security** | Membership Audit | Cross-classification membership-leak findings and per-finding revoke; opt-in (`enableMembershipAudit`). Returns an honest state when not deployed. |
+| **Security** | Membership Audit | Cross-classification membership-leak findings and per-finding revoke; always deployed (report-only by default, `-c membershipAuditEnforce=true` for auto-revoke). |
 
 ## Conversations - administration surface
 

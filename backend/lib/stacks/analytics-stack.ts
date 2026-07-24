@@ -49,8 +49,8 @@ export interface AnalyticsStackProps extends cdk.StackProps {
   /** A14 Scoped: role -> ceiling map (JSON) from the CognitoAuth stack; the handler resolves the
    *  caller's classification ceiling from their assumed-role ARN with no Cognito call. */
   classificationRoleCeilings?: string;
-  /** Layer 6 membership audit (SPEC-CONVERSATION-SECURITY). Opt-in; report-only unless enforce. */
-  enableMembershipAudit?: boolean;
+  /** Layer 6 membership audit (SPEC-CONVERSATION-SECURITY): ALWAYS deployed. `membershipAuditEnforce`
+   *  is the only knob - report-only (flag for review, default) vs auto-revoke. */
   membershipAuditEnforce?: boolean;
   membershipAuditAlertChannelArn?: string;
   senderEmail?: string;
@@ -84,8 +84,10 @@ export class AnalyticsStack extends cdk.Stack {
     this.kinesisStreamArn = messageStream.streamArn;
     this.kinesisStreamName = messageStream.streamName;
 
-    // Layer 6: near-real-time membership audit (SPEC-CONVERSATION-SECURITY). Opt-in.
-    if (props.enableMembershipAudit && props.userPool) {
+    // Layer 6: near-real-time membership audit (SPEC-CONVERSATION-SECURITY). ALWAYS deployed - flagging
+    // over-classification members for review is a standing security guarantee, not opt-in; the only knob
+    // is enforcement mode (membershipAuditEnforce). Requires the user pool (to resolve member tiers).
+    if (props.userPool) {
       new MembershipAuditConstruct(this, 'MembershipAudit', {
         stream: messageStream,
         appInstanceArn: props.appInstanceArn,
