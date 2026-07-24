@@ -204,6 +204,14 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
     // references the originating chat by link (the by-reference principle), NOT
     // the literal "yes". Either proves the confirm flow created + navigated.
     expect(confirm.text).toMatch(/NAVIGATE_CHANNEL|created a new conversation|started from a drift suggestion/i);
+
+    // REGRESSION (client-side redirect): the marker being SENT is not enough — assert the frontend
+    // actually NAVIGATED to the new channel. The active-conversation header title must change away from
+    // the origin ('E2E Drift Confirm') to the new drift channel. This is what the marker-only assertion
+    // above missed: the stale-closure bug in handleNavigateChannel left the user on the original
+    // conversation (the marker arrived, but navigation silently failed), so the title never changed.
+    await expect(page.locator('.conversation-header-title'))
+      .not.toHaveText('E2E Drift Confirm', { timeout: 20000 });
   });
 
   test('decline flow — "no" keeps the thread; no channel created, no NAVIGATE', async ({ page }) => {
