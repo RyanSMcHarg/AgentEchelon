@@ -1006,6 +1006,67 @@ export async function advanceTaskStateTo(args: {
 }
 
 /**
+ * BFS over legal transitions to the NEAREST terminal `success` state. Returns the ordered list of states
+ * to advance THROUGH (excluding `from`), or [] if `from` is already terminal or no success path exists.
+ * Shortest-path, so it prefers the direct completion edge (`generating -> completed`) over a detour
+ * through `revising`.
+ */
+function shortestPathToTerminalSuccess(machine: TaskStateMachine, from: string): string[] {
+  if (machine.states?.[from]?.terminal) return [];
+  const queue: string[][] = [[from]];
+  const seen = new Set<string>([from]);
+  while (queue.length) {
+    const path = queue.shift()!;
+    const cur = path[path.length - 1];
+    for (const next of machine.states?.[cur]?.transitions ?? []) {
+      if (seen.has(next)) continue;
+      seen.add(next);
+      const nextPath = [...path, next];
+      if (machine.states?.[next]?.terminal === 'success') return nextPath.slice(1); // drop `from`
+      queue.push(nextPath);
+    }
+  }
+  return [];
+}
+
+/**
+ * Deliver-on-generation completion for document-producing tasks (report_generation / data_extraction):
+ * when the assistant has PRODUCED the deliverable this turn, advance the task machine to its terminal
+ * success state by walking the shortest LEGAL transition path as a `system` transition. The model
+ * reliably writes the report/extraction but does NOT reliably emit `advance_task_state` on the delivery
+ * turn, so without this the machine sits in `generating` (or `formatting`) and the task never completes
+ * even though the file was delivered. Idempotent (no-op if already terminal or no machine), never takes
+ * an illegal edge (`advanceTaskStateTo` authorizes each hop), and stops on the first failed hop leaving
+ * the rest for a later turn. The CALLER decides WHEN this is appropriate (a real deliverable delivered in
+ * a delivery state, never a battle task); this function only performs the walk. Mutates `task.taskState`
+ * so the in-memory task stays current for the caller's downstream status derivation (`advanceTaskStateTo`
+ * persists the new state but does not mutate the passed object).
+ */
+export async function advanceDeliveredTaskToCompletion(args: {
+  task: Task;
+  messageId?: string;
+  machines?: Record<string, TaskStateMachine>;
+}): Promise<{ ok: boolean; to?: string; hops: number; error?: string }> {
+  const { task } = args;
+  const machines = args.machines ?? DEFAULT_TASK_STATE_MACHINES;
+  const machine = task.taskType ? machines[task.taskType] : undefined;
+  if (!machine || !task.taskState) return { ok: true, hops: 0 };
+  if (machine.states?.[task.taskState]?.terminal) return { ok: true, to: task.taskState, hops: 0 };
+  const path = shortestPathToTerminalSuccess(machine, task.taskState);
+  if (!path.length) return { ok: true, hops: 0 }; // defensive: no success path from here
+  let hops = 0;
+  for (const next of path) {
+    const r = await advanceTaskStateTo({
+      task, toState: next, by: 'system', reason: 'deliverable produced', messageId: args.messageId, machines,
+    });
+    if (!r.ok) return { ok: false, to: task.taskState, hops, error: r.error };
+    task.taskState = r.to; // keep the in-memory task current for the caller
+    hops++;
+  }
+  return { ok: true, to: task.taskState, hops };
+}
+
+/**
  * Turns a machine-backed task may sit in one state before the runtime flags it stalled
  * (SPEC-TASK-STATE-TRANSITIONS §7). Env-overridable (`TASK_STALL_TURNS`), default 6, floor 1. The
  * runtime NEVER force-advances on a stall — this only surfaces, on the dashboard, tasks the model is

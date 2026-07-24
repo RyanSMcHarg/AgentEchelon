@@ -76,6 +76,7 @@ import {
   buildTaskContextForPrompt,
   buildCrossChannelTasksHint,
   getActiveTasksForUser,
+  advanceDeliveredTaskToCompletion,
   type Task,
 } from './lib/task-tracking.js';
 import { resolveModelForIntent } from './lib/model-resolver.js';
@@ -1053,6 +1054,11 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // generation-out turn already attached an image (attachment is shared; never clobber it).
     if (!attachment && process.env.ATTACHMENTS_BUCKET) {
       let generate;
+      // Deliver-on-generation completion: set when a report/extraction task delivers its document while
+      // in a delivery state, so the task machine is advanced to `completed` below. The model does not
+      // reliably emit advance_task_state on the delivery turn, so without this the task hangs in
+      // `generating` even though the report was delivered (the reported bug).
+      let completeOnDelivery = false;
       // Document-producing tasks and the machine states on which they DELIVER a file. Keyed on
       // taskType so report_generation and data_extraction both hand back a real downloadable
       // document; guided_troubleshooting / work-item tasks are interactive and never attach.
@@ -1077,6 +1083,11 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
           (startState !== undefined && deliveryStates.includes(startState)) ||
           (taskContext?.transitions ?? []).some((t) => deliveryStates.includes(t.to));
         generate = isDeliverableDocument(response) || (inDeliveryState && response.trim().length >= 400);
+        // Complete the task on delivery ONLY when it delivered in a DELIVERY state (generating/revising
+        // for reports; extracting/validating/formatting for extractions) — never from drafting_outline/
+        // collecting_requirements (an outline-for-approval must not auto-complete), never for a battle
+        // task (own round progression), and never on a clarifying turn (generate is false there).
+        completeOnDelivery = generate && inDeliveryState && !event.battleContext;
       } else {
         // Ad-hoc (no report task): the user explicitly asked to save THIS response as a document.
         generate = isDocumentRequest(event.userMessage || '');
@@ -1100,6 +1111,28 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
           console.log('[AssistantAsyncProcessor] Document generated:', attachment.fileKey);
         } catch (docError) {
           console.error('[AssistantAsyncProcessor] Document generation failed:', docError);
+        }
+      }
+
+      // Deliver-on-generation: advance the task machine to its terminal `completed` state now that the
+      // report/extraction was delivered in a delivery state. Walks the LEGAL transition path as a system
+      // transition (finalize then derives status=completed from the terminal machine state). Runs even if
+      // the S3 upload above failed — the deliverable is in the reply itself, so the task is still done.
+      // Gated by completeOnDelivery: a clarifying/outline turn never reaches here, and battle tasks are
+      // excluded. Best-effort: a failure here never blocks the reply.
+      if (completeOnDelivery && event.taskId && taskContext?.task) {
+        try {
+          const adv = await advanceDeliveredTaskToCompletion({
+            task: taskContext.task,
+            messageId: messageId ?? undefined,
+          });
+          if (adv.ok && adv.hops > 0) {
+            console.log(`[AssistantAsyncProcessor] Task ${event.taskId} auto-completed on delivery (-> ${adv.to}, ${adv.hops} hop(s))`);
+          } else if (!adv.ok) {
+            console.warn(`[AssistantAsyncProcessor] Task ${event.taskId} auto-complete stopped at ${adv.to}: ${adv.error}`);
+          }
+        } catch (advErr) {
+          console.error('[AssistantAsyncProcessor] auto-complete on delivery failed (non-fatal):', advErr);
         }
       }
     }
