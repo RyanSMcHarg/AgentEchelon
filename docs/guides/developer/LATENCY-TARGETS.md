@@ -185,4 +185,4 @@ It brackets a Chime-stamped start against a server-clock entry with no shared cl
 - [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md) section 5 - the placeholder/update delivery pattern that makes TTFF the perceived metric.
 - [`SPEC-ADMIN-CONSOLE.md`](../../specs/interface/admin/SPEC-ADMIN-CONSOLE.md) - the Latency tab and the metric-target registry.
 - [`SPEC-FRONTEND-OBSERVABILITY.md`](../../specs/ops/SPEC-FRONTEND-OBSERVABILITY.md) - client-side web-vitals (the browser-perceived timing, gap G5).
-- [`SPEC-MESSAGE-METADATA-CODEBOOK.md`](../../specs/communication/SPEC-MESSAGE-METADATA-CODEBOOK.md) - the Metadata field the latency deltas ride.
+- [`SPEC-MESSAGE-METADATA-CODEBOOK.md`](../../specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md) - the Metadata field the latency deltas ride.

@@ -4,7 +4,7 @@
 
 **Problem and who it's for:** When people carry on work across several conversations, each multi-step task should stay pinned to the conversation where it lives - never accidentally resumed in another - while the assistant still knows the user has work open elsewhere. This is for the end user (whose tasks stay where they belong) and the platform developer, who would otherwise hand-roll cross-conversation task scoping on top of the messaging layer. It scopes task resume to a matching `channelArn` while surfacing out-of-channel tasks to the assistant only as a prompt hint, never an auto-resume.
 
-**Site section:** Communication layer (task continuity across conversations; placement - owner call).
+**Site section:** Interaction layer - conversation substrate (task continuity across conversations; placement - owner call).
 
 
 **Audience:** Anyone working on agent behavior, task tracking, or the asynchronous-fulfillment pipeline.

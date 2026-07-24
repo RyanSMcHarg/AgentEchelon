@@ -4,7 +4,7 @@
 
 **Problem and who it's for:** An assistant often needs to reach someone who is off the app - handing off a task to an assignee, say - on whatever channel actually reaches them (email, SMS, voice), and have their reply land back in the same conversation. This is for the end user reached on their preferred channel and the platform developer who would otherwise stitch and maintain a separate integration per transport, or bolt on a notifications product that lives in its own silo. It treats the conversation channel as the hub: a channel message fans out to members over the right transport (email today; SMS, voice/PSTN next), and - once the inbound loop lands - an HMAC-signed reply token routes their reply back into the same channel, so the on-channel assistant handles it transport-agnostically.
 
-**Site section:** Communication layer.
+**Site section:** Interaction layer - conversation substrate.
 
 > A **platform capability**: a notification is a MESSAGE in a conversation channel; the bridge delivers it to members over the right transport (email today; SMS, voice/PSTN, push next) and - once the inbound loop lands - routes their **reply back into the same channel**, so the on-channel assistant handles it with no per-transport code. First consumer: a task hand-off - the assistant posts the assignment as a channel message; the bridge reaches an offline assignee by email (and, when inbound ships, loops their reply back to the assistant).
 

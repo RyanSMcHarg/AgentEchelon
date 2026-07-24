@@ -21,7 +21,7 @@ This spec pairs with:
 
 - [`SPEC-WELCOME-AND-CONTEXT.md`](../../assistant-config/SPEC-WELCOME-AND-CONTEXT.md): the welcome composition pattern (static, targeted, "only you can see this message").
 - [`GUIDE-ASSISTANT-CONTEXT.md`](../../../../guides/developer/GUIDE-ASSISTANT-CONTEXT.md): where system-prompt guidance and welcome copy live.
-- [`SPEC-NOTIFICATION-BRIDGE.md`](../../../communication/SPEC-NOTIFICATION-BRIDGE.md): the email mirror of the private welcome (`metadata.notify`, `notifyTargets`).
+- [`SPEC-NOTIFICATION-BRIDGE.md`](../../../interaction/conversation/SPEC-NOTIFICATION-BRIDGE.md): the email mirror of the private welcome (`metadata.notify`, `notifyTargets`).
 - [`SPEC-CONVERSATION-SECURITY.md`](SPEC-CONVERSATION-SECURITY.md) Layer 6 (membership audit): the tier/eligibility checks reused here PRE-add rather than post-hoc.
 
 ## Use cases and future extensions

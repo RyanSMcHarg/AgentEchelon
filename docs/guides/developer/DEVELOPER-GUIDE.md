@@ -34,6 +34,6 @@ The precise behavior and boundaries of each subsystem live in the specs, grouped
 Common starting points:
 
 - Identity and access: [`../../specs/interaction/identity-access/`](../../specs/interaction/identity-access/) (credential exchange, conversation security, the access model with a worked example).
-- Conversation and messaging: [`../../specs/communication/`](../../specs/communication/) (archive and membership, message metadata, the notification bridge) and [`../../specs/interaction/conversation-config/`](../../specs/interaction/conversation-config/) (conversation types).
+- Conversation and messaging: [`../../specs/interaction/conversation/`](../../specs/interaction/conversation/) (archive and membership, message metadata, the notification bridge) and [`../../specs/interaction/conversation-config/`](../../specs/interaction/conversation-config/) (conversation types).
 - Assistant and context: [`../../specs/interaction/assistant-config/`](../../specs/interaction/assistant-config/) (assistant config, intent packs, per-profile ownership).
 - Analytics and evaluation: [`../../specs/ops/`](../../specs/ops/) (Aurora mode, cost sleep) and [`../../specs/capabilities/SPEC-DRIFT-CONVERGENCE.md`](../../specs/capabilities/SPEC-DRIFT-CONVERGENCE.md) (drift).

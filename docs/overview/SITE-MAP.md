@@ -6,7 +6,7 @@ Every surface a participant actually touches, mapped to the spec that defines it
 
 The **interface** is thin. A client renders, holds a bearer-pinned identity, and *calls* the substrate; it does not run messaging. So a chat surface below names the **layer that backs it**, not work the client does. Two facts drive the whole map:
 
-- **Messaging goes straight to Amazon Chime SDK Messaging, not through the client.** The chat client sends with `SendChannelMessage` and receives over a WebSocket directly against Amazon Chime SDK Messaging (communication layer), on bearer-pinned STS creds. A message is then *processed* server-side (channel-flow hook, then the assistant pipeline). The client never brokers, stores, or fans out messages.
+- **Messaging goes straight to Amazon Chime SDK Messaging, not through the client.** The chat client sends with `SendChannelMessage` and receives over a WebSocket (the communication-layer transport) directly against Amazon Chime SDK Messaging - the conversation substrate the interaction-layer engine composes over - on bearer-pinned STS creds. A message is then *processed* server-side (channel-flow hook, then the assistant pipeline). The client never brokers, stores, or fans out messages.
 - **Everything else is a REST call to an interaction-layer action.** Create / share / archive a conversation, add an assistant, moderate, read analytics: each is a Lambda behind API Gateway, gated in IAM per actor. The client only invokes them.
 
 ## Interface layer - the two thin clients
@@ -42,16 +42,16 @@ The client itself: [`interface/admin/SPEC-ADMIN-CONSOLE`](../specs/interface/adm
 | Users | user management, provisioning, escalation | `identity-access/core/SPEC-ADD-USER-ESCALATION` |
 | Security | membership audit, access audit, who-could-act | `identity-access/core/SPEC-CONVERSATION-SECURITY`, `interaction/auditing/SPEC-ACCESS-AND-CONTROLS-AUDITING` |
 
-## Communication layer - the substrate that moves messages and keeps context - `communication`
+## Communication layer - the connectivity that wires each client to the engine - `communication`
 
-What actually carries and records a message; the clients above are its consumers.
+Transport, not messaging logic: how each client reaches the engine. A client holds a bearer-pinned identity and connects over one of these; adding a channel never changes the engine. This layer is transport and has no dedicated spec directory; the conversation *substrate* it was once conflated with now lives in the interaction layer, below.
 
-| Concern | Spec |
-|---|---|
-| Durable conversation & membership (the memory is the channel) | `communication/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP` |
-| Per-message metadata pipeline | `communication/SPEC-MESSAGE-METADATA-CODEBOOK` |
-| Transport bridge (email / SMS / voice out) | `communication/SPEC-NOTIFICATION-BRIDGE` |
-| Cross-channel task carry | `communication/CROSS-CHANNEL-TASKS` |
+| Channel | Status | How it reaches the engine |
+|---|---|---|
+| WebSocket + REST (messaging) | Built | The chat client receives over a WebSocket directly against Amazon Chime SDK Messaging and sends with `SendChannelMessage`; every other action is a REST call to an interaction-layer Lambda, gated in IAM per actor. |
+| WebRTC (real-time audio/video) | Roadmap | Seamed; the connectivity pattern is proven on the predecessor site's communication widget. |
+| Email (outbound) | Partial | Outbound hand-off built; inbound next. |
+| Voice / phone (PSTN) | Roadmap | Pluggable SIP trunk (the deployer's provider); see `applications/DESIGN-ASSISTANT-MEETINGS` (Voice). |
 
 ## Interaction layer - who may act, as whom, at what capability - `interaction` (5 pillars)
 
@@ -65,6 +65,8 @@ Composition root: `interaction/conversation-config/SPEC-CONVERSATION-TYPES`. Cro
 | Conversation Configuration | core | `conversation-config/SPEC-CONVERSATION-TYPES` (the composition root) |
 | Connectors | core | `connectors/SPEC-CONNECTORS` (the connector contract - integrate, don't migrate; governed MCP seam), declared per experience in `SPEC-CONVERSATION-TYPES` section 6 |
 | Auditing (the access record) | core + admin | `auditing/`: `SPEC-ACCESS-AND-CONTROLS-AUDITING` |
+
+**Conversation substrate** (`interaction/conversation/`) - the Amazon Chime SDK Messaging fabric the engine composes over, distinct from the five config pillars: durable conversation & membership - the memory is the channel (`SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP`), the per-message metadata pipeline (`SPEC-MESSAGE-METADATA-CODEBOOK`), the notification bridge for email / SMS / voice out (`SPEC-NOTIFICATION-BRIDGE`), and cross-channel task carry (`CROSS-CHANNEL-TASKS`).
 
 ## Core platform - ops (cross-cutting; not a pillar) - `ops`
 

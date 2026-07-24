@@ -227,7 +227,7 @@ The boundary is deliberate and crisp: **this doc is the meetings APPLICATION; th
 |---|---|---|
 | Multi-agent orchestration (`capabilities/DESIGN-MULTI-AGENT-ORCHESTRATION.md`) | Spawning one sub-agent per attendee, each sub-agent's identity (credential-exchange, classification-gated), the parallel fan-out, retries, and lifecycle/teardown. | Which attendees get a greeter, and the per-attendee briefing text each greeter delivers (the `greeters[]` it passes to `onboard_attendees`). |
 | Credential-exchange (`interaction/identity-access/core/SPEC-CREDENTIAL-EXCHANGE.md`) | Vending each greeter's short-lived, bearer-pinned credentials. | Nothing - it never handles a sub-agent's credentials. |
-| Notification bridge (`communication/SPEC-NOTIFICATION-BRIDGE.md`) | Fanning a `metadata.notify` message out to email. | Composing the follow-up and targeting the owner; it emits the marker, not transport code. |
+| Notification bridge (`interaction/conversation/SPEC-NOTIFICATION-BRIDGE.md`) | Fanning a `metadata.notify` message out to email. | Composing the follow-up and targeting the owner; it emits the marker, not transport code. |
 | Add-user escalation allowlist (`interaction/identity-access/core/SPEC-ADD-USER-ESCALATION.md`) | Resolving an allowlist KEY to a real identity at the apply endpoint. | Selecting the KEY; it never emits an ARN, sub, email, or name as an identity. |
 | Generic `action_item` task lifecycle (`interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md`) | The `gather -> present options -> awaiting_completion -> completed` state machine, hand-off notices, and cross-channel continuity. | Supplying the `schedule_meeting` / `follow_up` intents that route onto it. |
 

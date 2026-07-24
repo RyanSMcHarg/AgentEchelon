@@ -198,22 +198,22 @@
     {
       "title": "Cross-Channel Task Continuity",
       "summary": "**Status:** Implemented.",
-      "path": "docs/specs/communication/CROSS-CHANNEL-TASKS.md"
+      "path": "docs/specs/interaction/conversation/CROSS-CHANNEL-TASKS.md"
     },
     {
       "title": "SPEC: Conversation Archive and Member Removal (moderator)",
       "summary": "**Status:** Implemented.",
-      "path": "docs/specs/communication/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md"
+      "path": "docs/specs/interaction/conversation/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md"
     },
     {
       "title": "SPEC: Compact message metadata - a coded codebook + out-of-band lookup",
       "summary": "**Status:** Partial (out-of-band lookup and the cap-shedding backstop ship; the coded-state codebook is design).",
-      "path": "docs/specs/communication/SPEC-MESSAGE-METADATA-CODEBOOK.md"
+      "path": "docs/specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md"
     },
     {
       "title": "SPEC: Conversation ↔ transport notification bridge (email now; SMS + voice/PSTN next)",
       "summary": "**Status:** Implemented (outbound email hand-off); inbound reply loop Planned.",
-      "path": "docs/specs/communication/SPEC-NOTIFICATION-BRIDGE.md"
+      "path": "docs/specs/interaction/conversation/SPEC-NOTIFICATION-BRIDGE.md"
     },
     {
       "title": "Assistant Configuration - what the assistant *is*, per experience",

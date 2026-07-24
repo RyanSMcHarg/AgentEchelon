@@ -6,7 +6,7 @@ The one-line version:
 
 > **Tags gate access. Channel metadata is public to members. User metadata does not exist. Sensitive per-channel data lives in Aurora, read server-side only.**
 
-Related: [SPEC-CONVERSATION-SECURITY](../../specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md), [TAGGING (cost tags)](../admin/TAGGING.md), [SPEC-MESSAGE-METADATA-CODEBOOK](../../specs/communication/SPEC-MESSAGE-METADATA-CODEBOOK.md). The channel-metadata relocation design (`SPEC-CHANNEL-METADATA-MINIMIZATION`) is tracked internally until it ships.
+Related: [SPEC-CONVERSATION-SECURITY](../../specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md), [TAGGING (cost tags)](../admin/TAGGING.md), [SPEC-MESSAGE-METADATA-CODEBOOK](../../specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md). The channel-metadata relocation design (`SPEC-CHANNEL-METADATA-MINIMIZATION`) is tracked internally until it ships.
 
 ---
 

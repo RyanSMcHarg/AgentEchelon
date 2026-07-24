@@ -1,6 +1,6 @@
 # ADR-017: Conversation archive mechanism (mark vs. delete vs. de-member)
 
-> **Status:** Accepted - **Option 1 (mark archived + read-only via tag)**, composed with the conversation type's Amazon Chime SDK expiration TTL. Governs `docs/specs/communication/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md`. Records the choice of how a moderator "archives" a conversation so members lose the ability to write and the conversation leaves their active list, while the durable archive persists and the channel eventually hard-expires.
+> **Status:** Accepted - **Option 1 (mark archived + read-only via tag)**, composed with the conversation type's Amazon Chime SDK expiration TTL. Governs `docs/specs/interaction/conversation/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md`. Records the choice of how a moderator "archives" a conversation so members lose the ability to write and the conversation leaves their active list, while the durable archive persists and the channel eventually hard-expires.
 
 ## Context
 

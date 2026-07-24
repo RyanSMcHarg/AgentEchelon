@@ -86,4 +86,4 @@ Personas are defined once in [`../../overview/PERSONAS.md`](../../overview/PERSO
 - Operator guide: `docs/guides/admin/GUIDE-AB-TESTING-AND-BATTLES.md`
 - Drift interaction: `docs/specs/capabilities/SPEC-DRIFT-CONVERGENCE.md`
 - Image providers: `docs/guides/admin/IMAGE-GEN-PROVIDERS.md`
-- Per-step metadata: `docs/specs/communication/SPEC-MESSAGE-METADATA-CODEBOOK.md`
+- Per-step metadata: `docs/specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md`

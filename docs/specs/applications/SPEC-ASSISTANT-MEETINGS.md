@@ -88,5 +88,5 @@ The universal `greeting`, `acknowledgment`, and `general` intents are always pre
 - Platform primitive it builds on: `capabilities/DESIGN-MULTI-AGENT-ORCHESTRATION.md`
 - Assistant configuration pillar: `interaction/assistant-config/SPEC-ASSISTANT-CONFIG.md`
 - Intent taxonomy mechanism: `interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md`
-- Task hand-off to a human (follow-up email path): `communication/SPEC-NOTIFICATION-BRIDGE.md`
+- Task hand-off to a human (follow-up email path): `interaction/conversation/SPEC-NOTIFICATION-BRIDGE.md`
 - Personas: `overview/PERSONAS.md`
