@@ -252,25 +252,22 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   // navigation goes through a stable ref.
   const selectConversationRef = useRef<((id: string) => Promise<void>) | null>(null);
 
-  // Drift-confirm redirect: when a bot message arrives carrying a
-  // NAVIGATE_CHANNEL marker, switch the active conversation. The new channel
-  // may not be in our local `conversations` list yet (membership-change
-  // event lags slightly); retry briefly to give that handler time to fire.
+  // Drift-confirm redirect: when a bot message arrives carrying a NAVIGATE_CHANNEL marker, switch to the
+  // new channel. It may not be in our local `conversations` list yet (the membership-change event lags),
+  // so DON'T poll the list: the previous retry loop closed over a STALE `conversations` snapshot (captured
+  // when the marker arrived) and never saw the channel land, so navigation silently failed ("target never
+  // appeared in local list"). Instead resolve it DIRECTLY — `selectConversation` fetches a not-yet-listed
+  // channel via DescribeChannel (the deep-link path) and folds it in. The conversation id is the ARN's
+  // last segment (chimeService builds it as `ChannelArn.split('/').pop()`), and the channel already exists
+  // server-side by the time this marker arrives (the bot creates it and adds the user before replying).
   const handleNavigateChannel = useCallback((targetArn: string) => {
-    const attemptNavigate = (attempt: number) => {
-      const target = conversations.find((c) => c.conversationArn === targetArn);
-      if (target) {
-        void selectConversationRef.current?.(target.id);
-        return;
-      }
-      if (attempt < 4) {
-        setTimeout(() => attemptNavigate(attempt + 1), 500);
-      } else {
-        console.warn('[ConversationProvider] NAVIGATE_CHANNEL target never appeared in local list:', targetArn);
-      }
-    };
-    attemptNavigate(0);
-  }, [conversations]);
+    const id = targetArn.split('/').pop();
+    if (!id) {
+      console.warn('[ConversationProvider] NAVIGATE_CHANNEL: could not derive a conversation id from', targetArn);
+      return;
+    }
+    void selectConversationRef.current?.(id);
+  }, []);
 
   // WebSocket callbacks for the active conversation
   const handleMessageCreate = useCallback((msg: Message) => {
