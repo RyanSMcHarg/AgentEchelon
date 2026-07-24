@@ -359,6 +359,10 @@ export class CognitoAuthStack extends cdk.Stack {
       || this.node.tryGetContext('enableAdminApp') === 'true';
     const useDedicatedAdminClient = enableAdminApp
       && this.node.tryGetContext('adminAppClient') !== 'shared';
+    // Held for the Identity Pool's trusted-provider list below: a dedicated admin app-client must ALSO
+    // be a trusted Identity-Pool provider, or the admin console (which signs in with that client) cannot
+    // obtain Identity-Pool credentials to SigV4-sign admin reads when adminIamEnforcement is on.
+    let adminClientForIdp: cognito.UserPoolClient | undefined;
     if (useDedicatedAdminClient) {
       const adminAppUrl = adminOrigin(this);
       const adminOAuthOrigins = [adminAppUrl].filter((o) => o.startsWith('https://'));
@@ -372,6 +376,7 @@ export class CognitoAuthStack extends cdk.Stack {
           logoutUrls: ['http://localhost:5174/', ...adminOAuthOrigins.map((o) => `${o}/`)],
         },
       });
+      adminClientForIdp = adminClient;
       new cdk.CfnOutput(this, 'AdminUserPoolClientId', {
         value: adminClient.userPoolClientId,
         description: 'Dedicated admin console app-client id — VITE_ADMIN_CLIENT_ID (admin package .env)',
@@ -388,6 +393,12 @@ export class CognitoAuthStack extends cdk.Stack {
           clientId: this.userPoolClient.userPoolClientId,
           providerName: this.userPool.userPoolProviderName,
         },
+        // The dedicated admin app-client, when present, must also be trusted here so the admin console
+        // can vend Identity-Pool creds (both clients are on the SAME user pool).
+        ...(adminClientForIdp ? [{
+          clientId: adminClientForIdp.userPoolClientId,
+          providerName: this.userPool.userPoolProviderName,
+        }] : []),
       ],
     });
 
@@ -467,17 +478,30 @@ export class CognitoAuthStack extends cdk.Stack {
     // Token-based role selection: the Identity Pool hands each authenticated
     // user the role from their group's roleArn; ambiguous/absent → the default
     // `authenticated` role (basic, most-restrictive).
+    const roleMappingProviderBase = `cognito-idp.${this.region}.amazonaws.com/${this.userPool.userPoolId}`;
     new cognito.CfnIdentityPoolRoleAttachment(this, 'IdentityPoolRoleAttachment', {
       identityPoolId: this.identityPool.ref,
       roles: {
         authenticated: this.authenticatedRole.roleArn,
       },
+      // Token-based role selection PER app-client. The admin console signs in with the dedicated admin
+      // client, so that client needs its OWN mapping too — without it the admin's Identity-Pool creds
+      // fall to the default (basic) `authenticated` role, and the AWS_IAM-authorized admin analytics API
+      // (execute-api) then 403s. Both clients use the same Token mapping (group -> role via cognito:roles),
+      // so an `admins`-group user gets the admin role whichever client issued the token.
       roleMappings: {
         cognitoProvider: {
           type: 'Token',
           ambiguousRoleResolution: 'AuthenticatedRole',
-          identityProvider: `cognito-idp.${this.region}.amazonaws.com/${this.userPool.userPoolId}:${this.userPoolClient.userPoolClientId}`,
+          identityProvider: `${roleMappingProviderBase}:${this.userPoolClient.userPoolClientId}`,
         },
+        ...(adminClientForIdp ? {
+          adminCognitoProvider: {
+            type: 'Token',
+            ambiguousRoleResolution: 'AuthenticatedRole',
+            identityProvider: `${roleMappingProviderBase}:${adminClientForIdp.userPoolClientId}`,
+          },
+        } : {}),
       },
     });
 
