@@ -39,6 +39,11 @@ export interface ChannelCallbacks {
  *  without needing per-channel subscriptions. */
 export interface GlobalMessageListener {
   onMessageInAnyChannel?: (channelArn: string, senderArn: string) => void;
+  /** Fires on CREATE_CHANNEL_MEMBERSHIP in ANY channel — including one we are NOT yet subscribed to
+   *  (a channel the user was just added to, e.g. a drift-spawned conversation). The per-channel
+   *  subscription lookup below bails for such channels, so without this global hook a newly-joined
+   *  channel never surfaces in the sidebar until a reload. */
+  onAddedToChannel?: (channelArn: string) => void;
 }
 
 interface MessagingContextType {
@@ -230,6 +235,17 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
               globalListenerRef.current?.onMessageInAnyChannel?.(channelArn, senderArn);
             } catch (err) {
               console.warn('Global message listener threw:', err);
+            }
+          }
+
+          // Global membership hook — fires BEFORE the per-channel bail below, so a membership in a
+          // channel we are not yet subscribed to (a channel we were just added to, e.g. a drift-spawned
+          // conversation) still reaches the app and can be surfaced in the sidebar.
+          if (eventType === 'CREATE_CHANNEL_MEMBERSHIP') {
+            try {
+              globalListenerRef.current?.onAddedToChannel?.(channelArn);
+            } catch (err) {
+              console.warn('Global membership listener threw:', err);
             }
           }
 

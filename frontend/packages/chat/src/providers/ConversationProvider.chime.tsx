@@ -241,6 +241,19 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
           },
         });
       },
+      onAddedToChannel: (channelArn) => {
+        // A CREATE_CHANNEL_MEMBERSHIP arrived for a channel we don't track yet -> we were just added
+        // (e.g. a drift-spawned conversation, or being added to a shared room). Surface it in the
+        // sidebar so it appears - and can show its unread dot - even if we never navigate to it. The
+        // functional update dedupes against a concurrent add; skip the fetch if we already have it.
+        if (conversations.some((c) => c.conversationArn === channelArn)) return;
+        void chimeService.getConversation(channelArn)
+          .then((fetched) => {
+            if (!fetched) return;
+            setConversations((prev) => (prev.some((c) => c.id === fetched.id) ? prev : [fetched, ...prev]));
+          })
+          .catch((err) => console.warn('[ConversationProvider] could not surface newly-joined channel:', err));
+      },
     });
 
     return () => setGlobalListener(null);
