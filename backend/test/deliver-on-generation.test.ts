@@ -47,6 +47,17 @@ describe('advanceDeliveredTaskToCompletion — a delivered report/extraction rea
     expect(shouldMarkTaskCompleted(t.taskType, t.taskState)).toBe(true);
   });
 
+  it('report_generation delivered from `drafting_outline` walks all the way to `completed` (the live-stuck case)', async () => {
+    // The model reliably delivers the report but often never advances past drafting_outline, so this is
+    // the state a delivered report is actually found in (verified live). The walk must reach completed.
+    const t = task({ taskState: 'drafting_outline' });
+    const r = await advanceDeliveredTaskToCompletion({ task: t });
+    expect(r.ok).toBe(true);
+    expect(r.hops).toBe(2); // drafting_outline -> generating -> completed
+    expect(t.taskState).toBe('completed');
+    expect(shouldMarkTaskCompleted(t.taskType, t.taskState)).toBe(true);
+  });
+
   it('report_generation in `revising` advances to `completed` (a delivered revision closes the task)', async () => {
     const t = task({ taskState: 'revising' });
     const r = await advanceDeliveredTaskToCompletion({ task: t });

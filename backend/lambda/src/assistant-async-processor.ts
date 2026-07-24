@@ -1083,11 +1083,15 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
           (startState !== undefined && deliveryStates.includes(startState)) ||
           (taskContext?.transitions ?? []).some((t) => deliveryStates.includes(t.to));
         generate = isDeliverableDocument(response) || (inDeliveryState && response.trim().length >= 400);
-        // Complete the task on delivery ONLY when it delivered in a DELIVERY state (generating/revising
-        // for reports; extracting/validating/formatting for extractions) — never from drafting_outline/
-        // collecting_requirements (an outline-for-approval must not auto-complete), never for a battle
-        // task (own round progression), and never on a clarifying turn (generate is false there).
-        completeOnDelivery = generate && inDeliveryState && !event.battleContext;
+        // Complete the task whenever a deliverable file is produced (`generate`), REGARDLESS of the machine
+        // state. The model reliably DELIVERS the report/extraction but does NOT reliably advance the machine
+        // to a delivery state first — it often delivers straight from `drafting_outline` (verified live: a
+        // delivered report was left stuck there). advanceDeliveredTaskToCompletion walks the LEGAL path to
+        // `completed` from wherever the machine is, so an in-delivery-state gate is both unnecessary and the
+        // thing that left the task hanging. Excludes battle tasks (their own round progression); a
+        // clarifying turn never sets `generate` (fails isDeliverableDocument + not in a delivery state), so
+        // it still never completes early.
+        completeOnDelivery = generate && !event.battleContext;
       } else {
         // Ad-hoc (no report task): the user explicitly asked to save THIS response as a document.
         generate = isDocumentRequest(event.userMessage || '');
