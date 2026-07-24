@@ -1082,16 +1082,19 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
         const inDeliveryState =
           (startState !== undefined && deliveryStates.includes(startState)) ||
           (taskContext?.transitions ?? []).some((t) => deliveryStates.includes(t.to));
-        generate = isDeliverableDocument(response) || (inDeliveryState && response.trim().length >= 400);
-        // Complete the task whenever a deliverable file is produced (`generate`), REGARDLESS of the machine
-        // state. The model reliably DELIVERS the report/extraction but does NOT reliably advance the machine
-        // to a delivery state first — it often delivers straight from `drafting_outline` (verified live: a
-        // delivered report was left stuck there). advanceDeliveredTaskToCompletion walks the LEGAL path to
-        // `completed` from wherever the machine is, so an in-delivery-state gate is both unnecessary and the
-        // thing that left the task hanging. Excludes battle tasks (their own round progression); a
-        // clarifying turn never sets `generate` (fails isDeliverableDocument + not in a delivery state), so
-        // it still never completes early.
-        completeOnDelivery = generate && !event.battleContext;
+        const deliveredDocument = isDeliverableDocument(response);
+        generate = deliveredDocument || (inDeliveryState && response.trim().length >= 400);
+        // Complete the task when a REAL deliverable was produced, REGARDLESS of the machine state. Gate on
+        // isDeliverableDocument (substantial + structured), NOT on `generate`: the model reliably DELIVERS
+        // the report/extraction but does NOT reliably advance the machine to a delivery state first — it
+        // often delivers straight from `drafting_outline` (verified live: a delivered report was left stuck
+        // there), so advanceDeliveredTaskToCompletion walks the LEGAL path to `completed` from wherever the
+        // machine is. We deliberately do NOT complete on `generate`'s length fallback (inDeliveryState &&
+        // len>=400): that branch ALSO fires for a long NON-deliverable reply (a status update or clarifying
+        // question emitted while already in a delivery state), which would wrongly close the task. On that
+        // fallback we still upload the doc but leave the task OPEN (recoverable next turn) rather than
+        // complete it. Battle tasks are excluded (their own round progression).
+        completeOnDelivery = deliveredDocument && !event.battleContext;
       } else {
         // Ad-hoc (no report task): the user explicitly asked to save THIS response as a document.
         generate = isDocumentRequest(event.userMessage || '');

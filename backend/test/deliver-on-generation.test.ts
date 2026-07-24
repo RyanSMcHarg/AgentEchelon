@@ -19,6 +19,7 @@ import {
   type Task,
 } from '../lambda/src/lib/task-tracking.js';
 import { DeliveryOption } from '../lambda/src/lib/delivery-options.js';
+import { isDeliverableDocument } from '../lambda/src/lib/async-processor-core.js';
 
 const task = (over: Partial<Task> = {}): Task => ({
   taskId: 't1',
@@ -101,5 +102,36 @@ describe('advanceDeliveredTaskToCompletion — a delivered report/extraction rea
     const r = await advanceDeliveredTaskToCompletion({ task: t });
     expect(r.hops).toBe(0);
     expect(t.taskState).toBeUndefined();
+  });
+});
+
+describe('completeOnDelivery gate — only a REAL deliverable completes the task, not a long non-deliverable', () => {
+  // The async processor sets `completeOnDelivery = isDeliverableDocument(response) && !battle` — deliberately
+  // NOT on `generate`, whose length fallback (inDeliveryState && len>=400) also fires for a long status or
+  // clarifying reply emitted WHILE already in a delivery state. These lock in that boundary: such a reply
+  // must upload its doc but leave the task OPEN, never walk it to `completed`.
+
+  it('a long plain-prose clarifying reply (no structure) is NOT a deliverable — task stays open', () => {
+    // ~900 chars: would pass generate's len>=400 fallback, but has no heading/table/list.
+    const longProse = (
+      'I am still pulling the figures together and wanted to confirm one thing before I finalize. '
+      + 'The revenue you asked about spans three regions and I need to know whether to break it out by '
+      + 'month or just report quarterly totals, and whether to include the pipeline forecast alongside. '
+    ).repeat(3);
+    expect(longProse.length).toBeGreaterThanOrEqual(500); // clears generate's length fallback
+    expect(isDeliverableDocument(longProse)).toBe(false);  // but is NOT completion-worthy
+  });
+
+  it('a substantial, STRUCTURED report (markdown heading) IS a deliverable — task completes', () => {
+    const report = '# Q3 Revenue Report\n\n## Summary\n\n'
+      + 'Revenue rose across all three regions this quarter versus the prior period. '.repeat(10);
+    expect(report.length).toBeGreaterThanOrEqual(500);
+    expect(isDeliverableDocument(report)).toBe(true);
+  });
+
+  it('length alone never qualifies: 600 chars of unstructured text is not a deliverable', () => {
+    const bulk = 'the quarter went well and the numbers are strong '.repeat(13); // >600 chars, no structure
+    expect(bulk.length).toBeGreaterThan(500);
+    expect(isDeliverableDocument(bulk)).toBe(false);
   });
 });
