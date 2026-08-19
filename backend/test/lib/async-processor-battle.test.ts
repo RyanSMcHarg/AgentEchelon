@@ -116,7 +116,7 @@ describe('isNoRebuttal', () => {
 describe('NO_REBUTTAL placeholder resolution (update, not delete)', () => {
   it('updateMessage issues an UpdateChannelMessage with URL-encoded content + the bot bearer', async () => {
     mockMessagingSend.mockResolvedValueOnce({});
-    await updateMessage('arn:channel', 'msg-id-X', 'No rebuttal.', ALT_SLOT);
+    await updateMessage('arn:channel', 'msg-id-X', 'No rebuttal.', ALT_SLOT, 'final');
     expect(mockMessagingSend).toHaveBeenCalledTimes(1);
     const cmd = mockMessagingSend.mock.calls[0][0];
     expect(cmd.__type).toBe('Update'); // NOT Delete — no chime:DeleteChannelMessage dependency
@@ -124,6 +124,9 @@ describe('NO_REBUTTAL placeholder resolution (update, not delete)', () => {
     expect(cmd.input.MessageId).toBe('msg-id-X');
     expect(cmd.input.ChimeBearer).toBe(ALT_SLOT);
     expect(decodeURIComponent(cmd.input.Content)).toBe('No rebuttal.');
+    // The declared phase rides the update itself (tracker row 49): a side that declines to rebut has
+    // finished, so this closes the turn rather than being another step toward one.
+    expect(JSON.parse(cmd.input.Metadata).respPhase).toBe('final');
   });
 });
 
@@ -283,5 +286,48 @@ describe('splitIntoChunks encoded-length Content budget', () => {
     const chunks = splitIntoChunks('aaaa bbbb cccc dddd eeee ffff', 5);
     expect(chunks.length).toBeGreaterThan(0);
     expect(chunks.every((c) => c.length > 0)).toBe(true);
+  });
+
+  // Pins the URIError crash: a long reply containing an astral-plane char
+  // (emoji = a UTF-16 surrogate PAIR) was chunked by a binary search that
+  // sliced text.slice(0, mid); a mid landing between the two surrogate halves
+  // produced a lone surrogate, and encodeURIComponent threw "URI malformed",
+  // crashing the whole processor -> user saw "Sorry, I encountered an issue".
+  it('does not throw and never emits a lone surrogate when chunking astral chars', () => {
+    // Build a long, no-whitespace body of emoji so the ONLY cut points fall
+    // inside surrogate pairs -- the naive splitter always split one here.
+    let heavy = '';
+    for (let i = 0; i < 400; i++) heavy += '😀'; // U+1F600, one surrogate pair
+    const first = 200;
+    const rest = 200;
+    let chunks: string[] = [];
+    expect(() => {
+      chunks = splitIntoChunks(heavy, first, rest);
+    }).not.toThrow();
+    expect(chunks.length).toBeGreaterThan(1);
+    // Every chunk must be a valid string: re-encodable (no lone surrogate) and
+    // within its encoded budget.
+    for (let i = 0; i < chunks.length; i++) {
+      expect(() => encodeURIComponent(chunks[i])).not.toThrow();
+      expect(enc(chunks[i])).toBeLessThanOrEqual(i === 0 ? first : rest);
+    }
+    // No content lost: rejoining preserves the emoji count.
+    expect(chunks.join('')).toBe(heavy);
+  });
+
+  it('keeps a surrogate pair intact when a natural cut lands mid-emoji', () => {
+    // Prose with an emoji straddling a plausible cut boundary.
+    const unit = 'Reverse the string by walking it backwards 🎯 and append. ';
+    let heavy = '';
+    for (let i = 0; i < 120; i++) heavy += unit;
+    heavy = heavy.trim();
+    let chunks: string[] = [];
+    expect(() => {
+      chunks = splitIntoChunks(heavy, 300, 400);
+    }).not.toThrow();
+    for (const c of chunks) {
+      expect(() => encodeURIComponent(c)).not.toThrow();
+    }
+    expect(stripWs(chunks.join(''))).toBe(stripWs(heavy));
   });
 });

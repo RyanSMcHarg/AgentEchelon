@@ -23,9 +23,14 @@
  *    correlation log; the surviving bot's round 2 sees no rival content
  *    (the system prompt acknowledges this and asks them to respond
  *    independently).
- *  - Async processor crashes mid-round-1: row never transitions → TTL
- *    expires it after 10 min. Orchestrator never fires for that battle.
- *    Round 1 messages stay in the channel; users see partial output.
+ *  - Async processor crashes mid-round-1: the row never transitions. Rather
+ *    than wait for the silent 10-min TTL (B2 "fail loud"), the orchestrator
+ *    gives round 1 a deadline: once a stalled (non-terminal) participant is
+ *    past it, it stops deferring, posts an explicit "<Name> didn't finish in
+ *    time" turn, and either runs a DEGRADED round 2 for the survivor(s) or —
+ *    when nobody finished — closes the battle with a message. Either way it
+ *    ends by writing a terminal 'battle complete' marker (B4) so consumers get
+ *    an explicit done signal instead of inferring it from TTL absence.
  */
 
 import {
@@ -36,6 +41,8 @@ import {
 } from '@aws-sdk/client-chime-sdk-messaging';
 import { LambdaClient, InvokeCommand, InvocationType } from '@aws-sdk/client-lambda';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 import {
   readBattleRows,
   allBotsTerminal,
@@ -47,36 +54,95 @@ import {
   resolveBattleVariantBySlotArn,
   resolveBattleControlVariantByAltSlotArn,
 } from './lib/experiment-manager.js';
+import { battleCorrelationId } from './lib/correlation.js';
 
 const messagingClient = new ChimeSDKMessagingClient({});
 const lambdaClient = new LambdaClient({});
 const ssmClient = new SSMClient({});
+const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+  marshallOptions: { removeUndefinedValues: true },
+});
+
+const BATTLE_STATE_TABLE = process.env.BATTLE_STATE_TABLE || '';
+const STATE_TTL_SECONDS = 600; // matches the BattleStateTable TTL
+// Round-1 fail-loud deadline (B2): if a participant is still non-terminal past
+// this many ms, the orchestrator stops waiting for the silent 10-min TTL and
+// drives a loud degraded resolution. Overridable; defaults well under the TTL.
+const ROUND1_DEADLINE_MS = Number(process.env.BATTLE_ROUND1_DEADLINE_MS) || 180_000;
 
 // The premium classification processor ARN is resolved at RUNTIME from SSM (the
 // AgentEchelonClassification-Premium stack publishes it). Resolving here — not at deploy via
 // valueForStringParameter — keeps this orchestrator decoupled from the premium
 // classification stack at deploy time (no fresh-deploy ordering cycle). A literal env
 // override is honored first for tests / special wiring.
-const PREMIUM_PROCESSOR_ARN_PARAM = process.env.PREMIUM_PROCESSOR_ARN_PARAM;
-const PREMIUM_ASYNC_PROCESSOR_ARN_ENV = process.env.PREMIUM_ASYNC_PROCESSOR_ARN;
-let cachedPremiumArn: string | null = null;
+const PROCESSOR_ARN_PARAMS: Record<string, string | undefined> = {
+  premium: process.env.PREMIUM_PROCESSOR_ARN_PARAM,
+  standard: process.env.STANDARD_PROCESSOR_ARN_PARAM,
+  basic: process.env.BASIC_PROCESSOR_ARN_PARAM,
+};
+const PROCESSOR_ARN_ENVS: Record<string, string | undefined> = {
+  premium: process.env.PREMIUM_ASYNC_PROCESSOR_ARN,
+  standard: process.env.ASYNC_PROCESSOR_ARN,
+  basic: process.env.BASIC_ASYNC_PROCESSOR_ARN,
+};
+const cachedArns: Record<string, string> = {};
 
-async function getPremiumProcessorArn(): Promise<string> {
-  if (cachedPremiumArn) return cachedPremiumArn;
-  if (PREMIUM_ASYNC_PROCESSOR_ARN_ENV) {
-    cachedPremiumArn = PREMIUM_ASYNC_PROCESSOR_ARN_ENV;
-    return cachedPremiumArn;
-  }
-  if (PREMIUM_PROCESSOR_ARN_PARAM) {
+/**
+ * The processor for a ROUND-2 rebuttal, resolved from the duel's classification.
+ *
+ * IT USED TO BE HARDCODED TO PREMIUM, and that was an escalation rather than a simplification.
+ * `battleEligible` is a per-profile flag an operator can turn on for any classification (the admin
+ * console edits it), so premium-only is a DEFAULT and not a guarantee. Flip it on standard and round
+ * 1 answered on the standard processor while round 2 answered on the premium one - the premium model,
+ * the premium guardrail and the premium `context/` S3 scope, which are IAM-enforced classification
+ * boundaries. That is precisely the cross-classification leak the round-1 routing fix exists to
+ * prevent, and half of every duel still had it.
+ *
+ * Fail-safe rules are IDENTICAL to the channel flow's on purpose: `basic` NEVER falls back up (that
+ * is the leak), `premium` may fall back DOWN to standard (a downgrade, safe), anything else is
+ * standard. Two routing tables that disagreed would put the two rounds of one duel on two
+ * classifications, which is the defect this replaces.
+ */
+/**
+ * The classification this duel runs as.
+ *
+ * ONE function, used for BOTH the worker ARN and the analytics attribution, so the two can never
+ * disagree. They did: `c8552bb` routed the worker from the duel's classification and left the payload's
+ * `userType` hardcoded to `'premium'` one line below, so a round-2 rebuttal archived as premium
+ * whatever it actually ran as - including on an ordinary premium duel whose SENDER was downgraded,
+ * since round 1 archives `min(user, channel)`. Half a duel attributed to the wrong classification is
+ * not cosmetic: it is the join key the battle rollup slices on.
+ *
+ * Absent resolves to standard, which is a downgrade for a premium duel and never an escalation.
+ */
+function classificationKeyFor(classification: string | undefined): 'premium' | 'standard' | 'basic' {
+  return classification === 'premium' || classification === 'basic' ? classification : 'standard';
+}
+
+async function getProcessorArnForClassification(classification: string | undefined): Promise<string> {
+  const key = classificationKeyFor(classification);
+  if (cachedArns[key]) return cachedArns[key];
+
+  const resolve = async (k: string): Promise<string> => {
+    const literal = PROCESSOR_ARN_ENVS[k];
+    if (literal) return literal;
+    const param = PROCESSOR_ARN_PARAMS[k];
+    if (!param) return '';
     try {
-      const resp = await ssmClient.send(new GetParameterCommand({ Name: PREMIUM_PROCESSOR_ARN_PARAM }));
-      cachedPremiumArn = resp.Parameter?.Value || '';
-      return cachedPremiumArn;
+      const resp = await ssmClient.send(new GetParameterCommand({ Name: param }));
+      return resp.Parameter?.Value || '';
     } catch (err) {
-      console.error('[BattleOrchestrator] failed to resolve premium processor ARN from SSM', err);
+      console.error('[BattleOrchestrator] failed to resolve processor ARN from SSM', { classification: k, err });
+      return '';
     }
-  }
-  return '';
+  };
+
+  let arn = await resolve(key);
+  // premium may degrade to standard; basic must not degrade UP, so it stays empty and the caller
+  // declines to dispatch rather than answering above the channel's clearance.
+  if (!arn && key === 'premium') arn = await resolve('standard');
+  if (arn) cachedArns[key] = arn;
+  return arn;
 }
 
 export interface BattleOrchestratorEvent {
@@ -89,15 +155,24 @@ export interface BattleOrchestratorEvent {
   senderArn?: string;
   /** Originating message id — referenced (never copied) in round-2 prompts. */
   originatingMessageId: string;
+  /**
+   * The CHANNEL's classification, carried from the side that fired the round. Round 2 answers at the
+   * duel's own classification; absent (an in-flight invoke from before this field existed) resolves
+   * to standard, which is a downgrade for a premium duel and never an escalation for a premium one.
+   */
+  classification?: string;
 }
 
 export async function handler(event: BattleOrchestratorEvent): Promise<void> {
   const { battleId, channelArn, userMessage, originatingMessageId } = event;
   console.log('[BattleOrchestrator] Invoked', { battleId, channelArn });
 
-  const premiumProcessorArn = await getPremiumProcessorArn();
-  if (!premiumProcessorArn) {
-    console.error('[BattleOrchestrator] premium processor ARN unresolved (set PREMIUM_PROCESSOR_ARN_PARAM or PREMIUM_ASYNC_PROCESSOR_ARN)');
+  // Round 2 answers at the DUEL'S classification, not a hardwired premium one (see the resolver).
+  const roundProcessorArn = await getProcessorArnForClassification(event.classification);
+  if (!roundProcessorArn) {
+    console.error('[BattleOrchestrator] no processor resolved for this duel; round 2 will not fire', {
+      classification: event.classification ?? '(absent, treated as standard)',
+    });
     return;
   }
 
@@ -109,33 +184,66 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
     return;
   }
 
-  // 2. All terminal? If not, defer — the late writer will fire.
-  if (!allBotsTerminal(rows)) {
-    console.log('[BattleOrchestrator] Not all bots terminal yet, deferring', {
+  // 2. Terminal check with a fail-loud deadline (B2). Normally we proceed only
+  //    once every bot row is terminal; a late writer fires us and we run round
+  //    2. If not all bots are terminal AND a stalled (non-terminal) bot is past
+  //    its round-1 deadline, stop deferring and drive a loud degraded resolution.
+  //
+  //    REACHABILITY - READ BEFORE RELYING ON THIS. The degraded branch below is
+  //    currently UNREACHABLE and does not yet fix the case it describes. The only
+  //    caller, `fireOrchestratorIfLast` (async-processor-core.ts), returns early
+  //    unless `allBotsTerminal(rows)` is already true, so every invocation arrives
+  //    with `terminal === true`. A bot that crashes or times out mid-round-1 never
+  //    writes a terminal row, so nothing invokes us again and the battle still ends
+  //    in the silent 10-min TTL strand.
+  //
+  //    Closing it needs a TIME-based trigger, not another event: the missing signal
+  //    is the ABSENCE of a transition, which cannot be event-sourced (TENETS 7,
+  //    which blesses a low-frequency reconcile sweep behind an event path for
+  //    exactly this shape). That means a scheduled sweep over battles with a
+  //    non-terminal row past deadline, firing this handler - new infrastructure the
+  //    battle stack does not have today. The logic below is kept because it is the
+  //    correct resolution once such a sweep exists; it is documented as inert so it
+  //    is not mistaken for working protection.
+  const terminal = allBotsTerminal(rows);
+  const nonTerminalBots = bots.filter(
+    (b) => b.state === 'INVOKED' || b.state === 'WAITING_FOR_USER',
+  );
+  if (!terminal) {
+    const stalledPastDeadline = nonTerminalBots.filter(isPastDeadline);
+    if (stalledPastDeadline.length === 0) {
+      console.log('[BattleOrchestrator] Not all bots terminal yet (within deadline), deferring', {
+        battleId,
+        states: bots.map((r) => ({ bot: r.botArn, state: r.state })),
+      });
+      return;
+    }
+    console.warn('[BattleOrchestrator] round-1 deadline exceeded with non-terminal bot(s); failing loud', {
       battleId,
-      states: bots.map((r) => ({ bot: r.botArn, state: r.state })),
+      stalled: stalledPastDeadline.map((r) => ({ bot: r.botArn, state: r.state })),
     });
-    return;
   }
 
-  // 3. Exactly-once claim.
+  // 3. Exactly-once claim. Whichever invocation wins drives the resolution
+  //    (normal round 2, degraded round 2, or a loud close); the rest no-op.
   const claimed = await tryClaimOrchestratorFire(battleId);
   if (!claimed) {
     console.log('[BattleOrchestrator] Another invocation already claimed the fire', { battleId });
     return;
   }
-  console.log('[BattleOrchestrator] Claimed orchestrator fire — proceeding to round 2', {
+  console.log('[BattleOrchestrator] Claimed orchestrator fire — proceeding', {
     battleId,
     bots: bots.length,
+    terminal,
   });
 
   // Resolve-once (DESIGN-MULTI-ASSISTANT-TURN-ENGINE, "Battle delegates to the
   // normal engine"): resolve each side's experiment variant ONCE here and stamp
   // it into the round-2 battleContext, so the worker runs a normal request for
-  // the variant with no second resolution. The alt-slot bot is whichever row
-  // resolves via the slot-keyed resolver; the other row is the default/control
-  // side. control = variants[0]; treatment = variants[1]. Best-effort: a
-  // resolver hiccup leaves the fields unset and the worker resolves normally.
+  // the variant with no second resolution. Also used for the fail-loud display
+  // names. The alt-slot bot is whichever row resolves via the slot-keyed
+  // resolver; the other row is the default/control side. control = variants[0];
+  // treatment = variants[1]. Best-effort: a resolver hiccup leaves fields unset.
   let altSlotArn = '';
   for (const row of bots) {
     if (await resolveBattleVariantBySlotArn(row.botArn)) {
@@ -149,18 +257,50 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
         resolveBattleVariantBySlotArn(altSlotArn),
       ])
     : [null, null];
+  const displayNameFor = (botArn: string): string | undefined =>
+    (botArn === altSlotArn ? treatmentVariant : controlVariant)?.displayName;
 
-  // 4. For each bot, send round-2 placeholder + invoke async with rival reply.
+  // 4. Fail loud (B2): any bot that did NOT finish round 1 — FAILED, or still
+  //    non-terminal past the deadline — gets an explicit "<Name> didn't finish
+  //    in time" turn so the user is never left staring at a stalled placeholder.
+  const completedBots = bots.filter((b) => b.state === 'COMPLETED');
+  const notFinishedBots = bots.filter((b) => b.state !== 'COMPLETED');
+  for (const b of notFinishedBots) {
+    await postDidNotFinish(channelArn, b.botArn, displayNameFor(b.botArn));
+  }
+
+  // If nobody finished there is nothing to rebut — close the battle with a
+  // message (never a silent TTL) and emit the terminal marker.
+  if (completedBots.length === 0) {
+    await postBattleMessage(
+      channelArn,
+      bots[0].botArn,
+      "This battle couldn't be completed. No assistant finished in time. Try /battle again.",
+    );
+    await emitBattleComplete(battleId, 'closed:no-completion');
+    console.log('[BattleOrchestrator] Battle closed — no completed bots', { battleId });
+    return;
+  }
+
+  const degraded = completedBots.length < bots.length;
+
+  // 5. For each bot that FINISHED round 1, send a round-2 placeholder + invoke
+  //    async with the rival's round-1 reply. In a degraded battle only the
+  //    survivor(s) run round 2 (the "didn't finish" note above is the visible
+  //    degradation signal); the survivor responds independently — its rival
+  //    reply is '' and rivalDidNotFinish is set so the rebuttal can say so.
   await Promise.all(
-    bots.map(async (selfRow) => {
+    completedBots.map(async (selfRow) => {
       const rivalRow = bots.find((r) => r.botArn !== selfRow.botArn);
       const rivalReply = rivalRow?.round1Reply || '';
       const rivalReplyMsgId = rivalRow?.round1MessageId;
+      const rivalCompleted =
+        !!rivalRow && completedBots.some((r) => r.botArn === rivalRow.botArn);
       const isAltSlot = selfRow.botArn === altSlotArn;
       const selfVariant = isAltSlot ? treatmentVariant : controlVariant;
       const rivalVariant = isAltSlot ? controlVariant : treatmentVariant;
 
-      const correlationId = `battle-r2-${selfRow.botArn.split('/').pop()}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+      const correlationId = battleCorrelationId({ botArn: selfRow.botArn, round: 'r2' });
 
       try {
         await sendPlaceholder({
@@ -179,17 +319,35 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
       try {
         await lambdaClient.send(
           new InvokeCommand({
-            FunctionName: premiumProcessorArn,
+            FunctionName: roundProcessorArn,
             InvocationType: InvocationType.Event,
             Payload: Buffer.from(JSON.stringify({
               channelArn,
               correlationId,
               userMessage,
-              userType: 'premium',
+              // Round 2 is fired by THIS orchestrator, not by a person: without the declaration the
+              // rebuttal turn archives trigger_kind NULL and is read as user-caused, mis-charging
+              // orchestrator-origin latency to user experience. This is the other producer the
+              // 'orchestrator' enum value shipped without.
+              trigger: 'orchestrator',
+              // The DUEL'S classification, resolved by the same function as the worker ARN above so
+              // the attribution can never disagree with the processor that actually answered.
+              userType: classificationKeyFor(event.classification),
               botArn: selfRow.botArn,
               senderArn: event.senderArn,
               intent: 'general',
               deliveryOption: 'PLACEHOLDER_UPDATE',
+              // EXPERIMENT ATTRIBUTION — the same fields, for the same reason, as the round-1 fan-out
+              // (channel-flow-processor). `buildAnalyticsMetadata` stamps `experiment_id`/`variant_id`
+              // from these TOP-LEVEL fields, so without them a round-2 rebuttal archives with
+              // experiment_id NULL and is invisible to `fetchBattleEffectivenessRows`. Round 1 was
+              // fixed and round 2 was not, so half of every duel was missing from the rollup: the
+              // resolvers already return both ids, only the payload omitted them.
+              ...(selfVariant?.experimentId && { experimentId: selfVariant.experimentId }),
+              ...(selfVariant?.variantId && { variantId: selfVariant.variantId }),
+              // SPEC-PORTABLE §6: this side's whole profile VERSION for a profileRef variant, so the
+              // rebuttal round runs the same assistant round 1 did. Absent for a modelKey variant.
+              ...(selfVariant?.variantProfile && { variantProfile: selfVariant.variantProfile }),
               battleContext: {
                 battleId,
                 round: 2,
@@ -199,6 +357,9 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
                 rivalReply,
                 rivalReplyMsgId,
                 originatingMessageId,
+                // Fail-loud: tell the worker the rival didn't finish so the
+                // rebuttal can acknowledge it rather than pretend there was one.
+                ...(!rivalCompleted && { rivalDidNotFinish: true }),
                 // Resolve-once: this side's variant + the rival's display name
                 // (woven into the rebuttal note). Unset fields fall back to the
                 // worker's normal resolution.
@@ -219,7 +380,129 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
     }),
   );
 
-  console.log('[BattleOrchestrator] Round 2 fan-out complete', { battleId });
+  // 6. Terminal marker (B4): round 2 is the final round, so once it is
+  //    dispatched the battle has no further orchestrated phase. Emit an explicit
+  //    'battle complete' signal (a '__complete__' sentinel row) so consumers
+  //    (analytics, the tally UI, a future notification) get a done signal
+  //    instead of inferring it from the state TTL aging out.
+  await emitBattleComplete(battleId, degraded ? 'round2:degraded' : 'round2:full');
+  console.log('[BattleOrchestrator] Round 2 fan-out complete', { battleId, degraded });
+}
+
+/**
+ * Deadline (ms epoch) for a bot's turn. Reads the `deadlineAt` the state layer wrote.
+ *
+ * WHICH CLOCK IT IS depends on the state the row is in, and only the writer knows: `battle-state.ts`
+ * stamps the MACHINE deadline on a generating side and the far longer USER-WAIT deadline on a side
+ * blocked on a person (ADR-026, the two clocks). This function must not second-guess that.
+ *
+ * The `enteredStateAt + ROUND1_DEADLINE_MS` fallback below is now only for rows written BEFORE
+ * `deadlineAt` existed, and it is exactly the arithmetic that made a thinking user indistinguishable
+ * from a stalled assistant - while nothing wrote `deadlineAt`, every deadline came from it. Kept so an
+ * in-flight duel spanning the deploy still resolves, rather than being treated as never due.
+ *
+ * Tolerated as an ISO string or an epoch number in seconds or ms, because a value this load-bearing
+ * should not fail loud over its own encoding. Final fallback is "not yet due" (never fail loud without
+ * cause).
+ */
+function rowDeadlineMs(row: BattleStateRow): number {
+  // Read as `unknown`: the row TYPE says number, but a legacy row (or a hand-repaired one) may carry an
+  // ISO string, and this is the wrong place to throw over an encoding.
+  const d: unknown = row.deadlineAt;
+  if (typeof d === 'number' && Number.isFinite(d)) return d < 1e12 ? d * 1000 : d;
+  if (typeof d === 'string' && d.trim() !== '') {
+    const n = Number(d);
+    if (Number.isFinite(n)) return n < 1e12 ? n * 1000 : n;
+    const parsed = Date.parse(d);
+    if (!Number.isNaN(parsed)) return parsed;
+  }
+  const entered = row.enteredStateAt ? Date.parse(row.enteredStateAt) : NaN;
+  if (!Number.isNaN(entered)) return entered + ROUND1_DEADLINE_MS;
+  return Date.now() + ROUND1_DEADLINE_MS; // no timing info → treat as not yet due
+}
+
+function isPastDeadline(row: BattleStateRow): boolean {
+  return Date.now() > rowDeadlineMs(row);
+}
+
+/**
+ * Fail-loud (B2): post an explicit "<Name> didn't finish in time" turn
+ * attributed to the stalled/failed bot, so the user is never left staring at a
+ * silent placeholder. Best-effort — a send failure must not abort the rest of
+ * the resolution.
+ */
+async function postDidNotFinish(
+  channelArn: string,
+  botArn: string,
+  displayName?: string,
+): Promise<void> {
+  const name = displayName || 'One assistant';
+  try {
+    await messagingClient.send(
+      new SendChannelMessageCommand({
+        ChannelArn: channelArn,
+        Content: `${name} didn't finish in time.`,
+        Type: ChannelMessageType.STANDARD,
+        Persistence: ChannelMessagePersistenceType.PERSISTENT,
+        ChimeBearer: botArn,
+      }),
+    );
+  } catch (err) {
+    console.warn('[BattleOrchestrator] postDidNotFinish failed for', botArn, err);
+  }
+}
+
+/** Post a plain battle-level message (e.g. the close notice) as a bot. Best-effort. */
+async function postBattleMessage(
+  channelArn: string,
+  botArn: string,
+  content: string,
+): Promise<void> {
+  try {
+    await messagingClient.send(
+      new SendChannelMessageCommand({
+        ChannelArn: channelArn,
+        Content: content,
+        Type: ChannelMessageType.STANDARD,
+        Persistence: ChannelMessagePersistenceType.PERSISTENT,
+        ChimeBearer: botArn,
+      }),
+    );
+  } catch (err) {
+    console.warn('[BattleOrchestrator] postBattleMessage failed for', botArn, err);
+  }
+}
+
+/**
+ * Terminal marker (B4): write a '__complete__' sentinel row so consumers get an
+ * explicit "battle done" signal instead of inferring it from the state TTL.
+ * Idempotent (attribute_not_exists) and best-effort. `botRowsOnly()` excludes
+ * '__'-prefixed SKs, so this sentinel never affects the "all bots terminal"
+ * checks. Fails open when the state table isn't provisioned.
+ */
+async function emitBattleComplete(battleId: string, reason: string): Promise<void> {
+  if (!BATTLE_STATE_TABLE) return;
+  const ttl = Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS;
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: BATTLE_STATE_TABLE,
+        Item: {
+          battleId,
+          botArn: '__complete__',
+          state: 'COMPLETED',
+          completeReason: reason,
+          enteredStateAt: new Date().toISOString(),
+          ttl,
+        },
+        ConditionExpression: 'attribute_not_exists(botArn)',
+      }),
+    );
+  } catch (err) {
+    if ((err as { name?: string }).name !== 'ConditionalCheckFailedException') {
+      console.warn('[BattleOrchestrator] emitBattleComplete failed (non-fatal):', err);
+    }
+  }
 }
 
 async function sendPlaceholder(args: {

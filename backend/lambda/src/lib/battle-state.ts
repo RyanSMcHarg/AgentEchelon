@@ -33,6 +33,71 @@ const BATTLE_STATE_TABLE = process.env.BATTLE_STATE_TABLE || '';
 const CACHE_TTL_MS = 60_000;
 const STATE_TTL_SECONDS = 600; // 10 min — matches spec's BattleStateTable TTL
 
+// ---------------------------------------------------------------------------
+// TWO CLOCKS (ADR-026)
+// ---------------------------------------------------------------------------
+//
+// A side that is GENERATING and goes quiet has stalled. A side WAITING ON A HUMAN has not. Those are
+// different measurements and they get different bounds; one deadline stamped at state entry cannot tell
+// them apart, and resolved the ambiguity the wrong way on every clarification.
+//
+// What it cost: `markBotWaitingForUser` stamped `enteredStateAt = now`, and the orchestrator's
+// `rowDeadlineMs` falls back to `enteredStateAt + BATTLE_ROUND1_DEADLINE_MS` (180s). So a user who took
+// more than three minutes to answer a clarifying question was reported as an assistant that failed to
+// finish, and the row itself was deleted by TTL ten minutes in. A task-shaped duel, which needs several
+// exchanges with the user, could not complete at all.
+//
+// `rowDeadlineMs` already PREFERS an explicit `deadlineAt` and only falls back to that arithmetic. That
+// field was never written by anything, so the preferred branch was dead code and every deadline came
+// from the fallback. Writing it is the fix: the state layer owns which clock a transition starts, and
+// the orchestrator reads the answer rather than recomputing it.
+//
+// Both bounds are configuration, not constants, for the reason ADR-023 gives for refusing a bare `X`:
+// the arithmetic is per-deployment, and an implementer who has to edit a constant will pick one number
+// and be wrong on some profiles.
+
+/** A side that is generating. Matches the orchestrator's own env read so the two cannot disagree. */
+const MACHINE_DEADLINE_MS = Number(process.env.BATTLE_ROUND1_DEADLINE_MS) || 180_000;
+
+/**
+ * A side blocked on a human. Generous by comparison and still BOUNDED: a duel the user walked away from
+ * is closed rather than left open forever, but the bound is a person's answering time, not a Lambda's.
+ */
+const USER_WAIT_MS = Number(process.env.BATTLE_USER_WAIT_MS) || 3_600_000; // 1 hour
+
+/**
+ * Row TTL for a deadline: the row must OUTLIVE its own deadline, or DynamoDB deletes the evidence
+ * before the orchestrator can report on it and the duel ends by disappearing instead of by saying so.
+ */
+const TTL_GRACE_SECONDS = 300;
+function ttlForDeadline(deadlineMs: number): number {
+  return Math.floor(deadlineMs / 1000) + TTL_GRACE_SECONDS;
+}
+
+/** When a generating side is due. */
+function machineDeadline(nowMs: number): number {
+  return nowMs + MACHINE_DEADLINE_MS;
+}
+
+/** When a side waiting on the user is due. */
+function userWaitDeadline(nowMs: number): number {
+  return nowMs + USER_WAIT_MS;
+}
+
+/**
+ * How long a whole duel may legitimately remain in flight.
+ *
+ * A single-turn duel is over in seconds; a task-shaped one runs as long as the work with the user takes,
+ * across an unbounded number of legs that are each individually bounded. Anything that treats "a duel is
+ * short" as an invariant needs this bound instead of the per-leg one - notably the single-active-battle
+ * pointer, which released after ten minutes and would let a SECOND `/battle` start while the first was
+ * still collecting requirements.
+ *
+ * Deliberately generous: the pointer is documented as a cheap pre-filter whose correctness rides on the
+ * caller re-validating against live rows, so an over-long value is safe and an over-short one is the bug.
+ */
+const DUEL_MAX_LIFETIME_MS = Number(process.env.BATTLE_MAX_LIFETIME_MS) || 14_400_000; // 4 hours
+
 // removeUndefinedValues: transitionBotState writes optional round1Reply /
 // round1MessageId / correlationId straight into the Item — all undefined
 // on the FAILED path (a bot that errored before replying). Without this
@@ -81,6 +146,14 @@ export interface ChannelBattleConfig {
    */
   activeBattleId?: string;
   activeBattleStartedAt?: string;
+  /**
+   * WHO OWNS THE IN-FLIGHT DUEL — the person who ran `/battle`, and the only one whose reply resumes a
+   * waiting side. It lives HERE, on the pointer, because this row has a single writer (`setActiveBattle`
+   * at fan-out) and is not rewritten by the duel's own progress. The per-bot rows are: they are
+   * transitioned by several writers across two Lambdas, and the terminal transition used to rewrite the
+   * whole item, so an owner recorded there was erased by the side's own completion.
+   */
+  activeBattleInitiator?: string;
 }
 
 interface ConfigCacheEntry {
@@ -93,6 +166,30 @@ const configCache = new Map<string, ConfigCacheEntry>();
 export async function isBattleEnabled(channelArn: string): Promise<boolean> {
   const cfg = await loadChannelBattleConfig(channelArn);
   return cfg?.enabled === true;
+}
+
+/**
+ * Can this channel still run a duel? Pure, so the rule is testable without the processor.
+ *
+ * `ChannelBattleConfig` is a SNAPSHOT written at enable time (slot arn, experiment id, briefing), and
+ * nothing re-checked the experiment afterwards. A channel enabled while an experiment was active
+ * therefore kept fanning out duels forever after that experiment ended, recording human picks against
+ * a completed experiment where they can never reach a recommendation - while enabling a NEW channel
+ * correctly refused, because enable auto-resolves the single ACTIVE battle experiment. The two paths
+ * disagreed about whether battle was available.
+ *
+ * Ending an experiment is how an operator stops a comparison; it has to stop the duels too.
+ *
+ * A config with NO bound experiment id is treated as runnable: that shape predates the binding and
+ * has no experiment to have ended. Enable has written the id since, so this only covers legacy rows.
+ */
+export function battleIsRunnable(
+  config: ChannelBattleConfig | null,
+  experiments: Array<{ experimentId: string; status?: string }>,
+): boolean {
+  if (config?.enabled !== true) return false;
+  if (!config.experimentId) return true;
+  return experiments.some((e) => e.experimentId === config.experimentId && e.status === 'active');
 }
 
 export async function loadChannelBattleConfig(channelArn: string): Promise<ChannelBattleConfig | null> {
@@ -141,6 +238,8 @@ export function invalidateChannelBattleConfigCache(channelArn: string): void {
 export async function setActiveBattle(args: {
   channelArn: string;
   battleId: string;
+  /** The duel owner, kept on the pointer so it survives the per-bot rows aging out. */
+  initiatorUserSub?: string;
 }): Promise<void> {
   if (!CHANNEL_BATTLE_CONFIG_TABLE) return;
   try {
@@ -148,11 +247,18 @@ export async function setActiveBattle(args: {
       new UpdateCommand({
         TableName: CHANNEL_BATTLE_CONFIG_TABLE,
         Key: { channelArn: args.channelArn },
-        UpdateExpression: 'SET activeBattleId = :b, activeBattleStartedAt = :now',
+        // A duel with no known owner must REMOVE the field, not leave the last duel's owner behind:
+        // this is one row reused by every battle in the channel, so a carried-over value would hand the
+        // new duel the PREVIOUS initiator - locking its real owner out and letting a stranger resume it.
+        // A stale owner is worse than no owner, because no owner fails open and a wrong one fails shut.
+        UpdateExpression: args.initiatorUserSub
+          ? 'SET activeBattleId = :b, activeBattleStartedAt = :now, activeBattleInitiator = :i'
+          : 'SET activeBattleId = :b, activeBattleStartedAt = :now REMOVE activeBattleInitiator',
         ConditionExpression: 'attribute_exists(channelArn)',
         ExpressionAttributeValues: {
           ':b': args.battleId,
           ':now': new Date().toISOString(),
+          ...(args.initiatorUserSub ? { ':i': args.initiatorUserSub } : {}),
         },
       }),
     );
@@ -172,12 +278,36 @@ export async function setActiveBattle(args: {
  * `WAITING_FOR_USER` rows yields no resume → safe fall-through).
  */
 export async function resolveActiveBattleId(channelArn: string): Promise<string | null> {
+  return (await resolveActiveBattle(channelArn))?.battleId ?? null;
+}
+
+/**
+ * The same resolution, WITH THE DUEL'S OWNER. Continuation is the caller that needs both, because
+ * "which battle is this reply about" and "whose reply counts" are answered by the same row.
+ *
+ * The owner is read HERE rather than off the per-bot rows. The rows were the original source and it
+ * was inert: they are rewritten by the duel's own progress (the terminal transition replaced the whole
+ * item), so the enforcement compared the speaker against `undefined` and passed for everybody. The
+ * pointer has one writer, at fan-out, from the `/battle` sender.
+ *
+ * `initiatorUserSub` undefined ⇒ this duel predates the field, or `setActiveBattle`'s non-fatal write
+ * lost the sender. The caller falls back to the rows and, failing that, resumes for anyone: an
+ * unanswerable duel is worse than an over-answerable one.
+ */
+export async function resolveActiveBattle(
+  channelArn: string,
+): Promise<{ battleId: string; initiatorUserSub?: string } | null> {
   const cfg = await loadChannelBattleConfig(channelArn);
   if (!cfg?.activeBattleId) return null;
+  const active = { battleId: cfg.activeBattleId, initiatorUserSub: cfg.activeBattleInitiator };
   const startedMs = cfg.activeBattleStartedAt ? Date.parse(cfg.activeBattleStartedAt) : NaN;
-  if (Number.isNaN(startedMs)) return cfg.activeBattleId; // no/invalid timestamp → let rows arbitrate
-  if (Date.now() - startedMs > STATE_TTL_SECONDS * 1000) return null; // battle aged out
-  return cfg.activeBattleId;
+  if (Number.isNaN(startedMs)) return active; // no/invalid timestamp → let rows arbitrate
+  // Bounded by the DUEL's lifetime, not one leg's. This used `STATE_TTL_SECONDS` (10 min), which is the
+  // right order of magnitude for a single-turn duel and wrong for a task-shaped one: it released the
+  // single-active-battle pointer while the first duel was still working with the user, so a second
+  // `/battle` could start alongside it (ADR-026).
+  if (Date.now() - startedMs > DUEL_MAX_LIFETIME_MS) return null; // battle aged out
+  return active;
 }
 
 // ---------------------------------------------------------------------------
@@ -190,11 +320,29 @@ export interface BattleStateRow {
   battleId: string;
   botArn: string;
   state: BattleBotStatus;
+  /**
+   * The person who ran /battle. A duel HAS AN OWNER (owner, 2026-08-13): they are who a waiting side
+   * is waiting on, who its task is assigned to, and the only person whose reply resumes it.
+   *
+   * Without it the continuation matched on the mentioned BOT alone, so any member could answer a
+   * question they were not asked and steer a comparison they did not start.
+   */
+  initiatorUserSub?: string;
   round1Reply?: string;
   round1MessageId?: string;
   correlationId?: string;
   enteredStateAt?: string;
   ttl?: number;
+  /**
+   * When this side is DUE, as an epoch-ms number (ADR-026, the two clocks).
+   *
+   * Which clock it came from depends on the state the row is in: a generating side gets the machine
+   * deadline, a side blocked on a human gets the far longer user-wait one. The orchestrator reads this
+   * rather than recomputing from `enteredStateAt`, because only the writer knows which clock applies -
+   * and while nothing wrote it, every deadline fell back to the machine arithmetic and a thinking user
+   * was reported as a stalled assistant.
+   */
+  deadlineAt?: number;
   /**
    * Clarification metrics — a *measured* battle dimension (see
    * project-battle-clarification-measured-dimension): how often each
@@ -219,15 +367,12 @@ export interface BattleStateRow {
    * ended" signal). Set by markBotWaitingForUser.
    */
   waitingMessageId?: string;
-  /**
-   * For a `TASK_*` battle, the per-bot task this row's bot is running
-   * (one Task per bot, assigned to it — see createBattleTask). Stamped
-   * at fan-out. Absent ⇒ a PLACEHOLDER/DIRECT battle. Lets the
-   * continuation router tell the two apart without re-deriving anything:
-   * present ⇒ resume that task chain (brick 2B-x-c); absent ⇒ plain
-   * re-invoke (brick 2B-x-b).
-   */
-  taskId?: string;
+  // NO `taskId`. A battle is not a task (DESIGN-BATTLE §2a): the row used to carry one so the
+  // continuation path could resume a side's chain, which is battle state reaching into task state to
+  // answer a battle question. The chain is found by asking who owns it - "the active task owned by
+  // this assistant in this conversation" (ADR-024) - so nothing about tasks belongs on this row, and
+  // the ordering problem it created (the row is written BEFORE the invoke, the task id only exists
+  // AFTER it) disappears with it rather than needing a second write.
 }
 
 /**
@@ -239,12 +384,14 @@ export async function initBotState(args: {
   battleId: string;
   botArn: string;
   correlationId: string;
-  /** Set for a TASK_* battle so the row records the bot's task (2B-x-c). */
-  taskId?: string;
+  /** Who ran /battle. Recorded on every side so the duel keeps its owner. */
+  initiatorUserSub?: string;
 }): Promise<void> {
   if (!BATTLE_STATE_TABLE) return;
-  const now = new Date().toISOString();
-  const ttl = Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS;
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
+  // A freshly invoked side is GENERATING, so it starts on the machine clock.
+  const deadlineAt = machineDeadline(nowMs);
   try {
     await ddb.send(
       new PutCommand({
@@ -254,9 +401,10 @@ export async function initBotState(args: {
           botArn: args.botArn,
           state: 'INVOKED',
           correlationId: args.correlationId,
+          ...(args.initiatorUserSub ? { initiatorUserSub: args.initiatorUserSub } : {}),
           enteredStateAt: now,
-          ttl,
-          ...(args.taskId && { taskId: args.taskId }),
+          deadlineAt,
+          ttl: ttlForDeadline(deadlineAt),
         },
         ConditionExpression: 'attribute_not_exists(botArn)',
       }),
@@ -277,6 +425,14 @@ export async function initBotState(args: {
  * idempotent. Returns true iff the write succeeded (i.e., this caller
  * is the one that transitioned the row — useful for "I'm last writer,
  * should I fire the orchestrator?" coordination).
+ *
+ * AN UPDATE, NOT A PUT. This wrote a whole item built from its own arguments, which silently deleted
+ * every attribute the row had accumulated that the caller does not pass: `initiatorUserSub` (the duel's
+ * owner), `clarificationCount`, `waitedMs`, `waitingSince`, `waitingMessageId`. So a side that recorded
+ * its owner at fan-out, then asked a clarifying question, then finished, ended terminal with none of
+ * it — which is why live rows read `owner=(none)` on duels started after ownership shipped, and why the
+ * owner now lives on the channel pointer as well. A state transition transitions the state; the rest of
+ * the row is not its to forget.
  */
 export async function transitionBotState(args: {
   battleId: string;
@@ -289,23 +445,37 @@ export async function transitionBotState(args: {
   if (!BATTLE_STATE_TABLE) return false;
   const now = new Date().toISOString();
   const ttl = Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS;
+
+  // Only what this caller actually knows is written. A round-2 or opt-out transition carries no round-1
+  // reply, and writing a null for it would erase the answer round 1 recorded — the same forgetting in a
+  // smaller shape. (DynamoDB rejects an unused `:value`, so the pairs are built together.)
+  const sets = ['#state = :state', 'correlationId = :corr', 'enteredStateAt = :now', '#ttl = :ttl'];
+  const values: Record<string, unknown> = {
+    ':state': args.state,
+    ':corr': args.correlationId ?? null,
+    ':now': now,
+    ':ttl': ttl,
+    ':invoked': 'INVOKED',
+    ':waiting': 'WAITING_FOR_USER',
+  };
+  if (args.round1Reply !== undefined) {
+    sets.push('round1Reply = :r1');
+    values[':r1'] = args.round1Reply;
+  }
+  if (args.round1MessageId !== undefined) {
+    sets.push('round1MessageId = :r1mid');
+    values[':r1mid'] = args.round1MessageId;
+  }
+
   try {
     await ddb.send(
-      new PutCommand({
+      new UpdateCommand({
         TableName: BATTLE_STATE_TABLE,
-        Item: {
-          battleId: args.battleId,
-          botArn: args.botArn,
-          state: args.state,
-          round1Reply: args.round1Reply,
-          round1MessageId: args.round1MessageId,
-          correlationId: args.correlationId,
-          enteredStateAt: now,
-          ttl,
-        },
+        Key: { battleId: args.battleId, botArn: args.botArn },
+        UpdateExpression: `SET ${sets.join(', ')}`,
         ConditionExpression: 'attribute_not_exists(botArn) OR #state IN (:invoked, :waiting)',
-        ExpressionAttributeNames: { '#state': 'state' },
-        ExpressionAttributeValues: { ':invoked': 'INVOKED', ':waiting': 'WAITING_FOR_USER' },
+        ExpressionAttributeNames: { '#state': 'state', '#ttl': 'ttl' },
+        ExpressionAttributeValues: values,
       }),
     );
     return true;
@@ -342,6 +512,20 @@ export async function markBotWaitingForUser(args: {
   question?: string;
   correlationId?: string;
   /**
+   * WHY this side is waiting. Both suspend round 2; only one is a clarification.
+   *
+   * `clarification` (the default) is the side asking a question of its own accord, and it is a MEASURED
+   * dimension - how often each model asks rather than wrongly forging ahead - so it increments
+   * `clarificationCount`.
+   *
+   * `task-step` is a task-shaped duel between the legs of its own state machine (ADR-026). The side is
+   * equally blocked on the user, but it did not choose to ask: the machine's next state requires input.
+   * Counting those as clarifications would inflate the measurement by however many steps the task
+   * happens to have, and make a `report_generation` duel look like a model that cannot stop asking
+   * questions. Same transition, same suspension, no counter.
+   */
+  reason?: 'clarification' | 'task-step';
+  /**
    * The channel placeholder message id that was turned into the "waiting"
    * state. Persisted so the resume path reuses THAT message (one clean
    * lifecycle, no orphan stale "waiting" message) instead of creating a
@@ -350,8 +534,14 @@ export async function markBotWaitingForUser(args: {
   waitingMessageId?: string;
 }): Promise<boolean> {
   if (!BATTLE_STATE_TABLE) return false;
-  const now = new Date().toISOString();
-  const ttl = Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS;
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
+  // THE CLOCK CHANGES HERE (ADR-026). This side is no longer generating, it is blocked on a person, so
+  // it moves off the machine deadline and onto the human one. Writing `deadlineAt` explicitly is what
+  // stops the orchestrator falling back to `enteredStateAt + MACHINE_DEADLINE_MS` and reporting a
+  // thinking user as a stalled assistant. The TTL follows the deadline so the row cannot be deleted
+  // out from under the wait.
+  const deadlineAt = userWaitDeadline(nowMs);
   try {
     await ddb.send(
       new UpdateCommand({
@@ -360,8 +550,9 @@ export async function markBotWaitingForUser(args: {
         UpdateExpression:
           'SET #state = :waiting, enteredStateAt = :now, waitingSince = :now, ' +
           'clarificationQuestion = :q, correlationId = :corr, ' +
-          'waitingMessageId = :wmid, #ttl = :ttl ' +
-          'ADD clarificationCount :one',
+          'waitingMessageId = :wmid, deadlineAt = :deadline, #ttl = :ttl'
+          // Only a real clarification moves the counter (see `reason`).
+          + (args.reason === 'task-step' ? '' : ' ADD clarificationCount :one'),
         ConditionExpression: 'attribute_exists(botArn) AND #state = :invoked',
         ExpressionAttributeNames: { '#state': 'state', '#ttl': 'ttl' },
         ExpressionAttributeValues: {
@@ -371,8 +562,9 @@ export async function markBotWaitingForUser(args: {
           ':q': args.question ?? null,
           ':corr': args.correlationId ?? null,
           ':wmid': args.waitingMessageId ?? null,
-          ':ttl': ttl,
-          ':one': 1,
+          ':deadline': deadlineAt,
+          ':ttl': ttlForDeadline(deadlineAt),
+          ...(args.reason === 'task-step' ? {} : { ':one': 1 }),
         },
       }),
     );
@@ -437,15 +629,24 @@ export async function resumeBotFromWaiting(args: {
     console.warn('[battle-state] resumeBotFromWaiting waitingSince read failed (banking 0):', err);
   }
 
-  const now = new Date().toISOString();
-  const ttl = Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS;
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
+  // BACK ON THE MACHINE CLOCK. The user has answered, so this side is generating again and a stall from
+  // here IS the assistant's. The deadline restarts from now rather than carrying the wait forward, which
+  // is the whole point of separating the two: waited time is banked into `waitedMs` (so
+  // `computeActiveResponseMs` can subtract it) and does not count against the side's own responsiveness.
+  //
+  // A chain with more exchanges to come will pass through here repeatedly, each leg getting a fresh
+  // machine deadline and each wait its own human one.
+  const deadlineAt = machineDeadline(nowMs);
   try {
     await ddb.send(
       new UpdateCommand({
         TableName: BATTLE_STATE_TABLE,
         Key: { battleId: args.battleId, botArn: args.botArn },
         UpdateExpression:
-          'SET #state = :invoked, enteredStateAt = :now, correlationId = :corr, #ttl = :ttl ' +
+          'SET #state = :invoked, enteredStateAt = :now, correlationId = :corr, ' +
+          'deadlineAt = :deadline, #ttl = :ttl ' +
           'ADD waitedMs :delta ' +
           'REMOVE waitingSince, clarificationQuestion',
         ConditionExpression: 'attribute_exists(botArn) AND #state = :waiting',
@@ -455,7 +656,8 @@ export async function resumeBotFromWaiting(args: {
           ':waiting': 'WAITING_FOR_USER',
           ':now': now,
           ':corr': args.correlationId ?? null,
-          ':ttl': ttl,
+          ':deadline': deadlineAt,
+          ':ttl': ttlForDeadline(deadlineAt),
           ':delta': waitedMs,
         },
       }),
@@ -564,7 +766,10 @@ export async function tryClaimOrchestratorFire(battleId: string): Promise<boolea
  */
 export async function tryClaimRound1Fanout(battleId: string): Promise<boolean> {
   if (!BATTLE_STATE_TABLE) return true; // no state table: cannot dedupe, fan out (dev/athena)
-  const ttl = Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS;
+  // Outlives the DUEL, not one leg. This sentinel is the only thing stopping a redelivered `/battle`
+  // fanning out twice, and a duel that now legitimately runs for an hour would otherwise outlive its own
+  // dedup claim and could be fanned out again on top of itself.
+  const ttl = Math.floor(Date.now() / 1000) + Math.floor(DUEL_MAX_LIFETIME_MS / 1000);
   try {
     await ddb.send(
       new PutCommand({
@@ -660,9 +865,40 @@ export interface BattleContinuationPlan {
 export function planBattleContinuation(
   rows: BattleStateRow[],
   mentions: string[] | undefined,
+  /**
+   * Who is speaking. A DUEL HAS ONE OWNER (owner, 2026-08-13): the person who ran `/battle` is who a
+   * waiting side is waiting on, and the only one whose reply resumes it.
+   *
+   * This used to match on the mentioned BOT alone, so any member of the channel could answer a
+   * question they were never asked and steer a comparison they did not start - and the initiator, who
+   * did start it, would find their duel already moved on. A non-owner's message is not refused here,
+   * it simply does not resume anything: it falls through and is answered as an ordinary turn.
+   *
+   * Omitted, or a battle recorded before owners existed, resumes as before rather than blocking - an
+   * old duel with no recorded owner must not become unanswerable by anyone.
+   */
+  speakerUserSub?: string,
+  /**
+   * The owner as the CALLER resolved it — from the channel pointer (`resolveActiveBattle`), which is
+   * where a duel's owner durably lives.
+   *
+   * This parameter is the fix for an enforcement that shipped inert. The owner used to be read from the
+   * rows below and only from there, and the rows do not keep it: the terminal transition rewrote the
+   * whole item, so a duel's owner was erased by its own completion and the comparison below ran against
+   * `undefined` — passing for every member, which is the hole it exists to close.
+   *
+   * The row scan stays as a fallback, for an in-flight duel whose pointer predates the field.
+   */
+  ownerUserSub?: string,
 ): BattleContinuationPlan {
+  const botRows = botRowsOnly(rows);
+  const owner = ownerUserSub ?? botRows.find((r) => r.initiatorUserSub)?.initiatorUserSub;
+  if (owner && speakerUserSub && owner !== speakerUserSub) {
+    return { resumeBotArns: [] };
+  }
+
   const waiting = new Set(
-    botRowsOnly(rows)
+    botRows
       .filter((r) => r.state === 'WAITING_FOR_USER')
       .map((r) => r.botArn),
   );
@@ -675,48 +911,6 @@ export function planBattleContinuation(
     }
   }
   return { resumeBotArns };
-}
-
-export interface BattleResumePlan {
-  deliveryOption: 'PLACEHOLDER_UPDATE' | 'TASK_UPDATE_IN_PLACE' | 'TASK_MULTI_STEP';
-  taskType?: string;
-  taskId?: string;
-}
-
-/**
- * Pure. SPEC-BATTLE.md "Per-bot reply UX" — how a resumed bot's invoke
- * should be shaped. Primitives only (the literal-union mirrors the
- * `DeliveryOption` string enum) so it carries no domain coupling and is
- * unit-testable.
- *
- *  - No `rowTaskId` ⇒ a PLACEHOLDER/DIRECT battle → plain re-invoke
- *    (the user's answer becomes the prompt).
- *  - `rowTaskId` set but the task is gone or already terminal ⇒ can't
- *    continue a chain → degrade to a plain re-invoke so the bot still
- *    answers rather than stranding (a missing/finished task must not
- *    leave the bot dead).
- *  - `rowTaskId` set and the task is live ⇒ resume THAT task chain
- *    (carry its deliveryOption + taskType + id; the premium async
- *    processor's existing TASK_* path advances the state machine with
- *    the user's answer as the next turn).
- */
-export function planBattleResume(args: {
-  rowTaskId?: string;
-  task?: { status?: string; deliveryOption?: string; taskType?: string; taskId?: string } | null;
-}): BattleResumePlan {
-  if (!args.rowTaskId) return { deliveryOption: 'PLACEHOLDER_UPDATE' };
-  const t = args.task;
-  if (!t || t.status === 'completed' || t.status === 'failed') {
-    return { deliveryOption: 'PLACEHOLDER_UPDATE' };
-  }
-  // Only resume the chain when the task really is a TASK_* one. Task
-  // fields are returned ONLY with a TASK_* deliveryOption — handing a
-  // taskId to a PLACEHOLDER invoke would be incoherent.
-  const d = t.deliveryOption;
-  if (d === 'TASK_UPDATE_IN_PLACE' || d === 'TASK_MULTI_STEP') {
-    return { deliveryOption: d, taskType: t.taskType, taskId: t.taskId ?? args.rowTaskId };
-  }
-  return { deliveryOption: 'PLACEHOLDER_UPDATE' };
 }
 
 /**

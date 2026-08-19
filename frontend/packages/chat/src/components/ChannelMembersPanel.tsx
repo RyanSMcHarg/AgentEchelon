@@ -18,6 +18,16 @@ import './ChannelMembersPanel.css';
 interface ChannelMembersPanelProps {
   isOpen: boolean;
   onClose: () => void;
+  /**
+   * Called whenever this panel changes the channel's battle config (enable/disable).
+   *
+   * The panel and `ConversationInterface` each hold their OWN copy of the config: the panel needs it
+   * for the toggle, the interface needs it for the battle BRIEFING banner. Without this callback the
+   * interface's copy is fetched once when the conversation opens and never again, so a moderator who
+   * turned Battle Mode on saw no briefing - no decision line, no prompt chips - until they switched
+   * conversations or reloaded. That is the moment the briefing exists to serve.
+   */
+  onBattleConfigChange?: (config: ChannelBattleConfig | null) => void;
 }
 
 type Role = 'moderator' | 'bot' | 'member';
@@ -37,7 +47,7 @@ function initialsFrom(name: string): string {
   return (first + second).toUpperCase() || '?';
 }
 
-const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClose }) => {
+const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClose, onBattleConfigChange }) => {
   const { t } = useTranslation();
   const { activeConversation, channelMembers } = useConversations();
   const { user } = useAuth();
@@ -66,8 +76,10 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
   // /battle (SPEC-BATTLE.md): only premium channels with a
   // moderator caller can toggle Battle Mode. The section is hidden for
   // everyone else; the API enforces the same gates server-side.
-  const isPremium = activeConversation?.modelTier === 'premium';
-  const showBattleSection = isPremium && isCurrentUserModerator;
+  // Loading is gated on the moderator check ALONE, because eligibility is a field on the config we are
+  // about to fetch - pre-gating the fetch on a hardcoded premium check is what made `battleEligible`
+  // unobservable to this panel. Rendering is gated on the fetched capability below.
+  const canLoadBattleConfig = isCurrentUserModerator;
 
   const [battleConfig, setBattleConfig] = useState<ChannelBattleConfig | null>(null);
   // The single battle-enabled experiment for this classification, when we can
@@ -79,8 +91,13 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
   // The resolved battle experiment for display, if listing surfaced one.
   const resolvedBattleExperiment = battleExperiments[0] ?? null;
 
+  // The section renders only for a moderator in a conversation whose PROFILE is battle-eligible. Until
+  // the config lands `battleConfig` is null and the section stays hidden, which is the same thing the
+  // old premium check did for a non-premium channel.
+  const showBattleSection = canLoadBattleConfig && battleConfig?.battleEligible === true;
+
   useEffect(() => {
-    if (!showBattleSection || !activeConversation) {
+    if (!canLoadBattleConfig || !activeConversation) {
       setBattleConfig(null);
       setBattleExperiments([]);
       return;
@@ -118,7 +135,9 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
     return () => {
       cancelled = true;
     };
-  }, [activeConversation, showBattleSection, user?.isAdmin]);
+    // Depends on the LOAD gate, not the render gate: the render gate flips once this effect sets the
+    // config, and depending on it would refetch for no reason.
+  }, [activeConversation, canLoadBattleConfig, user?.isAdmin]);
 
   const handleEnableBattle = async () => {
     if (!activeConversation) return;
@@ -130,6 +149,9 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
       await enableBattle(activeConversation.conversationArn);
       const refreshed = await getBattleConfig(activeConversation.conversationArn);
       setBattleConfig(refreshed);
+      // Tell the conversation view too: its copy is fetched once per conversation, so without this the
+      // briefing banner stays hidden for the moderator who just turned battle on.
+      onBattleConfigChange?.(refreshed);
     } catch (err) {
       setBattleError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -146,7 +168,10 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
     setBattleError(null);
     try {
       await disableBattle(activeConversation.conversationArn);
-      setBattleConfig({ channelArn: activeConversation.conversationArn, enabled: false });
+      const off = { channelArn: activeConversation.conversationArn, enabled: false };
+      setBattleConfig(off);
+      // Symmetric: turning battle OFF must retract the briefing, not leave a stale banner behind.
+      onBattleConfigChange?.(off);
     } catch (err) {
       setBattleError(err instanceof Error ? err.message : String(err));
     } finally {

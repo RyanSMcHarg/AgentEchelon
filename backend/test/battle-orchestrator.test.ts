@@ -100,6 +100,15 @@ const baseEvent: BattleOrchestratorEvent = {
   userMessage: 'Compare REST vs GraphQL',
   senderArn: 'arn:aws:chime:us-east-1:111:app-instance/i/user/sender',
   originatingMessageId: 'msg-orig-1',
+  // THE DUEL'S CLASSIFICATION, which a real invoke always carries: the finishing worker passes it
+  // from `event.userType` through `recordBattleTerminalAndFireOrchestrator`.
+  //
+  // This field was added when round 2 stopped hardcoding the premium processor (an escalation for any
+  // duel a `battleEligible` profile enabled below premium). Without it here, every event in this file
+  // resolved to the STANDARD key, found no standard env or param, correctly declined to fall back
+  // upward, and the handler returned before sending anything - so nine assertions about round-2
+  // fan-out SHAPE were failing on setup rather than exercising the shape at all.
+  classification: 'premium',
 };
 
 beforeEach(() => {
@@ -246,8 +255,13 @@ describe('battle-orchestrator handler', () => {
     });
   });
 
-  describe('partial-failure handling', () => {
-    it('still fans out round 2 when one bot failed round 1', async () => {
+  describe('partial-failure handling (fail-loud / degraded round 2, B2)', () => {
+    it('runs a DEGRADED round 2 for the survivor only when one bot FAILED round 1', async () => {
+      // NEW contract (DESIGN §3.4 B2, orchestrator header L27-33): a round-1
+      // participant that FAILED (or stalled past deadline) does NOT get a
+      // round-2 invocation. Instead the orchestrator posts an explicit "didn't
+      // finish in time" turn for it and runs a degraded round 2 for the
+      // completed survivor only, flagged so the rebuttal can acknowledge it.
       mockReadBattleRows.mockResolvedValueOnce([
         { battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED', round1Reply: 'A says', round1MessageId: 'msg-A' },
         { battleId: BATTLE_ID, botArn: BOT_B, state: 'FAILED' },
@@ -259,15 +273,28 @@ describe('battle-orchestrator handler', () => {
       const handler = await loadHandler();
       await handler(baseEvent);
 
-      // Both bots still get round-2 invocations; the FAILED bot's rival
-      // (BOT_A) sees the empty/failed reply.
-      expect(mockLambdaSend).toHaveBeenCalledTimes(2);
-      const bInvoke = mockLambdaSend.mock.calls.find((c) =>
+      // Only the survivor (BOT_A) is invoked for round 2 — NOT the failed bot.
+      expect(mockLambdaSend).toHaveBeenCalledTimes(1);
+      const invoke = mockLambdaSend.mock.calls[0][0];
+      const payload = JSON.parse(Buffer.from(invoke.input.Payload).toString());
+      expect(payload.botArn).toBe(BOT_A);
+      // The survivor's rival (the FAILED BOT_B) did not finish: the round-2
+      // payload carries the degraded flag and an empty rival reply.
+      expect(payload.battleContext.rivalDidNotFinish).toBe(true);
+      expect(payload.battleContext.rivalReply).toBe('');
+      // The failed bot is never invoked for round 2.
+      const failedInvoked = mockLambdaSend.mock.calls.some((c) =>
         JSON.parse(Buffer.from(c[0].input.Payload).toString()).botArn === BOT_B,
       );
-      const bPayload = JSON.parse(Buffer.from(bInvoke![0].input.Payload).toString());
-      // BOT_B's rival is BOT_A — should receive A's reply text
-      expect(bPayload.battleContext.rivalReply).toBe('A says');
+      expect(failedInvoked).toBe(false);
+
+      // Fail loud: an explicit "didn't finish in time" turn is posted, attributed
+      // to the failed bot (its ChimeBearer) — never a silent stall.
+      const didNotFinish = mockMessagingSend.mock.calls.find((c) =>
+        String(c[0].input.Content).includes("didn't finish"),
+      );
+      expect(didNotFinish).toBeDefined();
+      expect(didNotFinish![0].input.ChimeBearer).toBe(BOT_B);
     });
 
     it('skips a bot whose placeholder send throws (without blocking the other bot)', async () => {
@@ -385,5 +412,98 @@ describe('premium processor ARN resolution (runtime SSM)', () => {
     expect(mockSsmSend).not.toHaveBeenCalled();
     expect(mockReadBattleRows).not.toHaveBeenCalled();
     expect(mockLambdaSend).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * Round 2 answers at the DUEL'S classification, with the same fail-safe rules the channel flow uses.
+ *
+ * This block is new because the behaviour was. Round 2 used to pin the worker to premium, which was an
+ * ESCALATION rather than a shortcut: `battleEligible` is a per-profile flag an operator can turn on for
+ * any classification, so a battle-eligible standard duel answered round 1 on standard and round 2 on
+ * the premium model, guardrail and `context/` S3 scope - all IAM-enforced classification boundaries.
+ * The fix routes round 2 from the duel's own classification; nothing tested the resulting rules until
+ * a full four-shard run surfaced that the whole suite had been failing on setup since that change.
+ *
+ * The asymmetry is the point: premium may degrade DOWNWARD, basic must never resolve upward.
+ */
+describe('round-2 worker routing follows the duel, and never escalates', () => {
+  const terminalRows = [
+    { battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED', round1Reply: 'A says X', round1MessageId: 'msg-A' },
+    { battleId: BATTLE_ID, botArn: BOT_B, state: 'COMPLETED', round1Reply: 'B says Y', round1MessageId: 'msg-B' },
+  ];
+
+  /** Clear every classification's wiring so each case states its own configuration. */
+  const clearAll = () => {
+    for (const k of [
+      'PREMIUM_ASYNC_PROCESSOR_ARN', 'PREMIUM_PROCESSOR_ARN_PARAM',
+      'ASYNC_PROCESSOR_ARN', 'STANDARD_PROCESSOR_ARN_PARAM',
+      'BASIC_ASYNC_PROCESSOR_ARN', 'BASIC_PROCESSOR_ARN_PARAM',
+    ]) delete process.env[k];
+  };
+
+  const readyToFanOut = () => {
+    mockReadBattleRows.mockResolvedValueOnce(terminalRows);
+    mockTryClaimOrchestratorFire.mockResolvedValueOnce(true);
+    mockMessagingSend.mockResolvedValue({});
+    mockLambdaSend.mockResolvedValue({});
+  };
+
+  const workersUsed = () => mockLambdaSend.mock.calls.map((c) => c[0].input.FunctionName);
+
+  it('runs a standard duel on the STANDARD worker, not premium', async () => {
+    // The case the escalation fix exists for: a `battleEligible` standard profile.
+    clearAll();
+    process.env.ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111:function:standard';
+    process.env.PREMIUM_ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111:function:premium';
+    readyToFanOut();
+
+    const handler = await loadHandler();
+    await handler({ ...baseEvent, classification: 'standard' });
+
+    expect(workersUsed()).toHaveLength(2);
+    expect(workersUsed().every((n) => n === 'arn:aws:lambda:us-east-1:111:function:standard')).toBe(true);
+  });
+
+  it('treats an ABSENT classification as standard, which is a downgrade and never an escalation', async () => {
+    // An in-flight invoke from before the field existed. Answering it on premium would be the very
+    // escalation the field was added to stop, so the default has to be the lower rung.
+    clearAll();
+    process.env.ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111:function:standard';
+    process.env.PREMIUM_ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111:function:premium';
+    readyToFanOut();
+
+    const handler = await loadHandler();
+    await handler({ ...baseEvent, classification: undefined });
+
+    expect(workersUsed().every((n) => n === 'arn:aws:lambda:us-east-1:111:function:standard')).toBe(true);
+  });
+
+  it('lets PREMIUM degrade to standard when no premium worker is wired', async () => {
+    clearAll();
+    process.env.ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111:function:standard';
+    readyToFanOut();
+
+    const handler = await loadHandler();
+    await handler({ ...baseEvent, classification: 'premium' });
+
+    // A downgrade is safe; silence is not.
+    expect(workersUsed().every((n) => n === 'arn:aws:lambda:us-east-1:111:function:standard')).toBe(true);
+  });
+
+  it('NEVER resolves basic upward: an unwired basic duel declines rather than borrowing a higher worker', async () => {
+    // THE ASYMMETRY. Basic falling back to standard would answer with a higher classification's model,
+    // guardrail and context scope - the cross-classification leak the whole routing rule prevents. It
+    // must decline instead, even though that means the duel does not finish.
+    clearAll();
+    process.env.ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111:function:standard';
+    process.env.PREMIUM_ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111:function:premium';
+
+    const handler = await loadHandler();
+    await handler({ ...baseEvent, classification: 'basic' });
+
+    expect(mockLambdaSend).not.toHaveBeenCalled();
+    expect(mockMessagingSend).not.toHaveBeenCalled();
+    expect(mockReadBattleRows).not.toHaveBeenCalled();
   });
 });

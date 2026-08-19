@@ -8,11 +8,12 @@
  * Owns end-to-end:
  *   - Battle tables: `BattleState` (per-bot round state), `ChannelBattleConfig`
  *     (per-channel enable flag), `BattleOutcome` (the user's winner pick).
- *   - A battle-OWNED Lex bot + a silent alt-slot fulfillment handler
+ *   - A battle-OWNED Lex bot + the alt-slot fulfillment handler
  *     (`battle-alt-slot-handler.ts`). The alt-slots run on THIS Lex, which keeps
- *     battle self-contained. Real battle replies come from the channel-flow
- *     processor direct-invoking the premium async-processor; this Lex is only
- *     the alt-slots' formal `InvokedBy` handle.
+ *     battle self-contained and is what avoids a battle<->premium deploy cycle.
+ *     Round-1 replies come from the channel flow handing the turn to the router;
+ *     a USER answering an alt side arrives through this Lex, and the handler hands
+ *     that turn to the same router with the slot's own identity attached.
  *   - The alt-bot slot pool (AppInstanceBots with no static persona; the
  *     model/prompt each serves is read at runtime from the bound experiment
  *     variant) + per-slot + roster SSM.
@@ -104,10 +105,21 @@ export class BattleStack extends cdk.Stack {
       pointInTimeRecoverySpecification: { pointInTimeRecoveryEnabled: true },
     });
 
-    // BattleOutcomeTable: the user's explicit head-to-head pick per battle
-    // (SPEC-BATTLE.md §"Battle Scoring & Per-Step Telemetry", decision 3). PK
-    // battleId, one row, last-write-wins. No TTL — the pick is the durable
-    // scorecard record. Descriptive only; never read back into variant selection.
+    // BattleOutcomeTable: every channel member's explicit head-to-head pick per
+    // battle (SPEC-BATTLE.md §"Battle Scoring & Per-Step Telemetry", decision 3;
+    // DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP.md §3.4 B3 + A.4). PK battleId, ONE
+    // item per battle holding a per-user `votes` MAP keyed by the chooser's Cognito
+    // sub (see lib/battle-outcome.ts). Each member's pick is retained (re-picking
+    // overwrites only that user's map entry via an atomic `SET votes.<sub>`), and
+    // the winner is a TALLY of decisive picks, not the last click. No TTL — the
+    // pick is the durable scorecard record. Descriptive only; never read back into
+    // variant selection.
+    //
+    // The per-user map lives INSIDE the item under the SAME PK (battleId), so this
+    // is a purely ADDITIVE, item-level change — no sort key, no table re-key, no
+    // destructive replacement, and deployed rows keep working (INV-2). The reader
+    // (extractPicks) is versioned and tolerates a legacy v1 single-pick row during
+    // cutover, so no backfill is required.
     const battleOutcomeTable = new dynamodb.Table(this, 'BattleOutcomeTable', {
       partitionKey: { name: 'battleId', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -134,14 +146,68 @@ export class BattleStack extends cdk.Stack {
       entry: path.join(__dirname, '../../lambda/src/battle-alt-slot-handler.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: cdk.Duration.seconds(15),
+      // A real turn is now handed to the classification router and awaited, so this outlives a
+      // silent close. Bounded well under the router's own budget: a timeout here costs the user
+      // their answer, not correctness, because the handler degrades to silence.
+      timeout: cdk.Duration.seconds(60),
       memorySize: 256,
+      environment: {
+        SSM_ROOT: SSM_ROOT,
+        ALT_BOT_SLOTS_ROSTER_PARAM: `${SSM_ROOT}/alt-bot-slots/roster`,
+      },
       bundling: { minify: false, forceDockerBundling: false },
     });
+    // RESOLVED AT RUNTIME, NOT AT DEPLOY. Reading a classification router's ARN at synth would make
+    // this stack depend on the classification stacks, which already depend on this one through the
+    // battle SSM contract - neither could then go first. So the handler reads the channel's own
+    // classification tag when a turn arrives and resolves THAT classification's router parameter
+    // (battles are not premium-only), and the grant is name-pattern scoped for the same reason:
+    // the ARNs are unknown here.
+    altSlotHandler.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['ssm:GetParameter'],
+      resources: [
+        `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/alt-bot-slots/roster`,
+        `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/router-arn`,
+      ],
+    }));
+    // The classification gate reads the IMMUTABLE `classification` tag (never mutable metadata),
+    // same as every other turn path; channel-scoped, not instance-wide.
+    altSlotHandler.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['chime:ListTagsForResource'],
+      resources: [`${props.appInstanceArn}/channel/*`],
+    }));
+    // SCOPED TO THIS DEPLOYMENT'S OWN HANDLERS, which is not the same as scoped to a plausible name.
+    // This previously read `function:*AgentHandler*`, and the leading wildcard made it account-wide in
+    // an account that hosts several products: it matched Youji's and CommunicationHub's agent handlers
+    // as well as ours. That is worse than an ordinary over-grant, because our identity guard
+    // (`isSanctionedBattleBot`) runs INSIDE our handler - another product's handler never runs it, so
+    // nothing on the far side of the grant applied our sanction model, loop guard or budget.
+    //
+    // One target: the premium classification router, resolved from SSM at runtime (see the comment
+    // above on why the ARN cannot be known here). `${STACK_PREFIX}Classification-*` is the same pattern
+    // the sibling grants in this file, channel-flow-stack and post-processing-stack already use, and
+    // being a PREFIX it is safe against the CloudFormation name truncation ADR-030 records - truncation
+    // removes characters from the end, which a prefix pattern still matches.
+    altSlotHandler.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['lambda:InvokeFunction'],
+      resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Classification-*`],
+    }));
+    // To answer "which slot am I": the link between this Lex bot and its Chime bot is the
+    // AppInstanceBot's own configured alias, read from the bots the roster names.
+    altSlotHandler.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['chime:DescribeAppInstanceBot'],
+      resources: [`arn:aws:chime:${this.region}:${this.account}:app-instance/*`],
+    }));
+    // `sourceAccount`, for the same reason as the classification handler's own Lex permission (see
+    // `assistant-profile-stack.ts`): the Lex SERVICE principal alone accepts an invoke originating from
+    // ANY account. This handler is deliberately silent, so the impact here is far smaller - but the
+    // condition is added on both because "which of our Lex-invoked handlers is harmless" is not a
+    // property worth tracking, and a silent handler is one edit away from not being silent.
     new lambda.CfnPermission(this, 'AltSlotHandlerLexInvoke', {
       action: 'lambda:InvokeFunction',
       functionName: altSlotHandler.functionName,
       principal: 'lexv2.amazonaws.com',
+      sourceAccount: cdk.Stack.of(this).account,
     });
     const altSlotHandlerArn = altSlotHandler.functionArn;
 
@@ -378,7 +444,14 @@ export class BattleStack extends cdk.Stack {
       role: battleOrchestratorRole,
       environment: {
         BATTLE_STATE_TABLE: battleStateTable.tableName,
+        // ALL THREE, so round 2 answers at the duel's own classification. It used to receive only the
+        // premium param and so answered every rebuttal on the premium processor - an escalation for
+        // any duel a `battleEligible` profile enabled below premium, which is an operator setting
+        // rather than an impossibility. The invoke grant is already a `Classification-*` wildcard, so
+        // this needs no IAM change.
         PREMIUM_PROCESSOR_ARN_PARAM: processorArnKey('premium'),
+        STANDARD_PROCESSOR_ARN_PARAM: processorArnKey('standard'),
+        BASIC_PROCESSOR_ARN_PARAM: processorArnKey('basic'),
         // Resolve-once round-2 variant resolution (loadExperiments reads this table).
         EXPERIMENTS_TABLE: experimentsTableName,
       },
@@ -387,7 +460,7 @@ export class BattleStack extends cdk.Stack {
     this.battleOrchestratorFunctionArn = battleOrchestrator.functionArn;
 
     // ============================================================
-    // Shared SSM contract for the per-classification stacks (SPEC-PER-TIER-OWNERSHIP.md).
+    // Shared SSM contract for the per-classification stacks (SPEC-PER-PROFILE-OWNERSHIP.md).
     // AgentEchelonClassification-{Standard,Premium} resolve these at DEPLOY time via
     // valueForStringParameter (dynamic ref, NOT Fn::importValue) — but ONLY when
     // their own `enableBattle` is set, so a classification can deploy with battle off.
@@ -489,7 +562,10 @@ export class BattleStack extends cdk.Stack {
         BattleOutcomeDdb: new iam.PolicyDocument({
           statements: [
             new iam.PolicyStatement({
-              actions: ['dynamodb:GetItem', 'dynamodb:PutItem'],
+              // UpdateItem: recordBattleOutcome writes the per-user votes map with nested-path
+              // UpdateExpressions (`SET votes = if_not_exists(...)` then `SET votes.<sub> = ...`), not a
+              // whole-item Put - so the outcome Lambda needs UpdateItem or the pick write AccessDenies (503).
+              actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem'],
               resources: [battleOutcomeTable.tableArn],
             }),
           ],
@@ -499,6 +575,18 @@ export class BattleStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['chime:DescribeChannelMembership'],
               resources: [`${props.appInstanceArn}/*`],
+            }),
+          ],
+        }),
+        // Read-only on the channel battle config: the outcome handler resolves the pick's
+        // experimentId from the channel server-side rather than trusting the client to send it.
+        // Without this grant the lookup fails open and every pick records UNATTRIBUTED, which
+        // reads downstream as "no battle wins" rather than as an error.
+        BattleOutcomeChannelConfig: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['dynamodb:GetItem'],
+              resources: [channelBattleConfigTable.tableArn],
             }),
           ],
         }),
@@ -516,6 +604,7 @@ export class BattleStack extends cdk.Stack {
       environment: {
         APP_INSTANCE_ARN: props.appInstanceArn,
         BATTLE_OUTCOME_TABLE: battleOutcomeTable.tableName,
+        CHANNEL_BATTLE_CONFIG_TABLE: channelBattleConfigTable.tableName,
         ALLOWED_ORIGIN: appUrl,
       },
       bundling: { minify: false, forceDockerBundling: false },

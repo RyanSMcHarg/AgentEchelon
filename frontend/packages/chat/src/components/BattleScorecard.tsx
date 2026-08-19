@@ -65,6 +65,14 @@ interface BattleScorecardProps {
    *  can keep a live conversation-wide tally (SPEC-BATTLE Battle Objectives,
    *  objective 2). Fired on initial load, on a pick, and on rollback. */
   onOutcomeChange?: (battleId: string, winner: BattleWinner | null) => void;
+  /**
+   * The pick already known for this battle, held by the parent so it survives THIS component
+   * unmounting. The scorecard is rendered against one message, so an arriving round-2 reply can move
+   * it to a different message: React then discards this instance and its `winner` with it, and the
+   * fresh instance's mount fetch races the pick POST. When that fetch wins, a pick the server has
+   * already recorded renders as unpicked and the user cannot tell it registered.
+   */
+  knownWinner?: BattleWinner;
 }
 
 function formatMs(ms?: number): string {
@@ -91,9 +99,11 @@ function breakdownOf(v: ScorecardVariant): string | null {
   return null;
 }
 
-const BattleScorecard: React.FC<BattleScorecardProps> = ({ battleId, channelArn, variantA, variantB, onOutcomeChange }) => {
+const BattleScorecard: React.FC<BattleScorecardProps> = ({ battleId, channelArn, variantA, variantB, onOutcomeChange, knownWinner }) => {
   const { t } = useTranslation();
-  const [winner, setWinner] = useState<BattleWinner | null>(null);
+  // Seeded from the parent so a remount resumes showing the pick rather than starting blank and
+  // waiting on a fetch that may not see it yet.
+  const [winner, setWinner] = useState<BattleWinner | null>(knownWinner ?? null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showSteps, setShowSteps] = useState(false);

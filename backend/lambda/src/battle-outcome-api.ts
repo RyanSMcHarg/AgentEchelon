@@ -29,7 +29,7 @@ import {
 } from '@aws-sdk/client-chime-sdk-messaging';
 import {
   recordBattleOutcome,
-  readBattleOutcome,
+  readUserBattleOutcome,
 } from './lib/battle-outcome.js';
 import { loadChannelBattleConfig } from './lib/battle-state.js';
 import type { BattleOutcome } from './lib/analytics-metadata.js';
@@ -149,6 +149,16 @@ async function handlePost(
       channelArn, err: (cfgErr as Error).name,
     });
   }
+  if (!experimentId) {
+    // Not necessarily wrong - an unbound (legacy) battle has no experiment. But it is also what a
+    // missing CHANNEL_BATTLE_CONFIG_TABLE grant looks like, and an unattributed pick is invisible
+    // downstream: the analytics scan filters picks by experimentId, so this one silently never
+    // counts toward battle wins. Say so here rather than letting the tally read as a flat zero.
+    console.warn('[battle-outcome] recording pick with NO experiment attribution', {
+      channelArn,
+      configTableSet: Boolean(process.env.CHANNEL_BATTLE_CONFIG_TABLE),
+    });
+  }
 
   const outcome = await recordBattleOutcome({
     battleId,
@@ -174,14 +184,32 @@ async function handleGet(
   event: APIGatewayProxyEvent,
   origin?: string,
 ): Promise<APIGatewayProxyResult> {
-  if (!getCallerSub(event)) {
+  const callerSub = getCallerSub(event);
+  if (!callerSub) {
     return respond(401, { error: 'Unauthorized — no Cognito sub on the request' }, origin);
   }
   const battleId = (event.queryStringParameters?.battleId || '').trim();
   if (!battleId) {
     return respond(400, { error: 'Missing battleId' }, origin);
   }
-  const outcome = await readBattleOutcome(battleId);
+  // Return the CALLER'S OWN pick (the scorecard "you picked" state) - never another user's pick or sub.
+  // readUserBattleOutcome scopes to callerSub, so a caller who didn't vote (or isn't in the battle) gets
+  // null, and no other member's sub is ever disclosed. This also realizes the per-user votes-map read
+  // (the legacy read returned "whoever voted last", which both leaked a sub and was wrong in a group).
+  const pick = await readUserBattleOutcome(battleId, callerSub);
+  const outcome: BattleOutcome | null = pick
+    ? {
+        battleId,
+        winner: pick.winner,
+        chosenByUserSub: pick.userSub, // == callerSub (their own)
+        chosenAt: pick.chosenAt,
+        ...(pick.controlConfigId && { controlConfigId: pick.controlConfigId }),
+        ...(pick.treatmentConfigId && { treatmentConfigId: pick.treatmentConfigId }),
+        ...(pick.experimentId && { experimentId: pick.experimentId }),
+        ...(pick.variantId && { variantId: pick.variantId }),
+        ...(pick.intent && { intent: pick.intent }),
+      }
+    : null;
   return respond(200, { outcome }, origin); // outcome may be null — "no pick yet"
 }
 

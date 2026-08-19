@@ -97,43 +97,42 @@ describe('parseBattleClarification', () => {
 describe('planBattleClarificationDelivery', () => {
   const BATTLE_ID = 'a1b2c3d4e5f60718';
   const BOT = 'arn:aws:chime:us-east-1:111:app-instance/i/bot/AltSlot0';
-  const USER = 'arn:aws:chime:us-east-1:111:app-instance/i/user/u-123';
+  // USER is gone with the targeted question: ADR-029 broadcasts it, so nothing is addressed here.
   const QUESTION = 'Which fiscal quarter should the report cover — Q3 or Q4?';
 
-  it('placeholder is a neutral waiting state — NEVER the question', () => {
+  // ADR-029 REVERSES THE PRIVACY RULE, so these assertions are the inverse of the ones they replace.
+  // The question is a public, permanent part of the duel: it REPLACES this side's placeholder and
+  // stays. The neutral "Assistant is waiting for your response." copy and the separate `Target`-ed
+  // question message are both gone. What still protects the measurement property is that the user's
+  // REPLY stays targeted at the asking assistant - a rival learns what its opponent found ambiguous,
+  // never what the user answered.
+  it('the placeholder becomes the QUESTION itself, broadcast', () => {
     const d = planBattleClarificationDelivery({
       battleId: BATTLE_ID,
       botArn: BOT,
-      senderArn: USER,
       question: QUESTION,
     });
-    expect(d.waitingPlaceholderContent).toContain('waiting for your response');
-    // The question must not leak into the broadcast placeholder.
-    expect(d.waitingPlaceholderContent).not.toContain(QUESTION);
-    expect(d.waitingPlaceholderContent).not.toContain('Q3');
+    expect(d.waitingPlaceholderContent).toContain(QUESTION);
+    // The neutral copy is what this replaced; its return would mean the question is hidden again.
+    expect(d.waitingPlaceholderContent).not.toContain('waiting for your response');
   });
 
   it('placeholder carries the battlewaiting marker, shaped like battlestats/battle', () => {
-    const d = planBattleClarificationDelivery({ battleId: BATTLE_ID, botArn: BOT, senderArn: USER });
+    const d = planBattleClarificationDelivery({ battleId: BATTLE_ID, botArn: BOT });
     expect(d.waitingPlaceholderContent).toContain(
       `<!--battlewaiting:battleId=${BATTLE_ID},botArn=${BOT}-->`,
     );
   });
 
-  it('question is targeted to the invoking user only', () => {
+  it('emits ONE message: there is no targeted second send to lose', () => {
     const d = planBattleClarificationDelivery({
       battleId: BATTLE_ID,
       botArn: BOT,
-      senderArn: USER,
       question: QUESTION,
     });
-    expect(d.targetedQuestion).toEqual({ content: QUESTION, targetMemberArn: USER });
-  });
-
-  it('no senderArn → targetedQuestion null but placeholder still produced', () => {
-    const d = planBattleClarificationDelivery({ battleId: BATTLE_ID, botArn: BOT, question: QUESTION });
-    expect(d.targetedQuestion).toBeNull();
-    expect(d.waitingPlaceholderContent).toContain('waiting for your response');
+    // The old shape returned `targetedQuestion`, which was null whenever the sender could not be
+    // resolved - a waiting bubble with no question in it, and no way for the user to answer.
+    expect(Object.keys(d)).toEqual(['waitingPlaceholderContent']);
   });
 
   it('absent/empty question → a sensible fallback ask (lone-sentinel case)', () => {
@@ -141,11 +140,12 @@ describe('planBattleClarificationDelivery', () => {
       const d = planBattleClarificationDelivery({
         battleId: BATTLE_ID,
         botArn: BOT,
-        senderArn: USER,
         question: q,
       });
-      expect(d.targetedQuestion?.content).toMatch(/clarify/i);
-      expect(d.targetedQuestion?.targetMemberArn).toBe(USER);
+      expect(d.waitingPlaceholderContent).toMatch(/clarify/i);
+      expect(d.waitingPlaceholderContent).toContain(
+        `<!--battlewaiting:battleId=${BATTLE_ID},botArn=${BOT}-->`,
+      );
     }
   });
 });

@@ -96,16 +96,27 @@ describe('initBotState', () => {
     expect(cmd.input.Item.battleId).toBe(BATTLE_ID);
     expect(cmd.input.Item.botArn).toBe(BOT_A);
     expect(cmd.input.ConditionExpression).toBe('attribute_not_exists(botArn)');
-    // No taskId → PLACEHOLDER/DIRECT battle: the attribute is absent
-    // (not undefined) so the continuation router's presence check is clean.
+    // THE ROW CARRIES NOTHING ABOUT TASKS (DESIGN-BATTLE §2a). A battle is not a task, so battle
+    // state never answers a battle question out of task state: the continuation path finds a side's
+    // chain by asking who owns it. Put a taskId back on this row and the fusion is back.
     expect('taskId' in cmd.input.Item).toBe(false);
   });
 
-  it('stamps taskId for a TASK_* battle (continuation router uses its presence)', async () => {
+  it('records NO task on a TASK_* battle either', async () => {
     mockSend.mockResolvedValueOnce({} as PutCommandOutput);
     const { initBotState } = await import('../../lambda/src/lib/battle-state');
-    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'c', taskId: 'task-42' });
-    expect(mockSend.mock.calls[0][0].input.Item.taskId).toBe('task-42');
+    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'c' });
+    const item = mockSend.mock.calls[0][0].input.Item;
+    expect('taskId' in item).toBe(false);
+    // And with it goes the ordering problem that forced it: the row must be written BEFORE the
+    // invoke so a crashed side is visible in flight, while a task id only exists AFTER the handler
+    // returns. Nothing has to be attached in a second write, because nothing is needed.
+    // `deadlineAt` joins the set (ADR-026): a freshly invoked side is GENERATING, so the row records
+    // which clock it is on rather than leaving the orchestrator to infer one from `enteredStateAt`.
+    // The strict key set is the point of this assertion - it is what catches a task field creeping back.
+    expect(Object.keys(item).sort()).toEqual(
+      ['battleId', 'botArn', 'correlationId', 'deadlineAt', 'enteredStateAt', 'state', 'ttl'],
+    );
   });
 
   it('swallows ConditionalCheckFailedException (retries are no-ops)', async () => {
@@ -139,15 +150,40 @@ describe('transitionBotState', () => {
 
     expect(result).toBe(true);
     const cmd = mockSend.mock.calls[0][0];
-    expect(cmd.input.Item.state).toBe('COMPLETED');
-    expect(cmd.input.Item.round1Reply).toBe('the reply text');
-    expect(cmd.input.Item.round1MessageId).toBe('msg-reply-A');
+    expect(cmd.input.Key).toEqual({ battleId: BATTLE_ID, botArn: BOT_A });
+    expect(cmd.input.ExpressionAttributeValues[':state']).toBe('COMPLETED');
+    expect(cmd.input.ExpressionAttributeValues[':r1']).toBe('the reply text');
+    expect(cmd.input.ExpressionAttributeValues[':r1mid']).toBe('msg-reply-A');
     // Conditional: only transition if the row doesn't yet exist OR is
     // still in a non-terminal (INVOKED|WAITING_FOR_USER) state.
     expect(cmd.input.ConditionExpression).toContain('attribute_not_exists(botArn)');
     expect(cmd.input.ConditionExpression).toContain('IN');
     expect(cmd.input.ExpressionAttributeValues[':invoked']).toBe('INVOKED');
     expect(cmd.input.ExpressionAttributeValues[':waiting']).toBe('WAITING_FOR_USER');
+  });
+
+  /**
+   * THE TERMINAL WRITE USED TO ERASE THE ROW IT WAS TRANSITIONING. It was a whole-item Put built from
+   * its own arguments, so every attribute the row had accumulated - the duel's owner, the
+   * clarification counter, the banked user-wait, the waiting message id - was gone the moment a side
+   * finished. That is why LIVE rows read `owner=(none)` on duels started after the owner shipped.
+   *
+   * A state transition updates the state. It does not get to forget the rest of the row.
+   */
+  it('PRESERVES the rest of the row: it updates the state, it does not rewrite the item', async () => {
+    mockSend.mockResolvedValueOnce({} as PutCommandOutput);
+    const { transitionBotState } = await import('../../lambda/src/lib/battle-state');
+    await transitionBotState({
+      battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED', correlationId: 'corr-A',
+    });
+
+    const cmd = mockSend.mock.calls[0][0];
+    expect(cmd.__type).toBe('Update');
+    // Nothing may name these: an UpdateExpression that SETs them is the whole-item rewrite in
+    // another shape.
+    for (const field of ['initiatorUserSub', 'clarificationCount', 'waitedMs', 'waitingSince']) {
+      expect(cmd.input.UpdateExpression).not.toContain(field);
+    }
   });
 
   it('returns false (race-loser) when the conditional fails', async () => {
@@ -184,7 +220,7 @@ describe('transitionBotState', () => {
       correlationId: 'corr-A',
     });
     expect(ok).toBe(true);
-    expect(mockSend.mock.calls[0][0].input.Item.state).toBe('FAILED');
+    expect(mockSend.mock.calls[0][0].input.ExpressionAttributeValues[':state']).toBe('FAILED');
   });
 });
 
@@ -447,6 +483,29 @@ describe('setActiveBattle (channel→battle pointer at fan-out)', () => {
     expect(mockSend).toHaveBeenCalledTimes(2); // not served from a stale cache
   });
 
+  it('records the duel owner on the pointer', async () => {
+    mockSend.mockResolvedValueOnce({} as PutCommandOutput);
+    const { setActiveBattle } = await import('../../lambda/src/lib/battle-state');
+    await setActiveBattle({ channelArn: CHANNEL_ARN, battleId: BATTLE_ID, initiatorUserSub: 'user-owner' });
+
+    const cmd = mockSend.mock.calls[0][0];
+    expect(cmd.input.UpdateExpression).toContain('activeBattleInitiator = :i');
+    expect(cmd.input.ExpressionAttributeValues[':i']).toBe('user-owner');
+  });
+
+  it('CLEARS a previous duel\'s owner when the new one has none', async () => {
+    // The pointer is one row reused by every battle in the channel. Leaving the old value behind
+    // would hand the new duel the PREVIOUS initiator as its owner - which locks the real owner out of
+    // their own duel and lets the previous one resume it. A stale owner is worse than no owner.
+    mockSend.mockResolvedValueOnce({} as PutCommandOutput);
+    const { setActiveBattle } = await import('../../lambda/src/lib/battle-state');
+    await setActiveBattle({ channelArn: CHANNEL_ARN, battleId: BATTLE_ID });
+
+    const cmd = mockSend.mock.calls[0][0];
+    expect(cmd.input.UpdateExpression).toContain('REMOVE activeBattleInitiator');
+    expect(cmd.input.ExpressionAttributeValues[':i']).toBeUndefined();
+  });
+
   it('is non-fatal: a failed write must not throw (battle still fans out)', async () => {
     mockSend.mockRejectedValueOnce(new Error('ddb down'));
     const { setActiveBattle } = await import('../../lambda/src/lib/battle-state');
@@ -478,13 +537,28 @@ describe('resolveActiveBattleId (continuation pre-filter)', () => {
     expect(await resolveActiveBattleId(CHANNEL_ARN)).toBeNull();
   });
 
-  it('returns null when the pointer is older than the BattleState TTL (stale → aged out)', async () => {
-    const stale = new Date(Date.now() - 601_000).toISOString(); // > 600s
+  it('returns null when the pointer is older than the DUEL lifetime (stale → aged out)', async () => {
+    const stale = new Date(Date.now() - 14_401_000).toISOString(); // > BATTLE_MAX_LIFETIME_MS (4h)
     mockSend.mockResolvedValueOnce({
       Item: { channelArn: CHANNEL_ARN, enabled: true, activeBattleId: BATTLE_ID, activeBattleStartedAt: stale },
     } as unknown as GetCommandOutput);
     const { resolveActiveBattleId } = await import('../../lambda/src/lib/battle-state');
     expect(await resolveActiveBattleId(CHANNEL_ARN)).toBeNull();
+  });
+
+  it('STILL HOLDS the pointer past ten minutes — a task-shaped duel runs at human pace (ADR-026)', async () => {
+    // This is the behaviour change, and it is the half worth pinning. The bound was
+    // `STATE_TTL_SECONDS` (10 min), which is the right order for a single-turn duel and wrong for one
+    // collecting requirements from a person: it released the single-active-battle pointer mid-duel, so a
+    // SECOND `/battle` could start alongside the first. An over-long bound is safe here by design (the
+    // docstring makes the pointer a cheap pre-filter, with live rows arbitrating); an over-short one is
+    // the defect.
+    const twentyMinutesIn = new Date(Date.now() - 1_200_000).toISOString();
+    mockSend.mockResolvedValueOnce({
+      Item: { channelArn: CHANNEL_ARN, enabled: true, activeBattleId: BATTLE_ID, activeBattleStartedAt: twentyMinutesIn },
+    } as unknown as GetCommandOutput);
+    const { resolveActiveBattleId } = await import('../../lambda/src/lib/battle-state');
+    expect(await resolveActiveBattleId(CHANNEL_ARN)).toBe(BATTLE_ID);
   });
 
   it('returns the pointer (lets rows arbitrate) when the timestamp is missing/invalid', async () => {
@@ -577,62 +651,6 @@ describe('planBattleContinuation (per-bot resume routing — pure)', () => {
   });
 });
 
-describe('planBattleResume (PLACEHOLDER vs TASK_* resume shape — pure)', () => {
-  it('no rowTaskId → plain re-invoke, no task fields', async () => {
-    const { planBattleResume } = await import('../../lambda/src/lib/battle-state');
-    expect(planBattleResume({ rowTaskId: undefined, task: null }))
-      .toEqual({ deliveryOption: 'PLACEHOLDER_UPDATE' });
-  });
-
-  it('TASK_* battle, live task → resume that chain (carries deliveryOption/taskType/taskId)', async () => {
-    const { planBattleResume } = await import('../../lambda/src/lib/battle-state');
-    expect(
-      planBattleResume({
-        rowTaskId: 'task-1',
-        task: { status: 'in_progress', deliveryOption: 'TASK_MULTI_STEP', taskType: 'report_generation', taskId: 'task-1' },
-      }),
-    ).toEqual({ deliveryOption: 'TASK_MULTI_STEP', taskType: 'report_generation', taskId: 'task-1' });
-  });
-
-  it('TASK_* battle but task gone → degrade to plain re-invoke (no stranding)', async () => {
-    const { planBattleResume } = await import('../../lambda/src/lib/battle-state');
-    expect(planBattleResume({ rowTaskId: 'task-1', task: null }))
-      .toEqual({ deliveryOption: 'PLACEHOLDER_UPDATE' });
-  });
-
-  it('TASK_* battle but task already terminal → degrade to plain re-invoke', async () => {
-    const { planBattleResume } = await import('../../lambda/src/lib/battle-state');
-    for (const status of ['completed', 'failed']) {
-      expect(
-        planBattleResume({
-          rowTaskId: 'task-1',
-          task: { status, deliveryOption: 'TASK_MULTI_STEP', taskType: 'x', taskId: 'task-1' },
-        }),
-      ).toEqual({ deliveryOption: 'PLACEHOLDER_UPDATE' });
-    }
-  });
-
-  it('live task with a non-TASK deliveryOption → plain re-invoke, NO task fields (coherent)', async () => {
-    const { planBattleResume } = await import('../../lambda/src/lib/battle-state');
-    expect(
-      planBattleResume({
-        rowTaskId: 'task-1',
-        task: { status: 'in_progress', deliveryOption: 'PLACEHOLDER_UPDATE', taskType: 'x', taskId: 'task-1' },
-      }),
-    ).toEqual({ deliveryOption: 'PLACEHOLDER_UPDATE' });
-  });
-
-  it('falls back to rowTaskId when the task record omits its own taskId', async () => {
-    const { planBattleResume } = await import('../../lambda/src/lib/battle-state');
-    expect(
-      planBattleResume({
-        rowTaskId: 'row-task-9',
-        task: { status: 'pending', deliveryOption: 'TASK_UPDATE_IN_PLACE', taskType: 'data_extraction' },
-      }),
-    ).toEqual({ deliveryOption: 'TASK_UPDATE_IN_PLACE', taskType: 'data_extraction', taskId: 'row-task-9' });
-  });
-});
-
 describe('computeActiveResponseMs (elapsed − waited — pure)', () => {
   it('subtracts the banked wait', async () => {
     const { computeActiveResponseMs } = await import('../../lambda/src/lib/battle-state');
@@ -682,5 +700,134 @@ describe('getBotRow (single-item self-row read)', () => {
     const { getBotRow } = await import('../../lambda/src/lib/battle-state');
     expect(await getBotRow(BATTLE_ID, BOT_A)).toBeNull();
     expect(mockSend).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * A DUEL HAS ONE OWNER: the person who ran `/battle` (owner, 2026-08-13).
+ *
+ * The continuation used to match on the mentioned BOT alone, so any member of the channel could answer
+ * a question they were never asked and steer a comparison they did not start — while the person who
+ * did start it found their duel already moved on. Ownership is what makes "whose reply counts" have one
+ * answer, and it is the same answer the task queue gives, because the waiting side's task is assigned
+ * to that person.
+ */
+describe('planBattleContinuation — only the initiator resumes a duel', () => {
+  const OWNER = 'user-owner';
+  const OTHER = 'user-other';
+  const BOT = 'arn:aws:chime:us-east-1:1:app-instance/i/bot/Atlas';
+
+  const waitingRow = (over: Record<string, unknown> = {}) => ({
+    battleId: 'b1',
+    botArn: BOT,
+    state: 'WAITING_FOR_USER' as const,
+    initiatorUserSub: OWNER,
+    ...over,
+  });
+
+  it('resumes for the owner', async () => {
+    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
+    const plan = planBattleContinuation([waitingRow()], [BOT], OWNER);
+    expect(plan.resumeBotArns).toEqual([BOT]);
+  });
+
+  it('resumes NOTHING for another member, who falls through to an ordinary turn', async () => {
+    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
+    const plan = planBattleContinuation([waitingRow()], [BOT], OTHER);
+    expect(plan.resumeBotArns).toEqual([]);
+  });
+
+  it('resumes for a duel recorded before owners existed, rather than becoming unanswerable', async () => {
+    // An in-flight battle written by the previous build carries no initiator. Blocking it would strand
+    // the duel with nobody able to answer it — worse than the openness being fixed.
+    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
+    const plan = planBattleContinuation([waitingRow({ initiatorUserSub: undefined })], [BOT], OTHER);
+    expect(plan.resumeBotArns).toEqual([BOT]);
+  });
+
+  it('resumes when the speaker is unknown, for the same reason', async () => {
+    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
+    const plan = planBattleContinuation([waitingRow()], [BOT], undefined);
+    expect(plan.resumeBotArns).toEqual([BOT]);
+  });
+
+  /**
+   * THE ENFORCEMENT WAS INERT AS SHIPPED, and this is the half that makes it real.
+   *
+   * The owner was read off the ROWS, and the rows do not reliably keep it: `transitionBotState`
+   * rewrote the whole item on every terminal transition, so a duel's recorded owner was erased by its
+   * own completion. Live rows carried `owner=(none)` half an hour after the deploy that added the
+   * field. A check whose comparand is empty passes for EVERYONE — the exact hole it was added to close.
+   *
+   * The owner is on the CHANNEL POINTER, written once at fan-out by the one writer that knows it, and
+   * every live duel had it. So the caller resolves it there and hands it in.
+   */
+  it('takes the owner the CALLER resolved, when the rows have lost theirs', async () => {
+    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
+    const rowsWithNoOwner = [waitingRow({ initiatorUserSub: undefined })];
+
+    // The shape that shipped: no owner on the row, a stranger replying.
+    expect(planBattleContinuation(rowsWithNoOwner, [BOT], OTHER, OWNER).resumeBotArns).toEqual([]);
+    expect(planBattleContinuation(rowsWithNoOwner, [BOT], OWNER, OWNER).resumeBotArns).toEqual([BOT]);
+  });
+
+  it('still enforces a row-recorded owner when the caller resolved none', async () => {
+    // Defence in depth, and the path an in-flight duel takes across the deploy: the pointer may
+    // predate the field while the rows carry it.
+    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
+    expect(planBattleContinuation([waitingRow()], [BOT], OTHER, undefined).resumeBotArns).toEqual([]);
+  });
+});
+
+/**
+ * The pointer is where a duel's owner LIVES (tracker row 93). `setActiveBattle` is its single writer,
+ * at fan-out, from the `/battle` sender — so it survives every per-row rewrite the duel goes through.
+ */
+describe('resolveActiveBattle — the pointer carries the duel and its owner', () => {
+  const OWNER = 'user-owner';
+
+  it('returns the owner alongside the battle id', async () => {
+    mockSend.mockResolvedValueOnce({
+      Item: {
+        channelArn: CHANNEL_ARN,
+        enabled: true,
+        activeBattleId: BATTLE_ID,
+        activeBattleStartedAt: new Date().toISOString(),
+        activeBattleInitiator: OWNER,
+      },
+    } as unknown as GetCommandOutput);
+    const { resolveActiveBattle } = await import('../../lambda/src/lib/battle-state');
+    expect(await resolveActiveBattle(CHANNEL_ARN)).toEqual({
+      battleId: BATTLE_ID,
+      initiatorUserSub: OWNER,
+    });
+  });
+
+  it('returns the battle with NO owner when the pointer predates the field', async () => {
+    mockSend.mockResolvedValueOnce({
+      Item: {
+        channelArn: CHANNEL_ARN,
+        enabled: true,
+        activeBattleId: BATTLE_ID,
+        activeBattleStartedAt: new Date().toISOString(),
+      },
+    } as unknown as GetCommandOutput);
+    const { resolveActiveBattle } = await import('../../lambda/src/lib/battle-state');
+    expect(await resolveActiveBattle(CHANNEL_ARN)).toEqual({
+      battleId: BATTLE_ID,
+      initiatorUserSub: undefined,
+    });
+  });
+
+  it('returns null on the same staleness rule as resolveActiveBattleId', async () => {
+    const stale = new Date(Date.now() - 14_401_000).toISOString();
+    mockSend.mockResolvedValueOnce({
+      Item: {
+        channelArn: CHANNEL_ARN, enabled: true, activeBattleId: BATTLE_ID,
+        activeBattleStartedAt: stale, activeBattleInitiator: OWNER,
+      },
+    } as unknown as GetCommandOutput);
+    const { resolveActiveBattle } = await import('../../lambda/src/lib/battle-state');
+    expect(await resolveActiveBattle(CHANNEL_ARN)).toBeNull();
   });
 });

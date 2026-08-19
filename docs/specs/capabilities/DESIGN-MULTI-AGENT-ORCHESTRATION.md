@@ -2,6 +2,8 @@
 
 **Status:** Design (alignment doc). This proposes a recommended structure and a set of explicit decisions to confirm. It is not a finalized build; every "Recommendation" below is a starting position pending sign-off, not a committed design.
 
+**Coverage:** none - an alignment document proposing a structure; no code implements it yet.
+
 **Layer:** Core platform (capability - a platform feature under `capabilities/`, not an interaction pillar). Applications consume it; they do not reimplement it.
 
 **Plane:** core. Sub-agents act on the assistant plane (borrowed alt-slot bots), never the admin plane.

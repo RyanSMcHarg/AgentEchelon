@@ -2,9 +2,27 @@
 
 **Status:** Implemented (premium-gated) **Layer:** Core platform (capability - a platform feature, not an interaction pillar; its MECHANISM lives here, its variant CONFIG is assistant-config, pillar 2) **Plane:** core **Technical design:** [DESIGN-BATTLE.md](./DESIGN-BATTLE.md)
 
+**Coverage:** `e2e/battle.spec.ts` - FR1-FR9. **FR10 has none**: its e2e asserts today's behaviour, which is that no side reaches the waiting state, so the answer-then-resume round trip is unasserted and stays that way until a side can raise a question again.
+
 ## 1. Overview
 
 Battle Mode lets a user pit two assistants against each other on the same prompt in one conversation, unifying the head-to-head comparison with the existing probabilistic A/B experiment as a single feature.
+
+**How a duel gets its shape, end to end:** an admin configures an experiment (what is being decided,
+which two variants, whether they are two models or two whole assistant profiles, whether the output
+is text or images), arms it on a conversation, and everyone there is told **what is being tested and
+which prompts will actually settle it** - without being told which side is which model. Members then
+run `/battle <prompt>` and pick a winner, and that pick feeds the same experiment results as ordinary
+traffic. The full chain, with every configuration option and where it lands, is diagrammed in
+[DESIGN-BATTLE §2b](./DESIGN-BATTLE.md).
+
+**What a battle IS, stated first because everything else follows from it: two ordinary turns, asked of
+two assistants, with extra instruction.** Each side answers exactly as it would answer normally. The
+only additions are who gets asked, and the battle context telling a side what it is being asked to do
+differently - in round 2, rebut, build on, or concede to its rival. **A battle is not a different kind
+of turn**, and it is not a task; certain intents are tasks, and a battle turn opens one only when it
+would have anyway. This is what makes a duel a fair comparison: if a side answered on a special path,
+the thing being measured would be the path rather than the assistant.
 
 ## 2. Business Problem
 
@@ -50,19 +68,21 @@ Personas are defined once in [`../../overview/PERSONAS.md`](../../overview/PERSO
 
 **FR2 - Enable battle on a channel.** A moderator of a premium channel can turn Battle Mode on, choosing an armed experiment that matches the channel; the treatment variant joins as a real conversation member and a system message announces it. Turning it off removes the member and announces the departure. *Done when:* enabling adds a visible second assistant and makes `/battle` available; disabling removes it; a non-premium channel cannot enable battle.
 
-**FR3 - Run a battle (round 1, parallel).** A user typing `/battle <prompt>` in a battle-enabled channel gets every assistant in the channel answering the same prompt in parallel. Each assistant knows it is in a battle, so its first reply is not generic and it does not treat the prompt as off-topic or propose starting a new conversation. *Done when:* one `/battle` produces one round-1 reply per assistant, each labeled with its display name, on the same prompt.
+**FR3 - Run a battle (round 1, parallel).** A user typing `/battle <prompt>` in a battle-enabled channel gets every assistant in the channel answering the same prompt in parallel. Each assistant knows it is in a battle, so its first reply is not generic. *Done when:* one `/battle` produces one round-1 reply per assistant, each labeled with its display name, on the same prompt. **Not currently guaranteed:** "does not treat the prompt as off-topic or propose starting a new conversation" was enforced by a battle-side prompt clause deleted with `BATTLE_CONSTRAINTS_ROUND1`; the awareness note that replaced it makes no such statement. Deflecting an explicit request is a defect on any path, not only in a duel, so the fix belongs wherever that is decided rather than in a battle-only clause - see the alignment note in [DESIGN-BATTLE](./DESIGN-BATTLE.md).
 
-**FR4 - Rebut, agree, or stay silent (round 2).** After every side has fully completed round 1, each assistant receives the other's answer and may rebut, build on it, or decline to add anything. Round 2 is commentary; the deliverable is round 1. Round 2 only fires once both sides have *completed the intent* (a report or document battle finishes the deliverable first), not merely posted a first message. *Done when:* round 2 begins only after both sides complete; an assistant that declines leaves no leftover placeholder; both declining is a valid outcome.
+**FR4 - Rebut, agree, or stay silent (round 2).** After every side has fully completed round 1, each assistant receives the other's answer and may rebut, build on it, or decline to add anything. Round 2 is commentary; the deliverable is round 1. Round 2 only fires once both sides have *completed the intent* (a report or document battle finishes the deliverable first), not merely posted a first message. *Done when:* round 2 begins only after both sides complete; an assistant that declines leaves no STALE placeholder - its "One moment..." is updated in place to a visible `No rebuttal.`, so the opt-out is shown honestly and nothing appears then vanishes; both declining is a valid outcome.
 
 **FR5 - Not-enabled is a visible, explained no-op.** `/battle` in a channel without Battle Mode replies to the sender with a one-line hint ("Battle Mode is not enabled here; ask a moderator to turn it on") and broadcasts nothing. *Done when:* the sender sees the hint, no assistant answers, and there is no error and no fallback broadcast.
 
-**FR6 - Three-axis scorecard, no composite.** After both round-1 replies land, the user sees a scorecard with three independent axes shown side by side and never folded into one number: response time, estimated cost, and quality (an explicit human pick: A better, tie, or B better). Cost is labeled an estimate, not a bill. A "Show steps" expander reveals which model ran each step and how long it took. *Done when:* the three axes render separately; the pick records a per-battle outcome; re-picking overwrites; cost carries a "not a bill" caveat.
+**FR6 - Three-axis scorecard, no composite.** After both round-1 replies land, the user sees a scorecard with three independent axes shown side by side and never folded into one number: response time, estimated cost, and quality (an explicit human pick: A better, tie, or B better). Cost is labeled an estimate, not a bill. A "Show steps" expander reveals which model ran each step and how long it took. *Done when:* the three axes render separately; the pick records a per-battle outcome keyed per user (each member's pick is stored under their own sub in the battle's `votes` map); re-picking overwrites the caller's own pick (not another member's); cost carries a "not a bill" caveat.
 
 **FR7 - Per-battle result and per-variant credit.** Each battle ends with its own inline result card for that prompt (each side's response time and estimated cost, and which side the user picked); the next `/battle` gets a fresh card, so the conversation reads as a sequence of independent battle results rather than one running total. In Aurora mode each pick is credited per variant as a "Battle wins" column in the same experiment results as probabilistic traffic. *Done when:* each battle shows its own result card at its end; each pick maps A->control, B->treatment, tie->both, and surfaces in per-variant results.
 
 **FR8 - Unify with A/B, never auto-route.** A battle is the same experiment's two variants compared head-to-head instead of split probabilistically. Battle results are descriptive: a leading variant produces a recommendation, and promotion stays a deliberate manual config change. *Done when:* no battle outcome changes routing on its own; promotion requires an explicit operator action.
 
 **FR9 - Battle types escalate.** Deployments can run, in increasing capability: single-turn, report creation, document creation (downloadable attachment), image understanding (vision in), and image generation (generation out). The scorecard and pick-the-winner appear from the first battle onward. *Done when:* each enabled type produces a round-1/round-2 flow with a scorecard; image generation runs only where the extra deploy-time setup is present.
+
+**FR10 - A side can ask the user something, and the user can close it out.** When an assistant needs input before it can answer - the scope of a report, which columns an extraction should pull - it asks **in the duel, where everyone can see it**, and the duel waits for that side rather than treating it as finished. The user is told which assistant is waiting, answers that one, and gets the answer as a new reply from it. How many questions a side asks is a property of the request's intent and its task flow, not a battle rule: a report or extraction legitimately asks more than one. *Done when:* the question is visible in the conversation and attributed to the assistant that asked; the composer names the assistant being answered and lists all of them when several are waiting; the answer arrives as a new message rather than replacing the question; round 2 does not start until every side has either finished or been answered. **Status:** the routing, the waiting state and the composer queue exist; the path is **dormant** because the round-1 prompt no longer asks a model to raise a question, and it is being folded into task assignment rather than repaired - see [ADR-029](../../design/decisions/029-clarification-is-public-and-answers-get-their-own-placeholder.md).
 
 ## 6. Non-Goals / Out of Scope
 
@@ -76,7 +96,7 @@ Personas are defined once in [`../../overview/PERSONAS.md`](../../overview/PERSO
 
 ## 7. Open Product Questions
 
-- Should the end-of-battle summary retain the verbatim clarifying-question Q&A text, not just the quantitative "how often did each side ask" metric? (Currently the metric is captured, the verbatim text is not.)
+- Should the end-of-battle summary retain the verbatim clarifying-question Q&A text, not just the quantitative "how often did each side ask" metric? (Half of it is now available: under [ADR-029](../../design/decisions/029-clarification-is-public-and-answers-get-their-own-placeholder.md) the QUESTION is a public, permanent message and therefore in the transcript and the archive. The user's ANSWER is not: the flow denies that reply so it never reaches Lex, which means it is never persisted anywhere. Retaining the full exchange depends on that decision, not on the summary.)
 - For report and document battles, is one-shot (full deliverable in round 1) or outline-first the better default for comparing directions?
 - Which image-generation model should ship as the baseline for generation-out battles, and what default image-output guardrail is reasonable before a deployer tunes it?
 

@@ -1,6 +1,10 @@
 # DESIGN: Multi-Assistant Turn Engine
 
-Status: Draft (design-target). Anchors the redesign of `/battle` into a general
+**Status:** Draft (design-target).
+
+**Coverage:** none - a design target for generalizing `/battle`; the engine it describes is not built. The battle preset it would subsume is covered by `e2e/battle.spec.ts`.
+
+Anchors the redesign of `/battle` into a general
 multi-assistant turn-taking engine. Unifies the two "orchestrator" notions that
 [DESIGN-MULTI-AGENT-ORCHESTRATION.md](DESIGN-MULTI-AGENT-ORCHESTRATION.md) (hierarchical
 fan-out-collate) and [DESIGN-BATTLE.md](DESIGN-BATTLE.md) (peer round-scheduler) describe
@@ -197,8 +201,12 @@ meeting is policy-driven. No component hardcodes a phase count.
    take-turns beyond battle, and the substrate for later assistant-to-assistant coordination.
 5. **Generalize identity and the turn policy.** Grow the participant pool past two and add the
    turn-policy interface. Enables the meeting preset and richer coordination formats.
-6. **Retire duplicated paths.** Once presets cover them, remove the standalone `@all` bypass
-   and the battle-specific resolvers.
+6. **Retire duplicated paths.** Once presets cover them, remove the battle-specific resolvers and
+   the flow-side turn logic. The `@all` and `/battle` Lex bypasses stay - bypassing Lex is legitimate,
+   because neither is a native Amazon Chime SDK mention - but they converge on the handler so that
+   bypassing Lex is the ONLY way they differ from an ordinary turn
+   ([MESSAGE-FLOW §3.1](../../guides/developer/MESSAGE-FLOW.md)). The flow keeps the one decision only
+   it can make, which is who responds.
 
 ## Roadmap (beyond this pass)
 
@@ -209,3 +217,14 @@ meeting is policy-driven. No component hardcodes a phase count.
 - **Assistant-to-assistant coordination.** Move past the parallel race plus single rebuttal to
   true multi-turn exchange (assistants reacting across more than one round, negotiating, or
   handing off), which the turn-policy interface (phase 5) is designed to express.
+
+  **Constraint, measured rather than assumed: assistants cannot signal each other with a channel
+  message.** Amazon Chime SDK does not deliver a message authored by an `AppInstanceBot` to another
+  `AppInstanceBot`'s Lex, so one assistant cannot trigger another by addressing it, however the
+  message is targeted or mentioned. The identical message from a user principal does trigger. This is
+  undocumented - `TargetedMessages: ALL` reads as though any targeted message would be processed - and
+  it is platform-level loop prevention rather than an oversight. Evidence and the two ways around it
+  (an out-of-band call, or a per-assistant proxy `AppInstanceUser` sending under `sts:AssumeRole`) are
+  in [ADR-023](../../design/decisions/023-battle-round-coordination.md). Any turn policy that assumes
+  assistants can pass control to each other in-channel has to choose one of them first, and the proxy
+  route means owning loop safety the platform otherwise provides.

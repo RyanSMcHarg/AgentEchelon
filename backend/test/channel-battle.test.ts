@@ -177,7 +177,33 @@ describe('GET /channels/battle', () => {
       query: { channelArn: CHANNEL },
     }));
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body)).toEqual({ enabled: false, channelArn: CHANNEL });
+    // `battleEligible` rides along even with no config row, because the UI gates the Battle surfaces
+    // on capability. False here is the FAIL-CLOSED path: no classification tag is queued, so
+    // resolution falls back to the lowest profile, which is not battle-eligible.
+    expect(JSON.parse(res.body)).toEqual({
+      enabled: false,
+      channelArn: CHANNEL,
+      battleEligible: false,
+    });
+  });
+
+  it('reports battleEligible:true for a channel whose profile allows battles', async () => {
+    // The half that matters to the UI: eligibility is read from the profile behind the IMMUTABLE
+    // classification tag, not from `modelTier` in member-writable channel metadata. Without this the
+    // frontend has no capability signal and falls back to that mutable field.
+    // GET member-checks the caller BEFORE resolving the tag, so the membership response has to be
+    // queued first or it consumes the tag read and eligibility silently resolves fail-closed.
+    mockMessagingSend.mockResolvedValueOnce({});
+    queueClassificationTag('premium');
+    mockDdbSend.mockResolvedValueOnce({});
+    const handler = await loadHandler();
+    const res = await handler(makeEvent({
+      method: 'GET',
+      path: '/channels/battle',
+      query: { channelArn: CHANNEL },
+    }));
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).battleEligible).toBe(true);
   });
 
   it('returns 400 for invalid channelArn shape', async () => {

@@ -11,6 +11,15 @@
 export interface ChannelBattleConfig {
   channelArn: string;
   enabled: boolean;
+  /** Whether this conversation MAY battle, from the profile's `battleEligible` flag - the same source
+   *  the enable and invocation paths gate on. Distinct from `enabled`, which is whether a moderator has
+   *  actually turned it on.
+   *
+   *  Callers read it asymmetrically, deliberately. The CAPABILITY gate (the members-panel toggle)
+   *  requires `=== true` and so fails closed on an absent field. The briefing BANNER, which already
+   *  requires `enabled`, only checks `!== false`, so a missing field does not blank the briefing on a
+   *  battle that is demonstrably running. */
+  battleEligible?: boolean;
   experimentId?: string;
   altBotSlotArn?: string;
   altBotSlotId?: string;

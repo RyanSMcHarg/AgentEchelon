@@ -57,6 +57,7 @@ import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { parseJsonBody } from './lib/auth.js';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
+import { resolveChannelClassificationTag as resolveChannelClassificationTagShared } from './lib/channel-classification.js';
 import { resolveActiveBattleExperimentForClassification } from './lib/experiment-manager.js';
 
 const messagingClient = new ChimeSDKMessagingClient({});
@@ -145,26 +146,21 @@ async function readChannelMetadata(channelArn: string, botArn: string): Promise<
 // be changed by UpdateChannel. Fail-closed to the floor classification (not battle-eligible), so a
 // missing/unreadable tag denies the battle rather than opening it.
 async function resolveChannelClassification(channelArn: string): Promise<string> {
-  try {
-    const resp = await messagingClient.send(new ListTagsForResourceCommand({ ResourceARN: channelArn }));
-    const tag = (resp.Tags || []).find((t) => t.Key === 'classification')?.Value;
-    if (profiles.isKnownClassification(tag)) return profiles.resolveClassification(tag);
-    console.warn('[channel-battle][SecurityEvent] channel missing/invalid classification tag; failing closed', { channelArn, tag, failClosedTo: profiles.failClosedValue });
-    return profiles.failClosedValue;
-  } catch (err) {
-    console.warn('[channel-battle] failed to read channel classification tag; failing closed:', err);
-    return profiles.failClosedValue;
-  }
+  return resolveChannelClassificationTagShared(messagingClient, channelArn, '[channel-battle]');
 }
 
 interface Experiment {
   experimentId: string;
   status: 'active' | 'paused' | 'completed';
+  /** Target intent this experiment scopes to (drives the briefing's prompt steering, DESIGN §2.2). */
+  intent?: string;
   tiers: string[];
   battleEnabled?: boolean;
   altBotSlotId?: string;
   altBotSlotArn?: string;
   variants?: Array<{ displayName?: string }>;
+  /** Written objective (DESIGN §1.2). Only `statement` is read here, for the battle briefing (§2.2). */
+  objective?: { statement?: string };
 }
 
 async function loadExperiment(experimentId: string): Promise<Experiment | null> {
@@ -234,6 +230,90 @@ async function findSlotConflicts(altBotSlotId: string, excludeExperimentId: stri
     console.warn('[channel-battle] findSlotConflicts scan failed:', err);
     return [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// Battle-start briefing (DESIGN §2.2 / §2.3, A.5)
+// ---------------------------------------------------------------------------
+
+// Static prompt-steering table keyed by the experiment's target intent (the 8
+// shipped intents), so the enable briefing nudges users toward decision-relevant
+// prompts (DESIGN §2.2). The FRONTEND renders the starter chips; the backend uses
+// the coaching line + a couple of examples for the "Most useful prompts" line of
+// the enable broadcast, and snapshots the intent onto the config row so the
+// frontend can look up its own chips. Deployment-overridable example copy, not
+// policy; these ship as defaults.
+interface PromptSteering {
+  coachingLine: string;
+  examples: string[];
+}
+
+const PROMPT_STEERING: Record<string, PromptSteering> = {
+  general_qa: {
+    coachingLine: 'Ask real questions your users ask.',
+    examples: ['Explain X to a new hire', "What's the difference between A and B?"],
+  },
+  code_generation: {
+    coachingLine: "Ask a real coding task you'd actually ship.",
+    examples: ['Write a function that …', 'Add retry/timeout to this call'],
+  },
+  code_review: {
+    coachingLine: 'Paste real code and ask for a review.',
+    examples: ['Review this for bugs', 'Is this concurrency-safe?'],
+  },
+  document_extraction: {
+    coachingLine: 'Give a document and ask for specific fields.',
+    examples: ['Extract the totals as a table', 'Pull every date + owner'],
+  },
+  report_generation: {
+    coachingLine: "Ask for a report you'd actually send.",
+    examples: ['Draft a one-page status report on …', 'Summarize this for execs'],
+  },
+  image_generation: {
+    coachingLine: 'Describe an image you actually need.',
+    examples: ['A hero image for …', 'An icon set for …'],
+  },
+  strategic_analysis: {
+    coachingLine: 'Pose a real judgment call.',
+    examples: ['Pros/cons of migrating to …', 'What are the risks of …?'],
+  },
+  workflow_actions: {
+    coachingLine: 'Ask it to drive a multi-step task.',
+    examples: ['Plan and track the steps to …', 'Walk me through …'],
+  },
+};
+
+// Base/classification/profile experiments span intents (no single target intent),
+// so fall back to a generic coaching line (DESIGN §2.2).
+const GENERIC_COACHING_LINE =
+  'ask the kinds of questions your users actually ask';
+
+function endWithPeriod(s: string): string {
+  return /[.!?]$/.test(s) ? s : `${s}.`;
+}
+
+/**
+ * Build the battle-start briefing sentence(s) from the experiment's written
+ * objective + target intent (DESIGN §2.2). Semi-blind by design: it names the
+ * DECISION, never which alias is which model (INV-4 / §2.4). Returns null when
+ * there is no objective statement to brief on, so callers fall back to today's
+ * announcement (INV-2: absent ⇒ prior behavior).
+ */
+function buildBattleBriefing(statement?: string, intent?: string): string | null {
+  const decision = (statement || '').trim();
+  if (!decision) return null;
+
+  const steering = intent ? PROMPT_STEERING[intent] : undefined;
+  const prompts = steering
+    ? `${steering.coachingLine} For example: ${steering.examples.map((e) => `"${e}"`).join(', ')}.`
+    : `${GENERIC_COACHING_LINE}.`;
+
+  return (
+    'Battle Mode is now ON. Two assistants will answer the same prompt so you can compare them. '
+    + `We're deciding: ${endWithPeriod(decision)} `
+    + `Most useful prompts: ${prompts} `
+    + 'Try `/battle <your prompt>` to compare both assistants.'
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -373,28 +453,47 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
   if (!CHANNEL_BATTLE_CONFIG_TABLE) {
     return respond(500, { error: 'CHANNEL_BATTLE_CONFIG_TABLE not configured' }, origin);
   }
+  // ChannelBattleConfig has no shared TS interface — it is this inline Item.
+  // Snapshot the objective statement + target intent at enable time (DESIGN A.5,
+  // §2.3) so the frontend can render the same briefing to NON-moderators from the
+  // config GET, without a per-render experiment read. Both fields are optional and
+  // added only when present: this DocumentClient does not strip `undefined`, and a
+  // record without them keeps working (INV-2).
+  const configItem: Record<string, unknown> = {
+    channelArn,
+    enabled: true,
+    experimentId: exp.experimentId,
+    altBotSlotId: exp.altBotSlotId,
+    altBotSlotArn: exp.altBotSlotArn,
+    enabledBy: callerArn,
+    enabledAt: new Date().toISOString(),
+  };
+  const briefingStatement = exp.objective?.statement?.trim();
+  if (briefingStatement) configItem.briefingStatement = briefingStatement;
+  if (exp.intent) configItem.briefingIntent = exp.intent;
   await ddb.send(
     new PutCommand({
       TableName: CHANNEL_BATTLE_CONFIG_TABLE,
-      Item: {
-        channelArn,
-        enabled: true,
-        experimentId: exp.experimentId,
-        altBotSlotId: exp.altBotSlotId,
-        altBotSlotArn: exp.altBotSlotArn,
-        enabledBy: callerArn,
-        enabledAt: new Date().toISOString(),
-      },
+      Item: configItem,
     }),
   );
 
   // Announce the addition. Broadcast (no Target) as the default bot.
+  //
+  // When the experiment carries a written objective, brief battling users on WHAT
+  // is being decided and which prompts help (DESIGN §2.2) — semi-blind: the copy
+  // names the decision, never the models, so the aliases stay opaque (§2.4 / INV-4).
+  // With no objective statement we fall back to today's announcement (INV-2:
+  // absent ⇒ prior behavior).
   const variantDisplayName = exp.variants?.[1]?.displayName || 'an alternative assistant';
+  const briefing = buildBattleBriefing(exp.objective?.statement, exp.intent);
+  const announcement = briefing
+    ?? `Battle Mode is now ON. ${variantDisplayName} has joined the channel. Try \`/battle <your prompt>\` to compare both assistants.`;
   try {
     await messagingClient.send(
       new SendChannelMessageCommand({
         ChannelArn: channelArn,
-        Content: `Battle Mode is now ON. ${variantDisplayName} has joined the channel. Try \`/battle <your prompt>\` to compare both assistants.`,
+        Content: announcement,
         Type: ChannelMessageType.STANDARD,
         Persistence: ChannelMessagePersistenceType.PERSISTENT,
         ChimeBearer: botArn,
@@ -526,13 +625,32 @@ async function handleGet(event: APIGatewayProxyEvent, origin?: string): Promise<
     }
   }
 
+  // Whether this conversation MAY battle at all, from the same per-profile flag the enable path gates
+  // on. Returned so the UI can hide the Battle surfaces on capability rather than on a hardcoded
+  // `modelTier === 'premium'` — which read mutable channel metadata and ignored `battleEligible`
+  // entirely, so marking a non-premium profile eligible left the toggle invisible.
+  const battleEligible = profiles.profileFor(
+    await resolveChannelClassification(channelArn),
+  ).battleEligible === true;
+
   const result = await ddb.send(
     new GetCommand({ TableName: CHANNEL_BATTLE_CONFIG_TABLE, Key: { channelArn } }),
   );
   if (!result.Item) {
-    return respond(200, { enabled: false, channelArn }, origin);
+    return respond(200, { enabled: false, channelArn, battleEligible }, origin);
   }
-  return respond(200, result.Item, origin);
+  // Return only the member-relevant fields. NOT the raw Item: it carries `enabledBy` (the enabling
+  // admin's user ARN) and `enabledAt`, which would deanonymize the operator to every channel member.
+  const item = result.Item as Record<string, unknown>;
+  return respond(200, {
+    channelArn,
+    enabled: item.enabled ?? false,
+    battleEligible,
+    experimentId: item.experimentId,
+    altBotSlotArn: item.altBotSlotArn,
+    ...(item.briefingStatement ? { briefingStatement: item.briefingStatement } : {}),
+    ...(item.briefingIntent ? { briefingIntent: item.briefingIntent } : {}),
+  }, origin);
 }
 
 // ---------------------------------------------------------------------------

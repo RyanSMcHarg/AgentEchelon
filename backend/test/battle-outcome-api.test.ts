@@ -18,7 +18,9 @@ const mockRecord = jest.fn();
 const mockRead = jest.fn();
 jest.mock('../lambda/src/lib/battle-outcome', () => ({
   recordBattleOutcome: (...a: unknown[]) => mockRecord(...a),
-  readBattleOutcome: (...a: unknown[]) => mockRead(...a),
+  // The GET handler reads the CALLER'S OWN pick (scoped to their sub), not the last writer's -
+  // readUserBattleOutcome(battleId, callerSub). Mock that, not the retired readBattleOutcome.
+  readUserBattleOutcome: (...a: unknown[]) => mockRead(...a),
 }));
 
 import { handler } from '../lambda/src/battle-outcome-api';
@@ -128,20 +130,21 @@ describe('POST /channels/battle/outcome', () => {
 });
 
 describe('GET /channels/battle/outcome', () => {
-  it('returns the recorded outcome', async () => {
-    const stored = {
-      battleId: BATTLE_ID,
-      winner: 'A',
-      chosenByUserSub: SUB,
-      chosenAt: '2026-05-15T00:00:00.000Z',
-    };
-    mockRead.mockResolvedValueOnce(stored);
+  it('returns the caller\'s own recorded pick', async () => {
+    // readUserBattleOutcome returns the caller's vote row (userSub); the handler shapes it into the
+    // response outcome, mapping userSub -> chosenByUserSub (never another member's sub).
+    mockRead.mockResolvedValueOnce({ winner: 'A', userSub: SUB, chosenAt: '2026-05-15T00:00:00.000Z' });
     const res = await handler(
       makeEvent({ method: 'GET', query: { battleId: BATTLE_ID } }),
     );
     expect(res.statusCode).toBe(200);
-    expect(JSON.parse(res.body).outcome).toEqual(stored);
-    expect(mockRead).toHaveBeenCalledWith(BATTLE_ID);
+    expect(JSON.parse(res.body).outcome).toEqual({
+      battleId: BATTLE_ID,
+      winner: 'A',
+      chosenByUserSub: SUB,
+      chosenAt: '2026-05-15T00:00:00.000Z',
+    });
+    expect(mockRead).toHaveBeenCalledWith(BATTLE_ID, SUB); // scoped to the caller's sub
   });
 
   it('returns { outcome: null } when there is no pick yet', async () => {
