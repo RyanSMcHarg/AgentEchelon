@@ -11,6 +11,7 @@ import * as bedrock from 'aws-cdk-lib/aws-bedrock';
 import { Construct } from 'constructs';
 import * as crypto from 'crypto';
 import { RES_PREFIX } from '../stacks/agent-classification-common';
+import { METADATA_MARKER_FILTER_NAME } from '../config/guardrail-masks';
 
 export interface AgentGuardrailsProps {
   /** Descriptive name for the guardrail */
@@ -54,7 +55,11 @@ export function buildGuardrailPolicy(opts: { name: string; description?: string;
       ],
       regexesConfig: [
         {
-          name: 'MetadataMarkerFilter',
+          // The NAME is the mask: Bedrock Guardrails substitutes `{MetadataMarkerFilter}` for an
+          // ANONYMIZE match, so the name is a user-visible string the runtime has to recognise and
+          // remove. It comes from the shared declaration (`config/guardrail-masks`) that the marker
+          // stripper reads, so the provisioned filter and the stripped token cannot drift apart.
+          name: METADATA_MARKER_FILTER_NAME,
           description: 'Mask internal metadata markers if they leak into a response',
           pattern: '<!--(?:ACTIVE_TASK|corr):[^>]*-->',
           action: 'ANONYMIZE',

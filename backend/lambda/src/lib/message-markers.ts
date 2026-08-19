@@ -19,7 +19,11 @@
  *     content, so we strip ALL `<!--…-->` comments — this also auto-covers any
  *     future marker without a code change.
  *   - Inline nav marker: `NAVIGATE_CHANNEL:<channelArn>|<label>` (drift redirect).
+ *   - Guardrail MASK TOKENS: what Amazon Bedrock Guardrails leaves where it masked one of the
+ *     markers above. See `stripGuardrailMaskTokens`.
  */
+
+import { GUARDRAIL_MASK_TOKEN_PATTERNS } from '../../../lib/config/guardrail-masks.js';
 
 /** Every internal control marker, as a deterministic pattern. */
 export const MESSAGE_MARKER_PATTERNS: RegExp[] = [
@@ -27,7 +31,31 @@ export const MESSAGE_MARKER_PATTERNS: RegExp[] = [
   /<!--[\s\S]*?-->/g,
   // Inline drift-redirect marker: NAVIGATE_CHANNEL:<arn>|<label> (label runs to EOL).
   /NAVIGATE_CHANNEL:\S+\|[^\n]*/g,
+  // A marker the guardrail already rewrote. Text stored BEFORE the strip at the guardrail boundary
+  // (below) still carries the token, and every reader of stored text - the admin browser, the judge,
+  // analytics - has to see what the human was meant to see.
+  ...GUARDRAIL_MASK_TOKEN_PATTERNS,
 ];
+
+/**
+ * Remove the mask tokens Amazon Bedrock Guardrails leaves behind for the internal-marker filters.
+ *
+ * A guardrail regex filter with action `ANONYMIZE` replaces its match with the literal
+ * `{FILTER_NAME}`, so a control marker the model leaked comes back as `{MetadataMarkerFilter}`
+ * instead of as the marker. `stripMessageMarkers` cannot help: by the time the runtime holds the
+ * response, the text it matches on is gone and a token that matches nothing is in its place. This
+ * runs at the guardrail boundary itself (`applyOutputGuardrail`), which is the single point where
+ * such a token can enter the system, so no surface downstream ever stores or renders one.
+ *
+ * Scoped to the filters declared for internal markers (`config/guardrail-masks`), never to PII
+ * entity masks: `{EMAIL}` is the intended output of an EMAIL ANONYMIZE rule and deleting it would
+ * remove the evidence that a redaction happened. Idempotent; safe on null/undefined.
+ */
+export function stripGuardrailMaskTokens(content: string | null | undefined): string {
+  let s = content || '';
+  for (const pattern of GUARDRAIL_MASK_TOKEN_PATTERNS) s = s.replace(pattern, '');
+  return s.replace(/[ \t]+$/gm, '').replace(/\n{3,}/g, '\n\n').trim();
+}
 
 /**
  * Return the human-visible text with every internal marker removed, matching

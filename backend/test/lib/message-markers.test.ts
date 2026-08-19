@@ -2,7 +2,15 @@
  * message-markers — the canonical deterministic marker stripper.
  * Mirrors the SPA parser's marker set so analytics/eval never sees a raw marker.
  */
-import { stripMessageMarkers, stripReasoningTags } from '../../lambda/src/lib/message-markers';
+import {
+  stripMessageMarkers,
+  stripReasoningTags,
+  stripGuardrailMaskTokens,
+} from '../../lambda/src/lib/message-markers';
+import {
+  METADATA_MARKER_FILTER_NAME,
+  guardrailMaskToken,
+} from '../../lib/config/guardrail-masks';
 
 describe('stripMessageMarkers', () => {
   it('strips the NAVIGATE_CHANNEL drift-redirect marker (the leak the judge scored)', () => {
@@ -42,6 +50,59 @@ describe('stripMessageMarkers', () => {
   it('leaves ordinary content (incl. markdown) untouched', () => {
     const md = '**Spaces** — they render identically. Here is `code` and a [link](http://x).';
     expect(stripMessageMarkers(md)).toBe(md);
+  });
+
+  it('strips a marker the guardrail already rewrote (stored text still carries the token)', () => {
+    // Every reader of STORED text - the admin browser, the judge, analytics - has to see what the
+    // human was meant to see, and messages written before the strip at the guardrail boundary
+    // still hold the mask token.
+    const raw = `...in this condensed 1-2 page report format.${guardrailMaskToken(METADATA_MARKER_FILTER_NAME)}`;
+    expect(stripMessageMarkers(raw)).toBe('...in this condensed 1-2 page report format.');
+  });
+});
+
+/**
+ * A GUARDRAIL MASK IS ITSELF A LEAK when the filter exists to hide an internal marker. Amazon Bedrock
+ * Guardrails replaces an ANONYMIZE match with `{FILTER_NAME}`, so a leaked control marker reaches the
+ * person as the literal `{MetadataMarkerFilter}` - and the marker stripper cannot catch it, because
+ * the text it matches on was rewritten before the runtime saw the response. Live symptom: a reply
+ * ended `...in this condensed 1-2 page report format.{MetadataMarkerFilter}`.
+ */
+describe('stripGuardrailMaskTokens', () => {
+  const TOKEN = guardrailMaskToken(METADATA_MARKER_FILTER_NAME);
+
+  it('removes the mask token the metadata-marker filter leaves behind', () => {
+    expect(stripGuardrailMaskTokens(`Here is the report.${TOKEN}`)).toBe('Here is the report.');
+  });
+
+  it('removes every occurrence, mid-text as well as trailing', () => {
+    expect(stripGuardrailMaskTokens(`One ${TOKEN}two${TOKEN} three`)).toBe('One two three');
+  });
+
+  it('names the token from the SAME constant the guardrail construct provisions', () => {
+    // A second hardcoded string here would silently stop matching the day the filter is renamed,
+    // and the leak would return with no test failing.
+    expect(TOKEN).toBe('{MetadataMarkerFilter}');
+    expect(stripGuardrailMaskTokens('x{MetadataMarkerFilter}')).toBe('x');
+  });
+
+  it('leaves PII masks alone: the mask IS the intended output there', () => {
+    // `{EMAIL}` is what an EMAIL ANONYMIZE rule is supposed to show. Removing it would delete the
+    // evidence that a redaction happened, which is the opposite of the fix.
+    const redacted = 'Reach the team at {EMAIL} or {PHONE}.';
+    expect(stripGuardrailMaskTokens(redacted)).toBe(redacted);
+  });
+
+  it('leaves ordinary braces and code untouched', () => {
+    const md = 'Use `{ "key": "value" }` and the {placeholder} convention.';
+    expect(stripGuardrailMaskTokens(md)).toBe(md);
+  });
+
+  it('is idempotent and null-safe', () => {
+    const once = stripGuardrailMaskTokens(`hi${TOKEN}`);
+    expect(stripGuardrailMaskTokens(once)).toBe('hi');
+    expect(stripGuardrailMaskTokens(null)).toBe('');
+    expect(stripGuardrailMaskTokens(undefined)).toBe('');
   });
 });
 

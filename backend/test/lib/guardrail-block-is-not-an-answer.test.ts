@@ -80,4 +80,25 @@ describe('the block is a STRUCTURAL fact, not a text shape', () => {
     const metadata = read('lib/analytics-metadata.ts');
     expect(metadata).toMatch(/if \(context\.guardrailBlocked\) metadata\.guardrailBlocked = true;/);
   });
+
+  it('EVERY path that blocks on the input guardrail declares it, not just the Bedrock one', () => {
+    // The external-provider path runs the input guardrail itself, because Bedrock Guardrails do not
+    // apply to an external model. It ran the check and then built its result without the flag, so a
+    // turn blocked there archived as an ordinary answer: same guardrail verdict, different record,
+    // decided by which model the turn happened to route to.
+    //
+    // Scanned rather than named, so a THIRD provider path added later is held to the same rule instead
+    // of inheriting the omission silently. The block copy is deployment-specific
+    // (`blockedInputMessaging`), so nothing downstream can recover the fact from the text.
+    const files = ['lib/async-processor-core.ts', 'assistant-async-processor.ts'];
+    const blockResults = files.flatMap((f) =>
+      (read(f).match(/response: [A-Za-z]*[Gg]uard[A-Za-z]*\.message[\s\S]{0,800}?\};/g) ?? [])
+        .map((body) => ({ f, body })),
+    );
+    // A zero-match scan would pass vacuously, which is the failure mode this line exists to stop.
+    expect(blockResults.length).toBeGreaterThanOrEqual(2);
+    for (const { f, body } of blockResults) {
+      expect(`${f}: ${body}`).toMatch(/inputGuardBlocked: true/);
+    }
+  });
 });
