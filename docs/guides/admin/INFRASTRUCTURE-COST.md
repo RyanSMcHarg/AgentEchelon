@@ -33,7 +33,7 @@ Two deployment modes have very different cost shapes:
 | standard / Sonnet | ~3k / ~400 | ~$0.02 |
 | premium / Opus | ~4k / ~500 | ~$0.08 to 0.12 |
 
-Trivial turns (greeting, acknowledgment) route to Haiku and skip retrieval, so they cost a fraction of the above. This is why the tier-floor routing and the retrieval skip on trivial intents matter for cost, not just latency.
+Standalone trivial turns (greeting, acknowledgment) route to Haiku and skip retrieval, so they cost a fraction of the above. This is why the tier-floor routing and the retrieval skip on trivial intents matter for cost, not just latency. A trivial-looking message that CONTINUES an open task keeps its tier's model: the reply carries the task's work, and pricing it off the length of "looks good" is what put a full report on the cheapest model.
 
 ### Aurora mode only (the RAG / drift / summary baseline)
 

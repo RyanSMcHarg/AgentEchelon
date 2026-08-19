@@ -104,6 +104,15 @@ The distinction that decided it is the one D-1 rests on. The dead boundary was k
 
 **D-3. A profile version carries selections, never references, so it cannot widen a boundary across instances.** The portable definition holds behaviour: models, tools, machines, persona, classifier mode, timeouts, context source keys and a guardrail selection. It holds no classification, no context scope, no ARN and no policy. Which classification a profile serves is deployment config, so importing a profile does not place it anywhere; an operator binds it and that is a deploy.
 
+A task machine inside that definition is behaviour by the same test. A step declares who it awaits as
+`awaits: { party: 'requester' }` - a REFERENCE the runtime resolves against the task record when the
+step needs an owner, never a principal id baked into the version, so nothing instance-bound travels
+with it and a stored version cannot point at a person on another deployment. That is a different
+sense of the word from D-3's: what a version must not carry is a pointer to a provisioned RESOURCE.
+`requester` is the only party that ships, and the deprecated `awaitsUser: true` is accepted and means
+the same thing, so an existing version still imports and activates
+([`SPEC-TASK-STATE-TRANSITIONS.md`](../conversation/SPEC-TASK-STATE-TRANSITIONS.md) section 12.6).
+
 Import validates every selection against the target deployment's own catalogs and **rejects rather than degrading**: a guardrail that the target has not provisioned is refused, and a version whose guardrail catalog cannot be read is refused outright rather than landed unverified. A model outside the deployment's allowlist fails at the write path instead of surfacing later as a runtime access denial. The full statement of this cut, including which fields are runtime-editable and which are deploy-time only, is in [`SPEC-PORTABLE-PROFILES.md`](SPEC-PORTABLE-PROFILES.md).
 
 ## 6. Topology and naming

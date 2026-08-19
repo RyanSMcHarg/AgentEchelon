@@ -43,7 +43,7 @@ choose" will not take yes for an answer.
 
 ## Context
 
-A state marked `awaitsUser` says the machine is blocked on a person. It has never said what would
+A state that declares `awaits` says the machine is blocked on a party. It has never said what would
 unblock it. So nothing anywhere could tell a complete answer from a partial one, and a step with a
 single exit advanced on whatever arrived first. `report_generation.collecting_requirements` is that
 step, and it is the common case rather than a corner.
@@ -67,7 +67,7 @@ A new optional field on a state definition: what the person still owes before th
 ```ts
 collecting_requirements: {
   transitions: ['drafting_outline'],
-  awaitsUser: true,
+  awaits: { party: 'requester' },
   requires: ['the subject', 'the audience', 'the length or format'],
 },
 ```
@@ -111,7 +111,7 @@ they fail differently.
 
 **Enforced, in code:**
 
-- `requires` is only rendered for a state that is `awaitsUser` AND declares one. A step the workflow is
+- `requires` is only rendered for a state that awaits somebody AND declares one. A step the workflow is
   getting on with by itself never produces a checklist.
 - Machine validation REJECTS `requires` on a state that awaits nobody (there would be no one holding
   what it asks for) and on a state marked `resolvedByOneResponse` (the two flags contradict: advance on

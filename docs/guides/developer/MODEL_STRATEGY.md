@@ -92,9 +92,12 @@ At runtime, `backend/lambda/src/lib/model-resolver.ts` bridges the intent classi
 2. Looks up the `INTENT_ROUTE_STRATEGY` for the matched key
 3. Checks that the primary model is in `allowedClassifications` for the current user tier
 4. If not allowed, falls back to the tier's default model
-5. Same logic for the fallback model
+5. Applies the **tier floor**: a strategy primary that is allowed for the tier but weaker than the tier's own default model is raised to that default, so a premium conversation does not silently answer on the cheapest model
+6. Same logic for the fallback model
 
 This enforces IAM safety at the code level - a basic-tier request will never resolve to a premium-only model even if the strategy says so.
+
+**The trivial-turn bypass, and what suspends it.** A standalone `greeting` or `acknowledgment` skips the floor in step 5 and stays on the cheapest capable model: "thanks" does not warrant a premium invoke. It is a property of the TURN, not of the message: a turn that continues work already in flight keeps the floor, because the reply owes the task's work whatever the incoming message looks like. The caller states this with `TurnContext.continuesActiveWork` (`RoutingContext.continuesActiveWork` on `resolveModelPlan`), which the async processor derives from facts already on its event - the router's `isTaskContinuation` and the turn's `taskId` - so the rule costs no extra read.
 
 > **The classified-intent set is per-deployment configurable** (`docs/specs/interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md`). The classifier emits the universal three (`greeting`/`acknowledgment`/`general`) plus whatever *domain* intents the deployment's `ASSISTANT_INTENT_PACK` defines (the `DEFAULT_INTENT_PACK` is the default enterprise set). An intent key not present in `INTENT_TYPE_TO_ROUTE_KEY` simply falls to the tier default here (step 4) - so a custom deployment's `find_recipe` resolves the tier default model unless `INTENT_TYPE_TO_ROUTE_KEY` / `INTENT_ROUTE_STRATEGY` are extended for it. The intent is **rule 3** of `resolveModelPlan`; geography (`segment`) and language run ahead of it (`docs/specs/interaction/assistant-config/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md`).
 

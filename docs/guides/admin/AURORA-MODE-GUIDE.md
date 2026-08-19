@@ -144,6 +144,30 @@ Adding a migration:
 3. Confirm with `SELECT filename, applied_at FROM _migrations ORDER BY id DESC LIMIT 5;` - an
    unapplied migration is invisible in every other way until something queries what it added.
 
+#### A migration that rewrites existing data must be bounded
+
+Every pending file, plus the classification-boundary bootstrap, shares **one transaction inside one
+Lambda invocation**, and nothing commits unless all of it does. DDL is fixed work; a data step whose
+cost scales with how much data the deployment already holds is not. A statement that outruns the
+invocation records nothing, so the next cold start begins the identical work from zero and the upgrade
+never converges - while the schema it was carrying stays unapplied.
+
+So a data backfill does a **bounded batch** and reports how much it has left in `_migration_progress`.
+`applyPendingMigrations` records the file in `_migrations` only when that count is zero; a non-zero
+count leaves the file pending, and the next cold start runs the next batch. Files after it still apply,
+so a long backfill never blocks the schema - which also means nothing may depend on its data step
+having finished. `schema/029-embeddings-classification-key-backfill.sql` is the worked example, and
+`migration-data-steps-are-bounded.test.ts` fails the build on an unbounded one.
+
+Check progress with:
+
+```sql
+SELECT filename, remaining, updated_at FROM _migration_progress ORDER BY updated_at DESC;
+```
+
+A row stuck at the same `remaining` across cold starts means the batches are not running - look for the
+Lambda that should be cold-starting, not for a stuck lock.
+
 ### Why the cluster amortizes across multiple workloads
 
 The Aurora baseline (~$50-95/mo) is shared across **four** workloads, not one:

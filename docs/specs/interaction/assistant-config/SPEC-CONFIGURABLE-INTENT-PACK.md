@@ -40,6 +40,22 @@ interface IntentPack {
 // platform default graphs apply. This mirrors the intents-only universal-three pattern below.
 ```
 
+**Before writing a `machines` block, read
+[`SPEC-TASK-STATE-TRANSITIONS.md`](../conversation/SPEC-TASK-STATE-TRANSITIONS.md) sections 9 to 11.**
+It states the half of the contract this schema cannot express: which decisions belong to the platform
+and which to the deployment (section 9), how `delivers` chooses between an attachment and an inline
+answer and what a state's `prompt` may therefore claim about a file (section 10), and the defaults an
+author gets no warning about (section 11) - finality is declared rather than inferred, and a state's
+`awaits` declaration is the signal that topic-drift detection, intent classification and model
+selection all read to tell a continuation from a new subject. A state that waits on a person without
+declaring `awaits` compiles, validates, and then loses all three.
+
+A waiting state says `awaits: { party: 'requester' }`; the deprecated `awaitsUser: true` is still
+accepted and means the same thing, so a pack written against the older spelling keeps working
+(section 12.6). Both spellings survive the pack's field-by-field coercion, and a state naming a party
+the platform does not resolve is refused: the whole `machines` block falls back to the platform
+defaults rather than shipping steps that can never find an owner.
+
 ### Per-intent response settings (P3)
 
 A domain intent may carry `maxTokens` (a positive integer) and a coarse `verbosity` (`'tight' | 'normal' | 'long'`). `coerceIntentDef` keeps a valid pair and **drops invalid values** (negative/zero `maxTokens`, unknown `verbosity`) rather than silently keeping them. At classification time `responseSettingsForIntent(intent)` returns the settings; the handler **forwards them in the dispatch event** (D2); the processor resolves the turn's budget with `clampResponseMaxTokens(requested, ceiling, reasoning)` - the per-intent value WINS but can never exceed the tier ceiling (`CONFIG.maxTokens`), and reasoning turns keep a higher floor. Absent settings ⇒ the processor's default budget (today's behavior, unchanged). E.g. `logistics` → `maxTokens: 700` (tight), `research` → `maxTokens: 1600` (longer). Pinned by `test/lib/intent-pack.test.ts` ("P3 per-intent response settings").

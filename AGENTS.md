@@ -220,6 +220,16 @@ AWS_PROFILE=<your-profile> USER_POOL_ID=<pool-id> \
 AWS_PROFILE=<your-profile> node backend/scripts/backfill-channel-flow.mjs
 ```
 
+On a deployment that carried conversations from before the host grounding moved out of channel
+metadata, also run the grounding recovery once. Dry-run first; it reports what it would recover and
+what it leaves alone:
+```bash
+AWS_PROFILE=<your-profile> npx ts-node backend/scripts/backfill-channel-context.ts --dry-run
+AWS_PROFILE=<your-profile> npx ts-node backend/scripts/backfill-channel-context.ts
+```
+Without it those conversations answer ungrounded and on the deployment's default model and language
+(the router logs each such turn). A fresh deployment has nothing to recover and the run reports zero.
+
 ### Admin identity and membership enforcement (deploy-time choices)
 
 Two admin-facing choices, both defaulting to the safe option. Full model in

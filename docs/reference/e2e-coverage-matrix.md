@@ -23,8 +23,8 @@ provisioned credentials and skips silently without them. Read this as the floor.
 | ...declaring none, with a reason | 10 |
 | Documents claiming live behaviour (Implemented / Partial) | 39 |
 | ...of those, with no e2e spec | 0 |
-| e2e spec files | 44 |
-| e2e tests declared | 159 |
+| e2e spec files | 46 |
+| e2e tests declared | 165 |
 
 ## Specifications
 
@@ -93,7 +93,9 @@ is as visible as the forward one.
 - `e2e/feedback.spec.ts` (1 test)
 - `e2e/fulfillment-retry.spec.ts` (2 tests)
 - `e2e/open-work-items.spec.ts` (1 test)
+- `e2e/place-item-flow.spec.ts` (3 tests)
 - `e2e/platform-knowledge.spec.ts` (1 test)
+- `e2e/report-flow-branches.spec.ts` (3 tests)
 - `e2e/speaker-attribution.spec.ts` (2 tests)
 - `e2e/task-answer.spec.ts` (2 tests)
 - `e2e/task-resolution.spec.ts` (2 tests)

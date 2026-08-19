@@ -94,6 +94,29 @@ a routing decision.
 This keeps the private host payload out of every member's reach while the assistant still gets full
 grounding server-side.
 
+**Conversations created before the move need a one-time operator step.** The six fields used to be
+stamped into metadata, and every writer of the store is on a create path, so a conversation that
+already existed when the split shipped holds its grounding only in metadata and gets none from the
+store. Nothing errors: the assistant answers ungrounded, and because `userLanguage` and `segment`
+choose the model, a conversation routed to another language or region quietly falls back to the
+deployment default. `host-grounding.ts` detects and logs each such turn rather than reading metadata,
+naming the channel and which keys are present (never their values).
+
+The recovery is `backend/scripts/backfill-channel-context.ts`, run once:
+
+```bash
+AWS_PROFILE=<your-profile> npx ts-node backend/scripts/backfill-channel-context.ts --dry-run
+AWS_PROFILE=<your-profile> npx ts-node backend/scripts/backfill-channel-context.ts
+```
+
+It is an operator action rather than a read-time fallback for the reason this whole section exists:
+metadata is member-writable, so promoting it is a judgement about one deployment at one moment, not a
+standing trust relationship. The promoted values are re-bounded and marker-stripped on the way in, the
+store is never overwritten, and the run reports what it recovered and what it left alone. A channel
+whose metadata has since been rewritten without the legacy fields does not recover from anywhere; the
+host must re-send its grounding through the create path. Full rules in
+`backend/lambda/src/lib/legacy-channel-context.ts`.
+
 ## 5. Quick decision table
 
 | You want to store... | Put it in... |

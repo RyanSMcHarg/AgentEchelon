@@ -246,6 +246,8 @@ Two rates are tested this way today: the **battle win rate** and **user approval
 
 **D. Power** - the minimum is power-aware. Given the observed baseline and the minimum detectable effect implied by `objective.target`, the results show an **underpowered, need about N more per variant** state rather than a premature winner. A hard floor still applies below which nothing is claimed. That floor ships deliberately low as a demonstration floor, not a decision floor, and the operator guide recommends raising it before anyone routes traffic on a verdict.
 
+**Power counts the measurement, not the traffic.** For a `quality` or `accuracy` objective the metric is the evaluator score, and an exchange nobody scored enters the sample as a zero (§4.6.2). Both floors above count exchanges, so an experiment with plenty of traffic and nothing scored satisfies them while carrying no observation of the metric at all: both variants read mean 0 with no variance, the test correctly finds no difference, and the rule would return `equivalent` computed from nothing. A score-backed objective therefore also requires at least one scored exchange in **each** variant; with none, the verdict is `keep_running` and the reason is that the evidence has not been collected yet. `cost` and `latency` are measured on every exchange regardless of scoring, so they are not gated this way.
+
 **E. Confidence** maps from the computed result, not from a model's self-assessment:
 
 - `high`: primary metric significant at p < 0.01, powered, and all guardrails held.
@@ -328,7 +330,7 @@ Battle turns and battle picks are deliberately separate controls. A duel produce
 The recommendation is a pre-registered decision rule over the primary metric, the guardrails, and the battle-pick axis, evaluated in order:
 
 1. **Not enough data** produces `keep_running`. If the primary metric is underpowered for its target-derived effect size, the rule stops here regardless of the point estimate.
-2. **A guardrail breach vetoes a ship.** A guardrail that has significantly regressed past its bound makes the verdict `keep_control` even when the primary won, and the rationale names the breached guardrail. A primary win bought with a cost or compliance regression is not a ship.
+2. **A guardrail breach vetoes a ship.** A guardrail whose confidence interval lies entirely on the failing side of its bound makes the verdict `keep_control` even when the primary won, and the rationale names the breached guardrail. A primary win bought with a cost or compliance regression is not a ship. The comparison is against the **bound**, never against zero: a difference can be significantly different from zero and still be entirely consistent with sitting inside the bound, and a result that misses an `at_least` floor by a wide margin can be indistinguishable from zero. Both are answers to a question the guardrail did not ask.
 3. **Primary significant, treatment favoured, guardrails held** produces `promote_treatment`.
 4. **Primary significant, control favoured** produces `keep_control`.
 5. **Enough data, no significant difference** produces `equivalent`, which is a real answer rather than a failure. If the objective is cost or latency the cheaper or faster side is recommended as a tiebreak; otherwise `keep_control`. It is always surfaced as equivalent, never dressed as a winner.
@@ -458,8 +460,10 @@ The point estimate is inside the bound. The interval is not. So:
 
 - `pointWithinBound: true` (8.3 is less than 10)
 - `held: false` (12.83 is not less than 10, and the worst case consistent with the data is what a non-inferiority claim has to survive)
-- `breached: false` (a breach requires the point estimate to be outside the bound AND the difference to be significant)
+- `breached: false` (a breach requires the whole interval to lie past the bound, and this one reaches back to +3.84%)
 - `indeterminate: true`
+
+`held` and `breached` are the two ends of the same comparison against the bound, so they are mutually exclusive and everything between them is indeterminate. A guardrail is never breached because the difference is significant against **zero**: on this example the difference is significant (`p = 0.00029`) and the guardrail is still not breached, because 10% is a bound on the latency regression and the data cannot place the regression past it.
 
 **Indeterminate blocks a ship.** The data cannot rule out a 12.8% latency regression, and "we could not tell" must not read as "it held". This is the case a point-estimate check waved through: on thin or noisy data the estimate lands inside the bound by chance, and the ship goes out on ignorance.
 
@@ -771,7 +775,10 @@ interface ExperimentRecommendation {
   confidence: 'low' | 'medium' | 'high';        // derived from the statistic (§4.2-E)
   rationale: string;                            // prose narration only
   primary:   { metric; deltaPct; ci: [number, number]; pValue; significant; powered };
-  guardrails: Array<{ metric; deltaPct; bound; held: boolean }>;
+  // Three states, not two: held, breached, and neither, which is "not established". A caller cannot
+  // derive the third from `held` alone, and reading `!held` as breached reports a wide interval as a
+  // demonstrated regression, so both flags ride the contract.
+  guardrails: Array<{ metric; deltaPct; bound; held: boolean; breached: boolean }>;
   human?:    { picks: number; winRate: number; ci: [number, number]; significant: boolean };
   recommendedVsChosen?: { recommended: string; chosen?: ExperimentDecision['outcome'] };
 }

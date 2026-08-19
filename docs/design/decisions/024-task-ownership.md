@@ -678,7 +678,7 @@ a green suite stops meaning anything.
   chain THIS speaker holds, so a member who did not start a duel finds nothing and advances nothing,
   without a comparison that could be got wrong.
 - **A state can declare what it needs before it releases the person**
-  ([ADR-031](./031-a-step-says-what-it-needs.md)). `awaitsUser` says who holds the work; `requires`
+  ([ADR-031](./031-a-step-says-what-it-needs.md)). `awaits` says who holds the work; `requires`
   says what they still owe, which is what lets a partial answer be recognised as one.
 - **The battle work unblocks in this order:** this ADR, then `taskId` leaves the battle row, then
   ADR-023's per-`(battleId, botArn, round)` claim and bounded wait. Nothing above the ADR is safe to

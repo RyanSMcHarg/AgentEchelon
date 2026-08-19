@@ -236,8 +236,7 @@ what the guarantee must be, records which paths currently satisfy it, and names 
 
 The server-only channel-context store (`ChannelContextTable`, keyed by `channelArn`) holds the
 conversation's private grounding and routing signals: `participantProfile`, `domainContext`,
-`otherContexts`, `userName`, `participants`, `memberIdentities`, `userLanguage`, `segment`, and
-`memberCount` (a membership signal the archival path records; the `@all` size decision never reads it - see below).
+`otherContexts`, `userName`, `participants`, `memberIdentities`, `userLanguage`, and `segment`.
 
 It exists because Amazon Chime SDK channel `Metadata` is member-WRITABLE (`UpdateChannel`), so
 anything a member could forge cannot ground an answer or choose a model. That makes this store the
@@ -253,10 +252,10 @@ visible:
 | Model routing (`userLanguage`, `segment`) | falls back to the default model | wrong language or wrong model. Invisible to the operator. |
 | Onboarding (`getParticipantContext`) | reads live membership instead | a race the recorded shape exists to avoid |
 
-`memberCount` is written by the archival path as a cheap membership signal, but the `@all` responder
-decision is NOT a consumer of it: channel size is always resolved live via `resolveChannelSize`
-(`channel-size.ts`), which deliberately exposes no read accessor for the recorded count, so that
-decision is unaffected by a missing or sparse row.
+The store holds no member count, and the `@all` responder decision is not a consumer of one: channel
+size is resolved live via `resolveChannelSize` (`channel-size.ts`), because a count derived from
+archived membership events collapses assistants into the human roster (a battle channel of three
+reports 2). That decision is therefore unaffected by a missing or sparse row.
 
 None of these throw. That is the whole problem: a conversation with no context is a conversation that
 quietly answers slightly worse forever, and nothing reports it.
@@ -271,8 +270,8 @@ Two properties follow, and both are load-bearing:
    written afterwards races the first turn it is meant to ground.
 2. **A row may be sparse, and sparse must be indistinguishable from absent to every consumer.** Fields
    are written by different paths at different times; a consumer that branches on the ROW rather than
-   the FIELD would treat a row carrying only `memberCount` as "context exists". Every consumer today
-   guards the field (`if (priv.domainContext)`, `ctx?.memberIdentities || []`,
+   the FIELD would treat a row carrying one unrelated attribute as "context exists". Every consumer
+   today guards the field (`if (priv.domainContext)`, `ctx?.memberIdentities || []`,
    `parseParticipantContext(ctx?.participants)`), and that is a requirement, not a coincidence.
 
 ### Writers, and what each contributes
@@ -282,15 +281,14 @@ Two properties follow, and both are load-bearing:
 | `lib/channel-creation.ts` | `participants`, carried `memberIdentities`, drift's `priorMessage` | before `CreateChannel` |
 | `federated-create-conversation.ts` | `participants`, participant profile, domain context | at creation |
 | `federated-add-member.ts` | `participants` (re-derived), `memberIdentities` | on member add |
-| `kinesis-archival.ts` | `memberCount` | on every membership event |
 | **`admin-notification-channel-provision.ts`** | **nothing** | **GAP** |
 | **`proactive-briefing.ts`** | **nothing** | **GAP** |
 
 ### The gap, stated plainly
 
 **Two channel-creating paths write no context at all.** A conversation created by the admin
-notification provisioner or by proactive briefing has no participant shape, no grounding, and no
-member count. The assistant still answers in them; it answers with less than it should, and nothing
+notification provisioner or by proactive briefing has no participant shape and no grounding at all.
+The assistant still answers in them; it answers with less than it should, and nothing
 surfaces that.
 
 **This is a symptom of the root cause already on record: channel creation is implemented six times.**
@@ -313,10 +311,9 @@ is the checklist a new path must satisfy.
 - **Whether a missing row should be repaired lazily** (first turn notices and backfills) or whether
   creation paths must simply be correct. Lazy repair hides the gap; strict creation surfaces it but
   leaves existing conversations unrepaired.
-- **Whether `memberCount` should be conditional on the row existing.** Today it is not, so the
-  archival path can CREATE a sparse row for a channel that never had context. That is safe only
-  because every consumer is field-guarded; making it conditional would preserve the null/non-null
-  distinction at the cost of never caching for pre-existing channels.
+- **Whether any non-creation writer may create a row.** No writer does so today, so a row's existence
+  still means a creation path ran. Admitting one would trade that signal for the convenience of
+  writing without checking, and is safe only while every consumer stays field-guarded.
 - **A detector.** Absence is invisible by construction, so the only way this stops recurring is a
   scheduled check for channels with assistant turns and no context row.
 

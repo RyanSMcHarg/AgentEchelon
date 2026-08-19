@@ -196,6 +196,14 @@ be the source of private grounding or of trusted state.
 **Failure direction.** Reads fail soft to null, degrading to "no host grounding this turn" rather than
 erroring the turn. Writes are best-effort: a lost write degrades grounding, it never leaks.
 
+**Migration.** Every writer of this table is on a conversation-create path, so a conversation that
+predates the move out of channel Metadata has no row and is served ungrounded, on the deployment's
+default model and language. `host-grounding.ts` reports each such turn (channel and key names, never
+values) and does not fall back to Metadata. Recovery is the one-shot
+`backend/scripts/backfill-channel-context.ts`, run by an operator: it promotes what Metadata still
+carries, re-bounded and marker-stripped, never overwriting a row the store already owns. A channel
+whose Metadata has since been rewritten without those fields is not recoverable from any source.
+
 ### 3.2 `UserProfileTable` - per-user onboarding facts
 
 **Content.** A durable per-end-user record keyed by Cognito sub: an onboarded flag and the facts

@@ -550,7 +550,10 @@ aws ssm describe-parameters \
 # Post-deploy backfills (run BOTH after re-seeding):
 USER_POOL_ID=<USER_POOL_ID> node backend/scripts/backfill-tier-groups.mjs
 node backend/scripts/backfill-channel-flow.mjs
+# Host grounding for conversations older than the move out of channel metadata (dry-run first):
+npx ts-node backend/scripts/backfill-channel-context.ts --dry-run
 ```
+
 
 ## 16. Bot replies with `{"Code":429}` at ~43s (VPC-attached Lex handler can't reach its control plane)
 
@@ -824,3 +827,41 @@ Both causes are silent by construction, so the guard is observability rather tha
 - The history load logs the role shape alongside the count. A count cannot diagnose this; a shape can.
 
 Neither cause is deploy-sensitive. Cause A tracks how the conversation is worded, cause B tracks how the model happened to punctuate a reply, so a deployment that works today can fail tomorrow with no change shipped.
+
+## 21. An existing conversation lost its grounding, or started replying in the wrong language
+
+### Symptom
+
+A conversation that used to know the plan, the participant's profile and their name answers
+generically, and one meant for another language or region replies in the deployment's default language
+on the default model. New conversations are fine. Nothing errors.
+
+### Cause
+
+`participantProfile`, `domainContext`, `otherContexts`, `userName`, `userLanguage` and `segment` live
+in the server-only channel-context store, not in channel metadata. Channel metadata is
+member-**writable** (a channel's creator is a moderator of their own channel and holds
+`chime:UpdateChannel`, which sets Name and Metadata in one call), so the router reads those six only
+from the store and never falls back to metadata. Every writer of the store is on a conversation-create
+path, so a conversation created before that split holds its grounding only in metadata and gets none.
+
+### Confirm
+
+The router log group carries one line per affected turn, naming the channel and which keys are still
+in metadata (never their values):
+
+```
+[host-grounding] channel <arn> has legacy private grounding in member-readable Metadata (...)
+```
+
+### Fix
+
+```bash
+AWS_PROFILE=<your-profile> npx ts-node backend/scripts/backfill-channel-context.ts --dry-run
+AWS_PROFILE=<your-profile> npx ts-node backend/scripts/backfill-channel-context.ts
+```
+
+It promotes what metadata still carries, re-bounded and marker-stripped, and never overwrites a row
+the store already owns; the run reports what it recovered and what it left alone. A conversation whose
+metadata has since been rewritten without those fields cannot be recovered from anywhere, and the host
+application must re-send its grounding through the create/edit call.

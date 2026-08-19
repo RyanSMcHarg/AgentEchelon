@@ -47,6 +47,8 @@ Two properties worth calling out:
 - **Shared, not per-tier.** The instruction lives in the shared `async-processor-core.ts` prompt builder, so the shared processor applies it for every profile - no per-tier duplication.
 - **Untrusted tag → closed map.** `userLanguage` is never interpolated raw; the language *name* comes from the fixed `LANG_NAMES` map (`zh`/`en`), and unknown tags fall through to a generic phrasing. A crafted `userLanguage` cannot inject prompt text.
 
+**Conversations older than the store move.** Because the router reads `userLanguage` and `segment` only from the Channel Context store, a conversation created while they still lived in channel `Metadata` has neither and falls back to the deployment default language and model. The router logs each such turn rather than reading metadata; recovery is the one-shot operator run `backend/scripts/backfill-channel-context.ts`, which promotes what metadata still carries after re-validating the tag shape. See `docs/guides/developer/METADATA-AND-TAGS.md` §4.
+
 **Gap on the generic path:** the non-federated `create-conversation` (`backend/lambda/create-conversation/index.js:203, 312 - 321`) does **not** accept or persist `userLanguage` - it only writes `modelTier`/`topic`/`triggerContext`. This matters only if a deployment wants reply-language without the federated handler; if so, add the field there too (one line, well under the cap).
 
 ## Non-goals

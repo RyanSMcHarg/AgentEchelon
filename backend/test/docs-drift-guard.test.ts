@@ -353,6 +353,16 @@ const BANNED: Array<{ phrase: string; truth: string }> = [
 
   { phrase: 'provider-adapter seam is design', truth: 'the seam is built: lib/providers/external-llm.ts serves DeepSeek/Qwen behind resolveModelPlan, and DeepSeek-on-Bedrock is the preferred in-AWS CN path (SPEC-CONTEXT-AWARE-MODEL-ROUTING Status)' },
   { phrase: 'every context rule re-checks', truth: 'the CN context rules do NOT re-check the classification allowlist; they are bounded by the per-profile bedrock:InvokeModel grant. Only rules 3/4 check it, via model-resolver.ts (SPEC-CONTEXT-AWARE-MODEL-ROUTING Invariants)' },
+
+  // --- The archival path publishes no member count, and the channel-context store holds none. ---
+  //
+  // This claim survived in FOUR places at once - a spec's writer table, the store's own header, an IAM
+  // grant comment and a CloudWatch alarm description - for a value that had no reader anywhere. Each
+  // one made the others look corroborated, which is exactly the shape a guard is for. The count also
+  // cannot serve the decision it was written for: derived from archived membership events it collapses
+  // assistants into the human roster, so a battle channel of three reports 2.
+  { phrase: 'the archival path writes `memberCount`', truth: 'the archival path publishes no member count; @all size is resolved live by lib/channel-size.ts (resolveChannelSize)' },
+  { phrase: 'a membership signal the archival path records', truth: 'the channel-context store holds no member count; nothing reads one (lib/channel-size.ts)' },
 ];
 
 function walk(abs: string, out: string[]): void {

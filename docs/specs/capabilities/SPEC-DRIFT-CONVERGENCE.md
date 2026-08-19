@@ -151,7 +151,7 @@ interface DetectDriftInput {
   correlationId?: string;       // UUIDv7. Generated when omitted
   userClearance?: 'basic' | 'standard' | 'premium'; // EMF dimension; metrics aggregate across clearances when omitted
   declinedDistances?: number[]; // Cosine values recently declined; a distance inside any +/-0.05 band suppresses
-  activeTaskInProgress?: boolean; // Skip the cosine path while a task awaits this user's answer
+  activeTaskInProgress?: boolean; // Skip the cosine path while this CHANNEL has a live task, whoever holds it
 }
 ```
 
@@ -161,7 +161,7 @@ Algorithm:
  - Intent in `{GREETING, ACKNOWLEDGMENT, OFF_TOPIC}`.
  - Channel has no `conversation_summaries` row yet (no anchor to compare against). Emits `drift_skipped_no_summary`. This is the NORMAL path on a conversation's first user turn: drift runs before that turn's exchange has been summarised, and the seed is written afterwards. Drift is live from turn two onward - see Summary Updater.
  - User previously declined a drift suggestion with a cosine distance within ±0.05 of what this turn's distance will be (decline-suppression - see below).
- - **A live task exists for this user in this channel** (status `pending` or `in_progress`). Emits `drift_skipped_active_task`. Checked AFTER the explicit-routing fast-path and BEFORE the summary fetch and the embed call, so a suppressed turn costs no Bedrock round-trip. See "Active-task suppression" below.
+ - **A live task exists in this channel** (status `pending` or `in_progress`), whichever principal currently holds it. Emits `drift_skipped_active_task`. Checked AFTER the explicit-routing fast-path and BEFORE the summary fetch and the embed call, so a suppressed turn costs no Bedrock round-trip. See "Active-task suppression" below for why this is not keyed on the user owning the task.
 
 2. **Explicit routing fast-path:** if `detectExplicitRoutingRequest(latestMessage)` matches (e.g., regex like `/^(let'?s\s+)?(start|switch to|move to|open) a (new|separate) (conversation|channel|chat)\s+(about|for|on)\s+(.+)$/i`), return `{isDrift:true, suggestedAction:'redirect', confidence:'high', signalAvailable:true}` immediately. Emit `drift_fastpath_explicit_intent` EMF metric. This is the **only** string-matching path. Pattern lives in `lib/explicit-routing.ts` with a unit-tested allowlist.
 
@@ -235,10 +235,10 @@ A second case in the same suite: a 3-member channel (user A + user B + bot) wher
 
 ### Active-Task Suppression
 
-A live task (`pending` or `in_progress`) means the assistant is mid-workflow and has asked this
-user for something: report requirements, an outline approval, troubleshooting symptoms, a
-scheduling slot. The user's next turn is the ANSWER, and an answer is a continuation of the
-thread - not a pivot away from it.
+A live task (`pending` or `in_progress`) means the assistant is mid-workflow and has asked
+someone in this conversation for something: report requirements, an outline approval,
+troubleshooting symptoms, a scheduling slot. The next turn is the ANSWER, and an answer is a
+continuation of the thread - not a pivot away from it.
 
 The cosine signal cannot see that, because it compares one message against the summary. An
 answer is typically a short fragment that repeats none of the summary's topic words
@@ -252,6 +252,42 @@ expected result but does not by itself re-demonstrate the original failure.
 The router resolves the live task for task continuation anyway, so it passes
 `activeTaskInProgress` into `detectDrift` and no extra read is incurred.
 
+**The condition is "live task in THIS CHANNEL", not "live task this user owns".** Ownership moves to
+the person only when the machine enters a state that declares `awaits` ([ADR-024](../../design/decisions/024-task-ownership.md)),
+so an owner-keyed suppression silently inherited every such declaration as a dependency: a state that
+ends its turn on a question and does not carry the flag leaves the task with the ASSISTANT, the
+owner-keyed lookup finds nothing, and drift protection is gone with no error anywhere.
+`report_generation.drafting_outline` was exactly that state. A user answering the assistant's own
+outline question with "Can you make it 1-2 pages?" was served "It looks like you're shifting topics"
+instead of a shorter report, because a one-line request about page count sits far from an ARR
+summary's embedding. The flag is still worth declaring for its own reasons - it is what puts the item
+in the person's queue and what lets their next message resume it - but the drift guard no longer
+depends on it being right. The router derives the condition from the task lookups it already makes
+(the person's held list, the assistant's own partition, the requester-keyed fallback), all of which
+filter to `pending`/`in_progress` in their key condition, so nothing is read that was not read before.
+
+**This suppression is an INTERIM, and it is blunter than the intended rule.** It treats any live task
+as a reason to continue here, so while a task is open a genuinely new subject is never offered a
+conversation of its own. The target design asks two questions where this asks one:
+
+1. Is the message unrelated to the TASK but still related to the CONVERSATION? Break out of the task
+   and carry on here. No drift offer, no new conversation.
+2. Is it unrelated to the task AND unrelated to the conversation? That is real drift: offer a new
+   conversation, and if the person declines, break out of the task and carry on here.
+
+The interim errs toward continuity because continuity is the cheaper failure - interrupting an answer
+the assistant just solicited costs the person the turn they were in; a missed offer costs them a split
+they can still ask for outright, since the explicit-routing fast path is never suppressed. The
+decision lives in one named place (`backend/lambda/src/lib/task-continuity.ts`) so the two-axis rule
+replaces that function's body without touching the router or the drift flow.
+
+**What the two-axis version needs and does not have: a task-scoped signal.** Drift's only anchor is
+the conversation-summary embedding, and nothing embeds a task, so question 1 has no input at all
+today. The unbuilt `conversation_topic_embeddings` store (algorithm step 6b) is the same SHAPE - many
+small embeddings for one channel, replaced per summary version, compared by minimum cosine distance -
+but it is keyed on the summariser's `topics[]` and says nothing about the open task, so it does not by
+itself answer question 1.
+
 Scope of the suppression, deliberately narrow:
 
 - It suppresses the COSINE path only. The explicit-routing fast-path is checked FIRST, so a
@@ -259,7 +295,8 @@ Scope of the suppression, deliberately narrow:
   A long-running task must never become a trap.
 - It does not touch the pending-suggestion branch. A user answering an outstanding yes/no is
   always honoured.
-- It is per-channel and per-user, and it lifts as soon as the task reaches a terminal state.
+- It is per-channel and owner-independent, and it lifts as soon as the task reaches a terminal
+  state. **A follow-up ABOUT a finished task is therefore not covered** - see the next section.
 
 `drift_skipped_active_task` is expected to be nonzero on any deployment that uses multi-turn
 tasks; unlike `drift_skipped_no_summary` it is not an alertable condition. A drift precision
@@ -300,6 +337,41 @@ suppression covers that class only while a task is live. The uncovered case - a 
 follow-up in an ordinary conversation, against a single-exchange anchor - is not currently
 suppressed, and widening the threshold is not the answer to it: the distance is genuinely large, and
 what is wrong is treating a one-exchange anchor as equally authoritative as an established topic.
+
+**The same class arrives again the moment a task ENDS, and is also uncovered.** Observed in the same
+live `report_generation` conversation that produced the `drafting_outline` failure above: the report
+was delivered, the user said "Looks good", the assistant said it had saved the file, and the user
+asked "Where is the file?" - which fired a drift offer. Every task lookup on the router path filters
+to `pending`/`in_progress`, so a task that reached a terminal state is invisible to all of them and
+nothing about it can suppress anything. Widening the suppression to any live task in the channel does
+not reach this turn, because by then there may be no task at all.
+
+The shape of the miss is the same in both cases and names what a fix would have to be: the message
+refers to the **immediately preceding assistant turn**, and the only anchor drift holds is a summary
+of the conversation as a whole. "Where is the file?" is far from an ARR summary and very close to a
+reply that just said a file had been saved. So the honest fix is a SECOND ANCHOR, not a shape rule -
+carry the last exchange as its own embedding and treat the message as on-topic when it is near
+either. It costs one Titan embed per assistant turn on the path that already embeds the summary
+([ADR-019](../../design/decisions/019-conversation-summary-seeded-on-first-turn.md) writes from the
+reply handler, which is holding the reply text), and no additional read on the drift path. Its risk
+is the opposite one: a wandering assistant reply becomes a wide anchor that suppresses genuine
+pivots, so a second anchor may only ever SUPPRESS (take the nearer of the two distances) and never
+fire on its own.
+
+**Rejected: a length or question-shape rule** ("short, ends in a question mark, therefore a
+follow-up"). It cannot separate "Where is the file?" from "What about hiring?", which is a genuine
+pivot of identical shape, and it puts English punctuation and phrasing back into a signal this spec
+requires to be embedding-based throughout ("String matching in the design"). The attachment gate
+already ran this experiment: an English-opener phrase list deciding attach-vs-chat, defeated in both
+directions by a non-English deployment.
+
+**Rejected: a recency window after a task's terminal state.** It needs a fact nothing on this path
+holds - a terminal task is filtered out of every lookup, so it would take a new read or a new
+per-channel field - and it is wrong precisely where drift is most useful: the turn right after a
+piece of work finishes is the most likely moment for a legitimate new subject.
+
+Status: **open design question, not built.** Neither anchor nor guard exists today, and both false
+offers above remain reproducible on a deployment.
 
 ### Decline-Suppression
 

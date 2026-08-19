@@ -223,6 +223,22 @@ changed by a deploy.
 | **Handler IAM role** | The per-classification stack (`AgentHandlerRole`) | **Deploy only** | **Never** |
 | Task machines (`machines`) | Inside the versioned definition | `manage-profiles` API | Yes |
 
+**Authoring a task machine has its own contract.** The table above says where `machines` LIVES and
+that it travels with the profile. What each state must declare, and what the platform does with it,
+is [`SPEC-TASK-STATE-TRANSITIONS.md`](../../specs/interaction/conversation/SPEC-TASK-STATE-TRANSITIONS.md)
+sections 9 to 11: the platform-versus-deployment split, how `delivers` decides attachment against
+inline (and what a state's `prompt` may therefore say about a file), and the defaults nothing prompts
+an author for. The one worth knowing before writing a single state: `awaits: { party: 'requester' }`
+is what moves ownership to the person, and topic-drift detection, intent classification and model
+selection all read it to tell a continuation from a new subject. Omit it on a state that waits for an
+answer and the machine still validates, while the person's next message is treated as a new topic on
+the cheapest model.
+
+`requester` is the only reference that ships, and it resolves to the person whose request opened the
+task. The declaration is an object rather than a flag so further references stay additive; a machine
+that already says `awaitsUser: true` keeps working and means the same thing, so a stored version and
+an exported manifest both still import.
+
 ### Why the IAM role is not part of the profile
 
 The role is what makes the rest safe to edit at runtime. It grants `bedrock:InvokeModel` on the

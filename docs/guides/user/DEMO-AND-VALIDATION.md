@@ -38,10 +38,14 @@ The data-producing phases reach the LIVE app the same way the frontend does, via
 
 Read the DATA READINESS lines before assuming a full run - `MISS` there tells you exactly which admin data will be absent and why.
 
+`validate.mjs` resolves every stack it reads from this deployment's CloudFormation stack-name prefix, and prints that prefix on its first line. The prefix is the PascalCase form of the instance name (`agent-echelon` gives `AgentEchelon`, `acme` gives `Acme`), and it follows the same overrides the rest of the tooling takes: `AE_STACK_PREFIX`, `STACK_PREFIX`, `AE_INSTANCE_NAME`. Set one of those if your stacks are named differently, or the frontend lookup fails the run rather than guessing.
+
+A lookup that FAILS is reported differently from a stack that is absent. An expired SSO session, absent credentials, a denied call and a throttle all make `describe-stacks` exit non-zero, and none of them says anything about the deployment: those read as `the lookup itself failed`, and the fix is `aws sso login --profile <your-profile>`, not a redeploy.
+
 ## Prerequisites
 
 - A deployed stack (`npm run deploy` in `backend/`) and valid AWS creds (`aws sso login --profile <your-profile>`).
-- The e2e test users, provisioned into the `agent-interface/test-credentials` secret (`npm run provision-test-users`). The e2e reads them via `tests/e2e/helpers/test-credentials.ts`.
+- The e2e test users, provisioned into the `agent-interface/test-credentials` secret (`npm run provision-test-users`). The e2e reads them via `tests/e2e/helpers/test-credentials.ts`. Each run generates a fresh random password and writes it to that secret BEFORE rotating any user to it, so an interrupted run leaves nothing holding a credential nobody recorded: fix the cause and re-run the same command.
 - The standard-tier persona is seeded for you by `seed-demo.ts` (below), so the assistant speaks as Stratum out of the box - no deploy flag required. To use your own instead, pass `-c assistantSystemPrompt=...` at deploy (the seed leaves an operator-provided persona untouched).
 
 ## Steps
