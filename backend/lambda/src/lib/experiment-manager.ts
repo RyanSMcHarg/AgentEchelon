@@ -16,7 +16,8 @@ import { IMAGE_GEN_MODELS, type ImageGenModelKey } from './image-gen-models.js';
 import { intentTypeToRouteKey } from './model-resolver.js';
 import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
 import { SSMClient } from '@aws-sdk/client-ssm';
-import { lookupProfileVersionModelKey } from './profile-version-lookup.js';
+import { lookupProfileVersion, lookupProfileVersionModelKey } from './profile-version-lookup.js';
+import type { ProfileDefinition } from './active-profile.js';
 
 // removeUndefinedValues: createExperiment persists the validated record
 // directly, and validateAndSanitizeExperiment leaves optional fields
@@ -27,7 +28,7 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
 });
 const EXPERIMENTS_TABLE = process.env.EXPERIMENTS_TABLE || '';
-// SPEC-PORTABLE-VERSIONED-PROFILES §6: a profileRef variant resolves its model from the referenced
+// SPEC-PORTABLE-PROFILES §6: a profileRef variant resolves its model from the referenced
 // profile version's SSM definition. Own client (like the ddb one above); read-only + fail-safe.
 const ssmClient = new SSMClient({});
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
@@ -42,7 +43,7 @@ export interface ExperimentVariant {
    *  varies either a bare model (+ optional prompt-addendum) OR an entire profile version, not both. */
   modelKey?: BackendModelKey;
   /**
-   * SPEC-PORTABLE-VERSIONED-PROFILES §6: run an ENTIRE profile version as the variant. The variant's
+   * SPEC-PORTABLE-PROFILES §6: run an ENTIRE profile version as the variant. The variant's
    * model (and, once the AssistantConfig unification lands, its prompt/pack/tools/guardrail) come from
    * that version's definition. Resolved at runtime via lookupProfileVersionModelKey. Mutually exclusive
    * with `modelKey`.
@@ -70,7 +71,21 @@ export interface ExperimentVariant {
 /** Advisory objective metric. */
 export type ExperimentObjectiveMetric = 'cost' | 'accuracy' | 'quality' | 'latency';
 
+/**
+ * A metric that must NOT regress for a variant to be shippable (DESIGN §1.2).
+ * Pre-registers the decision rule so the statistics can't be fished. Advisory
+ * only — it frames the recommendation, never an automatic routing change.
+ */
+export interface ObjectiveGuardrail {
+  metric: ExperimentObjectiveMetric;
+  /** 'no_worse_than' bounds a regression; 'at_least' bounds an improvement floor. */
+  direction: 'no_worse_than' | 'at_least';
+  /** Percentage bound in [0, 100], same units as `target`. */
+  bound: number;
+}
+
 export interface ExperimentObjective {
+  // --- existing (unchanged; still the PRIMARY quantitative criterion) ---
   metric: ExperimentObjectiveMetric;
   /**
    * Target as a percentage in [0, 100]: a desired *decrease* for cost/latency,
@@ -78,6 +93,51 @@ export interface ExperimentObjective {
    * recommendation, never an automatic routing change.
    */
   target: number;
+
+  // --- new, all optional (absent ⇒ today's behavior — INV-2) ---
+  /** Prose: "the decision this test informs". Sanitized + capped at 500 chars. */
+  statement?: string;
+  /** Metrics that must NOT regress for a ship (≤3). Veto conditions, not a blend. */
+  guardrails?: ObjectiveGuardrail[];
+  /**
+   * 0..1: how much the battle human-pick counts vs the metric (DESIGN §4.3).
+   * Default absent ⇒ 0 ⇒ today's behavior (picks are dashboard-only). Never
+   * blends the human pick into one number — it only raises confidence on
+   * agreement and surfaces disagreement (INV-3/INV-4).
+   */
+  humanPickWeight?: number;
+}
+
+/**
+ * The operator's recorded outcome when a test that RAN is completed (DESIGN §3.2.1).
+ * Distinct from the computed advisory recommendation: this is the human's own
+ * record of what they did, and `no_decision` is the default + always available so
+ * an inconclusive test closes honestly (INV-1/INV-3). Recording it never routes.
+ */
+export interface ExperimentDecision {
+  outcome: 'promoted_treatment' | 'kept_control' | 'no_decision';
+  /** Optional prose, ≤500 chars (sanitized). */
+  note?: string;
+  /** Admin ARN from the token. */
+  by: string;
+  /** ISO timestamp. */
+  at: string;
+}
+
+/**
+ * One append-only lifecycle-audit entry (DESIGN §3.2 L7). Every status change and
+ * guarded edit appends one, so the lifecycle is auditable (TENET 4). `from` may be
+ * the pseudo-state 'create' for the record's first entry.
+ */
+export interface ExperimentTransition {
+  from: Experiment['status'] | 'create';
+  to: Experiment['status'];
+  /** Actor ARN from the token (like `boundBy`). */
+  by: string;
+  /** ISO timestamp. */
+  at: string;
+  /** e.g. 'auto:endDate', 'conflict:paused', 'delete:soft'. */
+  reason?: string;
 }
 
 /**
@@ -88,7 +148,7 @@ export interface ExperimentObjective {
  * any intent on the classification), and 'classification' via `resolveClassificationExperiment`
  * (it swaps the intent-classifier model).
  */
-// 'profile' (SPEC-PORTABLE-VERSIONED-PROFILES §6) pits two whole assistant PROFILE versions against each
+// 'profile' (SPEC-PORTABLE-PROFILES §6) pits two whole assistant PROFILE versions against each
 // other via profileRef variants. It swaps the assistant's base model across every intent, so it matches
 // and conflicts exactly like 'base_model' — the difference is provenance (a versioned profile, not a bare
 // model key), which the variant's profileRef carries.
@@ -96,18 +156,30 @@ export type ExperimentType = 'intent' | 'base_model' | 'classification' | 'profi
 
 export interface Experiment {
   experimentId: string;
-  status: 'active' | 'paused' | 'completed';
+  /**
+   * Lifecycle state (DESIGN §3.2 / A.3). Widened additively: 'draft' (L3, never
+   * resolves traffic) and 'deleted' (L8, terminal soft-delete tombstone) join the
+   * original 'active'|'paused'|'completed'. Absent/omitted status still means
+   * 'active' for legacy callers (INV-2). 'completed'/'deleted' are terminal.
+   */
+  status: 'draft' | 'active' | 'paused' | 'completed' | 'deleted';
   /** Defaults to 'intent' when absent. */
   experimentType?: ExperimentType;
   intent: string;
   tiers: Classification[];
   variants: ExperimentVariant[];
+  /** BEHAVIOR (L5): now enforced at resolve time — an experiment isn't live before startDate. */
   startDate: string;
+  /** BEHAVIOR (L5): auto-completes on expiry; already gates resolution. */
   endDate?: string;
   createdAt: string;
   description?: string;
   /** Advisory target. Never auto-acts. */
   objective?: ExperimentObjective;
+  /** NEW (§3.2.1): the operator's recorded outcome, set when a test that RAN is completed. Advisory-adjacent; never routes. */
+  decision?: ExperimentDecision;
+  /** NEW (L7): append-only lifecycle audit. Every status change / guarded edit appends one entry. */
+  transitions?: ExperimentTransition[];
   /** v0.2.0 (SPEC-BATTLE.md): when true, this experiment can power
    *  /battle. Requires exactly 2 variants and a defined altBotSlotId. */
   battleEnabled?: boolean;
@@ -143,6 +215,25 @@ export interface ExperimentResolution {
    * and battle is just the extra UI+scoring on top. Undefined for a text-only variant.
    */
   imageGenModelKey?: ImageGenModelKey;
+  /**
+   * The variant's FULL profile definition, for a `profileRef` variant (SPEC-PORTABLE §6). A variant is
+   * not a model: persona, tools, classifier mode, guardrail selection, task machines and context sources
+   * all ride the version, which is what lets profile-vs-profile answer "do these tools earn their place"
+   * — two versions that differ ONLY in `tools`. Serving just `modelKey` makes that experiment resolve to
+   * two identical variants and report no difference, for a reason unrelated to the tools.
+   *
+   * Undefined for a lightweight `modelKey` variant, which stays exactly as it was.
+   *
+   * The classification ceiling needs no widening to carry this, because every dimension is ALREADY
+   * bounded per classification, and none of them by this resolution: the model by
+   * `allowedClassifications` (checked below), tools by the serving Lambda's own IAM (a tool reads only
+   * what that classification's role can read), the guardrail by the per-classification ApplyGuardrail
+   * grant (an unprovisioned selection AccessDenies and falls back loudly, never fails open), and context
+   * sources by the published per-classification catalog (a source outside it is skipped, not served).
+   */
+  variantProfile?: ProfileDefinition;
+  /** The variant version's attribution key, so analytics slices by the version that actually served. */
+  configId?: string;
 }
 
 // ============================================================
@@ -157,8 +248,12 @@ interface CachedExperiments {
 const CACHE_TTL_MS = 60_000; // 1 minute
 let experimentCache: CachedExperiments | null = null;
 
-async function loadExperiments(): Promise<Experiment[]> {
-  if (experimentCache && Date.now() - experimentCache.loadedAt < CACHE_TTL_MS) {
+// `forceRefresh` bypasses the 60s cache for correctness-critical WRITE-PATH reads (the
+// create/activate conflict gate): a blocker created moments earlier must be visible or the
+// type-exclusion check silently passes and two conflicting experiments both go active. Hot
+// read paths (routing, drift, battle resolution) keep the cache.
+async function loadExperiments(forceRefresh = false): Promise<Experiment[]> {
+  if (!forceRefresh && experimentCache && Date.now() - experimentCache.loadedAt < CACHE_TTL_MS) {
     return experimentCache.experiments;
   }
 
@@ -221,6 +316,27 @@ export function assignVariant(experimentId: string, channelArn: string, variants
 // ============================================================
 
 /**
+ * Whether an experiment is live for a classification right now (DESIGN §3.2 L5).
+ * Requires `active` status (so draft/paused/completed/deleted never resolve traffic),
+ * the classification in scope, and — new in L5 — the window honored on BOTH ends:
+ * `startDate ≤ now` (an experiment isn't live before it starts) and, as before,
+ * `endDate > now` (expired experiments stop resolving). Absent `startDate` ⇒ live
+ * immediately (INV-2). Pure; exported so the resolver, sweeper, and admin read share it.
+ */
+export function isLiveForClassification(
+  exp: Experiment,
+  classification: Classification,
+  now: Date = new Date(),
+): boolean {
+  return (
+    exp.status === 'active' &&
+    exp.tiers.includes(classification) &&
+    (!exp.startDate || new Date(exp.startDate) <= now) &&
+    (!exp.endDate || new Date(exp.endDate) > now)
+  );
+}
+
+/**
  * Find an active experiment matching this classification + intent, assign a variant,
  * and return the model to use. Returns null if no experiment applies.
  */
@@ -232,10 +348,7 @@ export async function resolveExperimentModel(
 ): Promise<ExperimentResolution | null> {
   const experiments = await loadExperiments();
   const now = new Date();
-  const isLiveForClassification = (exp: Experiment): boolean =>
-    exp.status === 'active' &&
-    exp.tiers.includes(classification) &&
-    (!exp.endDate || new Date(exp.endDate) > now);
+  const isLive = (exp: Experiment): boolean => isLiveForClassification(exp, classification, now);
 
   // Resolution order: an intent-specific experiment wins over a base-model
   // experiment when both apply. A base-model experiment swaps the classification default
@@ -258,12 +371,12 @@ export async function resolveExperimentModel(
       (exp) =>
         (exp.experimentType ?? 'intent') === 'intent' &&
         (exp.intent === routeKey || exp.intent === intent) &&
-        isLiveForClassification(exp),
+        isLive(exp),
     ) ??
     experiments.find(
       (exp) =>
         (exp.experimentType === 'base_model' || exp.experimentType === 'profile') &&
-        isLiveForClassification(exp),
+        isLive(exp),
     );
 
   if (!experiment) return null;
@@ -290,9 +403,7 @@ export async function resolveClassificationExperiment(
   const experiment = experiments.find(
     (exp) =>
       exp.experimentType === 'classification' &&
-      exp.status === 'active' &&
-      exp.tiers.includes(classification) &&
-      (!exp.endDate || new Date(exp.endDate) > now),
+      isLiveForClassification(exp, classification, now),
   );
   if (!experiment) return null;
   return resolveVariantForProfile(experiment, classification, channelArn, catalog);
@@ -319,6 +430,24 @@ async function effectiveModelKeyOf(variant: ExperimentVariant): Promise<BackendM
   return variant.modelKey ?? null;
 }
 
+/**
+ * A variant's DEFINITION: the whole profile version for a `profileRef` variant, or null for a
+ * lightweight `modelKey` variant (which has no version behind it, by design — the two are mutually
+ * exclusive and validated as such).
+ *
+ * Resolves in ONE read, unlike calling `effectiveModelKeyOf` and then re-reading for the rest, so a
+ * variant can never be served a model from one version and a tool set from another.
+ */
+async function variantDefinitionOf(variant: ExperimentVariant): Promise<ProfileDefinition | null> {
+  if (!variant.profileRef) return null;
+  const def = await lookupProfileVersion(ssmClient, SSM_ROOT, variant.profileRef);
+  if (!def) {
+    console.warn(`[ExperimentManager] profileRef ${variant.profileRef.profileName}@${variant.profileRef.version ?? 'active'} unresolved`);
+    return null;
+  }
+  return def;
+}
+
 async function resolveVariantForProfile(
   experiment: Experiment,
   classification: Classification,
@@ -327,9 +456,13 @@ async function resolveVariantForProfile(
 ): Promise<ExperimentResolution | null> {
   const variant = assignVariant(experiment.experimentId, channelArn, experiment.variants);
 
-  // §6: a profileRef variant runs an entire profile version — its model comes from that version's
-  // definition. Fail-safe: an unresolvable variant skips the experiment (deterministic default holds).
-  const effectiveModelKey = await effectiveModelKeyOf(variant);
+  // §6: a profileRef variant runs an entire profile VERSION — model, persona, tools, classifier mode,
+  // guardrail selection, machines and context sources, not just a model. Read once, so the served
+  // model and the served tool set can never come from different versions.
+  // Fail-safe: an unresolvable variant skips the experiment (deterministic default holds).
+  const variantProfile = await variantDefinitionOf(variant);
+  if (variant.profileRef && !variantProfile) return null; // already logged by variantDefinitionOf
+  const effectiveModelKey = (variantProfile?.modelKey ?? variant.modelKey) as BackendModelKey | undefined;
   if (!effectiveModelKey) {
     console.error('[ExperimentManager] variant has neither modelKey nor a resolvable profileRef; skipping');
     return null;
@@ -352,9 +485,15 @@ async function resolveVariantForProfile(
     variantId: variant.variantId,
     modelKey: effectiveModelKey,
     bedrockModelId: bedrockInvokeId(model),
-    // Carry the variant's image model so an image_generation turn serves it in the normal flow
-    // (a profileRef variant carries its image model via its profile's models.image, not here).
-    ...(variant.imageGenModelKey && { imageGenModelKey: variant.imageGenModelKey }),
+    // Carry the variant's image model so an image_generation turn serves it in the normal flow. A
+    // profileRef variant carries its image model on the VERSION (`models.image`), so it is read from
+    // there; an explicit `imageGenModelKey` on the variant still wins, which is what an image-only
+    // experiment sets and what the battle image duel arms.
+    ...((variant.imageGenModelKey ?? variantProfile?.models?.image)
+      ? { imageGenModelKey: (variant.imageGenModelKey ?? variantProfile?.models?.image) as ImageGenModelKey }
+      : {}),
+    // §6: the whole definition rides the resolution, plus the version's attribution key.
+    ...(variantProfile ? { variantProfile, configId: variantProfile.configId } : {}),
   };
 }
 
@@ -362,14 +501,18 @@ async function resolveVariantForProfile(
 // CRUD Operations (for admin API)
 // ============================================================
 
-export async function createExperiment(experiment: Omit<Experiment, 'createdAt'>): Promise<Experiment> {
+export async function createExperiment(
+  experiment: Omit<Experiment, 'createdAt'>,
+  /** Catalog keys, so an unknown variant `modelKey` is a 400 here rather than a silent same-model duel. */
+  validModelKeys?: ReadonlySet<string>,
+): Promise<Experiment> {
   // Sanitize + validate before persistence. Throws ExperimentValidationError
   // on rule breaks (admin API surfaces these as 4xx). Battle-mode rules
   // (variant count, displayName, slot binding) are enforced here.
   const sanitized = validateAndSanitizeExperiment({
     ...experiment,
     createdAt: new Date().toISOString(),
-  } as Experiment);
+  } as Experiment, validModelKeys);
 
   const record: Experiment = {
     ...sanitized,
@@ -423,6 +566,12 @@ export const MAX_PROMPT_ADDENDUM_LENGTH = 500;
 
 /** Maximum length for displayName. Spec: max ~16 chars. */
 export const MAX_DISPLAY_NAME_LENGTH = 16;
+
+/** Maximum length for objective.statement and ExperimentDecision.note (DESIGN §1.2 / §3.2.1). */
+export const MAX_OBJECTIVE_STATEMENT_LENGTH = 500;
+
+/** Maximum number of pre-registered guardrails on an objective (DESIGN §1.2). */
+export const MAX_GUARDRAILS = 3;
 
 /**
  * Hard cap on total active experiments.
@@ -514,6 +663,31 @@ export function sanitizeDisplayName(raw: string | undefined): string | undefined
 }
 
 /**
+ * Sanitize free-prose objective/decision text (DESIGN §1.2 / §3.2.1): strip ASCII
+ * control chars, collapse whitespace, trim, and length-cap at
+ * MAX_OBJECTIVE_STATEMENT_LENGTH. Returns undefined for absent/blank input so the
+ * field simply stays absent (INV-2). Exported so the status handler can reuse it for
+ * ExperimentDecision.note (same 500-cap prose rule) instead of duplicating the logic.
+ */
+export function sanitizeObjectiveStatement(raw: string | undefined): string | undefined {
+  if (raw === undefined || raw === null) return undefined;
+  if (typeof raw !== 'string') {
+    throw new ExperimentValidationError('statement must be a string', 'STATEMENT_TYPE');
+  }
+  // eslint-disable-next-line no-control-regex
+  const stripped = raw.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '');
+  const normalized = stripped.replace(/\s+/g, ' ').trim();
+  if (normalized.length === 0) return undefined;
+  if (normalized.length > MAX_OBJECTIVE_STATEMENT_LENGTH) {
+    throw new ExperimentValidationError(
+      `statement exceeds ${MAX_OBJECTIVE_STATEMENT_LENGTH} chars (got ${normalized.length})`,
+      'STATEMENT_TOO_LONG',
+    );
+  }
+  return normalized;
+}
+
+/**
  * Validate + sanitize an Experiment record before persistence. Throws
  * ExperimentValidationError on any rule break so admin-API callers can
  * convert to 4xx responses.
@@ -526,14 +700,25 @@ export function sanitizeDisplayName(raw: string | undefined): string | undefined
  *
  * Returns a new Experiment with sanitized addendum + displayName fields.
  */
-export function validateAndSanitizeExperiment(input: Experiment): Experiment {
+export function validateAndSanitizeExperiment(
+  input: Experiment,
+  /**
+   * The deployment's model-catalog keys. When supplied, a variant's `modelKey` must be one of them.
+   *
+   * OPTIONAL so the ~40 existing call sites that test unrelated rules keep working, and so a caller with
+   * no catalog to hand degrades to the previous behaviour rather than being unable to validate anything.
+   * The WRITE path supplies it (`createExperiment`, and the admin update handler), which is where an
+   * unknown key would otherwise be persisted.
+   */
+  validModelKeys?: ReadonlySet<string>,
+): Experiment {
   const variants = input.variants.map((v) => ({
     ...v,
     displayName: sanitizeDisplayName(v.displayName),
     systemPromptAddendum: sanitizePromptAddendum(v.systemPromptAddendum),
   }));
 
-  // Each variant runs EITHER a bare model OR an entire profile version (SPEC-PORTABLE-VERSIONED-PROFILES
+  // Each variant runs EITHER a bare model OR an entire profile version (SPEC-PORTABLE-PROFILES
   // §6) — exactly one of modelKey / profileRef, never both, never neither. A bare modelKey is a catalog
   // key ('haiku'/'sonnet'); a profileRef {profileName, version?} runs that version's definition. Reject a
   // mis-specified variant at create time (400) instead of producing a mystery 0-row result.
@@ -546,10 +731,50 @@ export function validateAndSanitizeExperiment(input: Experiment): Experiment {
         'VARIANT_MODEL_KEY_REQUIRED',
       );
     }
+    // THE KEY MUST BE IN THE CATALOG (owner, 2026-08-10).
+    //
+    // Presence was checked and membership was not, and the failure is silent in the worst possible way.
+    // At resolution `catalog[modelKey]` returns undefined for an unknown key, so no variant model is
+    // resolved and the turn falls back to the profile's default - which means BOTH ARMS RUN THE SAME
+    // MODEL and the experiment reports `indistinguishable`. A typo produces a clean, confident,
+    // meaningless verdict, and the console shows nothing wrong because nothing errored.
+    //
+    // Same rule the profile write path already applies to `modelKey` (`validateBody` against the model
+    // catalog): confirm at the selection point, reject with a 400, never discover it as a mystery result.
+    //
+    // The KEY is what is stored, not a resolved Bedrock id - a version and a variant must both stay
+    // instance-agnostic (SPEC-PORTABLE §5), and the id is resolved per-deployment at runtime.
+    if (hasModel && validModelKeys && !validModelKeys.has(v.modelKey!.trim())) {
+      const offered = [...validModelKeys].sort().map((k) => `'${k}'`).join(', ');
+      throw new ExperimentValidationError(
+        `variant index ${i} modelKey '${v.modelKey}' is not in this deployment's model catalog; one of: ${offered}`,
+        'VARIANT_MODEL_KEY_UNKNOWN',
+      );
+    }
     if (hasRef && v.profileRef!.version !== undefined && (!Number.isInteger(v.profileRef!.version) || v.profileRef!.version < 1)) {
       throw new ExperimentValidationError(`variant index ${i} profileRef.version must be a positive integer (omit for the active version)`, 'VARIANT_PROFILE_REF_VERSION');
     }
   });
+
+  // L4 (DESIGN §3.2): weights must be non-negative integers summing to 100.
+  // Without this an assignVariant mis-split is silent (the cumulative-weight
+  // walk falls through to the last variant). Rejected at write time (400).
+  let weightSum = 0;
+  variants.forEach((v, i) => {
+    if (typeof v.weight !== 'number' || !Number.isFinite(v.weight) || !Number.isInteger(v.weight) || v.weight < 0) {
+      throw new ExperimentValidationError(
+        `variant index ${i} weight must be a non-negative integer (got ${v.weight})`,
+        'VARIANT_WEIGHT_INVALID',
+      );
+    }
+    weightSum += v.weight;
+  });
+  if (weightSum !== 100) {
+    throw new ExperimentValidationError(
+      `variant weights must sum to 100 (got ${weightSum})`,
+      'VARIANT_WEIGHT_SUM',
+    );
+  }
 
   // Experiment type. Absent ⇒ 'intent'.
   const experimentType: ExperimentType = input.experimentType ?? 'intent';
@@ -569,13 +794,23 @@ export function validateAndSanitizeExperiment(input: Experiment): Experiment {
     );
   }
 
+  // L5: startDate/endDate are load-bearing at resolve time (isLiveForClassification). A non-empty but
+  // UNPARSEABLE date makes `new Date(x) <= now` a NaN compare (false), silently stranding the experiment -
+  // stored `active`, resolves nothing, no error anywhere. Reject an unparseable date at write time (400).
+  for (const [field, val] of [['startDate', input.startDate], ['endDate', input.endDate]] as const) {
+    if (val !== undefined && val !== null && String(val).trim() !== '' && Number.isNaN(Date.parse(String(val)))) {
+      throw new ExperimentValidationError(`${field} is not a valid date: "${val}"`, 'EXPERIMENT_DATE_INVALID');
+    }
+  }
+
   // Objective — advisory; validate shape only.
   const objective = validateObjective(input.objective, experimentType);
 
   if (input.battleEnabled) {
     // A battle runs head-to-head in ONE channel, so it must target exactly one classification — never a
-    // mixed set (structural). But `battleEligible` is now a HINT, not a gate (SPEC-PORTABLE-VERSIONED-
-    // PROFILES §1/§6): an OPERATOR-driven comparison may battle any profile/version at any classification.
+    // mixed set (structural). But `battleEligible` is now a HINT, not a gate
+    // (SPEC-PORTABLE-PROFILES §1/§6): an OPERATOR-driven comparison may battle any profile/version at
+    // any classification.
     // The classification CEILING still binds — resolveVariantForProfile rejects a model not allowed for
     // the channel's classification (min-cap) — so allowing a non-"battleEligible" target never escalates.
     // (Error code kept as BATTLE_TIER_PREMIUM_ONLY for the API/UI contract.)
@@ -645,6 +880,70 @@ export const EXPERIMENT_TYPES: ExperimentType[] = ['intent', 'base_model', 'clas
 
 const OBJECTIVE_METRICS: ExperimentObjectiveMetric[] = ['cost', 'accuracy', 'quality', 'latency'];
 
+// ============================================================
+// Lifecycle: status enum + transition guard + audit append (DESIGN §3.2 / A.3)
+// ============================================================
+
+/** Canonical experiment statuses (DESIGN A.3). */
+export const EXPERIMENT_STATUSES: Experiment['status'][] = ['draft', 'active', 'paused', 'completed', 'deleted'];
+
+/**
+ * Server-enforced legal lifecycle transitions (DESIGN §3.2 / A.3):
+ *   draft   → active | deleted
+ *   active  → paused | completed | deleted
+ *   paused  → active | completed | deleted
+ *   completed → deleted            (terminal except for a soft-delete tombstone)
+ *   deleted → (none)               (terminal)
+ * `completed` and `deleted` are terminal; a never-started draft is hard-deleted by the
+ * handler (record removed) rather than transitioned, but draft→deleted is legal for the
+ * soft path. Auto-expiry (endDate) is the same active|paused→completed edge, tagged in
+ * the transition's `reason`.
+ */
+const ALLOWED_TRANSITIONS: Record<Experiment['status'], readonly Experiment['status'][]> = {
+  draft: ['active', 'deleted'],
+  active: ['paused', 'completed', 'deleted'],
+  paused: ['active', 'completed', 'deleted'],
+  completed: ['deleted'],
+  deleted: [],
+};
+
+/**
+ * Whether a `from → to` status change is legal (DESIGN §3.2 / A.3). Pure; the admin
+ * status handler calls it to reject an illegal transition (e.g. out of a terminal
+ * `completed`/`deleted`) with a 409 before writing. A no-op `from === to` is not a
+ * transition and returns false.
+ */
+export function isAllowedTransition(from: Experiment['status'], to: Experiment['status']): boolean {
+  if (from === to) return false;
+  return (ALLOWED_TRANSITIONS[from] ?? []).includes(to);
+}
+
+/**
+ * Append one entry to an experiment's append-only lifecycle audit (DESIGN §3.2 L7).
+ * Pure: returns a NEW array (never mutates the input), so callers can persist it
+ * directly. `at` defaults to now (ISO). `from` may be the pseudo-state 'create' for
+ * the record's first entry.
+ */
+export function appendTransition(
+  existing: ExperimentTransition[] | undefined,
+  entry: {
+    from: ExperimentTransition['from'];
+    to: Experiment['status'];
+    by: string;
+    at?: string;
+    reason?: string;
+  },
+): ExperimentTransition[] {
+  const record: ExperimentTransition = {
+    from: entry.from,
+    to: entry.to,
+    by: entry.by,
+    at: entry.at ?? new Date().toISOString(),
+    ...(entry.reason !== undefined && { reason: entry.reason }),
+  };
+  return [...(existing ?? []), record];
+}
+
 /**
  * Validate an optional objective. Returns the
  * objective unchanged when valid, or undefined when absent. Throws on a
@@ -685,7 +984,78 @@ export function validateObjective(
       'OBJECTIVE_METRIC_TYPE_MISMATCH',
     );
   }
-  return { metric: objective.metric, target: objective.target };
+
+  // --- new, all optional (absent ⇒ today's behavior — INV-2) ---
+  // statement: sanitized prose (DESIGN §1.2). API only warns on absence (it does not 400),
+  // so programmatic/legacy callers are unaffected; the create FORM makes it required.
+  const statement = sanitizeObjectiveStatement(objective.statement);
+
+  // guardrails: veto conditions, each a known metric with a bound in [0, 100]; at most MAX_GUARDRAILS.
+  let guardrails: ObjectiveGuardrail[] | undefined;
+  if (objective.guardrails !== undefined && objective.guardrails !== null) {
+    if (!Array.isArray(objective.guardrails)) {
+      throw new ExperimentValidationError('objective.guardrails must be an array', 'OBJECTIVE_GUARDRAILS_TYPE');
+    }
+    if (objective.guardrails.length > MAX_GUARDRAILS) {
+      throw new ExperimentValidationError(
+        `objective.guardrails allows at most ${MAX_GUARDRAILS} (got ${objective.guardrails.length})`,
+        'OBJECTIVE_GUARDRAILS_TOO_MANY',
+      );
+    }
+    const validated = objective.guardrails.map((g, i) => validateGuardrail(g, i));
+    guardrails = validated.length > 0 ? validated : undefined;
+  }
+
+  // humanPickWeight: 0..1 (DESIGN §4.3). Absent ⇒ 0 ⇒ today's behavior; never materialized to 0.
+  let humanPickWeight: number | undefined;
+  if (objective.humanPickWeight !== undefined && objective.humanPickWeight !== null) {
+    if (typeof objective.humanPickWeight !== 'number' || !Number.isFinite(objective.humanPickWeight)
+        || objective.humanPickWeight < 0 || objective.humanPickWeight > 1) {
+      throw new ExperimentValidationError(
+        `objective.humanPickWeight must be a number in [0, 1] (got ${objective.humanPickWeight})`,
+        'OBJECTIVE_HUMAN_PICK_WEIGHT_RANGE',
+      );
+    }
+    humanPickWeight = objective.humanPickWeight;
+  }
+
+  return {
+    metric: objective.metric,
+    target: objective.target,
+    ...(statement !== undefined && { statement }),
+    ...(guardrails !== undefined && { guardrails }),
+    ...(humanPickWeight !== undefined && { humanPickWeight }),
+  };
+}
+
+/**
+ * Validate one ObjectiveGuardrail (DESIGN §1.2): known metric, a valid direction,
+ * and a bound in [0, 100]. Returns a clean copy (drops any extra fields). Throws on
+ * any malformed guardrail so the admin API can surface a 400.
+ */
+function validateGuardrail(g: ObjectiveGuardrail | undefined, index: number): ObjectiveGuardrail {
+  if (!g || typeof g !== 'object') {
+    throw new ExperimentValidationError(`objective.guardrails[${index}] must be an object`, 'GUARDRAIL_TYPE');
+  }
+  if (!OBJECTIVE_METRICS.includes(g.metric)) {
+    throw new ExperimentValidationError(
+      `objective.guardrails[${index}].metric must be one of ${OBJECTIVE_METRICS.join(', ')} (got "${g.metric}")`,
+      'GUARDRAIL_METRIC_INVALID',
+    );
+  }
+  if (g.direction !== 'no_worse_than' && g.direction !== 'at_least') {
+    throw new ExperimentValidationError(
+      `objective.guardrails[${index}].direction must be 'no_worse_than' or 'at_least' (got "${g.direction}")`,
+      'GUARDRAIL_DIRECTION_INVALID',
+    );
+  }
+  if (typeof g.bound !== 'number' || !Number.isFinite(g.bound) || g.bound < 0 || g.bound > 100) {
+    throw new ExperimentValidationError(
+      `objective.guardrails[${index}].bound must be a percentage in [0, 100] (got ${g.bound})`,
+      'GUARDRAIL_BOUND_RANGE',
+    );
+  }
+  return { metric: g.metric, direction: g.direction, bound: g.bound };
 }
 
 /**
@@ -704,9 +1074,18 @@ export async function findTypeExclusionConflicts(args: {
 }): Promise<Experiment[]> {
   const candidateType = args.experimentType ?? 'intent';
   const tiers = new Set(args.tiers || []);
-  const experiments = await loadExperiments();
+  // Fresh read (bypass the 60s cache): this is the write-path conflict gate, so a blocker
+  // created seconds ago must be seen or two conflicting experiments both activate.
+  const experiments = await loadExperiments(true);
+  const now = new Date();
   return experiments.filter((e) => {
+    // An expired or not-yet-started experiment resolves NO traffic (isLiveForClassification), so it no
+    // longer occupies the classification and must not block a replacement. Match the resolver's liveness
+    // window (active + startDate<=now<endDate), not just the raw `active` status, or a dead experiment
+    // wedges the slot until an operator manually ends it.
     if (e.status !== 'active') return false;
+    if (e.startDate && new Date(e.startDate) > now) return false;
+    if (e.endDate && new Date(e.endDate) <= now) return false;
     if (e.experimentId === args.excludeExperimentId) return false;
     const otherType = e.experimentType ?? 'intent';
     const sharesClassification = (e.tiers || []).some((t) => tiers.has(t));
@@ -736,9 +1115,20 @@ export async function resolveBattleVariantBySlotArn(
    *  the worker runs its normal image path for an image battle (no battle-specific image branch). */
   imageGenModelKey?: ImageGenModelKey;
   longFormMode?: 'one-shot' | 'outline-first';
+  /** §6: the variant's whole profile VERSION, for a profileRef variant. Battle is the headline
+   *  profile-vs-profile surface, so serving only a model here would make the duel compare two
+   *  identical assistants whenever the versions differ in tools, persona or classifier mode. */
+  variantProfile?: ProfileDefinition;
 } | null> {
   if (!slotArn) return null;
-  const experiments = await loadExperiments();
+  // FRESH, not the 60s cache. These resolvers decide WHAT THE DUEL IS, and they run once per battle
+  // turn - not per ordinary turn - so the cache buys nothing here and costs correctness. The e2e image
+  // duel is the worked example: `activateBattleExperiment` had just made the IMAGE experiment the sole
+  // active one, but this read still saw the TEXT experiment on the same slot, `.find()` returned it, it
+  // carried no imageGenModelKey, and the duel silently degraded to a text battle - no image, no error,
+  // and nothing in any log to say why. Same defect as the enable race, in the sibling call sites that
+  // fix did not reach.
+  const experiments = await loadExperiments(true);
   const exp = experiments.find(
     (e) => e.battleEnabled === true && e.altBotSlotArn === slotArn,
   );
@@ -746,7 +1136,11 @@ export async function resolveBattleVariantBySlotArn(
   // variants[0] = control (default bot); variants[1] = treatment (alt slot).
   const treatment = exp.variants[1];
   if (!treatment) return null;
-  const treatmentModelKey = await effectiveModelKeyOf(treatment); // §6: resolves a profileRef variant
+  // §6: ONE read for the whole version, so this side's model and its tool set always come from the
+  // same version. An unresolvable profileRef fails the side closed, exactly as before.
+  const variantProfile = await variantDefinitionOf(treatment);
+  if (treatment.profileRef && !variantProfile) return null;
+  const treatmentModelKey = (variantProfile?.modelKey ?? treatment.modelKey) as BackendModelKey | undefined;
   if (!treatmentModelKey) return null;
   return {
     experimentId: exp.experimentId,
@@ -754,8 +1148,11 @@ export async function resolveBattleVariantBySlotArn(
     modelKey: treatmentModelKey,
     displayName: treatment.displayName ?? treatment.variantId,
     systemPromptAddendum: treatment.systemPromptAddendum,
-    ...(treatment.imageGenModelKey && { imageGenModelKey: treatment.imageGenModelKey }),
+    ...((treatment.imageGenModelKey ?? variantProfile?.models?.image)
+      ? { imageGenModelKey: (treatment.imageGenModelKey ?? variantProfile?.models?.image) as ImageGenModelKey }
+      : {}),
     longFormMode: exp.longFormMode,
+    ...(variantProfile && { variantProfile }),
   };
 }
 
@@ -788,9 +1185,20 @@ export async function resolveBattleControlVariantByAltSlotArn(
   /** Phase-2: the control variant's IMAGE-generation model (see resolveBattleVariantBySlotArn). */
   imageGenModelKey?: ImageGenModelKey;
   longFormMode?: 'one-shot' | 'outline-first';
+  /** §6: the control variant's whole profile VERSION (see resolveBattleVariantBySlotArn). Both sides
+   *  must resolve the same way, or a profile-vs-profile duel compares a full definition against a
+   *  bare model and reports a difference that is an artifact of the resolution. */
+  variantProfile?: ProfileDefinition;
 } | null> {
   if (!altSlotArn) return null;
-  const experiments = await loadExperiments();
+  // FRESH, not the 60s cache. These resolvers decide WHAT THE DUEL IS, and they run once per battle
+  // turn - not per ordinary turn - so the cache buys nothing here and costs correctness. The e2e image
+  // duel is the worked example: `activateBattleExperiment` had just made the IMAGE experiment the sole
+  // active one, but this read still saw the TEXT experiment on the same slot, `.find()` returned it, it
+  // carried no imageGenModelKey, and the duel silently degraded to a text battle - no image, no error,
+  // and nothing in any log to say why. Same defect as the enable race, in the sibling call sites that
+  // fix did not reach.
+  const experiments = await loadExperiments(true);
   const exp = experiments.find(
     (e) => e.battleEnabled === true && e.altBotSlotArn === altSlotArn,
   );
@@ -798,7 +1206,9 @@ export async function resolveBattleControlVariantByAltSlotArn(
   // variants[0] = control (default bot); variants[1] = treatment (alt slot).
   const control = exp.variants[0];
   if (!control) return null;
-  const controlModelKey = await effectiveModelKeyOf(control); // §6: resolves a profileRef variant
+  const variantProfile = await variantDefinitionOf(control); // §6: one read for the whole version
+  if (control.profileRef && !variantProfile) return null;
+  const controlModelKey = (variantProfile?.modelKey ?? control.modelKey) as BackendModelKey | undefined;
   if (!controlModelKey) return null;
   return {
     experimentId: exp.experimentId,
@@ -806,8 +1216,11 @@ export async function resolveBattleControlVariantByAltSlotArn(
     modelKey: controlModelKey,
     displayName: control.displayName ?? control.variantId,
     systemPromptAddendum: control.systemPromptAddendum,
-    ...(control.imageGenModelKey && { imageGenModelKey: control.imageGenModelKey }),
+    ...((control.imageGenModelKey ?? variantProfile?.models?.image)
+      ? { imageGenModelKey: (control.imageGenModelKey ?? variantProfile?.models?.image) as ImageGenModelKey }
+      : {}),
     longFormMode: exp.longFormMode,
+    ...(variantProfile && { variantProfile }),
   };
 }
 
@@ -828,7 +1241,14 @@ export async function resolveBattleImageGenPair(
   altSlotArn: string,
 ): Promise<{ controlModelId: string; treatmentModelId: string } | null> {
   if (!altSlotArn) return null;
-  const experiments = await loadExperiments();
+  // FRESH, not the 60s cache. These resolvers decide WHAT THE DUEL IS, and they run once per battle
+  // turn - not per ordinary turn - so the cache buys nothing here and costs correctness. The e2e image
+  // duel is the worked example: `activateBattleExperiment` had just made the IMAGE experiment the sole
+  // active one, but this read still saw the TEXT experiment on the same slot, `.find()` returned it, it
+  // carried no imageGenModelKey, and the duel silently degraded to a text battle - no image, no error,
+  // and nothing in any log to say why. Same defect as the enable race, in the sibling call sites that
+  // fix did not reach.
+  const experiments = await loadExperiments(true);
   const exp = experiments.find(
     (e) => e.battleEnabled === true && e.altBotSlotArn === altSlotArn,
   );
@@ -861,12 +1281,26 @@ export async function resolveBattleImageGenPair(
 export async function resolveActiveBattleExperimentForClassification(
   classification: string,
 ): Promise<Experiment | null> {
-  const experiments = await loadExperiments();
+  // forceRefresh, for the same reason the create/activate conflict gate uses it (see loadExperiments):
+  // this read BINDS A SLOT, so it is correctness-critical, not a hot-path lookup.
+  //
+  // The caller (`channel-battle.ts`) resolves an experiment HERE and then validates it with a direct,
+  // uncached `GetCommand`. With the 60s cache those two reads disagree for up to a minute after any
+  // status change: this one hands back an experiment that was just paused, the fresh read rejects it,
+  // and the operator sees "Experiment is not active" naming an experiment they can see is active in
+  // the console. Two views of one row inside a single request is the defect; the second read was
+  // already correct, so this one moves to match it.
+  const experiments = await loadExperiments(true);
+  // Share the resolver's liveness window rather than re-deriving it from raw `status`. Gating on
+  // `active` alone auto-selected an EXPIRED (past-endDate) or not-yet-started experiment when an
+  // operator enabled /battle on a channel - one that resolves no traffic, so the battle would arm
+  // against an experiment the resolver ignores. `findTypeExclusionConflicts` was updated to the
+  // window and this was not, which also made the two disagree about which experiments are occupying
+  // a classification.
   const matches = experiments.filter(
     (e) =>
-      e.status === 'active'
-      && e.battleEnabled === true
-      && (e.tiers || []).includes(classification as Classification),
+      e.battleEnabled === true
+      && isLiveForClassification(e, classification as Classification),
   );
   if (matches.length === 0) return null;
   if (matches.length > 1) {

@@ -107,6 +107,25 @@ describe('admin-experiments handler', () => {
     expect(mockDdbSend.mock.calls[0][0].__t).toBe('Scan');
   });
 
+  it('GET auto-completes a past-endDate active experiment (L5) with an auto:endDate audit', async () => {
+    const expired = { ...baseExp, experimentId: 'exp-expired', endDate: '2020-01-01T00:00:00Z', transitions: [] };
+    mockDdbSend
+      .mockResolvedValueOnce({ Items: [expired] }) // the paginated Scan
+      .mockResolvedValueOnce({}); // the reconcile Update
+    const r = await handler(evt({ httpMethod: 'GET' }));
+    expect(r.statusCode).toBe(200);
+    // The response reflects the reconciled status (endDate is authoritative).
+    expect(JSON.parse(r.body).experiments[0].status).toBe('completed');
+    // A conditional Update flipped it to completed with an auto:endDate transition.
+    const upd = mockDdbSend.mock.calls.find((c: unknown[]) => (c[0] as { __t?: string }).__t === 'Update');
+    expect(upd).toBeDefined();
+    const input = (upd![0] as { input: { ConditionExpression: string; ExpressionAttributeValues: Record<string, unknown> } }).input;
+    expect(input.ExpressionAttributeValues[':s']).toBe('completed');
+    expect(input.ConditionExpression).toContain('#s = :active'); // idempotent: only flips a still-active row
+    const txns = input.ExpressionAttributeValues[':t'] as Array<{ reason?: string }>;
+    expect(txns[txns.length - 1].reason).toBe('auto:endDate');
+  });
+
   it('POST create (non-battle) → Puts with server createdAt, returns the row', async () => {
     // The handler Scans for active experiment count BEFORE the Put.
     // Queue both responses and locate the Put by __t rather than index.
@@ -164,11 +183,12 @@ describe('admin-experiments handler', () => {
     const r = await handler(evt({ httpMethod: 'POST', body: battle }));
     expect(r.statusCode).toBe(400);
     expect(JSON.parse(r.body).error).toMatch(/not provisioned/);
-    expect(mockDdbSend).not.toHaveBeenCalled();
+    // Upsert reads the existing row first, but a rejected create never WRITES.
+    expect(mockDdbSend.mock.calls.find((c) => c[0].__t === 'Put')).toBeUndefined();
   });
 
   it('POST create (battle) → 400 BATTLE_TIER_PREMIUM_ONLY when it targets a MIXED classification set', async () => {
-    // SPEC-PORTABLE-VERSIONED-PROFILES §1/§6: `battleEligible` is now a HINT, so an operator-driven
+    // SPEC-PORTABLE-PROFILES §1/§6: `battleEligible` is now a HINT, so an operator-driven
     // battle may target any SINGLE classification (the ceiling still binds at resolution). What stays
     // rejected is a MIXED set — a battle runs head-to-head in ONE channel, so exactly one classification.
     mockSsmSend.mockResolvedValueOnce({
@@ -225,13 +245,17 @@ describe('admin-experiments handler', () => {
     const r = await handler(evt({ httpMethod: 'POST', body: bad }));
     expect(r.statusCode).toBe(400);
     expect(JSON.parse(r.body).code).toBe('BATTLE_IMAGE_GEN_PAIR');
-    expect(mockDdbSend).not.toHaveBeenCalled();
+    // Upsert reads the existing row first, but a rejected create never WRITES.
+    expect(mockDdbSend.mock.calls.find((c) => c[0].__t === 'Put')).toBeUndefined();
   });
 
   it('POST create → 429 MAX_ACTIVE_EXPERIMENTS when cap exceeded (audit L3)', async () => {
     // 50 active rows already.
     const fullActive = Array.from({ length: 50 }, (_, i) => ({ experimentId: `e-${i}` }));
-    mockDdbSend.mockResolvedValueOnce({ Items: fullActive });
+    // Upsert now reads any existing row first (Get, for createdAt/edit semantics); this
+    // create is a brand-new id, so no existing row. THEN the active-count Scan runs.
+    mockDdbSend.mockResolvedValueOnce({}); // getExistingExperiment — none
+    mockDdbSend.mockResolvedValueOnce({ Items: fullActive }); // active count
     const r = await handler(evt({ httpMethod: 'POST', body: baseExp }));
     expect(r.statusCode).toBe(429);
     expect(JSON.parse(r.body).code).toBe('MAX_ACTIVE_EXPERIMENTS');
@@ -252,7 +276,57 @@ describe('admin-experiments handler', () => {
     expect(r.statusCode).toBe(200);
   });
 
+  // L2/§3.2 on the UPSERT path. POST /admin/experiments writes `status` straight onto the row, so
+  // without these guards it was a way around the state machine POST /{id}/status enforces: the
+  // create route would resurrect a terminal experiment into live traffic resolution.
+  it('POST upsert → 409 EXPERIMENT_TERMINAL rather than resurrecting a completed experiment', async () => {
+    mockDdbSend.mockResolvedValueOnce({ Item: { ...baseExp, status: 'completed' } }); // the Get
+    const r = await handler(evt({ httpMethod: 'POST', body: { ...baseExp, status: 'active' } }));
+    expect(r.statusCode).toBe(409);
+    expect(JSON.parse(r.body).code).toBe('EXPERIMENT_TERMINAL');
+    // and nothing was written
+    expect(mockDdbSend.mock.calls.find((c) => c[0].__t === 'Put')).toBeUndefined();
+  });
+
+  it('POST upsert → 409 rather than resurrecting a soft-deleted (tombstoned) experiment', async () => {
+    mockDdbSend.mockResolvedValueOnce({ Item: { ...baseExp, status: 'deleted' } });
+    const r = await handler(evt({ httpMethod: 'POST', body: { ...baseExp, status: 'active' } }));
+    expect(r.statusCode).toBe(409);
+    expect(JSON.parse(r.body).code).toBe('EXPERIMENT_TERMINAL');
+    expect(mockDdbSend.mock.calls.find((c) => c[0].__t === 'Put')).toBeUndefined();
+  });
+
+  it('POST upsert → 400 on a status outside the enum (never stored unchecked)', async () => {
+    // 'Active' is not a status; storing it produced a row that is never live and never errors.
+    const r = await handler(evt({ httpMethod: 'POST', body: { ...baseExp, status: 'Active' } }));
+    expect(r.statusCode).toBe(400);
+    expect(mockDdbSend.mock.calls.find((c) => c[0].__t === 'Put')).toBeUndefined();
+  });
+
+  it('POST upsert → 409 INVALID_TRANSITION on an illegal status change through an edit', async () => {
+    // draft → paused is not in the transition table (draft may only go active | deleted).
+    mockDdbSend.mockResolvedValueOnce({ Item: { ...baseExp, status: 'draft' } });
+    const r = await handler(evt({ httpMethod: 'POST', body: { ...baseExp, status: 'paused' } }));
+    expect(r.statusCode).toBe(409);
+    expect(JSON.parse(r.body).code).toBe('INVALID_TRANSITION');
+  });
+
+  it('POST upsert → a plain edit of a live row (no status field) still succeeds', async () => {
+    // The guards must not break ordinary editing: omitting `status` keeps the current one and is
+    // not a transition.
+    const { status: _drop, ...noStatus } = baseExp;
+    mockDdbSend.mockResolvedValueOnce({ Item: { ...baseExp, status: 'active' } }); // the Get
+    mockDdbSend.mockResolvedValueOnce({ Items: [] }); // active count
+    mockDdbSend.mockResolvedValueOnce({}); // Put
+    const r = await handler(evt({ httpMethod: 'POST', body: noStatus }));
+    expect(r.statusCode).toBe(200);
+    expect(mockDdbSend.mock.calls.find((c) => c[0].__t === 'Put')).toBeDefined();
+  });
+
   it('POST {id}/status → Update; rejects an invalid status', async () => {
+    // L6: the status route now reads the row first (clean 404 on a missing id),
+    // then Updates. Supply the existing active row, then the Update response.
+    mockDdbSend.mockResolvedValueOnce({ Item: { experimentId: 'exp-1', status: 'active' } });
     mockDdbSend.mockResolvedValueOnce({});
     const ok = await handler(
       evt({
@@ -263,7 +337,7 @@ describe('admin-experiments handler', () => {
       }),
     );
     expect(ok.statusCode).toBe(200);
-    const upd = mockDdbSend.mock.calls[0][0];
+    const upd = mockDdbSend.mock.calls.find((c) => c[0].__t === 'Update')![0];
     expect(upd.__t).toBe('Update');
     expect(upd.input.Key).toEqual({ experimentId: 'exp-1' });
 

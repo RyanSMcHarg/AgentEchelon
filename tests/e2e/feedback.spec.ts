@@ -15,11 +15,19 @@
 import { test, expect } from '@playwright/test';
 import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
+import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+
+// Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
+guardConsoleErrors();
+
 
 const RUN = process.env.FEEDBACK_E2E === '1';
 const suite = RUN ? test.describe : test.describe.skip;
 
 suite('User feedback (thumbs) produces real feedback data', () => {
+  // Fails a PASSING test that hid a server-side error (see helpers/turn-guards).
+  guardBackendErrors('feedback');
+
   let creds: TestCredentials;
   test.beforeAll(async () => {
     creds = await getTestCredentials();

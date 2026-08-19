@@ -28,6 +28,15 @@ jest.mock('@aws-sdk/client-dynamodb', () => ({
   DynamoDBClient: jest.fn(),
 }), { virtual: true });
 
+// A profileRef variant resolves its VERSION from SSM (SPEC-PORTABLE §6), so the battle resolvers need
+// an SSM stand-in. Nothing else in this file reads SSM, so the mock is inert for every other test.
+const mockSsmSend = jest.fn();
+jest.mock('@aws-sdk/client-ssm', () => ({
+  SSMClient: jest.fn(() => ({ send: mockSsmSend })),
+  GetParameterCommand: jest.fn((input) => ({ input })),
+  GetParameterHistoryCommand: jest.fn((input) => ({ input })),
+}), { virtual: true });
+
 import {
   sanitizePromptAddendum,
   sanitizeDisplayName,
@@ -179,7 +188,9 @@ describe('validateAndSanitizeExperiment', () => {
       try {
         validateAndSanitizeExperiment({
           ...battleBase,
-          variants: [battleBase.variants[0]], // only 1
+          // Weight 100 so the general weight-sum check passes and this isolates the
+          // battle variant-COUNT rule (a 1-variant battle).
+          variants: [{ ...battleBase.variants[0], weight: 100 }], // only 1
         });
         fail('should have thrown');
       } catch (e) {
@@ -303,6 +314,10 @@ describe('validateAndSanitizeExperiment', () => {
 describe('resolveBattleVariantBySlotArn (hot-path lookup)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
+    // clearAllMocks does NOT drain a queued mockResolvedValueOnce, so an unconsumed response would
+    // become the NEXT test's first answer and a test that passes alone fails in file order.
+    mockSend.mockReset();
+    mockSsmSend.mockReset();
     process.env.EXPERIMENTS_TABLE = 'experiments-test';
     jest.resetModules();
   });
@@ -348,6 +363,85 @@ describe('resolveBattleVariantBySlotArn (hot-path lookup)', () => {
       displayName: 'Echo',
       systemPromptAddendum: 'be terse',
     });
+  });
+
+  it('a profileRef variant carries its WHOLE version, not just a model (SPEC-PORTABLE §6)', async () => {
+    mockSend.mockResolvedValueOnce({
+      Items: [
+        {
+          experimentId: 'exp-p',
+          status: 'active',
+          battleEnabled: true,
+          altBotSlotArn: 'arn:slot-0',
+          variants: [
+            { variantId: 'control', modelKey: 'sonnet', weight: 50, displayName: 'Atlas' },
+            { variantId: 'treatment', profileRef: { profileName: 'premium', version: 3 }, weight: 50, displayName: 'Echo' },
+          ],
+        },
+      ],
+    } as unknown as QueryCommandOutput);
+    // The pinned version's stored definition, answered as a `GetParameter` on `…/definition:3`.
+    //
+    // This used to mock `GetParameterHistory` and scan for `Version: 3`, which is how the lookup worked
+    // before it addressed the version directly. That scan took only the FIRST PAGE of history (10
+    // entries, oldest first), so any profile with more than ten versions resolved a pinned variant to
+    // null and the experiment silently ran control-only. The mock shape has to follow the fix, or it
+    // would keep asserting against a lookup that no longer exists.
+    mockSsmSend.mockResolvedValueOnce({
+      Parameter: {
+        Value: JSON.stringify({
+          schemaVersion: 1, profileName: 'premium', configId: 'cfg-v3', modelKey: 'opus',
+          tools: ['load_company_context'], persona: 'terse', classifierMode: 'llm',
+          timeoutSeconds: 60, taskSupport: 'full',
+        }),
+      },
+    });
+
+    const { resolveBattleVariantBySlotArn: resolve } = await import('../../lambda/src/lib/experiment-manager');
+    const result = await resolve('arn:slot-0');
+
+    // The model still resolves from the version...
+    expect(result?.modelKey).toBe('opus');
+    // ...and so does everything a duel actually compares. Without this the battle pits two identical
+    // assistants whenever the versions differ in tools or persona rather than in model.
+    expect(result?.variantProfile?.tools).toEqual(['load_company_context']);
+    expect(result?.variantProfile?.persona).toBe('terse');
+    expect(result?.variantProfile?.configId).toBe('cfg-v3');
+    expect(mockSsmSend).toHaveBeenCalledTimes(1); // ONE read for the whole version, not one per field
+  });
+
+  it('battle auto-resolve re-reads rather than serving the 60s cache', async () => {
+    // The caller binds a slot from THIS answer and then validates it with a direct, uncached
+    // GetCommand. A cached answer here disagrees with that fresh read for up to a minute after any
+    // status change, and the operator sees "Experiment is not active" for an experiment the console
+    // shows as active. Two reads of one row in one request must not have two freshnesses.
+    const scanWith = (id: string) => ({
+      Items: [
+        {
+          experimentId: id,
+          status: 'active',
+          battleEnabled: true,
+          altBotSlotArn: 'arn:slot-0',
+          tiers: ['premium'],
+          intent: 'general',
+          variants: [
+            { variantId: 'control', modelKey: 'sonnet', weight: 50, displayName: 'Atlas' },
+            { variantId: 'treatment', modelKey: 'opus', weight: 50, displayName: 'Echo' },
+          ],
+        },
+      ],
+    } as unknown as QueryCommandOutput);
+
+    mockSend.mockResolvedValueOnce(scanWith('exp-first'));
+    mockSend.mockResolvedValueOnce(scanWith('exp-second'));
+
+    const { resolveActiveBattleExperimentForClassification: resolve } =
+      await import('../../lambda/src/lib/experiment-manager');
+
+    expect((await resolve('premium'))?.experimentId).toBe('exp-first');
+    // Immediately after, well inside the 60s window. A cached read returns 'exp-first' again.
+    expect((await resolve('premium'))?.experimentId).toBe('exp-second');
+    expect(mockSend).toHaveBeenCalledTimes(2);
   });
 
   it('falls back to variantId as displayName when displayName is missing', async () => {
@@ -613,5 +707,48 @@ describe('resolveBattleImageGenPair (generation-out fan-out hot path)', () => {
       controlModelId: IMAGE_GEN_MODELS.titan_image.bedrockModelId,
       treatmentModelId: IMAGE_GEN_MODELS.nova_canvas.bedrockModelId,
     });
+  });
+});
+
+describe('battle resolvers read FRESH, not the 60s cache', () => {
+  // These decide WHAT THE DUEL IS. With two e2e experiments sharing slot-0 and only one active at a
+  // time, a stale read returns the wrong one: `resolveBattleImageGenPair` found the TEXT experiment,
+  // which carries no imageGenModelKey, returned null, and the image duel silently ran as a text
+  // battle - no image, no error, nothing in any log. Observed 2026-08-08.
+  beforeEach(() => {
+    jest.clearAllMocks();
+    mockSend.mockReset();
+    mockSsmSend.mockReset();
+    process.env.EXPERIMENTS_TABLE = 'experiments-test';
+    jest.resetModules();
+  });
+
+  const withImagePair = (id: string, imageKeys: [string?, string?]) => ({
+    Items: [{
+      experimentId: id,
+      status: 'active',
+      battleEnabled: true,
+      altBotSlotArn: 'arn:slot-0',
+      tiers: ['premium'],
+      variants: [
+        { variantId: 'control', modelKey: 'sonnet', weight: 50, displayName: 'Atlas', ...(imageKeys[0] ? { imageGenModelKey: imageKeys[0] } : {}) },
+        { variantId: 'treatment', modelKey: 'opus', weight: 50, displayName: 'Echo', ...(imageKeys[1] ? { imageGenModelKey: imageKeys[1] } : {}) },
+      ],
+    }],
+  } as unknown as QueryCommandOutput);
+
+  it('resolveBattleImageGenPair sees an experiment swap immediately', async () => {
+    // First scan: the TEXT experiment holds slot-0 (no image keys) => null, a text battle.
+    // Then the image experiment is activated in its place. A cached read keeps answering null.
+    mockSend.mockResolvedValueOnce(withImagePair('e2e-battle-text', [undefined, undefined]));
+    mockSend.mockResolvedValueOnce(withImagePair('e2e-battle-image', ['stability_image_core', 'stability_image_ultra']));
+
+    const { resolveBattleImageGenPair: resolve } = await import('../../lambda/src/lib/experiment-manager');
+    expect(await resolve('arn:slot-0')).toBeNull();
+    const pair = await resolve('arn:slot-0');
+    expect(pair).not.toBeNull();
+    expect(pair!.controlModelId).toBeTruthy();
+    expect(pair!.treatmentModelId).toBeTruthy();
+    expect(mockSend).toHaveBeenCalledTimes(2);
   });
 });

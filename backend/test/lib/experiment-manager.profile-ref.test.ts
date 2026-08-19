@@ -1,5 +1,5 @@
 /**
- * SPEC-PORTABLE-VERSIONED-PROFILES P2 — variant validation: modelKey XOR profileRef.
+ * SPEC-PORTABLE-PROFILES P2 — variant validation: modelKey XOR profileRef.
  */
 import { validateAndSanitizeExperiment, ExperimentValidationError, type Experiment } from '../../lambda/src/lib/experiment-manager';
 

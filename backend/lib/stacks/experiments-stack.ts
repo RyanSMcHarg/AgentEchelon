@@ -28,7 +28,7 @@ import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
 import { adminOrigin, sharedOrigins } from '../config/app-origins';
 import { personaExecuteApiResources, AdminPersona } from '../config/admin-capabilities';
-import { SHARED_SSM, INSTANCE_SSM, SSM_ROOT } from './agent-classification-common';
+import { SHARED_SSM, INSTANCE_SSM, SSM_ROOT, STACK_PREFIX } from './agent-classification-common';
 
 export interface ExperimentsStackProps extends cdk.StackProps {
   appInstanceArn: string;
@@ -39,6 +39,13 @@ export interface ExperimentsStackProps extends cdk.StackProps {
   adminSignOnRoleArn?: string;
   /** A14 personas (opt-in): persona key -> sign-on role ARN. Personas holding manage-profiles get its teeth. */
   adminPersonaRoleArns?: Record<string, string>;
+  /**
+   * SSM parameter holding the attachments-bucket ARN, which doubles as the profile BODY store
+   * (SPEC-PORTABLE-PROFILES, "Bodies are S3"). Resolved at deploy rather than taken as a direct bucket
+   * reference, matching how the other consumers of this bucket reach it - a plain-string contract
+   * between stacks, so neither takes a dependency on the other's deploy order.
+   */
+  attachmentsBucketArnParam?: string;
 }
 
 export class ExperimentsStack extends cdk.Stack {
@@ -56,7 +63,7 @@ export class ExperimentsStack extends cdk.Stack {
     // reads a channel's assignment (ChannelMembersPanel), so its API + Lambda
     // trust BOTH origins (admin-experiments.ts echoes the matching request Origin
     // from the comma list). manage-profiles (/admin/profiles) is admin-only.
-    // SPEC-SEPARATE-ADMIN-APP.md.
+    // DESIGN-SEPARATE-ADMIN-APP.md.
     const experimentsOrigins = sharedOrigins(this);
     const adminAppUrl = adminOrigin(this);
     // AgentEchelonBattle owns + publishes this roster; admin-experiments only READS it
@@ -90,7 +97,9 @@ export class ExperimentsStack extends cdk.Stack {
         ExperimentsDdb: new iam.PolicyDocument({
           statements: [
             new iam.PolicyStatement({
-              actions: ['dynamodb:Scan', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:GetItem'],
+              // DeleteItem: the DELETE route hard-removes a never-started draft (a test that ran is
+              // soft-tombstoned via UpdateItem). Without it the hard-delete path throws AccessDenied → 500.
+              actions: ['dynamodb:Scan', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:GetItem', 'dynamodb:DeleteItem'],
               resources: [experimentsTable.tableArn],
             }),
           ],
@@ -133,7 +142,7 @@ export class ExperimentsStack extends cdk.Stack {
       description: 'Admin A/B experiments CRUD',
       defaultCorsPreflightOptions: {
         allowOrigins: experimentsOrigins,
-        allowMethods: ['GET', 'POST', 'OPTIONS'],
+        allowMethods: ['GET', 'POST', 'DELETE', 'OPTIONS'],
         // The manage-profiles routes (/admin/profiles) are AWS_IAM (SigV4) under adminIamEnforcement, so
         // the console SIGNS them — the browser preflight must allow the X-Amz-* signing headers or the
         // signed request is CORS-blocked (net::ERR_FAILED → "Failed to fetch"). Experiments' own routes
@@ -159,19 +168,31 @@ export class ExperimentsStack extends cdk.Stack {
     for (const m of ['GET', 'POST']) {
       experimentsResource.addMethod(m, integration, experimentsAuthOptions);
     }
-    experimentsResource
-      .addResource('{experimentId}')
-      .addResource('status')
-      .addMethod('POST', integration, experimentsAuthOptions);
+    const experimentIdResource = experimentsResource.addResource('{experimentId}');
+    // POST /admin/experiments/{id}/status — lifecycle transitions (pause/resume/complete + decision).
+    experimentIdResource.addResource('status').addMethod('POST', integration, experimentsAuthOptions);
+    // DELETE /admin/experiments/{id} — hard-remove a never-started draft, else soft-tombstone a test
+    // that ran (the handler decides the mode); frees the classification. Same admin authorizer.
+    experimentIdResource.addMethod('DELETE', integration, experimentsAuthOptions);
 
     this.experimentsApiUrl = `${api.url}admin/experiments`;
 
-    // ── manage-profiles API (SPEC-PORTABLE-VERSIONED-PROFILES P1/P3) ────────────
+    // ── manage-profiles API (SPEC-PORTABLE-PROFILES P1/P3) ────────────
     // The versioning + import/export lifecycle for assistant profiles, on the SAME admin API (no new
     // gateway, §3). This role is the ONLY sanctioned WRITE path to the profile SSM namespace (§7): the
     // async-processor role stays read-only on /assistant/*; here we grant read + write + label, scoped
     // to this instance's assistant namespace. The handler additionally gates on the `manage-profiles`
     // capability (distinct from view-*, A14).
+    // The profile BODY store: personas live in S3 under `profiles/*` and the SSM definition carries a
+    // pointer, so a persona is bounded by MAX_PERSONA_LENGTH rather than by the 4096-character
+    // parameter (SPEC-PORTABLE-PROFILES, "Bodies are S3"). Same bucket as attachments, separate prefix.
+    const profileBodyBucketArn = props.attachmentsBucketArnParam
+      ? ssm.StringParameter.valueForStringParameter(this, props.attachmentsBucketArnParam)
+      : undefined;
+    const profileBodyBucketName = profileBodyBucketArn
+      ? cdk.Fn.select(5, cdk.Fn.split(':', profileBodyBucketArn))
+      : undefined;
+
     const manageProfilesRole = new iam.Role(this, 'ManageProfilesRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       inlinePolicies: {
@@ -181,18 +202,41 @@ export class ExperimentsStack extends cdk.Stack {
               actions: ['ssm:GetParameter', 'ssm:GetParameterHistory', 'ssm:PutParameter', 'ssm:LabelParameterVersion'],
               resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*`],
             }),
+            // A definition and its bodies are ONE artifact, so this role is the only sanctioned writer to
+            // both - the same rule the SSM namespace already follows (§7). A second writer to either half
+            // would be a second source of truth. GetObject is needed too, not just Put: editing a draft,
+            // cloning the active version and exporting all read the persona back.
+            ...(profileBodyBucketArn ? [new iam.PolicyStatement({
+              actions: ['s3:PutObject', 's3:GetObject'],
+              resources: [`${profileBodyBucketArn}/profiles/*`],
+            })] : []),
             // Read-only: the shared channel-flow ARN param (classification-level infra deep link). It lives
             // outside /assistant/*, so it needs its own read grant.
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
               resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/channel-flow-arn`],
             }),
-            // Read-only: resolve each profile's live processor Lambda config (its execution role + the
-            // GUARDRAIL_ID it applies) so the admin console can deep-link to the actual guardrail / IAM
-            // role / function for troubleshooting. GetFunctionConfiguration is metadata-only (no invoke).
+            // Read-only: resolve each profile's live processor and router Lambda config (its execution
+            // role + the GUARDRAIL_ID it applies) so the admin console can deep-link to the actual
+            // guardrail / IAM role / function for troubleshooting (`lib/profile-infra.ts`).
+            //
+            // SCOPED TO THIS DEPLOYMENT (tracker row 101). This previously read `function:*`, which in a
+            // MULTI-PRODUCT account granted a read of every other product's Lambdas. "Metadata-only" is
+            // not harmless here: `GetFunctionConfiguration` returns `Environment.Variables`, so the grant
+            // exposed the table names, ARNs and configuration of every unrelated function in the account.
+            //
+            // Weaker than the row 96 invoke over-grant in one respect, and worth stating: the holder is
+            // admin-gated, so reaching it already requires the admin plane. It amplifies an admin
+            // compromise rather than opening a new front door.
+            //
+            // Every legitimate target is our own: `profile-infra.ts` resolves the ARNs from this
+            // deployment's own SSM parameters (`{SSM_ROOT}/assistant/{profile}/processor-arn` and
+            // `/router-arn`), which name the classification stacks' functions. The read is best-effort
+            // and drops a console link rather than failing, so a future function outside this prefix
+            // degrades a deep link instead of breaking the list.
             new iam.PolicyStatement({
               actions: ['lambda:GetFunctionConfiguration'],
-              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:*`],
+              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}*`],
             }),
           ],
         }),
@@ -212,12 +256,16 @@ export class ExperimentsStack extends cdk.Stack {
         SSM_ROOT,
         AWS_ACCOUNT_ID: this.account,
         ALLOWED_ORIGIN: adminAppUrl,
+        // Without this the lifecycle keeps personas INLINE and silently re-imposes the 4096-character
+        // definition cap - the grant above would be present and unused, which is the shape a synth
+        // assertion exists to catch (profile-body-store-grant.test.ts).
+        ...(profileBodyBucketName ? { PROFILE_BODY_BUCKET: profileBodyBucketName } : {}),
         // MANAGE_PROFILES_GROUP_NAMES (optional) narrows who holds the capability; defaults to admins.
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
 
-    // A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): manage-profiles is an
+    // A14 (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md): manage-profiles is an
     // IAM-enforceable capability. Under adminIamEnforcement the profile routes are
     // AWS_IAM-authorized (the console SigV4-signs) and the `admins` sign-on role
     // gets execute-api teeth on them; a finer role that omits manage-profiles is
