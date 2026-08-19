@@ -21,9 +21,14 @@
 import { test, expect, request as pwRequest, Page } from '@playwright/test';
 import { signIn } from './helpers/agent-helpers';
 import { getAdminUser } from './helpers/test-credentials';
+import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
 test.use({ baseURL: ADMIN_BASE_URL });
+
+// Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
+guardBackendErrors('admin-attachments');
+guardConsoleErrors();
 
 const MAX_CONVERSATIONS = 12; // bound the scan for runtime
 const MAX_MESSAGES = 15;      // per conversation

@@ -35,7 +35,7 @@ const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
 // Dual-plane CORS: chat and admin origins both call this endpoint, so
 // ALLOWED_ORIGIN is a comma list and we echo the matching request Origin
-// (SPEC-SEPARATE-ADMIN-APP.md). '*' short-circuits to allow-all (dev/federated).
+// (DESIGN-SEPARATE-ADMIN-APP.md). '*' short-circuits to allow-all (dev/federated).
 const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || '*')
   .split(',')
   .map((s) => s.trim())
@@ -99,7 +99,7 @@ const CAPABILITY_ACTIONS: Record<string, string[]> = {
 // is always confined to one channel (enforced in the handler).
 const MODERATION_CAPS = new Set(['redact', 'delete', 'manage-membership', 'manage-channel']);
 
-// A14 archive plane (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6.5). The `execute-api`
+// A14 archive plane (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6.5). The `execute-api`
 // analogue of CAPABILITY_ACTIONS: a capability maps to the API Gateway resource ARN it
 // authorizes, and the exchange vends a SESSION POLICY of `execute-api:Invoke` on exactly
 // that resource (intersected with the admin-plane role ceiling, which carries the same
@@ -125,7 +125,7 @@ const EXECUTE_API_CAPS = new Set(Object.keys(EXECUTE_API_CAPABILITY_RESOURCES));
 // The admin-plane role ceiling (cognito-auth-stack) carries s3:GetObject on the same
 // bucket keys; the session policy intersects to one channel. A future restricted admin
 // role that omits a prefix from its ceiling is denied that prefix at the IAM layer — the
-// split is IAM-enforceable, not a code-only gate (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md).
+// split is IAM-enforceable, not a code-only gate (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md).
 const S3_ATTACHMENT_CAP_PREFIXES: Record<string, string> = {
   'attachment-read': 'generated-docs',
   'attachment-read-uploads': 'attachments',
@@ -395,7 +395,7 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
       // enforced downstream: admin-conversations.ts `channelClassificationAllowed` denies a
       // scoped caller a channel above their tier, and the API Gateway access log captures
       // the actual per-channel reads. A full admin (entitled to every channel) is not
-      // narrowed by design. See SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 11.
+      // narrowed by design. See DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md section 11.
       const sessionPolicy = JSON.stringify({
         Version: '2012-10-17',
         Statement: [
@@ -511,7 +511,7 @@ export const handler = async (event: any): Promise<{ statusCode: number; headers
     }
 
     // AppInstanceUserId == sub (AE convention). Display name, best-first: a real name claim; else
-    // the email LOCAL part (e.g. "ryan" — name-like, far better than a GUID in the @mention menu);
+    // the email LOCAL part (e.g. "jane" — name-like, far better than a GUID in the @mention menu);
     // else cognito:username if it isn't a UUID; else the sub.
     const emailLocal =
       typeof claims.email === 'string' && claims.email.includes('@') ? claims.email.split('@')[0] : '';

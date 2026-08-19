@@ -2,6 +2,8 @@
 
 **Status:** Design (not yet built). This design supersedes an initial admin-notification-channel attempt (the stack at `backend/lib/stacks/admin-notification-stack.ts` and its handler `admin-notification-channel-provision.ts`), which created and posted to the channel as the service app-instance-admin. That identity cannot legitimately post to the channel (section 4), so it is being reworked to the model below. **Layer:** Interaction **Pillar:** Identity & Access **Plane:** admin **Product spec:** [`SPEC-ADMIN-IDENTITY.md`](SPEC-ADMIN-IDENTITY.md) (the two credential planes and the admin trust boundary this delivery mechanism must stay inside). **Summary:** A first-class admin agent (an assistant defined by a capability profile like every other assistant) owns an admin notification channel and posts the platform's admin-facing alerts into it, delivered in-app plus email, while the service app-instance-admin is never a channel member.
 
+**Coverage:** none - a design that supersedes an earlier attempt; the admin agent it describes is not built.
+
 ## 1. Architecture
 
 The scope is a delivery path for admin-facing alerts (membership-audit findings, admin-error alerts, and future admin notifications) that respects the admin trust boundary. The moving parts:

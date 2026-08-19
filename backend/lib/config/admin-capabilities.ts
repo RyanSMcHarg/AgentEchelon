@@ -1,5 +1,5 @@
 /**
- * A14 - admin-action capability catalog (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md).
+ * A14 - admin-action capability catalog (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md).
  *
  * The single source of truth mapping each archive/analytics capability to the
  * API Gateway resource(s) it authorizes, its enforcement plane, and the personas
@@ -114,7 +114,15 @@ export const ADMIN_CAPABILITIES: Record<string, AdminCapability> = {
     key: 'view-analytics',
     rows: ['A6', 'A7', 'A8', 'A9', 'A10', 'A11', 'A12', 'A14', 'A15'],
     enforcement: 'signOnRole',
-    resources: [{ api: 'analytics', method: 'POST', path: '' }],
+    resources: [
+      { api: 'analytics', method: 'POST', path: '' },
+      // Starting a classifier replay is the same capability as reading its verdict (the shadow
+      // gate's queries stay in `view-analytics` — see admin-capability-map.ts), but it answers on a
+      // separate resource because the function behind it must sit OUTSIDE the VPC to invoke the
+      // batch Lambda at all. Listed here so a persona holding view-analytics gets the grant with
+      // everything else rather than being denied one route at the gateway.
+      { api: 'analytics', method: 'POST', path: 'classifier-replay-start' },
+    ],
     personas: ADMIN_DEV_AI, // Full / Scoped / Full / None
     wired: true,
   },

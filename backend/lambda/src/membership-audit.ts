@@ -34,6 +34,9 @@ import {
   ListTagsForResourceCommand,
   DeleteChannelMembershipCommand,
   SendChannelMessageCommand,
+  ListChannelsCommand,
+  ListChannelMembershipsCommand,
+  ListChannelMembershipsForAppInstanceUserCommand,
 } from '@aws-sdk/client-chime-sdk-messaging';
 import {
   CognitoIdentityProviderClient,
@@ -45,9 +48,14 @@ import { DynamoDBDocumentClient, GetCommand, PutCommand } from '@aws-sdk/lib-dyn
 import { randomUUID } from 'crypto';
 import { fanOutChannelNotification } from './lib/channel-notify.js';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
+import { resolveChannelClassificationTag as resolveChannelClassificationTagShared } from './lib/channel-classification.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const USER_POOL_ID = process.env.USER_POOL_ID || '';
+const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
+// Trigger #2 (sweep) bound: cap channels scanned per scheduled run so a large app instance can't run
+// the sweep unbounded. 0/unset ⇒ the default. A truncated sweep logs what it dropped (no silent cap).
+const MAX_SWEEP_CHANNELS = parseInt(process.env.MAX_SWEEP_CHANNELS || '500', 10);
 const ADMIN_ARN_PARAM = process.env.ADMIN_ARN_PARAM || '/agent-echelon/app-instance-admin-arn';
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID || 'agent-echelon-admin';
 const ALERT_CHANNEL_ARN = process.env.MEMBERSHIP_AUDIT_ALERT_CHANNEL_ARN || '';
@@ -136,11 +144,40 @@ async function writeFinding(f: {
   }
 }
 
+/**
+ * The admin AppInstanceUser ARN every Chime call in this Lambda uses as its ChimeBearer. Cached per
+ * container after the first successful read.
+ *
+ * THROWS rather than returning '' when it cannot be resolved, and the handler lets that propagate.
+ * That is deliberate: without a bearer ARN no membership can be evaluated, and an empty string would
+ * make every downstream Chime call fail one-by-one while the batch checkpointed successfully - a
+ * security audit that reports nothing and looks healthy. Failing the invocation instead hands the
+ * records back to the event source, which retries (retryAttempts: 3, bisectBatchOnError) and then
+ * surfaces the failure. A transient SSM throttle is absorbed by those retries; a PERSISTENT
+ * misconfiguration (parameter deleted, wrong name, no read grant) is what the explicit message below
+ * is for, because a bare SSM error here is indistinguishable from any other failure in the batch.
+ */
 let cachedAdminArn: string | null = null;
 async function getAdminArn(): Promise<string> {
   if (cachedAdminArn) return cachedAdminArn;
-  const resp = await ssm.send(new GetParameterCommand({ Name: ADMIN_ARN_PARAM }));
-  cachedAdminArn = resp.Parameter?.Value || '';
+  let value: string | undefined;
+  try {
+    const resp = await ssm.send(new GetParameterCommand({ Name: ADMIN_ARN_PARAM }));
+    value = resp.Parameter?.Value;
+  } catch (err) {
+    throw new Error(
+      `[MembershipAudit] cannot resolve the admin bearer ARN from SSM '${ADMIN_ARN_PARAM}' `
+      + `(${(err as Error).name}: ${(err as Error).message}). The membership audit cannot evaluate any `
+      + 'membership without it; failing the invocation so the records are retried rather than silently skipped.',
+    );
+  }
+  if (!value) {
+    throw new Error(
+      `[MembershipAudit] SSM parameter '${ADMIN_ARN_PARAM}' resolved to an empty value. The membership `
+      + 'audit cannot run without an admin bearer ARN - check the parameter was populated at deploy time.',
+    );
+  }
+  cachedAdminArn = value;
   return cachedAdminArn;
 }
 
@@ -169,16 +206,7 @@ async function resolveMemberClearance(sub: string): Promise<string | null> {
 // this detector (botClassification > channelClassification would go false). The tag cannot be changed by
 // UpdateChannel. Fail-closed to basic so an unreadable tag over-reports rather than misses.
 async function resolveChannelClassification(channelArn: string, _bearerArn: string): Promise<string> {
-  try {
-    const resp = await chime.send(new ListTagsForResourceCommand({ ResourceARN: channelArn }));
-    const tag = (resp.Tags || []).find((t) => t.Key === 'classification')?.Value;
-    if (profiles.isKnownClassification(tag)) return profiles.resolveClassification(tag);
-    console.warn('[MembershipAudit] channel missing/invalid classification tag; failing closed', { channelArn, tag, failClosedTo: profiles.failClosedValue });
-    return profiles.failClosedValue;
-  } catch (err) {
-    console.warn('[MembershipAudit] failed to read channel classification tag; failing closed:', err);
-    return profiles.failClosedValue;
-  }
+  return resolveChannelClassificationTagShared(chime, channelArn, '[MembershipAudit]');
 }
 
 let botClassificationMap: Map<string, string> | null = null;
@@ -291,47 +319,157 @@ function parseRecord(record: KinesisStreamRecord): ChimeKinesisEvent | null {
   }
 }
 
-export async function handler(event: KinesisStreamEvent, _context?: Context): Promise<void> {
+/**
+ * Evaluate ONE (channel, member) pair for an over-tier violation and flag/revoke it. The single shared
+ * check behind all three detection triggers (SPEC-CONVERSATION-SECURITY §11): the Kinesis event stream
+ * (#1), the scheduled sweep (#2), and the on-downgrade re-eval (#3) all funnel here, so the violation
+ * rule lives in exactly one place. Best-effort per pair - a resolution error for one member never aborts
+ * the batch/sweep.
+ */
+async function evaluateMembership(channelArn: string, memberArn: string, adminArn: string): Promise<void> {
+  const { kind, sub } = classifyMember(memberArn);
+  if (kind !== 'user' && kind !== 'bot') return; // admin service user, federated, unknown
+
+  try {
+    if (kind === 'user' && sub) {
+      // A human BELOW the channel's classification is the leak (they would see content above their clearance).
+      const memberClearance = await resolveMemberClearance(sub);
+      if (!memberClearance) return; // unresolvable identity — skip
+      const channelClassification = await resolveChannelClassification(channelArn, adminArn);
+      if (isClassificationViolation(memberClearance, channelClassification)) {
+        await handleViolation('member', channelArn, memberArn, sub, memberClearance, channelClassification);
+      }
+    } else if (kind === 'bot') {
+      // An assistant ABOVE the channel's classification is the leak: it answers with its own
+      // classification's model and context to users below that clearance. Layer 1 does NOT stop this,
+      // because the bot's own creds already cover its classification and below. A bot not matching any
+      // classification assistant (a `/battle` alt-slot) is left alone.
+      const botClassification = await resolveBotClassification(memberArn);
+      if (!botClassification) return;
+      const channelClassification = await resolveChannelClassification(channelArn, adminArn);
+      // Over-tier assistant: its classification ranks ABOVE the channel's. Unknown bot ranks 0,
+      // unknown channel the fail-closed floor — same fail-safe direction as isClassificationViolation.
+      const botRank = profiles.isKnownClassification(botClassification) ? profiles.rank(botClassification) : 0;
+      const chRank = profiles.isKnownClassification(channelClassification) ? profiles.rank(channelClassification) : profiles.rank(profiles.failClosedValue);
+      if (botRank > chRank) {
+        await handleViolation('assistant', channelArn, memberArn, botClassification, botClassification, channelClassification);
+      }
+    }
+  } catch (err) {
+    console.error('[MembershipAudit] error evaluating membership:', { channelArn, memberArn, err });
+  }
+}
+
+/**
+ * Trigger #2 (SPEC-CONVERSATION-SECURITY §11): scheduled sweep of EVERY channel's memberships against
+ * the CURRENT channel classification. Catches a violation the event stream can't - a member who became
+ * over-tier AFTER joining (their clearance was downgraded, or the channel was re-tagged down), which
+ * emits no membership event. Bounded by MAX_SWEEP_CHANNELS; a truncated run logs what it dropped.
+ */
+async function sweepAllChannels(adminArn: string): Promise<void> {
+  if (!APP_INSTANCE_ARN) {
+    console.warn('[MembershipAudit][sweep] APP_INSTANCE_ARN unset; cannot enumerate channels');
+    return;
+  }
+  let scanned = 0;
+  let nextToken: string | undefined;
+  let truncated = false;
+  do {
+    const resp = await chime.send(new ListChannelsCommand({
+      AppInstanceArn: APP_INSTANCE_ARN,
+      ChimeBearer: adminArn,
+      MaxResults: 50,
+      NextToken: nextToken,
+    }));
+    for (const ch of resp.Channels || []) {
+      if (scanned >= MAX_SWEEP_CHANNELS) { truncated = true; break; }
+      if (ch.ChannelArn) {
+        await sweepChannelMemberships(ch.ChannelArn, adminArn);
+        scanned += 1;
+      }
+    }
+    nextToken = truncated ? undefined : resp.NextToken;
+  } while (nextToken);
+  console.log('[MembershipAudit][sweep] complete', { scanned, truncated, cap: MAX_SWEEP_CHANNELS });
+  if (truncated) {
+    console.warn('[MembershipAudit][sweep] hit MAX_SWEEP_CHANNELS; remaining channels NOT scanned this run', { cap: MAX_SWEEP_CHANNELS });
+  }
+}
+
+/** Evaluate every member of one channel (paginated). Used by the sweep. */
+async function sweepChannelMemberships(channelArn: string, adminArn: string): Promise<void> {
+  let nextToken: string | undefined;
+  do {
+    const resp = await chime.send(new ListChannelMembershipsCommand({
+      ChannelArn: channelArn,
+      ChimeBearer: adminArn,
+      MaxResults: 50,
+      NextToken: nextToken,
+    }));
+    for (const m of resp.ChannelMemberships || []) {
+      if (m.Member?.Arn) await evaluateMembership(channelArn, m.Member.Arn, adminArn);
+    }
+    nextToken = resp.NextToken;
+  } while (nextToken);
+}
+
+/**
+ * Trigger #3 (SPEC-CONVERSATION-SECURITY §11): re-evaluate ONE user's existing memberships immediately
+ * after their clearance changes (a Cognito-group downgrade emits no Chime membership event, so the
+ * event stream never re-checks them). Invoked async by user-management on downgrade. Lists the user's
+ * channels and evaluates each against the user's new clearance.
+ */
+async function reevalUser(userArn: string, adminArn: string): Promise<void> {
+  let nextToken: string | undefined;
+  let scanned = 0;
+  do {
+    const resp = await chime.send(new ListChannelMembershipsForAppInstanceUserCommand({
+      AppInstanceUserArn: userArn,
+      ChimeBearer: adminArn,
+      MaxResults: 50,
+      NextToken: nextToken,
+    }));
+    for (const m of resp.ChannelMemberships || []) {
+      const channelArn = m.ChannelSummary?.ChannelArn;
+      if (channelArn) { await evaluateMembership(channelArn, userArn, adminArn); scanned += 1; }
+    }
+    nextToken = resp.NextToken;
+  } while (nextToken);
+  console.log('[MembershipAudit][reeval-user] complete', { userArn, scanned });
+}
+
+/** A non-Kinesis invocation: the scheduled sweep (#2) or a targeted user re-eval (#3). */
+interface AuditControlEvent {
+  type: 'sweep' | 'reeval-user';
+  /** Required for 'reeval-user': the AppInstanceUser ARN whose memberships to re-check. */
+  userArn?: string;
+}
+
+export async function handler(
+  event: KinesisStreamEvent | AuditControlEvent,
+  _context?: Context,
+): Promise<void> {
+  const adminArn = await getAdminArn();
+
+  // Dispatch by event shape. Kinesis event source → membership events (#1); a scheduled/async invoke
+  // carries { type } → the sweep (#2) or a targeted user re-eval (#3).
+  if ('type' in event) {
+    if (event.type === 'sweep') {
+      await sweepAllChannels(adminArn);
+    } else if (event.type === 'reeval-user' && event.userArn) {
+      await reevalUser(event.userArn, adminArn);
+    } else {
+      console.warn('[MembershipAudit] unrecognized control event', { event });
+    }
+    return;
+  }
+
   for (const record of event.Records) {
     const evt = parseRecord(record);
     if (!evt || !AUDITED_EVENT_TYPES.has(evt.EventType)) continue;
-
     const channelArn = evt.Payload.ChannelArn || evt.Payload.Channel?.ChannelArn;
     const memberArn = evt.Payload.Member?.Arn;
     if (!channelArn || !memberArn) continue;
-
-    const { kind, sub } = classifyMember(memberArn);
-    if (kind !== 'user' && kind !== 'bot') continue; // admin service user, federated, unknown
-
-    try {
-      const adminArn = await getAdminArn();
-      if (kind === 'user' && sub) {
-        // A human BELOW the channel's classification is the leak (they would see content above their clearance).
-        const memberClearance = await resolveMemberClearance(sub);
-        if (!memberClearance) continue; // unresolvable identity — skip
-        const channelClassification = await resolveChannelClassification(channelArn, adminArn);
-        if (isClassificationViolation(memberClearance, channelClassification)) {
-          await handleViolation('member', channelArn, memberArn, sub, memberClearance, channelClassification);
-        }
-      } else if (kind === 'bot') {
-        // An assistant ABOVE the channel's classification is the leak: it answers with its own
-        // classification's model and context to users below that clearance. Layer 1 does NOT stop this,
-        // because the bot's own creds already cover its classification and below. A bot not matching any
-        // classification assistant (a `/battle` alt-slot) is left alone.
-        const botClassification = await resolveBotClassification(memberArn);
-        if (!botClassification) continue;
-        const channelClassification = await resolveChannelClassification(channelArn, adminArn);
-        // Over-tier assistant: its classification ranks ABOVE the channel's. Unknown bot ranks 0,
-        // unknown channel the fail-closed floor — same fail-safe direction as isClassificationViolation.
-        const botRank = profiles.isKnownClassification(botClassification) ? profiles.rank(botClassification) : 0;
-        const chRank = profiles.isKnownClassification(channelClassification) ? profiles.rank(channelClassification) : profiles.rank(profiles.failClosedValue);
-        if (botRank > chRank) {
-          await handleViolation('assistant', channelArn, memberArn, botClassification, botClassification, channelClassification);
-        }
-      }
-    } catch (err) {
-      // Never fail the batch for one record; the next stream poll re-delivers if needed.
-      console.error('[MembershipAudit] error auditing membership record:', err);
-    }
+    await evaluateMembership(channelArn, memberArn, adminArn);
   }
 }

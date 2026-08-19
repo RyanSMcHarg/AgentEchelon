@@ -21,6 +21,8 @@ import {
 } from '@aws-sdk/client-chime-sdk-messaging';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { deriveFederatedSub } from './lib/federated-identity';
+import { putChannelContext } from './lib/channel-context-client';
+import { boundedDomainContext, boundedOtherContexts } from './lib/host-grounding';
 import { getConversationTypeConfig } from '../../lib/config/conversation-types.js';
 
 const messaging = new ChimeSDKMessagingClient({});
@@ -74,6 +76,7 @@ function channelIdFor(contextType: string, contextId: string): string {
   return raw.slice(0, 64);
 }
 
+
 interface Evt {
   httpMethod?: string;
   body?: string | null;
@@ -103,10 +106,20 @@ export const handler = async (event: Evt): Promise<{ statusCode: number; headers
   const userLanguage = String(body.userLanguage || '').slice(0, 8);
   // Free-text participant profile (preferences/working style) — personalizes the assistant's replies.
   const participantProfile = String(body.participantProfile || '').slice(0, 600);
-  const domainContext = body.domainContext && typeof body.domainContext === 'object'
-    ? (body.domainContext as { items?: unknown[]; [k: string]: unknown })
-    : undefined;
-  const otherContexts = Array.isArray(body.otherContexts) ? body.otherContexts : undefined;
+  // BOUNDED, like every other field on this path. These two were the only host-supplied inputs accepted
+  // with no cap at all, and they are the LARGEST: a plan's `items` array and a list of side contexts.
+  //
+  // Where an unbounded value actually breaks: the private store is DynamoDB (400KB per item, so it
+  // accepts far more than the rest of the system can carry), and the router spreads the whole grounding
+  // into the async processor's payload on an `Event` invoke - capped at 256KB. Past that the invoke
+  // throws `RequestEntityTooLargeException`, and `invokeAsync` logs it and returns, so the worker never
+  // runs, the placeholder is never resolved, and the user sits on "One moment..." forever. Not one turn
+  // either: EVERY turn in that conversation, because the grounding is re-read and re-sent each time.
+  //
+  // Rejecting at the write is what the rest of this handler already does, and it turns a silently lost
+  // conversation into a 400 the host can see and fix.
+  const domainContext = boundedDomainContext(body.domainContext, '[FederatedCreateConversation]');
+  const otherContexts = boundedOtherContexts(body.otherContexts);
   // Participant roster — owner + shared members, so the assistant is
   // multi-participant aware and can assign work items. Compact (sub + short name + role); host sends it
   // only for shared plans. Validated + capped; shed last under the metadata budget below.
@@ -138,38 +151,37 @@ export const handler = async (event: Evt): Promise<{ statusCode: number; headers
   const channelId = channelIdFor(contextType, contextId);
   const deterministicArn = `${APP_INSTANCE_ARN}/channel/${channelId}`;
 
-  // Chime channel Metadata is capped at ~1 KB. Build the richest metadata that fits, shedding
-  // work items first, then otherContexts, until under budget. userName + topic always survive —
-  // they are what the greeting + grounding most need. UTF-8 byte length (CJK names are multi-byte)
-  // is what Chime measures, so budget on bytes, not string length.
+  // Chime channel Metadata is capped at ~1 KB and is MEMBER-READABLE (DescribeChannel). It carries only
+  // the conversation's identity bits (topic/contextType/contextId) plus the participant ROSTER (member
+  // subs, already visible to members via ListChannelMemberships). The PRIVATE grounding —
+  // participantProfile, domainContext, otherContexts, userName — does NOT go here, and neither do the
+  // ROUTING signals userLanguage and segment: Metadata is member-WRITABLE (a channel's creator is a
+  // moderator of their own channel and holds `chime:UpdateChannel`, which writes Name and Metadata in
+  // one call), so a member could otherwise redirect their own conversation's model selection by
+  // rewriting them. All six are written server-side to the Channel Context store below
+  // (channel-context-client.ts), which no member can read or write. UTF-8 byte length (CJK names are
+  // multi-byte) is what Chime measures, so budget on bytes.
   const META_CAP = 1000; // headroom under Chime's 1024-byte cap
-  const buildMetadata = (itemBudget: number, includeOtherContexts: boolean, includeParticipants: boolean): string => {
-    const dc = domainContext
-      ? { ...domainContext, items: Array.isArray(domainContext.items) ? domainContext.items.slice(0, itemBudget) : [] }
-      : undefined;
-    return JSON.stringify({
-      modelTier: CLASSIFICATION,
-      // No `createdBy`: the owner is the sole human member (read from Chime membership),
-      // not copied into member-readable metadata (Tenet 6).
-      contextType: contextType.slice(0, 64),
-      contextId: contextId.slice(0, 128),
-      topic: title,
-      ...(userName ? { userName } : {}),
-      ...(userLanguage ? { userLanguage } : {}),
-      ...(segment ? { segment } : {}),
-      ...(participantProfile ? { participantProfile } : {}),
-      ...(includeParticipants && participants && participants.length ? { participants } : {}),
-      ...(dc ? { domainContext: dc } : {}),
-      ...(includeOtherContexts && otherContexts ? { otherContexts } : {}),
+  const buildMetadata = (includeParticipants: boolean): string => JSON.stringify({
+    modelTier: CLASSIFICATION,
+    // No `createdBy`: the owner is the sole human member (read from Chime membership),
+    // not copied into member-readable metadata (Tenet 6).
+    contextType: contextType.slice(0, 64),
+    contextId: contextId.slice(0, 128),
+    topic: title,
+    // NO `participants` ROSTER. It carried `{sub, iss, role}` — identity, which METADATA-AND-TAGS §1
+    // puts on the never-in-Metadata list: Metadata is readable by every member and writable by any
+    // moderator, so a roster there disclosed who else was in the conversation and which IdP they came
+    // from, and let a member edit it. It now goes to the server-only store as `memberIdentities`.
+  });
+  // `buildMetadata` no longer varies: the roster was the only shed-able part, and it is gone. The cap
+  // check stays because the remaining fields are host-supplied and still bounded by Chime's ~1KB.
+  const metadata = buildMetadata(true);
+  if (Buffer.byteLength(metadata, 'utf8') > META_CAP) {
+    console.warn('[FederatedCreateConversation] metadata exceeds the cap even without the roster', {
+      bytes: Buffer.byteLength(metadata, 'utf8'),
     });
-  };
-  let metadata = buildMetadata(20, true, true);
-  if (Buffer.byteLength(metadata, 'utf8') > META_CAP) metadata = buildMetadata(20, false, true);
-  for (let n = 15; Buffer.byteLength(metadata, 'utf8') > META_CAP && n >= 0; n -= 5) {
-    metadata = buildMetadata(n, false, true);
   }
-  // Last resort: the roster is shed only if even an items-less, otherContexts-less metadata is over budget.
-  if (Buffer.byteLength(metadata, 'utf8') > META_CAP) metadata = buildMetadata(0, false, false);
 
   try {
     const botArn = await getBotArn();
@@ -217,7 +229,50 @@ export const handler = async (event: Evt): Promise<{ statusCode: number; headers
       }
     }
 
-    // 2. Add the bot then the federated user as member + moderator (idempotent).
+    // Persist the PRIVATE host grounding to the server-only Channel Context store (never
+    // member-readable channel Metadata). Re-stamped on the edit path too, so an edited plan's context
+    // reaches the assistant. Best-effort: a lost write degrades grounding, it never leaks.
+    //
+    // `null` where the host OMITTED a field, so removing it from a plan actually clears the stored
+    // value. The store distinguishes absent (leave alone) from null (clear), but both callers used to
+    // coerce a missing field to `''`/`undefined` - which the store reads as "not part of this patch".
+    // On the edit path that meant grounding deleted from a plan kept being injected into the system
+    // prompt forever, which is the bug the re-stamp exists to prevent.
+    await putChannelContext(conversationArn, {
+      participantProfile: body.participantProfile === undefined ? null : participantProfile,
+      domainContext: body.domainContext === undefined ? null : domainContext,
+      otherContexts: body.otherContexts === undefined ? null : otherContexts,
+      userName: body.userName === undefined ? null : userName,
+      // Routing signals live here rather than in Metadata: they decide which model answers, and
+      // Metadata is member-writable.
+      userLanguage: body.userLanguage === undefined ? null : userLanguage,
+      segment: body.segment === undefined ? null : segment,
+      // The roster, moved out of member-readable Metadata. Server-only: it is identity (`sub`, the
+      // federated `iss`, role). Kept because a federated member's AppInstanceUser id is
+      // `deriveFederatedSub(iss, sub)` — a one-way hash — so nothing else can map them back to an IdP
+      // to resolve contact details. NOT the membership list; see `memberIdentities` docs.
+      memberIdentities: participants === undefined ? null : (participants ?? null),
+    });
+
+    // 2. Associate the channel flow BEFORE any membership (best-effort).
+    //
+    //    ORDERING IS THE POINT. The assistant becomes a member below and Lex can fire WelcomeIntent
+    //    from that moment; every message created before this association bypasses the flow, the
+    //    welcome included. `CreateChannel` takes no channel-flow field, so immediately after creation
+    //    is the earliest possible point. Same defect and same fix as `create-conversation/index.js`
+    //    and `lib/channel-creation.ts`.
+    const flowArn = await getFlowArn();
+    if (flowArn) {
+      try {
+        await messaging.send(new AssociateChannelFlowCommand({
+          ChannelArn: conversationArn, ChannelFlowArn: flowArn, ChimeBearer: botArn,
+        }));
+      } catch (err) {
+        console.warn('[FederatedCreateConversation] associate flow failed (non-fatal):', err);
+      }
+    }
+
+    // 3. Add the bot then the federated user as member + moderator (idempotent).
     for (const arn of [botArn, userArn]) {
       try {
         await messaging.send(new CreateChannelMembershipCommand({
@@ -233,18 +288,6 @@ export const handler = async (event: Evt): Promise<{ statusCode: number; headers
       }));
     } catch (err) {
       if ((err as { name?: string }).name !== 'ConflictException') throw err;
-    }
-
-    // 3. Associate the channel flow so @assistant routing runs (best-effort).
-    const flowArn = await getFlowArn();
-    if (flowArn) {
-      try {
-        await messaging.send(new AssociateChannelFlowCommand({
-          ChannelArn: conversationArn, ChannelFlowArn: flowArn, ChimeBearer: botArn,
-        }));
-      } catch (err) {
-        console.warn('[FederatedCreateConversation] associate flow failed (non-fatal):', err);
-      }
     }
 
     return res(200, { conversationArn, userArn, contextType, contextId });

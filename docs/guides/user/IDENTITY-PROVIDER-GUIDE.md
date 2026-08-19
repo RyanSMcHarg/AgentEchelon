@@ -408,6 +408,22 @@ The Cognito **group also selects the user's IAM role**, not just the application
 - **The strongest layer is IdP-agnostic.** Channels are tagged `classification=<tier>` at creation and the **assistant-side** Deny lives on backend Lambda (async-processor) roles - entirely independent of how users authenticate. So even a misconfigured user-side IdP mapping cannot make a tier-X *assistant* act on a higher-tier channel.
 - **Never key tier off a user-writable claim.** AgentEchelon keys role selection on group membership (admin-controlled), not the `custom:tier` attribute (which a user can self-set). If your IdP exposes a tier/role claim, ensure it is IdP-managed (admin/directory-controlled), not self-service-editable.
 
+### Step 9: The admin console's User Management tab
+
+`user-management.ts` - the Lambda behind the console's **User Management** tab (list, approve, reject, change tier, enable, delete) - calls Cognito User Pool admin APIs **directly**. It is the reference implementation for the bundled provider, not an abstraction over whichever IdP you configure. On a deployment where your own IdP is the directory, those actions have nothing to operate on: accounts are created, disabled, and assigned to groups in your IdP.
+
+Tell the console so, by naming the provider at deploy time:
+
+```bash
+npx cdk deploy --all --context identityProvider=okta
+```
+
+Any value other than `cognito` (the default) replaces the User Management tab with a short note that users are administered in that provider, and stops the tab calling the Cognito-backed endpoint. Nothing else changes: it is descriptive only, and authorization is unaffected.
+
+Tier assignment still works exactly as described above - it follows **group membership**, so keep Step 7's group sync in place and manage the underlying accounts in your IdP.
+
+> **This is the current boundary, deliberately.** AgentEchelon does not (yet) abstract user administration across providers the way it does authentication. Managing users in your own IdP is the supported path; the tab simply points you there rather than pretending to work.
+
 ---
 
 ## Approach 2: Credential Exchange Service

@@ -1,5 +1,5 @@
 /**
- * A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md) — the analytics-query capability
+ * A14 (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md) — the analytics-query capability
  * partition, shared by the Lambda handlers (runtime enforcement) and the CDK
  * (per-capability API resources + role policies), so both read ONE map.
  *
@@ -62,6 +62,13 @@ const VIEW_MODERATION_AUDIT_QUERIES = ['record_moderation', 'moderation_audit'];
  * latency, drift, flags, tasks, experiments, perf/health). Default-to-bundle is
  * deliberate: a new low-sensitivity query needs no map change, and a new
  * SENSITIVE query is a conscious addition here.
+ *
+ * DECIDED, not defaulted: the classification shadow gate's queries (`classifier_replay*`) stay in
+ * `view-analytics`. Its adjudication write is the same act as the ground-truth score already served
+ * there — a human recording a judgement for evaluation, attributed from the JWT — and its reads
+ * carry labels and counts, never message content. Starting a replay does spend real model calls, so
+ * it is the one that could argue for its own capability; it is held to the same bundle as the
+ * evaluation surfaces it belongs to, and the cap on that spend is the run's own message limit.
  */
 export const ANALYTICS_QUERY_CAPABILITY: Record<string, AnalyticsCapabilityKey> = Object.fromEntries([
   ...VIEW_EVENTS_QUERIES.map((q) => [q, 'view-events'] as const),

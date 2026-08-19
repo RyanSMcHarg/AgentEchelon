@@ -2,6 +2,8 @@
 
 **Status:** Implemented (reference: worked examples of the live IAM enforcement).
 
+**Coverage:** `e2e/classification-context.spec.ts`, `e2e/credential-exchange.spec.ts`
+
 **Problem and who it's for:** A team choosing or building on an AI platform needs to see - not just be told - that a blocked interaction is actually blocked by the infrastructure, and to know the one knob that changes each boundary. The alternative is to trust a product's isolation claim without proof, or to build your own enforcement and the test harness that proves it. This is for the platform developer and admin/operator reasoning about or customizing enforcement. It walks concrete blocked interactions end-to-end: the attempted action, the role that acts, the exact IAM statement that decides it (tag-gated conditional denial vs absolute denial), what the user and assistant experience, and the knob to change - showing that IAM over tagged resources, not application code, does the enforcing.
 
 **Site section:** Interaction layer, Identity & Access pillar (core plane).
@@ -48,9 +50,9 @@ So three boundaries do three different jobs: the IAM **tag condition** is the ti
 
 **Attempt.** A `basic` user (or a bug on their behalf) calls `chime:SendChannelMessage` on a channel tagged `classification=premium`.
 
-**Acting role.** The user's `basic` credential-exchange rung role, bearer-pinned to their own AppInstanceUser (`grantPinnedExchangePermissions`, `cognito-auth-stack.ts:403`). The SPA reaches Amazon Chime SDK only through this exchange; the Cognito Identity-Pool tier roles are empty (`makeTierRole`, `cognito-auth-stack.ts:342`).
+**Acting role.** The user's `basic` credential-exchange rung role, bearer-pinned to their own AppInstanceUser (`grantPinnedExchangePermissions`, `cognito-auth-stack.ts:403`). The SPA reaches Amazon Chime SDK only through this exchange; the Cognito Identity-Pool tier roles are empty (`makeClassificationRole`, `cognito-auth-stack.ts:342`).
 
-**Deciding policy** (`tierChannelScopedAllow('basic', …)`, `agent-classification-common.ts:115`):
+**Deciding policy** (`classificationChannelScopedAllow('basic', …)`, `agent-classification-common.ts:115`):
 
 ```json
 {
@@ -116,7 +118,7 @@ Category 1 was about *being on* a channel. This category is about *what actions*
 
 ## The complete set of tag-gated actions (conditional denials)
 
-The `aws:ResourceTag/classification` condition applies to **channel-resource** actions only. The helper `tierChannelScopedAllow` (`agent-classification-common.ts:115`) can gate any of the ten actions in `TIER_GATED_CHANNEL_ACTIONS` (`agent-classification-common.ts:43`). This is the complete set of actions denied on a channel whose classification is above the caller's tier:
+The `aws:ResourceTag/classification` condition applies to **channel-resource** actions only. The helper `classificationChannelScopedAllow` (`agent-classification-common.ts:115`) can gate any of the ten actions in `CLASSIFICATION_GATED_CHANNEL_ACTIONS` (`agent-classification-common.ts:43`). This is the complete set of actions denied on a channel whose classification is above the caller's tier:
 
 ```
 chime:SendChannelMessage
@@ -174,7 +176,7 @@ The tag gate above is a *conditional* denial. Some denials are *absolute*: the a
 
 **Attempt.** A crafted message tries to get the premium assistant to act as a user, or as another user's identity (a confused-deputy or impersonation attempt). In AWS the generic way to become another identity is `sts:AssumeRole`, so the real question is not only "can the credentials name another bearer" but "can this actor obtain different credentials at all."
 
-**Acting role.** The premium `ProcessorRole`. Its channel grant pins the bearer to a **bot** resource, never a user (`bearerResources: ['<appInstance>/bot/*']`, `premium-classification-stack.ts:129`); user rungs pin the other way, to `<appInstance>/user/${aws:PrincipalTag/sub}` (`cognito-auth-stack.ts:387`). At the Amazon Chime SDK layer, Amazon Chime SDK binds `x-amz-chime-bearer` to the caller's authenticated identity, so an AppInstanceBot and an AppInstanceUser are distinct principals that cannot be swapped.
+**Acting role.** The premium `ProcessorRole`. Its channel grant pins the bearer to a **bot** resource, never a user (`bearerResources: ['<appInstance>/bot/*']`, `backend/lib/stacks/agent-classification-common.ts:568`); user rungs pin the other way, to `<appInstance>/user/${aws:PrincipalTag/sub}` (`backend/lib/stacks/cognito-auth-stack.ts:538`). At the Amazon Chime SDK layer, Amazon Chime SDK binds `x-amz-chime-bearer` to the caller's authenticated identity, so an AppInstanceBot and an AppInstanceUser are distinct principals that cannot be swapped.
 
 **Deciding policy.** Two things have to hold, and both do:
 - **The bearer is pinned.** With the credentials it holds, the assistant can bear only its own bot identity, and a user can bear only their own `sub`. Neither names the other, and Amazon Chime SDK enforces the same binding.
@@ -206,17 +208,17 @@ Beyond channels, an assistant is bounded in *which model* it may invoke and *wha
 {
   "Effect": "Allow",
   "Action": ["bedrock:InvokeModel"],
-  "Resource": "<modelArnsForTier('basic')>"
+  "Resource": "<modelArnsForClassification('basic')>"
 }
 ```
 
-**Result: denied.** `modelArnsForTier('basic')` (`agent-classification-common.ts`, called from `assistant-profile-stack.ts`) resolves only the basic profile's model ARNs. A premium model ARN is not in the list, so `InvokeModel` on it is denied.
+**Result: denied.** `modelArnsForClassification('basic')` (`agent-classification-common.ts`, called from `assistant-profile-stack.ts`) resolves only the basic profile's model ARNs. A premium model ARN is not in the list, so `InvokeModel` on it is denied.
 
 **User experience.** A basic user only ever receives answers from the basic model; the model selector in the console is scoped to their tier, so a higher model is not even offered.
 
 **Assistant experience.** The basic processor cannot call the premium model even if code or configuration asked it to; the call returns `AccessDenied` at Bedrock.
 
-**To customize.** Change which models a tier may invoke in `modelArnsForTier` and the model catalog (`getModelCatalog`, `model-strategy.ts`), plus `tierModelSelection`. This is the single place tier-to-model access is granted.
+**To customize.** Change which models a tier may invoke in `modelArnsForClassification` and the model catalog (`getModelCatalog`, `model-strategy.ts`), plus `profileModelSelection`. This is the single place tier-to-model access is granted.
 
 ## A Basic-tier assistant tries to read Premium knowledge-base context
 
@@ -240,7 +242,33 @@ Beyond channels, an assistant is bounded in *which model* it may invoke and *wha
 
 **Assistant experience.** The context-retrieval tool returns nothing for premium documents; the model answers without that material rather than leaking it.
 
-**To customize.** Edit the `s3:prefix` list in each tier stack's `ContextS3Read`. Adding a prefix widens what that tier's assistant can read; removing one narrows it. Context is laid out under `context/{tier}/` in the attachments bucket.
+**To customize.** Edit the `s3:prefix` list in each tier stack's `ContextS3Read`. Adding a prefix widens what that tier's assistant can read; removing one narrows it. Context is laid out under `context/{classification}/` in the attachments bucket.
+
+## A channel member tries to read the conversation's private host grounding
+
+**Attempt.** A browser user (or a bug on their behalf) tries to read the conversation's private host grounding - the participant profile, domain context, extra context blobs, and resolved display name a host stamped on the channel.
+
+**Where it lives.** Not in the Amazon Chime SDK channel Metadata (any member reads that via `DescribeChannel`), but in a dedicated DynamoDB table, `ChannelContextTable` (`foundations-stack.ts`), keyed by `channelArn`. Only the member-readable routing bits (topic, language, segment) and the participant roster stay in Metadata; the sensitive grounding is held server-side.
+
+**Acting role.** No browser rung, Cognito, guest, or Identity-Pool principal holds any grant on the table. Writes belong to the conversation-create Lambdas (`channelContextTable.grantWriteData`, `foundations-stack.ts`); the read belongs to the router/assistant handler role, scoped to `dynamodb:GetItem` only (`assistant-profile-stack.ts`).
+
+**Deciding policy** (the router's grant on the store):
+
+```json
+{
+  "Effect": "Allow",
+  "Action": ["dynamodb:GetItem"],
+  "Resource": "<channelContextTable ARN>"
+}
+```
+
+**Result: absolute denial for every member principal.** The store is reachable only by server-side Lambda roles: the create Lambdas write it, the assistant handler reads one item at a time, and the router grant is `GetItem` only, so even that role can never write, `Query`, or `Scan` it. Because no user rung references the table at all, a member cannot read the private grounding by any path, and it never enters the member-readable channel Metadata. This boundary is asserted in `backend/test/cdk-synth.test.ts` (the assistant role holds only `dynamodb:GetItem` on the channel-context store, never write or scan; the Cognito auth stack references it from no role).
+
+**User experience.** A member sees the conversation and its messages, never the host grounding that shapes how the assistant is briefed; that grounding informs the assistant without being exposed to the people in the room.
+
+**Assistant experience.** The router reads the grounding server-side and forwards it to the worker as context for the turn; the assistant is grounded without any member being able to read the same record.
+
+**To customize.** Keep writes on the conversation-create Lambdas and the read on the assistant/router role scoped to `GetItem`; do not grant any browser or Identity-Pool rung access to `ChannelContextTable`. Put only member-safe fields in channel Metadata.
 
 ---
 
@@ -275,7 +303,7 @@ The admin console requests this identity's credential from the Credential-Exchan
 | You want to change | Edit | Effect |
 |---|---|---|
 | Tiers and their ordering | `classifications` + `groupClearance` in `backend/lib/config/profiles.ts` (interpreted by `ProfileRegistry`; `classificationsAllowedFor` delegates to `scopeAtOrBelow`) | Defines the classification ladder the channel gate evaluates |
-| Which models a tier may invoke | `modelArnsForTier` + model catalog (`model-strategy.ts`), `tierModelSelection` | The per-tier `bedrock:InvokeModel` resource list |
+| Which models a tier may invoke | `modelArnsForClassification` + model catalog (`model-strategy.ts`), `profileModelSelection` | The per-tier `bedrock:InvokeModel` resource list |
 | What context a tier's assistant may read | `ContextS3Read` `s3:prefix` list in each tier stack | The per-tier S3 read scope |
 | What the browser may do | `EXCHANGE_MSG_ACTIONS` (`cognito-auth-stack.ts`) | The action set on every user rung; keep destructive actions off it |
 | Who is an admin | `admins` group, `ADMIN_GROUP_NAMES` | Unlocks the cross-tier admin rung and the admin API |

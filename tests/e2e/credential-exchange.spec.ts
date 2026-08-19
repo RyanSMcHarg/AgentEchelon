@@ -16,6 +16,12 @@
 import { test, expect } from '@playwright/test';
 import { execSync } from 'child_process';
 import { getTestCredentials, hasTestCredentials } from './helpers/test-credentials';
+import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+
+// Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
+guardBackendErrors('credential-exchange');
+guardConsoleErrors();
+
 
 const AWS_PROFILE = process.env.AWS_PROFILE || 'default';
 const REGION = 'us-east-1';

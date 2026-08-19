@@ -36,6 +36,7 @@ import {
   DeleteChannelMembershipCommand,
 } from '@aws-sdk/client-chime-sdk-messaging';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import { LambdaClient, InvokeCommand, InvocationType } from '@aws-sdk/client-lambda';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { parseJsonBody, callerIsAdmin } from './lib/auth.js';
 
@@ -44,6 +45,9 @@ const cognitoClient = new CognitoIdentityProviderClient({});
 const chimeClient = new ChimeSDKIdentityClient({ region: REGION });
 const messagingClient = new ChimeSDKMessagingClient({ region: REGION });
 const ssmClient = new SSMClient({ region: REGION });
+const lambdaClient = new LambdaClient({ region: REGION });
+// Membership-audit Lambda name (trigger #3): re-check a user's memberships after a clearance downgrade.
+const MEMBERSHIP_AUDIT_FN_NAME = process.env.MEMBERSHIP_AUDIT_FN_NAME || '';
 
 const USER_POOL_ID = process.env.USER_POOL_ID || '';
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
@@ -101,6 +105,37 @@ async function syncClearanceGroup(username: string, clearance: Clearance): Promi
       GroupName: clearance,
     }));
     console.log(`[UserManagement] Added ${username} to ${clearance}`);
+  }
+
+  // Trigger #3 (SPEC-CONVERSATION-SECURITY §11): if this was a DOWNGRADE - the new clearance ranks
+  // below a clearance group the user held - re-evaluate their existing channel memberships now. A
+  // Cognito-group change emits no Chime membership event, so the audit's event stream (#1) never
+  // re-checks them; without this the downgraded member keeps read access to a now-over-tier channel
+  // until the scheduled sweep (#2) runs. From-nothing (approval) is not a downgrade and never fires.
+  const rank = (c: string): number => (CLEARANCE_GROUPS as readonly string[]).indexOf(c);
+  const oldRank = Math.max(-1, ...existing.map(rank));
+  if (rank(clearance) < oldRank) {
+    await triggerMembershipReeval(username);
+  }
+}
+
+/** Async-invoke the membership audit to re-check ONE user's memberships after a clearance downgrade
+ *  (#3). Best-effort: a missing fn name (audit not deployed yet) or an invoke error never blocks the
+ *  tier change - the scheduled sweep (#2) is the backstop. */
+async function triggerMembershipReeval(username: string): Promise<void> {
+  if (!MEMBERSHIP_AUDIT_FN_NAME || !APP_INSTANCE_ARN) return;
+  try {
+    const sub = await getUserSub(username);
+    if (!sub) return;
+    const userArn = `${APP_INSTANCE_ARN}/user/${sub}`;
+    await lambdaClient.send(new InvokeCommand({
+      FunctionName: MEMBERSHIP_AUDIT_FN_NAME,
+      InvocationType: InvocationType.Event,
+      Payload: Buffer.from(JSON.stringify({ type: 'reeval-user', userArn })),
+    }));
+    console.log('[UserManagement] triggered membership re-eval on downgrade', { userArn });
+  } catch (err) {
+    console.warn('[UserManagement] membership re-eval trigger failed (non-fatal):', (err as Error).name);
   }
 }
 

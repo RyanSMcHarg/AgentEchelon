@@ -86,10 +86,16 @@ describe('conversation-management API (Foundations)', () => {
   function foundationsTemplate() {
     const app = new cdk.App();
     const chime = new ChimeMessagingStack(app, 'Chime', { env, appInstanceName: 'test' });
+    // Foundations now hosts the user-feedback API (moved out of the identity stack), so it needs the
+    // pool for the authorizer and the feedback TABLE by reference - the table deliberately stayed in
+    // CognitoAuth, because relocating a DynamoDB table between stacks REPLACES it.
+    const cog = new CognitoAuthStack(app, 'CogForFound', { env, appInstanceArn: chime.appInstanceArn });
     const found = new FoundationsStack(app, 'Found', {
       env,
       appInstanceArn: chime.appInstanceArn,
       userPoolId: 'us-east-1_TestPool',
+      userPool: cog.userPool,
+      feedbackTable: cog.feedbackTable,
     });
     return Template.fromStack(found);
   }

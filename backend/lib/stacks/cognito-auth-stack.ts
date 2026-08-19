@@ -1,6 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
 import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
+import { MEMBERSHIP_AUDIT_FN_NAME } from '../constructs/membership-audit';
 import { adminOrigin, sharedOrigins } from '../config/app-origins';
 import {
   ADMIN_PERSONAS,
@@ -41,6 +42,17 @@ export interface CognitoAuthStackProps extends cdk.StackProps {
    * review). Absent ⇒ the S3 attachment vend is unavailable.
    */
   attachmentsBucketArnParam?: string;
+  /**
+   * Which identity provider governs END USERS on this deployment. Default `'cognito'`, the
+   * bundled provider. Set to any other value (e.g. `'okta'`, `'entra'`, `'auth0'`) on a
+   * deployment that replaces Cognito User Pools with its own IdP per IDENTITY-PROVIDER-GUIDE.md.
+   *
+   * Purely descriptive - it changes no authorization behaviour. It exists so the admin console
+   * can tell the operator WHERE users are actually managed, instead of offering a User Management
+   * tab backed by `user-management.ts`, which drives Cognito User Pools directly and therefore
+   * manages nothing once User Pools are no longer the directory.
+   */
+  identityProvider?: string;
 }
 
 export class CognitoAuthStack extends cdk.Stack {
@@ -51,7 +63,7 @@ export class CognitoAuthStack extends cdk.Stack {
   /**
    * The `admins` group's sign-on Identity-Pool role (A14). Exposed so cross-stack
    * admin APIs (analytics, experiments) can attach `execute-api:Invoke` teeth for
-   * their capabilities onto it (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6).
+   * their capabilities onto it (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6).
    */
   public readonly adminSignOnRoleArn: string;
   /**
@@ -335,7 +347,7 @@ export class CognitoAuthStack extends cdk.Stack {
         // deployer adopts the hosted UI. Both interface origins are registered so
         // that path works from either app: the chat SPA (appUrl) and the standalone
         // admin console (adminAppUrl). Localhost stays for development.
-        // SPEC-SEPARATE-ADMIN-APP.md.
+        // DESIGN-SEPARATE-ADMIN-APP.md.
         callbackUrls: [
           'http://localhost:5173/callback',
           ...oauthOrigins.map((o) => `${o}/callback`),
@@ -347,7 +359,7 @@ export class CognitoAuthStack extends cdk.Stack {
       },
     });
 
-    // Dedicated ADMIN app-client (P3, SPEC-SEPARATE-ADMIN-APP.md). On the SAME
+    // Dedicated ADMIN app-client (P3, DESIGN-SEPARATE-ADMIN-APP.md). On the SAME
     // user pool as the chat client — one pool, authority = `admins` group; this
     // is a second CLIENT, NOT a second pool. It isolates the admin session/token
     // from the chat session and scopes its hosted-UI callbacks to the admin
@@ -517,7 +529,7 @@ export class CognitoAuthStack extends cdk.Stack {
     // Credential-exchange is dual-plane: the chat SPA vends chat creds and the
     // admin console vends `${sub}-admin` creds, both against this one endpoint. So
     // its CORS must trust BOTH origins (credential-exchange.ts echoes the matching
-    // request Origin from the comma list). SPEC-SEPARATE-ADMIN-APP.md.
+    // request Origin from the comma list). DESIGN-SEPARATE-ADMIN-APP.md.
     const exchangeOrigins = sharedOrigins(this);
     const appUrlForExchange = exchangeOrigins.join(',');
     // The bearer pinned to the caller's own AppInstanceUser via the session tag.
@@ -818,7 +830,7 @@ export class CognitoAuthStack extends cdk.Stack {
     // ============================================================
 
     // CORS origins for this stack's admin-plane APIs after the console split
-    // (SPEC-SEPARATE-ADMIN-APP.md). User-management + admin-conversations are
+    // (DESIGN-SEPARATE-ADMIN-APP.md). User-management + admin-conversations are
     // admin-only → the admin console origin. Feedback is dual-plane (chat POSTs
     // thumbs, admin GETs the summary) → both origins (user-feedback.ts echoes the
     // matching request Origin from the comma list).
@@ -883,6 +895,17 @@ export class CognitoAuthStack extends cdk.Stack {
             }),
           ],
         }),
+        // Trigger #3 (SPEC-CONVERSATION-SECURITY §11): async-invoke the membership audit to re-check a
+        // user's memberships after a clearance downgrade. Scoped to the audit's stable function name (a
+        // constant, resolved without a cross-stack import since analytics already depends on this pool).
+        MembershipAuditInvoke: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['lambda:InvokeFunction'],
+              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${MEMBERSHIP_AUDIT_FN_NAME}`],
+            }),
+          ],
+        }),
       },
       managedPolicies: [
         iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
@@ -903,6 +926,8 @@ export class CognitoAuthStack extends cdk.Stack {
         APP_INSTANCE_ARN: props.appInstanceArn,
         ALLOWED_ORIGIN: adminAppUrl,
         ADMIN_ARN_PARAM: INSTANCE_SSM.appInstanceAdminArn,
+        // Trigger #3: the membership-audit Lambda to async-invoke on a clearance downgrade.
+        MEMBERSHIP_AUDIT_FN_NAME,
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
@@ -942,6 +967,17 @@ export class CognitoAuthStack extends cdk.Stack {
       value: `${userMgmtApi.url}users`,
       description: 'User Management API URL (admin only)',
       exportName: `${this.stackName}-UserManagementApiUrl`,
+    });
+
+    // Which identity provider actually governs users on this deployment. `user-management.ts`
+    // drives Cognito User Pools DIRECTLY (AdminListGroupsForUser, AdminUpdateUserAttributes,
+    // AdminDisableUser, ...), so on a deployment that replaces User Pools with its own IdP
+    // (IDENTITY-PROVIDER-GUIDE.md) that surface manages nothing. gen-frontend-env maps this to
+    // VITE_IDENTITY_PROVIDER so the console can say so plainly rather than presenting an admin
+    // UI whose buttons act on a directory the deployment no longer uses.
+    new cdk.CfnOutput(this, 'IdentityProvider', {
+      value: props.identityProvider ?? 'cognito',
+      description: 'Identity provider governing end users. "cognito" enables the User Management tab; any other value renders a pointer to that IdP.',
     });
 
     // A14 personas (opt-in, SPEC section 2): four example admin roles, each a
@@ -1008,9 +1044,18 @@ export class CognitoAuthStack extends cdk.Stack {
     }
 
     // ============================================================
-    // User Feedback API
+    // User Feedback TABLE (the API lives in FoundationsStack)
     // ============================================================
-
+    // Only the DATA stays here. The feedback API, its Lambda, and its role moved to
+    // FoundationsStack: thumbs-up/down on an assistant reply is a product
+    // feature with no identity relationship, and hosting it here put a non-IdP surface inside the
+    // identity stack's deploy blast radius and made it look IdP-dependent.
+    //
+    // The TABLE did not move with it, deliberately: relocating a DynamoDB table between stacks
+    // REPLACES it, which destroys the feedback history on any deployment whose removal policy is
+    // DESTROY (every non-production one, below) and orphans it on production. Moving stateless
+    // resources is free; moving state is a migration. It is exposed via `this.feedbackTable` and
+    // passed to FoundationsStack by reference.
     const isProduction = this.node.tryGetContext('environment') === 'production';
 
     const feedbackTable = this.feedbackTable = new dynamodb.Table(this, 'UserFeedbackTable', {
@@ -1022,88 +1067,7 @@ export class CognitoAuthStack extends cdk.Stack {
       },
     });
 
-    const feedbackRole = new iam.Role(this, 'UserFeedbackRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      inlinePolicies: {
-        FeedbackDdb: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({
-              actions: [
-                'dynamodb:PutItem',
-                'dynamodb:Scan',
-              ],
-              resources: [feedbackTable.tableArn],
-            }),
-          ],
-        }),
-        // Caller-membership check uses the caller's own AppInstanceUser ARN as
-        // ChimeBearer (allowed for self-membership-lookup by Chime); no bot SSM
-        // lookup needed.
-        FeedbackChime: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({
-              actions: ['chime:DescribeChannelMembership'],
-              resources: [`${props.appInstanceArn}/*`],
-            }),
-          ],
-        }),
-      },
-      managedPolicies: [
-        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
-      ],
-    });
-
-    const feedbackFn = new lambdaNodeJs.NodejsFunction(this, 'UserFeedbackFunction', {
-      entry: './lambda/src/user-feedback.ts',
-      handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: cdk.Duration.seconds(15),
-      memorySize: 256,
-      role: feedbackRole,
-      environment: {
-        FEEDBACK_TABLE: feedbackTable.tableName,
-        ALLOWED_ORIGIN: feedbackOrigins.join(','),
-        // M4: needed for the channel-membership check before recording feedback.
-        APP_INSTANCE_ARN: props.appInstanceArn,
-        // The GET summary is admin-gated via callerIsAdmin; give the handler the
-        // admin-auth mode/env so it honors ADMIN_GROUP_NAMES / service mode.
-        ...adminAuthEnv(this),
-      },
-      bundling: { minify: false, forceDockerBundling: false },
-    });
-
-    const feedbackAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'FeedbackAuthorizer', {
-      cognitoUserPools: [this.userPool],
-    });
-
-    const feedbackApi = new apigateway.RestApi(this, 'UserFeedbackApi', {
-      restApiName: 'Agent Echelon User Feedback',
-      defaultCorsPreflightOptions: {
-        allowOrigins: feedbackOrigins,
-        allowMethods: ['GET', 'POST', 'OPTIONS'],
-        allowHeaders: ['Content-Type', 'Authorization'],
-      },
-      deployOptions: {
-        throttlingBurstLimit: 30,
-        throttlingRateLimit: 15,
-        // Access logging.
-        ...apiAccessLogConfig(this, 'UserFeedbackApiAccessLogs'),
-      },
-    });
-
-    const feedbackIntegration = new apigateway.LambdaIntegration(feedbackFn);
-    const feedbackResource = feedbackApi.root.addResource('feedback');
-    // POST is user-level: any authenticated user submits feedback (plain Cognito
-    // authorizer). GET is the admin summary and gates on admin authority via the
-    // mode-aware options (Cognito admins group / federated host pool / IAM service).
-    feedbackResource.addMethod('POST', feedbackIntegration, {
-      authorizer: feedbackAuthorizer,
-      authorizationType: apigateway.AuthorizationType.COGNITO,
-    });
-    const feedbackAdminAuthOptions = adminApiMethodOptions(this, 'FeedbackAdminAuthorizer', {
-      userPool: this.userPool,
-    });
-    feedbackResource.addMethod('GET', feedbackIntegration, feedbackAdminAuthOptions);
+    // (feedback API, Lambda and role now live in FoundationsStack - see the note above.)
 
     // ── Admin conversation membership sync (SPEC-ADMIN-IDENTITY section 8) ───────
     // Scheduled reconcile: resolves the `admins` group and syncs each configured
@@ -1136,9 +1100,31 @@ export class CognitoAuthStack extends cdk.Stack {
         'chime:ListChannelMemberships', 'chime:CreateChannelMembership', 'chime:DeleteChannelMembership',
         'chime:DescribeChannel', 'chime:UpdateChannel',
         // DeleteAppInstanceUser: clean up a demoted admin's orphaned `${sub}-admin` identity.
-        'chime:ListAppInstanceAdmins', 'chime:DeleteAppInstanceAdmin', 'chime:DeleteAppInstanceUser',
+        'chime:DeleteAppInstanceAdmin', 'chime:DeleteAppInstanceUser',
       ],
       resources: [props.appInstanceArn, `${props.appInstanceArn}/*`],
+    }));
+    // ListAppInstanceAdmins authorizes against TWO resources, and needs both.
+    //
+    // The API checks the app instance itself AND a wildcard `app-instance/*/user/*` covering the
+    // identities it would return. A policy naming only the instance is denied on the wildcard; grant
+    // only the wildcard and it is then denied on the instance - each denial names the resource it is
+    // missing, which is how this was pinned down.
+    //
+    // Until this was granted the demotion backstop failed on EVERY scheduled run, and the sweep's
+    // catch logged only the error NAME, so it read as a recurring blip rather than a permission that
+    // had never once worked. The consequence is the part that matters: an app-instance-admin elevation
+    // left on a user removed from the `admins` group was never swept, and this sweep exists precisely
+    // for the case where the exchange path did not drop it.
+    //
+    // Its own statement so the wildcard applies to the LIST call alone. The mutations above stay
+    // pinned to this app instance, so nothing here widens what the sweep can DELETE.
+    adminConvSyncFn.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['chime:ListAppInstanceAdmins'],
+      resources: [
+        props.appInstanceArn,
+        `arn:aws:chime:${this.region}:${this.account}:app-instance/*/user/*`,
+      ],
     }));
     adminConvSyncFn.addToRolePolicy(new iam.PolicyStatement({
       actions: ['ssm:GetParameter'],
@@ -1151,11 +1137,7 @@ export class CognitoAuthStack extends cdk.Stack {
 
     // AdminConversationApiUrl output moved to AdminPlaneStack (D1).
 
-    new cdk.CfnOutput(this, 'UserFeedbackApiUrl', {
-      value: `${feedbackApi.url}feedback`,
-      description: 'User feedback API URL',
-      exportName: `${this.stackName}-UserFeedbackApiUrl`,
-    });
+    // UserFeedbackApiUrl output moved to FoundationsStack with the API (D1).
 
     new cdk.CfnOutput(this, 'UserPoolId', {
       value: this.userPool.userPoolId,

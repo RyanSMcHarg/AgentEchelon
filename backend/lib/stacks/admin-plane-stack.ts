@@ -24,7 +24,7 @@ import {
  * WHY A SEPARATE STACK (was in cognito-auth-stack): this is an admin-plane DATA api, not identity
  * infrastructure. It was parked in the IdP stack only because its auth wiring (the `admins` Identity-Pool
  * sign-on role + A14 persona roles + the userPool) lives there. Coupling an admin DATA feature to the
- * pluggable IdP layer is a layering violation (BUGS-ADMIN-CONSOLE D1): swap the IdP and this drags along.
+ * pluggable IdP layer is a layering violation: swap the IdP and this drags along.
  *
  * BREAKING THE CIRCULAR DEP: the Identity-Pool roles (created in cognito-auth) grant `execute-api:Invoke`
  * on THIS api's exact ARNs — a naive move (roles reference this api, this api references userPool/ceilings)

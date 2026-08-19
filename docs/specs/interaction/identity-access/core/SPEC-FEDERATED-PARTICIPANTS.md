@@ -2,6 +2,8 @@
 
 **Status:** Design (a wired, opt-in seam; not the shipped experience)
 
+**Coverage:** none - a wired but opt-in seam, not the shipped experience; no deployment enables it.
+
 **Problem and who it's for:** A customer, partner, or external specialist often needs to join one conversation without holding an account in this deployment, and should enter at their own capability - not a shared guest login and not by being migrated in. The alternative is provisioning an account for every outside person, accepting a shared guest identity with no attribution, or building your own cross-provider federation. This is for the admin/operator who invites external people and the platform developer wiring a second identity provider. It extends credential exchange to federated humans, so an external person authenticates against their own IdP and receives scoped, audited access like any member.
 
 **Site section:** Interaction layer, Identity & Access pillar (core plane).

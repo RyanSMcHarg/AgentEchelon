@@ -181,7 +181,7 @@ describe('admin identity — two-plane model', () => {
   });
 });
 
-// A14 archive plane (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6.5): reading
+// A14 archive plane (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6.5): reading
 // customer message content (A2) is vended as a short-lived, audited `execute-api`
 // session policy on the admin-plane role — NOT a Chime session policy — so a
 // standing sign-on role never holds a customer-PII read.

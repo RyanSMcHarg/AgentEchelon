@@ -514,3 +514,36 @@
     justify-content: flex-end;
   }
 }
+
+/* Shown instead of the user table when end users are governed by an external IdP.
+   The tab's actions are Cognito-backed, so on those deployments this points the
+   operator at the system that actually owns the accounts. */
+.um-external-idp {
+  max-width: 46rem;
+  padding: 1.5rem;
+  border: 1px solid var(--border, #2a2a2e);
+  border-radius: 8px;
+  background: var(--surface-50, #0f0f11);
+}
+
+.um-external-idp h3 {
+  margin: 0 0 0.75rem;
+  font-size: 1.05rem;
+}
+
+.um-external-idp p {
+  margin: 0 0 0.75rem;
+  line-height: 1.6;
+}
+
+.um-external-idp__detail {
+  font-size: 0.9rem;
+  opacity: 0.8;
+}
+
+.um-external-idp code {
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  background: var(--surface-0, #09090b);
+  font-size: 0.85em;
+}

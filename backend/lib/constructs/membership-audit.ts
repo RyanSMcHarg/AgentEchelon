@@ -17,9 +17,18 @@ import * as kinesis from 'aws-cdk-lib/aws-kinesis';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
+import * as events from 'aws-cdk-lib/aws-events';
+import * as targets from 'aws-cdk-lib/aws-events-targets';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
 import * as path from 'path';
 import { SSM_ROOT } from '../stacks/agent-classification-common';
+
+/** Stable name for the membership-audit Lambda. Fixed (not CDK-generated) so user-management in the
+ *  Cognito stack can grant `lambda:InvokeFunction` on it and invoke it by name for the on-downgrade
+ *  re-eval (#3) WITHOUT a cross-stack ARN import - analytics already depends on the Cognito user pool,
+ *  so a reverse hard ref would be circular. Safe as a constant because only one analytics stack (Athena
+ *  XOR Aurora) is deployed at a time. */
+export const MEMBERSHIP_AUDIT_FN_NAME = 'agent-echelon-membership-audit';
 
 export interface MembershipAuditProps {
   /** The Chime -> Kinesis message stream (carries CREATE/UPDATE_CHANNEL_MEMBERSHIP events). */
@@ -37,6 +46,11 @@ export interface MembershipAuditProps {
   senderEmail?: string;
   /** When true, memberships exceeding the member's clearance are auto-revoked. Default false (report-only). */
   enforce?: boolean;
+  /** Trigger #2 sweep schedule (EventBridge rate/cron expression). Default `rate(6 hours)`; bounds the
+   *  Chime ListChannels/ListChannelMemberships cost of the full-membership sweep. */
+  sweepRate?: string;
+  /** Trigger #2 per-run channel cap. Default 500; a run that hits it logs the remainder as unscanned. */
+  maxSweepChannels?: number;
 }
 
 export class MembershipAuditConstruct extends Construct {
@@ -59,6 +73,7 @@ export class MembershipAuditConstruct extends Construct {
     this.fn = new lambdaNodeJs.NodejsFunction(this, 'Fn', {
       entry: path.join(__dirname, '../../lambda/src/membership-audit.ts'),
       handler: 'handler',
+      functionName: MEMBERSHIP_AUDIT_FN_NAME,
       runtime: lambda.Runtime.NODEJS_20_X,
       timeout: cdk.Duration.seconds(30),
       memorySize: 256,
@@ -70,8 +85,22 @@ export class MembershipAuditConstruct extends Construct {
         AUDIT_TABLE: this.auditTable.tableName,
         MEMBERSHIP_AUDIT_ALERT_CHANNEL_ARN: props.alertChannelArn || '',
         MEMBERSHIP_AUDIT_ENFORCE: props.enforce ? 'true' : 'false',
+        MAX_SWEEP_CHANNELS: String(props.maxSweepChannels ?? 500),
         ...(props.senderEmail ? { SES_SENDER_EMAIL: props.senderEmail } : {}),
       },
+    });
+
+    // Trigger #2 (SPEC-CONVERSATION-SECURITY §11): scheduled full-membership sweep. Catches over-tier
+    // memberships the event stream can't - a member who became over-tier AFTER joining (clearance
+    // downgraded, or the channel re-tagged down), which emits no Chime membership event. Default every
+    // 6h to bound ListChannels/ListChannelMemberships cost; the Lambda caps channels per run.
+    new events.Rule(this, 'MembershipSweepSchedule', {
+      schedule: events.Schedule.expression(props.sweepRate || 'rate(6 hours)'),
+      targets: [
+        new targets.LambdaFunction(this.fn, {
+          event: events.RuleTargetInput.fromObject({ type: 'sweep' }),
+        }),
+      ],
     });
 
     // Consume the stream (its own iterator/checkpoint, independent of the archival consumer).
@@ -95,6 +124,19 @@ export class MembershipAuditConstruct extends Construct {
       new iam.PolicyStatement({
         actions: ['chime:ListTagsForResource', 'chime:DeleteChannelMembership', 'chime:SendChannelMessage'],
         resources: [`${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/user/*`],
+      }),
+    );
+
+    // Enumeration for the sweep (#2) and the on-downgrade re-eval (#3): list channels (authorizes on the
+    // app-instance resource), list a channel's members (channel/*), and list a user's channels (user/*).
+    this.fn.addToRolePolicy(
+      new iam.PolicyStatement({
+        actions: [
+          'chime:ListChannels',
+          'chime:ListChannelMemberships',
+          'chime:ListChannelMembershipsForAppInstanceUser',
+        ],
+        resources: [props.appInstanceArn, `${props.appInstanceArn}/channel/*`, `${props.appInstanceArn}/user/*`],
       }),
     );
 

@@ -9,7 +9,7 @@
  * opens as a top-level navigation (no S3 CORS needed) and expires quickly.
  *
  * Two capabilities, split by object-key prefix so the data-sensitivity boundary is
- * IAM-enforceable (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md), not a UI convention:
+ * IAM-enforceable (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md), not a UI convention:
  *   - generated-docs/… → 'attachment-read'          the assistant's DELIVERABLES (archive grade)
  *   - attachments/…     → 'attachment-read-uploads'  USER-UPLOADED input, PII (moderation grade)
  * A key under neither prefix is not an admin-reviewable attachment and is rejected.

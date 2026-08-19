@@ -1,5 +1,5 @@
 /**
- * A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6): SigV4-signed GETs to the
+ * A14 (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6): SigV4-signed GETs to the
  * IAM-authorized admin archive endpoints.
  *
  * Two credential sources, matching the two enforcement planes the backend wires:
@@ -39,6 +39,27 @@ let signOnProvider: (() => Promise<SigV4Credentials>) | null = null;
 // recreate the provider whenever the (freshly-ensured) idToken changes.
 let signOnToken: string | null = null;
 
+/**
+ * The resolved (or in-flight) credential request, so a BURST of concurrent callers issues one
+ * GetId/GetCredentialsForIdentity pair instead of one per caller.
+ *
+ * Caching the provider is not enough. The dashboard mounts and fires every section's analytics query
+ * at once, and each of the seven-plus `identityPoolCredentials()` call sites independently invokes
+ * the provider before any of them has resolved. Cognito answered with ten identical GetId calls and
+ * then `TooManyRequestsException: Rate exceeded` on GetCredentialsForIdentity - a self-inflicted
+ * rate limit on first paint. Nothing surfaced it: the failures are retried, the tabs eventually
+ * populate, and the only evidence is 400s in the browser console.
+ *
+ * Holding the PROMISE (not just the value) is what collapses the burst, because the window that
+ * matters is before the first request resolves.
+ */
+let credentialCache: { promise: Promise<SigV4Credentials>; expiresAt: number } | null = null;
+
+/** Re-fetch this far before the STS session actually expires, so a signed request never races it. */
+const EXPIRY_MARGIN_MS = 5 * 60_000;
+/** Used when the provider does not report an expiry; well inside the Identity-Pool session length. */
+const FALLBACK_TTL_MS = 10 * 60_000;
+
 export async function identityPoolCredentials(): Promise<SigV4Credentials> {
   if (!IDENTITY_POOL_ID || !USER_POOL_ID) {
     throw new Error('Signed admin reads require VITE_IDENTITY_POOL_ID + VITE_USER_POOL_ID');
@@ -54,14 +75,50 @@ export async function identityPoolCredentials(): Promise<SigV4Credentials> {
       identityPoolId: IDENTITY_POOL_ID,
       logins: { [`cognito-idp.${REGION}.amazonaws.com/${USER_POOL_ID}`]: idToken },
     }) as () => Promise<SigV4Credentials>;
+    // A new identity means the previous credentials belong to a different login.
+    credentialCache = null;
   }
-  return signOnProvider();
+
+  const now = Date.now();
+  if (credentialCache && credentialCache.expiresAt > now) return credentialCache.promise;
+
+  // Both handlers below write the cache only if it still holds THIS request's entry. Without that
+  // check, a request already in flight when the cache is deliberately dropped - a sign-out via
+  // resetSignOnCredentials, or a token refresh that rebuilds signOnProvider - would resolve
+  // afterwards and republish the PREVIOUS identity's credentials for the rest of the STS session.
+  // The failure path needs the same check for the mirror reason: a stale rejection must not clear a
+  // newer identity's good entry.
+  let entry: { promise: Promise<SigV4Credentials>; expiresAt: number } | null = null;
+
+  const promise = signOnProvider()
+    .then((creds) => {
+      const expiration = (creds as { expiration?: Date }).expiration?.getTime();
+      if (credentialCache === entry) {
+        credentialCache = {
+          promise: Promise.resolve(creds),
+          expiresAt: expiration ? expiration - EXPIRY_MARGIN_MS : Date.now() + FALLBACK_TTL_MS,
+        };
+      }
+      return creds;
+    })
+    .catch((err) => {
+      // Never cache a failure: the next caller must be able to retry, or one transient rate-limit
+      // would wedge every signed read for the life of the page.
+      if (credentialCache === entry) credentialCache = null;
+      throw err;
+    });
+
+  // Publish the in-flight promise immediately — this is the line that collapses the burst.
+  entry = { promise, expiresAt: now + 60_000 };
+  credentialCache = entry;
+  return promise;
 }
 
 /** Drop the cached sign-on provider (call on sign-out). */
 export function resetSignOnCredentials(): void {
   signOnProvider = null;
   signOnToken = null;
+  credentialCache = null;
 }
 
 /**

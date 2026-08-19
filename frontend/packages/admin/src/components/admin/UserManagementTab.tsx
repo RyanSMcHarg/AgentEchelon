@@ -62,7 +62,43 @@ function getUserStatus(user: User): 'pending' | 'approved' | 'disabled' {
   return user.approved === 'true' ? 'approved' : 'pending';
 }
 
+/**
+ * Which identity provider governs end users on this deployment (CfnOutput -> VITE_IDENTITY_PROVIDER).
+ * Defaults to the bundled provider so an env without the var behaves exactly as before.
+ */
+function getIdentityProvider(): string {
+  return (import.meta.env.VITE_IDENTITY_PROVIDER || 'cognito').trim();
+}
+
+/**
+ * Shown INSTEAD of the user table when this deployment does not use Cognito for end users.
+ *
+ * The actions on this tab (approve, reject, change tier, enable, delete) are implemented by
+ * `user-management.ts`, which calls Cognito User Pool admin APIs directly. On a deployment that
+ * replaced User Pools with its own IdP, those buttons would act on a directory that no longer
+ * governs anyone - so the honest surface is a pointer, not a disabled-looking table.
+ */
+const ExternalIdpNotice: React.FC<{ provider: string }> = ({ provider }) => (
+  <div className="admin-tab">
+    <div className="um-external-idp">
+      <h3>Users are managed in your identity provider</h3>
+      <p>
+        This deployment authenticates end users through <strong>{provider}</strong>, not the bundled
+        Amazon Cognito user pool. Accounts, group membership, and tier assignment are administered
+        there, so there is nothing for this console to change.
+      </p>
+      <p className="um-external-idp__detail">
+        Tier still comes from group membership as usual. Map your provider&apos;s groups or claims onto
+        the <code>basic</code> / <code>standard</code> / <code>premium</code> / <code>admins</code> groups
+        as described in the Identity Provider guide.
+      </p>
+    </div>
+  </div>
+);
+
 const UserManagementTab: React.FC = () => {
+  const identityProvider = getIdentityProvider();
+  const isCognito = identityProvider.toLowerCase() === 'cognito';
   const [users, setUsers] = useState<User[]>([]);
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -82,7 +118,12 @@ const UserManagementTab: React.FC = () => {
     }
   }, []);
 
-  useEffect(() => { loadUsers(); }, [loadUsers]);
+  // Skip the fetch entirely when users live in another IdP: the endpoint is Cognito-backed, so
+  // calling it would surface a spurious error on a deployment that is working exactly as intended.
+  useEffect(() => {
+    if (!isCognito) { setIsLoading(false); return; }
+    loadUsers();
+  }, [loadUsers, isCognito]);
 
   const doAction = async (fn: () => Promise<unknown>) => {
     try { await fn(); await loadUsers(); }
@@ -131,6 +172,9 @@ const UserManagementTab: React.FC = () => {
     { key: 'disabled', label: 'Disabled' },
     { key: 'all', label: 'Total' },
   ];
+
+  // Placed after every hook so hook order stays unconditional across renders.
+  if (!isCognito) return <ExternalIdpNotice provider={identityProvider} />;
 
   return (
     <div className="admin-tab">

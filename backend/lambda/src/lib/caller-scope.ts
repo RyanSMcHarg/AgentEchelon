@@ -1,5 +1,5 @@
 /**
- * A14 `Scoped` cells (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 10) — resolve
+ * A14 `Scoped` cells (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md section 10) — resolve
  * the caller's CLASSIFICATION CEILING from their verified identity, so an admin
  * read can be narrowed to the classification tier the caller is entitled to (the
  * one generic scope axis; ownership/membership scoping is deployment-specific).

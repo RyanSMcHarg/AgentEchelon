@@ -2,6 +2,8 @@
 
 **Status:** DESIGN (not yet built).
 
+**Coverage:** none - design only; the escalation path is not built.
+
 **Problem and who it's for:** Teams want a user - or the assistant itself - to bring the right human into a conversation (an eligible colleague, an approver, a routed support or sales specialist) without that becoming a way to leak the conversation to someone who should not see it. The alternative on the market is a chatbot that emails a link to any address you type, or building your own eligibility gate and prompt-injection defenses around member-adds. This is for the end user bringing in an eligible colleague and the admin/operator overseeing user provisioning, with the assistant able to escalate to a pre-approved human. It routes both the human-initiated invite and the assistant-initiated escalation through the same eligibility gate and deep-link delivery, selecting targets by allowlist key, never by raw ARN, so an LLM output never becomes an identity.
 
 **Site section:** Interaction layer, Identity & Access pillar (core plane).
@@ -77,7 +79,7 @@ The assistant signals an escalation by emitting a marker in its reply text:
 
 ### Detection and stripping (parity with `<!--proposal:-->`)
 
-AgentEchelon already embeds machine-readable markers in message content as HTML comments. Today these persist in the stored message as invisible HTML comments (the browser does not render them); they are NOT stripped server-side on the live send path. The one place a `.replace(/<!--...-->/g, '')` runs is the offline eval runner (`evaluation-runner.ts:516-517`), not the message send. So server-side stripping for `add_user` is genuinely net-new work (the build delta says so). Precedent markers in `lib/async-processor-core.ts`:
+AgentEchelon already embeds machine-readable markers in message content as HTML comments. Today these persist in the stored message as invisible HTML comments (the browser does not render them); they are NOT stripped server-side on the live send path. The one place a `.replace(/<!--...-->/g, '')` runs is the offline eval runner (`backend/lambda/src/evaluation/evaluation-runner.ts:515-517`, which delegates to the shared `stripMessageMarkers`), not the message send. So server-side stripping for `add_user` is genuinely net-new work (the build delta says so). Precedent markers in `lib/async-processor-core.ts`:
 
 - `<!--proposal:base64-->` (`proposalMarker`, work-item confirm cards),
 - `<!--corr:uuid-->` (correlation id),

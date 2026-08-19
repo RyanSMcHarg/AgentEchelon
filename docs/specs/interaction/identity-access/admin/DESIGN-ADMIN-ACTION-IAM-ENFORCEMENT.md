@@ -2,9 +2,11 @@
 
 **Status:** Built, flag-gated (opt-in), deployed and validated on the on-flag path. **Layer:** Interaction **Pillar:** Identity & Access **Plane:** admin **Product spec:** [`SPEC-ADMIN-IDENTITY.md`](SPEC-ADMIN-IDENTITY.md) (the capability model, personas, and fail-closed requirement this implements). **Summary:** Every privileged archive/analytics admin action is expressed as a named capability mapped to a specific API Gateway resource, so a deployer's IAM role can be denied a specific action or specific data at the gateway rather than only by an application group check.
 
+**Coverage:** `e2e/admin-attachments.spec.ts`, `e2e/credential-exchange.spec.ts`
+
 The Amazon Chime SDK plane is already IAM-enforced (the credential exchange vends `chime:*` session policies scoped to exactly the requested capability). The archive and analytics plane was group-gated only. This design brings that plane up to the same enforceability and grounds the boundaries in the personas of the product spec (FR-3, capability-level denial).
 
-Enablement: `-c adminIamEnforcement=true` (backend) plus `VITE_ADMIN_IAM_ENFORCEMENT=true` (admin app) turns it on; the four example persona roles are opt-in behind `-c enableAdminPersonas=true`. With the flag off, the interim Cognito-group gate is the control, unchanged.
+Enablement: **on by default** in the backend. `admin-plane-stack.ts`, `analytics-stack-aurora.ts` and `experiments-stack.ts` each treat any context value other than `false` as enabled, so the per-resource `AWS_IAM` authorizers are what a deployment gets without asking. Opt out with `-c adminIamEnforcement=false`, which falls back to the Cognito-group gate: weaker, because it is group-gated rather than per-capability IAM-enforced. The admin app must match with `VITE_ADMIN_IAM_ENFORCEMENT=true` so the console SigV4-signs its reads. The four example persona roles remain opt-in behind `-c enableAdminPersonas=true`.
 
 ## 1. Architecture
 

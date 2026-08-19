@@ -178,13 +178,13 @@ export function iamCallerSub(event: APIGatewayProxyEvent): string | null {
 /**
  * True when A14 fine-grained IAM enforcement is on for this handler
  * (`ADMIN_IAM_ENFORCEMENT=true`, set by the CDK only on the resources whose API
- * Gateway method is `AWS_IAM`-authorized under `-c adminIamEnforcement=true`)
+ * Gateway method is `AWS_IAM`-authorized when admin IAM enforcement is on, which is the default)
  * AND the request arrived IAM-signed. Unlike service mode (all-or-nothing), the
  * gateway has already enforced `execute-api:Invoke` on the SPECIFIC resource —
  * so reaching this handler proves the signed principal holds that capability
  * (its sign-on group role, or an exchange-vended per-use cred). The handler
  * therefore trusts the principal and derives the actor from it
- * (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6). Fails closed the same way:
+ * (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md section 6). Fails closed the same way:
  * no env → false; no IAM identity → false. See {@link iamPrincipal}.
  */
 export function isAdminIamEnforcedCall(event: APIGatewayProxyEvent): boolean {
@@ -237,7 +237,8 @@ export function callerIsAdmin(event: APIGatewayProxyEvent): boolean {
  * defaulting to the admin groups so current admins keep access; narrow it to deny a role.
  * The IAM-ENFORCEABLE version (a credential-exchange `view-archive` capability, like redact/
  * delete) is the tracked follow-up — this group gate is the placeholder for that action, NOT
- * the final control. See memory `admin-actions-iam-enforceable` + PLAN-NEXT-STEPS.
+ * the final control. The rule it is a placeholder for: a privileged admin action gates on an
+ * IAM-enforceable capability, never on group membership alone.
  */
 const ARCHIVE_VIEW_GROUPS = new Set<string>(
   (process.env.ARCHIVE_VIEW_GROUP_NAMES || process.env.ADMIN_GROUP_NAMES || 'admins')
@@ -259,14 +260,15 @@ export function callerCanReadArchive(event: APIGatewayProxyEvent): boolean {
 
 /**
  * `manage-profiles` capability — versioning/import lifecycle for assistant profiles
- * (SPEC-PORTABLE-VERSIONED-PROFILES §7, plan item A14). A DISTINCT capability from `view-*`: who may
+ * (SPEC-PORTABLE-PROFILES §7, plan item A14). A DISTINCT capability from `view-*`: who may
  * version/activate/import an assistant is separately denyable, not "any admin".
  *
  * INTERIM (this seam, same shape as `callerCanReadArchive`): a configurable Cognito group
  * `MANAGE_PROFILES_GROUP_NAMES`, defaulting to the admin groups so current admins keep access; narrow
  * it to deny a role. The IAM-ENFORCEABLE version (an `execute-api:Invoke` capability on the
  * profile-management routes, §7) is A14's tracked work — this group gate is the placeholder, NOT the
- * final control. See memory `admin-actions-iam-enforceable`.
+ * final control, under the same rule as `callerCanReadArchive`: a privileged admin action gates on an
+ * IAM-enforceable capability, never on group membership alone.
  */
 const MANAGE_PROFILES_GROUPS = new Set<string>(
   (process.env.MANAGE_PROFILES_GROUP_NAMES || process.env.ADMIN_GROUP_NAMES || 'admins')

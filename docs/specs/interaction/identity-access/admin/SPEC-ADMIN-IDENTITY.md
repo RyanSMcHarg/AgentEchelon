@@ -2,6 +2,8 @@
 
 **Status:** Implemented (with a small set of tracked gaps, section 6) **Layer:** Interaction **Pillar:** Identity & Access **Plane:** admin **Summary:** A capability model that decides who may perform a privileged action, proves who performed it, and never over-grants, by splitting every operator into a membership-gated chat identity and a separate, just-in-time admin identity. **Technical designs:** [`DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md`](DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md) (how a capability becomes IAM-enforceable), [`DESIGN-ADMIN-AGENT-NOTIFICATIONS.md`](DESIGN-ADMIN-AGENT-NOTIFICATIONS.md) (how admin-facing alerts are delivered inside the admin trust boundary). **Site section(s):** Admin console, identity and access.
 
+**Coverage:** `e2e/credential-exchange.spec.ts`, `e2e/admin-attachments.spec.ts`, `e2e/signin.spec.ts`
+
 ## 1. Business problem
 
 A business running assistants for users at different clearance levels has to let specific operators do privileged things - read any conversation across those levels, moderate a message, delete a message, change who is a member, configure models and routing, read the durable archive - and be sure only the right people can, with every act provable. The alternative is to trust a product's single bolted-on "admin" switch, or to build your own admin identity plane (least-privilege capability model, per-action denial, just-in-time credentials, end-to-end audit) and secure it yourself. Someone has to be able to do these things, but three failures are easy and expensive.

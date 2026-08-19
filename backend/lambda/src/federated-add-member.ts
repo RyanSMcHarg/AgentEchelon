@@ -24,6 +24,8 @@ import {
 } from '@aws-sdk/client-chime-sdk-messaging';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { deriveFederatedSub } from './lib/federated-identity';
+import { putChannelContext, recordMemberIdentity } from './lib/channel-context-client';
+import { boundedDomainContext, boundedOtherContexts } from './lib/host-grounding';
 
 const messaging = new ChimeSDKMessagingClient({});
 const ssm = new SSMClient({});
@@ -105,8 +107,10 @@ export const handler = async (event: AddMemberEvent) => {
   const userName = String(event.userName || '').slice(0, 80);
   const userLanguage = String(event.userLanguage || '').slice(0, 8);
   const participantProfile = String(event.participantProfile || '').slice(0, 600);
-  const domainContext = event.domainContext && typeof event.domainContext === 'object' ? event.domainContext : undefined;
-  const otherContexts = Array.isArray(event.otherContexts) ? event.otherContexts : undefined;
+  // Bounded, for the same reason and by the same helper as the creation path: an unbounded plan makes
+  // every turn's dispatch exceed the 256KB Event-invoke cap, and `invokeAsync` swallows that failure.
+  const domainContext = boundedDomainContext<DomainContext>(event.domainContext, '[FederatedAddMember]');
+  const otherContexts = boundedOtherContexts(event.otherContexts);
   const segCountry =
     event.segment && typeof event.segment === 'object'
       ? String(event.segment.country || '').slice(0, 3).toUpperCase()
@@ -117,26 +121,26 @@ export const handler = async (event: AddMemberEvent) => {
   const channelId = channelIdFor(contextType, contextId);
   const conversationArn = `${APP_INSTANCE_ARN}/channel/${channelId}`;
 
-  const buildMetadata = (itemBudget: number, includeOtherContexts: boolean): string => {
-    const dc = domainContext
-      ? { ...domainContext, items: Array.isArray(domainContext.items) ? domainContext.items.slice(0, itemBudget) : [] }
-      : undefined;
-    return JSON.stringify({
+  // Member-readable channel Metadata carries the conversation's identity bits only. The PRIVATE
+  // grounding (participantProfile, domainContext, otherContexts) and the ROUTING signals
+  // (userLanguage, segment) are written server-side to the Channel Context store below
+  // (channel-context-client.ts), which no member can read or write — never into channel Metadata,
+  // which a member holding `chime:UpdateChannel` can rewrite and thereby steer model selection.
+  const buildMetadata = (): string => JSON.stringify({
+    modelTier: CLASSIFICATION,
+    contextType: contextType.slice(0, 64),
+    contextId: contextId.slice(0, 128),
+    topic: title,
+  });
+  let metadata = buildMetadata();
+  // Only topic is unbounded; trim it defensively if a pathological name pushes metadata over the cap.
+  if (Buffer.byteLength(metadata, 'utf8') > META_CAP) {
+    metadata = JSON.stringify({
       modelTier: CLASSIFICATION,
       contextType: contextType.slice(0, 64),
       contextId: contextId.slice(0, 128),
-      topic: title,
-      ...(userLanguage ? { userLanguage } : {}),
-      ...(segment ? { segment } : {}),
-      ...(participantProfile ? { participantProfile } : {}),
-      ...(dc ? { domainContext: dc } : {}),
-      ...(includeOtherContexts && otherContexts ? { otherContexts } : {}),
+      topic: String(title).slice(0, 200),
     });
-  };
-  let metadata = buildMetadata(20, true);
-  if (Buffer.byteLength(metadata, 'utf8') > META_CAP) metadata = buildMetadata(20, false);
-  for (let n = 15; Buffer.byteLength(metadata, 'utf8') > META_CAP && n >= 0; n -= 5) {
-    metadata = buildMetadata(n, false);
   }
 
   try {
@@ -170,18 +174,58 @@ export const handler = async (event: AddMemberEvent) => {
       }
     }
 
-    // 2. Ensure the bot is a member, then add the TARGET as a DEFAULT member (NOT a moderator).
-    for (const arn of [botArn, userArn]) {
-      try {
-        await messaging.send(new CreateChannelMembershipCommand({
-          ChannelArn: conversationArn, MemberArn: arn, Type: 'DEFAULT', ChimeBearer: botArn,
-        }));
-      } catch (err) {
-        if ((err as { name?: string }).name !== 'ConflictException') throw err;
-      }
-    }
+    // Persist the PRIVATE host grounding to the server-only Channel Context store (never
+    // member-readable channel Metadata). Best-effort: a lost write degrades grounding, never leaks.
+    //
+    // OMISSION PRESERVES; ONLY AN EXPLICIT `null` CLEARS (owner, 2026-08-10).
+    //
+    // This is where add-member DIFFERS from the create path, and the difference follows from what each
+    // call IS. Create/edit re-stamps the whole plan, so a field the host stopped sending has genuinely
+    // been removed and clearing it is correct. Add-member create-or-GETS an EXISTING conversation and
+    // adds one person to it - the host is saying "this member joins", not "and here is the complete
+    // grounding again".
+    //
+    // Treating omission as removal there meant a call carrying only `{contextType, contextId, iss, sub}`
+    // wiped the conversation's private grounding AND its model/language routing: a richly grounded,
+    // Spanish-routed conversation silently became ungrounded and English-routed because somebody was
+    // added to it. Nothing errored, and the next turn simply answered worse.
+    //
+    // `putChannelContext` already distinguishes the two: `undefined` is "not part of this patch" and
+    // `null` is an explicit REMOVE. So passing the host's own intent through is the whole fix - a host
+    // that wants a field cleared still sends `null` and still gets it cleared.
+    await putChannelContext(conversationArn, {
+      ...(event.participantProfile === undefined
+        ? {} : { participantProfile: event.participantProfile === null ? null : participantProfile }),
+      ...(event.domainContext === undefined
+        ? {} : { domainContext: event.domainContext === null ? null : domainContext }),
+      ...(event.otherContexts === undefined
+        ? {} : { otherContexts: event.otherContexts === null ? null : otherContexts }),
+      // Routing signals live here rather than in Metadata: they decide which model answers, and
+      // Metadata is member-writable. They are also the fields whose silent loss is hardest to notice,
+      // because the assistant keeps answering - just in the wrong language, on the wrong model.
+      ...(event.userLanguage === undefined
+        ? {} : { userLanguage: event.userLanguage === null ? null : userLanguage }),
+      ...(event.segment === undefined
+        ? {} : { segment: event.segment === null ? null : segment }),
+    });
 
-    // 3. Associate the channel flow so @assistant routing runs (best-effort).
+    // Record THIS member's issuer hint, appended rather than written over the existing ones.
+    //
+    // Without it the person just added is the one member nothing can resolve: their AppInstanceUser id
+    // is `deriveFederatedSub(iss, sub)`, a one-way hash, so the notification fan-out falls back to the
+    // default pool, fails to find them, and skips them - a member added deliberately who then never
+    // hears anything - while host grounding can name everyone in the conversation except them. The
+    // creating path records the members present at creation; this is the same fact for a later arrival.
+    await recordMemberIdentity(conversationArn, { sub, iss, role: event.role });
+
+    // 2. Associate the channel flow BEFORE any membership, so @assistant routing runs and nothing
+    //    posted at join time bypasses the flow (best-effort).
+    //
+    //    ORDERING IS THE POINT. The assistant becomes a channel member below, and Lex can fire
+    //    WelcomeIntent from that moment; every message created before this association skips the flow
+    //    entirely. `CreateChannel` takes no channel-flow field, so immediately after creation is the
+    //    earliest possible point. Same defect and same fix as `create-conversation/index.js` and
+    //    `lib/channel-creation.ts` — this was the third of six creation paths carrying it.
     const flowArn = await getFlowArn();
     if (flowArn) {
       try {
@@ -190,6 +234,17 @@ export const handler = async (event: AddMemberEvent) => {
         }));
       } catch (err) {
         console.warn('[FederatedAddMember] associate flow failed (non-fatal):', err);
+      }
+    }
+
+    // 3. Ensure the bot is a member, then add the TARGET as a DEFAULT member (NOT a moderator).
+    for (const arn of [botArn, userArn]) {
+      try {
+        await messaging.send(new CreateChannelMembershipCommand({
+          ChannelArn: conversationArn, MemberArn: arn, Type: 'DEFAULT', ChimeBearer: botArn,
+        }));
+      } catch (err) {
+        if ((err as { name?: string }).name !== 'ConflictException') throw err;
       }
     }
 

@@ -2,6 +2,10 @@
 
 **Status:** Implemented (Layers 1-6 are live; Layer 7 mixed-trust visibility is partial).
 
+**Coverage:** `e2e/classification-context.spec.ts`, `e2e/mentions.spec.ts`, `e2e/credential-exchange.spec.ts`
+
+**Verified by:** `backend/test/cdk-synth.test.ts` asserts the SYNTHESIZED IAM policy, so a widened boundary fails the build. Layer 1 (describe 'Layer 1 - per-tier fail-closed channel-tag allow'): each tier's channel actions are ALLOWed only on `aws:ResourceTag/classification` in {its tier and below}, with no unconditioned `SendChannelMessage` reaching channel resources (untagged/higher-tier channels match no Allow and are implicitly denied). Layer 4 / §7 (describe 'Layer 4 / §7 - IAM resource boundaries (deny-by-absence...)'): each classification's S3 `context/` read EXCLUDES higher classifications; the channel-context store is router `GetItem`-only and referenced by no Cognito/Identity-Pool role; and `bedrock:ApplyGuardrail` is scoped to in-stack provisioned guardrails, never `*`.
+
 **Problem and who it's for:** A business running one assistant platform across clearance levels needs a provable guarantee that higher-classification content never leaks into a conversation a lower-clearance user can read - when a premium and a basic user share a room, the assistant can write financials, board minutes, or competitive intel into a channel the basic user can read, and context isolation controls what the assistant reads, not what it writes. The alternative is to accept that a general chatbot cannot promise this, or to build and prove your own multi-layer isolation. This is a cross-cutting foundation for the platform developer and admin/operator who must guarantee tier isolation. It layers defenses - channel tags and IAM conditions, metadata, Cognito-group tiers, S3-prefix agent scoping, Bedrock guardrails, and membership enforcement - so any one layer prevents the leak, with Layer 7 governing mixed-trust guest visibility.
 
 **Site section:** Interaction layer, Identity & Access pillar (core plane).
@@ -37,9 +41,14 @@ The solution requires **six defense layers**, any one of which should prevent th
 │ Each tier's assistant has S3 access scoped to its tier's    │
 │ prefix. It literally cannot read higher-tier context.       │
 ├─────────────────────────────────────────────────────────────┤
-│ Layer 5: Bedrock Guardrails (Content Filtering)             │
-│ Tier-specific guardrail policies block topic categories     │
-│ that exceed the conversation's classification.              │
+│ Layer 4b: Retrieval scoping (vector store)                  │
+│ Embedded content reaches the model without passing through  │
+│ Layer 4 at all. A per-classification database role + RLS,   │
+│ plus the SQL filter as depth (ADR-028). See §7a.            │
+├─────────────────────────────────────────────────────────────┤
+│ Layer 5: Bedrock Guardrails (Content Safety)                │
+│ Content, PII, and prompt-injection filtering on every turn, │
+│ selectable per profile. Cross-tier isolation is Layers 1+4. │
 ├─────────────────────────────────────────────────────────────┤
 │ Layer 6: Kinesis Stream Audit (Async Enforcement)           │
 │ Archival Lambda monitors membership events. Flags or        │
@@ -88,7 +97,7 @@ aws chime create-channel \
 
 ### IAM Policy Conditions: fail-closed ALLOW
 
-> **Two properties of this enforcement design - see `agent-classification-common.tierChannelScopedAllow`:** 1. **Condition key is the GLOBAL `aws:ResourceTag/classification`, NOT `chime:ResourceTag`.** Amazon Chime exposes **no service-specific condition keys**, so `chime:ResourceTag/...` never exists in the request context and any condition on it silently no-ops (a basic member could still send into a premium channel). The global `aws:ResourceTag` IS populated for the tag-aware channel actions. 2. **Channel-message actions authorize against TWO resources** - the **channel** AND the caller's **bearer identity** (`.../user/<id>` or `.../bot/<id>`). The `classification` tag only exists on the channel, so the boundary is the *channel-resource* grant; the *bearer-resource* grant must be unconditioned (Amazon Chime SDK restricts the bearer to the caller's own identity, so it widens nothing).
+> **Two properties of this enforcement design - see `agent-classification-common.classificationChannelScopedAllow`:** 1. **Condition key is the GLOBAL `aws:ResourceTag/classification`, NOT `chime:ResourceTag`.** Amazon Chime exposes **no service-specific condition keys**, so `chime:ResourceTag/...` never exists in the request context and any condition on it silently no-ops (a basic member could still send into a premium channel). The global `aws:ResourceTag` IS populated for the tag-aware channel actions. 2. **Channel-message actions authorize against TWO resources** - the **channel** AND the caller's **bearer identity** (`.../user/<id>` or `.../bot/<id>`). The `classification` tag only exists on the channel, so the boundary is the *channel-resource* grant; the *bearer-resource* grant must be unconditioned (Amazon Chime SDK restricts the bearer to the caller's own identity, so it widens nothing).
 
 We use **ALLOW**, not Deny, because **allow fails CLOSED**: a tier identity is granted the channel action ONLY when the channel's `classification` ∈ {its tier and below}; an **untagged** or higher-tier channel matches no grant → implicit deny. (A deny-on-higher fails OPEN on untagged/legacy channels - a real hole.)
 
@@ -127,7 +136,7 @@ Channels are tagged at creation (`create-conversation`, `lib/channel-creation`, 
 
 ### CDK Implementation
 
-The boundary is defined once in `agent-classification-common.tierChannelScopedAllow(tier, appInstanceArn, actions?)` and attached to the **credential-exchange rung roles** (`grantPinnedExchangePermissions` in `cognito-auth-stack.ts`, bearer-pinned to the caller's own `.../user/${aws:PrincipalTag/sub}`) and the **per-tier assistant roles** (`*-classification-stack.ts`). It is not on the per-tier Cognito Identity-Pool user roles: those are intentionally empty (`makeTierRole`), because the frontend reaches Amazon Chime SDK only through the exchange (there is no Identity-Pool Amazon Chime SDK fallback). See `docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md` §8 (row 2). `tierChannelScopedAllow` is the sole enforced boundary; the former inert `iam-policies-stack.ts` per-tier managed policies have been removed.
+The boundary is defined once in `classificationChannelScopedAllow(classification, appInstanceArn, actions?)` (`backend/lib/stacks/agent-classification-common.ts`) and attached to the **credential-exchange rung roles** (`grantPinnedExchangePermissions` in `backend/lib/stacks/cognito-auth-stack.ts`, bearer-pinned to the caller's own `.../user/${aws:PrincipalTag/sub}`) and the **per-classification assistant roles** (`*-classification-stack.ts`). It is not on the per-classification Cognito Identity-Pool user roles: those are intentionally empty (`makeClassificationRole`), because the frontend reaches Amazon Chime SDK only through the exchange (there is no Identity-Pool Amazon Chime SDK fallback). See `docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md` §8 (row 2). `classificationChannelScopedAllow` is the sole enforced boundary.
 
 ## 4a. Access Matrix (actions × roles × conversation classification)
 
@@ -219,10 +228,12 @@ async function validateMembership(channelArn: string, memberTier: string): Promi
 ```
 
 Applied in:
-- `manage-conversation.ts` → `addMember()`
-- `share-conversation/index.js` → before `CreateChannelMembership`
-- `create-conversation/index.js` → validates creator's tier >= requested classification
-- `router-agent-handler.ts` → resolves the served classification from the channel's immutable `classification` tag (never the mutable `modelTier` metadata) before routing
+- `backend/lambda/share-conversation/index.js` → reads the immutable `classification` tag before `CreateChannelMembership` and fails closed to `basic` when the tag is missing or invalid
+- `backend/lambda/create-conversation/index.js` → validates creator's tier >= requested classification
+- `backend/lambda/src/federated-add-member.ts` → a federated add is confined by construction: the channel is created at the deployment's own `ASSISTANT_CLASSIFICATION` and membership never crosses it
+- `backend/lambda/src/router-agent-handler.ts` → resolves the served classification from the channel's immutable `classification` tag (never the mutable `modelTier` metadata) before routing
+
+The membership-adding paths are enumerated and frozen by `backend/test/single-entry-point.test.ts`: a new one fails CI until it is registered there with the reason it cannot reuse `backend/lambda/src/lib/channel-creation.ts`. That guard is what keeps this list from drifting out of date again.
 
 ## 6. Layer 3: User Tier from Cognito Groups
 
@@ -239,6 +250,10 @@ The router, share, and create-conversation Lambdas call `AdminListGroupsForUser`
 ## 7. Layer 4: Agent IAM (S3 Prefix Scoping)
 
 Each tier's assistant role has S3 access scoped to its tier's prefix. The assistant literally cannot read higher-tier context files.
+
+### Server-only Channel Context store (private host grounding)
+
+A conversation's private host grounding - the participant profile, domain context, extra context blobs, and resolved display name - lives in a dedicated DynamoDB table (`ChannelContextTable`, `foundations-stack.ts`) keyed by `channelArn`, deliberately OUT of the member-readable Amazon Chime SDK channel Metadata (which any member reads via `DescribeChannel`). Only the conversation-create Lambdas write it, and only the router/assistant handler reads it, scoped to `dynamodb:GetItem` (`assistant-profile-stack.ts`); no channel member, Cognito, or Identity-Pool principal is granted any access. Code: `channel-context-client.ts`. The member-readable routing bits (topic, language, segment) and the participant roster stay in channel Metadata; the sensitive grounding does not.
 
 The live enforcement is `ContextS3Read` on each profile stack's processor role (the shared `assistant-async-processor.ts`, deployed once per profile stack), with the allowed prefixes generated from config (`classificationsAllowedFor`, which delegates to `ProfileRegistry.scopeAtOrBelow`). It scopes `s3:GetObject` and `s3:ListBucket` to that tier's prefixes: basic reads `context/basic/*`; standard reads `context/basic/*` and `context/standard/*`; premium reads all of `context/*`. Premium knowledge-base context is denied to basic and standard by the absence of the prefix grant, not by an explicit Deny. The per-tier policies below illustrate the shape.
 
@@ -284,17 +299,38 @@ const classification = JSON.parse(channel.Metadata || '{}').classification || 'b
 const contextFiles = await listS3Objects(`context/${classification}/`);
 ```
 
-## 8. Layer 5: Bedrock Guardrails (Tier-Specific)
+## 7a. Layer 4b: Retrieval scoping (the vector store)
 
-A guardrail is in place on the assistants. Rather than one guardrail for all tiers, the model is per-tier guardrails that deny topic categories above the tier's classification. The per-tier topic-denial policy below is the tuning surface: each tier denies the categories above its classification.
+**Status: the privilege is built and VERIFIED against a deployment (2026-08-12).** ADR-028 is implemented - a database role per classification, row-level security over both vector tables, and every reader and writer assuming a role for the statement. The `verifyClassificationBoundary` data-plane op passes seven of seven against the live cluster, including the defeat test issued with the classification filter deleted and the defeat test issued with no role assumed at all. A live `retrieve` returns content at the same time, so the boundary is not passing by matching nothing. One implementation note that is load-bearing rather than incidental: the runtime connects as a dedicated non-owning database user, because as the table owner it was exempt from its own policies for reasons the catalog did not account for.
 
-### Guardrail Policies
+Layer 4 bounds what the assistant can **fetch from S3**. Retrieval reaches the model by a different route and never touches that boundary: the router pre-fetches semantically relevant chunks from Aurora pgvector before dispatch, and passes them in on the payload. So a document embedded into the vector store is grounding that Layer 4 does not gate.
 
-| Tier | Denied Topics |
-|------|--------------|
-| Basic | Financial data, employee directory, roadmap details, customer accounts, competitive intel, board matters |
-| Standard | Financial data, customer contract terms, board matters, competitive win rates |
-| Premium | (no additional denials - full access) |
+What holds today:
+
+- **Document retrieval** (`document-retrieval.ts`) appends `AND metadata->>'classification' = ANY($3)`, where the scope is `profiles.scopeAtOrBelow(classification)`. It is fail-closed for untagged rows, and it refuses to run with an empty scope rather than defaulting to one.
+- **The classification of a chunk is asserted at ingest** by its S3 key (`rag/{sourceType}/{classification}/…`, `document-ingestion.ts`), defaulting to the most restrictive classification when absent. Fail-closed protects against omission; it does not protect against content written under the wrong classification.
+- **Conversation summaries** (`summary_embeddings`) now carry a classification column, and drift's two reads run as the channel's reader role. Membership scoping is unchanged and still applies: the live intersection of all human members' Chime memberships (`scoped-channels.ts`, `SearchChannels … MEMBERS INCLUDES`, no archive fallback, empty scope ⇒ suggest nothing). The two bound different things and neither subsumes the other - membership bounds *the people*, classification bounds *the channel* - so both are applied. This closes the case where two premium-cleared people talking in a basic channel let drift point from that basic channel at a premium one.
+  - The classification is resolved from the Amazon Chime SDK channel tag **outside** the VPC, because nothing that can reach Aurora can reach Chime (`natGateways: 0`, and no Chime endpoint), and lands in `channel_classification` as a projection - never an authority (ADR-012). A summary written for a channel that projection has never heard of is stamped with the **most restrictive** classification, so the failure withholds rather than leaks.
+
+**Why this is a named layer rather than a footnote to Layer 4.** Every other classification boundary in this document survives a wrongly written query, because the principal lacks the permission. Until ADR-028 this one did not: one database identity (`db-client.ts` `DB_USER`) could read every row, and the protection was that the filter had been written correctly at every call site that would ever exist. A leak here looks like a normal answer.
+
+ADR-028 moves it to a database privilege - a role per classification, row-level security admitting only rows at or below it, and every caller assuming a role for the statement - keeping the existing filters as defence in depth. Two properties of that design are worth stating here because getting either wrong reproduces the original hole while appearing to fix it: the policies are `FORCE`d (Postgres exempts a table's owner otherwise, and the data-plane connects as the owner), and they discriminate on `current_user` rather than on a policy role list (Postgres matches those by role membership, which `SET ROLE` requires the caller to hold).
+
+## 8. Layer 5: Bedrock Guardrails (Content Safety)
+
+A Bedrock guardrail is applied to every assistant turn, on input and on output (`applyInputGuardrail` / `applyOutputGuardrail` in `async-processor-core.ts`). The provisioned policy is content-safety, PII, and word filtering - not topic denial.
+
+### Guardrail Policy (as provisioned)
+
+`buildGuardrailPolicy` (`lib/constructs/bedrock-guardrails.ts`) provisions:
+
+- **Content filters:** SEXUAL, VIOLENCE, HATE, INSULTS, MISCONDUCT, and PROMPT_ATTACK (the prompt-injection filter, run on input).
+- **Sensitive information:** EMAIL and PHONE are anonymized; US Social Security and credit/debit card numbers are blocked; an internal-marker regex masks any control marker that leaks into a reply.
+- **Word policy:** a blocked-word list plus the managed PROFANITY list.
+
+Guardrails are define-then-select (SPEC-CONFIGURABLE-ASSISTANTS 4.6): a deployment provisions a catalog of guardrails and each assistant profile selects one by id (the default, or a stricter variant), with the IAM grant scoped per provisioned guardrail so a profile can never point at an arbitrary resource. That catalog is the tuning surface for stricter, industry-specific filtering: a deployer that needs topic denial adds a guardrail carrying a denied-topics policy to the catalog and selects it on the lower-tier profiles. No denied-topics policy is populated by default.
+
+Cross-tier context isolation - the property that a lower-tier reader must not see higher-tier grounding - is enforced by Layers 1 (channel-tag IAM gate), 4 (S3 prefix scoping) and 4b (retrieval scoping, §7a), not by Layer 5. Layer 5 is content safety plus the tier-drift agent instructions below. The three are not equally strong, and are not the same kind of control: Layers 1 and 4 are IAM, while 4b is a database privilege plus a query filter (ADR-028), verified against the deployment on 2026-08-12.
 
 ### Agent Instructions - Tier-Drift Handling
 
@@ -321,107 +357,24 @@ The membership audit is a dedicated consumer, `backend/lambda/src/membership-aud
 
 ### Monitored Events
 
-| Event | What to check | Action on violation |
-|-------|--------------|---------------------|
-| `CREATE_CHANNEL_MEMBERSHIP` | Member tier >= channel classification | Auto-revoke membership + alert admin |
-| `UPDATE_CHANNEL_MEMBERSHIP` | Member tier still valid after change | Auto-revoke if tier dropped below classification |
-| `UPDATE_CHANNEL` | Classification tag/metadata unchanged | Revert metadata to original classification + alert admin |
-| `CREATE_CHANNEL_MESSAGE` | Sender tier >= channel classification | Flag message for review (cannot delete - already persisted) |
-| `CREATE_CHANNEL` | Creator tier >= requested classification | Flag channel for review |
+The consumer audits the two MEMBERSHIP events - the ones that can place an under-cleared member on a higher-classification channel (`AUDITED_EVENT_TYPES` in `membership-audit.ts`):
 
-### Membership Audit
+| Event | Check | Action on violation |
+|-------|-------|---------------------|
+| `CREATE_CHANNEL_MEMBERSHIP` | Member clearance >= channel classification | Alert admin; auto-revoke when enforce is on |
+| `UPDATE_CHANNEL_MEMBERSHIP` | Member clearance still valid after the change | Alert admin; auto-revoke when enforce is on |
 
-```typescript
-// In kinesis-archival.ts - add to the membership sync section
-async function auditMembershipEvent(record: MessageRecord): Promise<void> {
-  const { event_type, channel_arn, target_arn } = record;
+The same over-tier check also runs on two non-event triggers - a scheduled sweep of every channel's memberships and an on-downgrade re-evaluation of one user's memberships - so a member who becomes over-tier AFTER joining (no membership event fires) is still caught. See `docs/specs/interaction/auditing/SPEC-ACCESS-AND-CONTROLS-AUDITING.md` (the three detection triggers).
 
-  if (event_type === 'CREATE_CHANNEL_MEMBERSHIP' || event_type === 'UPDATE_CHANNEL_MEMBERSHIP') {
-    const classification = await getChannelClassification(channel_arn);
-    const memberTier = await getUserTier(target_arn);
-
-    if (profiles.rank(memberTier) < profiles.rank(classification)) {
-      console.error('SECURITY: Tier violation in membership event', {
-        event_type, channel_arn, target_arn, memberTier, classification,
-      });
-
-      // Auto-revoke: remove the member immediately
-      await messagingClient.send(new DeleteChannelMembershipCommand({
-        ChannelArn: channel_arn,
-        MemberArn: target_arn,
-        ChimeBearer: botArn,
-      }));
-
-      // Alert: send to admin notification channel
-      await sendAdminAlert(
-        `Membership violation auto-reverted: ${memberTier} user removed ` +
-        `from ${classification} conversation (${event_type})`
-      );
-
-      // Persist: record the violation in the audit table
-      await recordSecurityEvent({
-        type: 'membership_violation',
-        channelArn: channel_arn,
-        memberArn: target_arn,
-        memberTier,
-        classification,
-        action: 'auto_revoked',
-        timestamp: new Date().toISOString(),
-      });
-    }
-  }
-}
-```
-
-### Metadata Tampering Audit
-
-```typescript
-async function auditChannelUpdate(record: MessageRecord): Promise<void> {
-  if (record.event_type !== 'UPDATE_CHANNEL') return;
-
-  const currentMeta = record.metadata;
-  const channelArn = record.channel_arn;
-
-  // Get the original classification from channel tags (immutable at IAM level)
-  const channelTags = await getChannelTags(channelArn);
-  const tagClassification = channelTags?.classification;
-  const metaClassification = currentMeta?.classification;
-
-  // Detect metadata tampering: someone changed classification in metadata
-  // but tags are the source of truth
-  if (tagClassification && metaClassification && tagClassification !== metaClassification) {
-    console.error('SECURITY: Classification metadata tampered', {
-      channelArn,
-      tagClassification,
-      metaClassification,
-    });
-
-    // Revert metadata to match tags
-    await messagingClient.send(new UpdateChannelCommand({
-      ChannelArn: channelArn,
-      Metadata: JSON.stringify({
-        ...currentMeta,
-        classification: tagClassification,
-      }),
-      ChimeBearer: botArn,
-    }));
-
-    await sendAdminAlert(
-      `Classification tampering reverted on ${channelArn}: ` +
-      `metadata said ${metaClassification}, tag says ${tagClassification}`
-    );
-  }
-}
-```
+`UPDATE_CHANNEL`, `CREATE_CHANNEL`, and `CREATE_CHANNEL_MESSAGE` are NOT audited here: the classification decision keys on the IMMUTABLE `classification` tag (not mutable metadata), so metadata tampering is a no-op that needs no revert, and a message from an under-cleared sender was already prevented by Layer 1 (the sender's tag-capped credentials cannot send on the channel).
 
 ### Why This Matters
 
-The Kinesis audit catches violations regardless of how they were introduced:
-- **Backend system adds wrong member:** Reverted within seconds
-- **Direct API call bypasses application:** IAM (Layer 1) blocks most cases, but if credentials are over-provisioned, Kinesis catches it
-- **Metadata tampering:** Channel tags are the source of truth; metadata is reverted to match
-- **Message sent by wrong tier:** Cannot be unsent (already persisted), but flagged for admin review
-- **Infrastructure change breaks IAM:** Kinesis audit operates independently of IAM policies
+The membership audit catches over-tier MEMBERSHIPS regardless of how they were introduced - a backend system, a direct API call, or over-provisioned credentials that bypass Layers 1-5 - and it operates independently of IAM:
+- **Backend system or direct API adds a wrong member:** flagged (report-only) or auto-revoked (enforce), from the membership event, the scheduled sweep, or the on-downgrade re-eval.
+- **A member becomes over-tier after joining** (clearance downgraded, or the channel re-tagged down): no membership event fires, but the sweep and the on-downgrade re-eval catch it.
+- **Metadata tampering needs no audit:** the `classification` tag is the source of truth and cannot be changed by `UpdateChannel`, so a tampered `metadata.modelTier` is simply never read.
+- **Message sent by an under-cleared sender:** already prevented by Layer 1 (the sender's tag-capped credentials cannot send on the channel).
 
 ## 9a. Layer 7: Mixed-trust visibility (external guests)
 
@@ -529,12 +482,13 @@ Premium user in Standard conversation: "What's our burn rate?"
 
 Layer 4 (IAM):     Standard agent tries s3://context/premium/financial-data.json → AccessDenied
 Layer 5 (Agent):   Agent instructions say "inform user, suggest Private conversation"
-Layer 5 (Guard):   Standard guardrail denies "financial data" topic
 Result:            "Financial metrics aren't available in this conversation.
                     Create a Private conversation for full access."
 ```
 
-Three layers independently prevent the leak. Any one is sufficient.
+Layer 4 (IAM S3-prefix scope) is the hard block that prevents the leak - the standard agent's role
+cannot read the premium context prefix, so the data never reaches the model. The Layer 5 agent
+instruction shapes the graceful refusal on top of that denial; it is UX, not the control.
 
 ## 11a. Control-Marker Injection Defense
 
@@ -562,7 +516,7 @@ The assistant embeds machine-readable control markers in a message's Content so 
 | `create-conversation/index.js` | Set `classification` in metadata AND channel tag |
 | `manage-conversation.ts` | Read metadata, validate tier before `CreateChannelMembership` |
 | `share-conversation/index.js` | Read metadata, validate recipient tier |
-| `agent-classification-common.ts` / `*-classification-stack.ts` / `cognito-auth-stack.ts` | The enforced tag-gate is `tierChannelScopedAllow` (fail-closed **Allow** on the global `aws:ResourceTag/classification`) attached to the exchange rung roles + per-profile assistant roles. |
+| `agent-classification-common.ts` / `*-classification-stack.ts` / `cognito-auth-stack.ts` | The enforced tag-gate is `classificationChannelScopedAllow` (fail-closed **Allow** on the global `aws:ResourceTag/classification`) attached to the exchange rung roles + per-profile assistant roles. |
 | `cognito-auth-stack.ts` | Define per-tier Cognito groups; mirror `custom:tier` into the matching group at post-confirmation |
 | `assistant-profile-stack.ts` | Per-profile processor IAM roles with S3 prefix scoping (prefixes generated from config). Per-profile guardrails. |
 | `channel-flow-processor.ts` | Enforce mention-required responses in multi-user conversations (@assistant / @all) |

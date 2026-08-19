@@ -2,6 +2,8 @@
 
 **Status:** Implemented (reference: the live identity and access model).
 
+**Coverage:** `e2e/credential-exchange.spec.ts`, `e2e/signin.spec.ts`, `e2e/classification-context.spec.ts`
+
 **Problem and who it's for:** A business that runs assistants for users at different clearance levels needs to trust - and be able to verify - exactly who can do what and which primitive enforces each boundary, so it can reason about isolation and map its own operators in. The alternative is to trust a product's access claims without an authoritative account, or to design, document, and secure your own identity-and-IAM model. This is for the platform developer and admin/operator who need that authoritative account of who can do what and which primitive (Cognito / IAM / Amazon Chime SDK) enforces it. It documents the one user pool, the four additive groups, the three distinct "admins," and the bearer-pinned, classification-capped exchange. (Current state: authority lives on group membership and the credential exchange, not a separate admin pool or the Identity-Pool roles - a design worth understanding before reasoning about the model.)
 
 **Site section:** Interaction layer, Identity & Access pillar (core plane).
@@ -32,15 +34,15 @@
 | **Claim**               | `cognito:groups` in the JWT                             | The authoritative permission signal                             | `auth.ts` `parseGroups`/`extractClaims`/`TIER_ORDER`                                                              |
 | **App-layer AuthZ**     | API Gateway Cognito authorizer + `auth.ts` guards       | Gate admin/tier APIs on the group claim                         | `requireAdmin`/`callerIsAdmin`/`requireGroup`                                                                     |
 | **Data-plane creds**    | **Credential exchange** (STS rung roles, bearer-pinned) | The *only* way the SPA gets Amazon Chime SDK creds; caps by classification | `cognito-auth-stack.ts` `grantPinnedExchangePermissions`, `credential-exchange.ts`, `SPEC-CREDENTIAL-EXCHANGE.md` |
-| **Identity-Pool roles** | `AuthenticatedRole` + per-tier roles                    | **Empty** - principal resolution only, no Amazon Chime SDK power           | `cognito-auth-stack.ts` `makeTierRole`                                                                            |
+| **Identity-Pool roles** | `AuthenticatedRole` + per-tier roles                    | **Empty** - principal resolution only, no Amazon Chime SDK power           | `cognito-auth-stack.ts` `makeClassificationRole`                                                                            |
 | **Administration identity** | Per-human `${sub}-admin` (client-side) + service `app-instance-admin` (automation) | Cross-channel redact **and** delete                             | `credential-exchange.ts`, `SPEC-ADMIN-IDENTITY.md`, `SPEC-MODERATION.md`                                          |
-| **Channel boundary**    | IAM `aws:ResourceTag/classification` on channel actions | min(userTier, channelTier), fail-closed ALLOW                   | `agent-classification-common.tierChannelScopedAllow`                                                                        |
+| **Channel boundary**    | IAM `aws:ResourceTag/classification` on channel actions | min(userTier, channelTier), fail-closed ALLOW                   | `agent-classification-common.classificationChannelScopedAllow`                                                                        |
 
 Two facts most readers get wrong, both verified in code:
 
-1. **The per-tier Identity-Pool roles are empty.** `makeTierRole = (logicalId) => new iam.Role(this, logicalId, { assumedBy: authTrust })` - no inline or managed policies (`cognito-auth-stack.ts:342`). The comment above it is explicit: the roles "are KEPT (so the pool still resolves a principal … ) but are powerless for Amazon Chime SDK. The frontend reaches Amazon Chime SDK ONLY via the exchange." So `AdminAuthenticatedRole` being an "admin" role grants **zero** admin power.
+1. **The per-tier Identity-Pool roles are empty.** `makeClassificationRole = (logicalId) => new iam.Role(this, logicalId, { assumedBy: authTrust })` - no inline or managed policies (`cognito-auth-stack.ts:342`). The comment above it is explicit: the roles "are KEPT (so the pool still resolves a principal … ) but are powerless for Amazon Chime SDK. The frontend reaches Amazon Chime SDK ONLY via the exchange." So `AdminAuthenticatedRole` being an "admin" role grants **zero** admin power.
 
-2. **The classification boundary lives on the credential-exchange rung roles, not the Identity-Pool roles.** `grantPinnedExchangePermissions` applies `tierChannelScopedAllow(rung, …)` to the `basic`/`standard`/`premium` rungs (`cognito-auth-stack.ts:432`), each **bearer-pinned** to `…/user/${aws:PrincipalTag/sub}`. This is the same fail-closed tag-gate the specs describe, but attached to the exchange rung, not the Cognito user role.
+2. **The classification boundary lives on the credential-exchange rung roles, not the Identity-Pool roles.** `grantPinnedExchangePermissions` applies `classificationChannelScopedAllow(rung, …)` to the `basic`/`standard`/`premium` rungs (`cognito-auth-stack.ts:432`), each **bearer-pinned** to `…/user/${aws:PrincipalTag/sub}`. This is the same fail-closed tag-gate the specs describe, but attached to the exchange rung, not the Cognito user role.
 
 ---
 
@@ -58,7 +60,7 @@ They share a word and nothing else. Keep them separate or the model won't make s
 
 ### 3.2 `AdminAuthenticatedRole` - an **empty** IAM role
 - **What it is:** the Identity-Pool role mapped to the `admins` group so the pool can resolve a principal and `cognito:preferred_role` flows (`cognito-auth-stack.ts:348,355`).
-- **What it grants:** **nothing** for Amazon Chime SDK. Built by `makeTierRole` with no policies. Its existence is an artifact of the Identity-Pool role-mapping contract, **not** an authority. Do not reason about admin power from this role.
+- **What it grants:** **nothing** for Amazon Chime SDK. Built by `makeClassificationRole` with no policies. Its existence is an artifact of the Identity-Pool role-mapping contract, **not** an authority. Do not reason about admin power from this role.
 
 ### 3.3 Amazon Chime SDK `app-instance-admin` - service AND per-human identities
 
@@ -153,7 +155,7 @@ Reading the two admin columns together is the whole model: an **admin (group)** 
 
 **How a user reads context depends on the use case.** In *this* deployment, users have no direct `s3:GetObject` on `context/*` (the Identity-Pool roles are empty; the exchange rungs grant only Amazon Chime SDK message actions), so a user's access to knowledge is mediated by (a) *which tier assistant* sits in their channel - `min(userTier, channelTier)` - and (b) *what that assistant is allowed to read*. So here, "what can a Basic user learn from the assistant" is answered by the **Basic assistant's row**, not the Basic user's.
 
-> **This is not the only shape - it is one of several the substrate supports.** The `context/{tier}/` store is a **role-tiered knowledge source**, and the same prefix structure is meant to be pointed at whatever the deployment's knowledge *is*. In many use cases that source is content users **also** read directly, by the **same role**: a wiki, a docs site, or **published posts**. A sibling reference deployment wires exactly this - a context-sync function syncs published blog-post summaries into the same tiered prefixes (`…/blog-posts-public.json` for the public/guest role, `…/blog-posts.json` for the authenticated role, an admin variant for everything), so the **assistant** reads the posts from S3 while **users** read the very same posts through the app - each gated by role. There, context is a *shared, role-gated* store, not an assistant-only one. AgentEchelon-Public ships a **seeded placeholder** (`context/{tier}/*.json` sample company context) with that structure in place, ready to be pointed at a real published-content / wiki source. The invariant that holds across all shapes is the **role/tier gate** (`context/{tier}/`), not "who" reads it - assistant, user, or both, according to role.
+> **This is not the only shape - it is one of several the substrate supports.** The `context/{classification}/` store is a **role-tiered knowledge source**, and the same prefix structure is meant to be pointed at whatever the deployment's knowledge *is*. In many use cases that source is content users **also** read directly, by the **same role**: a wiki, a docs site, or **published posts**. A sibling reference deployment wires exactly this - a context-sync function syncs published blog-post summaries into the same tiered prefixes (`…/blog-posts-public.json` for the public/guest role, `…/blog-posts.json` for the authenticated role, an admin variant for everything), so the **assistant** reads the posts from S3 while **users** read the very same posts through the app - each gated by role. There, context is a *shared, role-gated* store, not an assistant-only one. AgentEchelon-Public ships a **seeded placeholder** (`context/{classification}/*.json` sample company context) with that structure in place, ready to be pointed at a real published-content / wiki source. The invariant that holds across all shapes is the **role/tier gate** (`context/{classification}/`), not "who" reads it - assistant, user, or both, according to role.
 
 ### Table B - Assistant capabilities & context access
 
@@ -161,7 +163,7 @@ Per-tier assistant (the async-processor / handler role, acting as the tier's **b
 
 | Capability / resource | Basic asst | Standard asst | Premium asst | Enforced by |
 |---|:--:|:--:|:--:|---|
-| Send/read on channels **≤ its tier** (bot bearer, tag-gated) | basic | basic, standard | basic, standard, premium | `tierChannelScopedAllow` on the tier role (`agent-classification-common.ts:115`); bearer pinned to `/bot/*` |
+| Send/read on channels **≤ its tier** (bot bearer, tag-gated) | basic | basic, standard | basic, standard, premium | `classificationChannelScopedAllow` on the tier role (`agent-classification-common.ts:115`); bearer pinned to `/bot/*` |
 | **Redact** messages in its own channels (moderator) | ✅ | ✅ | ✅ | Amazon Chime SDK moderator (bot is channel creator) + `RedactChannelMessage` in tier role |
 | **Delete** a message | - | - | - | `DeleteChannelMessage` is AppInstanceAdmin-only; assistants are not admins |
 | Create channel / add members / set moderator | ✅ | ✅ | ✅ | tier role grant on `appInstance/*` (`agent-classification-common.ts:395-401`) |

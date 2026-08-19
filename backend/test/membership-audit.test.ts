@@ -20,6 +20,10 @@ let memberGroups: string[] = ['basic'];
 let channelModelTier = 'premium';
 let enforceConfig: string | undefined; // undefined => no config item => fall back to env default
 const ddbSends: Array<{ _cmd: string; input: unknown }> = [];
+// Sweep (#2) + reeval-user (#3) enumeration fixtures.
+let sweepChannels: string[] = [];   // channels ListChannels returns
+let channelMembers: string[] = [];  // member ARNs ListChannelMemberships returns (per channel)
+let userChannels: string[] = [];    // channel ARNs ListChannelMembershipsForAppInstanceUser returns
 
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => {
   class DescribeChannelCommand { _t = 'describe'; constructor(public input: unknown) {} }
@@ -29,12 +33,18 @@ jest.mock('@aws-sdk/client-chime-sdk-messaging', () => {
   // tag (ListTagsForResource), NOT mutable `metadata.modelTier` — see
   // membership-audit.ts resolveChannelClassification(). So the mock must serve the tag.
   class ListTagsForResourceCommand { _t = 'listtags'; constructor(public input: unknown) {} }
+  class ListChannelsCommand { _t = 'listchannels'; constructor(public input: unknown) {} }
+  class ListChannelMembershipsCommand { _t = 'listmemberships'; constructor(public input: unknown) {} }
+  class ListChannelMembershipsForAppInstanceUserCommand { _t = 'listuserchannels'; constructor(public input: unknown) {} }
   return {
     ChimeSDKMessagingClient: jest.fn(() => ({
       send: async (cmd: { _t: string; input: unknown }) => {
         chimeSends.push(cmd);
         if (cmd._t === 'listtags') return { Tags: [{ Key: 'classification', Value: channelModelTier }] };
         if (cmd._t === 'describe') return { Channel: { Metadata: JSON.stringify({ modelTier: channelModelTier }) } };
+        if (cmd._t === 'listchannels') return { Channels: sweepChannels.map((a) => ({ ChannelArn: a })) };
+        if (cmd._t === 'listmemberships') return { ChannelMemberships: channelMembers.map((a) => ({ Member: { Arn: a } })) };
+        if (cmd._t === 'listuserchannels') return { ChannelMemberships: userChannels.map((a) => ({ ChannelSummary: { ChannelArn: a } })) };
         return {};
       },
     })),
@@ -42,6 +52,9 @@ jest.mock('@aws-sdk/client-chime-sdk-messaging', () => {
     DeleteChannelMembershipCommand,
     SendChannelMessageCommand,
     ListTagsForResourceCommand,
+    ListChannelsCommand,
+    ListChannelMembershipsCommand,
+    ListChannelMembershipsForAppInstanceUserCommand,
   };
 });
 
@@ -115,6 +128,9 @@ beforeEach(() => {
   memberGroups = ['basic'];
   channelModelTier = 'premium';
   enforceConfig = undefined;
+  sweepChannels = [];
+  channelMembers = [];
+  userChannels = [];
   mockFanOut.mockClear();
 });
 
@@ -240,6 +256,55 @@ describe('runtime enforce toggle + findings', () => {
   });
 });
 
+describe('trigger #2 - scheduled sweep', () => {
+  it('sweeps every channel + member and flags an over-tier member the event stream missed', async () => {
+    // A basic member sits on a premium channel with NO membership event (e.g. a post-join downgrade).
+    sweepChannels = [`${APP}/channel/room-1`];
+    channelMembers = [`${APP}/user/basic-sub`];
+    channelModelTier = 'premium';
+    memberGroups = ['basic'];
+
+    await audit.handler({ type: 'sweep' });
+
+    const kinds = chimeSends.map((c) => c._t);
+    expect(kinds).toContain('listchannels');   // enumerated channels
+    expect(kinds).toContain('listmemberships'); // enumerated the channel's members
+    expect(kinds).toContain('listtags');        // resolved classification from the immutable tag
+    expect(kinds).toContain('send');            // flagged the over-tier member
+  });
+
+  it('a sweep of a compliant channel flags nothing', async () => {
+    sweepChannels = [`${APP}/channel/room-1`];
+    channelMembers = [`${APP}/user/premium-sub`];
+    channelModelTier = 'premium';
+    memberGroups = ['premium'];
+
+    await audit.handler({ type: 'sweep' });
+    expect(chimeSends.map((c) => c._t)).not.toContain('send');
+  });
+});
+
+describe('trigger #3 - on-downgrade user re-eval', () => {
+  it('re-evaluates a downgraded user\'s existing memberships and flags the now-over-tier one', async () => {
+    // The marquee case: a user downgraded to basic still sits on a premium channel. No Chime membership
+    // event fired (a Cognito group change is invisible to the stream), so only this targeted re-eval catches it.
+    userChannels = [`${APP}/channel/premium-room`];
+    channelModelTier = 'premium';
+    memberGroups = ['basic'];
+
+    await audit.handler({ type: 'reeval-user', userArn: `${APP}/user/basic-sub` });
+
+    const kinds = chimeSends.map((c) => c._t);
+    expect(kinds).toContain('listuserchannels'); // listed the user's channels
+    expect(kinds).toContain('send');             // flagged the over-tier membership
+  });
+
+  it('an unrecognized control event is a no-op (no Chime calls)', async () => {
+    await audit.handler({ type: 'reeval-user' } as never); // missing userArn
+    expect(chimeSends.map((c) => c._t)).not.toContain('send');
+  });
+});
+
 describe('handler (enforce mode)', () => {
   it('revokes a basic member on a premium channel when MEMBERSHIP_AUDIT_ENFORCE=true', async () => {
     await jest.isolateModulesAsync(async () => {
@@ -264,3 +329,12 @@ describe('handler (enforce mode)', () => {
     });
   });
 });
+
+// This file declares its jest mocks at top level and imports the module under test lazily
+// inside each case, so it has no top-level import/export of its own. Without one TypeScript treats
+// it as a global SCRIPT rather than a module: its top-level `const`s then share one global scope
+// with every other such test file, they collide (TS2451), and symbols resolve against whichever
+// file won - which is how `abuse-controls.test.ts` came to be typechecked against
+// `user-profile-client`. `npm run typecheck` was red with 52 errors for that reason alone, and
+// these files were effectively unchecked. This marks the file as a module. Do not remove.
+export {};
