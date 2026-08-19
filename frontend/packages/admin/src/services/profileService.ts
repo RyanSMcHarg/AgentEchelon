@@ -2,7 +2,7 @@ import { apiCall, ADMIN_IAM_ENFORCEMENT } from '@ae/shared';
 import { identityPoolCredentials, sigv4GetJson, sigv4PostJson } from './sigv4Fetch';
 
 /**
- * Assistant-profile lifecycle service (SPEC-PORTABLE-VERSIONED-PROFILES P1/P3) — the admin console's
+ * Assistant-profile lifecycle service (SPEC-PORTABLE-PROFILES P1/P3) — the admin console's
  * client for the manage-profiles API. Under A14 `adminIamEnforcement` the routes are AWS_IAM (SigV4),
  * so requests are signed with the operator's sign-on Identity-Pool creds (the gateway denies a role
  * without `execute-api:Invoke` on the profile resource); with enforcement off they fall back to the

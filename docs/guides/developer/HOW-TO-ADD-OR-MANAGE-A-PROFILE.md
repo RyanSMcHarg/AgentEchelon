@@ -44,6 +44,40 @@ Ownership: a profile team owns its thin `*-classification-stack.ts` descriptor. 
 
 ---
 
+## How an assistant hears a channel
+
+Three layers must all be in place before an assistant can take a turn. Getting one wrong produces
+silence rather than an error, which is why they are listed together. What happens to a message *after*
+it is routed is [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md).
+
+| Layer | What it is | Why it exists |
+|---|---|---|
+| **1. Lex bot** | A Lex V2 bot with two intents - `WelcomeIntent` (fires when the bot joins) and `FallbackIntent` (the catch-all that carries every real user turn) - both with a **fulfillment code hook** pointing at that classification's handler Lambda | Lex is the **entry trigger + session**. AgentEchelon does not use Lex for NLU beyond "something was said"; request classification happens downstream in the handler. Lex provides the managed Amazon Chime SDK to Lambda bridge and the per-turn session. |
+| **2. `AppInstanceBot` `InvokedBy`** | `StandardMessages: AUTO \| NONE` and `TargetedMessages: ALL` | The **routing policy**: which messages Amazon Chime SDK forwards to Lex. It is the single switch between "answer everything in this room" and "answer only when addressed". |
+| **3. Channel membership** | The bot is added to the channel (`CreateChannelMembership`) as the classification-matched bot | A bot only receives messages for channels it belongs to. **Order matters:** set `InvokedBy` *before* the bot joins, or Amazon Chime SDK may not route standard messages for that channel until the membership is re-created. |
+
+**One bot per classification.** Each runs its own Lex bot, model, guardrail and `context/{classification}/`
+scope. Channel creation binds the classification-matched bot (`create-conversation`), so which assistant
+is in a room is fixed to the room's `classification`.
+
+**The `InvokedBy` switch is what makes one substrate serve several use cases:**
+
+| Use case | `StandardMessages` | Effect |
+|---|---|---|
+| Private AI assistant (1:1) | `AUTO` | The assistant answers every turn |
+| Shared team room | `AUTO` + `@<assistant>` mentions | The assistant answers only when addressed; humans talk freely |
+| Announcement or comment thread (read-mostly) | `NONE` | The assistant stays silent unless explicitly mentioned (`TargetedMessages: ALL` still routes a mention) |
+
+Nothing else changes between these: the channel flow, the handler, the async processor and every
+enforcement layer are identical.
+
+**`AUTO` counts OTHER NON-HIDDEN MEMBERS, and bots count.** The rule is one other member versus more than
+one, from this bot's perspective, so **adding a second bot to a 1:1 flips the first bot from answering
+everything to answering only mentions**, silently. A hidden membership does not avoid it, because a
+hidden member cannot send messages and an assistant has to.
+
+---
+
 ## 1. Adding a new profile
 
 Use case: a deployer wants a fourth profile (say `enterprise`) with its own model selection, retrieval scope, guardrail, and Lex bot.
@@ -74,20 +108,20 @@ groupClearance: { basic: 'basic', standard: 'standard', premium: 'premium', ente
 Pick the profile's default model. `backend/lib/config/model-strategy.ts`:
 
 ```ts
-export interface TierModelSelection {
+export interface ProfileModelSelection {
   basic: BackendModelKey;
   standard: BackendModelKey;
   premium: BackendModelKey;
   enterprise: BackendModelKey;      // ← add
 }
 
-export const DEFAULT_TIER_MODEL_SELECTION: TierModelSelection = {
+export const DEFAULT_TIER_MODEL_SELECTION: ProfileModelSelection = {
   basic: 'haiku', standard: 'sonnet', premium: 'opus',
   enterprise: 'opus',               // ← add
 };
 ```
 
-For every model in `getModelCatalog`, decide whether `enterprise` is in its `allowedTiers`. By default it is a strict superset of premium. Also add `enterprise` to the `Tier` union in `agent-classification-common.ts` and the `ModelTier` union in `model-strategy.ts`.
+For every model in `getModelCatalog`, decide whether `enterprise` is in its `allowedClassifications`. By default it is a strict superset of premium. Also add `enterprise` to the `Tier` union in `agent-classification-common.ts` and the `ModelTier` union in `model-strategy.ts`.
 
 ### 1.3 Add the ProfileTopology descriptor + thin stack
 
@@ -168,23 +202,93 @@ aws ssm get-parameter --name /agent-echelon/assistant/enterprise/processor-arn \
 
 ---
 
+## 1.8 What a profile is made of, and which parts travel
+
+A profile is not one object. It is a **compiled seed**, a **versioned definition**, and the
+**infrastructure the definition selects among** - and the split between them is the whole security
+model. Behaviour is data and can be edited at runtime; the boundary is infrastructure and can only be
+changed by a deploy.
+
+| Component | Where it lives | Who writes it | Travels in an export? |
+|---|---|---|---|
+| Profile seed (`name`, `contextScope`) | Compiled into the stack from `lib/config/profiles.ts` | Deploy | No - the target's own seed applies |
+| Versioned definition (models, limits, `taskSupport`, `battleEligible`, guardrail selection, machines, plus a pointer to the persona) | SSM parameter `/<instance>/assistant/<profile>/definition`, one native SSM version per profile version | `manage-profiles` API at runtime | Yes - this IS the manifest body |
+| `active` pointer | The `active` **label** on that SSM parameter | Activate / rollback | No - an import always lands as a draft |
+| Draft in progress | SSM parameter `.../definition` draft slot | Create/edit draft | No |
+| **Persona body** | S3, at `profiles/<profile>/<configId>/persona` in the attachments bucket; the definition holds a `personaRef` | `manage-profiles` (the only sanctioned writer), on draft save and activate | Yes - export **inlines** the body and import writes it into the target's own bucket. A pointer would name this instance's storage |
+| Doc-set corpus | S3, under the classification's context prefix | Deploy or admin upload | The reference travels; the corpus does not |
+| Guardrail | A Bedrock guardrail provisioned by the deploy; the definition names a **catalog selection key** (`strict`), never a resolved id | Deploy provisions, definition selects | The KEY travels; the target resolves it to its own guardrail id |
+| Model | A Bedrock model in the deployment's catalog, allow-listed in the handler role | Deploy provisions, definition selects | The key travels; import REJECTS a model the target does not provision |
+| Context sources | Keys published in the classification's context-source catalog | Deploy publishes, definition selects | The key travels; import rejects an unpublished key |
+| **Handler IAM role** | The per-classification stack (`AgentHandlerRole`) | **Deploy only** | **Never** |
+| Task machines (`machines`) | Inside the versioned definition | `manage-profiles` API | Yes |
+
+### Why the IAM role is not part of the profile
+
+The role is what makes the rest safe to edit at runtime. It grants `bedrock:InvokeModel` on the
+allow-listed models, `ssm:GetParameter` on that profile's own parameters, and S3 reads scoped to the
+classification's prefix - and a profile version cannot alter any of it. So the worst an activated
+version can do is select a different option the deployment already provisioned and already permitted.
+
+That is why an export carries a guardrail's *selection key* rather than the id this instance resolved
+it to: a resolved id names nothing on any other account, so a manifest carrying one could not be
+imported anywhere. It is also why import is fail-closed - a manifest naming a model, guardrail, or
+context key the target does not provision is rejected with the valid keys named, rather than landing
+a definition that would fail at the first turn.
+
+### How the pieces resolve at a turn
+
+1. The handler reads `/<instance>/assistant/<profile>/definition:active` (label, not version number).
+2. Missing or unparseable, it serves the **compiled seed** - fail-closed, never a partial definition.
+3. Boundary fields (`name`, `contextScope`) always come from the seed, whatever the version says.
+4. Everything else - persona, model, limits, guardrail selection, machines - comes from the version. The
+   persona is fetched from S3 via the version's `personaRef` (cached per warm container with the rest of
+   the resolution) unless the version carries it inline, which is the shape written before the pointer
+   existed. A version with no persona at all falls back to the per-deployment seam in 2.2.
+5. The role decides whether the selected model, guardrail, and prefix are actually reachable.
+
+The practical consequence: **a profile version is portable because it contains only selections.** Move
+it to another instance and it re-resolves against that instance's catalog, guardrails, and role. Move
+infrastructure and you have moved nothing a version can see.
+
+---
+
 ## 2. Managing an existing profile's assistant
 
 The profile team owns its thin descriptor file. The most common changes:
 
+### 2.0 How a version becomes live, and when
+
+A profile is a set of immutable versions plus one `active` pointer. Nothing edits a live version in place, and nothing activates itself.
+
+The sequence:
+
+1. **Create a draft** (`Assistants > Profiles`, or `POST /profiles/version`). The draft starts as a copy of the active version.
+2. **Edit the draft**, then **validate** it. Validation checks the schema, the model/ARN boundary, the published context-source catalog, and the SSM size limit.
+3. **Activate.** A new immutable version is written and the `active` pointer moves onto it. Activation re-runs validation itself, because a caller can skip the validate step. **No deploy, no restart.**
+4. **Rollback** moves the `active` pointer onto an existing version. It writes no new content, so rolling back is as cheap as activating and the version you left is still there.
+
+**Importing never activates.** A manifest lands as a *draft*, always, so bringing a profile in from another instance cannot change what serves traffic. Promotion stays a human step.
+
+**Timing.** The `active` pointer is resolved per turn and cached per warm handler, so an activation - or a rollback - converges **within about 30 seconds**. It applies to the next TURN, not the next conversation: an existing conversation picks up the new persona, model, or limits mid-thread, with no reconnect and no interruption to a reply already in flight. Backing out a bad activation has the same ~30-second tail.
+
+**What activation can and cannot change.** Only the runtime-editable subset moves with a version. Boundary fields - the profile's `name` and `contextScope` - always come from the compiled seed, and resolution is fail-closed: if a version cannot be read or parsed, the handler serves the pure seed rather than a partial definition. So a version can change how an assistant behaves, but it cannot widen what it is allowed to reach.
+
+**Interaction with experiments.** While an A/B experiment is live for a classification, it takes precedence over the active profile for the model it governs. When that experiment ends, traffic falls back to whatever version is active *then* - see [A/B testing and battles](../admin/GUIDE-AB-TESTING-AND-BATTLES.md#when-a-change-takes-effect), which covers the experiment side and its separate ~60-second convergence.
+
 ### 2.1 Change the model
 
-The default model comes from `tierModelSelection` in `bin/backend.ts`; the model itself is defined in `model-strategy.ts` (catalog) and gated by `allowedTiers`.
+The default model comes from `profileModelSelection` in `bin/backend.ts`; the model itself is defined in `model-strategy.ts` (catalog) and gated by `allowedClassifications`.
 
 ```ts
 // bin/backend.ts
-const tierModelSelection: TierModelSelection = {
+const profileModelSelection: ProfileModelSelection = {
   ...DEFAULT_TIER_MODEL_SELECTION,
   premium: 'sonnet',                  // ← override
 };
 ```
 
-If the new model is not in the catalog, add it to `getModelCatalog` with the correct ARNs and `allowedTiers`. The processor role's `BedrockPolicy` derives its allowed ARNs from `modelArnsForTier`, so there is no manual IAM update.
+If the new model is not in the catalog, add it to `getModelCatalog` with the correct ARNs and `allowedClassifications`. The processor role's `BedrockPolicy` derives its allowed ARNs from `modelArnsForClassification`, so there is no manual IAM update.
 
 To intent-route within a profile (cheap model for greetings, expensive for analysis), edit `INTENT_ROUTE_STRATEGY` in `model-strategy.ts`. The min-cap clamp, `min(callerClearance, channelClassification)`, is resolved through `ProfileRegistry` in `router-agent-handler.ts`, so a mismatched route is downgraded before dispatch; `model-resolver.ts` then enforces only the per-profile floor.
 
@@ -192,7 +296,13 @@ To intent-route within a profile (cheap model for greetings, expensive for analy
 
 The per-turn prompt is assembled inside `assistant-async-processor.ts` (which calls the shared `async-processor-core.ts`). Each turn it composes, in order:
 
-1. **Base persona**: what the assistant is for this deployment (`resolveBaseSystemPrompt()`; see "Per-deployment persona" below), defaulting to the profile's built-in persona keyed by `PROFILE_NAME`.
+1. **Base persona**, resolved from the first of these that has one:
+   1. the **active profile version's** persona - the no-deploy path, edited in the admin Profiles tab or
+      through `manage-profiles`, stored in S3 and reached by the definition's `personaRef` (§1's table).
+      This is the one to change if you want a persona you can version, roll back, and export;
+   2. the **per-deployment** persona parameter (`resolveBaseSystemPrompt()`; see "Per-deployment persona"
+      below), which is the deploy-time seam and the fallback when a version carries no persona;
+   3. the profile's **built-in** persona keyed by `PROFILE_NAME`, compiled into the code.
 2. **Host context sections**: registered resolvers (domain context, user profile) via the registry + composer.
 3. **Dynamic sections**: S3 knowledge, task state, RAG hints, anti-repeat, appended by the pipeline.
 4. **Persona addendum / battle constraints**: from the bound /battle variant, appended last.
@@ -215,7 +325,7 @@ The persona param exists for `systemPromptParam` profiles; the intent pack for `
 
 Every turn's analytics is stamped with a `configId` = hash(persona + intent-pack + base system prompt) so quality is sliceable by config, not just by model (`lib/config-identity.ts`). The stamped fields are short hashes, never the config text.
 
-To change a profile's built-in persona in code (the fallback default, used when no SSM persona is set), edit the profile's entry in `DEFAULT_PROMPTS` in `assistant-async-processor.ts`.
+To change a profile's built-in persona in code - the last fallback, used only when neither the active version nor the per-deployment parameter supplies one - edit the profile's entry in `DEFAULT_PROMPTS` in `assistant-async-processor.ts`.
 
 ### 2.3 Change the guardrail
 

@@ -125,6 +125,66 @@ export const DEFAULT_INTENT_PACK: IntentPack = {
       delivery: 'PLACEHOLDER_UPDATE',
     },
     {
+      // Code generation is its own intent, not a flavour of report_generation. It has a dedicated
+      // RouteKey in the model strategy (and the admin Experiments tab offers it), which is only
+      // reachable if the classifier can actually emit it — `IntentDef.key` doubles as the
+      // INTENT_ROUTE_STRATEGY key. Without this entry a deployment could pin a code-specialist
+      // model and never have it selected.
+      //
+      // Declared BEFORE report_generation for the same reason image_generation is: "generate a
+      // TypeScript function" contains report_generation's very broad 'generate', and
+      // classifyByPackKeywords returns the FIRST-listed match.
+      //
+      // delivery PLACEHOLDER_UPDATE, deliberately not TASK_MULTI_STEP: a code request has a direct
+      // answer, and deferring it behind a tracked task is the ADR-018 failure mode (the user waits
+      // on a task for something the assistant could simply have written).
+      key: 'code_generation',
+      description:
+        'User wants the assistant to WRITE or MODIFY code — a function, class, script, query, ' +
+        'configuration, or test — in a programming language (e.g. "write a function that reverses a ' +
+        'string", "implement a retry wrapper", "refactor this to use async/await"). Diagnosing a ' +
+        'failure or an error message is guided_troubleshooting, not code_generation.',
+      // Deliberately few. The classifier is the LLM — it reads `description`; these run only when
+      // the LLM classifier is unavailable or a profile opts into keyword mode. A long keyword list
+      // buys nothing on the shipped path and costs real bytes against the SSM Standard-tier
+      // parameter limit (4096 chars) that the seeded per-deployment packs live inside.
+      keywords: ['write a function', 'write code', 'implement a', 'unit test', 'refactor this'],
+      delivery: 'PLACEHOLDER_UPDATE',
+    },
+    {
+      // The review counterpart. Separate from code_generation because the useful model for critique
+      // is not always the useful model for authoring, which is exactly what a per-intent route is
+      // for. Also declared before report_generation ('review' co-occurs with 'summary'/'analysis').
+      key: 'code_review',
+      description:
+        'User wants the assistant to REVIEW, critique, or assess existing code they have supplied — ' +
+        'correctness, style, security, or performance (e.g. "review this pull request", "is this ' +
+        'function correct?", "what is wrong with this code?"). Writing new code is code_generation; ' +
+        'diagnosing a runtime failure is guided_troubleshooting.',
+      keywords: ['code review', 'review this code', 'review my code', 'critique this code'],
+      delivery: 'PLACEHOLDER_UPDATE',
+    },
+    {
+      // The last RouteKey without an intent. Like the code intents, `strategic_analysis` is a route
+      // in the model strategy and a selectable option in the admin Experiments tab, so leaving it
+      // unclassifiable made it dead config.
+      //
+      // KEYWORDS ARE DELIBERATELY NARROW. report_generation already owns the bare word 'analysis',
+      // and the existing suite sends "Analyze the pros and cons of microservices vs monolithic" -
+      // which is a report_generation TASK_MULTI_STEP turn today. Claiming generic analysis phrasing
+      // here would silently re-route those turns to a different delivery class, changing behaviour
+      // for every deployment that never asked for it. These keywords name STRATEGY work
+      // specifically; broadening them is a deliberate product decision, not a naming tidy-up.
+      key: 'strategic_analysis',
+      description:
+        'User wants strategic or business judgement — a competitive or market assessment, a business ' +
+        'case, a go-to-market or roadmap decision, a build-vs-buy call (e.g. "what is our competitive ' +
+        'position", "make the business case for X"). A factual write-up or formatted document is ' +
+        'report_generation; a technical comparison is general.',
+      keywords: ['strategic', 'competitive analysis', 'business case', 'go-to-market'],
+      delivery: 'PLACEHOLDER_UPDATE',
+    },
+    {
       key: 'report_generation',
       description:
         'User wants to create a report, summary, analysis document, dashboard data, or formatted output',
@@ -269,8 +329,11 @@ function coerceMachinesConfig(raw: unknown): Record<string, TaskStateMachine> | 
 
 /**
  * The active intent pack. Parsed once from `ASSISTANT_INTENT_PACK` (a JSON array of IntentDef, or
- * an object `{ intents: [...], machines?: {...} }`). Any parse/shape error logs and falls back to
- * DEFAULT — a bad pack must never break classification.
+ * an object `{ intents: [...], machines?: {...}, extends?: 'default' }`). Any parse/shape error logs
+ * and falls back to DEFAULT — a bad pack must never break classification.
+ *
+ * `extends: 'default'` inherits the platform taxonomy and adds to it; without it the pack REPLACES
+ * the taxonomy outright, which stays the default so a deployment can still remove an intent.
  */
 export function getIntentPack(): IntentPack {
   const raw = rawPackSource();
@@ -285,10 +348,28 @@ export function getIntentPack(): IntentPack {
     const parsed = JSON.parse(raw);
     const list = Array.isArray(parsed) ? parsed : Array.isArray(parsed?.intents) ? parsed.intents : null;
     if (!list) throw new Error('expected an array or { intents: [...] }');
-    const intents = (list as unknown[])
+    const declared = (list as unknown[])
       .map(coerceIntentDef)
       .filter((d): d is IntentDef => d !== null);
-    if (intents.length === 0) throw new Error('no valid intents after coercion');
+    if (declared.length === 0) throw new Error('no valid intents after coercion');
+    // `extends: 'default'` — carry only what this deployment ADDS, and inherit the platform taxonomy
+    // for the rest. Opt-in, so a pack without it REPLACES exactly as before: that is what lets a
+    // deployment drop a default intent it does not want, and changing it silently would take that away.
+    //
+    // Why it exists: a per-deployment pack lives in ONE SSM Standard-tier parameter (4096 characters),
+    // and copying the platform defaults into it spent 3183 of them before a deployment expressed
+    // anything of its own. Three classifications each paid that toll, and the largest was 356 over the
+    // limit - which surfaced as the seed dying part way through, after the earlier classifications had
+    // already been written. Inheriting instead of copying is what makes the budget stop being the
+    // binding constraint on how much a deployment can say.
+    //
+    // Own intents come FIRST, then any default whose key was not overridden - the same order the
+    // seeder used when it inlined them, so the classifier prompt is unchanged for a migrated pack.
+    const extendsDefault = !Array.isArray(parsed)
+      && (parsed as Record<string, unknown>)?.extends === 'default';
+    const intents = extendsDefault
+      ? [...declared, ...DEFAULT_INTENT_PACK.intents.filter((d) => !declared.some((o) => o.key === d.key))]
+      : declared;
     const machines = Array.isArray(parsed)
       ? undefined
       : coerceMachinesConfig((parsed as Record<string, unknown>)?.machines);

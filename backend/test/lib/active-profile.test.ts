@@ -1,5 +1,5 @@
 /**
- * SPEC-PORTABLE-VERSIONED-PROFILES P0 — active profile resolution.
+ * SPEC-PORTABLE-PROFILES P0 — active profile resolution.
  *
  * The load-bearing guarantees: (1) seed byte-identical (behavior diff empty), (2) fail-closed to seed
  * on absent/corrupt versions, (3) the §7 cut — a version overrides ONLY runtime-editable fields, never
@@ -75,6 +75,32 @@ describe('active-profile P0 resolution', () => {
     expect(configId).not.toBe('seed');
   });
 
+  it('surfaces the active version PERSONA so it rides the versioned definition (SPEC-PORTABLE §5)', async () => {
+    const persona = 'You are Ada, a meticulous research assistant. Cite sources.';
+    const def = {
+      schemaVersion: PROFILE_DEFINITION_SCHEMA_VERSION,
+      profileName: 'standard',
+      modelKey: 'sonnet',
+      classifierMode: 'llm',
+      timeoutSeconds: 30,
+      taskSupport: 'full',
+      persona,
+      configId: 'persona00test',
+    };
+    const ssm = fakeSsm((name) =>
+      name.endsWith(':active') ? { Parameter: { Value: JSON.stringify(def) } } : notFound(),
+    );
+    const resolved = await resolveActiveProfile('standard', { ssm, ssmRoot: SSM_ROOT });
+    expect(resolved.persona).toBe(persona); // the worker prefers this over the deployment persona seam
+  });
+
+  it('validateDefinitionBody accepts a persona and rejects an over-long one', async () => {
+    const base = { modelKey: 'sonnet', classifierMode: 'llm' as const, timeoutSeconds: 30, taskSupport: 'full' as const };
+    expect(validateDefinitionBody({ ...base, persona: 'A concise persona.' })).toEqual([]);
+    const tooLong = 'x'.repeat(20001);
+    expect(validateDefinitionBody({ ...base, persona: tooLong }).some((e) => e.includes('persona'))).toBe(true);
+  });
+
   it('an active version overrides RUNTIME-EDITABLE fields but NOT the boundary (contextScope from seed)', async () => {
     const seed = defaultProfileRegistry.profileByName('basic')!;
     const def = {
@@ -104,6 +130,51 @@ describe('active-profile P0 resolution', () => {
     // Boundary + identity stayed from the seed — the hostile contextScope is ignored:
     expect(profile.contextScope).toBe(seed.contextScope);
     expect(profile.name).toBe('basic');
+  });
+
+  it('surfaces a version\'s per-assistant task machines (4.5) on the resolved result', async () => {
+    const machines = {
+      report_generation: {
+        initial: 'start',
+        states: { start: { transitions: ['done'] }, done: { transitions: [], terminal: 'success' } },
+      },
+    };
+    const def = {
+      schemaVersion: PROFILE_DEFINITION_SCHEMA_VERSION,
+      profileName: 'standard',
+      modelKey: 'sonnet',
+      classifierMode: 'llm',
+      timeoutSeconds: 60,
+      taskSupport: 'full',
+      machines,
+      configId: 'aa11bb22cc33',
+    };
+    const ssm = fakeSsm((name) =>
+      name.endsWith(':active') ? { Parameter: { Value: JSON.stringify(def) } } : notFound(),
+    );
+    const resolved = await resolveActiveProfile('standard', { ssm, ssmRoot: SSM_ROOT });
+    expect(resolved.machines).toEqual(machines);
+  });
+
+  it('fails closed to the seed (machines undefined) when a version carries an INVALID machine', async () => {
+    // `initial` names a state that is not declared → validateTaskStateMachines rejects → whole
+    // definition fails validation → resolver serves the pure seed, dropping the bad machines.
+    const def = {
+      schemaVersion: PROFILE_DEFINITION_SCHEMA_VERSION,
+      profileName: 'standard',
+      modelKey: 'sonnet',
+      classifierMode: 'llm',
+      timeoutSeconds: 60,
+      taskSupport: 'full',
+      machines: { report_generation: { initial: 'nope', states: { start: { transitions: [] } } } },
+      configId: 'bad0bad0bad0',
+    };
+    const ssm = fakeSsm((name) =>
+      name.endsWith(':active') ? { Parameter: { Value: JSON.stringify(def) } } : notFound(),
+    );
+    const resolved = await resolveActiveProfile('standard', { ssm, ssmRoot: SSM_ROOT });
+    expect(resolved.configId).toBe('seed');
+    expect(resolved.machines).toBeUndefined();
   });
 
   it('fails closed to the seed on a malformed / invalid definition', async () => {

@@ -1,5 +1,5 @@
 /**
- * Profile versioning lifecycle — SPEC-PORTABLE-VERSIONED-PROFILES P1 (§4).
+ * Profile versioning lifecycle — SPEC-PORTABLE-PROFILES P1 (§4).
  *
  * The WRITE path behind `manage-profiles` (never the async-processor role, §7). Every mutation is
  * server-actor-audited. Reuses SSM's native versioning — NO new datastore (§3):
@@ -22,6 +22,8 @@ import {
 } from '@aws-sdk/client-ssm';
 import type { BackendModelDefinition, BackendModelKey } from '../../../lib/config/model-strategy.js';
 import { defaultProfileRegistry } from '../../../lib/profile-registry.js';
+import { SSM_STANDARD_TIER_MAX } from './seed-profile-definitions.js';
+import { offloadBodies, hydrateBodies, bodyBucket } from './profile-bodies.js';
 import {
   ProfileDefinition,
   ProfileDefinitionBody,
@@ -123,24 +125,42 @@ export async function listProfile(ssm: SSMClient, ssmRoot: string, profileName: 
   return { profileName, activeVersion, versions, hasDraft, draftConfigId };
 }
 
-/** Read the current draft body, or null when there is none. */
+/**
+ * Read the current draft body, or null when there is none.
+ *
+ * HYDRATED, so callers see the persona whether the draft stores it inline or as an S3 pointer. That is
+ * load-bearing rather than cosmetic: `editDraft` merges its patch over this, and a draft returned with
+ * the pointer stripped and no persona would silently drop the persona out of the next version.
+ */
 export async function getDraft(ssm: SSMClient, ssmRoot: string, profileName: string): Promise<ProfileDefinition | null> {
+  let raw: string | undefined;
   try {
     const d = await ssm.send(new GetParameterCommand({ Name: draftParamName(ssmRoot, profileName) }));
-    return d.Parameter?.Value ? (JSON.parse(d.Parameter.Value) as ProfileDefinition) : null;
+    raw = d.Parameter?.Value;
   } catch {
-    return null;
+    return null; // no draft
   }
+  if (!raw) return null;
+  // Hydration is OUTSIDE the catch on purpose. "No draft" and "the draft's persona could not be read"
+  // are different answers, and collapsing them into null would make an unreadable body look like an
+  // absent draft - `editDraft` would then silently restart from the active version and the operator's
+  // work in progress would disappear without an error.
+  return hydrateBodies(JSON.parse(raw) as ProfileDefinition);
 }
 
 /** Resolve the current ACTIVE definition body, falling back to the compiled seed (never fails). */
 async function activeOrSeedBody(ssm: SSMClient, ssmRoot: string, profileName: string): Promise<ProfileDefinitionBody> {
+  let activeRaw: string | undefined;
   try {
     const resp = await ssm.send(new GetParameterCommand({ Name: `${definitionParamName(ssmRoot, profileName)}:${ACTIVE_LABEL}` }));
-    if (resp.Parameter?.Value) return bodyFrom(JSON.parse(resp.Parameter.Value) as ProfileDefinition);
+    activeRaw = resp.Parameter?.Value;
   } catch {
     /* fall through to seed */
   }
+  // Hydrated before `bodyFrom`, which strips the envelope: an offloaded persona is in `personaRef` (an
+  // envelope field), so cloning the active version without following the pointer first would produce a
+  // new version identical to it EXCEPT that the assistant lost its persona.
+  if (activeRaw) return bodyFrom(await hydrateBodies(JSON.parse(activeRaw) as ProfileDefinition));
   const seed = serializeSeedDefinition(profileName);
   if (!seed) throw new Error(`unknown profile '${profileName}'`);
   return bodyFrom(JSON.parse(seed) as ProfileDefinition);
@@ -154,12 +174,39 @@ async function activeOrSeedBodyComplete(ssm: SSMClient, ssmRoot: string, profile
   return ensureModelsBundle(await activeOrSeedBody(ssm, ssmRoot, profileName));
 }
 
+/**
+ * The ONE way a definition is written: offload the bodies, refuse an oversize remainder, then put.
+ *
+ * The sequence is fixed and the reason is `configId`. It hashes the body INCLUDING the persona, and the
+ * S3 key contains the configId, so the definition must be BUILT before a body can be stored - hash,
+ * then put, then keep the pointer. Doing it in one function is what stops the three write paths
+ * (create-version, edit-draft, activate) from each growing their own ordering.
+ *
+ * The storage-boundary check measures the value that is actually about to be sent, after offload. That
+ * is the point of the indirection: what has to fit in 4096 characters is the definition MINUS its
+ * bodies, so a persona anywhere inside `MAX_PERSONA_LENGTH` is now storable instead of passing schema
+ * validation and dying at PutParameter.
+ */
+async function putDefinition(
+  ssm: SSMClient,
+  paramName: string,
+  def: ProfileDefinition,
+): Promise<{ stored: ProfileDefinition; version: number }> {
+  const stored = await offloadBodies(def);
+  const tooBig = storageBoundaryError(stored);
+  if (tooBig) throw new ProfileValidationError([tooBig]);
+  const put = await ssm.send(new PutParameterCommand({
+    Name: paramName, Type: 'String', Value: JSON.stringify(stored), Overwrite: true, Tier: 'Standard',
+  }));
+  return { stored, version: put.Version ?? 1 };
+}
+
 /** Clone the active version into a fresh draft (§4 create-version). Returns the draft definition. */
 export async function createDraft(ssm: SSMClient, ssmRoot: string, profileName: string, actor: string): Promise<ProfileDefinition> {
   if (!isKnownProfile(profileName)) throw new Error(`unknown profile '${profileName}'`);
   const body = await activeOrSeedBodyComplete(ssm, ssmRoot, profileName);
   const def = buildDefinition(profileName, body);
-  await ssm.send(new PutParameterCommand({ Name: draftParamName(ssmRoot, profileName), Type: 'String', Value: JSON.stringify(def), Overwrite: true, Tier: 'Standard' }));
+  await putDefinition(ssm, draftParamName(ssmRoot, profileName), def);
   audit('create-version', actor, profileName, { configId: def.configId });
   return def;
 }
@@ -186,7 +233,16 @@ export async function editDraft(
   const errs = validateDefinitionBody(mergedBody);
   if (errs.length) throw new ProfileValidationError(errs);
   const def = buildDefinition(profileName, mergedBody);
-  await ssm.send(new PutParameterCommand({ Name: draftParamName(ssmRoot, profileName), Type: 'String', Value: JSON.stringify(def), Overwrite: true, Tier: 'Standard' }));
+  // The edit re-hashes, so it produces a NEW configId and therefore a new body key. That is correct and
+  // is why nothing here deletes: the previous version's body must survive for a rollback to it to mean
+  // anything. Content-addressing makes the write idempotent - re-saving an unchanged draft rewrites
+  // identical bytes to the same key.
+  //
+  // `putDefinition` still refuses an oversize remainder HERE, where the operator's edit actually is.
+  // The draft parameter carries the same limit as the active one, so without that check PutParameter
+  // throws an AWS ValidationException that the route reports as a bare 500 'Internal error' - naming
+  // neither the persona, the profile, nor the size.
+  await putDefinition(ssm, draftParamName(ssmRoot, profileName), def);
   audit('edit-draft', actor, profileName, { configId: def.configId });
   return def;
 }
@@ -225,7 +281,124 @@ export function validateBody(body: Partial<ProfileDefinitionBody>, catalog: Reco
       checkModel(route.fallback, `models.byIntent['${intent}'].fallback`);
     }
   }
+
+  // Measure what would be STORED, not what was submitted: on a deployment with a body store the persona
+  // moves to S3 and stops counting against the parameter, so measuring it here would reject a persona
+  // that saves perfectly well. The pointer that replaces it costs about 90 characters, which this does
+  // not add back - a deliberate slack, since the load-bearing check is the one `putDefinition` runs on
+  // the exact bytes it is about to send, and that one reports just as precisely.
+  const tooBig = storageBoundaryError(bodyBucket() ? { ...body, persona: undefined } : body);
+  if (tooBig) errs.push(tooBig);
   return errs;
+}
+
+/**
+ * The STORAGE boundary, as an actionable message (null when the value fits).
+ *
+ * Every definition write is `Tier: 'Standard'`, whose value limit is 4096 characters for the whole
+ * serialized definition. Without a message, an oversize write fails at PutParameter with an opaque AWS
+ * ValidationException naming neither the profile nor the field.
+ *
+ * MEASURE THE VALUE AS IT WILL BE STORED. Once the persona is offloaded (`personaRef` present) it does
+ * not count here at all, and the two cases need different advice: "shorten the persona" is the fix in
+ * one and actively misleading in the other, where the persona is no longer what is spending the budget.
+ *
+ * The seeder shares the same constant and arithmetic, so the paths cannot drift.
+ */
+export function storageBoundaryError(value: Partial<ProfileDefinition>): string | null {
+  const serialized = JSON.stringify(value).length;
+  if (serialized <= SSM_STANDARD_TIER_MAX) return null;
+  if (value.personaRef) {
+    return (
+      `definition is ${serialized} characters, over the ${SSM_STANDARD_TIER_MAX}-character SSM Standard-tier `
+      + 'limit WITH the persona already stored outside it. What remains - the model bundle, tool allowlist, '
+      + 'task machines and context selection - is what exceeds the budget, so shortening the persona will '
+      + 'not help; reduce one of those.'
+    );
+  }
+  const overhead = serialized - (value.persona?.length ?? 0);
+  return (
+    `definition is ${serialized} characters, over the ${SSM_STANDARD_TIER_MAX}-character SSM Standard-tier `
+    + `limit. Everything but the persona accounts for ${overhead}, leaving room for a persona of about `
+    + `${Math.max(0, SSM_STANDARD_TIER_MAX - overhead)} characters. Shorten the persona, move the long-form `
+    + 'grounding into a context source, or configure a profile body store (PROFILE_BODY_BUCKET) so the '
+    + 'persona is kept in S3 instead of inside the parameter.'
+  );
+}
+
+/**
+ * Check every selected context key against this classification's PUBLISHED catalog.
+ *
+ * `validateDefinitionBody` only proves the selection is a list of non-empty strings, and its own
+ * comment claimed the keys were "checked at the write path and at import". Only import checked them.
+ * So an operator could activate a version naming a key this deployment never publishes, get no error,
+ * and discover it as a per-turn `not-in-catalog` metric afterwards - a silent partial assistant.
+ *
+ * Fails CLOSED, matching import: a selection that cannot be verified must not be activated. Scoped to
+ * profiles that actually select sources, so an unrelated SSM problem cannot block a profile that uses
+ * none of this.
+ */
+async function contextSelectionErrors(
+  body: Partial<ProfileDefinitionBody>,
+  profileName: string,
+  readCatalog?: (profileName: string) => Promise<Array<{ key: string }>>,
+): Promise<string[]> {
+  if (!body.contextSources?.length || !readCatalog) return [];
+  let available: Array<{ key: string }>;
+  try {
+    available = await readCatalog(profileName);
+  } catch (err) {
+    return [
+      `the context source catalog for '${profileName}' could not be read (${(err as Error).message}); `
+      + 'refusing to activate a version whose context selection cannot be verified',
+    ];
+  }
+  const keys = new Set(available.map((s) => s.key));
+  const offered = available.map((s) => `'${s.key}'`).join(', ') || '(none published)';
+  return body.contextSources
+    .filter((key) => !keys.has(key))
+    .map((key) => `contextSources key '${key}' is not published for '${profileName}'; one of: ${offered}`);
+}
+
+/**
+ * Errors for a `guardrailId` the target cannot resolve.
+ *
+ * WHY THE WRITE PATH AND NOT JUST THE RUNTIME. `importManifest` already validates this, and
+ * activate/validate did not - so the same selection was rejected arriving as a manifest and accepted
+ * arriving through the console. The catalog publishes selection KEYS ('default', 'strict') alongside
+ * deploy-resolved ids, and an EXPORTED manifest deliberately carries the key, so a round trip through
+ * export/edit/activate is exactly how a key ends up in the stored field where an id belongs.
+ *
+ * What that costs is not silence: `runGuardrail` treats a selected guardrail that will not apply as a
+ * persistent misconfiguration, falls back to the deployment default and logs LOUD, so content is still
+ * filtered. But the profile then claims a stricter guardrail it is not getting, and the only signal is
+ * an error line on every single turn. Rejecting it once at the write is the same principle `validateBody`
+ * already applies to `modelKey`: an out-of-catalog selection is a reject, not a runtime surprise.
+ *
+ * Accepts either form, matching import: a catalog KEY or an already-resolved id that the target
+ * provisions. Fails CLOSED on an unreadable catalog - a selection that cannot be verified is not
+ * activated - and is skipped entirely when the profile selects no guardrail.
+ */
+async function guardrailSelectionErrors(
+  body: Partial<ProfileDefinitionBody>,
+  profileName: string,
+  readGuardrailCatalog?: (profileName: string) => Promise<Array<{ key: string; guardrailId: string }>>,
+): Promise<string[]> {
+  if (!body.guardrailId || !readGuardrailCatalog) return [];
+  let available: Array<{ key: string; guardrailId: string }>;
+  try {
+    available = await readGuardrailCatalog(profileName);
+  } catch (err) {
+    return [
+      `the guardrail catalog for '${profileName}' could not be read (${(err as Error).message}); `
+      + 'refusing to activate a version whose guardrail selection cannot be verified',
+    ];
+  }
+  if (available.some((g) => g.key === body.guardrailId || g.guardrailId === body.guardrailId)) return [];
+  const offered = available.map((g) => `'${g.key}'`).join(', ') || '(none published)';
+  return [
+    `guardrailId '${body.guardrailId}' matches no guardrail published for '${profileName}'; one of: ${offered}`,
+  ];
 }
 
 /** Validate the current draft (returns errors; empty ⇒ activatable). */
@@ -234,10 +407,18 @@ export async function validateDraft(
   ssmRoot: string,
   profileName: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
+  readContextCatalog?: (profileName: string) => Promise<Array<{ key: string }>>,
+  readGuardrailCatalog?: (profileName: string) => Promise<Array<{ key: string; guardrailId: string }>>,
 ): Promise<{ errors: string[]; configId?: string }> {
   const draft = await getDraft(ssm, ssmRoot, profileName);
   if (!draft) return { errors: ['no draft to validate'] };
-  return { errors: validateBody(bodyFrom(draft), catalog), configId: draft.configId };
+  const body = bodyFrom(draft);
+  const errors = [
+    ...validateBody(body, catalog),
+    ...(await contextSelectionErrors(body, profileName, readContextCatalog)),
+    ...(await guardrailSelectionErrors(body, profileName, readGuardrailCatalog)),
+  ];
+  return { errors, configId: draft.configId };
 }
 
 /** Promote the draft to a new active version (§4 activate): validate → PutParameter → move `active`. */
@@ -247,16 +428,27 @@ export async function activateDraft(
   profileName: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
   actor: string,
+  readContextCatalog?: (profileName: string) => Promise<Array<{ key: string }>>,
+  readGuardrailCatalog?: (profileName: string) => Promise<Array<{ key: string; guardrailId: string }>>,
 ): Promise<{ version: number; configId: string }> {
   const draft = await getDraft(ssm, ssmRoot, profileName);
   if (!draft) throw new Error('no draft to activate');
   const body = bodyFrom(draft);
-  const errs = validateBody(body, catalog);
+  const errs = [
+    ...validateBody(body, catalog),
+    // Activation is the gate, not validate: a caller can skip validate entirely.
+    ...(await contextSelectionErrors(body, profileName, readContextCatalog)),
+    ...(await guardrailSelectionErrors(body, profileName, readGuardrailCatalog)),
+  ];
   if (errs.length) throw new ProfileValidationError(errs);
   const def = buildDefinition(profileName, body);
   const name = definitionParamName(ssmRoot, profileName);
-  const put = await ssm.send(new PutParameterCommand({ Name: name, Type: 'String', Value: JSON.stringify(def), Overwrite: true, Tier: 'Standard' }));
-  const version = put.Version ?? 1;
+  // `putDefinition` re-measures the value it is about to send, for the same reason editDraft relies on
+  // it: validateBody above sees only the body, and this is the last gate before the write - activation
+  // is reachable without ever calling validate. The body write it does first is a no-op in content
+  // terms (the draft already stored this exact configId's persona at this exact key), so promoting a
+  // draft never rewrites a body it did not author.
+  const { version } = await putDefinition(ssm, name, def);
   await ssm.send(new LabelParameterVersionCommand({ Name: name, ParameterVersion: version, Labels: [ACTIVE_LABEL] }));
   audit('activate', actor, profileName, { version, configId: def.configId });
   return { version, configId: def.configId };
@@ -272,8 +464,18 @@ export async function activateExistingVersion(
 ): Promise<{ version: number; configId: string }> {
   const name = definitionParamName(ssmRoot, profileName);
   // Confirm the version exists + read its configId for the audit (immutable — no content change).
-  const resp = await ssm.send(new GetParameterHistoryCommand({ Name: name }));
-  const match = (resp.Parameters ?? []).find((p) => p.Version === version);
+  //
+  // Addressed as `name:N`. This scanned `GetParameterHistory`, which pages at 10 OLDEST-FIRST, with no
+  // pagination - so ROLLBACK was impossible past the tenth version: the version existed, the scan did
+  // not reach it, and the operator got "version N not found". `listProfile` above pages correctly
+  // (`NextToken`), so the console would OFFER a version this function then refused.
+  let match: { Value?: string } | undefined;
+  try {
+    const resp = await ssm.send(new GetParameterCommand({ Name: `${name}:${version}` }));
+    if (resp.Parameter?.Value !== undefined) match = { Value: resp.Parameter.Value };
+  } catch {
+    /* fall through to the not-found error below, which names the version */
+  }
   if (!match) throw new Error(`version ${version} not found for profile '${profileName}'`);
   await ssm.send(new LabelParameterVersionCommand({ Name: name, ParameterVersion: version, Labels: [ACTIVE_LABEL] }));
   const configId = configIdOf(match.Value);

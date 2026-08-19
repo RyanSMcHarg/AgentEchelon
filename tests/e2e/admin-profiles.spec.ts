@@ -1,13 +1,18 @@
 /**
- * Assistant Profiles admin tab (SPEC-PORTABLE-VERSIONED-PROFILES P1 UI) — proves the console's new
+ * Assistant Profiles admin tab (SPEC-PORTABLE-PROFILES P1 UI) — proves the console's new
  * Profiles surface actually LOADS from the live manage-profiles API (not just that the tab shell renders).
  */
 import { test, expect, Page } from '@playwright/test';
 import { signIn } from './helpers/agent-helpers';
 import { getAdminUser } from './helpers/test-credentials';
+import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
 test.use({ baseURL: ADMIN_BASE_URL });
+
+// Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
+guardBackendErrors('admin-profiles');
+guardConsoleErrors();
 
 async function signInAsAdmin(page: Page): Promise<void> {
   const admin = await getAdminUser();

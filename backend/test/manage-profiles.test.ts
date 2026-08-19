@@ -1,5 +1,5 @@
 /**
- * SPEC-PORTABLE-VERSIONED-PROFILES P1 — the manage-profiles API handler (gating + routing).
+ * SPEC-PORTABLE-PROFILES P1 — the manage-profiles API handler (gating + routing).
  * The lifecycle/manifest logic is unit-tested separately; here we prove the capability gate and route
  * dispatch, since this is the WRITE surface (§7).
  */

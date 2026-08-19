@@ -98,6 +98,20 @@ export class ProfileRegistry {
       .map((c) => c.value);
   }
 
+  /**
+   * The ONE resolver both the IAM statement generator and the retrieval walk consume for
+   * `contextScope: 'own-rank-and-below'`: the S3 `context/{classification}/` prefixes the assistant may
+   * read, derived from `scopeAtOrBelow` so a renamed/added classification can never drift IAM apart from
+   * retrieval (the fix for the hardcoded `CLASSIFICATION_PREFIXES` list). `highestFirst` orders them by
+   * DESCENDING rank so the caller's own-classification docs survive a char budget first (retrieval); IAM
+   * uses the default order and appends `*`. Trailing slash included; append `*` for an IAM resource/prefix.
+   */
+  contextPrefixesAtOrBelow(classification: string, opts?: { highestFirst?: boolean }): string[] {
+    const values = this.scopeAtOrBelow(classification);
+    const ordered = opts?.highestFirst ? [...values].reverse() : values;
+    return ordered.map((c) => `context/${c}/`);
+  }
+
   /** The assistant profile serving a classification. Fail-closed classification first. */
   profileFor(classification: string): AssistantProfile {
     const c = this.byValue.get(classification) ?? this.byValue.get(this.config.failClosedTo)!;
@@ -108,7 +122,7 @@ export class ProfileRegistry {
 
   /** The compiled-in (seed) profile by its NAME, or undefined if none is declared. This is the
    *  fail-closed fallback the runtime active-version resolver reverts to when the SSM definition is
-   *  absent/corrupt (SPEC-PORTABLE-VERSIONED-PROFILES §3 "fail-closed: ... falls back to the seed").
+   *  absent/corrupt (SPEC-PORTABLE-PROFILES §3 "fail-closed: ... falls back to the seed").
    *  Unlike profileFor(classification), this keys on the profile name (the /assistant/{name} segment). */
   profileByName(name: string): AssistantProfile | undefined {
     return this.profilesByName.get(name);

@@ -21,9 +21,14 @@
  */
 
 import * as cdk from 'aws-cdk-lib';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
+import * as cloudwatchActions from 'aws-cdk-lib/aws-cloudwatch-actions';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
+import * as logs from 'aws-cdk-lib/aws-logs';
+import * as sns from 'aws-cdk-lib/aws-sns';
+import * as snsSubscriptions from 'aws-cdk-lib/aws-sns-subscriptions';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import * as secretsmanager from 'aws-cdk-lib/aws-secretsmanager';
 import * as cr from 'aws-cdk-lib/custom-resources';
@@ -31,12 +36,22 @@ import { Construct } from 'constructs';
 import { createHash } from 'node:crypto';
 import * as path from 'path';
 import { AgentGuardrails } from '../constructs/bedrock-guardrails';
+import { guardrailCatalog } from '../config/guardrail-catalog';
+import {
+  loadContextSourceCatalog,
+  contextSourceGrant,
+  publishableContextSource,
+  CONTEXT_SOURCE_METRIC_NAMESPACE,
+} from '../config/context-sources';
 import { BattleImageGuardrails } from '../constructs/battle-image-guardrails';
+// The processor's image-model grant is DERIVED from the image-gen registry, so a model added there
+// cannot be left ungranted here (precedent: ANALYTICS_CAPABILITY_SUBPATHS in analytics-stack-aurora).
+import { BEDROCK_IMAGE_MODEL_ARNS } from '../../lambda/src/lib/image-gen-models';
 import { getModelCatalog, ProfileModelSelection } from '../config/model-strategy';
 import { defaultProfileRegistry } from '../profile-registry';
 import {
   classificationChannelScopedAllow,
-  classificationsAllowedFor,
+  contextPrefixesAllowedFor,
   modelArnsForClassification,
   resolveSharedSSM,
   adminErrorAlertWiring,
@@ -54,6 +69,7 @@ import {
   CHANNEL_FLOW_ARN_SSM_KEY,
   RES_PREFIX,
   SSM_ROOT,
+  INSTANCE_SSM,
 } from './agent-classification-common';
 
 /** The per-profile capability shape that drives the shared body. */
@@ -99,6 +115,15 @@ export interface AssistantProfileStackProps extends cdk.StackProps {
   /** Shared attachments bucket holding context/{classification}/*.json (from AgentEchelonS3Storage). */
   attachmentsBucketName: string;
   attachmentsBucketArn: string;
+  /**
+   * Image-generation guardrails in the regions the MODELS live in, region -> {id, version}.
+   *
+   * Bedrock guardrails are regional and the Stability generators are us-west-2-only, so a us-east-1
+   * deployment invokes them cross-region and the deploy-region guardrail cannot be attached. Provided
+   * by `bin/backend.ts` from a per-region `ImageGuardrailStack`. Absent for a region means the runtime
+   * REFUSES to generate there rather than generating unmoderated.
+   */
+  imageGuardrailByRegion?: Record<string, { id: string; version: string }>;
   /** Model selection (the profile team picks profileModelSelection[topology.modelSelectionKey]). */
   profileModelSelection: ProfileModelSelection;
   /** Wire /battle plumbing (only meaningful when topology.battleCapable). False ⇒ no battle plumbing. */
@@ -160,6 +185,31 @@ export class AssistantProfileStack extends cdk.Stack {
     const guardrail = new AgentGuardrails(this, 'AssistantGuardrail', {
       name: `${RES_PREFIX}-${classification}-guardrail`,
     });
+    // 4.6b: provision the deployment's SELECTABLE alternate guardrails from the catalog (the default
+    // above is what GUARDRAIL_ID env points at). A profile SELECTS one via its guardrailId; the
+    // ApplyGuardrail grant below covers EVERY provisioned ARN, so an unprovisioned selection AccessDenies
+    // and the apply path fails open — a version can never point at a resource the deployment didn't provision.
+    const alternateGuardrails = guardrailCatalog(RES_PREFIX)
+      .filter((e) => e.key !== 'default')
+      .map((e) => ({
+        key: e.key,
+        name: `${RES_PREFIX}-${classification}-${e.key}-guardrail`,
+        gr: new AgentGuardrails(this, `AssistantGuardrail-${e.key}`, {
+          policy: { ...e.policy, name: `${RES_PREFIX}-${classification}-${e.key}-guardrail` },
+        }),
+      }));
+    // Publish the SELECTABLE guardrails (resolved ids + versions) so an operator / the admin console /
+    // a profile author can discover what a profile's guardrailId may be set to (4.6b). Not read by the
+    // runtime (the processor gets guardrailId from the profile definition); it is the selection catalog.
+    new ssm.StringParameter(this, 'GuardrailsCatalogParam', {
+      parameterName: `${SSM_ROOT}/assistant/${classification}/guardrails`,
+      stringValue: JSON.stringify([
+        { key: 'default', name: `${RES_PREFIX}-${classification}-guardrail`, guardrailId: guardrail.guardrailId, guardrailVersion: guardrail.guardrailVersion },
+        ...alternateGuardrails.map((a) => ({ key: a.key, name: a.name, guardrailId: a.gr.guardrailId, guardrailVersion: a.gr.guardrailVersion })),
+      ]),
+      description: 'Selectable guardrails for this classification (SPEC-CONFIGURABLE-ASSISTANTS 4.6b): a profile.guardrailId picks one.',
+    });
+
     // ── Image-output guardrail (imageGen profiles only, for /battle generation-out) ──
     const imageGuardrail = topo.imageGen
       ? new BattleImageGuardrails(this, 'BattleImageGuardrails', { name: `${RES_PREFIX}-${classification}-battle-image-guardrail` })
@@ -193,7 +243,9 @@ export class AssistantProfileStack extends cdk.Stack {
             }),
             new iam.PolicyStatement({
               actions: ['bedrock:ApplyGuardrail'],
-              resources: [guardrail.guardrailArn],
+              // The deployment default + every selectable alternate (4.6b): a profile can only apply a
+              // PROVISIONED guardrail; anything else fails closed (open).
+              resources: [guardrail.guardrailArn, ...alternateGuardrails.map((a) => a.gr.guardrailArn)],
             }),
           ],
         }),
@@ -205,13 +257,20 @@ export class AssistantProfileStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['s3:ListBucket'],
               resources: [props.attachmentsBucketArn],
-              conditions: { StringLike: { 's3:prefix': [...classificationsAllowedFor(classification).map((c) => `context/${c}/*`), 'platform-knowledge/*'] } },
+              conditions: { StringLike: { 's3:prefix': [...contextPrefixesAllowedFor(classification).map((p) => `${p}*`), 'platform-knowledge/*'] } },
             }),
             new iam.PolicyStatement({
               actions: ['s3:GetObject'],
               resources: [
-                ...classificationsAllowedFor(classification).map((c) => `${props.attachmentsBucketArn}/context/${c}/*`),
+                ...contextPrefixesAllowedFor(classification).map((p) => `${props.attachmentsBucketArn}/${p}*`),
                 `${props.attachmentsBucketArn}/platform-knowledge/*`,
+                // The active version's PERSONA (SPEC-PORTABLE-PROFILES, "Bodies are S3"): the definition
+                // in SSM holds a pointer under `profiles/*` and the processor follows it every time it
+                // resolves its profile. READ-ONLY, and deliberately not classification-scoped the way the
+                // context prefixes are: a profile can only ever be handed its OWN version's key, which is
+                // content-addressed, and the assistant fails closed to the compiled seed if the read
+                // fails. Write stays exclusive to manage-profiles (§7).
+                `${props.attachmentsBucketArn}/profiles/*`,
               ],
             }),
           ],
@@ -262,23 +321,40 @@ export class AssistantProfileStack extends cdk.Stack {
       processorRole.addToPolicy(new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [battle.battleOrchestratorArn] }));
     }
 
-    // Image-gen profiles: /battle generation-out (Titan Image + Nova Canvas) + image-output guardrail
-    // + the default-bot SSM read (loadDefaultBotArn) + battle-images read/write.
+    // Image-gen profiles: image generation on ordinary `image_generation` turns and /battle
+    // generation-out + image-output guardrail + the default-bot SSM read (loadDefaultBotArn) +
+    // battle-images read/write.
+    //
+    // EVERY `aws-bedrock` MODEL IN THE REGISTRY IS LISTED, not just the ones a battle happens to use.
+    // This grant previously named only Titan Image and Nova Canvas, both LEGACY, while
+    // `DEFAULT_IMAGE_MODEL` had moved to Stability Image Core — so the shipped default was ungranted
+    // and every image turn failed. IAM and the registry drifted silently because nothing held them
+    // together; `image-gen-iam-parity.test.ts` now does.
+    //
+    // The `:*:` region wildcard is load-bearing. Bedrock does not offer every model in every region
+    // (the Stability base generators are us-west-2 only, see `region` in the registry), so the
+    // processor invokes them cross-region and a grant pinned to the deploy region would deny them.
     let igKeysSecretArn: string | undefined;
     if (topo.imageGen) {
       processorRole.addToPolicy(
         new iam.PolicyStatement({
           actions: ['bedrock:InvokeModel'],
-          resources: [
-            'arn:aws:bedrock:*::foundation-model/amazon.titan-image-generator-v2:0',
-            'arn:aws:bedrock:*::foundation-model/amazon.nova-canvas-v1:0',
-          ],
+          resources: BEDROCK_IMAGE_MODEL_ARNS,
         }),
       );
       processorRole.addToPolicy(
         new iam.PolicyStatement({
           actions: ['bedrock:ApplyGuardrail'],
-          resources: [`arn:aws:bedrock:${this.region}:${this.account}:guardrail/${imageGuardrail!.guardrailId}`],
+          resources: [
+            `arn:aws:bedrock:${this.region}:${this.account}:guardrail/${imageGuardrail!.guardrailId}`,
+            // A guardrail attached to a CROSS-REGION InvokeModel is enforced in the region the call
+            // goes to, so the grant has to name it there too. Without this the guardrail resolves and
+            // then AccessDenies - the same "ships inert" shape as the per-member fallback that was
+            // deployed without its ListChannelMemberships grant and died on first contact.
+            ...Object.entries(props.imageGuardrailByRegion ?? {}).map(
+              ([region, g]) => `arn:aws:bedrock:${region}:${this.account}:guardrail/${g.id}`,
+            ),
+          ],
         }),
       );
       processorRole.addToPolicy(new iam.PolicyStatement({ actions: ['s3:GetObject'], resources: [`${props.attachmentsBucketArn}/attachments/*`] }));
@@ -287,6 +363,206 @@ export class AssistantProfileStack extends cdk.Stack {
       processorRole.addToPolicy(
         new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${botArnKey(classification)}`] }),
       );
+    }
+
+    // ── Context source catalog (SPEC-CONTEXT-SOURCES-AND-STORES phase 2) ─────────
+    //
+    // The set of context sources a profile bound to THIS classification may select by key. Entries are
+    // DATA (lib/config/context-sources: the deployer's gitignored local file, else the tracked
+    // example), so this loop is generic and never names a source.
+    //
+    // INV-CTX-CAT-3: the grant is emitted HERE, beside the publication, and scoped to each entry's
+    // exact resource. A published key without its grant imports cleanly and fails at RUNTIME - an
+    // omission that fails OPEN. Publishing and granting in one place is what makes that impossible to
+    // get half-right, and `cdk-synth.test.ts` asserts the resource scope, not merely that a statement
+    // exists, because a wildcard would satisfy "a grant exists" while destroying least privilege.
+    const contextSources = loadContextSourceCatalog({
+      classification,
+      attachmentsBucketArn: props.attachmentsBucketArn,
+      attachmentsBucketName: props.attachmentsBucketName,
+      userProfileTableArn: shared.userProfileArn,
+      userProfileTableName: shared.userProfileName,
+      region: this.region,
+      account: this.account,
+    });
+    for (const entry of contextSources.entries) {
+      // Resource form is per type: an s3-prefix grants only its own prefix, never the bucket.
+      // A LIST of statements: a type may need more than one shape (an object-level read plus a
+      // conditioned bucket-level list, say), and folding those into one statement is how `ListBucket`
+      // ended up on an object ARN authorizing nothing.
+      for (const { actions, resources, conditions } of contextSourceGrant(entry)) {
+        processorRole.addToPolicy(new iam.PolicyStatement({ actions, resources, conditions }));
+      }
+    }
+    // The processor must be able to READ the catalog it resolves against. Granting the sources but not
+    // the catalog parameter is the same failure this file's INV-CTX-CAT-3 comment describes, one level
+    // up - and it fails the same way: the read denies, the code sees an empty catalog, and every
+    // selected key logs "not in this classification's catalog" as though the PROFILE were wrong.
+    // Found exactly that way on the live deployment.
+    processorRole.addToPolicy(new iam.PolicyStatement({
+      actions: ['ssm:GetParameter'],
+      resources: [
+        `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/${classification}/context-sources`,
+      ],
+    }));
+    new ssm.StringParameter(this, 'ContextSourcesCatalogParam', {
+      parameterName: `${SSM_ROOT}/assistant/${classification}/context-sources`,
+      // Published WITHOUT the arn, WITH the locator and prefix. The arn is the grant resource and is
+      // the only field carrying an account and region, so stripping it keeps account identifiers out
+      // of a parameter any principal with ssm:GetParameter on it can read. The locator and prefix
+      // stay because the READER resolves them - that is what keeps the read at the same location the
+      // grant above authorised. Stripping them forced the reader onto a hardcoded corpus path, so an
+      // entry granted on a per-team prefix was read from somewhere else entirely.
+      stringValue: JSON.stringify(contextSources.entries.map(publishableContextSource)),
+      description:
+        'Selectable context sources for this classification (SPEC-CONTEXT-SOURCES-AND-STORES): a profile.contextSources entry picks one by key.',
+    });
+
+    // ── Context source observability: dashboard + failure-RATE alarm (INV-CTX-CAT-7) ──────────
+    //
+    // The runtime counts every source's outcome, but a metric nobody watches is not a control. This
+    // is the watching half, and it deploys with the grants it exists to police - same argument as
+    // publish-and-grant above.
+    //
+    // A RATE, not an occurrence. Context sources resolve on every turn, so a broken grant fails
+    // continuously; alerting per occurrence would email every admin once per user message. CloudWatch
+    // does the 5-minute windowing, and because an alarm notifies on STATE TRANSITION it also does the
+    // de-duplication - one message when it breaks, one when it clears.
+    //
+    // Opt-in via the admin notification channel: with nowhere to deliver to, an alarm is a light
+    // nobody sees, and a dashboard is a monthly charge for a page nobody opens.
+    if (props.adminErrorAlertChannelArn) {
+      const thresholdPercent = Number(this.node.tryGetContext('contextSourceAlertThresholdPercent') ?? 10);
+      // The floor that stops a quiet deployment paging on arithmetic: 1 failure in 2 attempts is 50%
+      // and means nothing. Below this many attempts in the window the expression yields 0.
+      const minAttempts = Number(this.node.tryGetContext('contextSourceAlertMinAttempts') ?? 20);
+
+      const byClassification = { Classification: classification };
+      const failed = new cloudwatch.Metric({
+        namespace: CONTEXT_SOURCE_METRIC_NAMESPACE,
+        metricName: 'ContextSourceFailed',
+        dimensionsMap: byClassification,
+        statistic: 'Sum',
+        period: cdk.Duration.minutes(5),
+      });
+      const resolvedM = new cloudwatch.Metric({
+        namespace: CONTEXT_SOURCE_METRIC_NAMESPACE,
+        metricName: 'ContextSourceResolved',
+        dimensionsMap: byClassification,
+        statistic: 'Sum',
+        period: cdk.Duration.minutes(5),
+      });
+
+      // FILL(...,0) on both sides: a period with no failures emits no datapoint at all, and without
+      // the fill the expression would go missing rather than reporting a healthy 0%.
+      const failureRate = new cloudwatch.MathExpression({
+        expression: `IF(FILL(mf,0)+FILL(mr,0) >= ${minAttempts}, 100*FILL(mf,0)/(FILL(mf,0)+FILL(mr,0)), 0)`,
+        usingMetrics: { mf: failed, mr: resolvedM },
+        label: `${classification} context source failure %`,
+        period: cdk.Duration.minutes(5),
+      });
+
+      const dashboardName = `${RES_PREFIX}-${classification}-context-sources`;
+      const alarmTopic = new sns.Topic(this, 'ContextSourceAlarmTopic', {
+        displayName: `Context source failures (${classification})`,
+      });
+
+      const alarmFn = new lambdaNodeJs.NodejsFunction(this, 'ContextSourceAlarmFunction', {
+        entry: path.join(__dirname, '../../lambda/src/context-source-alarm.ts'),
+        handler: 'handler',
+        runtime: lambda.Runtime.NODEJS_20_X,
+        timeout: cdk.Duration.seconds(30),
+        environment: {
+          ...errAlert.env,
+          CLASSIFICATION: classification,
+          CONTEXT_SOURCE_DASHBOARD: dashboardName,
+        },
+      });
+      errAlert.grant(alarmFn.role!);
+      alarmTopic.addSubscription(new snsSubscriptions.LambdaSubscription(alarmFn));
+
+      const alarm = new cloudwatch.Alarm(this, 'ContextSourceFailureRateAlarm', {
+        alarmName: `${RES_PREFIX}-${classification}-context-source-failure-rate`,
+        alarmDescription:
+          `More than ${thresholdPercent}% of context source reads failed over 5 minutes `
+          + `(${classification}). A grant, a document, or the catalog parameter itself.`,
+        metric: failureRate,
+        threshold: thresholdPercent,
+        evaluationPeriods: 1,
+        comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_THRESHOLD,
+        // No traffic is not a failure. Without this the alarm would sit in INSUFFICIENT_DATA and, on
+        // some configurations, page for it.
+        treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+      });
+      alarm.addAlarmAction(new cloudwatchActions.SnsAction(alarmTopic));
+      // Recovery goes to the same place. An alert that never says "fixed" trains people to ignore it.
+      alarm.addOkAction(new cloudwatchActions.SnsAction(alarmTopic));
+
+      // The dashboard the alert links to. Source keys are known at SYNTH time, so the per-source
+      // widget names this deployment's actual catalog rather than making an operator guess.
+      const sourceKeys = [...contextSources.entries.map((e) => e.key), '(catalog)'];
+      const perSource = (metricName: string) => sourceKeys.map((key) => new cloudwatch.Metric({
+        namespace: CONTEXT_SOURCE_METRIC_NAMESPACE,
+        metricName,
+        dimensionsMap: { Classification: classification, Outcome: 'denied', SourceKey: key },
+        statistic: 'Sum',
+        period: cdk.Duration.minutes(5),
+        label: key,
+      }));
+
+      new cloudwatch.Dashboard(this, 'ContextSourceDashboard', {
+        dashboardName,
+        widgets: [
+          [
+            new cloudwatch.GraphWidget({
+              title: `Failure rate % (alarm at ${thresholdPercent}%, min ${minAttempts} attempts)`,
+              left: [failureRate],
+              leftAnnotations: [{ value: thresholdPercent, label: 'alarm', color: '#d13212' }],
+              width: 12,
+            }),
+            new cloudwatch.GraphWidget({
+              title: 'Resolved vs failed',
+              left: [resolvedM, failed],
+              width: 12,
+            }),
+          ],
+          [
+            new cloudwatch.GraphWidget({
+              title: 'Failures by reason - denied is the security one',
+              left: (['denied', 'absent', 'timeout', 'error'] as const).map((outcome) =>
+                new cloudwatch.Metric({
+                  namespace: CONTEXT_SOURCE_METRIC_NAMESPACE,
+                  metricName: 'ContextSourceFailed',
+                  dimensionsMap: { Classification: classification, Outcome: outcome },
+                  statistic: 'Sum',
+                  period: cdk.Duration.minutes(5),
+                  label: outcome,
+                })),
+              width: 12,
+            }),
+            new cloudwatch.GraphWidget({
+              title: 'Refusals by source - (catalog) means every source at once',
+              left: perSource('ContextSourceFailed'),
+              width: 12,
+            }),
+          ],
+          [
+            new cloudwatch.GraphWidget({
+              title: 'Never attempted - sustained not-in-catalog is a profile naming a removed key',
+              left: (['not-in-catalog', 'unavailable'] as const).map((outcome) =>
+                new cloudwatch.Metric({
+                  namespace: CONTEXT_SOURCE_METRIC_NAMESPACE,
+                  metricName: 'ContextSourceSkipped',
+                  dimensionsMap: { Classification: classification, Outcome: outcome },
+                  statistic: 'Sum',
+                  period: cdk.Duration.minutes(5),
+                  label: outcome,
+                })),
+              width: 24,
+            }),
+          ],
+        ],
+      });
     }
 
     // ── External (CN) provider secret (contextRouting profiles) ──────────────
@@ -367,6 +643,12 @@ export class AssistantProfileStack extends cdk.Stack {
       GUARDRAIL_VERSION: guardrail.guardrailVersion,
       TASKS_TABLE: shared.agentTasksName,
       USER_TASKS_TABLE: shared.userTasksName,
+      // The PROCESSOR needs this too, not just the router. The router reads the profile store for the
+      // once-per-user onboarding gate; the processor reads it to resolve a `user-profile` CONTEXT
+      // SOURCE on a real turn (SPEC-CONTEXT-SOURCES-AND-STORES). Without the table name here the catalog
+      // grant exists, the key publishes, and the reader silently resolves nothing - the published-key/
+      // absent-wiring shape this spec's INV-CTX-CAT-3 exists to prevent, one level up from IAM.
+      USER_PROFILE_TABLE: shared.userProfileName,
       ...errAlert.env,
       ...abuse.env,
     };
@@ -395,6 +677,14 @@ export class AssistantProfileStack extends cdk.Stack {
       processorEnv.BOT_ARN_PARAM = botArnKey(classification);
       processorEnv.BATTLE_IMAGE_GUARDRAIL_ID = imageGuardrail!.guardrailId;
       processorEnv.BATTLE_IMAGE_GUARDRAIL_VERSION = imageGuardrail!.guardrailVersion;
+      // Per-region guardrails for models Bedrock pins outside the deploy region. `toJsonString`
+      // rather than JSON.stringify: these ids are cross-region CloudFormation tokens, and only the
+      // CDK-aware serializer emits them as a resolvable Fn::Join instead of "${Token[...]}".
+      // The deploy region is included from the local guardrail so one map answers every region.
+      processorEnv.BATTLE_IMAGE_GUARDRAIL_BY_REGION = this.toJsonString({
+        [this.region]: { id: imageGuardrail!.guardrailId, version: imageGuardrail!.guardrailVersion },
+        ...(props.imageGuardrailByRegion ?? {}),
+      });
       const maxImages = this.node.tryGetContext('battleImageMaxImages');
       const maxDimension = this.node.tryGetContext('battleImageMaxDimension');
       if (maxImages != null) processorEnv.BATTLE_IMAGE_MAX_IMAGES = String(maxImages);
@@ -434,7 +724,7 @@ export class AssistantProfileStack extends cdk.Stack {
       // Read the persona from SSM at cold start (always — the param may exist from a preserved prior deploy).
       asyncProcessor.addToRolePolicy(new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [systemPromptParamArn] }));
     }
-    // SPEC-PORTABLE-VERSIONED-PROFILES P0/P2/§7: the processor resolves its OWN active profile version
+    // SPEC-PORTABLE-PROFILES P0/P2/§7: the processor resolves its OWN active profile version
     // (P0), and — for a /battle profileRef variant — reads OTHER profiles' versions (P2), so grant read
     // across the whole assistant-definition namespace. READ-ONLY: the write path (PutParameter/label on
     // /assistant/*) belongs ONLY to the manage-profiles role; reading a definition is behavior, not a
@@ -473,6 +763,13 @@ export class AssistantProfileStack extends cdk.Stack {
       stringValue: asyncProcessor.functionArn,
       description: `Async-processor ARN for ${classification} classification`,
     });
+    // The handler READS this param on every turn (resolveAsyncProcessorArn), so it must be granted
+    // below. Without the grant the read fails AccessDenied and silently falls back to the
+    // *_ASYNC_PROCESSOR_ARN env var: turns still work, so nothing looks broken, but the indirection
+    // this param exists for — re-pointing a classification at a different processor WITHOUT
+    // redeploying the handler — never takes effect, and every turn logs an IAM stack trace that
+    // trains the reader to ignore AccessDenied.
+    const processorArnParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${processorArnKey(classification)}`;
 
     // ── Per-deployment intent taxonomy (intentPackParam profiles) + onboarding-intake (all) ──
     const intentPackParamName = `${SSM_ROOT}/assistant/${classification}/assistant-intent-pack`;
@@ -528,16 +825,63 @@ export class AssistantProfileStack extends cdk.Stack {
     // dispatch to THIS profile's async-processor. Live drift (Aurora) is wired in Aurora mode (all-profile).
     const drift = props.auroraDriftHookup ? auroraDriftWiring(this, classification, props.auroraDriftHookup) : undefined;
 
+    // Additional trusted IdP pools for a MULTI-IDP deployment, read from the same context key the
+    // notification fan-out uses. Empty on a single-IdP deployment, which is the default.
+    const additionalUserPoolIds = ((this.node.tryGetContext('notifyAdditionalUserPoolIds') as string | undefined) || '')
+      .split(',')
+      .map((s) => s.trim())
+      .filter(Boolean);
+
     const handlerRole = new iam.Role(this, 'AgentHandlerRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       inlinePolicies: {
-        // The handler only READS channel classification metadata + member count; it does not send.
+        // The handler READS channel classification metadata, member count and recent messages, and
+        // SENDS its own acknowledgment on a bypass turn (ADR-025).
+        //
+        // WHY IT SENDS. The handler already composes the acknowledgment text (`getQuickResponse` /
+        // `getTaskPlaceholder`, resolved from the profile version it loaded), so before this the words
+        // were authored here and the ACT was performed elsewhere - by Chime on the Lex path, by the
+        // channel flow on a bypass. One profile-resolved behaviour reaching the channel by two routes
+        // is the divergence class the `@all` and round-1 handoffs exist to remove. The Lex path is
+        // unchanged and still materialises from the fulfillment return; this grant covers the bypass
+        // turns, where the assistant now speaks its own acknowledgment.
+        //
+        // The grant goes through `classificationChannelScopedAllow`, which layers the archived-channel
+        // read-only Deny automatically because `chime:SendChannelMessage` is in
+        // `ARCHIVE_DENIED_ACTIONS`. That is asserted by a test rather than left to the helper, because
+        // protection that arrives as a side effect is what disappears quietly when the helper is
+        // bypassed.
+        //
+        // `ListChannelMessages` is here so the drift flow can resolve the MessageId of the message that
+        // triggered it: Chime does not send `CHIME.message.id` as a Lex request attribute, so the id is
+        // read back from the channel and matched on the exact text being handled. Without it the
+        // resolution is denied and
+        // swallowed by its own catch, and the new conversation's link back can only anchor to the
+        // conversation rather than the message. Still classification-scoped through the same helper, so a
+        // classification cannot read another's channels.
         ChimePolicy: new iam.PolicyDocument({
           statements: [
-            ...classificationChannelScopedAllow(classification, props.appInstanceArn, ['chime:DescribeChannel', 'chime:ListChannelMemberships'], { bearerResources: [`${props.appInstanceArn}/bot/*`] }),
+            // `GetChannelMessage` is here for the 1:1 `@all` fall-through: the attachment rides the
+            // message Metadata, which Lex never passes, so the one entry that answers reads the
+            // stored message back. Read-only, and classification-scoped through the same helper.
+            ...classificationChannelScopedAllow(classification, props.appInstanceArn, ['chime:DescribeChannel', 'chime:ListChannelMemberships', 'chime:ListChannelMessages', 'chime:GetChannelMessage', 'chime:SendChannelMessage'], { bearerResources: [`${props.appInstanceArn}/bot/*`] }),
             // Read the immutable `classification` tag to resolve the served profile. A tag-READ cannot
             // itself be gated (it is how the profile is learned) — read-only, discloses only the tag.
             new iam.PolicyStatement({ actions: ['chime:ListTagsForResource'], resources: [`${props.appInstanceArn}/channel/*`] }),
+            // ADR-012 drift scoping: ask the messaging service which channels ALL of this
+            // conversation's human members belong to (`SearchChannels`, MEMBERS…INCLUDES), instead of
+            // reconstructing that intersection from the Aurora archive, which lags exactly when
+            // membership has just changed. A search is an app-instance operation, so it cannot carry
+            // the per-channel tag condition the statement above uses — the BEARER is what bounds it.
+            //
+            // The bearer is a HUMAN member, not the bot: the service requires the searching
+            // AppInstanceUser's own ARN to appear in the MEMBERS filter, and rejects a bot bearer
+            // outright (`AppInstanceUser must include its own ARN for MEMBERS field`, verified live).
+            // The search therefore only ever sees channels that member already belongs to.
+            new iam.PolicyStatement({
+              actions: ['chime:SearchChannels'],
+              resources: [props.appInstanceArn, `${props.appInstanceArn}/user/*`],
+            }),
           ],
         }),
         BedrockPolicy: new iam.PolicyDocument({ statements: [
@@ -545,7 +889,7 @@ export class AssistantProfileStack extends cdk.Stack {
         ] }),
         SSMPolicy: new iam.PolicyDocument({ statements: [
           new iam.PolicyStatement({ actions: ['ssm:GetParameter'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${botArnKey(classification)}`] }),
-          // SPEC-PORTABLE-VERSIONED-PROFILES P2/§6: the router resolves an A/B profileRef variant to the
+          // SPEC-PORTABLE-PROFILES P2/§6: the router resolves an A/B profileRef variant to the
           // referenced profile version's model — READ-ONLY on the assistant-definition namespace (reading a
           // definition is behavior, not a boundary, §7). Writes stay exclusive to the manage-profiles role.
           new iam.PolicyStatement({ actions: ['ssm:GetParameter', 'ssm:GetParameterHistory'], resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/definition`] }),
@@ -565,9 +909,39 @@ export class AssistantProfileStack extends cdk.Stack {
               ...(battle ? [battle.battleStateArn, `arn:aws:dynamodb:${this.region}:${this.account}:table/${battle.channelBattleConfigName}`] : []),
             ],
           }),
+          // Channel Context store: GetItem for per-turn grounding, plus UpdateItem because this Lambda is
+          // also a conversation-CREATING path.
+          //
+          // The boundary here used to be read-only, on the rule that "writes belong to the create Lambdas".
+          // That rule assumed creation happens only in a create Lambda, and the drift-confirm flow breaks the
+          // assumption: it creates channels from inside this handler (`lib/channel-creation.ts`), and now
+          // enrolls the assistant so the new conversation gets the same composed welcome as any other. That
+          // welcome reads the participant shape, which must be written BEFORE the channel exists
+          // (SPEC-USER-PROFILE-AND-ONBOARDING §2), so the write has to be possible from here.
+          //
+          // Still narrow, and deliberately not the broad set: one GetItem and one UpdateItem are the only
+          // operations any caller in this Lambda performs. No PutItem (which would replace a whole item
+          // rather than patch owned fields), no Delete, no Scan or Query. The alternative — moving drift
+          // channel creation into a create Lambda, which `channel-creation.ts`'s own TODO proposes — keeps
+          // the original boundary and is the better end state; this grant is what makes the welcome correct
+          // in the meantime rather than silently degraded.
+          new iam.PolicyStatement({
+            actions: ['dynamodb:GetItem', 'dynamodb:UpdateItem'],
+            resources: [shared.channelContextArn],
+          }),
         ] }),
+        // AdminGetUser is granted on the FULL set of trusted pools, not just this deployment's own:
+        // the participant roster the prompt grounds on comes from live membership, and a FEDERATED
+        // member's name lives in their home IdP's pool. Same set, same context key
+        // (`notifyAdditionalUserPoolIds`) and same trust boundary as the notification fan-out. With
+        // no additional pools configured this is exactly the single-pool grant it always was.
         CognitoReadPolicy: new iam.PolicyDocument({ statements: [
-          new iam.PolicyStatement({ actions: ['cognito-idp:AdminListGroupsForUser', 'cognito-idp:AdminGetUser'], resources: [`arn:aws:cognito-idp:${this.region}:${this.account}:userpool/${shared.cognitoUserPoolId}`] }),
+          new iam.PolicyStatement({
+            actions: ['cognito-idp:AdminListGroupsForUser', 'cognito-idp:AdminGetUser'],
+            resources: [...new Set([shared.cognitoUserPoolId, ...additionalUserPoolIds])].map(
+              (poolId) => `arn:aws:cognito-idp:${this.region}:${this.account}:userpool/${poolId}`,
+            ),
+          }),
         ] }),
       },
       managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')],
@@ -577,6 +951,19 @@ export class AssistantProfileStack extends cdk.Stack {
       for (const stmt of driftChannelCreateStatements(classification, props.appInstanceArn, this.region, this.account)) {
         handlerRole.addToPolicy(stmt);
       }
+      // The ASYNC PROCESSOR needs the same data-plane access as the handler, because the first-turn
+      // summary seed runs there: it is the only component holding BOTH the user message and the
+      // assistant's reply at the moment the reply is produced. The handler dispatches and returns, so
+      // it never sees the answer.
+      //
+      // Without this the seed is silently inert - `seedConversationSummary` gates on hasDataPlane(),
+      // which reads AURORA_DATA_PLANE_ARN, so an unwired processor no-ops with no error and drift
+      // never gets its turn-one anchor. Verified live: all three AsyncProcessors had the variable
+      // unset while the handlers had it, so a green deploy shipped a feature that did nothing.
+      for (const [key, value] of Object.entries(drift.env)) {
+        asyncProcessor.addEnvironment(key, value);
+      }
+      if (asyncProcessor.role) drift.grantTo(asyncProcessor.role);
     }
     // Handler SSM reads: the onboarding-intake schema (all profiles) + the intent pack (intentPackParam
     // profiles). The bot-arn read is in the inline SSMPolicy above; these ride the role's default policy
@@ -584,22 +971,60 @@ export class AssistantProfileStack extends cdk.Stack {
     handlerRole.addToPolicy(
       new iam.PolicyStatement({
         actions: ['ssm:GetParameter'],
-        resources: [onboardingIntakeParamArn, welcomeParamArn, ...(topo.intentPackParam ? [intentPackParamArn] : [])],
+        resources: [
+          onboardingIntakeParamArn,
+          welcomeParamArn,
+          processorArnParamArn,
+          // THE ALT-BOT SLOT ROSTER. `isSanctionedBattleBot` reads it to validate a caller-supplied bot
+          // identity on a `/battle` turn, and it FAILS CLOSED: without this grant the read throws
+          // AccessDenied, every alt-slot identity is rejected, and both sides of a duel answer as the
+          // classification's own bot. The duel still runs, which is why this shipped inert and was only
+          // caught by the backend-error guard on a live run (`[battle-turn] alt-bot roster unreadable`).
+          //
+          // Read-only, and it is a ROSTER of sanctioned ARNs - reading it is how the boundary is
+          // enforced, not a widening of it.
+          `arn:aws:ssm:${this.region}:${this.account}:parameter${INSTANCE_SSM.altBotSlotsRoster}`,
+          ...(topo.intentPackParam ? [intentPackParamArn] : []),
+        ],
+      }),
+    );
+
+    // The router resolves the ACTIVE profile version too (its classifier model is per-profile,
+    // SPEC-ASSISTANT-CONFIG §4 U2b), and an active version's persona lives in S3 behind a pointer.
+    // Without the bucket env + grant, `hydrateBodies` failed on the router, `resolveActiveProfile`
+    // fail-closed to the compiled seed with only a console.warn, and the router classified with the
+    // deployment default forever while the processor ran the activated version. The grant is
+    // `profiles/*` ONLY - the router gets none of the processor's classification-scoped context
+    // prefixes.
+    handlerRole.addToPolicy(
+      new iam.PolicyStatement({
+        actions: ['s3:GetObject'],
+        resources: [`${props.attachmentsBucketArn}/profiles/*`],
       }),
     );
 
     const handlerEnv: Record<string, string> = {
       CLASSIFICATION: classification,
+      PROFILE_BODY_BUCKET: props.attachmentsBucketName,
       ...(drift?.env ?? {}),
       ...(drift ? { CHANNEL_FLOW_ARN_PARAM: CHANNEL_FLOW_ARN_SSM_KEY } : {}),
       SSM_ROOT,
       ONBOARDING_INTAKE_PARAM: onboardingIntakeParamName,
       ASSISTANT_WELCOME_PARAM: welcomeParamName,
       BOT_ARN_PARAM: botArnKey(classification),
+      // Named explicitly rather than left to `battle-turn.ts`'s hardcoded fallback. The fallback is
+      // `/agent-echelon/alt-bot-slots/roster`, which is only correct while SSM_ROOT is the default - a
+      // deployment that sets its own root would read a parameter that does not exist, fail closed, and
+      // silently run every duel with one bot answering as both sides.
+      ALT_BOT_SLOTS_ROSTER_PARAM: INSTANCE_SSM.altBotSlotsRoster,
       [`${classification.toUpperCase()}_ASYNC_PROCESSOR_ARN`]: asyncProcessor.functionArn,
       APP_INSTANCE_ARN: props.appInstanceArn,
       AWS_ACCOUNT_ID: this.account,
       USER_POOL_ID: shared.cognitoUserPoolId,
+      // Which OTHER pools a federated member's name may be resolved from. Absent on a single-IdP
+      // deployment; the router then queries only `USER_POOL_ID` and leaves anyone else unnamed
+      // rather than guessing at a pool.
+      ...(additionalUserPoolIds.length ? { NOTIFY_ALLOWED_POOL_IDS: additionalUserPoolIds.join(',') } : {}),
       // Intent classification is a cheap, high-frequency call — always Haiku (on-demand-capable), never
       // the profile primary (a bare on-demand id for Opus/Sonnet is rejected by Bedrock).
       CLASSIFIER_MODEL_ID: modelCatalog['haiku'].bedrockModelId,
@@ -609,6 +1034,7 @@ export class AssistantProfileStack extends cdk.Stack {
       // can leave this and instead set USER_PROFILE_SERVICE_ARN to reach their own store; the client
       // prefers the ARN when present. See SPEC-USER-PROFILE-AND-ONBOARDING.md.
       USER_PROFILE_TABLE: shared.userProfileName,
+      CHANNEL_CONTEXT_TABLE: shared.channelContextName,
       EXPERIMENTS_TABLE: shared.experimentsName,
       ...abuse.env,
     };
@@ -629,11 +1055,56 @@ export class AssistantProfileStack extends cdk.Stack {
       bundling: { minify: false, forceDockerBundling: false },
     });
     asyncProcessor.grantInvoke(agentHandler);
+    // THE HANDOVER INVOKES THIS SAME FUNCTION as the assistant that owns the chain.
+    //
+    // A message answers the TASK, not whoever it was addressed to, so an assistant that receives one it
+    // does not own hands the turn to the one that does (rule 1, owner 2026-08-14). It cannot be sent as
+    // a message: ADR-023 measured that Amazon Chime SDK does not deliver a bot-authored message to
+    // another bot's Lex, so it would reach nobody.
+    //
+    // SELF is the whole target set, not a shortcut. Every identity this handler may answer as is one
+    // `isSanctionedBattleBot` sanctions - this classification's own bot, or an alt slot - and this
+    // function serves all of them, so the grant is exactly as wide as the sanction check.
+    //
+    // ITS OWN POLICY RESOURCE, not the role's default one, and that is the whole trick.
+    //
+    // `grantInvoke` puts the statement on the role's DEFAULT policy, which CDK makes the function
+    // depend on - so a statement naming the function closes a cycle (default policy -> function ->
+    // default policy) and the template will not deploy at all. A policy of its own carries no such
+    // dependency, so it can reference the function's real ARN.
+    //
+    // The alternative - a name PATTERN, which is what the battle stack must use across stacks - is not
+    // good enough here, and the reason is worth keeping: CloudFormation truncates the stack name when
+    // the generated physical name would exceed 64 characters, so this handler is really
+    // `AgentEchelonClassification-Pr-AgentHandler...`, and a pattern built from the full stack name
+    // matches nothing. That grant deploys clean and denies at runtime.
+    new iam.Policy(this, 'AgentHandlerSelfInvoke', {
+      roles: [handlerRole],
+      statements: [new iam.PolicyStatement({
+        actions: ['lambda:InvokeFunction'],
+        resources: [agentHandler.functionArn],
+      })],
+    });
     abuse.grant(handlerRole);
+    // `sourceAccount` is the confused-deputy condition, and it is load-bearing rather than hygiene.
+    //
+    // A Lex fulfillment code hook controls the request attributes it sends, and `isFlowEntry(event)`
+    // reads one of them (`AE.entry`) to decide whether this turn came from the channel flow. Since
+    // ADR-025 that flag no longer selects a response SHAPE - it gates whether the handler POSTS A
+    // MESSAGE ITSELF, as a resolved bot identity (`postAsAssistant`). Without this condition the
+    // resource policy accepts the Lex SERVICE principal from ANY account, so a Lex bot outside this
+    // account could set that attribute and reach the authorship path. Scoping to this account closes
+    // the only route by which the `isFlowEntry` gate can be reached from outside the two sanctioned
+    // callers (the channel flow and the battle orchestrator, both identity-based grants).
+    //
+    // IAM still bounds the damage either way - the send is classification-tag-scoped, bearer-restricted
+    // to `/bot/*`, and carries the archived-channel Deny - but "bounded impersonation" is not the
+    // boundary this should rest on.
     new lambda.CfnPermission(this, 'AgentHandlerLexInvoke', {
       action: 'lambda:InvokeFunction',
       functionName: agentHandler.functionName,
       principal: 'lexv2.amazonaws.com',
+      sourceAccount: this.account,
     });
     const handlerArn = agentHandler.functionArn;
 
@@ -646,6 +1117,27 @@ export class AssistantProfileStack extends cdk.Stack {
     });
 
     // ── Lex bot + AppInstanceBot (per profile) ──────────────────────────────
+
+    // CONVERSATION LOGS: THE ONLY INSTRUMENT THAT CAN SEE A DUPLICATE FULFILLMENT'S ORIGIN.
+    //
+    // One user message sometimes produces TWO fulfillments of the same turn. `lib/correlation.ts`
+    // measured what it is NOT - not a timeout (a turn duplicated at 3055ms while six slower ones, to
+    // 4222ms, did not), and not initiated by this codebase, because nothing here invokes the router:
+    // Lex does. It concludes that confirming the trigger "needs Lex conversation logs", and until now
+    // there were none, on any deployment, so the question could not be asked at all.
+    //
+    // Text logs only. Audio does not apply (this is a messaging bot with no speech), and text logs
+    // record the request/response pair per invocation - which is exactly what distinguishes ONE Lex
+    // invocation that our handler ran twice from TWO Lex invocations of the same turn.
+    //
+    // Retention is short on purpose: this is a diagnostic instrument for an open investigation, not an
+    // audit trail. The immutable S3 conversation archive is the record of what was SAID; this only
+    // records how many times Lex asked.
+    const lexConversationLogGroup = new logs.LogGroup(this, 'LexConversationLogs', {
+      retention: logs.RetentionDays.TWO_WEEKS,
+      removalPolicy: cdk.RemovalPolicy.DESTROY,
+    });
+
     const lexBotRole = new iam.Role(this, 'LexBotRole', {
       assumedBy: new iam.CompositePrincipal(
         new iam.ServicePrincipal('lexv2.amazonaws.com'),
@@ -658,6 +1150,10 @@ export class AssistantProfileStack extends cdk.Stack {
         }),
       },
     });
+    // Conversation logs are written by LEX under the BOT's role, not by the provisioning Lambda under
+    // its own. Granting the wrong one leaves the alias configured and the log group permanently empty,
+    // which reads as "no duplicates" - the failure mode this whole investigation is trying to avoid.
+    lexConversationLogGroup.grantWrite(lexBotRole);
 
     const createLexBotRole = new iam.Role(this, 'CreateLexBotRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
@@ -688,6 +1184,7 @@ export class AssistantProfileStack extends cdk.Stack {
         AWS_ACCOUNT_ID: this.account,
         BOT_HANDLER_LAMBDA_ARN: handlerArn,
         APP_INSTANCE_ARN: props.appInstanceArn,
+        LEX_CONVERSATION_LOG_GROUP_ARN: lexConversationLogGroup.logGroupArn,
       },
       handler: 'handler',
       role: createLexBotRole,
@@ -700,7 +1197,22 @@ export class AssistantProfileStack extends cdk.Stack {
     const lexResource = new cdk.CustomResource(this, 'CreateLexBotResource', {
       serviceToken: lexProvider.serviceToken,
       removalPolicy: cdk.RemovalPolicy.DESTROY,
-      properties: { tier: classification, botName: `Assistant-${classification}` }, // `tier` property key is the create-lex-bot custom-resource contract (PR5b)
+      properties: {
+        tier: classification, // `tier` property key is the create-lex-bot custom-resource contract (PR5b)
+        botName: `Assistant-${classification}`,
+        // THE LOG GROUP IS A PROPERTY SO THE RESOURCE ACTUALLY RE-RUNS.
+        //
+        // CloudFormation invokes a Custom Resource on Update only when its PROPERTIES change. Changing
+        // the provider Lambda's CODE does not do it. The first attempt at conversation logs shipped
+        // exactly that way: the handler learned to configure them, the stack updated successfully, no
+        // Update event was ever sent, and `describe-bot-alias` returned
+        // `conversationLogSettings: null`. Green deploy, nothing applied.
+        //
+        // Passing the ARN makes the property change when the log group appears or moves, which is
+        // precisely when the alias needs reconfiguring. It also documents the dependency: this
+        // resource's configuration depends on that log group.
+        conversationLogGroupArn: lexConversationLogGroup.logGroupArn,
+      },
     });
     const lexBotAliasArn = lexResource.getAtt('LexBotAliasArn').toString();
 

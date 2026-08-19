@@ -54,6 +54,14 @@ describe('profile-registry (default config = legacy behavior)', () => {
     expect(reg.scopeAtOrBelow('basic')).toEqual(['basic']);
   });
 
+  it('contextPrefixesAtOrBelow derives the S3 prefixes (IAM + retrieval consume this one resolver)', () => {
+    // Ascending by rank (IAM order); highestFirst reproduces the old hardcoded retrieval list.
+    expect(reg.contextPrefixesAtOrBelow('premium')).toEqual(['context/basic/', 'context/standard/', 'context/premium/']);
+    expect(reg.contextPrefixesAtOrBelow('premium', { highestFirst: true })).toEqual(['context/premium/', 'context/standard/', 'context/basic/']);
+    expect(reg.contextPrefixesAtOrBelow('standard')).toEqual(['context/basic/', 'context/standard/']);
+    expect(reg.contextPrefixesAtOrBelow('basic')).toEqual(['context/basic/']);
+  });
+
   it('profileFor returns the legacy capability bundle, with basic classified by LLM (intended deviation)', () => {
     const basic = reg.profileFor('basic');
     expect(basic.modelKey).toBe('haiku');
@@ -102,6 +110,10 @@ describe('profile-registry (aliases + non-default config)', () => {
     expect(reg.clearanceForGroups(['legal'])).toBe('restricted');
     expect(reg.scopeAtOrBelow('confidential')).toEqual(['internal', 'confidential']);
     expect(reg.profileFor('restricted').modelKey).toBe('opus');
+    // Drift-proof: the context prefixes derive from THIS config's classifications, not a hardcoded
+    // basic/standard/premium list — so IAM and retrieval move together on a renamed/added classification.
+    expect(reg.contextPrefixesAtOrBelow('confidential')).toEqual(['context/internal/', 'context/confidential/']);
+    expect(reg.contextPrefixesAtOrBelow('restricted', { highestFirst: true })).toEqual(['context/restricted/', 'context/confidential/', 'context/internal/']);
   });
 });
 

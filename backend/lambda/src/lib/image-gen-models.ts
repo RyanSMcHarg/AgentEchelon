@@ -126,6 +126,22 @@ export interface ImageGenModelDef {
    * exact variable to set.
    */
   authEnvVar?: string;
+  /**
+   * The ONLY region this Bedrock model is offered in, when it is not offered everywhere.
+   *
+   * Bedrock does not carry every model in every region, and an id invoked in the wrong one fails with
+   * `ValidationException: The provided model identifier is invalid` — a message that reads exactly
+   * like a typo and sent one investigation after another chasing the id instead of the region.
+   * Declaring it here makes the registry self-describing: the invoker builds its client for the
+   * model's region, so image generation works out of the box in ANY deploy region with no deployer
+   * configuration. `IMAGE_GEN_REGION` remains an override for a deployer who has the model somewhere
+   * else. Undefined ⇒ the model is available in the deploy region (the common case).
+   *
+   * Whatever is set here MUST also be reachable by the processor's IAM grant — the grants use an
+   * `arn:aws:bedrock:*::foundation-model/...` region wildcard so a region-pinned model stays covered.
+   * `image-gen-iam-parity.test.ts` holds the registry and that grant together.
+   */
+  region?: string;
   /** Hard caps the shaper clamps to (cost guard; tightened in 4D). */
   maxImages: number;
   maxDimension: number;
@@ -155,6 +171,8 @@ export const IMAGE_GEN_MODELS: Record<ImageGenModelKey, ImageGenModelDef> = {
   // Stability Image Core — currently-ACTIVE Bedrock model. The AWS-
   // native option for deployers who want everything in one cloud
   // (IAM auth, no external API keys, no egress).
+  // us-west-2 ONLY: the Stability base generators are not offered in
+  // us-east-1, where the only text-to-image model is Nova Canvas.
   stability_image_core: {
     key: 'stability_image_core',
     displayName: 'Stability Image Core (Bedrock)',
@@ -162,6 +180,7 @@ export const IMAGE_GEN_MODELS: Record<ImageGenModelKey, ImageGenModelDef> = {
     provider: 'stability',
     hosting: 'aws-bedrock',
     lifecycle: 'active',
+    region: 'us-west-2',
     maxImages: 1,
     // Stability's API takes an aspect_ratio rather than explicit pixel
     // dimensions; the registry's maxDimension is informational (used
@@ -176,6 +195,7 @@ export const IMAGE_GEN_MODELS: Record<ImageGenModelKey, ImageGenModelDef> = {
     provider: 'stability',
     hosting: 'aws-bedrock',
     lifecycle: 'active',
+    region: 'us-west-2',
     maxImages: 1,
     maxDimension: 1024,
   },
@@ -225,6 +245,27 @@ export const IMAGE_GEN_RATE_USD_PER_IMAGE: Record<ImageGenModelKey, number> = {
   // Subscription / commit plans are cheaper.
   fal_flux_pro_1_1: 0.04,
 };
+
+/**
+ * Every Bedrock image model's foundation-model ARN, for the processor role's `bedrock:InvokeModel`
+ * grant. DERIVED from the registry rather than hand-listed in the stack, so adding a model cannot
+ * leave it ungranted.
+ *
+ * That drift is not hypothetical: the grant used to name Titan Image and Nova Canvas only — both
+ * LEGACY — while `DEFAULT_IMAGE_MODEL` had moved to Stability Image Core. The shipped default was
+ * ungranted, so every image turn failed, and unit tests could not see it because the gap was between
+ * the registry and a CDK policy that nothing compared it to.
+ *
+ * LEGACY entries are included deliberately: an existing profile may still be bound to one, and
+ * revoking its permission would turn a working (if deprecated) configuration into an access error.
+ *
+ * The `:*:` region wildcard covers models Bedrock offers in only some regions — see `region` on the
+ * definition. `external-http` providers are excluded: they authenticate with an API key over HTTPS
+ * and are not IAM-reachable at all.
+ */
+export const BEDROCK_IMAGE_MODEL_ARNS: string[] = Object.values(IMAGE_GEN_MODELS)
+  .filter((m) => m.hosting === 'aws-bedrock')
+  .map((m) => `arn:aws:bedrock:*::foundation-model/${m.bedrockModelId}`);
 
 /**
  * List models filtered by lifecycle. Default: `active` only. Use this
@@ -514,22 +555,82 @@ export interface ImageGenInvokeResult {
   modelId: string;
 }
 
-// Lazy module-level client — constructed once, reused across warm
-// Lambda invocations (mirrors async-processor-core / intent-classifier).
-let _client: BedrockRuntimeClient | undefined;
-function defaultSendClient(): ImageGenSendClient {
-  if (!_client) {
-    // IMAGE_GEN_REGION lets a us-east-1 deployment reach the Stability base
-    // generators that are only offered in us-west-2; falls back to the
-    // Lambda's own region. (External-HTTP providers don't use this client.)
-    _client = new BedrockRuntimeClient({
-      region: process.env.IMAGE_GEN_REGION || process.env.AWS_REGION || 'us-east-1',
-    });
+/**
+ * The guardrail to apply for an image invocation IN A GIVEN REGION.
+ *
+ * **Guardrails are regional, and image models are not always local.** `stability_image_core` and
+ * `stability_image_ultra` are offered only in `us-west-2`, so a `us-east-1` deployment invokes them
+ * cross-region - while `BATTLE_IMAGE_GUARDRAIL_ID` names a guardrail in the DEPLOY region. Passing it
+ * to a call made in another region fails with:
+ *
+ *   ValidationException: The guardrail identifier or version provided in the request does not exist.
+ *
+ * which reads exactly like a bad id and is why two investigations checked the id (it was fine, and so
+ * was its version) before anyone checked the region. This is the same trap `region` on the model
+ * definition already documents; the model pinning was fixed and the guardrail was left behind.
+ *
+ * `BATTLE_IMAGE_GUARDRAIL_BY_REGION` is a JSON map of region -> `{id, version}`, populated at deploy
+ * for every region an active image model lives in. The legacy single-value env still applies, but only
+ * for the DEPLOY region, which is the one it was always provisioned in.
+ *
+ * Returns undefined when no guardrail covers the region. The CALLER MUST NOT then invoke unguarded:
+ * silently dropping content moderation is a safety regression that no test would notice.
+ */
+export function imageGuardrailFor(region: string): { id: string; version: string } | undefined {
+  const raw = process.env.BATTLE_IMAGE_GUARDRAIL_BY_REGION;
+  if (raw) {
+    try {
+      const map = JSON.parse(raw) as Record<string, { id?: string; version?: string }>;
+      const hit = map[region];
+      if (hit?.id && hit.version) return { id: hit.id, version: hit.version };
+    } catch {
+      // A malformed map must not read as "no guardrail configured anywhere" - fall through to the
+      // single-value env, and let the caller's no-guardrail branch handle a genuine absence.
+      console.warn('[image-gen] BATTLE_IMAGE_GUARDRAIL_BY_REGION is not valid JSON; ignoring it');
+    }
   }
-  const c = _client;
+  const deployRegion = process.env.AWS_REGION || 'us-east-1';
+  const id = process.env.BATTLE_IMAGE_GUARDRAIL_ID;
+  const version = process.env.BATTLE_IMAGE_GUARDRAIL_VERSION;
+  if (region === deployRegion && id && version) return { id, version };
+  return undefined;
+}
+
+/**
+ * The region to invoke a given image model in.
+ *
+ * Precedence, highest first:
+ *   1. `IMAGE_GEN_REGION` — the deployer's explicit override, for an account that has the model
+ *      somewhere other than where the registry says.
+ *   2. `def.region` — the model's declared home, for a model Bedrock offers in ONE region only.
+ *      This is what makes a us-west-2-only generator work from a us-east-1 deployment with no
+ *      configuration at all.
+ *   3. The Lambda's own region — the common case, where the model is offered locally.
+ *
+ * The override is checked FIRST on purpose: a deployer who sets it has information this registry does
+ * not, and silently preferring a hardcoded region over their explicit setting would be unfixable
+ * from the outside.
+ */
+export function imageGenRegionFor(def?: Pick<ImageGenModelDef, 'region'>): string {
+  return process.env.IMAGE_GEN_REGION || def?.region || process.env.AWS_REGION || 'us-east-1';
+}
+
+// Lazy clients, keyed BY REGION and reused across warm Lambda invocations (mirrors
+// async-processor-core / intent-classifier). Keyed rather than single because two profiles in one
+// deployment can legitimately select models with different homes — a single cached client would
+// serve whichever model ran first and send the other to the wrong endpoint.
+const _clients = new Map<string, BedrockRuntimeClient>();
+function defaultSendClient(def?: ImageGenModelDef): ImageGenSendClient {
+  const region = imageGenRegionFor(def);
+  let c = _clients.get(region);
+  if (!c) {
+    c = new BedrockRuntimeClient({ region });
+    _clients.set(region, c);
+  }
+  const client = c;
   return {
     send: (command: InvokeModelCommand, options?: { abortSignal?: AbortSignal }) =>
-      c.send(command, options),
+      client.send(command, options),
   };
 }
 
@@ -774,7 +875,7 @@ export async function invokeImageGenModel(
     return invokeExternalHttp(def, body, opts);
   }
 
-  const client = opts.client ?? defaultSendClient();
+  const client = opts.client ?? defaultSendClient(def);
   const maxRetries = opts.maxRetries ?? 2;
   const baseDelayMs = opts.baseDelayMs ?? 200;
   const requestTimeoutMs = opts.requestTimeoutMs ?? 60_000;

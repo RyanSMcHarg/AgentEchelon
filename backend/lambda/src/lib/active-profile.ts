@@ -1,5 +1,5 @@
 /**
- * Active profile resolution — SPEC-PORTABLE-VERSIONED-PROFILES P0 ("store + decouple").
+ * Active profile resolution — SPEC-PORTABLE-PROFILES P0 ("store + decouple").
  *
  * The capability-profiles migration froze a profile as deploy-time-only, 1:1 with a classification.
  * P0 relaxes exactly that: a profile's *behavioral* fields resolve at runtime from the **active
@@ -33,6 +33,8 @@ import { INTENT_ROUTE_STRATEGY } from '../../../lib/config/model-strategy.js';
 import type { IntentRouteDefinition, RouteKey, BackendModelKey } from '../../../lib/config/model-strategy.js';
 import { ALL_TOOL_NAMES, unknownTools } from './tool-registry.js';
 import { IMAGE_GEN_MODELS, type ImageGenModelKey } from './image-gen-models.js';
+import { validateTaskStateMachines, TaskMachineValidationError, type TaskStateMachine } from './task-state-machines.js';
+import { hydrateBodies, type ProfileBodyRef } from './profile-bodies.js';
 
 /** Current definition schema version. Bumped when the serialized shape changes (import migrations, §5). */
 export const PROFILE_DEFINITION_SCHEMA_VERSION = 1 as const;
@@ -57,7 +59,7 @@ export const DEFAULT_IMAGE_MODEL: ImageGenModelKey = 'stability_image_core';
  * per-intent overrides, all bounded by the classification's `bedrock:InvokeModel` allowlist (the
  * security ceiling — validated at the write path, §7). `byIntent` moves per-intent routing OFF the
  * global `model-strategy` table and onto the profile, which is the level of control a portable,
- * versioned assistant needs (SPEC-PORTABLE-VERSIONED-PROFILES §6).
+ * versioned assistant needs (SPEC-PORTABLE-PROFILES §6).
  */
 /**
  * Sentinel model value meaning "follow the classification-set default, whatever it is now". Stored
@@ -119,6 +121,21 @@ export interface ProfileDefinitionBody {
   /** Selection among deployment-provisioned guardrails (a version selects, never points at an arbitrary
    *  resource — §7 boundary). */
   guardrailId?: string;
+  /** Per-assistant task state machines (SPEC-CONFIGURABLE-ASSISTANTS 4.5), keyed by taskType. Preferred
+   *  over the deployment intent-pack machines at loop time, so a triage assistant and a report assistant
+   *  can carry DIFFERENT task lifecycles. Absent ⇒ inherit the deployment pack (byte-identical). Validated
+   *  (validateTaskStateMachines) at the write path AND here (shape/graph). */
+  machines?: Record<string, TaskStateMachine>;
+  /** Per-assistant PERSONA - the system-prompt body (SPEC-CONFIGURABLE-ASSISTANTS §2, SPEC-PORTABLE §5).
+   *  Rides the versioned definition so two versions can differ in character and an export/import carries
+   *  it across instances. Absent ⇒ the deployment persona seam (ASSISTANT_SYSTEM_PROMPT[_PARAM] →
+   *  defaultPersonaFor). Length-capped at the write path. */
+  persona?: string;
+  /** Context sources this profile SELECTS, by catalog key (SPEC-CONTEXT-SOURCES-AND-STORES §7). Logical and
+   *  instance-independent - never an ARN - so an export carries the selection and the target resolves it
+   *  against its OWN catalog. LIST ORDER IS PROMPT ORDER: the catalog says what exists, the profile says
+   *  what is used and in what sequence, so two orderings can never disagree. Absent ⇒ no catalog sources. */
+  contextSources?: string[];
   classifierMode: 'keyword' | 'llm';
   timeoutSeconds: number;
   taskSupport: 'lightweight' | 'full';
@@ -133,6 +150,16 @@ export interface ProfileDefinition extends ProfileDefinitionBody {
   profileName: string;
   /** Fingerprint of the behavioral body; a version's attribution key (analytics slices by it, §6). */
   configId: string;
+  /**
+   * Pointer to the persona when it lives in S3 instead of inline (SPEC-PORTABLE-PROFILES, "Bodies are
+   * S3"). Present on a stored definition INSTEAD of `persona`; the two are never both set.
+   *
+   * ENVELOPE, NOT BODY - it is deliberately absent from `RUNTIME_EDITABLE_KEYS`, so it is not hashed
+   * into `configId` and `bodyFrom` strips it. That is what keeps a version's identity a property of
+   * WHAT IT SAYS rather than WHERE IT IS KEPT: the same persona hashes the same inline or offloaded, so
+   * migrating a deployment's storage does not re-key its analytics or invalidate an exported manifest.
+   */
+  personaRef?: ProfileBodyRef;
 }
 
 const RUNTIME_EDITABLE_KEYS: ReadonlyArray<keyof ProfileDefinitionBody> = [
@@ -140,6 +167,9 @@ const RUNTIME_EDITABLE_KEYS: ReadonlyArray<keyof ProfileDefinitionBody> = [
   'models',
   'tools',
   'guardrailId',
+  'machines',
+  'persona',
+  'contextSources',
   'classifierMode',
   'timeoutSeconds',
   'taskSupport',
@@ -182,6 +212,14 @@ export function profileDefinitionConfigId(body: ProfileDefinitionBody): string {
  * it needs the model catalog and is enforced by the write path (profile-lifecycle validate); this is
  * the schema/shape check shared by the runtime parse and the lifecycle validate.
  */
+/** Persona length cap (~5k tokens of system prompt). Bounds a version's prompt so an import/edit can't
+ *  smuggle an unbounded persona; generous enough for a rich, grounded persona. */
+export const MAX_PERSONA_LENGTH = 20000;
+
+/** Upper bound on selected context sources. The list is prompt order, so an unbounded one is a
+ *  prompt-size and per-turn latency problem, not merely untidy. */
+export const MAX_CONTEXT_SOURCES = 16;
+
 export function validateDefinitionBody(body: Partial<ProfileDefinitionBody>): string[] {
   const errs: string[] = [];
   if (typeof body.modelKey !== 'string' || !body.modelKey) errs.push('modelKey required');
@@ -190,6 +228,27 @@ export function validateDefinitionBody(body: Partial<ProfileDefinitionBody>): st
   if (body.taskSupport !== 'lightweight' && body.taskSupport !== 'full') errs.push('taskSupport must be lightweight|full');
   if (body.rateLimitPerHour !== undefined && (typeof body.rateLimitPerHour !== 'number' || body.rateLimitPerHour < 0)) errs.push('rateLimitPerHour must be a non-negative number');
   if (body.battleEligible !== undefined && typeof body.battleEligible !== 'boolean') errs.push('battleEligible must be a boolean');
+  // Persona (system-prompt body). String, length-capped so a version can't smuggle an unbounded prompt.
+  if (body.persona !== undefined) {
+    if (typeof body.persona !== 'string') errs.push('persona must be a string');
+    else if (body.persona.length > MAX_PERSONA_LENGTH) errs.push(`persona must be at most ${MAX_PERSONA_LENGTH} characters`);
+  }
+  // SPEC-CONTEXT-SOURCES-AND-STORES §7: context SELECTION (shape only). Whether each key exists in this
+  // classification's published catalog is checked by `contextSelectionErrors` on the validate and
+  // activate paths, and by import — all three read the catalog, which this shape check cannot. Here we
+  // only guarantee it is a list of non-empty keys, so a malformed selection cannot reach resolution.
+  // Bounded because the list is prompt order and an unbounded one is a prompt-size and latency
+  // problem, not just a tidiness one.
+  if (body.contextSources !== undefined) {
+    if (!Array.isArray(body.contextSources)) errs.push('contextSources must be an array of catalog keys');
+    else if (body.contextSources.length > MAX_CONTEXT_SOURCES) {
+      errs.push(`contextSources must name at most ${MAX_CONTEXT_SOURCES} sources`);
+    } else if (!body.contextSources.every((k) => typeof k === 'string' && k.trim().length > 0)) {
+      errs.push('contextSources entries must be non-empty strings');
+    } else if (new Set(body.contextSources).size !== body.contextSources.length) {
+      errs.push('contextSources must not repeat a key');
+    }
+  }
   // SPEC-ASSISTANT-CONFIG §4: the per-profile model bundle (shape only — the InvokeModel-allowlist
   // boundary for each model is enforced at the write path, §7, where the catalog is available).
   if (body.models !== undefined) {
@@ -236,6 +295,20 @@ export function validateDefinitionBody(body: Partial<ProfileDefinitionBody>): st
     }
   }
   if (body.guardrailId !== undefined && (typeof body.guardrailId !== 'string' || !body.guardrailId)) errs.push('guardrailId must be a non-empty string');
+  // Per-assistant task machines (4.5): validate the FULL graph (initial in states, every transition
+  // target declared, terminal shape) with the same checker the deployment pack uses, so a hostile /
+  // malformed version can't seed an invalid lifecycle that would strand tasks.
+  if (body.machines !== undefined) {
+    if (typeof body.machines !== 'object' || body.machines === null || Array.isArray(body.machines)) {
+      errs.push('machines must be a map of taskType→TaskStateMachine');
+    } else {
+      try {
+        validateTaskStateMachines(body.machines as Record<string, TaskStateMachine>);
+      } catch (err) {
+        errs.push(err instanceof TaskMachineValidationError ? err.message : `machines invalid: ${(err as Error).message}`);
+      }
+    }
+  }
   return errs;
 }
 
@@ -256,6 +329,9 @@ export function bodyFrom(obj: Partial<ProfileDefinitionBody>): ProfileDefinition
     ...(obj.models !== undefined ? { models: obj.models } : {}),
     ...(obj.tools !== undefined ? { tools: obj.tools } : {}),
     ...(obj.guardrailId !== undefined ? { guardrailId: obj.guardrailId } : {}),
+    ...(obj.machines !== undefined ? { machines: obj.machines } : {}),
+    ...(obj.persona !== undefined ? { persona: obj.persona } : {}),
+    ...(obj.contextSources !== undefined ? { contextSources: obj.contextSources } : {}),
     classifierMode: obj.classifierMode as 'keyword' | 'llm',
     timeoutSeconds: obj.timeoutSeconds as number,
     taskSupport: obj.taskSupport as 'lightweight' | 'full',
@@ -354,11 +430,33 @@ function bodyOf(profile: AssistantProfile): ProfileDefinitionBody {
  * Serialize a profile's SEED (version 1) definition for the initial SSM write. The seed is
  * byte-for-byte the compiled default, so a fresh deploy that activates it changes nothing.
  * Returns null when the name is not a declared profile (nothing to seed).
+ *
+ * `persona` is the deployment's persona, folded into the definition when the caller has one. It
+ * belongs HERE rather than only in the `assistant-system-prompt` SSM parameter, because the
+ * definition is the portable artifact: `profile-manifest` exports the persona with the version, and
+ * the async processor prefers it over the deployment seam precisely "so an import carries it"
+ * (assistant-async-processor.ts). A deployment whose persona lives only in the parameter exports a
+ * profile that is mute about who the assistant is, and lands on another instance answering as the
+ * generic default - the portable artifact is not portable.
+ *
+ * Callers that want the pure compiled default (the lifecycle reset baseline, the manifest's seed
+ * comparison) omit it and get the previous behaviour byte-for-byte. The persona is part of the
+ * hashed body, so two personas are two configIds - which is what makes per-turn config attribution
+ * able to tell them apart.
  */
-export function serializeSeedDefinition(profileName: string): string | null {
+export function serializeSeedDefinition(profileName: string, persona?: string): string | null {
   const seed = defaultProfileRegistry.profileByName(profileName);
   if (!seed) return null;
-  const body = bodyOf(seed);
+  // Empty/whitespace is treated as absent, matching the runtime's `persona?.trim() || fallback`.
+  //
+  // Line endings are normalised to LF first. A persona authored in the repo reaches this function via
+  // a git checkout, and on Windows `core.autocrlf` rewrites its newlines to CRLF - so the SAME profile
+  // seeded from a Windows machine and from CI produces different bytes, a different content hash, and
+  // therefore a different configId. That silently splits per-turn config attribution across platforms
+  // and makes an exported manifest's contentHash depend on who exported it. Observed live: the
+  // deployment's standard persona was byte-identical to the source apart from 9 carriage returns.
+  const trimmed = persona?.replace(/\r\n/g, '\n').trim();
+  const body = { ...bodyOf(seed), ...(trimmed ? { persona: trimmed } : {}) };
   const def: ProfileDefinition = {
     schemaVersion: PROFILE_DEFINITION_SCHEMA_VERSION,
     profileName,
@@ -396,6 +494,11 @@ interface CacheEntry {
   models?: ProfileModels;
   tools?: string[];
   imageModelKey?: string;
+  machines?: Record<string, TaskStateMachine>;
+  guardrailId?: string;
+  persona?: string;
+  /** Catalog context source KEYS this version selects, in prompt order (SPEC-CONTEXT-SOURCES-AND-STORES). */
+  contextSources?: string[];
   expires: number;
 }
 const cache = new Map<string, CacheEntry>();
@@ -416,6 +519,19 @@ export interface ResolvedActiveProfile {
    *  seed fallback. The worker maps it to a Bedrock image-gen id (via IMAGE_GEN_MODELS) on an
    *  `image_generation` turn. Convenience projection of `models.image` so the worker need not reach in. */
   imageModelKey?: string;
+  /** The active version's per-assistant task machines (4.5). Undefined on the seed fallback (no active
+   *  version, or a version that carries none) — the loop then uses the deployment intent-pack machines. */
+  machines?: Record<string, TaskStateMachine>;
+  /** The active version's selected guardrail id (4.6). The apply path uses it in place of the
+   *  deployment `GUARDRAIL_ID` env — so a profile SELECTS among the deployment-provisioned guardrails.
+   *  Undefined ⇒ the deployment default guardrail (env). Never an arbitrary ARN: selection only, and the
+   *  IAM `ApplyGuardrail` grant is per provisioned guardrail, so an unprovisioned id fails closed (open). */
+  guardrailId?: string;
+  /** The active version's PERSONA (system-prompt body). The worker uses it in place of the deployment
+   *  persona seam. Undefined ⇒ the deployment persona (ASSISTANT_SYSTEM_PROMPT[_PARAM] → default). */
+  persona?: string;
+  /** Catalog context source KEYS this version selects, in prompt order (SPEC-CONTEXT-SOURCES-AND-STORES). */
+  contextSources?: string[];
 }
 
 export interface ResolveActiveProfileOptions {
@@ -446,7 +562,7 @@ export async function resolveActiveProfile(
 
   const cached = cache.get(profileName);
   if (cached && cached.expires > now()) {
-    return { profile: cached.profile, configId: cached.configId, models: cached.models, tools: cached.tools, imageModelKey: cached.imageModelKey };
+    return { profile: cached.profile, configId: cached.configId, models: cached.models, tools: cached.tools, imageModelKey: cached.imageModelKey, machines: cached.machines, guardrailId: cached.guardrailId, persona: cached.persona, contextSources: cached.contextSources };
   }
 
   // On the seed fallback (no activated version) the image model defaults to the seed's image capability
@@ -461,21 +577,11 @@ export async function resolveActiveProfile(
     const raw = resp.Parameter?.Value;
     if (raw) {
       const def = parseDefinition(raw, profileName);
-      // Merge ONLY the runtime-editable body over the seed; identity + boundary stay from the seed (§7).
-      const merged: AssistantProfile = {
-        ...seedProfile,
-        // Effective base model: the version's `models.default` when set to a CONCRETE key, else the
-        // transitional top-level modelKey, else the seed's CLASSIFICATION default — so a version that
-        // leaves base blank OR carries the `'default'` sentinel inherits the classification default
-        // (shown in the Model Strategy tab). `concreteModel` skips both blank and the sentinel.
-        modelKey: concreteModel(def.models?.default) ?? concreteModel(def.modelKey) ?? seedProfile.modelKey,
-        classifierMode: def.classifierMode,
-        timeoutSeconds: def.timeoutSeconds,
-        taskSupport: def.taskSupport,
-        rateLimitPerHour: def.rateLimitPerHour,
-        battleEligible: def.battleEligible,
-      };
-      resolved = { profile: merged, configId: def.configId, models: def.models, tools: def.tools, imageModelKey: def.models?.image };
+      // Follow the persona pointer, if this version has one. INSIDE the try and INSIDE the cache: an
+      // unreadable body takes the same fail-closed path as an unreadable parameter (serve the compiled
+      // seed, loudly) rather than serving a version stripped of the persona it declares, and a warm
+      // container pays for the S3 read once per TTL, not once per turn.
+      resolved = resolveFromDefinition(await hydrateBodies(def), profileName);
     }
   } catch (err) {
     // Absent label/param (nothing activated yet) is the COMMON, expected path — log at debug volume;
@@ -486,8 +592,64 @@ export async function resolveActiveProfile(
     }
   }
 
-  cache.set(profileName, { profile: resolved.profile, configId: resolved.configId, models: resolved.models, tools: resolved.tools, imageModelKey: resolved.imageModelKey, expires: now() + ttlMs });
+  cache.set(profileName, { profile: resolved.profile, configId: resolved.configId, models: resolved.models, tools: resolved.tools, imageModelKey: resolved.imageModelKey, machines: resolved.machines, guardrailId: resolved.guardrailId, persona: resolved.persona, contextSources: resolved.contextSources, expires: now() + ttlMs });
   return resolved;
+}
+
+/**
+ * Build the resolved runtime shape from a stored definition, merged over a seed profile.
+ *
+ * Extracted so an EXPERIMENT VARIANT can be served from a definition that is not the profile's active
+ * version (SPEC-PORTABLE §6: a `profileRef` variant runs an entire version). It is deliberately pure and
+ * takes no cache: the warm-container cache is keyed by profile NAME, so writing a variant's version into
+ * it would serve that variant's persona and tools to the next ordinary turn on the same container.
+ *
+ * Merge rule (unchanged, §7): only the runtime-editable body merges over the seed; identity and boundary
+ * fields stay from the seed, so a version can never widen what its classification permits.
+ */
+export function resolveFromDefinition(
+  def: ProfileDefinition,
+  profileName: string,
+): ResolvedActiveProfile {
+  // A definition still holding a POINTER has not been hydrated, and serving it would answer with no
+  // persona while reporting this version's configId. That is the failure this refuses to make quiet:
+  // it is a caller bug (a read path that forgot `hydrateBodies`), it looks like a healthy turn, and
+  // every caller here already has a fail-closed path for a throw.
+  if (def.personaRef && def.persona === undefined) {
+    throw new Error(
+      `[active-profile] '${profileName}' version ${def.configId} was resolved without hydrating its `
+      + 'persona pointer; call hydrateBodies on a stored definition before serving it.',
+    );
+  }
+  // Same fail-closed seed rule as resolveActiveProfile, resolved HERE rather than by the caller: an
+  // experiment variant must not be the place where a different (or absent) fallback creeps in.
+  const seed = defaultProfileRegistry.profileByName(profileName);
+  const seedProfile = seed ?? defaultProfileRegistry.profileFor(defaultProfileRegistry.failClosedValue);
+  const merged: AssistantProfile = {
+    ...seedProfile,
+    // Effective base model: the version's `models.default` when set to a CONCRETE key, else the
+    // transitional top-level modelKey, else the seed's CLASSIFICATION default — so a version that
+    // leaves base blank OR carries the `'default'` sentinel inherits the classification default
+    // (shown in the Model Strategy tab). `concreteModel` skips both blank and the sentinel.
+    modelKey: concreteModel(def.models?.default) ?? concreteModel(def.modelKey) ?? seedProfile.modelKey,
+    classifierMode: def.classifierMode,
+    timeoutSeconds: def.timeoutSeconds,
+    taskSupport: def.taskSupport,
+    rateLimitPerHour: def.rateLimitPerHour,
+    battleEligible: def.battleEligible,
+  };
+  const out = {
+    profile: merged,
+    configId: def.configId,
+    models: def.models,
+    tools: def.tools,
+    imageModelKey: def.models?.image,
+    machines: def.machines,
+    guardrailId: def.guardrailId,
+    persona: def.persona,
+    contextSources: def.contextSources,
+  };
+  return out;
 }
 
 /** Test seam: drop the warm-container cache. */

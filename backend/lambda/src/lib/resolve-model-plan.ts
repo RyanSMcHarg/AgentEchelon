@@ -5,13 +5,16 @@
  * RoutingContext, so new signals (request-segment geography, data-sensitivity, …) route without
  * new call sites.
  *
- * PHASE 1 (this file): a BACKWARD-COMPATIBLE wrapper. With no context extensions
- * (no `segment`/`signals`), it returns EXACTLY today's resolution —
+ * BACKWARD COMPATIBILITY IS THE INVARIANT, not a phase. With no context extensions
+ * (no `segment`/`signals`), this returns EXACTLY today's resolution —
  *   effectiveModel = experimentModelId || resolveModelForIntent(...).primaryModelId
  *   fallback       = resolveModelForIntent(...).fallbackModelId
- * — as an in-AWS Bedrock plan. The CN-segment context rule, the tool registry, and the
- * non-Bedrock provider adapter land in later increments at the marked extension point.
- * The backward-compat invariant is locked by test/lib/resolve-model-plan.test.ts.
+ * — as an in-AWS Bedrock plan, and test/lib/resolve-model-plan.test.ts locks that across the
+ * classification x intent matrix.
+ *
+ * BUILT since: both CN context rules (2a DeepSeek-on-Bedrock, the preferred in-AWS path; 2b the
+ * external provider behind the per-user consent gate) and the external adapter they route to.
+ * STILL DESIGN: the tool registry — `tools` is `[]` at every return site below.
  */
 import type {
   BackendModelDefinition,

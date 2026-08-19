@@ -2,6 +2,10 @@
 
 **Status:** Implemented (the taxonomy mechanism; the domain taxonomy is per-deployment config).
 
+**Coverage:** `e2e/agent-intents.spec.ts`
+
+**Verified by:** `backend/test/lib/intent-pack.test.ts` (back-compat, override, malformed-fallback, and the per-intent response settings), `backend/test/task-state-machines.test.ts` (task-machine graph validation, and the intent pack's optional `machines` block carried over the platform defaults with a malformed-override fallback), and `backend/test/lib/task-loop-machines.test.ts` (a per-assistant `machines` override takes effect at loop time over the deployment pack).
+
 **Problem and who it's for:** A business adapting an assistant to its own domain - support, recipes, billing - wants the assistant to recognize *its* intents and route delivery and model choice on them, by supplying its own taxonomy as config rather than editing platform code or living with a vendor's fixed intent set. This is for the AI developer adapting AgentEchelon to their domain; the alternative is forking the classifier or accepting an off-the-shelf bot's baked-in categories. It makes the intent taxonomy a per-deployment config value (mirroring the persona seam): AgentEchelon ships a generic default and a deployment supplies its own pack, so nothing domain-specific is baked into the platform. (Current state: the taxonomy was a fixed enterprise-support enum, so a non-support deployment saw its real intents collapse to `GENERAL` and the intent signal became dead weight.)
 
 **Site section:** Interaction layer, Assistant Configuration pillar.
@@ -73,7 +77,7 @@ A deployment can turn the generic `action_item` task lifecycle (gather → prese
 
 The same recipe generalizes: any deployment vertical (procurement, IT provisioning, expense approval, …) is *its own intent + its own executed tool* on the unchanged `action_item` engine.
 
-> **Note on geography routing.** The intent pack is the *what the user wants* signal; it does NOT drive the China→DeepSeek + reply-language routing. That is the **geography** signal (`segment.country`) + the **language** signal (`userLanguage`), rules 1 - 2 in `SPEC-CONTEXT-AWARE-MODEL-ROUTING.md`, which run ahead of the intent route. The two are orthogonal: a turn about the Beijing leg routes to the CN model because of its segment, not its intent.
+> **Note on geography routing.** The intent pack is the *what the user wants* signal; it does NOT drive the China→DeepSeek + reply-language routing. That is the **geography** signal (`segment.country`) + the **language** signal (`userLanguage`), rules 1 - 2 in `SPEC-CONTEXT-AWARE-MODEL-ROUTING.md`, which sit ahead of the intent route. The two are orthogonal: a turn about the Beijing leg routes to the CN model because of its segment, not its intent. Geography routing is opt-in per deployment (`ENABLE_CONTEXT_ROUTING`) and off by default, so on a deployment that has not enabled it the intent route is the first rule that fires - which changes nothing here, because the two signals never competed.
 
 ## Configuration
 
@@ -110,6 +114,27 @@ Pinned by `test/lib/intent-pack.test.ts` (the pack primitives + keyword fallback
 - **Back-compat:** no env ⇒ `DEFAULT` pack; default delivery classes + keyword fallback unchanged.
 - **Override:** a custom domain pack replaces the domain intents; universal three remain; category lines, keyword fallback, and delivery map come from the pack; object form `{ intents: [...] }` accepted; a universal-key override is dropped.
 - **Malformed ⇒ DEFAULT:** invalid JSON / empty array / wrong shape all fall back.
+- **Size budget:** the `DEFAULT` pack must stay within a byte budget that leaves room for a deployment's own intents inside an SSM Standard parameter, and no single intent may be disproportionately large. See the roadmap item below for why this is a test and not a comment.
+
+## Known constraint and roadmap: the pack does not fit its transport
+
+**The constraint.** A per-deployment pack is composed as `domain intents + DEFAULT_INTENT_PACK.intents` and stored in ONE SSM parameter per classification. SSM parameter value size is a **hard limit** - 4 KB Standard, 8 KB Advanced - and unlike throughput or parameter count, AWS publishes no mechanism to raise it. Measured on the demo deployment after three platform intents were added:
+
+| Classification | Composed pack | Against 4 KB Standard |
+|---|---:|---|
+| basic | 3,674 B | fits |
+| standard | 4,060 B | 36 B of headroom |
+| premium | 4,633 B | over; moved to Advanced tier |
+
+**Why it is structural, not incidental.** Every classification's parameter embeds a full copy of the platform defaults, so each new platform intent costs roughly 455 bytes MULTIPLIED BY the number of classifications. Growth is multiplicative in classifications, not additive. Advanced tier doubles the ceiling once - about seven more platform intents - and there is no third tier.
+
+**Why it failed quietly.** The seeder writes parameters *write-if-absent*, so a pack seeded before an intent existed is never updated and an over-size composition is never attempted. Nothing errors. This was found only because a live probe showed the deployed classifier could not emit an intent the platform had shipped.
+
+**Roadmap - an `extends` pack form.** `DEFAULT_INTENT_PACK` is already compiled into the Lambda bundle. The seeder currently reads it from code, serialises it into a parameter, and the Lambda reads it back at cold start - spending scarce SSM bytes to transport data the Lambda already holds. A pack form such as `{ "extends": "default", "intents": [ ...domain only... ] }` would leave the parameter carrying only the per-deployment delta (premium: ~4,633 B to roughly 1,200 B) and make platform intents cost **zero** SSM bytes in every deployment, permanently.
+
+The obstacle is semantic rather than technical: today a custom pack *replaces* the domain intents, which is deliberate - a deployment can drop platform intents it does not want. `extends` must therefore be an explicit opt-in alongside the existing full-replacement form, not a change to what a bare `intents` array means. Precedent exists: the universal three (`greeting` / `acknowledgment` / `general`) are already merged in implicitly.
+
+Scope: pack schema, the loader's merge, and the seeder's composition. Until it lands, the size-budget test above keeps the platform side of the equation honest, and a deployment whose composed pack exceeds 4 KB must use an Advanced-tier parameter.
 
 ## Related docs
 

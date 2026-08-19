@@ -29,7 +29,7 @@ import {
 import { toolInfo, TOOL_INFO } from '../../services/toolRegistry';
 
 /**
- * Assistant Profiles — the P1/P3 versioning lifecycle UI (SPEC-PORTABLE-VERSIONED-PROFILES). The whole
+ * Assistant Profiles — the P1/P3 versioning lifecycle UI (SPEC-PORTABLE-PROFILES). The whole
  * backend (SSM version store, manage-profiles API, export/import) already exists; this surfaces it:
  * list each profile's versions + active pointer + draft, and create/edit/validate/activate/rollback/
  * import/export — all gated server-side on the `manage-profiles` capability (A14).
@@ -274,18 +274,23 @@ const ProfilesTab: React.FC<ProfilesTabProps> = ({ registerBack, onOpenEffective
                   if (!config.tools || config.tools.length === 0) {
                     return <span className="admin-muted">— (no tools enabled for this profile)</span>;
                   }
-                  // Each tool: its description ("how it functions") + a deep link to THAT tool's runtime logic
-                  // — the processor Lambda's CloudWatch Logs filtered by the tool name (tools are code that
-                  // runs inside the per-classification processor, so this is the closest per-tool "logic" link).
+                  // Each tool: its description ("how it functions") + a link to THAT tool's invocations.
+                  // Tools are not separate resources — they run IN-LOOP inside the profile's processor
+                  // Lambda (the Converse loop), so there is no per-tool ARN to link to. The closest
+                  // "see what it did" surface is the processor's CloudWatch Logs filtered by the tool name.
                   return (
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 'var(--space-2)' }}>
+                      <span className="admin-muted" style={{ fontSize: '0.85em' }}>
+                        Tools run in-loop inside this profile’s processor Lambda (there’s no separate resource per tool);
+                        each “logs ↗” opens that tool’s invocations in the processor’s CloudWatch Logs.
+                      </span>
                       {config.tools.map((t) => {
                         const info = toolInfo(t);
                         const logs = fn ? cloudwatchLogsUrl(fn, t, region) : lambdaFunctionsUrl();
                         return (
                           <div key={t} style={{ display: 'flex', gap: 'var(--space-2)', alignItems: 'baseline', flexWrap: 'wrap' }}>
                             <code className="admin-chip">{t}</code>
-                            <a href={logs} target="_blank" rel="noopener noreferrer" title="Open this tool’s invocations in CloudWatch Logs">logic ↗</a>
+                            <a href={logs} target="_blank" rel="noopener noreferrer" title="Tools run in-process, so this opens the tool’s invocations in the processor Lambda’s CloudWatch Logs (no per-tool resource exists)">logs ↗</a>
                             {info && <span style={{ color: 'var(--text-secondary)', fontSize: '0.9em' }}>{info.description}</span>}
                           </div>
                         );

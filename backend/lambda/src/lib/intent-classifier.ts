@@ -70,6 +70,28 @@ export interface ClassifyIntentOptions {
   modelId?: string;
 }
 
+/** Messages short enough, or fixed enough, that no model is worth asking. */
+const EXACT_GREETINGS = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening'];
+const EXACT_ACKNOWLEDGMENTS = ['thanks', 'thank you', 'ok', 'okay', 'got it', 'great', 'perfect', 'cool', 'bye', 'goodbye'];
+
+/**
+ * The pre-LLM fast paths, or null when the message needs a model.
+ *
+ * Extracted because two things need to agree about it. The classifier itself takes these paths, and
+ * the classification shadow gate (DESIGN §5) must EXCLUDE the messages that take them: no model is
+ * consulted, so both candidates would "agree" on every one, and counting them would pad the corpus
+ * with pairs that could never distinguish the two while shrinking the accuracy difference between
+ * them. Duplicating the lists to answer that question would let the gate's idea of a fast path drift
+ * from the classifier's.
+ */
+export function fastPathIntent(userMessage: string): IntentClassification | null {
+  const message = userMessage.trim().toLowerCase();
+  if (!message || message.length < 3) return { intent: IntentType.GREETING, confidence: 'high' };
+  if (EXACT_GREETINGS.includes(message)) return { intent: IntentType.GREETING, confidence: 'high' };
+  if (EXACT_ACKNOWLEDGMENTS.includes(message)) return { intent: IntentType.ACKNOWLEDGMENT, confidence: 'high' };
+  return null;
+}
+
 /**
  * Classify user message intent using Bedrock
  * Fast call to Haiku (or a classification-experiment variant model) for intent
@@ -79,23 +101,8 @@ export async function classifyIntent(
   userMessage: string,
   opts?: ClassifyIntentOptions,
 ): Promise<IntentClassification> {
-  // Fast path: empty or very short messages are greetings
-  const message = userMessage.trim().toLowerCase();
-  if (!message || message.length < 3) {
-    return { intent: IntentType.GREETING, confidence: 'high' };
-  }
-
-  // Fast path: exact match greetings (no LLM call needed)
-  const exactGreetings = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening'];
-  if (exactGreetings.includes(message)) {
-    return { intent: IntentType.GREETING, confidence: 'high' };
-  }
-
-  // Fast path: exact match acknowledgments
-  const exactAcknowledgments = ['thanks', 'thank you', 'ok', 'okay', 'got it', 'great', 'perfect', 'cool', 'bye', 'goodbye'];
-  if (exactAcknowledgments.includes(message)) {
-    return { intent: IntentType.ACKNOWLEDGMENT, confidence: 'high' };
-  }
+  const fastPath = fastPathIntent(userMessage);
+  if (fastPath) return fastPath;
 
   // Use LLM for more complex classification. Categories come from the active intent pack —
   // the universal three plus the deployment's domain intents — so a deployment with a domain pack
@@ -168,23 +175,10 @@ Category:`;
  * classifier (`classifyIntent`); this runs only when a profile explicitly sets keyword mode.
  */
 export function classifyIntentByKeyword(userMessage: string): IntentClassification {
-  const message = userMessage.trim().toLowerCase();
-
-  if (!message || message.length < 3) {
-    return { intent: IntentType.GREETING, confidence: 'high' };
-  }
-
-  const exactGreetings = ['hi', 'hello', 'hey', 'good morning', 'good afternoon', 'good evening'];
-  if (exactGreetings.includes(message)) {
-    return { intent: IntentType.GREETING, confidence: 'high' };
-  }
-
-  const exactAcknowledgments = ['thanks', 'thank you', 'ok', 'okay', 'got it', 'great', 'perfect', 'cool', 'bye', 'goodbye'];
-  if (exactAcknowledgments.includes(message)) {
-    return { intent: IntentType.ACKNOWLEDGMENT, confidence: 'high' };
-  }
-
-  return classifyByKeywords(userMessage);
+  // The same fast paths the LLM classifier takes, from the same place: this function held a second
+  // copy of both word lists, so a greeting added to one path would silently not be a greeting on the
+  // other.
+  return fastPathIntent(userMessage) ?? classifyByKeywords(userMessage);
 }
 
 /**

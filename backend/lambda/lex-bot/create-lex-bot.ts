@@ -20,6 +20,83 @@ import { CloudFormationCustomResourceEvent } from 'aws-lambda';
 const { AWS_REGION } = process.env;
 const lexClient = new LexModelsV2Client({ region: AWS_REGION });
 
+const TEST_ALIAS_NAME = 'TestBotAlias';
+/** Lex V2 gives every bot's test alias this fixed id, so an ARN can be built without a lookup. */
+const TEST_ALIAS_ID = 'TSTALIASID';
+
+/**
+ * Point the alias at the fulfillment Lambda and turn on text conversation logs.
+ *
+ * ONE function, called from BOTH Create and Update, and that is the point rather than tidiness.
+ * This handler used to configure the alias inside the Create branch only; Update returned the
+ * PhysicalResourceId and did nothing. So any change to alias configuration shipped INERT to every
+ * deployment that already existed - the stack reported success, and the setting was never applied.
+ * That is the same shape as the schema-init Custom Resource that bootstraps on CREATE only and left
+ * five Lambdas unable to apply a migration.
+ *
+ * Both settings are sent in ONE call deliberately: `UpdateBotAlias` replaces alias settings wholesale,
+ * so configuring logs in a second call would drop the code hook and take every turn down.
+ */
+async function configureBotAlias(botId: string, botAliasId: string, handlerArn: string): Promise<void> {
+  // TEXT CONVERSATION LOGS, so a duplicate fulfillment can be attributed.
+  //
+  // `lib/correlation.ts` establishes that a second fulfillment of one turn is not a timeout and is not
+  // initiated by this codebase - Lex invokes the handler - and names conversation logs as what is
+  // needed to confirm the trigger. This is that instrument: each Lex invocation writes one record, so
+  // TWO records for one user message means Lex asked twice, and ONE record means our own code ran the
+  // turn twice. Identical symptoms, completely different fixes.
+  //
+  // Omitted rather than sent empty when the log group is absent, so a deployment that has not shipped
+  // the log group keeps working exactly as before.
+  const logGroupArn = process.env.LEX_CONVERSATION_LOG_GROUP_ARN;
+  const conversationLogSettings = logGroupArn
+    ? {
+        textLogSettings: [
+          {
+            enabled: true,
+            destination: {
+              cloudWatch: {
+                // Lex rejects the trailing `:*` that a CloudWatch log-group ARN often carries.
+                cloudWatchLogGroupArn: logGroupArn.replace(/:\*$/, ''),
+                logPrefix: 'aelex/',
+              },
+            },
+          },
+        ],
+      }
+    : undefined;
+
+  await lexClient.send(new UpdateBotAliasCommand({
+    botId,
+    botAliasId,
+    botAliasName: TEST_ALIAS_NAME,
+    botVersion: 'DRAFT',
+    botAliasLocaleSettings: {
+      en_US: {
+        enabled: true,
+        codeHookSpecification: {
+          lambdaCodeHook: {
+            lambdaARN: handlerArn,
+            codeHookInterfaceVersion: '1.0',
+          },
+        },
+      },
+    },
+    ...(conversationLogSettings ? { conversationLogSettings } : {}),
+  }));
+  console.log('Bot alias configured', {
+    botId,
+    botAliasId,
+    conversationLogs: conversationLogSettings ? 'enabled' : 'not configured',
+  });
+}
+
+/** The alias id for the bot's test alias, or undefined when it cannot be found. */
+async function resolveTestAliasId(botId: string): Promise<string | undefined> {
+  const resp = await lexClient.send(new ListBotAliasesCommand({ botId }));
+  return resp.botAliasSummaries?.find((a) => a.botAliasName === TEST_ALIAS_NAME)?.botAliasId;
+}
+
 const DEFAULT_BOT_NAME = 'Assistant';
 
 // Helper to wait for bot locale to be ready for intent creation
@@ -237,24 +314,7 @@ export const handler = async (event: CloudFormationCustomResourceEvent) => {
       const handlerArn = process.env.BOT_HANDLER_LAMBDA_ARN;
       if (handlerArn) {
         console.log('Configuring bot alias with fulfillment Lambda:', handlerArn);
-        await lexClient.send(new UpdateBotAliasCommand({
-          botId,
-          botAliasId,
-          botAliasName: 'TestBotAlias',
-          botVersion: 'DRAFT',
-          botAliasLocaleSettings: {
-            en_US: {
-              enabled: true,
-              codeHookSpecification: {
-                lambdaCodeHook: {
-                  lambdaARN: handlerArn,
-                  codeHookInterfaceVersion: '1.0',
-                },
-              },
-            },
-          },
-        }));
-        console.log('Bot alias configured with Lambda');
+        await configureBotAlias(botId, botAliasId, handlerArn);
       }
 
       // Step 9: Resource policies so Amazon Chime SDK Messaging can invoke the
@@ -344,8 +404,68 @@ export const handler = async (event: CloudFormationCustomResourceEvent) => {
       return {};
     }
   } else {
+    // UPDATE: RE-APPLY THE ALIAS CONFIGURATION RATHER THAN NO-OPPING.
+    //
+    // This branch used to return the PhysicalResourceId and nothing else, which meant the bot was
+    // created once and never reconfigured. Every later change to alias settings - the fulfillment
+    // Lambda, and now conversation logs - reported a successful stack update and applied NOTHING to
+    // any deployment that already existed.
+    //
+    // Best-effort ON PURPOSE. The bot exists and is serving turns; a failure to re-apply logging must
+    // not fail the stack update and roll back a deployment over a diagnostic setting. It is logged
+    // loudly enough to find, and the setting is verifiable directly (`describe-bot-alias`).
+    // IT MUST RETURN THE SAME `Data` ATTRIBUTES AS CREATE.
+    //
+    // The stack reads `LexBotAliasArn` off this resource with `getAtt`, and an Update response that
+    // omits it fails the whole stack with "Vendor response doesn't contain LexBotAliasArn attribute"
+    // and rolls back - which is exactly what happened the first time this branch did real work,
+    // because returning only the PhysicalResourceId is harmless ONLY while the branch is a no-op.
+    const botId = event.PhysicalResourceId;
+    const handlerArn = process.env.BOT_HANDLER_LAMBDA_ARN;
+    let botAliasId: string | undefined;
+    if (botId && botId !== 'FAILED') {
+      try {
+        botAliasId = await resolveTestAliasId(botId);
+        if (botAliasId && handlerArn) {
+          await configureBotAlias(botId, botAliasId, handlerArn);
+        } else {
+          console.warn('[CreateLexBot] update: alias configuration not applied', {
+            botId, foundAlias: !!botAliasId, hasHandlerArn: !!handlerArn,
+          });
+        }
+      } catch (error) {
+        // Best-effort ON PURPOSE: the bot is serving turns, and a diagnostic setting must not roll
+        // back a deployment. The attributes below are still returned so the stack stays healthy.
+        console.warn('[CreateLexBot] update: re-applying alias configuration failed (non-fatal)', error);
+      }
+    }
+
+    // "NON-FATAL" HAS TO INCLUDE THE RETURN VALUE, and it did not.
+    //
+    // `resolveTestAliasId` is one `ListBotAliases` call, so a throttle or a transient failure left
+    // `botAliasId` undefined. The catch above swallowed the error exactly as intended - and then this
+    // return produced `LexBotAliasArn: undefined`, which JSON drops, so CloudFormation failed the
+    // resource with "Vendor response doesn't contain LexBotAliasArn attribute" and rolled the
+    // deployment back. The precise outcome the comment above says this design avoids, arriving through
+    // the return rather than the throw.
+    //
+    // The test alias id is a Lex V2 constant (`TSTALIASID`), so the ARN is reconstructible without the
+    // lookup that just failed. Falling back to it keeps the attribute present and the stack healthy;
+    // the alias CONFIGURATION is what was skipped, and that is what the warning above reports.
+    const effectiveAliasId = botAliasId || (botId && botId !== 'FAILED' ? TEST_ALIAS_ID : undefined);
+    if (!botAliasId && effectiveAliasId) {
+      console.warn('[CreateLexBot] update: alias id unresolved; returning the well-known test alias id '
+        + 'so the stack keeps a usable LexBotAliasArn', { botId });
+    }
     return {
       PhysicalResourceId: event.PhysicalResourceId,
+      Data: {
+        BotId: botId,
+        BotAliasId: effectiveAliasId,
+        LexBotAliasArn: botId && effectiveAliasId
+          ? `arn:aws:lex:${AWS_REGION}:${process.env.AWS_ACCOUNT_ID}:bot-alias/${botId}/${effectiveAliasId}`
+          : undefined,
+      },
     };
   }
 };

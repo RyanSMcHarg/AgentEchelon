@@ -4,7 +4,7 @@
  * Tests intent → model mapping with classification-based access control.
  */
 
-import { resolveModelForIntent, collectArnsForClassification } from '../lambda/src/lib/model-resolver';
+import { resolveModelForIntent, collectArnsForClassification, intentTypeToRouteKey } from '../lambda/src/lib/model-resolver';
 import type {
   BackendModelDefinition,
   BackendModelKey,
@@ -273,5 +273,55 @@ describe('collectArnsForClassification', () => {
     expect(premiumArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/haiku');
     expect(premiumArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/sonnet');
     expect(premiumArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/opus');
+  });
+});
+
+/**
+ * Every RouteKey the platform offers must be REACHABLE from some classified intent.
+ *
+ * `code_generation`, `code_review` and `strategic_analysis` were not. No entry in the legacy
+ * rename table produced them, and the resolver consulted only that table, so any turn carrying
+ * those intents fell through to `general_qa`. The config was operator-facing - the admin
+ * Experiments tab lists Code Generation, Code Review and Strategic Analysis as selectable intents -
+ * so an operator could pin a model or run an A/B on code generation and it could never fire.
+ *
+ * `IntentDef.key` is documented as "the classified intent value + INTENT_ROUTE_STRATEGY key", i.e.
+ * one namespace. This asserts that contract holds for every route, which is also what lets a
+ * per-deployment intent pack (SPEC-CONFIGURABLE-INTENT-PACK) add `code_generation` and have model
+ * routing follow without editing platform code.
+ */
+describe('every RouteKey is reachable from a classified intent', () => {
+  const ALL_ROUTE_KEYS = [
+    'general_qa',
+    'code_generation',
+    'code_review',
+    'document_extraction',
+    'report_generation',
+    'strategic_analysis',
+    'workflow_actions',
+  ] as const;
+
+  it('maps an intent named for a RouteKey to that route, not to general_qa', () => {
+    const unreachable = ALL_ROUTE_KEYS.filter((rk) => intentTypeToRouteKey(rk) !== rk);
+    if (unreachable.length) {
+      throw new Error(
+        `These RouteKeys cannot be selected by any classified intent: ${unreachable.join(', ')}.\n`
+        + 'A model pinned to them is dead config, and the admin Experiments tab offers them as '
+        + 'selectable intents, so an operator can configure an A/B that never fires.',
+      );
+    }
+    expect(unreachable).toEqual([]);
+  });
+
+  it('still honours the legacy renames', () => {
+    expect(intentTypeToRouteKey('data_extraction')).toBe('document_extraction');
+    expect(intentTypeToRouteKey('guided_troubleshooting')).toBe('workflow_actions');
+    expect(intentTypeToRouteKey('greeting')).toBe('general_qa');
+    expect(intentTypeToRouteKey('acknowledgment')).toBe('general_qa');
+  });
+
+  it('falls through to general_qa for an intent that is neither', () => {
+    expect(intentTypeToRouteKey('recipe_lookup')).toBe('general_qa');
+    expect(intentTypeToRouteKey(undefined)).toBe('general_qa');
   });
 });

@@ -1,5 +1,5 @@
 /**
- * Manage Profiles API — SPEC-PORTABLE-VERSIONED-PROFILES P1/§4 (versioning lifecycle) + P3/§5
+ * Manage Profiles API — SPEC-PORTABLE-PROFILES P1/§4 (versioning lifecycle) + P3/§5
  * (export/import). The WRITE surface for assistant profile versions, gated by the `manage-profiles`
  * capability (§7 / plan item A14). Routes on the existing admin API — NO new gateway (§3).
  *
@@ -17,7 +17,7 @@
  * write path to the profile SSM namespace.
  */
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { SSMClient } from '@aws-sdk/client-ssm';
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { LambdaClient } from '@aws-sdk/client-lambda';
 import { resolveProfileInfra } from './lib/profile-infra.js';
 import { parseJsonBody, callerCanManageProfiles, respond as authRespond } from './lib/auth.js';
@@ -44,6 +44,55 @@ const lambdaClient = new LambdaClient({ region: AWS_REGION });
 function catalog() {
   return getModelCatalog(AWS_REGION, process.env.AWS_ACCOUNT_ID || '');
 }
+
+/**
+ * The selectable guardrails a profile may reference, as published by the assistant-profile stack at
+ * `${SSM_ROOT}/assistant/{profileName}/guardrails` (SPEC-CONFIGURABLE-ASSISTANTS 4.6b). Used by import
+ * to reject-or-remap a guardrail selection that came from another deployment.
+ *
+ * Throws on an unreadable/absent/malformed catalog rather than returning [] — importManifest fails
+ * CLOSED on a throw, and an empty array would read as "this instance provisions no guardrails", which
+ * would reject every selection with a misleading reason.
+ */
+async function guardrailCatalogFor(profileName: string): Promise<Array<{ key: string; guardrailId: string }>> {
+  const name = `${SSM_ROOT}/assistant/${profileName}/guardrails`;
+  const res = await ssm.send(new GetParameterCommand({ Name: name }));
+  const raw = res.Parameter?.Value;
+  if (!raw) throw new Error(`${name} is empty`);
+  const parsed = JSON.parse(raw) as Array<{ key?: string; guardrailId?: string }>;
+  if (!Array.isArray(parsed)) throw new Error(`${name} is not a JSON array`);
+  return parsed
+    .filter((g) => typeof g.key === 'string' && typeof g.guardrailId === 'string')
+    .map((g) => ({ key: g.key as string, guardrailId: g.guardrailId as string }));
+}
+/**
+ * The target's published context source catalog, for import validation
+ * (SPEC-CONTEXT-SOURCES-AND-STORES §6).
+ *
+ * THROWS on an absent/unreadable/malformed parameter, deliberately and exactly like
+ * `guardrailCatalogFor`: import treats a throw as "cannot verify this selection" and fails closed.
+ * Returning an empty array instead would read as "this instance publishes nothing", which silently
+ * rejects every key for the wrong reason - or, worse, would let a future caller treat it as no
+ * constraint at all.
+ */
+async function contextSourceCatalogFor(
+  profileName: string,
+): Promise<Array<{ key: string; fields?: Record<string, { type: string; optional?: boolean }>; contractVersion?: string }>> {
+  const name = `${SSM_ROOT}/assistant/${profileName}/context-sources`;
+  const res = await ssm.send(new GetParameterCommand({ Name: name }));
+  const raw = res.Parameter?.Value;
+  if (!raw) throw new Error(`${name} is empty`);
+  const parsed = JSON.parse(raw) as Array<Record<string, unknown>>;
+  if (!Array.isArray(parsed)) throw new Error(`${name} is not a JSON array`);
+  return parsed
+    .filter((s) => typeof s.key === 'string')
+    .map((s) => ({
+      key: s.key as string,
+      fields: s.fields as Record<string, { type: string; optional?: boolean }> | undefined,
+      contractVersion: typeof s.contractVersion === 'string' ? s.contractVersion : undefined,
+    }));
+}
+
 function callerSub(event: APIGatewayProxyEvent): string | null {
   const claims = (event.requestContext?.authorizer?.claims || {}) as Record<string, string>;
   if (claims.sub) return claims.sub;
@@ -97,6 +146,8 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
           catalog: catalog(),
           targetProfileName: typeof body.targetProfileName === 'string' ? body.targetProfileName : undefined,
           knownProfile: isKnownProfile,
+          guardrailCatalog: guardrailCatalogFor,
+          contextSourceCatalog: contextSourceCatalogFor,
           actor: sub,
         });
         return respond(200, { imported: draft.profileName, configId: draft.configId, landedAs: 'draft' });
@@ -116,11 +167,13 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
         return respond(200, { profileName, draftConfigId: draft.configId });
       }
       if (path.endsWith('/validate')) {
-        const { errors, configId } = await validateDraft(ssm, SSM_ROOT, profileName, catalog());
+        // The same catalog reader import uses, so a key that would be rejected on the way IN to
+        // another instance is also rejected on the way in here.
+        const { errors, configId } = await validateDraft(ssm, SSM_ROOT, profileName, catalog(), contextSourceCatalogFor, guardrailCatalogFor);
         return respond(200, { profileName, valid: errors.length === 0, errors, configId });
       }
       if (path.endsWith('/activate')) {
-        const r = await activateDraft(ssm, SSM_ROOT, profileName, catalog(), sub);
+        const r = await activateDraft(ssm, SSM_ROOT, profileName, catalog(), sub, contextSourceCatalogFor, guardrailCatalogFor);
         return respond(200, { profileName, ...r });
       }
       if (path.endsWith('/rollback')) {
@@ -131,7 +184,9 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       }
       if (path.endsWith('/export')) {
         const version = body.version !== undefined ? Number(body.version) : undefined;
-        const manifest = await exportManifest(ssm, SSM_ROOT, profileName, version);
+        // Pass the catalog so a guardrail SELECTION is emitted as its portable key rather than the id
+        // resolved on this instance (the manifest's instance-agnostic promise).
+        const manifest = await exportManifest(ssm, SSM_ROOT, profileName, version, guardrailCatalogFor, contextSourceCatalogFor);
         return respond(200, { manifest });
       }
     }

@@ -2,6 +2,10 @@
 
 **Status:** Implemented.
 
+**Coverage:** `e2e/profile-ownership.spec.ts`, `e2e/profile-config.spec.ts` - synth proves the shape CDK would emit; the e2e proves the shape actually deployed, which is a different claim. It asserts one handler per classification, each in its OWN CloudFormation stack (that separation is the blast radius), and that the structural cross-stack SSM parameters resolve - a renamed or never-written parameter leaves a handler silently running on a fallback. Per-deployment content parameters (intent pack, welcome, onboarding schema) are reported rather than asserted, since leaving them unset is a legitimate deployment choice. The runtime surface a profile exposes is covered by `e2e/profile-config.spec.ts`.
+
+**Verified by:** `backend/test/cdk-synth.test.ts` instantiates `BasicClassificationStack`, `StandardClassificationStack` and `PremiumClassificationStack` separately, asserting the per-profile stack bodies and their wiring at synth time. `e2e/profile-ownership.spec.ts` then asserts the same topology against the deployed account, which synth cannot see: a deleted stack, a partial deploy, or a drifted SSM parameter all leave synth green.
+
 **Problem and who it's for:** An organization running several assistant offerings side by side wants each team to own and ship its own - model, prompt, tools, guardrail, processor - end-to-end without touching or gaining access to the others, while a demo deployer still gets everything in one command. This is for the platform developer and AI developer who own a single classification, and the admin/operator who wants independent deploy cadences; the alternative is building your own deploy-isolation and blast-radius controls, or accepting a monolith where one team's change ships everyone's. It organizes the profiles as profile-as-data: one shared parametrized stack body with a thin per-profile subclass, wired across stacks by SSM only so each deploys on its own cadence.
 
 **Site section:** Interaction layer, Assistant Configuration pillar.
@@ -9,7 +13,7 @@
 
 > The per-profile assistant stacks are organized **profile-as-data**: one shared body (`AssistantProfileStack`) is parametrized by a `ProfileTopology`, and each profile lives in a thin subclass (`BasicTierStack` / `StandardTierStack` / `PremiumTierStack`, one per file) that supplies its topology, with shared constants in `agent-classification-common.ts`. This gives both independently-deployable *stacks* and independently-owned *config* - a change to one profile touches only that profile's thin descriptor, not the shared body. The live assistant path is the async-processor's self-hosted Converse tool loop - there is **no Bedrock Agent** - so a profile stack owns the **processor** (the shared `assistant-async-processor.ts`, one instance per profile), not an agent.
 
-> The stacks, stack names, and shared-constants module are renamed to classification (`*-classification-stack.ts`, the `AgentEchelonClassification-*` stack names, `agent-classification-common.ts`). A few internal helper symbols and one storage prefix still read `tier` for continuity (`modelArnsForTier`, `tierChannelScopedAllow`, the `context/{tier}/` S3 prefix); the concept they name is a **profile** / **classification**. Any remaining symbol rename is tracked separately and does not change any behavior described here.
+> The rename to classification is complete and reaches the symbols as well as the stack names: `*-classification-stack.ts`, the `AgentEchelonClassification-*` stack names, `agent-classification-common.ts`, and the helpers `modelArnsForClassification`, `classificationChannelScopedAllow`, `makeClassificationRole` and `CLASSIFICATION_GATED_CHANNEL_ACTIONS`. The S3 context prefix is `context/{classification}/`. Nothing in this area still reads `tier`, and `classification-naming-ratchet.test.ts` holds that: the list of files permitted to carry the old word may only shrink.
 
 ## Purpose
 
@@ -29,7 +33,7 @@ The **assistant is the async-processor** - shared-router intent classification �
 |---|---|
 | `AgentEchelonChimeMessaging` | One AppInstance per account; profiles add bots to it |
 | `AgentEchelonCognitoAuth` | One user/identity pool; tier groups are claims, not separate backends |
-| `AgentEchelonS3Storage` | One attachments bucket; `context/{tier}/` prefixes are the IAM boundary |
+| `AgentEchelonS3Storage` | One attachments bucket; `context/{classification}/` prefixes are the IAM boundary |
 | `AgentEchelonChannelFlow` | One channel-flow processor; dispatches per-profile via channel metadata |
 | `AgentEchelonNotifications`, `AgentEchelonAnalytics(Aurora)` | Cross-profile; classification is a partition/claim, not a stack boundary |
 | **Shared router** (`router-agent-handler`: classify intent → dispatch by `min(userTier,channelTier)`) | Holds the tier-comparison + intent→delivery/task logic; the router code is shared and deployed as one Lambda per profile stack |
@@ -40,7 +44,7 @@ The **assistant is the async-processor** - shared-router intent classification �
 | What | Why per-profile |
 |---|---|
 | **Async-processor** (the shared `assistant-async-processor.ts`, one instance per profile; the Converse tool loop) | The assistant - the team's product surface (model, prompt, tools) |
-| **Tier-scoped `context/{tier}/` S3 IAM** | The defense-in-depth isolation boundary (basic→basic; standard→+standard; premium→all) |
+| **Tier-scoped `context/{classification}/` S3 IAM** | The defense-in-depth isolation boundary (basic→basic; standard→+standard; premium→all) |
 | **Tier guardrail** (text; out-of-band ApplyGuardrail on output) | Each team owns its content policy |
 | **Lex bot** (WelcomeIntent + FallbackIntent → shared router) | The ownership/blast-radius boundary; bot ARN published to SSM |
 | **AppInstanceBot** | The Amazon Chime SDK-side handle for the tier bot |
@@ -82,7 +86,7 @@ backend/
 ├─ lib/profile-registry.ts                 the ONLY interpreter of a classification tag / clearance
 └─ lib/stacks/
    ├─ agent-classification-common.ts                 SHARED: SSM contract keys + thin helpers
-   │                                       (resolveSharedSSM, modelArnsForTier,
+   │                                       (resolveSharedSSM, modelArnsForClassification,
    │                                        tierBotArnKey, tierProcessorArnKey). No class.
    ├─ assistant-profile-stack.ts  class AssistantProfileStack   ← the SHARED body, parametrized
    │                                                              by a ProfileTopology descriptor.
@@ -130,4 +134,4 @@ Because the cross-stack contract is SSM-only, each profile stack deploys on its 
 - **`AgentEchelonClassification-*` are separate stacks**, not a single shared stack, so ownership is independent per tier.
 - **Cognito stays shared and decoupled from bots/assistants** - added auth methods (SAML/OIDC/custom) don't touch profile stacks.
 - **Channel flow stays shared**; per-conversation-type channel flow is a separate axis, not per-profile.
-- **Behavioral config is runtime-editable as versioned data.** [`SPEC-PORTABLE-PROFILES.md`](./SPEC-PORTABLE-PROFILES.md) extends this spec: a profile's model bundle, persona, intent pack, tool allowlist, and guardrail selection resolve at runtime from the active profile version, so activating, rolling back, or importing a version is a data change, not a stack deploy. The deploy-time framing here describes the security boundary that stays fixed - the context scope (S3 IAM grant), the guardrail resource, the per-profile model `InvokeModel` allowlist, and the bot identity - which a version selects among but never widens.
+- **Behavioral config is runtime-editable as versioned data.** [`SPEC-PORTABLE-PROFILES.md`](./SPEC-PORTABLE-PROFILES.md) extends this spec: a profile's model bundle, persona, tool allowlist, and guardrail selection resolve at runtime from the active profile version (the intent pack is the one behavioral field that has not moved - it still resolves per deployment), so activating, rolling back, or importing a version is a data change, not a stack deploy. The deploy-time framing here describes the security boundary that stays fixed - the context scope (S3 IAM grant), the guardrail resource, the per-profile model `InvokeModel` allowlist, and the bot identity - which a version selects among but never widens.

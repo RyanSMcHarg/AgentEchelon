@@ -23,9 +23,34 @@ import { bedrockInvokeId } from '../../../lib/config/model-strategy.js';
 export type { BackendModelKey, Classification };
 
 /**
- * Map from coarse IntentType (classifier output) to fine-grained RouteKey
- * (strategy input). The classifier produces 6 values; the strategy has 7 keys.
- * Unmapped classifier intents fall through to 'general_qa'.
+ * The RouteKeys a strategy can carry. An intent whose key IS one of these routes to it directly —
+ * see `intentTypeToRouteKey` for why that identity case matters.
+ */
+const ROUTE_KEYS = new Set<string>([
+  'general_qa',
+  'code_generation',
+  'code_review',
+  'document_extraction',
+  'report_generation',
+  'strategic_analysis',
+  'workflow_actions',
+]);
+
+/**
+ * LEGACY RENAMES from classifier intent to RouteKey.
+ *
+ * This is not the taxonomy — it is a compatibility shim for the handful of places where the two
+ * names genuinely differ (`data_extraction` vs `document_extraction`, `guided_troubleshooting` vs
+ * `workflow_actions`) plus the universal intents that all mean general QA.
+ *
+ * The DESIGN is that they are one namespace: `IntentDef.key` is documented as "the classified intent
+ * value + INTENT_ROUTE_STRATEGY key", and `report_generation` is both. Treating this table as the
+ * whole mapping broke that: because the resolver consulted ONLY this map and fell through to
+ * `general_qa` on a miss, `code_generation`, `code_review` and `strategic_analysis` were
+ * unreachable. An operator could configure a dedicated model for code generation - and the admin
+ * Experiments tab offers exactly those as selectable intents - and it could never be selected. The
+ * per-deployment intent pack (SPEC-CONFIGURABLE-INTENT-PACK) is supposed to let a deployment add
+ * `code_generation` and have routing follow; it could not.
  */
 const INTENT_TYPE_TO_ROUTE_KEY: Record<string, RouteKey> = {
   general: 'general_qa',
@@ -45,7 +70,13 @@ const INTENT_TYPE_TO_ROUTE_KEY: Record<string, RouteKey> = {
  * 'general_qa', exactly as resolveModelForIntent's default resolution does.
  */
 export function intentTypeToRouteKey(intent: string | undefined): RouteKey {
-  return (intent && INTENT_TYPE_TO_ROUTE_KEY[intent]) || 'general_qa';
+  if (!intent) return 'general_qa';
+  const renamed = INTENT_TYPE_TO_ROUTE_KEY[intent];
+  if (renamed) return renamed;
+  // Identity: an intent key that IS a RouteKey routes to it. This is the documented contract on
+  // `IntentDef.key`, and it is what makes a per-deployment pack able to add `code_generation`.
+  if (ROUTE_KEYS.has(intent)) return intent as RouteKey;
+  return 'general_qa';
 }
 
 // Ordinal capability/cost ranking, reusing each catalog entry's `costClass`.
@@ -94,7 +125,12 @@ export function resolveModelForIntent(
 
   if (!intent) return defaultResolution;
 
-  const routeKey = INTENT_TYPE_TO_ROUTE_KEY[intent];
+  // A rename, or an intent whose key IS a RouteKey (the documented `IntentDef.key` contract).
+  // A genuinely UNKNOWN intent still returns the profile default rather than being force-routed
+  // through general_qa - that is long-standing behaviour and changing it would silently re-route
+  // every unrecognised intent in every deployment, far beyond the three unreachable keys this
+  // change exists to fix.
+  const routeKey = INTENT_TYPE_TO_ROUTE_KEY[intent] ?? (ROUTE_KEYS.has(intent) ? (intent as RouteKey) : undefined);
   if (!routeKey) return defaultResolution;
 
   const route = strategy.find((r) => r.intent === routeKey);

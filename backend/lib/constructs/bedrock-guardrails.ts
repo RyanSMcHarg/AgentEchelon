@@ -15,6 +15,60 @@ import { RES_PREFIX } from '../stacks/agent-classification-common';
 export interface AgentGuardrailsProps {
   /** Descriptive name for the guardrail */
   name?: string;
+  /**
+   * A fully data-driven policy (SPEC-CONFIGURABLE-ASSISTANTS 4.6b): when provided, this construct
+   * provisions THIS policy verbatim instead of the built-in default — so a deployment can define more
+   * than one guardrail as data and a profile can SELECT among them. Absent ⇒ `buildGuardrailPolicy(name)`.
+   */
+  policy?: bedrock.CfnGuardrailProps;
+}
+
+/**
+ * The platform-default guardrail policy as DATA (SPEC-CONFIGURABLE-ASSISTANTS 4.6b). Exported so a
+ * deployment's guardrail catalog can start from it and tweak (e.g. add industry-specific blocked words)
+ * rather than re-declaring the whole policy. `extraBlockedWords` appends to the word filter — the cheap
+ * lever a "stricter" variant uses to be observably different from the default.
+ */
+export function buildGuardrailPolicy(opts: { name: string; description?: string; extraBlockedWords?: string[] }): bedrock.CfnGuardrailProps {
+  return {
+    name: opts.name,
+    description: opts.description ?? 'Content filtering for AgentEchelon Bedrock Agents',
+    blockedInputMessaging: 'I cannot process that request. Please rephrase your message.',
+    blockedOutputsMessaging: 'I cannot provide that response. Let me try a different approach.',
+    contentPolicyConfig: {
+      filtersConfig: [
+        { type: 'SEXUAL', inputStrength: 'HIGH', outputStrength: 'HIGH' },
+        { type: 'VIOLENCE', inputStrength: 'HIGH', outputStrength: 'HIGH' },
+        { type: 'HATE', inputStrength: 'HIGH', outputStrength: 'HIGH' },
+        { type: 'INSULTS', inputStrength: 'MEDIUM', outputStrength: 'HIGH' },
+        { type: 'MISCONDUCT', inputStrength: 'HIGH', outputStrength: 'HIGH' },
+        { type: 'PROMPT_ATTACK', inputStrength: 'HIGH', outputStrength: 'NONE' },
+      ],
+    },
+    sensitiveInformationPolicyConfig: {
+      piiEntitiesConfig: [
+        { type: 'EMAIL', action: 'ANONYMIZE' },
+        { type: 'PHONE', action: 'ANONYMIZE' },
+        { type: 'US_SOCIAL_SECURITY_NUMBER', action: 'BLOCK' },
+        { type: 'CREDIT_DEBIT_CARD_NUMBER', action: 'BLOCK' },
+      ],
+      regexesConfig: [
+        {
+          name: 'MetadataMarkerFilter',
+          description: 'Mask internal metadata markers if they leak into a response',
+          pattern: '<!--(?:ACTIVE_TASK|corr):[^>]*-->',
+          action: 'ANONYMIZE',
+        },
+      ],
+    },
+    wordPolicyConfig: {
+      wordsConfig: [
+        { text: 'system-admin' },
+        ...(opts.extraBlockedWords ?? []).map((text) => ({ text })),
+      ],
+      managedWordListsConfig: [{ type: 'PROFANITY' }],
+    },
+  };
 }
 
 export class AgentGuardrails extends Construct {
@@ -26,65 +80,9 @@ export class AgentGuardrails extends Construct {
   constructor(scope: Construct, id: string, props: AgentGuardrailsProps = {}) {
     super(scope, id);
 
-    const guardrailConfig: bedrock.CfnGuardrailProps = {
-      name: props.name || `${RES_PREFIX}-guardrail`,
-      description: 'Content filtering for AgentEchelon Bedrock Agents',
-      blockedInputMessaging:
-        'I cannot process that request. Please rephrase your message.',
-      blockedOutputsMessaging:
-        'I cannot provide that response. Let me try a different approach.',
-
-      // Content filters — block harmful content categories
-      contentPolicyConfig: {
-        filtersConfig: [
-          { type: 'SEXUAL', inputStrength: 'HIGH', outputStrength: 'HIGH' },
-          { type: 'VIOLENCE', inputStrength: 'HIGH', outputStrength: 'HIGH' },
-          { type: 'HATE', inputStrength: 'HIGH', outputStrength: 'HIGH' },
-          { type: 'INSULTS', inputStrength: 'MEDIUM', outputStrength: 'HIGH' },
-          { type: 'MISCONDUCT', inputStrength: 'HIGH', outputStrength: 'HIGH' },
-          { type: 'PROMPT_ATTACK', inputStrength: 'HIGH', outputStrength: 'NONE' },
-        ],
-      },
-
-      // Sensitive information filters — block PII in outputs
-      sensitiveInformationPolicyConfig: {
-        piiEntitiesConfig: [
-          { type: 'EMAIL', action: 'ANONYMIZE' },
-          { type: 'PHONE', action: 'ANONYMIZE' },
-          { type: 'US_SOCIAL_SECURITY_NUMBER', action: 'BLOCK' },
-          { type: 'CREDIT_DEBIT_CARD_NUMBER', action: 'BLOCK' },
-        ],
-        regexesConfig: [
-          {
-            name: 'MetadataMarkerFilter',
-            description: 'Mask internal metadata markers if they leak into a response',
-            pattern: '<!--(?:ACTIVE_TASK|corr):[^>]*-->',
-            // ANONYMIZE (mask the marker) — NOT BLOCK, which would reject the
-            // whole reply just because it carried an internal marker.
-            action: 'ANONYMIZE',
-          },
-        ],
-      },
-
-      // No topic-DENY policy. AgentEchelon is open source AND the assistant's
-      // knowledge is the classification-seeded company context we provide (plus general
-      // knowledge) — it never holds the deployment's AWS account id, tokens, or
-      // credentials, so there is nothing secret for a topic filter to protect.
-      // The real data boundary is the classification-scoped S3 IAM on context/{classification}/, and
-      // the rule is simply: don't seed secrets. A topic-DENY here only produced
-      // false positives (blocking legitimate technical answers). Production
-      // deployers can add their own topics (OSS: deployer-owned security).
-
-      // Word policy — block specific patterns
-      wordPolicyConfig: {
-        wordsConfig: [
-          { text: 'system-admin' },
-        ],
-        managedWordListsConfig: [
-          { type: 'PROFANITY' },
-        ],
-      },
-    };
+    // Default policy comes from the shared, data-driven builder (single source of truth); a caller may
+    // pass a fully-formed `policy` to provision an alternate guardrail (4.6b — the guardrail catalog).
+    const guardrailConfig: bedrock.CfnGuardrailProps = props.policy ?? buildGuardrailPolicy({ name: props.name || `${RES_PREFIX}-guardrail` });
 
     const guardrail = new bedrock.CfnGuardrail(this, 'Guardrail', guardrailConfig);
 

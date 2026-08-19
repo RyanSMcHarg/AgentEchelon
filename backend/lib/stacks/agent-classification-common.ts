@@ -60,6 +60,14 @@ export function classificationsAllowedFor(classification: Classification): strin
   return profiles.scopeAtOrBelow(classification);
 }
 
+/** The `context/{classification}/` S3 prefixes a classification may read — the ONE resolver the IAM
+ *  statement generator (assistant-profile-stack) and the retrieval walk (company-context) both consume,
+ *  so the boundary and the walk derive the identical prefix set from the classification config. Append
+ *  `*` for an IAM resource/prefix. */
+export function contextPrefixesAllowedFor(classification: Classification): string[] {
+  return profiles.contextPrefixesAtOrBelow(classification);
+}
+
 /**
  * SPEC-CONVERSATION-SECURITY Layer 1 — the channel-join boundary, **fail-closed**.
  *
@@ -258,6 +266,11 @@ export const SHARED_SSM = {
   // USER_PROFILE_SERVICE_ARN. See SPEC-USER-PROFILE-AND-ONBOARDING.md.
   userProfileArn: `${SSM_ROOT}/shared/tables/user-profile-arn`,
   userProfileName: `${SSM_ROOT}/shared/tables/user-profile-name`,
+  // Channel Context store (server-only private host grounding: participant profile, domain context,
+  // extra contexts, display name), keyed by channelArn. Written by the create Lambdas, read only by
+  // the assistant handler. NOT member-readable (contrast channel Metadata). See channel-context-client.
+  channelContextArn: `${SSM_ROOT}/shared/tables/channel-context-arn`,
+  channelContextName: `${SSM_ROOT}/shared/tables/channel-context-name`,
   // Abuse-controls control plane (dedup / spend budget / rate limit). SPEC-ABUSE-CONTROLS.
   abuseControlsArn: `${SSM_ROOT}/shared/tables/abuse-controls-arn`,
   abuseControlsName: `${SSM_ROOT}/shared/tables/abuse-controls-name`,
@@ -343,6 +356,16 @@ export function abuseControlsWiring(
       ? { ABUSE_CIRCUIT_PARAM: circuitParamName, ABUSE_CIRCUIT_TRIP_THRESHOLD: ctxNum('bedrockCircuitTripThreshold', globalBudget) }
       : {}),
     ...(cannedCtx ? { BUDGET_CANNED_RESPONSE: String(cannedCtx) } : {}),
+    // Admin exemption (SPEC-ABUSE-CONTROLS "Identity and exemptions"): OPT-IN, default off. When on, the
+    // router exempts senders in a trusted admin group from the per-user rate limit + per-user budget
+    // (never the global budget, which always protects the account). Group list overridable, defaults
+    // to `admins`. -c abuseExemptAdmins=true [-c abuseExemptAdminGroups=admins,staff].
+    ...(scope.node.tryGetContext('abuseExemptAdmins') === 'true' || scope.node.tryGetContext('abuseExemptAdmins') === true
+      ? {
+          ABUSE_EXEMPT_ADMINS: 'true',
+          ABUSE_EXEMPT_ADMIN_GROUPS: (scope.node.tryGetContext('abuseExemptAdminGroups') as string) || 'admins',
+        }
+      : {}),
   };
   const grant = (role: iam.IRole): void => {
     role.addToPrincipalPolicy(
@@ -425,6 +448,8 @@ export function resolveSharedSSM(scope: Construct): {
   userTasksName: string;
   userProfileArn: string;
   userProfileName: string;
+  channelContextArn: string;
+  channelContextName: string;
   abuseControlsArn: string;
   abuseControlsName: string;
   experimentsArn: string;
@@ -439,6 +464,8 @@ export function resolveSharedSSM(scope: Construct): {
     userTasksName: v(SHARED_SSM.userTasksName),
     userProfileArn: v(SHARED_SSM.userProfileArn),
     userProfileName: v(SHARED_SSM.userProfileName),
+    channelContextArn: v(SHARED_SSM.channelContextArn),
+    channelContextName: v(SHARED_SSM.channelContextName),
     abuseControlsArn: v(SHARED_SSM.abuseControlsArn),
     abuseControlsName: v(SHARED_SSM.abuseControlsName),
     experimentsArn: v(SHARED_SSM.experimentsArn),
@@ -557,7 +584,7 @@ export function driftChannelCreateStatements(
 export interface AuroraDriftHookup {
   /**
    * ARN of the retrieval + drift data-plane Lambda exposed by
-   * AnalyticsStackAurora (project decision 018). The classification's agent handler is
+   * AnalyticsStackAurora (ADR-013). The classification's agent handler is
    * granted `lambda:InvokeFunction` on it and invokes it for retrieval + drift,
    * instead of being VPC-attached to Aurora itself. This keeps the Lex-facing
    * handler off the VPC path, where it would hang on SSM / Cognito /
@@ -599,11 +626,12 @@ export function wireMessageAnalytics(
 /**
  * Wire LIVE drift detection + RAG retrieval onto a per-classification agent handler.
  * Returns the env + the IAM the handler role needs to INVOKE the retrieval +
- * drift data-plane Lambda (project decision 018). The handler is NOT
+ * drift data-plane Lambda (ADR-013). The handler is NOT
  * VPC-attached; the data-plane Lambda owns the Aurora + Titan-embed access.
  * Wired on EVERY classification (basic/standard/premium) so each can run drift + RAG.
- * Drift is conversation-level + all-classification + on-by-default in Aurora mode (NOT
- * premium-only — see docs/SPEC-DRIFT-CONVERGENCE.md §"runs on all AE tiers").
+ * Drift is conversation-level and runs on EVERY classification (NOT premium-only — see
+ * docs/SPEC-DRIFT-CONVERGENCE.md §"runs on all AE tiers"). The live path itself is
+ * opt-in (`-c enableLiveDrift=true`, Aurora mode only).
  *
  * Usage in a classification stack (only when `hookup` is provided, i.e. Aurora mode):
  *   const drift = auroraDriftWiring(this, classification, hookup);
@@ -627,10 +655,13 @@ export function auroraDriftWiring(
 
   return {
     // The handler reads HAS_AURORA = !!AURORA_DATA_PLANE_ARN and
-    // ENABLE_LIVE_DRIFT === 'true'. Setting ENABLE_LIVE_DRIFT here makes drift ON
-    // BY DEFAULT whenever Aurora is wired (the deployer opts OUT, not in). The
-    // handler is NOT VPC-attached: it invokes the data-plane Lambda for the
-    // Aurora + Bedrock work (project decision 018).
+    // ENABLE_LIVE_DRIFT === 'true'. ENABLE_LIVE_DRIFT is unconditional HERE because
+    // this helper only RUNS when the deployer already opted in: the classification
+    // stacks call it only when `hookup` is present, which `bin/backend.ts` supplies
+    // only for `-c enableLiveDrift=true` in Aurora mode. Live drift stays OPT-IN,
+    // default OFF (AURORA-MODE-GUIDE.md, ADR-013 decision 4). The handler is NOT
+    // VPC-attached: it invokes the data-plane Lambda for the Aurora + Bedrock work
+    // (ADR-013).
     env: {
       AURORA_DATA_PLANE_ARN: hookup.dataPlaneArn,
       ENABLE_LIVE_DRIFT: 'true',

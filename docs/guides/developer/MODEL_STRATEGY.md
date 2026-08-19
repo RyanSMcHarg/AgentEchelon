@@ -90,7 +90,7 @@ At runtime, `backend/lambda/src/lib/model-resolver.ts` bridges the intent classi
 
 1. Maps the classified intent key to a fine-grained `RouteKey` via `INTENT_TYPE_TO_ROUTE_KEY`
 2. Looks up the `INTENT_ROUTE_STRATEGY` for the matched key
-3. Checks that the primary model is in `allowedTiers` for the current user tier
+3. Checks that the primary model is in `allowedClassifications` for the current user tier
 4. If not allowed, falls back to the tier's default model
 5. Same logic for the fallback model
 
@@ -116,6 +116,6 @@ All resilience metadata (`wasFallback`, `fallbackReason`, `retryCount`) is track
 - **Experiment config**: Stored in DynamoDB (`ExperimentsTable`), cached 60s in-memory
 - **Variant assignment**: Deterministic MD5 hash of `channelArn + experimentId` - same conversation always gets the same variant without storing assignments
 - **Tier safety**: Experiments can't assign a model not allowed for the user's tier
-- **Analytics**: `experimentId` and `variantId` flow through to Aurora for side-by-side comparison via `GET /analytics/experiments`
+- **Analytics**: `experimentId` and `variantId` flow through to Aurora for side-by-side comparison via `POST /` with `{"queryType":"experiment_results"}` on the analytics API (there is no `/analytics/experiments` GET resource)
 
 The admin Experiments tab allows creating, pausing, and completing experiments with configurable intent, models, traffic split, and target tiers.

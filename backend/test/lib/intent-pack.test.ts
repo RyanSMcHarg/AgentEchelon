@@ -20,6 +20,7 @@ import {
   responseSettingsForIntent,
   clampResponseMaxTokens,
 } from '../../lambda/src/lib/intent-pack';
+import { intentTypeToRouteKey } from '../../lambda/src/lib/model-resolver';
 
 // An example custom domain pack (a recipe assistant) — stands in for any deployment's own taxonomy.
 const DOMAIN_PACK = JSON.stringify([
@@ -222,5 +223,164 @@ describe('intent pack — P3 per-intent response settings (maxTokens / verbosity
     // reasoning turns keep a higher floor even if the intent asked for fewer
     expect(clampResponseMaxTokens(700, CEILING, true)).toBe(4000);
     expect(clampResponseMaxTokens(undefined, CEILING, true)).toBe(CEILING);
+  });
+});
+
+/**
+ * Code work is its own intent by default.
+ *
+ * `code_generation` and `code_review` are RouteKeys in the model strategy and selectable intents in
+ * the admin Experiments tab, but no default-pack intent emitted them, so the classifier could never
+ * produce one and a code-specialist model pinned to that route was dead config.
+ *
+ * The ordering assertions are the load-bearing ones: `classifyByPackKeywords` returns the
+ * FIRST-listed match, and `report_generation` owns the very broad 'generate'. Declaring the code
+ * intents after it would silently route every "generate a function" to a multi-step report.
+ */
+describe('code_generation / code_review are in the default pack', () => {
+  // THE CLASSIFIER IS THE LLM. Every default profile is `classifierMode: 'llm'`, and what the LLM
+  // sees is `intentPackCategoryLines()` — the intent DESCRIPTIONS. `classifyByPackKeywords` is only
+  // a fallback (a keyword-mode profile, or an LLM-classifier failure), so asserting keyword matches
+  // would pin the wrong surface: a keyword test can pass while the shipped path is unchanged.
+  it('offers both intents to the LLM classifier', () => {
+    _resetIntentPackCache();
+    const lines = intentPackCategoryLines();
+    expect(lines).toContain('- CODE_GENERATION:');
+    expect(lines).toContain('- CODE_REVIEW:');
+  });
+
+  it('describes them well enough for the LLM to separate them', () => {
+    _resetIntentPackCache();
+    const lines = intentPackCategoryLines();
+    // The distinctions that matter are stated, not implied: authoring vs critique, and neither
+    // is diagnosis. If these disappear the LLM has nothing to discriminate on.
+    expect(lines).toMatch(/CODE_GENERATION:[^\n]*WRITE or MODIFY code/i);
+    expect(lines).toMatch(/CODE_REVIEW:[^\n]*REVIEW, critique/i);
+    expect(lines).toMatch(/CODE_GENERATION:[^\n]*guided_troubleshooting/i);
+  });
+
+  it('routes both to their own model-strategy key', () => {
+    expect(intentTypeToRouteKey('code_generation')).toBe('code_generation');
+    expect(intentTypeToRouteKey('code_review')).toBe('code_review');
+  });
+
+  // Fallback-only coverage. Ordering matters HERE because classifyByPackKeywords returns the first
+  // match — but this path runs only when the LLM classifier is unavailable or a profile opts into
+  // keyword mode. It is not how a default deployment classifies.
+  it('fallback keyword path: does not steal image or troubleshooting requests', () => {
+    _resetIntentPackCache();
+    expect(classifyByPackKeywords('generate an image of a mountain lake')).toBe('image_generation');
+    expect(classifyByPackKeywords('I have an error in my code')).toBe('guided_troubleshooting');
+  });
+});
+
+/**
+ * COMPLETENESS: every RouteKey must be reachable from an intent the DEFAULT PACK can actually emit.
+ *
+ * The weaker sibling assertion in model-resolver.test.ts only proves the identity mapping works —
+ * that IF something classifies as `code_generation`, it routes there. This proves the other half:
+ * that an intent capable of producing each route EXISTS. Without it, a route can be "reachable" in
+ * principle and unreachable in practice, which is exactly the state `code_generation`,
+ * `code_review` and `strategic_analysis` were in: routes in the model strategy, options in the
+ * admin Experiments tab, and no classifier output that could ever select them.
+ *
+ * Deployments that supply their own pack are free to drop intents; this asserts the DEFAULT is
+ * complete, so the shipped configuration surface has no dead entries.
+ */
+describe('the default pack covers every RouteKey', () => {
+  it('leaves no route without an intent that can produce it', () => {
+    const ALL_ROUTE_KEYS = [
+      'general_qa',
+      'code_generation',
+      'code_review',
+      'document_extraction',
+      'report_generation',
+      'strategic_analysis',
+      'workflow_actions',
+    ];
+
+    // Everything the classifier can emit: the universal three plus the pack's domain intents.
+    const emittable = [...knownIntentKeys(DEFAULT_INTENT_PACK)];
+    const reachable = new Set(emittable.map((k) => intentTypeToRouteKey(k)));
+
+    const dead = ALL_ROUTE_KEYS.filter((rk) => !reachable.has(rk as never));
+    if (dead.length) {
+      throw new Error(
+        `RouteKeys with no default-pack intent that can produce them: ${dead.join(', ')}.\n`
+        + 'These appear in the model strategy and the admin Experiments tab, so an operator can pin '
+        + 'a model or start an A/B on them - and nothing will ever classify into them.\n'
+        + `Intents the default pack can emit: ${emittable.join(', ')}`,
+      );
+    }
+    expect(dead).toEqual([]);
+  });
+
+  it('offers strategic_analysis to the LLM classifier, distinguished from report_generation', () => {
+    _resetIntentPackCache();
+    const lines = intentPackCategoryLines();
+    expect(lines).toContain('- STRATEGIC_ANALYSIS:');
+    // The description must draw the boundary explicitly, since "analysis" alone is ambiguous
+    // between a strategy judgement and a formatted write-up.
+    expect(lines).toMatch(/STRATEGIC_ANALYSIS:[^\n]*report_generation/i);
+  });
+
+  it('fallback keyword path: strategic terms do not swallow ordinary analysis', () => {
+    _resetIntentPackCache();
+    // On the fallback path, strategic_analysis must not claim generic analysis phrasing — that
+    // would change the delivery class of turns that are report_generation today.
+    const verdict = classifyByPackKeywords('Analyze the pros and cons of microservices vs monolithic');
+    expect(verdict).not.toBe('strategic_analysis');
+    expect(classifyByPackKeywords('generate a report on Q2 sales')).toBe('report_generation');
+  });
+});
+
+/**
+ * SIZE BUDGET — the platform defaults must leave room for a deployment's own intents.
+ *
+ * A per-deployment pack is composed as `domain intents + DEFAULT_INTENT_PACK.intents` and stored in
+ * ONE SSM parameter. SSM value size is a HARD limit — 4 KB Standard, 8 KB Advanced — and unlike
+ * throughput or parameter count, AWS publishes no way to raise it. So every byte the PLATFORM adds
+ * to the default pack is a byte a deployment cannot spend on its own taxonomy, in EVERY
+ * classification's parameter.
+ *
+ * This is not hypothetical: adding code_generation / code_review / strategic_analysis took the demo
+ * packs to 3674 / 4060 / 4633 bytes. Standard was left with 36 bytes of headroom and premium had to
+ * move to Advanced tier. Nothing failed loudly at the time, because the seeder writes
+ * write-if-absent — an over-size pack on an existing deployment is silently never applied. That
+ * silence is what this budget exists to break.
+ *
+ * The durable fix is on the roadmap in SPEC-CONFIGURABLE-INTENT-PACK: an `extends` pack form so the
+ * defaults (already compiled into the Lambda) stop being round-tripped through SSM at all. Until
+ * that lands, this keeps the platform side honest.
+ */
+describe('intent pack size budget (SSM value limits are hard)', () => {
+  const SSM_STANDARD_LIMIT = 4096;
+  /** Bytes reserved for a deployment's own domain intents + the JSON envelope, inside Standard tier. */
+  const DOMAIN_RESERVE = 900;
+  const PLATFORM_BUDGET = SSM_STANDARD_LIMIT - DOMAIN_RESERVE;
+
+  it('the DEFAULT pack leaves room for a deployment to add its own intents', () => {
+    const size = JSON.stringify(DEFAULT_INTENT_PACK.intents).length;
+    if (size > PLATFORM_BUDGET) {
+      throw new Error(
+        `DEFAULT_INTENT_PACK.intents is ${size} bytes; the budget is ${PLATFORM_BUDGET} `
+        + `(SSM Standard ${SSM_STANDARD_LIMIT} minus ${DOMAIN_RESERVE} reserved for a deployment's own `
+        + 'intents).\n'
+        + 'Every byte here is spent again in EVERY classification\'s parameter, and an over-size pack '
+        + 'is silently never applied by the write-if-absent seeder.\n'
+        + 'Either tighten a description (keywords are fallback-only — the classifier is the LLM), or '
+        + 'land the `extends` pack form so defaults stop being stored in SSM at all.',
+      );
+    }
+    expect(size).toBeLessThanOrEqual(PLATFORM_BUDGET);
+  });
+
+  it('no single intent is disproportionately large', () => {
+    // One runaway description is easier to fix than a diffuse overrun, and finding it late means
+    // finding it as "the pack no longer fits" rather than "this entry got long".
+    const oversized = DEFAULT_INTENT_PACK.intents
+      .map((i) => ({ key: i.key, size: JSON.stringify(i).length }))
+      .filter((i) => i.size > 700);
+    expect(oversized.map((i) => `${i.key}=${i.size}`)).toEqual([]);
   });
 });

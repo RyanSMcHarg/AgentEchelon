@@ -77,6 +77,22 @@ export function bedrockInvokeId(def: BackendModelDefinition): string {
 }
 
 /**
+ * The catalog's model KEYS — the stable selection vocabulary every write path validates against.
+ *
+ * DERIVED from the catalog rather than restated, so it cannot drift from the definitions the way a
+ * hand-maintained list would. The region/account arguments are placeholders on purpose: only the keys are
+ * read here, and the ARNs they would build are never looked at. Callers that need a real ARN must call
+ * `getModelCatalog` with the deployment's own values.
+ *
+ * A key is what profiles and experiment variants STORE (SPEC-PORTABLE §5: a model by catalog key, never a
+ * Bedrock ARN, so a version stays instance-agnostic and can move between deployments and regions). The
+ * Bedrock id is resolved from it per-deployment at runtime by `bedrockInvokeId`.
+ */
+export function modelCatalogKeys(): ReadonlySet<string> {
+  return new Set(Object.keys(getModelCatalog('us-east-1', '000000000000')));
+}
+
+/**
  * Member regions of the `us.` Anthropic SYSTEM_DEFINED cross-region
  * inference profiles (Sonnet 4.6 / Opus 4.6).
  *
