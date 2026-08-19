@@ -4,6 +4,26 @@
  * For a given user, finds related prior conversations to inject as context
  * into the current conversation. Supports both keyword matching and
  * pgvector similarity search when embeddings are available.
+ *
+ * ── NOT WIRED. READ THIS BEFORE BUILDING ON IT. ──────────────────────────────────────────────
+ * Neither export has a caller anywhere in `lambda/src`, so `cross_conversation_context` is NEVER
+ * WRITTEN at runtime and nothing injects these results into a prompt. The table's only reader is the
+ * admin `cross_conversation_context` analytics query, which therefore returns empty by construction
+ * (and no admin-console surface calls even that).
+ *
+ * Kept because the SEAM is the intended one - `drift-reasoning.ts` names `findRelatedConversations` as
+ * where the "is this topic already live in another of the user's conversations" check belongs
+ * (SPEC-DRIFT-CONVERGENCE decision-flow question 3). It is design, not delivered.
+ *
+ * Two things to settle when wiring it, neither handled here:
+ *  - CLASSIFICATION. Every query below scopes by `user_sub` only. A user may hold conversations at
+ *    different classifications, so surfacing another conversation's topic/summary into this one can
+ *    move content ACROSS a classification boundary the rest of the platform enforces (the assistant
+ *    receiving it is a narrower principal). Decide whether to filter by the caller's
+ *    `scopeAtOrBelow`, as document retrieval does.
+ *  - CONTENT vs AWARENESS. These rows carry topic AND summary. The cross-conversation design elsewhere
+ *    is deliberately awareness-only (that a conversation exists, and its type - never its content).
+ *    Injecting `summary` is a different, larger decision than turning the lookup on.
  */
 
 import { query } from './db-client.js';

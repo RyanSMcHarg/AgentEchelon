@@ -46,7 +46,7 @@ S3 bucket: rag/<source_type>/<file>            ← deployer uploads here
        └─────────────────────┘    before invoking the LLM
 ```
 
-**Execution model (project decision 018).** Retrieval and drift detection both need Aurora (pgvector) and Bedrock (embeddings), so both run inside a dedicated VPC-attached **data-plane Lambda**. The router agent handler stays **non-VPC** and invokes that Lambda synchronously. This keeps the Lex-facing handler off the VPC path, where it would otherwise hang on SSM, Cognito, and Lambda-invoke calls that have no endpoint in the isolated subnets. The data-plane Lambda's own dependencies (Bedrock embed, Secrets, the in-VPC Aurora proxy) are all covered by existing endpoints, so it adds **no new VPC endpoints**.
+**Execution model (ADR-013).** Retrieval and drift detection both need Aurora (pgvector) and Bedrock (embeddings), so both run inside a dedicated VPC-attached **data-plane Lambda**. The router agent handler stays **non-VPC** and invokes that Lambda synchronously. This keeps the Lex-facing handler off the VPC path, where it would otherwise hang on SSM, Cognito, and Lambda-invoke calls that have no endpoint in the isolated subnets. The data-plane Lambda's own dependencies (Bedrock embed, Secrets, the in-VPC Aurora proxy) are all covered by existing endpoints, so it adds **no new VPC endpoints**.
 
 The Aurora cluster, the Titan v2 embedding model, the pgvector extension, and the HNSW index are all **shared with drift detection**. RAG adds effectively zero incremental infrastructure cost: just the per-call Titan embed (about $0.0001 per turn) and one warm Lambda hop. Full per-piece figures are in [`INFRASTRUCTURE-COST.md`](../admin/INFRASTRUCTURE-COST.md).
 
@@ -57,7 +57,7 @@ The Aurora cluster, the Titan v2 embedding model, the pgvector extension, and th
 | `backend/lambda/src/analytics-aurora/schema/008-document-embeddings.sql` | Schema migration: 1024-dim embeddings + RAG columns + unique idempotency index |
 | `backend/lambda/src/analytics-aurora/document-ingestion.ts` | S3 → chunk → embed → INSERT Lambda |
 | `backend/lambda/src/analytics-aurora/document-retrieval.ts` | Query embed + cosine NN + citation packaging (runs in the data-plane Lambda) |
-| `backend/lambda/src/analytics-aurora/data-plane-handler.ts` | Retrieval/drift data-plane Lambda: dispatches `retrieve`, `detectDrift`, `recordDriftFire`, `recordDriftOutcome` (project decision 018) |
+| `backend/lambda/src/analytics-aurora/data-plane-handler.ts` | Retrieval/drift data-plane Lambda: dispatches `retrieve`, `detectDrift`, `recordDriftFire`, `recordDriftOutcome` (ADR-013) |
 | `backend/lambda/src/lib/data-plane-client.ts` | Non-VPC client seam: same function signatures, implemented as a synchronous invoke of the data-plane Lambda |
 | `backend/lambda/src/router-agent-handler.ts` | Call site - invokes the data-plane Lambda for retrieval, attaches result to InvokeAsync payload |
 | `backend/lambda/src/assistant-async-processor.ts` | Receiver - folds the retrieved context into the system prompt (every profile, via the shared processor) |
@@ -66,7 +66,7 @@ The Aurora cluster, the Titan v2 embedding model, the pgvector extension, and th
 ## Prerequisites
 
 1. **Aurora mode deployed.** `--context analyticsMode=aurora` at deploy time. The Aurora cluster, the embeddings table, and the ingestion Lambda all live in `AgentEchelonAnalyticsAurora`.
-2. **Live drift enabled.** `--context enableLiveDrift=true`. RAG and drift share the same gate: both run in the retrieval data-plane Lambda, which the router invokes. The router itself is not VPC-attached (project decision 018).
+2. **Live drift enabled.** `--context enableLiveDrift=true`. RAG and drift share the same gate: both run in the retrieval data-plane Lambda, which the router invokes. The router itself is not VPC-attached (ADR-013).
 3. **Schema migration 008 applied.** The schema-init custom resource runs migrations on stack create; verify by querying `information_schema.columns` for `embeddings.chunk_index`.
 4. **Bedrock model access for Titan v2.** `amazon.titan-embed-text-v2:0` in `us-east-1` (drift detection already requires this).
 
@@ -90,6 +90,23 @@ Per file:
 - Max 200 chunks per document - a hard cap to avoid runaway ingestion costs on a stray giant file
 
 **Idempotency:** the ingestor records the S3 ETag with each chunk. Re-uploading the same file is a no-op; uploading a modified version (ETag changes) clears the prior chunks and re-embeds. Safe to re-run the same `aws s3 cp` repeatedly.
+
+### The two seeded corpora, and which one you have to run yourself
+
+A demo deployment has two, uploaded by different things - worth separating, because only one is automatic:
+
+| Corpus | Prefix | Uploaded by | Answers |
+|---|---|---|---|
+| **Company** (the Stratum demo docs) | `rag/company/{tier}/` | `seed-demo.ts`, automatically, in Aurora mode | "what is our refund policy?" |
+| **Platform** (this repo's own docs) | `rag/agentechelon/basic/` | **you**, via `npm run sync-knowledge:rag` | "how does AgentEchelon do X?" |
+
+The platform corpus is generated from the `docs/` tree, which a deployed instance does not have, so it is a **deploy-time step an operator runs** rather than something the seed can do. Run it after the deploy and again whenever the docs change. It is tagged `tier=basic` so every tier can retrieve it, since it is public product information.
+
+**Skipping it is silent.** The assistant still answers platform questions - from the curated index (`platform-knowledge/agentechelon-about.json`, a title plus a ~400-character summary per doc, read through the `load_platform_info` tool), which `seed-demo` does upload. So the symptom is a vague-but-confident answer, not an error or an empty result. If platform answers read as thin, check this prefix before anything else:
+
+```bash
+aws s3 ls s3://<archive-bucket>/rag/agentechelon/ --recursive | wc -l   # 0 ⇒ never ingested
+```
 
 ## What happens at inference time
 
@@ -178,4 +195,4 @@ GROUP BY source_type;
 - `docs/specs/capabilities/SPEC-DRIFT-CONVERGENCE.md` - drift detection, shares the Aurora pgvector cluster
 - `docs/guides/admin/AURORA-MODE-GUIDE.md` - Aurora mode setup + cost detail
 - `docs/guides/admin/INFRASTRUCTURE-COST.md` - per-piece infrastructure cost model, including the data-plane Lambda
-- Project decision 018 (retrieval and drift data-plane Lambda) - the execution model and why the router stays non-VPC
+- [ADR-013](../../design/decisions/013-drift-retrieval-vs-decision.md) (retrieval and drift data-plane Lambda) - the execution model and why the router stays non-VPC

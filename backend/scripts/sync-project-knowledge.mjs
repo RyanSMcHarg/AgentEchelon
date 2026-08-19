@@ -5,11 +5,12 @@
  * can answer "what is this / how does X work" about the platform they run on.
  *
  * Two outputs (per the launch decision: curated + RAG):
- *   1. CURATED (this script, offline): a concise, all-tier context file written to
- *      backend/demo/context/basic/agentechelon-about.json. It lands in the `basic/`
- *      prefix, which EVERY tier inherits (basic reads basic/*, standard reads
- *      basic/*+standard/*, premium reads all), so the pitch + a documented index are
- *      available in Athena AND Aurora mode via the `load_company_context` tool.
+ *   1. CURATED (this script, offline): a concise, all-tier file written to
+ *      backend/demo/platform-knowledge/agentechelon-about.json, which seed-demo uploads
+ *      to the `platform-knowledge/` S3 prefix. EVERY tier's processor role can read that
+ *      prefix - it is deliberately not classification-scoped, because this is public
+ *      product information - so the pitch + a documented index are available in Athena
+ *      AND Aurora mode via the `load_platform_info` tool.
  *   2. RAG (Aurora only, needs a deploy): with `--rag`, the SAME file set (full repo
  *      docs + public blog) is uploaded to the Aurora archive bucket under
  *      `rag/agentechelon/basic/`. The DocumentIngestion Lambda (S3 notification on
@@ -29,6 +30,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { execSync } from 'node:child_process';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
@@ -39,11 +41,51 @@ const DOCS_DIR = path.join(REPO_ROOT, 'docs');
 const OUTPUT = path.join(REPO_ROOT, 'backend', 'demo', 'platform-knowledge', 'agentechelon-about.json');
 const RAG = process.argv.includes('--rag');
 
-// Repo docs to index: README + every docs/**/*.md. docs/ is organized into
+/**
+ * Docs that DOCUMENT THE DEMO DATASET, and therefore quote content the demo deliberately restricts by
+ * classification. They are excluded from the corpus entirely.
+ *
+ * THIS IS A CLASSIFICATION BOUNDARY, not tidiness. The corpus is ingested at the LOWEST classification
+ * so every tier can answer "how does the platform work?" - which means anything in it is readable by
+ * `basic`. `SPEC-DEMO-COMPANY.md` reproduces the Stratum org chart, the quarterly financials and the
+ * top accounts to illustrate what each tier may see, so ingesting it hands `basic` precisely the
+ * standard/premium-only data the demo exists to prove it cannot reach.
+ *
+ * Caught by `classification-context.spec.ts` ("basic CANNOT name internal leadership"), which failed
+ * with the assistant answering "the VP of Engineering at Stratum Technologies is Priya Patel" - sourced
+ * from this spec, not from any basic-tier context file. The lesson generalises: a doc ABOUT restricted
+ * data is itself restricted data.
+ */
+const DEMO_DATASET_DOCS = ['SPEC-DEMO-COMPANY.md'];
+
+// Repo docs to index: README + every TRACKED docs/**/*.md. docs/ is organized into
 // subfolders (overview/ guides/ specs/ design/), so walk it recursively. Excludes
-// decisions/ (ADRs) and non-doc/marker assets.
+// decisions/ (ADRs), non-doc/marker assets, and the demo-dataset docs above.
+//
+// TRACKED, because the corpus describes the repo AS SHIPPED - what a fresh checkout holds - and the
+// owner's working tree also carries gitignored private files (TRACKER-*.md, HANDOVER-*.md) that must
+// never reach a store every classification reads. This is not hypothetical: the tracker's own account
+// of the row-82 leak QUOTES a restricted employee name, so indexing it re-created the exact leak the
+// row records - a doc ABOUT restricted data is itself restricted data, one level up. The name guard
+// caught it, but the guard knows only the demo directory's names; git-tracked is the general boundary.
+function gitTrackedDocs() {
+  try {
+    const out = execSync('git ls-files -- docs', { cwd: REPO_ROOT, encoding: 'utf8' });
+    return new Set(
+      out.split('\n').map((l) => l.trim()).filter(Boolean)
+        .map((l) => path.resolve(REPO_ROOT, l)),
+    );
+  } catch {
+    // No git (an exported tree). There the filesystem IS the shipped surface - a tree without .git has
+    // no private working files to exclude - so the walk alone is correct, not merely tolerated.
+    return null;
+  }
+}
+
 function repoDocPaths() {
+  const tracked = gitTrackedDocs();
   const paths = [path.join(REPO_ROOT, 'README.md')];
+  const skipped = [];
   const walk = (dir) => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const name = entry.name;
@@ -55,11 +97,61 @@ function repoDocPaths() {
         walk(path.join(dir, name));
         continue;
       }
-      if (name.endsWith('.md')) paths.push(path.join(dir, name));
+      if (DEMO_DATASET_DOCS.includes(name)) continue;
+      if (!name.endsWith('.md')) continue;
+      const full = path.join(dir, name);
+      if (tracked && !tracked.has(path.resolve(full))) { skipped.push(name); continue; }
+      paths.push(full);
     }
   };
   walk(DOCS_DIR);
+  if (skipped.length) {
+    console.log(`  untracked (private) docs excluded from the corpus: ${skipped.join(', ')}`);
+  }
   return paths.filter((p) => fs.existsSync(p));
+}
+
+/**
+ * Refuse to ship a corpus that carries classification-restricted demo data.
+ *
+ * The exclusion above is a list, and a list rots - a new doc quoting the org chart would sail past it.
+ * So the content is checked too, against the EMPLOYEE DIRECTORY: any of those people named in a doc
+ * bound for a corpus every classification can read is restricted data leaving its tier.
+ *
+ * The names are read from the directory's own structure rather than pattern-matched out of the context
+ * files. A "two capitalised words" heuristic flags `Customer Success` and `Principal Engineer` as
+ * readily as `Priya Patel`, and a guard that cries wolf on a security spec gets switched off - which
+ * would be worse than not having one.
+ *
+ * Fails the run rather than warning. This corpus is read by the lowest classification, so shipping it
+ * with restricted content is not a degraded feature - it is the isolation guarantee not holding.
+ */
+function assertNoRestrictedDemoData(paths) {
+  const dir = path.join(REPO_ROOT, 'backend', 'demo', 'context', 'standard', 'employee-directory.json');
+  if (!fs.existsSync(dir)) return; // no demo dataset in this checkout - nothing to protect
+  let names = [];
+  try {
+    const doc = JSON.parse(fs.readFileSync(dir, 'utf8'));
+    names = (doc.departments || []).flatMap((d) => (d.members || []).map((m) => m.name)).filter(Boolean);
+  } catch {
+    return; // unreadable directory: do not invent a boundary from a parse failure
+  }
+  if (!names.length) return;
+  const offenders = [];
+  for (const p of paths) {
+    const body = fs.readFileSync(p, 'utf8');
+    const hits = names.filter((n) => body.includes(n));
+    if (hits.length) offenders.push(`${path.relative(REPO_ROOT, p).replace(/\\/g, '/')}  [${hits.slice(0, 4).join(', ')}]`);
+  }
+  if (offenders.length) {
+    console.error(
+      '\n✗ Refusing to ingest: these docs carry demo data restricted to standard/premium, and this\n'
+      + '  corpus is ingested at the LOWEST classification - so basic would be able to retrieve it.\n'
+      + '  Add the file to DEMO_DATASET_DOCS, or take the restricted content out of it.\n\n  '
+      + offenders.join('\n  ') + '\n',
+    );
+    process.exit(1);
+  }
 }
 
 /** Strip YAML frontmatter and return { frontmatter, body }. */
@@ -192,8 +284,26 @@ async function ingestToRag() {
   const put = (key, body) =>
     s3.send(new PutObjectCommand({ Bucket: bucket, Key: key, Body: body, ContentType: 'text/markdown' }));
 
+  // Checked BEFORE the first upload: a corpus read by the lowest classification must carry nothing
+  // the demo restricts to a higher one.
+  const docPaths = repoDocPaths();
+  assertNoRestrictedDemoData(docPaths);
+
+  // A doc that USED to be ingested and is now excluded still has its chunks in pgvector - an S3 delete
+  // does not reach the ingestor (docs/RAG.md). Overwrite the key with a stub instead: the ETag changes,
+  // so the ingestor clears the prior chunks and embeds the stub, which is how an excluded doc stops
+  // being retrievable without a manual DELETE against the embeddings table.
+  for (const name of DEMO_DATASET_DOCS) {
+    await put(
+      PREFIX + name,
+      `# ${name}\n\nThis document is not part of the platform knowledge corpus. It describes the demo `
+      + 'dataset, whose contents are deliberately restricted by classification, so it is excluded from '
+      + 'a corpus that every classification can read.\n',
+    );
+  }
+
   let n = 0;
-  for (const p of repoDocPaths()) {
+  for (const p of docPaths) {
     await put(PREFIX + path.basename(p), fs.readFileSync(p, 'utf8'));
     n++;
   }

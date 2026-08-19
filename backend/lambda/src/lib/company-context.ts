@@ -22,14 +22,21 @@ import {
   ListObjectsV2Command,
   GetObjectCommand,
 } from '@aws-sdk/client-s3';
+import { defaultProfileRegistry } from '../../../lib/profile-registry.js';
 
 const s3 = new S3Client({});
 
-// Every known classification prefix, MOST-SPECIFIC-FIRST (premium → standard → basic) so
-// that if the total-chars cap is ever hit, the caller's OWN classification documents load
-// first and survive rather than being dropped last. IAM decides which are
-// readable; a lower-clearance caller simply gets AccessDenied on the higher prefixes.
-export const CLASSIFICATION_PREFIXES = ['context/premium/', 'context/standard/', 'context/basic/'];
+/**
+ * The `context/{classification}/` prefixes a caller may read, derived from the SAME
+ * `scopeAtOrBelow` resolver the IAM statement generator consumes (registry.contextPrefixesAtOrBelow)
+ * — NOT a hardcoded classification list. That closes the drift the old `CLASSIFICATION_PREFIXES`
+ * const had: a renamed/added classification now moves IAM and retrieval together. Ordered
+ * highest-classification-first so, if the total-chars cap is hit, the caller's own documents survive.
+ * IAM still enforces every GetObject; this only skips prefixes the caller could not read anyway.
+ */
+function contextPrefixesFor(classification: string): string[] {
+  return defaultProfileRegistry.contextPrefixesAtOrBelow(classification, { highestFirst: true });
+}
 // Platform self-knowledge (about the AgentEchelon product itself) lives OUTSIDE
 // the company `context/` tree so a company/business question never loads it.
 // Retrieved separately via loadPlatformInfo (exposed as the load_platform_info
@@ -118,7 +125,7 @@ async function loadDocsFromPrefixes(
   docFilter?: Set<string>,
 ): Promise<CompanyContextResult> {
   const allKeys = await listAccessibleKeys(bucket, prefixes);
-  // SELECTIVE load (SPEC-ASSISTANT-CONTEXT): when the model named the document(s) it needs (by filename,
+  // SELECTIVE load (GUIDE-ASSISTANT-CONTEXT): when the model named the document(s) it needs (by filename,
   // from the digest), fetch ONLY those instead of the whole corpus — the cost win. An empty/unmatched
   // filter falls through to loading everything (recall-safe: a broad question still gets the full set).
   const filtered = docFilter && docFilter.size
@@ -167,6 +174,7 @@ export function __clearCompanyContextCache(): void {
  */
 export async function loadCompanyContext(
   bucket: string,
+  classification: string,
   opts?: { documents?: string[] },
 ): Promise<CompanyContextResult> {
   // The model names the specific documents it needs (filenames from the digest). Only those are fetched —
@@ -174,10 +182,11 @@ export async function loadCompanyContext(
   const docFilter = opts?.documents?.length
     ? new Set(opts.documents.map((d) => d.split('/').pop() || d))
     : undefined;
-  const cacheKey = `${bucket}::${docFilter ? [...docFilter].sort().join(',') : 'ALL'}`;
+  // Cache per (bucket, classification, doc set): different classifications resolve different prefix sets.
+  const cacheKey = `${bucket}::${classification}::${docFilter ? [...docFilter].sort().join(',') : 'ALL'}`;
   const cached = companyContextCache.get(cacheKey);
   if (cached && Date.now() - cached.at < COMPANY_CONTEXT_CACHE_TTL_MS) return cached.result;
-  const result = await loadDocsFromPrefixes(bucket, CLASSIFICATION_PREFIXES, 'company-context', docFilter);
+  const result = await loadDocsFromPrefixes(bucket, contextPrefixesFor(classification), 'company-context', docFilter);
   companyContextCache.set(cacheKey, { result, at: Date.now() });
   return result;
 }

@@ -1,33 +1,40 @@
 ---
 title: "ADR-013: Drift = pgvector retrieval + reasoning decision; reply handler stays out of the VPC"
-status: Proposed 2026-06-07
+status: Accepted
 date: 2026-06-07
 related:
   - SPEC-DRIFT-CONVERGENCE.md
   - 006-drift-detection-shape.md
   - AURORA-MODE-GUIDE.md
-  - "../../backend/lambda/src/lib/scoped-channels.ts"
-  - "../../backend/lambda/src/lib/live-drift-flow.ts"
-  - "../../backend/lib/stacks/analytics-stack-aurora.ts"
+  - "../../../backend/lambda/src/lib/scoped-channels.ts"
+  - "../../../backend/lambda/src/lib/live-drift-flow.ts"
+  - "../../../backend/lib/stacks/analytics-stack-aurora.ts"
 supersedes: |
   Amends the live-drift portion of SPEC-DRIFT-CONVERGENCE. The drift
   RESULT-SHAPE contract (ADR-006) is unchanged. What changes is (a) how the
   live signal is computed (retrieval vs decision split) and (b) where it
   runs (the reply handler leaves the VPC).
 tracking: |
-  Partially implemented. Done: the reasoning gate (`lib/drift-reasoning.ts`,
-  unit-tested) and the `enableLiveDrift` default flipped to OFF. Remaining:
-  Data-API/async retrieval, client-event outcome emission, the observability
+  Largely implemented. Done: the reasoning gate (`lib/drift-reasoning.ts`,
+  unit-tested); the `enableLiveDrift` default flipped to OFF; and decision 2 -
+  the reply handler is OUT of the VPC and keeps its Amazon Chime SDK egress.
+  Decision 2 shipped by a THIRD mechanism, neither the RDS Data API nor the TTL'd
+  async flag it proposed: a VPC-attached retrieval + drift DATA-PLANE Lambda
+  (`analytics-aurora/data-plane-handler.ts`) that the non-VPC handler invokes
+  through `lib/data-plane-client.ts`. That seam is what the codebase means
+  wherever it cites this ADR, and it is now the extension point for any new
+  Aurora-side work on the request path (add an `op` to its dispatch rather than
+  a VPC endpoint). Remaining: client-event outcome emission and the observability
   changes (drift_events schema migration + analytics query + ConversationsTab
-  rationale rendering), and moving `auroraDriftWiring` off the VPC. Until that
-  lands, live drift stays OFF in Aurora mode.
+  rationale rendering). Live drift is no longer blocked by this ADR; it is opt-in
+  per decision 4.
 ---
 
 # ADR-013: Drift = pgvector retrieval + reasoning decision; reply handler stays out of the VPC
 
 ## Status
 
-Proposed. Triggered by the first live Aurora-mode deploy, which surfaced a runtime failure that synth-only validation never could.
+Accepted, partially implemented. Triggered by the first live Aurora-mode deploy, which surfaced a runtime failure that synth-only validation never could. The reasoning gate, the `enableLiveDrift` default and decision 2 (the reply handler out of the VPC, reaching Aurora through the data-plane Lambda) ship; client-event outcome emission and the observability changes remain. The `tracking` block in the frontmatter is authoritative on the split.
 
 ## Context
 
@@ -60,11 +67,22 @@ Keep AE's pgvector investment, but use each tool for the sub-problem it actually
      model hop. Cosine becomes the cheap pre-filter that selects candidates;
      reasoning makes the call.
 
-2. **The reply handler stays OUT of the VPC.** Reach Aurora for the retrieval query via the **RDS Data API** (HTTPS, no VPC attachment) or via an **async** signal (the already-isolated embedding/archival Lambda computes the retrieval result and writes a lightweight, **TTL'd** flag -- e.g. a DynamoDB item with a short expiry, since the drift signal is ephemeral and single-turn; the next non-VPC turn reads the flag and surfaces the suggestion). Either way the handler keeps its Amazon Chime SDK egress. No NAT gateway (it would force a VPC topology change that replaces the VPC and the Aurora cluster).
+2. **The reply handler stays OUT of the VPC.** *(Shipped, by a mechanism not listed below: a VPC-attached retrieval + drift **data-plane Lambda** that the non-VPC handler invokes. It satisfies this decision's requirement - the handler keeps its Amazon Chime SDK egress and needs no NAT - while keeping the query in normal pgvector SQL. The codebase cites this ADR from that seam.)* As originally written: reach Aurora for the retrieval query via the **RDS Data API** (HTTPS, no VPC attachment) or via an **async** signal (the already-isolated embedding/archival Lambda computes the retrieval result and writes a lightweight, **TTL'd** flag -- e.g. a DynamoDB item with a short expiry, since the drift signal is ephemeral and single-turn; the next non-VPC turn reads the flag and surfaces the suggestion). Either way the handler keeps its Amazon Chime SDK egress. No NAT gateway (it would force a VPC topology change that replaces the VPC and the Aurora cluster).
 
 3. **Privacy scope stays enforced in SQL**, never in per-processor app code. Keep `scoped-channels.ts` and the all-human-member intersection inside the vector-search `WHERE` clause.
 
 4. **`enableLiveDrift` defaults to `false`.** Revert `bin/backend.ts` so a plain `cdk deploy --all -c analyticsMode=aurora` does not silently enable the broken live path. This matches `AURORA-MODE-GUIDE.md`, which already documents the default as `false` (opt-in). The async/archival drift telemetry path is unaffected and stays on in Aurora mode.
+
+   > **Re-affirmed 2026-07-29, on different grounds.** The original justification is VOID: the live
+   > path is no longer broken (the handler is out of the VPC, and the first-turn seed in
+   > [ADR-019](019-conversation-summary-seeded-on-first-turn.md) means drift actually fires). The
+   > default nonetheless stays `false`, now as a PRODUCT choice rather than a safety measure: live
+   > drift interrupts a user mid-conversation to propose splitting it, which is a visible behaviour
+   > change a deployer should opt into deliberately, and it adds a per-turn embedding call. Flipping
+   > it would also contradict `AURORA-MODE-GUIDE.md` and four places in
+   > `SPEC-DRIFT-CONVERGENCE.md`. **Any future flip must update those together and is a deliberate
+   > amendment, not a default tweak.** `bin/backend.ts` carries no timeout rationale for the flag, so
+   > it reads as the deliberate opt-in it is rather than as a broken-feature guard.
 
 5. **Record the outcome as a client-event, not an Aurora write in the reply path.** `recordDriftFire` / `recordDriftOutcome` currently write to Aurora `drift_events` from inside `live-drift-flow.ts` -- a SECOND Aurora coupling in the reply handler (beyond the cosine read), and another reason the handler was VPC-attached. The cleaner pattern measures drift via a `drift` **client-event** emitted through the existing telemetry path. AE should adopt it: the reply handler emits a drift client-event (fire + chosen outcome) through the already-built client-events pipeline (`eventTrackingService` -> `/events` -> Firehose), so the reply path makes **no Aurora write** and needs no VPC for observability. The richer `drift_events` row (for the admin analytics layer) is persisted **async** off that stream, not synchronously in the handler.
 

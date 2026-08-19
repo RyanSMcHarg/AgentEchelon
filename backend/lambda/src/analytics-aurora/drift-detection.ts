@@ -24,13 +24,14 @@ import {
   InvokeModelCommand,
 } from '@aws-sdk/client-bedrock-runtime';
 import { query } from './db-client.js';
+import { withReaderRole } from './classification-boundary.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
 import {
   emitDriftTiming,
   emitDriftCounter,
   newCorrelationId,
 } from '../lib/emf-metrics.js';
 import { detectExplicitRoutingRequest } from '../lib/explicit-routing.js';
-import { getScopedChannelArns } from '../lib/scoped-channels.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -63,10 +64,60 @@ export interface DetectDriftInput {
   /**
    * Set of `(distance ± 0.05)` cosine values the user has recently declined.
    * When the current distance falls inside any band, drift is suppressed.
-   * The Lex fulfillment Lambda reads these out of `routingState` and passes
-   * them in.
+   * The live drift flow (`lib/live-drift-flow.ts`, reached from the router) reads
+   * these out of `routingState` and passes them in.
    */
   declinedDistances?: number[];
+  /**
+   * True when this channel has a LIVE task (status pending/in_progress) for this user.
+   *
+   * A live task means the assistant is mid-workflow and has asked the user for something -
+   * requirements, an outline approval, symptoms. The user's turn is then an ANSWER, and an
+   * answer is a continuation of the thread, not a pivot away from it. The cosine signal
+   * cannot see that: an answer is often a short fragment ("Audience is engineering
+   * leadership. Focus on delivery velocity and CI cost.") carrying none of the topic words
+   * the summary embedding was built from, so it lands far from the summary and fires drift
+   * on the one turn the assistant explicitly solicited.
+   *
+   * Suppression applies to the COSINE path only. The explicit-routing fast-path is checked
+   * first and still fires, so a user who deliberately asks for a new conversation mid-task
+   * still gets one.
+   */
+  activeTaskInProgress?: boolean;
+  /**
+   * The channels this drift query may look in: those EVERY current human member of the conversation
+   * also belongs to (ADR-012).
+   *
+   * **Resolved by the CALLER, from Amazon Chime SDK Messaging, and required.** Two reasons it cannot
+   * be computed here:
+   *
+   *  - **Authority.** This is a privacy control. The only authoritative answer is the messaging
+   *    service's own membership; the Aurora `channel_membership` table is an archive the Kinesis path
+   *    fills asynchronously, and a member who joined seconds ago is missing from it — which widens
+   *    the scope past the people actually in the room.
+   *  - **Reachability.** This code runs in `DataPlaneLambda`, VPC-attached in the isolated subnets
+   *    with no Chime endpoint and no NAT, so a Chime call from here hangs until the timeout.
+   *
+   * Absent ⇒ no related conversation is suggested. There is deliberately no fallback to the archive.
+   */
+  scopedChannelArns?: string[];
+  /**
+   * REQUIRED. The current channel's classification, used to select the database reader role both
+   * summary-embedding reads run as (ADR-028).
+   *
+   * WHY THIS IS NOT `userClearance` ABOVE, which carries the same value today. That field is a metric
+   * DIMENSION and is optional; a boundary cannot be optional, and an absent value there would silently
+   * become an absent role here. The names also mean different things on purpose - clearance is what a
+   * PERSON holds, classification is what CONTENT is - and this one is deciding what content may be
+   * read, so it is named for that.
+   *
+   * WHAT IT FIXES. Scoping by membership alone let drift point from a BASIC channel at a PREMIUM one:
+   * two premium-cleared people talking in a basic channel have premium channels in their membership
+   * intersection. Nobody learned anything they could not already open, but the platform's model is
+   * that the CHANNEL's classification bounds what may surface in it. Membership protects the people;
+   * it does not protect the channel. The reader role now bounds the candidate set as well.
+   */
+  classification: string;
 }
 
 export interface DriftResult {
@@ -111,6 +162,22 @@ const bedrockClient = new BedrockRuntimeClient({});
 // ---------------------------------------------------------------------------
 
 export async function detectDrift(input: DetectDriftInput): Promise<DriftResult> {
+  // The classification selects the database reader role both summary reads run as (ADR-028). Checked
+  // HERE, at the entry point, because the data-plane dispatch hands this input across a Lambda
+  // boundary as `any`, which erases the required type - so a caller that omits it is a runtime
+  // condition, not a compile-time one.
+  //
+  // THIS CHECK IS HERE BECAUSE ITS ABSENCE SHIPPED. Without it the missing value flowed all the way to
+  // `readerRoleFor`, which built `ae_reader_undefined` and failed on the database once per turn. Two
+  // Lambdas, one contract: the data-plane enforced the new field before the router that supplies it
+  // was redeployed. Fail fast, with the caller named, rather than constructing a role that cannot exist.
+  if (!profiles.isKnownClassification(input?.classification)) {
+    throw new Error(
+      `[drift] classification is required and must be declared by this deployment; got `
+      + `${JSON.stringify(input?.classification)}. Drift reads summary embeddings as a per-classification `
+      + 'database role (ADR-028). If this is the live path, the ROUTER is older than the data-plane.',
+    );
+  }
   const correlationId = input.correlationId || newCorrelationId();
   const tStart = Date.now();
 
@@ -158,11 +225,21 @@ export async function detectDrift(input: DetectDriftInput): Promise<DriftResult>
     };
   }
 
+  // Skip: the assistant is mid-task and asked this user for something, so this turn is an
+  // ANSWER. Checked AFTER the explicit-routing fast-path (a deliberate "start a new
+  // conversation about X" still routes) and BEFORE the summary fetch + embed, so a suppressed
+  // turn also costs no Bedrock call. See `activeTaskInProgress` for why cosine mis-reads answers.
+  if (input.activeTaskInProgress) {
+    emitDriftCounter('drift_skipped_active_task', correlationId, emfOpts);
+    emitDriftTiming('total', Date.now() - tStart, correlationId, emfOpts);
+    return baseResult;
+  }
+
   // Fetch summary embedding (PK lookup; fast).
   const tSummaryStart = Date.now();
   let summaryEmbedding: number[] | null = null;
   try {
-    summaryEmbedding = await loadSummaryEmbedding(input.channelArn);
+    summaryEmbedding = await loadSummaryEmbedding(input.channelArn, input.classification);
   } catch (err) {
     console.warn('[drift] summary_embeddings lookup failed:', err);
   }
@@ -233,6 +310,8 @@ export async function detectDrift(input: DetectDriftInput): Promise<DriftResult>
     rivalConversationArn = await findRelatedConversation({
       currentChannelArn: input.channelArn,
       messageEmbedding,
+      scopedChannelArns: input.scopedChannelArns,
+      classification: input.classification,
     });
   } catch (err) {
     console.warn('[drift] related-conversation lookup failed:', err);
@@ -278,16 +357,27 @@ export interface RecordDriftInput {
   messageId: string;
   userSub?: string;
   intent: Intent;
+  /**
+   * Which path produced this row, and it is REQUIRED because the two mean different things.
+   *
+   * 'live'     - a suggestion was shown to the user, who can accept or decline it. An OFFER.
+   * 'archival' - post-hoc scoring of an archived message. Nothing was shown to anyone.
+   *
+   * Every question about user response ("did they accept?") is answerable only over 'live'
+   * rows: archival rows have nobody to accept them, never settle, and would silently deflate
+   * any acceptance rate they were counted in. See migration 016.
+   */
+  source: 'live' | 'archival';
 }
 
 export async function recordDriftFire(input: RecordDriftInput): Promise<string> {
-  const { result, channelArn, messageId, userSub, intent } = input;
+  const { result, channelArn, messageId, userSub, intent, source } = input;
   const rows = await query<{ event_id: string }>(
     `INSERT INTO drift_events (
        outcome, cosine_distance, parent_channel_arn, rival_conversation_arn,
        user_sub, originating_message_id, intent, confidence, correlation_id,
-       created_via_explicit_intent
-     ) VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, $8, $9)
+       created_via_explicit_intent, source
+     ) VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING event_id`,
     [
       Number.isFinite(result.driftScore) ? result.driftScore : null,
@@ -299,6 +389,7 @@ export async function recordDriftFire(input: RecordDriftInput): Promise<string> 
       result.confidence,
       result.correlationId,
       Boolean(result.viaExplicitIntent),
+      source,
     ],
   );
   return rows.rows[0].event_id;
@@ -346,15 +437,22 @@ export async function getLatestSummary(channelArn: string): Promise<string | nul
 // Internals
 // ---------------------------------------------------------------------------
 
-async function loadSummaryEmbedding(channelArn: string): Promise<number[] | null> {
+async function loadSummaryEmbedding(channelArn: string, classification: string): Promise<number[] | null> {
   // pgvector returns the embedding as a string like "[0.1,0.2,...]".
   // We cast to text and parse rather than relying on a pgvector node driver.
-  const result = await query<{ embedding_text: string | null }>(
+  //
+  // ADR-028: read as this channel's reader role. This is the channel's OWN anchor, so its row sits at
+  // this very classification and is in scope by construction - the role changes nothing here in the
+  // normal case. It matters when the row is NOT what it should be: a summary stamped fail-closed to
+  // the most restrictive value (because the Chime-sourced classification never arrived) becomes
+  // invisible to a lower-classification channel, and drift skips rather than comparing against an
+  // anchor whose provenance is unknown.
+  const result = await withReaderRole(classification, (client) => client.query<{ embedding_text: string | null }>(
     `SELECT embedding::text AS embedding_text
        FROM summary_embeddings
       WHERE channel_arn = $1`,
     [channelArn],
-  );
+  ));
   const text = result.rows[0]?.embedding_text;
   if (!text) return null;
   return parsePgVector(text);
@@ -395,22 +493,33 @@ async function embedText(text: string): Promise<number[] | null> {
 interface FindRelatedInput {
   currentChannelArn: string;
   messageEmbedding: number[];
+  scopedChannelArns?: string[];
+  classification: string;
 }
 
 async function findRelatedConversation(input: FindRelatedInput): Promise<string | undefined> {
-  // Scoping (security + privacy): intersection of all human channel members'
-  // memberships in the current channel. Enforced INSIDE the WHERE clause —
-  // pgvector ranks within the scoped set, not on the full table with a
-  // post-filter. See SPEC-DRIFT-CONVERGENCE.md "Scoping (Security + Privacy)".
-  const scopedArns = await getScopedChannelArns(input.currentChannelArn);
+  // Scoping (security + privacy): intersection of all human channel members' memberships in the
+  // current channel. Enforced INSIDE the WHERE clause — pgvector ranks within the scoped set, not on
+  // the full table with a post-filter. See SPEC-DRIFT-CONVERGENCE.md "Scoping (Security + Privacy)".
+  //
+  // The set arrives from the caller, resolved live from Amazon Chime SDK Messaging. No scope means no
+  // suggestion: the archive is NOT consulted as a fallback, because a lagging copy widens the scope
+  // beyond the people actually in the conversation — which is the disclosure this control prevents.
+  const scopedArns = input.scopedChannelArns;
+  if (!scopedArns || scopedArns.length === 0) return undefined;
 
   // Exclude the current channel itself from the scope (it would always be
   // the nearest neighbor to its own summary).
   const candidateArns = scopedArns.filter((arn) => arn !== input.currentChannelArn);
   if (candidateArns.length === 0) return undefined;
 
+  // ADR-028: TWO independent bounds now, and they restrict different things. The ARN list above is
+  // MEMBERSHIP - who is in the room, resolved live from Chime. The reader role here is
+  // CLASSIFICATION - what this channel is permitted to surface. Membership alone let a basic channel
+  // point at a premium one whenever the members happened to hold premium elsewhere; classification
+  // alone would ignore who is actually present. Neither subsumes the other, so both are applied.
   const vectorLiteral = `[${input.messageEmbedding.join(',')}]`;
-  const result = await query<{ channel_arn: string; similarity: number }>(
+  const result = await withReaderRole(input.classification, (client) => client.query<{ channel_arn: string; similarity: number }>(
     `SELECT channel_arn,
             1 - (embedding <=> $1::vector) AS similarity
        FROM summary_embeddings
@@ -418,7 +527,7 @@ async function findRelatedConversation(input: FindRelatedInput): Promise<string 
       ORDER BY embedding <=> $1::vector
       LIMIT 1`,
     [vectorLiteral, candidateArns],
-  );
+  ));
   const top = result.rows[0];
   if (!top) return undefined;
   if (top.similarity < REROUTE_SIMILARITY_THRESHOLD) return undefined;

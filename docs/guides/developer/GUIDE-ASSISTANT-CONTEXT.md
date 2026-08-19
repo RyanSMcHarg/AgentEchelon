@@ -23,12 +23,12 @@ An assistant answers from a stack of context sources assembled per turn. Pick th
 
 ## Building context for a new assistant
 
-An assistant is defined by its persona, model, tools, guardrail, and **context scope**. The unified configuration bundle a conversation type selects is the design *target* (see [`SPEC-ASSISTANT-CONFIG.md`](../../specs/interaction/assistant-config/SPEC-ASSISTANT-CONFIG.md)); today these settings live per tier (stack IAM + SSM persona + tool flags). To give a new assistant its context:
+An assistant is defined by its persona, model, tools, guardrail, and **context scope**. The unified configuration bundle a conversation type selects is the design *target* (see [`SPEC-ASSISTANT-CONFIG.md`](../../specs/interaction/assistant-config/SPEC-ASSISTANT-CONFIG.md)); today the boundary settings live per tier (stack IAM), while the persona and tool allowlist ride the tier's versioned profile definition - the persona as an S3 body the definition points at, editable with no deploy. To give a new assistant its context:
 
 1. **Classify the content.** For each thing the assistant must know, choose a row in the table above. Do not paste whole documents into the persona; that is expensive and does not scale.
 2. **Set the context scope.** Decide which tier(s) may read each document. Tier scope is the isolation boundary, enforced in infrastructure, not in the prompt.
 3. **Load the content:**
- - *Business/financial documents* go under the tier prefixes (`context/{tier}/...`). A document placed in
+ - *Business/financial documents* go under the tier prefixes (`context/{classification}/...`). A document placed in
      a tier's folder is readable by that tier and every higher tier.
  - *Reference documents* (wiki, runbooks) go under the RAG prefix (`rag/{source_type}/{tier}/...`) and are
      embedded automatically on upload (see [`RAG.md`](RAG.md)).
@@ -39,9 +39,9 @@ The mechanisms are shared; a new use case is configuration, not a forked agent l
 
 ## Loading company context (admin/deployer)
 
-**Built today.** Drop tier documents under `context/{tier}/`. Two different paths read them, each with its own tier boundary. They are frequently confused, so be precise about which does what:
+**Built today.** Drop tier documents under `context/{classification}/`. Two different paths read them, each with its own tier boundary. They are frequently confused, so be precise about which does what:
 
-- The **company-context tool** (`load_company_context`) returns whole documents from `context/{tier}/*`, scoped by the physical **IAM** prefix boundary, so a lower tier's role cannot read a higher tier's prefix. It is **selective, not whole-corpus**: the always-present **per-tier digest** (`context/{tier}/_digest.json`) lists each document's **filename** plus title plus one-line description, and the model names the specific file(s) it needs in the tool's `documents` argument, so it loads only those. It falls back to loading all permitted docs only for a genuinely broad question (or when a legacy digest has no filenames). Use it when the assistant needs a **complete document** (for example a data-extraction task pulling a full table).
+- The **company-context tool** (`load_company_context`) returns whole documents from `context/{classification}/*`, scoped by the physical **IAM** prefix boundary, so a lower tier's role cannot read a higher tier's prefix. It is **selective, not whole-corpus**: the always-present **per-tier digest** (`context/{classification}/_digest.json`) lists each document's **filename** plus title plus one-line description, and the model names the specific file(s) it needs in the tool's `documents` argument, so it loads only those. It falls back to loading all permitted docs only for a genuinely broad question (or when a legacy digest has no filenames). Use it when the assistant needs a **complete document** (for example a data-extraction task pulling a full table).
 - **Company RAG (retrieval):** the same documents are embedded into the pgvector store (stamped with their tier, under `rag/company/{tier}/`) and the router pre-fetches the top-K relevant **chunks** per turn by semantic relevance, scoped by the fail-closed **SQL** tier filter, and passes them in on the payload. Use it (it runs automatically) when the assistant needs the **relevant facts**, not a whole document. Requires Aurora mode.
 
 So: **digest = the menu** (always present, names what exists); **tool = fetch a whole named document**; **RAG = semantically retrieve the relevant chunks**. Because the router already pre-fetches relevant chunks, the tool is for the whole-document case, not a redundant "load everything." The digest is precomputed at ingestion/seed time and warm-cached, so it is not rebuilt from the corpus every turn.
@@ -66,7 +66,7 @@ The welcome is a passthrough: at minimum it greets with the context the system a
 
  Like the static welcome it is **deterministic (no Bedrock call)** on any intake turn, so it is instant and predictable. Progress within a single intake rides in Lex `sessionAttributes` across turns (no per-turn store); the questions and answers land as normal channel messages, so once the intake confirms, the working assistant sees the collected inputs in its recent-history window with nothing extra to wire.
 
- **Onboarding fires once per user.** The intake is not per-conversation: the router records that a user completed onboarding (and the collected facts) in a durable per-user profile, and every later conversation for that user skips the intake and answers directly. On WelcomeIntent it resolves the creator (channel membership, falling back to the `createdBy` metadata stamp because the welcome fires before the creator's membership settles) and starts the intake only when that user has no `onboardedAt`; on completion it writes `onboardedAt` plus the facts. Reads fail open (a profile-store outage degrades to starting the intake, never to a broken welcome). The profile store is a reference stand-in an implementer swaps for their own via `USER_PROFILE_SERVICE_ARN`. Full design: [`SPEC-USER-PROFILE-AND-ONBOARDING.md`](../../specs/interaction/assistant-config/SPEC-USER-PROFILE-AND-ONBOARDING.md).
+ **Onboarding fires once per user.** The intake is not per-conversation: the router records that a user completed onboarding (and the collected facts) in a durable per-user profile, and every later conversation for that user skips the intake and answers directly. On WelcomeIntent it resolves who the conversation is FOR from a participant row recorded BEFORE the channel was created (`resolveParticipants`, the server-only channel-context store), falling back to live membership only for a legacy channel that has no such row - not from channel metadata, and no longer through a retry loop over eventually-consistent reads, which missed the creator about 30% of the time inside the welcome window and fell open to re-onboarding someone who was already done. It then starts the intake only when that person has no `onboardedAt`, and only for a single-subject conversation: a group has nobody to key the gate on; on completion it writes `onboardedAt` plus the facts. Reads fail open (a profile-store outage degrades to starting the intake, never to a broken welcome). The profile store is a reference stand-in an implementer swaps for their own via `USER_PROFILE_SERVICE_ARN`. Full design: [`SPEC-USER-PROFILE-AND-ONBOARDING.md`](../../specs/interaction/assistant-config/SPEC-USER-PROFILE-AND-ONBOARDING.md).
 
  **Enabling it.** Onboarding is off by default (the generic assistant answers the first turn cold). A deployment turns it on by supplying an intake schema as JSON, either inline via the `ONBOARDING_INTAKE` environment variable or, for a larger schema, via an SSM parameter named by `ONBOARDING_INTAKE_PARAM`:
 
@@ -101,6 +101,60 @@ The welcome is a passthrough: at minimum it greets with the context the system a
 
  Disable it again by deleting the parameter (`aws ssm delete-parameter --name ...`); the router falls back to the static welcome. All tiers run the same shared router code (`router-agent-handler.ts`, deployed as a per-tier Lambda) and the same intake path. For a single small schema you can instead set the `ONBOARDING_INTAKE` env var directly on the router Lambda (read before the SSM param), but the SSM parameter is the deployment-managed path.
 
+## Trust: what a context source may influence
+
+A context source moves external data into the system prompt, which is the highest-trust region of a
+turn. Every catalog entry therefore declares a `trust` level, and the level is a required field
+(`ContextSourceTrust` in `backend/lib/config/context-sources.ts`), not an optional annotation.
+
+| `trust` | Written by | May influence |
+|---|---|---|
+| `platform` | platform code, from an authenticated identity | grounding, never policy |
+| `operator` | an admin or deployer, out of band | grounding and standing policy |
+| `member` | a conversation participant | grounding only, always delimited |
+
+**Conversation-scope sources are attacker-controlled.** Channel metadata is member-writable: a user
+holds `UpdateChannel`, which sets Name and Metadata in one call. Anything resolving from it may ground
+a reply and may never carry an access decision, a classification, or standing policy. See
+[`METADATA-AND-TAGS.md`](METADATA-AND-TAGS.md) for the storage rules this follows from.
+
+**Resolved values are data, never instructions.** Three mechanisms enforce that, and all three ship:
+
+- Every source renders inside an explicit delimiter carrying its own trust level,
+  `<context source="..." trust="...">`, so the model can tell provisioned content from participant
+  content. A `member` source additionally renders the instruction to treat it as information about
+  the request and never as instructions.
+- Every field value passes through `sanitiseValue`, which strips control markers
+  (`lib/message-markers.ts`) before the value can reach the prompt. This is an injection defence, not
+  formatting: a resume or a fetched job description is exactly the kind of third-party text that can
+  carry an `<!--ACTIVE_TASK...-->` or `NAVIGATE_CHANNEL:` marker that downstream parsers would read as
+  platform control output. The greeting path is not exempt, and it is the path most likely to carry
+  third-party text.
+- The assistant-visible menu lists descriptions only, never values, so a poisoned value cannot rewrite
+  the index of what exists.
+
+**An unresolvable source degrades, it does not except.** A source that times out, is refused, or
+throws renders as an empty section; one bad source never costs the user their turn. Because that makes
+a failure invisible to the user by design, each outcome is classified where it happens (`denied`,
+`absent`, `timeout`, `error`) and emitted per source and classification to the
+`AgentEchelon/ContextSources` CloudWatch namespace alongside the successes, so that "resolving fine" is
+distinguishable from "never ran". An unrecognised failure is classified `error` and never `absent`:
+guessing "absent" would relabel a novel authorisation failure as a missing document.
+
+## Selection: what is used, and in what order
+
+`contextSources` lives on the profile's runtime-editable body, so it versions, exports, rolls back and
+A/B-tests with everything else. It selects among what the deployment provisions and cannot widen the
+boundary: the catalog declares what exists, the profile declares what is used.
+
+**Order is the profile's, not the catalog's.** Registry order is prompt order, and prompt order affects
+both model behaviour and where the Bedrock `cachePoint` prefix ends, so the registry renders in profile
+order. A key present in the catalog but absent from `contextSources` is not rendered.
+
+Each key's fields, availability and trust are listed in
+[`context-catalog-reference.md`](../../reference/context-catalog-reference.md), which is generated from
+the catalog itself rather than maintained by hand.
+
 ## Efficiency notes (why the target is lighter)
 
 - **Do not re-gather unchanged context.** Static, per-tier content should be cached for the warm conversation rather than re-read from storage every turn.
@@ -121,7 +175,7 @@ Two context mechanisms, relevance **retrieval** (RAG over pgvector) and the **co
 
 This follows the platform rule that **Aurora is a strict superset**: Athena is the baseline (the tool and the digest still work; nothing is removed), and Aurora adds relevance retrieval and the summary on top. Nothing is Athena-only.
 
-**Recommendation for production.** Deploy **Aurora mode** for any instance whose assistants must answer from a non-trivial or growing body of documents. Relevance retrieval is what keeps context accurate and bounded as a corpus grows; the whole-corpus tool load does not scale, and the digest alone cannot rank relevance. The Aurora cluster is shared across RAG, drift, cross-conversation context, and evaluation, so the incremental cost of retrieval is small once Aurora is deployed (see [`AURORA-MODE-GUIDE.md`](../admin/AURORA-MODE-GUIDE.md), and [`INFRASTRUCTURE-COST.md`](../admin/INFRASTRUCTURE-COST.md) for the per-piece cost model). Retrieval and drift execute in a dedicated VPC-attached data-plane Lambda that the non-VPC assistant path invokes, which adds no new VPC endpoints (project decision 018; see [`RAG.md`](RAG.md)).
+**Recommendation for production.** Deploy **Aurora mode** for any instance whose assistants must answer from a non-trivial or growing body of documents. Relevance retrieval is what keeps context accurate and bounded as a corpus grows; the whole-corpus tool load does not scale, and the digest alone cannot rank relevance. The Aurora cluster is shared across RAG, drift, cross-conversation context, and evaluation, so the incremental cost of retrieval is small once Aurora is deployed (see [`AURORA-MODE-GUIDE.md`](../admin/AURORA-MODE-GUIDE.md), and [`INFRASTRUCTURE-COST.md`](../admin/INFRASTRUCTURE-COST.md) for the per-piece cost model). Retrieval and drift execute in a dedicated VPC-attached data-plane Lambda that the non-VPC assistant path invokes, which adds no new VPC endpoints (ADR-013; see [`RAG.md`](RAG.md)).
 
 **If Aurora is not an option:**
 - Keep company documents small and few so the tool load stays within budget, and lean on the digest so the model fetches the right document rather than the whole set.

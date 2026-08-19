@@ -45,11 +45,33 @@ function lambda(): LambdaClient {
   return _lambda;
 }
 
-// Warm-life cache of subs known to be onboarded. Onboarding is monotonic (once true, always true), so
-// caching only the POSITIVE result is safe and never goes stale in a way that matters: it can only skip
-// a re-onboard, which is exactly the goal. A not-yet-onboarded sub is deliberately NOT cached (the user
-// may complete onboarding during the Lambda's warm life).
-const onboardedCache = new Set<string>();
+// Cache of subs known to be onboarded, held for a BOUNDED time rather than for the container's whole
+// warm life. Only the POSITIVE result is cached; a not-yet-onboarded sub is deliberately not, since the
+// user may complete onboarding during that life.
+//
+// The original reasoning was that onboarding is monotonic - once true, always true - so a positive entry
+// could never go stale in a way that matters. That holds only while nothing ever un-onboards a user, and
+// things do: an operator resetting a profile, an erasure request, or a test restoring its precondition.
+// This store is explicitly a stand-in for an implementer's own (SPEC-USER-PROFILE-AND-ONBOARDING), and a
+// real one has deletion. With an unbounded entry the deletion is invisible for hours: the user is never
+// re-onboarded, and nothing in the logs explains why - the handler simply reports "already onboarded"
+// about a profile that no longer exists. That was observed directly, as a re-onboarding e2e that could
+// only pass against a cold container.
+//
+// A TTL keeps the point of the cache (no repeat reads inside a burst of turns) while bounding how long
+// a deletion can go unseen.
+const ONBOARDED_CACHE_TTL_MS = 5 * 60_000;
+/** sub -> epoch ms when the cached "onboarded" fact expires. */
+const onboardedCache = new Map<string, number>();
+
+/** True iff this sub is cached as onboarded AND that entry has not expired. */
+function cachedAsOnboarded(userSub: string, now: number): boolean {
+  const expiresAt = onboardedCache.get(userSub);
+  if (expiresAt === undefined) return false;
+  if (expiresAt > now) return true;
+  onboardedCache.delete(userSub); // expired — re-read the store rather than trusting a stale yes
+  return false;
+}
 
 /** Test hook: clear the warm onboarded cache. */
 export function __clearUserProfileCache(): void {
@@ -101,10 +123,12 @@ export async function getUserProfile(userSub: string): Promise<UserProfile | nul
  */
 export async function hasOnboarded(userSub: string): Promise<boolean> {
   if (!userSub) return false;
-  if (onboardedCache.has(userSub)) return true;
+  const now = Date.now();
+  if (cachedAsOnboarded(userSub, now)) return true;
   const profile = await getUserProfile(userSub);
   const done = !!profile?.onboardedAt;
-  if (done) onboardedCache.add(userSub);
+  if (done) onboardedCache.set(userSub, now + ONBOARDED_CACHE_TTL_MS);
+  else onboardedCache.delete(userSub); // the store says no — drop any entry that says otherwise
   return done;
 }
 
@@ -131,7 +155,7 @@ export async function markOnboarded(userSub: string, facts: Record<string, strin
         ExpressionAttributeValues: { ':now': now, ':facts': facts },
       }));
     }
-    onboardedCache.add(userSub);
+    onboardedCache.set(userSub, Date.now() + ONBOARDED_CACHE_TTL_MS);
   } catch (err) {
     console.warn('[user-profile] markOnboarded failed (non-fatal):', (err as Error).name);
   }

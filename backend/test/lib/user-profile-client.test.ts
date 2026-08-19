@@ -56,6 +56,43 @@ describe('user-profile-client', () => {
       expect(send).toHaveBeenCalledTimes(1); // only the first check queried DynamoDB
     });
 
+    it('re-reads the store once the cached positive expires, so a RESET profile is seen', async () => {
+      // THE DEFECT THIS EXISTS FOR. The positive entry used to live for the container's whole warm
+      // life, on the reasoning that onboarding is monotonic. It is not: an operator reset, an erasure
+      // request, or a test restoring its precondition all un-onboard a user. With an unbounded entry
+      // the deletion was invisible for hours - the user was never re-onboarded, and the handler
+      // reported "already onboarded" about a profile that no longer existed.
+      send.mockResolvedValueOnce({ Item: { userSub: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
+      const { hasOnboarded } = await load();
+      expect(await hasOnboarded('sub-1')).toBe(true);
+      expect(send).toHaveBeenCalledTimes(1);
+
+      // The profile is deleted, and enough time passes for the cached fact to expire.
+      const realNow = Date.now;
+      Date.now = () => realNow() + 6 * 60_000;
+      try {
+        send.mockResolvedValueOnce({}); // GetItem → no Item (profile was reset)
+        expect(await hasOnboarded('sub-1')).toBe(false);
+        expect(send).toHaveBeenCalledTimes(2); // it went back to the store rather than trusting the cache
+      } finally {
+        Date.now = realNow;
+      }
+    });
+
+    it('drops the cached positive when the store says not onboarded', async () => {
+      // Belt and braces for the same failure: even inside the TTL, a read that comes back negative
+      // must not leave a stale yes behind for the next caller.
+      send.mockResolvedValueOnce({ Item: { userSub: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
+      const { hasOnboarded, __clearUserProfileCache } = await load();
+      expect(await hasOnboarded('sub-1')).toBe(true);
+
+      __clearUserProfileCache();
+      send.mockResolvedValueOnce({}); // reset profile
+      expect(await hasOnboarded('sub-1')).toBe(false);
+      send.mockResolvedValueOnce({}); // still reset — must NOT report a cached yes
+      expect(await hasOnboarded('sub-1')).toBe(false);
+    });
+
     it('does NOT cache a negative — a later onboarding is still seen', async () => {
       send
         .mockResolvedValueOnce({}) // first check: not onboarded
@@ -119,3 +156,12 @@ describe('user-profile-client', () => {
     });
   });
 });
+
+// This file declares its jest mocks at top level and imports the module under test lazily
+// inside each case, so it has no top-level import/export of its own. Without one TypeScript treats
+// it as a global SCRIPT rather than a module: its top-level `const`s then share one global scope
+// with every other such test file, they collide (TS2451), and symbols resolve against whichever
+// file won - which is how `abuse-controls.test.ts` came to be typechecked against
+// `user-profile-client`. `npm run typecheck` was red with 52 errors for that reason alone, and
+// these files were effectively unchecked. This marks the file as a module. Do not remove.
+export {};

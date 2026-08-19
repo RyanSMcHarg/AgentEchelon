@@ -43,6 +43,14 @@ jest.mock('../../lambda/src/lib/data-plane-client', () => ({
   readPendingSuggestion: (...a: unknown[]) => mockReadPending(...a),
   resolvePendingSuggestion: (...a: unknown[]) => mockResolvePending(...a),
 }));
+// The drift suggestion is posted BEFORE the router's duplicate-fulfillment claim (that one runs
+// ~200 lines later), so this flow takes its own claim. Mocked here so a duplicate turn can be
+// simulated without a DynamoDB table.
+const mockClaimCorrelation = jest.fn();
+jest.mock('../../lambda/src/lib/abuse-controls', () => ({
+  claimCorrelation: (...args: unknown[]) => mockClaimCorrelation(...args),
+}));
+
 jest.mock('../../lambda/src/lib/battle-state', () => ({
   isBattleEnabled: (...a: unknown[]) => mockIsBattleEnabled(...a),
 }));
@@ -101,6 +109,7 @@ const DATA_PLANE_ARN = 'arn:aws:lambda:us-east-1:111:function:data-plane';
 const ENABLED = { ENABLE_LIVE_DRIFT: 'true', AURORA_DATA_PLANE_ARN: DATA_PLANE_ARN, APP_INSTANCE_ARN: 'arn:aws:chime:us-east-1:111:app-instance/i' };
 
 beforeEach(() => {
+    mockClaimCorrelation.mockResolvedValue(true);
   jest.clearAllMocks();
   mockDriftEnabled = true;
   mockReadRouting.mockReturnValue({ declinedDistances: [] });
@@ -142,13 +151,81 @@ describe('policy gate (conversation type drift on/off)', () => {
   });
 });
 
-describe('battle suppression', () => {
-  it('returns null when the channel has a battle active', async () => {
+// A BATTLE BLOCKS THE ACTION, NOT THE DETECTION (owner, 2026-08-13).
+//
+// The previous behaviour returned null the moment Battle Mode was on, so a user who changed the
+// subject mid-duel got no suggestion AND no reason for its absence - which reads as being ignored.
+// Detection now runs as it does anywhere else, and the battle changes only what happens when drift
+// fires: the user is told the duel is still running, and given the two ways out.
+describe('drift during a battle', () => {
+  it('detects as normal, but explains instead of offering to split', async () => {
     mockIsBattleEnabled.mockResolvedValue(true);
+    mockDetectDrift.mockResolvedValue({
+      isDrift: true,
+      driftScore: 0.42,
+      suggestedAction: 'confirm',
+      suggestionTemplate: 'Want me to start a separate conversation?',
+      correlationId: 'corr-1',
+    });
     const flow = loadFlow(ENABLED);
+
     const result = await flow.runLiveDriftFlow({ ...baseInput });
-    expect(result).toBeNull();
-    expect(mockDetectDrift).not.toHaveBeenCalled();
+
+    // It ran: a battle turn is an ordinary turn.
+    expect(mockDetectDrift).toHaveBeenCalled();
+    const content = result?.messages?.[0]?.content ?? '';
+    expect(content).toMatch(/battle/i);
+    // Both exits are named, or the user is told "no" with no way forward.
+    expect(content).toMatch(/finish|finishes/i);
+    expect(content).toMatch(/Battle Mode off/i);
+    // The offer itself must NOT appear - there is nothing to accept.
+    expect(content).not.toContain('Want me to start a separate conversation?');
+  });
+
+  it('records nothing: there is no offer, so an outcome would be a fiction', async () => {
+    mockIsBattleEnabled.mockResolvedValue(true);
+    mockDetectDrift.mockResolvedValue({
+      isDrift: true,
+      driftScore: 0.42,
+      suggestedAction: 'confirm',
+      suggestionTemplate: 'Want me to start a separate conversation?',
+      correlationId: 'corr-1',
+    });
+    const flow = loadFlow(ENABLED);
+
+    await flow.runLiveDriftFlow({ ...baseInput });
+
+    expect(mockRecordDriftFire).not.toHaveBeenCalled();
+    expect(mockSavePending).not.toHaveBeenCalled();
+  });
+
+  it('falls through normally when the turn has NOT drifted', async () => {
+    mockIsBattleEnabled.mockResolvedValue(true);
+    mockDetectDrift.mockResolvedValue({ isDrift: false, driftScore: 0.02 });
+    const flow = loadFlow(ENABLED);
+
+    // No drift means nothing to explain: a battle must not make ordinary turns chatty.
+    expect(await flow.runLiveDriftFlow({ ...baseInput })).toBeNull();
+  });
+
+  it('holds an ACCEPTANCE made before Battle Mode was turned on, without losing it', async () => {
+    // The suggestion outlived the condition it was made under. Acting now would walk the user out of a
+    // duel in progress; the pending stays so a later "yes" still works.
+    mockIsBattleEnabled.mockResolvedValue(true);
+    mockReadRouting.mockReturnValue({
+      pendingDriftSuggestion: {
+        taskId: 'task-1', channelArn: 'arn:chan', userSub: 'u1', kind: 'confirm',
+      },
+      declinedDistances: [],
+    });
+    mockClassifyReply.mockReturnValue('affirmative');
+    const flow = loadFlow(ENABLED);
+
+    const result = await flow.runLiveDriftFlow({ ...baseInput });
+
+    expect(mockCreateConversationFromDrift).not.toHaveBeenCalled();
+    expect(mockResolvePending).not.toHaveBeenCalled();
+    expect(result?.messages?.[0]?.content ?? '').toMatch(/battle/i);
   });
 });
 
@@ -173,9 +250,71 @@ describe('basic-classification drift path (basic had no drift before the re-home
       expect.objectContaining({ channelArn: CHANNEL, userClearance: 'basic', intent: 'GENERAL' }),
     );
     expect(mockRecordDriftFire).toHaveBeenCalledTimes(1);
+
+    // The drift row must carry a RESOLVED originating message id, and the SAME one the pending
+    // suggestion records. It previously took `CHIME.message.id` straight off the event, which Chime
+    // does not send, so every live row stored '' - and the evaluation pass selects offers by
+    // `JOIN messages m ON m.message_id = d.originating_message_id`, which '' can never satisfy. No
+    // live offer was ever judged and the Accuracy tile read "Not measured" for good.
+    const firedWith = mockRecordDriftFire.mock.calls[0][0] as { messageId?: string };
+    expect(firedWith.messageId).toBeTruthy();
+    const savedWith = mockSavePending.mock.calls[0][0] as { originatingMessageId?: string };
+    expect(firedWith.messageId).toBe(savedWith.originatingMessageId);
+
     expect(mockSavePending).toHaveBeenCalledTimes(1);
     expect(result).not.toBeNull();
     expect(result!.messages[0].content).toContain('separate conversation');
+  });
+
+  it('claims BEFORE posting, so a duplicate turn does not suggest twice', async () => {
+    // THE DEFECT THIS PINS. The router collapses a duplicate fulfillment with a correlation claim,
+    // but that claim runs ~200 lines AFTER this flow has already posted its suggestion. So a second
+    // invocation posted a SECOND suggestion and only then returned idempotently: the answer was
+    // protected, the suggestion was not.
+    //
+    // Measured live 2026-08-12 on a group @all: two identical suggestions 1.8s apart, distinct
+    // MessageIds, neither carrying a corr marker (this path posts directly, not as a placeholder,
+    // which is why the placeholder guards missed it too).
+    mockDetectDrift.mockResolvedValue({
+      isDrift: true, driftScore: 0.42, suggestedAction: 'confirm',
+      suggestionTemplate: 'Want me to start a separate conversation?', correlationId: 'corr-dup',
+    });
+    mockRecordDriftFire.mockResolvedValue('drift-evt-dup');
+    mockSavePending.mockResolvedValue({ taskId: 'task-dup' });
+
+    // The SECOND invocation of the same turn loses the claim.
+    mockClaimCorrelation.mockResolvedValueOnce(false);
+
+    const flow = loadFlow(ENABLED);
+    const result = await flow.runLiveDriftFlow({ ...baseInput });
+
+    // No suggestion, and nothing recorded: a duplicate must not double-count the offer either, or
+    // the acceptance rate is computed against inflated denominators.
+    expect(result).toBeNull();
+    expect(mockRecordDriftFire).not.toHaveBeenCalled();
+    expect(mockSavePending).not.toHaveBeenCalled();
+  });
+
+  it('claims on the ORIGINATING MESSAGE id, which a redelivery replays identically', async () => {
+    // A random or time-derived key would let each attempt claim its own and defeat the guard - the
+    // failure mode lib/correlation.ts documents for the placeholder path. It must be the same stable
+    // per-turn property the answer already dedups on.
+    mockDetectDrift.mockResolvedValue({
+      isDrift: true, driftScore: 0.42, suggestedAction: 'confirm',
+      suggestionTemplate: 'Want me to start a separate conversation?', correlationId: 'corr-key',
+    });
+    mockRecordDriftFire.mockResolvedValue('drift-evt-key');
+    mockSavePending.mockResolvedValue({ taskId: 'task-key' });
+
+    const flow = loadFlow(ENABLED);
+    await flow.runLiveDriftFlow({ ...baseInput });
+
+    expect(mockClaimCorrelation).toHaveBeenCalledTimes(1);
+    const key = String(mockClaimCorrelation.mock.calls[0][0]);
+    expect(key).toMatch(/^drift-suggest-/);
+    // The id the fire and the pending row both use, so all three agree on which turn this was.
+    const firedWith = mockRecordDriftFire.mock.calls[0][0] as { messageId?: string };
+    expect(key).toBe(`drift-suggest-${firedWith.messageId}`);
   });
 
   it('returns null (falls through to normal flow) when detectDrift reports no drift', async () => {

@@ -2,6 +2,8 @@
 
 **Status:** Design (the schema seam ships; the runtime path is not built). The connector schema lives in config today (`conversation-types.ts` + `connectors.ts`); this spec is the contract those seams point at, promoted out of `../conversation-config/SPEC-CONVERSATION-TYPES.md` section 6.
 
+**Coverage:** none - the schema seam ships but the runtime path is not built, so there is no connector call to drive.
+
 **Problem and who it's for:** A conversation almost always has to touch the business's own systems of record - the CRM case, the ticket, the calendar, the phone line - and teams want to wire those in by configuration, reading each system live, rather than duplicating its data into a new silo or hand-coding and owning a bespoke integration per system. This is for the AI developer and admin/operator who connect an experience to external systems, and the platform developer building an integration. It defines a connector as one governed integration to one external vendor, declared as config, reading each source of truth live rather than duplicating it.
 
 **Site section:** Interaction layer, Connectors pillar (core plane).

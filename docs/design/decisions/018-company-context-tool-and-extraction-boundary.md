@@ -1,3 +1,13 @@
+---
+title: "ADR-018: Company-context tool selection and the extraction boundary"
+status: Accepted
+date: 2026-07-21
+related:
+  - "./011-agent-routing-mechanism.md"
+  - "../../specs/interaction/assistant-config/SPEC-WELCOME-AND-CONTEXT.md"
+  - "../../guides/developer/GUIDE-ASSISTANT-CONTEXT.md"
+---
+
 # ADR-018: Company-context tool selection and the extraction boundary
 
 > **Status:** Accepted. Extends [ADR-011](011-agent-routing-mechanism.md) (tool-use retrieval) and the welcome/context design ([SPEC-WELCOME-AND-CONTEXT](../../specs/interaction/assistant-config/SPEC-WELCOME-AND-CONTEXT.md), [GUIDE-ASSISTANT-CONTEXT](../../guides/developer/GUIDE-ASSISTANT-CONTEXT.md)). Records why a company or financial question must be answered inline via a single company-context tool, and why a single-fact lookup must NOT be routed to a multi-step extraction task.
@@ -8,7 +18,7 @@ A business wants its assistant to answer questions from the company's own docume
 
 Per-classification business and financial documents (`context/{classification}/*.json`) are read by a model-invoked tool, `load_company_context`, and are IAM-isolated by classification prefix (ADR-011 Appendix F: "use tool-use retrieval, RAG, and prompt caching; don't paste whole docs"). A second tool, `load_platform_info`, was later split out for platform self-knowledge (the AgentEchelon product itself), kept separate so a business question never loads platform docs and vice versa.
 
-The canary for this area is the premium "exact ARR figure" question (`tier-context.spec.ts`, "premium CAN access financial data"): a leadership user asks for a single financial figure and must get it stated inline. Two distinct failure modes have been observed and traced:
+The canary for this area is the premium "exact ARR figure" question (`classification-context.spec.ts`, "premium CAN access financial data"): a leadership user asks for a single financial figure and must get it stated inline. Two distinct failure modes have been observed and traced:
 
 1. **Tool not called / wrong tool.** The model answers "the context does not contain financials" without calling `load_company_context`, or reaches for `load_platform_info`. The `load_platform_info` split is the documented prime suspect for degrading `load_company_context` selection: two similarly-shaped "load..." tools make the choice less reliable.
 2. **Answer deferred behind a task.** The model DOES call `load_company_context` and has the figure, but the turn was classified `data_extraction` (delivery `TASK_MULTI_STEP`), so the response is a task acknowledgement ("here's the exact figure:" + an `ACTIVE_TASK` marker) instead of the figure. The `data_extraction` intent was too broad: its description and keywords ("look up", "retrieve", "get data") caught a single-fact lookup that is really just a question.

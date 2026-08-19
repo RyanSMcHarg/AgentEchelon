@@ -22,6 +22,23 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
   getClient: jest.fn(),
 }));
 
+// ADR-028: the subject now runs its bounded-table statements as a database role, via
+// `withReaderRole`/`withWriterRole` (which wrap `transaction()`). Route those back to the mocked
+// `query` so the SQL assertions below are unchanged, and record which role was assumed so the tests
+// can assert the boundary was entered at all — a query that reaches the right table as the WRONG role
+// is precisely the failure this design exists to prevent, and it is invisible in the SQL text.
+const mockAssumedRoles: string[] = [];
+jest.mock('../../lambda/src/analytics-aurora/classification-boundary', () => ({
+  withReaderRole: jest.fn(async (classification: string, fn: (c: unknown) => unknown) => {
+    mockAssumedRoles.push(`ae_reader_${classification}`);
+    return fn({ query: require('../../lambda/src/analytics-aurora/db-client').query });
+  }),
+  withWriterRole: jest.fn(async (fn: (c: unknown) => unknown) => {
+    mockAssumedRoles.push('ae_writer');
+    return fn({ query: require('../../lambda/src/analytics-aurora/db-client').query });
+  }),
+}));
+
 const mockSend = jest.fn();
 jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
   BedrockRuntimeClient: jest.fn().mockImplementation(() => ({ send: mockSend })),
@@ -56,6 +73,13 @@ const MESSAGE_ID = 'msg-12345';
 
 beforeEach(() => {
   jest.clearAllMocks();
+  // `clearAllMocks` clears CALL RECORDS but NOT the `mockResolvedValueOnce` queue, so anything a test
+  // primes and does not consume is inherited by the next one. That coupling made this file's result
+  // depend on execution order: when a change to the code under test altered how many queries a run
+  // makes, a leftover response became the NEXT test's summary read, and a test that passes alone
+  // failed in file order with a NaN score. Reset the queues so each test starts from empty.
+  mockedQuery.mockReset();
+  mockSend.mockReset();
   process.env.DB_HOST = 'localhost';
   process.env.DB_NAME = 'analytics';
   process.env.DB_USER = 'testuser';
@@ -71,6 +95,7 @@ describe('detectDrift (hardened cosine path)', () => {
       messageId: MESSAGE_ID,
       latestMessage: 'hi',
       intent: 'GREETING',
+      classification: 'standard',
     });
 
     expect(result.isDrift).toBe(false);
@@ -87,6 +112,7 @@ describe('detectDrift (hardened cosine path)', () => {
       messageId: MESSAGE_ID,
       latestMessage: 'thanks',
       intent: 'ACKNOWLEDGMENT',
+      classification: 'standard',
     });
 
     expect(result.isDrift).toBe(false);
@@ -101,6 +127,7 @@ describe('detectDrift (hardened cosine path)', () => {
       messageId: MESSAGE_ID,
       latestMessage: 'what is the weather today',
       intent: 'OFF_TOPIC',
+      classification: 'standard',
     });
 
     expect(result.isDrift).toBe(false);
@@ -117,6 +144,7 @@ describe('detectDrift (hardened cosine path)', () => {
       messageId: MESSAGE_ID,
       latestMessage: 'a substantive question with several words to bypass length checks',
       intent: 'GENERAL',
+      classification: 'standard',
     });
 
     expect(result.isDrift).toBe(false);
@@ -138,6 +166,7 @@ describe('detectDrift (hardened cosine path)', () => {
       messageId: MESSAGE_ID,
       latestMessage: 'a substantive question that previously would have fallen back to keyword matching',
       intent: 'GENERAL',
+      classification: 'standard',
     });
 
     expect(result.isDrift).toBe(false);
@@ -156,8 +185,11 @@ describe('detectDrift (hardened cosine path)', () => {
     // Message embedding pointing opposite direction (negative correlation)
     const message = summary.map((v) => -v);
     mockBedrockEmbedding(message);
-    // findRelatedConversation: no scoped channels (1:1 channel) → returns no rival
-    mockedQuery.mockResolvedValueOnce(mockRows([])); // channel_membership for current channel
+    // NO membership query is primed, because none is made any more. `findRelatedConversation` takes
+    // its scope from `input.scopedChannelArns` (resolved by the caller from Amazon Chime SDK
+    // membership) and returns no rival when it is absent — the archive is never consulted. Priming a
+    // response the code does not consume left it queued for the NEXT test, which read `[]` as its
+    // summary embedding and produced a NaN drift score: green alone, red in file order.
 
     const { detectDrift } = await import('../../lambda/src/analytics-aurora/drift-detection');
 
@@ -166,6 +198,7 @@ describe('detectDrift (hardened cosine path)', () => {
       messageId: MESSAGE_ID,
       latestMessage: 'completely unrelated topic',
       intent: 'GENERAL',
+      classification: 'standard',
     });
 
     // Cosine distance of (0.7-vector, -0.7-vector) → ~2.0 (opposite vectors)
@@ -191,6 +224,7 @@ describe('detectDrift (hardened cosine path)', () => {
       messageId: MESSAGE_ID,
       latestMessage: 'a follow-up question on the same topic',
       intent: 'GENERAL',
+      classification: 'standard',
     });
 
     expect(result.isDrift).toBe(false);
@@ -212,11 +246,89 @@ describe('detectDrift (hardened cosine path)', () => {
       messageId: MESSAGE_ID,
       latestMessage: 'topic the user declined twice already',
       intent: 'GENERAL',
+      classification: 'standard',
       declinedDistances: [2.0], // matches the distance for opposite vectors
     });
 
     expect(result.isDrift).toBe(false);
     expect(result.suggestedAction).toBe('continue');
+  });
+});
+
+/**
+ * A live task means the assistant asked this user for something and the turn under
+ * evaluation is the ANSWER. Cosine cannot see that: an answer is typically a short
+ * fragment carrying none of the summary's topic words, so it lands FAR from the summary
+ * and fires drift on the one turn the assistant solicited. Observed live on 2026-07-30 -
+ * `drift_fired` on "Audience is engineering leadership. Focus on delivery velocity, code
+ * ownership, and CI cost." mid-report_generation, which derailed the flow.
+ */
+describe('detectDrift — a live task suppresses the cosine signal', () => {
+  it('does NOT fire on an answer to the assistant, even when it lands far from the summary', async () => {
+    // Identical setup to the "fires drift" case above: opposite vectors, distance ~2.0.
+    const summary = mockEmbedding(1024, 0.7);
+    mockedQuery.mockResolvedValueOnce(
+      mockRows([{ embedding_text: `[${summary.join(',')}]` }]),
+    );
+    mockBedrockEmbedding(summary.map((v) => -v));
+    mockedQuery.mockResolvedValueOnce(mockRows([]));
+
+    const { detectDrift } = await import('../../lambda/src/analytics-aurora/drift-detection');
+
+    const result = await detectDrift({
+      channelArn: CHANNEL_ARN,
+      messageId: MESSAGE_ID,
+      latestMessage: 'Audience is engineering leadership. Focus on delivery velocity and CI cost.',
+      intent: 'REPORT_GENERATION',
+      classification: 'standard',
+      activeTaskInProgress: true,
+    });
+
+    expect(result.isDrift).toBe(false);
+    expect(result.suggestedAction).toBe('continue');
+    // Suppressed BEFORE the summary fetch and the embed, so a skipped turn costs neither.
+    expect(mockedQuery).not.toHaveBeenCalled();
+    expect(mockSend).not.toHaveBeenCalled();
+  });
+
+  it('still fires for the SAME message when no task is live (proves the flag is what suppresses)', async () => {
+    const summary = mockEmbedding(1024, 0.7);
+    mockedQuery.mockResolvedValueOnce(
+      mockRows([{ embedding_text: `[${summary.join(',')}]` }]),
+    );
+    mockBedrockEmbedding(summary.map((v) => -v));
+    mockedQuery.mockResolvedValueOnce(mockRows([]));
+
+    const { detectDrift } = await import('../../lambda/src/analytics-aurora/drift-detection');
+
+    const result = await detectDrift({
+      channelArn: CHANNEL_ARN,
+      messageId: MESSAGE_ID,
+      latestMessage: 'Audience is engineering leadership. Focus on delivery velocity and CI cost.',
+      intent: 'REPORT_GENERATION',
+      classification: 'standard',
+      activeTaskInProgress: false,
+    });
+
+    expect(result.isDrift).toBe(true);
+  });
+
+  it('an EXPLICIT routing request still routes mid-task (suppression is cosine-only)', async () => {
+    const { detectDrift } = await import('../../lambda/src/analytics-aurora/drift-detection');
+
+    const result = await detectDrift({
+      channelArn: CHANNEL_ARN,
+      messageId: MESSAGE_ID,
+      latestMessage: "let's start a new conversation about quarterly forecasting",
+      intent: 'REPORT_GENERATION',
+      classification: 'standard',
+      activeTaskInProgress: true,
+    });
+
+    // The fast-path is checked BEFORE the task check, so a deliberate pivot is never
+    // trapped inside a long-running task.
+    expect(result.isDrift).toBe(true);
+    expect(result.viaExplicitIntent).toBe(true);
   });
 });
 
@@ -229,6 +341,7 @@ describe('detectDrift — explicit-routing fast-path (the only legitimate string
       messageId: MESSAGE_ID,
       latestMessage: "let's start a new conversation about quarterly forecasting",
       intent: 'GENERAL',
+      classification: 'standard',
     });
 
     expect(result.isDrift).toBe(true);
@@ -256,6 +369,7 @@ describe('detectDrift — explicit-routing fast-path (the only legitimate string
       messageId: MESSAGE_ID,
       latestMessage: "let's talk about the recent earnings call",
       intent: 'GENERAL',
+      classification: 'standard',
     });
 
     // Fell through to the cosine path (not fast-path), found no drift

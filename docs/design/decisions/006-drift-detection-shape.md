@@ -6,7 +6,7 @@ related:
   - SPEC-DRIFT-CONVERGENCE.md
   - 002-embedding-model.md
   - 004-pgvector-revival-timing.md
-  - "../../backend/lambda/src/analytics-aurora/drift-detection.ts"
+  - "../../../backend/lambda/src/analytics-aurora/drift-detection.ts"
 ---
 
 # ADR-006: Drift detection result shape (stable interface)
@@ -131,7 +131,7 @@ Changes to `DriftResult` MUST update the eval-suite fixture's `$schema` field ac
 These are AE-internal and may change without coordination:
 
 - **Bedrock model id** for embedding (currently `amazon.titan-embed-text-v2:0`). The contract assumes 1024-dim cosine-comparable embeddings; the specific model is an implementation detail.
-- **Threshold values** (`DRIFT_DISTANCE_THRESHOLD` default 0.35, `REROUTE_SIMILARITY_THRESHOLD` default 0.80). Both are SSM-tunable and expected to vary between deployments; the eval suite converges them.
+- **Threshold values** (`DRIFT_DISTANCE_THRESHOLD` default 0.35, `REROUTE_SIMILARITY_THRESHOLD` default 0.80, the latter read from `DRIFT_REROUTE_THRESHOLD`). Both are expected to vary between deployments and the eval suite converges them. They are **deploy-time environment variables on the data-plane Lambda**, not SSM parameters: nothing reads an SSM path for them, so changing one takes a deploy. Making them runtime-tunable is worth doing and is not what ships.
 - **EMF namespace** (currently `AgentEchelon/Drift`). The *dimension* names and metric shapes per the SPEC observability section are what stays stable, not the namespace string.
 - **Internal Lambda boundaries**. The logic currently lives in a single `analytics-aurora/drift-detection.ts` module, but may be split or merged across Lambdas. The function-level signature above is what crosses the wire.
 

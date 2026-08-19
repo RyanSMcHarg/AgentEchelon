@@ -1,3 +1,9 @@
+---
+title: "ADR-012: Assistant config store and drift (persona / intent pack): preserve-on-absent"
+status: Accepted
+date: 2026-06-13
+---
+
 # 012 - Assistant config store & drift (persona / intent pack): preserve-on-absent
 
 **Status:** Accepted · **Date:** 2026-06-13
@@ -27,7 +33,7 @@ Kept: the **synth `addWarning`** when a `standard`/`premium` tier resolves an em
 - A deploy that omits the persona/pack context **can no longer blank** an existing config - the exact footgun is structurally removed (verified: the synthesized `<Instance>Tier-Standard` template has two `Custom::AWS` writers and **no `AWS::SSM::Parameter`** for persona/pack).
 - A **changed** persona/pack re-PUTs reliably (hash in the physical id), so the drift "no changes" no-op is gone.
 - Least-privilege: each writer's policy is scoped to `ssm:PutParameter` on its own param ARN.
-- **Still open:** the **operator no-deploy path** (set persona at runtime via the admin API/console) with **admin authz + audit** - preserve-on-absent makes the *deploy* path safe, but an operator still needs a deploy to change the persona until that lands.
+- **Was open, now superseded:** the **operator no-deploy path** (set persona at runtime via the admin API/console) with **admin authz + audit**. Preserve-on-absent made the *deploy* path safe; the no-deploy path arrived with versioned profiles, where a persona is a field of a profile version edited through `manage-profiles` under the `manage-profiles` capability and audited per mutation ([`SPEC-PORTABLE-PROFILES.md`](../../specs/interaction/assistant-config/SPEC-PORTABLE-PROFILES.md)). The persona body itself lives in S3 there, not in the parameters below. Everything else in this decision - the per-deployment `assistant-{system-prompt,intent-pack}` parameters and their preserve-on-absent writers - is unchanged and remains the fallback seam.
 - Teardown: the params are now orphaned from the tier stack (not CFN-deleted on stack destroy) - a tier teardown must delete `${SSM_ROOT}/assistant/{tier}/assistant-*` explicitly (documented in HOW-TO-ADD-OR-MANAGE-A-PROFILE).
 
 ## Migration (2-step RETAIN - one-time)

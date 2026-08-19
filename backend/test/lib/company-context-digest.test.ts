@@ -67,7 +67,7 @@ describe('loadCompanyContext skips `_`-prefixed files', () => {
       });
     });
 
-    const result = await loadCompanyContext(BUCKET);
+    const result = await loadCompanyContext(BUCKET, 'basic');
     const sources = result.documents.map((d) => d.source);
     expect(sources).toEqual(['context/basic/company-public.json']);
     expect(sources).not.toContain('context/basic/_digest.json');
