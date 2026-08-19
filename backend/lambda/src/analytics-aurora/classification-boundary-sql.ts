@@ -143,6 +143,14 @@ function assertSafeIdentifier(value: string): void {
   }
 }
 
+/**
+ * How many unstamped rows the fail-closed stamp converts per application (step 6 below).
+ *
+ * A single-column write is cheap per row, so this is generous - the point is only that the statement
+ * has a ceiling at all, since it runs inside the shared cold-start migration transaction.
+ */
+const NULL_STAMP_BATCH = 20000;
+
 /** A Postgres string literal. Used for the scope arrays baked into the mapping function. */
 function sqlLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
@@ -336,12 +344,21 @@ END $$;`);
   //    ROW LEVEL SECURITY is on and the owner has no write policy, so the same UPDATE issued unroled
   //    would report success having touched ZERO rows. Every future migration that writes a bounded
   //    table has to do exactly this, which is why `migration-writer-role.test.ts` enforces it.
+  //
+  //    IT IS BOUNDED, because it shares one transaction with every pending migration inside one Lambda
+  //    invocation and nothing commits unless all of it does. On the first upgrade of an existing
+  //    deployment the column has just been added, so EVERY row is NULL and this would be a whole-table
+  //    write - one that, if it outran the invocation, would discard the migrations alongside it and
+  //    make the next cold start repeat the lot. Bounding it costs nothing that matters: this bootstrap
+  //    re-runs on every cold start, so the stamp converges on its own, and the rows it has not reached
+  //    yet are NULL, which is STRICTER than the value it is about to write, not looser.
   const mostRestrictive = registry.mostRestrictiveValue;
   assertSafeIdentifier(mostRestrictive);
   statements.push(`SET LOCAL ROLE ${WRITER_ROLE};`);
   for (const table of BOUNDED_TABLES) {
     statements.push(
-      `UPDATE ${table} SET classification = ${sqlLiteral(mostRestrictive)} WHERE classification IS NULL;`,
+      `UPDATE ${table} SET classification = ${sqlLiteral(mostRestrictive)}
+  WHERE ctid IN (SELECT ctid FROM ${table} WHERE classification IS NULL LIMIT ${NULL_STAMP_BATCH});`,
     );
   }
   // MANDATORY. `applyPendingMigrations` and this bootstrap share one transaction per cold start, so a

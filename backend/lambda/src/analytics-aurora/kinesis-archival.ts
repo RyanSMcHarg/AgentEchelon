@@ -25,7 +25,6 @@ import {
 } from './db-client.js';
 import { detectDrift, recordDriftFire } from './drift-detection.js';
 import { lookupChannelClassification } from './channel-classification.js';
-import { recordMemberCount } from '../lib/channel-context-client.js';
 import { writeTurnEvents } from './turn-events-live.js';
 import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
 import { updateConversationContext } from './cross-conversation-context.js';
@@ -1320,40 +1319,22 @@ async function syncMembershipRecords(
     console.log(`Synced ${synced} membership events`);
   }
 
-  // Publish the resulting member count for the channels this batch touched.
+  // NO DERIVED MEMBER COUNT IS PUBLISHED FROM HERE, and adding one back is a regression.
   //
-  // WHY HERE. This is the only component that learns a channel changed size without asking, and the
-  // `@all` responder branch needs the size on the request path (channel-flow-processor and
-  // router-agent-handler must agree on it, or a turn is answered twice or not at all). Writing it on
-  // the event keeps a Chime `ListChannelMemberships` off the hot path.
+  // This function's product is `channel_membership`, the per-member rows the admin conversation query
+  // aggregates at read time. It does not also cache a per-channel total, because the only decision that
+  // ever wanted one - which entry answers an `@all` turn - cannot use a stored count at all:
   //
-  // COUNTED FROM THE ROW WE JUST WROTE, not from the event: an event says one member joined or left,
-  // not how many there now are, and a batch can carry several events for one channel. `channel_membership`
-  // is the state this same function has just brought up to date, so it is the count that matches.
+  //  - `channel_membership` projects only `/user/` ARNs, so any total derived here counts humans and
+  //    has to guess at assistants. A battle channel is one user and TWO bots and reports 2, which is
+  //    the 1:1 shape the responder branch must never misread.
+  //  - `lib/channel-size.ts` is the single definition both the channel flow and the router import,
+  //    precisely so the two halves of that decision cannot disagree, and it resolves size from a live
+  //    `ListChannelMemberships` - what Amazon Chime SDK itself counts, which is what the routing rule
+  //    is about.
   //
-  // BEST-EFFORT AND ALARMED. A failure here must not fail the archival batch - an archive record is
-  // worth more than a cache entry - so `recordMemberCount` swallows errors and emits a
-  // `WriteFailures` metric instead. That metric is the alarm: without it, a broken write is invisible,
-  // because turns keep working via the live-read fallback and only the Chime call volume changes.
-  const touched = [...new Set(records
-    .filter((r) => MEMBERSHIP_EVENT_TYPES.includes(String(r.event_type)))
-    .map((r) => r.channel_arn)
-    .filter(Boolean))];
-  for (const arn of touched) {
-    try {
-      const counted = await query<{ n: string }>(
-        // +1 for the assistant: `channel_membership` tracks human members (it keys on `user_sub`,
-        // derived from `/user/` ARNs), while the responder branch reasons about TOTAL channel members
-        // the way Chime reports them. Two rows here is the 1:1 shape the branch must not misread.
-        `SELECT COUNT(*)::text AS n FROM channel_membership WHERE channel_arn = $1`,
-        [arn],
-      );
-      const humans = Number(counted.rows[0]?.n ?? 0);
-      if (humans > 0) await recordMemberCount(arn, humans + 1);
-    } catch (err) {
-      console.warn(`[membership] member-count publish failed for ${arn}:`, (err as Error).name);
-    }
-  }
+  // A cached total therefore has no reader, and producing one costs a `COUNT(*)` per touched channel on
+  // every batch that carries a membership event.
 }
 
 /**

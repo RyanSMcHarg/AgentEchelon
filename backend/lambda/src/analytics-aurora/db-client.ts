@@ -391,6 +391,26 @@ export async function batchInsert<T extends Record<string, any>>(
  * two instances cannot both apply the same file. Runtime-applied migrations MUST be idempotent
  * (IF NOT EXISTS) and transaction-safe (no CREATE INDEX CONCURRENTLY etc.), since they run in one
  * transaction here; the initial bootstrap of the base schema still happens via `schema-init` on Create.
+ *
+ * ---------------------------------------------------------------------------------------------
+ * RESUMABLE MIGRATIONS, and why a data backfill needs to be one.
+ *
+ * Everything below runs in ONE transaction inside ONE Lambda invocation, and `ensureSchema` rethrows on
+ * failure with `schemaInitialized` still false. So a file that outruns the invocation commits NOTHING:
+ * `_migrations` records nothing, the next cold start starts the identical work from zero, and the
+ * upgrade can never converge no matter how many times it is retried. DDL is small and fixed; a DATA
+ * backfill over an existing table is neither, and it is the shape that can hit this.
+ *
+ * The fix is to let such a file do a BOUNDED batch and say so. A migration reports how much work it has
+ * left in `_migration_progress`; a non-zero count leaves the file PENDING, so the next cold start runs
+ * the next batch, and the file is recorded in `_migrations` only when nothing remains. Each invocation
+ * therefore keeps its progress, and the series converges.
+ *
+ * A file that writes no progress row is finished the moment it runs, which is every existing migration.
+ *
+ * A resumable file must be safe to leave half-done: later migrations still apply while it is pending,
+ * so nothing may depend on its data step having completed.
+ * ---------------------------------------------------------------------------------------------
  */
 let schemaInitialized = false;
 
@@ -437,6 +457,17 @@ async function applyPendingMigrations(): Promise<void> {
       )
     `);
 
+    // Where a RESUMABLE migration reports the work it has left. Created here as well as in the file
+    // that uses it, because `schema-init` applies the same files on a fresh cluster and knows nothing
+    // about this table; both creations are `IF NOT EXISTS`, so whichever runs first wins.
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS _migration_progress (
+        filename VARCHAR(256) PRIMARY KEY,
+        remaining BIGINT NOT NULL,
+        updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+      )
+    `);
+
     const appliedRows = await client.query('SELECT filename FROM _migrations');
     const applied = new Set<string>(appliedRows.rows.map((r: { filename: string }) => r.filename));
 
@@ -445,6 +476,20 @@ async function applyPendingMigrations(): Promise<void> {
       const sql = fs.readFileSync(path.join(schemaDir, file), 'utf-8');
       console.log(`Applying migration: ${file} (${sql.length} bytes)`);
       await client.query(sql);
+
+      // A bounded batch that left work behind stays PENDING so the next cold start resumes it. The
+      // batch itself is already committed with this transaction, so the progress is kept either way -
+      // what is withheld is the CLAIM that the file is done. Recording it would be the lie that
+      // strands the remaining rows forever.
+      const remaining = await migrationRemainingWork(client, file);
+      if (remaining > 0) {
+        console.warn(
+          `Migration ${file} applied a bounded batch and reports ${remaining} row(s) still to convert. `
+          + 'It stays pending and resumes on the next cold start.',
+        );
+        continue;
+      }
+
       await client.query(
         `INSERT INTO _migrations (filename, checksum) VALUES ($1, $2)
          ON CONFLICT (filename) DO UPDATE SET applied_at = NOW(), checksum = $2`,
@@ -475,6 +520,27 @@ async function applyPendingMigrations(): Promise<void> {
     }
     console.log(`[classification-boundary] applied (${statements.length} statements)`);
   }, DB_OWNER_USER);
+}
+
+/**
+ * How many rows a just-applied migration says it still has to convert.
+ *
+ * Absent row, NULL, or a value that is not a positive number all mean FINISHED, which is the answer for
+ * every migration that is not resumable. Erring that way is deliberate: the alternative reading would
+ * leave an ordinary DDL file pending forever on a malformed row and re-apply it on every cold start.
+ *
+ * `remaining` is a BIGINT, which node-pg hands back as a STRING to preserve precision, so the parse is
+ * not optional - `> 0` on the raw value would compare a string and quietly decide every batch was done.
+ */
+async function migrationRemainingWork(client: PoolClient, file: string): Promise<number> {
+  const result = await client.query<{ remaining: string | number | null }>(
+    'SELECT remaining FROM _migration_progress WHERE filename = $1',
+    [file],
+  );
+  const raw = result.rows[0]?.remaining;
+  if (raw === undefined || raw === null) return 0;
+  const parsed = typeof raw === 'number' ? raw : parseInt(String(raw), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : 0;
 }
 
 /** Small non-crypto checksum for tracking migration file content (parity with schema-init.ts). */

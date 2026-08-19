@@ -2360,6 +2360,12 @@ async function fetchExperimentRows(
        COALESCE(e.intent, 'unknown') AS intent,
        e.agent_type,
        COUNT(*) AS exchange_count,
+       -- How many of those exchanges an evaluator actually SCORED. exchange_count measures traffic;
+       -- this measures evidence, and they are not interchangeable, because an unscored exchange still
+       -- counts toward the mean below as a zero. The recommendation gates a quality/accuracy objective
+       -- on this, so a variant with nothing scored reports "not enough evidence" instead of a mean of
+       -- placeholder zeros read as a real result.
+       COUNT(er.relevance_score) AS scored_count,
        ROUND(AVG(COALESCE(er.relevance_score, 0))::numeric, 1) AS avg_score,
        -- Per-variant dispersion for the statistical tests (§4.2-B/A.6): sample
        -- SD of each continuous metric so getExperimentRecommendation can run a
@@ -2387,7 +2393,19 @@ async function fetchExperimentRows(
        COUNT(DISTINCT e.task_id) FILTER (WHERE e.task_status = 'completed') AS task_completed_count
      FROM exchanges e
      JOIN messages m ON e.agent_message_id = m.id
-     LEFT JOIN evaluation_results er ON er.exchange_id = e.id
+     -- ONE relevance per exchange, exactly as the drill-down resolves it (getExperimentExchanges) and
+     -- as every other read of this table does. Joining the raw rows fanned the join out whenever an
+     -- exchange carried two evaluation rows, which is reachable: overlapping evaluation-runner
+     -- invocations race the unscored select and then insert. A fan-out double-counts COUNT(*) and
+     -- mis-weights the AVG/STDDEV feeding the Welch tests, so the inflated n reached the ship
+     -- recommendation while the drill-down beside it, which pre-aggregates, disagreed silently.
+     LEFT JOIN (
+       SELECT exchange_id, AVG(relevance_score) AS relevance_score,
+              BOOL_AND(COALESCE(is_compliant, true)) AS is_compliant
+         FROM evaluation_results
+        WHERE evaluation_type = 'exchange'
+        GROUP BY exchange_id
+     ) er ON er.exchange_id = e.id
      ${where}
      GROUP BY m.experiment_id, m.variant_id, COALESCE(m.bedrock_model, 'unknown'), COALESCE(e.intent, 'unknown'), e.agent_type
      ORDER BY m.experiment_id, m.variant_id`,
@@ -2474,6 +2492,9 @@ async function fetchExperimentRows(
       // latency_sd/tokens_sd are the SQL sample SDs (null for a single-row group);
       // cost_sd is derived (see above); n mirrors exchange_count for the stats layer.
       n,
+      // Scoring coverage, coerced (pg returns counts as strings). The recommendation's sufficiency
+      // gate for a score-backed objective counts THIS, not n.
+      scored_count: Number(r.scored_count) || 0,
       score_sd: r.score_sd == null ? null : Number(r.score_sd),
       latency_sd: r.latency_sd == null ? null : Number(r.latency_sd),
       tokens_sd: tokensSd,
@@ -2590,7 +2611,7 @@ async function fetchBattleEffectivenessRows(
 
 const EXPERIMENT_COLUMNS = [
   'experiment_id', 'variant_id', 'model_name', 'intent', 'agent_type',
-  'exchange_count', 'n', 'avg_score', 'score_sd', 'avg_total_ms', 'latency_sd', 'p95_total_ms',
+  'exchange_count', 'n', 'scored_count', 'avg_score', 'score_sd', 'avg_total_ms', 'latency_sd', 'p95_total_ms',
   'avg_tokens', 'tokens_sd', 'avg_cost_usd', 'cost_sd', 'compliance_rate', 'fallback_count', 'fallback_rate',
   'task_count', 'task_completion_rate',
   // Human-signal joins — separate from avg_score.
@@ -3067,7 +3088,14 @@ export interface ExperimentRecommendation {
     significant: boolean;
     powered: boolean;
   };
-  guardrails: Array<{ metric: string; deltaPct: number; bound: number; held: boolean }>;
+  /**
+   * One entry per pre-registered guardrail. THREE states, not two: `held` (proven within the margin),
+   * `breached` (proven past it, a ship veto), and neither, which is "not established" and is the state
+   * a caller must not render as a breach. Both flags ride the payload because a caller cannot derive
+   * the third state from `held` alone, and reading `!held` as breached reports a wide interval as a
+   * demonstrated regression.
+   */
+  guardrails: Array<{ metric: string; deltaPct: number; bound: number; held: boolean; breached: boolean }>;
   human?: { picks: number; winRate: number; ci: [number, number]; significant: boolean };
   /**
    * User approval (thumbs) as a TESTED rate: the difference between variants with a Newcombe CI, not
@@ -3094,6 +3122,9 @@ interface VariantContinuousStats {
   latency: GroupStat;
   cost: GroupStat;
   tokens: GroupStat;
+  /** Exchanges an evaluator scored, summed across the variant's rows. Traffic is `score.n`; this is
+   *  the evidence behind a quality/accuracy read, and the two diverge whenever scoring lags. */
+  scoredCount: number;
 }
 
 /** Safe JSON-string param → typed object (null on absent/malformed). */
@@ -3139,7 +3170,10 @@ async function getExperimentRecommendation(
   // and collect per-intent (mean, sd, n) so the continuous stats can be pooled
   // to a single variant-level (mean, sd, n) for the §4.2-B Welch tests.
   const byVariant = new Map<string, any>();
-  const statsByVariant = new Map<string, { score: GroupStat[]; latency: GroupStat[]; cost: GroupStat[]; tokens: GroupStat[] }>();
+  const statsByVariant = new Map<
+    string,
+    { score: GroupStat[]; latency: GroupStat[]; cost: GroupStat[]; tokens: GroupStat[]; scored: number }
+  >();
   for (const r of rows) {
     const key = r.variant_id || 'unknown';
     const acc = byVariant.get(key) || {
@@ -3171,7 +3205,10 @@ async function getExperimentRecommendation(
 
     // Per-intent dispersion groups for pooling. A null sd (single-row group)
     // pools as 0 variance for that group; a null cost drops the cost group.
-    const grp = statsByVariant.get(key) || { score: [], latency: [], cost: [], tokens: [] };
+    const grp = statsByVariant.get(key) || { score: [], latency: [], cost: [], tokens: [], scored: 0 };
+    // Scoring coverage sums straight across the variant's rows: it is a count of scored exchanges,
+    // not a mean, so it is never exchange-count weighted.
+    grp.scored += Number(r.scored_count) || 0;
     grp.score.push({ n, mean: Number(r.avg_score) || 0, sd: r.score_sd == null ? 0 : Number(r.score_sd) });
     grp.latency.push({ n, mean: Number(r.avg_total_ms) || 0, sd: r.latency_sd == null ? 0 : Number(r.latency_sd) });
     grp.tokens.push({ n, mean: Number(r.avg_tokens) || 0, sd: r.tokens_sd == null ? 0 : Number(r.tokens_sd) });
@@ -3261,6 +3298,7 @@ async function getExperimentRecommendation(
       latency: poolGroups(grp.latency),
       cost: poolGroups(grp.cost),
       tokens: poolGroups(grp.tokens),
+      scoredCount: grp.scored,
     });
   }
 
@@ -3419,7 +3457,9 @@ async function computeRecommendation(
       significant: primary.significant,
       powered: primary.powered,
     },
-    guardrails: guardrails.map((g) => ({ metric: g.metric, deltaPct: g.deltaPct, bound: g.bound, held: g.held })),
+    guardrails: guardrails.map((g) => ({
+      metric: g.metric, deltaPct: g.deltaPct, bound: g.bound, held: g.held, breached: g.breached,
+    })),
     human: hp
       ? { picks: hp.picks, winRate: round4(hp.winRate), ci: [round4(hp.ci[0]), round4(hp.ci[1])], significant: hp.significant }
       : undefined,
@@ -3439,7 +3479,9 @@ async function computeRecommendation(
 
 function zeroStats(): VariantContinuousStats {
   const z: GroupStat = { n: 0, mean: 0, sd: 0 };
-  return { score: { ...z }, latency: { ...z }, cost: { ...z }, tokens: { ...z } };
+  // scoredCount 0 is the truth for a variant with no rows at all, and it keeps the sufficiency gate
+  // engaged rather than leaving it unknown for the one case that has the least evidence of all.
+  return { score: { ...z }, latency: { ...z }, cost: { ...z }, tokens: { ...z }, scoredCount: 0 };
 }
 
 const round1 = (n: number): number => Math.round(n * 10) / 10;
@@ -3468,13 +3510,41 @@ function buildRationale(a: {
   parts.push(
     `Primary metric ${a.primary.metric}: treatment ${a.primary.deltaPct >= 0 ? '+' : ''}${a.primary.deltaPct}% vs control (CI [${a.primary.ci[0]}, ${a.primary.ci[1]}], ${sigTxt}).`,
   );
+  // Each guardrail is narrated as the state it is actually in. Three things were wrong with saying
+  // "breach ... (significant)" or otherwise "guardrails held": the significance behind a breach is now
+  // against the BOUND rather than against zero, so "significant" no longer names what was tested; an
+  // `at_least` breach is a required improvement MISSED, not a regression past a ceiling, and calling a
+  // proven +3% improvement "past its 5% bound" reported a win as a loss; and a guardrail that is
+  // merely indeterminate was swept into "Guardrails held", claiming the one thing the interval was too
+  // wide to establish, next to a verdict that had already declined to ship because of it.
   const breached = a.guardrails.filter((g) => g.breached);
+  const indeterminate = a.guardrails.filter((g) => g.indeterminate);
+  const held = a.guardrails.filter((g) => g.held);
+  const signedPct = (n: number): string => `${n >= 0 ? '+' : ''}${n}%`;
   if (a.guardrails.length) {
-    parts.push(
-      breached.length
-        ? `Guardrail breach: ${breached.map((g) => `${g.metric} ${g.deltaPct >= 0 ? '+' : ''}${g.deltaPct}% past its ${g.bound}% bound (significant)`).join('; ')} — a ship is vetoed.`
-        : `Guardrails held: ${a.guardrails.map((g) => `${g.metric} ${g.deltaPct >= 0 ? '+' : ''}${g.deltaPct}% within ${g.bound}%`).join('; ')}.`,
-    );
+    const clauses: string[] = [];
+    if (breached.length) {
+      clauses.push(
+        `Guardrail breach: ${breached
+          .map((g) =>
+            g.direction === 'at_least'
+              ? `${g.metric} ${signedPct(g.deltaPct)} falls short of its ${g.bound}% floor, with the whole confidence interval below it`
+              : `${g.metric} ${signedPct(g.deltaPct)} past its ${g.bound}% bound, with the whole confidence interval beyond it`,
+          )
+          .join('; ')}. A ship is vetoed.`,
+      );
+    }
+    if (indeterminate.length) {
+      clauses.push(
+        `Guardrails not established: ${indeterminate
+          .map((g) => `${g.metric} ${signedPct(g.deltaPct)} against a ${g.bound}% bound, on an interval too wide to place either side of it`)
+          .join('; ')}. That is too little evidence to ship on, not a pass.`,
+      );
+    }
+    if (held.length) {
+      clauses.push(`Guardrails held: ${held.map((g) => `${g.metric} ${signedPct(g.deltaPct)} within ${g.bound}%`).join('; ')}.`);
+    }
+    parts.push(clauses.join(' '));
   }
   if (a.hp) {
     const pct = Math.round(a.hp.winRate * 100);

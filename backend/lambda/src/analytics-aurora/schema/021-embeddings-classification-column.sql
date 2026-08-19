@@ -16,6 +16,13 @@ ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS classification TEXT;
 
 -- Backfill from the key schema 020 established. Only rows that have it and lack the column, so a
 -- re-run is a no-op and a partially-migrated table converges.
+--
+-- NO BATCH LIMIT HERE, and that is bounded rather than unbounded. This can only ever touch rows that
+-- carry the `classification` key AND have no column value, and there are two sources of those: 020,
+-- which is itself bounded to one batch and runs immediately before this file in the same transaction,
+-- and document-ingestion, which writes the key and the column in the same INSERT and so produces none.
+-- The ceiling is therefore 020's batch. `migration-data-steps-are-bounded.test.ts` records the
+-- exemption so that a future edit which widens the predicate has to argue for it.
 UPDATE embeddings
    SET classification = metadata ->> 'classification'
  WHERE classification IS NULL
@@ -31,8 +38,14 @@ UPDATE embeddings
 -- (`lib/config/profiles.ts` - a deployment may rename or extend the ladder), and static SQL cannot
 -- read it; hardcoding 'premium' here would be the same drift the profile registry exists to prevent,
 -- on the one path where the consequence is a cross-classification read. `classification-boundary.ts`
--- stamps both bounded tables from `mostRestrictiveValue` in the same cold start that applies this
--- file, under the write role, so there is no window in which a row is both present and unstamped.
+-- stamps both bounded tables from `mostRestrictiveValue` under the write role, a bounded batch per
+-- cold start so it cannot become a whole-table write inside the shared migration transaction. A row it
+-- has not reached yet is NULL, which is STRICTER than the stamp, not looser: NULL matches no scope.
+--
+-- A ROW THIS BACKFILL RAN TOO EARLY TO SEE IS NOT SETTLED BY THAT STAMP EITHER. 020's key rename is
+-- bounded to one batch, so rows still carrying the pre-020 key reach this file with nothing to read.
+-- 029 finishes the rename and writes the column from the same key in one statement, which corrects the
+-- fail-closed stamp instead of leaving it to be mistaken for the row's real value.
 
 -- Index for the policy predicate and for the existing scope filter.
 CREATE INDEX IF NOT EXISTS idx_embeddings_classification ON embeddings (classification);

@@ -34,7 +34,6 @@ import { recordNoTransitionTurn, TASK_STALL_TURNS, type Task } from '../../lambd
 import { recordWelcomeConfigDefect } from '../../lambda/src/lib/welcome-metrics';
 import { repairTaskAnswer } from '../../lambda/src/lib/task-answer-repair';
 import { DeliveryOption } from '../../lambda/src/lib/delivery-options';
-import { recordMemberCount } from '../../lambda/src/lib/channel-context-client';
 
 interface EmfDoc {
   _aws: {
@@ -293,16 +292,6 @@ const CALLERS: Array<{ module: string; label: string; emit: () => Promise<EmfDoc
         Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/a/user/u-emf', Name: 'A' },
       },
     } as never)),
-  },
-  {
-    // The member-count write-failure alarm (ChannelMemberCount/WriteFailures). This envelope was
-    // hand-rolled in its own module and therefore sat OUTSIDE this guard while feeding a real
-    // alarm; the write now lives with the item's one owner and emits through the shared emitter.
-    // Driven through the real entry: with no CHANNEL_CONTEXT_TABLE the unset-table path is the
-    // cheapest emitting path, and it is the same document the DynamoDB failure path emits.
-    module: 'lambda/src/lib/channel-context-client.ts',
-    label: 'recordMemberCount (WriteFailures, table unset)',
-    emit: async () => captureAsync(() => recordMemberCount('arn:aws:chime:us-east-1:1:app-instance/a/channel/c-emf', 2)),
   },
 ];
 

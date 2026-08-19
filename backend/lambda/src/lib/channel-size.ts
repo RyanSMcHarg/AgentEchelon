@@ -44,10 +44,9 @@ import {
   ChimeSDKMessagingClient,
   ListChannelMembershipsCommand,
 } from '@aws-sdk/client-chime-sdk-messaging';
-// The recorded member count (channel-context-client recordMemberCount) is deliberately NOT read
-// here: see the note in `resolveChannelSize` for why the recorded count cannot serve this decision.
-// It still runs in the archival path as a cheap membership signal; it simply is not the authority
-// for channel SIZE, which is why no read-side accessor for it exists at all.
+// There is no stored member count to read, and reintroducing one is a regression: see the note in
+// `resolveChannelSize` for why a recorded count cannot serve this decision. The archival path
+// publishes none, no read-side accessor exists, and the live read below is the only source.
 
 /**
  * A channel with exactly the user and the assistant. At this size Amazon Chime SDK's AUTO trigger
@@ -83,25 +82,25 @@ export async function resolveChannelSize(
   channelArn: string,
   bearerArn: string,
 ): Promise<ChannelSize> {
-  // ONE SOURCE, AND IT IS THE LIVE READ. This used to prefer an event-written count from the Kinesis
-  // archival path, to spend a DynamoDB GetItem instead of a Chime call. It was removed because that
-  // count cannot answer THIS question, and because the two callers were not even reading it alike:
+  // ONE SOURCE, AND IT IS THE LIVE READ. An event-written count from the Kinesis archival path is the
+  // obvious way to spend a DynamoDB GetItem instead of an Amazon Chime SDK call, and it is rejected on
+  // two independent grounds:
   //
-  //  - It counted `humans + 1`, hardcoding exactly one assistant, because `channel_membership` only
-  //    projects `/user/` ARNs. A battle channel is one user and TWO bots, so it recorded 2 and the
-  //    question "does this bot see exactly one other member?" was answered `true` for a 3-member room.
-  //    The flow then stood aside for `@all` while Chime, seeing two other members, kept the bot in
-  //    MENTIONS mode and never invoked Lex - so nobody answered, which this module names as the worse
-  //    of the two failure directions.
-  //  - Only the ROUTER could read it. The channel flow has no `CHANNEL_CONTEXT_TABLE` env and no grant
-  //    on that table, so it always fell through to the live read anyway. The two halves of a decision
-  //    that must be exact complements were computing it from different sources with different
-  //    semantics - the precise failure this module exists to prevent.
+  //  - IT COLLAPSES BOTS. A count derived from `channel_membership` sees only `/user/` ARNs, so it
+  //    counts humans and adds a fixed one for the assistant. A battle channel is one user and TWO bots
+  //    and reports 2, which answers "does this bot see exactly one other member?" with `true` for a
+  //    3-member room. The flow then stands aside for `@all` while Amazon Chime SDK, seeing two other
+  //    members, keeps the bot in MENTIONS mode and never invokes Lex - so nobody answers, the worse of
+  //    the two failure directions this module names.
+  //  - ONLY ONE CALLER COULD REACH IT. The channel flow has no `CHANNEL_CONTEXT_TABLE` env and no grant
+  //    on that table, so it falls through to the live read regardless. The two halves of a decision that
+  //    must be exact complements would compute it from different sources with different semantics - the
+  //    precise failure this module exists to prevent.
   //
-  // The live read counts what Chime counts, which is what the routing rule is actually about, and both
-  // callers now run the same code against the same source. It is paid only on a turn carrying a bypass
-  // token, and since `/battle` no longer consults size at all (the flow owns it at every size), that
-  // means `@all` turns alone.
+  // The live read counts what Amazon Chime SDK counts, which is what the routing rule is actually
+  // about, and both callers run this same code against that same source. It is paid only on a turn
+  // carrying a bypass token, and since `/battle` does not consult size at all (the flow owns it at
+  // every size), that means `@all` turns alone.
   try {
     const resp = await client.send(
       new ListChannelMembershipsCommand({

@@ -21,7 +21,6 @@
  * erroring the turn. Writes are best-effort: a lost write degrades grounding, it never leaks.
  */
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { emitEmfMetric } from './emf-metrics.js';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { parseParticipantContext, type ParticipantContext } from './participant-shape.js';
 
@@ -280,64 +279,15 @@ export async function putChannelContext(channelArn: string, patch: ChannelContex
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Member count (event-maintained; see the design note in lib/channel-size.ts)
+// NO MEMBER COUNT IS STORED ON THIS ITEM, and a writer for one does not belong here.
 //
-// LIVES HERE because it writes THIS store's item. It used to live in its own module with its own
-// DynamoDB client and its own hand-rolled EMF envelope - two independently maintained writers for
-// one item that also carries private grounding, whose patch rules had to be found in two places,
-// and whose failure metric sat outside the emf-schema drift guard feeding the very alarm it exists
-// for. One module owns the item now.
+// A cached count exists to keep a `ListChannelMemberships` off the `@all` request path, and it cannot
+// serve that purpose: the responder branch resolves size through `lib/channel-size.ts`, which takes
+// the live read because a count derived from archived membership events collapses assistants into the
+// human roster (a battle channel of three reports 2), and because only one of the two callers that
+// must agree on size can reach this table at all.
 //
-// `@all` has one responder and which entry answers depends on channel size; a request-path
-// ListChannelMemberships is the cost that got the member-count branch rejected the first time, so
-// the count is written when a MEMBERSHIP EVENT is archived and read from the item when needed.
-// Server-only for the same reason everything else here is: a member-writable member count is a
-// member-writable answer to "who responds".
+// A row from an earlier deployment can carry `memberCount` and `memberCountUpdatedAt`. Both are inert,
+// and `lib/legacy-channel-context.ts` accounts for that shape: neither is stamped onto `updatedAt`, so
+// such a row stays eligible for legacy grounding promotion.
 // ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Record the channel's member count. Called from the Kinesis archival path when a membership event
- * arrives, which is the only place that learns about a change without asking.
- *
- * Best-effort by contract: a failure emits the alarm metric (`ChannelMemberCount/WriteFailures`)
- * and returns, because this rides on the archival batch and an archive record is worth more than a
- * cache entry - Lambda `Errors` stays at zero, so the metric is the only visibility.
- *
- * Deliberately does NOT stamp `updatedAt`: that timestamp is the GROUNDING's freshness, and a count
- * write counterfeiting it would make stale grounding read as fresh. The count carries its own
- * `memberCountUpdatedAt`.
- */
-export async function recordMemberCount(channelArn: string, memberCount: number): Promise<void> {
-  const table = tableName();
-  if (!channelArn || !table || !Number.isFinite(memberCount) || memberCount < 1) {
-    if (!table) emitMemberCountWriteFailure('CHANNEL_CONTEXT_TABLE unset');
-    return;
-  }
-  try {
-    await ddb().send(new UpdateCommand({
-      TableName: table,
-      Key: { channelArn },
-      // Only these two attributes: the item is shared with the conversation's private grounding and
-      // this writer has no business touching the rest of it.
-      UpdateExpression: 'SET memberCount = :c, memberCountUpdatedAt = :t',
-      ExpressionAttributeValues: { ':c': memberCount, ':t': new Date().toISOString() },
-    }));
-  } catch (err) {
-    console.warn('[channel-context] member-count write failed:', (err as Error).name);
-    emitMemberCountWriteFailure((err as Error).name || 'unknown');
-  }
-}
-
-/** The alarmed failure signal, on the shared EMF emitter so the schema drift guard covers it. */
-function emitMemberCountWriteFailure(reason: string): void {
-  try {
-    emitEmfMetric({
-      namespace: 'AgentEchelon/ChannelMemberCount',
-      metrics: [{ name: 'WriteFailures', unit: 'Count' }],
-      dimensionSets: [[]],
-      properties: { WriteFailures: 1, reason },
-    });
-  } catch {
-    /* metric emission must never be the thing that breaks the caller */
-  }
-}

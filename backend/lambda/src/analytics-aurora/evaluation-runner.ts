@@ -775,15 +775,25 @@ export async function handler(
         // Postgres deduces its type independently in each, erroring with "inconsistent types deduced
         // for parameter $9" (which failed EVERY Pass A insert). Cast both uses to varchar so the type
         // is unambiguous. (task_id / intent_flows.task_id are both VARCHAR(64).)
-        await query(
+        const written = await query(
+          // ON CONFLICT DO NOTHING against the migration-028 partial unique index. The select above
+          // reads the unscored backlog and this writes it, with no lock between: two overlapping
+          // scheduled invocations both see the same exchange as unscored and both reach here. The
+          // loser is a no-op rather than a second score, which is what the index makes possible and
+          // what every reader of this table already assumes. The index is present by the time this
+          // runs: the handler awaits ensureSchema() before the pass begins.
           `INSERT INTO evaluation_results
              (exchange_id, run_id, evaluator_model, relevance_score, classification,
               reasoning, agent_type, intent, task_id, flow_id, evaluation_type)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::varchar,
-                   (SELECT id FROM intent_flows WHERE task_id = $9::varchar), 'exchange')`,
+                   (SELECT id FROM intent_flows WHERE task_id = $9::varchar), 'exchange')
+           ON CONFLICT (exchange_id) WHERE evaluation_type = 'exchange' DO NOTHING`,
           [ex.id, runId, evaluatorModel, r.relevanceScore, r.classification, r.reasoning, ex.agent_type, ex.intent, ex.task_id],
         );
-        scored += 1;
+        // Count what was WRITTEN. A conflict means a concurrent run scored this exchange first, and
+        // reporting it as scored here would overstate the run's output by exactly the races the
+        // constraint exists to absorb.
+        if (written.rowCount !== 0) scored += 1;
       } catch (err) {
         errors.push(`${ex.id}: ${err instanceof Error ? err.message : String(err)}`);
       }

@@ -17,9 +17,14 @@
  * clobber `createdAt`; the status route enforces the transition state machine
  * (`completed`/`deleted` terminal — L2, 409), 404s a missing id (L6), records the
  * operator's `decision` on completing a run test (§3.2.1), and appends to the
- * append-only `transitions` audit on every change (L7). DELETE hard-removes a
- * never-started draft, else writes a soft-delete tombstone (L8); both free the
- * classification and release any bound alt-bot slot.
+ * append-only `transitions` audit on every change (L7). Activating an experiment whose
+ * `endDate` has passed is refused (409 `EXPERIMENT_WINDOW_ENDED`) instead of reported as a
+ * resume that resolves no traffic. DELETE hard-removes a never-started draft, else writes a
+ * soft-delete tombstone (L8); both free the classification and release any bound alt-bot slot.
+ *
+ * Every write is a read-modify-write of one row, pinned to the row it was decided from
+ * (`optimisticGuard`), so overlapping admin actions cannot drop each other's audit entries or
+ * status label: the loser gets 409 `EXPERIMENT_CONCURRENT_MODIFICATION` and re-reads.
  *
  * Authorization: Cognito-authenticated (API Gateway Cognito authorizer
  * enforces the JWT; we additionally require a caller sub). `boundBy` is
@@ -154,9 +159,19 @@ async function reconcileExpiredExperiments(experiments: Experiment[]): Promise<v
             TableName: EXPERIMENTS_TABLE,
             Key: { experimentId: exp.experimentId },
             UpdateExpression: 'SET #s = :s, #t = :t',
-            ConditionExpression: '#s = :active',
+            // Still `active`, AND the audit is the one this reconcile read: `transitions` is written
+            // back whole, so without the length check an edit or status change that appended between
+            // the Scan and this write is erased by it. A failed condition is already the benign path
+            // (the row is presented as completed either way, and the next read reconciles it).
+            ConditionExpression:
+              '#s = :active AND (attribute_not_exists(#t) OR size(#t) = :expectedTransitions)',
             ExpressionAttributeNames: { '#s': 'status', '#t': 'transitions' },
-            ExpressionAttributeValues: { ':s': 'completed', ':t': transitions, ':active': 'active' },
+            ExpressionAttributeValues: {
+              ':s': 'completed',
+              ':t': transitions,
+              ':active': 'active',
+              ':expectedTransitions': (exp.transitions ?? []).length,
+            },
           }),
         );
         exp.transitions = transitions;
@@ -172,13 +187,87 @@ async function reconcileExpiredExperiments(experiments: Experiment[]): Promise<v
   );
 }
 
-/** True when a DynamoDB write's ConditionExpression failed (the row vanished
- *  between read and write, or never existed). Lets the guarded writes return 404
- *  instead of a bare 500 (L6). */
+/** True when a DynamoDB write's ConditionExpression failed: the row vanished between read and
+ *  write, never existed, or another writer moved it. Lets the guarded writes answer 404 or 409
+ *  (`respondToLostRace`) instead of a bare 500 (L6). */
 function isConditionalCheckFailed(err: unknown): boolean {
   return (
     !!err && typeof err === 'object' && (err as { name?: string }).name === 'ConditionalCheckFailedException'
   );
+}
+
+/**
+ * OPTIMISTIC CONCURRENCY for a read-modify-write of an experiment row.
+ *
+ * Every lifecycle write here is a read-modify-write: `getExistingExperiment` reads the row, the
+ * handler appends one entry to the append-only `transitions` audit (L7), and writes the WHOLE array
+ * back. `attribute_exists(experimentId)` only asserts the row still exists, so two overlapping admin
+ * actions both read N entries, both append their own, and the second write lands N+1 entries with
+ * the first action's entry gone: the audit loses a status change while both callers are told 200.
+ * The status label loses the same race, because an edit that omits `status` writes back the value it
+ * read and walks a concurrently paused experiment back into live traffic.
+ *
+ * The guard pins the write to the row it was decided from - the status being replaced (the idiom
+ * `advanceTaskStateTo` uses in `lib/task-tracking.ts`) plus the audit length, which also catches a
+ * concurrent writer that appends WITHOUT changing status. A losing writer fails loudly and re-reads
+ * (see `respondToLostRace`); it never silently clobbers.
+ */
+function optimisticGuard(existing: Experiment): {
+  ConditionExpression: string;
+  names: Record<string, string>;
+  values: Record<string, unknown>;
+} {
+  // A legacy row predating the status field carries no `status` attribute at all (INV-2 reads that
+  // as active). Pin such a row by the attribute's ABSENCE: comparing against a value the row does
+  // not carry would refuse every write to it.
+  const statusGuard = existing.status ? '#s = :expectedStatus' : 'attribute_not_exists(#s)';
+  return {
+    ConditionExpression:
+      `attribute_exists(experimentId) AND ${statusGuard}`
+      + ' AND (attribute_not_exists(#t) OR size(#t) = :expectedTransitions)',
+    names: { '#s': 'status', '#t': 'transitions' },
+    values: {
+      ...(existing.status ? { ':expectedStatus': existing.status } : {}),
+      ':expectedTransitions': (existing.transitions ?? []).length,
+    },
+  };
+}
+
+/**
+ * Answer a failed `optimisticGuard` honestly. The condition covers two different situations that
+ * need different answers, so re-read the row rather than reporting one as the other: absent means it
+ * was deleted (404), present means it moved under this request (409). Either way nothing was
+ * written, and the 409 names the status the row actually holds so the console can re-read and decide
+ * again instead of retrying a decision made from a stale row.
+ */
+async function respondToLostRace(args: {
+  experimentId: string;
+  from: Experiment['status'];
+  to: Experiment['status'];
+  action: string;
+  origin?: string;
+}): Promise<APIGatewayProxyResult> {
+  const { experimentId, from, to, action, origin } = args;
+  const current = await getExistingExperiment(experimentId);
+  if (!current) {
+    return respond(404, { error: `Experiment "${experimentId}" not found` }, origin);
+  }
+  console.warn('[admin-experiments] write lost a race; not applied', {
+    experimentId,
+    action,
+    from,
+    to,
+    current: current.status,
+  });
+  return respond(409, {
+    error:
+      `Experiment "${experimentId}" changed while this ${action} was in flight (it is now `
+      + `'${current.status}'). Nothing was written - reload the experiment and retry.`,
+    code: 'EXPERIMENT_CONCURRENT_MODIFICATION',
+    from,
+    to,
+    currentStatus: current.status,
+  }, origin);
 }
 
 /**
@@ -390,6 +479,28 @@ export const handler = async (
       }
 
       if (to === 'active') {
+        // An experiment whose `endDate` has passed has no window left to run in: resolution already
+        // refuses it (`isLiveForClassification` gates on `endDate`), and the next list read
+        // auto-completes it (L5). Writing the `active` label back therefore resumes nothing, so a
+        // 200 here tells the operator a run restarted that never will. Refuse with the window in the
+        // body. Extending the run is a real operation and stays available on the edit route, where
+        // `endDate` is one of the three fields that remain editable on a live experiment (§3.2 L1)
+        // and gets validated as a date; the status route does not take a second, unvalidated path to
+        // the same field.
+        const endsAt = existing.endDate ? new Date(existing.endDate).getTime() : NaN;
+        if (!Number.isNaN(endsAt) && endsAt <= Date.now()) {
+          return respond(409, {
+            error:
+              `Experiment "${experimentId}" ended at ${existing.endDate}, so activating it resolves `
+              + 'no traffic. Extend its end date first (POST /admin/experiments with a later '
+              + 'endDate), or create a new experiment (new id) to run it again.',
+            code: 'EXPERIMENT_WINDOW_ENDED',
+            endDate: existing.endDate,
+            from: existing.status,
+            to,
+          }, origin);
+        }
+
         // Refuse to reactivate beyond the cap (excludes the row being touched).
         const activeCount = await countActiveExperimentsExcluding(experimentId);
         if (activeCount >= MAX_ACTIVE_EXPERIMENTS) {
@@ -454,8 +565,11 @@ export const handler = async (
         reason: `status:${to}`,
       });
 
-      const names: Record<string, string> = { '#s': 'status', '#t': 'transitions' };
-      const values: Record<string, unknown> = { ':s': to, ':t': transitions };
+      // The write is pinned to the status and audit this transition was authorized from, so a
+      // concurrent lifecycle write is refused rather than silently overwritten (optimisticGuard).
+      const guard = optimisticGuard(existing);
+      const names: Record<string, string> = { ...guard.names };
+      const values: Record<string, unknown> = { ':s': to, ':t': transitions, ...guard.values };
       let setExpr = 'SET #s = :s, #t = :t';
       if (decision) {
         names['#d'] = 'decision';
@@ -470,12 +584,18 @@ export const handler = async (
             UpdateExpression: setExpr,
             ExpressionAttributeNames: names,
             ExpressionAttributeValues: values,
-            ConditionExpression: 'attribute_exists(experimentId)',
+            ConditionExpression: guard.ConditionExpression,
           }),
         );
       } catch (err) {
         if (isConditionalCheckFailed(err)) {
-          return respond(404, { error: `Experiment "${experimentId}" not found` }, origin);
+          return respondToLostRace({
+            experimentId,
+            from: existing.status,
+            to,
+            action: 'status change',
+            origin,
+          });
         }
         throw err;
       }
@@ -512,13 +632,20 @@ export const handler = async (
       // transition audit (L7) survives.
       const neverStarted = existing.status === 'draft' && !hasAccruedTraffic(existing);
 
+      // Both delete shapes are decided from the row read above - hard-vs-soft from its status, the
+      // tombstone's audit from its `transitions` - so both carry the same guard: a hard delete must
+      // not erase a draft that was activated in the meantime, and the tombstone must not drop a
+      // concurrent entry from the audit it is meant to preserve.
+      const guard = optimisticGuard(existing);
       try {
         if (neverStarted) {
           await ddb.send(
             new DeleteCommand({
               TableName: EXPERIMENTS_TABLE,
               Key: { experimentId },
-              ConditionExpression: 'attribute_exists(experimentId)',
+              ExpressionAttributeNames: guard.names,
+              ExpressionAttributeValues: guard.values,
+              ConditionExpression: guard.ConditionExpression,
             }),
           );
         } else {
@@ -534,15 +661,21 @@ export const handler = async (
               TableName: EXPERIMENTS_TABLE,
               Key: { experimentId },
               UpdateExpression: 'SET #s = :s, #t = :t',
-              ExpressionAttributeNames: { '#s': 'status', '#t': 'transitions' },
-              ExpressionAttributeValues: { ':s': 'deleted', ':t': transitions },
-              ConditionExpression: 'attribute_exists(experimentId)',
+              ExpressionAttributeNames: guard.names,
+              ExpressionAttributeValues: { ':s': 'deleted', ':t': transitions, ...guard.values },
+              ConditionExpression: guard.ConditionExpression,
             }),
           );
         }
       } catch (err) {
         if (isConditionalCheckFailed(err)) {
-          return respond(404, { error: `Experiment "${experimentId}" not found` }, origin);
+          return respondToLostRace({
+            experimentId,
+            from: existing.status,
+            to: 'deleted',
+            action: 'delete',
+            origin,
+          });
         }
         throw err;
       }
@@ -723,9 +856,39 @@ export const handler = async (
         }
       }
 
-      await ddb.send(
-        new PutCommand({ TableName: EXPERIMENTS_TABLE, Item: sanitized }),
-      );
+      // An EDIT rewrites the whole row from what the Get returned, including the status it read and
+      // the audit it appended to, so it is pinned to that row (optimisticGuard): otherwise an edit
+      // overlapping a Pause writes the stale `active` label back and drops the pause's audit entry,
+      // and both callers see 200. A CREATE has no prior row to pin to and stays unconditional, so an
+      // idempotent re-create still overwrites (the read that decides create-vs-edit is eventually
+      // consistent, so conditioning a create on the row's absence would reject legitimate retries).
+      const editGuard = existing ? optimisticGuard(existing) : null;
+      try {
+        await ddb.send(
+          new PutCommand({
+            TableName: EXPERIMENTS_TABLE,
+            Item: sanitized,
+            ...(editGuard
+              ? {
+                ConditionExpression: editGuard.ConditionExpression,
+                ExpressionAttributeNames: editGuard.names,
+                ExpressionAttributeValues: editGuard.values,
+              }
+              : {}),
+          }),
+        );
+      } catch (err) {
+        if (existing && isConditionalCheckFailed(err)) {
+          return respondToLostRace({
+            experimentId: sanitized.experimentId,
+            from: existing.status,
+            to: sanitized.status,
+            action: 'edit',
+            origin,
+          });
+        }
+        throw err;
+      }
       return respond(200, sanitized, origin);
     }
 

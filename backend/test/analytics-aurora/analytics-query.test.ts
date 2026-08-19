@@ -22,6 +22,16 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
   getClient: jest.fn(),
 }));
 
+// The recommendation's rationale is NARRATION over an already-computed verdict, and the model call
+// that renders it falls back to the deterministic template on any failure. Mocked as a failure so the
+// recommendation tests read that template, which is the prose an operator sees when the model is
+// unavailable, and so no test reaches the network.
+const mockBedrockSend = jest.fn().mockRejectedValue(new Error('no model in tests'));
+jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
+  BedrockRuntimeClient: jest.fn(() => ({ send: mockBedrockSend })),
+  InvokeModelCommand: jest.fn((input: unknown) => input),
+}));
+
 import { handler, resolveReplyCostUsd, battlePickAxis, approvalAxis } from '../../lambda/src/analytics-aurora/analytics-query';
 
 function postEvent(body: unknown): APIGatewayProxyEvent {
@@ -519,5 +529,147 @@ describe('experiment_exchanges', () => {
     // A page without a total cannot be reconciled, and a silent sample reads as a complete set.
     const { sql } = await call({ experimentId: 'exp1' });
     expect(sql).toContain('COUNT(*) OVER()');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The experiment rollup that feeds the ship recommendation.
+//
+// Two things about this read are correctness requirements rather than style. It must resolve ONE
+// relevance per exchange, because a second evaluation row fans the join out and inflates the sample
+// size behind the Welch tests, and it must report how many exchanges were actually SCORED, because a
+// mean built from unscored placeholder zeros is not evidence about quality.
+// ---------------------------------------------------------------------------
+describe('experiment_results — the rollup resolves one evaluation per exchange', () => {
+  const experimentRow = (over: Record<string, unknown> = {}) => ({
+    experiment_id: 'exp-1',
+    variant_id: 'control',
+    model_name: 'anthropic.claude-sonnet-4-6',
+    intent: 'general_qa',
+    agent_type: 'premium',
+    exchange_count: '40',
+    scored_count: '40',
+    avg_score: '80',
+    score_sd: '10',
+    avg_total_ms: '1200',
+    latency_sd: '300',
+    p95_total_ms: '1800',
+    avg_input_tokens: '1000',
+    avg_output_tokens: '500',
+    avg_tokens: '1500',
+    tokens_sd: '200',
+    avg_image_count: null,
+    compliance_rate: '100',
+    fallback_count: '0',
+    task_count: '0',
+    task_completed_count: '0',
+    ...over,
+  });
+
+  beforeEach(() => mockDbQuery.mockReset());
+
+  it('pre-aggregates evaluation_results per exchange, so a duplicate row cannot inflate n', async () => {
+    // A duplicate exchange-type evaluation is reachable: overlapping evaluation-runner invocations
+    // race the unscored select and both insert. Joined raw, that exchange is counted twice by
+    // COUNT(*) and double-weighted in AVG/STDDEV, and the inflated n reaches the Welch tests behind
+    // the recommendation while the drill-down beside it, which pre-aggregates, reports the true count.
+    mockDbQuery.mockResolvedValueOnce({ rows: [] }).mockResolvedValueOnce({ rows: [] });
+
+    await handler(postEvent({ queryType: 'experiment_results', dateRange: VALID_RANGE }));
+
+    const sql = String(mockDbQuery.mock.calls[0][0]);
+    expect(sql).toMatch(/FROM evaluation_results\s+WHERE evaluation_type = 'exchange'\s+GROUP BY exchange_id/);
+    // And never the raw join, which is what fanned out.
+    expect(sql).not.toMatch(/JOIN evaluation_results er ON/);
+  });
+
+  it('reports scored_count alongside exchange_count — traffic and evidence are different numbers', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [experimentRow({ scored_count: '12' })] }).mockResolvedValueOnce({ rows: [] });
+
+    const res = await handler(postEvent({ queryType: 'experiment_results', dateRange: VALID_RANGE }));
+
+    expect(String(mockDbQuery.mock.calls[0][0])).toMatch(/COUNT\(er\.relevance_score\) AS scored_count/);
+    const body = JSON.parse(res.body);
+    expect(body.data[0]).toMatchObject({ exchange_count: '40', scored_count: 12 });
+  });
+});
+
+// ---------------------------------------------------------------------------
+// experiment_recommendation — what the verdict is allowed to claim.
+//
+// This is the end an operator reads a ship or no-ship decision off, so the cases pinned here are the
+// ones where the number and the sentence beside it could disagree.
+// ---------------------------------------------------------------------------
+describe('experiment_recommendation', () => {
+  const variantRow = (variantId: string, over: Record<string, unknown> = {}) => ({
+    experiment_id: 'exp-1',
+    variant_id: variantId,
+    model_name: 'anthropic.claude-sonnet-4-6',
+    intent: 'general_qa',
+    agent_type: 'premium',
+    exchange_count: '40',
+    scored_count: '40',
+    avg_score: '80',
+    score_sd: '10',
+    avg_total_ms: '1200',
+    latency_sd: '300',
+    p95_total_ms: '1800',
+    avg_input_tokens: '1000',
+    avg_output_tokens: '500',
+    avg_tokens: '1500',
+    tokens_sd: '200',
+    avg_image_count: null,
+    compliance_rate: '100',
+    fallback_count: '0',
+    task_count: '0',
+    task_completed_count: '0',
+    ...over,
+  });
+
+  const recommend = async (rows: unknown[], body: Record<string, unknown> = {}) => {
+    mockDbQuery.mockResolvedValueOnce({ rows });
+    const res = await handler(
+      postEvent({ queryType: 'experiment_recommendation', experimentId: 'exp-1', dateRange: VALID_RANGE, ...body }),
+    );
+    return JSON.parse(res.body);
+  };
+
+  beforeEach(() => mockDbQuery.mockReset());
+
+  it('an experiment with NOTHING scored reports not-enough-evidence, never "equivalent"', async () => {
+    // Unscored exchanges count as zero in the mean, so both variants read mean 0 / sd 0, Welch takes
+    // its degenerate branch, and the sample floor is satisfied by traffic alone. That combination
+    // narrated two entirely unmeasured variants as "equivalent on quality".
+    const unscored = { scored_count: '0', avg_score: '0', score_sd: null };
+    const body = await recommend([variantRow('control', unscored), variantRow('treatment', unscored)]);
+
+    expect(body.verdict).toBe('keep_running');
+    expect(body.verdict).not.toBe('equivalent');
+    expect(body.primary.powered).toBe(false);
+    expect(String(body.rationale)).not.toMatch(/equivalent/i);
+  });
+
+  it('the same experiment WITH scores can still reach a real equivalence verdict', async () => {
+    // The gate must block the unmeasured case only. With the scoring done, "no difference" stands as
+    // an answer rather than being downgraded to "keep running".
+    const body = await recommend([variantRow('control'), variantRow('treatment')]);
+
+    expect(body.verdict).toBe('equivalent');
+    expect(body.primary.powered).toBe(true);
+  });
+
+  it('narrates a guardrail that is merely NOT ESTABLISHED as such, never as held', async () => {
+    // Latency +7.5% against a 10% bound, on an interval running from -3.8% to +18.8%. It is neither
+    // proven within the bound nor proven past it, and calling that "Guardrails held" claims the one
+    // thing the interval is too wide to support, next to a verdict that has already declined to ship.
+    const body = await recommend(
+      [variantRow('control'), variantRow('treatment', { avg_total_ms: '1290' })],
+      { objective: { metric: 'quality', guardrails: [{ metric: 'latency', direction: 'no_worse_than', bound: 10 }] } },
+    );
+
+    expect(body.guardrails).toHaveLength(1);
+    expect(body.guardrails[0]).toMatchObject({ metric: 'latency', bound: 10, held: false, breached: false });
+    expect(String(body.rationale)).toMatch(/not established/i);
+    expect(String(body.rationale)).not.toMatch(/Guardrails held/);
   });
 });

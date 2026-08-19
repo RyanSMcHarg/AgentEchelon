@@ -269,6 +269,110 @@ describe('guardrails require evidence of no harm, not absence of evidence of har
   });
 });
 
+// ---------------------------------------------------------------------------
+// A breach is significance against the MARGIN, never against zero.
+//
+// A guardrail states a bound, so the only question it asks is where the difference sits relative to
+// THAT bound. Testing the p-value against zero answers a different question, and answers it wrongly in
+// both directions: it calls a proven improvement that merely misses a floor a "significant" breach,
+// and it calls a cost overrun a breach on evidence that only rules out zero. Both reach an operator as
+// a ship or no-ship recommendation, which is why these are pinned case by case.
+// ---------------------------------------------------------------------------
+describe('a guardrail breach is proven against the bound, not against zero', () => {
+  const quality = { metric: 'quality' as const, direction: 'at_least' as const, bound: 5 };
+  const cost = { metric: 'cost' as const, direction: 'no_worse_than' as const, bound: 10 };
+
+  it('a significant IMPROVEMENT whose interval still reaches the floor is not a breach', () => {
+    // +3% quality against a +5% floor, significant against zero (CI roughly [+0.2%, +5.8%], p ~ 0.035).
+    // Tested against zero this was "past its 5% bound (significant)" and vetoed the ship: a real
+    // improvement reported to an operator as a significant regression. The interval still reaches the
+    // floor, so the honest state is that the guardrail is not established either way.
+    const r = evaluateOutcomeGuardrail(
+      quality,
+      vstats({ score: { n: 100, mean: 100, sd: 10 } }),
+      vstats({ score: { n: 100, mean: 103, sd: 10 } }),
+    );
+    expect(r.deltaPct).toBe(3);
+    expect(r.pointWithinBound).toBe(false); // below the floor on the point estimate
+    expect(r.breached).toBe(false);         // and NOT proven below it
+    expect(r.held).toBe(false);
+    expect(r.indeterminate).toBe(true);
+  });
+
+  it('an improvement that clears the floor holds and is never a breach', () => {
+    const r = evaluateOutcomeGuardrail(
+      quality,
+      vstats({ score: { n: 400, mean: 100, sd: 5 } }),
+      vstats({ score: { n: 400, mean: 108, sd: 5 } }),
+    );
+    expect(r.held).toBe(true);
+    expect(r.breached).toBe(false);
+  });
+
+  it('a FLAT result against an improvement floor is a breach, and p against zero read 1', () => {
+    // The symmetric hole: with no difference at all, the p-value against zero is 1, so nothing could
+    // ever breach an `at_least` guardrail however far short of the floor the result sat. Against the
+    // margin, a tight interval around zero proves the +5% floor was missed.
+    const r = evaluateOutcomeGuardrail(
+      quality,
+      vstats({ score: { n: 200, mean: 100, sd: 1 } }),
+      vstats({ score: { n: 200, mean: 100, sd: 1 } }),
+    );
+    expect(r.deltaPct).toBe(0);
+    expect(r.breached).toBe(true);
+    expect(r.direction).toBe('at_least'); // so a caller narrates a MISSED FLOOR, not a regression
+    expect(r.held).toBe(false);
+  });
+
+  it('a cost overrun that is significant vs zero but not vs the margin is not a breach', () => {
+    // +12% cost against a 10% bound, interval roughly [+0.9%, +23.1%]. Significant against zero and
+    // entirely consistent with sitting inside the bound, yet it was narrated as proven past it.
+    const r = evaluateOutcomeGuardrail(
+      cost,
+      vstats({ cost: { n: 50, mean: 1.0, sd: 0.28 } }),
+      vstats({ cost: { n: 50, mean: 1.12, sd: 0.28 } }),
+    );
+    expect(r.deltaPct).toBe(12);
+    expect(r.pointWithinBound).toBe(false);
+    expect(r.breached).toBe(false);
+    expect(r.indeterminate).toBe(true);
+  });
+
+  it('a cost overrun proven past the margin IS a breach, and still vetoes a ship', () => {
+    // The case the guardrail exists for: the whole interval beyond the bound. Removing the p-value
+    // must not remove the veto.
+    const control = vstats({ cost: { n: 500, mean: 1.0, sd: 0.02 }, score: { n: 500, mean: 50, sd: 5 } });
+    const treatment = vstats({ cost: { n: 500, mean: 1.4, sd: 0.02 }, score: { n: 500, mean: 62, sd: 5 } });
+    const r = evaluateOutcomeGuardrail(cost, control, treatment);
+    expect(r.breached).toBe(true);
+    expect(r.direction).toBe('no_worse_than');
+    expect(r.held).toBe(false);
+
+    const out = evaluateExperimentOutcome({
+      control,
+      treatment,
+      objective: { metric: 'quality', target: 5, guardrails: [cost] },
+    });
+    expect(out.primary.significant).toBe(true);   // the primary genuinely won
+    expect(out.verdict).toBe('keep_control');     // and the breach still vetoes the ship
+  });
+
+  it('held and breached are the two ends of one comparison, so never both', () => {
+    const cases: Array<[number, number]> = [[1.0, 1.0], [1.0, 1.05], [1.0, 1.12], [1.0, 1.4], [1.0, 0.5]];
+    for (const [c, t] of cases) {
+      for (const g of [cost, { ...cost, direction: 'at_least' as const }]) {
+        const r = evaluateOutcomeGuardrail(
+          g,
+          vstats({ cost: { n: 200, mean: c, sd: 0.1 } }),
+          vstats({ cost: { n: 200, mean: t, sd: 0.1 } }),
+        );
+        expect(r.held && r.breached).toBe(false);
+        expect(r.indeterminate).toBe(!r.held && !r.breached);
+      }
+    }
+  });
+});
+
 describe('mcnemarTest (paired classifier comparison, DESIGN §5.3)', () => {
   it('returns null when the models never disagree - a real finding, not a 50/50 result', () => {
     // "Do not bother splitting traffic": no online experiment could detect a difference either.

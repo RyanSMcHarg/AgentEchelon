@@ -39,7 +39,6 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
-import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as snsSubs from 'aws-cdk-lib/aws-sns-subscriptions';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
@@ -920,11 +919,6 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           ...dbEnvironment,
           // Phase 1: read the out-of-band analytics row by message id.
           MESSAGE_ANALYTICS_TABLE: messageAnalyticsTable.tableName,
-          // The `@all` responder branch needs the channel member count on the REQUEST path, and this
-          // Lambda is the only component that learns a channel changed size without asking. It writes
-          // the count here so the flow and router read DynamoDB instead of calling Chime per turn.
-          CHANNEL_CONTEXT_TABLE: ssm.StringParameter.valueForStringParameter(
-            this, SHARED_SSM.channelContextName),
         },
         bundling: {
           externalModules: ['@aws-sdk/*'],
@@ -935,56 +929,12 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
       }
     );
 
-    // ─────────────────────────────────────────────────────────────────────────
-    // The channel member count, maintained by event rather than polled per turn.
-    //
-    // WHY THIS LAMBDA WRITES IT. `@all` has exactly one responder and which entry it is depends on
-    // channel size (1:1 -> the Lex entry answers; group -> the flow's bypass answers). Both sides must
-    // agree, and asking Chime on every `@all` turn puts an API call on the request path. This Lambda
-    // consumes the membership events, so it is the only place that learns of a change without asking.
-    //
-    // UpdateItem ONLY, and on one table. It writes two attributes on an item it does not own - the
-    // conversation's private grounding lives on the same row - so the grant is deliberately the
-    // narrowest verb that can do the job. It cannot read that grounding and cannot delete the item.
-    const channelContextTableArn = ssm.StringParameter.valueForStringParameter(
-      this, SHARED_SSM.channelContextArn);
-    archivalLambda.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['dynamodb:UpdateItem'],
-      resources: [channelContextTableArn],
-    }));
-
-    // THE ALARM IS THE POINT, not a nicety. The write is best-effort by design: it must never fail an
-    // archival batch, because an archive record is worth more than a cache entry. That means a broken
-    // write is INVISIBLE - Lambda `Errors` stays at zero, every turn still gets answered via the
-    // live-read fallback, and the only symptom is a quiet rise in Chime API calls. Without this metric
-    // the event path could stop working for weeks and look exactly like success.
-    //
-    // Emitted as EMF from `lib/channel-context-client.ts` so the alarm needs no log-metric-filter and
-    // no prose parsing.
-    const memberCountWriteFailures = new cloudwatch.Metric({
-      namespace: 'AgentEchelon/ChannelMemberCount',
-      metricName: 'WriteFailures',
-      statistic: 'Sum',
-      period: cdk.Duration.minutes(5),
-    });
-    const memberCountAlarm = new cloudwatch.Alarm(this, 'ChannelMemberCountWriteFailureAlarm', {
-      alarmName: `${ANALYTICS_PREFIX}-channel-member-count-write-failures`,
-      alarmDescription:
-        'The channel member count stopped being written from the membership event path. Turns still '
-        + 'answer (the @all responder branch falls back to a live ListChannelMemberships), so this is '
-        + 'a cost and latency regression rather than an outage - and it is invisible without this alarm. '
-        + 'Check the archival Lambda for DynamoDB AccessDenied on the channel-context table.',
-      metric: memberCountWriteFailures,
-      threshold: 1,
-      evaluationPeriods: 1,
-      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
-      // No writes is not a failure: a quiet deployment has no membership changes.
-      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
-    });
-    // Left without an action deliberately when no topic is configured: an alarm that exists and is
-    // visible in the console is the floor, and wiring it to a destination is the deployer's choice.
-    // `memberCountAlarm` is exported below so a deployment can subscribe it.
-    void memberCountAlarm;
+    // NO GRANT ON THE CHANNEL-CONTEXT TABLE, and a grant to cache a member count there needs a reader
+    // first. The obvious one does not exist: the `@all` responder branch resolves channel size through
+    // `lib/channel-size.ts`, which takes a live `ListChannelMemberships` because a count derived from
+    // `channel_membership` collapses assistants into the human roster (a battle channel of three
+    // reports 2). With no write there is nothing to grant, no table env to set, and no write-failure
+    // alarm to raise, so the archival role reaches only the analytics stores it uses.
 
     // Read-only: archival merges the out-of-band analytics over the slim inline metadata.
     messageAnalyticsTable.grantReadData(archivalLambda);

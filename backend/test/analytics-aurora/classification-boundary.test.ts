@@ -169,7 +169,13 @@ describe('classification boundary — the generated SQL', () => {
       const update = statements.findIndex((s) => s.startsWith(`UPDATE ${table} SET classification =`));
       expect(update).toBeGreaterThanOrEqual(0);
       // Only NULL rows, so a re-run is a no-op and a partly-stamped table converges.
-      expect(statements[update]).toContain('WHERE classification IS NULL;');
+      expect(statements[update]).toContain('WHERE classification IS NULL');
+      // BOUNDED. This shares one transaction with every pending migration inside one Lambda
+      // invocation, and on an existing deployment's first upgrade every row is NULL - so unbounded,
+      // it is a whole-table write whose overrun discards the migrations with it. The bootstrap
+      // re-runs on every cold start, so the stamp converges; the rows it has not reached are NULL,
+      // which is stricter than the value it is about to write.
+      expect(statements[update]).toMatch(/LIMIT \d+\);$/);
       // Fail-closed direction: the TOP of the ladder, never the bottom. Stamping 'basic' here would
       // publish every pre-existing summary to every classification in one statement.
       expect(statements[update]).toContain(`'${DEFAULT_PROFILES_CONFIG.classifications.slice(-1)[0].value}'`);
@@ -202,7 +208,7 @@ describe('classification boundary — the generated SQL', () => {
     // `ALTER DEFAULT PRIVILEGES` is in the list because re-granting a default privilege that is
     // already held is a no-op in Postgres, exactly like a repeated GRANT. It is NOT here because it
     // happened to fail the check: it earns its place for the same reason GRANT does.
-    const REENTRANT = /IF NOT EXISTS|OR REPLACE|DROP POLICY IF EXISTS|^GRANT |^ALTER TABLE |^ALTER DEFAULT PRIVILEGES |^CREATE POLICY |^DO \$do\$|^SET LOCAL ROLE |^RESET ROLE;|WHERE classification IS NULL;/m;
+    const REENTRANT = /IF NOT EXISTS|OR REPLACE|DROP POLICY IF EXISTS|^GRANT |^ALTER TABLE |^ALTER DEFAULT PRIVILEGES |^CREATE POLICY |^DO \$do\$|^SET LOCAL ROLE |^RESET ROLE;|WHERE classification IS NULL/m;
     for (const statement of boundaryStatements()) {
       const guarded = REENTRANT.test(statement);
       expect({ statement, guarded }).toEqual({ statement, guarded: true });

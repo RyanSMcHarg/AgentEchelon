@@ -409,6 +409,100 @@ describe('evaluateExperimentOutcome — zero-baseline guard', () => {
   });
 });
 
+// ---------------------------------------------------------------------------
+// A quality verdict is gated on SCORED exchanges, not on traffic.
+//
+// An unscored exchange enters the score sample as a placeholder zero, so two variants with nothing
+// scored both read mean 0, sd 0. Welch takes its degenerate branch (p = 1, not significant), an
+// objective with no target treats the N floor as powered, and the rule reached its last step and
+// called them "equivalent on quality" over zero observations of quality. Equivalence is a claim, and a
+// claim needs evidence: the honest verdict when nothing has been scored is that more is needed.
+// ---------------------------------------------------------------------------
+describe('evaluateExperimentOutcome — scoring coverage gates a score-backed objective', () => {
+  const unscored = (scoredCount?: number): VariantStats => ({
+    // 40 exchanges of traffic, every one of them an unscored placeholder zero.
+    score: { n: 40, mean: 0, sd: 0 },
+    latency: { n: 40, mean: 1200, sd: 300 },
+    cost: { n: 40, mean: 0.002, sd: 0.0005 },
+    tokens: { n: 40, mean: 1500, sd: 200 },
+    ...(scoredCount === undefined ? {} : { scoredCount }),
+  });
+  const scored = (mean: number): VariantStats => ({
+    score: { n: 40, mean, sd: 10 },
+    latency: { n: 40, mean: 1200, sd: 300 },
+    cost: { n: 40, mean: 0.002, sd: 0.0005 },
+    tokens: { n: 40, mean: 1500, sd: 200 },
+    scoredCount: 40,
+  });
+
+  test('nothing scored on either side ⇒ not powered, keep_running, NEVER equivalent', () => {
+    const out = evaluateExperimentOutcome({
+      control: unscored(0),
+      treatment: unscored(0),
+      objective: { metric: 'quality' },
+    });
+    expect(out.primary.powered).toBe(false);
+    expect(out.verdict).toBe('keep_running');
+    expect(out.verdict).not.toBe('equivalent');
+    expect(out.confidence).toBe('low');
+  });
+
+  test('one side scored and the other not is still not a comparison', () => {
+    const out = evaluateExperimentOutcome({
+      control: scored(80),
+      treatment: unscored(0),
+      objective: { metric: 'quality' },
+    });
+    expect(out.primary.powered).toBe(false);
+    expect(out.verdict).toBe('keep_running');
+  });
+
+  test('an accuracy objective reads the same score field, so it is gated the same way', () => {
+    const out = evaluateExperimentOutcome({
+      control: unscored(0),
+      treatment: unscored(0),
+      objective: { metric: 'accuracy' },
+    });
+    expect(out.verdict).toBe('keep_running');
+  });
+
+  test('a metric that does not read the score is NOT gated by scoring coverage', () => {
+    // Cost is measured for every exchange whether or not a judge ever looked at the reply, so an
+    // unscored experiment can still answer a cost question. Gating it would withhold a real result.
+    const out = evaluateExperimentOutcome({
+      control: { ...unscored(0), cost: { n: 40, mean: 0.002, sd: 0.0001 } },
+      treatment: { ...unscored(0), cost: { n: 40, mean: 0.001, sd: 0.0001 } },
+      objective: { metric: 'cost' },
+    });
+    expect(out.primary.powered).toBe(true);
+    expect(out.verdict).toBe('promote_treatment');
+  });
+
+  test('scored and genuinely indistinguishable ⇒ equivalent, which is a real answer', () => {
+    // The gate must not swallow equivalence: with the scoring actually done, "no difference" stands.
+    const out = evaluateExperimentOutcome({
+      control: scored(80),
+      treatment: scored(80),
+      objective: { metric: 'quality' },
+    });
+    expect(out.primary.powered).toBe(true);
+    expect(out.primary.significant).toBe(false);
+    expect(out.verdict).toBe('equivalent');
+  });
+
+  test('a caller that reports no coverage has none inferred for it', () => {
+    // scoredCount is optional, and absent means UNKNOWN rather than zero. A pure function cannot
+    // invent scoring coverage, so the gate stays off and the older behaviour is unchanged.
+    const out = evaluateExperimentOutcome({
+      control: unscored(),
+      treatment: unscored(),
+      objective: { metric: 'quality' },
+    });
+    expect(out.primary.powered).toBe(true);
+    expect(out.verdict).toBe('equivalent');
+  });
+});
+
 describe('poolGroups — degenerate-input exclusion', () => {
   test('drops n=0 and NaN-mean groups; pools only the valid one, result finite', () => {
     const pooled = poolGroups([

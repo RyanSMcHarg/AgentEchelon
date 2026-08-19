@@ -615,9 +615,12 @@ export interface PrimaryEval {
  *
  * The three states are distinct and all three are worth showing:
  *  - `held`      - proven within the margin. A ship may proceed.
- *  - `breached`  - significantly past the margin. A ship is vetoed.
+ *  - `breached`  - proven past the margin. A ship is vetoed.
  *  - neither     - `indeterminate`: the data cannot support either claim. A ship must NOT proceed,
  *                  and the honest reason is "not enough evidence", not "the guardrail passed".
+ *
+ * `held` and `breached` are the two ends of the SAME comparison, the confidence interval against the
+ * bound, so they are mutually exclusive and everything between them is indeterminate.
  */
 export interface GuardrailEval {
   metric: string;
@@ -625,8 +628,11 @@ export interface GuardrailEval {
   bound: number;
   /** NON-INFERIORITY: the CI on the difference lies entirely within the margin. Required to ship. */
   held: boolean;
-  /** Significantly past the margin. Vetoes a ship. */
+  /** Proven past the margin: the CI on the difference lies entirely beyond the bound. Vetoes a ship. */
   breached: boolean;
+  /** The guardrail's own direction, carried so a caller can narrate a breach as what it is: a
+   *  `no_worse_than` breach is a regression past a ceiling, an `at_least` breach is a miss of a floor. */
+  direction?: 'no_worse_than' | 'at_least';
   /** The point estimate alone is within bound. DISPLAY ONLY - never sufficient to ship. */
   pointWithinBound: boolean;
   /** Neither proven within the margin nor proven past it: too little evidence to claim either. */
@@ -661,7 +667,7 @@ export interface VerdictResult {
  *
  * Order:
  *  1. Underpowered (not enough data) → keep_running, regardless of point estimate.
- *  2. Guardrail breach (significant regression past a bound) vetoes a ship → keep_control.
+ *  2. Guardrail breach (the CI on the difference lies entirely past the bound) vetoes a ship → keep_control.
  *  3. Primary significant + treatment favored + guardrails held → promote_treatment.
  *  4. Primary significant + control favored → keep_control.
  *  5. Enough data, no significant primary difference → equivalent.
@@ -758,10 +764,32 @@ export interface VariantStats {
   latency: GroupStat;
   cost: GroupStat;
   tokens: GroupStat;
+  /**
+   * How many of the variant's exchanges an evaluator actually SCORED.
+   *
+   * Distinct from `score.n`, which counts exchanges: an unscored exchange enters the score sample as a
+   * placeholder zero, so `score.n` measures traffic while this measures evidence. A score-backed
+   * objective is sufficiency-gated on this (see {@link evaluateExperimentOutcome}).
+   *
+   * Optional because a caller that cannot report scoring coverage must not have one inferred for it;
+   * absent leaves the gate off. The analytics read supplies it for every variant.
+   */
+  scoredCount?: number;
 }
 
+/**
+ * The fields of {@link VariantStats} that carry a pooled measurement, derived rather than listed.
+ *
+ * A metric axis indexes a variant to get something with `mean`/`sd`/`n`, so it must never be able to
+ * name a field that holds anything else. `keyof VariantStats` was that type until `scoredCount` was
+ * added, at which point every axis read widened to `GroupStat | number | undefined` and the whole
+ * module stopped compiling. Deriving the key set means the next scalar added here cannot reintroduce
+ * that: a non-`GroupStat` field maps to `never` and drops out.
+ */
+export type MetricStatKey = { [K in keyof VariantStats]-?: VariantStats[K] extends GroupStat ? K : never }[keyof VariantStats];
+
 /** Which pooled stat a metric reads, and whether higher is better (its good-direction). */
-export function metricAxis(metric: ObjectiveMetric): { key: keyof VariantStats; higherIsBetter: boolean; label: string } {
+export function metricAxis(metric: ObjectiveMetric): { key: MetricStatKey; higherIsBetter: boolean; label: string } {
   switch (metric) {
     case 'latency':
       return { key: 'latency', higherIsBetter: false, label: 'latency' };
@@ -779,10 +807,18 @@ const round1 = (n: number): number => Math.round(n * 10) / 10;
 const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
 
 /**
- * Evaluate one guardrail against the two variants (§4.2-A/B). `held` is the
- * point-estimate check (within bound, applying the metric's good-direction AND the
- * guardrail direction); `breached` additionally requires the regression to be
- * SIGNIFICANT, so only a real regression vetoes a ship — noise never blocks a winner.
+ * Evaluate one guardrail against the two variants (§4.2-A/B).
+ *
+ * BOTH claims are made against the BOUND, using the confidence interval on the difference:
+ * `held` when the whole interval sits on the acceptable side of the margin, `breached` when the whole
+ * interval sits beyond it. `pointWithinBound` is the point estimate, kept for display only.
+ *
+ * A guardrail states a MARGIN, so the significance that matters is significance against that margin,
+ * never against zero. Testing the p-value against zero answers a different question and answers it
+ * wrongly in both directions: a treatment proven to improve 3% against an `at_least 5` floor is a
+ * significant difference from zero and was reported as a breach, while a cost 12% over a 10% bound
+ * with an interval of +1% to +23% is significantly different from zero yet entirely consistent with
+ * sitting inside the bound, and was reported as proven past it.
  */
 export function evaluateOutcomeGuardrail(
   g: OutcomeGuardrail,
@@ -796,14 +832,13 @@ export function evaluateOutcomeGuardrail(
   const base = Math.abs(c.mean);
   const deltaPct = base !== 0 ? (welch.delta / base) * 100 : 0;
 
-  // The point-estimate check, kept for display and as the breach input.
+  // The point-estimate check. DISPLAY ONLY: it neither establishes the guardrail nor breaks it.
   let pointWithinBound: boolean;
   if (g.direction === 'no_worse_than') {
     pointWithinBound = axis.higherIsBetter ? deltaPct >= -g.bound : deltaPct <= g.bound;
   } else {
     pointWithinBound = axis.higherIsBetter ? deltaPct >= g.bound : deltaPct <= -g.bound;
   }
-  const breached = !pointWithinBound && welch.pValue < 0.05;
 
   // NON-INFERIORITY. Take the WORST case still consistent with the data and require even that to sit
   // within the margin. Which end is "worst" depends on the metric's good-direction: for a
@@ -814,8 +849,9 @@ export function evaluateOutcomeGuardrail(
   // backwards: thin data should block a ship, not wave it through.
   const ciPctLo = base !== 0 ? (welch.ci[0] / base) * 100 : Number.NaN;
   const ciPctHi = base !== 0 ? (welch.ci[1] / base) * 100 : Number.NaN;
+  const usableCi = Number.isFinite(ciPctLo) && Number.isFinite(ciPctHi);
   let held: boolean;
-  if (!Number.isFinite(ciPctLo) || !Number.isFinite(ciPctHi)) {
+  if (!usableCi) {
     // No usable baseline to express a percentage against, so no non-inferiority claim is possible.
     held = false;
   } else if (g.direction === 'no_worse_than') {
@@ -824,12 +860,30 @@ export function evaluateOutcomeGuardrail(
     held = axis.higherIsBetter ? ciPctLo >= g.bound : ciPctHi <= -g.bound;
   }
 
+  // THE BREACH IS THE MIRROR OF `held`, AGAINST THE SAME BOUND: the whole interval on the failing side
+  // of the margin, so the BEST case still consistent with the data already fails the guardrail. An
+  // interval that straddles the bound proves neither claim and falls through to `indeterminate`, which
+  // blocks a ship without pretending a regression was demonstrated.
+  //
+  // The failing side follows the guardrail's own direction. For `no_worse_than` it is the damaging
+  // end running past the margin; for `at_least` it is the whole interval short of the floor, which is
+  // a MISS of a required improvement rather than a regression, and is narrated as such.
+  let breached: boolean;
+  if (!usableCi) {
+    breached = false;
+  } else if (g.direction === 'no_worse_than') {
+    breached = axis.higherIsBetter ? ciPctHi < -g.bound : ciPctLo > g.bound;
+  } else {
+    breached = axis.higherIsBetter ? ciPctHi < g.bound : ciPctLo > -g.bound;
+  }
+
   return {
     metric: axis.label,
     deltaPct: round1(deltaPct),
     bound: g.bound,
     held,
     breached,
+    direction: g.direction,
     pointWithinBound,
     indeterminate: !held && !breached,
   };
@@ -883,6 +937,22 @@ export function evaluateExperimentOutcome(input: {
   if (objective && Number.isFinite(objective.target) && objective.target !== 0) {
     const mdeAbs = (Math.abs(objective.target as number) / 100) * Math.abs(c.mean);
     powered = requiredSampleForMean(c.sd, mdeAbs, minN).powered;
+  }
+
+  // SUFFICIENCY, ON THE MEASUREMENT RATHER THAN ON THE TRAFFIC.
+  //
+  // A score-backed objective (quality, accuracy) reads the evaluator score, and an exchange nobody
+  // scored enters that sample as a placeholder zero. A variant with nothing scored therefore reports
+  // mean 0 and sd 0 on both sides: Welch takes its degenerate branch, p reads 1, nothing is
+  // significant, and with no target the power check is the N floor, which counts EXCHANGES and is
+  // satisfied by traffic alone. The rule then reaches its last step and calls two entirely unmeasured
+  // variants "equivalent on quality" - a verdict computed from zero observations of the metric.
+  //
+  // Scoring coverage is the evidence here, so a comparison needs at least one scored exchange on EACH
+  // side; with none, no power claim is possible and the honest state is not powered, which the
+  // decision rule reports as keep_running (not enough evidence yet) rather than as an answer.
+  if (axis.key === 'score' && control.scoredCount != null && treatment.scoredCount != null) {
+    if (Math.min(control.scoredCount, treatment.scoredCount) <= 0) powered = false;
   }
 
   const primary: PrimaryEval = {

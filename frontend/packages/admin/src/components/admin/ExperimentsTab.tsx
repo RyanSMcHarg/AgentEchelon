@@ -91,6 +91,43 @@ function computeConflicts(
   });
 }
 
+/** Is this blocker still something the operator can resolve?
+ *
+ *  A 409 body names the experiments the SERVER believes hold the classification, and that belief is
+ *  read from an eventually-consistent scan. Right after an End/Pause/Delete the freed row can still
+ *  come back in a conflict body, so a retried create can be told it is blocked by an experiment that
+ *  has already completed. Presenting that row asks the operator to resolve something already
+ *  resolved, and its End/Pause buttons act on a terminal experiment.
+ *
+ *  The rule is the live half of `computeConflicts`: only an `active` experiment inside its own window
+ *  occupies a classification. Anything else is stale and is dropped rather than shown. */
+export function isResolvableBlocker(e: Experiment, now: number): boolean {
+  if (e.status !== 'active') return false;
+  if (e.startDate && new Date(e.startDate).getTime() > now) return false;
+  if (e.endDate && new Date(e.endDate).getTime() <= now) return false;
+  return true;
+}
+
+/** The subset of a 409's named blockers that is genuinely outstanding work for the operator.
+ *
+ *  Two ways a candidate is already dealt with, and both produce the same defect if presented: the
+ *  panel demands an End/Pause/Delete on an experiment that has already completed, and the operator is
+ *  told to resolve something they just resolved.
+ *
+ *   - `alreadyResolved` holds the ids this conflict flow has freed. The auto-retry re-checks
+ *     server-side against an eventually-consistent read, so a freed row can be named again.
+ *   - `isResolvableBlocker` drops a candidate the body itself reports as terminal, paused, expired or
+ *     not yet started; none of those occupy a classification. */
+export function presentableBlockers(
+  candidates: Experiment[],
+  alreadyResolved: string[],
+  now: number,
+): Experiment[] {
+  return candidates.filter(
+    (c) => !alreadyResolved.includes(c.experimentId) && isResolvableBlocker(c, now),
+  );
+}
+
 /** Consequence copy for a confirmed lifecycle action (§3.2.1, verbatim from the design's table). */
 function confirmCopy(kind: 'end' | 'pause' | 'delete', id: string): string {
   switch (kind) {
@@ -226,6 +263,11 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
   // offer End / Pause / Delete — each behind a confirm dialog — then auto-retry the create.
   const [pendingCreate, setPendingCreate] = useState<Omit<Experiment, 'createdAt'> | null>(null);
   const [conflicts, setConflicts] = useState<Experiment[] | null>(null);
+  // The blockers this flow has already freed. The auto-retry re-checks server-side against an
+  // eventually-consistent read, so a just-ended experiment can come back in the next 409 body; it is
+  // filtered out here rather than re-presented as work the operator still owes. Cleared when the flow
+  // ends (create succeeds, or the panel is cancelled).
+  const [resolvedBlockerIds, setResolvedBlockerIds] = useState<string[]>([]);
   // Confirm dialog for a single destructive/lifecycle action (from the conflict panel OR the table).
   const [confirm, setConfirm] = useState<
     | { kind: 'end' | 'pause' | 'delete'; exp: Experiment; ran: boolean; decision: DecisionOutcome; note: string }
@@ -519,13 +561,21 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
   // Create, handling the type-exclusion 409 (§3.2.1): on conflict we surface the blocker(s) and hold
   // the payload so a resolution auto-retries it. apiCall exposes only the 409's error string, so the
   // blockers are derived from the already-loaded list by tier overlap (computeConflicts).
-  async function submitCreate(payload: Omit<Experiment, 'createdAt'>) {
+  //
+  // `alreadyResolved` is passed EXPLICITLY by the auto-retry rather than read from state: the retry
+  // runs in the same tick as the `setResolvedBlockerIds` that recorded the resolution, so the closure
+  // still holds the pre-resolution array and the just-ended blocker would be re-presented.
+  async function submitCreate(
+    payload: Omit<Experiment, 'createdAt'>,
+    alreadyResolved: string[] = resolvedBlockerIds,
+  ) {
     try {
       setActionError(null);
       await createExperiment(payload);
       setShowCreate(false);
       setPendingCreate(null);
       setConflicts(null);
+      setResolvedBlockerIds([]);
       resetCreateForm();
       await loadExperiments();
     } catch (error) {
@@ -533,15 +583,20 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
         // Prefer the server's own `conflicts` body (deterministic) over re-deriving from the
         // loaded list, which races the list-load right after the blocker was created. The 409
         // conflicts are the active blockers, so stamp status:'active' (the panel needs it for
-        // the End/Pause "ran" decision). Fall back to the list derivation if the body is absent.
+        // the End/Pause "ran" decision) only where the body says nothing. Fall back to the list
+        // derivation if the body is absent.
         const serverConflicts = Array.isArray((error.body as { conflicts?: unknown[] } | undefined)?.conflicts)
           ? ((error.body as { conflicts: Array<Partial<Experiment>> }).conflicts).map(
               (c) => ({ status: 'active', tiers: [], variants: [], ...c }) as Experiment,
             )
           : [];
-        const blockers = serverConflicts.length > 0
+        const candidates = serverConflicts.length > 0
           ? serverConflicts
           : computeConflicts(payload.tiers, payload.experimentId, experiments, payload.experimentType);
+        // A candidate the operator has already freed, or one the body itself reports as terminal or
+        // outside its window, is a stale read, not outstanding work. Dropping it is what keeps the
+        // panel from demanding an End on a completed experiment.
+        const blockers = presentableBlockers(candidates, alreadyResolved, Date.now());
         if (blockers.length > 0) {
           setPendingCreate(payload);
           setConflicts(blockers);
@@ -551,6 +606,18 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
           // panel/dialog, which overlaps their controls. The payload is held in
           // pendingCreate and auto-retried on resolution, so nothing is lost.
           setShowCreate(false);
+          return;
+        }
+        if (candidates.length > 0) {
+          // Every named blocker is already resolved: the classification is free and the server's read
+          // has not caught up. Say that, and put the create form back with the operator's values
+          // still in it, so the retry is one click rather than a hunt for a conflict that is gone.
+          setConflicts(null);
+          setPendingCreate(null);
+          setShowCreate(true);
+          setActionError(
+            'The blocking experiment is already resolved. The classification frees within a few seconds; create again.',
+          );
           return;
         }
       }
@@ -582,22 +649,30 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
         await deleteExperiment(exp.experimentId);
       }
       setConfirm(null);
+      // Remembered for the auto-retry below: this experiment no longer holds the classification, so a
+      // 409 body that still names it is a lagging read and must not be presented as work to do.
+      const resolvedIds = resolvedBlockerIds.includes(exp.experimentId)
+        ? resolvedBlockerIds
+        : [...resolvedBlockerIds, exp.experimentId];
+      setResolvedBlockerIds(resolvedIds);
       const fresh = await listExperiments();
       setExperiments(fresh);
       if (pendingCreate) {
-        // Exclude the experiment we JUST resolved: the list read is an eventually-consistent scan
-        // that may still show it active for a moment, but we know End/Pause/Delete freed the
-        // classification — so the auto-retry must not race that lag and spuriously re-show the panel.
+        // Exclude EVERY experiment this flow has resolved, not just the last one: the list read is an
+        // eventually-consistent scan that may still show any of them active for a moment, but
+        // End/Pause/Delete freed the classification, so the auto-retry must not race that lag and
+        // spuriously re-show the panel.
         const remaining = computeConflicts(
           pendingCreate.tiers,
           pendingCreate.experimentId,
-          fresh.filter((e) => e.experimentId !== exp.experimentId),
+          fresh.filter((e) => !resolvedIds.includes(e.experimentId)),
           pendingCreate.experimentType,
         );
         if (remaining.length === 0) {
           const retry = pendingCreate;
           setConflicts(null);
-          await submitCreate(retry); // classification is free — auto-retry the original create
+          // classification is free: auto-retry the original create, telling it what is already freed
+          await submitCreate(retry, resolvedIds);
         } else {
           setConflicts(remaining);
         }
@@ -739,7 +814,10 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
               </div>
             </div>
           ))}
-          <button className="admin-inline-btn" onClick={() => { setConflicts(null); setPendingCreate(null); }}>
+          <button
+            className="admin-inline-btn"
+            onClick={() => { setConflicts(null); setPendingCreate(null); setResolvedBlockerIds([]); }}
+          >
             Cancel
           </button>
         </div>
@@ -1362,6 +1440,10 @@ interface VariantAgg {
   variant_id: string;
   model_name: string;
   exchange_count: number;
+  /** Exchanges an evaluator scored. Shown beside the sample because avg_score counts an unscored
+   *  exchange as zero, so the two numbers together say how much of the mean is quality and how much
+   *  is scoring coverage. */
+  scored_count: number;
   task_count: number;
   avg_score: number | null;
   avg_total_ms: number | null;
@@ -1391,7 +1473,7 @@ interface ExperimentGroup {
 /** Weighted aggregate of a variant's rows (by exchange_count), null-aware. */
 function aggregateVariant(rows: ExperimentResultRow[]): VariantAgg {
   let wScore = 0, wLat = 0, wCost = 0, wComp = 0, wFb = 0, wTask = 0;
-  let exch = 0, taskCount = 0;
+  let exch = 0, scored = 0, taskCount = 0;
   let scoreN = 0, latN = 0, costN = 0, compN = 0, fbN = 0, taskN = 0;
   // Thumbs + battle wins are raw counts at the (variant,intent) row grain — sum
   // straight to the variant total, then derive approval % from the totals.
@@ -1399,6 +1481,8 @@ function aggregateVariant(rows: ExperimentResultRow[]): VariantAgg {
   for (const r of rows) {
     const n = Number(r.exchange_count) || 0;
     exch += n;
+    // A count of scored exchanges, so it sums straight across the rows and is never weighted.
+    scored += Number(r.scored_count) || 0;
     taskCount += Number(r.task_count) || 0;
     thumbsUp += Number(r.thumbs_up) || 0;
     fbCount += Number(r.feedback_count) || 0;
@@ -1418,6 +1502,7 @@ function aggregateVariant(rows: ExperimentResultRow[]): VariantAgg {
     variant_id: rows[0]?.variant_id ?? 'unknown',
     model_name: rows[0]?.model_name ?? 'unknown',
     exchange_count: exch,
+    scored_count: scored,
     task_count: taskCount,
     avg_score: avg(wScore, scoreN),
     avg_total_ms: avg(wLat, latN, 0),
@@ -1973,6 +2058,16 @@ function ExperimentComparison({
               <DrillBtn axis="metrics" variantId="treatment" n={treatment.exchange_count} />
             </span>
           </div>
+
+          {/* Traffic and evidence are different numbers. The quality mean counts an unscored exchange
+              as zero, so a sample of 40 with 3 scored is mostly scoring coverage, and a quality
+              verdict over nothing scored is no verdict at all. Stated rather than left to be inferred
+              from a mean that looks low. */}
+          <div className="exp-metric-row exp-metric-row--sample">
+            <span className="exp-metric-val">{control.scored_count.toLocaleString()}</span>
+            <span className="exp-metric-label">Scored by the evaluator</span>
+            <span className="exp-metric-val">{treatment.scored_count.toLocaleString()}</span>
+          </div>
         </>
       ) : (
         <p className="admin-tab-description">
@@ -2141,7 +2236,9 @@ interface RecommendationView {
     significant: boolean;
     powered: boolean;
   };
-  guardrails?: Array<{ metric: string; deltaPct: number; bound: number; held: boolean }>;
+  /** Three states, not two: held, breached, or neither, which is "not established". `breached` is sent
+   *  because it cannot be derived from `held`, and older payloads omit it (treated as not breached). */
+  guardrails?: Array<{ metric: string; deltaPct: number; bound: number; held: boolean; breached?: boolean }>;
   human?: { picks: number; winRate: number; ci: [number, number]; significant: boolean };
   recommendedVsChosen?: { recommended: string; chosen?: DecisionOutcome };
   variants?: Array<{ exchange_count: number }>;
@@ -2210,11 +2307,18 @@ function RecommendationCard({
 
       {reco.guardrails && reco.guardrails.length > 0 && (
         <div className="exp-reco-guardrails">
-          {reco.guardrails.map((g, i) => (
-            <span className="exp-reco-guardrail" data-status={g.held ? 'held' : 'breached'} key={i}>
-              {g.metric} {g.deltaPct >= 0 ? '+' : ''}{g.deltaPct.toFixed(1)}% (bound {g.bound}%): {g.held ? 'held' : 'breached'}
-            </span>
-          ))}
+          {/* A guardrail has three states, and rendering `!held` as "breached" reported the middle one
+              as a proven regression: an interval too wide to place either side of the bound is "not
+              established", which blocks a ship without claiming harm was demonstrated. */}
+          {reco.guardrails.map((g, i) => {
+            const status = g.held ? 'held' : g.breached ? 'breached' : 'not-established';
+            const label = g.held ? 'held' : g.breached ? 'breached' : 'not established';
+            return (
+              <span className="exp-reco-guardrail" data-status={status} key={i}>
+                {g.metric} {g.deltaPct >= 0 ? '+' : ''}{g.deltaPct.toFixed(1)}% (bound {g.bound}%): {label}
+              </span>
+            );
+          })}
         </div>
       )}
 

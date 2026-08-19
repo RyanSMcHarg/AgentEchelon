@@ -181,6 +181,9 @@ export interface ExperimentResultRow {
   intent: string;
   agent_type: string;
   exchange_count: number;
+  /** Exchanges an evaluator actually scored. `exchange_count` is traffic, this is the evidence behind
+   *  `avg_score`, and the two differ whenever scoring lags: an unscored exchange counts as 0 in the mean. */
+  scored_count: number;
   avg_score: number;
   avg_total_ms: number;
   p95_total_ms: number;

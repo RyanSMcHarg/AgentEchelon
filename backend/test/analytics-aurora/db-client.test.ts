@@ -155,4 +155,114 @@ describe('DB Client', () => {
       expect(firstMigrationIdx).toBeGreaterThan(lockIdx);
     });
   });
+
+  /**
+   * RESUMABLE MIGRATIONS.
+   *
+   * Every pending file plus the classification boundary runs in ONE transaction, in ONE Lambda
+   * invocation, and `ensureSchema` rethrows with nothing committed if that invocation runs out. A data
+   * backfill over an existing table is the one migration shape whose cost scales with the deployment,
+   * so it does a BOUNDED batch and reports what is left in `_migration_progress`. The runner has to
+   * honour that report: recording the file as applied after one batch strands every remaining row,
+   * which is a migration marked done whose effect is partial.
+   */
+  describe('resumable migrations', () => {
+    const RESUMABLE = '002-resumable-backfill.sql';
+    const DONE = '001-initial.sql';
+    const EMPTY = { rows: [] as any[], rowCount: 0, command: '', oid: 0, fields: [] };
+
+    /** Drive the mocked client so `_migration_progress` answers `remaining` for the resumable file. */
+    function withRemaining(remaining: string | null) {
+      const pg = require('pg');
+      const fsMock = require('fs');
+      fsMock.readdirSync.mockReturnValue([RESUMABLE, DONE].sort());
+      pg.__mockClient.query.mockImplementation((sql: string, params?: any[]) => {
+        if (/FROM _migration_progress/.test(sql)) {
+          const isResumable = params?.[0] === RESUMABLE;
+          // BIGINT comes back from node-pg as a STRING, which is the detail a `> 0` on the raw value
+          // would get wrong.
+          return Promise.resolve(
+            isResumable && remaining !== null
+              ? { ...EMPTY, rows: [{ remaining }], rowCount: 1 }
+              : EMPTY,
+          );
+        }
+        return Promise.resolve(EMPTY);
+      });
+      return pg;
+    }
+
+    /** Filenames this run recorded as applied. */
+    function recorded(pg: any): string[] {
+      return pg.__mockClient.query.mock.calls
+        .filter((c: any[]) => /INSERT INTO _migrations/.test(String(c[0])))
+        .map((c: any[]) => c[1][0]);
+    }
+
+    afterEach(() => {
+      const pg = require('pg');
+      const fsMock = require('fs');
+      pg.__mockClient.query.mockReset();
+      pg.__mockClient.query.mockResolvedValue(EMPTY);
+      fsMock.readdirSync.mockReturnValue(['001-initial.sql', '002-pgvector.sql']);
+    });
+
+    it('leaves a file that still has rows to convert PENDING, so the next cold start resumes it', async () => {
+      const pg = withRemaining('4200');
+      const { ensureSchema } = await import('../../lambda/src/analytics-aurora/db-client');
+
+      await ensureSchema();
+
+      // The batch itself committed with the transaction; what is withheld is the claim that the file
+      // is finished. Without that, the remaining 4200 rows are never converted by anything.
+      expect(recorded(pg)).toEqual([DONE]);
+      expect(recorded(pg)).not.toContain(RESUMABLE);
+    });
+
+    it('still applies the files after it, so a long backfill does not block the schema', async () => {
+      const pg = withRemaining('4200');
+      const { ensureSchema } = await import('../../lambda/src/analytics-aurora/db-client');
+
+      await ensureSchema();
+
+      // 001 sorts before 002 here, so prove the ordering claim directly: the pending file that
+      // reported work left is not a barrier - `001-initial.sql` is still recorded in the same run.
+      const calls = pg.__mockClient.query.mock.calls.map((c: any[]) => String(c[0]));
+      expect(calls).toContain('COMMIT');
+      expect(recorded(pg)).toContain(DONE);
+    });
+
+    it('records the file once nothing remains', async () => {
+      const pg = withRemaining('0');
+      const { ensureSchema } = await import('../../lambda/src/analytics-aurora/db-client');
+
+      await ensureSchema();
+
+      expect(recorded(pg).sort()).toEqual([DONE, RESUMABLE].sort());
+    });
+
+    it('treats a file that reports no progress at all as finished — every ordinary migration', async () => {
+      // A missing `_migration_progress` row must not leave plain DDL pending forever, re-applying on
+      // every cold start.
+      const pg = withRemaining(null);
+      const { ensureSchema } = await import('../../lambda/src/analytics-aurora/db-client');
+
+      await ensureSchema();
+
+      expect(recorded(pg).sort()).toEqual([DONE, RESUMABLE].sort());
+    });
+
+    it('creates the progress table before it reads one, so a fresh cluster is not a special case', async () => {
+      const pg = withRemaining(null);
+      const { ensureSchema } = await import('../../lambda/src/analytics-aurora/db-client');
+
+      await ensureSchema();
+
+      const calls = pg.__mockClient.query.mock.calls.map((c: any[]) => String(c[0]));
+      const create = calls.findIndex((s: string) => /CREATE TABLE IF NOT EXISTS _migration_progress/.test(s));
+      const read = calls.findIndex((s: string) => /SELECT remaining FROM _migration_progress/.test(s));
+      expect(create).toBeGreaterThanOrEqual(0);
+      expect(read).toBeGreaterThan(create);
+    });
+  });
 });

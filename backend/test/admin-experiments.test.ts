@@ -19,6 +19,7 @@ jest.mock(
     ScanCommand: jest.fn().mockImplementation((a) => ({ __t: 'Scan', input: a })),
     PutCommand: jest.fn().mockImplementation((a) => ({ __t: 'Put', input: a })),
     UpdateCommand: jest.fn().mockImplementation((a) => ({ __t: 'Update', input: a })),
+    DeleteCommand: jest.fn().mockImplementation((a) => ({ __t: 'Delete', input: a })),
     GetCommand: jest.fn(),
   }),
   { virtual: true },
@@ -350,5 +351,207 @@ describe('admin-experiments handler', () => {
       }),
     );
     expect(bad.statusCode).toBe(400);
+  });
+});
+
+/**
+ * Every lifecycle write in this handler is a read-modify-write: the row is read, one entry is
+ * appended to the append-only `transitions` audit (L7), and the WHOLE array is written back.
+ * `attribute_exists(experimentId)` only asserts the row still exists, so two overlapping admin
+ * actions both read N entries, both append their own, and the second write lands N+1 entries with
+ * the first action's entry gone - the audit silently loses a status change while both callers are
+ * told 200. Pinning each write to the status AND audit length it was decided from is the same
+ * idiom `advanceTaskStateTo` uses (task-transition-concurrency.test.ts in this dir).
+ */
+describe('admin-experiments: optimistic concurrency on the lifecycle audit', () => {
+  const conditionalFailure = () =>
+    Object.assign(new Error('The conditional request failed'), {
+      name: 'ConditionalCheckFailedException',
+    });
+
+  const statusEvent = (body: unknown) =>
+    evt({
+      httpMethod: 'POST',
+      path: '/admin/experiments/exp-1/status',
+      pathParameters: { experimentId: 'exp-1' },
+      body,
+    });
+
+  const storedActive = (transitions: unknown[] = []) => ({
+    ...baseExp,
+    status: 'active',
+    transitions,
+  });
+
+  it('POST {id}/status pins the write to the status and audit length it read', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: storedActive([{ from: 'create', to: 'active', by: 'a', at: 't0' }]) })
+      .mockResolvedValueOnce({});
+    const r = await handler(statusEvent({ status: 'paused' }));
+    expect(r.statusCode).toBe(200);
+
+    const upd = mockDdbSend.mock.calls.find((c) => c[0].__t === 'Update')![0];
+    // Without both clauses the write is unguarded against a concurrent writer: the status clause
+    // catches a competing transition, the audit-length clause catches a competing EDIT that appends
+    // without changing status.
+    expect(upd.input.ConditionExpression).toContain('#s = :expectedStatus');
+    expect(upd.input.ConditionExpression).toContain('size(#t) = :expectedTransitions');
+    expect(upd.input.ExpressionAttributeValues[':expectedStatus']).toBe('active');
+    expect(upd.input.ExpressionAttributeValues[':expectedTransitions']).toBe(1);
+    // The audit still grows by exactly the one entry this request appends.
+    expect((upd.input.ExpressionAttributeValues[':t'] as unknown[]).length).toBe(2);
+  });
+
+  it('POST {id}/status → 409 EXPERIMENT_CONCURRENT_MODIFICATION when another writer lands first', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: storedActive() }) // the read this transition was decided from
+      .mockRejectedValueOnce(conditionalFailure()) // another admin action wrote in between
+      .mockResolvedValueOnce({ Item: { ...baseExp, status: 'completed' } }); // re-read: where it actually is
+    const r = await handler(statusEvent({ status: 'paused' }));
+
+    // Reporting this as "not found" would be a lie about a row that exists, and reporting 200 would
+    // claim a status change that was never applied.
+    expect(r.statusCode).toBe(409);
+    const body = JSON.parse(r.body);
+    expect(body.code).toBe('EXPERIMENT_CONCURRENT_MODIFICATION');
+    expect(body.currentStatus).toBe('completed');
+    expect(body.from).toBe('active');
+    expect(body.to).toBe('paused');
+  });
+
+  it('POST {id}/status → still 404 when the guard fails because the row is gone', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: storedActive() })
+      .mockRejectedValueOnce(conditionalFailure())
+      .mockResolvedValueOnce({}); // re-read: the row was deleted
+    const r = await handler(statusEvent({ status: 'paused' }));
+    expect(r.statusCode).toBe(404);
+  });
+
+  it('DELETE (soft tombstone) pins its write to the audit it is preserving', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: storedActive([{ from: 'create', to: 'active', by: 'a', at: 't0' }]) })
+      .mockResolvedValueOnce({});
+    const r = await handler(
+      evt({ httpMethod: 'DELETE', pathParameters: { experimentId: 'exp-1' } }),
+    );
+    expect(r.statusCode).toBe(200);
+    expect(JSON.parse(r.body).mode).toBe('soft');
+    const upd = mockDdbSend.mock.calls.find((c) => c[0].__t === 'Update')![0];
+    expect(upd.input.ConditionExpression).toContain('#s = :expectedStatus');
+    expect(upd.input.ConditionExpression).toContain('size(#t) = :expectedTransitions');
+    expect(upd.input.ExpressionAttributeValues[':expectedTransitions']).toBe(1);
+  });
+
+  it('DELETE (hard) refuses to erase a draft that was activated between the read and the write', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseExp, status: 'draft' } })
+      .mockRejectedValueOnce(conditionalFailure())
+      .mockResolvedValueOnce({ Item: { ...baseExp, status: 'active' } });
+    const r = await handler(
+      evt({ httpMethod: 'DELETE', pathParameters: { experimentId: 'exp-1' } }),
+    );
+    const del = mockDdbSend.mock.calls.find((c) => c[0].__t === 'Delete')![0];
+    expect(del.input.ConditionExpression).toContain('#s = :expectedStatus');
+    expect(del.input.ExpressionAttributeValues[':expectedStatus']).toBe('draft');
+    // The row is no longer the never-started draft the hard delete was chosen for.
+    expect(r.statusCode).toBe(409);
+    expect(JSON.parse(r.body).code).toBe('EXPERIMENT_CONCURRENT_MODIFICATION');
+  });
+
+  it('POST upsert (edit) pins the row rewrite, so it cannot revive a concurrently paused experiment', async () => {
+    mockDdbSend.mockResolvedValueOnce({
+      Item: storedActive([{ from: 'create', to: 'active', by: 'a', at: 't0' }]),
+    });
+    mockDdbSend.mockResolvedValue({ Items: [] }); // active-count scan, conflict scan, then the Put
+    const r = await handler(evt({ httpMethod: 'POST', body: baseExp }));
+    expect(r.statusCode).toBe(200);
+    const put = mockDdbSend.mock.calls.find((c) => c[0].__t === 'Put')![0];
+    // An edit writes the whole row back, including the status it read: unpinned, an edit racing a
+    // Pause writes `active` back over the pause and drops the pause's audit entry.
+    expect(put.input.ConditionExpression).toContain('#s = :expectedStatus');
+    expect(put.input.ConditionExpression).toContain('size(#t) = :expectedTransitions');
+    expect(put.input.ExpressionAttributeValues[':expectedStatus']).toBe('active');
+  });
+
+  it('POST create (no prior row) stays unconditional so an idempotent re-create still writes', async () => {
+    // The create/edit decision is made from an eventually-consistent read, so conditioning a create
+    // on the row's absence would reject legitimate retries.
+    mockDdbSend.mockResolvedValueOnce({}); // no existing row
+    mockDdbSend.mockResolvedValue({ Items: [] });
+    const r = await handler(evt({ httpMethod: 'POST', body: baseExp }));
+    expect(r.statusCode).toBe(200);
+    const put = mockDdbSend.mock.calls.find((c) => c[0].__t === 'Put')![0];
+    expect(put.input.ConditionExpression).toBeUndefined();
+  });
+
+  it('GET reconcile pins its auto-complete to the audit it read', async () => {
+    const expired = { ...baseExp, endDate: '2020-01-01T00:00:00Z', transitions: [{ from: 'create', to: 'active', by: 'a', at: 't0' }] };
+    mockDdbSend.mockResolvedValueOnce({ Items: [expired] }).mockResolvedValueOnce({});
+    await handler(evt({ httpMethod: 'GET' }));
+    const upd = mockDdbSend.mock.calls.find((c) => c[0].__t === 'Update')![0];
+    expect(upd.input.ConditionExpression).toContain('size(#t) = :expectedTransitions');
+    expect(upd.input.ExpressionAttributeValues[':expectedTransitions']).toBe(1);
+  });
+});
+
+/**
+ * A Resume request for an experiment whose `endDate` has passed used to return 200 while nothing
+ * resumed: the row's status label flipped to `active`, but `isLiveForClassification` gates
+ * resolution on `endDate`, so no traffic was served, and the next list read auto-completed the row
+ * again (L5). The API has to answer honestly - the spec's lifecycle has no resume-past-the-window
+ * edge ("on endDate reached: active|paused --auto--> completed"), and extending a run is the edit
+ * route's job, where `endDate` is validated and stays editable on a live experiment (§3.2 L1).
+ */
+describe('admin-experiments: activating a past-endDate experiment', () => {
+  const statusEvent = (body: unknown) =>
+    evt({
+      httpMethod: 'POST',
+      path: '/admin/experiments/exp-1/status',
+      pathParameters: { experimentId: 'exp-1' },
+      body,
+    });
+
+  it('POST {id}/status resume → 409 EXPERIMENT_WINDOW_ENDED naming the endDate, and writes nothing', async () => {
+    mockDdbSend.mockResolvedValueOnce({
+      Item: { ...baseExp, status: 'paused', endDate: '2020-01-01T00:00:00Z' },
+    });
+    const r = await handler(statusEvent({ status: 'active' }));
+
+    expect(r.statusCode).toBe(409);
+    const body = JSON.parse(r.body);
+    expect(body.code).toBe('EXPERIMENT_WINDOW_ENDED');
+    expect(body.endDate).toBe('2020-01-01T00:00:00Z');
+    expect(body.error).toContain('2020-01-01T00:00:00Z');
+    // A 200 here would report a resume that resolves no traffic.
+    expect(mockDdbSend.mock.calls.find((c) => c[0].__t === 'Update')).toBeUndefined();
+  });
+
+  it('POST {id}/status activate → 409 for an expired DRAFT too (same dead window)', async () => {
+    mockDdbSend.mockResolvedValueOnce({
+      Item: { ...baseExp, status: 'draft', endDate: '2020-01-01T00:00:00Z' },
+    });
+    const r = await handler(statusEvent({ status: 'active' }));
+    expect(r.statusCode).toBe(409);
+    expect(JSON.parse(r.body).code).toBe('EXPERIMENT_WINDOW_ENDED');
+    expect(mockDdbSend.mock.calls.find((c) => c[0].__t === 'Update')).toBeUndefined();
+  });
+
+  it('POST {id}/status resume → 200 when the window is still open (the guard is not over-broad)', async () => {
+    mockDdbSend.mockResolvedValueOnce({
+      Item: { ...baseExp, status: 'paused', endDate: '2099-01-01T00:00:00Z' },
+    });
+    mockDdbSend.mockResolvedValue({ Items: [] }); // active-count scan, conflict scan, then the Update
+    const r = await handler(statusEvent({ status: 'active' }));
+    expect(r.statusCode).toBe(200);
+    expect(mockDdbSend.mock.calls.find((c) => c[0].__t === 'Update')).toBeDefined();
+  });
+
+  it('POST {id}/status pause of an expired experiment is unaffected (only activation is refused)', async () => {
+    mockDdbSend
+      .mockResolvedValueOnce({ Item: { ...baseExp, status: 'active', endDate: '2020-01-01T00:00:00Z' } })
+      .mockResolvedValueOnce({});
+    const r = await handler(statusEvent({ status: 'paused' }));
+    expect(r.statusCode).toBe(200);
   });
 });
