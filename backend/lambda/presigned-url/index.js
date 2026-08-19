@@ -1,5 +1,6 @@
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
+const { createPresignedPost } = require('@aws-sdk/s3-presigned-post');
 
 const s3Client = new S3Client({});
 const BUCKET_NAME = process.env.BUCKET_NAME;
@@ -124,29 +125,35 @@ exports.handler = async (event) => {
       // body. Timestamp + sanitised fileName tail.
       const key = `attachments/${conversationId}/${callerSub}/${Date.now()}-${fileName}`;
 
-      // ContentLength constrains the presigned PUT to a max byte cap.
-      // The S3-request-presigner attaches this as a signed header; an
-      // upload exceeding it gets a 400 from S3.
-      const command = new PutObjectCommand({
+      // PRESIGNED POST, not a presigned PUT, and the difference is the size cap actually working.
+      // The previous shape signed ContentLength: MAX_FILE_BYTES on a PutObjectCommand believing it
+      // capped the upload - but a signed content-length is an EXACT pin, not a ceiling, so every
+      // real upload (whose length is never exactly 10 MiB) failed SignatureDoesNotMatch and user
+      // uploads were broken wholesale (measured live; found by the 1:1 @all attachment e2e).
+      // POST policies are the S3 mechanism built for browser uploads: content-length-range is a
+      // true range condition, and the type/encryption/metadata pins move into policy conditions.
+      const fields = {
+        'Content-Type': ct,
+        'x-amz-server-side-encryption': 'AES256',
+        'x-amz-meta-conversationid': conversationId,
+        'x-amz-meta-userid': callerSub,
+        'x-amz-meta-uploadedat': new Date().toISOString(),
+      };
+      const { url: uploadUrl, fields: signedFields } = await createPresignedPost(s3Client, {
         Bucket: BUCKET_NAME,
         Key: key,
-        ContentType: ct,
-        ContentLength: MAX_FILE_BYTES,
-        ServerSideEncryption: 'AES256',
-        Metadata: {
-          conversationId,
-          userId: callerSub,
-          uploadedAt: new Date().toISOString(),
-        },
-      });
-
-      const presignedUrl = await getSignedUrl(s3Client, command, {
-        expiresIn: EXPIRATION_SECONDS,
-        unhoistableHeaders: new Set(['content-length']),
+        Conditions: [
+          ['content-length-range', 1, MAX_FILE_BYTES],
+          ...Object.entries(fields).map(([k, v]) => ({ [k]: v })),
+        ],
+        Fields: fields,
+        Expires: EXPIRATION_SECONDS,
       });
 
       return respond(200, {
-        uploadUrl: presignedUrl,
+        uploadUrl,
+        // The client posts these verbatim as form fields ahead of the file part.
+        fields: signedFields,
         fileKey: key,
         expiresIn: EXPIRATION_SECONDS,
         maxBytes: MAX_FILE_BYTES,

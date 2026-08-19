@@ -68,6 +68,36 @@ describe('uploadFile', () => {
     expect(s3Options.method).toBe('PUT');
   });
 
+  it('uploads via presigned POST when the backend returns policy fields', async () => {
+    // The current backend shape. A presigned PUT signed an exact ContentLength believing it was a
+    // ceiling, so every real upload failed SignatureDoesNotMatch (measured live); a POST policy's
+    // content-length-range is a true cap. The signed fields must be posted verbatim, ahead of the
+    // file part - S3 ignores any field after the file.
+    const pdf = createFile('doc.pdf', 1024, 'application/pdf');
+
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        json: () => Promise.resolve({
+          uploadUrl: 'https://s3.example.com/bucket',
+          fileKey: 'attachments/conv-1/user-1/123-doc.pdf',
+          fields: { key: 'attachments/conv-1/user-1/123-doc.pdf', 'Content-Type': 'application/pdf', 'X-Amz-Signature': 'sig' },
+        }),
+      })
+      .mockResolvedValueOnce({ ok: true });
+
+    await uploadFile(pdf, 'conv-1', 'user-1');
+
+    const [s3Url, s3Options] = mockFetch.mock.calls[1];
+    expect(s3Url).toBe('https://s3.example.com/bucket');
+    expect(s3Options.method).toBe('POST');
+    const form = s3Options.body as FormData;
+    expect(form).toBeInstanceOf(FormData);
+    const entries = [...form.keys()];
+    expect(entries).toEqual(['key', 'Content-Type', 'X-Amz-Signature', 'file']);
+    expect(entries[entries.length - 1]).toBe('file');
+  });
+
   it('allows files with empty type', async () => {
     const noType = createFile('data.bin', 1024, '');
 

@@ -66,14 +66,26 @@ export async function uploadFile(
     throw new Error('Failed to get upload URL');
   }
 
-  const { uploadUrl, fileKey } = await response.json();
+  const { uploadUrl, fileKey, fields } = await response.json();
 
-  // Upload to S3
-  const uploadResponse = await fetch(uploadUrl, {
-    method: 'PUT',
-    headers: { 'Content-Type': file.type || 'application/octet-stream' },
-    body: file,
-  });
+  // Presigned POST (fields present): the S3 mechanism built for browser uploads, whose
+  // content-length-range condition is a true size cap. The signed fields go ahead of the file part,
+  // verbatim. (The previous presigned PUT signed an exact ContentLength believing it was a ceiling,
+  // so every real upload failed SignatureDoesNotMatch.) The PUT branch remains only for a backend
+  // that predates the POST shape.
+  let uploadResponse: Response;
+  if (fields && typeof fields === 'object') {
+    const form = new FormData();
+    for (const [k, v] of Object.entries(fields as Record<string, string>)) form.append(k, v);
+    form.append('file', file);
+    uploadResponse = await fetch(uploadUrl, { method: 'POST', body: form });
+  } else {
+    uploadResponse = await fetch(uploadUrl, {
+      method: 'PUT',
+      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      body: file,
+    });
+  }
 
   if (!uploadResponse.ok) {
     throw new Error('Failed to upload file');
