@@ -38,7 +38,14 @@ cd backend && npm run deploy-frontend -- --no-build   # publish an existing fron
 cd backend && npm ci
 cd backend && npx cdk deploy --all              # Deploy all stacks
 cd backend && npx cdk diff                      # Preview changes
-cd backend && npm test                          # Jest tests (the gate)
+cd backend && npm run test:shards               # Jest tests (the gate). 4 shards, ONE AT A TIME.
+                                                # Takes 15-25 min, so run it in the background.
+cd backend && npx jest test/<pattern>           # One area, fast
+cd backend && npm test                          # Whole suite in one run: CI only. It exceeds the
+                                                # 10-min limit an interactive tool call gets and is
+                                                # killed mid-run, which reports as "Jest worker
+                                                # encountered N child process exceptions" - a dying
+                                                # pool that reads exactly like a regression.
 cd backend && npm run build                      # tsc, deployable build typecheck (test/ excluded)
 cd backend && npm run typecheck                  # tsc -p tsconfig.test.json, typecheck the test tree (Bundler res.)
 
@@ -57,6 +64,29 @@ cd tests && npm run test:agents                 # Agent interaction suite
 cd tests && npm run test:headed                 # Headed mode (visible browser)
 cd tests && npm run test:report                 # View HTML report
 ```
+
+### One test run at a time
+
+Heavy test runs on a development machine are serial, and this is enforced rather than advised.
+
+The backend suite is split into 4 Jest shards because one run exceeds the 10-minute limit an
+interactive tool call gets. But shards started CONCURRENTLY hard-lock the machine: each Jest process
+runs 4 workers holding a full TypeScript program with `cache: false` (see the comments in
+`backend/jest.config.js`), so four shards is 16 compiling workers. It has cost a session's
+uncommitted work. Running the Jest shards alongside a Playwright e2e run starves it the same way.
+
+`npm run test:shards` runs them one after another from a single supervising process, which holds an
+exclusive lock (`backend/scripts/lib/test-run-lock.cjs`, a gitignored `.test-run.lock` at the repo
+root) for its whole lifetime. A second runner refuses to start rather than queueing - a queued run
+is indistinguishable from a hung one when you come back to read the output. A lock left behind by a
+crash names a pid that no longer exists and is reclaimed automatically, so a crash never needs
+manual cleanup.
+
+For Claude Code there is a second, earlier layer: `.claude/hooks/serial-test-runs.js` refuses the
+command shapes before they spawn - a hand-written `--shard`, two test runs chained in one command,
+the whole suite in a single call, or anything at all while the lock is held. The hook cannot see a
+run started from a terminal, and the lock cannot see a command before it spawns, so both exist.
+Neither is a substitute for the other.
 
 ## Session Setup
 

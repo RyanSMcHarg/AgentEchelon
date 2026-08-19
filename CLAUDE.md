@@ -26,3 +26,18 @@ the doc gap is part of the work.
 
 Wiring is in `.claude/settings.json` (checked in, so the behavior ships to every contributor).
 To disable locally, override in `.claude/settings.local.json` or unset the hook.
+
+## Serial test runs (enforced, not advised)
+
+`.claude/hooks/serial-test-runs.js` runs on `PreToolUse` for `Bash` and `PowerShell` and **denies**
+four command shapes: a hand-written `--shard`, two test runs chained in one command, the whole
+backend suite in a single call, and anything test-shaped while a run already holds the lock.
+
+Four Jest shards started at once hard-lock this machine (16 ts-jest workers, each holding a full TS
+program with `cache: false`) and it has cost a session's uncommitted work. This was recorded in prose
+in three separate documents and happened anyway, which is why it is now a refusal.
+
+Run the suite with `cd backend && npm run test:shards`, in the background. See the "One test run at a
+time" section of [`AGENTS.md`](AGENTS.md) for the mechanism, including the vendor-neutral lock that
+binds runs this hook cannot see (a terminal, another assistant). An assistant should not reach for
+the `AE_ALLOW_CONCURRENT_TESTS=1` override; it exists for the owner.

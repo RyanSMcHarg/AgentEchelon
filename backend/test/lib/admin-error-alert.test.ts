@@ -76,3 +76,12 @@ describe('sendProcessorErrorAlert', () => {
     await expect(sendProcessorErrorAlert(baseEvent, new Error('boom'))).resolves.toBeUndefined();
   });
 });
+
+// This file declares its jest mocks at top level and imports the module under test lazily
+// inside each case, so it has no top-level import/export of its own. Without one TypeScript treats
+// it as a global SCRIPT rather than a module: its top-level `const`s then share one global scope
+// with every other such test file, they collide (TS2451), and symbols resolve against whichever
+// file won - which is how `abuse-controls.test.ts` came to be typechecked against
+// `user-profile-client`. `npm run typecheck` was red with 52 errors for that reason alone, and
+// these files were effectively unchecked. This marks the file as a module. Do not remove.
+export {};

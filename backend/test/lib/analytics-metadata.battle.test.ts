@@ -35,6 +35,37 @@ describe('buildAnalyticsMetadata — assignmentMode rollup-safety invariant', ()
     expect(md.battleContext).toEqual(battleContext);
   });
 
+  // THE ATTRIBUTION A BATTLE TURN MUST CARRY.
+  //
+  // `experiment_id` / `variant_id` reach Aurora from these fields and NOWHERE else - a `battleContext`
+  // alone does not attribute a turn to its experiment. The battle fan-out sent `battleContext` without
+  // them for the life of the feature, so every duel archived with `experiment_id` NULL, and
+  // `fetchBattleEffectivenessRows` (`WHERE m.experiment_id IS NOT NULL`) matched none of them: no
+  // `battle_wins`, and a recommendation that reported "only one variant has recorded traffic" while
+  // reading ordinary probabilistic turns. Battles collected human picks that could never reach the
+  // decision loop they exist to feed.
+  //
+  // Pinned here because the two fields are easy to read as redundant next to `battleContext`, and
+  // dropping them again would be silent: nothing errors, the rows just stop matching.
+  it('attributes a BATTLE turn to its experiment and variant, alongside the battleContext', () => {
+    const battleContext: AnalyticsBattleContext = {
+      battleId: 'b1',
+      round: 1,
+      selfBotArn: 'arn:self',
+      rivalBotArn: 'arn:rival',
+    };
+    const md = buildAnalyticsMetadata(baseCtx({
+      battleContext,
+      experimentId: 'exp-1',
+      variantId: 'treatment',
+    }));
+    expect(md.assignmentMode).toBe('battle');
+    // Compared as one object so a failure shows WHICH id went missing: a turn without experimentId can
+    // never join its own results, and one without variantId cannot be attributed to a side.
+    expect({ experimentId: md.experimentId, variantId: md.variantId })
+      .toEqual({ experimentId: 'exp-1', variantId: 'treatment' });
+  });
+
   it('passes assignmentMode through unchanged when there is no battleContext', () => {
     const md = buildAnalyticsMetadata(baseCtx({ assignmentMode: 'probabilistic' }));
     expect(md.assignmentMode).toBe('probabilistic');

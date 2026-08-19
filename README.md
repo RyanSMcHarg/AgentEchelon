@@ -199,8 +199,7 @@ agentechelon/
 │   │   ├── battle-stack.ts
 │   │   ├── cognito-auth-stack.ts
 │   │   ├── s3-storage-stack.ts
-│   │   ├── analytics-stack.ts
-│   │   └── iam-policies-stack.ts
+│   │   └── analytics-stack.ts
 │   ├── lambda/               # Lambda functions
 │   │   ├── create-conversation/
 │   │   ├── add-agent-to-conversation/
@@ -348,12 +347,12 @@ npm run dev:admin    # admin console
 
 For a real, shareable deployment the SPA is hosted on **CloudFront + private S3
 by default**. The `AgentEchelonFrontend` stack (already created by `cdk deploy --all`)
-provisions the hosting; a build-and-publish step uploads the app:
+provisions the chat hosting; a build-and-publish step uploads the app:
 
 ```bash
 cd backend
 npm run deploy-frontend            # chat app: builds packages/chat/dist, syncs to S3, invalidates the CDN
-npm run deploy-frontend -- --admin # admin console (its own CloudFront + S3 origin)
+npm run deploy-frontend -- --admin # admin console (opt-in; see the admin-console note below)
 ```
 
 The build bakes in CDK outputs, so populate each app's `.env`
@@ -364,6 +363,19 @@ backend CORS allowlist includes the app origin (a custom domain avoids this
 round-trip). An optional `wafAllowedIps` context locks the distribution to known
 IPs. Full guide, including teardown and the security headers applied:
 **[`docs/guides/user/FRONTEND-DEPLOY.md`](docs/guides/user/FRONTEND-DEPLOY.md)**.
+
+**Deploying the admin console (opt-in).** The standalone admin console is a
+separate hosting stack that a plain `cdk deploy --all` does NOT create - a
+deployment can run headless or embed the console in its own app. To host it:
+
+1. Deploy the backend with the flag so the `AgentEchelonAdminFrontend` origin
+   (its own CloudFront + S3) exists: `cdk deploy --all --context enableAdminApp=true`.
+2. Publish the admin build to it: `npm run deploy-frontend -- --admin`.
+3. Redeploy the backend once more with the admin origin so the admin/analytics
+   APIs' CORS allowlist trusts it: `cdk deploy --all --context enableAdminApp=true --context adminAppUrl=https://<AdminDistributionUrl>`
+   (the admin-plane analog of the `appUrl` round-trip above). Running the admin
+   plane behind your own console/auth instead:
+   **[docs/guides/admin/ADMIN-INTEGRATION-GUIDE.md](docs/guides/admin/ADMIN-INTEGRATION-GUIDE.md)**.
 
 ### Create First Admin User
 
@@ -456,6 +468,8 @@ Backend config is set at deploy time via CDK context (`-c key=value` on `cdk dep
 | `sleepMode` | `false` | Aurora-only auto-pause to 0 ACU when idle (`sleepAfterIdle` default `2h`, `sleepCheckRate` default `rate(15 minutes)`). |
 | `membershipAuditEnforce` | `false` | The Layer-6 over-classification membership audit is ALWAYS deployed (it flags over-tier members for review - a standing security guarantee). This sets enforcement mode: `false` = report-only (flag for review), `true` = auto-revoke the over-tier membership. `membershipAuditAlertChannelArn` routes findings. See [ADMIN-GUIDE](docs/guides/admin/ADMIN-GUIDE.md). |
 | `adminAuthMode` | `ae-cognito` | Which IdP authenticates admins: `ae-cognito` / `federated` (`hostAdminPoolId`, `adminGroupNames`) / `service`. See [SPEC-ADMIN-IDENTITY](docs/specs/interaction/identity-access/admin/SPEC-ADMIN-IDENTITY.md). |
+| `enableAdminApp` | `false` | Opt-in: provision the standalone admin console hosting stack (`AgentEchelonAdminFrontend` - its own CloudFront + S3 origin serving `admin.html`). Off by default (a deployment can run headless or embed the console in its own app). Required before `npm run deploy-frontend -- --admin` has an origin to publish to. See [Deploy Frontend](#deploy-frontend-production---cloudfront--s3). |
+| `adminAppUrl` | (unset) | The deployed admin-console origin, added to the admin/analytics APIs' CORS allowlist (the admin-plane analog of `appUrl`). Set it on a second backend deploy once the admin console's CloudFront URL is known. |
 | `bedrockUserHourlyBudget` / `bedrockGlobalHourlyBudget` | (unset) | Per-user / global hourly spend ceilings (abuse controls). See [SPEC-ABUSE-CONTROLS](docs/specs/ops/SPEC-ABUSE-CONTROLS.md). |
 | `basicModelKey` / `standardModelKey` / `premiumModelKey` | (classification default) | Override the default model per classification (any catalog key whose `allowedClassifications` includes that classification). |
 | `assistantIntentPack` | (default pack) | The request-classification taxonomy (per deployment). |
@@ -550,8 +564,16 @@ The admin console groups analytics, conversation moderation (redact/delete), mod
 | `/analytics/conversations` | GET | Conversation list with auto-generated summaries |
 | `/analytics/drift` | GET | Drift detection events (original topic vs current) |
 | `/analytics/context?userSub=X` | GET | Cross-conversation context for a user (related prior conversations) |
-| `/analytics/latency?days=N` | GET | Response latency breakdown: avg/P95 total, Bedrock, polling by agent type and delivery option |
 | `/analytics/model-effectiveness` | GET | Compare model effectiveness by intent: score, latency, and compliance rate |
+
+Latency and experiment results have no dedicated GET resource. They are served from the API root, which takes a `queryType` in the body:
+
+| Request | Description |
+|---------|-------------|
+| `POST /` `{"queryType":"latency_metrics"}` | Response latency breakdown: avg/P95 total, Bedrock, polling by agent type and delivery option |
+| `POST /` `{"queryType":"experiment_results"}` | Per-variant experiment rollup (the Experiments tab) |
+
+The root `POST /` is the general contract for every query type; the GET resources above are the subset that also has its own path.
 
 ## Cost Estimate
 
@@ -674,7 +696,7 @@ read. It is **idempotent** - re-run it after every redeploy. Overridable via env
 
 | Var | Default | Purpose |
 |-----|---------|---------|
-| `TEST_USER_PASSWORD` | `AgentEchelonE2E!2026` | Permanent password for all four users |
+| `TEST_USER_PASSWORD` | random per run | Permanent password for all four users. Generated fresh each run and written to the credentials secret below, so no default credential ships in this repo. Set it only if you want stable logins across re-provisions. |
 | `TEST_EMAIL_DOMAIN` | `agentechelon.test` | Email host for the tier users |
 | `ADMIN_EMAIL` | `testuser-admin@<domain>` | Admin user's email |
 | `TEST_SECRET_NAME` | `agent-interface/test-credentials` | Secrets Manager secret id |
@@ -684,20 +706,11 @@ suite degrades gracefully on a stack that hasn't been provisioned.
 
 ### Test Coverage
 
-The suite is ~55 tests across 8 spec files:
+**151 e2e tests across 41 spec files**, mapped to the specifications they cover.
 
-| Suite | Tests | Description |
-|-------|-------|-------------|
-| signup.spec.ts | 5 | Form display, validation errors, successful registration, duplicate rejection |
-| signin.spec.ts | 8 | Form display, invalid credentials, tier-specific sign in (basic/standard/premium), WebSocket connection, sign out |
-| agent-intents.spec.ts | 12 | Conversation creation, greeting message, factual Q&A, context retention, concise responses, analysis requests, task tracking, code generation, metadata stripping |
-| admin-dashboard.spec.ts | 14 | Admin console navigation, analytics tabs, date range switching, and back navigation |
-| battle.spec.ts | 6 | `/battle` multi-assistant arming, parallel replies, and scorecard |
-| mentions.spec.ts | 2 | Mention routing (`@assistant` / `@all`) in multi-user channels |
-| credential-exchange.spec.ts | 3 | Bearer-pinned Amazon Chime SDK credential vending from the exchange |
-| drift-detection.spec.ts | 5 | Topic-drift detection + suggestion flow (Aurora mode) |
+The authoritative, per-spec breakdown is **[docs/reference/e2e-coverage-matrix.md](docs/reference/e2e-coverage-matrix.md)**, which is GENERATED from the specs and the spec files - it reports which documents claim live behaviour and which e2e covers each. Read it there rather than here: a hand-maintained inventory in this file drifted to "~55 tests across 8 spec files" (it listed 6 battle tests against an actual 17) and nothing failed while it was wrong.
 
-All tests include video recordings and trace files in `tests/test-results/` for debugging.
+Regenerate it with the command at the top of that file. All runs include video recordings and trace files in `tests/test-results/` for debugging.
 
 ### Testing Built-In Intents
 

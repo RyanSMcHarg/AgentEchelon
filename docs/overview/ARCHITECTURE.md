@@ -91,7 +91,7 @@ For deployment instructions, see [README.md](../../README.md). For Aurora-specif
               └───────────────────┘
 ```
 
-**Reading the flow:** the **Channel Flow Processor** runs first on every message (mention rules, filtering, marker stripping); `@all` bypasses Lex and invokes the async processor directly. **Amazon Lex is only the entry trigger** - an Amazon Chime SDK-to-Lambda passthrough via its Dialog Code Hook - not a classifier or router. Each tier's Lex bot fulfills into that tier's **own handler Lambda**: all run the shared `router-agent-handler.ts` code but are deployed one per tier (per-tier ownership, ADR-011), not a single shared router. The models shown per tier are **defaults**; model selection is configurable per tier and per intent via `model-strategy` (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS), so the platform is model-agnostic, not Anthropic-only.
+**Reading the flow:** the **Channel Flow Processor** runs first on every message (mention rules, filtering, marker stripping) and decides WHO responds; `@all` and `/battle` bypass Lex, which is the only way they differ from an ordinary turn (MESSAGE-FLOW §3.1 - the handoff is the design; the flow-side turn logic it replaces is being retired). **Amazon Lex is only the entry trigger** - an Amazon Chime SDK-to-Lambda passthrough via its Dialog Code Hook - not a classifier or router. Each tier's Lex bot fulfills into that tier's **own handler Lambda**: all run the shared `router-agent-handler.ts` code but are deployed one per tier (per-tier ownership, ADR-011), not a single shared router. The models shown per tier are **defaults**; model selection is configurable per tier and per intent via `model-strategy` (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS), so the platform is model-agnostic, not Anthropic-only.
 
 ---
 
@@ -137,19 +137,19 @@ Twelve stacks deploy in both modes (ChimeMessaging, CognitoAuth, AdminPlane, S3S
 
 **Stack outputs flow:** Each stack exports values (ARNs, URLs) as CloudFormation outputs; the per-classification stacks instead publish their processor/bot ARNs to SSM. The frontend `.env` file is populated from these outputs. See `.env.example` for the mapping.
 
-| Stack                         | Key Outputs                                                                                                                                             |
-| ----------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| ChimeMessaging                | `AppInstanceArn`                                                                                                                                        |
-| CognitoAuth                   | `UserPoolId`, `UserPoolClientId`, `IdentityPoolId`, `CredentialExchangeApiUrl`, `UserManagementApiUrl`, `UserFeedbackApiUrl`                             |
-| AdminPlane                    | `AdminConversationApiUrl`                                                                                                                               |
-| S3Storage                     | `PresignedUrlApiUrl`, `AttachmentBucketArn`                                                                                                             |
-| Foundations                   | `CreateConversationApiUrl`, `AddAgentApiUrl`                                                                                                            |
-| Experiments                   | `ExperimentsApiUrl`                                                                                                                                     |
-| Notifications                 | `ShareApiUrl`                                                                                                                                           |
-| Battle                        | `BattleOutcomeApiUrl`                                                                                                                                   |
-| Classification-{Basic,Standard,Premium} | SSM: `/agent-echelon/assistant/{classification}/{processor-arn,bot-arn}`                                                                       |
-| ChannelFlow                   | `ChannelFlowArn`, `ProcessorFunctionArn`                                                                                                                |
-| Analytics / AnalyticsAurora   | `AnalyticsApiUrl`, `ClientEventsApiUrl` (Athena)                                                                                                        |
+| Stack                                   | Key Outputs                                                                                                                  |
+| --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
+| ChimeMessaging                          | `AppInstanceArn`                                                                                                             |
+| CognitoAuth                             | `UserPoolId`, `UserPoolClientId`, `IdentityPoolId`, `CredentialExchangeApiUrl`, `UserManagementApiUrl`, `UserFeedbackApiUrl` |
+| AdminPlane                              | `AdminConversationApiUrl`                                                                                                    |
+| S3Storage                               | `PresignedUrlApiUrl`, `AttachmentBucketArn`                                                                                  |
+| Foundations                             | `CreateConversationApiUrl`, `AddAgentApiUrl`                                                                                 |
+| Experiments                             | `ExperimentsApiUrl`                                                                                                          |
+| Notifications                           | `ShareApiUrl`                                                                                                                |
+| Battle                                  | `BattleOutcomeApiUrl`                                                                                                        |
+| Classification-{Basic,Standard,Premium} | SSM: `/agent-echelon/assistant/{classification}/{processor-arn,bot-arn}`                                                     |
+| ChannelFlow                             | `ChannelFlowArn`, `ProcessorFunctionArn`                                                                                     |
+| Analytics / AnalyticsAurora             | `AnalyticsApiUrl`, `ClientEventsApiUrl` (Athena)                                                                             |
 
 ---
 
@@ -250,8 +250,8 @@ This is the core flow: user sends a message and receives an AI response.
  │  Amazon Chime SDK receives message in channel                               │
  │       │                                                              │
  │       ▼                                                              │
- │  Channel Flow Processor runs first (@all/@everyone → invoke the      │
- │  async processor DIRECTLY, bypassing Lex; otherwise pass to Lex)     │
+ │  Channel Flow Processor runs first (@all / /battle bypass Lex and    │
+ │  hand off to the same handler; otherwise pass to Lex)                │
  │       │                                                              │
  │       ▼                                                              │
  │  Per-tier Lex V2 Bot: RecognizeText                                 │
@@ -263,7 +263,7 @@ This is the core flow: user sends a message and receives an AI response.
  │       │                                                              │
  │       ├── 1. Resolve tier: min(userTier, channelTier)                │
  │       │                                                              │
- │       ├── 2. Classify intent (keywords, else the LLM classifier)     │
+ │       ├── 2. Classify intent (LLM classifier by default)            │
  │       │      └── Returns: delivery option + model route              │
  │       │                                                              │
  │       ├── 3. Select delivery option:                                 │
@@ -324,7 +324,7 @@ This is the core flow: user sends a message and receives an AI response.
 - `frontend/packages/chat/src/providers/MessagingProvider.tsx` - WebSocket session, message callbacks
 - `frontend/packages/shared/src/utils/messageParser.ts` - Strip metadata markers before display
 - `backend/lambda/src/router-agent-handler.ts` - Shared Lex fulfillment: tier resolution (`min(userTier, channelTier)`), intent classification, delivery selection, dispatch to the per-tier processor (ARN from SSM)
-- `backend/lambda/src/channel-flow-processor.ts` - Runs first on every message; `@all`/`@everyone` invokes the async processor directly (bypassing Lex)
+- `backend/lambda/src/channel-flow-processor.ts` - Runs first on every message; decides who responds. `@all` and `/battle` bypass Lex and otherwise follow the ordinary turn path
 - `backend/lambda/src/assistant-async-processor.ts` - The single config-driven assistant processor (one instance deployed per profile; self-gates its capabilities on the profile env)
 - `backend/lambda/src/lib/intent-classifier.ts` - Greeting/acknowledgment fast-path + a configurable LLM classifier (`CLASSIFIER_MODEL_ID`, default Haiku) used for every tier by default; a keyword-only classifier is opt-in per profile (`classifierMode: 'keyword'`)
 - `backend/lambda/src/lib/delivery-options.ts` - Intent → delivery option mapping
@@ -339,29 +339,45 @@ This is the core flow: user sends a message and receives an AI response.
 
 A message is classified once, and that single classification drives **two independent decisions**: how the reply is **delivered** (next), and which **model** answers it (Model routing, below).
 
+**The default is the LLM classifier, for every profile.** Each profile carries a `classifierMode`
+(`'llm' | 'keyword'`), and all three profiles this repository ships set `'llm'` - basic included, which
+is a deliberate choice rather than an omission (`backend/lib/config/profiles.ts`). The keyword
+classifier is an **opt-in alternative** a deployment may select for a profile where classification cost
+matters more than accuracy. It is not a stage every message passes through, and the two modes are
+alternatives rather than a chain.
+
 ```
   User message arrives at agent handler
           │
           ▼
-  ┌─────────────────────────────────────────┐
-  │ Fast-path keyword matching              │
-  │                                         │
-  │ "hello" / "hi" → GREETING              │
-  │ "thanks" / "ok" → ACKNOWLEDGMENT       │
-  │ "error" / "fix" → GUIDED_TROUBLESHOOTING│
-  │ "extract" / "pull" → DATA_EXTRACTION   │
-  │ "report" / "summary" → REPORT_GENERATION│
-  └────────────┬────────────────────────────┘
-               │
-               │ no keyword match?
-               ▼
-  ┌─────────────────────────────────────────┐
-  │ LLM classifier for unmatched messages   │
-  │ (model set by CLASSIFIER_MODEL_ID;      │
-  │  default Haiku), used for every tier by │
-  │  default. Categories from the pack.     │
-  └────────────┬────────────────────────────┘
-               │
+     profile.classifierMode
+          │
+          ├───────────────── 'keyword' (OPT-IN; no shipped profile uses it) ─────────┐
+          │                                                                          │
+          ▼ 'llm'  (the default, all shipped profiles)                               ▼
+  ┌─────────────────────────────────────────┐              ┌──────────────────────────────────┐
+  │ Exact-match short-circuit               │              │ classifyIntentByKeyword          │
+  │ (fastPathIntent)                        │              │                                  │
+  │                                         │              │ "error" / "fix" → GUIDED_TROUBLE │
+  │ empty or under 3 chars → GREETING       │              │ "extract" / "pull" → DATA_EXTRACT│
+  │ EXACT "hi" / "hello"   → GREETING       │              │ "report" / "summary" → REPORT_GEN│
+  │ EXACT "thanks" / "ok"  → ACKNOWLEDGMENT │              │ substring match, no model call   │
+  │                                         │              └────────────┬─────────────────────┘
+  │ Anything else falls through. This is an │                           │
+  │ EXACT-token check, not the keyword      │                           │
+  │ table on the right.                     │                           │
+  └────────────┬────────────────────────────┘                           │
+               │ no exact match (the common case)                       │
+               ▼                                                        │
+  ┌─────────────────────────────────────────┐                           │
+  │ LLM classifier - THE DEFAULT PATH       │                           │
+  │ (model set by CLASSIFIER_MODEL_ID;      │                           │
+  │  default Haiku). Categories from the    │                           │
+  │  active intent pack, so a deployment's  │                           │
+  │  domain intents are classifiable.       │                           │
+  └────────────┬────────────────────────────┘                           │
+               │                                                        │
+               ├────────────────────────────────────────────────────────┘
                ▼
   ┌─────────────────────────────────────────┐
   │ Delivery option lookup                  │
@@ -602,7 +618,7 @@ The two roles cannot collapse into one store: an immutable raw log cannot serve 
                                        + supporting views, Aurora mode)
 ```
 
-The diagram above is the **archival/analytics** path (asynchronous, off the request path). The **live request path** reaches Aurora separately: the non-VPC agent handler invokes a VPC-attached **retrieval data-plane Lambda** that runs RAG retrieval and drift detection (embed + pgvector) and returns results. The handler stays out of the VPC so it can still reach SSM, Cognito, and Lambda-invoke; the data-plane Lambda reuses the existing Bedrock and Secrets endpoints, adding no new VPC endpoints (project decision 018). See [RAG.md](../guides/developer/RAG.md) and, for per-piece costs, [INFRASTRUCTURE-COST.md](../guides/admin/INFRASTRUCTURE-COST.md).
+The diagram above is the **archival/analytics** path (asynchronous, off the request path). The **live request path** reaches Aurora separately: the non-VPC agent handler invokes a VPC-attached **retrieval data-plane Lambda** that runs RAG retrieval and drift detection (embed + pgvector) and returns results. The handler stays out of the VPC so it can still reach SSM, Cognito, and Lambda-invoke; the data-plane Lambda reuses the existing Bedrock and Secrets endpoints, adding no new VPC endpoints (ADR-013). See [RAG.md](../guides/developer/RAG.md) and, for per-piece costs, [INFRASTRUCTURE-COST.md](../guides/admin/INFRASTRUCTURE-COST.md).
 
 **Key files:**
 - `backend/lib/stacks/analytics-stack.ts` - Athena mode (Kinesis → Firehose → S3 → Glue → Athena)
@@ -651,7 +667,7 @@ If a provider fails to initialize, everything below it is unavailable. The `Conn
 
 | "I want to..." | Start here |
 |-----------------|-----------|
-| Change the AI system prompt | `backend/lambda/src/assistant-async-processor.ts` (the profile's `DEFAULT_PROMPTS` entry, or the SSM persona param) |
+| Change the AI system prompt | The admin Profiles tab / `manage-profiles` - edit the active version's persona, no deploy (fallbacks: the per-deployment SSM persona param, then the profile's `DEFAULT_PROMPTS` entry in `backend/lambda/src/assistant-async-processor.ts`) |
 | Add a new intent | `backend/lambda/src/lib/intent-classifier.ts` → `delivery-options.ts`; for its model route, `backend/lib/config/model-strategy.ts` (`INTENT_ROUTE_STRATEGY`) |
 | Add a new user tier | [How to add or manage a profile](../guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md) |
 | Change the auth flow | `frontend/packages/shared/src/providers/AuthProvider.tsx` + `backend/lib/stacks/cognito-auth-stack.ts` |
@@ -682,7 +698,7 @@ Deployment model overrides are selected in CDK with `basicModelKey`, `standardMo
 
 **How tier is determined:** User tier is stored as a Cognito custom attribute (`custom:tier`), set during admin approval. The fulfillment handler (`router-agent-handler.ts`) reads the tier and resolves the effective tier as `min(userTier, channelTier)`, then dispatches to that profile's async processor (the shared `assistant-async-processor.ts`, deployed once per profile). Lex is only the entry trigger; it performs no routing or tier logic.
 
-**How tier is enforced:** Each profile's processor Lambda has its own IAM role with Bedrock `InvokeModel` permissions scoped to that profile's model ARNs (`modelArnsForTier`). The Cognito Identity Pool authenticated roles (one per classification, generated from config in `cognito-auth-stack.ts`) give frontend SDK clients their classification-appropriate permissions; the former standalone IAMPolicies stack has been removed.
+**How tier is enforced:** Each profile's processor Lambda has its own IAM role with Bedrock `InvokeModel` permissions scoped to that profile's model ARNs (`modelArnsForClassification`). The Cognito Identity Pool authenticated roles (one per classification, generated from config in `cognito-auth-stack.ts`) give frontend SDK clients their classification-appropriate permissions; the former standalone IAMPolicies stack has been removed.
 
 ---
 
