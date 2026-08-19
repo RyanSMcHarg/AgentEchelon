@@ -31,7 +31,6 @@ import {
 const CHANNEL_BATTLE_CONFIG_TABLE = process.env.CHANNEL_BATTLE_CONFIG_TABLE || '';
 const BATTLE_STATE_TABLE = process.env.BATTLE_STATE_TABLE || '';
 const CACHE_TTL_MS = 60_000;
-const STATE_TTL_SECONDS = 600; // 10 min — matches spec's BattleStateTable TTL
 
 // ---------------------------------------------------------------------------
 // TWO CLOCKS (ADR-026)
@@ -65,15 +64,6 @@ const MACHINE_DEADLINE_MS = Number(process.env.BATTLE_ROUND1_DEADLINE_MS) || 180
  */
 const USER_WAIT_MS = Number(process.env.BATTLE_USER_WAIT_MS) || 3_600_000; // 1 hour
 
-/**
- * Row TTL for a deadline: the row must OUTLIVE its own deadline, or DynamoDB deletes the evidence
- * before the orchestrator can report on it and the duel ends by disappearing instead of by saying so.
- */
-const TTL_GRACE_SECONDS = 300;
-function ttlForDeadline(deadlineMs: number): number {
-  return Math.floor(deadlineMs / 1000) + TTL_GRACE_SECONDS;
-}
-
 /** When a generating side is due. */
 function machineDeadline(nowMs: number): number {
   return nowMs + MACHINE_DEADLINE_MS;
@@ -97,6 +87,40 @@ function userWaitDeadline(nowMs: number): number {
  * caller re-validating against live rows, so an over-long value is safe and an over-short one is the bug.
  */
 const DUEL_MAX_LIFETIME_MS = Number(process.env.BATTLE_MAX_LIFETIME_MS) || 14_400_000; // 4 hours
+
+/**
+ * ROW TTL: a row outlives the DUEL, not the leg that wrote it.
+ *
+ * The requirement used to be stated per leg (a row must outlive its own deadline) and that is too
+ * weak once the two clocks exist. Every row is read as a SET, not on its own: the orchestrator asks
+ * whether all sides are terminal and pairs each side with its rival. A row deleted while a SIBLING is
+ * still legitimately in flight does not lose one leg's evidence, it changes the answer to a question
+ * about the whole duel. Side A finishes round 1 in seconds; side B blocks on the user for 45 minutes,
+ * which the human clock permits. On a per-leg TTL A's row is already gone when B answers, so
+ * `allBotsTerminal` sees only B and calls the duel done, A never gets round 2, and B is told its rival
+ * did not finish - which is false.
+ *
+ * So every writer stamps the same bound, anchored at the instant of the write. Two properties follow,
+ * and both are load-bearing:
+ *
+ *   - A row outlives ANY deadline it can carry, because the bound covers the longest clock a leg can
+ *     start rather than the one this particular write started.
+ *   - The value only moves forward with the clock, so no later transition can SHORTEN a row's TTL.
+ *     That is what the terminal transition needed: it used to cut a waiting side's hours-long TTL down
+ *     to ten minutes on the way past.
+ */
+const TTL_GRACE_SECONDS = 300;
+const ROW_LIFETIME_MS = Math.max(DUEL_MAX_LIFETIME_MS, USER_WAIT_MS, MACHINE_DEADLINE_MS);
+
+/**
+ * The TTL (epoch SECONDS) for any `BattleState` row written at `nowMs`.
+ *
+ * Exported so the orchestrator's own sentinel writer takes the bound from here instead of keeping a
+ * second copy of the number, which is how the two got to disagree in the first place.
+ */
+export function battleRowTtl(nowMs: number = Date.now()): number {
+  return Math.floor((nowMs + ROW_LIFETIME_MS) / 1000) + TTL_GRACE_SECONDS;
+}
 
 // removeUndefinedValues: transitionBotState writes optional round1Reply /
 // round1MessageId / correlationId straight into the Item — all undefined
@@ -302,10 +326,10 @@ export async function resolveActiveBattle(
   const active = { battleId: cfg.activeBattleId, initiatorUserSub: cfg.activeBattleInitiator };
   const startedMs = cfg.activeBattleStartedAt ? Date.parse(cfg.activeBattleStartedAt) : NaN;
   if (Number.isNaN(startedMs)) return active; // no/invalid timestamp → let rows arbitrate
-  // Bounded by the DUEL's lifetime, not one leg's. This used `STATE_TTL_SECONDS` (10 min), which is the
-  // right order of magnitude for a single-turn duel and wrong for a task-shaped one: it released the
-  // single-active-battle pointer while the first duel was still working with the user, so a second
-  // `/battle` could start alongside it (ADR-026).
+  // Bounded by the DUEL's lifetime, not one leg's. A flat ten minutes is the right order of magnitude
+  // for a single-turn duel and wrong for a task-shaped one: it released the single-active-battle
+  // pointer while the first duel was still working with the user, so a second `/battle` could start
+  // alongside it (ADR-026).
   if (Date.now() - startedMs > DUEL_MAX_LIFETIME_MS) return null; // battle aged out
   return active;
 }
@@ -404,7 +428,7 @@ export async function initBotState(args: {
           ...(args.initiatorUserSub ? { initiatorUserSub: args.initiatorUserSub } : {}),
           enteredStateAt: now,
           deadlineAt,
-          ttl: ttlForDeadline(deadlineAt),
+          ttl: battleRowTtl(nowMs),
         },
         ConditionExpression: 'attribute_not_exists(botArn)',
       }),
@@ -443,8 +467,15 @@ export async function transitionBotState(args: {
   correlationId?: string;
 }): Promise<boolean> {
   if (!BATTLE_STATE_TABLE) return false;
-  const now = new Date().toISOString();
-  const ttl = Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS;
+  const nowMs = Date.now();
+  const now = new Date(nowMs).toISOString();
+  // THE DUEL'S BOUND, NOT THIS LEG'S. This stamped a flat 600s, which is a whole-duel lifetime only
+  // if a duel is short - and the human clock is an hour, so it is not. A side that finished round 1
+  // early had its row deleted while its rival was still legitimately waiting on the user, and the
+  // duel then read as a one-sided battle whose missing half "did not finish". Because
+  // `battleRowTtl` only moves forward, this write also cannot shorten the far longer TTL a waiting
+  // side is already carrying.
+  const ttl = battleRowTtl(nowMs);
 
   // Only what this caller actually knows is written. A round-2 or opt-out transition carries no round-1
   // reply, and writing a null for it would erase the answer round 1 recorded — the same forgetting in a
@@ -539,8 +570,8 @@ export async function markBotWaitingForUser(args: {
   // THE CLOCK CHANGES HERE (ADR-026). This side is no longer generating, it is blocked on a person, so
   // it moves off the machine deadline and onto the human one. Writing `deadlineAt` explicitly is what
   // stops the orchestrator falling back to `enteredStateAt + MACHINE_DEADLINE_MS` and reporting a
-  // thinking user as a stalled assistant. The TTL follows the deadline so the row cannot be deleted
-  // out from under the wait.
+  // thinking user as a stalled assistant. The TTL covers the whole DUEL (`battleRowTtl`), so neither
+  // this row nor the rival's is deleted out from under a wait this long.
   const deadlineAt = userWaitDeadline(nowMs);
   try {
     await ddb.send(
@@ -563,7 +594,7 @@ export async function markBotWaitingForUser(args: {
           ':corr': args.correlationId ?? null,
           ':wmid': args.waitingMessageId ?? null,
           ':deadline': deadlineAt,
-          ':ttl': ttlForDeadline(deadlineAt),
+          ':ttl': battleRowTtl(nowMs),
           ...(args.reason === 'task-step' ? {} : { ':one': 1 }),
         },
       }),
@@ -657,7 +688,7 @@ export async function resumeBotFromWaiting(args: {
           ':now': now,
           ':corr': args.correlationId ?? null,
           ':deadline': deadlineAt,
-          ':ttl': ttlForDeadline(deadlineAt),
+          ':ttl': battleRowTtl(nowMs),
           ':delta': waitedMs,
         },
       }),
@@ -731,7 +762,10 @@ export async function getBotRow(
  */
 export async function tryClaimOrchestratorFire(battleId: string): Promise<boolean> {
   if (!BATTLE_STATE_TABLE) return false;
-  const ttl = Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS;
+  // Outlives the duel, like every other row. This claim is the only thing stopping a redelivered
+  // orchestrator invocation fanning round 2 out a second time, so a claim that expires while the duel
+  // is still in flight is a claim that stopped claiming.
+  const ttl = battleRowTtl();
   try {
     await ddb.send(
       new PutCommand({
@@ -769,7 +803,7 @@ export async function tryClaimRound1Fanout(battleId: string): Promise<boolean> {
   // Outlives the DUEL, not one leg. This sentinel is the only thing stopping a redelivered `/battle`
   // fanning out twice, and a duel that now legitimately runs for an hour would otherwise outlive its own
   // dedup claim and could be fanned out again on top of itself.
-  const ttl = Math.floor(Date.now() / 1000) + Math.floor(DUEL_MAX_LIFETIME_MS / 1000);
+  const ttl = battleRowTtl();
   try {
     await ddb.send(
       new PutCommand({
@@ -800,7 +834,23 @@ export function botRowsOnly(rows: BattleStateRow[]): BattleStateRow[] {
   return rows.filter((r) => !r.botArn.startsWith('__'));
 }
 
-/** True iff every bot row is in a terminal state (COMPLETED or FAILED). */
+/**
+ * True iff every bot row is in a terminal state (COMPLETED or FAILED).
+ *
+ * NO EXPECTED-SIDE COUNT, DELIBERATELY. This trusts whatever rows survive, which is exactly how a
+ * vanished row used to be read as a finished duel: one side's row aged out, the survivor was the only
+ * row left, and "all of them are terminal" was true of a set with a hole in it. The fix for that is
+ * the row TTL above - a row now outlives the duel, so the set cannot lose a member while the duel is
+ * live - and NOT a count check here.
+ *
+ * A count check is the tempting second belt and it is not fail-safe. The count would have to come from
+ * the fan-out, whose `initBotState` write is deliberately non-fatal: a state-table blip there must not
+ * stop the user's turn being answered. So an expected count can legitimately exceed the rows that
+ * exist, and gating on it would make round 2 defer forever. Nothing would rescue it: the orchestrator's
+ * degraded resolution needs a time-based sweep the battle stack does not have yet, so today a deferral
+ * is a hang. A duel that is genuinely missing a side already resolves LOUDLY (the orchestrator posts
+ * "did not finish" for every non-completed side), which is the better failure of the two.
+ */
 export function allBotsTerminal(rows: BattleStateRow[]): boolean {
   const bots = botRowsOnly(rows);
   if (bots.length === 0) return false;

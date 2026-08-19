@@ -547,8 +547,8 @@ describe('resolveActiveBattleId (continuation pre-filter)', () => {
   });
 
   it('STILL HOLDS the pointer past ten minutes — a task-shaped duel runs at human pace (ADR-026)', async () => {
-    // This is the behaviour change, and it is the half worth pinning. The bound was
-    // `STATE_TTL_SECONDS` (10 min), which is the right order for a single-turn duel and wrong for one
+    // This is the behaviour change, and it is the half worth pinning. The bound was a flat
+    // ten minutes, which is the right order for a single-turn duel and wrong for one
     // collecting requirements from a person: it released the single-active-battle pointer mid-duel, so a
     // SECOND `/battle` could start alongside the first. An over-long bound is safe here by design (the
     // docstring makes the pointer a cheap pre-filter, with live rows arbitrating); an over-short one is

@@ -88,7 +88,7 @@ describe("a duel side's task, through the one creation path", () => {
     expect(put.input.Item.taskId).toBe(task.taskId);
     // TWO FIELDS, TWO QUESTIONS (owner, 2026-08-14). The OWNER is who must act next, and
     // `report_generation` starts at `collecting_requirements`, which the machine declares
-    // `awaitsUser` - so the chain is blocked on the person from its first moment and they hold it.
+    // `awaits` - so the chain is blocked on the person from its first moment and they hold it.
     // Owning it is what puts it in their queue; the caller's assistant owner is honoured only for a
     // first step the assistant actually owes.
     expect(put.input.Item.ownerId).toBe(principalIdOfUser);

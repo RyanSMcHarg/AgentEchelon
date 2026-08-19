@@ -24,7 +24,7 @@
  *    (the system prompt acknowledges this and asks them to respond
  *    independently).
  *  - Async processor crashes mid-round-1: the row never transitions. Rather
- *    than wait for the silent 10-min TTL (B2 "fail loud"), the orchestrator
+ *    than wait for the silent row TTL (B2 "fail loud"), the orchestrator
  *    gives round 1 a deadline: once a stalled (non-terminal) participant is
  *    past it, it stops deferring, posts an explicit "<Name> didn't finish in
  *    time" turn, and either runs a DEGRADED round 2 for the survivor(s) or —
@@ -48,6 +48,7 @@ import {
   allBotsTerminal,
   tryClaimOrchestratorFire,
   botRowsOnly,
+  battleRowTtl,
   type BattleStateRow,
 } from './lib/battle-state.js';
 import {
@@ -64,10 +65,9 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
 });
 
 const BATTLE_STATE_TABLE = process.env.BATTLE_STATE_TABLE || '';
-const STATE_TTL_SECONDS = 600; // matches the BattleStateTable TTL
 // Round-1 fail-loud deadline (B2): if a participant is still non-terminal past
-// this many ms, the orchestrator stops waiting for the silent 10-min TTL and
-// drives a loud degraded resolution. Overridable; defaults well under the TTL.
+// this many ms, the orchestrator stops waiting and drives a loud degraded
+// resolution. Overridable; defaults well under the row TTL.
 const ROUND1_DEADLINE_MS = Number(process.env.BATTLE_ROUND1_DEADLINE_MS) || 180_000;
 
 // The premium classification processor ARN is resolved at RUNTIME from SSM (the
@@ -195,7 +195,7 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
   //    unless `allBotsTerminal(rows)` is already true, so every invocation arrives
   //    with `terminal === true`. A bot that crashes or times out mid-round-1 never
   //    writes a terminal row, so nothing invokes us again and the battle still ends
-  //    in the silent 10-min TTL strand.
+  //    by stranding silently until the row TTL sweeps it.
   //
   //    Closing it needs a TIME-based trigger, not another event: the missing signal
   //    is the ABSENCE of a transition, which cannot be event-sourced (TENETS 7,
@@ -479,10 +479,14 @@ async function postBattleMessage(
  * Idempotent (attribute_not_exists) and best-effort. `botRowsOnly()` excludes
  * '__'-prefixed SKs, so this sentinel never affects the "all bots terminal"
  * checks. Fails open when the state table isn't provisioned.
+ *
+ * The TTL comes from `battleRowTtl`, the same bound every other row uses. It was a local 600s copy,
+ * which meant the "battle done" marker could expire while a task-shaped duel was still running - and a
+ * marker that is gone is indistinguishable from one that was never written.
  */
 async function emitBattleComplete(battleId: string, reason: string): Promise<void> {
   if (!BATTLE_STATE_TABLE) return;
-  const ttl = Math.floor(Date.now() / 1000) + STATE_TTL_SECONDS;
+  const ttl = battleRowTtl();
   try {
     await ddb.send(
       new PutCommand({

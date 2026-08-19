@@ -65,6 +65,12 @@ jest.mock('../../lambda/src/lib/task-tracking.js', () => {
       const t = await mockGetActiveTaskForOwner(...a);
       return t ? [t] : [];
     },
+    // The same one query, in the shape the router reads it: live work plus anything that ended here
+    // recently. These tests model no finished work, so the second list is always empty.
+    getOwnerChannelTasks: async (...a: unknown[]) => {
+      const t = await mockGetActiveTaskForOwner(...a);
+      return { live: t ? [t] : [], recentlyEnded: [] };
+    },
     getActiveTask: (...a: unknown[]) => mockGetActiveTask(...a),
     applyUserResponseToTask: (...a: unknown[]) => mockApplyUserResponseToTask(...a),
   };
@@ -287,7 +293,7 @@ describe('a battle turn resolves its task by the ANSWERING ASSISTANT', () => {
     // What changed is the mechanism, not the rule. The assistant's own chain IS now consulted on an
     // ordinary turn - that is how a person's private answer resumes the side that asked, since the
     // channel flow never sees the `Target` that used to route it. The licence is
-    // narrow: the chain must be in a state the machine declares `awaitsUser`. This one is mid-flight,
+    // narrow: the chain must be in a state the machine declares `awaits` on. This one is mid-flight,
     // so the message stays an ordinary turn.
     // Owner-aware, because the mirror is partitioned by owner: the PERSON owes nothing here, and the
     // chain in flight belongs to the assistant. A blanket mock would answer both lookups and the
@@ -320,7 +326,7 @@ describe('a battle turn resolves its task by the ANSWERING ASSISTANT', () => {
   });
 
   it('asks what the PERSON owes before what the assistant holds', async () => {
-    // The ordering half of the same rule. A task in an `awaitsUser` state is held by the person, and
+    // The ordering half of the same rule. A task in an `awaits` state is held by the person, and
     // their message is the response to it, so that lookup comes first and the assistant's own chain is
     // only consulted when it finds nothing. Asking the bot first would let a duel side's work claim a
     // message that answers the person's own outstanding item.

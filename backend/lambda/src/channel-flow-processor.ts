@@ -926,23 +926,18 @@ async function handleMentionedMessage(params: HandleMentionParams): Promise<void
     return;
   }
 
-  // AN EMPTY `messages` ARRAY MEANS POST NOTHING (ADR-022), and under ADR-025 that is now the NORMAL
-  // outcome rather than the exception: the assistant posts its own acknowledgment, because the turn
-  // is what resolved the words from its profile. This branch stays because the empty array also means
-  // a genuinely silent turn (a duplicate fulfillment that lost its correlation claim), and it is the
-  // fallback when the turn's own send failed and handed the message back.
-  const placeholder = response.messages?.[0]?.content;
-  if (!placeholder) {
-    console.log('[ChannelFlow] nothing to post for this mention; the turn either posted its own message or was silent');
-    return;
-  }
-
-  // Reached only when the turn handed the message back - it could not post (no resolved identity, or
-  // the send failed). Posting it here keeps a Chime hiccup from becoming a turn that answered and
-  // showed nothing. The message carries the correlation marker either way, so the duplicate-placeholder
-  // guard still claims `corr# -> MessageId` when it re-enters the flow (§5.1).
-  console.log('[ChannelFlow] the turn handed its message back; posting on its behalf');
-  await sendBotMessage(channelArn, botArn, placeholder, targetArns);
+  // Honour the hand-back half of the contract through the ONE helper every bypass path uses: an empty
+  // array posts nothing (the normal ADR-025 outcome, or a silent turn), and a handed-back message is
+  // posted on the turn's behalf so its correlation marker still reaches the channel. See
+  // `postHandedBackMessage` for what each outcome means.
+  await postHandedBackMessage({
+    response,
+    channelArn,
+    botArn,
+    targetArns,
+    logPrefix: '[ChannelFlow]',
+    logContext: { broadcast },
+  });
 }
 
 /**
@@ -985,6 +980,60 @@ async function sendBotMessage(
   // Undefined is tolerated rather than treated as an error: the send SUCCEEDED, so the turn should
   // proceed, and a caller with no id simply falls back to the poll as before.
   return res.MessageId;
+}
+
+/**
+ * Post the message a turn handed BACK, on the answering bot's behalf.
+ *
+ * THE ONE IMPLEMENTATION of the hand-back half of the router contract, for all three bypass paths
+ * (`@all`, the round-1 battle fan-out, the battle continuation), so what "the turn handed it back"
+ * means cannot drift per path.
+ *
+ * AN EMPTY `messages` ARRAY MEANS POST NOTHING (ADR-022), and under ADR-025 that is the NORMAL
+ * outcome: the assistant posts its own acknowledgment, because the turn is what resolved the words
+ * from its profile. Empty also covers a genuinely silent turn (a duplicate fulfillment that lost its
+ * correlation claim).
+ *
+ * A NON-EMPTY array is the exception this exists for: the turn's own `postAsAssistant`
+ * SendChannelMessage could not run (no resolved identity, or an Amazon Chime SDK throttle), so it
+ * hands the unposted placeholder back rather than dropping it. Posting it here keeps a transient send
+ * failure from becoming a turn that answered and showed nothing. The text carries the turn's
+ * `<!--corr:-->` marker either way, so when this message re-enters the flow the duplicate-placeholder
+ * guard claims `corr -> MessageId` (§5.1) - and for a bypass path that claim IS how the worker finds
+ * the placeholder to update. Composing a message here instead of posting the handed-back one would
+ * mint a second correlation id nothing is listening for.
+ *
+ * The battle CONTINUATION discarded the response entirely, which is what made this shared: nothing
+ * was posted, no mapping was claimed, and the resumed side's answer had nowhere to land - after the
+ * waiting marker was already cleared, so the person was left with nothing at all.
+ *
+ * Never throws. The turn has already run and cost what it costs, and on a fan-out a failed post for
+ * one side must not take the sibling side down with it; the warning is the record.
+ */
+async function postHandedBackMessage(params: {
+  response: LexResponse;
+  channelArn: string;
+  botArn: string;
+  /** Targeted delivery, matching the reply the turn would have sent itself. Omitted for broadcast. */
+  targetArns?: string[];
+  /** Log prefix of the calling path, e.g. `[ChannelFlow][battle]`. */
+  logPrefix: string;
+  logContext?: Record<string, unknown>;
+}): Promise<void> {
+  const { response, channelArn, botArn, targetArns, logPrefix, logContext = {} } = params;
+
+  const handedBack = response.messages?.[0]?.content;
+  if (!handedBack) {
+    console.log(`${logPrefix} nothing to post; the turn either posted its own message or was silent`, logContext);
+    return;
+  }
+
+  try {
+    console.log(`${logPrefix} the turn handed its message back; posting on its behalf`, logContext);
+    await sendBotMessage(channelArn, botArn, handedBack, targetArns);
+  } catch (err) {
+    console.warn(`${logPrefix} failed to post the handed-back message`, { ...logContext, err });
+  }
 }
 
 /**
@@ -1151,10 +1200,11 @@ async function handleBattleContinuation(
 
       // HAND THE TURN TO THE HANDLER, exactly as round 1 does. The handler classifies, finds the
       // chain this side owns, resolves this side's variant and picks the delivery option - none of
-      // which the flow may decide. It answers onto the side's EXISTING waiting message, so nothing
-      // new is posted and the cleared marker stays the frontend's "waiting ended" signal.
+      // which the flow may decide. It posts its own placeholder for the answer and clears the
+      // question message's marker, which is the frontend's "waiting ended" signal.
+      let reply: LexResponse;
       try {
-        await invokeRouterTurn(resumeRouterArn, {
+        reply = await invokeRouterTurn(resumeRouterArn, {
           channelArn,
           senderArn,
           userMessage: userAnswer,
@@ -1177,7 +1227,22 @@ async function handleBattleContinuation(
         });
       } catch (err) {
         console.error('[ChannelFlow][battle] continuation turn invoke failed for', selfBotArn, err);
+        return;
       }
+
+      // The SAME hand-back contract the other two bypass paths honour, and it was the one path that
+      // discarded the response. Normally empty (the resumed side posts its own placeholder), but when
+      // its send failed the placeholder comes back here - and dropping it left the side with no
+      // placeholder, so no `corr -> MessageId` mapping was ever claimed, the worker's scan found
+      // nothing and the answer could not be delivered. The waiting marker is cleared by then, so the
+      // person is shown neither a question nor an answer.
+      await postHandedBackMessage({
+        response: reply,
+        channelArn,
+        botArn: selfBotArn,
+        logPrefix: '[ChannelFlow][battle]',
+        logContext: { battleId, botArn: selfBotArn, round: '1c' },
+      });
     }),
   );
 }
@@ -1480,18 +1545,14 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
       // Normally empty now: each side posts its own placeholder as its own bot (ADR-025), which is
       // also what puts this side's variant display name in the marker. A non-empty array means the
       // turn could not post and handed it back, so post it on that side's behalf rather than leaving
-      // a gap where an answer should be.
-      const placeholder = reply.messages?.[0]?.content;
-      if (!placeholder) {
-        console.log('[ChannelFlow][battle] side posted its own message (or was silent)', { botArn: thisBotArn });
-        return;
-      }
-      try {
-        console.log('[ChannelFlow][battle] side handed its message back; posting on its behalf', { botArn: thisBotArn });
-        await sendBotMessage(channelArn, thisBotArn, placeholder);
-      } catch (err) {
-        console.warn('[ChannelFlow][battle] Failed to post placeholder for', thisBotArn, err);
-      }
+      // a gap where an answer should be. Broadcast: a duel is visible to the channel.
+      await postHandedBackMessage({
+        response: reply,
+        channelArn,
+        botArn: thisBotArn,
+        logPrefix: '[ChannelFlow][battle]',
+        logContext: { battleId, botArn: thisBotArn, round: 1 },
+      });
     }),
   );
 }

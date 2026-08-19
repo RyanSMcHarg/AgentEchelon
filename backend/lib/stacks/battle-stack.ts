@@ -85,8 +85,11 @@ export class BattleStack extends cdk.Stack {
     //
     // BattleStateTable: per-bot state-machine rows for in-flight battles.
     // PK battleId (sha256(channelArn + ':' + userMessageId)[:16]) groups rows by
-    // battle invocation. SK botArn distinguishes the per-bot row. TTL 10 min
-    // ages out stale rows from crashed invocations.
+    // battle invocation. SK botArn distinguishes the per-bot row. The `ttl`
+    // attribute ages out stale rows from crashed invocations; the writers set
+    // it (`battleRowTtl`, battle-state.ts) to outlive the whole duel, because a
+    // row deleted while a SIBLING side is still legitimately in flight makes a
+    // half-read set look like a finished battle.
     const battleStateTable = new dynamodb.Table(this, 'BattleStateTable', {
       partitionKey: { name: 'battleId', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'botArn', type: dynamodb.AttributeType.STRING },

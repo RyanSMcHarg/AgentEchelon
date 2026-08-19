@@ -253,6 +253,26 @@ export class ChannelFlowStack extends cdk.Stack {
       // Pinned by `channel-flow-outlasts-router.test.ts`.
       timeout: cdk.Duration.seconds(35),
       memorySize: 256,
+      // THE 35s CEILING ABOVE DOES NOT SIZE THIS NUMBER. Concurrency is consumed by DURATION, not by
+      // the timeout, and the `@all` handoff returns at TTFF: the router classifies, dispatches the
+      // async processor and returns the placeholder, so it is back in the SLO's 1s target / 2s
+      // threshold (LATENCY-TARGETS), not at the 35s ceiling. At the 2s threshold, 50 slots sustain 25
+      // `@all` turns per second; an ordinary message takes the `callbackAllow` path and frees its slot
+      // in well under a second. The battle round-1 fan-out invokes the two sides with `Promise.all`,
+      // so a duel still occupies ONE slot for one TTFF, not two in series.
+      //
+      // RAISING THIS MAKES A BURST WORSE, WHICH IS WHY IT IS NOT RAISED. A reservation is a hard
+      // carve-out from the account's concurrency pool, and `AgentHandler` - the router this function
+      // invokes and WAITS on - holds no reservation of its own. Extra slots here therefore come out of
+      // the pool the callee draws from, and a throttled `RequestResponse` invoke throws rather than
+      // being retried, so the added capacity lands on the caller and the failure lands on the callee.
+      // A duel doubles that pressure: one flow slot issues two concurrent router invokes.
+      //
+      // What a burst past 50 actually does: Amazon Chime SDK invokes this processor ASYNC with
+      // `FallbackAction: CONTINUE` (below), so a throttled invocation is retried from Lambda's async
+      // queue rather than dropped, and only a wait past the flow's own deadline delivers the message
+      // unprocessed. Sustained saturation here is a router-latency incident, not a sizing one - the
+      // signal to act on is `@all` occupancy climbing toward the ceiling, not this number.
       reservedConcurrentExecutions: 50,
       role: processorRole,
       environment: {

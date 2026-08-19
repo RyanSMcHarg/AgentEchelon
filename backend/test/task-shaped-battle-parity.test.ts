@@ -69,10 +69,34 @@ describe('a duel side keeps its state transitions', () => {
     expect(code).toMatch(/if\s*\(\s*!battleCtx\s*\r?\n?\s*&&\s*\(classification\.intent === IntentType\.GREETING/);
   });
 
-  it('a duel side is looked up for an active task regardless of intent', () => {
-    // The greeting/ack skip is right for an ordinary turn and wrong for a duel side answering its own
-    // clarifying question with "ok" - that turn CONTINUES a chain the side already owns.
-    expect(code).toMatch(/if\s*\(battleCtx\s*\r?\n?\s*\|\|\s*\(classification\.intent !== IntentType\.GREETING/);
+  it('waiting work is looked up regardless of intent, and not only for a declared duel', () => {
+    // The greeting/ack skip is right for a message that OPENS work and wrong for one that ANSWERS it:
+    // "ok" is 2 characters and "thanks" is an exact token, so both reach the router as pleasantries
+    // while carrying a chain's continuation. Guarding the lookups on `battleCtx` did not cover the duel
+    // case either - a flow-callback turn carries no battle context - so the gate admits any turn in a
+    // conversation, and the short-message saving is the requester-keyed fallback below it.
+    expect(code).toContain('if (battleCtx || channelArn || !shortAcknowledgment) {');
+    expect(code).toMatch(/const shortAcknowledgment = classification\.intent === IntentType\.GREETING/);
+  });
+
+  it('a short answer that resumed waiting work is relabelled, so nothing downstream reads it as a greeting', () => {
+    // Corrected ONCE, where the work is found, rather than at each of the three branches that read the
+    // label: the quick reply returns before any dispatch, `selectDeliveryOption` maps a greeting to
+    // DIRECT so the task branch is skipped, and the exchange is attributed to the wrong intent.
+    const correctedAt = code.indexOf('if (resumedWaitingWork && shortAcknowledgment) {');
+    const relabelledAt = code.indexOf('classification.intent = IntentType.GENERAL;', correctedAt);
+    const quickReplyAt = code.indexOf('getQuickResponse(lexIntentName, userMessage)');
+    expect(correctedAt).toBeGreaterThan(-1);
+    expect(relabelledAt).toBeGreaterThan(correctedAt);
+    // And it is corrected BEFORE anything reads it, which is what makes one correction enough.
+    expect(relabelledAt).toBeLessThan(quickReplyAt);
+  });
+
+  it('the requester-keyed fallback stays off the short-message path', () => {
+    // It asks what this person has OPEN, not what is waiting on them, and costs a read per declared
+    // task type. A bare "thanks" absorbed by one of those is a message annexed by work it was not
+    // about, at the price of N reads on the cheapest turn there is.
+    expect(code).toContain('if (!activeTask && !shortAcknowledgment) {');
   });
 
   it('an existing chain is continued BEFORE a new battle task is created', () => {

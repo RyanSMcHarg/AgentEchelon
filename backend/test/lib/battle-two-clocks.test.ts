@@ -33,6 +33,7 @@ const BOT_A = 'arn:aws:chime:..:app-instance/i/bot/AltSlot0';
 /** The defaults the state layer uses when the env vars are unset. */
 const MACHINE_MS = 180_000;
 const USER_WAIT_MS = 3_600_000;
+const DUEL_MAX_LIFETIME_MS = 14_400_000;
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -40,6 +41,7 @@ beforeEach(() => {
   process.env.BATTLE_STATE_TABLE = 'battle-state-test';
   delete process.env.BATTLE_ROUND1_DEADLINE_MS;
   delete process.env.BATTLE_USER_WAIT_MS;
+  delete process.env.BATTLE_MAX_LIFETIME_MS;
   mockSend.mockResolvedValue({});
 });
 
@@ -202,5 +204,113 @@ describe('resuming puts the side BACK on the machine clock', () => {
     // `computeActiveResponseMs` subtracts this, so a slow human is never recorded as a slow assistant.
     const banked = update.input.ExpressionAttributeValues[':delta'] as number;
     expect(banked).toBeGreaterThanOrEqual(waitedFor - 5_000);
+  });
+});
+
+/**
+ * THE DEADLINE IS PER LEG. THE ROW IS NOT.
+ *
+ * The two clocks let a duel legitimately run for hours, and the writers kept stamping a ten-minute row
+ * TTL on the way past. Rows are read as a SET - `allBotsTerminal` asks about every side at once and the
+ * orchestrator pairs each side with its rival - so a row that ages out while a SIBLING is still
+ * legitimately in flight does not lose one leg's evidence, it silently changes the answer to a question
+ * about the whole duel.
+ *
+ * The shape, end to end: side A completes round 1 at t0. Side B asks a clarifying question and the
+ * person answers 45 minutes later, which the human clock explicitly permits. A's row is gone by then, so
+ * the query returns only B, `allBotsTerminal([B])` is true, the rival lookup finds nothing, and B is
+ * told its rival did not finish while A never gets round 2 at all. Nothing errors and nothing logs.
+ */
+describe('a row outlives the DUEL, not the leg that wrote it', () => {
+  /** Epoch seconds, the unit DynamoDB TTL is in. */
+  const secs = (ms: number) => Math.floor(ms / 1000);
+
+  it('a TERMINAL transition writes a TTL that outlives the whole duel', async () => {
+    mockSend.mockResolvedValueOnce({} as UpdateCommandOutput);
+    const before = Date.now();
+    const { transitionBotState } = await import('../../lambda/src/lib/battle-state');
+    await transitionBotState({
+      battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED', round1Reply: 'A answers', correlationId: 'c',
+    });
+
+    // This is the row the ORCHESTRATOR needs when the rival's human finally answers. A per-leg TTL puts
+    // it well inside the window the duel is allowed to keep running.
+    expect(ttlFrom(mockSend.mock.calls[0][0])).toBeGreaterThan(secs(before + DUEL_MAX_LIFETIME_MS));
+  });
+
+  it('a completed side is still there when its rival\'s human answers 45 minutes later', async () => {
+    mockSend.mockResolvedValueOnce({} as UpdateCommandOutput);
+    const before = Date.now();
+    const { transitionBotState } = await import('../../lambda/src/lib/battle-state');
+    await transitionBotState({ battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED', correlationId: 'c' });
+
+    // The rival's wait is bounded by USER_WAIT_MS, so surviving that bound is the minimum that keeps
+    // `allBotsTerminal` reading a complete set rather than a set with a hole in it.
+    expect(ttlFrom(mockSend.mock.calls[0][0])).toBeGreaterThan(secs(before + USER_WAIT_MS));
+  });
+
+  it('FAILED is a row the duel needs too, so it gets the same bound', async () => {
+    mockSend.mockResolvedValueOnce({} as UpdateCommandOutput);
+    const before = Date.now();
+    const { transitionBotState } = await import('../../lambda/src/lib/battle-state');
+    await transitionBotState({ battleId: BATTLE_ID, botArn: BOT_A, state: 'FAILED', correlationId: 'c' });
+
+    // A FAILED row is what makes the orchestrator say "<Name> didn't finish in time" out loud. Deleted,
+    // the side is simply absent and the duel degrades in silence.
+    expect(ttlFrom(mockSend.mock.calls[0][0])).toBeGreaterThan(secs(before + DUEL_MAX_LIFETIME_MS));
+  });
+
+  it('a terminal transition does NOT shorten the longer TTL a waiting side already carries', async () => {
+    // A deployment whose humans get longer than the default duel bound. The point is that the terminal
+    // write must never be the thing that cuts a row's life short, whatever the two bounds are set to.
+    process.env.BATTLE_USER_WAIT_MS = String(6 * 3_600_000); // 6h, past the 4h duel default
+    mockSend.mockResolvedValue({} as UpdateCommandOutput);
+
+    const state = await import('../../lambda/src/lib/battle-state');
+    await state.markBotWaitingForUser({ battleId: BATTLE_ID, botArn: BOT_A, question: 'which period?' });
+    const waitingTtl = ttlFrom(mockSend.mock.calls[0][0]);
+
+    await state.transitionBotState({ battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED', correlationId: 'c' });
+    const terminalTtl = ttlFrom(mockSend.mock.calls[1][0]);
+
+    // The transition transitions the state. Shortening the row's life is not part of that, and a
+    // waiting side whose TTL is cut on completion is the row that disappears out from under its rival.
+    expect(terminalTtl).toBeGreaterThanOrEqual(waitingTtl);
+  });
+
+  it('an INVOKED row outlives the duel too, so a crashed side stays visible in flight', async () => {
+    mockSend.mockResolvedValueOnce({} as PutCommandOutput);
+    const before = Date.now();
+    const { initBotState } = await import('../../lambda/src/lib/battle-state');
+    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'c' });
+
+    const call = mockSend.mock.calls[0][0];
+    // The row is written before the invoke precisely so a side that crashes is VISIBLE rather than
+    // missing. On the machine deadline's own TTL it becomes missing a few minutes later, which is the
+    // state it exists to rule out. The deadline stays per-leg; only the row's life is duel-scoped.
+    expect(deadlineFrom(call)).toBeLessThan(before + USER_WAIT_MS);
+    expect(ttlFrom(call)).toBeGreaterThan(secs(before + DUEL_MAX_LIFETIME_MS));
+  });
+
+  it('the round-2 fire claim outlives the duel it dedupes', async () => {
+    mockSend.mockResolvedValueOnce({} as PutCommandOutput);
+    const before = Date.now();
+    const { tryClaimOrchestratorFire } = await import('../../lambda/src/lib/battle-state');
+    await tryClaimOrchestratorFire(BATTLE_ID);
+
+    // The sentinel is the only thing stopping a redelivered orchestrator invocation fanning round 2 out
+    // a second time. An expired claim has stopped claiming.
+    expect(ttlFrom(mockSend.mock.calls[0][0])).toBeGreaterThan(secs(before + DUEL_MAX_LIFETIME_MS));
+  });
+
+  it('the bound is configuration: a longer duel bound produces longer-lived rows', async () => {
+    process.env.BATTLE_MAX_LIFETIME_MS = String(8 * 3_600_000); // 8h
+    mockSend.mockResolvedValueOnce({} as UpdateCommandOutput);
+    const before = Date.now();
+    const { transitionBotState } = await import('../../lambda/src/lib/battle-state');
+    await transitionBotState({ battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED', correlationId: 'c' });
+
+    // Same reason ADR-023 gives for refusing a bare constant: the arithmetic is per-deployment.
+    expect(ttlFrom(mockSend.mock.calls[0][0])).toBeGreaterThan(secs(before + 8 * 3_600_000));
   });
 });
