@@ -12,7 +12,7 @@
  * So the queue reads ONE store, keyed by the OWNER of the current step:
  *   - a task whose machine starts blocked on the person is owned by the person from creation, which is
  *     what made a duel waiting on someone visible at all;
- *   - `maybeHandOver` moves ownership at every `awaitsUser` boundary afterwards;
+ *   - `maybeHandOver` moves ownership at every `awaits` boundary afterwards;
  *   - `getActiveTasksForUser` answers "what do I owe" cross-channel from that one partition.
  *
  * The two cases named as this row's exit criteria are here: several sources in one list, and a

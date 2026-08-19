@@ -124,7 +124,9 @@ export interface ProfileDefinitionBody {
   /** Per-assistant task state machines (SPEC-CONFIGURABLE-ASSISTANTS 4.5), keyed by taskType. Preferred
    *  over the deployment intent-pack machines at loop time, so a triage assistant and a report assistant
    *  can carry DIFFERENT task lifecycles. Absent ⇒ inherit the deployment pack (byte-identical). Validated
-   *  (validateTaskStateMachines) at the write path AND here (shape/graph). */
+   *  (validateTaskStateMachines) at the write path AND here (shape/graph). A state says who it awaits with
+   *  `awaits: { party: 'requester' }`; the deprecated `awaitsUser: true` a version stored earlier is
+   *  accepted and means the same (SPEC-TASK-STATE-TRANSITIONS §12.6), so an older version still activates. */
   machines?: Record<string, TaskStateMachine>;
   /** Per-assistant PERSONA - the system-prompt body (SPEC-CONFIGURABLE-ASSISTANTS §2, SPEC-PORTABLE §5).
    *  Rides the versioned definition so two versions can differ in character and an export/import carries
@@ -296,8 +298,10 @@ export function validateDefinitionBody(body: Partial<ProfileDefinitionBody>): st
   }
   if (body.guardrailId !== undefined && (typeof body.guardrailId !== 'string' || !body.guardrailId)) errs.push('guardrailId must be a non-empty string');
   // Per-assistant task machines (4.5): validate the FULL graph (initial in states, every transition
-  // target declared, terminal shape) with the same checker the deployment pack uses, so a hostile /
-  // malformed version can't seed an invalid lifecycle that would strand tasks.
+  // target declared, terminal shape, and the party a waiting state declares) with the same checker the
+  // deployment pack uses, so a hostile / malformed version can't seed an invalid lifecycle that would
+  // strand tasks. Both accepted forms of the wait pass, so a version stored before the declared form
+  // existed still validates and activates.
   if (body.machines !== undefined) {
     if (typeof body.machines !== 'object' || body.machines === null || Array.isArray(body.machines)) {
       errs.push('machines must be a map of taskType→TaskStateMachine');

@@ -214,27 +214,38 @@ suite('Task machine state persists to the source of truth (SPEC-TASK-STATE-TRANS
 
       // 2) The §6 transition log, if present, is well-formed: declared endpoints, an AUTHORIZED edge,
       //    and tool/system-authored (never a silent mutation).
+      //
+      //    ONLY THE GRAPH EDGES ARE EDGES. The log carries three kinds of entry and two of them name
+      //    no state: `reassignTask` appends ownership entries (`ownerFrom`/`ownerTo`, ADR-024 D3) and
+      //    `updateTaskStatus` appends the lifecycle ending (`terminal`). Reading every entry as an
+      //    edge reports a healthy task as malformed - and a report task crosses an `awaits`
+      //    boundary the moment it leaves its first step, so that is not a rare shape.
       const history: Array<Record<string, any>> = Array.isArray(task.stateHistory) ? task.stateHistory : [];
-      history.forEach((e, i) => {
-        expect(REPORT_STATES.has(e.from), `[${tc.tier}] stateHistory[${i}].from '${e.from}' is declared`).toBe(true);
-        expect(REPORT_STATES.has(e.to), `[${tc.tier}] stateHistory[${i}].to '${e.to}' is declared`).toBe(true);
+      const edges = history.filter((e) => typeof e.from === 'string' && typeof e.to === 'string');
+      edges.forEach((e, i) => {
+        expect(REPORT_STATES.has(e.from), `[${tc.tier}] stateHistory edge[${i}].from '${e.from}' is declared`).toBe(true);
+        expect(REPORT_STATES.has(e.to), `[${tc.tier}] stateHistory edge[${i}].to '${e.to}' is declared`).toBe(true);
         expect(
           REPORT_GEN_EDGES[e.from]?.includes(e.to),
-          `[${tc.tier}] stateHistory[${i}] edge ${e.from}->${e.to} is authorized`,
+          `[${tc.tier}] stateHistory edge[${i}] ${e.from}->${e.to} is authorized`,
         ).toBe(true);
+      });
+      // Authorship holds for EVERY entry, whichever kind it is: nothing writes this log but the tool
+      // dispatch and the runtime.
+      history.forEach((e, i) => {
         expect(['tool', 'system'], `[${tc.tier}] stateHistory[${i}].by`).toContain(e.by);
       });
 
       // 3) Consistency: current state == the last recorded transition target (when any transition ran).
-      if (history.length) {
-        expect(task.taskState, `[${tc.tier}] taskState should match the last stateHistory.to`).toBe(
-          history[history.length - 1].to,
+      if (edges.length) {
+        expect(task.taskState, `[${tc.tier}] taskState should match the last recorded edge's target`).toBe(
+          edges[edges.length - 1].to,
         );
       }
 
       // Basic runs the full task loop too, but on Haiku it typically stays at the initial state with no
       // tool transitions, which is a valid pass. Standard/premium MAY have advanced. Log the observed shape.
-      console.log(`[${tc.tier}] taskState=${task.taskState} transitions=${history.length}`);
+      console.log(`[${tc.tier}] taskState=${task.taskState} edges=${edges.length} entries=${history.length}`);
     });
   }
 });

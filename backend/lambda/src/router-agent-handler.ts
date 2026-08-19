@@ -40,6 +40,7 @@ import {
   intentToDeliveryOption,
 } from './lib/intent-classifier.js';
 import { hydrateIntentPackFromSsm, responseSettingsForIntent, activeIntentPackRaw, taskStateMachines } from './lib/intent-pack.js';
+import { awaitedPartyOf } from './lib/task-state-machines.js';
 import { componentVersion } from './lib/config-identity.js';
 import {
   DeliveryOption,
@@ -47,7 +48,16 @@ import {
   getQuickResponse,
   getTaskPlaceholder,
 } from './lib/delivery-options.js';
-import { applyUserResponseToTask, createTask, getActiveTask, getActiveTaskForOwner, getActiveTasksForOwnerInChannel, principalIdFromArn, TRIP_TASK_TTL_SECONDS, type TaskCreateOptions, type UserTask } from './lib/task-tracking.js';
+import { applyUserResponseToTask, createTask, getActiveTask, getActiveTaskForOwner, getOwnerChannelTasks, getTask, principalIdFromArn, RECENTLY_ENDED_TASK_WINDOW_MINUTES, taskEndedAt, TRIP_TASK_TTL_SECONDS, type TaskCreateOptions, type UserTask } from './lib/task-tracking.js';
+
+/**
+ * How long after a task ends the conversation is still treated as being about it, in milliseconds.
+ *
+ * Derived once from the named minutes constant (`task-tracking.ts`, which carries the reasoning for
+ * the default and the trade it accepts) rather than recomputed at each of the three sites that use
+ * it, so a deployment that tunes the window tunes all of them.
+ */
+const RECENTLY_ENDED_WINDOW_MS = RECENTLY_ENDED_TASK_WINDOW_MINUTES * 60 * 1000;
 // The duel a channel currently has in flight, and who owns it. Read on the resume path below: a
 // waiting duel side's chain is resumed through the ORDINARY Lex turn, so the handler is where the
 // battle row has to be moved off `WAITING_FOR_USER`.
@@ -73,6 +83,10 @@ import { resolveActiveProfile, concreteModel } from './lib/active-profile.js';
 import type { ProfileDefinition } from './lib/active-profile.js';
 import { randomUUID } from 'crypto';
 import { runLiveDriftFlow } from './lib/live-drift-flow.js';
+// Whether a turn continues in this conversation rather than being offered a new one. One named
+// decision, so the two-axis rule that replaces it (task-relatedness, then conversation-relatedness)
+// changes that function's body and no call site here.
+import { resolveTaskContinuity } from './lib/task-continuity.js';
 import {
   parseWelcomeOrientationDetailed,
   composeWelcome,
@@ -845,7 +859,7 @@ function isFlowEntry(event: LexEvent): boolean {
  *
  * SEPARATE FROM WHICH LOOKUP FOUND THE CHAIN, and that is the whole reason it is a function. It used
  * to live inside the assistant's-own-chain branch, which was right when a duel side's chain was owned
- * by the assistant. Under the ownership split a chain that starts in an `awaitsUser` state is held by
+ * by the assistant. Under the ownership split a chain that starts in a waiting state (`awaits`) is held by
  * the PERSON from its first moment, so the person-owed lookup finds it first and the assistant's branch
  * never runs - and the resume went with it. The task advanced, the battle row stayed waiting, round 2
  * stayed suspended, and nothing errored: the person's answer was accepted and the duel simply never
@@ -1002,43 +1016,33 @@ async function handOverToOwningAssistant(args: {
     return false;
   }
 
-  // ONCE PER INBOUND MESSAGE. Delivery is at-least-once, and this runs ahead of the turn's own
-  // correlation claim (`fulfil-`), which cannot cover it: that claim is minted per FULFILLMENT, and a
-  // redelivery of the same message is a new one. Unclaimed, a duplicate delivery gives the person two
-  // receipts and the owning assistant two turns on one message - the visible half of the same defect
-  // the placeholder claim exists to prevent.
+  // ONCE PER INBOUND MESSAGE, AND THE MARK RECORDS A DISPATCH THAT HAPPENED. Delivery is
+  // at-least-once, and this runs ahead of the turn's own correlation claim (`fulfil-`), which cannot
+  // cover it: that claim is minted per FULFILLMENT, and a redelivery of the same message is a new one.
+  // Unmarked, a duplicate delivery gives the person two receipts and the owning assistant two turns on
+  // one message - the visible half of the same defect the placeholder claim exists to prevent.
+  //
+  // TAKEN BEFORE THE DISPATCH, THE MARK CAUSED WHAT IT PREVENTED. A container that died between
+  // claiming and invoking left the mark standing with no turn behind it, and the redelivery read it as
+  // "the first handover stands" - so no invoke was ever issued and nobody answered the person at all.
+  // The mark is therefore a record of a dispatch, written after one, and a delivery that finds no mark
+  // does the work: the first delivery, or the redelivery of one that never got there.
+  //
+  // WHAT THAT TRADES. Two deliveries inside the dispatch window - the invoke itself - both find no
+  // mark and both dispatch. Priced deliberately: a redelivery arrives seconds later rather than inside
+  // a millisecond invoke, and a doubled answer is recoverable where a dropped one is not.
   //
   // Keyed on the message, so it is the same key from either entry (`inboundMessageId`). Fails OPEN
-  // like every other claim: a dedup table hiccup must not swallow a person's answer.
+  // like every claim here: a dedup table hiccup must not swallow a person's answer.
   const inboundId = inboundMessageId(event);
-  if (inboundId && !(await claimCorrelation(`handover-${inboundId}`))) {
-    console.log('[Router] duplicate delivery of a handed-over message; the first handover stands', {
+  const handoverMark = inboundId ? `handover-${inboundId}` : '';
+  if (handoverMark && await hasCorrelationClaim(handoverMark)) {
+    console.log('[Router] this message was handed over already; the first handover stands', {
       taskId: task.taskId, messageId: inboundId,
     });
     // TRUE, not false. The handover already happened, so this delivery owes nothing - falling through
     // to answer it would put the receiving assistant's reply beside the owning assistant's.
     return true;
-  }
-
-  // THE RECEIPT GOES FIRST, and it is posted rather than returned. A Lex reply inherits the INBOUND's
-  // targeting, so returning this as the turn's message would make it public exactly when the person did
-  // not address anyone - broadcasting to the channel that a message it never saw was passed somewhere.
-  // Targeted here explicitly, which is the whole of rule 2's "the code targets it".
-  //
-  // Best-effort, and the handover proceeds either way: a person who gets the answer without the receipt
-  // has lost a courtesy, and one who gets the receipt without the answer has lost the point.
-  try {
-    await chimeClient.send(new SendChannelMessageCommand({
-      ChannelArn: channelArn,
-      Content: encodeURIComponent(handoverAcknowledgement(await owningAssistantDisplayName(owningBotArn))),
-      Type: ChannelMessageType.STANDARD,
-      Persistence: ChannelMessagePersistenceType.PERSISTENT,
-      ChimeBearer: selfBotArn,
-      Target: [{ MemberArn: senderArn }],
-      Metadata: JSON.stringify({ botResponse: true }),
-    }));
-  } catch (err) {
-    console.warn('[Router] could not post the handover receipt (the handover still proceeds):', err);
   }
 
   const aeTurn: TurnRequest = {
@@ -1047,7 +1051,7 @@ async function handOverToOwningAssistant(args: {
     userMessage: event.inputTranscript ? decodeURIComponent(event.inputTranscript) : '',
     botArn: owningBotArn,
     handedOverFrom: selfAssistantId,
-    ...(inboundMessageId(event) && { userMessageId: inboundMessageId(event) }),
+    ...(inboundId && { userMessageId: inboundId }),
   };
   try {
     await lambdaClient.send(new InvokeCommand({
@@ -1063,7 +1067,44 @@ async function handOverToOwningAssistant(args: {
     }));
   } catch (err) {
     console.error('[Router] handover invoke failed; answering as an ordinary turn instead:', err);
+    // NOTHING WAS SAID AND NOTHING WAS MARKED, which is what makes falling back honest: the caller
+    // answers this as an ordinary turn without a receipt contradicting it, and a redelivery is free to
+    // attempt the handover again.
     return false;
+  }
+
+  // The dispatch stands, so record it - and let the RECORD decide who speaks. A delivery that loses
+  // this claim raced one that already dispatched and posted, so it stays quiet rather than telling the
+  // person a second time where their answer went.
+  const speaksForTheHandover = !handoverMark || await claimCorrelation(handoverMark);
+
+  // THE RECEIPT FOLLOWS THE DISPATCH, and it is POSTED rather than returned.
+  //
+  // It follows because it is a promise about something that has to be true by the time it is read.
+  // Sent first, an invoke that then threw left the person told that another assistant had their answer
+  // while this one answered it instead, under a name they were never given.
+  //
+  // It is posted rather than returned because a Lex reply inherits the INBOUND's targeting, so
+  // returning this as the turn's message would make it public exactly when the person did not address
+  // anyone - broadcasting to the channel that a message it never saw was passed somewhere. Targeted
+  // here explicitly, which is the whole of rule 2's "the code targets it".
+  //
+  // Best-effort in this direction only: a person who gets the answer without the receipt has lost a
+  // courtesy, so a failed post does not undo a dispatch that already stands.
+  if (speaksForTheHandover) {
+    try {
+      await chimeClient.send(new SendChannelMessageCommand({
+        ChannelArn: channelArn,
+        Content: encodeURIComponent(handoverAcknowledgement(await owningAssistantDisplayName(owningBotArn))),
+        Type: ChannelMessageType.STANDARD,
+        Persistence: ChannelMessagePersistenceType.PERSISTENT,
+        ChimeBearer: selfBotArn,
+        Target: [{ MemberArn: senderArn }],
+        Metadata: JSON.stringify({ botResponse: true }),
+      }));
+    } catch (err) {
+      console.warn('[Router] could not post the handover receipt (the handover still stands):', err);
+    }
   }
   console.log('[Router] handed the turn to the assistant that owns the chain', {
     taskId: task.taskId, from: selfAssistantId, to: owningAssistantId,
@@ -1805,6 +1846,54 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
 
     let activeTask: UserTask | null = null;
     /**
+     * THIS CHANNEL HAS LIVE WORK IN IT, whoever currently holds it.
+     *
+     * Distinct from `activeTask`, which is the chain this turn CONTINUES and is therefore owner-scoped
+     * on purpose - a duel side must never resume its rival's work, and a bare "thanks" must not be
+     * annexed by a task nobody was blocked on the speaker for. Drift asks a different question, and it
+     * is the broader one: is the assistant mid-workflow in this conversation. It is, whether the
+     * machine currently rests on the person or on the assistant.
+     *
+     * WHY THE OWNER-KEYED ANSWER WAS THE WRONG ONE. Suppression was keyed on `activeTask`, so it held
+     * only while a state declared `awaits`. A state that ends its turn on a question and forgets
+     * the flag therefore lost drift protection silently: `report_generation.drafting_outline` did, and
+     * a one-line answer to the assistant's own outline question ("Can you make it 1-2 pages?") was
+     * served an offer to split the conversation instead of an answer. The flag is worth declaring for
+     * its own reasons (ownership, the person's queue), but drift must not depend on it being right.
+     *
+     * NO EXTRA READ. Every value below comes from lookups this turn already makes: the person's held
+     * list, the assistant's own partition (read on the same branch), and the requester-keyed fallback.
+     * All of them filter to `pending` and `in_progress`, so anything they return IS live.
+     */
+    let liveTaskInChannel = false;
+    /**
+     * WORK THAT FINISHED HERE A MOMENT AGO, which the conversation is probably still about.
+     *
+     * A message arriving shortly after a task ends is usually about the thing that was just delivered:
+     * "Where is the file?", "Can you make it shorter?". Nothing in the live-task signal above reaches
+     * that turn, because every task lookup on this path filters to `pending`/`in_progress` and a
+     * finished task is invisible to all of them. Measured on the same live conversation that produced
+     * the `drafting_outline` failure: the report was delivered, the person said "Looks good", the
+     * assistant said it had saved the file, and "Where is the file?" was answered with an offer to
+     * start a separate conversation.
+     *
+     * PROVISIONAL UNTIL THE LOG CONFIRMS IT. The mirror row's `updatedAt` is when the ending was
+     * MIRRORED, and a task's ending is recorded in its `stateHistory`
+     * (SPEC-TASK-STATE-TRANSITIONS §6, which is explicit that there is no `resolvedAt` scalar beside
+     * that log). So the widened query is a pre-filter and the ending is read from the log before this
+     * is believed - one GetItem, taken only when the pre-filter matched AND nothing live was found,
+     * which is precisely the rare turn this exists for.
+     *
+     * WHAT IT DOES NOT COVER, and these are real: work that ended longer ago than the window; a
+     * conversation whose task never reached a terminal state at all (the model delivered without
+     * declaring it, in which case the task is still live and the signal above catches it instead); a
+     * follow-up about something the assistant said that was never a task; and the first follow-up in a
+     * conversation that has no task history. None of those are reachable from a task lookup, and the
+     * anchor that would reach them is a design question recorded in SPEC-DRIFT-CONVERGENCE rather than
+     * a widening of this one.
+     */
+    let recentlyEndedTaskHere: UserTask | null = null;
+    /**
      * This turn is the answer to a chain THIS ASSISTANT owns (a duel side, or any assistant-held
      * work), resumed below.
      *
@@ -1816,13 +1905,36 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
      * message (owner, 2026-08-14).
      */
     let resumedOwnChain = false;
-    // A DUEL SIDE IS LOOKED UP REGARDLESS OF INTENT (ADR-026). The greeting/acknowledgment skip is right
-    // for an ordinary turn - a bare "thanks" opens no work - but a duel side answering its own
-    // clarifying question with "ok" is CONTINUING a chain it already owns, and skipping the lookup there
-    // is how that chain gets abandoned mid-flight.
-    if (battleCtx
-        || (classification.intent !== IntentType.GREETING
-          && classification.intent !== IntentType.ACKNOWLEDGMENT)) {
+    /**
+     * The message is one the classifier settles without a model: under 3 characters, or an exact
+     * greeting/acknowledgement token (`fastPathIntent`). "ok" and "thanks" are both.
+     */
+    const shortAcknowledgment = classification.intent === IntentType.GREETING
+      || classification.intent === IntentType.ACKNOWLEDGMENT;
+    /**
+     * This turn resumed work that was WAITING on this person, which makes it a continuation whatever
+     * its length. Read below, once, to correct the classification the fast path gave it.
+     */
+    let resumedWaitingWork = false;
+    // WHAT IS WAITING ON THIS PERSON IS LOOKED UP REGARDLESS OF INTENT (ADR-026). The
+    // greeting/acknowledgment skip is right for a message that OPENS work, since a bare "thanks" opens
+    // none, and wrong for one that ANSWERS it. Answering a clarifying question with "ok" (2 characters)
+    // or "thanks" (an exact token) is how people answer, and every continuation path sits behind this
+    // gate: the response is never applied to the awaited task, the assistant's own chain is never
+    // resumed, and the duel side is never taken out of `WAITING_FOR_USER`.
+    //
+    // `battleCtx` did not rescue the duel case, which is why it is not the guard: a flow-callback turn
+    // carries no battle context at all (the callback has no `Target`, see channel-flow-processor), so
+    // the person got a canned quick reply, the battle row stayed WAITING_FOR_USER, and the chain sat
+    // there until the deadline reported an assistant that had in fact been answered as never finished.
+    //
+    // WHAT IT COSTS: one strongly-consistent Query on this person's queue for every short message,
+    // plus the reads the resume paths make when that finds nothing (the assistant's own partition, the
+    // channel's duel pointer). The same reads an ordinary turn already pays, and there is no cheaper
+    // way to answer "is anything waiting on this person" - which is precisely the question the quick
+    // reply further down is an answer to. The requester-keyed fallback is the one lookup a short
+    // message still skips; see the guard on it below.
+    if (battleCtx || channelArn || !shortAcknowledgment) {
       if (battleCtx) {
         // A DUEL SIDE'S CHAIN IS OWNED BY THE ASSISTANT, NOT THE HUMAN (ADR-024). Each side runs its
         // own chain for one user prompt, so `getActiveTask(userSub, ...)` would find the person's task
@@ -1832,10 +1944,16 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // battle continuation used to resolve this itself and pass a delivery option down, which was
         // the channel flow deciding a turn question.
         activeTask = await getActiveTaskForOwner(principalIdFromArn(botArn), channelArn);
+        // A duel turn reads the ASSISTANT's partition only, so this is what it can say about live work
+        // without a second query. Narrower than the ordinary branch below by exactly the person's own
+        // chains, and deliberately left that way: a battle turn already spends the reads it needs, and
+        // adding a person-keyed query here to widen a suppression would be a per-turn read bought for
+        // one branch. A duel side's chain is the live work in a duel channel in any case.
+        liveTaskInChannel = liveTaskInChannel || !!activeTask;
       } else {
         // THE MESSAGE IS THE RESPONSE TO THE WORK THIS PERSON OWES, and that is asked FIRST.
         //
-        // A task in a state declared `awaitsUser` was handed to the user (ADR-024 ownership), so it is
+        // A task in a state that declares `awaits` was handed to the user (ADR-024 ownership), so it is
         // findable by owner without anything being tagged, carried or parsed out of message content -
         // which is what lets this work identically for every workflow instead of each inventing its
         // own waiting signal. The queue has already brought them to this conversation; speaking here
@@ -1848,7 +1966,19 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // helpers both delegate to this same strongly-consistent Query with the same key condition
         // and filter, so calling them separately issued up to two byte-identical reads per ordinary
         // turn; the list is fetched once and each question is answered from it.
-        const heldByPerson = channelArn ? await getActiveTasksForOwnerInChannel(userSub, channelArn) : [];
+        // ONE query, both questions: what this person holds here, and what of theirs ended here within
+        // the window. The ended half is free - the filter runs after the read, so those rows are paid
+        // for by the channel scan whether or not they are handed back.
+        const personTasks = channelArn
+          ? await getOwnerChannelTasks(userSub, channelArn, { endedWithinMs: RECENTLY_ENDED_WINDOW_MS })
+          : { live: [], recentlyEnded: [] };
+        const heldByPerson = personTasks.live;
+        // Live work this person holds here. Recorded for drift the moment it is read, not when a
+        // continuation decides to use it: the two branches below can legitimately decline to continue
+        // one (it belongs to another assistant, or another person is the one being waited on), and the
+        // conversation is mid-workflow either way.
+        liveTaskInChannel = liveTaskInChannel || heldByPerson.length > 0;
+        recentlyEndedTaskHere = recentlyEndedTaskHere ?? personTasks.recentlyEnded[0] ?? null;
         const owed = heldByPerson[0] ?? null;
         // WHICH of the chains this person holds, when they hold more than one. The lookup above returns
         // the NEWEST, and the moment two duel sides both wait on the same person that names two rows -
@@ -1890,7 +2020,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
             assistantId: principalIdFromArn(botArn),
             // The DEPLOYMENT pack, not the profile's overrides: the active profile version is resolved
             // later in this turn, after this point. The cost is bounded and degrades safely - a state
-            // that only a profile's custom machine declares `awaitsUser` is not advanced here, and the
+            // that only a profile's custom machine declares `awaits` on is not advanced here, and the
             // model's `advance_task_state` on the worker, which does have the merged machines, moves it
             // instead. Nothing is advanced WRONGLY; at worst it is advanced one hop later.
             machines: taskStateMachines(),
@@ -1903,10 +2033,13 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
           // machine and handed the work back, and a deferred branch has handed it back for the model
           // to resolve with `advance_task_state`.
           activeTask = answered;
+          // Something WAS waiting on this person and this message answered it, so the turn is a
+          // continuation however short the message is.
+          resumedWaitingWork = true;
 
           // AND IF THAT CHAIN IS A DUEL SIDE'S, take the side out of `WAITING_FOR_USER` too.
           //
-          // THIS IS THE PATH A DUEL ACTUALLY TAKES. A duel side's chain starts in an `awaitsUser`
+          // THIS IS THE PATH A DUEL ACTUALLY TAKES. A duel side's chain starts in an `awaits`
           // state, so the person holds it from its first moment and THIS lookup is the one that finds
           // it - the assistant's-own-chain branch below never runs for it. Measured on the deployment:
           // the response was applied here, the battle row was never touched, and both sides sat in
@@ -1942,19 +2075,38 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
           // it waits on them (that is what puts it in their queue), so it is found in their partition -
           // and `assistantId` is what picks THIS assistant's chain out of it. Two duel sides wait on
           // the same person, so without that a side could resume its rival's work.
-          const mine = heldByPerson.find((t) => t.assistantId === principalIdFromArn(botArn))
+          let mine = heldByPerson.find((t) => t.assistantId === principalIdFromArn(botArn)) ?? null;
+          if (!mine) {
             // A chain the assistant still holds (its state does not await anyone) or one written
             // before `assistantId` existed. A DIFFERENT partition (the bot as owner), so this one
-            // is a real read.
-            ?? await getActiveTaskForOwner(principalIdFromArn(botArn), channelArn);
-          // ONLY A CHAIN THAT IS ACTUALLY BLOCKED ON A PERSON. `awaitsUser` is the machine declaring
-          // "I cannot go further without an answer", and it is the whole licence for reading an
-          // ordinary message as that answer. A chain merely IN PROGRESS must not absorb what someone
-          // says in the channel: that is a person's message being annexed by work they were not
+            // is a real read - and it is where a FINISHED chain's mirror row lives too, since a report
+            // is handed back to the assistant before it completes. Same query, both answers; the
+            // short-circuit above is kept so a person already holding this assistant's chain still
+            // costs nothing here.
+            const ownTasks = await getOwnerChannelTasks(
+              principalIdFromArn(botArn), channelArn, { endedWithinMs: RECENTLY_ENDED_WINDOW_MS },
+            );
+            mine = ownTasks.live[0] ?? null;
+            recentlyEndedTaskHere = recentlyEndedTaskHere ?? ownTasks.recentlyEnded[0] ?? null;
+          }
+          // THE READ THAT ANSWERS THE DRIFT QUESTION FOR THE REPORTED FAILURE, and it is already here.
+          // A chain the assistant still holds is live work in this conversation even though the
+          // continuation below declines to resume it - `blockedOnAPerson` is a rule about whose message
+          // may move a machine, not about whether the workflow is running. Recording it here is what
+          // makes the suppression independent of a state remembering to declare `awaits`.
+          liveTaskInChannel = liveTaskInChannel || !!mine;
+          // ONLY A CHAIN THAT IS ACTUALLY BLOCKED ON A PERSON. `awaits` is the machine declaring
+          // "I cannot go further without an answer from this party", and it is the whole licence for
+          // reading an ordinary message as that answer. A chain merely IN PROGRESS must not absorb what
+          // someone says in the channel: that is a person's message being annexed by work they were not
           // talking about, and it is what the guard test on this path exists to prevent.
+          //
+          // Through the normalizer, so a per-profile machine authored in either accepted form is read
+          // the same way. The only shipped reference is `requester`, a person, so the question this
+          // answers is unchanged; WHO is being waited on is settled just below.
           const blockedOnAPerson = Boolean(
             mine?.taskState
-            && taskStateMachines()[mine.taskType]?.states?.[mine.taskState]?.awaitsUser === true,
+            && awaitedPartyOf(taskStateMachines()[mine.taskType]?.states?.[mine.taskState]),
           );
           if (mine && blockedOnAPerson) {
             // WHO IS THIS WAITING ON. A duel's answer belongs to the person who started it (tracker
@@ -1981,6 +2133,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
               });
               activeTask = mine;
               resumedOwnChain = true;
+              resumedWaitingWork = true;
               console.log('[Router] resuming the chain this assistant owns', {
                 taskId: mine.taskId, ...applied,
               });
@@ -2012,11 +2165,17 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
               // A duel is a comparison: the resumed side's answer is posted publicly, same as the
               // task-shaped resumes above.
               resumedOwnChain = true;
+              resumedWaitingWork = true;
             }
           }
         }
 
-        if (!activeTask) {
+        // NOT FOR A SHORT MESSAGE, and that is the one lookup it still skips. Every branch above asks
+        // what is WAITING on this person; this one asks what this person has open at all - it is keyed
+        // on the requester, so it finds chains nobody is blocked on them for, and it costs a read per
+        // declared task type. Letting a bare "thanks" be absorbed by one of those is a message being
+        // annexed by work it was not about, at the price of N reads on the cheapest turn there is.
+        if (!activeTask && !shortAcknowledgment) {
           // EVERY declared task type, from the authoritative machines - not a hand-maintained list.
           // The literal trio this replaces omitted place_item/action_item and any pack-defined type,
           // so a continuation that missed the owner lookups found nothing here and the multi-step
@@ -2031,6 +2190,71 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         }
       }
     }
+    // The requester-keyed fallback and both resume branches can each be the first to name live work,
+    // so the last word is taken once, here, rather than repeated at every site that assigns a task.
+    liveTaskInChannel = liveTaskInChannel || !!activeTask;
+
+    // A SHORT ANSWER TO A WAITING QUESTION IS NOT A PLEASANTRY, so the classification is corrected
+    // here - once, in the same place and for the same reason as the attachment correction above. The
+    // fault is the label, not the three things that read it: `getQuickResponse` answers "Let me know
+    // if you have other questions" and returns, so no worker is dispatched and the chain this turn
+    // just resumed gets no turn; `selectDeliveryOption` maps a greeting to DIRECT, so even without the
+    // quick reply the task branch is skipped; and the exchange is attributed to the wrong intent.
+    //
+    // ONLY WHEN SOMETHING WAS ACTUALLY RESUMED. A person with nothing waiting on them keeps their
+    // greeting, their canned reply and their unspent model call, which is what the fast path is for.
+    if (resumedWaitingWork && shortAcknowledgment) {
+      console.log('[Router] a short message answered work that was waiting; not treating it as a greeting', {
+        classifiedAs: classification.intent,
+        taskId: activeTask?.taskId,
+        battleId: battleCtx?.battleId,
+      });
+      classification.intent = IntentType.GENERAL;
+    }
+
+    // THE ENDING IS READ FROM THE LOG THAT RECORDS IT, and only when it can still change the answer.
+    //
+    // The widened queries above hand back a finished chain by the MIRROR's `updatedAt`, which is when
+    // the ending was mirrored rather than when it happened - a second instant for a fact
+    // `stateHistory` already holds, and SPEC-TASK-STATE-TRANSITIONS §6 is explicit that the log is
+    // the record and there is deliberately no `resolvedAt` beside it. So the mirror decides only
+    // whether to LOOK, and the log decides.
+    //
+    // ONE GetItem, and it is skipped on every turn that cannot use it: a turn with live work is
+    // already suppressed, and a turn with nothing recently ended has nothing to confirm. What is left
+    // is a conversation whose task finished minutes ago, which is the turn this exists for.
+    let recentlyEndedWithinWindow = false;
+    if (!liveTaskInChannel && recentlyEndedTaskHere && channelArn) {
+      const ended = await getTask(recentlyEndedTaskHere.taskId, channelArn);
+      const endedAt = taskEndedAt(ended);
+      recentlyEndedWithinWindow = Boolean(
+        endedAt && Date.now() - Date.parse(endedAt) <= RECENTLY_ENDED_WINDOW_MS,
+      );
+      if (recentlyEndedWithinWindow) {
+        console.log('[Router] work finished here a moment ago; this turn is read as being about it', {
+          taskId: recentlyEndedTaskHere.taskId,
+          taskType: recentlyEndedTaskHere.taskType,
+          endedAt,
+          windowMinutes: RECENTLY_ENDED_TASK_WINDOW_MINUTES,
+        });
+      }
+    }
+
+    // WHETHER THIS TURN CONTINUES HERE, decided in ONE named place (`lib/task-continuity.ts`) rather
+    // than as a boolean assembled in the argument list below. The inputs are what this turn already
+    // read; the RULE is what is going to change.
+    //
+    // WHAT IT DOES TODAY IS AN INTERIM, and blunter than the intent: any live task in this
+    // conversation means continue here, whatever the person just said. The target design asks TWO
+    // questions - is the message unrelated to the TASK, and if so is it also unrelated to the
+    // CONVERSATION - and only the second is drift. Read `task-continuity.ts` before changing this: it
+    // carries the target, the cost this interim accepts (while a task is open, a genuinely new
+    // subject is never offered its own conversation), and the signal the two-axis version needs and
+    // does not have.
+    const continuity = resolveTaskContinuity({
+      liveTaskInChannel,
+      recentlyEndedTaskInChannel: recentlyEndedWithinWindow,
+    });
 
     const driftResponse = await runLiveDriftFlow({
       event,
@@ -2040,7 +2264,14 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       classification: effectiveClassification as 'basic' | 'standard' | 'premium',
       botArn,
       intent: classification.intent,
-      activeTaskInProgress: !!activeTask,
+      // The field name is the WIRE contract: `detectDrift` runs in the data-plane Lambda and this
+      // value crosses that boundary as JSON, so it is deliberately not renamed to match the widened
+      // meaning. Renaming it would mean a router and a data plane deployed minutes apart disagree
+      // about a field, and the failure would be silent - the suppression simply stops, exactly as it
+      // did here. `taskSignal` is additive for the same reason: an older data plane that has never
+      // heard of it still suppresses, and only loses the finer counter.
+      activeTaskInProgress: continuity.continueHere,
+      taskSignal: continuity.signal,
     });
     if (driftResponse) {
       return formatLexResponse(event, driftResponse.messages, driftResponse.sessionAttributes);
@@ -2166,9 +2397,12 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // canned greetings and no comparison.
     //
     // Reachable, not theoretical: the flow strips the command before dispatch (`stripBattleCommand`), so
-    // `/battle hello` arrives at the classifier as `hello` and classifies as a greeting. The continuation
-    // case is likelier still - a user answering a clarifying question with "ok" or "thanks" is an
-    // ACKNOWLEDGMENT, and that turn is the one carrying the resumed side's whole chain.
+    // `/battle hello` arrives at the classifier as `hello` and classifies as a greeting.
+    //
+    // A CONTINUATION NO LONGER ARRIVES HERE AS A GREETING AT ALL. Answering a clarifying question with
+    // "ok" or "thanks" is an ACKNOWLEDGMENT carrying a whole chain, and `!battleCtx` never caught it:
+    // a flow-callback turn has no battle context. That turn is relabelled GENERAL above, on the lookup
+    // that finds the work it answers, so what reaches this guard is the pleasantry it was written for.
     //
     // The fan-out used to enforce this itself; the round-1 handoff moved the decision here and did not
     // bring the guard with it. Falling through to `PLACEHOLDER_UPDATE` costs a duel one model call and

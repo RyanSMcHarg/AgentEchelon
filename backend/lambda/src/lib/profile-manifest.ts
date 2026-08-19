@@ -405,7 +405,9 @@ export async function importManifest(
   // resource that does not exist here (and a hand-authored one may carry a catalog KEY like 'strict').
   // Unvalidated, that landed a draft whose guardrail can never be applied. It is also the ONE
   // cross-deployment reference import did not check: models are checked against the target catalog,
-  // tools against the registry, machines structurally, and the target profile must be provisioned.
+  // tools against the registry, machines structurally (a machine's wait declaration is accepted in
+  // either form, so a manifest exported before the declared one existed still imports), and the target
+  // profile must be provisioned.
   //
   // Resolution order, mirroring the models rule:
   //   - already a resolved id in THIS target's catalog  -> accept unchanged;

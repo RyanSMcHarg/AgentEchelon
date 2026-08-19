@@ -74,12 +74,23 @@ function readGuardrailCatalog(classification: string): Array<{ key: string; name
   return JSON.parse(out);
 }
 
-/** A custom task machine that is DISTINCT from the deployment default report_generation (extra state). */
+/**
+ * A custom task machine that is DISTINCT from the deployment default report_generation (extra state).
+ *
+ * DELIBERATELY AUTHORED IN THE DEPRECATED WAIT FORM (`awaitsUser`), and it stays that way. This is the
+ * only place the copy -> edit -> validate -> activate -> export -> import path is exercised against a
+ * live deployment, and the promise the platform makes is that a machine stored before
+ * `awaits: { party: 'requester' }` existed keeps working through every one of those steps
+ * (SPEC-TASK-STATE-TRANSITIONS §12.6). A fixture moved to the declared form would assert the new
+ * spelling twice over and leave the compatibility promise untested where it matters most: on real
+ * stored configuration rather than in a unit fixture. The declared form is covered end to end by the
+ * shipped machines this profile overrides.
+ */
 const CUSTOM_MACHINES = {
   report_generation: {
     initial: 'collecting_requirements',
     states: {
-      collecting_requirements: { transitions: ['drafting_outline'] },
+      collecting_requirements: { transitions: ['drafting_outline'], awaitsUser: true },
       drafting_outline: { transitions: ['legal_review'] }, // <- extra state the default lacks
       legal_review: { transitions: ['generating'] },
       generating: { transitions: ['completed'] },

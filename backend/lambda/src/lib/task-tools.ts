@@ -29,7 +29,7 @@ export interface TaskLoopContext {
    *  compared against the same state the model saw even after the tool mutates task.taskState. */
   initialState?: string;
   transitions?: Array<{ from: string; to: string }>;
-  /** The assistant running this turn, so a task leaving an awaitsUser state is handed back to it. */
+  /** The assistant running this turn, so a task leaving a waiting state is handed back to it. */
   assistantId?: string;
 }
 

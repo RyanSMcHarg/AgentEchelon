@@ -7,6 +7,7 @@ import { getModelCatalog } from '../../lib/config/model-strategy';
 import { exportManifest, importManifest, ProfileManifestError, MANIFEST_SCHEMA_VERSION, signManifest, type TargetContextSource } from '../../lambda/src/lib/profile-manifest';
 import { createDraft, editDraft, activateDraft, getDraft, listProfile, isKnownProfile } from '../../lambda/src/lib/profile-lifecycle';
 import { fakeSsmStore } from '../helpers/fake-ssm-store';
+import { awaitedPartyOf } from '../../lambda/src/lib/task-state-machines';
 
 const ROOT = '/agent-echelon';
 const CATALOG = getModelCatalog('us-east-1', '123456789012');
@@ -79,6 +80,44 @@ describe('profile manifest P3', () => {
     // A human activation is still required (P1 lifecycle).
     const r = await activateDraft(b.client, ROOT, 'premium', CATALOG, ACTOR);
     expect(r.version).toBe(1);
+  });
+
+  it('carries a machine whose wait is spelled the OLD way through export, import and activation', async () => {
+    // THE REASON THE SHAPE CHANGED NOW RATHER THAN LATER. `machines` lives inside a versioned profile
+    // definition and travels in the manifest, so a stored version predating the declared form has to
+    // keep working: it validates on import, activates, and resolves to the same reference the declared
+    // form does (SPEC-TASK-STATE-TRANSITIONS §12.6). If it did not, an existing deployment's own
+    // profile would stop importing the day the platform changed the spelling.
+    const legacyMachines = {
+      report_generation: {
+        initial: 'collecting_requirements',
+        states: {
+          collecting_requirements: {
+            transitions: ['generating'],
+            awaitsUser: true,
+            requires: ['the audience'],
+          },
+          generating: { transitions: ['completed'], delivers: true },
+          completed: { transitions: [], terminal: 'success' },
+        },
+      },
+    };
+
+    const a = fakeSsmStore();
+    await seedActiveVersion(a.client, 'standard', 'opus', { machines: legacyMachines });
+    const manifest = await exportManifest(a.client, ROOT, 'standard');
+    expect(manifest.body.machines).toEqual(legacyMachines);
+
+    const b = fakeSsmStore();
+    const draft = await importManifest(b.client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR });
+    expect(draft.machines).toEqual(legacyMachines);
+    // Activation runs the same validation again, including the rule that refuses `requires` on a step
+    // awaiting nobody - which is exactly the rule a reader left on the declared form would fire here.
+    const activated = await activateDraft(b.client, ROOT, 'standard', CATALOG, ACTOR);
+    expect(activated.version).toBe(1);
+
+    expect(awaitedPartyOf(draft.machines!.report_generation.states.collecting_requirements))
+      .toEqual({ party: 'requester' });
   });
 
   it('rejects a manifest whose model is not in the target catalog (never widens the allowlist, §7)', async () => {

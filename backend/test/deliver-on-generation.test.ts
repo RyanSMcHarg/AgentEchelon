@@ -133,7 +133,7 @@ describe('the second completion door stays removed (source ratchets)', () => {
 });
 
 describe('every task-state writer is a DECLARATION (the exclusivity test §8 never had)', () => {
-  it('advanceTaskStateTo has exactly the three declared callers', () => {
+  it('advanceTaskStateTo has exactly the two declared callers', () => {
     // SPEC-TASK-STATE-TRANSITIONS §8's invariant table tests the behavior of the one authorized
     // path, but nothing tested that no OTHER writer exists - which is precisely how the removed
     // walker lived for a month: every hop it took was individually legal, so edge-level tests
@@ -141,11 +141,15 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
     //
     //   task-tools.ts x2      the model's advance_task_state tool, and the work-item
     //                         propose-and-confirm advance - both declared by the model
-    //   task-tracking.ts x1   applyUserResponseToTask - declared by the USER answering the
-    //                         step that awaited them
     //
-    // A new caller must be a DECLARATION by an actor (model tool call, user answer), never an
-    // inference from what the output looked like. Add it here with that argument stated, or the
+    // `applyUserResponseToTask` USED TO BE A THIRD, on the argument that a user answering the step
+    // that awaited them is a declaration too. It is not, and could not be: that function never reads
+    // the message, so at `place_item.confirming` it read a correction and a decline as approvals and
+    // moved the proposal to its SUCCESS terminal. It now hands the work back and advances nothing, so
+    // §8's "state advances ONLY through advance_task_state" is literally true of the code.
+    //
+    // A new caller must be a DECLARATION by an actor that read what was said, never an inference from
+    // structure or from what the output looked like. Add it here with that argument stated, or the
     // commit that adds it fails this test - which is the point.
     const SRC = path.join(__dirname, '../lambda/src');
     const counts: Record<string, number> = {};
@@ -161,7 +165,7 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
       }
     };
     walk(SRC);
-    expect(counts).toEqual({ 'lib/task-tools.ts': 2, 'lib/task-tracking.ts': 1 });
+    expect(counts).toEqual({ 'lib/task-tools.ts': 2 });
   });
 });
 

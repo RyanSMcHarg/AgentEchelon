@@ -21,6 +21,7 @@ import {
   ADVANCE_TASK_STATE_TOOL_NAME,
   stateNamesOf,
   authorizeTransition,
+  awaitedPartyOf,
 } from './task-state-machines.js';
 import { emitEmfMetric } from './emf-metrics.js';
 import * as crypto from 'crypto';
@@ -271,7 +272,7 @@ export interface Task {
    * THE ASSISTANT THIS CHAIN BELONGS TO, as a principal id. Written once at creation and never moved.
    *
    * Distinct from `ownerId`, and both are needed (owner, 2026-08-14). The OWNER is whoever must act
-   * next and legitimately changes hands every time the machine crosses an `awaitsUser` boundary; the
+   * next and legitimately changes hands every time the machine crosses an `awaits` boundary; the
    * ASSISTANT is which assistant's work this is, and never changes. Collapsing them is what forced the
    * choice between two broken things: keep the assistant as owner and a task blocked on a person is
    * invisible in that person's queue, or hand it to the person and two duel sides' chains land in one
@@ -367,7 +368,7 @@ export interface TaskCreateOptions {
   owner?: TaskOwner;
   /**
    * WHOSE WORK THIS IS - the assistant the chain belongs to, as a principal id. Fixed for the task's
-   * life, unlike `owner`, which changes hands at every `awaitsUser` boundary. Defaults to the owner
+   * life, unlike `owner`, which changes hands at every `awaits` boundary. Defaults to the owner
    * when the caller named an assistant one.
    */
   assistantId?: string;
@@ -436,7 +437,7 @@ export async function createTask(
 
   // THE OWNER IS WHOEVER OWES THE CURRENT STEP (ADR-024 D1, owner 2026-08-14), and that is decided by the state
   // the task STARTS in, not only by transitions later. `maybeHandOver` moves ownership when the machine
-  // CROSSES an `awaitsUser` boundary, which is right for every transition and silent about the start:
+  // CROSSES an `awaits` boundary, which is right for every transition and silent about the start:
   // a machine whose INITIAL state awaits the user was born blocked on them and nothing crossed
   // anything, so the task stayed with its creator. Every `report_generation`, `data_extraction` and
   // `guided_troubleshooting` chain starts that way - which is why a duel waiting on someone appeared
@@ -446,9 +447,12 @@ export async function createTask(
   // the chain belongs to is recorded separately (`assistantId`), so handing the step to the person
   // costs nothing in traceability: two duel sides stay distinguishable by assistant, not by owner.
   const requesterSub = userArn.split('/user/').pop() || '';
+  // The awaited party is a REFERENCE, and the only one that ships resolves to the requester, who is
+  // exactly the principal this line already had to hand. Read through the normalizer so a machine
+  // authored in either accepted form starts in the same owner's queue.
   const startsBlockedOnAPerson = Boolean(
     taskType && initialState
-    && machinesForCreate[taskType]?.states?.[initialState]?.awaitsUser === true,
+    && awaitedPartyOf(machinesForCreate[taskType]?.states?.[initialState]),
   );
   const owner: TaskOwner | null =
     (startsBlockedOnAPerson && requesterSub)
@@ -671,12 +675,94 @@ export async function getActiveTaskForAssistant(
   return held.find((t) => t.assistantId === assistantId) ?? null;
 }
 
-/** Every active task this owner holds in this channel, newest first. */
-export async function getActiveTasksForOwnerInChannel(
+/**
+ * HOW LONG A FINISHED TASK KEEPS ANSWERING FOR THE CONVERSATION, in minutes.
+ *
+ * A message that arrives shortly after a piece of work finishes is usually ABOUT that work - "where is
+ * the file?", "can you make it shorter?" - and not a new subject. The window is named and configurable
+ * rather than a number inside a condition, because it is a product judgement about how long a person
+ * stays in an exchange, and a deployment may know better than this default.
+ *
+ * WHY TEN MINUTES. It has to cover reading a delivered document and coming back with a question about
+ * it, which is minutes rather than seconds. It has to be short enough that a subject raised after the
+ * person has moved on is still recognised as new. The platform's existing notion of "still in this
+ * exchange" is the abandonment detector's five minutes of silence after an offer; reading a report
+ * takes longer than ignoring a yes/no prompt, so this is twice that.
+ *
+ * WHAT IT COSTS WHEN IT IS WRONG. Someone who genuinely changes the subject a minute after a report
+ * lands gets no offer to split the conversation, for the rest of the window - not one turn, every turn
+ * in it. They are answered normally in the current conversation, and they can still say "start a
+ * separate conversation about X", which takes the explicit-routing path and is never suppressed. That
+ * is the cheaper failure than the one this exists to stop, where a direct question about the thing
+ * just delivered is answered with an offer to talk about it somewhere else. It is also the same trade
+ * already accepted for a LIVE task, which suppresses for as long as the task runs - often far longer
+ * than ten minutes.
+ */
+export const RECENTLY_ENDED_TASK_WINDOW_MINUTES =
+  Number(process.env.RECENTLY_ENDED_TASK_WINDOW_MINUTES || '10');
+
+/** Options for the one owner-partition read. */
+export interface OwnerChannelTaskOptions {
+  /**
+   * Also return tasks that ENDED within this many milliseconds. Absent ⇒ live tasks only, which is
+   * the historical behaviour byte for byte.
+   *
+   * FREE. The query already reads the whole owner partition and filters after the read (see below),
+   * so widening the filter changes no read cost at all - only which of the rows already paid for are
+   * handed back.
+   */
+  endedWithinMs?: number;
+}
+
+/** What one owner holds, and recently held, in one conversation. Both lists newest first. */
+export interface OwnerChannelTasks {
+  /** Live work: `pending` or `in_progress`. */
+  live: UserTask[];
+  /**
+   * Work that reached a terminal status recently, by the MIRROR's `updatedAt`.
+   *
+   * PROVISIONAL, and named so at the call site. The mirror is written when the ending is mirrored,
+   * which is a second instant for a fact the task's `stateHistory` already records
+   * (SPEC-TASK-STATE-TRANSITIONS §6: the ending is an entry in the log, and there is deliberately no
+   * `resolvedAt` column beside it). This list is therefore a cheap PRE-FILTER; a caller that acts on
+   * the ending reads it from the log with `taskEndedAt`.
+   */
+  recentlyEnded: UserTask[];
+}
+
+/**
+ * WHEN THIS TASK ENDED, from the append-only log that records it (SPEC-TASK-STATE-TRANSITIONS §6).
+ *
+ * The terminal entry is the LAST entry carrying a `terminal` disposition - last rather than first
+ * because a task can be cancelled after being abandoned, and the ending that matters is the one that
+ * stuck. Undefined for a task that has not ended, or one written before the terminal entry existed.
+ */
+export function taskEndedAt(task: Pick<Task, 'stateHistory'> | null | undefined): string | undefined {
+  const entries = task?.stateHistory ?? [];
+  for (let i = entries.length - 1; i >= 0; i--) {
+    if (entries[i]?.terminal) return entries[i].at;
+  }
+  return undefined;
+}
+
+/**
+ * ONE READ of an owner's partition, answering both questions this turn can ask of it: what is live
+ * here, and what finished here recently.
+ *
+ * Two lists rather than two functions because it is one query. The singular helpers already delegate
+ * here for exactly that reason - they used to carry byte-identical hand-maintained queries, which is
+ * how a defect could be fixed in one and kept in the other.
+ */
+export async function getOwnerChannelTasks(
   ownerId: string,
   channelArn: string,
-): Promise<UserTask[]> {
-  if (!USER_TASKS_TABLE || !ownerId || !channelArn) return [];
+  opts: OwnerChannelTaskOptions = {},
+): Promise<OwnerChannelTasks> {
+  const empty: OwnerChannelTasks = { live: [], recentlyEnded: [] };
+  if (!USER_TASKS_TABLE || !ownerId || !channelArn) return empty;
+  const endedCutoff = opts.endedWithinMs
+    ? new Date(Date.now() - opts.endedWithinMs).toISOString()
+    : undefined;
   try {
     // PAGINATED, WITH NO Limit - and the review that removed the Limit is worth remembering. The
     // status/channel FilterExpression runs AFTER the read, and the sort key is a random UUID, so
@@ -685,6 +771,14 @@ export async function getActiveTasksForOwnerInChannel(
     // unread remainder and this returned null - the chain never resumed, a duel side re-created its
     // task each turn, all silently, and directly under a comment saying a Limit would drop matches.
     // The partition is bounded by TTL, so the full read is bounded too; correctness over a cap.
+    //
+    // THE FILTER RUNS AFTER THE READ, which is what makes the ended half free: the rows are paid for
+    // by the channel scan either way, so admitting the recently-ended ones adds no capacity, no
+    // latency and no second query. It also has to be a filter and not a second lookup, because a
+    // second lookup on this path would be a per-turn read bought for a rare turn.
+    const statusFilter = endedCutoff
+      ? '(#status IN (:pending, :inProgress) OR (#status IN (:completed, :failed, :cancelled) AND updatedAt > :since))'
+      : '#status IN (:pending, :inProgress)';
     const rows: UserTask[] = [];
     let lastKey: Record<string, unknown> | undefined;
     do {
@@ -692,25 +786,44 @@ export async function getActiveTasksForOwnerInChannel(
         TableName: USER_TASKS_TABLE,
         ConsistentRead: true,
         KeyConditionExpression: 'userSub = :owner',
-        FilterExpression: 'channelArn = :ch AND #status IN (:pending, :inProgress)',
+        FilterExpression: `channelArn = :ch AND ${statusFilter}`,
         ExpressionAttributeNames: { '#status': 'status' },
         ExpressionAttributeValues: {
           ':owner': ownerId,
           ':ch': channelArn,
           ':pending': 'pending',
           ':inProgress': 'in_progress',
+          ...(endedCutoff
+            ? { ':completed': 'completed', ':failed': 'failed', ':cancelled': 'cancelled', ':since': endedCutoff }
+            : {}),
         },
         ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
       }));
       rows.push(...(((result.Items as UserTask[] | undefined) ?? [])));
       lastKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
     } while (lastKey);
-    return rows.sort((a, b) =>
+    const newestFirst = rows.sort((a, b) =>
       String(b.updatedAt ?? b.createdAt).localeCompare(String(a.updatedAt ?? a.createdAt)));
+    // Partitioned by the SAME notion of an ending the writer uses (`TERMINAL_TASK_STATUS`), not by
+    // `ACTIVE_TASK_STATUSES` - those differ on `abandoned`, which is deliberately not an ending
+    // (the person may come back, §6), and putting it on the wrong side here would either resurrect a
+    // paused task as live work or record it as a finished one.
+    return {
+      live: newestFirst.filter((t) => !TERMINAL_TASK_STATUS[t.status]),
+      recentlyEnded: newestFirst.filter((t) => Boolean(TERMINAL_TASK_STATUS[t.status])),
+    };
   } catch (error) {
-    console.error('[getActiveTasksForOwnerInChannel] query failed:', error);
-    return [];
+    console.error('[getOwnerChannelTasks] query failed:', error);
+    return empty;
   }
+}
+
+/** Every active task this owner holds in this channel, newest first. */
+export async function getActiveTasksForOwnerInChannel(
+  ownerId: string,
+  channelArn: string,
+): Promise<UserTask[]> {
+  return (await getOwnerChannelTasks(ownerId, channelArn)).live;
 }
 
 /**
@@ -1201,7 +1314,7 @@ export async function resumeTask(taskId: string, channelArn: string): Promise<Ta
 /**
  * REASSIGN — hand a task to a different owner, human or assistant (ADR-024 D1/D3).
  *
- * WIRED, as of the `awaitsUser` boundary: `maybeHandOver` below calls this when a task's state starts
+ * WIRED, as of the `awaits` boundary: `maybeHandOver` below calls this when a task's state starts
  * or stops being blocked on a person, which is the "work-item flow" this was left waiting for. It
  * shipped unwired on purpose from 2026-08-09 (documented and covered, unlike `updateTaskAssignee`,
  * which it replaced and which was uncalled by ACCIDENT), so nobody had to guess whether reassignment
@@ -1395,7 +1508,7 @@ export async function advanceTaskStateTo(args: {
   machines?: Record<string, TaskStateMachine>;
   /**
    * The assistant running this turn, as a principal id. Used to hand the task BACK when it leaves a
-   * state that was blocked on the person (`awaitsUser`).
+   * state that was blocked on the person (`awaits`).
    *
    * Optional because not every caller is an assistant turn. When it is absent and a hand-back is due,
    * ownership is left with the user and the condition is logged: an item that lingers in someone's
@@ -1498,10 +1611,10 @@ export async function advanceTaskStateTo(args: {
 }
 
 /**
- * Move the task between the person and the assistant as the machine crosses an `awaitsUser` boundary.
+ * Move the task between the person and the assistant as the machine crosses an `awaits` boundary.
  *
- * THIS IS THE CALLER `reassignTask` WAS BUILT AND LEFT UNWIRED FOR. A state declared `awaitsUser` is
- * blocked on the person, so the person should hold it: that is what puts a report waiting on scope and
+ * THIS IS THE CALLER `reassignTask` WAS BUILT AND LEFT UNWIRED FOR. A state that declares `awaits` is
+ * blocked on that party, so they should hold it: that is what puts a report waiting on scope and
  * a duel's clarifying question into ONE queue the user can work through, instead of each workflow
  * inventing its own "waiting on you" signal (ADR-024, ADR-029).
  *
@@ -1521,15 +1634,19 @@ async function maybeHandOver(args: {
 }): Promise<void> {
   const { task, machine, to, assistantId } = args;
   if (!TASKS_TABLE || !machine) return;
-  const awaitsUser = machine.states?.[to]?.awaitsUser === true;
+  // Through the normalizer, so the boundary is the same one for a machine authored in either accepted
+  // form. `requester` is the only shipped reference and it resolves to a person, so "awaits somebody"
+  // and "the person holds it" are still the same question here.
+  const awaited = awaitedPartyOf(machine.states?.[to]);
   const holder = resolveTaskOwner(task);
   const heldByUser = holder?.type === 'user';
-  if (awaitsUser === heldByUser) return; // already on the right side of the boundary
+  if (Boolean(awaited) === heldByUser) return; // already on the right side of the boundary
 
   try {
-    if (awaitsUser) {
+    if (awaited) {
       // The REQUESTER is who is being waited on: they are the person in this conversation whose answer
-      // the machine needs. `assigneeUserSub` on a legacy row is honoured through resolveTaskOwner, so
+      // the machine needs, and the reference is resolved HERE, against the task record, rather than
+      // stored. `assigneeUserSub` on a legacy row is honoured through resolveTaskOwner, so
       // this does not fight a task that already names a different human.
       const userSub = task.assigneeUserSub || task.userArn?.split('/user/').pop() || '';
       if (!userSub) {
@@ -1542,7 +1659,7 @@ async function maybeHandOver(args: {
     }
     if (!assistantId) {
       console.warn(
-        '[task-state] leaving an awaitsUser state with no assistant to hand back to; the item stays in the user queue',
+        '[task-state] leaving a waiting state with no assistant to hand back to; the item stays in the user queue',
         { taskId: task.taskId, state: to },
       );
       return;
@@ -1557,23 +1674,40 @@ async function maybeHandOver(args: {
 /**
  * A user's message, applied as the RESPONSE to the work they owe.
  *
- * THE GENERAL SHAPE OF EVERY WORKFLOW, and the reason none of them needs its own signal. A state
- * declared `awaitsUser` means the machine is blocked on the person and the task is theirs to hold. When
+ * THE GENERAL SHAPE OF EVERY WORKFLOW, and the reason none of them needs its own signal. A state that
+ * declares `awaits` means the machine is blocked on that party and the task is theirs to hold. When
  * they speak in that conversation, that message IS the response: the handler reads the state they are
  * answering, checks the response can resolve it, moves the machine on, and the hand-back to the
  * assistant is what triggers the workflow's next action. A duel resumes its side, a report starts
  * generating, an extraction begins pulling - the same three steps, with no per-feature sentinel,
  * marker, or waiting flag anywhere in it.
  *
- * WHAT "VERIFY THE RESPONSE RESOLVES THE STATE" MEANS HERE, stated plainly because it is easy to
- * over-claim. It is a STRUCTURAL check, not a semantic one:
+ * WHAT IT DOES, and it is one thing: it hands the work back. The task stops being owed by the person
+ * and belongs to the assistant again, which is what makes their message trigger the next action rather
+ * than merely record one. The TRANSITION is not its business.
  *
- *  - the task must actually be in a state that awaits the person (otherwise their message is ordinary
- *    conversation and must not move a machine);
- *  - that state must have exactly ONE legal way out, in which case answering IS resolving it;
- *  - a state with several exits is a decision the ANSWER's content settles, which this cannot read. It
- *    hands the task back to the assistant and leaves the choice to `advance_task_state` on the turn
- *    that has the text and the model. The workflow still moves; only the picking is deferred.
+ * IT USED TO ADVANCE THE MACHINE ITSELF, on a state that declared `resolvedByOneResponse` and had one
+ * exit, and that was a second writer to `taskState` deciding a question only the message's content can
+ * answer. The check here is structural - it asks whether the state awaits someone, never what was
+ * said - so at `place_item.confirming` it read "actually, make it 45 minutes and put it before the
+ * kickoff" and "no, do not add it" as approvals, and moved the task to `placed`, a SUCCESS terminal
+ * that closes it. The person's correction then had nowhere to go, because the task that would carry it
+ * was finished, and the plan recorded an approval nobody gave.
+ *
+ * There is no structural test that separates a confirmation from a correction. Both are one reply to a
+ * step with one exit; only their content differs. A keyword list of affirmatives would be a second
+ * semantic judge sitting next to the model's, disagreeing with it in a language nobody chose, and
+ * SPEC-TASK-STATE-TRANSITIONS §8 already settles who advances a machine: `advance_task_state`, on the
+ * turn that has the text and the model. So every reply now defers, and `resolvedByOneResponse` says
+ * what it always meant to say - to the MODEL, in the prompt (`buildTaskContextForPrompt`), that one
+ * clear answer is enough here and it need not keep asking.
+ *
+ * WHAT IT COSTS: nothing in model calls, which is the part that looks like a cost and is not. A reply
+ * to a waiting step already dispatches a turn - the router corrects even a two-character answer's
+ * intent so it does (`resumedWaitingWork`), so a "yes" at a confirmation was always going to reach the
+ * model. What changes is WHEN the machine moves: at the end of that turn rather than before it starts.
+ * If the model then fails to call the tool, the task stays where it is and `turnsInState` records a
+ * stall (§7) - visible and recoverable, as against a silent wrong terminal.
  *
  * Returns what happened so the caller can say it, rather than a boolean nobody can explain.
  */
@@ -1585,8 +1719,13 @@ export async function applyUserResponseToTask(args: {
   machines?: Record<string, TaskStateMachine>;
   messageId?: string;
 }): Promise<{
+  /**
+   * Whether this call moved the machine. NO PATH SETS IT TRUE any more, and the field stays because it
+   * is what the two router call sites log: a result that quietly changed from an object to a boolean
+   * would leave those lines saying something else. `reason` is the field to read.
+   */
   applied: boolean;
-  reason?: 'not_awaiting' | 'no_machine' | 'deferred_to_model' | 'advance_failed';
+  reason?: 'not_awaiting' | 'no_machine' | 'deferred_to_model';
   from?: string;
   to?: string;
 }> {
@@ -1600,36 +1739,19 @@ export async function applyUserResponseToTask(args: {
 
   // Not blocked on the person ⇒ this message is ordinary conversation. Moving a machine on the
   // strength of an unrelated remark is how a workflow advances past a step nobody completed.
-  if (!state.awaitsUser) return { applied: false, reason: 'not_awaiting', from: task.taskState };
+  if (!awaitedPartyOf(state)) return { applied: false, reason: 'not_awaiting', from: task.taskState };
 
-  // ADVANCING NEEDS MORE THAN ONE EXIT AND A REPLY.  says the machine is blocked on the
-  // person; it does not say their next message finishes the step. Requirements gathering is the case
-  // that proves it - one exit, and several turns of answers before it is done - so advancing on the
-  // first reply moved a report to drafting before the assistant had what it needed.
+  // HAND BACK, AND LEAVE THE TRANSITION ALONE. `awaits` says the machine is blocked on a party;
+  // it does not say their next message finishes the step, and nothing here can read the message to
+  // find out. A state with one exit is no different: "make it 45 minutes" and "yes, go ahead" are both
+  // one reply to a one-exit step, and only their content tells them apart.
   //
-  // So the state must SAY that one answer completes it. Everything else hands the work back (which is
-  // what fires the next action) and leaves the transition to , on the turn that has
-  // the text and the model.
-  if (state.transitions.length !== 1 || !state.resolvedByOneResponse) {
-    await reassignTask(args.taskId, args.channelArn, { id: args.assistantId, type: 'assistant' })
-      .catch((err) => console.warn('[task-response] hand-back failed:', err));
-    return { applied: false, reason: 'deferred_to_model', from: task.taskState };
-  }
-
-  const to = state.transitions[0];
-  const result = await advanceTaskStateTo({
-    task,
-    toState: to,
-    by: 'system',
-    reason: 'the user responded to the step that was waiting on them',
-    ...(args.messageId ? { messageId: args.messageId } : {}),
-    machines,
-    // Leaving an awaitsUser state hands the task back to this assistant, which is what makes the
-    // response trigger the next action rather than merely record one.
-    assistantId: args.assistantId,
-  });
-  if (!result.ok) return { applied: false, reason: 'advance_failed', from: task.taskState };
-  return { applied: true, from: result.from, to: result.to };
+  // The hand-back is the whole mechanism. The assistant owns the work again, so the turn that follows
+  // acts on it, and `advance_task_state` moves the machine on the turn that has the text and the model
+  // (§8: state advances through that tool and the runtime never force-advances).
+  await reassignTask(args.taskId, args.channelArn, { id: args.assistantId, type: 'assistant' })
+    .catch((err) => console.warn('[task-response] hand-back failed:', err));
+  return { applied: false, reason: 'deferred_to_model', from: task.taskState };
 }
 
 /*
@@ -1738,6 +1860,12 @@ export async function failTask(taskId: string, channelArn: string, error: string
  * ASKING ONLY FOR WHAT IS MISSING is the part that is easy to lose. The person has already answered
  * part of the question; re-asking the whole thing reads as not having been listened to, which is the
  * same complaint as advancing without the answer, arriving from the other side.
+ *
+ * WHO PACKAGES A DELIVERABLE (see the delivering-state section below). A step that delivers a
+ * document is told not to claim it saved a file, because it cannot know whether it did: packaging is
+ * decided AFTER the text exists, from the transition the turn declared and the minimum artifact size
+ * (SPEC-TASK-STATE-TRANSITIONS §4). A live report posted inline under a reply that said it had been
+ * saved as a Markdown file, and the person asked where the file was.
  */
 export function buildTaskContextForPrompt(
   task: Task | null,
@@ -1775,12 +1903,65 @@ Check the user's message against that list, together with anything already colle
 `
     : '';
 
+  // A step the machine declares as `resolvedByOneResponse` is one where ONE clear answer is enough -
+  // a confirmation, an approval, a single choice - so the model is told not to keep asking. It is
+  // rendered HERE, to the model, because that is the only reader that can tell a confirmation from a
+  // correction; the runtime used to act on this flag itself and moved a proposal to its SUCCESS
+  // terminal on "actually, make it 45 minutes", recording an approval nobody gave.
+  //
+  // Mutually exclusive with `requires` by validation, so the two blocks can never both render and tell
+  // the model to advance on any answer and to withhold until a checklist is satisfied.
+  const oneAnswerCompletes = task.taskType && task.taskState
+    ? machines[task.taskType]?.states?.[task.taskState]?.resolvedByOneResponse
+    : undefined;
+  const oneAnswer = oneAnswerCompletes
+    ? `
+
+### ONE ANSWER COMPLETES THIS STEP
+
+You have put something to the user and are waiting on their decision. Do not re-ask for detail you
+already have, and do not restate the whole proposal back at them.
+
+- They agree ⇒ that completes it. Call \`${ADVANCE_TASK_STATE_TOOL_NAME}\`, then say briefly what
+  happened.
+- They ask for something DIFFERENT ⇒ that is not agreement. Do not advance. Put the corrected version
+  back to them the same way you put the first one, and wait again.
+- They say no, or to drop it ⇒ that is not agreement either. Do not advance and do not tell them it
+  went ahead. Acknowledge it and ask what they would like instead.
+`
+    : '';
+
+  // A step the machine declares as DELIVERING (`delivers`) produces content that may be packaged as
+  // a downloadable file or posted inline. The runtime decides which, after the text exists, from the
+  // declared transition and the minimum artifact size - so the model writing the text cannot know,
+  // and any claim it makes about a saved file is a guess that was wrong live. Read from the same
+  // `delivers` flag the attachment gate reads, so a per-deployment machine that renames or adds a
+  // delivering state carries the rule with it. The alternative - checking the finished reply for a
+  // file claim - is the output-shape heuristic this codebase has already retired twice.
+  const delivers = task.taskType && task.taskState
+    ? machines[task.taskType]?.states?.[task.taskState]?.delivers
+    : undefined;
+  const deliveryHonesty = delivers
+    ? `
+
+### DELIVERING THIS STEP
+
+Write the finished content directly in your reply. You do NOT package it: whether it arrives as a
+downloadable file or as text in the conversation is decided after you answer.
+
+- Do not say you have saved, attached, created, uploaded or exported a file, and do not offer a
+  download link. A file is attached for the person automatically when there is one.
+- Refer to what you produced as the report, the summary, or the extraction, never as "the file
+  above" or "the attached document".
+`
+    : '';
+
   return `
 ## ACTIVE TASK
 
 Type: ${task.taskType || 'general'}${stateLabel}
 Status: ${task.status}
-Original request: ${(task.requestExcerpt ?? task.userMessage)?.substring(0, TASK_EXCERPT_MAX_CHARS) ?? '(not recorded)'}${detailsStr}${sufficiency}
+Original request: ${(task.requestExcerpt ?? task.userMessage)?.substring(0, TASK_EXCERPT_MAX_CHARS) ?? '(not recorded)'}${detailsStr}${sufficiency}${oneAnswer}${deliveryHonesty}
 
 When responding, continue working on this task. Guide the user through the current step.
 If the user's message is off-topic, acknowledge it briefly and redirect back to the task.

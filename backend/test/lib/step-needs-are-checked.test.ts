@@ -4,7 +4,7 @@
  * The rule: review the person's message against what the step needs; everything there, move the
  * workflow on; something missing, ask for that and only that.
  *
- * WHAT IT REPLACES. `awaitsUser` said the machine was blocked on someone but never what would unblock
+ * WHAT IT REPLACES. `awaits` said the machine was blocked on someone but never what would unblock
  * it, so nothing could tell a complete answer from a partial one - and a step with a single exit moved
  * on whatever arrived first. A report was drafted with no audience and no format, to nobody, in no
  * particular shape. It did not error and it did not look broken; it looked like an assistant that was
@@ -25,6 +25,7 @@ import {
   validateTaskStateMachine,
   TaskMachineValidationError,
   ADVANCE_TASK_STATE_TOOL_NAME,
+  awaitedPartyOf,
   type TaskStateMachine,
 } from '../../lambda/src/lib/task-state-machines';
 
@@ -118,6 +119,48 @@ describe('the step a person is holding says what it needs', () => {
   });
 });
 
+/**
+ * A CONFIRMATION STEP TELLS THE MODEL WHAT COUNTS AS AGREEMENT.
+ *
+ * `resolvedByOneResponse` used to let the RUNTIME advance the machine on any reply, which at
+ * `place_item.confirming` moved a proposal to `placed` - a success terminal - on "actually, make it 45
+ * minutes" and on "no, do not add it". Nothing structural separates those from a "yes", so the flag now
+ * reaches the only reader that can tell them apart. These assert the prompt, for the same reason the
+ * `requires` tests above do: the judgement is the model's, and what is testable is that the rule gets
+ * to it.
+ */
+describe('the step where one answer is enough says so, and says what is not an answer', () => {
+  it('tells the model to take a clear agreement and advance', () => {
+    const prompt = buildTaskContextForPrompt(taskIn('place_item', 'confirming'));
+
+    expect(prompt).toContain('ONE ANSWER COMPLETES THIS STEP');
+    expect(prompt).toContain(ADVANCE_TASK_STATE_TOOL_NAME);
+  });
+
+  it('tells the model a correction is not agreement, and to put the change back to them', () => {
+    // The reported failure. Advancing here records the proposal the person had just asked to change,
+    // and closes the task that would have carried the change.
+    const prompt = buildTaskContextForPrompt(taskIn('place_item', 'confirming'));
+
+    expect(prompt).toMatch(/not agreement/i);
+    expect(prompt).toMatch(/corrected version/i);
+  });
+
+  it('tells the model a decline advances nothing and is not reported as done', () => {
+    const prompt = buildTaskContextForPrompt(taskIn('place_item', 'confirming'));
+
+    expect(prompt).toMatch(/do not advance and do not tell them it/i);
+  });
+
+  it('says nothing of the kind on a step that is not a confirmation', () => {
+    // Requirements gathering takes as many turns as it takes; telling the model one answer finishes it
+    // is the exact instruction `requires` exists to prevent.
+    const prompt = buildTaskContextForPrompt(taskIn('report_generation', 'collecting_requirements'));
+
+    expect(prompt).not.toContain('ONE ANSWER COMPLETES THIS STEP');
+  });
+});
+
 describe('a machine cannot declare needs that could never be met', () => {
   const machineWith = (state: Record<string, unknown>): TaskStateMachine => ({
     initial: 'waiting',
@@ -151,6 +194,41 @@ describe('a machine cannot declare needs that could never be met', () => {
     }))).not.toThrow();
   });
 
+  // THE RULE MOVED ONTO THE NORMALIZER, AND THESE ARE WHAT PROVE IT DID.
+  //
+  // Left keyed on `awaitsUser`, the rule stops seeing a machine authored in the declared form: the
+  // valid one below is rejected, and the invalid one is accepted because nothing it looks at is set.
+  // Both directions are asserted, because a rule that only ever throws is as broken as one that never
+  // does - it would simply refuse every new-form machine instead of checking any of them.
+  it('accepts needs on a step that declares who it awaits', () => {
+    expect(() => validateTaskStateMachine('good', machineWith({
+      awaits: { party: 'requester' },
+      requires: ['the audience'],
+    }))).not.toThrow();
+  });
+
+  it('rejects needs on a step that awaits nobody, in a machine authored in the declared form', () => {
+    // The whole machine is written in the new form; only the step carrying `requires` omits the wait.
+    // A rule reading the old boolean sees nothing set anywhere and lets this through.
+    const authoredNewForm: TaskStateMachine = {
+      initial: 'waiting',
+      states: {
+        waiting: { transitions: ['unattended'], awaits: { party: 'requester' } },
+        unattended: { transitions: ['done'], requires: ['the audience'] },
+        done: { transitions: [], terminal: 'success' },
+      },
+    };
+    expect(() => validateTaskStateMachine('bad', authoredNewForm))
+      .toThrow(/state "unattended" declares requires but awaits nobody/);
+  });
+
+  it('rejects a wait on a party nothing resolves', () => {
+    // Only `requester` ships. A reference the runtime cannot resolve leaves the step with no owner and
+    // no way to say so, so it is refused at the ingress rather than discovered at the boundary.
+    expect(() => validateTaskStateMachine('bad', machineWith({ awaits: { party: 'manager-of-requester' } })))
+      .toThrow(/awaits an unknown party/);
+  });
+
   it('leaves every shipped machine valid', () => {
     // The declarations added with this rule are themselves subject to it.
     for (const [name, machine] of Object.entries(DEFAULT_TASK_STATE_MACHINES)) {
@@ -163,7 +241,9 @@ describe('a machine cannot declare needs that could never be met', () => {
     // above passing against a feature that does nothing on the deployment.
     for (const type of ['report_generation', 'data_extraction', 'guided_troubleshooting']) {
       const machine = DEFAULT_TASK_STATE_MACHINES[type];
-      const waiting = Object.values(machine.states).filter((s) => s.awaitsUser);
+      // Through the normalizer: a filter on the deprecated boolean finds nothing in a shipped machine
+      // and leaves every assertion here passing over an empty list.
+      const waiting = Object.values(machine.states).filter((s) => awaitedPartyOf(s));
       expect(waiting.length).toBeGreaterThan(0);
       expect(waiting.some((s) => (s.requires?.length ?? 0) > 0)).toBe(true);
     }

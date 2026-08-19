@@ -15,6 +15,7 @@ import {
   isDeclaredState,
   terminalKindOf,
   stateNamesOf,
+  awaitedPartyOf,
   type TaskStateMachine,
 } from '../lambda/src/lib/task-state-machines.js';
 import { TASK_STATE_MACHINES } from '../lambda/src/lib/task-tracking.js';
@@ -84,6 +85,102 @@ describe('task state machine graphs', () => {
     expect(isDeclaredState('report_generation', 'revising')).toBe(true);
     expect(isDeclaredState('report_generation', 'nope')).toBe(false);
     expect(initialStateFor('unknown_type')).toBeUndefined();
+  });
+});
+
+/**
+ * WORK DOES NOT BEGIN UNTIL THE PERSON HAS ANSWERED.
+ *
+ * A PROPERTY over the machines rather than an assertion about one state name, because the bug it
+ * catches is a family bug and the family is configurable: a pack or a per-assistant profile may
+ * rename every state here (SPEC-CONFIGURABLE-ASSISTANTS 4.5), and a check spelled `drafting_outline`
+ * would pass while the machine it was written for no longer exists.
+ *
+ * The shape it pins: the LAST state before a workflow starts producing its deliverable is the one the
+ * assistant is asking about, so it must be blocked on the person. `report_generation.drafting_outline`
+ * was not, so the report stayed with the assistant while the person was the one being waited on -
+ * which cost the owner-keyed drift suppression its answer and turned a reply to the assistant's own
+ * question ("Can you make it 1-2 pages?") into an offer to split the conversation.
+ *
+ * Deliberately scoped to the edge INTO production from outside it. Delivering states legitimately
+ * transition among themselves without asking anyone (extracting -> validating, generating -> revising);
+ * it is the boundary that has to have been answered.
+ */
+describe('a machine does not start producing before the person has answered', () => {
+  const boundaryEdges = (machine: TaskStateMachine): Array<{ from: string; to: string; awaits: boolean }> => {
+    const edges: Array<{ from: string; to: string; awaits: boolean }> = [];
+    for (const [from, def] of Object.entries(machine.states)) {
+      if (def.delivers) continue; // delivering -> delivering is production continuing, not starting
+      for (const to of def.transitions) {
+        // Through the normalizer, so the property holds for a machine authored in either form. Read
+        // off `awaitsUser` this check passed vacuously the moment the shipped machines moved to
+        // `awaits`, which is the failure this whole change is about.
+        if (machine.states[to]?.delivers) edges.push({ from, to, awaits: awaitedPartyOf(def) !== null });
+      }
+    }
+    return edges;
+  };
+
+  it('every shipped machine only enters production from a state that awaits the person', () => {
+    for (const [name, machine] of Object.entries(DEFAULT_TASK_STATE_MACHINES)) {
+      for (const edge of boundaryEdges(machine)) {
+        expect({ machine: name, ...edge }).toEqual({ machine: name, from: edge.from, to: edge.to, awaits: true });
+      }
+    }
+  });
+
+  it('the property has something to check (it is not vacuously true)', () => {
+    // A `delivers` flag that nobody set, or a machine set with none, would leave the assertion above
+    // passing over an empty list forever.
+    const edges = Object.values(DEFAULT_TASK_STATE_MACHINES).flatMap(boundaryEdges);
+    expect(edges.length).toBeGreaterThan(0);
+    expect(edges.map((e) => e.from)).toEqual(expect.arrayContaining(['drafting_outline', 'collecting_requirements']));
+  });
+
+  it('catches a machine that starts producing on an unanswered step', () => {
+    // The exact shape the live defect had: one exit, straight into the work, nobody asked.
+    const broken: TaskStateMachine = {
+      initial: 'outline',
+      states: {
+        outline: { transitions: ['writing'] }, // awaits nobody
+        writing: { transitions: ['done'], delivers: true },
+        done: { transitions: [], terminal: 'success' },
+      },
+    };
+    expect(boundaryEdges(broken)).toEqual([{ from: 'outline', to: 'writing', awaits: false }]);
+  });
+
+  it('a step that ends its turn asking the person is held by the person', () => {
+    // The two states with no separate waiting state to hold their pause: each exits only into the
+    // assistant working, so the wait has nowhere else to live. `validating` carries no `delivers`
+    // boundary of its own (it is already a delivering state), so the property above cannot reach it.
+    expect(awaitedPartyOf(DEFAULT_TASK_STATE_MACHINES.report_generation.states.drafting_outline))
+      .toEqual({ party: 'requester' });
+    expect(awaitedPartyOf(DEFAULT_TASK_STATE_MACHINES.data_extraction.states.validating))
+      .toEqual({ party: 'requester' });
+    // And neither may advance on whatever arrives: "make it 1-2 pages" and "row 3 is wrong" are
+    // replies, not approvals, and one exit plus any reply would produce the wrong document.
+    expect(DEFAULT_TASK_STATE_MACHINES.report_generation.states.drafting_outline.resolvedByOneResponse)
+      .toBeUndefined();
+    expect(DEFAULT_TASK_STATE_MACHINES.data_extraction.states.validating.resolvedByOneResponse)
+      .toBeUndefined();
+  });
+
+  it('leaves the states a machine passes through within a turn alone', () => {
+    // The other half, and the one that makes this a judgement rather than a sweep. Each of these
+    // produces something and hands on to a state that IS the wait, so marking them would move
+    // ownership twice and put a step nobody is blocked on into a person's queue.
+    expect(awaitedPartyOf(DEFAULT_TASK_STATE_MACHINES.guided_troubleshooting.states.proposing_solutions))
+      .toBeNull();
+    expect(awaitedPartyOf(DEFAULT_TASK_STATE_MACHINES.place_item.states.collecting)).toBeNull();
+    expect(awaitedPartyOf(DEFAULT_TASK_STATE_MACHINES.action_item.states.gathering)).toBeNull();
+    // ...and each of those waits is declared, or the states above would be resting on nothing.
+    expect(awaitedPartyOf(DEFAULT_TASK_STATE_MACHINES.guided_troubleshooting.states.awaiting_result))
+      .toEqual({ party: 'requester' });
+    expect(awaitedPartyOf(DEFAULT_TASK_STATE_MACHINES.place_item.states.confirming))
+      .toEqual({ party: 'requester' });
+    expect(awaitedPartyOf(DEFAULT_TASK_STATE_MACHINES.action_item.states.options_presented))
+      .toEqual({ party: 'requester' });
   });
 });
 

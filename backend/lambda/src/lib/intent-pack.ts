@@ -19,6 +19,7 @@ import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import {
   type TaskStateMachine,
   type TerminalKind,
+  type AwaitedPartyRef,
   DEFAULT_TASK_STATE_MACHINES,
   validateTaskStateMachines,
 } from './task-state-machines.js';
@@ -307,9 +308,19 @@ function coerceMachinesConfig(raw: unknown): Record<string, TaskStateMachine> | 
           typeof sr.terminal === 'string' && (TERMINAL_KINDS as readonly string[]).includes(sr.terminal)
             ? (sr.terminal as TerminalKind)
             : undefined;
+        // WHO THE STEP AWAITS, in either accepted form (SPEC-TASK-STATE-TRANSITIONS §12.6). Carried
+        // through as declared rather than normalized here: `awaitedPartyOf` is the single reader, and
+        // rewriting a pack's declaration on the way in would make the stored pack and the merged view
+        // two different documents. An unknown party is left to `validateTaskStateMachines` below, which
+        // refuses the whole block loudly rather than admitting a reference nothing resolves.
+        const awaits = sr.awaits && typeof sr.awaits === 'object' && !Array.isArray(sr.awaits)
+          ? (sr.awaits as AwaitedPartyRef)
+          : undefined;
         states[stateName] = {
           transitions,
           ...(terminal ? { terminal } : {}),
+          ...(awaits ? { awaits } : {}),
+          ...(sr.awaitsUser === true ? { awaitsUser: true } : {}),
           ...(typeof sr.prompt === 'string' ? { prompt: sr.prompt } : {}),
           ...(typeof sr.placeholder === 'string' ? { placeholder: sr.placeholder } : {}),
         };

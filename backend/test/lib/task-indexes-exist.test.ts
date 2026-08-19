@@ -53,9 +53,9 @@ describe('task index names line up with the stack', () => {
     // ADR-024 D2: it is a strongly consistent read of the mirror's BASE TABLE. A GSI can never be
     // read consistently, so an IndexName appearing on this query would silently drop the guard that
     // stops a rapid follow-up turn starting a second expensive task.
-    // The singular helper is a [0] over the plural one; the QUERY - and so the index discipline -
-    // lives in getActiveTasksForOwnerInChannel now.
-    const fn = TASK_CODE.slice(TASK_CODE.indexOf('export async function getActiveTasksForOwnerInChannel'));
+    // Both list helpers are projections of ONE query; the query - and so the index discipline -
+    // lives in getOwnerChannelTasks, which they delegate to.
+    const fn = TASK_CODE.slice(TASK_CODE.indexOf('export async function getOwnerChannelTasks'));
     const body = fn.slice(0, fn.indexOf('\n}\n'));
     expect(body).toContain('ConsistentRead');
     expect(body).not.toContain('IndexName');

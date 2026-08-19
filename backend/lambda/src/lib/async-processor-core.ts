@@ -15,7 +15,7 @@
  * classification-specific post-processing.
  */
 
-import { stripMessageMarkers } from './message-markers.js';
+import { stripMessageMarkers, stripGuardrailMaskTokens } from './message-markers.js';
 import {
   ChimeSDKMessagingClient,
   ListChannelMessagesCommand,
@@ -1602,7 +1602,13 @@ export async function applyOutputGuardrail(text: string, guardrailId?: string): 
   const resp = await runGuardrail('OUTPUT', text, guardrailId);
   if (resp?.action === 'GUARDRAIL_INTERVENED') {
     const masked = (resp.outputs ?? []).map((o) => o.text ?? '').join('').trim();
-    return masked || text;
+    // THE MASK IS ITSELF A LEAK when the filter exists to hide an internal marker: Bedrock
+    // substitutes `{FILTER_NAME}`, so a masked ACTIVE_TASK/corr marker reaches the human as the
+    // literal `{MetadataMarkerFilter}` (live). This is the one point in the system where such a
+    // token can be created, so it is where it is removed - before the reply is posted, archived, or
+    // scored. PII masks (`{EMAIL}`) are left alone; there the mask is the intended output.
+    // An empty result falls back to the model's text, so a guardrail outcome never drops a reply.
+    return stripGuardrailMaskTokens(masked) || text;
   }
   return text;
 }
@@ -2760,6 +2766,34 @@ export async function finalizePlaceholderResponse(params: {
     }
   }
 
+  /**
+   * Close out the private placeholder once this turn's output has moved to a message of its own.
+   *
+   * ONE helper, because both of the turn's exits owe it: the answer, and the clarifying question that
+   * asks for more before an answer exists. The exit that forgot is how a person was left watching a
+   * "..." bubble that never resolved, beside a message they were never told to look at.
+   *
+   * The phase is the caller's to declare (`updateMessage` requires one for exactly this reason): the
+   * answer ends the person's wait and closes the turn, a question does not.
+   *
+   * No-op unless the answer actually moved, so an ordinary turn - which answers on the placeholder
+   * itself - writes nothing extra.
+   */
+  const closeOutAcknowledgement = async (phase: ResponsePhase): Promise<void> => {
+    if (!acknowledgementMessageId || acknowledgementMessageId === deliveryMessageId) return;
+    try {
+      await updateMessage(
+        event.channelArn,
+        acknowledgementMessageId,
+        RESUMED_CHAIN_ACKNOWLEDGEMENT,
+        event.botArn,
+        phase,
+      );
+    } catch (err) {
+      console.warn('[AsyncProcessor] could not close out the private acknowledgement:', err);
+    }
+  };
+
   const longResponseResult = attachment
     ? { content: buildAttachmentLede(response) }
     : await handleLongResponse(
@@ -2981,9 +3015,9 @@ export async function finalizePlaceholderResponse(params: {
   // project-battle-clarification-measured-dimension): detection is the
   // explicit NEED_CLARIFICATION sentinel, never substring inference.
   //
-  // ONE message, broadcast (ADR-029): this side's placeholder becomes the QUESTION and stays that way.
-  // The second, `Target`-ed question message is gone, and with it the case where a clarification with
-  // no resolvable sender left the user with a waiting bubble and no question in it.
+  // ONE message, broadcast (ADR-029): this side's public message becomes the QUESTION and stays that
+  // way. The second, `Target`-ed question message is gone, and with it the case where a clarification
+  // with no resolvable sender left the user with a waiting bubble and no question in it.
   //
   // A clarifying round-1 reply is NOT round-1 completion — the asking bot enters WAITING_FOR_USER so
   // the round-2 orchestrator stays suppressed until this bot later completes (we return BEFORE the
@@ -2993,17 +3027,25 @@ export async function finalizePlaceholderResponse(params: {
   if (event.battleContext?.round === 1) {
     const clarification = parseBattleClarification(longResponseResult.content);
     if (clarification.needsClarification) {
-      const delivery = planBattleClarificationDelivery({
+      const clarificationDelivery = planBattleClarificationDelivery({
         battleId: event.battleContext.battleId,
         botArn: event.botArn,
         question: clarification.question,
       });
       // No battlestats scorecard on this branch: the bot has not completed round 1, so `finalContent`
       // above is intentionally unused.
+      //
+      // THE QUESTION GOES WHERE THE ANSWER WOULD HAVE GONE (`deliveryMessageId`), which on a resumed
+      // chain is the public message posted above and on every other turn is the placeholder itself.
+      // A question is this turn's output, so it lands on the turn's output message - the same rule
+      // ADR-029 states for a first clarification, applied to a resumed side that asks again. Sending it
+      // to the placeholder instead left two things wrong at once on a resumed chain: the public "..."
+      // was never resolved, and the question was buried in a private message the rival cannot read,
+      // which is the concealment ADR-029 reverses.
       await updateMessage(
         event.channelArn,
-        messageId,
-        delivery.waitingPlaceholderContent,
+        deliveryMessageId,
+        clarificationDelivery.waitingPlaceholderContent,
         event.botArn,
         // THE UPDATE THAT MOTIVATES THIS WHOLE CHANGE. A side asking the person a clarifying question
         // posts a real, visible update - and it carries worker telemetry, so the old
@@ -3012,6 +3054,10 @@ export async function finalizePlaceholderResponse(params: {
         'interim',
         messageMetadata,
       );
+      // `interim` for the receipt too, and deliberately not `final`: the person's message was picked
+      // up and answered with a question, so the turn is a step on the way to an answer rather than the
+      // answer. Stamping it `final` here would close the turn on a message carrying no answer.
+      await closeOutAcknowledgement('interim');
       const marked = await markBotWaitingForUser({
         battleId: event.battleContext.battleId,
         botArn: event.botArn,
@@ -3020,7 +3066,7 @@ export async function finalizePlaceholderResponse(params: {
         // The message now HOLDING THE QUESTION. The resume does not answer onto it - it posts its own
         // placeholder (ADR-029) - it only clears this message's `<!--battlewaiting-->` marker so the
         // frontend's waiting affordance ends while the question text stays in the transcript.
-        waitingMessageId: messageId,
+        waitingMessageId: deliveryMessageId,
       });
       console.log(
         '[AsyncProcessor][battle] Round-1 clarification — WAITING_FOR_USER (question posted, orchestrator suppressed)',
@@ -3062,23 +3108,11 @@ export async function finalizePlaceholderResponse(params: {
   // acknowledgement - leaving it saying "one moment" forever, next to an answer it never received,
   // is how a person concludes their reply went nowhere.
   await updateMessage(event.channelArn, deliveryMessageId, finalContent, event.botArn, 'final', messageMetadata);
-  if (acknowledgementMessageId && acknowledgementMessageId !== deliveryMessageId) {
-    try {
-      await updateMessage(
-        event.channelArn,
-        acknowledgementMessageId,
-        RESUMED_CHAIN_ACKNOWLEDGEMENT,
-        event.botArn,
-        // `final` FOR THIS MESSAGE, though the answer is in the other one. This closes the placeholder
-        // the person has been watching, at the moment their wait actually ended - which is what its
-        // `e2e_ms` should say. Calling it a notice would leave that placeholder measured as never
-        // resolved, reporting a measurement gap on a turn that answered correctly.
-        'final',
-      );
-    } catch (err) {
-      console.warn('[AsyncProcessor] could not close out the private acknowledgement:', err);
-    }
-  }
+  // `final` FOR THIS MESSAGE, though the answer is in the other one. This closes the placeholder the
+  // person has been watching, at the moment their wait actually ended - which is what its `e2e_ms`
+  // should say. Calling it a notice would leave that placeholder measured as never resolved, reporting
+  // a measurement gap on a turn that answered correctly.
+  await closeOutAcknowledgement('final');
 
   console.log('[AsyncProcessor] Message updated successfully', {
     pollTime,

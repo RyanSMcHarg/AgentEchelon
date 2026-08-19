@@ -59,14 +59,53 @@ const principalIdOf = (arn: string) => arn.split('/').pop() || arn;
 const ROSTER_PARAM = '/agent-echelon/alt-bot-slots/roster';
 const SELF_FUNCTION = 'AgentEchelonClassification-Premium-AgentHandler';
 
-/** Keys a previous delivery has already claimed, so a redelivery can be exercised. */
+/**
+ * THE ENVIRONMENT THIS FILE RUNS THE ROUTER IN, DECLARED RATHER THAN INHERITED.
+ *
+ * Every value the router reads out of `process.env` is a value that decides what a turn does, and a
+ * test file that names only the two it needs runs the other ones as whatever the shell that started
+ * jest happened to hold. `undefined` means "unset for this file", and it is as much a dependency as a
+ * value is: `ENABLE_LIVE_DRIFT=true` alongside a data-plane ARN adds retrieval and running-summary
+ * invokes to every turn, and the assertions here read the turn's Lambda invokes to decide which one is
+ * the worker dispatch. With the pair set in the ambient environment, two of these tests fail against a
+ * router that is behaving correctly.
+ *
+ * The router captures most of these at module scope, so they are applied before the import below, not
+ * after it.
+ */
+const ROUTER_ENV: Record<string, string | undefined> = {
+  AWS_LAMBDA_FUNCTION_NAME: SELF_FUNCTION,
+  ALT_BOT_SLOTS_ROSTER_PARAM: ROSTER_PARAM,
+  ENABLE_LIVE_DRIFT: undefined,
+};
+
+const applyEnv = (values: Record<string, string | undefined>) => {
+  for (const [key, value] of Object.entries(values)) {
+    if (value === undefined) delete process.env[key];
+    else process.env[key] = value;
+  }
+};
+
+/**
+ * The dedup marks that are down, standing in for the table.
+ *
+ * WRITTEN BY THE CLAIM, not only seeded by a test, because the handover's whole correctness question
+ * is WHEN a mark goes down relative to the dispatch. A mock that only reads a pre-seeded set cannot
+ * tell a mark taken before an invoke from one taken after it, so a redelivery in these tests observes
+ * exactly what the previous delivery actually left behind.
+ */
 const mockAlreadyClaimed = new Set<string>();
 
 jest.mock('../../lambda/src/lib/abuse-controls.js', () => {
   const actual = jest.requireActual('../../lambda/src/lib/abuse-controls.js');
   return {
     ...actual,
-    claimCorrelation: async (key: string) => !mockAlreadyClaimed.has(key),
+    claimCorrelation: async (key: string) => {
+      if (mockAlreadyClaimed.has(key)) return false;
+      mockAlreadyClaimed.add(key);
+      return true;
+    },
+    hasCorrelationClaim: async (key: string) => mockAlreadyClaimed.has(key),
   };
 }, { virtual: true });
 
@@ -117,6 +156,14 @@ jest.mock('../../lambda/src/lib/task-tracking.js', () => {
       const t = await mockGetActiveTaskForOwner(...a);
       return t ? [t] : [];
     },
+    // The same one query, in the shape the router reads it: live work plus anything that ended here
+    // recently. These tests model no finished work, so the second list is always empty.
+    getOwnerChannelTasks: async (...a: unknown[]) => {
+      const list = await mockGetActiveTasksForOwnerInChannel(...a);
+      if (list !== undefined) return { live: list, recentlyEnded: [] };
+      const t = await mockGetActiveTaskForOwner(...a);
+      return { live: t ? [t] : [], recentlyEnded: [] };
+    },
     getActiveTask: (...a: unknown[]) => mockGetActiveTask(...a),
     applyUserResponseToTask: (...a: unknown[]) => mockApplyUserResponseToTask(...a),
   };
@@ -164,14 +211,23 @@ const turn = (extra: Record<string, unknown> = {}) => ({
 
 describe('a message answering another assistant\'s work is handed to that assistant', () => {
   let routerHandler: (e: any) => Promise<any>;
+  /** What the environment held before this file touched it, put back when the file is done. */
+  const envBefore: Record<string, string | undefined> = {};
+
+  beforeAll(() => {
+    for (const key of Object.keys(ROUTER_ENV)) envBefore[key] = process.env[key];
+  });
+
+  // Restored rather than left standing. A test file mutating the environment it runs in is a file
+  // whose result depends on where it sits in a run, and the reader of a failure has no way to see it.
+  afterAll(() => applyEnv(envBefore));
 
   beforeEach(async () => {
     jest.resetModules();
     jest.clearAllMocks();
     mockAlreadyClaimed.clear();
 
-    process.env.AWS_LAMBDA_FUNCTION_NAME = SELF_FUNCTION;
-    process.env.ALT_BOT_SLOTS_ROSTER_PARAM = ROSTER_PARAM;
+    applyEnv(ROUTER_ENV);
 
     // The roster is what makes an identity sanctionable, so it is mocked per-parameter rather than
     // blanket: a blanket mock would make the security test below pass for the wrong reason.
@@ -192,6 +248,13 @@ describe('a message answering another assistant\'s work is handed to that assist
     mockResumeFromWaiting.mockResolvedValue(false);
     mockGetActiveTaskForOwner.mockResolvedValue(null);
     mockGetActiveTaskForAssistant.mockResolvedValue(null);
+    // BACK TO UNSET, so the list falls back to wrapping the singular mock again. `jest.clearAllMocks`
+    // clears recorded calls and KEEPS implementations, and this is the only mock here whose default is
+    // "unset" rather than a value, so it is the only one an earlier test can leave standing. Left
+    // standing, the multi-chain list set below is every later test's answer: the person holds a chain
+    // THIS assistant owns, so the handover branch is never reached and the tests that assert a
+    // handover report on something else entirely.
+    mockGetActiveTasksForOwnerInChannel.mockResolvedValue(undefined);
     mockGetActiveTask.mockResolvedValue(null);
     mockApplyUserResponseToTask.mockResolvedValue({ applied: true });
 
@@ -276,8 +339,9 @@ describe('a message answering another assistant\'s work is handed to that assist
 
     it('hands one message over ONCE, however many times it is delivered', async () => {
       // Delivery is at-least-once, and this runs ahead of the turn's own correlation claim - which is
-      // minted per fulfillment, so a redelivery mints a fresh one and would sail past it. Unclaimed, a
+      // minted per fulfillment, so a redelivery mints a fresh one and would sail past it. Unmarked, a
       // duplicate gives the person two receipts and the owning assistant two turns on one message.
+      // The mark records a dispatch that happened, which is what the seeded key stands for here.
       mockAlreadyClaimed.add('handover-m-1');
 
       await routerHandler(turn());
@@ -365,7 +429,7 @@ describe('a message answering another assistant\'s work is handed to that assist
 
   // MEASURED ON THE DEPLOYMENT, 2026-08-14, by B-E7's positive control.
   //
-  // A duel side's chain starts in an `awaitsUser` state, so under the ownership split the PERSON holds
+  // A duel side's chain starts in an `awaits` state, so under the ownership split the PERSON holds
   // it from its first moment - and the person-owed lookup is therefore the one that finds it. The duel
   // resume lived only in the assistant's-own-chain branch, which that split had stopped reaching. The
   // response was applied, the battle row was never touched, and both sides of a live duel sat in
@@ -431,6 +495,99 @@ describe('a message answering another assistant\'s work is handed to that assist
       await routerHandler(turn());
 
       expect(mockResumeFromWaiting).not.toHaveBeenCalled();
+    });
+  });
+
+  // THE RECEIPT IS A PROMISE, AND A PROMISE MADE BEFORE THE DISPATCH CAN BE FALSE BY THE TIME IT IS
+  // READ. Posted first, an invoke that then threw left the person told that another assistant had
+  // their answer while this one answered it instead - and the same ordering hid a worse case: a mark
+  // taken before the dispatch and a container that died before issuing it made the redelivery read
+  // "the first handover stands", so no invoke was ever issued and nobody answered the person at all.
+  describe('the receipt follows the dispatch that makes it true', () => {
+    beforeEach(() => {
+      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
+        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OWNER)) : null);
+    });
+
+    /** The receipt: the only message this turn TARGETS at the person. */
+    const receipts = () => posts().filter((p) => p.Target);
+
+    /**
+     * When a mock recorded a matching call, on the counter jest keeps ACROSS mocks - which is what
+     * lets a Lambda invoke and a Chime message be put in order against each other.
+     */
+    const orderOf = (
+      mock: { mock: { calls: any[][]; invocationCallOrder: number[] } },
+      matches: (arg: any) => unknown,
+    ): number => {
+      const at = mock.mock.calls.findIndex((c) => Boolean(matches(c[0])));
+      return at < 0 ? Number.POSITIVE_INFINITY : mock.mock.invocationCallOrder[at];
+    };
+
+    const isHandoverInvoke = (c: any) => c?.__type === 'Invoke'
+      && JSON.parse(Buffer.from(c.input.Payload).toString())?.aeTurn?.handedOverFrom;
+
+    /** The owning assistant's Lambda is unreachable; the worker dispatch still works. */
+    const handoverDispatchFails = () => mockLambdaSend.mockImplementation(async (cmd: any) => {
+      if (isHandoverInvoke(cmd)) throw new Error('Lambda unavailable');
+      return { Payload: Buffer.from(JSON.stringify({ messages: [] })) };
+    });
+
+    it('dispatches before it tells the person where their answer went', async () => {
+      await routerHandler(turn());
+
+      expect(orderOf(mockLambdaSend, isHandoverInvoke))
+        .toBeLessThan(orderOf(mockMessagingSend, (c) => c?.__type === 'SendMessage'));
+    });
+
+    it('says nothing about a handover that did not happen', async () => {
+      handoverDispatchFails();
+
+      await routerHandler(turn());
+
+      // THE DISPATCH WAS ATTEMPTED, asserted first because everything below it is also true of a turn
+      // that never reached the handover at all. Without this the test passes on a mislabelled task, a
+      // stale lookup, or a branch that stopped being reachable, and reports the ordering as sound.
+      expect(mockLambdaSend.mock.calls.some((c) => isHandoverInvoke(c[0]))).toBe(true);
+      // The receipt names an assistant and promises its reply. Sent for a dispatch that threw, it is
+      // a message the person can only read as an answer being on its way from someone it is not.
+      expect(receipts()).toHaveLength(0);
+      // And the fallback still stands: refusing to promise is not refusing to answer.
+      expect(mockApplyUserResponseToTask).toHaveBeenCalled();
+    });
+
+    it('leaves a failed handover for the redelivery to make', async () => {
+      handoverDispatchFails();
+      await routerHandler(turn());
+
+      mockLambdaSend.mockClear();
+      mockMessagingSend.mockClear();
+      mockApplyUserResponseToTask.mockClear();
+      mockLambdaSend.mockResolvedValue({ Payload: Buffer.from(JSON.stringify({ messages: [] })) });
+
+      await routerHandler(turn());
+
+      // Marked before the dispatch, the first delivery's mark stood for an invoke that never left, and
+      // this delivery read it as "already handed over" - so the person's answer reached nobody and the
+      // chain waited on a turn no assistant had been given.
+      expect(handover()?.botArn).toBe(BOT_OWNER);
+      expect(receipts()).toHaveLength(1);
+    });
+
+    it('does not hand over or speak twice when the first dispatch DID happen', async () => {
+      await routerHandler(turn());
+
+      mockLambdaSend.mockClear();
+      mockMessagingSend.mockClear();
+      mockApplyUserResponseToTask.mockClear();
+
+      await routerHandler(turn());
+
+      // The idempotency the mark exists for, and it has to survive the reordering: a real redelivery
+      // after a handover that succeeded gives the owning assistant one turn and the person one receipt.
+      expect(invokes()).toHaveLength(0);
+      expect(posts()).toHaveLength(0);
+      expect(mockApplyUserResponseToTask).not.toHaveBeenCalled();
     });
   });
 

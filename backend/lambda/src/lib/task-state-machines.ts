@@ -16,6 +16,28 @@
 /** Terminal disposition of a state with no outgoing transitions. */
 export type TerminalKind = 'success' | 'failure' | 'handoff';
 
+/**
+ * The references a step may declare as the party it awaits (SPEC-TASK-STATE-TRANSITIONS §12.6).
+ *
+ * `requester` is the person whose request opened the task, resolved from the task record itself, so it
+ * costs nothing to resolve and can never fail. It is the ONLY reference that ships, because a value the
+ * runtime cannot resolve would describe a capability that does not exist.
+ */
+export const AWAITED_PARTIES = ['requester'] as const;
+
+/** A reference to the party a step awaits. Never a resolved principal id (§12.3). */
+export type AwaitedParty = (typeof AWAITED_PARTIES)[number];
+
+/**
+ * WHO a step is waiting on, as a REFERENCE resolved when the step needs an owner.
+ *
+ * An object rather than a bare string so further reference kinds are additive: a future value carries
+ * its own subject (`manager-of(requester)`) without changing the field's type again.
+ */
+export interface AwaitedPartyRef {
+  party: AwaitedParty;
+}
+
 export interface TaskStateDef {
   /** System-prompt fragment for this state (migrates buildTaskSystemPrompt's switch). Optional until that migration. */
   prompt?: string;
@@ -26,39 +48,64 @@ export interface TaskStateDef {
   /** Set iff `transitions` is empty; the outcome this terminal records. */
   terminal?: TerminalKind;
   /**
-   * This state is blocked on the PERSON, not on the assistant.
+   * WHO this state is blocked on. Present ⇒ the machine cannot go further without that party.
    *
-   * Declared rather than inferred, for the same reason transitions are: a runtime that guessed from a
-   * state's name would be right about `awaiting_result` and wrong about the next machine somebody
-   * writes. Entering a state with this set hands the task to the user who is being waited on
+   * THE DECLARED FORM. Declared rather than inferred, for the same reason transitions are: a runtime
+   * that guessed from a state's name would be right about `awaiting_result` and wrong about the next
+   * machine somebody writes. Entering a state that awaits somebody hands the task to them
    * (`reassignTask`), so it appears in their open-items queue alongside every other assistant's; the
    * task returns to the assistant when the state is left.
    *
    * It is what makes "waiting on you" one concept across workflows rather than a per-feature signal -
    * a duel's clarifying question and a report waiting on scope are the same thing to the person
    * holding them (ADR-024, ADR-029).
+   *
+   * IT HOLDS A REFERENCE, NEVER A RESOLVED PRINCIPAL (SPEC-TASK-STATE-TRANSITIONS §12.3). A stored
+   * principal id is wrong the moment the person it names changes, while a reference resolves afresh on
+   * every read and the append-only transition log still answers who actually held the step. Only
+   * `requester` ships; it resolves from the task record, so it is free and always resolvable.
+   *
+   * Read it through `awaitedPartyOf`, never off the field: a reader that keys on one of the two
+   * accepted forms silently stops firing for a machine authored in the other.
+   */
+  awaits?: AwaitedPartyRef;
+  /**
+   * @deprecated Declare `awaits: { party: 'requester' }` instead. Accepted, and normalized to exactly
+   * that by `awaitedPartyOf`, so a machine already stored in a profile version or carried through
+   * profile export and import keeps working (SPEC-TASK-STATE-TRANSITIONS §12.6). It cannot express
+   * WHICH party a step awaits, which is why the declared form is an object.
    */
   awaitsUser?: boolean;
   /**
-   * ONE answer from the person completes this step, so their reply may advance it without the model
-   * being consulted.
+   * ONE clear answer from the person completes this step, so the assistant should take it and move on
+   * rather than asking again.
    *
-   * Opt-in, and deliberately rare. `awaitsUser` says the machine is blocked on a person; it does NOT
+   * Opt-in, and deliberately rare. `awaits` says the machine is blocked on a party; it does NOT
    * say that the next thing they type finishes the step. Requirements gathering is the counter-example
    * and it is the common case: `collecting_requirements` has exactly one exit, so a rule of "advance
    * when there is only one way out" would move a report to drafting on the FIRST reply, before the
    * assistant has what it needs. That is a state machine racing ahead of the conversation it is
    * supposed to be following.
    *
-   * Without this flag a response still hands the work back to the assistant - so the next action fires
-   * either way - and the transition is left to `advance_task_state`, on the turn that has the text and
-   * the model. Set it only where the step IS the answer: a confirmation, an approval, a single choice.
+   * IT IS A STATEMENT TO THE MODEL, NOT A LICENCE FOR THE RUNTIME. It used to let
+   * `applyUserResponseToTask` advance the machine before the model saw the message, and that check is
+   * structural - it asks whether the state awaits someone, never what was said. So `confirming` read
+   * "actually, make it 45 minutes and put it before the kickoff" and "no, do not add it" as approvals
+   * and moved the task to `placed`, a SUCCESS terminal, recording an approval nobody gave and closing
+   * the task the correction needed. No structural test separates those replies from a "yes": they are
+   * all one reply to a one-exit step, and only their content differs.
+   *
+   * So the reply always hands the work back to the assistant - which is what fires the next action -
+   * and the transition is left to `advance_task_state`, on the turn that has the text and the model.
+   * This flag is rendered into that turn's prompt (`buildTaskContextForPrompt`): one clear agreement
+   * completes the step, a correction is put back to the person instead, and a decline advances
+   * nothing. Set it only where the step IS the answer: a confirmation, an approval, a single choice.
    */
   resolvedByOneResponse?: boolean;
   /**
    * WHAT THIS STEP NEEDS from the person before the workflow can go on.
    *
-   * The missing half of `awaitsUser`. That flag says the machine is blocked on someone; it does not say
+   * The missing half of `awaits`. That declaration says the machine is blocked on someone; it does not say
    * what would unblock it, so nothing could tell a complete answer from a partial one - and a step with
    * one exit advanced on whatever arrived first. "Make it about our Q3 numbers" moved a report to
    * drafting with no audience and no format, and the report was written anyway, to nobody, in no
@@ -79,7 +126,7 @@ export interface TaskStateDef {
   /**
    * A DOCUMENT-PRODUCING workflow hands its file back from this state.
    *
-   * Declared rather than inferred, for the same reason `awaitsUser` is: the attachment gate used to
+   * Declared rather than inferred, for the same reason `awaits` is: the attachment gate used to
    * key on a hardcoded per-taskType list of default-machine state names, which a per-profile machine
    * (SPEC-CONFIGURABLE-ASSISTANTS 4.5) could never match - a renamed state or a new document-producing
    * task type silently shipped every deliverable as unattached chat text, with only a shadow log line
@@ -99,6 +146,32 @@ export interface TaskStateDef {
  */
 export const ADVANCE_TASK_STATE_TOOL_NAME = 'advance_task_state';
 
+/**
+ * THE ONE READER OF "who does this step await". Every consumer goes through it; none reads either
+ * field directly.
+ *
+ * Two forms are accepted and mean the same thing: the declared `awaits: { party: 'requester' }`, and
+ * the deprecated `awaitsUser: true` a machine already stored in a profile version or carried through
+ * profile export and import may still hold (SPEC-TASK-STATE-TRANSITIONS §12.6). A consumer that keyed
+ * on one of them would silently stop firing for a machine authored in the other, and the consumers
+ * include the validator that refuses `requires` on a state awaiting nobody - a rule that stops firing
+ * is worse than one that never existed, because the machine it was protecting still looks checked.
+ *
+ * Returns a REFERENCE, not a principal. Resolving it to a person is the caller's, on the record it
+ * holds, at the moment the step needs an owner (§12.3).
+ *
+ * An unrecognised party yields null rather than a guess. Every ingress that can carry one - the
+ * per-assistant profile body, the deployment intent pack, an imported manifest - validates the party
+ * first (`validateTaskStateMachine`), so a value that reaches here unknown is one no path admits.
+ */
+export function awaitedPartyOf(def: TaskStateDef | undefined | null): AwaitedPartyRef | null {
+  if (!def) return null;
+  if (def.awaits) {
+    return (AWAITED_PARTIES as readonly string[]).includes(def.awaits.party) ? def.awaits : null;
+  }
+  return def.awaitsUser === true ? { party: 'requester' } : null;
+}
+
 export interface TaskStateMachine {
   /** The state a freshly created task of this type starts in. Must be a declared state. */
   initial: string;
@@ -117,9 +190,25 @@ export class TaskMachineValidationError extends Error {
 }
 
 /**
- * The platform DEFAULT machines — the five historical task types, migrated verbatim in ordering
+ * The platform DEFAULT machines - the five historical task types, migrated verbatim in ordering
  * with the regression and branch edges the array form could not represent. Keeping these as the
  * default makes the migration a no-op for any deployment that does not override machines in its pack.
+ *
+ * THESE ARE REFERENCE WORKFLOWS, NOT PRODUCTION ONES. They exist to prove the mechanism and to give a
+ * deployment something that works on day one. They are deliberately minimal, and a real deployment is
+ * expected to replace or extend them rather than adopt them as they stand. The clearest illustration
+ * is `guided_troubleshooting.escalated`: it is terminal with disposition `handoff`, and NOTHING routes
+ * that anywhere. No person is notified, no queue receives it, no external system is called. The
+ * disposition does not even survive to an operator: any terminal state marks the lifecycle
+ * `completed`, and a completed task's terminal kind is recorded as `success`, so an escalation reads
+ * in the ledger exactly like a resolution. Only the tool's return value carries `handoff`, to the
+ * model. The missing DESTINATION is a deliberate boundary, since where an escalation should go is a
+ * property of the deploying organisation; the missing DISTINCTION in the record is not, and a
+ * deployment relying on this state should expect to fix both.
+ *
+ * The same caveat applies to the rest: no machine here carries an SLA, a retry policy, an approval
+ * with an entitled approver, or an integration with anything outside the conversation. Read them as
+ * worked examples of the contract in SPEC-TASK-STATE-TRANSITIONS, not as flows to run a business on.
  *
  * Deltas from the old linear arrays (SPEC-TASK-STATE-TRANSITIONS §5):
  *  - guided_troubleshooting: `diagnosing -> collecting_symptoms` (need more info) and
@@ -129,6 +218,13 @@ export class TaskMachineValidationError extends Error {
  *    user-requested rework only, with `revising -> {completed | generating}`.
  *  - place_item: advanced by the propose_item tool's success side-effect (collecting -> confirming).
  *  - action_item: options_presented entered by the model's own tool call.
+ *
+ * WHERE EACH MACHINE RESTS ON THE PERSON. Three of them name their wait in a state of its own -
+ * `awaiting_result`, `confirming`, `options_presented`/`awaiting_completion` - so the state that
+ * produces the thing being waited on (`proposing_solutions`, `collecting`, `gathering`) is passed
+ * through within the turn and awaits nobody. The other two have no such state: `drafting_outline`
+ * exits only to `generating` and `validating` only to `formatting`, both of which are the assistant
+ * working, so in those two machines the producing state IS the wait and carries `awaits` itself.
  */
 export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
   guided_troubleshooting: {
@@ -136,14 +232,17 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
     states: {
       collecting_symptoms: {
         transitions: ['diagnosing'],
-        awaitsUser: true,
+        awaits: { party: 'requester' },
         requires: ['what is going wrong', 'when it started', 'what they have already tried'],
       },
       diagnosing: { transitions: ['proposing_solutions', 'collecting_symptoms'] }, // regression: need more info
       proposing_solutions: { transitions: ['awaiting_result'] },
       // Worked / didn't / give up. No `requires`: the outcome IS the answer, and asking someone to
       // elaborate on "that fixed it" is the assistant not listening in the other direction.
-      awaiting_result: { transitions: ['resolved', 'diagnosing', 'escalated'], awaitsUser: true },
+      awaiting_result: {
+        transitions: ['resolved', 'diagnosing', 'escalated'],
+        awaits: { party: 'requester' },
+      },
       resolved: { transitions: [], terminal: 'success' },
       escalated: { transitions: [], terminal: 'handoff' },
     },
@@ -153,11 +252,19 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
     states: {
       collecting_requirements: {
         transitions: ['extracting'],
-        awaitsUser: true,
+        awaits: { party: 'requester' },
         requires: ['what data to pull', 'where it comes from', 'the output format'],
       },
       extracting: { transitions: ['validating', 'collecting_requirements'], delivers: true }, // regression: requirements were wrong
-      validating: { transitions: ['formatting'], delivers: true },
+      // THE EXTRACTION IS PUT TO THE PERSON TO CHECK, so the person holds it. The step's whole job is
+      // "do these records look right?", and the only way out of it is `formatting`, which is work the
+      // assistant does once they have said. There is no separate waiting state to hold that pause, so
+      // it rests here - the same shape as `drafting_outline` below, and it is left off for the same
+      // reason it was left off there.
+      //
+      // No `resolvedByOneResponse`: "row 3 is wrong" is a reply and is not an approval, and one exit
+      // plus any reply is exactly what would format and deliver the wrong table.
+      validating: { transitions: ['formatting'], awaits: { party: 'requester' }, delivers: true },
       formatting: { transitions: ['completed'], delivers: true },
       completed: { transitions: [], terminal: 'success' },
     },
@@ -170,10 +277,35 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
       // particular shape, from an assistant that looks like it was not listening.
       collecting_requirements: {
         transitions: ['drafting_outline'],
-        awaitsUser: true,
+        awaits: { party: 'requester' },
         requires: ['the subject', 'the audience', 'the length or format'],
       },
-      drafting_outline: { transitions: ['generating'] },
+      // THE OUTLINE IS PUT TO THE PERSON FOR APPROVAL, so the person holds it. The step ends its turn
+      // on a question ("does this structure work, or do you want to change a section?") and the only
+      // way out of it is `generating`, which is the assistant writing the report. Nothing else in the
+      // machine can hold that pause, unlike `guided_troubleshooting`, where the wait has its own state
+      // (`awaiting_result`) one hop on; here the wait IS this state.
+      //
+      // WHAT ITS ABSENCE COST. Ownership moves at every `awaits` boundary, so with the declaration off the
+      // report stayed with the assistant while the person was the one being waited on. The next turn's
+      // owner-keyed lookup found nothing held by them, the router reported no live task, and drift
+      // suppression - which existed for precisely this turn - never ran. "Can you make it 1-2 pages?",
+      // a direct answer to the assistant's own question, was answered with an offer to split the
+      // conversation, because a short reply about page count sits far from an ARR summary's embedding.
+      //
+      // `requires` names the one thing the person still owes, because the step is genuinely blocked on
+      // a decision and the list is read back to them when it is missing. It also tells the model that a
+      // change request IS the answer to this step - apply it and move on - rather than a new subject.
+      //
+      // NOT `resolvedByOneResponse`: that would advance to `generating` on whatever arrived, so "how
+      // long will this take?" would start writing the report. The reply hands the work back to the
+      // assistant either way; the transition is left to `advance_task_state`, on the turn that has the
+      // text and the model.
+      drafting_outline: {
+        transitions: ['generating'],
+        awaits: { party: 'requester' },
+        requires: ['approval of the outline, or what to change about it'],
+      },
       // Deliver the report on generation: generating -> completed is the DEFAULT path. A generated
       // report is a finished deliverable; the user is never forced to run a revision pass. `revising`
       // is entered ONLY when the user explicitly asks for changes (generating -> revising, then apply
@@ -190,8 +322,15 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
     initial: 'collecting',
     states: {
       collecting: { transitions: ['confirming'] },
-      // The confirmation IS the step: one 'yes' completes it, so the reply may advance it directly.
-      confirming: { transitions: ['placed'], awaitsUser: true, resolvedByOneResponse: true },
+      // The confirmation IS the step: one clear "yes" completes it, and the assistant is told to take
+      // that answer rather than ask again. It does NOT mean any reply completes it - a correction
+      // ("make it 45 minutes") and a decline ("do not add it") arrive at this same step, and `placed`
+      // is a SUCCESS terminal that would record them as approvals.
+      confirming: {
+        transitions: ['placed'],
+        awaits: { party: 'requester' },
+        resolvedByOneResponse: true,
+      },
       placed: { transitions: [], terminal: 'success' },
     },
   },
@@ -200,8 +339,8 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
     states: {
       gathering: { transitions: ['options_presented'] },
       // The options are ON THE TABLE and the person has to pick; then the work itself is theirs to do.
-      options_presented: { transitions: ['awaiting_completion'], awaitsUser: true },
-      awaiting_completion: { transitions: ['completed'], awaitsUser: true },
+      options_presented: { transitions: ['awaiting_completion'], awaits: { party: 'requester' } },
+      awaiting_completion: { transitions: ['completed'], awaits: { party: 'requester' } },
       completed: { transitions: [], terminal: 'success' },
     },
   },
@@ -235,13 +374,26 @@ export function validateTaskStateMachine(name: string, machine: TaskStateMachine
     } else if (def.terminal) {
       throw new TaskMachineValidationError(name, `state "${state}" has transitions but is marked terminal`);
     }
-    // `requires` is what the PERSON still owes, so a state that is not waiting on one cannot have any.
-    // Declared on a state the machine passes through unattended, it would be rendered into the prompt
-    // as a list of things to chase nobody was ever asked for.
-    if (def.requires?.length && !def.awaitsUser) {
+    // An unresolvable reference is refused HERE, at every ingress a machine can arrive through (the
+    // per-assistant profile body, the deployment intent pack, an imported manifest), because a party
+    // nothing resolves leaves a step with no owner and no way to say so.
+    if (def.awaits && !(AWAITED_PARTIES as readonly string[]).includes(def.awaits.party)) {
       throw new TaskMachineValidationError(
         name,
-        `state "${state}" declares requires but does not await the user`,
+        `state "${state}" awaits an unknown party "${def.awaits.party}"; declared parties: ${AWAITED_PARTIES.join(', ')}`,
+      );
+    }
+    // `requires` is what the awaited party still owes, so a state waiting on nobody cannot have any.
+    // Declared on a state the machine passes through unattended, it would be rendered into the prompt
+    // as a list of things to chase nobody was ever asked for.
+    //
+    // KEYED ON THE NORMALIZER, not on either field. Keyed on `awaitsUser` this rule stopped firing the
+    // moment a machine was authored in the declared form, which is the state of affairs it exists to
+    // catch: the machine still reads as validated while nothing checks it.
+    if (def.requires?.length && !awaitedPartyOf(def)) {
+      throw new TaskMachineValidationError(
+        name,
+        `state "${state}" declares requires but awaits nobody`,
       );
     }
     // A step that one reply completes cannot also have a checklist standing between it and its exit:

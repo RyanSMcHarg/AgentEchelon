@@ -1,11 +1,11 @@
 /**
- * The `awaitsUser` boundary — who holds a task while it is blocked on a person.
+ * The `awaits` boundary — who holds a task while it is blocked on a person.
  *
  * This is the behaviour that makes "waiting on you" one concept across workflows: a report waiting on
  * scope and a duel's clarifying question are both a task the PERSON owns, so both appear in the same
  * queue (ADR-024 D1/D3, ADR-029). The rules under test:
  *
- *   - entering a state declared `awaitsUser` hands the task to the user;
+ *   - entering a state that declares `awaits` hands the task to the party it names;
  *   - leaving one hands it back to the assistant that is running the turn;
  *   - moving BETWEEN two states on the same side of the boundary moves nothing, so an ordinary
  *     multi-step task does not churn the mirror partition on every hop.
@@ -71,22 +71,22 @@ beforeEach(() => {
   process.env.USER_TASKS_TABLE = 'user-tasks';
 });
 
-describe('awaitsUser hand-over', () => {
+describe('the awaits hand-over', () => {
   it('hands the task to the USER when the machine enters a state that awaits them', async () => {
     const { advanceTaskStateTo } = await import('../../lambda/src/lib/task-tracking');
     // report_generation: generating -> revising. `revising` is entered only when the user asks for
-    // changes, and `collecting_requirements` is the declared awaitsUser state, so use that machine's
+    // changes, and `collecting_requirements` is the declared waiting state, so use that machine's
     // real edge into it: completed <- ... use collecting_requirements as the target via a task there.
     const task = { ...taskInState('drafting_outline'), taskType: 'report_generation' };
-    // drafting_outline -> generating is NOT an awaitsUser state, so nothing moves.
+    // drafting_outline -> generating is NOT a waiting state, so nothing moves.
     await advanceTaskStateTo({ task, toState: 'generating', assistantId: BOT_ID });
     expect(ownerWrites()).toHaveLength(0);
   });
 
-  it('hands the task to the USER on entering an awaitsUser state', async () => {
+  it('hands the task to the USER on entering a state that awaits them', async () => {
     const { advanceTaskStateTo } = await import('../../lambda/src/lib/task-tracking');
     // data_extraction: extracting -> collecting_requirements is a declared regression edge INTO an
-    // awaitsUser state ("the requirements were wrong, ask again").
+    // waiting state ("the requirements were wrong, ask again").
     const task = {
       ...taskInState('extracting'),
       taskType: 'data_extraction',
@@ -114,7 +114,7 @@ describe('awaitsUser hand-over', () => {
 
   it('does NOT move ownership between two states that both await the user', async () => {
     const { advanceTaskStateTo } = await import('../../lambda/src/lib/task-tracking');
-    // action_item: options_presented -> awaiting_completion, both declared awaitsUser. The user held
+    // action_item: options_presented -> awaiting_completion, both of which await them. The user held
     // it before and still holds it, so a partition move here would be pure churn.
     const task = {
       ...taskInState('options_presented'),
@@ -133,7 +133,7 @@ describe('awaitsUser hand-over', () => {
 
   it('leaves the item with the user when no assistant is supplied to hand back to', async () => {
     const { advanceTaskStateTo } = await import('../../lambda/src/lib/task-tracking');
-    // Leaving an awaitsUser state with no `assistantId`: ownership must NOT be cleared. An item that
+    // Leaving a waiting state with no `assistantId`: ownership must NOT be cleared. An item that
     // lingers in a queue is visible and fixable; a task owned by nobody is findable by no query.
     const task = {
       ...taskInState('collecting_requirements'),
