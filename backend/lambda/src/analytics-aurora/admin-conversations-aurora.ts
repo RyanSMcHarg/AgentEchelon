@@ -91,6 +91,9 @@ export async function adminListConversations(
        SELECT DISTINCT ON (channel_arn) channel_arn, content AS name
          FROM messages
         WHERE event_type IN ('CREATE_CHANNEL','UPDATE_CHANNEL') AND content IS NOT NULL AND content <> ''
+          -- Not the client placeholder: the CREATE row always carries 'New conversation', which made
+          -- the first_msg fallback unreachable in exactly the lost-rename case it covers.
+          AND content <> 'New conversation'
         ORDER BY channel_arn, created_at DESC
      ),
      first_msg AS (

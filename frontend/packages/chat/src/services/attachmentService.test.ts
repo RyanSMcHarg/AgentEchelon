@@ -98,8 +98,12 @@ describe('uploadFile', () => {
     expect(entries[entries.length - 1]).toBe('file');
   });
 
-  it('allows files with empty type', async () => {
-    const noType = createFile('data.bin', 1024, '');
+  it('infers the type from the extension when the browser reports none', async () => {
+    // Browsers report '' for extensions they don't know (.md on Windows is the common case). The old
+    // behaviour admitted these and sent application/octet-stream, which the presigner categorically
+    // rejects - a guaranteed LATE 400 for a file this function had just accepted. The type is
+    // inferred and the real type is what reaches the presigner and S3.
+    const md = createFile('notes.md', 1024, '');
 
     mockFetch
       .mockResolvedValueOnce({
@@ -108,8 +112,17 @@ describe('uploadFile', () => {
       })
       .mockResolvedValueOnce({ ok: true });
 
-    const result = await uploadFile(noType, 'conv-1', 'user-1');
-    expect(result.type).toBe('application/octet-stream');
+    const result = await uploadFile(md, 'conv-1', 'user-1');
+    expect(result.type).toBe('text/markdown');
+    expect(JSON.parse(mockFetch.mock.calls[0][1].body).fileType).toBe('text/markdown');
+  });
+
+  it('refuses a file whose type cannot be determined, BEFORE anything uploads', async () => {
+    // The counterpart: an unknown binary must fail here, with the reason, not three hops later as a
+    // presigner 400 the user cannot interpret.
+    const bin = createFile('data.bin', 1024, '');
+    await expect(uploadFile(bin, 'conv-1', 'user-1')).rejects.toThrow('not supported');
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('throws on presigned URL failure', async () => {

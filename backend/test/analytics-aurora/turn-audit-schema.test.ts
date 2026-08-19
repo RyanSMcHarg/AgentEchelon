@@ -144,3 +144,26 @@ describe('v_turn_latency — the rules that make the numbers honest', () => {
     expect(sql.slice(viewStart, viewEnd)).not.toContain('resolve_ms');
   });
 });
+
+describe('027: the view measures LIVE rows, not only backfilled ones', () => {
+  // The live writer's final_response carries turn_id NULL (an update's content has no corr marker)
+  // and its placeholders carry no declared trigger - so the 019/026 grain split every live turn in
+  // two with e2e_ms NULL, and the strict trigger gate nulled TTFF for all ordinary live traffic.
+  // Healed at READ so already-written rows are repaired too.
+  const sql027 = require('fs').readFileSync(
+    require('path').join(SCHEMA_DIR, '027-turn-latency-live-rows.sql'), 'utf8');
+
+  it('grains per RESPONSE and lifts the placeholder-declared turn id over the final row NULL', () => {
+    expect(sql027).toContain('SELECT MAX(turn_id) AS turn_id');
+    expect(sql027).toMatch(/GROUP BY response_id, channel_arn/);
+    expect(sql027).not.toMatch(/GROUP BY turn_id, response_id/);
+  });
+
+  it('an undeclared trigger defaults to user, while a declared non-user still suppresses TTFF', () => {
+    expect(sql027).toContain("COALESCE(r.trigger_kind, 'user') = 'user'");
+  });
+
+  it('keeps the 026 pushable-channel shape (a relabel, never a type change)', () => {
+    expect(sql027).toContain('channel_arn::text');
+  });
+});

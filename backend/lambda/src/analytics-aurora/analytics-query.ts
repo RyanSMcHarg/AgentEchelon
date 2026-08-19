@@ -1090,6 +1090,11 @@ async function getConversations(
         WHERE m.channel_arn = c.channel_arn
           AND m.event_type IN ('CREATE_CHANNEL','UPDATE_CHANNEL')
           AND m.content IS NOT NULL AND m.content <> ''
+          -- The CREATE row always carries the client's placeholder title, which made the
+          -- first-message fallback below unreachable in exactly the lost-rename case it exists
+          -- for: COALESCE took 'New conversation' and fm was never consulted. The placeholder is
+          -- not a name; only a real (derived or user-set) title wins here.
+          AND m.content <> 'New conversation'
         ORDER BY m.created_at DESC
         LIMIT 1
      ) n ON TRUE

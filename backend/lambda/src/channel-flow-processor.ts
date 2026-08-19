@@ -1316,7 +1316,17 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
       .map((m) => m.Member?.Arn || '')
       .filter((arn) => arn.includes('/bot/'));
   } catch (err) {
+    // NEVER SILENT. The router returns silence for the /battle token unconditionally, so this flow
+    // is the only thing that can answer - a bare return here left the user's persisted /battle
+    // answered by nothing after a transient Chime throttle. Same rule as every sibling gate in this
+    // function: the person is told, targeted, best-effort.
     console.warn('[ChannelFlow][battle] ListChannelMemberships failed:', err);
+    await sendBotMessage(
+      channelArn,
+      defaultBotArn,
+      "I couldn't start that battle just now. Please try /battle again.",
+      [senderArn],
+    ).catch(() => { /* the log above is the fallback record */ });
     return;
   }
 
@@ -1345,9 +1355,17 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
   // dispatches its own worker. One routing table decides both, so the two can never disagree.
   const battleRouterArn = routerArnForClassification(channelClassification);
   if (!battleRouterArn) {
+    // Deterministic and deployment-shaped (a missing router env), so silence would read as the
+    // assistant being broken on EVERY /battle in this channel. Tell the person, loudly log the why.
     console.warn('[ChannelFlow][battle] no router wired for classification, cannot fan out', {
       channelClassification,
     });
+    await sendBotMessage(
+      channelArn,
+      defaultBotArn,
+      "Battle Mode isn't fully configured for this conversation's classification. Ask an operator to check the deployment.",
+      [senderArn],
+    ).catch(() => { /* the log above is the fallback record */ });
     return;
   }
 

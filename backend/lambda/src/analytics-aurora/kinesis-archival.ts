@@ -1378,7 +1378,10 @@ async function syncChannelRegistryRecords(
         `INSERT INTO channel_registry (channel_arn, channel_type, is_primary, channel_name, created_via)
          VALUES ($1, COALESCE($2, 'conversation'), $3, $4, $5)
          ON CONFLICT (channel_arn) DO UPDATE SET
-           channel_type = COALESCE(EXCLUDED.channel_type, channel_registry.channel_type),
+           -- The RAW parameter, NOT EXCLUDED.channel_type: the VALUES row has already coalesced $2
+           -- to 'conversation', so EXCLUDED is never NULL and the guard the comment above describes
+           -- never fired - a metadata-less UPDATE_CHANNEL silently reclassified a 'guest' row.
+           channel_type = COALESCE($2, channel_registry.channel_type),
            channel_name = COALESCE(EXCLUDED.channel_name, channel_registry.channel_name),
            created_via = COALESCE(EXCLUDED.created_via, channel_registry.created_via),
            updated_at = NOW()`,

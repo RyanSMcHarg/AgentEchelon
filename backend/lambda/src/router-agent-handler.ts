@@ -1796,6 +1796,12 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // turn IS a battle side's continuation, and synthesizes the context the bypass would have
     // carried (see resumeDuelSideIfWaiting).
     let battleCtx = bypassBattleContext(event);
+    // WHETHER THE CALLER ALREADY METERED THIS TURN. True only for a DECLARED context: the channel
+    // flow gates a duel as a whole before the fan-out and before a continuation invoke, so a turn
+    // that ARRIVES with battleContext was paid for upstream. A context SYNTHESIZED by a resume below
+    // is the opposite case - an ordinary Lex turn no upstream ever gated - and it must be metered
+    // here like any other turn, or every answer in a multi-step duel chain is unmetered model spend.
+    const meteredUpstream = Boolean(battleCtx);
 
     let activeTask: UserTask | null = null;
     /**
@@ -2289,7 +2295,9 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     //
     // This is the one battle-shaped branch in the handler. It is not a licence for others: what is
     // special here is that the caller already authorised BOTH turns, which is true of nothing else.
-    if (battleCtx) {
+    // Only a DECLARED battle context skips the gate (see meteredUpstream above): a resumed side's
+    // synthesized context is a real, un-gated user turn and pays like one.
+    if (battleCtx && meteredUpstream) {
       console.log('[Router] battle turn: metered once by the flow for the whole duel, not per side', {
         battleId: battleCtx.battleId,
         round: battleCtx.round,

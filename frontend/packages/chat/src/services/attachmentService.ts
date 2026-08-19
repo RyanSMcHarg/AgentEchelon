@@ -28,6 +28,29 @@ function getPresignedUrlEndpoint(): string {
   return url;
 }
 
+/**
+ * Browsers report `file.type === ''` for extensions they don't know (`.md` on Windows is the common
+ * case). The old behaviour admitted those and sent 'application/octet-stream', which the presigner
+ * categorically rejects - a guaranteed late 400 for a file this function had just accepted. The type
+ * is inferred from the extension instead, and a file that is STILL unknown is refused here, with the
+ * reason, before anything is uploaded.
+ */
+const TYPE_BY_EXTENSION: Record<string, string> = {
+  txt: 'text/plain',
+  md: 'text/markdown',
+  markdown: 'text/markdown',
+  csv: 'text/csv',
+  json: 'application/json',
+  html: 'text/html',
+  htm: 'text/html',
+};
+
+function effectiveFileType(file: File): string {
+  if (file.type) return file.type;
+  const ext = file.name.split('.').pop()?.toLowerCase() ?? '';
+  return TYPE_BY_EXTENSION[ext] ?? '';
+}
+
 export async function uploadFile(
   file: File,
   conversationId: string,
@@ -37,8 +60,9 @@ export async function uploadFile(
     throw new Error(`File size exceeds ${MAX_FILE_SIZE / (1024 * 1024)}MB limit`);
   }
 
-  if (ALLOWED_TYPES.length > 0 && !ALLOWED_TYPES.includes(file.type) && file.type !== '') {
-    throw new Error(`File type "${file.type}" is not supported`);
+  const fileType = effectiveFileType(file);
+  if (!ALLOWED_TYPES.includes(fileType)) {
+    throw new Error(`File type "${file.type || file.name.split('.').pop() || 'unknown'}" is not supported`);
   }
 
   // Get presigned upload URL (Cognito-authorized)
@@ -56,7 +80,7 @@ export async function uploadFile(
     body: JSON.stringify({
       action: 'upload',
       fileName: file.name,
-      fileType: file.type || 'application/octet-stream',
+      fileType,
       conversationId,
       userId,
     }),
@@ -82,7 +106,7 @@ export async function uploadFile(
   } else {
     uploadResponse = await fetch(uploadUrl, {
       method: 'PUT',
-      headers: { 'Content-Type': file.type || 'application/octet-stream' },
+      headers: { 'Content-Type': fileType },
       body: file,
     });
   }
@@ -93,7 +117,7 @@ export async function uploadFile(
 
   trackEvent('file_uploaded', {
     size: file.size,
-    type: file.type || 'application/octet-stream',
+    type: fileType,
     conversationId,
   });
 
@@ -101,7 +125,7 @@ export async function uploadFile(
     fileKey,
     name: file.name,
     size: file.size,
-    type: file.type || 'application/octet-stream',
+    type: fileType,
   };
 }
 

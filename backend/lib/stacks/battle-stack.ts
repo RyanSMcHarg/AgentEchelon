@@ -419,7 +419,12 @@ export class BattleStack extends cdk.Stack {
           statements: [
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
-              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${processorArnKey('premium')}`],
+              // EVERY classification's processor parameter, matching the env above - battles are not
+              // premium-only. This listed only premium while the env named all three, so a standard
+              // or basic duel's round-2 lookup got AccessDenied, the catch returned '', and the
+              // rebuttal silently never fired. Name-pattern scoped for the same synth-order reason
+              // as the alt-slot handler's router grant: the ARNs are unknown at deploy.
+              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/processor-arn`],
             }),
           ],
         }),

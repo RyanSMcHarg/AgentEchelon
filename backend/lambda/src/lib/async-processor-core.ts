@@ -1132,6 +1132,12 @@ export function docFormatFromContentType(contentType: string | undefined): Conve
       return 'txt';
     case 'text/markdown':
       return 'md';
+    // JSON is text Converse has no format tag for. Served as 'txt' rather than dropped: the upload
+    // allowlists (client + presigner) both admit application/json, so a silent undefined here meant
+    // the user's .json uploaded to S3 and the assistant answered as if nothing was sent - the
+    // three-way contract drift the mime-contract test now pins.
+    case 'application/json':
+      return 'txt';
     default:
       return undefined;
   }
