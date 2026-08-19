@@ -2,6 +2,8 @@
 
 **Status:** Partial (frontend workspace split and CORS/env split built through P3; further docs and hardening remain) **Layer:** Interface (admin interface - reference client) **Plane:** admin **Product spec:** [`SPEC-ADMIN-CONSOLE.md`](SPEC-ADMIN-CONSOLE.md) **Summary:** An operator wants the privileged admin surface - its code and its endpoint URLs - kept out of the public chat app that any visitor loads, and wants to deploy, harden, replace, or omit that surface on its own schedule rather than ship one bundle where admin code rides along in every browser. The alternative is to hand-separate admin from public code and manage the split yourself. The admin console ships as its own npm-workspace package (`@ae/admin`) built and deployed to its own CloudFront origin, sharing `@ae/shared` with the chat app (`@ae/chat`); a build-time import-graph assertion keeps admin code out of the public chat bundle.
 
+**Coverage:** `e2e/admin-nav.spec.ts`, `e2e/admin-dashboard.spec.ts`
+
 ## 1. Architecture
 
 The frontend is an npm-workspaces monorepo of three packages under `frontend/packages/`:

@@ -1,9 +1,9 @@
 /**
  * Admin conversation membership sync (SPEC-ADMIN-IDENTITY section 8).
  *
- * Scheduled reconcile. Resolves the admin set from the Cognito `admins` group and
- * syncs each configured admin conversation's Chime membership + the Metadata
- * `participants[]` the notification bridge reads. Runs as the SERVICE
+ * Scheduled reconcile. Resolves the admin set from the Cognito `admins` group and syncs each
+ * configured admin conversation's Chime MEMBERSHIP — which is the whole roster; no second copy is
+ * written anywhere, and the notification bridge reads membership directly. Runs as the SERVICE
  * app-instance-admin (an automated, no-human path). It also de-provisions
  * app-instance-admin for any human no longer in the admins group (the demotion
  * backstop, so a demoted user loses cross-channel authority even if their last
@@ -41,6 +41,21 @@ const ssm = new SSMClient({ region: REGION });
 
 const errName = (e: unknown): string => (e as { name?: string })?.name || '';
 
+/**
+ * Name AND message, for the places that REPORT an error rather than branch on it.
+ *
+ * `errName` is right for control flow (`!== 'NotFoundException'`), and wrong for a log line: an
+ * AccessDeniedException's whole diagnostic value is in its message, which names the principal and the
+ * action denied. Logging the name alone produced "deprovision sweep failed AccessDeniedException" on
+ * every scheduled run - enough to know something is broken, not enough to know WHAT, and the sweep
+ * spans four different API calls. Determining which one required reading IAM policies by hand against
+ * the source, and still did not settle it.
+ */
+const errDetail = (e: unknown): string => {
+  const err = e as { name?: string; message?: string };
+  return err?.message ? `${err.name || 'Error'}: ${err.message}` : (err?.name || String(e));
+};
+
 let cachedAdminArn = '';
 async function serviceAdminArn(): Promise<string> {
   if (cachedAdminArn) return cachedAdminArn;
@@ -66,8 +81,9 @@ async function resolveAdminUserArns(): Promise<Set<string>> {
   return arns;
 }
 
-/** Sync one admin conversation: add missing admins, remove humans no longer admins
- *  (bots/assistants are left alone), and refresh the Metadata `participants[]`. */
+/** Sync one admin conversation: add missing admins and remove humans no longer admins
+ *  (bots/assistants are left alone). Membership IS the roster — nothing else is written; see the
+ *  note at the end of this function for why the Metadata copy was removed. */
 async function syncConversation(channelArn: string, adminArns: Set<string>, bearer: string): Promise<void> {
   const currentHumans = new Set<string>();
   let NextToken: string | undefined;
@@ -99,19 +115,18 @@ async function syncConversation(channelArn: string, adminArns: Set<string>, bear
     } catch (e) { if (errName(e) !== 'NotFoundException') throw e; }
   }
 
-  // Refresh the participants[] the notification bridge reads (channel-notify.ts).
-  try {
-    const desc = await messaging.send(new DescribeChannelCommand({ ChannelArn: channelArn, ChimeBearer: bearer }));
-    const ch = desc.Channel;
-    let meta: Record<string, unknown> = {};
-    try { meta = JSON.parse(ch?.Metadata || '{}') as Record<string, unknown>; } catch { meta = {}; }
-    meta.participants = [...adminArns].map((a) => ({ sub: a.split('/user/')[1] }));
-    await messaging.send(new UpdateChannelCommand({
-      ChannelArn: channelArn, Name: ch?.Name, Mode: ch?.Mode, Metadata: JSON.stringify(meta), ChimeBearer: bearer,
-    }));
-  } catch (e) {
-    console.warn('[AdminConvSync] metadata refresh failed for', channelArn, errName(e));
-  }
+  // NO Metadata roster refresh. This used to rewrite `Metadata.participants` on every sync so the
+  // notification bridge had a recipient list. Both halves of that are now wrong:
+  //
+  //   - IDENTITY IN METADATA. It wrote every admin's `sub` into a blob readable by every channel
+  //     member and writable by any moderator. METADATA-AND-TAGS §1 puts identity on the never list.
+  //   - IT WAS A COPY THAT DRIFTED. The membership calls above are the real change; the roster was a
+  //     second representation of the same fact, and any sync that updated one and failed the other
+  //     left them disagreeing — with the stale copy deciding who got emailed.
+  //
+  // `channel-notify.ts` now derives recipients from live `ListChannelMemberships`, so the membership
+  // work above IS the update. These are native subs (AppInstanceUser id == sub), so no issuer hint is
+  // needed either.
 }
 
 /**
@@ -161,11 +176,11 @@ export const handler = async (): Promise<{ ok: boolean; admins: number; conversa
   if (bearer) {
     for (const channelArn of ADMIN_CONVERSATION_ARNS) {
       try { await syncConversation(channelArn, adminArns, bearer); }
-      catch (e) { console.error('[AdminConvSync] conversation sync failed', channelArn, errName(e)); }
+      catch (e) { console.error('[AdminConvSync] conversation sync failed', channelArn, errDetail(e)); }
     }
   }
   try { await deprovisionDemotedAdmins(adminArns); }
-  catch (e) { console.error('[AdminConvSync] deprovision sweep failed', errName(e)); }
+  catch (e) { console.error('[AdminConvSync] deprovision sweep failed', errDetail(e)); }
 
   console.log(JSON.stringify({
     _auditEvent: 'admin_conversation_sync',

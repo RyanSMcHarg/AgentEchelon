@@ -115,8 +115,74 @@
 /* Stacked-card layout on narrow screens: a wide, horizontally-scrolling table is unusable on a phone,
    and the row-drill needs a real tap target. Each row becomes a card of "Label: value" pairs (the
    label comes from each cell's data-label), and the whole card is tappable when the row is clickable. */
+/* Mobile sort bar — hidden by default, revealed with the stacked layout below. */
+.data-table-mobile-sort { display: none; }
+
 @media (max-width: 640px) {
   .data-table-wrapper { overflow-x: visible; }
+
+  /* The sort control that replaces the hidden column headers. Sits directly above the cards so the
+     ordering control is adjacent to what it orders. Mono label for the technical register. */
+  .data-table-mobile-sort {
+    display: flex;
+    align-items: center;
+    gap: var(--space-2);
+    padding: var(--space-2) var(--space-3);
+    border-bottom: 1px solid var(--surface-100);
+    background: var(--surface-50);
+  }
+  .data-table-mobile-sort-label {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--tracking-wide);
+    color: var(--text-secondary);
+    flex: 0 0 auto;
+  }
+  .data-table-mobile-sort-select {
+    flex: 1 1 auto;
+    min-width: 0;
+    min-height: 40px; /* touch target */
+    padding: var(--space-1) var(--space-2);
+    border: 1px solid var(--surface-200);
+    border-radius: var(--radius-md);
+    background: var(--surface-0);
+    color: var(--text-primary);
+    font-family: var(--font-sans);
+    font-size: var(--text-base);
+  }
+  .data-table-mobile-sort-dir {
+    flex: 0 0 auto;
+    min-height: 40px;
+    padding: var(--space-1) var(--space-3);
+    border: 1px solid var(--surface-200);
+    border-radius: var(--radius-md);
+    background: var(--surface-0);
+    color: var(--text-secondary);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    cursor: pointer;
+  }
+  .data-table-mobile-sort-dir:disabled { opacity: 0.45; cursor: default; }
+  .data-table-mobile-sort-select:focus-visible,
+  .data-table-mobile-sort-dir:focus-visible {
+    outline: none;
+    border-color: var(--accent-500);
+    box-shadow: var(--shadow-glow);
+  }
+
+  /* ACTIONS CELL. The generic stacked rule is `display:flex; justify-content:space-between` with the
+     label pinned left — which squeezes a 4-button group into whatever is left and pushes the last
+     buttons out of the card. An action you cannot reach is the same as an action that does not exist,
+     which is how End/Delete became unavailable on a phone. Give the actions their own row instead. */
+  .data-table td[data-col="actions"] {
+    display: block;
+    text-align: left;
+  }
+  .data-table td[data-col="actions"]::before {
+    display: block;
+    margin-bottom: var(--space-2);
+  }
   .data-table { font-size: var(--text-sm); }
   .data-table thead { display: none; }
   .data-table, .data-table tbody, .data-table tr, .data-table td { display: block; width: 100%; }
@@ -126,6 +192,13 @@
     margin: var(--space-2) var(--space-2);
     padding: var(--space-1) var(--space-2);
     background: var(--surface-0);
+    /* `width: auto`, NOT the `100%` inherited from the shared display:block rule above.
+       100% resolves against the FULL row width and then the 8px side margins and 1px borders are
+       added on top, so each card measured 390 + 16 + 2 = 408px in a 390px viewport. Every admin table
+       has been scrolling the whole PAGE sideways on a phone because of it — measured at 390px:
+       scrollWidth 397 vs viewport 390, with the `tr` as the sole overflowing element.
+       `auto` lets the block fill what is left AFTER margins, which is what the card layout wants. */
+    width: auto;
   }
   .data-table tbody tr:last-child td { border-bottom: 1px solid var(--surface-100); }
   .data-table td {

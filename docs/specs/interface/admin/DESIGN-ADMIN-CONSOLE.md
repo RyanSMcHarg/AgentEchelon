@@ -2,6 +2,8 @@
 
 **Status:** Partial (8 sections built; Aurora-only quality views ship their scoring passes incrementally) **Layer:** Interface (admin interface - reference client) **Plane:** admin **Product spec:** [`SPEC-ADMIN-CONSOLE.md`](SPEC-ADMIN-CONSOLE.md) **Summary:** A standalone React app (`@ae/admin`) whose `AdminDashboard` fans out per-tab analytics queries to admin-gated APIs, reads conversation history from the event archive, manages assistant profiles as versioned artifacts, and performs live administration actions client-side under the operator's own `${sub}-admin` identity.
 
+**Coverage:** `e2e/admin-dashboard.spec.ts`, `e2e/admin-dashboard-render.spec.ts`, `e2e/admin-flow.spec.ts`, `e2e/admin-nav.spec.ts`
+
 ## 1. Architecture
 
 The console is a standalone frontend app in the npm-workspaces monorepo, deployed to its own origin. Its container is `AdminDashboard.tsx` (`frontend/packages/admin/src/components/admin/`), which renders a two-level navigation (a section rail plus per-section sub-tabs) over 8 sections (Overview, Conversations, Effectiveness, Models, Assistants, Experiments, Users, Security) and roughly 18 sub-views. `activeTab` (a `TabId`) is the single source of truth for content and data loading; the `SECTIONS` array only groups sub-views for the rail. The app-split mechanics (packages, invariant, CORS, deploy) are in [`DESIGN-SEPARATE-ADMIN-APP.md`](DESIGN-SEPARATE-ADMIN-APP.md); this doc covers the console's internals.

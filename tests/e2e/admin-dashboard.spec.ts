@@ -28,8 +28,10 @@ import { signIn } from './helpers/agent-helpers';
 import { getTestCredentials } from './helpers/test-credentials';
 import { assertNoErrorBanners } from './helpers/banner-check';
 import { armSettle, SECTION_QUERIES } from './helpers/analytics-settle';
+import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { assertTabIsDeterminate } from './helpers/tab-data';
 
-// Post D-split (SPEC-SEPARATE-ADMIN-APP.md): the admin console is its OWN app on
+// Post D-split (DESIGN-SEPARATE-ADMIN-APP.md): the admin console is its OWN app on
 // its OWN origin. Point these specs at it via E2E_ADMIN_BASE_URL (the admin
 // CloudFront URL when running against a deployment, or the admin dev server
 // locally). The admin app renders the dashboard at root for an authenticated
@@ -37,6 +39,10 @@ import { armSettle, SECTION_QUERIES } from './helpers/analytics-settle';
 // (that was the old chat-embedded model).
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
 test.use({ baseURL: ADMIN_BASE_URL });
+
+// Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
+guardBackendErrors('admin-dashboard');
+guardConsoleErrors();
 
 let credentials: Awaited<ReturnType<typeof getTestCredentials>>;
 
@@ -204,8 +210,11 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     await expect(page.locator('button:has-text("New Experiment")')).toBeVisible();
     await expect(page.locator('button:has-text("Refresh")')).toBeVisible();
 
-    // Should show experiments table (may be empty)
-    await expect(page.locator('h4:has-text("Active Experiments")')).toBeVisible();
+    // Should show experiments table (may be empty). The heading is "Experiments", renamed from
+    // "Active Experiments" deliberately (ExperimentsTab.tsx ~1226): the table lists every non-deleted
+    // experiment regardless of state, and the old heading asserted otherwise on a mostly-completed
+    // list. `active` survives as a status filter, not as the table's name.
+    await expect(page.locator('h4:has-text("Experiments")')).toBeVisible();
 
     // Toggle create form
     await page.locator('button:has-text("New Experiment")').click();
@@ -301,6 +310,10 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
     // Filter buttons should be visible
     await expect(page.locator('.admin-filter-btn:has-text("Pending")')).toBeVisible();
     await expect(page.locator('.admin-filter-btn:has-text("Reviewed")')).toBeVisible();
+
+    // The heading and the filter chips are CHROME - they render whether or not the query returned.
+    // Require the tab to have actually answered: rows, or an explicit empty state.
+    await assertTabIsDeterminate(page, 'Flagged responses');
   });
 
   test('should display Ground Truth tab with calibration metrics', async ({ page }) => {
@@ -308,6 +321,9 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
     await openEffectiveness(page);
     await page.locator('#admin-tab-ground_truth').click();
     await expect(page.locator('h3:has-text("Ground Truth Calibration")')).toBeVisible();
+
+    // This test asserted a single heading. It passed against a dead query.
+    await assertTabIsDeterminate(page, 'Ground Truth calibration');
   });
 
   // (Removed) "should display Tasks tab" tested the OLD standalone Tasks sub-tab. Tasks are now drill

@@ -91,7 +91,7 @@ export const SECTIONS: AdminSection[] = [
   // drill is the eval surface; in Athena (no drill) it is the reachable basic evaluation view.
   { id: 'quality', label: 'Effectiveness', tabs: ['effectiveness', 'evaluations', 'flagged', 'ground_truth'] },
   { id: 'models', label: 'Models', tabs: ['models', 'strategy'] },
-  // Assistant profiles as versioned, portable artifacts (SPEC-PORTABLE-VERSIONED-PROFILES): version /
+  // Assistant profiles as versioned, portable artifacts (SPEC-PORTABLE-PROFILES): version /
   // activate / rollback / import / export the assistant definition, no redeploy. The retiring global
   // "Model Strategy" surface (per-intent routing) is moving onto the profile here.
   { id: 'assistants', label: 'Assistants', tabs: ['profiles'] },
@@ -557,6 +557,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             resultsData={results.experiment_results ?? null}
             isLoading={isLoading}
             registerBack={registerDrillBack}
+            onOpenConversation={openConversation}
           />
         )}
         {activeTab === 'profiles' && (
@@ -571,6 +572,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             pageLoadData={results.page_load_metrics ?? null}
             connectionHealthData={results.connection_health_daily ?? null}
             isLoading={isLoading}
+            dateRange={getDateRange(datePreset)}
           />
         )}
         {activeTab === 'flagged' && (
@@ -588,6 +590,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             isLoading={isLoading}
             onSubmitScore={handleSubmitGroundTruth}
             onOpenConversation={openConversation}
+            dateRange={getDateRange(datePreset)}
           />
         )}
         {activeTab === 'effectiveness' && (

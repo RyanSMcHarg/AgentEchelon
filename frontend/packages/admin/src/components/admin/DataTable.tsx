@@ -131,8 +131,47 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
   const labelFor = (col: Column<T>): string =>
     col.mobileLabel ?? (typeof col.label === 'string' ? col.label : col.key);
 
+  // Sortable columns, for the mobile sort control below.
+  const sortableCols = columns.filter((c) => c.sortable !== false);
+
   return (
     <div className="data-table-wrapper">
+      {/*
+        MOBILE SORT. Below 640px the stacked card layout hides `thead` entirely - and the column
+        headers are the ONLY sort affordance this table has. So on a phone a long list could not be
+        ordered at all: finding the one `active` row among ~95 experiments meant scrolling every card.
+        (Reported from a phone; the desktop advice "click the Status header" is unfollowable there.)
+
+        Rendered in the DOM at every width and revealed by CSS at <=640px, so it cannot fall out of
+        sync with the breakpoint that hides the headers.
+      */}
+      {sortableCols.length > 0 && (
+        <div className="data-table-mobile-sort">
+          <label className="data-table-mobile-sort-label" htmlFor="dt-sort">Sort</label>
+          <select
+            id="dt-sort"
+            className="data-table-mobile-sort-select"
+            value={sortKey ?? ''}
+            onChange={(e) => setSortKey(e.target.value || null)}
+          >
+            <option value="">Default order</option>
+            {sortableCols.map((c) => (
+              <option key={c.key} value={c.key}>
+                {typeof c.label === 'string' ? c.label : c.key}
+              </option>
+            ))}
+          </select>
+          <button
+            type="button"
+            className="data-table-mobile-sort-dir"
+            disabled={!sortKey}
+            aria-label={sortDir === 'asc' ? 'Sort ascending, switch to descending' : 'Sort descending, switch to ascending'}
+            onClick={() => setSortDir(sortDir === 'asc' ? 'desc' : 'asc')}
+          >
+            {sortDir === 'asc' ? '↑ Asc' : '↓ Desc'}
+          </button>
+        </div>
+      )}
       <table className={`data-table${onRowClick ? ' data-table--rows-clickable' : ''}`}>
         <thead>
           <tr>
@@ -172,7 +211,9 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
               tabIndex={onRowClick ? 0 : undefined}
             >
               {columns.map((col) => (
-                <td key={col.key} data-label={labelFor(col)}>
+                // `data-col` is the STABLE hook for per-column styling. `data-label` is display text
+                // and changes whenever a heading is reworded, so CSS keyed on it breaks silently.
+                <td key={col.key} data-col={col.key} data-label={labelFor(col)}>
                   {col.render ? col.render((row as AnyRow)[col.key], row) : String((row as AnyRow)[col.key] ?? '')}
                 </td>
               ))}

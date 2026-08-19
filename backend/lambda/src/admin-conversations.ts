@@ -28,6 +28,7 @@ import {
 } from '@aws-sdk/client-athena';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall } from './lib/auth.js';
+import { unwrapLexEnvelope } from './lib/lex-envelope.js';
 import { ceilingForRequest, classificationAllowed, type ClassificationCeiling } from './lib/caller-scope.js';
 // Aurora-mode read path: when the data-plane ARN is wired (analyticsMode=aurora),
 // read conversations from Aurora via the VPC data-plane Lambda instead of Athena
@@ -123,29 +124,16 @@ function safeDecode(value: string): string {
   }
 }
 
-// Unwrap a Lex fulfillment envelope (welcome) so the admin view never shows raw
-// JSON. The archived Payload carries no ContentType, so detect the envelope
-// STRUCTURALLY (a top-level object whose only meaningful key is a Messages array
-// of {Content,...}). A coding answer is prose+fenced code, never a bare
-// top-level Lex envelope — so this won't eat code-block JSON.
-function unwrapArchivedLex(content: string): string {
-  if (!content.startsWith('{') || !content.includes('"Messages"')) return content;
-  try {
-    const parsed = JSON.parse(content);
-    if (
-      parsed &&
-      Array.isArray(parsed.Messages) &&
-      parsed.Messages.length > 0 &&
-      typeof parsed.Messages[0]?.Content === 'string' &&
-      Object.keys(parsed).length === 1
-    ) {
-      return parsed.Messages[0].Content;
-    }
-  } catch {
-    /* not an envelope */
-  }
-  return content;
-}
+// Unwrap a Lex fulfillment envelope (welcome) so the admin view never shows raw JSON.
+//
+// The archived Payload carries no ContentType, so the envelope is detected STRUCTURALLY. That rule
+// now lives in `lib/lex-envelope.ts`, shared with the channel flow, which needs the identical test for
+// the identical reason (the flow event carries no ContentType either). It was defined twice here and
+// there before that - two copies of one shape, and only one of them visible in any given bug report.
+//
+// This stays a READ-side concern permanently: the flow now drops NEW empty envelopes, but envelopes
+// already written to history do not disappear, and the admin view reads history.
+const unwrapArchivedLex = unwrapLexEnvelope;
 
 // ── Athena (archive) ───────────────────────────────────────────────────────
 async function runAthena(query: string): Promise<{ columns: string[]; rows: string[][] }> {

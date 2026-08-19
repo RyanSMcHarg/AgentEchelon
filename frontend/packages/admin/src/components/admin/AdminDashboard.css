@@ -289,6 +289,26 @@
   align-items: center;
   justify-content: space-between;
   gap: var(--space-3);
+  /* WRAP. Without this the group is a single nowrap line, so once a row carries four actions
+     (View results / Pause / End / Delete) the tail overflows its cell and is unreachable — worst on
+     the stacked mobile card, where the cell is already narrow. */
+  flex-wrap: wrap;
+}
+
+@media (max-width: 640px) {
+  /* Touch ergonomics: the decision controls are the point of this table on a phone (End records the
+     promote/keep decision), so they get full-width, thumb-sized targets rather than 6px-padded
+     desktop chips squeezed to the right edge. */
+  .admin-inline-actions {
+    justify-content: flex-start;
+    gap: var(--space-2);
+  }
+  .admin-inline-actions .admin-inline-btn {
+    flex: 1 1 auto;
+    min-width: 44%;
+    min-height: 40px;
+    padding: var(--space-2) var(--space-3);
+  }
 }
 
 .admin-tab-description {
@@ -344,6 +364,54 @@
   border-color: var(--error-border);
   background: var(--error-bg);
   color: var(--error);
+}
+
+/* Status filter for the Experiments list.
+   The count is the payload, not decoration: "Active 1" answers the question an operator opens this
+   tab to ask, and it is legible before any row is read. Mono numerals so the digits line up across
+   chips and a change in count is noticed rather than read. */
+.experiments-status-filter {
+  margin: 0 0 var(--space-3);
+}
+
+.admin-filter-count {
+  margin-left: var(--space-2);
+  padding: 0 var(--space-1);
+  min-width: 1.25em;
+  border-radius: var(--radius-sm);
+  background: var(--surface-100);
+  color: var(--text-secondary);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-variant-numeric: tabular-nums;
+  text-align: center;
+}
+
+.admin-filter-btn.active .admin-filter-count {
+  background: var(--surface-0);
+  color: var(--accent-700);
+}
+
+/* A live experiment silently splits production traffic. When one exists, the Active chip carries the
+   amber "intelligence" accent so it reads as a live state rather than one tab among five — even when
+   the operator has not selected it. Non-zero only; an empty Active chip stays neutral. */
+.admin-filter-btn.is-live:not(.active) {
+  border-color: var(--accent-400);
+  color: var(--accent-700);
+}
+.admin-filter-btn.is-live:not(.active) .admin-filter-count {
+  background: var(--accent-50);
+  color: var(--accent-700);
+}
+
+@media (max-width: 640px) {
+  /* Chips wrap to a comfortable two-up grid rather than a horizontal scroll strip that hides the
+     right-hand states — the same class of defect as the overflowing action row above. */
+  .experiments-status-filter .admin-filter-btn {
+    flex: 1 1 auto;
+    min-height: 40px;
+    justify-content: space-between;
+  }
 }
 
 .admin-badge {
@@ -1675,11 +1743,167 @@
   color: var(--text-muted, var(--zinc-500, #71717a));
 }
 
+/* ── Classification shadow gate (DESIGN-EXPERIMENTS-BATTLE §5) ───────────────────────────────── */
+.cgate { margin-top: var(--space-5, 20px); }
+.cgate-start {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2, 8px);
+  margin-bottom: var(--space-3, 12px);
+}
+.cgate-start input { min-width: 8rem; flex: 1 1 8rem; }
+.cgate-runs { list-style: none; padding: 0; margin: 0 0 var(--space-3, 12px); }
+.cgate-runs li { display: flex; gap: var(--space-2, 8px); align-items: baseline; flex-wrap: wrap; }
+.cgate-run-meta { font-size: 11px; color: var(--text-muted, var(--zinc-500, #71717a)); }
+.cgate-detail {
+  border-top: 1px dashed var(--surface-200, var(--zinc-200, #e4e4e7));
+  padding-top: var(--space-3, 12px);
+}
+/* An unfinished run is called out ahead of its numbers, not beneath them. */
+.cgate-incomplete {
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  margin-bottom: var(--space-2, 8px);
+  border: 1px solid color-mix(in srgb, var(--status-warn, #b26a00) 50%, transparent);
+  background: color-mix(in srgb, var(--status-warn, #b26a00) 10%, transparent);
+}
+.cgate-verdict {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: var(--space-2, 8px);
+  padding: 8px 12px;
+  border-radius: 6px;
+  border: 1px solid var(--surface-200, var(--zinc-200, #e4e4e7));
+}
+.cgate-verdict[data-tone='win'] { border-color: color-mix(in srgb, var(--status-good, #2e7d32) 45%, transparent); }
+.cgate-verdict[data-tone='bad'] { border-color: color-mix(in srgb, var(--status-bad, #c62828) 50%, transparent); }
+.cgate-verdict-label { font-weight: 600; }
+.cgate-verdict-margin,
+.cgate-verdict-detail {
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  color: var(--text-muted, var(--zinc-500, #71717a));
+}
+.cgate-rationale,
+.cgate-corpus,
+.cgate-sizing {
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 78ch;
+  margin: var(--space-2, 8px) 0 0;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+}
+.cgate-cells {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3, 12px);
+  font-size: 12px;
+  margin-top: var(--space-2, 8px);
+}
+.cgate-queue-title { margin: var(--space-4, 16px) 0 4px; font-size: 13px; }
+.cgate-queue { width: 100%; border-collapse: collapse; font-size: 13px; }
+.cgate-queue th,
+.cgate-queue td {
+  padding: 8px 12px;
+  text-align: left;
+  border-bottom: 1px solid var(--surface-100, var(--zinc-100, #f4f4f5));
+}
+.cgate-queue-actions { display: flex; flex-wrap: wrap; gap: var(--space-2, 8px); align-items: center; }
+
+/* ── Drill-down: the evidence behind a result (DESIGN-EXPERIMENTS-BATTLE §4.3) ───────────────── */
+
+/* The per-metric "show the rows" control. Small and inline, because it belongs to the number it
+   explains — a single control next to the verdict would be wrong for at least two of the axes. */
+.exp-drill-btn {
+  display: block;
+  font-size: 11px;
+  margin-top: 2px;
+  white-space: nowrap;
+}
+.exp-drill {
+  margin-top: var(--space-4, 16px);
+  padding-top: var(--space-4, 16px);
+  border-top: 1px dashed var(--surface-200, var(--zinc-200, #e4e4e7));
+}
+.exp-drill-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--space-3, 12px);
+  flex-wrap: wrap;
+}
+.exp-drill-title { margin: 0 0 4px; font-size: 14px; }
+.exp-drill-variant {
+  font-family: var(--font-mono, monospace);
+  font-size: 12px;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+}
+/* The population statement. Never collapsed to a tooltip: which set is on screen is the difference
+   between evidence and a plausible-looking list. */
+.exp-drill-population {
+  margin: 0 0 var(--space-3, 12px);
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 78ch;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+}
+.exp-drill-recon {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2, 8px);
+  padding: 8px 12px;
+  border-radius: 6px;
+  font-size: 12px;
+  border: 1px solid var(--surface-200, var(--zinc-200, #e4e4e7));
+}
+.exp-drill-recon[data-status='ok'] {
+  border-color: color-mix(in srgb, var(--status-good, #2e7d32) 40%, transparent);
+  background: color-mix(in srgb, var(--status-good, #2e7d32) 8%, transparent);
+}
+.exp-drill-recon[data-status='mismatch'] {
+  border-color: color-mix(in srgb, var(--status-bad, #c62828) 50%, transparent);
+  background: color-mix(in srgb, var(--status-bad, #c62828) 10%, transparent);
+}
+.exp-drill-recon-verdict { font-weight: 600; }
+.exp-drill-recon-line {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+}
+.exp-drill-recon-line[data-agrees='false'] { color: var(--status-bad, #c62828); font-weight: 600; }
+.exp-drill-recon-note {
+  flex-basis: 100%;
+  font-style: italic;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+}
+.exp-drill-note {
+  margin: var(--space-2, 8px) 0 0;
+  font-size: 12px;
+  line-height: 1.5;
+  max-width: 78ch;
+  color: var(--text-muted, var(--zinc-500, #71717a));
+}
+.exp-drill-muted { color: var(--text-muted, var(--zinc-500, #71717a)); }
+/* A withheld transcript is LABELLED, not blank: the row still counted, and the operator needs to
+   know the content was retracted rather than missing. */
+.exp-drill-withheld {
+  font-size: 11px;
+  font-family: var(--font-mono, monospace);
+  color: var(--status-warn, #b26a00);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.exp-drill-vote[data-vote='down'] { color: var(--status-bad, #c62828); }
+.exp-drill-vote[data-vote='up'] { color: var(--status-good, #2e7d32); }
+
 @media (max-width: 640px) {
   .exp-variant-row,
   .exp-metric-row { gap: var(--space-2, 8px); }
   .exp-metric-row--headline .exp-metric-val { font-size: 18px; }
   .exp-reco-tag { margin-left: 0; flex-basis: 100%; }
+  .exp-drill-recon { flex-direction: column; align-items: flex-start; }
 }
 
 /* Effectiveness drill (SPEC-ADMIN-CONSOLE-EFFECTIVENESS): inline-link buttons + breadcrumb. */

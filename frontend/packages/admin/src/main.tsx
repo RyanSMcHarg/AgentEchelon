@@ -5,7 +5,7 @@ import '@ae/shared/i18n'
 import AdminApp from './AdminApp.tsx'
 
 // Standalone admin console entry (separate app from the chat SPA — see
-// SPEC-SEPARATE-ADMIN-APP.md). Deliberately mounts ONLY AdminApp: no chat
+// DESIGN-SEPARATE-ADMIN-APP.md). Deliberately mounts ONLY AdminApp: no chat
 // messaging providers (Chime/conversation/messaging), no chat routes. The
 // admin surface reads its own token from AuthProvider and calls the admin APIs
 // directly, so the chat client stack is not imported here.

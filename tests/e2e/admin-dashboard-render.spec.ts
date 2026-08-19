@@ -19,41 +19,21 @@ import { test, expect, Page, Response } from '@playwright/test';
 import { signIn } from './helpers/agent-helpers';
 import { getAdminUser } from './helpers/test-credentials';
 import { collectBanners } from './helpers/banner-check';
+import { ANALYTICS_HOST, SECTION_QUERIES, isAnalyticsPost } from './helpers/analytics-settle';
+import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 
-// The admin console is its own app on its own origin (SPEC-SEPARATE-ADMIN-APP.md).
+// The admin console is its own app on its own origin (DESIGN-SEPARATE-ADMIN-APP.md).
 // Point at it via E2E_ADMIN_BASE_URL (admin CloudFront URL, or the admin dev server).
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
 test.use({ baseURL: ADMIN_BASE_URL });
 
-// The analytics API the built frontend POSTs every queryType to. Match by host
-// so we don't couple to the trailing path/stage.
-const ANALYTICS_HOST = process.env.E2E_ANALYTICS_HOST || '<analytics-api-id>.execute-api.us-east-1.amazonaws.com';
+// Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
+guardBackendErrors('admin-dashboard-render');
+guardConsoleErrors();
 
-// The queryTypes each top-level SECTION fires on its default (first) sub-tab.
-// Mirrors QUERIES_BY_TAB in AdminDashboard.tsx for the section's default tab.
-const SECTION_QUERIES: Record<string, string[]> = {
-  Overview: [
-    'conversation_volumes',
-    'intent_distribution',
-    'active_users_daily',
-    'active_messaging_users_daily',
-    'error_rate_daily',
-  ],
-  Conversations: ['conversation_summaries', 'drift_events'],
-  // Section label is "Effectiveness" (SECTIONS id `quality`); its default sub-tab is
-  // `effectiveness` → queryType `intent_effectiveness` (AdminDashboard.tsx QUERIES_BY_TAB).
-  Effectiveness: ['intent_effectiveness'],
-  Models: ['model_usage', 'model_effectiveness'],
-  Experiments: ['experiment_results'],
-  Users: [
-    'user_activity',
-    'active_users_daily',
-    'active_messaging_users_daily',
-    'messages_per_user',
-    'signup_funnel_conversion',
-    'signin_funnel_conversion',
-  ],
-};
+// Host resolution + the queryType map live in helpers/analytics-settle. They were duplicated here,
+// and both copies carried the same scrubbed `<analytics-api-id>` placeholder, so fixing one would
+// have left this spec still matching nothing. One definition, one place to fix.
 
 interface Captured {
   queryType: string;
@@ -70,10 +50,6 @@ function reqQueryType(r: Response): string {
   } catch {
     return '';
   }
-}
-
-function isAnalyticsPost(r: Response): boolean {
-  return r.url().includes(ANALYTICS_HOST) && r.request().method() === 'POST';
 }
 
 /** Build waiters for each expected queryType BEFORE triggering the load. */
@@ -116,6 +92,16 @@ async function countTableRows(page: Page): Promise<number> {
 test.describe('Admin Dashboard - render validation (live)', () => {
   test('renders analytics for every section after deterministic settle', async ({ page }) => {
     test.setTimeout(180000);
+    // Fail on the CAUSE, not on a downstream `undefined`. With no analytics host every waiter times
+    // out, the ledger stays empty, and the assertion at the end reports "conversation_volumes should
+    // be 200 / Received: undefined" - which reads like a broken API while the console is in fact
+    // rendering fine. Say what is actually wrong.
+    expect(
+      ANALYTICS_HOST,
+      'analytics host unresolved - set VITE_ANALYTICS_API_URL (validate.mjs reads it from '
+        + 'packages/admin/.env) or E2E_ANALYTICS_HOST. Without it this spec captures no responses '
+        + 'and cannot judge the dashboard.',
+    ).toBeTruthy();
     const admin = await getAdminUser();
     console.log(`[render] admin user: ${admin.email} (tier=${admin.tier})`);
 

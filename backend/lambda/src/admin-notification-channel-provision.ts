@@ -77,14 +77,16 @@ async function syncAdmins(channelArn: string): Promise<number> {
       ChannelArn: channelArn,
       Name: CHANNEL_NAME,
       Mode: 'RESTRICTED',
-      Metadata: JSON.stringify({
-        kind: 'admin-notifications',
-        participants: adminArns.map((a) => ({ sub: a.split('/user/').pop() })),
-      }),
+      // NO `participants` ROSTER. It listed every admin's `sub` in member-readable Metadata, which
+      // METADATA-AND-TAGS §1 forbids outright (identity is on the never list). Nothing is lost: these
+      // are NATIVE subs, so the AppInstanceUser id IS the sub, and the notification fan-out now reads
+      // the recipient list from live `ListChannelMemberships` — which is also the authority, rather
+      // than a copy that drifts as admins come and go.
+      Metadata: JSON.stringify({ kind: 'admin-notifications' }),
       ChimeBearer: ADMIN_BEARER_ARN,
     }));
   } catch (err) {
-    console.warn('[AdminNotifChannel] roster stamp failed:', (err as { name?: string }).name);
+    console.warn('[AdminNotifChannel] metadata stamp failed:', (err as { name?: string }).name);
   }
   return adminArns.length;
 }

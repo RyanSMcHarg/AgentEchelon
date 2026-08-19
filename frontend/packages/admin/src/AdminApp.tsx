@@ -9,7 +9,7 @@ type AdminAuthView = 'login' | 'forgot';
 /**
  * The standalone admin console shell. Gates on the `admins` group and mounts
  * AdminDashboard. This is the ENTRY of the separate admin app (admin-main.tsx),
- * not a route inside the chat SPA — see SPEC-SEPARATE-ADMIN-APP.md.
+ * not a route inside the chat SPA — see DESIGN-SEPARATE-ADMIN-APP.md.
  *
  * Auth: reuses the chat app's raw-SDK Cognito AuthProvider (no Amplify). Admins
  * are provisioned, not self-registered, so there is no registration path here —

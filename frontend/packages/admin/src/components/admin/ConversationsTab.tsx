@@ -16,6 +16,7 @@ import MessageInspectDrawer from './MessageInspectDrawer';
 import MembershipTimeline from './MembershipTimeline';
 import { recordModeration, listChannelEvents } from '../../services/analyticsService';
 import { getAdminAttachmentDownloadUrl, isUserUploadedAttachment } from '../../services/adminAttachmentService';
+import { driftHealthMetrics, parseDriftCounts, formatRate, type DriftRate } from './driftHealth';
 import type { AnalyticsResult } from '@ae/shared';
 import type {
   AdminConversationEvent,
@@ -71,15 +72,93 @@ function stateBadge(state?: 'live' | 'archived' | 'deleted'): React.ReactNode {
   );
 }
 
+/**
+ * Drift is a TOPIC-CHANGE signal, not a quality failure. A user moving to a new subject is normal
+ * conversation, and the product's response is to OFFER a new conversation - a feature working, not an
+ * error. So the scale is informational (how far the topic moved), never good-to-bad: colouring a
+ * strong signal with `--status-bad` told operators to treat successful detection as a problem, and
+ * made "no drift" look like the healthy state when it simply means nobody changed subject.
+ */
 function driftBadge(score: number): React.ReactNode {
-  const color = score >= 0.7 ? 'var(--status-bad)' : score >= 0.4 ? 'var(--status-warn)' : 'var(--status-good)';
-  const label = score >= 0.7 ? 'High Drift' : score >= 0.4 ? 'Moderate' : 'On Topic';
+  const color = score >= 0.7 ? 'var(--status-info)' : score >= 0.4 ? 'var(--status-info)' : 'var(--text-muted)';
+  const label = score >= 0.7 ? 'Topic changed' : score >= 0.4 ? 'Partial shift' : 'Same topic';
   return (
     <span style={{ backgroundColor: `${color}20`, color, padding: '2px 8px', borderRadius: '4px', fontSize: '12px', fontWeight: 600 }}>
       {label} ({(score * 100).toFixed(0)}%)
     </span>
   );
 }
+
+/**
+ * The drift headline: two questions about an offer that was made.
+ *
+ *   1. Was it ACCURATE, judged after the fact by evaluation?
+ *   2. Did the user ACCEPT it?
+ *
+ * Kept separate on purpose: a user can decline a correct call, or accept a bad one, so a single
+ * blended number would hide which half is failing. Deliberately NOT drift volume, which measures
+ * users rather than the feature.
+ *
+ * Two rules this enforces:
+ *  - a rate with a zero denominator renders "No data", never a fabricated 0%;
+ *  - a metric nothing instruments renders "Not measured", never a number.
+ * No good/bad colouring: no target has been agreed for these rates, and colouring one would assert
+ * a threshold the product has not set (the same mistake as colouring high drift volume as bad).
+ */
+const DriftHealthPanel: React.FC<{ stats?: Record<string, string | number | null> }> = ({ stats }) => {
+  const m = driftHealthMetrics(parseDriftCounts(stats));
+
+  const tiles: { label: string; rate: DriftRate; unavailable?: string; hint: string }[] = [
+    {
+      label: 'Accuracy',
+      rate: m.accuracy,
+      // Denominator is offers JUDGED. Nothing judged yet is "Not measured", never a score.
+      unavailable: m.accuracy.denominator === 0 ? 'Not measured' : undefined,
+      hint: 'Offers the post-hoc judge called correct',
+    },
+    { label: 'Acceptance', rate: m.acceptance, hint: 'Offers the user accepted' },
+  ];
+
+  return (
+    <>
+      <div className="admin-metrics-row">
+        {tiles.map((t) => {
+          const pct = t.unavailable ? null : formatRate(t.rate);
+          return (
+            <div className="admin-metric-card" key={t.label}>
+              <div
+                className="admin-metric-value"
+                style={pct === null ? { color: 'var(--text-muted)', fontSize: '1rem' } : undefined}
+              >
+                {pct ?? t.unavailable ?? 'No data'}
+              </div>
+              <div className="admin-metric-label">{t.label}</div>
+              <div style={{ fontSize: '11px', color: 'var(--text-muted)', marginTop: 2 }}>
+                {t.unavailable ? 'No offers judged yet in this window' : `${t.hint} (${t.rate.numerator}/${t.rate.denominator})`}
+              </div>
+            </div>
+          );
+        })}
+      </div>
+      {(m.pending > 0 || m.awaitingEvaluation > 0) && (
+        <p style={{ fontSize: '12px', color: 'var(--text-muted)', margin: '4px 0 12px' }}>
+          {m.pending > 0 && (
+            <>
+              {m.pending} offer{m.pending === 1 ? '' : 's'} not yet settled. Acceptance counts every
+              offer made, so it is a floor that rises as these resolve.{' '}
+            </>
+          )}
+          {m.awaitingEvaluation > 0 && (
+            <>
+              {m.awaitingEvaluation} awaiting evaluation, so accuracy is measured over the judged
+              subset rather than every offer.
+            </>
+          )}
+        </p>
+      )}
+    </>
+  );
+};
 
 const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoading, deepLinkChannelArn, onDeepLinkConsumed, registerBack, onConversationChange }) => {
   const [view, setView] = useState<'browser' | 'drift'>('browser');
@@ -632,9 +711,12 @@ const ConversationsTab: React.FC<ConversationsTabProps> = ({ driftData, isLoadin
           */}
           <UnsupportedAnalyticsBanner result={driftData} />
           <p className="admin-tab-description">
-            Drift detection identifies conversations that have shifted away from their stated purpose.
-            High drift may indicate the user needs to be redirected to a new conversation.
+            Drift detection offers to split a conversation that has moved to a new subject. Two things
+            matter about an offer: was it accurate, and did the user accept. How often users change
+            topic is a fact about users, not a health measure, so the per-event signal below is detail
+            rather than the headline.
           </p>
+          <DriftHealthPanel stats={driftData?.stats} />
           <DataTable
             columns={[
               { key: 'detected_at', label: 'Detected', render: (v) => new Date(String(v)).toLocaleString() },

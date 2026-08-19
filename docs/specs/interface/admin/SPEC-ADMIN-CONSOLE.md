@@ -2,6 +2,8 @@
 
 **Status:** Partial (8 sections built; Aurora-only quality views and several operator affordances are opt-in or roadmap) **Layer:** Interface (admin interface - reference client) **Plane:** admin **Summary:** A single internal operator surface for reading conversations, moderating and administering them, managing assistant profiles, and watching platform health, assistant effectiveness, experiments, users, and security in one place. **Technical design:** [`DESIGN-ADMIN-CONSOLE.md`](DESIGN-ADMIN-CONSOLE.md) **Site section(s):** Admin Console (standalone operator app; see [`DESIGN-SEPARATE-ADMIN-APP.md`](DESIGN-SEPARATE-ADMIN-APP.md))
 
+**Coverage:** `e2e/admin-dashboard.spec.ts`, `e2e/admin-dashboard-render.spec.ts`, `e2e/admin-flow.spec.ts`, `e2e/admin-nav.spec.ts`, `e2e/admin-attachments.spec.ts`
+
 ## 1. Business problem
 
 An operator running an AgentEchelon instance flies blind. The record of what the platform did lives in several stores at once: an event archive of every conversation, an analytics projection for derived quality signals, a Cognito user pool, and a live messaging substrate. There is no single place to read a conversation end to end, moderate or administer it, see whether the assistants are actually answering well, compare models, run and read experiments, manage users, or confirm that classification isolation is holding. Answering any one of those questions means querying a store directly and reassembling the picture by hand. The alternative on the market is to stitch together general-purpose dashboards, log tools, and moderation scripts - none of which understands conversations, classifications, or an accountable privileged action - and keep them in sync as the platform evolves, or to fly blind.

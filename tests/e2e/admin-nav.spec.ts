@@ -13,12 +13,17 @@
 import { test, expect, Page } from '@playwright/test';
 import { signIn } from './helpers/agent-helpers';
 import { getAdminUser } from './helpers/test-credentials';
+import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 
-// The admin console is its own app on its own origin (SPEC-SEPARATE-ADMIN-APP.md).
+// The admin console is its own app on its own origin (DESIGN-SEPARATE-ADMIN-APP.md).
 // `?admin=<tab>` is now a TAB selector within that app (AdminDashboard reads it),
 // not a "console open" toggle on the chat SPA. Point at the admin origin.
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
 test.use({ baseURL: ADMIN_BASE_URL });
+
+// Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
+guardBackendErrors('admin-nav');
+guardConsoleErrors();
 
 /** The `admin` query param on the current URL (the tab id), or null. */
 const adminParam = (page: Page): string | null => new URL(page.url()).searchParams.get('admin');

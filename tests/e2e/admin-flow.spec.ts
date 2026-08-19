@@ -27,9 +27,14 @@ import { test, expect, Page } from '@playwright/test';
 import { signIn } from './helpers/agent-helpers';
 import { getAdminUser } from './helpers/test-credentials';
 import { assertNoErrorBanners } from './helpers/banner-check';
+import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
 test.use({ baseURL: ADMIN_BASE_URL });
+
+// Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
+guardBackendErrors('admin-flow');
+guardConsoleErrors();
 
 /** The active tab id per the `?admin=<tab>` URL param (how selectTab reflects navigation). */
 const adminParam = (page: Page): string | null => new URL(page.url()).searchParams.get('admin');
