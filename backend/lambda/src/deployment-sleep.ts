@@ -116,8 +116,28 @@ async function handleHttp(event: APIGatewayProxyEvent): Promise<APIGatewayProxyR
       return json(403, { error: 'Admin access required' });
     }
     const target = path.endsWith('/deployment/sleep') ? 'asleep' : 'awake';
-    const r = await transition(target, `admin:${adminSub(event)}`);
-    return json(200, { ok: true, ...r });
+    const changedBy = `admin:${adminSub(event)}`;
+    try {
+      const r = await transition(target, changedBy);
+      return json(200, { ok: true, ...r });
+    } catch (err) {
+      // A MANUAL transition alerts for the same reason the auto-idle one does. The 500 below lands
+      // in one operator's HTTP response; the failure it reports is a deployment left in the wrong
+      // capacity, and the moment someone drives sleep/wake by hand is a cost incident nobody else
+      // can see. `transition` drives Aurora before flipping the flag, so the recorded state is
+      // unchanged either way — what may not be is Aurora's capacity, which is what to check.
+      console.error(`[sleep] manual ${target} failed; state left unchanged`, err);
+      await notify(
+        `Deployment manual ${target === 'asleep' ? 'sleep' : 'wake'} FAILED`,
+        `A manual transition to ${target} failed and the recorded state is unchanged. ` +
+          `Requested by: ${changedBy} at ${new Date(now()).toISOString()}. ` +
+          `Verify the Aurora cluster's minimum capacity before retrying. Error: ${String(err)}`,
+      ).catch((notifyErr) => {
+        // Never let an alerting failure replace the failure it is reporting.
+        console.error('[sleep] manual transition alert failed to publish', notifyErr);
+      });
+      throw err;
+    }
   }
 
   return json(404, { error: 'not found' });

@@ -66,11 +66,23 @@ describe('abuse-controls', () => {
       expect(send).not.toHaveBeenCalled();
     });
 
-    it('exempts admins', async () => {
-      process.env.BEDROCK_GLOBAL_HOURLY_BUDGET = '5';
+    it('exempts admins from the PER-USER budget (the per-user counter is not consumed)', async () => {
+      process.env.BEDROCK_USER_HOURLY_BUDGET = '2';
       const { checkAndConsumeBudget } = await load();
+      // Only a per-user budget is set; an admin skips it entirely, so the per-user counter never bumps.
       expect(await checkAndConsumeBudget('user-1', { isAdmin: true })).toEqual({ allowed: true });
       expect(send).not.toHaveBeenCalled();
+    });
+
+    it('still counts admins against the GLOBAL budget and blocks them once it is exceeded', async () => {
+      process.env.BEDROCK_USER_HOURLY_BUDGET = '2';
+      process.env.BEDROCK_GLOBAL_HOURLY_BUDGET = '10';
+      send.mockResolvedValueOnce({ Attributes: { count: 11 } }); // global bump, over the ceiling
+      const { checkAndConsumeBudget } = await load();
+      // The global ceiling protects the account, so even an exempt admin is blocked when it is crossed;
+      // the per-user counter is still skipped, so only the global bump happened.
+      expect(await checkAndConsumeBudget('user-1', { isAdmin: true })).toEqual({ allowed: false, reason: 'global' });
+      expect(send).toHaveBeenCalledTimes(1);
     });
 
     it('allows while under the global ceiling', async () => {
@@ -168,4 +180,55 @@ describe('abuse-controls', () => {
       expect(capUserMessage(long)).toBe(long);
     });
   });
+
+  // The shared gate the router AND the channel-flow @all/battle paths both run (M2): one place owns the
+  // order (rate, THEN budget) and the reject-message selection, so the two entry points can't drift.
+  describe('evaluateAbuseGate (shared order + message selection)', () => {
+    const bump = (count: number) => ({ Attributes: { count } });
+
+    it('blocks on the rate limit FIRST and never consumes budget', async () => {
+      process.env.BEDROCK_USER_HOURLY_BUDGET = '10';
+      send.mockResolvedValueOnce(bump(6)); // rate counter over the ceiling (5)
+      const { evaluateAbuseGate } = await load();
+      const res = await evaluateAbuseGate({ userSub: 'u1', rateCeiling: 5, isAdmin: false });
+      expect(res.allowed).toBe(false);
+      expect(res).toMatchObject({ reason: 'rate' });
+      expect((res as { message: string }).message).toBeTruthy();
+      expect(send).toHaveBeenCalledTimes(1); // budget was NOT consumed after the rate block
+    });
+
+    it('passes the rate limit, then blocks on the budget', async () => {
+      process.env.BEDROCK_USER_HOURLY_BUDGET = '10';
+      send
+        .mockResolvedValueOnce(bump(1))  // rate ok (1 <= 5)
+        .mockResolvedValueOnce(bump(11)); // user budget over (11 > 10)
+      const { evaluateAbuseGate } = await load();
+      const res = await evaluateAbuseGate({ userSub: 'u1', rateCeiling: 5, isAdmin: false });
+      expect(res).toMatchObject({ allowed: false, reason: 'budget' });
+    });
+
+    it('allows when both rate and budget are within limits', async () => {
+      process.env.BEDROCK_USER_HOURLY_BUDGET = '10';
+      send
+        .mockResolvedValueOnce(bump(1))  // rate ok
+        .mockResolvedValueOnce(bump(1)); // budget ok
+      const { evaluateAbuseGate } = await load();
+      expect(await evaluateAbuseGate({ userSub: 'u1', rateCeiling: 5, isAdmin: false })).toEqual({ allowed: true });
+    });
+
+    it('an exempt admin passes the per-user rate limit even over the ceiling', async () => {
+      // isAdmin skips the per-user rate counter entirely (no bump), so an over-ceiling admin still passes.
+      const { evaluateAbuseGate } = await load();
+      expect(await evaluateAbuseGate({ userSub: 'admin', rateCeiling: 1, isAdmin: true })).toEqual({ allowed: true });
+    });
+  });
 });
+
+// This file declares its jest mocks at top level and imports the module under test lazily
+// inside each case, so it has no top-level import/export of its own. Without one TypeScript treats
+// it as a global SCRIPT rather than a module: its top-level `const`s then share one global scope
+// with every other such test file, they collide (TS2451), and symbols resolve against whichever
+// file won - which is how `abuse-controls.test.ts` came to be typechecked against
+// `user-profile-client`. `npm run typecheck` was red with 52 errors for that reason alone, and
+// these files were effectively unchecked. This marks the file as a module. Do not remove.
+export {};

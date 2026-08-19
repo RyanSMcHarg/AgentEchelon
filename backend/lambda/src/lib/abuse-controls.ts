@@ -14,7 +14,7 @@
  * env is set, so partial rollout is safe. Admin exemption is the caller's responsibility.
  */
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, PutCommand, UpdateCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { SSMClient, PutParameterCommand } from '@aws-sdk/client-ssm';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
@@ -55,6 +55,86 @@ export async function claimCorrelation(correlationId: string): Promise<boolean> 
   }
 }
 
+/**
+ * Whether a claim EXISTS, without taking it. A read, not a write: the losing side of a dedup race
+ * sometimes needs to know what the winner DID (e.g. "was the winning fulfillment gate-blocked?")
+ * and probing by claiming would poison the very marker it is asking about. Fail-open to false - an
+ * unreadable table means "assume the normal path", the same direction every other claim here fails.
+ */
+export async function hasCorrelationClaim(correlationId: string): Promise<boolean> {
+  if (!TABLE || !correlationId) return false;
+  try {
+    const res = await ddb.send(new GetCommand({
+      TableName: TABLE,
+      Key: { pk: `dedup#${correlationId}` },
+    }));
+    return !!res.Item;
+  } catch (err: any) {
+    console.warn('[abuse-controls] dedup probe failed (fail-open):', err?.message);
+    return false;
+  }
+}
+
+/**
+ * How long a placeholder mapping lives. Sized for the gap between the router dispatching and the
+ * processor resolving, not for a conversation - see TURN_CORRELATION_WINDOW_SECONDS.
+ */
+const CORR_MAP_TTL_SECONDS = 300;
+
+/**
+ * Record which message carries a correlation id, so the async processor can resolve its placeholder
+ * with a point read instead of scanning recent messages (ADR-022).
+ *
+ * WRITE-ONCE, and the return value is the point. `true` means this is the first message seen for the
+ * correlation id. `false` means one is already recorded, which makes THIS message a duplicate
+ * placeholder for a turn already in flight - the caller denies it so it never reaches the channel.
+ * That is what keeps a retried Lex fulfillment from leaving a second "One moment..." stranded.
+ *
+ * Write-once also matters without any duplicate: an updated message re-invokes the channel flow, so
+ * the flow sees the same marker again when the processor writes the real answer over the placeholder.
+ * That second sighting must not be treated as new.
+ *
+ * Fails OPEN (`true`) when the table is unset or on a non-conditional error: losing the mapping costs
+ * a fallback scan, while wrongly denying a placeholder would drop the reply.
+ */
+export async function claimPlaceholderMapping(correlationId: string, messageId: string): Promise<string> {
+  if (!TABLE || !correlationId || !messageId) return messageId;
+  try {
+    await ddb.send(new PutCommand({
+      TableName: TABLE,
+      Item: { pk: `corr#${correlationId}`, messageId, ttl: nowSec() + CORR_MAP_TTL_SECONDS },
+      ConditionExpression: 'attribute_not_exists(pk)',
+    }));
+    return messageId;
+  } catch (err: any) {
+    if (err?.name !== 'ConditionalCheckFailedException') {
+      console.warn('[abuse-controls] placeholder mapping write failed (fail-open):', err?.message);
+      return messageId;
+    }
+    // Already mapped. Return the OWNER so the caller can tell a duplicate placeholder (a different
+    // message) from this same message being seen again, which happens on every update: the processor
+    // writes the answer over the placeholder, and an updated message re-invokes the channel flow.
+    // Treating that second sighting as a duplicate would delete the answer.
+    const owner = await readPlaceholderMapping(correlationId);
+    return owner || messageId;
+  }
+}
+
+/** The message carrying `correlationId`, or null if it is not recorded (yet, or at all). */
+export async function readPlaceholderMapping(correlationId: string): Promise<string | null> {
+  if (!TABLE || !correlationId) return null;
+  try {
+    const res = await ddb.send(new GetCommand({
+      TableName: TABLE,
+      Key: { pk: `corr#${correlationId}` },
+    }));
+    return (res.Item?.messageId as string) || null;
+  } catch (err: any) {
+    console.warn('[abuse-controls] placeholder mapping read failed:', err?.message);
+    return null;
+  }
+}
+
 export interface BudgetDecision {
   allowed: boolean;
   reason?: 'user' | 'global';
@@ -70,13 +150,15 @@ export async function checkAndConsumeBudget(
   userSub: string,
   opts: { isAdmin?: boolean } = {},
 ): Promise<BudgetDecision> {
-  if (!TABLE || opts.isAdmin) return { allowed: true };
+  if (!TABLE) return { allowed: true };
   const userBudget = parseInt(process.env.BEDROCK_USER_HOURLY_BUDGET || '0', 10);
   const globalBudget = parseInt(process.env.BEDROCK_GLOBAL_HOURLY_BUDGET || '0', 10);
   if (userBudget <= 0 && globalBudget <= 0) return { allowed: true }; // not configured -> off
   const hour = hourKey();
   const ttl = nowSec() + BUDGET_TTL_SECONDS;
   try {
+    // The GLOBAL ceiling applies to EVERYONE, admins included - it protects the account, so an exempt
+    // admin is never a bypass for unbounded spend (the exemption below is per-user only).
     if (globalBudget > 0) {
       const globalCount = await bumpCounter(`budget#global#${hour}`, ttl);
       // Circuit trip (CH parity): once the global count crosses the trip threshold, flip the SSM
@@ -86,7 +168,9 @@ export async function checkAndConsumeBudget(
       if (ssm && CIRCUIT_PARAM && globalCount > tripThreshold) tripCircuit(globalCount, tripThreshold);
       if (globalCount > globalBudget) return { allowed: false, reason: 'global' };
     }
-    if (userSub && userBudget > 0) {
+    // Admin exemption (opt-in, forwarded by the router): skip ONLY the per-user budget. The global
+    // ceiling above still counted this call and can still block it.
+    if (userSub && userBudget > 0 && !opts.isAdmin) {
       const userCount = await bumpCounter(`budget#user#${userSub}#${hour}`, ttl);
       if (userCount > userBudget) return { allowed: false, reason: 'user' };
     }
@@ -165,6 +249,34 @@ export async function checkRateLimit(
     console.warn('[abuse-controls] rate-limit check failed (fail-open):', err?.message);
     return { allowed: true, remaining: limit, resetInMinutes };
   }
+}
+
+export type AbuseGateDecision =
+  | { allowed: true }
+  | { allowed: false; reason: 'rate' | 'budget'; message: string };
+
+/**
+ * The shared cost/abuse gate: the ORDER (per-user rate limit, then per-user+global spend budget) and
+ * the reject-message selection, in one place. Every model-dispatch entry point runs it - the Lex
+ * router (1:1 turn) and the channel-flow @all / battle paths - so a new control or a wording change
+ * lands once, not per call site. Returns a decision; the CALLER emits it in its own transport (a Lex
+ * response, or a targeted bot message). `rateCeiling` is passed in (the profile registry that resolves
+ * it lives above this lib); `isAdmin` forwards the opt-in per-user exemption (never the global budget).
+ */
+export async function evaluateAbuseGate(opts: {
+  userSub: string;
+  rateCeiling: number;
+  isAdmin: boolean;
+}): Promise<AbuseGateDecision> {
+  const rate = await checkRateLimit(opts.userSub, opts.rateCeiling, { isAdmin: opts.isAdmin });
+  if (!rate.allowed) {
+    return { allowed: false, reason: 'rate', message: rateLimitMessage(rate.resetInMinutes) };
+  }
+  const budget = await checkAndConsumeBudget(opts.userSub, { isAdmin: opts.isAdmin });
+  if (!budget.allowed) {
+    return { allowed: false, reason: 'budget', message: budgetCannedResponse() };
+  }
+  return { allowed: true };
 }
 
 /** The reply served when a user hits their hourly rate limit. */
