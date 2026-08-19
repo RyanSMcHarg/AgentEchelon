@@ -69,21 +69,47 @@ export interface DetectDriftInput {
    */
   declinedDistances?: number[];
   /**
-   * True when this channel has a LIVE task (status pending/in_progress) for this user.
+   * True when this CHANNEL has a LIVE task (status pending/in_progress), whichever principal holds it.
    *
-   * A live task means the assistant is mid-workflow and has asked the user for something -
-   * requirements, an outline approval, symptoms. The user's turn is then an ANSWER, and an
-   * answer is a continuation of the thread, not a pivot away from it. The cosine signal
-   * cannot see that: an answer is often a short fragment ("Audience is engineering
-   * leadership. Focus on delivery velocity and CI cost.") carrying none of the topic words
-   * the summary embedding was built from, so it lands far from the summary and fires drift
-   * on the one turn the assistant explicitly solicited.
+   * A live task means the assistant is mid-workflow and has asked someone here for something -
+   * requirements, an outline approval, symptoms. The turn is then an ANSWER, and an answer is a
+   * continuation of the thread, not a pivot away from it. The cosine signal cannot see that: an answer
+   * is often a short fragment ("Audience is engineering leadership. Focus on delivery velocity and CI
+   * cost.") carrying none of the topic words the summary embedding was built from, so it lands far
+   * from the summary and fires drift on the one turn the assistant explicitly solicited.
    *
-   * Suppression applies to the COSINE path only. The explicit-routing fast-path is checked
-   * first and still fires, so a user who deliberately asks for a new conversation mid-task
-   * still gets one.
+   * NOT KEYED ON OWNERSHIP, and the narrower version is what shipped the failure. Ownership moves to
+   * the person only at an `awaits` boundary, so a state that ends its turn on a question and does
+   * not declare the flag left the task with the ASSISTANT - and a suppression that asked "does this
+   * user hold a task" answered no. `report_generation.drafting_outline` was such a state, and "Can you
+   * make it 1-2 pages?", a direct answer to the assistant's own outline question, was met with an
+   * offer to split the conversation. The condition this field stands for is "the assistant is
+   * mid-workflow here", which is true either way, so it no longer depends on a per-state flag.
+   *
+   * THE NAME IS THE WIRE CONTRACT and is deliberately unchanged: this input crosses a Lambda boundary
+   * as JSON (the router calls into the data plane, ADR-013), so renaming the field would mean the two
+   * disagree for as long as their deploys are apart, and the drift suppression would simply stop.
+   *
+   * Suppression applies to the COSINE path only. The explicit-routing fast-path is checked first and
+   * still fires, so a user who deliberately asks for a new conversation mid-task still gets one. It
+   * also lifts the moment the task reaches a terminal state: a follow-up ABOUT a finished task is not
+   * covered here (SPEC-DRIFT-CONVERGENCE, "Active-Task Suppression").
    */
   activeTaskInProgress?: boolean;
+  /**
+   * WHICH EVIDENCE suppressed the turn, when `activeTaskInProgress` is set. Reporting only; it never
+   * changes the decision.
+   *
+   * 'live'            - work is running here now.
+   * 'recently_ended'  - work finished here within the deployment's recently-ended window, so the turn
+   *                     is probably about what was just delivered ("Where is the file?").
+   *
+   * ADDITIVE ON PURPOSE. An older data plane that has never heard of this field still reads the
+   * boolean and still suppresses; it loses only the finer counter. Carrying the distinction in a
+   * SECOND boolean instead would have made an unrecognised field mean "do not suppress", which is the
+   * silent-regression shape this input's own history is a record of.
+   */
+  taskSignal?: 'live' | 'recently_ended';
   /**
    * The channels this drift query may look in: those EVERY current human member of the conversation
    * also belongs to (ADR-012).
@@ -225,12 +251,26 @@ export async function detectDrift(input: DetectDriftInput): Promise<DriftResult>
     };
   }
 
-  // Skip: the assistant is mid-task and asked this user for something, so this turn is an
-  // ANSWER. Checked AFTER the explicit-routing fast-path (a deliberate "start a new
-  // conversation about X" still routes) and BEFORE the summary fetch + embed, so a suppressed
-  // turn also costs no Bedrock call. See `activeTaskInProgress` for why cosine mis-reads answers.
+  // Skip: the assistant is mid-workflow in this conversation, so this turn is an ANSWER. Checked
+  // AFTER the explicit-routing fast-path (a deliberate "start a new conversation about X" still
+  // routes) and BEFORE the summary fetch + embed, so a suppressed turn also costs no Bedrock call.
+  // See `activeTaskInProgress` for why cosine mis-reads answers, and why the caller resolves this
+  // without reference to who currently owns the task.
+  //
+  // THIS IS A DELIBERATE INTERIM, NOT THE INTENDED RULE. It treats ANY live task as a reason to
+  // continue here, so while a task is open a genuinely new subject is never offered a conversation of
+  // its own. The target design separates the two questions this collapses: is the message unrelated
+  // to the TASK (break out of the task, carry on in this conversation), and is it ALSO unrelated to
+  // the CONVERSATION (that, and only that, is drift). The interim errs toward continuity because
+  // continuity is the cheaper failure - the person can still ask outright, which takes the fast path
+  // above. Do not read this branch as the product decision; `lib/task-continuity.ts` holds it, along
+  // with what the two-axis version needs and does not have.
   if (input.activeTaskInProgress) {
-    emitDriftCounter('drift_skipped_active_task', correlationId, emfOpts);
+    emitDriftCounter(
+      input.taskSignal === 'recently_ended' ? 'drift_skipped_recent_task' : 'drift_skipped_active_task',
+      correlationId,
+      emfOpts,
+    );
     emitDriftTiming('total', Date.now() - tStart, correlationId, emfOpts);
     return baseResult;
   }

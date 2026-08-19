@@ -4,7 +4,14 @@
  * Tests intent → model mapping with classification-based access control.
  */
 
-import { resolveModelForIntent, collectArnsForClassification, intentTypeToRouteKey } from '../lambda/src/lib/model-resolver';
+import * as fs from 'fs';
+import * as path from 'path';
+import {
+  resolveModelForIntent,
+  collectArnsForClassification,
+  intentTypeToRouteKey,
+  isTrivialTurn,
+} from '../lambda/src/lib/model-resolver';
 import type {
   BackendModelDefinition,
   BackendModelKey,
@@ -198,6 +205,47 @@ describe('resolveModelForIntent', () => {
     expect(result.primaryModelId).toBe('anthropic.claude-3-haiku');
   });
 
+  // A TURN THAT CONTINUES LIVE WORK IS NOT TRIVIAL, whatever the message that triggered it looked
+  // like. Live: a person answered "Looks good" mid-report, the message classified as
+  // `acknowledgment`, the bypass below kept the cheap model, and the reply that followed was a full
+  // multi-section board report generated on Haiku for a premium conversation.
+  it('an acknowledgment that CONTINUES a task keeps the classification floor (Opus, not Haiku)', () => {
+    const result = resolveModelForIntent(
+      'acknowledgment', 'premium', catalog, strategy, profileDefaults,
+      { continuesActiveWork: true },
+    );
+    expect(result.primaryModelKey).toBe('opus');
+    expect(result.primaryModelId).toBe('anthropic.claude-opus');
+  });
+
+  it('a greeting that continues a task keeps the floor too (the bypass is about the TURN)', () => {
+    const result = resolveModelForIntent(
+      'greeting', 'standard', catalog, strategy, profileDefaults,
+      { continuesActiveWork: true },
+    );
+    expect(result.primaryModelKey).toBe('sonnet');
+  });
+
+  it('a STANDALONE acknowledgment still stays on the cheap model (the cost lever is intact)', () => {
+    // The bypass exists so "thanks" does not buy a premium invoke. Continuation is the only thing
+    // that suspends it; an acknowledgment with no work behind it is unchanged.
+    const result = resolveModelForIntent(
+      'acknowledgment', 'premium', catalog, strategy, profileDefaults,
+      { continuesActiveWork: false },
+    );
+    expect(result.primaryModelKey).toBe('haiku');
+    expect(resolveModelForIntent('acknowledgment', 'premium', catalog, strategy, profileDefaults).primaryModelKey)
+      .toBe('haiku');
+  });
+
+  it('the turn context does not disturb a non-trivial intent', () => {
+    // `general` was never subject to the bypass, so the floor applies either way. Guards against the
+    // flag becoming a second, differently-shaped routing knob.
+    const withWork = resolveModelForIntent('general', 'premium', catalog, strategy, profileDefaults, { continuesActiveWork: true });
+    const without = resolveModelForIntent('general', 'premium', catalog, strategy, profileDefaults);
+    expect(withWork).toEqual(without);
+  });
+
   it('downgrades primary model when classification does not allow it', () => {
     // strategic_analysis → opus, but basic classification can't use opus
     const result = resolveModelForIntent('general', 'basic', catalog, strategy, profileDefaults);
@@ -251,6 +299,43 @@ describe('resolveModelForIntent', () => {
     expect(result.primaryModelId).toBe('anthropic.claude-opus');
     expect(result.fallbackModelId).toBe('arn:aws:bedrock:us-east-1:123:inference-profile/sonnet');
     expect(result.resolvedFromStrategy).toBe(true);
+  });
+});
+
+describe('isTrivialTurn', () => {
+  it('is the one answer to "does the cheap-model bypass apply"', () => {
+    expect(isTrivialTurn('greeting')).toBe(true);
+    expect(isTrivialTurn('acknowledgment')).toBe(true);
+    expect(isTrivialTurn('acknowledgment', { continuesActiveWork: true })).toBe(false);
+    expect(isTrivialTurn('report_generation')).toBe(false);
+    expect(isTrivialTurn(undefined)).toBe(false);
+  });
+});
+
+/**
+ * THE SIGNAL HAS TO REACH THE RESOLVER. A pure function that answers correctly while its caller
+ * never passes the argument is inert, and the live defect was exactly a routing decision that no
+ * test exercised end to end. The processor already holds both facts on its event, so this is a call
+ * shape rather than a new read, and there is nothing for the router to send that it does not send
+ * today (`isTaskContinuation`, `taskId`).
+ */
+describe('the async processor passes the turn context (wiring ratchet)', () => {
+  const processorSrc = fs.readFileSync(
+    path.join(__dirname, '../lambda/src/assistant-async-processor.ts'), 'utf8',
+  );
+
+  it('derives continuesActiveWork from the event, with no extra lookup', () => {
+    expect(processorSrc).toMatch(
+      /const continuesActiveWork = !!event\.isTaskContinuation \|\| !!event\.taskId;/,
+    );
+  });
+
+  it('hands it to BOTH resolution paths (the baseline and context routing)', () => {
+    // resolveModelForIntent takes it as the turn context; resolveModelPlan takes it on the
+    // RoutingContext, so the context-routing path cannot resolve cheaper than the path it is meant
+    // to stay backward-compatible with.
+    expect(processorSrc).toMatch(/\{ continuesActiveWork \}/);
+    expect((processorSrc.match(/continuesActiveWork/g) || []).length).toBeGreaterThanOrEqual(3);
   });
 });
 

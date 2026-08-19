@@ -256,12 +256,18 @@ describe('detectDrift (hardened cosine path)', () => {
 });
 
 /**
- * A live task means the assistant asked this user for something and the turn under
- * evaluation is the ANSWER. Cosine cannot see that: an answer is typically a short
+ * A live task means the assistant asked someone in this conversation for something and the
+ * turn under evaluation is the ANSWER. Cosine cannot see that: an answer is typically a short
  * fragment carrying none of the summary's topic words, so it lands FAR from the summary
  * and fires drift on the one turn the assistant solicited. Observed live on 2026-07-30 -
  * `drift_fired` on "Audience is engineering leadership. Focus on delivery velocity, code
  * ownership, and CI cost." mid-report_generation, which derailed the flow.
+ *
+ * The flag is a statement about the CHANNEL, not about who holds the task: ownership moves only at
+ * an `awaits` boundary, so keying it on the user made the guard depend on every state declaring
+ * that flag correctly, and one that did not lost drift protection with no error. Who resolves it, and
+ * from which reads, is the router's side of the contract (`live-work-suppresses-drift.test.ts`);
+ * this module only ever sees the boolean.
  */
 describe('detectDrift — a live task suppresses the cosine signal', () => {
   it('does NOT fire on an answer to the assistant, even when it lands far from the summary', async () => {

@@ -151,6 +151,34 @@ describe('policy gate (conversation type drift on/off)', () => {
   });
 });
 
+// LIVE WORK IN THE CONVERSATION REACHES THE DETECTOR.
+//
+// The flow does not resolve this itself - the router already read it for task continuation, and a
+// second DynamoDB round-trip here would be paid on every reply. So the only thing this layer can get
+// wrong is dropping it, and dropping it is invisible: the turn still answers, drift just fires when it
+// should not. That is how the live report_generation defect looked from the logs.
+describe('the caller\'s live-task signal reaches detectDrift', () => {
+  it('forwards it, so a mid-workflow turn is not read as a pivot', async () => {
+    mockDetectDrift.mockResolvedValue({ isDrift: false, driftScore: 0.9 });
+    const flow = loadFlow(ENABLED);
+
+    await flow.runLiveDriftFlow({ ...baseInput, activeTaskInProgress: true });
+
+    expect(mockDetectDrift.mock.calls[0][0].activeTaskInProgress).toBe(true);
+  });
+
+  it('forwards its absence too, rather than defaulting the guard on', async () => {
+    // A helpful default here would suppress drift for every caller that never resolved a task,
+    // including the ones that have no task path at all.
+    mockDetectDrift.mockResolvedValue({ isDrift: false, driftScore: 0.02 });
+    const flow = loadFlow(ENABLED);
+
+    await flow.runLiveDriftFlow({ ...baseInput, activeTaskInProgress: false });
+
+    expect(mockDetectDrift.mock.calls[0][0].activeTaskInProgress).toBe(false);
+  });
+});
+
 // A BATTLE BLOCKS THE ACTION, NOT THE DETECTION (owner, 2026-08-13).
 //
 // The previous behaviour returned null the moment Battle Mode was on, so a user who changed the

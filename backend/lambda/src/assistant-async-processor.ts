@@ -813,12 +813,25 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // so this is byte-identical until an operator edits a version; fail-closed to the global strategy
     // when a version carries no per-intent routing.
     const profileStrategy = buildIntentStrategy(active.models) ?? INTENT_ROUTE_STRATEGY;
+    // WHAT THE TURN IS DOING, not only what the message looked like. The trivial-intent bypass in
+    // model-resolver keeps the cheap model for a greeting or an acknowledgment; a turn that carries a
+    // task is doing that task's work whatever the message's shape, and resolving it from the shape
+    // alone put a full board report on Haiku because the message before it was "Looks good" (live).
+    //
+    // Both signals are already on THIS event - no extra read, and no change to the router:
+    //  - `isTaskContinuation`: the router's own statement that this turn continues an open chain. It
+    //    is resolved from an owner-scoped active-task lookup, which depends on a state declaring
+    //    `awaits`, so it can be false while work really is in flight.
+    //  - `taskId`: the structural fact that this turn is bound to a task at all, which holds whether
+    //    the task was opened this turn or resumed, and does not depend on any state's declaration.
+    const continuesActiveWork = !!event.isTaskContinuation || !!event.taskId;
     const resolution = resolveModelForIntent(
       event.intent || event.resolvedModel,
       CONFIG.userType,
       catalog,
       profileStrategy,
       baseModelSelection,
+      { continuesActiveWork },
     );
     const variantDef = battleVariantModelKey
       ? catalog[battleVariantModelKey as keyof typeof catalog]
@@ -878,6 +891,9 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
               intent: event.intent,
               experimentModelId: event.resolvedModel,
               userLanguage: event.userLanguage,
+              // Same turn fact as the baseline resolution above, so the context-routing path cannot
+              // reach a cheaper model than the path it is meant to be backward-compatible with.
+              continuesActiveWork,
               // Geography routing (rule 2): the dominant geo segment forwarded from the host. A CN
               // segment routes to the CN model even when the user's global language isn't zh.
               segment: event.segment,
@@ -949,7 +965,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       // machines are preferred over the deployment pack (undefined ⇒ the pack, byte-identical).
       machines: active.machines,
       // Who holds the task while the assistant is working, and who it returns to once the person has
-      // answered. Without it a task that entered an `awaitsUser` state would stay in the user's queue
+      // answered. Without it a task that entered a waiting state would stay in the user's queue
       // after they had already dealt with it.
       assistantId: principalIdFromArn(event.botArn),
     });
@@ -1267,6 +1283,12 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
           modelUsed: `external:${cnCfg.model}`,
           wasFallback: false,
           retryCount: 0,
+          // The SAME structural fact the Bedrock path declares (invokeBedrock's blocked early return).
+          // `response` here is guardrail block copy, not an answer, and a deployment with custom
+          // blockedInputMessaging leaves no text shape a reader could recover that from - so a turn
+          // blocked on this path archived as an ordinary answer purely because it took the external
+          // route. Parity in the guardrail call without parity in what it records is not parity.
+          inputGuardBlocked: true,
         };
       } else {
       try {

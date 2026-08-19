@@ -47,6 +47,26 @@ describe('resolveModelPlan — backward compatibility (empty context)', () => {
   }
 });
 
+describe('resolveModelPlan — a turn that continues live work', () => {
+  it('carries continuesActiveWork into the intent resolution, so an acknowledgment keeps the floor', () => {
+    // The generalized resolver must not be a cheaper door than the baseline one. Both are called
+    // from the same processor turn, and a plan that dropped to Haiku here would undo the fix for any
+    // deployment with context routing on.
+    const plan = resolveModelPlan(
+      { classification: 'premium', intent: 'acknowledgment', continuesActiveWork: true },
+      deps,
+    );
+    const continued = resolveModelForIntent(
+      'acknowledgment', 'premium', catalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION,
+      { continuesActiveWork: true },
+    );
+    const standalone = resolveModelPlan({ classification: 'premium', intent: 'acknowledgment' }, deps);
+
+    expect(plan.ref.modelId).toBe(continued.primaryModelId);
+    expect(plan.ref.modelId).not.toBe(standalone.ref.modelId);
+  });
+});
+
 describe('resolveModelPlan — experiment override (rule 1)', () => {
   it('experimentModelId wins on the primary, exactly like effectiveModel today', () => {
     const experimentModelId = 'us.anthropic.some-experiment-model-v1:0';

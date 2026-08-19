@@ -121,15 +121,23 @@ export interface LiveDriftFlowInput {
    */
   conversationType?: string;
   /**
-   * True when a LIVE task (pending/in_progress) exists for this user in this channel. The
-   * caller already resolves this for task continuation, so it is passed in rather than
-   * re-read here (no extra DynamoDB round-trip on the reply path).
+   * True when a LIVE task (pending/in_progress) exists in this channel, whichever principal holds it.
+   * The caller already resolves this for task continuation, so it is passed in rather than re-read
+   * here (no extra DynamoDB round-trip on the reply path).
    *
-   * Suppresses the cosine signal only - see `DetectDriftInput.activeTaskInProgress`. The
-   * pending-suggestion branch below is NOT gated on it: a user answering an outstanding
-   * yes/no must always be honoured.
+   * NOT owner-scoped, deliberately: ownership only moves to the person at an `awaits` boundary, so
+   * keying on it made the suppression depend on every state remembering to declare that flag, and a
+   * state that did not silently lost drift protection. See `DetectDriftInput.activeTaskInProgress`.
+   *
+   * Suppresses the cosine signal only. The pending-suggestion branch below is NOT gated on it: a user
+   * answering an outstanding yes/no must always be honoured.
    */
   activeTaskInProgress?: boolean;
+  /**
+   * Which evidence the caller used, for the skip counter only - 'live' work, or work that ENDED here
+   * within the deployment's recently-ended window. Never read to make a decision here or downstream.
+   */
+  taskSignal?: 'live' | 'recently_ended';
 }
 
 /** A short-circuit response from the drift flow — the caller turns this into a
@@ -488,6 +496,7 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
       userClearance: classification,
       declinedDistances: routing.declinedDistances,
       activeTaskInProgress: input.activeTaskInProgress,
+      taskSignal: input.taskSignal,
       scopedChannelArns,
       // Same value as `userClearance` above, and deliberately a separate field: that one is an
       // optional metric dimension, this one selects the database reader role both summary-embedding

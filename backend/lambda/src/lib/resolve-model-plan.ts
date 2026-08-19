@@ -55,6 +55,11 @@ export interface RoutingContext {
   intent?: string;
   /** Experiment override already resolved upstream (router `resolveExperimentModel`). Rule #1. */
   experimentModelId?: string;
+  /**
+   * This turn continues work already in flight, so the trivial-intent bypass does not apply to it
+   * (`TurnContext.continuesActiveWork` in model-resolver). Absent ⇒ intent alone decides, unchanged.
+   */
+  continuesActiveWork?: boolean;
   // NEW, optional signals — absent ⇒ today's behavior unchanged:
   userLanguage?: string;
   segment?: { country?: string; region?: string; lat?: number; lng?: number };
@@ -99,7 +104,9 @@ export function resolveModelPlan(ctx: RoutingContext, deps: ResolveModelPlanDeps
   const { catalog, strategy, profileDefaults } = deps;
 
   // Rules 3 + 4: today's intent→classification resolution (with classification safety) is the baseline.
-  const base = resolveModelForIntent(ctx.intent, ctx.classification, catalog, strategy, profileDefaults);
+  const base = resolveModelForIntent(ctx.intent, ctx.classification, catalog, strategy, profileDefaults, {
+    continuesActiveWork: ctx.continuesActiveWork,
+  });
 
   // Rule 1: experiment override wins on the primary model id — identical to today's
   // `event.resolvedModel || resolution.primaryModelId`.

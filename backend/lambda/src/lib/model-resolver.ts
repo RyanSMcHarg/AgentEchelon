@@ -88,6 +88,36 @@ const COST_RANK: Record<'low' | 'medium' | 'high', number> = { low: 0, medium: 1
 // is subject to the classification floor below.
 const TRIVIAL_INTENTS = new Set<string>(['greeting', 'acknowledgment']);
 
+/**
+ * What the TURN is doing, as distinct from what the incoming message looks like.
+ *
+ * The intent classifies the user's message; it does not describe the work the reply has to do. Those
+ * two came apart live: "Looks good" classified as `acknowledgment`, the trivial bypass below kept the
+ * cheap model, and the reply that followed was a full multi-section board report generated on Haiku.
+ * The shape of a four-word message decided the model for work that was already in flight.
+ */
+export interface TurnContext {
+  /**
+   * This turn continues work already in flight (a task the router resolved for it). A continuation
+   * is never trivial however short the message that triggered it: the reply carries the task's work,
+   * not the message's shape.
+   *
+   * The caller passes a fact it ALREADY holds - the router states it on the dispatch
+   * (`isTaskContinuation`) and the turn's `taskId` is on the same event - so nothing here costs a
+   * per-turn read.
+   */
+  continuesActiveWork?: boolean;
+}
+
+/**
+ * Does the trivial-intent bypass apply to this turn? Only when the intent is trivial AND the turn is
+ * not carrying live work. Exported so the same question has one answer wherever it is asked.
+ */
+export function isTrivialTurn(intent: string | undefined, turn: TurnContext = {}): boolean {
+  if (!intent || !TRIVIAL_INTENTS.has(intent)) return false;
+  return !turn.continuesActiveWork;
+}
+
 export interface ModelResolution {
   primaryModelId: string;
   primaryModelKey: BackendModelKey;
@@ -105,6 +135,9 @@ export interface ModelResolution {
  * 3. Checks that the strategy's primaryModel is allowed for this classification
  * 4. Falls back to the classification's default model if not allowed
  * 5. Same logic for fallbackModel
+ *
+ * `turn` carries what the TURN is doing (see {@link TurnContext}); omitted ⇒ intent alone decides,
+ * which is the historical behavior.
  */
 export function resolveModelForIntent(
   intent: string | undefined,
@@ -112,6 +145,7 @@ export function resolveModelForIntent(
   catalog: Record<BackendModelKey, BackendModelDefinition>,
   strategy: IntentRouteDefinition[],
   profileDefaults: ProfileModelSelection,
+  turn: TurnContext = {},
 ): ModelResolution {
   const defaultModel = catalog[profileDefaults[classification]];
   const defaultResolution: ModelResolution = {
@@ -144,12 +178,14 @@ export function resolveModelForIntent(
   if (primaryDef && primaryDef.allowedClassifications.includes(classification)) {
     // Classification floor: a strategy primary can be allowed for a classification yet weaker than
     // that classification's default model (e.g. general_qa → haiku, which IS allowed for
-    // premium). For any non-trivial intent, never resolve below the classification default,
+    // premium). For any non-trivial turn, never resolve below the classification default,
     // so a premium user gets a premium-grade response instead of silently
     // dropping to Haiku. Lower classifications still degrade to their own (cheaper) floor;
-    // greetings/acknowledgments bypass the floor and stay on Haiku for everyone.
+    // a standalone greeting/acknowledgment bypasses the floor and stays on Haiku for everyone.
+    // A greeting-shaped message that CONTINUES a live task is not standalone and keeps the floor
+    // (isTrivialTurn): the reply owes the task's work, not the incoming message's word count.
     const belowFloor = COST_RANK[primaryDef.costClass] < COST_RANK[defaultModel.costClass];
-    if (intent && !TRIVIAL_INTENTS.has(intent) && belowFloor) {
+    if (intent && !isTrivialTurn(intent, turn) && belowFloor) {
       primaryModelId = bedrockInvokeId(defaultModel);
       primaryModelKey = defaultModel.key;
     } else {

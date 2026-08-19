@@ -28,6 +28,10 @@ type DriftCounter =
   | 'drift_skipped_intent'
   | 'drift_skipped_no_summary'
   | 'drift_skipped_active_task'
+  // Suppressed because work FINISHED here a moment ago, not because work is running. Counted apart
+  // from the live case: they are the same decision resting on different evidence, and an operator
+  // tuning the recently-ended window needs to see how often it is the thing doing the suppressing.
+  | 'drift_skipped_recent_task'
   | 'drift_fastpath_explicit_intent'
   | 'drift_summary_embedding_lazy_compute'
   | 'drift_signal_disagreement';
