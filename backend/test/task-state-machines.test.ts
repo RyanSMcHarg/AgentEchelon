@@ -14,8 +14,10 @@ import {
   initialStateFor,
   isDeclaredState,
   terminalKindOf,
+  stateNamesOf,
   type TaskStateMachine,
 } from '../lambda/src/lib/task-state-machines.js';
+import { TASK_STATE_MACHINES } from '../lambda/src/lib/task-tracking.js';
 import { getIntentPack, taskStateMachines, _resetIntentPackCache } from '../lambda/src/lib/intent-pack.js';
 import { shouldMarkTaskCompleted } from '../lambda/src/lib/task-tracking.js';
 
@@ -34,6 +36,23 @@ describe('shouldMarkTaskCompleted — lifecycle status follows the machine termi
   it('is TRUE for a task with NO state machine (lightweight/single-turn completes as before)', () => {
     expect(shouldMarkTaskCompleted('general', 'anything')).toBe(true);
     expect(shouldMarkTaskCompleted(undefined, undefined)).toBe(true);
+  });
+});
+
+describe('stateNamesOf — the derived state-name shape (retires the shadow const)', () => {
+  it('projects each machine to its ordered state names', () => {
+    const m: Record<string, TaskStateMachine> = {
+      t: { initial: 'a', states: { a: { transitions: ['b'] }, b: { transitions: [], terminal: 'success' } } },
+    };
+    expect(stateNamesOf(m)).toEqual({ t: ['a', 'b'] });
+  });
+
+  it('the module-level TASK_STATE_MACHINES is DERIVED from the authoritative graph (no drift)', () => {
+    // It equals stateNamesOf(DEFAULT) exactly — the hand-maintained shadow is gone.
+    expect(TASK_STATE_MACHINES).toEqual(stateNamesOf(DEFAULT_TASK_STATE_MACHINES));
+    // And it follows the authoritative report_generation order (…revising, completed) — the old shadow
+    // had completed before revising, so its terminal-last check treated 'revising' as terminal.
+    expect(TASK_STATE_MACHINES.report_generation[TASK_STATE_MACHINES.report_generation.length - 1]).toBe('completed');
   });
 });
 

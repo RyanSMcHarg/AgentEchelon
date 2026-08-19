@@ -39,7 +39,7 @@ export function selectDeliveryOption(intent: string, hasActiveTask: boolean): De
  *    generated reply to compare, so greetings/acks fall back to
  *    PLACEHOLDER_UPDATE),
  *  - task intents carry the taskType (= the IntentType value, which is
- *    also the TASK_STATE_MACHINES key) so each bot's createBattleTask
+ *    also the TASK_STATE_MACHINES key) so each bot's task creation
  *    starts the right state machine.
  * Pure — unit-testable; the fan-out just consumes it.
  */

@@ -89,4 +89,57 @@ describe('isDeliverableDocument', () => {
     expect(isDeliverableDocument(undefined)).toBe(false);
     expect(isDeliverableDocument('')).toBe(false);
   });
+
+  // A LONG, well-formatted requirements questionnaire clears the old structural bar (>500 chars,
+  // >=4 list items, >=800 chars) even though it is ASKING, not delivering. Live-verified on the
+  // standard classification: this exact shape was uploaded as report-*.md AND completed the task
+  // while it was still collecting requirements, because completeOnDelivery keys on this gate.
+  const REQUIREMENTS_QUESTIONNAIRE = `Hi Demo, let's start by gathering the requirements for your `
+    + `report on the pros and cons of a monorepo versus multi-repo for a 5-team organization. `
+    + `Please provide the following details so the report lands where you need it:\n\n`
+    + `1. Audience: is this for engineering leadership, the platform team, or a wider org readout?\n`
+    + `2. Scope: should it cover build tooling and CI cost, or only repository structure?\n`
+    + `3. Current state: how are the five teams' repositories organised today, and what hurts most?\n`
+    + `4. Constraints: are there compliance, release-cadence, or tooling constraints I should honour?\n`
+    + `5. Length and format: a one-page brief, or a fuller document with appendices?\n`
+    + `6. Decision timeline: when do you need to make the call, and who signs off on it?\n\n`
+    + `Once I have these I will draft the outline for your approval before writing the full report.`;
+
+  it('does NOT deliver a long requirements questionnaire (live standard-classification bug)', () => {
+    // Guard the premise: it clears every structural bar, so only the intent veto can reject it.
+    expect(REQUIREMENTS_QUESTIONNAIRE.length).toBeGreaterThan(800);
+    expect((REQUIREMENTS_QUESTIONNAIRE.match(/(^|\n)\s*(?:[-*]\s+|\d+\.\s+)\S/g) || []).length)
+      .toBeGreaterThanOrEqual(4);
+    expect(isDeliverableDocument(REQUIREMENTS_QUESTIONNAIRE)).toBe(false);
+  });
+
+  it('does NOT deliver a long bulleted question list with no heading and no table', () => {
+    // Exercises the SECOND signal specifically: no recognised solicitation opener, so only the
+    // "several questions in a body with no heading and no table" clause can reject it. It clears
+    // the list-only structural branch, so without that clause it would be delivered as a file.
+    const questions = 'Thanks for the request. The shape of this document changes a lot depending '
+      + 'on scope and audience, and getting that wrong wastes a draft, so it is worth settling a '
+      + 'handful of points up front before any substantial writing happens for the five teams:\n\n'
+      + '- Who is the primary audience, and what decision are they actually trying to make?\n'
+      + '- How deep should the CI cost modelling go, given most readers will skim that section?\n'
+      + '- Is there an existing internal standard or earlier write-up this should build on?\n'
+      + '- What is the deadline, and who ultimately signs off on the recommendation?\n'
+      + '- Should the recommendation be a single call, or a set of options with trade-offs?\n\n'
+      + 'Answering these turns the draft from a generic topic overview into something specific to '
+      + 'how the teams actually work today, which is the difference between a document that gets '
+      + 'used in the decision and one that gets skimmed once and quietly forgotten afterwards.';
+    // Guard the premise: it clears the structural bar the old gate used.
+    expect(questions.length).toBeGreaterThan(800);
+    expect((questions.match(/(^|\n)\s*(?:[-*]\s+|\d+\.\s+)\S/g) || []).length).toBeGreaterThanOrEqual(4);
+    expect(/(^|\n)#{1,6}\s+\S/.test(questions)).toBe(false);
+    expect(isDeliverableDocument(questions)).toBe(false);
+  });
+
+  it('still delivers a report that merely MENTIONS a solicitation phrase in its body', () => {
+    // The veto is scoped to the OPENING window on purpose: a finished report may sign off with
+    // "let me know" without becoming a questionnaire. A body-anywhere match would drop real files.
+    const reportWithSignoff = FULL_REPORT + '\n\nIf you want the CI cost section expanded with our '
+      + 'actual pipeline numbers, let me know and I will fold them into a second revision.';
+    expect(isDeliverableDocument(reportWithSignoff)).toBe(true);
+  });
 });

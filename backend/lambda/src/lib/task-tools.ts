@@ -5,9 +5,15 @@
  * dispatch logic is unit-testable without a Bedrock round-trip.
  */
 import { type Task, advanceTaskStateTo, type AdvanceResult } from './task-tracking.js';
-import { type TaskStateMachine, DEFAULT_TASK_STATE_MACHINES } from './task-state-machines.js';
+import {
+  type TaskStateMachine,
+  DEFAULT_TASK_STATE_MACHINES,
+  ADVANCE_TASK_STATE_TOOL_NAME,
+} from './task-state-machines.js';
 
-export const ADVANCE_TASK_STATE_TOOL_NAME = 'advance_task_state';
+// Re-exported from where the machines are declared, so a prompt that names this tool and the loop that
+// dispatches it read the same constant. Kept exported here because this is where callers expect it.
+export { ADVANCE_TASK_STATE_TOOL_NAME };
 
 /**
  * The active-task context threaded into the Converse loop. Passing it registers the task tools and
@@ -23,6 +29,8 @@ export interface TaskLoopContext {
    *  compared against the same state the model saw even after the tool mutates task.taskState. */
   initialState?: string;
   transitions?: Array<{ from: string; to: string }>;
+  /** The assistant running this turn, so a task leaving an awaitsUser state is handed back to it. */
+  assistantId?: string;
 }
 
 /**
@@ -86,6 +94,8 @@ export async function handleAdvanceTaskStateTool(args: {
   input: Record<string, unknown>;
   machines?: Record<string, TaskStateMachine>;
   messageId?: string;
+  /** The assistant running this turn, so a task can be handed back when it stops awaiting the user. */
+  assistantId?: string;
 }): Promise<{ payload: Record<string, unknown>; result: AdvanceResult }> {
   const toState = typeof args.input.to_state === 'string' ? args.input.to_state.trim() : '';
   const reason = typeof args.input.reason === 'string' ? args.input.reason : undefined;
@@ -105,6 +115,7 @@ export async function handleAdvanceTaskStateTool(args: {
     reason,
     messageId: args.messageId,
     machines: args.machines ?? DEFAULT_TASK_STATE_MACHINES,
+    ...(args.assistantId ? { assistantId: args.assistantId } : {}),
   });
 
   const payload: Record<string, unknown> = result.ok

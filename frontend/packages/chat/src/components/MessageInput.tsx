@@ -1,4 +1,4 @@
-import React, { useState, useRef, useCallback } from 'react';
+import React, { useState, useRef, useCallback, useMemo } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useConversations } from '../providers/ConversationProvider.chime';
 import { useAuth } from '@ae/shared';
@@ -23,7 +23,7 @@ const MessageInput: React.FC = () => {
   const [selectedMentionIndex, setSelectedMentionIndex] = useState(0);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
-  const { activeConversation, sendMessage, isSending, sendError, clearSendError, channelMembers, stickyTarget, setStickyTarget, battleWaitingBots } = useConversations();
+  const { activeConversation, sendMessage, isSending, sendError, clearSendError, channelMembers, stickyTarget, setStickyTarget, battleWaitingBots, openWorkItems, refreshOpenWorkItems } = useConversations();
   const { user } = useAuth();
 
   const everyoneMember: StickyMentionTarget = { userArn: 'EVERYONE', name: 'all', isBot: false, isAll: true };
@@ -45,6 +45,39 @@ const MessageInput: React.FC = () => {
       : null;
   const botDisplayName = (arn: string) =>
     channelMembers.find((m) => m.userArn === arn)?.name || 'assistant';
+
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+  // ANSWERING A WORK ITEM (ADR-032).
+  //
+  // In a shared conversation, a message that addresses nobody reaches no assistant: silence-by-default
+  // is the rule, and it is the right one - an assistant must not answer chatter it was not part of.
+  // But a person answering a question an assistant asked THEM is not chatter, and they have no reason
+  // to know they were supposed to address it. Left alone, their answer lands in the channel, nothing
+  // runs, and the work stays blocked with nothing anywhere showing an error.
+  //
+  // THE COMPOSER IS WHERE THIS IS FIXED, because it is the one component that knows what is being
+  // answered: it rendered the item. So while something is waiting on this person here, the composer
+  // addresses their next message to the assistant that asked, and stamps the task it answers. The
+  // stream-side repair exists for the cases this misses, and counts them, so this staying correct
+  // remains measurable (ADR-032 tenets 3 and 6).
+  //
+  // ONLY IN A GROUP. In a 1:1 Amazon Chime SDK's AUTO trigger routes every message to the assistant
+  // regardless of addressing, so there is nothing to fix and targeting would only make the person's
+  // own message private for no reason.
+  const [dismissedTaskId, setDismissedTaskId] = useState<string | null>(null);
+  const taskAnswer = useMemo(() => {
+    const channelArn = activeConversation?.conversationArn;
+    if (!channelArn || channelMembers.length <= 2) return null;
+    for (const item of openWorkItems) {
+      if (item.channelArn !== channelArn || !item.assistantId || item.taskId === dismissedTaskId) continue;
+      // Resolved against the members this client can SEE, never assembled from an id: an item naming
+      // an assistant that is not a member of this conversation addresses nothing, which is honest
+      // about what the client knows and cannot produce an ARN for a bot it has never seen.
+      const bot = channelMembers.find((m) => m.isBot && m.userArn.endsWith(`/${item.assistantId}`));
+      if (bot) return { taskId: item.taskId, title: item.title || item.taskType, botArn: bot.userArn };
+    }
+    return null;
+  }, [openWorkItems, activeConversation?.conversationArn, channelMembers, dismissedTaskId]);
 
   // Build mention options: filter out current user, add @all when 3+ members
   const getMentionOptions = useCallback((): (ChannelMember & { isAll?: boolean })[] => {
@@ -138,8 +171,22 @@ const MessageInput: React.FC = () => {
       } else {
         // If a sticky target is set and the user didn't type their own @-mention,
         // prepend the sticky mention so it carries over to the next send.
+        //
+        // A slash command is exempt. `/battle` is a START-OF-MESSAGE command, so a prepended
+        // mention turns it into ordinary prose addressed to one assistant: the router reads
+        // `invokesBattle: false` and answers normally, with no duel and nothing to explain why.
+        // The sticky target is also semantically wrong for a battle, which fans out to two bots
+        // rather than to the one the mention names. Once a sticky target was set - and it persists
+        // across sends - every later slash command in that conversation was silently swallowed.
         let effectiveContent = input.trim();
-        if (stickyTarget && !effectiveContent.startsWith('@')) {
+        // THE CHIP AND THE SEND MUST AGREE. The banner above renders `taskAnswer` BEFORE
+        // `stickyTarget`, so when both exist the person is told "Answering <work item>" - and the
+        // sticky prefix must therefore stand down: prepending it here set `mentions.targetArn` to the
+        // sticky human, which forced `answersTask` false below, and the message routed to that person
+        // with no taskId while the UI said the opposite. The work item stayed blocked. The sticky
+        // target is not cleared, only skipped: it comes back once the work item is answered or
+        // dismissed, exactly as the banner does.
+        if (stickyTarget && !taskAnswer && !effectiveContent.startsWith('@') && !effectiveContent.startsWith('/')) {
           const prefix = stickyTarget.isAll ? '@all' : `@${stickyTarget.name}`;
           effectiveContent = effectiveContent ? `${prefix} ${effectiveContent}` : prefix;
         }
@@ -159,11 +206,24 @@ const MessageInput: React.FC = () => {
           return;
         }
 
+        // ANSWERING A WORK ITEM, when the person addressed nobody themselves. The assistant that asked
+        // is addressed for them and the task is named, so the message reaches the work it answers
+        // instead of reaching nobody (ADR-032).
+        //
+        // WHAT THE PERSON TYPED ALWAYS WINS. An explicit mention, `@all` and a slash command each take
+        // this branch away: a mention is the person naming who they are talking to, and ADR-030 makes
+        // that a supported path in its own right - the turn resolves the chain from the task, so no
+        // reference needs to ride the message. A `/battle` is a new instruction, not an answer.
+        const answersTask = taskAnswer && !mentions.isAtAll && !mentions.targetArn
+          && !mentions.mentionBotArn && !fallbackContent.startsWith('/');
+
         const sendOptions = mentions.isAtAll
           ? undefined
-          : (mentions.targetArn || mentions.mentionBotArn)
-            ? { targetArn: mentions.targetArn, mentionBotArn: mentions.mentionBotArn }
-            : undefined;
+          : answersTask
+            ? { targetArn: taskAnswer.botArn, taskId: taskAnswer.taskId }
+            : (mentions.targetArn || mentions.mentionBotArn)
+              ? { targetArn: mentions.targetArn, mentionBotArn: mentions.mentionBotArn }
+              : undefined;
 
         await sendMessage(fallbackContent, attachment, sendOptions);
 
@@ -192,6 +252,10 @@ const MessageInput: React.FC = () => {
 
       setInput('');
       setShowMentionDropdown(false);
+      // Answering is what closes an item, so re-read the queue rather than waiting for the poll. The
+      // assistant advances the task a moment later, so this can still show the item briefly; the poll
+      // settles it, and a queue that lags by seconds is better than one that lags by a minute.
+      refreshOpenWorkItems();
     } catch (err) {
       setIsUploading(false);
       setUploadError(err instanceof Error ? err.message : 'Failed to send');
@@ -301,9 +365,32 @@ const MessageInput: React.FC = () => {
           )}
           <span className="message-input-sticky-target-hint">
             {battleWaitingBots.length === 1
-              ? t('conversation.battleWaitingOne')
+              ? t('conversation.battleWaitingOne', { name: botDisplayName(selectedWaiting.botArn) })
               : t('conversation.battleWaitingMany', { count: battleWaitingBots.length })}
           </span>
+        </div>
+      ) : taskAnswer ? (
+        /* Something is waiting on this person here, so their next message answers it and says so.
+           The dismiss is the whole reason this is visible rather than silent: a person who wants to
+           say something else in the room must be able to, and a chip they cannot clear would make
+           every remark an answer. Dismissing is per item, and it comes back with the next one. */
+        <div className="message-input-sticky-target" role="status">
+          <span className="message-input-sticky-target-label">{t('conversation.answering')}</span>
+          <span className="message-input-sticky-target-chip message-input-sticky-target-chip--bot">
+            {taskAnswer.title}
+          </span>
+          <span className="message-input-sticky-target-hint">
+            {t('conversation.answeringHint', { name: botDisplayName(taskAnswer.botArn) })}
+          </span>
+          <button
+            type="button"
+            className="message-input-sticky-target-clear"
+            onClick={() => setDismissedTaskId(taskAnswer.taskId)}
+            aria-label={t('conversation.clearAnswering')}
+            title={t('conversation.clearAnswering')}
+          >
+            &times;
+          </button>
         </div>
       ) : stickyTarget ? (
         <div className="message-input-sticky-target" role="status">
@@ -379,9 +466,17 @@ const MessageInput: React.FC = () => {
                 ? 'Select a conversation to start messaging'
                 : isArchived
                   ? t('conversation.readOnlyNotice')
-                  : isMultiUser
-                    ? t('conversation.placeholderMultiUser')
-                    : t('conversation.placeholder')
+                  // WHO IS THIS REPLY FOR. The chips above the field route the send, but the field
+                  // itself said "Type your message…", so a user typing into it had nothing telling
+                  // them where it lands - and with two sides waiting, the routing decision is the one
+                  // thing they most need to see. Name the recipient in the field they are looking at.
+                  : selectedWaiting
+                    ? t('conversation.placeholderBattleReply', {
+                        name: botDisplayName(selectedWaiting.botArn),
+                      })
+                    : isMultiUser
+                      ? t('conversation.placeholderMultiUser')
+                      : t('conversation.placeholder')
             }
             value={input}
             onChange={handleChange}

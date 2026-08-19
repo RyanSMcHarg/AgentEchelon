@@ -31,13 +31,24 @@
  *     npx playwright test e2e/tasks.spec.ts --config=playwright.config.ts
  */
 import { test, expect, request as pwRequest } from '@playwright/test';
-import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
+import { signIn, createConversation, sendAndWaitForResponse, looksLikeTaskPlaceholder } from './helpers/agent-helpers';
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { assertNoDuplicateTasks, openAndValidateAttachment } from './helpers/task-validation';
+import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+
+// Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
+guardConsoleErrors();
+
 
 const RUN = process.env.TASKS_E2E === '1';
-const suite = RUN ? test.describe : test.describe.skip;
+// A gate that STATES ITS REASON. `test.describe.skip` records none, so a run without the flag reports
+// "6 skipped" and gives the reader nothing to act on (see e2e/reporters/skip-visibility.ts). Same
+// effect, with the why attached.
+const suite = test.describe;
+const SKIP_REASON =
+  'Set TASKS_E2E=1 (the validate.mjs "tasks" phase). This suite drives real multi-step tasks against a '
+  + 'live deployment and reads them back through the admin analytics API.';
 const ANALYTICS_API = process.env.VITE_ANALYTICS_API_URL || '';
 
 // A prompt the intent pack classifies as report_generation (delivery
@@ -56,6 +67,10 @@ const TIER_CASES: Array<{ tier: 'basic' | 'standard' | 'premium'; classification
 ];
 
 suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () => {
+  test.skip(!RUN, SKIP_REASON);
+  // Fails a PASSING test that hid a server-side error (see helpers/turn-guards).
+  guardBackendErrors('tasks');
+
   let creds: TestCredentials;
   test.beforeAll(async () => {
     creds = await getTestCredentials();
@@ -78,16 +93,46 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
       const resp = await sendAndWaitForResponse(page, REPORT_PROMPT, 180_000);
       expect(resp.text && resp.text.length, `[${tc.tier}] the report turn must return a response`).toBeTruthy();
 
+      // VACUITY GUARD (must come first). A TASK_MULTI_STEP turn posts a progress placeholder that is
+      // later REPLACED in place. A placeholder carries no attachment and no sticky chip, so if the
+      // capture returns one, every guard below passes without ever exercising its intent — which is
+      // exactly how the doc-gen guard stayed green while the bug it was written for was live. Fail
+      // loudly here instead, so a capture regression can never masquerade as coverage again.
+      expect(
+        looksLikeTaskPlaceholder(resp.text ?? ''),
+        `[${tc.tier}] captured a task progress placeholder ("${resp.text}"), not the settled reply — `
+          + 'the guards below would pass vacuously',
+      ).toBe(false);
+
       // Regression guards for two live-found bugs (this is a 1:1 conversation with a report task):
-      //  1. Doc-gen: the FIRST/clarifying turn of a report task is conversational text, NOT a
-      //     downloadable file. The gate used to key off isDocumentRequest(userMessage), which matches
-      //     the user's "...report..." request on every turn, so the clarifying questions were wrongly
-      //     sent as an attachment. The report attachment must appear only on the delivery turn.
+      //  1. Doc-gen: a turn that ASKS the user for requirements is conversational text, NOT a
+      //     downloadable file. Two live failures sit behind this. First, the gate keyed off
+      //     isDocumentRequest(userMessage), which matches the user's "...report..." ask on every
+      //     turn. Then the output gate (isDeliverableDocument) keyed on length + structure alone,
+      //     so a verbose model's requirements questionnaire ("Please provide the following
+      //     details:" + a numbered list) cleared the bar and was uploaded as report-*.md AND marked
+      //     the task complete while it was still asking. Note the turn is NOT distinguishable by
+      //     its Completed status: the bug set that too. Only the reply's own text tells them apart.
       const lastBotMsg = page.locator('.assistant-message').last();
-      await expect(
-        lastBotMsg.locator('.attachment-display'),
-        `[${tc.tier}] a report task's clarifying turn must be a chat message, not an attachment`,
-      ).toHaveCount(0);
+      const replyText = (await lastBotMsg.innerText()).trim();
+      const asksForDetails = /\?\s*$/.test(replyText)
+        || /please (provide|share|confirm|specify)|let me know|the following (details|information)/i.test(replyText);
+      if (asksForDetails) {
+        await expect(
+          lastBotMsg.locator('.attachment-display'),
+          `[${tc.tier}] a report task's clarifying turn must be a chat message, not an attachment `
+            + `(reply: "${replyText.slice(0, 160)}")`,
+        ).toHaveCount(0);
+      } else {
+        // A genuine delivery turn MAY carry the file; if it does, it must be the report artifact.
+        const attachments = lastBotMsg.locator('.attachment-display');
+        if (await attachments.count() > 0) {
+          await expect(
+            attachments.first(),
+            `[${tc.tier}] a delivered report attachment should be the report artifact`,
+          ).toContainText(/report-.*\.md/);
+        }
+      }
       //  2. Sticky @-mention: in a 1:1 the assistant's reply is untargeted (AUTO delivery), so the
       //     sticky "replying to @assistant" chip must NOT appear (it did when the reply was wrongly
       //     stamped targetedSender). It should only set on a genuinely targeted, multi-party @-mention.

@@ -34,7 +34,18 @@ import { writeFileSync, mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
-import { getBasicUser, getStandardUser, getPremiumUser, type TestUser } from './helpers/test-credentials';
+import {
+  getBasicUser,
+  getStandardUser,
+  getPremiumUser,
+  missingUserReason,
+  type TestUser,
+} from './helpers/test-credentials';
+import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+
+// Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
+guardConsoleErrors();
+
 
 const RUN = process.env.TASKS_E2E === '1';
 const suite = RUN ? test.describe : test.describe.skip;
@@ -114,13 +125,22 @@ function jwtSub(idToken: string): string {
   return payload.sub;
 }
 
-const TIERS: Array<{ tier: 'basic' | 'standard' | 'premium'; classification: string; getUser: () => Promise<TestUser> }> = [
-  { tier: 'basic', classification: 'Open', getUser: getBasicUser },
-  { tier: 'standard', classification: 'Standard', getUser: getStandardUser },
-  { tier: 'premium', classification: 'Premium', getUser: getPremiumUser },
+const TIERS: Array<{
+  tier: 'basic' | 'standard' | 'premium';
+  classification: string;
+  getUser: () => Promise<TestUser>;
+  /** The secret entry this tier reads, so a credential gate can name what is missing. */
+  secretKey: 'basicUser' | 'standardUser' | 'premiumUser';
+}> = [
+  { tier: 'basic', classification: 'Open', getUser: getBasicUser, secretKey: 'basicUser' },
+  { tier: 'standard', classification: 'Standard', getUser: getStandardUser, secretKey: 'standardUser' },
+  { tier: 'premium', classification: 'Premium', getUser: getPremiumUser, secretKey: 'premiumUser' },
 ];
 
 suite('Task machine state persists to the source of truth (SPEC-TASK-STATE-TRANSITIONS §6)', () => {
+  // Fails a PASSING test that hid a server-side error (see helpers/turn-guards).
+  guardBackendErrors('task-state-machine');
+
   let agentTable: string | null = null;
   let userTable: string | null = null;
 
@@ -136,10 +156,7 @@ suite('Task machine state persists to the source of truth (SPEC-TASK-STATE-TRANS
       test.setTimeout(300_000); // TASK_MULTI_STEP turn (up to 180s) + correlation poll
 
       const user = await tc.getUser();
-      if (!user.password) {
-        test.skip();
-        return;
-      }
+      test.skip(!user.password, missingUserReason(tc.secretKey));
 
       const runStart = Date.now() - 60_000; // small skew cushion vs. the row's createdAt
 

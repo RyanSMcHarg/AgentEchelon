@@ -25,7 +25,79 @@ export interface TaskStateDef {
   transitions: string[];
   /** Set iff `transitions` is empty; the outcome this terminal records. */
   terminal?: TerminalKind;
+  /**
+   * This state is blocked on the PERSON, not on the assistant.
+   *
+   * Declared rather than inferred, for the same reason transitions are: a runtime that guessed from a
+   * state's name would be right about `awaiting_result` and wrong about the next machine somebody
+   * writes. Entering a state with this set hands the task to the user who is being waited on
+   * (`reassignTask`), so it appears in their open-items queue alongside every other assistant's; the
+   * task returns to the assistant when the state is left.
+   *
+   * It is what makes "waiting on you" one concept across workflows rather than a per-feature signal -
+   * a duel's clarifying question and a report waiting on scope are the same thing to the person
+   * holding them (ADR-024, ADR-029).
+   */
+  awaitsUser?: boolean;
+  /**
+   * ONE answer from the person completes this step, so their reply may advance it without the model
+   * being consulted.
+   *
+   * Opt-in, and deliberately rare. `awaitsUser` says the machine is blocked on a person; it does NOT
+   * say that the next thing they type finishes the step. Requirements gathering is the counter-example
+   * and it is the common case: `collecting_requirements` has exactly one exit, so a rule of "advance
+   * when there is only one way out" would move a report to drafting on the FIRST reply, before the
+   * assistant has what it needs. That is a state machine racing ahead of the conversation it is
+   * supposed to be following.
+   *
+   * Without this flag a response still hands the work back to the assistant - so the next action fires
+   * either way - and the transition is left to `advance_task_state`, on the turn that has the text and
+   * the model. Set it only where the step IS the answer: a confirmation, an approval, a single choice.
+   */
+  resolvedByOneResponse?: boolean;
+  /**
+   * WHAT THIS STEP NEEDS from the person before the workflow can go on.
+   *
+   * The missing half of `awaitsUser`. That flag says the machine is blocked on someone; it does not say
+   * what would unblock it, so nothing could tell a complete answer from a partial one - and a step with
+   * one exit advanced on whatever arrived first. "Make it about our Q3 numbers" moved a report to
+   * drafting with no audience and no format, and the report was written anyway, to nobody, in no
+   * particular shape. It reads as an assistant that was not listening.
+   *
+   * Named in the person's vocabulary, not the schema's, because it is read back to them when something
+   * is missing: `'the audience'` is a sentence, `'audienceType'` is a field name.
+   *
+   * The check it enables is SEMANTIC and belongs to the model, on the turn that has the person's text -
+   * `buildTaskContextForPrompt` renders these and the rule that goes with them. Deliberately not
+   * enforced structurally: only the answer's content can say whether it named an audience, and a
+   * keyword test for that is the sort of thing that passes on "no particular audience".
+   *
+   * Absent ⇒ today's behaviour exactly: any response is treated as sufficient. That is the right
+   * default for a confirmation or a single choice, where the step IS the answer.
+   */
+  requires?: string[];
+  /**
+   * A DOCUMENT-PRODUCING workflow hands its file back from this state.
+   *
+   * Declared rather than inferred, for the same reason `awaitsUser` is: the attachment gate used to
+   * key on a hardcoded per-taskType list of default-machine state names, which a per-profile machine
+   * (SPEC-CONFIGURABLE-ASSISTANTS 4.5) could never match - a renamed state or a new document-producing
+   * task type silently shipped every deliverable as unattached chat text, with only a shadow log line
+   * as the trace. The machine is the authority on its own states, so the machine says which of them
+   * deliver. Absent everywhere ⇒ the task type is interactive and never attaches a file.
+   */
+  delivers?: boolean;
 }
+
+/**
+ * The tool a turn calls to move a machine on.
+ *
+ * It lives HERE, with the machines, rather than in `task-tools.ts` where it is registered: the name is
+ * spoken by whatever grounds a step into a prompt as well as by the loop that dispatches it, and this
+ * module is the one both of those can import without a cycle. A second literal copy of it is how a
+ * prompt ends up telling a model to call a tool by a name that no longer exists.
+ */
+export const ADVANCE_TASK_STATE_TOOL_NAME = 'advance_task_state';
 
 export interface TaskStateMachine {
   /** The state a freshly created task of this type starts in. Must be a declared state. */
@@ -62,10 +134,16 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
   guided_troubleshooting: {
     initial: 'collecting_symptoms',
     states: {
-      collecting_symptoms: { transitions: ['diagnosing'] },
+      collecting_symptoms: {
+        transitions: ['diagnosing'],
+        awaitsUser: true,
+        requires: ['what is going wrong', 'when it started', 'what they have already tried'],
+      },
       diagnosing: { transitions: ['proposing_solutions', 'collecting_symptoms'] }, // regression: need more info
       proposing_solutions: { transitions: ['awaiting_result'] },
-      awaiting_result: { transitions: ['resolved', 'diagnosing', 'escalated'] }, // worked / didn't / give up
+      // Worked / didn't / give up. No `requires`: the outcome IS the answer, and asking someone to
+      // elaborate on "that fixed it" is the assistant not listening in the other direction.
+      awaiting_result: { transitions: ['resolved', 'diagnosing', 'escalated'], awaitsUser: true },
       resolved: { transitions: [], terminal: 'success' },
       escalated: { transitions: [], terminal: 'handoff' },
     },
@@ -73,24 +151,35 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
   data_extraction: {
     initial: 'collecting_requirements',
     states: {
-      collecting_requirements: { transitions: ['extracting'] },
-      extracting: { transitions: ['validating', 'collecting_requirements'] }, // regression: requirements were wrong
-      validating: { transitions: ['formatting'] },
-      formatting: { transitions: ['completed'] },
+      collecting_requirements: {
+        transitions: ['extracting'],
+        awaitsUser: true,
+        requires: ['what data to pull', 'where it comes from', 'the output format'],
+      },
+      extracting: { transitions: ['validating', 'collecting_requirements'], delivers: true }, // regression: requirements were wrong
+      validating: { transitions: ['formatting'], delivers: true },
+      formatting: { transitions: ['completed'], delivers: true },
       completed: { transitions: [], terminal: 'success' },
     },
   },
   report_generation: {
     initial: 'collecting_requirements',
     states: {
-      collecting_requirements: { transitions: ['drafting_outline'] },
+      // THE STEP THAT PROVES WHY `requires` EXISTS. One exit, so anything that arrived used to move the
+      // report on - and a report drafted with no audience and no format is written to nobody, in no
+      // particular shape, from an assistant that looks like it was not listening.
+      collecting_requirements: {
+        transitions: ['drafting_outline'],
+        awaitsUser: true,
+        requires: ['the subject', 'the audience', 'the length or format'],
+      },
       drafting_outline: { transitions: ['generating'] },
       // Deliver the report on generation: generating -> completed is the DEFAULT path. A generated
       // report is a finished deliverable; the user is never forced to run a revision pass. `revising`
       // is entered ONLY when the user explicitly asks for changes (generating -> revising, then apply
       // and re-deliver via revising -> completed, or regenerate).
-      generating: { transitions: ['completed', 'revising'] },
-      revising: { transitions: ['completed', 'generating'] }, // apply the requested changes -> deliver, or regenerate
+      generating: { transitions: ['completed', 'revising'], delivers: true },
+      revising: { transitions: ['completed', 'generating'], delivers: true }, // apply the requested changes -> deliver, or regenerate
       completed: { transitions: [], terminal: 'success' },
     },
   },
@@ -101,7 +190,8 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
     initial: 'collecting',
     states: {
       collecting: { transitions: ['confirming'] },
-      confirming: { transitions: ['placed'] },
+      // The confirmation IS the step: one 'yes' completes it, so the reply may advance it directly.
+      confirming: { transitions: ['placed'], awaitsUser: true, resolvedByOneResponse: true },
       placed: { transitions: [], terminal: 'success' },
     },
   },
@@ -109,8 +199,9 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
     initial: 'gathering',
     states: {
       gathering: { transitions: ['options_presented'] },
-      options_presented: { transitions: ['awaiting_completion'] },
-      awaiting_completion: { transitions: ['completed'] },
+      // The options are ON THE TABLE and the person has to pick; then the work itself is theirs to do.
+      options_presented: { transitions: ['awaiting_completion'], awaitsUser: true },
+      awaiting_completion: { transitions: ['completed'], awaitsUser: true },
       completed: { transitions: [], terminal: 'success' },
     },
   },
@@ -143,6 +234,24 @@ export function validateTaskStateMachine(name: string, machine: TaskStateMachine
       }
     } else if (def.terminal) {
       throw new TaskMachineValidationError(name, `state "${state}" has transitions but is marked terminal`);
+    }
+    // `requires` is what the PERSON still owes, so a state that is not waiting on one cannot have any.
+    // Declared on a state the machine passes through unattended, it would be rendered into the prompt
+    // as a list of things to chase nobody was ever asked for.
+    if (def.requires?.length && !def.awaitsUser) {
+      throw new TaskMachineValidationError(
+        name,
+        `state "${state}" declares requires but does not await the user`,
+      );
+    }
+    // A step that one reply completes cannot also have a checklist standing between it and its exit:
+    // the two flags would tell the model to advance on any answer and to withhold it until the list is
+    // satisfied, and whichever won would be arbitrary.
+    if (def.requires?.length && def.resolvedByOneResponse) {
+      throw new TaskMachineValidationError(
+        name,
+        `state "${state}" is resolvedByOneResponse, so it cannot also declare requires`,
+      );
     }
     for (const target of def.transitions) {
       if (!machine.states[target]) {
@@ -177,6 +286,20 @@ export function validateTaskStateMachines(machines: Record<string, TaskStateMach
   for (const [name, machine] of Object.entries(machines)) {
     validateTaskStateMachine(name, machine);
   }
+}
+
+/**
+ * Project each machine to its ORDERED state-name array (`Record<taskType, string[]>`) — the legacy
+ * shape the keyword shadow-detector + the terminal-state check consume. DERIVED from the authoritative
+ * machines so the two can never drift (retires the hand-maintained TASK_STATE_MACHINES const). Insertion
+ * order of `states` is the declared order, so the last name is the terminal happy-path state.
+ */
+export function stateNamesOf(
+  machines: Record<string, TaskStateMachine> = DEFAULT_TASK_STATE_MACHINES,
+): Record<string, string[]> {
+  const out: Record<string, string[]> = {};
+  for (const [type, machine] of Object.entries(machines)) out[type] = Object.keys(machine.states);
+  return out;
 }
 
 /** The initial state of a task type, or undefined if the type has no machine. */

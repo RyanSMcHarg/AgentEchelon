@@ -17,6 +17,8 @@ import {
   type TaskStateMachine,
   type TerminalKind,
   DEFAULT_TASK_STATE_MACHINES,
+  ADVANCE_TASK_STATE_TOOL_NAME,
+  stateNamesOf,
   authorizeTransition,
 } from './task-state-machines.js';
 import { emitEmfMetric } from './emf-metrics.js';
@@ -26,7 +28,7 @@ import * as crypto from 'crypto';
 const TASK_METRICS_NAMESPACE = 'AgentEchelon/Tasks';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
-// removeUndefinedValues: createTask/createBattleTask write optional
+// removeUndefinedValues: createTask writes optional
 // taskType / taskState / messageId into the Item — taskState is
 // explicitly undefined for any task with no state machine (the common
 // generic-task case). Without this the PutCommand throws and is
@@ -53,73 +55,61 @@ export const ACTIVE_TASK_STATUSES: readonly TaskStatus[] = ['pending', 'in_progr
  * fail. `reason` is the model's stated justification; `messageId` is the turn that carried the call.
  */
 export interface StateTransition {
-  from: string;
-  to: string;
+  /** The graph edge. ABSENT on an ownership entry, which is not a graph edge (ADR-024 D3). */
+  from?: string;
+  to?: string;
   at: string; // ISO
   by: 'tool' | 'system';
   reason?: string;
   messageId?: string;
+  /**
+   * Ownership entries (ADR-024 D3), as `<type>:<principalId>`. Present INSTEAD of `from`/`to`, so a
+   * consumer that reads `from` gets nothing rather than a principal id in a field every other reader
+   * treats as a state name. `ownerFrom` is absent when the task had no resolvable owner before.
+   */
+  ownerFrom?: string;
+  ownerTo?: string;
+  /** The owner in force when this entry was written, so every state edge is attributable. */
+  owner?: string;
+  /**
+   * THE OUTCOME, present only on the entry that ENDS the task.
+   *
+   * A task's life used to have no recorded ending: `updateTaskStatus` set `status='completed'` and
+   * appended nothing, so the row said it was finished and nothing said when, or how it went. This
+   * entry is that ending, and it lives in the same append-only log as every other transition rather
+   * than in a column beside it - one writer, one record, nothing to disagree with.
+   *
+   * It is NOT a graph edge, so `from`/`to` are absent: a lightweight task with no state machine also
+   * ends, and reading an ending as an edge is the confusion `ownerFrom`/`ownerTo` already avoid here.
+   */
+  terminal?: TerminalKind;
 }
 
-/** Result of a requested transition (authorization + persistence). Mirrors the tool result shape. */
+/**
+ * Result of a requested transition (authorization + persistence). Mirrors the tool result shape.
+ *
+ * `state_changed` = the task moved between the read this transition was authorized against and the
+ * write, so the edge was authorized from a state the task no longer occupies. Distinct from
+ * `persist_failed` (an infrastructure error) because it is not a retry candidate: the caller must
+ * re-read and re-decide from the CURRENT state.
+ */
 export type AdvanceResult =
   | { ok: true; from: string; to: string; terminal?: TerminalKind }
   | {
       ok: false;
-      error: 'no_active_task' | 'unknown_state' | 'illegal_transition' | 'persist_failed';
+      error: 'no_active_task' | 'unknown_state' | 'illegal_transition' | 'persist_failed' | 'state_changed';
       from?: string;
       legal?: string[];
     };
 
 /**
- * Task state machines for multi-turn intents
+ * Task state machines for multi-turn intents, as ORDERED state-name arrays — the legacy shape the
+ * keyword shadow-detector + the terminal-last check consume. DERIVED from the authoritative
+ * DEFAULT_TASK_STATE_MACHINES (task-state-machines.ts) so it can never drift from the real graph
+ * (SPEC-CONFIGURABLE-ASSISTANTS 4.5 — retire the hand-maintained shadow). A per-assistant loop uses
+ * the RESOLVED machines (via stateNamesOf(ctx.machines)); this default backs the machine-less paths.
  */
-export const TASK_STATE_MACHINES: Record<string, string[]> = {
-  guided_troubleshooting: [
-    'collecting_symptoms',
-    'diagnosing',
-    'proposing_solutions',
-    'awaiting_result',
-    'resolved',
-    'escalated',
-  ],
-  data_extraction: [
-    'collecting_requirements',
-    'extracting',
-    'validating',
-    'formatting',
-    'completed',
-  ],
-  report_generation: [
-    'collecting_requirements',
-    'drafting_outline',
-    'generating',
-    'completed',
-    // 'revising' is a user-requested rework branch (see task-state-machines.ts), not part of the
-    // linear deliver-on-generation happy path; the authoritative graph governs it.
-    'revising',
-  ],
-  // Place-an-item task. place_item gathers WHERE a new item
-  // goes (position + what it involves) then proposes a placed add_item. The advance is driven by the
-  // PROPOSAL itself (robust), not prose keywords: `collecting` → `confirming` when the assistant emits
-  // the add_item proposal; → `placed` once the user confirms it (the host apply; deferred to a later
-  // phase — for now the task rests in `confirming`/TTL until cascade or a nudge closes it).
-  place_item: [
-    'collecting',
-    'confirming',
-    'placed',
-  ],
-  // Action item. A real-world action handed to a plan
-  // participant: gather what/when/who → present options + concrete steps/deep-link → the user
-  // completes it off-platform → mark done. Carries a dueBy (due-by) + an assignee (who's
-  // responsible); on a shared plan the assistant asks who, else it's the requester.
-  action_item: [
-    'gathering',
-    'options_presented',
-    'awaiting_completion',
-    'completed',
-  ],
-};
+export const TASK_STATE_MACHINES: Record<string, string[]> = stateNamesOf(DEFAULT_TASK_STATE_MACHINES);
 
 /**
  * Should a task turn mark the LIFECYCLE status 'completed'? Keeps the lifecycle status in step with the
@@ -138,11 +128,86 @@ export function shouldMarkTaskCompleted(
   return !!(machineState && machine.states?.[machineState]?.terminal);
 }
 
+/**
+ * Who owns a task: the actor that must act on it NEXT (ADR-024 D1). One at a time, human or
+ * assistant, reassignable at a step boundary.
+ *
+ * `id` is the **app-instance principal's unique id** - an `AppInstanceUserId` for a person (a raw
+ * pool sub, or a `fed_` hash for a federated user), an `AppInstanceBotId` for an assistant. Never an
+ * ARN: the ARN is rebuilt from the type when a Chime call needs one.
+ *
+ * `type` is stored rather than inferred, and that follows from the id rather than qualifying it: the
+ * unique id **cannot be turned back into an ARN** without knowing whether the path segment is
+ * `/user/` or `/bot/`, so the information is not in the id at all.
+ */
+export type OwnerType = 'user' | 'assistant';
+
+export interface TaskOwner {
+  id: string;
+  type: OwnerType;
+}
+
+/** The unique id of an app-instance principal, from its ARN. `.../user/<id>` and `.../bot/<id>`. */
+export function principalIdFromArn(arn: string | undefined): string {
+  return arn?.split('/').pop() || '';
+}
+
+/**
+ * The owner in force, for a row that may predate the migration. New rows carry `ownerId`/`ownerType`
+ * and this returns them directly; a legacy row is resolved from whichever ownership-shaped field it
+ * happens to carry, in the order the old code preferred them, so a task written before the migration
+ * stays resumable by the same actor it was resumable by before.
+ */
+export function resolveTaskOwner(
+  task: Partial<Pick<Task, 'ownerId' | 'ownerType' | 'assignedBotArn' | 'assigneeUserSub' | 'userArn'>>,
+): TaskOwner | null {
+  if (task.ownerId && task.ownerType) return { id: task.ownerId, type: task.ownerType };
+  if (task.assignedBotArn) return { id: principalIdFromArn(task.assignedBotArn), type: 'assistant' };
+  if (task.assigneeUserSub) return { id: task.assigneeUserSub, type: 'user' };
+  const fromRequester = task.userArn?.split('/user/').pop() || '';
+  return fromRequester ? { id: fromRequester, type: 'user' } : null;
+}
+
+/**
+ * THE SINGLE OWNERSHIP WRITER (ADR-024). Every path that sets an owner goes through this, because
+ * "owned by one at a time" is only enforceable where there is one place to enforce it: the two
+ * fields are written together or not at all, so a row can never carry a type without an id or claim
+ * two owners.
+ *
+ * Returns the fields to merge into a Task item; it does not write, so it composes with both the
+ * create paths and the reassignment path.
+ */
+export function setTaskOwner(owner: TaskOwner): Pick<Task, 'ownerId' | 'ownerType'> {
+  if (!owner.id) throw new Error('[setTaskOwner] an owner needs an id');
+  if (owner.type !== 'user' && owner.type !== 'assistant') {
+    throw new Error(`[setTaskOwner] unknown owner type: ${String(owner.type)}`);
+  }
+  return { ownerId: owner.id, ownerType: owner.type };
+}
+
+/**
+ * How much of the message that opened a task the task keeps (ADR-024 D5). A task stores what the
+ * task requires, and the ONE consumer of this text is `buildTaskContextForPrompt`, which truncates
+ * to exactly this. At this length the prompt it builds is byte-identical to the one the full
+ * transcript produced, so bounding the copy is a reduction with nothing traded against it.
+ *
+ * Defined beside its reader deliberately: split the two and the stored excerpt silently stops
+ * matching what is read.
+ */
+export const TASK_EXCERPT_MAX_CHARS = 200;
+
 export interface Task {
   taskId: string;
   channelArn: string;
   userArn: string;
-  userMessage: string;
+  /**
+   * A BOUNDED EXCERPT of the request that opened the task (ADR-024 D5), not the transcript. To read
+   * the message itself, resolve `userMessageId` against the channel - which also gets its redacted
+   * state rather than a copy that outlived the redaction.
+   */
+  requestExcerpt?: string;
+  /** @deprecated the unbounded copy. Superseded by `requestExcerpt`; still read for older rows. */
+  userMessage?: string;
   status: TaskStatus;
   deliveryOption: DeliveryOption;
   taskType?: string;
@@ -156,6 +221,22 @@ export interface Task {
    * force-advances, this is only a dashboard signal that the model is failing to drive the task.
    */
   turnsInState?: number;
+  /**
+   * The turn's correlation key - what ties this task to the rest of its turn's records. Always
+   * present; derived when the caller cannot declare one.
+   */
+  correlationId?: string;
+  /**
+   * The RESOLVABLE Chime message id of the USER's message that opened this task, or ABSENT (ADR-024
+   * D5). Never the correlation id as a fallback, and never the assistant's placeholder: that
+   * substitution is what made the old `messageId` field misleading.
+   *
+   * Absent on the ordinary Lex path today, because Chime sends the fulfilment exactly three request
+   * attributes and the message id is not among them; the bypass paths declare the inbound id they
+   * already hold.
+   */
+  userMessageId?: string;
+  /** @deprecated held a CORRELATION id on the path that creates most tasks. Use `correlationId`. */
   messageId?: string;
   details?: Record<string, unknown>; // State-specific data collected during the task
   createdAt: string;
@@ -164,27 +245,55 @@ export interface Task {
   error?: string;
   ttl: number;
   /**
-   * Phase-2 `/battle` TASK_*: the assistant this task is assigned to.
-   * In a battle each bot runs its OWN task chain for the same user
-   * prompt, so a task is owned by a bot, not just the user. Set only
-   * for battle tasks (createBattleTask); undefined for normal tasks.
-   * Battle tasks are looked up by taskId per-bot — NOT via the
-   * userSub-taskType active-lookup GSI (two bots + one user + one
-   * taskType would collide there) — so no GSI change is needed.
+   * DESCRIPTIVE ONLY: which duel this task's turn belonged to (ADR-026).
+   *
+   * A battle is not a task; a battle TURN may open one because its intent was task-shaped, and that
+   * task then proceeds like any other. Set via `TaskCreateOptions.battleId` on the one creation path -
+   * there is no separate battle constructor any more, and the second door is what made a resumed side
+   * restart its chain.
+   *
+   * NEVER read to make a decision. What keeps two sides' tasks apart is the OWNER being that side
+   * (ADR-024 D1/D2), so the lookup is "the active task owned by this actor in this channel" and works
+   * identically for a duelling assistant and a person holding a work item. Whether this field should
+   * exist at all is the live question ADR-024 raised; it is kept because analytics joins a duel's tasks
+   * by it.
    */
   battleId?: string;
+  /**
+   * THE OWNER (ADR-024 D1) - the actor that must act on this task next, human or assistant, one at a
+   * time. Written only via `setTaskOwner`, always as a pair. Absent on rows written before the
+   * migration; use `resolveTaskOwner` rather than reading these directly.
+   */
+  ownerId?: string;
+  ownerType?: OwnerType;
+  /**
+   * THE ASSISTANT THIS CHAIN BELONGS TO, as a principal id. Written once at creation and never moved.
+   *
+   * Distinct from `ownerId`, and both are needed (owner, 2026-08-14). The OWNER is whoever must act
+   * next and legitimately changes hands every time the machine crosses an `awaitsUser` boundary; the
+   * ASSISTANT is which assistant's work this is, and never changes. Collapsing them is what forced the
+   * choice between two broken things: keep the assistant as owner and a task blocked on a person is
+   * invisible in that person's queue, or hand it to the person and two duel sides' chains land in one
+   * partition with nothing to tell them apart (ADR-024 D2 separated them by owner alone).
+   *
+   * With both, a duel side resolves its own chain precisely - "the task in this channel whose
+   * assistant is me" - while the person holds the step and sees it in their queue.
+   */
+  assistantId?: string;
+  /** @deprecated superseded by `ownerId`/`ownerType`. Read through `resolveTaskOwner`. */
   assignedBotArn?: string;
   // Work-item tasks: a task is anchored to a context (plan) + (optionally) a
   // work item, and assigned to a participant. itemId is the cascade key (drop the item ⇒
   // cancel its tasks); dueBy drives reminders. All optional — enterprise tasks leave them unset.
   contextId?: string;
   itemId?: string; // the work item id this task serves; null for plan-level tasks
-  // The assignee's `fed_` Chime/AppInstanceUser id (the user-tasks partition key) — NOT a raw
-  // host-pool sub, and not reversible (deriveFederatedSub is a one-way hash). To email an assignee
-  // across MULTIPLE IDPs, the notifier reverse-matches this id against the channel roster
-  // ({sub, iss}) via deriveFederatedSub to recover the resolvable (sub, iss). The roster is the
-  // single IDP pointer; we deliberately do NOT copy iss onto the task (avoids drift). See
-  // SPEC-NOTIFICATION-BRIDGE "Identity resolution across multiple IDPs".
+  // @deprecated superseded by `ownerId`/`ownerType`. Read through `resolveTaskOwner`.
+  // The assignee's Chime/AppInstanceUser id — a raw pool sub for a native user, a `fed_` hash for a
+  // federated one, and not reversible (deriveFederatedSub is one-way). To email an assignee across
+  // MULTIPLE IDPs, the notifier reverse-matches this id against the channel roster ({sub, iss}) via
+  // deriveFederatedSub to recover the resolvable (sub, iss). The roster is the single IDP pointer; we
+  // deliberately do NOT copy iss onto the task (avoids drift). See SPEC-NOTIFICATION-BRIDGE
+  // "Identity resolution across multiple IDPs".
   assigneeUserSub?: string;
   dueBy?: string; // ISO date/datetime the action is due
   // Last time a due-date reminder fired for this task (ISO). The scheduled reminder uses it to avoid
@@ -192,8 +301,21 @@ export interface Task {
   lastRemindedAt?: string;
 }
 
+/**
+ * The active-task mirror row. **`userSub` is the OWNER's principal id** (ADR-024 D2), not
+ * necessarily a user and not necessarily the requester: an assistant-owned task sits in a partition
+ * keyed by its `AppInstanceBotId`.
+ *
+ * THE NAME IS WRONG AND CANNOT BE FIXED IN PLACE - DynamoDB cannot rename a key attribute, and this
+ * one is the table's partition key. The alternative was a new table plus a backfill of live rows
+ * against a 200-day plan TTL; the accepted trade is recorded in ADR-024 D2, which also keeps a
+ * correctly named table as the end state. Read `ownerType` to know what kind of actor the id names.
+ */
 export interface UserTask {
   userSub: string;
+  ownerType?: OwnerType;
+  /** Mirror of `Task.assistantId` - whose work this is, as opposed to who owes the next step. */
+  assistantId?: string;
   taskId: string;
   taskType: string;
   channelArn: string;
@@ -232,11 +354,39 @@ export const TRIP_TASK_TTL_SECONDS = 200 * 24 * 60 * 60;
 export interface TaskCreateOptions {
   contextId?: string;
   itemId?: string;
-  assigneeUserSub?: string;
+  /** Who must act on this next. Defaults to the requester, as a `user` owner. */
+  owner?: TaskOwner;
+  /**
+   * WHOSE WORK THIS IS - the assistant the chain belongs to, as a principal id. Fixed for the task's
+   * life, unlike `owner`, which changes hands at every `awaitsUser` boundary. Defaults to the owner
+   * when the caller named an assistant one.
+   */
+  assistantId?: string;
+  /** The user message that opened this, when the caller holds a resolvable id (ADR-024 D5). */
+  userMessageId?: string;
   dueBy?: string;
   /** Row TTL in seconds from now. Defaults to DEFAULT_TASK_TTL_SECONDS (24h); plan tasks pass
    *  TRIP_TASK_TTL_SECONDS (or end + buffer) so they don't expire before the work happens. */
   ttlSeconds?: number;
+  /**
+   * Which duel this turn belonged to, when a battle turn's intent opened a task (ADR-026).
+   *
+   * The task itself is ORDINARY - a battle is not a task, the intent was. This is descriptive only and
+   * is never read to make a decision: the per-side collision is prevented by the OWNER being that side
+   * (ADR-024 D1/D2), not by this field. Whether it should exist at all is the live question ADR-024
+   * raised; it is kept for now because analytics joins a duel's tasks by it.
+   */
+  battleId?: string;
+  /**
+   * The user's message in DECODED form, for the stored excerpt.
+   *
+   * Amazon Chime SDK delivers a transcript percent-encoded, and a bypass entry re-encodes it to keep the
+   * round trip lossless - so `event.inputTranscript` is encoded and reading it directly stores
+   * `Produce%20a%20report` as the excerpt a human later reads in the admin console. The caller has
+   * already decoded it for the turn, so it passes the decoded text rather than this function guessing at
+   * an encoding. Falls back to the transcript when absent, which is correct for the Lex path.
+   */
+  requestExcerpt?: string;
 }
 
 /**
@@ -246,7 +396,7 @@ export async function createTask(
   event: LexEventForTask,
   deliveryOption: DeliveryOption,
   taskType?: string,
-  messageId?: string,
+  correlationId?: string,
   opts?: TaskCreateOptions
 ): Promise<Task> {
   const taskId = generateTaskId();
@@ -271,25 +421,54 @@ export async function createTask(
   const anchor = {
     ...(opts?.contextId ? { contextId: opts.contextId } : {}),
     ...(opts?.itemId ? { itemId: opts.itemId } : {}),
-    ...(opts?.assigneeUserSub ? { assigneeUserSub: opts.assigneeUserSub } : {}),
     ...(opts?.dueBy ? { dueBy: opts.dueBy } : {}),
   };
+
+  // THE OWNER IS WHOEVER OWES THE CURRENT STEP (ADR-024 D1, owner 2026-08-14), and that is decided by the state
+  // the task STARTS in, not only by transitions later. `maybeHandOver` moves ownership when the machine
+  // CROSSES an `awaitsUser` boundary, which is right for every transition and silent about the start:
+  // a machine whose INITIAL state awaits the user was born blocked on them and nothing crossed
+  // anything, so the task stayed with its creator. Every `report_generation`, `data_extraction` and
+  // `guided_troubleshooting` chain starts that way - which is why a duel waiting on someone appeared
+  // in nobody's queue, and why "what do I owe" could not see it.
+  //
+  // A caller-supplied owner is honoured only when the first step is NOT the person's. The ASSISTANT
+  // the chain belongs to is recorded separately (`assistantId`), so handing the step to the person
+  // costs nothing in traceability: two duel sides stay distinguishable by assistant, not by owner.
+  const requesterSub = userArn.split('/user/').pop() || '';
+  const startsBlockedOnAPerson = Boolean(
+    taskType && initialState
+    && DEFAULT_TASK_STATE_MACHINES[taskType]?.states?.[initialState]?.awaitsUser === true,
+  );
+  const owner: TaskOwner | null =
+    (startsBlockedOnAPerson && requesterSub)
+      ? { id: requesterSub, type: 'user' as const }
+      : (opts?.owner ?? (requesterSub ? { id: requesterSub, type: 'user' as const } : null));
+
+  // Whose work it is. Explicit when the caller names an assistant owner (a duel side does), otherwise
+  // the assistant running this turn if the caller supplied one. Never moves afterwards.
+  const assistantId = opts?.assistantId
+    ?? (opts?.owner?.type === 'assistant' ? opts.owner.id : undefined);
 
   const task: Task = {
     taskId,
     channelArn,
     userArn,
-    userMessage: event.inputTranscript || '',
+    requestExcerpt: (opts?.requestExcerpt ?? event.inputTranscript ?? '').slice(0, TASK_EXCERPT_MAX_CHARS),
     status: 'pending',
     deliveryOption,
     taskType,
     taskState: initialState,
-    messageId,
+    ...(correlationId ? { correlationId } : {}),
+    ...(opts?.userMessageId ? { userMessageId: opts.userMessageId } : {}),
+    ...(opts?.battleId ? { battleId: opts.battleId } : {}),
+    ...(assistantId ? { assistantId } : {}),
     details: {},
     createdAt: now,
     updatedAt: now,
     ttl,
     ...anchor,
+    ...(owner ? setTaskOwner(owner) : {}),
   };
 
   if (TASKS_TABLE) {
@@ -304,100 +483,48 @@ export async function createTask(
     }
   }
 
-  // Also write to UserTasksTable for active task lookup
-  if (USER_TASKS_TABLE && userArn) {
-    const userSub = userArn.split('/user/').pop() || '';
-    if (userSub) {
-      try {
-        const userTask: UserTask = {
-          userSub,
-          taskId,
-          taskType: taskType || 'general',
-          channelArn,
-          status: 'pending',
-          taskState: initialState,
-          details: {},
-          createdAt: now,
-          updatedAt: now,
-          ttl,
-          ...anchor,
-        };
-        await dynamoClient.send(new PutCommand({
-          TableName: USER_TASKS_TABLE,
-          Item: userTask,
-        }));
-      } catch (error) {
-        console.error('Error creating user task:', error);
-      }
-    }
+  // The active-task mirror, partitioned by the OWNER (ADR-024 D2). It used to be partitioned by the
+  // REQUESTER here while every other writer keyed on the assignee, so the moment those differed the
+  // row a status update touched was not the row this one wrote.
+  if (USER_TASKS_TABLE && owner) {
+    await putMirrorRow(task);
   }
 
   return task;
 }
 
 /**
- * Phase-2 `/battle` TASK_*: create a task OWNED BY A SPECIFIC ASSISTANT.
- *
- * In a battle, each bot independently runs its own task chain for the
- * same user prompt, so we create one Task per bot, assigned to that
- * bot (assignedBotArn) and tagged with the battleId. Each gets its own
- * taskId; the per-bot battle state row carries that taskId so the
- * round-2 orchestrator can wait on "each bot's task chain reached a
- * terminal state".
- *
- * Deliberately does NOT write the UserTasksTable single-active-per-
- * (userSub,taskType) row: two bots + one user + one taskType would
- * collide on that GSI and getActiveTask would return only one. Battle
- * tasks are addressed by taskId per-bot instead — which is why this
- * needs no GSI migration (per the owner decision).
+ * Write the mirror row for a task, under its owner. The single place the mirror is created, so the
+ * partition it lands in can only ever be the one `resolveTaskOwner` reads back.
  */
-export async function createBattleTask(args: {
-  channelArn: string;
-  userArn: string;
-  assignedBotArn: string;
-  battleId: string;
-  userMessage: string;
-  taskType: string;
-  deliveryOption: DeliveryOption;
-  messageId?: string;
-}): Promise<Task> {
-  const taskId = generateTaskId();
-  const now = new Date().toISOString();
-  const initialState = TASK_STATE_MACHINES[args.taskType]
-    ? TASK_STATE_MACHINES[args.taskType][0]
-    : undefined;
-
-  const task: Task = {
-    taskId,
-    channelArn: args.channelArn,
-    userArn: args.userArn,
-    userMessage: args.userMessage,
-    status: 'pending',
-    deliveryOption: args.deliveryOption,
-    taskType: args.taskType,
-    taskState: initialState,
-    messageId: args.messageId,
-    details: {},
-    createdAt: now,
-    updatedAt: now,
-    ttl: Math.floor(Date.now() / 1000) + 24 * 60 * 60,
-    battleId: args.battleId,
-    assignedBotArn: args.assignedBotArn,
-  };
-
-  if (TASKS_TABLE) {
-    try {
-      await dynamoClient.send(new PutCommand({ TableName: TASKS_TABLE, Item: task }));
-      console.log(
-        `[battle-task] Created ${taskId} for bot ${args.assignedBotArn} ` +
-          `(battle ${args.battleId}, type ${args.taskType}, state ${initialState || 'none'})`,
-      );
-    } catch (error) {
-      console.error('[battle-task] Error creating battle task:', error);
-    }
+async function putMirrorRow(task: Task): Promise<void> {
+  const owner = resolveTaskOwner(task);
+  if (!USER_TASKS_TABLE || !owner) return;
+  try {
+    const userTask: UserTask = {
+      userSub: owner.id,
+      ownerType: owner.type,
+      taskId: task.taskId,
+      taskType: task.taskType || 'general',
+      channelArn: task.channelArn,
+      status: task.status,
+      taskState: task.taskState,
+      details: task.details ?? {},
+      createdAt: task.createdAt,
+      updatedAt: task.updatedAt,
+      ttl: task.ttl,
+      // Carried onto the mirror so a chain can be found by ITS ASSISTANT from whichever partition the
+      // owner currently puts it in. Without it here, an assistant looking for its own work in a
+      // person's partition would have to read the full task row for every candidate.
+      ...(task.assistantId ? { assistantId: task.assistantId } : {}),
+      ...(task.contextId ? { contextId: task.contextId } : {}),
+      ...(task.itemId ? { itemId: task.itemId } : {}),
+      ...(task.dueBy ? { dueBy: task.dueBy } : {}),
+    };
+    await dynamoClient.send(new PutCommand({ TableName: USER_TASKS_TABLE, Item: userTask }));
+  } catch (error) {
+    console.error('Error writing user-task mirror:', error);
   }
-  // Intentionally NOT written to USER_TASKS_TABLE — see the doc above.
-  return task;
 }
 
 /**
@@ -500,6 +627,214 @@ async function queryActiveTask(
 }
 
 /**
+ * THE OWNER LOOKUP (ADR-024): the active task owned by this actor in this conversation.
+ *
+ * The same question for a duelling assistant and for a person holding a work item, so it is one
+ * query with the owner as its only subject - which is what lets the battle state row stop carrying a
+ * `taskId` to answer a battle question with task state.
+ *
+ * A base-table query on the owner partition, filtered to this channel and to ACTIVE statuses, newest
+ * first. Strongly consistent by default: this is the same read that stops a rapid follow-up turn
+ * starting a second expensive task, and the eventually-consistent GSI cannot serve that (D2). Returns
+ * the mirror row; the caller reads the full task from the source of truth when it needs fields the
+ * index does not carry.
+ */
+/**
+ * THE CHAIN IN THIS CHANNEL THAT BELONGS TO THIS ASSISTANT AND IS HELD BY THIS PERSON.
+ *
+ * The precise form of "what is this message the answer to". Both halves are load-bearing: the OWNER
+ * partition is where a task blocked on a person lives, and `assistantId` is what tells two duel sides'
+ * chains apart inside it - they await the same person, so the partition alone names two rows and
+ * picking the newest would hand a side its rival's work.
+ *
+ * Returns the task ID, which is what callers should carry from here on. "The active task" as an
+ * implicit notion is exactly what let a resumed turn operate on whichever row a second lookup happened
+ * to return (owner, 2026-08-14).
+ */
+export async function getActiveTaskForAssistant(
+  assistantId: string,
+  ownerId: string,
+  channelArn: string,
+): Promise<UserTask | null> {
+  if (!assistantId) return null;
+  const held = await getActiveTasksForOwnerInChannel(ownerId, channelArn);
+  return held.find((t) => t.assistantId === assistantId) ?? null;
+}
+
+/** Every active task this owner holds in this channel, newest first. */
+export async function getActiveTasksForOwnerInChannel(
+  ownerId: string,
+  channelArn: string,
+): Promise<UserTask[]> {
+  if (!USER_TASKS_TABLE || !ownerId || !channelArn) return [];
+  try {
+    // PAGINATED, WITH NO Limit - and the review that removed the Limit is worth remembering. The
+    // status/channel FilterExpression runs AFTER the read, and the sort key is a random UUID, so
+    // `Limit: 25` read 25 ARBITRARY rows and filtered them: once an owner's partition passed 25
+    // accumulated rows (they persist to TTL, up to 200 days), the live active task could sit in the
+    // unread remainder and this returned null - the chain never resumed, a duel side re-created its
+    // task each turn, all silently, and directly under a comment saying a Limit would drop matches.
+    // The partition is bounded by TTL, so the full read is bounded too; correctness over a cap.
+    const rows: UserTask[] = [];
+    let lastKey: Record<string, unknown> | undefined;
+    do {
+      const result = await dynamoClient.send(new QueryCommand({
+        TableName: USER_TASKS_TABLE,
+        ConsistentRead: true,
+        KeyConditionExpression: 'userSub = :owner',
+        FilterExpression: 'channelArn = :ch AND #status IN (:pending, :inProgress)',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':owner': ownerId,
+          ':ch': channelArn,
+          ':pending': 'pending',
+          ':inProgress': 'in_progress',
+        },
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }));
+      rows.push(...(((result.Items as UserTask[] | undefined) ?? [])));
+      lastKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (lastKey);
+    return rows.sort((a, b) =>
+      String(b.updatedAt ?? b.createdAt).localeCompare(String(a.updatedAt ?? a.createdAt)));
+  } catch (error) {
+    console.error('[getActiveTasksForOwnerInChannel] query failed:', error);
+    return [];
+  }
+}
+
+/**
+ * The newest active task this owner holds in this channel. DELEGATES to the plural lookup - the two
+ * used to carry byte-identical hand-maintained queries, which is how the Limit-drops-matches defect
+ * above could have been fixed in one and kept in the other. One query, one fix surface.
+ */
+export async function getActiveTaskForOwner(
+  ownerId: string,
+  channelArn: string,
+): Promise<UserTask | null> {
+  return (await getActiveTasksForOwnerInChannel(ownerId, channelArn))[0] ?? null;
+}
+
+/**
+ * What a conversation member may see of a task (ADR-024 D4): the RECORD, not the text behind it.
+ *
+ * `userMessage` and `details` are deliberately absent. A task keeps a copy of the message that
+ * started it, and nothing in the task path participates in redaction, so widening the read to every
+ * member would surface text from a message the user watched disappear. Exposing the record instead
+ * of the content is what makes a redaction cascade unnecessary rather than merely deferred - and it
+ * is also what the assistant needs to say what is open here.
+ */
+export interface ConversationTask {
+  taskId: string;
+  channelArn: string;
+  taskType?: string;
+  taskState?: string;
+  status: TaskStatus;
+  ownerId?: string;
+  ownerType?: OwnerType;
+  dueBy?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * THE CONVERSATION READ (ADR-024 D4): the open work in this conversation, whoever owns it.
+ *
+ * Visibility is scoped by conversation membership rather than by ownership - ownership decides who
+ * must act next, never who can see - so this deliberately does not take an owner. Membership itself
+ * is enforced by the caller's channel context, live and never from a stored roster copy.
+ *
+ * Newest first, bounded. Returns records with no message text; see ConversationTask.
+ */
+export async function getOpenTasksForConversation(
+  channelArn: string,
+  opts: { limit?: number } = {},
+): Promise<ConversationTask[]> {
+  if (!TASKS_TABLE || !channelArn) return [];
+  const limit = Math.min(Math.max(opts.limit ?? 10, 1), 25);
+  try {
+    const result = await dynamoClient.send(new QueryCommand({
+      TableName: TASKS_TABLE,
+      IndexName: 'channelArn-updatedAt-index',
+      KeyConditionExpression: 'channelArn = :ch',
+      FilterExpression: '#status IN (:pending, :inProgress)',
+      ExpressionAttributeNames: { '#status': 'status' },
+      ExpressionAttributeValues: {
+        ':ch': channelArn,
+        ':pending': 'pending',
+        ':inProgress': 'in_progress',
+      },
+      ScanIndexForward: false, // newest first, by the index's sort key
+      Limit: limit * 4, // the status filter runs post-read; over-fetch rather than under-return
+    }));
+    const rows = (result.Items as Task[] | undefined) ?? [];
+    return rows.slice(0, limit).map((t) => {
+      const owner = resolveTaskOwner(t);
+      // Built field by field, NOT by deleting from the row: a spread-then-delete would leak every
+      // future field by default, and the one thing this read must never carry is message content.
+      return {
+        taskId: t.taskId,
+        channelArn: t.channelArn,
+        status: t.status,
+        ...(t.taskType ? { taskType: t.taskType } : {}),
+        ...(t.taskState ? { taskState: t.taskState } : {}),
+        ...(owner ? { ownerId: owner.id, ownerType: owner.type } : {}),
+        ...(t.dueBy ? { dueBy: t.dueBy } : {}),
+        createdAt: t.createdAt,
+        updatedAt: t.updatedAt,
+      };
+    });
+  } catch (error) {
+    console.error('[getOpenTasksForConversation] query failed:', error);
+    return [];
+  }
+}
+
+/**
+ * The prompt fragment for "what is open in this conversation" (ADR-024 D4).
+ *
+ * A SUMMARY, never content. It says what kind of work is open and who has to move it, so the
+ * assistant can answer the question without replaying another member's task text - which it could
+ * not do anyway, since the conversation read carries none.
+ *
+ * Owners are described by their RELATION to the viewer rather than by id. A principal id is opaque
+ * to the model and useless in a sentence, and printing one into a prompt puts an identifier in front
+ * of the model for no gain.
+ *
+ * `excludeTaskId` drops the task this turn is already resuming: that one is described in full by
+ * `buildTaskContextForPrompt`, and listing it twice invites the model to treat it as two.
+ */
+export function buildConversationTasksHint(
+  tasks: ConversationTask[],
+  viewer: { id: string } | null,
+  opts: { excludeTaskId?: string } = {},
+): string {
+  const others = (tasks ?? []).filter((t) => t.taskId !== opts.excludeTaskId);
+  if (others.length === 0) return '';
+
+  const line = (t: ConversationTask): string => {
+    const who = !t.ownerId
+      ? 'unassigned'
+      : t.ownerType === 'assistant'
+        ? 'held by an assistant'
+        : viewer && t.ownerId === viewer.id
+          ? 'held by the person you are talking to'
+          : 'held by another participant';
+    const state = t.taskState ? ` (${t.taskState})` : '';
+    const due = t.dueBy ? `, due ${t.dueBy}` : '';
+    return `- ${t.taskType || 'general'}${state}: ${who}${due}`;
+  };
+
+  return `
+## OPEN WORK IN THIS CONVERSATION
+
+${others.map(line).join('\n')}
+
+Anyone in this conversation may ask about these. Only the holder can move one forward, so if someone asks about work they do not hold, say what its state is rather than continuing it. Do not quote the original request behind a task: you do not have it.
+`;
+}
+
+/**
  * Cross-channel task discovery: return EVERY active task for this user,
  * regardless of channel or task type. Used by the agent handlers to
  * inject a "user has tasks open elsewhere" hint into the system prompt
@@ -595,6 +930,41 @@ Do NOT interrupt the current conversation to handle them. Only acknowledge them 
 /**
  * Update task status
  */
+/**
+ * The lifecycle statuses a task cannot leave, and what each one MEANS as an outcome.
+ *
+ * `abandoned` is deliberately absent: the person dropped out and may still come back, so it stays in
+ * `ACTIVE_TASK_STATUSES` and a nudge can offer to resume it. A task is only ended here when nothing
+ * further is expected of anyone.
+ */
+export const TERMINAL_TASK_STATUS: Partial<Record<TaskStatus, TerminalKind>> = {
+  completed: 'success',
+  failed: 'failure',
+  cancelled: 'handoff',
+};
+
+/**
+ * A TASK MUST SAY WHEN IT ENDED, and this is the writer that ends it.
+ *
+ * THE HOLE THIS CLOSES. `stateHistory` is the append-only record of a task's life, and every graph
+ * transition appended to it - except the last one. A task could be set to `completed` here with no
+ * entry written at all, so the row said it was finished and nothing said WHEN, by whom, or how. The
+ * only timestamp left was `updatedAt`, which every write moves, so it cannot answer "when did this
+ * end" a moment after anything else touches the row.
+ *
+ * WHY THAT MATTERS BEYOND TIDINESS. Task resolution is measured separately from turn latency, on
+ * purpose: a task with `resolve_ms = 4h` and `agent_ms = 22s` is healthy, and only a stamped terminal
+ * instant can say so. Without one, every ended task is a measurement gap - and gaps of this shape do
+ * not error, they just quietly leave the population, which is the failure this file's guards exist to
+ * prevent.
+ *
+ * ONE WRITER, NOT A NEW COLUMN. A `resolvedAt` field would be a second place for the same fact,
+ * free to disagree with the history beside it. The entry appends to `stateHistory` like every other
+ * transition, so a reader that already walks the log gets the ending for free.
+ *
+ * `by: 'system'` because this writer is not the model's `advance_task_state` call: it is the runtime
+ * concluding the task, on a turn's completion or an error path.
+ */
 export async function updateTaskStatus(
   taskId: string,
   channelArn: string,
@@ -629,6 +999,29 @@ export async function updateTaskStatus(
       expressionAttributeValues[':error'] = error;
     }
 
+    // THE ENDING, APPENDED. `list_append` over `if_not_exists` covers a task whose machine never wrote
+    // a transition (a lightweight single-turn task has no graph), so the terminal entry is the whole
+    // history rather than being dropped for want of a list to append to.
+    const terminalKind = TERMINAL_TASK_STATUS[status];
+    if (terminalKind) {
+      const terminalEntry: StateTransition = {
+        at: now,
+        by: 'system',
+        // NOT a graph edge: `from`/`to` name states in a machine, and this records the LIFECYCLE
+        // ending, which a machine-less task also has. Reading it as an edge is the mistake ADR-024 D3
+        // avoided for ownership entries in this same log, and it is avoided the same way here.
+        terminal: terminalKind,
+        reason: error !== undefined ? `task ${status}: ${error}`.slice(0, 300) : `task ${status}`,
+      };
+      // NO SEPARATE `resolvedAt` COLUMN, deliberately. A scalar beside the log would be a second place
+      // for one fact, free to disagree with the entry describing it - and the log already holds
+      // per-transition instants, so the ending is readable from the record that was always the record.
+      updateExpression.push('#stateHistory = list_append(if_not_exists(#stateHistory, :empty), :terminalEntry)');
+      expressionAttributeNames['#stateHistory'] = 'stateHistory';
+      (expressionAttributeValues as Record<string, unknown>)[':terminalEntry'] = [terminalEntry];
+      (expressionAttributeValues as Record<string, unknown>)[':empty'] = [];
+    }
+
     await dynamoClient.send(new UpdateCommand({
       TableName: TASKS_TABLE,
       Key: { taskId, channelArn },
@@ -637,7 +1030,24 @@ export async function updateTaskStatus(
       ExpressionAttributeValues: expressionAttributeValues,
     }));
 
-    console.log(`Task ${taskId} updated to status: ${status}`);
+    console.log(`Task ${taskId} updated to status: ${status}`, terminalKind ? { terminalKind, endedAt: now } : {});
+
+    // AND THE QUEUE HAS TO LEARN IT ENDED. `/tasks/mine` reads the MIRROR, not this row, and nothing
+    // propagated an ending to it: only `pauseTask` and `resumeTask` mirrored, so a task that COMPLETED
+    // kept its mirror row at `in_progress` for the whole of its TTL. Measured on the deployment: one
+    // test user held nine "open" items, finished ones among them.
+    //
+    // That is not a cosmetic queue defect. The composer addresses a person's next message at the
+    // assistant holding their open item (ADR-032), so a queue that never lets go would point a reply
+    // at work that is already done - a wrong answer arriving for a right-looking reason.
+    //
+    // TERMINAL STATUSES ONLY, so this stays off the per-turn path: `in_progress` is written on every
+    // task turn and mirroring it would put a read and a write on each one, to restate what the mirror
+    // already says. An ending happens once.
+    if (terminalKind) {
+      const ended = await getTask(taskId, channelArn);
+      if (ended) await mirrorTaskStatus(ended, status);
+    }
   } catch (updateError) {
     console.error('Error updating task status:', updateError);
   }
@@ -682,7 +1092,7 @@ export async function cancelTasksForStop(contextId: string, itemId?: string): Pr
     for (const id of selectTasksToCancel(tasks, itemId)) {
       const t = byId.get(id)!;
       await updateTaskStatus(id, t.channelArn, 'cancelled');
-      const userSub = t.assigneeUserSub || t.userArn?.split('/user/').pop() || '';
+      const userSub = resolveTaskOwner(t)?.id || '';
       if (USER_TASKS_TABLE && userSub) {
         try {
           await dynamoClient.send(new UpdateCommand({
@@ -711,15 +1121,34 @@ export async function cancelTasksForStop(contextId: string, itemId?: string): Pr
  */
 async function mirrorTaskStatus(task: Task, status: TaskStatus): Promise<void> {
   if (!USER_TASKS_TABLE) return;
-  const userSub = task.assigneeUserSub || task.userArn?.split('/user/').pop() || '';
-  if (!userSub) return;
+  const owner = resolveTaskOwner(task);
+  if (!owner) return;
   try {
+    // An UPSERT, so it must write a WHOLE row. It used to set only `status` and `updatedAt`: when the
+    // key it computed differed from the one `createTask` had written under - which it did, one keying
+    // on the assignee and the other on the requester - this created a second row carrying nothing
+    // else. No `ttl`, so it never expired; no `taskType`, so it was invisible to the lookup GSI; no
+    // `channelArn`, so the channel-scoped filter dropped it. One owner removes the divergence, and
+    // `if_not_exists` removes the partial row even if a mirror write was ever lost.
     await dynamoClient.send(new UpdateCommand({
       TableName: USER_TASKS_TABLE,
-      Key: { userSub, taskId: task.taskId },
-      UpdateExpression: 'SET #s = :s, updatedAt = :now',
-      ExpressionAttributeNames: { '#s': 'status' },
-      ExpressionAttributeValues: { ':s': status, ':now': new Date().toISOString() },
+      Key: { userSub: owner.id, taskId: task.taskId },
+      UpdateExpression:
+        'SET #s = :s, updatedAt = :now, ownerType = :ot'
+        + ', taskType = if_not_exists(taskType, :tt)'
+        + ', channelArn = if_not_exists(channelArn, :ch)'
+        + ', createdAt = if_not_exists(createdAt, :created)'
+        + ', #ttl = if_not_exists(#ttl, :ttl)',
+      ExpressionAttributeNames: { '#s': 'status', '#ttl': 'ttl' },
+      ExpressionAttributeValues: {
+        ':s': status,
+        ':now': new Date().toISOString(),
+        ':ot': owner.type,
+        ':tt': task.taskType || 'general',
+        ':ch': task.channelArn,
+        ':created': task.createdAt,
+        ':ttl': task.ttl,
+      },
     }));
   } catch (e) {
     console.warn('[mirrorTaskStatus] user-task mirror update failed:', e);
@@ -760,56 +1189,73 @@ export async function resumeTask(taskId: string, channelArn: string): Promise<Ta
 }
 
 /**
- * Re-stamp a task's assignee (reassignment). Updates the
- * `agent-tasks` row in place, and MOVES the `user-tasks` mirror: that table is partitioned by
- * `userSub`, so a reassignment is a delete-old + put-new (a plain update can't move a partition key).
- * Best-effort; the agent-tasks row is the source of truth, the mirror is a convenience index.
- * `assigneeUserSub` is the new assignee's Chime/AppInstanceUser id (see Task.assigneeUserSub).
+ * REASSIGN — hand a task to a different owner, human or assistant (ADR-024 D1/D3).
+ *
+ * WIRED, as of the `awaitsUser` boundary: `maybeHandOver` below calls this when a task's state starts
+ * or stops being blocked on a person, which is the "work-item flow" this was left waiting for. It
+ * shipped unwired on purpose from 2026-08-09 (documented and covered, unlike `updateTaskAssignee`,
+ * which it replaced and which was uncalled by ACCIDENT), so nobody had to guess whether reassignment
+ * worked or had simply never run.
+ *
+ * One thing the earlier note flagged is still true and still accepted: the hand-off is SILENT. Nothing
+ * tells the person in the conversation that an item is now theirs; they find it in the queue.
+ *
+ * Updates the `agent-tasks` row through `setTaskOwner`, appends the change to the task log, and MOVES
+ * the mirror: that table is partitioned by the owner, so a reassignment is a delete-old + put-new (a
+ * plain update cannot move a partition key). The old row is deleted LAST, so a failure mid-way leaves
+ * the task findable under both owners rather than under neither.
+ *
+ * The one-owner invariant holds by construction: there is one field pair and one writer, so handing a
+ * task over cannot leave the previous owner also holding it.
  */
-export async function updateTaskAssignee(
+export async function reassignTask(
   taskId: string,
   channelArn: string,
-  assigneeUserSub: string,
+  owner: TaskOwner,
 ): Promise<void> {
-  if (!TASKS_TABLE || !assigneeUserSub) return;
+  if (!TASKS_TABLE || !owner?.id) return;
   const now = new Date().toISOString();
   let prev: Task | null = null;
+  const fields = setTaskOwner(owner);
   try {
     prev = await getTask(taskId, channelArn);
+    if (!prev) return;
+    const from = resolveTaskOwner(prev);
+    if (from && from.id === owner.id && from.type === owner.type) return; // already there
+    // The ownership change is an entry in the SAME log as state transitions (D3), carrying
+    // ownerFrom/ownerTo and NO from/to: a reassignment is not a graph edge, and a consumer that reads
+    // `from` must get nothing rather than a principal id in a field every other reader treats as a
+    // state name. It touches neither `taskState` nor `turnsInState` — counting it as a transition
+    // would clear the stall signal on a task that was handed over but never progressed.
+    const entry: StateTransition = {
+      ...(from ? { ownerFrom: `${from.type}:${from.id}` } : {}),
+      ownerTo: `${owner.type}:${owner.id}`,
+      at: now,
+      by: 'system',
+    };
     await dynamoClient.send(new UpdateCommand({
       TableName: TASKS_TABLE,
       Key: { taskId, channelArn },
-      UpdateExpression: 'SET assigneeUserSub = :a, updatedAt = :now',
-      ExpressionAttributeValues: { ':a': assigneeUserSub, ':now': now },
-    }));
-  } catch (err) {
-    console.error('[updateTaskAssignee] agent-tasks update failed:', err);
-    return;
-  }
-  if (!USER_TASKS_TABLE || !prev) return;
-  const oldSub = prev.assigneeUserSub || prev.userArn?.split('/user/').pop() || '';
-  if (oldSub === assigneeUserSub) return; // no move needed
-  try {
-    // Re-mirror under the new owner (carry the anchor + status so getActiveTasksForUser stays correct).
-    await dynamoClient.send(new PutCommand({
-      TableName: USER_TASKS_TABLE,
-      Item: {
-        userSub: assigneeUserSub,
-        taskId,
-        taskType: prev.taskType,
-        channelArn,
-        status: prev.status,
-        ...(prev.taskState ? { taskState: prev.taskState } : {}),
-        ...(prev.details ? { details: prev.details } : {}),
-        createdAt: prev.createdAt,
-        updatedAt: now,
-        ttl: prev.ttl,
-        ...(prev.contextId ? { contextId: prev.contextId } : {}),
-        ...(prev.itemId ? { itemId: prev.itemId } : {}),
-        assigneeUserSub,
-        ...(prev.dueBy ? { dueBy: prev.dueBy } : {}),
+      UpdateExpression:
+        'SET ownerId = :oid, ownerType = :otype, updatedAt = :now'
+        + ', stateHistory = list_append(if_not_exists(stateHistory, :empty), :entry)',
+      ExpressionAttributeValues: {
+        ':oid': fields.ownerId,
+        ':otype': fields.ownerType,
+        ':now': now,
+        ':empty': [] as StateTransition[],
+        ':entry': [entry],
       },
     }));
+  } catch (err) {
+    console.error('[reassignTask] agent-tasks update failed:', err);
+    return;
+  }
+  if (!USER_TASKS_TABLE) return;
+  const oldSub = resolveTaskOwner(prev)?.id || '';
+  if (oldSub === owner.id) return; // same partition; nothing to move
+  try {
+    await putMirrorRow({ ...prev, ...fields, updatedAt: now });
     if (oldSub) {
       await dynamoClient.send(new DeleteCommand({
         TableName: USER_TASKS_TABLE,
@@ -817,7 +1263,7 @@ export async function updateTaskAssignee(
       }));
     }
   } catch (err) {
-    console.warn('[updateTaskAssignee] user-tasks mirror move failed (non-fatal):', err);
+    console.warn('[reassignTask] user-tasks mirror move failed (non-fatal):', err);
   }
 }
 
@@ -937,6 +1383,16 @@ export async function advanceTaskStateTo(args: {
   messageId?: string;
   details?: Record<string, unknown>;
   machines?: Record<string, TaskStateMachine>;
+  /**
+   * The assistant running this turn, as a principal id. Used to hand the task BACK when it leaves a
+   * state that was blocked on the person (`awaitsUser`).
+   *
+   * Optional because not every caller is an assistant turn. When it is absent and a hand-back is due,
+   * ownership is left with the user and the condition is logged: an item that lingers in someone's
+   * queue is visible and fixable, whereas silently dropping the owner would leave the task held by
+   * nobody and findable by no query.
+   */
+  assistantId?: string;
 }): Promise<AdvanceResult> {
   const { task, toState } = args;
   const machines = args.machines ?? DEFAULT_TASK_STATE_MACHINES;
@@ -957,11 +1413,15 @@ export async function advanceTaskStateTo(args: {
   }
 
   const now = new Date().toISOString();
+  // The owner in force rides on the edge (ADR-024 D3), so the log says who held the task when it
+  // moved rather than only that it moved.
+  const holder = resolveTaskOwner(task);
   const entry: StateTransition = {
     from: authz.from,
     to: authz.to,
     at: now,
     by: args.by ?? 'tool',
+    ...(holder ? { owner: `${holder.type}:${holder.id}` } : {}),
     ...(args.reason ? { reason: args.reason } : {}),
     ...(args.messageId ? { messageId: args.messageId } : {}),
   };
@@ -985,19 +1445,41 @@ export async function advanceTaskStateTo(args: {
       sets.push('details = :details');
       exprValues[':details'] = { ...task.details, ...args.details };
     }
+    exprValues[':from'] = authz.from;
     await dynamoClient.send(new UpdateCommand({
       TableName: TASKS_TABLE,
       Key: { taskId: task.taskId, channelArn: task.channelArn },
       UpdateExpression: 'SET ' + sets.join(', '),
+      // OPTIMISTIC CONCURRENCY. `authorizeTransition` above ran against `task.taskState`, which was read
+      // at the START of this turn. Writing unconditionally meant the graph was checked against a value
+      // never re-verified at write time: if another turn advanced the task in between, this write took an
+      // edge that is not legal from the state the task actually occupies, silently landing it somewhere
+      // the machine forbids. Overlapping turns on one task are a REAL condition here, not a theoretical
+      // one - `getActiveTask` already carries a mitigation for a rapid follow-up turn arriving ~2s after
+      // a clarify, and `deliverOnGeneration` walks several hops as separate writes.
+      // Pinning the write to the state we authorized FROM makes the machine the authority at the moment
+      // it actually matters. A lost race fails cleanly and the caller re-reads.
+      ConditionExpression: 'taskState = :from',
       ExpressionAttributeValues: exprValues,
     }));
     task.turnsInState = 0;
+    task.taskState = authz.to;
     console.log(
       `[task-state] ${task.taskId} ${authz.from} -> ${authz.to} ` +
         `(by ${entry.by}${args.reason ? `: ${args.reason}` : ''})`,
     );
+    await maybeHandOver({ task, machine: machines[task.taskType], to: authz.to, assistantId: args.assistantId });
     return { ok: true, from: authz.from, to: authz.to, terminal: authz.terminal };
   } catch (error) {
+    // A failed condition is NOT an infrastructure error: the task moved under us, so this edge was
+    // authorized from a state it no longer occupies. Report it distinctly - retrying the same
+    // transition would be wrong, and the model must not be told the state changed when it did not.
+    if ((error as { name?: string })?.name === 'ConditionalCheckFailedException') {
+      console.warn(
+        `[task-state] ${task.taskId} ${authz.from} -> ${authz.to} lost a race (no longer in ${authz.from}); not applied`,
+      );
+      return { ok: false, error: 'state_changed', from: authz.from };
+    }
     // Persistence failed AFTER authorization — report failure so the model does not believe the
     // state changed. The task rests in its current state (§7), which is recoverable.
     console.error('[task-state] Error persisting transition:', error);
@@ -1006,65 +1488,148 @@ export async function advanceTaskStateTo(args: {
 }
 
 /**
- * BFS over legal transitions to the NEAREST terminal `success` state. Returns the ordered list of states
- * to advance THROUGH (excluding `from`), or [] if `from` is already terminal or no success path exists.
- * Shortest-path, so it prefers the direct completion edge (`generating -> completed`) over a detour
- * through `revising`.
+ * Move the task between the person and the assistant as the machine crosses an `awaitsUser` boundary.
+ *
+ * THIS IS THE CALLER `reassignTask` WAS BUILT AND LEFT UNWIRED FOR. A state declared `awaitsUser` is
+ * blocked on the person, so the person should hold it: that is what puts a report waiting on scope and
+ * a duel's clarifying question into ONE queue the user can work through, instead of each workflow
+ * inventing its own "waiting on you" signal (ADR-024, ADR-029).
+ *
+ * Only a BOUNDARY moves ownership. A transition between two states that both await the user leaves it
+ * with the user, and one between two that do not leaves it with the assistant, so an ordinary
+ * multi-step task does not churn the mirror partition on every hop.
+ *
+ * Best-effort by construction: the state transition is already durable and is the source of truth. A
+ * failed hand-over means the queue is briefly wrong, which is recoverable; throwing here would fail a
+ * turn that has already, correctly, moved.
  */
-function shortestPathToTerminalSuccess(machine: TaskStateMachine, from: string): string[] {
-  if (machine.states?.[from]?.terminal) return [];
-  const queue: string[][] = [[from]];
-  const seen = new Set<string>([from]);
-  while (queue.length) {
-    const path = queue.shift()!;
-    const cur = path[path.length - 1];
-    for (const next of machine.states?.[cur]?.transitions ?? []) {
-      if (seen.has(next)) continue;
-      seen.add(next);
-      const nextPath = [...path, next];
-      if (machine.states?.[next]?.terminal === 'success') return nextPath.slice(1); // drop `from`
-      queue.push(nextPath);
+async function maybeHandOver(args: {
+  task: Task;
+  machine?: TaskStateMachine;
+  to: string;
+  assistantId?: string;
+}): Promise<void> {
+  const { task, machine, to, assistantId } = args;
+  if (!TASKS_TABLE || !machine) return;
+  const awaitsUser = machine.states?.[to]?.awaitsUser === true;
+  const holder = resolveTaskOwner(task);
+  const heldByUser = holder?.type === 'user';
+  if (awaitsUser === heldByUser) return; // already on the right side of the boundary
+
+  try {
+    if (awaitsUser) {
+      // The REQUESTER is who is being waited on: they are the person in this conversation whose answer
+      // the machine needs. `assigneeUserSub` on a legacy row is honoured through resolveTaskOwner, so
+      // this does not fight a task that already names a different human.
+      const userSub = task.assigneeUserSub || task.userArn?.split('/user/').pop() || '';
+      if (!userSub) {
+        console.warn('[task-state] cannot hand over: no user on the task', { taskId: task.taskId });
+        return;
+      }
+      await reassignTask(task.taskId, task.channelArn, { id: userSub, type: 'user' });
+      console.log('[task-state] handed to the user', { taskId: task.taskId, state: to, userSub });
+      return;
     }
+    if (!assistantId) {
+      console.warn(
+        '[task-state] leaving an awaitsUser state with no assistant to hand back to; the item stays in the user queue',
+        { taskId: task.taskId, state: to },
+      );
+      return;
+    }
+    await reassignTask(task.taskId, task.channelArn, { id: assistantId, type: 'assistant' });
+    console.log('[task-state] handed back to the assistant', { taskId: task.taskId, state: to });
+  } catch (err) {
+    console.warn('[task-state] hand-over failed (state change stands):', err);
   }
-  return [];
 }
 
 /**
- * Deliver-on-generation completion for document-producing tasks (report_generation / data_extraction):
- * when the assistant has PRODUCED the deliverable this turn, advance the task machine to its terminal
- * success state by walking the shortest LEGAL transition path as a `system` transition. The model
- * reliably writes the report/extraction but does NOT reliably emit `advance_task_state` on the delivery
- * turn, so without this the machine sits in `generating` (or `formatting`) and the task never completes
- * even though the file was delivered. Idempotent (no-op if already terminal or no machine), never takes
- * an illegal edge (`advanceTaskStateTo` authorizes each hop), and stops on the first failed hop leaving
- * the rest for a later turn. The CALLER decides WHEN this is appropriate (a real deliverable delivered in
- * a delivery state, never a battle task); this function only performs the walk. Mutates `task.taskState`
- * so the in-memory task stays current for the caller's downstream status derivation (`advanceTaskStateTo`
- * persists the new state but does not mutate the passed object).
+ * A user's message, applied as the RESPONSE to the work they owe.
+ *
+ * THE GENERAL SHAPE OF EVERY WORKFLOW, and the reason none of them needs its own signal. A state
+ * declared `awaitsUser` means the machine is blocked on the person and the task is theirs to hold. When
+ * they speak in that conversation, that message IS the response: the handler reads the state they are
+ * answering, checks the response can resolve it, moves the machine on, and the hand-back to the
+ * assistant is what triggers the workflow's next action. A duel resumes its side, a report starts
+ * generating, an extraction begins pulling - the same three steps, with no per-feature sentinel,
+ * marker, or waiting flag anywhere in it.
+ *
+ * WHAT "VERIFY THE RESPONSE RESOLVES THE STATE" MEANS HERE, stated plainly because it is easy to
+ * over-claim. It is a STRUCTURAL check, not a semantic one:
+ *
+ *  - the task must actually be in a state that awaits the person (otherwise their message is ordinary
+ *    conversation and must not move a machine);
+ *  - that state must have exactly ONE legal way out, in which case answering IS resolving it;
+ *  - a state with several exits is a decision the ANSWER's content settles, which this cannot read. It
+ *    hands the task back to the assistant and leaves the choice to `advance_task_state` on the turn
+ *    that has the text and the model. The workflow still moves; only the picking is deferred.
+ *
+ * Returns what happened so the caller can say it, rather than a boolean nobody can explain.
  */
-export async function advanceDeliveredTaskToCompletion(args: {
-  task: Task;
-  messageId?: string;
+export async function applyUserResponseToTask(args: {
+  taskId: string;
+  channelArn: string;
+  /** The assistant that takes the work back, as a principal id. */
+  assistantId: string;
   machines?: Record<string, TaskStateMachine>;
-}): Promise<{ ok: boolean; to?: string; hops: number; error?: string }> {
-  const { task } = args;
+  messageId?: string;
+}): Promise<{
+  applied: boolean;
+  reason?: 'not_awaiting' | 'no_machine' | 'deferred_to_model' | 'advance_failed';
+  from?: string;
+  to?: string;
+}> {
+  const task = await getTask(args.taskId, args.channelArn);
+  if (!task?.taskType || !task.taskState) return { applied: false, reason: 'not_awaiting' };
+
   const machines = args.machines ?? DEFAULT_TASK_STATE_MACHINES;
-  const machine = task.taskType ? machines[task.taskType] : undefined;
-  if (!machine || !task.taskState) return { ok: true, hops: 0 };
-  if (machine.states?.[task.taskState]?.terminal) return { ok: true, to: task.taskState, hops: 0 };
-  const path = shortestPathToTerminalSuccess(machine, task.taskState);
-  if (!path.length) return { ok: true, hops: 0 }; // defensive: no success path from here
-  let hops = 0;
-  for (const next of path) {
-    const r = await advanceTaskStateTo({
-      task, toState: next, by: 'system', reason: 'deliverable produced', messageId: args.messageId, machines,
-    });
-    if (!r.ok) return { ok: false, to: task.taskState, hops, error: r.error };
-    task.taskState = r.to; // keep the in-memory task current for the caller
-    hops++;
+  const machine = machines[task.taskType];
+  const state = machine?.states?.[task.taskState];
+  if (!machine || !state) return { applied: false, reason: 'no_machine' };
+
+  // Not blocked on the person ⇒ this message is ordinary conversation. Moving a machine on the
+  // strength of an unrelated remark is how a workflow advances past a step nobody completed.
+  if (!state.awaitsUser) return { applied: false, reason: 'not_awaiting', from: task.taskState };
+
+  // ADVANCING NEEDS MORE THAN ONE EXIT AND A REPLY.  says the machine is blocked on the
+  // person; it does not say their next message finishes the step. Requirements gathering is the case
+  // that proves it - one exit, and several turns of answers before it is done - so advancing on the
+  // first reply moved a report to drafting before the assistant had what it needed.
+  //
+  // So the state must SAY that one answer completes it. Everything else hands the work back (which is
+  // what fires the next action) and leaves the transition to , on the turn that has
+  // the text and the model.
+  if (state.transitions.length !== 1 || !state.resolvedByOneResponse) {
+    await reassignTask(args.taskId, args.channelArn, { id: args.assistantId, type: 'assistant' })
+      .catch((err) => console.warn('[task-response] hand-back failed:', err));
+    return { applied: false, reason: 'deferred_to_model', from: task.taskState };
   }
-  return { ok: true, to: task.taskState, hops };
+
+  const to = state.transitions[0];
+  const result = await advanceTaskStateTo({
+    task,
+    toState: to,
+    by: 'system',
+    reason: 'the user responded to the step that was waiting on them',
+    ...(args.messageId ? { messageId: args.messageId } : {}),
+    machines,
+    // Leaving an awaitsUser state hands the task back to this assistant, which is what makes the
+    // response trigger the next action rather than merely record one.
+    assistantId: args.assistantId,
+  });
+  if (!result.ok) return { applied: false, reason: 'advance_failed', from: task.taskState };
+  return { applied: true, from: result.from, to: result.to };
 }
+
+/*
+ * advanceDeliveredTaskToCompletion and its BFS walker were REMOVED here (owner decision 2026-08-18).
+ * They force-walked a task to its terminal state when the OUTPUT looked deliverable-shaped - a second
+ * completion door beside the model's own advance_task_state, and it closed a task from
+ * drafting_outline while the reply was still asking for outline approval. Completion now has one
+ * path: the model declares it, the machine reaches terminal, shouldMarkTaskCompleted reports it
+ * (invariant AT6). Do not reintroduce a walker that completes a task the model did not complete.
+ */
 
 /**
  * Turns a machine-backed task may sit in one state before the runtime flags it stalled
@@ -1149,9 +1714,25 @@ export async function failTask(taskId: string, channelArn: string, error: string
 }
 
 /**
- * Build task context string for system prompt
+ * Build task context string for system prompt.
+ *
+ * WHERE THE SUFFICIENCY RULE LIVES (owner, 2026-08-14). When the current step declares what it needs
+ * (`requires`), the person's message is reviewed against that list: everything there ⇒ advance and get
+ * on with the work; something missing ⇒ ask for THAT, and only that, leaving the step where it is.
+ *
+ * It is the model's judgement and not the machine's, deliberately. Only the answer's content can say
+ * whether it named an audience, and the structural check the router runs before this
+ * (`applyUserResponseToTask`) is explicit that it cannot read content - which is why a step with one
+ * exit used to advance on whatever arrived first.
+ *
+ * ASKING ONLY FOR WHAT IS MISSING is the part that is easy to lose. The person has already answered
+ * part of the question; re-asking the whole thing reads as not having been listened to, which is the
+ * same complaint as advancing without the answer, arriving from the other side.
  */
-export function buildTaskContextForPrompt(task: Task | null): string {
+export function buildTaskContextForPrompt(
+  task: Task | null,
+  machines: Record<string, TaskStateMachine> = DEFAULT_TASK_STATE_MACHINES,
+): string {
   if (!task) return '';
 
   const stateLabel = task.taskState ? ` (${task.taskState})` : '';
@@ -1159,12 +1740,37 @@ export function buildTaskContextForPrompt(task: Task | null): string {
     ? `\nCollected information: ${JSON.stringify(task.details)}`
     : '';
 
+  // Only for a step that is BLOCKED ON THE PERSON and says what it needs. A step the workflow is
+  // getting on with by itself has nothing to chase, and a step with no list keeps today's behaviour:
+  // any answer is sufficient, which is right for a confirmation or a single choice.
+  const requires = task.taskType && task.taskState
+    ? machines[task.taskType]?.states?.[task.taskState]?.requires
+    : undefined;
+  const sufficiency = requires?.length
+    ? `
+
+### THIS STEP NEEDS
+
+${requires.map((r) => `- ${r}`).join('\n')}
+
+Check the user's message against that list, together with anything already collected above.
+
+- Everything there ⇒ move on. Call \`${ADVANCE_TASK_STATE_TOOL_NAME}\` and continue the work; do not
+  ask them to confirm what they have already told you.
+- Something missing ⇒ ask for ONLY the missing part, in one short question, and do not advance the
+  task. Do not re-ask for anything they have already given, and do not restate the whole list back
+  at them.
+- They decline to specify, or tell you to choose ⇒ that is an answer. Say what you are assuming and
+  move on. Do not ask again.
+`
+    : '';
+
   return `
 ## ACTIVE TASK
 
 Type: ${task.taskType || 'general'}${stateLabel}
 Status: ${task.status}
-Original request: ${task.userMessage?.substring(0, 200) ?? '(not recorded)'}${detailsStr}
+Original request: ${(task.requestExcerpt ?? task.userMessage)?.substring(0, TASK_EXCERPT_MAX_CHARS) ?? '(not recorded)'}${detailsStr}${sufficiency}
 
 When responding, continue working on this task. Guide the user through the current step.
 If the user's message is off-topic, acknowledge it briefly and redirect back to the task.

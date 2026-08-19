@@ -2,6 +2,8 @@
 
 **Status:** Implemented.
 
+**Coverage:** `e2e/cross-channel-tasks.spec.ts` - drives two conversations as one user and asserts in DynamoDB, not in the reply text, that a continuation-shaped turn in conversation B leaves the task opened in conversation A untouched (same `taskState`, `status`, `updatedAt`, `turnsInState`) and that A's `taskId` acquires no row under B's `channelArn`. The open-task precondition is arranged directly in the source of truth, because `getActiveTask` only considers `pending`/`in_progress` and a task the model finished inside one turn would make the assertion vacuous. Falsified by sending the same turn in conversation A, where it resumes the task and moves every one of those fields.
+
 **Problem and who it's for:** When people carry on work across several conversations, each multi-step task should stay pinned to the conversation where it lives - never accidentally resumed in another - while the assistant still knows the user has work open elsewhere. This is for the end user (whose tasks stay where they belong) and the platform developer, who would otherwise hand-roll cross-conversation task scoping on top of the messaging layer. It scopes task resume to a matching `channelArn` while surfacing out-of-channel tasks to the assistant only as a prompt hint, never an auto-resume.
 
 **Site section:** Interaction layer - conversation substrate (task continuity across conversations; placement - owner call).
