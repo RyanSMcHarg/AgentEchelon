@@ -97,6 +97,7 @@ jest.mock('../../lambda/src/lib/battle-state.js', () => {
 
 const mockGetActiveTaskForOwner = jest.fn();
 const mockGetActiveTaskForAssistant = jest.fn();
+const mockGetActiveTasksForOwnerInChannel = jest.fn();
 const mockGetActiveTask = jest.fn();
 const mockApplyUserResponseToTask = jest.fn();
 
@@ -106,6 +107,16 @@ jest.mock('../../lambda/src/lib/task-tracking.js', () => {
     ...actual,
     getActiveTaskForOwner: (...a: unknown[]) => mockGetActiveTaskForOwner(...a),
     getActiveTaskForAssistant: (...a: unknown[]) => mockGetActiveTaskForAssistant(...a),
+    // The router fetches the person's held LIST once per turn and answers both "what do they owe"
+    // and "which chain is mine" from it. Tests that model one held task keep setting the singular
+    // mock - the list falls back to wrapping it - and a test that models a person holding SEVERAL
+    // chains sets this one directly.
+    getActiveTasksForOwnerInChannel: async (...a: unknown[]) => {
+      const list = await mockGetActiveTasksForOwnerInChannel(...a);
+      if (list !== undefined) return list;
+      const t = await mockGetActiveTaskForOwner(...a);
+      return t ? [t] : [];
+    },
     getActiveTask: (...a: unknown[]) => mockGetActiveTask(...a),
     applyUserResponseToTask: (...a: unknown[]) => mockApplyUserResponseToTask(...a),
   };
@@ -295,9 +306,12 @@ describe('a message answering another assistant\'s work is handed to that assist
       // necessarily this assistant's. The person is mid-conversation with THIS assistant; reading their
       // message as the answer to the other side's question is the wrong reading, and it would hand away
       // a message that was meant here.
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OWNER), 't-theirs') : null);
-      mockGetActiveTaskForAssistant.mockResolvedValue(heldTask(principalIdOf(BOT_SELF), 't-mine'));
+      // The person holds BOTH sides' chains; the list is newest-first, so the other side's is the
+      // newest and "the active task" as an implicit notion would name it.
+      mockGetActiveTasksForOwnerInChannel.mockImplementation(async (ownerId: string) =>
+        ownerId === principalIdOf(HUMAN)
+          ? [heldTask(principalIdOf(BOT_OWNER), 't-theirs'), heldTask(principalIdOf(BOT_SELF), 't-mine')]
+          : []);
 
       await routerHandler(turn());
 

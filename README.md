@@ -706,7 +706,7 @@ suite degrades gracefully on a stack that hasn't been provisioned.
 
 ### Test Coverage
 
-**151 e2e tests across 41 spec files**, mapped to the specifications they cover.
+**159 e2e tests across 44 spec files**, mapped to the specifications they cover.
 
 The authoritative, per-spec breakdown is **[docs/reference/e2e-coverage-matrix.md](docs/reference/e2e-coverage-matrix.md)**, which is GENERATED from the specs and the spec files - it reports which documents claim live behaviour and which e2e covers each. Read it there rather than here: a hand-maintained inventory in this file drifted to "~55 tests across 8 spec files" (it listed 6 battle tests against an actual 17) and nothing failed while it was wrong.
 

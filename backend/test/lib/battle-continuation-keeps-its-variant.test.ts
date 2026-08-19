@@ -59,6 +59,12 @@ jest.mock('../../lambda/src/lib/task-tracking.js', () => {
   return {
     ...actual,
     getActiveTaskForOwner: (...a: unknown[]) => mockGetActiveTaskForOwner(...a),
+    // The router fetches the person's held LIST once per turn; these tests model at most one held
+    // task, so the list wraps the singular mock and every call-order assertion keeps observing it.
+    getActiveTasksForOwnerInChannel: async (...a: unknown[]) => {
+      const t = await mockGetActiveTaskForOwner(...a);
+      return t ? [t] : [];
+    },
     getActiveTask: (...a: unknown[]) => mockGetActiveTask(...a),
     applyUserResponseToTask: (...a: unknown[]) => mockApplyUserResponseToTask(...a),
   };
