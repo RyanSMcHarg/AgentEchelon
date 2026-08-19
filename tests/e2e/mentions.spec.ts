@@ -554,20 +554,24 @@ test.describe('the @all handoff: a bypass turn is classified like any other', ()
     await expect(async () => {
       expect(await assistantResponseCount(channelArn)).toBeGreaterThan(botsBefore);
     }).toPass({ timeout: 180_000 });
-    // Let the placeholder->final update land before reading.
-    await page.waitForTimeout(15000);
-
-    const messages = await botMessagesForDiagnosis(channelArn);
-    const answered = messages.some((m) => m.includes(codename));
-    for (const m of messages.slice(-3)) {
+    // POLL for the codename rather than sampling once after the first reply. The question may
+    // classify as data_extraction (it is one, if a small one), whose delivery is a multi-step task
+    // chain - the grounded answer then lands a message or two AFTER the first reply, and a single
+    // read taken then reported 'not answered from the document' about a chain that was still
+    // answering. The codename survives percent-encoding verbatim (A-Z, digits, hyphen), so the raw
+    // stored content is searchable either way.
+    await expect
+      .poll(async () => (await botMessagesForDiagnosis(channelArn)).some((m) => m.includes(codename)), {
+        timeout: 180_000,
+        message:
+          'no assistant message contains the codename that exists only inside the attached document. '
+          + 'The reply was probably fluent - that is the failure mode: the attachment rides Metadata, '
+          + 'Lex never passes it, and a fall-through that does not recover it answers on the caption '
+          + 'alone with nothing erroring.',
+      })
+      .toBe(true);
+    for (const m of (await botMessagesForDiagnosis(channelArn)).slice(-3)) {
       console.log(`[1:1 @all attach] bot message: ${JSON.stringify(m.slice(0, 160))}`);
     }
-    expect(
-      answered,
-      'no assistant message contains the codename that exists only inside the attached document. '
-      + 'The reply was probably fluent - that is the failure mode: the attachment rides Metadata, '
-      + 'Lex never passes it, and a fall-through that does not recover it answers on the caption '
-      + 'alone with nothing erroring.',
-    ).toBe(true);
   });
 });

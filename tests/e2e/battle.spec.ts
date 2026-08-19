@@ -1182,6 +1182,11 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
 
     const ctx = await browser.newContext({
       baseURL: process.env.E2E_BASE_URL || 'http://localhost:5173',
+      // EXPLICITLY EMPTY, not omitted. `browser.newContext()` inside @playwright/test inherits the
+      // project's `use` options, and this project's storageState is the pre-authed ADMIN state for
+      // BOTH origins - so an "empty" context loaded the chat app already signed in, no login form
+      // ever rendered, and the standard sign-in below timed out (measured live).
+      storageState: { cookies: [], origins: [] },
     });
     const pageStd = await ctx.newPage();
     try {
