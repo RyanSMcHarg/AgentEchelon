@@ -18,7 +18,7 @@ import { shortenModelId } from '../utils/modelLabel';
 import { getModelGreeting } from '../utils/greeting';
 import type { Message } from '@ae/shared';
 import './ConversationInterface.css';
-import { hasPendingMessageFocus, requestMessageFocus, scrollToMessage, takePendingMessageFocus } from '../utils/focusMessage';
+import { clearMessageFocus, hasPendingMessageFocus, noteMessageFocusMiss, peekMessageFocus, scrollToMessage } from '../utils/focusMessage';
 
 /** Multi-day date divider: a divider
  *  separates messages when the calendar day changes vs the previous
@@ -365,9 +365,12 @@ const ConversationInterface: React.FC = () => {
     setShowScrollBtn(false);
   }, []);
 
+  const activeConversationId = activeConversation?.id;
+
   // A `#message=<id>` deep link (a drift conversation's link back to the message that caused it) records its
   // target before the conversation's history exists. This runs on every `messages` change, so it fires
-  // exactly when the target renders - no polling, no deadline.
+  // exactly when the target renders - no polling. The request is scoped to the conversation the link named
+  // and carries a bounded budget, so a target that never renders stops being waited on (see focusMessage).
   //
   // Running FIRST is not what makes the deep link win - it is what made it LOSE. Effects run in
   // declaration order within a commit, so on the render where the target finally mounts this one
@@ -381,27 +384,32 @@ const ConversationInterface: React.FC = () => {
   // yanking them away - on this render and on later ones, which is also the right behaviour while
   // someone is reading history.
   useEffect(() => {
-    if (!hasPendingMessageFocus()) return;
-    const id = takePendingMessageFocus();
-    if (id && !scrollToMessage(id)) {
-      // Not rendered on this pass (a longer history still loading). Put it back so the next render tries
-      // again; the request is only consumed once it actually lands.
-      requestMessageFocus(id);
+    const id = peekMessageFocus(activeConversationId);
+    if (!id) return;
+    if (!scrollToMessage(id)) {
+      // Not rendered on this pass (a longer history still loading). Leave the request pending so the next
+      // render tries again, at the cost of one attempt from its budget.
+      noteMessageFocusMiss();
       return;
     }
-    if (id) userScrolledRef.current = true;
-  }, [messages]);
+    clearMessageFocus();
+    userScrolledRef.current = true;
+    // `isLoadingMessages` is a dependency because the list is replaced by a skeleton while it is true: a
+    // commit that swaps the skeleton back for the messages is a render where the target can appear, even
+    // when the `messages` reference did not change again.
+  }, [messages, activeConversationId, isLoadingMessages]);
 
   useEffect(() => {
     // Skip the "jump to newest" behaviour while a deep link is still waiting to land, or it would scroll
-    // away from the message the user followed a link to reach.
-    if (hasPendingMessageFocus()) return;
+    // away from the message the user followed a link to reach. Once the request gives up this goes back to
+    // scrolling normally.
+    if (hasPendingMessageFocus(activeConversationId)) return;
     if (!userScrolledRef.current) {
       scrollToBottom();
     } else {
       setShowScrollBtn(true);
     }
-  }, [messages, scrollToBottom]);
+  }, [messages, scrollToBottom, activeConversationId]);
 
   const handleScroll = useCallback(() => {
     const el = containerRef.current;

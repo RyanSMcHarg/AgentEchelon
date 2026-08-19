@@ -48,8 +48,10 @@ function AppContent() {
     // would leave the reader to hunt for it. Read before the URL is cleaned below.
     const messageId = decodeURIComponent((window.location.hash.match(/message=([^&]+)/) || [])[1] || '');
     // Recorded BEFORE selecting, because the target's history has not loaded yet. ConversationInterface
-    // scrolls to it in an effect once the message renders, so nothing here waits or polls.
-    if (messageId) requestMessageFocus(messageId);
+    // scrolls to it in an effect once the message renders, so nothing here waits or polls. The request is
+    // scoped to this conversation and gives up after a bounded wait, so a target that never renders (deleted,
+    // redacted, past the loaded page) cannot keep suppressing auto-scroll.
+    if (messageId) requestMessageFocus(messageId, conversationId);
     void selectConversation(conversationId).finally(() => {
       // Clean up URL once selection has been attempted.
       window.history.replaceState({}, '', window.location.pathname);
