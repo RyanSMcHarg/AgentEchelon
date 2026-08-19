@@ -975,7 +975,17 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
           if (imgFmt) {
             imageInput = { format: imgFmt, bytes };
           } else if (docFmt) {
-            const safeName = (event.attachment.name || 'document').replace(/[^a-zA-Z0-9 .\-()[\]]/g, ' ').slice(0, 200) || 'document';
+            // Bedrock's document-name rules are stricter than a filesystem's: alphanumerics,
+            // single spaces, hyphens, parentheses and brackets ONLY - a dot rejects the request
+            // outright (ValidationException, measured live on 'project-brief.txt'), and so does any
+            // run of consecutive whitespace. The extension is dropped rather than laundered: the
+            // `format` field is what tells Converse the type.
+            const safeName = (event.attachment.name || 'document')
+              .replace(/\.[a-zA-Z0-9]+$/, '')
+              .replace(/[^a-zA-Z0-9 \-()[\]]/g, ' ')
+              .replace(/\s+/g, ' ')
+              .trim()
+              .slice(0, 200) || 'document';
             documentInput = { format: docFmt, name: safeName, bytes };
           }
           console.log('[AssistantAsyncProcessor] attachment-in', { type: event.attachment.contentType, kind: imgFmt ? 'image' : 'document' });
