@@ -76,6 +76,15 @@ function parseChimeFrame(data: string): {
   senderArn: string;
   content: string;
   messageId: string;
+  /**
+   * The message's `Metadata`, parsed. This carries the turn's analytics — including which model
+   * actually served it (`bedrockModel`) and the classified `intent`.
+   *
+   * Captured because a whole class of assertion is otherwise impossible from a browser: a test can
+   * see the REPLY but not which model produced it, so "should access Opus model" could only ever
+   * assert that the answer mentioned quantum physics — which a Haiku reply passes just as well.
+   */
+  metadata: Record<string, unknown> | null;
 } | null {
   try {
     const json = JSON.parse(data);
@@ -103,7 +112,16 @@ function parseChimeFrame(data: string): {
       }
     } catch { /* not URL-encoded */ }
 
-    return { eventType, senderArn, content, messageId: payload.MessageId || '' };
+    let metadata: Record<string, unknown> | null = null;
+    try {
+      if (typeof payload.Metadata === 'string' && payload.Metadata.trim()) {
+        metadata = JSON.parse(payload.Metadata);
+      } else if (payload.Metadata && typeof payload.Metadata === 'object') {
+        metadata = payload.Metadata as Record<string, unknown>;
+      }
+    } catch { /* metadata is best-effort; a turn without it is not a failure */ }
+
+    return { eventType, senderArn, content, messageId: payload.MessageId || '', metadata };
   } catch {
     return null;
   }
@@ -132,6 +150,25 @@ export class WebSocketMonitor {
   private ttfrMs: number | null = null;
   private responseContent = '';
   private placeholderMessageId: string | null = null;
+
+  /**
+   * Metadata from the most recent BOT frame seen. Exposed because a browser test can read the reply
+   * text but nothing about how it was produced — which model served it, which intent was classified.
+   * Those are the claims several specs make and none could previously assert.
+   */
+  private lastBotMetadataValue: Record<string, unknown> | null = null;
+
+  /** Metadata of the latest bot message (model attribution, intent, correlation id), or null. */
+  get lastBotMetadata(): Record<string, unknown> | null {
+    return this.lastBotMetadataValue;
+  }
+
+  /** MessageId of the most recent bot message — the handle a moderation action targets. */
+  private lastBotMessageIdValue: string | null = null;
+
+  get lastBotMessageId(): string | null {
+    return this.lastBotMessageIdValue;
+  }
 
   /**
    * Attach to the page to capture the Chime SDK WebSocket when it opens.
@@ -200,6 +237,8 @@ export class WebSocketMonitor {
 
     const elapsed = Date.now() - this.startTime;
     const isBot = parsed.senderArn.includes('/bot/');
+    if (isBot && parsed.metadata) this.lastBotMetadataValue = parsed.metadata;
+    if (isBot && parsed.messageId) this.lastBotMessageIdValue = parsed.messageId;
 
     if (parsed.eventType === 'CREATE_CHANNEL_MESSAGE') {
       if (!isBot && this.userEchoMs === null) {

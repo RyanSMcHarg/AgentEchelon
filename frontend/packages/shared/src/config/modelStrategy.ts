@@ -1,6 +1,7 @@
 export type ModelTier = 'basic' | 'standard' | 'premium';
-export type ProviderKey = 'anthropic' | 'amazon' | 'openai';
-export type ModelStrategyKey = 'haiku' | 'sonnet' | 'opus' | 'titan' | 'gpt_oss_20b' | 'gpt_oss_120b';
+export type ProviderKey = 'anthropic' | 'amazon' | 'openai' | 'deepseek';
+export type ModelStrategyKey =
+  | 'haiku' | 'sonnet' | 'opus' | 'titan' | 'gpt_oss_20b' | 'gpt_oss_120b' | 'deepseek_v3';
 
 export interface ModelStrategyCard {
   key: ModelStrategyKey;
@@ -64,8 +65,11 @@ export const MODEL_STRATEGY_MODELS: ModelStrategyCard[] = [
   {
     key: 'titan',
     provider: 'amazon',
-    bedrockModelId: 'amazon.titan-text-premier-v1:0',
-    displayName: 'Amazon Titan Text Premier',
+    // Titan Text Premier reached Bedrock end-of-life; Nova Pro is its successor. The catalog KEY stays
+    // 'titan' so the strategy and admin wiring are unaffected, which is exactly why this mirror drifted
+    // unnoticed - the key kept working while the console advertised a retired model by name.
+    bedrockModelId: 'amazon.nova-pro-v1:0',
+    displayName: 'Amazon Nova Pro',
     allowedTiers: ['standard', 'premium'],
     strengths: ['summaries', 'structured drafting', 'bedrock-native fallback'],
     costClass: 'medium',
@@ -96,6 +100,21 @@ export const MODEL_STRATEGY_MODELS: ModelStrategyCard[] = [
     latencyClass: 'deep',
     codingFit: 'excellent',
     deploymentNotes: 'Best fit for premium experiments that want stronger OpenAI-style coding or review behavior through Bedrock.',
+  },
+  {
+    key: 'deepseek_v3',
+    provider: 'deepseek',
+    bedrockModelId: 'deepseek.v3.2',
+    displayName: 'DeepSeek V3.2 (Bedrock)',
+    allowedTiers: ['standard', 'premium'],
+    strengths: ['Chinese fluency', 'strong reasoning', 'low-cost open-weight'],
+    costClass: 'low',
+    latencyClass: 'balanced',
+    codingFit: 'good',
+    deploymentNotes:
+      'The working-language model behind geography routing (SPEC-CONTEXT-AWARE-MODEL-ROUTING): a CN-segment '
+      + 'turn routes here and replies in Chinese. Was missing from this mirror while present in the backend '
+      + 'catalog, which made it unselectable in the experiments form - see model-catalog-mirror.test.ts.',
   },
 ];
 

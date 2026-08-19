@@ -279,7 +279,7 @@ aws bedrock list-foundation-models --by-provider <provider> \
 
 **Root Cause** - `ChannelMembersPanel` renders the empty-state on its pre-fetch initial paint; the driver's instant visibility check saw it before `listExperiments()` resolved.
 
-**Solution** - wait for `#battle-experiment-select` to appear, only honest-degrade if it never does. File: `tests/e2e/demo/post2-abtest-battle.demo.spec.ts`.
+**Solution** - wait for `#battle-experiment-select` to appear, only honest-degrade if it never does. File: `tests/e2e/demo/post2-abtest-battle.demo.spec.ts` *(this driver is not present in this repository)*.
 
 ---
 
@@ -579,7 +579,7 @@ A VPC-attached, Lex-facing AgentHandler in ISOLATED subnets cannot reach the con
 
 ### Solution
 
-The handler no longer VPC-attaches (project decision 018). Retrieval and drift run in a dedicated VPC-attached **data-plane Lambda** in the Aurora stack; the handler stays non-VPC and invokes it. `enableLiveDrift=true` now wires the handler with `AURORA_DATA_PLANE_ARN` + `lambda:InvokeFunction`, not a VpcConfig. Verify the handler shows `Vpc=""` and `AURORA_DATA_PLANE_ARN` set. If you are on an older build that still VPC-attaches the handler, either roll back `enableLiveDrift` (redeploy the 3 tier stacks without it, plus `-c appUrl` to avoid the CORS trap in §18b) or add `ssm` + `cognito-idp` + `lambda` interface endpoints. See `docs/guides/developer/RAG.md` and `docs/guides/admin/INFRASTRUCTURE-COST.md`.
+The handler no longer VPC-attaches (ADR-013). Retrieval and drift run in a dedicated VPC-attached **data-plane Lambda** in the Aurora stack; the handler stays non-VPC and invokes it. `enableLiveDrift=true` now wires the handler with `AURORA_DATA_PLANE_ARN` + `lambda:InvokeFunction`, not a VpcConfig. Verify the handler shows `Vpc=""` and `AURORA_DATA_PLANE_ARN` set. If you are on an older build that still VPC-attaches the handler, either roll back `enableLiveDrift` (redeploy the 3 tier stacks without it, plus `-c appUrl` to avoid the CORS trap in §18b) or add `ssm` + `cognito-idp` + `lambda` interface endpoints. See `docs/guides/developer/RAG.md` and `docs/guides/admin/INFRASTRUCTURE-COST.md`.
 
 ### Prevention
 
@@ -610,7 +610,7 @@ Effective tier = `min(userTier, channelTier)`. The channel's tier is set by the 
 
 ### Solution
 
-Open the conversation with the tier's own assistant: `createConversation(page, title, 'Claude Opus')` for premium, `'Claude Sonnet'` for standard, `'Claude Haiku'` for basic. See `tests/e2e/tier-context.spec.ts` `ask()`.
+Open the conversation with the tier's own assistant: `createConversation(page, title, 'Claude Opus')` for premium, `'Claude Sonnet'` for standard, `'Claude Haiku'` for basic. See `tests/e2e/classification-context.spec.ts` `ask()`.
 
 ### Prevention
 
@@ -695,3 +695,132 @@ to use.
 - `CLAUDE.md` - tier authorization, post-deploy backfill steps
 - `README.md` "Setup" - where CDK outputs / `.env` values come from
 - §18 - deploy landmines (stale bundles, single-stack context, CORS, Windows)
+
+---
+
+## 19. A turn produces no reply at all (placeholder never found)
+
+**Symptom** - the user sends a message, the assistant posts *"One moment..."*, and it never resolves. No error bubble, nothing in the UI to say anything failed. The answer was computed and discarded.
+
+**Diagnosis** - the async processor logs the give-up line and returns nothing:
+
+```bash
+aws logs filter-log-events \
+  --log-group-name "/aws/lambda/<INSTANCE>Classification--AsyncProcessor<SUFFIX>" \
+  --start-time $(( ($(date +%s) - 3600) * 1000 )) \
+  --filter-pattern "Could not find placeholder" \
+  --query "events[].message" --output text
+```
+
+Then confirm it polled rather than being handed an id - `Polling attempt 1/15` for the same request id means `placeholderMessageId` was absent:
+
+```bash
+aws logs filter-log-events \
+  --log-group-name "/aws/lambda/<INSTANCE>Classification--AsyncProcessor<SUFFIX>" \
+  --start-time $(( ($(date +%s) - 3600) * 1000 )) \
+  --filter-pattern "<REQUEST_ID>" --query "events[].message" --output text | grep -E "Polling attempt|placeholder"
+```
+
+**Why a lookup exists at all** - the placeholder is created by Amazon Chime SDK Messaging *from the Lex response*, so its `MessageId` does not exist when the router invokes the processor (`InvocationType.Event`, before Chime has posted anything). The processor's only handle is the `<!--corr:{uuid}-->` marker, which it finds by polling `ListChannelMessages` - the **20 most recent** messages, 15 attempts over about 20 seconds. That is a best-effort search against an eventually consistent list, so it can miss a message that is present. It also cannot distinguish that case from a marker that was never written, which is the case established below.
+
+The `/battle` path usually avoids this because `channel-flow-processor` posts each placeholder itself and passes `placeholderMessageId`. It is not immune: that field is only set when a waiting message exists (`...(waitingMsgId && { placeholderMessageId: waitingMsgId })`), so a battle turn without one falls back to the same poll.
+
+**Cause** - established. **One user message is served by two async processor invocations, and only one of them has a placeholder.**
+
+The evidence is two invocations two seconds apart for a single turn, with different Lambda request ids and different correlation ids. The first polled for its own marker for 22 seconds and found nothing; the second found its placeholder in 376 ms and answered. They were not retries of one another: the first returned `null`, which is a success, and the second began while the first was still polling.
+
+Each fulfillment mints its own correlation id, so each looks for a marker only it could match. The invocation whose placeholder was never created can never succeed, no matter how wide the search.
+
+The reason two fulfillments happen at all is that **the normal path has no inbound delivery dedup**. Amazon Chime SDK and Lex deliver at least once. `/battle` collapses a duplicate delivery with a durable claim on `deriveBattleId(channelArn, userMessageId)`, and `@all` collapses it within a warm container, but an ordinary turn takes neither path and is claimed by nothing. See [SPEC-ABUSE-CONTROLS](../../specs/ops/SPEC-ABUSE-CONTROLS.md).
+
+**Solution** - three changes, specified in [ADR-022](../../design/decisions/022-message-identity-is-established-at-the-channel-flow.md):
+
+1. **The correlation id is derived from the turn** (`turnCorrelationId`: channel, sender, transcript, 90 second bucket) rather than minted at random, so a retried fulfillment reuses the label and the processor's existing `dedup#<correlationId>` claim collapses it. Every input is one a retry provably replays. The Lex `sessionId` is deliberately not among them: the session is per channel and per user, both already hashed, so it discriminates nothing, while adding a dependency on Amazon Chime SDK replaying the same session on a retry - undocumented, and never measured. An input that separates nothing and can only fail is a liability, because if it varied every derived id would differ and this control would silently do nothing. No claim is taken on the inbound message at the flow: the duplicate is a retried *fulfillment*, which happens after the flow released the message and is beyond its reach, and the only way a flow can stop a message reaching Lex is `callbackDeny`, which would remove the user's own message from the conversation.
+2. **The router replays the same placeholder on a duplicate fulfillment.** Having derived the same id, the retry fails to claim `fulfil-<correlationId>` and returns the SAME placeholder text carrying the SAME `<!--corr:-->` marker, doing no work. It does not go silent: Amazon Chime SDK materialises one message per turn from the LAST fulfillment response, so returning nothing suppresses the only message that reaches the channel - which may be the attempt that did the work. Replaying makes the two attempts interchangeable, so whichever materialises carries the marker the dispatched processor is looking for. present and empty. Omitting the field instead would leave `parsed.Messages` undefined, fall through that guard, and render the raw envelope. This is the only place the duplicate can be caught, because **channel flows do not intercept Lex responses** and nothing downstream sees that placeholder before it lands.
+3. **The flow writes the `corr#<id> -> MessageId` mapping** when a bot message carrying the marker passes through it, and the processor point-reads that key before scanning. That includes the normal path's placeholder: a message Amazon Chime SDK materialises from a Lex response runs through the flow like any other. What differs is ORDERING, not reach - the processor may look before the flow has recorded the mapping, which is why the marker scan remains as a fallback.
+
+**What the user sees when resolution still fails.** A turn that cannot resolve is reported as failed in place rather than left as a silent *"One moment..."*, and any task it opened is closed as failed rather than left pending. A stuck placeholder with no error is therefore a symptom to investigate, not an expected outcome.
+
+There is deliberately **no fallback that posts a replacement placeholder**. That was tried and is worse than the symptom: with two invocations in flight, the loser posting its own bubble produces a duplicate answer rather than a repaired one, and it breaks the one-message-updated-in-place pattern this codebase settled on deliberately (see [DESIGN-BATTLE](../../specs/capabilities/DESIGN-BATTLE.md) - *"nothing appears-then-vanishes"*). The losing invocation returns without posting. File: `backend/lambda/src/lib/async-processor-core.ts`.
+
+**What is ruled out.** The 20-message scan window is *not* the constraint: the failure examined in detail occurred in a freshly created channel holding a handful of messages, so the window covered the whole channel and the placeholder was still not found across 22 seconds. Widening the window would look like a fix while leaving the cause unexamined. Nor was it a turn that never intended a placeholder - the router logged `deliveryOption: PLACEHOLDER_UPDATE` four seconds earlier.
+
+**Also ruled out.** The correlation marker is NOT stripped from the stored message: `stripMessageMarkers` removes every `<!--...-->` comment including `<!--corr:...-->`, but every caller is read-side (analytics, the admin conversation browser, the evaluation judge, config sanitising) and none writes stripped content back to Chime. Nor was the marker consumed by another invocation updating the placeholder ahead of this one: no other processor logged the same correlation id. Note what that does **not** rule out, and what misled an earlier reading of it - a concurrent invocation serving the same user message logs a *different* correlation id, because each fulfillment mints its own. Absence of a shared id is evidence against a replay, not against duplication.
+
+**What is still open.** Which layer redelivers - Amazon Chime SDK re-invoking the flow, or Lex re-fulfilling a released message. The inbound claim collapses the duplicate either way, so this does not block the fix, but it determines whether a duplicate is also visible as a second flow invocation.
+
+Also unexamined, and moot once the mapping replaces the scan: whether the stored `Content` encoding defeats the match. The poll tries a decoded form and a Lex JSON wrapper form, so a third form would slip past both, the same class of problem as the still-encoded content in section 5.
+
+**Identifying the turn in the logs.** The invocation line carries the channel id and the placeholder message id, and nothing else. The Chime ARN prefix is deliberately absent: it is identical on every line, carries the account and app-instance ids, and identifies nothing.
+
+**Prevention** - rare (twice in fourteen days on the reference deployment), and load-sensitive rather than deploy-sensitive: the busier the channel, the likelier a duplicate delivery and the likelier the lookup window is to miss. Widening the window does not address it, because the losing invocation is searching for a marker that was never written.
+
+**Where the mapping should be written.** The channel flow, not the Kinesis archival consumer. Both see a `MessageId` paired with the content that carries the marker, but the flow sees it *synchronously, before the message is released*, so the mapping exists before the message is even visible to `ListChannelMessages`. The stream sees it after a batching lag of a few seconds. The flow is strictly earlier, needs no new consumer, and reaches a table it already uses for rate limiting. See [ADR-022](../../design/decisions/022-message-identity-is-established-at-the-channel-flow.md).
+
+---
+
+## 20. The assistant does not remember the previous turn
+
+**Symptom** - a user states a fact, asks for it back a turn or two later, and the assistant denies ever having seen it ("I do not have any record of you mentioning a cutover date"). It is intermittent: the same exchange succeeds on one run and fails on the next, with no code change between them. Nothing reports an error, and the reply is fluent, so it reads as a model quality problem rather than a defect.
+
+There are two independent causes. They present identically. Establish which one applies before changing anything.
+
+### Diagnosis
+
+Start at the router, because the first cause never reaches the model at all:
+
+```bash
+aws logs filter-log-events \
+  --log-group-name "/aws/lambda/<INSTANCE>Classification-<Ba|St|Pr>-AgentHandler<SUFFIX>" \
+  --start-time $(( ($(date +%s) - 3600) * 1000 )) \
+  --filter-pattern '"short-circuiting the turn"' \
+  --query "events[].message" --output text
+```
+
+A hit means drift answered the turn instead of the assistant. If there is no hit, look at what the processor actually assembled:
+
+```bash
+aws logs filter-log-events \
+  --log-group-name "/aws/lambda/<INSTANCE>Classification--AsyncProcessor<SUFFIX>" \
+  --start-time $(( ($(date +%s) - 3600) * 1000 )) \
+  --filter-pattern '"messages from channel history"' \
+  --query "events[].message" --output text
+```
+
+Read the `roles` field, not the count. A healthy second turn is `aua` (the welcome, the user's opening turn, the reply). The count alone cannot distinguish that from `aa`, which is the same length with the user's own turn missing - and a leading run of assistant turns is promoted wholesale into `priorAgentContext`, leaving the model nothing but the current message.
+
+### Cause A: a drift suggestion short-circuited the turn
+
+A fired drift suggestion returns immediately from the router. The agent flow never runs, so the turn is answered without conversation history and without a model call. That is by design, and it is correct when the user really has pivoted.
+
+It misfires on a turn that refers *backwards* into the same conversation. Measured on the reference deployment: a conversation whose opening exchange was summarised and embedded four seconds after the first reply, then a follow-up asking for a detail from that first turn, which scored past `DRIFT_DISTANCE_THRESHOLD` (0.35) and fired. The signal is a single cosine distance between the message and the running summary, and a short referential question ("what did I mention?") carries almost none of the topic words the summary embedding was built from, so it lands far from an anchor that summarises one exchange.
+
+This is the same false-positive shape `activeTaskInProgress` already suppresses, documented in `drift-detection.ts`: an answer the assistant solicited is a continuation, not a pivot, and cosine cannot see the difference. That suppression only applies while a task is live.
+
+**Confirm it from the metrics** rather than inferring it. The decision runs in the data-plane Lambda and emits EMF:
+
+```bash
+aws logs filter-log-events \
+  --log-group-name "/aws/lambda/<INSTANCE>AnalyticsAuror-DataPlaneLambda<SUFFIX>" \
+  --start-time $(( ($(date +%s) - 3600) * 1000 )) \
+  --filter-pattern '"drift_fired"' --query "events[].message" --output text
+```
+
+`drift_fired` confirms the cosine path. `drift_fastpath_explicit_intent` means the explicit-routing allowlist matched instead, which is a different defect - that allowlist is deliberately narrow and should not match an ordinary question.
+
+### Cause B: the assistant's own prior turn was filtered out of the history
+
+`loadChannelHistory` excludes placeholder messages so the *"One moment..."* bubble is not fed back to the model as an assistant turn. Placeholders are identified by the `<!--corr:{id}-->` marker every one of them carries; the answer arrives as an update whose content has no marker, so a resolved placeholder correctly stops matching.
+
+Identifying them by their punctuation instead does not work, and is worth stating because it looks reasonable. Every placeholder copy ends in an ellipsis (*"One moment..."*, *"Analyzing..."*, *"Looking into that..."*), but so does ordinary prose, so a substring test on `...` silently deletes real assistant turns from the next turn's context. The drop is invisible, and intermittent in exactly the reported way, because it depends on whether that one reply happened to use an ellipsis.
+
+Losing the trailing assistant turn has a second effect. Bedrock requires alternating roles, which is why the history is consolidated before the model call; a history that ends on a user turn puts two user turns next to each other once the current message is appended. The composition therefore consolidates the history *and* the current turn as one array, not the history alone.
+
+### Prevention
+
+Both causes are silent by construction, so the guard is observability rather than a check:
+
+- The router logs every drift interception, so a short-circuited turn is no longer indistinguishable from a turn that failed to dispatch. Before that, the router logged its delivery decision only *after* the drift check returned, so an intercepted turn left no trace at all.
+- The history load logs the role shape alongside the count. A count cannot diagnose this; a shape can.
+
+Neither cause is deploy-sensitive. Cause A tracks how the conversation is worded, cause B tracks how the model happened to punctuate a reply, so a deployment that works today can fail tomorrow with no change shipped.

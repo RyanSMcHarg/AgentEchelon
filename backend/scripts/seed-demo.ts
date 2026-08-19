@@ -40,14 +40,21 @@ import {
 import {
   SecretsManagerClient,
   PutSecretValueCommand,
+  GetSecretValueCommand,
   CreateSecretCommand,
 } from '@aws-sdk/client-secrets-manager';
 import { SSMClient, PutParameterCommand, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { seedAllProfileDefinitions } from '../lambda/src/lib/seed-profile-definitions.js';
-import { DEFAULT_INTENT_PACK } from '../lambda/src/lib/intent-pack.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomBytes } from 'crypto';
+// Demo (Stratum) personas. Their own module because seed-demo runs main() at import, so nothing can
+// read them from here without running the whole seeder - and they are the portable payload a profile
+// export carries to another instance.
+import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA } from '../demo/personas.js';
+// Demo intent packs, same reason and same place as the personas above - and kept measurable, so a
+// pack that outgrows its parameter fails a unit test instead of a deploy's seed step.
+import { stratumIntentPack } from '../demo/intent-packs.js';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const cognitoClient = new CognitoIdentityProviderClient({ region });
@@ -271,7 +278,29 @@ async function writeTestCredentialsSecret(
   const clientId = clients.UserPoolClients?.[0]?.ClientId || '';
   const emailFor = (t: string) => users.find((u) => u.tier === t)?.email || '';
   const u = (tier: string) => ({ email: emailFor(tier), password: DEMO_PASSWORD, tier });
+
+  // MERGE onto whatever is already there, rather than replacing it.
+  //
+  // This built the payload from scratch and PUT it, so every key the seeder does not own was
+  // destroyed on each run. That is not hypothetical: a suite needing a second premium user (battle's
+  // per-user picks) and one needing a never-onboarded user (the intake) both provision their own
+  // entries, and both were silently wiped by the next `seed` phase. The tests then SKIPPED with "no
+  // provisioned <user>", which reads as a deployment that was never set up rather than as state the
+  // run itself had just deleted - and it only happened inside a full sweep, because running those
+  // suites alone never triggers a seed.
+  //
+  // The seeder owns the four demo users and the pool/client ids. Anything else in the secret belongs
+  // to whoever put it there.
+  let existing: Record<string, unknown> = {};
+  try {
+    const current = await smClient.send(new GetSecretValueCommand({ SecretId: TEST_SECRET_NAME }));
+    existing = JSON.parse(current.SecretString || '{}') as Record<string, unknown>;
+  } catch {
+    // No secret yet, or unreadable — the create path below writes a fresh one.
+  }
+
   const payload = {
+    ...existing,
     testAdmin: u('premium'), // the premium demo user is also in the `admins` group
     basicUser: u('basic'),
     standardUser: u('standard'),
@@ -376,122 +405,40 @@ async function writeOnboardingIntake(): Promise<void> {
   console.log(`  ✓ standard onboarding intake → ${name}`);
 }
 
-// Standard-tier assistant persona (ASSISTANT_SYSTEM_PROMPT_PARAM). Standard is the ONLY classification
-// whose persona is per-deployment (standard-classification-stack.ts: `systemPromptParam: true`); basic
-// and premium ship a built-in persona. Absent an operator persona, standard falls back to the generic
-// Agent Echelon prose which — on Sonnet, and without premium's "use the knowledge base" priming — answers
-// tersely and declines to name people from the seeded directory (the two standard-tier validation gaps:
-// tier-context.spec.ts "standard CAN name leadership" + the "detailed analysis" depth check). Seeding a
-// Stratum-grounded persona makes the DEMO self-grounding: standard answers as Stratum's internal
-// assistant and USES the company context the platform appends each turn.
-const STANDARD_PERSONA = `You are the internal assistant for Stratum Technologies, an enterprise SaaS company (workflow automation, ~280 people, based in Austin). You support Stratum employees through a chat interface.
-
-You are speaking with a colleague who has standard internal access: the employee directory, internal processes and runbooks, and the product roadmap. Leadership-only material (financials, board summaries, customer accounts, competitive intelligence) is out of scope on this tier - if asked for it, say it is restricted to leadership access rather than guessing.
-
-How to answer:
-- Ground every answer in the Stratum company context provided to you this turn (directory entries, internal documents, roadmap). When that context contains the answer - a person's name, a team, a process detail - state it directly and specifically. Name the person or the team; do not reply "I don't have that" when the information is in front of you.
-- Be thorough and well-structured. Give the real, detailed answer a colleague needs, not a one-line reply. Use markdown (short headings, lists, tables) when it aids readability.
-- If a request is genuinely outside your access or the provided context, say so plainly and point to who can help; never fabricate internal facts.
-- Answer directly. Do NOT open with disclaimers such as "as an AI assistant" or "I don't have access to..."; never refuse and then comply in the same reply.
-- If asked about "this tool", "this app", or the platform itself, explain that you run on AgentEchelon, a tiered enterprise assistant platform, and offer to explain how it works.`;
 
 /**
- * Stratum DOMAIN intent pack (per tier). Beyond the universal greeting/acknowledgment/general and the
- * platform DEFAULT task intents (guided_troubleshooting / data_extraction / image_generation /
- * report_generation, reused verbatim so they never drift from the platform), the demo adds Stratum's
- * everyday questions as their OWN intents so the admin console segments them into meaningful buckets
- * instead of one fat `general` bar.
+ * The SSM Standard-tier value limit every seeded parameter is written under.
  *
- * KEY DESIGN POINT (ADR-018): intent and DELIVERY are separate axes. These inline intents carry
- * `delivery: 'PLACEHOLDER_UPDATE'` (one grounded reply, answered in the turn) — NOT `TASK_MULTI_STEP`.
- * So a single-fact revenue/account/product question is bucketed AND answered inline (no deferral behind
- * a task), which is exactly what ADR-018 wanted; collapsing it to `general` (and losing the signal) was
- * never required — the per-intent delivery field is the real lever. Genuinely multi-step work stays on
- * the DEFAULT task intents (report_generation / data_extraction, both TASK_MULTI_STEP), which the
- * per-tier packs keep so existing task flows + e2e + taskType routing are unchanged.
- *
- * Scoped per tier to match each tier's data access (basic sees product info; standard the directory /
- * processes; premium financials / accounts / competitive intel), so a tier's classifier only offers the
- * intents that tier can actually satisfy.
+ * Not an incidental AWS number: the per-deployment packs are DESIGNED to live inside it
+ * (`intent-pack.ts` keeps keyword lists short for exactly this reason), and profile definitions are
+ * written under the same cap (`profile-lifecycle.ts`). Named here so the seeder can fail with the
+ * field and the measurement rather than an opaque AWS error.
  */
-type InlineIntent = { key: string; description: string; keywords: string[]; delivery: 'PLACEHOLDER_UPDATE' };
-const STRATUM_INLINE_INTENTS: Record<'basic' | 'standard' | 'premium', InlineIntent[]> = {
-  basic: [
-    {
-      key: 'product_info',
-      description:
-        'User asks about Stratum products, plans, pricing, features, integrations, or the public FAQ — '
-        + 'answerable inline from the company overview (e.g. "what is in the StratumFlow Professional plan?", '
-        + '"which integrations are supported?"). A single-turn answer, not a compiled report.',
-      keywords: ['plan', 'pricing', 'price', 'how much', 'feature', 'integration', 'integrations', 'stratumflow', 'product', 'faq', 'edition'],
-      delivery: 'PLACEHOLDER_UPDATE',
-    },
-  ],
-  standard: [
-    {
-      key: 'directory_lookup',
-      description:
-        'User asks who someone is, who leads or owns a team, a person\'s role or manager, or how to reach a '
-        + 'team — answerable inline from the employee directory (e.g. "who leads Platform Core?"). Exporting the '
-        + 'whole roster as a table is data_extraction, not this.',
-      keywords: ['who leads', 'who is', 'who owns', 'who manages', 'manager of', 'team lead', 'reports to', 'head of', 'contact for', 'directory'],
-      delivery: 'PLACEHOLDER_UPDATE',
-    },
-    {
-      key: 'process_lookup',
-      description:
-        'User asks about an internal process, runbook, escalation path, response-time SLA, or operating '
-        + 'procedure — answerable inline from internal processes (e.g. "what is the escalation path for a Sev-1?").',
-      keywords: ['process', 'procedure', 'runbook', 'escalation', 'escalate', 'sla', 'response time', 'policy', 'on-call', 'sev-1', 'sev 1'],
-      delivery: 'PLACEHOLDER_UPDATE',
-    },
-  ],
-  premium: [
-    {
-      key: 'financial_metric',
-      description:
-        'User asks for a SINGLE financial figure or SaaS metric, stated inline — ARR, NRR / net revenue '
-        + 'retention, churn rate, revenue by plan, gross margin, a specific quarter\'s number (e.g. "what was our '
-        + 'Q2 ARR?", "current net revenue retention?"). Answer the figure directly in one turn. Compiling these '
-        + 'into a written report is report_generation; exporting many rows is data_extraction.',
-      keywords: ['arr', 'nrr', 'net revenue retention', 'churn', 'mrr', 'revenue', 'gross margin', 'burn', 'runway', 'ltv', 'cac', 'what was our'],
-      delivery: 'PLACEHOLDER_UPDATE',
-    },
-    {
-      key: 'account_status',
-      description:
-        'User asks about ONE customer account\'s health, renewal, ARR, or churn risk, stated inline (e.g. "is '
-        + 'Acme at risk?", "when does Globex renew?"). Exporting all at-risk accounts as a table is data_extraction.',
-      keywords: ['account', 'customer', 'at risk', 'churn risk', 'renewal', 'renew', 'account health', 'expansion', 'upsell', 'contract'],
-      delivery: 'PLACEHOLDER_UPDATE',
-    },
-    {
-      key: 'competitive_intel',
-      description:
-        'User asks how Stratum compares to a competitor, competitor positioning / pricing, or win/loss reasons — '
-        + 'answerable inline from competitive intelligence (e.g. "how do we compare to Competitor X?", "why do we '
-        + 'lose deals to Y?").',
-      keywords: ['competitor', 'competitive', 'compare to', 'win rate', 'win/loss', 'win loss', 'positioning', 'differentiat', 'why do we lose'],
-      delivery: 'PLACEHOLDER_UPDATE',
-    },
-  ],
-};
-
-/** A tier's full pack: its Stratum inline intents, then the platform DEFAULT task intents (reused so
- *  they stay in sync). Universal greeting/acknowledgment/general are added implicitly by the classifier. */
-function stratumIntentPack(tier: 'basic' | 'standard' | 'premium'): { intents: unknown[] } {
-  return { intents: [...STRATUM_INLINE_INTENTS[tier], ...DEFAULT_INTENT_PACK.intents] };
-}
+const SSM_STANDARD_TIER_MAX = 4096;
 
 /** Write an SSM param only if it does not already exist (protects an operator's `-c` value / prior seed). */
 async function putParamIfAbsent(name: string, value: string, label: string): Promise<void> {
+  // SIZE IS CHECKED BEFORE THE WRITE, because the AWS failure is unusable on its own: a bare
+  // `ValidationException: Standard tier parameters support a maximum parameter value of 4096
+  // characters` names neither the parameter nor the field, and it lands MID-SEED. Earlier parameters
+  // are already written, so the retry reports them as "already set - leaving it" and dies on the same
+  // one, which reads as idempotent progress while the deployment is left incomplete. This is the same
+  // guard `profile-lifecycle.ts` provides for definition writes; this write previously had none.
+  if (value.length > SSM_STANDARD_TIER_MAX) {
+    throw new Error(
+      `${label} is ${value.length} characters; the SSM Standard tier caps a value at ${SSM_STANDARD_TIER_MAX} `
+      + `(${value.length - SSM_STANDARD_TIER_MAX} over). Parameter: ${name}. `
+      + `Shorten the content rather than raising the tier - the definition write in profile-lifecycle.ts `
+      + `is Tier: 'Standard' regardless, so an oversize body fails again at profile activation.`,
+    );
+  }
   try {
     await ssmClient.send(new GetParameterCommand({ Name: name }));
     console.log(`  - ${label} already set (${name}) - leaving it`);
   } catch (err: any) {
     if (err?.name === 'ParameterNotFound') {
       await ssmClient.send(new PutParameterCommand({ Name: name, Value: value, Type: 'String', Overwrite: false }));
-      console.log(`  ✓ ${label} → ${name}`);
+      console.log(`  ✓ ${label} → ${name} (${value.length}/${SSM_STANDARD_TIER_MAX})`);
     } else {
       throw err;
     }
@@ -580,7 +527,7 @@ async function uploadContextFiles(bucketName: string): Promise<void> {
     for (const tier of ['basic', 'standard', 'premium'] as const) {
       const entries = manifest.documents
         .filter((d) => scope[tier].includes(d.tier))
-        // `file` lets the assistant name the exact document(s) to load (SPEC-ASSISTANT-CONTEXT selective load).
+        // `file` lets the assistant name the exact document(s) to load (GUIDE-ASSISTANT-CONTEXT selective load).
         .map((d) => ({ file: d.file, title: d.title, description: d.description, classification: d.tier }));
       await s3Client.send(
         new PutObjectCommand({
@@ -733,12 +680,25 @@ async function main(): Promise<void> {
   await writeStratumIntentPacks();
   console.log('');
 
-  // Step 2d: seed each profile's ACTIVE version (SPEC-PORTABLE-VERSIONED-PROFILES P0). Writes the
+  // Step 2d: seed each profile's ACTIVE version (SPEC-PORTABLE-PROFILES P0). Writes the
   // compiled default as version 1 of /assistant/{name}/definition and labels it `active`, so the
   // async-processor resolves its base model from the versioned definition (byte-identical to the
   // deploy default here) and the P1 lifecycle has a v1 to build on. Idempotent + fail-closed.
+  // The standard persona is folded INTO the definition, not left to `assistant-system-prompt` alone.
+  // Persona truth lives in the profile: that is what a manifest export carries and what the async
+  // processor prefers, so a profile imported into another instance arrives as the Stratum assistant
+  // rather than the generic default. The parameter is still written (below) as the deployment seam
+  // for a deploy that runs no versioned profile - it is the fallback now, not the source of truth.
   console.log('Step 2d: Seeding active profile definitions to SSM...');
-  for (const r of await seedAllProfileDefinitions(ssmClient, SSM_ROOT)) {
+  // The attachments bucket doubles as the profile BODY store, so each persona is written to
+  // `profiles/{name}/{configId}/persona` and the parameter carries a pointer. Resolved from the stack
+  // outputs rather than an env var: this runs as an operator script, not in a Lambda, so there is no
+  // PROFILE_BODY_BUCKET/CONTEXT_BUCKET in its environment to fall back to.
+  for (const r of await seedAllProfileDefinitions(ssmClient, SSM_ROOT, {
+    basic: BASIC_PERSONA,
+    standard: STANDARD_PERSONA,
+    premium: PREMIUM_PERSONA,
+  }, { bucket: bucketName })) {
     console.log(`  ✓ ${r.profileName} definition v${r.version} labeled active`);
   }
   console.log('');
@@ -753,6 +713,16 @@ async function main(): Promise<void> {
   // otherwise); the load_company_context tool remains the fallback.
   if (archiveBucketName) {
     await uploadCompanyRag(archiveBucketName);
+    // The PLATFORM corpus (the repo's own docs, for "how does AgentEchelon work?") is deliberately
+    // NOT uploaded here: it is generated from the docs tree, which a deployed instance does not have,
+    // so it is its own deploy-time step. Say so at the point the operator is already looking at RAG,
+    // because the failure mode is silent - without it the assistant still answers platform questions,
+    // from titles and one-paragraph summaries, which reads as vague rather than as a missing step.
+    console.log('  NOTE: platform self-knowledge (deep Q&A about AgentEchelon itself) is a SEPARATE');
+    console.log('        deploy-time step and is not seeded here. Run it now, and after any doc change:');
+    console.log('          npm run sync-knowledge:rag');
+    console.log('        Without it, the assistant answers platform questions from the curated');
+    console.log('        summaries only (the load_platform_info tool), not the full documentation.');
   }
   console.log('');
 

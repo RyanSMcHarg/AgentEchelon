@@ -19,7 +19,7 @@ Two deployment modes have very different cost shapes:
 |---|---|---|---|
 | **Lambda (agent handlers, async processors, APIs)** | The request path: router/agent handler classifies + routes; per-tier async processor runs the Bedrock Converse loop; Cognito-auth APIs (credential exchange, feedback, admin). Billed per request + GB-second. | $0.20 / M requests + $0.0000166667 / GB-s | **$5 to 40**, usage-driven |
 | **DynamoDB (tasks, experiments, battle state)** | On-demand tables for agent tasks, A/B experiments, battle config/outcomes. Reached via a free gateway endpoint in Aurora mode. | $1.25 / M writes, $0.25 / M reads (on-demand) + $0.25 / GB-mo | **$1 to 10**, usage-driven |
-| **S3 (attachments, context, SPA, archive)** | Tier context documents (`context/{tier}/`), the RAG corpus (`rag/`), user attachments, the built frontend, and the message archive. | $0.023 / GB-mo Standard + request tiers | **$1 to 10** |
+| **S3 (attachments, context, SPA, archive)** | Tier context documents (`context/{classification}/`), the RAG corpus (`rag/`), user attachments, the built frontend, and the message archive. | $0.023 / GB-mo Standard + request tiers | **$1 to 10** |
 | **Cognito** | User pool, tier groups, hosted sign-in. Free below 50k MAU on the standard tier. | Free tier, then per-MAU | **$0** at demo scale |
 | **CloudFront + API Gateway** | SPA delivery + REST APIs (credential exchange, admin, analytics query). | CloudFront $0.085/GB out; API GW $1.00 / M requests (REST) | **$1 to 15**, usage-driven |
 | **Amazon Chime SDK messaging** | The messaging backbone: channels, memberships, app-instance bots, channel flows. Billed per active user and per message. | Per-message + per-active-user | **usage-driven**; low at demo scale |
@@ -55,7 +55,7 @@ Trivial turns (greeting, acknowledgment) route to Haiku and skip retrieval, so t
 
 ## The retrieval data-plane Lambda (Aurora mode)
 
-RAG retrieval and live drift both need to reach Aurora (pgvector) and Bedrock (embeddings). Rather than VPC-attaching the synchronous, Lex-facing agent handler (which also calls SSM, Cognito, and Lambda-invoke, none of which have endpoints in the isolated subnets, so attaching it there makes it hang), a single **data-plane Lambda** owns the Aurora + Bedrock work and the agent handler invokes it. See the design in [`RAG.md`](../developer/RAG.md) and the decision record (project decision 018).
+RAG retrieval and live drift both need to reach Aurora (pgvector) and Bedrock (embeddings). Rather than VPC-attaching the synchronous, Lex-facing agent handler (which also calls SSM, Cognito, and Lambda-invoke, none of which have endpoints in the isolated subnets, so attaching it there makes it hang), a single **data-plane Lambda** owns the Aurora + Bedrock work and the agent handler invokes it. See the design in [`RAG.md`](../developer/RAG.md) and the decision record (ADR-013).
 
 **Cost impact: effectively zero new infrastructure.**
 

@@ -76,8 +76,8 @@
       "path": "docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md"
     },
     {
-      "title": "Latency targets (industry-sourced)",
-      "summary": "The admin console's latency targets (`frontend/packages/admin/src/components/admin/metricTargets.ts` and `LatencyTab.latencyColor`) are set to published industry standards, not to a self-imposed ceiling. This doc records the standards and how they map onto AgentEchelon so the numbers are defensible and reviewable.",
+      "title": "Latency: metric definitions, targets, and the end-to-end gap",
+      "summary": "The admin console's Latency tab reports several latency numbers, and its targets (`frontend/packages/admin/src/components/admin/metricTargets.ts` and `LatencyTab.latencyColor`) are set to published industry standards, not a self-imposed ceiling. This doc (a) defines each metric precisely - what it measures, where it is stamped, and why it matters - (b) records the targets and their basis, (c) stat",
       "path": "docs/guides/developer/LATENCY-TARGETS.md"
     },
     {
@@ -99,6 +99,11 @@
       "title": "Model Strategy",
       "summary": "Agent Echelon treats model routing as a capability-first concern, not a tier-only choice.",
       "path": "docs/guides/developer/MODEL_STRATEGY.md"
+    },
+    {
+      "title": "Performance optimization (reducing latency)",
+      "summary": "AgentEchelon ships with **cost-lean defaults**, not latency-optimized ones. Out of the box every request path is serverless and scales to zero: Lambdas are on-demand (no provisioned concurrency), Aurora runs at a low minimum capacity, RDS Proxy is off, and the intent classifier is a live model call. That reduces cost for idle and low-traffic deployments, but it means the first request after",
+      "path": "docs/guides/developer/PERFORMANCE-OPTIMIZATION.md"
     },
     {
       "title": "RAG - Document Retrieval",
@@ -151,9 +156,24 @@
       "path": "docs/overview/SITE-MAP.md"
     },
     {
+      "title": "Stacks: what each one owns, what it depends on, and what deploys when",
+      "summary": "**Audience:** anyone deploying AgentEchelon into their own AWS account, or deciding where a new resource belongs.",
+      "path": "docs/overview/STACKS.md"
+    },
+    {
       "title": "AgentEchelon Tenets",
       "summary": "The non-negotiables. Every architectural decision in the project traces back to one of these, and where two designs competed, the tenet broke the tie.",
       "path": "docs/overview/TENETS.md"
+    },
+    {
+      "title": "Context catalog reference",
+      "summary": "What an assistant can reference by key, and what each key yields. A profile selects from this by setting `contextSources`; the deployment decides which keys exist, per classification.",
+      "path": "docs/reference/context-catalog-reference.md"
+    },
+    {
+      "title": "End-to-end coverage matrix",
+      "summary": "Do not edit by hand. Generated from the `**Coverage:**` line of every document under `docs/specs/` and the spec files under `tests/e2e/`. Regenerate with:",
+      "path": "docs/reference/e2e-coverage-matrix.md"
     },
     {
       "title": "DESIGN-ASSISTANT: Meetings assistant",
@@ -166,14 +186,14 @@
       "path": "docs/specs/applications/SPEC-ASSISTANT-MEETINGS.md"
     },
     {
-      "title": "Demo Company Spec: Stratum Technologies",
-      "summary": "**Status:** Implemented (the demo dataset and seed script ship)",
-      "path": "docs/specs/applications/SPEC-DEMO-COMPANY.md"
-    },
-    {
       "title": "DESIGN: Battle Mode (`/battle`) - Technical Design",
       "summary": "**Status:** Implemented (premium-gated) **Layer:** Core platform (capability - a platform feature, not an interaction pillar; its MECHANISM lives here, its variant CONFIG is assistant-config, pillar 2) **Plane:** core **Product spec:** [SPEC-BATTLE.md](./SPEC-BATTLE.md)",
       "path": "docs/specs/capabilities/DESIGN-BATTLE.md"
+    },
+    {
+      "title": "DESIGN: Experiments and Battle - Objective, Briefing, Lifecycle, and Decision Loop",
+      "summary": "**Status:** Implemented. The §4.3 drill-down's real-data reconciliation is **verified live** by `e2e/experiments.spec.ts` (\"the drill-down reproduces the aggregate: same count, same mean, per variant\"); `e2e/experiment-results-trust.spec.ts` extends that check to every experiment type through the admin console, and needs a live run. **§5's gate is built and deployed but has never been executed**, ",
+      "path": "docs/specs/capabilities/DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP.md"
     },
     {
       "title": "DESIGN: Multi-Agent Orchestration",
@@ -182,7 +202,7 @@
     },
     {
       "title": "DESIGN: Multi-Assistant Turn Engine",
-      "summary": "Status: Draft (design-target). Anchors the redesign of `/battle` into a general multi-assistant turn-taking engine. Unifies the two \"orchestrator\" notions that [DESIGN-MULTI-AGENT-ORCHESTRATION.md](DESIGN-MULTI-AGENT-ORCHESTRATION.md) (hierarchical fan-out-collate) and [DESIGN-BATTLE.md](DESIGN-BATTLE.md) (peer round-scheduler) describe",
+      "summary": "**Status:** Draft (design-target).",
       "path": "docs/specs/capabilities/DESIGN-MULTI-ASSISTANT-TURN-ENGINE.md"
     },
     {
@@ -192,13 +212,78 @@
     },
     {
       "title": "SPEC: Drift Detection",
-      "summary": "**Status:** Implemented (Aurora mode; the live-suggestion path is behind `enableLiveDrift`).",
+      "summary": "**Status:** Partial. **Built:** the embedding-based signal, the confirm/decline and new-channel flow, the scheduled summary updater, related-conversation retrieval, the per-stage telemetry, the first-turn summary seed ([ADR-019](../../design/decisions/019-conversation-summary-seeded-on-first-turn.md), verified live 2026-07-29), active-task suppression, and the drift health surface (accuracy from p",
       "path": "docs/specs/capabilities/SPEC-DRIFT-CONVERGENCE.md"
+    },
+    {
+      "title": "Assistant Configuration - what the assistant *is*, per experience",
+      "summary": "**Status:** Implemented. The per-classification config seams ship, and the unified `AssistantConfig` bundle rides the versioned profile definition ([`SPEC-PORTABLE-PROFILES.md`](SPEC-PORTABLE-PROFILES.md)). The versioned definition carries a per-profile **`models` bundle** (`default` plus optional `classifier` / `complex` / `byIntent` overrides), a per-profile **`tools`** surface, a per-profile **",
+      "path": "docs/specs/interaction/assistant-config/SPEC-ASSISTANT-CONFIG.md"
+    },
+    {
+      "title": "SPEC: Bilingual conversations (reply-language, pivot, dual delivery)",
+      "summary": "**Status:** Partial (reply-language ships; the inference pivot and dual delivery are design).",
+      "path": "docs/specs/interaction/assistant-config/SPEC-BILINGUAL-CONVERSATIONS.md"
+    },
+    {
+      "title": "SPEC: Capability profiles and deployment-defined classifications",
+      "summary": "**Status:** Implemented. Classifications and assistant profiles are deployment configuration (`backend/lib/config/profiles.ts`), and `backend/lib/profile-registry.ts` is the only module that interprets a classification value. The legacy constants this replaced (`VALID_TIERS`, `TIER_RANK`, `TIER_GROUPS`, `minTier`, `isAdvancedTier`) are deleted, and the per-tier stack files are consolidated into on",
+      "path": "docs/specs/interaction/assistant-config/SPEC-CAPABILITY-PROFILES.md"
+    },
+    {
+      "title": "SPEC: Configurable assistants - three per-assistant config axes on one governed boundary",
+      "summary": "**Status:** Implemented",
+      "path": "docs/specs/interaction/assistant-config/SPEC-CONFIGURABLE-ASSISTANTS.md"
+    },
+    {
+      "title": "SPEC: Configurable intent pack (per-deployment intent taxonomy)",
+      "summary": "**Status:** Implemented (the taxonomy mechanism; the domain taxonomy is per-deployment config).",
+      "path": "docs/specs/interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md"
+    },
+    {
+      "title": "SPEC: Context-aware model routing (RoutingContext + provider adapter)",
+      "summary": "**Status:** Partial, and gated off - the routing feature ships behind an opt-in flag that no deployment in this repo sets, so none of it has run in service. **Built:** `RoutingContext` + `resolveModelPlan` (`lib/resolve-model-plan.ts`), the CN context rule in both of its forms - DeepSeek-on-Bedrock as the preferred in-AWS path and the OpenAI-compatible external adapter (`lib/providers/external-llm",
+      "path": "docs/specs/interaction/assistant-config/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md"
+    },
+    {
+      "title": "SPEC: Per-profile ownership (`AgentEchelonClassification-*`)",
+      "summary": "**Status:** Implemented.",
+      "path": "docs/specs/interaction/assistant-config/SPEC-PER-PROFILE-OWNERSHIP.md"
+    },
+    {
+      "title": "SPEC: Portable, versioned assistant profiles",
+      "summary": "**Status:** Implemented and deployed. The versioning lifecycle (create / edit / activate / rollback), A/B and battle over any profile version (`profileRef`), and export / import with manifest signing are built - `lib/profile-lifecycle.ts`, `lib/profile-manifest.ts`, `lib/profile-version-lookup.ts`, `manage-profiles.ts`, and the admin Profiles tab. Extends `SPEC-PER-PROFILE-OWNERSHIP.md` and `SPEC-",
+      "path": "docs/specs/interaction/assistant-config/SPEC-PORTABLE-PROFILES.md"
+    },
+    {
+      "title": "SPEC: User profile store and once-per-user onboarding",
+      "summary": "**Status:** Partial (the store, the swap seam and the once-per-user gate ship; the resolution model and identity provenance sections below are design).",
+      "path": "docs/specs/interaction/assistant-config/SPEC-USER-PROFILE-AND-ONBOARDING.md"
+    },
+    {
+      "title": "SPEC: Welcome flow and assistant context",
+      "summary": "**Status:** Partial (the welcome wiring ships; later context phases are design).",
+      "path": "docs/specs/interaction/assistant-config/SPEC-WELCOME-AND-CONTEXT.md"
+    },
+    {
+      "title": "Access & Controls Auditing - an append-only record of who could act, and what changed",
+      "summary": "**Status:** Implemented (audit capture and the membership-history view; forward extensions noted inline).",
+      "path": "docs/specs/interaction/auditing/SPEC-ACCESS-AND-CONTROLS-AUDITING.md"
+    },
+    {
+      "title": "SPEC: Connectors - integrate with the business's systems, don't replace them",
+      "summary": "**Status:** Design (the schema seam ships; the runtime path is not built). The connector schema lives in config today (`conversation-types.ts` + `connectors.ts`); this spec is the contract those seams point at, promoted out of `../conversation-config/SPEC-CONVERSATION-TYPES.md` section 6.",
+      "path": "docs/specs/interaction/connectors/SPEC-CONNECTORS.md"
     },
     {
       "title": "Cross-Channel Task Continuity",
       "summary": "**Status:** Implemented.",
       "path": "docs/specs/interaction/conversation/CROSS-CHANNEL-TASKS.md"
+    },
+    {
+      "title": "SPEC: Context sources and stores, and what restricts each one",
+      "summary": "**Status:** Partial. Every path below marked \"as built\" is described from the code that implements it, with the file named. Three paths are **NOT BUILT** and say so in place: the external approved-link allowlist, the two-tier RAG pointer design, and the meetings/operations telemetry sources. ADR-028's database boundary (sections 5.1 and 5.2) is verified against the deployment; every other guard he",
+      "path": "docs/specs/interaction/conversation/SPEC-CONTEXT-SOURCES-AND-STORES.md"
     },
     {
       "title": "SPEC: Conversation Archive and Member Removal (moderator)",
@@ -216,54 +301,9 @@
       "path": "docs/specs/interaction/conversation/SPEC-NOTIFICATION-BRIDGE.md"
     },
     {
-      "title": "Assistant Configuration - what the assistant *is*, per experience",
-      "summary": "**Status:** In progress (unification underway). The per-classification config seams ship; the unified `AssistantConfig` bundle is now landing on the versioned profile definition ([`SPEC-PORTABLE-PROFILES.md`](SPEC-PORTABLE-PROFILES.md)). The versioned definition carries a per-profile **`models` bundle** (`default` plus optional `classifier` / `complex` / `byIntent` overrides), a per-profile **`too",
-      "path": "docs/specs/interaction/assistant-config/SPEC-ASSISTANT-CONFIG.md"
-    },
-    {
-      "title": "SPEC: Bilingual conversations (reply-language, pivot, dual delivery)",
-      "summary": "**Status:** Partial (reply-language ships; the inference pivot and dual delivery are design).",
-      "path": "docs/specs/interaction/assistant-config/SPEC-BILINGUAL-CONVERSATIONS.md"
-    },
-    {
-      "title": "SPEC: Configurable intent pack (per-deployment intent taxonomy)",
-      "summary": "**Status:** Implemented (the taxonomy mechanism; the domain taxonomy is per-deployment config).",
-      "path": "docs/specs/interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md"
-    },
-    {
-      "title": "SPEC: Context-aware model routing (RoutingContext + provider adapter)",
-      "summary": "**Status:** Partial (`RoutingContext` runs on the standard profile; the provider-adapter seam is design)",
-      "path": "docs/specs/interaction/assistant-config/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md"
-    },
-    {
-      "title": "SPEC: Per-profile ownership (`AgentEchelonClassification-*`)",
-      "summary": "**Status:** Implemented.",
-      "path": "docs/specs/interaction/assistant-config/SPEC-PER-PROFILE-OWNERSHIP.md"
-    },
-    {
-      "title": "SPEC: Portable, versioned assistant profiles",
-      "summary": "**Status:** Implemented and deployed. The versioning lifecycle (create / edit / activate / rollback), A/B and battle over any profile version (`profileRef`), and export / import with manifest signing are built - `lib/profile-lifecycle.ts`, `lib/profile-manifest.ts`, `lib/profile-version-lookup.ts`, `manage-profiles.ts`, and the admin Profiles tab. Extends `SPEC-PER-PROFILE-OWNERSHIP.md` and `SPEC-",
-      "path": "docs/specs/interaction/assistant-config/SPEC-PORTABLE-PROFILES.md"
-    },
-    {
-      "title": "SPEC: User profile store and once-per-user onboarding",
-      "summary": "**Status:** Implemented (pending live deploy + e2e validation)",
-      "path": "docs/specs/interaction/assistant-config/SPEC-USER-PROFILE-AND-ONBOARDING.md"
-    },
-    {
-      "title": "SPEC: Welcome flow and assistant context",
-      "summary": "**Status:** Partial (the welcome wiring ships; later context phases are design).",
-      "path": "docs/specs/interaction/assistant-config/SPEC-WELCOME-AND-CONTEXT.md"
-    },
-    {
-      "title": "Access & Controls Auditing - an append-only record of who could act, and what changed",
-      "summary": "**Status:** Implemented (audit capture and the membership-history view; forward extensions noted inline).",
-      "path": "docs/specs/interaction/auditing/SPEC-ACCESS-AND-CONTROLS-AUDITING.md"
-    },
-    {
-      "title": "SPEC: Connectors - integrate with the business's systems, don't replace them",
-      "summary": "**Status:** Design (the schema seam ships; the runtime path is not built). The connector schema lives in config today (`conversation-types.ts` + `connectors.ts`); this spec is the contract those seams point at, promoted out of `../conversation-config/SPEC-CONVERSATION-TYPES.md` section 6.",
-      "path": "docs/specs/interaction/connectors/SPEC-CONNECTORS.md"
+      "title": "SPEC: Task state transitions",
+      "summary": "**Status:** Implemented. **Verified by:** `backend/test/lib/task-loop-machines.test.ts`, `backend/test/task-state-machines.test.ts`, `backend/test/lib/task-ownership.test.ts`, `backend/test/lib/task-has-an-end.test.ts`.",
+      "path": "docs/specs/interaction/conversation/SPEC-TASK-STATE-TRANSITIONS.md"
     },
     {
       "title": "Conversation Configuration - a conversation is a configurable experience",
@@ -336,6 +376,11 @@
       "path": "docs/specs/interface/admin/DESIGN-SEPARATE-ADMIN-APP.md"
     },
     {
+      "title": "SPEC: Admin console effectiveness, the intent-anchored drill",
+      "summary": "**Status:** Implemented. The Effectiveness section is one intent-anchored drill (`frontend/packages/admin/src/components/admin/EffectivenessTab.tsx`) served by the `intent_effectiveness`, `intent_exchanges`, `task_details`, and `task_timeline` queries. Both data prerequisites ship: evaluation join keys are stamped at Pass A write time, and `ConverseStep` carries per-tool outcome. Aurora-served; in",
+      "path": "docs/specs/interface/admin/SPEC-ADMIN-CONSOLE-EFFECTIVENESS.md"
+    },
+    {
       "title": "SPEC: Admin Console",
       "summary": "**Status:** Partial (8 sections built; Aurora-only quality views and several operator affordances are opt-in or roadmap) **Layer:** Interface (admin interface - reference client) **Plane:** admin **Summary:** A single internal operator surface for reading conversations, moderating and administering them, managing assistant profiles, and watching platform health, assistant effectiveness, experiment",
       "path": "docs/specs/interface/admin/SPEC-ADMIN-CONSOLE.md"
@@ -352,7 +397,7 @@
     },
     {
       "title": "SPEC: Abuse Controls (rate limiting, spend budgets, request dedup)",
-      "summary": "**Status:** Implemented (all phases).",
+      "summary": "**Status:** Implemented, with two of the five controls opt-in and OFF unless configured, and **one control partially implemented**. Request dedup covers replays of a single dispatch on every path, and covers duplicate *deliveries* of one user message on `/battle` (a durable claim on `deriveBattleId`), within a single warm container on `@all`, and on the normal path through the router's derived cor",
       "path": "docs/specs/ops/SPEC-ABUSE-CONTROLS.md"
     },
     {
@@ -373,7 +418,7 @@
   ],
   "blog": [],
   "generated_from": {
-    "repo_docs": 73,
+    "repo_docs": 82,
     "public_blog_posts": 0,
     "blog_vault_used": false
   }

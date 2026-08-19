@@ -24,10 +24,11 @@
  *
  * Overridable via env:
  *   TEST_SECRET_NAME   secret id            (default: agent-interface/test-credentials)
- *   TEST_USER_PASSWORD permanent password   (default: AgentEchelonE2E!2026)
+ *   TEST_USER_PASSWORD permanent password   (default: RANDOM per run, written to the secret)
  *   TEST_EMAIL_DOMAIN  tier-user email host (default: agentechelon.test)
  *   ADMIN_EMAIL        admin user's email   (default: testuser-admin@<domain>)
  */
+import { randomBytes } from 'node:crypto';
 import {
   CognitoIdentityProviderClient,
   AdminCreateUserCommand,
@@ -49,11 +50,31 @@ import {
   SecretsManagerClient,
   PutSecretValueCommand,
   CreateSecretCommand,
+  GetSecretValueCommand,
 } from '@aws-sdk/client-secrets-manager';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const SECRET_NAME = process.env.TEST_SECRET_NAME || 'agent-interface/test-credentials';
-const PASSWORD = process.env.TEST_USER_PASSWORD || 'AgentEchelonE2E!2026';
+/**
+ * The test-user password: a strong RANDOM value per run unless TEST_USER_PASSWORD overrides it.
+ *
+ * This shipped a hardcoded default in a PUBLIC repo, and documented it in the README as the default.
+ * The literal is not repeated here, because it is still the live password on any user provisioned by
+ * an earlier run. Its sibling `seed-demo.ts` had already settled the policy the other way, in
+ * as many words - "a strong RANDOM password is generated per run, so NO default credential ships in
+ * the repo" - so the two provisioning paths disagreed about the same question, and the one a deployer
+ * is told to run first was the one shipping a known password. Anyone who ran it and did not think to
+ * override got four Cognito users whose password is published in this file.
+ *
+ * Nothing needs the value to be predictable: it is written to the credentials secret below, which is
+ * where the e2e suite reads it from. TEST_USER_PASSWORD remains for a deployer who deliberately wants
+ * stable logins across re-provisions.
+ */
+function generateTestPassword() {
+  // Cognito-valid by construction: upper + lower + digit + symbol, plus ~16 chars of entropy.
+  return `Ae${randomBytes(12).toString('base64url').replace(/[^A-Za-z0-9]/g, '')}9!`;
+}
+const PASSWORD = process.env.TEST_USER_PASSWORD || generateTestPassword();
 const EMAIL_DOMAIN = process.env.TEST_EMAIL_DOMAIN || 'agentechelon.test';
 const ADMIN_EMAIL = process.env.ADMIN_EMAIL || `testuser-admin@${EMAIL_DOMAIN}`;
 
@@ -69,7 +90,39 @@ const USERS = [
   { key: 'standardUser', email: `testuser-standard@${EMAIL_DOMAIN}`, tier: 'standard', groups: ['standard'],         name: 'Test Standard' },
   { key: 'premiumUser',  email: `testuser-premium@${EMAIL_DOMAIN}`,  tier: 'premium',  groups: ['premium'],          name: 'Test Premium' },
   { key: 'testAdmin',    email: ADMIN_EMAIL,                         tier: 'premium',  groups: ['admins', 'premium'], name: 'Test Admin' },
+  // A SECOND premium identity, distinct from the admin. `testAdmin` and `premiumUser` are the same
+  // account, so nothing that turns on two different PEOPLE could be exercised: who owns a duel, whose
+  // reply resumes it, per-user battle picks, what a NON-moderator member sees. The e2e suite has read
+  // this key for as long as those tests have existed and nothing here created it, so they self-skipped
+  // with "no provisioned secondPremiumUser" - a permanent gate that reads like a deployment choice.
+  { key: 'secondPremiumUser', email: `testuser-premium2@${EMAIL_DOMAIN}`, tier: 'premium', groups: ['premium'], name: 'Test Premium Two' },
+  // Reserved for the ONBOARDING intake and used by nothing else, so its onboarding state is whatever
+  // the onboarding spec last set it to - global-setup deliberately does not pre-onboard it. Same story
+  // as secondPremiumUser one row up: the e2e read this key for as long as the intake spec existed,
+  // nothing wrote it, and the phase self-skipped with a reason that read like a deployment choice.
+  { key: 'onboardingUser', email: `testuser-onboarding@${EMAIL_DOMAIN}`, tier: 'standard', groups: ['standard'], name: 'Test Onboarding' },
 ];
+
+/**
+ * `--only <key>[,<key>]` provisions just those users and leaves the rest of the secret untouched.
+ *
+ * Without it the only way to add one user is a full run, which resets EVERY user's password (a fresh
+ * random one per run) and republishes the secret from this table alone. On a deployment whose e2e is
+ * already signed in and whose demo data is tied to those accounts, that is a wide blast radius for
+ * adding one login.
+ */
+const onlyIdx = process.argv.indexOf('--only');
+const ONLY_KEYS = onlyIdx !== -1 && process.argv[onlyIdx + 1]
+  ? process.argv[onlyIdx + 1].split(',').map((k) => k.trim()).filter(Boolean)
+  : null;
+if (ONLY_KEYS) {
+  const unknown = ONLY_KEYS.filter((k) => !USERS.some((u) => u.key === k));
+  if (unknown.length) {
+    console.error(`--only: unknown user key(s): ${unknown.join(', ')}. Known: ${USERS.map((u) => u.key).join(', ')}`);
+    process.exit(1);
+  }
+}
+const SELECTED = ONLY_KEYS ? USERS.filter((u) => ONLY_KEYS.includes(u.key)) : USERS;
 
 async function getCognitoOutputs() {
   const resp = await cfn.send(new DescribeStacksCommand({ StackName: 'AgentEchelonCognitoAuth' }));
@@ -196,8 +249,20 @@ async function ensureUser(userPoolId, appInstanceArn, u) {
   await ensureChimeUser(appInstanceArn, userPoolId, u.email);
 }
 
+/**
+ * MERGES into the existing secret rather than replacing it. A wholesale replace drops any key this
+ * table does not know about - `onboardingUser` is one the e2e reads and this script has never written -
+ * so adding a user could silently un-provision another suite.
+ */
 async function writeSecret(creds) {
-  const SecretString = JSON.stringify(creds);
+  let existing = {};
+  try {
+    const cur = await secrets.send(new GetSecretValueCommand({ SecretId: SECRET_NAME }));
+    existing = cur.SecretString ? JSON.parse(cur.SecretString) : {};
+  } catch (err) {
+    if (err.name !== 'ResourceNotFoundException') throw err;
+  }
+  const SecretString = JSON.stringify({ ...existing, ...creds });
   try {
     await secrets.send(new PutSecretValueCommand({ SecretId: SECRET_NAME, SecretString }));
     console.log(`  ~ updated secret ${SECRET_NAME}`);
@@ -218,19 +283,25 @@ async function main() {
   console.log(`  pool=${userPoolId} client=${clientId}`);
   console.log(`  appInstance=${appInstanceArn}`);
 
-  for (const u of USERS) {
+  if (ONLY_KEYS) console.log(`  --only: ${SELECTED.map((u) => u.key).join(', ')} (other users and secret keys untouched)`);
+
+  for (const u of SELECTED) {
     await ensureUser(userPoolId, appInstanceArn, u);
   }
 
-  const creds = { cognitoUserPoolId: userPoolId, cognitoClientId: clientId };
-  for (const u of USERS) {
+  // In `--only` mode the pool/client ids are NOT rewritten. The pool publishes more than one app
+  // client (web + admin), this reads whichever the CFN output names, and the secret's existing value
+  // may deliberately be the other one - tokens minted for the wrong audience fail at the API, which is
+  // a confusing way for an unrelated suite to break because someone added a login.
+  const creds = ONLY_KEYS ? {} : { cognitoUserPoolId: userPoolId, cognitoClientId: clientId };
+  for (const u of SELECTED) {
     creds[u.key] = { email: u.email, password: PASSWORD, tier: u.tier };
   }
   await writeSecret(creds);
 
   console.log('');
   console.log('Done. Test users ready (all share one password):');
-  for (const u of USERS) console.log(`  ${u.key.padEnd(13)} ${u.email}`);
+  for (const u of SELECTED) console.log(`  ${u.key.padEnd(18)} ${u.email}`);
   console.log('');
   console.log('Next: cd tests && npm install && npx playwright install chromium && npm test');
 }

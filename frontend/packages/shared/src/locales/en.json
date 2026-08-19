@@ -155,8 +155,12 @@
     "attachFile": "Attach file",
     "replyingTo": "Replying to",
     "clearStickyTarget": "Clear reply target",
-    "battleWaitingOne": "An assistant is waiting for your reply",
-    "battleWaitingMany": "{{count}} assistants are waiting — choose who to reply to"
+    "battleWaitingOne": "@{{name}} is waiting for your reply",
+    "battleWaitingMany": "{{count}} assistants are waiting — choose who to reply to",
+    "placeholderBattleReply": "Reply to @{{name}}…",
+    "answering": "Answering",
+    "answeringHint": "Your reply goes to @{{name}}, who is waiting on it",
+    "clearAnswering": "Send this message to the conversation instead"
   },
   "conversationList": {
     "heading": "Conversations",
@@ -307,5 +311,14 @@
       "unsupportedTitle": "This view isn't served by the current analytics mode.",
       "unsupportedBody": "Redeploy with "
     }
+  },
+  "workItems": {
+    "regionLabel": "Your open items",
+    "headlineOne": "An assistant is waiting on you",
+    "headlineMany": "{{count}} items are waiting on you",
+    "here": "in this conversation",
+    "otherConversation": "another conversation",
+    "finish": "Finish",
+    "blockedByBattle": "waits until the battle finishes"
   }
 }

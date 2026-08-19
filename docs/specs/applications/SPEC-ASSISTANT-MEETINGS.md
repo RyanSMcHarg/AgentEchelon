@@ -2,6 +2,8 @@
 
 **Status:** Draft / planning - the design is not finalized and nothing is built.
 
+**Coverage:** none - a draft design; nothing is built, so there is no deployed behaviour to drive.
+
 **Layer:** Built on the platform (application)
 
 **Summary:** An assistant that helps a person run a meeting end to end - schedule it, invite the attendees, greet and onboard each one as they arrive, take notes while it runs, and send the follow-ups afterward.

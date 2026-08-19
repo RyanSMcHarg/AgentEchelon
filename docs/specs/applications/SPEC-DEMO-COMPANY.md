@@ -2,6 +2,8 @@
 
 **Status:** Implemented (the demo dataset and seed script ship)
 
+**Coverage:** `e2e/classification-context.spec.ts`, `e2e/welcome.spec.ts`
+
 
 **Purpose:** A realistic, pre-loaded demo environment that showcases tiered agent access, in-loop tools, Guardrails, and context isolation. The demo context dataset ships in `backend/demo/context/`; the seed script is `backend/scripts/seed-demo.ts`.
 
@@ -283,7 +285,8 @@ The context files are uploaded to S3 by the seed script (`backend/scripts/seed-d
 
 ### Seed Script
 
-The seed script creates demo users in Cognito and populates initial conversations:
+The seed script creates the demo users and the context they need. It does **not** create
+conversations:
 
 ```bash
 # After CDK deploy, run:
@@ -295,11 +298,17 @@ The script:
 2. Sets their `custom:tier` attributes
 3. Confirms their accounts (skips email verification)
 4. Uploads context files to S3
-5. Creates a sample conversation per tier with 2-3 seed messages
+5. Validates the identity preconditions (tier groups + the premium admin)
+
+**Conversations are produced by `npm run validate`, not by the seed.** They are real
+user-to-assistant turns driven through the deployed system, deliberately never faked
+(`backend/scripts/seed-demo.ts` says so at the top of the file). So after seeding, the demo users
+exist and their context is in place, but every conversation list is empty until the validation run
+populates it. An empty list at that point is the expected state, not a broken seed.
 
 ### Persona Update
 
-The assistant persona flows through the `ASSISTANT_SYSTEM_PROMPT` env var (CDK context `assistantSystemPrompt`) on the tier's async-processor - there is no Bedrock Agent. The demo persona references Stratum Technologies as the default company and tells the assistant:
+The demo persona is written by `seed-demo.ts` into each tier's **active profile version** - the body goes to S3 under `profiles/{profile}/{configId}/persona` and the version's definition keeps a pointer to it ([`SPEC-PORTABLE-PROFILES.md`](../interaction/assistant-config/SPEC-PORTABLE-PROFILES.md)). That is what makes it versionable and exportable rather than a deploy-time constant. A deployment can still set a persona per deployment instead, through the `assistantSystemPrompt` CDK context, which writes the `assistant-{tier}/assistant-system-prompt` SSM parameter that the processor reads when a version carries no persona (the env var names the parameter; it does not carry the text). There is no Bedrock Agent either way. The demo persona references Stratum Technologies as the default company and tells the assistant:
 - You work for Stratum Technologies
 - Your knowledge comes from the context files in your tier's S3 prefix
 - Use the `load_company_context` tool to retrieve relevant information
@@ -309,8 +318,8 @@ The assistant persona flows through the `ASSISTANT_SYSTEM_PROMPT` env var (CDK c
 
 There is no demo deploy flag. The demo is set up in two steps after a normal deploy:
 
-1. **Persona (optional, at deploy).** To make the assistant speak as Stratum, pass the demo persona via `-c assistantSystemPrompt=...` (this sets `ASSISTANT_SYSTEM_PROMPT` on the tier async-processors). Omit it for the generic default ("You are a helpful AI assistant").
-2. **Seed (post-deploy).** Run `seed-demo.ts`. It creates the three demo users, uploads the context files to `s3://<AttachmentsBucketName>/context/`, and seeds a sample conversation per tier.
+1. **Persona (optional, at deploy).** The seed in step 2 already gives each tier the Stratum persona, so this step is only for a deployment that wants a persona in place before any seeding: pass it via `-c assistantSystemPrompt=...`, which writes the per-deployment parameter. Omit it and, until the seed runs, the assistant uses the generic default ("You are a helpful AI assistant").
+2. **Seed (post-deploy).** Run `seed-demo.ts`. It creates the three demo users, uploads the context files to `s3://<AttachmentsBucketName>/context/`, and seeds each tier's active profile version with the Stratum persona (body in S3 under `profiles/`). It seeds NO conversations - those come from `npm run validate` as real turns.
 
 For a blank-slate / production deployment, skip the seed step (and the demo persona): no context is uploaded and no demo users exist.
 
@@ -327,4 +336,4 @@ For a blank-slate / production deployment, skip the seed step (and the demo pers
 | `backend/demo/context/premium/board-summary.json` | Board meeting notes |
 | `backend/demo/context/premium/competitive-intel.json` | Feature comparisons |
 | `backend/demo/context/premium/team-metrics.json` | OKR progress |
-| `backend/scripts/seed-demo.ts` | User + conversation + context seeder (uploads context files to S3 via `uploadContextFiles`) |
+| `backend/scripts/seed-demo.ts` | User + context seeder (uploads context files to S3 via `uploadContextFiles`). Creates no conversations. |

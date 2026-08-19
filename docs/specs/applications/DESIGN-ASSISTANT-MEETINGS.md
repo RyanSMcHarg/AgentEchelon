@@ -2,6 +2,8 @@
 
 **Status:** Draft / planning - the design is not finalized and nothing is built.
 
+**Coverage:** none - a draft design; nothing is built, so there is no deployed behaviour to drive.
+
 **Layer:** Built on the platform (application)
 
 **Product spec:** [`SPEC-ASSISTANT-MEETINGS.md`](SPEC-ASSISTANT-MEETINGS.md)
@@ -23,7 +25,7 @@
 | **Classification cap** | Immutable channel `classification` tag; min-cap; fail-closed to the lowest rank. | Serves the classification of the meeting channel; an attendee below that classification is capped to it in-channel. |
 | **Identity / bot** | Own `CfnAppInstanceBot`, bearer-pinned; `ChannelModerator` of its own channels; privileged actions via credential-exchange. | The meetings bot owns and moderates the meeting channel. It never holds a standing calendar-write or membership grant - those run through host apply endpoints (below). |
 | **Converse tool loop** | `invokeBedrock` in `async-processor-core.ts`: input guardrail, bounded loop (`MAX_TOOL_ITERATIONS = 3`), `tool_use` dispatch, `toolResult`, final generate, output guardrail, `ConverseStep` telemetry. | Unchanged. It exposes the tools in Part B. |
-| **Intent classification** | Intent pack (`ASSISTANT_INTENT_PACK` -> SSM) + universal three; LLM classifier with keyword fallback; pack + persona hash into `configId`. | `intent-pack-meetings.json` (section "Config wiring"). |
+| **Intent classification** | Intent pack (`ASSISTANT_INTENT_PACK` -> SSM) + universal three; LLM classifier (the default for every profile; the keyword classifier is an opt-in alternative, not a fallback stage); pack + persona hash into `configId`. | `intent-pack-meetings.json` (section "Config wiring"). |
 
 The two TASK_MULTI_STEP intents (`schedule_meeting`, `follow_up`) ride the generic `action_item` task lifecycle (`gather -> present options -> awaiting_completion -> completed`) exactly as the corporate-travel worked example does - no meeting-specific state machine is added. `onboard_attendee` is TASK_MULTI_STEP but its steps are attendee greeters run by the orchestration primitive (Part B.3), not a task graph.
 

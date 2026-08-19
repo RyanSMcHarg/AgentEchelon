@@ -165,7 +165,7 @@ export async function signIn(
   await page.locator('input[type="password"]').fill(password);
   await page.locator('button[type="submit"]').click();
 
-  // Wait for authenticated UI. Post the admin/chat split (SPEC-SEPARATE-ADMIN-APP.md) this helper
+  // Wait for authenticated UI. Post the admin/chat split (DESIGN-SEPARATE-ADMIN-APP.md) this helper
   // signs into EITHER app: the chat SPA lands on `.app-header`, the admin console on
   // `.admin-dashboard`. Accept whichever renders.
   await page.waitForSelector('.app-header, .admin-dashboard', { timeout: 30000 });
@@ -219,36 +219,38 @@ export async function createConversation(
   // to the WRONG channel (confirmed via trace: the Chime SendChannelMessage
   // POST targeted the prior channel's ARN). Gating on the modal close makes the
   // active-conversation swap a happens-before for the send.
-  await page.locator('.ncm-modal').waitFor({ state: 'hidden', timeout: 20000 });
+  await page.locator('.ncm-modal').waitFor({ state: 'hidden', timeout: 5000 });
 
   // Wait for conversation to load
-  await page.waitForSelector('.conversation-header', { timeout: 15000 });
+  await page.waitForSelector('.conversation-header', { timeout: 10000 });
 
-  // Confirm the assistant's welcome before returning. The bot greets when the
-  // ASSISTANT joins the channel (Chime fires the per-tier bot's WelcomeIntent on
-  // the assistant being added, NOT on the creator's join) — correct product
-  // behaviour, but the greeting can land
-  // a beat AFTER the conversation view renders (cold Lambda + context lookup).
-  // Waiting for it here means a test's first real message and its answer are
-  // never conflated with the separate, earlier welcome. Best-effort: a 30s
-  // budget covers a cold welcome; if none shows we proceed (the per-test
-  // response wait still asserts the actual answer) rather than fail on the
-  // greeting alone.
+  // The assistant greets when it is ADDED to the channel (Chime fires the per-classification
+  // assistant's WelcomeIntent on the assistant joining, not on the creator's join). Waiting for it
+  // here keeps a test's first real message and its answer from being conflated with that earlier
+  // greeting.
+  //
+  // This ASSERTS rather than warns, and the budget is deliberately tight. The previous 30s
+  // best-effort wait was padding around a real defect: the client dropped the welcome outright when
+  // it arrived in the window between creating the channel and registering a listener, so the wait
+  // could never succeed and the test shrugged and continued. That hid the bug for months AND, by
+  // consuming most of the 120s test budget, produced unrelated-looking timeout failures further
+  // down the same test.
+  //
+  // Measured cost of the welcome is 50ms to 1.7s of handler time (CloudWatch, 2026-07-31) plus
+  // delivery, so 10s is generous. A welcome slower than that is a regression worth failing on, and
+  // a missing one is the defect this assertion exists to catch.
   const welcomeLocator = page.locator('.assistant-message .message-text').first();
-  const welcomeAppeared = await welcomeLocator
-    .waitFor({ state: 'visible', timeout: 30000 })
-    .then(() => true)
-    .catch(() => {
-      console.warn('[createConversation] No welcome message appeared within 30s');
-      return false;
-    });
-  if (welcomeAppeared) {
-    // The on-add welcome must render as human text — never the raw Lex
-    // fulfillment envelope (`{"Messages":[…]}`). Guards the frontend unwrap so
-    // users never see raw JSON.
-    const welcomeText = ((await welcomeLocator.textContent()) || '').trim();
-    expect(welcomeText.startsWith('{') && welcomeText.includes('"Messages"')).toBe(false);
-  }
+  await expect(
+    welcomeLocator,
+    'the assistant\'s on-add welcome must arrive; a missing welcome means the client dropped it '
+      + '(see ConversationProvider: the single app-level channel handler) or the assistant never posted it',
+  ).toBeVisible({ timeout: 10000 });
+
+  // The on-add welcome must render as human text — never the raw Lex
+  // fulfillment envelope (`{"Messages":[…]}`). Guards the frontend unwrap so
+  // users never see raw JSON.
+  const welcomeText = ((await welcomeLocator.textContent()) || '').trim();
+  expect(welcomeText.startsWith('{') && welcomeText.includes('"Messages"')).toBe(false);
 }
 
 /**
@@ -261,14 +263,68 @@ export async function createConversation(
  * parsed greeting copy) is robust where an exact-text compare leaks. Real
  * answers are posted clean via UpdateChannelMessage, so they never match.
  */
+/**
+ * A backend FAILURE the assistant posted into the channel as its reply.
+ *
+ * When Lex fulfillment errors or times out, Chime retries and then posts the raw error envelope -
+ * `{"Code":429}` on throttle, `{"Code":403}` on an authorization failure - as the assistant's
+ * message. It is a real, user-visible failure: the person sees JSON where an answer should be.
+ *
+ * Nothing used to look for it. The reply did not match the "answer" shape, so the wait loop simply
+ * kept polling until the test's timeout, and the failure surfaced as `locator.fill: Target page
+ * closed` - naming the teardown instead of the cause, minutes later. Detecting it here turns a
+ * mystery timeout into an immediate, named failure.
+ */
+function backendErrorReply(text: string): string | null {
+  const trimmed = text.trim();
+  const m = trimmed.match(/^\{"Code"\s*:\s*(\d+)\}$/);
+  if (m) return `the assistant posted a raw error envelope (HTTP ${m[1]}) instead of a reply`;
+  // NOT an error: `{"Messages":[]}` is the router's DESIGNED silent response to a duplicate
+  // fulfillment (ADR-022). Amazon Chime SDK retries a fulfillment that does not answer in time; the
+  // retry derives the same correlation id, fails to claim `fulfil-<corr>`, and returns an empty
+  // messages array so no second placeholder is produced. The client suppresses that envelope
+  // (`isEmptyLexEnvelope`), so the user never sees it.
+  //
+  // This helper used to call it a backend failure, which was true before the dedup control existed and
+  // is now exactly backwards: it fails the turn precisely when the duplicate-suppression is WORKING.
+  // Observed live 2026-08-06 - fulfillment at 16:52:56 answered, its retry at 16:52:59 logged
+  // `[Router] duplicate fulfillment suppressed` and returned this envelope, and the test reported a
+  // backend failure on a turn the user saw answered exactly once.
+  //
+  // Treating it as "keep waiting" is right: the winning fulfillment's answer arrives on its own
+  // placeholder, so the capture loop should ignore this frame and settle on the real reply.
+  return null;
+}
+
 function looksLikeWelcomeOrEnvelope(text: string): boolean {
   if (!text) return false;
   return (
+    /^\{"Messages"\s*:\s*\[\s*\]\s*\}$/.test(text.trim()) || // suppressed-duplicate silent envelope (ADR-022)
     /"Messages"\s*:\s*\[\s*\{\s*"Content"/.test(text) || // raw Lex-fulfillment JSON envelope
     text.includes('your assistant for this conversation') || // router/tier welcome (parsed)
     text.includes("I'm your AI assistant") || // basic welcome (parsed)
     text.includes("I'm your assistant at") // config-driven orientation welcome ("…assistant at <company>…")
   );
+}
+
+// Task-progress placeholders the backend posts SYNCHRONOUSLY while an async task
+// runs, then REPLACES in place with the real answer (backend getTaskPlaceholder,
+// lambda/src/lib/delivery-options.ts). Like the welcome, these are interim copy —
+// the capture must keep waiting for the settled final reply, never return one, or
+// a task turn reports the "Let me understand the issue..." placeholder as its
+// answer. The UI appends animated dots, so normalize trailing dots before compare.
+// Keep this set in sync with getTaskPlaceholder; a stale entry only costs one extra
+// poll, never a false answer.
+const TASK_PLACEHOLDERS = new Set([
+  'let me understand the issue', 'analyzing the problem', 'finding solutions', 'looking into that',
+  'understanding your data needs', 'extracting data', 'validating results', 'processing your request',
+  'understanding your report needs', 'drafting outline', 'generating report', 'working on the report',
+  'analyzing', 'working on that', 'one moment',
+]);
+export function looksLikeTaskPlaceholder(text: string): boolean {
+  if (!text) return false;
+  const norm = text.trim().toLowerCase().replace(/[.…\s]+$/, '');
+  return TASK_PLACEHOLDERS.has(norm);
 }
 
 /**
@@ -312,7 +368,12 @@ export async function sendAndWaitForResponse(
       .replace(/<!--[a-zA-Z_]+(?::[^>]*)?-->/gs, '')
       .trim();
 
-    if (text.length > 0 && text !== priorLastText && !looksLikeWelcomeOrEnvelope(text)) {
+    // The socket sees the assistant's reply first, so this is the earliest possible point to catch a
+    // backend failure - before the DOM settle loop spends the caller's whole timeout on it.
+    const wsErr = backendErrorReply(text);
+    if (wsErr) throw new Error(`[backend failure] ${wsErr}: ${text}`);
+
+    if (text.length > 0 && text !== priorLastText && !looksLikeWelcomeOrEnvelope(text) && !looksLikeTaskPlaceholder(text)) {
       const ttfrLabel = wsTimings.ttfrMs ? ` [TTFR: ${wsTimings.ttfrMs}ms]` : '';
       console.log(`Response (${elapsed}ms${ttfrLabel}): "${text.substring(0, 80)}..."`);
 
@@ -330,7 +391,14 @@ export async function sendAndWaitForResponse(
         wsTimings,
       };
     }
-    console.warn('[sendAndWaitForResponse] WebSocket returned empty content');
+    // Empty, the pre-send welcome, or a task-progress placeholder that will be
+    // replaced in place — fall through to the DOM settle loop, which waits for the
+    // real answer to land and stabilize instead of returning interim copy.
+    console.warn(
+      looksLikeTaskPlaceholder(text)
+        ? `[sendAndWaitForResponse] WebSocket saw a task placeholder ("${text.slice(0, 40)}"); waiting for the settled reply via DOM`
+        : '[sendAndWaitForResponse] WebSocket returned empty content',
+    );
   }
 
   // -- Fallback: DOM polling --
@@ -358,7 +426,15 @@ export async function sendAndWaitForResponse(
     // handled by the three checks below; a length gate added nothing but that
     // false negative.
     expect(trimmed.length).toBeGreaterThan(0);
-    expect(trimmed.toLowerCase()).not.toContain('one moment');
+    // Fail NOW on a backend error the assistant posted as its reply, rather than polling until the
+    // caller's timeout and reporting the teardown instead of the cause.
+    const domErr = backendErrorReply(trimmed);
+    if (domErr) throw new Error(`[backend failure] ${domErr}: ${trimmed}`);
+    // A task turn first renders a progress placeholder ("Let me understand the
+    // issue...", "Extracting data...") that is later replaced in place. Keep
+    // polling past ANY of them so the settled real answer is what we return,
+    // not the interim — supersedes the old single "one moment" special-case.
+    expect(looksLikeTaskPlaceholder(trimmed), `still on a task placeholder: "${trimmed}"`).toBe(false);
     // Must be a genuinely NEW bot reply, not the pre-send welcome re-read
     // (exact match) nor the welcome in any other rendered/envelope form.
     expect(trimmed).not.toBe(priorLastText);
@@ -519,7 +595,15 @@ export function logResult(
 ): void {
   console.log(`\n--- ${testId} ---`);
   const wsLabel = response.wsTimings?.ttfrMs ? ` [TTFR: ${response.wsTimings.ttfrMs}ms]` : '';
-  console.log(`Response (${response.latencyMs}ms${wsLabel}): ${response.text.substring(0, 200)}...`);
+  // 200 chars is enough to eyeball a failure, and not enough to audit a PASS. A grounding
+  // assertion is `mustContainAny`, so it is satisfied by the name appearing anywhere - including
+  // one table row about somebody else, while the headline answer names a different person. That
+  // difference is invisible at 200 chars, and a rate measured from truncated logs is a rate
+  // measured from something other than the answer. E2E_FULL_REPLY=1 prints the whole reply.
+  const body = process.env.E2E_FULL_REPLY === '1'
+    ? response.text
+    : `${response.text.substring(0, 200)}...`;
+  console.log(`Response (${response.latencyMs}ms${wsLabel}): ${body}`);
   if (response.sawPlaceholder) console.log('Saw placeholder response');
   if (qualityIssues.length > 0) console.log(`Quality issues: ${qualityIssues.join('; ')}`);
   if (contentIssues.length > 0) console.log(`Content issues: ${contentIssues.join('; ')}`);

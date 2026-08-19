@@ -59,10 +59,17 @@ const OUTPUT_TO_VITE = {
   SleepModeEnabled: 'VITE_SLEEP_MODE_ENABLED',
   ClientEventsApiUrl: 'VITE_CLIENT_EVENTS_API_URL',
   UserManagementApiUrl: 'VITE_USER_MANAGEMENT_API_URL',
+  // Drives whether the admin console shows the User Management tab or a pointer to the
+  // configured IdP: `user-management.ts` drives Cognito User Pools directly, so it manages
+  // nothing on a deployment that replaced them.
+  IdentityProvider: 'VITE_IDENTITY_PROVIDER',
   AdminConversationApiUrl: 'VITE_ADMIN_CONVERSATIONS_API_URL',
   UserFeedbackApiUrl: 'VITE_USER_FEEDBACK_API_URL',
   ChannelBattleApiUrl: 'VITE_CHANNEL_BATTLE_API_URL',
   BattleOutcomeApiUrl: 'VITE_BATTLE_OUTCOME_API_URL',
+  // The caller's own open work items (GET /tasks/mine). Absent ⇒ the chat app renders no queue,
+  // which is why it is OPTIONAL below: a deployment without it simply has no reminder surface.
+  UserTasksApiUrl: 'VITE_USER_TASKS_API_URL',
   ExperimentsApiUrl: 'VITE_EXPERIMENTS_API_URL',
   // SPEC-PORTABLE-VERSIONED-PROFILES: the manage-profiles lifecycle API (list/version/activate/
   // rollback/import/export). Admin-only. Co-hosted with the experiments API.
@@ -110,6 +117,7 @@ const CHAT_ONLY = new Set([
   'VITE_CLIENT_EVENTS_API_URL',
   'VITE_CHANNEL_BATTLE_API_URL',
   'VITE_BATTLE_OUTCOME_API_URL',
+  'VITE_USER_TASKS_API_URL',
 ]);
 
 // VITE vars that are optional: absent output ⇒ omit the line (the app degrades,
@@ -120,6 +128,7 @@ const OPTIONAL = new Set([
   'VITE_CLIENT_EVENTS_API_URL',
   'VITE_CHANNEL_BATTLE_API_URL',
   'VITE_BATTLE_OUTCOME_API_URL',
+  'VITE_USER_TASKS_API_URL',
   'VITE_EXPERIMENTS_API_URL',
   'VITE_ADMIN_CLIENT_ID',
   // The standalone admin console is OPT-IN (`-c enableAdminApp=true`): without it there is no

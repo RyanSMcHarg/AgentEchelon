@@ -33,7 +33,7 @@ A deployer can run one, the other, or both. There's no required default; the reg
 Three dimensions to consider:
 
 **1. Where do credentials live?**
-- Bedrock providers use IAM. The Lambda execution role gets `bedrock:InvokeModel` on the configured model ARN. No secrets to rotate, no env vars to set, no third-party billing.
+- Bedrock providers use IAM. The Lambda execution role gets `bedrock:InvokeModel` on the configured model ARN. No secrets to rotate, no env vars to set, no third-party billing. The grant is DERIVED from the registry (`BEDROCK_IMAGE_MODEL_ARNS`), so every `aws-bedrock` entry is covered and adding a model cannot leave it ungranted. It uses a region wildcard, which is what lets a region-pinned model be invoked cross-region.
 - External providers need an API key in the Lambda's environment. The key gets paid through that vendor's billing relationship, not your AWS account. Rotation is on you.
 
 **2. Where does network traffic go?**
@@ -54,7 +54,7 @@ Modern Stability text-to-image models exposed by Bedrock. AWS-native, IAM-authed
 |---|---|
 | Registry keys | `stability_image_core`, `stability_image_ultra` |
 | Bedrock model ids | `stability.stable-image-core-v1:1`, `stability.stable-image-ultra-v1:1` |
-| Region | us-west-2 only - the Stability base generators are not offered in us-east-1 (a us-east-1 deployment reaches them by setting `IMAGE_GEN_REGION` / `imageGenRegion` to `us-west-2`; check `aws bedrock list-foundation-models --region us-west-2`) |
+| Region | us-west-2 only - the Stability base generators are not offered in us-east-1, where every Stability model Bedrock lists is an editing operation (upscale, inpaint, erase-object, style-transfer) rather than a generator. **No configuration is needed:** the registry declares `region: 'us-west-2'` on these entries and the invoker builds its Bedrock client for the model's own region, so they work from any deploy region. Set `IMAGE_GEN_REGION` / `imageGenRegion` only to OVERRIDE that (it wins over the registry). Check with `aws bedrock list-foundation-models --region us-west-2` |
 | Auth | IAM - Lambda role needs `bedrock:InvokeModel` on the model ARN |
 | Approx cost per image | $0.04 (Core), $0.08 (Ultra) |
 | Request body | `{ prompt, mode:'text-to-image', aspect_ratio:'1:1', output_format:'png', seed? }` |

@@ -10,10 +10,14 @@ import { AnalyticsStack } from '../lib/stacks/analytics-stack';
 import { AnalyticsStackAurora } from '../lib/stacks/analytics-stack-aurora';
 import { IAnalyticsStackOutputs } from '../lib/interfaces/analytics-stack-interface';
 import { NotificationStack } from '../lib/stacks/notification-stack';
+import { IMAGE_GEN_MODELS } from '../lambda/src/lib/image-gen-models';
+import { RES_PREFIX } from '../lib/stacks/agent-classification-common';
+import { ImageGuardrailStack } from '../lib/stacks/image-guardrail-stack';
 import { BasicClassificationStack } from '../lib/stacks/basic-classification-stack';
 import { StandardClassificationStack } from '../lib/stacks/standard-classification-stack';
 import { PremiumClassificationStack } from '../lib/stacks/premium-classification-stack';
 import { ChannelFlowStack } from '../lib/stacks/channel-flow-stack';
+import { PostProcessingStack } from '../lib/stacks/post-processing-stack';
 import { BattleStack } from '../lib/stacks/battle-stack';
 import { ExperimentsStack } from '../lib/stacks/experiments-stack';
 import { FrontendStack } from '../lib/stacks/frontend-stack';
@@ -81,14 +85,17 @@ const enableBattle: boolean =
 // path"). It REQUIRES analyticsMode=aurora; in Athena mode there is no Aurora to
 // query, so drift is inert regardless.
 //
-// WHY default OFF: the current live path runs a synchronous pgvector query inside
-// the reply handler, which forces a VPC attachment (`auroraDriftWiring`) onto
-// PRIVATE_ISOLATED subnets — and that severs the handler's egress to Chime (no
-// Chime PrivateLink, no NAT), so every agent reply times out. ADR-013 fixes this
-// (retrieval via RDS Data API / async, decision via a reasoning gate, handler
-// stays out of the VPC); until that lands, opting in with `-c enableLiveDrift=true`
-// re-enables the broken VPC path — do not enable it in Aurora mode until ADR-013
-// ships.
+// WHY default OFF: it is the documented contract (AURORA-MODE-GUIDE.md, ADR-013
+// decision 4) — a plain `cdk deploy -c analyticsMode=aurora` ships the
+// analytics-only post-hoc path, and the live user-facing suggestion is an
+// explicit opt-in. It is NOT off because the live path is broken: the original
+// reason (ADR-013 §"the live-drift re-homing broke agent replies") was that
+// `auroraDriftWiring` VPC-attached each agent handler to PRIVATE_ISOLATED
+// subnets, severing its egress to Amazon Chime SDK Messaging so every reply hung
+// to the 30s timeout. That is FIXED: retrieval and drift now run in a dedicated
+// VPC-attached data-plane Lambda and the handler stays non-VPC, invoking it
+// (ADR-013; see TROUBLESHOOTING.md §"live drift returns 429").
+// Opting in with `-c enableLiveDrift=true` is therefore safe on the current build.
 const enableLiveDrift: boolean =
   analyticsMode === 'aurora'
   && (app.node.tryGetContext('enableLiveDrift') === true
@@ -166,7 +173,7 @@ const enableManagedWaf = app.node.tryGetContext('frontendWaf') !== false
 const wafRateLimitCtx = app.node.tryGetContext('wafRateLimit');
 const wafRateLimit = wafRateLimitCtx ? Number(wafRateLimitCtx) : undefined;
 const wafAllowedIps = parseWafAllowedIps(app.node.tryGetContext('wafAllowedIps'));
-// Standalone admin console hosting (SPEC-SEPARATE-ADMIN-APP.md). OPT-IN: a
+// Standalone admin console hosting (DESIGN-SEPARATE-ADMIN-APP.md). OPT-IN: a
 // deployment may run headless or host its own console, so the AgentEchelonAdminFrontend
 // stack (its own S3 + CloudFront origin, serving admin.html) is only created with
 // `--context enableAdminApp=true`. The chat SPA never carries admin code either way.
@@ -207,11 +214,15 @@ const cognitoStack = new CognitoAuthStack(app, `${STACK_PREFIX}CognitoAuth`, {
   env,
   appInstanceArn: chimeStack.appInstanceArn,
   attachmentsBucketArnParam,
+  // Descriptive only (changes no authorization): names the IdP that actually governs end users, so
+  // the admin console can point operators at it instead of showing a Cognito-only User Management
+  // tab on a deployment that replaced User Pools. See IDENTITY-PROVIDER-GUIDE.md.
+  identityProvider: (app.node.tryGetContext('identityProvider') as string) || 'cognito',
   description: 'Cognito authentication with SAML/OIDC support',
 });
 
 // Admin conversation READ plane (list / messages / membership-history over the archive). Moved OUT of
-// cognito-auth-stack (BUGS-ADMIN-CONSOLE D1): it is an admin-plane DATA api, not identity infra. It
+// cognito-auth-stack: it is an admin-plane DATA api, not identity infra. It
 // imports the Identity-Pool sign-on + persona roles by ARN and attaches its execute-api teeth here, so
 // there is no circular dependency (admin-plane → cognito-auth only).
 const adminPlaneStack = new AdminPlaneStack(app, `${STACK_PREFIX}AdminPlane`, {
@@ -353,7 +364,7 @@ if (analyticsMode === 'aurora') {
 // The Aurora-drift hookup passed to EVERY per-tier stack when drift is on (Aurora
 // mode). Each tier grants its agent handler invoke access to the retrieval +
 // drift data-plane Lambda via `auroraDriftWiring`; the handler stays non-VPC
-// (project decision 018).
+// (ADR-013).
 const auroraDriftHookup = enableLiveDrift && auroraStackForDrift
   ? {
       dataPlaneArn: auroraStackForDrift.dataPlaneLambdaArn,
@@ -381,7 +392,12 @@ const foundationsStack = new FoundationsStack(app, `${STACK_PREFIX}Foundations`,
   env,
   appInstanceArn: chimeStack.appInstanceArn,
   userPoolId: cognitoStack.userPool.userPoolId,
-  description: 'Shared foundation: task tables + create-conversation/add-agent',
+  // The feedback API moved here from CognitoAuthStack (D1): it is a product feature with no identity
+  // relationship. It needs the pool only for its authorizer, and the TABLE stays in CognitoAuthStack
+  // because moving a DynamoDB table between stacks replaces it and loses the data.
+  userPool: cognitoStack.userPool,
+  feedbackTable: cognitoStack.feedbackTable,
+  description: 'Shared foundation: task tables + create-conversation/add-agent + user feedback',
 });
 
 // 5b. Experiments Stack — A/B experiments table + admin-experiments API.
@@ -395,6 +411,9 @@ const experimentsStack = new ExperimentsStack(app, `${STACK_PREFIX}Experiments`,
   appUrl,
   adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
   adminPersonaRoleArns: cognitoStack.adminPersonaRoleArns,
+  // manage-profiles keeps profile personas in the attachments bucket under `profiles/*` so a version's
+  // persona is bounded by its own limit rather than by the SSM parameter it used to live inside.
+  attachmentsBucketArnParam,
   description: 'A/B experiments table + admin-experiments API (VITE_EXPERIMENTS_API_URL)',
 });
 experimentsStack.addDependency(chimeStack);
@@ -417,7 +436,7 @@ const notificationStack = new NotificationStack(app, `${STACK_PREFIX}Notificatio
 // per-tier processor + credential-exchange roles (agent-classification-common.classificationChannelScopedAllow); the
 // model allowlist is the processor role's own Bedrock grant. Deleted per SPEC-CAPABILITY-PROFILES §D-2.
 
-// 8b. Per-tier stacks (docs/SPEC-PER-TIER-OWNERSHIP.md, ADR-011) — each tier is
+// 8b. Per-tier stacks (docs/SPEC-PER-PROFILE-OWNERSHIP.md, ADR-011) — each tier is
 // an independently-deployable stack a separate team can own end-to-end: the
 // async-processor (the assistant — a self-hosted Converse tool loop, no Bedrock
 // Agent) + its tier-scoped context S3 IAM + content guardrail + Lex bot
@@ -435,8 +454,47 @@ const notificationStack = new NotificationStack(app, `${STACK_PREFIX}Notificatio
 // (basic-classification-stack.ts / standard-classification-stack.ts / premium-classification-stack.ts),
 // so a classification-team change reviews + ships only that classification. Shared constants live in
 // lib/stacks/agent-classification-common.ts.
+// ── Image-generation guardrails in the regions the MODELS live in ──────────────
+//
+// Bedrock guardrails are REGIONAL and Bedrock does not offer every image model in every region:
+// the Stability generators are us-west-2-only, so a us-east-1 deployment invokes them cross-region.
+// A guardrail in the deploy region cannot be attached to that call - it fails as
+// "The guardrail identifier or version provided in the request does not exist", which reads like a
+// bad id rather than a wrong region. Derived from the registry (not hardcoded) so adding a
+// region-pinned model provisions its guardrail automatically, exactly as the image-gen IAM ARNs are
+// already derived.
+const imageModelRegions = [...new Set(
+  Object.values(IMAGE_GEN_MODELS)
+    .filter((m) => m.lifecycle === 'active' && m.hosting === 'aws-bedrock' && m.region)
+    .map((m) => m.region as string),
+)].filter((r) => r !== env.region);
+
+const imageGuardrailStacks = imageModelRegions.map((region) => new ImageGuardrailStack(
+  app,
+  `${STACK_PREFIX}ImageGuardrail-${region}`,
+  {
+    env: { account: env.account, region },
+    // The classification stacks read this stack's outputs across regions; CDK needs this on BOTH
+    // sides to generate the SSM-backed cross-region export.
+    crossRegionReferences: true,
+    guardrailName: `${RES_PREFIX}-image-guardrail-${region}`,
+    description: `AgentEchelon image-generation content guardrail in ${region} (models pinned there)`,
+  },
+));
+
+/** region -> {id, version}, for every region an active pinned image model lives in. */
+const imageGuardrailByRegion: Record<string, { id: string; version: string }> = {};
+imageModelRegions.forEach((region, i) => {
+  imageGuardrailByRegion[region] = {
+    id: imageGuardrailStacks[i].guardrailId,
+    version: imageGuardrailStacks[i].guardrailVersion,
+  };
+});
+
 const classificationSharedProps = {
   env,
+  crossRegionReferences: true,
+  imageGuardrailByRegion,
   appInstanceArn: chimeStack.appInstanceArn,
   attachmentsBucketName: s3Stack.attachmentsBucket.bucketName,
   attachmentsBucketArn: s3Stack.attachmentsBucket.bucketArn,
@@ -554,6 +612,26 @@ const channelFlowStack = new ChannelFlowStack(app, `${STACK_PREFIX}ChannelFlow`,
 // table exists before ChannelFlow deploys (env var + read grant reference its name/ARN).
 channelFlowStack.addDependency(experimentsStack);
 
+// 9b. Post-processing — what the platform does with a message AFTER delivery (ADR-032 tenet 4): one
+// consumer on the message stream, acting on messages delivery did not route. Deliberately NOT in the
+// channel flow, which is synchronous and runs on every message: a correction for a state that should
+// not exist must cost time only in the broken case. It goes AFTER the stacks whose SSM contract it
+// resolves at deploy (the tasks table from Foundations, the router ARNs from the classifications),
+// which is also why it cannot live in the analytics stacks - those deploy before both.
+const postProcessingStack = new PostProcessingStack(app, `${STACK_PREFIX}PostProcessing`, {
+  env,
+  appInstanceArn: chimeStack.appInstanceArn,
+  // Both analytics modes create the Chime message stream and push the same streaming configuration,
+  // so this resolves identically whichever mode is deployed.
+  kinesisStreamArn: analyticsStack.kinesisStreamArn,
+  description: 'Post-processing on the message stream: acts on messages delivery did not route',
+});
+postProcessingStack.addDependency(analyticsStack); // the stream it consumes
+postProcessingStack.addDependency(foundationsStack); // the tasks + abuse-controls tables (SSM, at deploy)
+postProcessingStack.addDependency(classificationStandardStack); // the router ARNs it dispatches to
+postProcessingStack.addDependency(classificationPremiumStack);
+postProcessingStack.addDependency(classificationBasicStack);
+
 // Frontend hosting — the DEFAULT production path for the SPA (CloudFront + S3).
 // Independent of every other stack: it provisions an empty bucket + CloudFront
 // distribution only. The Vite build is synced out-of-band after the rest of
@@ -569,7 +647,7 @@ const frontendStack = new FrontendStack(app, `${STACK_PREFIX}Frontend`, {
 void frontendStack;
 
 // Admin console hosting — the separate operator-interface origin (layer 4 of the
-// four-layer deploy ordering; SPEC-SEPARATE-ADMIN-APP.md). Opt-in and independent:
+// four-layer deploy ordering; DESIGN-SEPARATE-ADMIN-APP.md). Opt-in and independent:
 // its own S3 + CloudFront serving admin.html (dist-admin/), 'Admin*'-prefixed
 // outputs so they don't collide with the chat stack's. The admin UI is synced
 // separately (deploy-frontend.mjs, admin target); after it deploys, redeploy the
@@ -594,7 +672,13 @@ analyticsStack.addDependency(chimeStack);
 cognitoStack.addDependency(chimeStack);
 s3Stack.addDependency(chimeStack);
 foundationsStack.addDependency(chimeStack);
-foundationsStack.addDependency(analyticsStack);
+// ANALYTICS AFTER FOUNDATIONS, and the direction is load-bearing on a FRESH account: the Aurora
+// stack resolves the shared channel-context SSM parameters at deploy time
+// (valueForStringParameter), and Foundations is what CREATES them. The reverse dependency this
+// replaces shipped in the initial commit with no consumer - Foundations takes nothing from
+// analytics - and made every new deployer's first deploy fail with "SSM parameter not available"
+// while staying green on any account whose parameters already existed.
+analyticsStack.addDependency(foundationsStack);
 foundationsStack.addDependency(cognitoStack); // create-conversation reads user groups for tier gate
 channelFlowStack.addDependency(chimeStack);
 channelFlowStack.addDependency(foundationsStack); // create-conversation channel-flow ARN + bot ARN in SSM

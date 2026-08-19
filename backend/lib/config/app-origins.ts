@@ -2,7 +2,7 @@ import type { Construct } from 'constructs';
 
 /**
  * Frontend origins for CORS wiring, after the admin console split
- * (SPEC-SEPARATE-ADMIN-APP.md). Two independently-deployed interface origins:
+ * (DESIGN-SEPARATE-ADMIN-APP.md). Two independently-deployed interface origins:
  *
  *   - chat SPA        -> CDK context `appUrl`      (AgentEchelonFrontend)
  *   - admin console   -> CDK context `adminAppUrl` (AgentEchelonAdminFrontend)

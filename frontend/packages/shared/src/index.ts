@@ -44,7 +44,7 @@ export {
 export { trackEvent, setAuthToken, trackPerformance, startTimer, endTimer, flushEvents } from './services/eventTrackingService';
 export { ensureFreshIdToken } from './services/ensureFreshToken';
 
-export { listExperiments, createExperiment, updateExperimentStatus } from './services/experimentService';
+export { listExperiments, createExperiment, updateExperimentStatus, DEFAULT_ACCURACY_MARGIN_PCT } from './services/experimentService';
 export type {
   Experiment,
   ExperimentVariant,
@@ -62,9 +62,9 @@ export {
   parseActiveTaskFromMetadata,
   parseMessageFeedbackFromMetadata,
   unwrapLexEnvelope,
-  isAllowedBattleImageUrl,
+  isEmptyLexEnvelope,
 } from './utils/messageParser';
-export type { NavigateChannel, BattleMarker, BattleWaiting, BattleImage } from './utils/messageParser';
+export type { NavigateChannel, BattleMarker, BattleWaiting } from './utils/messageParser';
 
 // Shared model-strategy reference data (used by the chat NewConversationModal +
 // BattleScorecard and the admin ModelStrategyTab).

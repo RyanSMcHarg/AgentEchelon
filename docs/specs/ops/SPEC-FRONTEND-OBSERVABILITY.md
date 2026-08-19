@@ -2,6 +2,8 @@
 
 **Status:** Proposed **Layer:** Core platform (ops - cross-cutting telemetry, not an interaction pillar) **Plane:** core **Scope:** `frontend/packages/chat`, `frontend/packages/admin`, `frontend/packages/shared` **Related:** [`../interface/admin/DESIGN-SEPARATE-ADMIN-APP.md`](../interface/admin/DESIGN-SEPARATE-ADMIN-APP.md), `docs/LATENCY-TARGETS.md`
 
+**Coverage:** none - proposed; no telemetry is emitted yet.
+
 ## Business problem
 
 An operator improving a front-end needs to know which page or admin tab is actually slow, janky, or failing - not just that the app is slow on average - without standing up their own frontend telemetry pipeline to find out. This is for the admin/operator who owns front-end performance and reliability. This spec defines, per page and per admin tab, the performance, usage, and reliability metrics to capture, and maps each to the existing ingestion seam so the gaps are additive instrumentation rather than a new pipeline. (Current state: both front-ends emit client events today, but the signal is coarse and session-global - web vitals captured once per page load with no route attribution, and the only reliability surface is WebSocket connection health - so an operator sees that Largest Contentful Paint is slow across the app but not that the data-heavy Conversations admin tab is dragging the average, or that a specific chat view janks on interaction.)

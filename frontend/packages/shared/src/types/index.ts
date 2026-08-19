@@ -73,6 +73,14 @@ export interface Message {
   experimentId?: string;
   variantId?: string;
   assignmentMode?: string;
+  /**
+   * The conversation this one continued into, when this message announced a redirect (drift confirm).
+   *
+   * Carried on the message's Chime Metadata, NOT parsed from its content: the `NAVIGATE_CHANNEL:` marker that
+   * drives the immediate switch is stripped before display, so it cannot be the durable record. This is what
+   * lets the parent conversation stay followable after the fact.
+   */
+  driftRedirect?: { childChannelArn: string; label: string };
   // True when the SendChannelMessage Target included the current user's ARN —
   // i.e., the message was targeted to us (and is invisible to other channel
   // members). Used to drive the sticky-mention follow-up behavior.
@@ -137,12 +145,9 @@ export interface Message {
   // which is the "waiting ended" signal. Drives the composer's
   // "Replying to:" affordance.
   battleWaiting?: { battleId: string; botArn: string };
-  // /battle generation-out (SPEC-BATTLE.md) — set on a battle
-  // reply that produced an image. The conversation view renders the
-  // image(s) in the bot's message bubble; the scorecard's pick-the-
-  // winner works unchanged (user compares the two images). Absent ⇒
-  // a text/failed/withheld reply — render the text, never a broken img.
-  battleImage?: { urls: string[]; modelId: string; count: number };
+  // /battle generation-out (SPEC-BATTLE.md) has no field of its own: a generated image arrives as
+  // `attachment` like any other, and the scorecard's pick-the-winner works unchanged (the user
+  // compares the two images). A failed/withheld reply simply carries no attachment.
 }
 
 export interface ChannelMember {

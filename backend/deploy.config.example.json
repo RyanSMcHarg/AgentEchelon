@@ -1,15 +1,107 @@
 {
-  "_comment": "Copy to deploy.config.json (gitignored) and set your values. Read by scripts/deploy.mjs and forwarded to cdk as --context k=v (CLI --context flags override). Keys are cdk context flags; `_`-prefixed keys are ignored. Omit a key to take its default. Do NOT set appUrl; deploy.mjs derives it from the live CloudFront distribution and closes the CORS loop for you.",
-  "_athena_default": "Minimal Athena-mode deploy: just set senderEmail.",
+  "_comment": "Copy to deploy.config.json (gitignored) and set your values. Read by scripts/deploy.mjs and forwarded to cdk as --context k=v (CLI --context flags override). Keys are cdk context flags; `_`-prefixed keys are comments and are ignored. An EMPTY value is skipped entirely, so it means 'take the built-in default' and can never change behaviour. This file lists EVERY context flag the app reads, so a flag is discoverable here and not only in the source; deploy-config-example.test.ts fails if the two drift apart.",
+
+  "_WHY_COMPLETE": "Forward this WHOLE set on every deploy, including single-stack ones. Many flags gate resources that already exist, and an ABSENT flag reads as 'off', so deploying a stack without them DELETES things: enableAdminPersonas / adminIamEnforcement drop the execute-api teeth on the shared admin roles (breaking every admin surface, not just the stack you deployed), enableLiveDrift unwires Aurora RAG and drift, and appUrl / adminAppUrl reset each API's CORS allowlist to localhost. Always run `cdk diff --exclusively` with the full set before deploying a single stack.",
+
+  "_required": "Minimal Athena-mode deploy: just set senderEmail.",
   "senderEmail": "you@example.com",
-  "_aurora_optional": "Aurora mode adds a VPC + Aurora (advanced analytics). To reuse an existing VPC set analyticsVpcId + analyticsVpcSubnetType and createVpcEndpoints=false.",
+  "senderEmailPreVerified": false,
+  "environment": "dev",
+
+  "_urls": "Both are derived by deploy.mjs from the live CloudFront distributions, which closes the CORS loop for you. Leave EMPTY unless you serve the apps from custom domains, in which case set them before the first deploy. A CORS-bearing stack deployed without these falls back to http://localhost:5173 and CORS-blocks the hosted SPA.",
+  "appUrl": "",
+  "adminAppUrl": "",
+
+  "_analytics": "Aurora mode adds a VPC + Aurora (advanced analytics, pgvector retrieval, live drift). To reuse an existing VPC set analyticsVpcId + analyticsVpcSubnetType and createVpcEndpoints=false. enableRdsProxy adds a standing hourly cost; leave off unless you need it.",
   "analyticsMode": "athena",
   "analyticsVpcId": "",
   "analyticsVpcSubnetType": "isolated",
   "createVpcEndpoints": true,
-  "_features": "On/off toggles.",
+  "enableRdsProxy": false,
+
+  "_minSamplePerVariant": "Exchanges a variant needs before an A/B experiment reports a verdict instead of 'keep the experiment running'. Defaults to 5, deliberately low so the experiment LIFECYCLE is visible on a fresh deployment: at a statistically respectable floor the first verdict is tens of minutes of traffic away, which makes the honest setting and the demonstrable one mutually exclusive. Five is a DEMONSTRATION floor, not a decision floor - the verdict is real arithmetic on real traffic, but underpowered, so it will usually report 'low' confidence with a wide interval. RECOMMENDED: raise this once you are past the first look, and before anyone routes traffic or retires a variant on a verdict - 30 per variant is the usual starting point, higher if your metric is noisy or the effect you care about is small. Per-variant, so the SMALLEST arm gates the result.",
+  "minSamplePerVariant": 5,
+
+  "_features": "enableLiveDrift is an EXPLICIT opt-in and REQUIRES analyticsMode=aurora. It wires BOTH Aurora RAG retrieval and live drift, so deploying the assistant stacks without it sets those env vars to null and silently disables both.",
+  "enableLiveDrift": false,
+  "enableBattle": true,
+  "sleepMode": false,
+  "sleepAfterIdle": "2h",
+  "sleepCheckRate": "rate(15 minutes)",
+  "sleepRecipients": "",
+
+  "_frontendWaf": "Managed-rules WAF on the frontend distribution, on by default.",
+  "frontendWaf": true,
+  "wafRateLimit": "",
+  "wafAllowedIps": "",
+
+  "_adminConsole": "The operator console is a separate app on its own origin (opt-in). adminAppClient defaults to a dedicated Cognito app-client on the same pool; set it to 'shared' to reuse the chat client.",
+  "enableAdminApp": false,
+  "adminAppClient": "",
+  "adminSyncRate": "",
+  "adminConversationArns": "",
+
+  "_adminIdentity": "Admin authority. adminIamEnforcement flips admin API routes to AWS_IAM and grants execute-api teeth on the shared sign-on and persona roles; enableAdminPersonas creates the example persona groups and roles. Omitting either on a redeploy REMOVES those grants and cascades to every admin surface. adminAuthMode=federated additionally needs hostAdminPoolId.",
+  "adminIamEnforcement": false,
+  "enableAdminPersonas": false,
+  "adminAuthMode": "",
+  "hostAdminPoolId": "",
+  "adminGroupNames": "",
+
+  "_adminNotifications": "Creates a dedicated admin conversation channel that operational alerts (errors, latency SLA, eval-quality breaches) are posted into, with the admins group as members. Off means those alerts stay log-only.",
+  "enableAdminNotificationChannel": false,
+
+  "_membershipAudit": "Always deployed. Report-only until membershipAuditEnforce=true; alerts are log-only until an admin channel ARN is set.",
   "membershipAuditEnforce": false,
+  "membershipAuditAlertChannelArn": "",
+
+  "_identity": "identityProvider names the IdP governing END USERS ('cognito' enables the User Management tab; any other value renders a pointer to that IdP). federatedUserPoolId and notifyAdditionalUserPoolIds wire additional pools.",
+  "identityProvider": "cognito",
+  "federatedUserPoolId": "",
+  "notifyAdditionalUserPoolIds": "",
+
+  "_assistantConfig": "Per-deployment assistant configuration. An empty assistantSystemPrompt means the generic default persona (off-brand, no host grounding); an empty assistantIntentPack means the generic default intents. assistantParamWriter grants a principal write access to those SSM params.",
+  "assistantSystemPrompt": "",
+  "assistantIntentPack": "",
+  "assistantParamWriter": "",
+  "assistantTier": "",
+
+  "_models": "Override a profile's default model from the catalog. Empty takes the catalog default.",
+  "basicModelKey": "",
+  "standardModelKey": "",
+  "premiumModelKey": "",
+
+  "_contextRouting": "External/CN model routing (SPEC-CONTEXT-AWARE-MODEL-ROUTING), standard profile only. Active at runtime only when enableContextRouting is on.",
+  "enableContextRouting": "",
+  "cnBedrockChatModel": "",
+  "cnBedrockReasoningModel": "",
+  "cnBedrockReasoningIntents": "",
+  "deepseekModel": "",
+  "externalConsentDefault": "",
+
   "_imageGen": "REQUIRED for /battle image generation-out with EXTERNAL providers (OpenAI, FAL): the ARN of a Secrets Manager secret holding a JSON object of provider keys ({\"OPENAI_API_KEY\":\"...\",\"FAL_KEY\":\"...\"}). Without it the premium (imageGen:true) processor still gets the image guardrail but CANNOT authenticate to a provider, so image battles silently honest-empty. Alternatively export OPENAI_API_KEY / FAL_KEY in the deploy shell.",
   "imageGenKeysSecretArn": "",
-  "environment": "dev"
+  "imageGenRegion": "",
+
+  "_battle": "Battle alt-bot slot count and per-image limits.",
+  "altBotSlotCount": "",
+  "battleImageMaxImages": "",
+  "battleImageMaxDimension": "",
+
+  "_notifications": "Recipients for the scheduled briefing and the analytics alerts.",
+  "briefingRecipients": "",
+  "briefingScheduleRate": "",
+  "alertRecipients": "",
+
+  "_contextSourceAlerting": "Context source failure-rate alarm (needs enableAdminNotificationChannel; delivers to the admin conversation). Percentage of reads that must fail over 5 minutes before alerting, and the minimum attempts in that window before the percentage is trusted at all.",
+  "contextSourceAlertThresholdPercent": "",
+  "contextSourceAlertMinAttempts": "",
+
+  "_abuse": "Per-user hourly budget exemptions (these never exempt the global budget).",
+  "abuseExemptAdmins": "",
+  "abuseExemptAdminGroups": "",
+  "budgetCannedResponse": "",
+
+  "_misc": "isProduction gates production-only behaviour on the experiments stack.",
+  "isProduction": ""
 }

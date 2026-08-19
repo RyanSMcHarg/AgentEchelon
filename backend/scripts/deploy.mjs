@@ -32,6 +32,8 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { CloudFormationClient, DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
+// Compiled from lib/config/deploy-context.ts (npm run build runs first, step 0).
+import { compareDeployContext, describeDeployContextGap } from '../lib/config/deploy-context.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BACKEND_DIR = path.resolve(__dirname, '..');
@@ -45,26 +47,92 @@ const FRONTEND_STACK = process.env.FRONTEND_STACK_NAME || 'AgentEchelon' + 'Fron
  * and win. This is what lets `npm run deploy` reproduce an instance that uses non-default
  * choices (aurora mode, an imported VPC, etc.) without anyone reverse-engineering the flags.
  */
+/**
+ * FAIL CLOSED. Both failure paths here used to warn (or say nothing) and continue with ZERO
+ * context flags, which is the most destructive thing this script can do: many flags gate resources
+ * that already exist, and an ABSENT flag reads as "off". A deploy with no context therefore
+ * REMOVES the admin persona/IAM execute-api teeth on the shared roles (cascading to every admin
+ * surface, not just the stack being deployed), unwires live drift + Aurora RAG, and resets each
+ * API's CORS allowlist to localhost. A JSON typo silently doing all of that is not an acceptable
+ * outcome, so a config that exists but cannot be parsed is fatal, and a missing config aborts
+ * unless the caller opts out explicitly.
+ */
+const NO_CONFIG_FLAG = '--no-deploy-config';
+/** Opt out of the completeness check (a deliberately partial context). */
+const PARTIAL_CONFIG_FLAG = '--allow-partial-config';
+
 function configFlags() {
   const p = path.join(BACKEND_DIR, 'deploy.config.json');
-  if (!existsSync(p)) return [];
-  try {
-    const cfg = JSON.parse(readFileSync(p, 'utf8'));
-    const out = [];
-    for (const [k, v] of Object.entries(cfg)) {
-      if (k.startsWith('_') || v === undefined || v === null || v === '') continue; // `_`-keys are comments
-      out.push('--context', `${k}=${v}`);
+  const optedOut = process.argv.slice(2).includes(NO_CONFIG_FLAG);
+
+  if (!existsSync(p)) {
+    if (optedOut) {
+      console.warn(`! ${NO_CONFIG_FLAG}: deploying with CLI context only (no deploy.config.json).`);
+      return [];
     }
-    if (out.length) console.log(`  (loaded ${out.length / 2} context flags from deploy.config.json)`);
-    return out;
-  } catch (e) {
-    console.warn(`! Could not read deploy.config.json: ${e.message}`);
-    return [];
+    console.error(
+      '\n✗ backend/deploy.config.json not found.\n'
+        + '  It holds this instance\'s deploy context. Deploying without it silently drops every\n'
+        + '  flag, which DELETES existing grants (admin IAM/personas, live drift, CORS origins).\n\n'
+        + '  First deploy:  cp deploy.config.example.json deploy.config.json  then set your values.\n'
+        + `  Deliberately bare (a genuinely fresh account):  npm run deploy -- ${NO_CONFIG_FLAG} --context senderEmail=you@example.com\n`,
+    );
+    process.exit(1);
   }
+
+  let cfg;
+  try {
+    cfg = JSON.parse(readFileSync(p, 'utf8'));
+  } catch (e) {
+    console.error(
+      `\n✗ backend/deploy.config.json could not be parsed: ${e.message}\n`
+        + '  Refusing to deploy. Continuing would forward NO context flags and silently strip the\n'
+        + '  admin IAM/persona grants, live drift, and CORS origins this instance depends on.\n',
+    );
+    process.exit(1);
+  }
+
+  // Loading is not the same as being COMPLETE. A config missing a key parses fine, forwards fewer
+  // flags, and reports success — which is how this instance deployed with `appUrl` absent and came
+  // within one command of rewriting every CORS origin to localhost. Compare against the example,
+  // which the test suite already proves documents every flag the app reads.
+  const examplePath = path.join(BACKEND_DIR, 'deploy.config.example.json');
+  if (!process.argv.slice(2).includes(PARTIAL_CONFIG_FLAG) && existsSync(examplePath)) {
+    try {
+      const example = JSON.parse(readFileSync(examplePath, 'utf8'));
+      const gap = compareDeployContext(cfg, example);
+      const message = describeDeployContextGap(gap, PARTIAL_CONFIG_FLAG);
+      if (message) {
+        // Fail CLOSED on a missing key (it deletes things); an unknown key alone only warns, since a
+        // stale entry cannot drop a grant.
+        console[gap.destructive.length ? 'error' : 'warn'](message);
+        if (gap.destructive.length) process.exit(1);
+      }
+    } catch (e) {
+      console.warn(`! could not compare deploy.config.json against the example: ${e.message}`);
+    }
+  }
+
+  const out = [];
+  for (const [k, v] of Object.entries(cfg)) {
+    if (k.startsWith('_') || v === undefined || v === null || v === '') continue; // `_`-keys are comments
+    out.push('--context', `${k}=${v}`);
+  }
+  console.log(`  (loaded ${out.length / 2} context flags from deploy.config.json)`);
+  return out;
 }
 
-const forwarded = [...configFlags(), ...process.argv.slice(2)]; // persisted config, then CLI (CLI wins)
+// `--no-deploy-config` is ours, not cdk's: strip it before forwarding or cdk rejects it.
+const cliArgs = process.argv.slice(2).filter((a) => a !== NO_CONFIG_FLAG && a !== PARTIAL_CONFIG_FLAG);
+const forwarded = [...configFlags(), ...cliArgs]; // persisted config, then CLI (CLI wins)
 const userSetAppUrl = forwarded.some((a, i) => a === '--context' && /^appUrl=/.test(forwarded[i + 1] || ''));
+// Whether this instance provisions the standalone admin console. Read from the SAME
+// forwarded context the CDK app gates the stack on, so the publish step and the stack
+// can never disagree. Accepts the string form (`--context enableAdminApp=true`) since
+// that is how context arrives on the command line.
+const adminAppEnabled = forwarded.some(
+  (a, i) => a === '--context' && /^enableAdminApp=(true|1)$/i.test(forwarded[i + 1] || ''),
+);
 
 function run(cmd, args, label) {
   console.log(`\n▶ ${label}\n  ${cmd} ${args.join(' ')}`);
@@ -154,7 +222,21 @@ async function main() {
   run('npx', [...cdkBase, ...corsFlag], '1/4 Deploy backend stacks (appUrl pre-resolved — CORS never transiently broken)');
   run('node', ['scripts/sync-context.mjs'], '2/4 Sync tiered context into S3');
   run('node', ['scripts/gen-frontend-env.mjs'], '3/4 Generate frontend/.env from outputs');
-  run('node', ['scripts/deploy-frontend.mjs'], '4/4 Publish SPA to CloudFront');
+  run('node', ['scripts/deploy-frontend.mjs'], '4/4 Publish chat SPA to CloudFront');
+
+  // The admin console is a SEPARATE package with its own bucket + distribution, and
+  // deploy-frontend.mjs only publishes it when passed --admin. Without this step a
+  // deploy updates the admin BACKEND (AdminPlane, Experiments, AnalyticsAurora, ...)
+  // while leaving the admin BUNDLE frozen at whatever the last manual --admin run
+  // shipped — a stale console talking to a moved backend, which surfaces as
+  // unexplained 4xx in the console rather than as an obvious deploy failure.
+  // Gated on the same flag that provisions the stack, so a chat-only deployment
+  // (enableAdminApp unset) does not try to publish a distribution that isn't there.
+  if (adminAppEnabled) {
+    run('node', ['scripts/deploy-frontend.mjs', '--admin'], '4b/4 Publish admin console to CloudFront');
+  } else {
+    console.log('\n• enableAdminApp is not set — skipping the admin console publish.');
+  }
 
   const url = preUrl || (await cloudFrontUrl().catch(() => null));
   if (!url) {

@@ -19,10 +19,13 @@ export function setApiTokenProvider(fn: TokenProvider): void {
 
 export class ApiError extends Error {
   readonly status: number;
-  constructor(status: number, message: string) {
+  /** The parsed JSON error body, when the response had one (e.g. a 409's `conflicts` array). */
+  readonly body?: unknown;
+  constructor(status: number, message: string, body?: unknown) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
+    this.body = body;
   }
 }
 
@@ -68,12 +71,14 @@ export async function apiCall<T = any>(
 
   if (!res.ok) {
     let be: string | undefined;
+    let body: unknown;
     try {
-      be = (await res.clone().json())?.error;
+      body = await res.clone().json();
+      be = (body as { error?: string } | null)?.error;
     } catch {
       /* non-JSON error body */
     }
-    throw new ApiError(res.status, opts.mapError?.(res.status, be) ?? be ?? `${opts.label ?? 'Request'} failed: ${res.status}`);
+    throw new ApiError(res.status, opts.mapError?.(res.status, be) ?? be ?? `${opts.label ?? 'Request'} failed: ${res.status}`, body);
   }
 
   if (res.status === 204) return undefined as T;

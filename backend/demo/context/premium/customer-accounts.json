@@ -18,6 +18,9 @@
     { "account": "Summit Logistics", "opportunity": "StratumConnect API gateway", "value": "$30K ARR", "stage": "Discovery", "closeDate": "2026-10-01" }
   ],
   "churnRisk": [
-    { "account": "Coastal Health Systems", "arr": "$155K", "risk": "high", "reason": "Evaluating Zapier Enterprise + custom solution", "mitigationOwner": "James Okafor", "nextAction": "Executive sponsor meeting scheduled for July 15" }
+    { "account": "Coastal Health Systems", "arr": "$155K", "risk": "high", "reason": "Evaluating Zapier Enterprise + custom solution", "mitigationOwner": "James Okafor", "nextAction": "Executive sponsor meeting scheduled for July 15" },
+    { "account": "Precision Analytics", "arr": "$89K", "risk": "high", "reason": "Champion left; new VP Engineering is scoping an in-house build", "mitigationOwner": "Nicole Park", "nextAction": "New-champion enablement session booked for Aug 12" },
+    { "account": "Greenfield Energy", "arr": "$120K", "risk": "medium", "reason": "Budget cuts after sector downturn; monthly active usage down 30% QoQ", "mitigationOwner": "Chris Thompson", "nextAction": "Renewal-value review scheduled for Aug 5" },
+    { "account": "Urban Retail Group", "arr": "$98K", "risk": "medium", "reason": "Low feature adoption (2 of 8 modules) and no executive sponsor", "mitigationOwner": "Chris Thompson", "nextAction": "Executive business review scheduled for Aug 20" }
   ]
 }

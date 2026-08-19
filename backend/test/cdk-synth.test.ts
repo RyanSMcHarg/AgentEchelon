@@ -16,6 +16,7 @@ import { BasicClassificationStack } from '../lib/stacks/basic-classification-sta
 import { StandardClassificationStack } from '../lib/stacks/standard-classification-stack';
 import { PremiumClassificationStack } from '../lib/stacks/premium-classification-stack';
 import { BattleStack } from '../lib/stacks/battle-stack';
+import { ChannelFlowStack } from '../lib/stacks/channel-flow-stack';
 import { DEFAULT_PROFILE_MODEL_SELECTION } from '../lib/config/model-strategy';
 
 describe('CDK Synthesis', () => {
@@ -60,7 +61,53 @@ describe('CDK Synthesis', () => {
       template.resourceCountIs('AWS::Athena::WorkGroup', 1);
     });
 
-    it('should create evaluation runner Lambda with daily schedule', () => {
+    // ORPHANED-STREAM REGRESSION. The message stream's name is FIXED (Chime SDK Messaging rejects
+    // PutMessagingStreamingConfigurations unless it begins with `chime-messaging-`, so CDK cannot
+    // auto-name it). A RETAINed stream therefore survives a teardown under a name the NEXT fresh
+    // deploy must reuse, and that deploy fails ResourceExistenceCheck with "resource already exists".
+    // Nothing asserted the policy, so the fix could silently regress to CDK's default on any refactor.
+    it('the message Kinesis stream is DESTROY, so a teardown cannot orphan it', () => {
+      const app = new cdk.App();
+      const chime = new ChimeMessagingStack(app, 'TestChime', { env, appInstanceName: 'test-instance' });
+      const stack = new AnalyticsStack(app, 'TestAnalytics', {
+        env,
+        appInstanceArn: chime.appInstanceArn,
+        userPool: cognito.UserPool.fromUserPoolId(chime, 'TestPool', 'us-east-1_TestPool'),
+      });
+      const template = Template.fromStack(stack);
+      // Both policies matter: UpdateReplacePolicy governs a REPLACEMENT (a rename/shard change), which
+      // orphans the old stream under the same fixed name just as a teardown would.
+      template.hasResource('AWS::Kinesis::Stream', {
+        DeletionPolicy: 'Delete',
+        UpdateReplacePolicy: 'Delete',
+      });
+    });
+
+    // The SECOND orphan vector: the Chime streaming CONFIGURATION is an app-instance-level binding that
+    // lives outside CloudFormation. Deleting the stream without unbinding leaves Chime pointing at a
+    // stream that no longer exists. The unbind is an onDelete on the custom resource, and it can only
+    // run if the resource's role is actually granted the Delete action - so pin the grant, not just the
+    // intent. A missing permission here fails at teardown time, which is the worst time to discover it.
+    it('the Chime streaming configuration can be UNBOUND on delete (the onDelete grant exists)', () => {
+      const app = new cdk.App();
+      const chime = new ChimeMessagingStack(app, 'TestChime', { env, appInstanceName: 'test-instance' });
+      const stack = new AnalyticsStack(app, 'TestAnalytics', {
+        env,
+        appInstanceArn: chime.appInstanceArn,
+        userPool: cognito.UserPool.fromUserPoolId(chime, 'TestPool', 'us-east-1_TestPool'),
+      });
+      Template.fromStack(stack).hasResourceProperties('AWS::IAM::Policy', {
+        PolicyDocument: Match.objectLike({
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: Match.arrayWith(['chime:DeleteMessagingStreamingConfigurations']),
+            }),
+          ]),
+        }),
+      });
+    });
+
+    it('should create evaluation runner Lambda with daily schedule + the membership sweep schedule', () => {
       const app = new cdk.App();
       const chime = new ChimeMessagingStack(app, 'TestChime', {
         env,
@@ -74,7 +121,33 @@ describe('CDK Synthesis', () => {
       });
 
       const template = Template.fromStack(stack);
-      template.resourceCountIs('AWS::Events::Rule', 1);
+      // Two scheduled rules: the daily evaluation runner + the membership-audit sweep (trigger #2).
+      template.resourceCountIs('AWS::Events::Rule', 2);
+      // The sweep rule fires the audit Lambda with a { type: 'sweep' } payload.
+      template.hasResourceProperties('AWS::Events::Rule', {
+        Targets: Match.arrayWith([
+          Match.objectLike({ Input: Match.stringLikeRegexp('.*"type":"sweep".*') }),
+        ]),
+      });
+    });
+
+    it('membership audit: fixed fn name + sweep/reeval List* IAM (triggers #2/#3)', () => {
+      const app = new cdk.App();
+      const chime = new ChimeMessagingStack(app, 'TestChime', { env, appInstanceName: 'test-instance' });
+      const stack = new AnalyticsStack(app, 'TestAnalytics', {
+        env,
+        appInstanceArn: chime.appInstanceArn,
+        userPool: cognito.UserPool.fromUserPoolId(chime, 'TestPool', 'us-east-1_TestPool'),
+      });
+      const template = Template.fromStack(stack);
+      // Stable name so user-management (a different stack) can grant invoke without a cross-stack ARN.
+      template.hasResourceProperties('AWS::Lambda::Function', {
+        FunctionName: 'agent-echelon-membership-audit',
+      });
+      // The sweep + reeval enumeration grants.
+      const policies = JSON.stringify(template.findResources('AWS::IAM::Policy'));
+      expect(policies).toContain('chime:ListChannels');
+      expect(policies).toContain('chime:ListChannelMembershipsForAppInstanceUser');
     });
 
     it('should NOT create VPC or Aurora resources in Athena mode', () => {
@@ -126,6 +199,39 @@ describe('CDK Synthesis', () => {
 
       // Kinesis stream (same as Athena mode)
       template.resourceCountIs('AWS::Kinesis::Stream', 1);
+    });
+
+    // Same orphaned-stream regression as the Athena test above, plus the conditional. Aurora keys the
+    // policy on `environment` (default 'dev'), so BOTH sides need pinning: a dev teardown must clean the
+    // stream up, and prod must still retain it. Asserting only the default would let the prod branch
+    // silently invert.
+    it('dev: the message Kinesis stream is DESTROY, so a teardown cannot orphan it', async () => {
+      const { AnalyticsStackAurora } = await import('../lib/stacks/analytics-stack-aurora');
+      const app = new cdk.App();
+      const stack = new AnalyticsStackAurora(app, 'TestAuroraStreamDev', {
+        env,
+        appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
+        userPoolId: 'us-east-1_TestPoolId',
+        // environment omitted on purpose: 'dev' is the default and the case that bit us.
+      });
+      Template.fromStack(stack).hasResource('AWS::Kinesis::Stream', {
+        DeletionPolicy: 'Delete',
+        UpdateReplacePolicy: 'Delete',
+      });
+    });
+
+    it('prod: the message Kinesis stream is RETAINed (the conditional works both ways)', async () => {
+      const { AnalyticsStackAurora } = await import('../lib/stacks/analytics-stack-aurora');
+      const app = new cdk.App();
+      const stack = new AnalyticsStackAurora(app, 'TestAuroraStreamProd', {
+        env,
+        appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
+        userPoolId: 'us-east-1_TestPoolId',
+        environment: 'prod',
+      });
+      Template.fromStack(stack).hasResource('AWS::Kinesis::Stream', {
+        DeletionPolicy: 'Retain',
+      });
     });
 
     it('does not create an RDS Proxy by default (avoids the 8-ACU minimum)', async () => {
@@ -327,6 +433,27 @@ describe('CDK Synthesis', () => {
       expect(assertedAdminUpdate).toBe(true);
     });
 
+    it('user-management can invoke the membership audit for on-downgrade re-eval (trigger #3)', () => {
+      const app = new cdk.App();
+      const chime = new ChimeMessagingStack(app, 'TestChimeReeval', { env, appInstanceName: 'test-instance' });
+      const stack = new CognitoAuthStack(app, 'TestCognitoReeval', { env, appInstanceArn: chime.appInstanceArn });
+      const template = Template.fromStack(stack);
+
+      // The invoke grant is scoped to the audit's STABLE function name (not '*'), so the reverse
+      // dependency stays name-based, not a cross-stack ARN import. It is an INLINE policy on the
+      // user-management role, so assert against the whole template (inline policies live in the Role).
+      const whole = JSON.stringify(template.toJSON());
+      expect(whole).toContain('lambda:InvokeFunction');
+      expect(whole).toContain('function:agent-echelon-membership-audit');
+
+      // The Lambda carries the audit fn name so it knows what to invoke.
+      const fns = Object.values(template.findResources('AWS::Lambda::Function')) as Array<{
+        Properties?: { Environment?: { Variables?: Record<string, unknown> } };
+      }>;
+      const withName = fns.filter((f) => f.Properties?.Environment?.Variables?.MEMBERSHIP_AUDIT_FN_NAME !== undefined);
+      expect(withName.length).toBeGreaterThanOrEqual(1);
+    });
+
     it('Credential Exchange: bearer-pinned exchange roles + TagSession + API (SPEC-CREDENTIAL-EXCHANGE)', () => {
       const app = new cdk.App();
       const chime = new ChimeMessagingStack(app, 'TestChimeCx', { env, appInstanceName: 'test-instance' });
@@ -435,16 +562,21 @@ describe('CDK Synthesis', () => {
       template.resourceCountIs('AWS::Bedrock::Agent', 0);
       template.resourceCountIs('AWS::Bedrock::AgentAlias', 0);
 
-      // One tier content guardrail (basic has no /battle image guardrail).
-      template.resourceCountIs('AWS::Bedrock::Guardrail', 1);
+      // Two content guardrails (SPEC-CONFIGURABLE-ASSISTANTS 4.6b): the default + one selectable
+      // alternate ('strict') from the catalog; basic has no /battle image guardrail.
+      template.resourceCountIs('AWS::Bedrock::Guardrail', 2);
 
       // Lex bot + AppInstanceBot custom resources.
       template.resourceCountIs('AWS::CloudFormation::CustomResource', 2);
 
       // SSM contract: processor-arn + bot-arn published for the shared router and
-      // create-conversation to discover, plus router-arn (per-classification router
-      // Lambda) for the profile infra resolver (ProfilesTab Infrastructure section).
-      template.resourceCountIs('AWS::SSM::Parameter', 3);
+      // create-conversation to discover, router-arn (per-classification router
+      // Lambda) for the profile infra resolver, the selectable-guardrails catalog
+      // (SPEC-CONFIGURABLE-ASSISTANTS 4.6b), and the selectable context-source catalog
+      // (SPEC-CONTEXT-SOURCES-AND-STORES). The COUNT is asserted deliberately: this is the
+      // published contract other stacks and the admin console read, so a parameter
+      // appearing or vanishing should require someone to say so here.
+      template.resourceCountIs('AWS::SSM::Parameter', 5);
       template.hasResourceProperties('AWS::SSM::Parameter', {
         Name: '/agent-echelon/assistant/basic/processor-arn',
       });
@@ -453,6 +585,256 @@ describe('CDK Synthesis', () => {
       });
       template.hasResourceProperties('AWS::SSM::Parameter', {
         Name: '/agent-echelon/assistant/basic/router-arn',
+      });
+      template.hasResourceProperties('AWS::SSM::Parameter', {
+        Name: '/agent-echelon/assistant/basic/guardrails',
+      });
+      template.hasResourceProperties('AWS::SSM::Parameter', {
+        Name: '/agent-echelon/assistant/basic/context-sources',
+      });
+    });
+
+    // Publishing processor-arn is only half the contract: the HANDLER reads it every turn
+    // (resolveAsyncProcessorArn). The grant was missing, and nothing caught it because the failure
+    // is invisible — the read denies, the code falls back to the *_ASYNC_PROCESSOR_ARN env var, and
+    // the turn succeeds. The only symptoms were an AccessDenied stack trace on every request and a
+    // dead re-pointing capability. Assert the READ grant, not just the parameter.
+    it('the handler is granted ssm:GetParameter on the processor-arn it reads every turn', () => {
+      const app = new cdk.App();
+      const stack = new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', classificationBasicProps);
+
+      Template.fromStack(stack).hasResourceProperties('AWS::IAM::Policy', {
+        PolicyDocument: Match.objectLike({
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: 'ssm:GetParameter',
+              Resource: Match.arrayWith([
+                `arn:aws:ssm:${env.region}:${env.account}:parameter/agent-echelon/assistant/basic/processor-arn`,
+              ]),
+            }),
+          ]),
+        }),
+      });
+    });
+
+    // THE HANDOVER'S SELF-INVOKE (MESSAGE-FLOW §3). A message is answered by the assistant whose work
+    // it answers, so a handler that receives one it does not own invokes this same function as the
+    // owning assistant. Both halves of the grant have a failure mode that deploys clean:
+    //   - Referencing the function from the role's DEFAULT policy closes a dependency cycle, which is
+    //     caught at synth (the template is simply undeployable).
+    //   - A NAME PATTERN is not caught anywhere. CloudFormation truncates the stack name when the
+    //     generated physical name would exceed 64 characters, so the handler is really named
+    //     `AgentEchelonClassification-Pr-AgentHandler...`; a pattern built from the full stack name
+    //     matches nothing, deploys green, and denies at runtime. Found on the deployment, not here.
+    it('grants the handler invoke on ITSELF, by ARN and from a policy of its own', () => {
+      const app = new cdk.App();
+      const stack = new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', classificationBasicProps);
+      const template = Template.fromStack(stack);
+
+      const handler = Object.keys(template.findResources('AWS::Lambda::Function'))
+        .find((id) => id.startsWith('AgentHandler'));
+      // The grant is meaningless without the function it names.
+      expect(handler).toBeTruthy();
+
+      // The ARN itself, never a pattern: a pattern is the failure that reaches runtime.
+      template.hasResourceProperties('AWS::IAM::Policy', {
+        PolicyDocument: Match.objectLike({
+          Statement: Match.arrayWith([
+            Match.objectLike({
+              Action: 'lambda:InvokeFunction',
+              Resource: { 'Fn::GetAtt': [handler, 'Arn'] },
+            }),
+          ]),
+        }),
+      });
+
+      // And NOT on the role's default policy, which is what the function depends on. `Template.fromStack`
+      // does not run the cycle check, so assert the placement rather than the symptom.
+      const defaultPolicy = Object.entries(template.findResources('AWS::IAM::Policy'))
+        .find(([id]) => id.startsWith('AgentHandlerRoleDefaultPolicy'));
+      const defaultStatements = JSON.stringify(
+        (defaultPolicy?.[1] as any)?.Properties?.PolicyDocument?.Statement ?? [],
+      );
+      // The default policy must not name the function it is attached to; that IS the deploy cycle.
+      expect(defaultStatements.includes(`"${handler}"`)).toBe(false);
+    });
+
+    // SPEC-CONTEXT-SOURCES-AND-STORES phase 2. The catalog is published and the read is granted in one
+    // construct, because a published key WITHOUT its grant imports cleanly and fails at runtime - an
+    // omission that fails OPEN. These assert the pairing and, critically, the RESOURCE SCOPE: a
+    // wildcard grant would satisfy "a statement exists" while removing the boundary the catalog is for.
+    describe('context source catalog (INV-CTX-CAT-3)', () => {
+      const synth = (name: string) =>
+        Template.fromStack(
+          new StandardClassificationStack(new cdk.App(), `AgentEchelonClassification-${name}`, classificationBasicProps),
+        );
+
+      it('publishes the catalog WITH a resolvable locator but WITHOUT the account-qualified arn', () => {
+        const template = synth('CtxPublish');
+        const params = template.findResources('AWS::SSM::Parameter');
+        const entry = Object.values(params).find(
+          (p) => String((p.Properties as { Name?: string }).Name || '').endsWith('/context-sources'),
+        );
+        expect(entry).toBeDefined();
+        // The published value is a CFN intrinsic, not a plain string: the bucket LOCATOR is an
+        // imported token, so CDK emits Fn::Join. Resolve it the way CloudFormation will, substituting
+        // a marker for each unresolved token so the JSON still parses and the shape can be asserted.
+        const resolveValue = (v: unknown): string => {
+          if (typeof v === 'string') return v;
+          const join = (v as { 'Fn::Join'?: [string, unknown[]] })['Fn::Join'];
+          if (!join) return JSON.stringify(v);
+          const [sep, parts] = join;
+          return parts.map((p) => (typeof p === 'string' ? p : 'RESOLVED-AT-DEPLOY')).join(sep);
+        };
+        const published = JSON.parse(resolveValue((entry!.Properties as { Value: unknown }).Value));
+        expect(published.length).toBeGreaterThan(0);
+        // The scannable layer must survive publication - it is what the console and the model read.
+        for (const source of published) {
+          expect(source.key).toBeTruthy();
+          expect(source.title).toBeTruthy();
+          expect(source.description).toBeTruthy();
+          expect(source.useWhen).toBeTruthy();
+          // The LOCATOR and PREFIX are published, because the reader resolves them - that is what
+          // keeps the read at the same location the IAM grant authorised. Stripping the prefix is
+          // what previously forced the reader to hardcode a corpus path.
+          expect(source.locator).toBeTruthy();
+          // The account-qualified ARN is still dropped: the grant already binds it, and it is the
+          // only part that carries an account id.
+          expect(source.arn).toBeUndefined();
+          expect(JSON.stringify(source)).not.toMatch(/arn:aws:/);
+        }
+        // The s3 entry must publish the prefix it was granted on, or grant and read can diverge.
+        const s3Entry = published.find((s: { type: string }) => s.type === 's3-prefix');
+        expect(s3Entry?.prefix).toBe('context/standard/');
+      });
+
+      it('grants each source a resource-SCOPED read, never a wildcard', () => {
+        const template = synth('CtxGrant');
+        const policies = Object.values(template.findResources('AWS::IAM::Policy'));
+        const statements = policies.flatMap(
+          (p) => ((p.Properties as { PolicyDocument: { Statement: unknown[] } }).PolicyDocument.Statement || []),
+        ) as Array<{ Action?: unknown; Resource?: unknown }>;
+
+        // The example catalog's company-docs entry is an s3-prefix; its grant must name the PREFIX.
+        const flat = JSON.stringify(statements);
+        expect(flat).toContain('context/standard/*');
+
+        // No statement may grant a bare "*" resource. This is the assertion that a permissive grant
+        // would otherwise sail past - presence alone proves nothing about the boundary.
+        const hasWildcard = (s: { Resource?: unknown }) => {
+          const r = Array.isArray(s.Resource) ? s.Resource : [s.Resource];
+          return r.some((x) => x === '*');
+        };
+        expect(statements.filter(hasWildcard)).toEqual([]);
+
+        // Falsification: the detector must actually fire. Without this the assertion above could pass
+        // because the predicate is wrong rather than because the policy is clean - which is precisely
+        // how a guard in this repo once passed having checked nothing.
+        expect(hasWildcard({ Resource: '*' })).toBe(true);
+        expect(hasWildcard({ Resource: ['*'] })).toBe(true);
+        expect(hasWildcard({ Resource: ['arn:aws:s3:::b/context/standard/*'] })).toBe(false);
+      });
+    });
+
+    /**
+     * The watching half of INV-CTX-CAT-7. The runtime counts every outcome; this asserts the
+     * deployment actually looks at those counts, and - just as important - that it does NOT ship an
+     * alarm with nowhere to deliver to.
+     */
+    describe('context source failure-rate alarm and dashboard (INV-CTX-CAT-7)', () => {
+      const withAlerting = {
+        ...classificationBasicProps,
+        adminErrorAlertChannelArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test/channel/admin',
+      };
+      const alerting = () => Template.fromStack(
+        new StandardClassificationStack(new cdk.App(), 'AgentEchelonClassification-CtxAlarm', withAlerting),
+      );
+
+      it('alarms on a RATE over five minutes, not on any single failure', () => {
+        // Context sources resolve on every turn, so a broken grant fails continuously. An
+        // occurrence alarm would notify once per user message - which is how an alert gets muted.
+        const alarms = alerting().findResources('AWS::CloudWatch::Alarm');
+        const alarm = Object.values(alarms).find(
+          (a) => String((a.Properties as { AlarmName?: string }).AlarmName || '').includes('context-source-failure-rate'),
+        );
+        expect(alarm).toBeDefined();
+        const props = alarm!.Properties as {
+          Metrics?: Array<{ Expression?: string; MetricStat?: { Period?: number } }>;
+          EvaluationPeriods?: number;
+          TreatMissingData?: string;
+        };
+        const expr = props.Metrics?.find((m) => m.Expression)?.Expression || '';
+        // A percentage, not a count.
+        expect(expr).toContain('100*');
+        // Every referenced metric is a five-minute period.
+        for (const m of props.Metrics || []) {
+          if (m.MetricStat) expect(m.MetricStat.Period).toBe(300);
+        }
+        expect(props.EvaluationPeriods).toBe(1);
+        // No traffic must not page.
+        expect(props.TreatMissingData).toBe('notBreaching');
+      });
+
+      it('guards against paging on arithmetic when traffic is low', () => {
+        // 1 failure in 2 attempts is 50% and means nothing. Without a floor, a quiet deployment
+        // alarms on its first hiccup and the alarm is disabled within a week.
+        const alarms = alerting().findResources('AWS::CloudWatch::Alarm');
+        const expr = Object.values(alarms)
+          .flatMap((a) => ((a.Properties as { Metrics?: Array<{ Expression?: string }> }).Metrics || []))
+          .map((m) => m.Expression).find(Boolean) || '';
+        expect(expr).toMatch(/IF\(/);
+        expect(expr).toMatch(/>= ?\d+/);
+      });
+
+      it('fills missing datapoints, so a quiet period reads 0% rather than going blind', () => {
+        const alarms = alerting().findResources('AWS::CloudWatch::Alarm');
+        const expr = Object.values(alarms)
+          .flatMap((a) => ((a.Properties as { Metrics?: Array<{ Expression?: string }> }).Metrics || []))
+          .map((m) => m.Expression).find(Boolean) || '';
+        expect(expr).toContain('FILL(');
+      });
+
+      it('notifies on RECOVERY as well as on breaking', () => {
+        const alarms = alerting().findResources('AWS::CloudWatch::Alarm');
+        const alarm = Object.values(alarms).find(
+          (a) => String((a.Properties as { AlarmName?: string }).AlarmName || '').includes('context-source-failure-rate'),
+        );
+        const props = alarm!.Properties as { AlarmActions?: unknown[]; OKActions?: unknown[] };
+        expect(props.AlarmActions?.length).toBeGreaterThan(0);
+        expect(props.OKActions?.length).toBeGreaterThan(0);
+      });
+
+      it('routes the alarm to the ADMIN CHANNEL, not to an email list', () => {
+        // SNS is the transport between CloudWatch and the notifier; the destination is the admin
+        // conversation, which fans out to the roster by email through the channel flow.
+        const t = alerting();
+        t.resourceCountIs('AWS::SNS::Topic', 1);
+        const subs = Object.values(t.findResources('AWS::SNS::Subscription'));
+        expect(subs.some((s) => (s.Properties as { Protocol?: string }).Protocol === 'lambda')).toBe(true);
+      });
+
+      it('builds a dashboard naming THIS deployment\'s sources', () => {
+        const boards = Object.values(alerting().findResources('AWS::CloudWatch::Dashboard'));
+        expect(boards).toHaveLength(1);
+        const body = JSON.stringify((boards[0].Properties as { DashboardBody: unknown }).DashboardBody);
+        // The catalog's own keys, so an operator does not have to guess what to look for.
+        expect(body).toContain('company-docs');
+        // And the failure reasons, with the security one present.
+        expect(body).toContain('denied');
+      });
+
+      // FALSIFICATION. Without this, the assertions above could all pass while the alarm shipped
+      // unconditionally - an alarm with no delivery target is a light nobody sees, and a dashboard is
+      // a monthly charge for a page nobody opens.
+      it('ships NEITHER when there is no admin channel to deliver to', () => {
+        const t = Template.fromStack(
+          new StandardClassificationStack(new cdk.App(), 'AgentEchelonClassification-CtxNoAlarm', classificationBasicProps),
+        );
+        const alarms = Object.values(t.findResources('AWS::CloudWatch::Alarm'));
+        expect(alarms.filter(
+          (a) => String((a.Properties as { AlarmName?: string }).AlarmName || '').includes('context-source'),
+        )).toEqual([]);
+        t.resourceCountIs('AWS::CloudWatch::Dashboard', 0);
       });
     });
 
@@ -506,8 +888,9 @@ describe('CDK Synthesis', () => {
 
       const template = Template.fromStack(stack);
       template.resourceCountIs('AWS::Bedrock::Agent', 0);
-      // Premium owns the tier content guardrail + the /battle image guardrail.
-      template.resourceCountIs('AWS::Bedrock::Guardrail', 2);
+      // Premium owns the default content guardrail + the 'strict' selectable alternate (4.6b) + the
+      // /battle image guardrail.
+      template.resourceCountIs('AWS::Bedrock::Guardrail', 3);
     });
   });
 
@@ -736,6 +1119,79 @@ describe('CDK Synthesis', () => {
       // No Bedrock managed agents anywhere in the battle stack.
       template.resourceCountIs('AWS::Bedrock::Agent', 0);
     });
+
+    it('the battle-outcome role grants dynamodb:UpdateItem (votes-map nested writes), not just PutItem', () => {
+      // recordBattleOutcome writes the per-user votes map with nested-path UpdateExpressions
+      // (`SET votes = if_not_exists(...)` then `SET votes.<sub> = ...`), so the outcome Lambda's role
+      // MUST grant UpdateItem - a Put-only grant AccessDenies the pick write and the API returns 503.
+      const template = Template.fromStack(new BattleStack(new cdk.App(), 'AgentEchelonBattle', { ...battleProps }));
+      const roles = Object.values(template.findResources('AWS::IAM::Role'));
+      const statements = roles.flatMap((r: any) =>
+        (r.Properties?.Policies ?? []).flatMap((p: any) => p.PolicyDocument?.Statement ?? []));
+      const grantsUpdateItem = statements.some((s: any) =>
+        (Array.isArray(s.Action) ? s.Action : [s.Action]).includes('dynamodb:UpdateItem'));
+      expect(grantsUpdateItem).toBe(true);
+    });
+  });
+
+  // ── SPEC-ABUSE-CONTROLS: the channel-flow dispatch paths are metered too ──
+  // @all/@assistant mentions and /battle fan-outs are dispatched by the channel-flow
+  // processor BEFORE the Lex router that gates the 1:1 tier turn. Without an abuse gate
+  // here, a group channel is a budget-bypass path to the model. The processor must carry
+  // the ABUSE_CONTROLS_TABLE env AND a DynamoDB write grant on the control table so the
+  // rate-limit / budget counters can bump. Regression guard for that wiring.
+  describe('Channel-flow stack — abuse gate wiring (SPEC-ABUSE-CONTROLS)', () => {
+    const channelFlowProps = {
+      env,
+      appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
+    };
+
+    it('the channel-flow processor carries ABUSE_CONTROLS_TABLE env + a DynamoDB write grant', () => {
+      const template = Template.fromStack(
+        new ChannelFlowStack(new cdk.App(), 'AgentEchelonChannelFlow', { ...channelFlowProps }));
+
+      // The processor Lambda carries the shared control-table env (enforceAbuseGate reads it).
+      const fns = Object.values(template.findResources('AWS::Lambda::Function')) as Array<{
+        Properties?: { Environment?: { Variables?: Record<string, unknown> } };
+      }>;
+      const withAbuse = fns.filter((f) => f.Properties?.Environment?.Variables?.ABUSE_CONTROLS_TABLE !== undefined);
+      expect(withAbuse.length).toBeGreaterThanOrEqual(1);
+
+      // The rate-limit / budget counters need DynamoDB UpdateItem on the control table.
+      const policies = JSON.stringify(template.findResources('AWS::IAM::Policy'));
+      expect(policies).toContain('dynamodb:UpdateItem');
+    });
+
+    it('@all routes by channel classification: processor carries basic + standard + premium ARNs (F1)', () => {
+      // @all is generated at the CHANNEL's classification, so the channel-flow processor must be able to
+      // invoke the basic, standard, AND premium processors - not just standard. Without BASIC_*, an @all
+      // in a basic channel would run on the standard processor and broadcast standard-tier company
+      // context into a lower channel.
+      const template = Template.fromStack(
+        new ChannelFlowStack(new cdk.App(), 'AgentEchelonChannelFlow', { ...channelFlowProps }));
+      const fns = Object.values(template.findResources('AWS::Lambda::Function')) as Array<{
+        Properties?: { Environment?: { Variables?: Record<string, unknown> } };
+      }>;
+      const proc = fns.find((f) => f.Properties?.Environment?.Variables?.ASYNC_PROCESSOR_ARN !== undefined);
+      expect(proc).toBeDefined();
+      const vars = proc!.Properties!.Environment!.Variables!;
+      expect(vars.BASIC_ASYNC_PROCESSOR_ARN).toBeDefined();
+      expect(vars.ASYNC_PROCESSOR_ARN).toBeDefined();   // standard
+      expect(vars.PREMIUM_ASYNC_PROCESSOR_ARN).toBeDefined();
+    });
+
+    it('budget + circuit stay OPT-IN on channel-flow: no circuit SSM grant without a global budget', () => {
+      const template = Template.fromStack(
+        new ChannelFlowStack(new cdk.App(), 'AgentEchelonChannelFlow', { ...channelFlowProps }));
+      const policies = JSON.stringify(template.findResources('AWS::IAM::Policy'));
+      expect(policies).not.toContain('/agent-echelon/abuse/circuit');
+
+      const template2 = Template.fromStack(
+        new ChannelFlowStack(new cdk.App({ context: { bedrockGlobalHourlyBudget: '800' } }),
+          'AgentEchelonChannelFlow', { ...channelFlowProps }));
+      const policies2 = JSON.stringify(template2.findResources('AWS::IAM::Policy'));
+      expect(policies2).toContain('abuse/circuit');
+    });
   });
 
   // ── SPEC-CONVERSATION-SECURITY Layer 1: channel-tag IAM allow-tests ───────
@@ -879,5 +1335,175 @@ describe('CDK Synthesis', () => {
       );
       expect(withRole).toHaveLength(4); // basic, standard, premium, admins
     });
+  });
+
+  describe('Layer 4 / §7 — IAM resource boundaries (deny-by-absence, SPEC-CONVERSATION-SECURITY §4)', () => {
+    const appInstanceArn = 'arn:aws:chime:us-east-1:123456789012:app-instance/test';
+    const bucketArn = 'arn:aws:s3:::agent-echelon-attachments-test';
+    const props = {
+      env,
+      appInstanceArn,
+      attachmentsBucketName: 'agent-echelon-attachments-test',
+      attachmentsBucketArn: bucketArn,
+      profileModelSelection: DEFAULT_PROFILE_MODEL_SELECTION,
+    };
+
+    // Every IAM statement in the synthesized template (inline role policies + AWS::IAM::Policy).
+    const allStatements = (template: Template): any[] => {
+      const policies = template.findResources('AWS::IAM::Policy');
+      const roles = template.findResources('AWS::IAM::Role');
+      const out: any[] = [];
+      for (const r of [...Object.values(policies), ...Object.values(roles)]) {
+        const doc =
+          (r as any).Properties?.PolicyDocument ||
+          (r as any).Properties?.Policies?.flatMap((p: any) => p.PolicyDocument?.Statement || []);
+        const stmts = doc?.Statement || (Array.isArray(doc) ? doc : []);
+        if (Array.isArray(stmts)) out.push(...stmts);
+      }
+      return out;
+    };
+
+    // Flatten an IAM resource / condition entry (plain string OR an Fn::Join token) to one
+    // searchable string, so `context/premium/` and the SSM-resolved channel-context ARN match
+    // whether CDK emitted a literal or a Join.
+    const flat = (r: any): string => {
+      if (typeof r === 'string') return r;
+      if (r && r['Fn::Join']) return (r['Fn::Join'][1] as any[]).map((p) => (typeof p === 'string' ? p : '')).join('');
+      if (r && r.Ref) return String(r.Ref);
+      return '';
+    };
+    const actionsOf = (s: any): string[] => (Array.isArray(s.Action) ? s.Action : [s.Action]);
+    const asArr = (x: any): any[] => (Array.isArray(x) ? x : x === undefined ? [] : [x]);
+    // The channel-context resource is an SSM `valueForStringParameter` → a CfnParameter `Ref` whose
+    // logical id sanitizes the param name (`…channel-context-arn` → `…channelcontextarn`). Normalize
+    // (drop non-alphanumerics, lowercase) so the match holds whether the resource is the param name or
+    // the Ref logical id.
+    const isChannelContextRes = (r: string): boolean => r.replace(/[^a-z0-9]/gi, '').toLowerCase().includes('channelcontext');
+
+    // Resource strings reachable by an `s3:GetObject` Allow.
+    const getObjectResources = (t: Template): string[] =>
+      allStatements(t)
+        .filter((s) => s.Effect === 'Allow' && actionsOf(s).includes('s3:GetObject'))
+        .flatMap((s) => asArr(s.Resource).map(flat));
+    // s3:prefix values in a `s3:ListBucket` StringLike condition.
+    const listBucketPrefixes = (t: Template): string[] =>
+      allStatements(t)
+        .filter((s) => s.Effect === 'Allow' && actionsOf(s).includes('s3:ListBucket'))
+        .flatMap((s) => asArr(s.Condition?.StringLike?.['s3:prefix']).map(flat));
+    const hasContext = (arr: string[], c: string): boolean => arr.some((x) => x.includes(`context/${c}/`));
+
+    // ── S3 context prefix boundary (Layer 4). The single most load-bearing security claim:
+    //    a classification's assistant role CANNOT read a higher classification's context/.
+    //    Deny-by-absence — widening ContextS3Read to include context/premium/ breaks this. ──
+    it('basic assistant: context S3 read includes context/basic/ and EXCLUDES standard + premium', () => {
+      const t = Template.fromStack(new BasicClassificationStack(new cdk.App(), 'AgentEchelonClassification-Basic', props));
+      const gets = getObjectResources(t);
+      const lists = listBucketPrefixes(t);
+      expect(hasContext(gets, 'basic')).toBe(true);
+      expect(hasContext(gets, 'standard')).toBe(false);
+      expect(hasContext(gets, 'premium')).toBe(false);
+      expect(hasContext(lists, 'basic')).toBe(true);
+      expect(hasContext(lists, 'standard')).toBe(false);
+      expect(hasContext(lists, 'premium')).toBe(false);
+    });
+
+    it('standard assistant: context S3 read includes basic + standard and EXCLUDES premium', () => {
+      const t = Template.fromStack(new StandardClassificationStack(new cdk.App(), 'AgentEchelonClassification-Standard', props));
+      const gets = getObjectResources(t);
+      expect(hasContext(gets, 'basic')).toBe(true);
+      expect(hasContext(gets, 'standard')).toBe(true);
+      expect(hasContext(gets, 'premium')).toBe(false);
+    });
+
+    it('premium assistant: context S3 read includes basic + standard + premium (top of the ladder)', () => {
+      const t = Template.fromStack(new PremiumClassificationStack(new cdk.App(), 'AgentEchelonClassification-Premium', props));
+      const gets = getObjectResources(t);
+      expect(hasContext(gets, 'basic')).toBe(true);
+      expect(hasContext(gets, 'standard')).toBe(true);
+      expect(hasContext(gets, 'premium')).toBe(true);
+    });
+
+    // ── Channel Context store grant boundary. The assistant role may READ (GetItem) and PATCH
+    //    (UpdateItem) and NOTHING ELSE. The private host grounding is never replaceable wholesale,
+    //    deletable, or scannable by this role.
+    //
+    //    UpdateItem is here because the drift-confirm flow CREATES conversations from inside this Lambda
+    //    (`lib/channel-creation.ts`) and must record the participant shape before the channel exists, so the
+    //    new conversation gets the same composed welcome as any other (SPEC-USER-PROFILE-AND-ONBOARDING §2).
+    //    The assertion below is the part that still matters: PutItem would let a turn replace another
+    //    conversation's whole grounding item rather than patch the fields this store owns, and Scan/Query
+    //    would let it read across conversations. Those stay forbidden. ──
+    const channelContextStatements = (t: Template): any[] =>
+      allStatements(t).filter(
+        (s) => s.Effect === 'Allow' && asArr(s.Resource).map(flat).some(isChannelContextRes),
+      );
+
+    it('assistant role holds only GetItem + UpdateItem on the channel-context store (never replace/delete/scan)', () => {
+      const t = Template.fromStack(new PremiumClassificationStack(new cdk.App(), 'AgentEchelonClassification-Premium', props));
+      const ccStmts = channelContextStatements(t);
+      expect(ccStmts.length).toBeGreaterThanOrEqual(1);
+      const actions = new Set(ccStmts.flatMap(actionsOf));
+      // Read for per-turn grounding; patch for the pre-creation participant write on the drift path.
+      expect(actions.has('dynamodb:GetItem')).toBe(true);
+      expect(actions.has('dynamodb:UpdateItem')).toBe(true);
+      // PutItem is the one that matters most here: UpdateItem patches the fields this store owns, while
+      // PutItem would let a single turn REPLACE another conversation's entire grounding item. Scan/Query
+      // would let it read across conversations.
+      for (const forbidden of ['dynamodb:PutItem', 'dynamodb:DeleteItem', 'dynamodb:Scan', 'dynamodb:Query', 'dynamodb:BatchWriteItem']) {
+        expect(actions.has(forbidden)).toBe(false);
+      }
+      expect(actions.has('dynamodb:*')).toBe(false);
+    });
+
+    // ── The private host-grounding store is NEVER reachable by an end-user / Identity-Pool
+    //    principal — its only readers/writers are server-side Lambda roles. Assert absence in
+    //    the Cognito auth stack (which owns the Identity-Pool auth/unauth + per-clearance roles). ──
+    it('Cognito / Identity-Pool roles grant NO access to the channel-context store (member-unreadable)', () => {
+      const app = new cdk.App();
+      const chime = new ChimeMessagingStack(app, 'TestChimeCC', { env, appInstanceName: 'test-instance' });
+      const t = Template.fromStack(new CognitoAuthStack(app, 'TestCognitoCC', { env, appInstanceArn: chime.appInstanceArn }));
+      const referencesChannelContext = allStatements(t).some((s) =>
+        asArr(s.Resource).map(flat).some(isChannelContextRes),
+      );
+      expect(referencesChannelContext).toBe(false);
+    });
+
+    // ── Guardrail selection boundary (§7 / 4.6b). A profile SELECTS a deployment-provisioned
+    //    guardrail; it can never point at an arbitrary resource because the ApplyGuardrail grant
+    //    is per-provisioned-ARN. Widening the grant to '*' (or a raw/arbitrary ARN) breaks this. ──
+    it('assistant role can bedrock:ApplyGuardrail ONLY on in-stack provisioned guardrails, never * / arbitrary', () => {
+      const t = Template.fromStack(new PremiumClassificationStack(new cdk.App(), 'AgentEchelonClassification-Premium', props));
+      const applyStmts = allStatements(t).filter(
+        (s) => s.Effect === 'Allow' && actionsOf(s).includes('bedrock:ApplyGuardrail'),
+      );
+      expect(applyStmts.length).toBeGreaterThanOrEqual(1);
+      for (const s of applyStmts) {
+        const resources = asArr(s.Resource);
+        expect(resources.length).toBeGreaterThanOrEqual(1);
+        for (const r of resources) {
+          // Each resource must reference a guardrail provisioned in-stack (GetAtt or a constructed ARN
+          // token that names a guardrail) — never a wildcard and never a raw arbitrary ARN a profile
+          // could smuggle in. A `*` resource would carry no 'guardrail' token and fail here.
+          expect(/guardrail/i.test(JSON.stringify(r))).toBe(true);
+          expect(JSON.stringify(r)).not.toContain('*');
+        }
+      }
+    });
+  });
+});
+
+describe('deploy order honors SSM creator-before-reader (review finding 1)', () => {
+  it('analytics depends on foundations, never the reverse', () => {
+    // The Aurora stack resolves the shared channel-context SSM parameters at DEPLOY time, and
+    // Foundations creates them. The reversed dependency this pins against shipped in the initial
+    // commit with no consumer and made every fresh account's first deploy fail with "SSM parameter
+    // not available" - while staying green on any account whose parameters already existed, which
+    // is why no existing-deployment run could ever catch it.
+    const fs = require('fs') as typeof import('fs');
+    const path = require('path') as typeof import('path');
+    const src = fs.readFileSync(path.join(__dirname, '..', 'bin', 'backend.ts'), 'utf8')
+      .replace(/^\s*\/\/.*$/gm, '');
+    expect(src).toMatch(/analyticsStack\.addDependency\(foundationsStack\)/);
+    expect(src).not.toMatch(/foundationsStack\.addDependency\(analyticsStack\)/);
   });
 });

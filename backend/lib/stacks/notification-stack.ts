@@ -11,6 +11,7 @@ import * as events from 'aws-cdk-lib/aws-events';
 import * as targets from 'aws-cdk-lib/aws-events-targets';
 import { Construct } from 'constructs';
 import { SSM_ROOT, botArnKey } from './agent-classification-common';
+import { sesSenderIdentityArns } from '../ses-identity';
 
 export interface NotificationStackProps extends cdk.StackProps {
   appInstanceArn: string;
@@ -133,10 +134,10 @@ export class NotificationStack extends cdk.Stack {
           statements: [
             new iam.PolicyStatement({
               actions: ['ses:SendEmail', 'ses:SendRawEmail'],
-              // Scoped to the verified identity ARN
-              resources: [
-                `arn:aws:ses:${this.region}:${this.account}:identity/${props.senderEmail}`,
-              ],
+              // Scoped to the sender's identity ARNs — the address AND its parent domain,
+              // because SES authorizes against whichever of the two it resolves the From
+              // address to. See lib/ses-identity.ts.
+              resources: sesSenderIdentityArns(this.region, this.account, props.senderEmail),
             }),
           ],
         }),
@@ -186,6 +187,41 @@ export class NotificationStack extends cdk.Stack {
         ...apiAccessLogConfig(this, 'NotificationApiAccessLogs'),
       },
     });
+
+    // CORS headers on the GATEWAY's OWN error responses, not just on the integration's.
+    //
+    // `defaultCorsPreflightOptions` covers the preflight and the Lambda's own replies. It does NOT
+    // cover a response API Gateway generates itself - an authorizer 401, a throttle 429, a 5XX - and
+    // those come back with no `Access-Control-Allow-Origin`. The browser then refuses to expose them
+    // to the page, and `fetch` rejects with a bare "Failed to fetch": no status, no body, no reason.
+    //
+    // The share modal showed exactly that during an e2e run, which is indistinguishable from the
+    // network being down and sent the investigation to the wrong place. Whatever the cause, the
+    // operator and the user should be able to SEE it. Mirrors the analytics API, which already does
+    // this for the same reason.
+    // The authorizer types are listed EXPLICITLY, not left to DEFAULT_4XX. Verified live: with only
+    // the defaults customised, a call with no token still came back `401 {"message":"Unauthorized"}`
+    // carrying no `Access-Control-Allow-Origin` — API Gateway serves the more specific `UNAUTHORIZED`
+    // response and does not inherit the DEFAULT_4XX mapping. An expired token is the likeliest
+    // failure a real session hits, and it is precisely the one that was reaching the user as
+    // "Failed to fetch" with nothing to act on.
+    for (const [id, type] of [
+      ['NotificationGatewayResponse4XX', apigateway.ResponseType.DEFAULT_4XX],
+      ['NotificationGatewayResponse5XX', apigateway.ResponseType.DEFAULT_5XX],
+      ['NotificationGatewayResponseUnauthorized', apigateway.ResponseType.UNAUTHORIZED],
+      ['NotificationGatewayResponseAccessDenied', apigateway.ResponseType.ACCESS_DENIED],
+      ['NotificationGatewayResponseExpiredToken', apigateway.ResponseType.EXPIRED_TOKEN],
+      ['NotificationGatewayResponseThrottled', apigateway.ResponseType.THROTTLED],
+    ] as const) {
+      api.addGatewayResponse(id, {
+        type,
+        responseHeaders: {
+          'Access-Control-Allow-Origin': `'${appUrl}'`,
+          'Access-Control-Allow-Headers': "'Content-Type,Authorization'",
+          'Access-Control-Allow-Methods': "'POST,OPTIONS'",
+        },
+      });
+    }
 
     // /share-conversation is Cognito-authed so no anonymous caller can add a
     // user to a channel or send a SES email under an arbitrary sender name. The
@@ -292,9 +328,7 @@ export class NotificationStack extends cdk.Stack {
           statements: [
             new iam.PolicyStatement({
               actions: ['ses:SendEmail', 'ses:SendRawEmail'],
-              resources: [
-                `arn:aws:ses:${this.region}:${this.account}:identity/${props.senderEmail}`,
-              ],
+              resources: sesSenderIdentityArns(this.region, this.account, props.senderEmail),
             }),
           ],
         }),

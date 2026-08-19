@@ -21,7 +21,19 @@ export interface ConsoleEntry {
 export class ConsoleMonitor {
   private entries: ConsoleEntry[] = [];
 
-  /** Substrings to ignore -- noisy browser/SDK warnings that are not actionable */
+  /**
+   * Substrings to ignore -- noisy browser/SDK messages that say nothing about THIS app.
+   *
+   * The bar is "not about our code". Everything below is environmental: a devtools nag, a browser
+   * privacy notice, a dev-server artifact, a missing favicon.
+   *
+   * Deliberately NOT ignored any more: invalid DOM nesting ("cannot be a descendant of", "cannot
+   * contain a nested") and hydration errors. Those were on this list as "not actionable", but they
+   * are real React defects in our own components - invalid nesting produces genuinely broken markup
+   * and hydration mismatches mean the server and client disagree about what to render. Filtering
+   * them meant the three specs that DO check the console were checking with those classes of bug
+   * already excluded.
+   */
   private ignorePatterns: string[] = [
     'Download the React DevTools',
     'Third-party cookie',
@@ -30,9 +42,6 @@ export class ConsoleMonitor {
     'Manifest:',
     'favicon.ico',
     'Warning: ReactDOM.render is no longer supported',
-    'cannot be a descendant of',
-    'cannot contain a nested',
-    'hydration error',
   ];
 
   /** Key phrases from info/log messages that indicate problems worth capturing */

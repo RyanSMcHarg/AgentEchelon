@@ -1,5 +1,7 @@
 import * as cdk from 'aws-cdk-lib';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
+import { adminApiMethodOptions, adminAuthEnv } from '../constructs/admin-auth-mode';
+import { sharedOrigins } from '../config/app-origins';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
@@ -17,6 +19,19 @@ export interface FoundationsStackProps extends cdk.StackProps {
   appInstanceArn: string;
   /** User Pool ID for the create-conversation classification gate. */
   userPoolId: string;
+  /**
+   * The user pool itself, for the feedback API's Cognito authorizer. Needing a pool for an
+   * AUTHORIZER is true of almost every API and is not a reason to live in the identity stack -
+   * otherwise every API would.
+   */
+  userPool: cognito.IUserPool;
+  /**
+   * The UserFeedback (thumbs) table, which stays in CognitoAuthStack. Relocating a DynamoDB table
+   * between stacks REPLACES it - destroying history where the removal policy is DESTROY, orphaning
+   * it where it is RETAIN - so the stateless API moved here and the state did not. Passed by
+   * reference; this stack only reads/writes it.
+   */
+  feedbackTable: dynamodb.ITable;
 }
 
 /**
@@ -66,6 +81,21 @@ export class FoundationsStack extends cdk.Stack {
       projectionType: dynamodb.ProjectionType.ALL,
     });
 
+    // "What work is open in THIS conversation", whoever owns it (ADR-024 D4). Visibility is scoped by
+    // conversation membership rather than by ownership, and that question had no index at all: the
+    // table's channelArn is a SORT key, so it cannot be queried on its own, and the two owner-keyed
+    // reads can only narrow one actor's tasks to a channel. Not sparse - every task has a channel.
+    //
+    // Sorted by `updatedAt` rather than by `status`: recency answers "what is open here" in one query
+    // and orders the result, where a status sort key needs one query per active status and still does
+    // not order them. A judgement, not a measurement; revisit if the filtered read proves wasteful.
+    agentTasksTable.addGlobalSecondaryIndex({
+      indexName: 'channelArn-updatedAt-index',
+      partitionKey: { name: 'channelArn', type: dynamodb.AttributeType.STRING },
+      sortKey: { name: 'updatedAt', type: dynamodb.AttributeType.STRING },
+      projectionType: dynamodb.ProjectionType.ALL,
+    });
+
     const userTasksTable = new dynamodb.Table(this, 'UserTasksTable', {
       partitionKey: { name: 'userSub', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'taskId', type: dynamodb.AttributeType.STRING },
@@ -98,6 +128,22 @@ export class FoundationsStack extends cdk.Stack {
       },
     });
 
+    // Channel Context store (channel-context-client.ts). The SERVER-ONLY grounding a conversation
+    // carries — participant profile, domain context, extra context blobs, resolved display name —
+    // keyed by channelArn. These must NOT sit in Amazon Chime SDK channel Metadata, which any member
+    // can read via DescribeChannel; only the conversation-create Lambdas write here and only the
+    // assistant handler reads. Durable (no TTL), PITR on, like UserProfileTable. The member-readable
+    // routing bits (topic, language, segment, contextId) and the participant ROSTER (already visible
+    // via ListChannelMemberships) deliberately stay in channel Metadata.
+    const channelContextTable = new dynamodb.Table(this, 'ChannelContextTable', {
+      partitionKey: { name: 'channelArn', type: dynamodb.AttributeType.STRING },
+      billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
+      removalPolicy: dataRemovalPolicy,
+      pointInTimeRecoverySpecification: {
+        pointInTimeRecoveryEnabled: true,
+      },
+    });
+
     // Abuse-controls control plane (docs/specs/analytics-eval/SPEC-ABUSE-CONTROLS.md). One
     // generic pk+ttl table backs request dedup (`dedup#<corr>`), spend budgets
     // (`budget#user#…`, `budget#global#…`), and later rate limits. Every entry is short-lived
@@ -117,7 +163,7 @@ export class FoundationsStack extends cdk.Stack {
     // battle-OWNED Lex, so this stack needs no shared Lex/router.
 
     // ============================================================
-    // Shared SSM contract for the per-classification stacks (SPEC-PER-TIER-OWNERSHIP.md).
+    // Shared SSM contract for the per-classification stacks (SPEC-PER-PROFILE-OWNERSHIP.md).
     // AgentEchelonClassification-{Standard,Premium} resolve these at DEPLOY time via
     // valueForStringParameter (an SSM dynamic ref, NOT Fn::importValue), so a
     // classification deploys decoupled from this stack while still pointing at the shared
@@ -131,6 +177,8 @@ export class FoundationsStack extends cdk.Stack {
       ['SharedUserTasksNameParam', SHARED_SSM.userTasksName, userTasksTable.tableName],
       ['SharedUserProfileArnParam', SHARED_SSM.userProfileArn, userProfileTable.tableArn],
       ['SharedUserProfileNameParam', SHARED_SSM.userProfileName, userProfileTable.tableName],
+      ['SharedChannelContextArnParam', SHARED_SSM.channelContextArn, channelContextTable.tableArn],
+      ['SharedChannelContextNameParam', SHARED_SSM.channelContextName, channelContextTable.tableName],
       ['SharedAbuseControlsArnParam', SHARED_SSM.abuseControlsArn, abuseControlsTable.tableArn],
       ['SharedAbuseControlsNameParam', SHARED_SSM.abuseControlsName, abuseControlsTable.tableName],
       // NOTE: cognito pool id is published by AgentEchelonCognitoAuth (not here) to
@@ -242,6 +290,52 @@ export class FoundationsStack extends cdk.Stack {
       authorizationType: apigateway.AuthorizationType.COGNITO,
     });
 
+    // ── GET /tasks/mine — the open work items this user owns, across every conversation ──────────
+    //
+    // It lives HERE, on the existing conversation API, because this stack owns `userTasksTable`. A
+    // separate API would mean a second authorizer, a second CORS surface and a cross-stack grant for
+    // one read of a table three metres away.
+    //
+    // The grant is READ ONLY and scoped to that one table. This endpoint never writes: an item is
+    // handed over by the assistant that owns the work, and closed by the turn that finishes it, so a
+    // client that could write here could fabricate or clear someone's obligations.
+    const userTasksApiFn = new lambdaNodeJs.NodejsFunction(this, 'UserTasksApiFunction', {
+      entry: './lambda/src/user-tasks-api.ts',
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: cdk.Duration.seconds(10),
+      memorySize: 256,
+      environment: {
+        USER_TASKS_TABLE: userTasksTable.tableName,
+        ALLOWED_ORIGIN: appUrl,
+      },
+      bundling: { minify: false, forceDockerBundling: false },
+    });
+    userTasksTable.grantReadData(userTasksApiFn);
+
+    // Its own preflight: the API's default allows POST only, and this is the first GET on it.
+    const tasksResource = api.root.addResource('tasks', {
+      defaultCorsPreflightOptions: {
+        allowOrigins: [appUrl],
+        allowMethods: ['GET', 'OPTIONS'],
+        allowHeaders: ['Content-Type', 'Authorization'],
+      },
+    });
+    tasksResource.addResource('mine').addMethod(
+      'GET',
+      new apigateway.LambdaIntegration(userTasksApiFn),
+      {
+        authorizer: conversationApiAuthorizer,
+        authorizationType: apigateway.AuthorizationType.COGNITO,
+      },
+    );
+
+    new cdk.CfnOutput(this, 'UserTasksApiUrl', {
+      value: `${api.url}tasks/mine`,
+      description: 'Open work items owned by the caller (the chat client renders this as their queue)',
+      exportName: `${this.stackName}-UserTasksApiUrl`,
+    });
+
     const channelFlowArnParamArn = `arn:aws:ssm:${this.region}:${this.account}:parameter${CHANNEL_FLOW_ARN_SSM_KEY}`;
     const userPoolArn = `arn:aws:cognito-idp:${this.region}:${this.account}:userpool/${props.userPoolId}`;
 
@@ -340,9 +434,24 @@ export class FoundationsStack extends cdk.Stack {
         // standalone create-conversation asset can't import the CDK-side config, so
         // it reads these env vars and applies them when a request sends no override.
         ...defaultExpirationEnv,
+        // WHO will be in the conversation, written BEFORE CreateChannel
+        // (SPEC-USER-PROFILE-AND-ONBOARDING §2). The assistant is added by creation itself, so there is no
+        // window afterwards; the welcome reads this instead of racing eventually-consistent Chime reads.
+        CHANNEL_CONTEXT_TABLE: channelContextTable.tableName,
       },
       role: createChannelRole,
     });
+
+    // Server-only write of the private per-conversation grounding (participant shape, participant profile,
+    // domain context, ...); the sensitive fields go here, NOT into member-readable channel Metadata.
+    //
+    // Granted OUTSIDE any feature conditional, deliberately. This grant and the env var above used to live
+    // inside the `federatedHostPoolId` block, so on a deployment that does not enable federation the primary
+    // create path had NEITHER - and because `putChannelContext` returns early on an empty table name and
+    // swallows write failures, the participant write would have been a silent no-op with the welcome quietly
+    // falling back. Scoped to UpdateItem: the create path issues one UpdateItem and has no reason to be able
+    // to delete or overwrite another conversation's grounding.
+    channelContextTable.grant(createChannelRole, 'dynamodb:UpdateItem');
 
     const createConversationIntegration = new apigateway.LambdaIntegration(createChannelFunction);
     const createConversationResource = api.root.addResource('create-conversation');
@@ -479,6 +588,7 @@ export class FoundationsStack extends cdk.Stack {
           APP_INSTANCE_ARN: props.appInstanceArn,
           CHANNEL_FLOW_ARN_PARAM: CHANNEL_FLOW_ARN_SSM_KEY,
           ASSISTANT_CLASSIFICATION: (this.node.tryGetContext('assistantTier') as string) || 'basic',
+          CHANNEL_CONTEXT_TABLE: channelContextTable.tableName,
           ALLOWED_ORIGIN: '*',
         },
         bundling: { minify: false, forceDockerBundling: false, externalModules: ['@aws-sdk/*'] },
@@ -545,7 +655,12 @@ export class FoundationsStack extends cdk.Stack {
         APP_INSTANCE_ARN: props.appInstanceArn,
         CHANNEL_FLOW_ARN_PARAM: CHANNEL_FLOW_ARN_SSM_KEY,
         ASSISTANT_CLASSIFICATION: (this.node.tryGetContext('assistantTier') as string) || 'basic',
+        CHANNEL_CONTEXT_TABLE: channelContextTable.tableName,
       };
+      // add-member writes the private host grounding to the server-only store, not channel Metadata.
+      // UpdateItem only (see the create role above): the add-member Lambda only ever upserts the one
+      // channel's grounding via putChannelContext.
+      channelContextTable.grant(shareMemberRole, 'dynamodb:UpdateItem');
       const shareBundling = { minify: false, forceDockerBundling: false, externalModules: ['@aws-sdk/*'] };
 
       const addMemberFn = new lambdaNodeJs.NodejsFunction(this, 'FederatedAddMemberFunction', {
@@ -610,6 +725,109 @@ export class FoundationsStack extends cdk.Stack {
       value: `${api.url}create-conversation`,
       description: 'API Gateway URL for creating conversations with AI agent',
       exportName: `${this.stackName}-CreateConversationApiUrl`,
+    });
+
+
+    // ============================================================
+    // User Feedback API (moved from CognitoAuthStack)
+    // ============================================================
+    // Thumbs up/down on an assistant reply is a product feature with no identity relationship.
+    // It lived in the identity stack, which put a non-IdP surface inside that stack's deploy blast
+    // radius and made the feature look IdP-dependent. Needing the user pool for an AUTHORIZER is
+    // not an identity coupling - nearly every API needs that.
+    //
+    // The TABLE deliberately stayed behind (props.feedbackTable): moving state between stacks
+    // replaces the table and loses the data. Stateless resources move; state migrates.
+    const feedbackOrigins = sharedOrigins(this);
+    const feedbackTable = props.feedbackTable;
+
+    const feedbackRole = new iam.Role(this, 'UserFeedbackRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      inlinePolicies: {
+        FeedbackDdb: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: [
+                'dynamodb:PutItem',
+                'dynamodb:Scan',
+              ],
+              resources: [feedbackTable.tableArn],
+            }),
+          ],
+        }),
+        // Caller-membership check uses the caller's own AppInstanceUser ARN as
+        // ChimeBearer (allowed for self-membership-lookup by Chime); no bot SSM
+        // lookup needed.
+        FeedbackChime: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['chime:DescribeChannelMembership'],
+              resources: [`${props.appInstanceArn}/*`],
+            }),
+          ],
+        }),
+      },
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
+      ],
+    });
+
+    const feedbackFn = new lambdaNodeJs.NodejsFunction(this, 'UserFeedbackFunction', {
+      entry: './lambda/src/user-feedback.ts',
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: cdk.Duration.seconds(15),
+      memorySize: 256,
+      role: feedbackRole,
+      environment: {
+        FEEDBACK_TABLE: feedbackTable.tableName,
+        ALLOWED_ORIGIN: feedbackOrigins.join(','),
+        // M4: needed for the channel-membership check before recording feedback.
+        APP_INSTANCE_ARN: props.appInstanceArn,
+        // The GET summary is admin-gated via callerIsAdmin; give the handler the
+        // admin-auth mode/env so it honors ADMIN_GROUP_NAMES / service mode.
+        ...adminAuthEnv(this),
+      },
+      bundling: { minify: false, forceDockerBundling: false },
+    });
+
+    const feedbackAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'FeedbackAuthorizer', {
+      cognitoUserPools: [props.userPool],
+    });
+
+    const feedbackApi = new apigateway.RestApi(this, 'UserFeedbackApi', {
+      restApiName: 'Agent Echelon User Feedback',
+      defaultCorsPreflightOptions: {
+        allowOrigins: feedbackOrigins,
+        allowMethods: ['GET', 'POST', 'OPTIONS'],
+        allowHeaders: ['Content-Type', 'Authorization'],
+      },
+      deployOptions: {
+        throttlingBurstLimit: 30,
+        throttlingRateLimit: 15,
+        // Access logging.
+        ...apiAccessLogConfig(this, 'UserFeedbackApiAccessLogs'),
+      },
+    });
+
+    const feedbackIntegration = new apigateway.LambdaIntegration(feedbackFn);
+    const feedbackResource = feedbackApi.root.addResource('feedback');
+    // POST is user-level: any authenticated user submits feedback (plain Cognito
+    // authorizer). GET is the admin summary and gates on admin authority via the
+    // mode-aware options (Cognito admins group / federated host pool / IAM service).
+    feedbackResource.addMethod('POST', feedbackIntegration, {
+      authorizer: feedbackAuthorizer,
+      authorizationType: apigateway.AuthorizationType.COGNITO,
+    });
+    const feedbackAdminAuthOptions = adminApiMethodOptions(this, 'FeedbackAdminAuthorizer', {
+      userPool: props.userPool,
+    });
+    feedbackResource.addMethod('GET', feedbackIntegration, feedbackAdminAuthOptions);
+
+    new cdk.CfnOutput(this, 'UserFeedbackApiUrl', {
+      value: `${feedbackApi.url}feedback`,
+      description: 'User feedback API URL',
+      exportName: `${this.stackName}-UserFeedbackApiUrl`,
     });
 
     cdk.Tags.of(this).add('Component', 'Foundations');

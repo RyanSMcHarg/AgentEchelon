@@ -20,7 +20,7 @@ export const USER_POOL_ID = import.meta.env.VITE_USER_POOL_ID;
  * `VITE_ADMIN_CLIENT_ID`) for session isolation; when that is unset (reuse mode,
  * or the chat app) it falls back to the shared client (`VITE_CLIENT_ID`). Single
  * fallback path, so "reuse the shared client" stays a config option with no
- * extra code — see SPEC-SEPARATE-ADMIN-APP.md P3.
+ * extra code — see DESIGN-SEPARATE-ADMIN-APP.md P3.
  */
 export const USER_POOL_CLIENT_ID =
   import.meta.env.VITE_ADMIN_CLIENT_ID || import.meta.env.VITE_CLIENT_ID;
@@ -34,7 +34,7 @@ export const CREDENTIAL_EXCHANGE_API_URL = import.meta.env.VITE_CREDENTIAL_EXCHA
 
 /**
  * The admin console's URL (the SEPARATE admin app, `AgentEchelonAdminFrontend`).
- * The admin console is not a route in the chat SPA (SPEC-SEPARATE-ADMIN-APP.md);
+ * The admin console is not a route in the chat SPA (DESIGN-SEPARATE-ADMIN-APP.md);
  * when this is set, the chat app shows an admin a LINK OUT to it (a plain URL, no
  * operator code — `assert-no-admin-in-chat.mjs` stays satisfied). A deployer can
  * point it at ANY admin surface they run (AE's own console, or one they build on
@@ -43,7 +43,7 @@ export const CREDENTIAL_EXCHANGE_API_URL = import.meta.env.VITE_CREDENTIAL_EXCHA
 export const ADMIN_APP_URL = import.meta.env.VITE_ADMIN_APP_URL || '';
 
 /**
- * A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): when `true`, the admin console
+ * A14 (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md): when `true`, the admin console
  * reaches the archive endpoints with SigV4-signed, IAM-authorized requests
  * instead of a Cognito JWT — `view-conversations`/`membership-history` signed
  * with the operator's sign-on Identity-Pool creds, and the `view-messages` (A2)
