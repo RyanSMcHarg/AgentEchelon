@@ -1413,7 +1413,12 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
         const declaredDelivery = (taskContext?.transitions ?? []).some((t) =>
           deliveryStates.includes(t.to)
           || (deliveryStates.includes(t.from) && taskMachine?.states[t.to]?.terminal !== undefined));
-        generate = declaredDelivery && response.trim().length > 0;
+        // The 400-char floor is a MINIMUM ARTIFACT SIZE, not a return of the shape heuristic: a
+        // declared delivery below it still advances and completes identically, but its content posts
+        // as chat text instead of a file - a one-sentence extraction shipped as a downloadable
+        // document buries the answer behind a click (measured live: a single-fact codename landed as
+        // an attachment nobody asked for). Above the floor, the machine's declaration is the gate.
+        generate = declaredDelivery && response.trim().length >= 400;
         // SHADOW: the retired heuristic, log-only (same treatment as shadowKeywordTransition). A
         // deliverable-shaped output with NO declared delivery transition is the model
         // under-declaring — the case the heuristic existed for — and is now measured instead of

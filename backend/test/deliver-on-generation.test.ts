@@ -94,10 +94,13 @@ describe('the second completion door stays removed (source ratchets)', () => {
     const shadowMentions = region.match(/deliverable_shaped_without_declared_state/g) || [];
     expect(mentions.length).toBe(1);
     expect(shadowMentions.length).toBe(1);
-    // The generate assignment keys on the declared transition and nothing text-shaped: the last
-    // remnant (solicitsInput, an English-opener phrase list deciding attach-vs-chat) is gone from
-    // the live gate along with its length bar.
-    expect(region).toMatch(/generate = declaredDelivery && response\.trim\(\)\.length > 0/);
+    // The generate assignment keys on the declared transition plus a minimum artifact size, and
+    // nothing text-shaped: the last remnant (solicitsInput, an English-opener phrase list deciding
+    // attach-vs-chat) is gone from the live gate. The 400-char floor is not a shape heuristic - a
+    // declared delivery below it still advances identically, its content just posts inline, because
+    // a one-sentence extraction shipped as a downloadable file buries the answer behind a click
+    // (measured live).
+    expect(region).toMatch(/generate = declaredDelivery && response\.trim\(\)\.length >= 400/);
     expect(region).not.toMatch(/solicitsInput/);
   });
 
