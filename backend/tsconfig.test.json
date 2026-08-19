@@ -9,6 +9,16 @@
   "compilerOptions": {
     "module": "ESNext",
     "moduleResolution": "Bundler",
+    // Every file is a MODULE, even one whose imports are all inside `jest.mock`
+    // factories or `await import()` calls. Without this, TypeScript classifies
+    // such a file as a global SCRIPT, so its top-level `const`s share one scope
+    // with every other script file — and the gate emitted 21 "Cannot redeclare
+    // block-scoped variable" errors for `mockSend`, `CHANNEL`, `BOT` in files
+    // that never reference each other. Jest runs each file in its own module
+    // registry, so those collisions never existed at runtime; they were an
+    // artifact of the whole-program check. A gate whose output is all noise is
+    // one nobody reads, which is the same as having no gate.
+    "moduleDetection": "force",
     "noEmit": true,
     "types": ["node", "jest"]
   },

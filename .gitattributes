@@ -1,15 +1,15 @@
 # Line-ending policy, pinned so behavior does not depend on each clone's
 # core.autocrlf setting (which otherwise produces phantom "modified" files with
-# empty diffs). Canonical form in the repository is LF; the working tree gets
-# platform-native endings, with the exceptions noted below.
-* text=auto
-
-# Docs are authored in Obsidian with CRLF. Force CRLF in the working tree on
-# every platform so the authoring convention is deterministic.
-*.md eol=crlf
-
-# Shell scripts must stay LF even on Windows checkouts (they run on Linux/CI).
-*.sh text eol=lf
+# empty diffs). LF is canonical in the repository AND in the working tree on
+# every platform, including Windows.
+#
+# Why LF in the working tree: the generators, test harnesses, and editors that
+# write into this repo all emit LF. A CRLF working tree turns every such write
+# into an LF island inside a CRLF file, and because the index normalizes to LF
+# the resulting mixed-ending file is invisible to `git diff` while breaking
+# mid-line in Windows editors. Pinning eol=lf keeps the two in agreement.
+# `.githooks/pre-commit` rejects staged files with mixed endings.
+* text=auto eol=lf
 
 # Binary assets, never apply EOL conversion.
 *.png binary

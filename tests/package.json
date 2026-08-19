@@ -8,7 +8,8 @@
     "test:signin": "npx playwright test e2e/signin.spec.ts --config=playwright.config.ts",
     "test:agents": "npx playwright test e2e/agent-intents.spec.ts --config=playwright.config.ts",
     "test:headed": "npx playwright test --config=playwright.config.ts --headed",
-    "test:report": "npx playwright show-report"
+    "test:report": "npx playwright show-report",
+    "typecheck": "node ../backend/node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
   },
   "keywords": [],
   "author": "",

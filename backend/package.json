@@ -10,15 +10,19 @@
     "watch": "tsc -w",
     "typecheck": "tsc -p tsconfig.test.json --noEmit",
     "test": "jest",
+    "test:shards": "node scripts/run-test-shards.mjs",
     "cdk": "cdk",
     "doctor": "node scripts/deployment-doctor.mjs",
     "sync-context": "node scripts/sync-context.mjs",
     "sync-knowledge": "node scripts/sync-project-knowledge.mjs",
+    "sync-knowledge:rag": "node scripts/sync-project-knowledge.mjs --rag",
     "validate": "node scripts/validate.mjs",
     "provision-test-users": "node scripts/provision-test-users.mjs",
     "provision-admin": "node scripts/provision-admin.mjs",
     "deploy": "node scripts/deploy.mjs",
-    "deploy-frontend": "node scripts/deploy-frontend.mjs"
+    "deploy-frontend": "node scripts/deploy-frontend.mjs",
+    "gen-context-reference": "node scripts/gen-context-reference.mjs",
+    "gen-coverage-matrix": "tsc && node scripts/gen-coverage-matrix.mjs"
   },
   "overrides": {
     "fast-xml-parser": "^5.8.0",

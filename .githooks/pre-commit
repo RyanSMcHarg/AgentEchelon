@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# Pre-commit hook: prevent committing sensitive/critical files.
+# Pre-commit hook: prevent committing sensitive/critical files, and reject files whose
+# line endings are half CRLF and half LF.
 # Install: git config core.hooksPath .githooks
 #
 
@@ -56,6 +57,64 @@ if [ ${#VIOLATIONS[@]} -gt 0 ]; then
   echo "COMMIT BLOCKED — sensitive files detected:"
   echo ""
   printf '%s\n' "${VIOLATIONS[@]}"
+  echo ""
+  echo "If this is intentional, bypass with: git commit --no-verify"
+  echo ""
+  exit 1
+fi
+
+# ---------------------------------------------------------------------------
+# Mixed line endings
+#
+# `.gitattributes` pins LF in the repository AND in the working tree. A file that
+# ends up half CRLF and half LF — a CRLF file that a generator or an editor appended
+# LF lines to — is the failure this catches, and it is invisible by default: the
+# index normalizes to LF, so `git diff` shows nothing while a Windows editor breaks
+# mid-line and a reviewer sees a whole-file diff on the next touch.
+#
+# This reads the WORKING TREE, not the index, and that is deliberate: `text=auto`
+# has already normalized the staged blob, so an index-side check would inspect
+# content in which the defect cannot exist and pass every time.
+# ---------------------------------------------------------------------------
+
+MIXED=()
+
+while IFS= read -r file; do
+  [ -n "$file" ] || continue
+  [ -f "$file" ] || continue
+
+  # Skip anything git treats as binary; `--numstat` reports "-" for both counts there.
+  if git diff --cached --numstat -- "$file" | head -1 | grep -q '^-[[:space:]]*-'; then
+    continue
+  fi
+
+  # Count BYTES with `tr`, not lines with `grep`. Git Bash / MSYS grep reads in text mode and strips
+  # the trailing CR before matching, so `grep -c $'\r$'` returns 0 for a CRLF file and this check
+  # would pass everything while appearing to work. `tr` is byte-exact on every platform.
+  crlf=$(tr -cd '\r' < "$file" | wc -c | tr -d '[:space:]')
+  total=$(tr -cd '\n' < "$file" | wc -c | tr -d '[:space:]')
+  crlf=${crlf:-0}
+  total=${total:-0}
+
+  # Neither all-CRLF (crlf == total) nor all-LF (crlf == 0) is mixed. Only the middle is.
+  if [ "$crlf" -gt 0 ] && [ "$crlf" -lt "$total" ]; then
+    MIXED+=("  $file  ($crlf of $total lines end CRLF)")
+  fi
+done <<< "$STAGED"
+
+if [ ${#MIXED[@]} -gt 0 ]; then
+  echo ""
+  echo "COMMIT BLOCKED — mixed line endings (part CRLF, part LF):"
+  echo ""
+  printf '%s\n' "${MIXED[@]}"
+  echo ""
+  echo "Normalize to LF, which is what .gitattributes pins:"
+  echo ""
+  echo "  # one file"
+  echo "  sed -i 's/\\r\$//' <path>"
+  echo ""
+  echo "  # or re-checkout everything against the current .gitattributes"
+  echo "  git add --renormalize ."
   echo ""
   echo "If this is intentional, bypass with: git commit --no-verify"
   echo ""

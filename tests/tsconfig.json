@@ -1,0 +1,38 @@
+{
+  "//": "Typecheck ONLY (noEmit). Playwright runs these specs through esbuild, which STRIPS types without checking them - so until this file existed, nothing in tests/ was ever type-checked. That is not a theoretical gap: `helpers/turn-guards.ts` shipped a guard reading `.text`/`.severity` off `monitor.getErrors()` (a string[]), so it threw instead of reporting, and by its own comment had 'never once reported a console error usefully'. A test guard that cannot run is a false pass, and nothing caught it. Run: npm run typecheck",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "lib": [
+      "es2022",
+      "dom"
+    ],
+    "types": [
+      "node"
+    ],
+    "strict": true,
+    "noImplicitAny": true,
+    "strictNullChecks": true,
+    "noImplicitReturns": true,
+    "skipLibCheck": true,
+    "resolveJsonModule": true,
+    "allowJs": false,
+    "noEmit": true,
+    "esModuleInterop": true,
+    "allowSyntheticDefaultImports": true,
+    "forceConsistentCasingInFileNames": true,
+    "typeRoots": [
+      "../backend/node_modules/@types"
+    ]
+  },
+  "include": [
+    "e2e/**/*.ts",
+    "*.ts"
+  ],
+  "exclude": [
+    "node_modules",
+    "test-results",
+    "playwright-report"
+  ]
+}

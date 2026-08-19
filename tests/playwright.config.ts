@@ -9,6 +9,56 @@ import { defineConfig, devices } from '@playwright/test';
  */
 export const BATTLE_AUTH_FILE = 'playwright/.auth/battle-admin.json';
 
+/**
+ * The RUN's battle experiment ids, minted once by the setup project and read by battle.spec.ts.
+ *
+ * They must be fresh per run. The suite used to arm a single fixed id ('e2e-battle-sonnet-vs-opus'),
+ * which works exactly until something completes that experiment - and `completed` is TERMINAL by design
+ * (`admin-experiments.ts`: "'completed' and 'deleted' are terminal - re-run with a new experiment id").
+ * A terminal row cannot be resumed, so `activateBattleExperiment` could never restore it and every
+ * behavioral battle test failed in beforeAll. Worse, the arming POST still returned 2xx, so the failure
+ * surfaced four lines later as a missing admin-table row and read like a UI timeout.
+ *
+ * Same file-handoff shape as BATTLE_AUTH_FILE, and defined HERE for the same reason: the config cannot
+ * import a test file.
+ */
+export const BATTLE_EXP_FILE = 'playwright/.auth/battle-exp.json';
+
+/**
+ * The PREMIUM (non-moderator) member's storageState, for the two battle tests that need a SECOND
+ * participant: B-E1 (the briefing must reach a non-moderator) and B-E6 (two members pick opposite
+ * sides).
+ *
+ * They previously built a bare `browser.newContext()` and ran the interactive sign-in inside it. That
+ * is the only place in the suite that logs in by hand, and it failed two ways: the login form never
+ * rendered (so `waitForSelector('input[type=email]')` timed out), and spawning that extra context
+ * intermittently killed the worker outright with STATUS_DLL_INIT_FAILED. Pre-authenticating the
+ * premium user once, exactly as BATTLE_AUTH_FILE does for the admin, removes the login step and the
+ * second browser launch it needed.
+ */
+export const BATTLE_PREMIUM_AUTH_FILE = 'playwright/.auth/battle-premium.json';
+
+/**
+ * A second member who is genuinely a DIFFERENT PERSON from the moderator.
+ *
+ * `testAdmin` and `premiumUser` in the credentials secret are the same account
+ * (premium@stratum.example.com), so BATTLE_PREMIUM_AUTH_FILE holds the same Cognito identity the
+ * `battle` project already runs as. Anything that turns on two distinct users is therefore not
+ * actually testing two users:
+ *
+ *   - B-E6 asserts per-user picks are RETAINED, not last-write-wins. Battle outcomes are keyed by the
+ *     chooser's sub (`SET votes.<sub>`), so one identity picking twice overwrites its own vote and
+ *     only ever credits one variant. The assertion could not pass however correct the product was.
+ *   - B-E1 calls its second participant a NON-moderator, but the shared account created the channel
+ *     and is its moderator, so the test could not see what a non-moderator sees.
+ *
+ * The second member must be PREMIUM. Sharing is tier-gated on the invitee's own access level, not
+ * only on the channel's: adding the standard user to a premium conversation is refused with "Their
+ * access level (standard) does not meet the conversation's premium tier". So the second identity has
+ * to be a premium account that is not the one the suite already runs as.
+ */
+export const BATTLE_SECOND_MEMBER_AUTH_FILE = 'playwright/.auth/battle-second-member.json';
+
 export default defineConfig({
   testDir: '.',
   // Pre-onboards the standard demo user (once-per-user onboarding, SPEC-USER-PROFILE-AND-ONBOARDING) so
@@ -23,7 +73,10 @@ export default defineConfig({
   // absorbs harness flake without masking a real, consistent failure.
   retries: process.env.PW_RETRIES ? Number(process.env.PW_RETRIES) : 0,
   workers: 1,
-  reporter: 'list',
+  // 'list' for the live view; skip-visibility for what the live view cannot tell you - which tests did
+  // NOT run, and why. Most of this suite is gated on provisioned credentials, so a run without them
+  // silently no-ops a large fraction of it and still prints green. See e2e/reporters/skip-visibility.ts.
+  reporter: [['list'], ['./e2e/reporters/skip-visibility.ts']],
   preserveOutput: 'always',
   use: {
     // Defaults to the local dev server; set E2E_BASE_URL to run against a

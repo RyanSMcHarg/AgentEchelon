@@ -8,7 +8,7 @@ on:
 
 jobs:
   backend:
-    name: Backend build + CDK synth
+    name: Backend build + typecheck + CDK synth
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -29,12 +29,54 @@ jobs:
       - name: TypeScript build
         run: npm run build
 
+      # `npm run build` compiles lambda + lib only; it does NOT look at test/, so a clean build has
+      # never proved the test sources compile. This uses tsconfig.test.json, which does.
+      - name: TypeScript typecheck (includes test sources)
+        run: npm run typecheck
+
       - name: CDK synth (Athena mode, default)
         run: npx cdk synth
         env:
           # Dummy values to satisfy CDK environment resolution during synth
           CDK_DEFAULT_ACCOUNT: '123456789012'
           CDK_DEFAULT_REGION: 'us-east-1'
+
+  # Sharded because the suite is ~1700 tests and a single run takes far longer than it needs to.
+  # fail-fast is off so one red shard does not hide the state of the other three.
+  #
+  # This job is the point of the workflow. Several build-failing guards live in this suite and
+  # nothing executed them automatically before it existed: the classification naming ratchet, the
+  # SSM-grant omission check (which catches an IAM failure that fails OPEN), the docs drift guard,
+  # and the deploy-config example check.
+  backend-tests:
+    name: Backend tests (shard ${{ matrix.shard }}/4)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4]
+    defaults:
+      run:
+        working-directory: backend
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: backend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Jest
+        run: npx jest --shard=${{ matrix.shard }}/4 --ci
+        env:
+          # The jest config defaults to 4 workers, sized for a dev box. A hosted runner has 2 cores,
+          # and 4 ts-jest workers each holding a full TS program thrash it.
+          JEST_MAX_WORKERS: '2'
 
   frontend:
     name: Frontend lint + build
@@ -57,6 +99,13 @@ jobs:
 
       - name: Lint
         run: npm run lint
+
+      # Runs every workspace's vitest suite (@ae/chat, @ae/admin, @ae/shared). @ae/shared had test
+      # files but no `test` script, so `-ws --if-present` skipped it silently and two suites - one of
+      # them messageParser, which strips the control markers that are a deliberate injection defence
+      # - had never run in this layout.
+      - name: Unit tests (all workspaces)
+        run: npm test
 
       - name: Build
         run: npm run build
@@ -104,7 +153,11 @@ jobs:
   #     - name: Run E2E tests
   #       run: npm test
   #       env:
-  #         TEST_SECRET_NAME: agent-echelon/test-credentials
+  #         # Must match the default in tests/e2e/helpers/test-credentials.ts, which is what every
+  #         # local and manual run reads. This block previously named `agent-echelon/…`, a secret
+  #         # that does not exist - provisioning to that name would have given CI a secret no
+  #         # developer could read, and every local run would still fail.
+  #         TEST_SECRET_NAME: agent-interface/test-credentials
   #     - name: Upload Playwright report
   #       if: always()
   #       uses: actions/upload-artifact@v4
