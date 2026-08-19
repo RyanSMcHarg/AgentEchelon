@@ -124,7 +124,7 @@ describe('NO_REBUTTAL placeholder resolution (update, not delete)', () => {
     expect(cmd.input.MessageId).toBe('msg-id-X');
     expect(cmd.input.ChimeBearer).toBe(ALT_SLOT);
     expect(decodeURIComponent(cmd.input.Content)).toBe('No rebuttal.');
-    // The declared phase rides the update itself (tracker row 49): a side that declines to rebut has
+    // The declared phase rides the update itself: a side that declines to rebut has
     // finished, so this closes the turn rather than being another step toward one.
     expect(JSON.parse(cmd.input.Metadata).respPhase).toBe('final');
   });

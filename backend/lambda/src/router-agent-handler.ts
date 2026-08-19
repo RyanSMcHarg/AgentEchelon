@@ -661,7 +661,7 @@ export interface TurnRequest {
    * which names a message to un-mark rather than one to answer onto. This field, the
    * `BYPASS_PLACEHOLDER_ATTR` silence branch below and the processor's handed-id resolution step are
    * therefore unreachable, and are kept only until the removal is done deliberately with its tests
-   * (tracker row 91). Do not add a caller: answering onto a message that already exists is what put a
+   *. Do not add a caller: answering onto a message that already exists is what put a
    * finished answer above the question that produced it.
    */
   placeholderMessageId?: string;
@@ -692,7 +692,7 @@ export interface TurnRequest {
    *     construction, so a second hop should be impossible, and "should be impossible" is not a loop
    *     bound. Only a turn WITHOUT this field may create one, so the chain is bounded at one hop
    *     structurally rather than by a counter each side declares for itself - which is the failure
-   *     ADR-023's hop cap has and tracker row 66 records.
+   *     ADR-023's hop cap has, measured on the deployment.
    */
   handedOverFrom?: string;
 }
@@ -1928,7 +1928,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         //
         // THIS IS THE WHOLE CONTINUATION MECHANISM NOW. It used to be the channel flow's: read the
         // message's `Target`, resolve the duel, deny the message, hand the turn back. That path never
-        // ran - the flow callback does not carry `Target` at all (tracker row 94) - and it did not
+        // ran - the flow callback does not carry `Target` at all - and it did not
         // need to exist: targeting is a client-side DELIVERY concern, already handled at send, and
         // "which work is this the answer to" is answerable from ownership alone.
         if (!activeTask && channelArn) {

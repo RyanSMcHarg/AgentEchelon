@@ -87,7 +87,7 @@ suite('Full latency set populates on a real turn', () => {
     expect(Number(row.avg_model_ms), 'avg_model_ms > 0 (model inference share of Bedrock)').toBeGreaterThan(0);
 
     // ────────────────────────────────────────────────────────────────────────────────────────────
-    // EACH TURN IS COUNTED ONCE (tracker row 48), asserted on real traffic because that is the only
+    // EACH TURN IS COUNTED ONCE, asserted on real traffic because that is the only
     // place the defect was ever visible.
     //
     // A bot reply is stored twice - the canonical row and a `-UPD` audit row holding the finalized

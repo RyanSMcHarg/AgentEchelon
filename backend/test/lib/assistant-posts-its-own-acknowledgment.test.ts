@@ -138,7 +138,7 @@ describe('a bypass turn posts its own message', () => {
   it('does NOT post when the caller handed over an existing message', async () => {
     // A battle continuation reuses the side's "waiting" message. Posting here would strand it and
     // leave the processor two candidates, so the turn stays quiet and answers onto the one it was
-    // told about (ADR-025 / tracker row 59).
+    // told about (ADR-025 /).
     const res = await handler({
       aeTurn: {
         channelArn: CHANNEL, senderArn: HUMAN, userMessage: 'the audience is engineering leadership',

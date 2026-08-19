@@ -136,7 +136,7 @@ Channels are tagged at creation (`create-conversation`, `lib/channel-creation`, 
 
 ### CDK Implementation
 
-The boundary is defined once in `classificationChannelScopedAllow(classification, appInstanceArn, actions?)` (`backend/lib/stacks/agent-classification-common.ts`) and attached to the **credential-exchange rung roles** (`grantPinnedExchangePermissions` in `backend/lib/stacks/cognito-auth-stack.ts`, bearer-pinned to the caller's own `.../user/${aws:PrincipalTag/sub}`) and the **per-classification assistant roles** (`*-classification-stack.ts`). It is not on the per-classification Cognito Identity-Pool user roles: those are intentionally empty (`makeClassificationRole`), because the frontend reaches Amazon Chime SDK only through the exchange (there is no Identity-Pool Amazon Chime SDK fallback). See `docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md` §8 (row 2). `classificationChannelScopedAllow` is the sole enforced boundary.
+The boundary is defined once in `classificationChannelScopedAllow(classification, appInstanceArn, actions?)` (`backend/lib/stacks/agent-classification-common.ts`) and attached to the **credential-exchange rung roles** (`grantPinnedExchangePermissions` in `backend/lib/stacks/cognito-auth-stack.ts`, bearer-pinned to the caller's own `.../user/${aws:PrincipalTag/sub}`) and the **per-classification assistant roles** (`*-classification-stack.ts`). It is not on the per-classification Cognito Identity-Pool user roles: those are intentionally empty (`makeClassificationRole`), because the frontend reaches Amazon Chime SDK only through the exchange (there is no Identity-Pool Amazon Chime SDK fallback). See `docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md` §8. `classificationChannelScopedAllow` is the sole enforced boundary.
 
 ## 4a. Access Matrix (actions × roles × conversation classification)
 
@@ -241,7 +241,7 @@ A user's tier is their **Cognito group** membership, not a stored Amazon Chime S
 
 ### The group is the authoritative tier signal
 
-The router, share, and create-conversation Lambdas call `AdminListGroupsForUser` and use the **group**, not the `custom:tier` attribute, as the authoritative tier signal. Deriving tier from group membership keeps a single source of truth that a stray attribute edit cannot silently desync. This substitutes for the original AppInstanceUser-metadata design; see `docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md` §8 (row 3).
+The router, share, and create-conversation Lambdas call `AdminListGroupsForUser` and use the **group**, not the `custom:tier` attribute, as the authoritative tier signal. Deriving tier from group membership keeps a single source of truth that a stray attribute edit cannot silently desync. This substitutes for the original AppInstanceUser-metadata design; see `docs/specs/interaction/identity-access/core/IDENTITY-AND-ACCESS-MODEL.md` §8.
 
 ### Channel classification caps the tier
 

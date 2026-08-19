@@ -157,7 +157,7 @@ describe('kinesis-archival backfillFromUpdateEvents', () => {
   });
 
   // ────────────────────────────────────────────────────────────────────────────────────────────
-  // FINALITY IS DECLARED, NOT INFERRED (tracker row 49).
+  // FINALITY IS DECLARED, NOT INFERRED.
   //
   // The old gate read "this update carries worker telemetry, so it must be the completion", and
   // `COALESCE` then froze whichever update satisfied that first. The two coincided only for as long as

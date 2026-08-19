@@ -532,7 +532,7 @@ export async function transformToMessageRecord(
 
   const analytics = (metadata as any)?.analytics || metadata || {};
 
-  // THE DECLARED PHASE (tracker row 49). Read from the TOP level of the blob, where `updateMessage`
+  // THE DECLARED PHASE. Read from the TOP level of the blob, where `updateMessage`
   // merges it, and from the analytics sub-object as a fallback so a producer that nests it is not
   // silently ignored. Absent on every message written before this shipped, which is what keeps the
   // legacy inference below reachable for them and only for them.
@@ -560,7 +560,7 @@ export async function transformToMessageRecord(
   // preceded this state" - and it is what the turn-events projection reads as `task_opened`. The
   // previous truthiness check (`.from && .to`) silently dropped exactly the edge whose emptiness is
   // its meaning, so the producer's declaration never reached the column and `opened_at` stayed NULL
-  // on live data while the projection's unit tests passed on synthesized rows (row 104, third find).
+  // on live data while the projection's unit tests passed on synthesized rows.
   const taskState = analytics.taskState || null;
   const taskTransition =
     analytics.taskTransition
@@ -696,7 +696,7 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
     'ON CONFLICT (message_id, channel_arn) DO NOTHING'
   );
 
-  // THE LEDGER, WRITTEN FROM THE SAME BATCH (row 50 step 3). `turn_events` had existed since migration
+  // THE LEDGER, WRITTEN FROM THE SAME BATCH. `turn_events` had existed since migration
   // 019 with no runtime writer at all - only a hand-run backfill - so `v_turn_latency` and
   // `v_task_resolution` were built, documented and empty.
   //
@@ -716,7 +716,7 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
     task_id: r.task_id,
     task_state: r.task_state,
     // The two the task kinds are derived from. Already on the archive record; they were simply never
-    // handed to the ledger, which is why v_task_resolution had nothing to aggregate (row 104).
+    // handed to the ledger, which is why v_task_resolution had nothing to aggregate.
     task_status: r.task_status,
     task_transition: r.task_transition,
   })));
@@ -1000,7 +1000,7 @@ export async function backfillFromUpdateEvents(
                 was_fallback    = COALESCE(was_fallback, FALSE) OR $11,
                 -- agent_final_at: the Chime update time of the FINAL answer, for e2e_ms (LATENCY-TARGETS.md).
                 --
-                -- FINALITY IS DECLARED, NOT INFERRED (tracker row 49). $17 is the producer's own
+                -- FINALITY IS DECLARED, NOT INFERRED. $17 is the producer's own
                 -- respPhase, stamped on the update that carries the answer. Only 'final' closes the turn,
                 -- so an interim update is harmless BY CONSTRUCTION rather than by happening to arrive with
                 -- no telemetry.

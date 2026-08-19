@@ -1,5 +1,5 @@
 /**
- * ONE TURN, AUDITED AGAINST THE LEDGER (LATENCY-TARGETS; tracker row 50 step 8).
+ * ONE TURN, AUDITED AGAINST THE LEDGER (LATENCY-TARGETS).
  *
  * Everything else on the Latency tab is an aggregate, and AN AGGREGATE CANNOT BE AUDITED. If the
  * average TTFF looks wrong, or a band flips a health indicator, the only useful next question is

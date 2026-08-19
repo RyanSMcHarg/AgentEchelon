@@ -259,7 +259,7 @@ describe('drift context carried into the new conversation', () => {
  * and host grounding can name every participant except them.
  *
  * This is the same defect that `federated-add-member` had, in a different creation path — which is
- * what tracker row 6 is about: the same invariant has to be re-implemented per path, so a fix in one
+ * what is about: the same invariant has to be re-implemented per path, so a fix in one
  * looks complete from the outside.
  */
 describe('the drift child inherits the member identity hint', () => {

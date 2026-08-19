@@ -1,5 +1,5 @@
 /**
- * ROUTING FOLLOWS THE TASK, NEVER THE TARGET (owner, 2026-08-14; tracker row 94).
+ * ROUTING FOLLOWS THE TASK, NEVER THE TARGET (owner, 2026-08-14).
  *
  * Whether a person addressed nobody or addressed the wrong assistant is the SAME case. Targeting is a
  * delivery concern the client settled at send - it says who can see a message, not what the message is
@@ -352,7 +352,7 @@ describe('a message answering another assistant\'s work is handed to that assist
 
     it('never hands over a turn that ARRIVED by handover', async () => {
       // The loop bound, and it is structural rather than a counter each side declares for itself -
-      // which is the weakness ADR-023's hop cap has and tracker row 66 records. Exercised with a task
+      // which is the weakness ADR-023's hop cap has, measured on the deployment. Exercised with a task
       // that still names another assistant, so the guard cannot pass by the branch being unreachable.
       mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
         ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OWNER)) : null);

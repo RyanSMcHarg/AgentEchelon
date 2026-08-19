@@ -1,5 +1,5 @@
 /**
- * "Waiting on you" is ONE queue, across conversations (tracker row 92, ADR-024/ADR-029).
+ * "Waiting on you" is ONE queue, across conversations (ADR-024/ADR-029).
  *
  * WHY THIS EXISTS. A person accumulates open items from several assistants and several workflows at
  * once, and each is the same thing to them: something is blocked on me. `GET /tasks/mine` is the only

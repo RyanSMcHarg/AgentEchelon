@@ -1,5 +1,5 @@
 /**
- * EVERY UNCLOSED TURN FALLS INTO A NAMED CATEGORY (tracker row 100).
+ * EVERY UNCLOSED TURN FALLS INTO A NAMED CATEGORY.
  *
  * The first live reading of `unclosed_count` was **closed 418, unclosed 172** - 29% of paired turns
  * never recorded a final answer, and `AVG` had been skipping every one of them in silence. The count
@@ -120,7 +120,7 @@ describe('unclosed turns are split by what the ledger observed', () => {
     expect([...consumed].sort()).toEqual([...produced].sort());
 
     // Plus the three arms that are not ledger outcomes at all: the message never carried a marker,
-    // it carried one the reader cannot see (row 103), and the ledger had nothing to say about a real
+    // it carried one the reader cannot see, and the ledger had nothing to say about a real
     // placeholder. The first two split on the LITERAL '<!--corr:' because the bounded substring is
     // NULL for BOTH - one predicate served two opposite findings ("nobody was promised an answer" vs
     // "a person was promised one the platform structurally cannot deliver") until the split.

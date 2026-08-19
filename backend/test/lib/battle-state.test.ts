@@ -780,7 +780,7 @@ describe('planBattleContinuation — only the initiator resumes a duel', () => {
 });
 
 /**
- * The pointer is where a duel's owner LIVES (tracker row 93). `setActiveBattle` is its single writer,
+ * The pointer is where a duel's owner LIVES. `setActiveBattle` is its single writer,
  * at fan-out, from the `/battle` sender — so it survives every per-row rewrite the duel goes through.
  */
 describe('resolveActiveBattle — the pointer carries the duel and its owner', () => {

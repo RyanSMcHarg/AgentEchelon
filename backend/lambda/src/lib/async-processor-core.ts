@@ -2109,7 +2109,7 @@ export async function updateMessage(
   content: string,
   botArn: string,
   /**
-   * WHICH STEP OF THE ANSWER THIS UPDATE IS, and it is REQUIRED (tracker row 49).
+   * WHICH STEP OF THE ANSWER THIS UPDATE IS, and it is REQUIRED.
    *
    * Required rather than defaulted, because the whole point is that a future update path cannot
    * forget to say. A default would be a second inference wearing a different name: whichever value it

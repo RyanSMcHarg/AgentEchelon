@@ -594,7 +594,7 @@ const POST_DISPATCH: Record<
   intent_exchanges: { fn: getIntentExchanges, dataKey: 'data' },
   cross_conversation_context: { fn: getConversationContext, dataKey: 'contexts' },
   latency_metrics: { fn: getLatencyMetrics, dataKey: 'data' },
-  // THE AUDIT OF ONE TURN, from the ledger (row 50). `latency_metrics` aggregates; this shows the
+  // THE AUDIT OF ONE TURN, from the ledger. `latency_metrics` aggregates; this shows the
   // calculation for a single channel so a human can check it against the stream, which is the whole
   // point of the ledger existing. Unlisted queryTypes default to the `view-analytics` capability.
   turn_latency_audit: { fn: getTurnLatencyAudit, dataKey: 'data' },
@@ -1523,7 +1523,7 @@ async function getConversationContext(
  * Latency components: total_ms (full round trip), latency_ms (Bedrock inference), poll_ms (placeholder polling).
  */
 /**
- * THE AUDIT OF ONE TURN (row 50, "auditing one turn against the stream").
+ * THE AUDIT OF ONE TURN.
  *
  * `latency_metrics` aggregates; this returns the CALCULATION, one row per (turn_id, response_id), so
  * a human can check it against the message stream. That is the whole reason the ledger exists - an
@@ -1605,7 +1605,7 @@ async function getLatencyMetrics(
 
   const result = await query(
     `WITH resp_ledger AS (
-       -- WHY THE CLASSIFICATION LIVES HERE AND NOT IN SIX FILTER CLAUSES (tracker row 100).
+       -- WHY THE CLASSIFICATION LIVES HERE AND NOT IN SIX FILTER CLAUSES.
        --
        -- unclosed_count said 172 turns never recorded a final answer and could not say why, so the
        -- number carried every reading from "test litter" to "answers were lost" at once. Splitting it
@@ -1682,7 +1682,7 @@ async function getLatencyMetrics(
        ROUND(AVG(m.model_ms)) AS avg_model_ms,
        ROUND(AVG(m.tool_ms)) AS avg_tool_ms,
        ROUND(AVG(e.inbound_ms)) AS avg_inbound_ms,
-       -- ── THE DENOMINATOR, REPORTED RATHER THAN PERFORMED (tracker row 48 part b) ──
+       -- ── THE DENOMINATOR, REPORTED RATHER THAN PERFORMED ──
        --
        -- total_ms > 0 used to sit in the WHERE, so responses that ran no measurable compute were
        -- silently absent and every average was over a population nobody could state. Reporting the
@@ -1701,7 +1701,7 @@ async function getLatencyMetrics(
        -- a completion. Correct semantics, and invisible without this count.
        COUNT(*) FILTER (WHERE e.e2e_ms IS NOT NULL) AS closed_count,
        COUNT(*) FILTER (WHERE e.id IS NOT NULL AND e.e2e_ms IS NULL) AS unclosed_count,
-       -- ── AND WHY IT DID NOT CLOSE (tracker row 100) ──
+       -- ── AND WHY IT DID NOT CLOSE ──
        --
        -- These six partition unclosed_count. They differ enormously in seriousness and only one of them
        -- is a defect, which is the entire reason the total was not actionable:
@@ -1775,7 +1775,7 @@ async function getLatencyMetrics(
      -- history, including turns older than the live writer.
      --
      -- no_placeholder REQUIRES the literal marker to be absent, not merely unreadable. The bounded
-     -- substring is NULL in two OPPOSITE situations (tracker row 103): the message never carried a
+     -- substring is NULL in two OPPOSITE situations: the message never carried a
      -- marker (benign - nobody was promised an answer), and the message carries a marker LONGER
      -- than the 64-character bound (the defect - a person WAS told to wait and no reader can ever
      -- close the turn). One predicate served both and 26 turns were counted as the benign kind.
@@ -1794,7 +1794,7 @@ async function getLatencyMetrics(
        END AS unclosed_bucket
      ) b ON TRUE
      WHERE m.is_bot = true
-       -- ONE TURN IS ONE ROW HERE (tracker row 48). A bot reply is stored twice: the canonical CREATE
+       -- ONE TURN IS ONE ROW HERE. A bot reply is stored twice: the canonical CREATE
        -- row, and a -UPD audit row holding the finalized text for the conversation browser. The audit
        -- row carries total_ms, so without this filter every turn's compute was counted TWICE - and
        -- because the exchange join is on the CREATE id, the duplicates could not be attributed and
@@ -1831,8 +1831,8 @@ async function getLatencyMetrics(
       // New columns are APPENDED so the existing contract is byte-for-byte intact: LatencyTab,
       // alerts.ts and metricTargets.ts read by name and are unaffected by additions.
       'compute_count', 'direct_count', 'closed_count', 'unclosed_count',
-      // The buckets that partition unclosed_count (row 100). Appended, like their parent.
-      // `unreadable_marker` split from `no_placeholder` (row 103): a marker the reader cannot see is
+      // The buckets that partition unclosed_count. Appended, like their parent.
+      // `unreadable_marker` split from `no_placeholder`: a marker the reader cannot see is
       // a promised answer that can never close, not the benign absence of a promise. The two
       // `unreadable_marker_*` columns attribute it by producer and are SUB-counts of the bucket, not
       // partition members.

@@ -1,5 +1,5 @@
 /**
- * THE LEDGER'S LIVE WRITER (row 50 step 3).
+ * THE LEDGER'S LIVE WRITER.
  *
  * `turn_events` has existed since migration 019 and until now nothing wrote to it at RUNTIME - only
  * `turn-events-backfill.ts`, run by hand over history. A table with a shape and no contents is the
@@ -182,7 +182,7 @@ export function ledgerRowsFor(records: LedgerSourceRecord[]): TurnEventRow[] {
         // `trigger_kind` is left NULL rather than guessed. The backfill derives it from whether an
         // exchange paired - a join this path cannot do, because the pairing has not happened yet when
         // the placeholder is archived. A guess here would be a second, disagreeing source for the one
-        // fact that decides whether a TTFF is meaningful (row 50).
+        // fact that decides whether a TTFF is meaningful.
         // THE DECLARED CAUSE, when the producer gave one. This was null and left for the backfill to
         // infer from whether an exchange paired - a join this path cannot do, because pairing has not
         // happened yet when the placeholder is archived. A DECLARED value is not an inference, so it
@@ -243,7 +243,7 @@ export function ledgerRowsFor(records: LedgerSourceRecord[]): TurnEventRow[] {
     }
   }
 
-  // ── TASK KINDS (row 104) ───────────────────────────────────────────────────────────────────────
+  // ── TASK KINDS ───────────────────────────────────────────────────────────────────────
   // `v_task_resolution` aggregates `task_opened`, `task_transition` and `task_terminal`, and until now
   // NO producer emitted any of them: the deployed query returned zero rows over a 47-day window with
   // real task traffic, which reads as "no task resolved" when the truth is "this was never measured".

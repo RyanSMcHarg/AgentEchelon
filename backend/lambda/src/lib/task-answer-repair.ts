@@ -14,8 +14,7 @@
  * the fact this costs time only in the broken case, where the same rule inline would cost every turn
  * in every conversation to buy nothing on the ones that were already right.
  *
- * It also could not run there. The channel flow callback carries no `Target` at all (tracker row 94,
- * and the table in MESSAGE-FLOW Appendix A), so the flow cannot tell an addressed message from an
+ * It also could not run there. The channel flow callback carries no `Target` at all (* and the table in MESSAGE-FLOW Appendix A), so the flow cannot tell an addressed message from an
  * unaddressed one; the message stream carries both `Target` and `Metadata`. Any rule about how a
  * message was ADDRESSED can only run after the fact.
  *

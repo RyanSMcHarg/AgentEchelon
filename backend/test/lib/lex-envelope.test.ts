@@ -1,7 +1,7 @@
 /**
  * The empty Lex envelope, recognised without a ContentType.
  *
- * The channel flow drops these so no client has to know the shape exists (row 87). The flow event
+ * The channel flow drops these so no client has to know the shape exists. The flow event
  * carries no ContentType, so detection is STRUCTURAL - and the risk that buys is eating real user
  * content. Most of this file is therefore about what must NOT be recognised.
  */

@@ -1,5 +1,5 @@
 /**
- * NO `lambda:InvokeFunction` GRANT MAY REACH OUTSIDE THIS DEPLOYMENT (tracker row 96).
+ * NO `lambda:InvokeFunction` GRANT MAY REACH OUTSIDE THIS DEPLOYMENT.
  *
  * `battle-stack.ts` granted the alt-slot handler
  * `arn:aws:lambda:<region>:<account>:function:*AgentHandler*`. The LEADING wildcard is the whole
@@ -23,7 +23,7 @@
  * added by `grantInvoke()` never appears in a source scan, and a construct that fails to render is
  * invisible to one.
  *
- * SCOPE (widened 2026-08-17, tracker row 101). This now sweeps EVERY `lambda:` action, not
+ * SCOPE (widened 2026-08-17). This now sweeps EVERY `lambda:` action, not
  * `InvokeFunction` alone, across every stack that grants one - including `experiments-stack.ts`.
  *
  * The earlier version said, in this comment, that it deliberately did not fail the account-wide
@@ -88,7 +88,7 @@ interface Statement { Action?: unknown; Resource?: unknown }
 /**
  * Every IAM statement in a template that grants ANY `lambda:` action, from roles and policies alike.
  *
- * WIDENED FROM `InvokeFunction` ALONE (tracker row 101). The narrow sweep passed while
+ * WIDENED FROM `InvokeFunction` ALONE. The narrow sweep passed while
  * `experiments-stack.ts` held `lambda:GetFunctionConfiguration` on `function:*` - account-wide, in a
  * multi-product account, on a call that returns `Environment.Variables`. So the narrow version was
  * green beside a live cross-product READ of every other product's configuration.

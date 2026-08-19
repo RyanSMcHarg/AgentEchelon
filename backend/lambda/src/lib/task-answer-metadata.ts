@@ -18,7 +18,7 @@
  * WHY METADATA AND NOT `Target` FOR THE DETECTION. A `Target` says who may SEE a message; it does not
  * say what the message is about, and the stream would have to reconstruct that from ownership anyway.
  * The task reference states it directly. (A channel flow could not use `Target` for this in any case:
- * it can neither read one - the callback delivers none, tracker row 94 - nor set one, since
+ * it can neither read one - the callback delivers none - nor set one, since
  * `ChannelMessageCallback` carries `MessageId`, `Content`, `Metadata`, `PushNotification`,
  * `MessageAttributes` and `SubChannelId`, and no `Target`.)
  *

@@ -94,8 +94,7 @@ while the workflow it would unblock stays blocked. Nothing errors; the conversat
 The direction taken earlier the same day was that the channel flow should notice and correct it. Two
 things are wrong with that, and only the second is about architecture:
 
-- **It is not buildable as stated.** A flow can neither read a `Target` (the callback delivers none,
-  tracker row 94) nor set one (`ChannelMessageCallback` carries `MessageId`, `Content`, `Metadata`,
+- **It is not buildable as stated.** A flow can neither read a `Target` (the callback delivers none) nor set one (`ChannelMessageCallback` carries `MessageId`, `Content`, `Metadata`,
   `PushNotification`, `MessageAttributes`, `SubChannelId`, and no `Target`).
 - **It is the wrong place even where it is buildable.** The client knows which task the person is
   answering - it rendered it - so it can address the message correctly at send. A message arriving

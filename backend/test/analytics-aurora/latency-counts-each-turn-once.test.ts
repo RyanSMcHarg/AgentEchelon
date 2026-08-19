@@ -1,5 +1,5 @@
 /**
- * ONE TURN IS ONE ROW IN THE LATENCY QUERY (tracker row 48).
+ * ONE TURN IS ONE ROW IN THE LATENCY QUERY.
  *
  * A bot reply is stored TWICE: the canonical `CREATE_CHANNEL_MESSAGE` row, and a `<id>-UPD` audit row
  * holding the finalized text for the conversation browser. The audit row carries `total_ms`, so
@@ -92,7 +92,7 @@ describe('the latency query counts a turn once', () => {
     expect(whereClause).not.toMatch(/AND m\.total_ms/);
   });
 
-  it('COUNTS the turns that never closed (row 48 part b)', async () => {
+  it('COUNTS the turns that never closed', async () => {
     // A turn whose answer never landed has a null e2e_ms, and AVG skips nulls without complaint - so
     // it leaves the average rather than being reported as incomplete.
     //

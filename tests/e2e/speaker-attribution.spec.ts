@@ -1,6 +1,6 @@
 /**
  * A merged turn carries WHO said it, and the convention never leaks into the channel (ADR-027 phase 2,
- * tracker row 68).
+ *).
  *
  * WHAT PHASE 2 DID. A transcript entry now carries its speaker and kind, applied at the MERGE - the one
  * place the boundary between two colleagues, or a colleague and a peer assistant, was being lost. The

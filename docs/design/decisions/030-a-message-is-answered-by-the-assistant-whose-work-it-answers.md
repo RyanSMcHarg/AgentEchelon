@@ -143,7 +143,7 @@ dispatch runs on. When ADR-023's B-proxy identities land it can move onto them.
 
 ## How the hop is bounded
 
-Not by a counter. ADR-023's `aecoord` hop cap is self-declared by each side, and tracker row 66 records
+Not by a counter. ADR-023's `aecoord` hop cap is self-declared by each side, measured on the deployment:
 that this does not bound an exchange at all. Here, only a turn that did NOT arrive by handover may
 create one, so the chain is bounded at one hop structurally.
 

@@ -1,7 +1,7 @@
 /**
  * CODE THAT CITES A DOCUMENT MUST CITE ONE THAT EXISTS. The mirror of `docs-code-references.test.ts`.
  *
- * THE ASYMMETRY IS THE FINDING (tracker row 99). `docs-code-references` has checked docs -> code for
+ * THE ASYMMETRY IS THE FINDING. `docs-code-references` has checked docs -> code for
  * months: every path a document names must resolve, every cited line number must be in range. **Nothing
  * checked code -> docs**, and in that unguarded direction 12 document names accumulated across 117 file
  * references that resolved to nothing at all. A reader of the PUBLIC repo, opening the files most

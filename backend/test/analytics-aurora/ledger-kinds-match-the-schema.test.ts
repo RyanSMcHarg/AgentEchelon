@@ -1,5 +1,5 @@
 /**
- * THE LEDGER'S COLUMN COMMENT MUST ENUMERATE WHAT THE WRITERS EMIT (tracker row 102).
+ * THE LEDGER'S COLUMN COMMENT MUST ENUMERATE WHAT THE WRITERS EMIT.
  *
  * `019-turn-audit.sql` declared the `turn_events.kind` vocabulary and omitted two kinds the producer
  * actually writes: `error_response` and `notice_posted`. The first is the one that matters, because it

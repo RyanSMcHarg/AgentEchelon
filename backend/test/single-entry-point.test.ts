@@ -52,7 +52,7 @@ const CONTROLLED: Record<string, Controlled> = {
         'THE canonical helper. Drift-spawned and internal creation goes through here.',
       'backend/lambda/create-conversation/index.js':
         'The primary user-facing create path, and the oldest. Predates the helper; the consolidation '
-        + 'target is for this to call it (tracker row 6).',
+        + 'target is for this to call it.',
       'backend/lambda/src/federated-create-conversation.ts':
         'Host-provisioned federated create: deterministic ChannelId, federated member identities, and '
         + 'a different bearer. Folds into the helper as an option set.',
@@ -62,7 +62,7 @@ const CONTROLLED: Record<string, Controlled> = {
         'Assistant-initiated briefing channel. Known gap: writes no channel context.',
       'backend/lambda/src/admin-notification-channel-provision.ts':
         'Admin notification channel. Known gap: sets NO classification tag and associates no channel '
-        + 'flow - verify reachability before consolidating (tracker row 6).',
+        + 'flow - verify reachability before consolidating.',
     },
   },
 

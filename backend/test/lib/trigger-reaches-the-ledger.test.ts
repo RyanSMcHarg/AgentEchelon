@@ -1,5 +1,5 @@
 /**
- * What caused a turn reaches the measurement (tracker row 50, the `trigger` wiring).
+ * What caused a turn reaches the measurement (the `trigger` wiring).
  *
  * `TurnRequest.trigger` was declared, written into a request attribute, and read by NOTHING. Its own
  * doc comment claimed it kept battle rebuttals out of the TTFF average - and that exclusion was real

@@ -1,5 +1,5 @@
 /**
- * A blocked turn is not an answer, and that has to be assertable (tracker row 67).
+ * A blocked turn is not an answer, and that has to be assertable.
  *
  * Found live: one side of a duel was blocked by the INPUT guardrail before its model was called. It
  * still posted an ATTRIBUTED reply - the guardrail's block text - so the duel was shaped exactly like

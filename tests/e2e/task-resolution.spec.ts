@@ -1,5 +1,5 @@
 /**
- * `v_task_resolution` measures a real task (tracker row 104).
+ * `v_task_resolution` measures a real task.
  *
  * WHY THIS EXISTS. The view aggregates three ledger kinds - `task_opened`, `task_transition` and
  * `task_terminal` - and for 47 days nothing emitted any of them, so the query returned zero rows over

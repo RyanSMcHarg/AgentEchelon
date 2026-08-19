@@ -1,5 +1,5 @@
 /**
- * The per-turn audit drill (tracker row 50 step 8).
+ * The per-turn audit drill.
  *
  * What matters is not that a table renders. It is that an operator can reconcile a number:
  *   - the ledger is read for the conversation they name, not for a date window;

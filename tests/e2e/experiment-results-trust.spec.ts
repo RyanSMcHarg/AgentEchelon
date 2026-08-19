@@ -106,7 +106,7 @@ const TYPES: TypeCase[] = [
   },
   {
     // The type that was attributed to NOTHING until the router threaded the classifier ids onto the
-    // turn (tracker row 21). Two things stay true about it even now, and both are honest:
+    // turn. Two things stay true about it even now, and both are honest:
     //  - BOTH variants answer with the same response model, so `avg_score` compares a model against
     //    itself. Its real evidence is the §5 gate, not this table.
     //  - Only turns the LLM classifier actually ran on are attributed; a greeting takes the fast path

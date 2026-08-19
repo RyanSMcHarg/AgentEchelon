@@ -1,5 +1,5 @@
 /**
- * THE LEDGER'S LIVE WRITER (tracker row 50 step 3).
+ * THE LEDGER'S LIVE WRITER.
  *
  * `turn_events` existed from migration 019 with NO runtime writer - only a hand-run backfill - so
  * `v_turn_latency` and `v_task_resolution` were built, documented and empty. Every claim resting on

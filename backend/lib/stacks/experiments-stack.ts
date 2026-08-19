@@ -220,7 +220,7 @@ export class ExperimentsStack extends cdk.Stack {
             // role + the GUARDRAIL_ID it applies) so the admin console can deep-link to the actual
             // guardrail / IAM role / function for troubleshooting (`lib/profile-infra.ts`).
             //
-            // SCOPED TO THIS DEPLOYMENT (tracker row 101). This previously read `function:*`, which in a
+            // SCOPED TO THIS DEPLOYMENT. This previously read `function:*`, which in a
             // MULTI-PRODUCT account granted a read of every other product's Lambdas. "Metadata-only" is
             // not harmless here: `GetFunctionConfiguration` returns `Environment.Variables`, so the grant
             // exposed the table names, ARNs and configuration of every unrelated function in the account.

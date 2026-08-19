@@ -1,5 +1,5 @@
 /**
- * "Waiting on you" is ONE queue, keyed on who owes the step (tracker row 92, ADR-024 + ADR-029).
+ * "Waiting on you" is ONE queue, keyed on who owes the step (ADR-024 + ADR-029).
  *
  * The shape this pins, and why it is worth a test of its own: a person accumulates blocked items from
  * several assistants and several workflows at once - a duel side that asked a clarifying question, a

@@ -34,7 +34,7 @@ describe('assertNotAnErrorReply', () => {
 
   it('throws when the notice is wrapped in a Lex envelope', () => {
     // Messages that reach the channel through the Lex path are stored wrapped, so the text a guard
-    // needs is one level down (tracker row 87).
+    // needs is one level down.
     const wrapped = JSON.stringify({
       Messages: [{ Content: 'I encountered an issue. Could you try rephrasing?', ContentType: 'PlainText' }],
     });

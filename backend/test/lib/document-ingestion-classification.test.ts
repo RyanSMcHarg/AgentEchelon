@@ -6,7 +6,7 @@
  * was returned to ALL classifications. These pin the fail-closed contract: an explicit
  * `rag/{type}/{classification}/` segment wins; anything else defaults to the
  * most-restrictive classification (or RAG_DEFAULT_CLASSIFICATION) so untagged content never leaks
- * down to a lower tier. See docs/IDENTITY-AND-ACCESS-MODEL.md §8 (row 5).
+ * down to a lower tier. See docs/IDENTITY-AND-ACCESS-MODEL.md §8.
  */
 import { deriveContentClassification } from '../../lambda/src/analytics-aurora/document-ingestion';
 

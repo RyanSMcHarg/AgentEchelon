@@ -279,7 +279,7 @@ test.describe.serial('Mentions — Multi-User', () => {
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// THE ACCEPTANCE TEST FOR THE `@all` HANDOFF (tracker row 46, MESSAGE-FLOW §3.1).
+// THE ACCEPTANCE TEST FOR THE `@all` HANDOFF (MESSAGE-FLOW §3.1).
 //
 // Every test above passes whether or not the handoff landed, because they all ask "did `@all`
 // answer?" - and it answered before the handoff too. That is exactly the failure mode §3.1 exists to

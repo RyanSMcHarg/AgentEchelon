@@ -1,5 +1,5 @@
 /**
- * A clarification-resumed battle side keeps its variant (tracker row 59).
+ * A clarification-resumed battle side keeps its variant.
  *
  * THE DEFECT THIS PINS. When a side asks a clarifying question and the user answers, the flow used to
  * invoke the async processor DIRECTLY with a payload that carried no `experimentId`, `variantId`,
@@ -286,7 +286,7 @@ describe('a battle turn resolves its task by the ANSWERING ASSISTANT', () => {
     //
     // What changed is the mechanism, not the rule. The assistant's own chain IS now consulted on an
     // ordinary turn - that is how a person's private answer resumes the side that asked, since the
-    // channel flow never sees the `Target` that used to route it (tracker row 94). The licence is
+    // channel flow never sees the `Target` that used to route it. The licence is
     // narrow: the chain must be in a state the machine declares `awaitsUser`. This one is mid-flight,
     // so the message stays an ordinary turn.
     // Owner-aware, because the mirror is partitioned by owner: the PERSON owes nothing here, and the

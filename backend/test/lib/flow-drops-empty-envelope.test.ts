@@ -1,5 +1,5 @@
 /**
- * THE EMPTY LEX ENVELOPE IS DROPPED AT THE FLOW, so no client has to know it exists (row 87 part 2).
+ * THE EMPTY LEX ENVELOPE IS DROPPED AT THE FLOW, so no client has to know it exists.
  *
  * Chime materialises a channel message from a bot's Lex fulfillment even when that fulfillment
  * returned `messages: []`, and the flow IS invoked for it - verified live 2026-08-06 with the

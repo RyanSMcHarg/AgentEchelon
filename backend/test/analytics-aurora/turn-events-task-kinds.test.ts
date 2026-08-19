@@ -1,5 +1,5 @@
 /**
- * The task kinds have a producer (tracker row 104).
+ * The task kinds have a producer.
  *
  * `v_task_resolution` aggregates `task_opened`, `task_transition` and `task_terminal` and NOTHING
  * emitted any of them: measured live, the deployed query returned zero rows over a 47-day window with

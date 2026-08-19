@@ -469,7 +469,7 @@ export async function handler(event: ChannelFlowEvent): Promise<void> {
   // ever resolved, no reply is ever DENIED, and a side sitting in `WAITING_FOR_USER` cannot be resumed
   // by anybody - owner or not. The reply is delivered and answered as an ordinary turn instead, which
   // is indistinguishable from a message the user never targeted, which is why this survived unnoticed.
-  // The `targets:` field in the routing log above is what makes it visible. See tracker row 94.
+  // The `targets:` field in the routing log above is what makes it visible.
   // ═══════════════════════════════════════════════════════════════
   const targetedBotArns = extractTargetedBotArns(ChannelMessage.Target);
   let continuation:
@@ -1361,7 +1361,7 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
   // rather than here - handleMentionedMessage no longer runs a gate of its own. That is the point:
   // `evaluateAbuseGate` both increments the rate counter and consumes budget, so a gate on both sides
   // of the handoff would double-charge every `@all`. This gate stays because the battle fan-out still
-  // dispatches processors directly and so genuinely does bypass the router (tracker row 46).
+  // dispatches processors directly and so genuinely does bypass the router.
   if (!(await enforceAbuseGate(channelArn, defaultBotArn, senderArn, channelClassification))) {
     return;
   }
