@@ -4,7 +4,7 @@
 
 **Reference posture.** This guide documents the reference, open-source implementation. It is not a prescription for where sensitive data must live. A production deployment keeps sensitive data (financials, PII, regulated records) in its **authoritative source of truth** and has the assistant read it there, live, through a connector that carries the source system's own access controls, rather than copying it into the context store. Duplicating sensitive data into S3 or an embedding store is a reference convenience, not the production pattern.
 
-**What's built today vs target.** The context *mechanisms* below are built and in use: tier-scoped company context via a tool, project **and** company RAG over pgvector, the **company-context digest** (a per-tier manifest injected into the system prompt), **conversation-summary-as-context** (the running summary folded in for long conversations), per-turn history, welcome composition, and **prompt caching** of the stable system-prompt prefix (a Bedrock cachePoint on the persona + standing policy), and an opt-in **onboarding-welcome** intake (a deterministic multi-step flow that gathers required inputs before the assistant proper). The **connector / config-bundle** items marked "target" are the intended direction, **not current behavior**; each section marks its status. Every context source is also inventoried in [`SPEC-WELCOME-AND-CONTEXT.md`](../../specs/interaction/assistant-config/SPEC-WELCOME-AND-CONTEXT.md); the message path is in [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md); retrieval is in [`RAG.md`](RAG.md).
+**What's built today vs target.** The context *mechanisms* below are built and in use: classification-scoped company context via a tool, project **and** company RAG over pgvector, the **company-context digest** (a per-classification manifest injected into the system prompt), **conversation-summary-as-context** (the running summary folded in for long conversations), per-turn history, welcome composition, and **prompt caching** of the stable system-prompt prefix (a Bedrock cachePoint on the persona + standing policy), and an opt-in **onboarding-welcome** intake (a deterministic multi-step flow that gathers required inputs before the assistant proper). The **connector / config-bundle** items marked "target" are the intended direction, **not current behavior**; each section marks its status. Every context source is also inventoried in [`SPEC-WELCOME-AND-CONTEXT.md`](../../specs/interaction/assistant-config/SPEC-WELCOME-AND-CONTEXT.md); the message path is in [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md); retrieval is in [`RAG.md`](RAG.md).
 
 ## The model in one picture
 
@@ -12,9 +12,9 @@ An assistant answers from a stack of context sources assembled per turn. Pick th
 
 | Content | Mechanism | Isolation | Cost shape |
 |---|---|---|---|
-| **Tier-gated business facts** (pricing, plan, product) | Company context: a per-tier **digest** (always present) names what exists; specifics come from the tool **and** deterministic RAG retrieval | Digest + tool scoped by **S3 IAM**; company RAG scoped by the fail-closed **SQL tier filter** | Fetch what's relevant, not the whole corpus |
-| **Sensitive records** (financials, PII, regulated) | *Production:* live read from the source of truth via a connector. *Reference:* a tier document. | The source system's own controls | On demand; not duplicated into the store |
-| **Reference corpus** (wiki, runbooks, policies, FAQ) | Project RAG over pgvector, top-K by relevance | SQL tier filter, fail-closed | ~$0.0001/turn embed; skips trivial turns |
+| **Classification-gated business facts** (pricing, plan, product) | Company context: a per-classification **digest** (always present) names what exists; specifics come from the tool **and** deterministic RAG retrieval | Digest + tool scoped by **S3 IAM**; company RAG scoped by the fail-closed **SQL classification filter** | Fetch what's relevant, not the whole corpus |
+| **Sensitive records** (financials, PII, regulated) | *Production:* live read from the source of truth via a connector. *Reference:* a classification document. | The source system's own controls | On demand; not duplicated into the store |
+| **Reference corpus** (wiki, runbooks, policies, FAQ) | Project RAG over pgvector, top-K by relevance | SQL classification filter, fail-closed | ~$0.0001/turn embed; skips trivial turns |
 | **Live external facts** (ticket status, inventory) | Connector tool (`fetchContext`) *(target)* | The connector's own auth | On demand only |
 | **Always-present small context** (persona, standing policy) | System prompt; prompt caching (built) via a Bedrock cachePoint on supporting models | n/a | Cached prefix, billed once |
 | **This conversation so far** | Conversation history (recent turns); running **summary** folded in for older turns | Channel membership | History every turn; summary only when long |
@@ -23,14 +23,14 @@ An assistant answers from a stack of context sources assembled per turn. Pick th
 
 ## Building context for a new assistant
 
-An assistant is defined by its persona, model, tools, guardrail, and **context scope**. The unified configuration bundle a conversation type selects is the design *target* (see [`SPEC-ASSISTANT-CONFIG.md`](../../specs/interaction/assistant-config/SPEC-ASSISTANT-CONFIG.md)); today the boundary settings live per tier (stack IAM), while the persona and tool allowlist ride the tier's versioned profile definition - the persona as an S3 body the definition points at, editable with no deploy. To give a new assistant its context:
+An assistant is defined by its persona, model, tools, guardrail, and **context scope**. The unified configuration bundle a conversation type selects is the design *target* (see [`SPEC-ASSISTANT-CONFIG.md`](../../specs/interaction/assistant-config/SPEC-ASSISTANT-CONFIG.md)); today the boundary settings live per classification (stack IAM), while the persona and tool allowlist ride the classification's versioned profile definition - the persona as an S3 body the definition points at, editable with no deploy. To give a new assistant its context:
 
 1. **Classify the content.** For each thing the assistant must know, choose a row in the table above. Do not paste whole documents into the persona; that is expensive and does not scale.
-2. **Set the context scope.** Decide which tier(s) may read each document. Tier scope is the isolation boundary, enforced in infrastructure, not in the prompt.
+2. **Set the context scope.** Decide which classification(s) may read each document. Classification scope is the isolation boundary, enforced in infrastructure, not in the prompt.
 3. **Load the content:**
- - *Business/financial documents* go under the tier prefixes (`context/{classification}/...`). A document placed in
-     a tier's folder is readable by that tier and every higher tier.
- - *Reference documents* (wiki, runbooks) go under the RAG prefix (`rag/{source_type}/{tier}/...`) and are
+ - *Business/financial documents* go under the classification prefixes (`context/{classification}/...`). A document placed in
+     a classification's folder is readable by that classification and every higher one.
+ - *Reference documents* (wiki, runbooks) go under the RAG prefix (`rag/{source_type}/{classification}/...`) and are
      embedded automatically on upload (see [`RAG.md`](RAG.md)).
 4. **Choose the welcome.** A simple assistant uses the static welcome (instant, no model call). An assistant that onboards or intakes uses the context-gathering welcome pattern (below).
 5. **Set response shape and guardrail** on the assistant config as needed.
@@ -39,18 +39,18 @@ The mechanisms are shared; a new use case is configuration, not a forked agent l
 
 ## Loading company context (admin/deployer)
 
-**Built today.** Drop tier documents under `context/{classification}/`. Two different paths read them, each with its own tier boundary. They are frequently confused, so be precise about which does what:
+**Built today.** Drop classification documents under `context/{classification}/`. Two different paths read them, each with its own classification boundary. They are frequently confused, so be precise about which does what:
 
-- The **company-context tool** (`load_company_context`) returns whole documents from `context/{classification}/*`, scoped by the physical **IAM** prefix boundary, so a lower tier's role cannot read a higher tier's prefix. It is **selective, not whole-corpus**: the always-present **per-tier digest** (`context/{classification}/_digest.json`) lists each document's **filename** plus title plus one-line description, and the model names the specific file(s) it needs in the tool's `documents` argument, so it loads only those. It falls back to loading all permitted docs only for a genuinely broad question (or when a legacy digest has no filenames). Use it when the assistant needs a **complete document** (for example a data-extraction task pulling a full table).
-- **Company RAG (retrieval):** the same documents are embedded into the pgvector store (stamped with their tier, under `rag/company/{tier}/`) and the router pre-fetches the top-K relevant **chunks** per turn by semantic relevance, scoped by the fail-closed **SQL** tier filter, and passes them in on the payload. Use it (it runs automatically) when the assistant needs the **relevant facts**, not a whole document. Requires Aurora mode.
+- The **company-context tool** (`load_company_context`) returns whole documents from `context/{classification}/*`, scoped by the physical **IAM** prefix boundary, so a lower classification's role cannot read a higher classification's prefix. It is **selective, not whole-corpus**: the always-present **per-classification digest** (`context/{classification}/_digest.json`) lists each document's **filename** plus title plus one-line description, and the model names the specific file(s) it needs in the tool's `documents` argument, so it loads only those. It falls back to loading all permitted docs only for a genuinely broad question (or when a legacy digest has no filenames). Use it when the assistant needs a **complete document** (for example a data-extraction task pulling a full table).
+- **Company RAG (retrieval):** the same documents are embedded into the pgvector store (stamped with their classification, under `rag/company/{classification}/`) and the router pre-fetches the top-K relevant **chunks** per turn by semantic relevance, scoped by the fail-closed **SQL** classification filter, and passes them in on the payload. Use it (it runs automatically) when the assistant needs the **relevant facts**, not a whole document. Requires Aurora mode.
 
 So: **digest = the menu** (always present, names what exists); **tool = fetch a whole named document**; **RAG = semantically retrieve the relevant chunks**. Because the router already pre-fetches relevant chunks, the tool is for the whole-document case, not a redundant "load everything." The digest is precomputed at ingestion/seed time and warm-cached, so it is not rebuilt from the corpus every turn.
 
 > **The digest must carry each document's `file`** (its filename) for the tool's selective load to work; the seed writes it from `demo/context-digest-manifest.json`. A digest without `file` degrades safely to the tool loading all permitted docs.
 
-**Isolation posture (read this before embedding sensitive data).** With company RAG active, a document's tier is now enforced by **two** mechanisms: IAM (tool + digest) and the fail-closed SQL filter (retrieval). The SQL filter is fail-closed but is a data-layer boundary, not a physical prefix boundary. **For genuinely sensitive records (financials, PII, regulated data), the production pattern is to NOT embed them at all** - keep them in their **source of truth** and read them live through a connector so the source system's own access controls apply. The demo embeds *fictional* financials for illustration; a real deployment would not.
+**Isolation posture (read this before embedding sensitive data).** With company RAG active, a document's classification is enforced by **two** mechanisms: IAM (tool + digest) and the fail-closed SQL filter (retrieval). The SQL filter is fail-closed but is a data-layer boundary, not a physical prefix boundary. **For genuinely sensitive records (financials, PII, regulated data), the production pattern is to NOT embed them at all** - keep them in their **source of truth** and read them live through a connector so the source system's own access controls apply. The demo embeds *fictional* financials for illustration; a real deployment would not.
 
-**Tier scoping rule (both models):** content tagged for a tier is visible to that tier and above; a lower tier never sees it. Put all-tier content in `basic`.
+**Classification scoping rule (both models):** content tagged for a classification is visible to that classification and above; a lower classification never sees it. Put all-classification content in `basic`.
 
 ## Conversation history and summary
 
@@ -85,9 +85,10 @@ The welcome is a passthrough: at minimum it greets with the context the system a
 
  Each field has a `key` (where the answer is stored), a `prompt` (the question), and `required` (default true; optional fields accept a blank or `skip`). A required field may set a validation `pattern` (a case-insensitive regex) with an `example` shown when an answer does not match. `{name}` in `completion` interpolates the user's display name when known. An empty or malformed schema leaves onboarding disabled. The implementation is `backend/lambda/src/lib/onboarding-intake.ts` (a pure FSM engine) wired into the router welcome path.
 
- **Where the schema lives (per tier).** The router Lambda for each advanced tier (standard, premium) reads its schema from a per-tier SSM parameter, wired by the tier stack:
+ **Where the schema lives (per classification).** Every classification's router Lambda reads its schema from a per-classification SSM parameter, wired by the classification stack (`assistant-profile-stack.ts` grants and points at it for every profile):
 
   ```
+  /agent-echelon/assistant/basic/onboarding-intake
   /agent-echelon/assistant/standard/onboarding-intake
   /agent-echelon/assistant/premium/onboarding-intake
   ```
@@ -99,7 +100,7 @@ The welcome is a passthrough: at minimum it greets with the context the system a
     --type String --overwrite --value "$(cat intake.json)"
   ```
 
- Disable it again by deleting the parameter (`aws ssm delete-parameter --name ...`); the router falls back to the static welcome. All tiers run the same shared router code (`router-agent-handler.ts`, deployed as a per-tier Lambda) and the same intake path. For a single small schema you can instead set the `ONBOARDING_INTAKE` env var directly on the router Lambda (read before the SSM param), but the SSM parameter is the deployment-managed path.
+ Disable it again by deleting the parameter (`aws ssm delete-parameter --name ...`); the router falls back to the static welcome. All classifications run the same shared router code (`router-agent-handler.ts`, deployed as a per-classification Lambda) and the same intake path. For a single small schema you can instead set the `ONBOARDING_INTAKE` env var directly on the router Lambda (read before the SSM param), but the SSM parameter is the deployment-managed path.
 
 ## Trust: what a context source may influence
 
@@ -157,7 +158,7 @@ the catalog itself rather than maintained by hand.
 
 ## Efficiency notes (why the target is lighter)
 
-- **Do not re-gather unchanged context.** Static, per-tier content should be cached for the warm conversation rather than re-read from storage every turn.
+- **Do not re-gather unchanged context.** Static, per-classification content should be cached for the warm conversation rather than re-read from storage every turn.
 - **Do not re-bill an always-present prefix (built).** Prompt caching is applied to the stable system-prompt prefix (persona + standing policy) via a Bedrock cachePoint, so it is billed and processed once and reused across tool-loop iterations and turns, not re-billed every turn. It engages on supporting models (Claude 3.5+/4.x) once the prefix clears the ~1024-token minimum; the dynamic suffix (retrieved context, the company-context digest, conversation summary, and the history-note) stays after the cachePoint.
 - **Retrieve, do not dump.** Relevance retrieval scales with corpus size; a whole-corpus load does not.
 - **Skip trivial turns.** A greeting or acknowledgment needs no retrieval.
@@ -168,7 +169,7 @@ Two context mechanisms, relevance **retrieval** (RAG over pgvector) and the **co
 
 | Capability | Athena (default) | Aurora |
 |---|---|---|
-| Company context | `load_company_context` tool (loads the specific doc(s) the model names from the digest, tier-scoped by IAM), plus the digest | Plus RAG relevance retrieval, deterministic router pre-fetch |
+| Company context | `load_company_context` tool (loads the specific doc(s) the model names from the digest, classification-scoped by IAM), plus the digest | Plus RAG relevance retrieval, deterministic router pre-fetch |
 | Project docs (wiki, runbooks) | Not retrievable | RAG retrieval |
 | Conversation summary | Not available | Consumed for long conversations |
 | Drift / cross-conversation | Not available | Available |
@@ -189,5 +190,5 @@ This follows the platform rule that **Aurora is a strict superset**: Athena is t
 - [`RAG.md`](RAG.md) - the pgvector retrieval path and the data-plane Lambda.
 - [`INFRASTRUCTURE-COST.md`](../admin/INFRASTRUCTURE-COST.md) - per-piece infrastructure cost model.
 - [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md) - where context enters the message path.
-- [`SPEC-CONVERSATION-SECURITY.md`](../../specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md) - tier isolation guarantees.
-- [`HOW-TO-ADD-OR-MANAGE-A-PROFILE.md`](HOW-TO-ADD-OR-MANAGE-A-PROFILE.md) - per-tier assistant management.
+- [`SPEC-CONVERSATION-SECURITY.md`](../../specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md) - classification isolation guarantees.
+- [`HOW-TO-ADD-OR-MANAGE-A-PROFILE.md`](HOW-TO-ADD-OR-MANAGE-A-PROFILE.md) - per-classification assistant management.

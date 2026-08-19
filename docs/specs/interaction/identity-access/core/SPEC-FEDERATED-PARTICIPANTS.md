@@ -39,10 +39,10 @@ An external human crosses four layers; each is handled so a gap in any one can't
 
 **The classification guard** (the IAM enforcement column of the capability model): a lookup from the IdP group to an **existing** classification is the *ceiling*; effective = `min(ceiling, channel)`; membership pins them to the routed channel; unmapped → the lowest classification (fail-closed); the table never adds a classification.
 
-## 5. Two modes - prefer embedding our experience; proxy only as fallback
+## 5. Two modes - prefer embedding the AgentEchelon experience; proxy only as fallback
 
-- **Mode A - direct (preferred):** where we can put the AgentEchelon surface in front of the person, they SSO-federate, assume the capped role, and act *in our experience* (our context, targeting, assistant). The credential exchange + the bearer pin are the guard.
-- **Mode B - connector-proxy (fallback):** where we can't embed, the connector relays the person's messages and bears the conversation itself; the person holds no credentials here and is attribution-only metadata. The guard is on the connector's (classification-bounded) identity. Mode is chosen per use case, biased to A.
+- **Mode A - direct (preferred):** where the AgentEchelon surface can sit in front of the person, they SSO-federate, assume the capped role, and act *in the AgentEchelon experience* (its context, targeting, assistant). The credential exchange + the bearer pin are the guard.
+- **Mode B - connector-proxy (fallback):** where embedding is not possible, the connector relays the person's messages and bears the conversation itself; the person holds no credentials here and is attribution-only metadata. The guard is on the connector's (classification-bounded) identity. Mode is chosen per use case, biased to A.
 
 ## 6. How it composes
 

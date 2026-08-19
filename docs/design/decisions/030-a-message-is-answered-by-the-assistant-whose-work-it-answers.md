@@ -24,7 +24,7 @@ tracking: |
 
 ## Status
 
-**Accepted (owner, 2026-08-14). Built and deployed to mcharg-dev.**
+**Accepted (owner, 2026-08-14). Built and deployed to the dev deployment.**
 
 Verification is uneven and is stated per part rather than as a single claim:
 
@@ -168,6 +168,14 @@ chain branch, which that made unreachable for duels. Measured on the deployment 
 control: the answer was accepted, the task advanced, both sides sat in `WAITING_FOR_USER`, and round 2
 never fired. Resuming a side is a consequence of the chain being answered, not of which lookup found
 it, so it is one function called from both paths.
+
+**A third resume site covers the TASKLESS wait.** A round-1 clarification asked before any chain
+exists parks the side in `WAITING_FOR_USER` with no task row - the wait lives on the battle row alone
+- so neither chain-answering path above finds anything to resume. The handler therefore checks, when
+no task was found, whether the active duel has a side waiting in this channel, and resumes it. The
+owner rule is preserved (the duel answers to whoever started it, and an unrecorded initiator fails
+open rather than making the side unresumable), and the check runs BEFORE the generic task fallback so
+an unrelated open task cannot absorb the answer while the duel strands.
 
 **The owner rule needs no check on the person-owed path.** That lookup only ever returns a chain THIS
 PERSON holds, so a member who did not start the duel finds nothing and advances nothing. The refusal is

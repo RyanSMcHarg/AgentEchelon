@@ -2,7 +2,7 @@
 
 **Status:** Partial (the built content-moderation surfaces plus the can-work design; assistant-neutral).
 
-**Coverage:** `e2e/moderation.spec.ts` - drives real redacts against the deployed exchange and Amazon Chime SDK, asserting three distinct refusals: a moderation capability on the chat plane (400), the admin plane for a non-admin (403), and an admin credential scoped to one conversation acting on another (AccessDeniedException). The third is paired with a positive control - the same credential redacting successfully in the conversation it WAS scoped to - so the refusal is evidence of scoping rather than of a broken request.
+**Coverage:** `tests/e2e/moderation.spec.ts` - drives real redacts against the deployed exchange and Amazon Chime SDK, asserting three distinct refusals: a moderation capability on the chat plane (400), the admin plane for a non-admin (403), and an admin credential scoped to one conversation acting on another (AccessDeniedException). The third is paired with a positive control - the same credential redacting successfully in the conversation it WAS scoped to - so the refusal is evidence of scoping rather than of a broken request.
 
 Note on the model, established by a failing run: an AppInstanceAdmin CAN redact without holding the `ChannelModerator` role. The containment is the channel SCOPE on the vended credential, not the channel role. Delete, and the client-side/guardrail/Kinesis-tap surfaces, are not yet covered.
 

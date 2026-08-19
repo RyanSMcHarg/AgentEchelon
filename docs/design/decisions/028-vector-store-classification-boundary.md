@@ -36,10 +36,8 @@ originally written did not hold, and the reason was not any of the three things 
 
 The mechanism below is implemented (`classification-boundary-sql.ts`, `classification-boundary.ts`,
 `channel-classification.ts`, migrations `021`/`022`, and the reader/writer role assumption at every
-call site that touches either table). What is **not** done is the only thing that would make this
-`Implemented`: running the checks in "Verification this ADR owes" against a real database. They exist
-as a data-plane op (`verifyClassificationBoundary`) and have never been executed, because there is no
-deployment carrying this code yet. No `Verified by:` line is claimed until they have run and passed.
+call site that touches either table), and the checks in "Verification this ADR owes" have run and
+passed against the deployed cluster, per the `Verified by:` line above.
 
 **One decision below changed during implementation**, and it is recorded inline where it applies: the
 policies key on `current_user` rather than on a policy role list, because this cluster is PostgreSQL
@@ -64,7 +62,7 @@ Eleven sources feed a turn. Grouped by what restricts them:
 | Mechanism | Sources |
 |---|---|
 | **IAM prefix grant** | company digest, `load_company_context`, `load_platform_info`, persona body, intent pack, attachment-in, user-profile facts |
-| **Chime membership** | channel history, conversation summary, drift's related-conversation lookup |
+| **Amazon Chime SDK membership** | channel history, conversation summary, drift's related-conversation lookup |
 | **SQL filter** | document retrieval (`embeddings`) |
 | **Nothing recorded** | conversation summary embeddings (`summary_embeddings`) |
 
@@ -89,7 +87,7 @@ CREATE TABLE summary_embeddings (
 ```
 
 Drift's control over it is genuinely well built - the candidate set is the intersection of all human
-members' **live** Chime memberships via `SearchChannels … MEMBERS INCLUDES`, enforced inside the
+members' **live** Amazon Chime SDK memberships via `SearchChannels … MEMBERS INCLUDES`, enforced inside the
 `WHERE`, fail-closed on an empty scope, never falling back to the archive (`scoped-channels.ts`,
 ADR-012). But it means the entire boundary for conversation summaries is one caller passing the right
 ARNs, with nothing in the data for a second reader to check against.
@@ -209,7 +207,7 @@ classified content - and the platform should not require that they give it up to
   against a synthetic bad file so it cannot pass by scanning nothing.
 - **A classification cannot be read where a summary is written.** The Aurora VPC has `natGateways: 0`
   and interface endpoints for Kinesis, S3, Secrets Manager, DynamoDB and Bedrock Runtime only, so
-  `summary-updater`, the data-plane and the archival pipeline have no route to the Chime SDK at all.
+  `summary-updater`, the data-plane and the archival pipeline have no route to Amazon Chime SDK at all.
   The authoritative read therefore happens outside the VPC and arrives as an op payload, landing in
   `channel_classification` - a projection, never an authority (ADR-012). A live turn refreshes its own
   channel through the `detectDrift` op; `backfill-channel-classifications.mjs` covers the rest.
@@ -232,7 +230,24 @@ classified content - and the platform should not require that they give it up to
 
 ## Verification this ADR owes
 
-Nothing here may claim `Implemented` until each of these exists.
+Nothing here may claim `Implemented` until each of these exists. (Each now does, and has run and
+passed; see Status and the run record below.)
+
+1. **A negative test at the database.** Connect as `ae_reader_basic`, query for content that exists
+   only at premium, assert zero rows - and assert the same query as `ae_reader_premium` returns them.
+   Proves the policy discriminates rather than merely being present.
+2. **A defeat test.** Issue the retrieval query with the classification filter deliberately removed
+   while connected as `ae_reader_basic`, and assert restricted rows still do not come back. This is
+   the only test that proves the boundary is the privilege and not the clause. **Run it against the
+   table owner too**, asserting that the owner path is not the hole: without `FORCE ROW LEVEL
+   SECURITY` this test is the one that fails.
+3. **A non-vacuity test.** Retrieval still returns chunks for an in-scope query - a boundary that
+   passes because it matches nothing is the failure this is most likely to ship as.
+4. **A role-leak test.** Two queries in sequence on the same pooled connection, the first at premium
+   and the second at basic, asserting the second sees only basic rows. Pooling plus role switching is
+   the specific way this design can reintroduce the leak it removes.
+5. **The live isolation e2e** (`e2e/classification-context.spec.ts`) green against a deployment with
+   RLS active.
 
 **Where they run.** These need a real Postgres, which the Jest suite does not have - and an unrunnable
 test is how a control gets "verified" by a green suite that never exercised it.
@@ -344,19 +359,3 @@ design no longer depends on the answer, but nobody has established what the answ
 drop the table it is reading; migrations and queries are separate principals; and the rule that a
 migration must assume `ae_writer` or silently affect zero rows now applies only to the owner's own
 path, where it belongs.
-
-1. **A negative test at the database.** Connect as `ae_reader_basic`, query for content that exists
-   only at premium, assert zero rows - and assert the same query as `ae_reader_premium` returns them.
-   Proves the policy discriminates rather than merely being present.
-2. **A defeat test.** Issue the retrieval query with the classification filter deliberately removed
-   while connected as `ae_reader_basic`, and assert restricted rows still do not come back. This is
-   the only test that proves the boundary is the privilege and not the clause. **Run it against the
-   table owner too**, asserting that the owner path is not the hole: without `FORCE ROW LEVEL
-   SECURITY` this test is the one that fails.
-3. **A non-vacuity test.** Retrieval still returns chunks for an in-scope query - a boundary that
-   passes because it matches nothing is the failure this is most likely to ship as.
-4. **A role-leak test.** Two queries in sequence on the same pooled connection, the first at premium
-   and the second at basic, asserting the second sees only basic rows. Pooling plus role switching is
-   the specific way this design can reintroduce the leak it removes.
-5. **The live isolation e2e** (`e2e/classification-context.spec.ts`) green against a deployment with
-   RLS active.

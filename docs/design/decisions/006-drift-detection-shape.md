@@ -17,7 +17,7 @@ SPEC-DRIFT-CONVERGENCE.md establishes the hardened drift design (path C). The ev
 
 For the eval suite to stay stable, **the `DriftResult` shape must be stable**. This ADR pins the interface so a consumer can depend on the drift module without translation overhead, and so a future refactor can't silently desync the shape the eval suite asserts against.
 
-This is not a design decision in the "which approach do we take" sense - the design is already locked in the spec. This ADR exists to prevent drift (heh) in the *interface*.
+This is not a design decision in the "which approach do we take" sense - the design is already locked in the spec. This ADR exists to prevent drift in the *interface*.
 
 ## Decision
 
@@ -115,8 +115,11 @@ export interface DetectDriftInput {
   latestMessage: string;
   intent: Intent;            // GREETING | ACKNOWLEDGMENT | OFF_TOPIC | ...
   correlationId?: string;    // Generated if not provided
-  userTier?: 'basic' | 'standard' | 'premium';
+  userClearance?: 'basic' | 'standard' | 'premium';  // EMF dimension only
   declinedDistances?: number[];
+  activeTaskInProgress?: boolean;  // suppresses the cosine path while a live task awaits an answer
+  scopedChannelArns?: string[];    // caller-resolved membership intersection (ADR-012); absent = no suggestion
+  classification: string;          // REQUIRED; selects the database reader role (ADR-028)
 }
 ```
 
@@ -147,3 +150,5 @@ The SPEC describes design intent. This ADR describes the *commitment* that the r
 ## Revision history
 
 - Locks the `DriftResult` shape as of AE's drift-convergence implementation.
+- `userTier` renamed to `userClearance` in the tier-to-classification migration. Same values, same optionality; it is a metric dimension for EMF, and the new name says what a person holds (clearance) rather than reusing the content term (classification).
+- `DetectDriftInput` gained `activeTaskInProgress?` (cosine-path suppression while a live task awaits the user's answer), `scopedChannelArns?` (caller-resolved membership intersection per ADR-012; absent means no related-conversation suggestion), and the required `classification` (selects the database reader role per ADR-028). `DriftResult` is unchanged.

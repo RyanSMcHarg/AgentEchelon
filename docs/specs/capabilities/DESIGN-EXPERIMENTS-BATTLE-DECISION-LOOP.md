@@ -29,7 +29,7 @@ These are load-bearing constraints from the specs and tenets. Every mechanism be
 - **INV-2 - Additive schema.** Deployed experiments keep working; new fields are optional and absent means prior behaviour (TENET 3).
 - **INV-3 - Honest about confidence.** Low-sample flags, `pending` states, and the advisory tags are preserved.
 - **INV-4 - No algorithmic judge decides the battle.** The human pick and objective telemetry are first-class; a model-as-judge control loop is out of scope (SPEC-BATTLE Non-Goals). Statistics are computed over the picks and metrics, but the quality verdict per battle stays the human's.
-- **INV-5 - Governance holds.** Battle stays premium-gated and single-classification; no result escalates a classification's model access (TENET 4).
+- **INV-5 - Governance holds.** Battle stays gated by the per-profile `battleEligible` flag (premium-only out of the box) and single-classification; no result escalates a classification's model access (TENET 4).
 
 ## Business value
 

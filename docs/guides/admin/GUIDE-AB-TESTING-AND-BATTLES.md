@@ -265,7 +265,7 @@ A battle is the visible, hands-on version of the same experiment: the two varian
 
 Arming a battle takes a few extra fields on the same experiment form.
 
-In the experiment's form, tick **Enable for /battle** (battles are premium-only by default). The Battle Mode card unfolds with a side-by-side control-versus-treatment layout:
+In the experiment's form, tick **Enable for /battle** (whether battles can run in a channel is controlled by the channel classification profile's `battleEligible` flag; premium is the only battle-eligible profile in the default configuration). The Battle Mode card unfolds with a side-by-side control-versus-treatment layout:
 
 - **Display name** per variant (for example, control = Atlas, treatment = Echo), up to sixteen characters. This is what users see, so they read two distinct assistants rather than two model identifiers.
 - **System prompt addendum** per variant (optional, up to 500 characters), a short style or persona instruction layered on top of the tier's base prompt. It shapes voice, not capability; the models remain the real comparison.
@@ -279,7 +279,7 @@ Any experiment type can be armed for battle, including **Profile vs Profile**: t
 
 #### Turn on Battle Mode for a channel
 
-Battle is opt-in per conversation, and only on premium channels. A channel moderator opens the conversation's **members panel**, finds the **Battle Mode** section (status **Off**), picks the armed experiment, and chooses **Turn on Battle Mode**. The status flips to **Active** and the treatment variant joins as a real member.
+Battle is opt-in per conversation, and only in channels whose classification profile is battle-eligible (the profile's `battleEligible` flag; premium channels only in the default configuration). A channel moderator opens the conversation's **members panel**, finds the **Battle Mode** section (status **Off**), picks the armed experiment, and chooses **Turn on Battle Mode**. The status flips to **Active** and the treatment variant joins as a real member.
 
 #### The battle briefing (what is being decided)
 
@@ -337,7 +337,7 @@ Quality is captured as an explicit human pick (A, B, or tie) per battle, and in 
 
 ## Cost and safety guardrails
 
-- A single `/battle` is up to four model invocations (two assistants times two rounds), so battle is **premium-tier only** by default.
+- A single `/battle` is up to four model invocations (two assistants times two rounds), so battle is gated by the profile's `battleEligible` flag, and **premium is the only battle-eligible profile** by default.
 - Only **one** active battle runs per channel at a time; a second `/battle` while one is in flight is asked to wait.
 - The platform's existing retry, fallback, and circuit-breaker protections apply to battle invocations unchanged.
 - An experiment and a battle compare exactly **two** variants; comparing more than two at once is not supported.
@@ -345,7 +345,7 @@ Quality is captured as an explicit human pick (A, B, or tie) per battle, and in 
 ## Troubleshooting
 
 - **"/battle did nothing or said it is not enabled here."** The channel does not have Battle Mode on. A moderator enables it in the members panel, then try `/battle` again.
-- **"/battle is premium-only."** The conversation is not on the premium tier. Battle requires a premium channel by default.
+- **"Battle Mode isn't available in this conversation. Reply normally and I'll respond as usual."** The channel's classification profile is not battle-eligible. By default only premium channels are.
 - **The Enable for /battle option does nothing useful.** The experiment must have a display name on each variant and a free alt-bot slot.
 - **No alt-bot slot is available.** Disable battle on another experiment to free its slot, or raise the alt-bot slot count on your next deploy.
 - **The Experiment Results table is empty or shows an Aurora-only banner.** Per-variant results require Aurora mode; enable it, then let traffic flow through the experiment.

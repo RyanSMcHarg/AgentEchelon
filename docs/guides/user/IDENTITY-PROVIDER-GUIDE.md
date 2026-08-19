@@ -123,7 +123,7 @@ this.identityPool = new cognito.CfnIdentityPool(this, 'IdentityPool', {
 
 #### For SAML providers (Azure AD, Okta SAML, ADFS, etc.)
 
-The `cognito-auth-stack.ts` already has a commented-out SAML placeholder (lines 175-191). Uncomment and configure it:
+Add a SAML provider to `cognito-auth-stack.ts` and configure it:
 
 ```typescript
 const samlProvider = new cognito.UserPoolIdentityProviderSaml(this, 'SAMLProvider', {
@@ -388,14 +388,14 @@ new lambda.CfnPermission(this, 'PostAuthenticationPermission', {
 });
 ```
 
-**No changes needed elsewhere.** The three readers already call `AdminListGroupsForUser` and pick the highest tier the user belongs to - they don't care whether the group was populated by `post-confirmation.js`, `post-authentication.js`, or an admin action via `user-management.ts`.
+**No changes needed elsewhere.** The three readers already resolve the user's groups (`create-conversation/index.js` reads the validated JWT's `cognito:groups` claim; the others call `AdminListGroupsForUser`) and pick the highest tier the user belongs to - they don't care whether the group was populated by `post-confirmation.js`, `post-authentication.js`, or an admin action via `user-management.ts`.
 
 **Caveats:**
 
 - **Runs on every sign-in.** The extra Lambda invocation is a few milliseconds plus three Cognito API calls per sign-in. For high-volume deployments, add a cache or short-circuit when `current` already contains `desired`.
 - **`PostAuthentication` does not fire on silent token refresh** - only on full sign-in events. Tier changes therefore take effect on the user's next full login, not mid-session.
 - **Admin UI remains the override.** `user-management.ts` still wins on any tier change performed through the admin dashboard - on the user's next sign-in, `post-authentication.js` sees the admin's chosen tier in `custom:tier` (because the admin UI updates both the attribute and the group together) and no-ops.
-- **Group precedence is managed in `cognito-auth-stack.ts`.** The Cognito groups are generated from config (one `admins` group plus one per clearance classification in `backend/lib/config/profiles.ts`); each group's precedence derives from the classification rank (the default 3-classification config yields precedence 0 - 3, `admins` / `premium` / `standard` / `basic`). If you need multi-group membership (e.g., an admin who is also premium), the readers already pick the highest group via `TIER_ORDER` (`auth.ts`) - no change needed.
+- **Group precedence is managed in `cognito-auth-stack.ts`.** The Cognito groups are generated from config (one `admins` group plus one per clearance classification in `backend/lib/config/profiles.ts`); each group's precedence derives from the classification rank (the default 3-classification config yields precedence 0 - 3, `admins` / `premium` / `standard` / `basic`). If you need multi-group membership (e.g., an admin who is also premium), the readers already pick the highest group via `CLASSIFICATION_ORDER` (`auth.ts`) - no change needed.
 
 ### Step 8: Tier → IAM role mapping (channel-join enforcement) - important for federated IdPs
 
@@ -404,7 +404,7 @@ The Cognito **group also selects the user's IAM role**, not just the application
 **What this means when you swap the IdP:**
 
 - **Token-based role mapping reads `cognito:preferred_role`, which only exists for Cognito-group-backed roles.** A federated user with no group → no `preferred_role` → the Identity Pool falls back to the default `authenticated` role (the most-restrictive **basic** role). That is fail-safe, but a premium federated user stays basic at the IAM layer until their group is populated - so **Step 7 (group sync) is now a Layer-1 requirement, not just an app-layer nicety.** Use the `PostAuthentication` trigger above so every federated sign-in lands in the right group, hence the right role.
-- **If you bypass Cognito groups entirely** (e.g., a pure claim-based mapping, or Approach 2's credential-exchange Lambda), map your IdP's tier claim directly to the per-tier IAM role: with the Identity Pool use **rules-based role mapping** on the claim; with the exchange Lambda, `AssumeRole` the matching `…AuthenticatedRole` based on the validated token's tier. The four role ARNs are stack outputs of `AgentEchelonCognitoAuth`.
+- **If you bypass Cognito groups entirely** (e.g., a pure claim-based mapping, or Approach 2's credential-exchange Lambda), map your IdP's tier claim directly to the per-tier IAM role: with the Identity Pool use **rules-based role mapping** on the claim; with the exchange Lambda, `AssumeRole` the matching `…AuthenticatedRole` based on the validated token's tier. The per-classification role ARNs are not exposed as stack outputs; read them from the IAM console or the Identity Pool's role mapping (or add outputs for them in `cognito-auth-stack.ts`).
 - **The strongest layer is IdP-agnostic.** Channels are tagged `classification=<tier>` at creation and the **assistant-side** Deny lives on backend Lambda (async-processor) roles - entirely independent of how users authenticate. So even a misconfigured user-side IdP mapping cannot make a tier-X *assistant* act on a higher-tier channel.
 - **Never key tier off a user-writable claim.** AgentEchelon keys role selection on group membership (admin-controlled), not the `custom:tier` attribute (which a user can self-set). If your IdP exposes a tier/role claim, ensure it is IdP-managed (admin/directory-controlled), not self-service-editable.
 

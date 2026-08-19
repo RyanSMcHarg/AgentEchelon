@@ -29,9 +29,9 @@ backend/
 │   ├── profile-registry.ts               ← the ONLY interpreter of a classification tag / clearance
 │   └── stacks/
 │       ├── assistant-profile-stack.ts    ← AssistantProfileStack + ProfileTopology (the shared body)
-│       ├── basic-classification-stack.ts           ← BasicTierStack: a thin ProfileTopology wrapper
-│       ├── standard-classification-stack.ts        ← StandardTierStack
-│       ├── premium-classification-stack.ts         ← PremiumTierStack
+│       ├── basic-classification-stack.ts           ← BasicClassificationStack: a thin ProfileTopology wrapper
+│       ├── standard-classification-stack.ts        ← StandardClassificationStack
+│       ├── premium-classification-stack.ts         ← PremiumClassificationStack
 │       └── agent-classification-common.ts          ← shared SSM keys + thin helpers (no class)
 └── lambda/src/
     ├── assistant-async-processor.ts      ← the ONE config-driven assistant (entry for every profile)
@@ -115,13 +115,13 @@ export interface ProfileModelSelection {
   enterprise: BackendModelKey;      // ← add
 }
 
-export const DEFAULT_TIER_MODEL_SELECTION: ProfileModelSelection = {
+export const DEFAULT_PROFILE_MODEL_SELECTION: ProfileModelSelection = {
   basic: 'haiku', standard: 'sonnet', premium: 'opus',
   enterprise: 'opus',               // ← add
 };
 ```
 
-For every model in `getModelCatalog`, decide whether `enterprise` is in its `allowedClassifications`. By default it is a strict superset of premium. Also add `enterprise` to the `Tier` union in `agent-classification-common.ts` and the `ModelTier` union in `model-strategy.ts`.
+For every model in `getModelCatalog`, decide whether `enterprise` is in its `allowedClassifications`. By default it is a strict superset of premium. Also add `enterprise` to the `Classification` union in `agent-classification-common.ts` and the `Classification` union in `model-strategy.ts`.
 
 ### 1.3 Add the ProfileTopology descriptor + thin stack
 
@@ -140,11 +140,11 @@ const ENTERPRISE_TOPOLOGY: ProfileTopology = {
   richProcessor: true,      // multi-turn tasks + docs + experiments + attachment-in
   battleCapable: true,
   handlerExperimentsIndex: false,
-  componentTag: 'Tier-Enterprise',
+  componentTag: 'Classification-Enterprise',
 };
 
-export class EnterpriseTierStack extends AssistantProfileStack {
-  constructor(scope: Construct, id: string, props: EnterpriseTierStackProps) {
+export class EnterpriseClassificationStack extends AssistantProfileStack {
+  constructor(scope: Construct, id: string, props: EnterpriseClassificationStackProps) {
     super(scope, id, { ...props, topology: ENTERPRISE_TOPOLOGY });
   }
 }
@@ -155,17 +155,17 @@ Every capability the profile does not want is a `false` flag, not deleted code: 
 ### 1.4 Wire the stack in `bin/backend.ts`
 
 ```ts
-import { EnterpriseTierStack } from '../lib/stacks/enterprise-classification-stack';
+import { EnterpriseClassificationStack } from '../lib/stacks/enterprise-classification-stack';
 
-const tierEnterpriseStack = new EnterpriseTierStack(app, `${STACK_PREFIX}Tier-Enterprise`, {
-  ...tierSharedProps,
+const classificationEnterpriseStack = new EnterpriseClassificationStack(app, `${STACK_PREFIX}Classification-Enterprise`, {
+  ...classificationSharedProps,
   description: 'enterprise-profile assistant',
 });
-tierEnterpriseStack.addDependency(foundationsStack);
-tierEnterpriseStack.addDependency(experimentsStack);
+classificationEnterpriseStack.addDependency(foundationsStack);
+classificationEnterpriseStack.addDependency(experimentsStack);
 ```
 
-Every profile stack is named `${STACK_PREFIX}Tier-*`, where `STACK_PREFIX = AE_STACK_PREFIX || pascal(AE_INSTANCE_NAME)`. The prefix is instance-derived: `AgentEchelon` for the default instance, and (e.g.) `Stratum` for `AE_INSTANCE_NAME=stratum`.
+Every profile stack is named `${STACK_PREFIX}Classification-*`, where `STACK_PREFIX = AE_STACK_PREFIX || pascal(AE_INSTANCE_NAME)`. The prefix is instance-derived: `AgentEchelon` for the default instance, and (e.g.) `Stratum` for `AE_INSTANCE_NAME=stratum`. Get the name exactly right: `cdk deploy` with a stack name that matches nothing **exits 0 and deploys nothing**, so a typo (or a stale `Tier-*` name) looks like a successful deploy. Run `npx cdk list` with your full context and grep the output for the stack before deploying.
 
 ### 1.5 Add a synth test
 
@@ -173,7 +173,7 @@ In `backend/test/cdk-synth.test.ts`, mirror the existing per-profile block:
 
 ```ts
 it('should synthesize AgentEchelonClassification-Enterprise (no Bedrock Agent)', () => {
-  const stack = new EnterpriseTierStack(new cdk.App(), 'AgentEchelonClassification-Enterprise', tierBasicProps);
+  const stack = new EnterpriseClassificationStack(new cdk.App(), 'AgentEchelonClassification-Enterprise', classificationBasicProps);
   const template = Template.fromStack(stack);
   template.resourceCountIs('AWS::Bedrock::Agent', 0);
   template.hasResourceProperties('AWS::SSM::Parameter', { Name: '/agent-echelon/assistant/enterprise/processor-arn' });
@@ -183,14 +183,14 @@ it('should synthesize AgentEchelonClassification-Enterprise (no Bedrock Agent)',
 
 ### 1.6 Frontend gating
 
-The frontend reads `custom:tier` from the JWT and gates the model picker by it. Add a card entry in `NewConversationModal` to surface the new classification, and follow the existing `isPremium` pattern to gate any profile-specific UI.
+The frontend reads `custom:tier` from the JWT and gates the model picker by it. Add a card entry in `NewConversationModal.tsx` to surface the new classification, extend its `TIER_RANK` map, and set the card's `minTier`; `canAccessClassification` compares the user's rank against the card's `minTier`, which is how profile-specific UI is gated.
 
 ### 1.7 Deploy + verify
 
 ```bash
 # <Instance> = ${STACK_PREFIX}; AgentEchelon for the default instance.
 cd backend && AWS_PROFILE=<your-profile> \
-  npx cdk deploy <Instance>Tier-Enterprise --require-approval never
+  npx cdk deploy <Instance>Classification-Enterprise --require-approval never
 ```
 
 The shared router (`router-agent-handler.ts`) is SSM-first and picks up `/agent-echelon/assistant/enterprise/processor-arn` without a redeploy. Confirm the SSM key exists, then create an enterprise-classification channel from the UI and confirm the processor's CloudWatch logs show its invocations.
@@ -283,14 +283,14 @@ The default model comes from `profileModelSelection` in `bin/backend.ts`; the mo
 ```ts
 // bin/backend.ts
 const profileModelSelection: ProfileModelSelection = {
-  ...DEFAULT_TIER_MODEL_SELECTION,
+  ...DEFAULT_PROFILE_MODEL_SELECTION,
   premium: 'sonnet',                  // ← override
 };
 ```
 
 If the new model is not in the catalog, add it to `getModelCatalog` with the correct ARNs and `allowedClassifications`. The processor role's `BedrockPolicy` derives its allowed ARNs from `modelArnsForClassification`, so there is no manual IAM update.
 
-To intent-route within a profile (cheap model for greetings, expensive for analysis), edit `INTENT_ROUTE_STRATEGY` in `model-strategy.ts`. The min-cap clamp, `min(callerClearance, channelClassification)`, is resolved through `ProfileRegistry` in `router-agent-handler.ts`, so a mismatched route is downgraded before dispatch; `model-resolver.ts` then enforces only the per-profile floor.
+To intent-route within a profile (cheap model for greetings, expensive for analysis), edit `INTENT_ROUTE_STRATEGY` in `model-strategy.ts`. The min-cap clamp, `min(callerClearance, channelClassification)`, is resolved through `ProfileRegistry` in `router-agent-handler.ts`, so a mismatched route is downgraded before dispatch; `model-resolver.ts` then checks `allowedClassifications` on both the primary and the fallback model (an unallowed model falls back to the classification default) and enforces the classification floor, so a non-trivial intent never resolves below the classification's default model.
 
 ### 2.2 Change the system prompt
 
@@ -312,7 +312,7 @@ The per-turn prompt is assembled inside `assistant-async-processor.ts` (which ca
 A rich persona/pack exceeds Lambda's 4 KB env cap, so they live in SSM (`${SSM_ROOT}/assistant/{profile}/assistant-{system-prompt,intent-pack}`); the processor (persona) and handler (pack) hydrate them by name at cold start. Set them at deploy via context:
 
 ```bash
-npx cdk deploy <Instance>Tier-Standard --require-approval never \
+npx cdk deploy <Instance>Classification-Standard --require-approval never \
   -c assistantSystemPrompt="$(cat persona.txt)" \
   -c assistantIntentPack="$(cat intent-pack.json)"
 ```
@@ -363,8 +363,9 @@ Turn a capability on or off through the `ProfileTopology` flags (`contextRouting
 
 ```bash
 # Deploy only one profile. <Instance> = ${STACK_PREFIX}; AgentEchelon for the default instance.
+# A stack name that matches nothing exits 0 and deploys NOTHING; verify with `npx cdk list` first.
 cd backend && AWS_PROFILE=<your-profile> \
-  npx cdk deploy <Instance>Tier-<Profile> --require-approval never
+  npx cdk deploy <Instance>Classification-<Profile> --require-approval never
 
 # Confirm the profile published its SSM contract
 aws ssm get-parameter --name /agent-echelon/assistant/<profile>/processor-arn \
@@ -373,7 +374,7 @@ aws ssm get-parameter --name /agent-echelon/assistant/<profile>/bot-arn \
   --profile <your-profile> --query 'Parameter.Value' --output text
 
 # Watch the processor's logs while exercising the channel
-aws logs tail /aws/lambda/<Instance>Tier-<Profile>-AsyncProcessor<...> \
+aws logs tail /aws/lambda/<Instance>Classification-<Profile>-AsyncProcessor<...> \
   --follow --profile <your-profile>
 
 # Confirm the synth still passes

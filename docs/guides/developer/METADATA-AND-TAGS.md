@@ -6,7 +6,7 @@ The one-line version:
 
 > **Tags gate access. Channel metadata is public to members. User metadata does not exist. The private per-channel host grounding lives in a server-only store (`ChannelContextTable`), read server-side only.**
 
-Related: [SPEC-CONVERSATION-SECURITY](../../specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md), [TAGGING (cost tags)](../admin/TAGGING.md), [SPEC-MESSAGE-METADATA-CODEBOOK](../../specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md). The channel-metadata relocation design (`SPEC-CHANNEL-METADATA-MINIMIZATION`) is tracked internally until it ships.
+Related: [SPEC-CONVERSATION-SECURITY](../../specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md), [TAGGING (cost tags)](../admin/TAGGING.md), [SPEC-MESSAGE-METADATA-CODEBOOK](../../specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md). The direction of travel is minimization: fields move out of member-readable channel metadata and into the server-only store unless every member may see them.
 
 ---
 
@@ -31,7 +31,7 @@ Non-sensitive, display-level data that is appropriate for **every** member to se
 If you need per-channel context that is not safe for every member to read, it goes in the server-only Channel Context store (section 4), not in metadata.
 
 ### Do not trust channel metadata for a security decision
-Metadata is mutable by any channel moderator (the owner `rename` capability is `chime:UpdateChannel`, which can rewrite the metadata blob). Never read a field from channel metadata and use it to authorize, gate a tier, or select a model tier. The authoritative signal is the `classification` tag (section 3). `modelTier` may exist in metadata as a convenience mirror, but the router resolves the served tier from the tag (`resolveChannelTier` -> `ListTagsForResource`), never from metadata.
+Metadata is mutable by any channel moderator (the owner `rename` capability is `chime:UpdateChannel`, which can rewrite the metadata blob). Never read a field from channel metadata and use it to authorize, gate a tier, or select a model tier. The authoritative signal is the `classification` tag (section 3). `modelTier` may exist in metadata as a convenience mirror, but the router resolves the served tier from the tag (`resolveChannelClassificationTag` -> `ListTagsForResource`), never from metadata.
 
 ## 2. User metadata: there is none
 
@@ -83,9 +83,13 @@ and reported.
 
 **What stays in member-readable channel metadata (by design):** the conversation's identity bits
 (`topic`, `triggerContext`, `contextType`, `contextId`) and the participant **roster** of member subs.
-The roster is not a secret - members can already enumerate it via `ListChannelMemberships` - and it is
-what the notification fan-out reads, so it stays in metadata rather than being duplicated into the
-store. Nothing in metadata is trusted as grounding or as a routing decision.
+The roster is not a secret - members can already enumerate it via `ListChannelMemberships` - and
+nothing trusts it as a recipient list: the notification fan-out resolves WHO to notify from **live
+channel membership**, never from a stored roster, because a member-writable roster would be a
+member-controlled recipient list (`channel-notify.ts`). The stored roster survives only as an
+**issuer/role hint** - it supplies the home-IdP `iss` needed to resolve a federated member's contact
+details, and only for ids that are already members. Nothing in metadata is trusted as grounding or as
+a routing decision.
 
 This keeps the private host payload out of every member's reach while the assistant still gets full
 grounding server-side.
@@ -100,7 +104,8 @@ grounding server-side.
 | Who the members are | nowhere - read `ListChannelMemberships` |
 | A member's profile / the conversation's domain grounding | `ChannelContextTable` DynamoDB (server-only, `channel-context-client.ts`) |
 | Host-app work items / plans / other-context blobs | `ChannelContextTable` DynamoDB (server-only) |
-| The member roster / a member's language, geo | channel **metadata** (member-readable routing bits; roster is already visible via `ListChannelMemberships`) |
+| The member roster | channel **metadata** / live membership (already visible via `ListChannelMemberships`; never trusted as a recipient list - see section 4) |
+| A member's language, geo | `ChannelContextTable` DynamoDB (server-only) - they select the reply language and the model, so they are never sourced from member-writable metadata (section 1, `host-grounding.ts`) |
 | A user's tier / authority | Cognito **group** (admin-managed) |
 | Any attribute on an AppInstanceUser | nowhere - user metadata stays empty |
 | Cost-attribution identity | app-root **tags** (see TAGGING) |

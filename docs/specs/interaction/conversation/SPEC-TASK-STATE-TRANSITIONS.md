@@ -4,9 +4,9 @@
 `backend/test/task-state-machines.test.ts`, `backend/test/lib/task-ownership.test.ts`,
 `backend/test/lib/task-has-an-end.test.ts`.
 
-**Coverage:** `e2e/task-state-machine.spec.ts` - drives a machine-backed task through real turns and
+**Coverage:** `tests/e2e/task-state-machine.spec.ts` - drives a machine-backed task through real turns and
 asserts the persisted `taskState` moves along declared edges rather than being inferred from the reply
-text; `e2e/tasks.spec.ts` - a report request opens a tracked task and the `task_id` reaches analytics,
+text; `tests/e2e/tasks.spec.ts` - a report request opens a tracked task and the `task_id` reaches analytics,
 which is what makes the machine observable to an operator rather than only to the turn that ran it.
 
 **Problem and who it's for:** A person asks for something that cannot be answered in one turn - a
@@ -69,12 +69,22 @@ infrastructure error) from `state_changed`, because only the last is a retry can
 ## 4. Machines are configuration, not code
 
 `DEFAULT_TASK_STATE_MACHINES` ships the built-in graphs keyed by `taskType`; a deployment's intent pack
-can supply its own (`SPEC-CONFIGURABLE-INTENT-PACK`). A machine is a map of state -> `{ transitions[],
-terminal?, awaitsUser? }`:
+can supply its own (`SPEC-CONFIGURABLE-INTENT-PACK`). A machine is a map of state -> `TaskStateDef`
+(`task-state-machines.ts`: `{ transitions[], terminal?, awaitsUser?, resolvedByOneResponse?, requires?,
+delivers?, prompt?, placeholder? }`):
 
 - `transitions: []` marks a **terminal** state, and `terminal` records its outcome
   (`success` | `failure` | `handoff`);
 - `awaitsUser: true` marks a state blocked on the PERSON, which is what moves ownership to them;
+- `resolvedByOneResponse: true` (opt-in, deliberately rare) marks a state where ONE answer from the
+  person completes the step, so their reply may advance it without the model being consulted - set
+  only where the step IS the answer (a confirmation, an approval, a single choice), never on
+  requirements gathering;
+- `requires: string[]` names WHAT the step needs from the person before the workflow can go on,
+  in the person's vocabulary (it is read back to them when something is missing); the sufficiency
+  check is semantic and belongs to the model. Absent, any response is treated as sufficient;
+- `prompt` and `placeholder` (optional) carry the state's system-prompt fragment and placeholder
+  copy, making both pack-configurable and localizable;
 - `delivers: true` marks a state a document-producing workflow hands its file back from. The
   attachment gate derives its delivery states from the merged machines (never a hardcoded list a
   per-deployment machine could not match), and a file is generated when the turn **declares** a

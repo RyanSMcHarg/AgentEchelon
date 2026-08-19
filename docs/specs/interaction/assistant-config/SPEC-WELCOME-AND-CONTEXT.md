@@ -2,7 +2,7 @@
 
 **Status:** Partial (the welcome wiring ships; later context phases are design).
 
-**Coverage:** `e2e/welcome.spec.ts` asserts the deployed welcome path per classification (the orientation parameter is in the handler env, resolves, parses with the shipped parser, and IAM allows the role to read it), that the welcome delivered on the Chime websocket is byte-for-byte what this deployment's own SSM config composes to, and that a run of consecutive new conversations never drops one, separating "never delivered" from "delivered and not rendered". `e2e/context-sources.spec.ts` covers the wider context assembly.
+**Coverage:** `tests/e2e/welcome.spec.ts` asserts the deployed welcome path per classification (the orientation parameter is in the handler env, resolves, parses with the shipped parser, and IAM allows the role to read it), that the welcome delivered on the Amazon Chime SDK websocket is byte-for-byte what this deployment's own SSM config composes to, and that a run of consecutive new conversations never drops one, separating "never delivered" from "delivered and not rendered". `tests/e2e/context-sources.spec.ts` covers the wider context assembly.
 
 **Verified by:** `backend/test/lib/welcome-orientation.test.ts` (parser tolerance, the generic fallback copy, the name-less lead-in, the trigger/topic short-circuits, and the oriented rendering), `backend/test/lib/first-turn-greeting.test.ts` (the by-name greeting on the first real turn, which is where personalization moved to).
 
@@ -17,8 +17,8 @@
 When a user opens a new conversation, the assistant should *always* greet them with at least the context the system already has (their name), plus anything specific about why this conversation exists (a topic the user typed at create time, a drift-redirect prompt, an explicit trigger from a sibling flow). Silent channels are a launch bug - and a no-context greeting (`"Hello! I'm your AI assistant"`) is barely better.
 
 Reference Use Cases
-* When a new conversation is created in AgentEchelon, the user creates a conversation with a title, a tier, and the user has a profile. The assistant should use this information to provide a personalized contextual greeting to the user to help them get started such as a few example prompts the user can provide for the given tier.
-* When a new conversation is created in AgentEchelon due to drift in a pervious conversation, when the assistant is added they should carry the context from the previous conversation to avoid having the user repeat themselves and allow the conversation to carry on smoothly
+* A user creates a conversation with a title and a tier, and has a profile. The assistant uses that information to open with a personalized, contextual greeting - including a few example prompts appropriate for the tier - that helps the user get started.
+* A conversation created from drift in a previous conversation carries that context forward when the assistant is added, so the user does not repeat themselves and the conversation continues smoothly.
 
 This spec defines:
 
@@ -183,13 +183,13 @@ This path cannot fail loudly on its own. The welcome still lands, so a missing f
 
 Both are `Count` metrics in the `AgentEchelon/Welcome` namespace, dimensioned on `Classification`, alongside a `[Router][WelcomeIntent][ConfigDefect]` error log carrying the specific reasons. The router reads the parameter through a variant of its SSM helper that preserves the failure reason, because the ordinary helper collapses "absent", "malformed" and "access denied" into a single `undefined`, and the difference between those is the difference between a legitimate un-configured deployment and a silent misconfiguration.
 
-`e2e/welcome.spec.ts` asserts the deployed wiring directly (parameter name in the handler env, parameter resolving, the shipped parser accepting it, and IAM allowing the role to read it) for the same reason.
+`tests/e2e/welcome.spec.ts` asserts the deployed wiring directly (parameter name in the handler env, parameter resolving, the shipped parser accepting it, and IAM allowing the role to read it) for the same reason.
 
 ### The drift-created conversation uses the same welcome
 
 A conversation created by confirming a drift suggestion runs the welcome flow above, unchanged. It is worth stating explicitly because it did not always, and because the mechanism is easy to get wrong in a way that looks fine.
 
-**`WelcomeIntent` fires on the assistant's AUTOMATIC channel membership.** The bot acquires that membership by being the `CreateChannel` bearer, so it happens on every creation path with no explicit call. Verified against live Chime: a channel created by a bot bearer with **no** `CreateChannelMembership` call at all receives the composed welcome within seconds. An earlier comment in `create-conversation` claimed the opposite - that only an explicit membership add fires it - and that claim was wrong. The explicit add there is still made, for a different reason: it guarantees `ListChannelMemberships` returns the bot, which `@mention` routing needs.
+**`WelcomeIntent` fires on the assistant's AUTOMATIC channel membership.** The bot acquires that membership by being the `CreateChannel` bearer, so it happens on every creation path with no explicit call. Verified against a live Amazon Chime SDK deployment: a channel created by a bot bearer with **no** `CreateChannelMembership` call at all receives the composed welcome within seconds. An earlier comment in `create-conversation` claimed the opposite - that only an explicit membership add fires it - and that claim was wrong. The explicit add there is still made, for a different reason: it guarantees `ListChannelMemberships` returns the bot, which `@mention` routing needs.
 
 The consequence for this document's ordering rule (§2 of [`SPEC-USER-PROFILE-AND-ONBOARDING.md`](SPEC-USER-PROFILE-AND-ONBOARDING.md)) is direct: because the welcome fires on creation, it can arrive before the creator's own membership settles. That is why per-conversation participant context is written ahead of `CreateChannel` rather than read back afterwards.
 
@@ -208,7 +208,7 @@ So a spawned conversation opens directly on `This conversation picks up <topic> 
 
 The reason is that none of the dropped copy is new information to this reader. They were already mid-conversation with this same assistant, were told who it is and what they can ask in the thread they came from, and arrived by accepting an offer to continue one thought. Repeating the introduction pushes the only line that matters, what this thread is for, below an introduction they have just read.
 
-It previously posted its own hardcoded first message as well. That message was not filling a gap - the welcome was already arriving - so a drift conversation opened with **two** bot messages in nondeterministic order, one of them bypassing the composer entirely. Removing it left one.
+The drift path posts no first message of its own. An extra hardcoded message fills no gap - the welcome already arrives - and would open a drift conversation with **two** bot messages in nondeterministic order, one of them bypassing the composer entirely.
 
 **On quoting.** The composer's `priorMessage` clause quotes the user's message back to them, which is a deliberate exception to the drift design's by-reference principle and is documented with its erasure consequence in [`SPEC-DRIFT-CONVERGENCE.md`](../../capabilities/SPEC-DRIFT-CONVERGENCE.md). The topic (`priorSubject`) and the quote (`priorMessage`) are separate fields because they answer different questions: what this conversation is about, and what the person actually typed.
 
@@ -236,8 +236,8 @@ what the guarantee must be, records which paths currently satisfy it, and names 
 
 The server-only channel-context store (`ChannelContextTable`, keyed by `channelArn`) holds the
 conversation's private grounding and routing signals: `participantProfile`, `domainContext`,
-`otherContexts`, `userName`, `participants`, `memberIdentities`, `userLanguage`, `segment`, and (since
-the `@all` responder branch) `memberCount`.
+`otherContexts`, `userName`, `participants`, `memberIdentities`, `userLanguage`, `segment`, and
+`memberCount` (a membership signal the archival path records; the `@all` size decision never reads it - see below).
 
 It exists because Amazon Chime SDK channel `Metadata` is member-WRITABLE (`UpdateChannel`), so
 anything a member could forge cannot ground an answer or choose a model. That makes this store the
@@ -252,7 +252,11 @@ visible:
 | `host-grounding.ts` | no participant profile, no domain grounding, no `userName` | a generic, slightly worse answer. **Invisible.** |
 | Model routing (`userLanguage`, `segment`) | falls back to the default model | wrong language or wrong model. Invisible to the operator. |
 | Onboarding (`getParticipantContext`) | reads live membership instead | a race the recorded shape exists to avoid |
-| `@all` responder branch (`memberCount`) | live `ListChannelMemberships` per turn | correct, slower, costs a Chime call |
+
+`memberCount` is written by the archival path as a cheap membership signal, but the `@all` responder
+decision is NOT a consumer of it: channel size is always resolved live via `resolveChannelSize`
+(`channel-size.ts`), which deliberately exposes no read accessor for the recorded count, so that
+decision is unaffected by a missing or sparse row.
 
 None of these throw. That is the whole problem: a conversation with no context is a conversation that
 quietly answers slightly worse forever, and nothing reports it.

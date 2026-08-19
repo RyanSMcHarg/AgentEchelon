@@ -18,7 +18,7 @@ allowlist, the two-tier RAG pointer design, and the meetings/operations telemetr
 database boundary (sections 5.1 and 5.2) is verified against the deployment; every other guard here is
 described from code and inherits the coverage of the document that owns it.
 
-**Coverage:** `e2e/classification-context.spec.ts` - the only test that drives these paths end to end
+**Coverage:** `tests/e2e/classification-context.spec.ts` - the only test that drives these paths end to end
 against a deployment, asserting that a basic turn cannot name content that exists only at a higher
 classification, with real `simulate-principal-policy` IAM assertions behind it. It is also what caught
 the `platform-knowledge` pollution described in section 1.3, which no unit test could have found: the
@@ -103,13 +103,13 @@ company financials. It is readable at every classification, which is the point: 
 should be able to answer "how does this work?".
 
 **The trap that lives here, and the reason this section exists.** Content readable at every
-classification must contain nothing restricted at any classification. On 2026-08-11 the platform
-corpus included `SPEC-DEMO-COMPANY.md`, which reproduces the demo org chart and financials to
-illustrate what each classification may see. A basic turn then named a person who appears in no basic
-context file. The IAM boundary held perfectly; the content simply arrived by the path with no
-classification. `sync-project-knowledge.mjs` now excludes that document and **fails the whole run** if
-any document bound for this corpus names anyone from the employee directory. The generalisable rule:
-**a document about restricted data is itself restricted data.**
+classification must contain nothing restricted at any classification. `SPEC-DEMO-COMPANY.md`
+reproduces the demo org chart and financials to illustrate what each classification may see, so a
+copy of it in the platform corpus lets a basic turn name a person who appears in no basic context
+file - the IAM boundary holds perfectly while the content arrives by the path with no
+classification. `sync-project-knowledge.mjs` therefore excludes that document and **fails the whole
+run** if any document bound for this corpus names anyone from the employee directory. The
+generalisable rule: **a document about restricted data is itself restricted data.**
 
 ### 1.4 `profiles/{profileName}/{configId}/{persona|intentPack}` - profile bodies
 

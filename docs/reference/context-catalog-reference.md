@@ -19,6 +19,8 @@ profile using one is portable only to a deployment that agreed on it.
 A deployment publishing a **reserved** key MUST satisfy its contract: it may ADD fields, never
 remove or retype one. Each carries a `contractVersion` - adding an optional field is a minor bump,
 removing or retyping is major, and import rejects a profile written against a different major.
+A contract may exist for a reserved key the shipped catalog above does not publish; it binds any
+deployment that chooses to publish that key.
 
 - `user-profile` v1.0 requires: `displayName`
 - `company-docs` v1.0 requires: `digest`

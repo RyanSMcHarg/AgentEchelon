@@ -2,7 +2,7 @@
 
 > **Audience.** Anyone running AgentEchelon **in their own AWS account** - not just the reference deployment. Every command uses placeholders and a discovery recipe instead of hardcoded account IDs, resource names, or profiles. Substitute your own values from the "Conventions" section below. **Structure.** Each entry follows `Symptom → Diagnosis CLI → Root Cause → Solution → Prevention`. The root causes and fixes here are properties of the AgentEchelon codebase, so they apply to *any* deployment; only the resource names differ, and the recipes below resolve those for your account.
 
-> **Verification discipline (read first).** A passing E2E/demo run does **not** mean a feature works. The `/battle` demo driver only asserts `.message.battle-message` *bubble count ≥ 2* - a placeholder bubble + an error bubble satisfy it. **Open the captured frames** (`tests/demo-output/post2/*.png`) and read the message content + scorecard before declaring success. Bubble count lies.
+> **Verification discipline (read first).** A passing E2E/demo run does **not** mean a feature works. A bubble-count-only assertion (`.message.battle-message` *count ≥ 2*) is satisfied by a placeholder bubble + an error bubble. **Read the captured message content** - the e2e suites' own outputs (Playwright traces and screenshots under `tests/test-results/`) - and check the message content + scorecard before declaring success. Bubble count lies.
 
 ---
 
@@ -19,9 +19,9 @@ Placeholders used below - resolve each **once** and reuse:
 
 | Placeholder | What it is | How to get it |
 |---|---|---|
-| `<REGION>` | Deploy region | `frontend/.env` → `VITE_AWS_REGION` (default `us-east-1`) |
-| `<USER_POOL_ID>` | Cognito user pool | CDK output `AgentEchelonCognitoAuth.UserPoolId` / `.env` `VITE_USER_POOL_ID` |
-| `<APP_INSTANCE_ARN>` | Amazon Chime SDK app instance | CDK output `AgentEchelonChimeMessaging.AppInstanceArn` / `.env` `VITE_APP_INSTANCE_ARN` |
+| `<REGION>` | Deploy region | `frontend/packages/chat/.env` → `VITE_AWS_REGION` (default `us-east-1`) |
+| `<USER_POOL_ID>` | Cognito user pool | CDK output `AgentEchelonCognitoAuth.UserPoolId` / `frontend/packages/chat/.env` `VITE_USER_POOL_ID` |
+| `<APP_INSTANCE_ARN>` | Amazon Chime SDK app instance | CDK output `AgentEchelonChimeMessaging.AppInstanceArn` / `frontend/packages/chat/.env` `VITE_APP_INSTANCE_ARN` |
 | `<DEMO_EMAIL>` | A seeded test identity | Whatever `backend/scripts/seed-demo.ts` created in *your* pool (reference seed uses `*@stratum.example.com`) |
 | `<STACK>` | A CDK stack | `AgentEchelonClassification-Premium`, `AgentEchelonChannelFlow`, `AgentEchelonCognitoAuth`, … |
 | `<LOGICAL_ID>` | A construct's CFN logical id | Stable across accounts for the same CDK code (e.g. `AsyncProcessor`, `ChannelFlowProcessor`, `ExperimentsTable`, `ChannelBattleConfigTable`) |
@@ -76,11 +76,11 @@ This is a **layered failure** - several independent defects on the same path. Wo
 2. **Was the ChannelFlowProcessor invoked, and did it fan out?**
    ```bash
    fnlog AgentEchelonChannelFlow ChannelFlowProcessor 20m > /tmp/cfp.log
-   grep -nE '\[ChannelFlow\] routing|\[ChannelFlow\]\[battle\] (Detected|Fanning out)|premium-only|DescribeChannel' /tmp/cfp.log
+   grep -nE '\[ChannelFlow\] routing|\[ChannelFlow\]\[battle\] (Detected|Fanning out)|failing closed|Battle Mode isn' /tmp/cfp.log
    ```
  - No `[ChannelFlow] routing` line, or `invokesBattle:false` → **§5**.
- - `DescribeChannel … AccessDenied` then a *"battles are only available on
-     premium-tier channels"* reply → **§6**.
+ - A classification-tag read `AccessDenied` ("failing closed") then a *"Battle Mode
+     isn't available in this conversation."* reply → **§6**.
  - `[ChannelFlow][battle] Fanning out { botCount:2 … }` → fan-out happened;
      go to step 3.
 
@@ -109,7 +109,7 @@ This is a **layered failure** - several independent defects on the same path. Wo
 | admin-experiments PutCommand 500 (undefined marshalling) | §2 |
 | Battle panel never rendered (frontend `userArn` + create `createdByArn`) | §c below |
 | `/battle` detection brittle (`safeDecodeURIComponent`) | §5 |
-| ChannelFlowProcessor role missing `chime:DescribeChannel` (tier gate) | §6 |
+| ChannelFlowProcessor role missing the classification-tag read (battle eligibility gate) | §6 |
 | Bedrock invoke used bare model id for inference-profile-only models | §7 |
 | `buildTaskContextForPrompt` TypeError | §9 |
 | EOL fallback model | §8 |
@@ -121,15 +121,15 @@ This is a **layered failure** - several independent defects on the same path. Wo
 
 ### Resolution - three independent defects, not a threading bug
 
-This is not a variant-threading bug: `prepareBattleInvocation` threads the variant correctly (the alt-slot resolves `self: 'Echo', variantModelKey: 'opus'` as intended). The visible breakage is three separate root causes on the same frame:
+This is not a variant-threading bug: the battle variant resolution threads the variant correctly (the alt-slot resolves `self: 'Echo', variantModelKey: 'opus'` as intended). The visible breakage is three separate root causes on the same frame:
 
 1. **Alt-slot `AccessDeniedException` (the "Sorry, I encountered an issue" bubble).** The treatment model (Opus 4.6) is invoked through the `us.` cross-region inference profile, which Bedrock fans out to **us-east-1 / us-east-2 / us-west-2**. The IAM grant (built from the catalog's `foundationModelArns` via `collectArnsForTier`) only listed the **deploy-region** foundation-model ARN, so Bedrock denied the invoke on `arn:aws:bedrock:us-east-2::foundation-model/…opus`. On `access_denied` `bedrock-resilience` fails hard by design (no model fallback) → the error bubble. **Full detail + fix: §11.**
 
-2. **Default bot ignored the configured control variant.** `prepareBattleInvocation` resolved a variant only for the alt-slot; the default bot fell through to normal tier+intent resolution (Haiku for premium+general) instead of the experiment's configured **control** variant (e.g. Atlas / Sonnet). The battle therefore wasn't the configured A/B. Fix: the default-bot side now resolves `variants[0]` via `resolveBattleControlVariantByAltSlotArn` (`backend/lambda/src/lib/experiment-manager.ts`, `async-processor-core.ts` `prepareBattleInvocation`), degrading to the tier+intent path only when no battle/control variant is bound. See `docs/specs/capabilities/SPEC-BATTLE.md` §413.
+2. **Default bot ignored the configured control variant.** The variant resolution covered only the alt-slot; the default bot fell through to normal tier+intent resolution (Haiku for premium+general) instead of the experiment's configured **control** variant (e.g. Atlas / Sonnet). The battle therefore wasn't the configured A/B. Fix: the default-bot side now resolves `variants[0]` via `resolveBattleControlVariantByAltSlotArn` (`backend/lambda/src/lib/experiment-manager.ts:1177`), degrading to the tier+intent path only when no battle/control variant is bound - a duel side otherwise runs the ordinary turn path. See `docs/specs/capabilities/SPEC-BATTLE.md` §413.
 
-3. **Variant `displayName` never reached the frontend.** `prepareBattleInvocation` resolves `selfDisplayName` ("Atlas"/"Echo") but it was only logged. No marker field carried it, so the scorecard header + variant chip fell back to the bot's generic Amazon Chime SDK AppInstanceUser name ("Assistant"/"AltSlot0"). Fix: the `<!--battlestats:-->` marker now carries `name=<uri-encoded displayName>`; `messageParser.ts` parses it into `battle.label`; `ConversationInterface.tsx` (`toScorecardVariant`, `battleVariantLabel`) prefers it over `sender.name`.
+3. **Variant `displayName` never reached the frontend.** The variant resolution produces `displayName` ("Atlas"/"Echo") but it was only logged. No marker field carried it, so the scorecard header + variant chip fell back to the bot's generic Amazon Chime SDK AppInstanceUser name ("Assistant"/"AltSlot0"). Fix: the `<!--battlestats:-->` marker now carries `name=<uri-encoded displayName>`; `messageParser.ts` parses it into `battle.label`; `ConversationInterface.tsx` (`toScorecardVariant`, `battleVariantLabel`) prefers it over `sender.name`.
 
-Once Opus actually runs (1), the model badge becomes `OPUS`/`SONNET` automatically (it's `message.modelId` from analytics metadata) - no separate badge fix is needed. Re-verify by opening `tests/demo-output/post2/P2-B1.png` per the verification-discipline note, not by the green run.
+Once Opus actually runs (1), the model badge becomes `OPUS`/`SONNET` automatically (it's `message.modelId` from analytics metadata) - no separate badge fix is needed. Re-verify by reading the captured battle messages (the e2e run's own traces/screenshots) per the verification-discipline note, not by the green run.
 
 ---
 
@@ -161,7 +161,7 @@ aws cognito-idp admin-list-groups-for-user \
 ```
 Empty ⇒ the user is in **no Cognito tier group**.
 
-**Root Cause** - Cognito **group** membership is the authoritative tier signal (see `CLAUDE.md` → Tier authorization). Seeded / admin-created users skip the post-confirmation trigger that mirrors `custom:tier` → group.
+**Root Cause** - Cognito **group** membership is the authoritative tier signal (see `AGENTS.md` → Tier authorization). Seeded / admin-created users skip the post-confirmation trigger that mirrors `custom:tier` → group.
 
 **Solution**
 ```bash
@@ -169,7 +169,7 @@ USER_POOL_ID=<USER_POOL_ID> node backend/scripts/backfill-tier-groups.mjs
 ```
 Idempotent, pool-wide, self-correcting; does not touch the `admins` group.
 
-**Prevention** - after any deploy that re-seeds demo users, always run `backfill-tier-groups.mjs` **and** `backfill-channel-flow.mjs`. `seed-demo.ts` does not register groups. This is a documented post-deploy step in `CLAUDE.md`.
+**Prevention** - `seed-demo.ts` registers the tier groups for the users it creates, so the backfill applies only to identities created outside the seed (older seeds, hand-created users). After a deploy that touches such identities, run `backfill-tier-groups.mjs` **and** `backfill-channel-flow.mjs`. This is a documented post-deploy step in `AGENTS.md`.
 
 ---
 
@@ -196,7 +196,7 @@ aws chime-sdk-identity create-app-instance-user \
 ```
 Repeat for every seeded identity a flow exercises.
 
-**Prevention** - `seed-demo.ts` should register AppInstanceUsers (it currently does not). Until then, treat this as a mandatory post-seed step alongside the tier-group backfill.
+**Prevention** - `seed-demo.ts` registers an AppInstanceUser for every user it creates, so the manual step applies only to identities created outside the seed (pre-fix seeds, hand-created users). For those, treat it as a mandatory post-seed step alongside the tier-group backfill.
 
 ---
 
@@ -212,15 +212,15 @@ Repeat for every seeded identity a flow exercises.
 
 ---
 
-## 6. `/battle` answered "battles are only available on premium-tier channels" (on a premium channel)
+## 6. `/battle` answered "Battle Mode isn't available in this conversation." (on a battle-eligible channel)
 
-**Symptom** - on a real premium channel, `/battle` wrongly replies premium-only and returns before fan-out.
+**Symptom** - on a channel whose classification profile IS battle-eligible (premium in the default configuration), `/battle` wrongly replies *"Battle Mode isn't available in this conversation. Reply normally and I'll respond as usual."* and returns before fan-out.
 
-**Diagnosis** - `grep -n 'DescribeChannel failed, defaulting to basic' /tmp/cfp.log`. An `AccessDeniedException` on `chime:DescribeChannel` for the ChannelFlowProcessor role ⇒ this bug.
+**Diagnosis** - `grep -n 'failing closed' /tmp/cfp.log`. An `AccessDeniedException` on the classification-tag read (`chime:ListTagsForResource`) for the ChannelFlowProcessor role ⇒ this bug.
 
-**Root Cause** - `handleBattleMessage`'s tier gate calls `DescribeChannel` to read the channel's immutable `classification` tag. The role granted `ChannelFlowCallback`/`SendChannelMessage`/`ListChannelMemberships` but **not `chime:DescribeChannel`**; the `catch` defaulted `channelTier='basic'` → rejected every battle.
+**Root Cause** - `handleBattleMessage`'s eligibility gate resolves the channel's immutable `classification` tag (`resolveChannelClassificationTag`, via `chime:ListTagsForResource`) and then gates on the resolved profile's `battleEligible` flag. When the role lacks the tag-read permission, the read fails closed to the floor classification, whose profile is not battle-eligible → every battle refused.
 
-**Solution** - add `chime:DescribeChannel` to that role statement (same `<APP_INSTANCE_ARN>/*` scope as the other Amazon Chime SDK actions). File: `backend/lib/stacks/channel-flow-stack.ts`; redeploy `AgentEchelonChannelFlow`.
+**Solution** - keep `chime:ListTagsForResource` in that role statement (same `<APP_INSTANCE_ARN>/*` scope as the other Amazon Chime SDK actions). File: `backend/lib/stacks/channel-flow-stack.ts`; redeploy `AgentEchelonChannelFlow`.
 
 **Prevention** - when a Lambda's code adds a new AWS call, audit its CDK role in the same change. A fail-open-to-wrong-default `catch` masks an IAM gap as a "feature off" message - always log the underlying error so it's visible.
 
@@ -273,13 +273,13 @@ aws bedrock list-foundation-models --by-provider <provider> \
 
 ---
 
-## 10. Demo driver honest-degrades at P2-S4 though battle is armed
+## 10. A UI check concludes battle infrastructure is absent though battle is armed
 
-**Symptom** - `post2-abtest-battle.demo.spec.ts` captions *"Battle infra absent - not faked"* and exits green, yet the experiment/slot are armed.
+**Symptom** - an automated check (or a quick manual look) concludes the Battle Mode panel is absent and moves on, yet the experiment/slot are armed.
 
-**Root Cause** - `ChannelMembersPanel` renders the empty-state on its pre-fetch initial paint; the driver's instant visibility check saw it before `listExperiments()` resolved.
+**Root Cause** - `ChannelMembersPanel` renders its empty-state on the pre-fetch initial paint; an instant visibility check sees it before `listExperiments()` resolves.
 
-**Solution** - wait for `#battle-experiment-select` to appear, only honest-degrade if it never does. File: `tests/e2e/demo/post2-abtest-battle.demo.spec.ts` *(this driver is not present in this repository)*.
+**Solution** - wait for `#battle-experiment-select` to appear before concluding Battle Mode is unavailable; conclude absence only if it never appears.
 
 ---
 
@@ -692,7 +692,7 @@ to use.
 ## See also
 
 - `docs/specs/capabilities/SPEC-BATTLE.md` - battle design; clarification as a measured dimension
-- `CLAUDE.md` - tier authorization, post-deploy backfill steps
+- `AGENTS.md` - tier authorization, post-deploy backfill steps
 - `README.md` "Setup" - where CDK outputs / `.env` values come from
 - §18 - deploy landmines (stale bundles, single-stack context, CORS, Windows)
 
@@ -751,7 +751,7 @@ There is deliberately **no fallback that posts a replacement placeholder**. That
 
 Also unexamined, and moot once the mapping replaces the scan: whether the stored `Content` encoding defeats the match. The poll tries a decoded form and a Lex JSON wrapper form, so a third form would slip past both, the same class of problem as the still-encoded content in section 5.
 
-**Identifying the turn in the logs.** The invocation line carries the channel id and the placeholder message id, and nothing else. The Chime ARN prefix is deliberately absent: it is identical on every line, carries the account and app-instance ids, and identifies nothing.
+**Identifying the turn in the logs.** The invocation line carries the channel id and the placeholder message id, and nothing else. The Amazon Chime SDK ARN prefix is deliberately absent: it is identical on every line, carries the account and app-instance ids, and identifies nothing.
 
 **Prevention** - rare (twice in fourteen days on the reference deployment), and load-sensitive rather than deploy-sensitive: the busier the channel, the likelier a duplicate delivery and the likelier the lookup window is to miss. Widening the window does not address it, because the losing invocation is searching for a marker that was never written.
 

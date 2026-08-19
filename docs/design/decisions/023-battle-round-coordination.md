@@ -10,15 +10,17 @@ related:
   - "../../../backend/lambda/src/lib/async-processor-core.ts"
   - "../../../backend/lambda/src/battle-orchestrator.ts"
 tracking: |
-  OPEN, NOTHING BUILT. Option B (peer rendezvous) is DISPROVEN: Amazon Chime SDK does not route a
+  Option A SHIPS: `tryClaimOrchestratorFire` claims the fire by conditional write once every side is
+  terminal, and `battle-orchestrator.ts` dispatches round 2. The battle turn ENTRY
+  (router-agent-handler TurnRequest.battleContext, lib/battle-turn.ts) is exercised by the router on
+  every battle turn. Option B (peer rendezvous) is DISPROVEN: Amazon Chime SDK does not route a
   message authored by an AppInstanceBot to another AppInstanceBot's Lex, so the nudge can never
-  arrive. Measured directly, with a control (see Status). No replacement is chosen; A-prime is the
-  leading candidate, with no recorded objection standing against it.
-  Raised by the owner decision that battle state is not task state
+  arrive. Measured directly, with a control (see Status). A-prime (drop the orchestrator Lambda and
+  have the claiming worker fan out itself) remains the open OPTIMISATION, with no recorded objection
+  standing against it. Raised by the owner decision that battle state is not task state
   (DESIGN-BATTLE 2a): removing the task-terminality gate from round-1 completion forces the question
   of what "a side has finished its round" means on its own terms, and what fires round 2 once both
-  have. The battle turn ENTRY exists (router-agent-handler TurnRequest.battleContext, lib/battle-turn.ts,
-  commit 3798a62) and nothing calls it; this ADR decides the coordination layer that will.
+  have.
 ---
 
 # ADR-023: How a battle round ends, and what fires the next one
@@ -113,7 +115,7 @@ re-implement a turn. That constraint is common to every option here and is not a
   in this option and in every other one below, including what ships today. The placeholders then
   strand until the 600s row TTL and nothing tells the user. That is a real uncovered case, not a
   detail - it is called out here so "no hang" is not read as full coverage.
-- **Precisely on the TTL:** `allBotsTerminal` (`battle-state.ts:623-627`) returns **false** when no
+- **Precisely on the TTL:** `allBotsTerminal` (`battle-state.ts:804`) returns **false** when no
   bot rows remain, so full reaping means round 2 never fires at all. A partially reaped partition
   lets the survivors' rows carry the check. "A missing row reads as FAILED" is only true while at
   least one row remains.
@@ -274,7 +276,7 @@ platform-wide change to how assistants address each other should not arrive as b
 
 **Status: the premise is MEASURED. The option is not built.**
 
-**The probe, 2026-08-14 20:00Z (mcharg-dev).** One `Target`-ed message from `Assistant-premium` to
+**The probe, 2026-08-14 20:00Z (the dev deployment).** One `Target`-ed message from `Assistant-premium` to
 `AltSlot0`, carrying `<!--aecoord:kind=nudge,hop=1,ref=bstream-probe-1-->`, message
 `0b769a6ca7f0d9cf...`:
 
@@ -283,7 +285,7 @@ platform-wide change to how assistants address each other should not arrive as b
 | The flow ALLOWS a marked bot-to-bot message | Invoked, no deny, message reached `SENT` |
 | It persists, with its addressing intact | Read back as the SENDER: `Status: SENT`, `Target` naming AltSlot0, marker intact |
 | It stays private to non-targets | The app-instance admin bearer is refused outright (`ForbiddenException`), so targeting hides it even from the admin plane |
-| **It reaches the Kinesis stream** | Record found on `chime-messaging-agent-echelon-aurora`, matching message id, marker intact. **This was the whole unmeasured premise** |
+| **It reaches the Kinesis stream** | Record found on the messaging stream, matching message id, marker intact. **This was the whole unmeasured premise** |
 | It still triggers no assistant | AltSlot0's Lex handler: ZERO invocations, reconfirming the finding that disproved option B |
 
 Read together, those five say the thing that makes this option exist: **the message survives everything
@@ -321,9 +323,10 @@ Payload: { Content, Persistence, Redacted, LastUpdatedTimestamp, Sender{Name,Arn
 EventType: CREATE_CHANNEL_MESSAGE
 ```
 
-Tracker row 94's blindness is a property of the FLOW CALLBACK, not of the platform: the same message
-that reaches the flow with no `Target` at all reaches the stream with its `Target` and its `Metadata`
-intact. Anything that needs to reason about how a message was ADDRESSED can do so after the fact, and
+The flow callback's blindness to targeting is a property of the CALLBACK, not of the platform (the
+`ChannelMessageCallback` carries no `Target` field, so the flow cannot see how a message was
+addressed): the same message that reaches the flow with no `Target` at all reaches the stream with
+its `Target` and its `Metadata` intact. Anything that needs to reason about how a message was ADDRESSED can do so after the fact, and
 only after the fact. This is load-bearing well beyond coordination - see
 [ADR-032](./032-where-a-rule-runs.md).
 
@@ -361,9 +364,9 @@ runaway exchange is a model call somebody pays for.
 
 | Precondition | Why it is not optional |
 |---|---|
-| A spend ceiling that is actually ARMED | `BEDROCK_GLOBAL_HOURLY_BUDGET` and `BEDROCK_USER_HOURLY_BUDGET` read `0` on mcharg-dev, and the code treats `<= 0` as OFF, so the gate returns allowed on every turn and no circuit is wired |
+| A spend ceiling that is actually ARMED | The code treats a `BEDROCK_GLOBAL_HOURLY_BUDGET` / `BEDROCK_USER_HOURLY_BUDGET` of `<= 0` as OFF, and an unarmed ceiling gates nothing - the gate returns allowed on every turn and no circuit is wired. Arming one is part of shipping this option, not an assumption about the deployment |
 | The ceiling must be the GLOBAL one | Budgets key on `userSub`, and a bot-to-bot turn has no user. A fully-armed per-user budget cannot see this exchange at all |
-| A STATEFUL `ref`+hop claim | Tracker row 66: the hop cap in `bot-coordination.ts` is stateless and self-declared, so each side re-declares its own count and an `ack,hop=2` volley is unbounded. It constrains a cycle's SHAPE, never its cost. `claimCorrelation` is the mechanism the codebase already uses for this |
+| A STATEFUL `ref`+hop claim | The hop cap in `bot-coordination.ts` is stateless and self-declared, so each side re-declares its own count and an `ack,hop=2` volley is unbounded. It constrains a cycle's SHAPE, never its cost. `claimCorrelation` is the mechanism the codebase already uses for this |
 | A per-`ref` dispatch ceiling | The bound has to live on the exchange, which is the thing that can run away, rather than on a principal |
 | A counter on every stream-triggered dispatch | [ADR-032](./032-where-a-rule-runs.md) tenet 6. An uncounted mechanism is indistinguishable from one that is not running, in either direction |
 

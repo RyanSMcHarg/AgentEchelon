@@ -2,11 +2,11 @@
 
 **Status:** Partial (reply-language ships; the inference pivot and dual delivery are design).
 
-**Coverage:** `e2e/bilingual-conversations.spec.ts` - covers the shipped half. It drives the opposite case to the obvious one: the user writes in ENGLISH in a conversation configured `userLanguage=zh` and must still be answered in Chinese, which is what meeting the assistant in your own language means and rules out the model simply mirroring the language it was addressed in. The assertion counts Han characters rather than judging prose, so it is objective: 82 of 102 characters with `zh`, and 0 falsified with `en`.
+**Coverage:** `tests/e2e/bilingual-conversations.spec.ts` - covers the shipped half. It drives the opposite case to the obvious one: the user writes in ENGLISH in a conversation configured `userLanguage=zh` and must still be answered in Chinese, which is what meeting the assistant in your own language means and rules out the model simply mirroring the language it was addressed in. The assertion counts Han characters rather than judging prose, so it is objective: 82 of 102 characters with `zh`, and 0 falsified with `en`.
 
 The exercised chain is production code end to end - the server-only Channel Context store's `userLanguage` -> `assembleHostGrounding` -> `event.userLanguage` -> the reply-language instruction in the system prompt. Only the stored value itself is arranged by the test, because the host path that normally writes it (`federated-create-conversation`) is gated on a `federatedUserPoolId` a non-federated deployment does not set.
 
-The test also drives the NEGATIVE control, which is the more valuable half: it writes a conflicting `userLanguage=en` into member-writable channel `Metadata` with the same `rename` capability (`chime:UpdateChannel`) the conversation-rename UI holds, and requires the reply to follow the store regardless. `userLanguage` selects the model as well as the language (see [`SPEC-CONTEXT-AWARE-MODEL-ROUTING`](SPEC-CONTEXT-AWARE-MODEL-ROUTING.md)), so a member able to override it could choose which model serves their own conversation. The inference pivot and dual delivery remain design and are not covered.
+The test also drives the NEGATIVE control, which is the more valuable half: it writes a conflicting `userLanguage=en` into member-writable channel `Metadata` with the same `rename` capability (`chime:UpdateChannel`) the conversation-rename UI holds, and requires the reply to follow the store regardless. `userLanguage` always selects the reply language, and, when context routing is enabled (`ENABLE_CONTEXT_ROUTING`; no shipped deployment sets it), the model as well (see [`SPEC-CONTEXT-AWARE-MODEL-ROUTING`](SPEC-CONTEXT-AWARE-MODEL-ROUTING.md)), so a member able to override it could choose which model serves their own conversation. The inference pivot and dual delivery remain design and are not covered.
 
 **Problem and who it's for:** A user with a set language preference should meet the assistant end-to-end in their own language, and a business serving multiple locales should be able to route each one to the model strongest in it - without bolting a translation layer onto a monolingual assistant or wiring up its own language-aware routing. This is for the end user (a native-feeling, not bolted-on, experience) and the AI developer (who gets language as a first-class routing signal alongside intent and rung). It honours a per-user language preference on three escalating levels: reply in the user's language, pivot to the model's strong language for inference, and optionally deliver both languages side by side.
 
@@ -40,7 +40,7 @@ Reply-in-user-language works on the federated path, end to end:
 | Host sends `userLanguage` in the create-conversation body | Host user-api (`POST /…/assistant/session` → federated create-conversation) |
 | AE persists it to the server-only Channel Context store | `backend/lambda/src/federated-create-conversation.ts` (reads `body.userLanguage`, writes it through `putChannelContext`). It is deliberately NOT written to channel `Metadata`, which is member-writable |
 | Router forwards it from the store | `backend/lambda/src/lib/host-grounding.ts` (`assembleHostGrounding` reads `userLanguage` from `getChannelContext`, never from metadata) |
-| Shared prompt builder emits the reply-language instruction | `backend/lambda/src/lib/async-processor-core.ts:397 - 407` (`formatDomainContextForPrompt`): a closed `LANG_NAMES` map → "Respond in {language} unless the user writes in another language", non-English only |
+| Shared prompt builder emits the reply-language instruction | `backend/lambda/src/lib/async-processor-core.ts` (`formatDomainContextForPrompt`): a closed `LANG_NAMES` map → "Respond in {language} unless the user writes in another language", non-English only |
 
 Two properties worth calling out:
 
@@ -70,7 +70,7 @@ User → Amazon Chime SDK channel → Lex (AUTO) → router-agent-handler (one f
 
 | Level | Hook point | File(s) |
 |---|---|---|
-| 1. Reply language | shared prompt builder + metadata forward | `backend/lambda/src/lib/async-processor-core.ts:397`; `…/router-agent-handler.ts:515`; `…/federated-create-conversation.ts:122` |
+| 1. Reply language | shared prompt builder + metadata forward | `backend/lambda/src/lib/async-processor-core.ts` (`formatDomainContextForPrompt`); `…/router-agent-handler.ts`; `…/federated-create-conversation.ts` |
 | 2. Pivot | wrap the Converse call: translate inbound user text → model language; translate output → user language | `…/lib/async-processor-core.ts` (around the Converse loop); `backend/lambda/src/lib/translation.ts` *(does not exist yet - this level is design)*; routes via `…/lib/model-resolver.ts` + `…/lib/bedrock-resilience.ts` |
 | 3. Dual delivery *(opt-in)* | send the second language as a **linked sibling message** via `handleLongResponse`; widget groups by `responseGroup` | `…/lib/async-processor-core.ts` (send path); the embeddable widget (render) |
 
@@ -80,7 +80,7 @@ For turns where the resolved model is stronger in a language other than the user
 
 1. Read the model's `workingLanguage` from the catalog (`backend/lib/config/model-strategy.ts`) - a **per-model attribute** (e.g. `haiku` → `en`, a CN-tuned model → `zh`; default `en`). A required catalog field following the `visionCapable` precedent; default `en` is a no-op until a non-`en` model exists.
 2. If `userLanguage !== workingLanguage`: translate the inbound user message into `workingLanguage` before the Converse call, infer, then (two-hop variant) translate the output back into `userLanguage`. Skip the whole pivot when they match - the common case, **zero added cost**. The Level 1 instruction stays as a backstop so the model answers in-language even when the pivot is skipped.
-3. Translation is **a model call routed through the existing layer**: add a `translation` key to the `RouteKey` union (`model-strategy.ts`) and an entry to `INTENT_ROUTE_STRATEGY` (`:232`) - primary a cheap fast model (`haiku`-class), per-tier fallback - so it inherits `model-resolver` tier safety and `bedrock-resilience` (retry / fallback / circuit-breaker). Note: translation is invoked **directly with the fixed `translation` key**, it does **not** pass through `classifyIntent` (it's not a classified user intent).
+3. Translation is **a model call routed through the existing layer**: add a `translation` key to the `RouteKey` union (`model-strategy.ts`) and an entry to `INTENT_ROUTE_STRATEGY` (`model-strategy.ts`) - primary a cheap fast model (`haiku`-class), per-tier fallback - so it inherits `model-resolver` tier safety and `bedrock-resilience` (retry / fallback / circuit-breaker). Note: translation is invoked **directly with the fixed `translation` key**, it does **not** pass through `classifyIntent` (it's not a classified user intent).
 
 ### Security of the translation hop (AppSec)
 

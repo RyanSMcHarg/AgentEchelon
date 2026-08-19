@@ -71,7 +71,7 @@ cd backend && npx cdk deploy --all \
   --context appUrl=https://your-frontend-url
 ```
 
-This deploys ~14 stacks in Aurora mode with `/battle` default-on (the base feature stacks + `AgentEchelonBattle` + `AgentEchelonAnalyticsAurora` instead of `AgentEchelonAnalytics`).
+This deploys the full stack set in Aurora mode with `/battle` default-on (the base feature stacks + `AgentEchelonBattle` + `AgentEchelonAnalyticsAurora` instead of `AgentEchelonAnalytics`).
 
 ### First deploy
 
@@ -116,8 +116,8 @@ VITE_ANALYTICS_API_URL=<AgentEchelonAnalyticsAurora.AnalyticsApiUrl output>
 
 SQL migrations live in `backend/lambda/src/analytics-aurora/schema/` and run in filename order.
 **That directory is the authority on what exists** - this guide deliberately does not reproduce the
-list, because a hand-copied list is wrong the moment someone adds a file and it was wrong for eleven
-migrations before anyone noticed. `ls backend/lambda/src/analytics-aurora/schema/` answers "what is
+list, because a hand-copied list is wrong the moment someone adds a file.
+`ls backend/lambda/src/analytics-aurora/schema/` answers "what is
 there"; each file's header comment answers "why".
 
 **Two mechanisms, and the difference matters when you are waiting for a change to take effect:**
@@ -216,6 +216,10 @@ The Aurora analytics API serves the admin dashboard. All endpoints accept `GET` 
 | `/analytics/drift` | Drift detection events |
 | `/analytics/context` | Cross-conversation context records |
 | `/analytics/model-effectiveness` | Model performance comparison |
+| `/analytics/latency` | Response latency breakdown by agent type and delivery option |
+| `/analytics/execution-steps` | Per-message step telemetry |
+| `/analytics/experiments` | A/B experiment results by variant |
+| `/analytics/experiments/recommendation` | Statistically grounded, advisory experiment recommendation |
 
 ---
 
@@ -303,7 +307,7 @@ Enabling the proxy adds ~$86/month (the 8-ACU floor) and re-points the Lambdas' 
 ### Lambda can't connect to Aurora
 
 - Verify the Lambda's security group has an ingress rule to the DB security group on port 5432
-- Check that the RDS Proxy status is `available`
+- Only if you enabled `enableRdsProxy`: check that the RDS Proxy status is `available`
 - Verify IAM auth setup succeeded (check `/aws/lambda/AgentEchelonAnalyticsAurora-IamAuthSetupLambda*` logs)
 
 ### Schema migrations fail

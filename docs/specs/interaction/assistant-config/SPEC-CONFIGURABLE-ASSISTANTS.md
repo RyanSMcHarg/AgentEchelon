@@ -2,7 +2,7 @@
 
 **Status:** Implemented
 
-**Coverage:** `e2e/profile-config.spec.ts`
+**Coverage:** `tests/e2e/profile-config.spec.ts`
 
 **Verified by:** `backend/test/cdk-synth.test.ts` (describe 'Layer 4 / §7 - IAM resource boundaries (deny-by-absence...)' - each classification's S3 context read EXCLUDES higher classifications, the channel-context store is router `GetItem`-only and unreadable by Cognito/Identity-Pool roles, and `bedrock:ApplyGuardrail` is scoped to provisioned guardrails, never `*`; plus describe 'Layer 1 - per-tier fail-closed channel-tag allow'), `backend/test/lib/guardrail-catalog.test.ts` (default vs strict guardrail policy - strict adds a blocked term), `backend/test/task-state-machines.test.ts` and `backend/test/lib/task-loop-machines.test.ts` (task-machine graph validation + a profile's machines override the deployment pack at loop time), `backend/test/lib/active-profile.test.ts` (a version's models/tools/machines/guardrailId surface on the resolved profile and fail closed to the seed on an invalid version), and `tests/e2e/profile-config.spec.ts` (a strict-selecting profile masks a term the default does not, and config survives export/import; gated `PROFILE_CONFIG_E2E=1`).
 

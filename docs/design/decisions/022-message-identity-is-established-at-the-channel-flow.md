@@ -139,7 +139,7 @@ Three options were considered:
 **Stable message identity is established at the channel flow. Idempotency and placeholder correlation
 both anchor there, and neither depends on a value passing through Lex.**
 
-The channel flow is the only component that sees a stable Chime `MessageId` for every message, and it
+The channel flow is the only component that sees a stable Amazon Chime SDK `MessageId` for every message, and it
 sees it twice over: once on the inbound user message, and again on the bot placeholder, which re-enters
 the flow like any other message.
 
@@ -205,6 +205,16 @@ fulfillments 3.5 seconds apart, where the second returned an empty envelope and 
 the channel's only bot message. Replaying the placeholder makes the two attempts interchangeable, so
 whichever materialises carries the marker the dispatched processor is looking for.
 
+**One decided exception: a duplicate of a GATE-BLOCKED fulfillment stays silent.** The dispatch claim
+runs before the abuse gate (so a duplicate cannot double-meter the user), which means a winner can take
+the claim and then be refused: it dispatched nothing and returned the block notice, not a placeholder.
+Replaying the placeholder there would post a waiting bubble no worker will ever update, and the
+last-response-wins materialisation would discard the notice the person should see. So the router marks
+the block beside the fulfillment claim (`fulfil-blocked-<correlationId>`), and a duplicate that finds
+that marker returns the empty envelope so the winner's notice stands. A gate block is fast and never
+hits the retry timeout, so the notice did materialise; the marker write is best-effort, and an
+unwritten marker degrades to the ordinary replay.
+
 ### 2b. The flow still claims the correlation, as a duplicate guard
 
 When a bot message carrying `<!--corr:{id}-->` passes through, the flow claims `corr#<id>` against that
@@ -212,7 +222,7 @@ When a bot message carrying `<!--corr:{id}-->` passes through, the flow claims `
 placeholder for a turn already in flight, and is denied.
 
 **This sees EVERY bot message, including ones Amazon Chime SDK materialises from a Lex return.**
-Measured live: a Lex fulfillment returned `{"Messages":[]}`, Chime created a message from it, and the
+Measured live: a Lex fulfillment returned `{"Messages":[]}`, Amazon Chime SDK created a message from it, and the
 flow was invoked for exactly that MessageId. So no placeholder is out of the flow's reach - it sees
 each one, holds a stable MessageId for it, and can deny it.
 
@@ -241,7 +251,7 @@ messages re-invoke channel flows, so when the processor updates the placeholder 
 that update re-enters the flow carrying the same marker. The flow will legitimately see the same
 correlation id more than once, and must not treat the second sighting as a new mapping.
 
-Ordering favours this. Chime creates the message, the flow intercepts it, the flow takes the claim, and
+Ordering favours this. Amazon Chime SDK creates the message, the flow intercepts it, the flow takes the claim, and
 only then is the message released and visible to `ListChannelMessages` - so a duplicate is denied
 before it can ever be seen.
 
@@ -329,8 +339,9 @@ it obtained by posting) true without an unexplained exception.
 ## The control, applied at the flow's own entry (2026-08-14)
 
 The flow's own duplicate gate was the last place still outside this ADR, and it looked like it was
-inside. It was a module-scope `Set`, declared under the comment `Idempotency gate — Chime channel
-flows have at-least-once delivery`, capped at 200 entries and evicting by insertion order.
+inside. It was a module-scope `Set`, declared under a comment naming it the idempotency gate for the
+at-least-once delivery of Amazon Chime SDK channel flows, capped at 200 entries and evicting by
+insertion order.
 
 **A dedup that lives in a process is a same-container optimisation wearing the label of a control.** A
 redelivery is a separate invocation, usually on a separate container, so both attempts read an empty
@@ -341,8 +352,20 @@ It now claims `flow-<MessageId>` through `claimCorrelation`, the same conditiona
 and the round-1 fan-out use. `MessageId` needs no derivation: Amazon Chime SDK replays it verbatim, so
 it is already a key a redelivery provably replays.
 
+**The claim is bypass-only.** It is taken only when the message takes a flow-owned path (`@all`,
+`/battle`, or a battle continuation); an ordinary message is released to Lex without one, because its
+duplicate is a retried FULFILLMENT that only the handler's derived-id claim can see.
+
+**Claim-before-dispatch is a decided trade, not an oversight.** A winner that dies between taking the
+claim and dispatching makes the redelivery a no-op, and that turn is lost. The window is bounded on
+both sides: the claim carries the dedup TTL (5 minutes, and Amazon Chime SDK redelivers within
+seconds), and the window itself is a hard crash only - every dispatch path that can fail notifies the
+sender instead of throwing through. Claiming after dispatch would reopen the double answer this claim
+exists to prevent, which is the worse direction: a duplicate is visible and confusing, a rare lost turn
+is retryable by the person.
+
 **The loser still calls back.** The claim records that the MESSAGE was handled, not that its CALLBACK
-was resolved, and a winner that died between the two would otherwise leave Chime holding the message
+was resolved, and a winner that died between the two would otherwise leave Amazon Chime SDK holding the message
 until it times out. `FallbackAction: CONTINUE` then delivers it UNPROCESSED, past the mention rules and
 marker stripping the flow exists to apply. Resolving a callback the winner already resolved is safe
 because an already-decided callback is no longer treated as an error.

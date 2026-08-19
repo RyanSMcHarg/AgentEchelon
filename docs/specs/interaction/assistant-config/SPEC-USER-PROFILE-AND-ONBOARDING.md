@@ -2,7 +2,7 @@
 
 **Status:** Partial (the store, the swap seam and the once-per-user gate ship; the resolution model and identity provenance sections below are design).
 
-**Coverage:** `e2e/onboarding-intake.spec.ts` - runs against a live deployment. It drives the full intake (greeting, a field per turn, confirmation, hand-off) and then asserts the PROFILE STORE rather than the transcript: the row carries `onboardedAt` and the collected `facts`. It then requires a second conversation for the same user to answer directly AND to leave `onboardedAt` byte-for-byte unchanged, which is the once-per-user contract stated as a property of the store instead of a property of what the assistant chose to say.
+**Coverage:** `tests/e2e/onboarding-intake.spec.ts` - runs against a live deployment. It drives the full intake (greeting, a field per turn, confirmation, hand-off) and then asserts the PROFILE STORE rather than the transcript: the row carries `onboardedAt` and the collected `facts`. It then requires a second conversation for the same user to answer directly AND to leave `onboardedAt` byte-for-byte unchanged, which is the once-per-user contract stated as a property of the store instead of a property of what the assistant chose to say.
 
 **Verified by:** `backend/test/lib/user-profile-client.test.ts` covers the client boundary: the built-in DynamoDB path, the `USER_PROFILE_SERVICE_ARN` delegation seam, and the fail-open reads that make a store outage degrade to "not yet onboarded" rather than erroring a turn.
 
@@ -14,7 +14,7 @@ The store assertions are what make it evidence. "The assistant did not re-ask" i
 
 **Site section:** Interaction layer, Assistant Configuration pillar (core plane). Consumed by the welcome / onboarding flow in `SPEC-WELCOME-AND-CONTEXT.md`.
 
-> "User profile" here means a durable per-END-USER record of what the person told us and what the platform learned about them: whether they have been onboarded, the answers they gave, and the preferences they stated. It is deliberately NOT a copy of who they are according to their identity provider (see §1a). It is NOT the assistant capability-"profile" of SPEC-PER-PROFILE-OWNERSHIP. The two are unrelated; this document uses "user profile" strictly for the per-user record and "assistant profile" when it must refer to the capability bundle. AgentEchelon ships a minimal built-in user profile store. It is a **reference stand-in for an OSS implementer's own profile store**, not a system of record. A real deployment plugs in its own store behind the client boundary defined below, the same way the identity provider is pluggable (IDENTITY-PROVIDER-GUIDE.md): the router is a *client* of a profile store it does not own, reaching an externally owned profile service by ARN when one is configured. The built-in store exists so the platform runs end to end out of the box, not to prescribe where real user data lives.
+> "User profile" here means a durable per-END-USER record of what the person told the platform and what it learned about them: whether they have been onboarded, the answers they gave, and the preferences they stated. It is deliberately NOT a copy of who they are according to their identity provider (see §1a). It is NOT the assistant capability-"profile" of SPEC-PER-PROFILE-OWNERSHIP. The two are unrelated; this document uses "user profile" strictly for the per-user record and "assistant profile" when it must refer to the capability bundle. AgentEchelon ships a minimal built-in user profile store. It is a **reference stand-in for an OSS implementer's own profile store**, not a system of record. A real deployment plugs in its own store behind the client boundary defined below, the same way the identity provider is pluggable (IDENTITY-PROVIDER-GUIDE.md): the router is a *client* of a profile store it does not own, reaching an externally owned profile service by ARN when one is configured. The built-in store exists so the platform runs end to end out of the box, not to prescribe where real user data lives.
 
 ## Problem
 
@@ -181,9 +181,9 @@ separately is the point of this section.
 
 | Fact | What it is | Where it comes from | Use it for |
 |---|---|---|---|
-| **Calling principal** | which principal invoked `CreateChannel` | Chime `Channel.CreatedBy` | nothing here. It is **always the assistant**, because the bot is the acting bearer on every creation path |
+| **Calling principal** | which principal invoked `CreateChannel` | Amazon Chime SDK `Channel.CreatedBy` | nothing here. It is **always the assistant**, because the bot is the acting bearer on every creation path |
 | **Initiator** | the person whose action caused this conversation to exist | the request that triggered creation | attribution and audit. **Never** the onboarding gate |
-| **Participants** | who is in the conversation now, and how many | Chime channel membership | the onboarding gate, and how personal the welcome should be |
+| **Participants** | who is in the conversation now, and how many | Amazon Chime SDK channel membership | the onboarding gate, and how personal the welcome should be |
 | **Sender** | who wrote the turn being handled | `CHIME.sender.arn` on the turn | every per-turn per-user context read |
 
 **The gate keys on the participant, not the initiator.** The question the gate asks is "has the person I am
@@ -214,7 +214,7 @@ creation request already knew, ahead of creation, rather than by reading a store
 Two details for those later live reads, because both are easy to get wrong:
 
 - **`Channel.CreatedBy` is the assistant, not the person.** The bot creates the channel as the acting
-  bearer, so Chime's own creator field resolves to the bot ARN for every conversation on every path. It
+  bearer, so Amazon Chime SDK's own creator field resolves to the bot ARN for every conversation on every path. It
   answers "which principal called `CreateChannel`", which is not a question about the user.
 - **Reading the *sole* non-bot member is narrower than reading the *earliest*.** A sole-member read returns
   nothing as soon as a second person joins, so it silently stops resolving on any shared conversation. The
@@ -236,7 +236,7 @@ write something the welcome will need.
 
 So the participant context is written **before the conversation exists**:
 
-1. Derive the channel ARN. Chime channel ARNs are `{appInstance}/channel/{channelId}` and the caller
+1. Derive the channel ARN. Amazon Chime SDK channel ARNs are `{appInstance}/channel/{channelId}` and the caller
    supplies `channelId`, so the ARN is known before `CreateChannel` returns. Both creation paths already
    generate their own channel id, and the federated path already derives the ARN this way.
 2. Write the participant context to the server-only store under that ARN.

@@ -82,11 +82,6 @@ const ALLOWED: Record<string, string> = {
     + 'DESIGN-MULTI-AGENT-ORCHESTRATION leans on it twice for where per-assistant delegation config '
     + 'is declared, so the split it defines is load-bearing for a doc that IS published.',
 
-  'docs/guides/developer/METADATA-AND-TAGS.md::SPEC-CHANNEL-METADATA-MINIMIZATION':
-    'DELIBERATELY PRIVATE, and the citing sentence says so ("tracked internally until it ships"). The '
-    + 'document describes an unshipped confidentiality relocation and carries its own publish trigger: '
-    + 'release it once the relocation lands. File-scoped so a citation elsewhere, which would not carry '
-    + 'that caveat, still fails.',
 
   'docs/specs/applications/SPEC-ASSISTANT-MEETINGS.md::SPEC-ASSISTANT':
     'NOT A CITATION: the document\'s own H1 is "# SPEC-ASSISTANT: Meetings assistant", a title prefix '

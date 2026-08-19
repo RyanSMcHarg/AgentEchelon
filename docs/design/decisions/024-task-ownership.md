@@ -17,26 +17,30 @@ related:
   - "../../../backend/lib/stacks/foundations-stack.ts"
   - "../../../backend/lib/stacks/assistant-profile-stack.ts"
 tracking: |
-  ACCEPTED, NOTHING BUILT. Raised by the owner's task model: a task has a state and steps, is
-  assigned to a human or an assistant, the assignment can change per step, and it can be owned by
-  only one at a time. The current shape carries TWO ownership fields and enforces nothing. This
-  blocks the battle work: dropping `taskId` from the battle state row (DESIGN-BATTLE 2a, ADR-023)
-  requires a lookup for "the active task owned by this actor in this channel", which is the same
-  question for a duelling assistant and for a person holding a work item. D1, D3 and D4 are set: the
-  owner is the app-instance principal's unique id plus a stored type; ownership changes are entries
-  in the existing `stateHistory` log; a task is visible to its conversation's current members whatever
-  its owner, which needs a conversation-keyed index that exists in neither table; a task stores what
-  it requires of the message that started it - a bounded excerpt plus the user message id where one
-  can be had - rather than a verbatim transcript; and tasks stay in DynamoDB so every read works in
-  Athena mode. D2 is settled too: the mirror is re-partitioned by owner and stays a base table, which
-  is the only shape that keeps the strongly consistent duplicate-task guard. Nothing is blocked.
+  BUILT AND DEPLOYED (all eight migration steps; see "The migration"). New rows carry
+  `ownerId`/`ownerType` behind the single `setTaskOwner` writer, `createBattleTask` is deleted, the
+  battle state row carries no `taskId`, and `channelArn-updatedAt-index` is live. Raised by the
+  owner's task model: a task has a state and steps, is assigned to a human or an assistant, the
+  assignment can change per step, and it can be owned by only one at a time. The pre-migration shape
+  carried TWO ownership fields and enforced nothing, which blocked the battle work: dropping `taskId`
+  from the battle state row (DESIGN-BATTLE 2a, ADR-023) requires a lookup for "the active task owned
+  by this actor in this channel", the same question for a duelling assistant and for a person holding
+  a work item. Decisions: the owner is the app-instance principal's unique id plus a stored type;
+  ownership changes are entries in the existing `stateHistory` log; a task is visible to its
+  conversation's current members whatever its owner, via the conversation-keyed index; a task stores
+  what it requires of the message that started it - a bounded excerpt plus the user message id where
+  one can be had - rather than a verbatim transcript; tasks stay in DynamoDB so every read works in
+  Athena mode; and the mirror is re-partitioned by owner and stays a base table, the only shape that
+  keeps the strongly consistent duplicate-task guard. Remaining by decision: the Lex path leaves
+  `userMessageId` absent, and reassignment ships unwired.
 ---
 
 # ADR-024: One owner for a task, and the lookup that follows from it
 
 ## Status
 
-**All six decisions are set (owner, 2026-08-09). Nothing is built.**
+**All six decisions are set (owner, 2026-08-09), and the migration is built and deployed
+(2026-08-10; all eight steps, see "The migration").**
 
 | | Question | State |
 |---|---|---|
@@ -57,10 +61,13 @@ this can change depending on the step, but can only be owned by one at a time."*
 
 The current shape cannot express it, and the reason is structural rather than a missing check.
 
-### What exists today
+### What existed at decision time
+
+The shape below is the PRE-MIGRATION state this ADR was decided against; the migration has since
+replaced it (new rows carry `ownerId`/`ownerType`, and `createBattleTask` is deleted).
 
 Two tables, both defined in `foundations-stack.ts:63-100`, and all access to both is contained in
-`lib/task-tracking.ts` (verified: no other file under `backend/lambda/src` reads either table):
+`lib/task-tracking.ts` (verified at decision time: no other file under `backend/lambda/src` reads either table):
 
 | Table | Key | Indexes | Role |
 |---|---|---|---|
@@ -83,9 +90,13 @@ owned the task across it.
 
 ### Four things found while grounding this ADR
 
-Stated because a migration that does not address them ships reassignment broken. **Three of the four
-are latent rather than live**, and they are latent for one reason only: the single assignee-setting
-caller sets the assignee to the requester, so the two ids coincide.
+Stated because a migration that does not address them ships reassignment broken. **All four are since
+fixed by the migration**: findings 1 and 2 by the owner re-partition (one id to key on, migration step
+3), finding 3 by `reassignTask` replacing the uncalled `updateTaskAssignee` as a deliberate, tested,
+documented affordance (step 5), and finding 4 by `createBattleTask` collapsing into `createTask` with
+an assistant owner, so battle tasks enter the mirror. As found, **three of the four
+were latent rather than live**, and they were latent for one reason only: the single assignee-setting
+caller set the assignee to the requester, so the two ids coincided.
 
 1. **The mirror is partitioned by the REQUESTER at create and by the ASSIGNEE afterwards.**
    `createTask` writes the mirror row under `userArn`'s sub (`:275-277`) even when
@@ -189,7 +200,7 @@ is re-keyed - which is what a 200-day plan TTL demanded.
 
 **`ownerType` is still required, and it follows from the decision rather than qualifying it.** The
 unique id alone **cannot be turned back into an ARN**, because the ARN needs `/user/` or `/bot/` in
-its path, and an ARN is what every Chime call takes. It is not that inferring the type from the id
+its path, and an ARN is what every Amazon Chime SDK call takes. It is not that inferring the type from the id
 would be fragile; it is that the id does not contain the information at all. So the stored pair is
 `ownerId` (unique id, opaque) plus `ownerType` (`'user' | 'assistant'`), and the ARN is reconstructed
 as `${appInstanceArn}/user/${ownerId}` or `${appInstanceArn}/bot/${ownerId}`.
@@ -358,7 +369,7 @@ every member and the assistant could surface text from a message the user watche
 
 **A cascade is also impractical here, and for a concrete reason.** Following a redaction through to
 the task would mean finding the task from the redacted message, and there is no dependable mapping:
-on the router path `Task.messageId` holds the turn's **correlationId, not a Chime message id**
+on the router path `Task.messageId` holds the turn's **correlationId, not an Amazon Chime SDK message id**
 (`router-agent-handler.ts:1729-1731`), which is documented at the call site and is a correlation key
 by design. **D5 addresses the copy itself rather than the cascade**, and shrinks what is at stake
 here from a full transcript to a bounded excerpt.
@@ -409,7 +420,7 @@ it creates the task**, so storing it there is a field, not a mechanism.
 **On the ordinary Lex path it is absent in both places you would look, and that is the whole
 difficulty:**
 
-- The handler receives **exactly three request attributes** from Chime - channel arn, sender arn, lex
+- The handler receives **exactly three request attributes** from Amazon Chime SDK - channel arn, sender arn, lex
   platform - and the message id is not among them (`router-agent-handler.ts:1484-1486`). This is why
   `Task.messageId` holds a correlation id there: an absent input, not an oversight.
 - The processor does not have it either. Its `messageId` is the **assistant's placeholder**, which it
@@ -441,7 +452,7 @@ correlation key into a field readers will follow.
 
 - `correlationId` - always present, derived when it cannot be declared. What ties the task to the
   rest of its turn.
-- `userMessageId` - the resolvable Chime message id of the user's message, or absent. What a reader
+- `userMessageId` - the resolvable Amazon Chime SDK message id of the user's message, or absent. What a reader
   can actually follow back.
 
 A field named `messageId` that holds a correlation key on the path that creates most tasks will
@@ -632,7 +643,7 @@ a green suite stops meaning anything.
 | Invariant | The test that can fail |
 |---|---|
 | One owner at a time | Set an assistant owner on a task that has a human owner; assert the writer rejects it. Reintroduce a second ownership field and it must go red |
-| Owner type is not inferred from the id | Own a task with an id that looks like the other type (a `fed_` id, a bare sub); assert the type is read from `ownerType` alone, and that the ARN rebuilt for a Chime call takes its `/user/` or `/bot/` segment from it |
+| Owner type is not inferred from the id | Own a task with an id that looks like the other type (a `fed_` id, a bare sub); assert the type is read from `ownerType` alone, and that the ARN rebuilt for an Amazon Chime SDK call takes its `/user/` or `/bot/` segment from it |
 | An owner is a unique id, never an ARN | Assert a stored `ownerId` contains no `arn:` prefix and no path segments, including on a battle task backfilled from `assignedBotArn` |
 | A reassignment is not a state edge | Reassign without advancing; assert `stateHistory` gains an entry with `ownerFrom`/`ownerTo` and no `from`/`to`, that `taskState` is unchanged, and that **`turnsInState` is NOT cleared**. Route the append through the state path and the stall signal must go red |
 | A reassignment projects no edge | Assert the turn's `taskTransition` is absent, so `exchanges.task_transition` stays null and the L3 timeline shows no edge |

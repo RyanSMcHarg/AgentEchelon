@@ -21,7 +21,7 @@ tracking: |
 
 ## Status
 
-**Accepted (owner, 2026-08-14). Built and deployed to mcharg-dev. NOT verified live.**
+**Accepted (owner, 2026-08-14). Built and deployed to the dev deployment. NOT verified live.**
 
 `Verified by:` `test/lib/step-needs-are-checked.test.ts` (12 tests). Those assert the declarations, the
 validation, and that the rule reaches the model. They cannot assert that a model follows it, and no

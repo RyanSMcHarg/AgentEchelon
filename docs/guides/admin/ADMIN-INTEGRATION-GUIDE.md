@@ -35,8 +35,8 @@ The authorizers that gate the operator plane:
 | Analytics query (Athena) | `backend/lib/stacks/analytics-stack.ts` (`AnalyticsAuthorizer`) |
 | Analytics query (Aurora) | `backend/lib/stacks/analytics-stack-aurora.ts` |
 | User management | `backend/lib/stacks/cognito-auth-stack.ts` (`UserMgmtAuthorizer`) |
-| Admin conversations / administration | `backend/lib/stacks/cognito-auth-stack.ts` (`AdminConversationAuthorizer`) |
-| User feedback (admin GET summary) | `backend/lib/stacks/cognito-auth-stack.ts` |
+| Admin conversations / administration | `backend/lib/stacks/admin-plane-stack.ts` (`AdminConversationAuthorizer`) |
+| User feedback (admin GET summary) | `backend/lib/stacks/foundations-stack.ts` (the feedback API lives in FoundationsStack; only the table remains in the Cognito auth stack) |
 
 To host-own the admin plane you change **two things**: the *claim* that `requireAdmin()` trusts, and the *authorizer* (or front door) those endpoints sit behind. Pick one of the two approaches below for the front door.
 

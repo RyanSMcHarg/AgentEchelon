@@ -1,6 +1,6 @@
 # DESIGN: Battle Mode (`/battle`) - Technical Design
 
-**Status:** Implemented (premium-gated) **Layer:** Core platform (capability - a platform feature, not an interaction pillar; its MECHANISM lives here, its variant CONFIG is assistant-config, pillar 2) **Plane:** core **Product spec:** [SPEC-BATTLE.md](./SPEC-BATTLE.md)
+**Status:** Implemented. Gated by the profile's `battleEligible` flag (`backend/lib/config/profiles.ts`); premium is the only eligible profile out of the box. **Layer:** Core platform (capability - a platform feature, not an interaction pillar; its MECHANISM lives here, its variant CONFIG is assistant-config, pillar 2) **Plane:** core **Product spec:** [SPEC-BATTLE.md](./SPEC-BATTLE.md)
 
 **Coverage:** `e2e/battle.spec.ts`
 
@@ -42,6 +42,7 @@ Battle Mode is self-contained within AgentEchelon. The moving parts:
 - **`backend/lambda/src/channel-flow-processor.ts`** - detects `/battle`, gates on classification and battle-enablement, lists channel members, and hands the turn to the handler once per bot member. It decides WHO responds and passes the coordination context; it does not run the turn.
 - **`backend/lambda/src/lib/async-processor-core.ts`** - per-bot generation: assembles the system prompt with battle awareness, writes battle state, and handles the `NO_REBUTTAL` sentinel. The variant it serves is resolved on the ordinary turn path, not on a battle-specific one.
 - **`backend/lambda/src/battle-orchestrator.ts`** - fires round 2 once both sides reach round-1 completion.
+- **`backend/lambda/src/battle-alt-slot-handler.ts`** - Lex fulfillment for the alt-bot slots. A real turn addressed at an alt slot is handed to the classification's router (resolved at runtime from `/assistant/{classification}/router-arn`) with this slot's own identity attached. The identity comes from the battle state, not the Lex event (every slot shares one Lex bot/alias): the addressed slot is the active duel's single `WAITING_FOR_USER` alt side, and anything ambiguous degrades to silence rather than answering as a guessed identity. The router invoke is aborted at 25s so the degrade stays inside Lex's 30s code-hook window.
 - **`backend/lambda/src/lib/battle-state.ts`** - the state and config data layer (see below): `deriveBattleId`, `isBattleEnabled`, per-bot state transitions, the orchestrator claim, and continuation planning.
 - **`backend/lambda/src/lib/experiment-manager.ts`** - the A/B experiment schema and cache, extended with battle fields and the slot-to-variant resolvers.
 - **Frontend** (`frontend/packages/chat`, `frontend/packages/admin`) - marker parsing, round dividers, variant chips, the scorecard, the live tally, the admin arming form, and the per-step steps view.
@@ -134,10 +135,10 @@ the handler, and what remains is either unavoidable or named.
 
 | Divergence | Status | What it costs |
 |---|---|---|
-| The flow decides the turn happens, not Chime routing | **Unavoidable** | Nothing. `/battle` is not a Chime mention value, so nothing else can route it |
+| The flow decides the turn happens, not Amazon Chime SDK routing | **Unavoidable** | Nothing. `/battle` is not an Amazon Chime SDK mention value, so nothing else can route it |
 | The handler is TOLD which bot identity to answer as | **Unavoidable** | A duel needs two authors. Priced by validating the identity against the alt-slot roster instead of trusting the caller |
 | Round 2 has no user message behind it | **Unavoidable** | TTFF is undefined and must be null; those rows stay out of TTFF averages |
-| One rate-limit and spend charge for the duel, not one per side | **Deliberate** (owner, 2026-08-09) | Fidelity, traded knowingly: a rejection landing between the sides would leave one answer with nothing to compare against, which is measurement bias rather than a UX wrinkle |
+| One rate-limit and spend charge for the duel, not one per side | **Deliberate** (owner, 2026-08-09) | Fidelity, traded knowingly: a rejection landing between the sides would leave one answer with nothing to compare against, which is measurement bias rather than a UX wrinkle. Scoped to the flow-DECLARED duel only: a resumed side's turn synthesizes its battle context after the router's metered-upstream check and is metered like an ordinary turn |
 | **Round 2 dispatches the worker directly** | **Not aligned** | A rebuttal never classifies, so it cannot honour a profile's `classifierMode`, cannot join a classifier experiment, and carries a hardcoded delivery option. [ADR-023](../../design/decisions/023-battle-round-coordination.md) A-prime moves it to the handler entry |
 | **Battle correlation ids are minted, not derived** | **Not aligned** | The flow's duplicate-placeholder guard keys on the id, so it cannot collapse a duplicated battle delivery; the battle-state claims carry that alone ([ADR-022](../../design/decisions/022-message-identity-is-established-at-the-channel-flow.md) §4) |
 | **A duel-only way to ask the user something** | **Retiring** | Into task assignment, not repair ([ADR-029](../../design/decisions/029-clarification-is-public-and-answers-get-their-own-placeholder.md)) |
@@ -338,11 +339,11 @@ this is a privilege change to the component that runs on every turn, not a refac
 handler is read-only on channels" is a property worth naming before giving it up.
 
 It also needs the audience passed in: the handler cannot see the inbound message's `Target`
-(`router-agent-handler.ts:1915-1916`), which is why reply visibility is derived downstream from the
+(`router-agent-handler.ts`), which is why reply visibility is derived downstream from the
 placeholder's own `Target` rather than from anything the caller says.
 
 **The flow is NOT deciding targeting today, and on `@all` it sets no `Target` at all.** Both call
-sites of the mention path pass `broadcast: true` (`channel-flow-processor.ts:495`, `:1134`), so the
+sites of the mention path pass `broadcast: true` (`channel-flow-processor.ts`), so the
 placeholder is untargeted and the reply's tail stays public - which is the intended behaviour. The
 `broadcast: false` branch has no caller. The flow's only targeted sends are its OWN notices (the
 single-active-battle message, the unwired-router error), addressed to the sender.
@@ -419,7 +420,7 @@ Large `steps[]` arrays persist out of band in the message-analytics record keyed
 ## 4. APIs, Interfaces, and Markers
 
 **Endpoints** (existing admin/user-management API Gateway, Cognito-scoped, handled by `channel-battle.ts`):
-- `POST /channels/battle/enable` - body `{ channelArn, experimentId }`; validates battle-eligibility and classification/intent match, calls `CreateChannelMembership` with the alt-slot ARN, writes `ChannelBattleConfig`, posts an announce message. Premium-classification only; channel-moderator only.
+- `POST /channels/battle/enable` - body `{ channelArn, experimentId }`; validates battle-eligibility and classification/intent match, calls `CreateChannelMembership` with the alt-slot ARN, writes `ChannelBattleConfig`, posts an announce message. Battle-eligible classification only (`profile.battleEligible`); channel-moderator only.
 - `POST /channels/battle/disable` - body `{ channelArn }`; removes membership, deletes the config row, posts a leave message.
 - `GET /channels/battle?channelArn=...` - returns the config or 404.
 
@@ -481,7 +482,7 @@ Found while wiring the fan-out to the entry, and settled before the switch lande
 option is user-visible.
 
 The flow gates the duel **once**, before fanning out (`enforceAbuseGate`), and the handler gates every
-ordinary turn (`router-agent-handler.ts:1716`). A battle turn arriving at the handler must therefore
+ordinary turn (`evaluateAbuseGate` in `router-agent-handler.ts`). A battle turn arriving at the handler must therefore
 either skip that gate or add a second and third charge to a single user action.
 
 Two coherent answers, and they differ on what a duel *is*:
@@ -496,9 +497,12 @@ Two coherent answers, and they differ on what a duel *is*:
   comparison the feature exists for is gone. That needs its own handling - reject the duel as a
   whole, or present the missing side as a non-response, which is measurement bias in an experiment.
 
-**Decided: one user action, one gate (owner, 2026-08-09).** The handler skips its gate whenever a
-battle context is present (`router-agent-handler.ts:1710`), so the flow's single gate stands for the
-duel as a whole and a 2-bot duel consumes **one** rate/spend charge, not one per side. The deciding
+**Decided: one user action, one gate (owner, 2026-08-09).** The handler skips its gate only for a
+**declared** battle context - one that ARRIVED with the turn, meaning the flow already metered the
+duel upstream (`meteredUpstream` in `router-agent-handler.ts`) - so the flow's single gate stands for
+the duel as a whole and a 2-bot duel consumes **one** rate/spend charge, not one per side. A context
+SYNTHESIZED by a resumed side is created after that check: the resumed turn is an ordinary Lex turn
+no upstream ever gated, so it is metered here like any other turn. The deciding
 argument is the half-duel: a rejection landing between the sides leaves one answer with nothing to
 compare it against, and a rejected arm is indistinguishable in the results from an arm that answered
 badly, which is measurement bias in an experiment rather than a UX wrinkle. The accepted cost is one
@@ -509,13 +513,13 @@ the gate changes nothing about what gets charged. Here one user action is two tu
 
 **Round 2 is measured too, and it was not before.** The ratchet scanned the channel flow only, so the
 flow's count read as the whole remaining distance while `battle-orchestrator.ts` - a third way into
-the worker - went uncounted. It makes the same kind of decision the fan-out does, and three of its
+the worker - went uncounted. It makes the same kind of decision the fan-out does, and two of its
 own: it hardcodes `intent: 'general'` and `PLACEHOLDER_UPDATE` instead of letting the handler classify
 and select, which is the pair the `@all` handoff deleted from the flow and the reason a rebuttal
-cannot presently be anything but a placeholder update; and it pins the worker to **premium** while
-round 1 resolves it from the channel classification, so the two rounds of one duel resolve their
-worker by different rules. That is benign only while battle stays premium-gated, which is a gate and
-not a guarantee.
+cannot presently be anything but a placeholder update. The orchestrator resolves its processor from
+the DUEL'S classification (`getProcessorArnForClassification`, `battle-orchestrator.ts`), and its
+role grants `/assistant/*/processor-arn`, so both rounds of one duel resolve their worker by the same
+rule; the remaining round-2 divergence is the hardcoded intent and delivery pair above.
 
 - **The delivery option** was needed before dispatch only because the fan-out was choosing it. The
   handler already runs `selectDeliveryOption(intent, hasActiveTask)` and owns task creation.
@@ -567,8 +571,10 @@ The flow dispatches no worker on any path. `routerArnForClassification` is its o
    rejects every caller-supplied identity rather than waving it through. An unsanctioned ARN logs a
    security event and falls back to the classification's own bot, so the duel shows the wrong author -
    visible - rather than going silent.
-2. **Per-side gate charging: no.** The flow gates the duel once and the handler skips its gate on any
-   battle context, so a 2-bot duel consumes **one** rate/spend charge rather than one per side. Two
+2. **Per-side gate charging: no.** The flow gates the duel once and the handler skips its gate on a
+   flow-declared battle context (a context synthesized by a resumed side comes after the
+   metered-upstream check and meters itself like an ordinary turn), so a 2-bot duel consumes **one**
+   rate/spend charge rather than one per side. Two
    model calls are two turns, so this is a deliberate departure from fidelity: it buys the guarantee
    that a duel refuses or runs as a whole, because a rejection landing between the sides is
    measurement bias. See "How a duel is metered" above for the full argument, and §3.3 of MESSAGE-FLOW
@@ -585,8 +591,8 @@ The flow dispatches no worker on any path. `routerArnForClassification` is its o
    replaces it dispatches THROUGH this entry rather than re-implementing a turn, which turns
    `battle-orchestrator` from a turn-runner into a dispatcher. It can be removed **only once its
    degraded-path duties have a home**: it currently posts the "didn't finish in time" turn for every
-   stalled side (`postDidNotFinish`, `:417-434`, fanned out at `:266-269`) and closes a duel where
-   nobody finished (`:271-282`). The rendezvous
+   stalled side (`postDidNotFinish`, fanned out over the not-finished sides) and closes a duel where
+   nobody finished (the `closed:no-completion` path). The rendezvous
    design gave the first duty to the waiting side; with that design gone **both duties are back with
    the orchestrator**, which is an argument for keeping it as the dispatcher rather than removing it.
    A duel where both sides die has no owner in any option and remains an open gap.
@@ -670,14 +676,14 @@ An earlier round-1 constant carried its own copies of those rules - permission f
 
 - **Bounded bot growth.** Alt-bot slots are pre-provisioned at deploy time, not created per experiment. Runtime `chime:CreateAppInstanceBot` is avoided; growth is capped by `ALT_BOT_SLOT_COUNT`, and every slot ARN is statically known to Lex and handler resource policies. Raising the count is a CDK deploy, no schema change.
 - **Cost gate.** A battle is up to 4 model invocations (2 variants x 2 rounds). `/battle` requires a battle-eligible classification (premium by default), resolved from the immutable `classification` tag, plus the single-active-battle lock. Existing `bedrock-resilience.ts` retry and circuit-breaking apply unchanged.
-- **Authorization.** Enable/disable is channel-moderator only and premium-classification only. Addendum text is sanitized server-side and wrapped in a delimiter so the model treats it as a distinct authorial layer, with battle constraints appended last.
+- **Authorization.** Enable/disable is channel-moderator only and battle-eligible-classification only. Addendum text is sanitized server-side and wrapped in a delimiter so the model treats it as a distinct authorial layer, with battle constraints appended last.
 - **Image-output moderation** ships as a basic default guardrail; production-grade tuning is the deployer's documented responsibility (open-source posture), not an internal sign-off gate.
 
 ## 7. Testing
 
 Backend unit tests (`backend/test/lib/` and `backend/test/`):
 - `battle-state.test.ts` - id derivation, state transitions, `allBotsTerminal`, the orchestrator claim.
-- `battle-round1-complete.test.ts` - intent-aware round-1 completion.
+- `battle-round1-complete.test.ts` - pins the ABSENCE of task-coupled round completion: the task-terminality gate is gone and recording a side terminal consults no task (§2a).
 - `battle-orchestrator.test.ts` - pairs both completions, fires round 2 once.
 - `async-processor-battle.test.ts` - prompt assembly, `NO_REBUTTAL`, long-form.
 - `experiment-manager.battle.test.ts` - slot/variant resolution, validation.
@@ -685,7 +691,8 @@ Backend unit tests (`backend/test/lib/` and `backend/test/`):
 - `battle-task.test.ts`, `battle-task-delivery.test.ts` - `TASK_*` battles.
 - `battle-vision-plan.test.ts`, `vision-battle-action.test.ts`, `battle-generation-out-plan.test.ts`, `battle-attachment.test.ts` - image modes.
 - `battle-outcome.test.ts`, `battle-outcome-api.test.ts`, `analytics-metadata.battle.test.ts` - outcome record and analytics metadata.
-- `channel-battle.test.ts`, `battle-alt-slot-handler.test.ts` - the API handlers.
+- `channel-battle.test.ts` - the enable/disable/get-config API handler.
+- `battle-alt-slot-handler.test.ts` - the alt-slot Lex handler: identity resolved from the battle state's single waiting alt side, the router handoff, and silence on ambiguity.
 
 Frontend unit tests (`frontend/packages/`):
 - `chat/src/utils/battleTally.test.ts` - `computeBattleTally` aggregation.

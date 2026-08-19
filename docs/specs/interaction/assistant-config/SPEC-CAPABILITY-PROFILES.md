@@ -2,7 +2,7 @@
 
 **Status:** Implemented. Classifications and assistant profiles are deployment configuration (`backend/lib/config/profiles.ts`), and `backend/lib/profile-registry.ts` is the only module that interprets a classification value. The legacy constants this replaced (`VALID_TIERS`, `TIER_RANK`, `TIER_GROUPS`, `minTier`, `isAdvancedTier`) are deleted, and the per-tier stack files are consolidated into one parametrized `backend/lib/stacks/assistant-profile-stack.ts`.
 
-**Coverage:** `e2e/classification-context.spec.ts`, `e2e/profile-config.spec.ts`, `e2e/agent-intents.spec.ts`
+**Coverage:** `tests/e2e/classification-context.spec.ts`, `tests/e2e/profile-config.spec.ts`, `tests/e2e/agent-intents.spec.ts`
 
 **Verified by:** `backend/test/profile-registry.test.ts` (resolution, alias mapping, rank ordering, the min cap, group clearance and context scope, each against a non-default config so a hardcoded triple cannot satisfy it), `backend/test/cdk-synth.test.ts` (per-classification IAM statements are generated from the config's classification list, and each classification's context read excludes higher classifications), and `backend/test/classification-naming-ratchet.test.ts` (the vocabulary cannot regress: the list of files permitted to carry the old word may only shrink).
 
@@ -77,7 +77,7 @@ export interface ProfilesConfig {
 | Which classifications may this one read context from? | `scopeAtOrBelow`, `contextPrefixesAtOrBelow` |
 | Which assistant serves it? | `profileFor`, `profileByName` |
 
-The capability questions that used to be booleans read off the resolved profile: `classifierMode` chooses the keyword or LLM classifier, `rateLimitPerHour` replaces per-classification environment variables, and `battleEligible` replaces a deploy-time list of eligible classifications.
+The capability questions read off the resolved profile rather than standalone booleans: `classifierMode` chooses the keyword or LLM classifier, `rateLimitPerHour` lives on the profile (not a per-classification environment variable), and `battleEligible` lives on the profile (not a deploy-time list of eligible classifications).
 
 ## 4. Identity and IAM
 

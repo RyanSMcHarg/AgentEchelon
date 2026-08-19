@@ -18,8 +18,9 @@ none of which composes: `@all` (broadcast, every bot answers once, no turns), `/
 (exactly two bots, two rounds, scored), and a design-only delegate tool (a parent spawning
 ephemeral workers). All three converge on the same async processor, but nothing models them
 as one thing. Battle is the only built peer turn-taker, and it is hardcoded to two
-participants and two rounds, with its configuration resolved twice in two Lambdas, which is
-a live source of silent divergence.
+participants and two rounds. Round-1 configuration now resolves through the handler on the
+ordinary turn path; only the round-2 orchestrator still resolves its own configuration,
+which is the remaining source of silent divergence.
 
 The goal: one engine that runs N named assistant participants through a policy-driven
 sequence of turns, where battle, co-reply, round-robin discussion, and facilitated meetings
@@ -54,7 +55,9 @@ These constraints are authoritative and shape every phase below.
 - **Battle mode is scoped to the experiment's lifetime.** Battle stays on for as long as the
   owning experiment is running, unless the admin or experiment owner turns it off. It is a
   property of the experiment (`experiment.battleEnabled`), not a per-conversation toggle that
-  has to be re-enabled each time.
+  has to be re-enabled each time. **This is a proposed change**: as built, enablement is a
+  per-channel moderator toggle (`ChannelBattleConfig`, enabled and disabled per conversation)
+  layered on the experiment's `battleEnabled` flag.
 - **Scorecard is inline and terminal.** The scoring interface appears inline at the end of
   each battle rather than remaining persistently visible.
 - **Results are recorded as they are today** unless the refactor forces a change.
@@ -96,8 +99,9 @@ image-battle failure that motivated this redesign.
 | Meeting | N + a facilitator role | facilitator-driven ordering over an agenda | policy-defined | agenda, minutes |
 
 Battle stops being a feature and becomes the 2-participant, 2-phase, adversarial, scored
-preset. Its distinctive parts (the `BATTLE_CONSTRAINTS_ROUND1/2` prompts, the `battlestats`
-scorecard, the `NO_REBUTTAL` opt-out) are preset config, not engine mechanics.
+preset. Its distinctive parts (the battle awareness note and rebuttal guidance - the old
+`BATTLE_CONSTRAINTS_ROUND1/2` prompts are already deleted - the `battlestats` scorecard, the
+`NO_REBUTTAL` opt-out) are preset config, not engine mechanics.
 
 ## Battle delegates to the normal engine
 
@@ -110,11 +114,12 @@ coordination context it cannot derive itself: the shared `sessionId`, which vari
 (for a rebuttal turn) the transcript slice it is reacting to. The worker then runs the ordinary
 flow for that variant.
 
-This removes the class of bug this redesign was triggered by: today the fan-out resolves the
-image-model pair and display names while the worker independently re-resolves the battle
-variant, so a resolution that succeeds on one side and falls through on the other (for
-example, the fan-out Lambda missing the experiments-table grant) silently degrades to a text
-turn with no signal. When there is only one resolution path (the normal one, in the worker),
+This removes the class of bug this redesign was triggered by: the pre-handoff fan-out resolved
+the image-model pair and display names while the worker independently re-resolved the battle
+variant, so a resolution that succeeded on one side and fell through on the other (for
+example, the fan-out Lambda missing the experiments-table grant) silently degraded to a text
+turn with no signal. The round-1 handoff closed that instance; the round-2 orchestrator is the
+remaining one. When there is only one resolution path (the normal one, in the worker),
 there is nothing to diverge.
 
 ## Modality follows the profile, never the battle path
@@ -181,14 +186,16 @@ meeting is policy-driven. No component hardcodes a phase count.
 
 ## Phasing (battle keeps working throughout)
 
-1. **Route battle through the normal engine.** Replace battle's own model, prompt, and
-   modality resolution so each round-one turn is an ordinary request for that assistant (real
-   intent, real profile model, real tools), fanned out to both. The rebuttal round is the same
-   ordinary request with the rival's prior turn injected as the thing to respond to. Keep the
-   parallel race and the results recording as they are. Render the scorecard inline at the end.
-   The battle-specific `BATTLE_CONSTRAINTS_ROUND1/2` and the double variant resolution go away.
-   (Open detail: whether the two combatants are two variants of one profile or two distinct
-   assistant profiles is a configuration choice the engine supports either way.)
+1. **Route battle through the normal engine.** Largely done for round 1: the fan-out hands
+   each side to the handler as an ordinary request (real intent, real profile model, real
+   tools), and the battle-specific `BATTLE_CONSTRAINTS_ROUND1/2` are already deleted. The
+   parallel race, the results recording, and the inline scorecard stay as they are. What
+   remains of this phase is the round-2 orchestrator, which still runs its own turn logic
+   (hardcoded intent and delivery, its own variant resolution, a direct worker invoke) instead
+   of dispatching the rebuttal through the same handler entry with the rival's prior turn
+   injected as the thing to respond to. (Open detail: whether the two combatants are two
+   variants of one profile or two distinct assistant profiles is a configuration choice the
+   engine supports either way.)
 2. **Image generation as a normal capability.** Make image generation a first-class profile
    capability and intent on the normal engine, so any suitably configured assistant can produce
    an image on a normal request. Battle image prompts then work with no battle-specific image

@@ -12,13 +12,13 @@ date: 2026-06-13
 
 A team that has invested in customizing its assistant - its persona and its intent pack, the things that make it *their* assistant and not a generic bot - expects that configuration to stay put through routine operations. Silently reverting to "I'm an AI assistant without access..." because of an unrelated deploy is exactly the failure a user would not forgive. Keeping a configured assistant configured is the user problem this decision protects.
 
-The per-tier assistant **persona** and **intent pack** live in SSM (`${SSM_ROOT}/assistant/{tier}/assistant-{system-prompt,intent-pack}`) because a rich persona + pack exceed the Lambda 4 KB env cap (the processor/handler hydrate them by name at cold start).
+The per-tier assistant **persona** and **intent pack** live in SSM (`${SSM_ROOT}/assistant/{classification}/assistant-{system-prompt,intent-pack}`; at decision time the path segment was `{tier}`, renamed in the tier-to-classification migration) because a rich persona + pack exceed the Lambda 4 KB env cap (the processor/handler hydrate them by name at cold start).
 
 They were written by CFN-managed `ssm.StringParameter` constructs whose value came from `-c assistantSystemPrompt` / `-c assistantIntentPack`. This caused a production incident: a routine `cdk deploy` that **omitted** the context synthesised the parameter as `undefined` → CloudFormation **deleted** the param → the assistant silently fell back to the generic default ("I'm an AI assistant without access…"). Worse, after out-of-band churn CFN's recorded state still listed the param while the actual param was gone, so a re-deploy reported **"no changes"** and would not recreate it. There was also no safe operator path: a manual `aws ssm put-parameter` is reverted by the next deploy (CFN owns the value).
 
 ## Decision
 
-**Preserve-on-absent via a custom resource.** Each config param is written by an `AwsCustomResource` that:
+**Preserve-on-absent via a custom resource.** Each config param is written by an `AwsCustomResource` (today in `backend/lib/stacks/assistant-profile-stack.ts`; at decision time the writer lived in the per-tier stack) that:
 
 - `putParameter` (Overwrite) **only when a non-empty value is supplied** (`if (value.trim())`);
 - has **no `onDelete`** - so removing the writer (an empty-context deploy) **does not delete** the param. An existing persona is preserved across deploys that don't carry the context.
@@ -30,7 +30,7 @@ Kept: the **synth `addWarning`** when a `standard`/`premium` tier resolves an em
 
 ## Consequences
 
-- A deploy that omits the persona/pack context **can no longer blank** an existing config - the exact footgun is structurally removed (verified: the synthesized `<Instance>Tier-Standard` template has two `Custom::AWS` writers and **no `AWS::SSM::Parameter`** for persona/pack).
+- A deploy that omits the persona/pack context **can no longer blank** an existing config - the exact footgun is structurally removed (verified at decision time: the synthesized `<Instance>Tier-Standard` template had two `Custom::AWS` writers and **no `AWS::SSM::Parameter`** for persona/pack; after the tier-to-classification rename the writers synthesize in the assistant-profile stack).
 - A **changed** persona/pack re-PUTs reliably (hash in the physical id), so the drift "no changes" no-op is gone.
 - Least-privilege: each writer's policy is scoped to `ssm:PutParameter` on its own param ARN.
 - **Was open, now superseded:** the **operator no-deploy path** (set persona at runtime via the admin API/console) with **admin authz + audit**. Preserve-on-absent made the *deploy* path safe; the no-deploy path arrived with versioned profiles, where a persona is a field of a profile version edited through `manage-profiles` under the `manage-profiles` capability and audited per mutation ([`SPEC-PORTABLE-PROFILES.md`](../../specs/interaction/assistant-config/SPEC-PORTABLE-PROFILES.md)). The persona body itself lives in S3 there, not in the parameters below. Everything else in this decision - the per-deployment `assistant-{system-prompt,intent-pack}` parameters and their preserve-on-absent writers - is unchanged and remains the fallback seam.

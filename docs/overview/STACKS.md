@@ -30,14 +30,16 @@ what follows explains WHY each dependency exists.
 | # | Stack | Owns | Depends on |
 |---|---|---|---|
 | 1 | `ChimeMessaging` | The Amazon Chime SDK app instance, channel flow, messaging streaming config | - |
-| 2 | `CognitoAuth` | Identity ONLY: user pool, identity pool, per-clearance IAM roles, credential exchange, user management (Cognito-coupled by nature), the feedback TABLE | ChimeMessaging (app instance ARN) |
+| 2 | `CognitoAuth` | Identity ONLY: user pool, identity pool, per-classification Identity-Pool roles, credential exchange, user management (Cognito-coupled by nature), the feedback TABLE | ChimeMessaging (app instance ARN) |
 | 3 | `S3Storage` | Attachments bucket + presigned-URL API | ChimeMessaging, CognitoAuth |
 | 4 | `Foundations` | Shared always-on plane: task tables, per-user profile, channel context, abuse controls, create-conversation / add-agent, **user feedback API** | ChimeMessaging, CognitoAuth (pool for authorizer, feedback table by reference) |
 | 5 | `Experiments` | Experiments table + admin experiments API (**also hosts `/admin/profiles`** - see Known problems) | CognitoAuth |
-| 6 | `AnalyticsAthena` *or* `AnalyticsAurora` | Analytics/eval store + admin analytics API; Aurora mode adds the VPC, pgvector, the retrieval + drift **data-plane Lambda**, and the summary updater | CognitoAuth, Foundations |
-| 7 | `Battle` | `/battle` alt-slot Lex + battle state tables + battle APIs | ChimeMessaging, Foundations |
+| 6 | `Analytics` (Athena mode) *or* `AnalyticsAurora` | Analytics/eval store + admin analytics API; Aurora mode adds the VPC, pgvector, the retrieval + drift **data-plane Lambda**, and the summary updater | CognitoAuth, Foundations |
+| 7 | `Battle` | `/battle` alt-slot Lex + battle state tables + battle APIs | ChimeMessaging, CognitoAuth (API authorizer), Experiments (resolves the experiments SSM at deploy) |
 | 7b | `ChannelFlow` | The Amazon Chime SDK **channel flow** processor: intercepts messages in-flight for `@all` fan-out and `/battle` dispatch. Resolves the per-classification processors from the SSM contract at deploy rather than by stack import, so it does not hard-depend on the classification stacks | ChimeMessaging; optionally Battle (its tables are undefined when `/battle` is off) and Experiments |
+| 7c | `ImageGuardrail-{region}` | Conditional, one per region hosting an active image model outside the deploy region: the regional image-generation content guardrail (Bedrock guardrails are regional, so a cross-region image invoke needs a guardrail in the model's region) | - (the classification stacks reference its outputs cross-region) |
 | 8 | `Classification-{Basic,Standard,Premium}` | One per classification: Lex bot, AppInstanceBot, router handler, async processor, per-classification IAM | Most of the above |
+| 8b | `PostProcessing` | Unconditional, one consumer on the message stream: acts on messages delivery did not route (post-delivery correction, off the synchronous channel-flow path) | The analytics stack (its Kinesis stream), Foundations (SSM contract), the classification stacks (router ARNs via SSM) |
 | 9 | `AdminPlane` | Admin conversation read API | CognitoAuth, analytics |
 | 10 | `Notifications`, `AdminNotification` | Outbound email / admin alerting | CognitoAuth |
 | 11 | `Frontend`, `AdminFrontend` | The two CloudFront distributions + their S3 origins | - (consume outputs at build time) |

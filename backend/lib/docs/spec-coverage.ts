@@ -178,7 +178,10 @@ export function parseSpecDoc(repoRoot: string, specPath: string): SpecRecord {
   // still matched, still looked up, and still fails when it does not exist.
   const named = Array.from(body.matchAll(/`([^`]+)`/g))
     .map((m) => m[1].trim())
-    .filter((t) => /\.spec\.ts$/.test(t));
+    .filter((t) => /\.spec\.ts$/.test(t))
+    // Coverage lines write the repo-rooted `tests/e2e/...` form so a reader can open the path as
+    // written; the lookup key stays `tests/`-relative, so the prefix is normalized away here.
+    .map((t) => t.replace(/^tests\//, ''));
   return {
     path: specPath,
     title,

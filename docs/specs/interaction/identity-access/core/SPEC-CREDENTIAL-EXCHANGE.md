@@ -2,13 +2,13 @@
 
 **Status:** Implemented.
 
-**Coverage:** `e2e/credential-exchange.spec.ts`
+**Coverage:** `tests/e2e/credential-exchange.spec.ts`
 
 **Problem and who it's for:** A business wants every actor in a conversation - a tiered user, an external person from another identity provider, a guest, the assistant - to act at exactly their capability and only as themselves, whatever IdP it plugs in, without writing and trusting access-control logic in the frontend and per integration. The alternative is scattering that logic across the client and each IdP wiring, or trusting a product that cannot enforce it below the application. This is for the business plugging in any identity provider, every participant (provably un-spoofable and classification-capped), and the admin/operator who wants one credential chokepoint. It is a backend exchange that vends short-lived AWS credentials scoped by IAM to the caller's own validated identity at their capped classification, bearer-pinned so a client bug or routing mistake cannot exceed it.
 
 **Site section:** Interaction layer, Identity & Access pillar (core plane).
 
-**Related:** `docs/specs/interaction/SPEC-INTERACTION-LAYER.md` (the model) · `docs/specs/interaction/conversation-config/SPEC-CONVERSATION-TYPES.md` (sets the `classification` this enforces) · `docs/design/SPEC-FEDERATED-PARTICIPANTS.md` (external humans) · `docs/guides/user/IDENTITY-PROVIDER-GUIDE.md` (deployer guide - Approach 2 is this) · `docs/specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md` (the channel-join boundary) · AWS blog *"Integrate your Identity Provider with Amazon Chime SDK Messaging"* (June 2021) - the public token-vending pattern.
+**Related:** `docs/specs/interaction/SPEC-INTERACTION-LAYER.md` (the model) · `docs/specs/interaction/conversation-config/SPEC-CONVERSATION-TYPES.md` (sets the `classification` this enforces) · `docs/specs/interaction/identity-access/core/SPEC-FEDERATED-PARTICIPANTS.md` (external humans) · `docs/guides/user/IDENTITY-PROVIDER-GUIDE.md` (deployer guide - Approach 2 is this) · `docs/specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md` (the channel-join boundary) · AWS blog *"Integrate your Identity Provider with Amazon Chime SDK Messaging"* (June 2021) - the public token-vending pattern.
 
 ---
 

@@ -2,7 +2,7 @@
 
 **Status:** Partial (the `classification` type seam and the dimension/connector schemas ship and default to the profile today; the full conversation-type flexibility is the design target).
 
-**Coverage:** `e2e/classification-context.spec.ts`
+**Coverage:** `tests/e2e/classification-context.spec.ts`
 
 **Problem and who it's for:** A support case, a sales engagement, a scheduled service visit, and an incident room are all "a conversation," yet each needs different participants, assistant, transports, access, and external systems - and teams want to stand up and tailor each experience by configuration, not by writing and shipping new handler code (or a separate bespoke app) for every one. This is for the AI developer and admin/operator who add or tailor experiences by config. It captures that policy as data: a conversation type is the composition root that names which assistant, which access, which connectors, and which capabilities an experience gets, so handlers read dimension fields instead of branching on type.
 
@@ -92,15 +92,13 @@ The type is the composition root; the conversation (channel) is where it all mee
 
 ## 6. Connectors - integrate with the business's systems, don't replace them
 
-A **connector** is one integration to one external vendor (Salesforce, ServiceNow, Jira, AWS Support, PagerDuty, …). Broad per-vendor: one connector may implement several capabilities; the runtime consumes them generically (never `switch (vendor)`). Capabilities (open set):
+The Connectors pillar's owning contract is [`../connectors/SPEC-CONNECTORS.md`](../connectors/SPEC-CONNECTORS.md) - what a connector is, declaration as config, read-live-don't-duplicate, per-tenant credential isolation, governed MCP as the intended vehicle, and lenient resolution. This section is the summary the composition root needs, because the conversation type is what declares them:
 
-- **`resolveParticipant`** - turn "bring in a human" into a concrete identity via the vendor's router/assignment (the platform does **not** reimplement routing - it calls the vendor's API + existing AWS event integrations). The resolved person is admitted at the channel's classification.
-- **`syncRecord`** - create/update/read a ticket/case/work-order and attach the transcript; rides a normalized, vendor-neutral `PlatformEvent` taxonomy on an EventBridge bus, idempotent by `eventId`.
-- **`fetchContext`** - read external/observability data into the conversation (e.g. CloudWatch/CloudTrail).
-- **`provideComms`** - supply a non-chat transport (voice/SMS via a pluggable provider, Amazon Chime SDK Meetings); artifacts summarize back into the hub (§4b).
-- **`ingest`** - inbound mirror (a vendor webhook → platform actions), signature-verified.
+- A **connector** is one integration to one external vendor (Salesforce, ServiceNow, Jira, AWS Support, PagerDuty, …), broad per-vendor: one connector may implement several capabilities, and the runtime consumes them generically (never `switch (vendor)`).
+- A conversation **type** declares available connectors (`ConnectorRef`); a conversation **instance** holds the live bindings (`ExternalRef` - the specific case/call).
+- Externally resolved humans (`resolveParticipant`, via the vendor's own router/assignment - the platform never reimplements routing) are admitted at the channel's classification: connectors feed admission, never bypass it.
 
-A conversation **type** declares available connectors (`ConnectorRef`); a conversation **instance** holds the live bindings (`ExternalRef` - the specific case/call). **Security:** per-vendor, **per-tenant** credential isolation in Secrets Manager (`connector/{tenantId}/{connectorId}`) with scoped IAM - one tenant's connector run cannot read another's secret; outbound actions (dial, open case, dispatch) are audited; externally resolved humans are admitted under the **same** classification (connectors feed admission, never bypass it).
+Two capability details recorded here beyond the owning contract's list: **`syncRecord`** rides a normalized, vendor-neutral `PlatformEvent` taxonomy on an EventBridge bus, idempotent by `eventId`; **`ingest`** is the inbound mirror (a vendor webhook → platform actions), signature-verified. `fetchContext` reads external/observability data (e.g. CloudWatch/CloudTrail) into the conversation; `provideComms` supplies a non-chat transport (voice/SMS via a pluggable provider, Amazon Chime SDK Meetings) whose artifacts summarize back into the hub (§4b).
 
 ## 7. Security & forward-compatibility (what must stay true as it grows)
 

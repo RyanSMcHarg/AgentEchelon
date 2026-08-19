@@ -134,8 +134,8 @@ resolved from the profile version the turn loaded; what differs is which compone
 ```
   ENTRY SHAPE             DECIDES A TURN       POSTS THE FIRST BUBBLE          ITS Target
   ──────────────────────  ───────────────────  ──────────────────────────────  ───────────────
-  ordinary Lex turn       Chime routing        Amazon Chime SDK, from the      the inbound's
-   1:1, or @<assistant>    (InvokedBy)          fulfillment return              SENDER
+  ordinary Lex turn       Amazon Chime SDK     Amazon Chime SDK, from the      the inbound's
+   1:1, or @<assistant>    routing (InvokedBy)  fulfillment return              SENDER
 
   drift-spawned welcome   Lex WelcomeIntent    Amazon Chime SDK; the welcome   none, broadcast
    only when spawned                            IS the placeholder
@@ -265,7 +265,7 @@ is debugging something else.
 | Difference | Why it is unavoidable | What it costs |
 |---|---|---|
 | The assistant posts its own placeholder, not Lex | A bypass has no Lex return to materialise, and the words are the assistant's ([ADR-025](../../design/decisions/025-who-posts-the-placeholder.md)) | Nothing to measurement: TTFF is placeholder minus user message on the Amazon Chime SDK clock, which does not care who wrote it. This holds for round 1 and the clarification continuation, which dispatch through the handler. Round 2 still has its placeholder and its degraded-path notices posted by the orchestrator, because it does not yet dispatch through the entry (ADR-023 A-prime) |
-| One user message, N responding assistants | That is the feature | **One** rate-limit and spend charge, not N. The flow gates the duel as a whole and the handler skips its gate on any battle context, so a duel refuses or runs together; a rejection landing between the sides would leave one answer with nothing to compare it against, which is measurement bias. Fidelity is deliberately traded for that guarantee (owner, 2026-08-09) |
+| One user message, N responding assistants | That is the feature | **One** rate-limit and spend charge, not N. The flow gates the duel as a whole, and the handler skips its own gate only for a flow-DECLARED `battleContext` - a turn that arrives with one was already metered upstream. A resumed side that SYNTHESIZES its battle context mid-turn is the opposite case: an ordinary Lex turn no upstream gated, so the router meters it like any other turn (`meteredUpstream`, `router-agent-handler.ts`). So a duel refuses or runs together; a rejection landing between the sides would leave one answer with nothing to compare it against, which is measurement bias. Fidelity is deliberately traded for that guarantee |
 | Round 2 is fired by the orchestrator, not a user | A rebuttal answers a rival, not a person | No user message to measure from, so **TTFF is undefined and must be null, not zero**; these rows carry a non-user trigger and stay out of TTFF averages |
 | Coordination context rides the turn (`battleContext`) | A side cannot derive its own battle id, round, rival or which variant it is | None to resolution - the side still resolves its model, persona and tools on the ordinary path; the context only tells it *which* side it is |
 | Each side answers as its own bot identity | The duel must show two authors | The handler is told which identity to answer as rather than resolving its own, so that identity has to be **validated against the alt-slot roster** rather than trusted from the caller |
@@ -297,7 +297,7 @@ Lex dialog code hook ──► Fulfillment handler (tier-pinned)
    │                                         user has not onboarded before, start the once-per-user
    │                                         intake instead; see GUIDE-ASSISTANT-CONTEXT.md)
    └─ FallbackIntent (a real user turn):
-        1. Resolve tier   = min(userTier, channelTier)   ← downgrade enforcement
+        1. Resolve effectiveClassification = min(callerClearance, channelClassification)   ← downgrade enforcement
         2. Classify intent (separate Haiku classifier; configurable)
         3. Resolve model  (tier default → intent → A/B experiment override)
         4. (Aurora mode) Retrieval + drift: invoke the data-plane Lambda (skips trivial intents)
@@ -406,7 +406,7 @@ identifier, and where identity comes from) and
 
 | Shape | Who performs the send | When, relative to the worker dispatch |
 |---|---|---|
-| ordinary Lex turn | Amazon Chime SDK, from the fulfillment return | after: the handler dispatches, returns, and Chime materialises |
+| ordinary Lex turn | Amazon Chime SDK, from the fulfillment return | after: the handler dispatches, returns, and Amazon Chime SDK materialises |
 | drift-spawned welcome | Amazon Chime SDK; the welcome IS the placeholder, and the answer updates it in place under `messagePrefix` so the orientation copy survives | after |
 | `@all` | the turn handler, as the assistant (`postAsAssistant`) | after: `runTurn` dispatches, then the entry wrapper sends |
 | `/battle` round 1 | the turn handler, once per side, each as its own bot identity | after |
@@ -529,20 +529,20 @@ user message, and only one of them remains:
 
 - **Two ENTRIES, now fixed at the root.** `@all` used to take the flow bypass at every channel size
   while Lex also invoked the handler in a 1:1, so one message was handled twice - and because the two
-  entries derive the id by different rules, neither claim could see the collision. Measured 2026-08-12:
+  entries derive the id by different rules, neither claim could see the collision. Measured live:
   two placeholders 558ms apart, one stranded forever. The member-count branch (`lib/channel-size.ts`)
   makes the two decisions exact complements, so exactly ONE entry runs at any size.
-- **Two FULFILLMENTS of one entry, which remains.** Measured 2026-08-06: one turn in 52 over 24 hours
+- **Two FULFILLMENTS of one entry, which remains.** Measured live: one turn in 52 over 24 hours
   produced two fulfillments 2.6s apart carrying a byte-identical transcript. The cause is not
   established, it is not a response-time retry (a 4222ms turn did not duplicate while a 3055ms one did),
   and nothing in this codebase invokes the handler - Lex does. That shape is what at-least-once delivery
   looks like.
 
 So the `dedup#fulfil-` claim is insurance against a rare platform behaviour, not a control the ordinary
-path leans on. Over the 7 days to 2026-08-13 the deployed flow logged **0** duplicate-placeholder
+path leans on. Over a measured 7-day window the deployed flow logged **0** duplicate-placeholder
 denials across 736 invocations. Separating "Lex asked twice" from "our code ran the turn twice" needs
-the Lex conversation logs, which are on for every classification as of 2026-08-13; that measurement is
-owed rather than done.
+the Lex conversation logs, which are enabled for every classification; that separation is not yet
+measured.
 
 #### Known limits
 
@@ -592,7 +592,7 @@ Mapping the flow onto the defense-in-depth layers ([IDENTITY-AND-ACCESS-MODEL §
 |---|---|---|
 | User's `SendChannelMessage` | **IAM + `classification` tag** (on the user's exchange-vended, bearer-pinned creds) | The user can only send in a channel of their tier-and-below; fail-closed |
 | Channel Flow Processor (every message) | **Channel flow** | Conversation-level handling/idempotency; runs even with no assistant |
-| Fulfillment handler | **`min(userTier, channelTier)`** | A lower-tier user in a higher-tier room is downgraded (+ security-event log) |
+| Fulfillment handler | **`min(callerClearance, channelClassification)`** (the effectiveClassification) | A lower-clearance user in a higher-classification room is downgraded (+ security-event log) |
 | Async processor - **before** the model call | **Guardrail `source:'INPUT'`** | Prompt-injection (`PROMPT_ATTACK`) + input content filters; blocks before tokens spent |
 | Async processor - model + context read | **Per-tier S3 IAM** (`context/{classification}/`) | The assistant reads only its tier's context (and the sender's own attachment) |
 | Async processor - **after** the model call | **Guardrail `source:'OUTPUT'`** | PII anonymize/block, content filters, metadata-marker masking |
@@ -609,8 +609,8 @@ Every hop leaves a trace. The join across them (intent × model × experiment ×
 |---|---|---|
 | User's send (surface) | client events - optimistic render, UI actions, timing | `client_events` table (Aurora mode) |
 | Channel flow / Lex entry | routed? mention type, selected **delivery mode** | archive event + message metadata |
-| Fulfillment handler | resolved tier `min(userTier,channelTier)`, classified **intent**, chosen **model**, **experiment assignment** (variant vs `deterministic`) | coded message metadata + analytics record |
-| `min(tier)` downgrade | `[SecurityEvent]` when a lower-tier user is in a higher-tier room | logs / security-event trail |
+| Fulfillment handler | resolved effectiveClassification `min(callerClearance, channelClassification)`, classified **intent**, chosen **model**, **experiment assignment** (variant vs `deterministic`) | coded message metadata + analytics record |
+| effectiveClassification downgrade | `[SecurityEvent]` when a lower-clearance user is in a higher-classification room | logs / security-event trail |
 | Async processor - **per Converse step** | one `ConverseStep` per tool-loop iteration: model, tokens in/out, step latency, **estimated cost** (`estCostUsd`), and structured per-tool outcomes `tools[]` (name, ok, bounded `errorClass`, no payloads/PII) | out-of-band analytics, keyed by message id |
 | Async processor - reply | totals: input/output tokens, Bedrock time, guardrail action, config fingerprint | `MESSAGE_ANALYTICS_TABLE` (out-of-band, keyed by message id, 7-day TTL) |
 | Every channel event | full event stream (message/redact/membership/channel) | Kinesis → conversation archive (Athena/Aurora) |
@@ -643,7 +643,7 @@ measurement ride the same path**, so every enforced decision is also a recorded,
 | File | Role in the flow |
 |---|---|
 | `backend/lambda/src/channel-flow-processor.ts` | Channel flow: runs first on every message; decides WHO responds - the `@all` and `/battle` Lex bypasses (§3.1) - plus notify directives and idempotency |
-| `backend/lambda/src/router-agent-handler.ts` | The turn handler: `min(tier)`, intent classification, model resolution, delivery selection, dispatch. Reached through Lex fulfillment on an ordinary turn, and the intended entry for a bypass too (§3.1) |
+| `backend/lambda/src/router-agent-handler.ts` | The turn handler: `min(callerClearance, channelClassification)`, intent classification, model resolution, delivery selection, dispatch. Reached through Lex fulfillment on an ordinary turn, and the intended entry for a bypass too (§3.1) |
 | `backend/lambda/src/assistant-async-processor.ts` | The shared model-turn processor (one instance per profile, profile-pinned via env) |
 | `backend/lambda/src/lib/async-processor-core.ts` | The Converse tool loop, `applyInputGuardrail`/`applyOutputGuardrail`, `handleLongResponse` |
 | `backend/lambda/src/lib/intent-classifier.ts` | The separate request-category classifier |
@@ -677,7 +677,7 @@ no Lex in it has no envelope to return. What is left:
   requires Lex to be invoked on a message the flow is also bypassing, which the size branch is designed
   to prevent; it is a defensive complement rather than an expected path.
 
-**Measured, 7 days to 2026-08-13, on the deployed flow:** 736 invocations, **0** empty-envelope drops.
+**Measured over a 7-day window on the deployed flow:** 736 invocations, **0** empty-envelope drops.
 The control is 2 `carrying Lex envelope` unwraps in the same window and the same code block, so the
 zero means the case did not arise, not that the code was absent.
 
@@ -685,7 +685,7 @@ zero means the case did not arise, not that the code was absent.
 upstream returned nothing when it should have returned a placeholder. It is worth alarming on for that
 reason, and worth reading as a defect rather than as noise.
 
-## Appendix A. Where to put a rule: the critical path, or after it
+## Appendix B. Where to put a rule: the critical path, or after it
 
 Full reasoning in [ADR-032](../../design/decisions/032-where-a-rule-runs.md). Stated here because this
 is the document someone reads before adding to the flow, and the pull to add to it is constant: it is
@@ -727,7 +727,7 @@ and someone can close it.
 
 ### What the flow can and cannot see, which decides where a rule CAN live
 
-Measured 2026-08-14. The asymmetry is not obvious and has been re-derived more than once:
+Measured against a live deployment. The asymmetry is not obvious and has been re-derived more than once:
 
 | Field | The channel flow | The Kinesis stream |
 |---|---|---|

@@ -7,7 +7,7 @@
 Two deployment modes have very different cost shapes:
 
 - **Athena mode (default):** almost nothing runs at rest. Analytics is pay-per-query (Athena scans S3). There is no Aurora cluster, no RDS Proxy, no VPC interface endpoints. Retrieval (RAG), live drift, and the conversation summary are **not available** in this mode.
-- **Aurora mode:** an Aurora Serverless v2 cluster (with pgvector) backs RAG, drift, the summary store, and evaluation. This adds an hourly baseline (cluster, proxy, endpoints) in exchange for the retrieval and drift capabilities. See [`AURORA-MODE-GUIDE.md`](AURORA-MODE-GUIDE.md) and [`SPEC-AURORA-VPC-MODE.md`](../../specs/ops/SPEC-AURORA-VPC-MODE.md).
+- **Aurora mode:** an Aurora Serverless v2 cluster (with pgvector) backs RAG, drift, the summary store, and evaluation. This adds an hourly baseline (cluster, endpoints, and the RDS Proxy when enabled) in exchange for the retrieval and drift capabilities. See [`AURORA-MODE-GUIDE.md`](AURORA-MODE-GUIDE.md) and [`SPEC-AURORA-VPC-MODE.md`](../../specs/ops/SPEC-AURORA-VPC-MODE.md).
 
 ---
 
@@ -61,7 +61,7 @@ RAG retrieval and live drift both need to reach Aurora (pgvector) and Bedrock (e
 
 | Item | Effect | Est. monthly |
 |---|---|---|
-| New endpoints required | None. The data-plane Lambda uses the **existing** Bedrock + Secrets Manager interface endpoints and the in-VPC Aurora proxy. | **$0** |
+| New endpoints required | None. The data-plane Lambda uses the **existing** Bedrock + Secrets Manager interface endpoints and the in-VPC Aurora writer endpoint (or proxy when enabled). | **$0** |
 | Data-plane Lambda invocations | One synchronous invoke per non-trivial turn (retrieve, and drift when enabled). | **< $1**, usage-driven |
 | Added latency | One warm Lambda-to-Lambda hop (~10 to 50 ms) per non-trivial turn. | n/a |
 

@@ -81,16 +81,16 @@ The async processors get the state table name via env and update `lastActivityAt
 
 ## What keeps the cluster awake, and why sleeping alone may not save much
 
-**Measured on mcharg-dev, 2026-08-14.** Sleep pauses Aurora; it does not stop anything that connects to
+**Measured on the reference deployment.** Sleep pauses Aurora; it does not stop anything that connects to
 Aurora. Four scheduled jobs do, on these cadences:
 
 | Rule | Cadence | Touches Aurora |
 |---|---|---|
 | Abandonment detector | **every 5 minutes** | yes |
 | Summary updater | every 30 minutes | yes |
-| Daily evaluation | every 30 minutes | yes |
+| Evaluation runner (the construct name `DailyEvaluationSchedule` is historical) | every 30 minutes | yes |
 | Admin conversation sync | every 15 minutes | yes |
-| Membership audit | every 6 hours | Chime |
+| Membership audit | every 6 hours | Amazon Chime SDK |
 | Proactive briefing | daily | may invoke the model |
 
 A connection scales the cluster back up, so on a deployment with these schedules enabled the minimum

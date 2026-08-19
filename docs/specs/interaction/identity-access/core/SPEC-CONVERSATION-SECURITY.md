@@ -2,7 +2,7 @@
 
 **Status:** Implemented (Layers 1-6 are live; Layer 7 mixed-trust visibility is partial).
 
-**Coverage:** `e2e/classification-context.spec.ts`, `e2e/mentions.spec.ts`, `e2e/credential-exchange.spec.ts`
+**Coverage:** `tests/e2e/classification-context.spec.ts`, `tests/e2e/mentions.spec.ts`, `tests/e2e/credential-exchange.spec.ts`
 
 **Verified by:** `backend/test/cdk-synth.test.ts` asserts the SYNTHESIZED IAM policy, so a widened boundary fails the build. Layer 1 (describe 'Layer 1 - per-tier fail-closed channel-tag allow'): each tier's channel actions are ALLOWed only on `aws:ResourceTag/classification` in {its tier and below}, with no unconditioned `SendChannelMessage` reaching channel resources (untagged/higher-tier channels match no Allow and are implicitly denied). Layer 4 / §7 (describe 'Layer 4 / §7 - IAM resource boundaries (deny-by-absence...)'): each classification's S3 `context/` read EXCLUDES higher classifications; the channel-context store is router `GetItem`-only and referenced by no Cognito/Identity-Pool role; and `bedrock:ApplyGuardrail` is scoped to in-stack provisioned guardrails, never `*`.
 
@@ -97,9 +97,9 @@ aws chime create-channel \
 
 ### IAM Policy Conditions: fail-closed ALLOW
 
-> **Two properties of this enforcement design - see `agent-classification-common.classificationChannelScopedAllow`:** 1. **Condition key is the GLOBAL `aws:ResourceTag/classification`, NOT `chime:ResourceTag`.** Amazon Chime exposes **no service-specific condition keys**, so `chime:ResourceTag/...` never exists in the request context and any condition on it silently no-ops (a basic member could still send into a premium channel). The global `aws:ResourceTag` IS populated for the tag-aware channel actions. 2. **Channel-message actions authorize against TWO resources** - the **channel** AND the caller's **bearer identity** (`.../user/<id>` or `.../bot/<id>`). The `classification` tag only exists on the channel, so the boundary is the *channel-resource* grant; the *bearer-resource* grant must be unconditioned (Amazon Chime SDK restricts the bearer to the caller's own identity, so it widens nothing).
+> **Two properties of this enforcement design - see `agent-classification-common.classificationChannelScopedAllow`:** 1. **Condition key is the GLOBAL `aws:ResourceTag/classification`, NOT `chime:ResourceTag`.** Amazon Chime SDK exposes **no service-specific condition keys**, so `chime:ResourceTag/...` never exists in the request context and any condition on it silently no-ops (a basic member could still send into a premium channel). The global `aws:ResourceTag` IS populated for the tag-aware channel actions. 2. **Channel-message actions authorize against TWO resources** - the **channel** AND the caller's **bearer identity** (`.../user/<id>` or `.../bot/<id>`). The `classification` tag only exists on the channel, so the boundary is the *channel-resource* grant; the *bearer-resource* grant must be unconditioned (Amazon Chime SDK restricts the bearer to the caller's own identity, so it widens nothing).
 
-We use **ALLOW**, not Deny, because **allow fails CLOSED**: a tier identity is granted the channel action ONLY when the channel's `classification` ∈ {its tier and below}; an **untagged** or higher-tier channel matches no grant → implicit deny. (A deny-on-higher fails OPEN on untagged/legacy channels - a real hole.)
+The enforcement uses **ALLOW**, not Deny, because **allow fails CLOSED**: a tier identity is granted the channel action ONLY when the channel's `classification` ∈ {its tier and below}; an **untagged** or higher-tier channel matches no grant → implicit deny. (A deny-on-higher fails OPEN on untagged/legacy channels - a real hole.)
 
 ```jsonc
 // Per-tier role - TWO statements per the resource split:
@@ -309,8 +309,8 @@ What holds today:
 
 - **Document retrieval** (`document-retrieval.ts`) appends `AND metadata->>'classification' = ANY($3)`, where the scope is `profiles.scopeAtOrBelow(classification)`. It is fail-closed for untagged rows, and it refuses to run with an empty scope rather than defaulting to one.
 - **The classification of a chunk is asserted at ingest** by its S3 key (`rag/{sourceType}/{classification}/…`, `document-ingestion.ts`), defaulting to the most restrictive classification when absent. Fail-closed protects against omission; it does not protect against content written under the wrong classification.
-- **Conversation summaries** (`summary_embeddings`) now carry a classification column, and drift's two reads run as the channel's reader role. Membership scoping is unchanged and still applies: the live intersection of all human members' Chime memberships (`scoped-channels.ts`, `SearchChannels … MEMBERS INCLUDES`, no archive fallback, empty scope ⇒ suggest nothing). The two bound different things and neither subsumes the other - membership bounds *the people*, classification bounds *the channel* - so both are applied. This closes the case where two premium-cleared people talking in a basic channel let drift point from that basic channel at a premium one.
-  - The classification is resolved from the Amazon Chime SDK channel tag **outside** the VPC, because nothing that can reach Aurora can reach Chime (`natGateways: 0`, and no Chime endpoint), and lands in `channel_classification` as a projection - never an authority (ADR-012). A summary written for a channel that projection has never heard of is stamped with the **most restrictive** classification, so the failure withholds rather than leaks.
+- **Conversation summaries** (`summary_embeddings`) carry a classification column, and drift's two reads run as the channel's reader role. Membership scoping also applies: the live intersection of all human members' Amazon Chime SDK memberships (`scoped-channels.ts`, `SearchChannels … MEMBERS INCLUDES`, no archive fallback, empty scope ⇒ suggest nothing). The two bound different things and neither subsumes the other - membership bounds *the people*, classification bounds *the channel* - so both are applied. This closes the case where two premium-cleared people talking in a basic channel let drift point from that basic channel at a premium one.
+  - The classification is resolved from the Amazon Chime SDK channel tag **outside** the VPC, because nothing that can reach Aurora can reach Amazon Chime SDK Messaging (`natGateways: 0`, and no Amazon Chime SDK endpoint), and lands in `channel_classification` as a projection - never an authority (ADR-012). A summary written for a channel that projection has never heard of is stamped with the **most restrictive** classification, so the failure withholds rather than leaks.
 
 **Why this is a named layer rather than a footnote to Layer 4.** Every other classification boundary in this document survives a wrongly written query, because the principal lacks the permission. Until ADR-028 this one did not: one database identity (`db-client.ts` `DB_USER`) could read every row, and the protection was that the filter had been written correctly at every call site that would ever exist. A leak here looks like a normal answer.
 
@@ -381,11 +381,11 @@ The membership audit catches over-tier MEMBERSHIPS regardless of how they were i
 The first six layers isolate *tiers* of internal users. Layer 7 governs a different shape: an **external guest** (a federated or routed human) sharing one channel with **internal** members, for example AWS Support dialed into an incident triage room or a routed support agent on a customer case. The guest must see only what is meant for them, never the internal back-channel. This is the layer that applies when an external-guest use case runs: a routed support agent, AWS Support, or a customer alongside internal responders.
 
 **The visibility model:**
-- The external guest is admitted at a **capped classification** (`min(idpGroupCeiling, channel)`, `docs/design/SPEC-FEDERATED-PARTICIPANTS.md`) **and** scoped to that one channel (membership pin) - Layers 1/2/6 as today.
+- The external guest is admitted at a **capped classification** (`min(idpGroupCeiling, channel)`, `docs/specs/interaction/identity-access/core/SPEC-FEDERATED-PARTICIPANTS.md`) **and** scoped to that one channel (membership pin) - Layers 1/2/6 as today.
 - **On top of that, a per-message visibility gate:** every message is either **targeted** (internal-only) or **broadcast** (guest-visible); the external guest is **broadcast-only**. Internal context (including `fetchContext`/dashboard data, D9) stays targeted.
 - The assistant is the gate (it chooses targeted vs broadcast based on content sensitivity), riding **Amazon Chime SDK targeted messaging** (`Target=[…]`) - the *mechanism exists today*; the missing piece is the **policy + discipline**: a single wrong broadcast leaks internal context to the external party.
 
-**Why a distinct layer:** the existing layers gate *which channels* a principal can touch and at *what tier* - they do **not** gate *within a channel* between a broadcast and a targeted message when trust levels are mixed. This is the new gate. The federated-guest admission model is in `docs/design/SPEC-FEDERATED-PARTICIPANTS.md`.
+**Why a distinct layer:** the existing layers gate *which channels* a principal can touch and at *what tier* - they do **not** gate *within a channel* between a broadcast and a targeted message when trust levels are mixed. This is the new gate. The federated-guest admission model is in `docs/specs/interaction/identity-access/core/SPEC-FEDERATED-PARTICIPANTS.md`.
 
 ## 10. HIDDEN Membership and Restricted Operations
 
@@ -514,13 +514,13 @@ The assistant embeds machine-readable control markers in a message's Content so 
 | Component | Change |
 |-----------|--------|
 | `create-conversation/index.js` | Set `classification` in metadata AND channel tag |
-| `manage-conversation.ts` | Read metadata, validate tier before `CreateChannelMembership` |
-| `share-conversation/index.js` | Read metadata, validate recipient tier |
+| `src/conversation-management.ts` | Moderator archive / member removal / self-leave, authorized per operation server-side |
+| `share-conversation/index.js` | Read the immutable `classification` tag, validate recipient tier before `CreateChannelMembership` |
 | `agent-classification-common.ts` / `*-classification-stack.ts` / `cognito-auth-stack.ts` | The enforced tag-gate is `classificationChannelScopedAllow` (fail-closed **Allow** on the global `aws:ResourceTag/classification`) attached to the exchange rung roles + per-profile assistant roles. |
 | `cognito-auth-stack.ts` | Define per-tier Cognito groups; mirror `custom:tier` into the matching group at post-confirmation |
 | `assistant-profile-stack.ts` | Per-profile processor IAM roles with S3 prefix scoping (prefixes generated from config). Per-profile guardrails. |
 | `channel-flow-processor.ts` | Enforce mention-required responses in multi-user conversations (@assistant / @all) |
-| `kinesis-archival.ts` | Add membership audit on `CREATE_CHANNEL_MEMBERSHIP` events |
+| `src/membership-audit.ts` | Dedicated Kinesis consumer auditing `CREATE_CHANNEL_MEMBERSHIP` / `UPDATE_CHANNEL_MEMBERSHIP` events (§9) |
 | Frontend `NewConversationModal` | Classification picker |
 | Frontend `ShareConversationModal` | Filter recipient list by tier. Show classification badge. |
 | Frontend conversation list | Show classification badge per conversation |

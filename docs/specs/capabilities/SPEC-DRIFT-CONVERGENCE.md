@@ -1,4 +1,4 @@
-# SPEC: Drift Detection
+# SPEC: Drift Detection (Drift Convergence)
 
 **Status:** Partial. **Built:** the embedding-based signal, the confirm/decline and new-channel flow, the scheduled summary updater, related-conversation retrieval, the per-stage telemetry, the first-turn summary seed ([ADR-019](../../design/decisions/019-conversation-summary-seeded-on-first-turn.md), verified live 2026-07-29), active-task suppression, and the drift health surface (accuracy from post-hoc evaluation + acceptance) - all in Aurora mode, with the live-suggestion path behind `enableLiveDrift`. **Design, NOT built:** the known-topic suppression (decision-flow question 2) and the `conversation_topic_embeddings` store it needs; the `rejected_in_new_channel` outcome, which has no writer; erasure of the message reference on deletion (no scrubber exists); threshold alerting; and the nightly eval-suite CI gate. Sections describing those are marked inline.
 
@@ -229,7 +229,7 @@ Two paths, both live and both authoritative:
 
 **Every case it cannot answer returns an empty scope, meaning suggest nothing:** no human members, more members than one filter can express, a failed membership read, a failed search whose cause is not the membership limit, or a member whose own list cannot be read. Dropping an unreadable member would WIDEN the intersection, which is the one direction that discloses.
 
-**It runs on the ROUTER, not in the data plane.** `detectDrift` executes in `DataPlaneLambda` (isolated subnets, no Chime endpoint, no NAT), where a Chime call would hang to the timeout. `DetectDriftInput.scopedChannelArns` is supplied by the caller; absent means no suggestion, by design.
+**It runs on the ROUTER, not in the data plane.** `detectDrift` executes in `DataPlaneLambda` (isolated subnets, no Amazon Chime SDK endpoint, no NAT), where an Amazon Chime SDK call would hang to the timeout. `DetectDriftInput.scopedChannelArns` is supplied by the caller; absent means no suggestion, by design.
 
 A second case in the same suite: a 3-member channel (user A + user B + bot) where A is in some channel C that B is not in. The test fails if C appears in the multi-member scope.
 
@@ -328,7 +328,7 @@ When `detectDrift()` returns `isDrift=true && suggestedAction ∈ {confirm, redi
 
 A drift-created conversation opens with the **ordinary composed welcome**, not a message written by the drift flow. `createConversationFromDrift` posts nothing into the child: it stamps the drift context into channel `Metadata` and the assistant's `WelcomeIntent` renders it through the same composer every other conversation uses (see [`SPEC-WELCOME-AND-CONTEXT.md`](../interaction/assistant-config/SPEC-WELCOME-AND-CONTEXT.md)).
 
-`WelcomeIntent` fires on the assistant's **automatic** channel membership, which it acquires by being the `CreateChannel` bearer. No explicit `CreateChannelMembership` is needed or made, and this is not opt-out-able: verified against live Chime, a channel created by a bot bearer with no membership call at all receives the welcome within seconds.
+`WelcomeIntent` fires on the assistant's **automatic** channel membership, which it acquires by being the `CreateChannel` bearer. No explicit `CreateChannelMembership` is needed or made, and this is not opt-out-able: verified against the live Amazon Chime SDK service, a channel created by a bot bearer with no membership call at all receives the welcome within seconds.
 
 The welcome carries four things, each from channel `Metadata` written at creation:
 
@@ -352,7 +352,7 @@ Both directions are needed, and they use different mechanisms because only one o
 - **Child to parent:** the welcome's link, built from `parentChannelArn` and `originatingMessageId`. Part of the message body, so it survives any re-read.
 - **Parent to child:** a message the drift flow posts into the parent carrying `driftRedirect: { childChannelArn, label }` in **message Metadata**.
 
-The parent side needs Metadata rather than link text because the confirm reply reaches the parent through Lex, and a Lex-delivered message cannot carry Chime message Metadata. That reply instead carries a `NAVIGATE_CHANNEL:` marker, which the client consumes once to switch conversations and `stripMessageMarkers` then removes for display - so on a later re-read the announcement is there and the way to reach what it announced is not. The Metadata-carrying follow-up is what makes the link durable, and it deliberately does not repeat the marker, so the switch still happens exactly once.
+The parent side needs Metadata rather than link text because the confirm reply reaches the parent through Lex, and a Lex-delivered message cannot carry Amazon Chime SDK message Metadata. That reply instead carries a `NAVIGATE_CHANNEL:` marker, which the client consumes once to switch conversations and `stripMessageMarkers` then removes for display - so on a later re-read the announcement is there and the way to reach what it announced is not. The Metadata-carrying follow-up is what makes the link durable, and it deliberately does not repeat the marker, so the switch still happens exactly once.
 
 ### `drift_events` Schema (By-Reference)
 
@@ -551,7 +551,7 @@ The post-hoc analytics path (kinesis-archival's `detectDrift` call) does *not* s
 | `backend/lambda/src/analytics-aurora/schema/007-conversation-creation-tasks.sql` (new) | Pending drift-suggestion state for resilience across Lex session resets. |
 | `backend/lambda/src/lib/intent-classifier.ts` | Add optional `isDrift` flag derivation as a sanity-check sidecar (NOT a primary signal). Pin temperature to 0 for intent extraction. |
 | `backend/lambda/src/lib/routing-state.ts` (new) | Serializes/deserializes pending drift state in Lex session attributes; reads/writes the `conversation_creation_tasks` table for backup. |
-| `backend/lambda/src/lib/scoped-channels.ts` | `resolveScopedChannelArns(input)` - multi-member intersection scoping, computed LIVE by Amazon Chime SDK (`SearchChannels`, falling back to per-member channel lists above the search-user membership limit). Excludes bot ARNs from the intersection set. Never reads the Aurora archive. Runs on the router, not the data plane. |
+| `backend/lambda/src/lib/scoped-channels.ts` | `resolveScopedChannelArns(input)` - multi-member intersection scoping, computed LIVE by Amazon Chime SDK (`SearchChannels`; the only retry is bearer rotation when a search bearer exceeds the membership limit, and every other unanswerable case fails closed to an empty scope). Excludes bot ARNs from the intersection set. Never reads the Aurora archive. Runs on the router, not the data plane. |
 | `backend/lambda/src/analytics-aurora/kinesis-archival.ts` | Wire the embedding-writer trigger on summary-update events. |
 | `backend/lambda/src/router-agent-handler.ts` + `backend/lambda/src/lib/live-drift-flow.ts` | The Lex fulfillment path for user messages. The router is the single fulfillment hook for every classification; it classifies intent and delegates the drift turn to `runLiveDriftFlow`, which checks the explicit-routing fast-path, suppresses on a battle-enabled channel or a live task, calls `detectDrift()`, emits the suggestion and persists `routingState`, completes the confirm/decline on the next turn, and otherwise leaves the turn to the per-profile async processor. Feature-flagged by `enableLiveDrift` CDK context (default `false`; flip to `true` after dev validation). |
 | `backend/lambda/src/analytics-aurora/abandonment-detector.ts` (new) | Scheduled Lambda (EventBridge every 5 min) that writes `outcome='abandoned'` to stale `drift_events` rows. |
@@ -567,7 +567,7 @@ The post-hoc analytics path (kinesis-archival's `detectDrift` call) does *not* s
 | Unit: `drift-detection` cosine path | Same input produces same `DriftResult` over ≥50 consecutive runs |
 | Unit: `drift-detection` embedding-failure path | Bedrock 5xx → `signalAvailable:false`, no substring fallback path is exercised |
 | Unit: `detectExplicitRoutingRequest` regex allowlist | Comprehensive positive + negative cases; no false matches on common phrases like "let's talk about" |
-| Unit: `scoped-channels.resolveScopedChannelArns` | 1:1 channel scope = sender's memberships; 3-member channel scope = intersection; bot ARNs excluded; every unanswerable case returns an EMPTY scope (failed membership read, failed search, no humans, over the filter cap, unreadable member list); the membership-limit fallback intersects per-member lists and an unrelated `BadRequestException` does NOT take it. **Verified by:** `backend/test/lib/scoped-channels.test.ts` (10) |
+| Unit: `scoped-channels.resolveScopedChannelArns` | 1:1 channel scope = sender's memberships; 3-member channel scope = intersection; bot ARNs excluded; every unanswerable case returns an EMPTY scope (failed membership read, failed search, no humans, over the filter cap); the membership-limit case retries with a DIFFERENT bearer (the answer is bearer-independent), fails closed when every human is over the limit, and an unrelated `BadRequestException` does NOT take the retry. **Verified by:** `backend/test/lib/scoped-channels.test.ts` |
 | Integration: cross-user leakage prevention | Two synthetic users with similar summaries; A's drift query never returns B's channels |
 | Integration: 3-member channel privacy | User A in private channel C; A+B+bot in current channel; drift in current channel never suggests C |
 | Integration: confirm/decline flow | Full live path with confirm creates a new channel; decline stores the cosine distance in `declinedDistances` |
@@ -594,7 +594,7 @@ Drift detection is per-message overhead on the live path: one embedding call + o
 | **Medium** | 1k - 50k | 10k - 500k | Bedrock Titan v2 embedding latency on the critical path (~50-100ms per call adds to TTFR) | Add a summary-embedding DDB cache (write-through, 24h TTL backstop). The first post-launch optimization |
 | **Large** | 50k - 500k | 500k - 5M | Aurora memory pressure: pgvector HNSW index outgrows the minimum-ACU shared_buffers (~1GB at 0.5 ACU). At ~250k summary embeddings × 4KB/row + 2-3× index overhead, the index no longer fits in memory and queries hit disk | Raise Aurora Serverless v2 min ACU (config in `analytics-stack-aurora.ts`); document the breakpoint in `docs/guides/admin/AURORA-MODE-GUIDE.md` |
 | **Large** (parallel) | - | Same | Bedrock per-account/region TPS throttling on Titan v2 - sustained throttle = drift skipped per-message via the `signalAvailable:false` path. Bedrock resilience layer handles retries but sustained throttle is a real signal degradation | Request a quota increase, or move to Bedrock provisioned throughput for embedding endpoints |
-| **Huge** | >500k | >5M | Multi-member intersection scoping fan-out. For a 50-member channel where each user has 1000+ channels, the per-member FALLBACK path makes one paginated `ListChannelMembershipsForAppInstanceUser` call per human (the primary `SearchChannels` path makes one call regardless of member count, so this cost applies only above the search-user membership limit). This adds ~500ms-1s of latency to the critical path | Per-user-memberships cache (Aurora or DDB), invalidated on `CreateChannelMembership` / `DeleteChannelMembership` events. Or: precompute a `scoped_channels_cache` table keyed by `(channelArn, computed_at)` and refresh on a TTL |
+| **Huge** | >500k | >5M | Multi-member intersection scoping. The primary `SearchChannels` path makes one call regardless of member count; above the search-user membership limit the scope fails closed to empty (drift suggests nothing for those members). A reinstated per-member intersection would make one paginated `ListChannelMembershipsForAppInstanceUser` call per human, adding ~500ms-1s of latency to the critical path | Per-user-memberships cache (Aurora or DDB), invalidated on `CreateChannelMembership` / `DeleteChannelMembership` events. Or: precompute a `scoped_channels_cache` table keyed by `(channelArn, computed_at)` and refresh on a TTL |
 
 ### Specific load math
 
@@ -640,16 +640,16 @@ These are baseline numbers. The Scale tiers table above shows what changes as de
 
 ## Rollback
 
-Every behavior change sits behind an SSM-parameter feature flag mirroring the `FORMS_CIRCUIT_PARAM` pattern.
+The mechanism is the `enableLiveDrift` CDK context flag (default `false`), not a runtime feature flag: the live-suggestion wiring deploys only when the flag is set, so rollback is a redeploy with the flag off, which reverts the deployment to analytics-only drift. There are no SSM-parameter feature flags on this path.
 
-| Item | Flag | Default | Rollback action |
-|------|------|---------|-----------------|
-| Live drift path | `DRIFT_LIVE_ENABLED` (also CDK context `enableLiveDrift`) | `closed` (open after dev validation) | Set `closed` to revert to analytics-only drift |
-| Templated suggestion | (always on; no flag) | n/a | Revert the templated copy if it fails user testing |
-| Embedding writer | `DRIFT_EMBEDDING_WRITER_ENABLED` | `closed` (open after backfill) | Set `closed` to halt writes; reads fall back to lazy-compute path |
-| `drift_events` schema migration | n/a - schema change is not flagged | Applied during CDK deploy | Forward-only; rollback = revert the migration + redeploy |
+| Item | Mechanism | Rollback action |
+|------|-----------|-----------------|
+| Live drift path | `enableLiveDrift` CDK context (default `false`) | Redeploy with the flag off to revert to analytics-only drift |
+| Templated suggestion | ships with the live drift path; no flag of its own | Revert the templated copy if it fails user testing |
+| Embedding writer | deploys with the Aurora analytics stack; no flag | Rolls back with the stack (new summaries then stop gaining embeddings, so drift skips those conversations) |
+| `drift_events` schema migration | not flagged | Forward-only; rollback = revert the migration + redeploy |
 
-After each flag flip, watch the per-stage EMF metrics for ≥30 min before declaring the rollback successful.
+After a rollback deploy, watch the per-stage EMF metrics for ≥30 min before declaring the rollback successful.
 
 ## Validation
 
@@ -658,7 +658,7 @@ After each flag flip, watch the per-stage EMF metrics for ≥30 min before decla
 - Integration tests: the A→B leakage test fails with a deliberate bug and passes with the SQL `IN` filter; the multi-member test prevents cross-member channel disclosure.
 - With `DRIFT_LIVE_ENABLED=open`, posting a pivot message triggers a templated suggestion; confirming creates a new channel; declining stores the distance and stays put; bare "yes please" creates the channel with the original message reference.
 - An accepted-but-abandoned drift transitions to `outcome='abandoned'` within 10 minutes of the 5-minute window expiring.
-- The eval suite reports ≥95% TPR / ≤5% FPR on the curated dataset in CI, passing on two consecutive nights.
+- Design, NOT built (see Status): the eval suite reports ≥95% TPR / ≤5% FPR on the curated dataset in CI, passing on two consecutive nights.
 
 ## References
 

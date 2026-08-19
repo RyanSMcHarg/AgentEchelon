@@ -2,7 +2,7 @@
 
 **Status:** Implemented (outbound email hand-off); inbound reply loop Planned.
 
-**Coverage:** `e2e/notification-bridge.spec.ts` - proving DELIVERY still needs a mail capture this suite does not have, so the spec asserts what has to hold for a send to be possible at all: every deployed sender carries a real sender address rather than the placeholder (which makes `sendEmailNotifications` skip-but-report), and each sender's execution role is allowed `ses:SendEmail` on the identity SES actually resolves that address to. Senders are discovered from the deployment rather than listed, so a new one inherits the check.
+**Coverage:** `tests/e2e/notification-bridge.spec.ts` - proving DELIVERY still needs a mail capture this suite does not have, so the spec asserts what has to hold for a send to be possible at all: every deployed sender carries a real sender address rather than the placeholder (which makes `sendEmailNotifications` skip-but-report), and each sender's execution role is allowed `ses:SendEmail` on the identity SES actually resolves that address to. Senders are discovered from the deployment rather than listed, so a new one inherits the check.
 
 That last point is not a formality. Treating the address identity as the resource is what broke the path: SES authorizes against the verified parent DOMAIN when the address is covered by one, so every outbound notification failed with `AccessDenied` on `identity/<domain>` while the grant named `identity/<address>`. Because send failures are collected rather than thrown, the caller still succeeded and nothing surfaced. The spec now simulates both identities and requires the verified one to be allowed; it failed against the live deployment before the grant was widened (`lib/ses-identity.ts`) and passes after.
 
@@ -83,7 +83,7 @@ A bare `sub` is ambiguous once members span more than one identity provider, so 
 
 ### Resolving a task assignee (no `iss` on the task)
 
-A task's `assigneeUserSub` is the assignee's **`fed_` Amazon Chime SDK/AppInstanceUser id** (the `user-tasks` partition key), produced by `deriveFederatedSub(iss, sub)` - a one-way hash, so the raw `(sub, iss)` can't be recovered from it. We deliberately do **not** copy `iss` onto the task (that would be a second, drift-prone IDP pointer). Instead, to email an assignee, the notifier **reverse-matches** the `fed_` id against the channel roster `[{sub, iss}]`: the member whose `deriveFederatedSub(iss, sub)` equals `assigneeUserSub` yields the resolvable `(sub, iss)` for `notifyTargets`. The roster (carrying `iss` per member) is the single IDP pointer; the task only names *who*, the roster says *how to reach them*. (The assignment hand-off implements this match; for single-IDP today the assignee resolves against the primary pool regardless.)
+A task's `assigneeUserSub` is the assignee's **`fed_` Amazon Chime SDK/AppInstanceUser id** (the `user-tasks` partition key), produced by `deriveFederatedSub(iss, sub)` - a one-way hash, so the raw `(sub, iss)` can't be recovered from it. The design deliberately does **not** copy `iss` onto the task (that would be a second, drift-prone IDP pointer). Instead, to email an assignee, the notifier **reverse-matches** the `fed_` id against the channel roster `[{sub, iss}]`: the member whose `deriveFederatedSub(iss, sub)` equals `assigneeUserSub` yields the resolvable `(sub, iss)` for `notifyTargets`. The roster (carrying `iss` per member) is the single IDP pointer; the task only names *who*, the roster says *how to reach them*. (The assignment hand-off implements this match; for single-IDP today the assignee resolves against the primary pool regardless.)
 
 ### Readiness state (single-IDP today)
 
@@ -96,12 +96,12 @@ A task's `assigneeUserSub` is the assignee's **`fed_` Amazon Chime SDK/AppInstan
 - **Authz boundary** stays the resource ACL - a member removed from the resource drops off the fan-out (membership derives from the ACL-reconciled channel + IDP).
 - Untrusted inbound email is sanitized (strip quotes/HTML) before it enters the channel.
 
-## Open questions
+## Deployment prerequisites and open scope
 
-1. **Receiving address/domain** - confirm the domain to MX-point at SES.
-2. **SES production access** - already granted for this account, or needs a request?
-3. **Trigger point** - the `metadata.notify` fan-out hooks the channel-flow processor; confirm.
-4. **Scope of v1** - Phase 1 (outbound email) only, or commit to the full inbound bridge once ops land?
+1. **Receiving address/domain** - the inbound bridge requires a domain MX-pointed at SES; each deployment supplies its own.
+2. **SES production access** - the sending account must be out of the SES sandbox (production access granted) before external recipients receive mail.
+3. **Trigger point** - the `metadata.notify` fan-out hooks the channel-flow processor.
+4. **Scope** - Phase 1 (outbound email) stands alone; adopting the full inbound bridge is a separate per-deployment decision once the prerequisites above are in place.
 
 ## Related
 

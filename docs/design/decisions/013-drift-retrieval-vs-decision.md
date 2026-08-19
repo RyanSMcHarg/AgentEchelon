@@ -120,4 +120,4 @@ Moving the decision from a cosine score to a reasoning verdict ripples into the 
 ## Open doc/code gaps surfaced by this ADR
 
 - The channel-scoping privacy decision referenced in `scoped-channels.ts` + `SPEC-DRIFT-CONVERGENCE.md` step 6 has no dedicated ADR file yet. It should be filed (it is the privacy invariant this ADR depends on).
-- `bin/backend.ts` defaults `enableLiveDrift` ON in Aurora mode while `AURORA-MODE-GUIDE.md` documents the default as `false`. Decision item 4 reconciles them in favor of the doc.
+- RESOLVED: at decision time `bin/backend.ts` defaulted `enableLiveDrift` ON in Aurora mode while `AURORA-MODE-GUIDE.md` documented the default as `false`. Decision item 4 reconciled them in favor of the doc; `bin/backend.ts` now makes live drift an explicit opt-in (`-c enableLiveDrift=true`, Aurora mode only), matching the tracking block.

@@ -2,7 +2,7 @@
 
 **Status:** Implemented (reference: worked examples of the live IAM enforcement).
 
-**Coverage:** `e2e/classification-context.spec.ts`, `e2e/credential-exchange.spec.ts`
+**Coverage:** `tests/e2e/classification-context.spec.ts`, `tests/e2e/credential-exchange.spec.ts`
 
 **Problem and who it's for:** A team choosing or building on an AI platform needs to see - not just be told - that a blocked interaction is actually blocked by the infrastructure, and to know the one knob that changes each boundary. The alternative is to trust a product's isolation claim without proof, or to build your own enforcement and the test harness that proves it. This is for the platform developer and admin/operator reasoning about or customizing enforcement. It walks concrete blocked interactions end-to-end: the attempted action, the role that acts, the exact IAM statement that decides it (tag-gated conditional denial vs absolute denial), what the user and assistant experience, and the knob to change - showing that IAM over tagged resources, not application code, does the enforcing.
 
@@ -19,7 +19,7 @@ The synthesized statements shown are what CDK emits from the constructs cited; v
 
 One relationship underlies every example here:
 
-- **Your identity provider** (Cognito by default, or a federated SAML/OIDC IdP) authenticates a person. That identity maps 1:1 to a **Amazon Chime SDK AppInstanceUser** of the same id (the Cognito `sub`). Assistants are **AppInstanceBots**; administration runs as a single AppInstanceAdmin service identity (see Category 4).
+- **Your identity provider** (Cognito by default, or a federated SAML/OIDC IdP) authenticates a person. That identity maps 1:1 to a **Amazon Chime SDK AppInstanceUser** of the same id (the Cognito `sub`). Assistants are **AppInstanceBots**; administration runs as AppInstanceAdmin identities of two kinds - a per-human `${sub}-admin` identity for each admin operator, plus a service identity for backend administration (see Category 4 and `SPEC-ADMIN-IDENTITY.md`).
 - **Users, assistants, and channels are all AWS resources with ARNs** (`<appInstance>/user/<id>`, `<appInstance>/bot/<id>`, `<appInstance>/channel/<id>`). Because they are ARN-able resources, "who may act on what" is an **IAM and resource-policy decision**, not application logic.
 - **IAM policies** over those ARNs, plus the channel's immutable `classification` tag, allow or deny each action. On top of IAM, the Amazon Chime SDK enforces its own membership and bearer rules (the next section).
 
@@ -98,7 +98,7 @@ So three boundaries do three different jobs: the IAM **tag condition** is the ti
 
 **Why IAM tags cannot fully prevent this.** `CreateChannelMembership` and `DeleteChannelMembership` authorize against the **bearer/user** resource (`<appInstance>/user/<id>`), which carries no `classification` tag. A tag condition on them would fail closed and break legitimate membership, so they are granted unconditioned (see the tag-gated-actions section and `agent-classification-common.ts:38-41`). Membership is therefore governed by three other mechanisms, not by the tag gate. This is the honest edge: the tier boundary on *messages* is provable IAM, but the boundary on *membership* is not, so it is defended in depth.
 
-**Gate 1, synchronous app-layer admission (live).** Every path that adds a human validates `memberTier ≥ channelClassification` and refuses. The invite-by-email path (`share-conversation/index.js`) reads the recipient's authoritative Cognito-group tier, compares it to the channel's `modelTier`, and returns **403 `TIER_FORBIDDEN`** on a shortfall. `create-conversation` adds only the creator (over-tier creation already 403s), and the assistant-add paths add only the tier-matched bot, so no in-app path adds an under-tier human. This is application code, so it is defense in depth, not the provable IAM boundary.
+**Gate 1, synchronous app-layer admission (live).** Every path that adds a human validates `memberTier ≥ channelClassification` and refuses. The invite-by-email path (`share-conversation/index.js`) reads the recipient's authoritative Cognito-group tier, compares it to the channel's immutable `classification` tag (never the mutable `metadata.modelTier`; a missing or invalid tag fails closed to `basic` - `share-conversation/index.js:104-116`), and returns **403 `TIER_FORBIDDEN`** on a shortfall. `create-conversation` adds only the creator (over-tier creation already 403s), and the assistant-add paths add only the tier-matched bot, so no in-app path adds an under-tier human. This is application code, so it is defense in depth, not the provable IAM boundary.
 
 **Gate 2, IAM containment (live).** A membership added out of band (a direct Amazon Chime SDK API call by a moderator, a script, or compromised creds) bypasses Gate 1. But the tier tag gate (the first example above) still denies that member's `SendChannelMessage`, `GetChannelMessage`, and `ListChannelMessages` on the higher-tier channel, because their credentials are classification-capped. A wrongly-added member is therefore **inert**: present, but unable to read or send. The residual exposure is at most the visibility of the channel's existence and membership, never a message leak.
 

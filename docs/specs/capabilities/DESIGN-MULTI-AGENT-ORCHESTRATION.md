@@ -68,7 +68,7 @@ Each decision is presented with a recommendation, the reasoning, and the tradeof
 ### 2. Sub-agent identity: reuse the alt-slot pool vs dynamic provisioning
 
 - **Recommendation:** **reuse the bounded alt-slot bot pool.** Assign a free slot per sub-agent, act as that slot, release on completion.
-- **Rationale:** the pool already exists, is persona-less, is bounded, and `SPEC-BATTLE.md` already rejected per-invocation `AppInstanceBot` creation on IAM-policy and unbounded-growth grounds. The same reasoning applies here, so the platform keeps one bounded-pool story instead of two identity models.
+- **Rationale:** the pool already exists, is persona-less, is bounded, and [DESIGN-BATTLE §6](./DESIGN-BATTLE.md) already rejected per-invocation `AppInstanceBot` creation on IAM-policy and unbounded-growth grounds. The same reasoning applies here, so the platform keeps one bounded-pool story instead of two identity models.
 - **Tradeoff:** pool size caps concurrent sub-agents (a 5-attendee meeting with a 2-slot pool runs in waves). Dynamic per-attendee bot provisioning removes that cap but reintroduces the unbounded-growth and IAM-surface problems the battle work deliberately avoided, plus provisioning latency on the critical path. If large fan-outs become common, the answer is raising `altBotSlotCount`, not per-attendee bots.
 
 ### 3. Runtime: Lambda vs a longer-running host
@@ -86,7 +86,7 @@ Each decision is presented with a recommendation, the reasoning, and the tradeof
 ### 5. Lifecycle and bounds
 
 - **Max concurrency:** bounded by the alt-slot pool size (`altBotSlotCount`, default 2). The orchestrator claims up to that many slots and queues the rest into waves.
-- **Slot claim/release:** a sub-agent claims a slot atomically (conditional write on a slot-lease record keyed by slot ARN, mirroring the battle-state conditional-write idiom), and releases on completion. A crashed sub-agent's lease ages out on a TTL, so a lost slot self-heals (same pattern as the 10-minute battle-state TTL).
+- **Slot claim/release:** a sub-agent claims a slot atomically (conditional write on a slot-lease record keyed by slot ARN, mirroring the battle-state conditional-write idiom), and releases on completion. A crashed sub-agent's lease ages out on a TTL, so a lost slot self-heals (TTL-reaped like the battle-state rows, whose TTL is deadline-driven: it follows the row's deadline and extends for a side waiting on a person).
 - **Failure/timeout:** one sub-agent failing does not fail the batch. The orchestrator collates partial results ("invited Priya and Marco; could not reach Dana - retry?"), the same fail-soft posture `/battle` uses when a bot's row never reaches terminal.
 - **Cleanup:** slots are released and any transient coordination rows TTL out. No durable per-sub-agent state persists past the turn.
 - **Recommendation:** ship the bounded, TTL-reaped, fail-soft lifecycle above; do not add a durable sub-agent registry in v1.

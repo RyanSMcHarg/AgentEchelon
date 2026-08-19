@@ -57,7 +57,7 @@ The Aurora cluster, the Titan v2 embedding model, the pgvector extension, and th
 | `backend/lambda/src/analytics-aurora/schema/008-document-embeddings.sql` | Schema migration: 1024-dim embeddings + RAG columns + unique idempotency index |
 | `backend/lambda/src/analytics-aurora/document-ingestion.ts` | S3 → chunk → embed → INSERT Lambda |
 | `backend/lambda/src/analytics-aurora/document-retrieval.ts` | Query embed + cosine NN + citation packaging (runs in the data-plane Lambda) |
-| `backend/lambda/src/analytics-aurora/data-plane-handler.ts` | Retrieval/drift data-plane Lambda: dispatches `retrieve`, `detectDrift`, `recordDriftFire`, `recordDriftOutcome` (ADR-013) |
+| `backend/lambda/src/analytics-aurora/data-plane-handler.ts` | The data-plane Lambda: dispatches retrieval + drift + summary and the other data-plane ops (ADR-013) |
 | `backend/lambda/src/lib/data-plane-client.ts` | Non-VPC client seam: same function signatures, implemented as a synchronous invoke of the data-plane Lambda |
 | `backend/lambda/src/router-agent-handler.ts` | Call site - invokes the data-plane Lambda for retrieval, attaches result to InvokeAsync payload |
 | `backend/lambda/src/assistant-async-processor.ts` | Receiver - folds the retrieved context into the system prompt (every profile, via the shared processor) |
@@ -67,7 +67,7 @@ The Aurora cluster, the Titan v2 embedding model, the pgvector extension, and th
 
 1. **Aurora mode deployed.** `--context analyticsMode=aurora` at deploy time. The Aurora cluster, the embeddings table, and the ingestion Lambda all live in `AgentEchelonAnalyticsAurora`.
 2. **Live drift enabled.** `--context enableLiveDrift=true`. RAG and drift share the same gate: both run in the retrieval data-plane Lambda, which the router invokes. The router itself is not VPC-attached (ADR-013).
-3. **Schema migration 008 applied.** The schema-init custom resource runs migrations on stack create; verify by querying `information_schema.columns` for `embeddings.chunk_index`.
+3. **Schema migration 008 applied.** The schema-init custom resource runs migrations on stack create, and later migrations auto-apply at runtime via `db-client.ensureSchema` (any unapplied `schema/*.sql` lands on an existing cluster with no manual step; see [`LATENCY-TARGETS.md`](LATENCY-TARGETS.md)). Verify by querying `information_schema.columns` for `embeddings.chunk_index`.
 4. **Bedrock model access for Titan v2.** `amazon.titan-embed-text-v2:0` in `us-east-1` (drift detection already requires this).
 
 ## Uploading a corpus
@@ -78,7 +78,10 @@ Find your archive bucket name (CDK output `ArchiveBucketName` from `AgentEchelon
 # wiki/ as the source_type - anything you upload under rag/wiki/ becomes
 # searchable with source_type='wiki' filtering. runbooks/, docs/, faq/
 # all work the same way; the first path segment under rag/ is the type.
-aws s3 cp ./local-docs/ s3://<archive-bucket>/rag/wiki/ --recursive \
+# The NEXT segment is the classification (basic/standard/premium): omitting
+# it makes the content premium-only (the fail-closed default), so tag
+# all-tier content basic/ as shown here.
+aws s3 cp ./local-docs/ s3://<archive-bucket>/rag/wiki/basic/ --recursive \
   --exclude "*" --include "*.md" --include "*.txt" --include "*.html"
 ```
 
@@ -112,8 +115,8 @@ aws s3 ls s3://<archive-bucket>/rag/agentechelon/ --recursive | wc -l   # 0 ⇒ 
 
 When `enableLiveDrift=true` (and the corpus has content), every non-trivial user message (skips GREETING/ACKNOWLEDGMENT) triggers:
 
-1. **Router Lambda** embeds the user message via Titan v2 (~100-300ms warm)
-2. Runs pgvector cosine-NN against `embeddings WHERE source_type IN ('wiki', 'doc') AND <tier filter>` for top-K (default 4)
+1. **Router Lambda** invokes the **data-plane Lambda**, which embeds the user message via Titan v2 (~100-300ms warm)
+2. Runs pgvector cosine-NN against `embeddings WHERE source_type IN ('wiki', 'doc', 'company', 'agentechelon') AND <classification filter>` for top-K (the router configures 6; 4 is only the retrieval helper's default)
 3. Drops chunks below similarity 0.35 (honest empty if nothing's relevant enough)
 4. Deduplicates citations by `source_id` - multiple chunks from the same file share one citation number
 5. Attaches `{ chunks, citations }` to the async-processor InvokeAsync payload
@@ -122,14 +125,14 @@ When `enableLiveDrift=true` (and the corpus has content), every non-trivial user
 
 ## Tier-based scoping
 
-Documents are visibility-scoped by tier. Ingestion stamps `metadata.tier` from the S3 path: `rag/{source_type}/{tier}/…` where `{tier}` is `basic`, `standard`, or `premium`. Content with no tier segment defaults to `RAG_DEFAULT_TIER` (default `premium`, the most-restrictive tier), so untagged content is never exposed to a lower tier. Tag content `basic` to publish it to all tiers.
+Documents are visibility-scoped by tier. Ingestion stamps `metadata.classification` from the S3 path: `rag/{source_type}/{classification}/…` where `{classification}` is `basic`, `standard`, or `premium` (schema 020 names the isolation key `classification`). Content with no classification segment defaults to `RAG_DEFAULT_CLASSIFICATION` (default `premium`, the most-restrictive classification), so untagged content is never exposed to a lower tier. Tag content `basic` to publish it to all tiers.
 
 Scoping at the retriever (a user's scope is their tier and below):
-- **Basic tier:** sees only chunks with `metadata.tier='basic'`
+- **Basic tier:** sees only chunks with `metadata.classification='basic'`
 - **Standard tier:** sees `basic` OR `standard`
 - **Premium tier:** sees everything
 
-The tier gate is fail-closed: a chunk is returned only if its `metadata.tier` is in the caller's scope. Untagged chunks (`tier IS NULL`, e.g. legacy rows written before ingestion stamped tier) are not returned; re-put the S3 object under `rag/` to re-ingest and make them visible. The filter is applied at SQL level (inside the WHERE clause), not post-filter, so the HNSW index can prune correctly.
+The tier gate is fail-closed: a chunk is returned only if its `metadata.classification` is in the caller's scope. Chunks with no classification key (e.g. legacy rows written before ingestion stamped it) are not returned; re-put the S3 object under `rag/` to re-ingest and make them visible. The filter is applied at SQL level (inside the WHERE clause), not post-filter, so the HNSW index can prune correctly.
 
 ## Failure modes
 
@@ -159,13 +162,13 @@ The dominant cost line is Titan embedding calls. At ~10K turns/day, query-side e
 
 **Re-ingest a single file** (e.g. after editing):
 ```bash
-aws s3 cp ./updated-doc.md s3://<archive-bucket>/rag/wiki/updated-doc.md
+aws s3 cp ./updated-doc.md s3://<archive-bucket>/rag/wiki/basic/updated-doc.md
 # The ETag changes; the ingestor clears prior chunks + re-embeds.
 ```
 
 **Delete a document from the corpus:**
 ```bash
-aws s3 rm s3://<archive-bucket>/rag/wiki/old-doc.md
+aws s3 rm s3://<archive-bucket>/rag/wiki/basic/old-doc.md
 # Note: S3 deletes don't trigger the ingestor. The chunks stay in
 # the embeddings table until the deployer runs a manual cleanup
 # (DELETE WHERE source_id = ... against the embeddings table).
@@ -176,7 +179,7 @@ aws s3 rm s3://<archive-bucket>/rag/wiki/old-doc.md
 # Via the analytics-query API (if exposed) - count chunks per source_type
 # Or via psql + RDS Proxy IAM auth:
 SELECT source_type, COUNT(DISTINCT source_id) AS docs, COUNT(*) AS chunks
-FROM embeddings WHERE source_type IN ('wiki', 'doc')
+FROM embeddings WHERE source_type IN ('wiki', 'doc', 'company', 'agentechelon')
 GROUP BY source_type;
 ```
 

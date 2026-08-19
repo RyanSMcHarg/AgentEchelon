@@ -2,7 +2,7 @@
 
 **Status:** Implemented.
 
-**Coverage:** `e2e/cross-channel-tasks.spec.ts` - drives two conversations as one user and asserts in DynamoDB, not in the reply text, that a continuation-shaped turn in conversation B leaves the task opened in conversation A untouched (same `taskState`, `status`, `updatedAt`, `turnsInState`) and that A's `taskId` acquires no row under B's `channelArn`. The open-task precondition is arranged directly in the source of truth, because `getActiveTask` only considers `pending`/`in_progress` and a task the model finished inside one turn would make the assertion vacuous. Falsified by sending the same turn in conversation A, where it resumes the task and moves every one of those fields.
+**Coverage:** `tests/e2e/cross-channel-tasks.spec.ts` - drives two conversations as one user and asserts in DynamoDB, not in the reply text, that a continuation-shaped turn in conversation B leaves the task opened in conversation A untouched (same `taskState`, `status`, `updatedAt`, `turnsInState`) and that A's `taskId` acquires no row under B's `channelArn`. The open-task precondition is arranged directly in the source of truth, because `getActiveTask` only considers `pending`/`in_progress` and a task the model finished inside one turn would make the assertion vacuous. Falsified by sending the same turn in conversation A, where it resumes the task and moves every one of those fields.
 
 **Problem and who it's for:** When people carry on work across several conversations, each multi-step task should stay pinned to the conversation where it lives - never accidentally resumed in another - while the assistant still knows the user has work open elsewhere. This is for the end user (whose tasks stay where they belong) and the platform developer, who would otherwise hand-roll cross-conversation task scoping on top of the messaging layer. It scopes task resume to a matching `channelArn` while surfacing out-of-channel tasks to the assistant only as a prompt hint, never an auto-resume.
 
@@ -22,9 +22,9 @@ Tasks (`guided_troubleshooting`, `data_extraction`, `report_generation`, `place_
 `getActiveTask(userSub, taskType, { channelArn })` queries the `userSub-taskType-index` GSI and adds `channelArn = :channelArn` to the filter. Same-channel tasks resume normally. Tasks in other channels are invisible to this path.
 
 Called from the single agent handler:
-- `router-agent-handler.ts` (the shared router / Lex fulfillment Lambda that serves every classification and profile; `backend/lambda/src/router-agent-handler.ts` ~line 796)
+- `router-agent-handler.ts` (the shared router / Lex fulfillment Lambda that serves every classification and profile; `backend/lambda/src/router-agent-handler.ts`)
 
-The handler iterates the task-type list (`guided_troubleshooting`, `data_extraction`, `report_generation`), looks up each scoped by `channelArn`, and stops at the first match. If no task is active in the current channel, the resume path returns null and the handler proceeds with a fresh classification.
+The handler iterates every declared task type from the merged task-state machines (`Object.keys(taskStateMachines())` in `router-agent-handler.ts`, deliberately not a hand-maintained list, so a pack-defined type is covered automatically), looks up each scoped by `channelArn`, and stops at the first match. If no task is active in the current channel, the resume path returns null and the handler proceeds with a fresh classification.
 
 GREETING and ACKNOWLEDGMENT intents short-circuit *before* the active-task lookup runs (the resume path is intent-gated). A user typing "hi" never triggers a task lookup, which is intentional - saves a DDB roundtrip on trivial messages.
 
@@ -48,7 +48,7 @@ The hint is intentionally terse - no other channels' ARNs, no task content, no m
 2. **Performance.** Looking up other channels' names (e.g. for "in your Q3 sales conversation") would require an Amazon Chime SDK `DescribeChannel` per other-channel task. That cost would land on every turn for users with multiple active tasks. Worth it only if user testing proves the richer hint moves the needle.
 
 Called from the shared async processor at prompt-build time:
-- `assistant-async-processor.ts` (every profile with `richProcessor`; the shared processor gates the hint on task support; `backend/lambda/src/assistant-async-processor.ts` ~line 525)
+- `assistant-async-processor.ts` (every profile with `richProcessor`; the shared processor gates the hint on task support; `backend/lambda/src/assistant-async-processor.ts`)
 
 Best-effort: a failure of the cross-channel lookup logs and proceeds. The agent still replies; it just doesn't know about other-channel work for that turn.
 

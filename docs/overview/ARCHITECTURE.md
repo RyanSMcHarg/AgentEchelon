@@ -27,11 +27,11 @@ For deployment instructions, see [README.md](../../README.md). For Aurora-specif
         ┌───────────────────┘            │     │    │     │    │
         │ IAM credentials               │     │    │     │    │
         ▼                                │     │    │     │    │
- ┌──────────────┐                        │     │    │     │    │
- │  Amazon Chime SDK   │◄───────────────────────┘     │    │     │    │
- │  Messaging   │                              │    │     │    │
- │  AppInstance  │                              │    │     │    │
- └──────┬───────┘                              │    │     │    │
+ ┌──────────────────┐                    │     │    │     │    │
+ │ Amazon Chime SDK │◄───────────────────┘     │    │     │    │
+ │ Messaging        │                          │    │     │    │
+ │ AppInstance      │                          │    │     │    │
+ └──────┬───────────┘                          │    │     │    │
         │ Channel message event                │    │     │    │
         ▼                                      │    │     │    │
  ┌──────────────┐                              │    │     │    │
@@ -91,7 +91,7 @@ For deployment instructions, see [README.md](../../README.md). For Aurora-specif
               └───────────────────┘
 ```
 
-**Reading the flow:** the **Channel Flow Processor** runs first on every message (mention rules, filtering, marker stripping) and decides WHO responds; `@all` and `/battle` bypass Lex, which is the only way they differ from an ordinary turn (MESSAGE-FLOW §3.1 - the handoff is the design; the flow-side turn logic it replaces is being retired). **Amazon Lex is only the entry trigger** - an Amazon Chime SDK-to-Lambda passthrough via its Dialog Code Hook - not a classifier or router. Each tier's Lex bot fulfills into that tier's **own handler Lambda**: all run the shared `router-agent-handler.ts` code but are deployed one per tier (per-tier ownership, ADR-011), not a single shared router. The models shown per tier are **defaults**; model selection is configurable per tier and per intent via `model-strategy` (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS), so the platform is model-agnostic, not Anthropic-only.
+**Reading the flow:** the **Channel Flow Processor** runs first on every message (mention rules, filtering, marker stripping) and decides WHO responds; `@all` and `/battle` bypass Lex, which is the only way they differ from an ordinary turn (MESSAGE-FLOW §3.1). **Amazon Lex is only the entry trigger** - an Amazon Chime SDK-to-Lambda passthrough via its Dialog Code Hook - not a classifier or router. Each tier's Lex bot fulfills into that tier's **own handler Lambda**: all run the shared `router-agent-handler.ts` code but are deployed one per tier (per-tier ownership, ADR-011), not a single shared router. The models shown per tier are **defaults**; model selection is configurable per tier and per intent via `model-strategy` (Anthropic Claude, Amazon Nova, OpenAI GPT-OSS), so the platform is model-agnostic, not Anthropic-only.
 
 ---
 
@@ -124,7 +124,15 @@ ChimeMessaging                    (foundation - no dependencies)
      ├──► Classification-{Basic,Standard,Premium}   (the shared async processor + Lex bot + AppInstanceBot, one instance per profile;
      │                                               depend on Foundations + Experiments; Standard/Premium also on Battle)
      │
-     ├──► ChannelFlow             (@all routing + message filtering; depends on Foundations + the classification stacks)
+     ├──► ChannelFlow             (@all + /battle routing + message filtering; hard-depends on Experiments, optionally
+     │                             Battle; resolves the per-classification processors from the SSM contract at deploy,
+     │                             so it does not hard-depend on the classification stacks)
+     │
+     ├──► PostProcessing          (post-delivery consumer on the message stream; depends on the analytics stack's
+     │                             Kinesis stream + Foundations + the classification stacks' SSM contracts)
+     │
+     ├──► ImageGuardrail-{region} (conditional: one per region hosting an active image model outside the deploy region;
+     │                             the regional content guardrail the classification stacks reference cross-region)
      │
      ├──► Frontend                (CloudFront + private S3 origin for the chat SPA)
      │
@@ -133,17 +141,17 @@ ChimeMessaging                    (foundation - no dependencies)
      └──► AdminNotification       (opt-in, -c enableAdminNotificationChannel=true: dedicated admin alert channel; depends on CognitoAuth)
 ```
 
-Twelve stacks deploy in both modes (ChimeMessaging, CognitoAuth, AdminPlane, S3Storage, Foundations, Experiments, the three `Classification-*` stacks, Notifications, ChannelFlow, Frontend). `Battle` is default-on (opt out with `-c enableBattle=false`), and one analytics stack is added - `Analytics` in Athena mode or `AnalyticsAurora` in Aurora mode. Two operator-console stacks are opt-in: `AdminFrontend` (`-c enableAdminApp=true`) hosts the separate admin SPA, and `AdminNotification` (`-c enableAdminNotificationChannel=true`) provisions the admin alert channel.
+Thirteen stacks deploy in both modes (ChimeMessaging, CognitoAuth, AdminPlane, S3Storage, Foundations, Experiments, the three `Classification-*` stacks, Notifications, ChannelFlow, PostProcessing, Frontend). `Battle` is default-on (opt out with `-c enableBattle=false`), and one analytics stack is added - `Analytics` in Athena mode or `AnalyticsAurora` in Aurora mode. Conditional `ImageGuardrail-{region}` stacks are added, one per region that hosts an active image model outside the deploy region. Two operator-console stacks are opt-in: `AdminFrontend` (`-c enableAdminApp=true`) hosts the separate admin SPA, and `AdminNotification` (`-c enableAdminNotificationChannel=true`) provisions the admin alert channel.
 
 **Stack outputs flow:** Each stack exports values (ARNs, URLs) as CloudFormation outputs; the per-classification stacks instead publish their processor/bot ARNs to SSM. The frontend `.env` file is populated from these outputs. See `.env.example` for the mapping.
 
 | Stack                                   | Key Outputs                                                                                                                  |
 | --------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------- |
 | ChimeMessaging                          | `AppInstanceArn`                                                                                                             |
-| CognitoAuth                             | `UserPoolId`, `UserPoolClientId`, `IdentityPoolId`, `CredentialExchangeApiUrl`, `UserManagementApiUrl`, `UserFeedbackApiUrl` |
+| CognitoAuth                             | `UserPoolId`, `UserPoolClientId`, `IdentityPoolId`, `CredentialExchangeApiUrl`, `UserManagementApiUrl`                       |
 | AdminPlane                              | `AdminConversationApiUrl`                                                                                                    |
 | S3Storage                               | `PresignedUrlApiUrl`, `AttachmentBucketArn`                                                                                  |
-| Foundations                             | `CreateConversationApiUrl`, `AddAgentApiUrl`                                                                                 |
+| Foundations                             | `CreateConversationApiUrl`, `AddAgentApiUrl`, `UserFeedbackApiUrl`                                                           |
 | Experiments                             | `ExperimentsApiUrl`                                                                                                          |
 | Notifications                           | `ShareApiUrl`                                                                                                                |
 | Battle                                  | `BattleOutcomeApiUrl`                                                                                                        |
@@ -406,7 +414,7 @@ alternatives rather than a chain.
 The same classified intent also selects the model, through two layers:
 
 - **Tier default model.** Each tier has a configurable default (`basicModelKey` / `standardModelKey` / `premiumModelKey`; defaults Haiku, Sonnet, Opus). It answers any request not pinned to a specific intent.
-- **Per-intent routing.** `INTENT_ROUTE_STRATEGY` (`backend/lib/config/model-strategy.ts`) gives each intent a primary and a fallback model. The classifier's category is mapped to a strategy key (`INTENT_TYPE_TO_KEY`; anything unmapped goes to `general_qa`), then the strategy is applied. If the chosen model is not allowed for the user's tier, resolution falls back to the tier default, so per-intent routing never grants more access than the tier already has (`resolveModelForIntent` in `backend/lambda/src/lib/model-resolver.ts`).
+- **Per-intent routing.** `INTENT_ROUTE_STRATEGY` (`backend/lib/config/model-strategy.ts`) gives each intent a primary and a fallback model. The classifier's category is mapped to a strategy key (the `INTENT_TYPE_TO_ROUTE_KEY` renames, plus the identity rule: an intent key that is itself a route key routes to it), then the strategy is applied. A genuinely unknown intent resolves to the classification's default model, not to `general_qa`. If the chosen model is not allowed for the user's tier, resolution falls back to the tier default, so per-intent routing never grants more access than the tier already has (`resolveModelForIntent` in `backend/lambda/src/lib/model-resolver.ts`).
 
 | Strategy key | Primary model | Fallback model |
 |--------------|---------------|----------------|
@@ -418,7 +426,7 @@ The same classified intent also selects the model, through two layers:
 | `strategic_analysis` | opus | sonnet |
 | `workflow_actions` | sonnet | haiku |
 
-How the default intent pack maps onto those keys: `general` / `greeting` / `acknowledgment` to `general_qa`, `data_extraction` to `document_extraction`, `report_generation` to `report_generation`, `guided_troubleshooting` to `workflow_actions`. A deployment that ships its own intent pack (`ASSISTANT_INTENT_PACK`) supplies its own categories; see [SPEC-CONFIGURABLE-INTENT-PACK.md](../specs/interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md). The resolved model then runs through the Bedrock resilience layer (retry, model fallback, circuit breaker) inside the async processor.
+How the default intent pack maps onto those keys: `general` / `greeting` / `acknowledgment` to `general_qa`, `data_extraction` to `document_extraction`, `report_generation` to `report_generation`, `guided_troubleshooting` to `workflow_actions`; `code_generation`, `code_review`, and `strategic_analysis` route to the strategy keys of the same name. `image_generation` maps to no strategy key: an image turn selects the profile's image model (`models.image`), not a text-model route. A deployment that ships its own intent pack (`ASSISTANT_INTENT_PACK`) supplies its own categories; see [SPEC-CONFIGURABLE-INTENT-PACK.md](../specs/interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md). The resolved model then runs through the Bedrock resilience layer (retry, model fallback, circuit breaker) inside the async processor.
 
 ### A/B experiments over the routing
 
@@ -502,7 +510,9 @@ A classification experiment cannot run alongside an intent or base-model experim
           ▼
   share-conversation Lambda:
   1. Look up recipient in Cognito (by email)
-  2. Resolve channel tier (DescribeChannel metadata)
+  2. Resolve channel tier from the immutable `classification` tag
+     (ListTagsForResource, failing closed to basic - never DescribeChannel
+     metadata, which a member could tamper)
   3. Resolve recipient tier (AdminListGroupsForUser → basic/standard/premium)
   4. Reject with 403 TIER_FORBIDDEN if recipient tier < channel tier
   5. CreateChannelMembership (bot bearer)
@@ -593,7 +603,7 @@ The two roles cannot collapse into one store: an immutable raw log cannot serve 
   (raw absolute archive,                          │
    system of record)                              │
                                                    ▼
-                                           RDS Proxy (IAM auth)
+                              writer endpoint (IAM auth); RDS Proxy when enabled
                                                    │
                                                    ▼
                                            Aurora Serverless v2
@@ -675,7 +685,7 @@ If a provider fails to initialize, everything below it is unavailable. The `Conn
 | Change the auth flow | `frontend/packages/shared/src/providers/AuthProvider.tsx` + `backend/lib/stacks/cognito-auth-stack.ts` |
 | Add an admin dashboard tab | `frontend/packages/admin/src/components/admin/` + `AdminDashboard.tsx` |
 | Modify the analytics pipeline | `backend/lib/stacks/analytics-stack.ts` (Athena) or `analytics-stack-aurora.ts` (Aurora) |
-| Change file upload limits | `frontend/packages/chat/src/services/attachmentService.ts` |
+| Change file upload limits | `backend/lambda/presigned-url/index.js` (the enforced size cap + MIME allow-list) and `frontend/packages/chat/src/services/attachmentService.ts` (the matching client-side check) |
 | Debug message delivery | `backend/lambda/src/lib/async-processor-core.ts` → CloudWatch Logs |
 | Debug auth token issues | `frontend/packages/shared/src/providers/AuthProvider.tsx` → browser console |
 | Understand the database schema | `backend/lambda/src/analytics-aurora/schema/001-initial.sql` |
@@ -698,32 +708,33 @@ Access to AI models is enforced at the IAM level. Deployments can choose Anthrop
 
 Deployment model overrides are selected in CDK with `basicModelKey`, `standardModelKey`, and `premiumModelKey`.
 
-**How tier is determined:** User tier is stored as a Cognito custom attribute (`custom:tier`), set during admin approval. The fulfillment handler (`router-agent-handler.ts`) reads the tier and resolves the effective tier as `min(userTier, channelTier)`, then dispatches to that profile's async processor (the shared `assistant-async-processor.ts`, deployed once per profile). Lex is only the entry trigger; it performs no routing or tier logic.
+**How tier is determined:** Cognito group membership (`basic`/`standard`/`premium`) is the authoritative signal, read via `resolveUserClearance` (`AdminListGroupsForUser`, `backend/lambda/src/lib/user-clearance.ts`). The `custom:tier` attribute is only the approval-time input, synced into the groups. The fulfillment handler (`router-agent-handler.ts`) resolves the effective tier as `min(userTier, channelTier)`, then dispatches to that profile's async processor (the shared `assistant-async-processor.ts`, deployed once per profile). Lex is only the entry trigger; it performs no routing or tier logic.
 
-**How tier is enforced:** Each profile's processor Lambda has its own IAM role with Bedrock `InvokeModel` permissions scoped to that profile's model ARNs (`modelArnsForClassification`). The Cognito Identity Pool authenticated roles (one per classification, generated from config in `cognito-auth-stack.ts`) give frontend SDK clients their classification-appropriate permissions; the former standalone IAMPolicies stack has been removed.
+**How tier is enforced:** Each profile's processor Lambda has its own IAM role with Bedrock `InvokeModel` permissions scoped to that profile's model ARNs (`modelArnsForClassification`). The Cognito Identity Pool authenticated roles (one per classification, generated from config in `cognito-auth-stack.ts`) give frontend SDK clients their classification-appropriate permissions.
 
 ---
 
 ## Admin Dashboard
 
-The admin console groups its views into **7 sections** (section rail + sub-tabs): Overview (Overview + Latency), Conversations, Effectiveness (the intent-anchored Dashboard drill - the consolidation target that Evaluations/Flows/Tasks/Steps fold into - plus those detail sub-tabs and the Flagged and Ground Truth action tabs), Models (Models + Model Strategy), Experiments, Users (Users + Manage Users), and Security (Membership Audit). Aurora-only views are hidden in Athena mode. (Usage: [ADMIN-GUIDE.md](../guides/admin/ADMIN-GUIDE.md); design: [SPEC-ADMIN-CONSOLE.md](../specs/interface/admin/SPEC-ADMIN-CONSOLE.md).) The individual views:
+The admin console groups its views into **8 sections** (section rail + sub-tabs, the `SECTIONS` array in `frontend/packages/admin/src/components/admin/AdminDashboard.tsx`): Overview (Overview + Alerts + Latency), Conversations, Effectiveness (the intent-anchored drill plus the Flagged and Ground Truth action tabs, and the basic Evaluations view in Athena mode), Models (Models + Model Strategy), Assistants (Profiles), Experiments, Users (Users + Manage Users), and Security (Membership Audit). Flows, Tasks, and Steps are not standalone tabs: their detail lives inside the Effectiveness drill. Views unavailable in the active analytics mode are hidden - Aurora-only views in Athena mode, and the Athena-only Evaluations view in Aurora mode (there the drill is the evaluation surface). (Usage: [ADMIN-GUIDE.md](../guides/admin/ADMIN-GUIDE.md); design: [SPEC-ADMIN-CONSOLE.md](../specs/interface/admin/SPEC-ADMIN-CONSOLE.md).) The individual views:
 
 | Tab | Mode | Data Source | Shows |
 |-----|------|------------|-------|
 | Overview | Both | `conversation_volumes`, `intent_distribution` | Daily message/conversation counts, intent type breakdown |
-| Models | Both | `model_usage`, `model_effectiveness`, `/feedback` | Per-model usage, intent-by-model effectiveness, latency, compliance, and user feedback summaries |
-| Model Strategy | Both | Static frontend config mirrored from backend strategy metadata | Provider posture, deploy-time model choices, intent routing, fallback model guidance, tier availability |
-| Experiments | Both | `experiment_results`, DynamoDB `ExperimentsTable` | A/B test management: create/pause/complete experiments, side-by-side variant comparison (score, latency, tokens, compliance, fallback rate) |
-| Conversations | Both | `/admin/conversations{,/messages,/members,/membership-history,/add-member,/remove-member,/redact-message,/delete-message}`, `drift_events` | **Archive-backed** conversation browser (Athena over the `conversations` Glue table - not live Amazon Chime SDK), messages with per-message inspect (all fields + metadata + raw), member list + add/remove, membership-history timeline, and redact (moderation) and delete (administration) - acting as the **app-instance-admin**. Optional drift view in Aurora mode. |
-| Evaluations | Both | `evaluation_scores` | Scores by date, agent type, intent - color-coded by quality |
+| Alerts | Aurora | Effectiveness, model-effectiveness, and latency data | Consolidated alertable conditions: literal errors, latency SLA breaches, and eval-quality breaches |
 | Latency | Both | `latency_metrics` | Avg/P95 total, Bedrock inference, and polling time |
-| Users | Both | `active_users_daily`, `messages_per_user`, `signup`/`signin_funnel_conversion` (client-events); `user_activity` legacy fallback | Session DAU vs messaging DAU + tier breakdown, sign-up/sign-in conversion funnels, top-50 sender leaderboard |
-| Manage Users | Both | Cognito admin actions | Approve, reject, tier, and enable users from the console |
-| Flows | Aurora | `evaluation_flows` | Multi-turn evaluation: 5 weighted dimensions, drill into flow detail |
+| Conversations | Both | `/admin/conversations{,/messages,/members,/membership-history,/add-member,/remove-member,/redact-message,/delete-message}`, `drift_events` | **Archive-backed** conversation browser (Athena over the `conversations` Glue table - not live Amazon Chime SDK), messages with per-message inspect (all fields + metadata + raw), member list + add/remove, membership-history timeline, and redact (moderation) and delete (administration) - acting as the **app-instance-admin**. Optional drift view in Aurora mode. |
+| Effectiveness | Aurora | `intent_effectiveness`, `intent_exchanges`, `task_timeline` | Intent-anchored worst-first dashboard (classification/execution/latency/cost/tool-error per intent), drilling intent -> exchanges/tasks -> per-task turn timeline -> steps (the detail that the retired Evaluations/Flows/Tasks/Steps tabs carried) |
+| Evaluations | Athena | `evaluation_scores` | Scores by date, agent type, intent - color-coded by quality (the basic evaluation view; in Aurora mode the Effectiveness drill supersedes it) |
 | Flagged | Aurora | `flagged_responses` | Response review queue: approve/reject with notes |
 | Ground Truth | Aurora | `ground_truth` | Human scores vs automated scores, calibration metrics |
-| Tasks | Aurora | `task_metrics`, `task_details` | Completion rate, duration, per-type breakdown; `task_details` also carries each task's current `task_state` (declared-graph machine state) + `transition_count` |
-| Effectiveness | Aurora | `intent_effectiveness`, `intent_exchanges`, `task_timeline` | Intent-anchored worst-first dashboard (classification/execution/latency/cost/tool-error per intent), drilling intent -> exchanges/tasks -> per-task turn timeline -> steps |
+| Models | Both | `model_usage`, `model_effectiveness`, `/feedback` | Per-model usage, intent-by-model effectiveness, latency, compliance, and user feedback summaries |
+| Model Strategy | Both | Static frontend config mirrored from backend strategy metadata | Provider posture, deploy-time model choices, intent routing, fallback model guidance, tier availability |
+| Profiles | Both | `/admin/profiles` | Versioned, portable assistant profiles: edit persona/model/tool configuration, activate, rollback, import/export - no redeploy |
+| Experiments | Both | `experiment_results`, DynamoDB `ExperimentsTable` | A/B test management: create/pause/complete experiments, side-by-side variant comparison (score, latency, tokens, compliance, fallback rate) |
+| Users | Both | `active_users_daily`, `messages_per_user`, `signup`/`signin_funnel_conversion` (client-events); `user_activity` legacy fallback | Session DAU vs messaging DAU + tier breakdown, sign-up/sign-in conversion funnels, top-50 sender leaderboard |
+| Manage Users | Both | Cognito admin actions | Approve, reject, tier, and enable users from the console |
+| Membership Audit | Both | Layer 6 membership-audit findings | Over-tier membership flags for review, with the report-only vs auto-revoke runtime toggle |
 
 ---
 
@@ -763,13 +774,13 @@ This section summarizes security controls.
 **Input handling:**
 - React escapes all rendered content (no `dangerouslySetInnerHTML`)
 - Message metadata markers (`<!--ACTIVE_TASK:-->`) stripped by `messageParser.ts` before display
-- File uploads validated client-side (10MB limit, MIME type whitelist) - no server-side malware scanning
+- File uploads enforced server-side by the presigned-url Lambda (`backend/lambda/presigned-url/index.js`): MIME allow-list, filename sanitizing (path separators / control characters / traversal segments rejected), identity-bound keys (the caller's JWT `sub`, never a body-supplied userId), and a POST-policy `content-length-range` of 1 byte to 10 MiB; the client mirrors the same limit and type checks. No server-side malware scanning
 - SQL queries in Aurora mode use parameterized queries; table/column names validated against identifier regex
 
 **CORS:**
 - API Gateway REST APIs use the `appUrl` CDK context variable for allowed origins
 - Aurora analytics API uses the same `appUrl` context variable
-- S3 attachment bucket CORS still uses wildcard origins
+- S3 attachment bucket CORS is pinned to the configured `appUrl` origin (`s3-storage-stack.ts`)
 
 **Data in transit:**
 - All AWS SDK calls use HTTPS
@@ -806,7 +817,7 @@ This section summarizes security controls.
 |-----------|----------|---------------|------|
 | **E2E (Playwright)** | `tests/e2e/` | Signup, signin, agent intents (per tier), admin dashboard | Disabled in CI; requires deployed AWS environment |
 | **Backend unit (Jest)** | `backend/test/` | CDK synth validation, Aurora modules (db-client, drift-detection, cross-conversation-context) | Tests mock all external dependencies; no integration tests against real databases |
-| **Frontend unit** | (none) | Nothing | No component, hook, or provider unit tests exist. All frontend coverage comes from E2E only. |
+| **Frontend unit (Vitest)** | `frontend/packages/{chat,admin,shared}/src/**/*.test.{ts,tsx}` | Components, providers, services, and utils (33+ suites; run with `cd frontend && npm test`) | Coverage is targeted at behavior-heavy modules, not exhaustive |
 
 ```bash
 # Run E2E tests (requires deployed backend + running frontend)
@@ -818,7 +829,6 @@ cd backend && npm test
 
 **Known testing gaps:**
 - E2E tests are disabled in CI (`.github/workflows/ci.yml`) because they require a deployed AWS environment
-- No frontend unit tests (React component tests, provider tests, service tests)
 - Backend unit tests mock everything - no integration tests verify actual database queries, Bedrock calls, or Amazon Chime SDK interactions
 - No load/performance testing
 - Error paths and edge cases are largely untested

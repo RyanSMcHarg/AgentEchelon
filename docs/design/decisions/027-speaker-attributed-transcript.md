@@ -43,10 +43,11 @@ while there is one surface; it becomes worth building when a second wire format 
 lives in one function today, which is the property part 5 exists to protect.
 
 **Sequencing (owner, 2026-08-11): design first.** The narrow alternative, scoring the turn's own user
-message and changing nothing else, is deliberately NOT taken as an interim patch; it is retained as
-the shape decision 4 takes. The consequence accepted with that choice: until this ships, a duel in a
-channel carrying a platform notice continues to block the side that did not author it, and the
-measurement it produces is unusable. The defect and its live evidence are tracked separately.
+message and changing nothing else, was deliberately NOT taken as an interim patch; it is retained as
+the shape decision 4 takes. The consequence accepted with that choice: until parts 1 to 4 shipped, a
+duel in a channel carrying a platform notice continued to block the side that did not author it, and
+the measurement it produced was unusable. That window has closed: the defect is fixed by part 4 (the
+guardrail scores the person's own turn), pinned by `guardrail-scores-the-user-turn.test.ts`.
 
 ## Problem and who it's for
 
@@ -62,7 +63,9 @@ are concatenated into one block. The assistant answers as though one voice said 
 This is the shared-conversation promise the platform is built on: assistants are participants in a
 channel with people, not a private one-to-one chat.
 
-## What the transcript does today
+## What the transcript did before this change
+
+This section records the state at decision time; parts 1 to 4 have since replaced it (see Status).
 
 `loadChannelHistory` reads the channel and resolves the SENDER of every message. It computes both
 whether the sender is a bot (`async-processor-core.ts:678`) and whether the sender is this assistant
@@ -241,7 +244,10 @@ commitments covering who appears in a prompt need that reviewed, and a deploymen
 names needs a pseudonymous stable label (`Participant 2`) rather than the change being skipped,
 since the ordering and turn boundaries are what the model needs most.
 
-**Tests owed before any `Verified by:` line:**
+**Tests owed before any `Verified by:` line - satisfied by the suites named in Status**
+(`transcript-attribution.test.ts`, `channel-history-context.test.ts`,
+`guardrail-scores-the-user-turn.test.ts`), except the final renderer-ratchet item, which is deferred
+with part 5:
 - Two people speaking consecutively survive consolidation as two attributed contributions.
 - A peer assistant's message is labelled as an assistant and is not scored as user input.
 - A user who types a forged attribution label does not impersonate another participant, and neither

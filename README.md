@@ -87,7 +87,7 @@ Agent Echelon deploys in **Athena mode** by default (lower cost, simpler). Auror
 - No cross-conversation context (each conversation is isolated)
 - No drift detection. Drift requires Aurora's pgvector cosine similarity and the summary-updater Lambda; neither exists in Athena mode. Deploying with `enableLiveDrift=true` in Athena mode is a misconfiguration - the feature silently skips every turn.
 - Admin dashboard shows only aggregate metrics from S3/Athena, not per-exchange detail
-- Aurora-only tabs (Flows, Flagged, Ground Truth, Tasks) are hidden
+- Aurora-only views (the Effectiveness drill, Alerts, Flagged, Ground Truth) are hidden. Flows and Tasks are not standalone tabs; their detail lives inside the Effectiveness drill
 
 **Graceful degradation:** The app is designed to run fully in Athena mode without errors. Aurora-only admin tabs are hidden (not shown as broken). Task tracking in async processors silently skips DynamoDB writes when `TASKS_TABLE` is not configured - the bot still generates responses, just without multi-turn state. The premium classification's S3 knowledge base context is optional - if `CONTEXT_BUCKET` is empty, responses are generated without enrichment. The admin dashboard shows an informational banner when no analytics data has been archived yet, explaining the pipeline delay and suggesting Aurora mode for advanced features. Cross-conversation context and drift detection are never referenced in Athena mode.
 
@@ -122,7 +122,7 @@ The full documentation lives under [`docs/`](docs/DOCUMENTATION.md), organized b
              │ channel message event
              ▼
 ┌───────────────────────────┐   runs FIRST on every message: mention
-│   Channel Flow Processor   │   rules + filtering. @all / @everyone
+│   Channel Flow Processor   │   rules + filtering. @all (and /battle)
 └────────────┬──────────────┘   bypass Lex and invoke the async
              │ (otherwise)       processor directly.
              ▼
@@ -215,10 +215,7 @@ agentechelon/
 │   │       │   ├── cross-conversation-context.ts
 │   │       │   ├── schema-init.ts       # Migration runner
 │   │       │   ├── iam-auth-setup.ts
-│   │       │   └── schema/
-│   │       │       ├── 001-initial.sql
-│   │       │       ├── 002-pgvector.sql
-│   │       │       └── 003-materialized-views.sql
+│   │       │   └── schema/           # NNN-*.sql migrations (27, applied at runtime)
 │   │       ├── channel-flow-processor.ts   # @all routing, message filtering
 │   │       ├── evaluation/           # Evaluation runner
 │   │       └── lib/                  # Shared agent libraries
@@ -254,9 +251,11 @@ npm run doctor
 
 # Deploy all stacks (set your sender email for notifications)
 # Optional model selection:
-#   cdk deploy --all --context standardModelKey=gpt_oss_20b --context premiumModelKey=gpt_oss_120b
-SES_SENDER_EMAIL=you@example.com cdk deploy --all
+#   npm run deploy -- --context standardModelKey=gpt_oss_20b --context premiumModelKey=gpt_oss_120b
+SES_SENDER_EMAIL=you@example.com npm run deploy
 ```
+
+`npm run deploy` is the supported path: it builds first (the Lambda bundler ships compiled `.js`, so a stale build deploys silently otherwise), refuses an `--all` deploy if any stack falls outside the instance prefix (the safety gate for shared accounts), and forwards the persisted per-instance context from `backend/deploy.config.json`. A raw `cdk deploy --all` works as an advanced option, but only after `npm run build`, and it forwards none of the persisted context, so every `-c` flag must be passed explicitly.
 
 ### Email & the SES Sandbox (read this - it affects whether email works)
 
@@ -708,13 +707,13 @@ suite degrades gracefully on a stack that hasn't been provisioned.
 
 **159 e2e tests across 44 spec files**, mapped to the specifications they cover.
 
-The authoritative, per-spec breakdown is **[docs/reference/e2e-coverage-matrix.md](docs/reference/e2e-coverage-matrix.md)**, which is GENERATED from the specs and the spec files - it reports which documents claim live behaviour and which e2e covers each. Read it there rather than here: a hand-maintained inventory in this file drifted to "~55 tests across 8 spec files" (it listed 6 battle tests against an actual 17) and nothing failed while it was wrong.
+The authoritative, per-spec breakdown is **[docs/reference/e2e-coverage-matrix.md](docs/reference/e2e-coverage-matrix.md)**, which is GENERATED from the specs and the spec files - it reports which documents claim live behaviour and which e2e covers each. Read it there rather than here.
 
 Regenerate it with the command at the top of that file. All runs include video recordings and trace files in `tests/test-results/` for debugging.
 
 ### Testing Built-In Intents
 
-The agent ships with 6 built-in intents. Use this script to test each one against a running deployment:
+The default intent pack defines 7 domain intents plus the 3 universal intents (greeting, acknowledgment, general). Use this script to exercise the taxonomy against a running deployment:
 
 ```bash
 #!/bin/bash
@@ -764,14 +763,18 @@ echo "Results: tests/test-results/"
 echo "Report:  npx playwright show-report"
 ```
 
-**Intent taxonomy reference** (defined in `backend/lambda/src/lib/intent-classifier.ts`):
+**Intent taxonomy reference** (the default pack in `backend/lambda/src/lib/intent-pack.ts`; a deployment supplies its own via `ASSISTANT_INTENT_PACK`):
 
 | Intent | Trigger | Delivery Option | Example |
 |--------|---------|----------------|---------|
 | `GREETING` | "Hello", "Hi", "Hey" | DIRECT | Fast path - no Bedrock call needed |
 | `ACKNOWLEDGMENT` | "Thanks", "OK", "Got it", "Bye" | DIRECT | Fast path - no Bedrock call needed |
 | `GUIDED_TROUBLESHOOTING` | Troubleshooting or debugging requests | TASK_MULTI_STEP | Multi-turn state machine with step tracking |
-| `DATA_EXTRACTION` | Extract data, parse, analyze a document | PLACEHOLDER_UPDATE | Async processor with "Thinking..." placeholder |
+| `DATA_EXTRACTION` | Extract or export structured/bulk data (a table, list, or dataset) | TASK_MULTI_STEP | Multi-turn state machine; a single-fact question is `GENERAL` |
+| `IMAGE_GENERATION` | "Generate an image of ...", "draw ..." | PLACEHOLDER_UPDATE | Async processor with "Thinking..." placeholder |
+| `CODE_GENERATION` | "Write a function that ...", "refactor this ..." | PLACEHOLDER_UPDATE | Async processor with "Thinking..." placeholder |
+| `CODE_REVIEW` | "Review this code", critique of supplied code | PLACEHOLDER_UPDATE | Async processor with "Thinking..." placeholder |
+| `STRATEGIC_ANALYSIS` | Business case, competitive or market assessment | PLACEHOLDER_UPDATE | Async processor with "Thinking..." placeholder |
 | `REPORT_GENERATION` | Generate a report or summary | TASK_MULTI_STEP | Multi-turn state machine |
 | `GENERAL` | Anything else | PLACEHOLDER_UPDATE | Default classification for open-domain questions |
 

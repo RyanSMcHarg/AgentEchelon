@@ -45,8 +45,8 @@ Three constraints shape the fix:
 
 Option D keeps a **self-hosted agent loop** - Converse plus a tool loop AE runs in its own `async-processor` Lambda - instead of adopting the managed **Bedrock Agents** runtime. Concretely: keep the assistant = **AE's orchestration pipeline**, and add **native Converse tool use** (`toolConfig`) so `load_company_context` fires - with the *same* tier-scoped IAM isolation - while `intent → {delivery option, task state machine, per-intent model}` stays intact. Layer **prompt caching**, **selective tool invocation**, and the **existing RAG path** to be cost/latency-competitive with (or better than) a managed agent.
 
-- **Unwind** the built-but-uncommitted Option-B swap (the InvokeAgent terminal call in `agent-invoke.ts` + the processor `InvokeAgent` IAM).
-- **Keep** the `tier-stack.ts` agent-role IAM fix (`InvokeModel` + `InvokeModelWithResponseStream` + `ApplyGuardrail`) and the guardrail-ARN export - correct regardless, and doc-corroborated ([Appendix G](#appendix-g--aws-feature-reference)).
+- **Unwind** the spiked Option-B swap (the InvokeAgent terminal call in `agent-invoke.ts` + the processor `InvokeAgent` IAM).
+- **Keep** the per-tier classification-stack agent-role IAM fix (`{basic,standard,premium}-classification-stack.ts` via `agent-classification-common.ts`: `InvokeModel` + `InvokeModelWithResponseStream` + `ApplyGuardrail`) and the guardrail-ARN export - correct regardless, and doc-corroborated ([Appendix G](#appendix-g--aws-feature-reference)).
 - **Reserve** Bedrock Agents / multi-agent collaboration for a *future, explicit* decision to cede orchestration to the managed layer.
 
 ## Why (high-level rationale)
@@ -78,7 +78,7 @@ In one line: AE chooses a **self-hosted agent runtime** over a managed one to ke
 One-liners (full detail in [Appendix B](#appendix-b--options-in-detail)):
 
 - **A - Lex `BedrockAgentIntent`:** ruled out - console-only, not IaC-able.
-- **B - InvokeAgent terminal swap:** tools + guardrails for free, but cedes the per-intent model and task-aware prompt. Built, uncommitted.
+- **B - InvokeAgent terminal swap:** tools + guardrails for free, but cedes the per-intent model and task-aware prompt. Spiked, then rejected.
 - **C - Converse today:** the status quo; tools never fire.
 - **D - Converse + native tool use (recommended):** tools fire *and* orchestration kept; we own a small tool loop.
 - **E - Multi-agent collaboration:** the way to regain per-intent multi-model *inside* the managed layer; heaviest infra; future option.
@@ -118,7 +118,7 @@ Sources for the API behaviors above: [Appendix H](#appendix-h--sources--referenc
 ### A - Lex `AMAZON.BedrockAgentIntent` (+ manual console activation) - RULED OUT
 Per-tier Lex bots route to the agent natively. **Decisive con:** the BedrockAgentIntent activation is **console-only** - the Lex Models V2 SDK has no `bedrockAgentIntentConfiguration` field (verified: `CreateIntent` rejects it; the bot-locale build fails "missing required bedrockAgentIntentConfiguration"). Requires a manual click per bot per deploy, which breaks `cdk deploy`-only for OSS deployers.
 
-### B - Router calls InvokeAgent (terminal swap) - BUILT, UNCOMMITTED
+### B - Router calls InvokeAgent (terminal swap) - SPIKED, REJECTED
 The async-processor's terminal Converse call becomes `InvokeAgent(tierAgent)`.
 - **Pro:** fully IaC; makes the tool fire; guardrails enforced on the live path automatically.
 - **Con (decisive):** the agent answers with its single model and its own instruction, so AE's per-intent model routing and task-aware prompting are discarded (see [Appendix D](#appendix-d--spike-results--code-evidence)).
@@ -202,6 +202,8 @@ user ─► Amazon Chime SDK ─► channel-flow ─► Lex (FallbackIntent)
 
 ### The assistant IS the orchestration (code-cited, `router-agent-handler.ts`)
 
+Line numbers below are as of decision time; the functions are the durable references.
+
 | One intent drives | Code |
 |---|---|
 | Delivery option | `intentToDeliveryOption(intent)` (472); `selectDeliveryOption(intent, hasActiveTask)` (535) |
@@ -236,7 +238,7 @@ The agent execution role created in CDK granted only `bedrock:InvokeModel`; ever
 1. `bedrock:InvokeModelWithResponseStream` - InvokeAgent streams the model.
 2. `bedrock:ApplyGuardrail` - the agent enforces its attached guardrail.
 
-AWS docs confirm the agent service role needs exactly these, and that the console/managed creation flow adds them automatically - which is why AE's hand-rolled CDK role failed. The `tier-stack.ts` fix matches the documented requirement and **stays regardless of the C/D/B decision** ([Appendix H](#appendix-h--sources--references)).
+AWS docs confirm the agent service role needs exactly these, and that the console/managed creation flow adds them automatically - which is why AE's hand-rolled CDK role failed. The per-tier classification-stack fix (`{basic,standard,premium}-classification-stack.ts` + `agent-classification-common.ts`) matches the documented requirement and **stays regardless of the C/D/B decision** ([Appendix H](#appendix-h--sources--references)).
 
 ## Appendix E - Cross-cutting requirements
 
@@ -258,7 +260,7 @@ Two concerns, deliberately separated. **Conversation history** is a derived cach
 
 ## Appendix F - Efficiency & cost levers (answers to the inline questions)
 
-Addressing the three notes left in the Primer:
+Three efficiency questions surfaced while the decision was being worked; this appendix answers them:
 
 **"How do we make the self-hosted agent loop efficient, and how does it compare?"**
 - **Prompt caching** is the big lever: cache the stable prefix (instruction + tool schemas + any always-on context) so it isn't re-billed each turn. On Bedrock this gives up to ~90% input-cost and ~85% latency reduction on long prompts. *Caveat:* a minimum cache-checkpoint size applies - Claude 4.5 models need ≥4,096 tokens, Claude 3.7 Sonnet ≥1,024. The spike's tool turn was ~3,880 input tokens - just under 4,096 - so on a 4.5 model the cached prefix must clear 4,096 to qualify (RAG context pushes it over).

@@ -2,7 +2,7 @@
 
 **Status:** Implemented (the taxonomy mechanism; the domain taxonomy is per-deployment config).
 
-**Coverage:** `e2e/agent-intents.spec.ts`
+**Coverage:** `tests/e2e/agent-intents.spec.ts`
 
 **Verified by:** `backend/test/lib/intent-pack.test.ts` (back-compat, override, malformed-fallback, and the per-intent response settings), `backend/test/task-state-machines.test.ts` (task-machine graph validation, and the intent pack's optional `machines` block carried over the platform defaults with a malformed-override fallback), and `backend/test/lib/task-loop-machines.test.ts` (a per-assistant `machines` override takes effect at loop time over the deployment pack).
 
@@ -85,7 +85,7 @@ A JSON array of `IntentDef` (or `{ "intents": [...] }`), supplied via CDK contex
 
 **Transport - SSM, not a raw env var (this matters).** AWS caps a Lambda's **total** env-var size at **4 KB**. A realistic pack (~3 KB) plus the AgentHandler's existing table/ARN vars (~1.5 KB) blows that - and the persona (`ASSISTANT_SYSTEM_PROMPT`, ~1.6 KB) can't share a Lambda with it either. So the shared `assistant-profile-stack.ts` writes the pack JSON to an **SSM parameter** (`${SSM_ROOT}/assistant/{profile}/assistant-intent-pack`, e.g. `/agent-echelon/assistant/standard/assistant-intent-pack`) and passes the AgentHandler only the small param **name** in `ASSISTANT_INTENT_PACK_PARAM` (+ an `ssm:GetParameter` grant). At cold start the handler calls `hydrateIntentPackFromSsm()` (once, cached) before classifying. `getIntentPack()` prefers the hydrated value, then the inline `ASSISTANT_INTENT_PACK` env (still honored for small packs / tests), then `DEFAULT`.
 
-**Profile scope:** provisioned for profiles whose `ProfileTopology` sets `intentPackParam` (basic and standard by default) - on the AgentHandler (where the classifier runs; the AsyncProcessor consumes the already-classified `event.intent` and needs no pack). The premium profile does not provision the param by default (`intentPackParam: false`) and uses `DEFAULT`; flipping the flag in its descriptor provisions the same SSM-param + grant wiring, with no other change.
+**Profile scope:** provisioned for profiles whose `ProfileTopology` sets `intentPackParam` - all three shipped profiles do (`intentPackParam: true` in `basic-classification-stack.ts`, `standard-classification-stack.ts`, and `premium-classification-stack.ts`) - on the AgentHandler (where the classifier runs; the AsyncProcessor consumes the already-classified `event.intent` and needs no pack). A profile that sets `intentPackParam: false` in its descriptor skips the SSM-param + grant wiring and uses `DEFAULT`, with no other change.
 
 **Injecting the context** (the JSON can exceed the Windows ~8 KB command-line limit, so don't inline it on the command - merge it into `cdk.context.json`, deploy, then revert):
 ```js
@@ -138,7 +138,7 @@ Scope: pack schema, the loader's merge, and the seeder's composition. Until it l
 
 ## Related docs
 
-- `docs/design/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md` - geography/language routing (rules 1 - 2); intent is rule 3.
+- `docs/specs/interaction/assistant-config/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md` - geography/language routing (rules 1 - 2); intent is rule 3.
 - `docs/guides/developer/MODEL_STRATEGY.md` - `INTENT_ROUTE_STRATEGY` / `INTENT_TYPE_TO_KEY` the intent key feeds.
 - `docs/specs/interaction/assistant-config/SPEC-ASSISTANT-CONFIG.md` - the broader "what the assistant *is*" config pillar this is part of.
 - `docs/specs/interaction/assistant-config/SPEC-BILINGUAL-CONVERSATIONS.md` - the reply-language ("translation") feature, language signal.

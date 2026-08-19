@@ -272,10 +272,10 @@ If a Basic agent is prompt-injected to request financial data, the S3 `GetObject
 
 **Goal:** Show analytics populated with demo data.
 
-1. Log in as Premium user → navigate to Admin Dashboard
-2. Overview tab: conversation volumes from demo interactions
-3. Models tab: model usage split across Haiku/Sonnet/Opus
-4. Evaluations tab: quality scores for demo exchanges
+1. Sign in to the Admin Console as the seeded admin (the premium demo user, which the seed script also puts in the `admins` group). The console is a separate app gated on that group, not a view inside the chat app.
+2. Overview section: conversation volumes from demo interactions
+3. Models section: model usage split across Haiku/Sonnet/Opus
+4. Effectiveness section: quality scores for demo exchanges (the Evaluations sub-tab serves this in Athena mode; in Aurora mode the Effectiveness drill supersedes it)
 
 ## 6. Implementation
 

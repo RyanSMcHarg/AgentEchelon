@@ -61,7 +61,7 @@ Modern Stability text-to-image models exposed by Bedrock. AWS-native, IAM-authed
 | Response | `{ images: [base64,...], seeds, finish_reasons:['SUCCESS'|'CONTENT_FILTERED',...] }` |
 | Non-SUCCESS handling | Image dropped - caller sees honest empty, not a censored image |
 
-Enable in Bedrock console: us-east-1 / Bedrock / Model access → request access to Stability models. Approval is usually immediate.
+Enable in Bedrock console: us-west-2 / Bedrock / Model access → request access to Stability models. Approval is usually immediate.
 
 ### OpenAI gpt-image-1
 
@@ -74,10 +74,10 @@ The current state of the art for prompt adherence and typography. External-HTTP 
 | Endpoint | `https://api.openai.com/v1/images/generations` |
 | Auth | `Authorization: Bearer $OPENAI_API_KEY` |
 | Approx cost per image | $0.04 (standard quality, 1024×1024) |
-| Request body | `{ model:'gpt-image-1', prompt, n, size:'1024x1024', response_format:'b64_json', seed? }` |
+| Request body | `{ model:'gpt-image-1', prompt, n, size:'1024x1024' }` |
 | Response | `{ data: [{ b64_json:'...' }, ...] }` |
 
-**API surface caveat (verify against current OpenAI docs).** The current shaper passes `response_format: 'b64_json'`. That field is documented for DALL-E 3 but **may not be honored by `gpt-image-1`**, which is OpenAI's post-2024 image model and returns base64 by default. OpenAI's APIs generally tolerate extra fields, but if a future surface change starts returning hosted URLs instead of inline base64, the parser will currently return empty. The parser would need a URL-handling branch (the FAL parser already does this pattern) - small change, not yet implemented. Watch the first live invocation against `gpt-image-1` and confirm the response shape.
+**API surface note.** `gpt-image-1` always returns inline base64 (`data[].b64_json`) and rejects the `response_format` parameter that DALL-E 3 used, so the shaper deliberately does not send it. `seed` is likewise not a `gpt-image-1` parameter and is omitted. The base64 result feeds the persistence path identically to the Bedrock providers.
 
 Provision (the image-gen invocations are made from the shared `assistant-async-processor` Lambda - the premium profile's instance, whose topology is defined in `backend/lib/stacks/premium-classification-stack.ts` and wired by `backend/lib/stacks/assistant-profile-stack.ts`):
 
@@ -114,7 +114,7 @@ Black Forest Labs FLUX, hosted by FAL.ai. Best-in-breed open-weights quality, fa
 | Endpoint | `https://fal.run/fal-ai/flux-pro/v1.1` |
 | Auth | `Authorization: Key $FAL_KEY` |
 | Approx cost per image | ~$0.04 (pay-as-you-go; cheaper with subscription) |
-| Request body | `{ prompt, image_size:'square_hd', num_images, seed? }` |
+| Request body | `{ prompt, image_size:'square_hd', num_images, sync_mode:true, output_format:'png', seed? }` |
 | Response | `{ images: [{ url:'data:image/png;base64,...' \| 'https://...' }, ...] }` |
 
 Provision:
@@ -122,9 +122,9 @@ Provision:
 2. Create an API key (Settings → Keys).
 3. Set `FAL_KEY` on the `PremiumAsyncProcessor` Lambda environment using the same patterns shown for OpenAI above (CLI for quick, Secrets Manager for production).
 
-**Sync vs async endpoint.** The current implementation uses FAL's **sync endpoint** (`fal.run/<model-path>`) which returns inline. FAL also offers an async queue endpoint (`queue.fal.run`) that requires polling; the implementation does NOT support it today. Practical effect: a sync FLUX 1.1 Pro call is expected to return in 5-15s. If FAL's sync timeout ceiling tightens or a future model exceeds it, the deployer hits an HTTP timeout (which fails fast in `invokeImageGenModel`'s catch path). Migrating to the queue endpoint would be a per-provider invoker change - manageable but not yet done.
+**Sync vs async endpoint.** The implementation uses FAL's **sync endpoint** (`fal.run/<model-path>`) with `sync_mode: true`, which makes FAL return the image inline as a base64 `data:` URI instead of a CDN URL - required because the persistence path base64-decodes the result. It also sends `output_format: 'png'` so the bytes match the persistence path's `.png` key and `image/png` content type (FLUX defaults to JPEG). FAL also offers an async queue endpoint (`queue.fal.run`) that requires polling; the implementation does NOT support it. Practical effect: a sync FLUX 1.1 Pro call is expected to return in 5-15s. If FAL's sync timeout ceiling tightens or a future model exceeds it, the deployer hits an HTTP timeout (which fails fast in `invokeImageGenModel`'s catch path).
 
-The response URL can be either an inline `data:image/png;base64,...` (small images) or a hosted `https://fal.run/cached/...` URL (large/cached). The parser strips the `data:` prefix; hosted URLs pass through as-is.
+With `sync_mode: true` the response URL is an inline `data:image/png;base64,...` URI; the parser strips the `data:` prefix. The parser also passes a hosted `https://` URL through as-is, but the sync request shape keeps responses inline.
 
 ### Titan Image v2 / Nova Canvas (legacy)
 
@@ -223,16 +223,16 @@ This isn't a unique cost structure - it's the standard production-AWS bill for "
 | Deployment shape | Monthly baseline | External-HTTP image gen | Notes |
 |---|---|---|---|
 | **Athena mode** (default, non-VPC Lambda) | minimal | $0 incremental infra; only per-image API costs | The most common starting point. `fetch` to OpenAI/FAL has no NAT cost. |
-| **Aurora mode**, Bedrock-only image gen | ~$50-95 (proxy off; +~$44 stack-created endpoints) | n/a (uses Bedrock VPC endpoint) | Single-cloud, all-AWS. Cheapest path to drift detection + advanced analytics. |
-| **Aurora mode + external-HTTP image gen** | ~$122-174 (above + NAT Gateway, 1-2 AZ) | per-image API costs + ~$0.045/GB bandwidth | NAT gateway is the new line. Realistic for any agentic app integrating beyond Bedrock. |
+| **Aurora mode**, Bedrock-only image gen | ~$50-95 (proxy off; the ~$95 upper bound is a stack-created VPC and already includes ~$44 of interface endpoints) | n/a (uses Bedrock VPC endpoint) | Single-cloud, all-AWS. Cheapest path to drift detection + advanced analytics. |
+| **Aurora mode + external-HTTP image gen** | ~$82-159 (above + NAT Gateway at ~$32/month per AZ, 1-2 AZ) | per-image API costs + ~$0.045/GB bandwidth | NAT gateway is the new line. Realistic for any agentic app integrating beyond Bedrock. |
 
 The NAT Gateway line is **not introduced by this project** - it's the cost of running ANY VPC-attached Lambda that calls anything outside AWS. The moment a deployer adds an external MCP server, a Pinecone vector DB, a Stripe webhook, or any other non-AWS integration, the same NAT Gateway sits in front of all of them. Image-gen happens to be the first concrete trigger; it's not the only one.
 
-**Observability gap on the external-HTTP path.** Bedrock invocations carry an invocation ID natively and per-stage EMF metrics live in `lib/emf-metrics.ts` for the drift-detection path. External-HTTP calls do **not** currently emit EMF or carry a correlation ID through to provider logs. OpenAI returns `x-request-id` in response headers; FAL includes a request id in the body. Capturing those into `ImageGenInvokeResult` is a clean follow-up that would enable end-to-end tracing - tracked as a v0.3.x enhancement.
+**Observability gap on the external-HTTP path.** Bedrock invocations carry an invocation ID natively and per-stage EMF metrics live in `lib/emf-metrics.ts` for the drift-detection path. External-HTTP calls do **not** emit EMF or carry a correlation ID through to provider logs. OpenAI returns `x-request-id` in response headers and FAL includes a request id in the body, but the invoker does not capture either into `ImageGenInvokeResult`, so there is no end-to-end trace across the HTTP boundary.
 
 ## Agentic integration - where image-gen sits in the architecture
 
-AgentEchelon's fulfillment path is the **self-hosted Converse tool loop** - see CLAUDE.md > Architecture. The shared `assistant-async-processor.ts` (via `async-processor-core.ts`) runs a Converse `toolConfig` loop under the serving profile's own IAM role; there is no Bedrock Agent and no Action Group. Image generation is a normal capability of this path, not a battle-only branch: on an `image_generation` turn the worker resolves the image model with `resolveTurnImageGenModelId` (a battle variant's image model, then a non-battle experiment variant's image model, then the profile's `models.image`) and calls `invokeImageGenModel` directly instead of running the text loop. A battle resolves the same way and just runs both variants. The turn needs `ATTACHMENTS_BUCKET` and the image guardrail wired on it - the battle-eligible profile (premium by default) has these; other profiles that set `models.image` degrade to a text turn until the same env is wired on their processor.
+AgentEchelon's fulfillment path is the **self-hosted Converse tool loop** - see docs/overview/ARCHITECTURE.md. The shared `assistant-async-processor.ts` (via `async-processor-core.ts`) runs a Converse `toolConfig` loop under the serving profile's own IAM role; there is no Bedrock Agent and no Action Group. Image generation is a normal capability of this path, not a battle-only branch: on an `image_generation` turn the worker resolves the image model with `resolveTurnImageGenModelId` (a battle variant's image model, then a non-battle experiment variant's image model, then the profile's `models.image`) and calls `invokeImageGenModel` directly instead of running the text loop. A battle resolves the same way and just runs both variants. The turn needs `ATTACHMENTS_BUCKET` and the image guardrail wired on it - the battle-eligible profile (premium by default) has these; other profiles that set `models.image` degrade to a text turn until the same env is wired on their processor.
 
 **Why call it directly rather than as a Converse tool?** Image generation is slow (5-20s per call). Folding a 15-second image-gen into the synchronous Converse text loop would push a turn's latency well past acceptable bounds and couple the text timing to the image timing. So an `image_generation` turn takes the direct-invocation branch instead of the text loop.
 

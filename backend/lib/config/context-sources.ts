@@ -409,6 +409,8 @@ export function renderCatalogReference(entries: ContextSourceEntry[]): string {
     'A deployment publishing a **reserved** key MUST satisfy its contract: it may ADD fields, never',
     'remove or retype one. Each carries a `contractVersion` - adding an optional field is a minor bump,',
     'removing or retyping is major, and import rejects a profile written against a different major.',
+    'A contract may exist for a reserved key the shipped catalog above does not publish; it binds any',
+    'deployment that chooses to publish that key.',
     '',
     ...Object.entries(RESERVED_CONTRACTS).map(
       ([key, c]) => `- \`${key}\` v${c.contractVersion} requires: `

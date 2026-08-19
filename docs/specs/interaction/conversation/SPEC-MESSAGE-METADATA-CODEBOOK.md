@@ -2,7 +2,7 @@
 
 **Status:** Partial (out-of-band lookup and the cap-shedding backstop ship; the coded-state codebook is design).
 
-**Coverage:** `e2e/agent-intents.spec.ts`
+**Coverage:** `tests/e2e/agent-intents.spec.ts`
 
 **Problem and who it's for:** A conversation's analytics and experiment data should survive even the heaviest turns instead of silently vanishing when a single message carries too much state. This is for the platform developer maintaining the message and analytics pipeline, who would otherwise hand-roll an overflow-safe encoding on top of the transport. It defines a durable, deployment-extensible encoding: replace bounded state values with versioned-codebook integer codes and move analytics-only payload out of band keyed by message id. (Current state: Amazon Chime SDK caps message metadata at 1024 encoded characters, and that one field feeds both the frontend and the analytics archive; a heavy turn overflows the cap and `safeMetadataString` drops the whole blob - far worse with CJK text - so both consumers silently lose analytics and the experiment join.)
 
@@ -58,7 +58,9 @@ Each metadata field whose domain is a known set is replaced by a small integer i
 | `taskState` | the declared-graph machine state after this turn (distinct from `activeTask.status`) | **per-deployment** (the machine graph is pack-configurable) |
 | `taskTransition` | the edge this turn applied, `{from,to}` (absent when nothing advanced) | literal / out-of-band |
 | `fallbackReason` | the **known** reason set in `bedrock-resilience.ts` (`throttled` / `quota_exceeded` / `model_unavailable` / `model_error` / `access_denied` / `validation_error` / `server_error`) **plus an `other` code** | semi-open - see below |
-| `wasFallback`, `continuation` | booleans | already minimal (`0`/`1`) |
+| `respPhase` | the five-value `ResponsePhase` enum (`placeholder` / `interim` / `final` / `error` / `notice`, `analytics-metadata.ts`); never shed - `METADATA_SHED_ORDER` omits it because it decides whether a turn closes at all | fixed |
+| `trigger` | `user` / `orchestrator` (`analytics-metadata.ts` - what caused the turn) | fixed |
+| `wasFallback`, `continuation`, `guardrailBlocked` | booleans | already minimal (`0`/`1`) |
 
 `fallbackReason` is **not** strictly bounded: `bedrock-resilience.ts:102` falls through to `message || 'unknown_error'`, a free-form error string. Code the seven known reasons and reserve a final `other` code; the free-form message itself is heavy and analytics-only, so it goes **out of band** (Technique B), never inline. This keeps the inline field one character while preserving the full reason for archival. The same rule applies to any future field that is "mostly enum with an open fallthrough": code the known cases, reserve `other`, push the open tail out of band.
 
@@ -66,7 +68,7 @@ The two biggest wins are `bedrockModel` (a ~45 - 60 char id becomes one or two c
 
 ### What stays literal
 
-Open-valued fields are not coded: `inputTokens` / `outputTokens` / `latencyMs` / `totalMs` / `pollMs` / `modelMs` / `toolMs` / `processorEntryMs` (unbounded numbers - the last three are the latency split + server-clock processor-entry stamp for the E2E/model/tool/inbound metrics, see `LATENCY-TARGETS.md`), `configId` / `personaVersion` / `intentPackVersion` / `systemPromptHash` (content-addressed), `targetedSender` (an ARN), `attachment.fileKey` (an S3 key). Most of these are analytics-only and are handled by Technique B.
+Open-valued fields are not coded: `inputTokens` / `outputTokens` / `latencyMs` / `totalMs` / `pollMs` / `modelMs` / `toolMs` / `processorEntryMs` (unbounded numbers - the last three are the latency split + server-clock processor-entry stamp for the E2E/model/tool/inbound metrics, see `LATENCY-TARGETS.md`), `imageCount` (an unbounded number - how many images a generation-out turn produced, the basis for per-image cost), `configId` / `personaVersion` / `intentPackVersion` / `systemPromptHash` (content-addressed), `profileName` / `profileConfigId` / `profileVersion` (portable-profile attribution - the exact assistant profile and version that served the turn), `targetedSender` (an ARN), `attachment.fileKey` (an S3 key). Most of these are analytics-only and are handled by Technique B.
 
 `experimentId` is a borderline case. It is technically codeable - experiments are a finite, per-deployment domain (rows in the experiments table), so it could be an append-ordered codebook field exactly like `intent`. This spec keeps it **literal inline** anyway: it is the join key the frontend reads synchronously, it is only present on the small fraction of turns served by an experiment, and a UUID is ~38 encoded characters - cheap enough that coding it trades real cross-version stability (a stable UUID survives any `cbv` change) for a marginal byte saving. A deployment running many concurrent experiments on CJK-heavy traffic could revisit and code it; the codebook mechanism already supports it.
 
@@ -147,7 +149,7 @@ The dominant remaining inline costs are the genuinely open values that must stay
 
 The encoding ships with named, automated gates - it is unsafe without them:
 
-- **Budget guard.** `backend/test/lib/safe-metadata-string.test.ts` asserts a maximal heavy turn stays within 1024 encoded with the experiment join + core analytics preserved, and that an irreducible blob still drops as a last resort. This is the standing "did we just blow the 1k limit?" guard.
+- **Budget guard.** `backend/test/lib/safe-metadata-string.test.ts` asserts a maximal heavy turn stays within 1024 encoded with the experiment join + core analytics preserved, and that an irreducible blob still drops as a last resort. This is the standing guard against exceeding the 1024-character cap.
 - **Append-only invariant.** A test snapshots each coded domain's ordered values per `cbv` and fails if an existing entry is reordered or removed without a `cbv` bump (reordering silently remaps historical data - the one unrecoverable error).
 - **Round-trip identity.** For every coded field, `decode(encode(v)) === v` across the full domain.
 - **Honest-degradation.** An out-of-range code decodes to `unknown` (not a throw, not a wrong value); an unresolved `cbv` falls back to literal reads. Both asserted explicitly.

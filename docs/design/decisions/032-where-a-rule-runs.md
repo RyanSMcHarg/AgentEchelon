@@ -15,7 +15,9 @@ tracking: |
   Tenets, plus one worked example built end to end: the composer addresses a task answer and names the
   task; post-processing dispatches the ones that arrived at nobody, and counts them. Supersedes the
   direction, taken earlier the same day, that the channel flow should repair a missing `Target` inline.
-  The server half is verified live; the composer half ships with the next client build.
+  Both halves are built and deployed. The server half is verified live; the composer half is
+  unit-verified with no live exercise yet - the `Repairs` count falling to zero is what will show it
+  working.
 ---
 
 # ADR-032: Where a rule runs - the critical path, or after it
@@ -123,6 +125,14 @@ doing with a dismiss beside it - a person who wants to say something else in the
 or every remark becomes an answer. What the person types always wins: an explicit mention, `@all` and a
 slash command each take the branch away. In a 1:1 it does nothing at all, because Amazon Chime SDK's
 AUTO trigger already routes every message to the assistant there.
+
+**A task answer takes precedence over the sticky mention, because the chip and the send must agree.**
+The banner renders "Answering <work item>" ahead of the sticky target, so when both exist the sticky
+prefix stands down for that send: prepending it would set the mention target to the sticky human,
+force the send out of the task-answer branch, and route the message to that person with no task id
+while the UI said the opposite - the work item would stay blocked. The sticky target is not cleared,
+only skipped; it comes back once the work item is answered or dismissed, exactly as the banner does
+(`MessageInput.tsx`).
 
 Post-processing then acts only on what arrived at nobody, and two of its refusals are load-bearing
 rather than defensive:

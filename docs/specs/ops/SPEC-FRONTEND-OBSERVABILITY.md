@@ -1,6 +1,6 @@
 # SPEC: Per-Page Frontend Observability
 
-**Status:** Proposed **Layer:** Core platform (ops - cross-cutting telemetry, not an interaction pillar) **Plane:** core **Scope:** `frontend/packages/chat`, `frontend/packages/admin`, `frontend/packages/shared` **Related:** [`../interface/admin/DESIGN-SEPARATE-ADMIN-APP.md`](../interface/admin/DESIGN-SEPARATE-ADMIN-APP.md), `docs/LATENCY-TARGETS.md`
+**Status:** Proposed **Layer:** Core platform (ops - cross-cutting telemetry, not an interaction pillar) **Plane:** core **Scope:** `frontend/packages/chat`, `frontend/packages/admin`, `frontend/packages/shared` **Related:** [`../interface/admin/DESIGN-SEPARATE-ADMIN-APP.md`](../interface/admin/DESIGN-SEPARATE-ADMIN-APP.md), `docs/guides/developer/LATENCY-TARGETS.md`
 
 **Coverage:** none - proposed; no telemetry is emitted yet.
 
@@ -37,7 +37,7 @@ The seam is real and already carries traffic. Do not re-propose it; extend it.
 
 ## Routing model (why "page" is not a URL)
 
-Neither app uses a router. The chat app (`chat/src/App.tsx`) is a state machine: auth views (`login` / `register` / `verify` / `success` / `forgot`), then a list+detail shell where `activeConversation` selects the detail pane, a mobile master-detail swap driven by the `has-active` CSS class, and a `NewConversationModal`. The admin app (`admin/src/components/admin/AdminDashboard.tsx`) is query-param navigation: seven `SECTIONS` grouping sub-tab `TabId`s, reflected in `?admin=<tab>` with `?conv=<id>` deep links. A "page" here is therefore a rendered view/state, and a "route change" is a state transition, not a browser navigation. Per-page attribution must be stamped by the app at transition time, not inferred from `location`.
+Neither app uses a router. The chat app (`chat/src/App.tsx`) is a state machine: auth views (`login` / `register` / `verify` / `success` / `forgot`), then a list+detail shell where `activeConversation` selects the detail pane, a mobile master-detail swap driven by the `has-active` CSS class, and a `NewConversationModal`. The admin app (`admin/src/components/admin/AdminDashboard.tsx`) is query-param navigation: eight `SECTIONS` grouping sub-tab `TabId`s, reflected in `?admin=<tab>` with `?conv=<id>` deep links. A "page" here is therefore a rendered view/state, and a "route change" is a state transition, not a browser navigation. Per-page attribution must be stamped by the app at transition time, not inferred from `location`.
 
 ## Personas
 
@@ -134,7 +134,7 @@ BUILT: `admin_tab_viewed`. PROPOSED: `tab_settle_ms`, `query_failed`, dwell, and
 - No third-party RUM SaaS (Datadog, Sentry, New Relic, Google Analytics). The seam stays first-party: `web-vitals` -> `/events` -> Athena/Aurora -> admin console. A deployer may wire an external RUM sink themselves, but the product does not depend on one.
 - No PII in analytics. Events carry `user_id` (Cognito sub), classification/clearance, and a session id only. Message content, prompts, file names, and free-text stay out of the client-events stream; `properties` remain typed scalars, not payloads.
 - No new datastore or ingestion path. Everything routes through the existing Firehose/Aurora `client_events` seam.
-- No token-level streaming timing; TTFF (time to first feedback) remains the perceived- latency metric per `docs/LATENCY-TARGETS.md`.
+- No token-level streaming timing; TTFF (time to first feedback) remains the perceived- latency metric per `docs/guides/developer/LATENCY-TARGETS.md`.
 - No synthetic monitoring or uptime probing; this spec is real-user telemetry only.
 
 ## Open questions

@@ -1,6 +1,6 @@
 ---
 title: "ADR-029: A duel's clarifying question is public, and the answer gets its own placeholder"
-status: Accepted 2026-08-13 (owner). Not built.
+status: Accepted 2026-08-13 (owner). Built; the deferred reply question resolved as option B (see ADR-030).
 date: 2026-08-13
 related:
   - "../../specs/capabilities/SPEC-BATTLE.md"
@@ -14,17 +14,25 @@ related:
   - "../../../backend/lambda/src/lib/async-processor-core.ts"
   - "../../../backend/lambda/src/lib/battle-state.ts"
 tracking: |
-  DECIDED, NOT BUILT. Reverses the clarification privacy rule in SPEC-BATTLE and removes the last
-  caller that hands a placeholder id to the processor, which is what closes the open item in ADR-022
-  section 4 ("one field names two different things"). The e2e assertion that a clarifying question is
-  NOT broadcast inverts with this decision and must be rewritten rather than deleted.
+  DECIDED AND BUILT. Shipped: the clarifying question is a visible public update to the side's own
+  placeholder; the resume posts its OWN placeholder through the handler entry; and `waitingMessageId`
+  narrowed to the marker-clear job only (the handler passes
+  `battleContext.clearWaitingMarkerMessageId`, and nothing hands a `placeholderMessageId`), which
+  closes the open item in ADR-022 section 4 ("one field names two different things"). Reverses the
+  clarification privacy rule in SPEC-BATTLE. The e2e assertion that a clarifying question is NOT
+  broadcast inverted with this decision. The reply question this ADR deferred resolved as option B -
+  the ordinary Lex turn IS the resume - and is superseded in that respect by ADR-030.
 ---
 
 # ADR-029: A duel's clarifying question is public, and the answer gets its own placeholder
 
 ## Status
 
-**Accepted (owner, 2026-08-13). Not built.**
+**Accepted (owner, 2026-08-13). Built**: the clarifying question ships as a visible public update to
+the side's placeholder (decisions 1, 2, 6 and 7), the resume posts its own placeholder (decision 5),
+and `waitingMessageId` is marker-clear-only. Decision 3 (keep the deny) was overtaken by measurement:
+the reply is delivered and the ordinary Lex turn is the resume - see "The reply" below and
+[ADR-030](./030-a-message-is-answered-by-the-assistant-whose-work-it-answers.md).
 
 ## Problem and who it's for
 
@@ -85,8 +93,9 @@ placeholder, like every other turn.**
 2. **The battle state is unchanged.** That side stays `WAITING_FOR_USER`, which is non-terminal and
    suppresses the round-2 orchestrator exactly as it does now (ADR-026), and the user-wait clock still
    applies.
-3. **The user's reply keeps being denied, for now, and that is the part of this decision that is NOT
-   settled.** See "The reply, and why it is still denied" below.
+3. **The user's reply: the deny decided here proved unreachable on the deployment, and the deferred
+   option B is what ships** - the reply is delivered and the ordinary Lex turn is the resume. See
+   "The reply" below.
 4. *(withdrawn - see below)*
 5. **The resumed side posts a NEW placeholder** and updates it with the answer, through the handler
    entry like every other bypass (ADR-025). It carries a fresh correlation id and resolves through the
@@ -151,7 +160,9 @@ signal to design, and specifically no `<!--taskwaiting-->` to invent beside `<!-
   only from a prompt clause that no longer exists.
 - **The channel marker stops being the source of truth.** `<!--battlewaiting-->` and the composer's
   `battleWaitingBots` derivation are a channel-side projection of state that belongs in the task store,
-  which is why an ordinary chain waiting on the same person renders nothing today.
+  which is why an ordinary chain waiting on the same person rendered nothing when this was written.
+  That gap has since closed: the composer renders task-sourced open work items (the `OpenWorkItems`
+  queue, fed by the open-work-item service), so an ordinary chain's wait is visible alongside a duel's.
 - **`WAITING_FOR_USER` stays, narrowed to what it is for.** It suppresses the round-2 orchestrator,
   which is a battle concern and stays a battle concern. What it stops carrying is the user-facing "you
   owe an answer", which the assigned task carries instead. ADR-026 already treats a clarification and a
@@ -165,7 +176,11 @@ That is the destination. This ADR does not build it; it records that the battle 
 work assigned to a person, so the next change reaches for `assigneeUserSub` rather than for a third
 representation.
 
-## The reply, and why it is still denied
+## The reply: the deny proved unreachable, and option B is what ships
+
+> **Superseded in part by
+> [ADR-030](./030-a-message-is-answered-by-the-assistant-whose-work-it-answers.md)**, which settles
+> routing on the task rather than the target and retires the flow's `Target`-based continuation.
 
 The first draft of this decision said the reply would be released and the Lex entry would stand down,
 "the same complement rule `@all` already uses". **That is not implementable as written, and the reason
@@ -181,26 +196,29 @@ measured). The flow cannot stamp anything the Lex entry can read: `Metadata` doe
 and rewriting the user's own `Content` to carry a marker is exactly what `stripMessageMarkers` exists to
 defend against.
 
-So there are two real options, and this ADR does not choose between them:
+Two real options were weighed, and events settled the choice:
 
-- **A. Keep the deny.** Costs the archive record of the exchange, which is what the end-of-battle
-  summary wants. This is what ships today and what the build under this decision keeps.
-- **B. Let the ordinary Lex turn BE the resume.** Do not deny; the targeted reply invokes that bot's
-  Lex as normal, and the handler notices it owns a `WAITING_FOR_USER` row for this channel's active
-  battle and resumes from there. One entry, message persisted, and the flow's continuation path
-  disappears entirely rather than being duplicated. It costs a battle-state read on the Lex path, gated
-  behind the `ChannelBattleConfig` the handler already caches, and it makes the resume depend on state
-  rather than on routing.
+- **A. Keep the deny.** What this decision originally kept. **It is unreachable on the deployment:**
+  the flow callback carries no `Target` (measured; ADR-023 and ADR-030), so the flow can never
+  recognise the reply as a continuation and the deny never fires. The reply is delivered, persisted,
+  and reaches the archive like any other message.
+- **B. Let the ordinary Lex turn BE the resume.** The targeted reply invokes that bot's Lex as normal,
+  and the handler notices it owns a `WAITING_FOR_USER` row for this channel's active battle and
+  resumes from there. One entry, message persisted, and the flow's continuation path disappears
+  entirely rather than being duplicated.
 
-B is the better shape and is a larger change than this decision needs. Deciding it is deferred, and
-until it is decided the deny stands - with the cost recorded here rather than discovered again.
+**B is the shipped behaviour.** The deferral resolved itself: with the deny unreachable, the reply
+arrives at the addressed bot's Lex as an ordinary turn, and the handler's resume (per ADR-030,
+routing follows the work) is what answers it. The end-of-battle summary's want - the archive holding
+the exchange - is met, because the reply persists like any other message.
 
 ## Consequences
 
 - **The transcript reads in order.** Question, then the answer at the bottom, where a user who waited
   an hour is looking. Today the answer lands in the bubble from before the question was asked.
-- **The archive holds the QUESTION.** Half of what SPEC-BATTLE's open question about the verbatim
-  clarifying Q&A needs. The reply half waits on option B above.
+- **The archive holds the QUESTION - and the reply.** The question is a persisted placeholder update,
+  and the reply is delivered and archived as an ordinary message (option B above), so the verbatim
+  clarifying Q&A SPEC-BATTLE's open question asked for is in the record.
 - **The last handed placeholder id disappears.** `placeholderMessageId` stops meaning two things, and
   ADR-022 section 4's open item closes. `resolvePlaceholderTarget`'s handed-id branch and the
   `BYPASS_PLACEHOLDER_ATTR` silence branch in the handler both lose their only caller.
@@ -216,6 +234,7 @@ until it is decided the deny stands - with the cost recorded here rather than di
   routing rule that still holds.
 - **A rival can read the question in round 2**, which is intended, and which makes "did this side ask a
   useful clarifying question" a thing a rebuttal can address.
-- **Releasing the reply adds a stand-down branch.** It is the same shape as the `@all` size branch and
-  carries the same risk: if the flow and the handler ever disagree about whether a message is a
-  continuation, the turn is answered twice or not at all. Both sides read one shared predicate.
+- **No stand-down branch turned out to be needed.** Releasing the reply was expected to add one, with
+  the `@all`-shaped risk that the flow and the handler disagree about whether a message is a
+  continuation. With the flow's continuation unreachable (no `Target` in the callback), the handler
+  alone decides what a reply resumes, so that disagreement cannot arise.

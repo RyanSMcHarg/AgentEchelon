@@ -80,7 +80,7 @@ Amazon Chime SDK → Kinesis Data Stream ─┤    append-only system of record 
                                         │
                                         └─► ArchivalLambda (VPC) → Aurora PostgreSQL Serverless v2
                                                    ↓                      ↑
-                                            (via RDS Proxy)       (via RDS Proxy, IAM auth)
+                                            (IAM auth)             (IAM auth)
                                                                           ↑
                                                             EvaluationLambda (VPC)
                                                             AnalyticsQueryLambda (VPC)
@@ -89,6 +89,8 @@ Amazon Chime SDK → Kinesis Data Stream ─┤    append-only system of record 
                                                                           ↓
                                                                  Admin Dashboard (frontend)
 ```
+
+By default every Lambda connects to the cluster's writer endpoint directly with IAM authentication; when the opt-in RDS Proxy is enabled (`enableRdsProxy`), the same connections route through the proxy instead, with the same IAM auth.
 
 The Kinesis stream fans out to **two** independent sinks. The top branch (`ConversationArchive`) is the same raw archive as the default Athena mode and is always-on; it is the durable system of record. The bottom branch is the Aurora analytics projection that this mode adds. The admin console reads conversation history from the archive and the analytics views from Aurora.
 
@@ -221,6 +223,8 @@ const cluster = new rds.DatabaseCluster(this, 'AnalyticsDb', {
   deletionProtection: props.environment === 'prod',
 });
 
+// Opt-in only (`enableRdsProxy`, default off): without it, Lambdas connect to the
+// writer endpoint directly with the same IAM auth and no proxy is created.
 const proxy = new rds.DatabaseProxy(this, 'AnalyticsProxy', {
   proxyTarget: rds.ProxyTarget.fromCluster(cluster),
   secrets: [dbSecret],
@@ -297,7 +301,7 @@ Rewritten version of `backend/lambda/src/archival/*` that writes to Aurora inste
 
 ### 7. Evaluation Runner Lambda
 
-Source: `backend/lambda/src/analytics-aurora/evaluation-runner.ts`. Scheduled Lambda (daily 2am UTC), also directly invokable (empty payload) to re-score a backlog on demand.
+Source: `backend/lambda/src/analytics-aurora/evaluation-runner.ts`. Scheduled Lambda (every 30 minutes; the construct name `DailyEvaluationSchedule` is historical), also directly invokable (empty payload) to re-score a backlog on demand.
 
 **Pass A - per-exchange relevance scoring (built).**
 1. Queries unscored exchanges (`evaluation_results` LEFT JOIN, `IS NULL`), up to `EVAL_MAX_PER_RUN` (default 200) per run.

@@ -2,7 +2,7 @@
 
 **Status:** Implemented (with a small set of tracked gaps, section 6) **Layer:** Interaction **Pillar:** Identity & Access **Plane:** admin **Summary:** A capability model that decides who may perform a privileged action, proves who performed it, and never over-grants, by splitting every operator into a membership-gated chat identity and a separate, just-in-time admin identity. **Technical designs:** [`DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md`](DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md) (how a capability becomes IAM-enforceable), [`DESIGN-ADMIN-AGENT-NOTIFICATIONS.md`](DESIGN-ADMIN-AGENT-NOTIFICATIONS.md) (how admin-facing alerts are delivered inside the admin trust boundary). **Site section(s):** Admin console, identity and access.
 
-**Coverage:** `e2e/credential-exchange.spec.ts`, `e2e/admin-attachments.spec.ts`, `e2e/signin.spec.ts`
+**Coverage:** `tests/e2e/credential-exchange.spec.ts`, `tests/e2e/admin-attachments.spec.ts`, `tests/e2e/signin.spec.ts`
 
 ## 1. Business problem
 
@@ -56,7 +56,9 @@ At the conversation level, two levels of authority exist, and they are not the s
 | Join as a non-visible observer | No | Yes |
 | Redact a message | Yes | Yes |
 | Delete a message | No | Yes |
-| Delete a conversation | Yes | Yes |
+| Delete a conversation | No | No |
+
+Deleting a conversation is not a supported action at either level: archiving (read-only via the immutable `archived` tag, `SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md`) is the supported end-of-life path, and `chime:DeleteChannel` sits on no credential-exchange rung.
 
 Creating a conversation is neither a moderator nor an admin action: it is a base user capability, and moderator status is a consequence of creating the channel, not a permission that authorizes it. A moderator of a channel cannot exist before the channel does.
 
@@ -98,7 +100,7 @@ Creating a conversation is neither a moderator nor an admin action: it is a base
 Most of the model ships. The known gaps are:
 
 - The archive plane's per-request proof-of-need decrypt gate (vend archive decrypt only against a recorded, approved request) is not yet built; the customer-managed encryption key it would gate is implemented.
-- Fine-grained per-resource IAM enforcement of privileged actions is built but opt-in behind a flag; the interim control is a configurable admin-group gate. See [`DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md`](DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md).
+- Fine-grained per-resource IAM enforcement of privileged actions is built and on by default; a deployment can opt out with `-c adminIamEnforcement=false` (`admin-plane-stack.ts:165-166`), falling back to the weaker admin-group gate (group-gated, not per-capability IAM-enforced). See [`DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md`](DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md).
 - Admin reads are attributed for content vends but cross-classification read-logging as a blanket accountability control is not complete.
 
 ## 7. Open product questions
@@ -107,7 +109,7 @@ Most of the model ships. The known gaps are:
 - **Moderation-audit as its own capability.** Whether "who redacted or deleted, and when" is a separate capability or rides on the moderate capability.
 - **Admin console distribution.** A separate admin application (plan item D) is a natural place to require these capabilities per persona; how the two interact is open.
 - **Archive read accountability.** Whether, and how strictly, every cross-classification read (not only mutations and content vends) must be logged before the model is used where messages are personal data.
-- **Default enforcement mode.** Whether per-resource IAM enforcement should become the default for all admin auth modes, or stay opt-in with the group gate as the ceiling in the default mode.
+- **Opt-out enforcement mode.** Per-resource IAM enforcement is the default; whether the `-c adminIamEnforcement=false` opt-out (group gate as the ceiling) should remain available for all admin auth modes is open.
 
 ## Related
 

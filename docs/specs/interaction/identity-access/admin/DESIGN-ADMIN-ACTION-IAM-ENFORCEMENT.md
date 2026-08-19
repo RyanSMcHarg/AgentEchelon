@@ -1,8 +1,8 @@
 # DESIGN: Admin-Action IAM Enforcement
 
-**Status:** Built, flag-gated (opt-in), deployed and validated on the on-flag path. **Layer:** Interaction **Pillar:** Identity & Access **Plane:** admin **Product spec:** [`SPEC-ADMIN-IDENTITY.md`](SPEC-ADMIN-IDENTITY.md) (the capability model, personas, and fail-closed requirement this implements). **Summary:** Every privileged archive/analytics admin action is expressed as a named capability mapped to a specific API Gateway resource, so a deployer's IAM role can be denied a specific action or specific data at the gateway rather than only by an application group check.
+**Status:** Built, on by default (opt-out with `-c adminIamEnforcement=false`), deployed and validated on the enforced path. **Layer:** Interaction **Pillar:** Identity & Access **Plane:** admin **Product spec:** [`SPEC-ADMIN-IDENTITY.md`](SPEC-ADMIN-IDENTITY.md) (the capability model, personas, and fail-closed requirement this implements). **Summary:** Every privileged archive/analytics admin action is expressed as a named capability mapped to a specific API Gateway resource, so a deployer's IAM role can be denied a specific action or specific data at the gateway rather than only by an application group check.
 
-**Coverage:** `e2e/admin-attachments.spec.ts`, `e2e/credential-exchange.spec.ts`
+**Coverage:** `tests/e2e/admin-attachments.spec.ts`, `tests/e2e/credential-exchange.spec.ts`
 
 The Amazon Chime SDK plane is already IAM-enforced (the credential exchange vends `chime:*` session policies scoped to exactly the requested capability). The archive and analytics plane was group-gated only. This design brings that plane up to the same enforceability and grounds the boundaries in the personas of the product spec (FR-3, capability-level denial).
 
@@ -49,7 +49,7 @@ The wired capabilities and their resources:
 
 ## 3. APIs and interfaces
 
-- **Per-capability resources.** The analytics API, previously coarse, is split so each capability has its own `execute-api:Invoke` resource (the paths in section 2), each `AWS_IAM`-authorized under the flag. A role whose policy omits a resource is denied at the gateway.
+- **Per-capability resources.** The analytics API is split so each capability has its own `execute-api:Invoke` resource (the paths in section 2), each `AWS_IAM`-authorized by default (the opt-out falls back to the Cognito-group authorizer). A role whose policy omits a resource is denied at the gateway.
 - **The queryType-to-capability partition** (`backend/lambda/src/lib/admin-capability-map.ts`) is the shared contract that stops a caller reaching an out-of-capability query through an in-capability resource: for the analytics plane the handler rejects a `queryType` that does not belong to the resource's capability.
 - **The exchange vend request** carries an `identity` (`chat` or `admin`) and a capability set. An archive vend (an `execute-api` session policy) and an Amazon Chime SDK Messaging vend (a `chime:*` session policy) need different session policies, so the exchange rejects a request that mixes archive and Amazon Chime SDK Messaging capabilities. A content-read (A2) vend emits `admin_scoped_credential_vend` and scopes the session policy to the messages resource for its lifetime.
 - **The principal contract.** On an `AWS_IAM`-authorized call, API Gateway populates `requestContext.identity.userArn` (the assumed-role ARN, used for the ceiling) and `cognitoAuthenticationProvider` (from which `iamCallerSub` extracts the verified human sub). On a Cognito-JWT call these are absent, which is exactly what makes the fallback fail closed.

@@ -6,7 +6,7 @@
 
 **Design, NOT built:** the local-knowledge tool registry (`ModelPlan.tools` is empty at every return site), the per-turn budget ceiling and spend-cap kill-switch, tool-result caching, and the external-spend line in analytics and the admin console. Sections describing those are marked inline.
 
-**Coverage:** `e2e/agent-intents.spec.ts`
+**Coverage:** `tests/e2e/agent-intents.spec.ts`
 
 **Problem and who it's for:** A business running an assistant wants the strongest model that fits each turn and no more - a single fixed model is too weak for the hard turns or too costly for the easy ones - and the right choice depends on the turn's context (data sensitivity, cost ceiling, geographic segment, language), not just its intent. This is for the AI developer, who wants the strongest model that fits each turn within the classification cap, and the platform developer extending routing to non-Bedrock providers; the alternative is hand-rolling per-turn routing logic or paying for the top model on every turn. It defines the `RoutingContext` signal set and the provider-adapter seam that consumes it, so a deployment can route per turn without forking the processor.
 
@@ -145,7 +145,7 @@ The architecture has two layers: a Bedrock-native base and a gated non-Bedrock e
 The seam is a distinct layer rather than folded into the base, for four reasons:
 - **Accuracy.** A CN-native model wins on Chinese fluency + parametric China knowledge, but local-fact accuracy (hours, prices, "best X near Y") is the tool layer. That layer is not built on either path yet (see §Tool registry), so the seam's contribution today is the fluency/reasoning edge alone.
 - **Cost.** DeepSeek is markedly cheaper than Sonnet-4-class (Qwen sits in the middle), so a non-Bedrock plan can lower per-turn cost on CN traffic. That spend is outside AWS, however, and must be tracked explicitly (see §Observability).
-- **Latency.** The backend is `us-east-1`; DeepSeek/Qwen are China/SG-hosted, so a non-Bedrock call adds a trans-Pacific hop and is slower from our infrastructure even though it is faster for a user physically in China. In-country reach is a deployment-topology problem, not a model swap, and is out of scope here.
+- **Latency.** The backend is `us-east-1`; DeepSeek/Qwen are China/SG-hosted, so a non-Bedrock call adds a trans-Pacific hop and is slower from the deployment's infrastructure even though it is faster for a user physically in China. In-country reach is a deployment-topology problem, not a model swap, and is out of scope here.
 - **Bedrock reality.** First-class Chinese options on Bedrock are thin, which is why the seam exists as its own layer. It is thinner than it was: the catalog now carries a DeepSeek entry served by Bedrock (`deepseek_v3` in `backend/lib/config/model-strategy.ts`), and that is what makes the in-AWS CN path preferable to crossing the border. The seam remains for the cases a Bedrock-served model cannot cover - a provider Bedrock does not serve, or reach for users physically in China.
 
 ## Observability, cost tracking & flagging

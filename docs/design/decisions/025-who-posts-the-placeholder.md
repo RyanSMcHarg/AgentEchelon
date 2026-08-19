@@ -93,8 +93,8 @@ flow.
 ### 1. The handler posts on the bypass paths (leaning)
 
 The handler posts its own placeholder for `@all`, `/battle` and any future bypass, and returns to its
-caller the fact that it has done so rather than the text to post. The Lex path is unchanged: Chime
-keeps materialising that placeholder from the fulfillment return.
+caller the fact that it has done so rather than the text to post. The Lex path is unchanged: Amazon
+Chime SDK keeps materialising that placeholder from the fulfillment return.
 
 - **It matches what is actually happening.** The assistant acknowledges the request it received, then
   hands off to the processor for the full response. The component that decided what the turn IS is the
@@ -119,7 +119,7 @@ keeps materialising that placeholder from the fulfillment return.
   cost:
   - **TTFF improves slightly.** The placeholder is posted before the handler returns rather than after
     its caller receives the return, which removes one hop from the first visible feedback on a bypass.
-  - **The processor dispatch is delayed by one Chime round trip.** The answer lands that much later.
+  - **The processor dispatch is delayed by one Amazon Chime SDK round trip.** The answer lands that much later.
     Small, and paid only on bypass turns.
   - **A failed send stops being silent.** Today the dispatch has already gone when the caller's send
     fails, so the processor produces an answer with no placeholder to update and falls back to a scan.
@@ -131,7 +131,7 @@ keeps materialising that placeholder from the fulfillment return.
   path already posts a placeholder, takes the returned id and dispatches with it immediately
   (`waitingMsgId` in `channel-flow-processor.ts`). The evidence is that path working, not an argument
   from timing, and a test should pin it.
-- **Cost: two resolution paths again.** The Lex path still resolves by lookup, because Chime
+- **Cost: two resolution paths again.** The Lex path still resolves by lookup, because Amazon Chime SDK
   materialises that placeholder and no AE component ever sees its id. The `@all` handoff deliberately
   collapsed to one path; this re-splits it. The split is at least principled - whoever can know the id
   passes it - but it is a real reversal and must be recorded as one rather than discovered later.
@@ -144,8 +144,11 @@ keeps materialising that placeholder from the fulfillment return.
   - The processor does not need it at dispatch. It resolves at FINALIZE, after the model call, by a
     single mapping read. The mapping lands in about a second and the model call takes seconds, so the
     read succeeds.
-  - `pollForPlaceholderMessage` is the THIRD fallback, after the mapping read and an explicitly handed
-    id, on both the success and error paths. On an ordinary turn it does not run.
+  - The last resort is `scanForPlaceholderMessage`, behind the mapping read and an explicitly handed
+    id, and it runs on BOTH the success and error paths - so an error notice still lands on the
+    person's "One moment..." bubble even when the mapping write failed. It is deferred until the
+    answer (or the error) is ready to deliver, never before the model call, so on an ordinary turn it
+    does not run.
 
   So the honest accounting is: this option lets the bypass paths skip **one GetItem**. The mapping, the
   fallback and the flow's claim all stay, and they stay under option 2 as well for as long as any path
@@ -168,7 +171,7 @@ As option 1, plus the Lex path: the handler posts the placeholder itself and ret
   fallback could retire. **Weigh this modestly.** Resolution is not failing today - the mapping is
   written by the flow the instant the placeholder appears and is read once, at finalize, long after it
   has landed. This removes a working mechanism rather than a broken one.
-- **Blocker: Chime materialises a message even from an empty `messages` array.** Verified live and
+- **Blocker: Amazon Chime SDK materialises a message even from an empty `messages` array.** Verified live and
   recorded at the flow's duplicate-placeholder guard. So every ordinary turn would leave a stray empty
   envelope beside the real placeholder. Removing it means the channel flow inspecting and dropping
   Lex envelopes, which is more flow behaviour rather than less and contradicts the rule this ADR is
@@ -192,7 +195,7 @@ The handler dispatches; the processor posts the placeholder as its first act, th
 
 ### 4. Status quo
 
-The flow keeps posting on bypasses, Chime keeps materialising on the Lex path.
+The flow keeps posting on bypasses, Amazon Chime SDK keeps materialising on the Lex path.
 
 - **Nothing breaks, and that is the point.** It costs nothing today and leaves one profile-resolved
   behaviour with four routes to the channel, none of them written down as a decision.
@@ -222,7 +225,9 @@ whose latency is already the problem.
   that fails if the dispatch moves back in front of the send, not merely one that checks the id
   arrives.
 - `channel-flow-processor.ts` loses `sendBotMessage` from both turn paths. It keeps it for its own
-  rejection notices, which is the only remaining reason the flow sends anything.
+  rejection notices, and for the HAND-BACK FALLBACK: when a turn hands the message back instead of
+  posting its own acknowledgment, the flow posts on the turn's behalf, so the caller's contract is
+  unchanged (see Status). Those are the two remaining reasons the flow sends anything.
 - **The bypass paths do NOT hand `placeholderMessageId` to the processor.** An earlier draft of this
   bullet said they would, on the reasoning that a component which posts the message holds its id. It
   does hold it, and passing it on would require posting BEFORE the dispatch, which means reordering
