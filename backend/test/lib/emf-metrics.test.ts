@@ -49,7 +49,10 @@ describe('emf-metrics', () => {
       expect(aws.CloudWatchMetrics[0]).toEqual({
         Namespace: 'AgentEchelon/Test',
         Dimensions: [['SomeDim']],
-        Metrics: [{ name: 'TestCounter', unit: 'Count' }],
+        // CloudWatch requires capitalised Name/Unit inside _aws. The input API takes lowercase
+        // (line 39); emitting it lowercase is what made every document malformed and silently
+        // discarded, so this assertion is on the WIRE shape, not the caller's shape.
+        Metrics: [{ Name: 'TestCounter', Unit: 'Count' }],
       });
       expect(out.SomeDim).toBe('a');
       expect(out.TestCounter).toBe(1);
@@ -75,7 +78,7 @@ describe('emf-metrics', () => {
       const aws = out._aws as { CloudWatchMetrics: Array<{ Namespace: string; Metrics: unknown[] }> };
       expect(aws.CloudWatchMetrics[0].Namespace).toBe('AgentEchelon/Drift');
       expect(aws.CloudWatchMetrics[0].Metrics).toEqual([
-        { name: 'DriftStageLatency', unit: 'Milliseconds' },
+        { Name: 'DriftStageLatency', Unit: 'Milliseconds' },
       ]);
       expect(out.Stage).toBe('message_embed');
       expect(out.DriftStageLatency).toBe(123);
@@ -114,7 +117,7 @@ describe('emf-metrics', () => {
       const out = lastLog();
       const aws = out._aws as { CloudWatchMetrics: Array<{ Metrics: unknown[] }> };
       expect(aws.CloudWatchMetrics[0].Metrics).toEqual([
-        { name: 'drift_fired', unit: 'Count' },
+        { Name: 'drift_fired', Unit: 'Count' },
       ]);
       expect(out.Counter).toBe('drift_fired');
       expect(out.drift_fired).toBe(1);

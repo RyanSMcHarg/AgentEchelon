@@ -23,6 +23,7 @@ import type { QueryResult, QueryResultRow } from 'pg';
 jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
   query: jest.fn(),
   getClient: jest.fn(),
+  ensureSchema: jest.fn(),
 }));
 
 const mockBedrockSend = jest.fn();
@@ -152,8 +153,10 @@ describe('summary-updater handler', () => {
           { version: 2, summary: 'Earlier discussion of the staging migration.', purpose: 'ops', topics: ['migration'] },
         ]),
       )
-      // getMessageCount (called BEFORE the INSERT in the source)
-      .mockResolvedValueOnce(mockRows([{ count: '12' }]))
+      // NOTE: no getMessageCount hop any more - `message_count` is not written (ADR-020 / migration
+      // 015), so the INSERT is the very next query. Leaving the old mock queued here made the INSERT
+      // consume the COUNT row and left the real INSERT mock unconsumed, so this assertion passed
+      // without the write it claims to check ever being exercised.
       // INSERT new version
       .mockResolvedValueOnce(mockRows([{ version: 3 }]));
 
@@ -187,7 +190,10 @@ describe('summary-updater handler', () => {
       'Coordinating tonight\'s production database migration.',
       ['migration', 'staging', 'release'],
       ['target window 10pm UTC', 'rollback plan ready'],
-      expect.any(Number), // totalMessageCount (lookup happened before this call)
+      // `message_count` is NO LONGER written (ADR-020, migration 015): it stored the channel TOTAL,
+      // which is channel STATE frozen into a versioned row, not provenance for this summary version.
+      // Readers count it live from `messages`. The parameter list is the assertion that the column
+      // really is gone from the write path, not just from the schema.
       3, // previousVersion(2) + 1
       'anthropic.claude-3-haiku-20240307-v1:0',
     ]);
@@ -214,8 +220,6 @@ describe('summary-updater handler', () => {
       )
       // pull existing summary
       .mockResolvedValueOnce(mockRows([]))
-      // getMessageCount (called BEFORE the INSERT in the source)
-      .mockResolvedValueOnce(mockRows([{ count: '5' }]))
       // INSERT → 0 rows (race lost)
       .mockResolvedValueOnce(mockRows<{ version: number }>([]));
 
@@ -251,8 +255,7 @@ describe('summary-updater handler', () => {
         ]),
       )
       .mockResolvedValueOnce(mockRows([]))
-      .mockResolvedValueOnce(mockRows([{ count: '1' }]))   // getMessageCount first
-      .mockResolvedValueOnce(mockRows([{ version: 1 }]));  // then INSERT
+      .mockResolvedValueOnce(mockRows([{ version: 1 }]));  // INSERT (no message-count hop)
 
     // Realistic Haiku output: fenced block + leading prose.
     mockHaikuResponse(
@@ -331,8 +334,7 @@ describe('summary-updater handler', () => {
         ]),
       )
       .mockResolvedValueOnce(mockRows([]))
-      .mockResolvedValueOnce(mockRows([{ count: '1' }]))   // getMessageCount first
-      .mockResolvedValueOnce(mockRows([{ version: 1 }]));  // then INSERT
+      .mockResolvedValueOnce(mockRows([{ version: 1 }]));  // INSERT (no message-count hop)
 
     mockHaikuResponse(JSON.stringify({
       summary: 'ok',

@@ -26,7 +26,7 @@ jest.mock('@aws-sdk/client-s3', () => ({
   PutObjectCommand: jest.fn((input) => ({ input })),
 }));
 
-jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({ query: jest.fn() }));
+jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({ query: jest.fn(), ensureSchema: jest.fn() }));
 
 import { query } from '../../lambda/src/analytics-aurora/db-client';
 import {

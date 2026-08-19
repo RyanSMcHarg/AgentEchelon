@@ -12,6 +12,7 @@
  */
 import { execSync } from 'child_process';
 import { SignatureV4 } from '@smithy/signature-v4';
+import { HttpRequest } from '@smithy/protocol-http';
 import { Sha256 } from '@aws-crypto/sha256-js';
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
@@ -53,19 +54,64 @@ export async function signedAnalyticsPost(analyticsUrl: string, idToken: string,
   const u = new URL(analyticsUrl);
   const signer = new SignatureV4({ credentials: creds, region: REGION, service: 'execute-api', sha256: Sha256 });
   const bodyStr = JSON.stringify(body);
-  const signed = await signer.sign({
+  // A REAL HttpRequest, not `{...} as any`. The cast defeated overload resolution on `sign()`, so TS
+  // picked the string-returning (presign) overload and `signed.headers` below was a type error on a
+  // `string`. It happened to work at runtime, which is exactly why it survived - and it is the same
+  // shape-mismatch class as the console guard that "never once reported a console error usefully".
+  // Neither was caught because tests/ had no typecheck until now.
+  const signed = await signer.sign(new HttpRequest({
     method: 'POST',
     protocol: u.protocol,
     hostname: u.hostname,
     path: u.pathname,
     headers: { host: u.hostname, 'content-type': 'application/json' },
     body: bodyStr,
-  } as any);
+  }));
   const resp = await fetch(u.toString(), { method: 'POST', headers: signed.headers as Record<string, string>, body: bodyStr });
   const text = await resp.text();
   try {
     return JSON.parse(text);
   } catch {
     return { status: resp.status, text };
+  }
+}
+
+/**
+ * SigV4-signed GET against an IAM-enforced admin endpoint.
+ *
+ * The archive routes (`/admin/conversations`, `.../messages`, `.../membership-history`) are
+ * AWS_IAM-authorized under A14 the same way the analytics API is, so a Cognito Bearer token is
+ * rejected with a 403 and the browser cannot sign the request itself. Returns the parsed body
+ * ALONGSIDE the HTTP status, because these handlers answer 200 with an `archiveError` field when
+ * the underlying read fails - a caller that only checks the status would read a broken archive as
+ * a healthy empty one.
+ */
+export async function signedAdminGet(
+  url: string,
+  idToken: string,
+  query: Record<string, string> = {},
+): Promise<{ status: number; body: any }> {
+  const creds = identityPoolCreds(idToken);
+  const u = new URL(url);
+  for (const [k, v] of Object.entries(query)) u.searchParams.set(k, v);
+
+  // SignatureV4 takes the query as a map, not as a pre-encoded string; passing an already-encoded
+  // path would double-encode the ARN colons and produce a signature mismatch.
+  const signer = new SignatureV4({ credentials: creds, region: REGION, service: 'execute-api', sha256: Sha256 });
+  const signed = await signer.sign(new HttpRequest({
+    method: 'GET',
+    protocol: u.protocol,
+    hostname: u.hostname,
+    path: u.pathname,
+    query: Object.fromEntries(u.searchParams.entries()),
+    headers: { host: u.hostname },
+  }));
+
+  const resp = await fetch(u.toString(), { method: 'GET', headers: signed.headers as Record<string, string> });
+  const text = await resp.text();
+  try {
+    return { status: resp.status, body: JSON.parse(text) };
+  } catch {
+    return { status: resp.status, body: { raw: text } };
   }
 }

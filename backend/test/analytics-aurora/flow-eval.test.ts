@@ -8,7 +8,7 @@ jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
   BedrockRuntimeClient: jest.fn(() => ({ send: mockSend })),
   InvokeModelCommand: jest.fn((input) => ({ input })),
 }));
-jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({ query: jest.fn() }));
+jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({ query: jest.fn(), ensureSchema: jest.fn() }));
 
 import { query } from '../../lambda/src/analytics-aurora/db-client';
 import { handler, flowComposite } from '../../lambda/src/analytics-aurora/evaluation-runner';

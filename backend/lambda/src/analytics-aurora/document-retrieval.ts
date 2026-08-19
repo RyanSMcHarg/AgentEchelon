@@ -20,7 +20,8 @@ import {
   BedrockRuntimeClient,
   InvokeModelCommand,
 } from '@aws-sdk/client-bedrock-runtime';
-import { query } from './db-client.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
+import { withReaderRole } from './classification-boundary.js';
 
 const bedrock = new BedrockRuntimeClient({});
 
@@ -50,11 +51,28 @@ export interface RetrieveContextInput {
    */
   minSimilarity?: number;
   /**
-   * Optional classification filter — restricts chunks to those whose
-   * metadata.tier is in this list (or has no value set, treated as
-   * available to all). Implements ADR-007 (KB permission filters).
+   * REQUIRED classification filter — the caller's classification and everything below it, as
+   * `profiles.scopeAtOrBelow(classification)`. Restricts chunks to those whose `metadata.classification` is in
+   * this list. Implements ADR-007 (KB permission filters).
+   *
+   * Required, and separately re-checked at runtime, because this is a read boundary: it used to be
+   * optional, and an omitted scope produced NO filter at all rather than no results, so a single caller
+   * that forgot it would silently read across every classification. The type alone is not enough - the
+   * data-plane dispatch hands this input across a Lambda boundary as `any`, which erases it.
    */
-  classificationScope?: string[];
+  classificationScope: string[];
+  /**
+   * REQUIRED. The caller's OWN classification - the immutable channel tag the router resolved, not a
+   * derived list. It selects the database reader role this query runs as (ADR-028), which is the
+   * boundary; `classificationScope` above is the query filter, which is defence in depth.
+   *
+   * WHY BOTH, when one is derivable from the other. It is NOT safely derivable: taking the top of
+   * `classificationScope` would mean a caller that built a too-wide scope also got a too-privileged
+   * role, so the bug that widens the filter would widen the privilege with it and the second control
+   * would fail in the same direction as the first. Passing the classification independently, and
+   * cross-checking the two below, means a mismatch is an error rather than an escalation.
+   */
+  classification: string;
 }
 
 export interface RetrievedChunk {
@@ -85,6 +103,45 @@ const EMPTY: RetrieveContextResult = { chunks: [], citations: [], signalAvailabl
 export async function retrieveContext(
   input: RetrieveContextInput,
 ): Promise<RetrieveContextResult> {
+  // FAIL CLOSED ON AN ABSENT SCOPE, before any other work. Previously a missing/empty scope produced
+  // an EMPTY filter clause, i.e. no filter and every chunk at every classification returned - the read
+  // boundary was fail-open by omission, enforced only by each caller remembering to pass it. Refuse
+  // instead: an unscoped call is a programming error, and returning "no results" would disguise it as
+  // an empty corpus. Checked FIRST so a misconfigured call cannot spend a Bedrock embed round-trip on
+  // its way to being rejected. The runtime check is not redundant with the required type - the
+  // data-plane dispatch hands this input across a Lambda boundary as `any`, which erases the type.
+  if (!Array.isArray(input.classificationScope) || input.classificationScope.length === 0) {
+    throw new Error(
+      '[document-retrieval] classificationScope is required and must be non-empty: retrieval is '
+      + 'classification-scoped (ADR-007) and will not run unscoped. Pass profiles.scopeAtOrBelow(classification).',
+    );
+  }
+
+  // The role this query will assume. Rejected rather than defaulted: `resolveClassification` would
+  // fail CLOSED to the floor, which sounds safe and is wrong here - it would silently downgrade a
+  // premium turn to basic retrieval and present the resulting hole in the answer as "nothing
+  // relevant". An unrecognized classification is a wiring fault and is surfaced as one.
+  if (!profiles.isKnownClassification(input.classification)) {
+    throw new Error(
+      `[document-retrieval] unknown classification ${JSON.stringify(input.classification)}: retrieval `
+      + 'runs as a per-classification database role (ADR-028) and there is no role for this value.',
+    );
+  }
+
+  // The filter and the privilege must describe the same ladder. If they disagree, one of them is
+  // wrong and there is no way to tell which - so neither is used. This is the check that keeps the
+  // two controls independent instead of letting the wider one win.
+  const expectedScope = profiles.scopeAtOrBelow(input.classification);
+  const scopeMatches = input.classificationScope.length === expectedScope.length
+    && [...input.classificationScope].sort().join(',') === [...expectedScope].sort().join(',');
+  if (!scopeMatches) {
+    throw new Error(
+      `[document-retrieval] classificationScope ${JSON.stringify(input.classificationScope)} is not the `
+      + `ladder for ${JSON.stringify(input.classification)} (${JSON.stringify(expectedScope)}). The SQL `
+      + 'filter and the database role would enforce different boundaries.',
+    );
+  }
+
   const text = (input.query || '').trim();
   if (!text) return EMPTY;
 
@@ -104,23 +161,31 @@ export async function retrieveContext(
   // similarity = 1 - distance. Filter by source_type at SQL level (not
   // post-filter) so the HNSW index can prune correctly. Optionally
   // filter by classification metadata.
-  // FAIL-CLOSED classification gate: a chunk is returned only if its `metadata.tier` is in
-  // the caller's scope (their classification and below). An untagged chunk (`tier IS NULL`)
-  // is NOT returned — the previous `IS NULL OR …` made every untagged chunk
-  // visible to every classification, and since ingestion tagged nothing, that leaked ALL KB
-  // content to ALL classifications. Ingestion now stamps the `tier` metadata key
-  // (document-ingestion.ts, fail-closed default); legacy rows written before that must be
-  // re-ingested (re-put the S3 object under `rag/`) to become visible again.
-  const classificationClause = input.classificationScope && input.classificationScope.length > 0
-    ? `AND metadata->>'tier' = ANY($3::text[])`
-    : '';
+  // FAIL-CLOSED classification gate: a chunk is returned only if its `metadata.classification` is in
+  // the caller's scope (their classification and below). An untagged chunk is NOT returned — the
+  // previous `IS NULL OR …` made every untagged chunk visible to every classification, and since
+  // ingestion tagged nothing, that leaked ALL KB content to ALL classifications. Ingestion now stamps
+  // the `classification` metadata key (document-ingestion.ts, fail-closed default); legacy rows
+  // written before that must be re-ingested (re-put the S3 object under `rag/`) to become visible.
+  //
+  // Schema 020 renamed this key and moved it on every row. Reading ONLY the current name is
+  // deliberate: had that migration not run, this filter matches nothing and retrieval returns empty,
+  // which withholds content rather than leaking it. Accepting both names via COALESCE would have been
+  // more forgiving and would have kept a second spelling alive on a security boundary indefinitely.
+  // Scope was validated at the top of the function, so the filter is unconditional here.
+  const classificationClause = `AND metadata->>'classification' = ANY($3::text[])`;
+  const params: unknown[] = [vectorLiteral, sourceTypes, input.classificationScope];
 
-  const params: unknown[] = [vectorLiteral, sourceTypes];
-  if (input.classificationScope && input.classificationScope.length > 0) {
-    params.push(input.classificationScope);
-  }
-
-  const result = await query<{
+  // ADR-028: the query runs as this classification's READER ROLE, not as the shared owner. Row-level
+  // security admits only rows at or below that role's ladder, so the clause above becomes defence in
+  // depth rather than the boundary itself - if it were deleted tomorrow, this query would still not
+  // see a premium chunk on a basic turn.
+  //
+  // It goes through `withReaderRole` (which uses `transaction()` + `SET LOCAL ROLE`) rather than the
+  // pooled `query()` for a specific reason: `query()` opens no transaction, and a bare `SET ROLE`
+  // there would persist on the pooled connection into the NEXT invocation - possibly a different
+  // classification - which is the leak this control exists to prevent.
+  const result = await withReaderRole(input.classification, (client) => client.query<{
     source_id: string;
     source_type: string;
     title: string | null;
@@ -140,7 +205,7 @@ export async function retrieveContext(
       ORDER BY embedding <=> $1::vector
       LIMIT ${topK}`,
     params,
-  );
+  ));
 
   const chunks: RetrievedChunk[] = result.rows
     .filter((r) => r.similarity >= minSim)
@@ -182,6 +247,22 @@ export async function retrieveContext(
  * model is instructed to use the markers when answering from retrieved
  * context, so a downstream `<!--sources:-->` marker (emitted by the
  * model in its reply text) can resolve to the right URLs.
+ *
+ * The wording carries BOTH directions on purpose, because each guards a different failure.
+ *
+ * The original text only guarded fabrication: it said to cite "when your answer draws on them" and
+ * to ignore irrelevant context, with no instruction to actually USE the passages. That is a
+ * permissive framing plus an explicit escape hatch, and the model took the escape. Traced live on
+ * 2026-07-31: the standard assistant was handed `employee-directory.json` ranked first at
+ * similarity 0.615, with the person's name in the prompt, and still answered "I don't have specific
+ * information about the individuals leading...". Every other link (corpus, embeddings,
+ * classification scope, ranking, forwarding, injection) was verified working; only the instruction
+ * was missing.
+ *
+ * So the positive directive is now explicit, and the irrelevance escape is KEPT - removing it would
+ * trade a refusal problem for a fabrication problem, and the corpus is customer-supplied, so a
+ * model that over-trusts retrieved text is also a prompt-injection surface. Changing one direction
+ * without the other is how this oscillates.
  */
 export function buildRetrievedContextHint(result: RetrieveContextResult): string {
   if (!result.chunks.length) return '';
@@ -201,7 +282,11 @@ export function buildRetrievedContextHint(result: RetrieveContextResult): string
   return `
 ## RETRIEVED CONTEXT
 
-The following passages were retrieved from the knowledge base based on the user's message. Cite them with the bracketed numbers when your answer draws on them. If retrieved context is irrelevant to the user's actual question, ignore it — never fabricate a citation.
+The following passages were retrieved from this deployment's own knowledge base, which the user has access to, based on their message.
+
+If a passage below contains the answer, ANSWER FROM IT and cite it with its bracketed number. Do not say you lack the information when it is present here - these documents are the authoritative source for questions about this organisation, including specific names, figures and dates.
+
+If the passages are irrelevant to what was actually asked, ignore them and answer normally - never fabricate a citation, and never stretch a passage to fit a question it does not answer.
 
 ${chunkLines.join('\n\n')}
 

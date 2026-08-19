@@ -21,7 +21,7 @@
  * logged; the next 5-minute run reprocesses the same rows.
  */
 
-import { query } from './db-client.js';
+import { query, ensureSchema } from './db-client.js';
 
 const ABANDONMENT_WINDOW_MIN = Number(process.env.ABANDONMENT_WINDOW_MIN || '5');
 const BATCH_LIMIT = Number(process.env.ABANDONMENT_BATCH_LIMIT || '100');
@@ -35,6 +35,10 @@ interface PendingRow {
 export async function handler(): Promise<{ checked: number; abandoned: number }> {
   const startedAt = Date.now();
   console.log('[abandonment-detector] run start');
+
+  // Apply any pending migration first - see `summary-updater.ts` for why bundling the schema is not
+  // enough. Memoized per instance; pinned by `db-lambdas-apply-migrations.test.ts`.
+  await ensureSchema();
 
   // Find candidate drift_events rows. The partial index
   // idx_drift_events_pending_abandon makes this cheap.

@@ -24,6 +24,10 @@ import {
   isAuthError,
 } from './db-client.js';
 import { detectDrift, recordDriftFire } from './drift-detection.js';
+import { lookupChannelClassification } from './channel-classification.js';
+import { recordMemberCount } from '../lib/channel-context-client.js';
+import { writeTurnEvents } from './turn-events-live.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
 import { updateConversationContext } from './cross-conversation-context.js';
 import { readMessageAnalytics } from '../lib/message-analytics.js';
 import { backfillModelFromAnalytics, ModelBackfillResult } from './model-backfill.js';
@@ -141,6 +145,15 @@ interface MessageRecord {
    *  `created_at` which prefers the original CreatedTimestamp). Used to derive `agent_final_at` /
    *  `e2e_ms` from the final-answer update. Null on events that carry no update timestamp. */
   last_updated_at: string | null;
+  /**
+   * WHICH STEP OF THE ANSWER THIS EVENT IS, as the producer DECLARED it (`ResponsePhase`), or null on
+   * a message written before the declaration existed.
+   *
+   * Only `final` may close a turn. Null falls back to the legacy inference, and only for those rows.
+   */
+  resp_phase: string | null;
+  /** What caused the turn ('user' | 'orchestrator'), when the producer declared it. */
+  trigger_kind: string | null;
   intent: string | null;
   intent_confidence: string | null;
   original_intent: string | null;
@@ -290,12 +303,14 @@ export async function handler(
           await syncMembershipRecords(membershipRecords);
         }
 
-        // 7. Sync channel creation events
-        const channelCreateRecords = records.filter(
-          (r) => r.event_type === 'CREATE_CHANNEL'
+        // 7. Sync channel registry events. UPDATE_CHANNEL is included so a rename
+        // (including the first-turn auto-title) reaches channel_name, not just the
+        // creation-time placeholder.
+        const channelRegistryRecords = records.filter(
+          (r) => r.event_type === 'CREATE_CHANNEL' || r.event_type === 'UPDATE_CHANNEL'
         );
-        if (channelCreateRecords.length > 0) {
-          await syncChannelRegistryRecords(channelCreateRecords);
+        if (channelRegistryRecords.length > 0) {
+          await syncChannelRegistryRecords(channelRegistryRecords);
         }
       });
 
@@ -517,6 +532,20 @@ export async function transformToMessageRecord(
 
   const analytics = (metadata as any)?.analytics || metadata || {};
 
+  // THE DECLARED PHASE (tracker row 49). Read from the TOP level of the blob, where `updateMessage`
+  // merges it, and from the analytics sub-object as a fallback so a producer that nests it is not
+  // silently ignored. Absent on every message written before this shipped, which is what keeps the
+  // legacy inference below reachable for them and only for them.
+  // Same two sources as respPhase, for the same reason: the frontend-rendered Metadata carries it on
+  // the paths that keep a full blob, and the out-of-band analytics record carries it everywhere else.
+  const triggerKind: string | null =
+    (typeof (metadata as any)?.trigger === 'string' ? (metadata as any).trigger : null)
+    ?? (typeof analytics.trigger === 'string' ? analytics.trigger : null);
+
+  const respPhase: string | null =
+    (typeof (metadata as any)?.respPhase === 'string' ? (metadata as any).respPhase : null)
+    ?? (typeof analytics.respPhase === 'string' ? analytics.respPhase : null);
+
   const intent = analytics.intent || null;
   const intentConfidence = analytics.intentConfidence || null;
   const originalIntent = analytics.originalIntent || null;
@@ -526,9 +555,17 @@ export async function transformToMessageRecord(
   const taskStatus = analytics.activeTask?.status || null;
   // Machine state (§6): stamped per turn by buildAnalyticsMetadata. taskTransition is absent on a
   // turn that advanced nothing; kept structured ({from,to}) for the JSONB column.
+  //
+  // `from` may be EMPTY and must survive that way: an empty `from` IS the open edge - "nothing
+  // preceded this state" - and it is what the turn-events projection reads as `task_opened`. The
+  // previous truthiness check (`.from && .to`) silently dropped exactly the edge whose emptiness is
+  // its meaning, so the producer's declaration never reached the column and `opened_at` stayed NULL
+  // on live data while the projection's unit tests passed on synthesized rows (row 104, third find).
   const taskState = analytics.taskState || null;
   const taskTransition =
-    analytics.taskTransition && analytics.taskTransition.from && analytics.taskTransition.to
+    analytics.taskTransition
+      && typeof analytics.taskTransition.from === 'string'
+      && analytics.taskTransition.to
       ? { from: analytics.taskTransition.from, to: analytics.taskTransition.to }
       : null;
 
@@ -560,6 +597,8 @@ export async function transformToMessageRecord(
     metadata,
     created_at: createdAt,
     last_updated_at: lastUpdatedAt,
+    resp_phase: respPhase,
+    trigger_kind: triggerKind,
     intent,
     intent_confidence: intentConfidence,
     original_intent: originalIntent,
@@ -650,12 +689,39 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
     created_at: r.created_at,
   }));
 
-  return batchInsert(
+  const inserted = await batchInsert(
     'messages',
     columns,
     rows,
     'ON CONFLICT (message_id, channel_arn) DO NOTHING'
   );
+
+  // THE LEDGER, WRITTEN FROM THE SAME BATCH (row 50 step 3). `turn_events` had existed since migration
+  // 019 with no runtime writer at all - only a hand-run backfill - so `v_turn_latency` and
+  // `v_task_resolution` were built, documented and empty.
+  //
+  // Best-effort and deliberately AFTER the archive write: losing a measurement must never cost an
+  // archive record, so `writeTurnEvents` swallows its own failures rather than failing this batch.
+  await writeTurnEvents(records.map((r) => ({
+    event_type: r.event_type,
+    message_id: r.message_id,
+    channel_arn: r.channel_arn,
+    sender_arn: r.sender_arn,
+    is_bot: r.is_bot,
+    created_at: r.created_at,
+    last_updated_at: r.last_updated_at,
+    resp_phase: r.resp_phase,
+    trigger_kind: r.trigger_kind,
+    content: r.content,
+    task_id: r.task_id,
+    task_state: r.task_state,
+    // The two the task kinds are derived from. Already on the archive record; they were simply never
+    // handed to the ledger, which is why v_task_resolution had nothing to aggregate (row 104).
+    task_status: r.task_status,
+    task_transition: r.task_transition,
+  })));
+
+  return inserted;
 }
 
 /**
@@ -823,7 +889,14 @@ async function createExchangesFromDatabase(
          response_latency_ms, user_message_at, agent_response_at,
          intent, task_id, task_status, task_state, task_transition
        )
-       SELECT
+       -- ONE ROW PER (turn, responding bot). The next-user bound below keeps replies attached to the
+       -- prompt that caused them, but alone it paired EVERY bot CREATE before the next user turn -
+       -- welcomes, drift notices and continuation chunks each minted an exchange whose
+       -- response_latency_ms was the gap to a user message they never answered, inflating raw
+       -- exchange counts and polluting TTFF averages. DISTINCT ON takes the EARLIEST bot CREATE per
+       -- sender: a normal turn yields exactly one row again (the in-batch pairer's own rule), and a
+       -- duel still yields two because its sides answer as different bot identities.
+       SELECT DISTINCT ON (um.id, am.sender_arn)
          c.id,
          um.id,
          am.id,
@@ -847,20 +920,30 @@ async function createExchangesFromDatabase(
          AND am_upd.event_type = 'UPDATE_CHANNEL_MESSAGE'
          AND am_upd.message_id = am.message_id || '-UPD'
        JOIN conversations c ON c.channel_arn = um.channel_arn
-       LEFT JOIN exchanges e ON e.user_message_id = um.id
+       -- Dedup on the PAIR, not on the user message. A /battle turn is answered by BOTH variants,
+       -- so one user message legitimately has two agent replies; keying on user_message_id alone let
+       -- the first reply claim the turn and silently dropped the second, leaving every duel with one
+       -- side in exchanges and no comparison possible.
+       LEFT JOIN exchanges e
+         ON e.user_message_id = um.id AND e.agent_message_id = am.id
        WHERE um.is_bot = false
          AND um.event_type = 'CREATE_CHANNEL_MESSAGE'
          AND um.created_at > NOW() - INTERVAL '24 hours'
          AND um.channel_arn = ANY($1)
          AND e.id IS NULL
+         -- Bound the reply to THIS turn by the next USER message, not by the first bot message. The
+         -- old "no intervening bot message" test is what limited a turn to a single reply; bounding on
+         -- the next user turn keeps replies attached to the prompt that caused them while allowing the
+         -- two a battle produces. A normal turn still yields exactly one row.
          AND NOT EXISTS (
-           SELECT 1 FROM messages mid
-           WHERE mid.channel_arn = um.channel_arn
-             AND mid.is_bot = true
-             AND mid.event_type = 'CREATE_CHANNEL_MESSAGE'
-             AND mid.created_at > um.created_at
-             AND mid.created_at < am.created_at
+           SELECT 1 FROM messages nxt
+           WHERE nxt.channel_arn = um.channel_arn
+             AND nxt.is_bot = false
+             AND nxt.event_type = 'CREATE_CHANNEL_MESSAGE'
+             AND nxt.created_at > um.created_at
+             AND nxt.created_at < am.created_at
          )
+       ORDER BY um.id, am.sender_arn, am.created_at
        ON CONFLICT DO NOTHING
        RETURNING id
      )
@@ -916,14 +999,25 @@ export async function backfillFromUpdateEvents(
                 variant_id      = COALESCE($10, variant_id),
                 was_fallback    = COALESCE(was_fallback, FALSE) OR $11,
                 -- agent_final_at: the Chime update time of the FINAL answer, for e2e_ms (LATENCY-TARGETS.md).
-                -- Two independent guards. (1) The $7 (total_ms) gate excludes PRE-completion updates that
-                -- carry no telemetry - e.g. the battle round-1 waiting-state update, which posts BEFORE the
-                -- out-of-band analytics are written, so it arrives with total_ms NULL. (2) COALESCE freezes
-                -- the FIRST completion so a later edit cannot move it - a moderation content-edit re-reads the
-                -- SAME out-of-band record (same MessageId), so its total_ms is NOT null and it PASSES the gate;
-                -- COALESCE, not the gate, is what protects the timestamp there. (Redactions are -RED rows,
-                -- skipped upstream, and never reach here.)
-                agent_final_at  = COALESCE(agent_final_at, CASE WHEN $7 IS NOT NULL THEN $14::timestamptz END),
+                --
+                -- FINALITY IS DECLARED, NOT INFERRED (tracker row 49). $17 is the producer's own
+                -- respPhase, stamped on the update that carries the answer. Only 'final' closes the turn,
+                -- so an interim update is harmless BY CONSTRUCTION rather than by happening to arrive with
+                -- no telemetry.
+                --
+                -- The $7 (total_ms) test is now a LEGACY FALLBACK and fires only when no phase was declared,
+                -- i.e. on messages written before this shipped. It was never a statement about finality: it
+                -- said "this update carries worker telemetry", and the two coincided only for as long as no
+                -- interim update happened to carry any. The battle clarification update does carry telemetry,
+                -- and under the old rule it FROZE e2e_ms at a moment the duel had not finished.
+                --
+                -- COALESCE still freezes the FIRST completion so a later edit cannot move it: a moderation
+                -- content-edit re-reads the SAME out-of-band record and would otherwise pass any gate.
+                -- (Redactions are -RED rows, skipped upstream, and never reach here.)
+                agent_final_at  = COALESCE(agent_final_at,
+                                    CASE WHEN $17::text = 'final' THEN $14::timestamptz
+                                         WHEN $17::text IS NULL AND $7 IS NOT NULL THEN $14::timestamptz
+                                    END),
                 -- Latency split (LATENCY-TARGETS.md): model_ms = Converse inference, tool_ms = in-loop
                 -- tool execution. Folded like latency_ms; COALESCE keeps them idempotent.
                 model_ms        = COALESCE($15, model_ms),
@@ -948,6 +1042,7 @@ export async function backfillFromUpdateEvents(
           upd.last_updated_at,
           upd.model_ms,
           upd.tool_ms,
+          upd.resp_phase,
         ]
       );
 
@@ -1039,13 +1134,44 @@ async function processDriftDetection(
   // Only check user messages (not bot responses)
   const userMessages = records.filter((r) => !r.is_bot && r.content);
 
+  // Per-BATCH memo: classification is immutable per channel, and the lookup is one SELECT per call,
+  // so a busy channel's N user messages in one batch were N identical queries. Batch-scoped (not
+  // module-scoped) on purpose - a channel recorded mid-run is picked up by the next batch rather
+  // than pinned to a stale null for the container's lifetime.
+  const classificationByChannel = new Map<string, string | null>();
+
   for (const record of userMessages) {
     try {
+      // ADR-028: drift's summary-embedding reads run as a per-classification database role, so this
+      // post-hoc pass needs a classification too. It runs in the VPC with no route to Chime, so the
+      // only source is the projection.
+      //
+      // THE FALLBACK IS THE LOWEST CLASSIFICATION, NOT THE MOST RESTRICTIVE, and the difference is
+      // the whole point. A reader role sees its own classification AND everything below it, so
+      // defaulting an unknown channel to `mostRestrictiveValue` would hand this pass the entire
+      // table - "fail-closed" spelled the way that fails open. For a READER, closed is the floor.
+      //
+      // The consequence is honest under-reporting: an unrecorded channel is scored as if it were at
+      // the floor, so its own anchor may be invisible and drift simply does not fire. Analytics loses
+      // a row; nothing crosses a boundary.
+      const projected = classificationByChannel.has(record.channel_arn)
+        ? classificationByChannel.get(record.channel_arn)!
+        : await lookupChannelClassification(record.channel_arn);
+      classificationByChannel.set(record.channel_arn, projected);
+      if (!projected) {
+        console.warn(
+          `[kinesis-archival] no recorded classification for ${record.channel_arn}; scoring drift at `
+          + `the floor (${profiles.failClosedValue}). Historical drift for this channel is `
+          + 'under-reported until the Chime-sourced backfill records it.',
+        );
+      }
+
       const driftResult = await detectDrift({
         channelArn: record.channel_arn,
         messageId: record.message_id,
         latestMessage: record.content!,
         intent: 'GENERAL',
+        classification: projected ?? profiles.failClosedValue,
       });
 
       if (driftResult.isDrift) {
@@ -1053,8 +1179,16 @@ async function processDriftDetection(
           result: driftResult,
           channelArn: record.channel_arn,
           messageId: record.message_id,
-          userSub: record.sender_arn || undefined,
+          // The bare sub, matching what the LIVE path writes. This previously stored the whole
+          // sender ARN, so `drift_events.user_sub` held two different shapes depending on which
+          // path fired: any join to a user, and the idx_drift_events_user index, silently split in
+          // two. (The column is VARCHAR(128) while sender_arn is VARCHAR(256), so a long ARN was a
+          // truncation risk too.) Same `/user/` idiom this file already uses elsewhere.
+          userSub: record.sender_arn?.split('/user/').pop() || undefined,
           intent: 'GENERAL',
+          // Nothing was shown to the user here - this is historical scoring, not a suggestion. It
+          // must never be counted as an offer: it has nobody to accept it and never settles.
+          source: 'archival',
         });
         console.log(
           `Drift detected in ${record.channel_arn}: score=${driftResult.driftScore} confidence=${driftResult.confidence}`
@@ -1167,10 +1301,51 @@ async function syncMembershipRecords(
   if (synced > 0) {
     console.log(`Synced ${synced} membership events`);
   }
+
+  // Publish the resulting member count for the channels this batch touched.
+  //
+  // WHY HERE. This is the only component that learns a channel changed size without asking, and the
+  // `@all` responder branch needs the size on the request path (channel-flow-processor and
+  // router-agent-handler must agree on it, or a turn is answered twice or not at all). Writing it on
+  // the event keeps a Chime `ListChannelMemberships` off the hot path.
+  //
+  // COUNTED FROM THE ROW WE JUST WROTE, not from the event: an event says one member joined or left,
+  // not how many there now are, and a batch can carry several events for one channel. `channel_membership`
+  // is the state this same function has just brought up to date, so it is the count that matches.
+  //
+  // BEST-EFFORT AND ALARMED. A failure here must not fail the archival batch - an archive record is
+  // worth more than a cache entry - so `recordMemberCount` swallows errors and emits a
+  // `WriteFailures` metric instead. That metric is the alarm: without it, a broken write is invisible,
+  // because turns keep working via the live-read fallback and only the Chime call volume changes.
+  const touched = [...new Set(records
+    .filter((r) => MEMBERSHIP_EVENT_TYPES.includes(String(r.event_type)))
+    .map((r) => r.channel_arn)
+    .filter(Boolean))];
+  for (const arn of touched) {
+    try {
+      const counted = await query<{ n: string }>(
+        // +1 for the assistant: `channel_membership` tracks human members (it keys on `user_sub`,
+        // derived from `/user/` ARNs), while the responder branch reasons about TOTAL channel members
+        // the way Chime reports them. Two rows here is the 1:1 shape the branch must not misread.
+        `SELECT COUNT(*)::text AS n FROM channel_membership WHERE channel_arn = $1`,
+        [arn],
+      );
+      const humans = Number(counted.rows[0]?.n ?? 0);
+      if (humans > 0) await recordMemberCount(arn, humans + 1);
+    } catch (err) {
+      console.warn(`[membership] member-count publish failed for ${arn}:`, (err as Error).name);
+    }
+  }
 }
 
 /**
- * Sync CREATE_CHANNEL events to channel_registry table
+ * Sync CREATE_CHANNEL and UPDATE_CHANNEL events to the channel_registry table.
+ *
+ * UPDATE_CHANNEL matters as much as CREATE_CHANNEL here: a conversation is created
+ * as the placeholder 'New conversation' (channel-title.ts) and auto-titled on its
+ * first turn via UpdateChannel, and a user can rename it at any time afterwards.
+ * Syncing creation alone froze `channel_name` at the placeholder for every
+ * auto-titled conversation, so the column did not mean what its name says.
  */
 async function syncChannelRegistryRecords(
   records: MessageRecord[]
@@ -1183,23 +1358,27 @@ async function syncChannelRegistryRecords(
 
     try {
       const meta = metadata || {};
-      let channelType = 'conversation';
       const isPrimary = false;
 
-      // Classify channel type from metadata
+      // Classify channel type from metadata. Left NULL when the event carries no
+      // classification so an UPDATE_CHANNEL (a rename, which has no channelType)
+      // cannot downgrade an existing 'guest' row to the 'conversation' default.
+      let channelType: string | null = null;
       if (meta.channelType) {
         channelType = meta.channelType;
       } else if (meta.contextType === 'guest') {
         channelType = 'guest';
+      } else if (record.event_type === 'CREATE_CHANNEL') {
+        channelType = 'conversation';
       }
 
       const channelName = record.content || meta.channelName || null;
 
       await query(
         `INSERT INTO channel_registry (channel_arn, channel_type, is_primary, channel_name, created_via)
-         VALUES ($1, $2, $3, $4, $5)
+         VALUES ($1, COALESCE($2, 'conversation'), $3, $4, $5)
          ON CONFLICT (channel_arn) DO UPDATE SET
-           channel_type = EXCLUDED.channel_type,
+           channel_type = COALESCE(EXCLUDED.channel_type, channel_registry.channel_type),
            channel_name = COALESCE(EXCLUDED.channel_name, channel_registry.channel_name),
            created_via = COALESCE(EXCLUDED.created_via, channel_registry.created_via),
            updated_at = NOW()`,
@@ -1221,6 +1400,6 @@ async function syncChannelRegistryRecords(
   }
 
   if (synced > 0) {
-    console.log(`Synced ${synced} channel creation events`);
+    console.log(`Synced ${synced} channel registry events`);
   }
 }

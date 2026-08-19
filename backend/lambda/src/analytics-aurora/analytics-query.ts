@@ -29,21 +29,74 @@ const USER_POOL_ID = process.env.USER_POOL_ID || '';
 import { recordModerationAction, adminListEvents } from './admin-conversations-aurora.js';
 import {
   aggregateVariantFeedback,
-  aggregateBattleWins,
   aggregateBattleWinsByVariant,
+  flattenBattleOutcomeItem,
   feedbackColumnsFor,
-  battleColumnsFor,
   feedbackKey,
   battleWinKey,
-  type FeedbackItem,
+  selectVariantFeedbackRecords,
+  selectBattlePicks,
+  type FeedbackRecord,
   type VariantFeedback,
   type BattleOutcomeItem,
 } from './variant-feedback.js';
+import {
+  welchTTest,
+  poolGroups,
+  requiredSampleForMean,
+  humanPickTest,
+  twoProportionTest,
+  decideVerdict,
+  evaluateExperimentOutcome,
+  type GroupStat,
+  type PrimaryEval,
+  type GuardrailEval,
+  type Verdict,
+  type Confidence,
+  type OutcomeObjective,
+} from '../lib/experiment-stats.js';
+import type {
+  ExperimentObjective,
+  ObjectiveGuardrail,
+  ExperimentObjectiveMetric,
+  ExperimentDecision,
+} from '../lib/experiment-manager.js';
+// The classification shadow gate (DESIGN §5). The replay itself runs in its own batch Lambda, which
+// also OPENS the run (it is the only side that can reach the database); what happens here is the
+// read side — list runs, read a run's labels, record an adjudication, and compute the gate verdict
+// from whatever has been ruled on so far.
+import {
+  listReplayRuns,
+  listReplayLabels,
+  getReplayRun,
+  adjudicateReplayLabel,
+} from './classifier-replay.js';
+import { evaluateClassifierGate } from '../lib/classifier-gate.js';
 
 // Minimum exchanges per variant before a result is treated as decision-grade.
 // Below this the variant is flagged needs_more_data and the recommendation
 // endpoint returns an inconclusive verdict without spending a model call.
-const MIN_SAMPLE_PER_VARIANT = 30;
+//
+// The default is 5, chosen so the experiment LIFECYCLE is visible on a fresh deployment. Most people
+// meeting this feature want to watch a variant get created, take traffic, and produce a verdict - and
+// at a statistically respectable floor (30+ per variant, and a battle turn is two live model calls)
+// that first verdict is tens of minutes of duelling away. A floor of 30 makes the honest choice and
+// the demonstrable one mutually exclusive.
+//
+// FIVE IS A DEMONSTRATION FLOOR, NOT A DECISION FLOOR. A verdict over five exchanges per variant is
+// real arithmetic on real traffic, but it is underpowered: the confidence it reports will usually be
+// 'low' and the interval wide, which is the honest reading and not a defect.
+//
+// RAISING IT IS RECOMMENDED once a deployment is past that first look, and before anyone routes
+// traffic or retires a variant on a verdict - 30 per variant is the usual starting point, higher for
+// a noisy metric or a small effect. The recommendation is advisory in any case and never
+// auto-applies (INV-1), but "advisory" is not a licence to read an underpowered verdict as a result.
+//
+// Per VARIANT, so the SMALLEST arm gates the result. Set via the `minSamplePerVariant` context key.
+const MIN_SAMPLE_PER_VARIANT = Math.max(
+  1,
+  Number(process.env.MIN_SAMPLE_PER_VARIANT) || 5,
+);
 
 // Cheapest model that is everywhere; we only summarise a small metrics table.
 // NOTE: the analytics-query Lambda role must grant bedrock:InvokeModel on this
@@ -62,6 +115,7 @@ const FEEDBACK_TABLE = process.env.FEEDBACK_TABLE || '';
 // runtime SSM read — the VPC has no SSM endpoint), so this is just a baked-in
 // table name. Empty when /battle is off => the battle join is skipped.
 const BATTLE_OUTCOME_TABLE = process.env.BATTLE_OUTCOME_TABLE || '';
+
 const ddbDocClient = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 // CORS configuration
@@ -207,7 +261,7 @@ export async function handler(
       const ceiling: ClassificationCeiling = isAdminIamEnforcedCall(event)
         ? await ceilingForRequest(event, USER_POOL_ID)
         : null;
-      return handlePostQuery(event.body, ceiling);
+      return handlePostQuery(event.body, ceiling, callerSub);
     }
 
     const path = event.path || '';
@@ -284,17 +338,37 @@ export async function handler(
 /**
  * Quality > Flagged. Derived from the evaluation store: an exchange is flagged
  * when the judge scored it low, marked it non-compliant, or attached flags. No
- * separate table/pipeline needed. (Review persistence — approve/reject + notes —
- * needs a schema column and is a follow-up; schema-init is one-time so it can't
- * ship in a normal deploy.)
+ * separate table/pipeline needed. The reviewer's verdict IS persisted, in its own
+ * `flagged_review` table (migration 014) — the flagged list stays derived, and
+ * re-evaluating an exchange never discards a human review.
  */
 async function getFlaggedResponses(
   params: Record<string, string | undefined>
 ): Promise<APIGatewayProxyResult> {
   if (params.action === 'review') {
-    // Review persistence is not yet wired (needs a review_status column; the
-    // one-time schema-init can't add it on Update). Acknowledge without 500ing.
-    return success({ reviewed: false, note: 'Flagged review persistence is a pending follow-up.' });
+    const exchangeId = params.exchangeId;
+    // `reviewAction` / `notes` are the names the admin console already sends (AdminDashboard
+    // handleReviewResponse); the backend matches the deployed client rather than the other way round.
+    // Only these two verdicts are storable: 'pending' is the ABSENCE of a row, not a value, so a
+    // reviewer can never write the state that means "nobody has looked at this".
+    const status =
+      params.reviewAction === 'approved' || params.reviewAction === 'rejected' ? params.reviewAction : null;
+    if (!exchangeId || !status) {
+      return success({ reviewed: false, error: "exchangeId and reviewAction ('approved'|'rejected') required" });
+    }
+    // Re-reviewing replaces the verdict rather than accumulating rows: the list shows one current
+    // state per exchange, and an admin correcting a mis-click should not leave the old verdict behind.
+    await query(
+      `INSERT INTO flagged_review (exchange_id, review_status, reviewer_sub, note)
+       VALUES ($1, $2, $3, $4)
+       ON CONFLICT (exchange_id) DO UPDATE SET
+         review_status = EXCLUDED.review_status,
+         reviewer_sub  = EXCLUDED.reviewer_sub,
+         note          = EXCLUDED.note,
+         reviewed_at   = NOW()`,
+      [exchangeId, status, params.callerSub || null, params.notes || null],
+    );
+    return success({ reviewed: true, exchangeId, reviewStatus: status });
   }
   const days = parseInt(params.days || '7', 10);
   const limit = Math.min(parseInt(params.limit || '50', 10), 200);
@@ -308,7 +382,12 @@ async function getFlaggedResponses(
             er.relevance_score, er.classification, er.reasoning,
             er.is_compliant, er.compliance_categories AS compliance, er.flags,
             er.evaluated_at AS flagged_at,
-            'pending' AS review_status,
+            -- No review row means nobody has looked at it yet. 'pending' is the absence of a
+            -- verdict, which is why it is derived here rather than stored.
+            COALESCE(fr.review_status, 'pending') AS review_status,
+            fr.reviewer_sub AS reviewed_by,
+            fr.note AS review_note,
+            fr.reviewed_at,
             um.content AS user_message,
             COALESCE(am.updated_content, am.content) AS agent_response
        FROM evaluation_results er
@@ -316,6 +395,7 @@ async function getFlaggedResponses(
        LEFT JOIN conversations c ON e.conversation_id = c.id
        LEFT JOIN messages um ON e.user_message_id = um.id
        LEFT JOIN messages am ON e.agent_message_id = am.id
+       LEFT JOIN flagged_review fr ON fr.exchange_id = e.id
       WHERE er.evaluation_type = 'exchange'
         AND er.evaluated_at >= NOW() - INTERVAL '1 day' * $1
         AND (er.relevance_score < 50
@@ -514,14 +594,41 @@ const POST_DISPATCH: Record<
   intent_exchanges: { fn: getIntentExchanges, dataKey: 'data' },
   cross_conversation_context: { fn: getConversationContext, dataKey: 'contexts' },
   latency_metrics: { fn: getLatencyMetrics, dataKey: 'data' },
+  // THE AUDIT OF ONE TURN, from the ledger (row 50). `latency_metrics` aggregates; this shows the
+  // calculation for a single channel so a human can check it against the stream, which is the whole
+  // point of the ledger existing. Unlisted queryTypes default to the `view-analytics` capability.
+  turn_latency_audit: { fn: getTurnLatencyAudit, dataKey: 'data' },
+  // Task resolution, measured SEPARATELY from turn latency and deliberately never mixed into it: a
+  // four-hour task with twenty seconds of assistant time is healthy, and only a different denominator
+  // can say so.
+  task_resolution: { fn: getTaskResolution, dataKey: 'data' },
   model_effectiveness: { fn: getModelEffectiveness, dataKey: 'data' },
   experiment_results: { fn: getExperimentResults, dataKey: 'data' },
+  // The per-exchange drill-down behind one axis of one experiment (DESIGN §4.3). A COMPANION query:
+  // the aggregate rows stay aggregate, and this serves detail only when a caller asks for it.
+  //
+  // THREE queries, not one, because the verdict rests on three different populations (§4.3 C3):
+  // exchanges (metric averages, split by axis into probabilistic and battle turns), votes
+  // (approval), and picks (the human axis). One drill-down serving all of them would be filtered
+  // wrongly for at least two.
+  experiment_exchanges: { fn: getExperimentExchanges, dataKey: 'data' },
+  experiment_feedback: { fn: getExperimentFeedback, dataKey: 'data' },
+  experiment_picks: { fn: getExperimentPicks, dataKey: 'data' },
+  // Classification shadow gate (DESIGN §5). The measurement a `classification` experiment needs, so
+  // the decision rests on labelling rather than on the evaluator's opinion of the answer downstream.
+  classifier_replays: { fn: getClassifierReplays, dataKey: 'data' },
+  classifier_replay: { fn: getClassifierReplayDetail, dataKey: 'data' },
+  classifier_replay_labels: { fn: getClassifierReplayLabels, dataKey: 'data' },
+  classifier_replay_start: { fn: postClassifierReplayStart, dataKey: 'data' },
+  classifier_replay_adjudicate: { fn: postClassifierAdjudication, dataKey: 'data' },
   // Recommendation returns { verdict, confidence, rationale, variants } at top
   // level; the shim mirrors `variants` into `data` and passes the rest through.
   experiment_recommendation: { fn: getExperimentRecommendation, dataKey: 'variants' },
   // Superset parity: every metric Athena serves, Aurora serves too (no
   // capability is Athena-only). intent/user-activity read the message tables;
-  // the rest read client_events (populated once client-event ingestion lands).
+  // the rest read client_events, which IS populated: the /events handler writes straight to
+  // Aurora through the data-plane Lambda (client-events.ts -> ingestClientEvents), because the
+  // Firehose->S3->Glue pipeline is Athena-mode only. Empty here means no client traffic, not no writer.
   intent_distribution: { fn: getIntentDistribution, dataKey: 'data' },
   user_activity: { fn: getUserActivity, dataKey: 'data' },
   active_users_daily: { fn: getActiveUsersDaily, dataKey: 'data' },
@@ -546,11 +653,26 @@ function buildParamsFromBody(body: Record<string, unknown>): Record<string, stri
   }
   for (const k of [
     'limit', 'offset', 'channelArn', 'userSub', 'experimentId', 'unresolved', 'agentType', 'includeBattle', 'taskId', 'intent',
+    // experiment_exchanges: which axis (metrics/battle) and an optional per-variant narrowing.
+    'axis', 'variantId',
+    // Classification shadow gate (DESIGN §5): replay lifecycle + adjudication.
+    'runId', 'labelId', 'trueLabel', 'note', 'incumbentModel', 'challengerModel', 'windowDays',
+    'marginPct', 'pendingOnly',
     // Quality-tab write actions (ground_truth submit / flagged review) — #33/#35.
     'action', 'exchangeId', 'score', 'classification', 'reasoning', 'reviewAction', 'notes', 'scorerId',
   ]) {
     const v = body[k];
     if (v !== undefined && v !== null) p[k] = String(v);
+  }
+  // Experiment recommendation (§4): the caller (which already holds the experiment
+  // record client-side) may pass the pre-registered objective so the verdict reads
+  // the primary metric + guardrails + humanPickWeight, and the operator's recorded
+  // decision so the response can show recommended-vs-chosen (§4.4). Both optional
+  // (absent ⇒ a quality-primary default with no guardrails — additive, INV-2); sent
+  // as JSON so the whole sub-object rides one param.
+  for (const k of ['objective', 'decision']) {
+    const v = body[k];
+    if (v !== undefined && v !== null) p[k] = typeof v === 'string' ? v : JSON.stringify(v);
   }
   return p;
 }
@@ -617,7 +739,12 @@ async function getChannelEvents(
   return success({ events });
 }
 
-async function handlePostQuery(rawBody: string | null, ceiling: ClassificationCeiling = null): Promise<APIGatewayProxyResult> {
+async function handlePostQuery(
+  rawBody: string | null,
+  ceiling: ClassificationCeiling = null,
+  /** Server-verified caller sub from the JWT. Overwrites any body-supplied value (see below). */
+  callerSub?: string,
+): Promise<APIGatewayProxyResult> {
   let body: Record<string, unknown>;
   try {
     body = JSON.parse(rawBody || '{}');
@@ -633,7 +760,12 @@ async function handlePostQuery(rawBody: string | null, ceiling: ClassificationCe
       reason: `Query "${queryType || '(none)'}" is not available in Aurora analytics mode.`,
     });
   }
-  const res = await entry.fn(buildParamsFromBody(body));
+  const params = buildParamsFromBody(body);
+  // Identity comes from the verified JWT, never the request body, and is written AFTER the body is
+  // unpacked so a caller cannot attribute a write to someone else by sending their own `callerSub`.
+  // Same rule as maybeRecordModeration: the actor is server-verified or absent.
+  if (callerSub) params.callerSub = callerSub;
+  const res = await entry.fn(params);
   if (res.statusCode !== 200) return res;
   let parsed: Record<string, unknown>;
   try {
@@ -916,7 +1048,13 @@ async function getConversations(
     });
   }
 
-  // Conversation list
+  // Conversation list.
+  //
+  // The name lookups are LEFT JOIN LATERAL, per page row - NOT CTEs. As `WITH names/first_msg`
+  // (SELECT DISTINCT ON (channel_arn) ... FROM messages) each scanned and sorted the ENTIRE messages
+  // table - first_msg additionally regexp_replacing every first human message in the archive - to
+  // title a page bounded by LIMIT ≤ 100, because the join key cannot be pushed below DISTINCT ON.
+  // A lateral runs once per returned conversation and walks the (channel_arn, created_at) index.
   const result = await query(
     `SELECT
        c.channel_arn,
@@ -925,7 +1063,9 @@ async function getConversations(
        c.message_count,
        c.first_message_at,
        c.last_message_at,
-       cs.name AS conversation_name,
+       COALESCE(n.name, fm.name) AS conversation_name,
+       -- Purpose/summary/topics DO come from the summary: they are the artifact it produced,
+       -- not channel state (ADR-020).
        cs.purpose,
        cs.summary,
        cs.topics
@@ -935,6 +1075,36 @@ async function getConversations(
          SELECT MAX(version) FROM conversation_summaries
          WHERE channel_arn = c.channel_arn
        )
+     -- The conversation NAME is derived from the ARCHIVED channel events, not from the summary
+     -- row (migration 015 drops that column) and not from channel_registry. channel_registry is
+     -- written only from CREATE_CHANNEL (kinesis-archival.ts, syncChannelRegistryRecords), so it
+     -- freezes the name at CREATION - which is the placeholder 'New conversation'
+     -- (channel-title.ts) for any conversation that is auto-titled on its first turn rather than
+     -- named by hand. Taking the LATEST channel event instead picks up the auto-derive and any
+     -- later user rename. This is the same resolution admin-conversations-aurora.ts uses for the
+     -- Conversations list, so both surfaces answer "what is this conversation called" from one
+     -- source (tenet 8).
+     LEFT JOIN LATERAL (
+       SELECT content AS name
+         FROM messages m
+        WHERE m.channel_arn = c.channel_arn
+          AND m.event_type IN ('CREATE_CHANNEL','UPDATE_CHANNEL')
+          AND m.content IS NOT NULL AND m.content <> ''
+        ORDER BY m.created_at DESC
+        LIMIT 1
+     ) n ON TRUE
+     -- Fallback title: the first human message. The first-turn auto-derive renames the live
+     -- Amazon Chime SDK channel, and that UpdateChannel event does not reliably reach Kinesis, so
+     -- without this fallback rows show the placeholder or nothing at all.
+     LEFT JOIN LATERAL (
+       SELECT LEFT(REGEXP_REPLACE(m.content, '<!--.*?-->', '', 'g'), 60) AS name
+         FROM messages m
+        WHERE m.channel_arn = c.channel_arn
+          AND m.event_type = 'CREATE_CHANNEL_MESSAGE' AND m.is_bot = false
+          AND m.content IS NOT NULL AND m.content <> ''
+        ORDER BY m.created_at ASC
+        LIMIT 1
+     ) fm ON TRUE
      WHERE c.last_message_at >= NOW() - INTERVAL '1 day' * $1
      ORDER BY c.last_message_at DESC
      LIMIT $2 OFFSET $3`,
@@ -1011,12 +1181,40 @@ async function getDriftEvents(
     [days, limit]
   );
 
-  // Summary stats
+  // Summary stats.
+  //
+  // The headline for this feature is two questions about an OFFER that was made: was it accurate
+  // (judged after the fact by evaluation), and did the user accept it. Drift VOLUME is neither -
+  // how often users change topic is a fact about users, so a high number is not a failure and a low
+  // one is not success, and it must never be presented as health.
+  //
+  // Accuracy comes from the evaluation runner's post-hoc judgement (`evaluated_correct`), NOT from
+  // the user's reaction: someone can decline a correct suggestion and accept a bad one, so deriving
+  // accuracy from acceptance would measure the wrong thing. Acceptance is reported separately.
+  //
+  // `source = 'live'` is load-bearing (migration 016). The archival pass scores historical messages
+  // and writes drift_events rows too, but nothing was shown to anyone on that path: counting them
+  // would inflate the denominator with offers that have nobody to accept them and never settle.
+  // Rows written before 016 have source NULL (provenance genuinely unknown) and are excluded rather
+  // than guessed, so this window reports on offers made since that migration.
+  //
+  // Counts are returned raw and the rates derived client-side, so a zero denominator renders as
+  // "No data" instead of a fabricated 0%. `pending_count` (outcome IS NULL) is the honest caveat:
+  // a just-made offer has no response yet but is already in the denominator, so acceptance reads as
+  // a floor while offers are in flight.
   const statsResult = await query(
     `SELECT
-       COUNT(*) AS total_events,
-       COUNT(*) FILTER (WHERE outcome = 'abandoned') AS unresolved_count,
-       ROUND(AVG(cosine_distance)::numeric, 4) AS avg_drift_score
+       COUNT(*) FILTER (WHERE source = 'live') AS total_events,
+       -- source = 'live' HERE TOO: every sibling stat filters to the live population, and a count
+       -- over a different population beside them cannot be ratioed. Pre-migration-016 rows have
+       -- source NULL but can be outcome = 'abandoned', so without this filter a window covering
+       -- them returns unresolved_count > total_events and a client-side rate over 100%.
+       COUNT(*) FILTER (WHERE source = 'live' AND outcome = 'abandoned') AS unresolved_count,
+       ROUND(AVG(cosine_distance)::numeric, 4) AS avg_drift_score,
+       COUNT(*) FILTER (WHERE source = 'live' AND outcome = 'accepted') AS accepted_count,
+       COUNT(*) FILTER (WHERE source = 'live' AND outcome IS NULL) AS pending_count,
+       COUNT(*) FILTER (WHERE source = 'live' AND evaluated_at IS NOT NULL) AS evaluated_count,
+       COUNT(*) FILTER (WHERE source = 'live' AND evaluated_correct IS TRUE) AS evaluated_correct_count
      FROM drift_events
      WHERE occurred_at >= NOW() - INTERVAL '1 day' * $1`,
     [days]
@@ -1271,6 +1469,13 @@ async function getConnectionHealthDaily(
 
 /**
  * GET /analytics/context?userSub=X - Cross-conversation context for a user
+ *
+ * ALWAYS EMPTY TODAY, and that is not a data problem. `cross_conversation_context` has no writer:
+ * `cross-conversation-context.ts` owns the only INSERT and neither of its exports has a caller (see
+ * that module's header). No admin-console surface calls this queryType either, so it is a registered
+ * endpoint over an unpopulated table on both ends. Left in place because the table and the query are
+ * the intended shape for the drift decision-flow's "already discussed in another conversation" check;
+ * do not read an empty result as a broken pipeline or start debugging the join.
  */
 async function getConversationContext(
   params: Record<string, string | undefined>
@@ -1317,17 +1522,139 @@ async function getConversationContext(
  * Returns avg/p95 latency metrics broken down by date, agent_type, and delivery_option.
  * Latency components: total_ms (full round trip), latency_ms (Bedrock inference), poll_ms (placeholder polling).
  */
+/**
+ * THE AUDIT OF ONE TURN (row 50, "auditing one turn against the stream").
+ *
+ * `latency_metrics` aggregates; this returns the CALCULATION, one row per (turn_id, response_id), so
+ * a human can check it against the message stream. That is the whole reason the ledger exists - an
+ * aggregate cannot be audited, and until this endpoint existed the ledger's views had no reader at all.
+ *
+ * The reconciliation residuals are the point of interest: a NEGATIVE `unattributed_ms` means compute
+ * was attributed to the wrong turn, which is exactly the bug class this design was built to expose.
+ * They are returned rather than judged here - the caller decides what a breach means.
+ *
+ * Scoped to a channel deliberately. An unbounded read of the ledger is a table scan, and the auditing
+ * workflow always starts from a conversation someone is looking at.
+ */
+async function getTurnLatencyAudit(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const channelArn = params.channelArn;
+  if (!channelArn) {
+    return success({ data: [], error: 'channelArn is required to audit a turn' });
+  }
+  const limit = Math.min(parseInt(params.limit || '50', 10), 200);
+  const result = await query(
+    `SELECT turn_id, response_id, channel_arn, turn_id_source, trigger_kind, battle_round, responder,
+            t0_user_at, t2_placeholder_at, t3_final_at,
+            ttff_ms, e2e_ms, answer_ms, unattributed_ms, overhead_ms,
+            status, progress_update_count, task_id
+       FROM v_turn_latency
+      WHERE channel_arn = $1
+      ORDER BY t0_user_at DESC NULLS LAST
+      LIMIT $2`,
+    [channelArn, limit],
+  );
+  return success({
+    data: result.rows,
+    columns: [
+      'turn_id', 'response_id', 'channel_arn', 'turn_id_source', 'trigger_kind', 'battle_round',
+      'responder', 't0_user_at', 't2_placeholder_at', 't3_final_at',
+      'ttff_ms', 'e2e_ms', 'answer_ms', 'unattributed_ms', 'overhead_ms',
+      'status', 'progress_update_count', 'task_id',
+    ],
+  });
+}
+
+/**
+ * TASK RESOLUTION, WHICH IS NOT LATENCY.
+ *
+ * `resolve_ms` decomposes into `agent_ms` - the part the system is accountable for - and the human
+ * think time that makes up the rest. A task open for four hours with twenty seconds of assistant time
+ * is HEALTHY, and this is the table that says so on its face.
+ *
+ * It never enters `getLatencyMetrics` or the alert computation, and that separation is the design
+ * rather than an oversight: one number would either flatter the turn latency or damn the workflow.
+ */
+async function getTaskResolution(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const days = Math.min(parseInt(params.days || '7', 10), 90);
+  const result = await query(
+    `SELECT task_id, channel_arn, opened_at, terminal_at, terminal_kind,
+            is_resolved, resolve_ms, agent_ms, transitions, turns
+       FROM v_task_resolution
+      WHERE opened_at >= NOW() - INTERVAL '1 day' * $1
+      ORDER BY opened_at DESC
+      LIMIT 200`,
+    [days],
+  );
+  return success({
+    data: result.rows,
+    columns: [
+      'task_id', 'channel_arn', 'opened_at', 'terminal_at', 'terminal_kind',
+      'is_resolved', 'resolve_ms', 'agent_ms', 'transitions', 'turns',
+    ],
+  });
+}
+
 async function getLatencyMetrics(
   params: Record<string, string | undefined>
 ): Promise<APIGatewayProxyResult> {
   const days = Math.min(parseInt(params.days || '7', 10), 90);
 
   const result = await query(
-    `SELECT
+    `WITH resp_ledger AS (
+       -- WHY THE CLASSIFICATION LIVES HERE AND NOT IN SIX FILTER CLAUSES (tracker row 100).
+       --
+       -- unclosed_count said 172 turns never recorded a final answer and could not say why, so the
+       -- number carried every reading from "test litter" to "answers were lost" at once. Splitting it
+       -- with six independent predicates would have re-created that ambiguity in a new form: overlapping
+       -- predicates double-count and a missing one drops a turn silently, and neither shows up as an
+       -- error - the split would just fail to add up to the count it explains, quietly.
+       --
+       -- One CASE per response makes the buckets DISJOINT BY CONSTRUCTION (a response gets exactly one
+       -- outcome) and EXHAUSTIVE (the ELSE, plus the IS NULL of the LEFT JOIN). The split therefore sums
+       -- to unclosed_count as an arithmetic fact rather than as something to be checked.
+       --
+       -- PRECEDENCE, and why this order. A ledger-declared final outranks everything because it means
+       -- the two derivations DISAGREE - that is a shadow-diff finding, not a lost answer, and reading it
+       -- as one would send an investigation after the wrong thing. Then the explained non-closures in
+       -- descending strength of explanation: the producer said error; the answer was removed after the
+       -- fact; the turn is still moving. What is left is a placeholder with nothing after it, which is
+       -- the only bucket that means an answer went missing.
+       SELECT response_id,
+              channel_arn,
+              CASE
+                WHEN bool_or(kind = 'final_response')                                     THEN 'ledger_final'
+                WHEN bool_or(kind = 'error_response')                                     THEN 'errored'
+                WHEN bool_or(kind IN ('content_redacted','message_deleted','content_edited'))
+                                                                                          THEN 'superseded'
+                WHEN bool_or(kind IN ('progress_update','notice_posted'))                 THEN 'awaiting'
+                ELSE 'silent'
+              END AS outcome
+         FROM turn_events
+        WHERE response_id IS NOT NULL
+          AND occurred_at >= NOW() - INTERVAL '1 day' * $1
+        GROUP BY response_id, channel_arn
+     )
+     SELECT
        DATE(m.created_at) AS date,
        -- Fall back to the conversation tier so legacy/DIRECT exchanges do not group as 'unknown'.
        COALESCE(e.agent_type, c.agent_type, 'unknown') AS agent_type,
        COALESCE(e.delivery_option, 'unknown') AS delivery_option,
+       -- MISNAMED, AND KEPT ONLY BECAUSE THE COLUMN CONTRACT IS READ BY LatencyTab, alerts.ts AND
+       -- metricTargets.ts. This has never been a count of EXCHANGES. There is a real exchanges table
+       -- - one row per agent reply, carrying user_message_id - and this count does not come from it.
+       --
+       -- What it actually counts, once the -UPD exclusion below applies: BOT MESSAGE ROWS THAT CARRIED
+       -- COMPUTE TELEMETRY. That is close to "assistant responses that ran a model", and it still is not
+       -- exchanges: a bot-INITIATED message (a welcome, a round-2 rebuttal, a drift notice) has no user
+       -- message to pair with, so it is counted here and has no exchange at all.
+       --
+       -- Before that exclusion it was not even this - every turn contributed TWO rows, so the figure was
+       -- double a population it was already mislabelling. Anything tuned against it, the P95 latency band
+       -- in particular, was tuned against a number nobody could name.
        COUNT(*) AS exchange_count,
        ROUND(AVG(m.total_ms)) AS avg_total_ms,
        ROUND(AVG(m.latency_ms)) AS avg_bedrock_ms,
@@ -1354,13 +1681,140 @@ async function getLatencyMetrics(
        -- the completion update is folded. LATENCY-TARGETS.md.
        ROUND(AVG(m.model_ms)) AS avg_model_ms,
        ROUND(AVG(m.tool_ms)) AS avg_tool_ms,
-       ROUND(AVG(e.inbound_ms)) AS avg_inbound_ms
+       ROUND(AVG(e.inbound_ms)) AS avg_inbound_ms,
+       -- ── THE DENOMINATOR, REPORTED RATHER THAN PERFORMED (tracker row 48 part b) ──
+       --
+       -- total_ms > 0 used to sit in the WHERE, so responses that ran no measurable compute were
+       -- silently absent and every average was over a population nobody could state. Reporting the
+       -- split makes "avg over N" mean something: compute_count is the population the compute averages
+       -- are actually taken over, direct_count is what the old WHERE was discarding.
+       COUNT(*) FILTER (WHERE m.total_ms IS NOT NULL AND m.total_ms > 0) AS compute_count,
+       COUNT(*) FILTER (WHERE m.total_ms IS NULL OR m.total_ms <= 0)     AS direct_count,
+       -- ── THE MEASUREMENT GAP, MADE COUNTABLE ──
+       --
+       -- A turn whose answer never landed has a null e2e_ms, and AVG skips nulls without complaint, so
+       -- it leaves the average rather than being reported as incomplete. That is the failure this row
+       -- names: an excluded turn should be VISIBLE, not filtered away.
+       --
+       -- It matters more since finality became declared: an errored turn now correctly does NOT close
+       -- (only respPhase='final' sets agent_final_at), so it lands here instead of being miscounted as
+       -- a completion. Correct semantics, and invisible without this count.
+       COUNT(*) FILTER (WHERE e.e2e_ms IS NOT NULL) AS closed_count,
+       COUNT(*) FILTER (WHERE e.id IS NOT NULL AND e.e2e_ms IS NULL) AS unclosed_count,
+       -- ── AND WHY IT DID NOT CLOSE (tracker row 100) ──
+       --
+       -- These six partition unclosed_count. They differ enormously in seriousness and only one of them
+       -- is a defect, which is the entire reason the total was not actionable:
+       --
+       --   no_placeholder  the bot message never carried a correlation marker, so it was never a
+       --               placeholder and there is no answer pending. STRUCTURALLY UNCLOSABLE, and checked
+       --               FIRST because it is a property of the message rather than of the ledger - it
+       --               therefore answers for all history, including turns older than the live writer.
+       --               Only a placeholder is ever edited into a final answer (backfillFromUpdateEvents
+       --               is the sole writer of agent_final_at), so a marker-less bot message cannot close
+       --               however long it is waited for. These reach the population at all because
+       --               createExchangesFromDatabase pairs ANY bot CREATE that follows a user message -
+       --               a welcome, a drift notice, a continuation chunk, a DIRECT quick reply.
+       --   unobserved  the ledger holds nothing for this response. NOT an explanation - it is the
+       --               honest absence of one. A real placeholder, older than the live writer or missed
+       --               by it. It must never be read as "fine"; it is "cannot say".
+       --   disagreed   the ledger declared a final answer and exchanges.e2e_ms is still null. The two
+       --               derivations disagree - the shadow diff of rollout step 4, arriving early.
+       --   errored     the producer declared phase 'error'. A CORRECT non-closure: the wait ended and no
+       --               answer was produced, and folding that duration into time-to-answer would make a
+       --               broken turn read as a fast one.
+       --   superseded  the answer was redacted, deleted or edited afterwards.
+       --   awaiting    a progress update or a notice and nothing terminal - the turn is still moving, or
+       --               it handed back to the person.
+       --   silent      a placeholder, and then nothing. THE DEFECT POPULATION: someone was told to wait
+       --               and no answer, no error and no update ever followed. This is the number the whole
+       --               ledger was built to expose, and the only one of the seven worth an alert.
+       --
+       -- The buckets consume ONE per-row classification (b.unclosed_bucket, defined in the lateral
+       -- below with the marker grammar stated once). They used to repeat the full marker predicate
+       -- ten times, which made the partition property depend on ten hand-copied strings agreeing;
+       -- CASE arms are mutually exclusive by construction, so it now cannot stop being a partition.
+       COUNT(*) FILTER (WHERE b.unclosed_bucket = 'no_placeholder')    AS unclosed_no_placeholder,
+       COUNT(*) FILTER (WHERE b.unclosed_bucket = 'unreadable_marker') AS unclosed_unreadable_marker,
+       -- Attribution of the unreadable markers by producer, because the two mints that could overflow
+       -- are known: the battle template (fixed part 31 chars + a service-assigned ARN segment) and the
+       -- mention mint (a service MessageId up to 128 chars). A count outside both names a third mint.
+       -- SUB-counts of the unreadable bucket, not partition members.
+       COUNT(*) FILTER (WHERE b.unclosed_bucket = 'unreadable_marker' AND m.content LIKE '%<!--corr:battle-%')   AS unreadable_marker_battle,
+       COUNT(*) FILTER (WHERE b.unclosed_bucket = 'unreadable_marker' AND m.content LIKE '%<!--corr:mention-%')  AS unreadable_marker_mention,
+       COUNT(*) FILTER (WHERE b.unclosed_bucket = 'unobserved')  AS unclosed_unobserved,
+       COUNT(*) FILTER (WHERE b.unclosed_bucket = 'disagreed')   AS unclosed_disagreed,
+       COUNT(*) FILTER (WHERE b.unclosed_bucket = 'errored')     AS unclosed_errored,
+       COUNT(*) FILTER (WHERE b.unclosed_bucket = 'superseded')  AS unclosed_superseded,
+       COUNT(*) FILTER (WHERE b.unclosed_bucket = 'awaiting')    AS unclosed_awaiting,
+       COUNT(*) FILTER (WHERE b.unclosed_bucket = 'silent')      AS unclosed_silent
      FROM messages m
      LEFT JOIN exchanges e ON e.agent_message_id = m.id
      LEFT JOIN conversations c ON e.conversation_id = c.id
+     -- GROUPED before it is joined, so it cannot multiply a row. resp_ledger is unique on
+     -- (response_id, channel_arn); a plain join to turn_events would emit one row per EVENT and
+     -- multiply every average in this query by the number of events the turn happened to record - the
+     -- same fan-out hazard v_turn_latency documents against exchanges, arriving from the other side.
+     LEFT JOIN resp_ledger l ON l.response_id = m.message_id AND l.channel_arn = m.channel_arn
+     -- ── THE MARKER GRAMMAR, ONCE ──
+     -- CHARACTER-FOR-CHARACTER the predicate turn-events-backfill.ts uses to decide what a
+     -- placeholder is, deliberately: two disagreeing definitions of "response" is the defect this
+     -- whole ledger exists to remove, and it would be a poor place to introduce a third.
+     --
+     -- IT MUST BE THE FULL PATTERN, NOT A LIKE ON THE OPENING TOKEN, and this was learned the
+     -- expensive way. A first cut tested only for the literal marker opening; against live data it
+     -- classified 26 rows as "a real placeholder the ledger has not observed" that the backfill had
+     -- declined to record, because the backfill also requires the id to match the bounded character
+     -- class AND the marker to be closed.
+     LEFT JOIN LATERAL (
+       SELECT substring(m.content from '<!--corr:([A-Za-z0-9._-]{1,64})-->') AS marker_id
+     ) mk ON TRUE
+     -- ── ONE CLASSIFICATION PER ROW ──
+     -- NULL for any closed (or unpaired) row; otherwise exactly one bucket. The first two arms
+     -- answer WITHOUT the ledger - they are properties of the MESSAGE, so they hold for all
+     -- history, including turns older than the live writer.
+     --
+     -- no_placeholder REQUIRES the literal marker to be absent, not merely unreadable. The bounded
+     -- substring is NULL in two OPPOSITE situations (tracker row 103): the message never carried a
+     -- marker (benign - nobody was promised an answer), and the message carries a marker LONGER
+     -- than the 64-character bound (the defect - a person WAS told to wait and no reader can ever
+     -- close the turn). One predicate served both and 26 turns were counted as the benign kind.
+     LEFT JOIN LATERAL (
+       SELECT CASE
+         WHEN e.id IS NULL OR e.e2e_ms IS NOT NULL          THEN NULL
+         WHEN mk.marker_id IS NULL
+              AND m.content NOT LIKE '%<!--corr:%'          THEN 'no_placeholder'
+         WHEN mk.marker_id IS NULL                          THEN 'unreadable_marker'
+         WHEN l.outcome IS NULL                             THEN 'unobserved'
+         WHEN l.outcome = 'ledger_final'                    THEN 'disagreed'
+         WHEN l.outcome = 'errored'                         THEN 'errored'
+         WHEN l.outcome = 'superseded'                      THEN 'superseded'
+         WHEN l.outcome = 'awaiting'                        THEN 'awaiting'
+         WHEN l.outcome = 'silent'                          THEN 'silent'
+       END AS unclosed_bucket
+     ) b ON TRUE
      WHERE m.is_bot = true
-       AND m.total_ms IS NOT NULL
-       AND m.total_ms > 0
+       -- ONE TURN IS ONE ROW HERE (tracker row 48). A bot reply is stored twice: the canonical CREATE
+       -- row, and a -UPD audit row holding the finalized text for the conversation browser. The audit
+       -- row carries total_ms, so without this filter every turn's compute was counted TWICE - and
+       -- because the exchange join is on the CREATE id, the duplicates could not be attributed and
+       -- landed in an unknown/unknown bucket. Live, that was 564 phantom rows against ~570 real ones,
+       -- all inside the traffic-weighted P95 alert population, where at that ratio they outweigh the
+       -- turns they were doubling.
+       --
+       -- getModelUsage documented this trap and excluded the row; this query never learned. A guard
+       -- that lives in a comment beside ONE call site does not protect the others.
+       --
+       -- EXCLUDING THE ROW IS NOT EXCLUDING THE UPDATE. The update is the moment the person gets their
+       -- answer and it is fully measured: archival folds its timestamp onto the CANONICAL row as
+       -- agent_final_at, which is what e2e_ms is derived from. The -UPD row carries no timing the
+       -- canonical row lacks. It is a STEP to be measured, not a turn to be counted.
+       AND m.event_type = 'CREATE_CHANNEL_MESSAGE'
+       -- total_ms is NO LONGER filtered here. It moved into FILTER clauses on the compute aggregates
+       -- above, so a response that ran no measurable compute is COUNTED and attributed rather than
+       -- vanishing from the population. The compute averages are unchanged - a null contributes
+       -- nothing to AVG or PERCENTILE_CONT either way - but the counts beside them are now honest
+       -- about what they are averaging over.
        AND m.created_at >= NOW() - INTERVAL '1 day' * $1
      GROUP BY DATE(m.created_at), COALESCE(e.agent_type, c.agent_type, 'unknown'), e.delivery_option
      ORDER BY date DESC, agent_type, delivery_option`,
@@ -1374,6 +1828,18 @@ async function getLatencyMetrics(
       'avg_total_ms', 'avg_bedrock_ms', 'avg_poll_ms',
       'p95_total_ms', 'p95_bedrock_ms',
       'min_total_ms', 'max_total_ms',
+      // New columns are APPENDED so the existing contract is byte-for-byte intact: LatencyTab,
+      // alerts.ts and metricTargets.ts read by name and are unaffected by additions.
+      'compute_count', 'direct_count', 'closed_count', 'unclosed_count',
+      // The buckets that partition unclosed_count (row 100). Appended, like their parent.
+      // `unreadable_marker` split from `no_placeholder` (row 103): a marker the reader cannot see is
+      // a promised answer that can never close, not the benign absence of a promise. The two
+      // `unreadable_marker_*` columns attribute it by producer and are SUB-counts of the bucket, not
+      // partition members.
+      'unclosed_no_placeholder', 'unclosed_unreadable_marker',
+      'unreadable_marker_battle', 'unreadable_marker_mention',
+      'unclosed_unobserved', 'unclosed_disagreed', 'unclosed_errored',
+      'unclosed_superseded', 'unclosed_awaiting', 'unclosed_silent',
       'avg_ttff_ms', 'p95_ttff_ms',
       'avg_e2e_ms', 'p95_e2e_ms',
       'avg_model_ms', 'avg_tool_ms', 'avg_inbound_ms',
@@ -1752,9 +2218,22 @@ async function scanVariantFeedback(
   experimentId: string | undefined,
   includeBattle: boolean,
 ): Promise<Map<string, VariantFeedback>> {
-  if (!FEEDBACK_TABLE) return new Map();
   const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
-  const items: FeedbackItem[] = [];
+  return aggregateVariantFeedback(await scanFeedbackRecords(experimentId), sinceMs, includeBattle);
+}
+
+/**
+ * The raw experiment-attributed feedback records, unfiltered.
+ *
+ * ONE scan serves both the rollup and the per-vote drill-down, so the two can never read different
+ * sets of votes: the difference between them is which PURE function is applied afterwards
+ * (`aggregateVariantFeedback` vs `selectVariantFeedbackRecords`), and both start from
+ * `latestVotePerVoter`. Fails OPEN — an unset table or a scan error yields no records, and every
+ * caller renders without thumbs (logged server-side).
+ */
+async function scanFeedbackRecords(experimentId: string | undefined): Promise<FeedbackRecord[]> {
+  if (!FEEDBACK_TABLE) return [];
+  const items: FeedbackRecord[] = [];
   try {
     let exclusiveStartKey: Record<string, any> | undefined;
     do {
@@ -1763,7 +2242,10 @@ async function scanVariantFeedback(
           TableName: FEEDBACK_TABLE,
           // Alias every name: experimentId/variantId/intent etc. avoid any
           // reserved-word surprises and document the projection intent.
-          ProjectionExpression: '#eid, #vid, #intent, #fb, #am, #ca',
+          // userSub + messageId are the VOTE's identity, not the record's: the table appends every
+          // revision, so without them `latestVotePerVoter` cannot collapse a decision trail and the
+          // rollup counts a switched vote on both sides.
+          ProjectionExpression: '#eid, #vid, #intent, #fb, #am, #ca, #us, #mid, #carn, #fid',
           FilterExpression: experimentId
             ? '#eid = :eid'
             : 'attribute_exists(#eid) AND #eid <> :null',
@@ -1774,74 +2256,75 @@ async function scanVariantFeedback(
             '#fb': 'feedback',
             '#am': 'assignmentMode',
             '#ca': 'createdAt',
+            '#us': 'userSub',
+            '#mid': 'messageId',
+            // The drill-down's link target: the conversation the rated reply lives in.
+            '#carn': 'channelArn',
+            '#fid': 'feedbackId',
           },
           ExpressionAttributeValues: experimentId ? { ':eid': experimentId } : { ':null': null },
           ExclusiveStartKey: exclusiveStartKey,
         }),
       );
-      for (const it of res.Items || []) items.push(it as FeedbackItem);
+      for (const it of res.Items || []) items.push(it as FeedbackRecord);
       exclusiveStartKey = res.LastEvaluatedKey;
     } while (exclusiveStartKey);
   } catch (err) {
     console.warn('[experiment-feedback] thumbs scan failed (rendering without thumbs):', err);
-    return new Map();
-  }
-  return aggregateVariantFeedback(items, sinceMs, includeBattle);
-}
-
-/**
- * Scan the BattleOutcome table for head-to-head picks (projected to the join
- * columns). Paginated; fails OPEN: an unset table (/battle off) or a scan error
- * yields an empty list and every caller renders without battle picks. Shared by
- * the probabilistic (variant,intent) rollup and the battle-scoped effectiveness
- * view, which bucket the same items on different keys.
- */
-async function scanBattleOutcomeItems(experimentId: string | undefined): Promise<BattleOutcomeItem[]> {
-  if (!BATTLE_OUTCOME_TABLE) return [];
-  const items: BattleOutcomeItem[] = [];
-  try {
-    let exclusiveStartKey: Record<string, any> | undefined;
-    do {
-      const res: any = await ddbDocClient.send(
-        new ScanCommand({
-          TableName: BATTLE_OUTCOME_TABLE,
-          ProjectionExpression: '#eid, #vid, #intent, #winner, #ca',
-          FilterExpression: experimentId
-            ? '#eid = :eid'
-            : 'attribute_exists(#eid) AND #eid <> :null',
-          ExpressionAttributeNames: {
-            '#eid': 'experimentId',
-            '#vid': 'variantId',
-            '#intent': 'intent',
-            '#winner': 'winner',
-            '#ca': 'chosenAt',
-          },
-          ExpressionAttributeValues: experimentId ? { ':eid': experimentId } : { ':null': null },
-          ExclusiveStartKey: exclusiveStartKey,
-        }),
-      );
-      for (const it of res.Items || []) items.push(it as BattleOutcomeItem);
-      exclusiveStartKey = res.LastEvaluatedKey;
-    } while (exclusiveStartKey);
-  } catch (err) {
-    console.warn('[experiment-feedback] battle-outcome scan failed (rendering without battle picks):', err);
     return [];
   }
   return items;
 }
 
 /**
- * Bucket battle wins per (variant, intent) for the probabilistic A/B rollup.
- * Fails OPEN via scanBattleOutcomeItems.
+ * Scan the BattleOutcome table for head-to-head picks, FLATTENED to one
+ * BattleOutcomeItem per user pick (see flattenBattleOutcomeItem). Optionally
+ * filtered to one experiment (applied per-pick, since attribution is now nested
+ * in the votes map). Paginated; fails OPEN: an unset table (/battle off) or a
+ * scan error yields an empty list and every caller renders without battle picks.
+ * Shared by the probabilistic (variant,intent) rollup and the battle-scoped
+ * effectiveness view, which bucket the same picks on different keys.
  */
-async function scanBattleWins(
-  days: number,
-  experimentId: string | undefined,
-): Promise<Map<string, number>> {
-  const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
-  const items = await scanBattleOutcomeItems(experimentId);
-  return aggregateBattleWins(items, sinceMs);
+async function scanBattleOutcomeItems(experimentId: string | undefined): Promise<BattleOutcomeItem[]> {
+  if (!BATTLE_OUTCOME_TABLE) return [];
+  const picks: BattleOutcomeItem[] = [];
+  try {
+    let exclusiveStartKey: Record<string, any> | undefined;
+    do {
+      const res: any = await ddbDocClient.send(
+        new ScanCommand({
+          TableName: BATTLE_OUTCOME_TABLE,
+          ProjectionExpression: '#bid, #votes, #eid, #vid, #intent, #winner, #ca, #cbu',
+          ExpressionAttributeNames: {
+            // The PK. Carried so the pick drill-down can match a pick to the battle turns that
+            // produced it and, through them, to the conversation.
+            '#bid': 'battleId',
+            '#votes': 'votes',
+            '#eid': 'experimentId',
+            '#vid': 'variantId',
+            '#intent': 'intent',
+            '#winner': 'winner',
+            '#ca': 'chosenAt',
+            '#cbu': 'chosenByUserSub',
+          },
+          ExclusiveStartKey: exclusiveStartKey,
+        }),
+      );
+      for (const it of res.Items || []) {
+        for (const pick of flattenBattleOutcomeItem(it)) {
+          if (experimentId && (pick.experimentId ?? '') !== experimentId) continue;
+          picks.push(pick);
+        }
+      }
+      exclusiveStartKey = res.LastEvaluatedKey;
+    } while (exclusiveStartKey);
+  } catch (err) {
+    console.warn('[experiment-feedback] battle-outcome scan failed (rendering without battle picks):', err);
+    return [];
+  }
+  return picks;
 }
+
 
 async function fetchExperimentRows(
   days: number,
@@ -1873,11 +2356,18 @@ async function fetchExperimentRows(
        e.agent_type,
        COUNT(*) AS exchange_count,
        ROUND(AVG(COALESCE(er.relevance_score, 0))::numeric, 1) AS avg_score,
+       -- Per-variant dispersion for the statistical tests (§4.2-B/A.6): sample
+       -- SD of each continuous metric so getExperimentRecommendation can run a
+       -- Welch t-test on (mean, sd, n). Sample SD is NULL for a single-row group;
+       -- surfaced as null and pooled/guarded downstream.
+       ROUND(STDDEV_SAMP(COALESCE(er.relevance_score, 0))::numeric, 2) AS score_sd,
        ROUND(AVG(COALESCE(m.total_ms, e.response_latency_ms, 0))::numeric, 0) AS avg_total_ms,
+       ROUND(STDDEV_SAMP(COALESCE(m.total_ms, e.response_latency_ms, 0))::numeric, 1) AS latency_sd,
        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY COALESCE(m.total_ms, e.response_latency_ms, 0))::numeric, 0) AS p95_total_ms,
        ROUND(AVG(COALESCE(m.input_tokens, 0))::numeric, 0) AS avg_input_tokens,
        ROUND(AVG(COALESCE(m.output_tokens, 0))::numeric, 0) AS avg_output_tokens,
        ROUND(AVG(COALESCE(m.input_tokens, 0) + COALESCE(m.output_tokens, 0))::numeric, 0) AS avg_tokens,
+       ROUND(STDDEV_SAMP(COALESCE(m.input_tokens, 0) + COALESCE(m.output_tokens, 0))::numeric, 1) AS tokens_sd,
        -- Image (generation-out) variants: per-reply image count so cost prices per-image (an
        -- image model reports 0 tokens). Regex-guarded cast so a malformed value never errors
        -- the whole query; NULL on token-only variants.
@@ -1903,9 +2393,17 @@ async function fetchExperimentRows(
   // attach per (variant, intent) row. Both are
   // separate signals alongside the evaluator's avg_score — never blended into it.
   // (Battle wins are not gated by includeBattle: a pick only exists from a battle.)
-  const [feedbackByVariantIntent, battleWinsByVariantIntent] = await Promise.all([
+  // Battle picks bucket per VARIANT, not per (variant, intent). A pick records no intent - nothing
+  // in the write path has one to record, since the judgement is of the whole reply rather than of an
+  // intent bucket - so an intent-keyed lookup resolved every pick to `variant::unknown` while the
+  // rows carried real intents, and the advertised battle_wins column could never populate.
+  const [feedbackByVariantIntent, battleWinsByVariant] = await Promise.all([
     scanVariantFeedback(days, experimentId, includeBattle),
-    scanBattleWins(days, experimentId),
+    (async () =>
+      aggregateBattleWinsByVariant(
+        await scanBattleOutcomeItems(experimentId),
+        Date.now() - days * 24 * 60 * 60 * 1000,
+      ))(),
   ]);
 
   // A (variant, intent) can span more than one row when a fallback produced a
@@ -1914,6 +2412,9 @@ async function fetchExperimentRows(
   // zero the rest — otherwise the per-variant sum (frontend + recommendation)
   // would double-count the same thumbs.
   const thumbsAttached = new Set<string>();
+  // Same double-count guard as thumbs, one grain up: a variant's wins attach to its FIRST row and
+  // the rest read null, so the per-variant sum stays the true tally however many rows it spans.
+  const winsAttached = new Set<string>();
 
   // Derive cost, rates, and the needs-more-data flag in code (the rate table
   // and the sample threshold are not SQL concerns).
@@ -1934,18 +2435,44 @@ async function fetchExperimentRows(
       tokensOut: Number(r.avg_output_tokens) || 0,
       imageCount: isImageModel ? Number(r.avg_image_count) || 0 : 0,
     });
-    const dedupKey = feedbackKey(r.variant_id, r.intent);
+    // The EXPERIMENT is part of both the dedup key and the lookup. Without it, two experiments sharing
+    // a variant id and intent shared one bucket: the first row seen attached the combined thumbs and
+    // every later row was zeroed as a "duplicate". Single-experiment reads hid this because the scan
+    // filters to one experiment; the all-experiments view did not.
+    const dedupKey = feedbackKey(r.experiment_id, r.variant_id, r.intent);
     const firstForKey = !thumbsAttached.has(dedupKey);
     const thumbs = firstForKey
-      ? feedbackColumnsFor(feedbackByVariantIntent, r.variant_id, r.intent)
+      ? feedbackColumnsFor(feedbackByVariantIntent, r.experiment_id, r.variant_id, r.intent)
       : { thumbs_up: 0, thumbs_down: 0, feedback_count: 0, approval_rate: null };
-    const battle = firstForKey
-      ? battleColumnsFor(battleWinsByVariantIntent, r.variant_id, r.intent)
-      : { battle_wins: null };
+    const winsKey = battleWinKey(r.experiment_id, r.variant_id);
+    const wins = winsAttached.has(winsKey)
+      ? 0
+      : battleWinsByVariant.get(winsKey) || 0;
+    const battle = { battle_wins: wins > 0 ? wins : null };
+    winsAttached.add(winsKey);
     thumbsAttached.add(dedupKey);
+    // Cost has no stored per-exchange column (it is MODELED from tokens via the
+    // rate table), so there is no SQL STDDEV for it. Approximate its dispersion by
+    // carrying the tokens coefficient-of-variation onto the modeled cost
+    // (cost ≈ k·tokens for a given model). null when it can't be derived — the
+    // Welch guard then reads no variance and claims no significance (honest).
+    const avgTokens = Number(r.avg_tokens) || 0;
+    const tokensSd = r.tokens_sd == null ? null : Number(r.tokens_sd);
+    const costSd =
+      avgCostUsd != null && tokensSd != null && avgTokens > 0
+        ? Math.round(avgCostUsd * (tokensSd / avgTokens) * 1e6) / 1e6
+        : null;
     return {
       ...r,
       avg_cost_usd: avgCostUsd, // null when the model/usage can't be priced (honesty contract)
+      // Continuous-metric dispersion + explicit n for the §4.2-B tests. score_sd/
+      // latency_sd/tokens_sd are the SQL sample SDs (null for a single-row group);
+      // cost_sd is derived (see above); n mirrors exchange_count for the stats layer.
+      n,
+      score_sd: r.score_sd == null ? null : Number(r.score_sd),
+      latency_sd: r.latency_sd == null ? null : Number(r.latency_sd),
+      tokens_sd: tokensSd,
+      cost_sd: costSd,
       fallback_rate: n > 0 ? Math.round((Number(r.fallback_count) / n) * 1000) / 10 : 0,
       task_completion_rate: taskCount > 0 ? Math.round((taskCompleted / taskCount) * 1000) / 10 : null,
       ...thumbs, // thumbs_up, thumbs_down, feedback_count, approval_rate (null = no signal)
@@ -2058,8 +2585,8 @@ async function fetchBattleEffectivenessRows(
 
 const EXPERIMENT_COLUMNS = [
   'experiment_id', 'variant_id', 'model_name', 'intent', 'agent_type',
-  'exchange_count', 'avg_score', 'avg_total_ms', 'p95_total_ms',
-  'avg_tokens', 'avg_cost_usd', 'compliance_rate', 'fallback_count', 'fallback_rate',
+  'exchange_count', 'n', 'avg_score', 'score_sd', 'avg_total_ms', 'latency_sd', 'p95_total_ms',
+  'avg_tokens', 'tokens_sd', 'avg_cost_usd', 'cost_sd', 'compliance_rate', 'fallback_count', 'fallback_rate',
   'task_count', 'task_completion_rate',
   // Human-signal joins — separate from avg_score.
   'thumbs_up', 'thumbs_down', 'feedback_count', 'approval_rate',
@@ -2071,6 +2598,432 @@ const EXPERIMENT_COLUMNS = [
  * GET /analytics/experiments - A/B experiment results by variant.
  * Query params: days, experimentId, includeBattle ('true' folds battle traffic in).
  */
+/** Columns the per-exchange drill-down returns. Deliberately the values that ROLL UP, so the caller
+ *  can recompute the aggregate rather than take it on trust. */
+const EXPERIMENT_EXCHANGE_COLUMNS = [
+  'exchange_id', 'channel_arn', 'agent_message_id', 'created_at',
+  'variant_id', 'intent', 'assignment_mode',
+  'relevance_score', 'total_ms', 'input_tokens', 'output_tokens', 'bedrock_model', 'is_compliant',
+  'redacted', 'deleted',
+  'total_count',
+];
+
+/**
+ * The exchanges behind ONE axis of ONE experiment (DESIGN §4.3, "not built" -> built).
+ *
+ * The point of this query is that an operator can RECOMPUTE the number they are about to ship on, so
+ * it returns the per-exchange values that roll up, not a list of links. Row count and the mean of
+ * `relevance_score` must reconcile with `experiment_results` for the same axis; if they do not, the
+ * rollup is wrong and the console should say so rather than render a quiet contradiction.
+ *
+ * **THE PREDICATE IS THE SAME ONE THE SCORING USES.** That is the whole correctness requirement: a
+ * drill-down filtered more loosely surfaces exchanges that did not count toward the number beside it,
+ * which is worse than no drill-down at all. Hence:
+ *  - `axis='metrics'` mirrors `fetchExperimentRows(..., includeBattle=false)`: probabilistic turns only.
+ *  - `axis='battle'` is the complement: battle turns only, the population the picks come from.
+ * Intent scoping needs no clause - an intent experiment only ever binds its own intent's turns, so
+ * only those carry its `experiment_id`. Matching on the intent STRING would find nothing, because the
+ * stored value is the classifier intent (`general`) while the experiment stores the route key
+ * (`general_qa`).
+ *
+ * **Redaction.** A redacted exchange STAYS in the set: it contributed to the score, and dropping it
+ * would break the reconciliation above and misrepresent what the verdict was computed from. Its
+ * `redacted`/`deleted` flags ride along so the caller can withhold the TRANSCRIPT while still counting
+ * the row. See DESIGN §4.3 for the unresolved questions here; this returns flags, it does not decide
+ * policy.
+ */
+async function getExperimentExchanges(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const experimentId = (params.experimentId || '').trim();
+  // No experiment id means no scoped set. Return empty rather than every experiment's exchanges:
+  // an unscoped drill-down is precisely the "wrong set" failure this query exists to avoid.
+  if (!experimentId) return success({ data: [], columns: EXPERIMENT_EXCHANGE_COLUMNS, total: 0 });
+
+  const days = Math.min(parseInt(params.days || '30', 10), 180);
+  const limit = Math.min(parseInt(params.limit || '100', 10), 500);
+  const offset = Math.max(parseInt(params.offset || '0', 10), 0);
+  const variantId = (params.variantId || '').trim() || null;
+  // 'metrics' (default) = probabilistic turns, the A/B population. 'battle' = battle turns only.
+  const axis = params.axis === 'battle' ? 'battle' : 'metrics';
+
+  const mode = `COALESCE(m.metadata->'analytics'->>'assignmentMode', m.metadata->>'assignmentMode', 'probabilistic')`;
+  const sqlParams: any[] = [days, experimentId];
+  let where = `WHERE m.experiment_id = $2
+                 AND e.created_at >= NOW() - INTERVAL '1 day' * $1
+                 AND ${mode} ${axis === 'battle' ? '=' : '<>'} 'battle'`;
+  if (variantId) {
+    sqlParams.push(variantId);
+    where += ` AND m.variant_id = $${sqlParams.length}`;
+  }
+  sqlParams.push(limit, offset);
+
+  const result = await query(
+    `SELECT e.id AS exchange_id,
+            e.channel_arn,
+            e.agent_message_id,
+            e.created_at,
+            m.variant_id,
+            COALESCE(e.intent, 'unknown') AS intent,
+            ${mode} AS assignment_mode,
+            er.relevance_score,
+            er.is_compliant,
+            m.total_ms,
+            m.input_tokens,
+            m.output_tokens,
+            m.bedrock_model,
+            -- RETRACTION COMES FROM THE -RED/-DEL SIBLING ROW, not from the moderation audit table.
+            --
+            -- The moderation ITSELF is complete: it is a Chime SDK API call, so every redaction and
+            -- deletion reaches the event stream and archival writes the sibling row. That is the
+            -- authority, and the admin conversation read already uses it.
+            --
+            -- What moderation_actions adds is ATTRIBUTION (who acted), and only for moderations
+            -- performed through the admin console: it is a SECOND client call made after the Chime
+            -- call returns, and the console deliberately swallows its failure so a bookkeeping error
+            -- can never fail a moderation (ConversationsTab.handleRedact). A redaction issued any
+            -- other way writes no row there at all. It is also keyed on the Chime message id, not the
+            -- messages PK, so joining it on m.id compares a varchar to a UUID.
+            EXISTS (
+              SELECT 1 FROM messages x
+               WHERE x.channel_arn = m.channel_arn
+                 AND x.event_type = 'REDACT_CHANNEL_MESSAGE'
+                 AND x.message_id = regexp_replace(m.message_id, '-(UPD|RED|DEL)$', '') || '-RED'
+            ) AS redacted,
+            EXISTS (
+              SELECT 1 FROM messages x
+               WHERE x.channel_arn = m.channel_arn
+                 AND x.event_type = 'DELETE_CHANNEL_MESSAGE'
+                 AND x.message_id = regexp_replace(m.message_id, '-(UPD|RED|DEL)$', '') || '-DEL'
+            ) AS deleted,
+            COUNT(*) OVER() AS total_count,
+            -- FULL-MATCH aggregates, computed over every matching exchange rather than the page.
+            -- Window functions run before LIMIT, so these hold on page 3 of 40 exactly as on page 1;
+            -- without them the mean could only be recomputed by pulling every row, and a paginated
+            -- view could never satisfy the reconciliation it exists to make possible.
+            --
+            -- UNSCORED COUNTS AS ZERO, because that is what the aggregate this reconciles against
+            -- does (fetchExperimentRows: AVG(COALESCE(er.relevance_score, 0))). Reproducing the
+            -- number means reproducing that convention, and scored_count is returned alongside so
+            -- the operator can see how much of the mean is scoring coverage rather than quality.
+            AVG(COALESCE(er.relevance_score, 0)) OVER() AS avg_score_all,
+            COUNT(er.relevance_score) OVER() AS scored_count,
+            COUNT(*) FILTER (
+              WHERE EXISTS (
+                SELECT 1 FROM messages x
+                 WHERE x.channel_arn = m.channel_arn
+                   AND x.event_type IN ('REDACT_CHANNEL_MESSAGE','DELETE_CHANNEL_MESSAGE')
+                   AND x.message_id IN (
+                         regexp_replace(m.message_id, '-(UPD|RED|DEL)$', '') || '-RED',
+                         regexp_replace(m.message_id, '-(UPD|RED|DEL)$', '') || '-DEL')
+              )
+            ) OVER() AS withheld_count
+       FROM exchanges e
+       JOIN messages m ON e.agent_message_id = m.id
+       LEFT JOIN (
+         SELECT exchange_id, AVG(relevance_score) AS relevance_score,
+                BOOL_AND(COALESCE(is_compliant, true)) AS is_compliant
+           FROM evaluation_results
+          WHERE evaluation_type = 'exchange'
+          GROUP BY exchange_id
+       ) er ON er.exchange_id = e.id
+       ${where}
+       ORDER BY e.created_at DESC
+       LIMIT $${sqlParams.length - 1} OFFSET $${sqlParams.length}`,
+    sqlParams,
+  );
+
+  const rows = result.rows || [];
+  const first = rows[0];
+  return success({
+    data: rows,
+    columns: EXPERIMENT_EXCHANGE_COLUMNS,
+    // The FULL match count, not the page size. A view that shows a page without the total cannot be
+    // reconciled against the aggregate, and a silent sample reads as a complete set.
+    total: rows.length ? Number(first.total_count) || rows.length : 0,
+    limit,
+    offset,
+    axis,
+    experimentId,
+    variantId,
+    // The reconciliation targets: what the aggregate SHOULD equal if the rollup is right. Returned
+    // as numbers over the full match so the console can state the check on any page.
+    stats: {
+      total: rows.length ? Number(first.total_count) || rows.length : 0,
+      avg_score: rows.length && first.avg_score_all != null ? Number(first.avg_score_all) : null,
+      scored_count: rows.length ? Number(first.scored_count) || 0 : 0,
+      withheld_count: rows.length ? Number(first.withheld_count) || 0 : 0,
+    },
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Classification shadow gate (DESIGN §5)
+// ---------------------------------------------------------------------------
+
+/** Replay runs, newest first, optionally for one experiment. */
+async function getClassifierReplays(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const runs = await listReplayRuns((params.experimentId || '').trim() || undefined);
+  return success({ data: runs, columns: [] });
+}
+
+/**
+ * One run, with the gate's verdict computed from its labels.
+ *
+ * The verdict is derived here rather than stored, so it always reflects the adjudication as it
+ * stands: a queue worked further since the last read moves the answer, and a cached verdict would
+ * quietly disagree with the rows beneath it.
+ */
+async function getClassifierReplayDetail(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const runId = (params.runId || '').trim();
+  if (!runId) return error(400, 'runId is required');
+  const { run, labels } = await getReplayRun(runId);
+  if (!run) return error(404, 'No such replay run');
+  const marginPct = Number(params.marginPct);
+  const gate = evaluateClassifierGate(labels, {
+    marginPct: Number.isFinite(marginPct) && marginPct > 0 ? marginPct : undefined,
+  });
+  // A run that did not finish cannot be read as a measurement of its window, whatever its labels say.
+  return success({ data: [], run, gate, incomplete: run.status !== 'complete' });
+}
+
+/** The adjudication queue (discordant + unruled) or a run's whole label set. */
+async function getClassifierReplayLabels(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const runId = (params.runId || '').trim();
+  if (!runId) return error(400, 'runId is required');
+  const { rows, total } = await listReplayLabels(runId, {
+    pendingOnly: params.pendingOnly === 'true',
+    limit: Number(params.limit) || undefined,
+    offset: Number(params.offset) || undefined,
+  });
+  return success({ data: rows, columns: [], total });
+}
+
+/**
+ * Starting a replay does NOT happen here, and cannot.
+ *
+ * This function is VPC-attached (the database is in the VPC), and the isolated subnets it runs in
+ * have no NAT, no internet gateway and no `lambda` interface endpoint. A `lambda:Invoke` from here
+ * therefore has no route: it hangs until this function's own timeout and the caller gets a 504, with
+ * the batch function never invoked and the run row left `running` forever. That is not a bug to
+ * retry - it is the network shape. IAM permission was granted and reachability never existed, which
+ * is exactly why a template review and 14 mocked unit tests all passed.
+ *
+ * The start therefore lives OUTSIDE the VPC, in `classifier-replay-start.ts`, on its own
+ * `POST /classifier-replay-start` resource. That function mints the run id, returns it, and invokes
+ * the batch Lambda, which opens the row from inside the VPC. Same shape as `ClientEventsFunction`,
+ * the other Lambda-to-Lambda hop in this stack, which is non-VPC for the same reason.
+ *
+ * Kept as an explicit refusal rather than deleted: a caller that still posts the old queryType here
+ * (an older console bundle, a script) should be told where the route went, not left reading a
+ * generic "unknown queryType" while the operation it asked for silently never happens.
+ */
+async function postClassifierReplayStart(): Promise<APIGatewayProxyResult> {
+  return error(
+    400,
+    'classifier_replay_start does not run on this route. POST to /classifier-replay-start, which is ' +
+      'outside the VPC and is the only place that can invoke the replay function.',
+  );
+}
+
+/** Record one human ruling. The actor comes from the JWT, never the body. */
+async function postClassifierAdjudication(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const adjudicatedBy = (params.callerSub || '').trim();
+  if (!adjudicatedBy) return error(401, 'An adjudication must be attributable to a caller');
+  try {
+    const res = await adjudicateReplayLabel({
+      labelId: (params.labelId || '').trim(),
+      trueLabel: (params.trueLabel || '').trim(),
+      adjudicatedBy,
+      note: params.note,
+    });
+    // `updated: false` means the row was concordant or absent — a ruling that changes no number.
+    return success({ data: [], ...res });
+  } catch (e) {
+    return error(400, e instanceof Error ? e.message : 'Could not record the adjudication');
+  }
+}
+
+/** Columns the per-vote approval drill-down returns. One row per COUNTED vote. */
+const EXPERIMENT_FEEDBACK_COLUMNS = [
+  'created_at', 'variant_id', 'intent', 'feedback', 'assignment_mode', 'channel_arn', 'message_id',
+];
+
+/**
+ * The individual thumbs behind an approval rate (the THIRD axis, DESIGN §4.3).
+ *
+ * A separate query from `experiment_exchanges` because it is a separate POPULATION: thumbs are
+ * self-selected votes on ordinary traffic, held in DynamoDB, and only a fraction of exchanges carry
+ * one. Serving them from the exchange drill-down would show an operator hundreds of unrated rows as
+ * the evidence for a rate computed from twelve votes.
+ *
+ * Reconciles exactly: `stats.votes` is the denominator of `approval_rate` and `stats.thumbs_up` its
+ * numerator, both from the same `latestVotePerVoter` collapse the rollup applies.
+ */
+async function getExperimentFeedback(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const experimentId = (params.experimentId || '').trim();
+  if (!experimentId) return success({ data: [], columns: EXPERIMENT_FEEDBACK_COLUMNS, total: 0 });
+
+  const days = Math.min(parseInt(params.days || '30', 10), 180);
+  const limit = Math.min(parseInt(params.limit || '100', 10), 500);
+  const offset = Math.max(parseInt(params.offset || '0', 10), 0);
+  const variantId = (params.variantId || '').trim() || null;
+  const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
+
+  const records = selectVariantFeedbackRecords(
+    await scanFeedbackRecords(experimentId),
+    sinceMs,
+    params.includeBattle === 'true',
+    variantId,
+  );
+  const page = records.slice(offset, offset + limit);
+  const up = records.filter((r) => r.feedback === 'up').length;
+
+  return success({
+    data: page.map((r) => ({
+      created_at: r.createdAt ?? null,
+      variant_id: r.variantId ?? null,
+      intent: r.intent ?? null,
+      feedback: r.feedback ?? null,
+      assignment_mode: r.assignmentMode ?? null,
+      channel_arn: r.channelArn ?? null,
+      message_id: r.messageId ?? null,
+    })),
+    columns: EXPERIMENT_FEEDBACK_COLUMNS,
+    total: records.length,
+    limit,
+    offset,
+    axis: 'approval',
+    experimentId,
+    variantId,
+    stats: {
+      total: records.length,
+      votes: records.length,
+      thumbs_up: up,
+      thumbs_down: records.length - up,
+      // The rate the console shows, recomputed from the rows it is about to display.
+      approval_rate: records.length ? Math.round((up / records.length) * 1000) / 10 : null,
+    },
+  });
+}
+
+/** Columns the per-pick battle drill-down returns. One row per COUNTED pick (ties excluded). */
+const EXPERIMENT_PICK_COLUMNS = [
+  'chosen_at', 'variant_id', 'winner', 'intent', 'battle_id', 'channel_arn',
+];
+
+/**
+ * The individual head-to-head picks behind `battle_wins` (the human axis, DESIGN §4.3).
+ *
+ * A FOURTH population, and the one most easily conflated with the third: `experiment_exchanges`
+ * with `axis='battle'` returns the battle TURNS (what the models produced), while this returns the
+ * PICKS (what people chose between them). They reconcile against different numbers — turn metrics
+ * versus the win count and its CI — so the console must not offer one link for both.
+ *
+ * The conversation is resolved, not decoded: `battleId` is `sha256(channelArn:userMessageId)`, so the
+ * only way back is to match it against the battle turns that carry it in their metadata. A pick whose
+ * battle has no archived turn keeps its row and reports no conversation, rather than being dropped —
+ * it still counted toward the win.
+ */
+async function getExperimentPicks(
+  params: Record<string, string | undefined>
+): Promise<APIGatewayProxyResult> {
+  const experimentId = (params.experimentId || '').trim();
+  if (!experimentId) return success({ data: [], columns: EXPERIMENT_PICK_COLUMNS, total: 0 });
+
+  const days = Math.min(parseInt(params.days || '30', 10), 180);
+  const limit = Math.min(parseInt(params.limit || '100', 10), 500);
+  const offset = Math.max(parseInt(params.offset || '0', 10), 0);
+  const variantId = (params.variantId || '').trim() || null;
+  const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
+
+  const picks = selectBattlePicks(await scanBattleOutcomeItems(experimentId), sinceMs, variantId);
+  const page = picks.slice(offset, offset + limit);
+  const channelByBattle = await resolveBattleChannels(
+    experimentId,
+    days,
+    page.map((p) => (p.battleId ?? '').trim()).filter(Boolean),
+  );
+
+  return success({
+    data: page.map((p) => ({
+      chosen_at: p.chosenAt ?? null,
+      variant_id: p.variantId ?? null,
+      winner: p.winner ?? null,
+      intent: p.intent ?? null,
+      battle_id: p.battleId ?? null,
+      channel_arn: channelByBattle.get((p.battleId ?? '').trim()) ?? null,
+    })),
+    columns: EXPERIMENT_PICK_COLUMNS,
+    total: picks.length,
+    limit,
+    offset,
+    axis: 'picks',
+    experimentId,
+    variantId,
+    stats: {
+      total: picks.length,
+      picks: picks.length,
+      treatment_wins: picks.filter((p) => p.variantId === 'treatment').length,
+      control_wins: picks.filter((p) => p.variantId === 'control').length,
+      // How many of the shown picks cannot be traced to a conversation. Stated rather than hidden:
+      // a missing link is a gap in the evidence, and an operator reconciling should see its size.
+      unresolved_conversations: page.filter((p) => !channelByBattle.get((p.battleId ?? '').trim())).length,
+    },
+  });
+}
+
+/**
+ * Map battleId -> channel_arn by looking up the archived battle TURNS that carry it.
+ *
+ * The id is a one-way hash, so this is the only path back to the conversation. Reads the same
+ * metadata shape the assignment-mode predicate does (`analytics` nesting first, then top level), and
+ * returns an empty map on any failure — an unlinkable pick still renders.
+ */
+async function resolveBattleChannels(
+  experimentId: string,
+  days: number,
+  battleIds: string[],
+): Promise<Map<string, string>> {
+  const unique = Array.from(new Set(battleIds));
+  if (!unique.length) return new Map();
+  try {
+    const result = await query(
+      `SELECT DISTINCT
+              COALESCE(m.metadata->'analytics'->'battleContext'->>'battleId',
+                       m.metadata->'battleContext'->>'battleId') AS battle_id,
+              e.channel_arn
+         FROM exchanges e
+         JOIN messages m ON e.agent_message_id = m.id
+        WHERE m.experiment_id = $2
+          AND e.created_at >= NOW() - INTERVAL '1 day' * $1
+          AND COALESCE(m.metadata->'analytics'->'battleContext'->>'battleId',
+                       m.metadata->'battleContext'->>'battleId') = ANY($3::text[])`,
+      [days, experimentId, unique],
+    );
+    const map = new Map<string, string>();
+    for (const r of result.rows || []) {
+      const id = String((r as any).battle_id || '');
+      const arn = String((r as any).channel_arn || '');
+      if (id && arn && !map.has(id)) map.set(id, arn);
+    }
+    return map;
+  } catch (err) {
+    console.warn('[experiment-picks] battle->channel resolution failed (rendering without links):', err);
+    return new Map();
+  }
+}
+
 async function getExperimentResults(
   params: Record<string, string | undefined>
 ): Promise<APIGatewayProxyResult> {
@@ -2091,11 +3044,76 @@ async function getExperimentResults(
 }
 
 /**
- * GET /analytics/experiments/recommendation - LLM-generated recommendation
- * from the actual test outcome. Descriptive guidance only; it never reroutes
- * traffic. Returns { verdict, confidence, rationale, variants }.
+ * The recommendation contract (DESIGN §4 / A.6). Confidence is DERIVED FROM THE
+ * STATISTIC (§4.2-E), not an LLM's self-assessment; the LLM/template only narrates
+ * the numbers in `rationale`. The human battle pick is a DISTINCT axis (`human`),
+ * never blended into the metric verdict (INV-3/INV-4). Advisory only — nothing
+ * here routes traffic (INV-1).
+ */
+export interface ExperimentRecommendation {
+  verdict: Verdict; // 'promote_treatment'|'keep_control'|'keep_running'|'equivalent'|'inconclusive'
+  confidence: Confidence; // derived from the stat, not the LLM
+  rationale: string; // prose narration only
+  primary: {
+    metric: string;
+    deltaPct: number; // treatment relative to control, %
+    ci: [number, number]; // CI on the RAW mean difference (metric units)
+    pValue: number;
+    significant: boolean;
+    powered: boolean;
+  };
+  guardrails: Array<{ metric: string; deltaPct: number; bound: number; held: boolean }>;
+  human?: { picks: number; winRate: number; ci: [number, number]; significant: boolean };
+  /**
+   * User approval (thumbs) as a TESTED rate: the difference between variants with a Newcombe CI, not
+   * a bare percentage. Absent when nobody has voted, so "no votes" never renders as "0% approval".
+   *
+   * A THIRD axis, kept separate from both the metric verdict and the battle pick. Thumbs are
+   * self-selected feedback on ordinary traffic; battle picks are a forced choice in a duel; the
+   * primary metric is a randomised measurement. Folding them together would average away exactly the
+   * disagreement an operator needs to see.
+   */
+  approval?: {
+    controlRate: number; treatmentRate: number; delta: number; ci: [number, number];
+    pValue: number; significant: boolean; votes: number;
+  };
+  recommendedVsChosen?: { recommended: string; chosen?: ExperimentDecision['outcome'] };
+  /** Exchanges per variant this deployment requires before a verdict is decision-grade. Configurable,
+   *  so a caller must read it rather than assume one. */
+  minSamplePerVariant?: number;
+}
+
+/** Per-variant continuous stats (mean, sd, n) pooled across the variant's intent rows. */
+interface VariantContinuousStats {
+  score: GroupStat;
+  latency: GroupStat;
+  cost: GroupStat;
+  tokens: GroupStat;
+}
+
+/** Safe JSON-string param → typed object (null on absent/malformed). */
+function parseJsonParam<T>(raw: string | undefined): T | undefined {
+  if (!raw) return undefined;
+  try {
+    const v = JSON.parse(raw);
+    return v && typeof v === 'object' ? (v as T) : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * GET /analytics/experiments/recommendation - statistically-grounded, ADVISORY
+ * recommendation from the actual test outcome (DESIGN §4). It never reroutes
+ * traffic (INV-1). Confidence is computed from the statistic (§4.2-E), not an
+ * LLM opinion; the human battle pick is surfaced as a distinct axis, never
+ * blended (INV-3/INV-4). Returns the A.6 ExperimentRecommendation plus `variants`.
  *
- * verdict: 'promote_control' | 'promote_treatment' | 'keep_running' | 'inconclusive'
+ * Optional params (the caller holds the experiment record client-side): `objective`
+ * (JSON ExperimentObjective — primary metric, guardrails, humanPickWeight) and
+ * `decision` (JSON ExperimentDecision — the operator's recorded outcome, for the
+ * recommended-vs-chosen meta-signal). Absent ⇒ a quality-primary default with no
+ * guardrails (additive, INV-2).
  */
 async function getExperimentRecommendation(
   params: Record<string, string | undefined>
@@ -2105,10 +3123,18 @@ async function getExperimentRecommendation(
   if (!experimentId) {
     return error(400, 'experimentId is required');
   }
+  const objective = parseJsonParam<ExperimentObjective>(params.objective);
+  const decision = parseJsonParam<ExperimentDecision>(params.decision);
 
+  // `includeBattle: false` keeps battle TURNS out of the probabilistic averages (rollup-safety), but
+  // the rows still carry each variant's battle WINS, which is what feeds the human axis below. The
+  // two are deliberately different populations: metrics exclude the duel, the human pick is the duel.
   const rows = await fetchExperimentRows(days, experimentId, false);
-  // Collapse to one row per variant (sum across intents/tiers) for the summary.
+  // Collapse to one row per variant (sum across intents/tiers) for the summary,
+  // and collect per-intent (mean, sd, n) so the continuous stats can be pooled
+  // to a single variant-level (mean, sd, n) for the §4.2-B Welch tests.
   const byVariant = new Map<string, any>();
+  const statsByVariant = new Map<string, { score: GroupStat[]; latency: GroupStat[]; cost: GroupStat[]; tokens: GroupStat[] }>();
   for (const r of rows) {
     const key = r.variant_id || 'unknown';
     const acc = byVariant.get(key) || {
@@ -2137,6 +3163,17 @@ async function getExperimentRecommendation(
       acc._taskWeight += n;
     }
     byVariant.set(key, acc);
+
+    // Per-intent dispersion groups for pooling. A null sd (single-row group)
+    // pools as 0 variance for that group; a null cost drops the cost group.
+    const grp = statsByVariant.get(key) || { score: [], latency: [], cost: [], tokens: [] };
+    grp.score.push({ n, mean: Number(r.avg_score) || 0, sd: r.score_sd == null ? 0 : Number(r.score_sd) });
+    grp.latency.push({ n, mean: Number(r.avg_total_ms) || 0, sd: r.latency_sd == null ? 0 : Number(r.latency_sd) });
+    grp.tokens.push({ n, mean: Number(r.avg_tokens) || 0, sd: r.tokens_sd == null ? 0 : Number(r.tokens_sd) });
+    if (r.avg_cost_usd != null) {
+      grp.cost.push({ n, mean: Number(r.avg_cost_usd), sd: r.cost_sd == null ? 0 : Number(r.cost_sd) });
+    }
+    statsByVariant.set(key, grp);
   }
   const variants = Array.from(byVariant.values()).map((v) => {
     const w = v._scoreWeight || 1;
@@ -2156,53 +3193,322 @@ async function getExperimentRecommendation(
       // Human approval %, or null when no thumbs yet — a separate signal from avg_score.
       approval_rate: v.feedback_count > 0 ? Math.round((v.thumbs_up / v.feedback_count) * 1000) / 10 : null,
       // Head-to-head /battle picks this variant won (null when none) — the fast human signal.
+      // Carried on the rows by fetchExperimentRows, which joins the picks per variant regardless of
+      // includeBattle: a pick only ever exists from a battle, so excluding battle TURNS from the
+      // metric averages (rollup-safety) must not also hide the human signal.
       battle_wins: v.battle_wins > 0 ? v.battle_wins : null,
     };
   });
 
   const minN = variants.length ? Math.min(...variants.map((v) => v.exchange_count)) : 0;
 
-  // Short-circuit: not enough data, or not a 2-variant comparison. No model call.
+  // Short-circuit: not enough data, or not a 2-variant comparison. No stats/model
+  // call. Emits the full A.6 shape so the console renders one contract everywhere.
+  //
+  // THE HUMAN AXIS IS NOT GATED BY THIS FLOOR (§4.3). It is a SEPARATE axis - "never folded into" the
+  // metric verdict - and it is measured on a DIFFERENT population: the metric floor counts
+  // probabilistic traffic, which deliberately EXCLUDES battle turns (`includeBattle: false`, see
+  // fetchExperimentRows), while every pick comes FROM a battle. Gating the picks behind the
+  // probabilistic floor therefore withheld the human signal precisely when battles were the evidence
+  // being collected - a battle-driven evaluation could accrue any number of picks and still report no
+  // human block at all. Battle picks are part of the evaluation, so they are reported whenever they
+  // exist, alongside (never merged into) the metric read.
+  const humanAxis = battlePickAxis(variants);
+  // Approval is the other human signal, on ordinary traffic rather than duels. Same reasoning as the
+  // battle axis: it is not gated by the probabilistic floor, because it is a separate measurement
+  // reported alongside rather than an input to the metric verdict.
+  const approval = approvalAxis(variants);
+
   if (variants.length < 2 || minN < MIN_SAMPLE_PER_VARIANT) {
+    const metricNote = variants.length < 2
+      ? 'Only one variant has recorded traffic, so there is nothing to compare on metrics yet.'
+      : `The smallest variant has ${minN} exchanges, below the ${MIN_SAMPLE_PER_VARIANT}-exchange floor for a reliable metric read.`;
+    // Say what the human signal shows even though the metric half is not ready, so an operator
+    // running a battle-led evaluation sees their picks rather than a bare "keep it running".
+    const humanNote = humanAxis
+      ? ` Human picks so far: ${Math.round(humanAxis.winRate * 100)}% for treatment across ${humanAxis.picks} `
+        + `pick${humanAxis.picks === 1 ? '' : 's'} (95% CI ${Math.round(humanAxis.ci[0] * 100)}-${Math.round(humanAxis.ci[1] * 100)}%), `
+        + `which ${humanAxis.significant ? 'excludes' : 'includes'} 50%. That is the human axis only; it does not `
+        + 'settle the metric comparison.'
+      : ' No battle picks recorded yet either.';
+    const approvalNote = approval
+      ? ` User approval: ${Math.round(approval.treatmentRate * 100)}% treatment vs `
+        + `${Math.round(approval.controlRate * 100)}% control across ${approval.votes} vote`
+        + `${approval.votes === 1 ? '' : 's'} (95% CI on the difference `
+        + `${(approval.ci[0] * 100).toFixed(1)} to ${(approval.ci[1] * 100).toFixed(1)} points), `
+        + `which ${approval.significant ? 'excludes' : 'includes'} zero.`
+      : '';
+    const rec = inconclusiveRecommendation(`${metricNote}${humanNote}${approvalNote}`, objective, decision);
     return success({
-      verdict: 'inconclusive',
-      confidence: 'low',
-      rationale: variants.length < 2
-        ? 'Only one variant has recorded traffic, so there is nothing to compare yet. Let both variants accumulate conversations.'
-        : `The smallest variant has ${minN} exchanges, below the ${MIN_SAMPLE_PER_VARIANT}-exchange threshold for a reliable read. Keep the experiment running before deciding.`,
+      ...rec,
+      ...(humanAxis ? { human: humanAxis } : {}),
+      ...(approval ? { approval } : {}),
       variants,
       experimentId,
     });
   }
 
-  const llm = await generateRecommendation(experimentId, variants);
-  return success({ ...llm, variants, experimentId });
+  // Pool each variant's per-intent groups into one (mean, sd, n) per metric.
+  const pooled = new Map<string, VariantContinuousStats>();
+  for (const [key, grp] of statsByVariant) {
+    pooled.set(key, {
+      score: poolGroups(grp.score),
+      latency: poolGroups(grp.latency),
+      cost: poolGroups(grp.cost),
+      tokens: poolGroups(grp.tokens),
+    });
+  }
+
+  const rec = await computeRecommendation(variants, pooled, objective, decision);
+  return success({ ...rec, variants, experimentId });
+}
+
+/** The A.6 shape for the not-enough-data / single-variant case (honest, INV-3). */
+/**
+ * The human battle-pick axis, derived from the variants' `battle_wins`.
+ *
+ * Returns null when no pick has been recorded, so "no battles yet" stays visibly different from
+ * "battles ran and split 50/50" - a zero-filled axis would read as the latter.
+ *
+ * Orientation matches the metric axis: the rate is TREATMENT's share of decisive picks, so a >50%
+ * human rate and a positive metric delta point the same way and can be compared without re-reading
+ * which side the number describes. Ties carry no variantId and never reach `battle_wins`, so
+ * `picks` is the count of DECISIVE picks.
+ */
+export function battlePickAxis(
+  variants: Array<{ variant_id: string; battle_wins: number | null }>,
+): { picks: number; winRate: number; ci: [number, number]; significant: boolean } | null {
+  if (variants.length < 2) return null;
+  const control = variants.find((v) => v.variant_id === 'control') || variants[0];
+  const treatment = variants.find((v) => v.variant_id === 'treatment') || variants.find((v) => v !== control) || variants[1];
+  const tWins = Number(treatment?.battle_wins) || 0;
+  const cWins = Number(control?.battle_wins) || 0;
+  const decisive = tWins + cWins;
+  if (decisive <= 0) return null;
+  const r = humanPickTest(tWins, decisive);
+  return { picks: r.picks, winRate: r.winRate, ci: r.ci as [number, number], significant: r.significant };
 }
 
 /**
- * Ask a model to turn the per-variant metrics into a verdict + rationale.
- * Falls back to a deterministic heuristic if the model call or parse fails,
- * so the endpoint always returns a usable recommendation.
+ * The USER-APPROVAL axis: thumbs up/down collected on ordinary (non-duel) experiment traffic.
+ *
+ * Reported as a TESTED rate with a confidence interval, not a bare percentage. `GUIDE-AB-TESTING`
+ * listed approval among the rate metrics that "each use the appropriate test, and the difference is
+ * reported with a confidence interval" - which was untrue: approval is not in `ExperimentObjectiveMetric`
+ * (`cost|accuracy|quality|latency`), so it could be neither a primary metric nor a guardrail, and
+ * `experiment-stats.ts` had no reference to it. It was collected, displayed, and never evaluated.
+ *
+ * This is the SECOND human signal and the higher-volume one: a battle pick needs a duel, whereas any
+ * exchange can carry a thumb. Like the battle axis it stays SEPARATE from the metric verdict - it is
+ * self-selected feedback, not a randomised measurement, so it informs a decision rather than settling it.
+ *
+ * delta is treatment minus control, matching the orientation of the metric delta and the battle axis,
+ * so all three point the same way. Returns null when neither side has a vote, so "nobody voted" stays
+ * distinct from "both sides scored 0%".
  */
-async function generateRecommendation(
-  experimentId: string,
-  variants: any[]
-): Promise<{ verdict: string; confidence: string; rationale: string }> {
-  const prompt = `You are an experimentation analyst for an enterprise AI platform. An operator ran an A/B test comparing model variants on the same intent. Recommend what to do, based ONLY on the numbers below.
+export function approvalAxis(
+  variants: Array<{ variant_id: string; thumbs_up?: number; feedback_count?: number }>,
+): {
+  controlRate: number; treatmentRate: number; delta: number; ci: [number, number];
+  pValue: number; significant: boolean; votes: number;
+} | null {
+  if (variants.length < 2) return null;
+  const control = variants.find((v) => v.variant_id === 'control') || variants[0];
+  const treatment = variants.find((v) => v.variant_id === 'treatment') || variants.find((v) => v !== control) || variants[1];
+  const cN = Number(control?.feedback_count) || 0;
+  const tN = Number(treatment?.feedback_count) || 0;
+  if (cN + tN <= 0) return null;
+  const cUp = Number(control?.thumbs_up) || 0;
+  const tUp = Number(treatment?.thumbs_up) || 0;
+  const r = twoProportionTest(tUp, tN, cUp, cN);
+  return {
+    controlRate: r.pB,
+    treatmentRate: r.pA,
+    delta: r.delta,
+    ci: r.ci,
+    pValue: r.pValue,
+    // Significant when the CI on the DIFFERENCE excludes zero, the same bar the metric axis uses.
+    significant: r.ci[0] > 0 || r.ci[1] < 0,
+    votes: cN + tN,
+  };
+}
 
-Variants (control is the baseline, treatment is the challenger):
-${JSON.stringify(variants, null, 2)}
+function inconclusiveRecommendation(
+  rationale: string,
+  objective?: ExperimentObjective,
+  decision?: ExperimentDecision,
+): ExperimentRecommendation {
+  const metric = objective?.metric ?? 'quality';
+  return {
+    verdict: 'inconclusive',
+    confidence: 'low',
+    rationale,
+    primary: { metric, deltaPct: 0, ci: [0, 0], pValue: 1, significant: false, powered: false },
+    guardrails: [],
+    recommendedVsChosen: { recommended: 'inconclusive', chosen: decision?.outcome },
+  };
+}
 
-Scoring guidance:
-- "avg_score" is response quality 0-100 (higher better). "task_completion_rate" is the percent of multi-step tasks the variant actually completed (higher better) and is the most important agent metric when present.
-- "compliance_rate" (higher better), "fallback_rate" (lower better), "avg_total_ms" latency (lower better), "avg_cost_usd" per response (lower better).
-- "approval_rate" is the user thumbs-up percent over "feedback_count" ratings (higher better) — a direct HUMAN signal. Weigh it alongside avg_score, but treat it cautiously when feedback_count is small (single digits) and as null/ignore when it is null (no ratings yet).
-- "battle_wins" is how many head-to-head /battle rounds this variant was explicitly picked to win (higher better) — the strongest direct HUMAN preference signal when present. Compare the two variants' battle_wins; ignore when null (no battles run).
-- A winner should be clearly better on quality and/or task completion without a serious regression on compliance or fallback. A cheaper/faster variant that matches the other on quality and completion is a win for cost.
+/**
+ * Compute the statistically-grounded recommendation (DESIGN §4.2-4.4) from the
+ * pooled per-variant stats. The verdict is a pre-registered decision RULE, the
+ * confidence is DERIVED from the primary p-value/power/guardrails (§4.2-E), and
+ * the human battle pick is a distinct axis. Nothing is auto-judged (INV-4).
+ */
+async function computeRecommendation(
+  variants: any[],
+  pooled: Map<string, VariantContinuousStats>,
+  objective?: ExperimentObjective,
+  decision?: ExperimentDecision,
+): Promise<ExperimentRecommendation> {
+  // Orient control vs treatment (fall back to first/second when unlabeled).
+  const control = variants.find((v) => v.variant_id === 'control') || variants[0];
+  const treatment = variants.find((v) => v.variant_id === 'treatment') || variants.find((v) => v !== control) || variants[1];
+  const cStats = pooled.get(control.variant_id) || zeroStats();
+  const tStats = pooled.get(treatment.variant_id) || zeroStats();
 
-Respond with ONLY a JSON object, no preamble:
-{"verdict": "promote_control" | "promote_treatment" | "keep_running" | "inconclusive", "confidence": "low" | "medium" | "high", "rationale": "one short paragraph citing the actual numbers"}`;
+  const primaryMetric: ExperimentObjectiveMetric = objective?.metric ?? 'quality';
 
+  // Objective-DRIVEN evaluation (§4.2-4.4, experiment-stats.evaluateExperimentOutcome): the
+  // recommendation reads the objective's primary metric + good-direction, ties the power check
+  // to its target, applies its guardrails, and folds the weighted human battle pick as a
+  // distinct axis — so the verdict HONORS THE GOALS of the test, not a fixed metric. Pure +
+  // unit-tested; here we only orient the variants, then narrate the result.
+  // Computed once; referenced in the payload below.
+  const approvalOnPoweredPath = approvalAxis(variants);
+
+  const { primary, guardrails, human: hp, humanPickWeight, verdict, confidence, humanAgrees, humanConflicts } =
+    evaluateExperimentOutcome({
+      control: cStats,
+      treatment: tStats,
+      objective: objective as OutcomeObjective | undefined,
+      battleWins: { treatment: Number(treatment.battle_wins) || 0, control: Number(control.battle_wins) || 0 },
+    });
+
+  const template = buildRationale({
+    verdict,
+    confidence,
+    control,
+    treatment,
+    primary,
+    guardrails,
+    hp,
+    humanPickWeight,
+    humanAgrees,
+    humanConflicts,
+    objectiveMetric: primaryMetric,
+  });
+  // The LLM (or the template fallback) narrates the numbers ONLY — it never sources
+  // the verdict or confidence (§4.2-E). A failed/odd model call keeps the template.
+  const rationale = await narrateRationale(template);
+
+  return {
+    verdict,
+    confidence,
+    rationale,
+    primary: {
+      metric: primary.metric,
+      deltaPct: primary.deltaPct,
+      ci: primary.ci,
+      pValue: primary.pValue,
+      significant: primary.significant,
+      powered: primary.powered,
+    },
+    guardrails: guardrails.map((g) => ({ metric: g.metric, deltaPct: g.deltaPct, bound: g.bound, held: g.held })),
+    human: hp
+      ? { picks: hp.picks, winRate: round4(hp.winRate), ci: [round4(hp.ci[0]), round4(hp.ci[1])], significant: hp.significant }
+      : undefined,
+    // User approval (thumbs) as a TESTED rate, alongside and separate from the metric verdict. It is
+    // self-selected feedback rather than a randomised measurement, so like the battle pick it informs
+    // the decision and never silently moves it.
+    ...(approvalOnPoweredPath ? { approval: approvalOnPoweredPath } : {}),
+    recommendedVsChosen: { recommended: verdict, chosen: decision?.outcome },
+    // The floor THIS deployment applies. It is configurable, so a console that hardcodes a number
+    // will eventually contradict the verdict it is rendering next to - banner a variant as "below N
+    // exchanges" while the backend has already returned a real verdict, or prescribe "need ~N more"
+    // against a threshold the backend does not use. Reported so the console can state the truth
+    // rather than infer it.
+    minSamplePerVariant: MIN_SAMPLE_PER_VARIANT,
+  };
+}
+
+function zeroStats(): VariantContinuousStats {
+  const z: GroupStat = { n: 0, mean: 0, sd: 0 };
+  return { score: { ...z }, latency: { ...z }, cost: { ...z }, tokens: { ...z } };
+}
+
+const round1 = (n: number): number => Math.round(n * 10) / 10;
+const round4 = (n: number): number => Math.round(n * 1e4) / 1e4;
+
+/** Deterministic prose narrating the computed numbers (the honest default). */
+function buildRationale(a: {
+  verdict: Verdict;
+  confidence: Confidence;
+  control: any;
+  treatment: any;
+  primary: PrimaryEval;
+  guardrails: GuardrailEval[];
+  hp: ReturnType<typeof humanPickTest> | null;
+  humanPickWeight: number;
+  humanAgrees: boolean;
+  humanConflicts: boolean;
+  objectiveMetric: ExperimentObjectiveMetric;
+}): string {
+  const sigTxt = a.primary.significant
+    ? `p=${a.primary.pValue}`
+    : a.primary.powered
+      ? `not significant (p=${a.primary.pValue})`
+      : 'underpowered for the target effect';
+  const parts: string[] = [];
+  parts.push(
+    `Primary metric ${a.primary.metric}: treatment ${a.primary.deltaPct >= 0 ? '+' : ''}${a.primary.deltaPct}% vs control (CI [${a.primary.ci[0]}, ${a.primary.ci[1]}], ${sigTxt}).`,
+  );
+  const breached = a.guardrails.filter((g) => g.breached);
+  if (a.guardrails.length) {
+    parts.push(
+      breached.length
+        ? `Guardrail breach: ${breached.map((g) => `${g.metric} ${g.deltaPct >= 0 ? '+' : ''}${g.deltaPct}% past its ${g.bound}% bound (significant)`).join('; ')} — a ship is vetoed.`
+        : `Guardrails held: ${a.guardrails.map((g) => `${g.metric} ${g.deltaPct >= 0 ? '+' : ''}${g.deltaPct}% within ${g.bound}%`).join('; ')}.`,
+    );
+  }
+  if (a.hp) {
+    const pct = Math.round(a.hp.winRate * 100);
+    const lo = Math.round(a.hp.ci[0] * 100);
+    const hi = Math.round(a.hp.ci[1] * 100);
+    const human = `Humans: ${a.hp.wins}/${a.hp.picks} picked treatment (${pct}% [${lo}-${hi}%]${a.hp.significant ? ', excludes 50%' : ', not significant'}).`;
+    // The human axis is shown ALWAYS but folded into the rule only when weighted;
+    // agreement reinforces, disagreement is surfaced — never averaged (INV-3).
+    if (a.humanConflicts) {
+      parts.push(`${human} This CONTRADICTS the metric verdict — reconcile it yourself; the signals are not averaged.`);
+    } else if (a.humanAgrees) {
+      parts.push(`${human} This agrees with the metric verdict, reinforcing it.`);
+    } else {
+      parts.push(human);
+    }
+  }
+  const verdictTxt: Record<Verdict, string> = {
+    promote_treatment: 'Recommendation: promote treatment',
+    keep_control: 'Recommendation: keep control',
+    keep_running: 'Recommendation: keep running — not enough data yet',
+    equivalent: `Recommendation: variants are equivalent on ${a.primary.metric}`,
+    inconclusive: 'Recommendation: inconclusive',
+  };
+  let tail = `${verdictTxt[a.verdict]} (confidence: ${a.confidence}).`;
+  if (a.verdict === 'equivalent' && (a.objectiveMetric === 'cost' || a.objectiveMetric === 'latency')) {
+    tail += ` As the objective is ${a.objectiveMetric}, prefer the cheaper/faster side as a tiebreak.`;
+  }
+  parts.push(`${tail} Advisory only — not auto-applied.`);
+  return parts.join(' ');
+}
+
+/**
+ * Prose-only narration. Given the already-computed, verdict-bearing template, ask
+ * the model to render a cleaner one-paragraph narration WITHOUT changing the
+ * decision — it no longer sources the verdict/confidence (§4.2-E). Any failure or
+ * empty output falls back to the deterministic template, so a recommendation is
+ * always available.
+ */
+async function narrateRationale(template: string): Promise<string> {
   try {
     const resp = await bedrockClient.send(new InvokeModelCommand({
       modelId: RECOMMENDATION_MODEL_ID,
@@ -2210,50 +3516,20 @@ Respond with ONLY a JSON object, no preamble:
       accept: 'application/json',
       body: JSON.stringify({
         anthropic_version: 'bedrock-2023-05-31',
-        max_tokens: 400,
+        max_tokens: 300,
         temperature: 0.2,
-        messages: [{ role: 'user', content: prompt }],
+        messages: [{
+          role: 'user',
+          content: `Rewrite the following A/B-test recommendation as one clear, neutral paragraph for an operator. Keep EVERY number, the verdict, and the confidence EXACTLY as given — do not add, change, or infer any conclusion. Return only the paragraph, no preamble.\n\n${template}`,
+        }],
       }),
     }));
     const body = JSON.parse(new TextDecoder().decode(resp.body));
-    const text: string = body?.content?.[0]?.text || '';
-    const match = text.match(/\{[\s\S]*\}/);
-    if (match) {
-      const parsed = JSON.parse(match[0]);
-      const validVerdicts = ['promote_control', 'promote_treatment', 'keep_running', 'inconclusive'];
-      if (validVerdicts.includes(parsed.verdict) && typeof parsed.rationale === 'string') {
-        return {
-          verdict: parsed.verdict,
-          confidence: ['low', 'medium', 'high'].includes(parsed.confidence) ? parsed.confidence : 'medium',
-          rationale: parsed.rationale,
-        };
-      }
-    }
-    console.warn('[experiment-recommendation] model output not parseable, using heuristic');
+    const text: string = (body?.content?.[0]?.text || '').trim();
+    if (text.length >= 20) return text;
+    console.warn('[experiment-recommendation] narration too short, using template');
   } catch (err) {
-    console.warn('[experiment-recommendation] model call failed, using heuristic:', err);
+    console.warn('[experiment-recommendation] narration model call failed, using template:', err);
   }
-
-  return heuristicRecommendation(variants);
-}
-
-/** Deterministic fallback so a recommendation is always available. */
-function heuristicRecommendation(variants: any[]): { verdict: string; confidence: string; rationale: string } {
-  const score = (v: any) =>
-    (v.task_completion_rate ?? v.avg_score ?? 0) - v.fallback_rate * 0.5;
-  const sorted = [...variants].sort((a, b) => score(b) - score(a));
-  const [best, next] = sorted;
-  const margin = score(best) - score(next);
-  if (margin < 3) {
-    return {
-      verdict: 'keep_running',
-      confidence: 'low',
-      rationale: `${best.variant_id} and ${next.variant_id} are within ${margin.toFixed(1)} points on the combined quality/completion signal; the difference is not yet decisive.`,
-    };
-  }
-  return {
-    verdict: best.variant_id === 'control' ? 'promote_control' : 'promote_treatment',
-    confidence: margin > 10 ? 'high' : 'medium',
-    rationale: `${best.variant_id} (${best.model_name}) leads on the combined quality/completion signal (${score(best).toFixed(1)} vs ${score(next).toFixed(1)}) with a ${best.fallback_rate}% fallback rate.`,
-  };
+  return template;
 }

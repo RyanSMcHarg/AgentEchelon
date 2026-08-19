@@ -1,5 +1,5 @@
 /**
- * Client seam for the retrieval + drift DATA-PLANE Lambda (project decision 018).
+ * Client seam for the retrieval + drift DATA-PLANE Lambda (ADR-013).
  *
  * Runs in the NON-VPC agent handler. Exposes the SAME function signatures as the
  * underlying `document-retrieval` / `drift-detection` modules, but implemented as
@@ -81,6 +81,7 @@ type DataPlaneOp =
   | 'recordDriftFire'
   | 'recordDriftOutcome'
   | 'getSummary'
+  | 'seedSummary'
   | 'savePendingSuggestion'
   | 'readPendingSuggestion'
   | 'resolvePendingSuggestion'
@@ -110,6 +111,26 @@ async function invoke<T>(op: Op, input: unknown): Promise<T> {
     throw new Error(`data-plane '${op}' FunctionError=${resp.FunctionError}: ${raw.slice(0, 300)}`);
   }
   return (raw ? JSON.parse(raw) : null) as T;
+}
+
+/**
+ * Fire-and-forget variant: `Event` invocation, so it returns as soon as Lambda ACCEPTS the payload
+ * rather than waiting for the work. Used by side-effect ops on the reply path, where the caller
+ * must not pay the data plane's latency (a Bedrock summarisation is seconds) and must not fail the
+ * user's turn if the data plane is unavailable. No result is available by construction.
+ */
+async function invokeAsync(op: Op, input: unknown): Promise<void> {
+  const arn = dataPlaneArn();
+  if (!arn) {
+    throw new Error(`AURORA_DATA_PLANE_ARN unset; cannot run '${op}'`);
+  }
+  await lambda.send(
+    new InvokeCommand({
+      FunctionName: arn,
+      InvocationType: 'Event',
+      Payload: Buffer.from(JSON.stringify({ op, input })),
+    }),
+  );
 }
 
 /** Retrieval — degrades to honest-empty on failure. */
@@ -175,11 +196,40 @@ export async function getLatestSummary(channelArn: string): Promise<string | nul
   }
 }
 
+/**
+ * Seed a conversation's first summary from its opening exchange, giving drift an anchor from turn
+ * one instead of leaving it unable to fire until the scheduled summariser runs.
+ *
+ * The summarisation itself is asynchronous (`Event` invoke), so the caller does NOT wait for
+ * Bedrock - but the returned promise MUST still be awaited. An async Lambda freezes the instant its
+ * handler resolves, so an un-awaited SDK call is frequently suspended before the request is even
+ * sent (the same trap documented on the first-turn title rename). Awaiting costs only the
+ * milliseconds Lambda takes to ACCEPT the payload, and guarantees the seed is actually dispatched.
+ *
+ * Never throws: a failed seed leaves the scheduled scan to write the summary later, which is exactly
+ * the behaviour that existed before this - so the worst case is the old behaviour, never a lost reply.
+ *
+ * Safe to call on ANY turn: the data-plane side no-ops when a summary already exists, so the caller
+ * does not have to know whether this turn was genuinely the conversation's first.
+ */
+export async function seedConversationSummary(input: {
+  channelArn: string;
+  userMessage: string;
+  assistantReply: string;
+}): Promise<void> {
+  if (!hasDataPlane()) return;
+  try {
+    await invokeAsync('seedSummary', input);
+  } catch (err) {
+    console.warn('[data-plane-client] seedSummary failed (non-fatal):', err);
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Pending-drift-suggestion task lifecycle (conversation_creation_tasks).
 // Open on detect, read to RESUME on a later turn, close on confirm/decline.
 // Runs via the data plane so the non-VPC handler can persist durable drift
-// state (ADR-018) — a direct query() here fails with DB_SECRET_ARN.
+// state (ADR-013) — a direct query() here fails with DB_SECRET_ARN.
 // ---------------------------------------------------------------------------
 
 /** Open a pending suggestion. Degrades to a stub (taskId='') on failure — the

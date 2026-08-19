@@ -27,6 +27,24 @@ jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
 jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
   query: mockDbQuery,
   getClient: jest.fn(),
+  ensureSchema: jest.fn(),
+}));
+
+// ADR-028: the subject now runs its bounded-table statements as a database role, via
+// `withReaderRole`/`withWriterRole` (which wrap `transaction()`). Route those back to the mocked
+// `query` so the SQL assertions below are unchanged, and record which role was assumed so the tests
+// can assert the boundary was entered at all — a query that reaches the right table as the WRONG role
+// is precisely the failure this design exists to prevent, and it is invisible in the SQL text.
+const mockAssumedRoles: string[] = [];
+jest.mock('../../lambda/src/analytics-aurora/classification-boundary', () => ({
+  withReaderRole: jest.fn(async (classification: string, fn: (c: unknown) => unknown) => {
+    mockAssumedRoles.push(`ae_reader_${classification}`);
+    return fn({ query: require('../../lambda/src/analytics-aurora/db-client').query });
+  }),
+  withWriterRole: jest.fn(async (fn: (c: unknown) => unknown) => {
+    mockAssumedRoles.push('ae_writer');
+    return fn({ query: require('../../lambda/src/analytics-aurora/db-client').query });
+  }),
 }));
 
 beforeEach(() => {

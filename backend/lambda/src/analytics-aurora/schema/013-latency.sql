@@ -23,9 +23,15 @@
 -- 1024-char cap. All nullable: absent values are skipped by AVG/PERCENTILE and never
 -- wrong-valued during first traffic. No backfill.
 --
--- Idempotent (ADD COLUMN IF NOT EXISTS). Same schema-init Update-path caveat as
--- migrations 010-012: applies on a fresh cluster Create; an already-bootstrapped
--- cluster must apply it out-of-band (or be re-stood-up).
+-- Idempotent (ADD COLUMN IF NOT EXISTS).
+--
+-- The "an already-bootstrapped cluster must apply this out-of-band" caveat that used to sit here is
+-- GONE: `db-client.ensureSchema` applies any unapplied schema/*.sql at RUNTIME over the IAM
+-- connection, under an advisory lock, so a migration lands on an existing cluster with no manual
+-- step. `schema-init` really does bootstrap on Create only (IamAuthSetup grants rds_iam, which
+-- disables the password auth it used) - runtime application is what covers the gap. It only happens
+-- in Lambdas that CALL ensureSchema; all eight DB Lambdas now do, pinned by
+-- db-lambdas-apply-migrations.test.ts. Runtime-applied migrations must be transaction-safe.
 
 ALTER TABLE messages   ADD COLUMN IF NOT EXISTS agent_final_at TIMESTAMPTZ;
 ALTER TABLE messages   ADD COLUMN IF NOT EXISTS model_ms       INTEGER;

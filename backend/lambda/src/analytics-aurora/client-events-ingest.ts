@@ -5,7 +5,7 @@
  * Athena) is NOT deployed, so nothing populates the Aurora `client_events` table
  * and every session/user/WebSocket rollup reads empty. Instead of standing up a
  * second Firehose+loader, the `/events` handler writes straight to Aurora through
- * the VPC data-plane Lambda (ADR-018) — this function does the insert.
+ * the VPC data-plane Lambda (ADR-013) — this function does the insert.
  *
  * The normalized record shape mirrors client-events.ts `NormalizedEvent`; the
  * analytics-only fields fold into `event_data` (the query functions read exactly

@@ -21,9 +21,31 @@ export type QueryType =
   | 'drift_events'
   | 'cross_conversation_context'
   | 'latency_metrics'
+  // ONE TURN, AUDITED (LATENCY-TARGETS, row 50 step 8). `latency_metrics` aggregates; this returns the
+  // calculation itself - one row per (turn_id, response_id) with its instants and its reconciliation
+  // residuals - so an operator can check a number against the message stream instead of trusting it.
+  // An aggregate cannot be audited, which is the reason the ledger exists at all.
+  | 'turn_latency_audit'
+  // Whole-task resolution, deliberately NOT latency: resolve_ms is mostly human think time, and
+  // agent_ms is the part the deployment is accountable for. Mixing them reads as a latency regression.
+  | 'task_resolution'
   | 'model_effectiveness'
   | 'experiment_results'
   | 'experiment_recommendation'
+  // The evidence behind an experiment verdict (DESIGN-EXPERIMENTS-BATTLE §4.3). THREE queries,
+  // because the verdict rests on three different populations and one drill-down filtered for the
+  // metric averages would be the wrong set for the other two: exchanges (metric averages, split by
+  // `axis` into probabilistic and battle turns), votes (the approval rate), picks (the human axis).
+  | 'experiment_exchanges'
+  | 'experiment_feedback'
+  | 'experiment_picks'
+  // The classification shadow gate (DESIGN-EXPERIMENTS-BATTLE §5): replay lifecycle, the gate
+  // verdict, and the discordant-only adjudication queue.
+  | 'classifier_replays'
+  | 'classifier_replay'
+  | 'classifier_replay_labels'
+  | 'classifier_replay_start'
+  | 'classifier_replay_adjudicate'
   // Client-events rollups
   | 'active_users_daily'
   | 'active_messaging_users_daily'
@@ -65,12 +87,26 @@ export interface AnalyticsResult {
   limit?: number;
   offset?: number;
   /**
+   * Aggregate counters a query returns alongside its rows (the dispatcher spreads the query's
+   * response and only overwrites `data`, so any extra top-level key survives). Used by drift, whose
+   * headline is the OUTCOME RATES rather than the row list. Postgres returns COUNT(*) as a string,
+   * so values are widened to string | number and parsed at the point of use.
+   */
+  stats?: Record<string, string | number | null>;
+  /**
    * experiment_results only: the battle-scoped effectiveness view (SPEC-BATTLE). Per-variant metrics
    * from a battle-enabled experiment's BATTLE turns ONLY, kept OUT of the probabilistic A/B `data`
    * rollup so a hand-picked battle prompt never biases the A/B averages. The ExperimentsTab renders
    * this as a separate "Battle results" section, additional to (never replacing) the A/B table.
    */
   battleEffectiveness?: { data: BattleEffectivenessRow[]; columns: string[] };
+  /**
+   * Drill-down queries only: which population the response actually served, echoed from the query
+   * rather than assumed from the request. The view must be able to state what it is showing, and a
+   * silently-defaulted axis would otherwise be labelled as the one that was asked for.
+   */
+  axis?: string;
+  variantId?: string | null;
 }
 
 // Battle-scoped effectiveness: one row per (experiment, variant), from BATTLE turns only.
@@ -197,6 +233,16 @@ export interface ExperimentRecommendation {
   rationale: string;
   variants: ExperimentRecommendationVariant[];
   experimentId: string;
+  /**
+   * Exchanges per variant THIS deployment requires before a verdict is decision-grade.
+   *
+   * The backend already returns it (`analytics-query.ts`, `minSamplePerVariant`) precisely so the console
+   * does not hardcode a threshold and then contradict the verdict rendered beside it. It was declared on
+   * the sibling `ExperimentRecommendation` in `services/experimentService.ts` but not on this one, so a
+   * consumer importing from here could not read a value the response already carried - which is how the
+   * thin-data banner ended up derived from per-slice flags instead of the floor actually applied.
+   */
+  minSamplePerVariant?: number;
 }
 
 // Basic evaluation (Athena mode)

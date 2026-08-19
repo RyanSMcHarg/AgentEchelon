@@ -2,6 +2,8 @@
 
 **Status:** Implemented (opt-in deployment mode).
 
+**Coverage:** `e2e/latency.spec.ts`, `e2e/admin-dashboard.spec.ts`
+
 **Problem and who it's for:** When a deployment's analytics and evaluation outgrow the cheap serverless default - it needs sub-second multi-table joins, stateful multi-turn evaluation, pgvector similarity, or materialized views for a real-time admin dashboard and eval loops - teams want that heavier query engine by flipping one flag, not by assembling and running their own VPC, PostgreSQL, and pgvector stack. This is for the admin/operator and the AI developer whose analytics and eval have outgrown the default Athena path. It provisions a full Aurora PostgreSQL Serverless v2 + VPC query engine behind one CDK flag, additive and leaving the default path untouched; the S3/Athena conversation archive remains the system of record in both modes.
 
 **Site section:** Core platform, ops (cross-cutting operations; not a pillar).
@@ -126,18 +128,19 @@ Both stacks implement a common `IAnalyticsStack` interface so downstream stacks 
 ### Interface Abstraction
 
 ```typescript
-// backend/lib/interfaces/analytics-stack.ts
-export interface IAnalyticsStack {
-  readonly kinesisStream: IStream;
-  readonly summaryUpdaterLambda: IFunction;
-  readonly analyticsQueryLambda: IFunction;
-  readonly archiveBucketArn?: string;  // Athena mode only
+// backend/lib/interfaces/analytics-stack-interface.ts
+export interface IAnalyticsStackOutputs {
+  readonly kinesisStreamArn: string;
+  readonly kinesisStreamName: string;
+  readonly archiveBucketArn: string;
+  readonly archiveBucketName: string;
+  readonly analyticsMode: 'athena' | 'aurora';
   readonly dbProxyEndpoint?: string;   // Aurora mode only
-  readonly vpc?: IVpc;                 // Aurora mode only
+  readonly vpc?: ec2.IVpc;             // Aurora mode only
 }
 ```
 
-Consuming stacks read `kinesisStream` and `summaryUpdaterLambda` - both modes provide them. Mode-specific fields are optional.
+**The contract is ARNs and names, not construct references, and that is deliberate.** Passing an `IStream` or an `IFunction` between stacks creates a CloudFormation export and a hard dependency edge, which is what makes two stacks undeployable in either order. Strings cross the boundary without one. The archive bucket is required rather than Athena-only because both modes archive conversations to S3; only the query layer differs. No Lambda handles are exposed: a consumer that needs to invoke one resolves it from the SSM contract at runtime.
 
 ---
 
@@ -147,7 +150,7 @@ Consuming stacks read `kinesisStream` and `summaryUpdaterLambda` - both modes pr
 
 Source: the reference Aurora evaluation stack
 
-New: `AgentEchelon/backend/lib/stacks/analytics-stack-aurora.ts`
+New: `backend/lib/stacks/analytics-stack-aurora.ts`
 
 > **VPC import support.** The stack supports BOTH creating a dedicated VPC (default) and importing an existing one. `-c analyticsVpcId=<id>` imports via `ec2.Vpc.fromLookup` so an Aurora deploy can SHARE a VPC already in the account (e.g. a sibling project's) and avoid a second VPC + endpoint footprint; `-c analyticsVpcSubnetType=isolated|private|public` (default `isolated`) picks which subnet tier of the imported VPC hosts the data plane; `-c createVpcEndpoints=false` skips the interface/gateway endpoints when the imported VPC already provides AWS-API egress (a newly created VPC is NAT-free and always builds them - `false` there is rejected at synth). A single shared `dbSubnets` selection drives Aurora, the RDS Proxy, and every in-VPC Lambda. The code below is the create-only design; the import path wraps it.
 
@@ -231,7 +234,7 @@ const proxy = new rds.DatabaseProxy(this, 'AnalyticsProxy', {
 
 Source: the reference Aurora evaluation schema (24KB, full schema)
 
-New location: `AgentEchelon/backend/lambda/src/analytics-aurora/schema/001-initial.sql`, `002-pgvector.sql`, etc.
+New location: `backend/lambda/src/analytics-aurora/schema/001-initial.sql`, `002-pgvector.sql`, etc.
 
 **Schema contents to extract:**
 - `conversations` table (channel_arn, created_at, summary, status)
@@ -275,13 +278,13 @@ Provides a shared `pg` client with:
 - Automatic reconnect on 28P01 auth errors
 - Query helpers for common patterns
 
-New location: `AgentEchelon/backend/lambda/src/analytics-aurora/db-client.ts`
+New location: `backend/lambda/src/analytics-aurora/db-client.ts`
 
 ### 6. Archival Lambda (Kinesis → Aurora)
 
 Source: the reference Kinesis-to-Aurora archival Lambda
 
-Rewritten version of `AgentEchelon/backend/lambda/src/archival/*` that writes to Aurora instead of S3 via Firehose.
+Rewritten version of `backend/lambda/src/archival/*` that writes to Aurora instead of S3 via Firehose.
 
 **Responsibilities:**
 - Consume Kinesis records

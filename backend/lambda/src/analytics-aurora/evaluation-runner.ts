@@ -19,7 +19,7 @@ import {
   type ConverseCommandInput,
 } from '@aws-sdk/client-bedrock-runtime';
 import { S3Client } from '@aws-sdk/client-s3';
-import { query } from './db-client.js';
+import { query, ensureSchema } from './db-client.js';
 import { stripMessageMarkers } from '../lib/message-markers.js';
 import { fetchAttachmentBytes } from '../lib/attachment-bytes.js';
 import { extractAttachment } from '../lib/battle-attachment.js';
@@ -598,6 +598,139 @@ async function runFlowPass(): Promise<{ scored: number; errors: number }> {
   return { scored, errors };
 }
 
+// ============================================================================
+// Pass C: drift OFFERS — judge whether the call was right, not how the user reacted.
+// ============================================================================
+
+/**
+ * Whether a drift suggestion was CORRECT is a judgement about the call, and it cannot be read off
+ * the user's response: someone can decline a perfectly good suggestion because they are mid-thought,
+ * and accept a bad one and never return. So the accuracy half of the drift health surface comes
+ * from here, and acceptance is reported separately (SPEC-DRIFT-CONVERGENCE).
+ *
+ * The judge sees exactly what the detector compared: the conversation's summary (the anchor) and
+ * the message that fired. Deliberately NOT the outcome — telling the judge the user declined would
+ * turn this into a measure of user reaction, which is the thing it exists to be independent of.
+ */
+const DRIFT_OFFER_PROMPT = `You are evaluating an automated "topic change" detector in a chat assistant.
+
+When the detector believes a user has moved to a genuinely NEW subject, the assistant offers to split the discussion into a separate conversation. Your job is to judge whether making that offer was CORRECT for this message.
+
+The conversation so far is summarised as:
+{{summary}}
+
+The user then sent:
+{{message}}
+
+Judge ONLY whether the user genuinely moved to a new subject that deserves its own conversation.
+
+Answer correct=true when the message starts a subject the summary does not cover and would not naturally belong in this thread.
+
+Answer correct=false when any of these apply:
+- the message continues, narrows, or digs deeper into a subject the summary already covers
+- the message ANSWERS a question the assistant asked (short fragments supplying requirements, preferences, or details are continuations, however differently worded)
+- the message is a greeting, thanks, acknowledgement, or other small talk
+- the message merely mentions something in passing while staying on the current subject
+
+Respond with ONLY this JSON:
+{"correct": true or false, "reasoning": "one sentence"}`;
+
+interface DriftOfferRow {
+  event_id: string;
+  user_message: string | null;
+  conversation_summary: string | null;
+}
+
+/**
+ * Live OFFERS awaiting judgement. `source='live'` is load-bearing: archival rows are post-hoc
+ * scoring that was never shown to anyone (migration 016), so judging them would measure a
+ * suggestion that does not exist.
+ *
+ * Requiring the message body to be present means a row whose message has not been archived yet is
+ * simply not selected, rather than burning a judge call or being scored without its input. It
+ * becomes eligible once archival catches up.
+ */
+async function getUnjudgedDriftOffers(limit: number): Promise<DriftOfferRow[]> {
+  const result = await query<DriftOfferRow>(
+    `SELECT d.event_id,
+            m.content AS user_message,
+            cs.summary AS conversation_summary
+       FROM drift_events d
+       JOIN messages m
+         ON m.message_id = d.originating_message_id
+        AND m.channel_arn = d.parent_channel_arn
+       LEFT JOIN LATERAL (
+            SELECT summary
+              FROM conversation_summaries
+             WHERE channel_arn = d.parent_channel_arn
+             ORDER BY version DESC
+             LIMIT 1
+          ) cs ON TRUE
+      WHERE d.source = 'live'
+        AND d.evaluated_at IS NULL
+        AND m.content IS NOT NULL
+      ORDER BY d.occurred_at DESC
+      LIMIT $1`,
+    [limit],
+  );
+  return result.rows;
+}
+
+async function scoreDriftOffer(row: DriftOfferRow): Promise<{ correct: boolean; reasoning: string }> {
+  const prompt = DRIFT_OFFER_PROMPT
+    .replace('{{summary}}', row.conversation_summary || '(no summary recorded for this conversation)')
+    .replace('{{message}}', stripMarkers(row.user_message || ''));
+
+  const response = await bedrockClient.send(
+    new InvokeModelCommand({
+      modelId: EVALUATOR_MODEL,
+      contentType: 'application/json',
+      accept: 'application/json',
+      body: JSON.stringify({
+        anthropic_version: 'bedrock-2023-05-31',
+        max_tokens: 512,
+        messages: [{ role: 'user', content: prompt }],
+      }),
+    }),
+  );
+
+  const body = JSON.parse(new TextDecoder().decode(response.body));
+  const text = body.content?.[0]?.text || '{}';
+  const match = text.match(/\{[\s\S]*\}/);
+  // A parse failure must NOT become a verdict: throwing leaves evaluated_at NULL, so the row stays
+  // "not measured" and is retried, rather than being recorded as a wrong (or right) call.
+  const parsed = JSON.parse(match ? match[0] : text);
+  if (typeof parsed.correct !== 'boolean') throw new Error('judge did not return a boolean verdict');
+  return { correct: parsed.correct, reasoning: String(parsed.reasoning || '') };
+}
+
+async function runDriftOfferPass(): Promise<{ scored: number; errors: number }> {
+  const offers = await getUnjudgedDriftOffers(MAX_PER_RUN);
+  if (offers.length === 0) return { scored: 0, errors: 0 };
+
+  let scored = 0;
+  let errors = 0;
+  for (const offer of offers) {
+    try {
+      const verdict = await scoreDriftOffer(offer);
+      await query(
+        `UPDATE drift_events
+            SET evaluated_correct = $1,
+                evaluation_reasoning = $2,
+                evaluator_model = $3,
+                evaluated_at = NOW()
+          WHERE event_id = $4`,
+        [verdict.correct, verdict.reasoning, EVALUATOR_MODEL, offer.event_id],
+      );
+      scored += 1;
+    } catch (err) {
+      errors += 1;
+      console.warn(`drift offer ${offer.event_id} failed:`, err instanceof Error ? err.message : String(err));
+    }
+  }
+  return { scored, errors };
+}
+
 export async function handler(
   event: unknown,
 ): Promise<{ statusCode: number; body: string }> {
@@ -605,6 +738,9 @@ export async function handler(
   const runId = `eval-${new Date().toISOString()}`;
 
   try {
+    // Apply any pending migration first - see `summary-updater.ts` for why bundling the schema is not
+    // enough. Memoized per instance; pinned by `db-lambdas-apply-migrations.test.ts`.
+    await ensureSchema();
     const exchanges = await getUnscoredExchanges(MAX_PER_RUN);
     // NOTE: do not early-return when Pass A is empty — Pass B (flow scoring) still
     // needs to run (a deployment can have all exchanges scored but new task flows).
@@ -659,11 +795,27 @@ export async function handler(
       return { scored: 0, errors: 1 };
     });
 
-    console.log(`Evaluation complete: exchanges ${scored} (errors ${errors.length}, image-skipped ${imageSkipped}); flows ${flows.scored} (errors ${flows.errors}).`);
+    // Pass C: drift OFFERS — was the suggestion the right call, independent of how the user
+    // reacted. Feeds the accuracy half of the drift health surface (SPEC-DRIFT-CONVERGENCE).
+    const driftOffers = await runDriftOfferPass().catch((err) => {
+      console.error('Drift offer pass error:', err);
+      return { scored: 0, errors: 1 };
+    });
+
+    console.log(`Evaluation complete: exchanges ${scored} (errors ${errors.length}, image-skipped ${imageSkipped}); flows ${flows.scored} (errors ${flows.errors}); drift offers ${driftOffers.scored} (errors ${driftOffers.errors}).`);
     if (errors.length) console.warn('Eval errors:', errors.slice(0, 5));
     return {
       statusCode: 200,
-      body: JSON.stringify({ evaluated: scored, errors: errors.length, imageSkipped, flowsScored: flows.scored, flowErrors: flows.errors, runId }),
+      body: JSON.stringify({
+        evaluated: scored,
+        errors: errors.length,
+        imageSkipped,
+        flowsScored: flows.scored,
+        flowErrors: flows.errors,
+        driftOffersScored: driftOffers.scored,
+        driftOfferErrors: driftOffers.errors,
+        runId,
+      }),
     };
   } catch (err) {
     console.error('Evaluation runner error:', err);

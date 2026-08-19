@@ -11,9 +11,34 @@ import { Page, Response } from '@playwright/test';
  * validate the *rendered* frontend rather than a timing window.
  */
 
-// The analytics API the built frontend POSTs every queryType to. Match by host
-// so the tests don't couple to the trailing stage/path.
-export const ANALYTICS_HOST = process.env.E2E_ANALYTICS_HOST || '<analytics-api-id>.execute-api.us-east-1.amazonaws.com';
+/**
+ * The analytics API host the built frontend POSTs every queryType to. Matched by host so the tests
+ * don't couple to the trailing stage/path.
+ *
+ * This used to default to the literal string `<analytics-api-id>.execute-api.us-east-1.amazonaws.com`
+ * - a placeholder left behind when the real host was scrubbed for the public repo. Nothing re-derived
+ * it, so unless E2E_ANALYTICS_HOST happened to be exported by hand, `isAnalyticsPost` matched NOTHING:
+ * every waiter below burned its full 25s timeout and resolved null, and the "deterministic settle"
+ * this file exists to provide silently reverted to racing the page load. The admin phase kept passing,
+ * because its assertions tolerate a slow render - which is why it went unnoticed.
+ *
+ * Derived from VITE_ANALYTICS_API_URL instead, which `validate.mjs` already resolves from
+ * packages/admin/.env. No private host in the tree, and it works without hand-exported env.
+ */
+function resolveAnalyticsHost(): string {
+  if (process.env.E2E_ANALYTICS_HOST) return process.env.E2E_ANALYTICS_HOST;
+  const url = process.env.VITE_ANALYTICS_API_URL;
+  if (url) {
+    try {
+      return new URL(url).host;
+    } catch {
+      console.warn(`[analytics-settle] VITE_ANALYTICS_API_URL is not a URL: ${url}`);
+    }
+  }
+  return '';
+}
+
+export const ANALYTICS_HOST = resolveAnalyticsHost();
 
 // queryTypes each top-level SECTION fires on its default (first) sub-tab.
 // Mirrors QUERIES_BY_TAB in AdminDashboard.tsx for each section's default tab.
@@ -49,7 +74,23 @@ function reqQueryType(r: Response): string {
   }
 }
 
+let warnedNoHost = false;
+
 export function isAnalyticsPost(r: Response): boolean {
+  // An unresolved host must not silently match everything (`''.includes` is true for every URL) NOR
+  // silently match nothing. Say which, once, and match nothing - a settle that captures every POST
+  // on the page is worse than one that captures none.
+  if (!ANALYTICS_HOST) {
+    if (!warnedNoHost) {
+      warnedNoHost = true;
+      console.warn(
+        '[analytics-settle] analytics host UNRESOLVED - set VITE_ANALYTICS_API_URL (validate.mjs '
+          + 'reads it from packages/admin/.env) or E2E_ANALYTICS_HOST. Section settles will time out '
+          + 'and any ledger built from them will be EMPTY.',
+      );
+    }
+    return false;
+  }
   return r.url().includes(ANALYTICS_HOST) && r.request().method() === 'POST';
 }
 

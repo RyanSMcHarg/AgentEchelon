@@ -27,6 +27,7 @@ type DriftCounter =
   | 'drift_skipped_declined_neighborhood'
   | 'drift_skipped_intent'
   | 'drift_skipped_no_summary'
+  | 'drift_skipped_active_task'
   | 'drift_fastpath_explicit_intent'
   | 'drift_summary_embedding_lazy_compute'
   | 'drift_signal_disagreement';
@@ -60,7 +61,19 @@ export function emitEmfMetric(args: {
           {
             Namespace: namespace,
             Dimensions: dimensionSets,
-            Metrics: metrics,
+            // `Name`/`Unit`, CAPITALISED. The EMF schema requires it, and CloudWatch rejects a
+            // malformed document SILENTLY: the log line is still written, so everything looks
+            // healthy, and no metric is ever created.
+            //
+            // This emitted `{name, unit}` for as long as it has existed. The result is that NO
+            // metric in any AgentEchelon namespace has ever materialised - `list-metrics` on
+            // AgentEchelon/Drift returned zero after months of drift detection running, and any
+            // alarm over one of these would sit in INSUFFICIENT_DATA forever rather than fire.
+            //
+            // Found by an end-to-end test that asserted the metric existed in CloudWatch rather
+            // than that the code emitted something. The unit tests all passed: they asserted the
+            // shape this function produces, which is not the same as the shape AWS parses.
+            Metrics: metrics.map((m) => ({ Name: m.name, Unit: m.unit })),
           },
         ],
       },

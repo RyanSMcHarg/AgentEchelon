@@ -2,7 +2,8 @@ import React, { useState } from 'react';
 import DataTable from './DataTable';
 import { DocLink } from './AdminHelp';
 import { DOC_LINKS } from '../../config/docLinks';
-import type { AnalyticsResult } from '@ae/shared';
+import ClassifierGatePanel from './ClassifierGatePanel';
+import type { AnalyticsDateRange, AnalyticsResult } from '@ae/shared';
 
 interface GroundTruthTabProps {
   data: AnalyticsResult | null;
@@ -10,6 +11,8 @@ interface GroundTruthTabProps {
   onSubmitScore?: (exchangeId: string, score: number, classification: string, reasoning: string) => void;
   /** Open a conversation's detail (Conversations tab) from a scored exchange. */
   onOpenConversation?: (channelArn: string) => void;
+  /** Window the classifier-gate panel reads its runs over. */
+  dateRange?: AnalyticsDateRange;
 }
 
 function deltaColor(delta: number): string {
@@ -19,7 +22,7 @@ function deltaColor(delta: number): string {
   return 'var(--status-bad)';                  // significant disagreement
 }
 
-const GroundTruthTab: React.FC<GroundTruthTabProps> = ({ data, isLoading, onSubmitScore, onOpenConversation }) => {
+const GroundTruthTab: React.FC<GroundTruthTabProps> = ({ data, isLoading, onSubmitScore, onOpenConversation, dateRange }) => {
   const [showScoring, setShowScoring] = useState(false);
   const [scoreForm, setScoreForm] = useState({
     exchangeId: '',
@@ -205,6 +208,11 @@ const GroundTruthTab: React.FC<GroundTruthTabProps> = ({ data, isLoading, onSubm
         data={rows}
         emptyMessage="No ground truth scores submitted yet. Use the scoring form above to start calibrating."
       />
+
+      {/* The classification shadow gate (DESIGN §5). It lives here because it is the same act as the
+          scoring above - a human deciding what the correct answer was - applied to intent LABELS
+          rather than to answer quality, and both feed evaluation rather than routing. */}
+      {dateRange && <ClassifierGatePanel dateRange={dateRange} />}
     </div>
   );
 };

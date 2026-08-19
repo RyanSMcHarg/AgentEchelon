@@ -1,3 +1,11 @@
+---
+title: "ADR-017: Conversation archive mechanism (mark vs. delete vs. de-member)"
+status: Accepted (option 1 - mark archived + read-only via tag, composed with the type's expiration TTL)
+date: 2026-07-16
+related:
+  - "../../specs/interaction/conversation/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md"
+---
+
 # ADR-017: Conversation archive mechanism (mark vs. delete vs. de-member)
 
 > **Status:** Accepted - **Option 1 (mark archived + read-only via tag)**, composed with the conversation type's Amazon Chime SDK expiration TTL. Governs `docs/specs/interaction/conversation/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md`. Records the choice of how a moderator "archives" a conversation so members lose the ability to write and the conversation leaves their active list, while the durable archive persists and the channel eventually hard-expires.
@@ -55,9 +63,9 @@ The tradeoff accepted: Option 1 carries the most machinery (a read-only enforcem
 
 Retention: all conversation types set `expiration` = `{ days: 90, criterion: LAST_MESSAGE_TIMESTAMP }` - a platform-wide 90-day retention after last activity, applied as `ExpirationSettings` in all three creation paths (see "Composition" above). New conversations are created with this TTL; pre-existing channels are not retro-fitted. This is what gives an archived, now-inactive conversation its eventual hard delete rather than lingering read-only forever.
 
-**Read-only is a documented AWS pattern, not novel.** The IAM-tag enforcement is exactly AWS's own recommendation for read-only Amazon Chime SDK channels ([Creating read-only chat channels for announcements with Amazon Chime SDK messaging](https://aws.amazon.com/blogs/business-productivity/creating-read-only-chat-channels-for-announcements-with-amazon-chime-sdk-messaging/), Approach 2): tag the channel and add an IAM condition that denies `SendChannelMessage`/`UpdateChannelMessage` on tagged channels (`StringNotLike aws:ResourceTag/readonly`). We apply the identical mechanism with the `archived` tag, reusing the existing tag-gated send grant (`tierChannelScopedAllow`) so archive is an incremental condition on a proven pattern rather than new machinery. This de-risks the "most machinery" tradeoff noted above - the enforcement primitive is AWS-documented and already in use for the tier boundary.
+**Read-only is a documented AWS pattern, not novel.** The IAM-tag enforcement is exactly AWS's own recommendation for read-only Amazon Chime SDK channels ([Creating read-only chat channels for announcements with Amazon Chime SDK messaging](https://aws.amazon.com/blogs/business-productivity/creating-read-only-chat-channels-for-announcements-with-amazon-chime-sdk-messaging/), Approach 2): tag the channel and add an IAM condition that denies `SendChannelMessage`/`UpdateChannelMessage` on tagged channels (`StringNotLike aws:ResourceTag/readonly`). We apply the identical mechanism with the `archived` tag, reusing the existing tag-gated send grant (`classificationChannelScopedAllow`) so archive is an incremental condition on a proven pattern rather than new machinery. This de-risks the "most machinery" tradeoff noted above - the enforcement primitive is AWS-documented and already in use for the tier boundary.
 
-**Locking, not just hiding:** on archive the backend also removes all `ChannelModerator`s (only the human is a moderator - `create-conversation/index.js:373-375` on the primary path, `lib/channel-creation.ts:98-100` on drift, `federated-create-conversation.ts:221` on federation; the assistant bot is never one), so no user-side actor can un-archive, rename, or re-open. Read-only (IAM tag) + no moderators (no management authority) makes archive one-way from the user side; only an admin (admin plane) could reverse it.
+**Locking, not just hiding:** on archive the backend also removes all `ChannelModerator`s (only the human is a moderator - `backend/lambda/create-conversation/index.js:457-461` on the primary path, `lib/channel-creation.ts:98-100` on drift, `federated-create-conversation.ts:221` on federation; the assistant bot is never one), so no user-side actor can un-archive, rename, or re-open. Read-only (IAM tag) + no moderators (no management authority) makes archive one-way from the user side; only an admin (admin plane) could reverse it.
 
 ### Roadmap (follow-up, not part of the initial archive build)
 Surface the **retention/expiration setting to the user for their current conversation** - so a user can see how long an (archived or active) conversation will be kept before Amazon Chime SDK deletes it, and understands the grace window they have after archiving. The setting already exists per conversation (`ExpirationSettings`); this is a read-only disclosure in the UI, tracked as a roadmap item.
@@ -65,6 +73,6 @@ Surface the **retention/expiration setting to the user for their current convers
 ## Consequences
 
 - A backend moderator-membership Lambda (per the spec) is required regardless of option - it verifies moderator status and acts as the admin bearer. Option 3 uses only `DeleteChannelMembership`; Option 2 adds `DeleteChannel` + flow/streaming teardown; Option 1 adds tag writes + a read-only gate.
-- `DELETE_CHANNEL_MEMBERSHIP` is not currently audited (`membership-audit.ts:59`); a moderator archive/removal should be logged by the Lambda irrespective of option.
+- `DELETE_CHANNEL_MEMBERSHIP` is not currently audited (`backend/lambda/src/membership-audit.ts:66`); a moderator archive/removal should be logged by the Lambda irrespective of option.
 - The admin dashboard needs no change - it already reads Aurora.
 - **Related (separate, not gated by this ADR): conversation list ordering.** Amazon Chime SDK supplies `LastMessageTimestamp` on each `ChannelSummary` (already captured as `lastMessageAt`, `chimeService.ts:311`) but `ListChannelMembershipsForAppInstanceUser` does **not** return the list pre-sorted - the client must sort. The list should order by `lastMessageAt` (last activity) then `createdAt`, both descending. This is a small frontend sort in `listConversations` / the provider, orthogonal to the archive choice.

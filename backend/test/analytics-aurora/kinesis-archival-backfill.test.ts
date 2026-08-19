@@ -125,16 +125,15 @@ describe('kinesis-archival backfillFromUpdateEvents', () => {
     expect(params[12]).toBe('arn:aws:chime:...:channel/abc');
   });
 
-  it('derives agent_final_at from the update timestamp (gated on total_ms) and e2e_ms on the exchange', async () => {
-    await backfillFromUpdateEvents([updateRecord()]);
+  it('derives agent_final_at from the update timestamp (gated on the DECLARED phase) and e2e_ms on the exchange', async () => {
+    await backfillFromUpdateEvents([updateRecord({ resp_phase: 'final' })]);
 
-    // agent_final_at is the Chime update time ($14), set only when this update carries completion
-    // telemetry ($7 total_ms) and frozen by COALESCE so a later moderation/battle update cannot move it.
+    // agent_final_at is the Chime update time ($14), set when the producer DECLARED this update the
+    // final answer ($17), and frozen by COALESCE so a later moderation/battle update cannot move it.
     const messageCall = mockedQuery.mock.calls.find(([sql]) => /UPDATE messages/.test(sql as string));
     const [msgSql, msgParams] = messageCall as [string, any[]];
-    expect(msgSql).toMatch(
-      /agent_final_at\s*=\s*COALESCE\(agent_final_at, CASE WHEN \$7 IS NOT NULL THEN \$14::timestamptz END\)/,
-    );
+    expect(msgSql).toMatch(/\$17::text = 'final' THEN \$14::timestamptz/);
+    expect(msgParams[16]).toBe('final');
     expect(msgParams[13]).toBe('2026-07-15T00:00:02.000Z');
     // Bedrock latency split folded onto the message: model_ms ($15), tool_ms ($16).
     expect(msgSql).toMatch(/model_ms\s*=\s*COALESCE\(\$15, model_ms\)/);
@@ -155,6 +154,50 @@ describe('kinesis-archival backfillFromUpdateEvents', () => {
     // not by this mock-level assertion). The cast is the fix.
     expect(exSql).toContain('$16::bigint');
     expect(exParams[15]).toBe(1752537600000); // $16 processor_entry_ms
+  });
+
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+  // FINALITY IS DECLARED, NOT INFERRED (tracker row 49).
+  //
+  // The old gate read "this update carries worker telemetry, so it must be the completion", and
+  // `COALESCE` then froze whichever update satisfied that first. The two coincided only for as long as
+  // no interim update happened to carry telemetry - and the battle clarification update does, so it
+  // froze `e2e_ms` at a moment the duel had not finished. Nothing errored; the number simply read too
+  // fast. These three cases are the ones that distinguish the rules.
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+
+  it('does NOT close the turn on an INTERIM update that carries telemetry', async () => {
+    // The exact input the old gate got wrong. `total_ms` is present and the phase says this is a step
+    // on the way, so nothing may be frozen here.
+    await backfillFromUpdateEvents([updateRecord({ resp_phase: 'interim', total_ms: 1200 })]);
+    const [, msgParams] = mockedQuery.mock.calls.find(([sql]) =>
+      /UPDATE messages/.test(sql as string)) as [string, any[]];
+    expect(msgParams[16]).toBe('interim');
+    // The SQL is what decides: with a declared phase that is not 'final', neither branch of the CASE
+    // can fire, so the timestamp param is inert on this row.
+    const [msgSql] = mockedQuery.mock.calls.find(([sql]) =>
+      /UPDATE messages/.test(sql as string)) as [string, any[]];
+    expect(msgSql).toMatch(/\$17::text IS NULL AND \$7 IS NOT NULL/);
+  });
+
+  it('falls back to the legacy inference ONLY when no phase was declared', async () => {
+    // Messages archived before the declaration shipped carry no phase, and their `e2e_ms` must keep
+    // working exactly as it did - the fallback exists for them and for nothing else.
+    await backfillFromUpdateEvents([updateRecord({ resp_phase: null, total_ms: 1200 })]);
+    const [msgSql, msgParams] = mockedQuery.mock.calls.find(([sql]) =>
+      /UPDATE messages/.test(sql as string)) as [string, any[]];
+    expect(msgParams[16]).toBeNull();
+    expect(msgSql).toMatch(/\$17::text IS NULL AND \$7 IS NOT NULL THEN \$14::timestamptz/);
+  });
+
+  it('freezes the FIRST final, so a later edit cannot move the completion', async () => {
+    // A moderation content-edit re-reads the same out-of-band record and arrives looking like a
+    // completion. COALESCE, not the gate, is what protects the timestamp there - and it must survive
+    // the gate being rewritten.
+    await backfillFromUpdateEvents([updateRecord({ resp_phase: 'final' })]);
+    const [msgSql] = mockedQuery.mock.calls.find(([sql]) =>
+      /UPDATE messages/.test(sql as string)) as [string, any[]];
+    expect(msgSql).toMatch(/agent_final_at\s*=\s*COALESCE\(agent_final_at,/);
   });
 
   it('folds task machine state (task_state + JSONB task_transition) onto the exchange', async () => {
@@ -193,5 +236,24 @@ describe('kinesis-archival backfillFromUpdateEvents', () => {
     await expect(
       backfillFromUpdateEvents([updateRecord()])
     ).resolves.toBeUndefined();
+  });
+});
+
+describe('the cross-batch exchange sweep mints one row per (turn, responding bot)', () => {
+  // The next-user bound alone paired EVERY bot CREATE before the next user turn - welcomes, drift
+  // notices and continuation chunks each minted an exchange whose latency was the gap to a user
+  // message they never answered. Raw exchange counts inflated and TTFF averages polluted, silently:
+  // the unclosed_no_placeholder bucket absorbed them in the latency view, so nothing errored.
+  // Source-level on the SQL because the function is not exported and the property is the query's.
+  const src = require('fs').readFileSync(
+    require('path').join(__dirname, '..', '..', 'lambda', 'src', 'analytics-aurora', 'kinesis-archival.ts'), 'utf8');
+
+  it('takes the EARLIEST bot CREATE per sender, so a duel still pairs both sides', () => {
+    expect(src).toContain('SELECT DISTINCT ON (um.id, am.sender_arn)');
+    expect(src).toContain('ORDER BY um.id, am.sender_arn, am.created_at');
+  });
+
+  it('keeps the next-user bound that attaches a reply to the prompt that caused it', () => {
+    expect(src).toMatch(/NOT EXISTS \(\s*\n\s*SELECT 1 FROM messages nxt/);
   });
 });

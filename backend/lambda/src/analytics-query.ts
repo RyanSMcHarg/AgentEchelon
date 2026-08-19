@@ -499,7 +499,7 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
     // finer capability (events-log / user-activity / moderation-audit) is therefore DENIED
     // here - coarser than the section-3b matrix, fail-CLOSED. Athena reaches parity by
     // splitting these sub-paths on the stack + exposing the queryTypes; the data itself is
-    // in the Athena archive (the system of record). See SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md
+    // in the Athena archive (the system of record). See DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md
     // section 10.
     if (isAdminIamEnforcedCall(event) && !queryTypeAllowedOnPath(queryType, event.path || '')) {
       return respond(403, { error: 'queryType not permitted on this resource' });

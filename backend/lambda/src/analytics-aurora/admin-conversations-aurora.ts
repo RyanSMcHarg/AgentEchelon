@@ -8,14 +8,14 @@
  * table (message events, plus channel + membership events as their own
  * `event_type` rows), so these queries answer the same three views in
  * sub-second time. Runs inside the VPC-attached data-plane Lambda (the only seam
- * with Aurora access); the non-VPC admin handler invokes it (ADR-018 pattern).
+ * with Aurora access); the non-VPC admin handler invokes it (ADR-013 pattern).
  *
  * Field parity with the Athena path: the channel name is archived in `content`
  * for CREATE/UPDATE_CHANNEL rows; the member name in `content` and the inviter in
  * `sender_name` for membership rows - so nothing degrades.
  */
 
-import { query } from './db-client.js';
+import { query, ownerQuery } from './db-client.js';
 import { stripMessageMarkers } from '../lib/message-markers.js';
 
 export interface AdminConvSummary {
@@ -94,10 +94,20 @@ export async function adminListConversations(
         ORDER BY channel_arn, created_at DESC
      ),
      first_msg AS (
-       -- Fallback title: the first human message in the conversation. The title auto-derive
-       -- renames the LIVE Chime channel, but that UpdateChannel event is not streamed to Kinesis,
-       -- so Aurora has no derived title and every row showed 'Untitled'. Deriving from the first
-       -- user message (the same signal the client title-derive uses) gives a meaningful title.
+       -- Fallback title: the first human message in the conversation.
+       --
+       -- THE STATED CAUSE HERE WAS WRONG, and it is corrected rather than deleted because the fallback
+       -- is still worth having. It claimed the title auto-derive's UpdateChannel "is not streamed to
+       -- Kinesis". It IS: the immutable S3 archive carries UPDATE_CHANNEL events with real derived
+       -- titles (verified 2026-08-12 - "Moon Facts Sharing", "Calculate Simple Math Problem"), and
+       -- kinesis-archival deliberately stamps channel events with LastUpdatedTimestamp so a rename
+       -- sorts after the create and wins the DISTINCT ON above.
+       --
+       -- What actually leaves a row titled 'New conversation' is a conversation whose auto-derive
+       -- never RAN: the rename fires on the first user turn (async-processor-core, isFirstUserTurn),
+       -- so a conversation that never had one keeps the placeholder. That is a real gap and it is
+       -- what this fallback covers - deriving from the first user message, the same signal the
+       -- client title-derive uses.
        SELECT DISTINCT ON (channel_arn) channel_arn,
               LEFT(REGEXP_REPLACE(content, '<!--.*?-->', '', 'g'), 60) AS name
          FROM messages
@@ -183,7 +193,9 @@ export async function adminListConversations(
 let moderationTableReady = false;
 async function ensureModerationTable(): Promise<void> {
   if (moderationTableReady) return;
-  await query(
+  // AS THE OWNER: `ae_app` has no CREATE on schema public by design (ADR-028), so this DDL fails on
+  // the ordinary path with `permission denied for schema public`.
+  await ownerQuery(
     `CREATE TABLE IF NOT EXISTS moderation_actions (
        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
        channel_arn VARCHAR(512) NOT NULL,
@@ -195,7 +207,7 @@ async function ensureModerationTable(): Promise<void> {
        created_at  TIMESTAMPTZ  NOT NULL DEFAULT now()
      )`,
   );
-  await query(
+  await ownerQuery(
     `CREATE INDEX IF NOT EXISTS idx_moderation_actions_msg ON moderation_actions(channel_arn, message_id)`,
   );
   moderationTableReady = true;

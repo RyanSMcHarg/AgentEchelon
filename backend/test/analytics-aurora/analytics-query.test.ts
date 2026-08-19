@@ -22,7 +22,7 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
   getClient: jest.fn(),
 }));
 
-import { handler, resolveReplyCostUsd } from '../../lambda/src/analytics-aurora/analytics-query';
+import { handler, resolveReplyCostUsd, battlePickAxis, approvalAxis } from '../../lambda/src/analytics-aurora/analytics-query';
 
 function postEvent(body: unknown): APIGatewayProxyEvent {
   return {
@@ -332,5 +332,192 @@ describe('drift_events reads the by-reference table (migration 006), not the dro
     // by-reference columns, not the removed topic/resolved columns
     expect(sql).toContain('cosine_distance');
     expect(sql).not.toContain('original_topic');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// The human battle-pick axis (§4.3).
+//
+// It is a SEPARATE axis from the metric verdict, measured on a DIFFERENT population: the metric read
+// counts probabilistic traffic, which deliberately EXCLUDES battle turns, while every pick comes FROM
+// a battle. It therefore must NOT be gated behind the metric sample floor — doing so withheld the
+// human signal exactly when battles were the evidence being gathered, so a battle-led evaluation could
+// collect any number of picks and still report no human block at all.
+// ---------------------------------------------------------------------------
+describe('battlePickAxis', () => {
+  const v = (control: number | null, treatment: number | null) => ([
+    { variant_id: 'control', battle_wins: control },
+    { variant_id: 'treatment', battle_wins: treatment },
+  ]);
+
+  it('returns null when no pick has been recorded, so "no battles" differs from "split 50/50"', () => {
+    // A zero-filled axis would render as a real 0% result and read as evidence. Absence is not a tie.
+    expect(battlePickAxis(v(0, 0))).toBeNull();
+    expect(battlePickAxis(v(null, null))).toBeNull();
+  });
+
+  it('returns null for a single-variant experiment (nothing head-to-head to compare)', () => {
+    expect(battlePickAxis([{ variant_id: 'control', battle_wins: 3 }])).toBeNull();
+  });
+
+  it('reports TREATMENT share of decisive picks, oriented like the metric delta', () => {
+    // 5 of 6 for treatment. Same orientation as the metric axis so >50% and a positive delta agree.
+    const r = battlePickAxis(v(1, 5))!;
+    expect(r.picks).toBe(6);
+    expect(r.winRate).toBeCloseTo(5 / 6, 5);
+    expect(r.ci[0]).toBeLessThan(r.winRate);
+    expect(r.ci[1]).toBeGreaterThan(r.winRate);
+  });
+
+  it('a lopsided but TINY sample is not called decisive', () => {
+    // 2-0 looks unanimous and is not evidence: the Wilson interval still spans 50%.
+    const r = battlePickAxis(v(0, 2))!;
+    expect(r.picks).toBe(2);
+    expect(r.significant).toBe(false);
+  });
+
+  it('a large, one-sided sample IS decisive (the interval clears 50%)', () => {
+    const r = battlePickAxis(v(3, 30))!;
+    expect(r.significant).toBe(true);
+    expect(r.ci[0]).toBeGreaterThan(0.5);
+  });
+
+  it('counts only DECISIVE picks — a tie credits neither side and never reaches battle_wins', () => {
+    // Ties carry no variantId upstream, so `picks` is the decisive count, not every battle fought.
+    expect(battlePickAxis(v(2, 2))!.picks).toBe(4);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// User approval (thumbs) as a TESTED rate.
+//
+// `GUIDE-AB-TESTING-AND-BATTLES` listed approval among the rate metrics that "each use the appropriate
+// test, and the difference is reported with a confidence interval". That was untrue: approval is not
+// in ExperimentObjectiveMetric (cost|accuracy|quality|latency), so it could be neither a primary
+// metric nor a guardrail, and experiment-stats.ts referenced it nowhere. It was collected, displayed,
+// and never evaluated. These pin the claim to real arithmetic.
+// ---------------------------------------------------------------------------
+describe('approvalAxis', () => {
+  const v = (cUp: number, cN: number, tUp: number, tN: number) => ([
+    { variant_id: 'control', thumbs_up: cUp, feedback_count: cN },
+    { variant_id: 'treatment', thumbs_up: tUp, feedback_count: tN },
+  ]);
+
+  it('returns null when nobody has voted, so "no votes" never renders as "0% approval"', () => {
+    expect(approvalAxis(v(0, 0, 0, 0))).toBeNull();
+    expect(approvalAxis([{ variant_id: 'control', thumbs_up: 1, feedback_count: 1 }])).toBeNull();
+  });
+
+  it('reports both rates and a treatment-minus-control delta, matching the metric orientation', () => {
+    const r = approvalAxis(v(5, 10, 9, 10))!;
+    expect(r.controlRate).toBeCloseTo(0.5, 5);
+    expect(r.treatmentRate).toBeCloseTo(0.9, 5);
+    expect(r.delta).toBeCloseTo(0.4, 5);   // treatment - control, positive = treatment better
+    expect(r.votes).toBe(20);
+  });
+
+  it('carries a CI on the DIFFERENCE and only calls it significant when that CI excludes zero', () => {
+    // A tiny, lopsided sample must NOT read as decisive — the interval still spans zero.
+    const small = approvalAxis(v(1, 2, 2, 2))!;
+    expect(small.significant).toBe(false);
+    expect(small.ci[0]).toBeLessThan(0);
+    // A large, clearly separated sample does.
+    const big = approvalAxis(v(20, 100, 80, 100))!;
+    expect(big.significant).toBe(true);
+    expect(big.ci[0]).toBeGreaterThan(0);
+  });
+
+  it('an equal split is reported, not suppressed — zero delta is a real finding', () => {
+    const r = approvalAxis(v(5, 10, 5, 10))!;
+    expect(r.delta).toBeCloseTo(0, 5);
+    expect(r.significant).toBe(false);
+    expect(r.votes).toBe(20);
+  });
+
+  it('votes on only ONE side still produce an axis (a real asymmetry, not missing data)', () => {
+    const r = approvalAxis(v(0, 0, 4, 5))!;
+    expect(r.votes).toBe(5);
+    expect(r.treatmentRate).toBeCloseTo(0.8, 5);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// experiment_exchanges — the drill-down behind a result (DESIGN §4.3).
+//
+// The correctness requirement is the PREDICATE: this must resolve to exactly the set the aggregate
+// scored. A drill-down filtered more loosely surfaces exchanges that did not count toward the number
+// beside it, which is worse than no drill-down. These assert the predicate, not the rendering.
+// ---------------------------------------------------------------------------
+describe('experiment_exchanges', () => {
+  const call = async (body: Record<string, unknown>) => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [] });
+    const res = await handler(postEvent({ queryType: 'experiment_exchanges', ...body }) as any);
+    return { res, sql: (mockDbQuery.mock.calls.at(-1)?.[0] ?? '') as string, params: mockDbQuery.mock.calls.at(-1)?.[1] };
+  };
+
+  beforeEach(() => mockDbQuery.mockReset());
+
+  it('without an experimentId returns EMPTY and never queries — an unscoped drill-down is the bug', () => {
+    // Returning every experiment's exchanges would be exactly the "wrong set" failure.
+    return handler(postEvent({ queryType: 'experiment_exchanges' }) as any).then((res: any) => {
+      expect(JSON.parse(res.body).data).toEqual([]);
+      expect(mockDbQuery).not.toHaveBeenCalled();
+    });
+  });
+
+  it('scopes on experiment_id, NOT on the intent string', async () => {
+    // The stored exchange intent is the CLASSIFIER intent ('general'); the experiment stores the
+    // ROUTE KEY ('general_qa'). Matching on the string would silently return nothing.
+    const { sql, params } = await call({ experimentId: 'exp1' });
+    expect(sql).toContain('m.experiment_id = $2');
+    expect(params).toContain('exp1');
+  });
+
+  it("axis 'metrics' EXCLUDES battle turns — the same population the A/B rollup scores", async () => {
+    const { sql } = await call({ experimentId: 'exp1' });
+    expect(sql).toMatch(/assignmentMode[\s\S]*<>\s*'battle'/);
+  });
+
+  it("axis 'battle' is the complement: battle turns ONLY, where the picks come from", async () => {
+    const { sql } = await call({ experimentId: 'exp1', axis: 'battle' });
+    expect(sql).toMatch(/assignmentMode[\s\S]*=\s*'battle'/);
+    expect(sql).not.toMatch(/assignmentMode[\s\S]*<>\s*'battle'/);
+  });
+
+  it('returns the values that ROLL UP, so the aggregate can be recomputed', async () => {
+    // A list of links cannot be recalculated from; these are the columns the mean is built out of.
+    const { sql } = await call({ experimentId: 'exp1' });
+    for (const col of ['relevance_score', 'total_ms', 'input_tokens', 'output_tokens', 'variant_id']) {
+      expect(sql).toContain(col);
+    }
+  });
+
+  it('carries redaction flags but KEEPS the row — it still counted toward the score', async () => {
+    // Dropping redacted rows would break reconciliation and misrepresent what the verdict used.
+    const { sql } = await call({ experimentId: 'exp1' });
+    expect(sql).toContain('redacted');
+    expect(sql).toContain('deleted');
+    expect(sql).not.toMatch(/WHERE[\s\S]*red\.id IS NULL/);
+  });
+
+  it('derives retraction from the -RED/-DEL SIBLING ROW, not from moderation_actions', async () => {
+    // Two different failures hide behind this, and neither can surface in a suite that mocks the
+    // database. `moderation_actions.message_id` holds the Chime message id while `messages.id` is a
+    // UUID, so joining them is a Postgres type error that only appears against a real DB. And that
+    // table is an ATTRIBUTION record, not the moderation record: it is written only for moderations
+    // performed through the admin console, by a follow-up call whose failure the console swallows on
+    // purpose. The moderation itself is a Chime SDK call, so the event stream carries every one and
+    // archival writes the -RED/-DEL sibling row — the authority the admin conversation read uses.
+    const { sql } = await call({ experimentId: 'exp1' });
+    expect(sql).toContain('REDACT_CHANNEL_MESSAGE');
+    expect(sql).toContain('DELETE_CHANNEL_MESSAGE');
+    expect(sql).toMatch(/regexp_replace\(m\.message_id, '-\(UPD\|RED\|DEL\)\$', ''\) \|\| '-RED'/);
+    expect(sql).not.toMatch(/JOIN\s+moderation_actions/i);
+  });
+
+  it('reports the FULL match count, not the page size', async () => {
+    // A page without a total cannot be reconciled, and a silent sample reads as a complete set.
+    const { sql } = await call({ experimentId: 'exp1' });
+    expect(sql).toContain('COUNT(*) OVER()');
   });
 });

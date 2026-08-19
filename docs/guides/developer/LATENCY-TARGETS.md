@@ -130,16 +130,84 @@ The user->final-answer metric (former G1), the model/tool split (G2), the worker
 | # | Gap | Why it matters | How to fill |
 |---|-----|----------------|-------------|
 | **G5** | **Server and client latency are not joined** - `messages.*_ms` vs `client_events` web-vitals live in separate stores. | No single view of server compute vs what the browser saw. | Correlate by `message_id` / `correlationId`; surface client TTFR beside server metrics. |
-| **G6** | **DIRECT fast-path excluded** (`AND m.total_ms > 0`) - greetings/acks never counted. | Averages skew toward slow LLM turns; not "all responses." | Report DIRECT separately (count + its TTFF-based latency) so the exclusion is explicit. |
+| ~~**G6**~~ | ~~**DIRECT fast-path excluded**~~ - **CLOSED 2026-08-15.** `total_ms > 0` moved out of the `WHERE` into `FILTER` clauses on the compute aggregates, so a response that ran no measurable compute is counted and attributed rather than vanishing. `compute_count` and `direct_count` state the split. | The averages are unchanged - a null contributes nothing to `AVG` either way - but they can now be read against a population somebody can name. | Done. The exclusion is reported rather than performed. |
 | **G8** | **Aurora-only** - no latency query in Athena mode; dropped archival events are not counted. | Coverage differs by deployment mode. | Document the mode difference; monitor archival drop rate. |
 | **G9** | **P95 noise at low volume**; cold start shows in TTFF but not `total_ms`. | Early numbers unstable; TTFF/Total legitimately diverge. | Show sample counts next to P95; annotate the divergence as cold-start, not error. |
 | **G10** | **Per-tier targets and metrics** - latency is targeted globally, so a premium turn (larger model, more context) is held to the same band as basic. | A basic and a premium turn have different budgets. | The `latency_metrics` query already carries `agent_type`; add per-tier bands in `metricTargets.ts` and aggregate per tier. |
+
+## The ledger: one record of every event a latency number is derived from
+
+**`turn_events` (migration 019), written live by `analytics-aurora/turn-events-live.ts` from the
+archival batch.** Before this, latency was derived from `messages` and `exchanges` by inference, and
+the inference was not stated anywhere a reader could check.
+
+**One row per observed, timestamped fact.** Append-only, never updated. Two keys, because a turn can
+have more than one responder: `turn_id` (the correlation id, one per user turn) and `response_id` (the
+placeholder's Amazon Chime SDK MessageId, one per assistant response within it). A normal turn is 1 + 1; a
+`/battle` is 1 turn_id + 2 response_ids.
+
+**Finality is DECLARED, not inferred.** The producer stamps `respPhase` on every update it posts
+(`ResponsePhase` in `lib/analytics-metadata.ts`, a required parameter of `updateMessage`), and only
+`final` closes a turn. The mapping fails closed: an unrecognised phase becomes `progress_update`, so a
+phase invented later by a component that has not been taught about latency cannot close a turn early.
+
+| Phase | Ledger kind | Closes the turn? |
+|---|---|---|
+| `placeholder` | `placeholder_posted` | no - sets TTFF |
+| `interim` | `progress_update` | no |
+| `final` | `final_response` | **yes - the only one** |
+| `error` | `error_response` | **no** - the wait ended, no answer was produced |
+| `notice` | `notice_posted` | no - assistant-initiated, no user message to measure from |
+| anything else | `progress_update` | no |
+
+**What it does NOT store: message content.** Ids, timestamps, kinds and provenance only. The `turn_id`
+is *derived from* content (the `<!--corr:-->` marker) but only the id is kept. The payoff is concrete:
+a redaction or deletion needs no ledger mutation, so the erasure path does not grow a second place to
+get wrong. Enforced by `turn-events-live.test.ts`, not merely intended.
+
+**The audit boundary, stated rather than implied.** The outer bracket - user message -> placeholder ->
+final answer - is on the Amazon Chime SDK message clock and is auditable against the message stream. The inner breakdown
+(`processor_entry`, `model_ms`, `tool_ms`) is server-clock and was never in the S3 line; it is attested,
+not auditable, and rows carrying it are marked `auditable = false` so no dashboard implies otherwise.
+
+**Reading it:** `POST { queryType: 'turn_latency_audit', channelArn }` returns the calculation for one
+channel, one row per (turn_id, response_id), including the reconciliation residuals. A NEGATIVE
+`unattributed_ms` means compute was attributed to the wrong turn - the bug class this exists to expose.
+
+## Task resolution is measured separately, and never mixed in
+
+`POST { queryType: 'task_resolution' }`, over `v_task_resolution`. `resolve_ms` decomposes into
+`agent_ms` (the part the system is accountable for) and the human think time that makes up the rest.
+**A task open for four hours with twenty seconds of assistant time is healthy**, and this table says so
+on its face. It never enters `getLatencyMetrics` or the alert computation: one number would either
+flatter the turn latency or damn the workflow.
+
+A task's ending is recorded by the writer that ends it - a terminal entry appended to `stateHistory`
+with its outcome (`success` / `failure` / `handoff`) - rather than by a separate timestamp column that
+could disagree with the log beside it.
+
+## Populations, and why the counts sit beside the averages
+
+Three counts accompany every `latency_metrics` row, because an average whose denominator is unstated
+is not a measurement:
+
+| Column | What it counts |
+|---|---|
+| `exchange_count` | **Misnamed and kept for the column contract.** Bot message rows in the window - it has never counted exchanges, and there is a separate `exchanges` table it does not read |
+| `compute_count` / `direct_count` | with / without measurable compute - the split the old `WHERE` performed silently |
+| `closed_count` / `unclosed_count` | turns that closed, and turns whose answer never landed |
+
+`unclosed_count` matters more since finality became declared: an errored turn correctly does NOT close,
+where the old `total_ms` proxy counted it as a completion. Correct semantics shrink the population, and
+this is the counter that keeps the shrink visible instead of silent.
 
 ## How the full set is captured (as built)
 
 The complete set is captured, so the console is stable and no deployment migrates late. Two properties keep it contained:
 
-- **Full schema up front.** All columns are in the base schema (`lambda/src/analytics-aurora/schema/013-latency.sql`), applied in order on a fresh Aurora Create: `messages.agent_final_at / model_ms / tool_ms` and `exchanges.e2e_ms / inbound_ms`, all nullable. Every deployment gets the whole set on stand-up; there is no follow-up migration. (An already-bootstrapped cluster applies it out-of-band or is re-stood-up - the same schema-init Update caveat as migrations 010-012.)
+- **Full schema up front.** All columns are in the base schema (`lambda/src/analytics-aurora/schema/013-latency.sql`), applied in order on a fresh Aurora Create: `messages.agent_final_at / model_ms / tool_ms` and `exchanges.e2e_ms / inbound_ms`, all nullable. Every deployment gets the whole set on stand-up; there is no follow-up migration.
+
+  **Correction (2026-08-09):** this used to add "an already-bootstrapped cluster applies it out-of-band or is re-stood-up." That is no longer true, and the reason is worth stating precisely, because the previous wording was half right for a while. `schema-init` (the Custom Resource) does bootstrap on Create only and can never reconnect - `IamAuthSetup` grants `rds_iam`, which disables the password auth it used. But `db-client.ensureSchema` applies any unapplied `schema/*.sql` at RUNTIME over the IAM connection, under an advisory lock, so a new migration lands on an existing cluster with no manual step. The catch, found the hard way: that only happens in Lambdas that CALL `ensureSchema`, and for a long time only three of the eight that bundle the schema files did. All eight do now, pinned by `db-lambdas-apply-migrations.test.ts`. Runtime-applied migrations must be idempotent and transaction-safe (no `CREATE INDEX CONCURRENTLY`).
 - **Out-of-band, off the response path.** Latency telemetry rides the out-of-band DynamoDB analytics store (`message-analytics.ts`; `async-processor-core.ts` writes it, `kinesis-archival.ts` joins it onto Aurora rows), NOT the size-capped Chime messaging Metadata. Added fields cost nothing against the 1024B budget and add no user-perceived latency (measure on-path with `Date.now()`, emit off-path).
 
 ### How each is derived

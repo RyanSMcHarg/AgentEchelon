@@ -40,6 +40,7 @@ import * as snsSubs from 'aws-cdk-lib/aws-sns-subscriptions';
 import { Construct } from 'constructs';
 import { ANALYTICS_PREFIX, ATHENA_WORKGROUP_NAME, ANALYTICS_DB_NAME, INSTANCE_SSM } from './agent-classification-common';
 import { MembershipAuditConstruct } from '../constructs/membership-audit';
+import { sesSenderIdentityArns } from '../ses-identity';
 
 export interface AnalyticsStackProps extends cdk.StackProps {
   appInstanceArn: string;
@@ -80,6 +81,11 @@ export class AnalyticsStack extends cdk.Stack {
       retentionPeriod: cdk.Duration.hours(24),
       encryption: kinesis.StreamEncryption.MANAGED,
     });
+    // A transient 24h buffer, not durable data (the ConversationArchive S3 is the RETAINed system of
+    // record). Its streamName is FIXED (Chime requires the `chime-messaging-` prefix), so a RETAINed
+    // stream would only ORPHAN on teardown and block the next fresh deploy ("resource already exists").
+    // DESTROY so a teardown cleans it up.
+    messageStream.applyRemovalPolicy(cdk.RemovalPolicy.DESTROY);
 
     this.kinesisStreamArn = messageStream.streamArn;
     this.kinesisStreamName = messageStream.streamName;
@@ -605,7 +611,7 @@ export class AnalyticsStack extends cdk.Stack {
     // Admin-plane auth mode (ae-cognito default / federated / service) — see
     // docs/ADMIN-INTEGRATION-GUIDE.md. In ae-cognito mode this uses a Cognito
     // authorizer on AE's own user pool.
-    // A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): under adminIamEnforcement the
+    // A14 (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md): under adminIamEnforcement the
     // analytics query is AWS_IAM-authorized (the console SigV4-signs). Athena mode
     // enforces at the COARSE analytics-read level: this API is a single POST /query
     // (no per-capability sub-path split), so the handler's per-resource queryType
@@ -652,7 +658,7 @@ export class AnalyticsStack extends cdk.Stack {
 
     // A14: gen-frontend-env maps this to VITE_ADMIN_IAM_ENFORCEMENT so the admin console
     // signs its requests iff the backend enforces IAM — the two flags are derived from one
-    // deployed value and can't drift. See SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md.
+    // deployed value and can't drift. See DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md.
     new cdk.CfnOutput(this, 'AdminIamEnforcement', {
       value: String(adminIamEnforcement),
       description: 'Whether admin read APIs require AWS_IAM (SigV4) auth; drives admin-app request signing.',
@@ -961,9 +967,7 @@ export class AnalyticsStack extends cdk.Stack {
       archivalAlarmFn.addToRolePolicy(
         new iam.PolicyStatement({
           actions: ['ses:SendEmail', 'ses:SendRawEmail'],
-          resources: [
-            `arn:aws:ses:${this.region}:${this.account}:identity/${senderEmail}`,
-          ],
+          resources: sesSenderIdentityArns(this.region, this.account, senderEmail),
         }),
       );
 

@@ -7,7 +7,8 @@ import LineChart from './LineChart';
 import { METRIC_TARGETS } from './metricTargets';
 import { InfoTooltip, DocLink } from './AdminHelp';
 import { DOC_LINKS } from '../../config/docLinks';
-import type { AnalyticsResult } from '@ae/shared';
+import TurnLatencyAudit from './TurnLatencyAudit';
+import type { AnalyticsDateRange, AnalyticsResult } from '@ae/shared';
 
 interface LatencyTabProps {
   data: AnalyticsResult | null;
@@ -16,6 +17,8 @@ interface LatencyTabProps {
   /** websocket_connected/disconnected/reconnected counts per day. */
   connectionHealthData?: AnalyticsResult | null;
   isLoading: boolean;
+  /** The window the tab is showing. Handed to the per-turn audit drill below. */
+  dateRange: AnalyticsDateRange;
 }
 
 function latencyColor(ms: number): string {
@@ -52,6 +55,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
   pageLoadData,
   connectionHealthData,
   isLoading,
+  dateRange,
 }) => {
   // Response-type filter (by delivery_option). null = the default set (all NON-task response types, so
   // the perceived-single-reply headline excludes multi-step tasks); a Set = the operator's explicit
@@ -524,6 +528,12 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
           />
         )}
       </div>
+
+      {/* THE AUDIT, last on the tab because it is where an operator goes AFTER an aggregate looks
+          wrong. Everything above is a summary; this is the calculation those summaries are made of,
+          and until it existed the ledger built to answer "why is this number what it is" had no
+          reader in the console at all. */}
+      <TurnLatencyAudit dateRange={dateRange} />
     </div>
   );
 };

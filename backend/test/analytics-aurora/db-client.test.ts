@@ -129,16 +129,30 @@ describe('DB Client', () => {
       const { ensureSchema } = await import('../../lambda/src/analytics-aurora/db-client');
       const pg = require('pg');
 
-      // First call: schema check (messages table doesn't exist yet)
-      pg.__mockPool.query
-        .mockResolvedValueOnce({ rows: [{ has_messages: false }], rowCount: 1, command: 'SELECT', oid: 0, fields: [] })
-        // Subsequent calls: migration SQL execution
-        .mockResolvedValue({ rows: [], rowCount: 0, command: '', oid: 0, fields: [] });
-
+      // applyPendingMigrations runs inside transaction(), which acquires a client via
+      // pool.connect() and executes everything on that client (not pool.query). With no rows
+      // in _migrations, both mocked schema files (001-initial.sql, 002-pgvector.sql) are pending.
+      // SELECT filename FROM _migrations -> [] (default mockClient result) so both get applied.
       await ensureSchema();
 
-      // Should have executed schema check + migration files
-      expect(pg.__mockPool.query).toHaveBeenCalledTimes(3); // 1 check + 2 migration files
+      const client = pg.__mockClient;
+      expect(pg.__mockPool.connect).toHaveBeenCalled(); // transaction opened a client
+      const calls = client.query.mock.calls.map((c: any[]) => String(c[0]));
+
+      // Transaction envelope
+      expect(calls[0]).toBe('BEGIN');
+      expect(calls).toContain('COMMIT');
+
+      // Each of the 2 pending migration files' SQL was executed (mocked readFileSync content)
+      const migrationSql = 'CREATE TABLE IF NOT EXISTS test (id INT);';
+      const migrationExecs = calls.filter((sql: string) => sql === migrationSql);
+      expect(migrationExecs).toHaveLength(2);
+
+      // ...and applied in order: advisory lock -> _migrations table -> read applied -> apply files
+      const lockIdx = calls.findIndex((s: string) => s.includes('pg_advisory_xact_lock'));
+      const firstMigrationIdx = calls.indexOf(migrationSql);
+      expect(lockIdx).toBeGreaterThan(0);
+      expect(firstMigrationIdx).toBeGreaterThan(lockIdx);
     });
   });
 });

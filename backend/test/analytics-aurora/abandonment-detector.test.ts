@@ -20,6 +20,7 @@ import type { QueryResult, QueryResultRow } from 'pg';
 jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
   query: jest.fn(),
   getClient: jest.fn(),
+  ensureSchema: jest.fn(),
 }));
 
 import { query } from '../../lambda/src/analytics-aurora/db-client';

@@ -23,13 +23,13 @@ This guide covers when to switch, how to deploy, and what to expect.
 | Materialized views | Not available | Pre-computed daily metrics |
 | Monthly cost (baseline, rough estimate) | ~$30-50 (Kinesis-dominated) | ~$50-95 (proxy off by default; see INFRASTRUCTURE-COST.md) |
 | VPC required | No | Yes (auto-provisioned) |
-| Schema migrations | None | Automated via custom resource |
+| Schema migrations | None | Base schema on stack Create; every later migration applies at runtime on cold start |
 
 **Use Athena** when cost matters more than query speed and you don't need evaluation, drift detection, or cross-conversation features. You still have the full, durable event archive - it is the system of record in both modes.
 
 **Use Aurora** when you need real-time admin dashboards, automated evaluation pipelines, drift detection, or cross-conversation context.
 
-> **A14 note (IAM enforcement).** Under `-c adminIamEnforcement=true`, Aurora mode splits the analytics API into per-capability resources (so a persona role can be denied, say, `view-user-activity` at the gateway). Athena mode's analytics API is a single `POST /query`, so it enforces at the coarse analytics-read level - a stack gap, not a data one. See `SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md`.
+> **A14 note (IAM enforcement).** When admin IAM enforcement is on (the default), Aurora mode splits the analytics API into per-capability resources (so a persona role can be denied, say, `view-user-activity` at the gateway). Athena mode's analytics API is a single `POST /query`, so it enforces at the coarse analytics-read level - a stack gap, not a data one. See [`DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md`](../../specs/interaction/identity-access/admin/DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md).
 
 ---
 
@@ -41,13 +41,13 @@ Aurora mode provisions:
 - **VPC Endpoints**: Kinesis (interface), S3 (gateway), Secrets Manager (interface), Bedrock Runtime (interface)
 - **Aurora PostgreSQL Serverless v2**: 0.5-4 ACU, IAM auth, encrypted at rest, Performance Insights
 - **RDS Proxy** (opt-in, OFF by default): connection pooling + IAM auth in front of Aurora, enabled with `enableRdsProxy=true`. Off by default because on Serverless v2 it bills a fixed ~8-ACU floor (~$86/month) regardless of load; the default path is direct writer-endpoint IAM auth (see Connection pooling below)
-- **Schema Init**: Custom resource Lambda runs SQL migrations on deploy
+- **Schema Init**: Custom resource Lambda bootstraps the BASE schema on stack Create (later migrations apply at runtime - see Schema migrations)
 - **IAM Auth Setup**: Custom resource grants `rds_iam` role to DB user
 - **Kinesis Stream**: 2 shards, 24h retention (same as Athena mode)
 - **Archival Lambda**: VPC-attached, consumes Kinesis, writes to Aurora + S3
 - **Evaluation Runner**: VPC-attached, daily 2am UTC schedule, uses Haiku/Sonnet via Bedrock
 - **Analytics Query Lambda + API Gateway**: VPC-attached, serves admin dashboard queries
-- **Retrieval Data-Plane Lambda**: VPC-attached, runs RAG retrieval + drift detection (embed + pgvector) so the non-VPC agent handler can invoke it (project decision 018)
+- **Retrieval Data-Plane Lambda**: VPC-attached, runs RAG retrieval + drift detection (embed + pgvector) so the non-VPC agent handler can invoke it (ADR-013)
 - **S3 Archive Bucket**: Backwards-compatible with Athena mode (90-day lifecycle)
 
 By default the Lambdas connect DIRECTLY to the Aurora writer endpoint using IAM database authentication (no hardcoded passwords). RDS Proxy is opt-in (`enableRdsProxy`, off by default); when enabled, the Lambdas connect through the proxy instead. See Connection pooling below.
@@ -78,11 +78,13 @@ This deploys ~14 stacks in Aurora mode with `/battle` default-on (the base featu
 On first deploy, the stack automatically:
 
 1. Creates the VPC and Aurora cluster
-2. Runs every schema migration in `schema/` in order (currently `001-initial` through `012-moderation-actions`)
+2. Bootstraps the base schema and the classification boundary, via the `schema-init` custom resource
 3. Sets up IAM authentication on the database user
 4. Wires all Lambdas to the Aurora writer endpoint with IAM auth (RDS Proxy is opt-in and OFF by default; enable `enableRdsProxy=true` only for high Lambda-concurrency workloads that need pooling)
 
-No manual steps required. The schema init custom resource runs idempotently on each deploy.
+No manual steps required. Every migration after the base bootstrap applies at runtime on the next
+Lambda cold start rather than during the deploy - see [Schema migrations](#schema-migrations), which
+is the section to read if a deploy succeeds and the new column still is not there.
 
 ### Switching from Athena to Aurora
 
@@ -100,7 +102,9 @@ Historical Athena data remains in S3 but is not migrated to Aurora. Aurora start
 
 ### Update frontend .env
 
-After deploying, update `frontend/.env` with the new analytics API URL:
+After deploying, update the frontend env with the new analytics API URL. Each package has its own:
+`frontend/packages/chat/.env` and `frontend/packages/admin/.env` (`npm run gen-frontend-env` writes
+both from the stack outputs). A root `frontend/.env` is not read by either package.
 
 ```
 VITE_ANALYTICS_API_URL=<AgentEchelonAnalyticsAurora.AnalyticsApiUrl output>
@@ -110,27 +114,35 @@ VITE_ANALYTICS_API_URL=<AgentEchelonAnalyticsAurora.AnalyticsApiUrl output>
 
 ## Schema migrations
 
-SQL migrations live in `backend/lambda/src/analytics-aurora/schema/` and run in alphabetical order:
+SQL migrations live in `backend/lambda/src/analytics-aurora/schema/` and run in filename order.
+**That directory is the authority on what exists** - this guide deliberately does not reproduce the
+list, because a hand-copied list is wrong the moment someone adds a file and it was wrong for eleven
+migrations before anyone noticed. `ls backend/lambda/src/analytics-aurora/schema/` answers "what is
+there"; each file's header comment answers "why".
 
-| File | Purpose |
-|------|---------|
-| `001-initial.sql` | Core tables: `messages`, `exchanges`, `conversation_summaries`, `drift_detection`, `cross_conversation_context` |
-| `002-pgvector.sql` | Enables `pgvector` extension, adds `embeddings` table for similarity search |
-| `003-materialized-views.sql` | Pre-computed views: daily metrics, model effectiveness, conversation stats |
-| `004-experiments.sql` | A/B experiment tracking: `experiments`, `experiment_variants`, `experiment_results` |
-| `005-summary-embeddings.sql` | `summary_embeddings` table (Titan v2 @ 1024-dim) for live drift detection |
-| `006-drift-events-hardened.sql` | `drift_events` by-reference telemetry table replacing `drift_detection` |
-| `007-conversation-creation-tasks.sql` | Pending drift-suggestion durability across Lex session resets |
-| `008-document-embeddings.sql` | RAG: embeddings table → 1024-dim + idempotency index + tier-metadata GIN index |
-| `009-drift-reasoning-decision.sql` | `drift_events` reasoning-decision columns: LLM verdict + human-auditable rationale; cosine similarity retained only for retrieval |
-| `010-task-state-machine.sql` | `task_state` + `task_transition` (JSONB) on `messages` and `exchanges`: the declared-graph machine state per turn (distinct from `task_status`), for the Effectiveness turn timeline |
-| `011-eval-task-join-key.sql` | `evaluation_results.task_id`: the flow join key Pass A stamps at write time (paired with the existing `flow_id`) |
-| `012-moderation-actions.sql` | `moderation_actions`: who redacted/deleted which message and when, stamped with the server-verified admin identity (the Amazon Chime SDK Messaging redact/delete event keeps the original author, so this table is the source for admin-console attribution) |
+**Two mechanisms, and the difference matters when you are waiting for a change to take effect:**
 
-Migrations are idempotent (`CREATE TABLE IF NOT EXISTS`, `CREATE EXTENSION IF NOT EXISTS`). Adding a new migration:
+| | Base bootstrap | Every later migration |
+|---|---|---|
+| What | `001-initial.sql` and the classification-boundary bootstrap | every `NNN-*.sql` file after it |
+| When | the `schema-init` custom resource, on stack **Create** | at **runtime**, on the next Lambda **cold start** |
+| Where | `analytics-aurora/schema-init.ts` | `db-client.ts` `applyPendingMigrations`, recorded in the `_migrations` table |
 
-1. Create `012-your-feature.sql` in the schema directory
-2. Redeploy - the custom resource picks up new files automatically
+So a new migration file does **not** need the stack to create anything: deploying new Lambda code is
+enough, and the first cold start after that applies whatever `_migrations` has not seen, under a
+Postgres advisory lock so two cold starts cannot double-apply. On an EXISTING cluster this is the only
+path a migration takes.
+
+That is also why the constraints are what they are: a runtime-applied migration runs inside one
+transaction, so it MUST be idempotent (`CREATE TABLE IF NOT EXISTS`) **and transaction-safe** - no
+`CREATE INDEX CONCURRENTLY`, no `VACUUM`, nothing that demands its own transaction.
+
+Adding a migration:
+
+1. Create the next numbered SQL file in the schema directory - the same `NNN-name` shape as its siblings, numbered one above the highest one there.
+2. Deploy the backend. The next cold start applies it and inserts the filename into `_migrations`.
+3. Confirm with `SELECT filename, applied_at FROM _migrations ORDER BY id DESC LIMIT 5;` - an
+   unapplied migration is invisible in every other way until something queries what it added.
 
 ### Why the cluster amortizes across multiple workloads
 
@@ -147,7 +159,11 @@ When the cost is presented as "$50-95/mo for drift detection" the ratio looks ba
 
 ## Verifying deployment
 
-### Check RDS Proxy health
+### Check RDS Proxy health (only if you enabled it)
+
+The proxy is **off by default** (`enableRdsProxy`), so on a default deployment this command correctly
+returns an empty table and that is not a fault - see [Connection pooling](#connection-pooling-rds-proxy-optional-for-scale).
+Run it only when you deployed with `-c enableRdsProxy=true`.
 
 ```bash
 aws rds describe-db-proxies \
@@ -222,9 +238,13 @@ Drift detection is **exclusively an Aurora-mode capability.** It depends on pgve
 
 **Design summary** (full detail in `docs/specs/capabilities/SPEC-DRIFT-CONVERGENCE.md`):
 
-1. **Summary updater Lambda** runs every 30 minutes (EventBridge scheduled), finds channels with messages newer than their newest summary, generates a fresh summary via Bedrock Haiku at temperature 0, and stores it in `conversation_summaries`.
+1. **Summaries are written on two paths** ([ADR-019](../../design/decisions/019-conversation-summary-seeded-on-first-turn.md)):
+ - **First-turn seed.** A conversation's summary is created on its FIRST turn, at `version = 1`, from the opening exchange the reply path already holds in memory (no message store is read). This is what gives drift a comparison anchor immediately; without it a new conversation cannot drift at all until the scheduled scan catches up, which is precisely the window where a user is most likely to change topic. It runs as a `seedSummary` op on the data-plane Lambda and is idempotent.
+ - **Scheduled updater.** An EventBridge-scheduled Lambda (`SUMMARY_UPDATER_INTERVAL_MIN`, default 30) then handles INCREMENTAL updates - channels with messages newer than their newest summary - via Bedrock Haiku at temperature 0. It also acts as the backstop if a seed failed.
+
+ The schedule therefore bounds summary FRESHNESS, not availability. A sustained nonzero `drift_skipped_no_summary` is an alertable condition, not a normal cold start.
 2. **Embedding writer** (inline in the summary updater) generates a Titan v2 1024-dim embedding of the new summary and UPSERTs into `summary_embeddings` with a version guard.
-3. **`detectDrift()`** runs on the live user-message path (when `enableLiveDrift` CDK context is `true`), executing inside the retrieval **data-plane Lambda** that the non-VPC router invokes (project decision 018):
+3. **`detectDrift()`** runs on the live user-message path (when `enableLiveDrift` CDK context is `true`), executing inside the retrieval **data-plane Lambda** that the non-VPC router invokes (ADR-013):
  - Embeds the user message via Titan v2 (500ms hard timeout)
  - Computes cosine distance against the channel's summary embedding
  - If distance > threshold (default 0.35), drift fires
@@ -244,7 +264,7 @@ npx cdk deploy --all \
 
 Both flags are required for live drift. `enableLiveDrift=true` without `analyticsMode=aurora` is a misconfiguration - the router has no Aurora to query and drift will silently skip every turn (with a CloudWatch warn log).
 
-**How `enableLiveDrift` wires the path (project decision 018).** It does **not** VPC-attach the agent handler. The handler stays non-VPC; retrieval and drift run in a dedicated VPC-attached **data-plane Lambda** (in the Aurora stack), and `enableLiveDrift` grants the handler `lambda:InvokeFunction` on that Lambda plus its ARN. This avoids the failure where a VPC-attached handler cannot reach SSM, Cognito, or Lambda-invoke from the isolated subnets. The data-plane Lambda reuses the existing Bedrock and Secrets endpoints, so it adds no new VPC endpoints. Per-piece costs are in `docs/guides/admin/INFRASTRUCTURE-COST.md`.
+**How `enableLiveDrift` wires the path (ADR-013).** It does **not** VPC-attach the agent handler. The handler stays non-VPC; retrieval and drift run in a dedicated VPC-attached **data-plane Lambda** (in the Aurora stack), and `enableLiveDrift` grants the handler `lambda:InvokeFunction` on that Lambda plus its ARN. This avoids the failure where a VPC-attached handler cannot reach SSM, Cognito, or Lambda-invoke from the isolated subnets. The data-plane Lambda reuses the existing Bedrock and Secrets endpoints, so it adds no new VPC endpoints. Per-piece costs are in `docs/guides/admin/INFRASTRUCTURE-COST.md`.
 
 ---
 

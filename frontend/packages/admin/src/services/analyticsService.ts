@@ -34,7 +34,22 @@ const ANALYTICS_SUBPATH_FOR_QUERY: Record<string, string> = {
   signin_funnel_conversion: 'user-activity',
   record_moderation: 'moderation-audit',
   moderation_audit: 'moderation-audit',
+  // Not a capability split — a NETWORK one. Starting a classifier replay is `view-analytics` like
+  // the rest of the gate, but the root resource is served by a VPC-attached function that cannot
+  // invoke the replay Lambda (isolated subnets, no route to the Lambda control plane), so the start
+  // has its own non-VPC function on its own resource. See classifier-replay-start.ts.
+  classifier_replay_start: 'classifier-replay-start',
 };
+
+/**
+ * QueryTypes whose sub-path is REQUIRED in both auth modes.
+ *
+ * The other entries above are a capability split, and under a plain Cognito authorizer the root
+ * resource answers them all, so posting to the root is correct there. These are different: a
+ * different FUNCTION answers them, and the root cannot do the work in either mode. Routing them by
+ * capability alone would work under IAM enforcement and silently fail without it.
+ */
+const SUBPATH_REQUIRED_IN_BOTH_MODES = new Set(['classifier_replay_start']);
 
 function analyticsPathForQuery(queryType: string): string {
   const sub = ANALYTICS_SUBPATH_FOR_QUERY[queryType];
@@ -125,7 +140,10 @@ export async function queryAnalytics(
     const creds = await identityPoolCredentials();
     return sigv4PostJson<AnalyticsResult>(analyticsPathForQuery(String(queryType)), body, creds);
   }
-  return apiCall<AnalyticsResult>(getAnalyticsApiUrl(), '', {
+  const url = SUBPATH_REQUIRED_IN_BOTH_MODES.has(String(queryType))
+    ? analyticsPathForQuery(String(queryType))
+    : getAnalyticsApiUrl();
+  return apiCall<AnalyticsResult>(url, '', {
     body,
     mapError: (status) => (status === 403 ? 'Access denied. Admin privileges required.' : `Analytics query failed: ${status}`),
   });
@@ -135,11 +153,23 @@ export async function queryAnalytics(
  * Fetch the LLM-generated recommendation for an experiment's outcome.
  * Returns the verdict, confidence, rationale, and the per-variant summary.
  * Descriptive guidance only; it never changes routing.
+ *
+ * `objective` and `decision` come from the experiment record the CALLER already holds (the backend
+ * does not re-read it) and are sent as JSON, which is the shape `getExperimentRecommendation` parses.
+ * They are what make the evaluation the experiment's own rather than a generic one: without the
+ * objective the backend falls back to a quality-primary default with NO guardrails and skips the
+ * target-tied power check, so the guardrail veto and the underpowered→keep_running rule never fire
+ * and `reco.guardrails` renders permanently empty. Omitting them was silently choosing that default.
  */
 export async function getExperimentRecommendation(
   experimentId: string,
   dateRange: AnalyticsDateRange,
+  opts?: { objective?: unknown; decision?: unknown },
 ): Promise<ExperimentRecommendation> {
-  const res = await queryAnalytics('experiment_recommendation', dateRange, { experimentId });
+  const res = await queryAnalytics('experiment_recommendation', dateRange, {
+    experimentId,
+    ...(opts?.objective ? { objective: JSON.stringify(opts.objective) } : {}),
+    ...(opts?.decision ? { decision: JSON.stringify(opts.decision) } : {}),
+  });
   return res as unknown as ExperimentRecommendation;
 }

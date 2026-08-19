@@ -25,7 +25,7 @@ import {
   BedrockRuntimeClient,
   InvokeModelCommand,
 } from '@aws-sdk/client-bedrock-runtime';
-import { query } from './db-client.js';
+import { query, ensureSchema } from './db-client.js';
 import { writeSummaryEmbedding } from './embedding-writer.js';
 import { emitDriftCounter, emitDriftTiming, newCorrelationId } from '../lib/emf-metrics.js';
 
@@ -54,6 +54,12 @@ export async function handler(event: SummaryUpdaterEvent = {}): Promise<{ proces
   const startedAt = Date.now();
   console.log('[summary-updater] run start', { event });
 
+  // Apply any pending migration first. `schema-init` bootstraps on Create only and can never
+  // reconnect, so runtime application is the ONLY way a new migration reaches an existing cluster -
+  // and it happens where `ensureSchema` is called, not where the schema files are bundled. Memoized
+  // per instance; pinned by `db-lambdas-apply-migrations.test.ts`.
+  await ensureSchema();
+
   // Find channels needing summary updates.
   const channels = await findActiveChannels(event.channelArn);
   console.log(`[summary-updater] found ${channels.length} active channels`);
@@ -72,6 +78,81 @@ export async function handler(event: SummaryUpdaterEvent = {}): Promise<{ proces
 
   console.log('[summary-updater] run complete', { processed, failed, durationMs: Date.now() - startedAt });
   return { processed, failed };
+}
+
+/**
+ * Seed a conversation's FIRST summary from the opening exchange, so drift has an anchor from
+ * turn one instead of waiting up to a full scheduler interval (the `drift_skipped_no_summary`
+ * window, during which drift cannot fire at all).
+ *
+ * The exchange is passed IN by the caller rather than read from a store. The reply handler already
+ * holds both messages when it responds, and Aurora `messages` is a projection fed by Kinesis then
+ * archival - seeding from it would inherit exactly the lag this exists to remove. (Amazon Chime SDK
+ * Messaging is the authoritative conversation; neither store is consulted here.)
+ *
+ * Idempotent: a conversation that already has ANY summary is left alone, so a caller may invoke this
+ * without tracking whether the turn was genuinely the first.
+ */
+export async function seedSummaryFromExchange(input: {
+  channelArn: string;
+  userMessage: string;
+  assistantReply: string;
+}): Promise<{ seeded: boolean; reason?: string }> {
+  const correlationId = newCorrelationId();
+  const { channelArn, userMessage, assistantReply } = input;
+  if (!channelArn || !userMessage || !assistantReply) {
+    return { seeded: false, reason: 'incomplete-exchange' };
+  }
+
+  const existing = await query<{ version: number }>(
+    `SELECT version FROM conversation_summaries WHERE channel_arn = $1 LIMIT 1`,
+    [channelArn],
+  );
+  if (existing.rows.length > 0) return { seeded: false, reason: 'already-summarised' };
+
+  const transcript = `User: ${userMessage.slice(0, 4000)}\nAssistant: ${assistantReply.slice(0, 4000)}`;
+  const tBedrock = Date.now();
+  let parsed: ParsedSummary | null = null;
+  try {
+    parsed = await callBedrockHaiku(buildSummaryPrompt({ transcript }));
+  } catch (err) {
+    console.warn(`[summary-updater][seed] Bedrock call failed for ${channelArn}:`, err);
+  }
+  emitDriftTiming('comparison', Date.now() - tBedrock, correlationId);
+  if (!parsed) return { seeded: false, reason: 'summarisation-failed' };
+
+  // `name`, `message_count` and `participant_count` were DROPPED (ADR-020, migration 015): each
+  // described CHANNEL STATE, and this row is versioned and never rewritten, so a value copied here
+  // was frozen at one summarisation. Their live homes are the Amazon Chime SDK channel /
+  // `channel_registry`, `messages`, and `channel_membership`.
+  const inserted = await query<{ version: number }>(
+    `INSERT INTO conversation_summaries (
+       channel_arn, purpose, summary, topics, key_points, version, generated_by, model_used
+     ) VALUES ($1, $2, $3, $4::text[], $5::text[], 1, 'summary-seed', $6)
+     ON CONFLICT (channel_arn, version) DO NOTHING
+     RETURNING version`,
+    [
+      channelArn,
+      parsed.purpose.slice(0, 64),
+      parsed.summary,
+      parsed.topics,
+      parsed.keyPoints,
+      SUMMARY_MODEL_ID,
+    ],
+  );
+  // Lost the race with a concurrent seed or the scheduled scan. Their row stands.
+  if (inserted.rows.length === 0) return { seeded: false, reason: 'already-summarised' };
+
+  try {
+    await writeSummaryEmbedding({ channelArn, summaryText: parsed.summary, fromVersion: 1 });
+  } catch (err) {
+    // The row is what unblocks drift's cold start; the embedding writer will catch up on the next
+    // scheduled run. Do not fail the seed over it.
+    console.warn(`[summary-updater][seed] embedding write failed for ${channelArn}:`, err);
+  }
+
+  console.log(`[summary-updater][seed] seeded v1 for ${channelArn}`);
+  return { seeded: true };
 }
 
 async function findActiveChannels(specificArn?: string): Promise<ActiveChannel[]> {
@@ -196,13 +277,14 @@ async function processChannel(channel: ActiveChannel): Promise<void> {
 
   // UPSERT with version guard (race-safe against concurrent updaters).
   const newVersion = previousVersion + 1;
-  const totalMessageCount = await getMessageCount(channel.channel_arn);
 
+  // `name`, `participant_count` and `message_count` were DROPPED (ADR-020, migration 015) - all three
+  // described CHANNEL STATE, and this row is versioned and never rewritten, so any value copied here
+  // was frozen at one summarisation and wrong from the next change onward.
   const inserted = await query<{ version: number }>(
     `INSERT INTO conversation_summaries (
-       channel_arn, name, purpose, summary, topics, key_points,
-       message_count, participant_count, version, generated_by, model_used
-     ) VALUES ($1, NULL, $2, $3, $4::text[], $5::text[], $6, 0, $7, 'summary-updater', $8)
+       channel_arn, purpose, summary, topics, key_points, version, generated_by, model_used
+     ) VALUES ($1, $2, $3, $4::text[], $5::text[], $6, 'summary-updater', $7)
      RETURNING version`,
     [
       channel.channel_arn,
@@ -210,7 +292,6 @@ async function processChannel(channel: ActiveChannel): Promise<void> {
       parsed.summary,
       parsed.topics,
       parsed.keyPoints,
-      totalMessageCount,
       newVersion,
       SUMMARY_MODEL_ID,
     ],
@@ -316,10 +397,27 @@ function parseSummaryJson(text: string): ParsedSummary | null {
   }
 }
 
-async function getMessageCount(channelArn: string): Promise<number> {
-  const result = await query<{ count: string }>(
-    `SELECT COUNT(*)::text AS count FROM messages WHERE channel_arn = $1`,
-    [channelArn],
-  );
-  return parseInt(result.rows[0]?.count || '0', 10);
-}
+// `name`, `message_count` and `participant_count` are DELIBERATELY left NULL on conversation_summaries.
+//
+// All three describe CHANNEL STATE, and a conversation_summaries row is VERSIONED and never
+// rewritten - so a value copied in here is frozen at one summarisation and wrong from the next
+// change onward. Unfixable by construction, not merely hard to keep in sync (ADR-020):
+//
+//   name              -> the Amazon Chime SDK channel is authoritative (set on the first turn by
+//                        `maybeDeriveAndRenameChannel`, and renameable by the user afterwards).
+//                        Readers derive it from the ARCHIVED channel events - the latest
+//                        CREATE/UPDATE_CHANNEL row - which is what both the admin Conversations list
+//                        and the analytics conversation list do; `channel_registry.channel_name`
+//                        mirrors the same events via `syncChannelRegistryRecords`. Having the
+//                        summariser generate its own name would create a SECOND name that can
+//                        disagree with the one the user actually sees.
+//   participant_count -> `channel_membership`, maintained live from the Kinesis membership events
+//                        (`syncMembershipRecords`). Read it when needed:
+//                        SELECT COUNT(*) FROM channel_membership WHERE channel_arn = $1
+//   message_count     -> counted at read time from `messages`. It previously stored the channel
+//                        TOTAL, which is channel state, not a fact about this summary version. No
+//                        consumer ever read it: every "messages" figure in the console counts live
+//                        or reads `conversations.message_count`.
+//
+// Nothing reads any of the three, so NULL removes a wrong value rather than a useful one. The
+// incremental watermark is `updated_at`, not a count. Migration 015 drops all three columns.

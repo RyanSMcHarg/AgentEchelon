@@ -32,7 +32,8 @@ import {
   BedrockRuntimeClient,
   InvokeModelCommand,
 } from '@aws-sdk/client-bedrock-runtime';
-import { query } from './db-client.js';
+import { ensureSchema } from './db-client.js';
+import { withWriterRole } from './classification-boundary.js';
 import { emitDriftCounter, newCorrelationId } from '../lib/emf-metrics.js';
 import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
 
@@ -59,17 +60,17 @@ function deriveSourceType(s3Key: string): string {
   return m ? m[1] : 'doc';
 }
 
-// Classification derivation for per-classification retrieval (schema 008: `metadata` holds the
-// `tier` key). Without this, no chunk was tagged and the retrieval classification-filter was a
-// no-op — ALL KB content was returned to ALL classifications (cross-classification leak).
+// Classification derivation for per-classification retrieval (schema 008 added `metadata`; schema 020
+// renamed its isolation key to `classification`). Without this, no chunk was tagged and the retrieval
+// classification-filter was a no-op — ALL KB content was returned to ALL classifications (leak).
 // Convention: an optional classification segment right after the source-type —
 // `rag/{sourceType}/{classification}/…` where `{classification}` ∈ basic|standard|premium.
 // Content with NO classification segment defaults to `RAG_DEFAULT_CLASSIFICATION` (default
 // `premium` = most-restrictive, **fail-closed**), so untagged content is never exposed to a
 // lower classification; tag content `basic` to publish it to all classifications. Retrieval
-// filters `metadata->>'tier' = ANY(scope)` where a user's scope is their classification and
+// filters `metadata->>'classification' = ANY(scope)` where a user's scope is their classification and
 // below (router-agent-handler.ts).
-export function deriveClearance(s3Key: string): string {
+export function deriveContentClassification(s3Key: string): string {
   const seg = s3Key.match(/^rag\/[^/]+\/([^/]+)\//)?.[1];
   if (seg && profiles.isKnownClassification(seg)) return profiles.resolveClassification(seg);
   // Untagged content defaults to the MOST restrictive classification (fail-closed) so it is never
@@ -187,6 +188,10 @@ export interface IngestResult {
  * record's failure does not abort the others.
  */
 export async function handler(event: S3Event): Promise<{ ingested: IngestResult[] }> {
+  // Apply any pending migration first - see `summary-updater.ts` for why bundling the schema is not
+  // enough. Memoized per instance; pinned by `db-lambdas-apply-migrations.test.ts`.
+  await ensureSchema();
+
   const correlationId = newCorrelationId();
   console.log('[document-ingestion] event received', {
     correlationId,
@@ -229,12 +234,29 @@ export async function ingestObject(
   // exists. A content edit produces a new etag; we re-embed when the
   // recorded etag differs.
   if (etag) {
-    const existing = await query<{ count: string }>(
+    // ADR-028: `embeddings` is under FORCE ROW LEVEL SECURITY and the owner has no policy, so this
+    // runs as the write role. The COUNT is inside it as much as the DELETE is - not because reading
+    // is privileged, but because the owner reading through the boundary sees ZERO rows, which here
+    // would mean "no chunk for this etag" for every source, forever: every ingest would look like a
+    // first ingest, re-embedding the whole corpus on every S3 event and silently spending Bedrock
+    // calls to do it. A read that is wrong in the harmless direction is still wrong.
+    //
+    // THE CHECK AND THE DELETE ARE SEPARATE TRANSACTIONS, and this comment used to claim they were
+    // one. `withWriterRole` opens a transaction per call, so two S3 events for the same key can
+    // interleave between them. What that costs is bounded and self-correcting: the loser re-embeds a
+    // source that was already current, spending Bedrock calls and rewriting identical chunks. It
+    // cannot corrupt the corpus, because the DELETE is keyed on `source_id` and the re-ingest writes
+    // the same rows back.
+    //
+    // Stated rather than fixed because the fix is to hold one transaction across the embedding calls,
+    // which would keep a write transaction open for the length of a Bedrock round trip per chunk.
+    // Trading a rare duplicate ingest for a long-held write lock on the corpus is the worse deal.
+    const existing = await withWriterRole((client) => client.query<{ count: string }>(
       `SELECT COUNT(*)::text AS count
          FROM embeddings
         WHERE source_id = $1 AND source_etag = $2`,
       [sourceId, etag],
-    );
+    ));
     if (parseInt(existing.rows[0]?.count || '0', 10) > 0) {
       console.log('[document-ingestion] unchanged etag, skipping', { sourceId, etag });
       return {
@@ -249,10 +271,10 @@ export async function ingestObject(
 
     // ETag changed — clear the prior version's chunks so we don't keep
     // a mix of old + new embeddings for the same source_id.
-    await query(
+    await withWriterRole((client) => client.query(
       `DELETE FROM embeddings WHERE source_id = $1 AND source_type = $2`,
       [sourceId, sourceType],
-    );
+    ));
   }
 
   // Fetch object body. Only text-like content is supported in this
@@ -296,22 +318,31 @@ export async function ingestObject(
     }
     chunksEmbedded++;
 
+    // ADR-028 step 1: the classification is written to BOTH the JSONB key and the column while the
+    // policy is not yet in place. Retrieval still reads the key; dropping either side before the
+    // policy lands would break the boundary in one direction or the other.
+    const rowClassification = deriveContentClassification(key);
+
     const metadata = {
       filename: key.split('/').pop(),
       sourceKey: key,
       chunkStart: chunk.start,
-      // Per-classification retrieval gate (fail-closed default). See deriveClearance.
-      // The stored metadata key stays `tier` (schema 008); the value is the classification.
-      tier: deriveClearance(key),
+      // Per-classification retrieval gate (fail-closed default). See deriveContentClassification.
+      // Schema 020 renamed this key and moved the value on every existing row in the same deploy -
+      // the read side matches only this name, so the data had to move with it.
+      classification: rowClassification,
     };
 
     try {
       const vectorLiteral = `[${embedding.join(',')}]`;
-      const result = await query(
+      // Per chunk, not per document: the loop makes a Bedrock embedding call between iterations, and
+      // holding one transaction open across those would pin a pooled connection for the length of the
+      // whole file. The WITH CHECK on the write policy is evaluated per statement either way.
+      const result = await withWriterRole((client) => client.query(
         `INSERT INTO embeddings (
            source_type, source_id, content, embedding, metadata,
-           chunk_index, source_etag, title
-         ) VALUES ($1, $2, $3, $4::vector, $5::jsonb, $6, $7, $8)
+           chunk_index, source_etag, title, classification
+         ) VALUES ($1, $2, $3, $4::vector, $5::jsonb, $6, $7, $8, $9)
          ON CONFLICT (source_type, source_id, chunk_index) DO NOTHING`,
         [
           sourceType,
@@ -322,8 +353,9 @@ export async function ingestObject(
           chunk.index,
           etag || null,
           title,
+          rowClassification,
         ],
-      );
+      ));
       if ((result.rowCount ?? 0) > 0) chunksWritten++;
     } catch (err) {
       console.warn('[document-ingestion] chunk write failed:', { chunkIndex: chunk.index, err });

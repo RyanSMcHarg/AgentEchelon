@@ -3,9 +3,13 @@
  * views (BUG #21). Pins the query targets and the row→response mapping (incl.
  * marker stripping and the channel-name/member-name parity fields).
  */
-jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({ query: jest.fn() }));
+// `ownerQuery` is the OWNER-connection path (ADR-028): `ae_app` has no CREATE on schema public, so
+// the runtime-DDL that ensures the moderation table must not run on the ordinary connection. Mocked
+// separately from `query` so a test can tell WHICH connection a statement went out on - conflating
+// them is how the "permission denied for schema public" regression passed a green suite.
+jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({ query: jest.fn(), ownerQuery: jest.fn() }));
 
-import { query } from '../../lambda/src/analytics-aurora/db-client';
+import { query, ownerQuery } from '../../lambda/src/analytics-aurora/db-client';
 import {
   adminListConversations,
   adminListMessages,

@@ -39,6 +39,7 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as apigateway from 'aws-cdk-lib/aws-apigateway';
 import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as sns from 'aws-cdk-lib/aws-sns';
 import * as snsSubs from 'aws-cdk-lib/aws-sns-subscriptions';
 import { apiAccessLogConfig } from '../constructs/api-access-logging';
@@ -52,6 +53,7 @@ import { MembershipAuditConstruct } from '../constructs/membership-audit';
 import { ConversationArchive } from '../constructs/conversation-archive';
 import { ANALYTICS_CAPABILITY_SUBPATHS } from '../../lambda/src/lib/admin-capability-map';
 import { personaExecuteApiResources, AdminPersona } from '../config/admin-capabilities';
+import { getModelCatalog } from '../config/model-strategy';
 
 /**
  * esbuild commandHooks for a DB Lambda's asset. Copies:
@@ -101,8 +103,8 @@ export interface AnalyticsStackAuroraProps extends cdk.StackProps {
   /** Cognito User Pool ARN (Layer 6 membership audit: AdminListGroupsForUser + AdminGetUser). */
   userPoolArn?: string;
   /**
-   * A14 (SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md): the `admins` group's sign-on role
-   * ARN. When `-c adminIamEnforcement=true`, the analytics read resources are
+   * A14 (DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md): the `admins` group's sign-on role
+   * ARN. When admin IAM enforcement is on (the default), the analytics read resources are
    * AWS_IAM-authorized and this role is granted `execute-api:Invoke` on them, so
    * a signing admin is allowed while a finer persona role that omits a capability
    * is denied at the gateway.
@@ -221,7 +223,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
   // and IAM grants (see agent-classification-common.ts `auroraDriftWiring`).
   public readonly dbProxyArn: string;
   public readonly dbClusterResourceId: string;
-  // ARN of the retrieval + drift data-plane Lambda (project decision 018): the
+  // ARN of the retrieval + drift data-plane Lambda (ADR-013): the
   // non-VPC agent handler invokes it instead of being VPC-attached itself.
   public readonly dataPlaneLambdaArn: string;
 
@@ -464,6 +466,11 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           actions: ['rds-db:connect'],
           resources: [
             `arn:aws:rds-db:${this.region}:${this.account}:dbuser:${dbCluster.clusterResourceIdentifier}/evaladmin`,
+            // The runtime identity (ADR-028). The direct-cluster grant below is already a wildcard
+            // over db users, so this path was the only one pinned to the owner; without it, enabling
+            // the optional proxy would break every runtime query with an auth error that looks
+            // nothing like its cause.
+            `arn:aws:rds-db:${this.region}:${this.account}:dbuser:${dbCluster.clusterResourceIdentifier}/ae_app`,
           ],
         })
       );
@@ -487,6 +494,11 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
       retentionPeriod: cdk.Duration.hours(24),
       encryption: kinesis.StreamEncryption.MANAGED,
     });
+    // Match the stack's data-removal pattern (RETAIN in prod, DESTROY in dev). The streamName is FIXED
+    // (Chime requires the `chime-messaging-` prefix, so it can't be auto-named), so a RETAINED dev stream
+    // would ORPHAN on teardown and then block the next fresh deploy with a ResourceExistenceCheck
+    // ("resource already exists"). DESTROY in dev cleans it up with the stack, so a redeploy stays clean.
+    messageStream.applyRemovalPolicy(environment === 'prod' ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY);
 
     this.kinesisStreamArn = messageStream.streamArn;
     this.kinesisStreamName = messageStream.streamName;
@@ -813,7 +825,13 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
       DB_HOST: dbProxy ? dbProxy.endpoint : dbCluster.clusterEndpoint.hostname,
       DB_PORT: '5432',
       DB_NAME: 'evaluation',
+      // The OWNER identity: migrations, DDL, and the classification-boundary bootstrap only.
       DB_USER: 'evaladmin',
+      // The RUNTIME identity (ADR-028). Every ordinary query connects as this: no ownership and no
+      // DDL, so row-level security applies to it through the ordinary path instead of depending on
+      // FORCE and owner-exemption semantics. The role itself is created BY the bootstrap, which runs
+      // as the owner, so the first cold start after this ships still connects fine.
+      DB_APP_USER: 'ae_app',
       DB_REGION: this.region,
       USE_IAM_AUTH: 'true',
     };
@@ -902,6 +920,11 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           ...dbEnvironment,
           // Phase 1: read the out-of-band analytics row by message id.
           MESSAGE_ANALYTICS_TABLE: messageAnalyticsTable.tableName,
+          // The `@all` responder branch needs the channel member count on the REQUEST path, and this
+          // Lambda is the only component that learns a channel changed size without asking. It writes
+          // the count here so the flow and router read DynamoDB instead of calling Chime per turn.
+          CHANNEL_CONTEXT_TABLE: ssm.StringParameter.valueForStringParameter(
+            this, SHARED_SSM.channelContextName),
         },
         bundling: {
           externalModules: ['@aws-sdk/*'],
@@ -911,6 +934,57 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
         },
       }
     );
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // The channel member count, maintained by event rather than polled per turn.
+    //
+    // WHY THIS LAMBDA WRITES IT. `@all` has exactly one responder and which entry it is depends on
+    // channel size (1:1 -> the Lex entry answers; group -> the flow's bypass answers). Both sides must
+    // agree, and asking Chime on every `@all` turn puts an API call on the request path. This Lambda
+    // consumes the membership events, so it is the only place that learns of a change without asking.
+    //
+    // UpdateItem ONLY, and on one table. It writes two attributes on an item it does not own - the
+    // conversation's private grounding lives on the same row - so the grant is deliberately the
+    // narrowest verb that can do the job. It cannot read that grounding and cannot delete the item.
+    const channelContextTableArn = ssm.StringParameter.valueForStringParameter(
+      this, SHARED_SSM.channelContextArn);
+    archivalLambda.addToRolePolicy(new iam.PolicyStatement({
+      actions: ['dynamodb:UpdateItem'],
+      resources: [channelContextTableArn],
+    }));
+
+    // THE ALARM IS THE POINT, not a nicety. The write is best-effort by design: it must never fail an
+    // archival batch, because an archive record is worth more than a cache entry. That means a broken
+    // write is INVISIBLE - Lambda `Errors` stays at zero, every turn still gets answered via the
+    // live-read fallback, and the only symptom is a quiet rise in Chime API calls. Without this metric
+    // the event path could stop working for weeks and look exactly like success.
+    //
+    // Emitted as EMF from `lib/channel-context-client.ts` so the alarm needs no log-metric-filter and
+    // no prose parsing.
+    const memberCountWriteFailures = new cloudwatch.Metric({
+      namespace: 'AgentEchelon/ChannelMemberCount',
+      metricName: 'WriteFailures',
+      statistic: 'Sum',
+      period: cdk.Duration.minutes(5),
+    });
+    const memberCountAlarm = new cloudwatch.Alarm(this, 'ChannelMemberCountWriteFailureAlarm', {
+      alarmName: `${ANALYTICS_PREFIX}-channel-member-count-write-failures`,
+      alarmDescription:
+        'The channel member count stopped being written from the membership event path. Turns still '
+        + 'answer (the @all responder branch falls back to a live ListChannelMemberships), so this is '
+        + 'a cost and latency regression rather than an outage - and it is invisible without this alarm. '
+        + 'Check the archival Lambda for DynamoDB AccessDenied on the channel-context table.',
+      metric: memberCountWriteFailures,
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      // No writes is not a failure: a quiet deployment has no membership changes.
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    // Left without an action deliberately when no topic is configured: an alarm that exists and is
+    // visible in the console is the floor, and wiring it to a destination is the deployer's choice.
+    // `memberCountAlarm` is exported below so a deployment can subscribe it.
+    void memberCountAlarm;
 
     // Read-only: archival merges the out-of-band analytics over the slim inline metadata.
     messageAnalyticsTable.grantReadData(archivalLambda);
@@ -1326,7 +1400,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     );
 
     // =====================================================
-    // Retrieval + drift DATA-PLANE Lambda (project decision 018)
+    // Retrieval + drift DATA-PLANE Lambda (ADR-013)
     // VPC-attached; runs RAG retrieval + drift detection (embed + pgvector) so
     // the Lex-facing agent handler can stay NON-VPC and invoke it. Reuses the
     // existing Bedrock + Secrets endpoints + the in-VPC Aurora proxy, so it adds
@@ -1355,7 +1429,17 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           statements: [
             new iam.PolicyStatement({
               actions: ['bedrock:InvokeModel'],
-              resources: [titanEmbedArn],
+              // Titan embed: the drift / RAG vector path.
+              // Haiku: the first-turn summary SEED (`seedSummary` op) summarises the opening
+              // exchange HERE, so this role needs the same model access the scheduled
+              // summary-updater already has. Without it the seed reaches the data plane and then
+              // dies on AccessDenied at the Bedrock call - live-verified, and invisible from the
+              // deploy, which reports success either way.
+              resources: [
+                titanEmbedArn,
+                'arn:aws:bedrock:*::foundation-model/anthropic.claude-3-haiku-*',
+                'arn:aws:bedrock:*::foundation-model/anthropic.claude-3-5-haiku-*',
+              ],
             }),
           ],
         }),
@@ -1407,6 +1491,73 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
       stringValue: dataPlaneLambda.functionArn,
       description: 'Aurora data-plane Lambda ARN for the admin-conversations read path (BUG #21).',
     });
+
+    // =====================================================
+    // Classifier Replay Lambda (the classification shadow gate, DESIGN-EXPERIMENTS-BATTLE §5.2)
+    // =====================================================
+    // Its OWN function because the work fits nowhere else: a replay is hundreds of paired model
+    // calls over minutes, while DataPlaneLambda is capped at 15s (it serves the per-turn request
+    // path) and the analytics API has an API Gateway request behind it. Both of those caps are
+    // guards worth keeping, so the batch job gets a timeout measured in minutes without weakening
+    // either. Nothing invokes it synchronously.
+    const classifierReplayRole = new iam.Role(this, 'ClassifierReplayLambdaRole', {
+      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
+      managedPolicies: [
+        iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaVPCAccessExecutionRole'),
+      ],
+      inlinePolicies: {
+        RdsIamAuth: rdsIamAuthPolicy,
+        // DERIVED FROM THE CATALOG, never hand-listed. A classification experiment's challenger can
+        // be ANY catalog model, so a hand-written list of the two Haiku ids (which is what the
+        // data-plane role carries, for its own reasons) would let a replay against Sonnet die on
+        // AccessDenied at the model call — with the deploy reporting success either way. This is the
+        // same failure the image-gen fix removed by deriving its grant from the registry.
+        BedrockClassify: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['bedrock:InvokeModel'],
+              resources: Array.from(
+                new Set(
+                  Object.values(getModelCatalog(this.region, this.account)).flatMap((m) => [
+                    ...m.foundationModelArns,
+                    ...(m.inferenceProfileArns ?? []),
+                  ]),
+                ),
+              ),
+            }),
+          ],
+        }),
+      },
+    });
+
+    const classifierReplayLambda = new lambdaNodeJs.NodejsFunction(this, 'ClassifierReplayLambda', {
+      entry: path.join(__dirname, '../../lambda/src/analytics-aurora/classifier-replay-handler.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      // A batch job, invoked as an Event. The cap is a backstop against a runaway window, not a
+      // budget: the job's own `limit` bounds how many messages it will classify.
+      timeout: cdk.Duration.minutes(15),
+      memorySize: 1024,
+      vpc,
+      vpcSubnets: dbSubnets,
+      // Reuses the data-plane security group, which already has the Aurora ingress rule.
+      securityGroups: [dataPlaneLambdaSg],
+      role: classifierReplayRole,
+      // AWS_ACCOUNT_ID is REQUIRED here, not decoration: classifier-replay.ts builds the model
+      // catalog with getModelCatalog(region, process.env.AWS_ACCOUNT_ID || ''), and an empty account
+      // yields inference-profile ARNs with an empty account segment. Converse then rejects,
+      // classifyIntent's catch silently falls back to the keyword classifier, and a replay records
+      // status 'complete' while attributing keyword labels to a Bedrock model that never ran - the
+      // role's grants were even derived from the same catalog, so ONLY this env var was missing.
+      environment: { ...dbEnvironment, AWS_ACCOUNT_ID: this.account },
+      bundling: {
+        externalModules: ['@aws-sdk/*'],
+        minify: true,
+        sourceMap: true,
+        commandHooks: dbLambdaCommandHooks(),
+      },
+    });
+    classifierReplayLambda.node.addDependency(iamAuthSetup);
 
     // The premium + standard async processors need read access to
     // pgvector via the RDS Proxy + Bedrock for query embedding. Those
@@ -1471,6 +1622,13 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
           ...(props.enableBattleJoin
             ? { BATTLE_OUTCOME_TABLE: ssm.StringParameter.valueForStringParameter(this, SHARED_SSM.battleOutcomeName) }
             : {}),
+          // Exchanges-per-variant floor before a result is decision-grade. Unset keeps the built-in 30.
+          // A deployment used for demos or e2e can lower it (`-c minSamplePerVariant=2`) so a handful
+          // of duels reaches a real verdict instead of "keep the experiment running" - a battle turn is
+          // two live model calls, so 30 per variant is tens of minutes of traffic.
+          ...(this.node.tryGetContext('minSamplePerVariant')
+            ? { MIN_SAMPLE_PER_VARIANT: String(this.node.tryGetContext('minSamplePerVariant')) }
+            : {}),
         },
         bundling: {
           externalModules: [],
@@ -1482,6 +1640,12 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     );
 
     analyticsLambda.node.addDependency(iamAuthSetup);
+
+    // NOTE: `analyticsLambda` deliberately holds NO invoke grant on the replay function and does not
+    // carry its ARN. It is VPC-attached in the isolated subnets, which have no NAT, no internet
+    // gateway and no `lambda` interface endpoint, so `lambda:Invoke` from it has no route at all — it
+    // hangs until the function's timeout. Granting the permission would describe a call that cannot
+    // happen. The start hop lives outside the VPC instead (`classifierReplayStartFn`, below).
 
     // The /analytics/experiments/recommendation endpoint
     // (analytics-query.ts getExperimentRecommendation) summarises an A/B
@@ -1534,7 +1698,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     const appUrl = this.node.tryGetContext('appUrl') || 'http://localhost:5173';
     // The analytics + membership-audit APIs are admin-only → the admin console
     // origin. (The client-events ingestion + deployment-state APIs below stay
-    // chat-facing on appUrl.) SPEC-SEPARATE-ADMIN-APP.md.
+    // chat-facing on appUrl.) DESIGN-SEPARATE-ADMIN-APP.md.
     const adminAppUrl = adminOrigin(this);
     // Admin-plane auth mode (ae-cognito default / federated / service) — see
     // docs/ADMIN-INTEGRATION-GUIDE.md. In ae-cognito mode this uses a Cognito
@@ -1649,6 +1813,42 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     for (const { path: subPath } of ANALYTICS_CAPABILITY_SUBPATHS) {
       analyticsApi.root.addResource(subPath).addMethod('POST', analyticsIntegration, authMethodOptions);
     }
+
+    // Starting a classifier replay (DESIGN §5.2) — its OWN, NON-VPC function, and that is the whole
+    // reason it exists rather than being one more queryType on the root resource.
+    //
+    // The replay is a batch Lambda inside the VPC, and something has to invoke it when an operator
+    // clicks. `analyticsLambda` cannot: it is attached to the ISOLATED subnets, which have no NAT, no
+    // internet gateway and no `lambda` interface endpoint, so the Lambda control plane is simply not
+    // reachable from it. The call hangs until the function times out and the caller gets a 504 with
+    // nothing invoked. `grantInvoke` grants permission and says nothing about reachability, which is
+    // why this passed a template review and 14 mocked unit tests before it was caught live.
+    //
+    // `ClientEventsFunction` (below) is the same shape for the same reason: every Lambda-to-Lambda
+    // hop in this stack originates OUTSIDE the VPC.
+    const classifierReplayStartFn = new lambdaNodeJs.NodejsFunction(this, 'ClassifierReplayStartFn', {
+      entry: path.join(__dirname, '../../lambda/src/classifier-replay-start.ts'),
+      handler: 'handler',
+      runtime: lambda.Runtime.NODEJS_20_X,
+      timeout: cdk.Duration.seconds(15),
+      memorySize: 256,
+      environment: {
+        ...adminAuthEnv(this),
+        CLASSIFIER_REPLAY_ARN: classifierReplayLambda.functionArn,
+        ALLOWED_ORIGINS: adminOrigin(this),
+      },
+      bundling: { externalModules: ['@aws-sdk/*'], minify: true, sourceMap: true },
+    });
+    if (adminIamEnforcement) {
+      // Without this the handler's `requireAdmin` cannot recognise a gateway-vetted signed principal
+      // — there are no Cognito claims on an IAM-authorized request — and every call 401s. Found live:
+      // the function deployed, the route answered, and the first real request was refused.
+      classifierReplayStartFn.addEnvironment('ADMIN_IAM_ENFORCEMENT', 'true');
+    }
+    classifierReplayLambda.grantInvoke(classifierReplayStartFn);
+    analyticsApi.root
+      .addResource('classifier-replay-start')
+      .addMethod('POST', new apigateway.LambdaIntegration(classifierReplayStartFn, { allowTestInvoke: false }), authMethodOptions);
 
     // A14 sign-on-role teeth: the `admins` group's role gets execute-api:Invoke on
     // the whole analytics API (admins = Full on every capability, SPEC section 4).
@@ -1812,7 +2012,7 @@ export class AnalyticsStackAurora extends cdk.Stack implements IAnalyticsStackOu
     // A14: gen-frontend-env maps this to VITE_ADMIN_IAM_ENFORCEMENT so the admin console
     // SIGNS its requests (SigV4) iff the backend enforces IAM on the read plane — the two
     // flags are DERIVED from one deployed value and can't drift (an off-frontend against an
-    // on-backend 403s every admin read). See SPEC-ADMIN-ACTION-IAM-ENFORCEMENT.md.
+    // on-backend 403s every admin read). See DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md.
     new cdk.CfnOutput(this, 'AdminIamEnforcement', {
       value: String(adminIamEnforcement),
       description: 'Whether admin read APIs require AWS_IAM (SigV4) auth; drives admin-app request signing.',
