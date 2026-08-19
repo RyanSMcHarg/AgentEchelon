@@ -13,6 +13,7 @@
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand, GetCommand, UpdateCommand, QueryCommand, ScanCommand, DeleteCommand } from '@aws-sdk/lib-dynamodb';
 import { DeliveryOption } from './delivery-options.js';
+import { taskStateMachines as packTaskStateMachines } from './intent-pack.js';
 import {
   type TaskStateMachine,
   type TerminalKind,
@@ -352,6 +353,14 @@ export const TRIP_TASK_TTL_SECONDS = 200 * 24 * 60 * 60;
 
 /** Work-item-task anchor + lifetime overrides. All optional. */
 export interface TaskCreateOptions {
+  /**
+   * The machines to resolve the initial state and its ownership from. Defaults to the PACK-merged
+   * set (deployment machines over the platform defaults) - never the raw defaults alone, which left
+   * a pack-declared task type created STATELESS: taskState undefined, the loop never registered the
+   * advance tool, and the task reached nobody's queue. A caller holding PROFILE machines may pass
+   * the fully-merged set.
+   */
+  machines?: Record<string, TaskStateMachine>;
   contextId?: string;
   itemId?: string;
   /** Who must act on this next. Defaults to the requester, as a `user` owner. */
@@ -411,10 +420,11 @@ export async function createTask(
     event.requestAttributes?.['CHIME.sender.arn'] ||
     '';
 
-  // Determine initial state from state machine
-  const initialState = taskType && TASK_STATE_MACHINES[taskType]
-    ? TASK_STATE_MACHINES[taskType][0]
-    : undefined;
+  // Determine the initial state from the MERGED machines (pack over defaults, or the caller's
+  // profile-merged set) - the same resolution every other consumer applies. The raw defaults alone
+  // cannot see a deployment-pack task type.
+  const machinesForCreate = opts?.machines ?? packTaskStateMachines();
+  const initialState = taskType ? machinesForCreate[taskType]?.initial : undefined;
 
   const ttl = Math.floor(Date.now() / 1000) + (opts?.ttlSeconds ?? DEFAULT_TASK_TTL_SECONDS);
   // Work-item-task anchor fields, included only when supplied (enterprise tasks omit them).
@@ -438,7 +448,7 @@ export async function createTask(
   const requesterSub = userArn.split('/user/').pop() || '';
   const startsBlockedOnAPerson = Boolean(
     taskType && initialState
-    && DEFAULT_TASK_STATE_MACHINES[taskType]?.states?.[initialState]?.awaitsUser === true,
+    && machinesForCreate[taskType]?.states?.[initialState]?.awaitsUser === true,
   );
   const owner: TaskOwner | null =
     (startsBlockedOnAPerson && requesterSub)

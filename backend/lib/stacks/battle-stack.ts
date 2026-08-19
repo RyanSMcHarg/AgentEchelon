@@ -154,9 +154,15 @@ export class BattleStack extends cdk.Stack {
       environment: {
         SSM_ROOT: SSM_ROOT,
         ALT_BOT_SLOTS_ROSTER_PARAM: `${SSM_ROOT}/alt-bot-slots/roster`,
+        // WHICH SLOT AM I is answered from the battle state (the side WAITING on the person), not
+        // from the Lex event: every slot shares one Lex bot/alias, so the event cannot name a slot.
+        BATTLE_STATE_TABLE: battleStateTable.tableName,
+        CHANNEL_BATTLE_CONFIG_TABLE: channelBattleConfigTable.tableName,
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
+    battleStateTable.grantReadData(altSlotHandler);
+    channelBattleConfigTable.grantReadData(altSlotHandler);
     // RESOLVED AT RUNTIME, NOT AT DEPLOY. Reading a classification router's ARN at synth would make
     // this stack depend on the classification stacks, which already depend on this one through the
     // battle SSM contract - neither could then go first. So the handler reads the channel's own
@@ -191,12 +197,6 @@ export class BattleStack extends cdk.Stack {
     altSlotHandler.addToRolePolicy(new iam.PolicyStatement({
       actions: ['lambda:InvokeFunction'],
       resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Classification-*`],
-    }));
-    // To answer "which slot am I": the link between this Lex bot and its Chime bot is the
-    // AppInstanceBot's own configured alias, read from the bots the roster names.
-    altSlotHandler.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['chime:DescribeAppInstanceBot'],
-      resources: [`arn:aws:chime:${this.region}:${this.account}:app-instance/*`],
     }));
     // `sourceAccount`, for the same reason as the classification handler's own Lex permission (see
     // `assistant-profile-stack.ts`): the Lex SERVICE principal alone accepts an invoke originating from

@@ -33,17 +33,13 @@
  */
 import { LambdaClient, InvokeCommand, InvocationType } from '@aws-sdk/client-lambda';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
-import {
-  ChimeSDKIdentityClient,
-  DescribeAppInstanceBotCommand,
-} from '@aws-sdk/client-chime-sdk-identity';
 import { ChimeSDKMessagingClient } from '@aws-sdk/client-chime-sdk-messaging';
 import { resolveChannelClassificationTag } from './lib/channel-classification.js';
+import { resolveActiveBattle, readBattleRows } from './lib/battle-state.js';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const lambdaClient = new LambdaClient({ region });
 const ssmClient = new SSMClient({ region });
-const identityClient = new ChimeSDKIdentityClient({ region });
 const messagingClient = new ChimeSDKMessagingClient({ region });
 
 const INSTANCE_ROOT = process.env.SSM_ROOT || '/agent-echelon';
@@ -84,8 +80,10 @@ interface LexResponse {
   messages: Array<{ contentType: string; content: string }>;
 }
 
-/** Container-lifetime caches: the roster and the Lex-bot→slot mapping do not change per invocation. */
-const selfArnByLexBotId = new Map<string, string>();
+/** Container-lifetime cache: the roster does not change per invocation. The Lex-bot→slot mapping
+ *  cache is GONE, deliberately: every slot shares ONE Lex bot/alias, so an identity memoized by
+ *  lexBotId was one identity for all slots (see resolveSelfBotArn). */
+
 
 async function ssmValue(name: string): Promise<string | null> {
   try {
@@ -97,42 +95,57 @@ async function ssmValue(name: string): Promise<string | null> {
   }
 }
 
-/**
- * WHICH SLOT AM I. The Lex event names the Lex bot, the roster names the Chime bots, and the link
- * between them is the AppInstanceBot's own configured Lex alias — so it is read from the bots
- * themselves rather than kept as a second copy that could disagree with the wiring it describes.
- */
-async function resolveSelfBotArn(lexBotId: string | undefined): Promise<string | null> {
-  if (!lexBotId) return null;
-  const cached = selfArnByLexBotId.get(lexBotId);
-  if (cached) return cached;
-
+let cachedRoster: Array<{ slotId?: string; botArn?: string }> | null = null;
+async function altSlotRoster(): Promise<Array<{ slotId?: string; botArn?: string }>> {
+  if (cachedRoster) return cachedRoster;
   const rosterRaw = await ssmValue(ROSTER_PARAM);
-  if (!rosterRaw) return null;
-  let roster: Array<{ slotId?: string; botArn?: string }> = [];
+  if (!rosterRaw) return [];
   try {
-    roster = JSON.parse(rosterRaw);
+    cachedRoster = JSON.parse(rosterRaw);
   } catch (err) {
     console.warn('[BattleAltSlot] alt-slot roster is not parseable JSON:', err);
+    return [];
+  }
+  return cachedRoster ?? [];
+}
+
+/**
+ * WHICH SLOT AM I. NOT answerable from the Lex event: every alt slot shares ONE battle-owned Lex
+ * bot and alias (battle-stack passes the same LexBotAliasArn to every CreateAltBotFunction), so the
+ * previous alias-substring match ALWAYS returned the first roster entry - and memoized it - meaning
+ * every slot answered as slot-0, against the wrong experiment variant, while the addressed slot
+ * stayed WAITING_FOR_USER.
+ *
+ * The identity comes from the BATTLE STATE instead: a person's message reaches this handler only
+ * when it is Target-addressed at an alt slot, and the slot being addressed is the one whose side is
+ * blocked on the person. When exactly one roster slot is WAITING_FOR_USER in this channel's active
+ * duel, that slot is self. Anything else - no duel, no waiting alt side, or (in an alt-vs-alt duel)
+ * two waiting alt sides - is ambiguous, and answering as a GUESSED identity is the defect this
+ * replaces, so the turn degrades to silence with the reason logged.
+ */
+async function resolveSelfBotArn(channelArn: string): Promise<string | null> {
+  const roster = await altSlotRoster();
+  const rosterArns = new Set(roster.map((s) => s?.botArn).filter(Boolean));
+  if (rosterArns.size === 0) return null;
+
+  try {
+    const duel = await resolveActiveBattle(channelArn);
+    if (!duel?.battleId) {
+      console.warn('[BattleAltSlot] no active duel in this channel; cannot resolve which slot was addressed');
+      return null;
+    }
+    const rows = await readBattleRows(duel.battleId);
+    const waitingSlots = rows.filter((r) => r.state === 'WAITING_FOR_USER' && rosterArns.has(r.botArn));
+    if (waitingSlots.length === 1) return waitingSlots[0].botArn;
+    console.warn('[BattleAltSlot] cannot resolve identity from the battle state', {
+      battleId: duel.battleId,
+      waitingAltSlots: waitingSlots.length,
+    });
+    return null;
+  } catch (err) {
+    console.warn('[BattleAltSlot] battle-state read failed; cannot resolve identity:', err);
     return null;
   }
-
-  for (const slot of roster) {
-    if (!slot?.botArn) continue;
-    try {
-      const bot = await identityClient.send(new DescribeAppInstanceBotCommand({
-        AppInstanceBotArn: slot.botArn,
-      }));
-      const aliasArn = bot.AppInstanceBot?.Configuration?.Lex?.LexBotAliasArn || '';
-      if (aliasArn.includes(lexBotId)) {
-        selfArnByLexBotId.set(lexBotId, slot.botArn);
-        return slot.botArn;
-      }
-    } catch (err) {
-      console.warn('[BattleAltSlot] could not describe', slot.botArn, err);
-    }
-  }
-  return null;
 }
 
 function silent(event: LexEvent, intentName: string): LexResponse {
@@ -171,7 +184,7 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
     return silent(event, lexIntentName);
   }
 
-  const selfBotArn = await resolveSelfBotArn(event.bot?.id);
+  const selfBotArn = await resolveSelfBotArn(channelArn);
   // The immutable tag is the authority, read with this slot's own identity as bearer - the same
   // fail-closed resolver every other turn path uses. An unreadable tag resolves to the fail-closed
   // floor there, never to premium.
