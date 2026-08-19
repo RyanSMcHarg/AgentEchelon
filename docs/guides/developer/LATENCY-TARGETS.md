@@ -171,7 +171,9 @@ final answer - is on the Amazon Chime SDK message clock and is auditable against
 not auditable, and rows carrying it are marked `auditable = false` so no dashboard implies otherwise.
 
 **Reading it:** `POST { queryType: 'turn_latency_audit', channelArn }` returns the calculation for one
-channel, one row per (turn_id, response_id), including the reconciliation residuals. A NEGATIVE
+channel, one row per response (the response's turn id is lifted across its own ledger rows, so a
+live final-answer row - whose content carries no corr marker to declare a turn from - still lands
+in its placeholder's row; migration 027), including the reconciliation residuals. A NEGATIVE
 `unattributed_ms` means compute was attributed to the wrong turn - the bug class this exists to expose.
 
 ## Task resolution is measured separately, and never mixed in

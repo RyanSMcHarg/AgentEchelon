@@ -277,8 +277,11 @@ turn logic:
 - **the inbound `MessageId`**, so the turn's correlation id is *declared* rather than derived from a
   time bucket. Only the flow sees a stable id on every message; Amazon Chime SDK does not give Lex
   one. A redelivery therefore still collapses.
-- **the attachment**, read from the message Metadata. Lex never sees Metadata, so this is the only
-  route by which a file can reach a turn at all.
+- **the attachment**, read from the message Metadata. Lex never sees Metadata, so a bypass is the
+  primary route by which a file reaches a turn. The one Lex-entry exception is the 1:1 `@all`
+  fall-through, where the router recovers the attachment itself: it lists the channel's recent
+  messages (the same content-matched read-back the drift flow uses to find its anchor, since Lex
+  also carries no message id) and reads the stored message's Metadata directly.
 
 ---
 
@@ -663,9 +666,13 @@ is why the two cases are handled differently.
 **What still produces one.** Not an ordinary turn: Lex returns exactly one placeholder, and a turn with
 no Lex in it has no envelope to return. What is left:
 
-- **The alt-slot handler** (`battle-alt-slot-handler.ts`), which closes its intent with no message. It
-  is the alt-slot bot's formal `InvokedBy` handle and fires on `WelcomeIntent` when that bot is added to
-  a channel as battle is enabled. Once per enable, never per turn.
+- **The alt-slot handler** (`battle-alt-slot-handler.ts`) on its SILENT paths: `WelcomeIntent` when
+  the alt-slot bot is added as battle is enabled, and any real turn it cannot safely attribute. A
+  real turn - a person's reply `Target`-ed at an alt slot - is handed to the channel's
+  classification router with the slot's own identity attached. That identity comes from the BATTLE
+  STATE (the alt side currently `WAITING_FOR_USER` in the channel's active duel), never from the
+  Lex event: every slot shares one battle-owned Lex bot and alias, so the event cannot name a slot,
+  and an ambiguous read degrades to silence rather than answering as a guess.
 - **A Lex entry standing down for the flow** (`router-agent-handler.ts`, the bypass-token branch). It
   requires Lex to be invoked on a message the flow is also bypassing, which the size branch is designed
   to prevent; it is a defensive complement rather than an expected path.

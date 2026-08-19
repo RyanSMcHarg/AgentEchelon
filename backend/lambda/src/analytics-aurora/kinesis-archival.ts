@@ -924,13 +924,31 @@ async function createExchangesFromDatabase(
        -- so one user message legitimately has two agent replies; keying on user_message_id alone let
        -- the first reply claim the turn and silently dropped the second, leaving every duel with one
        -- side in exchanges and no comparison possible.
+       -- Durable per-(turn, sender), NOT per exact pair. The pair-level anti-join runs BEFORE
+       -- DISTINCT ON, so once (U, A1) was inserted in an earlier batch, A1 was eliminated as a
+       -- candidate and a LATER unprompted message from the same sender became the "earliest
+       -- surviving" row - minting a second exchange for an already-answered turn, at whatever
+       -- latency the gap happened to be. The join now asks "has this SENDER already answered this
+       -- turn", which survives across batches.
        LEFT JOIN exchanges e
-         ON e.user_message_id = um.id AND e.agent_message_id = am.id
+         ON e.user_message_id = um.id
+        AND EXISTS (
+          SELECT 1 FROM messages am_prev
+           WHERE am_prev.id = e.agent_message_id AND am_prev.sender_arn = am.sender_arn
+        )
        WHERE um.is_bot = false
          AND um.event_type = 'CREATE_CHANNEL_MESSAGE'
          AND um.created_at > NOW() - INTERVAL '24 hours'
          AND um.channel_arn = ANY($1)
          AND e.id IS NULL
+         -- Only RESPONSE-ANCHORED bot messages pair: a reply is always born as a corr-marked
+         -- placeholder (placeholder->update delivery), so a marker-less bot CREATE - a drift
+         -- notice, a hint, a raw send - is not an answer to anything and must not mint an exchange.
+         AND am.content LIKE '%<!--corr:%'
+         -- And a reply belongs to a RECENT prompt. Placeholders land within seconds of dispatch;
+         -- an unbounded gap let a briefing hours later pair with a stale user message at ~8-hour
+         -- "latency", dragging every average built on this table.
+         AND am.created_at <= um.created_at + INTERVAL '1 hour'
          -- Bound the reply to THIS turn by the next USER message, not by the first bot message. The
          -- old "no intervening bot message" test is what limited a turn to a single reply; bounding on
          -- the next user turn keeps replies attached to the prompt that caused them while allowing the

@@ -147,9 +147,11 @@ export class BattleStack extends cdk.Stack {
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
       // A real turn is now handed to the classification router and awaited, so this outlives a
-      // silent close. Bounded well under the router's own budget: a timeout here costs the user
-      // their answer, not correctness, because the handler degrades to silence.
-      timeout: cdk.Duration.seconds(60),
+      // silent close. 30s, NOT more: Lex's code-hook wait is 30s, so a handler still working past
+      // that returns to nobody - Lex has already surfaced a visible error while the handler burned
+      // the extra 30s for nothing. The invoke itself is aborted earlier still (25s, in the handler)
+      // so the degrade is OUR silent close, inside Lex's window, not Lex's error.
+      timeout: cdk.Duration.seconds(30),
       memorySize: 256,
       environment: {
         SSM_ROOT: SSM_ROOT,

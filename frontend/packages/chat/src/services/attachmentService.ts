@@ -59,6 +59,11 @@ export async function uploadFile(
   if (file.size > MAX_FILE_SIZE) {
     throw new Error(`File size exceeds ${MAX_FILE_SIZE / (1024 * 1024)}MB limit`);
   }
+  // The presigned POST policy's content-length-range starts at 1 byte, so a 0-byte file would fail
+  // at S3 with an opaque policy error three hops from here. Refused where the reason can be said.
+  if (file.size === 0) {
+    throw new Error('File is empty');
+  }
 
   const fileType = effectiveFileType(file);
   if (!ALLOWED_TYPES.includes(fileType)) {

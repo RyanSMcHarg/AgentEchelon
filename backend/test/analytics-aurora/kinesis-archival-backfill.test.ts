@@ -257,3 +257,25 @@ describe('the cross-batch exchange sweep mints one row per (turn, responding bot
     expect(src).toMatch(/NOT EXISTS \(\s*\n\s*SELECT 1 FROM messages nxt/);
   });
 });
+
+describe('the sweep pairs only real replies, once per (turn, sender), within a bounded window', () => {
+  // The pair-level anti-join ran before DISTINCT ON, so a sender's LATER unprompted message became
+  // the "earliest surviving" candidate for an already-answered turn and minted a second exchange -
+  // and with no delay ceiling, a briefing hours later paired at ~8-hour "latency". Three bounds,
+  // pinned together because each alone leaves a mint path open.
+  const sweepSrc = require('fs').readFileSync(
+    require('path').join(__dirname, '..', '..', 'lambda', 'src', 'analytics-aurora', 'kinesis-archival.ts'), 'utf8');
+
+  it('the anti-join is durable per (turn, sender), not per exact pair', () => {
+    expect(sweepSrc).toMatch(/e\.user_message_id = um\.id\s*\n\s*AND EXISTS \(/);
+    expect(sweepSrc).toMatch(/am_prev\.sender_arn = am\.sender_arn/);
+  });
+
+  it('only corr-marked (response-anchored) bot messages may pair', () => {
+    expect(sweepSrc).toContain("AND am.content LIKE '%<!--corr:%'");
+  });
+
+  it('a reply pairs only within an hour of its prompt', () => {
+    expect(sweepSrc).toContain("AND am.created_at <= um.created_at + INTERVAL '1 hour'");
+  });
+});

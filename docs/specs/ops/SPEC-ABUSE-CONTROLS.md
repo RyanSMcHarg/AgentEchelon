@@ -111,7 +111,7 @@ Keeping the checks in the shared pipeline means all three tiers inherit them fro
 Most controls are env-driven with fail-open defaults so a misconfiguration never blocks legitimate traffic (the per-profile request-rate ceiling is config-driven, see below):
 
 - `ABUSE_CONTROLS_TABLE` - table name (from the shared SSM contract).
-- Per-user hourly request ceiling: the `rateLimitPerHour` field on each assistant profile (`backend/lib/config/profiles.ts`), which replaced the former `RATE_LIMIT_<TIER>` env.
+- Per-user hourly request ceiling: the `rateLimitPerHour` field on each assistant profile (`backend/lib/config/profiles.ts`), which replaced the former `RATE_LIMIT_<TIER>` env. **Metered at the sender's EFFECTIVE classification** - `min(channel, clearance)` via the one shared resolver (`lib/user-clearance.ts`) - on every entry that dispatches a model call: the router for ordinary turns, and the channel flow for `@all` and `/battle` (a duel is gated once, as a whole, before the fan-out; a federated sender's entitlement is the channel they were provisioned into). A RESUMED duel turn - a person answering a waiting side, which arrives as an ordinary turn nothing upstream gated - is metered by the router like any other turn; only a battle context DECLARED by the flow (which already paid for the duel) skips the router's gate.
 - `BEDROCK_USER_HOURLY_BUDGET`, `BEDROCK_GLOBAL_HOURLY_BUDGET` - hourly model-call ceilings.
 - `ABUSE_CIRCUIT_TRIP_THRESHOLD` - global count that flips the intake circuit. (The CDK context key that sets it is `bedrockCircuitTripThreshold`; the env var the Lambda reads is the name above.)
 - `BUDGET_CANNED_RESPONSE` - the high-demand reply text.

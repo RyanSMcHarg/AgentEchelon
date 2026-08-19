@@ -94,13 +94,15 @@ describe('the second completion door stays removed (source ratchets)', () => {
     const shadowMentions = region.match(/deliverable_shaped_without_declared_state/g) || [];
     expect(mentions.length).toBe(1);
     expect(shadowMentions.length).toBe(1);
-    // The generate assignment keys on the declared transition plus a minimum artifact size, and
-    // nothing text-shaped: the last remnant (solicitsInput, an English-opener phrase list deciding
-    // attach-vs-chat) is gone from the live gate. The 400-char floor is not a shape heuristic - a
-    // declared delivery below it still advances identically, its content just posts inline, because
-    // a one-sentence extraction shipped as a downloadable file buries the answer behind a click
-    // (measured live).
-    expect(region).toMatch(/generate = declaredDelivery && response\.trim\(\)\.length >= 400/);
+    // Two doors, both machine-anchored, plus the minimum artifact size: a DECLARED transition, or
+    // an in-state rewrite - a follow-up inside a delivering state has no legal transition to
+    // declare, and requiring one posted whole rewritten reports as chat walls. The in-state door
+    // carries the trailing-question veto, the one language-neutral structural residue of the
+    // retired heuristic (the live incident that demoted it ended with exactly such a question).
+    // The English-opener phrase list (solicitsInput) stays out of the live gate.
+    expect(region).toMatch(/generate = \(declaredDelivery \|\| inStateRewrite\) && trimmedResponse\.length >= 400/);
+    expect(region).toMatch(/deliveryStates\.includes\(startState\)/);
+    expect(region).toMatch(/transitions \?\? \[\]\)\.length === 0/);
     expect(region).not.toMatch(/solicitsInput/);
   });
 

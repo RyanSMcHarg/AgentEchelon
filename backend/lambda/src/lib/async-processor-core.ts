@@ -2247,7 +2247,13 @@ export async function handleProcessingError(
     // guard owns the correlation, and an error notice belongs on the message the user can still see.
     // Honors an explicit /battle-resume placeholder when nothing has claimed the correlation, so an
     // error on a resumed turn lands on the reused "waiting" message rather than a new one.
-    const messageId = await resolveDeliveryMessageId(event.correlationId, event.placeholderMessageId);
+    const messageId = await resolveDeliveryMessageId(event.correlationId, event.placeholderMessageId)
+      // The SAME last resort the success path keeps: when the mapping write failed or was throttled
+      // but the placeholder message exists in the channel, the mapping-only poll returns null and,
+      // without this scan, the guard below skipped the update entirely - the person's "One moment..."
+      // bubble sat forever with no error text, violating this function's own contract that a notice
+      // lands on the message the answer would have.
+      ?? await scanForPlaceholderMessage(event.channelArn, event.correlationId, event.botArn);
     if (messageId) {
       await updateMessage(
         event.channelArn,

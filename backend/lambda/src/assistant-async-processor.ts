@@ -1413,17 +1413,32 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
         const declaredDelivery = (taskContext?.transitions ?? []).some((t) =>
           deliveryStates.includes(t.to)
           || (deliveryStates.includes(t.from) && taskMachine?.states[t.to]?.terminal !== undefined));
+        // IN-STATE REWRITE: a follow-up inside a delivering state ("add a section on churn", asked
+        // while the task sits in `generating`/`revising`) legitimately re-produces the whole
+        // document with NO legal transition to declare, so a declaration-only gate posted the full
+        // rewritten report as an inline wall of chat text. Restored from the pre-contract shape with
+        // two guards the declared path does not need: the artifact floor below, and a
+        // trailing-question veto - the single structural residue of the retired heuristic, kept
+        // because the live incident that demoted it (a proposed outline ATTACHED as the report while
+        // still asking for approval) ended with exactly such a question, and end-punctuation is
+        // language-neutral where the English phrase list was not.
+        const trimmedResponse = response.trim();
+        const inStateRewrite =
+          startState !== undefined
+          && deliveryStates.includes(startState)
+          && (taskContext?.transitions ?? []).length === 0
+          && !/[?？؟]$/.test(trimmedResponse);
         // The 400-char floor is a MINIMUM ARTIFACT SIZE, not a return of the shape heuristic: a
-        // declared delivery below it still advances and completes identically, but its content posts
-        // as chat text instead of a file - a one-sentence extraction shipped as a downloadable
-        // document buries the answer behind a click (measured live: a single-fact codename landed as
-        // an attachment nobody asked for). Above the floor, the machine's declaration is the gate.
-        generate = declaredDelivery && response.trim().length >= 400;
+        // delivery below it still advances and completes identically, but its content posts as chat
+        // text instead of a file - a one-sentence extraction shipped as a downloadable document
+        // buries the answer behind a click (measured live: a single-fact codename landed as an
+        // attachment nobody asked for). Above the floor, the machine decides.
+        generate = (declaredDelivery || inStateRewrite) && trimmedResponse.length >= 400;
         // SHADOW: the retired heuristic, log-only (same treatment as shadowKeywordTransition). A
         // deliverable-shaped output with NO declared delivery transition is the model
         // under-declaring — the case the heuristic existed for — and is now measured instead of
         // silently acted on.
-        if (!declaredDelivery && isDeliverableDocument(response)) {
+        if (!declaredDelivery && !inStateRewrite && isDeliverableDocument(response)) {
           console.log('[AssistantAsyncProcessor][shadow] deliverable_shaped_without_declared_state', {
             taskId: event.taskId, taskType: event.taskType, state: startState ?? 'unknown',
           });

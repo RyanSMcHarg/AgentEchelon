@@ -448,11 +448,13 @@ A classification experiment cannot run alongside an intent or base-model experim
           │
           ▼
   API Gateway → presigned-url Lambda
-  (generates S3 PutObject presigned URL, 1-hour default expiry)
+  (creates an S3 presigned POST: a policy whose content-length-range
+  is a true 1..10MiB cap, with type/encryption/metadata pinned as
+  policy conditions; 1-hour default expiry)
           │
           ▼
   attachmentService.ts: uploadToS3()
-  (PUT file to S3 via presigned URL)
+  (POST the signed policy fields + file to S3 as multipart form data)
           │
           ▼
   Message sent with attachment in Amazon Chime SDK message metadata:

@@ -520,6 +520,15 @@ export async function handler(event: ChannelFlowEvent): Promise<void> {
   // one container's memory - so both attempts believed they were the first. `claimCorrelation` is the
   // same conditional write the processor and the round-1 fan-out already claim with, and it FAILS OPEN:
   // a dedup-table outage degrades to today's duplicate rather than dropping a turn.
+  //
+  // CLAIM-BEFORE-DISPATCH, AND THE WINDOW THAT LEAVES - stated because it is a decided trade, not an
+  // oversight. A winner that dies BETWEEN this claim and its dispatch makes the redelivery no-op, and
+  // that turn is lost. Bounded on both sides: the claim carries the dedup TTL (5 minutes - only
+  // redeliveries inside it are swallowed, and Chime redelivers within seconds), and the window itself
+  // is a hard crash only - every dispatch path that can FAIL (router invoke, membership read, missing
+  // router) now notifies the sender instead of throwing through. Claiming after dispatch instead
+  // would reopen the double-answer this claim exists to prevent, which is the worse direction: a
+  // duplicate is visible and confusing, a rare lost turn is retryable by the person.
   const usesBypass = mentionsAll || invokesBattle || continuation !== null;
   if (usesBypass && !(await claimCorrelation(flowDeliveryKey(MessageId)))) {
     console.log('[ChannelFlow] duplicate delivery; this message is already handled', { messageId: MessageId });

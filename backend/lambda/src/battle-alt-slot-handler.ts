@@ -202,6 +202,12 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
   }
 
   try {
+    // BOUNDED INSIDE LEX'S OWN WINDOW. The Lex code-hook wait is 30s; an invoke allowed to run
+    // longer answers nobody while Lex surfaces a visible error. Aborting at 25s keeps the degrade
+    // on OUR silent path - and the router has usually dispatched its worker by then, so the answer
+    // often still arrives via the placeholder it posted.
+    const abort = new AbortController();
+    const abortTimer = setTimeout(() => abort.abort(), 25_000);
     const result = await lambdaClient.send(new InvokeCommand({
       FunctionName: routerArn,
       InvocationType: InvocationType.RequestResponse,
@@ -218,7 +224,8 @@ export const handler = async (event: LexEvent): Promise<LexResponse> => {
             : {}),
         },
       })),
-    }));
+    }), { abortSignal: abort.signal });
+    clearTimeout(abortTimer);
     const payload = result.Payload ? JSON.parse(Buffer.from(result.Payload).toString()) : null;
     if (payload?.sessionState && Array.isArray(payload?.messages)) {
       console.log('[BattleAltSlot] turn handed to the router', {

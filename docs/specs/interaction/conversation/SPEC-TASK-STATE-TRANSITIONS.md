@@ -74,7 +74,16 @@ terminal?, awaitsUser? }`:
 
 - `transitions: []` marks a **terminal** state, and `terminal` records its outcome
   (`success` | `failure` | `handoff`);
-- `awaitsUser: true` marks a state blocked on the PERSON, which is what moves ownership to them.
+- `awaitsUser: true` marks a state blocked on the PERSON, which is what moves ownership to them;
+- `delivers: true` marks a state a document-producing workflow hands its file back from. The
+  attachment gate derives its delivery states from the merged machines (never a hardcoded list a
+  per-deployment machine could not match), and a file is generated when the turn **declares** a
+  transition into a delivering state or from one to a terminal, or when a follow-up **inside** a
+  delivering state re-produces the document with no legal transition to declare (guarded by a
+  trailing-question veto, since a turn that ends by asking is not delivering). Below the 400-char
+  minimum artifact size the content posts inline instead - the task advances identically either
+  way; only the packaging differs. Task creation resolves the initial state from the same merged
+  machines, so a pack-declared task type is never created stateless.
 
 ## 5. Proposals drive their own edges
 
