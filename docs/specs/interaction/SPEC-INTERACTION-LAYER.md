@@ -4,6 +4,8 @@
 
 **Status:** Design overview.
 
+**Coverage:** none - a design overview that owns no behaviour of its own; each pillar spec it maps declares its own coverage.
+
 AgentEchelon today serves internal-collaboration use cases where one or more people interact with an assistant. Users and assistants are restricted to the data and models their specific role or use case requires, managed through an interaction layer that sits between the frontend surfaces (web, voice, and SMS) and the backend to control access at multiple levels. Because AgentEchelon is built on AWS services at its core, it enforces this with AWS primitives: a defense-in-depth approach that blocks restricted features in real time through both application code and infrastructure, and produces an automated audit trail of access and control changes. Five pillars accomplish this:
 
 - **Message flow (how a turn travels the layers)** - `docs/guides/developer/MESSAGE-FLOW.md` (channel flow / Lex / `@all` / fulfillment / async processor, and where each control acts)

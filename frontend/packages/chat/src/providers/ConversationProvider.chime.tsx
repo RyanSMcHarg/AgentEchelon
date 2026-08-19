@@ -1,5 +1,6 @@
 import { createContext, useContext, useState, useEffect, useRef, useCallback, type ReactNode, useMemo } from 'react';
 import type { Conversation, Message, UserTier, Attachment, ChannelMember, StickyMentionTarget } from '@ae/shared';
+import { fetchOpenWorkItems, type OpenWorkItem } from '../services/openWorkItemService';
 import { useAuth } from '@ae/shared';
 import { useAwsClient } from './AwsClientProvider';
 import { useMessaging } from './MessagingProvider';
@@ -41,7 +42,7 @@ interface ConversationContextType {
   sendMessage: (
     content: string,
     attachment?: Attachment,
-    options?: { targetArn?: string; mentionBotArn?: string },
+    options?: { targetArn?: string; mentionBotArn?: string; taskId?: string },
   ) => Promise<void>;
   shareConversation: (recipientEmail: string) => Promise<ShareConversationResult>;
   deleteConversation: (conversationId: string) => void;
@@ -61,6 +62,13 @@ interface ConversationContextType {
    *  is message order so the LAST entry is the most-recent waiter
    *  (composer default selection, SPEC-BATTLE.md §"Per-bot reply UX"). */
   battleWaitingBots: Array<{ botArn: string; battleId: string }>;
+  /** Work items this user OWNS, across every conversation, oldest first (GET /tasks/mine).
+   *  This is the cross-conversation half of "waiting on you": battleWaitingBots derives from the
+   *  loaded channel's messages, so the item a user is most likely to have forgotten - the one in a
+   *  conversation they are not looking at - is exactly the one it cannot show. */
+  openWorkItems: OpenWorkItem[];
+  /** Re-read the queue. Called after a send, because answering is what closes an item. */
+  refreshOpenWorkItems: () => void;
 }
 
 const ConversationContext = createContext<ConversationContextType | undefined>(undefined);
@@ -86,7 +94,7 @@ function reflectConversationInUrl(conversationId: string | null): void {
 export function ConversationProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
   const { isInitialized } = useAwsClient();
-  const { subscribe, unsubscribe, setGlobalListener } = useMessaging();
+  const { setChannelListener, setGlobalListener } = useMessaging();
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversation, setActiveConversation] = useState<Conversation | null>(null);
@@ -98,6 +106,16 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   const [sendError, setSendError] = useState<string | null>(null);
   const [channelMembers, setChannelMembers] = useState<ChannelMember[]>([]);
   const [stickyTarget, setStickyTarget] = useState<StickyMentionTarget | null>(null);
+
+  // A sticky target belongs to the conversation it was set in. It is set from a mention the user
+  // JUST SENT, so carrying it into a different conversation asserts a targeted exchange that never
+  // happened there - and the composer then prepends `@Name ` to everything the user types, often
+  // naming a member of the OTHER channel entirely. Keyed on the ARN so a rename or archive, which
+  // replaces the conversation object without changing which conversation is open, does not clear it.
+  useEffect(() => {
+    setStickyTarget(null);
+  }, [activeConversation?.conversationArn]);
+
   const channelMembersRef = useRef<ChannelMember[]>([]);
   channelMembersRef.current = channelMembers;
   // In-session viewedAt map. channelArn -> millis timestamp. Combined with
@@ -112,6 +130,69 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
 
   const activeConversationRef = useRef<Conversation | null>(null);
   activeConversationRef.current = activeConversation;
+
+  // Live view of the rendered messages, so the create-time reconcile can tell "already delivered"
+  // from "still missing" without re-running on every state change.
+  const messagesRef = useRef<Message[]>([]);
+  messagesRef.current = messages;
+
+  /**
+   * Swap the active conversation, updating the ref SYNCHRONOUSLY as well as the state.
+   *
+   * The channel-event handler reads this ref to decide what to render. React commits state on the
+   * next render, so setting state alone leaves a window - short, but real - in which the ref still
+   * names the PREVIOUS conversation and an arriving message is discarded as "not active". That is
+   * the same class of defect as the create-then-subscribe window this refactor removed, so it is
+   * closed the same way rather than left as a smaller version of it.
+   *
+   * The render-time assignment above remains the source of truth for subsequent renders; this only
+   * makes the handoff atomic.
+   */
+  const setActiveConversationNow = useCallback((conv: Conversation | null) => {
+    activeConversationRef.current = conv;
+    setActiveConversation(conv);
+  }, []);
+
+  /**
+   * Recover the assistant's on-add welcome if neither the socket nor the initial load caught it.
+   * See the call site in createConversation for why that window exists and cannot be closed by
+   * listener design alone.
+   *
+   * Bounded and self-cancelling: it stops at the first assistant message, when the user navigates
+   * away, or after the budget. Merges by id so an optimistic user message is never dropped, and
+   * only ever ADDS - it cannot remove a message the socket delivered.
+   */
+  const reconcileNewConversationWelcome = useCallback(async (channelArn: string) => {
+    const DELAYS_MS = [400, 800, 1500, 2500, 4000];
+
+    for (const delay of DELAYS_MS) {
+      await new Promise((r) => setTimeout(r, delay));
+      // Navigated away, or the socket delivered it while we waited.
+      if (activeConversationRef.current?.conversationArn !== channelArn) return;
+      if (messagesRef.current.some((m) => m.isBot)) return;
+
+      try {
+        const fetched = await chimeService.listMessages(channelArn);
+        if (activeConversationRef.current?.conversationArn !== channelArn) return;
+        if (!fetched.some((m) => m.isBot)) continue;
+
+        setMessages((prev) => {
+          const seen = new Set(prev.map((m) => m.id));
+          const missing = fetched.filter((m) => !seen.has(m.id));
+          if (missing.length === 0) return prev;
+          console.warn(
+            `[ConversationProvider] recovered ${missing.length} message(s) missed during conversation create`,
+          );
+          return [...prev, ...missing].sort(
+            (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+          );
+        });
+        return;
+      } catch (err) {
+        console.warn('[ConversationProvider] welcome reconcile attempt failed:', err);
+      }
+    }
+  }, []);
 
   // Load conversations when AWS clients are initialized
   useEffect(() => {
@@ -381,10 +462,6 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         // Waiting is undefined → it must clear here. That clearing IS
         // the "waiting ended" signal the composer affordance keys off.
         battleWaiting: msg.battleWaiting,
-        // Generation-out: the image marker rides the placeholder UPDATE
-        // (PLACEHOLDER_UPDATE), so msg.battleImage is the authoritative
-        // source; fall back to any existing value defensively.
-        battleImage: msg.battleImage ?? updated[idx].battleImage,
         activeTask: msg.activeTask,
         attachment: msg.attachment ?? updated[idx].attachment,
         modelId: msg.modelId ?? updated[idx].modelId,
@@ -435,12 +512,43 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const selectConversation = useCallback(async (conversationId: string) => {
-    const prev = activeConversationRef.current;
-    if (prev) {
-      unsubscribe(prev.conversationArn);
-    }
+  /**
+   * The single channel-event handler, registered once for the whole app.
+   *
+   * Every event carries its `channelArn` and we branch on the live active-conversation ref: render
+   * it, or ignore it (the global listener owns unread bookkeeping for the other channels). That
+   * branch is the same guard the old per-conversation callbacks each carried to stop a previous
+   * channel's in-flight reply rendering into a newly opened chat - expressed once, in the only place
+   * that knows which conversation is current, instead of re-derived at every subscribe site.
+   *
+   * Registering once is what removes the create-then-subscribe window: the handler exists before any
+   * conversation does, so a welcome posted moments after CreateChannel always has somewhere to land.
+   * Channel RENAMES are deliberately NOT gated on the active conversation - a title derived for a
+   * background conversation should still update its sidebar entry.
+   */
+  useEffect(() => {
+    const isActive = (channelArn: string) =>
+      activeConversationRef.current?.conversationArn === channelArn;
 
+    setChannelListener({
+      onMessageCreate: (channelArn, msg) => { if (isActive(channelArn)) handleMessageCreate(msg); },
+      onMessageUpdate: (channelArn, msg) => { if (isActive(channelArn)) handleMessageUpdate(msg); },
+      onMessageDelete: (channelArn, msgId) => { if (isActive(channelArn)) handleMessageDelete(msgId); },
+      onMembershipChange: (channelArn) => { if (isActive(channelArn)) handleMembershipChange(); },
+      onChannelUpdate: (channelArn, name) => handleChannelUpdate(channelArn, name),
+    });
+
+    return () => setChannelListener(null);
+  }, [
+    setChannelListener,
+    handleMessageCreate,
+    handleMessageUpdate,
+    handleMessageDelete,
+    handleMembershipChange,
+    handleChannelUpdate,
+  ]);
+
+  const selectConversation = useCallback(async (conversationId: string) => {
     let conversation = conversations.find((c) => c.id === conversationId);
     if (!conversation) {
       // Not in the loaded (paginated) list — e.g. deep-linked from a share or
@@ -463,9 +571,20 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         clearTimeout(botTypingTimeoutRef.current);
         botTypingTimeoutRef.current = undefined;
       }
-      setActiveConversation(conversation);
+      setActiveConversationNow(conversation);
+      // Drop the OUTGOING conversation's roster before the new one is fetched.
+      //
+      // Members were only ever replaced once the fetch resolved, so between the switch and that
+      // response the panel kept rendering the PREVIOUS conversation's members - a roster that belongs
+      // to a different conversation, shown as though it were this one. On a slow fetch, or if the
+      // fetch failed (the catch below cleared messages but not members), it stayed wrong.
+      //
+      // Empty is the honest intermediate state: this conversation's membership is not known yet.
+      setChannelMembers([]);
       reflectConversationInUrl(conversation.id); // shareable/bookmarkable URL; reload reopens it
-      setStickyTarget(null);
+      // The sticky target is cleared by the ARN-keyed effect, not here: this clear ran on EVERY
+      // select, so re-opening the conversation already open (clicking it again in the sidebar)
+      // dropped a mention the user was still addressing.
 
       // Mark as read: local viewedAt stamp (immediate) + Chime read
       // marker (authoritative, eventual). Also clear any pending
@@ -487,41 +606,18 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       setMessages(conversationMessages);
       setChannelMembers(members);
 
-      // Defensive belt-and-suspenders (mirrors createConversation): guard
-      // each callback against the live activeConversation so a late event
-      // arriving after a switch can't leak into the wrong chat.
-      const arn = conversation.conversationArn;
-      subscribe(arn, {
-        onMessageCreate: (msg) => {
-          if (activeConversationRef.current?.conversationArn !== arn) return;
-          handleMessageCreate(msg);
-        },
-        onMessageUpdate: (msg) => {
-          if (activeConversationRef.current?.conversationArn !== arn) return;
-          handleMessageUpdate(msg);
-        },
-        onMessageDelete: (id) => {
-          if (activeConversationRef.current?.conversationArn !== arn) return;
-          handleMessageDelete(id);
-        },
-        onMembershipChange: () => {
-          if (activeConversationRef.current?.conversationArn !== arn) return;
-          handleMembershipChange();
-        },
-        onChannelUpdate: (name) => {
-          // No active-conversation guard: a rename can land while the
-          // user is on a different chat and we still want the sidebar
-          // entry to update.
-          handleChannelUpdate(arn, name);
-        },
-      });
+      // No per-channel subscription: the app-level handler is already live and branches on the
+      // active-conversation ref, which this flow has just set.
     } catch (error) {
       console.error('Failed to load messages:', error);
       setMessages([]);
+      // Members too: a failed load must not leave the previous conversation's roster standing in for
+      // this one. Clearing messages but not members is what let a stale roster survive an error.
+      setChannelMembers([]);
     } finally {
       setIsLoadingMessages(false);
     }
-  }, [conversations, subscribe, unsubscribe, handleMessageCreate, handleMessageUpdate, handleMessageDelete, handleMembershipChange, handleChannelUpdate]);
+  }, [conversations]);
 
   // Keep selectConversationRef pointing at the latest callback so the
   // notification click handler routes correctly even after re-renders.
@@ -542,14 +638,11 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
 
       const newConversation = await chimeService.createConversation(title, modelId, modelName, modelTier, topic);
 
-      // J: cross-chat leak. createConversation was missing the
-      // unsubscribe(prev) that selectConversation does — so the previous
-      // channel's subscription stayed alive and its in-flight battle
-      // reply rendered into the just-opened new chat. Mirror the switch
-      // pattern: drop the prior subscription before swapping active.
-      const prevConv = activeConversationRef.current;
-      if (prevConv) unsubscribe(prevConv.conversationArn);
-
+      // J (cross-chat leak) is now structural rather than a step that can be forgotten: the single
+      // handler renders only the ACTIVE conversation, so a previous channel's in-flight battle
+      // reply can no longer land in the just-opened chat. That was originally fixed by mirroring
+      // selectConversation's unsubscribe(prev) here - the bug being that it was easy to omit.
+      //
       // Mask the swap window exactly like selectConversation: clear the
       // outgoing conversation's messages and raise the loading flag BEFORE
       // swapping active. Without this, the previous conversation's messages
@@ -569,39 +662,28 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       }
 
       setConversations((prev) => [newConversation, ...prev]);
-      setActiveConversation(newConversation);
-
-      // Defensive belt-and-suspenders: guard each callback against the
-      // live activeConversation so a future missed-unsubscribe (or a
-      // late event arriving after a switch) can't leak into the wrong
-      // chat. The subscribed-arn is captured in closure.
-      const arn = newConversation.conversationArn;
-      subscribe(arn, {
-        onMessageCreate: (msg) => {
-          if (activeConversationRef.current?.conversationArn !== arn) return;
-          handleMessageCreate(msg);
-        },
-        onMessageUpdate: (msg) => {
-          if (activeConversationRef.current?.conversationArn !== arn) return;
-          handleMessageUpdate(msg);
-        },
-        onMessageDelete: (id) => {
-          if (activeConversationRef.current?.conversationArn !== arn) return;
-          handleMessageDelete(id);
-        },
-        onMembershipChange: () => {
-          if (activeConversationRef.current?.conversationArn !== arn) return;
-          handleMembershipChange();
-        },
-        onChannelUpdate: (name) => {
-          handleChannelUpdate(arn, name);
-        },
-      });
+      setActiveConversationNow(newConversation);
 
       // Greeting is rendered client-side as an empty-state — see
       // utils/greeting.ts and the empty branch in ConversationInterface.
       const conversationMessages = await chimeService.listMessages(newConversation.conversationArn);
       setMessages(conversationMessages);
+
+      // CREATE-TIME RECONCILE. One window survives the app-level handler, and it is inherent to
+      // creation rather than to any listener design:
+      //
+      // The assistant's welcome fires when the BOT IS ADDED, which happens INSIDE
+      // chimeService.createConversation() above. So it can be posted before that call returns -
+      // before this client has the channel ARN at all. At that instant no active-conversation ref
+      // can match it, so the handler correctly ignores it. The listMessages() above should then
+      // catch it, but Chime's ListChannelMessages is eventually consistent and runs milliseconds
+      // later, so it can miss it too. The result is the symptom this chased for days: an empty
+      // conversation carrying an unread dot in the user's own sidebar, because the global
+      // (ARN-agnostic) listener saw the message while the rendering path did not.
+      //
+      // So poll briefly for the assistant's first message, and stop the moment it appears. On the
+      // healthy path the socket has already delivered it and the first check exits immediately.
+      void reconcileNewConversationWelcome(newConversation.conversationArn);
       trackEvent('conversation_created', { modelId, modelName, modelTier });
     } catch (error) {
       console.error('Failed to create conversation:', error);
@@ -611,12 +693,12 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       // been applied, so the client-side greeting empty-state renders.
       setIsLoadingMessages(false);
     }
-  }, [user, subscribe, unsubscribe, handleMessageCreate, handleMessageUpdate, handleMessageDelete, handleMembershipChange]);
+  }, [user]);
 
   const sendMessage = useCallback(async (
     content: string,
     attachment?: Attachment,
-    options?: { targetArn?: string; mentionBotArn?: string },
+    options?: { targetArn?: string; mentionBotArn?: string; taskId?: string },
   ): Promise<void> => {
     if (!activeConversationRef.current || !user) return;
 
@@ -624,7 +706,19 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       setIsSending(true);
       setSendError(null);
 
-      const metadata = attachment ? { attachment } : undefined;
+      // THE TASK REFERENCE, when this message answers a work item (ADR-032). It rides the same
+      // metadata blob as an attachment because it is the same kind of fact: something about the
+      // message that the message text does not say.
+      //
+      // It is NOT how the assistant is reached - `options.targetArn` is, and it is what makes the
+      // message arrive. The reference exists so a message that arrived at NOBODY can be detected
+      // afterwards, off the message stream, and dispatched late instead of stranding. A repair that
+      // fires is counted, so the client failing to address a task answer stays visible.
+      //
+      // THE TASK ID AND NOTHING ELSE. The task already records which assistant owns it, so naming
+      // one here would be a second source for one fact, free to disagree with the row it describes.
+      const task = options?.taskId ? { task: { id: options.taskId } } : undefined;
+      const metadata = attachment || task ? { ...(attachment ? { attachment } : {}), ...task } : undefined;
       const userMessage = await chimeService.sendMessage(
         activeConversationRef.current.conversationArn,
         content,
@@ -665,14 +759,16 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     setConversations((prev) => prev.filter((c) => c.id !== conversationId));
 
     if (activeConversationRef.current?.id === conversationId) {
-      if (activeConversationRef.current) {
-        unsubscribe(activeConversationRef.current.conversationArn);
-      }
-      setActiveConversation(null);
+      // Clearing active is the whole deselect: with one app-level handler branching on the active
+      // ref, nothing further arrives for this channel once it is no longer current. Uses the atomic
+      // setter so the REF clears now rather than at the next commit - the handler reads the ref, so
+      // a late CREATE_CHANNEL_MESSAGE arriving in that window would still match this channel and
+      // repopulate the list immediately after setMessages([]).
+      setActiveConversationNow(null);
       reflectConversationInUrl(null); // the open conversation was deleted — drop it from the URL
       setMessages([]);
     }
-  }, [unsubscribe]);
+  }, []);
 
   // Resolve a conversation's channel ARN from the current list (or the active one).
   const resolveArn = useCallback((conversationId: string): string | undefined => {
@@ -754,6 +850,35 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   // message still carrying it ⇒ that bot is genuinely waiting. Keyed by
   // botArn (one waiting placeholder per bot); Map insertion = message
   // order, so the last value is the most-recent waiter.
+  // The user's own open items, across every conversation. Polled rather than pushed: an item can be
+  // opened by an assistant in a channel this client is not subscribed to, so there is no event here to
+  // listen for. The interval is deliberately slow - this is an ambient reminder, not a live feed - and
+  // a send refreshes it immediately, because answering is what closes an item.
+  const [openWorkItems, setOpenWorkItems] = useState<OpenWorkItem[]>([]);
+  const refreshOpenWorkItems = useCallback(() => {
+    void fetchOpenWorkItems().then((items) => {
+      // KEEP REFERENTIAL IDENTITY when nothing changed. openWorkItems is a dependency of the
+      // provider-value useMemo, so a freshly parsed (always-new) array here invalidated the context
+      // value and re-rendered every useConversations consumer once a minute even when the queue was
+      // identical. The fingerprint covers identity, state and freshness - anything the UI renders
+      // moves at least one of these.
+      setOpenWorkItems((prev) => {
+        const fingerprint = (list: OpenWorkItem[]) =>
+          list.map((i) => `${i.taskId}|${i.status}|${i.taskState ?? ''}|${i.updatedAt ?? ''}`).join('\n');
+        return fingerprint(prev) === fingerprint(items) ? prev : items;
+      });
+    });
+  }, []);
+  useEffect(() => {
+    if (!user) {
+      setOpenWorkItems([]);
+      return;
+    }
+    refreshOpenWorkItems();
+    const timer = setInterval(refreshOpenWorkItems, 60_000);
+    return () => clearInterval(timer);
+  }, [user, refreshOpenWorkItems]);
+
   const battleWaitingBots = useMemo(() => {
     const byBot = new Map<string, { botArn: string; battleId: string }>();
     for (const m of messages) {
@@ -764,15 +889,16 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
 
   // Deselect the active conversation (return to the list) without removing it —
   // the mobile Back affordance. Unlike deleteConversation it deletes nothing; it
-  // just unsubscribes the live view and clears the detail pane, matching the
-  // deselect half of the delete/select flows. Re-selecting re-subscribes.
+  // just clears the detail pane, matching the deselect half of the delete/select
+  // flows. Clearing active is sufficient: the app-level handler renders only the
+  // active conversation, so nothing further lands here until it is reselected.
   const clearActiveConversation = useCallback(() => {
-    const current = activeConversationRef.current;
-    if (current) unsubscribe(current.conversationArn);
-    setActiveConversation(null);
+    // Atomic, for the same reason as the delete path: the app-level handler branches on the ref, so
+    // leaving it pointing at the closed conversation keeps a late message eligible to render.
+    setActiveConversationNow(null);
     reflectConversationInUrl(null); // back to the list — clear the conversation from the URL
     setMessages([]);
-  }, [unsubscribe]);
+  }, []);
 
   const value: ConversationContextType = useMemo(() => ({
     conversations,
@@ -798,6 +924,8 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     stickyTarget,
     setStickyTarget,
     battleWaitingBots,
+    openWorkItems,
+    refreshOpenWorkItems,
   }), [
     conversations, activeConversation, messages, isLoadingMessages,
     isInitializing, isSending, isBotTyping, sendError, channelMembers,
@@ -806,6 +934,8 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     deleteConversation, archiveConversation, leaveConversation, renameConversation, clearSendError,
     stickyTarget,
     battleWaitingBots,
+    openWorkItems,
+    refreshOpenWorkItems,
   ]);
 
   return <ConversationContext.Provider value={value}>{children}</ConversationContext.Provider>;

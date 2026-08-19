@@ -2,6 +2,8 @@
 
 **Status:** Partial (the `classification` type seam and the dimension/connector schemas ship and default to the profile today; the full conversation-type flexibility is the design target).
 
+**Coverage:** `e2e/classification-context.spec.ts`
+
 **Problem and who it's for:** A support case, a sales engagement, a scheduled service visit, and an incident room are all "a conversation," yet each needs different participants, assistant, transports, access, and external systems - and teams want to stand up and tailor each experience by configuration, not by writing and shipping new handler code (or a separate bespoke app) for every one. This is for the AI developer and admin/operator who add or tailor experiences by config. It captures that policy as data: a conversation type is the composition root that names which assistant, which access, which connectors, and which capabilities an experience gets, so handlers read dimension fields instead of branching on type.
 
 **Site section:** Interaction layer, Conversation Configuration pillar (composition root).
@@ -41,9 +43,10 @@ Each maps onto the connector capability contract (§6). Adding one is a new `Con
 A conversation type is a named bundle that **composes orthogonal dimensions**, each with a safe default. Handlers never `switch (type)` - they read dimension fields and call generic engines, so a new experience recombines existing dimensions (and a genuinely new behavior is a new *dimension*, added once). The shipped schema (`conversation-types.ts`):
 
 ```ts
+// backend/lib/config/conversation-types.ts. The type KEY is the key of the map these are stored
+// under (CONVERSATION_TYPES['support']), not a field on the config - deployers still add types freely.
 interface ConversationTypeConfig {
-  key: string;                 // open string - deployers add types freely
-  classification: ModelTier;   // CLOSED, ordered - the one IAM-evaluated axis (§4a)
+  classification: Classification;   // CLOSED, ordered - the one IAM-evaluated axis (§4a)
 
   // optional, defaulted, composable dimensions:
   initiation?: 'user'|'system'|'schedule'|'alert';  // who/what starts it (default 'user')
@@ -52,6 +55,11 @@ interface ConversationTypeConfig {
   capabilities?: { tasks?: boolean; battle?: boolean; [k]: boolean };
   driftEnabled: boolean;                             // topic-drift suggestion on/off (shipped)
   participants?: ParticipantPolicy;                  // who joins + how non-creator humans are resolved
+  welcome?: {                                        // how this type OPENS a conversation (§4c)
+    mode?: 'interpolated' | 'generated';             //   default 'interpolated' (no model call)
+    template?: string;                               //   default: the built-in clause assembly
+    contextKeys?: string[];                          //   context sources that orient the welcome
+  };
   connectors?: ConnectorRef[];                       // external vendor systems (§6)
   offboardMode?: 'delete' | 'deactivate';            // how a departed member appears in history
   expiration?: { days: number; criterion: 'CREATED_TIMESTAMP'|'LAST_MESSAGE_TIMESTAMP' };  // default channel TTL → Amazon Chime SDK ExpirationSettings (SPEC-ACCESS-AND-CONTROLS-AUDITING §4c, toggle 2)
@@ -64,6 +72,15 @@ Access is gated by a small, **ordered, closed** set of security classifications 
 
 ### 4b. The conversation is the hub
 The conversation (an Amazon Chime SDK channel + its metadata/context) is the **runtime hub** every transport and connector attaches to: non-chat transports (voice/SMS/meeting) and external systems post their artifacts (summaries, structured cards) **back into the conversation** and link external records by reference (`ExternalRef`). So "history attached to the conversation" needs no separate aggregate store - the channel is the conversation, and everything attaches to it. A conversation-matcher routes inbound external comms to the right conversation. (`channel-creation.ts` stamps `parentChannelArn`/`createdViaDrift`.)
+
+### 4c. How a type opens a conversation
+A support case, a drift follow-up, and an alert-triggered incident room should not open the same way, and the difference is not which handler runs. It is which context orients the opening and what the opening emphasises, so it is `welcome` on the type:
+
+- **`contextKeys`** name the context sources that orient this type's welcome, resolved against the published catalog. A drift follow-up adds the previous conversation's subject; an incident room adds incident state. Sources compose additively, so a drift conversation still knows which company it is in. A source whose `availability` is unmet at `WelcomeIntent` is omitted, never awaited (see SPEC-WELCOME-AND-CONTEXT).
+- **`template`** is the copy shape. Absent, the built-in clause assembly is used, so an un-configured type is unchanged.
+- **`mode`** decides how the template becomes copy. `interpolated` substitutes the assembled orientation with no model call: deterministic, and the fallback that keeps the welcome landing. `generated` has the assistant fill in and adjust the template against the context it was given, which is what a type carrying arbitrary state (an incident) needs, since no template can summarise state it has never seen. `generated` costs a model call per new conversation, brings the output guardrail onto the welcome, and falls back to `interpolated` on a deadline miss or when the model is unavailable.
+
+An unrecognised `mode` degrades to `interpolated` rather than to `generated`: failing towards the deterministic path costs richness, while failing the other way would spend a model call on every new conversation because of a config typo.
 
 ## 5. How it composes with the other pillars
 

@@ -110,6 +110,10 @@ function classifyError(error: unknown): { action: ErrorAction; reason: string } 
 
 export interface ResilientInvokeResult {
   response: string;
+  /** The INPUT guardrail blocked this turn before any model ran; `response` is block copy, not an
+   *  answer. Structural, flowing through from invokeBedrock via `...result` - consumers must never
+   *  re-derive this from the reply's text shape (custom blockedInputMessaging defeats that). */
+  inputGuardBlocked?: boolean;
   inputTokens: number;
   outputTokens: number;
   bedrockTime: number;

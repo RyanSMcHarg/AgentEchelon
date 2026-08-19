@@ -4,7 +4,7 @@
  * The assistant embeds machine-readable control markers in a message's Content
  * so the frontend can render UI deterministically (navigate to a channel, show a
  * battle scorecard, render suggestion cards, attach a generated image, etc.).
- * The SPA parses + strips them in `frontend/src/utils/messageParser.ts`
+ * The SPA parses + strips them in `frontend/packages/shared/src/utils/messageParser.ts`
  * (parseMessageContent) so the human never sees them. Everything that reads the
  * message text for a *non-UI* purpose — analytics, the LLM relevance judge, the
  * admin conversation browser — must strip the SAME markers, or the raw marker
@@ -13,7 +13,7 @@
  * This module is the single backend source of truth for that set, mirroring the
  * SPA parser. Two shapes:
  *   - HTML-comment markers: `<!--ACTIVE_TASK:…-->`, `<!--battle:…-->`,
- *     `<!--battlestats:…-->`, `<!--battlewaiting:…-->`, `<!--battleimage:…-->`,
+ *     `<!--battlestats:…-->`, `<!--battlewaiting:…-->`,
  *     `<!--corr:…-->`, `<!--proposal:…-->`, `<!--sources:…-->`,
  *     `<!--suggestions:…-->`. The assistant never emits HTML comments as real
  *     content, so we strip ALL `<!--…-->` comments — this also auto-covers any

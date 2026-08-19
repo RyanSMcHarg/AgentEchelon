@@ -15,12 +15,16 @@ import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import * as path from 'path';
+import { sesSenderIdentityArns } from '../ses-identity';
 import {
   SSM_ROOT,
   STACK_PREFIX,
   INSTANCE_SSM,
   processorArnKey,
+  routerArnKey,
   CHANNEL_FLOW_ARN_SSM_KEY,
+  resolveSharedSSM,
+  abuseControlsWiring,
 } from './agent-classification-common';
 
 /** SSM parameter key for the channel flow ARN. Read at runtime by create-conversation
@@ -63,10 +67,32 @@ export class ChannelFlowStack extends cdk.Stack {
     // @all fan-out and /battle target the per-classification async-processors
     // (AgentEchelonClassification-{Standard,Premium}), resolved at deploy from the SSM
     // contract those stacks publish (dynamic ref, not Fn::importValue).
+    const basicProcessorArn = ssm.StringParameter.valueForStringParameter(
+      this, processorArnKey('basic'));
     const standardProcessorArn = ssm.StringParameter.valueForStringParameter(
       this, processorArnKey('standard'));
     const premiumProcessorArn = ssm.StringParameter.valueForStringParameter(
       this, processorArnKey('premium'));
+    // The per-classification ROUTER (`router-agent-handler`). `@all` hands the turn to it rather than
+    // running the turn itself (MESSAGE-FLOW §3.1), so the flow needs the same three-way routing table
+    // it already has for processors. Published by the classification stacks alongside processor-arn;
+    // no new SSM contract.
+    const basicRouterArn = ssm.StringParameter.valueForStringParameter(
+      this, routerArnKey('basic'));
+    const standardRouterArn = ssm.StringParameter.valueForStringParameter(
+      this, routerArnKey('standard'));
+    const premiumRouterArn = ssm.StringParameter.valueForStringParameter(
+      this, routerArnKey('premium'));
+
+    // Abuse-controls plane (SPEC-ABUSE-CONTROLS). @all/@assistant mentions and /battle fan-outs are
+    // dispatched HERE, before the Lex router that gates the 1:1 tier turn - so the channel-flow
+    // processor must enforce the SAME per-user rate limit + per-user/global spend budget, or a group
+    // channel becomes a budget-bypass path to the model. Same shared control table + budget envs the
+    // classification processors wire; the `classification` arg is unused by the helper (this shared
+    // flow discovers classification per message at runtime), so any value is fine.
+    const shared = resolveSharedSSM(this);
+    const abuse = abuseControlsWiring(
+      this, shared.abuseControlsArn, shared.abuseControlsName, 'standard', this.region, this.account);
 
     // ============================================================
     // Channel Flow Processor Lambda
@@ -123,8 +149,8 @@ export class ChannelFlowStack extends cdk.Stack {
             }),
           ],
         }),
-        // @all fan-out → classification standard processor; /battle fan-out → classification
-        // premium processor. Both are ${STACK_PREFIX}Classification-* functions.
+        // @all hands off to the classification ROUTER; /battle fans out to the classification
+        // processor. Both are ${STACK_PREFIX}Classification-* functions, so one wildcard covers them.
         LambdaInvokePolicy: new iam.PolicyDocument({
           statements: [
             new iam.PolicyStatement({
@@ -184,7 +210,11 @@ export class ChannelFlowStack extends cdk.Stack {
           NotifyBridgePolicy: new iam.PolicyDocument({
             statements: [
               new iam.PolicyStatement({
-                actions: ['cognito-idp:AdminGetUser'],
+                // AdminListGroupsForUser: the /battle and @all abuse gate meters the sender at
+                // min(channel, clearance) - the same rule the router applies to ordinary turns -
+                // and clearance is derived from the server-verified group list. Primary pool only:
+                // clearance is an AE-pool concept, and federated senders never reach the lookup.
+                actions: ['cognito-idp:AdminGetUser', 'cognito-idp:AdminListGroupsForUser'],
                 resources: [...new Set([props.userPoolId, ...(props.additionalUserPoolIds || [])])].map(
                   (poolId) => `arn:aws:cognito-idp:${this.region}:${this.account}:userpool/${poolId}`,
                 ),
@@ -193,10 +223,13 @@ export class ChannelFlowStack extends cdk.Stack {
                 actions: ['ses:SendEmail', 'ses:SendRawEmail'],
                 // Scope to the configured sender identity (matching notification-stack),
                 // not '*' — a '*' would let the processor send as any verified SES
-                // identity in the account.
-                resources: [
-                  `arn:aws:ses:${this.region}:${this.account}:identity/${props.senderEmail || 'noreply@example.com'}`,
-                ],
+                // identity in the account. Both the address and its parent domain, since
+                // SES authorizes against whichever it resolves the From address to.
+                resources: sesSenderIdentityArns(
+                  this.region,
+                  this.account,
+                  props.senderEmail || 'noreply@example.com',
+                ),
               }),
             ],
           }),
@@ -211,7 +244,14 @@ export class ChannelFlowStack extends cdk.Stack {
       entry: path.join(__dirname, '../../lambda/src/channel-flow-processor.ts'),
       handler: 'handler',
       runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: cdk.Duration.seconds(15),
+      // MUST EXCEED THE ROUTER'S 30s. `@all` hands the turn to the router and WAITS for it
+      // (RequestResponse), so this budget has to outlast the callee's or the caller dies first - and
+      // that failure is silent and total: the router would still be running, so it dispatches the
+      // processor, but the flow never returns to post the placeholder, so the processor polls for a
+      // message that never appears and the answer is lost. `callbackAllow` runs BEFORE the handoff, so
+      // a longer budget never delays the user's own message reaching the channel.
+      // Pinned by `channel-flow-outlasts-router.test.ts`.
+      timeout: cdk.Duration.seconds(35),
       memorySize: 256,
       reservedConcurrentExecutions: 50,
       role: processorRole,
@@ -220,8 +260,19 @@ export class ChannelFlowStack extends cdk.Stack {
         // resolved from SSM at deploy. lib/battle-state.ts fails open if these
         // are absent, so a partial rollout never throws at runtime.
         SSM_ROOT,
+        // @all routes to the processor MATCHING the channel classification (F1): basic→basic,
+        // standard→standard (the ASYNC_PROCESSOR_ARN default), premium→premium. Without the basic ARN
+        // an @all in a basic channel would run on the standard processor and leak standard-tier context.
         ASYNC_PROCESSOR_ARN: standardProcessorArn,
+        BASIC_ASYNC_PROCESSOR_ARN: basicProcessorArn,
         PREMIUM_ASYNC_PROCESSOR_ARN: premiumProcessorArn,
+        // @all hands the turn to the classification's ROUTER, which classifies, resolves the profile
+        // and variant, and dispatches the processor - the same code Lex fulfills into. Same
+        // three-way routing rule as the processors above, and covered by the SAME invoke grant: the
+        // routers are ${STACK_PREFIX}Classification-* functions too.
+        ROUTER_ARN: standardRouterArn,
+        BASIC_ROUTER_ARN: basicRouterArn,
+        PREMIUM_ROUTER_ARN: premiumRouterArn,
         ...(props.battleStateTableName && {
           BATTLE_STATE_TABLE: props.battleStateTableName,
         }),
@@ -241,11 +292,18 @@ export class ChannelFlowStack extends cdk.Stack {
           NOTIFY_ALLOWED_POOL_IDS: props.additionalUserPoolIds.join(','),
         }),
         ...(props.senderEmail && { SENDER_EMAIL: props.senderEmail }),
+        // Abuse controls: ABUSE_CONTROLS_TABLE + budget/rate/circuit envs, so enforceAbuseGate can
+        // meter the @all/battle dispatch paths. No-op until the budget ceilings are set via context.
+        ...abuse.env,
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
 
     this.processorFunctionArn = processorFn.functionArn;
+
+    // Grant the processor role PutItem/UpdateItem/GetItem on the shared abuse-controls table (+ the
+    // circuit SSM param when a global budget is wired) so the rate-limit / budget counters can bump.
+    abuse.grant(processorRole);
 
     // Grant Chime SDK permission to invoke the processor
     processorFn.addPermission('ChimeInvoke', {

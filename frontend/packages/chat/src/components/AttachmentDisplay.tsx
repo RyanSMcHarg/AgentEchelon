@@ -33,6 +33,7 @@ const AttachmentDisplay: React.FC<AttachmentDisplayProps> = ({ attachment }) => 
   const [isDownloading, setIsDownloading] = useState(false);
   const [imageUrl, setImageUrl] = useState<string | null>(null);
   const [imageFailed, setImageFailed] = useState(false);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const { user } = useAuth();
   const { activeConversation } = useConversations();
 
@@ -60,8 +61,21 @@ const AttachmentDisplay: React.FC<AttachmentDisplayProps> = ({ attachment }) => 
     };
   }, [isImage, attachment.fileKey, user, activeConversation]);
 
+  // Every failure path below MUST leave something on screen. This handler used to return
+  // early when the auth/conversation context was missing and to swallow a failed URL vend
+  // into console.error, so a user who clicked a delivered report got NO window, NO error,
+  // and no indication the click had registered - indistinguishable from a dead UI. Observed
+  // live on 2026-07-30: the report was delivered correctly and the click produced zero
+  // presigned-URL requests, silently.
   const handleDownload = async () => {
-    if (!user || !activeConversation) return;
+    setDownloadError(null);
+
+    if (!user || !activeConversation) {
+      // Not the user's fault and not retryable by clicking again, so say what is wrong
+      // rather than failing mute.
+      setDownloadError('Not ready yet — reopen this conversation and try again.');
+      return;
+    }
 
     try {
       setIsDownloading(true);
@@ -73,9 +87,15 @@ const AttachmentDisplay: React.FC<AttachmentDisplayProps> = ({ attachment }) => 
       // noopener+noreferrer prevents the opened window from accessing
       // window.opener (reverse-tabnabbing).
       // Low risk here (presigned S3 URL) but free hardening.
-      window.open(url, '_blank', 'noopener,noreferrer');
+      const opened = window.open(url, '_blank', 'noopener,noreferrer');
+      // A blocked popup returns null. Without this the file simply never appears and the
+      // user has no idea their own browser stopped it.
+      if (!opened) {
+        setDownloadError('Your browser blocked the download window. Allow pop-ups for this site, then retry.');
+      }
     } catch (error) {
       console.error('Failed to download file:', error);
+      setDownloadError("Couldn't open this file. Please try again.");
     } finally {
       setIsDownloading(false);
     }
@@ -115,6 +135,13 @@ const AttachmentDisplay: React.FC<AttachmentDisplayProps> = ({ attachment }) => 
             {isDownloading ? '...' : '\u2193'}
           </button>
         </div>
+      )}
+      {/* role=alert so a screen reader announces the failure; a silently-dead download
+          button is the bug this exists to prevent. */}
+      {downloadError && (
+        <p className="attachment-error" role="alert">
+          {downloadError}
+        </p>
       )}
     </div>
   );

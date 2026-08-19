@@ -102,6 +102,76 @@ function tierFromGroupsClaim(rawGroups) {
 }
 
 /**
+ * A new conversation's channel id.
+ *
+ * Timestamp PLUS cryptographic randomness. The timestamp alone is only millisecond-resolution, so two
+ * concurrent creates collide, and this id is load-bearing beyond the CreateChannel call: the channel ARN is
+ * derived from it (`{appInstance}/channel/{id}`), which makes it the key for per-conversation context written
+ * BEFORE the channel exists (SPEC-USER-PROFILE-AND-ONBOARDING §2 - the assistant is added by creation
+ * itself, so there is no window afterwards). A collision would therefore let one request's participant
+ * context attach to another's conversation, which is a cross-user leak rather than a retryable conflict.
+ *
+ * `crypto` not `Math.random`: the consequence of a repeated id here is a context mix-up, so it gets a real
+ * random source. Exported for the collision/legality test - the property is the point, not the format.
+ */
+function newConversationChannelId() {
+  return `conv-${Date.now()}-${crypto.randomBytes(6).toString('hex')}`;
+}
+exports.newConversationChannelId = newConversationChannelId;
+
+/**
+ * Record WHO will be in this conversation, BEFORE the channel exists.
+ *
+ * SPEC-USER-PROFILE-AND-ONBOARDING §2. The assistant is added to the channel BY creation (the bot is the
+ * acting bearer), so there is no window after `CreateChannel` in which to write something the welcome will
+ * read. Writing ahead of creation is possible because the channel ARN is derived from a channel id we supply.
+ *
+ * This conversation has exactly one human by construction: the authenticated caller. So the shape is
+ * `single`, written literally rather than computed - there is no member list to classify yet. The shape, NOT
+ * an initiator: "who asked for this conversation" and "who is in it" are different facts, and only the second
+ * belongs here (§2).
+ *
+ * BEST-EFFORT, deliberately. A failure here degrades the welcome (the router falls back to reading live
+ * membership, which is the pre-existing behaviour) and must never fail conversation creation. The DynamoDB
+ * client is required lazily for the same reason: this is a raw Lambda asset with no bundled dependencies, so
+ * it relies on the runtime-provided SDK, and a missing client degrades the welcome rather than breaking the
+ * endpoint.
+ */
+async function writeParticipantContext(channelArn, humanSub) {
+  const table = process.env.CHANNEL_CONTEXT_TABLE;
+  if (!table) {
+    console.warn('[CreateChannel] CHANNEL_CONTEXT_TABLE unset - participant shape not recorded');
+    return;
+  }
+  try {
+    // eslint-disable-next-line global-require
+    const { DynamoDBClient, UpdateItemCommand } = require('@aws-sdk/client-dynamodb');
+    const ddb = new DynamoDBClient({});
+    await ddb.send(new UpdateItemCommand({
+      TableName: table,
+      Key: { channelArn: { S: channelArn } },
+      UpdateExpression: 'SET #participants = :participants, #updatedAt = :updatedAt',
+      ExpressionAttributeNames: { '#participants': 'participants', '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: {
+        // Shape mirrors lambda/src/lib/participant-shape.ts ParticipantContext. The reader re-derives the
+        // focus from `humans`, so an inconsistent triple cannot key the onboarding gate on a bad subject.
+        ':participants': {
+          M: {
+            focus: { S: 'single' },
+            humans: { L: [{ S: humanSub }] },
+            subject: { S: humanSub },
+          },
+        },
+        ':updatedAt': { S: new Date().toISOString() },
+      },
+    }));
+    console.log('[CreateChannel] participant shape recorded before creation', { channelArn });
+  } catch (err) {
+    console.warn('[CreateChannel] participant shape write failed (non-fatal):', err && err.name);
+  }
+}
+
+/**
  * Lambda function to create a conversation and add the AI agent atomically.
  *
  * Steps:
@@ -258,8 +328,14 @@ exports.handler = async (event) => {
     // runtime. Falls back to the legacy single bot if the SSM param hasn't
     // rolled out yet.
     const botArn = await getBotArnForTier(requestedTier);
-    const conversationId = `conv-${Date.now()}`;
+    const conversationId = newConversationChannelId();
     console.log('Creating conversation:', { conversationId, title, modelId, userArn, requestedTier });
+
+    // Step 0: record the participant shape BEFORE the channel exists. Ordering is the whole mechanism -
+    // see writeParticipantContext. The ARN is derived, not read back, precisely because the channel is not
+    // there yet.
+    const derivedArn = `${appInstanceArn}/channel/${conversationId}`;
+    await writeParticipantContext(derivedArn, sub);
 
     // Step 1: Bot creates the channel (bot is the creator, making it a moderator)
     // RESTRICTED mode: only moderators can send messages
@@ -289,15 +365,15 @@ exports.handler = async (event) => {
           modelName,
           modelTier: requestedTier,
           // createdBy — the creator's AppInstanceUser ARN (…/user/<sub>), server-set from the JWT
-          // callerSub (never the request body). This is the DURABLE welcome-time identity BACKUP for the
-          // once-per-user onboarding gate (SPEC-USER-PROFILE-AND-ONBOARDING.md): the WelcomeIntent fires
-          // on the bot's membership, BEFORE the creator's membership settles, so the router cannot always
-          // resolve the human from ListChannelMemberships at that instant. This value is written
-          // atomically with CreateChannel and is already read by the router on WelcomeIntent, so it is
-          // present with no race. It stays authoritative-by-membership at runtime (this is a read-only,
-          // immutable, creator-at-creation copy — it is never used to GRANT anything), so it does not
-          // reintroduce mutable-owner-copy staleness. The router prefers membership and falls back to
-          // this only when the human member has not propagated yet.
+          // callerSub (never the request body). ATTRIBUTION ONLY, for share-conversation and the admin
+          // views: channel Metadata is member-WRITABLE (a participant holds UpdateChannel, which sets
+          // Name and Metadata in one call), so another member can rewrite this and it must never key a
+          // per-user decision or grant anything.
+          //
+          // It is NOT what the once-per-user onboarding gate reads
+          // (SPEC-USER-PROFILE-AND-ONBOARDING.md). That gate reads the participant shape written to the
+          // server-only channel-context store ABOVE, before CreateChannel, which no member can write and
+          // which is settled by the time WelcomeIntent fires.
           createdBy: userArn,
           // topic + triggerContext — read by the router on WelcomeIntent
           // (docs/SPEC-WELCOME-AND-CONTEXT.md). Both bounded to keep
@@ -316,6 +392,47 @@ exports.handler = async (event) => {
     }
 
     console.log('Conversation created by bot:', conversationArn);
+
+    // Step 1a: Associate the channel flow IMMEDIATELY, before any membership.
+    //
+    // This used to run last, after both membership calls, and that left a window in which the channel
+    // had a bot but no flow. The bot is a member from `CreateChannel` itself (ChimeBearer=botArn), so
+    // Lex can fire `WelcomeIntent` from this point on - and every message Amazon Chime SDK materialises
+    // during the window bypasses the flow entirely.
+    //
+    // Measured 2026-08-06, in one channel: the flow was invoked for the user's message and for a
+    // Lex-materialised bot message mid-conversation, but NOT for the welcome. A clean-channel probe
+    // reproduced it - welcome delivered, zero flow invocations. So the exemption was ours, not a
+    // property of Lex-created messages.
+    //
+    // It matters because the flow is what writes the `corr#<id> -> MessageId` mapping the async
+    // processor resolves placeholders from, and what denies a duplicate placeholder. Anything created
+    // in the gap has neither. No placeholder is created there today, so this was latent rather than
+    // broken - but it is exactly the kind of gap that bites when work moves earlier in this sequence.
+    //
+    // `CreateChannel` cannot take the flow itself: its input has no channel-flow field (AppInstanceArn,
+    // Name, Mode, Privacy, Metadata, ClientRequestToken, Tags, ChimeBearer, ChannelId, MemberArns,
+    // ModeratorArns, ElasticChannelConfiguration, ExpirationSettings). Immediately after is the
+    // earliest the association can happen.
+    const channelFlowArn = await getChannelFlowArn();
+    if (channelFlowArn) {
+      try {
+        await messagingClient.send(
+          new AssociateChannelFlowCommand({
+            ChannelArn: conversationArn,
+            ChannelFlowArn: channelFlowArn,
+            ChimeBearer: botArn,
+          })
+        );
+        console.log('[CreateChannel] Associated channel flow');
+      } catch (flowErr) {
+        // Non-fatal: the channel still works, but @assistant/@all routing and the placeholder mapping
+        // do not. Log loudly so this is visible in alarms.
+        console.error('[CreateChannel] Failed to associate channel flow:', flowErr);
+      }
+    } else {
+      console.warn('[CreateChannel] CHANNEL_FLOW_ARN_PARAM unset or missing — flow not associated');
+    }
 
     // Step 1b: Add the USER as a member + moderator FIRST — BEFORE the bot membership that fires the
     // welcome (step 1c). Ordering matters: the WelcomeIntent handler resolves the creator to gate
@@ -350,15 +467,19 @@ exports.handler = async (event) => {
       throw new Error(`User could not be added to conversation: ${userError.message}`);
     }
 
-    // Step 1c: Explicitly enroll the bot as a DEFAULT channel member. This is what FIRES the bot's
-    // Lex WelcomeIntent: Chime invokes it on the bot's CHANNEL_MEMBERSHIP event (verified against live
-    // Chime + AWS docs — https://docs.aws.amazon.com/chime-sdk/latest/dg/welcome-intent.html). The
-    // creator (ChimeBearer=botArn) is auto-added as a channel member at CreateChannel, but that
-    // auto-membership does NOT fire the welcome — only this explicit CreateChannelMembership does; it
-    // also (idempotently) ensures ListChannelMemberships returns the bot, which @mention routing needs.
-    // The user is now already a member (step 1b), so the WelcomeIntent's creator resolution is reliable.
-    // The welcome copy stays generic (the assistant still greets by name on the first real turn). Non-
-    // fatal on ConflictException (the bot is already a member from creation).
+    // Step 1c: Idempotently ensure the bot is a DEFAULT channel member, so `ListChannelMemberships`
+    // returns it — which `@mention` routing needs.
+    //
+    // This does NOT fire the WelcomeIntent, and the comment here used to claim it did. CORRECTED after
+    // testing against live Chime (2026-08-03): a channel created with `ChimeBearer=botArn` auto-adds the bot
+    // as a member, and THAT automatic membership is what fires the welcome — a channel created with no
+    // `CreateChannelMembership` call at all still receives the composed welcome within seconds. So this call
+    // conflicts on every normal creation and exists purely for the membership-listing guarantee.
+    //
+    // Worth knowing when reasoning about ordering: because the welcome fires on creation, it can arrive
+    // BEFORE the user's own membership settles. That is why per-conversation participant context is written
+    // ahead of CreateChannel (step 0) rather than read back afterwards.
+    // Non-fatal on ConflictException (the expected case).
     try {
       await messagingClient.send(
         new CreateChannelMembershipCommand({
@@ -375,28 +496,6 @@ exports.handler = async (event) => {
       } else {
         console.warn('[CreateChannel] Failed to enroll bot as member (non-fatal):', botMembershipErr);
       }
-    }
-
-    // Step 3: Associate the channel flow so the processor runs on every message.
-    // This enables @all / @assistant routing and multi-member mention enforcement.
-    const channelFlowArn = await getChannelFlowArn();
-    if (channelFlowArn) {
-      try {
-        await messagingClient.send(
-          new AssociateChannelFlowCommand({
-            ChannelArn: conversationArn,
-            ChannelFlowArn: channelFlowArn,
-            ChimeBearer: botArn,
-          })
-        );
-        console.log('[CreateChannel] Associated channel flow');
-      } catch (flowErr) {
-        // Non-fatal: channel will work but @assistant routing in multi-member
-        // conversations won't. Log loudly so this is visible in alarms.
-        console.error('[CreateChannel] Failed to associate channel flow:', flowErr);
-      }
-    } else {
-      console.warn('[CreateChannel] CHANNEL_FLOW_ARN_PARAM unset or missing — flow not associated');
     }
 
     // No synchronous welcome here. The bot's WelcomeIntent (Lex) is now

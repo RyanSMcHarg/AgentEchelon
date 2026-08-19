@@ -35,7 +35,7 @@ const Header: React.FC<HeaderProps> = ({ onHome }) => {
         </div>
         <div className="header-actions">
           {/*
-            Configurable LINK OUT to the admin console (SPEC-SEPARATE-ADMIN-APP.md).
+            Configurable LINK OUT to the admin console (DESIGN-SEPARATE-ADMIN-APP.md).
             The admin console is a separate app; this is only a URL, so the chat
             bundle carries no operator code (assert-no-admin-in-chat.mjs). Shown to
             admins when VITE_ADMIN_APP_URL is set; a deployer can point it at their

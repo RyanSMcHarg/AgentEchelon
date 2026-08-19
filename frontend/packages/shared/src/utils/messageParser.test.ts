@@ -1,5 +1,69 @@
 import { describe, it, expect } from 'vitest';
-import { parseMessageContent, parseActiveTaskFromMetadata, isAllowedBattleImageUrl } from './messageParser';
+import {
+  parseMessageContent,
+  parseActiveTaskFromMetadata,
+  isEmptyLexEnvelope,
+  unwrapLexEnvelope,
+} from './messageParser';
+
+const LEX = 'application/amz-chime-lex-msgs';
+
+/**
+ * The client half of duplicate suppression (ADR-022).
+ *
+ * The router answers a retried Lex fulfillment with `messages: []`. Amazon Chime SDK posts that
+ * envelope into the channel either way, so whether the user sees a clean conversation or raw JSON is
+ * decided HERE. Both ingestion paths - the REST history load and the realtime websocket - route
+ * through this predicate for exactly that reason.
+ */
+describe('isEmptyLexEnvelope', () => {
+  it('recognises the envelope the router emits to suppress a retry', () => {
+    expect(isEmptyLexEnvelope(JSON.stringify({ Messages: [] }), LEX)).toBe(true);
+  });
+
+  it('keeps a real Lex reply, which carries messages', () => {
+    const real = JSON.stringify({ Messages: [{ Content: 'Here is your answer.', ContentType: 'PlainText' }] });
+    expect(isEmptyLexEnvelope(real, LEX)).toBe(false);
+  });
+
+  it('ignores an ordinary message that happens to contain the same JSON', () => {
+    // A coding answer may legitimately quote `{"Messages":[]}` in a fenced block. Only Lex's OWN
+    // envelope is suppressed, so the gate is the ContentType and not the text.
+    expect(isEmptyLexEnvelope(JSON.stringify({ Messages: [] }), 'text/plain')).toBe(false);
+    expect(isEmptyLexEnvelope(JSON.stringify({ Messages: [] }), undefined)).toBe(false);
+  });
+
+  it('keeps an unparseable envelope rather than silently dropping it', () => {
+    // Not provably empty. Dropping here would lose a message we merely failed to understand.
+    expect(isEmptyLexEnvelope('not json at all', LEX)).toBe(false);
+    expect(isEmptyLexEnvelope('', LEX)).toBe(false);
+  });
+
+  it('keeps an envelope whose Messages is absent or not an array', () => {
+    expect(isEmptyLexEnvelope(JSON.stringify({}), LEX)).toBe(false);
+    expect(isEmptyLexEnvelope(JSON.stringify({ Messages: null }), LEX)).toBe(false);
+    expect(isEmptyLexEnvelope(JSON.stringify({ Messages: 'nope' }), LEX)).toBe(false);
+  });
+});
+
+describe('unwrapLexEnvelope', () => {
+  it('unwraps a Lex reply to its text, so the user never sees the envelope', () => {
+    const real = JSON.stringify({ Messages: [{ Content: 'Here is your answer.', ContentType: 'PlainText' }] });
+    expect(unwrapLexEnvelope(real, LEX)).toBe('Here is your answer.');
+  });
+
+  it('leaves an ordinary message untouched', () => {
+    expect(unwrapLexEnvelope('Just text', 'text/plain')).toBe('Just text');
+  });
+
+  it('does NOT unwrap an empty envelope, which is why the drop must happen first', () => {
+    // This is the coupling between the two functions: unwrap returns the raw JSON for an empty
+    // envelope, so any ingestion path that unwraps WITHOUT dropping first renders `{"Messages":[]}`
+    // to the user. Both call sites drop first; this asserts the reason they must.
+    const empty = JSON.stringify({ Messages: [] });
+    expect(unwrapLexEnvelope(empty, LEX)).toBe(empty);
+  });
+});
 
 describe('parseMessageContent', () => {
   it('returns content unchanged when no markers present', () => {
@@ -260,61 +324,6 @@ describe('parseMessageContent — battlestats marker (#1 emission wiring)', () =
   });
 });
 
-describe('parseMessageContent — battleimage marker (Phase 4 generation-out)', () => {
-  const PRESIGNED =
-    'https://bkt.s3.amazonaws.com/battle-images/c/2026-05-16T0-0.png?X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=ab=cd,ef';
-
-  it('extracts urls/modelId/count and strips the marker (URL has =,&, — JSON-only survives)', () => {
-    const raw = `Generated an image with Amazon Nova Canvas.<!--battleimage:${JSON.stringify({
-      urls: [PRESIGNED],
-      modelId: 'amazon.nova-canvas-v1:0',
-      count: 1,
-    })}-->`;
-    const result = parseMessageContent(raw);
-    expect(result.content).toBe('Generated an image with Amazon Nova Canvas.');
-    expect(result.battleImage).toEqual({
-      urls: [PRESIGNED],
-      modelId: 'amazon.nova-canvas-v1:0',
-      count: 1,
-    });
-  });
-
-  it('count defaults to urls.length when absent', () => {
-    // F3: fixture URLs must satisfy isAllowedBattleImageUrl
-    const urls = [
-      'https://my-bucket.s3.amazonaws.com/u1.png',
-      'https://my-bucket.s3.amazonaws.com/u2.png',
-    ];
-    const raw = `x<!--battleimage:${JSON.stringify({ urls, modelId: 'm' })}-->`;
-    expect(parseMessageContent(raw).battleImage).toEqual({
-      urls,
-      modelId: 'm',
-      count: 2,
-    });
-  });
-
-  it('honest empty: a failure/withheld line carries NO marker → battleImage null, text shown', () => {
-    const result = parseMessageContent(
-      'The generated image was withheld by the content filter.',
-    );
-    expect(result.battleImage).toBeNull();
-    expect(result.content).toBe('The generated image was withheld by the content filter.');
-  });
-
-  it('malformed JSON or invalid shape is ignored (never a fabricated image)', () => {
-    expect(parseMessageContent('y<!--battleimage:not json-->').battleImage).toBeNull();
-    expect(
-      parseMessageContent(`y<!--battleimage:${JSON.stringify({ urls: [], modelId: 'm' })}-->`)
-        .battleImage,
-    ).toBeNull();
-    expect(
-      parseMessageContent(`y<!--battleimage:${JSON.stringify({ urls: [123], modelId: 'm' })}-->`)
-        .battleImage,
-    ).toBeNull();
-    // marker still stripped from displayed content even when ignored
-    expect(parseMessageContent('y<!--battleimage:not json-->').content).toBe('y');
-  });
-});
 
 describe('parseActiveTaskFromMetadata', () => {
   it('returns null for null metadata', () => {
@@ -372,60 +381,4 @@ describe('parseMessageContent — battlewaiting marker', () => {
   });
 });
 
-describe('isAllowedBattleImageUrl — F3 URL allow-list', () => {
-  it.each([
-    'https://my-bucket.s3.amazonaws.com/path/key.png',
-    'https://my-bucket.s3.us-east-1.amazonaws.com/path/key.png',
-    'https://s3.amazonaws.com/bucket/key.png',
-    'https://s3.us-west-2.amazonaws.com/bucket/key.png',
-  ])('accepts AWS https URL: %s', (u) => {
-    expect(isAllowedBattleImageUrl(u)).toBe(true);
-  });
 
-  it.each([
-    'http://my-bucket.s3.amazonaws.com/key.png',         // non-https
-    'javascript:alert(1)',                                // script scheme
-    'data:image/png;base64,AAAA',                        // data URL
-    'file:///etc/passwd',                                 // file URL
-    'https://attacker.com/exfil.png',                    // wrong host
-    'https://evil.s3.amazonaws.com.attacker.io/key.png', // suffix-spoof
-    'https://amazonaws.com.evil/key.png',                 // suffix-spoof
-    'not a url at all',                                   // unparseable
-    '',                                                   // empty
-  ])('rejects %s', (u) => {
-    expect(isAllowedBattleImageUrl(u)).toBe(false);
-  });
-
-  it('rejects overlong URLs', () => {
-    expect(isAllowedBattleImageUrl('https://' + 'a'.repeat(9000))).toBe(false);
-  });
-
-  it('rejects non-string inputs', () => {
-    expect(isAllowedBattleImageUrl(undefined as unknown as string)).toBe(false);
-    expect(isAllowedBattleImageUrl(null as unknown as string)).toBe(false);
-    expect(isAllowedBattleImageUrl(42 as unknown as string)).toBe(false);
-  });
-});
-
-describe('battleimage marker — F3 integration', () => {
-  it('drops the image payload when any URL fails the allow-list', () => {
-    const marker = JSON.stringify({
-      urls: ['https://my-bucket.s3.amazonaws.com/ok.png', 'javascript:bad()'],
-      modelId: 'nova-canvas',
-      count: 2,
-    });
-    const r = parseMessageContent(`done<!--battleimage:${marker}-->`);
-    expect(r.battleImage).toBeNull();
-    expect(r.content).toBe('done');
-  });
-
-  it('keeps the image when all URLs are AWS-hosted https', () => {
-    const marker = JSON.stringify({
-      urls: ['https://my-bucket.s3.amazonaws.com/ok.png'],
-      modelId: 'nova-canvas',
-      count: 1,
-    });
-    const r = parseMessageContent(`done<!--battleimage:${marker}-->`);
-    expect(r.battleImage?.urls).toEqual(['https://my-bucket.s3.amazonaws.com/ok.png']);
-  });
-});

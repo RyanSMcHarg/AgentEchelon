@@ -8,6 +8,7 @@ import ArchiveConversationModal from './ArchiveConversationModal';
 import ChannelMembersPanel from './ChannelMembersPanel';
 import { useAwsClient } from '../providers/AwsClientProvider';
 import { chimeService } from '../services/chimeService';
+import { getBattleConfig, type ChannelBattleConfig } from '../services/channelBattleService';
 import { CollapsibleText } from './CollapsibleText';
 import BattleScorecard, { type ScorecardVariant } from './BattleScorecard';
 import BattleTallyBar from './BattleTallyBar';
@@ -17,6 +18,7 @@ import { shortenModelId } from '../utils/modelLabel';
 import { getModelGreeting } from '../utils/greeting';
 import type { Message } from '@ae/shared';
 import './ConversationInterface.css';
+import { hasPendingMessageFocus, requestMessageFocus, scrollToMessage, takePendingMessageFocus } from '../utils/focusMessage';
 
 /** Multi-day date divider: a divider
  *  separates messages when the calendar day changes vs the previous
@@ -70,9 +72,128 @@ function toScorecardVariant(m: Message): ScorecardVariant {
   };
 }
 
+/** Battle prompt-steering table (DESIGN-EXPERIMENTS-BATTLE §2.2). Keyed by the
+ *  experiment's target intent (the shipped intents), each row is a coaching
+ *  line plus 2-3 concrete starter chips the user can click to prefill the
+ *  composer with `/battle <chip>` — so the battle exercises what the experiment
+ *  measures instead of leaving users to guess. Deployment-overridable example
+ *  copy, shipped as defaults. Aliases stay opaque: the briefing names the
+ *  DECISION, never the models (INV-4, semi-blind eval). */
+interface BattleSteering {
+  coaching: string;
+  chips: string[];
+}
+
+const BATTLE_STEERING: Record<string, BattleSteering> = {
+  general_qa: {
+    coaching: 'Ask real questions your users ask.',
+    chips: ['Explain X to a new hire', "What's the difference between A and B?"],
+  },
+  code_generation: {
+    coaching: "Ask a real coding task you'd actually ship.",
+    chips: ['Write a function that …', 'Add retry/timeout to this call'],
+  },
+  code_review: {
+    coaching: 'Paste real code and ask for a review.',
+    chips: ['Review this for bugs', 'Is this concurrency-safe?'],
+  },
+  document_extraction: {
+    coaching: 'Give a document and ask for specific fields.',
+    chips: ['Extract the totals as a table', 'Pull every date + owner'],
+  },
+  report_generation: {
+    coaching: "Ask for a report you'd actually send.",
+    chips: ['Draft a one-page status report on …', 'Summarize this for execs'],
+  },
+  image_generation: {
+    coaching: 'Describe an image you actually need.',
+    chips: ['A hero image for …', 'An icon set for …'],
+  },
+  strategic_analysis: {
+    coaching: 'Pose a real judgment call.',
+    chips: ['Pros/cons of migrating to …', 'What are the risks of …?'],
+  },
+  workflow_actions: {
+    coaching: 'Ask it to drive a multi-step task.',
+    chips: ['Plan and track the steps to …', 'Walk me through …'],
+  },
+};
+
+/** Fallback for base/classification/profile experiments — they span intents, so
+ *  there is no single intent row (§2.2): a generic coaching line + broadly useful
+ *  chips seeded from the most common intents. */
+const BATTLE_STEERING_GENERIC: BattleSteering = {
+  coaching: "We're comparing overall quality — ask the kinds of questions your users actually ask.",
+  chips: ['Explain X to a new hire', 'Write a function that …', 'Draft a one-page status report on …'],
+};
+
+/** Inline styles (this component owns no CSS file for the briefing) built from
+ *  the app's design tokens so the banner stays theme-aware and consistent with
+ *  the existing mention-banner. */
+const battleBriefingStyles: Record<string, React.CSSProperties> = {
+  banner: {
+    display: 'flex',
+    alignItems: 'flex-start',
+    gap: 'var(--space-3)',
+    margin: 'var(--space-4) 0 var(--space-2)',
+    padding: 'var(--space-3) var(--space-4)',
+    background: 'var(--accent-50)',
+    border: '1px solid var(--accent-200)',
+    borderLeft: '3px solid var(--accent-500)',
+    borderRadius: 'var(--radius-md)',
+  },
+  body: { flex: 1, minWidth: 0 },
+  eyebrow: {
+    display: 'inline-block',
+    fontFamily: 'var(--font-mono)',
+    fontSize: 'var(--text-xs)',
+    textTransform: 'uppercase',
+    letterSpacing: 'var(--tracking-wider)',
+    color: 'var(--accent-700)',
+    marginBottom: 'var(--space-1)',
+  },
+  decision: {
+    margin: '0 0 var(--space-2)',
+    fontSize: 'var(--text-md)',
+    color: 'var(--text-primary)',
+    lineHeight: 'var(--leading-relaxed)',
+  },
+  decisionLabel: { fontWeight: 600 },
+  coaching: {
+    margin: '0 0 var(--space-2)',
+    fontSize: 'var(--text-sm)',
+    color: 'var(--text-secondary)',
+  },
+  chips: { display: 'flex', flexWrap: 'wrap', gap: 'var(--space-2)' },
+  chip: {
+    fontFamily: 'var(--font-mono)',
+    fontSize: 'var(--text-xs)',
+    color: 'var(--accent-700)',
+    background: 'var(--surface-0)',
+    border: '1px solid var(--accent-300)',
+    borderRadius: 'var(--radius-sm)',
+    padding: '4px var(--space-3)',
+    cursor: 'pointer',
+  },
+  dismiss: {
+    flexShrink: 0,
+    display: 'inline-flex',
+    alignItems: 'center',
+    justifyContent: 'center',
+    width: 22,
+    height: 22,
+    padding: 0,
+    color: 'var(--text-tertiary)',
+    background: 'transparent',
+    border: 'none',
+    borderRadius: 'var(--radius-full)',
+    cursor: 'pointer',
+  },
+};
+
 const ConversationInterface: React.FC = () => {
   const { t } = useTranslation();
-  const { activeConversation, messages, isLoadingMessages, isBotTyping, channelMembers, renameConversation, archiveConversation } = useConversations();
+  const { activeConversation, messages, isLoadingMessages, isBotTyping, channelMembers, renameConversation, archiveConversation, selectConversation } = useConversations();
   const { userArn: currentUserArn } = useAwsClient();
   const messagesEndRef = useRef<HTMLDivElement>(null);
   const containerRef = useRef<HTMLDivElement>(null);
@@ -134,6 +255,47 @@ const ConversationInterface: React.FC = () => {
     setBattleWinners((prev) => (prev[battleId] === winner ? prev : { ...prev, [battleId]: winner }));
   }, []);
 
+  // Battle briefing (DESIGN-EXPERIMENTS-BATTLE §2.2/§2.3): read the channel's
+  // battle config so a dismissible intro banner can be shown to EVERY battling
+  // member — non-moderators included, read-only — carrying the decision line
+  // (objective statement) and intent-keyed prompt chips. Only premium channels
+  // can have battle (INV-5), so we skip the fetch elsewhere; errors are
+  // swallowed (a member without config access just sees no banner).
+  const [battleConfig, setBattleConfig] = useState<ChannelBattleConfig | null>(null);
+  const [isBattleBriefingDismissed, setIsBattleBriefingDismissed] = useState(false);
+  useEffect(() => {
+    setIsBattleBriefingDismissed(false);
+    const arn = activeConversation?.conversationArn;
+    // Eligibility comes from the config response (the profile's `battleEligible`), so the request is
+    // no longer pre-gated on a hardcoded premium check against mutable metadata. A non-eligible
+    // conversation simply gets `battleEligible: false` back and renders nothing.
+    if (!arn) { setBattleConfig(null); return; }
+    let cancelled = false;
+    void getBattleConfig(arn)
+      .then((cfg) => { if (!cancelled) setBattleConfig(cfg); })
+      .catch(() => { if (!cancelled) setBattleConfig(null); });
+    return () => { cancelled = true; };
+  }, [activeConversation?.conversationArn]);
+
+  // Clicking a starter chip prefills the composer with `/battle <chip>`. The
+  // composer (MessageInput) is a sibling component with no shared draft state,
+  // so we load its controlled <textarea> the React-safe way: call the native
+  // value setter, then dispatch a bubbling 'input' event so React's onChange
+  // fires and the composer re-renders with the prefilled text (no coupling,
+  // no edit to MessageInput).
+  const handleBattleChip = useCallback((chip: string) => {
+    const text = `/battle ${chip}`;
+    const textarea = document.querySelector<HTMLTextAreaElement>('.message-textarea');
+    if (!textarea) return;
+    const setValue = Object.getOwnPropertyDescriptor(
+      window.HTMLTextAreaElement.prototype,
+      'value',
+    )?.set;
+    setValue?.call(textarea, text);
+    textarea.dispatchEvent(new Event('input', { bubbles: true }));
+    textarea.focus();
+  }, []);
+
   // Round-1 pairs grouped by battleId — the input to the running tally. Built
   // once per message change (independent of pick state) so picks don't re-walk
   // the whole message list.
@@ -178,6 +340,23 @@ const ConversationInterface: React.FC = () => {
   const humanMemberCount = channelMembers.filter((m) => !m.isBot).length;
   const isMultiUser = humanMemberCount >= 2;
   const showMentionBanner = isMultiUser && !isMentionBannerDismissed;
+
+  // Briefing fields ride on the battle config (DESIGN-EXPERIMENTS-BATTLE A.5),
+  // snapshotted at enable time. Read them via a local augmentation so this stays
+  // type-safe whether or not ChannelBattleConfig has grown the optional fields
+  // yet (same pattern as the Experiment battleEnabled read).
+  const briefing = battleConfig as
+    | (ChannelBattleConfig & { briefingStatement?: string; briefingIntent?: string })
+    | null;
+  const briefingStatement = briefing?.briefingStatement?.trim() || '';
+  const briefingSteering =
+    (briefing?.briefingIntent && BATTLE_STEERING[briefing.briefingIntent]) || BATTLE_STEERING_GENERIC;
+  // Absent statement ⇒ no banner (additive: absent ⇒ today's behavior). Eligibility is checked as well
+  // as `enabled`: a profile can have `battleEligible` revoked after a moderator turned Battle Mode on,
+  // and the stored config would still say enabled.
+  const showBattleBriefing =
+    !!battleConfig?.enabled && battleConfig.battleEligible !== false
+    && !!briefingStatement && !isBattleBriefingDismissed;
   const userScrolledRef = useRef(false);
 
   const scrollToBottom = useCallback((smooth = true) => {
@@ -186,7 +365,37 @@ const ConversationInterface: React.FC = () => {
     setShowScrollBtn(false);
   }, []);
 
+  // A `#message=<id>` deep link (a drift conversation's link back to the message that caused it) records its
+  // target before the conversation's history exists. This runs on every `messages` change, so it fires
+  // exactly when the target renders - no polling, no deadline.
+  //
+  // Running FIRST is not what makes the deep link win - it is what made it LOSE. Effects run in
+  // declaration order within a commit, so on the render where the target finally mounts this one
+  // consumed the pending request and scrolled to the message, and then the auto-scroll effect below
+  // saw no pending focus, found `userScrolledRef` still false on a freshly loaded conversation, and
+  // scrolled to the bottom - the last scroll applied, and the one that wins. Following a drift link
+  // landed the reader at the newest message with a highlight they never saw.
+  //
+  // Marking the position as user-owned is what settles it: the viewport is now where the reader asked
+  // to be, so the auto-scroll effect takes its "offer the jump-to-newest button" branch instead of
+  // yanking them away - on this render and on later ones, which is also the right behaviour while
+  // someone is reading history.
   useEffect(() => {
+    if (!hasPendingMessageFocus()) return;
+    const id = takePendingMessageFocus();
+    if (id && !scrollToMessage(id)) {
+      // Not rendered on this pass (a longer history still loading). Put it back so the next render tries
+      // again; the request is only consumed once it actually lands.
+      requestMessageFocus(id);
+      return;
+    }
+    if (id) userScrolledRef.current = true;
+  }, [messages]);
+
+  useEffect(() => {
+    // Skip the "jump to newest" behaviour while a deep link is still waiting to land, or it would scroll
+    // away from the message the user followed a link to reach.
+    if (hasPendingMessageFocus()) return;
     if (!userScrolledRef.current) {
       scrollToBottom();
     } else {
@@ -330,14 +539,6 @@ const ConversationInterface: React.FC = () => {
                 <span className="conversation-header-tier-dot" aria-hidden="true" />
                 {t(`tier.${activeConversation.modelTier}`)}
               </span>
-              {isMultiUser && (
-                <span className="conversation-header-members-chip" aria-label={t('membersPanel.memberCount', { count: humanMemberCount })}>
-                  <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="12" height="12" aria-hidden="true">
-                    <path d="M10 9a3 3 0 100-6 3 3 0 000 6zM6 8a2 2 0 11-4 0 2 2 0 014 0zM1.49 15.326a.78.78 0 01-.358-.442 3 3 0 014.308-3.516 6.484 6.484 0 00-1.905 3.959c-.023.222-.014.442.025.654a4.97 4.97 0 01-2.07-.655zM16.44 15.98a4.97 4.97 0 002.07-.654.78.78 0 00.357-.442 3 3 0 00-4.308-3.517 6.484 6.484 0 011.907 3.96 2.32 2.32 0 01-.026.654zM18 8a2 2 0 11-4 0 2 2 0 014 0zM5.304 16.19a.844.844 0 01-.277-.71 5 5 0 019.947 0 .843.843 0 01-.277.71A6.975 6.975 0 0110 18a6.974 6.974 0 01-4.696-1.81z" />
-                  </svg>
-                  {humanMemberCount}
-                </span>
-              )}
             </div>
             <div className="conversation-header-actions">
               <button
@@ -362,6 +563,12 @@ const ConversationInterface: React.FC = () => {
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="16" height="16" aria-hidden="true">
                   <path d="M10 9a3 3 0 100-6 3 3 0 000 6zM6 8a2 2 0 11-4 0 2 2 0 014 0zM1.49 15.326a.78.78 0 01-.358-.442 3 3 0 014.308-3.516 6.484 6.484 0 00-1.905 3.959c-.023.222-.014.442.025.654a4.97 4.97 0 01-2.07-.655zM16.44 15.98a4.97 4.97 0 002.07-.654.78.78 0 00.357-.442 3 3 0 00-4.308-3.517 6.484 6.484 0 011.907 3.96 2.32 2.32 0 01-.026.654zM18 8a2 2 0 11-4 0 2 2 0 014 0zM5.304 16.19a.844.844 0 01-.277-.71 5 5 0 019.947 0 .843.843 0 01-.277.71A6.975 6.975 0 0110 18a6.974 6.974 0 01-4.696-1.81z" />
                 </svg>
+                {/* The count rides ON the toggle. It used to be a separate `members-chip` next to it,
+                    which rendered the SAME people icon a second time - two identical glyphs in the
+                    header, one of them not clickable. One control, one icon, one meaning. */}
+                {isMultiUser && (
+                  <span className="conversation-header-btn-count">{humanMemberCount}</span>
+                )}
               </button>
               {isModerator && (
                 <button
@@ -411,6 +618,56 @@ const ConversationInterface: React.FC = () => {
           )}
         </header>
       <div className="messages-container" ref={containerRef} onScroll={handleScroll}>
+        {/* Battle briefing (DESIGN-EXPERIMENTS-BATTLE §2.2): a compact,
+            dismissible intro rendered above the first battle turn. It names the
+            DECISION (objective statement) — never the models, keeping aliases
+            opaque (INV-4) — and offers intent-keyed starter chips that prefill
+            the composer with `/battle …`. Shown to every battling member,
+            non-moderators included, read-only. */}
+        {showBattleBriefing && (
+          <div className="battle-briefing" role="region" aria-label="Battle briefing" style={battleBriefingStyles.banner}>
+            <div className="battle-briefing-body" style={battleBriefingStyles.body}>
+              <span className="battle-briefing-eyebrow" style={battleBriefingStyles.eyebrow}>Battle Mode</span>
+              <p className="battle-briefing-decision" style={battleBriefingStyles.decision}>
+                <span style={battleBriefingStyles.decisionLabel}>We&rsquo;re deciding: </span>
+                {briefingStatement}
+              </p>
+              {briefingSteering.coaching && (
+                <p className="battle-briefing-coaching" style={battleBriefingStyles.coaching}>
+                  {briefingSteering.coaching}
+                </p>
+              )}
+              {briefingSteering.chips.length > 0 && (
+                <div className="battle-briefing-chips" role="group" aria-label="Suggested battle prompts" style={battleBriefingStyles.chips}>
+                  {briefingSteering.chips.map((chip) => (
+                    <button
+                      key={chip}
+                      type="button"
+                      className="battle-briefing-chip"
+                      style={battleBriefingStyles.chip}
+                      onClick={() => handleBattleChip(chip)}
+                      title={`Prefill: /battle ${chip}`}
+                    >
+                      {chip}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+            <button
+              type="button"
+              className="battle-briefing-dismiss"
+              style={battleBriefingStyles.dismiss}
+              onClick={() => setIsBattleBriefingDismissed(true)}
+              aria-label="Dismiss battle briefing"
+              title="Dismiss"
+            >
+              <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="14" height="14" aria-hidden="true">
+                <path fillRule="evenodd" d="M4.293 4.293a1 1 0 011.414 0L10 8.586l4.293-4.293a1 1 0 111.414 1.414L11.414 10l4.293 4.293a1 1 0 01-1.414 1.414L10 11.414l-4.293 4.293a1 1 0 01-1.414-1.414L8.586 10 4.293 5.707a1 1 0 010-1.414z" clipRule="evenodd" />
+              </svg>
+            </button>
+          </div>
+        )}
         {isLoadingMessages ? (
           <div className="messages-loading">
             <div className="message-skeleton">
@@ -539,6 +796,10 @@ const ConversationInterface: React.FC = () => {
               </div>
             )}
             <div
+              // Addressable so a `#message=<id>` deep link can scroll to and highlight this exact message
+              // (see utils/focusMessage). A drift-created conversation links back to the message that
+              // caused it, which is useless if it only lands the reader in the right thread.
+              data-message-id={message.id}
               className={`message ${message.isBot ? 'assistant-message' : 'user-message'}${isContinuation || isGroupedWithPrev ? ' continuation' : ''}${message.battle ? ' battle-message' : ''}`}
             >
               <div className="message-content">
@@ -582,7 +843,8 @@ const ConversationInterface: React.FC = () => {
                     message.isBot
                     && !!message.battle
                     && message.battle.responseMs === undefined
-                    && !message.battleImage
+                    // An image reply is the other way a battle turn finishes: it lands as an
+                    // attachment, so `attachment` alone covers what battleImage used to.
                     && !message.attachment;
                   if (isBattlePlaceholder) {
                     const name = message.battle?.label || message.sender?.name || 'Assistant';
@@ -596,21 +858,29 @@ const ConversationInterface: React.FC = () => {
                   }
                   return <CollapsibleText content={message.content} isBot={message.isBot} />;
                 })()}
-                {message.isBot && message.battleImage && (
-                  <div className="battle-generated-images">
-                    {message.battleImage.urls.map((url, i) => (
-                      <img
-                        key={i}
-                        src={url}
-                        className="battle-generated-image"
-                        loading="lazy"
-                        alt={t('battle.generatedImageAlt', {
-                          defaultValue: `Generated image ${i + 1} of ${message.battleImage!.count} (${message.battleImage!.modelId})`,
-                        })}
-                      />
-                    ))}
-                  </div>
+                {/*
+                  A durable way into the conversation this one continued into. The `NAVIGATE_CHANNEL:` marker
+                  that switches conversations on arrival is stripped before display, so without this the
+                  parent keeps the announcement and loses the link. Rendered from message METADATA, which
+                  survives that stripping, so it still works on a re-read days later.
+                */}
+                {message.isBot && message.driftRedirect && (
+                  <button
+                    type="button"
+                    className="drift-redirect-link"
+                    onClick={() => {
+                      const id = message.driftRedirect!.childChannelArn.split('/').pop();
+                      if (id) void selectConversation(id);
+                    }}
+                  >
+                    {t('drift.openConversation', {
+                      label: message.driftRedirect.label,
+                      defaultValue: 'Open {{label}}',
+                    })}
+                  </button>
                 )}
+                {/* A generated image (battle generation-out, or any image_generation turn) arrives as
+                    an ATTACHMENT and renders below, same as an uploaded one. */}
                 {message.attachment && (
                   <AttachmentDisplay attachment={message.attachment} />
                 )}
@@ -658,6 +928,12 @@ const ConversationInterface: React.FC = () => {
                 channelArn={activeConversation.conversationArn}
                 variantA={scorecard.variantA}
                 variantB={scorecard.variantB}
+                // The pick this session already made, if any. The scorecard hangs off a specific
+                // message, so an arriving round-2 reply can move it to a different one - React
+                // unmounts and remounts it, and the child's own state goes with it. Its mount fetch
+                // then races the pick POST and can resolve to "no pick", leaving a recorded pick
+                // rendered as unpicked with no way back. This state outlives the remount.
+                knownWinner={battleWinners[scorecard.battleId] ?? undefined}
                 onOutcomeChange={handleBattleOutcome}
               />
             )}
@@ -715,6 +991,11 @@ const ConversationInterface: React.FC = () => {
       <ChannelMembersPanel
         isOpen={isMembersPanelOpen}
         onClose={() => setIsMembersPanelOpen(false)}
+        // The panel owns the battle TOGGLE; this view owns the battle BRIEFING. Both read the same
+        // server config, so the toggle has to publish its result here - otherwise this copy stays at
+        // whatever it was when the conversation opened, and the briefing never appears for the person
+        // who just enabled Battle Mode.
+        onBattleConfigChange={setBattleConfig}
       />
     </div>
   );

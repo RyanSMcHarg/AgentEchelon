@@ -28,6 +28,7 @@ import {
   parseActiveTaskFromMetadata,
   parseMessageFeedbackFromMetadata,
   unwrapLexEnvelope,
+  isEmptyLexEnvelope,
 } from '@ae/shared';
 
 export interface ShareConversationResult {
@@ -35,6 +36,21 @@ export interface ShareConversationResult {
   isNowMultiUser: boolean;
   emailSent: boolean;
   emailError?: string;
+}
+
+/**
+ * A drift redirect recorded on a message's Chime Metadata: the conversation this one continued into.
+ *
+ * Tolerant, and returns undefined rather than a partial object. A half-formed value would render a link that
+ * goes nowhere, which is worse than rendering nothing - the announcement text still reads sensibly on its own.
+ */
+function parseDriftRedirect(raw: unknown): { childChannelArn: string; label: string } | undefined {
+  if (!raw || typeof raw !== 'object') return undefined;
+  const r = raw as Record<string, unknown>;
+  const childChannelArn = typeof r.childChannelArn === 'string' ? r.childChannelArn.trim() : '';
+  if (!childChannelArn) return undefined;
+  const label = typeof r.label === 'string' && r.label.trim() ? r.label.trim() : 'the new conversation';
+  return { childChannelArn, label };
 }
 
 /**
@@ -412,18 +428,10 @@ class ChimeService {
       for (const msg of response.ChannelMessages || []) {
         if (!msg.MessageId || !msg.Content) continue;
 
-        // Filter out Lex's empty message responses
-        // These appear as {"Messages":[]} with ContentType application/amz-chime-lex-msgs
-        if (msg.ContentType === 'application/amz-chime-lex-msgs') {
-          try {
-            const parsed = JSON.parse(msg.Content);
-            if (parsed.Messages && Array.isArray(parsed.Messages) && parsed.Messages.length === 0) {
-              continue; // Skip empty Lex responses
-            }
-          } catch (e) {
-            // If we can't parse it, include it
-          }
-        }
+        // Filter out Lex's empty message responses. These appear as {"Messages":[]} with ContentType
+        // application/amz-chime-lex-msgs, and are how the router suppresses a retried fulfillment
+        // (ADR-022). Shared with the realtime path so the two cannot drift.
+        if (isEmptyLexEnvelope(msg.Content, msg.ContentType)) continue;
 
         // Parse metadata to check if it's a bot message
         let metadata: any = {};
@@ -438,7 +446,7 @@ class ChimeService {
         const isBot = metadata.botResponse || msg.Sender?.Arn?.includes('/bot/');
         // Unwrap the Lex fulfillment envelope (e.g. the WelcomeIntent greeting)
         // BEFORE decoding, so users never see raw `{"Messages":[…]}` JSON.
-        const { content: cleanContent, activeTask: contentTask, navigateChannel, battle, battleWaiting, battleImage } = parseMessageContent(decodeURIComponent(unwrapLexEnvelope(msg.Content, msg.ContentType)));
+        const { content: cleanContent, activeTask: contentTask, navigateChannel, battle, battleWaiting } = parseMessageContent(decodeURIComponent(unwrapLexEnvelope(msg.Content, msg.ContentType)));
         const metadataTask = parseActiveTaskFromMetadata(metadata);
         const msgTargets = (msg as { Target?: Array<{ MemberArn?: string }> }).Target;
         const targetedToUser = Array.isArray(msgTargets)
@@ -462,6 +470,11 @@ class ChimeService {
           experimentId: typeof metadata.experimentId === 'string' ? metadata.experimentId : undefined,
           variantId: typeof metadata.variantId === 'string' ? metadata.variantId : undefined,
           assignmentMode: typeof metadata.assignmentMode === 'string' ? metadata.assignmentMode : undefined,
+          // A conversation this one continued into (drift redirect). Lifted from METADATA rather than parsed
+          // out of the content: the `NAVIGATE_CHANNEL:` marker that drives the one-shot switch is stripped
+          // before display, so without this the parent conversation keeps the announcement and loses the way
+          // to reach what it announced.
+          driftRedirect: parseDriftRedirect(metadata.driftRedirect),
           feedback: parseMessageFeedbackFromMetadata(metadata),
           status: 'sent',
           targetedToUser: targetedToUser || undefined,
@@ -475,7 +488,6 @@ class ChimeService {
           // /battle marker
           battle: battle || undefined,
           battleWaiting: battleWaiting || undefined,
-          battleImage: battleImage || undefined,
         });
       }
 

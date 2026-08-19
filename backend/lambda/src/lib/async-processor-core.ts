@@ -15,6 +15,7 @@
  * classification-specific post-processing.
  */
 
+import { stripMessageMarkers } from './message-markers.js';
 import {
   ChimeSDKMessagingClient,
   ListChannelMessagesCommand,
@@ -30,9 +31,20 @@ import {
 } from '@aws-sdk/client-bedrock-runtime';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { LambdaClient, InvokeCommand, InvocationType } from '@aws-sdk/client-lambda';
-import { buildAnalyticsMetadata, pickFrontendMetadata, makeConverseStep, classifyToolError, type ConverseStep, type ToolStepOutcome } from './analytics-metadata.js';
+import { buildAnalyticsMetadata, pickFrontendMetadata, makeConverseStep, classifyToolError, type ConverseStep, type ToolStepOutcome, type ResponsePhase } from './analytics-metadata.js';
 import { writeMessageAnalytics, messageAnalyticsEnabled } from './message-analytics.js';
 import { estimateStepCostUsd } from './model-rate-table.js';
+import {
+  needsAttribution,
+  renderContribution,
+  speakerIdFrom,
+  speakerKindFor,
+  stripAttribution,
+  type Speaker,
+} from './transcript-attribution.js';
+// Type-only: the event carries a resolved profile VERSION for a profileRef variant (SPEC-PORTABLE §6).
+// Erased at compile, so it introduces no module cycle with active-profile.
+import type { ProfileDefinition } from './active-profile.js';
 import { loadCompanyContext, loadPlatformInfo, loadContextDigest, buildDigestHint } from './company-context.js';
 import {
   CORPORATE_TRAVEL_TOOL_SPEC,
@@ -45,7 +57,7 @@ import {
   IMAGE_GEN_MODELS,
   type ImageGenModelKey,
 } from './image-gen-models.js';
-import { updateTaskStatus, getTask, recordNoTransitionTurn, shouldMarkTaskCompleted, TASK_STATE_MACHINES, type TaskStatus, type Task } from './task-tracking.js';
+import { updateTaskStatus, getTask, recordNoTransitionTurn, shouldMarkTaskCompleted, resolveTaskOwner, TASK_STATE_MACHINES, type TaskStatus, type Task } from './task-tracking.js';
 import {
   ADVANCE_TASK_STATE_TOOL_NAME,
   taskToolSpecsFor,
@@ -54,7 +66,10 @@ import {
   type TaskLoopContext,
 } from './task-tools.js';
 import { taskStateMachines } from './intent-pack.js';
-import { claimCorrelation, capUserMessage } from './abuse-controls.js';
+import { stateNamesOf, type TaskStateMachine } from './task-state-machines.js';
+import { claimCorrelation, capUserMessage, readPlaceholderMapping } from './abuse-controls.js';
+import { resolvePlaceholderTarget } from './placeholder-target.js';
+import { planResumedChainDelivery, RESUMED_CHAIN_ACKNOWLEDGEMENT } from './resumed-chain-delivery.js';
 import { matchAssigneeInRoster, buildAssignmentNotice } from './task-notify.js';
 import type { RosterParticipant } from './channel-notify.js';
 import {
@@ -94,6 +109,24 @@ const CHUNK0_MARKER_HEADROOM = 700;
 
 function encodedLen(s: string): number {
   return encodeURIComponent(s).length;
+}
+
+// A prefix cut must never fall BETWEEN a UTF-16 surrogate pair (an astral-plane
+// char - emoji, math alphanumerics, some CJK extensions - is two code units).
+// Slicing there yields a lone surrogate, and encodeURIComponent (used to measure
+// and to send the Chime wire Content) throws `URIError: URI malformed` on a lone
+// surrogate, which crashed the whole processor on any long reply containing an
+// emoji. Snap such an index back by one so the high surrogate stays with its low
+// half in the following chunk. ASCII boundaries (space/newline/period) can never
+// sit inside a pair, so natural-boundary cuts are already safe.
+function surrogateSafeCut(text: string, idx: number): number {
+  if (idx <= 0 || idx >= text.length) return idx;
+  const hi = text.charCodeAt(idx - 1);
+  const lo = text.charCodeAt(idx);
+  if (hi >= 0xd800 && hi <= 0xdbff && lo >= 0xdc00 && lo <= 0xdfff) {
+    return idx - 1;
+  }
+  return idx;
 }
 
 // ============================================================
@@ -234,6 +267,12 @@ export interface BattleContextPayload {
   /** Originating /battle user message id — referenced in round-1 prompts. */
   originatingMessageId?: string;
   /**
+   * A RESUME only: the message holding this side's clarifying question, whose `<!--battlewaiting-->`
+   * marker this turn clears (ADR-029). Never a placeholder id - this turn answers on its own
+   * placeholder, like every other turn - so it is deliberately not called one.
+   */
+  clearWaitingMarkerMessageId?: string;
+  /**
    * Phase-3 vision-in: the image attachment on the `/battle` turn (from
    * the user message Metadata's `attachment`). Present only when the
    * triggering message carried an image. Each variant decides via
@@ -312,6 +351,14 @@ export interface AsyncProcessorEvent {
   };
   taskId?: string;
   taskType?: string;
+  /**
+   * The router CREATED this task on this turn (as opposed to resuming an active one). This is the
+   * task's OPEN edge, declared by the one component that knows it happened: without it the analytics
+   * record never carries a from-less transition, `turn_events` never gets a `task_opened` row, and
+   * `v_task_resolution.opened_at` is NULL for every task - the row-104 unit tests synthesized the
+   * from-less edge that no producer emitted, and the e2e against a live deployment is what caught it.
+   */
+  taskCreated?: boolean;
   botArn: string;
   conversationHistory?: Array<{ role: 'user' | 'assistant'; content: string }>;
   senderArn?: string;
@@ -339,6 +386,15 @@ export interface AsyncProcessorEvent {
   userLanguage?: string;
   /** Free-text participant profile (the user's stated preferences/working style) — personalizes replies. */
   participantProfile?: string;
+  /**
+   * WHAT CAUSED THIS TURN (`TurnRequest.trigger`), forwarded by the router.
+   *
+   * 'user' is a person's message; 'orchestrator' is the platform driving a turn - a battle round 2, a
+   * repair. It rides the analytics record so the latency ledger can record it, because "how long did
+   * this take" means something different for the two: one is a person waiting, the other is not.
+   * Absent ⇒ treated as a user turn, which is what every path did before this existed.
+   */
+  trigger?: 'user' | 'orchestrator';
   /** Geography routing signal (SPEC-CONTEXT-AWARE-MODEL-ROUTING) — the geo segment for this turn;
    *  `segment.country === 'CN'` routes to the Chinese model + reply. Absent ⇒ today's routing. */
   segment?: { country?: string; region?: string; lat?: number; lng?: number };
@@ -351,6 +407,47 @@ export interface AsyncProcessorEvent {
   // a resumed bot reuses its "waiting" message (no orphan; the cleared
   // battlewaiting marker is the frontend's "waiting ended" signal).
   placeholderMessageId?: string;
+  /**
+   * This turn resumed a chain an assistant was holding, so deliver it as the NORMALIZED PAIR: the
+   * answer UNTARGETED, the acknowledgement TARGETED at the person who spoke (owner, 2026-08-14).
+   *
+   * Set when the turn resumes a chain this assistant owns (`resumedOwnChain` in the handler). Which of
+   * the two the placeholder already is depends on how the person's message arrived - Amazon Chime SDK
+   * gives a Lex reply the inbound's targeting - so the processor reads the placeholder's real `Target`
+   * and posts whichever message is missing. It does NOT mean "post a second message": on an untargeted
+   * inbound the placeholder is already the public answer, and it is the receipt that gets one.
+   *
+   * A duel is a comparison and its answers have to be public to be one; a task step's result belongs to
+   * the conversation for the same reason. Continuation chunks follow the message the answer is in, so a
+   * long answer does not end up half public.
+   */
+  broadcastAnswer?: boolean;
+  /**
+   * Somebody else already gave the person their receipt, so this turn owes only the answer.
+   *
+   * The handover case (rule 3): the assistant the person ADDRESSED does not own the chain, so it
+   * acknowledges with copy of its own - saying the message was passed to the assistant whose work it is
+   * - and hands the turn over. The owning assistant then answers. Without this the person gets two
+   * receipts for one message, the second of them contradicting the first about who is acting.
+   *
+   * Only meaningful alongside `broadcastAnswer`: the answer is still untargeted, it is the receipt that
+   * is already spoken for.
+   */
+  suppressAcknowledgement?: boolean;
+  /**
+   * Text to KEEP above the answer when this turn's placeholder is a real message rather than a
+   * throwaway "One moment...".
+   *
+   * The welcome path is the case that needs it. A drift-spawned conversation quotes the question that
+   * started it ("You asked: > …") and then answered nothing, so the person had to retype it. The
+   * welcome now IS the placeholder — it carries the `<!--corr:-->` marker and this processor resolves
+   * and updates it — but a plain update REPLACES content, which would throw the orientation copy away
+   * (company, access line, example prompts) to show the answer. Prepending keeps both: the welcome
+   * stays, the answer arrives underneath it.
+   *
+   * Absent on every ordinary turn, where the placeholder is disposable and replacing it is correct.
+   */
+  messagePrefix?: string;
 
   // Intent classification (passed from agent handler for analytics)
   intent?: string;
@@ -379,6 +476,21 @@ export interface AsyncProcessorEvent {
   // A/B experiment tracking
   experimentId?: string;
   variantId?: string;
+
+  /**
+   * The assigned variant's FULL profile version, for a `profileRef` variant (SPEC-PORTABLE §6).
+   *
+   * A variant is not a model. `resolvedModel` alone cannot express the experiment §6 exists for — two
+   * versions differing ONLY in `tools`, or in persona, or in classifier mode — because both sides would
+   * resolve to the same model and the comparison would report no difference for a reason that has
+   * nothing to do with what was varied. Resolved ONCE by the router (or the battle fan-out) and stamped
+   * here, so the worker performs no second resolution.
+   *
+   * Absent ⇒ the worker resolves the profile's own ACTIVE version exactly as before. Serving this never
+   * touches the warm-container profile cache (which is keyed by profile NAME), or the next ordinary turn
+   * on the same container would inherit the variant's persona and tools.
+   */
+  variantProfile?: ProfileDefinition;
 
   // /battle invocation (SPEC-BATTLE.md). When set, this invocation
   // is part of an /battle fan-out — the system prompt is augmented with
@@ -446,6 +558,20 @@ export interface AsyncProcessorConfig {
    *  round-1 turn, and re-guarding the re-sent history would inconsistently block a rebuttal whose prompt
    *  round-1 already allowed. The OUTPUT guardrail still runs. Never set for a real user turn. */
   skipInputGuardrail?: boolean;
+  /** THE TEXT THIS TURN'S HUMAN ACTUALLY SUBMITTED, scored by the input guardrail (ADR-027 phase 1).
+   *  The guardrail previously scored the last user-ROLE entry in the assembled transcript, which is a
+   *  different thing the moment a second assistant is in the channel: `loadChannelHistory` gives every
+   *  participant that is not this bot the user role, so a peer's message can occupy that slot. A platform
+   *  notice authored by one bot then reaches its rival as an instruction about model behaviour and is
+   *  scored as a prompt attack, blocking that side before its model is called - deterministically, and
+   *  only for the side that did not write the notice. Scoring the turn's own input is also parity with the
+   *  external-provider path, which already passes `event.userMessage`. Absent ⇒ falls back to the
+   *  transcript scan, so a caller that cannot name the turn's input keeps the prior behaviour. */
+  userTurnText?: string;
+  /** The guardrail this assistant SELECTS (SPEC-CONFIGURABLE-ASSISTANTS 4.6), from the resolved profile
+   *  version. Applied by applyInput/OutputGuardrail in place of the deployment `GUARDRAIL_ID` env; absent
+   *  ⇒ the deployment default. Selection only (an unprovisioned id AccessDenies → fails open). */
+  guardrailId?: string;
 }
 
 export interface LongResponseResult {
@@ -467,6 +593,15 @@ export type ConversationMessage = {
    * to before.
    */
   images?: Array<{ fileKey: string; contentType: string; bytes?: Uint8Array }>;
+  /**
+   * WHO said this (ADR-027 part 1). Resolved during history assembly and no longer discarded: the
+   * Converse role is two-valued, so without this every non-self participant - colleagues AND peer
+   * assistants - collapses into one `user` voice the moment consolidation merges them. Absent on an
+   * entry assembled by a path that has no sender to resolve, which renders exactly as before.
+   */
+  speaker?: Speaker;
+  /** This assistant's own prior turn. Distinct from `role`, which a renderer derives from it. */
+  isSelf?: boolean;
 };
 
 // ============================================================
@@ -474,65 +609,132 @@ export type ConversationMessage = {
 // ============================================================
 
 /**
- * Poll for placeholder message by correlation ID.
- * Correlation ID is embedded in message content as <!--corr:uuid-->
+ * Resolve the placeholder's MessageId by correlation id, from the mapping the channel flow writes.
+ *
+ * DETERMINISTIC HANDOFF, NOT A SEARCH. Every bot message entering the channel passes through the
+ * channel flow, which parses its `<!--corr:{id}-->` marker and records `corr#<id> -> MessageId`
+ * (`claimPlaceholderMapping`) before releasing it. That includes placeholders Amazon Chime SDK
+ * materialises from a Lex fulfillment return: verified live 2026-08-06, where the flow was invoked for
+ * the exact MessageId of a Lex-created placeholder 62ms before the processor resolved it, and the
+ * table held `corr#5acfc651103ac6ee -> 8a152788...` while the turn was in flight.
+ *
+ * WHAT THIS REPLACED, AND WHY. This used to ALSO scan `ListChannelMessages` for the marker across 15
+ * attempts. That scan existed because the code believed a Lex-created placeholder "never enters a
+ * channel flow" and so could not be mapped. That belief was wrong, and the scan it justified was
+ * expensive and unreliable: a best-effort search over an eventually consistent list that cannot
+ * distinguish "not yet visible" from "never written", and that burned 22 seconds returning nothing on
+ * a turn whose placeholder genuinely did not exist. The mapping answers the same question exactly.
+ *
+ * Still bounded and still retried: this processor is dispatched BEFORE the placeholder exists, so the
+ * mapping appears a moment later. Returning null when it never appears is correct and is handled by
+ * the caller.
  */
-export async function pollForPlaceholderMessage(
+export async function pollForPlaceholderMessage(correlationId: string): Promise<string | null> {
+  // SHORT. The mapping is written before the placeholder is released, so it lands within about a
+  // second; waiting 22 for it only delays a turn that is going to fall back anyway. Eight attempts on
+  // the existing backoff is a little over three seconds. The channel/bot parameters this once took
+  // are gone rather than voided: the mapping needs neither, and a dead parameter advertises a
+  // channel-scan contract the function deliberately no longer has.
+  const maxAttempts = 8;
+  const baseDelay = 150;
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    const mapped = await readPlaceholderMapping(correlationId);
+    if (mapped) {
+      console.log('[AsyncProcessor] Resolved placeholder from mapping', { attempt, messageId: mapped });
+      return mapped;
+    }
+
+    await new Promise(resolve => setTimeout(resolve, Math.min(baseDelay * Math.pow(1.5, attempt - 1), 2000)));
+  }
+
+  console.warn('[AsyncProcessor] No placeholder mapping yet; deferring to a scan at answer time', { correlationId });
+  return null;
+}
+
+/**
+ * The message a turn's output (or error notice) should land on: the claimed mapping wins, the
+ * dispatched placeholder id is the resolver's own fallback, and only when neither exists yet is the
+ * short mapping poll paid. ONE definition, because the success path and the error path used to carry
+ * copy-pasted variants of this - each with a dead ternary that re-tested a fallback the resolver had
+ * already applied - and an error notice must land on the same message the answer would have.
+ */
+export async function resolveDeliveryMessageId(
+  correlationId: string,
+  dispatchedPlaceholderId?: string,
+): Promise<string | null> {
+  const target = resolvePlaceholderTarget(await readPlaceholderMapping(correlationId), dispatchedPlaceholderId);
+  return target.messageId || (await pollForPlaceholderMessage(correlationId));
+}
+
+/**
+ * LAST RESORT: find the placeholder by scanning the channel.
+ *
+ * `ListChannelMessages` is a billed API call, so this runs only when the mapping never appeared AND
+ * the answer is ready to deliver - never on the happy path, and never before the model call. By then
+ * the placeholder has had the whole inference window to land, so a single pass is enough; the old
+ * 15-attempt loop existed to cover a race that the mapping now settles.
+ *
+ * Returns null when the placeholder genuinely does not exist, which the caller reports rather than
+ * papering over.
+ */
+export async function scanForPlaceholderMessage(
   channelArn: string,
   correlationId: string,
   botArn: string
 ): Promise<string | null> {
-  const maxAttempts = 15;
-  const baseDelay = 150;
+  try {
+    const response = await messagingClient.send(new ListChannelMessagesCommand({
+      ChannelArn: channelArn,
+      ChimeBearer: botArn,
+      MaxResults: 20,
+      SortOrder: 'DESCENDING',
+    }));
 
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    console.log(`[AsyncProcessor] Polling attempt ${attempt}/${maxAttempts}`);
+    for (const message of response.ChannelMessages || []) {
+      const messageId = message.MessageId || '';
+      const content = message.Content || '';
+      if (tryDecode(content).includes(`<!--corr:${correlationId}-->`)) return messageId;
 
-    try {
-      const response = await messagingClient.send(new ListChannelMessagesCommand({
-        ChannelArn: channelArn,
-        ChimeBearer: botArn,
-        MaxResults: 20,
-        SortOrder: 'DESCENDING',
-      }));
-
-      const messages = response.ChannelMessages || [];
-
-      for (const message of messages) {
-        const messageId = message.MessageId || '';
-        const content = message.Content || '';
-        const decodedContent = tryDecode(content);
-
-        if (decodedContent.includes(`<!--corr:${correlationId}-->`)) {
-          return messageId;
-        }
-
-        // Check Lex JSON wrapper format
-        try {
-          const parsed = JSON.parse(content);
-          const innerContent = parsed.Messages?.[0]?.Content || '';
-          const decodedInner = tryDecode(innerContent);
-          if (decodedInner.includes(`<!--corr:${correlationId}-->`)) {
-            return messageId;
-          }
-        } catch {
-          // Not JSON, continue
-        }
+      // A placeholder Chime materialised from a Lex return carries the marker INSIDE the envelope.
+      try {
+        const inner = JSON.parse(content)?.Messages?.[0]?.Content || '';
+        if (tryDecode(inner).includes(`<!--corr:${correlationId}-->`)) return messageId;
+      } catch {
+        // Not JSON - not an envelope-wrapped placeholder.
       }
-    } catch (error) {
-      console.error(`[AsyncProcessor] Poll attempt ${attempt} failed:`, error);
     }
-
-    const delay = Math.min(baseDelay * Math.pow(1.5, attempt - 1), 2000);
-    await new Promise(resolve => setTimeout(resolve, delay));
+  } catch (error) {
+    console.error('[AsyncProcessor] Placeholder scan failed:', error);
   }
-
   return null;
 }
 
 // ============================================================
 // Channel History
 // ============================================================
+
+/**
+ * Is this bot message a PLACEHOLDER (the "One moment..." bubble awaiting its answer) rather than a
+ * real assistant turn?
+ *
+ * Every placeholder is posted as `${copy} <!--corr:${correlationId}-->` - router-agent-handler,
+ * channel-flow-processor and battle-orchestrator all build it that way, and `getTaskPlaceholder`
+ * supplies the copy - so the marker is a complete and exact discriminator. The answer arrives as an
+ * UpdateChannelMessage whose Content carries no `corr` marker, so a placeholder that has been
+ * answered correctly stops matching.
+ *
+ * This USED to be `content.includes('thinking') || content.includes('...')`, which silently deleted
+ * genuine assistant turns from the model's context: every placeholder copy ends in an ellipsis, but
+ * so does ordinary prose, and Haiku in particular uses them freely. The drop is invisible (the turn
+ * simply is not in the array) and intermittent (it depends on whether that one reply happened to
+ * contain "..."), which is exactly the shape of the reported "the assistant forgot the previous
+ * turn" defect. Matching the marker instead of the punctuation costs nothing and cannot misfire on
+ * prose.
+ */
+export function isPlaceholderMessage(content: string): boolean {
+  return content.includes('<!--corr:');
+}
 
 /**
  * Load conversation history from Chime channel.
@@ -575,8 +777,9 @@ export async function loadChannelHistory(
       // Skip the current user message (it's added separately)
       if (!isBot && content.trim() === currentMessage.trim()) continue;
 
-      // Skip placeholder messages
-      if (isBot && (content.includes('thinking') || content.includes('...'))) continue;
+      // Skip placeholder messages (see isPlaceholderMessage: matched on the `corr` marker every
+      // placeholder carries, NOT on its punctuation).
+      if (isBot && isPlaceholderMessage(content)) continue;
 
       // Vision-through-conversation: capture an IMAGE attachment carried on this message (from the
       // message Metadata's `attachment` - the same shape a generated image rides on, see
@@ -588,9 +791,24 @@ export async function loadChannelHistory(
           ? [{ fileKey: att.fileKey, contentType: att.contentType }]
           : undefined;
 
+      // ADR-027 part 1: keep the identity this loop already resolved. `isBot` and `isSelfBot` were
+      // both computed and then thrown away, which is why a peer assistant reached the model shaped
+      // exactly like a human instruction. The display name is the one the channel already returns on
+      // the message - no extra lookup, and no IdP call on the hot path.
+      const speaker: Speaker = {
+        // The PRINCIPAL id, not the raw ARN: this and the current turn's speaker are read from
+        // different places and are compared for equality, so they must be the same shape by
+        // construction rather than by coincidence.
+        id: speakerIdFrom(senderArn),
+        name: msg.Sender?.Name,
+        kind: speakerKindFor(senderArn, botArn),
+      };
+
       history.push({
         role: isSelfBot ? 'assistant' : 'user',
         content,
+        speaker,
+        isSelf: isSelfBot,
         ...(images && { images }),
       });
     }
@@ -639,6 +857,15 @@ export function formatDomainContextForPrompt(event: {
     );
   }
 
+  // Host/plan grounding is authored by ordinary channel members (via the work-item tools) and re-stamped
+  // into this prompt on the next turn, so it is UNTRUSTED input like a chat message. Strip HTML-comment
+  // control markers (no legitimate title carries `<!--ACTIVE_TASK…-->`/`<!--corr…-->`) and length-cap
+  // every rendered field, matching the discipline applied to `participantProfile` - so a planted item
+  // title can't inject instructions or smuggle a control marker into the system prompt.
+  // stripMessageMarkers, not a local regex: this is a bad-actor defense, and the hand-rolled copy it
+  // replaces covered only the comment pattern - an inline NAVIGATE_CHANNEL marker passed straight
+  // into the system prompt, and future patterns added to the canonical list would have been missed.
+  const clip = (s: unknown, max: number): string => stripMessageMarkers(String(s ?? '')).slice(0, max);
   const dc = event.domainContext as
     | {
         title?: string;
@@ -652,19 +879,19 @@ export function formatDomainContextForPrompt(event: {
         }>;
       }
     | undefined;
-  const items = dc && Array.isArray(dc.items) ? dc.items : [];
+  const items = (dc && Array.isArray(dc.items) ? dc.items : []).slice(0, 25); // cap the item count
   if (dc && (dc.title || items.length)) {
     const lines: string[] = [];
-    if (dc.title) lines.push(`Title: ${dc.title}`);
+    if (dc.title) lines.push(`Title: ${clip(dc.title, 200)}`);
     if (items.length) {
       lines.push('Work items (in order). Reference an item by its id when proposing a change:');
       for (const it of items) {
-        const bits = [it.title || 'Untitled item'];
-        bits.push(`[${it.status || 'open'}]`);
-        if (it.assignee) bits.push(`{assignee: ${it.assignee}}`);
-        if (it.start) bits.push(`(start: ${it.start})`);
-        if (it.end) bits.push(`(end: ${it.end})`);
-        if (it.id) bits.push(`{id: ${it.id}}`);
+        const bits = [clip(it.title, 200) || 'Untitled item'];
+        bits.push(`[${clip(it.status, 40) || 'open'}]`);
+        if (it.assignee) bits.push(`{assignee: ${clip(it.assignee, 80)}}`);
+        if (it.start) bits.push(`(start: ${clip(it.start, 40)})`);
+        if (it.end) bits.push(`(end: ${clip(it.end, 40)})`);
+        if (it.id) bits.push(`{id: ${clip(it.id, 100)}}`);
         lines.push(`  - ${bits.join(' ')}`);
       }
     }
@@ -678,12 +905,12 @@ export function formatDomainContextForPrompt(event: {
     );
   }
 
-  const others = Array.isArray(event.otherContexts)
+  const others = (Array.isArray(event.otherContexts)
     ? (event.otherContexts as Array<{ title?: string; slug?: string }>)
-    : [];
+    : []).slice(0, 15); // cap the count; same untrusted-grounding treatment as the items above
   if (others.length) {
     const list = others
-      .map((t) => `  - ${t.title || 'Untitled'}${t.slug ? ` (${t.slug})` : ''}`)
+      .map((t) => `  - ${clip(t.title, 120) || 'Untitled'}${t.slug ? ` (${clip(t.slug, 60)})` : ''}`)
       .join('\n');
     parts.push(
       `The user also has these OTHER plans/contexts. If they clearly reference one by name, switch ` +
@@ -739,6 +966,48 @@ export function firstTurnGreetingDirective(senderDisplayName?: string): string {
   );
 }
 
+/**
+ * State WHO the user is, on every turn, so a name asserted in conversation cannot silently replace the
+ * one their identity carries.
+ *
+ * The assistant resolves the signed-in user's name from their authenticated identity and greets them
+ * with it. Nothing then told it that name was authoritative, so a user who wrote "My name is TestBot"
+ * was answered "Hi TestBot, it's nice to meet you!" - by an assistant that had opened the same
+ * conversation addressing them as someone else. It neither adopted the claim knowingly nor flagged the
+ * conflict; it simply had no idea there was one.
+ *
+ * That matters beyond politeness. This is an authenticated enterprise assistant, not a guest flow: who
+ * the user is, is established at sign-in, and a claim typed into a message is not evidence about it. An
+ * assistant that answers to whatever name it is handed is one that will also repeat that name back into
+ * summaries, tasks and anything else downstream that reads the transcript.
+ *
+ * GUEST FLOWS ARE THE EXCEPTION, and they fall out for free rather than needing a branch: an
+ * unauthenticated or federated sender resolves to the router's 'there' fallback, this returns '', and
+ * no constraint is stated. A name can only be contradicted where one was actually established.
+ *
+ * A PREFERRED NAME IS PROFILE DATA, NOT A CONVERSATIONAL CLAIM. If a deployment wants the assistant to
+ * call someone something other than what their directory record says, that belongs in a field on the
+ * user's profile which the deployment populates and chooses to honour - the same shape as every other
+ * per-user setting here. It does not belong in the model's discretion, and it is not something to infer
+ * from a message, because "call me X" and "I am X" are indistinguishable in free text. There is no
+ * dedicated preferred-name field today; the nearest existing carrier is the free-text
+ * `participantProfile`, and a first-class field is worth adding if this is a surface OSS users want.
+ *
+ * A name mentioned about SOMEONE ELSE is untouched - the constraint is only on the user's own identity
+ * being reassigned by assertion.
+ */
+export function userIdentityDirective(senderDisplayName?: string): string {
+  const name = (senderDisplayName || '').trim();
+  if (!name || name === 'there') return '';
+  return (
+    `\n\n<user_identity>\nThe person you are talking to is ${name}. This comes from their authenticated `
+    + `sign-in and is the only authority on who they are. Address them as ${name}.\n`
+    + `If they tell you their name is something else, do NOT adopt it and do NOT argue: say plainly that `
+    + `your records have them as ${name}, and carry on with what they asked. A name they mention about `
+    + `someone ELSE is not a claim about themselves and needs no comment.\n</user_identity>`
+  );
+}
+
 /** Render the participant's profile (free-text preferences/working style) so replies are pre-tuned to
  *  them without being asked. Empty ⇒ '' (no-op). Sibling of formatDomainContextForPrompt. */
 export function formatUserProfileForPrompt(event: { participantProfile?: string }): string {
@@ -758,24 +1027,60 @@ export function formatUserProfileForPrompt(event: { participantProfile?: string 
 /**
  * Consolidate consecutive same-role messages into single messages.
  * Bedrock requires alternating user/assistant roles.
+ *
+ * THE MERGE IS WHERE ATTRIBUTION IS WON OR LOST (ADR-027 part 2). Converse roles are two-valued, so
+ * every non-self participant arrives as `user`, and consecutive ones are combined here - which is
+ * precisely where the boundary between two colleagues, or between a colleague and a peer assistant,
+ * used to dissolve. Each contribution therefore carries its speaker label INTO the merged content,
+ * because no provider surface available here offers a per-message speaker field.
+ *
+ * ATTRIBUTION IS CONDITIONAL, and the condition is whether there is anything to disambiguate:
+ *   - the transcript holds more than one distinct non-self speaker  => label every entry, because the
+ *     current turn may come from a different person than the previous one; or
+ *   - a merge combines contributions from DIFFERENT speakers        => label those, because that is
+ *     the boundary the merge erases.
+ * Neither holds in a 1:1, so a 1:1 transcript comes out byte-identical - no labels, no extra tokens,
+ * no behaviour change. Two messages in a row from the SAME person merge unlabelled for the same
+ * reason: repeating one name twice disambiguates nothing and is charged on every turn.
+ *
+ * SANITISATION RUNS REGARDLESS (part 3). A label the model is taught to read is a label a member can
+ * type, so an attribution-shaped prefix is stripped from every contribution even when nothing is
+ * being labelled - otherwise "the 1:1 case is unchanged" would also mean "the 1:1 case is forgeable".
  */
 export function consolidateConsecutiveMessages(
   history: ConversationMessage[]
 ): ConversationMessage[] {
   if (history.length === 0) return [];
 
+  const attributeAll = needsAttribution(history);
   const consolidated: ConversationMessage[] = [];
+  /** Per consolidated entry: has a label already been applied to its first contribution? */
+  const labelled: boolean[] = [];
 
   for (const msg of history) {
-    const last = consolidated[consolidated.length - 1];
+    const idx = consolidated.length - 1;
+    const last = consolidated[idx];
     if (last && last.role === msg.role) {
-      last.content += '\n\n' + msg.content;
+      const sameSpeaker = !!last.speaker && !!msg.speaker && last.speaker.id === msg.speaker.id;
+      const attribute = attributeAll || !sameSpeaker;
+      // Relabel the FIRST contribution now that it is no longer alone, or the merged turn reads as
+      // one speaker who was interrupted mid-thought.
+      if (attribute && !labelled[idx]) {
+        last.content = renderContribution(last.content, last.speaker, true);
+        labelled[idx] = true;
+      }
+      last.content += '\n\n' + renderContribution(msg.content, msg.speaker, attribute);
       // Preserve image attachments from every merged message (e.g. both bots' round-1 images in an
       // image battle are consecutive assistant messages that consolidate into one block), so no
       // shared-conversation image is lost when consecutive same-role turns are combined.
       if (msg.images?.length) last.images = [...(last.images ?? []), ...msg.images];
     } else {
-      consolidated.push({ ...msg, ...(msg.images ? { images: [...msg.images] } : {}) });
+      consolidated.push({
+        ...msg,
+        content: renderContribution(msg.content, msg.speaker, attributeAll),
+        ...(msg.images ? { images: [...msg.images] } : {}),
+      });
+      labelled.push(attributeAll);
     }
   }
 
@@ -1235,26 +1540,65 @@ function firstText(message: { content?: Array<Record<string, unknown>> } | undef
  * the original text with a warning) so a transient guardrail outage never
  * silently drops a reply.
  */
-export async function applyOutputGuardrail(text: string): Promise<string> {
-  const guardrailIdentifier = process.env.GUARDRAIL_ID;
-  const guardrailVersion = process.env.GUARDRAIL_VERSION;
-  if (!guardrailIdentifier || !guardrailVersion || !text) return text;
-  try {
-    const resp = await bedrockClient.send(new ApplyGuardrailCommand({
-      guardrailIdentifier,
-      guardrailVersion,
-      source: 'OUTPUT',
-      content: [{ text: { text } }],
-    }));
-    if (resp.action === 'GUARDRAIL_INTERVENED') {
-      const masked = (resp.outputs ?? []).map((o) => o.text ?? '').join('').trim();
-      return masked || text;
+/** Minimal shape of the ApplyGuardrail response the callers read. */
+type GuardrailResult = { action?: string; outputs?: Array<{ text?: string }> } | null;
+
+/**
+ * Apply a guardrail with a FALLBACK CHAIN (SPEC-CONFIGURABLE-ASSISTANTS 4.6). A profile may SELECT a
+ * deployment-provisioned guardrail (applied as its live DRAFT); absent ⇒ the deployment default
+ * (GUARDRAIL_ID/GUARDRAIL_VERSION env). The IAM ApplyGuardrail grant is per provisioned guardrail, so a
+ * SELECTED id that isn't provisioned for THIS classification (e.g. a valid id from the wrong
+ * classification's catalog) AccessDenies. That is a persistent MISCONFIGURATION, not a transient outage,
+ * so we do NOT fail open on it: we fall back to the deployment default and re-apply, and log LOUD so the
+ * bad selection surfaces. Only a genuine error of the DEFAULT itself (or no guardrail configured) fails
+ * open (returns null → the caller passes the turn through), preserving "a guardrail outage never drops a
+ * reply / bricks input".
+ */
+async function runGuardrail(source: 'INPUT' | 'OUTPUT', text: string, guardrailId?: string): Promise<GuardrailResult> {
+  const attempts: Array<{ id?: string; version?: string; selected: boolean }> = [];
+  if (guardrailId) attempts.push({ id: guardrailId, version: 'DRAFT', selected: true });
+  if (process.env.GUARDRAIL_ID) attempts.push({ id: process.env.GUARDRAIL_ID, version: process.env.GUARDRAIL_VERSION, selected: false });
+  for (let i = 0; i < attempts.length; i++) {
+    const a = attempts[i];
+    if (!a.id || !a.version) continue;
+    try {
+      return await bedrockClient.send(new ApplyGuardrailCommand({
+        guardrailIdentifier: a.id,
+        guardrailVersion: a.version,
+        source,
+        content: [{ text: { text } }],
+      }));
+    } catch (err) {
+      const hasFallback = i + 1 < attempts.length;
+      if (a.selected && hasFallback) {
+        // ANY failure of a SELECTED guardrail falls back to the deployment default. Narrowing this
+        // to AccessDenied left every other failure mode silently UNFILTERED: nothing validates a
+        // selected id beyond "non-empty string", and the published catalog exposes selection KEYS
+        // ('default', 'strict') next to resolved ids, so a profile or an imported bundle carrying a
+        // key raises ValidationException / ResourceNotFoundException - which fell straight through
+        // to the fail-open return without ever trying the default. A selected guardrail that cannot
+        // be applied is a persistent MISCONFIGURATION whatever the error name; the deployment
+        // default is still there and must be applied. Only a failure of the DEFAULT itself (below)
+        // fails open, which is what keeps "a guardrail outage never drops a reply / bricks input".
+        const name = String((err as { name?: string })?.name || 'Error');
+        console.error(`[AsyncProcessor] selected ${source} guardrail "${a.id}" failed to apply (${name}); falling back to the deployment default`, err);
+        continue; // re-apply with the default rather than failing open
+      }
+      console.warn(`[AsyncProcessor] ${source} ApplyGuardrail failed; failing open`, err);
+      return null;
     }
-    return text;
-  } catch (err) {
-    console.warn('[AsyncProcessor] ApplyGuardrail failed; passing output through', err);
-    return text;
   }
+  return null;
+}
+
+export async function applyOutputGuardrail(text: string, guardrailId?: string): Promise<string> {
+  if (!text) return text;
+  const resp = await runGuardrail('OUTPUT', text, guardrailId);
+  if (resp?.action === 'GUARDRAIL_INTERVENED') {
+    const masked = (resp.outputs ?? []).map((o) => o.text ?? '').join('').trim();
+    return masked || text;
+  }
+  return text;
 }
 
 /**
@@ -1269,23 +1613,39 @@ export async function applyOutputGuardrail(text: string): Promise<string> {
  * guardrail outage (allows the turn) so a transient guardrail failure never
  * bricks input — the output guardrail remains a backstop.
  */
-export async function applyInputGuardrail(text: string): Promise<{ blocked: boolean; message: string }> {
-  const guardrailIdentifier = process.env.GUARDRAIL_ID;
-  const guardrailVersion = process.env.GUARDRAIL_VERSION;
-  if (!guardrailIdentifier || !guardrailVersion || !text) return { blocked: false, message: '' };
-  try {
-    const resp = await bedrockClient.send(new ApplyGuardrailCommand({
-      guardrailIdentifier,
-      guardrailVersion,
-      source: 'INPUT',
-      content: [{ text: { text } }],
-    }));
-    if (resp.action === 'GUARDRAIL_INTERVENED') {
-      const masked = (resp.outputs ?? []).map((o) => o.text ?? '').join('').trim();
-      return { blocked: true, message: masked || 'I cannot process that request. Please rephrase your message.' };
-    }
-  } catch (err) {
-    console.warn('[AsyncProcessor] input ApplyGuardrail failed; allowing input', err);
+/**
+ * What a blocked turn says when the guardrail supplies no masked output of its own.
+ *
+ * Exported because a REPLY IS NOT AN ANSWER when it is this, and that distinction has to be
+ * assertable. A duel side blocked at input still posts an attributed reply carrying this text, so the
+ * duel looks complete - two replies, a scorecard, a countable human pick - while the experiment
+ * records a loss against a model that never ran. Tests that check "the side answered" match on this
+ * constant rather than re-typing the sentence, so a copy change cannot quietly disarm them.
+ */
+export const GUARDRAIL_BLOCK_FALLBACK = 'I cannot process that request. Please rephrase your message.';
+
+/**
+ * Does this reply text look like a guardrail block rather than an answer?
+ *
+ * Matches the fallback copy above and the leading clause of a masked variant. Deliberately a PREFIX
+ * test on the recognisable sentence rather than a keyword search: an answer may legitimately contain
+ * "cannot process" in the middle of a sentence about something else.
+ */
+export function isGuardrailBlockReply(text: string): boolean {
+  const t = (text || '').trim();
+  if (!t) return false;
+  return t.startsWith(GUARDRAIL_BLOCK_FALLBACK) || /^I cannot process that request\b/i.test(t);
+}
+
+export async function applyInputGuardrail(text: string, guardrailId?: string): Promise<{ blocked: boolean; message: string }> {
+  // Profile-selected guardrail (4.6) via the shared fallback chain: a bad SELECTION falls back to the
+  // deployment default (never silently unfiltered); a genuine outage of the default fails OPEN (allows
+  // the turn) - the output guardrail remains a backstop.
+  if (!text) return { blocked: false, message: '' };
+  const resp = await runGuardrail('INPUT', text, guardrailId);
+  if (resp?.action === 'GUARDRAIL_INTERVENED') {
+    const masked = (resp.outputs ?? []).map((o) => o.text ?? '').join('').trim();
+    return { blocked: true, message: masked || GUARDRAIL_BLOCK_FALLBACK };
   }
   return { blocked: false, message: '' };
 }
@@ -1312,7 +1672,7 @@ export async function invokeBedrock(
   documentInput?: BedrockDocumentInput,
   cacheableSystemPrefixLength?: number,
   taskContext?: TaskLoopContext,
-): Promise<{ response: string; inputTokens: number; outputTokens: number; bedrockTime: number; modelMs: number; toolMs: number; steps: ConverseStep[] }> {
+): Promise<{ response: string; inputTokens: number; outputTokens: number; bedrockTime: number; modelMs: number; toolMs: number; steps: ConverseStep[]; inputGuardBlocked?: boolean }> {
   const bedrockStart = Date.now();
   const convMessages = buildConverseMessages(messages, imageInput, documentInput) as Array<Record<string, unknown>>;
   // ADR-011: company-context bucket (attachments bucket, context/{classification}/);
@@ -1375,16 +1735,26 @@ export async function invokeBedrock(
   // any model call and short-circuits on a prompt attack (no tokens spent). Fails
   // OPEN on a guardrail outage. Pairs with applyOutputGuardrail below (input +
   // output = full coverage). See docs/IDENTITY-AND-ACCESS-MODEL.md §8.
-  const latestUserText = [...messages].reverse().find((m) => m.role === 'user')?.content ?? '';
+  // WHAT GETS SCORED: this turn's own human input when the caller can name it, and only otherwise the
+  // last user-role entry in the transcript. Those two stop being the same thing once a channel holds a
+  // second assistant - see `AsyncProcessorConfig.userTurnText` and ADR-027.
+  // The FALLBACK reads a consolidated entry, which since ADR-027 may carry speaker labels. Strip them
+  // before scoring: a label is platform text, not something the sender submitted, and letting it reach
+  // the filter would mean a participant's display name could influence whether a turn is blocked.
+  const latestUserText = config.userTurnText
+    ?? stripAttribution([...messages].reverse().find((m) => m.role === 'user')?.content ?? '');
   // A /battle round-2 rebuttal is orchestrator-triggered with no new user input (the prompt was already
   // guardrail-checked on round 1), so skipping the INPUT guardrail here avoids inconsistently blocking a
   // rebuttal whose prompt round-1 already allowed. The output guardrail still runs. See AsyncProcessorConfig.
   const inputGuard = config.skipInputGuardrail
     ? { blocked: false, message: '' }
-    : await applyInputGuardrail(latestUserText);
+    : await applyInputGuardrail(latestUserText, config.guardrailId);
   if (inputGuard.blocked) {
     console.warn('[AsyncProcessor] input guardrail intervened; blocking turn before model call');
-    return { response: inputGuard.message, inputTokens: 0, outputTokens: 0, bedrockTime: Date.now() - bedrockStart, modelMs: 0, toolMs: 0, steps };
+    // The STRUCTURAL fact rides the result. Flattening it into text made a blocked turn
+    // indistinguishable from an answer to every consumer once the guardrail carried custom
+    // blockedInputMessaging (the prefix test below only ever matched the default copy).
+    return { response: inputGuard.message, inputTokens: 0, outputTokens: 0, bedrockTime: Date.now() - bedrockStart, modelMs: 0, toolMs: 0, steps, inputGuardBlocked: true };
   }
 
   // model_ms / tool_ms split (LATENCY-TARGETS.md): iterStart->iterEnd brackets ONLY the Converse
@@ -1465,7 +1835,7 @@ export async function invokeBedrock(
           if (toolUse.name === 'load_company_context') {
             // Honor the model's document selection (filenames) so we load only what the task needs.
             const docs = Array.isArray(toolInput.documents) ? (toolInput.documents as unknown[]).filter((d): d is string => typeof d === 'string') : undefined;
-            payload = (await loadCompanyContext(companyContextBucket, docs?.length ? { documents: docs } : undefined)) as unknown as Record<string, unknown>;
+            payload = (await loadCompanyContext(companyContextBucket, config.userType, docs?.length ? { documents: docs } : undefined)) as unknown as Record<string, unknown>;
           } else if (toolUse.name === 'load_platform_info') {
             payload = (await loadPlatformInfo(companyContextBucket)) as unknown as Record<string, unknown>;
           } else if (toolUse.name === 'search_corporate_travel') {
@@ -1480,6 +1850,9 @@ export async function invokeBedrock(
               input: toolInput,
               machines: taskContext.machines,
               messageId: taskContext.messageId,
+              // Who to hand the task BACK to when it stops awaiting the user: this assistant. Without
+              // it, an item that the person has answered stays in their queue looking unfinished.
+              assistantId: taskContext.assistantId,
             });
             if (result.ok) {
               taskContext.task.taskState = result.to;
@@ -1527,7 +1900,7 @@ export async function invokeBedrock(
 
   // Guardrail parity (ADR-011): enforce the guardrail out-of-band on
   // the final output, matching what the managed-agent path does automatically.
-  response = await applyOutputGuardrail(response);
+  response = await applyOutputGuardrail(response, config.guardrailId);
 
   const bedrockTime = Date.now() - bedrockStart;
   console.log('[AsyncProcessor] Bedrock response received', {
@@ -1558,7 +1931,9 @@ function cutIndexByEncoded(text: string, budget: number): number {
   let fit = 1;
   while (lo <= hi) {
     const mid = (lo + hi) >> 1;
-    if (encodeURIComponent(text.slice(0, mid)).length <= budget) {
+    // Measure a surrogate-safe prefix so encodeURIComponent never throws on a
+    // mid-pair slice; the <=1-char difference is immaterial against the budget.
+    if (encodeURIComponent(text.slice(0, surrogateSafeCut(text, mid))).length <= budget) {
       fit = mid;
       lo = mid + 1;
     } else {
@@ -1572,7 +1947,11 @@ function cutIndexByEncoded(text: string, budget: number): number {
   if (sentence > fit * 0.5) return sentence + 1;
   const word = window.lastIndexOf(' ');
   if (word > fit * 0.5) return word;
-  return fit;
+  // Never return a cut that splits a surrogate pair. If snapping the only
+  // fitting index to 0 (a single leading astral char under a tiny budget),
+  // include the whole pair so we still make forward progress.
+  const safe = surrogateSafeCut(text, fit);
+  return safe > 0 ? safe : Math.min(2, text.length);
 }
 
 /**
@@ -1729,6 +2108,18 @@ export async function updateMessage(
   messageId: string,
   content: string,
   botArn: string,
+  /**
+   * WHICH STEP OF THE ANSWER THIS UPDATE IS, and it is REQUIRED (tracker row 49).
+   *
+   * Required rather than defaulted, because the whole point is that a future update path cannot
+   * forget to say. A default would be a second inference wearing a different name: whichever value it
+   * carried would silently become the claim for every path nobody thought about, which is exactly how
+   * `total_ms IS NOT NULL` came to mean "this is the final answer".
+   *
+   * Only `final` closes the turn. Archival gates `agent_final_at` on it, so an interim update that
+   * happens to carry telemetry no longer freezes the completion instant at the wrong moment.
+   */
+  phase: ResponsePhase,
   metadata?: Record<string, unknown>
 ): Promise<void> {
   const encodedContent = encodeURIComponent(content);
@@ -1743,13 +2134,93 @@ export async function updateMessage(
     );
   }
 
-  await messagingClient.send(new UpdateChannelMessageCommand({
-    ChannelArn: channelArn,
-    MessageId: messageId,
-    Content: encodedContent,
-    ChimeBearer: botArn,
-    Metadata: safeMetadataString(metadata),
-  }));
+  // A MESSAGE JUST POSTED INTO A FLOW-ASSOCIATED CHANNEL CANNOT BE UPDATED YET. It is `PENDING` until
+  // the channel flow returns its callback, and Amazon Chime SDK refuses the update outright:
+  // `BadRequestException: No operations allowed for messages in processing`. Every channel here has a
+  // flow, so any post-then-update - the broadcast answer is the first - hits this on the first try and
+  // would otherwise lose the answer entirely, leaving the placeholder reading "...".
+  //
+  // Bounded, and only for THAT condition: anything else throws on the first attempt as before.
+  // THE PHASE IS MERGED HERE, not at the call sites, so it cannot be lost by one of them assembling
+  // its metadata differently - and so it is stamped exactly once, on the same call that performs the
+  // update it describes. It is deliberately outside `METADATA_SHED_ORDER`: shedding it would turn a
+  // heavy turn into an unclosable one, silently.
+  const declaredMetadata = { ...(metadata ?? {}), respPhase: phase };
+
+  const startedAt = Date.now();
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await messagingClient.send(new UpdateChannelMessageCommand({
+        ChannelArn: channelArn,
+        MessageId: messageId,
+        Content: encodedContent,
+        ChimeBearer: botArn,
+        Metadata: safeMetadataString(declaredMetadata),
+      }));
+      return;
+    } catch (err) {
+      const inProcessing = /No operations allowed for messages in processing/i.test(
+        (err as Error)?.message ?? '',
+      );
+      if (!inProcessing || Date.now() - startedAt > 10_000) throw err;
+      console.log('[AsyncProcessor] message still in flow processing; retrying the update', {
+        messageId, attempt,
+      });
+      await new Promise((r) => setTimeout(r, 400 * attempt));
+    }
+  }
+}
+
+/** `<!--battlewaiting:...-->`, the only marker this clear touches. */
+const BATTLE_WAITING_MARKER = /<!--battlewaiting:[^>]*-->/g;
+
+/**
+ * End the waiting affordance on the message holding this side's clarifying question (ADR-029).
+ *
+ * The user has answered, so the side is generating again and the frontend must stop rendering it as
+ * waiting. The QUESTION TEXT STAYS: it is a real part of the duel and the transcript, and the answer
+ * lands on a placeholder of its own rather than overwriting this message. Only the marker goes.
+ *
+ * Read-then-write, because only the channel knows what the question said - the battle row drops
+ * `clarificationQuestion` on resume, deliberately, so this cannot reconstruct the content locally.
+ *
+ * BEST-EFFORT BY CONSTRUCTION. A failure here leaves a stale "Replying to:" affordance on one message,
+ * which is cosmetic; throwing would cost the user the answer they are waiting for. Logged so it is
+ * visible rather than silent.
+ */
+export async function clearBattleWaitingMarker(
+  channelArn: string,
+  messageId: string,
+  botArn: string,
+): Promise<boolean> {
+  try {
+    const current = await messagingClient.send(new GetChannelMessageCommand({
+      ChannelArn: channelArn,
+      MessageId: messageId,
+      ChimeBearer: botArn,
+    }));
+    const raw = current.ChannelMessage?.Content || '';
+    const decoded = (() => {
+      try { return decodeURIComponent(raw); } catch { return raw; }
+    })();
+    if (!BATTLE_WAITING_MARKER.test(decoded)) {
+      BATTLE_WAITING_MARKER.lastIndex = 0;
+      return false; // already cleared, or never carried one
+    }
+    BATTLE_WAITING_MARKER.lastIndex = 0;
+    const cleared = decoded.replace(BATTLE_WAITING_MARKER, '').trimEnd();
+    await messagingClient.send(new UpdateChannelMessageCommand({
+      ChannelArn: channelArn,
+      MessageId: messageId,
+      Content: encodeURIComponent(cleared),
+      ChimeBearer: botArn,
+      Metadata: current.ChannelMessage?.Metadata,
+    }));
+    return true;
+  } catch (err) {
+    console.warn('[AsyncProcessor][battle] could not clear the waiting marker (non-fatal):', err);
+    return false;
+  }
 }
 
 // ============================================================
@@ -1766,21 +2237,21 @@ export async function handleProcessingError(
   console.error('[AsyncProcessor] Error:', error);
 
   try {
-    // Honor an explicit /battle-resume placeholder so an error on a
-    // resumed turn lands on the reused "waiting" message, not a new one.
-    const messageId = event.placeholderMessageId
-      ? event.placeholderMessageId
-      : await pollForPlaceholderMessage(
-          event.channelArn,
-          event.correlationId,
-          event.botArn
-        );
+    // Same resolution order as the success path: the placeholder that survived the flow's duplicate
+    // guard owns the correlation, and an error notice belongs on the message the user can still see.
+    // Honors an explicit /battle-resume placeholder when nothing has claimed the correlation, so an
+    // error on a resumed turn lands on the reused "waiting" message rather than a new one.
+    const messageId = await resolveDeliveryMessageId(event.correlationId, event.placeholderMessageId);
     if (messageId) {
       await updateMessage(
         event.channelArn,
         messageId,
         'Sorry, I encountered an issue processing your request. Please try again.',
-        event.botArn
+        event.botArn,
+        // TERMINAL FOR THE PERSON, and deliberately not `final`. Their wait ended, but no answer was
+        // produced - counting this as a completion would fold a failure's duration into the average
+        // time-to-answer and make a broken turn look like a fast one.
+        'error',
       );
     }
   } catch (updateError) {
@@ -1905,27 +2376,89 @@ export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
     );
   }
 
-  // Step 1: Resolve the placeholder. A /battle resume hands us the
-  // existing "waiting" message id explicitly — reuse it (one clean
-  // message lifecycle, no orphan) instead of polling for a fresh one.
-  const messageId = event.placeholderMessageId
-    ? event.placeholderMessageId
-    : await pollForPlaceholderMessage(channelArn, correlationId, botArn);
-  if (!messageId) {
-    console.error('[AsyncProcessor] Could not find placeholder message with correlationId:', correlationId);
-    if (event.taskId) {
-      await updateTaskStatus(event.taskId, channelArn, 'failed', undefined, 'Placeholder message not found');
-    }
-    return null;
+  // Step 1: Resolve the placeholder. A /battle resume hands us the existing "waiting" message id
+  // explicitly — reuse it (one clean message lifecycle, no orphan) instead of polling for a fresh one.
+  //
+  // THE CLAIMED OWNER WINS OVER THE HANDED ID, and that is not a detail. Two things race on a
+  // duplicate delivery of the same turn, and until now nothing tied them together:
+  //  - the channel flow's duplicate-placeholder guard claims `corr#<id>` for the FIRST placeholder to
+  //    reach it and DENIES every other, so one placeholder survives in the channel;
+  //  - `claimCorrelation` picks one processor, whichever got there first.
+  // Nothing made those two the same delivery. When they diverged, this processor wrote the answer
+  // over the placeholder its own dispatch created — the one the flow had already denied — and the
+  // user watched the surviving "One moment..." forever while a completed answer landed on a message
+  // that was no longer in the channel.
+  //
+  // Reading the claim makes both races resolve to the same message: whatever survived the guard IS
+  // the placeholder the answer belongs on. One extra GetItem on the dispatch path, on a table this
+  // turn already touches.
+  //
+  // A miss is normal and means only "not claimed yet" (this processor is dispatched before the
+  // placeholder exists), so the handed id still stands.
+  const target = resolvePlaceholderTarget(await readPlaceholderMapping(correlationId), event.placeholderMessageId);
+  if (target.overrodeHandedId) {
+    console.warn('[AsyncProcessor] dispatched placeholder lost the duplicate guard; answering on the claimed one', {
+      correlationId, dispatched: event.placeholderMessageId, claimed: target.messageId,
+    });
   }
-  console.log('[AsyncProcessor] Found placeholder message:', messageId);
+  let messageId = target.messageId || (await pollForPlaceholderMessage(correlationId));
+  // NOT RESOLVED YET IS NOT A FAILURE. This used to abort the turn here, which was right when the
+  // only way to find a placeholder was to search for it: if 22 seconds of scanning found nothing, the
+  // placeholder did not exist. The mapping changes that. It is written before the placeholder is
+  // released, so a miss after ~3s means only that Chime has not created it YET - and the most common
+  // reason is that this processor was dispatched by the router BEFORE the fulfillment response was
+  // materialised.
+  //
+  // So carry on with `messageId` unresolved and let inference run. The placeholder lands during the
+  // model call, and the caller resolves it once the answer is ready (`scanForPlaceholderMessage`),
+  // which is both later and cheaper: `ListChannelMessages` is billed, and on the happy path it is
+  // never called at all.
+  //
+  // A DUPLICATE DISPATCH DOES NOT REACH HERE. `claimCorrelation(correlationId)` above already
+  // collapsed it, so continuing past this point is not duplicate Bedrock spend - that guard, not this
+  // one, is what stops a second answer.
+  if (!messageId) {
+    console.warn(
+      '[AsyncProcessor] Placeholder unresolved at dispatch; continuing and resolving at answer time',
+      { correlationId },
+    );
+  } else {
+    console.log('[AsyncProcessor] Found placeholder message:', messageId);
+  }
   const pollTime = Date.now() - startTime;
+
+  // A RESUMED duel side ends its waiting affordance here (ADR-029), as early as it can: the user has
+  // answered, this turn is generating, and the question message must stop rendering as "Replying to:"
+  // while the answer is produced on the placeholder posted above. The question text is left in place.
+  //
+  // Awaited rather than fired and forgotten. It is one Chime call against a turn that runs for seconds,
+  // and an async Lambda freezes its environment the moment the handler resolves, so a loose promise here
+  // is a coin flip. It cannot fail the turn: the helper swallows its own errors.
+  if (event.battleContext?.clearWaitingMarkerMessageId) {
+    const clearedMarker = await clearBattleWaitingMarker(
+      channelArn,
+      event.battleContext.clearWaitingMarkerMessageId,
+      event.botArn,
+    );
+    console.log('[AsyncProcessor][battle] resumed side: waiting marker', {
+      messageId: event.battleContext.clearWaitingMarkerMessageId,
+      cleared: clearedMarker,
+    });
+  }
 
   // Step 2: Load conversation history
   let conversationHistory = event.conversationHistory || [];
   if (conversationHistory.length === 0 && channelArn) {
     conversationHistory = await loadChannelHistory(channelArn, event.botArn, userMessage);
-    console.log(`[AsyncProcessor] Loaded ${conversationHistory.length} messages from channel history`);
+    // Role SHAPE alongside the count, because a bare count cannot diagnose a context-loss report:
+    // "2" is healthy as `ua` but broken as `aa` (a welcome plus a reply, with the user's own turn
+    // missing), and `aa` is promoted wholesale into priorAgentContext below, leaving the model
+    // nothing but the current message. The shape distinguishes them; the message CONTENT is
+    // deliberately not logged.
+    console.log(
+      `[AsyncProcessor] Loaded ${conversationHistory.length} messages from channel history`,
+      { roles: conversationHistory.map(m => (m.role === 'assistant' ? 'a' : 'u')).join('') },
+    );
   }
 
   // Step 2b: Title rename on the first user turn into a channel still named
@@ -1963,12 +2496,36 @@ export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
 
   const userSub = event.senderArn?.split('/user/').pop() || '';
 
-  const bedrockMessages = [
-    ...consolidatedHistory,
+  // Consolidated INCLUDING the current turn. Consolidation exists because Bedrock requires
+  // alternating roles, so appending the current user message to an ALREADY-consolidated history
+  // re-introduced the exact adjacency it removes whenever the history ends on a user turn - which is
+  // routine, not exotic: it is what remains once the trailing bot message is a placeholder still
+  // awaiting its answer, or an assistant turn that was filtered out.
+  // The CURRENT turn carries its speaker too (ADR-027 part 1). Without this the person now typing is
+  // the one contribution in the transcript with no name on it, and - worse - they would not COUNT
+  // toward the "more than one distinct speaker" test, so a turn from a second colleague could go
+  // unattributed precisely when attribution started to matter. `senderDisplayName` is the name the
+  // router already resolved from the IdP for this turn.
+  const currentSpeaker: Speaker | undefined = event.senderArn
+    ? {
+        id: speakerIdFrom(event.senderArn),
+        name: event.senderDisplayName,
+        kind: speakerKindFor(event.senderArn, event.botArn || ''),
+      }
+    : undefined;
+
+  const bedrockMessages = consolidateConsecutiveMessages([
+    ...conversationHistory,
     // Length cap (SPEC-ABUSE-CONTROLS): clamp an over-long user turn before the model call.
     // No-op unless MAX_USER_MESSAGE_LENGTH is set.
-    { role: 'user' as const, content: capUserMessage(userMessage) },
-  ];
+    // The cap runs BEFORE sanitisation renders it: a forged attribution prefix must not survive by
+    // sitting inside a message that was truncated after the strip.
+    {
+      role: 'user' as const,
+      content: capUserMessage(userMessage),
+      ...(currentSpeaker && { speaker: currentSpeaker }),
+    },
+  ]);
 
   return {
     messageId,
@@ -2005,6 +2562,8 @@ export async function finalizePlaceholderResponse(params: {
    *  the net transition applied this turn onto the analytics. Absent on non-task turns. */
   taskContext?: TaskLoopContext;
   attachment?: GeneratedDocument;
+  /** The INPUT guardrail blocked this turn before the model ran (structural fact, not text-shape). */
+  guardrailBlocked?: boolean;
   wasFallback?: boolean;
   fallbackReason?: string;
   retryCount?: number;
@@ -2070,7 +2629,9 @@ export async function finalizePlaceholderResponse(params: {
       botArn: event.botArn,
     });
     try {
-      await updateMessage(event.channelArn, messageId, 'No rebuttal.', event.botArn);
+      // A side declining to rebut IS its answer for round 2 - the duel is over for it, and the
+      // placeholder resolves to the outcome rather than to a step on the way to one.
+      await updateMessage(event.channelArn, messageId, 'No rebuttal.', event.botArn, 'final');
     } catch (err) {
       // Loud: a silently-swallowed failure here is exactly what hid the orphaned-placeholder bug.
       console.error('[AsyncProcessor][battle] Failed to resolve the NO_REBUTTAL placeholder:', err);
@@ -2087,6 +2648,7 @@ export async function finalizePlaceholderResponse(params: {
         round1MessageId: messageId,
         correlationId: event.correlationId,
         userMessage: event.userMessage,
+        classification: event.userType,
       });
     }
     return;
@@ -2115,14 +2677,85 @@ export async function finalizePlaceholderResponse(params: {
   // D: when the deliverable is an attachment, do NOT chunk the full
   // report inline (duplicated wall). Inline = a bounded lede; the full
   // content lives only in the attachment chip.
+  // KEEP the placeholder's own text above the answer when the caller asked for it (`messagePrefix` —
+  // today, the welcome). Applied to the DELIVERED text only: `response` stays the model's answer alone,
+  // so analytics, evals and the battle scorecard are not polluted with copy the model never produced.
+  //
+  // Prefixed BEFORE sizing, not after, so `handleLongResponse` chunks against what will actually be
+  // sent. Prepending to an already-sized chunk would push the first message past the Chime limit.
+  const deliverable = event.messagePrefix ? `${event.messagePrefix}\n\n${response}` : response;
+  // WHERE THE ANSWER LANDS, AND WHERE THE RECEIPT LANDS. The rule and its reasoning live in
+  // `planResumedChainDelivery`; this is the half that talks to Amazon Chime SDK.
+  //
+  // The answer's message is posted BEFORE sizing so continuation chunks hang off the message the answer
+  // is actually in, and inherit ITS target rather than the placeholder's - otherwise a long answer ends
+  // up half public.
+  const delivery = planResumedChainDelivery({
+    resumedChain: event.broadcastAnswer,
+    receiptAlreadyGiven: event.suppressAcknowledgement,
+    placeholderIsTargeted: replyIsTargeted,
+  });
+  let deliveryMessageId = messageId;
+  /** The message carrying the receipt, when it is the placeholder and still owes its final copy. */
+  let acknowledgementMessageId: string | undefined;
+  if (delivery.broadcastTheAnswer) {
+    // The placeholder is private, so it IS the receipt. The answer needs a public message of its own.
+    try {
+      const posted = await messagingClient.send(new SendChannelMessageCommand({
+        ChannelArn: event.channelArn,
+        Content: encodeURIComponent('...'),
+        Type: 'STANDARD',
+        Persistence: 'PERSISTENT',
+        ChimeBearer: event.botArn,
+        // No Target. That is the entire point of this branch.
+      }));
+      if (posted.MessageId) {
+        deliveryMessageId = posted.MessageId;
+        // Only once the answer HAS somewhere public to go. Re-labelling the placeholder as a receipt
+        // when the post failed would replace the person's answer with a note pointing at a message
+        // that was never written.
+        if (!event.suppressAcknowledgement) acknowledgementMessageId = messageId;
+      }
+    } catch (err) {
+      // Fall back to the placeholder rather than losing the answer. It stays private, which is a
+      // degraded duel rather than a missing one.
+      console.warn('[AsyncProcessor] could not post the broadcast answer message; answering in place:', err);
+    }
+  }
+  if (delivery.targetTheReceipt) {
+    // The placeholder is already public, so it IS the answer. The receipt needs a message of its own,
+    // and this is the half that cannot be inherited: there is no inbound target to inherit FROM, so the
+    // code names the recipient. Sent with its final copy rather than a placeholder to update later,
+    // because a receipt has nothing to wait for.
+    //
+    // Best-effort: a missing receipt costs the person a confirmation, and losing the answer to protect
+    // one would be the worse trade.
+    if (event.senderArn) {
+      try {
+        await messagingClient.send(new SendChannelMessageCommand({
+          ChannelArn: event.channelArn,
+          Content: encodeURIComponent(RESUMED_CHAIN_ACKNOWLEDGEMENT),
+          Type: 'STANDARD',
+          Persistence: 'PERSISTENT',
+          ChimeBearer: event.botArn,
+          Target: [{ MemberArn: event.senderArn }],
+        }));
+      } catch (err) {
+        console.warn('[AsyncProcessor] could not post the private receipt (the answer still lands):', err);
+      }
+    } else {
+      console.warn('[AsyncProcessor] no sender to acknowledge to; the answer lands untargeted with no receipt');
+    }
+  }
+
   const longResponseResult = attachment
     ? { content: buildAttachmentLede(response) }
     : await handleLongResponse(
-        response,
+        deliverable,
         event.userType,
         event.channelArn,
         event.botArn,
-        messageId,
+        deliveryMessageId,
       );
 
   const totalTime = Date.now() - startTime;
@@ -2163,10 +2796,20 @@ export async function finalizePlaceholderResponse(params: {
   // (first from → last to) applied this turn, so exchanges are sliceable by state and transitions
   // are countable. Distinct from activeTask.status (the task lifecycle) — this is the machine state.
   const taskTx = params.taskContext?.transitions;
+  // A task the router CREATED this turn carries the OPEN edge: `from` is empty, because nothing
+  // preceded the initial state. That empty `from` is what the turn-events projection reads as
+  // `task_opened` - it is a declared signal (the router set taskCreated when createTask ran), never
+  // inferred here. When the model ALSO advanced the machine on its first turn, the open edge wins the
+  // `from` slot and the final state wins `to`: opened_at is the fact this record must not lose, and
+  // the same-turn advance is still visible as taskState.
   const taskAnalytics = {
     taskState: params.taskContext?.task.taskState,
     taskTransition:
-      taskTx && taskTx.length ? { from: taskTx[0].from, to: taskTx[taskTx.length - 1].to } : undefined,
+      taskTx && taskTx.length
+        ? { from: event.taskCreated ? '' : taskTx[0].from, to: taskTx[taskTx.length - 1].to }
+        : event.taskCreated && params.taskContext?.task.taskState
+          ? { from: '', to: params.taskContext.task.taskState }
+          : undefined,
   };
 
   // Build analytics metadata
@@ -2178,6 +2821,9 @@ export async function finalizePlaceholderResponse(params: {
     intent: event.intent,
     intentConfidence: event.intentConfidence,
     deliveryOption: event.deliveryOption,
+    // Forwarded, not inferred. The router declares it; the ledger records it; nothing in between
+    // guesses, which is the property that makes a repaired turn distinguishable from a slow one.
+    ...(event.trigger && { trigger: event.trigger }),
     bedrockResponse: {
       model,
       inputTokens,
@@ -2192,6 +2838,7 @@ export async function finalizePlaceholderResponse(params: {
     ...(activeTaskInfo && { activeTask: activeTaskInfo }),
     ...(taskAnalytics.taskState && { taskState: taskAnalytics.taskState }),
     ...(taskAnalytics.taskTransition && { taskTransition: taskAnalytics.taskTransition }),
+    ...(params.guardrailBlocked && { guardrailBlocked: true }),
     ...(params.wasFallback !== undefined && { wasFallback: params.wasFallback }),
     ...(params.fallbackReason && { fallbackReason: params.fallbackReason }),
     ...(params.retryCount !== undefined && { retryCount: params.retryCount }),
@@ -2307,7 +2954,13 @@ export async function finalizePlaceholderResponse(params: {
   const messageMetadata: Record<string, unknown> = {
     ...(messageAnalyticsEnabled() ? pickFrontendMetadata(fullAnalytics) : fullAnalytics),
     ...(attachment && { attachment }),
-    ...(replyIsTargeted && event.senderArn && { targetedSender: event.senderArn }),
+    // AND the answer actually stayed on the targeted message: on a broadcast resume the final moves
+    // to a NEW public message (delivery.broadcastTheAnswer), and stamping targetedSender there made
+    // the public answer render a directed-reply chip and archive as targeted - contradicting its
+    // actual visibility. The stamp describes the message the metadata lands ON, not the placeholder
+    // the turn started with.
+    ...(replyIsTargeted && !delivery.broadcastTheAnswer && event.senderArn
+      && { targetedSender: event.senderArn }),
   };
 
   // /battle round-1 clarification (SPEC-BATTLE.md "Clarification
@@ -2316,79 +2969,53 @@ export async function finalizePlaceholderResponse(params: {
   // project-battle-clarification-measured-dimension): detection is the
   // explicit NEED_CLARIFICATION sentinel, never substring inference.
   //
-  // Detected BEFORE the visible placeholder is touched so the question
-  // is NEVER broadcast: the channel + rival see only a neutral waiting
-  // state; the question is sent targeted to the invoking user; the
-  // user's exchange stays private until the end-of-battle summary. A
-  // clarifying round-1 reply is NOT round-1 completion — the asking bot
-  // enters WAITING_FOR_USER so the round-2 orchestrator stays suppressed
-  // until this bot later completes (we return BEFORE the task-complete
-  // and terminal/orchestrator blocks). Idempotent under retry:
-  // markBotWaitingForUser is conditional on state=INVOKED, so a
-  // re-delivery returns false and clarificationCount is not double-counted.
+  // ONE message, broadcast (ADR-029): this side's placeholder becomes the QUESTION and stays that way.
+  // The second, `Target`-ed question message is gone, and with it the case where a clarification with
+  // no resolvable sender left the user with a waiting bubble and no question in it.
+  //
+  // A clarifying round-1 reply is NOT round-1 completion — the asking bot enters WAITING_FOR_USER so
+  // the round-2 orchestrator stays suppressed until this bot later completes (we return BEFORE the
+  // task-complete and terminal/orchestrator blocks). Idempotent under retry: markBotWaitingForUser is
+  // conditional on state=INVOKED, so a re-delivery returns false and clarificationCount is not
+  // double-counted.
   if (event.battleContext?.round === 1) {
     const clarification = parseBattleClarification(longResponseResult.content);
     if (clarification.needsClarification) {
       const delivery = planBattleClarificationDelivery({
         battleId: event.battleContext.battleId,
         botArn: event.botArn,
-        senderArn: event.senderArn,
         question: clarification.question,
       });
-      // Visible placeholder: neutral waiting state ONLY — no question,
-      // no battlestats scorecard (the bot has not completed round 1, so
-      // `finalContent` above is intentionally unused on this branch).
+      // No battlestats scorecard on this branch: the bot has not completed round 1, so `finalContent`
+      // above is intentionally unused.
       await updateMessage(
         event.channelArn,
         messageId,
         delivery.waitingPlaceholderContent,
         event.botArn,
+        // THE UPDATE THAT MOTIVATES THIS WHOLE CHANGE. A side asking the person a clarifying question
+        // posts a real, visible update - and it carries worker telemetry, so the old
+        // `total_ms IS NOT NULL` proxy read it as the final answer and froze `e2e_ms` at a moment the
+        // duel had not finished. The turn continues after this; the person has not been answered.
+        'interim',
         messageMetadata,
       );
-      // Clarifying question: targeted to the invoking user only.
-      if (delivery.targetedQuestion) {
-        try {
-          await messagingClient.send(
-            new SendChannelMessageCommand({
-              ChannelArn: event.channelArn,
-              Content: encodeURIComponent(delivery.targetedQuestion.content),
-              Type: 'STANDARD',
-              Persistence: 'PERSISTENT',
-              ChimeBearer: event.botArn,
-              Target: [{ MemberArn: delivery.targetedQuestion.targetMemberArn }],
-              Metadata: JSON.stringify({
-                battleClarification: true,
-                battleId: event.battleContext.battleId,
-                botArn: event.botArn,
-              }),
-            }),
-          );
-        } catch (err) {
-          console.warn('[AsyncProcessor][battle] targeted clarification send failed:', err);
-        }
-      } else {
-        console.warn(
-          '[AsyncProcessor][battle] clarification but no senderArn — question not delivered',
-          { battleId: event.battleContext.battleId, botArn: event.botArn },
-        );
-      }
       const marked = await markBotWaitingForUser({
         battleId: event.battleContext.battleId,
         botArn: event.botArn,
         question: clarification.question,
         correlationId: event.correlationId,
-        // Persist the placeholder we just turned into the waiting state
-        // so the resume path reuses THIS message (no orphan; the marker
-        // clearing is the frontend's "waiting ended" signal).
+        // The message now HOLDING THE QUESTION. The resume does not answer onto it - it posts its own
+        // placeholder (ADR-029) - it only clears this message's `<!--battlewaiting-->` marker so the
+        // frontend's waiting affordance ends while the question text stays in the transcript.
         waitingMessageId: messageId,
       });
       console.log(
-        '[AsyncProcessor][battle] Round-1 clarification — WAITING_FOR_USER (targeted question, orchestrator suppressed)',
+        '[AsyncProcessor][battle] Round-1 clarification — WAITING_FOR_USER (question posted, orchestrator suppressed)',
         {
           battleId: event.battleContext.battleId,
           botArn: event.botArn,
           transitioned: marked,
-          questionDelivered: !!delivery.targetedQuestion,
         },
       );
       return;
@@ -2402,7 +3029,10 @@ export async function finalizePlaceholderResponse(params: {
   // steps[] (per-Converse-iteration telemetry) lives ONLY here, never inline:
   // it would blow the 1024 Metadata cap and only archival/admin consume it.
   await writeMessageAnalytics({
-    messageId,
+    // The message the ANSWER is in, which on a broadcast resume is not the placeholder. Keyed on the
+    // wrong id, the analytics row would describe a message carrying an acknowledgement, and the
+    // archive would hold the answer with no telemetry attached to it.
+    messageId: deliveryMessageId,
     channelArn: event.channelArn,
     // steps + the latency split (model_ms/tool_ms) + processorEntryMs (server-clock handler entry, for
     // inbound_ms) ride the out-of-band record only, never the size-capped Chime Metadata (LATENCY-TARGETS.md).
@@ -2415,8 +3045,28 @@ export async function finalizePlaceholderResponse(params: {
     },
   });
 
-  // Update the placeholder message (non-clarification path)
-  await updateMessage(event.channelArn, messageId, finalContent, event.botArn, messageMetadata);
+  // Update the message the answer lands in (non-clarification path). On a broadcast resume that is the
+  // new untargeted message, and the private placeholder is then closed out with a one-line
+  // acknowledgement - leaving it saying "one moment" forever, next to an answer it never received,
+  // is how a person concludes their reply went nowhere.
+  await updateMessage(event.channelArn, deliveryMessageId, finalContent, event.botArn, 'final', messageMetadata);
+  if (acknowledgementMessageId && acknowledgementMessageId !== deliveryMessageId) {
+    try {
+      await updateMessage(
+        event.channelArn,
+        acknowledgementMessageId,
+        RESUMED_CHAIN_ACKNOWLEDGEMENT,
+        event.botArn,
+        // `final` FOR THIS MESSAGE, though the answer is in the other one. This closes the placeholder
+        // the person has been watching, at the moment their wait actually ended - which is what its
+        // `e2e_ms` should say. Calling it a notice would leave that placeholder measured as never
+        // resolved, reporting a measurement gap on a turn that answered correctly.
+        'final',
+      );
+    } catch (err) {
+      console.warn('[AsyncProcessor] could not close out the private acknowledgement:', err);
+    }
+  }
 
   console.log('[AsyncProcessor] Message updated successfully', {
     pollTime,
@@ -2424,44 +3074,69 @@ export async function finalizePlaceholderResponse(params: {
     totalTime,
   });
 
-  // Battle TASK_* round-1 gate. premium-async-processor has already
-  // advanced the state machine for this turn before finalize, so the
-  // task's REAL state tells us whether round-1 is actually done.
-  const isBattleTaskInvocation =
-    !!event.battleContext &&
-    (event.deliveryOption === 'TASK_UPDATE_IN_PLACE' ||
-      event.deliveryOption === 'TASK_MULTI_STEP');
-
-  let roundComplete:
-    | { deliveryOption?: string; taskType?: string; taskState?: string; taskStatus?: string }
-    | undefined;
-  if (isBattleTaskInvocation && event.taskId) {
-    const t = await getTask(event.taskId, event.channelArn);
-    roundComplete = {
-      deliveryOption: event.deliveryOption,
-      taskType: event.taskType || t?.taskType,
-      taskState: t?.taskState,
-      taskStatus: t?.status,
-    };
-  }
-  const battleRoundDone = !roundComplete || isBattleRound1Complete(roundComplete);
-
   // Update task status if task-based — but NEVER force-complete a machine-backed task mid-flow (AT6):
-  // like a battle task, a non-battle task only becomes 'completed' once its state machine reaches a
-  // TERMINAL state; before that it stays 'in_progress' so the lifecycle status never contradicts the
-  // machine state. Battle mid-chain is still excluded by the existing round guard.
-  if (event.taskId && !(isBattleTaskInvocation && !battleRoundDone)) {
+  // a task only becomes 'completed' once its state machine reaches a TERMINAL state; before that it
+  // stays 'in_progress' so the lifecycle status never contradicts the machine state.
+  //
+  // NO BATTLE GATE HERE ANY MORE (ADR-023, DESIGN-BATTLE §2a). A battle is not a task: whether a duel
+  // side has finished its ROUND is a battle question, and whether a task has reached a terminal state
+  // is a task question. This used to skip the update entirely mid-chain on a battle turn, which meant
+  // a duel's task progressed differently from an identical non-duel task. `shouldMarkTaskCompleted`
+  // already refuses to force-complete a machine-backed task, so the ordinary rule is sufficient and
+  // the battle-specific one only made the two paths diverge.
+  // `taskStillRunning` is read by the battle block below: a duel side whose chain has more legs to go is
+  // BUSY, not finished (ADR-026).
+  let taskStillRunning = false;
+  if (event.taskId) {
     const machineState = params.taskContext?.task.taskState;
-    const status: TaskStatus = shouldMarkTaskCompleted(event.taskType ?? params.taskContext?.task.taskType, machineState) ? 'completed' : 'in_progress';
+    const taskComplete = shouldMarkTaskCompleted(event.taskType ?? params.taskContext?.task.taskType, machineState);
+    const status: TaskStatus = taskComplete ? 'completed' : 'in_progress';
     await updateTaskStatus(event.taskId, event.channelArn, status, response.substring(0, 500));
+    taskStillRunning = !taskComplete;
   }
 
   // /battle: record the per-bot terminal state row. On the LAST writer's
-  // round-1 transition this also fires the orchestrator for round 2.
-  // Round-2 transitions are recorded but never refire round-2 (guarded
-  // inside the helper). The roundComplete gate (when set) makes a
-  // mid-chain TASK_* update a no-op here.
+  // round-1 transition this also fires round 2. Round-2 transitions are
+  // recorded but never refire round-2 (guarded inside the helper).
+  //
+  // A SIDE'S ROUND IS DONE WHEN IT HAS PRODUCED ITS RESPONSE (ADR-023), and a side still working WITH
+  // THE USER has not produced it yet (ADR-026).
+  //
+  // Those are the same rule, not two. The separation ADR-023 made was that battle completion is never
+  // DEFINED BY task terminality - `isBattleRound1Complete` asked a task question to answer a battle one,
+  // which gave a task-shaped duel a different completion rule from any other. That stands: there is no
+  // such predicate here and a guard test keeps it that way.
+  //
+  // What a task-shaped side needs is not a different completion rule but the RIGHT STATE between legs.
+  // `WAITING_FOR_USER` is already non-terminal and `allBotsTerminal` already ignores it, so the machinery
+  // that suspends round 2 for a clarifying question suspends it for a task step too. A side mid-chain is
+  // BUSY, not incomplete, and the state machine already had a word for that.
+  //
+  // Why it matters: a rebuttal of a half-collected report is not a rebuttal. Round 2 firing while one
+  // side sat at `collecting_requirements` compared a finished answer against an unfinished one and called
+  // it a duel.
   if (event.battleContext) {
+    if (event.battleContext.round === 1 && taskStillRunning) {
+      const marked = await markBotWaitingForUser({
+        battleId: event.battleContext.battleId,
+        botArn: event.botArn,
+        correlationId: event.correlationId,
+        // NOT a clarification: the side did not choose to ask, its state machine needs the next input.
+        // Counting these would inflate the measured clarification rate by the task's step count.
+        reason: 'task-step',
+        // Deliberately NO `waitingMessageId`. The message just updated carries this leg's real answer and
+        // the user should keep seeing it; the next leg posts its own. Reusing it would overwrite the step
+        // the user is reading in order to say "one moment" again.
+      });
+      console.log('[AsyncProcessor][battle] round-1 task leg done, chain still running — WAITING_FOR_USER', {
+        battleId: event.battleContext.battleId,
+        botArn: event.botArn,
+        taskId: event.taskId,
+        taskState: params.taskContext?.task.taskState,
+        transitioned: marked,
+      });
+      return;
+    }
     const fired = await recordBattleTerminalAndFireOrchestrator({
       battleContext: event.battleContext,
       channelArn: event.channelArn,
@@ -2471,7 +3146,7 @@ export async function finalizePlaceholderResponse(params: {
       round1MessageId: messageId,
       correlationId: event.correlationId,
       userMessage: event.userMessage,
-      ...(roundComplete && { roundComplete }),
+      classification: event.userType,
     });
     if (fired) {
       console.log('[AsyncProcessor][battle] Fired orchestrator for round 2', {
@@ -2529,7 +3204,7 @@ export function isDocumentRequest(userMessage: string): boolean {
  *
  * A deliverable document is SUBSTANTIAL (a clarifying question is never this long) AND STRUCTURED like a
  * document: a markdown heading, a markdown table (an extraction's natural shape), or several list items
- * in a long body.
+ * in a long body — AND it must not be SOLICITING input (see solicitsInput).
  */
 export function isDeliverableDocument(response: string | null | undefined): boolean {
   const text = (response || '').trim();
@@ -2537,9 +3212,54 @@ export function isDeliverableDocument(response: string | null | undefined): bool
   const hasHeading = /(^|\n)#{1,6}\s+\S/.test(text); // "# Title" / "## Section"
   const hasTable = /(^|\n)\s*\|.+\|\s*\n\s*\|[-:\s|]+\|/.test(text); // markdown table w/ header rule
   const listItems = (text.match(/(^|\n)\s*(?:[-*]\s+|\d+\.\s+)\S/g) || []).length;
+  // A requirements-gathering turn is ASKING, never delivering, however long and tidy it looks.
+  // Length + structure alone cannot tell the two apart, so veto on intent first.
+  if (solicitsInput(text)) return false;
   // A heading or a table is a strong document signal; a plain list needs several items AND a long
   // body so a 3-bullet answer doesn't masquerade as a deliverable.
   return hasHeading || hasTable || (listItems >= 4 && text.length >= 800);
+}
+
+// Phrases a requirements-gathering turn opens with. Matched only in the OPENING window: a turn that
+// asks for input announces it up front ("to get started, please provide the following details"),
+// whereas a delivered report may legitimately use the same words deep in its body (a recommendations
+// section saying "let me know"), so an anywhere-match would suppress real deliverables.
+const SOLICITATION_OPENERS = [
+  'please provide', 'please share', 'please confirm', 'please specify', 'please answer',
+  'could you provide', 'could you share', 'could you confirm', 'could you clarify',
+  'can you provide', 'can you share', 'can you confirm', 'can you clarify',
+  'let me know', 'to get started', 'before i can', 'before i begin', 'before i start',
+  'i need the following', "i'll need", 'i will need', 'i need a few', 'need some details',
+  'gathering the requirements', 'gather the requirements', 'a few questions', 'some questions',
+  'the following details', 'the following information', 'to tailor', 'to better tailor',
+];
+const SOLICITATION_WINDOW = 400;
+
+/**
+ * Is THIS response asking the user for information rather than delivering content?
+ *
+ * The structural bar (substantial + structured) cannot separate a finished report from a long,
+ * well-formatted questionnaire: a verbose model answering a `collecting_requirements` turn writes
+ * "Please provide the following details:" followed by a numbered list, which clears both the length
+ * and the list-item bar. Live-verified on the standard classification, where such a turn was uploaded
+ * as `report-*.md` AND completed the task while it was still asking (the completion gate keys on
+ * isDeliverableDocument, so a false positive here both attaches the wrong thing and closes the task).
+ *
+ * Two signals, each scoped to keep real deliverables safe:
+ *  1. A solicitation phrase in the opening window (see SOLICITATION_OPENERS).
+ *  2. Two or more questions in a body with NO heading and NO table. A heading or a table is a strong
+ *     document signal, so this only ever vetoes the WEAK list-only branch — which is precisely the
+ *     shape a requirements questionnaire takes.
+ */
+export function solicitsInput(response: string | null | undefined): boolean {
+  const text = (response || '').trim();
+  if (!text) return false;
+  const opening = text.slice(0, SOLICITATION_WINDOW).toLowerCase();
+  if (SOLICITATION_OPENERS.some(p => opening.includes(p))) return true;
+  const hasHeading = /(^|\n)#{1,6}\s+\S/.test(text);
+  const hasTable = /(^|\n)\s*\|.+\|\s*\n\s*\|[-:\s|]+\|/.test(text);
+  if (!hasHeading && !hasTable && (text.match(/\?/g) || []).length >= 2) return true;
+  return false;
 }
 
 export interface GeneratedDocument {
@@ -2574,7 +3294,9 @@ export async function generateAndUploadDocument(
     Bucket: bucketName,
     Key: fileKey,
     Body: bodyBuffer,
-    ContentType: 'text/markdown',
+    // The charset is declared, or a viewer decodes these UTF-8 bytes as windows-1252 and every
+    // em-dash renders as mojibake (reported live 2026-08-18 on a delivered report).
+    ContentType: 'text/markdown; charset=utf-8',
     ServerSideEncryption: 'AES256',
     Metadata: {
       channelArn,
@@ -2706,13 +3428,23 @@ export async function buildTaskLoopContext(args: {
   taskType?: string;
   channelArn: string;
   messageId?: string;
+  /** Per-assistant task machines from the resolved profile (SPEC-CONFIGURABLE-ASSISTANTS 4.5). When
+   *  present they are PREFERRED over the deployment pack, MERGED per taskType so a profile can override a
+   *  subset and inherit the rest. Absent ⇒ the deployment pack alone (byte-identical to before 4.5). */
+  machines?: Record<string, TaskStateMachine>;
+  /** The bot answering this turn, as a principal id (see TaskLoopContext.assistantId). */
+  assistantId?: string;
 }): Promise<TaskLoopContext | undefined> {
   if (!args.taskId || !args.taskType) return undefined;
-  const machines = taskStateMachines();
+  const base = taskStateMachines();
+  const machines = args.machines ? { ...base, ...args.machines } : base;
   if (!machines[args.taskType]) return undefined;
   const task = await getTask(args.taskId, args.channelArn);
   if (!task || !task.taskState) return undefined;
-  return { task, machines, messageId: args.messageId, initialState: task.taskState, transitions: [] };
+  return {
+    task, machines, messageId: args.messageId, initialState: task.taskState, transitions: [],
+    ...(args.assistantId ? { assistantId: args.assistantId } : {}),
+  };
 }
 
 /**
@@ -2726,7 +3458,9 @@ export function shadowKeywordTransition(response: string, ctx: TaskLoopContext, 
   const taskType = ctx.task.taskType;
   const from = ctx.initialState;
   if (!taskType || !from) return;
-  const keywordWouldAdvance = detectStateTransition(response, taskType, from, TASK_STATE_MACHINES);
+  // Detect against the RESOLVED machines this loop is running (per-assistant, 4.5), derived to the
+  // state-name shape — not the deployment-default const — so the shadow measures the real graph.
+  const keywordWouldAdvance = detectStateTransition(response, taskType, from, stateNamesOf(ctx.machines));
   const toolAdvanced = (ctx.transitions?.length ?? 0) > 0;
   if (keywordWouldAdvance || toolAdvanced) {
     console.log(
@@ -2769,9 +3503,14 @@ export async function postTaskHandoffNotice(args: {
   senderArn?: string;
 }): Promise<boolean> {
   const senderSub = args.senderArn?.split('/user/').pop();
-  // Only notify a hand-off to SOMEONE ELSE — the assignee chatting right now needs no email.
-  if (!args.task.assigneeUserSub || args.task.assigneeUserSub === senderSub) return false;
-  const target = matchAssigneeInRoster(args.task.assigneeUserSub, args.roster);
+  const owner = resolveTaskOwner(args.task);
+  // An ASSISTANT owner is not notified, and this is now a branch rather than a fallthrough (ADR-024).
+  // It used to fall out of `matchAssigneeInRoster` returning null, which also happens when the human
+  // owner has LEFT the conversation — so a dropped notification and a bot owner were indistinguishable.
+  if (!owner || owner.type !== 'user') return false;
+  // Only notify a hand-off to SOMEONE ELSE — the owner chatting right now needs no email.
+  if (owner.id === senderSub) return false;
+  const target = matchAssigneeInRoster(owner.id, args.roster);
   if (!target) return false;
   const notice = buildAssignmentNotice(args.task);
   try {
@@ -3014,42 +3753,6 @@ export function resolveTurnImageGenModelId(input: {
  * terminal AND this caller successfully claimed the orchestrator-fire
  * sentinel. The caller can use this to log "I fired round 2."
  */
-/**
- * Round-1 completion semantics (SPEC-BATTLE.md). Round-2 must not fire
- * until each bot has FULLY completed the round-1 intent — for a TASK_*
- * battle that means the bot's task chain reached a terminal state, NOT
- * merely that the first async UpdateChannelMessage landed.
- *
- *   DIRECT / PLACEHOLDER_UPDATE → complete when the async update lands
- *   TASK_UPDATE_IN_PLACE / TASK_MULTI_STEP → complete only when the
- *     task chain is terminal (status completed|failed, OR taskState is
- *     a terminal state / the last state of the taskType machine)
- *
- * Unknown/absent deliveryOption falls back to "complete" so an
- * unrecognised path can never strand a battle (preserves the prior
- * unconditional behaviour for non-TASK invocations). Pure → unit-test.
- */
-const TERMINAL_TASK_STATES = new Set(['completed', 'resolved', 'escalated', 'failed']);
-
-export function isBattleRound1Complete(input: {
-  deliveryOption?: string;
-  taskType?: string;
-  taskState?: string;
-  taskStatus?: TaskStatus | string;
-}): boolean {
-  const d = input.deliveryOption;
-  if (d === 'TASK_UPDATE_IN_PLACE' || d === 'TASK_MULTI_STEP') {
-    if (input.taskStatus === 'completed' || input.taskStatus === 'failed') return true;
-    if (input.taskState && TERMINAL_TASK_STATES.has(input.taskState)) return true;
-    if (input.taskType && input.taskState) {
-      const states = TASK_STATE_MACHINES[input.taskType];
-      if (states && input.taskState === states[states.length - 1]) return true;
-    }
-    return false;
-  }
-  // DIRECT, PLACEHOLDER_UPDATE, or anything unrecognised → complete.
-  return true;
-}
 
 export async function recordBattleTerminalAndFireOrchestrator(args: {
   battleContext: BattleContextPayload;
@@ -3061,34 +3764,10 @@ export async function recordBattleTerminalAndFireOrchestrator(args: {
   correlationId: string;
   /** Original /battle user message text — passed through to the orchestrator's round-2 payload. */
   userMessage: string;
-  /**
-   * Phase-2 TASK_* gate. When provided AND this is NOT a failure
-   * (response !== null), the per-bot terminal write is skipped unless
-   * isBattleRound1Complete() says round-1 is actually done — so a
-   * mid-chain TASK_* async update doesn't prematurely mark the bot
-   * COMPLETED and fire round-2. Omitted (current callers) → the prior
-   * unconditional behaviour, so this is zero-regression until a caller
-   * opts in (next brick). A hard failure is always terminal.
-   */
-  roundComplete?: {
-    deliveryOption?: string;
-    taskType?: string;
-    taskState?: string;
-    taskStatus?: string;
-  };
+  /** The channel's classification, so round 2 answers where round 1 did rather than on premium. */
+  classification?: string;
 }): Promise<boolean> {
   const { battleContext, response, selfBotArn, correlationId } = args;
-
-  // TASK_* round-1 gate: a mid-chain (non-terminal) task update is not
-  // round-1 completion. Failures (response === null) are always
-  // terminal — a failed bot can't continue its chain.
-  if (
-    response !== null &&
-    args.roundComplete &&
-    !isBattleRound1Complete(args.roundComplete)
-  ) {
-    return false;
-  }
 
   const terminalState = response !== null ? 'COMPLETED' : 'FAILED';
 
@@ -3131,6 +3810,10 @@ export async function recordBattleTerminalAndFireOrchestrator(args: {
           userMessage: args.userMessage,
           senderArn: args.senderArn,
           originatingMessageId: battleContext.originatingMessageId || '',
+          // The duel's classification, so ROUND 2 answers where round 1 did. Without it the
+          // orchestrator had nothing to route on and answered every rebuttal on the premium
+          // processor - an escalation for any duel a `battleEligible` profile enabled below premium.
+          classification: args.classification,
         })),
       }),
     );
@@ -3214,36 +3897,39 @@ export function parseBattleClarification(response: string): BattleClarification 
 
 export interface BattleClarificationDelivery {
   /**
-   * What the channel + rival bot see in the placeholder — a neutral
-   * waiting state ONLY, never the question. Carries the
-   * `<!--battlewaiting-->` marker the frontend (brick 2B-xii) renders
-   * as the "Replying to:" affordance — this marker shape is a contract;
-   * keep it parallel to `<!--battlestats-->` / `<!--battle-->`.
+   * What replaces this side's placeholder: the QUESTION ITSELF, broadcast like every other duel
+   * message, plus the `<!--battlewaiting-->` marker the frontend renders as the "Replying to:"
+   * affordance. The marker shape is a contract; keep it parallel to `<!--battlestats-->` /
+   * `<!--battle-->`.
    */
   waitingPlaceholderContent: string;
-  /**
-   * The clarifying question, addressed to the invoking user ONLY. null
-   * when there is no senderArn to target — the caller still enters
-   * WAITING_FOR_USER (a lost question is recoverable by re-prompting; a
-   * wrongly-fired round-2 is not), but logs that the question wasn't
-   * delivered.
-   */
-  targetedQuestion: { content: string; targetMemberArn: string } | null;
 }
 
 /**
- * Pure. SPEC-BATTLE.md "Clarification Routing": shape the two outputs
- * of a round-1 clarification so the channel + rival see ONLY a neutral
- * waiting state while the question goes targeted to the invoking user.
- * The user's clarification exchange stays private until the
- * end-of-battle summary (project-battle-clarification-measured-
- * dimension — broadcasting it would let a bot that failed to ask
- * free-ride on its rival's clarification). Pure → unit-test.
+ * Pure. What a round-1 clarification puts on the channel (ADR-029).
+ *
+ * THE QUESTION IS PUBLIC AND PERMANENT. It replaces this side's placeholder and stays there, so the
+ * duel reads as a conversation: question, the user's reply, then the answer on a placeholder of its
+ * own. This REVERSES the previous rule, which showed a neutral "Assistant is waiting for your
+ * response." and sent the real question as a second, `Target`-ed message.
+ *
+ * WHY THE REVERSAL. The privacy rule existed for a measurement reason - a side that did not think to
+ * ask should not free-ride on its rival's clarification - and it survives a far smaller mechanism. The
+ * rival seeing the QUESTION learns what the asker found ambiguous; it does not learn the ANSWER, which
+ * is where the information the user supplied lives, and which stays targeted at the asking assistant.
+ * Concealing the question additionally cost the transcript, the event archive and the end-of-battle
+ * summary, which is why SPEC-BATTLE could not retain the verbatim exchange: the answer half was never
+ * written down anywhere.
+ *
+ * It also earns something. A round-2 rebuttal can now see whether its rival asked a useful clarifying
+ * question or a needless one, and say so - a dimension of the comparison that was invisible.
+ *
+ * `senderArn` is no longer an input: nothing is targeted here, so a clarification with no resolvable
+ * sender is no longer a question that silently fails to arrive.
  */
 export function planBattleClarificationDelivery(args: {
   battleId: string;
   botArn: string;
-  senderArn?: string;
   question?: string;
 }): BattleClarificationDelivery {
   const waitingMarker = `<!--battlewaiting:battleId=${args.battleId},botArn=${args.botArn}-->`;
@@ -3251,10 +3937,7 @@ export function planBattleClarificationDelivery(args: {
     (args.question ?? '').trim() ||
     'Could you clarify your request so I can give you the best answer?';
   return {
-    waitingPlaceholderContent: `Assistant is waiting for your response.${waitingMarker}`,
-    targetedQuestion: args.senderArn
-      ? { content: question, targetMemberArn: args.senderArn }
-      : null,
+    waitingPlaceholderContent: `${question}${waitingMarker}`,
   };
 }
 

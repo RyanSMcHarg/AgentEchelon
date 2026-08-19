@@ -259,19 +259,15 @@
   background: var(--tier-premium);
 }
 
-.conversation-header-members-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 4px;
-  padding: 3px var(--space-2);
-  background: var(--surface-100);
-  color: var(--text-secondary);
-  border-radius: var(--radius-full);
+/* Member count, rendered INSIDE the members toggle button. It was previously a separate chip beside
+   the button, which drew the same people icon twice - one clickable, one not. */
+.conversation-header-btn-count {
+  margin-left: 4px;
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   font-weight: 500;
   letter-spacing: var(--tracking-wide);
-  flex-shrink: 0;
+  line-height: 1;
 }
 
 .conversation-header-actions {
@@ -608,24 +604,6 @@
   outline: none;
 }
 
-/* /battle generation-out: the model's rendered image(s) under the
-   reply text. Reuses existing tokens (no new design tokens). The two
-   variants sit side-by-side because each bot's battle-message renders
-   adjacently with the shared scorecard below. */
-.battle-generated-images {
-  display: flex;
-  flex-wrap: wrap;
-  gap: var(--space-2);
-  margin-top: var(--space-2);
-}
-
-.battle-generated-image {
-  max-width: 100%;
-  height: auto;
-  border-radius: var(--radius-md);
-  border: 1px solid var(--accent-200);
-}
-
 /* Subtle left border on agent messages */
 .assistant-message .message-text {
   padding-left: var(--space-4);
@@ -935,4 +913,98 @@
   width: 2px;
   background: linear-gradient(180deg, var(--accent-500), transparent);
   pointer-events: none;
+}
+
+/* Durable link into a conversation this one continued into (drift redirect).
+   Rendered from message metadata, so it survives the marker stripping that removes the
+   one-shot NAVIGATE_CHANNEL directive from the displayed text. Styled as a link rather than
+   a primary button: it is a way back to something, not the message's main action. */
+.drift-redirect-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  margin-top: 0.5rem;
+  padding: 0;
+  background: none;
+  border: none;
+  color: var(--color-primary, #2563eb);
+  font: inherit;
+  font-weight: 500;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+  cursor: pointer;
+}
+
+.drift-redirect-link:hover,
+.drift-redirect-link:focus-visible {
+  text-decoration-thickness: 2px;
+}
+
+.drift-redirect-link::before {
+  content: '↳';
+  text-decoration: none;
+  opacity: 0.75;
+}
+
+/* A message reached by a `#message=<id>` deep link. Briefly marked so the reader can see WHICH message
+   the link meant, then cleared - a permanent highlight would read as unread state. */
+.message--focused .message-content {
+  animation: message-focus-pulse 2.4s ease-out;
+  border-radius: 8px;
+}
+
+@keyframes message-focus-pulse {
+  0%, 55% {
+    box-shadow: 0 0 0 2px var(--color-primary, #2563eb);
+    background-color: color-mix(in srgb, var(--color-primary, #2563eb) 8%, transparent);
+  }
+  100% {
+    box-shadow: 0 0 0 2px transparent;
+    background-color: transparent;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Mobile header
+   ---------------------------------------------------------------------------
+   The conversation name takes the FULL width of the row and the metadata drops
+   below it. On a narrow screen the title, the tier pill and the action buttons
+   were competing for one line, so the name - the only thing identifying which
+   conversation you are in - was the part that got ellipsised away.
+
+   The title group wraps to its own full-width line; the tier pill and actions
+   follow underneath. 640px rather than the 968px used by the registration
+   screen: this header only runs out of room at phone widths, and collapsing it
+   on a tablet would waste vertical space that is not under pressure there.
+   --------------------------------------------------------------------------- */
+@media (max-width: 640px) {
+  .conversation-header-content {
+    flex-wrap: wrap;
+    padding: var(--space-3) var(--space-4);
+    row-gap: var(--space-2);
+  }
+
+  /* 100% of the row, so the name is never truncated to make room for controls. */
+  .conversation-header-title-group {
+    flex: 0 0 100%;
+    width: 100%;
+    min-width: 0;
+  }
+
+  .conversation-header-title,
+  .conversation-header-title-input {
+    width: 100%;
+    max-width: 100%;
+  }
+
+  /* The rename affordance stays on the title line; the input must not force the
+     row wider than the viewport. */
+  .conversation-header-title-input {
+    min-width: 0;
+  }
+
+  /* Metadata and controls share the second line. */
+  .conversation-header-actions {
+    margin-left: auto;
+  }
 }

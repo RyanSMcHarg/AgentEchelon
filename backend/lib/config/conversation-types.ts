@@ -65,6 +65,51 @@ export interface ParticipantPolicy {
   resolveVia?: ConnectorRef[];
 }
 
+/**
+ * How a conversation type's welcome template becomes copy.
+ *
+ * `interpolated` substitutes the assembled orientation into the template with NO model call. It is the
+ * deterministic path and the FALLBACK THAT KEEPS THE WELCOME LANDING: a welcome that always arrives is
+ * the one property this surface cannot trade away.
+ *
+ * `generated` has the assistant fill in and ADJUST the template against the orientation it was given,
+ * which is what a conversation type carrying arbitrary context (incident state, a prior conversation)
+ * needs - no template can usefully summarise state it has never seen. It costs a Bedrock call per new
+ * conversation, brings the output guardrail onto the welcome, and must fall back to `interpolated` on a
+ * deadline miss or when the model is unavailable.
+ *
+ * Naming deliberately mirrors `AssistantProfile.classifierMode` (`'llm' | 'keyword'`): the platform
+ * already has a "model or not" axis and should not grow a second vocabulary for it.
+ */
+export type WelcomeRenderMode = 'interpolated' | 'generated';
+
+/**
+ * Per-conversation-type welcome configuration. ABSENT means today's behaviour exactly: the built-in
+ * clause assembly, interpolated, over the deployment orientation plus whatever the channel carries.
+ *
+ * This is the axis that makes a new use case configuration rather than code. An incident-escalation
+ * meeting and a drift follow-up differ in which context orients them and in what the opening should
+ * emphasise - not in which handler runs.
+ */
+export interface WelcomeConfig {
+  /** Absent ⇒ `interpolated`. See {@link WelcomeRenderMode}. */
+  mode?: WelcomeRenderMode;
+  /**
+   * The template the welcome is built from. Absent ⇒ the built-in clause assembly in
+   * `welcome-orientation.ts`, so an un-configured type is byte-identical to today.
+   */
+  template?: string;
+  /**
+   * Context-source keys that orient this type's welcome, resolved against the published catalog at the
+   * WelcomeIntent call site. Absent ⇒ the deployment orientation parameter alone.
+   *
+   * A source whose `availability` is unmet at WelcomeIntent is OMITTED, never awaited - the welcome
+   * fires on the assistant's channel membership, before the creator's membership and channel metadata
+   * converge, so waiting would trade promptness for data that may never arrive.
+   */
+  contextKeys?: string[];
+}
+
 /** Chime channel-expiration criterion: age since creation, or since the last message. */
 export type ExpirationCriterion = 'CREATED_TIMESTAMP' | 'LAST_MESSAGE_TIMESTAMP';
 
@@ -107,6 +152,12 @@ export interface ConversationTypeConfig {
   capabilities?: Capabilities;
   /** Who participates + how non-creator humans are resolved/admitted. */
   participants?: ParticipantPolicy;
+  /**
+   * How this type opens a conversation: which context orients the welcome, and how the template becomes
+   * copy. Absent ⇒ the built-in interpolated assembly over the deployment orientation (today's
+   * behaviour, unchanged). See {@link WelcomeConfig} and {@link resolveWelcomeConfig}.
+   */
+  welcome?: WelcomeConfig;
   /** External vendor systems this type may use (broad per-vendor connectors). */
   connectors?: ConnectorRef[];
   /** How a departed member appears in history: hard-`delete` (ARN stops resolving →
@@ -182,4 +233,34 @@ export function getConversationTypeConfig(typeKey: string): ConversationTypeConf
 /** Is the user-facing live drift flow enabled for this conversation type? */
 export function isDriftEnabledForType(typeKey: string): boolean {
   return getConversationTypeConfig(typeKey).driftEnabled;
+}
+
+/** A {@link WelcomeConfig} with every default applied, so no caller has to know them. */
+export interface ResolvedWelcomeConfig {
+  mode: WelcomeRenderMode;
+  /** Undefined ⇒ use the built-in clause assembly. */
+  template?: string;
+  contextKeys: string[];
+}
+
+/**
+ * Resolve a conversation type's welcome configuration, defaults applied.
+ *
+ * Exists as its own function rather than as inline `??` at the call site so the DEFAULTS ARE TESTABLE
+ * independently of the router. The default has to be byte-identical to today's behaviour: adding this
+ * field must not change a single existing deployment's welcome, and "no config" is the state every
+ * shipped conversation type is in.
+ *
+ * `mode` degrades to `interpolated` for an unrecognised value rather than throwing or guessing
+ * `generated`. Failing towards the deterministic, no-model path costs richness; failing towards the
+ * model path would spend Bedrock on every new conversation because of a typo in a config file.
+ */
+export function resolveWelcomeConfig(typeKey: string): ResolvedWelcomeConfig {
+  const configured = getConversationTypeConfig(typeKey).welcome ?? {};
+  const mode: WelcomeRenderMode = configured.mode === 'generated' ? 'generated' : 'interpolated';
+  const template = configured.template?.trim() ? configured.template : undefined;
+  const contextKeys = (configured.contextKeys ?? [])
+    .map((k) => k.trim())
+    .filter((k) => k.length > 0);
+  return { mode, template, contextKeys };
 }

@@ -125,9 +125,10 @@ describe('invokeBedrock Converse tool loop (ADR-011)', () => {
     expect(r.outputTokens).toBe(50);
     expect(mockBedrockSend).toHaveBeenCalledTimes(2);
     expect(mockLoadContext).toHaveBeenCalledTimes(1);
-    // loadCompanyContext takes an optional second `documents` arg (undefined when the turn
-    // carries no attachments); assert both so the call signature stays pinned.
-    expect(mockLoadContext).toHaveBeenCalledWith('test-context-bucket', undefined);
+    // loadCompanyContext takes (bucket, callerClassification, opts?): the classification scopes the
+    // context/{c}/ prefixes (SPEC-CONFIGURABLE-ASSISTANTS 4.1), and the 3rd `documents` arg is undefined
+    // when the turn carries no attachments. Assert all three so the call signature stays pinned.
+    expect(mockLoadContext).toHaveBeenCalledWith('test-context-bucket', 'basic', undefined);
 
     // the second Converse call carried a user toolResult for t1
     const secondMessages = mockBedrockSend.mock.calls[1][0].input.messages;

@@ -1,3 +1,13 @@
+---
+title: "ADR-016: Compact message-metadata encoding (coded states + out-of-band analytics)"
+status: Accepted
+scope: Phase 0 (graceful-shedding backstop and budget guard) and phase 1 (out-of-band analytics keyed by message id). Technique A, coded state values, is specified for a later phase.
+date: 2026-07-16
+related:
+  - "../../specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md"
+  - "../../../backend/lambda/src/analytics-aurora/kinesis-archival.ts"
+---
+
 # ADR-016: Compact message-metadata encoding (coded states + out-of-band analytics)
 
 > **Status:** Accepted, partially implemented (governs `docs/specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md`). Phase 0 (graceful-shedding backstop + budget guard) and **Phase 1 (Technique B - out-of-band analytics keyed by message id)** are shipped; Technique A (coded state values) is designed, not yet built.

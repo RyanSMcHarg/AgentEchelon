@@ -30,13 +30,16 @@ import {
   AsyncProcessorConfig,
   GeneratedDocument,
   runSharedPipeline,
+  scanForPlaceholderMessage,
   firstTurnGreetingDirective,
+  userIdentityDirective,
   handleProcessingError,
   finalizePlaceholderResponse,
   generateAndUploadDocument,
   isDocumentRequest,
   isDeliverableDocument,
   getTaskLabel,
+  applyInputGuardrail,
   applyOutputGuardrail,
   WORK_ITEM_OPENAI_TOOLS,
   WORK_ITEM_TOOL_NAMES,
@@ -58,6 +61,9 @@ import {
   type BedrockImageInput,
   type BedrockDocumentInput,
 } from './lib/async-processor-core.js';
+// First-turn summary seed. Runs through the data-plane seam (ADR-013): this processor
+// is non-VPC, so the Aurora write + Bedrock summarisation happen in the data-plane Lambda.
+import { seedConversationSummary } from './lib/data-plane-client.js';
 import { fetchAttachmentBytes, senderOwnsAttachmentKey } from './lib/attachment-bytes.js';
 import { stripReasoningTags } from './lib/message-markers.js';
 import type { RosterParticipant } from './lib/channel-notify.js';
@@ -68,26 +74,40 @@ import { invokeBedrockWithFallback } from './lib/bedrock-resilience.js';
 import { makeConverseStep, type ConverseStep } from './lib/analytics-metadata.js';
 import { resolveModelPlan } from './lib/resolve-model-plan.js';
 import { externalProviderFromEnv, invokeExternalLlm } from './lib/providers/external-llm.js';
-import { invokeImageGenModel } from './lib/image-gen-models.js';
+import { transcriptConventionDirective } from './lib/transcript-attribution.js';
+import {
+  invokeImageGenModel,
+  imageGenRegionFor,
+  imageGuardrailFor,
+  imageGenModelIdToKey,
+  IMAGE_GEN_MODELS,
+} from './lib/image-gen-models.js';
 import { persistImageGenOutput, buildBattleImageContent, buildImageGenAttachment } from './lib/image-gen-output.js';
 import { buildRetrievedContextHint, buildConversationSummaryHint } from './analytics-aurora/document-retrieval.js';
+import { readPublishedCatalog, selectSources, resolveContextSources, renderContextMenu, renderSourceSection } from './lib/context-sources-runtime.js';
+import { createSourceReader } from './lib/context-source-readers.js';
+import { emitContextSourceOutcome, classifyAccessError, ContextSourceAccessError } from './lib/context-source-outcomes.js';
 import {
   getTask,
   buildTaskContextForPrompt,
   buildCrossChannelTasksHint,
   getActiveTasksForUser,
-  advanceDeliveredTaskToCompletion,
+  principalIdFromArn,
+  buildConversationTasksHint,
+  getOpenTasksForConversation,
+  updateTaskStatus,
   type Task,
 } from './lib/task-tracking.js';
 import { resolveModelForIntent } from './lib/model-resolver.js';
-import { clampResponseMaxTokens } from './lib/intent-pack.js';
+import { clampResponseMaxTokens, taskStateMachines } from './lib/intent-pack.js';
 import { legalTransitionsFrom } from './lib/task-state-machines.js';
 import { taskHasMachine } from './lib/task-tools.js';
 import { getModelCatalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION, bedrockInvokeId } from '../../lib/config/model-strategy.js';
-import { resolveActiveProfile, buildIntentStrategy } from './lib/active-profile.js';
+import { resolveActiveProfile, resolveFromDefinition, buildIntentStrategy } from './lib/active-profile.js';
+import { hydrateBodies } from './lib/profile-bodies.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
-// SPEC-PORTABLE-VERSIONED-PROFILES P0: root for the per-profile SSM namespace (/{root}/assistant/{name}/…).
+// SPEC-PORTABLE-PROFILES P0: root for the per-profile SSM namespace (/{root}/assistant/{name}/…).
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
 
 // The serving profile (= the classification's profile name, e.g. 'basic'/'standard'/'premium').
@@ -98,6 +118,59 @@ const BATTLE_ELIGIBLE = process.env.BATTLE_ELIGIBLE === 'true';
 const MODEL_NAME = process.env.MODEL_NAME || 'Claude';
 
 const s3Client = new S3Client({ region: AWS_REGION });
+
+/**
+ * DynamoDB client for `dynamodb-table` context sources, created on FIRST USE.
+ *
+ * Lazy on purpose: every profile pays this module's import cost on cold start, and a deployment whose
+ * profiles select no DynamoDB-backed source should not construct a client it never calls.
+ */
+let ddbClientSingleton: import('@aws-sdk/client-dynamodb').DynamoDBClient | undefined;
+function contextDdbClient(): import('@aws-sdk/client-dynamodb').DynamoDBClient {
+  if (!ddbClientSingleton) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+    ddbClientSingleton = new DynamoDBClient({ region: AWS_REGION });
+  }
+  return ddbClientSingleton!;
+}
+
+/**
+ * Lambda client for `lambda-service` context sources, same lazy rationale.
+ *
+ * This was MISSING, which made `lambda-service` the one published type that could never resolve: the
+ * stack emitted its `lambda:InvokeFunction` grant, the catalog published the key, and the reader had
+ * no client to call with. Published, granted, unreadable - the exact fail-open shape INV-CTX-CAT-3
+ * exists to prevent, and the type an implementer swaps in to front their own profile store.
+ */
+let lambdaClientSingleton: import('@aws-sdk/client-lambda').LambdaClient | undefined;
+function contextLambdaClient(): import('@aws-sdk/client-lambda').LambdaClient {
+  if (!lambdaClientSingleton) {
+    // eslint-disable-next-line @typescript-eslint/no-var-requires, global-require
+    const { LambdaClient } = require('@aws-sdk/client-lambda');
+    lambdaClientSingleton = new LambdaClient({ region: AWS_REGION });
+  }
+  return lambdaClientSingleton!;
+}
+
+/**
+ * Read one SSM parameter. Absent ⇒ null. Anything else THROWS.
+ *
+ * ParameterNotFound is the normal state on a deployment that has configured no source, so it is null.
+ *
+ * Every other failure - above all AccessDenied - is a wiring fault and must propagate. Returning null
+ * for it turned a missing IAM grant into "profile selects 'company-docs', not in this classification's
+ * catalog", which blames the PROFILE for an infrastructure bug and cost a live debugging cycle.
+ *
+ * Logging it was not enough, and that is the subtle part. A swallowed denial still produced an empty
+ * catalog, so every selected key counted `not-in-catalog` (a Skipped, not a Failed) and the
+ * failure-rate alarm - which divides Failed by Failed+Resolved - stayed at zero while nothing worked.
+ * The caller's `(catalog)` handler can only classify what reaches it, so this has to throw.
+ */
+async function getSsmParameter(name: string): Promise<string | null> {
+  const res = await ssmClient.send(new GetParameterCommand({ Name: name }));
+  return res.Parameter?.Value ?? null;
+}
 const ssmClient = new SSMClient({ region: AWS_REGION });
 
 const CONFIG: AsyncProcessorConfig = {
@@ -439,7 +512,16 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
   const startTime = Date.now();
   console.log('[AssistantAsyncProcessor] Invoked', JSON.stringify({
     profile: PROFILE_NAME,
-    channelArn: event.channelArn?.substring(0, 50),
+    // The IDS ONLY - the two values that identify this turn and nothing else.
+    //
+    // This logged `channelArn.substring(0, 50)`, and a Chime ARN is about that long before it reaches
+    // the instance id, so every line read `...:app-instance/` and identified nothing: a failure could
+    // not be traced back to the conversation it happened in. The fix is not a longer ARN, though. The
+    // prefix is identical on every line of every deployment - it carries the account and app-instance
+    // ids and no information - so logging it is noise that also sprays real identifiers through
+    // CloudWatch. The channel id alone is what a reader greps, and what `describe-channel` needs.
+    channelId: event.channelArn?.split('/').pop(),
+    placeholderMessageId: event.placeholderMessageId,
     correlationId: event.correlationId,
     taskType: event.taskType,
     taskId: event.taskId,
@@ -457,7 +539,27 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // Build system prompt with the resolved persona + host per-turn context (domain grounding + i18n
     // + participant profile), assembled via the resolver registry + defensive composer. Each resolver
     // no-ops to '' for a generic AE conversation, so the composed prompt is byte-identical there.
-    const baseSystemPrompt = await resolveBaseSystemPrompt();
+    // Persona: prefer the ACTIVE profile version's persona - it rides the versioned/portable definition
+    // (SPEC-CONFIGURABLE-ASSISTANTS §2 / SPEC-PORTABLE §5), so two versions can differ in character and an
+    // import carries it. Fall back to the deployment persona seam (ASSISTANT_SYSTEM_PROMPT[_PARAM] →
+    // default) when the version carries none. resolveActiveProfile is cached per container, so this shares
+    // the resolution the model/guardrail path does below (no extra SSM round-trip).
+    // SPEC-PORTABLE §6: when this turn is serving a `profileRef` variant, the VARIANT'S version is the
+    // definition for the turn — persona, tools, classifier mode, guardrail selection, machines and
+    // context sources — not the profile's active version. Built from the stamped definition rather than
+    // read again: the router already resolved it, and re-reading could serve a version that changed
+    // mid-turn. Deliberately does NOT populate the profile cache (keyed by profile name), or the next
+    // ordinary turn on this warm container would inherit the variant's persona and tools.
+    // The variant's definition arrives carrying a POINTER to its persona, not the persona itself: the
+    // router that stamped it has no use for the body, so the body is fetched HERE, at the one place it
+    // is read. An unreadable body throws rather than degrading to the profile's active version - a
+    // variant quietly served as control is the exact shape that reports "indistinguishable" for a
+    // reason that has nothing to do with what the experiment was testing.
+    const activeProfile = event.variantProfile
+      ? resolveFromDefinition(await hydrateBodies(event.variantProfile), PROFILE_NAME)
+      : await resolveActiveProfile(PROFILE_NAME, { ssm: ssmClient, ssmRoot: SSM_ROOT });
+    const versionedPersona = activeProfile.persona;
+    const baseSystemPrompt = versionedPersona?.trim() || (await resolveBaseSystemPrompt());
 
     // P4 config attribution — fingerprint the deployment config (persona resolved here + the pack
     // version the router forwarded) so this turn's analytics is sliceable by config, not just model.
@@ -484,6 +586,92 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       systemPrompt += firstTurnGreetingDirective(event.senderDisplayName);
     }
 
+    // WHO the user is, on EVERY turn - not just the first. A name asserted in conversation ("my name
+    // is X") can arrive on any turn, and until it did the assistant simply adopted it, having been
+    // told to greet by name but never that the name was authoritative. Sits in the dynamic suffix
+    // beside the greeting for the same reason: it is per-USER, so caching it would poison the shared
+    // prefix. No-ops for an unresolved sender, which is what keeps guest and federated flows free of a
+    // constraint that has no identity to anchor to.
+    systemPrompt += userIdentityDirective(event.senderDisplayName);
+
+    // WHAT THE SPEAKER LABELS MEAN (ADR-027 part 2). Returns '' unless this turn's transcript actually
+    // carries labels, so a 1:1 pays nothing and reads exactly as before. In the dynamic suffix beside
+    // the identity directive, and for the same reason: it depends on who is in the conversation.
+    systemPrompt += transcriptConventionDirective(bedrockMessages);
+
+    // Catalog context sources (SPEC-CONTEXT-SOURCES-AND-STORES phase 5). The profile SELECTS keys; this
+    // resolves them against the classification's published catalog and appends one fenced section per
+    // source, plus the AVAILABLE CONTEXT menu.
+    //
+    // Appended AFTER the cache-prefix capture, like the first-turn greeting and the task appends: these
+    // values are per-turn and per-USER, so putting them inside the cached prefix would invalidate the
+    // persona cachePoint on every request and raise the cost of every turn to serve one of them.
+    //
+    // Entirely inert until a profile sets `contextSources` - `selectSources` returns [] for an empty
+    // selection and nothing below runs.
+    try {
+      const senderSub = event.senderArn?.split('/user/').pop() || '';
+      const selection = activeProfile.contextSources;
+      if (selection?.length) {
+        // Throws on anything but ParameterNotFound, so a denied catalog read reaches the `(catalog)`
+        // handler below instead of quietly becoming an empty catalog.
+        const catalog = await readPublishedCatalog(
+          () => getSsmParameter(`${SSM_ROOT}/assistant/${PROFILE_NAME}/context-sources`),
+        );
+        // On a real turn the sender is resolved and the channel exists, so both availability gates are
+        // met. The creation-time welcome is the call site where they are not - see the router.
+        const callSite = { identitySettled: Boolean(senderSub), conversationSettled: Boolean(event.channelArn) };
+        // PROFILE_NAME is the classification, and it is passed to both calls so every source's
+        // disposition lands in CloudWatch under AgentEchelon/ContextSources. Without it the feature is
+        // observable only by reading this log group by hand, which is not a control an operator can
+        // alarm on - see GUIDE-ASSISTANT-CONTEXT "Monitoring and access review".
+        const chosen = selectSources(catalog, selection, callSite, PROFILE_NAME);
+        if (chosen.length) {
+          const resolved = await resolveContextSources(chosen, {
+            callSite,
+            classification: PROFILE_NAME,
+            // No resource map: each entry carries its own locator and prefix from the published
+            // catalog, so the read lands where the grant was scoped rather than at an env-var path.
+            read: createSourceReader(
+              { classification: PROFILE_NAME, userSub: senderSub, channelArn: event.channelArn },
+              { s3: s3Client, ddb: contextDdbClient(), ssm: ssmClient, lambda: contextLambdaClient() },
+            ),
+          });
+          // The menu names what the model HAS this turn, so it is built from what actually resolved,
+          // never from the selection - listing a source that failed to resolve invites the model to
+          // promise what it cannot deliver.
+          systemPrompt += renderContextMenu(resolved.map((r) => r.entry));
+          for (const r of resolved) systemPrompt += renderSourceSection(r);
+          // Positive confirmation that sources reached the prompt. Without it the only signal is the
+          // ABSENCE of a warning, which cannot distinguish "resolved fine" from "never ran" - the
+          // difference this project keeps getting caught by. Names what was asked for AND what landed,
+          // so a source silently resolving to nothing is visible as a gap between the two.
+          console.log('[context-sources] applied', {
+            selected: selection,
+            resolved: resolved.map((r) => r.entry.key),
+          });
+        }
+      }
+    } catch (err) {
+      // The whole feature is additive context. A failure here must cost the sections, never the turn.
+      //
+      // But it must not cost the SIGNAL. This catch also covers the catalog read itself, and a failure
+      // there takes out every source at once - which is the worst outcome and, before this, the only
+      // one that emitted nothing at all. It has happened: the processor lacked `ssm:GetParameter` on
+      // the catalog parameter, `getSsmParameter` threw, and the sole evidence was this warn line.
+      //
+      // Counted under a `(catalog)` pseudo-key so it is impossible to mistake for one source failing,
+      // and classified, so a missing grant on the parameter reads as `denied` like any other refusal.
+      console.warn('[AssistantAsyncProcessor] context source resolution failed (non-fatal):', err);
+      if (activeProfile.contextSources?.length) {
+        emitContextSourceOutcome({
+          classification: PROFILE_NAME,
+          sourceKey: '(catalog)',
+          outcome: err instanceof ContextSourceAccessError ? err.reason : classifyAccessError(err),
+        });
+      }
+    }
+
     // Load task context if task-based: fold the standing per-state guidance + the task's own context
     // into the prompt, and stamp activeTaskInfo (with taskId) so the reply archives with task_id.
     let activeTaskInfo: { type: string; status: string; label: string; taskId: string } | undefined;
@@ -491,7 +679,12 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       const task = await getTask(event.taskId, event.channelArn);
       if (task) {
         systemPrompt += buildTaskSystemPrompt(event.taskType, task.taskState || '', task);
-        systemPrompt += buildTaskContextForPrompt(task);
+        // THIS PROFILE'S machines, the same ones the `advance_task_state` tool is authorized against
+        // below. A profile that declares its own step - and therefore its own `requires` - must have
+        // the step's needs grounded from that declaration, or the prompt would chase the deployment
+        // pack's checklist while the tool enforced the profile's graph. Undefined ⇒ the pack, which is
+        // byte-identical for every profile that does not override machines.
+        systemPrompt += buildTaskContextForPrompt(task, activeProfile.machines);
         activeTaskInfo = {
           type: event.taskType,
           status: task.taskState || task.status,
@@ -502,8 +695,24 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       }
     }
 
-    // P2.4 cross-channel task awareness — best-effort hint about open work in the user's OTHER
-    // channels. Failure is never fatal — the hint augments judgment, the conversation proceeds.
+    // TASK AWARENESS, on two axes that answer different questions (ADR-024 D4/D6). By CONVERSATION:
+    // what is open HERE, whoever owns it, because visibility is scoped by membership and never by
+    // ownership. By OWNER, across conversations: the speaker's own work elsewhere, deliberately terse
+    // because that one crosses the conversation boundary and this one does not.
+    //
+    // Both are best-effort — the hints augment judgment, and a failure must not cost the turn.
+    try {
+      const conversationTasks = await getOpenTasksForConversation(event.channelArn);
+      const hereHint = buildConversationTasksHint(
+        conversationTasks,
+        event.senderArn ? { id: event.senderArn.split('/user/').pop() || '' } : null,
+        { excludeTaskId: event.taskId },
+      );
+      if (hereHint) systemPrompt += hereHint;
+    } catch (err) {
+      console.warn('[AssistantAsyncProcessor] conversation task hint failed (non-fatal):', err);
+    }
+
     try {
       const userSub = event.senderArn?.split('/user/').pop() || '';
       if (userSub) {
@@ -541,10 +750,11 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     let battleSelfDisplayName: string | undefined;
     const battleOn = BATTLE_ELIGIBLE && !!event.battleContext;
     if (battleOn && event.battleContext) {
-      // TODO(phase1b): profileRef variants. `variantModelKey` is a resolved modelKey today (the
-      // fan-out resolvers resolve a profileRef variant to its modelKey upstream). If a variant ever
-      // arrives unresolved, this stays undefined and the model application below falls back to the
-      // profile's normal resolution rather than crashing.
+      // A profileRef variant's WHOLE version arrives as `event.variantProfile` (stamped by both
+      // fan-out sites) and has already been applied above, so this side's persona, tools, classifier
+      // mode and guardrail are the variant's. `variantModelKey` remains the model override for a
+      // lightweight modelKey variant; if it ever arrives unset, the model application below falls back
+      // to the profile's normal resolution rather than crashing.
       battleVariantModelKey = event.battleContext.variantModelKey;
       battleSelfDisplayName = event.battleContext.selfDisplayName;
       // Normal persona layering: <persona_addendum> is the SAME mechanism the normal engine uses,
@@ -577,13 +787,23 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // Resolve model for this intent (respects classification boundaries). When the bot is an alt-slot
     // in a battle, the variant's modelKey wins.
     const catalog = getModelCatalog(process.env.AWS_REGION || 'us-east-1', process.env.AWS_ACCOUNT_ID || '');
-    // P0 (SPEC-PORTABLE-VERSIONED-PROFILES): the profile's BASE model comes from the ACTIVE version in
+    // P0 (SPEC-PORTABLE-PROFILES): the profile's BASE model comes from the ACTIVE version in
     // SSM, not the deploy-time default — so activating a new profile version re-models the assistant
     // with NO redeploy. Fail-closed to the compiled seed (== today's deploy default), so a deployment
     // that never versions behaves byte-identically. A version whose modelKey is not in this catalog is
     // ignored here (the deploy-time default holds) — the §7 model-ARN boundary is deploy-owned; a
     // version selects WITHIN it, never beyond. Battle/experiment models still win over this base below.
-    const active = await resolveActiveProfile(PROFILE_NAME, { ssm: ssmClient, ssmRoot: SSM_ROOT });
+    //
+    // ONE RESOLUTION PER TURN, and it is the one resolved above. This used to call
+    // `resolveActiveProfile` a SECOND time, which ignored `event.variantProfile` and therefore served
+    // the profile's ACTIVE version here while the persona came from the variant. Everything downstream
+    // of this line reads it - tools, guardrail selection, per-intent routing, the base model and the
+    // attribution `configId` - so a `profileRef` experiment whose two versions differed in any of those
+    // ran BOTH ARMS IDENTICALLY and reported "indistinguishable". A false negative reads exactly like a
+    // real result, which is why this is one binding rather than two lookups that agree by luck.
+    // `resolveFromDefinition` returns the same `ResolvedActiveProfile` shape, so there is nothing to
+    // reconcile: SPEC-PORTABLE §6 says the variant's version IS the definition for the turn.
+    const active = activeProfile;
     const activeModelKey = active.profile.modelKey;
     const baseModelSelection = (catalog as Record<string, unknown>)[activeModelKey]
       ? { ...DEFAULT_PROFILE_MODEL_SELECTION, [CONFIG.userType]: activeModelKey }
@@ -615,7 +835,13 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       ...CONFIG,
       model: effectiveModel,
       tools: active.tools,
+      // The guardrail this assistant SELECTS (SPEC-CONFIGURABLE-ASSISTANTS 4.6); undefined ⇒ deployment default.
+      guardrailId: active.guardrailId,
       skipInputGuardrail: battleOn && event.battleContext?.round === 2,
+      // ADR-027 phase 1: the input guardrail scores what this turn's human submitted, not whatever
+      // sits last in the user role. In a channel with a second assistant those differ, and the peer's
+      // message wins the slot.
+      userTurnText: event.userMessage,
     };
     // P0 attribution: which profile VERSION served this turn's base model ('seed' = the compiled
     // default, i.e. no active version). Battle/experiment overrides still take precedence above.
@@ -708,6 +934,8 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       steps?: ConverseStep[];
       modelMs?: number;
       toolMs?: number;
+      /** The INPUT guardrail blocked the turn before any model ran (structural, see invokeBedrock). */
+      inputGuardBlocked?: boolean;
     };
 
     // SPEC-TASK-STATE-TRANSITIONS: active-task context for the in-loop advance_task_state tool
@@ -717,6 +945,13 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       taskId: event.taskId,
       taskType: event.taskType,
       channelArn: event.channelArn,
+      // Per-assistant task machines (SPEC-CONFIGURABLE-ASSISTANTS 4.5): the resolved active version's
+      // machines are preferred over the deployment pack (undefined ⇒ the pack, byte-identical).
+      machines: active.machines,
+      // Who holds the task while the assistant is working, and who it returns to once the person has
+      // answered. Without it a task that entered an `awaitsUser` state would stay in the user's queue
+      // after they had already dealt with it.
+      assistantId: principalIdFromArn(event.botArn),
     });
 
     // Attachment-in (non-battle): the user sent an image/PDF/doc — fetch it and attach a Converse
@@ -784,6 +1019,47 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
           'falling through to a text turn',
         { imageGenModelId: genOutModelId },
       );
+    }
+
+    // FAIL FAST, AND SAY WHY. An `image_generation` turn that resolved no registered image model used
+    // to fall through and run as a TEXT turn. That is the wrong failure twice over: the person asked
+    // for an image and silently got prose, and when the text model was itself unusable the turn died on
+    // a `ValidationException: The provided model identifier is invalid` from Bedrock - after paying the
+    // round-trip, with a stack trace and no statement of what was misconfigured.
+    //
+    // Observed in a battle: the variant carried a TEXT model key ('sonnet') and no image model, so an
+    // `image_generation` turn resolved a text inference-profile ARN and failed inside Bedrock.
+    //
+    // NOTE ON THAT BEDROCK MESSAGE. It reads like a bad id and is not always one: Bedrock returns the
+    // identical text for a VALID id invoked in a region that does not carry the model. That cost one
+    // investigation already. Region is now a property of the registry entry (`region` in
+    // image-gen-models.ts) and the invoker builds its client for the model's own region, so a
+    // wrong-region call is no longer reachable through configuration. What remains below is the
+    // genuinely-unconfigured case.
+    //
+    // Name the three things a reader needs: that this was an image turn, which id was resolved (or that
+    // none was), and where an image model is configured. Battle is called out separately because the
+    // variant is the override that wins, so that is the thing to fix.
+    if (event.intent === 'image_generation' && genOutPlan.action !== 'generation') {
+      const reason = genOutModelId
+        ? `resolved image model "${genOutModelId}" is not a registered image model`
+        : 'no image model is configured for this turn';
+      const where = battleOn
+        ? "the battle variant carries no image model (its `imageGenModelKey`), so the variant's TEXT "
+          + 'model was all that was available'
+        : "the profile's `models.image` is unset";
+      console.error(
+        '[AssistantAsyncProcessor] image_generation turn cannot run: ' + reason + ' — ' + where,
+        { imageGenModelId: genOutModelId, battleOn, intent: event.intent },
+      );
+      await handleProcessingError(
+        event,
+        new Error(
+          'image_generation turn cannot run: ' + reason + ' — ' + where
+            + '. No image model is configured for this assistant.',
+        ),
+      );
+      return;
     }
     // Honest degrade (no crash): image generation needs the attachments bucket (to persist the PNG).
     // The guardrail + cost-cap env (BATTLE_IMAGE_GUARDRAIL_ID, BATTLE_IMAGE_MAX_IMAGES/DIMENSION,
@@ -858,9 +1134,27 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
         const n = Number(v);
         return v != null && Number.isFinite(n) ? n : undefined;
       };
+      // Guardrails are REGIONAL and image models are not always local: the Stability generators are
+      // us-west-2-only, so a us-east-1 deployment invokes them cross-region. Resolve the guardrail
+      // that exists in the region this call actually goes to.
+      const genKey = imageGenModelIdToKey(genOutPlan.modelId);
+      const genRegion = imageGenRegionFor(genKey ? IMAGE_GEN_MODELS[genKey] : undefined);
+      const guard = imageGuardrailFor(genRegion);
+      if (!guard) {
+        // REFUSE rather than generate unguarded. Dropping the guardrail would produce an image and a
+        // green test while content moderation was silently off - the failure mode that hides longest.
+        // Deliberately loud: this is a deployment gap (no guardrail provisioned in that region), and
+        // the honest empty path below already handles "no image" without fabricating one.
+        console.error(
+          `[AssistantAsyncProcessor][image] no guardrail provisioned in ${genRegion}; refusing to `
+          + 'generate rather than run unmoderated. Provision a guardrail there '
+          + '(BATTLE_IMAGE_GUARDRAIL_BY_REGION) and redeploy.',
+        );
+        throw new Error(`image generation blocked: no content guardrail available in ${genRegion}`);
+      }
       const gen = await invokeImageGenModel(genOutPlan.modelId!, event.userMessage || '', {
-        guardrailIdentifier: process.env.BATTLE_IMAGE_GUARDRAIL_ID,
-        guardrailVersion: process.env.BATTLE_IMAGE_GUARDRAIL_VERSION,
+        guardrailIdentifier: guard.id,
+        guardrailVersion: guard.version,
         maxImagesCap: envInt(process.env.BATTLE_IMAGE_MAX_IMAGES),
         maxDimensionCap: envInt(process.env.BATTLE_IMAGE_MAX_DIMENSION),
       });
@@ -946,8 +1240,25 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       }
     } else if (useExternal && cnCfg) {
       // External (Chinese) provider — text-only. Bedrock Guardrails do NOT apply to external
-      // providers, so apply the compensating output check explicitly. Any failure degrades to Bedrock.
+      // providers, so apply the compensating INPUT and output checks explicitly. Any failure degrades to Bedrock.
       const t0 = Date.now();
+      // Input guardrail parity: the external provider never runs Bedrock's input-side PROMPT_ATTACK /
+      // content filter, so run it here BEFORE the external model sees the prompt (the Bedrock path does
+      // this inside invokeBedrock). A prompt attack short-circuits the turn with no external call; fails
+      // OPEN on a guardrail outage. External turns are never /battle rounds, so no skip case applies.
+      const extInputGuard = await applyInputGuardrail(event.userMessage || '', active.guardrailId);
+      if (extInputGuard.blocked) {
+        console.warn('[AssistantAsyncProcessor] external path: input guardrail intervened; blocking before the external model call');
+        bedrockResult = {
+          response: extInputGuard.message,
+          inputTokens: 0,
+          outputTokens: 0,
+          bedrockTime: Date.now() - t0,
+          modelUsed: `external:${cnCfg.model}`,
+          wasFallback: false,
+          retryCount: 0,
+        };
+      } else {
       try {
         const ext = await invokeExternalLlm(cnCfg, systemPrompt, bedrockMessages, {
           maxTokens: resolveMaxTokens(event, false),
@@ -962,7 +1273,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
           const lead = ext.response || "Here's the change I'd make — review and apply it when you're ready.";
           extText = `${lead}\n\n${proposalMarker(ext.toolCall.name, ext.toolCall.args)}`;
         }
-        const guarded = await applyOutputGuardrail(extText);
+        const guarded = await applyOutputGuardrail(extText, active.guardrailId);
         bedrockResult = {
           response: guarded,
           inputTokens: ext.inputTokens,
@@ -999,6 +1310,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
           taskContext,
         });
       }
+      } // end input-guardrail else (external path)
     } else {
       // Default path — Bedrock with retry + fallback; company-context tool + work-item tools (the
       // latter only on plan conversations, and not on reasoning-model turns) + the task tool loop.
@@ -1054,47 +1366,53 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // generation-out turn already attached an image (attachment is shared; never clobber it).
     if (!attachment && process.env.ATTACHMENTS_BUCKET) {
       let generate;
-      // Deliver-on-generation completion: set when a report/extraction task delivers its document while
-      // in a delivery state, so the task machine is advanced to `completed` below. The model does not
-      // reliably emit advance_task_state on the delivery turn, so without this the task hangs in
-      // `generating` even though the report was delivered (the reported bug).
-      let completeOnDelivery = false;
-      // Document-producing tasks and the machine states on which they DELIVER a file. Keyed on
-      // taskType so report_generation and data_extraction both hand back a real downloadable
-      // document; guided_troubleshooting / work-item tasks are interactive and never attach.
-      const DOC_DELIVERY_STATES: Record<string, string[]> = {
-        report_generation: ['generating', 'revising'],
-        data_extraction: ['extracting', 'validating', 'formatting'],
-      };
-      if (event.taskType && event.taskId && DOC_DELIVERY_STATES[event.taskType]) {
-        // Deliver the document (a finished report, or a formatted data extraction) as a downloadable
-        // file on the turn the model actually PRODUCES it, detected DETERMINISTICALLY from the OUTPUT
-        // (isDeliverableDocument: substantial + structured) — NOT from the task's machine state. The
-        // model reliably writes the deliverable but does NOT reliably advance the state machine to its
-        // delivery state on that turn (reports often emit while still in 'drafting_outline'), so a
-        // state-based gate silently dropped the file. A short clarifying/outline turn fails
-        // isDeliverableDocument, so a few-line follow-up is never turned into a file (the original
-        // "clarifying-text-as-attachment" bug stays fixed). Belt-and-suspenders fallback: the task
-        // clearly entered a delivery state this turn (or started there) and produced non-trivial
-        // content. Do NOT use isDocumentRequest here: it matches the user's original ask on EVERY turn.
+      // WHICH STATES DELIVER A FILE comes from the MACHINE, not a hardcoded list. Task machines are
+      // per-profile configurable (SPEC-CONFIGURABLE-ASSISTANTS 4.5); a `Record<taskType, string[]>`
+      // of default-machine state names here could never match a renamed state or a new
+      // document-producing task type, so every such deliverable shipped as unattached chat text with
+      // only a shadow line as the trace. The merged machines - the same merge the advance tool is
+      // authorized against - are the authority, and `delivers` is their declared flag.
+      const mergedMachines = { ...taskStateMachines(), ...(activeProfile.machines ?? {}) };
+      const taskMachine = event.taskType ? mergedMachines[event.taskType] : undefined;
+      const deliveryStates = taskMachine
+        ? Object.entries(taskMachine.states).filter(([, d]) => d.delivers).map(([name]) => name)
+        : [];
+      if (event.taskType && event.taskId && deliveryStates.length > 0) {
+        // THE DELIVERY CONTRACT IS DECLARED, NOT INFERRED (owner decision 2026-08-18). The model is
+        // told, per state, to advance_task_state when it delivers — the final state is explicit and
+        // MEASURED. Attachment therefore keys on a transition the model DECLARED this turn: into a
+        // delivering state, or from a delivering state to a terminal (the deliver-and-finish turn).
+        // Completion is not decided here at all; it has one door — the machine reaching a terminal
+        // state via the model's own advance_task_state (shouldMarkTaskCompleted, invariant AT6:
+        // never force-completed mid-flow).
+        //
+        // The output-shape heuristic (isDeliverableDocument) used to be a second door on BOTH
+        // decisions, and it kept failing in a new costume each time: a clarifying question attached as
+        // a file, a requirements questionnaire attached as a file, and finally a structured
+        // outline-for-approval attached as the report AND completing the task from `drafting_outline`
+        // while it was still ASKING — three live incidents patched into one predicate. Its last
+        // remnant on the live gate was an English-opener phrase list (solicitsInput) deciding
+        // attach-vs-chat, which a non-English deployment defeated in both directions. It survives
+        // below in SHADOW MODE only, so the divergence it used to hide is now a number.
+        //
+        // The failure this trades into is the honest one: a model that delivers without declaring
+        // leaves the report as chat text, unattached, task open — visible and recoverable next turn —
+        // instead of a question shipped as a deliverable and a falsely closed task, which is invisible.
+        // A clarifying question asked from a delivering state declares nothing, so it stays chat.
         const startState = activeTaskInfo?.status;
-        const deliveryStates = DOC_DELIVERY_STATES[event.taskType];
-        const inDeliveryState =
-          (startState !== undefined && deliveryStates.includes(startState)) ||
-          (taskContext?.transitions ?? []).some((t) => deliveryStates.includes(t.to));
-        const deliveredDocument = isDeliverableDocument(response);
-        generate = deliveredDocument || (inDeliveryState && response.trim().length >= 400);
-        // Complete the task when a REAL deliverable was produced, REGARDLESS of the machine state. Gate on
-        // isDeliverableDocument (substantial + structured), NOT on `generate`: the model reliably DELIVERS
-        // the report/extraction but does NOT reliably advance the machine to a delivery state first — it
-        // often delivers straight from `drafting_outline` (verified live: a delivered report was left stuck
-        // there), so advanceDeliveredTaskToCompletion walks the LEGAL path to `completed` from wherever the
-        // machine is. We deliberately do NOT complete on `generate`'s length fallback (inDeliveryState &&
-        // len>=400): that branch ALSO fires for a long NON-deliverable reply (a status update or clarifying
-        // question emitted while already in a delivery state), which would wrongly close the task. On that
-        // fallback we still upload the doc but leave the task OPEN (recoverable next turn) rather than
-        // complete it. Battle tasks are excluded (their own round progression).
-        completeOnDelivery = deliveredDocument && !event.battleContext;
+        const declaredDelivery = (taskContext?.transitions ?? []).some((t) =>
+          deliveryStates.includes(t.to)
+          || (deliveryStates.includes(t.from) && taskMachine?.states[t.to]?.terminal !== undefined));
+        generate = declaredDelivery && response.trim().length > 0;
+        // SHADOW: the retired heuristic, log-only (same treatment as shadowKeywordTransition). A
+        // deliverable-shaped output with NO declared delivery transition is the model
+        // under-declaring — the case the heuristic existed for — and is now measured instead of
+        // silently acted on.
+        if (!declaredDelivery && isDeliverableDocument(response)) {
+          console.log('[AssistantAsyncProcessor][shadow] deliverable_shaped_without_declared_state', {
+            taskId: event.taskId, taskType: event.taskType, state: startState ?? 'unknown',
+          });
+        }
       } else {
         // Ad-hoc (no report task): the user explicitly asked to save THIS response as a document.
         generate = isDocumentRequest(event.userMessage || '');
@@ -1121,27 +1439,51 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
         }
       }
 
-      // Deliver-on-generation: advance the task machine to its terminal `completed` state now that the
-      // report/extraction was delivered in a delivery state. Walks the LEGAL transition path as a system
-      // transition (finalize then derives status=completed from the terminal machine state). Runs even if
-      // the S3 upload above failed — the deliverable is in the reply itself, so the task is still done.
-      // Gated by completeOnDelivery: a clarifying/outline turn never reaches here, and battle tasks are
-      // excluded. Best-effort: a failure here never blocks the reply.
-      if (completeOnDelivery && event.taskId && taskContext?.task) {
-        try {
-          const adv = await advanceDeliveredTaskToCompletion({
-            task: taskContext.task,
-            messageId: messageId ?? undefined,
-          });
-          if (adv.ok && adv.hops > 0) {
-            console.log(`[AssistantAsyncProcessor] Task ${event.taskId} auto-completed on delivery (-> ${adv.to}, ${adv.hops} hop(s))`);
-          } else if (!adv.ok) {
-            console.warn(`[AssistantAsyncProcessor] Task ${event.taskId} auto-complete stopped at ${adv.to}: ${adv.error}`);
-          }
-        } catch (advErr) {
-          console.error('[AssistantAsyncProcessor] auto-complete on delivery failed (non-fatal):', advErr);
-        }
+      // No completion here. The auto-complete-on-delivery door (advanceDeliveredTaskToCompletion,
+      // gated on the output-shape heuristic) is REMOVED: it completed a task from `drafting_outline`
+      // while the reply was still asking for outline approval, against invariant AT6. Completion has
+      // one path — the model's advance_task_state reaching the machine's terminal state — so the
+      // final state is explicit and measured, never inferred from what the reply looked like.
+    }
+
+    // THE ANSWER IS READY. If the placeholder was not resolved at dispatch, resolve it now.
+    //
+    // This is the only place the channel is scanned, and it runs only when the mapping never appeared.
+    // `ListChannelMessages` is a billed call, so the happy path must not pay for it: the mapping the
+    // channel flow writes resolves virtually every turn, and this line is never reached on those.
+    //
+    // Deferring it to here also makes it far likelier to succeed - the placeholder has had the entire
+    // inference window to be created, whereas the old up-front loop was racing Chime and burned up to
+    // 22 seconds before the model was even called.
+    let deliverMessageId = messageId;
+    if (!deliverMessageId) {
+      deliverMessageId = await scanForPlaceholderMessage(
+        event.channelArn,
+        event.correlationId,
+        event.botArn,
+      );
+      console.log('[AssistantAsyncProcessor] Deferred placeholder resolution', {
+        correlationId: event.correlationId,
+        resolved: !!deliverMessageId,
+        messageId: deliverMessageId ?? undefined,
+      });
+    }
+
+    if (!deliverMessageId) {
+      // The placeholder genuinely does not exist. Report it rather than posting a replacement: a
+      // replacement duplicates the answer and strands a "One moment..." bubble (DESIGN-BATTLE,
+      // "nothing appears-then-vanishes"). The answer is lost, and that is the honest outcome to
+      // record - see TROUBLESHOOTING.md #19.
+      console.error(
+        '[AssistantAsyncProcessor] No placeholder for correlationId after the answer was ready:',
+        event.correlationId,
+        '- the reply cannot be delivered. Not posting a replacement.',
+      );
+      if (event.taskId) {
+        await updateTaskStatus(event.taskId, event.channelArn, 'failed', undefined, 'Placeholder message not found')
+          .catch((e) => console.error('[AssistantAsyncProcessor] task status update failed:', e));
       }
+      return;
     }
 
     // Finalize response
@@ -1152,13 +1494,15 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       inputTokens: bedrockResult.inputTokens,
       outputTokens: bedrockResult.outputTokens,
       bedrockTime: bedrockResult.bedrockTime,
-      messageId: messageId!,
+      messageId: deliverMessageId,
       pollTime,
       conversationHistoryLength: consolidatedHistory.length,
       startTime,
       activeTaskInfo,
       taskContext,
       attachment,
+      // The structural block fact, never inferred from the reply's text shape.
+      guardrailBlocked: bedrockResult.inputGuardBlocked,
       wasFallback: bedrockResult.wasFallback,
       fallbackReason: bedrockResult.fallbackReason,
       retryCount: bedrockResult.retryCount,
@@ -1172,6 +1516,21 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       modelMs: bedrockResult.modelMs,
       toolMs: bedrockResult.toolMs,
     });
+
+    // Seed the conversation summary from THIS exchange, on the same first turn that names the
+    // conversation. Drift compares against the summary, so without a turn-one anchor it cannot fire
+    // at all until the scheduled summariser catches up - every early turn skips with
+    // `drift_skipped_no_summary`, which is precisely the window where a user is most likely to
+    // pivot. The exchange is passed straight from memory: reading it back from Aurora would wait on
+    // the Kinesis + archival lag this exists to remove. Awaited for the same reason as the rename
+    // below (the environment freezes on resolve); the actual summarisation runs asynchronously.
+    if (pipeline.isFirstUserTurn && event.channelArn && event.userMessage && response) {
+      await seedConversationSummary({
+        channelArn: event.channelArn,
+        userMessage: event.userMessage,
+        assistantReply: response,
+      });
+    }
 
     // Reply is posted; now let the first-turn title rename finish before the Lambda execution
     // environment freezes (see runSharedPipeline). Awaiting here adds no user-facing latency (this is

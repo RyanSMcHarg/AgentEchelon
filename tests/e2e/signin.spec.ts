@@ -1,6 +1,12 @@
 import { test, expect } from '@playwright/test';
 import { navigateToApp, signIn, isConnected } from './helpers/agent-helpers';
-import { getBasicUser, getStandardUser, getPremiumUser } from './helpers/test-credentials';
+import { getBasicUser, getStandardUser, getPremiumUser, missingUserReason } from './helpers/test-credentials';
+import { guardBackendErrors, guardConsoleErrors, allowConsoleError } from './helpers/turn-guards';
+
+// Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
+guardBackendErrors('signin');
+guardConsoleErrors();
+
 
 test.describe.serial('Sign In Flow', () => {
   test('should display login form on load', async ({ page }) => {
@@ -12,6 +18,11 @@ test.describe.serial('Sign In Flow', () => {
   });
 
   test('should reject invalid credentials', async ({ page }) => {
+    // This test EXISTS to make the sign-in call fail, so Cognito answering 400 and the browser
+    // logging a failed resource load is the assertion succeeding, not the app breaking. Declared
+    // for this test only - adding "400" to the global ignore list would blind every other spec to
+    // real failed requests.
+    allowConsoleError('Failed to load resource: the server responded with a status of 400');
     await navigateToApp(page);
     await page.waitForSelector('input[type="email"]', { timeout: 10000 });
 
@@ -38,10 +49,7 @@ test.describe.serial('Sign In Flow', () => {
 
   test('should sign in basic user and show app header', async ({ page }) => {
     const user = await getBasicUser();
-    if (!user.password) {
-      test.skip();
-      return;
-    }
+    test.skip(!user.password, missingUserReason('basicUser'));
 
     await signIn(page, user.email, user.password);
 
@@ -57,10 +65,7 @@ test.describe.serial('Sign In Flow', () => {
 
   test('should establish WebSocket connection after sign in', async ({ page }) => {
     const user = await getBasicUser();
-    if (!user.password) {
-      test.skip();
-      return;
-    }
+    test.skip(!user.password, missingUserReason('basicUser'));
 
     await signIn(page, user.email, user.password);
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
@@ -78,10 +83,7 @@ test.describe.serial('Sign In Flow', () => {
 
   test('should sign in standard user and verify tier features', async ({ page }) => {
     const user = await getStandardUser();
-    if (!user.password) {
-      test.skip();
-      return;
-    }
+    test.skip(!user.password, missingUserReason('standardUser'));
 
     await signIn(page, user.email, user.password);
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
@@ -92,10 +94,7 @@ test.describe.serial('Sign In Flow', () => {
 
   test('should sign in premium user and see admin button', async ({ page }) => {
     const user = await getPremiumUser();
-    if (!user.password) {
-      test.skip();
-      return;
-    }
+    test.skip(!user.password, missingUserReason('premiumUser'));
 
     await signIn(page, user.email, user.password);
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
@@ -115,10 +114,7 @@ test.describe.serial('Sign In Flow', () => {
 
   test('should sign out successfully', async ({ page }) => {
     const user = await getBasicUser();
-    if (!user.password) {
-      test.skip();
-      return;
-    }
+    test.skip(!user.password, missingUserReason('basicUser'));
 
     await signIn(page, user.email, user.password);
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });

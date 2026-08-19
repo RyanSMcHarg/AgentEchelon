@@ -136,3 +136,16 @@
 .attachment-image-preview .attachment-name {
   font-size: var(--text-sm);
 }
+
+/* Download failures are shown, never only logged: a click that produces no window and no
+   message is indistinguishable from a dead button. Uses the shared --error* tokens. */
+.attachment-error {
+  margin: var(--space-2) 0 0;
+  padding: 6px var(--space-3);
+  max-width: 320px;
+  font-size: var(--text-xs);
+  background: var(--error-bg);
+  border: 1px solid var(--error-border);
+  border-radius: var(--radius-md);
+  color: var(--error);
+}

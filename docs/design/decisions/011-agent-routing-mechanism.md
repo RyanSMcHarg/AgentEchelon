@@ -1,21 +1,27 @@
 ---
 title: "ADR-011: Agent routing mechanism - self-hosted vs managed agent runtime"
-status: Accepted - Option D (Converse + native tool use)
+status: Accepted 2026-07-16 - Option D (Converse + native tool use); implemented
+date: 2026-07-16
 related:
   - SPEC-PER-PROFILE-OWNERSHIP.md
-  - ../../backend/lib/stacks/basic-classification-stack.ts
-  - ../../backend/lib/stacks/standard-classification-stack.ts
-  - ../../backend/lib/stacks/premium-classification-stack.ts
-  - ../../backend/lib/stacks/agent-classification-common.ts
-  - ../../backend/lambda/src/router-agent-handler.ts
-  - ../../backend/lambda/src/lib/async-processor-core.ts
+  - ../../../backend/lib/stacks/basic-classification-stack.ts
+  - ../../../backend/lib/stacks/standard-classification-stack.ts
+  - ../../../backend/lib/stacks/premium-classification-stack.ts
+  - ../../../backend/lib/stacks/agent-classification-common.ts
+  - ../../../backend/lambda/src/router-agent-handler.ts
+  - ../../../backend/lambda/src/lib/async-processor-core.ts
 ---
 
 # ADR-011: Agent routing mechanism
 
 > **Reading guide.** The body is the decision: issue, recommendation, rationale, options-at-a-glance. All depth - what Converse/InvokeAgent actually are, per-option detail, flow diagrams, the spike data, cost levers, the AWS-doc verification, and sources - lives in the appendices.
 
-## Issue & current state
+## Issue & the state that forced the decision
+
+> **This section records the state at decision time, not today's.** Option D is implemented: the
+> terminal model call offers tool specs and runs a self-hosted, in-Lambda tool loop
+> (`lib/async-processor-core.ts:1491-1701`), and `load_company_context` is one of the tools it answers
+> (`:1656`). The gap described below, a tool that is deployed but never fires, is closed.
 
 What a team wants from this layer is an assistant that answers grounded in the right, access-appropriate company knowledge, while the deployer keeps fine-grained control over which model (and which provider) handles each kind of request and what it costs. The build-vs-adopt question underneath is whether to hand that orchestration to a managed runtime (Bedrock Agents) or keep it in AE's own pipeline - the decision this ADR makes. Current state is what forces the question: AE's per-tier Bedrock Agents and their action groups - notably the tier-scoped `load_company_context` (PR #16) - are **deployed but never executed at runtime**. The terminal model call is the **Converse API with no tool loop**, so the tool never fires. That breaks the product's defense-in-depth story (basic should decline product questions; premium should cite financials) because nothing invokes the tier-scoped retrieval.
 
@@ -83,7 +89,7 @@ One-liners (full detail in [Appendix B](#appendix-b--options-in-detail)):
 
 **Reversibility.** The terminal model call is a single seam (`async-processor-core.ts` `invokeBedrock`). Options C/D/B all swap only that call, so moving between them stays a localized change - which is why committing to D is low-risk.
 
-**What's implemented:** Option D is code-complete - the Converse self-hosted tool loop (`async-processor-core.ts` `invokeBedrock`), the shared `company-context.ts` retrieval, tier-scoped `context/{tier}/` S3 grants on the per-tier processor roles (the isolation boundary), enabled on normal text turns only (vision + `/battle` stay tool-less), with unit tests. The per-tier agent-role IAM (`InvokeModel` + `InvokeModelWithResponseStream` + `ApplyGuardrail`) and guardrail-ARN export are kept (correct regardless). **Follow-ups:** runtime validation (exercise the tool firing end-to-end) and guardrail parity (out-of-band `ApplyGuardrail` on the tool-loop output).
+**What's implemented:** Option D is code-complete - the Converse self-hosted tool loop (`async-processor-core.ts` `invokeBedrock`), the shared `company-context.ts` retrieval, tier-scoped `context/{classification}/` S3 grants on the per-tier processor roles (the isolation boundary), enabled on normal text turns only (vision + `/battle` stay tool-less), with unit tests. The per-tier agent-role IAM (`InvokeModel` + `InvokeModelWithResponseStream` + `ApplyGuardrail`) and guardrail-ARN export are kept (correct regardless). **Follow-ups:** runtime validation (exercise the tool firing end-to-end) and guardrail parity (out-of-band `ApplyGuardrail` on the tool-loop output).
 
 ---
 

@@ -2,6 +2,8 @@
 
 **Status:** Implemented **Layer:** Interface (chat interface - reference client) **Plane:** core **Summary:** The end-user surface for conversing with tier-capped assistants in real time, across devices, in one coherent app. **Technical design:** [`DESIGN-CHAT-APP.md`](DESIGN-CHAT-APP.md) **Site section(s):** Chat application (the public end-user SPA; the counterpart to the standalone Admin Console, see [`../admin/SPEC-ADMIN-CONSOLE.md`](../admin/SPEC-ADMIN-CONSOLE.md))
 
+**Coverage:** `e2e/signin.spec.ts`, `e2e/signup.spec.ts`, `e2e/agent-intents.spec.ts`, `e2e/mentions.spec.ts`, `e2e/welcome.spec.ts`
+
 > **Terminology.** This is the customer-facing chat interface, where the accepted label for a capability level is **tier** (basic, standard, premium). The platform, admin, config, and security docs use **classification** for the same concept. Both name the ceiling on data and models; "tier" in this document is the interface term, not drift.
 
 ## 1. Business problem

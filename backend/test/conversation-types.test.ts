@@ -14,6 +14,8 @@ import {
   resolveConversationTypeKey,
   getConversationTypeConfig,
   isDriftEnabledForType,
+  resolveWelcomeConfig,
+  type ConversationTypeConfig,
 } from '../lib/config/conversation-types';
 
 describe('conversation-types registry', () => {
@@ -74,5 +76,87 @@ describe('getConversationTypeConfig / isDriftEnabledForType', () => {
     } finally {
       CONVERSATION_TYPES['basic'].driftEnabled = original;
     }
+  });
+});
+
+describe('resolveWelcomeConfig', () => {
+  /** Register a temporary type so a test never mutates a shipped one. */
+  function withType(key: string, config: ConversationTypeConfig, run: () => void): void {
+    CONVERSATION_TYPES[key] = config;
+    try {
+      run();
+    } finally {
+      delete CONVERSATION_TYPES[key];
+    }
+  }
+
+  it('defaults every shipped type to the interpolated built-in assembly', () => {
+    // THE LOAD-BEARING TEST FOR THIS FIELD. Adding `welcome` must not change a single existing
+    // deployment's welcome, and "no welcome config" is the state every shipped type is in. If this
+    // regresses, every conversation on every deployment silently changes its opening copy - or starts
+    // spending a Bedrock call it never used to.
+    for (const key of Object.keys(CONVERSATION_TYPES)) {
+      expect(resolveWelcomeConfig(key)).toEqual({
+        mode: 'interpolated',
+        template: undefined,
+        contextKeys: [],
+      });
+    }
+  });
+
+  it('defaults an unknown type the same way, rather than throwing', () => {
+    expect(resolveWelcomeConfig('no-such-type').mode).toBe('interpolated');
+  });
+
+  it('honours a generated mode with a template and context keys', () => {
+    withType('incident', {
+      classification: 'standard',
+      driftEnabled: false,
+      welcome: {
+        mode: 'generated',
+        template: 'Open with the incident state, then who is here.',
+        contextKeys: ['x-incident', 'user-profile'],
+      },
+    }, () => {
+      expect(resolveWelcomeConfig('incident')).toEqual({
+        mode: 'generated',
+        template: 'Open with the incident state, then who is here.',
+        contextKeys: ['x-incident', 'user-profile'],
+      });
+    });
+  });
+
+  it('degrades an unrecognised mode to interpolated rather than to generated', () => {
+    // Failing towards the deterministic path costs richness. Failing towards `generated` would spend a
+    // Bedrock call on every new conversation because of a typo in a config file.
+    withType('typo', {
+      classification: 'basic',
+      driftEnabled: false,
+      welcome: { mode: 'genrated' as unknown as 'generated' },
+    }, () => {
+      expect(resolveWelcomeConfig('typo').mode).toBe('interpolated');
+    });
+  });
+
+  it('treats a blank template as absent, so it falls back to the built-in assembly', () => {
+    // A blank template must not render a blank welcome. "Welcome always lands" outranks honouring
+    // whitespace an operator left in a config file.
+    withType('blank', {
+      classification: 'basic',
+      driftEnabled: false,
+      welcome: { template: '   ' },
+    }, () => {
+      expect(resolveWelcomeConfig('blank').template).toBeUndefined();
+    });
+  });
+
+  it('drops blank context keys instead of asking the catalog for an empty key', () => {
+    withType('sloppy', {
+      classification: 'basic',
+      driftEnabled: false,
+      welcome: { contextKeys: ['  user-profile  ', '', '   '] },
+    }, () => {
+      expect(resolveWelcomeConfig('sloppy').contextKeys).toEqual(['user-profile']);
+    });
   });
 });

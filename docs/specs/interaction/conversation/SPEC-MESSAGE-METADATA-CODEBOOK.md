@@ -2,6 +2,8 @@
 
 **Status:** Partial (out-of-band lookup and the cap-shedding backstop ship; the coded-state codebook is design).
 
+**Coverage:** `e2e/agent-intents.spec.ts`
+
 **Problem and who it's for:** A conversation's analytics and experiment data should survive even the heaviest turns instead of silently vanishing when a single message carries too much state. This is for the platform developer maintaining the message and analytics pipeline, who would otherwise hand-roll an overflow-safe encoding on top of the transport. It defines a durable, deployment-extensible encoding: replace bounded state values with versioned-codebook integer codes and move analytics-only payload out of band keyed by message id. (Current state: Amazon Chime SDK caps message metadata at 1024 encoded characters, and that one field feeds both the frontend and the analytics archive; a heavy turn overflows the cap and `safeMetadataString` drops the whole blob - far worse with CJK text - so both consumers silently lose analytics and the experiment join.)
 
 **Site section:** Interaction layer - conversation substrate.

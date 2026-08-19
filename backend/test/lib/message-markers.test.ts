@@ -20,7 +20,9 @@ describe('stripMessageMarkers', () => {
       ['Round 1<!--battle:battleId=b1,round=1-->', 'Round 1'],
       ['x<!--battlestats:battleId=b1,responseMs=10-->', 'x'],
       ['y<!--battlewaiting:battleId=b1,botArn=z-->', 'y'],
-      ['see<!--battleimage:{"url":"https://x/y.png"}-->', 'see'],
+      // An UNKNOWN marker: the pattern strips every HTML comment, so a marker this module has never
+      // heard of is covered without a code change. (This was `battleimage`, retired with that path.)
+      ['see<!--somefuturemarker:{"k":"v"}-->', 'see'],
     ];
     for (const [raw, want] of cases) expect(stripMessageMarkers(raw)).toBe(want);
   });

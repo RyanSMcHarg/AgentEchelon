@@ -197,23 +197,13 @@ export const handler = async (
     const conversationArn = created.ChannelArn;
     if (!conversationArn) throw new Error('CreateChannel returned no ARN');
 
-    // 2. Add each member.
-    for (const m of members) {
-      try {
-        await messagingClient.send(
-          new CreateChannelMembershipCommand({
-            ChannelArn: conversationArn,
-            MemberArn: m.userArn,
-            Type: 'DEFAULT',
-            ChimeBearer: botArn,
-          }),
-        );
-      } catch (err) {
-        console.error(`[proactive-briefing] Failed to add member ${m.userArn}:`, err);
-      }
-    }
-
-    // 3. Associate the channel flow (best-effort — @assistant routing).
+    // 2. Associate the channel flow BEFORE any membership (best-effort — @assistant routing).
+    //
+    //    ORDERING IS THE POINT. The assistant is a member from `CreateChannel` itself (it is the
+    //    acting bearer), so Lex can fire WelcomeIntent from that instant, and every message created
+    //    before this association bypasses the flow. `CreateChannel` takes no channel-flow field, so
+    //    immediately after creation is the earliest possible point. Same defect and same fix as
+    //    `create-conversation/index.js` and `lib/channel-creation.ts`.
     const flowArn = await getFlowArn();
     if (flowArn) {
       try {
@@ -226,6 +216,22 @@ export const handler = async (
         );
       } catch (err) {
         console.warn('[proactive-briefing] AssociateChannelFlow failed (non-fatal):', err);
+      }
+    }
+
+    // 3. Add each member.
+    for (const m of members) {
+      try {
+        await messagingClient.send(
+          new CreateChannelMembershipCommand({
+            ChannelArn: conversationArn,
+            MemberArn: m.userArn,
+            Type: 'DEFAULT',
+            ChimeBearer: botArn,
+          }),
+        );
+      } catch (err) {
+        console.error(`[proactive-briefing] Failed to add member ${m.userArn}:`, err);
       }
     }
 

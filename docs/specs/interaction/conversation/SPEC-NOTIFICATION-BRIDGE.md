@@ -2,6 +2,12 @@
 
 **Status:** Implemented (outbound email hand-off); inbound reply loop Planned.
 
+**Coverage:** `e2e/notification-bridge.spec.ts` - proving DELIVERY still needs a mail capture this suite does not have, so the spec asserts what has to hold for a send to be possible at all: every deployed sender carries a real sender address rather than the placeholder (which makes `sendEmailNotifications` skip-but-report), and each sender's execution role is allowed `ses:SendEmail` on the identity SES actually resolves that address to. Senders are discovered from the deployment rather than listed, so a new one inherits the check.
+
+That last point is not a formality. Treating the address identity as the resource is what broke the path: SES authorizes against the verified parent DOMAIN when the address is covered by one, so every outbound notification failed with `AccessDenied` on `identity/<domain>` while the grant named `identity/<address>`. Because send failures are collected rather than thrown, the caller still succeeded and nothing surfaced. The spec now simulates both identities and requires the verified one to be allowed; it failed against the live deployment before the grant was widened (`lib/ses-identity.ts`) and passes after.
+
+A role holding no SES grant at all is reported as INERT rather than failed - the channel-flow notify bridge is gated on a `federatedUserPoolId` a non-federated deployment does not set, so it ships configured but switched off by design. At least one sender must still be active, so the exemption cannot quietly empty the check.
+
 **Problem and who it's for:** An assistant often needs to reach someone who is off the app - handing off a task to an assignee, say - on whatever channel actually reaches them (email, SMS, voice), and have their reply land back in the same conversation. This is for the end user reached on their preferred channel and the platform developer who would otherwise stitch and maintain a separate integration per transport, or bolt on a notifications product that lives in its own silo. It treats the conversation channel as the hub: a channel message fans out to members over the right transport (email today; SMS, voice/PSTN next), and - once the inbound loop lands - an HMAC-signed reply token routes their reply back into the same channel, so the on-channel assistant handles it transport-agnostically.
 
 **Site section:** Interaction layer - conversation substrate.

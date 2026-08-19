@@ -177,3 +177,25 @@ describe('proactive-briefing handler', () => {
 
 // Make this file a module so project-mode tsc isolates its top-level test scaffolding.
 export {};
+
+/**
+ * The channel flow must be associated BEFORE any membership.
+ *
+ * The assistant is a member from `CreateChannel` itself (it is the acting bearer), so Lex can fire
+ * WelcomeIntent from that instant and every message created before the association bypasses the flow.
+ * `CreateChannel` takes no channel-flow field, so immediately after creation is the earliest point.
+ *
+ * Same defect `39208b5` fixed in `create-conversation/index.js` — fixed there only, and left standing
+ * in this path plus two others because nothing held the six creation paths to a single order.
+ */
+describe('channel-flow association ordering', () => {
+  it('associates the flow before adding any member', async () => {
+    const { handler } = await import('../lambda/src/proactive-briefing');
+    await handler({ source: 'aws.events' });
+    const order = mockChimeSend.mock.calls.map((c) => (c[0] as { __t: string }).__t);
+    // Guard against a vacuous pass: if no association is issued at all, the ordering below is
+    // meaningless. CHANNEL_FLOW_ARN_PARAM is set in beforeEach, so it must appear.
+    expect(order).toContain('AssocFlow');
+    expect(order.indexOf('AssocFlow')).toBeLessThan(order.indexOf('AddMember'));
+  });
+});

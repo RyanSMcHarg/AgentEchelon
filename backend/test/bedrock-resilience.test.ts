@@ -25,6 +25,8 @@ const successResult = {
   inputTokens: 10,
   outputTokens: 5,
   bedrockTime: 200,
+  modelMs: 200,
+  toolMs: 0,
   steps: [],
 };
 

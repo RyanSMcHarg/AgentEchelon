@@ -1,33 +1,5 @@
 import type { ActiveTask } from '../types';
 
-/**
- * Validates a URL parsed out of a `<!--battleimage:-->` marker.
- * Only allows https + the AWS-managed hosts the async processor actually
- * writes (S3 presigned, Bedrock image stream). Rejects javascript:/data:/
- * file: schemes, attacker-controlled hosts, and anything that won't
- * `new URL()`-parse.
- */
-export function isAllowedBattleImageUrl(raw: string): boolean {
-  if (typeof raw !== 'string' || raw.length === 0 || raw.length > 8192) return false;
-  let u: URL;
-  try {
-    u = new URL(raw);
-  } catch {
-    return false;
-  }
-  if (u.protocol !== 'https:') return false;
-  const host = u.hostname.toLowerCase();
-  // Allow virtual-hosted-style S3 (`bucket.s3.amazonaws.com`,
-  // `bucket.s3.<region>.amazonaws.com`) and path-style S3
-  // (`s3.amazonaws.com`, `s3.<region>.amazonaws.com`). Reject everything
-  // else — e.g. an attacker-supplied `evil.s3.amazonaws.com.attacker.io`
-  // would not pass `.endsWith('.amazonaws.com')` here because the
-  // suffix-check is anchored to the hostname end (URL parsing
-  // normalises trailing dots away).
-  if (!host.endsWith('.amazonaws.com') && host !== 'amazonaws.com') return false;
-  return true;
-}
-
 export interface NavigateChannel {
   channelArn: string;
   channelName: string;
@@ -78,19 +50,10 @@ export interface BattleWaiting {
   botArn: string;
 }
 
-/**
- * Generation-out: a battle reply that produced an IMAGE. Set
- * from the `<!--battleimage:{json}-->` marker the async processor
- * appends to the updated reply Content (JSON-in-marker like
- * ACTIVE_TASK — presigned S3 URLs contain `=,&,:` so the key=val
- * battle-field form can't carry them). Absent ⇒ a text/failed/withheld
- * reply: render the text only, never a broken <img>.
- */
-export interface BattleImage {
-  urls: string[];
-  modelId: string;
-  count: number;
-}
+// Generation-out has NO marker here by design: a generated image is delivered as a message
+// ATTACHMENT and rendered by AttachmentDisplay, which fetches a fresh presigned URL on demand.
+// The inline `<!--battleimage:{urls}-->` marker this file used to parse embedded a presigned URL in
+// the content, so it expired with the STS token and did not render; nothing has emitted it since.
 
 interface ParsedMessage {
   content: string;
@@ -98,7 +61,6 @@ interface ParsedMessage {
   navigateChannel: NavigateChannel | null;
   battle: BattleMarker | null;
   battleWaiting: BattleWaiting | null;
-  battleImage: BattleImage | null;
 }
 
 const NAVIGATE_CHANNEL_PATTERN = /NAVIGATE_CHANNEL:([^|\s]+)\|([^\n]+)/;
@@ -130,6 +92,35 @@ const LEX_MSGS_CONTENT_TYPE = 'application/amz-chime-lex-msgs';
  * JSON in a code block, and that must render verbatim — only Lex's envelope is
  * unwrapped.
  */
+/**
+ * Is this a Lex envelope carrying NO messages, i.e. nothing the user should see?
+ *
+ * The router returns `messages: []` to suppress a retried fulfillment (ADR-022). Amazon Chime SDK
+ * posts that envelope into the channel regardless, so it is the CLIENT that has to recognise it as
+ * nothing - otherwise the user sees raw JSON, which is worse than the duplicate the suppression exists
+ * to prevent.
+ *
+ * Shared because both ingestion paths need the identical rule: the REST history load
+ * (`chimeService.listMessages`) and the realtime websocket (`MessagingProvider.parseMessagePayload`).
+ * They previously each carried their own copy, which is two places for the rule to drift and only one
+ * of them visible in any given bug report - a message dropped live but present on reload, or the
+ * reverse.
+ *
+ * Gated on the Lex ContentType for the same reason as `unwrapLexEnvelope`: a coding answer may
+ * legitimately contain `{"Messages":[]}` in a fenced block and must render verbatim.
+ */
+export function isEmptyLexEnvelope(rawContent: string, contentType?: string): boolean {
+  if (contentType !== LEX_MSGS_CONTENT_TYPE) return false;
+  try {
+    const lex = JSON.parse(rawContent);
+    return Array.isArray(lex?.Messages) && lex.Messages.length === 0;
+  } catch {
+    // Marked as a Lex envelope but unparseable. Not provably empty, so keep it rather than silently
+    // dropping a message we failed to understand.
+    return false;
+  }
+}
+
 export function unwrapLexEnvelope(rawContent: string, contentType?: string): string {
   if (contentType !== LEX_MSGS_CONTENT_TYPE) return rawContent;
   try {
@@ -153,7 +144,6 @@ export function parseMessageContent(rawContent: string): ParsedMessage {
   let navigateChannel: NavigateChannel | null = null;
   let battle: BattleMarker | null = null;
   let battleWaiting: BattleWaiting | null = null;
-  let battleImage: BattleImage | null = null;
 
   // Extract <!--ACTIVE_TASK:{JSON}--> markers
   const taskMatch = content.match(/<!--ACTIVE_TASK:(.*?)-->/s);
@@ -248,40 +238,6 @@ export function parseMessageContent(rawContent: string): ParsedMessage {
     content = content.replace(BATTLEWAITING_MARKER_PATTERN, '');
   }
 
-  // Extract <!--battleimage:{json}--> — set by the async processor on a
-  // generation-out reply. JSON-in-marker (mirrors ACTIVE_TASK); a
-  // malformed or shape-invalid payload is ignored (no fabricated image).
-  //
-  // Every URL is validated against isAllowedBattleImageUrl below.
-  // Server-side markers are the only
-  // intended writer, but Chime message content is writable by any
-  // channel member, so a hostile sender could craft a marker pointing
-  // at an attacker-controlled host (tracking-pixel exfil of cookies/
-  // referrer) or a `javascript:` URL (XSS if rendered into a clickable
-  // <a>, which a future change could easily introduce).
-  const imageMatch = content.match(/<!--battleimage:(.*?)-->/s);
-  if (imageMatch) {
-    try {
-      const parsed = JSON.parse(imageMatch[1]) as Partial<BattleImage>;
-      const urls = parsed.urls;
-      if (
-        Array.isArray(urls) &&
-        urls.length > 0 &&
-        urls.every((u) => typeof u === 'string' && isAllowedBattleImageUrl(u)) &&
-        typeof parsed.modelId === 'string'
-      ) {
-        battleImage = {
-          urls,
-          modelId: parsed.modelId,
-          count: typeof parsed.count === 'number' ? parsed.count : urls.length,
-        };
-      }
-    } catch {
-      // Ignore parse errors — fall back to the text line.
-    }
-    content = content.replace(/<!--battleimage:.*?-->/gs, '');
-  }
-
   // Extract NAVIGATE_CHANNEL:<arn>|<name> markers (drift confirm redirect)
   const navMatch = content.match(NAVIGATE_CHANNEL_PATTERN);
   if (navMatch) {
@@ -300,7 +256,7 @@ export function parseMessageContent(rawContent: string): ParsedMessage {
   // Clean up leading/trailing whitespace from stripping
   content = content.trim();
 
-  return { content, activeTask, navigateChannel, battle, battleWaiting, battleImage };
+  return { content, activeTask, navigateChannel, battle, battleWaiting };
 }
 
 interface BattleFields {

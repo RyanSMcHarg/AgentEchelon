@@ -34,6 +34,15 @@ export interface PendingSuggestion {
   kind: SuggestionKind;
   rivalConversationArn?: string;
   originatingMessageId: string;
+  /**
+   * The text of the message that caused the drift, carried so the new conversation's welcome can quote it
+   * back to the person.
+   *
+   * Carried HERE rather than re-read at confirm time because the confirm arrives on a LATER turn ("yes"),
+   * by which point the triggering message is no longer the turn's input. Session-scoped and short-lived:
+   * it exists only between the suggestion and the answer.
+   */
+  originatingMessageText?: string;
   cosineDistance?: number;
   correlationId: string;
   driftEventId?: string;        // The drift_events row id (set after recordDriftFire)

@@ -4,7 +4,7 @@ This guide is the rule for storing data on Amazon Chime SDK channels and users, 
 
 The one-line version:
 
-> **Tags gate access. Channel metadata is public to members. User metadata does not exist. Sensitive per-channel data lives in Aurora, read server-side only.**
+> **Tags gate access. Channel metadata is public to members. User metadata does not exist. The private per-channel host grounding lives in a server-only store (`ChannelContextTable`), read server-side only.**
 
 Related: [SPEC-CONVERSATION-SECURITY](../../specs/interaction/identity-access/core/SPEC-CONVERSATION-SECURITY.md), [TAGGING (cost tags)](../admin/TAGGING.md), [SPEC-MESSAGE-METADATA-CODEBOOK](../../specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md). The channel-metadata relocation design (`SPEC-CHANNEL-METADATA-MINIMIZATION`) is tracked internally until it ships.
 
@@ -28,7 +28,7 @@ Non-sensitive, display-level data that is appropriate for **every** member to se
 - **Host-app domain payload**: work items, plans, assignees, `participantProfile`, `domainContext`, `otherContexts`, `contextId`. This is another user's business data.
 - **Secrets or credentials** of any kind.
 
-If you need per-channel context that is not safe for every member to read, it goes in Aurora (section 4), not in metadata.
+If you need per-channel context that is not safe for every member to read, it goes in the server-only Channel Context store (section 4), not in metadata.
 
 ### Do not trust channel metadata for a security decision
 Metadata is mutable by any channel moderator (the owner `rename` capability is `chime:UpdateChannel`, which can rewrite the metadata blob). Never read a field from channel metadata and use it to authorize, gate a tier, or select a model tier. The authoritative signal is the `classification` tag (section 3). `modelTier` may exist in metadata as a convenience mirror, but the router resolves the served tier from the tag (`resolveChannelTier` -> `ListTagsForResource`), never from metadata.
@@ -48,7 +48,7 @@ Two tag families exist, for two different jobs.
 
 ### The `classification` security tag
 - Set **once, at channel creation**, to the channel's tier, and **never changed**. `chime:UpdateChannel` cannot modify tags, which is exactly why the tier boundary keys on the tag and not on metadata.
-- IAM enforces it: `tierChannelScopedAllow` grants channel actions only where `aws:ResourceTag/classification` is the caller's tier or below, fail-closed on an untagged or higher-tier channel (`lib/stacks/agent-classification-common.ts`).
+- IAM enforces it: `classificationChannelScopedAllow` grants channel actions only where `aws:ResourceTag/classification` is the caller's tier or below, fail-closed on an untagged or higher-tier channel (`lib/stacks/agent-classification-common.ts`).
 - Every channel-creation path must apply it (native, drift, federated, briefing). A channel created without it is inert to tier-capped callers by design; that is a bug in the creation path, not a safe default to rely on.
 - Reading the tag at runtime uses `chime:ListTagsForResource`. A tag **read** cannot be tier-gated (it is how the tier is learned), so grant it as an ungated channel read.
 
@@ -60,15 +60,35 @@ Two tag families exist, for two different jobs.
 - Never put a secret, a mutable value, or per-user data in a tag. Tags are readable through the AWS API and are capped in size and count.
 - If a value needs to change over the channel's life, it does not belong in a tag.
 
-## 4. Sensitive per-channel data lives in Aurora, read server-side
+## 4. The private host grounding lives in a server-only store, not in channel metadata
 
-Per-channel host and participant context (`domainContext`, `otherContexts`, `participantProfile`, the `{sub, iss, role}` roster, `userLanguage`, `segment`, `contextId`) is stored in the Aurora `channel_context` table, keyed by `channel_arn`. It is never member-readable.
+The sensitive host grounding a conversation carries - `participantProfile`, `domainContext`,
+`otherContexts`, and the resolved `userName` - is stored in a **server-only DynamoDB table**
+(`ChannelContextTable`, keyed by `channelArn`). No member principal is granted access: only the
+conversation-create Lambdas write it and only the assistant handler reads it. It is never
+member-readable.
 
-Non-VPC Lambdas (the router, notification bridge) must not connect to Aurora directly (ADR-018). They call the data-plane Lambda through `lib/data-plane-client.ts`:
-- `putChannelContext(channelArn, context, roster)` to write (federated create / add-member).
-- `getChannelContext(channelArn)` to read (router grounding, notification roster).
+Read and written through `lambda/src/lib/channel-context-client.ts`:
+- `putChannelContext(channelArn, { participantProfile, domainContext, otherContexts, userName,
+  userLanguage, segment })` to write (federated create / add-member).
+- `getChannelContext(channelArn)` to read (router grounding).
 
-This keeps the host payload out of every member's reach while the assistant still gets full grounding server-side.
+**The model-routing signals live here too, and for a stronger reason.** `userLanguage` and
+`segment` decide which model answers the turn (`segment.country === 'CN'` routes to the Chinese model)
+and which language it replies in. Channel metadata is member-WRITABLE, so sourcing them from it would
+let a member choose the model serving their own conversation. They are configuration a deployment
+sets, not something a participant may edit, so they are written server-side and read only from the
+store. `host-grounding.ts` reads them from the store alone, and a value found in metadata is ignored
+and reported.
+
+**What stays in member-readable channel metadata (by design):** the conversation's identity bits
+(`topic`, `triggerContext`, `contextType`, `contextId`) and the participant **roster** of member subs.
+The roster is not a secret - members can already enumerate it via `ListChannelMemberships` - and it is
+what the notification fan-out reads, so it stays in metadata rather than being duplicated into the
+store. Nothing in metadata is trusted as grounding or as a routing decision.
+
+This keeps the private host payload out of every member's reach while the assistant still gets full
+grounding server-side.
 
 ## 5. Quick decision table
 
@@ -78,8 +98,9 @@ This keeps the host payload out of every member's reach while the assistant stil
 | The channel's display title / greeting hint | channel **metadata** (`topic`, `triggerContext`) |
 | Who created the channel | nowhere - read `Channel.CreatedBy` |
 | Who the members are | nowhere - read `ListChannelMemberships` |
-| A member's issuer, role, profile, language, geo | Aurora `channel_context` (server-only) |
-| Host-app work items / plans / assignees | Aurora `channel_context` (server-only) |
+| A member's profile / the conversation's domain grounding | `ChannelContextTable` DynamoDB (server-only, `channel-context-client.ts`) |
+| Host-app work items / plans / other-context blobs | `ChannelContextTable` DynamoDB (server-only) |
+| The member roster / a member's language, geo | channel **metadata** (member-readable routing bits; roster is already visible via `ListChannelMemberships`) |
 | A user's tier / authority | Cognito **group** (admin-managed) |
 | Any attribute on an AppInstanceUser | nowhere - user metadata stays empty |
 | Cost-attribution identity | app-root **tags** (see TAGGING) |

@@ -1,6 +1,16 @@
+---
+title: "ADR-014: Model `workingLanguage` as a catalog attribute"
+status: Accepted
+scope: The catalog attribute. The bilingual pivot that consumes it is specified separately (SPEC-BILINGUAL-CONVERSATIONS level 2).
+date: 2026-07-16
+related:
+  - "../../specs/interaction/assistant-config/SPEC-BILINGUAL-CONVERSATIONS.md"
+  - "../../../backend/lib/config/model-strategy.ts"
+---
+
 # ADR-014: Model `workingLanguage` as a catalog attribute
 
-> **Status:** Proposed (design input for `docs/specs/interaction/assistant-config/SPEC-BILINGUAL-CONVERSATIONS.md` Level 2 / pivot). No code yet.
+> **Status:** Accepted - the catalog attribute ships; the pivot that consumes it does not. `workingLanguage` is a required field on every entry in the model catalog (`backend/lib/config/model-strategy.ts`), so the catalog stays exhaustive and parity-testable, and one non-`'en'` model is already published (DeepSeek V3.2, `'zh'`). What is NOT built is the translate-in / translate-back pivot that reads it: `resolve-model-plan.ts` still returns a hardcoded `workingLanguage` rather than the catalog's, so the field changes no current behaviour. The pivot remains design input for `docs/specs/interaction/assistant-config/SPEC-BILINGUAL-CONVERSATIONS.md` Level 2.
 
 ## Context
 

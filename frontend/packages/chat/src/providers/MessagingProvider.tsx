@@ -15,41 +15,54 @@ import {
   parseMessageContent,
   parseActiveTaskFromMetadata,
   parseMessageFeedbackFromMetadata,
+  isEmptyLexEnvelope,
 } from '@ae/shared';
 import type { Message } from '@ae/shared';
 
+/**
+ * Channel events, delivered for EVERY channel the user is a member of.
+ *
+ * There is deliberately no per-channel registration. The websocket session is app-level and always
+ * on, so a per-channel callback map only ever added a window in which a channel had no registered
+ * handler - and a message arriving in that window was dropped with no repair. That window opened on
+ * every conversation CREATE: the bot is added (firing its welcome server-side) before the client can
+ * register anything, and the welcome lands seconds later because the router retries the
+ * eventually-consistent creator lookup. The result was an empty conversation carrying an unread dot
+ * in the user's own sidebar, in roughly a third of new conversations.
+ *
+ * So the handler is registered once and receives `channelArn`; deciding what is "current" belongs to
+ * the consumer, which is the only layer that knows. This mirrors the Amazon Chime SDK sample chat
+ * app (`aws-samples/amazon-chime-sdk`, `ChatMessagesProvider`), which subscribes once on auth and
+ * branches on an active-channel ref - render it, or mark the channel unread.
+ */
 export interface ChannelCallbacks {
-  onMessageCreate?: (msg: Message) => void;
-  onMessageUpdate?: (msg: Message) => void;
-  onMessageDelete?: (msgId: string) => void;
+  onMessageCreate?: (channelArn: string, msg: Message) => void;
+  onMessageUpdate?: (channelArn: string, msg: Message) => void;
+  onMessageDelete?: (channelArn: string, msgId: string) => void;
   /** Fires on CREATE_CHANNEL_MEMBERSHIP or DELETE_CHANNEL_MEMBERSHIP events.
    *  The subscriber is expected to re-fetch the member list — we don't try
    *  to reconcile individual events into local state because Chime's at-
    *  least-once delivery can drop or duplicate membership events. */
-  onMembershipChange?: () => void;
+  onMembershipChange?: (channelArn: string) => void;
   /** Fires on UPDATE_CHANNEL events — primarily when the bot renames a
    *  channel after deriving a title from the first user message. The
    *  subscriber receives the new channel `Name`. */
-  onChannelUpdate?: (channelName: string) => void;
+  onChannelUpdate?: (channelArn: string, channelName: string) => void;
 }
 
-/** Global listener fires for EVERY channel the user is a member of,
- *  not just the one currently subscribed via `subscribe()`. Used by
- *  ConversationProvider to flip unread state on inactive channels
- *  without needing per-channel subscriptions. */
+/** Cross-channel bookkeeping that is not about rendering: unread state, and surfacing a channel the
+ *  user was just added to (a drift-spawned conversation) that is not in the sidebar yet. */
 export interface GlobalMessageListener {
   onMessageInAnyChannel?: (channelArn: string, senderArn: string) => void;
-  /** Fires on CREATE_CHANNEL_MEMBERSHIP in ANY channel — including one we are NOT yet subscribed to
-   *  (a channel the user was just added to, e.g. a drift-spawned conversation). The per-channel
-   *  subscription lookup below bails for such channels, so without this global hook a newly-joined
-   *  channel never surfaces in the sidebar until a reload. */
+  /** Fires on CREATE_CHANNEL_MEMBERSHIP in ANY channel, including one the sidebar does not know
+   *  about yet — without it a newly-joined channel never appears until a reload. */
   onAddedToChannel?: (channelArn: string) => void;
 }
 
 interface MessagingContextType {
   isConnected: boolean;
-  subscribe: (channelArn: string, callbacks: ChannelCallbacks) => void;
-  unsubscribe: (channelArn: string) => void;
+  /** Register the single channel-event handler. Pass null to clear it. */
+  setChannelListener: (callbacks: ChannelCallbacks | null) => void;
   setGlobalListener: (listener: GlobalMessageListener | null) => void;
 }
 
@@ -74,7 +87,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
   const { refreshCredentials } = useAuth();
   const [isConnected, setIsConnected] = useState(false);
   const sessionRef = useRef<MessagingSession | null>(null);
-  const subscriptionsRef = useRef<Map<string, ChannelCallbacks>>(new Map());
+  const channelListenerRef = useRef<ChannelCallbacks | null>(null);
   const globalListenerRef = useRef<GlobalMessageListener | null>(null);
   const isConnectingRef = useRef(false);
   const hiddenAtRef = useRef<number | null>(null);
@@ -83,6 +96,16 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
   // so we can emit websocket_reconnected instead of websocket_connected when
   // the next messagingSessionDidStart fires.
   const isReconnectRef = useRef(false);
+  // Set immediately before any DELIBERATE session.stop() (forceReconnect, unmount, sign-out) so the
+  // stop observer can tell "we ended this" from "the socket dropped" and only auto-reconnect the
+  // second. Without it, forceReconnect's own stop would race a second reconnect against itself.
+  const intentionalStopRef = useRef(false);
+  // Consecutive unattended drops, for backoff. Reset on a successful start.
+  const dropCountRef = useRef(0);
+  const reconnectTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  // The observer is built inside `connect`, so it cannot close over `forceReconnect` (defined after,
+  // and itself depending on `connect`). A ref holding the latest one breaks the cycle.
+  const forceReconnectRef = useRef<(() => Promise<void>) | null>(null);
 
   // Parse a Chime message payload into our Message type
   const parseMessagePayload = useCallback((payload: Record<string, unknown>): Message | null => {
@@ -95,15 +118,14 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     // Empty `Messages` arrays are noise (e.g. Lex returned no response); drop them.
     // Otherwise unwrap so the user sees the actual text.
     const contentType = payload.ContentType as string | undefined;
+    // Empty envelope: the router suppressing a retried fulfillment (ADR-022). Same rule as the REST
+    // history load, shared so a message cannot be dropped on one path and rendered on the other.
+    if (isEmptyLexEnvelope(content, contentType)) return null;
     if (contentType === 'application/amz-chime-lex-msgs') {
       try {
         const parsed = JSON.parse(content);
-        const messages = parsed?.Messages;
-        if (Array.isArray(messages)) {
-          if (messages.length === 0) return null;
-          const first = messages[0]?.Content;
-          if (typeof first === 'string') content = first;
-        }
+        const first = parsed?.Messages?.[0]?.Content;
+        if (typeof first === 'string') content = first;
       } catch {
         // If we can't parse it, render the raw content as a fallback
       }
@@ -196,6 +218,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
         messagingSessionDidStart: () => {
           sessionRef.current = session;
           lastMessageTimeRef.current = Date.now();
+          dropCountRef.current = 0;
           setIsConnected(true);
           trackEvent(isReconnectRef.current ? 'websocket_reconnected' : 'websocket_connected');
           isReconnectRef.current = false;
@@ -204,6 +227,40 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           sessionRef.current = null;
           setIsConnected(false);
           trackEvent('websocket_disconnected');
+
+          // A deliberate stop is not a fault; the caller drives what happens next.
+          if (intentionalStopRef.current) {
+            intentionalStopRef.current = false;
+            return;
+          }
+
+          // AN UNATTENDED DROP MUST RECONNECT ITSELF.
+          //
+          // Reconnecting used to be driven ONLY by `visibilitychange`, so a socket that dropped while
+          // the page was VISIBLE - the ordinary case for someone sitting in a conversation - was never
+          // re-established. The header rendered "Reconnecting..." indefinitely while nothing was
+          // reconnecting, and messages the backend had already delivered simply never arrived. The
+          // only recovery was switching tabs away and back, which no user knows to do.
+          //
+          // A HIDDEN tab is left alone deliberately: browsers suspend background sockets as a matter
+          // of course, so retrying there burns credentials against a connection the browser intends to
+          // keep down, and the visibility handler already re-establishes it on return.
+          if (document.visibilityState === 'hidden') return;
+
+          const attempt = ++dropCountRef.current;
+          // 1s, 2s, 4s, 8s, capped at 15s. Backoff rather than a fixed retry so a server-side outage
+          // is not amplified by every open client retrying in lockstep.
+          const delay = Math.min(1000 * 2 ** (attempt - 1), 15000);
+          console.warn(
+            `[MessagingProvider] messaging session dropped (attempt ${attempt}); reconnecting in ${delay}ms`,
+          );
+          if (reconnectTimerRef.current) clearTimeout(reconnectTimerRef.current);
+          reconnectTimerRef.current = setTimeout(() => {
+            reconnectTimerRef.current = null;
+            // Full forceReconnect, not a bare connect(): a drop is frequently an expired credential,
+            // and reconnecting with the same stale one fails identically and forever.
+            void forceReconnectRef.current?.();
+          }, delay);
         },
         messagingSessionDidReceiveMessage: (message: any) => {
           // Track last message time for staleness detection
@@ -249,7 +306,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
             }
           }
 
-          const callbacks = subscriptionsRef.current.get(channelArn);
+          const callbacks = channelListenerRef.current;
           if (!callbacks) return;
 
           // Bot replies arrive in one of two shapes:
@@ -259,10 +316,14 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           // Latency + analytics tracking must fire when the *actual answer*
           // arrives, not when the placeholder lands — otherwise we measure
           // time-to-acknowledgment, which is uniformly fast and useless.
+          // Scoped to a channel we are AWAITING a reply in. The handler now sees every channel, so
+          // without this a bot reply in a background conversation would be counted as a response to
+          // a send we never made. markResponseReceived returns null when there is no pending send
+          // for the channel, which is exactly that condition — so it is the gate, not just a no-op.
           const trackBotResponse = (isBot: boolean) => {
             if (!isBot) return;
             try {
-              markResponseReceived(channelArn);
+              if (!markResponseReceived(channelArn)) return;
               trackEvent('message_received', { isBot: true, channelArn });
             } catch {
               // Tracking must never break message processing
@@ -276,7 +337,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
                 if (msg.isBot && !isAsyncPlaceholder(payload.Content as string | undefined)) {
                   trackBotResponse(true);
                 }
-                callbacks.onMessageCreate?.(msg);
+                callbacks.onMessageCreate?.(channelArn, msg);
               }
               break;
             }
@@ -288,19 +349,19 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
                 // send is deleted on first call), so this is also safe in
                 // the direct-CREATE path where the metric was already taken.
                 trackBotResponse(msg.isBot);
-                callbacks.onMessageUpdate?.(msg);
+                callbacks.onMessageUpdate?.(channelArn, msg);
               }
               break;
             }
             case 'DELETE_CHANNEL_MESSAGE': {
               const msgId = payload.MessageId as string;
-              if (msgId) callbacks.onMessageDelete?.(msgId);
+              if (msgId) callbacks.onMessageDelete?.(channelArn, msgId);
               break;
             }
             case 'CREATE_CHANNEL_MEMBERSHIP':
             case 'UPDATE_CHANNEL_MEMBERSHIP':
             case 'DELETE_CHANNEL_MEMBERSHIP': {
-              callbacks.onMembershipChange?.();
+              callbacks.onMembershipChange?.(channelArn);
               break;
             }
             case 'UPDATE_CHANNEL': {
@@ -308,7 +369,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
               // title derive) updates the channel's Name or Metadata.
               // The payload places the new name at `payload.Name`.
               const newName = (payload.Name as string | undefined) || '';
-              if (newName) callbacks.onChannelUpdate?.(newName);
+              if (newName) callbacks.onChannelUpdate?.(channelArn, newName);
               break;
             }
           }
@@ -336,11 +397,19 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     // Mark the next messagingSessionDidStart as a reconnect so the
     // observer emits websocket_reconnected rather than _connected.
     isReconnectRef.current = true;
+    // A queued auto-reconnect would now be redundant, and would race this one.
+    if (reconnectTimerRef.current) {
+      clearTimeout(reconnectTimerRef.current);
+      reconnectTimerRef.current = null;
+    }
     // Stop existing session
     if (sessionRef.current) {
       try {
+        // Ours, not a fault: the stop observer must not schedule its own reconnect on top of this.
+        intentionalStopRef.current = true;
         sessionRef.current.stop();
       } catch (e) {
+        intentionalStopRef.current = false;
         console.warn('Error stopping old session:', e);
       }
       sessionRef.current = null;
@@ -367,12 +436,23 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     connect();
   }, [connect, refreshCredentials]);
 
+  // Keep the ref pointing at the current forceReconnect so the stop observer can reach it.
+  useEffect(() => {
+    forceReconnectRef.current = forceReconnect;
+  }, [forceReconnect]);
+
   // Initial connection
   useEffect(() => {
     connect();
 
     return () => {
+      if (reconnectTimerRef.current) {
+        clearTimeout(reconnectTimerRef.current);
+        reconnectTimerRef.current = null;
+      }
       if (sessionRef.current) {
+        // Teardown, not a fault: never let unmount schedule a reconnect against a dead provider.
+        intentionalStopRef.current = true;
         sessionRef.current.stop();
         sessionRef.current = null;
       }
@@ -411,12 +491,8 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     return () => document.removeEventListener('visibilitychange', handleVisibilityChange);
   }, [forceReconnect]);
 
-  const subscribe = useCallback((channelArn: string, callbacks: ChannelCallbacks) => {
-    subscriptionsRef.current.set(channelArn, callbacks);
-  }, []);
-
-  const unsubscribe = useCallback((channelArn: string) => {
-    subscriptionsRef.current.delete(channelArn);
+  const setChannelListener = useCallback((callbacks: ChannelCallbacks | null) => {
+    channelListenerRef.current = callbacks;
   }, []);
 
   const setGlobalListener = useCallback((listener: GlobalMessageListener | null) => {
@@ -424,7 +500,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <MessagingContext.Provider value={{ isConnected, subscribe, unsubscribe, setGlobalListener }}>
+    <MessagingContext.Provider value={{ isConnected, setChannelListener, setGlobalListener }}>
       {children}
     </MessagingContext.Provider>
   );

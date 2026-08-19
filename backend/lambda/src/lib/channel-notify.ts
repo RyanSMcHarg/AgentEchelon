@@ -2,19 +2,30 @@
  * Conversation → transport notification fan-out (SPEC-NOTIFICATION-BRIDGE Phase 1, outbound).
  *
  * A channel message tagged with a `notify` directive in its Metadata is fanned out to the
- * conversation's PARTICIPANTS over the requested transport (email in v1; SMS/voice are the same
- * fan-out later). The recipient list comes from the channel's participant ROSTER — `{sub,name,role}[]`
- * stamped into channel Metadata by create-conversation — NOT from raw channel membership, because
- * federated AppInstanceUser ids are derived and are not the IDP subs we resolve contacts by. Email is
- * resolved from the IDP (`AdminGetUser`) by sub at send time (never stored). Best-effort: reuses
- * `lib/notification.sendEmailNotifications`; failures are collected, never thrown.
+ * conversation's MEMBERS over the requested transport (email in v1; SMS/voice are the same fan-out
+ * later).
+ *
+ * WHO is decided by live channel MEMBERSHIP (`ListChannelMemberships`). It used to be decided by the
+ * `{sub,iss,role}[]` roster stamped into channel Metadata, and that was a member-controlled recipient
+ * list: Metadata is writable by any channel moderator — including a user in their own conversation —
+ * so a member could add a sub and have the assistant's messages emailed to that person. Membership is
+ * not forgeable that way.
+ *
+ * The roster survives ONLY as an issuer hint. A federated member's AppInstanceUser id is
+ * `deriveFederatedSub(iss, sub)`, a one-way hash, so membership alone cannot say which IdP to query
+ * for their contact; the roster supplies that `iss`, and only for ids that are already members.
+ *
+ * CONTACT DETAILS are resolved from the IdP (`AdminGetUser`) by (iss, sub) at send time, never stored.
+ * Best-effort: reuses `lib/notification.sendEmailNotifications`; failures are collected, never thrown.
  *
  * The on-channel message stays in the conversation (the in-app surface); this just adds the
  * out-of-band transport for members who aren't watching it.
  */
-import { ChimeSDKMessagingClient, DescribeChannelCommand } from '@aws-sdk/client-chime-sdk-messaging';
+import { ChimeSDKMessagingClient, DescribeChannelCommand, ListChannelMembershipsCommand } from '@aws-sdk/client-chime-sdk-messaging';
 import { CognitoIdentityProviderClient, AdminGetUserCommand } from '@aws-sdk/client-cognito-identity-provider';
 import { sendEmailNotifications, type EmailRecipient } from './notification.js';
+import { deriveFederatedSub, isFederatedSub } from './federated-identity.js';
+import { getChannelContext } from './channel-context-client.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 
@@ -121,23 +132,64 @@ export function selectNotifyRecipients(
   return out;
 }
 
-/** Read the participant roster off a channel's Metadata (best-effort). Keeps `iss` when present so a
- *  multi-IDP roster resolves each member against their own pool. */
-async function readRoster(
+/**
+ * The channel's HUMAN members, from live membership. This is the authority on WHO gets notified.
+ *
+ * WHY NOT THE METADATA ROSTER, WHICH THIS REPLACED. Channel Metadata is member-WRITABLE: a channel's
+ * creator is a moderator of their own channel and holds `chime:UpdateChannel`, which rewrites Name and
+ * Metadata in ONE call that IAM cannot split. Deriving the recipient list from it let any member add a
+ * `sub` to their own conversation's roster and have the assistant's messages emailed to that person -
+ * a member-controlled path to sending someone else conversation content out of band. Membership cannot
+ * be forged that way: adding a member is `CreateChannelMembership`, a separate, moderated operation
+ * that shows up in the conversation.
+ *
+ * Bots are excluded - they have no IdP identity and nothing to email.
+ */
+async function readMemberIds(
   chime: ChimeSDKMessagingClient,
   channelArn: string,
   bearerArn: string,
-): Promise<RosterParticipant[]> {
+): Promise<string[]> {
   try {
-    const r = await chime.send(new DescribeChannelCommand({ ChannelArn: channelArn, ChimeBearer: bearerArn }));
-    const meta = JSON.parse(r.Channel?.Metadata || '{}') as { participants?: unknown };
-    return Array.isArray(meta.participants)
-      ? (meta.participants as RosterParticipant[]).filter((p) => p && typeof p.sub === 'string')
-      : [];
+    const r = await chime.send(new ListChannelMembershipsCommand({
+      ChannelArn: channelArn,
+      ChimeBearer: bearerArn,
+      MaxResults: 50,
+    }));
+    return (r.ChannelMemberships || [])
+      .map((m) => m.Member?.Arn || '')
+      .filter((arn) => arn && !arn.includes('/bot/'))
+      .map((arn) => arn.split('/user/').pop() || '')
+      .filter(Boolean);
   } catch (err) {
-    console.warn('[channel-notify] failed to read roster:', err);
+    console.warn('[channel-notify] failed to list memberships:', err);
     return [];
   }
+}
+
+/**
+ * Issuer hints, keyed by AppInstanceUser id, read from the channel's Metadata roster.
+ *
+ * ONLY an `iss` LOOKUP, never a recipient list. A federated member's AppInstanceUser id is
+ * `deriveFederatedSub(iss, sub)` - a one-way SHA-256 of `issuer|subject` - so membership alone cannot
+ * tell us which IdP to query for their contact details. That is the reason the roster was stamped into
+ * Metadata in the first place, and it is still the only place that mapping exists.
+ *
+ * Demoting it to a hint is what makes it safe. The recipient set is fixed by membership before this is
+ * consulted, so a forged roster can no longer ADD anyone; the worst a tampered entry can do is point a
+ * real member at the wrong pool, where `resolvePoolForTarget` rejects an untrusted issuer and
+ * `AdminGetUser` simply fails to resolve - that member is skipped, not misdelivered.
+ */
+async function readIssuerHints(channelArn: string): Promise<Map<string, string>> {
+  const hints = new Map<string, string>();
+  const ctx = await getChannelContext(channelArn);
+  for (const p of ctx?.memberIdentities || []) {
+    if (!p || typeof p.sub !== 'string' || !p.sub || typeof p.iss !== 'string' || !p.iss) continue;
+    // Keyed by the id membership reports: a roster entry carries the RAW (iss, sub), and the member id
+    // it corresponds to is the derived one.
+    hints.set(deriveFederatedSub(p.iss, p.sub), p.iss);
+  }
+  return hints;
 }
 
 /** Resolve which trusted pool a target belongs to: its issuer's pool when given + allowed, else the
@@ -220,17 +272,35 @@ export async function fanOutChannelNotification(args: {
   }
 
   // Recipients: explicit `targets` resolve DIRECTLY (a targeted recipient — e.g. a just-shared
-  // member — may not be in the channel roster yet); otherwise notify the whole roster. Each target
-  // keeps its `iss` so cross-IDP sends hit the right pool.
+  // member — may not be in the channel membership yet, which is the whole point of a share
+  // notification). Those come from the CALLER, server-side, not from channel Metadata.
+  //
+  // Otherwise the recipient set is the channel's live MEMBERSHIP. It used to be the Metadata roster,
+  // which a member could rewrite to have conversation content emailed to someone of their choosing —
+  // see `readMemberIds`. The roster now contributes only the `iss` needed to resolve a federated
+  // member's contact, and only for ids that are already members.
   let targets: NotifyTarget[];
   if (directive.targets && directive.targets.length) {
     const seen = new Set<string>();
     targets = directive.targets.filter((t) => t.sub && !seen.has(t.sub) && seen.add(t.sub));
   } else {
-    targets = selectNotifyRecipients(await readRoster(chime, channelArn, bearerArn)).map((p) => ({
-      sub: p.sub,
-      ...(p.iss ? { iss: p.iss } : {}),
-    }));
+    const memberIds = await readMemberIds(chime, channelArn, bearerArn);
+    // Only pay for the Metadata read when a federated member is actually present; a single-IdP
+    // deployment never needs an issuer hint.
+    const hints = memberIds.some(isFederatedSub)
+      ? await readIssuerHints(channelArn)
+      : new Map<string, string>();
+    const seen = new Set<string>();
+    targets = memberIds
+      .filter((id) => !seen.has(id) && seen.add(id))
+      .map((id) => {
+        const iss = hints.get(id);
+        return iss ? { sub: id, iss } : { sub: id };
+      })
+      // A federated member with no issuer hint cannot be resolved to a contact — `sub` is a one-way
+      // hash, so querying the default pool would find nothing (or, worse, a same-named native user).
+      // Skipping is the honest outcome; `resolveContact` would only fail later anyway.
+      .filter((t) => !isFederatedSub(t.sub) || !!t.iss);
   }
   if (!targets.length) return { emailed: [], skipped: [], failed: [] };
 

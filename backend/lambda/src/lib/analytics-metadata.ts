@@ -40,6 +40,32 @@ export type AssignmentMode = 'deterministic' | 'probabilistic' | 'battle';
 export type ToolErrorClass = 'timeout' | 'not_found' | 'unauthorized' | 'bad_input' | 'error';
 
 /**
+ * Which step of the answer a message is, DECLARED by the component that posts it.
+ *
+ * ONLY `final` CLOSES A TURN. Everything else is a step along the way, and an unrecognised value is
+ * treated as a step too - the ledger files an unknown phase as `progress_update`, so a phase added
+ * later by a component that has not been taught about latency cannot silently close a turn early.
+ * Failing closed into "not final" is the forward-looking guarantee this type exists for.
+ *
+ * `partial` and `stream_chunk` are RESERVED, not implemented: token streaming would produce them, and
+ * naming them here keeps a future producer from inventing a synonym that the ledger would file as
+ * unknown.
+ */
+export type ResponsePhase =
+  /** The acknowledgment. Sets TTFF; never closes the turn. */
+  | 'placeholder'
+  /** A step the person can see, mid-answer: a task advancing, a duel side waiting on them. */
+  | 'interim'
+  /** THE ANSWER. The only phase that closes a turn and stamps `agent_final_at`. */
+  | 'final'
+  /** The turn failed and said so. Terminal for the person, and deliberately NOT `final`: it closes
+   *  the conversation's expectation without contributing a completion time to the latency average. */
+  | 'error'
+  /** A message the assistant volunteered - a welcome, a drift offer. No user message anchors it, so
+   *  it has no TTFF and must not be paired with one. */
+  | 'notice';
+
+/**
  * Per-tool outcome for one Converse iteration (P2). A single iteration can invoke several tools
  * (`stepLabel` shows `tool:a+b`), so outcome is per-tool, not one boolean for the step — tool-error
  * rate must attribute to the right tool. `name` is the tool, `ok` its success, `errorClass` the bounded
@@ -217,6 +243,14 @@ export interface AnalyticsMetadata {
   taskState?: string;
   taskTransition?: { from: string; to: string };
 
+  /**
+   * The INPUT guardrail blocked this turn before the model was called; the reply text is the
+   * guardrail's block copy, not an answer. STRUCTURAL, so consumers (battle analytics, e2e guards,
+   * experiment reads) do not have to recognise deployment-specific blockedInputMessaging by shape -
+   * the prefix test on the default English copy is exactly what a custom-copy guardrail defeats.
+   */
+  guardrailBlocked?: boolean;
+
   // Bedrock resilience tracking
   wasFallback?: boolean;
   fallbackReason?: string;
@@ -246,6 +280,43 @@ export interface AnalyticsMetadata {
   assignmentMode?: AssignmentMode;
   battleContext?: AnalyticsBattleContext;
 
+  /**
+   * WHICH STEP OF THE ANSWER THIS MESSAGE IS. Declared by the producer, never inferred (tracker
+   * row 49).
+   *
+   * Latency's outer bracket closes when the FINAL answer lands, and until this existed nothing in the
+   * event said which update that was. Archival deduced it: an update carrying worker telemetry
+   * (`total_ms`) must be the completion, first-such-update-wins. That proxy is correct only by
+   * coincidence of the current flow - add any interim update that carries telemetry before the real
+   * answer and it silently becomes "the answer", `COALESCE` freezes the wrong instant, `e2e_ms` reads
+   * too fast, and nothing errors. A multi-step task is the shape that already breaks it, because its
+   * real answer is the LAST update rather than the first.
+   *
+   * So the producer says so. A new intermediate update is then harmless by construction rather than
+   * by nobody having added one yet.
+   *
+   * IT RIDES MESSAGE METADATA, and that is load-bearing rather than convenient. The out-of-band
+   * analytics store has a 7-day TTL, never reaches S3, and is overwritten per MessageId, so a marker
+   * there could not survive as evidence on a multi-update turn. Metadata reaches the S3 archive, which
+   * is what makes "auditable against the stream" a fact rather than a claim.
+   *
+   * IT MUST NEVER BE SHED. It is ~18 encoded characters of the 1024 cap, and it is not analytics
+   * detail - it is the field that decides whether a turn is closed at all. `METADATA_SHED_ORDER`
+   * therefore does not list it, and a test asserts that it survives an overflowing blob.
+   */
+  respPhase?: ResponsePhase;
+
+  /**
+   * WHAT CAUSED THIS TURN: a person's message, or the platform driving one (a battle round 2, a
+   * repair). Forwarded from `TurnRequest.trigger`.
+   *
+   * It is a MEASUREMENT field, not bookkeeping. "How long did this take" means something different
+   * for the two - one is a person waiting and the other is not - so a ledger that cannot tell them
+   * apart reports a repaired turn as one very slow answer. Absent ⇒ read as a user turn, which is
+   * what every path did before this was forwarded.
+   */
+  trigger?: 'user' | 'orchestrator';
+
   // Timestamp for analytics
   timestamp: string;
 }
@@ -262,6 +333,8 @@ export interface AnalyticsContext {
   intent?: string;
   intentConfidence?: string;
   deliveryOption?: string;
+  /** What caused the turn ('user' | 'orchestrator'). See `AnalyticsMetadata.trigger`. */
+  trigger?: 'user' | 'orchestrator';
 
   bedrockResponse?: {
     model: string;
@@ -286,6 +359,8 @@ export interface AnalyticsContext {
   taskState?: string;
   taskTransition?: { from: string; to: string };
 
+  /** See AnalyticsMetadata.guardrailBlocked - the INPUT guardrail blocked this turn (structural). */
+  guardrailBlocked?: boolean;
   wasFallback?: boolean;
   fallbackReason?: string;
   retryCount?: number;
@@ -361,6 +436,9 @@ export function buildAnalyticsMetadata(context: AnalyticsContext): AnalyticsMeta
   if (context.intent) metadata.intent = context.intent;
   if (context.intentConfidence) metadata.intentConfidence = context.intentConfidence;
   if (context.deliveryOption) metadata.deliveryOption = context.deliveryOption;
+  // Copied through, never derived here: the router declares what caused the turn and this is a
+  // carrier. A default invented at this layer would be indistinguishable from a declaration.
+  if (context.trigger) metadata.trigger = context.trigger;
 
   if (context.bedrockResponse) {
     metadata.bedrockModel = context.bedrockResponse.model;
@@ -383,6 +461,7 @@ export function buildAnalyticsMetadata(context: AnalyticsContext): AnalyticsMeta
   if (context.taskState) metadata.taskState = context.taskState;
   if (context.taskTransition) metadata.taskTransition = context.taskTransition;
 
+  if (context.guardrailBlocked) metadata.guardrailBlocked = true;
   if (context.wasFallback !== undefined) metadata.wasFallback = context.wasFallback;
   if (context.fallbackReason) metadata.fallbackReason = context.fallbackReason;
   if (context.retryCount !== undefined) metadata.retryCount = context.retryCount;

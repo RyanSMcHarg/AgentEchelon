@@ -8,11 +8,13 @@ import RegistrationScreen from './components/RegistrationScreen';
 import EmailVerificationScreen from './components/EmailVerificationScreen';
 import Header from './components/Header';
 import ConversationList from './components/ConversationList';
+import { OpenWorkItems } from './components/OpenWorkItems';
 import ConversationInterface from './components/ConversationInterface';
 import MessageInput from './components/MessageInput';
 import NewConversationModal from './components/NewConversationModal';
 import DeploymentStatusBanner from './components/DeploymentStatusBanner';
 import '@ae/shared/styles/App.css';
+import { requestMessageFocus } from './utils/focusMessage';
 
 type AuthView = 'login' | 'register' | 'verify' | 'success' | 'forgot';
 
@@ -41,6 +43,13 @@ function AppContent() {
     const params = new URLSearchParams(window.location.search);
     const conversationId = params.get('conversation');
     if (!conversationId) return;
+    // `#message=<id>` deep-links to a SPECIFIC message, not just the conversation. A drift-created
+    // conversation links back to the message that caused it, so landing at the bottom of a long thread
+    // would leave the reader to hunt for it. Read before the URL is cleaned below.
+    const messageId = decodeURIComponent((window.location.hash.match(/message=([^&]+)/) || [])[1] || '');
+    // Recorded BEFORE selecting, because the target's history has not loaded yet. ConversationInterface
+    // scrolls to it in an effect once the message renders, so nothing here waits or polls.
+    if (messageId) requestMessageFocus(messageId);
     void selectConversation(conversationId).finally(() => {
       // Clean up URL once selection has been attempted.
       window.history.replaceState({}, '', window.location.pathname);
@@ -132,7 +141,7 @@ function AppContent() {
   // The admin console is a SEPARATE app (AgentEchelonAdminFrontend, admin.html /
   // admin-main.tsx) served from its own origin — it is NOT a route in this chat
   // SPA. The chat bundle therefore carries no operator code or admin endpoints;
-  // assert-no-admin-in-chat.mjs pins that invariant. See SPEC-SEPARATE-ADMIN-APP.md.
+  // assert-no-admin-in-chat.mjs pins that invariant. See DESIGN-SEPARATE-ADMIN-APP.md.
   return (
     <div className="app">
       <Header />
@@ -146,6 +155,9 @@ function AppContent() {
               <span>+</span> New conversation
             </button>
           </div>
+          {/* Above the conversation list on purpose: an item you owe outranks the list of places you
+              might go, and it is the one thing a returning user should see before choosing. */}
+          <OpenWorkItems />
           <ConversationList onNewConversation={() => setIsModalOpen(true)} />
         </div>
 

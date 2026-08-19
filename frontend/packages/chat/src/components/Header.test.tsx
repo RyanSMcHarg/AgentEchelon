@@ -16,7 +16,7 @@ function renderWith(user: Partial<User> | null) {
   return render(<Header onHome={vi.fn()} />);
 }
 
-describe('Header — chat-only after the admin console split (SPEC-SEPARATE-ADMIN-APP)', () => {
+describe('Header — chat-only after the admin console split (DESIGN-SEPARATE-ADMIN-APP)', () => {
   beforeEach(() => vi.clearAllMocks());
 
   // The admin console is a separate app on its own origin; the chat Header no
