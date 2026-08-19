@@ -25,7 +25,7 @@ import {
   ListChannelMembershipsCommand,
   ListTagsForResourceCommand,
   SendChannelMessageCommand,
-  GetChannelMessageCommand,
+  ListChannelMessagesCommand,
   ChannelMessageType,
   ChannelMessagePersistenceType,
 } from '@aws-sdk/client-chime-sdk-messaging';
@@ -1337,16 +1337,30 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     //     "@all summarize this" with a PDF answered on the caption alone, with no error anywhere.
     // The stored message still holds the Metadata, so it is recovered here, on the one entry that
     // answers this turn. Best-effort: an unreadable message degrades to the text turn it already was.
-    event.inputTranscript = encodeURIComponent(stripAtAll(decodedTranscript));
-    const inboundId = event.requestAttributes?.['CHIME.message.id'];
-    if (inboundId && channelArn) {
+    // READ BACK BY CONTENT, not by id: Chime sends Lex no `CHIME.message.id` (measured live - the
+    // drift flow's resolveOriginatingMessageId documents the exact attribute set), so the stored
+    // message is found the same way drift finds its anchor: newest-first listing, matched on the
+    // exact transcript being handled, BEFORE the token strip below mutates it. The listing carries
+    // the Metadata, which is where the attachment rides.
+    const allSenderArn = event.requestAttributes?.['CHIME.sender.arn'] || '';
+    if (channelArn && allSenderArn) {
       try {
-        const stored = await chimeClient.send(new GetChannelMessageCommand({
+        const listed = await chimeClient.send(new ListChannelMessagesCommand({
           ChannelArn: channelArn,
-          MessageId: inboundId,
           ChimeBearer: await getBotArn(),
+          SortOrder: 'DESCENDING',
+          MaxResults: 20,
         }));
-        const recovered = extractAttachment(stored.ChannelMessage?.Metadata);
+        const wantedRaw = rawTranscript.trim();
+        const wantedDec = decodedTranscript.trim();
+        const inbound = (listed.ChannelMessages || []).find((m) => {
+          if (m.Sender?.Arn !== allSenderArn) return false;
+          const raw = (m.Content || '').trim();
+          let dec = raw;
+          try { dec = decodeURIComponent(raw).trim(); } catch { /* raw form is still compared */ }
+          return raw === wantedRaw || dec === wantedDec || dec === wantedRaw || raw === wantedDec;
+        });
+        const recovered = extractAttachment(inbound?.Metadata);
         if (recovered && event.requestAttributes) {
           event.requestAttributes[BYPASS_ATTACHMENT_ATTR] = JSON.stringify(recovered);
         }
@@ -1354,6 +1368,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         console.warn('[Router] could not read the stored 1:1 @all message for its attachment; continuing as a text turn', err);
       }
     }
+    event.inputTranscript = encodeURIComponent(stripAtAll(decodedTranscript));
   }
 
   try {

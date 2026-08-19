@@ -144,9 +144,18 @@ describe('the 1:1 @all fall-through is normalized to the bypass shape', () => {
   });
 
   it('recovers the attachment from the STORED message, into the same attribute a bypass carries', () => {
-    // The read is the only route: Lex is never given Metadata (MESSAGE-FLOW §3.2).
-    expect(routerSrc).toMatch(/GetChannelMessageCommand\(\{\s*\n\s*ChannelArn: channelArn,\s*\n\s*MessageId: inboundId,/);
-    expect(routerSrc).toMatch(/extractAttachment\(stored\.ChannelMessage\?\.Metadata\)/);
+    // The read is the only route: Lex is never given Metadata (MESSAGE-FLOW §3.2) - and it is never
+    // given `CHIME.message.id` either (measured live; the drift flow documents the exact attribute
+    // set), so a GetChannelMessage keyed on the id ran on NO live turn and the recovery silently
+    // never fired. The stored message is found the way drift finds its anchor: newest-first listing,
+    // matched on the exact transcript, and the listing itself carries the Metadata.
+    expect(routerSrc).toMatch(/ListChannelMessagesCommand\(\{\s*\n\s*ChannelArn: channelArn,/);
+    expect(routerSrc).toMatch(/extractAttachment\(inbound\?\.Metadata\)/);
     expect(routerSrc).toMatch(/event\.requestAttributes\[BYPASS_ATTACHMENT_ATTR\] = JSON\.stringify\(recovered\)/);
+    // Matched BEFORE the token strip mutates the transcript, or the content match can never hit.
+    const src = routerSrc;
+    expect(src.indexOf('ListChannelMessagesCommand({')).toBeLessThan(
+      src.indexOf('event.inputTranscript = encodeURIComponent(stripAtAll(decodedTranscript));'),
+    );
   });
 });
