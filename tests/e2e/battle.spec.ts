@@ -1185,6 +1185,12 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     });
     const pageStd = await ctx.newPage();
     try {
+      // Warm the SPA before the sign-in helper's fixed 10s login-form wait: this is the suite's only
+      // fresh-context load, so it pays the full CloudFront + bundle cold cost that every other test
+      // amortizes through the pre-authed storage state - and after an invalidation that cold load
+      // alone can exceed the helper's window.
+      await pageStd.goto('/', { timeout: 60_000 });
+      await pageStd.waitForLoadState('networkidle', { timeout: 60_000 }).catch(() => {});
       await signIn(pageStd, std.email, std.password);
       const createResp = pageStd.waitForResponse(
         (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',

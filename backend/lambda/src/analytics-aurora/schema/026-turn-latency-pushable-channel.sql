@@ -7,6 +7,12 @@
 -- channel), so grouping BY it is a no-op on the result and makes the qual pushable.
 --
 -- Idempotent: CREATE OR REPLACE VIEW with an identical column list; re-running converges.
+--
+-- The ::text below is LOAD-BEARING, not decoration. min(varchar) returns TEXT, so the deployed 019
+-- view's channel_arn column is text - and CREATE OR REPLACE VIEW refuses to change a column's type.
+-- The bare varchar column must be relabeled back to text or this migration fails on every existing
+-- cluster (measured live: 'cannot change data type of view column "channel_arn"', retried on every
+-- cold start). A relabel cast is binary-compatible, so the predicate still pushes to the index.
 
 CREATE OR REPLACE VIEW v_turn_latency AS
 WITH
@@ -24,7 +30,7 @@ anchor AS (
 resp AS (
     SELECT turn_id,
            response_id,
-           channel_arn,
+           channel_arn::text AS channel_arn,
            MIN(occurred_at) FILTER (WHERE kind = 'placeholder_posted')     AS t2_placeholder_at,
            -- FIRST final wins, mirroring the COALESCE freeze: a later edit cannot move the answer time.
            MIN(occurred_at) FILTER (WHERE kind = 'final_response')         AS t3_final_at,

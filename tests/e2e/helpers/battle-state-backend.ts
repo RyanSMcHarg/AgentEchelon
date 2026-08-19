@@ -20,7 +20,11 @@ function aws(args: string[]): any {
     encoding: 'utf8',
     maxBuffer: 20 * 1024 * 1024,
     timeout: 60_000,
-    env: { ...process.env, MSYS_NO_PATHCONV: '1' },
+    // PYTHONIOENCODING/PYTHONUTF8: the AWS CLI is Python, and on Windows its stdout encoder is the
+    // console codepage - a battle row whose content carries a non-ANSI character (a real answer
+    // used U+2192 '→') crashes the CLI itself with "'charmap' codec can't encode character",
+    // failing the poll that read it. Force UTF-8 so row CONTENT can never break row READS.
+    env: { ...process.env, MSYS_NO_PATHCONV: '1', PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
   }).trim();
   return out ? JSON.parse(out) : null;
 }
