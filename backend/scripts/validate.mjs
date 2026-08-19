@@ -41,7 +41,7 @@
  *   node backend/scripts/validate.mjs --strict            # optional-phase failure fails the run
  *   (valid --only ids: knowledge knowledge-rag seed user battle image-gen feedback experiments tasks
  *    task-answer profiles knowledge-qa welcome evaluate admin auth governance context-sources
- *    tasks-deep onboarding bilingual notifications cost latency task-resolution open-work attribution
+ *    tasks-deep task-branches onboarding bilingual notifications cost latency task-resolution open-work attribution
  *    admin-surfaces)
  *
  * Exit code: non-zero if a REQUIRED phase fails, or if any phase fails under --strict.
@@ -52,8 +52,12 @@ import { spawnSync } from 'node:child_process';
 import path from 'node:path';
 import fs from 'node:fs';
 import dns from 'node:dns/promises';
+import { createRequire } from 'node:module';
 import { fileURLToPath } from 'node:url';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
+
+const require = createRequire(import.meta.url);
+const { resolveInstanceName, resolveStackPrefix, classifyStackLookup } = require('./lib/stack-lookup.cjs');
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BACKEND = path.resolve(__dirname, '..');
@@ -74,22 +78,21 @@ const failedOptional = [];
 // The deployment's instance name — the SSM root without its leading slash. Specs that resolve shared
 // resources from the SSM contract (`/<instance>/shared/...`) need it, and a missing value reads as a
 // broken feature rather than as unset configuration.
-const INSTANCE_NAME = (process.env.E2E_INSTANCE_NAME || process.env.INSTANCE_NAME
-  || (process.env.SSM_ROOT || '/agent-echelon').replace(/^\//, ''));
+const INSTANCE_NAME = resolveInstanceName(process.env);
 
 /**
- * This instance's CloudFormation stack prefix, derived the same way `bin/backend.ts` derives it:
- * PascalCase of the instance name (`agent-echelon` -> `AgentEchelon`).
+ * This instance's CloudFormation stack prefix. Resolved by the same rules the rest of the tooling
+ * uses (`AE_STACK_PREFIX` / `STACK_PREFIX` / `FRONTEND_STACK_NAME`, else PascalCase of the instance
+ * name) - see scripts/lib/stack-lookup.cjs.
  *
- * Used to ANCHOR resource lookups to this deployment. In a shared account, "the function whose name
- * contains AnalyticsAuro" matches other projects' functions too, and the thing being resolved here is
- * invoked - so an unanchored match is a validation run pointed at somebody else's data.
+ * EVERY stack this script names is built from it, for two reasons. It ANCHORS resource lookups to
+ * this deployment: in a shared account, "the function whose name contains AnalyticsAuro" matches
+ * other projects' functions too, and the thing being resolved here is INVOKED, so an unanchored
+ * match is a validation run pointed at somebody else's data. And it keeps the script usable on a
+ * deployment that is not the default instance: a hardcoded `AgentEchelon...` resolves nothing there,
+ * which now fails the run outright at the frontend lookup below.
  */
-const STACK_PREFIX_FROM_INSTANCE = INSTANCE_NAME
-  .split(/[-_]/)
-  .filter(Boolean)
-  .map((p) => p.charAt(0).toUpperCase() + p.slice(1))
-  .join('');
+const STACK_PREFIX = resolveStackPrefix(process.env);
 
 const PW = (specs, extraEnv = {}) =>
   `npx playwright test ${specs} --config=playwright.config.ts`;
@@ -196,6 +199,15 @@ const PHASES = [
     cmd: PW('e2e/task-state-machine.spec.ts e2e/cross-channel-tasks.spec.ts'),
     env: { TASKS_E2E: '1', E2E_INSTANCE_NAME: INSTANCE_NAME }, optional: true },
 
+  // The BRANCHES, which are where the machines have actually failed people. `tasks-deep` proves a
+  // task's persisted state is valid; this drives a report past its outline into a revision and a
+  // close, and drives the scheduling machine through a confirmation, a correction and a decline.
+  // Its own phase because these are long multi-turn journeys (several model turns each) and because
+  // a branch failure is a different diagnosis from "the row is malformed".
+  { id: 'task-branches', label: 'Task e2e (branches): a report is revised and closed, a placement is confirmed', cwd: TESTS,
+    cmd: PW('e2e/report-flow-branches.spec.ts e2e/place-item-flow.spec.ts'),
+    env: { TASKS_E2E: '1', E2E_INSTANCE_NAME: INSTANCE_NAME }, optional: true },
+
   { id: 'onboarding', label: 'Onboarding e2e: the intake runs once per user, not once per conversation', cwd: TESTS,
     cmd: PW('e2e/onboarding-intake.spec.ts'), env: { ONBOARDING_E2E: '1' }, optional: true },
 
@@ -293,15 +305,19 @@ async function triggerEvaluation() {
   console.log(`[validate] evaluation runner result: ${body.slice(0, 300)}`);
 }
 
+// Say which deployment this run is about to resolve everything from, before anything is looked up.
+console.log(`[validate] instance "${INSTANCE_NAME}" — CloudFormation stack prefix "${STACK_PREFIX}" (override: AE_STACK_PREFIX).`);
+
 // Resolve the credential-exchange endpoint from CDK outputs and export it, so
 // the credential-exchange e2e in the "user" phase actually runs. Without a URL
 // that spec self-skips, and the identity contract (401 on anon, scoped-cred
 // vend, IDOR ignore) is silently never validated. Pull it once here.
 if (!process.env.VITE_CREDENTIAL_EXCHANGE_API_URL && !process.env.EXCHANGE_API_URL) {
   const region = process.env.AWS_REGION || 'us-east-1';
+  const stack = `${STACK_PREFIX}CognitoAuth`;
   const q = "Stacks[0].Outputs[?OutputKey=='CredentialExchangeApiUrl'].OutputValue";
   const res = spawnSync(
-    `aws cloudformation describe-stacks --stack-name AgentEchelonCognitoAuth --region ${region} --query "${q}" --output text`,
+    `aws cloudformation describe-stacks --stack-name ${stack} --region ${region} --query "${q}" --output text`,
     { shell: true, encoding: 'utf8' },
   );
   const url = (res.stdout || '').trim();
@@ -309,7 +325,11 @@ if (!process.env.VITE_CREDENTIAL_EXCHANGE_API_URL && !process.env.EXCHANGE_API_U
     process.env.VITE_CREDENTIAL_EXCHANGE_API_URL = url;
     console.log(`[validate] credential-exchange URL resolved from CDK outputs: ${url}`);
   } else {
-    console.warn('[validate] WARNING: could not resolve CredentialExchangeApiUrl — credential-exchange tests will SKIP. Deploy AgentEchelonCognitoAuth or set VITE_CREDENTIAL_EXCHANGE_API_URL.');
+    const { presence, why } = classifyStackLookup(res);
+    console.warn(`[validate] WARNING: could not resolve CredentialExchangeApiUrl from ${stack} — credential-exchange tests will SKIP.`);
+    console.warn(presence === 'unknown'
+      ? `[validate] The lookup itself failed, so the stack's state is UNKNOWN: ${why}`
+      : `[validate] Deploy ${stack} or set VITE_CREDENTIAL_EXCHANGE_API_URL.`);
   }
 }
 
@@ -320,9 +340,14 @@ if (!process.env.VITE_CREDENTIAL_EXCHANGE_API_URL && !process.env.EXCHANGE_API_U
 // and battle-setup falls back to the chat URL when E2E_ADMIN_BASE_URL is unset (that origin has no
 // admin UI, so the arm step times out on .admin-section-rail). Resolve both here so a plain
 // `validate.mjs` run is self-contained. Absent stack / unset → the phase uses the localhost default.
+//
+// The stack names are built from STACK_PREFIX, not hardcoded: this lookup is FATAL for the chat
+// origin, so a hardcoded `AgentEchelon...` would kill the run outright on any deployment whose
+// instance name is not the default - a script refusing to run against the very deployment it was
+// pointed at. STACK_PREFIX is overridable (AE_STACK_PREFIX / STACK_PREFIX), which the failure says.
 for (const [envVar, stack, key] of [
-  ['E2E_BASE_URL', 'AgentEchelonFrontend', 'DistributionUrl'],
-  ['E2E_ADMIN_BASE_URL', 'AgentEchelonAdminFrontend', 'AdminDistributionUrl'],
+  ['E2E_BASE_URL', `${STACK_PREFIX}Frontend`, 'DistributionUrl'],
+  ['E2E_ADMIN_BASE_URL', `${STACK_PREFIX}AdminFrontend`, 'AdminDistributionUrl'],
 ]) {
   if (process.env[envVar]) continue;
   const region = process.env.AWS_REGION || 'us-east-1';
@@ -332,6 +357,14 @@ for (const [envVar, stack, key] of [
     { shell: true, encoding: 'utf8' },
   );
   const url = (res.stdout || '').trim();
+  // Name the reason rather than listing the possibilities: an unaskable lookup (expired SSO, no
+  // credentials, a denied call) is a different fix from a stack that is genuinely not deployed.
+  const { presence, why } = classifyStackLookup(res);
+  const cause = presence === 'unknown'
+    ? `the lookup FAILED, so the stack's state is UNKNOWN: ${why}`
+    : presence === 'absent'
+      ? `${stack} is not deployed in ${region}`
+      : `${stack} exists but publishes no ${key} output`;
   if (url && url !== 'None') {
     process.env[envVar] = url;
     console.log(`[validate] ${envVar} resolved from ${stack}: ${url}`);
@@ -342,14 +375,18 @@ for (const [envVar, stack, key] of [
     // confirm a deploy, and it reports as a sweep that "ran" without having touched the deployment.
     // A validate run that cannot name the live origin has nothing to say about it.
     console.error(
-      `\n[validate] FATAL: could not resolve ${envVar} from ${stack}.\n`
+      `\n[validate] FATAL: could not resolve ${envVar} from ${stack} — ${cause}.\n`
       + '  Browser e2e would silently fall back to localhost and report on a deployment it never reached.\n'
-      + `  Check credentials first (an expired SSO token looks exactly like a missing stack), then deploy ${stack}.\n`
-      + `  Deliberately testing a local dev server:  E2E_ALLOW_LOCALHOST=1 node scripts/validate.mjs\n`,
+      + (presence === 'unknown'
+        ? '  Repair the AWS session first (aws sso login --profile <your-profile>); nothing here says the stack is missing.\n'
+        : `  Deploy ${stack}, or set ${envVar} directly.\n`)
+      + `  Stacks named differently? This deployment's prefix resolved to "${STACK_PREFIX}"; override with\n`
+      + '  AE_STACK_PREFIX=<prefix> (or STACK_PREFIX / AE_INSTANCE_NAME, as the rest of the tooling takes it).\n'
+      + '  Deliberately testing a local dev server:  E2E_ALLOW_LOCALHOST=1 node scripts/validate.mjs\n',
     );
     process.exit(1);
   } else {
-    console.warn(`[validate] WARNING: could not resolve ${envVar} from ${stack} — browser e2e falls back to localhost (the LIVE app is not tested). Deploy ${stack} or set ${envVar}.`);
+    console.warn(`[validate] WARNING: could not resolve ${envVar} from ${stack} — ${cause}. Browser e2e falls back to localhost (the LIVE app is not tested). Deploy ${stack} or set ${envVar}.`);
   }
 }
 
@@ -438,12 +475,12 @@ for (const key of [
 // e2e-produced exchanges on demand. Absent in Athena mode / older deploys → that phase self-skips.
 // Set by the stack lookup below. Null means the lookup did not run because EVAL_LAMBDA_NAME was
 // already supplied - which itself implies an Aurora deployment.
-let auroraStackPresent = null;
+let auroraStackPresence = null;
 if (!process.env.EVAL_LAMBDA_NAME) {
   const region = process.env.AWS_REGION || 'us-east-1';
   // This instance's analytics stack. Named once so the output read and the name-anchored fallback
   // below cannot drift apart - and so neither can match another project in this shared account.
-  const ANALYTICS_STACK = `${STACK_PREFIX_FROM_INSTANCE}AnalyticsAurora`;
+  const ANALYTICS_STACK = `${STACK_PREFIX}AnalyticsAurora`;
   const q = "Stacks[0].Outputs[?OutputKey=='EvaluationLambdaName'].OutputValue";
   const res = spawnSync(
     `aws cloudformation describe-stacks --stack-name ${ANALYTICS_STACK} --region ${region} --query "${q}" --output text`,
@@ -452,7 +489,18 @@ if (!process.env.EVAL_LAMBDA_NAME) {
   // Whether the Aurora ANALYTICS STACK EXISTS is a different question from whether one of its outputs
   // resolved, and the vector store follows the former. describe-stacks exits non-zero when the stack is
   // absent, so this is the same call already being made, read for what it actually proves.
-  auroraStackPresent = res.status === 0;
+  //
+  // A NON-ZERO EXIT IS NOT PROOF OF ABSENCE. The same exit code covers an expired SSO session, absent
+  // credentials, a denied call, a throttle and no network - and reading it as "no Aurora stack" told
+  // an operator their analytics stack was not deployed when the script had simply failed to ask. The
+  // three outcomes are kept apart (present / absent / unknown) and reported differently below.
+  const lookup = classifyStackLookup(res);
+  auroraStackPresence = lookup.presence;
+  if (lookup.presence === 'unknown') {
+    console.warn(`[validate] WARNING: could not determine whether ${ANALYTICS_STACK} exists — the lookup itself failed: ${lookup.why}`);
+    console.warn('[validate] This says NOTHING about the deployment. Treating Aurora as PRESENT so nothing is silently dropped;');
+    console.warn('[validate] repair the AWS session (aws sso login --profile <your-profile>) and re-run for a clean read.');
+  }
   let name = (res.stdout || '').trim();
   if (name === 'None') name = '';
   // Fallback: the EvaluationLambdaName output ships in a newer analytics-stack version; until that
@@ -480,7 +528,9 @@ if (!process.env.EVAL_LAMBDA_NAME) {
     process.env.EVAL_LAMBDA_NAME = name;
     console.log(`[validate] evaluation Lambda resolved: ${name}`);
   } else {
-    console.warn('[validate] NOTE: could not resolve the evaluation Lambda — the post-e2e evaluate step will skip (Athena mode / analytics stack not deployed).');
+    console.warn(auroraStackPresence === 'unknown'
+      ? '[validate] NOTE: could not resolve the evaluation Lambda — the post-e2e evaluate step will skip. The stack lookup above failed, so this is NOT evidence of Athena mode.'
+      : '[validate] NOTE: could not resolve the evaluation Lambda — the post-e2e evaluate step will skip (Athena mode / analytics stack not deployed).');
   }
 }
 
@@ -501,9 +551,11 @@ if (!process.env.EVAL_LAMBDA_NAME) {
 // `analyticsMode` is the thing that actually decides whether a vector store exists, and it is known
 // without calling anything.
 // The vector store exists iff the Aurora ANALYTICS STACK does, which `describe-stacks` above already
-// answered. `auroraStackPresent === null` means the lookup was skipped because EVAL_LAMBDA_NAME was
-// supplied, which itself implies Aurora.
-const auroraDeployment = auroraStackPresent !== false;
+// answered. `auroraStackPresence === null` means the lookup was skipped because EVAL_LAMBDA_NAME was
+// supplied, which itself implies Aurora; `'unknown'` means the lookup could not be made, and an
+// unanswered question is not an answer of "no" - dropping the phase on it is exactly the silent
+// substitution this gate exists to prevent, so only a POSITIVE 'absent' removes it.
+const auroraDeployment = auroraStackPresence !== 'absent';
 if (!auroraDeployment) {
   const i = PHASES.findIndex((p) => p.id === 'knowledge-rag');
   if (i !== -1) {
@@ -515,7 +567,9 @@ if (!auroraDeployment) {
   // a deploy in flight. That is a fault rather than a configuration, so the phase STAYS and fails
   // visibly. The old gate read this case as "no Aurora stack" and silently dropped the ingestion it
   // exists to guarantee - a skip that looks identical to a pass in the summary.
-  console.warn('[validate] WARNING: the Aurora analytics stack resolved but EVAL_LAMBDA_NAME did not. Keeping the RAG ingestion phase so the failure is visible rather than skipped.');
+  console.warn(auroraStackPresence === 'unknown'
+    ? '[validate] WARNING: neither the Aurora analytics stack nor EVAL_LAMBDA_NAME could be read. Keeping the RAG ingestion phase so the failure is visible rather than skipped.'
+    : '[validate] WARNING: the Aurora analytics stack resolved but EVAL_LAMBDA_NAME did not. Keeping the RAG ingestion phase so the failure is visible rather than skipped.');
 }
 
 let phases = PHASES;

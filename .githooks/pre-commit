@@ -15,8 +15,28 @@ BLOCKED_FILES=(
   ".env.local"
 )
 
+# Names that LOOK sensitive and are deliberately tracked. Checked by BASENAME, so it holds at any
+# depth: the per-package templates live under frontend/packages/{chat,admin}/.
+ALLOWED_BASENAMES=(
+  ".env.example"
+)
+
+is_allowed() {
+  local base
+  base=$(basename "$1")
+  for allowed in "${ALLOWED_BASENAMES[@]}"; do
+    [ "$base" = "$allowed" ] && return 0
+  done
+  return 1
+}
+
 # Patterns that must never be committed (matched against staged paths)
 BLOCKED_PATTERNS=(
+  # ANY .env spelling at ANY depth, minus the allow-list above. The exact-path list cannot carry this
+  # one: it named `.env` and `frontend/.env` while the real values live in
+  # frontend/packages/{chat,admin}/.env, and it missed `.env.production` entirely - which is the name
+  # Vite itself uses for a production build.
+  '(^|/)\.env($|\.)'
   '\.env\..*\.local$'
   '\.pem$'
   '\.key$'
@@ -30,7 +50,12 @@ BLOCKED_PATTERNS=(
   'id_ed25519$'
 )
 
-STAGED=$(git diff --cached --name-only --diff-filter=ACR)
+# ACMR, not ACR: M (modified) is the filter both checks below care about most. A secret file is
+# usually EDITED after the first slip, and a mixed-ending file is almost always one being EDITED:
+# a generator or an editor appending LF lines to a CRLF file. Excluding M made both checks look at
+# the one category where the defect is least likely to appear. D is excluded: a file deleted in this
+# commit has nothing to inspect.
+STAGED=$(git diff --cached --name-only --diff-filter=ACMR)
 
 if [ -z "$STAGED" ]; then
   exit 0
@@ -48,7 +73,9 @@ done
 # Check pattern matches
 for pattern in "${BLOCKED_PATTERNS[@]}"; do
   while IFS= read -r match; do
-    [ -n "$match" ] && VIOLATIONS+=("  $match")
+    if [ -n "$match" ] && ! is_allowed "$match"; then
+      VIOLATIONS+=("  $match")
+    fi
   done < <(echo "$STAGED" | grep -E "$pattern" || true)
 done
 
@@ -75,32 +102,97 @@ fi
 # This reads the WORKING TREE, not the index, and that is deliberate: `text=auto`
 # has already normalized the staged blob, so an index-side check would inspect
 # content in which the defect cannot exist and pass every time.
+#
+# The candidate list comes from ONE `--numstat` call, which answers both questions at once: which
+# paths are staged (added, copied, modified — deletes are filtered out, and `--no-renames` reports a
+# rename as an add of the new path, so no entry is ever the `old => new` form that would break
+# parsing), and which of them git treats as BINARY (both counts reported as "-"). `-z` makes the
+# paths NUL-separated, so a path with a space or a quote in it needs no unquoting. The previous form
+# spawned a `git` per staged file for the binary question alone.
+#
+# Counting is BYTE-EXACT, and that matters: Git Bash / MSYS `grep` reads in text mode and strips the
+# trailing CR before matching, so `grep -c $'\r$'` returns 0 for a CRLF file and a grep-based check
+# would pass everything while appearing to work. gawk on Windows does the same. Two implementations
+# of the same arithmetic, chosen by bash version:
+#
+#   bash 4.4+  `mapfile -d` reads the file with a builtin — NO subprocess per file. Process startup
+#              dominates this hook on Windows, and now that modified files are included there are
+#              many more files to start processes for.
+#   older      `tr` + `wc`, as before. macOS still ships bash 3.2 as /bin/bash, and a hook that only
+#              works on a recent bash is a hook half the contributors do not have.
+#
+# Both count the same two things: every CR byte, and every LF byte. Same inputs, same verdict.
 # ---------------------------------------------------------------------------
+
+# Set by count_line_endings below.
+crlf=0
+total=0
+
+FAST_COUNT=0
+if [ "${BASH_VERSINFO[0]:-0}" -gt 4 ]; then
+  FAST_COUNT=1
+elif [ "${BASH_VERSINFO[0]:-0}" -eq 4 ] && [ "${BASH_VERSINFO[1]:-0}" -ge 4 ]; then
+  FAST_COUNT=1
+fi
+
+count_line_endings() {
+  local file=$1
+  crlf=0
+  total=0
+
+  if [ "$FAST_COUNT" -eq 0 ]; then
+    crlf=$(tr -cd '\r' < "$file" | wc -c | tr -d '[:space:]')
+    total=$(tr -cd '\n' < "$file" | wc -c | tr -d '[:space:]')
+    crlf=${crlf:-0}
+    total=${total:-0}
+    return 0
+  fi
+
+  # Split on LF, KEEPING the delimiter, so a final line with no trailing newline is distinguishable
+  # from a terminated one and is not miscounted as a line ending.
+  local -a lines=()
+  local line rest next
+  mapfile -d $'\n' lines < "$file" || true
+  for line in ${lines[@]+"${lines[@]}"}; do
+    case "$line" in
+      *$'\n') total=$((total + 1)) ;;
+    esac
+    case "$line" in
+      *$'\r'*)
+        # Count every CR in the line, not just a line-ending one, so this agrees with `tr` above.
+        rest=$line
+        while :; do
+          next=${rest#*$'\r'}
+          if [ "$next" = "$rest" ]; then break; fi
+          crlf=$((crlf + 1))
+          rest=$next
+        done
+        ;;
+    esac
+  done
+}
 
 MIXED=()
 
-while IFS= read -r file; do
-  [ -n "$file" ] || continue
-  [ -f "$file" ] || continue
-
-  # Skip anything git treats as binary; `--numstat` reports "-" for both counts there.
-  if git diff --cached --numstat -- "$file" | head -1 | grep -q '^-[[:space:]]*-'; then
+while IFS= read -r -d '' record; do
+  # `<added>\t<deleted>\t<path>`. A binary file reports "-" for both counts.
+  if [ "${record%%$'\t'*}" = "-" ]; then
     continue
   fi
+  file=${record#*$'\t'}
+  file=${file#*$'\t'}
+  [ -n "$file" ] || continue
+  # Staged but gone from the working tree (added then removed, or deleted after staging): there is
+  # nothing to read, and reading it is what would fail the hook rather than the commit's content.
+  [ -f "$file" ] || continue
 
-  # Count BYTES with `tr`, not lines with `grep`. Git Bash / MSYS grep reads in text mode and strips
-  # the trailing CR before matching, so `grep -c $'\r$'` returns 0 for a CRLF file and this check
-  # would pass everything while appearing to work. `tr` is byte-exact on every platform.
-  crlf=$(tr -cd '\r' < "$file" | wc -c | tr -d '[:space:]')
-  total=$(tr -cd '\n' < "$file" | wc -c | tr -d '[:space:]')
-  crlf=${crlf:-0}
-  total=${total:-0}
+  count_line_endings "$file"
 
   # Neither all-CRLF (crlf == total) nor all-LF (crlf == 0) is mixed. Only the middle is.
   if [ "$crlf" -gt 0 ] && [ "$crlf" -lt "$total" ]; then
     MIXED+=("  $file  ($crlf of $total lines end CRLF)")
   fi
-done <<< "$STAGED"
+done < <(git diff --cached --numstat --no-renames -z --diff-filter=ACM)
 
 if [ ${#MIXED[@]} -gt 0 ]; then
   echo ""

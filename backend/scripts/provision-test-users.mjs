@@ -16,6 +16,11 @@
  * rewrites the secret. Safe to run after every redeploy (pool/client IDs are
  * re-read from the live CloudFormation outputs each time).
  *
+ * Order matters, and it is: create/refresh the users, WRITE THE SECRET, then rotate passwords. The
+ * generated password lives only in this process, so a run that rotated first and was interrupted
+ * left users holding a credential nobody knew and nothing recorded. Writing first makes every
+ * failure resumable by simply re-running.
+ *
  * Why a script and not the post-confirmation trigger: AdminCreateUser bypasses
  * the self-signup flow, so the Cognito post-confirmation trigger that normally
  * mirrors `custom:tier` into the tier group never fires. We therefore add each
@@ -29,6 +34,7 @@
  *   ADMIN_EMAIL        admin user's email   (default: testuser-admin@<domain>)
  */
 import { randomBytes } from 'node:crypto';
+import { createRequire } from 'node:module';
 import {
   CognitoIdentityProviderClient,
   AdminCreateUserCommand,
@@ -52,6 +58,9 @@ import {
   CreateSecretCommand,
   GetSecretValueCommand,
 } from '@aws-sdk/client-secrets-manager';
+
+const require = createRequire(import.meta.url);
+const { buildSecretPatch, mergeSecretValue } = require('./lib/test-user-secret.cjs');
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const SECRET_NAME = process.env.TEST_SECRET_NAME || 'agent-interface/test-credentials';
@@ -183,7 +192,13 @@ async function ensureChimeUser(appInstanceArn, userPoolId, email) {
   }
 }
 
-async function ensureUser(userPoolId, appInstanceArn, u) {
+/**
+ * Create the user (or refresh its attributes) WITHOUT touching its password.
+ *
+ * Split from the credential step below so the whole run can reach the secret write before anything
+ * rotates a password. See the ordering note in main().
+ */
+async function ensureUserExists(userPoolId, u) {
   const attrs = [
     { Name: 'email', Value: u.email },
     { Name: 'email_verified', Value: 'true' },
@@ -220,7 +235,15 @@ async function ensureUser(userPoolId, appInstanceArn, u) {
       throw err;
     }
   }
+}
 
+/**
+ * Set the password, the group membership and the Chime identity.
+ *
+ * Runs only AFTER the secret holds this password: the rotation is the irreversible half, and a
+ * password nobody recorded is a user nobody can sign in as.
+ */
+async function applyCredentialAndAccess(userPoolId, appInstanceArn, u) {
   // Permanent password also moves the user to CONFIRMED (skips the
   // FORCE_CHANGE_PASSWORD challenge AdminCreateUser would otherwise impose).
   await cognito.send(
@@ -253,8 +276,11 @@ async function ensureUser(userPoolId, appInstanceArn, u) {
  * MERGES into the existing secret rather than replacing it. A wholesale replace drops any key this
  * table does not know about - `onboardingUser` is one the e2e reads and this script has never written -
  * so adding a user could silently un-provision another suite.
+ *
+ * `fillIfAbsent` supplies a key only when the secret has none, which is how `--only` mode leaves a
+ * deliberately-chosen app client alone. See lib/test-user-secret.cjs for which key is which and why.
  */
-async function writeSecret(creds) {
+async function writeSecret(patch, fillIfAbsent = {}) {
   let existing = {};
   try {
     const cur = await secrets.send(new GetSecretValueCommand({ SecretId: SECRET_NAME }));
@@ -262,7 +288,7 @@ async function writeSecret(creds) {
   } catch (err) {
     if (err.name !== 'ResourceNotFoundException') throw err;
   }
-  const SecretString = JSON.stringify({ ...existing, ...creds });
+  const SecretString = JSON.stringify(mergeSecretValue(existing, patch, fillIfAbsent));
   try {
     await secrets.send(new PutSecretValueCommand({ SecretId: SECRET_NAME, SecretString }));
     console.log(`  ~ updated secret ${SECRET_NAME}`);
@@ -285,19 +311,34 @@ async function main() {
 
   if (ONLY_KEYS) console.log(`  --only: ${SELECTED.map((u) => u.key).join(', ')} (other users and secret keys untouched)`);
 
+  // PASS 1: existence and attributes only. Nothing here changes a password, so a failure - the
+  // common one, a permissions gap on AdminCreateUser - leaves every existing login working and the
+  // secret untouched.
   for (const u of SELECTED) {
-    await ensureUser(userPoolId, appInstanceArn, u);
+    await ensureUserExists(userPoolId, u);
   }
 
-  // In `--only` mode the pool/client ids are NOT rewritten. The pool publishes more than one app
-  // client (web + admin), this reads whichever the CFN output names, and the secret's existing value
-  // may deliberately be the other one - tokens minted for the wrong audience fail at the API, which is
-  // a confusing way for an unrelated suite to break because someone added a login.
-  const creds = ONLY_KEYS ? {} : { cognitoUserPoolId: userPoolId, cognitoClientId: clientId };
+  // PERSIST THE CREDENTIAL BEFORE IT BECOMES ANYONE'S PASSWORD.
+  //
+  // The password is a fresh random value per run unless TEST_USER_PASSWORD pins it, and it exists
+  // nowhere but this process's memory. Rotating first meant an interrupted run - an expired session
+  // midway, a throttle, a Ctrl-C - left the users it had already reached holding a password nobody
+  // knew and nothing recorded, with the secret still advertising the previous one. Writing first
+  // inverts that: the secret is always at least as current as the pool, so an interrupted run is
+  // resumable by re-running (the whole script is idempotent), and no state is ever unrecoverable.
+  const { patch, fillIfAbsent } = buildSecretPatch({
+    userPoolId,
+    clientId,
+    users: SELECTED,
+    password: PASSWORD,
+    onlyMode: !!ONLY_KEYS,
+  });
+  await writeSecret(patch, fillIfAbsent);
+
+  // PASS 2: the irreversible half - password, groups, Chime identity.
   for (const u of SELECTED) {
-    creds[u.key] = { email: u.email, password: PASSWORD, tier: u.tier };
+    await applyCredentialAndAccess(userPoolId, appInstanceArn, u);
   }
-  await writeSecret(creds);
 
   console.log('');
   console.log('Done. Test users ready (all share one password):');
@@ -308,5 +349,10 @@ async function main() {
 
 main().catch((err) => {
   console.error('provision-test-users failed:', err);
+  console.error(
+    '\nNo user is left holding an unrecorded password: this run writes the credential to\n'
+      + `${SECRET_NAME} BEFORE rotating anyone to it. Re-run the same command once the cause is\n`
+      + 'fixed - the script is idempotent and re-applies the password to every selected user.',
+  );
   process.exit(1);
 });

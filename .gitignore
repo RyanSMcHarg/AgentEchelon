@@ -23,9 +23,17 @@ cdk.out/
 !*.ts
 
 # Environment
-.env
-.env.local
-.env.*.local
+#
+# BROAD ON PURPOSE, and the narrow version is what let a gap stand. Listing `.env`, `.env.local` and
+# `.env.*.local` covered exactly three spellings, so `.env.production` and `.env.development` - Vite's
+# OWN convention, and therefore the likeliest names for a file holding real deployment values - were
+# neither ignored here nor blocked by the pre-commit hook. The remote is public, so the cost of the
+# miss is unrecoverable and the cost of being broad is one negation.
+#
+# The example templates are the one thing that must stay tracked: they carry placeholders only, and
+# every deployment starts by copying one.
+.env*
+!.env.example
 
 # CDK — never commit the lookup cache (account-specific: account IDs, VPC/subnet IDs
 # from fromLookup) or synth output.
