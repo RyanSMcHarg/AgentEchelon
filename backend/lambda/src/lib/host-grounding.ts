@@ -1,12 +1,14 @@
 /**
  * Assemble a conversation's per-turn HOST GROUNDING from its two sources, keeping the P1 privacy split:
- *  - member-readable channel Metadata → routing bits (contextId, userLanguage, segment) + the
- *    participant roster;
+ *  - member-readable channel Metadata → the plan anchor (`contextId`) and nothing else;
  *  - the SERVER-ONLY Channel Context store → the private grounding (domainContext, otherContexts,
- *    participantProfile, userName).
+ *    participantProfile, userName) AND the model-routing signals (userLanguage, segment);
+ *  - live channel membership → who is in the conversation.
  *
- * This is the READ half of the P1 boundary: the private fields are never read from member-readable
- * Metadata. Fail-soft — a missing store row just yields no private grounding for the turn.
+ * This is the READ half of the P1 boundary: none of the six private/routing fields is ever read from
+ * member-readable Metadata. Fail-soft: a missing store row just yields no private grounding for the
+ * turn, and a channel created before the move is reported rather than silently served (see the legacy
+ * block at the end of `assembleHostGrounding`).
  */
 import { getChannelContext } from './channel-context-client.js';
 import { deriveFederatedSub } from './federated-identity.js';
@@ -16,6 +18,32 @@ export interface HostGrounding {
   domainGrounding: Record<string, unknown>;
   /** The conversation's contextId (plan anchor), when present. */
   contextId?: string;
+}
+
+/**
+ * The six fields this module takes ONLY from the server-only store, never from channel Metadata.
+ *
+ * Exported because three places have to agree on the set and none of them may drift from the others:
+ * the read below, the legacy detection at the end of `assembleHostGrounding`, and the operator backfill
+ * that promotes a pre-move channel's Metadata into the store (`legacy-channel-context.ts`, driven by
+ * `scripts/backfill-channel-context.ts`). A field added to the store but not to this list is one the
+ * backfill silently never carries and the legacy report never counts.
+ */
+export const PRIVATE_GROUNDING_FIELDS = [
+  'participantProfile',
+  'domainContext',
+  'otherContexts',
+  'userName',
+  'userLanguage',
+  'segment',
+] as const;
+
+/** One of the six. */
+export type PrivateGroundingField = (typeof PRIVATE_GROUNDING_FIELDS)[number];
+
+/** Present means "this field carries a value"; `''` counts as absent, matching the write side. */
+function isSet(value: unknown): boolean {
+  return value !== undefined && value !== null && value !== '';
 }
 
 /** One participant, as the prompt should see them. */
@@ -142,12 +170,12 @@ export async function assembleHostGrounding(
     }
   }
 
-  // LEGACY CHANNELS: detect, report, and deliberately do NOT fall back.
+  // LEGACY CHANNELS: detect, report, name the remedy, and deliberately do NOT fall back.
   //
   // These six fields used to be written into channel Metadata; the P1 split moved them to the
   // server-only store and the writers stopped populating Metadata. A conversation created before that
-  // change carries its grounding ONLY in Metadata, so it silently degrades to an ungrounded turn here
-  // (and, for the two routing signals, to the deployment's default model and language).
+  // change carries its grounding ONLY in Metadata, so it degrades to an ungrounded turn here (and, for
+  // the two routing signals, to the deployment's default model and language).
   //
   // Reading them back out of Metadata would fix the degradation and open a worse hole: a channel's
   // creator is a moderator of their own channel and holds `chime:UpdateChannel` (granted for owner
@@ -157,18 +185,28 @@ export async function assembleHostGrounding(
   // grounding. That is why the read half takes these ONLY from the server-only store, and why a
   // "compatibility fallback" must never be added here.
   //
-  // Degrading is the correct behaviour; degrading INVISIBLY is not. Log once per channel so the size
-  // of the legacy population is observable and a backfill can be a decision rather than a discovery.
-  // Values are never logged - only which keys were present.
-  if (!priv) {
-    const legacyKeys = ['participantProfile', 'domainContext', 'otherContexts', 'userName',
-      'userLanguage', 'segment']
-      .filter((k) => contextMeta[k] !== undefined && contextMeta[k] !== null && contextMeta[k] !== '');
+  // The recovery is an OPERATOR action, not a read-time one: `scripts/backfill-channel-context.ts`
+  // promotes a legacy channel's Metadata into the store once, under someone who can decide whether that
+  // deployment's Metadata is trustworthy. Until it runs, these channels stay ungrounded.
+  //
+  // DETECTION IS ON THE FIELDS, NOT ON THE ROW. A row can exist and carry none of the six: the native
+  // create path writes only the participant shape, and `recordMemberIdentity` appends an issuer hint and
+  // nothing else when someone is added to an existing conversation. Keying this on "no row at all"
+  // reported nothing for exactly those channels - the legacy conversations the platform has touched
+  // since, which are the ones most likely to still be in use.
+  //
+  // Degrading is the correct behaviour; degrading INVISIBLY is not. Log once per turn so the size of the
+  // legacy population is observable and the backfill is a decision rather than a discovery. Values are
+  // never logged - only which keys were present.
+  const hasStoredGrounding = PRIVATE_GROUNDING_FIELDS.some((k) => isSet(priv?.[k]));
+  if (!hasStoredGrounding) {
+    const legacyKeys = PRIVATE_GROUNDING_FIELDS.filter((k) => isSet(contextMeta[k]));
     if (legacyKeys.length > 0) {
       console.warn(
         `[host-grounding] channel ${channelArn} has legacy private grounding in member-readable Metadata `
-        + `(${legacyKeys.join(', ')}) and no Channel Context row; serving this turn UNGROUNDED. `
-        + 'Metadata is member-writable, so it is never used as a source for these fields.',
+        + `(${legacyKeys.join(', ')}) and no stored grounding; serving this turn UNGROUNDED. `
+        + 'Metadata is member-writable, so it is never used as a source for these fields. '
+        + 'Recover it once with backend/scripts/backfill-channel-context.ts.',
       );
     }
   }

@@ -141,6 +141,52 @@ describe('assembleHostGrounding — P1 read split', () => {
     warn.mockRestore();
   });
 
+  // A ROW IS NOT GROUNDING. The detection used to key on "no store row at all", which meant a legacy
+  // channel the platform had touched since was reported as healthy: `recordMemberIdentity` appends an
+  // issuer hint when someone is added to an existing conversation, and the native create path records
+  // the participant shape, so the row EXISTS while carrying none of the six. Those are the legacy
+  // channels most likely to still be in use, and they were the ones the report could not see. Nothing
+  // about the grounding changes - Metadata is still never a source - only whether the loss is visible.
+  it('a row that exists but holds no grounding is still a legacy channel, and is reported', async () => {
+    mockDdbSend.mockResolvedValue({
+      Item: {
+        channelArn: ARN,
+        memberIdentities: [{ sub: 's1', iss: 'https://idp.example' }],
+        updatedAt: '2026-01-01T00:00:00.000Z',
+      },
+    });
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const { domainGrounding } = await assembleHostGrounding(ARN, {
+      userLanguage: 'zh',
+      segment: { country: 'CN' },
+      domainContext: { plan: 'stale' },
+    } as Record<string, unknown>);
+    // Still ungrounded: the row is empty and Metadata is not a source.
+    expect(domainGrounding).toEqual({});
+    expect(warn).toHaveBeenCalledTimes(1);
+    const logged = warn.mock.calls[0][0] as string;
+    expect(logged).toContain('userLanguage');
+    expect(logged).toContain('segment');
+    expect(logged).toContain('domainContext');
+    // The report names the remedy, so the operator does not have to discover that one exists.
+    expect(logged).toContain('backfill-channel-context');
+    warn.mockRestore();
+  });
+
+  // The other half of the same rule: one stored field means the store owns this conversation, so a
+  // leftover value in Metadata is not a legacy gap and must not be reported as one.
+  it('a row carrying even one of the six is not legacy, whatever Metadata still holds', async () => {
+    mockDdbSend.mockResolvedValue({ Item: { channelArn: ARN, userLanguage: 'zh' } });
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    const { domainGrounding } = await assembleHostGrounding(ARN, {
+      participantProfile: 'LEAKED',
+      domainContext: { leaked: true },
+    } as Record<string, unknown>);
+    expect(domainGrounding).toEqual({ userLanguage: 'zh' });
+    expect(warn).not.toHaveBeenCalled();
+    warn.mockRestore();
+  });
+
   it('a channel with a store row and no legacy Metadata logs nothing', async () => {
     mockDdbSend.mockResolvedValue({ Item: { channelArn: ARN, userName: 'Priya' } });
     const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
