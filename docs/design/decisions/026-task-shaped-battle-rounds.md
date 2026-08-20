@@ -108,6 +108,15 @@ So the mechanism is: a task-shaped side that has more work to do with the user e
 state. No new predicate, no battle question answered from task state, and the guard test stays valid.
 Being able to keep that test is evidence the separation was the right cut.
 
+**The separation is of DEFINITION, not of LIFETIME.** This decision describes two things proceeding in
+step and can be misread as making them peers that end independently. They are not peers: the duel
+CONTAINS the task, so a person who leaves one leaves both, in a single action, and the duel is what the
+assistant asks them about. That containment, the abandoned state it needs, and the rule that an abandoned
+round contributes no results, are set out in
+[DESIGN-BATTLE 2a-i](../../specs/capabilities/DESIGN-BATTLE.md) (owner decision 2026-08-20). It does not
+disturb the cut made here: the containment is expressed through ADR-024's owner-scoped task lookup, so the
+battle row still carries no `taskId`.
+
 ## Decision 2: two clocks, because a human is not a stalled Lambda
 
 **A machine deadline and a human wait are different measurements and get different bounds.**

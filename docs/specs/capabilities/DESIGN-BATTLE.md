@@ -127,6 +127,137 @@ recording why it went, `battle-state.ts` states "NO `taskId`" at the row definit
 is live rather than proposed - `getActiveTaskForOwner` (`task-tracking.ts`, called from
 `router-agent-handler.ts`) is the owner-scoped lookup that made the row's `taskId` unnecessary.
 
+## 2a-i. The battle WRAPS the task, and leaving is one action (owner decision, 2026-08-20)
+
+**Status:** Implemented. **Verified by** `backend/test/lib/a-duel-ends-by-a-recorded-state.test.ts`
+(the `ABANDONED` state never satisfying the round-2 trigger, the conditional pointer release, the waiting
+affordance coming down, and an already-claimed round-2 fire being reported rather than hidden) and
+`backend/test/lib/live-drift-flow.test.ts` (the initiator offered the way out, a non-initiator told who
+has it, and no battle claim at all when Battle Mode is on with no duel in flight). Exercised live against
+a deployment by `e2e/battle.spec.ts` - the multi-turn case, in which a follow-up turn that changes the
+subject mid-conversation must still produce a fresh duel rather than being answered inline.
+
+The code: `backend/lambda/src/lib/battle-end.ts` (`endBattle`), `battle-state.ts`
+(`ABANDONED`, `duelInFlight`, `isPastDeadline`, `clearActiveBattle`), `battle-waiting-marker.ts`,
+`channel-moderator.ts`, `channel-flow-processor.ts` (`/battle end` and both ownership-branched refusals),
+`live-drift-flow.ts`, `channel-battle.ts` (Battle Mode off ends the running duel) and
+`battle-outcome-api.ts` (a pick on an abandoned duel is refused).
+
+Section 2a separates the two concepts by **definition**: battle completion is never defined by task
+terminality, and the battle row carries no `taskId`. That stands. This section is about **lifetime**, a
+different question that the same sentence "a battle is not a task" was wrongly read as answering.
+
+**A task sits inside a battle.** A task-shaped duel is one task per side, running within the duel that
+compares them. The containment is what the user experiences, so it governs leaving:
+
+> Break out of the task and you break out of the battle. Break out of the battle and you break out of the
+> task. There is no state where one continues without the other.
+
+The two statements do not conflict because they answer different questions. The completion rule looks
+INWARD and must not read task state to decide whether a round is done. The lifecycle looks OUTWARD: the
+duel is the container, so it is the thing a person leaves, and its task leaves with it.
+
+### What the assistant asks
+
+When the subject changes mid-duel, or a second `/battle` arrives while one is running, **the
+clarification names the battle**, because the battle is the outer thing. It does not ask about the report
+being collected; ending the battle already answers that.
+
+The person is allowed to leave. A response that only refuses is the wrong shape, whatever its wording:
+
+| Situation | Wrong shape | What it has to be |
+|---|---|---|
+| Subject changes mid-duel | "I can't move it while a battle is running" | Name the battle and the way out of it |
+| Second `/battle` while one runs | "A battle is already in progress, try again" | Name the battle and the way out of it |
+
+The way out differs by speaker, because only the initiator has one - see "Who may end a duel" below.
+`/battle end` is a **command**, not a yes/no conversation: "end it" typed mid-duel is ambiguous between
+the battle and the report being collected inside it, and a wrong guess destroys work. A literal command
+cannot be misread, reads the same in every language the channel speaks
+([tenet 11](../../overview/TENETS.md)), and is testable without an NLU round trip.
+
+### Leaving is a recorded state
+
+A duel a person walks out of ends **abandoned**, and that is written down. This is the state whose
+absence made a clock necessary in the first place: with no word for "left unfinished", expiry was the
+only way such a duel ever ended, so the TTL was made to carry the meaning. Once the state exists the
+clock is garbage collection again and nothing reads expiry as intent.
+
+Finding the task to end with it needs no `taskId` on the battle row. ADR-024's owner-scoped lookup
+(`getActiveTaskForOwner`) already answers "the active task owned by this actor in this channel", which is
+the same question here. The containment is therefore expressible without re-fusing the two rows.
+
+**What abandoning has to clean up, and it is not only state.** A side stopped at `WAITING_FOR_USER` is
+holding a question the person can still answer: the message carries the `<!--battlewaiting-->` marker that
+the frontend renders as its live "Replying to:" affordance, and today that marker is cleared in exactly
+one place, when the side resumes. Abandoning without clearing it leaves an answerable question attached to
+a duel that has ended. The abandon path clears it the same way a resume does. The rule generalises: **a
+duel that ends removes every affordance that invited the next input**, or the transcript keeps asking.
+
+### A battle has an initiator, and it is required
+
+**A duel is owned the way a task is owned** ([ADR-024](../../design/decisions/024-task-ownership.md)).
+The initiator is who a waiting side is waiting on, the only person whose reply resumes it, and the only
+person who may end it. Every ownership rule in a duel is a rule about them.
+
+So the initiator is **required, not best-effort**. Where it was optional, each of those rules quietly
+degraded to "anyone" when it was absent - the continuation's owner check skips entirely with no owner to
+check against - and an unattributable duel is therefore not a duel with a small gap in its record, it is
+one with no ownership rules at all. **The fan-out refuses to start a duel it cannot attribute.** Refusing
+costs the sender one message; starting costs the channel a duel anybody can steer.
+
+### Who may end a duel, and why everyone else is refused
+
+The person who started it, read from the pointer's `activeBattleInitiator`. A **channel moderator** may
+also end it, which grants nothing new - they can already end any duel by turning Battle Mode off, and
+that now ends the running one - it only saves the detour. Moderation here is channel-scoped
+`ChannelModerator`, not channel membership and not app-instance administration; it is proven against
+Amazon Chime SDK at the moment of the request, never from an archived copy, and fails CLOSED.
+
+**Anyone else is refused, and the refusal is the design rather than a gap to widen later.** A duel that
+any member could end, or restart by launching their own, would leave the assistants taking competing
+instructions from several people mid-comparison. A head-to-head result is only worth something while both
+sides are answering the same person's question, so the container has one owner for the same reason the
+comparison has one prompt.
+
+What a refusal says: the two routes that exist - its initiator ends it, or a moderator turns Battle Mode
+off - and **not who the initiator is**, which is not a refusal's business to disclose. It goes to the
+sender alone. Who ended a duel, and when, is retained on the release.
+
+The same split governs what a person is *offered* elsewhere. When the subject changes mid-duel, or a
+second `/battle` arrives, the initiator is offered the way out and everybody else is told who has it. An
+instruction somebody cannot carry out is worse than no instruction: they try it, it is refused, and now
+they have been refused twice.
+
+**The one race, and what happens when it is lost.** Round 2 fires from `allBotsTerminal`, so abandonment
+arriving after the last side completed can collide with a fire already in progress. The abandon path
+attempts the orchestrator's exactly-once claim (`tryClaimOrchestratorFire`) to poison a fire that has not
+started. If that claim is LOST the rebuttal is already dispatched and cannot be recalled; the duel is
+still recorded abandoned and the pick is still refused, so the comparison contributes nothing even though
+a round-2 message was produced. This is stated rather than designed away because the alternative is
+pretending a distributed claim cannot be lost.
+
+### No results are counted from an abandoned round
+
+An abandoned duel must not reach the comparison: no round 2, no scorecard, no human pick. **Round 2 is
+suppressed structurally, not by a check that a future call site can forget** - `allBotsTerminal` counts
+only `COMPLETED` and `FAILED`, so an abandoned row can never satisfy the round-2 trigger. The pick API
+refuses an abandoned battle, which is what keeps it out of the human-pick axis, and that refusal is
+ordered AFTER the existing channel-membership check so it cannot be used to probe which battle ids exist.
+
+**Where the boundary falls, because the phrase does not draw it.** What is excluded is the COMPARISON:
+round 2, the scorecard, the pick. The round-1 turns themselves remain in ordinary exchange telemetry with
+their ordinary variant attribution. Those turns really happened, really reached the user, and really cost
+money; dropping them would misstate spend, which is a different falsehood from the one being prevented.
+
+The reason is measurement, not tidiness. Section 5b sets out what a battle result may claim; a duel
+scored as though it finished when it did not is worse than absent data, because absent data is visibly
+absent and a fabricated round points a recommendation the wrong way.
+
+The end state is also **visible**. A duel that was left shows that it was left, where its scorecard would
+have been; `BattleScorecard` and `BattleTallyBar` present no comparison for it. A silent gap invites the
+reader to assume a result they never got.
+
 ## 2c. How far a duel still diverges from an ordinary turn
 
 A battle is worth what it predicts about production, so every divergence is either paid for or is a
