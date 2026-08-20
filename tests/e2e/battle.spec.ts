@@ -32,7 +32,9 @@ import {
   battleImageExpId,
   retireThisRunsBattleExperiments,
 } from './helpers/battle-setup';
-import { getSecondPremiumUser, getStandardUser, missingUserReason } from './helpers/test-credentials';
+// No `missingUserReason` here any more: every user this suite needs is provisioned by
+// `provision-test-users.mjs`, so a missing one is a broken harness and is asserted, not skipped.
+import { getSecondPremiumUser, getStandardUser } from './helpers/test-credentials';
 import {
   waitForActiveBattle,
   waitForWaitingSide,
@@ -45,6 +47,11 @@ import {
   messageExistsForSender,
   publicMessages,
   readActiveBattle,
+  readDuelSides,
+  sendAs,
+  holdsPointer,
+  waitForPointerCleared,
+  waitForSideState,
 } from './helpers/battle-state-backend';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { signIn, createConversation } from './helpers/agent-helpers';
@@ -682,7 +689,10 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     // sharing with the premium user handed the channel back to the person who just created it - its
     // own moderator - and the test could not see what a non-moderator sees.
     const second = await getSecondPremiumUser();
-    test.skip(!second?.password, missingUserReason('secondPremiumUser'));
+    // NOT a skip. `battle.setup` fails loudly when this credential is missing, so by the time a test
+    // runs it is guaranteed - and a skip here would have reported a claim about two DISTINCT PEOPLE as
+    // passed when nothing exercised it.
+    expect(second?.password, 'secondPremiumUser must be provisioned - battle.setup guarantees it').toBeTruthy();
 
     const channelId = await newBattleChannelWithId(page, 'E2E briefing non-moderator');
     await shareChannelWith(page, second!.email);
@@ -780,7 +790,10 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
             .toLowerCase(),
         { timeout: 60_000 },
       )
-      .toMatch(/already .*progress|battle .*in progress|give it a moment/);
+      // The second `/battle` is refused, and the wording now offers a way out rather than "try again"
+      // (DESIGN-BATTLE 2a-i). Matched on the CLAIM - a battle is already running - not on the advice
+      // that follows it, which differs for the duel's initiator and for anybody else.
+      .toMatch(/already .*running|already .*progress/);
 
     // Exactly ONE battle runs to completion — the second did not spawn a duel, and the first resolved
     // (its scorecard rendered), proving activeBattleId was not overwritten / the first was not orphaned.
@@ -976,7 +989,10 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     // picks are keyed by the chooser's sub, so sharing with the premium user made this one person
     // picking twice: the second pick overwrote the first and only one variant could ever hold a win.
     const second = await getSecondPremiumUser();
-    test.skip(!second?.password, missingUserReason('secondPremiumUser'));
+    // NOT a skip. `battle.setup` fails loudly when this credential is missing, so by the time a test
+    // runs it is guaranteed - and a skip here would have reported a claim about two DISTINCT PEOPLE as
+    // passed when nothing exercised it.
+    expect(second?.password, 'secondPremiumUser must be provisioned - battle.setup guarantees it').toBeTruthy();
     await shareChannelWith(page, second!.email);
 
     // A manually-created context does NOT inherit the project's `use.baseURL`, so pass it explicitly.
@@ -1049,7 +1065,10 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
   test('B-E7: a waiting side is answerable ONLY by the person who started the duel', async ({ page, browser }) => {
     test.setTimeout(15 * 60_000);
     const second = await getSecondPremiumUser();
-    test.skip(!second?.password, missingUserReason('secondPremiumUser'));
+    // NOT a skip. `battle.setup` fails loudly when this credential is missing, so by the time a test
+    // runs it is guaranteed - and a skip here would have reported a claim about two DISTINCT PEOPLE as
+    // passed when nothing exercised it.
+    expect(second?.password, 'secondPremiumUser must be provisioned - battle.setup guarantees it').toBeTruthy();
     await activateBattleExperiment(page, battleExpId());
 
     const channelId = await newBattleChannelWithId(page, 'E2E duel owner');
@@ -1178,7 +1197,11 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
   test('B-E8: a /battle below premium is answered by the capability gate, never silently run', async ({ browser }) => {
     test.setTimeout(8 * 60_000);
     const std = await getStandardUser();
-    test.skip(!std?.password, missingUserReason('standardUser'));
+    // NOT a skip, for the same reason as the second premium member above: `standardUser` is provisioned
+    // by `provision-test-users.mjs`, so its absence is a broken harness. Skipping would report the
+    // capability gate - the control that stops a below-premium `/battle` running at all - as passed
+    // while nothing tested it.
+    expect(std?.password, 'standardUser must be provisioned - see provision-test-users.mjs').toBeTruthy();
 
     const ctx = await browser.newContext({
       baseURL: process.env.E2E_BASE_URL || 'http://localhost:5173',
@@ -1230,6 +1253,98 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     } finally {
       await ctx.close();
     }
+  });
+
+  // B-E9 - As the person who STARTED a duel, I want to end it and get my conversation back, and as
+  // anyone else I must not be able to end someone else's (DESIGN-BATTLE 2a-i).
+  //
+  // The claim has three parts and each is asserted on BACKEND STATE rather than on what the assistant
+  // said. Wording is the least stable thing in the product and this suite has already been burned by
+  // matching on it: a phrase list is what made a settled turn look unsettled, and the copy here differs
+  // by speaker on purpose. The durable facts are the pointer and the per-side rows.
+  //
+  //   1. a non-initiator cannot end it        -> the pointer still names the duel, held over a window
+  //   2. the initiator can                    -> the pointer is released and the waiting side is ABANDONED
+  //   3. the channel is genuinely free again  -> the NEXT /battle starts a duel with a different id
+  //
+  // Part 3 is the one worth having. Before this change nothing ever cleared the pointer, so a channel
+  // stayed locked to a finished-or-abandoned duel until a four-hour clock expired; "the rows say
+  // abandoned" would be satisfied by a fix that still left the channel unusable.
+  test('B-E9: only the person who started a duel can end it, and ending it frees the conversation', async ({ page }) => {
+    test.setTimeout(15 * 60_000);
+    const second = await getSecondPremiumUser();
+    expect(second?.password, 'secondPremiumUser must be provisioned - battle.setup guarantees it').toBeTruthy();
+    await activateBattleExperiment(page, battleExpId());
+
+    const channelId = await newBattleChannelWithId(page, 'E2E battle end');
+    await shareChannelWith(page, second!.email);
+
+    // Task-shaped, so a side parks on the user and the duel stays genuinely IN FLIGHT for the whole
+    // test. A plain duel would race to completion and then "the pointer cleared" could not be told
+    // apart from an ordinary finish.
+    await fireBattleNoWait(
+      page,
+      '/battle Compile a concise 1-page report comparing trunk-based development against long-lived '
+      + 'release branches for a 5-team engineering org.',
+    );
+
+    const active = await waitForActiveBattle(channelId, 180_000);
+    expect(active?.battleId, 'the fan-out stamps the channel pointer').toBeTruthy();
+    expect(active?.initiatorUserSub, 'a battle has an initiator, recorded on the pointer').toBeTruthy();
+
+    const waiting = await waitForWaitingSide(active!.battleId!, 420_000);
+    expect(
+      waiting,
+      'a task-shaped duel must park a side on the user (ADR-026) - with nothing in flight there is no '
+      + 'duel to end, and this test would be asserting nothing',
+    ).toBeTruthy();
+
+    const ownerArn = userArnFor(active!.initiatorUserSub!);
+    const nonOwner = humanMembers(channelId).find((arn) => arn !== ownerArn);
+    expect(nonOwner, 'the channel has a second human member to try this as').toBeTruthy();
+
+    // ── 1. the NON-OWNER tries to end it ───────────────────────────────────────────────────────
+    sendAs(channelId, nonOwner!, '/battle end');
+    expect(
+      await holdsPointer(channelId, active!.battleId!, 60_000),
+      "a member who did not start the duel must not be able to end it - the channel's duel is not "
+      + 'theirs to take away',
+    ).toBe(active!.battleId!);
+    expect(
+      readDuelSides(active!.battleId!).some((r) => r.state === 'WAITING_FOR_USER' || r.state === 'INVOKED'),
+      'and the duel is still running: a refused end must leave every side exactly where it was',
+    ).toBe(true);
+
+    // ── 2. the OWNER ends it ───────────────────────────────────────────────────────────────────
+    sendAs(channelId, ownerArn, '/battle end');
+    expect(
+      await waitForPointerCleared(channelId, 120_000),
+      'the initiator ends their own duel, and the release is what frees the channel',
+    ).toBe(true);
+    expect(
+      await waitForSideState(active!.battleId!, waiting!.botArn, 'ABANDONED', 120_000),
+      'the side that was waiting is recorded ABANDONED - an END, not a completion, so nothing '
+      + 'downstream can read it as a finished comparison',
+    ).toBe('ABANDONED');
+
+    // ── 3. the conversation is usable again ────────────────────────────────────────────────────
+    //
+    // TASK-SHAPED AGAIN, and not for symmetry. The pointer is now released the moment a duel resolves,
+    // so a short duel sets and clears it within about a minute - and a poll that happens to look either
+    // side of that window would report "no new battle started" for a duel that ran perfectly. A duel
+    // that parks on the user holds its pointer until somebody ends it, which makes the observation
+    // stable instead of a race this test would lose intermittently.
+    await fireBattleNoWait(
+      page,
+      '/battle Compile a short summary of the tradeoffs between tabs and spaces for indentation in a '
+      + 'shared codebase.',
+    );
+    const next = await waitForActiveBattle(channelId, 180_000);
+    expect(next?.battleId, 'a new /battle starts after the old duel was ended').toBeTruthy();
+    expect(
+      next!.battleId,
+      'and it is a genuinely NEW duel, not the ended one still holding the channel',
+    ).not.toBe(active!.battleId);
   });
 });
 

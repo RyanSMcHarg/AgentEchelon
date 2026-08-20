@@ -15,6 +15,7 @@
  * Guard: it only runs against a live deploy (E2E_BASE_URL set). Off a live run
  * (localhost default) it skips, so `--list` and the default unit suite stay green.
  */
+import { readFileSync } from 'node:fs';
 import { test as setup, expect } from '@playwright/test';
 import { getTestCredentials, getPremiumUser, getSecondPremiumUser } from './helpers/test-credentials';
 import { initBattleExpIds } from './helpers/battle-setup';
@@ -95,22 +96,55 @@ setup('authenticate admin on both origins', async ({ page }) => {
   // (d) A second member who is a DIFFERENT IDENTITY from the moderator. testAdmin and premiumUser are
   //     the same account, so (c) alone cannot exercise anything that turns on two distinct users -
   //     see BATTLE_SECOND_MEMBER_AUTH_FILE in playwright.config for what that silently defeated.
+  //
+  //     A FAILURE HERE MUST BE LOUD, and it used to be silent. The whole block was wrapped in
+  //     `if (second?.password)`, so anything that stopped the second member being prepared - the key
+  //     absent from the secret, or a sign-in that simply did not complete - left the storage file
+  //     unwritten and the setup passing. The tests that need it then reported `test.skip`, and a skip
+  //     reads as a pass in the summary line everyone actually looks at. Two claims the product makes
+  //     about DIFFERENT PEOPLE (per-user picks are keyed by the chooser's sub; a briefing must reach a
+  //     non-moderator) would have gone unverified with nothing on screen saying so.
+  //
+  //     The credential is provisioned by `provision-test-users.mjs`, so on a live run its absence is a
+  //     broken harness rather than an unsupported deployment - and this suite is skipped wholesale off
+  //     a live deploy, which is the only case where "not available" is a legitimate answer.
   const second = await getSecondPremiumUser();
-  if (second?.password) {
-    const secondCtx = await page.context().browser()!.newContext();
-    const secondPage = await secondCtx.newPage();
-    try {
-      await secondPage.goto(CHAT_BASE_URL);
-      await secondPage.waitForSelector('input[type="email"]', { timeout: 15_000 });
-      await secondPage.locator('input[type="email"]').fill(second.email);
-      await secondPage.locator('input[type="password"]').fill(second.password);
-      await secondPage.locator('button[type="submit"]').click();
-      await secondPage.waitForSelector('.app-header', { timeout: 30_000 });
-      await secondCtx.storageState({ path: BATTLE_SECOND_MEMBER_AUTH_FILE });
-    } finally {
-      await secondCtx.close();
-    }
+  if (!second?.password) {
+    throw new Error(
+      'battle e2e: `secondPremiumUser` is missing from the test-credentials secret, so B-E1 and B-E6 '
+      + 'cannot verify anything about two distinct people. Provision it with '
+      + '`node backend/scripts/provision-test-users.mjs` rather than letting those tests skip.',
+    );
+  }
+  const secondCtx = await page.context().browser()!.newContext();
+  const secondPage = await secondCtx.newPage();
+  try {
+    await secondPage.goto(CHAT_BASE_URL);
+    await secondPage.waitForSelector('input[type="email"]', { timeout: 15_000 });
+    await secondPage.locator('input[type="email"]').fill(second.email);
+    await secondPage.locator('input[type="password"]').fill(second.password);
+    await secondPage.locator('button[type="submit"]').click();
+    // Fails the SETUP if this member cannot actually sign in, which is the point: the alternative is
+    // writing a storage file for a session that never authenticated, and every test that loads it then
+    // fails somewhere further downstream with a symptom that looks like a product defect.
+    await secondPage.waitForSelector('.app-header', { timeout: 30_000 });
+    await secondCtx.storageState({ path: BATTLE_SECOND_MEMBER_AUTH_FILE });
+  } finally {
+    await secondCtx.close();
   }
 
-  expect(true).toBe(true);
+  // The setup's real assertion: every storage file a test will load exists and carries a session. An
+  // `expect(true).toBe(true)` stood here, which asserts that this file was reached and nothing else.
+  for (const [label, file] of [
+    ['admin', BATTLE_AUTH_FILE],
+    ['premium', BATTLE_PREMIUM_AUTH_FILE],
+    ['second member', BATTLE_SECOND_MEMBER_AUTH_FILE],
+  ] as const) {
+    const state = JSON.parse(readFileSync(file, 'utf8')) as {
+      cookies?: unknown[]; origins?: Array<{ localStorage?: unknown[] }>;
+    };
+    const hasSession = (state.origins ?? []).some((o) => (o.localStorage ?? []).length > 0)
+      || (state.cookies ?? []).length > 0;
+    expect(hasSession, `${label} storageState (${file}) has no session - the sign-in did not stick`).toBe(true);
+  }
 });

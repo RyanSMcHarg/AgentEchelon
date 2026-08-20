@@ -174,6 +174,61 @@ export function sendTargetedAs(
   return res?.MessageId as string;
 }
 
+/**
+ * Send an ordinary BROADCAST message as a given member - the shape a person typing into the composer
+ * produces, and therefore the shape a command like `/battle end` arrives in.
+ *
+ * The targeted sibling above cannot stand in for this: a `Target` makes the message a directed reply,
+ * which the flow routes down the continuation path instead of the command path.
+ */
+export function sendAs(channelId: string, senderUserArn: string, content: string): string {
+  const res = aws([
+    'chime-sdk-messaging', 'send-channel-message',
+    '--channel-arn', channelArnFor(channelId),
+    '--content', content,
+    '--type', 'STANDARD',
+    '--persistence', 'PERSISTENT',
+    '--chime-bearer', senderUserArn,
+  ]);
+  return res?.MessageId as string;
+}
+
+/** Wait for the channel's pointer to be RELEASED - the duel ended and the channel is free. */
+export function waitForPointerCleared(channelId: string, timeoutMs = 120_000): Promise<boolean | null> {
+  return poll(() => (readActiveBattle(channelId).battleId ? null : true), timeoutMs);
+}
+
+/**
+ * Assert the pointer still names `battleId` for the whole window - the negative half of the ownership
+ * rule, and a hold rather than a single read for the same reason `holdsWaiting` is: an end that lands
+ * two seconds after the check would otherwise pass, and "the refusal is slow" is not "it was refused".
+ *
+ * Returns the battleId the pointer ended on, or `null` if it was cleared at any point.
+ */
+export async function holdsPointer(
+  channelId: string,
+  battleId: string,
+  forMs: number,
+): Promise<string | null> {
+  const deadline = Date.now() + forMs;
+  for (;;) {
+    const now = readActiveBattle(channelId).battleId ?? null;
+    if (now !== battleId) return now;
+    if (Date.now() > deadline) return now;
+    await new Promise((r) => setTimeout(r, 5_000));
+  }
+}
+
+/** Wait for one side to reach a given state. */
+export function waitForSideState(
+  battleId: string,
+  botArn: string,
+  state: string,
+  timeoutMs = 120_000,
+): Promise<string | null> {
+  return poll(() => (sideState(battleId, botArn) === state ? state : null), timeoutMs);
+}
+
 /** A member's app-instance-user ARN from their Cognito sub. */
 export function userArnFor(sub: string): string {
   return `${appInstanceArn()}/user/${sub}`;

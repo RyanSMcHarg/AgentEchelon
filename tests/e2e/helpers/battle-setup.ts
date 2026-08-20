@@ -569,13 +569,23 @@ export async function retireThisRunsBattleExperiments(page: Page): Promise<void>
       const resp = await api
         .post(`${experimentsApi}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } })
         .catch(() => null);
-      if (!resp?.ok()) {
-        console.warn(
-          `[battle-setup] could not retire ${id}; premium routing may still be split by it. `
-          + 'Complete it from the admin console, or the next agent-intents run will report a premium '
-          + 'conversation served by the control model.',
-        );
-      }
+      if (resp?.ok()) continue;
+
+      // A 404 IS NOT A FAILURE, and reporting it as one taught readers to ignore this warning.
+      //
+      // Both ids are minted at setup, but the IMAGE experiment is only CREATED by the image duel, which
+      // is opt-in (BATTLE_IMAGE_E2E). An ordinary run therefore tried to retire an experiment that had
+      // never existed, got a 404, and printed a warning claiming premium routing "may still be split by
+      // it" - about an experiment that cannot split anything because there is nothing there. Every
+      // green run ended on an alarm that was not true, which is how a real one comes to be scrolled
+      // past. Nothing to retire is the desired end state, so it is silent.
+      if (resp?.status() === 404) continue;
+
+      console.warn(
+        `[battle-setup] could not retire ${id} (${resp ? `HTTP ${resp.status()}` : 'request failed'}); `
+        + 'premium routing may still be split by it. Complete it from the admin console, or the next '
+        + 'agent-intents run will report a premium conversation served by the control model.',
+      );
     }
   } finally {
     await api.dispose();

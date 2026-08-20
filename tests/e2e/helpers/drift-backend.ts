@@ -314,7 +314,12 @@ const ERROR_REPLY_SHAPES = [
   'I encountered an issue. Could you try rephrasing?',
   "I couldn't start on that just now",
   'We are experiencing unusually high demand',
-  'A battle is already in progress here',
+  // A second `/battle` while one is running. No longer worded as "try again" - the person is now told
+  // how to end the running duel, or who can - but it still means their `/battle` did not start, which
+  // is the only thing this list cares about. Both wordings share this prefix on purpose.
+  'A battle is already running in this conversation',
+  // `/battle end` from someone who does not own the duel.
+  'This battle belongs to the person who started it',
 ];
 
 /**
