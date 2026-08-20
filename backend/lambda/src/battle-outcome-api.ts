@@ -31,7 +31,7 @@ import {
   recordBattleOutcome,
   readUserBattleOutcome,
 } from './lib/battle-outcome.js';
-import { loadChannelBattleConfig } from './lib/battle-state.js';
+import { loadChannelBattleConfig, readBattleRows, botRowsOnly } from './lib/battle-state.js';
 import type { BattleOutcome } from './lib/analytics-metadata.js';
 import { parseJsonBody } from './lib/auth.js';
 
@@ -133,6 +133,35 @@ async function handlePost(
         code: 'NOT_A_MEMBER',
       }, origin);
     }
+  }
+
+  // AN ABANDONED DUEL IS NOT COMPARABLE, so it takes no pick (DESIGN-BATTLE 2a-i).
+  //
+  // A duel somebody walked out of never produced the comparison a pick is a judgement of: one side may
+  // have been mid-sentence, or still collecting the details it needed. Recording a winner would put a
+  // fabricated round into the human-pick axis, where it points a recommendation with the authority of
+  // real data. Refusing here is what keeps it out - `battlePickAxis` reads recorded picks, so a pick
+  // that never lands never counts.
+  //
+  // ORDERED AFTER THE MEMBERSHIP CHECK, deliberately. This response distinguishes battle ids that exist
+  // from ones that do not, so it must sit behind the gate that establishes the caller belongs here;
+  // in front of it, it would answer that question for anyone who asked.
+  try {
+    const rows = botRowsOnly(await readBattleRows(battleId));
+    if (rows.length > 0 && rows.some((r) => r.state === 'ABANDONED')) {
+      console.log('[battle-outcome] refusing a pick for an abandoned battle', { battleId });
+      return respond(409, {
+        error: 'That battle was ended before it finished, so there is no result to judge',
+        code: 'BATTLE_ABANDONED',
+      }, origin);
+    }
+  } catch (stateErr) {
+    // Fail OPEN, and only here. The duel's state could not be read; refusing would lose a pick on a
+    // comparison the person did see. A stray pick on an abandoned duel is a smaller error than
+    // discarding a real judgement, and the abandon path is what normally prevents it.
+    console.warn('[battle-outcome] could not read battle state; recording the pick anyway', {
+      battleId, err: (stateErr as Error).name,
+    });
   }
 
   // Feedback join: resolve the experiment from the channel's battle config
