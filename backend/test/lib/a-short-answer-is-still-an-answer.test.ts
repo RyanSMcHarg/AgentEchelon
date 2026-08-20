@@ -283,6 +283,37 @@ describe('a short message is read as an answer when something is waiting on the 
     });
   });
 
+  // HOLDING WORK IS NOT THE SAME AS OWING AN ANSWER. The person can hold a task whose CURRENT state
+  // awaits nobody - `applyUserResponseToTask` refuses it with `not_awaiting` and hands nothing back -
+  // so a "thanks" arriving there resumed nothing. Counting it as a continuation anyway suppresses the
+  // canned reply and spends a full worker turn at the classification floor, because the model tier
+  // now reads the same continuation fact.
+  describe('when the person holds work that is not waiting on them', () => {
+    beforeEach(() => {
+      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
+        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_SELF)) : null);
+      mockApplyUserResponseToTask.mockResolvedValue({ applied: false, reason: 'not_awaiting', from: 'collecting' });
+    });
+
+    it('answers "thanks" from the fast path instead of resuming nothing', async () => {
+      await routerHandler(turn('thanks'));
+
+      expect(worker()).toBeUndefined();
+      expect(posts().map((p) => p.Content).join(' ')).toContain('Happy to help');
+    });
+
+    // The one-answer path refuses to ADVANCE and still hands the work back, so it IS a continuation.
+    // Same shape of refusal, opposite meaning: the distinction is what the reason names.
+    it('still resumes when the refusal is `deferred_to_model`', async () => {
+      mockApplyUserResponseToTask.mockResolvedValue({ applied: false, reason: 'deferred_to_model', from: 'confirming' });
+
+      await routerHandler(turn('ok'));
+
+      expect(worker()).toBeTruthy();
+      expect(worker()?.isTaskContinuation).toBe(true);
+    });
+  });
+
   describe('when nothing is waiting on the person', () => {
     it('answers "thanks" from the fast path, with no model call and no dispatch', async () => {
       await routerHandler(turn('thanks'));

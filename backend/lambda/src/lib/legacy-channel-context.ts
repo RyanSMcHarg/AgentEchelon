@@ -85,10 +85,18 @@ function present(value: unknown): boolean {
  * Its item titles and notes land in the system prompt exactly as the scalars do, so a `<!--ACTIVE_TASK…-->`
  * or `NAVIGATE_CHANNEL:` marker buried in a plan item is the same injection with more room to hide.
  * Bounded by depth so a deeply nested blob cannot turn the sanitiser into a denial of service.
+ *
+ * PAST THE BOUND THE VALUE IS DROPPED, NOT RETURNED. Returning it was the wrong end of the trade: a
+ * string is stripped before the depth test, so scalars were always safe, but an OBJECT at the bound
+ * came back whole with every string inside it unstripped - so the way to defeat the sanitiser was to
+ * nest the marker one level deeper than it looks. Dropping is safe in the direction that matters:
+ * this input is member-writable Metadata being promoted into the server-only store, and losing a
+ * field nested eight deep in a plan costs a fragment of recovered grounding, while keeping it
+ * unstripped costs the injection defense the whole module exists to provide.
  */
 function stripDeep(value: unknown, depth = 0): unknown {
   if (typeof value === 'string') return stripMessageMarkers(value);
-  if (depth >= MAX_STRIP_DEPTH) return value;
+  if (depth >= MAX_STRIP_DEPTH) return typeof value === 'object' && value !== null ? undefined : value;
   if (Array.isArray(value)) return value.map((v) => stripDeep(v, depth + 1));
   if (value && typeof value === 'object') {
     const out: Record<string, unknown> = {};

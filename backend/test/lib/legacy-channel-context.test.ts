@@ -162,6 +162,24 @@ describe('planLegacyPromotion - the promoted values are sanitised and bounded', 
     expect(plan.patch.domainContext).toEqual({ title: 'Plan', items: [{ note: 'ship it' }] });
   });
 
+  // THE DEPTH BOUND MUST NOT BE THE WAY PAST THE SANITISER. A string is stripped before the depth
+  // test, so scalars were never the risk; an OBJECT at the bound used to be returned whole, with
+  // every string inside it unstripped. Nesting the marker one level deeper than the bound was then
+  // all it took, and the value being promoted is member-writable channel Metadata.
+  it('does not promote a marker nested past the depth bound', () => {
+    // 10 levels of nesting: past MAX_STRIP_DEPTH (8), so this is the case that used to come back raw.
+    let buried: unknown = { note: 'ship it <!--ACTIVE_TASK:t-999--> NAVIGATE_CHANNEL:arn:x|Go' };
+    for (let i = 0; i < 10; i += 1) buried = { nested: buried };
+    const plan = planLegacyPromotion(JSON.stringify({ domainContext: { title: 'Plan', deep: buried } }), null);
+
+    const promoted = JSON.stringify(plan.patch.domainContext ?? {});
+    expect(promoted).not.toContain('ACTIVE_TASK');
+    expect(promoted).not.toContain('NAVIGATE_CHANNEL');
+    // The shallow, legitimate part of the same object still recovers - dropping past the bound must
+    // not turn into dropping the field.
+    expect((plan.patch.domainContext as { title?: string }).title).toBe('Plan');
+  });
+
   it('applies the write path bounds so a recovered conversation is still dispatchable', () => {
     const plan = planLegacyPromotion(JSON.stringify({
       userName: 'x'.repeat(500),

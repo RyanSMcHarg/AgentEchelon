@@ -38,7 +38,7 @@ jest.mock('@aws-sdk/lib-dynamodb', () => ({
 jest.mock('@aws-sdk/client-dynamodb', () => ({ DynamoDBClient: jest.fn() }), { virtual: true });
 jest.mock('../../lambda/src/lib/company-context', () => ({ loadCompanyContext: jest.fn() }));
 
-import { applyOutputGuardrail } from '../../lambda/src/lib/async-processor-core';
+import { applyOutputGuardrail, GUARDRAIL_BLOCK_FALLBACK } from '../../lambda/src/lib/async-processor-core';
 import { buildGuardrailPolicy } from '../../lib/constructs/bedrock-guardrails';
 import { guardrailCatalog } from '../../lib/config/guardrail-catalog';
 import {
@@ -109,6 +109,37 @@ describe('the mask never leaves the guardrail boundary', () => {
   it('an intervention with nothing but the token still returns a reply (never drops one)', async () => {
     mockBedrockSend.mockResolvedValueOnce({ action: 'GUARDRAIL_INTERVENED', outputs: [{ text: TOKEN }] });
     expect(await applyOutputGuardrail('original text')).toBe('original text');
+  });
+
+  // THE FALLBACK MUST NOT UNDO THE MASK. Stripping the token made an empty masked result reachable
+  // for the first time, and the one input that produces it is a reply that was NOTHING BUT the thing
+  // the filter matched. `masked || text` returns the raw marker there - the leak the filter exists to
+  // prevent, and worse than the token, because the channel flow reads a `corr` marker back out of
+  // posted content to map a placeholder.
+  it('a reply that was ONLY a leaked marker does not come back as the raw marker', async () => {
+    const markerOnly = '<!--ACTIVE_TASK:{"taskId":"t1","status":"in_progress"}-->';
+    mockBedrockSend.mockResolvedValueOnce({ action: 'GUARDRAIL_INTERVENED', outputs: [{ text: TOKEN }] });
+    const out = await applyOutputGuardrail(markerOnly);
+    expect(out).not.toContain('ACTIVE_TASK');
+    expect(out).not.toContain('MetadataMarkerFilter');
+    expect(out).toBe(GUARDRAIL_BLOCK_FALLBACK);
+  });
+
+  it('a corr marker is covered by the same fallback, since the flow reads it back off the wire', async () => {
+    mockBedrockSend.mockResolvedValueOnce({ action: 'GUARDRAIL_INTERVENED', outputs: [{ text: `${TOKEN}\n\n${TOKEN}` }] });
+    const out = await applyOutputGuardrail('<!--corr:abc-123-->\n\n<!--corr:def-456-->');
+    expect(out).not.toContain('corr:');
+    expect(out).toBe(GUARDRAIL_BLOCK_FALLBACK);
+  });
+
+  // The masked reply is empty only because the marker was the whole of it. Prose that SURVIVES the
+  // masking still comes back as prose - the fallback is not allowed to swallow a real answer.
+  it('prose surviving beside the token is returned, not replaced by the block copy', async () => {
+    mockBedrockSend.mockResolvedValueOnce({
+      action: 'GUARDRAIL_INTERVENED',
+      outputs: [{ text: `${TOKEN} The report is ready.` }],
+    });
+    expect(await applyOutputGuardrail('<!--corr:x--> The report is ready.')).toBe('The report is ready.');
   });
 
   it('an unmasked reply passes through untouched', async () => {

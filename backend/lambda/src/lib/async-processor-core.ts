@@ -1607,8 +1607,18 @@ export async function applyOutputGuardrail(text: string, guardrailId?: string): 
     // literal `{MetadataMarkerFilter}` (live). This is the one point in the system where such a
     // token can be created, so it is where it is removed - before the reply is posted, archived, or
     // scored. PII masks (`{EMAIL}`) are left alone; there the mask is the intended output.
-    // An empty result falls back to the model's text, so a guardrail outcome never drops a reply.
-    return stripGuardrailMaskTokens(masked) || text;
+    // AND THE FALLBACK MUST NOT UNDO THE MASK. `masked || text` was safe while the mask token was
+    // left in place, because the token itself kept the string non-empty. Stripping it makes an empty
+    // result reachable for the first time, and it is reachable in exactly one case: the reply was
+    // NOTHING BUT the thing the filter matched. Falling back to `text` there hands back the raw
+    // marker the filter exists to hide - a worse outcome than the leak this whole change fixes, since
+    // the channel flow reads a `<!--corr:-->` marker back out of posted content.
+    //
+    // So the fallback strips the markers instead, and a reply that is empty after that gets the
+    // block copy. A guardrail outcome still never drops a reply; it just never returns unmasked text.
+    const cleaned = stripGuardrailMaskTokens(masked);
+    if (cleaned) return cleaned;
+    return stripMessageMarkers(text).trim() || GUARDRAIL_BLOCK_FALLBACK;
   }
   return text;
 }

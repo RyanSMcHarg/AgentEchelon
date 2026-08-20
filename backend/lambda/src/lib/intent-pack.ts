@@ -316,11 +316,33 @@ function coerceMachinesConfig(raw: unknown): Record<string, TaskStateMachine> | 
         const awaits = sr.awaits && typeof sr.awaits === 'object' && !Array.isArray(sr.awaits)
           ? (sr.awaits as AwaitedPartyRef)
           : undefined;
+        // THE THREE BEHAVIOURAL FLAGS, CARRIED. Dropping them made a pack-declared machine a
+        // different document from the one its author wrote, and silently: `delivers` decides whether
+        // a deliverable is packaged as a file, so a pack-declared document workflow shipped every
+        // report as chat text - exactly the defect `delivers` was introduced to remove, reappearing
+        // one layer up in the coercion. `resolvedByOneResponse` and `requires` are both rendered into
+        // the turn's prompt, so a pack lost the "one answer completes this" and "this step needs"
+        // instructions it declared.
+        //
+        // AND CARRYING THEM IS WHAT MAKES VALIDATION MEAN ANYTHING HERE. The rules below run on the
+        // object this loop builds, so while these fields were stripped, "requires needs an awaited
+        // party" and "requires cannot coexist with resolvedByOneResponse" passed VACUOUSLY for every
+        // pack: the validator was handed a state that no longer declared the thing it checks. A pack
+        // that declares an invalid combination is now refused loudly, whole-block, like any other
+        // invalid pack - which is the point. A block that reverts to the platform defaults is a
+        // deployment the operator can diagnose; a block quietly missing the field that decides
+        // delivery is not.
+        const requires = Array.isArray(sr.requires)
+          ? sr.requires.filter((r): r is string => typeof r === 'string')
+          : undefined;
         states[stateName] = {
           transitions,
           ...(terminal ? { terminal } : {}),
           ...(awaits ? { awaits } : {}),
           ...(sr.awaitsUser === true ? { awaitsUser: true } : {}),
+          ...(requires?.length ? { requires } : {}),
+          ...(sr.resolvedByOneResponse === true ? { resolvedByOneResponse: true } : {}),
+          ...(sr.delivers === true ? { delivers: true } : {}),
           ...(typeof sr.prompt === 'string' ? { prompt: sr.prompt } : {}),
           ...(typeof sr.placeholder === 'string' ? { placeholder: sr.placeholder } : {}),
         };

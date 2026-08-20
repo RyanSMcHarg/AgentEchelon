@@ -614,6 +614,15 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
           // still in it, so the retry is one click rather than a hunt for a conflict that is gone.
           setConflicts(null);
           setPendingCreate(null);
+          // AND FORGET WHAT WAS RESOLVED, because this exit ends the episode. `resolvedBlockerIds`
+          // exists to suppress a blocker the operator just freed from a stale server read; carrying
+          // it past this point makes it suppress that same experiment after it has been re-activated.
+          // The loop that produces: pause E, land here, re-activate E, retry - the 409 names E,
+          // `presentableBlockers` drops it as already-resolved, and the operator is told again that
+          // the blocker is resolved, with no panel and no End/Pause control, against a classification
+          // that is genuinely held. Cleared on the create and on Cancel for the same reason; this was
+          // the third exit and the only one that forgot.
+          setResolvedBlockerIds([]);
           setShowCreate(true);
           setActionError(
             'The blocking experiment is already resolved. The classification frees within a few seconds; create again.',

@@ -122,6 +122,24 @@ describe('parseMessageContent', () => {
     const result = parseMessageContent('<!--corr:aaaa-bbbb-cccc-dddd-->');
     expect(result.content).toBe('');
   });
+
+  // What Amazon Bedrock Guardrails leaves where it masked one of the markers above. The backend strips
+  // it at the guardrail boundary, which covers everything written from that point on - it does NOT
+  // reach a message already stored in Amazon Chime SDK, and this parser is what the person re-opening
+  // that conversation sees. The reported leak was exactly such a message.
+  it('strips the guardrail mask token left where a marker was masked', () => {
+    const result = parseMessageContent(
+      'Here is the summary in this condensed 1-2 page report format.{MetadataMarkerFilter}'
+    );
+    expect(result.content).toBe('Here is the summary in this condensed 1-2 page report format.');
+  });
+
+  // The mask is the intended output for a PII entity rule: removing it would hide that a redaction
+  // happened. Only the internal-marker filter's token is noise to the reader.
+  it('leaves a PII mask alone', () => {
+    const result = parseMessageContent('Reach the team at {EMAIL}.');
+    expect(result.content).toBe('Reach the team at {EMAIL}.');
+  });
 });
 
 describe('parseMessageContent — NAVIGATE_CHANNEL marker (drift redirect)', () => {

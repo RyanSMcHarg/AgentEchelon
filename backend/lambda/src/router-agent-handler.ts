@@ -2035,7 +2035,21 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
           activeTask = answered;
           // Something WAS waiting on this person and this message answered it, so the turn is a
           // continuation however short the message is.
-          resumedWaitingWork = true;
+          //
+          // ONLY IF SOMETHING ACTUALLY ENGAGED, and the two refusals are not hypothetical: the person
+          // can hold a task whose CURRENT state awaits nobody (`not_awaiting`, task-tracking.ts), or
+          // whose machine is not in this deployment's pack (`no_machine`). Neither hands the work
+          // back, so nothing resumed - and calling it a continuation anyway spends a full worker turn
+          // on the classification floor for a "thanks" that answered nothing, because
+          // `continuesActiveWork` reads this. `deferred_to_model` DOES count: the reply handed the
+          // work back for `advance_task_state` to resolve, which is the one-answer path.
+          //
+          // Stated as what does NOT count, so an unrecognised future reason still resumes. A missed
+          // resume is the deterministic-strand class this branch exists to close; a wrongly-resumed
+          // turn only costs money.
+          if (applied.reason !== 'not_awaiting' && applied.reason !== 'no_machine') {
+            resumedWaitingWork = true;
+          }
 
           // AND IF THAT CHAIN IS A DUEL SIDE'S, take the side out of `WAITING_FOR_USER` too.
           //

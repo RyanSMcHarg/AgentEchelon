@@ -253,6 +253,25 @@ export function parseMessageContent(rawContent: string): ParsedMessage {
   // so we widen the pattern to accept any UUID-ish or hyphen-delimited token.
   content = content.replace(/<!--corr:[^>]+-->/g, '');
 
+  // Strip the guardrail MASK TOKEN, which is what Amazon Bedrock Guardrails leaves where it masked
+  // one of the markers above: an ANONYMIZE match is replaced by the literal `{FILTER_NAME}`, so a
+  // leaked ACTIVE_TASK/corr marker comes back as `{MetadataMarkerFilter}` rather than as the marker.
+  //
+  // THE BACKEND STRIP DOES NOT COVER THIS SURFACE. It removes the token at the guardrail boundary,
+  // which protects everything written from that point on, and its marker patterns cover every
+  // backend READER of stored text. Neither reaches a message already persisted in Amazon Chime SDK,
+  // and this parser is what the person re-opening that conversation sees. The reported leak
+  // ("...in this condensed 1-2 page report format.{MetadataMarkerFilter}") is exactly such a message.
+  //
+  // The filter NAME is the backend's (`backend/lib/config/guardrail-masks.ts`), duplicated here
+  // because a browser bundle cannot import from the CDK/Lambda tree. `guardrail-mask-parity.test.ts`
+  // reads that file and fails if the two ever disagree, which is the same shape the correlation-id
+  // pattern uses for its own copies.
+  //
+  // PII entity masks (`{EMAIL}`, `{PHONE}`) are deliberately NOT stripped: there the mask is the
+  // intended output and removing it would hide that a redaction happened.
+  content = content.replace(/\{MetadataMarkerFilter\}/g, '');
+
   // Clean up leading/trailing whitespace from stripping
   content = content.trim();
 
