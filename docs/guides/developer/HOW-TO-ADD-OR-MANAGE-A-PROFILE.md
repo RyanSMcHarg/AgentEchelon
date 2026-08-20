@@ -239,6 +239,51 @@ task. The declaration is an object rather than a flag so further references stay
 that already says `awaitsUser: true` keeps working and means the same thing, so a stored version and
 an exported manifest both still import.
 
+### What the runtime checks before it delivers, and every number you can change
+
+A state marked `delivers` does not simply hand its text over. The turn writes the document, checks it,
+corrects it if needed, and delivers what passes. Two kinds of check run:
+
+- **Against the agreement.** If the step's `requires` collected a length ("1-2 pages", "roughly
+  600-900 words"), the recorded answer lives in `task.details.requirements` and the document is
+  measured against it. Nothing recorded means nothing to enforce - `"as a table"` is a legitimate
+  answer to "the length or format" and names no size.
+- **Against being a document at all.** No opening greeting or self-announcement, no question or offer
+  put to the reader, no describing its own packaging. These need no agreement: a delivered file is
+  read later by someone who is not in the conversation it came from.
+
+A document that fails goes back to the model, up to three times, with the placeholder saying what is
+being fixed. **Every threshold in that paragraph is a constant with a reason, not a property of the
+design.** They are gathered here so you can change them deliberately:
+
+| Knob | Where | Today | What moving it costs |
+|---|---|---|---|
+| Correction passes | `MAX_CORRECTION_ROUNDS`, `assistant-async-processor.ts` | 3 | Each pass is a model call on the most expensive turn the platform runs. Raise it for stricter conformance, lower it for latency. |
+| Minimum artifact size | `assistant-async-processor.ts`, **two sites**: the task delivery gate and the ad-hoc "save this as a document" path | 400 chars | Below it, content posts inline instead of as a file. Raising it sends more short answers to chat; lowering it risks a one-sentence answer buried behind a download. Change both, or the two paths disagree about what is worth downloading - the ad-hoc path had no floor at all until a guardrail refusal was uploaded as somebody's table. |
+| Words per page | `WORDS_PER_PAGE_MIN` / `MAX`, `deliverable-check.ts` | 300-900 | A wide band on purpose: a page of tables carries far fewer words than a page of prose. Narrowing it catches more length misses and rewrites more documents that were fine. |
+| Content floor on a rewrite | `acceptCorrection`, `deliverable-check.ts` | 60% of the original | Stops a correction that deletes the document from being accepted. Raising it rejects legitimate tightening; lowering it re-opens the failure this exists for. |
+| Which requirement is the length | `assistant-async-processor.ts` | `/length\|format\|size\|pages?\|words?/i` | Matches the requirement NAME your machine declares. If you word yours differently ("how long"), either match this or widen the pattern. |
+| What counts as chat wrapper / reader question / file claim | `deliverable-check.ts` | three regexes | Deliberately narrow so ordinary prose survives. Add a rule when you find a shape that should not ship; each one applies to every delivering state in every machine. |
+
+**Two limits are worth knowing before you design around them, and neither is fundamental:**
+
+1. **At the correction bound, the best version is delivered anyway** and the shortfall is logged. The
+   reasoning is that a report the person can read beats a turn that never lands. If your deployment
+   would rather withhold a document that does not match, that is a change at the same place the bound
+   lives - stop assigning the corrected text and take the error path instead.
+2. **Completion is still the model's decision.** `advance_task_state` runs earlier in the same turn
+   than these checks, so the loop can correct a document but cannot un-declare a completion the model
+   already made. The delivering state's prompt says that delivering is not closing, and observed runs
+   hold at `generating`, but that is the model complying rather than the runtime enforcing. Making
+   completion conditional on the checks passing means moving the gate: hold the terminal transition
+   until the delivering checks pass, in the same way the recorded requirements moved the length
+   agreement out of prose and into data.
+
+Both of these, and the thresholds above, are per-platform constants today rather than per-deployment
+configuration. If a deployment needs its own values, the established seam is the one the rest of this
+guide uses: carry them in the versioned profile definition beside `machines`, so they travel with the
+profile and can be changed without a code deploy.
+
 ### Why the IAM role is not part of the profile
 
 The role is what makes the rest safe to edit at runtime. It grants `bedrock:InvokeModel` on the

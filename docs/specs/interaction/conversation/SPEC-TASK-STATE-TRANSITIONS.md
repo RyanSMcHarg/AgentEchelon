@@ -273,6 +273,14 @@ delivers?, prompt?, placeholder? }`):
   Wording and language changes remain the person's to ask for, through `revising` - the check is about
   whether the document is the one that was agreed, never about whether it is the one they wanted.
 
+  Every threshold in the above - the number of passes, the artifact floor, the words-per-page band,
+  the floor a rewrite must keep - is a constant with a stated reason rather than a property of the
+  design, and the two limits worth designing around (the bound delivers the best version, and
+  completion remains the model's call) are both movable. They are listed with their trade-offs, and
+  with what changing each one costs, in
+  [`HOW-TO-ADD-OR-MANAGE-A-PROFILE.md`](../../../guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md)
+  under "What the runtime checks before it delivers".
+
 ## 5. Proposals drive their own edges
 
 A step that proposes something to the person (`propose_item`, `place_item`) advances the machine as a
