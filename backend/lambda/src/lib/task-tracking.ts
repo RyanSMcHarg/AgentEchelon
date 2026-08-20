@@ -198,6 +198,16 @@ export function setTaskOwner(owner: TaskOwner): Pick<Task, 'ownerId' | 'ownerTyp
  */
 export const TASK_EXCERPT_MAX_CHARS = 200;
 
+/** One thing this task handed over: what it was, when, and the state it was produced from. */
+export interface TaskDelivery {
+  /** The file as the person sees it in the channel, or a short description when there is no file. */
+  name: string;
+  /** ISO timestamp of the hand-over. */
+  at: string;
+  /** The machine state that produced it, so a reader can tell a draft from a final. */
+  fromState?: string;
+}
+
 export interface Task {
   taskId: string;
   channelArn: string;
@@ -223,6 +233,20 @@ export interface Task {
    * force-advances, this is only a dashboard signal that the model is failing to drive the task.
    */
   turnsInState?: number;
+  /**
+   * WHAT THIS TASK HAS ALREADY HANDED OVER, append-only.
+   *
+   * A turn that produces a document uploads it, attaches it to a message, and remembers nothing. The
+   * next turn therefore has no idea the work was delivered - so an assistant asked "is this done?"
+   * cannot see that it already handed the person their report, and cannot decide whether the task
+   * should be closed. Reported live: a delivered report with its task still open, and the assistant
+   * unable to say either way.
+   *
+   * This is CONTEXT FOR THE MODEL, not a completion trigger. Completion keeps its single path - the
+   * model calls `advance_task_state` and the machine reaches terminal (invariant AT6). What was
+   * missing was never the authority to close a task, it was knowing there was anything to close.
+   */
+  deliveries?: TaskDelivery[];
   /**
    * The turn's correlation key - what ties this task to the rest of its turn's records. Always
    * present; derived when the caller cannot declare one.
@@ -1088,6 +1112,42 @@ export const TERMINAL_TASK_STATUS: Partial<Record<TaskStatus, TerminalKind>> = {
  * `by: 'system'` because this writer is not the model's `advance_task_state` call: it is the runtime
  * concluding the task, on a turn's completion or an error path.
  */
+/**
+ * Record that this task handed something over.
+ *
+ * Append-only via `list_append`, so two deliveries from one task both survive and a revision does not
+ * erase the draft it replaced. `if_not_exists` seeds the list, because a task written before this field
+ * existed has no attribute to append to.
+ *
+ * Best-effort by construction: the person already HAS the document by the time this runs, and losing a
+ * note about it must never cost them the delivery. A failure here degrades to the behaviour that
+ * shipped before - an assistant that cannot see what it handed over.
+ */
+export async function recordTaskDelivery(
+  taskId: string,
+  channelArn: string,
+  delivery: TaskDelivery,
+): Promise<void> {
+  if (!TASKS_TABLE) return;
+  try {
+    await dynamoClient.send(new UpdateCommand({
+      TableName: TASKS_TABLE,
+      Key: { taskId, channelArn },
+      UpdateExpression:
+        'SET deliveries = list_append(if_not_exists(deliveries, :empty), :d), #updatedAt = :now',
+      ExpressionAttributeNames: { '#updatedAt': 'updatedAt' },
+      ExpressionAttributeValues: {
+        ':empty': [],
+        ':d': [delivery],
+        ':now': new Date().toISOString(),
+      },
+      ConditionExpression: 'attribute_exists(taskId)',
+    }));
+  } catch (err) {
+    console.warn('[task-tracking] could not record a delivery (non-fatal):', err);
+  }
+}
+
 export async function updateTaskStatus(
   taskId: string,
   channelArn: string,
@@ -1200,6 +1260,63 @@ export function selectTasksToCancel(
  * user-tasks mirror too, so a cancelled task can't resurface via getActiveTask). Best-effort +
  * idempotent — a missing task is not an error. Returns the number cancelled.
  */
+/**
+ * Cancel ONE task in both tables: the task row and the per-user mirror.
+ *
+ * Extracted because a second caller appeared. The mirror matters as much as the row - `getActiveTask`
+ * reads it, so a task cancelled in one table and not the other comes back to life on the next turn,
+ * which is worse than never having cancelled it. Keeping that pairing in one place is the point.
+ */
+async function cancelOneTask(
+  task: { taskId: string; channelArn: string }
+    & Partial<Pick<Task, 'ownerId' | 'ownerType' | 'assignedBotArn' | 'assigneeUserSub' | 'userArn'>>,
+): Promise<void> {
+  await updateTaskStatus(task.taskId, task.channelArn, 'cancelled');
+  const userSub = resolveTaskOwner(task)?.id || '';
+  if (!USER_TASKS_TABLE || !userSub) return;
+  try {
+    await dynamoClient.send(new UpdateCommand({
+      TableName: USER_TASKS_TABLE,
+      Key: { userSub, taskId: task.taskId },
+      UpdateExpression: 'SET #s = :c, updatedAt = :now',
+      ExpressionAttributeNames: { '#s': 'status' },
+      ExpressionAttributeValues: { ':c': 'cancelled', ':now': new Date().toISOString() },
+    }));
+  } catch (e) {
+    console.warn('[task-tracking] user-task mirror cancel failed:', e);
+  }
+}
+
+/**
+ * STOP THE WORK IN THIS CONVERSATION - every active task this person holds here.
+ *
+ * The way out of a task that is not going anywhere, and the reason the runtime can safely decline to
+ * start a second turn on work it is already doing: a person who is told "I am still working on that"
+ * must have something to say when the answer is "no you are not". Without this, declining would make a
+ * stalled task unanswerable, which is a worse failure than the duplicate turn it prevents.
+ *
+ * Scoped to the CHANNEL and to the OWNER, so stopping work here never reaches into another
+ * conversation or cancels somebody else's task. Returns what it cancelled, so the reply can name it
+ * rather than claiming something vague happened.
+ */
+export async function cancelActiveTasksInChannel(
+  channelArn: string,
+  ownerId: string,
+): Promise<UserTask[]> {
+  if (!TASKS_TABLE || !channelArn || !ownerId) return [];
+  const cancelled: UserTask[] = [];
+  try {
+    const active = await getActiveTasksForOwnerInChannel(ownerId, channelArn);
+    for (const task of active) {
+      await cancelOneTask(task);
+      cancelled.push(task);
+    }
+  } catch (err) {
+    console.error('[task-tracking] cancelActiveTasksInChannel failed:', err);
+  }
+  return cancelled;
+}
+
 export async function cancelTasksForStop(contextId: string, itemId?: string): Promise<number> {
   if (!TASKS_TABLE || !contextId) return 0;
   let cancelled = 0;
@@ -1213,22 +1330,7 @@ export async function cancelTasksForStop(contextId: string, itemId?: string): Pr
     const tasks = (q.Items as Task[] | undefined) ?? [];
     const byId = new Map(tasks.map((t) => [t.taskId, t]));
     for (const id of selectTasksToCancel(tasks, itemId)) {
-      const t = byId.get(id)!;
-      await updateTaskStatus(id, t.channelArn, 'cancelled');
-      const userSub = resolveTaskOwner(t)?.id || '';
-      if (USER_TASKS_TABLE && userSub) {
-        try {
-          await dynamoClient.send(new UpdateCommand({
-            TableName: USER_TASKS_TABLE,
-            Key: { userSub, taskId: id },
-            UpdateExpression: 'SET #s = :c, updatedAt = :now',
-            ExpressionAttributeNames: { '#s': 'status' },
-            ExpressionAttributeValues: { ':c': 'cancelled', ':now': new Date().toISOString() },
-          }));
-        } catch (e) {
-          console.warn('[cancelTasksForStop] user-task mirror update failed:', e);
-        }
-      }
+      await cancelOneTask(byId.get(id)!);
       cancelled++;
     }
   } catch (err) {
@@ -1938,6 +2040,31 @@ already have, and do not restate the whole proposal back at them.
   // `delivers` flag the attachment gate reads, so a per-deployment machine that renames or adds a
   // delivering state carries the rule with it. The alternative - checking the finished reply for a
   // file claim - is the output-shape heuristic this codebase has already retired twice.
+  // WHAT THIS TASK HAS ALREADY HANDED OVER.
+  //
+  // A turn knew everything about the document it was writing and nothing about the one it wrote last
+  // time, so an assistant asked "is this task complete?" could not see that it had already delivered
+  // the report - and answered by starting the work again. The person watched a finished report sit
+  // next to an open work item while the assistant re-generated it.
+  //
+  // This is CONTEXT, not a trigger. It does not complete anything: it tells the model what happened so
+  // the model can make the call the machine requires (invariant AT6 - completion has one path, and this
+  // does not add a second one). An assistant that can see it delivered the report is in a position to
+  // close the task, or to say plainly that it already did the work.
+  const delivered = (task.deliveries ?? []).slice(-3);
+  const deliveredSoFar = delivered.length
+    ? `
+
+### ALREADY DELIVERED ON THIS TASK
+
+${delivered.map((d) => `- ${d.name} (${d.at}${d.fromState ? `, from ${d.fromState}` : ''})`).join('\n')}
+
+The person already has ${delivered.length === 1 ? 'this' : 'these'}. Do not produce it again unless they
+ask for a change. If the work is finished, say so and advance the task to its final state; if they are
+asking for a revision, advance to the revising step instead. If they are simply asking whether it is
+done, answer the question - the delivery above is the evidence.`
+    : '';
+
   const delivers = task.taskType && task.taskState
     ? machines[task.taskType]?.states?.[task.taskState]?.delivers
     : undefined;
@@ -1967,7 +2094,7 @@ downloadable file or as text in the conversation is decided after you answer.
 
 Type: ${task.taskType || 'general'}${stateLabel}
 Status: ${task.status}
-Original request: ${(task.requestExcerpt ?? task.userMessage)?.substring(0, TASK_EXCERPT_MAX_CHARS) ?? '(not recorded)'}${detailsStr}${sufficiency}${oneAnswer}${deliveryHonesty}
+Original request: ${(task.requestExcerpt ?? task.userMessage)?.substring(0, TASK_EXCERPT_MAX_CHARS) ?? '(not recorded)'}${detailsStr}${sufficiency}${oneAnswer}${deliveredSoFar}${deliveryHonesty}
 
 When responding, continue working on this task. Guide the user through the current step.
 If the user's message is off-topic, acknowledge it briefly and redirect back to the task.

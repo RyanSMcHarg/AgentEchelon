@@ -48,7 +48,7 @@ import {
   getQuickResponse,
   getTaskPlaceholder,
 } from './lib/delivery-options.js';
-import { applyUserResponseToTask, createTask, getActiveTask, getActiveTaskForOwner, getOwnerChannelTasks, getTask, principalIdFromArn, RECENTLY_ENDED_TASK_WINDOW_MINUTES, taskEndedAt, TRIP_TASK_TTL_SECONDS, type TaskCreateOptions, type UserTask } from './lib/task-tracking.js';
+import { applyUserResponseToTask, cancelActiveTasksInChannel, createTask, getActiveTask, getActiveTaskForOwner, getOwnerChannelTasks, getTask, principalIdFromArn, RECENTLY_ENDED_TASK_WINDOW_MINUTES, taskEndedAt, TRIP_TASK_TTL_SECONDS, type TaskCreateOptions, type UserTask } from './lib/task-tracking.js';
 
 /**
  * How long after a task ends the conversation is still treated as being about it, in milliseconds.
@@ -2146,7 +2146,6 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
                 messageId: inboundMessageId(event),
               });
               activeTask = mine;
-              resumedOwnChain = true;
               resumedWaitingWork = true;
               console.log('[Router] resuming the chain this assistant owns', {
                 taskId: mine.taskId, ...applied,
@@ -2157,6 +2156,40 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
               // deliberately not a second copy: one of the two paths having a resume and the other not
               // is exactly the defect that left both sides of a live duel parked forever.
               battleCtx = battleCtx ?? (await resumeDuelSideIfWaiting(channelArn, botArn)) ?? undefined;
+
+              // THE ANSWER/RECEIPT SPLIT NEEDS A PUBLIC TO SPLIT FOR, and this branch set it
+              // unconditionally.
+              //
+              // `broadcastAnswer` makes the turn post its answer as a NEW untargeted message and leave
+              // the private placeholder holding "Thanks - picking that back up. My answer is in the
+              // conversation." That is right in a room: the person targeted the assistant, so the reply
+              // Amazon Chime SDK posts is private, and burying a task result where only its sender can
+              // read it is the defect the split exists to fix.
+              //
+              // In a 1:1 there is nobody else to read it. The person gets their answer AND a note
+              // telling them the answer is somewhere else, which reads as the assistant replying to
+              // itself - and because that note is targeted, it latches the client's sticky target, so
+              // their next message goes out addressed rather than spoken to the room.
+              //
+              // The duel branch above already states this rule in its own comment ("an ordinary task
+              // continuation in a 1:1 has no public to broadcast to, and would gain only a receipt
+              // nobody needs") and scopes itself accordingly. This branch is that ordinary task
+              // continuation, and did not.
+              //
+              // A duel always broadcasts: it is a comparison, and a channel running one has two bots in
+              // it anyway. Unknown size resolves to "not 1:1", which keeps today's behaviour rather
+              // than inventing a new one on an unreadable read.
+              if (battleCtx) {
+                resumedOwnChain = true;
+              } else {
+                const size = await resolveChannelSize(chimeClient, channelArn, botArn);
+                resumedOwnChain = !size.isOneToOne;
+                if (size.isOneToOne) {
+                  console.log('[Router] 1:1 chain resume - answering in place, no receipt to split off', {
+                    taskId: mine.taskId,
+                  });
+                }
+              }
             }
           }
         }
@@ -2270,6 +2303,34 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
       recentlyEndedTaskInChannel: recentlyEndedWithinWindow,
     });
 
+    // `/stop` - CANCEL THE WORK IN THIS CONVERSATION, and it runs before everything below.
+    //
+    // A COMMAND, for the reasons `/battle end` is one: "stop" typed mid-sentence is ambiguous, a wrong
+    // guess throws away work the person wanted, and a decision that depends on recognising a phrase
+    // does not survive the conversation being held in another language (tenet 11). A literal token
+    // cannot be misread and reads the same everywhere.
+    //
+    // FIRST, because it is the escape hatch. The declining guard below tells people to send this, so
+    // it has to reach the runtime even when the assistant believes it owes them a step - anything that
+    // could swallow it would make the way out unreachable exactly when it is needed.
+    if (userMessage.trim().toLowerCase() === '/stop') {
+      const cancelled = await cancelActiveTasksInChannel(channelArn, userSub);
+      console.log('[Router] /stop cancelled the work in this conversation', {
+        channelArn, count: cancelled.length,
+      });
+      return formatLexResponse(
+        event,
+        [{
+          contentType: 'PlainText',
+          content: cancelled.length
+            ? `Stopped. I've cancelled ${cancelled.length === 1 ? 'that' : `those ${cancelled.length}`} `
+              + 'and will not carry on with it. Ask me again whenever you want to pick it back up.'
+            : "There's nothing in progress here to stop.",
+        }],
+        event.sessionState.sessionAttributes || {},
+      );
+    }
+
     const driftResponse = await runLiveDriftFlow({
       event,
       channelArn,
@@ -2289,6 +2350,43 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     });
     if (driftResponse) {
       return formatLexResponse(event, driftResponse.messages, driftResponse.sessionAttributes);
+    }
+
+    // ONE THREAD PER PIECE OF WORK (owner, 2026-08-20).
+    //
+    // Drift has already answered the question this depends on: it ran above and did not fire, so this
+    // message is about the work in hand rather than a new topic. What remains is whose turn it is, and
+    // the task already records that - a state that does not `await` the requester is one the ASSISTANT
+    // owes. A message arriving then is not input the task is waiting for; it is someone asking about
+    // work already under way.
+    //
+    // Starting a turn for it produced a second thread on one task: the person asked "is this task
+    // complete?", the runtime re-entered report generation, and they watched their finished report be
+    // written again. So the runtime declines, and says so.
+    //
+    // THE WAY OUT IS NAMED IN THE REPLY, and that is what makes declining safe. "The assistant owes the
+    // next step" is also true of a task that has stalled, so without an escape this would answer every
+    // message with the same sentence for ever. `/stop` cancels the work in this conversation; changing
+    // the subject also passes, because drift runs before this and returns first.
+    if (activeTask?.taskType && activeTask.taskState) {
+      const stateDef = taskStateMachines()[activeTask.taskType]?.states?.[activeTask.taskState];
+      const assistantOwesTheStep = Boolean(stateDef) && !awaitedPartyOf(stateDef);
+      if (assistantOwesTheStep) {
+        console.log('[Router] a turn is already owed on this task; declining to start a second', {
+          taskId: activeTask.taskId,
+          taskType: activeTask.taskType,
+          taskState: activeTask.taskState,
+        });
+        return formatLexResponse(
+          event,
+          [{
+            contentType: 'PlainText',
+            content: "I'm still working on that - I'll post it here when it's ready. Send `/stop` if you "
+              + 'want to cancel it, or ask me about something else and I will pick that up instead.',
+          }],
+          event.sessionState.sessionAttributes || {},
+        );
+      }
     }
 
     // BATTLE SIDE RESOLUTION, on the turn path (MESSAGE-FLOW §3.2, DESIGN-BATTLE §5a).

@@ -97,6 +97,7 @@ import {
   buildConversationTasksHint,
   getOpenTasksForConversation,
   updateTaskStatus,
+  recordTaskDelivery,
   type Task,
 } from './lib/task-tracking.js';
 import { resolveModelForIntent } from './lib/model-resolver.js';
@@ -1660,6 +1661,20 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
             response, event.channelArn, event.taskType || 'document', process.env.ATTACHMENTS_BUCKET,
           );
           console.log('[AssistantAsyncProcessor] Document generated:', attachment.fileKey);
+          // REMEMBER THAT IT WENT OUT, so the next turn knows this task has already handed something
+          // over. Without it a turn knows everything about the document it is writing and nothing
+          // about the one it wrote last time - which is how an assistant asked "is this task
+          // complete?" answered by starting the report again instead of looking at the one it had
+          // already delivered.
+          //
+          // A record, not a trigger: completion still happens only when the model advances the machine.
+          if (event.taskId) {
+            await recordTaskDelivery(event.taskId, event.channelArn, {
+              name: attachment.name || attachment.fileKey,
+              at: new Date().toISOString(),
+              fromState: taskContext?.task.taskState,
+            });
+          }
         } catch (docError) {
           console.error('[AssistantAsyncProcessor] Document generation failed:', docError);
         }
