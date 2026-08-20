@@ -254,9 +254,12 @@ The reason is measurement, not tidiness. Section 5b sets out what a battle resul
 scored as though it finished when it did not is worse than absent data, because absent data is visibly
 absent and a fabricated round points a recommendation the wrong way.
 
-The end state is also **visible**. A duel that was left shows that it was left, where its scorecard would
-have been; `BattleScorecard` and `BattleTallyBar` present no comparison for it. A silent gap invites the
-reader to assume a result they never got.
+**Not yet built: showing that a duel was left.** No comparison is presented for an abandoned duel, but
+only because none is produced - no round 2 means no scorecard payload, so `BattleScorecard` and
+`BattleTallyBar` render nothing. That is absence, not explanation, and no frontend code reads the
+`ABANDONED` state today. A person who walks away from a duel and comes back sees a gap where a result
+would have been, which invites them to assume a result they never got. Making the end state visible is
+outstanding work, not a property of what shipped.
 
 ## 2c. How far a duel still diverges from an ordinary turn
 
