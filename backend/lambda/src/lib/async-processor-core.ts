@@ -1724,7 +1724,17 @@ export async function invokeBedrock(
   // SPEC-TASK-STATE-TRANSITIONS §3: register advance_task_state only when a machine-backed task is
   // active (one fewer distractor tool off-task). The tool result is the ONLY thing that changes
   // task state — the loop authorizes it against the graph and persists in-loop.
-  const taskToolSpecs = taskContext ? taskToolSpecsFor(taskContext.task.taskType, taskContext.machines) : [];
+  // The STATE is passed so the tool can carry the step's declared needs and require an accounting for
+  // them (§4). `initialState` is the state the model saw when the turn began, which is the one whose
+  // needs it was answering - `task.taskState` can already have moved if the tool ran earlier in this
+  // same loop, and a tool spec that changed mid-loop would describe a step the model is no longer on.
+  const taskToolSpecs = taskContext
+    ? taskToolSpecsFor(
+      taskContext.task.taskType,
+      taskContext.machines,
+      taskContext.initialState ?? taskContext.task.taskState,
+    )
+    : [];
   // Combined tool surface: company-context + corporate-travel (both executed in-loop) + work-item tools
   // (intercepted as proposals, never executed here) + task tools. Each is gated by its RUNTIME availability
   // (companyToolOn / travelToolOn / enableEditTools / an active task).

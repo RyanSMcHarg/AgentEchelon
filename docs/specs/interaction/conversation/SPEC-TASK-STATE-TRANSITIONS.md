@@ -6,7 +6,11 @@
 `backend/test/lib/a-delivering-step-claims-no-file.test.ts`,
 `backend/test/lib/a-step-declares-who-it-awaits.test.ts`,
 `backend/test/lib/the-router-reads-either-wait-declaration.test.ts`,
-`backend/test/lib/step-needs-are-checked.test.ts`, `backend/test/lib/profile-manifest.test.ts`.
+`backend/test/lib/step-needs-are-checked.test.ts`, `backend/test/lib/profile-manifest.test.ts`,
+`backend/test/lib/a-step-records-what-it-was-told.test.ts` (the step's needs ride in the tool, and
+what the person answered is recorded on the task),
+`backend/test/lib/a-deliverable-is-checked-before-it-ships.test.ts` (the delivering turn's
+write-check-correct pass, against documents this deployment actually produced).
 
 **Coverage:** `tests/e2e/task-state-machine.spec.ts` - drives a machine-backed task through real turns and
 asserts the persisted `taskState` moves along declared edges rather than being inferred from the reply
@@ -211,11 +215,21 @@ delivers?, prompt?, placeholder? }`):
   next turn, and §8's single authorized path is then the only writer;
 - `requires: string[]` names WHAT the step needs from the person before the workflow can go on,
   in the person's vocabulary (it is read back to them when something is missing); the sufficiency
-  check is semantic and belongs to the model. Absent, any response is treated as sufficient. **The
-  runtime does not enforce it**: the list and the rule to ask for only what is missing are rendered
-  into the turn's prompt, `advance_task_state` never reads them (§3), and an advance with unmet needs
-  is authorized like any other legal edge. `requires` therefore names what the step needs and tells
-  the model to collect it; it does not gate the exit;
+  check is semantic and belongs to the model. Absent, any response is treated as sufficient.
+  **The step's needs ride in `advance_task_state` itself**: when the current state declares
+  `requires`, the tool's description names each one and its input schema requires a `collected`
+  accounting - the requirement text, and the value the person actually supplied. The sufficiency
+  judgement is still the model's, and the runtime still does not refuse an advance over unmet needs;
+  what changed is that the caller can no longer skip the question, because "I have all the data I
+  need" satisfied a free-text `reason` completely while the checklist rendered in the prompt was the
+  only thing asking.
+  **What the person answered is RECORDED**, merged into `task.details.requirements` on the
+  transition. That is what makes the answers usable rather than conversational: the length someone
+  asked for is agreed once, at the moment they confirm it, and every later reader - the delivery
+  check below, the revision branch, an audit of why a document looks the way it does - reads the same
+  value instead of re-deriving an agreement from prose in the transcript. A malformed accounting is
+  dropped rather than written, and never blocks the transition: the step advanced for real reasons,
+  and stranding a task over bookkeeping is the worse failure;
 - `prompt` and `placeholder` (optional) carry the state's system-prompt fragment and placeholder
   copy, making both pack-configurable and localizable;
 - `delivers: true` marks a state a document-producing workflow hands its file back from. The
@@ -237,6 +251,27 @@ delivers?, prompt?, placeholder? }`):
   read off the same `delivers` flag, so a per-deployment machine that renames or adds a delivering
   state carries the rule with it. The alternative - checking the finished reply for a file claim -
   is the output-shape heuristic this gate exists to keep out of the decision.
+
+  **And the rule is CHECKED, not merely stated.** That prompt rule shipped, and the next delivered
+  report still opened "Here's your report, `<name>` - delivered as a downloadable markdown document."
+  An instruction the model can ignore is not a control, and what noticed was an end-to-end test rather
+  than the runtime. So a delivering turn now writes, checks, and corrects before it hands anything
+  over (`lib/deliverable-check.ts`):
+  - the document must not open with a greeting or an announcement of itself, must not put a question
+    or an offer to the reader, and must not describe its own packaging. Those hold whatever was asked
+    for: a delivered file is read later, by someone who is not in the conversation it came from, and a
+    greeting addressed to a name at a moment that has passed is noise to them;
+  - its LENGTH is compared against the requirement the step recorded when the person confirmed it
+    (`details.requirements`). Nothing recorded means nothing to enforce - an absent agreement is not a
+    violation, and "as a table" is a legitimate answer to "the length or format" that names no size;
+  - a failing document goes back to the model ONCE, with the specific faults and an instruction to
+    return the corrected document alone. If that rewrite comes back empty, or still fails, the
+    original is delivered: a flawed document the person can read beats a corrective loop they are
+    waiting on. A second model call on every delivery would double the cost of the most expensive turn
+    the platform runs to fix nothing on the deliveries that were already right.
+
+  Wording and language changes remain the person's to ask for, through `revising` - the check is about
+  whether the document is the one that was agreed, never about whether it is the one they wanted.
 
 ## 5. Proposals drive their own edges
 

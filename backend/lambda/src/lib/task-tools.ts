@@ -77,9 +77,80 @@ export function taskHasMachine(
 export function taskToolSpecsFor(
   taskType: string | undefined,
   machines: Record<string, TaskStateMachine> = DEFAULT_TASK_STATE_MACHINES,
+  currentState?: string,
 ): Array<typeof ADVANCE_TASK_STATE_TOOL_SPEC> {
   if (!taskHasMachine(taskType, machines)) return [];
-  return [ADVANCE_TASK_STATE_TOOL_SPEC];
+
+  // THE STEP'S DECLARED NEEDS RIDE IN THE TOOL ITSELF when it has any (SPEC-TASK-STATE-TRANSITIONS
+  // §4). Until now the tool was STATE-BLIND: its inputs were `to_state` and a free-text `reason`, and
+  // its description said nothing about what the current step needs - so "I have all the data I need"
+  // satisfied `reason` completely, and the checklist rendered in the prompt was the only thing asking.
+  // A checklist the caller never has to answer is a checklist the caller can skip.
+  //
+  // AND THE ANSWERS ARE RECORDED, which is the half that makes this more than a nag. `collected`
+  // becomes `task.details.requirements`, so what the person actually said - the audience, the length -
+  // is agreed ONCE and readable afterwards by every consumer: the delivering check that compares the
+  // document against it, the revision branch, and anyone auditing why a document looks the way it
+  // does. The alternative is re-deriving the agreement from prose on every read, which makes a
+  // contract out of a sentence someone happened to type.
+  const requires = currentState
+    ? machines[taskType as string]?.states?.[currentState]?.requires
+    : undefined;
+  if (!requires?.length) return [ADVANCE_TASK_STATE_TOOL_SPEC];
+
+  const list = requires.map((r) => `"${r}"`).join(', ');
+  return [{
+    toolSpec: {
+      ...ADVANCE_TASK_STATE_TOOL_SPEC.toolSpec,
+      description:
+        `${ADVANCE_TASK_STATE_TOOL_SPEC.toolSpec.description} This step needs ${list}. Account for `
+        + 'each one in `collected`, copying the requirement text verbatim and giving the value the '
+        + 'person actually supplied. If something is still missing, do not call this tool - ask them '
+        + 'for the missing part instead.',
+      inputSchema: {
+        json: {
+          ...ADVANCE_TASK_STATE_TOOL_SPEC.toolSpec.inputSchema.json,
+          properties: {
+            ...ADVANCE_TASK_STATE_TOOL_SPEC.toolSpec.inputSchema.json.properties,
+            collected: {
+              type: 'array',
+              description: `What the person gave for each of this step's needs (${list}).`,
+              items: {
+                type: 'object',
+                properties: {
+                  requirement: { type: 'string', description: 'The requirement text, copied verbatim.' },
+                  value: { type: 'string', description: 'What the person actually said for it.' },
+                },
+                required: ['requirement', 'value'],
+              },
+            },
+          },
+          required: [...ADVANCE_TASK_STATE_TOOL_SPEC.toolSpec.inputSchema.json.required, 'collected'],
+        },
+      },
+    },
+  } as unknown as typeof ADVANCE_TASK_STATE_TOOL_SPEC];
+}
+
+/**
+ * The `collected` tool input, as the map recorded on the task.
+ *
+ * Tolerant of shape because a model supplies it: a non-array, a non-object entry, or a blank
+ * requirement/value is dropped rather than written. A malformed accounting is worth less than a
+ * correct one and is worth more than a rejected transition - the step still advanced for real
+ * reasons, and refusing it here would strand the task over bookkeeping.
+ */
+export function collectedRequirements(input: unknown): Record<string, string> | undefined {
+  if (!Array.isArray(input)) return undefined;
+  const out: Record<string, string> = {};
+  for (const entry of input) {
+    if (!entry || typeof entry !== 'object') continue;
+    const { requirement, value } = entry as Record<string, unknown>;
+    if (typeof requirement !== 'string' || typeof value !== 'string') continue;
+    if (!requirement.trim() || !value.trim()) continue;
+    out[requirement.trim()] = value.trim();
+  }
+  return Object.keys(out).length ? out : undefined;
 }
 
 /**
@@ -108,6 +179,12 @@ export async function handleAdvanceTaskStateTool(args: {
     };
   }
 
+  // RECORDED ON THE TRANSITION, not on the turn: the values belong to the step the person answered,
+  // and `advanceTaskStateTo` merges them into `task.details` so a later step cannot lose an earlier
+  // one's answers. Written under `requirements` so the map is addressable rather than spread across
+  // details' top level, where a state-specific key could collide with it.
+  const collected = collectedRequirements(args.input.collected);
+
   const result = await advanceTaskStateTo({
     task: args.task,
     toState,
@@ -115,6 +192,9 @@ export async function handleAdvanceTaskStateTool(args: {
     reason,
     messageId: args.messageId,
     machines: args.machines ?? DEFAULT_TASK_STATE_MACHINES,
+    ...(collected
+      ? { details: { requirements: { ...(args.task.details?.requirements as Record<string, string> ?? {}), ...collected } } }
+      : {}),
     ...(args.assistantId ? { assistantId: args.assistantId } : {}),
   });
 

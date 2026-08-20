@@ -37,6 +37,7 @@ import {
   finalizePlaceholderResponse,
   generateAndUploadDocument,
   isDocumentRequest,
+  updateMessage,
   isDeliverableDocument,
   getTaskLabel,
   applyInputGuardrail,
@@ -102,6 +103,14 @@ import { resolveModelForIntent } from './lib/model-resolver.js';
 import { clampResponseMaxTokens, taskStateMachines } from './lib/intent-pack.js';
 import { legalTransitionsFrom } from './lib/task-state-machines.js';
 import { taskHasMachine } from './lib/task-tools.js';
+import {
+  acceptCorrection,
+  correctionInstruction,
+  correctionProgressLine,
+  deliverableIssues,
+  documentWordCount,
+  parseLengthTarget,
+} from './lib/deliverable-check.js';
 import { getModelCatalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION, bedrockInvokeId } from '../../lib/config/model-strategy.js';
 import { resolveActiveProfile, resolveFromDefinition, buildIntentStrategy } from './lib/active-profile.js';
 import { hydrateBodies } from './lib/profile-bodies.js';
@@ -1383,7 +1392,9 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
     // Strip any leaked reasoning scaffolding (`<thinking>…</thinking>`, `<result>` wrappers) the model
     // sometimes emits in its FINAL answer — never intended for the human, and it also poisons the
     // generated report file if left in. Not a control marker, so stripMessageMarkers wouldn't catch it.
-    const response = stripReasoningTags(
+    // `let`, because a delivering turn may CORRECT this once before it is delivered (the deliverable
+    // check below). Nothing else reassigns it.
+    let response = stripReasoningTags(
       event.domainContext ? extractSuggestions(bedrockResult.response) : bedrockResult.response,
     );
 
@@ -1498,6 +1509,147 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
         && event.battleContext?.round === 1
         && event.taskType === 'report_generation') {
         generate = true;
+      }
+
+      // A BLOCKED TURN HAS NOTHING TO DELIVER, and this is where that stopped being obvious. The
+      // ad-hoc document path keys on the PERSON's words ("give it to me as a downloadable table"), not
+      // on what came back, and it carries no artifact floor - so when the guardrail blocked the turn,
+      // the 60-character refusal ("I cannot process that request. Please rephrase your message.") was
+      // uploaded as the downloadable table they asked for. Measured live: an e2e downloaded it and
+      // found a 60-byte document.
+      //
+      // TWO GUARDS, AND NEITHER READS THE TEXT'S SHAPE. The block-copy recogniser in
+      // `async-processor-core` looks made for this, and `guardrail-block-is-not-an-answer.test.ts`
+      // pins that this file must NOT call it - a deployment with custom `blockedInputMessaging` never
+      // matches the English prefix, so a text-shape test would protect the default deployment and
+      // silently fail every other one. The structural fact rides the invoke result instead. (That test
+      // asserts on this file's SOURCE, so naming the function even in a comment trips it, which is how
+      // this comment came to describe it rather than name it.)
+      //
+      // The floor is the second guard and the language-neutral one: the ad-hoc path had no minimum at
+      // all, while the task path has required 400 characters since the delivery contract landed. A
+      // document worth downloading is not 60 bytes in any language, whatever produced it.
+      if (generate && bedrockResult.inputGuardBlocked) {
+        console.warn('[AssistantAsyncProcessor] guardrail-blocked turn: no document is generated', {
+          taskId: event.taskId, taskType: event.taskType,
+        });
+        generate = false;
+      }
+      if (generate && response.trim().length < 400) {
+        console.warn('[AssistantAsyncProcessor] reply is below the minimum artifact size; posting inline', {
+          taskId: event.taskId, taskType: event.taskType, length: response.trim().length,
+        });
+        generate = false;
+      }
+
+      // WRITE, CHECK, CORRECT - then deliver (owner, 2026-08-20). The loop has just written a
+      // document and is about to hand it over; this is the last point at which it is still ours to
+      // fix, and the only point at which the finished text exists.
+      //
+      // WHY IT IS A CHECK AND NOT A PROMPT LINE. The delivering prompt has told the model not to claim
+      // a saved file since this branch's first deploy, and the report that arrived still opened
+      // "Here's your report, <name> - delivered as a downloadable markdown document." An instruction
+      // the model can ignore is not a control, and the e2e - not the runtime - is what noticed.
+      //
+      // The length half compares against what the person AGREED to, read from the requirements the
+      // step recorded when they confirmed them. Nothing recorded means nothing to enforce.
+      //
+      // IT ITERATES UNTIL THE DOCUMENT MATCHES, and the person watches it happen. A single silent pass
+      // was the first shape and it was wrong in both directions: a document still off after one try was
+      // delivered anyway, and the person saw a placeholder sit unchanged through a model call that
+      // never announced itself. A report agreed at one length and delivered at another is not the
+      // report they agreed to, and the turn is not finished until it matches.
+      //
+      // BOUNDED, because a loop that cannot end is worse than a document that is slightly long: each
+      // pass costs a model call on the most expensive turn the platform runs. When the bound is reached
+      // the best version still goes out - the person gets their report, and the shortfall is in the log
+      // rather than in a turn that never lands.
+      const MAX_CORRECTION_ROUNDS = 3;
+      if (generate && event.taskId) {
+        const recorded = (taskContext?.task.details?.requirements ?? {}) as Record<string, unknown>;
+        const lengthValue = Object.entries(recorded)
+          .find(([k]) => /length|format|size|pages?|words?/i.test(k))?.[1];
+        const target = parseLengthTarget(lengthValue);
+        let issues = deliverableIssues(response, target);
+        if (issues.length > 0) {
+          console.log('[AssistantAsyncProcessor] deliverable check found issues; correcting', {
+            taskId: event.taskId,
+            kinds: issues.map((i) => i.kind),
+            words: documentWordCount(response),
+            agreed: target ? `${target.minWords}-${target.maxWords} (${target.source})` : 'not recorded',
+          });
+        }
+        for (let round = 1; issues.length > 0 && round <= MAX_CORRECTION_ROUNDS; round += 1) {
+          try {
+            // THE PLACEHOLDER SAYS WHAT IS HAPPENING. `interim` deliberately, never `final`: this
+            // update must not close the turn or freeze the completion instant - the answer has not
+            // been delivered yet. Best-effort, because failing to narrate is not a reason to stop
+            // fixing.
+            if (messageId) {
+              await updateMessage(
+                event.channelArn, messageId, correctionProgressLine(issues, target), event.botArn, 'interim',
+              ).catch((err: unknown) => console.warn('[AssistantAsyncProcessor] progress update failed:', err));
+            }
+            // The SAME resilient path every other model call here takes, so a corrective turn degrades
+            // to the fallback model rather than throwing away a document over a throttle.
+            // THE TURN'S OWN RESOLVED CONFIG, not the profile default. `CONFIG.model` is a bare model
+            // id, and this deployment's premium model has no on-demand throughput under one: the call
+            // failed with "Invocation of model ID ... with on-demand throughput isn't supported. Retry
+            // with the ID or ARN of an inference profile". `invokeConfig` is what the turn itself was
+            // invoked with, so the correction runs on the same model, with the same fallback, and
+            // cannot drift from the turn that produced the document.
+            const corrected = await invokeBedrockWithFallback(
+              'You are editing a document that is about to be delivered. Return only the corrected '
+                + 'document.',
+              [{ role: 'user', content: correctionInstruction(issues, response) }],
+              invokeConfig,
+              resolution.fallbackModelId,
+            );
+            const rewritten = (corrected.response || '').trim();
+            const remaining = rewritten ? deliverableIssues(rewritten, target) : issues;
+            const verdict = acceptCorrection({
+              original: response,
+              rewritten,
+              issuesBefore: issues,
+              issuesAfter: remaining,
+              target,
+              blocked: corrected.inputGuardBlocked,
+            });
+            if (verdict.accept) {
+              console.log('[AssistantAsyncProcessor] deliverable corrected', {
+                taskId: event.taskId,
+                round,
+                before: issues.map((i) => i.kind),
+                after: remaining.map((i) => i.kind),
+                detail: verdict.reason,
+              });
+              response = rewritten;
+              issues = remaining;
+            } else {
+              // A REJECTED REWRITE ENDS THE LOOP rather than feeding it. The rejections are a blocked
+              // corrective turn, an empty answer, and one that gutted the document - none of which
+              // another identical pass would fix, and each retry is a model call.
+              console.warn('[AssistantAsyncProcessor] correction rejected; keeping the best version', {
+                taskId: event.taskId, round, reason: verdict.reason, remaining: remaining.map((i) => i.kind),
+              });
+              break;
+            }
+          } catch (err) {
+            console.warn('[AssistantAsyncProcessor] deliverable correction failed (keeping the best version):', err);
+            break;
+          }
+        }
+        if (issues.length > 0) {
+          // VISIBLE, not silent. The document goes out because a report the person can read beats a
+          // turn that never lands, but a delivery that did not meet what was agreed is a fact somebody
+          // should be able to find afterwards.
+          console.warn('[AssistantAsyncProcessor] delivering a document that still does not match', {
+            taskId: event.taskId,
+            remaining: issues.map((i) => i.kind),
+            words: documentWordCount(response),
+            agreed: target ? `${target.minWords}-${target.maxWords} (${target.source})` : 'not recorded',
+          });
+        }
       }
 
       if (generate) {
