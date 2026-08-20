@@ -1299,15 +1299,21 @@ async function cancelOneTask(
  * conversation or cancels somebody else's task. Returns what it cancelled, so the reply can name it
  * rather than claiming something vague happened.
  */
-export async function cancelActiveTasksInChannel(
-  channelArn: string,
-  ownerId: string,
-): Promise<UserTask[]> {
-  if (!TASKS_TABLE || !channelArn || !ownerId) return [];
-  const cancelled: UserTask[] = [];
+export async function cancelActiveTasksInChannel(channelArn: string): Promise<ConversationTask[]> {
+  if (!TASKS_TABLE || !channelArn) return [];
+  const cancelled: ConversationTask[] = [];
   try {
-    const active = await getActiveTasksForOwnerInChannel(ownerId, channelArn);
-    for (const task of active) {
+    // BY CHANNEL, NOT BY OWNER, and the first version got this wrong in a way that mattered.
+    //
+    // It looked up the tasks the PERSON owned - and by the time somebody needs to stop the work, they
+    // do not own it. Their answer handed the task to the assistant (`applyUserResponseToTask` ->
+    // `reassignTask`), which is the whole reason the runtime knows a turn is owed. So an owner-scoped
+    // stop found nothing, cancelled nothing, and told the person there was nothing in progress - while
+    // the task it could not see went on holding the conversation.
+    //
+    // The stop is about the CONVERSATION: it ends the work happening here, whoever is holding it.
+    const open = await getOpenTasksForConversation(channelArn, { limit: 25 });
+    for (const task of open) {
       await cancelOneTask(task);
       cancelled.push(task);
     }

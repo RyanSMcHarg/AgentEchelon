@@ -2314,7 +2314,7 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
     // it has to reach the runtime even when the assistant believes it owes them a step - anything that
     // could swallow it would make the way out unreachable exactly when it is needed.
     if (userMessage.trim().toLowerCase() === '/stop') {
-      const cancelled = await cancelActiveTasksInChannel(channelArn, userSub);
+      const cancelled = await cancelActiveTasksInChannel(channelArn);
       console.log('[Router] /stop cancelled the work in this conversation', {
         channelArn, count: cancelled.length,
       });
