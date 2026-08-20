@@ -30,7 +30,15 @@ anchor AS (
 ),
 -- One assistant response within a turn.
 resp AS (
-    SELECT MAX(turn_id) AS turn_id,
+    -- THE CAST IS LOAD-BEARING, exactly as 026's `channel_arn::text` is, and for the same reason one
+    -- column over. `max(varchar)` returns TEXT, while 026 selected the bare `turn_id` column, so the
+    -- deployed view's `turn_id` is `varchar(64)` - and `CREATE OR REPLACE VIEW` refuses to change a
+    -- column's type. Without this relabel the migration fails with "cannot change data type of view
+    -- column turn_id from character varying(64) to text", and because every pending migration shares
+    -- ONE transaction, that failure takes 028 and 029 down with it, leaves `schemaInitialized` false,
+    -- and rethrows on every data-plane invocation. Measured live: the whole data plane errored on
+    -- every turn until this was relabeled.
+    SELECT MAX(turn_id)::VARCHAR(64) AS turn_id,
            response_id,
            channel_arn::text AS channel_arn,
            MIN(occurred_at) FILTER (WHERE kind = 'placeholder_posted')     AS t2_placeholder_at,
