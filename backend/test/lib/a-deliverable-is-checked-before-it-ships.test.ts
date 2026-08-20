@@ -14,7 +14,7 @@ import {
   correctionProgressLine,
   deliverableIssues,
   documentWordCount,
-  parseLengthTarget,
+  recordedLengthTarget,
 } from '../../lambda/src/lib/deliverable-check';
 
 /** The extraction that shipped with a chat wrapper around real data (live, 2026-08-20). */
@@ -48,41 +48,32 @@ const CLEAN_EXTRACTION = `# Enterprise Accounts — Churn Risk
 immediate attention: Coastal Health is actively evaluating alternatives, and Precision Analytics lost
 its internal champion.`;
 
-describe('what the person agreed to, read from the recorded requirement', () => {
+describe('the agreed size is read as numbers, never parsed out of prose', () => {
+  // The model resolves "1-2 pages" to a range when it RECORDS the requirement, so this reader only
+  // validates. The regex parser that used to live here is gone: it put the runtime back to guessing at
+  // English one layer below where the agreement had just been moved out of prose.
+  it('reads a recorded range', () => {
+    const t = recordedLengthTarget({ lengthTarget: { minWords: 600, maxWords: 900, source: '1-2 pages' } });
+    expect(t).toEqual({ minWords: 600, maxWords: 900, source: '1-2 pages' });
+  });
+
+  it('falls back to naming the range when the model recorded no source phrase', () => {
+    expect(recordedLengthTarget({ lengthTarget: { minWords: 600, maxWords: 900 } })?.source)
+      .toBe('600-900 words');
+  });
+
+  // HALF AN AGREEMENT IS NOT AN AGREEMENT. A minimum alone admits a document ten times what was asked
+  // for; a maximum alone admits an empty one. Each of these is treated as no agreement at all.
   it.each([
-    ['1-2 pages', 300, 1800],
-    ['1–2 pages', 300, 1800],
-    ['2 to 3 pages', 600, 2700],
-    ['one page', 300, 900],
-    ['roughly 600-900 words', 600, 900],
-    ['about 800 words', 480, 1280],
-  ])('reads %s as %i-%i words', (recorded: string, min: number, max: number) => {
-    const t = parseLengthTarget(recorded);
-    expect(t).not.toBeNull();
-    expect(t!.minWords).toBe(min);
-    expect(t!.maxWords).toBe(max);
-  });
-
-  // A WORD range beats a page range in the same answer: that conversion is the assistant's own and is
-  // more precise than ours.
-  it('prefers a stated word range over the pages beside it', () => {
-    const t = parseLengthTarget('1-2 pages (roughly 600-900 words)')!;
-    expect(t.minWords).toBe(600);
-    expect(t.maxWords).toBe(900);
-  });
-
-  // "the length or format" is one requirement, and a person may answer only the format half. That is a
-  // legitimate answer, not a violation, so there is simply nothing to enforce.
-  it.each([['as a markdown table'], ['whatever you think is best'], [''], ['a table']])(
-    'finds no size in %s, so length is not enforced',
-    (recorded: string) => {
-      expect(parseLengthTarget(recorded)).toBeNull();
-    },
-  );
-
-  it('ignores a non-string recorded value rather than guessing', () => {
-    expect(parseLengthTarget(undefined)).toBeNull();
-    expect(parseLengthTarget(42)).toBeNull();
+    ['no details at all', undefined],
+    ['no lengthTarget', {}],
+    ['a minimum only', { lengthTarget: { minWords: 600 } }],
+    ['a maximum only', { lengthTarget: { maxWords: 900 } }],
+    ['non-numeric bounds', { lengthTarget: { minWords: '600', maxWords: '900' } }],
+    ['a reversed pair', { lengthTarget: { minWords: 900, maxWords: 600 } }],
+    ['a zero minimum', { lengthTarget: { minWords: 0, maxWords: 900 } }],
+  ])('treats %s as nothing to enforce', (_label: string, details: unknown) => {
+    expect(recordedLengthTarget(details)).toBeNull();
   });
 });
 
@@ -117,7 +108,7 @@ describe('the checks, against documents this deployment actually produced', () =
 });
 
 describe('length is enforced only against a recorded agreement', () => {
-  const target = parseLengthTarget('roughly 600-900 words')!;
+  const target = ({ minWords: 600, maxWords: 900, source: 'roughly 600-900 words' });
 
   it('flags a document a fraction of what was agreed', () => {
     const stub = `# Report\n\n${'word '.repeat(200)}`;
@@ -146,7 +137,7 @@ describe('length is enforced only against a recorded agreement', () => {
 });
 
 describe('the correction instruction asks for a document, not a conversation about one', () => {
-  const issues = deliverableIssues(WRAPPED_EXTRACTION, parseLengthTarget('600-900 words'));
+  const issues = deliverableIssues(WRAPPED_EXTRACTION, ({ minWords: 600, maxWords: 900, source: '600-900 words' }));
   const instruction = correctionInstruction(issues, WRAPPED_EXTRACTION);
 
   it('names every issue it found', () => {
@@ -229,7 +220,7 @@ describe('a rewrite is accepted only if it is better AND still the document', ()
   // SHRINKING IS THE CORRECTION when the document was too long, so the 60% floor would refuse the very
   // fix it asked for. There the floor becomes the length the person agreed to.
   it('allows a too-long document to shrink to the agreed minimum', () => {
-    const target = parseLengthTarget('roughly 600-900 words')!;
+    const target = ({ minWords: 600, maxWords: 900, source: 'roughly 600-900 words' });
     const long = `# Report\n\n${'word '.repeat(2000)}`;
     const trimmed = `# Report\n\n${'word '.repeat(700)}`;
     const v = acceptCorrection({
@@ -243,7 +234,7 @@ describe('a rewrite is accepted only if it is better AND still the document', ()
   });
 
   it('still refuses a too-long document shrunk below what was agreed', () => {
-    const target = parseLengthTarget('roughly 600-900 words')!;
+    const target = ({ minWords: 600, maxWords: 900, source: 'roughly 600-900 words' });
     const long = `# Report\n\n${'word '.repeat(2000)}`;
     const gutted = `# Report\n\n${'word '.repeat(80)}`;
     const v = acceptCorrection({
@@ -266,7 +257,7 @@ describe('a rewrite is accepted only if it is better AND still the document', ()
  * two pages can tell which one they are owed.
  */
 describe('the progress line names the work, not the machinery', () => {
-  const target = parseLengthTarget('1-2 pages')!;
+  const target = ({ minWords: 300, maxWords: 1800, source: '1-2 pages' });
 
   it('says it is trimming when the document ran long', () => {
     const line = correctionProgressLine([{ kind: 'too_long', fix: 'x' }], target);

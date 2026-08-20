@@ -64,8 +64,10 @@ describe('the answers are read tolerantly, because a model supplies them', () =>
       { requirement: 'the audience', value: 'engineering leadership' },
       { requirement: 'the length or format', value: '1-2 pages' },
     ])).toEqual({
-      'the audience': 'engineering leadership',
-      'the length or format': '1-2 pages',
+      requirements: {
+        'the audience': 'engineering leadership',
+        'the length or format': '1-2 pages',
+      },
     });
   });
 
@@ -85,11 +87,86 @@ describe('the answers are read tolerantly, because a model supplies them', () =>
     expect(collectedRequirements([
       { requirement: 'the audience', value: 'the board' },
       { requirement: 'the subject', value: 42 },
-    ])).toEqual({ 'the audience': 'the board' });
+    ])).toEqual({ requirements: { 'the audience': 'the board' } });
   });
 
   it('trims, so a copied requirement with stray whitespace still matches its declaration', () => {
     expect(collectedRequirements([{ requirement: '  the audience  ', value: '  the board  ' }]))
-      .toEqual({ 'the audience': 'the board' });
+      .toEqual({ requirements: { 'the audience': 'the board' } });
+  });
+});
+
+/**
+ * THE SIZE IS RECORDED AS NUMBERS, BY THE COMPONENT THAT UNDERSTANDS THE SENTENCE.
+ *
+ * The first version stored the person's words ("1-2 pages") and had the delivering check regex them
+ * into a range at read time. That is the same defect one layer down from the one this whole row fixed:
+ * an agreement moved out of the transcript, then written back as prose and re-interpreted by a pattern.
+ * A person says "a page or two", "keep it short", "two pages max" - turning any of those into a number
+ * is language work, and the model recording the requirement is the only component that saw the
+ * sentence in context. It resolves the range once; every reader afterwards gets numbers.
+ */
+describe('a size is recorded as a range, not as a sentence to be parsed later', () => {
+  it('carries the model-resolved bounds alongside what the person said', () => {
+    expect(collectedRequirements([
+      { requirement: 'the audience', value: 'engineering leadership' },
+      { requirement: 'the length or format', value: '1-2 pages', minWords: 600, maxWords: 900 },
+    ])).toEqual({
+      requirements: {
+        'the audience': 'engineering leadership',
+        'the length or format': '1-2 pages',
+      },
+      lengthTarget: { minWords: 600, maxWords: 900, source: '1-2 pages' },
+    });
+  });
+
+  it('records no size when the answer named none, which is a real answer', () => {
+    const out = collectedRequirements([{ requirement: 'the length or format', value: 'as a table' }]);
+    expect(out?.requirements).toEqual({ 'the length or format': 'as a table' });
+    expect(out?.lengthTarget).toBeUndefined();
+  });
+
+  // HALF AN AGREEMENT IS NOT AN AGREEMENT: a minimum alone admits a document ten times the size asked
+  // for, a maximum alone admits an empty one, and a reversed pair is noise a model produced.
+  it.each([
+    ['a minimum only', { minWords: 600 }],
+    ['a maximum only', { maxWords: 900 }],
+    ['a reversed pair', { minWords: 900, maxWords: 600 }],
+    ['a zero minimum', { minWords: 0, maxWords: 900 }],
+    ['non-numeric bounds', { minWords: '600', maxWords: '900' }],
+  ])('discards %s rather than half-enforcing it', (_label: string, bounds: object) => {
+    const out = collectedRequirements([{ requirement: 'the length or format', value: 'x', ...bounds }]);
+    expect(out?.lengthTarget).toBeUndefined();
+    // The VALUE still records: what the person said is worth keeping even when the numbers are not.
+    expect(out?.requirements).toEqual({ 'the length or format': 'x' });
+  });
+
+  it('takes the FIRST size when a model marks two, rather than picking by an undeclared rule', () => {
+    const out = collectedRequirements([
+      { requirement: 'the length or format', value: '1-2 pages', minWords: 600, maxWords: 900 },
+      { requirement: 'the summary length', value: 'half a page', minWords: 150, maxWords: 450 },
+    ]);
+    expect(out?.lengthTarget).toEqual({ minWords: 600, maxWords: 900, source: '1-2 pages' });
+  });
+
+  it('rounds a fractional bound rather than storing it', () => {
+    const out = collectedRequirements([
+      { requirement: 'the length', value: 'about a page', minWords: 299.6, maxWords: 900.4 },
+    ]);
+    expect(out?.lengthTarget).toEqual({ minWords: 300, maxWords: 900, source: 'about a page' });
+  });
+
+  // The tool has to ASK for the numbers, or the model has no reason to supply them.
+  it('the tool schema asks the model for the bounds, and does not require them', () => {
+    const [spec] = taskToolSpecsFor('report_generation', DEFAULT_TASK_STATE_MACHINES, 'collecting_requirements');
+    const items = (spec.toolSpec.inputSchema.json as unknown as {
+      properties: { collected: { items: { properties: Record<string, { description?: string }>; required: string[] } } };
+    }).properties.collected.items;
+
+    expect(items.properties.minWords).toBeDefined();
+    expect(items.properties.maxWords).toBeDefined();
+    expect(items.properties.minWords.description).toMatch(/only when this requirement fixes a SIZE/i);
+    // Optional: a requirement that names no size must not force the model to invent one.
+    expect(items.required).toEqual(['requirement', 'value']);
   });
 });

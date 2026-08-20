@@ -22,6 +22,9 @@ const GUIDE = fs.readFileSync(
 const PROCESSOR = fs.readFileSync(
   path.join(__dirname, '../lambda/src/assistant-async-processor.ts'), 'utf8',
 );
+const TOOLS = fs.readFileSync(
+  path.join(__dirname, '../lambda/src/lib/task-tools.ts'), 'utf8',
+);
 const CHECK = fs.readFileSync(
   path.join(__dirname, '../lambda/src/lib/deliverable-check.ts'), 'utf8',
 );
@@ -52,10 +55,17 @@ describe('the delivery knobs the guide documents are the ones the code uses', ()
     expect(section).toMatch(/two sites/i);
   });
 
-  it('words per page: the guide says 300-900 and the constants agree', () => {
-    expect(section).toMatch(/300-900/);
-    expect(CHECK).toMatch(/const WORDS_PER_PAGE_MIN = 300;/);
-    expect(CHECK).toMatch(/const WORDS_PER_PAGE_MAX = 900;/);
+  it('words a page is worth: the guide quotes the guidance the tool schema actually gives', () => {
+    // NOT a constant any more, and the guide says so. The model converts pages to words when it
+    // records the requirement, so what to change is the sentence it converts BY - the schema's own
+    // description - not a number in the reader.
+    expect(section).toMatch(/roughly 300-900 words/);
+    // Matched in fragments: the description is assembled from concatenated string literals in the
+    // source, so the whole sentence never appears on one line to match against.
+    expect(TOOLS).toMatch(/A page is roughly 300-900 words/);
+    expect(TOOLS).toMatch(/depending on how much of it is tables and lists/);
+    // And the constant it replaced is gone, so nothing converts pages to words a second way.
+    expect(CHECK).not.toMatch(/WORDS_PER_PAGE/);
   });
 
   it('content floor on a rewrite: the guide says 60% and acceptCorrection uses 0.6', () => {
@@ -63,10 +73,14 @@ describe('the delivery knobs the guide documents are the ones the code uses', ()
     expect(CHECK).toMatch(/before \* 0\.6/);
   });
 
-  it('the length-requirement matcher in the guide is the pattern the processor runs', () => {
-    const documented = /\/length\\?\|format\\?\|size\\?\|pages\?\\?\|words\?\/i/;
-    expect(section).toMatch(documented);
-    expect(PROCESSOR).toMatch(/\/length\|format\|size\|pages\?\|words\?\/i/);
+  it('no pattern guesses which requirement was the length', () => {
+    // The first version searched requirement NAMES for the pattern below, which fails the moment a
+    // machine words its own requirement differently ("how long should it be") - and a machine's
+    // `requires` is per-deployment prose, so that was always going to happen. The size now arrives
+    // under a known key, resolved to numbers by the model that read the sentence.
+    expect(PROCESSOR).not.toContain('/length|format|size|pages?|words?/i');
+    expect(PROCESSOR).toContain('recordedLengthTarget(taskContext?.task.details)');
+    expect(section).toMatch(/Nothing here parses English/);
   });
 
   it('the three purity rules the guide counts are the three the module declares', () => {

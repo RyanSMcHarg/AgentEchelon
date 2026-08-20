@@ -5,6 +5,9 @@
  * dispatch logic is unit-testable without a Bedrock round-trip.
  */
 import { type Task, advanceTaskStateTo, type AdvanceResult } from './task-tracking.js';
+// The shape the delivering check reads back. Imported rather than re-declared so the writer and the
+// reader cannot drift into two different ideas of what an agreed size is.
+import type { LengthTarget as RecordedLengthTarget } from './deliverable-check.js';
 import {
   type TaskStateMachine,
   DEFAULT_TASK_STATE_MACHINES,
@@ -120,6 +123,26 @@ export function taskToolSpecsFor(
                 properties: {
                   requirement: { type: 'string', description: 'The requirement text, copied verbatim.' },
                   value: { type: 'string', description: 'What the person actually said for it.' },
+                  // THE MODEL NORMALISES, BECAUSE THE MODEL IS WHAT UNDERSTANDS THE ANSWER. A person
+                  // says "1-2 pages", "a page or two", "keep it short"; turning any of those into a
+                  // number is language work, and doing it downstream with a pattern means the runtime
+                  // guessing at English it never saw in context. Recorded once here, every later
+                  // reader gets a number instead of a sentence to re-interpret.
+                  //
+                  // Optional on purpose: absent means no size was agreed, which is a real answer to
+                  // "the length or format" (a person may only name the format). Nothing is enforced
+                  // then - an absent agreement is not a violation, and a guessed one is worse than none.
+                  minWords: {
+                    type: 'integer',
+                    description: 'Only when this requirement fixes a SIZE: the fewest words that '
+                      + 'satisfies what the person asked for. A page is roughly 300-900 words '
+                      + 'depending on how much of it is tables and lists. Omit if no size was agreed.',
+                  },
+                  maxWords: {
+                    type: 'integer',
+                    description: 'Only when this requirement fixes a SIZE: the most words that still '
+                      + 'satisfies it. Omit if no size was agreed.',
+                  },
                 },
                 required: ['requirement', 'value'],
               },
@@ -140,17 +163,39 @@ export function taskToolSpecsFor(
  * correct one and is worth more than a rejected transition - the step still advanced for real
  * reasons, and refusing it here would strand the task over bookkeeping.
  */
-export function collectedRequirements(input: unknown): Record<string, string> | undefined {
+export function collectedRequirements(
+  input: unknown,
+): { requirements: Record<string, string>; lengthTarget?: RecordedLengthTarget } | undefined {
   if (!Array.isArray(input)) return undefined;
-  const out: Record<string, string> = {};
+  const requirements: Record<string, string> = {};
+  let lengthTarget: RecordedLengthTarget | undefined;
+
   for (const entry of input) {
     if (!entry || typeof entry !== 'object') continue;
-    const { requirement, value } = entry as Record<string, unknown>;
+    const { requirement, value, minWords, maxWords } = entry as Record<string, unknown>;
     if (typeof requirement !== 'string' || typeof value !== 'string') continue;
     if (!requirement.trim() || !value.trim()) continue;
-    out[requirement.trim()] = value.trim();
+    requirements[requirement.trim()] = value.trim();
+
+    // A SIZE IS A PAIR OR IT IS NOTHING. One bound alone cannot say what satisfies the person: a
+    // minimum with no maximum admits a document ten times what they asked for, and a maximum alone
+    // admits an empty one. Half an agreement is not an agreement, so it is discarded rather than
+    // half-enforced. Same for a reversed or non-positive pair - a model produced it, and a bound that
+    // makes no sense is noise, not data.
+    if (typeof minWords === 'number' && typeof maxWords === 'number'
+      && Number.isFinite(minWords) && Number.isFinite(maxWords)
+      && minWords > 0 && maxWords >= minWords) {
+      // The FIRST size wins if a model marks two requirements as sizes: the alternative is picking by
+      // a rule nobody declared. One step, one agreed size.
+      lengthTarget ??= {
+        minWords: Math.round(minWords),
+        maxWords: Math.round(maxWords),
+        source: value.trim(),
+      };
+    }
   }
-  return Object.keys(out).length ? out : undefined;
+  if (!Object.keys(requirements).length) return undefined;
+  return { requirements, ...(lengthTarget ? { lengthTarget } : {}) };
 }
 
 /**
@@ -193,7 +238,18 @@ export async function handleAdvanceTaskStateTool(args: {
     messageId: args.messageId,
     machines: args.machines ?? DEFAULT_TASK_STATE_MACHINES,
     ...(collected
-      ? { details: { requirements: { ...(args.task.details?.requirements as Record<string, string> ?? {}), ...collected } } }
+      ? {
+        details: {
+          requirements: {
+            ...(args.task.details?.requirements as Record<string, string> ?? {}),
+            ...collected.requirements,
+          },
+          // The agreed SIZE, stored as the numbers the model resolved it to. A later step that agrees
+          // a new size replaces it; one that agrees none leaves the earlier agreement standing, which
+          // is what a person would expect from having said it once.
+          ...(collected.lengthTarget ? { lengthTarget: collected.lengthTarget } : {}),
+        },
+      }
       : {}),
     ...(args.assistantId ? { assistantId: args.assistantId } : {}),
   });

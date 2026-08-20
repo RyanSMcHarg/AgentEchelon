@@ -244,10 +244,13 @@ an exported manifest both still import.
 A state marked `delivers` does not simply hand its text over. The turn writes the document, checks it,
 corrects it if needed, and delivers what passes. Two kinds of check run:
 
-- **Against the agreement.** If the step's `requires` collected a length ("1-2 pages", "roughly
-  600-900 words"), the recorded answer lives in `task.details.requirements` and the document is
-  measured against it. Nothing recorded means nothing to enforce - `"as a table"` is a legitimate
-  answer to "the length or format" and names no size.
+- **Against the agreement.** If the step's `requires` collected a length, the model records it as a
+  WORD RANGE at the moment the person confirms it - it resolves "1-2 pages" or "keep it short" into
+  `minWords`/`maxWords` on the `advance_task_state` call - and the delivering turn measures the
+  document against those numbers (`task.details.lengthTarget`). Nothing here parses English: the
+  component that understood the sentence is the one that converted it, and a requirement naming no
+  size (`"as a table"`) records none, so nothing is enforced. That is deliberate - an absent agreement
+  is not a violation, and a guessed one is worse than none.
 - **Against being a document at all.** No opening greeting or self-announcement, no question or offer
   put to the reader, no describing its own packaging. These need no agreement: a delivered file is
   read later by someone who is not in the conversation it came from.
@@ -260,12 +263,21 @@ design.** They are gathered here so you can change them deliberately:
 |---|---|---|---|
 | Correction passes | `MAX_CORRECTION_ROUNDS`, `assistant-async-processor.ts` | 3 | Each pass is a model call on the most expensive turn the platform runs. Raise it for stricter conformance, lower it for latency. |
 | Minimum artifact size | `assistant-async-processor.ts`, **two sites**: the task delivery gate and the ad-hoc "save this as a document" path | 400 chars | Below it, content posts inline instead of as a file. Raising it sends more short answers to chat; lowering it risks a one-sentence answer buried behind a download. Change both, or the two paths disagree about what is worth downloading - the ad-hoc path had no floor at all until a guardrail refusal was uploaded as somebody's table. |
-| Words per page | `WORDS_PER_PAGE_MIN` / `MAX`, `deliverable-check.ts` | 300-900 | A wide band on purpose: a page of tables carries far fewer words than a page of prose. Narrowing it catches more length misses and rewrites more documents that were fine. |
+| Words a page is worth | the `minWords`/`maxWords` descriptions in the `advance_task_state` schema, `task-tools.ts` | "roughly 300-900 words depending on how much of it is tables and lists" | GUIDANCE, not a constant: the model converts "1-2 pages" to a range when it records the requirement, and this sentence is what it converts by. Narrow it and more documents get rewritten; widen it and more length misses pass. |
 | Content floor on a rewrite | `acceptCorrection`, `deliverable-check.ts` | 60% of the original | Stops a correction that deletes the document from being accepted. Raising it rejects legitimate tightening; lowering it re-opens the failure this exists for. |
-| Which requirement is the length | `assistant-async-processor.ts` | `/length\|format\|size\|pages?\|words?/i` | Matches the requirement NAME your machine declares. If you word yours differently ("how long"), either match this or widen the pattern. |
 | What counts as chat wrapper / reader question / file claim | `deliverable-check.ts` | three regexes | Deliberately narrow so ordinary prose survives. Add a rule when you find a shape that should not ship; each one applies to every delivering state in every machine. |
 
-**Two limits are worth knowing before you design around them, and neither is fundamental:**
+**The purity rules are ENGLISH patterns, and a deployment answering in another language gets no
+protection from them.** They are regexes over the delivered text, so a report written in Spanish or
+Chinese passes all three whatever it opens with. This platform has already been burned by exactly this
+shape once - an English opener list decided attachment-versus-inline until a non-English deployment
+defeated it in both directions, which is why that heuristic now runs in shadow only. These rules are
+narrower and they fail SAFE (a rule that does not fire delivers the document as written, rather than
+rewriting a good one), but a multilingual deployment should know it is running unchecked. Two ways out
+when it matters: carry per-deployment patterns in the versioned profile definition beside `machines`,
+or make the check itself a model call, which is what the length half deliberately avoids paying for.
+
+**Two further limits are worth knowing before you design around them, and neither is fundamental:**
 
 1. **At the correction bound, the best version is delivered anyway** and the shortfall is logged. The
    reasoning is that a report the person can read beats a turn that never lands. If your deployment

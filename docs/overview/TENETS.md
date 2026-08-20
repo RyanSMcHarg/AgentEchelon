@@ -20,7 +20,7 @@ The platform **invariants** in `docs/specs/interaction/SPEC-INTERACTION-LAYER.md
 
 ## Implementation tenets
 
-Tenets 1-6 are the commitments a design is judged against. These four are the mechanics that follow
+Tenets 1-6 are the commitments a design is judged against. These five are the mechanics that follow
 from them and settle day-to-day implementation choices - which source to read, whether to add
 infrastructure, whether a schedule is warranted. They are listed separately because they are applied
 at a different altitude, not because they are lesser, and because each has been violated in practice
@@ -82,3 +82,33 @@ fix to one silently leaves the other broken. If a new case genuinely does not fi
 pattern, change the pattern or record why it does not apply - do not quietly fork it. This applies to
 where a resource lives (a stack owns a capability, not a technology), to how a surface authorizes, and
 to how a value is stored: a versioned row may hold provenance, never current state.
+
+11. **Build for more than one language: no decision depends on recognising a phrase** - The
+deployment's language, the person's language, and the model's working language are three independent
+variables (`SPEC-BILINGUAL-CONVERSATIONS`), and the platform holds none of them constant. Matching
+something the platform itself wrote is pattern work and stays: a `<!--corr:-->` marker, a SQLSTATE, an
+ARN. Matching what a person or a model SAID, to decide what happens next, is a language judgement
+wearing a regex, and it is wrong in every language nobody tested.
+
+    **When something must be understood, the component that understands it decides - once.** A model
+    reads the sentence in context; the runtime does not. So the model resolves the meaning at the
+    point it is established and records it as data - a number, an enum, a declared intent - and every
+    later reader gets the data. A report's agreed length is the worked example: the model turns "a
+    concise 1-page report" into `minWords`/`maxWords` when the requirement is confirmed, and the
+    delivering check compares against numbers. The rejected alternative, and the first thing built,
+    was to store the sentence and re-parse it downstream, which moves an agreement out of prose and
+    then puts it back.
+
+    **Failing safe is a requirement, not an excuse.** A language-dependent check that fails safe - it
+    does not fire, and the unchecked thing proceeds - may ship, but it must say so where an operator
+    will find it. A guard that silently enforces nothing for two thirds of a deployment's users is
+    worse than no guard, because it is on the diagram. The delivered-document checks are exactly this
+    today and are documented as such in
+    [`HOW-TO-ADD-OR-MANAGE-A-PROFILE.md`](../guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md).
+
+    **The pivot is the deadline.** `isDocumentRequest` (an English phrase list deciding whether a reply
+    is packaged as a file) and the three delivered-document rules are limitations today and become
+    defects when the bilingual Level 2 pivot ships, because the text inside the loop stops being the
+    text the person typed. The precedent is already in the tree: `solicitsInput` decided
+    attachment-versus-inline by English openers until a non-English deployment defeated it in both
+    directions, and it now runs in shadow only, deciding nothing.

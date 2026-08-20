@@ -23,69 +23,45 @@
  * against real documents. The one model call this feature makes belongs to the caller.
  */
 
-/** Words the person's answer maps to, when the recorded requirement names a size. */
+/**
+ * The size the person agreed to, as the numbers it was recorded as.
+ *
+ * NOT PARSED HERE, AND THAT IS THE POINT. The first version regexed the recorded value - "1-2 pages",
+ * "roughly 600-900 words" - into a range at read time, which put the runtime back to guessing at
+ * English one layer below where the agreement had just been moved out of prose. A person says "a page
+ * or two" or "keep it short"; turning that into a number is language work, and the model doing the
+ * turn is the only component that saw the sentence in context. It resolves the range ONCE, when the
+ * requirement is recorded (`collected[].minWords/maxWords`, task-tools), and every reader here gets
+ * numbers.
+ */
 export interface LengthTarget {
   minWords: number;
   maxWords: number;
-  /** The recorded requirement value this came from, for the correction instruction and the logs. */
+  /** What the person actually said, carried for the correction instruction and the logs. */
   source: string;
 }
 
 /**
- * Pages are fuzzy and words are not, so a page becomes a WIDE word band.
+ * The agreed size off the task's recorded details, or null when none was agreed.
  *
- * A page of tables and bullets carries far fewer words than a page of paragraphs, and the failure
- * worth correcting is a document that is a fraction of what was agreed - not one that ran 15% long.
- * Erring wide keeps the loop from rewriting documents that are already fine, which costs a model call
- * and risks making a good document worse.
+ * Validated rather than trusted: `details` is JSON that a model's tool call produced and DynamoDB
+ * returned, so a bound that is missing, non-numeric, non-positive or reversed is treated as no
+ * agreement at all. Half an agreement cannot say what satisfies the person, and a guessed one is
+ * worse than none.
  */
-const WORDS_PER_PAGE_MIN = 300;
-const WORDS_PER_PAGE_MAX = 900;
-
-/** En dash, em dash, hyphen or "to" - the assistant writes all four. */
-const RANGE = '\\s*(?:[-–—]|to)\\s*';
-
-/**
- * Read a size out of the requirement value the person gave ("1-2 pages", "roughly 600-900 words",
- * "one page", "a short summary").
- *
- * A stated WORD range wins over a page range in the same value, because that is the assistant's own
- * conversion and it is more precise than this one. Returns null when the value names no size - "as a
- * table", "markdown", "whatever you think" - which is a legitimate answer to "the length or format"
- * and simply leaves nothing to check.
- */
-export function parseLengthTarget(recorded: unknown): LengthTarget | null {
-  if (typeof recorded !== 'string' || !recorded.trim()) return null;
-  const value = recorded.replace(/\*\*/g, '').trim();
-
-  const words = new RegExp(`(\\d{2,5})${RANGE}(\\d{2,5})\\s*words`, 'i').exec(value);
-  if (words) {
-    return { minWords: Number(words[1]), maxWords: Number(words[2]), source: value };
-  }
-  const oneWordCount = /(?:about|around|roughly|approximately|~)?\s*(\d{2,5})\s*words/i.exec(value);
-  if (oneWordCount) {
-    const n = Number(oneWordCount[1]);
-    // A single number is a target, not a bound. Allow a generous band either side of it.
-    return { minWords: Math.round(n * 0.6), maxWords: Math.round(n * 1.6), source: value };
-  }
-
-  const pageRange = new RegExp(`(\\d{1,2})${RANGE}(\\d{1,2})\\s*pages?`, 'i').exec(value);
-  if (pageRange) {
-    return {
-      minWords: Number(pageRange[1]) * WORDS_PER_PAGE_MIN,
-      maxWords: Number(pageRange[2]) * WORDS_PER_PAGE_MAX,
-      source: value,
-    };
-  }
-  const WORD_NUMBERS: Record<string, number> = { one: 1, two: 2, three: 3, four: 4, five: 5, six: 6 };
-  const onePage = /(\d{1,2}|one|two|three|four|five|six)[\s-]*pages?\b/i.exec(value);
-  if (onePage) {
-    const n = Number(onePage[1]) || WORD_NUMBERS[onePage[1].toLowerCase()];
-    if (n) {
-      return { minWords: n * WORDS_PER_PAGE_MIN, maxWords: n * WORDS_PER_PAGE_MAX, source: value };
-    }
-  }
-  return null;
+export function recordedLengthTarget(details: unknown): LengthTarget | null {
+  const t = (details as { lengthTarget?: unknown } | undefined)?.lengthTarget as
+    { minWords?: unknown; maxWords?: unknown; source?: unknown } | undefined;
+  if (!t || typeof t !== 'object') return null;
+  const { minWords, maxWords, source } = t;
+  if (typeof minWords !== 'number' || typeof maxWords !== 'number') return null;
+  if (!Number.isFinite(minWords) || !Number.isFinite(maxWords)) return null;
+  if (minWords <= 0 || maxWords < minWords) return null;
+  return {
+    minWords: Math.round(minWords),
+    maxWords: Math.round(maxWords),
+    source: typeof source === 'string' && source.trim() ? source.trim() : `${minWords}-${maxWords} words`,
+  };
 }
 
 /** Words in the document, ignoring markdown table pipes and heading marks. */

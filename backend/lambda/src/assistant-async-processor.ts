@@ -109,7 +109,7 @@ import {
   correctionProgressLine,
   deliverableIssues,
   documentWordCount,
-  parseLengthTarget,
+  recordedLengthTarget,
 } from './lib/deliverable-check.js';
 import { getModelCatalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION, bedrockInvokeId } from '../../lib/config/model-strategy.js';
 import { resolveActiveProfile, resolveFromDefinition, buildIntentStrategy } from './lib/active-profile.js';
@@ -1566,10 +1566,12 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       // rather than in a turn that never lands.
       const MAX_CORRECTION_ROUNDS = 3;
       if (generate && event.taskId) {
-        const recorded = (taskContext?.task.details?.requirements ?? {}) as Record<string, unknown>;
-        const lengthValue = Object.entries(recorded)
-          .find(([k]) => /length|format|size|pages?|words?/i.test(k))?.[1];
-        const target = parseLengthTarget(lengthValue);
+        // NO PATTERN GUESSES WHICH REQUIREMENT WAS THE LENGTH. The first version searched the recorded
+        // requirement NAMES for /length|format|size|pages?|words?/, which fails the moment a machine
+        // words its own requirement differently ("how long should it be") - and a machine's `requires`
+        // are per-deployment prose, so that was always going to happen. The model marks the size when
+        // it records it, so the size arrives as numbers under a known key.
+        const target = recordedLengthTarget(taskContext?.task.details);
         let issues = deliverableIssues(response, target);
         if (issues.length > 0) {
           console.log('[AssistantAsyncProcessor] deliverable check found issues; correcting', {
