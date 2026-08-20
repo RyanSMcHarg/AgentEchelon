@@ -59,6 +59,7 @@ import { parseJsonBody } from './lib/auth.js';
 import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
 import { resolveChannelClassificationTag as resolveChannelClassificationTagShared } from './lib/channel-classification.js';
 import { resolveActiveBattleExperimentForClassification } from './lib/experiment-manager.js';
+import { endBattle } from './lib/battle-end.js';
 
 const messagingClient = new ChimeSDKMessagingClient({});
 const ssmClient = new SSMClient({});
@@ -572,6 +573,28 @@ async function handleDisable(event: APIGatewayProxyEvent, origin?: string): Prom
     }
   }
 
+  // END THE DUEL BEFORE THE CONFIG ROW GOES, and the order is the whole point.
+  //
+  // Turning Battle Mode off is what every refusal tells people to ask a moderator for, and it used to
+  // leave a running duel exactly where it stood: sides still INVOKED or waiting, a question in the
+  // transcript still rendering its live "Replying to:" control, and a pointer nothing would clear.
+  // Ending the container ends the task inside it (DESIGN-BATTLE 2a-i), so one action does what the
+  // person asked for rather than half of it.
+  //
+  // Before the delete because the pointer lives ON the config row: clearing it afterwards would find no
+  // item and do nothing. The row is deleted a few lines below, which takes the pointer with it - the
+  // release still runs first so the audit fields are written and the abandon path is driven from one
+  // door rather than open-coded here.
+  const activeBattleId = (config.Item as { activeBattleId?: string } | undefined)?.activeBattleId;
+  if (activeBattleId) {
+    await endBattle({
+      channelArn,
+      battleId: activeBattleId,
+      reason: 'abandoned:battle-mode-off',
+      endedBy: callerArn,
+    });
+  }
+
   await ddb.send(
     new DeleteCommand({ TableName: CHANNEL_BATTLE_CONFIG_TABLE, Key: { channelArn } }),
   );
@@ -580,7 +603,9 @@ async function handleDisable(event: APIGatewayProxyEvent, origin?: string): Prom
     await messagingClient.send(
       new SendChannelMessageCommand({
         ChannelArn: channelArn,
-        Content: 'Battle Mode is now OFF.',
+        Content: activeBattleId
+          ? 'Battle Mode is now OFF. The battle that was running has ended, along with anything it was collecting.'
+          : 'Battle Mode is now OFF.',
         Type: ChannelMessageType.STANDARD,
         Persistence: ChannelMessagePersistenceType.PERSISTENT,
         ChimeBearer: botArn,

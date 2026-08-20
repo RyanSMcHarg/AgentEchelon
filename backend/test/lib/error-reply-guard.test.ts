@@ -17,7 +17,9 @@ describe('assertNotAnErrorReply', () => {
       'I encountered an issue. Could you try rephrasing?',
       "I couldn't start on that just now. Please try again.",
       'We are experiencing unusually high demand right now. Please try again in a little while.',
-      'A battle is already in progress here. Give it a moment, then try again.',
+      'A battle is already running in this conversation. Send `/battle end` to end it and start this one instead, or let it finish and ask again.',
+      'A battle is already running in this conversation, and it stays with the person who started it. They can end it with `/battle end`, or a moderator can turn Battle Mode off. Then this one can start.',
+      'This battle belongs to the person who started it, so only they can end it - or a moderator can turn Battle Mode off.',
     ];
     for (const f of failures) {
       expect(() => assertNotAnErrorReply(f)).toThrow(/FAILURE NOTICE, not an answer/);

@@ -108,6 +108,12 @@ export class ChannelFlowStack extends cdk.Stack {
                 'chime:ChannelFlowCallback',
                 'chime:SendChannelMessage',
                 'chime:ListChannelMemberships',
+                // `/battle end` asks whether the sender is a channel MODERATOR, because ending a duel
+                // destroys work in flight for everyone in it (DESIGN-BATTLE 2a-i). The check is
+                // deliberately fail-closed, which makes a missing grant INVISIBLE: every moderator
+                // would simply be told they are not one, and only the duel's initiator could ever end
+                // a battle. A silently narrower authority is exactly the shape that goes unnoticed.
+                'chime:ListChannelModerators',
                 // The classification decision (which assistant responds + the /battle premium
                 // gate) reads the IMMUTABLE `classification` tag via ListTagsForResource,
                 // NOT mutable metadata, so a moderator cannot tamper the classification up. Without

@@ -17,7 +17,24 @@
 const mockDetectDrift = jest.fn();
 const mockRecordDriftFire = jest.fn();
 const mockRecordDriftOutcome = jest.fn();
-const mockIsBattleEnabled = jest.fn();
+const mockResolveActiveBattle = jest.fn();
+const mockReadBattleRows = jest.fn();
+
+/**
+ * Put a RUNNING duel in the channel, owned by `initiatorUserSub`.
+ *
+ * "A battle is running" is read from the duel itself - a side generating or blocked on a person - and
+ * NOT from the channel's Battle Mode flag. The flag says only that a moderator switched the feature on,
+ * so keying on it fired between duels, with nothing in flight, and told the person "the assistants are
+ * still comparing answers" while no assistant was doing anything.
+ */
+function duelRunning(initiatorUserSub: string) {
+  mockResolveActiveBattle.mockResolvedValue({ battleId: 'a1b2c3d4e5f60718', initiatorUserSub });
+  mockReadBattleRows.mockResolvedValue([
+    { battleId: 'a1b2c3d4e5f60718', botArn: 'arn:bot/A', state: 'WAITING_FOR_USER' },
+    { battleId: 'a1b2c3d4e5f60718', botArn: 'arn:bot/B', state: 'COMPLETED' },
+  ]);
+}
 const mockCreateConversationFromDrift = jest.fn();
 
 const mockReadRouting = jest.fn();
@@ -52,7 +69,10 @@ jest.mock('../../lambda/src/lib/abuse-controls', () => ({
 }));
 
 jest.mock('../../lambda/src/lib/battle-state', () => ({
-  isBattleEnabled: (...a: unknown[]) => mockIsBattleEnabled(...a),
+  resolveActiveBattle: (...a: unknown[]) => mockResolveActiveBattle(...a),
+  readBattleRows: (...a: unknown[]) => mockReadBattleRows(...a),
+  duelInFlight: (rows: Array<{ state: string }>) =>
+    rows.some((r) => r.state === 'INVOKED' || r.state === 'WAITING_FOR_USER'),
 }));
 jest.mock('../../lambda/src/lib/channel-creation', () => ({
   createConversationFromDrift: (...a: unknown[]) => mockCreateConversationFromDrift(...a),
@@ -114,7 +134,7 @@ beforeEach(() => {
   mockDriftEnabled = true;
   mockReadRouting.mockReturnValue({ declinedDistances: [] });
   mockClassifyReply.mockReturnValue('ambiguous');
-  mockIsBattleEnabled.mockResolvedValue(false);
+  mockResolveActiveBattle.mockResolvedValue(null);
   mockWriteRouting.mockReturnValue({ routing: 'serialized' });
   // These are awaited with `.catch(...)` in the flow, so they must be promises.
   mockRecordDriftOutcome.mockResolvedValue(undefined);
@@ -147,7 +167,7 @@ describe('policy gate (conversation type drift on/off)', () => {
     expect(result).toBeNull();
     expect(mockDetectDrift).not.toHaveBeenCalled();
     // The type gate is evaluated before the (async) battle check.
-    expect(mockIsBattleEnabled).not.toHaveBeenCalled();
+    expect(mockResolveActiveBattle).not.toHaveBeenCalled();
   });
 });
 
@@ -187,7 +207,7 @@ describe('the caller\'s live-task signal reaches detectDrift', () => {
 // fires: the user is told the duel is still running, and given the two ways out.
 describe('drift during a battle', () => {
   it('detects as normal, but explains instead of offering to split', async () => {
-    mockIsBattleEnabled.mockResolvedValue(true);
+    duelRunning('u1');
     mockDetectDrift.mockResolvedValue({
       isDrift: true,
       driftScore: 0.42,
@@ -203,15 +223,66 @@ describe('drift during a battle', () => {
     expect(mockDetectDrift).toHaveBeenCalled();
     const content = result?.messages?.[0]?.content ?? '';
     expect(content).toMatch(/battle/i);
-    // Both exits are named, or the user is told "no" with no way forward.
+    // THE INITIATOR OWNS THE DUEL, so they are offered the way out of it rather than told to wait.
+    // The battle is the container: ending it ends what it was collecting, so the offer names the
+    // battle and gives the exact command instead of an action to go and find.
+    expect(content).toContain('/battle end');
     expect(content).toMatch(/finish|finishes/i);
-    expect(content).toMatch(/Battle Mode off/i);
     // The offer itself must NOT appear - there is nothing to accept.
     expect(content).not.toContain('Want me to start a separate conversation?');
   });
 
+  it('tells a NON-initiator who can end it, and never offers them a command they cannot run', async () => {
+    // A duel belongs to whoever started it. Offering `/battle end` to everyone would let any member
+    // pull a duel out from under the person running it, and leave the assistants taking competing
+    // instructions mid-comparison. An instruction somebody cannot carry out is also worse than none:
+    // they try it, it is refused, and now they have been refused twice.
+    duelRunning('someone-else');
+    mockDetectDrift.mockResolvedValue({
+      isDrift: true,
+      driftScore: 0.42,
+      suggestedAction: 'confirm',
+      suggestionTemplate: 'Want me to start a separate conversation?',
+      correlationId: 'corr-1',
+    });
+    const flow = loadFlow(ENABLED);
+
+    const result = await flow.runLiveDriftFlow({ ...baseInput });
+
+    const content = result?.messages?.[0]?.content ?? '';
+    expect(content).not.toContain('/battle end');
+    // The two routes that actually exist, and no disclosure of WHO the initiator is.
+    expect(content).toMatch(/started the battle|Battle Mode off/i);
+    expect(content).not.toContain('someone-else');
+  });
+
+  it('says nothing about a battle when Battle Mode is on but NO duel is in flight', async () => {
+    // The bug this pins. The guard read `isBattleEnabled`, which says only that a moderator switched
+    // the feature on - so between duels it refused the split and asserted "the assistants are still
+    // comparing answers" while no assistant was doing anything. A claim about what is happening now
+    // has to be read from what is happening now.
+    mockResolveActiveBattle.mockResolvedValue({ battleId: 'a1b2c3d4e5f60718', initiatorUserSub: 'u1' });
+    mockReadBattleRows.mockResolvedValue([
+      { battleId: 'a1b2c3d4e5f60718', botArn: 'arn:bot/A', state: 'COMPLETED' },
+      { battleId: 'a1b2c3d4e5f60718', botArn: 'arn:bot/B', state: 'COMPLETED' },
+    ]);
+    mockDetectDrift.mockResolvedValue({
+      isDrift: true,
+      driftScore: 0.42,
+      suggestedAction: 'confirm',
+      suggestionTemplate: 'Want me to start a separate conversation?',
+      correlationId: 'corr-1',
+    });
+    const flow = loadFlow(ENABLED);
+
+    const result = await flow.runLiveDriftFlow({ ...baseInput });
+
+    // The ordinary drift offer, because nothing is running to protect.
+    expect(result?.messages?.[0]?.content ?? '').toContain('Want me to start a separate conversation?');
+  });
+
   it('records nothing: there is no offer, so an outcome would be a fiction', async () => {
-    mockIsBattleEnabled.mockResolvedValue(true);
+    duelRunning('u1');
     mockDetectDrift.mockResolvedValue({
       isDrift: true,
       driftScore: 0.42,
@@ -228,7 +299,7 @@ describe('drift during a battle', () => {
   });
 
   it('falls through normally when the turn has NOT drifted', async () => {
-    mockIsBattleEnabled.mockResolvedValue(true);
+    duelRunning('u1');
     mockDetectDrift.mockResolvedValue({ isDrift: false, driftScore: 0.02 });
     const flow = loadFlow(ENABLED);
 
@@ -236,10 +307,10 @@ describe('drift during a battle', () => {
     expect(await flow.runLiveDriftFlow({ ...baseInput })).toBeNull();
   });
 
-  it('holds an ACCEPTANCE made before Battle Mode was turned on, without losing it', async () => {
+  it('holds an ACCEPTANCE made before the duel started, without losing it', async () => {
     // The suggestion outlived the condition it was made under. Acting now would walk the user out of a
     // duel in progress; the pending stays so a later "yes" still works.
-    mockIsBattleEnabled.mockResolvedValue(true);
+    duelRunning('u1');
     mockReadRouting.mockReturnValue({
       pendingDriftSuggestion: {
         taskId: 'task-1', channelArn: 'arn:chan', userSub: 'u1', kind: 'confirm',

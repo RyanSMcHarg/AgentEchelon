@@ -45,7 +45,7 @@ import {
   classifyConfirmDeclineReply,
 } from './routing-state.js';
 import { createConversationFromDrift } from './channel-creation.js';
-import { isBattleEnabled } from './battle-state.js';
+import { resolveActiveBattle, readBattleRows, duelInFlight } from './battle-state.js';
 import { claimCorrelation } from './abuse-controls.js';
 import {
   resolveConversationTypeKey,
@@ -310,13 +310,49 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
   // as the product ignoring them, and they retype the pivot.
   //
   // Detection now runs exactly as it does anywhere else - a battle turn is an ordinary turn - and the
-  // battle changes only what happens WHEN drift fires: the user is told the duel is still running and
-  // that they cannot split this conversation until it finishes or Battle Mode is turned off. Splitting
-  // mid-battle would strand a duel whose sides are mid-round in a conversation the user has left.
+  // battle changes only what happens WHEN drift fires. Splitting mid-battle would strand a duel whose
+  // sides are mid-round in a conversation the user has left.
   //
-  // The flag is read once here and threaded down, so detection and the two branches below agree about
-  // it within a turn even if a moderator toggles Battle Mode while the turn is in flight.
-  const battleActive = await isBattleEnabled(channelArn);
+  // A RUNNING DUEL, NOT THE MODE FLAG. This asked `isBattleEnabled`, which says only that a moderator
+  // has Battle Mode switched on for the channel - so the answer fired between duels, with nothing in
+  // flight, and told the person "the assistants are still comparing answers" when no assistant was
+  // doing anything. A claim about what is happening now has to be read from what is happening now:
+  // whether a side is generating or blocked on a person. The mode being on is not an event.
+  //
+  // Read once here and threaded down, so detection and the two branches below agree within a turn even
+  // if the duel ends while the turn is in flight.
+  //
+  // WHO IS SPEAKING matters as much as whether a duel is running, because only the person who started
+  // it may end it. Offering `/battle end` to everyone would let any member pull a duel out from under
+  // the person running it, and would leave the assistants fielding competing instructions from several
+  // people at once - the opposite of the focus a head-to-head comparison needs. So the answer differs by
+  // speaker: the initiator is offered the way out, everybody else is told who has it.
+  const { battleActive, viewerStartedIt } = await (async () => {
+    const active = await resolveActiveBattle(channelArn);
+    if (!active) return { battleActive: false, viewerStartedIt: false };
+    const startedIt = Boolean(active.initiatorUserSub) && active.initiatorUserSub === userSub;
+    try {
+      return { battleActive: duelInFlight(await readBattleRows(active.battleId)), viewerStartedIt: startedIt };
+    } catch (err) {
+      // The pointer says a duel is live and the rows could not be read. Treat it as running: refusing
+      // to split a conversation is recoverable in one message, walking someone out of a live duel is
+      // not.
+      console.warn('[live-drift] could not read battle rows; treating the duel as running:', err);
+      return { battleActive: true, viewerStartedIt: startedIt };
+    }
+  })();
+
+  /**
+   * What to tell this speaker about leaving the duel.
+   *
+   * An instruction somebody cannot carry out is worse than no instruction: they try it, it is refused,
+   * and now they have been refused twice. A non-initiator gets the two routes that actually exist -
+   * the person who started it ends it, or a moderator turns Battle Mode off - and neither names who
+   * the initiator is, which is not a refusal's business to disclose.
+   */
+  const wayOutOfBattle = viewerStartedIt
+    ? 'Send `/battle end` to end the battle, and anything it was collecting'
+    : 'Whoever started the battle can end it, or a moderator can turn Battle Mode off';
 
   const driftIntent = intent.toUpperCase() as DriftIntent;
   const routing = readRoutingFromSession(event.sessionState.sessionAttributes);
@@ -361,8 +397,9 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
         messages: [{
           contentType: 'PlainText',
           content:
-            "I can't split that off yet - a battle is still running in this conversation. Tell me again "
-            + 'once it finishes, or ask a moderator to turn Battle Mode off, and I will move it across.',
+            "I can't split that off while a battle is running here - moving you across would leave the "
+            + `duel behind. ${wayOutOfBattle}, or tell me again once it finishes and I will move it `
+            + 'across.',
         }],
         // The pending suggestion stays in session: it is still valid, just not actionable yet.
         sessionAttributes: event.sessionState.sessionAttributes || {},
@@ -504,23 +541,24 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
       classification,
     });
 
-    // DRIFT FIRED DURING A DUEL: say so, and offer nothing.
+    // DRIFT FIRED DURING A DUEL: name the battle, and offer the way out of it.
     //
-    // The user has changed the subject while two assistants are mid-comparison. Acting on that would
-    // move them into a new conversation and leave the duel behind, so the answer is not a suggestion
-    // but an explanation with the two ways out - let it finish, or turn Battle Mode off. Nothing is
-    // recorded: no drift row, no durable task, no session pending. There is no offer to accept or
-    // decline, so an outcome would be a fiction, and the next turn re-detects if they persist.
+    // The person has changed the subject while two assistants are mid-comparison. Splitting now would
+    // move them into a new conversation and leave the duel behind, so this cannot simply act. What it
+    // says next depends on who is asking: the battle is the CONTAINER (DESIGN-BATTLE 2a-i), its owner
+    // may leave it and take the work inside with them, and anyone else is told who can.
+    //
+    // Nothing is recorded: no drift row, no durable task, no session pending. The choice is theirs to
+    // make in their next message, and the next turn re-detects if they persist.
     if (driftResult.isDrift && battleActive) {
-      logGateExit('battle_active_drift_reported');
+      logGateExit(viewerStartedIt ? 'battle_active_drift_reported' : 'battle_active_drift_reported:not-initiator');
       return {
         messages: [{
           contentType: 'PlainText',
           content:
-            "That's a different topic, and I can't move it into its own conversation while a battle "
-            + 'is running here - the assistants are still comparing answers. Once the battle finishes '
-            + '(or a moderator turns Battle Mode off) ask me again and I will split it out. For now, '
-            + 'go ahead and I will answer it here.',
+            "That's a different topic, and I can't move it into its own conversation while a battle is "
+            + `running here. ${wayOutOfBattle}, then ask me again and I will split it out. Or let the `
+            + 'battle finish first. For now, go ahead and I will answer it here.',
         }],
         sessionAttributes: event.sessionState.sessionAttributes || {},
       };

@@ -55,8 +55,12 @@ import {
   planBattleContinuation,
   resumeBotFromWaiting,
   extractTargetedBotArns,
+  isPastDeadline,
+  duelInFlight,
   type BattleStateRow,
 } from './lib/battle-state.js';
+import { endBattle } from './lib/battle-end.js';
+import { callerIsChannelModerator } from './lib/channel-moderator.js';
 import {
   extractImageAttachment,
   extractAttachment,
@@ -571,6 +575,21 @@ export async function handler(event: ChannelFlowEvent): Promise<void> {
       cleanLen: cleanMessage.length,
       willDispatch: cleanMessage.length > 0,
     });
+    // `/battle end` - the explicit way out, and the reason the refusals above have something to name.
+    //
+    // A duel is a container: the person who started it, or a moderator, can end it, and the task inside
+    // it ends with it (DESIGN-BATTLE 2a-i). Before this there was no such action at all - an unfinished
+    // duel ended only when a clock expired - so every path that needed to say "you can leave" had to
+    // tell people to wait instead.
+    //
+    // A COMMAND rather than a yes/no conversation, deliberately. "End it" typed mid-duel is ambiguous
+    // between the battle and the report being collected inside it, and a wrong guess destroys work. A
+    // literal command cannot be misread, is the same in every language the channel speaks (tenet 11),
+    // and is testable without an NLU round trip.
+    if (cleanMessage.trim().toLowerCase() === 'end') {
+      await handleBattleEnd({ channelArn, senderArn, defaultBotArn: botArn });
+      return;
+    }
     if (cleanMessage) {
       await handleBattleMessage({
         channelArn,
@@ -1280,9 +1299,152 @@ interface HandleBattleParams {
  *    INVOKED state row, invoke the premium async processor with a
  *    battleContext payload.
  */
+/**
+ * `/battle end` - end the duel running in this channel, and the task inside it.
+ *
+ * WHO MAY. The person who started it, or a channel moderator. Ending a duel destroys work in flight for
+ * everyone in it, so this is moderation authority (channel-scoped `ChannelModerator`) and not membership;
+ * it is read live from Amazon Chime SDK and fails closed. The initiator comes from the channel pointer,
+ * which has a single writer at fan-out - the per-bot rows are rewritten by the duel's own progress and so
+ * cannot be trusted to still carry it.
+ *
+ * An initiator we never recorded (`activeBattleInitiator` absent - a duel from before the field, or a
+ * non-fatal write that lost it) leaves the moderator check as the only gate. That is the safe direction:
+ * it withholds authority rather than granting it to whoever asks.
+ *
+ * Every reply is TARGETED at the sender. A refusal is between the asker and the assistant, and it does
+ * not name the initiator - who started a duel is not something a refusal should disclose.
+ */
+async function handleBattleEnd(params: {
+  channelArn: string;
+  senderArn: string;
+  defaultBotArn: string;
+}): Promise<void> {
+  const { channelArn, senderArn, defaultBotArn } = params;
+
+  const active = await resolveActiveBattle(channelArn);
+  if (!active) {
+    await sendBotMessage(
+      channelArn,
+      defaultBotArn,
+      "There is no battle running in this conversation, so there is nothing to end.",
+      [senderArn],
+    );
+    return;
+  }
+
+  // AUTHORISE FIRST, BEFORE READING THE DUEL AND BEFORE ANY BRANCH THAT WRITES.
+  //
+  // This gate used to sit AFTER an "already finished" branch that called `endBattle` - and that branch
+  // is not the rare case it reads like. `duelInFlight` is false for the whole of ROUND 2: round 1 ends
+  // by moving both sides to `COMPLETED`, and nothing moves them back while the rebuttal generates. So
+  // for the tens of seconds a duel spends being rebutted, any member of the channel could send
+  // `/battle end`, reach the ungated branch, and have it release the pointer and claim the
+  // orchestrator's exactly-once sentinel on somebody else's duel. Either they then start their own
+  // battle on top of the one still streaming, or their claim beats the orchestrator's and round 2
+  // never fires at all - the duel silently truncated with no rebuttal.
+  //
+  // The lesson generalises past this function: "already finished" was treated as a read-only pleasantry
+  // when it performs two writes and stamps an audit field. A branch that mutates belongs behind the
+  // gate no matter how harmless its message sounds.
+  const senderSub = senderArn.split('/user/')[1] || '';
+  const isInitiator = Boolean(active.initiatorUserSub) && active.initiatorUserSub === senderSub;
+  // A moderator may also end it, and that grants nothing new: they can already end any duel by turning
+  // Battle Mode off, which now ends the running one. Accepting the command from them simply saves the
+  // detour. Everyone else is refused - see below.
+  const authorised = isInitiator || await callerIsChannelModerator(channelArn, senderArn);
+  if (!authorised) {
+    // THE REFUSAL IS THE POINT, not a gap to be widened later.
+    //
+    // A duel belongs to the person who started it. If any member could end it, the assistants would be
+    // taking competing instructions from several people mid-comparison, and a duel is only worth
+    // anything while both sides are answering the same person's question. So this names the two routes
+    // that exist - its initiator ends it, or a moderator turns Battle Mode off - without naming who the
+    // initiator is, which is not a refusal's business to disclose.
+    console.log('[ChannelFlow][battle] /battle end refused: not the initiator and not a moderator', {
+      channelArn,
+      battleId: active.battleId,
+    });
+    await sendBotMessage(
+      channelArn,
+      defaultBotArn,
+      'This battle belongs to the person who started it, so only they can end it - or a moderator can '
+      + 'turn Battle Mode off.',
+      [senderArn],
+    );
+    return;
+  }
+
+  // Past the gate, so both remaining exits are the owner's (or a moderator's) to take.
+  const rows = botRowsOnly(await readBattleRows(active.battleId));
+  if (!duelInFlight(rows)) {
+    // Every side has already stopped - the duel finished, or it is mid-rebuttal, and either way there
+    // is nothing left running to interrupt. Release the pointer so the next `/battle` is not refused,
+    // and say the plain thing rather than reporting an end that had already happened.
+    await endBattle({
+      channelArn,
+      battleId: active.battleId,
+      reason: 'abandoned:requested',
+      endedBy: senderArn,
+    });
+    await sendBotMessage(
+      channelArn,
+      defaultBotArn,
+      'That battle is done. The conversation is clear for a new one.',
+      [senderArn],
+    );
+    return;
+  }
+
+  const outcome = await endBattle({
+    channelArn,
+    battleId: active.battleId,
+    reason: 'abandoned:requested',
+    endedBy: senderArn,
+  });
+
+  // SAY WHAT ACTUALLY HAPPENED. A lost orchestrator claim means a rebuttal was already on its way and
+  // cannot be recalled, so promising "no more answers" would be a promise the channel visibly breaks a
+  // few seconds later. It still counts for nothing, and that is the part worth stating.
+  await sendBotMessage(
+    channelArn,
+    defaultBotArn,
+    outcome.round2Suppressed
+      ? 'Battle ended. Nothing from it is counted, and anything it was collecting has stopped. '
+        + 'Send `/battle <your question>` whenever you want to start a new one.'
+      : 'Battle ended. A final reply was already on its way and may still arrive - nothing from this '
+        + 'battle is counted either way. Send `/battle <your question>` to start a new one.',
+    [senderArn],
+  );
+}
+
 async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
   const { channelArn, classification: channelClassification, userMessageId, content, senderArn, defaultBotArn, imageAttachment } = params;
   console.log('[ChannelFlow][battle] Detected', { channelArn, senderArn });
+
+  // A BATTLE HAS AN INITIATOR, the way a task has an owner (ADR-024, owner 2026-08-20).
+  //
+  // Every ownership rule in a duel is a rule about this person: they are who a waiting side is waiting
+  // on, the only one whose reply resumes it, and the only one who may end it. When the sub could not be
+  // derived it was passed along as `undefined`, and each of those rules quietly degraded to "anyone" -
+  // `planBattleContinuation` skips the owner check entirely when it has no owner to check against. An
+  // unattributable duel is therefore not a duel with a small gap in its record; it is one with no
+  // ownership rules at all.
+  //
+  // So it does not start. Refusing costs the sender one message; starting costs the channel a duel
+  // anybody can steer.
+  const initiatorUserSub = senderArn.split('/user/')[1] || '';
+  if (!initiatorUserSub) {
+    console.error('[ChannelFlow][battle] refusing to start an unattributable duel', { channelArn, senderArn });
+    await sendBotMessage(
+      channelArn,
+      defaultBotArn,
+      "I couldn't tell who is starting this battle, so I haven't started one. Try again, and if it keeps "
+      + 'happening let an administrator know.',
+      [senderArn],
+    );
+    return;
+  }
 
   // 1. Eligibility gate. Resolve classification from the immutable `classification` tag (not mutable
   //    metadata) so a tampered modelTier cannot open premium battles on a lower channel, then gate on
@@ -1353,23 +1515,45 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
   const battleId = deriveBattleId(channelArn, userMessageId);
   const activeBattleId = await resolveActiveBattleId(channelArn);
   if (activeBattleId && activeBattleId !== battleId) {
-    const nowSec = Math.floor(Date.now() / 1000);
     const activeRows = botRowsOnly(await readBattleRows(activeBattleId));
+    // STILL RUNNING means a side is generating or blocked on a person AND has not blown its deadline.
+    //
+    // It used to mean "...and the row has not been deleted yet", reading `ttl > nowSec`. Expiry is a
+    // fact about DynamoDB's janitor; being past deadline is a fact about the duel, and conflating them
+    // made one number carry two meanings. When the row lifetime was lengthened so a finished side could
+    // outlive its rival's think time, a stalled duel silently went from holding its channel for ten
+    // minutes to holding it for four hours - nobody changed this guard, and its behaviour changed
+    // anyway. `deadlineAt` carries the right clock for the state the row is in (ADR-026).
     const inFlight = activeRows.some(
-      (r) =>
-        (r.state === 'INVOKED' || r.state === 'WAITING_FOR_USER') &&
-        (r.ttl === undefined || r.ttl > nowSec),
+      (r) => (r.state === 'INVOKED' || r.state === 'WAITING_FOR_USER') && !isPastDeadline(r),
     );
     if (inFlight) {
-      console.log('[ChannelFlow][battle] single-active-battle guard: a battle is already in flight; explained no-op', {
+      // WHAT THIS SAYS DEPENDS ON WHO ASKED (DESIGN-BATTLE 2a-i).
+      //
+      // The duel's initiator is allowed to leave the one they are in, so they are offered the way out
+      // rather than told to "try again" as though the running battle were weather. Anyone ELSE is
+      // refused, and told the two routes that exist: its initiator ends it, or a moderator turns Battle
+      // Mode off. That refusal is not politeness - a duel that any member could end or restart would
+      // leave the assistants taking competing instructions from several people at once, which is the
+      // opposite of the focus a head-to-head comparison needs.
+      const active = await resolveActiveBattle(channelArn);
+      const senderStartedIt = Boolean(active?.initiatorUserSub)
+        && active?.initiatorUserSub === (senderArn.split('/user/')[1] || '');
+      console.log('[ChannelFlow][battle] a battle is already in flight', {
         channelArn,
         activeBattleId,
         attemptedBattleId: battleId,
+        senderStartedIt,
       });
       await sendBotMessage(
         channelArn,
         defaultBotArn,
-        'A battle is already in progress here. Give it a moment, then try again.',
+        senderStartedIt
+          ? 'A battle is already running in this conversation. Send `/battle end` to end it and start '
+            + 'this one instead, or let it finish and ask again.'
+          : 'A battle is already running in this conversation, and it stays with the person who started '
+            + 'it. They can end it with `/battle end`, or a moderator can turn Battle Mode off. Then '
+            + 'this one can start.',
         [senderArn],
       );
       return;
@@ -1478,7 +1662,7 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
   await setActiveBattle({
     channelArn,
     battleId,
-    initiatorUserSub: senderArn.split('/user/').pop() || undefined,
+    initiatorUserSub,
   });
 
   // The treatment slot. The turn needs it to know which SIDE of the experiment it is; it does not
@@ -1498,7 +1682,7 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
         botArn: thisBotArn,
         correlationId,
         // The duel's owner: the person who ran /battle. Recorded on every side.
-        initiatorUserSub: senderArn.split('/user/').pop() || undefined,
+        initiatorUserSub,
       });
 
       // HAND THE TURN TO THE HANDLER, exactly as `@all` does. Everything this loop used to do
