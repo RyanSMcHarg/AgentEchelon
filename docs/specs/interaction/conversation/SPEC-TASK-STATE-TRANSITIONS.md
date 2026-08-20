@@ -273,6 +273,14 @@ delivers?, prompt?, placeholder? }`):
   Wording and language changes remain the person's to ask for, through `revising` - the check is about
   whether the document is the one that was agreed, never about whether it is the one they wanted.
 
+  **What a delivering state may hand over is a GENERATED ARTIFACT** - a report, an extraction, a
+  summary the assistant wrote. The conversation itself is deliberately not offered as a file, because
+  an assistant's history read carries targeted messages the requestor may not be entitled to, and a
+  transcript composed from that context would carry them too. The boundary, and what offering it would
+  require, is in
+  [`SPEC-CONVERSATION-SECURITY.md`](../identity-access/core/SPEC-CONVERSATION-SECURITY.md) under
+  "Not offered: a file containing the conversation".
+
   Every threshold in the above - the number of passes, the artifact floor, the words-per-page band,
   the floor a rewrite must keep - is a constant with a stated reason rather than a property of the
   design, and the two limits worth designing around (the bound delivers the best version, and

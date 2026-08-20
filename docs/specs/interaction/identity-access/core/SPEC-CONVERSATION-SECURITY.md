@@ -387,6 +387,32 @@ The first six layers isolate *tiers* of internal users. Layer 7 governs a differ
 
 **Why a distinct layer:** the existing layers gate *which channels* a principal can touch and at *what tier* - they do **not** gate *within a channel* between a broadcast and a targeted message when trust levels are mixed. This is the new gate. The federated-guest admission model is in `docs/specs/interaction/identity-access/core/SPEC-FEDERATED-PARTICIPANTS.md`.
 
+### Not offered: a file containing the conversation
+
+The platform delivers **generated artifacts** as downloadable files - a report, an extraction, a
+summary the assistant wrote. It does **not** offer to package the conversation itself, and that is a
+deliberate boundary rather than a missing feature.
+
+**Why.** An assistant reads channel history with its OWN bearer
+(`loadChannelHistory`, `ChimeBearer: botArn`) and applies no per-message visibility filter, so its
+working context includes **targeted** messages - including ones addressed to other members. A
+transcript composed from that context would carry content the person asking for it may not be
+entitled to see. No prompt instruction fixes this: by the time the request arrives, the model has
+already read the text, and asking it to leave something out is a request, not a control.
+
+**What offering it would require.** The export would have to be assembled by the runtime, re-reading
+messages with the **requestor's** bearer, so the Amazon Chime SDK itself excludes what that person
+cannot see - targeted messages to others, and anything from before they joined. The same test would
+apply to any attachment the export references: a document they cannot open must not ride along inside
+one they can. That is a read the platform does not perform today, so the capability is not offered
+today.
+
+**What this boundary does NOT claim.** It governs what the platform *offers to package*. It is not a
+guarantee that a model cannot be induced to repeat targeted content in an ordinary reply - that is the
+policy-and-discipline gap this layer names above, and declining to write files does not close it.
+Stating the boundary honestly is the point: a reader should not mistake "we do not offer transcript
+downloads" for "targeted content cannot reach the wrong person".
+
 ## 10. HIDDEN Membership and Restricted Operations
 
 From the [read-only channels blog post](https://aws.amazon.com/blogs/business-productivity/creating-read-only-chat-channels-for-announcements-with-amazon-chime-sdk-messaging/) (McHarg, 2021), HIDDEN membership allows users to read channel messages without being visible to other members or being able to send. This is **enforced by the Amazon Chime SDK itself** - no application code needed.
