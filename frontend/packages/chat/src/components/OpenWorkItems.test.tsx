@@ -99,18 +99,42 @@ describe('OpenWorkItems', () => {
     expect(screen.queryByText('workItems.finish')).toBeNull();
   });
 
-  it('still lists an item whose conversation this client cannot see', () => {
-    // Honest about what the client knows: the obligation is real even when the conversation is not
-    // loaded, so it is listed without a jump target rather than hidden.
-    ctx.openWorkItems = [item({ channelArn: 'arn:chan:unknown' })];
+  it('can still TAKE YOU to an item whose conversation this client has not loaded', () => {
+    // This asserted the opposite - listed, but with no way to open it - on the reasoning that the
+    // client should not offer what it cannot do. It can: `selectConversation` resolves an unlisted
+    // channel through the same deep-link path a navigation marker uses, and the conversation id is
+    // the channel ARN's last segment.
+    //
+    // The old behaviour was worst exactly where the queue matters most. Work you have forgotten is by
+    // definition in a conversation you are not looking at, which is the one least likely to be loaded -
+    // so the item you most needed to reach was the one that offered no way to reach it.
+    ctx.openWorkItems = [item({ channelArn: 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c-unloaded' })];
     ctx.conversations = [];
     render(<OpenWorkItems />);
 
     fireEvent.click(screen.getByRole('button', { expanded: false }));
 
     expect(screen.getByText('Scope the Q3 report')).toBeTruthy();
+    // Still honest about the NAME: without the conversation loaded there is no title to show.
     expect(screen.getByText('workItems.otherConversation')).toBeTruthy();
-    expect(screen.queryByText('workItems.finish')).toBeNull();
+
+    fireEvent.click(screen.getByText('workItems.finish'));
+    expect(ctx.selectConversation).toHaveBeenCalledWith('c-unloaded');
+  });
+
+  it('renders a task type a person can read, never the raw key', () => {
+    // The fallback for an item with no title of its own rendered `report_generation`. Task types are
+    // declared per deployment, so there is no table to look them up in - the key is reshaped instead,
+    // which is what the backend already does for the status chip and degrades for a type nobody
+    // anticipated.
+    ctx.openWorkItems = [item({ title: undefined, taskType: 'report_generation' })];
+    ctx.conversations = [];
+    render(<OpenWorkItems />);
+
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+
+    expect(screen.getByText('Report generation')).toBeTruthy();
+    expect(screen.queryByText('report_generation')).toBeNull();
   });
 });
 

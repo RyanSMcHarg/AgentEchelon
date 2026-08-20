@@ -17,6 +17,23 @@ import { useConversations } from '../providers/ConversationProvider.chime';
  * It renders NOTHING when there is nothing owed, and nothing when the endpoint is unconfigured - a
  * deployment without the queue simply does not have one, which must not look like an error.
  */
+/**
+ * A task type a person can read, when the item carries no title of its own.
+ *
+ * The fallback rendered the RAW KEY - a queue row reading `report_generation` rather than "Report
+ * generation". Task types are declared per deployment (an intent pack may add its own), so there is no
+ * table to look them up in and inventing one would go stale the first time a deployment declared a type
+ * it did not know about. Reshaping the key is what the backend already does for the same problem on the
+ * status chip, and it degrades gracefully for a type nobody anticipated.
+ *
+ * A title, when the item has one, always wins: it says what THIS work is, not what kind of work it is.
+ */
+function readableTaskType(taskType: string | undefined): string {
+  if (!taskType) return '';
+  const words = taskType.replace(/[_-]+/g, ' ').trim();
+  return words ? words.charAt(0).toUpperCase() + words.slice(1) : '';
+}
+
 export function OpenWorkItems() {
   const {
     openWorkItems, conversations, selectConversation, activeConversation, battleWaitingBots,
@@ -34,14 +51,19 @@ export function OpenWorkItems() {
   const battleHoldsTheFloor = battleWaitingBots.length > 0;
   const battleChannelArn = activeConversation?.conversationArn;
 
-  // The conversation each item belongs to, so the queue can say WHERE rather than only WHAT. An item
-  // whose conversation this client cannot see still lists - it is still owed - it just cannot be
-  // jumped to, which is honest about what the client knows.
+  // The conversation each item belongs to, so the queue can say WHERE rather than only WHAT.
+  //
+  // AN ITEM WHOSE CONVERSATION IS NOT IN THE LOCAL LIST IS STILL REACHABLE. This used to list such an
+  // item without a way to open it, on the reasoning that the client should not offer what it cannot
+  // do - but it can: `selectConversation` resolves a channel that is not yet listed via DescribeChannel,
+  // which is the same deep-link path a drift navigation marker uses. The conversation id is the ARN's
+  // last segment. So the queue can always take you there, and the missing entry only costs it a NAME.
   const rows = useMemo(
     () =>
       openWorkItems.map((item) => ({
         item,
         conversation: conversations.find((c) => c.conversationArn === item.channelArn),
+        targetId: item.channelArn?.split('/').pop(),
       })),
     [openWorkItems, conversations],
   );
@@ -64,7 +86,7 @@ export function OpenWorkItems() {
 
       {expanded && (
         <ul className="open-work-items-list">
-          {rows.map(({ item, conversation }) => {
+          {rows.map(({ item, conversation, targetId }) => {
             // The item you are already looking at is not something to navigate to; say so, so the
             // queue does not send you where you already are.
             const isHere = activeConversation?.conversationArn === item.channelArn;
@@ -78,7 +100,7 @@ export function OpenWorkItems() {
                 aria-disabled={blockedByBattle || undefined}
               >
                 <div className="open-work-items-item-text">
-                  <span className="open-work-items-item-title">{item.title || item.taskType}</span>
+                  <span className="open-work-items-item-title">{item.title || readableTaskType(item.taskType)}</span>
                   <span className="open-work-items-item-where">
                     {blockedByBattle
                       ? t('workItems.blockedByBattle')
@@ -87,11 +109,19 @@ export function OpenWorkItems() {
                         : conversation?.title || t('workItems.otherConversation')}
                   </span>
                 </div>
-                {!isHere && conversation && (
+                {/*
+                  * Offered whenever there is somewhere to go, which is whenever the item names a
+                  * channel. It used to require the conversation to be in the local list, so an item in
+                  * a conversation this client had not loaded listed with no way to reach it - the one
+                  * case where the queue is most useful, since the work you have forgotten is by
+                  * definition not in front of you. `selectConversation` resolves an unlisted channel
+                  * on its own.
+                  */}
+                {!isHere && targetId && (
                   <button
                     type="button"
                     className="open-work-items-item-go"
-                    onClick={() => selectConversation(conversation.id)}
+                    onClick={() => selectConversation(conversation?.id ?? targetId)}
                     disabled={blockedByBattle}
                     title={blockedByBattle ? t('workItems.blockedByBattle') : undefined}
                   >
