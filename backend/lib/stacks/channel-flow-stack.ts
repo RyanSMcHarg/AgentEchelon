@@ -114,6 +114,17 @@ export class ChannelFlowStack extends cdk.Stack {
                 // would simply be told they are not one, and only the duel's initiator could ever end
                 // a battle. A silently narrower authority is exactly the shape that goes unnoticed.
                 'chime:ListChannelModerators',
+                // ENDING A DUEL EDITS A MESSAGE. A side stopped at `WAITING_FOR_USER` holds a question
+                // carrying the `<!--battlewaiting-->` marker the client renders as a live "Replying to:"
+                // control, and `/battle end` has to take it down or an ended duel goes on inviting an
+                // answer nothing is listening for. That clear is a read-then-write on the message.
+                //
+                // Like the moderator check, it fails soft: without these the clear AccessDenies into a
+                // caught warning, reports `false`, and leaves the affordance standing - the precise
+                // defect the shared marker module was extracted to fix, silently reintroduced by a
+                // missing grant rather than by any change to the code.
+                'chime:GetChannelMessage',
+                'chime:UpdateChannelMessage',
                 // The classification decision (which assistant responds + the /battle premium
                 // gate) reads the IMMUTABLE `classification` tag via ListTagsForResource,
                 // NOT mutable metadata, so a moderator cannot tamper the classification up. Without

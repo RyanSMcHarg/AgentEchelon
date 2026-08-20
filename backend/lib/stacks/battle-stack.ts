@@ -396,6 +396,15 @@ export class BattleStack extends cdk.Stack {
               actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:Query'],
               resources: [battleStateTable.tableArn],
             }),
+            // RELEASING THE CHANNEL is part of finishing a duel. `emitBattleComplete` clears the
+            // `activeBattleId` pointer, which lives on the CONFIG table - a table this Lambda had no
+            // reason to touch until the pointer stopped being released by a clock.
+            //
+            // UpdateItem only: it clears a pointer, it never reads or replaces the row.
+            new iam.PolicyStatement({
+              actions: ['dynamodb:UpdateItem'],
+              resources: [channelBattleConfigTable.tableArn],
+            }),
           ],
         }),
         // Resolve-once (DESIGN-MULTI-ASSISTANT-TURN-ENGINE): the orchestrator now
@@ -454,6 +463,10 @@ export class BattleStack extends cdk.Stack {
       role: battleOrchestratorRole,
       environment: {
         BATTLE_STATE_TABLE: battleStateTable.tableName,
+        // The pointer this Lambda now RELEASES when a duel finishes. Absent, `clearActiveBattle`
+        // returns at its first line and the release silently never happens - the whole point of the
+        // change, inert, with no error to notice. The env var and the grant above go together.
+        CHANNEL_BATTLE_CONFIG_TABLE: channelBattleConfigTable.tableName,
         // ALL THREE, so round 2 answers at the duel's own classification. It used to receive only the
         // premium param and so answered every rebuttal on the premium processor - an escalation for
         // any duel a `battleEligible` profile enabled below premium, which is an operator setting
@@ -517,9 +530,23 @@ export class BattleStack extends cdk.Stack {
         }),
         BattleConfigDdb: new iam.PolicyDocument({
           statements: [
+            // TURNING BATTLE MODE OFF NOW ENDS THE RUNNING DUEL, which needs two things this policy
+            // did not grant. `UpdateItem` because releasing the `activeBattleId` pointer is an UPDATE,
+            // not the Put/Delete this handler previously used - without it the release AccessDenies
+            // into a caught warning and the pointer survives a disable.
             new iam.PolicyStatement({
-              actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:DeleteItem'],
+              actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:DeleteItem'],
               resources: [channelBattleConfigTable.tableArn],
+            }),
+            // And the duel's own rows, because ending it is not only releasing the pointer: the sides
+            // are marked ABANDONED (UpdateItem), the round-2 fire is poisoned by claiming the
+            // orchestrator sentinel (PutItem), and both need the partition read first (Query). Missing,
+            // every one of those fails soft - `readBattleRows` returns [], the transitions return false
+            // - so Battle Mode off would release the channel while leaving a duel's sides live and its
+            // rebuttal unsuppressed.
+            new iam.PolicyStatement({
+              actions: ['dynamodb:Query', 'dynamodb:UpdateItem', 'dynamodb:PutItem'],
+              resources: [battleStateTable.tableArn],
             }),
           ],
         }),
@@ -558,6 +585,10 @@ export class BattleStack extends cdk.Stack {
         SSM_ROOT,
         APP_INSTANCE_ARN: props.appInstanceArn,
         CHANNEL_BATTLE_CONFIG_TABLE: channelBattleConfigTable.tableName,
+        // Turning Battle Mode off ends the duel that is running, and every helper that does so returns
+        // early when this is unset. The disable would still report success while the duel it claimed to
+        // end carried on.
+        BATTLE_STATE_TABLE: battleStateTable.tableName,
         EXPERIMENTS_TABLE: experimentsTableName,
         ALLOWED_ORIGIN: appUrl,
       },
@@ -577,6 +608,15 @@ export class BattleStack extends cdk.Stack {
               // whole-item Put - so the outcome Lambda needs UpdateItem or the pick write AccessDenies (503).
               actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem'],
               resources: [battleOutcomeTable.tableArn],
+            }),
+            // READ-ONLY on the duel's rows, so a pick can be refused for a duel that was ABANDONED.
+            // Without it `readBattleRows` returns [], the `rows.length > 0` guard is never satisfied,
+            // and the refusal never fires - a pick on a comparison nobody finished would be recorded
+            // and counted, which is the one outcome that rule exists to prevent. Query only: this
+            // Lambda reads the duel's state and never writes it.
+            new iam.PolicyStatement({
+              actions: ['dynamodb:Query'],
+              resources: [battleStateTable.tableArn],
             }),
           ],
         }),
@@ -615,6 +655,9 @@ export class BattleStack extends cdk.Stack {
         APP_INSTANCE_ARN: props.appInstanceArn,
         BATTLE_OUTCOME_TABLE: battleOutcomeTable.tableName,
         CHANNEL_BATTLE_CONFIG_TABLE: channelBattleConfigTable.tableName,
+        // The duel's rows, read to refuse a pick on an ABANDONED battle. Unset, `readBattleRows`
+        // returns [] and the refusal is unreachable - the check would look present and do nothing.
+        BATTLE_STATE_TABLE: battleStateTable.tableName,
         ALLOWED_ORIGIN: appUrl,
       },
       bundling: { minify: false, forceDockerBundling: false },
