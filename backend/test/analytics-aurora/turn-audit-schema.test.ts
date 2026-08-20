@@ -154,7 +154,12 @@ describe('027: the view measures LIVE rows, not only backfilled ones', () => {
     require('path').join(SCHEMA_DIR, '027-turn-latency-live-rows.sql'), 'utf8');
 
   it('grains per RESPONSE and lifts the placeholder-declared turn id over the final row NULL', () => {
-    expect(sql027).toContain('SELECT MAX(turn_id) AS turn_id');
+    // THE CAST IS PART OF THE ASSERTION, not noise around it. `max(varchar)` returns text while 026
+    // selected the bare column, so an uncast `MAX(turn_id)` makes this migration fail on every
+    // deployment that already ran 026 - `CREATE OR REPLACE VIEW` refuses to change a column's type -
+    // and takes every later migration in the same transaction down with it. Measured live: the data
+    // plane rethrew on every invocation until the relabel landed.
+    expect(sql027).toMatch(/SELECT MAX\(turn_id\)::VARCHAR\(64\) AS turn_id/);
     expect(sql027).toMatch(/GROUP BY response_id, channel_arn/);
     expect(sql027).not.toMatch(/GROUP BY turn_id, response_id/);
   });

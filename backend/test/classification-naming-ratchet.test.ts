@@ -61,6 +61,20 @@ const EXEMPT: Array<{ pattern: RegExp; why: string }> = [
       + 'a coordinated reader/writer change; scheduled, not silently kept.',
   },
   {
+    // ENGLISH WORDS THAT HAPPEN TO END IN -TIER. The scan is a substring test on purpose, because
+    // that is what catches `userTier` and `modelTier` in camelCase - a word-boundary pattern would
+    // miss every one of them. The cost is that ordinary prose trips it: "emptier" flagged a comment
+    // in `deliverable-check.ts`, and "prettier", "frontier" and "courtier" would do the same.
+    //
+    // Listed rather than reworded around, because the next person writing plain English should not
+    // have to discover this by reading a failure. Anchored with \b at BOTH ends so it exempts the
+    // whole word only: `emptierTier` would still be caught.
+    pattern: /\b(?:empt|prett|front|court|rent|flatt|cash|dain|gaunt|sultr)ier\b/i,
+    why: 'Ordinary English words containing "tier" as a substring. The scan is deliberately a '
+      + 'substring test so camelCase `userTier`/`modelTier` cannot hide from it; these are the '
+      + 'false positives that follows from, exempted as whole words.',
+  },
+  {
     // Deliberately anchored to the ARRAY LITERAL that starts an experiment payload's field, so a
     // sentence like "the premium tier assistant" in the same file is still caught. A bare /tiers/
     // would exempt any prose using the plural.

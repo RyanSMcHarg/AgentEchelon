@@ -1,7 +1,7 @@
 /**
  * A REPORT TASK, DRIVEN THROUGH ITS BRANCHES, not just past its opening turn.
  *
- * THE LIVE DEFECT THIS EXISTS FOR. A person asked for a board-ready report. The assistant proposed an
+ * THE LIVE DEFECT THIS EXISTS FOR. A person asked for a report on Q2 ARR performance. The assistant proposed an
  * outline and ended its turn with a question: "Shall I go ahead, or would you like to adjust any
  * sections?". They answered it - "Can you make it 1-2 pages?" - and were told "It looks like you're
  * shifting topics. Want me to start a separate conversation?". A direct answer to the assistant's own

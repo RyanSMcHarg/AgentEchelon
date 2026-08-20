@@ -28,6 +28,11 @@ const SCAN_ROOTS = [
   'docs',
   'backend/lambda/src',
   'backend/lib',
+  // The operator scripts, which is where the DEMO COPY lives: `seed-demo.ts` writes the suggested
+  // prompts a person reads before they have seen any output. "board-ready" sat there, unscanned,
+  // while every doc making the same claim would have been caught - the guard was watching the
+  // surfaces we write ABOUT the product and not the one the product speaks WITH.
+  'backend/scripts',
   'tests/e2e',
 ];
 
@@ -40,6 +45,17 @@ const SCAN_EXTENSIONS = new Set(['.md', '.ts']);
  * keyword-classified" notes) must not trip it.
  */
 const BANNED: Array<{ phrase: string; truth: string }> = [
+  // --- Class -3: "board-ready" grades the answer before anyone has seen it (owner, 2026-08-20). ---
+  //
+  // It sat in the premium demo's SUGGESTED PROMPTS, which is the first thing a person reads and the
+  // last place a claim should outrun the product. The assistant writes a structured, grounded report;
+  // nothing here establishes that it is fit to put in front of a board, and the delivered document has
+  // failed shape checks in this very session. Describe the ask, never grade the answer in advance.
+  {
+    phrase: 'board-ready',
+    truth: 'describe what is asked for ("a report on Q2 ARR performance for the leadership team"); '
+      + 'the reader judges whether the output clears their bar',
+  },
   // --- Class -2: `place_item.placed` records the APPROVAL, not a host apply (owner, 2026-08-19). ---
   //
   // The claim lived in the machine's code comment and was copied into the spec from there, which is

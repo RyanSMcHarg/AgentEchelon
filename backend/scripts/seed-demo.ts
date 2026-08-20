@@ -357,7 +357,10 @@ const WELCOME_ORIENTATION: Record<'basic' | 'standard' | 'premium', unknown> = {
     companyBlurb: STRATUM_BLURB,
     accessBlurb: 'You have leadership access: financials, team metrics, customer accounts, the board summary, and competitive intel.',
     examples: [
-      'Compile a board-ready report on our Q2 ARR performance',
+      // This example used to grade the answer in advance, in the one place a person reads before they
+      // have seen any output: the suggested prompts. The assistant writes a structured, grounded
+      // report; whether it clears a given audience's bar is the reader's call. Describe the ask.
+      'Compile a report on our Q2 ARR performance for the leadership team',
       'Extract the enterprise accounts flagged as churn risk as a table',
       "What's our current net revenue retention?",
     ],
@@ -508,10 +511,10 @@ async function uploadContextFiles(bucketName: string): Promise<void> {
   const count = await uploadDir(contextDir, 'context/');
   console.log(`  ✓ ${count} context files uploaded to s3://${bucketName}/context/`);
 
-  // Per-tier company-context DIGEST (ADR-017): a small manifest of the documents
-  // each tier may read (title + one-line description), so an assistant knows WHAT
+  // Per-classification company-context DIGEST (ADR-017): a small manifest of the documents
+  // each classification may read (title + one-line description), so an assistant knows WHAT
   // company context exists and can fetch the right document. Cumulative (premium
-  // includes standard + basic); stored at context/{tier}/_digest.json, scoped by
+  // includes standard + basic); stored at context/{classification}/_digest.json, scoped by
   // the SAME IAM prefix boundary as the documents it describes. The `_` prefix
   // keeps it out of company-context document loads.
   const manifestPath = path.join(__dirname, '..', 'demo', 'context-digest-manifest.json');
@@ -556,12 +559,12 @@ async function uploadContextFiles(bucketName: string): Promise<void> {
 }
 
 /**
- * ADR-017: embed the tier company docs for relevance retrieval. Each
- * `demo/context/{tier}/*.json` is uploaded under `rag/company/{tier}/` in the
+ * ADR-017: embed the per-classification company docs for relevance retrieval. Each
+ * `demo/context/{classification}/*.json` is uploaded under `rag/company/{classification}/` in the
  * archive bucket; the DocumentIngestion Lambda chunks + embeds it with
- * `source_type='company'` and the tier stamped from the path, so the router
+ * `source_type='company'` and the classification stamped from the path, so the router
  * retrieves the relevant company facts per turn (deterministic pre-fetch),
- * tier-scoped by the fail-closed SQL filter. Aurora mode only.
+ * classification-scoped by the fail-closed SQL filter. Aurora mode only.
  */
 async function uploadCompanyRag(archiveBucketName: string): Promise<void> {
   const contextDir = path.join(__dirname, '..', 'demo', 'context');
