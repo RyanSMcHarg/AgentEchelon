@@ -67,8 +67,35 @@ export interface AttachmentValidation {
 
 // Conversational tells that mean a clarifying/chat turn got saved as a file instead of a real
 // document (the reported bug). Shared across every attachment-producing test.
+//
+// THE ORIGINAL SET WAS TOO LITERAL AND A REAL DEFECT WALKED THROUGH IT. It listed the phrasings from
+// one incident, so a document that ASKED THE READER FOR APPROVAL in any other words - an outline with
+// a table, ending "does this structure work?" - satisfied every check: markdown structure, on-topic
+// words, substantial length, no listed phrase. The file was a proposal about the report, delivered as
+// the report, and the suite called it a valid document.
+//
+// So the rule is now about the ACT, not the wording: a finished deliverable does not ask its reader to
+// decide anything, and does not describe what it is going to contain. Both patterns below are matched
+// against the lowercased content.
 const CLARIFYING_TELLS =
   /a few quick questions|what should the report focus on|let me know your preferences|before i (start|begin|proceed)|could you clarify|to make sure i|happy to help/;
+
+/**
+ * A question, or an offer, aimed at the READER. A report states; it does not negotiate.
+ *
+ * Deliberately narrow so ordinary report prose survives: a rhetorical question inside a sentence
+ * ("which repository model scales?") has no second person in it, and section prose that mentions "you"
+ * without a question mark is untouched.
+ */
+const READER_DIRECTED_ASK =
+  /\b(would|do|does|should|shall|can|could|are)\s+you\b[^.?!]{0,160}\?|\blet me know\b|\bif you'?d like\b|\bshall i\b|\bwant me to\b|\bwould you like\b|\bsound good\b|\bhow does (this|that) (look|sound)\b/;
+
+/**
+ * The document is describing itself instead of being itself: an OUTLINE or a plan-to-write, saved as
+ * the deliverable. This is the exact shape of the incident that demoted the output-shape heuristic.
+ */
+const OUTLINE_TELLS =
+  /\bproposed outline\b|\bhere'?s? (a|the) (proposed )?outline\b|\boutline for (the|your) report\b|\bi'?ll (then )?(write|generate|draft|produce)\b|\bthe report will (cover|include|contain)\b|\bonce you (approve|confirm)\b/;
 
 /**
  * Download the delivered attachment via its presigned URL and validate the CONTENT is a real
@@ -112,6 +139,17 @@ export async function openAndValidateAttachment(
       content.toLowerCase(),
       `${label}the document must not be a clarifying/chat turn saved as a file`,
     ).not.toMatch(CLARIFYING_TELLS);
+    expect(
+      content.toLowerCase(),
+      `${label}a finished deliverable does not ask its reader to decide anything. This document puts a `
+        + 'question or an offer to the reader, which is what a clarifying turn saved as a file looks '
+        + 'like - and a table plus on-topic words is not enough to tell the two apart',
+    ).not.toMatch(READER_DIRECTED_ASK);
+    expect(
+      content.toLowerCase(),
+      `${label}the document describes what it WILL contain instead of containing it - an outline or a `
+        + 'plan-to-write delivered as the deliverable',
+    ).not.toMatch(OUTLINE_TELLS);
     for (const m of v.mustNotMatch || []) {
       expect(m.lower ? content.toLowerCase() : content, `${label}${m.because}`).not.toMatch(m.re);
     }

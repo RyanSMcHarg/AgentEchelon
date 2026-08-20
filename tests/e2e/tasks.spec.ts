@@ -214,17 +214,70 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
 
     // Open the presigned download and validate the CONTENT is a real report — catches an empty/garbage
     // report or a conversational turn saved as a file (the reported bug), regardless of plumbing being green.
-    await openAndValidateAttachment(page, attachment, {
+    const report = await openAndValidateAttachment(page, attachment, {
       namePattern: /\.(md|markdown|txt|pdf)$/i,
-      minLength: 400,
+      // A one-page report is roughly 500 words. 400 characters is two paragraphs, which an OUTLINE
+      // clears comfortably - and an outline is exactly what has been delivered as the report before.
+      minLength: 1200,
       mustMatch: [
         {
           re: /(^|\n)#{1,3}\s|\n\s*[-*]\s|\n\s*\d+\.\s/,
           because: 'the report must have markdown structure (headings / bullets / numbered sections)',
         },
         { re: /mono-?repo|multi-?repo|repositor/, because: 'the report must be ON-TOPIC (mono/multi-repo)', lower: true },
+        // THE THREE THINGS THIS TEST ASKED FOR. Structure and a topic word are satisfied by a table of
+        // section titles; covering the requested subjects is not. This is the cheapest assertion that
+        // separates a report from a proposal to write one.
+        { re: /velocity/, because: 'the report must cover DELIVERY VELOCITY, which the request named', lower: true },
+        { re: /ownership/, because: 'the report must cover CODE OWNERSHIP, which the request named', lower: true },
+        { re: /\bci\b|continuous integration|build (time|cost)/, because: 'the report must cover CI COST, which the request named', lower: true },
       ],
     });
+
+    // SUBSTANCE, NOT SHAPE. Everything above can be satisfied by an outline: headings, a table, the
+    // topic words, even the three subject names as section titles. What an outline does NOT have is
+    // CONTENT-BEARING BLOCKS - lines long enough to argue something rather than to name a section.
+    //
+    // NOT "prose paragraphs", which was the first attempt and would have failed a good document. Asked
+    // to be concise, the assistant says so explicitly - "bullet points over paragraphs, tight tables"
+    // (measured, live) - so a correct 1-2 page report can carry almost no paragraphs at all. Bullets
+    // are how it delivers substance at that length; what separates them from an outline's stubs is
+    // LENGTH, because "Executive Headline | Q2 ARR result vs. target, one-line narrative" is 60
+    // characters and a real finding runs to twice that.
+    const blocks = report.split(/\n\s*\n/).map((p) => p.trim());
+    const proseParagraphs = blocks
+      .filter((p) => !/^#{1,6}\s/.test(p))          // not a heading
+      .filter((p) => !/^\s*([-*]|\d+\.)\s/.test(p)) // not a bullet or numbered stub
+      .filter((p) => !p.startsWith('|'))            // not a table
+      .filter((p) => p.length >= 180);
+    const substantiveBullets = report
+      .split('\n')
+      .map((l) => l.trim())
+      .filter((l) => /^([-*]|\d+\.)\s/.test(l))
+      .filter((l) => l.length >= 140);
+    const contentBlocks = proseParagraphs.length + substantiveBullets.length;
+    // Printed so the floor above stays tied to what the product actually delivers rather than to an
+    // estimate. The ask here is a CONCISE report and the assistant offers considerably longer ones, so
+    // a run that only just clears the floor is worth seeing before anyone raises it.
+    //
+    // LENGTH CONFORMANCE IS NOT ASSERTED HERE, DELIBERATELY. Whether the document is the size the
+    // person agreed to is a property of the AGREEMENT, and the agreement is not a string in the
+    // transcript for a test to re-derive: it is a requirement the step collects and records when the
+    // person confirms it. Until the task carries that value, an assertion here would be re-deriving a
+    // promise from prose and calling the result a contract. See the ownership of `requires` in
+    // SPEC-TASK-STATE-TRANSITIONS section 4.
+    console.log(
+      `--- delivered report: ${report.length} chars, ${proseParagraphs.length} prose paragraph(s) + `
+        + `${substantiveBullets.length} substantive bullet(s) = ${contentBlocks} content block(s) `
+        + '(floor 1200 chars / 3 blocks) ---',
+    );
+    expect(
+      contentBlocks,
+      'the report must contain ANALYSIS, not a section list: at least three content-bearing blocks - a '
+        + `prose paragraph over 180 chars, or a bullet over 140. Found ${proseParagraphs.length} `
+        + `paragraph(s) + ${substantiveBullets.length} bullet(s). An outline delivered as the report is `
+        + 'the defect this asserts against, and it passes every structural check above.',
+    ).toBeGreaterThanOrEqual(3);
   });
 
   // OUTPUT VALIDITY — data_extraction: an extraction task must hand back a real, structured, on-topic
@@ -259,7 +312,7 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
 
     // Open the presigned download and validate the CONTENT is a real structured extraction — a markdown
     // table with the requested fields, on-topic (churn / at-risk accounts), not a conversational summary.
-    await openAndValidateAttachment(page, attachment, {
+    const extracted = await openAndValidateAttachment(page, attachment, {
       namePattern: /\.(md|markdown|txt|csv)$/i,
       minLength: 200,
       mustMatch: [
@@ -267,6 +320,38 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
         { re: /churn|at.risk|risk/, because: 'the extraction must be ON-TOPIC (churn / at-risk accounts)', lower: true },
       ],
     });
+
+    // GROUNDED, NOT MERELY ON-TOPIC. The checks above are satisfied by any table containing the word
+    // "risk", so on their own they cannot tell a real extraction from a plausible invention - and this
+    // test's whole claim is that tier-scoped retrieval fed the answer. These assert the ROWS came from
+    // the seeded records (`backend/demo/context/premium/customer-accounts.json`, `churnRisk`).
+    //
+    // Three of four, not four of four: the ask is "every at-risk enterprise account", and which rows
+    // qualify as ENTERPRISE is the model's judgement over the corpus, not a fact this test owns. Three
+    // is enough to prove the corpus was read while leaving that judgement room.
+    const SEEDED_CHURN_ACCOUNTS = [
+      'Coastal Health Systems',
+      'Precision Analytics',
+      'Greenfield Energy',
+      'Urban Retail Group',
+    ];
+    const present = SEEDED_CHURN_ACCOUNTS.filter((a) => extracted.includes(a));
+    expect(
+      present.length,
+      `the extraction must carry the SEEDED churn-risk accounts, so this proves retrieval rather than a `
+        + `plausible-looking table. Found ${present.length}/4: [${present.join(', ')}]`,
+    ).toBeGreaterThanOrEqual(3);
+
+    // And the ARR the record carries, for at least one of them: the account NAME could be echoed from
+    // the request's phrasing, a figure could not. Tolerant of $155K / $155,000 / 155000 formatting.
+    const SEEDED_ARR = [155, 89, 120, 98];
+    const arrHit = SEEDED_ARR.some((n) =>
+      new RegExp(`\\$?\\s?${n}\\s?(k\\b|,000)`, 'i').test(extracted));
+    expect(
+      arrHit,
+      `the extraction must carry at least one seeded ARR figure (${SEEDED_ARR.map((n) => `$${n}K`).join(', ')}), `
+        + 'which a name alone does not prove',
+    ).toBe(true);
   });
 
   // guided_troubleshooting is an INTERACTIVE diagnostic task, NOT a document-producing one. It must
