@@ -316,8 +316,23 @@ export const DEFAULT_TASK_STATE_MACHINES: Record<string, TaskStateMachine> = {
     },
   },
   // place_item advances on the propose_item tool's success side-effect (collecting -> confirming),
-  // not a prose keyword or an in-band marker. `placed` (the host apply) is deferred; the task rests
-  // in `confirming` under its TTL until the apply lands or a cascade/nudge closes it.
+  // not a prose keyword or an in-band marker.
+  //
+  // `placed` RECORDS THE APPROVAL, not the host apply (owner decision 2026-08-19). The comment here
+  // used to call it the apply landing, with the task resting in `confirming` until the apply arrived,
+  // and that described a system this is not: nothing outside a model turn can move a machine
+  // (`advance_task_state` is callable only inside the tool loop, and the reply path keys on a message
+  // arriving in the conversation), there is no host endpoint, and no return path. On that reading NO
+  // task could ever reach `placed` and every place-item task would sit in `confirming` until its TTL.
+  // The runtime already behaves as this comment now says - the `placed` prompt tells the model the
+  // item has been added - so the comment was the only thing out of step.
+  //
+  // A state meaning "the host actually applied it" is DEFERRED, and it waits on an out-of-band
+  // advance rather than on a state name. SPEC-TASK-STATE-TRANSITIONS sets its two conditions: a
+  // runtime advancer needs a state DECLARING that it expects one, or it is the unbounded second
+  // writer the one-writer rule exists to prevent; and the advance is an AUTHORIZATION decision,
+  // because a submitter arriving on an API call has no sender to infer a party from and has to be
+  // checked against the party the step awaits.
   place_item: {
     initial: 'collecting',
     states: {
