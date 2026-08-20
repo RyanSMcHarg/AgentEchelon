@@ -379,10 +379,21 @@ propose the add, make sure you know WHERE it goes:
 If the position or detail is unclear, ask ONE short question (offer your best suggestion). Once you
 know the detail + position, PROPOSE the add with the add_item tool, setting \`afterItemId\` so it lands
 where it belongs (not appended blindly at the bottom).`;
+    // A CONFIRMATION IS COMPLETED BY ADVANCING, NOT BY PROPOSING AGAIN. The previous wording said only
+    // to "acknowledge briefly", and measured live, "Yes, that is right - go ahead and add it" was
+    // answered by calling the propose tool a second time: the person saw the identical proposal card
+    // again and the machine never left `confirming`. Read literally that was reasonable - they said
+    // "add it" and there is an add tool - so the prompt has to say which act completes the step.
     case 'confirming':
       return `\n\n## CURRENT TASK: Add a work item — awaiting confirmation
-You've proposed the add; the user reviews it on the card. If they confirm, acknowledge briefly and say
-where it landed. If they want a different position/detail, propose the corrected add_item again.`;
+You've proposed the add; the person reviews it on the card. The proposal is already on the table, so
+your job now is to record their decision, not to make it again:
+- They AGREE ("yes", "go ahead", "that is right") => call advance_task_state to \`placed\`, then say
+  briefly what was agreed and where it lands. Do NOT call add_item again - that re-proposes, shows
+  them the same card twice, and records no decision.
+- They want a DIFFERENT position or detail => propose the corrected add_item and wait. Do not advance.
+- They DECLINE => do not advance, and do not say it went ahead. Acknowledge it and ask what they would
+  like instead.`;
     case 'placed':
       return `\n\n## CURRENT TASK: Add a work item — done
 The item has been added. Offer a sensible next step (assign it, set a date, or add a related item).`;
@@ -483,18 +494,27 @@ Present a report outline for approval:
 - Note key data/metrics for each section
 - Ask if the user wants to adjust the structure`;
 
+    // DELIVERING IS NOT CLOSING, and the previous wording made those the same act: it said to mark
+    // the task done when the report is presented, and then to advance to `revising` if the user later
+    // asked for changes. `completed` is TERMINAL - it has no outgoing transitions - so the second
+    // instruction was unreachable from the first. Measured live: a person who said "keep the task open
+    // for review" got the report AND a closed task, and the revision they then asked for had no legal
+    // edge to travel; the machine recorded generating -> completed and the branch was gone.
     case 'generating':
       return `\n\n## CURRENT TASK: Report Generation - Generating
 Generate the full report and DELIVER it:
 - Follow the approved outline; include relevant data and analysis; use appropriate formatting (headers, tables, etc.).
-- The report is a finished deliverable. When you present it, mark the task done: advance_task_state to \`completed\`.
-- Do NOT make the user run a revision pass. Only if the user later asks for changes, advance to \`revising\`.`;
+- Delivering is NOT closing. Do not advance the task just because you presented the report - the person has it, and has not yet said whether it stands.
+- They ask for CHANGES => advance_task_state to \`revising\`.
+- They say it is right, or that they are done => advance_task_state to \`completed\`.
+- \`completed\` is TERMINAL: nothing can reopen it. A report closed at delivery cannot be revised, so do not close one the person is still reviewing.`;
 
     case 'revising':
       return `\n\n## CURRENT TASK: Report Generation - Revising (user-requested changes)
 The user asked for changes to a report you already delivered. Apply them:
-- Make the requested changes and briefly highlight what you modified.
-- Re-deliver: advance_task_state back to \`completed\`. Stay in revising only if the user asks for further changes.`;
+- Make the requested changes, briefly highlight what you modified, and re-deliver the report.
+- Stay in \`revising\` while they keep asking for changes - re-delivering is not closing here either.
+- Advance to \`completed\` only when they say it is right. \`completed\` is terminal and a closed report cannot be reopened.`;
 
     default:
       return '\n\n## CURRENT TASK: Report Generation\nHelp the user create their report.';
