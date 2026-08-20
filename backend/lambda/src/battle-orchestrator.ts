@@ -49,6 +49,7 @@ import {
   tryClaimOrchestratorFire,
   botRowsOnly,
   battleRowTtl,
+  clearActiveBattle,
   type BattleStateRow,
 } from './lib/battle-state.js';
 import {
@@ -277,7 +278,7 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
       bots[0].botArn,
       "This battle couldn't be completed. No assistant finished in time. Try /battle again.",
     );
-    await emitBattleComplete(battleId, 'closed:no-completion');
+    await emitBattleComplete(battleId, 'closed:no-completion', channelArn);
     console.log('[BattleOrchestrator] Battle closed — no completed bots', { battleId });
     return;
   }
@@ -385,7 +386,7 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
   //    'battle complete' signal (a '__complete__' sentinel row) so consumers
   //    (analytics, the tally UI, a future notification) get a done signal
   //    instead of inferring it from the state TTL aging out.
-  await emitBattleComplete(battleId, degraded ? 'round2:degraded' : 'round2:full');
+  await emitBattleComplete(battleId, degraded ? 'round2:degraded' : 'round2:full', channelArn);
   console.log('[BattleOrchestrator] Round 2 fan-out complete', { battleId, degraded });
 }
 
@@ -484,7 +485,20 @@ async function postBattleMessage(
  * which meant the "battle done" marker could expire while a task-shaped duel was still running - and a
  * marker that is gone is indistinguishable from one that was never written.
  */
-async function emitBattleComplete(battleId: string, reason: string): Promise<void> {
+async function emitBattleComplete(battleId: string, reason: string, channelArn?: string): Promise<void> {
+  // RELEASE THE CHANNEL, and do it here because this is already the place that knows the duel is over.
+  //
+  // The `__complete__` sentinel below was written so consumers would get a done signal "instead of
+  // inferring it from the state TTL aging out" - and then the one consumer that most needed it, the
+  // channel's active-battle pointer, went on inferring exactly that. Nothing cleared the pointer, so a
+  // finished duel kept its channel locked until `DUEL_MAX_LIFETIME_MS` expired and every reader that
+  // consults the pointer kept answering "a battle is running" for hours after the last answer landed.
+  //
+  // Before the sentinel write, deliberately: the sentinel is conditional on not already existing, so a
+  // redelivered invocation would skip straight past a release that had not happened yet.
+  if (channelArn) {
+    await clearActiveBattle({ channelArn, battleId, reason });
+  }
   if (!BATTLE_STATE_TABLE) return;
   const ttl = battleRowTtl();
   try {

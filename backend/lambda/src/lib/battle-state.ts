@@ -262,8 +262,16 @@ export function invalidateChannelBattleConfigCache(channelArn: string): void {
 export async function setActiveBattle(args: {
   channelArn: string;
   battleId: string;
-  /** The duel owner, kept on the pointer so it survives the per-bot rows aging out. */
-  initiatorUserSub?: string;
+  /**
+   * The duel owner, kept on the pointer so it survives the per-bot rows aging out.
+   *
+   * REQUIRED. A battle has an initiator the way a task has an owner (ADR-024): it is the person a
+   * waiting side is waiting on, the only one whose reply resumes it, and the only one who may end it.
+   * A duel without one is a comparison nobody is running - every ownership rule downstream degrades to
+   * "anyone", which is how a member who never started a duel could answer a question they were never
+   * asked. The fan-out refuses to start a duel it cannot attribute, so this is never absent by design.
+   */
+  initiatorUserSub: string;
 }): Promise<void> {
   if (!CHANNEL_BATTLE_CONFIG_TABLE) return;
   try {
@@ -271,23 +279,91 @@ export async function setActiveBattle(args: {
       new UpdateCommand({
         TableName: CHANNEL_BATTLE_CONFIG_TABLE,
         Key: { channelArn: args.channelArn },
-        // A duel with no known owner must REMOVE the field, not leave the last duel's owner behind:
-        // this is one row reused by every battle in the channel, so a carried-over value would hand the
-        // new duel the PREVIOUS initiator - locking its real owner out and letting a stranger resume it.
-        // A stale owner is worse than no owner, because no owner fails open and a wrong one fails shut.
-        UpdateExpression: args.initiatorUserSub
-          ? 'SET activeBattleId = :b, activeBattleStartedAt = :now, activeBattleInitiator = :i'
-          : 'SET activeBattleId = :b, activeBattleStartedAt = :now REMOVE activeBattleInitiator',
+        // ALWAYS SET THE OWNER, because a duel always has one.
+        //
+        // This used to branch, REMOVEing the field when no owner was known - a real hazard while the
+        // initiator was optional, since this is ONE row reused by every battle in the channel and a
+        // carried-over value would hand the new duel the PREVIOUS initiator, locking its real owner out
+        // and letting a stranger resume it. The branch is gone because its precondition is: the
+        // initiator is required and the fan-out refuses a duel it cannot attribute, so the SET always
+        // overwrites and nothing can be inherited.
+        UpdateExpression:
+          'SET activeBattleId = :b, activeBattleStartedAt = :now, activeBattleInitiator = :i',
         ConditionExpression: 'attribute_exists(channelArn)',
         ExpressionAttributeValues: {
           ':b': args.battleId,
           ':now': new Date().toISOString(),
-          ...(args.initiatorUserSub ? { ':i': args.initiatorUserSub } : {}),
+          ':i': args.initiatorUserSub,
         },
       }),
     );
   } catch (err) {
     console.warn('[battle-state] setActiveBattle failed (continuation may degrade):', err);
+  }
+  invalidateChannelBattleConfigCache(args.channelArn);
+}
+
+/**
+ * RELEASE the channel's active-battle pointer, because the duel it points at has ENDED - finished,
+ * closed loud, or abandoned. All three release it the same way; only `reason` differs.
+ *
+ * This is the write whose absence made the clock load-bearing. `setActiveBattle` was the pointer's only
+ * writer, so a duel that reached `COMPLETED` on both sides still left the pointer standing and the only
+ * thing that ever took it down was `DUEL_MAX_LIFETIME_MS` expiring. The rows knew the duel was over; the
+ * pointer did not, and the readers that consult the pointer went on believing a battle was running.
+ *
+ * CONDITIONAL on the battleId, and that condition is not decoration. A straggler from an ended duel - a
+ * late orchestrator invocation, a retried abandon - arriving after the channel has started a NEW battle
+ * would otherwise clear the new duel's pointer and strand it exactly as an overwrite would have. The
+ * condition makes a late release a no-op instead.
+ *
+ * Non-fatal, like `setActiveBattle`: a failure here degrades to the old behaviour (the pointer stands
+ * until the backstop clock releases it) and must never take down the path that is ending the duel.
+ */
+export async function clearActiveBattle(args: {
+  channelArn: string;
+  battleId: string;
+  /** `round2:full` | `round2:degraded` | `closed:no-completion` | `abandoned:*` - kept for the audit. */
+  reason: string;
+  /** WHO ended it, when a person did. Absent when the duel ended on its own. */
+  endedBy?: string;
+}): Promise<void> {
+  if (!CHANNEL_BATTLE_CONFIG_TABLE) return;
+  try {
+    await ddb.send(
+      new UpdateCommand({
+        TableName: CHANNEL_BATTLE_CONFIG_TABLE,
+        Key: { channelArn: args.channelArn },
+        UpdateExpression:
+          'SET activeBattleEndedAt = :now, activeBattleEndReason = :r'
+          + (args.endedBy ? ', activeBattleEndedBy = :by' : '')
+          + ' REMOVE activeBattleId, activeBattleStartedAt, activeBattleInitiator',
+        ConditionExpression: 'activeBattleId = :b',
+        ExpressionAttributeValues: {
+          ':b': args.battleId,
+          ':now': new Date().toISOString(),
+          ':r': args.reason,
+          ...(args.endedBy ? { ':by': args.endedBy } : {}),
+        },
+      }),
+    );
+    console.log('[battle-state] active battle released', {
+      channelArn: args.channelArn,
+      battleId: args.battleId,
+      reason: args.reason,
+    });
+  } catch (err) {
+    // ConditionalCheckFailed is the EXPECTED outcome for a late release and is not a problem: it means
+    // the pointer already moved on. Anything else degrades to the backstop clock.
+    const name = (err as { name?: string }).name;
+    if (name === 'ConditionalCheckFailedException') {
+      console.log('[battle-state] active battle already released or superseded; nothing to clear', {
+        channelArn: args.channelArn,
+        battleId: args.battleId,
+      });
+    } else {
+      console.warn('[battle-state] clearActiveBattle failed (pointer falls back to the backstop):', err);
+    }
   }
   invalidateChannelBattleConfigCache(args.channelArn);
 }
@@ -326,11 +402,13 @@ export async function resolveActiveBattle(
   const active = { battleId: cfg.activeBattleId, initiatorUserSub: cfg.activeBattleInitiator };
   const startedMs = cfg.activeBattleStartedAt ? Date.parse(cfg.activeBattleStartedAt) : NaN;
   if (Number.isNaN(startedMs)) return active; // no/invalid timestamp → let rows arbitrate
-  // Bounded by the DUEL's lifetime, not one leg's. A flat ten minutes is the right order of magnitude
-  // for a single-turn duel and wrong for a task-shaped one: it released the single-active-battle
-  // pointer while the first duel was still working with the user, so a second `/battle` could start
-  // alongside it (ADR-026).
-  if (Date.now() - startedMs > DUEL_MAX_LIFETIME_MS) return null; // battle aged out
+  // A BACKSTOP, NOT THE MECHANISM (DESIGN-BATTLE 2a-i). A duel now ends by a recorded release -
+  // `clearActiveBattle`, called when it finishes, closes loud, or is abandoned - and this clock only
+  // covers a release that never landed, since that write is deliberately non-fatal. It must stay long
+  // enough not to fire under a task-shaped duel that is legitimately still working with the user; ten
+  // minutes was not, and released the pointer mid-duel so a second `/battle` could start alongside the
+  // first (ADR-026). It is no longer how an ordinary duel ends, and nothing should read it as intent.
+  if (Date.now() - startedMs > DUEL_MAX_LIFETIME_MS) return null; // backstop: release never landed
   return active;
 }
 
@@ -338,7 +416,16 @@ export async function resolveActiveBattle(
 // BattleState — per-bot state-machine rows
 // ---------------------------------------------------------------------------
 
-export type BattleBotStatus = 'INVOKED' | 'WAITING_FOR_USER' | 'COMPLETED' | 'FAILED';
+/**
+ * `ABANDONED` is an END, not a FAILURE, and the distinction is the whole point of it existing.
+ *
+ * A duel the person walked out of - by changing the subject, by starting another one, or by a moderator
+ * turning Battle Mode off - stops here (DESIGN-BATTLE 2a-i). `FAILED` would be a lie: nothing went wrong,
+ * somebody left. And `COMPLETED` would be worse, because it would feed a comparison that never happened.
+ *
+ * It is deliberately ABSENT from `allBotsTerminal`. See that function and `duelInFlight`.
+ */
+export type BattleBotStatus = 'INVOKED' | 'WAITING_FOR_USER' | 'COMPLETED' | 'FAILED' | 'ABANDONED';
 
 export interface BattleStateRow {
   battleId: string;
@@ -408,8 +495,8 @@ export async function initBotState(args: {
   battleId: string;
   botArn: string;
   correlationId: string;
-  /** Who ran /battle. Recorded on every side so the duel keeps its owner. */
-  initiatorUserSub?: string;
+  /** Who ran /battle. REQUIRED - see `setActiveBattle`. Recorded on every side so the duel keeps its owner. */
+  initiatorUserSub: string;
 }): Promise<void> {
   if (!BATTLE_STATE_TABLE) return;
   const nowMs = Date.now();
@@ -461,7 +548,13 @@ export async function initBotState(args: {
 export async function transitionBotState(args: {
   battleId: string;
   botArn: string;
-  state: 'COMPLETED' | 'FAILED';
+  /**
+   * The three states a side can STOP in. `ABANDONED` joins them because ending a duel is a transition
+   * like any other, and this function's existing condition is already the rule it needs: only a side
+   * that is `INVOKED` or `WAITING_FOR_USER` may move, so a side that genuinely completed keeps its
+   * answer and a second abandon claims nothing.
+   */
+  state: 'COMPLETED' | 'FAILED' | 'ABANDONED';
   round1Reply?: string;
   round1MessageId?: string;
   correlationId?: string;
@@ -855,6 +948,59 @@ export function allBotsTerminal(rows: BattleStateRow[]): boolean {
   const bots = botRowsOnly(rows);
   if (bots.length === 0) return false;
   return bots.every((r) => r.state === 'COMPLETED' || r.state === 'FAILED');
+}
+
+/**
+ * Is a duel still RUNNING - a different question from `allBotsTerminal`, and the reason there are now two.
+ *
+ * `allBotsTerminal` answers "may round 2 fire", and it counts only `COMPLETED|FAILED`. `ABANDONED` is
+ * absent from that list ON PURPOSE (DESIGN-BATTLE 2a-i): a duel somebody walked out of can then never
+ * satisfy the round-2 trigger, so the suppression is STRUCTURAL rather than a check every future call
+ * site has to remember. The cost of that choice is that "not terminal" no longer means "still going",
+ * which is what this predicate is for.
+ *
+ * Running means a side is still `INVOKED` (generating) or `WAITING_FOR_USER` (blocked on a person).
+ * `ABANDONED` fails both, so an abandoned duel is neither running nor comparable - which is exactly what
+ * it is.
+ */
+export function duelInFlight(rows: BattleStateRow[]): boolean {
+  return botRowsOnly(rows).some((r) => r.state === 'INVOKED' || r.state === 'WAITING_FOR_USER');
+}
+
+/**
+ * Is this side past the moment it was DUE? Moved here from the orchestrator so the in-flight guard and
+ * the degraded-resolution path share one rule.
+ *
+ * WHICH CLOCK depends on the state the row is in, and only the writer knows: a generating side carries
+ * the machine deadline, a side blocked on a human the far longer user-wait one (ADR-026, the two clocks).
+ * This must not second-guess that, so it reads `deadlineAt` and nothing else.
+ *
+ * WHY NOT THE ROW'S TTL, which the single-active-battle guard used to read. Expiry is a fact about
+ * DynamoDB's janitor; being past deadline is a fact about the duel. Reading the first as the second made
+ * one number carry two meanings, and when the row lifetime was lengthened so a finished side could
+ * outlive its rival's think time, a stalled duel silently went from holding its channel for ten minutes
+ * to holding it for four hours. A deadline says the same thing at any TTL.
+ *
+ * Tolerates ISO, epoch seconds or epoch ms, because a value this load-bearing should not fail loud over
+ * its own encoding. The `enteredStateAt + MACHINE_DEADLINE_MS` fallback is for rows written BEFORE
+ * `deadlineAt` existed, and it is exactly the arithmetic that made a thinking user indistinguishable
+ * from a stalled assistant - kept only so an in-flight duel spanning a deploy still resolves. Final
+ * fallback is "not yet due": never fail loud without cause.
+ */
+export function isPastDeadline(row: BattleStateRow, nowMs: number = Date.now()): boolean {
+  const raw: unknown = row.deadlineAt;
+  let ms = NaN;
+  if (typeof raw === 'number') {
+    ms = raw < 1e12 ? raw * 1000 : raw; // seconds vs milliseconds
+  } else if (typeof raw === 'string' && raw !== '') {
+    const n = Number(raw);
+    ms = Number.isFinite(n) ? (n < 1e12 ? n * 1000 : n) : Date.parse(raw);
+  } else if (row.enteredStateAt) {
+    const entered = Date.parse(row.enteredStateAt);
+    ms = Number.isFinite(entered) ? entered + MACHINE_DEADLINE_MS : NaN;
+  }
+  if (!Number.isFinite(ms)) return false;
+  return nowMs > ms;
 }
 
 /**

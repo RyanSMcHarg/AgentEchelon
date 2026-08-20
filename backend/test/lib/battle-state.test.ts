@@ -87,7 +87,7 @@ describe('initBotState', () => {
   it('writes the INVOKED row with attribute_not_exists guard', async () => {
     mockSend.mockResolvedValueOnce({} as PutCommandOutput);
     const { initBotState } = await import('../../lambda/src/lib/battle-state');
-    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'corr-1' });
+    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'corr-1', initiatorUserSub: 'owner-sub' });
 
     expect(mockSend).toHaveBeenCalledTimes(1);
     const cmd = mockSend.mock.calls[0][0];
@@ -105,7 +105,7 @@ describe('initBotState', () => {
   it('records NO task on a TASK_* battle either', async () => {
     mockSend.mockResolvedValueOnce({} as PutCommandOutput);
     const { initBotState } = await import('../../lambda/src/lib/battle-state');
-    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'c' });
+    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'c', initiatorUserSub: 'owner-sub' });
     const item = mockSend.mock.calls[0][0].input.Item;
     expect('taskId' in item).toBe(false);
     // And with it goes the ordering problem that forced it: the row must be written BEFORE the
@@ -114,8 +114,10 @@ describe('initBotState', () => {
     // `deadlineAt` joins the set (ADR-026): a freshly invoked side is GENERATING, so the row records
     // which clock it is on rather than leaving the orchestrator to infer one from `enteredStateAt`.
     // The strict key set is the point of this assertion - it is what catches a task field creeping back.
+    // `initiatorUserSub` is in the set because a battle HAS an initiator, required, the way a task has
+    // an owner - it is the duel's ownership record, not a task field.
     expect(Object.keys(item).sort()).toEqual(
-      ['battleId', 'botArn', 'correlationId', 'deadlineAt', 'enteredStateAt', 'state', 'ttl'],
+      ['battleId', 'botArn', 'correlationId', 'deadlineAt', 'enteredStateAt', 'initiatorUserSub', 'state', 'ttl'],
     );
   });
 
@@ -123,14 +125,14 @@ describe('initBotState', () => {
     mockSend.mockRejectedValueOnce(conditionalCheckFailed());
     const { initBotState } = await import('../../lambda/src/lib/battle-state');
     await expect(
-      initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'corr-1' }),
+      initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'corr-1', initiatorUserSub: 'owner-sub' }),
     ).resolves.toBeUndefined();
   });
 
   it('is a no-op when BATTLE_STATE_TABLE is unset (fail-open)', async () => {
     delete process.env.BATTLE_STATE_TABLE;
     const { initBotState } = await import('../../lambda/src/lib/battle-state');
-    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'corr-1' });
+    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'corr-1', initiatorUserSub: 'owner-sub' });
     expect(mockSend).not.toHaveBeenCalled();
   });
 });
@@ -466,7 +468,7 @@ describe('setActiveBattle (channel→battle pointer at fan-out)', () => {
   it('conditionally SETs the pointer and busts the config cache', async () => {
     mockSend.mockResolvedValueOnce({} as PutCommandOutput);
     const mod = await import('../../lambda/src/lib/battle-state');
-    await mod.setActiveBattle({ channelArn: CHANNEL_ARN, battleId: BATTLE_ID });
+    await mod.setActiveBattle({ channelArn: CHANNEL_ARN, battleId: BATTLE_ID, initiatorUserSub: 'owner-sub' });
 
     const cmd = mockSend.mock.calls[0][0];
     expect(cmd.__type).toBe('Update');
@@ -493,31 +495,38 @@ describe('setActiveBattle (channel→battle pointer at fan-out)', () => {
     expect(cmd.input.ExpressionAttributeValues[':i']).toBe('user-owner');
   });
 
-  it('CLEARS a previous duel\'s owner when the new one has none', async () => {
-    // The pointer is one row reused by every battle in the channel. Leaving the old value behind
-    // would hand the new duel the PREVIOUS initiator as its owner - which locks the real owner out of
-    // their own duel and lets the previous one resume it. A stale owner is worse than no owner.
+  it('OVERWRITES a previous duel\'s owner, so nothing is ever inherited', async () => {
+    // The pointer is one row reused by every battle in the channel. Leaving the old value behind would
+    // hand the new duel the PREVIOUS initiator as its owner - which locks the real owner out of their
+    // own duel and lets the previous one resume it.
+    //
+    // This used to be guarded by a REMOVE branch for the no-owner case. That branch is gone with the
+    // case it covered: a battle has an initiator the way a task has an owner, the field is required,
+    // and the fan-out refuses to start a duel it cannot attribute. So the write is an unconditional
+    // SET, and this asserts it stays that way - a re-introduced branch here brings the stale-owner
+    // hazard back with it.
     mockSend.mockResolvedValueOnce({} as PutCommandOutput);
     const { setActiveBattle } = await import('../../lambda/src/lib/battle-state');
-    await setActiveBattle({ channelArn: CHANNEL_ARN, battleId: BATTLE_ID });
+    await setActiveBattle({ channelArn: CHANNEL_ARN, battleId: BATTLE_ID, initiatorUserSub: 'owner-sub' });
 
     const cmd = mockSend.mock.calls[0][0];
-    expect(cmd.input.UpdateExpression).toContain('REMOVE activeBattleInitiator');
-    expect(cmd.input.ExpressionAttributeValues[':i']).toBeUndefined();
+    expect(cmd.input.UpdateExpression).toContain('activeBattleInitiator = :i');
+    expect(cmd.input.UpdateExpression).not.toContain('REMOVE');
+    expect(cmd.input.ExpressionAttributeValues[':i']).toBe('owner-sub');
   });
 
   it('is non-fatal: a failed write must not throw (battle still fans out)', async () => {
     mockSend.mockRejectedValueOnce(new Error('ddb down'));
     const { setActiveBattle } = await import('../../lambda/src/lib/battle-state');
     await expect(
-      setActiveBattle({ channelArn: CHANNEL_ARN, battleId: BATTLE_ID }),
+      setActiveBattle({ channelArn: CHANNEL_ARN, battleId: BATTLE_ID, initiatorUserSub: 'owner-sub' }),
     ).resolves.toBeUndefined();
   });
 
   it('is a no-op when CHANNEL_BATTLE_CONFIG_TABLE is unset', async () => {
     delete process.env.CHANNEL_BATTLE_CONFIG_TABLE;
     const { setActiveBattle } = await import('../../lambda/src/lib/battle-state');
-    await setActiveBattle({ channelArn: CHANNEL_ARN, battleId: BATTLE_ID });
+    await setActiveBattle({ channelArn: CHANNEL_ARN, battleId: BATTLE_ID, initiatorUserSub: 'owner-sub' });
     expect(mockSend).not.toHaveBeenCalled();
   });
 });

@@ -90,6 +90,7 @@ import {
   getModelCatalog,
   type BackendModelKey,
 } from '../../../lib/config/model-strategy.js';
+import { clearBattleWaitingMarker } from './battle-waiting-marker.js';
 import { extractAttachment } from './battle-attachment.js';
 import { fetchAttachmentBytes, type S3GetClient } from './attachment-bytes.js';
 
@@ -2209,57 +2210,19 @@ export async function updateMessage(
   }
 }
 
-/** `<!--battlewaiting:...-->`, the only marker this clear touches. */
-const BATTLE_WAITING_MARKER = /<!--battlewaiting:[^>]*-->/g;
-
 /**
- * End the waiting affordance on the message holding this side's clarifying question (ADR-029).
+ * The waiting-affordance clear now lives in `battle-waiting-marker.ts` and is re-exported here.
  *
- * The user has answered, so the side is generating again and the frontend must stop rendering it as
- * waiting. The QUESTION TEXT STAYS: it is a real part of the duel and the transcript, and the answer
- * lands on a placeholder of its own rather than overwriting this message. Only the marker goes.
+ * It moved because the RESUME stopped being its only caller: a duel that ENDS while a side is still
+ * waiting has to take the affordance down too, or an ended duel goes on inviting an answer (DESIGN-BATTLE
+ * 2a-i). That caller runs in an API Lambda, which cannot import this module without pulling the entire
+ * generation stack along for forty lines of code.
  *
- * Read-then-write, because only the channel knows what the question said - the battle row drops
- * `clarificationQuestion` on resume, deliberately, so this cannot reconstruct the content locally.
- *
- * BEST-EFFORT BY CONSTRUCTION. A failure here leaves a stale "Replying to:" affordance on one message,
- * which is cosmetic; throwing would cost the user the answer they are waiting for. Logged so it is
- * visible rather than silent.
+ * Re-exported rather than relocated outright so every existing importer, and the generated `.d.ts`,
+ * keeps working. Imported as well as re-exported because the resume path below still calls it, and
+ * `export ... from` alone creates no local binding.
  */
-export async function clearBattleWaitingMarker(
-  channelArn: string,
-  messageId: string,
-  botArn: string,
-): Promise<boolean> {
-  try {
-    const current = await messagingClient.send(new GetChannelMessageCommand({
-      ChannelArn: channelArn,
-      MessageId: messageId,
-      ChimeBearer: botArn,
-    }));
-    const raw = current.ChannelMessage?.Content || '';
-    const decoded = (() => {
-      try { return decodeURIComponent(raw); } catch { return raw; }
-    })();
-    if (!BATTLE_WAITING_MARKER.test(decoded)) {
-      BATTLE_WAITING_MARKER.lastIndex = 0;
-      return false; // already cleared, or never carried one
-    }
-    BATTLE_WAITING_MARKER.lastIndex = 0;
-    const cleared = decoded.replace(BATTLE_WAITING_MARKER, '').trimEnd();
-    await messagingClient.send(new UpdateChannelMessageCommand({
-      ChannelArn: channelArn,
-      MessageId: messageId,
-      Content: encodeURIComponent(cleared),
-      ChimeBearer: botArn,
-      Metadata: current.ChannelMessage?.Metadata,
-    }));
-    return true;
-  } catch (err) {
-    console.warn('[AsyncProcessor][battle] could not clear the waiting marker (non-fatal):', err);
-    return false;
-  }
-}
+export { clearBattleWaitingMarker };
 
 // ============================================================
 // Error Handling

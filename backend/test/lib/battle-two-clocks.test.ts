@@ -65,7 +65,7 @@ describe('a generating side is on the MACHINE clock', () => {
     mockSend.mockResolvedValueOnce({} as PutCommandOutput);
     const before = Date.now();
     const { initBotState } = await import('../../lambda/src/lib/battle-state');
-    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'c' });
+    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'c', initiatorUserSub: 'owner-sub' });
 
     const deadline = deadlineFrom(mockSend.mock.calls[0][0]);
     // Within the machine window, nowhere near the human one.
@@ -282,7 +282,7 @@ describe('a row outlives the DUEL, not the leg that wrote it', () => {
     mockSend.mockResolvedValueOnce({} as PutCommandOutput);
     const before = Date.now();
     const { initBotState } = await import('../../lambda/src/lib/battle-state');
-    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'c' });
+    await initBotState({ battleId: BATTLE_ID, botArn: BOT_A, correlationId: 'c', initiatorUserSub: 'owner-sub' });
 
     const call = mockSend.mock.calls[0][0];
     // The row is written before the invoke precisely so a side that crashes is VISIBLE rather than

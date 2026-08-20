@@ -20,6 +20,7 @@ const mockLambdaSend = jest.fn();
 const mockSsmSend = jest.fn();
 const mockReadBattleRows = jest.fn();
 const mockTryClaimOrchestratorFire = jest.fn();
+const mockClearActiveBattle = jest.fn();
 
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn().mockImplementation(() => ({ send: mockMessagingSend })),
@@ -51,6 +52,7 @@ jest.mock('../lambda/src/lib/battle-state', () => ({
     return bots.every((r) => r.state === 'COMPLETED' || r.state === 'FAILED');
   },
   botRowsOnly: (rows: Array<{ botArn: string }>) => rows.filter((r) => r.botArn !== '__orchestrator__'),
+  clearActiveBattle: (...args: unknown[]) => mockClearActiveBattle(...args),
 }));
 
 import type { BattleOrchestratorEvent } from '../lambda/src/battle-orchestrator';
@@ -84,6 +86,7 @@ async function loadHandler() {
       return bots.every((r) => r.state === 'COMPLETED' || r.state === 'FAILED');
     },
     botRowsOnly: (rows: Array<{ botArn: string }>) => rows.filter((r) => r.botArn !== '__orchestrator__'),
+    clearActiveBattle: (...args: unknown[]) => mockClearActiveBattle(...args),
   }));
   const mod = await import('../lambda/src/battle-orchestrator');
   return mod.handler;
