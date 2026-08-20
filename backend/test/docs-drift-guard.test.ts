@@ -40,6 +40,30 @@ const SCAN_EXTENSIONS = new Set(['.md', '.ts']);
  * keyword-classified" notes) must not trip it.
  */
 const BANNED: Array<{ phrase: string; truth: string }> = [
+  // --- Class -2: `place_item.placed` records the APPROVAL, not a host apply (owner, 2026-08-19). ---
+  //
+  // The claim lived in the machine's code comment and was copied into the spec from there, which is
+  // how it survived: both readings looked mutually confirming. It describes a system this is not -
+  // nothing outside a model turn can move a machine, so on that reading no task could ever reach
+  // `placed`. Pinned because the deferred capability it points at (an out-of-band advance) will be
+  // designed later, and whoever picks that up must not start from a state that already claims to be
+  // the landing.
+  // Both phrases are lowercase and fit on ONE line, because the matcher tests
+  // `line.toLowerCase().includes(phrase)` per line: a phrase carrying a newline or a capital can
+  // never fire, and a guard that cannot fire is the failure this file exists to prevent.
+  // "the host apply" alone is deliberately NOT banned - DESIGN-ASSISTANT-MEETINGS uses it correctly
+  // for its host apply ENDPOINTS, which is a real thing that design proposes.
+  {
+    phrase: 'placed` (the host apply',
+    truth: '`placed` records the person\'s approval; the host-apply landing is a DEFERRED capability '
+      + 'waiting on the out-of-band advance (SPEC-TASK-STATE-TRANSITIONS, "an advance from outside a '
+      + 'model turn")',
+  },
+  {
+    phrase: 'until the apply lands',
+    truth: 'a confirmation completes the step and the model advances it to `placed`; nothing waits '
+      + 'for a host apply, because no return path exists',
+  },
   // --- Class -1: a Lex-materialised message DOES pass through the channel flow. ---
   //
   // This one earned its guard the hard way. The claim was asserted in FOUR places - ADR-022,

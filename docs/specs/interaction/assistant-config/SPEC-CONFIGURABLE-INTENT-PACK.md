@@ -4,7 +4,7 @@
 
 **Coverage:** `tests/e2e/agent-intents.spec.ts`
 
-**Verified by:** `backend/test/lib/intent-pack.test.ts` (back-compat, override, malformed-fallback, and the per-intent response settings), `backend/test/task-state-machines.test.ts` (task-machine graph validation, and the intent pack's optional `machines` block carried over the platform defaults with a malformed-override fallback), and `backend/test/lib/task-loop-machines.test.ts` (a per-assistant `machines` override takes effect at loop time over the deployment pack).
+**Verified by:** `backend/test/lib/intent-pack.test.ts` (back-compat, override, malformed-fallback, and the per-intent response settings), `backend/test/task-state-machines.test.ts` (task-machine graph validation, and the intent pack's optional `machines` block carried over the platform defaults with a malformed-override fallback), `backend/test/lib/task-loop-machines.test.ts` (a per-assistant `machines` override takes effect at loop time over the deployment pack), and `backend/test/lib/a-pack-machine-keeps-its-flags.test.ts` (`requires`, `resolvedByOneResponse` and `delivers` survive the coercion, a pack-declared delivering state reaches the attachment gate, and a pack declaring a contradiction is refused whole-block).
 
 **Problem and who it's for:** A business adapting an assistant to its own domain - support, recipes, billing - wants the assistant to recognize *its* intents and route delivery and model choice on them, by supplying its own taxonomy as config rather than editing platform code or living with a vendor's fixed intent set. This is for the AI developer adapting AgentEchelon to their domain; the alternative is forking the classifier or accepting an off-the-shelf bot's baked-in categories. It makes the intent taxonomy a per-deployment config value (mirroring the persona seam): AgentEchelon ships a generic default and a deployment supplies its own pack, so nothing domain-specific is baked into the platform. (Current state: the taxonomy was a fixed enterprise-support enum, so a non-support deployment saw its real intents collapse to `GENERAL` and the intent signal became dead weight.)
 
@@ -55,6 +55,20 @@ accepted and means the same thing, so a pack written against the older spelling 
 (section 12.6). Both spellings survive the pack's field-by-field coercion, and a state naming a party
 the platform does not resolve is refused: the whole `machines` block falls back to the platform
 defaults rather than shipping steps that can never find an owner.
+
+**A pack machine keeps every field a `TaskStateDef` may declare**, and that is worth stating because
+the coercion rebuilds each state field by field rather than copying it: `requires`,
+`resolvedByOneResponse` and `delivers` survive alongside the wait forms, `transitions`, `terminal`,
+`prompt` and `placeholder`. A `requires` entry that is not a string is dropped from the list rather
+than admitted.
+
+**A pack that declares a contradiction is refused, whole-block.** The rules in
+`SPEC-TASK-STATE-TRANSITIONS` section 4 - a state that awaits nobody cannot declare `requires`, and
+`requires` cannot sit beside `resolvedByOneResponse` - are evaluated against the machine the pack
+actually wrote, so a pack cannot ship a combination the platform refuses from any other author. As
+with a malformed graph, the deployment falls back to the platform defaults and logs loudly: a
+deployment running the reference workflows is one an operator can diagnose, while a block quietly
+missing the field that decides delivery is not.
 
 ### Per-intent response settings (P3)
 

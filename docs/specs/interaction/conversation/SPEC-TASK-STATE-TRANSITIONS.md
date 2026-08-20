@@ -585,10 +585,21 @@ parses: the active-task and battle markers. The proposal and suggestions markers
 HOST widget that is not part of this platform, and the Apply that widget offers calls a host endpoint
 that does not exist here either. So the emission half exists; the surface and the RETURN path do not.
 
-**And one shipped machine already assumes that return path.** `place_item` documents `placed` as the
-HOST APPLY, with the task resting in `confirming` under its TTL until the apply lands. The machine was
-written for a step completed by something other than a chat message, and nothing delivers that
-completion, which is why a confirmation currently has to stand in for it.
+**And one shipped machine was written against that return path.** `place_item` proposes an item and
+waits for the person to confirm it. The step it was drawn for is completed by something other than a
+chat message - a host applying the proposal - and nothing delivers that completion.
+
+**So `placed` records the APPROVAL, not the apply.** The machine's own comment used to call `placed`
+the host-apply landing, with the task resting in `confirming` until the apply arrived, and that
+described a system this is not: on that reading no task could ever reach `placed`, because nothing
+outside a model turn can move a machine, and every place-item task would sit in `confirming` until its
+TTL expired. What the runtime does, and has always done, is complete the step when the person agrees
+and the model advances it. A state meaning "the host actually applied it" is a DEFERRED capability
+that waits on the out-of-band advance below, not a rename of this one.
+
+The cost of that is worth stating plainly, because it is the reason the deferred capability matters:
+the record cannot distinguish an approval from an applied change. A `place_item` task that reaches
+`placed` says a person said yes, and says nothing about whether anything was placed.
 
 Two things follow, and both are decisions rather than implementation details:
 
