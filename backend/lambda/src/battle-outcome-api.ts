@@ -31,7 +31,7 @@ import {
   recordBattleOutcome,
   readUserBattleOutcome,
 } from './lib/battle-outcome.js';
-import { loadChannelBattleConfig, readBattleRows, botRowsOnly } from './lib/battle-state.js';
+import { loadChannelBattleConfig, readBattleRows, duelWasAbandoned } from './lib/battle-state.js';
 import type { BattleOutcome } from './lib/analytics-metadata.js';
 import { parseJsonBody } from './lib/auth.js';
 
@@ -147,8 +147,8 @@ async function handlePost(
   // from ones that do not, so it must sit behind the gate that establishes the caller belongs here;
   // in front of it, it would answer that question for anyone who asked.
   try {
-    const rows = botRowsOnly(await readBattleRows(battleId));
-    if (rows.length > 0 && rows.some((r) => r.state === 'ABANDONED')) {
+    const rows = await readBattleRows(battleId);
+    if (rows.length > 0 && duelWasAbandoned(rows)) {
       console.log('[battle-outcome] refusing a pick for an abandoned battle', { battleId });
       return respond(409, {
         error: 'That battle was ended before it finished, so there is no result to judge',
@@ -156,9 +156,12 @@ async function handlePost(
       }, origin);
     }
   } catch (stateErr) {
-    // Fail OPEN, and only here. The duel's state could not be read; refusing would lose a pick on a
-    // comparison the person did see. A stray pick on an abandoned duel is a smaller error than
-    // discarding a real judgement, and the abandon path is what normally prevents it.
+    // Belt and braces: `readBattleRows` catches internally and returns `[]`, so this branch is not the
+    // fail-open path and should not be read as one. THE FAIL-OPEN IS `rows.length > 0` ABOVE - an empty
+    // result means either "this duel has no rows" or "the read did not work", the two are
+    // indistinguishable from here, and neither is evidence that a duel was abandoned. Refusing on
+    // silence would discard a real judgement from someone who did see the comparison, which is the worse
+    // error of the two.
     console.warn('[battle-outcome] could not read battle state; recording the pick anyway', {
       battleId, err: (stateErr as Error).name,
     });

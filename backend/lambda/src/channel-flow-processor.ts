@@ -56,7 +56,7 @@ import {
   resumeBotFromWaiting,
   extractTargetedBotArns,
   isPastDeadline,
-  duelInFlight,
+  duelIsLive,
   type BattleStateRow,
 } from './lib/battle-state.js';
 import { endBattle } from './lib/battle-end.js';
@@ -1376,11 +1376,16 @@ async function handleBattleEnd(params: {
   }
 
   // Past the gate, so both remaining exits are the owner's (or a moderator's) to take.
-  const rows = botRowsOnly(await readBattleRows(active.battleId));
-  if (!duelInFlight(rows)) {
-    // Every side has already stopped - the duel finished, or it is mid-rebuttal, and either way there
-    // is nothing left running to interrupt. Release the pointer so the next `/battle` is not refused,
-    // and say the plain thing rather than reporting an end that had already happened.
+  //
+  // `duelIsLive`, NOT `duelInFlight`. The narrow predicate is false for the whole of round 2, so using
+  // it here reported a duel as already finished WHILE its rebuttal was generating - and then ended it
+  // anyway, winning the orchestrator's claim and killing the round 2 it had just told the person was
+  // over. A duel is finished when the orchestrator says so, not when both sides happen to be idle.
+  const rows = await readBattleRows(active.battleId);
+  if (!duelIsLive(rows)) {
+    // Nothing further is going to happen for this duel: it resolved, or every side was abandoned.
+    // Release the pointer so the next `/battle` is not refused, and say the plain thing rather than
+    // reporting an end that had already happened.
     await endBattle({
       channelArn,
       battleId: active.battleId,
@@ -1515,7 +1520,10 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
   const battleId = deriveBattleId(channelArn, userMessageId);
   const activeBattleId = await resolveActiveBattleId(channelArn);
   if (activeBattleId && activeBattleId !== battleId) {
-    const activeRows = botRowsOnly(await readBattleRows(activeBattleId));
+    // RAW rows, sentinels included: `duelIsLive` reads the resolution marker, which `botRowsOnly`
+    // filters out by design. Stripping first would hide the very row that says the duel is over. The
+    // state filter below is unaffected - a sentinel is never INVOKED or WAITING_FOR_USER.
+    const activeRows = await readBattleRows(activeBattleId);
     // STILL RUNNING means a side is generating or blocked on a person AND has not blown its deadline.
     //
     // It used to mean "...and the row has not been deleted yet", reading `ttl > nowSec`. Expiry is a
@@ -1524,10 +1532,16 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
     // outlive its rival's think time, a stalled duel silently went from holding its channel for ten
     // minutes to holding it for four hours - nobody changed this guard, and its behaviour changed
     // anyway. `deadlineAt` carries the right clock for the state the row is in (ADR-026).
-    const inFlight = activeRows.some(
-      (r) => (r.state === 'INVOKED' || r.state === 'WAITING_FOR_USER') && !isPastDeadline(r),
-    );
-    if (inFlight) {
+    //
+    // LIVE, not merely in flight: a duel mid-round-2 has both sides idle at COMPLETED and is very much
+    // still going, so the narrow predicate would have let a second `/battle` start on top of a rebuttal
+    // about to land. The deadline check keeps the escape hatch for a duel whose side crashed and will
+    // never report - that one really is abandoned, whatever its rows say.
+    const stalled = activeRows.length > 0 && activeRows
+      .filter((r) => r.state === 'INVOKED' || r.state === 'WAITING_FOR_USER')
+      .some((r) => isPastDeadline(r));
+    const stillRunning = duelIsLive(activeRows) && !stalled;
+    if (stillRunning) {
       // WHAT THIS SAYS DEPENDS ON WHO ASKED (DESIGN-BATTLE 2a-i).
       //
       // The duel's initiator is allowed to leave the one they are in, so they are offered the way out
@@ -1558,6 +1572,27 @@ async function handleBattleMessage(params: HandleBattleParams): Promise<void> {
       );
       return;
     }
+
+    // SUPERSEDING A DUEL IS ALSO ENDING IT, and this path used to just walk past.
+    //
+    // Falling through means the pointer is about to be overwritten by `setActiveBattle`. The duel it
+    // named - stalled past its deadline, or resolved - then had no owner, no release, and, if a side
+    // was parked on a question, a live "Replying to:" control on a message nothing would ever read.
+    // That is the fourth call site this module's own header warned would get ending wrong, and it did.
+    //
+    // Best-effort by construction: the person's new duel must start whether or not the old one tidies
+    // up cleanly, so nothing here is awaited for its result beyond the logging inside `endBattle`.
+    console.log('[ChannelFlow][battle] superseding a duel that is no longer live; ending it first', {
+      channelArn,
+      supersededBattleId: activeBattleId,
+      newBattleId: battleId,
+    });
+    await endBattle({
+      channelArn,
+      battleId: activeBattleId,
+      reason: 'abandoned:new-battle',
+      endedBy: senderArn,
+    });
   }
 
   // 4. List bot members of the channel.

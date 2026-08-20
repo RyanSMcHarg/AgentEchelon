@@ -101,6 +101,61 @@ describe('ABANDONED is an end, and never a completion', () => {
       { battleId: BATTLE_ID, botArn: BOT_B, state: 'COMPLETED' },
     ])).toBe(false);
   });
+
+  it('and `duelIsLive` is the predicate that DOES cover round 2, up to the resolution marker', async () => {
+    const { duelIsLive } = await import('../../lambda/src/lib/battle-state');
+
+    // Mid round 2: both sides idle at COMPLETED, no marker yet. The duel is generating a rebuttal that
+    // is about to land in the channel, so anything asking "is a battle running here" must say yes.
+    // Two separate defects came from asking `duelInFlight` instead: drift would have moved a person
+    // into a new conversation moments before the rebuttal arrived in the one they left, and
+    // `/battle end` reported the duel already finished while killing the round 2 it had not noticed.
+    expect(duelIsLive([
+      { battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED' },
+      { battleId: BATTLE_ID, botArn: BOT_B, state: 'COMPLETED' },
+    ])).toBe(true);
+
+    // The orchestrator's marker is what ends it. That is the only durable statement that no further
+    // orchestrated phase is coming, which is exactly the question being asked.
+    expect(duelIsLive([
+      { battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED' },
+      { battleId: BATTLE_ID, botArn: BOT_B, state: 'COMPLETED' },
+      { battleId: BATTLE_ID, botArn: '__complete__', state: 'COMPLETED' },
+    ])).toBe(false);
+
+    // A duel everybody walked out of is not live either, marker or no marker.
+    expect(duelIsLive([
+      { battleId: BATTLE_ID, botArn: BOT_A, state: 'ABANDONED' },
+      { battleId: BATTLE_ID, botArn: BOT_B, state: 'ABANDONED' },
+    ])).toBe(false);
+  });
+
+  it('records the end as a marker no race can take away', async () => {
+    const { duelWasAbandoned } = await import('../../lambda/src/lib/battle-state');
+
+    // THE RACE THIS EXISTS FOR. `endBattle` claims the orchestrator sentinel before it transitions the
+    // sides, so a side reaching COMPLETED in that instant fails its abandon transition - and the duel
+    // ends up genuinely ended by a person while carrying no ABANDONED row at all. Keying only on the
+    // rows would then accept a pick on a comparison whose rebuttal was suppressed.
+    expect(duelWasAbandoned([
+      { battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED' },
+      { battleId: BATTLE_ID, botArn: BOT_B, state: 'COMPLETED' },
+      { battleId: BATTLE_ID, botArn: '__abandoned__', state: 'ABANDONED' },
+    ])).toBe(true);
+
+    // The per-side rows still answer it when they can.
+    expect(duelWasAbandoned([
+      { battleId: BATTLE_ID, botArn: BOT_A, state: 'ABANDONED' },
+      { battleId: BATTLE_ID, botArn: BOT_B, state: 'COMPLETED' },
+    ])).toBe(true);
+
+    // A duel that simply finished is not abandoned, and takes its pick normally.
+    expect(duelWasAbandoned([
+      { battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED' },
+      { battleId: BATTLE_ID, botArn: BOT_B, state: 'COMPLETED' },
+      { battleId: BATTLE_ID, botArn: '__complete__', state: 'COMPLETED' },
+    ])).toBe(false);
+  });
 });
 
 describe('being past a DEADLINE is not the same as a row expiring', () => {
@@ -180,15 +235,18 @@ describe('endBattle does all four writes, or the end is only half done', () => {
       clearActiveBattle: mockClearActiveBattle,
       tryClaimOrchestratorFire: jest.fn().mockResolvedValue(claimWon),
       transitionBotState: mockTransition,
+      markBattleAbandoned: mockMarkAbandoned,
     }));
     return import('../../lambda/src/lib/battle-end');
   }
 
   const mockClearActiveBattle = jest.fn();
   const mockTransition = jest.fn();
+  const mockMarkAbandoned = jest.fn();
 
   beforeEach(() => {
     mockClearActiveBattle.mockReset().mockResolvedValue(undefined);
+    mockMarkAbandoned.mockReset().mockResolvedValue(undefined);
     mockTransition.mockReset().mockResolvedValue(true);
   });
 
@@ -243,6 +301,7 @@ describe('endBattle does all four writes, or the end is only half done', () => {
       clearActiveBattle: mockClearActiveBattle,
       tryClaimOrchestratorFire: jest.fn().mockResolvedValue(true),
       transitionBotState: mockTransition,
+      markBattleAbandoned: mockMarkAbandoned,
     }));
     const { endBattle } = await import('../../lambda/src/lib/battle-end');
 

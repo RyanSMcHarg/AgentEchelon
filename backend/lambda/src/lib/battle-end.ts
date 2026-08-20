@@ -7,16 +7,19 @@
  * `DUEL_MAX_LIFETIME_MS` expiring - and every reader that consulted the pointer went on believing a
  * battle was running until it did.
  *
- * Ending is not one write. It is four, and doing three of them is a worse outcome than doing none:
+ * Ending is not one write. It is five, and doing four of them is a worse outcome than doing none:
  *
- *   1. every non-terminal side moves to `ABANDONED`, so the duel's end is a recorded fact;
- *   2. the round-2 fire is poisoned, so no rebuttal is produced for a comparison nobody finished;
- *   3. every waiting affordance comes down, so an ended duel stops inviting an answer;
- *   4. the channel's active-battle pointer is released, so the next `/battle` is not refused.
+ *   1. the round-2 fire is poisoned, so no rebuttal is produced for a comparison nobody finished;
+ *   2. the end is recorded as a marker of its own, which no race can take away;
+ *   3. every non-terminal side moves to `ABANDONED`, so each side's end is recorded too;
+ *   4. every waiting affordance comes down, so an ended duel stops inviting an answer;
+ *   5. the channel's active-battle pointer is released, so the next `/battle` is not refused.
  *
- * Skip (3) and the transcript keeps a live "Replying to:" control on a question nothing is listening
- * for. Skip (4) and the channel is locked until the backstop clock fires. So they live together behind
- * one function rather than at each call site, where the fourth one added would have got it wrong.
+ * Skip (2) and a duel ended in the instant its last side completed carries no record of having been
+ * ended, so a pick on it is accepted. Skip (4) and the transcript keeps a live "Replying to:" control on
+ * a question nothing is listening for. Skip (5) and the channel is locked until the backstop clock
+ * fires. So they live together behind one function rather than at each call site, where the fifth one
+ * added would have got it wrong.
  *
  * WHY THE TASK NEEDS NO SEPARATE STEP HERE. A task-shaped side is suspended at `WAITING_FOR_USER`
  * between legs and only advances when the duel hands it the next input. Ending the duel therefore ends
@@ -30,6 +33,7 @@ import {
   clearActiveBattle,
   tryClaimOrchestratorFire,
   transitionBotState,
+  markBattleAbandoned,
   type BattleStateRow,
 } from './battle-state.js';
 import { clearBattleWaitingMarker } from './battle-waiting-marker.js';
@@ -96,7 +100,19 @@ export async function endBattle(args: {
     console.warn('[battle-end] orchestrator claim attempt failed:', err);
   }
 
-  // 2. Record the end on every side that had not already stopped.
+  // 2. RECORD THE END AS A FACT OF ITS OWN, before touching the sides.
+  //
+  //    The per-side rows are not a reliable record of "a person ended this". The claim above is taken
+  //    first so no rebuttal is generated, and a side that reaches COMPLETED in that instant then fails
+  //    its abandon transition below - leaving a duel that WAS ended by a person carrying no ABANDONED
+  //    row at all. A reader keying on the rows would call that duel a completed comparison and accept a
+  //    pick on it, which is the fabricated round the exclusion rule exists to prevent.
+  //
+  //    So the end gets a marker of its own, mirroring the orchestrator's `__complete__`. It cannot be
+  //    raced away, because nothing else writes it.
+  await markBattleAbandoned(battleId, reason);
+
+  // 3. Record the end on every side that had not already stopped.
   //
   //    COMPLETED and FAILED are left ALONE. A side that genuinely produced its answer did produce it,
   //    and rewriting that as abandoned would erase real work to make the row set tidy.
@@ -115,7 +131,7 @@ export async function endBattle(args: {
     }
   }
 
-  // 3. Take down every affordance that invited the next input.
+  // 4. Take down every affordance that invited the next input.
   //
   //    Only a side that was WAITING has one. The question text stays in the transcript - it was a real
   //    part of the duel - and only the control that made it answerable goes.
@@ -125,7 +141,7 @@ export async function endBattle(args: {
     if (cleared) result.markersCleared += 1;
   }
 
-  // 4. Release the channel. Conditional on this battleId, so a late call cannot clear a newer duel.
+  // 5. Release the channel. Conditional on this battleId, so a late call cannot clear a newer duel.
   await clearActiveBattle({ channelArn, battleId, reason, endedBy });
 
   console.log('[battle-end] duel ended', {

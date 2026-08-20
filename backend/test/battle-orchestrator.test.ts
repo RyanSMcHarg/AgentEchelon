@@ -53,6 +53,13 @@ jest.mock('../lambda/src/lib/battle-state', () => ({
   },
   botRowsOnly: (rows: Array<{ botArn: string }>) => rows.filter((r) => r.botArn !== '__orchestrator__'),
   clearActiveBattle: (...args: unknown[]) => mockClearActiveBattle(...args),
+  COMPLETE_SENTINEL: '__complete__',
+  isPastDeadline: (row: { deadlineAt?: number; enteredStateAt?: string }) => {
+    const d = row.deadlineAt;
+    if (typeof d === 'number' && Number.isFinite(d)) return Date.now() > (d < 1e12 ? d * 1000 : d);
+    const e = row.enteredStateAt ? Date.parse(row.enteredStateAt) : NaN;
+    return Number.isFinite(e) ? Date.now() > e + 180000 : false;
+  },
 }));
 
 import type { BattleOrchestratorEvent } from '../lambda/src/battle-orchestrator';
@@ -87,6 +94,13 @@ async function loadHandler() {
     },
     botRowsOnly: (rows: Array<{ botArn: string }>) => rows.filter((r) => r.botArn !== '__orchestrator__'),
     clearActiveBattle: (...args: unknown[]) => mockClearActiveBattle(...args),
+  COMPLETE_SENTINEL: '__complete__',
+  isPastDeadline: (row: { deadlineAt?: number; enteredStateAt?: string }) => {
+    const d = row.deadlineAt;
+    if (typeof d === 'number' && Number.isFinite(d)) return Date.now() > (d < 1e12 ? d * 1000 : d);
+    const e = row.enteredStateAt ? Date.parse(row.enteredStateAt) : NaN;
+    return Number.isFinite(e) ? Date.now() > e + 180000 : false;
+  },
   }));
   const mod = await import('../lambda/src/battle-orchestrator');
   return mod.handler;

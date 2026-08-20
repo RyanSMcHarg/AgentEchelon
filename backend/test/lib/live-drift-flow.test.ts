@@ -71,8 +71,12 @@ jest.mock('../../lambda/src/lib/abuse-controls', () => ({
 jest.mock('../../lambda/src/lib/battle-state', () => ({
   resolveActiveBattle: (...a: unknown[]) => mockResolveActiveBattle(...a),
   readBattleRows: (...a: unknown[]) => mockReadBattleRows(...a),
-  duelInFlight: (rows: Array<{ state: string }>) =>
-    rows.some((r) => r.state === 'INVOKED' || r.state === 'WAITING_FOR_USER'),
+  duelIsLive: (rows: Array<{ state: string; botArn?: string }>) => {
+    const bots = rows.filter((r) => !String(r.botArn || '').startsWith('__'));
+    if (bots.length === 0) return false;
+    if (bots.every((r) => r.state === 'ABANDONED')) return false;
+    return !rows.some((r) => r.botArn === '__complete__');
+  },
 }));
 jest.mock('../../lambda/src/lib/channel-creation', () => ({
   createConversationFromDrift: (...a: unknown[]) => mockCreateConversationFromDrift(...a),
@@ -256,7 +260,7 @@ describe('drift during a battle', () => {
     expect(content).not.toContain('someone-else');
   });
 
-  it('says nothing about a battle when Battle Mode is on but NO duel is in flight', async () => {
+  it('says nothing about a battle once the duel has RESOLVED, even with Battle Mode still on', async () => {
     // The bug this pins. The guard read `isBattleEnabled`, which says only that a moderator switched
     // the feature on - so between duels it refused the split and asserted "the assistants are still
     // comparing answers" while no assistant was doing anything. A claim about what is happening now
@@ -265,6 +269,10 @@ describe('drift during a battle', () => {
     mockReadBattleRows.mockResolvedValue([
       { battleId: 'a1b2c3d4e5f60718', botArn: 'arn:bot/A', state: 'COMPLETED' },
       { battleId: 'a1b2c3d4e5f60718', botArn: 'arn:bot/B', state: 'COMPLETED' },
+      // THE RESOLUTION MARKER, and the duel is not over without it. Two COMPLETED sides on their own
+      // describe the ROUND-2 window - the rebuttal is generating and the duel is still very much
+      // running - so a fixture that means "finished" has to say so the way the orchestrator does.
+      { battleId: 'a1b2c3d4e5f60718', botArn: '__complete__', state: 'COMPLETED' },
     ]);
     mockDetectDrift.mockResolvedValue({
       isDrift: true,

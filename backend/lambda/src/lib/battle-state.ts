@@ -32,6 +32,17 @@ const CHANNEL_BATTLE_CONFIG_TABLE = process.env.CHANNEL_BATTLE_CONFIG_TABLE || '
 const BATTLE_STATE_TABLE = process.env.BATTLE_STATE_TABLE || '';
 const CACHE_TTL_MS = 60_000;
 
+/**
+ * SENTINEL SORT KEYS - rows in a duel's partition that are not sides.
+ *
+ * Named here rather than written as literals at each use, because two of them are now read by code in
+ * other files to answer "did this duel end, and how". A literal that appears in four places is a
+ * rename waiting to break one of them silently: `botRowsOnly` would keep filtering it, and the reader
+ * asking about it would simply never find it.
+ */
+export const COMPLETE_SENTINEL = '__complete__';
+export const ABANDONED_SENTINEL = '__abandoned__';
+
 // ---------------------------------------------------------------------------
 // TWO CLOCKS (ADR-026)
 // ---------------------------------------------------------------------------
@@ -967,6 +978,78 @@ export function duelInFlight(rows: BattleStateRow[]): boolean {
   return botRowsOnly(rows).some((r) => r.state === 'INVOKED' || r.state === 'WAITING_FOR_USER');
 }
 
+/** Has the orchestrator RESOLVED this duel - round 2 dispatched, or closed loud? The `__complete__` row. */
+export function duelIsResolved(rows: BattleStateRow[]): boolean {
+  return rows.some((r) => r.botArn === COMPLETE_SENTINEL);
+}
+
+/**
+ * Is this duel still ALIVE - is anything about it still going to happen?
+ *
+ * A THIRD question, and the reason `duelInFlight` must not be asked in its place. `duelInFlight` means
+ * "is a side working right now", and it is FALSE for the whole of round 2: round 1 ends by moving both
+ * sides to `COMPLETED` and nothing moves them back while the rebuttal generates. So a caller asking "is
+ * a battle running here" and reading `duelInFlight` gets `false` in the middle of a live duel - which
+ * would let a topic change split the conversation out from under a rebuttal about to land in it, and
+ * would let `/battle end` report a duel as already finished while killing the rebuttal it had not
+ * noticed was coming.
+ *
+ * Alive means: sides exist, not every one of them has been abandoned, and the orchestrator has not yet
+ * written the resolution marker. That marker is the only durable record of "there is no further
+ * orchestrated phase", which is exactly the question being asked.
+ */
+export function duelIsLive(rows: BattleStateRow[]): boolean {
+  const bots = botRowsOnly(rows);
+  if (bots.length === 0) return false;
+  if (bots.every((r) => r.state === 'ABANDONED')) return false;
+  return !duelIsResolved(rows);
+}
+
+/**
+ * Was this duel ABANDONED - ended by a person rather than finished?
+ *
+ * Reads the sentinel FIRST and the per-side rows second, because the sentinel is the claim that cannot
+ * be lost to a race. `endBattle` takes the orchestrator's exactly-once claim before it transitions the
+ * sides, so a side that reaches `COMPLETED` in between fails its abandon transition - leaving a duel
+ * that was genuinely ended by a person with no `ABANDONED` row on it at all. A reader keying only on the
+ * rows would then accept a pick on a comparison whose rebuttal was suppressed.
+ */
+export function duelWasAbandoned(rows: BattleStateRow[]): boolean {
+  if (rows.some((r) => r.botArn === ABANDONED_SENTINEL)) return true;
+  return botRowsOnly(rows).some((r) => r.state === 'ABANDONED');
+}
+
+/**
+ * Record that this duel was abandoned, as a row of its own.
+ *
+ * The mirror of the orchestrator's `__complete__` marker, and it exists for the same reason: a duel's
+ * END must be a durable fact rather than something inferred from whatever the per-side rows happen to
+ * say. Conditional, so a second end claims nothing. Non-fatal.
+ */
+export async function markBattleAbandoned(battleId: string, reason: string): Promise<void> {
+  if (!BATTLE_STATE_TABLE) return;
+  try {
+    await ddb.send(
+      new PutCommand({
+        TableName: BATTLE_STATE_TABLE,
+        Item: {
+          battleId,
+          botArn: ABANDONED_SENTINEL,
+          state: 'ABANDONED',
+          completeReason: reason,
+          enteredStateAt: new Date().toISOString(),
+          ttl: battleRowTtl(),
+        },
+        ConditionExpression: 'attribute_not_exists(botArn)',
+      }),
+    );
+  } catch (err) {
+    if ((err as { name?: string }).name !== 'ConditionalCheckFailedException') {
+      console.warn('[battle-state] markBattleAbandoned failed (non-fatal):', err);
+    }
+  }
+}
+
 /**
  * Is this side past the moment it was DUE? Moved here from the orchestrator so the in-flight guard and
  * the degraded-resolution path share one rule.
@@ -995,7 +1078,15 @@ export function isPastDeadline(row: BattleStateRow, nowMs: number = Date.now()):
   } else if (typeof raw === 'string' && raw !== '') {
     const n = Number(raw);
     ms = Number.isFinite(n) ? (n < 1e12 ? n * 1000 : n) : Date.parse(raw);
-  } else if (row.enteredStateAt) {
+  }
+  // THE FALLBACK IS A SEPARATE STATEMENT, not another arm of the chain above.
+  //
+  // As an `else if` it was unreachable for the case that needs it most: a `deadlineAt` that is present
+  // but unparseable took the string arm, produced NaN, and returned "not yet due" - so a row with a
+  // corrupt deadline could never be past due here, while the orchestrator's own copy of this rule fell
+  // through to `enteredStateAt` and called the same row stalled. One row, two answers, and the duel
+  // held its channel until the backstop while the orchestrator closed it loud.
+  if (!Number.isFinite(ms) && row.enteredStateAt) {
     const entered = Date.parse(row.enteredStateAt);
     ms = Number.isFinite(entered) ? entered + MACHINE_DEADLINE_MS : NaN;
   }

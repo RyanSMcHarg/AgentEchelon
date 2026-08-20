@@ -45,7 +45,7 @@ import {
   classifyConfirmDeclineReply,
 } from './routing-state.js';
 import { createConversationFromDrift } from './channel-creation.js';
-import { resolveActiveBattle, readBattleRows, duelInFlight } from './battle-state.js';
+import { resolveActiveBattle, readBattleRows, duelIsLive } from './battle-state.js';
 import { claimCorrelation } from './abuse-controls.js';
 import {
   resolveConversationTypeKey,
@@ -331,15 +331,28 @@ export async function runLiveDriftFlow(input: LiveDriftFlowInput): Promise<LiveD
     const active = await resolveActiveBattle(channelArn);
     if (!active) return { battleActive: false, viewerStartedIt: false };
     const startedIt = Boolean(active.initiatorUserSub) && active.initiatorUserSub === userSub;
-    try {
-      return { battleActive: duelInFlight(await readBattleRows(active.battleId)), viewerStartedIt: startedIt };
-    } catch (err) {
-      // The pointer says a duel is live and the rows could not be read. Treat it as running: refusing
-      // to split a conversation is recoverable in one message, walking someone out of a live duel is
-      // not.
-      console.warn('[live-drift] could not read battle rows; treating the duel as running:', err);
+
+    const rows = await readBattleRows(active.battleId);
+
+    // AN EMPTY RESULT IS "I COULD NOT TELL", NOT "NOTHING IS RUNNING".
+    //
+    // `readBattleRows` catches its own errors and returns `[]`, so a DynamoDB failure, a missing table
+    // and a duel whose rows have aged out are one value here. The pointer says a duel exists; if its
+    // rows cannot be produced, the safe reading is that it is still going. Splitting a conversation out
+    // from under a live duel strands it; declining to split costs the person one more message.
+    if (rows.length === 0) {
+      console.warn('[live-drift] the pointer names a duel with no readable rows; treating it as running', {
+        battleId: active.battleId,
+      });
       return { battleActive: true, viewerStartedIt: startedIt };
     }
+
+    // `duelIsLive`, NOT `duelInFlight`. The question here is "is a battle running in this conversation",
+    // and `duelInFlight` answers a narrower one - "is a side working right now" - which is FALSE for the
+    // whole of round 2, while the rebuttal generates. Asking the narrow question would let a topic
+    // change move the person into a new conversation moments before the rebuttal lands in the one they
+    // left. The previous `isBattleEnabled` check happened to cover that window; this must too.
+    return { battleActive: duelIsLive(rows), viewerStartedIt: startedIt };
   })();
 
   /**

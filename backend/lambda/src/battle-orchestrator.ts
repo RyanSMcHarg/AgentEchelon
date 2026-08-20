@@ -50,6 +50,8 @@ import {
   botRowsOnly,
   battleRowTtl,
   clearActiveBattle,
+  isPastDeadline,
+  COMPLETE_SENTINEL,
   type BattleStateRow,
 } from './lib/battle-state.js';
 import {
@@ -265,7 +267,14 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
   //    non-terminal past the deadline — gets an explicit "<Name> didn't finish
   //    in time" turn so the user is never left staring at a stalled placeholder.
   const completedBots = bots.filter((b) => b.state === 'COMPLETED');
-  const notFinishedBots = bots.filter((b) => b.state !== 'COMPLETED');
+  // ABANDONED IS NOT "DIDN'T FINISH IN TIME", and this filter was written before that state existed.
+  //
+  // `!== 'COMPLETED'` swept in every non-completed row, which now includes a side somebody deliberately
+  // ended. Announcing "<Name> didn't finish in time" for it would blame the assistant for a decision the
+  // person made - and it would say so in a duel they had just walked out of. An abandoned duel normally
+  // never reaches here at all, because ending it claims the sentinel this handler needs; this covers the
+  // narrow case where the claim was already lost and the abandon landed afterwards.
+  const notFinishedBots = bots.filter((b) => b.state !== 'COMPLETED' && b.state !== 'ABANDONED');
   for (const b of notFinishedBots) {
     await postDidNotFinish(channelArn, b.botArn, displayNameFor(b.botArn));
   }
@@ -406,25 +415,11 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
  * should not fail loud over its own encoding. Final fallback is "not yet due" (never fail loud without
  * cause).
  */
-function rowDeadlineMs(row: BattleStateRow): number {
-  // Read as `unknown`: the row TYPE says number, but a legacy row (or a hand-repaired one) may carry an
-  // ISO string, and this is the wrong place to throw over an encoding.
-  const d: unknown = row.deadlineAt;
-  if (typeof d === 'number' && Number.isFinite(d)) return d < 1e12 ? d * 1000 : d;
-  if (typeof d === 'string' && d.trim() !== '') {
-    const n = Number(d);
-    if (Number.isFinite(n)) return n < 1e12 ? n * 1000 : n;
-    const parsed = Date.parse(d);
-    if (!Number.isNaN(parsed)) return parsed;
-  }
-  const entered = row.enteredStateAt ? Date.parse(row.enteredStateAt) : NaN;
-  if (!Number.isNaN(entered)) return entered + ROUND1_DEADLINE_MS;
-  return Date.now() + ROUND1_DEADLINE_MS; // no timing info → treat as not yet due
-}
-
-function isPastDeadline(row: BattleStateRow): boolean {
-  return Date.now() > rowDeadlineMs(row);
-}
+//  and  used to live here as a private copy. They are now imported
+// from battle-state, because a second implementation of "is this side past due" had drifted from the
+// first: for a present-but-unparseable deadline this copy fell through to `enteredStateAt` and reported
+// the row stalled, while the shared rule returned "not yet due". The same row got opposite answers from
+// the orchestrator and from the single-active-battle guard.
 
 /**
  * Fail-loud (B2): post an explicit "<Name> didn't finish in time" turn
@@ -507,7 +502,7 @@ async function emitBattleComplete(battleId: string, reason: string, channelArn?:
         TableName: BATTLE_STATE_TABLE,
         Item: {
           battleId,
-          botArn: '__complete__',
+          botArn: COMPLETE_SENTINEL,
           state: 'COMPLETED',
           completeReason: reason,
           enteredStateAt: new Date().toISOString(),
