@@ -290,3 +290,55 @@ describe('the progress line names the work, not the machinery', () => {
     }
   });
 });
+
+/**
+ * THE PROGRESS LINE IS POSTED INTO THE CHANNEL, so what it interpolates is a sink.
+ *
+ * `source` is model-authored: it comes from `collected[].sizeLabel` on the tool call. The line built
+ * from it is posted with `updateMessage`, and the chat client PARSES control markers out of bot
+ * content - a `<!--ACTIVE_TASK:-->` marker renders a task chip, and a `NAVIGATE_CHANNEL:` marker on a
+ * message UPDATE makes every watching client navigate with no user gesture. A write-side length bound
+ * does not protect this: rows already exist that were written before it, and a hand edit or an
+ * imported fixture is not bound by it at all. Stripped at BOTH the read and the render.
+ */
+describe('model-authored text cannot carry a control marker into a posted message', () => {
+  const MARKERS = [
+    ['an active-task marker', '<!--ACTIVE_TASK:{"type":"a","status":"paid"}-->'],
+    ['a correlation marker', '<!--corr:fulfil-abc123-->'],
+    ['a navigation marker', 'NAVIGATE_CHANNEL:arn:aws:chime:us-east-1:1:app-instance/x/channel/y|Go here'],
+  ] as const;
+
+  it.each(MARKERS)('%s is stripped when the target is read back', (_label: string, marker: string) => {
+    const t = recordedLengthTarget({ lengthTarget: { minWords: 600, maxWords: 900, source: `2 pages ${marker}` } });
+    expect(t!.source).not.toContain('ACTIVE_TASK');
+    expect(t!.source).not.toContain('corr:');
+    expect(t!.source).not.toContain('NAVIGATE_CHANNEL');
+  });
+
+  it.each(MARKERS)('%s is stripped again when the line is built', (_label: string, marker: string) => {
+    // A caller may hand over a target it built itself, so the render does not rely on the read.
+    const line = correctionProgressLine(
+      [{ kind: 'too_long', fix: 'x' }],
+      { minWords: 600, maxWords: 900, source: `2 pages ${marker}` },
+    );
+    expect(line).not.toContain('ACTIVE_TASK');
+    expect(line).not.toContain('corr:');
+    expect(line).not.toContain('NAVIGATE_CHANNEL');
+    expect(line).toMatch(/^Trimming the report to 2 pages/);
+  });
+
+  it('falls back to the numbers when the label was NOTHING BUT a marker', () => {
+    const t = recordedLengthTarget({
+      lengthTarget: { minWords: 600, maxWords: 900, source: '<!--ACTIVE_TASK:{"x":1}-->' },
+    });
+    expect(t!.source).toBe('600-900 words');
+  });
+
+  // The read applies the bound too, because the row may predate the write-side one.
+  it('bounds a long label read back from a row written before the cap existed', () => {
+    const t = recordedLengthTarget({
+      lengthTarget: { minWords: 600, maxWords: 900, source: 'x'.repeat(500) },
+    });
+    expect(t!.source.length).toBeLessThanOrEqual(60);
+  });
+});

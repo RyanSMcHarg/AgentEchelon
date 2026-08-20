@@ -1877,7 +1877,7 @@ export async function invokeBedrock(
             // success reflect the new state so later iterations see it, and record the applied
             // transition on the shared context (for analytics + the shadow comparison). An
             // unauthorized request returns an error the model can read and recover from in-loop.
-            const { payload: taskPayload, result } = await handleAdvanceTaskStateTool({
+            const { payload: taskPayload, result, details: writtenDetails } = await handleAdvanceTaskStateTool({
               task: taskContext.task,
               input: toolInput,
               machines: taskContext.machines,
@@ -1888,6 +1888,12 @@ export async function invokeBedrock(
             });
             if (result.ok) {
               taskContext.task.taskState = result.to;
+              // AND WHAT THE TOOL WROTE, or a later reader in THIS turn sees a snapshot taken before
+              // it ran. The delivering check is such a reader: a step that collects a requirement and
+              // delivers in the same turn (`data_extraction.collecting_requirements` goes straight
+              // into `extracting`, which delivers) found no agreement and enforced nothing on the very
+              // turn the agreement was made. Measured live before this line existed.
+              if (writtenDetails) taskContext.task.details = writtenDetails;
               (taskContext.transitions ??= []).push({ from: result.from, to: result.to });
             }
             payload = taskPayload;

@@ -99,9 +99,17 @@ function stripDeep(value: unknown, depth = 0): unknown {
   if (depth >= MAX_STRIP_DEPTH) return typeof value === 'object' && value !== null ? undefined : value;
   if (Array.isArray(value)) return value.map((v) => stripDeep(v, depth + 1));
   if (value && typeof value === 'object') {
-    const out: Record<string, unknown> = {};
-    for (const [k, v] of Object.entries(value as Record<string, unknown>)) out[k] = stripDeep(v, depth + 1);
-    return out;
+    // NULL-PROTOTYPE, and `__proto__` skipped: this walks JSON parsed from MEMBER-WRITABLE channel
+    // Metadata, so `{"__proto__": {...}}` would otherwise reassign this object's prototype through the
+    // setter. Nothing inherited is marshalled to DynamoDB and this runs only in an operator-invoked
+    // backfill, so it was not exploitable - but the input is attacker-controlled by definition and the
+    // fix is two lines.
+    const out: Record<string, unknown> = Object.create(null);
+    for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+      if (k === '__proto__') continue;
+      out[k] = stripDeep(v, depth + 1);
+    }
+    return { ...out };
   }
   return value;
 }

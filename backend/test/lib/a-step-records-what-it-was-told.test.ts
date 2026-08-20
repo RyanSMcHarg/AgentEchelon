@@ -106,11 +106,20 @@ describe('the answers are read tolerantly, because a model supplies them', () =>
  * is language work, and the model recording the requirement is the only component that saw the
  * sentence in context. It resolves the range once; every reader afterwards gets numbers.
  */
+/**
+ * THE SIZE IS RECORDED AS NUMBERS, BY THE COMPONENT THAT UNDERSTANDS THE SENTENCE.
+ *
+ * The first version stored the person's words ("1-2 pages") and had the delivering check regex them
+ * into a range at read time - an agreement moved out of the transcript and then written back as prose.
+ * A person says "a page or two", "keep it short", "two pages max"; turning any of those into a number
+ * is language work, and the model recording the requirement is the only component that saw the
+ * sentence in context.
+ */
 describe('a size is recorded as a range, not as a sentence to be parsed later', () => {
-  it('carries the model-resolved bounds alongside what the person said', () => {
+  it('carries the model-resolved bounds and the label to show for them', () => {
     expect(collectedRequirements([
       { requirement: 'the audience', value: 'engineering leadership' },
-      { requirement: 'the length or format', value: '1-2 pages', minWords: 600, maxWords: 900 },
+      { requirement: 'the length or format', value: '1-2 pages', minWords: 600, maxWords: 900, sizeLabel: '1-2 pages' },
     ])).toEqual({
       requirements: {
         'the audience': 'engineering leadership',
@@ -118,6 +127,37 @@ describe('a size is recorded as a range, not as a sentence to be parsed later', 
       },
       lengthTarget: { minWords: 600, maxWords: 900, source: '1-2 pages' },
     });
+  });
+
+  // THE LABEL IS NOT THE ANSWER. A size can arrive inside a whole sentence - at `drafting_outline` the
+  // requirement is "approval of the outline, or what to change about it" - and this string is rendered
+  // to the person while the document is corrected. Without a label, the numbers are shown instead of
+  // "Trimming the report to Looks good, but can you make it 1-2 pages?...".
+  it('shows the numbers when no label was given, never the whole answer', () => {
+    const out = collectedRequirements([{
+      requirement: 'approval of the outline, or what to change about it',
+      value: 'Looks good, but can you make it 1-2 pages?',
+      minWords: 600,
+      maxWords: 900,
+    }]);
+    expect(out?.lengthTarget?.source).toBe('600-900 words');
+  });
+
+  it('refuses a label that is a paragraph rather than a size', () => {
+    const out = collectedRequirements([{
+      requirement: 'the length', value: 'x', minWords: 600, maxWords: 900,
+      sizeLabel: 'they said they wanted something around one to two pages, but shorter is fine if the data is thin',
+    }]);
+    expect(out?.lengthTarget?.source).toBe('600-900 words');
+  });
+
+  // `"600"` is an ordinary model output for an integer field. Coercing it is arithmetic, not a
+  // language judgement, and discarding it silently threw away a real agreement.
+  it('accepts a numeric string, which is what models often send for an integer', () => {
+    const out = collectedRequirements([
+      { requirement: 'the length', value: '1-2 pages', minWords: '600', maxWords: '900', sizeLabel: '1-2 pages' },
+    ]);
+    expect(out?.lengthTarget).toEqual({ minWords: 600, maxWords: 900, source: '1-2 pages' });
   });
 
   it('records no size when the answer named none, which is a real answer', () => {
@@ -133,7 +173,7 @@ describe('a size is recorded as a range, not as a sentence to be parsed later', 
     ['a maximum only', { maxWords: 900 }],
     ['a reversed pair', { minWords: 900, maxWords: 600 }],
     ['a zero minimum', { minWords: 0, maxWords: 900 }],
-    ['non-numeric bounds', { minWords: '600', maxWords: '900' }],
+    ['words rather than numbers', { minWords: 'six hundred', maxWords: 'nine hundred' }],
   ])('discards %s rather than half-enforcing it', (_label: string, bounds: object) => {
     const out = collectedRequirements([{ requirement: 'the length or format', value: 'x', ...bounds }]);
     expect(out?.lengthTarget).toBeUndefined();
@@ -141,23 +181,48 @@ describe('a size is recorded as a range, not as a sentence to be parsed later', 
     expect(out?.requirements).toEqual({ 'the length or format': 'x' });
   });
 
+  // A DISCARD AND A GENUINE "no size" LOOK IDENTICAL AT DELIVERY (`agreed: 'not recorded'`), so the
+  // difference has to be findable where the discard happens.
+  it('says so when bounds were offered and refused', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      collectedRequirements([{ requirement: 'the length', value: 'x', minWords: 900, maxWords: 600 }]);
+      expect(warn).toHaveBeenCalledWith(
+        '[TaskTools] size bounds discarded as unusable',
+        expect.objectContaining({ requirement: 'the length' }),
+      );
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
+  it('stays quiet when no bounds were offered at all', () => {
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    try {
+      collectedRequirements([{ requirement: 'the length or format', value: 'as a table' }]);
+      expect(warn).not.toHaveBeenCalled();
+    } finally {
+      warn.mockRestore();
+    }
+  });
+
   it('takes the FIRST size when a model marks two, rather than picking by an undeclared rule', () => {
     const out = collectedRequirements([
-      { requirement: 'the length or format', value: '1-2 pages', minWords: 600, maxWords: 900 },
-      { requirement: 'the summary length', value: 'half a page', minWords: 150, maxWords: 450 },
+      { requirement: 'the length or format', value: '1-2 pages', minWords: 600, maxWords: 900, sizeLabel: '1-2 pages' },
+      { requirement: 'the summary length', value: 'half a page', minWords: 150, maxWords: 450, sizeLabel: 'half a page' },
     ]);
     expect(out?.lengthTarget).toEqual({ minWords: 600, maxWords: 900, source: '1-2 pages' });
   });
 
   it('rounds a fractional bound rather than storing it', () => {
     const out = collectedRequirements([
-      { requirement: 'the length', value: 'about a page', minWords: 299.6, maxWords: 900.4 },
+      { requirement: 'the length', value: 'about a page', minWords: 299.6, maxWords: 900.4, sizeLabel: 'about a page' },
     ]);
     expect(out?.lengthTarget).toEqual({ minWords: 300, maxWords: 900, source: 'about a page' });
   });
 
-  // The tool has to ASK for the numbers, or the model has no reason to supply them.
-  it('the tool schema asks the model for the bounds, and does not require them', () => {
+  // The tool has to ASK for the numbers and the label, or the model has no reason to supply either.
+  it('the tool schema asks for the bounds and a label, and requires neither', () => {
     const [spec] = taskToolSpecsFor('report_generation', DEFAULT_TASK_STATE_MACHINES, 'collecting_requirements');
     const items = (spec.toolSpec.inputSchema.json as unknown as {
       properties: { collected: { items: { properties: Record<string, { description?: string }>; required: string[] } } };
@@ -165,7 +230,9 @@ describe('a size is recorded as a range, not as a sentence to be parsed later', 
 
     expect(items.properties.minWords).toBeDefined();
     expect(items.properties.maxWords).toBeDefined();
+    expect(items.properties.sizeLabel).toBeDefined();
     expect(items.properties.minWords.description).toMatch(/only when this requirement fixes a SIZE/i);
+    expect(items.properties.sizeLabel.description).toMatch(/never the whole of what they said/i);
     // Optional: a requirement that names no size must not force the model to invent one.
     expect(items.required).toEqual(['requirement', 'value']);
   });

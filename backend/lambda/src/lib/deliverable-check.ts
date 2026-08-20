@@ -22,6 +22,9 @@
  * PURE, and deliberately: no AWS clients and no model calls, so every rule here is unit-testable
  * against real documents. The one model call this feature makes belongs to the caller.
  */
+// Pure too, and load-bearing: anything from this module that reaches a POSTED message is stripped of
+// control markers first. See `recordedLengthTarget` and `correctionProgressLine`.
+import { stripMessageMarkers } from './message-markers.js';
 
 /**
  * The size the person agreed to, as the numbers it was recorded as.
@@ -57,10 +60,23 @@ export function recordedLengthTarget(details: unknown): LengthTarget | null {
   if (typeof minWords !== 'number' || typeof maxWords !== 'number') return null;
   if (!Number.isFinite(minWords) || !Number.isFinite(maxWords)) return null;
   if (minWords <= 0 || maxWords < minWords) return null;
+  const min = Math.round(minWords);
+  const max = Math.round(maxWords);
+  // SANITISED ON THE WAY OUT, not only on the way in. `source` is model-authored text that this
+  // module hands to a string which is POSTED INTO THE CHANNEL, and the write-side bound cannot protect
+  // this read: rows already exist that were written before that bound, by a hand edit, or by an
+  // imported fixture. A control marker reaching a bot message is not cosmetic - the chat client parses
+  // markers out of bot content, and a `NAVIGATE_CHANNEL:` marker on a message UPDATE makes every
+  // watching client navigate with no user gesture (`ConversationProvider.chime.tsx`). Stripped AND
+  // bounded here, so no writer can re-open the sink.
+  const cleaned = typeof source === 'string' ? stripMessageMarkers(source).trim().slice(0, 60) : '';
   return {
-    minWords: Math.round(minWords),
-    maxWords: Math.round(maxWords),
-    source: typeof source === 'string' && source.trim() ? source.trim() : `${minWords}-${maxWords} words`,
+    minWords: min,
+    maxWords: max,
+    // The ROUNDED values, because this string is shown to the person. A row written by anything other
+    // than `collectedRequirements` - a hand edit, a future writer, an imported fixture - can carry
+    // fractional bounds, and the raw ones surfaced as "Trimming the report to 299.6-900.4 words...".
+    source: cleaned || `${min}-${max} words`,
   };
 }
 
@@ -167,15 +183,15 @@ export function deliverableIssues(doc: string, target: LengthTarget | null): Del
  */
 export function correctionProgressLine(issues: DeliverableIssue[], target: LengthTarget | null): string {
   const kinds = new Set(issues.map((i) => i.kind));
+  // STRIPPED AT THE POINT OF USE as well as at the read, because this string is posted into the
+  // channel and a caller may hand us a target it built itself. Two cheap strips beat one that a later
+  // call site forgets: the same belt-and-braces the prompt builder applies to model-supplied titles.
+  const size = target ? (stripMessageMarkers(target.source).trim() || 'the agreed length') : '';
   if (kinds.has('too_long')) {
-    return target
-      ? `Trimming the report to ${target.source}...`
-      : 'Trimming the report to the agreed length...';
+    return target ? `Trimming the report to ${size}...` : 'Trimming the report to the agreed length...';
   }
   if (kinds.has('too_short')) {
-    return target
-      ? `Expanding the report to ${target.source}...`
-      : 'Expanding the report to the agreed length...';
+    return target ? `Expanding the report to ${size}...` : 'Expanding the report to the agreed length...';
   }
   return 'Tidying the document before delivering it...';
 }

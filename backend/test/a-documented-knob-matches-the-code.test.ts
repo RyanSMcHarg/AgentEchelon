@@ -29,17 +29,33 @@ const CHECK = fs.readFileSync(
   path.join(__dirname, '../lambda/src/lib/deliverable-check.ts'), 'utf8',
 );
 
-/** The knobs table's own section, so a number elsewhere in the guide cannot satisfy these. */
+const SECTION_HEADING = '### What the runtime checks before it delivers';
+
+/**
+ * The knobs table's own section, so a number elsewhere in the guide cannot satisfy these.
+ *
+ * Ends at the next heading of ANY level at or above its own. Ending only at `\n## ` did not isolate
+ * anything: the section ran past two sibling `###` subsections all the way to the next chapter, so a
+ * stray "60% of the original" in either of them would have kept this suite green while the row it was
+ * meant to pin was gone.
+ */
 function knobsSection(): string {
-  const start = GUIDE.indexOf('### What the runtime checks before it delivers');
-  expect(start).toBeGreaterThan(-1);
-  const rest = GUIDE.slice(start + 1);
-  const end = rest.indexOf('\n## ');
+  const start = GUIDE.indexOf(SECTION_HEADING);
+  if (start === -1) return '';
+  const rest = GUIDE.slice(start + SECTION_HEADING.length);
+  const end = rest.search(/\n#{2,3} /);
   return end === -1 ? rest : rest.slice(0, end);
 }
 
 describe('the delivery knobs the guide documents are the ones the code uses', () => {
   const section = knobsSection();
+
+  // Asserted as a TEST rather than inside the helper: a renamed heading should fail one case with a
+  // readable message, not break collection of the whole suite before anything runs.
+  it('finds the section at all, so nothing below passes by reading an empty string', () => {
+    expect(section).not.toBe('');
+    expect(section).toContain('| Knob |');
+  });
 
   it('correction passes: the guide says 3 and the constant is 3', () => {
     expect(section).toMatch(/MAX_CORRECTION_ROUNDS[^|]*\|[^|]*\b3\b/);

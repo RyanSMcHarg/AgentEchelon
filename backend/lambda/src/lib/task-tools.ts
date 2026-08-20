@@ -143,6 +143,19 @@ export function taskToolSpecsFor(
                     description: 'Only when this requirement fixes a SIZE: the most words that still '
                       + 'satisfies it. Omit if no size was agreed.',
                   },
+                  // SHOWN TO THE PERSON, so it has to be the size and nothing else. The value of the
+                  // requirement is a whole answer - at `drafting_outline` it is "approval of the
+                  // outline, or what to change about it", so a size can arrive inside "Looks good, but
+                  // can you make it 1-2 pages?". Rendering that back produced "Trimming the report to
+                  // Looks good, but can you make it 1-2 pages?...". The label is asked for separately
+                  // rather than extracted, because extracting it would be a pattern reading English
+                  // (tenet 11); absent, the numbers are shown instead.
+                  sizeLabel: {
+                    type: 'string',
+                    description: 'Only with minWords/maxWords: how to NAME that size to the person, in '
+                      + 'their own words and nothing else - "1-2 pages", "a short summary". Not a '
+                      + 'sentence, and never the whole of what they said.',
+                  },
                 },
                 required: ['requirement', 'value'],
               },
@@ -163,6 +176,16 @@ export function taskToolSpecsFor(
  * correct one and is worth more than a rejected transition - the step still advanced for real
  * reasons, and refusing it here would strand the task over bookkeeping.
  */
+/** A number, or a numeric string a model sent where an integer was asked for. Anything else is null. */
+function toFiniteNumber(v: unknown): number | null {
+  if (typeof v === 'number') return Number.isFinite(v) ? v : null;
+  if (typeof v === 'string' && v.trim()) {
+    const n = Number(v.trim());
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
 export function collectedRequirements(
   input: unknown,
 ): { requirements: Record<string, string>; lengthTarget?: RecordedLengthTarget } | undefined {
@@ -172,7 +195,7 @@ export function collectedRequirements(
 
   for (const entry of input) {
     if (!entry || typeof entry !== 'object') continue;
-    const { requirement, value, minWords, maxWords } = entry as Record<string, unknown>;
+    const { requirement, value, minWords, maxWords, sizeLabel } = entry as Record<string, unknown>;
     if (typeof requirement !== 'string' || typeof value !== 'string') continue;
     if (!requirement.trim() || !value.trim()) continue;
     requirements[requirement.trim()] = value.trim();
@@ -182,16 +205,32 @@ export function collectedRequirements(
     // admits an empty one. Half an agreement is not an agreement, so it is discarded rather than
     // half-enforced. Same for a reversed or non-positive pair - a model produced it, and a bound that
     // makes no sense is noise, not data.
-    if (typeof minWords === 'number' && typeof maxWords === 'number'
-      && Number.isFinite(minWords) && Number.isFinite(maxWords)
-      && minWords > 0 && maxWords >= minWords) {
+    // A NUMBER MAY ARRIVE AS A NUMERIC STRING. `"600"` is an ordinary model output for an integer
+    // field, and discarding it silently threw away a real agreement. Coercing a numeric string is
+    // arithmetic, not a language judgement: anything that is not a number after coercion is refused.
+    const min = toFiniteNumber(minWords);
+    const max = toFiniteNumber(maxWords);
+    const boundsOffered = minWords !== undefined || maxWords !== undefined;
+
+    if (min !== null && max !== null && min > 0 && max >= min) {
       // The FIRST size wins if a model marks two requirements as sizes: the alternative is picking by
       // a rule nobody declared. One step, one agreed size.
+      const label = typeof sizeLabel === 'string' ? sizeLabel.trim() : '';
       lengthTarget ??= {
-        minWords: Math.round(minWords),
-        maxWords: Math.round(maxWords),
-        source: value.trim(),
+        minWords: Math.round(min),
+        maxWords: Math.round(max),
+        // The LABEL, never the whole answer: this is rendered to the person while the document is
+        // being corrected. Bounded, because a model asked for a short phrase can still send a
+        // paragraph, and a progress line is not the place to find that out.
+        source: label && label.length <= 60 ? label : `${Math.round(min)}-${Math.round(max)} words`,
       };
+    } else if (boundsOffered) {
+      // BOUNDS WERE OFFERED AND REFUSED, which is not the same as no size being agreed - and at
+      // delivery the two look identical (`agreed: 'not recorded'`). Said here, where the discard
+      // happens, so a malformed pair is findable instead of looking like a person who named no size.
+      console.warn('[TaskTools] size bounds discarded as unusable', {
+        requirement: requirement.trim(), minWords, maxWords,
+      });
     }
   }
   if (!Object.keys(requirements).length) return undefined;
@@ -212,7 +251,12 @@ export async function handleAdvanceTaskStateTool(args: {
   messageId?: string;
   /** The assistant running this turn, so a task can be handed back when it stops awaiting the user. */
   assistantId?: string;
-}): Promise<{ payload: Record<string, unknown>; result: AdvanceResult }> {
+}): Promise<{
+  payload: Record<string, unknown>;
+  result: AdvanceResult;
+  /** What was written to `task.details`, so the caller can refresh its in-memory task. */
+  details?: Record<string, unknown>;
+}> {
   const toState = typeof args.input.to_state === 'string' ? args.input.to_state.trim() : '';
   const reason = typeof args.input.reason === 'string' ? args.input.reason : undefined;
 
@@ -229,6 +273,24 @@ export async function handleAdvanceTaskStateTool(args: {
   // one's answers. Written under `requirements` so the map is addressable rather than spread across
   // details' top level, where a state-specific key could collide with it.
   const collected = collectedRequirements(args.input.collected);
+  // Built once and RETURNED, so the caller can put it back on its in-memory task. A step that
+  // collects a requirement and delivers in the SAME turn - `data_extraction.collecting_requirements`
+  // goes straight into `extracting`, which delivers - would otherwise check the document against a
+  // snapshot taken before the tool ran, find no agreement, and enforce nothing on the very turn the
+  // agreement was made. Measured: the live extraction logged `agreed: 'not recorded'` immediately
+  // after recording one.
+  const mergedDetails = collected
+    ? {
+      requirements: {
+        ...(args.task.details?.requirements as Record<string, string> ?? {}),
+        ...collected.requirements,
+      },
+      // The agreed SIZE, stored as the numbers the model resolved it to. A later step that agrees
+      // a new size replaces it; one that agrees none leaves the earlier agreement standing, which
+      // is what a person would expect from having said it once.
+      ...(collected.lengthTarget ? { lengthTarget: collected.lengthTarget } : {}),
+    }
+    : undefined;
 
   const result = await advanceTaskStateTo({
     task: args.task,
@@ -237,20 +299,7 @@ export async function handleAdvanceTaskStateTool(args: {
     reason,
     messageId: args.messageId,
     machines: args.machines ?? DEFAULT_TASK_STATE_MACHINES,
-    ...(collected
-      ? {
-        details: {
-          requirements: {
-            ...(args.task.details?.requirements as Record<string, string> ?? {}),
-            ...collected.requirements,
-          },
-          // The agreed SIZE, stored as the numbers the model resolved it to. A later step that agrees
-          // a new size replaces it; one that agrees none leaves the earlier agreement standing, which
-          // is what a person would expect from having said it once.
-          ...(collected.lengthTarget ? { lengthTarget: collected.lengthTarget } : {}),
-        },
-      }
-      : {}),
+    ...(mergedDetails ? { details: mergedDetails } : {}),
     ...(args.assistantId ? { assistantId: args.assistantId } : {}),
   });
 
@@ -262,7 +311,7 @@ export async function handleAdvanceTaskStateTool(args: {
         ...(result.from ? { from: result.from } : {}),
         ...(result.legal ? { legal_transitions: result.legal } : {}),
       };
-  return { payload, result };
+  return { payload, result, ...(mergedDetails ? { details: mergedDetails } : {}) };
 }
 
 /**
