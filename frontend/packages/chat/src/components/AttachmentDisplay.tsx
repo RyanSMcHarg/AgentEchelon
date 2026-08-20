@@ -84,15 +84,24 @@ const AttachmentDisplay: React.FC<AttachmentDisplayProps> = ({ attachment }) => 
         activeConversation.id,
         user.id
       );
-      // noopener+noreferrer prevents the opened window from accessing
-      // window.opener (reverse-tabnabbing).
-      // Low risk here (presigned S3 URL) but free hardening.
-      const opened = window.open(url, '_blank', 'noopener,noreferrer');
-      // A blocked popup returns null. Without this the file simply never appears and the
-      // user has no idea their own browser stopped it.
-      if (!opened) {
-        setDownloadError('Your browser blocked the download window. Allow pop-ups for this site, then retry.');
-      }
+      // AN ANCHOR CLICK, NOT `window.open`, and the reason is that its return value cannot be read.
+      // `window.open(url, '_blank', 'noopener,noreferrer')` returns null WHENEVER `noopener` is set -
+      // that is what the specification requires, since the opener must not receive a handle to the new
+      // window. The old code read that null as "the popup was blocked", so every SUCCESSFUL download
+      // told the person their browser had stopped it (measured live: the file downloaded, and the UI
+      // said it was blocked).
+      //
+      // A user-gesture anchor click keeps the same hardening - `rel="noopener noreferrer"` prevents
+      // reverse-tabnabbing on the presigned URL - without inventing a failure signal that cannot
+      // exist. There is no reliable way to detect a blocked popup here, so nothing claims to.
+      const link = document.createElement('a');
+      link.href = url;
+      link.target = '_blank';
+      link.rel = 'noopener noreferrer';
+      link.style.display = 'none';
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
     } catch (error) {
       console.error('Failed to download file:', error);
       setDownloadError("Couldn't open this file. Please try again.");

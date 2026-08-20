@@ -3431,8 +3431,30 @@ const TASK_LABELS: Record<string, Record<string, string>> = {
   },
 };
 
-export function getTaskLabel(taskType: string, taskState: string): string {
-  return TASK_LABELS[taskType]?.[taskState] || taskType;
+export function getTaskLabel(
+  taskType: string,
+  taskState: string,
+  machines?: Record<string, TaskStateMachine>,
+): string {
+  // 1. WHAT THE MACHINE SAYS. A task machine is per-deployment configuration, so its author is the one
+  //    who can name their own states. `TASK_LABELS` below cannot: it is a hardcoded table keyed by the
+  //    SHIPPED task types, so a pack-declared type or a renamed state never had a label at all - the
+  //    same hardcoded-list shape the delivery gate already retired for exactly this reason.
+  const declared = machines?.[taskType]?.states?.[taskState]?.label;
+  if (declared?.trim()) return declared.trim();
+
+  // 2. The shipped table, which still names the five default machines' states.
+  const known = TASK_LABELS[taskType]?.[taskState];
+  if (known) return known;
+
+  // 3. DERIVED FROM THE STATE, never the bare task type. The old fallback returned `taskType`, so a
+  //    state the table did not know showed the person a key: "report_generation" in the status chip
+  //    (owner, measured in the live app). A state name is a key we chose, so reshaping it is
+  //    presentation rather than a language judgement: `drafting_outline` -> "Drafting outline".
+  const source = taskState?.trim() || taskType?.trim() || '';
+  if (!source) return '';
+  const words = source.replace(/[_-]+/g, ' ').trim();
+  return words.charAt(0).toUpperCase() + words.slice(1);
 }
 
 /**

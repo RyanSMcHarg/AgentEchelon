@@ -43,6 +43,19 @@ export interface TaskStateDef {
   prompt?: string;
   /** Placeholder copy for this state (migrates getTaskPlaceholder's switch). Optional until that migration. */
   placeholder?: string;
+  /**
+   * How this state is NAMED to the person, in the status chip the chat client renders from the
+   * `ACTIVE_TASK` marker.
+   *
+   * Declared, for the same reason `delivers` and `awaits` are: the shipped label table is keyed by the
+   * SHIPPED task types, so a pack-declared type or a renamed state could never have a label and the
+   * person was shown the raw key - "report_generation" in the chip (measured live). A machine's author
+   * is the one who can name their own states, and in their deployment's own language.
+   *
+   * Absent, the runtime falls back to the shipped table and then to the state name reshaped
+   * (`drafting_outline` -> "Drafting outline"), so omitting it is never a key on screen.
+   */
+  label?: string;
   /** Legal target states reachable from here. Empty array = terminal. */
   transitions: string[];
   /** Set iff `transitions` is empty; the outcome this terminal records. */

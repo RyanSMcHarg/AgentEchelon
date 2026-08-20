@@ -66,16 +66,48 @@ describe('AttachmentDisplay — a failed download is never silent', () => {
     expect(getDownloadUrl).not.toHaveBeenCalled();
   });
 
-  it('shows an error when the browser blocks the popup (window.open returns null)', async () => {
+  // THIS TEST USED TO PIN A DEFECT. It asserted that a null return from `window.open` produced "your
+  // browser blocked the download window" - but `window.open(url, '_blank', 'noopener,noreferrer')`
+  // returns null WHENEVER `noopener` is set, by specification, because the opener must not receive a
+  // handle to the new window. So the message appeared on every SUCCESSFUL download (measured live: the
+  // file downloaded, and the UI said it was blocked), and this test kept that in place.
+  //
+  // The download is now an anchor click, which has no return value to misread. There is no reliable
+  // way to detect a blocked popup here, so nothing claims to - and what is asserted instead is that a
+  // successful download says nothing at all.
+  it('opens the presigned URL in a new tab with reverse-tabnabbing protection', async () => {
     vi.mocked(getDownloadUrl).mockResolvedValue('https://s3.example.com/report.md?sig=abc');
-    vi.stubGlobal('open', vi.fn().mockReturnValue(null));
-    const { container } = renderWith();
+    const clicked: HTMLAnchorElement[] = [];
+    const realClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function patched(this: HTMLAnchorElement) { clicked.push(this); };
+    try {
+      const { container } = renderWith();
+      (container.querySelector('.attachment-file') as HTMLElement).click();
 
-    (container.querySelector('.attachment-file') as HTMLElement).click();
+      await waitFor(() => expect(clicked).toHaveLength(1));
+      expect(clicked[0].href).toBe('https://s3.example.com/report.md?sig=abc');
+      expect(clicked[0].target).toBe('_blank');
+      expect(clicked[0].rel).toBe('noopener noreferrer');
+      // And it does not tell the person their browser stopped something that worked.
+      expect(container.querySelector('.attachment-error')).toBeNull();
+    } finally {
+      HTMLAnchorElement.prototype.click = realClick;
+    }
+  });
 
-    await waitFor(() => {
-      expect(container.querySelector('.attachment-error')?.textContent).toMatch(/blocked the download window/i);
-    });
+  it('leaves nothing appended to the document after the click', async () => {
+    vi.mocked(getDownloadUrl).mockResolvedValue('https://s3.example.com/report.md?sig=abc');
+    const realClick = HTMLAnchorElement.prototype.click;
+    HTMLAnchorElement.prototype.click = function patched(this: HTMLAnchorElement) { /* no navigation */ };
+    try {
+      const { container } = renderWith();
+      (container.querySelector('.attachment-file') as HTMLElement).click();
+
+      await waitFor(() => expect(getDownloadUrl).toHaveBeenCalled());
+      await waitFor(() => expect(document.querySelectorAll('a[rel="noopener noreferrer"]')).toHaveLength(0));
+    } finally {
+      HTMLAnchorElement.prototype.click = realClick;
+    }
   });
 
   it('shows NO error on a successful download', async () => {

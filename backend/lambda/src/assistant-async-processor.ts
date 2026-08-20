@@ -1589,7 +1589,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
             // fixing.
             if (messageId) {
               await updateMessage(
-                event.channelArn, messageId, correctionProgressLine(issues, target), event.botArn, 'interim',
+                event.channelArn, messageId, correctionProgressLine(issues, target), event.botArn, 'progress',
               ).catch((err: unknown) => console.warn('[AssistantAsyncProcessor] progress update failed:', err));
             }
             // The SAME resilient path every other model call here takes, so a corrective turn degrades
@@ -1724,7 +1724,24 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       pollTime,
       conversationHistoryLength: consolidatedHistory.length,
       startTime,
-      activeTaskInfo,
+      // THE STATE THE TURN ENDED IN, not the one it started in. `activeTaskInfo` is stamped before the
+      // model runs, because the same object grounds the prompt - but it is also what becomes the
+      // `<!--ACTIVE_TASK:-->` marker the chat client renders as a status chip. Left as stamped, the
+      // chip is always ONE TURN BEHIND: it reads "Drafting outline" while the report is being
+      // generated, and still reads "Generating report" after the document has been delivered (owner,
+      // measured in the live app). The tool loop has since moved `taskContext.task.taskState`, so the
+      // chip is rebuilt from it here.
+      activeTaskInfo: activeTaskInfo && taskContext
+        ? {
+          ...activeTaskInfo,
+          status: taskContext.task.taskState || activeTaskInfo.status,
+          label: getTaskLabel(
+            activeTaskInfo.type,
+            taskContext.task.taskState || '',
+            taskContext.machines,
+          ),
+        }
+        : activeTaskInfo,
       taskContext,
       attachment,
       // The structural block fact, never inferred from the reply's text shape.

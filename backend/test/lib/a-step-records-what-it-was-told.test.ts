@@ -15,6 +15,7 @@
 import {
   ADVANCE_TASK_STATE_TOOL_SPEC,
   collectedRequirements,
+  handleAdvanceTaskStateTool,
   taskToolSpecsFor,
 } from '../../lambda/src/lib/task-tools';
 import { DEFAULT_TASK_STATE_MACHINES } from '../../lambda/src/lib/task-state-machines';
@@ -235,5 +236,70 @@ describe('a size is recorded as a range, not as a sentence to be parsed later', 
     expect(items.properties.sizeLabel.description).toMatch(/never the whole of what they said/i);
     // Optional: a requirement that names no size must not force the model to invent one.
     expect(items.required).toEqual(['requirement', 'value']);
+  });
+});
+
+/**
+ * THE TURN THAT RECORDS A SIZE MUST BE ABLE TO SEE IT.
+ *
+ * The delivering check reads `task.details`, and the task object it reads is the one loaded BEFORE the
+ * Converse loop ran. `data_extraction.collecting_requirements` goes straight into `extracting`, which
+ * delivers - so a size collected and a document delivered in the SAME turn used to be checked against a
+ * snapshot taken before the size existed. It logged `agreed: 'not recorded'` immediately after
+ * recording one, and enforced nothing on precisely the flow the recording was built for.
+ *
+ * The tool therefore RETURNS what it wrote, and the loop puts it back on the in-memory task.
+ */
+jest.mock('../../lambda/src/lib/task-tracking', () => ({
+  ...jest.requireActual('../../lambda/src/lib/task-tracking'),
+  advanceTaskStateTo: jest.fn(async () => ({ ok: true, from: 'collecting_requirements', to: 'extracting' })),
+}));
+
+describe('what the tool wrote is handed back to the turn that wrote it', () => {
+  const task = {
+    taskId: 't-1',
+    channelArn: 'arn:aws:chime:us-east-1:1:app-instance/a/channel/c',
+    taskType: 'data_extraction',
+    taskState: 'collecting_requirements',
+    details: { requirements: { 'the subject': 'churn risk' } },
+  } as unknown as Parameters<typeof handleAdvanceTaskStateTool>[0]['task'];
+
+  it('returns the merged details, including a size recorded this turn', async () => {
+    const out = await handleAdvanceTaskStateTool({
+      task,
+      input: {
+        to_state: 'extracting',
+        reason: 'the person supplied the last requirement',
+        collected: [
+          { requirement: 'the output format', value: 'a table, at most 200 words', minWords: 120, maxWords: 200, sizeLabel: 'at most 200 words' },
+        ],
+      },
+    });
+
+    expect(out.details).toEqual({
+      requirements: {
+        'the subject': 'churn risk',           // the earlier step's answer survives
+        'the output format': 'a table, at most 200 words',
+      },
+      lengthTarget: { minWords: 120, maxWords: 200, source: 'at most 200 words' },
+    });
+  });
+
+  it('returns no details when the call recorded nothing, so the caller overwrites nothing', async () => {
+    const out = await handleAdvanceTaskStateTool({
+      task,
+      input: { to_state: 'extracting', reason: 'moving on' },
+    });
+    expect(out.details).toBeUndefined();
+  });
+
+  // The other half of the fix is in the loop, which is not unit-testable here without standing up a
+  // Converse turn. Pinned by source, in the style of the delivery-contract ratchets: the assignment
+  // must exist, and it must be conditional so a call that recorded nothing cannot blank the details.
+  it('the loop copies them onto the in-memory task', () => {
+    const core = require('fs').readFileSync(
+      require('path').join(__dirname, '../../lambda/src/lib/async-processor-core.ts'), 'utf8',
+    );
+    expect(core).toContain('if (writtenDetails) taskContext.task.details = writtenDetails;');
   });
 });

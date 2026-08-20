@@ -463,6 +463,13 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         // the "waiting ended" signal the composer affordance keys off.
         battleWaiting: msg.battleWaiting,
         activeTask: msg.activeTask,
+        // WHICH STEP OF THE ANSWER THIS UPDATE IS. Taken from the UPDATE, not preserved from the
+        // CREATE, because that is the whole point: the placeholder says `placeholder`, an in-flight
+        // correction says `interim`, and the settled answer says `final`. Omitted from this list, the
+        // field never changed after the CREATE - which is the failure this merge's own comment warns
+        // about, and it cost three e2e runs to find, because the attribute simply never appeared and a
+        // guard reading it skipped silently.
+        responsePhase: msg.responsePhase ?? updated[idx].responsePhase,
         attachment: msg.attachment ?? updated[idx].attachment,
         modelId: msg.modelId ?? updated[idx].modelId,
         intent: msg.intent ?? updated[idx].intent,

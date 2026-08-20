@@ -85,6 +85,19 @@ export interface Message {
   // i.e., the message was targeted to us (and is invisible to other channel
   // members). Used to drive the sticky-mention follow-up behavior.
   targetedToUser?: boolean;
+  /**
+   * WHICH STEP OF THE ANSWER THIS MESSAGE IS, as the backend declared it (`respPhase` in the Chime
+   * metadata): `placeholder`, `interim`, `final`, `error`, `notice`.
+   *
+   * Carried through rather than inferred from the text, because "is this the settled answer?" is a
+   * question several readers ask and only the writer can answer. A delivering turn now updates its
+   * placeholder mid-flight ("Trimming the report to 1-2 pages..."), which looks exactly like a settled
+   * short reply to anything reading the DOM - and an e2e that mistook one for the answer sent its next
+   * message into a turn that was still generating, producing the report twice.
+   *
+   * Undefined for messages whose writer stamped no phase.
+   */
+  responsePhase?: string;
   // Multi-part response grouping
   responseGroup?: string;
   continuation?: boolean;

@@ -808,6 +808,14 @@ const ConversationInterface: React.FC = () => {
               // (see utils/focusMessage). A drift-created conversation links back to the message that
               // caused it, which is useless if it only lands the reader in the right thread.
               data-message-id={message.id}
+              // WHICH STEP OF THE ANSWER THIS IS, as the backend declared it. Rendered as an attribute
+              // rather than kept in state alone because it is the only structural way to tell a
+              // settled reply from work in progress by looking at the page: a delivering turn updates
+              // its message mid-flight ("Trimming the report to 1-2 pages..."), which is indistinguishable
+              // from a short final answer by text. An e2e reading the DOM mistook one for the answer
+              // and sent its next message into a turn that was still generating, producing the report
+              // twice. Absent when the writer stamped no phase.
+              data-response-phase={message.responsePhase}
               className={`message ${message.isBot ? 'assistant-message' : 'user-message'}${isContinuation || isGroupedWithPrev ? ' continuation' : ''}${message.battle ? ' battle-message' : ''}`}
             >
               <div className="message-content">

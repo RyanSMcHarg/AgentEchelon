@@ -64,6 +64,14 @@ export interface WebSocketTimings {
   isDirect: boolean;
   /** Content of the final response from WebSocket */
   responseContent: string;
+  /**
+   * The `respPhase` the accepted frame DECLARED, when it declared one.
+   *
+   * Exposed so a caller can tell "this is the settled answer" from "this is as far as the frame path
+   * got" without re-reading the text. `null` means the frame carried no phase and the content test
+   * decided - which is the older, weaker path, kept for writers that do not stamp one.
+   */
+  responsePhase: string | null;
 }
 
 /**
@@ -149,6 +157,8 @@ export class WebSocketMonitor {
   private ttffMs: number | null = null;
   private ttfrMs: number | null = null;
   private responseContent = '';
+  /** The phase the accepted frame declared, or null when it carried none. */
+  private responsePhase: string | null = null;
   private placeholderMessageId: string | null = null;
 
   /**
@@ -206,13 +216,14 @@ export class WebSocketMonitor {
     this.ttffMs = null;
     this.ttfrMs = null;
     this.responseContent = '';
+    this.responsePhase = null;
     this.placeholderMessageId = null;
     this.startTime = Date.now();
 
     if (!this.ws) {
       console.warn('[WsMonitor] No WebSocket captured -- returning empty timings');
       return Promise.resolve({
-        userEchoMs: null, ttffMs: null, ttfrMs: null,
+        userEchoMs: null, ttffMs: null, ttfrMs: null, responsePhase: null,
         isDirect: false, responseContent: '',
       });
     }
@@ -249,7 +260,13 @@ export class WebSocketMonitor {
         // First bot message -- either placeholder or DIRECT response
         this.ttffMs = elapsed;
         this.placeholderMessageId = parsed.messageId;
-        if (isPlaceholder(parsed.content)) {
+        // Same structural question as the UPDATE branch below: a frame that DECLARES a phase other
+        // than `final` is not the answer, whatever its text looks like. A `placeholder` phase is the
+        // ordinary case here; anything else that is not `final` is still work in progress.
+        const createPhase = typeof parsed.metadata?.respPhase === 'string' ? parsed.metadata.respPhase : null;
+        if (createPhase === 'placeholder' || createPhase === 'progress') {
+          console.log(`[WsMonitor] Bot ${createPhase} (TTFF): ${elapsed}ms [msgId=${parsed.messageId.substring(0, 8)}]`);
+        } else if (isPlaceholder(parsed.content)) {
           console.log(`[WsMonitor] Bot placeholder (TTFF): ${elapsed}ms [msgId=${parsed.messageId.substring(0, 8)}]`);
         } else {
           // DIRECT response -- no UPDATE will follow
@@ -265,10 +282,36 @@ export class WebSocketMonitor {
         console.log(`[WsMonitor] Ignoring update for msgId=${parsed.messageId.substring(0, 8)} (expected ${this.placeholderMessageId?.substring(0, 8) ?? 'none'})`);
         return;
       }
-      // Bot updated the placeholder with the real response. Accept any
-      // non-placeholder, non-empty content -- a correct terse answer (e.g. "4"
-      // to "2 + 2") is legitimately short, so a length floor here would drop
-      // the real UPDATE frame and force a 60s timeout + empty content.
+      // WHICH STEP OF THE ANSWER THIS IS, ASKED STRUCTURALLY. Every update the platform writes stamps
+      // `respPhase` into the message metadata (`updateMessage`), and only `final` closes the turn -
+      // the runtime's own rule, which archival already gates `agent_final_at` on. An `interim` frame
+      // is work in progress and must not be mistaken for the answer.
+      //
+      // THIS REPLACED A PHRASE LIST, and the list had just cost a test run. `isPlaceholder` matches
+      // known placeholder COPY, so the moment the platform posted a progress line nobody had added to
+      // it ("Tidying the document before delivering it..."), this frame was accepted as the settled
+      // reply. `sendAndWaitForResponse` returned, the spec sent its next message into a turn that was
+      // still generating, and the report was produced twice - three attachments where the test
+      // expected two. A list of sentences cannot keep up with the copy the product writes.
+      //
+      // The text test remains as a FALLBACK for a frame with no phase: other writers post messages
+      // (the channel flow's handed-back placeholder, a battle notice) and not all of them stamp one.
+      const phase = typeof parsed.metadata?.respPhase === 'string' ? parsed.metadata.respPhase : null;
+      if (phase === 'placeholder' || phase === 'progress') {
+        console.log(`[WsMonitor] Ignoring ${phase} update for msgId=${parsed.messageId.substring(0, 8)}`);
+        return;
+      }
+      // Every OTHER declared phase is a message the person can see and may have to act on - `final`
+      // is the answer, `interim` is a duel's clarifying question, `error` is a failure that ended
+      // their wait. All of them settle this monitor; only the two above are work in progress.
+      if (phase && parsed.content.trim().length > 0) {
+        this.ttfrMs = elapsed;
+        this.responseContent = parsed.content;
+        this.responsePhase = phase;
+        console.log(`[WsMonitor] Bot update (TTFR, phase=${phase}): ${elapsed}ms -- "${parsed.content.substring(0, 60)}..."`);
+        this.complete();
+        return;
+      }
       if (!isPlaceholder(parsed.content) && parsed.content.trim().length > 0) {
         this.ttfrMs = elapsed;
         this.responseContent = parsed.content;
@@ -292,6 +335,7 @@ export class WebSocketMonitor {
         ttfrMs: this.ttfrMs,
         isDirect: this.ttfrMs !== null && this.ttffMs === this.ttfrMs,
         responseContent: this.responseContent,
+        responsePhase: this.responsePhase,
       });
     }
   }

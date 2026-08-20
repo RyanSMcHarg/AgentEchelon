@@ -177,6 +177,9 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       assignmentMode: typeof metadata.assignmentMode === 'string' ? metadata.assignmentMode : undefined,
       feedback: parseMessageFeedbackFromMetadata(metadata),
       targetedToUser: targetedToUser || undefined,
+      // The step of the answer this message is, as the backend declared it. Carried so a reader does
+      // not have to guess from the text whether the turn has settled - see `Message.responsePhase`.
+      responsePhase: typeof metadata.respPhase === 'string' ? metadata.respPhase : undefined,
       // Multi-part response grouping
       responseGroup: typeof metadata.responseGroup === 'string' ? metadata.responseGroup : undefined,
       continuation: metadata.continuation === true,

@@ -373,7 +373,16 @@ export async function sendAndWaitForResponse(
     const wsErr = backendErrorReply(text);
     if (wsErr) throw new Error(`[backend failure] ${wsErr}: ${text}`);
 
-    if (text.length > 0 && text !== priorLastText && !looksLikeWelcomeOrEnvelope(text) && !looksLikeTaskPlaceholder(text)) {
+    // THE PHASE DECIDES WHEN THE FRAME DECLARES ONE. `looksLikeTaskPlaceholder` is a list of
+    // placeholder SENTENCES, and it silently stopped covering the platform the moment a progress line
+    // was written that nobody had added to it ("Tidying the document before delivering it..."). This
+    // helper then returned mid-turn, the spec sent its next message into a turn still generating, and
+    // the report was produced twice. The monitor now refuses any frame that declares a phase other
+    // than `final`, so by the time this runs a phased frame is already the settled answer; the text
+    // tests below remain for frames that carry no phase at all.
+    const settledByPhase = wsTimings.responsePhase === 'final';
+    if (text.length > 0 && text !== priorLastText
+      && (settledByPhase || (!looksLikeWelcomeOrEnvelope(text) && !looksLikeTaskPlaceholder(text)))) {
       const ttfrLabel = wsTimings.ttfrMs ? ` [TTFR: ${wsTimings.ttfrMs}ms]` : '';
       console.log(`Response (${elapsed}ms${ttfrLabel}): "${text.substring(0, 80)}..."`);
 
@@ -430,6 +439,31 @@ export async function sendAndWaitForResponse(
     // caller's timeout and reporting the teardown instead of the cause.
     const domErr = backendErrorReply(trimmed);
     if (domErr) throw new Error(`[backend failure] ${domErr}: ${trimmed}`);
+    // IS THIS THE SETTLED ANSWER? ASKED STRUCTURALLY FIRST. The client renders the phase the backend
+    // declared (`data-response-phase`, from `respPhase` in the message metadata), and only `final`
+    // closes a turn - the runtime's own rule. A `placeholder` or `interim` message is work in
+    // progress however finished its text looks.
+    //
+    // THE TEXT LIST BELOW COULD NOT KEEP UP. It matches known placeholder COPY, so when a delivering
+    // turn began updating its message mid-flight ("Tidying the document before delivering it..."),
+    // this loop saw a short, stable, unknown-to-the-list string and called it the answer - after
+    // waiting the 400ms settle, which an interim line passes trivially because the model is still
+    // generating. The caller returned, its spec sent the next message into a live turn, and the report
+    // was produced twice. The list stays as a fallback for messages that carry no phase at all.
+    // READ THE PHASE OFF THE SAME ELEMENT THE TEXT CAME FROM. `.assistant-message` alone also matches
+    // the typing indicator (`message assistant-message thinking-indicator`), which renders LAST while
+    // the bot is working and carries neither `.message-text` nor a phase - so `.last()` returned that
+    // node, the attribute read as null, and this guard silently skipped exactly when it was needed.
+    const lastPhase = await page.locator('.assistant-message:has(.message-text)').last()
+      .getAttribute('data-response-phase');
+    if (lastPhase) {
+      // Only these two mean "still working". `final` is the answer, `interim` is a message the person
+      // may have to act on (a duel's clarifying question), `error` ended their wait - all settle.
+      expect(
+        ['placeholder', 'progress'].includes(lastPhase),
+        `still mid-turn (phase=${lastPhase}): "${trimmed.slice(0, 60)}"`,
+      ).toBe(false);
+    }
     // A task turn first renders a progress placeholder ("Let me understand the
     // issue...", "Extracting data...") that is later replaced in place. Keep
     // polling past ANY of them so the settled real answer is what we return,

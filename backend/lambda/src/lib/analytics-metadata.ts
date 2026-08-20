@@ -54,8 +54,22 @@ export type ToolErrorClass = 'timeout' | 'not_found' | 'unauthorized' | 'bad_inp
 export type ResponsePhase =
   /** The acknowledgment. Sets TTFF; never closes the turn. */
   | 'placeholder'
-  /** A step the person can see, mid-answer: a task advancing, a duel side waiting on them. */
+  /** A step the person can see, mid-answer: a task advancing, a duel side waiting on them.
+   *  It is a real message with content they may need to ACT on - a duel's clarifying question is one -
+   *  so it ends their wait even though it does not close the turn. */
   | 'interim'
+  /**
+   * The turn narrating its own work, with nothing for the person to act on: "Trimming the report to
+   * 1-2 pages...", posted while a delivering turn corrects a document.
+   *
+   * DISTINCT FROM `interim`, and the distinction is load-bearing rather than tidy. Both are updates
+   * that do not close a turn, but `interim` carries a message the person may be expected to answer,
+   * while this one is a progress note that will itself be replaced. Reusing `interim` for it
+   * conflated the two immediately: a reader waiting for "the assistant has said something to me"
+   * cannot then tell a clarifying question from a status line, and an e2e that treated every
+   * non-`final` update as work-in-progress would wait forever on a duel's question.
+   */
+  | 'progress'
   /** THE ANSWER. The only phase that closes a turn and stamps `agent_final_at`. */
   | 'final'
   /** The turn failed and said so. Terminal for the person, and deliberately NOT `final`: it closes

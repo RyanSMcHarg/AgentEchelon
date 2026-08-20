@@ -87,7 +87,13 @@ export function aws(args: string): any {
   const out = execSync(`aws ${args} --region ${REGION} --output json`, {
     encoding: 'utf8',
     timeout: 30_000,
-    env: { ...process.env, AWS_PROFILE, MSYS_NO_PATHCONV: '1' },
+    // PYTHONIOENCODING IS NOT OPTIONAL ON WINDOWS. The AWS CLI is Python, and its default console
+    // codec is the system ANSI page - so a row containing any non-ASCII character kills the command
+    // rather than the read: a task whose transition reason said "generating -> revising" with a real
+    // arrow failed with `'charmap' codec can't encode character '→'`, which reads as a broken
+    // helper rather than as an encoding default. The task rows this reads are model-authored text, so
+    // non-ASCII in them is ordinary, not exceptional.
+    env: { ...process.env, AWS_PROFILE, MSYS_NO_PATHCONV: '1', PYTHONIOENCODING: 'utf-8' },
   }).trim();
   return out ? JSON.parse(out) : null;
 }
