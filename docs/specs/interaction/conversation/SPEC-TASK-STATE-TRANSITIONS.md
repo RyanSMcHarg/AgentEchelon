@@ -672,6 +672,76 @@ them required in its input schema (`corporate-travel-tool.ts` declares `origin`,
 own tool declares `reason` required, and its handler accepts a call without one. Declaring a field
 required makes it far likelier to arrive; it does not guarantee it.
 
+## 13. One thread per piece of work, and the way out of it
+
+**Status: Implemented.** **Verified by** `backend/test/lib/one-thread-per-piece-of-work.test.ts`,
+`backend/test/lib/a-task-remembers-what-it-delivered.test.ts` and the `tasks` e2e phase.
+
+A person asked "is this task complete?" while a report task was open. The runtime started a turn,
+re-entered report generation, and wrote the report a second time - while the finished document sat in
+the conversation above it and the work item stayed open. Two threads on one piece of work, and neither
+of them answered the question.
+
+### 13.1 The runtime declines to start a second turn on work it already owes
+
+Two facts the turn already has are enough, so this needs no lock and no timeout:
+
+1. **Drift has already run**, and did not fire. Its job is to notice a new topic; when it declines, the
+   message is about the work in hand.
+2. **The task records whose turn it is.** A state that does not `await` the requester (§12) is one the
+   ASSISTANT owes. A message arriving then is not the input the task is blocked on - it is somebody
+   asking about work already under way.
+
+So the runtime replies that the work is still in progress and dispatches nothing. A state that DOES
+await the requester is untouched by this: that message is the answer the task is waiting for, and
+declining it would refuse the only thing that can move the task.
+
+**It fails toward answering.** A task type a deployment declared, or a state renamed since the row was
+written, resolves to no state definition and the guard does not fire. A conversation that stops
+replying is a far worse outcome than a duplicate turn, so the unknown case takes the duplicate.
+
+**What it does NOT cover, and why that is a different change.** The decision reads the task's RECORDED
+state, and the turn that is running is what updates it - so two messages sent seconds apart can both
+arrive while the state still says the person owes the step. The window this closes is the one that was
+reported: a delivered report whose task was never advanced, sitting in a state the assistant owes while
+every later message is treated as input to a step nobody is waiting on. Closing the sub-turn window
+needs a claim written when a turn starts and released on both its exit paths - and a claim needs a
+non-temporal release, or a turn that dies leaves the task unanswerable. That is deliberately not built:
+this removes the reported failure without introducing something that can strand.
+
+### 13.2 `/stop` is what makes declining safe
+
+"The assistant owes the next step" is also true of a task that has STALLED. Without an escape, a stalled
+task would answer every message with the same sentence for ever - so the reply names the way out, and
+the way out works.
+
+`/stop` cancels every active task the person holds in that conversation, in both the task row and the
+per-user mirror (a task cancelled in one and not the other returns on the next turn). It is scoped to
+the channel and to the owner, so it never reaches into another conversation or cancels somebody else's
+work. It runs BEFORE the guard, because a guard that could swallow the escape hatch makes it unreachable
+exactly when it is needed.
+
+A **command**, for the reason `/battle end` is one: "stop" typed mid-sentence is ambiguous, a wrong guess
+throws away work somebody wanted, and a decision that depends on recognising a phrase does not survive
+the conversation being held in another language ([tenet 11](../../../overview/TENETS.md)).
+
+Changing the subject is the other way through: drift runs first and returns before the guard.
+
+### 13.3 A task remembers what it handed over
+
+A turn knew everything about the document it was writing and nothing about the one it wrote last time,
+so an assistant could not see that it had already delivered the report - which is why it answered a
+question about the work by doing the work again.
+
+A task now records each hand-over (`deliveries`: what, when, and the state it came from), appended when
+a document is uploaded, and the task prompt carries it. The assistant is told not to produce it again,
+to advance to the final state if the work is finished, to advance to the revising step if a change was
+asked for, and to simply ANSWER when the person only asked whether it was done.
+
+**This is context, not a completion trigger.** Completion keeps the single path §3 describes: the model
+calls `advance_task_state` and the machine reaches a terminal state. The gap was never the authority to
+close a task - it was knowing there was anything to close.
+
 ## How this gets proven
 
 | Invariant | The test that can fail |
