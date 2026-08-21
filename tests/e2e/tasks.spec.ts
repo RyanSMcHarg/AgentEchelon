@@ -328,6 +328,9 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
 
     await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
     await createConversation(page, `One thread ${Date.now()}`, 'Premium');
+    // The window that makes the capture below THIS test's. 60s of skew, because the task is created
+    // slightly before its reply lands.
+    const runStart = Date.now() - 60_000;
 
     await sendAndWaitForResponse(
       page,
@@ -347,10 +350,19 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     // first run of this test failed exactly there - the `tasks` phase was not passing
     // `E2E_INSTANCE_NAME`, so the table never resolved and a working product looked broken.
     expect(userTable, 'the user-tasks table must resolve - the phase needs E2E_INSTANCE_NAME').toBeTruthy();
+    // SCOPED TO THIS TEST'S OWN TASK, and it has to be. Every tier case in this file opens a
+    // `report_generation` task as the SAME user, so "the report task for this person" matches several -
+    // and picking the wrong one is invisible: the test then stops one conversation's work and polls
+    // another's row, which never cancels. Run alone it passed; run in the suite it failed, which is the
+    // signature of a fixture that is not scoped to its own run.
+    //
+    // Newest-created after this test began, the same correlation `task-state-machine.spec.ts` uses.
     let taskRef: { taskId: string; channelArn: string } | undefined;
     for (let i = 0; i < 12 && !taskRef; i++) {
       const mine = (userTable ? readUserTasks(userTable, sub) : [])
-        .find((t) => String(t.taskType) === 'report_generation');
+        .filter((t) => String(t.taskType) === 'report_generation')
+        .filter((t) => new Date(String(t.createdAt ?? 0)).getTime() >= runStart)
+        .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))[0];
       if (mine) taskRef = { taskId: String(mine.taskId), channelArn: String(mine.channelArn) };
       else await page.waitForTimeout(5000);
     }
