@@ -192,6 +192,10 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
 
     await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
     await createConversation(page, `Report validity ${Date.now()}`, 'Premium');
+    // The window that makes the closure assertion below THIS test's task. Every tier case in this file
+    // opens a `report_generation` task as the same user, so an unscoped match can land on another
+    // test's row - which passes or fails for reasons that have nothing to do with this one.
+    const reportStart = Date.now() - 60_000;
 
     // Kick off, then approve/answer each step until the model DELIVERS a downloadable document.
     await sendAndWaitForResponse(
@@ -199,6 +203,30 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
       'Compile a concise 1-page report on the pros and cons of a monorepo vs multi-repo setup for a 5-team engineering org.',
       180_000,
     );
+
+    // CAPTURE THE TASK NOW, while the person still holds it. The per-user mirror is partitioned by the
+    // CURRENT OWNER, and ownership moves to the assistant at the first answer and STAYS there when the
+    // task completes (a terminal state awaits nobody, so there is no hand-back). A capture attempted at
+    // the end therefore finds an empty partition and reports "no task" for a task that closed perfectly
+    // - which is exactly how this assertion failed while the table showed `completed`.
+    const reportIdToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const reportSub = jwtSub(reportIdToken!);
+    const reportUserTable = resolveTaskTable('user-tasks');
+    const reportAgentTable = resolveTaskTable('agent-tasks');
+    expect(reportUserTable && reportAgentTable, 'the task tables must resolve - the phase needs E2E_INSTANCE_NAME')
+      .toBeTruthy();
+    let reportRef: { taskId: string; channelArn: string } | undefined;
+    for (let i = 0; i < 12 && !reportRef; i++) {
+      const mine = readUserTasks(reportUserTable!, reportSub)
+        .filter((t) => String(t.taskType) === 'report_generation')
+        .filter((t) => new Date(String(t.createdAt ?? 0)).getTime() >= reportStart)
+        .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))[0];
+      if (mine) reportRef = { taskId: String(mine.taskId), channelArn: String(mine.channelArn) };
+      else await page.waitForTimeout(5000);
+    }
+    expect(reportRef, 'the report task must exist before this test can assert anything about closing it')
+      .toBeTruthy();
+
     const attachment = page.locator('.assistant-message .attachment-display').last();
     const approvals = [
       'Audience is engineering leadership. Focus on delivery velocity, code ownership, and CI cost. Keep it concise.',
@@ -290,21 +318,20 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     // still reading "in progress" behind it, because a state only moved when the model chose to call
     // `advance_task_state` and this turn had no reason to.
     //
-    // Polled, because the status reaches `task_details` through Kinesis and archival like every other
-    // field this test reads.
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
-    const end = new Date();
-    const start = new Date(end.getTime() - 1 * 86_400_000);
+    // READ THE TASK ROW, NOT THE ANALYTICS PROJECTION. This asserted against `task_details`, which
+    // reaches Aurora through Kinesis and archival - a lossy copy on a lag, so the assertion could fail
+    // on a task that had genuinely closed. The row is the system of record for a status and it is
+    // immediate. (Its sibling assertion in the `/stop` test was converted first; this one was left
+    // behind, which is why it kept failing after the behaviour was fixed.)
+    //
+    // Correlated to THIS test's task, and captured while the person still holds it: the per-user mirror
+    // is partitioned by the current OWNER, and ownership moves to the assistant at the first answer.
     let closed = false;
-    for (let i = 0; i < 25 && !closed; i++) {
-      const j = await signedAnalyticsPost(ANALYTICS_API, idToken!, {
-        queryType: 'task_details',
-        dateRange: { start: start.toISOString(), end: end.toISOString() },
-      });
-      const rows = (j.data || []) as Array<Record<string, unknown>>;
-      closed = rows.some((r) => String(r.task_type) === 'report_generation'
-        && String(r.status) === 'completed');
-      if (!closed) await page.waitForTimeout(6000);
+    for (let i = 0; i < 20 && !closed; i++) {
+      const row = readTask(reportAgentTable!, reportRef!.taskId, reportRef!.channelArn) as
+        Record<string, unknown> | undefined;
+      closed = String(row?.status) === 'completed';
+      if (!closed) await page.waitForTimeout(5000);
     }
 
     expect(
