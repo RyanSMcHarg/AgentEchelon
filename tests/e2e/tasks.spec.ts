@@ -35,6 +35,7 @@ import { signIn, createConversation, sendAndWaitForResponse, looksLikeTaskPlaceh
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { assertNoDuplicateTasks, openAndValidateAttachment } from './helpers/task-validation';
+import { resolveTaskTable, readUserTasks, readTask, jwtSub } from './helpers/task-backend';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
@@ -278,6 +279,145 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
         + `paragraph(s) + ${substantiveBullets.length} bullet(s). An outline delivered as the report is `
         + 'the defect this asserts against, and it passes every structural check above.',
     ).toBeGreaterThanOrEqual(3);
+
+    // AND THE TASK IS CLOSED. Nothing in this suite asserted this, which is why it was reported from
+    // live use rather than caught here: a search across every task spec for an assertion on a terminal
+    // status returned one hit, and it was a line in a transition TABLE.
+    //
+    // Everything above verifies that the work STARTED and that the artifact is good - a task row lands,
+    // metrics roll it up, the document is a real report. All of it passes while the task stays open
+    // for ever, which is exactly what happened: the person held a finished report with a work item
+    // still reading "in progress" behind it, because a state only moved when the model chose to call
+    // `advance_task_state` and this turn had no reason to.
+    //
+    // Polled, because the status reaches `task_details` through Kinesis and archival like every other
+    // field this test reads.
+    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const end = new Date();
+    const start = new Date(end.getTime() - 1 * 86_400_000);
+    let closed = false;
+    for (let i = 0; i < 25 && !closed; i++) {
+      const j = await signedAnalyticsPost(ANALYTICS_API, idToken!, {
+        queryType: 'task_details',
+        dateRange: { start: start.toISOString(), end: end.toISOString() },
+      });
+      const rows = (j.data || []) as Array<Record<string, unknown>>;
+      closed = rows.some((r) => String(r.task_type) === 'report_generation'
+        && String(r.status) === 'completed');
+      if (!closed) await page.waitForTimeout(6000);
+    }
+
+    expect(
+      closed,
+      'a delivered report must CLOSE its task. The document arrived, so the work is done - a task left '
+        + 'open behind a finished deliverable shows the person an "in progress" item they can do '
+        + 'nothing about, and leaves the chain resumable when there is nothing left to resume.',
+    ).toBe(true);
+  });
+
+  // ONE THREAD PER PIECE OF WORK (SPEC-TASK-STATE-TRANSITIONS §13). A message that arrives while the
+  // assistant owes the next step must NOT start a second turn on the same task, and `/stop` must be a
+  // real way out - a runtime that declines without an escape makes a stalled task unanswerable.
+  //
+  // Asserted STRUCTURALLY, not on wording. The defect was the work being done twice, so the assertion
+  // is that it is done once: a second message while a report is generating must not produce a second
+  // document. Matching the decline's sentence would pin copy that is allowed to change and would pass
+  // just as happily if the turn had silently done nothing.
+  test('[premium] a message about work already under way does not start a second thread, and /stop ends it', async ({ page }) => {
+    test.setTimeout(600_000);
+
+    await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
+    await createConversation(page, `One thread ${Date.now()}`, 'Premium');
+
+    await sendAndWaitForResponse(
+      page,
+      'Compile a concise 1-page report on the pros and cons of a monorepo vs multi-repo setup for a '
+        + '5-team engineering org.',
+      180_000,
+    );
+    // CAPTURE THE TASK NOW, while the person still holds it. The mirror is partitioned by the current
+    // OWNER, and every answer below hands the task to the assistant - so this is the last moment its id
+    // can be read from this person's partition. Taken here rather than at the end for that reason, not
+    // for convenience.
+    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const sub = jwtSub(idToken!);
+    const userTable = resolveTaskTable('user-tasks');
+    // ASSERTED, because an unresolved table is indistinguishable from an absent task: the read returns
+    // an empty list either way, and the poll below would spend its whole budget learning nothing. The
+    // first run of this test failed exactly there - the `tasks` phase was not passing
+    // `E2E_INSTANCE_NAME`, so the table never resolved and a working product looked broken.
+    expect(userTable, 'the user-tasks table must resolve - the phase needs E2E_INSTANCE_NAME').toBeTruthy();
+    let taskRef: { taskId: string; channelArn: string } | undefined;
+    for (let i = 0; i < 12 && !taskRef; i++) {
+      const mine = (userTable ? readUserTasks(userTable, sub) : [])
+        .find((t) => String(t.taskType) === 'report_generation');
+      if (mine) taskRef = { taskId: String(mine.taskId), channelArn: String(mine.channelArn) };
+      else await page.waitForTimeout(5000);
+    }
+    expect(taskRef, 'the report task must exist before this test can assert anything about stopping it')
+      .toBeTruthy();
+
+    // Answer the requirements step, then approve the outline. The approval is what moves the task into
+    // a state the ASSISTANT owes, which is the window this test exists for.
+    await sendAndWaitForResponse(
+      page,
+      'Audience is engineering leadership. Focus on delivery velocity and CI cost. Keep it concise.',
+      180_000,
+    );
+
+    const attachments = page.locator('.assistant-message .attachment-display');
+    await sendAndWaitForResponse(
+      page,
+      'The outline looks good - generate the full report now and deliver it as a downloadable document.',
+      300_000,
+    );
+    await expect(attachments, 'the report must be delivered before this test has anything to guard')
+      .toHaveCount(1, { timeout: 300_000 });
+
+    // THE WINDOW THIS ACTUALLY GUARDS, and it is the one reported live: the report has been delivered,
+    // the model never advanced the task, so it sits in a state the ASSISTANT owes - and every message
+    // after that was treated as input to a step nobody was waiting on. The person asked whether the
+    // work was finished and watched their finished report be written a second time.
+    //
+    // Note what this does NOT cover. The guard reads the task's RECORDED state, and the running turn is
+    // what updates it, so two messages sent seconds apart can both arrive while the state still says the
+    // person owes the step. Closing that window needs an in-flight marker, which is a different change;
+    // this asserts the behaviour that exists.
+    await sendAndWaitForResponse(page, 'Is this task complete?', 180_000);
+    await page.waitForTimeout(20_000);
+    await expect(
+      attachments,
+      'a message about work the assistant already owes must not produce a second document - it should '
+        + 'be answered, or declined, but never re-run',
+    ).toHaveCount(1);
+
+    // `/stop` is what makes declining safe, so it has to actually end the work.
+    await sendAndWaitForResponse(page, '/stop', 120_000);
+
+    // READ THE TASK ROW, NOT THE ANALYTICS PROJECTION. The first version polled `task_details`, which
+    // reaches Aurora through Kinesis and archival - so it asserted a cancel that HAD happened (the
+    // assistant confirmed it in the channel) and failed on lag. The row is the system of record for a
+    // task's status and it is immediate; the projection is a lossy copy of it.
+    // The task is read from the AUTHORITATIVE row, and its id is captured while the PERSON still
+    // holds it. The per-user mirror is partitioned by the task's CURRENT OWNER, and ownership moves to
+    // the assistant the moment an answer is given ( deletes the old partition's row and
+    // writes a new one) - so after  the person's partition is empty, and a test reading it
+    // learns something about ownership rather than about the task.
+    const agentTable = resolveTaskTable('agent-tasks');
+    expect(agentTable, 'the agent-tasks table must resolve for this assertion to mean anything').toBeTruthy();
+
+    let cancelledRow: Record<string, unknown> | undefined;
+    for (let i = 0; i < 12 && !cancelledRow; i++) {
+      const row = readTask(agentTable!, taskRef!.taskId, taskRef!.channelArn) as Record<string, unknown> | undefined;
+      if (String(row?.status) === 'cancelled') cancelledRow = row;
+      else await page.waitForTimeout(5000);
+    }
+    expect(
+      cancelledRow,
+      '`/stop` must cancel the work this person started. It is the escape the decline guard names, so a '
+        + '`/stop` that does not land leaves a stalled task answering every message with the same '
+        + 'sentence and no way for the person to clear it.',
+    ).toBeTruthy();
   });
 
   // OUTPUT VALIDITY — data_extraction: an extraction task must hand back a real, structured, on-topic

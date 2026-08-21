@@ -134,7 +134,7 @@ const PHASES = [
   { id: 'experiments', label: 'Experiment e2e: create an A/B experiment + run a turn (→ #39 experiment_results)', cwd: TESTS,
     cmd: PW('e2e/experiments.spec.ts'), env: { EXPERIMENTS_E2E: '1' }, optional: true },
   { id: 'tasks', label: 'Task e2e: a report request opens a tracked task (→ #32/#35 task_id + Flows)', cwd: TESTS,
-    cmd: PW('e2e/tasks.spec.ts'), env: { TASKS_E2E: '1' }, optional: true },
+    cmd: PW('e2e/tasks.spec.ts'), env: { TASKS_E2E: '1', E2E_INSTANCE_NAME: INSTANCE_NAME }, optional: true },
   // A task answer in a SHARED conversation (ADR-032). Its own phase because the shape is expensive and
   // specific: more than one person in the room AND an open item held by the answerer. Every
   // single-user test passes whatever this code does - in a 1:1 Chime routes every message to the
