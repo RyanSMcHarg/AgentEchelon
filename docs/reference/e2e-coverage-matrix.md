@@ -24,7 +24,7 @@ provisioned credentials and skips silently without them. Read this as the floor.
 | Documents claiming live behaviour (Implemented / Partial) | 39 |
 | ...of those, with no e2e spec | 0 |
 | e2e spec files | 46 |
-| e2e tests declared | 165 |
+| e2e tests declared | 167 |
 
 ## Specifications
 
@@ -33,11 +33,11 @@ provisioned credentials and skips silently without them. Read this as the floor.
 | [DESIGN-ASSISTANT: Meetings assistant](../specs/applications/DESIGN-ASSISTANT-MEETINGS.md) | Draft / planning - the design is not finalized… | none - a draft design; nothing is built, so there is no deployed behaviour to drive. | - |
 | [SPEC-ASSISTANT: Meetings assistant](../specs/applications/SPEC-ASSISTANT-MEETINGS.md) | Draft / planning - the design is not finalized… | none - a draft design; nothing is built, so there is no deployed behaviour to drive. | - |
 | [Demo Company Spec: Stratum Technologies](../specs/applications/SPEC-DEMO-COMPANY.md) | Implemented (the demo dataset and seed script s… | `e2e/classification-context.spec.ts`<br>`e2e/welcome.spec.ts` | 11 |
-| [DESIGN: Battle Mode (`/battle`) - Technical Design](../specs/capabilities/DESIGN-BATTLE.md) | Implemented. Gated by the profile's `battleElig… | `e2e/battle.spec.ts` | 18 |
-| [DESIGN: Experiments and Battle - Objective, Briefing, Lifecycle…](../specs/capabilities/DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP.md) | Implemented. The §4.3 drill-down's real-data re… | `e2e/experiments.spec.ts`<br>`e2e/battle.spec.ts` | 31 |
+| [DESIGN: Battle Mode (`/battle`) - Technical Design](../specs/capabilities/DESIGN-BATTLE.md) | Implemented. Gated by the profile's `battleElig… | `e2e/battle.spec.ts` | 19 |
+| [DESIGN: Experiments and Battle - Objective, Briefing, Lifecycle…](../specs/capabilities/DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP.md) | Implemented. The §4.3 drill-down's real-data re… | `e2e/experiments.spec.ts`<br>`e2e/battle.spec.ts` | 32 |
 | [DESIGN: Multi-Agent Orchestration](../specs/capabilities/DESIGN-MULTI-AGENT-ORCHESTRATION.md) | Design (alignment doc). This proposes a recomme… | none - an alignment document proposing a structure; no code implements it yet. | - |
 | [DESIGN: Multi-Assistant Turn Engine](../specs/capabilities/DESIGN-MULTI-ASSISTANT-TURN-ENGINE.md) | Draft (design-target). | none - a design target for generalizing `/battle`; the engine it describes is not built. The bat… | - |
-| [SPEC: Battle Mode (`/battle`) - Product Specification](../specs/capabilities/SPEC-BATTLE.md) | Implemented. Gated by the profile's `battleElig… | `e2e/battle.spec.ts` | 18 |
+| [SPEC: Battle Mode (`/battle`) - Product Specification](../specs/capabilities/SPEC-BATTLE.md) | Implemented. Gated by the profile's `battleElig… | `e2e/battle.spec.ts` | 19 |
 | [SPEC: Drift Detection (Drift Convergence)](../specs/capabilities/SPEC-DRIFT-CONVERGENCE.md) | Partial. | `e2e/drift-detection.spec.ts` | 9 |
 | [The AgentEchelon Interaction Layer - platform composition model](../specs/interaction/SPEC-INTERACTION-LAYER.md) | Design overview. | none - a design overview that owns no behaviour of its own; each pillar spec it maps declares it… | - |
 | [Assistant Configuration - what the assistant *is*, per experien…](../specs/interaction/assistant-config/SPEC-ASSISTANT-CONFIG.md) | Implemented. The per-classification config seam… | `e2e/profile-config.spec.ts`<br>`e2e/admin-profiles.spec.ts` | 2 |
@@ -99,4 +99,4 @@ is as visible as the forward one.
 - `e2e/speaker-attribution.spec.ts` (2 tests)
 - `e2e/task-answer.spec.ts` (2 tests)
 - `e2e/task-resolution.spec.ts` (2 tests)
-- `e2e/tasks.spec.ts` (4 tests)
+- `e2e/tasks.spec.ts` (5 tests)

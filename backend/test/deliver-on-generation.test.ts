@@ -133,7 +133,7 @@ describe('the second completion door stays removed (source ratchets)', () => {
 });
 
 describe('every task-state writer is a DECLARATION (the exclusivity test §8 never had)', () => {
-  it('advanceTaskStateTo has exactly the two declared callers', () => {
+  it('advanceTaskStateTo has exactly the three declared callers', () => {
     // SPEC-TASK-STATE-TRANSITIONS §8's invariant table tests the behavior of the one authorized
     // path, but nothing tested that no OTHER writer exists - which is precisely how the removed
     // walker lived for a month: every hop it took was individually legal, so edge-level tests
@@ -151,6 +151,32 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
     // A new caller must be a DECLARATION by an actor that read what was said, never an inference from
     // structure or from what the output looked like. Add it here with that argument stated, or the
     // commit that adds it fails this test - which is the point.
+    //
+    //   assistant-async-processor.ts x1   the delivered-step close (owner, 2026-08-20)
+    //
+    // AND IT DOES NOT MEET THE RULE ABOVE, which is stated plainly rather than argued around. It is an
+    // inference from structure: the machine declares the state `delivers`, a document was uploaded, so
+    // the step is finished. No actor read anything.
+    //
+    // It is here because the owner ruled on what completion MEANS - "if the report is delivered it is
+    // complete, unless the user objects with additional changes required" - and because telling the
+    // MODEL that was tried first, deployed, verified present in the running bundle, and did not work:
+    // every report afterwards still sat `in_progress` in `generating`, delivered and never advanced.
+    // The instruction remains in the prompt; this is what makes the rule true when the model declines
+    // to act on it.
+    //
+    // What keeps it away from the walker that was removed, and what a future reader must preserve if
+    // they touch it:
+    //   - gated on the machine's own `delivers` flag, NEVER on what the output looked like. That was
+    //     the removed walker's defect, and it is the one this file exists to prevent;
+    //   - refuses any state that AWAITS a party, so the `drafting_outline` case that walker broke
+    //     cannot arise - `data_extraction.validating` delivers a draft AND expects an answer, and
+    //     stays open;
+    //   - ONE declared edge, and only when the machine names exactly one terminal successor. Two ways
+    //     to finish is a choice, and a choice is not the runtime's to make.
+    //
+    // If that gating is ever loosened, this entry should be removed rather than widened: the value of
+    // this test is that a third writer had to argue for itself in writing, and a fourth must too.
     const SRC = path.join(__dirname, '../lambda/src');
     const counts: Record<string, number> = {};
     const walk = (dir: string): void => {
@@ -165,7 +191,10 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
       }
     };
     walk(SRC);
-    expect(counts).toEqual({ 'lib/task-tools.ts': 2 });
+    expect(counts).toEqual({
+      'lib/task-tools.ts': 2,
+      'assistant-async-processor.ts': 1,
+    });
   });
 });
 
