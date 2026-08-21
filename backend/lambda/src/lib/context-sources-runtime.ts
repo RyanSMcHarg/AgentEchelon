@@ -189,9 +189,26 @@ export function isAvailable(entry: PublishedContextSource, callSite: CallSiteCap
  * byte, so this can only ever cut MORE than the declared cap, never less.
  */
 export function sanitiseValue(value: string, maxBytes: number): string {
-  const stripped = stripMessageMarkers(value);
+  const stripped = neutraliseFence(stripMessageMarkers(value));
   if (stripped.length <= maxBytes) return stripped;
   return `${stripped.slice(0, maxBytes)}\n[truncated at ${maxBytes} characters]`;
+}
+
+/**
+ * Defuse the FENCE ITSELF, not just the markers inside it.
+ *
+ * `renderSourceSection` wraps a value in `<context source=... trust="member">...</context>`, and that
+ * trust label is the security control - it is what tells the model the difference between its own
+ * standing instructions and something a participant typed. A member-writable value containing a
+ * literal `</context>` closed the fence early, so everything after it rendered OUTSIDE the untrusted
+ * region and read as platform text.
+ *
+ * Stripping the marker set was never enough for this, because the fence delimiter is not a marker:
+ * it is the syntax the markers are rendered between. Broken with a zero-width-free substitution that
+ * keeps the text legible to the model while removing its ability to terminate the element.
+ */
+function neutraliseFence(value: string): string {
+  return value.replace(/<\s*\/?\s*context\b/gi, (m) => m.replace('<', '&lt;'));
 }
 
 /**
