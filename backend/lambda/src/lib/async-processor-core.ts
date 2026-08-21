@@ -2886,7 +2886,14 @@ export async function finalizePlaceholderResponse(params: {
     // AT6: only mark 'completed' once the MACHINE reached a terminal state (or there is no machine); a
     // machine-backed task mid-flow stays 'in_progress' so status never contradicts task_state (e.g.
     // Completed vs still-extracting). Mirrors the DB update below.
-    const done = shouldMarkTaskCompleted(activeTaskInfo.type, params.taskContext?.task.taskState);
+    // THE PACK-MERGED MACHINES, not the platform defaults. Omitted, the helper fell back to
+    // DEFAULT_TASK_STATE_MACHINES, and a task type declared only by a deployment pack or a profile
+    // resolved to no machine at all - which the helper reads as "nothing to progress" and reports
+    // COMPLETE. A mid-chain turn then closed the task. The mirror case is as bad: a pack that renames
+    // a terminal state leaves the task in_progress for ever.
+    const done = shouldMarkTaskCompleted(
+      activeTaskInfo.type, params.taskContext?.task.taskState, taskStateMachines(),
+    );
     activeTaskInfo.status = done ? 'completed' : 'in_progress';
     activeTaskInfo.label = getTaskLabel(activeTaskInfo.type, activeTaskInfo.status);
   }
@@ -3193,7 +3200,11 @@ export async function finalizePlaceholderResponse(params: {
   let taskStillRunning = false;
   if (event.taskId) {
     const machineState = params.taskContext?.task.taskState;
-    const taskComplete = shouldMarkTaskCompleted(event.taskType ?? params.taskContext?.task.taskType, machineState);
+    // Same machine set as the label above, for the same reason - these two decide the SAME fact and
+    // must not be able to disagree about which machines exist.
+    const taskComplete = shouldMarkTaskCompleted(
+      event.taskType ?? params.taskContext?.task.taskType, machineState, taskStateMachines(),
+    );
     const status: TaskStatus = taskComplete ? 'completed' : 'in_progress';
     await updateTaskStatus(event.taskId, event.channelArn, status, response.substring(0, 500));
     taskStillRunning = !taskComplete;
