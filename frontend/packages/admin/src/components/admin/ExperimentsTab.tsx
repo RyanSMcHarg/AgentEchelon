@@ -1916,6 +1916,36 @@ function ObjectiveBanner({
   );
 }
 
+/**
+ * The "show the N this number came from" affordance, beside one aggregate.
+ *
+ * MODULE SCOPE, deliberately. Defined inside `ExperimentComparison` it was a NEW component type on
+ * every render, so React unmounted and remounted all six buttons on each poll refresh - losing focus
+ * mid-interaction - and `react-hooks/static-components` failed the build as an error rather than a
+ * warning. `drill` and `onOpen` are props for that reason: they are the only two things it needed
+ * from the closure, and passing them is what lets the type be stable.
+ */
+function DrillButton({ axis, variantId, n, drill, onOpen }: {
+  axis: DrillAxis;
+  variantId: string;
+  n: number | null;
+  drill: DrillTarget | null;
+  onOpen: (axis: DrillAxis, variantId: string) => void;
+}) {
+  if (!n) return null; // nothing recorded on this axis for this variant — a link would lead nowhere
+  const open = drill?.axis === axis && drill?.variantId === variantId;
+  return (
+    <button
+      className="admin-link-btn exp-drill-btn"
+      aria-expanded={open}
+      onClick={() => onOpen(axis, variantId)}
+      title={`Show the ${AXES[axis].countLabel.toLowerCase()} this number is computed from`}
+    >
+      {open ? 'hide' : 'show'} {AXES[axis].countLabel.toLowerCase()}
+    </button>
+  );
+}
+
 function ExperimentComparison({
   group,
   objective,
@@ -1964,20 +1994,6 @@ function ExperimentComparison({
   };
 
   /** The per-variant "show me the evidence" control, rendered inside the metric cell it explains. */
-  const DrillBtn = ({ axis, variantId, n }: { axis: DrillAxis; variantId: string; n: number | null }) => {
-    if (!n) return null; // nothing recorded on this axis for this variant — a link would lead nowhere
-    const open = drill?.axis === axis && drill?.variantId === variantId;
-    return (
-      <button
-        className="admin-link-btn exp-drill-btn"
-        aria-expanded={open}
-        onClick={() => openDrill(axis, variantId)}
-        title={`Show the ${AXES[axis].countLabel.toLowerCase()} this number is computed from`}
-      >
-        {open ? 'hide' : 'show'} {AXES[axis].countLabel.toLowerCase()}
-      </button>
-    );
-  };
   const totalN = (control?.exchange_count ?? 0) + (treatment?.exchange_count ?? 0);
   // The BACKEND's below-the-floor flag, not a local count against a hardcoded number. Comparing
   // locally produced a banner calling a verdict "directional, not decisive" while the backend had
@@ -2039,8 +2055,8 @@ function ExperimentComparison({
                   {m.key === 'approval_rate' && control.feedback_count > 0 && (
                     <em className="exp-hint">{control.feedback_count} rating{control.feedback_count === 1 ? '' : 's'}</em>
                   )}
-                  {m.key === 'approval_rate' && <DrillBtn axis="approval" variantId="control" n={control.feedback_count} />}
-                  {m.key === 'battle_wins' && <DrillBtn axis="picks" variantId="control" n={control.battle_wins} />}
+                  {m.key === 'approval_rate' && <DrillButton drill={drill} onOpen={openDrill} axis="approval" variantId="control" n={control.feedback_count} />}
+                  {m.key === 'battle_wins' && <DrillButton drill={drill} onOpen={openDrill} axis="picks" variantId="control" n={control.battle_wins} />}
                 </span>
                 <span className="exp-metric-label">{m.label}</span>
                 <span className={`exp-metric-val${w === 1 ? ' is-winner' : ''}`}>
@@ -2049,8 +2065,8 @@ function ExperimentComparison({
                   {m.key === 'approval_rate' && treatment.feedback_count > 0 && (
                     <em className="exp-hint">{treatment.feedback_count} rating{treatment.feedback_count === 1 ? '' : 's'}</em>
                   )}
-                  {m.key === 'approval_rate' && <DrillBtn axis="approval" variantId="treatment" n={treatment.feedback_count} />}
-                  {m.key === 'battle_wins' && <DrillBtn axis="picks" variantId="treatment" n={treatment.battle_wins} />}
+                  {m.key === 'approval_rate' && <DrillButton drill={drill} onOpen={openDrill} axis="approval" variantId="treatment" n={treatment.feedback_count} />}
+                  {m.key === 'battle_wins' && <DrillButton drill={drill} onOpen={openDrill} axis="picks" variantId="treatment" n={treatment.battle_wins} />}
                 </span>
               </div>
             );
@@ -2059,12 +2075,12 @@ function ExperimentComparison({
           <div className="exp-metric-row exp-metric-row--sample">
             <span className="exp-metric-val">
               {control.exchange_count.toLocaleString()}
-              <DrillBtn axis="metrics" variantId="control" n={control.exchange_count} />
+              <DrillButton drill={drill} onOpen={openDrill} axis="metrics" variantId="control" n={control.exchange_count} />
             </span>
             <span className="exp-metric-label">Sample (exchanges)</span>
             <span className="exp-metric-val">
               {treatment.exchange_count.toLocaleString()}
-              <DrillBtn axis="metrics" variantId="treatment" n={treatment.exchange_count} />
+              <DrillButton drill={drill} onOpen={openDrill} axis="metrics" variantId="treatment" n={treatment.exchange_count} />
             </span>
           </div>
 

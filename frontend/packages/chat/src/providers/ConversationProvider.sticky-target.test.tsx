@@ -86,11 +86,23 @@ import { ConversationProvider, useConversations } from './ConversationProvider.c
 
 const TARGET = { userArn: 'bot-arn', name: 'Assistant-premium', isBot: true, isAll: false };
 
-/** Exposes the pieces of context these tests drive, plus the sticky value under assertion. */
-let ctx: ReturnType<typeof useConversations>;
+/**
+ * Exposes the pieces of context these tests drive, plus the sticky value under assertion.
+ *
+ * The handle is a MUTABLE HOLDER rather than a bare `let` the probe reassigns: the React compiler
+ * rejects assigning to a variable declared outside the component (`react-hooks/globals`), and it is
+ * right to - a render that writes to module scope is not a pure render. A property write on a stable
+ * object is the same capability without the rule violation.
+ */
+const held: { ctx?: ReturnType<typeof useConversations> } = {};
+const ctxOf = () => {
+  if (!held.ctx) throw new Error('the probe has not rendered yet');
+  return held.ctx;
+};
 const Probe: React.FC = () => {
-  ctx = useConversations();
-  return <div data-testid="sticky">{ctx.stickyTarget ? ctx.stickyTarget.name : 'NONE'}</div>;
+  const value = useConversations();
+  held.ctx = value;
+  return <div data-testid="sticky">{value.stickyTarget ? value.stickyTarget.name : 'NONE'}</div>;
 };
 
 const sticky = () => screen.getByTestId('sticky').textContent;
@@ -118,12 +130,12 @@ describe('ConversationProvider — sticky target does not cross conversations', 
     await mount();
 
     // The user targeted someone in the conversation they were in.
-    await act(async () => { ctx.setStickyTarget(TARGET); });
+    await act(async () => { ctxOf().setStickyTarget(TARGET); });
     expect(sticky()).toBe('Assistant-premium');
 
     // Creating a conversation swaps active WITHOUT going through selectConversation — the path the
     // sticky target used to survive.
-    await act(async () => { await ctx.createConversation('B', 'anthropic.claude-opus', 'Opus'); });
+    await act(async () => { await ctxOf().createConversation('B', 'anthropic.claude-opus', 'Opus'); });
 
     await waitFor(() => expect(sticky()).toBe('NONE'));
   });
@@ -131,10 +143,10 @@ describe('ConversationProvider — sticky target does not cross conversations', 
   it('drops the sticky target when SELECTING a different conversation', async () => {
     await mount();
 
-    await act(async () => { ctx.setStickyTarget(TARGET); });
+    await act(async () => { ctxOf().setStickyTarget(TARGET); });
     expect(sticky()).toBe('Assistant-premium');
 
-    await act(async () => { await ctx.selectConversation('conv-a'); });
+    await act(async () => { await ctxOf().selectConversation('conv-a'); });
 
     await waitFor(() => expect(sticky()).toBe('NONE'));
   });
@@ -144,11 +156,11 @@ describe('ConversationProvider — sticky target does not cross conversations', 
 
     // Guard against over-correcting: clearing on every render would also pass the tests above while
     // destroying the feature, which is carrying the mention forward within one conversation.
-    await act(async () => { await ctx.selectConversation('conv-a'); });
-    await act(async () => { ctx.setStickyTarget(TARGET); });
+    await act(async () => { await ctxOf().selectConversation('conv-a'); });
+    await act(async () => { ctxOf().setStickyTarget(TARGET); });
 
     // A re-render that does not change which conversation is open must not clear it.
-    await act(async () => { await ctx.selectConversation('conv-a'); });
+    await act(async () => { await ctxOf().selectConversation('conv-a'); });
     expect(sticky()).toBe('Assistant-premium');
   });
 });

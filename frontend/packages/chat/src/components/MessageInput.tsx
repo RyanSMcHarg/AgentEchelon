@@ -10,6 +10,41 @@ import { parseMentions, mentionValidationMessage } from '../utils/mentionParser'
 import type { ChannelMember, StickyMentionTarget } from '@ae/shared';
 import './MessageInput.css';
 
+/** One open work item, as the conversation context surfaces it. */
+type OpenWorkItem = {
+  taskId: string;
+  channelArn?: string;
+  assistantId?: string;
+  title?: string;
+  taskType?: string;
+};
+
+/**
+ * The open item in THIS conversation whose assistant is a visible member, or null.
+ *
+ * Module scope so the memo around it is a single pure call. Inline, the early-return walk defeated the
+ * React Compiler's memoization check, which is reported as an error and fails the lint job.
+ */
+function resolveTaskAnswer(
+  channelArn: string | undefined,
+  channelMembers: ChannelMember[],
+  openWorkItems: OpenWorkItem[],
+  dismissedTaskId: string | null,
+): { taskId: string; title: string; botArn: string } | null {
+  // ONLY IN A GROUP. In a 1:1 the AUTO trigger routes every message to the assistant regardless of
+  // addressing, so targeting would only make the person's own message private for no reason.
+  if (!channelArn || channelMembers.length <= 2) return null;
+  for (const item of openWorkItems) {
+    if (item.channelArn !== channelArn || !item.assistantId || item.taskId === dismissedTaskId) continue;
+    // Resolved against the members this client can SEE, never assembled from an id: an item naming
+    // an assistant that is not a member of this conversation addresses nothing, which is honest
+    // about what the client knows and cannot produce an ARN for a bot it has never seen.
+    const bot = channelMembers.find((m) => m.isBot && m.userArn.endsWith(`/${item.assistantId}`));
+    if (bot) return { taskId: item.taskId, title: item.title || item.taskType || '', botArn: bot.userArn };
+  }
+  return null;
+}
+
 const MessageInput: React.FC = () => {
   const { t } = useTranslation();
   const [input, setInput] = useState('');
@@ -65,19 +100,19 @@ const MessageInput: React.FC = () => {
   // regardless of addressing, so there is nothing to fix and targeting would only make the person's
   // own message private for no reason.
   const [dismissedTaskId, setDismissedTaskId] = useState<string | null>(null);
-  const taskAnswer = useMemo(() => {
-    const channelArn = activeConversation?.conversationArn;
-    if (!channelArn || channelMembers.length <= 2) return null;
-    for (const item of openWorkItems) {
-      if (item.channelArn !== channelArn || !item.assistantId || item.taskId === dismissedTaskId) continue;
-      // Resolved against the members this client can SEE, never assembled from an id: an item naming
-      // an assistant that is not a member of this conversation addresses nothing, which is honest
-      // about what the client knows and cannot produce an ARN for a bot it has never seen.
-      const bot = channelMembers.find((m) => m.isBot && m.userArn.endsWith(`/${item.assistantId}`));
-      if (bot) return { taskId: item.taskId, title: item.title || item.taskType, botArn: bot.userArn };
-    }
-    return null;
-  }, [openWorkItems, activeConversation?.conversationArn, channelMembers, dismissedTaskId]);
+  // MEMOIZED AROUND A PURE CALL, not around the loop itself. Inline, the early-return walk defeated
+  // the React Compiler ("existing memoization could not be preserved") and it reported that as an
+  // ERROR, which fails the frontend lint job. The behaviour is unchanged - the resolution is the same
+  // walk, moved to module scope where it is also testable on its own.
+  const taskAnswer = useMemo(
+    () => resolveTaskAnswer(
+      activeConversation?.conversationArn,
+      channelMembers,
+      openWorkItems,
+      dismissedTaskId,
+    ),
+    [openWorkItems, activeConversation?.conversationArn, channelMembers, dismissedTaskId],
+  );
 
   // Build mention options: filter out current user, add @all when 3+ members
   const getMentionOptions = useCallback((): (ChannelMember & { isAll?: boolean })[] => {
