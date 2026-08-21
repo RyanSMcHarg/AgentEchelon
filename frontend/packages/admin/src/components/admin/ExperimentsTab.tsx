@@ -143,6 +143,8 @@ function confirmCopy(kind: 'end' | 'pause' | 'delete', id: string): string {
 interface ExperimentsTabProps {
   resultsData: AnalyticsResult | null;
   isLoading: boolean;
+  /** The window the dashboard is showing, so this tab's on-demand calls match the table beside them. */
+  dateRange?: AnalyticsDateRange;
   /** Register a "close the results detail first" handler so global/browser Back steps out of a focused
    *  experiment's results before walking tab history. */
   registerBack?: (close: (() => void) | null) => void;
@@ -197,7 +199,7 @@ function isImageIntentExperiment(experimentType: string, intent: string): boolea
   return experimentType === 'intent' && intent === 'image_generation';
 }
 
-const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading: _isLoading, registerBack, onOpenConversation }) => {
+const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading: _isLoading, registerBack, onOpenConversation, dateRange }) => {
   const [experiments, setExperiments] = useState<Experiment[]>([]);
   const [showCreate, setShowCreate] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
@@ -728,6 +730,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
           <UnsupportedAnalyticsBanner result={resultsData} />
         ) : (
           <ExperimentResults
+            dashboardRange={dateRange}
             resultsData={resultsData}
             experiments={experiments}
             selectedExperimentId={selectedExperimentId}
@@ -1423,6 +1426,7 @@ const ExperimentsTab: React.FC<ExperimentsTabProps> = ({ resultsData, isLoading:
         <UnsupportedAnalyticsBanner result={resultsData} />
       ) : (
         <ExperimentResults
+          dashboardRange={dateRange}
           resultsData={resultsData}
           experiments={experiments}
           selectedExperimentId={selectedExperimentId}
@@ -1614,12 +1618,15 @@ function ExperimentResults({
   selectedExperimentId,
   onClearSelection,
   onOpenConversation,
+  dashboardRange,
 }: {
   resultsData: AnalyticsResult | null;
   experiments: Experiment[];
   selectedExperimentId?: string | null;
   onClearSelection?: () => void;
   onOpenConversation?: (channelArn: string) => void;
+  /** The window the DASHBOARD is showing. Its on-demand calls must use the same one. */
+  dashboardRange?: AnalyticsDateRange;
 }) {
   const [includeBattle, setIncludeBattle] = useState(false);
   const [overrideRows, setOverrideRows] = useState<ExperimentResultRow[] | null>(null);
@@ -1634,13 +1641,18 @@ function ExperimentResults({
     [experiments],
   );
 
-  // The comparison view needs a date range for on-demand calls; mirror the
-  // 30-day default the dashboard uses. (Last 30 days, computed at mount.)
-  const dateRange: AnalyticsDateRange = useMemo(() => {
+  // THE DASHBOARD'S OWN WINDOW, not a second one that claims to mirror it.
+  //
+  // This hardcoded 30 days while `AdminDashboard` defaults `datePreset` to '7d', so the
+  // recommendation card and the head-to-head table were computed over DIFFERENT windows - which
+  // surfaced as a spurious "does not reconcile" banner on a perfectly healthy experiment. The comment
+  // asserting it mirrored the dashboard is exactly the kind of claim that stops anyone checking.
+  const fallbackRange: AnalyticsDateRange = useMemo(() => {
     const end = new Date();
     const start = new Date(end.getTime() - 30 * 86_400_000);
     return { start: start.toISOString(), end: end.toISOString() };
   }, []);
+  const dateRange = dashboardRange ?? fallbackRange;
 
   const baseRows = (resultsData?.data as unknown as ExperimentResultRow[]) ?? [];
   const rows = overrideRows ?? baseRows;

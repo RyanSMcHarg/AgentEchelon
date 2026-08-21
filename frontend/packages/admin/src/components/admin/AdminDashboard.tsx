@@ -558,6 +558,7 @@ const AdminDashboard: React.FC<AdminDashboardProps> = ({ onBack, analyticsMode =
             isLoading={isLoading}
             registerBack={registerDrillBack}
             onOpenConversation={openConversation}
+            dateRange={getDateRange(datePreset)}
           />
         )}
         {activeTab === 'profiles' && (
