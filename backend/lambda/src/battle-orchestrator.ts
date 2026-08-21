@@ -345,7 +345,18 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
               userType: classificationKeyFor(event.classification),
               botArn: selfRow.botArn,
               senderArn: event.senderArn,
-              intent: 'general',
+              // INHERITED FROM ROUND 1, never declared here. A duel's two rounds answer the same user
+              // question, so they carry the same intent - but only round 1 runs a classifier, because
+              // this dispatch goes straight to the worker. This was a hardcoded 'general', which is
+              // the exact shape `channel-flow-processor.ts` records having REMOVED from the flow: "a
+              // second implementation of decisions the router already makes, and a second
+              // implementation diverges SILENTLY - the turn still answers, so nothing errors". It
+              // split every duel across two intent buckets and reported one of them wrongly.
+              //
+              // OMITTED when round 1 recorded none, rather than falling back. A duel that predates
+              // the stored intent archives nothing there, which is honest; a fallback would put a
+              // value nobody derived back into the analytics and re-create the defect quietly.
+              ...(selfRow.intent && { intent: selfRow.intent }),
               deliveryOption: 'PLACEHOLDER_UPDATE',
               // EXPERIMENT ATTRIBUTION — the same fields, for the same reason, as the round-1 fan-out
               // (channel-flow-processor). `buildAnalyticsMetadata` stamps `experiment_id`/`variant_id`

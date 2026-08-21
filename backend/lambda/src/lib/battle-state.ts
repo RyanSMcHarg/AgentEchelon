@@ -452,6 +452,15 @@ export interface BattleStateRow {
   initiatorUserSub?: string;
   round1Reply?: string;
   round1MessageId?: string;
+  /**
+   * The intent round 1 was CLASSIFIED as, so round 2 can inherit it.
+   *
+   * Only round 1 runs a classifier - round 2 is dispatched straight to the worker by the
+   * orchestrator - so without this the rebuttal has no derived intent to declare. Absent rather
+   * than defaulted: a duel whose round 1 predates this field records nothing, which is honest,
+   * where a fallback would put a value nobody derived back into the analytics.
+   */
+  intent?: string;
   correlationId?: string;
   enteredStateAt?: string;
   ttl?: number;
@@ -568,6 +577,8 @@ export async function transitionBotState(args: {
   state: 'COMPLETED' | 'FAILED' | 'ABANDONED';
   round1Reply?: string;
   round1MessageId?: string;
+  /** Round 1's classified intent, so the orchestrator can hand round 2 an intent nobody invented. */
+  intent?: string;
   correlationId?: string;
 }): Promise<boolean> {
   if (!BATTLE_STATE_TABLE) return false;
@@ -600,6 +611,12 @@ export async function transitionBotState(args: {
   if (args.round1MessageId !== undefined) {
     sets.push('round1MessageId = :r1mid');
     values[':r1mid'] = args.round1MessageId;
+  }
+  // Written only when the caller HAS one, so a round-1 completion that carried no classification
+  // leaves the attribute absent rather than writing a placeholder into it.
+  if (args.intent !== undefined) {
+    sets.push('intent = :intent');
+    values[':intent'] = args.intent;
   }
 
   try {

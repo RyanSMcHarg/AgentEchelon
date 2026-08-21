@@ -2714,6 +2714,7 @@ export async function finalizePlaceholderResponse(params: {
         correlationId: event.correlationId,
         userMessage: event.userMessage,
         classification: event.userType,
+        intent: event.intent,
       });
     }
     return;
@@ -3245,6 +3246,7 @@ export async function finalizePlaceholderResponse(params: {
       correlationId: event.correlationId,
       userMessage: event.userMessage,
       classification: event.userType,
+      intent: event.intent,
     });
     if (fired) {
       console.log('[AsyncProcessor][battle] Fired orchestrator for round 2', {
@@ -3886,6 +3888,15 @@ export async function recordBattleTerminalAndFireOrchestrator(args: {
   userMessage: string;
   /** The channel's classification, so round 2 answers where round 1 did rather than on premium. */
   classification?: string;
+  /**
+   * The intent this turn was CLASSIFIED as, persisted so round 2 can inherit it.
+   *
+   * A duel's two rounds answer the same user question, so they share an intent - but only round 1
+   * ever runs a classifier, because round 2 is dispatched straight to the worker by the orchestrator.
+   * Without carrying it, every rebuttal archived a hardcoded 'general' that nobody derived, which
+   * split a duel across two intent buckets and reported one of them wrongly.
+   */
+  intent?: string;
 }): Promise<boolean> {
   const { battleContext, response, selfBotArn, correlationId } = args;
 
@@ -3897,6 +3908,10 @@ export async function recordBattleTerminalAndFireOrchestrator(args: {
     state: terminalState,
     round1Reply: response || undefined,
     round1MessageId: args.round1MessageId,
+    // Recorded on the ROW rather than threaded through the orchestrator's arguments, because the
+    // orchestrator fires from a timer as well as from this call and would otherwise have no source
+    // for it on the timer path.
+    intent: args.intent,
     correlationId,
   });
   if (!claimed) return false;
