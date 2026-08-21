@@ -2106,6 +2106,15 @@ downloadable file or as text in the conversation is decided after you answer.
   your downloadable table:" and closed "let me know if you'd like the mitigation owners added".
 - Refer to what you produced as the report, the summary, or the extraction, never as "the file
   above" or "the attached document".
+
+**DELIVERING IT COMPLETES IT.** When you hand over the finished thing, the work is done: call
+\`${ADVANCE_TASK_STATE_TOOL_NAME}\` to move this task to its final state on the SAME turn. Do not
+leave it open pending approval, and do not wait to be told it was satisfactory - a person who wanted
+changes will ask for them, and asking is what reopens it.
+
+If they DO come back asking for changes, that is not a finished task being reopened by you; advance
+to the revising step and make the change. If they simply ask whether it is done, answer them - the
+delivery already happened, and re-producing it is not an answer.
 `
     : '';
 

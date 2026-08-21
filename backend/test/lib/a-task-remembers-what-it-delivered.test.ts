@@ -77,3 +77,37 @@ describe('the task prompt carries what has already been delivered', () => {
     expect(prompt).toContain('revised.md');
   });
 });
+
+describe('a delivering step is told that delivering COMPLETES the task', () => {
+  it('tells the model to advance on the same turn it hands the work over', () => {
+    // The rule the model was missing. It had the delivery context and still answered "not yet" when
+    // asked whether the work was finished - correctly, under an invariant that says completion is the
+    // model's call, because nothing had told it what delivering MEANS.
+    //
+    // Owner: if the report is delivered it is complete, unless the person objects and asks for changes.
+    // That is a rule for the MODEL, not a runtime walker: completion keeps its single path (the
+    // advance tool reaching a terminal state) and the model is simply told when to take it.
+    const prompt = buildTaskContextForPrompt({ ...base, taskState: 'generating' });
+
+    expect(prompt).toMatch(/DELIVERING IT COMPLETES IT/);
+    expect(prompt).toMatch(/same turn/i);
+    // The two habits that used to keep a delivered task open for ever.
+    // Whitespace-tolerant: the prompt is wrapped prose, and a test that pins where a line breaks
+    // fails on a reflow that changed nothing a reader would notice.
+    expect(prompt).toMatch(/do\s+not\s+leave it open pending approval/i);
+    expect(prompt).toMatch(/do\s+not\s+wait to be told/i);
+  });
+
+  it('names what reopens it, so a change request is not read as a refusal to finish', () => {
+    const prompt = buildTaskContextForPrompt({ ...base, taskState: 'generating' });
+    expect(prompt).toMatch(/asking\s+is\s+what\s+reopens\s+it/i);
+    expect(prompt).toMatch(/revising step/i);
+  });
+
+  it('says none of it on a step that does not deliver', () => {
+    // Collecting requirements produces conversation. Telling it that delivering completes the task
+    // would invite it to close work it has not started.
+    const prompt = buildTaskContextForPrompt({ ...base, taskState: 'collecting_requirements' });
+    expect(prompt).not.toMatch(/DELIVERING IT COMPLETES IT/);
+  });
+});
