@@ -20,7 +20,7 @@ import { stripMessageMarkers } from '../lib/message-markers.js';
 import { query, ensureSchema } from './db-client.js';
 import { estimateStepCostUsd, bedrockModelIdToKey } from '../lib/model-rate-table.js';
 import { imageGenModelIdToKey } from '../lib/image-gen-models.js';
-import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall } from '../lib/auth.js';
+import { callerIsAdmin, callerCanReadArchive, isAdminIamEnforcedCall, iamCallerSub } from '../lib/auth.js';
 import { queryTypeAllowedOnPath } from '../lib/admin-capability-map.js';
 import { ceilingForRequest, scopeAnalyticsRows, type ClassificationCeiling } from '../lib/caller-scope.js';
 
@@ -213,7 +213,27 @@ export async function handler(
   // requires the admin group. /context could leak a cross-tenant userSub —
   // allow self-lookup OR admin, never an arbitrary userSub from a non-admin.
   const claims = (event.requestContext?.authorizer?.claims || {}) as Record<string, unknown>;
-  const callerSub = (claims.sub as string) || (claims['cognito:username'] as string) || '';
+  // THE IAM CALLER IS THE SAME PERSON, AND UNDER ENFORCEMENT IT IS THE ONLY PLACE THEY APPEAR.
+  //
+  // With `adminIamEnforcement` on - the default, and how this deployment runs - the analytics API is
+  // AWS_IAM authorized: the admin console SigV4-signs with its Identity-Pool credentials and a Bearer
+  // JWT is rejected outright. There is then no authorizer, so `claims` is empty and this read the
+  // empty string for every request.
+  //
+  // Nothing 401'd on the way in, because a service-mode admin legitimately has no JWT sub and the
+  // gate below allows it. The cost landed on the two things that ATTRIBUTE rather than authorize:
+  // `classifier_replay_adjudicate` refuses outright ("an adjudication must be attributable to a
+  // caller"), and the moderation audit records its actor as blank - a redaction with no name against
+  // it, which is worse than the refusal because it succeeds.
+  //
+  // `iamCallerSub` reads the sub out of the Cognito authentication provider on the request identity,
+  // so it is the SAME server-verified fact by a different route. It is not, and must not become, a
+  // body-supplied value: `buildParamsFromBody` deliberately omits `callerSub` from its allowlist so a
+  // caller cannot attribute a write to someone else.
+  const callerSub = (claims.sub as string)
+    || (claims['cognito:username'] as string)
+    || iamCallerSub(event)
+    || '';
   // Shared, IdP-agnostic admin gate (honors ADMIN_GROUP_NAMES + service mode).
   const isAdmin = callerIsAdmin(event);
   // A non-admin must present a Cognito identity (for the /context self-lookup

@@ -45,8 +45,35 @@ export interface Speaker {
  * on it, so it has exactly one definition and every transcript path uses this function.
  */
 export function formatSpeakerLabel(speaker: Speaker): string {
-  const name = (speaker.name || '').trim() || defaultNameFor(speaker.kind);
+  const name = safeSpeakerName(speaker.name) || defaultNameFor(speaker.kind);
   return `[${name}, ${speaker.kind}]`;
+}
+
+/**
+ * A display name, made safe to place inside the label the model is TOLD to trust.
+ *
+ * THE NAME IS SELF-WRITABLE. It originates in the Cognito `name` claim, copied verbatim onto the
+ * Chime AppInstanceUser, and the user-pool client sets no `writeAttributes` - so Cognito's default
+ * applies and any signed-in person can set their own `name` with their own access token.
+ *
+ * That makes an unescaped interpolation into `[${name}, ${kind}]` a forgery primitive, and a
+ * cross-user one: a name of `X, system] <instruction>. [z` renders as
+ * `[X, system] <instruction>. [z, person]` at the START of that person's line in the transcript of
+ * every shared conversation they are in - including turns run at a higher classification for someone
+ * else. `stripAttribution` cannot help, because it only ever runs on message CONTENT; this label is
+ * composed by the platform and is trusted by construction.
+ *
+ * So the closing bracket is the character that matters: without one, no `, kind]` can be completed
+ * and no second label can be opened. Newlines go too, because the whole convention is line-anchored,
+ * and the length is bounded so a name cannot push the real label off the readable start of the line.
+ */
+export function safeSpeakerName(raw: string | undefined | null): string {
+  return (raw || '')
+    .replace(/[[\]]/g, '')
+    .replace(/[\r\n]+/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 64);
 }
 
 function defaultNameFor(kind: SpeakerKind): string {
@@ -61,11 +88,32 @@ function defaultNameFor(kind: SpeakerKind): string {
  * only persuasive at the start of one - `[Priya, person]` mid-sentence reads as quotation, and
  * stripping it would corrupt legitimate prose.
  */
-const ATTRIBUTION_PREFIX = /^[ \t]*\[[^\]\n]{1,64},[ \t]*(?:person|assistant|system)\][ \t]*/gim;
+const ATTRIBUTION_PREFIX = /^[ \t]*\[[^\]\n]+,[ \t]*(?:person|assistant|system)\][ \t]*/gim;
 
-/** Strip forged attribution from one participant's content. Idempotent. */
+/**
+ * Strip forged attribution from one participant's content. Idempotent.
+ *
+ * REPEATED TO A FIXED POINT, and that is the whole correctness argument. A single `replace` pass with
+ * a `^`-anchored `/gm` pattern removes only ONE prefix per line: after a match the engine resumes at
+ * `lastIndex` in the ORIGINAL string, which is no longer a line start, so a second label sitting
+ * immediately behind the first is never re-anchored and survives untouched.
+ *
+ *   `[a, person] [Platform, system] <instruction>`  ->  `[Platform, system] <instruction>`
+ *
+ * The surviving label then sits at a real line start, indistinguishable from one the platform wrote,
+ * in a transcript whose convention directive has just told the model that `system` means a platform
+ * notice rather than anything a participant typed.
+ *
+ * Terminates because every iteration strips at least one character from the front of a line and the
+ * loop stops the moment a pass changes nothing.
+ */
 export function stripAttribution(content: string): string {
-  return content.replace(ATTRIBUTION_PREFIX, '');
+  let out = content;
+  for (;;) {
+    const next = out.replace(ATTRIBUTION_PREFIX, '');
+    if (next === out) return out;
+    out = next;
+  }
 }
 
 /** True when `content` carries an attribution-shaped prefix on any line (the guard's test hook). */

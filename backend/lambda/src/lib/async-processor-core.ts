@@ -37,6 +37,7 @@ import { estimateStepCostUsd } from './model-rate-table.js';
 import {
   needsAttribution,
   renderContribution,
+  safeSpeakerName,
   speakerIdFrom,
   speakerKindFor,
   stripAttribution,
@@ -977,7 +978,9 @@ export function formatDomainContextForPrompt(event: {
  * by name in normal replies" instruction for host-stamped plan channels.
  */
 export function firstTurnGreetingDirective(senderDisplayName?: string): string {
-  const name = (senderDisplayName || '').trim();
+  // SANITISED, for the same reason the transcript label is: this name is the self-writable Cognito
+  //  claim, and it lands inside a system-prompt block the model is told to trust.
+  const name = safeSpeakerName(senderDisplayName);
   if (!name || name === 'there') return '';
   return (
     `\n\nThis is the user's FIRST message in this conversation. Open your reply by greeting them warmly ` +
@@ -1017,7 +1020,9 @@ export function firstTurnGreetingDirective(senderDisplayName?: string): string {
  * being reassigned by assertion.
  */
 export function userIdentityDirective(senderDisplayName?: string): string {
-  const name = (senderDisplayName || '').trim();
+  // Sanitised - see firstTurnGreetingDirective. A name carrying brackets or newlines could close this
+  // block early and open text of its own inside the trusted region.
+  const name = safeSpeakerName(senderDisplayName);
   if (!name || name === 'there') return '';
   return (
     `\n\n<user_identity>\nThe person you are talking to is ${name}. This comes from their authenticated `
