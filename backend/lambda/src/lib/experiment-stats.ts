@@ -269,6 +269,24 @@ export function twoProportionTest(
   const pB = nB > 0 ? xB / nB : 0;
   const delta = pA - pB;
 
+  // AN ARM WITH NO OBSERVATIONS SUPPORTS NO INTERVAL, and saying so is the point.
+  //
+  // `wilsonInterval` on n=0 still returns a finite pair, so the Newcombe combination produced a
+  // bounded interval that could exclude zero - a "significant difference" derived from an arm nobody
+  // was ever exposed to, feeding a ship/no-ship recommendation. The full [-1, 1] is the honest
+  // interval here: with one arm unobserved, every difference remains consistent with the data, so
+  // nothing downstream can read it as evidence either way.
+  if (nA === 0 || nB === 0) {
+    return {
+      delta,
+      ci: [-1, 1],
+      pValue: 1,
+      method: 'fisher',
+      pA,
+      pB,
+    };
+  }
+
   // Newcombe (method 10) CI on the difference, from the two Wilson intervals.
   const wa = wilsonInterval(xA, nA, z);
   const wb = wilsonInterval(xB, nB, z);
