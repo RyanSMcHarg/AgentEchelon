@@ -70,21 +70,50 @@ describe('the latency query reports the locate cost and the fallback rate separa
     expect(sql).toMatch(/ROUND\(AVG\(m\.placeholder_resolve_ms\)\)\s*AS\s+avg_placeholder_resolve_ms/);
   });
 
+  it('gates every step figure on the row having been measured the new way', async () => {
+    // FOUND IN LIVE VERIFICATION. Ungated, the first post-deploy read reported poll_fallback_count
+    // equal to the row count on every historical group - a 100% fallback rate - because the OLD
+    // poll_ms was stamped on every turn and could never be null. The rate would have read as a total
+    // outage of the handoff until the history aged out.
+    //
+    // placeholder_resolve_ms is the discriminator because only the new code writes it: its presence
+    // DECLARES that this row's poll_ms means the scan alone.
+    const { sql } = await latencyQuery();
+    const GATE = /FILTER\s*\(\s*WHERE\s+m\.placeholder_resolve_ms\s+IS\s+NOT\s+NULL\s*\)/;
+    expect(sql).toMatch(new RegExp(/COUNT\(m\.poll_ms\)\s*/.source + GATE.source));
+    expect(sql).toMatch(new RegExp(/AVG\(m\.poll_ms\)\s*/.source + GATE.source));
+    // And the tail, which had the same contamination the other way: a pre-split row's unmeasured
+    // admission and lookup would otherwise be reported AS tail, inflating one bucket with two others.
+    const tail = /AVG\(m\.total_ms[\s\S]*?AS\s+avg_processor_tail_ms/.exec(sql);
+    expect(tail).not.toBeNull();
+    expect(tail![0]).toMatch(GATE);
+    // The denominator, so a count of fallbacks is readable as a proportion rather than against a row
+    // count that includes turns this split never measured.
+    expect(sql).toMatch(/COUNT\(m\.placeholder_resolve_ms\)\s*AS\s+placeholder_measured_count/);
+  });
+
   it('COUNTS the scans, which is the number that sits on a floor of zero', async () => {
     // The rate is the readable signal precisely because it CAN be zero: a regression is then a step
     // off the floor rather than a drift inside noise. `poll_ms` never could be, which is why a
     // partial handoff failure would have hidden in it.
     const { sql } = await latencyQuery();
-    expect(sql).toMatch(/COUNT\(m\.poll_ms\)\s*AS\s+poll_fallback_count/);
+    expect(sql).toMatch(/COUNT\(m\.poll_ms\)[\s\S]*?AS\s+poll_fallback_count/);
   });
 
-  it('leaves the poll average UNFILTERED, because the nulls are what make it conditional', async () => {
-    // The mutation this catches is someone "fixing" the null-ness by writing 0 in the producer, or
-    // adding a FILTER here that duplicates what the nulls already do. Either would work today and
-    // the first would silently turn a conditional mean back into a diluted one.
+  it('keeps the poll average conditional on the NULLS, and gates only on the row era', async () => {
+    // Two different things, and the distinction is the point. The conditional-ness comes from
+    // poll_ms being NULL when no scan ran, which AVG skips for free - NOT from a predicate about
+    // scanning. The only FILTER here is the era gate, which answers "was this row measured the new
+    // way", never "did this row scan".
+    //
+    // The mutation this catches is someone "fixing" the null-ness by writing 0 in the producer and
+    // compensating with a `poll_ms > 0` filter here. That would work, and it would quietly turn a
+    // conditional mean back into a diluted one the moment the filter was dropped.
     const { sql } = await latencyQuery();
-    expect(sql).toMatch(/ROUND\(AVG\(m\.poll_ms\)\)\s*AS\s+avg_poll_ms/);
-    expect(sql).not.toMatch(/AVG\(m\.poll_ms\)\s*FILTER/);
+    const pollAvg = /ROUND\(AVG\(m\.poll_ms\)[\s\S]*?\)\s*AS\s+avg_poll_ms/.exec(sql);
+    expect(pollAvg).not.toBeNull();
+    expect(pollAvg![0]).toMatch(/m\.placeholder_resolve_ms\s+IS\s+NOT\s+NULL/);
+    expect(pollAvg![0]).not.toMatch(/poll_ms\s*[>!]/);
   });
 
   it('declares both new columns, appended so the existing contract is intact', async () => {
@@ -118,7 +147,7 @@ describe('the processor leg decomposes into steps that add up', () => {
     // by luck. Defined as total minus the named steps, a reader can check the arithmetic.
     const { sql } = await latencyQuery();
     expect(sql).toMatch(
-      /AVG\(m\.total_ms\s*-\s*COALESCE\(m\.guard_ms,\s*0\)\s*-\s*COALESCE\(m\.placeholder_resolve_ms,\s*0\)[\s\S]*?-\s*COALESCE\(m\.latency_ms,\s*0\)\)\)\s*AS\s+avg_processor_tail_ms/,
+      /AVG\(m\.total_ms\s*-\s*COALESCE\(m\.guard_ms,\s*0\)\s*-\s*COALESCE\(m\.placeholder_resolve_ms,\s*0\)[\s\S]*?-\s*COALESCE\(m\.latency_ms,\s*0\)\)[\s\S]*?AS\s+avg_processor_tail_ms/,
     );
   });
 

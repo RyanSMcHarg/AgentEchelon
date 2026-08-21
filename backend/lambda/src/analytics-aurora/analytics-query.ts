@@ -1745,10 +1745,30 @@ async function getLatencyMetrics(
        ROUND(AVG(m.router_ms - COALESCE(m.classifier_ms, 0))) AS avg_router_other_ms,
        ROUND(AVG(m.guard_ms)) AS avg_guard_ms,
        ROUND(AVG(m.placeholder_resolve_ms)) AS avg_placeholder_resolve_ms,
+       --
+       -- ── EVERY FIGURE BELOW IS GATED ON A ROW HAVING BEEN MEASURED THE NEW WAY ──
+       --
+       -- A NOT NULL placeholder_resolve_ms is the discriminator, and it is a DECLARED fact rather
+       -- than an inference: only the step-latency code writes that column, so its presence says "this
+       -- row's poll_ms means the scan alone" and its absence says "this row predates the split".
+       --
+       -- FOUND IN LIVE VERIFICATION, NOT IN REVIEW. Ungated, the first read after deploy reported
+       -- poll_fallback_count equal to the row count on every historical group - a 100% fallback rate -
+       -- because the OLD poll_ms was stamped on every turn (it timed from handler entry and could
+       -- never be null). The rate metric would have read as a total outage of the placeholder handoff
+       -- until the history aged out, which is a worse failure than the one it was built to expose.
+       --
+       -- The tail had the same contamination in the other direction: derived from total_ms less
+       -- COALESCE(...,0) of columns a pre-split row does not carry, it reported that row's unmeasured
+       -- admission and lookup time AS tail, silently inflating one bucket with two others.
        ROUND(AVG(m.total_ms - COALESCE(m.guard_ms, 0) - COALESCE(m.placeholder_resolve_ms, 0)
-                            - COALESCE(m.latency_ms, 0))) AS avg_processor_tail_ms,
-       COUNT(m.poll_ms) AS poll_fallback_count,
-       ROUND(AVG(m.poll_ms)) AS avg_poll_ms,
+                            - COALESCE(m.latency_ms, 0))
+             FILTER (WHERE m.placeholder_resolve_ms IS NOT NULL)) AS avg_processor_tail_ms,
+       -- The denominator the rate is OVER, so "N fallbacks" is readable as a proportion rather than
+       -- against a row count that includes turns this split never measured.
+       COUNT(m.placeholder_resolve_ms) AS placeholder_measured_count,
+       COUNT(m.poll_ms) FILTER (WHERE m.placeholder_resolve_ms IS NOT NULL) AS poll_fallback_count,
+       ROUND(AVG(m.poll_ms) FILTER (WHERE m.placeholder_resolve_ms IS NOT NULL)) AS avg_poll_ms,
        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.total_ms)) AS p95_total_ms,
        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.latency_ms)) AS p95_bedrock_ms,
        ROUND(MIN(m.total_ms)) AS min_total_ms,
@@ -1984,7 +2004,8 @@ async function getLatencyMetrics(
       // keeps its name and its position in the contract above; what changed is that it now means
       // the SCAN alone and is conditional on one having happened.
       'avg_router_ms', 'avg_classifier_ms', 'classified_by_model_count', 'avg_router_other_ms',
-      'avg_guard_ms', 'avg_placeholder_resolve_ms', 'avg_processor_tail_ms', 'poll_fallback_count',
+      'avg_guard_ms', 'avg_placeholder_resolve_ms', 'avg_processor_tail_ms',
+      'placeholder_measured_count', 'poll_fallback_count',
       'avg_e2e_ms', 'p95_e2e_ms',
       'avg_model_ms', 'avg_tool_ms', 'avg_inbound_ms',
     ],
