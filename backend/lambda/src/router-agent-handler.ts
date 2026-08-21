@@ -2217,21 +2217,33 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
           }
         }
 
-        // NOT FOR A SHORT MESSAGE, and that is the one lookup it still skips. Every branch above asks
-        // what is WAITING on this person; this one asks what this person has open at all - it is keyed
-        // on the requester, so it finds chains nobody is blocked on them for, and it costs a read per
-        // declared task type. Letting a bare "thanks" be absorbed by one of those is a message being
-        // annexed by work it was not about, at the price of N reads on the cheapest turn there is.
-        if (!activeTask && !shortAcknowledgment) {
+        // THE LOOKUP FOR A TURN THAT HAS NO CHANNEL TO SCOPE TO, and only that turn.
+        //
+        // This was written as the requester-keyed question - "what does this person have open at
+        // all", as against "what is waiting on them" - and that was a real distinction before
+        // ADR-024. It is not one now. The mirror row is partitioned by the CURRENT OWNER
+        // (`putMirrorRow`), so this reads the same partition as the channel lookup above, which
+        // already returns every live row in it for this channel: paginated with no Limit, strongly
+        // consistent, and not narrowed by task type. Per type this is the same partition key, the
+        // same channel filter and the same active statuses with a type filter added - strictly
+        // weaker than a read the turn has already made, and it cannot name a row that read missed.
+        //
+        // So with a channel it found nothing and cost up to two DynamoDB reads per declared machine
+        // on the most ordinary turn there is (a GSI query, then the strongly-consistent base-table
+        // re-check behind it). Skipped rather than deleted: a channel-less turn makes no owner read
+        // at all - `getOwnerChannelTasks` needs a channel for its filter - so there this is the only
+        // lookup, and removing it would remove a lookup rather than a duplicate.
+        //
+        // NOT FOR A SHORT MESSAGE, unchanged: letting a bare "thanks" be absorbed by an open chain is
+        // a message annexed by work it was not about.
+        if (!activeTask && !shortAcknowledgment && !channelArn) {
           // EVERY declared task type, from the authoritative machines - not a hand-maintained list.
           // The literal trio this replaces omitted place_item/action_item and any pack-defined type,
           // so a continuation that missed the owner lookups found nothing here and the multi-step
           // branch opened a fresh task beside the live chain; the next machine anyone adds drifted
           // the same way with no error.
           for (const candidateType of Object.keys(taskStateMachines())) {
-            activeTask = channelArn
-              ? await getActiveTask(userSub, candidateType, { channelArn })
-              : await getActiveTask(userSub, candidateType);
+            activeTask = await getActiveTask(userSub, candidateType);
             if (activeTask) break;
           }
         }

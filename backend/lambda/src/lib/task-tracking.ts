@@ -584,7 +584,12 @@ export async function getTask(taskId: string, channelArn: string): Promise<Task 
 }
 
 /**
- * Get the most recent active task for a user by task type.
+ * Get the most recent active task of a type in an OWNER's partition.
+ *
+ * `userSub` is the partition key, which since ADR-024 D2 holds the task's CURRENT OWNER rather than
+ * its requester (`putMirrorRow`) - so this finds a chain only while that actor holds it, and a person's
+ * own request becomes invisible here the moment the assistant takes it back. Named for the column,
+ * which predates the repartition.
  *
  * By default this queries the `userSub-taskType-index` GSI across
  * all channels — the row returned may have originated in a different
@@ -595,7 +600,12 @@ export async function getTask(taskId: string, channelArn: string): Promise<Task 
  * `getTask(taskId, channelArn)` step in the async processor, since
  * that table is keyed by both.
  *
- * For cross-channel visibility (e.g. "the user has tasks active
+ * PREFER `getOwnerChannelTasks` WHEN THERE IS A CHANNEL. It answers the same question over the same
+ * partition without a type filter, in one paginated strongly-consistent query rather than one call
+ * per declared machine, and it hands back the recently-ended rows in the same read. A caller that has
+ * a channel and loops this per type is issuing reads that lookup has already made.
+ *
+ * For cross-channel visibility (e.g. "the tasks this actor holds
  * elsewhere"), use `getActiveTasksForUser` instead.
  */
 export async function getActiveTask(

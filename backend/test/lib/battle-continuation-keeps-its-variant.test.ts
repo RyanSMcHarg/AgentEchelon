@@ -338,6 +338,10 @@ describe('a battle turn resolves its task by the ANSWERING ASSISTANT', () => {
 
     const ownersAsked = mockGetActiveTaskForOwner.mock.calls.map((c) => c[0]);
     expect(ownersAsked[0]).toBe(principalIdOf(HUMAN));
-    expect(mockGetActiveTask).toHaveBeenCalled();
+    // NON-VACUITY: the assistant's partition IS consulted, second. Without this the ordering
+    // assertion above would pass on a turn that asked one owner and stopped. This used to be pinned
+    // on the per-type fallback running afterwards, which is no longer a fact about a channel turn -
+    // it repeated the person read this turn had already made (`one-read-answers-the-owner-partition`).
+    expect(ownersAsked).toEqual([principalIdOf(HUMAN), principalIdOf(BOT_DEFAULT)]);
   });
 });
