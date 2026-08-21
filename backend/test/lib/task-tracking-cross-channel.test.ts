@@ -120,24 +120,43 @@ describe('getActiveTasksForUser — cross-channel discovery', () => {
     expect(rows[1].taskId).toBe('t-1');
   });
 
-  it('respects opts.limit (over-fetches 4× to compensate for FilterExpression)', async () => {
+  it('sends NO Limit, because Limit applies before the filter', async () => {
+    // THE OVER-FETCH WAS THE DEFECT, not the mitigation it read as. `Limit: limit * 4` had DynamoDB
+    // return an arbitrary 4N rows and only then apply the status filter, and the sort key is the task
+    // id - not time - so the 4N were arbitrary in id order. A user whose partition began with 40
+    // finished rows got an empty result, and the more work someone had done the likelier that became.
+    // This read backs `/tasks/mine`, so the symptom was open work vanishing for the heaviest users.
     mockSend.mockResolvedValueOnce({ Items: [] });
     const { getActiveTasksForUser } = await import('../../lambda/src/lib/task-tracking');
     await getActiveTasksForUser(USER_SUB, { limit: 3 });
-    expect(mockSend.mock.calls[0][0].input.Limit).toBe(12);
+    expect(mockSend.mock.calls[0][0].input.Limit).toBeUndefined();
   });
 
-  it('clamps a too-small limit up to 1, and a too-large limit down to 25', async () => {
-    // Each await import gets a fresh module instance because of resetModules in beforeEach;
-    // but within a single test the module is loaded once. Reset manually between calls.
-    mockSend.mockResolvedValue({ Items: [] });
+  it('follows LastEvaluatedKey rather than stopping at the first page', async () => {
+    // The active rows can sit anywhere in the partition, so one page is not an answer.
+    mockSend
+      .mockResolvedValueOnce({ Items: [], LastEvaluatedKey: { userSub: USER_SUB, taskId: 't-40' } })
+      .mockResolvedValueOnce({
+        Items: [{ userSub: USER_SUB, taskId: 't-99', status: 'in_progress', updatedAt: '2026-08-21T00:00:00Z' }],
+      });
+    const { getActiveTasksForUser } = await import('../../lambda/src/lib/task-tracking');
+    const rows = await getActiveTasksForUser(USER_SUB, { limit: 3 });
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    expect(mockSend.mock.calls[1][0].input.ExclusiveStartKey).toEqual({ userSub: USER_SUB, taskId: 't-40' });
+    expect(rows.map((r) => r.taskId)).toEqual(['t-99']);
+  });
+
+  it('still clamps the returned count, low and high', async () => {
+    // The clamp moved from the QUERY to the RESULT, which is where it belongs: it bounds what the
+    // caller is handed, and no longer decides how much of the partition is examined.
+    const many = Array.from({ length: 60 }, (_, i) => ({
+      userSub: USER_SUB, taskId: `t-${i}`, status: 'in_progress', updatedAt: `2026-08-${10 + (i % 20)}T00:00:00Z`,
+    }));
+    mockSend.mockResolvedValue({ Items: many });
 
     const mod1 = await import('../../lambda/src/lib/task-tracking');
-    await mod1.getActiveTasksForUser(USER_SUB, { limit: -5 });
-    expect(mockSend.mock.calls[0][0].input.Limit).toBe(4); // 1 × 4
-
-    await mod1.getActiveTasksForUser(USER_SUB, { limit: 999 });
-    expect(mockSend.mock.calls[1][0].input.Limit).toBe(100); // 25 × 4
+    expect((await mod1.getActiveTasksForUser(USER_SUB, { limit: -5 })).length).toBe(1);
+    expect((await mod1.getActiveTasksForUser(USER_SUB, { limit: 999 })).length).toBe(25);
   });
 
   it('returns [] when USER_TASKS_TABLE is unset (no implicit DDB call)', async () => {

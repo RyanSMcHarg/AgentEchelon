@@ -1015,20 +1015,40 @@ export async function getActiveTasksForUser(
   const limit = Math.min(Math.max(opts.limit ?? 10, 1), 25);
 
   try {
-    const result = await dynamoClient.send(new QueryCommand({
-      TableName: USER_TASKS_TABLE,
-      KeyConditionExpression: 'userSub = :userSub',
-      FilterExpression: '#status IN (:pending, :inProgress)',
-      ExpressionAttributeNames: { '#status': 'status' },
-      ExpressionAttributeValues: {
-        ':userSub': userSub,
-        ':pending': 'pending',
-        ':inProgress': 'in_progress',
-      },
-      Limit: limit * 4, // FilterExpression runs post-read; over-fetch to compensate
-    }));
+    // PAGINATED, because `Limit` applies BEFORE the filter and the sort key is a task id.
+    //
+    // `Limit: limit * 4` read an arbitrary 40 rows and then filtered them, and the partition holds
+    // every task this owner has had until TTL (up to 200 days) in id order - not time order. So a
+    // user whose partition happened to start with 40 finished rows got NOTHING back, and the more
+    // work someone had done the likelier that became. This read backs `/tasks/mine` and the
+    // cross-channel prompt hint, so the symptom was open work vanishing for the heaviest users.
+    //
+    // Bounded by the same reasoning as `getOwnerChannelTasks`: the partition is TTL-bounded, so the
+    // full walk is bounded too, and a page cap stops early once enough ACTIVE rows are in hand.
+    const rows: UserTask[] = [];
+    let lastKey: Record<string, unknown> | undefined;
+    let pages = 0;
+    do {
+      const result = await dynamoClient.send(new QueryCommand({
+        TableName: USER_TASKS_TABLE,
+        KeyConditionExpression: 'userSub = :userSub',
+        FilterExpression: '#status IN (:pending, :inProgress)',
+        ExpressionAttributeNames: { '#status': 'status' },
+        ExpressionAttributeValues: {
+          ':userSub': userSub,
+          ':pending': 'pending',
+          ':inProgress': 'in_progress',
+        },
+        ...(lastKey ? { ExclusiveStartKey: lastKey } : {}),
+      }));
+      rows.push(...((result.Items as UserTask[] | undefined) ?? []));
+      lastKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
+      pages += 1;
+      // Enough ACTIVE rows to answer with, or a runaway partition. Either way stop: the caller wants
+      // the newest `limit`, and a further page cannot change which those are once we hold more than
+      // `limit` of them... except by recency, which is why the cap is generous rather than exact.
+    } while (lastKey && rows.length < limit * 4 && pages < 10);
 
-    const rows = (result.Items as UserTask[] | undefined) ?? [];
     rows.sort((a, b) => (b.updatedAt || '').localeCompare(a.updatedAt || ''));
     return rows.slice(0, limit);
   } catch (error) {
