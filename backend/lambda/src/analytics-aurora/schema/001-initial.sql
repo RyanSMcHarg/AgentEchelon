@@ -59,6 +59,29 @@ CREATE TABLE IF NOT EXISTS messages (
     output_tokens INTEGER,
     latency_ms INTEGER,
     total_ms INTEGER,
+    -- The ROUTER leg: its handler entry to the moment it handed the turn off, on one clock. Sits in
+    -- front of the placeholder, so it is INSIDE ttff. Distinct from exchanges.inbound_ms, which is
+    -- cross-clock and spans the channel flow, Lex and the router together - a bound, not a step.
+    router_ms INTEGER,
+    -- What the intent classification cost, measured by the ROUTER - the largest controllable step
+    -- on the user-message-to-placeholder leg, and the only one the processor cannot see for itself.
+    -- NULL when no model was asked (the pre-LLM fast paths, an orchestrator-dispatched rebuttal), so
+    -- a null means no classification was bought rather than none was measured.
+    classifier_ms INTEGER,
+    -- Admission: the dedup claim and the task-status write, before any lookup begins. Separated so
+    -- the processor leg reconciles: total_ms less guard_ms, placeholder_resolve_ms and latency_ms is
+    -- the finalize/update tail, and a residual that will not close is a measurement bug.
+    guard_ms INTEGER,
+    -- What LOCATING the placeholder cost: the correlation-mapping read, plus the fallback scan when
+    -- one was needed. Timed from the start of resolution, NOT from processor entry - the dedup claim
+    -- and the task-status write that precede it are not part of locating anything, and billing them
+    -- here is what kept the old figure off zero however well the handoff worked.
+    placeholder_resolve_ms INTEGER,
+    -- The fallback SCAN only, and NULL when no scan ran - never 0. A scan is rare and costs seconds,
+    -- so a column holding 0 for the common case would have a mean describing no turn on the system.
+    -- Left NULL, one column answers both questions: COUNT(poll_ms) is how often the channel flow's
+    -- placeholder-id handoff failed to supply a target, and AVG(poll_ms) is what a scan costs when it
+    -- happens, because AVG skips nulls.
     poll_ms INTEGER,
     persistence VARCHAR(32) DEFAULT 'PERSISTENT',
     task_id VARCHAR(64),

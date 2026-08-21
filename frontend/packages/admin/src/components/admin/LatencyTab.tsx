@@ -154,6 +154,23 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
   const avgModel = favg('avg_model_ms');
   const avgTool = favg('avg_tool_ms');
   const avgInbound = favg('avg_inbound_ms');
+  // The path, step by step (docs/LATENCY-TARGETS.md "The message path"). These NEST rather than add:
+  // classifier is inside router, poll is inside the placeholder lookup. Adding a parent to its own
+  // child double-counts, which is the reading these cards exist to make hard.
+  const avgRouter = favg('avg_router_ms');
+  const avgClassifier = favg('avg_classifier_ms');
+  const avgRouterOther = favg('avg_router_other_ms');
+  const avgGuard = favg('avg_guard_ms');
+  const avgResolve = favg('avg_placeholder_resolve_ms');
+  const avgTail = favg('avg_processor_tail_ms');
+  // HOW OFTEN, not how long. Both of these are counts summed over the scoped rows, because the
+  // question they answer is a rate: a mean of a column that is null on most turns would sit between
+  // two populations and describe neither.
+  const sumCount = (field: string): number =>
+    withLatency.reduce((s, r) => s + (Number(r[field]) || 0), 0);
+  const pollFallbacks = sumCount('poll_fallback_count');
+  const classifiedByModel = sumCount('classified_by_model_count');
+  const pollFallbackPct = totalExchanges > 0 ? (pollFallbacks / totalExchanges) * 100 : 0;
 
   // Round the upper-bound to nice numbers for the distribution rail.
   const distMax = p95Total > 0 ? Math.ceil((p95Total * 1.15) / 500) * 500 : 6000;
@@ -297,11 +314,47 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
         <MetricCard title="Worker compute" value={formatMs(avgTotal)} target={scopeIsSingle ? METRIC_TARGETS.avg_total_ms : undefined} rawValue={avgTotal} tooltip="The async processor's server compute for the turn, from processor entry to the answer being posted (history load + tool loop + guardrail + post). NOT the user's wall-clock wait: it excludes the inbound hop (router + classifier + invoke), cold start, and browser delivery, so it is always less than E2E — see E2E for the full wait." />
         <MetricCard title="Avg Model" value={formatMs(avgModel)} rawValue={avgModel} tooltip="Model-inference time: the sum of the Converse (Bedrock) call durations in the tool loop — the pure model-inference share of the turn, distinct from tool execution (see Avg Tool). Shown without a target: the published bands cover the whole model loop (model + tool), not model inference alone." />
         <MetricCard title="Avg Tool" value={avgTool > 0 ? formatMs(avgTool) : 'n/a'} rawValue={avgTool > 0 ? avgTool : undefined} tooltip="In-loop tool-execution time (RAG / S3 company-context reads) — the non-inference share of the model loop. A RAG-heavy turn shows here, not as slow model inference." />
-        <MetricCard title="Inbound" value={avgInbound > 0 ? formatMs(avgInbound) : 'n/a'} rawValue={avgInbound > 0 ? avgInbound : undefined} tooltip="Front-of-turn hop: user message → async worker entry, the part Worker compute omits. NOT a single cold start — it covers the Lex/router fulfillment Lambda, the intent-classification round-trip (a Bedrock call on the default LLM classifier), and the invoke of the async worker: two VPC Lambdas plus a model call. On an idle deployment both Lambdas pay full cold-init, stacking to several seconds; under steady traffic they stay warm and this collapses toward the classifier call alone (~1s). Cross-clock/approximate (Chime send-time vs server entry-time), clamped to ≥ 0." />
+        <MetricCard title="Inbound" value={avgInbound > 0 ? formatMs(avgInbound) : 'n/a'} rawValue={avgInbound > 0 ? avgInbound : undefined} tooltip="Everything in front of the worker, as ONE figure: Amazon Chime SDK ingest, the channel flow, Lex, the whole router (classification included) and the invoke, plus the worker's cold start. A BOUND on the front of the turn, not a step in it — the worker is dispatched at roughly the instant the placeholder is returned, so this tracks TTFF almost exactly rather than dividing it, and it OVERLAPS the Router and Classifier cards entirely (do not add them together). Use Router and Classifier to see which part to fix; what they do not cover is the pre-router hop (ingest, channel flow, Lex) and the placeholder's trip back. Cross-clock and approximate (Chime send-time vs server entry-time), clamped to ≥ 0 — the only card here that is not skew-free." />
         <MetricCard
-          title="Avg Polling"
-          value={formatMs(avgPoll)}
-          tooltip="Mean time the async processor spent polling for the completed answer before swapping it in for the placeholder, for single-reply deliveries only (multi-step tasks are excluded — their polling spans the whole task). Part of total latency, distinct from model inference."
+          title="Placeholder lookup"
+          value={avgResolve > 0 ? formatMs(avgResolve) : 'n/a'}
+          rawValue={avgResolve > 0 ? avgResolve : undefined}
+          tooltip="What it cost the worker to work out WHICH message to answer on: the correlation-mapping read, plus a fallback scan on the turns that need one. This is the placeholder handshake, not the answer. It replaces the old 'Avg Polling' card, which timed from worker entry and so charged the duplicate-delivery claim and the task-status write to polling — which is why it could never read zero however well the handshake worked, and why task turns sat about 100ms above everything else."
+        />
+        <MetricCard
+          title="Placeholder scan rate"
+          value={totalExchanges > 0 ? `${pollFallbackPct.toFixed(1)}%` : 'n/a'}
+          rawValue={totalExchanges > 0 ? pollFallbackPct : undefined}
+          subtitle={pollFallbacks > 0
+            ? `${pollFallbacks} of ${totalExchanges}, avg ${formatMs(avgPoll)} each`
+            : 'handoff resolved every turn'}
+          tooltip="How often the channel flow's placeholder id did NOT resolve the target, so the worker had to scan Amazon Chime SDK messages for it. Read as a RATE: the scan is rare and costs seconds, so a single average over all turns would sit between a common zero and a rare few thousand and describe no turn at all. The average shown in the subtitle is the cost WHEN a scan happens. Zero is the healthy value, which is what makes a regression here a step off the floor rather than a drift inside noise."
+        />
+        <MetricCard
+          title="Router"
+          value={avgRouter > 0 ? formatMs(avgRouter) : 'n/a'}
+          rawValue={avgRouter > 0 ? avgRouter : undefined}
+          subtitle={avgRouterOther > 0 ? `${formatMs(avgRouterOther)} outside classification` : undefined}
+          tooltip="The router Lambda's own compute, from its entry to handing the turn off: classification, task lookups, SSM reads, the classification tag read and delivery selection. This span sits IN FRONT of the placeholder, so it is inside TTFF — it is the part of the user's pre-answer wait that this codebase controls. One clock, no skew, unlike Inbound."
+        />
+        <MetricCard
+          title="Classifier"
+          value={avgClassifier > 0 ? formatMs(avgClassifier) : 'n/a'}
+          rawValue={avgClassifier > 0 ? avgClassifier : undefined}
+          subtitle={classifiedByModel > 0 ? `${classifiedByModel} of ${totalExchanges} asked a model` : 'no model classifications'}
+          tooltip="What intent classification cost, when a model was asked. A SUB-STEP of Router, not a separate slice to add to it. Turns settled by the pre-LLM fast paths (exact greetings and acknowledgments) and orchestrator-dispatched rebuttals never call a model, and are excluded rather than counted as zero — averaging them in would make the classifier look CHEAPER the more often it is skipped, instead of rarer. The subtitle is how often a model was actually asked. This is the largest controllable step inside TTFF."
+        />
+        <MetricCard
+          title="Admission"
+          value={avgGuard > 0 ? formatMs(avgGuard) : 'n/a'}
+          rawValue={avgGuard > 0 ? avgGuard : undefined}
+          tooltip="The worker's unavoidable per-turn cost before it looks for anything: the duplicate-delivery claim, plus the task-status write on task turns (which is why task turns read higher here). Named separately so the worker leg reconciles — Worker compute now equals Admission + Placeholder lookup + Bedrock + Tail."
+        />
+        <MetricCard
+          title="Worker tail"
+          value={avgTail !== 0 ? formatMs(avgTail) : 'n/a'}
+          rawValue={avgTail !== 0 ? avgTail : undefined}
+          tooltip="What is left of Worker compute after Admission, Placeholder lookup and Bedrock: finalizing the answer, updating the message and dispatching to archival. Derived from the total rather than stamped, so the arithmetic is checkable. A NEGATIVE value is a real finding, not a display glitch — it means compute was attributed to the wrong turn, so it is deliberately not clamped to zero."
         />
         <MetricCard title="P95 worker compute" value={formatMs(p95Total)} target={scopeIsSingle ? METRIC_TARGETS.p95_total_ms : undefined} rawValue={p95Total} tooltip="95th-percentile async-processor compute latency, traffic-weighted across groups. Follows the response-type filter above: by default multi-step tasks are excluded; add them back and each task TURN counts individually (per-turn compute), never the whole multi-turn task cycle (that lives on Tasks / Effectiveness). A per-group tail summary — not the exact global p95 — so it's a stable headline rather than the single worst group." />
       </div>

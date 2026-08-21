@@ -1663,6 +1663,91 @@ async function getLatencyMetrics(
        COUNT(*) AS exchange_count,
        ROUND(AVG(m.total_ms)) AS avg_total_ms,
        ROUND(AVG(m.latency_ms)) AS avg_bedrock_ms,
+       -- ── LOCATING THE PLACEHOLDER: THE COST, AND HOW OFTEN IT GOES THE SLOW WAY ──
+       --
+       -- Three figures because there are three questions, and one column was answering none of them.
+       -- Before migration 030, poll_ms spanned processor entry to placeholder resolved, so it billed
+       -- the dedup claim and the task-status write to "polling" and could never read 0 however well
+       -- the channel flow's handoff worked. Task turns ran ~100ms above every other delivery option
+       -- on every day measured; that was updateTaskStatus, not a scan.
+       --
+       --   avg_placeholder_resolve_ms  what LOCATING cost - the mapping read, plus the scan when
+       --                               there was one. The latency the turn actually paid before it
+       --                               knew which message to answer on.
+       --   poll_fallback_count         how often the handoff did NOT supply a target, so a scan ran.
+       --                               This is the number to read: it sits on a hard floor of zero,
+       --                               so a regression is a step off it rather than a drift within
+       --                               noise, and it is what makes an alert here mean one thing.
+       --   avg_poll_ms                 what a scan costs WHEN it happens.
+       --
+       -- avg_poll_ms IS CONDITIONAL BY CONSTRUCTION, not by a FILTER: poll_ms is NULL on turns that
+       -- did not scan (030), and AVG skips nulls. Written as 0 instead, the mean would land between
+       -- a common 0 and a rare few thousand and describe no turn on the system - the same defect as
+       -- averaging a reconstructed pairing into TTFF, in the other direction.
+       --
+       -- ── THE PROCESSOR LEG, STEP BY STEP, AND IT RECONCILES ──
+       --
+       -- The point is not four more numbers, it is that they ADD UP. A turn between the placeholder
+       -- and the final answer spends its time in exactly four places, and each is now named:
+       --
+       --   guard_ms                the dedup claim + the task-status write (admission)
+       --   placeholder_resolve_ms  locating the message to answer on
+       --   latency_ms              the model loop, itself split into model_ms + tool_ms
+       --   avg_processor_tail_ms   what is LEFT of total_ms - the finalize, the message update and
+       --                           the archival dispatch. Derived, not stamped, so it cannot drift
+       --                           from the total it is defined against.
+       --
+       -- The tail is the honest residual, and it is reported rather than assumed to be zero for the
+       -- same reason v_turn_latency returns unattributed_ms: a residual that will not close is a
+       -- measurement bug, and one that is never computed is a measurement bug nobody can see. If it
+       -- goes NEGATIVE, compute has been attributed to the wrong turn - the bug class this ledger
+       -- exists to expose - so it is not clamped at zero.
+       -- ── THE TTFF LEG'S LARGEST CONTROLLABLE STEP ──
+       --
+       -- The classifier is a Bedrock call, and it runs BEFORE the placeholder is minted - so it is
+       -- inside the number the 1s SLO is about, and it was the one step of the whole path that had
+       -- no column. It was measurable only from CloudWatch, where it read 444 ms avg / 1,410 ms p95
+       -- / 1,723 ms max on premium traffic over three days: between a sixth and a third of a TTFF
+       -- that was missing its target by 1.6 s. A step that large deciding an SLO from outside the
+       -- ledger is how an optimisation gets argued about instead of measured.
+       --
+       -- CONDITIONAL BY NULL, like poll_ms and for the same reason: a turn settled by the pre-LLM
+       -- fast path, or a rebuttal dispatched by the orchestrator, never asked a model for a label.
+       -- Those turns did not pay this, and averaging a 0 into the cost of classifying would report a
+       -- cheaper classifier rather than a rarer one. So AVG is the cost WHEN a model is asked, and
+       -- the count beside it is how often that happens.
+       -- ── THE ROUTER LEG, AND WHY inbound_ms COULD NOT ANSWER THIS ──
+       --
+       -- avg_inbound_ms is the user message to ASYNC PROCESSOR ENTRY: the channel flow, Lex, this
+       -- router and the dispatch, as one cross-clock figure clamped at zero. It tracks TTFF almost
+       -- exactly (2,591 against 2,653 ms on 2026-08-21) because the processor is dispatched at
+       -- roughly the instant the placeholder is returned - so it is a near-DUPLICATE of TTFF, not a
+       -- component of it, and it can never say which of the three hops to fix.
+       --
+       -- router_ms is the router's own compute on ONE clock, so the leg finally divides:
+       --
+       --   avg_router_ms         this handler, entry to hand-off
+       --   avg_classifier_ms     its largest single step - a SUB-STEP of router_ms, not a sibling
+       --   avg_router_other_ms   the rest of the handler: the task lookups, the SSM reads, the
+       --                         classification tag read, delivery selection. Derived, for the same
+       --                         reason the processor tail is.
+       --   (ttff - router_ms)    what is left is the pre-router hop plus the placeholder's trip back
+       --                         to Chime. Deliberately NOT computed here: those endpoints are on
+       --                         different clocks, and a residual across a clock boundary is an
+       --                         estimate wearing a column's clothes. inbound_ms already bounds it.
+       ROUND(AVG(m.router_ms)) AS avg_router_ms,
+       ROUND(AVG(m.classifier_ms)) AS avg_classifier_ms,
+       COUNT(m.classifier_ms) AS classified_by_model_count,
+       -- The router MINUS the classification it may or may not have bought. COALESCE on the
+       -- classifier only: a turn that took a fast path spent none of its router time classifying, so
+       -- its whole router span is "other" - whereas a NULL router_ms means the turn was never
+       -- measured, and subtracting from it would invent a number.
+       ROUND(AVG(m.router_ms - COALESCE(m.classifier_ms, 0))) AS avg_router_other_ms,
+       ROUND(AVG(m.guard_ms)) AS avg_guard_ms,
+       ROUND(AVG(m.placeholder_resolve_ms)) AS avg_placeholder_resolve_ms,
+       ROUND(AVG(m.total_ms - COALESCE(m.guard_ms, 0) - COALESCE(m.placeholder_resolve_ms, 0)
+                            - COALESCE(m.latency_ms, 0))) AS avg_processor_tail_ms,
+       COUNT(m.poll_ms) AS poll_fallback_count,
        ROUND(AVG(m.poll_ms)) AS avg_poll_ms,
        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.total_ms)) AS p95_total_ms,
        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.latency_ms)) AS p95_bedrock_ms,
@@ -1673,8 +1758,52 @@ async function getLatencyMetrics(
        -- streaming, so this acknowledgment latency is the only pre-answer signal
        -- distinct from total_ms). response_latency_ms already records
        -- placeholder_created_at - user_message_at; null on unpaired/DIRECT rows.
-       ROUND(AVG(e.response_latency_ms)) AS avg_ttff_ms,
-       ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY e.response_latency_ms)) AS p95_ttff_ms,
+       --
+       -- ── MEASURED PAIRINGS ONLY, AND THE REST MADE COUNTABLE ──
+       --
+       -- An exchange reaches this table by one of two pairers, and only one of them measures a
+       -- placeholder. The in-batch pairer sees the turn's own analytics and records what the delivery
+       -- actually was. createExchangesFromDatabase is the fallback for a turn whose user and bot
+       -- messages landed in different Kinesis batches: it RECONSTRUCTS the pair by looking for the
+       -- earliest corr-marked bot CREATE after the user message, and its only bound on that search is
+       -- one hour. So its response_latency_ms is not a time-to-placeholder at all - it is the gap to
+       -- whatever reply that search decided belonged to the prompt, and it can be up to an hour.
+       --
+       -- MEASURED: 101 such rows on 2026-08-14 averaged 487,360 ms with a p95 of 2,428,479 ms - just
+       -- inside the hour cap - and produced 93% of a 7-day TTFF total across 2,719 exchanges. The
+       -- headline read 21,555 ms; without them it read 3,585 ms. Against a 1s SLO that is not a
+       -- degraded measurement, it is a fabricated one, and it describes a system that was actually
+       -- answering in about two and a half seconds.
+       --
+       -- THE DAMAGE SCALES INVERSELY WITH TRAFFIC, which is why this could not be left to age out of
+       -- the window. A fresh deployment's first run produces tens of exchanges, not thousands, so ONE
+       -- reconstructed row puts its average TTFF into the minutes - and a first-time reader has no
+       -- history telling them the number is wrong.
+       --
+       -- PARTITIONED, NOT HIDDEN - the same rule as the unclosed_* buckets below and the
+       -- compute/direct split above. The reconstructed rows keep their exchange_count and are counted
+       -- here by name; what they lose is a vote on a latency nobody experienced.
+       --
+       -- THE DISCRIMINATOR IS INFERRED, AND THAT IS THIS FIX'S ONE WEAKNESS. delivery_option is NULL
+       -- exactly because the fallback pairer's INSERT omits the column, so NULL means "the fallback
+       -- minted this" - today. A turn whose analytics genuinely lacked a delivery option would also
+       -- be NULL and would be excluded with them. That is the safe direction (a real row lost from an
+       -- average is recoverable; a fabricated one poisoning it is not) and the count makes any such
+       -- loss visible. A declared provenance column on the pairer would make this a read of a fact
+       -- rather than of an absence, and is the better end state.
+       --
+       -- E2E IS NOT PARTITIONED HERE and carries the same exposure: it is anchored on the same
+       -- possibly-reconstructed user_message_at. Left alone deliberately, so this change is one
+       -- decision rather than two - see the tracker row.
+       ROUND(AVG(e.response_latency_ms) FILTER (WHERE e.delivery_option IS NOT NULL)) AS avg_ttff_ms,
+       ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY e.response_latency_ms)
+             FILTER (WHERE e.delivery_option IS NOT NULL)) AS p95_ttff_ms,
+       -- The population the two figures above are taken over, and the one they are not. Reported so
+       -- "avg over N" means something here as well.
+       COUNT(*) FILTER (WHERE e.response_latency_ms IS NOT NULL AND e.delivery_option IS NOT NULL)
+         AS ttff_measured_count,
+       COUNT(*) FILTER (WHERE e.response_latency_ms IS NOT NULL AND e.delivery_option IS NULL)
+         AS ttff_reconstructed_count,
        -- E2E = user message -> FINAL answer (exchanges.e2e_ms = agent_final_at - user_message_at),
        -- the full user-perceived wait. Distinct from total_ms (server compute from processor entry)
        -- and from TTFF (time to the placeholder). Null on rows whose final-answer update has not been
@@ -1846,6 +1975,16 @@ async function getLatencyMetrics(
       'unclosed_unobserved', 'unclosed_disagreed', 'unclosed_errored',
       'unclosed_superseded', 'unclosed_awaiting', 'unclosed_silent',
       'avg_ttff_ms', 'p95_ttff_ms',
+      // The TTFF population, split by whether the pairing was MEASURED or RECONSTRUCTED by the
+      // cross-batch fallback. Appended, so the existing contract is untouched: LatencyTab already
+      // skips a null avg_ttff_ms when it traffic-weights, which is what a reconstructed-only group
+      // now returns.
+      'ttff_measured_count', 'ttff_reconstructed_count',
+      // Locating the placeholder, split into the cost and the rate (migration 030). `avg_poll_ms`
+      // keeps its name and its position in the contract above; what changed is that it now means
+      // the SCAN alone and is conditional on one having happened.
+      'avg_router_ms', 'avg_classifier_ms', 'classified_by_model_count', 'avg_router_other_ms',
+      'avg_guard_ms', 'avg_placeholder_resolve_ms', 'avg_processor_tail_ms', 'poll_fallback_count',
       'avg_e2e_ms', 'p95_e2e_ms',
       'avg_model_ms', 'avg_tool_ms', 'avg_inbound_ms',
     ],

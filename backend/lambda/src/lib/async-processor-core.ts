@@ -207,6 +207,7 @@ const METADATA_SHED_ORDER: readonly string[] = [
   // Secondary analytics / config attribution — useful but reconstructable / low-value per-message.
   'systemPromptHash', 'intentPackVersion', 'personaVersion', 'configId',
   'fallbackReason', 'retryCount', 'wasFallback', 'deliveryOption', 'intentConfidence', 'pollMs',
+  'placeholderResolveMs', 'guardMs', 'classifierMs', 'routerMs',
   // Bulky / UX-degrading-but-not-data-losing (battle metadata is droppable by
   // existing design; activeTask/attachment/targetedSender degrade UI, not the join).
   'battleContext', 'activeTask', 'attachment', 'targetedSender',
@@ -453,6 +454,24 @@ export interface AsyncProcessorEvent {
   // Intent classification (passed from agent handler for analytics)
   intent?: string;
   intentConfidence?: string;
+  /**
+   * What the intent classification cost, in ms, as measured by the ROUTER.
+   *
+   * Carried on the dispatch rather than re-derived because the classifier runs before the
+   * placeholder is minted and the processor never sees it. ABSENT on the pre-LLM fast paths and on
+   * an orchestrator-dispatched rebuttal, neither of which asks a model for a label - so a null here
+   * means "no classification was bought", not "not measured".
+   */
+  classifierMs?: number;
+  /**
+   * The ROUTER leg: its handler entry to the moment it handed this turn off, on one clock.
+   *
+   * The span that sits in front of the placeholder and is therefore inside TTFF. Distinct from
+   * exchanges.inbound_ms, which is cross-clock and spans the channel flow, Lex AND this handler as a
+   * single figure - useful as a bound, useless for deciding which of them to fix. classifierMs is a
+   * SUB-STEP of this, not a sibling.
+   */
+  routerMs?: number;
   deliveryOption?: string;
 
   // Per-intent response shaping. Forwarded by the router from the
@@ -2343,7 +2362,12 @@ export async function sendProcessorErrorAlert(
  */
 export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
   messageId: string | null;
-  pollTime: number;
+  /** Admission: the dedup claim and the task-status write, before any lookup begins. */
+  guardMs: number;
+  /** What locating the placeholder cost: the mapping read, plus the scan when one was needed. */
+  placeholderResolveMs: number;
+  /** The scan only, and UNDEFINED when none ran - so a count of these is the fallback RATE. */
+  pollMs?: number;
   consolidatedHistory: ConversationMessage[];
   priorAgentContext: string;
   bedrockMessages: ConversationMessage[];
@@ -2402,13 +2426,39 @@ export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
   //
   // A miss is normal and means only "not claimed yet" (this processor is dispatched before the
   // placeholder exists), so the handed id still stands.
+  //
+  // WHERE LOCATING THE PLACEHOLDER STARTS. The clock for it opens HERE and not at handler entry,
+  // which is the whole correction: the span above this line is the dedup claim and the task-status
+  // write, work that happens whether or not there is a placeholder to find. Timing from entry
+  // charged both of them to "polling", so the figure could never reach zero however well the
+  // handoff worked - and the ~100ms by which task turns exceeded the rest was updateTaskStatus
+  // showing through a metric that claimed to be measuring a scan.
+  // ADMISSION ENDS HERE. Everything between handler entry and this instant is the dedup claim and
+  // the task-status write - work a turn pays whether or not there is a placeholder to find - and
+  // charging it to the lookup is exactly what made the old poll figure unable to reach zero.
+  const resolveStart = Date.now();
+  const guardMs = resolveStart - startTime;
   const target = resolvePlaceholderTarget(await readPlaceholderMapping(correlationId), event.placeholderMessageId);
   if (target.overrodeHandedId) {
     console.warn('[AsyncProcessor] dispatched placeholder lost the duplicate guard; answering on the claimed one', {
       correlationId, dispatched: event.placeholderMessageId, claimed: target.messageId,
     });
   }
-  let messageId = target.messageId || (await pollForPlaceholderMessage(correlationId));
+  // THE SCAN IS THE EXCEPTION, AND IS TIMED AS ONE. `pollMs` is left UNDEFINED when the mapping or
+  // the handed id already named the target, rather than being written as 0.
+  //
+  // That distinction is what makes the aggregate readable. A poll is rare and expensive, so a column
+  // holding 0 for the common case and seconds for the rare one has a MEAN THAT DESCRIBES NO TURN -
+  // it sits in the gap between two populations. Left null, the same column answers both questions
+  // the owner asked of it without further arithmetic: COUNT(poll_ms) is how often a scan was needed,
+  // and AVG(poll_ms) is what a scan costs WHEN it happens, because AVG skips nulls.
+  let messageId: string | null = target.messageId ?? null;
+  let pollMs: number | undefined;
+  if (!messageId) {
+    const pollStart = Date.now();
+    messageId = await pollForPlaceholderMessage(correlationId);
+    pollMs = Date.now() - pollStart;
+  }
   // NOT RESOLVED YET IS NOT A FAILURE. This used to abort the turn here, which was right when the
   // only way to find a placeholder was to search for it: if 22 seconds of scanning found nothing, the
   // placeholder did not exist. The mapping changes that. It is written before the placeholder is
@@ -2432,7 +2482,11 @@ export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
   } else {
     console.log('[AsyncProcessor] Found placeholder message:', messageId);
   }
-  const pollTime = Date.now() - startTime;
+  // WHAT IT COST TO LOCATE THE PLACEHOLDER - the mapping read, plus the scan when there was one.
+  // This is the number that answers "how long before the turn knew which message to answer on", and
+  // it is a SUPERSET of pollMs by exactly the mapping read. Reported alongside rather than instead:
+  // the resolve cost is what the turn pays, and the poll rate is the reason it ever moves.
+  const placeholderResolveMs = Date.now() - resolveStart;
 
   // A RESUMED duel side ends its waiting affordance here (ADR-029), as early as it can: the user has
   // answered, this turn is generating, and the question message must stop rendering as "Replying to:"
@@ -2536,7 +2590,9 @@ export async function runSharedPipeline(event: AsyncProcessorEvent): Promise<{
 
   return {
     messageId,
-    pollTime,
+    guardMs,
+    placeholderResolveMs,
+    pollMs,
     consolidatedHistory,
     priorAgentContext,
     bedrockMessages,
@@ -2561,7 +2617,9 @@ export async function finalizePlaceholderResponse(params: {
   outputTokens: number;
   bedrockTime: number;
   messageId: string;
-  pollTime: number;
+  guardMs: number;
+  placeholderResolveMs: number;
+  pollMs?: number;
   conversationHistoryLength: number;
   startTime: number;
   activeTaskInfo?: { type: string; status: string; label: string; taskId: string };
@@ -2617,7 +2675,7 @@ export async function finalizePlaceholderResponse(params: {
 }): Promise<void> {
   const {
     event, response, model, inputTokens, outputTokens, bedrockTime,
-    messageId, pollTime, conversationHistoryLength, startTime, activeTaskInfo,
+    messageId, guardMs, placeholderResolveMs, pollMs, conversationHistoryLength, startTime, activeTaskInfo,
     attachment,
   } = params;
 
@@ -2855,6 +2913,8 @@ export async function finalizePlaceholderResponse(params: {
     agentType: event.userType,
     intent: event.intent,
     intentConfidence: event.intentConfidence,
+    ...(event.classifierMs !== undefined && { classifierMs: event.classifierMs }),
+    ...(event.routerMs !== undefined && { routerMs: event.routerMs }),
     deliveryOption: event.deliveryOption,
     // Forwarded, not inferred. The router declares it; the ledger records it; nothing in between
     // guesses, which is the property that makes a repaired turn distinguishable from a slow one.
@@ -2869,7 +2929,9 @@ export async function finalizePlaceholderResponse(params: {
     // cost path can price per-image (an image model reports 0 tokens).
     ...(params.imageCount != null && { imageCount: params.imageCount }),
     totalMs: totalTime,
-    pollMs: pollTime,
+    guardMs,
+    placeholderResolveMs,
+    ...(pollMs !== undefined && { pollMs }),
     ...(activeTaskInfo && { activeTask: activeTaskInfo }),
     ...(taskAnalytics.taskState && { taskState: taskAnalytics.taskState }),
     ...(taskAnalytics.taskTransition && { taskTransition: taskAnalytics.taskTransition }),
@@ -3104,7 +3166,8 @@ export async function finalizePlaceholderResponse(params: {
   await closeOutAcknowledgement('final');
 
   console.log('[AsyncProcessor] Message updated successfully', {
-    pollTime,
+    placeholderResolveMs,
+    pollMs,
     bedrockTime,
     totalTime,
   });

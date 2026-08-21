@@ -129,6 +129,15 @@ interface MessageRecord {
   output_tokens: number | null;
   latency_ms: number | null;
   total_ms: number | null;
+  /** The router leg: handler entry to hand-off, one clock. classifier_ms is a sub-step of it. */
+  router_ms: number | null;
+  /** What the intent classification cost, from the router. NULL when no model was asked. */
+  classifier_ms: number | null;
+  /** Admission: the dedup claim and the task-status write, before any lookup begins. */
+  guard_ms: number | null;
+  /** Cost of LOCATING the placeholder (mapping read + scan when needed). */
+  placeholder_resolve_ms: number | null;
+  /** The fallback SCAN only, NULL when none ran - so a COUNT of it is the fallback rate. */
   poll_ms: number | null;
   /** Latency split (LATENCY-TARGETS.md), from the out-of-band analytics record: model_ms = Converse
    *  inference time, tool_ms = in-loop tool execution. Folded onto messages.model_ms / tool_ms. */
@@ -588,7 +597,16 @@ export async function transformToMessageRecord(
     output_tokens: analytics.outputTokens || null,
     latency_ms: analytics.latencyMs || analytics.bedrockLatencyMs || null,
     total_ms: analytics.totalMs || null,
-    poll_ms: analytics.pollMs || null,
+    // typeof-guarded, NOT ||: a resolve that completed inside a millisecond is a real 0 and the
+    // best reading the metric has - coercing it to NULL would drop the fastest turns out of the
+    // average and make locating look slower than it is.
+    router_ms: typeof analytics.routerMs === 'number' ? analytics.routerMs : null,
+    classifier_ms: typeof analytics.classifierMs === 'number' ? analytics.classifierMs : null,
+    guard_ms: typeof analytics.guardMs === 'number' ? analytics.guardMs : null,
+    placeholder_resolve_ms: typeof analytics.placeholderResolveMs === 'number' ? analytics.placeholderResolveMs : null,
+    // Same guard, for the opposite reason: a scan that returned immediately still HAPPENED, and the
+    // count of this column is the fallback rate. || null would erase that turn from the rate.
+    poll_ms: typeof analytics.pollMs === 'number' ? analytics.pollMs : null,
     model_ms: typeof analytics.modelMs === 'number' ? analytics.modelMs : null,
     tool_ms: typeof analytics.toolMs === 'number' ? analytics.toolMs : null,
     processor_entry_ms: typeof analytics.processorEntryMs === 'number' ? analytics.processorEntryMs : null,
@@ -645,6 +663,10 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
     'output_tokens',
     'latency_ms',
     'total_ms',
+    'router_ms',
+    'classifier_ms',
+    'guard_ms',
+    'placeholder_resolve_ms',
     'poll_ms',
     'persistence',
     'task_id',
@@ -674,6 +696,10 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
     output_tokens: r.output_tokens,
     latency_ms: r.latency_ms,
     total_ms: r.total_ms,
+    router_ms: r.router_ms,
+    classifier_ms: r.classifier_ms,
+    guard_ms: r.guard_ms,
+    placeholder_resolve_ms: r.placeholder_resolve_ms,
     poll_ms: r.poll_ms,
     persistence: r.persistence,
     task_id: r.task_id,
@@ -1038,7 +1064,14 @@ export async function backfillFromUpdateEvents(
                 -- Latency split (LATENCY-TARGETS.md): model_ms = Converse inference, tool_ms = in-loop
                 -- tool execution. Folded like latency_ms; COALESCE keeps them idempotent.
                 model_ms        = COALESCE($15, model_ms),
-                tool_ms         = COALESCE($16, tool_ms)
+                tool_ms         = COALESCE($16, tool_ms),
+                -- APPENDED AS $18, not inserted next to poll_ms: the params above are referenced by
+                -- number in this statements own comments, and renumbering them to keep related
+                -- columns adjacent is how a fold quietly starts writing the wrong one.
+                placeholder_resolve_ms = COALESCE($18, placeholder_resolve_ms),
+                guard_ms               = COALESCE($19, guard_ms),
+                classifier_ms          = COALESCE($20, classifier_ms),
+                router_ms              = COALESCE($21, router_ms)
           WHERE message_id = $12
             AND channel_arn = $13
             AND event_type = 'CREATE_CHANNEL_MESSAGE'`,
@@ -1060,6 +1093,16 @@ export async function backfillFromUpdateEvents(
           upd.model_ms,
           upd.tool_ms,
           upd.resp_phase,
+          // $18. Appended LAST because the position in this array IS the parameter number: putting it
+          // beside poll_ms would have shifted model_ms/tool_ms/resp_phase by one and folded each into
+          // the column after it, with nothing to complain.
+          upd.placeholder_resolve_ms,
+          // $19. Appended last, same reason as $18.
+          upd.guard_ms,
+          // $20. Appended last, same reason as $18 and $19.
+          upd.classifier_ms,
+          // $21. Appended last, same reason as $18-$20.
+          upd.router_ms,
         ]
       );
 

@@ -566,7 +566,7 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       return;
     }
 
-    const { messageId, pollTime, consolidatedHistory, priorAgentContext, bedrockMessages, isFirstUserTurn } = pipeline;
+    const { messageId, guardMs, placeholderResolveMs, pollMs, consolidatedHistory, priorAgentContext, bedrockMessages, isFirstUserTurn } = pipeline;
 
     // Build system prompt with the resolved persona + host per-turn context (domain grounding + i18n
     // + participant profile), assembled via the resolver registry + defensive composer. Each resolver
@@ -1777,7 +1777,9 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       outputTokens: bedrockResult.outputTokens,
       bedrockTime: bedrockResult.bedrockTime,
       messageId: deliverMessageId,
-      pollTime,
+      guardMs,
+      placeholderResolveMs,
+      pollMs,
       conversationHistoryLength: consolidatedHistory.length,
       startTime,
       // THE STATE THE TURN ENDED IN, not the one it started in. `activeTaskInfo` is stamped before the

@@ -241,6 +241,35 @@ export interface AnalyticsMetadata {
 
   // End-to-end pipeline timing (assistant messages only)
   totalMs?: number;
+  /**
+   * The ROUTER leg: handler entry to hand-off, one clock. classifierMs is a sub-step of it.
+   */
+  routerMs?: number;
+  /**
+   * What the intent classification cost, in ms, measured by the router. ABSENT when no model was
+   * asked - the pre-LLM fast paths and orchestrator-dispatched rebuttals - so null means "no
+   * classification was bought" rather than "not measured".
+   */
+  classifierMs?: number;
+  /**
+   * Admission: the dedup claim and the task-status write, before any placeholder lookup begins.
+   * Broken out so the processor leg RECONCILES - total_ms less guard, resolve and the model loop is
+   * the finalize/update tail, and a residual that will not close is a measurement bug rather than a
+   * shrug.
+   */
+  guardMs?: number;
+  /**
+   * What locating the placeholder cost: the mapping read plus the scan when one was needed.
+   * Always present on a turn that ran the shared pipeline. A SUPERSET of pollMs.
+   */
+  placeholderResolveMs?: number;
+  /**
+   * The placeholder SCAN only, and ABSENT when no scan ran - never 0.
+   *
+   * Absence is the signal. A scan is rare and costs seconds, so a field holding 0 for the common
+   * case would have a mean describing no turn at all; left absent, a COUNT of it is the fallback
+   * rate and an AVG of it is what a fallback costs when it happens.
+   */
   pollMs?: number;
 
   // Active task indicator (surfaced to frontend for UI status display)
@@ -362,6 +391,10 @@ export interface AnalyticsContext {
   imageCount?: number;
 
   totalMs?: number;
+  routerMs?: number;
+  classifierMs?: number;
+  guardMs?: number;
+  placeholderResolveMs?: number;
   pollMs?: number;
 
   activeTask?: {
@@ -466,6 +499,10 @@ export function buildAnalyticsMetadata(context: AnalyticsContext): AnalyticsMeta
   if (context.imageCount !== undefined) metadata.imageCount = context.imageCount;
 
   if (context.totalMs !== undefined) metadata.totalMs = context.totalMs;
+  if (context.routerMs !== undefined) metadata.routerMs = context.routerMs;
+  if (context.classifierMs !== undefined) metadata.classifierMs = context.classifierMs;
+  if (context.guardMs !== undefined) metadata.guardMs = context.guardMs;
+  if (context.placeholderResolveMs !== undefined) metadata.placeholderResolveMs = context.placeholderResolveMs;
   if (context.pollMs !== undefined) metadata.pollMs = context.pollMs;
 
   if (context.activeTask) {

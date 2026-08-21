@@ -147,7 +147,8 @@ const finalize = (broadcastAnswer: boolean) =>
     outputTokens: 20,
     bedrockTime: 100,
     messageId: PRIVATE_PLACEHOLDER,
-    pollTime: 5,
+    guardMs: 2,
+    placeholderResolveMs: 5,
     conversationHistoryLength: 2,
     startTime: Date.now(),
   });

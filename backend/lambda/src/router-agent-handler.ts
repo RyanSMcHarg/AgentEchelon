@@ -1243,6 +1243,11 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
   // ONE turn path, two entries. A bypass (@all, /battle) is normalized to the same event the Lex
   // fulfillment arrives on, so everything below this line cannot tell them apart - which is the point
   // (MESSAGE-FLOW §3.1). Bypassing Lex is the only sanctioned difference, and it ends here.
+  // THE ROUTER LEG'S OWN CLOCK. Everything this handler does before it hands the turn off sits in
+  // front of the placeholder, so it is inside TTFF - and until now the only instrument aimed at that
+  // span was exchanges.inbound_ms, which is CROSS-CLOCK and spans the flow, Lex and this handler
+  // together. One server-clock measurement of this handler alone is what makes the leg divisible.
+  const routerStart = Date.now();
   const lexIntentName = event.sessionState?.intent?.name;
   const channelArn = event.requestAttributes?.['CHIME.channel.arn'] || '';
 
@@ -2972,6 +2977,16 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
             // here - the router cannot see the inbound message's Target.
             intent: classification.intent,
             intentConfidence: classification.confidence,
+            // WHAT THE LABEL COST, carried because it is the largest controllable step in TTFF and the
+            // router is the only component that can see it. Absent on the no-LLM fast paths, which
+            // is itself the fact worth recording: those turns did not pay for a model.
+            ...(classification.classifierLatencyMs !== undefined
+              && { classifierMs: classification.classifierLatencyMs }),
+            // This handler entry -> the hand-off, on ONE clock. Stamped HERE rather than at the
+            // return because the payload leaves before the turn does; what is missed is formatting
+            // the Lex envelope, and naming the span for what it measures beats a truer number that
+            // cannot be taken.
+            routerMs: Date.now() - routerStart,
             deliveryOption,
             ...(resolvedModel && { resolvedModel }),
             ...(resolvedImageModelKey && { resolvedImageModelKey }),
@@ -3039,6 +3054,9 @@ const runTurn = async (event: LexEvent, spoke: SpokenAs): Promise<LexResponse> =
         // the async processor (see the task-continuation invoke above).
         intent: classification.intent,
         intentConfidence: classification.confidence,
+        ...(classification.classifierLatencyMs !== undefined
+          && { classifierMs: classification.classifierLatencyMs }),
+        routerMs: Date.now() - routerStart,
         ...(placeholderRetrievedContext && { retrievedContext: placeholderRetrievedContext }),
         ...(placeholderSummary && { conversationSummary: placeholderSummary }),
         deliveryOption: deliveryOptionName,

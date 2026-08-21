@@ -8,6 +8,37 @@ AgentEchelon delivers a reply in two phases (see [`MESSAGE-FLOW.md`](MESSAGE-FLO
 
 This is why a 2-second total-latency target is the wrong lens for the console: an agentic turn runs a self-hosted tool loop (reason, call `load_company_context`, answer) with input and output guardrails, which is two or more Bedrock calls plus a retrieval. Completion in seconds is expected; the user is not waiting on it blind because the placeholder already landed.
 
+## The message path, step by step
+
+Every metric below is one span of this path. Read this first: most confusion about these numbers comes
+from treating a bound as a step, or a sub-step as a sibling.
+
+```
+user message                                                          final answer
+     |                                                                      |
+     |<---------------------------- e2e_ms -------------------------------->|
+     |<-------- ttff_ms -------->|                                          |
+     |                           | placeholder                              |
+     |                           |<---------- total_ms (worker) ----------->|
+     |                                                                      |
+     |  ingest + flow + Lex  |   router_ms   |  guard | resolve |  latency_ms  | tail |
+     |  (no column; bounded  |  classifier_ms|        |  poll_ms|  model + tool|      |
+     |   by inbound_ms)      |  + other      |        | (if any)|              |      |
+```
+
+- **Nesting, not addition.** `classifier_ms` is inside `router_ms`. `poll_ms` is inside
+  `placeholder_resolve_ms`. `model_ms` and `tool_ms` are inside `latency_ms`. Adding a parent to its
+  own child double-counts.
+- **The two legs reconcile differently.** The worker leg closes exactly:
+  `total_ms = guard_ms + placeholder_resolve_ms + latency_ms + tail`, all on one clock. The front leg
+  does not, because its start is an Amazon Chime SDK timestamp and its steps are server wall-clock;
+  `inbound_ms` bounds it rather than dividing it.
+- **`inbound_ms` is a bound, not a step.** It spans everything before the processor and therefore
+  overlaps `router_ms` entirely. It is not a component to add alongside the others.
+- **Some steps are conditional, and null means "did not happen".** `poll_ms` is null when no scan ran;
+  `classifier_ms` is null when no model was asked. Averages over these are costs *when they occur*,
+  and each has a count beside it for how often that is.
+
 ## Metric definitions (what each number means and why it matters)
 
 Source of truth: the processor stamps deltas into the Amazon Chime SDK message Metadata field via `buildAnalyticsMetadata` (`async-processor-core.ts`); the archival Lambda (`kinesis-archival.ts`) writes them to `messages.*` and derives `exchanges.response_latency_ms` from message timestamps; `getLatencyMetrics` (`analytics-query.ts`) aggregates them for the tab. There are two clock domains: **server wall-clock** (`Date.now()` inside one Lambda - exact deltas, no skew: `latency_ms`, `total_ms`, `poll_ms`) and **Amazon Chime SDK message timestamps** (one shared clock across messages: `response_latency_ms`).
@@ -33,11 +64,44 @@ Source of truth: the processor stamps deltas into the Amazon Chime SDK message M
 - **Why it matters:** the **dominant component of Worker compute** on most turns and the lever for model comparison - where the turn's time actually goes.
 - **Now split:** `latency_ms` alone conflated model and tool time (a RAG-heavy turn inflated "Bedrock" without the model being slow). The dashboard now shows it split into **`model_ms`** (Avg Model) and **`tool_ms`** (Avg Tool) - see below. `latency_ms` remains the combined loop time.
 
-### Polling - `poll_ms` (dashboard card: "Avg Polling")
-- **Definition:** time spent at the start locating/confirming the placeholder message the router just created.
-- **Measures:** Amazon Chime SDK polling with retries until the placeholder id resolves. A **sub-interval of Worker compute**. `0` when the placeholder id is passed directly (e.g. /battle resume).
-- **Stamp:** `pollTime = Date.now() - startTime`, stamped `pollMs` -> `messages.poll_ms`.
-- **Why it matters:** a **handshake artifact, not compute**. Near-zero normally; a spike points at Amazon Chime SDK message-propagation trouble, not a slow model.
+### Locating the placeholder - `placeholder_resolve_ms` (dashboard card: "Placeholder lookup")
+- **Definition:** what it cost the processor to work out which message to answer on.
+- **Measures:** the correlation-mapping read, plus the fallback scan when one is needed. A **sub-interval of Worker compute**. Timed from the start of resolution, so it excludes the admission work before it (see `guard_ms`).
+- **Stamp:** `placeholderResolveMs` -> `messages.placeholder_resolve_ms`.
+- **Why it matters:** it is the cost of the placeholder handshake, and it is the number a handshake regression moves.
+
+### Placeholder scan - `poll_ms` (dashboard card: "Placeholder scan") and `poll_fallback_count`
+- **Definition:** the **fallback scan only**, on turns where the channel flow's placeholder id did not resolve the target.
+- **Measures:** Amazon Chime SDK message scanning with retries. `NULL` (not `0`) when no scan runs, which is the common case.
+- **Stamp:** `pollMs` -> `messages.poll_ms`, written only when a scan actually runs.
+- **Read it as a RATE, not an average.** `poll_fallback_count` is how often a scan was needed; `AVG(poll_ms)` is what a scan costs **when it happens** (`AVG` skips the nulls). A single mean over both populations would sit between a common zero and a rare few thousand and describe no turn on the system.
+- **Why it matters:** the count sits on a hard floor of zero, so a handshake regression is a step off that floor rather than a drift inside noise. That is what makes it alertable.
+
+### Admission - `guard_ms` (dashboard card: "Admission")
+- **Definition:** the processor's work before it starts looking for anything: the duplicate-delivery claim and the task-status write.
+- **Measures:** `claimCorrelation` plus `updateTaskStatus` (the latter only on task turns, which is why task turns read higher here).
+- **Stamp:** `guardMs` -> `messages.guard_ms`.
+- **Why it matters:** it is unavoidable per-turn cost, and naming it is what lets the processor leg reconcile.
+
+### Processor tail - `avg_processor_tail_ms` (derived, not stamped)
+- **Definition:** `total_ms - guard_ms - placeholder_resolve_ms - latency_ms`: the finalize, the message update and the archival dispatch.
+- **Why it matters:** it closes the processor leg. Every millisecond of Worker compute is now in a named bucket, so an unexplained residual is visible rather than absorbed.
+- **A NEGATIVE value is a finding, not a display bug.** It means compute was attributed to the wrong turn, the same class `v_turn_latency.unattributed_ms` exists to expose. It is deliberately not clamped.
+
+### Router leg - `router_ms` (dashboard card: "Router") and `avg_router_other_ms`
+- **Definition:** the router handler's own compute, from its entry to the moment it hands the turn off.
+- **Measures:** intent classification, task lookups, SSM reads, the classification tag read and delivery selection. Server wall-clock, one Lambda, no skew. It stops at the hand-off, so it excludes formatting the Lex envelope.
+- **Stamp:** `routerMs` -> `messages.router_ms`, carried on the dispatch because the router finishes after the payload leaves.
+- **Why it matters:** this span sits **in front of the placeholder**, so it is inside TTFF. It is the part of TTFF this codebase controls.
+- `avg_router_other_ms` is `router_ms - classifier_ms`: the router's work other than classifying.
+
+### Intent classification - `classifier_ms` (dashboard card: "Classifier") and `classified_by_model_count`
+- **Definition:** what the intent classification cost, measured by the router.
+- **Measures:** the classifier model call. A **sub-step of `router_ms`, not a sibling of it.**
+- **Stamp:** `classifierLatencyMs` in `intent-classifier.ts` -> carried on the dispatch as `classifierMs` -> `messages.classifier_ms`.
+- **`NULL` means no model was asked**, not that nothing was measured. The pre-LLM fast paths (exact greetings and acknowledgments) and orchestrator-dispatched rebuttals classify without a model call.
+- **Read it as cost plus frequency.** `AVG` is the cost when a model is asked; `classified_by_model_count` is how often that happens. Folding the fast paths in as zeroes would make the classifier look **cheaper** the more often it is skipped, rather than **rarer**.
+- **Why it matters:** it is the largest controllable step inside TTFF, and it runs before the placeholder. Whether to hold the placeholder for it is the main TTFF design question.
 
 ### Model / Tool - `model_ms` / `tool_ms` (dashboard cards: "Avg Model", "Avg Tool")
 - **Definition:** the Bedrock tool-loop time split into model inference vs in-loop tool execution.
@@ -52,10 +116,11 @@ Source of truth: the processor stamps deltas into the Amazon Chime SDK message M
 - **Why it matters:** **the number operators actually want** - the real answer wait an SLA or a UX complaint is about. The only metric that spans the whole user journey.
 
 ### Inbound - `inbound_ms` (dashboard card: "Inbound")
-- **Definition:** user message -> async processor entry (routing / queue / cold start). `inbound_ms = processor_entry - user_message_at`.
-- **Measures:** the front-of-turn hop that `total_ms` omits.
+- **Definition:** user message -> async processor entry. `inbound_ms = processor_entry - user_message_at`.
+- **Measures:** everything in front of the processor, as ONE figure: Amazon Chime SDK ingest, the channel flow, Lex, the whole router (classification included) and the dispatch, plus the processor's own cold start.
 - **Stamp:** the processor emits its entry `Date.now()` out-of-band; archival computes the delta on the exchange, clamped `>= 0`.
-- **Why it matters:** surfaces the routing / cold-start portion that was previously invisible. **The one metric that is not skew-free** - a server-clock entry vs an Amazon Chime SDK start, so it carries NTP skew and is approximate by design.
+- **It is a BOUND on the front of the turn, not a step in it.** Because the processor is dispatched at roughly the instant the placeholder is returned, `inbound_ms` tracks TTFF almost exactly rather than decomposing it. It cannot tell you which of the three hops to fix. Use `router_ms` and `classifier_ms` for that; what those two do not account for is the pre-router hop (Amazon Chime SDK ingest, the channel flow and Lex) plus the placeholder's trip back.
+- **The one metric that is not skew-free** - a server-clock entry against an Amazon Chime SDK start, so it carries NTP skew and is approximate by design. That is also why the pre-router hop is left as prose here rather than published as a column: a residual taken across a clock boundary is an estimate, not a measurement.
 
 ### Off this surface: client web-vitals
 The frontend emits web-vitals (TTFB, FCP, LCP, INP, CLS) via `/events` -> `client_events` (Firehose -> S3), the only **browser-perceived** timing. It lands in a different store than the `messages` latency query and is not joined to it (gap G5). See [`SPEC-FRONTEND-OBSERVABILITY.md`](../../specs/ops/SPEC-FRONTEND-OBSERVABILITY.md).
