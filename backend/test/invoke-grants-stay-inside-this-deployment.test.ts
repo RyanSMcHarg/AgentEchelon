@@ -3,9 +3,9 @@
  *
  * `battle-stack.ts` granted the alt-slot handler
  * `arn:aws:lambda:<region>:<account>:function:*AgentHandler*`. The LEADING wildcard is the whole
- * defect: it makes the grant account-wide, and this account hosts several products. It matched, live,
- * `YoujiTier-Premium-AgentHandler...`, `YoujiTier-Basic-AgentHandler...`,
- * `CommunicationHub-Dev-Agen-GuestAgentHandler...` and `...-AdminAgentHandler...`.
+ * defect: it makes the grant account-wide, and this account hosts several products. Measured live, it
+ * matched four handlers belonging to two unrelated deployments - their per-tier agent handlers and
+ * their guest and admin handlers - none of which this deployment has any business invoking.
  *
  * WHY THIS IS WORSE THAN AN ORDINARY OVER-GRANT. Our identity guard, `isSanctionedBattleBot`, runs
  * INSIDE our handler. Another product's handler never runs it, so nothing on the far side of that

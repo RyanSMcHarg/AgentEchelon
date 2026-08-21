@@ -509,7 +509,7 @@ if (!process.env.EVAL_LAMBDA_NAME) {
     // ANCHORED TO THIS INSTANCE'S STACK PREFIX, not a bare `contains('AnalyticsAuro')`.
     //
     // This account is shared with other projects, and CDK derives a function name from its stack -
-    // so the unanchored form matched `YoujiAnalyticsAurora-EvaluationLambda...` just as readily as
+    // so the unanchored form matched another project's `...AnalyticsAurora-EvaluationLambda...` just as readily as
     // ours. Measured in this account: with AgentEchelon's own stack mid-teardown, the unanchored
     // query returned ONLY the other project's Lambda. The `evaluate` phase INVOKES what this
     // resolves, so the failure would have been a validation run scoring another project's data -

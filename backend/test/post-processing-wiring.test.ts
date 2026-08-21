@@ -54,7 +54,7 @@ describe('PostProcessingStack', () => {
     // This consumer dispatches a turn; the archival consumer on the SAME stream does bulk writes and
     // wants the opposite setting. This shipped with archival's 5s window copied onto it, and it cost
     // 3.0-3.4s per repair on the live deployment - all of it the window, none of it Kinesis, which
-    // measures ~200-500ms for this shape in the sibling communication-hub.
+    // measures ~200-500ms for this shape in a comparable dispatch-off-stream deployment.
     //
     // Asserted as an ABSENT property rather than a value, because the failure mode is someone copying
     // the archival block again, and that is what this must catch.

@@ -189,8 +189,8 @@ export class BattleStack extends cdk.Stack {
     }));
     // SCOPED TO THIS DEPLOYMENT'S OWN HANDLERS, which is not the same as scoped to a plausible name.
     // This previously read `function:*AgentHandler*`, and the leading wildcard made it account-wide in
-    // an account that hosts several products: it matched Youji's and CommunicationHub's agent handlers
-    // as well as ours. That is worse than an ordinary over-grant, because our identity guard
+    // an account that hosts several products: it matched other deployments' agent handlers as well as
+    // this one's. That is worse than an ordinary over-grant, because our identity guard
     // (`isSanctionedBattleBot`) runs INSIDE our handler - another product's handler never runs it, so
     // nothing on the far side of the grant applied our sanction model, loop guard or budget.
     //

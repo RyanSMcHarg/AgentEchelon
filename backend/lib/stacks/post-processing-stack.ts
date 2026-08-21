@@ -169,10 +169,10 @@ export class PostProcessingStack extends cdk.Stack {
     //
     // This shipped with archival's settings copied onto it, and the cost was measured on the live
     // deployment before anyone noticed the cause: 3.0s and 3.4s from message to dispatch on two probes,
-    // essentially all of it the window. Kinesis itself is not slow - the sibling communication-hub
-    // measures ~200-500ms end to end for exactly this shape (its ADR-003 "thinking message" pattern
-    // triggers a whole Bedrock turn off this stream), and it distinguishes the two uses the same way:
-    // its dispatch consumer sets no window, its archival consumer sets 5s.
+    // essentially all of it the window. Kinesis itself is not slow - a comparable dispatch-off-stream
+    // deployment measures ~200-500ms end to end for exactly this shape, where the stream event
+    // triggers a whole model turn, and it distinguishes the two uses the same way: the dispatch
+    // consumer sets no window, the archival consumer sets 5s.
     //
     // `batchSize` is a CAP, not a delay: with no window, records are delivered as they arrive. Kept
     // small so one slow record cannot hold up the messages behind it.
