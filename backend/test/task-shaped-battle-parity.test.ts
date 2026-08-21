@@ -92,11 +92,24 @@ describe('a duel side keeps its state transitions', () => {
     expect(relabelledAt).toBeLessThan(quickReplyAt);
   });
 
-  it('the requester-keyed fallback stays off the short-message path', () => {
-    // It asks what this person has OPEN, not what is waiting on them, and costs a read per declared
-    // task type. A bare "thanks" absorbed by one of those is a message annexed by work it was not
-    // about, at the price of N reads on the cheapest turn there is.
-    expect(code).toContain('if (!activeTask && !shortAcknowledgment) {');
+  it('the per-type fallback stays off the short-message path AND off any turn with a channel', () => {
+    // TWO rules now, and they are there for different reasons.
+    //
+    // `!shortAcknowledgment` is the original: a bare "thanks" absorbed by an open chain is a message
+    // annexed by work it was not about, at the price of N reads on the cheapest turn there is.
+    //
+    // `!channelArn` is newer. This loop was written as the requester-keyed question - "what does this
+    // person have open at all" as against "what is waiting on them" - and the mirror's repartition by
+    // CURRENT OWNER collapsed that distinction: with a channel it reads the same partition the
+    // channel lookup above already scanned unbounded, so it could not name a row that read missed and
+    // cost up to two DynamoDB reads per declared machine on the commonest turn there is. It is
+    // SKIPPED rather than deleted because a channel-less turn makes no owner read at all, and there
+    // this is the only lookup the turn has.
+    //
+    // Asserted as a condition rather than as a line, so re-wrapping the source does not fail it while
+    // dropping either rule still does.
+    const cond = /if\s*\(\s*!activeTask\s*&&\s*!shortAcknowledgment\s*&&\s*!channelArn\s*\)\s*\{/;
+    expect(code).toMatch(cond);
   });
 
   it('an existing chain is continued BEFORE a new battle task is created', () => {
