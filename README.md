@@ -705,7 +705,7 @@ suite degrades gracefully on a stack that hasn't been provisioned.
 
 ### Test Coverage
 
-**165 e2e tests across 46 spec files**, mapped to the specifications they cover.
+**167 e2e tests across 46 spec files**, mapped to the specifications they cover.
 
 The authoritative, per-spec breakdown is **[docs/reference/e2e-coverage-matrix.md](docs/reference/e2e-coverage-matrix.md)**, which is GENERATED from the specs and the spec files - it reports which documents claim live behaviour and which e2e covers each. Read it there rather than here.
 
