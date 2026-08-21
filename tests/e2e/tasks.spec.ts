@@ -275,18 +275,37 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     // are how it delivers substance at that length; what separates them from an outline's stubs is
     // LENGTH, because "Executive Headline | Q2 ARR result vs. target, one-line narrative" is 60
     // characters and a real finding runs to twice that.
+    // AND A TABLE ROW IS A CONTENT BLOCK, which excluding it made this assertion get a good report
+    // wrong. Measured on two live 3.2-3.5k reports that carry an executive summary, a populated
+    // six-row comparison table, pros/cons for both options and a recommendation: they scored 2 and 1,
+    // because their substance sits in the TABLE and in tight bullets. Excluding tables did not detect
+    // outlines, it penalised the format a comparison brief is supposed to use - so the better the
+    // report was written, the likelier it failed.
+    //
+    // What separates a real row from an outline's row is the same thing that separates a real bullet
+    // from a stub: whether the cells ARGUE or merely NAME. So the first cell is dropped (it is the
+    // dimension label - "CI build time") and the remaining cells must carry real content between
+    // them. A separator row has none, and an outline's table - "| Section | TBD |" - has almost none.
+    const lines = report.split('\n').map((l) => l.trim());
     const blocks = report.split(/\n\s*\n/).map((p) => p.trim());
     const proseParagraphs = blocks
       .filter((p) => !/^#{1,6}\s/.test(p))          // not a heading
       .filter((p) => !/^\s*([-*]|\d+\.)\s/.test(p)) // not a bullet or numbered stub
       .filter((p) => !p.startsWith('|'))            // not a table
       .filter((p) => p.length >= 180);
-    const substantiveBullets = report
-      .split('\n')
-      .map((l) => l.trim())
+    const substantiveBullets = lines
       .filter((l) => /^([-*]|\d+\.)\s/.test(l))
       .filter((l) => l.length >= 140);
-    const contentBlocks = proseParagraphs.length + substantiveBullets.length;
+    const substantiveTableRows = lines
+      .filter((l) => l.startsWith('|') && l.endsWith('|'))
+      .filter((l) => !/^\|[\s:|-]+\|$/.test(l))     // not the header separator
+      .filter((l) => {
+        const cells = l.split('|').slice(1, -1).map((c) => c.trim());
+        // Drop the row label; what is left is what the row actually claims.
+        const claimed = cells.slice(1).join(' ').replace(/\*\*/g, '').trim();
+        return cells.length >= 2 && claimed.length >= 120;
+      });
+    const contentBlocks = proseParagraphs.length + substantiveBullets.length + substantiveTableRows.length;
     // Printed so the floor above stays tied to what the product actually delivers rather than to an
     // estimate. The ask here is a CONCISE report and the assistant offers considerably longer ones, so
     // a run that only just clears the floor is worth seeing before anyone raises it.
@@ -299,15 +318,17 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     // SPEC-TASK-STATE-TRANSITIONS section 4.
     console.log(
       `--- delivered report: ${report.length} chars, ${proseParagraphs.length} prose paragraph(s) + `
-        + `${substantiveBullets.length} substantive bullet(s) = ${contentBlocks} content block(s) `
-        + '(floor 1200 chars / 3 blocks) ---',
+        + `${substantiveBullets.length} substantive bullet(s) + ${substantiveTableRows.length} populated `
+        + `table row(s) = ${contentBlocks} content block(s) (floor 1200 chars / 3 blocks) ---`,
     );
     expect(
       contentBlocks,
       'the report must contain ANALYSIS, not a section list: at least three content-bearing blocks - a '
-        + `prose paragraph over 180 chars, or a bullet over 140. Found ${proseParagraphs.length} `
-        + `paragraph(s) + ${substantiveBullets.length} bullet(s). An outline delivered as the report is `
-        + 'the defect this asserts against, and it passes every structural check above.',
+        + 'prose paragraph over 180 chars, a bullet over 140, or a table row whose cells (after the '
+        + `label) carry over 120. Found ${proseParagraphs.length} paragraph(s) + `
+        + `${substantiveBullets.length} bullet(s) + ${substantiveTableRows.length} table row(s). An `
+        + 'outline delivered as the report is the defect this asserts against, and it passes every '
+        + 'structural check above.',
     ).toBeGreaterThanOrEqual(3);
 
     // AND THE TASK IS CLOSED. Nothing in this suite asserted this, which is why it was reported from
