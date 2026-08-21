@@ -1235,7 +1235,11 @@ async function getDriftEvents(
        -- source NULL but can be outcome = 'abandoned', so without this filter a window covering
        -- them returns unresolved_count > total_events and a client-side rate over 100%.
        COUNT(*) FILTER (WHERE source = 'live' AND outcome = 'abandoned') AS unresolved_count,
-       ROUND(AVG(cosine_distance)::numeric, 4) AS avg_drift_score,
+       -- FILTERED TO live, like every count beside it. Unfiltered, this averaged over archival rows
+       -- (processDriftDetection writes source='archival' in Aurora mode) and pre-migration-016 rows
+       -- as well, so the console showed a small live total_events next to a mean drawn from hundreds
+       -- of other events - the mismatched-population reading the filters above exist to prevent.
+       ROUND(AVG(cosine_distance) FILTER (WHERE source = 'live')::numeric, 4) AS avg_drift_score,
        COUNT(*) FILTER (WHERE source = 'live' AND outcome = 'accepted') AS accepted_count,
        COUNT(*) FILTER (WHERE source = 'live' AND outcome IS NULL) AS pending_count,
        COUNT(*) FILTER (WHERE source = 'live' AND evaluated_at IS NOT NULL) AS evaluated_count,
