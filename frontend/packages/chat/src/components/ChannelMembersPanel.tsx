@@ -168,7 +168,12 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
     setBattleError(null);
     try {
       await disableBattle(activeConversation.conversationArn);
-      const off = { channelArn: activeConversation.conversationArn, enabled: false };
+      // ELIGIBILITY IS PRESERVED, not re-derived. `showBattleSection` gates on
+      // `battleConfig?.battleEligible === true`, so dropping the flag here made the whole Battle Mode
+      // section vanish the instant a moderator turned it off - and with the control gone there was no
+      // way back short of a full reload. Eligibility is a property of the channel, not of whether the
+      // feature is currently switched on, so turning it off cannot change it.
+      const off = { ...battleConfig, channelArn: activeConversation.conversationArn, enabled: false };
       setBattleConfig(off);
       // Symmetric: turning battle OFF must retract the briefing, not leave a stale banner behind.
       onBattleConfigChange?.(off);
