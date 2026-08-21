@@ -3134,6 +3134,23 @@ async function getExperimentPicks(
   const sinceMs = Date.now() - days * 24 * 60 * 60 * 1000;
 
   const picks = selectBattlePicks(await scanBattleOutcomeItems(experimentId), sinceMs, variantId);
+
+  // WHICH TWO IDS THIS EXPERIMENT ACTUALLY USES, counted once over the whole result rather than the
+  // page: a rollup that changed when someone paged would not be a rollup.
+  const winsByVariant: Record<string, number> = {};
+  for (const p of picks) {
+    const v = (p.variantId ?? '').trim();
+    if (v) winsByVariant[v] = (winsByVariant[v] || 0) + 1;
+  }
+  const observed = Object.keys(winsByVariant);
+  // The conventional names win when present; otherwise the observed pair stands in, control first so
+  // a two-variant experiment is reported consistently rather than by whichever pick landed first.
+  const sorted = [...observed].sort();
+  const controlId = observed.includes('control') ? 'control' : sorted.find((v) => v !== 'treatment') ?? '';
+  const treatmentId = observed.includes('treatment')
+    ? 'treatment'
+    : sorted.find((v) => v !== controlId) ?? '';
+
   const page = picks.slice(offset, offset + limit);
   const channelByBattle = await resolveBattleChannels(
     experimentId,
@@ -3160,8 +3177,22 @@ async function getExperimentPicks(
     stats: {
       total: picks.length,
       picks: picks.length,
-      treatment_wins: picks.filter((p) => p.variantId === 'treatment').length,
-      control_wins: picks.filter((p) => p.variantId === 'control').length,
+      // RESOLVED FROM THE PICKS, not hardcoded. These two counts read the literal ids 'treatment'
+      // and 'control', so an experiment whose variants are named anything else reported 0 and 0 -
+      // the human axis of the decision loop, silently empty, on exactly the experiments a custom
+      // name implies someone was paying attention to. Variant ids are caller-supplied
+      // (`admin-experiments.ts:323` builds its map from whatever was submitted), so custom names are
+      // reachable rather than hypothetical.
+      //
+      // The two names still WIN when present, which keeps every existing experiment reading
+      // identically; the fallback only decides the naming for a pair that used neither. Same shape as
+      // `decideVerdict`'s control/treatment resolution, so the two cannot disagree about which side
+      // is which.
+      treatment_wins: picks.filter((p) => p.variantId === treatmentId).length,
+      control_wins: picks.filter((p) => p.variantId === controlId).length,
+      // The full breakdown, so a three-way comparison is not silently flattened into two buckets.
+      // Appended, so the two counts above stay the contract the console already reads.
+      wins_by_variant: winsByVariant,
       // How many of the shown picks cannot be traced to a conversation. Stated rather than hidden:
       // a missing link is a gap in the evidence, and an operator reconciling should see its size.
       unresolved_conversations: page.filter((p) => !channelByBattle.get((p.battleId ?? '').trim())).length,
