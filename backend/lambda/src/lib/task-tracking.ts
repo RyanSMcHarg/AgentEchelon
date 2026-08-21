@@ -1299,23 +1299,37 @@ async function cancelOneTask(
  * conversation or cancels somebody else's task. Returns what it cancelled, so the reply can name it
  * rather than claiming something vague happened.
  */
-export async function cancelActiveTasksInChannel(channelArn: string): Promise<ConversationTask[]> {
-  if (!TASKS_TABLE || !channelArn) return [];
+export async function cancelActiveTasksInChannel(
+  channelArn: string,
+  requesterSub: string,
+): Promise<ConversationTask[]> {
+  if (!TASKS_TABLE || !channelArn || !requesterSub) return [];
   const cancelled: ConversationTask[] = [];
   try {
-    // BY CHANNEL, NOT BY OWNER, and the first version got this wrong in a way that mattered.
+    // SCOPED TO WHO STARTED THE WORK, which is neither of the two things the first attempts used.
     //
-    // It looked up the tasks the PERSON owned - and by the time somebody needs to stop the work, they
-    // do not own it. Their answer handed the task to the assistant (`applyUserResponseToTask` ->
-    // `reassignTask`), which is the whole reason the runtime knows a turn is owed. So an owner-scoped
-    // stop found nothing, cancelled nothing, and told the person there was nothing in progress - while
-    // the task it could not see went on holding the conversation.
+    // NOT by current OWNER: by the time somebody needs to stop, they do not own it. Their answer handed
+    // the task to the assistant (`applyUserResponseToTask` -> `reassignTask`), which is the very
+    // mechanism that lets the runtime know a turn is owed. An owner-scoped stop found nothing and told
+    // the person there was nothing in progress, while the task it could not see held the conversation.
     //
-    // The stop is about the CONVERSATION: it ends the work happening here, whoever is holding it.
+    // NOT by CHANNEL either: a conversation can carry work several people asked for, and stopping
+    // "everything here" would cancel somebody else's report because a different person typed `/stop`.
+    //
+    // The requester is stable for the life of the task - ownership moves between the person and the
+    // assistant at every step boundary, and the person who ASKED does not change. That is the one who
+    // gets to call it off.
+    //
+    // Read per task rather than from the listing, which projects a shape without the requester on it.
+    // The count is bounded (a conversation with more than a handful of open tasks is already a problem
+    // this cannot fix) and being right about whose work is being cancelled is worth the reads.
     const open = await getOpenTasksForConversation(channelArn, { limit: 25 });
-    for (const task of open) {
-      await cancelOneTask(task);
-      cancelled.push(task);
+    for (const summary of open) {
+      const full = await getTask(summary.taskId, channelArn);
+      const startedBy = full?.userArn?.split('/user/').pop() || '';
+      if (!full || startedBy !== requesterSub) continue;
+      await cancelOneTask(full);
+      cancelled.push(summary);
     }
   } catch (err) {
     console.error('[task-tracking] cancelActiveTasksInChannel failed:', err);
