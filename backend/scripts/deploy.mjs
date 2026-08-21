@@ -32,8 +32,11 @@ import { readFileSync, existsSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
 import { CloudFormationClient, DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
-// Compiled from lib/config/deploy-context.ts (npm run build runs first, step 0).
-import { compareDeployContext, describeDeployContextGap } from '../lib/config/deploy-context.js';
+// deploy-context is COMPILED OUTPUT, and `backend/.gitignore` starts with `*.js`, so it does not
+// exist on a fresh clone until step 0 builds it. A static import here resolved at MODULE LOAD -
+// before main() could run that build - so `npm run deploy` died with ERR_MODULE_NOT_FOUND for every
+// new contributor, on the one command the README tells them to run first. It is imported
+// dynamically now, from inside main(), after the build has produced it.
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const BACKEND_DIR = path.resolve(__dirname, '..');
@@ -124,15 +127,35 @@ function configFlags() {
 
 // `--no-deploy-config` is ours, not cdk's: strip it before forwarding or cdk rejects it.
 const cliArgs = process.argv.slice(2).filter((a) => a !== NO_CONFIG_FLAG && a !== PARTIAL_CONFIG_FLAG);
-const forwarded = [...configFlags(), ...cliArgs]; // persisted config, then CLI (CLI wins)
-const userSetAppUrl = forwarded.some((a, i) => a === '--context' && /^appUrl=/.test(forwarded[i + 1] || ''));
-// Whether this instance provisions the standalone admin console. Read from the SAME
-// forwarded context the CDK app gates the stack on, so the publish step and the stack
-// can never disagree. Accepts the string form (`--context enableAdminApp=true`) since
-// that is how context arrives on the command line.
-const adminAppEnabled = forwarded.some(
-  (a, i) => a === '--context' && /^enableAdminApp=(true|1)$/i.test(forwarded[i + 1] || ''),
-);
+// Resolved in main(), AFTER the build, for the same reason the import moved. Module-level `const`
+// would re-introduce the load-time dependency the dynamic import exists to remove.
+let forwarded = [...cliArgs];
+let userSetAppUrl = false;
+let adminAppEnabled = false;
+
+/**
+ * Resolve the forwarded context. Called from main() AFTER the build, because `configFlags()` reaches
+ * `deploy-context.js`, which the build is what produces.
+ */
+async function resolveForwardedContext() {
+  ({ compareDeployContext, describeDeployContextGap } = await import('../lib/config/deploy-context.js'));
+  forwarded = [...configFlags(), ...cliArgs]; // persisted config, then CLI (CLI wins)
+  userSetAppUrl = forwarded.some((a, i) => a === '--context' && /^appUrl=/.test(forwarded[i + 1] || ''));
+  adminAppEnabled = forwarded.some(
+    (a, i) => a === '--context' && /^enableAdminApp=(true|1)$/i.test(forwarded[i + 1] || ''),
+  );
+}
+
+/**
+ * Bound by {@link resolveForwardedContext}. Declared here, assigned there, because the module they
+ * come from is build output that does not exist until step 0 has run.
+ *
+ * `adminAppEnabled` is read from the SAME forwarded context the CDK app gates the stack on, so the
+ * publish step and the stack can never disagree; `userSetAppUrl` records that the caller supplied
+ * their own origin, which skips the CloudFront lookup.
+ */
+let compareDeployContext;
+let describeDeployContextGap;
 
 function run(cmd, args, label) {
   console.log(`\n▶ ${label}\n  ${cmd} ${args.join(' ')}`);
@@ -202,6 +225,10 @@ async function main() {
   //    it bundles STALE `.js` and edited `.ts` silently doesn't ship (a clean
   //    exit-0 deploy that changes nothing). Build up front so assets = source.
   run('npm', ['run', 'build'], '0/4 Compile Lambda TS → JS (avoid stale-.js bundling)');
+
+  // ONLY NOW can the deploy-context helper be loaded: it is build output. Everything below reads
+  // `forwarded`, so this has to precede all of it.
+  await resolveForwardedContext();
 
   // Refuse to `--all`-deploy anything outside this instance (shared-account safety).
   assertOnlyOurStacks();
