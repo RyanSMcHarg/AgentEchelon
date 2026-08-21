@@ -35,7 +35,9 @@ import { signIn, createConversation, sendAndWaitForResponse, looksLikeTaskPlaceh
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { assertNoDuplicateTasks, openAndValidateAttachment } from './helpers/task-validation';
-import { resolveTaskTable, readUserTasks, readTask, jwtSub } from './helpers/task-backend';
+import {
+  resolveTaskTable, readUserTasks, readTask, jwtSub, REPORT_GENERATION, type TaskRow,
+} from './helpers/task-backend';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
@@ -326,20 +328,43 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     //
     // Correlated to THIS test's task, and captured while the person still holds it: the per-user mirror
     // is partitioned by the current OWNER, and ownership moves to the assistant at the first answer.
-    let closed = false;
-    for (let i = 0; i < 20 && !closed; i++) {
-      const row = readTask(reportAgentTable!, reportRef!.taskId, reportRef!.channelArn) as
-        Record<string, unknown> | undefined;
-      closed = String(row?.status) === 'completed';
-      if (!closed) await page.waitForTimeout(5000);
+    // THE MECHANISM, NOT THE OUTCOME. `status === 'completed'` alone is the weaker claim, and it is
+    // satisfied by the defect this suite already caught once: a turn that set the lifecycle complete
+    // while the machine was still mid-flow, asking for requirements. The invariant is that a
+    // machine-backed task is completed BECAUSE its machine reached a terminal state
+    // (SPEC-TASK-STATE-TRANSITIONS) - so both halves are asserted, and terminality is read from the
+    // machine rather than hardcoded, so a deployment that renames its ending is still checked.
+    let row: TaskRow | undefined;
+    for (let i = 0; i < 20; i++) {
+      row = readTask(reportAgentTable!, reportRef!.taskId, reportRef!.channelArn);
+      if (String(row?.status) === 'completed') break;
+      await page.waitForTimeout(5000);
     }
 
+    const landedIn = String(row?.taskState ?? '(none)');
+    const terminalKind = REPORT_GENERATION.states[landedIn]?.terminal;
+
     expect(
-      closed,
-      'a delivered report must CLOSE its task. The document arrived, so the work is done - a task left '
-        + 'open behind a finished deliverable shows the person an "in progress" item they can do '
-        + 'nothing about, and leaves the chain resumable when there is nothing left to resume.',
-    ).toBe(true);
+      terminalKind,
+      `a delivered report must leave its machine in a TERMINAL state. It is in "${landedIn}", which the `
+        + 'report machine does not declare as an ending - so whatever the lifecycle status says, the '
+        + 'work item is still somewhere in the graph.',
+    ).toBeTruthy();
+
+    expect(
+      String(row?.status),
+      'and the lifecycle must AGREE with the machine. A terminal state with an open status is the two '
+        + 'halves disagreeing, which is what leaves a person an "in progress" item they can do nothing '
+        + 'about behind a report they already have.',
+    ).toBe('completed');
+
+    // The delivery is what closed it, and the task records having made one. Without this the two
+    // assertions above are also satisfied by a task that was cancelled or failed its way to an ending.
+    expect(
+      (row?.deliveries ?? []).length,
+      'the closure must follow a DELIVERY. A task that reached an ending without handing anything over '
+        + 'is a different event, and this test is about the report arriving.',
+    ).toBeGreaterThan(0);
   });
 
   // ONE THREAD PER PIECE OF WORK (SPEC-TASK-STATE-TRANSITIONS §13). A message that arrives while the
