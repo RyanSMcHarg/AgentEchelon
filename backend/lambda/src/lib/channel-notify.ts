@@ -42,6 +42,15 @@ export interface NotifyOptions {
 export interface NotifyTarget {
   sub: string;
   iss?: string;
+  /**
+   * The issuer-side subject, for a federated member.
+   *
+   * `sub` is the AppInstanceUser id read off the membership ARN, which for a federated member is
+   * `deriveFederatedSub(iss, rawSub)` - a one-way SHA-256. The issuer pool has never heard of it, so
+   * an AdminGetUser keyed on it fails for EVERY federated recipient and the notification silently
+   * reaches nobody outside the primary pool. The raw subject is what that pool can actually answer.
+   */
+  rawSub?: string;
 }
 
 /** A notify directive parsed off a channel message's Metadata. */
@@ -151,16 +160,27 @@ async function readMemberIds(
   bearerArn: string,
 ): Promise<string[]> {
   try {
-    const r = await chime.send(new ListChannelMembershipsCommand({
-      ChannelArn: channelArn,
-      ChimeBearer: bearerArn,
-      MaxResults: 50,
-    }));
-    return (r.ChannelMemberships || [])
-      .map((m) => m.Member?.Arn || '')
-      .filter((arn) => arn && !arn.includes('/bot/'))
-      .map((arn) => arn.split('/user/').pop() || '')
-      .filter(Boolean);
+    // PAGINATED. One 50-member page silently dropped everyone past it, and because this read is the
+    // AUTHORITY for who gets notified, the omission was invisible downstream: the recipients simply
+    // did not exist as far as the rest of the function was concerned. A conversation of 60 people
+    // notified 50 of them and reported success.
+    const ids: string[] = [];
+    let nextToken: string | undefined;
+    do {
+      const r = await chime.send(new ListChannelMembershipsCommand({
+        ChannelArn: channelArn,
+        ChimeBearer: bearerArn,
+        MaxResults: 50,
+        ...(nextToken ? { NextToken: nextToken } : {}),
+      }));
+      ids.push(...(r.ChannelMemberships || [])
+        .map((m) => m.Member?.Arn || '')
+        .filter((arn) => arn && !arn.includes('/bot/'))
+        .map((arn) => arn.split('/user/').pop() || '')
+        .filter(Boolean));
+      nextToken = r.NextToken;
+    } while (nextToken);
+    return ids;
   } catch (err) {
     console.warn('[channel-notify] failed to list memberships:', err);
     return [];
@@ -180,14 +200,17 @@ async function readMemberIds(
  * real member at the wrong pool, where `resolvePoolForTarget` rejects an untrusted issuer and
  * `AdminGetUser` simply fails to resolve - that member is skipped, not misdelivered.
  */
-async function readIssuerHints(channelArn: string): Promise<Map<string, string>> {
-  const hints = new Map<string, string>();
+async function readIssuerHints(channelArn: string): Promise<Map<string, { iss: string; rawSub: string }>> {
+  const hints = new Map<string, { iss: string; rawSub: string }>();
   const ctx = await getChannelContext(channelArn);
   for (const p of ctx?.memberIdentities || []) {
     if (!p || typeof p.sub !== 'string' || !p.sub || typeof p.iss !== 'string' || !p.iss) continue;
     // Keyed by the id membership reports: a roster entry carries the RAW (iss, sub), and the member id
     // it corresponds to is the derived one.
-    hints.set(deriveFederatedSub(p.iss, p.sub), p.iss);
+    // The RAW sub is kept alongside the issuer - the sibling roster read in host-grounding.ts does
+    // the same, and for the same reason: the derived id identifies the member, the raw one is the
+    // only thing the issuer pool can be queried with.
+    hints.set(deriveFederatedSub(p.iss, p.sub), { iss: p.iss, rawSub: p.sub });
   }
   return hints;
 }
@@ -220,7 +243,11 @@ async function resolveContact(
     return { email: null, name: 'Member' };
   }
   try {
-    const u = await cognito.send(new AdminGetUserCommand({ UserPoolId: poolId, Username: target.sub }));
+    // The RAW subject when this is a federated member, because the derived id is a hash the issuer
+    // pool cannot resolve. Falls back to `sub` for a native user, where the two are the same thing.
+    const u = await cognito.send(new AdminGetUserCommand({
+      UserPoolId: poolId, Username: target.rawSub || target.sub,
+    }));
     const attr = (u.UserAttributes || []).reduce<Record<string, string>>((a, x) => {
       if (x.Name && x.Value !== undefined) a[x.Name] = x.Value;
       return a;
@@ -289,13 +316,13 @@ export async function fanOutChannelNotification(args: {
     // deployment never needs an issuer hint.
     const hints = memberIds.some(isFederatedSub)
       ? await readIssuerHints(channelArn)
-      : new Map<string, string>();
+      : new Map<string, { iss: string; rawSub: string }>();
     const seen = new Set<string>();
     targets = memberIds
       .filter((id) => !seen.has(id) && seen.add(id))
       .map((id) => {
-        const iss = hints.get(id);
-        return iss ? { sub: id, iss } : { sub: id };
+        const hint = hints.get(id);
+        return hint ? { sub: id, iss: hint.iss, rawSub: hint.rawSub } : { sub: id };
       })
       // A federated member with no issuer hint cannot be resolved to a contact — `sub` is a one-way
       // hash, so querying the default pool would find nothing (or, worse, a same-named native user).
