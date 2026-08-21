@@ -6,12 +6,24 @@
  * report - and answered by starting the work again, while the finished document sat in the conversation
  * above it and the work item stayed open.
  *
- * CONTEXT, NOT A TRIGGER. Completion keeps its single path: the model calls `advance_task_state` and the
- * machine reaches terminal (invariant AT6, owner 2026-08-18 - "do not reintroduce a walker that
- * completes a task the model did not complete"). What was missing was never the authority to close a
- * task, it was knowing there was anything to close.
+ * THE DELIVERY RECORD IS CONTEXT. It exists so the assistant can see what it handed over, and it
+ * triggers nothing on its own.
+ *
+ * CLOSING THE TASK IS SEPARATE, and it took three tries to land on the right shape. Completion was the
+ * model's alone (owner 2026-08-18 - "do not reintroduce a walker that completes a task the model did not
+ * complete"), which was a rule about a walker gated on OUTPUT SHAPE that closed a task while its reply
+ * was still asking for approval. Then the owner stated what completion MEANS: "if the report is
+ * delivered it is complete, unless the user objects with additional changes required."
+ *
+ * Telling the model that was tried first and is still in the prompt, because a model that closes its own
+ * task is the better outcome. Measured after deploying it: every recent report still `in_progress`,
+ * several sitting in `generating` - delivered and never advanced. So the runtime takes the edge, under
+ * conditions narrow enough that the case the old walker broke cannot arise: the machine's own `delivers`
+ * declaration, never the output's shape; nothing that awaits a person; one declared edge, only when the
+ * machine names exactly one way to finish.
  */
-import { buildTaskContextForPrompt } from '../../lambda/src/lib/task-tracking';
+import { buildTaskContextForPrompt, terminalStateAfterDelivery } from '../../lambda/src/lib/task-tracking';
+import { DEFAULT_TASK_STATE_MACHINES } from '../../lambda/src/lib/task-state-machines';
 import type { Task } from '../../lambda/src/lib/task-tracking';
 import { DeliveryOption } from '../../lambda/src/lib/delivery-options';
 
@@ -109,5 +121,57 @@ describe('a delivering step is told that delivering COMPLETES the task', () => {
     // would invite it to close work it has not started.
     const prompt = buildTaskContextForPrompt({ ...base, taskState: 'collecting_requirements' });
     expect(prompt).not.toMatch(/DELIVERING IT COMPLETES IT/);
+  });
+});
+
+describe('the runtime closes a delivering step once it has actually delivered', () => {
+  it('closes a generated report, which is the default path its own machine documents', () => {
+    // The owner's rule: a delivered report is complete unless the person asks for changes. Telling the
+    // model that is deployed and did not achieve it - every recent report sat `in_progress` in
+    // `generating`, delivered and never advanced - so the fact does the work.
+    expect(terminalStateAfterDelivery('report_generation', 'generating')).toBe('completed');
+  });
+
+  it('closes a revised report too: applying the change and re-delivering ends the work', () => {
+    expect(terminalStateAfterDelivery('report_generation', 'revising')).toBe('completed');
+  });
+
+  it('REFUSES a step that awaits the person, however much it delivered', () => {
+    // The case the removed walker got wrong, and the reason that ban stands. `validating` delivers a
+    // draft AND expects an answer about it; closing it would throw away the review it just asked for.
+    const validating = DEFAULT_TASK_STATE_MACHINES.data_extraction?.states?.validating;
+    expect(validating?.delivers).toBe(true);
+    expect(validating?.awaits).toBeTruthy();
+    expect(terminalStateAfterDelivery('data_extraction', 'validating')).toBeUndefined();
+  });
+
+  it('refuses a delivering step with no terminal successor', () => {
+    // `extracting` delivers and what follows is more work. Neither successor is an ending.
+    expect(terminalStateAfterDelivery('data_extraction', 'extracting')).toBeUndefined();
+  });
+
+  it('refuses a step that does not deliver at all', () => {
+    expect(terminalStateAfterDelivery('report_generation', 'collecting_requirements')).toBeUndefined();
+  });
+
+  it('refuses to choose when a machine names more than one way to finish', () => {
+    // Two terminal successors is a CHOICE, and a choice is not the runtime's to make. Pinned with a
+    // synthetic machine so the rule holds for a deployment that declares one.
+    const machines = {
+      forked: {
+        initial: 'producing',
+        states: {
+          producing: { transitions: ['accepted', 'rejected'], delivers: true },
+          accepted: { transitions: [], terminal: 'success' as const },
+          rejected: { transitions: [], terminal: 'failure' as const },
+        },
+      },
+    } as unknown as typeof DEFAULT_TASK_STATE_MACHINES;
+    expect(terminalStateAfterDelivery('forked', 'producing', machines)).toBeUndefined();
+  });
+
+  it('says nothing about a type or state it does not know, so an unknown task is left alone', () => {
+    expect(terminalStateAfterDelivery('a_type_nobody_declared', 'generating')).toBeUndefined();
+    expect(terminalStateAfterDelivery('report_generation', 'a_state_nobody_declared')).toBeUndefined();
   });
 });

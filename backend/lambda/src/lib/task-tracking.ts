@@ -1620,6 +1620,41 @@ export async function advanceTaskState(
  * The caller supplies the already-fetched `task` (the processor holds it), so this performs check 1
  * ("an active task exists") on the passed object and checks 2-3 against the graph.
  */
+/**
+ * The state a DELIVERING step lands in once it has actually delivered - or `undefined` when the step is
+ * not one that finishes on delivery.
+ *
+ * WHY THE RUNTIME AND NOT THE MODEL. Completion was the model's alone, on the rule that the runtime
+ * never force-advances (the `advanceDeliveredTaskToCompletion` walker was removed for closing a task
+ * from `drafting_outline` while the reply was still asking for approval). That rule stands for what it
+ * was protecting against. This is not that walker:
+ *
+ *   - it is gated on the MACHINE'S OWN DECLARATION (`delivers`), never on what the output looked like,
+ *     which is the property the removed one was judged on;
+ *   - it refuses any state that AWAITS somebody, so the `drafting_outline` case it broke cannot arise;
+ *   - it takes ONE declared edge, never a walk, and only when the machine names exactly one terminal
+ *     successor - two ways to finish is a choice, and a choice is not the runtime's to make.
+ *
+ * And it is what the owner's rule requires: "if the report is delivered it is complete, unless the user
+ * objects with additional changes required". Telling the MODEL that was tried first and is deployed; a
+ * scan of the task table afterwards found every recent report still `in_progress`, several sitting in
+ * `generating` - delivered and never advanced. The instruction was necessary and not sufficient, so the
+ * fact does the work instead. A person who wants changes asks for them, and asking is what reopens it.
+ */
+export function terminalStateAfterDelivery(
+  taskType: string | undefined,
+  machineState: string | undefined,
+  machines: Record<string, TaskStateMachine> = DEFAULT_TASK_STATE_MACHINES,
+): string | undefined {
+  if (!taskType || !machineState) return undefined;
+  const machine = machines[taskType];
+  const state = machine?.states?.[machineState];
+  if (!state?.delivers) return undefined;
+  if (awaitedPartyOf(state)) return undefined;
+  const terminals = (state.transitions ?? []).filter((next) => machine?.states?.[next]?.terminal);
+  return terminals.length === 1 ? terminals[0] : undefined;
+}
+
 export async function advanceTaskStateTo(args: {
   task: Task;
   toState: string;

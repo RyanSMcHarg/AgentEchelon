@@ -403,7 +403,31 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
         + 'be answered, or declined, but never re-run',
     ).toHaveCount(1);
 
-    // `/stop` is what makes declining safe, so it has to actually end the work.
+    // `/stop` IS EXERCISED ON WORK THAT IS STILL OPEN, in a conversation of its own.
+    //
+    // It cannot be tested on the report above any more, and that is the point of the change alongside
+    // it: a delivered report is COMPLETE, so by now there is nothing left to stop. Stopping a finished
+    // task would assert the opposite of the rule this suite exists to protect.
+    //
+    // So: a second conversation, stopped mid-collection, which is when a person actually reaches for it.
+    await createConversation(page, `Stop mid-flight ${Date.now()}`, 'Premium');
+    const stopStart = Date.now() - 60_000;
+    await sendAndWaitForResponse(
+      page,
+      'Compile a report on our Q2 ARR performance for the leadership team.',
+      180_000,
+    );
+    let stopRef: { taskId: string; channelArn: string } | undefined;
+    for (let i = 0; i < 12 && !stopRef; i++) {
+      const open = (userTable ? readUserTasks(userTable, sub) : [])
+        .filter((t) => String(t.taskType) === 'report_generation')
+        .filter((t) => new Date(String(t.createdAt ?? 0)).getTime() >= stopStart)
+        .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))[0];
+      if (open) stopRef = { taskId: String(open.taskId), channelArn: String(open.channelArn) };
+      else await page.waitForTimeout(5000);
+    }
+    expect(stopRef, 'a second report task must be open before /stop has anything to end').toBeTruthy();
+
     await sendAndWaitForResponse(page, '/stop', 120_000);
 
     // READ THE TASK ROW, NOT THE ANALYTICS PROJECTION. The first version polled `task_details`, which
@@ -420,7 +444,7 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
 
     let cancelledRow: Record<string, unknown> | undefined;
     for (let i = 0; i < 12 && !cancelledRow; i++) {
-      const row = readTask(agentTable!, taskRef!.taskId, taskRef!.channelArn) as Record<string, unknown> | undefined;
+      const row = readTask(agentTable!, stopRef!.taskId, stopRef!.channelArn) as Record<string, unknown> | undefined;
       if (String(row?.status) === 'cancelled') cancelledRow = row;
       else await page.waitForTimeout(5000);
     }

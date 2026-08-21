@@ -98,6 +98,8 @@ import {
   getOpenTasksForConversation,
   updateTaskStatus,
   recordTaskDelivery,
+  terminalStateAfterDelivery,
+  advanceTaskStateTo,
   type Task,
 } from './lib/task-tracking.js';
 import { resolveModelForIntent } from './lib/model-resolver.js';
@@ -1674,6 +1676,45 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
               at: new Date().toISOString(),
               fromState: taskContext?.task.taskState,
             });
+
+            // AND THE DELIVERY CLOSES IT (owner: "if the report is delivered it is complete unless the
+            // user objects with additional changes required").
+            //
+            // This is the point the delivery is a FACT rather than an intention - the document exists
+            // and is attached. Telling the model to advance here was tried first and is still in the
+            // prompt, because a model that closes its own task is the better outcome; it did not
+            // happen. Every recent report sat `in_progress` in `generating`, delivered and never
+            // advanced. The instruction stays and the fact is now enough on its own.
+            //
+            // `terminalStateAfterDelivery` is why this is not the walker that was removed: it reads the
+            // machine's declaration, refuses anything that awaits a person, and takes a single declared
+            // edge only when the machine names one way to finish. A change request reopens the task by
+            // the ordinary route - the person asks, and the model advances to revising.
+            const closesOnDelivery = terminalStateAfterDelivery(
+              event.taskType ?? taskContext?.task.taskType,
+              taskContext?.task.taskState,
+              taskStateMachines(),
+            );
+            if (taskContext?.task && closesOnDelivery) {
+              const advanced = await advanceTaskStateTo({
+                task: taskContext.task,
+                toState: closesOnDelivery,
+                by: 'system',
+                reason: 'the delivering step delivered its deliverable',
+                machines: taskStateMachines(),
+                assistantId: principalIdFromArn(event.botArn),
+              }).catch((err: unknown) => {
+                console.warn('[AssistantAsyncProcessor] closing a delivered task threw (non-fatal):', err);
+                return { ok: false as const, error: 'threw' };
+              });
+              console.log('[AssistantAsyncProcessor] delivered step close', {
+                taskId: event.taskId,
+                to: closesOnDelivery,
+                ok: advanced.ok,
+                ...(advanced.ok ? {} : { error: (advanced as { error?: string }).error }),
+              });
+              if (advanced.ok) taskContext.task.taskState = closesOnDelivery;
+            }
           }
         } catch (docError) {
           console.error('[AssistantAsyncProcessor] Document generation failed:', docError);
