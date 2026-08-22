@@ -53,7 +53,7 @@ export const METRIC_TARGETS: Record<string, MetricTarget> = {
   avg_total_ms: {
     label: 'Avg worker-compute latency', direction: 'lower', target: 10000, warn: 30000, format: fmtMs,
     description:
-      'Mean async-processor compute for the turn, from processor entry to the answer being posted (history load + tool loop + guardrail + post). NOT the user wall-clock wait: it excludes the inbound hop (router + classifier + invoke), cold start, and delivery, so it is always less than E2E — see E2E for the full wait. Agentic tool loops make multiple model calls, so multi-second values are normal.',
+      'Mean async-processor compute for the turn, from processor entry to the answer content being ready (history load + tool loop + guardrail). NOT the user wall-clock wait: it excludes the inbound hop (router + classifier + invoke), cold start, posting the answer, and delivery, so it is always less than E2E — see E2E for the full wait. Agentic tool loops make multiple model calls, so multi-second values are normal.',
   },
   // The true user-perceived wait (user message -> final answer). Includes the inbound hop + cold start
   // that total omits. Nielsen 10s attention limit (good), ~30s abandon (warn). docs/LATENCY-TARGETS.md.
@@ -134,6 +134,79 @@ export const METRIC_TARGETS: Record<string, MetricTarget> = {
     description: 'Share of sign-in attempts that succeeded. A low value can indicate credential or auth-flow friction.',
   },
 };
+
+/**
+ * PER-TIER LATENCY BANDS (G10, docs/guides/developer/LATENCY-TARGETS.md).
+ *
+ * THE GAP. Latency was targeted globally, so a premium turn - larger model, retrieval, a longer tool
+ * loop - was held to the same band as a basic turn that runs one small model call and no tools. One
+ * band cannot be right for both: set for premium it is so loose that a basic regression is invisible
+ * inside it, and set for basic it marks healthy premium traffic as failing. Either way the colour on
+ * the card stops carrying information, which is worse than having no band at all.
+ *
+ * WHAT MAY VARY BY TIER, AND WHAT MAY NOT. This is the whole design decision, so it is stated rather
+ * than implied:
+ *
+ *   COMPUTE metrics (worker compute, its P95, the model loop) are ENGINEERING BUDGETS. What a turn
+ *   ought to cost genuinely depends on what it was asked to do, so these vary by tier.
+ *
+ *   PERCEIVED metrics (TTFF, E2E) are UX LIMITS and are deliberately NOT overridden. A person waiting
+ *   for a reply does not know or care which model answered them, and the Nielsen thresholds describe
+ *   the person, not the system. Giving premium a slower "good" TTFF would not be a tuned target, it
+ *   would be a worse experience relabelled as an acceptable one.
+ *
+ * THE CEILING IS INVARIANT. No override may exceed the Nielsen ~30s abandon threshold, whatever the
+ * tier: past it a person leaves, and a band that says otherwise is describing a system nobody is
+ * still waiting for. Tiering therefore only ever TIGHTENS expectations for cheaper work; it never
+ * buys a slower one permission to be slow. Pinned by metric-targets-tier-bands.test.ts.
+ */
+export type LatencyTier = 'basic' | 'standard' | 'premium';
+
+/** The Nielsen abandon threshold. No tier band may sit beyond it - see the note above. */
+export const ABANDON_CEILING_MS = 30000;
+
+type Band = Pick<MetricTarget, 'target' | 'warn'>;
+
+export const TIER_TARGET_OVERRIDES: Record<string, Partial<Record<LatencyTier, Band>>> = {
+  // A basic turn is a classification plus one small model call with no tool loop, so seconds of
+  // compute is already an anomaly rather than a busy turn. Premium buys a bigger model AND retrieval,
+  // and both are on the critical path.
+  avg_total_ms: {
+    basic: { target: 4000, warn: 10000 },
+    standard: { target: 10000, warn: 20000 },
+    premium: { target: 15000, warn: ABANDON_CEILING_MS },
+  },
+  // The tail widens with the loop: a premium turn has more places to be slow (more iterations, a
+  // retrieval that can miss cache), so its P95 sits further from its mean by construction.
+  p95_total_ms: {
+    basic: { target: 8000, warn: 15000 },
+    standard: { target: 15000, warn: ABANDON_CEILING_MS },
+    premium: { target: 22000, warn: ABANDON_CEILING_MS },
+  },
+  // The model loop alone. Tracks the same shape as compute, since on most turns it IS most of it.
+  avg_bedrock_ms: {
+    basic: { target: 2500, warn: 6000 },
+    standard: { target: 6000, warn: 12000 },
+    premium: { target: 10000, warn: 20000 },
+  },
+};
+
+/**
+ * The target for a metric, narrowed to one tier when the view is scoped to one.
+ *
+ * Returns the GLOBAL target when no tier is given, when the tier has no override, or when the tier is
+ * unrecognised - so a new tier, or the 'unknown' bucket the latency query emits for legacy rows, is
+ * held to the published standard rather than to nothing. Falling back to no target would quietly drop
+ * the band off the card, which reads as "this metric has no expectation" instead of "this tier has no
+ * tuning yet".
+ */
+export function targetFor(key: string, tier?: string | null): MetricTarget | undefined {
+  const base = METRIC_TARGETS[key];
+  if (!base) return undefined;
+  const band = tier ? TIER_TARGET_OVERRIDES[key]?.[tier as LatencyTier] : undefined;
+  if (!band) return base;
+  return { ...base, ...band, label: `${base.label} (${tier})` };
+}
 
 export function evaluateTarget(value: number, t: MetricTarget): TargetStatus {
   if (t.direction === 'lower') {

@@ -9,7 +9,7 @@ import {
 import { useAwsClient } from './AwsClientProvider';
 import { useAuth } from '@ae/shared';
 import { chimeService } from '../services/chimeService';
-import { markResponseReceived } from '../services/messageLatencyTracker';
+import { markResponseReceived, markPlaceholderShown } from '../services/messageLatencyTracker';
 import { trackEvent } from '@ae/shared';
 import {
   parseMessageContent,
@@ -339,6 +339,13 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
               if (msg) {
                 if (msg.isBot && !isAsyncPlaceholder(payload.Content as string | undefined)) {
                   trackBotResponse(true);
+                } else if (msg.isBot) {
+                  // The placeholder, which is where the person's wait VISIBLY ends even though the
+                  // answer has not arrived (G5). Measured here and not folded into the round trip:
+                  // this is time-to-acknowledgment, the primary perceived-latency SLO under
+                  // placeholder-then-update delivery, and the server's own TTFF has no way to see the
+                  // WebSocket hop and the render that this includes.
+                  markPlaceholderShown(channelArn);
                 }
                 callbacks.onMessageCreate?.(channelArn, msg);
               }

@@ -57,7 +57,13 @@ vi.mock('../services/chimeService', () => ({
   },
 }));
 
-vi.mock('../services/messageLatencyTracker', () => ({ markResponseReceived: vi.fn() }));
+// EVERY export the provider imports. A partial mock leaves the missing name `undefined`, and the
+// call site is a plain call in the WebSocket switch - so an omission here does not fail as "mock
+// missing", it throws a TypeError inside message processing and takes the delivery path with it.
+vi.mock('../services/messageLatencyTracker', () => ({
+  markResponseReceived: vi.fn(),
+  markPlaceholderShown: vi.fn(),
+}));
 
 import { MessagingProvider } from './MessagingProvider';
 

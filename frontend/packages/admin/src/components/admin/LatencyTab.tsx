@@ -4,7 +4,7 @@ import MetricCard from './MetricCard';
 import DistributionBar from './DistributionBar';
 import Sparkline from './Sparkline';
 import LineChart from './LineChart';
-import { METRIC_TARGETS } from './metricTargets';
+import { METRIC_TARGETS, targetFor } from './metricTargets';
 import { InfoTooltip, DocLink } from './AdminHelp';
 import { DOC_LINKS } from '../../config/docLinks';
 import TurnLatencyAudit from './TurnLatencyAudit';
@@ -62,6 +62,10 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
   // selection. Task turns show PER-TURN reply latency, not whole-task cycle time (a separate metric on
   // the Tasks / Effectiveness surface). Single-reply targets are shown only when no task type is selected.
   const [typeFilter, setTypeFilter] = React.useState<Set<string> | null>(null);
+  // Tier scope (G10). null = every tier, which is the honest default: the headline should describe
+  // all the traffic unless an operator narrows it. Narrowing to exactly ONE tier is what unlocks the
+  // per-tier bands, because a band is only meaningful over a population that shares a budget.
+  const [tierFilter, setTierFilter] = React.useState<string | null>(null);
 
   if (isLoading) {
     return (
@@ -100,7 +104,20 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
   });
   const anyTaskSelected = [...activeTypes].some(isTaskType);
   const scopeIsSingle = !anyTaskSelected; // single-reply targets apply only when no task type is selected
-  const scopeMatch = (r: Record<string, unknown>) => activeTypes.has(String(r.delivery_option || 'unknown'));
+  // The tiers present in this window, so the control offers what the data actually has rather than a
+  // hardcoded three that may not all be deployed.
+  const tiers = [...new Set(rows.map((r) => String(r.agent_type || 'unknown')))].sort();
+  const scopeMatch = (r: Record<string, unknown>) =>
+    activeTypes.has(String(r.delivery_option || 'unknown'))
+    && (tierFilter === null || String(r.agent_type || 'unknown') === tierFilter);
+  // The tier the per-tier bands apply to. A band describes ONE budget, so it is offered only when the
+  // view is narrowed to one tier - across a mixed population it would judge premium turns by a basic
+  // expectation or the reverse, which is the defect G10 names.
+  const bandTier = tierFilter;
+  // Resolved once and shared by the cards and the trend chart's reference lines. `targetFor` falls
+  // back to the published band for an untuned tier, so these are always defined for a registered key.
+  const avgTarget = targetFor('avg_total_ms', bandTier) ?? METRIC_TARGETS.avg_total_ms;
+  const p95Target = targetFor('p95_total_ms', bandTier) ?? METRIC_TARGETS.p95_total_ms;
   const withLatency = rows.filter((r) => r.avg_total_ms != null && Number(r.avg_total_ms) > 0 && scopeMatch(r));
   // Rows for the breakdown table: respect the response-type filter (so the table matches the headline
   // scope the copy claims), but keep rows even when a latency field is absent so the raw daily groups
@@ -171,6 +188,22 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
   const pollFallbacks = sumCount('poll_fallback_count');
   const classifiedByModel = sumCount('classified_by_model_count');
   const pollFallbackPct = totalExchanges > 0 ? (pollFallbacks / totalExchanges) * 100 : 0;
+  // ── G9: WHAT THE PERCENTILE IS A PERCENTILE OF, AND WHY THE TAIL MAY BE HIGH ──
+  // A P95 over a handful of turns is one of the turns, not a tail statistic, and it renders exactly
+  // like a P95 over five hundred. The count is what stops a first-run deployment reading its own
+  // noise as a performance characteristic.
+  const p95Samples = sumCount('p95_total_sample_count');
+  // Under this many turns the percentile is an observation rather than a statistic. 20 is the point
+  // where the 95th percentile stops being "the single slowest turn" - it is a rule of thumb and it is
+  // labelled as one on the card, not presented as a threshold with authority behind it.
+  const P95_STABLE_MIN = 20;
+  const p95IsNoisy = p95Samples > 0 && p95Samples < P95_STABLE_MIN;
+  const coldStarts = sumCount('cold_start_count');
+  const coldStartPct = totalExchanges > 0 ? (coldStarts / totalExchanges) * 100 : 0;
+  // TTFF over warm turns only. The comparison is the point: if this sits close to the headline, cold
+  // start was NOT the explanation and the divergence is a real finding.
+  const avgTtffWarm = favg('avg_ttff_warm_ms');
+  const coldStartCostMs = avgTtffWarm > 0 && avgTtff > 0 ? avgTtff - avgTtffWarm : 0;
 
   // Round the upper-bound to nice numbers for the distribution rail.
   const distMax = p95Total > 0 ? Math.ceil((p95Total * 1.15) / 500) * 500 : 6000;
@@ -196,6 +229,27 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
 
   // ---------- Page-load percentiles ----------
   const pageLoadRows = pageLoadData?.data ?? [];
+  // ── G5: THE SAME WAIT, MEASURED FROM THE OTHER END ──
+  //
+  // The server brackets TTFF between two Chime message timestamps. The browser brackets it between
+  // the person's click and the bubble appearing. Neither is wrong and they are not the same span:
+  // the difference is the WebSocket hop and the render, which no server-side metric can see. Until
+  // both were on one surface, a slow perceived reply had two candidate explanations and no way to
+  // choose - so the DELTA is the number this pair exists to produce.
+  const clientMetric = (metric: string): number => {
+    const row = pageLoadRows.find((r) => String(r.metric) === metric);
+    return row ? Number(row.avg_ms) || 0 : 0;
+  };
+  const clientMetricSamples = (metric: string): number => {
+    const row = pageLoadRows.find((r) => String(r.metric) === metric);
+    return row ? Number(row.sample_count) || 0 : 0;
+  };
+  const clientTtff = clientMetric('client_ttff_ms');
+  const clientTtffSamples = clientMetricSamples('client_ttff_ms');
+  // Positive = the browser waited longer than the server thinks it made them, which is delivery and
+  // render. NEGATIVE is a finding, not a glitch: the two clocks disagree, or the server is measuring
+  // from a message the client never sent - so it is shown rather than clamped.
+  const deliveryGapMs = clientTtff > 0 && avgTtff > 0 ? clientTtff - avgTtff : 0;
 
   // ---------- Connection health ----------
   const connRows = connectionHealthData?.data ?? [];
@@ -275,6 +329,45 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
         </div>
       )}
 
+      {tiers.length > 1 && (
+        <div
+          role="group"
+          aria-label="Tier filter"
+          style={{ display: 'flex', gap: '8px', margin: 'var(--space-2, 8px) 0', alignItems: 'center', flexWrap: 'wrap' }}
+        >
+          <span style={{ color: 'var(--text-secondary, #666)', fontSize: '0.85em' }}>Tier:</span>
+          {[null, ...tiers].map((t) => {
+            const on = tierFilter === t;
+            return (
+              <button
+                key={t ?? '__all'}
+                type="button"
+                aria-pressed={on}
+                onClick={() => setTierFilter(t)}
+                style={{
+                  padding: '3px 10px',
+                  borderRadius: 'var(--radius-sm, 6px)',
+                  border: '1px solid var(--border, #ccc)',
+                  cursor: 'pointer',
+                  fontSize: '0.85em',
+                  fontWeight: on ? 600 : 400,
+                  background: on ? 'var(--accent, #2563eb)' : 'transparent',
+                  color: on ? 'var(--accent-contrast, #fff)' : 'var(--text-primary, inherit)',
+                }}
+              >
+                {t === null ? 'All tiers' : humanizeType(t)}
+              </button>
+            );
+          })}
+          <span style={{ color: 'var(--text-secondary, #666)', fontSize: '0.8em' }}>
+            {bandTier
+              ? `compute targets are the ${bandTier} band`
+              : 'compute targets are the published band; pick one tier for its own budget'}
+            <InfoTooltip label="About tier bands" content="A basic turn is one small model call with no tool loop; a premium turn runs a larger model plus retrieval. Holding both to one compute band means it is either too loose to catch a basic regression or too tight for healthy premium traffic, so the compute cards (Worker compute, its P95, the model loop) take a per-tier band when the view is narrowed to one tier. TTFF and E2E deliberately do NOT: those measure the person waiting, who neither knows nor cares which model answered, so the Nielsen limits apply to every tier. No tier band ever exceeds the ~30s abandon threshold." />
+          </span>
+        </div>
+      )}
+
       {avgTotal > 0 && (
         <div className="admin-tab-banner" style={{ alignItems: 'stretch', flexDirection: 'column' }}>
           <div className="admin-tab-banner-label" style={{ marginBottom: 'var(--space-1)' }}>
@@ -299,7 +392,7 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
           title="TTFF"
           value={ttffCaptured ? formatMs(avgTtff) : 'n/a'}
           subtitle={ttffCaptured ? 'time to placeholder' : 'no paired exchanges yet'}
-          target={scopeIsSingle ? METRIC_TARGETS.ttff_ms : undefined}
+          target={scopeIsSingle ? targetFor('ttff_ms', bandTier) : undefined}
           rawValue={ttffCaptured ? avgTtff : undefined}
           tooltip="Time to first feedback: the wait from the user sending the message — the client shows a typing indicator — to the assistant's 'One moment…' placeholder appearing. With no token streaming, this acknowledgment latency is the perceived wait, distinct from the completed answer."
         />
@@ -307,11 +400,11 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
           title="E2E"
           value={e2eCaptured ? formatMs(avgE2e) : 'n/a'}
           subtitle={e2eCaptured ? 'user → final answer' : 'no completed answers yet'}
-          target={scopeIsSingle ? METRIC_TARGETS.avg_e2e_ms : undefined}
+          target={scopeIsSingle ? targetFor('avg_e2e_ms', bandTier) : undefined}
           rawValue={e2eCaptured ? avgE2e : undefined}
           tooltip="End-to-end: the full wait from the user's message to the FINAL answer replacing the placeholder (agent_final_at − user_message_at, on the Chime clock, so skew-free). The real user-perceived latency — it includes the inbound hop and cold start that Worker compute (async-processor only) omits."
         />
-        <MetricCard title="Worker compute" value={formatMs(avgTotal)} target={scopeIsSingle ? METRIC_TARGETS.avg_total_ms : undefined} rawValue={avgTotal} tooltip="The async processor's server compute for the turn, from processor entry to the answer content being ready (history load + tool loop + guardrail). NOT the user's wall-clock wait: it excludes the inbound hop (router + classifier + invoke), cold start, posting the answer, and browser delivery, so it is always less than E2E — see E2E for the full wait." />
+        <MetricCard title="Worker compute" value={formatMs(avgTotal)} target={scopeIsSingle ? targetFor('avg_total_ms', bandTier) : undefined} rawValue={avgTotal} tooltip="The async processor's server compute for the turn, from processor entry to the answer content being ready (history load + tool loop + guardrail). NOT the user's wall-clock wait: it excludes the inbound hop (router + classifier + invoke), cold start, posting the answer, and browser delivery, so it is always less than E2E — see E2E for the full wait." />
         <MetricCard title="Avg Model" value={formatMs(avgModel)} rawValue={avgModel} tooltip="Model-inference time: the sum of the Converse (Bedrock) call durations in the tool loop — the pure model-inference share of the turn, distinct from tool execution (see Avg Tool). Shown without a target: the published bands cover the whole model loop (model + tool), not model inference alone." />
         <MetricCard title="Avg Tool" value={avgTool > 0 ? formatMs(avgTool) : 'n/a'} rawValue={avgTool > 0 ? avgTool : undefined} tooltip="In-loop tool-execution time (RAG / S3 company-context reads) — the non-inference share of the model loop. A RAG-heavy turn shows here, not as slow model inference." />
         <MetricCard title="Inbound" value={avgInbound > 0 ? formatMs(avgInbound) : 'n/a'} rawValue={avgInbound > 0 ? avgInbound : undefined} tooltip="Everything in front of the worker, as ONE figure: Amazon Chime SDK ingest, the channel flow, Lex, the whole router (classification included) and the invoke, plus the worker's cold start. A BOUND on the front of the turn, not a step in it — the worker is dispatched at roughly the instant the placeholder is returned, so this tracks TTFF almost exactly rather than dividing it, and it OVERLAPS the Router and Classifier cards entirely (do not add them together). Use Router and Classifier to see which part to fix; what they do not cover is the pre-router hop (ingest, channel flow, Lex) and the placeholder's trip back. Cross-clock and approximate (Chime send-time vs server entry-time), clamped to ≥ 0 — the only card here that is not skew-free." />
@@ -356,8 +449,41 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
           rawValue={avgTail !== 0 ? avgTail : undefined}
           tooltip="What is left of Worker compute after Admission, Placeholder lookup and Bedrock: loading the conversation history (a billed Chime read), assembling the prompt, and long-response handling. NOT the message update — Worker compute is stamped before the answer is posted, so posting it is outside this number and outside Worker compute entirely. Derived from the total rather than stamped, so the arithmetic is checkable. A NEGATIVE value is a real finding, not a display glitch — it means compute was attributed to the wrong turn, so it is deliberately not clamped to zero."
         />
-        <MetricCard title="P95 worker compute" value={formatMs(p95Total)} target={scopeIsSingle ? METRIC_TARGETS.p95_total_ms : undefined} rawValue={p95Total} tooltip="95th-percentile async-processor compute latency, traffic-weighted across groups. Follows the response-type filter above: by default multi-step tasks are excluded; add them back and each task TURN counts individually (per-turn compute), never the whole multi-turn task cycle (that lives on Tasks / Effectiveness). A per-group tail summary — not the exact global p95 — so it's a stable headline rather than the single worst group." />
+        <MetricCard
+          title="P95 worker compute"
+          value={formatMs(p95Total)}
+          target={scopeIsSingle ? targetFor('p95_total_ms', bandTier) : undefined}
+          rawValue={p95Total}
+          // THE DENOMINATOR, ON THE CARD (G9). Not a footnote: the number's meaning changes with it.
+          subtitle={p95Samples > 0
+            ? (p95IsNoisy ? `over ${p95Samples} turns - too few to be a tail` : `over ${p95Samples} turns`)
+            : undefined}
+          tooltip="95th-percentile async-processor compute latency, traffic-weighted across groups. Follows the response-type filter above: by default multi-step tasks are excluded; add them back and each task TURN counts individually (per-turn compute), never the whole multi-turn task cycle (that lives on Tasks / Effectiveness). A per-group tail summary — not the exact global p95 — so it's a stable headline rather than the single worst group. THE SAMPLE COUNT IS PART OF THE READING: under roughly 20 turns the 95th percentile is close to the single slowest turn, so it moves by seconds when one turn does. It renders identically at any sample size, which is why the count is stated rather than left to be inferred."
+        />
+        <MetricCard
+          title="Cold starts"
+          value={coldStarts > 0 ? `${coldStartPct.toFixed(coldStartPct < 10 ? 1 : 0)}%` : (totalExchanges > 0 ? '0%' : 'n/a')}
+          rawValue={coldStarts > 0 ? coldStartPct : undefined}
+          subtitle={coldStarts > 0
+            ? (coldStartCostMs > 0
+              ? `${coldStarts} of ${totalExchanges} · +${formatMs(coldStartCostMs)} on TTFF`
+              : `${coldStarts} of ${totalExchanges} turns`)
+            : (totalExchanges > 0 ? 'every turn hit a warm container' : undefined)}
+          tooltip="Share of turns that ran on a container which had to initialise first. THIS IS THE SANCTIONED REASON TTFF AND WORKER COMPUTE DISAGREE: init happens before handler entry, so Worker compute structurally cannot contain it, while TTFF — measured from the user's message on the Chime clock — necessarily does. Recorded by the worker itself (a flag true only on a container's first invocation), not inferred from the gap it explains, so a real regression cannot be waved away as a cold start. The subtitle quantifies it: the difference between the headline TTFF and TTFF over warm turns only. If that is small, cold start was NOT the story. A high share on a QUIET window explains a slow TTFF; a high share on a BUSY one means containers are being created as fast as they are used, which is a concurrency finding with a different fix (see Performance Optimization)."
+        />
+        <MetricCard
+          title="TTFF (browser)"
+          value={clientTtff > 0 ? formatMs(clientTtff) : 'n/a'}
+          rawValue={clientTtff > 0 ? clientTtff : undefined}
+          subtitle={clientTtff > 0
+            ? (deliveryGapMs !== 0
+              ? `${deliveryGapMs > 0 ? '+' : ''}${formatMs(deliveryGapMs)} vs server · ${clientTtffSamples} samples`
+              : `${clientTtffSamples} samples`)
+            : 'no client timings yet'}
+          tooltip="The SAME wait as the TTFF card, measured from the other end: from the person clicking send to the placeholder bubble actually rendering in their browser. The server brackets TTFF between two Chime message timestamps and cannot see the WebSocket hop or the React render; the browser can see nothing before its own click. So the DELTA in the subtitle is the delivery-and-render cost — the part of the perceived wait neither side could attribute on its own, and the reason a 'slow reply' complaint used to have two candidate explanations and no way to choose. A NEGATIVE delta is a finding rather than a display bug: it means the two clocks disagree, so it is shown rather than clamped. Aggregate comparison only — a per-message join by correlation id is still open (G5)."
+        />
       </div>
+
 
       {latencyTrendDates.length >= 2 && (
         <div className="admin-section">
@@ -379,9 +505,11 @@ const LatencyTab: React.FC<LatencyTabProps> = ({
               { label: 'P95 worker', points: p95Series, color: 'var(--accent-500)' },
               { label: 'Avg worker', points: avgSeries, color: 'var(--status-good)' },
             ]}
+            // The SAME resolver the cards use, so a tier-scoped view cannot show a card judged against
+            // one band and a chart drawn against another - two answers to one question on one screen.
             referenceLines={[
-              { value: METRIC_TARGETS.p95_total_ms.target, label: `P95 target ${formatMs(METRIC_TARGETS.p95_total_ms.target)}`, color: 'var(--status-bad)' },
-              { value: METRIC_TARGETS.avg_total_ms.target, label: `Avg target ${formatMs(METRIC_TARGETS.avg_total_ms.target)}`, color: 'var(--status-warn)' },
+              { value: p95Target.target, label: `P95 target ${formatMs(p95Target.target)}`, color: 'var(--status-bad)' },
+              { value: avgTarget.target, label: `Avg target ${formatMs(avgTarget.target)}`, color: 'var(--status-warn)' },
             ]}
           />
           <div className="admin-latency-legend">
