@@ -32,6 +32,7 @@ import {
 } from '../../lambda/src/lib/context-source-outcomes';
 import { recordNoTransitionTurn, TASK_STALL_TURNS, type Task } from '../../lambda/src/lib/task-tracking';
 import { recordWelcomeConfigDefect } from '../../lambda/src/lib/welcome-metrics';
+import { emitArchivalHealth } from '../../lambda/src/analytics-aurora/archival-health';
 import { repairTaskAnswer } from '../../lambda/src/lib/task-answer-repair';
 import { DeliveryOption } from '../../lambda/src/lib/delivery-options';
 
@@ -201,6 +202,18 @@ const CALLERS: Array<{ module: string; label: string; emit: () => Promise<EmfDoc
     emit: async () => capture(() => emitDriftTiming('comparison', 7, 'corr-1', {
       userClearance: 'basic', intent: 'general',
     })),
+  },
+  {
+    module: 'lambda/src/analytics-aurora/archival-health.ts',
+    label: 'emitArchivalHealth (a clean batch)',
+    emit: async () => capture(() => emitArchivalHealth({ archived: 120, errors: 0 })),
+  },
+  {
+    module: 'lambda/src/analytics-aurora/archival-health.ts',
+    // The case the alarm exists for. Published with its denominator, because "12 errors" is a
+    // catastrophe on a batch of 20 and noise on a batch of 10,000.
+    label: 'emitArchivalHealth (records dropped)',
+    emit: async () => capture(() => emitArchivalHealth({ archived: 108, errors: 12 })),
   },
   {
     module: 'lambda/src/lib/context-source-outcomes.ts',

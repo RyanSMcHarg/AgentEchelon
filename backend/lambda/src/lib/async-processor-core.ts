@@ -2641,6 +2641,15 @@ export async function finalizePlaceholderResponse(params: {
   pollMs?: number;
   conversationHistoryLength: number;
   startTime: number;
+  /**
+   * This container initialised on this turn (G9, LATENCY-TARGETS.md).
+   *
+   * The ONE reason TTFF and worker compute are allowed to disagree: the init runs before handler
+   * entry, so `total_ms` cannot contain it and `ttff_ms` - measured from the user's message on the
+   * Chime clock - necessarily does. Recorded rather than inferred, so a slow TTFF beside a fast
+   * worker number is a fact about the container instead of an argument about one.
+   */
+  coldStart?: boolean;
   activeTaskInfo?: { type: string; status: string; label: string; taskId: string };
   /** SPEC-TASK-STATE-TRANSITIONS: the active-task context, so finalize can stamp taskState +
    *  the net transition applied this turn onto the analytics. Absent on non-task turns. */
@@ -3122,6 +3131,9 @@ export async function finalizePlaceholderResponse(params: {
       ...(params.steps?.length ? { steps: params.steps } : {}),
       ...(params.modelMs !== undefined ? { modelMs: params.modelMs } : {}),
       ...(params.toolMs !== undefined ? { toolMs: params.toolMs } : {}),
+      // Only when TRUE (G9). A cold start is the rare event; writing `false` on every warm turn would
+      // put a byte on every record to say nothing happened, and archival reads absence as warm.
+      ...(params.coldStart ? { coldStart: true } : {}),
       processorEntryMs: startTime,
     },
   });

@@ -70,7 +70,9 @@ CREATE TABLE IF NOT EXISTS messages (
     classifier_ms INTEGER,
     -- Admission: the dedup claim and the task-status write, before any lookup begins. Separated so
     -- the processor leg reconciles: total_ms less guard_ms, placeholder_resolve_ms and latency_ms is
-    -- the finalize/update tail, and a residual that will not close is a measurement bug.
+    -- the tail - the history load, prompt assembly and long-response handling - and a residual that
+    -- will not close is a measurement bug. NOT the update or the archival write: both happen after
+    -- total_ms is stamped, so neither can be inside a residual derived from it.
     guard_ms INTEGER,
     -- What LOCATING the placeholder cost: the correlation-mapping read, plus the fallback scan when
     -- one was needed. Timed from the start of resolution, NOT from processor entry - the dedup claim
@@ -83,6 +85,12 @@ CREATE TABLE IF NOT EXISTS messages (
     -- placeholder-id handoff failed to supply a target, and AVG(poll_ms) is what a scan costs when it
     -- happens, because AVG skips nulls.
     poll_ms INTEGER,
+    -- This turn ran on a container that had to initialise first. The ONE sanctioned reason ttff and
+    -- total_ms disagree: init runs BEFORE handler entry, so total_ms cannot contain it while ttff -
+    -- measured from the user's message on the Chime clock - necessarily does. Recorded so that
+    -- divergence is a fact about the container rather than prose in a doc. FALSE-by-absence: only a
+    -- cold turn writes it, so a NULL is warm.
+    cold_start BOOLEAN,
     persistence VARCHAR(32) DEFAULT 'PERSISTENT',
     task_id VARCHAR(64),
     task_status VARCHAR(32),

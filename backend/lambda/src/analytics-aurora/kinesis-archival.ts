@@ -31,6 +31,7 @@ import { updateConversationContext } from './cross-conversation-context.js';
 import { readMessageAnalytics } from '../lib/message-analytics.js';
 import { backfillModelFromAnalytics, ModelBackfillResult } from './model-backfill.js';
 import { touchActivity } from '../lib/sleep-mode.js';
+import { emitArchivalHealth } from './archival-health.js';
 
 const MAX_AUTH_RETRIES = 2;
 
@@ -139,6 +140,8 @@ interface MessageRecord {
   placeholder_resolve_ms: number | null;
   /** The fallback SCAN only, NULL when none ran - so a COUNT of it is the fallback rate. */
   poll_ms: number | null;
+  /** This turn initialised its container (G9). NULL means warm; only a cold turn declares itself. */
+  cold_start: boolean | null;
   /** Latency split (LATENCY-TARGETS.md), from the out-of-band analytics record: model_ms = Converse
    *  inference time, tool_ms = in-loop tool execution. Folded onto messages.model_ms / tool_ms. */
   model_ms: number | null;
@@ -325,6 +328,22 @@ export async function handler(
       console.log(
         `Successfully archived ${records.length} records, ${errors.length} errors`
       );
+      // ── THE ARCHIVAL DROP RATE (G8, LATENCY-TARGETS.md) ──
+      //
+      // Every latency number on the console is computed over rows that REACHED this table, so a
+      // dropped record does not make a metric wrong - it makes it silently narrower. That is the
+      // worse failure: an average over 90% of the traffic reads exactly like an average over all of
+      // it, and nothing on the dashboard moves. The count has existed in this log line all along and
+      // could only be read by a human grepping CloudWatch after already suspecting a problem.
+      //
+      // Emitted as a metric so it can carry an ALARM, which is the only form of monitoring that
+      // works for a failure nobody goes looking for. Both series are published deliberately:
+      // Archived is the denominator, without which "12 errors" is unreadable.
+      //
+      // Through a NAMED emitter in its own module, not an inline envelope here: CloudWatch rejects a
+      // malformed EMF document silently, and the schema guard can only exercise an emitter a test can
+      // call. `emitArchivalHealth` swallows its own failures - measurement must not cost the archive.
+      emitArchivalHealth({ archived: records.length, errors: errors.length });
       return;
     } catch (error: any) {
       lastError = error;
@@ -607,6 +626,10 @@ export async function transformToMessageRecord(
     // Same guard, for the opposite reason: a scan that returned immediately still HAPPENED, and the
     // count of this column is the fallback rate. || null would erase that turn from the rate.
     poll_ms: typeof analytics.pollMs === 'number' ? analytics.pollMs : null,
+    // TRUE or NULL, never FALSE (G9). The producer writes the key only on a cold turn, so a warm turn
+    // is an ABSENCE - and `=== true` keeps it that way rather than coercing some other truthy value
+    // into a claim about a container this record cannot see.
+    cold_start: analytics.coldStart === true ? true : null,
     model_ms: typeof analytics.modelMs === 'number' ? analytics.modelMs : null,
     tool_ms: typeof analytics.toolMs === 'number' ? analytics.toolMs : null,
     processor_entry_ms: typeof analytics.processorEntryMs === 'number' ? analytics.processorEntryMs : null,
@@ -668,6 +691,7 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
     'guard_ms',
     'placeholder_resolve_ms',
     'poll_ms',
+    'cold_start',
     'persistence',
     'task_id',
     'task_status',
@@ -701,6 +725,7 @@ async function insertMessageRecords(records: MessageRecord[]): Promise<number> {
     guard_ms: r.guard_ms,
     placeholder_resolve_ms: r.placeholder_resolve_ms,
     poll_ms: r.poll_ms,
+    cold_start: r.cold_start,
     persistence: r.persistence,
     task_id: r.task_id,
     task_status: r.task_status,
@@ -1071,7 +1096,11 @@ export async function backfillFromUpdateEvents(
                 placeholder_resolve_ms = COALESCE($18, placeholder_resolve_ms),
                 guard_ms               = COALESCE($19, guard_ms),
                 classifier_ms          = COALESCE($20, classifier_ms),
-                router_ms              = COALESCE($21, router_ms)
+                router_ms              = COALESCE($21, router_ms),
+                -- $22 (G9). COALESCE like the rest, which is also what keeps FALSE-by-absence intact:
+                -- a warm turn folds NULL and leaves whatever the row already had, so a cold turn's
+                -- TRUE can never be erased by a later update of the same message.
+                cold_start             = COALESCE($22, cold_start)
           WHERE message_id = $12
             AND channel_arn = $13
             AND event_type = 'CREATE_CHANNEL_MESSAGE'`,
@@ -1103,6 +1132,8 @@ export async function backfillFromUpdateEvents(
           upd.classifier_ms,
           // $21. Appended last, same reason as $18-$20.
           upd.router_ms,
+          // $22. Appended last, same reason as $18-$21.
+          upd.cold_start,
         ]
       );
 

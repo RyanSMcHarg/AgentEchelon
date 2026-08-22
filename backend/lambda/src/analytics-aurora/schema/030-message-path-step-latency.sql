@@ -42,7 +42,9 @@ COMMENT ON COLUMN messages.classifier_ms IS
 COMMENT ON COLUMN messages.guard_ms IS
     'Admission, in ms: the duplicate-delivery claim plus the task-status write (the latter only on '
     'task turns, which is why those read higher). Named so the worker leg reconciles - total_ms less '
-    'guard_ms, placeholder_resolve_ms and latency_ms is the finalize/update/archival tail.';
+    'guard_ms, placeholder_resolve_ms and latency_ms is the tail: the conversation-history load, '
+    'prompt assembly and long-response handling. NOT the message update or the archival write, which '
+    'both happen after total_ms is stamped and so cannot be inside a residual derived from it.';
 
 COMMENT ON COLUMN messages.placeholder_resolve_ms IS
     'Cost of locating the placeholder to answer on, in ms: the correlation-mapping read plus the '

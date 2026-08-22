@@ -1574,9 +1574,14 @@ async function getTurnLatencyAudit(
   }
   const limit = Math.min(parseInt(params.limit || '50', 10), 200);
   const result = await query(
-    `SELECT turn_id, response_id, channel_arn, turn_id_source, trigger_kind, battle_round, responder,
+    // `anchor_source` (031) travels with the numbers it explains. A row whose ttff/e2e are NULL is
+    // either a turn nothing anchored or a genuinely system-triggered response, and those are different
+    // findings - without this column the reader cannot tell them apart and reads a measurement gap as
+    // a latency one.
+    `SELECT turn_id, response_id, channel_arn, turn_id_source, anchor_source, trigger_kind,
+            battle_round, responder,
             t0_user_at, t2_placeholder_at, t3_final_at,
-            ttff_ms, e2e_ms, answer_ms, unattributed_ms, overhead_ms,
+            ttff_ms, ack_ms, ack_source, e2e_ms, answer_ms, unattributed_ms, overhead_ms,
             status, progress_update_count, task_id
        FROM v_turn_latency
       WHERE channel_arn = $1
@@ -1587,9 +1592,12 @@ async function getTurnLatencyAudit(
   return success({
     data: result.rows,
     columns: [
-      'turn_id', 'response_id', 'channel_arn', 'turn_id_source', 'trigger_kind', 'battle_round',
-      'responder', 't0_user_at', 't2_placeholder_at', 't3_final_at',
-      'ttff_ms', 'e2e_ms', 'answer_ms', 'unattributed_ms', 'overhead_ms',
+      'turn_id', 'response_id', 'channel_arn', 'turn_id_source', 'anchor_source', 'trigger_kind',
+      'battle_round', 'responder', 't0_user_at', 't2_placeholder_at', 't3_final_at',
+      // `ack_ms` beside `ttff_ms` rather than instead of it (G13): on a user turn they are the same
+      // two instants, and on a proactive one only ack_ms exists. Seeing both is what makes the
+      // difference legible instead of looking like two competing latencies.
+      'ttff_ms', 'ack_ms', 'ack_source', 'e2e_ms', 'answer_ms', 'unattributed_ms', 'overhead_ms',
       'status', 'progress_update_count', 'task_id',
     ],
   });
@@ -1798,6 +1806,34 @@ async function getLatencyMetrics(
        ROUND(AVG(m.poll_ms) FILTER (WHERE m.placeholder_resolve_ms IS NOT NULL)) AS avg_poll_ms,
        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.total_ms)) AS p95_total_ms,
        ROUND(PERCENTILE_CONT(0.95) WITHIN GROUP (ORDER BY m.latency_ms)) AS p95_bedrock_ms,
+       -- ── WHAT THE P95 IS A P95 OF (G9) ──
+       --
+       -- A percentile over a handful of rows is not a tail, it is one of the rows. At n=3 the "95th
+       -- percentile" is the slowest observation and moves by seconds when a single turn does; at n=500
+       -- it is a stable statistic. The number renders identically in both cases, so a first-run
+       -- deployment reads its own noise as a performance characteristic - and this is exactly when a
+       -- reader has no history to tell them otherwise.
+       --
+       -- Reported per percentile, not once, because the two do not share a population: worker compute
+       -- is present on any turn that ran a model, while TTFF additionally requires a MEASURED pairing.
+       -- One count standing for both would overstate whichever is smaller.
+       COUNT(m.total_ms)   AS p95_total_sample_count,
+       COUNT(m.latency_ms) AS p95_bedrock_sample_count,
+       -- ── COLD START: THE SANCTIONED REASON TTFF AND WORKER COMPUTE DISAGREE (G9) ──
+       --
+       -- Container init happens BEFORE handler entry, so total_ms structurally cannot contain it while
+       -- ttff_ms - Chime clock, from the user's message - necessarily does. Recorded by the processor
+       -- (a module-scope flag: true on the first invocation of a container, false on every reuse), so
+       -- this is the event itself rather than a threshold inferred from the divergence it explains.
+       --
+       -- A RATE, read against exchange_count. A high share on a quiet window explains a slow TTFF; a
+       -- high share on a BUSY window is a concurrency finding - containers are being created as fast
+       -- as they are used - and that is a different problem with a different fix.
+       COUNT(*) FILTER (WHERE m.cold_start) AS cold_start_count,
+       -- The same TTFF average over warm turns only, so the divergence can be QUANTIFIED rather than
+       -- asserted. If avg_ttff_ms and this are close, cold start was not the story.
+       ROUND(AVG(e.response_latency_ms) FILTER (WHERE e.delivery_option IS NOT NULL AND NOT COALESCE(m.cold_start, false)))
+         AS avg_ttff_warm_ms,
        ROUND(MIN(m.total_ms)) AS min_total_ms,
        ROUND(MAX(m.total_ms)) AS max_total_ms,
        -- TTFF = time to first feedback: the delay from the user's message to the
@@ -2035,6 +2071,11 @@ async function getLatencyMetrics(
       'placeholder_measured_count', 'poll_fallback_count',
       'avg_e2e_ms', 'p95_e2e_ms',
       'avg_model_ms', 'avg_tool_ms', 'avg_inbound_ms',
+      // G9. The denominator each percentile is actually taken over, and the cold-start rate that is
+      // the sanctioned explanation for a TTFF/worker-compute divergence. Appended, like every
+      // addition before them, so the existing contract is untouched.
+      'p95_total_sample_count', 'p95_bedrock_sample_count',
+      'cold_start_count', 'avg_ttff_warm_ms',
     ],
   });
 }

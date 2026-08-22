@@ -540,8 +540,26 @@ function resolveMaxTokens(event: AsyncProcessorEvent, reasoning: boolean): numbe
   return clampResponseMaxTokens(event.responseSettings?.maxTokens, CONFIG.maxTokens, reasoning);
 }
 
+/**
+ * TRUE until this container has served one turn (G9, LATENCY-TARGETS.md).
+ *
+ * Cold start is the documented reason TTFF and worker compute legitimately diverge - the init runs
+ * BEFORE handler entry, so `total_ms` cannot contain it while `ttff_ms` (Chime clock, from the user's
+ * message) necessarily does. Until now that divergence was reasoning offered in prose, so an operator
+ * looking at a slow TTFF beside a fast worker number had no way to tell a cold container from a
+ * regression, and the doc could only advise them to "annotate it as cold-start, not error".
+ *
+ * Module scope is what makes it a measurement rather than a guess: the module body runs once per
+ * container, so the first invocation on a fresh container sees `true` and every reused invocation
+ * sees `false`. Read and flipped at handler ENTRY, before any await, so a concurrent second event
+ * cannot also claim the cold start.
+ */
+let containerIsCold = true;
+
 export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
   const startTime = Date.now();
+  const coldStart = containerIsCold;
+  containerIsCold = false;
   console.log('[AssistantAsyncProcessor] Invoked', JSON.stringify({
     profile: PROFILE_NAME,
     // The IDS ONLY - the two values that identify this turn and nothing else.
@@ -1782,6 +1800,10 @@ export const handler = async (event: AsyncProcessorEvent): Promise<void> => {
       pollMs,
       conversationHistoryLength: consolidatedHistory.length,
       startTime,
+      // Whether this container had to initialise first (G9). Travels with the turn's other timings
+      // rather than being logged, because the question it answers - "is this slow TTFF a cold start
+      // or a regression?" - is asked of the dashboard, not of CloudWatch.
+      coldStart,
       // THE STATE THE TURN ENDED IN, not the one it started in. `activeTaskInfo` is stamped before the
       // model runs, because the same object grounds the prompt - but it is also what becomes the
       // `<!--ACTIVE_TASK:-->` marker the chat client renders as a status chip. Left as stamped, the
