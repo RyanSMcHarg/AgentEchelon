@@ -13,6 +13,13 @@
  */
 const mockMessagingSend = jest.fn();
 const mockMarkBotWaitingForUser = jest.fn();
+const mockWriteMessageAnalytics = jest.fn();
+/**
+ * How many messages had been PUBLISHED (sent or updated) when the analytics row was written. Pins the
+ * ORDER, not a line. Counts mutations only: the turn reads the placeholder first to learn how it was
+ * targeted, and a read publishes nothing archival could race.
+ */
+let publishesAtAnalyticsWrite: number | null = null;
 
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn(() => ({ send: mockMessagingSend })),
@@ -77,7 +84,7 @@ jest.mock('../../lambda/src/lib/battle-state', () => ({
 }));
 
 jest.mock('../../lambda/src/lib/message-analytics', () => ({
-  writeMessageAnalytics: jest.fn().mockResolvedValue(undefined),
+  writeMessageAnalytics: (...args: unknown[]) => mockWriteMessageAnalytics(...args),
   messageAnalyticsEnabled: () => false,
 }));
 
@@ -157,7 +164,21 @@ beforeEach(() => {
   mockMessagingSend.mockReset();
   mockMarkBotWaitingForUser.mockReset();
   mockMarkBotWaitingForUser.mockResolvedValue(true);
+  publishesAtAnalyticsWrite = null;
+  mockWriteMessageAnalytics.mockReset();
+  mockWriteMessageAnalytics.mockImplementation(() => {
+    publishesAtAnalyticsWrite = mockMessagingSend.mock.calls
+      .map((c) => (c[0] as FakeCommand)?.__type)
+      .filter((t) => t === 'Update' || t === 'Send').length;
+    return Promise.resolve(undefined);
+  });
 });
+
+/** The single argument the turn hands the out-of-band store, whatever branch it took. */
+const analyticsWrite = (): { messageId: string; channelArn: string; analytics: Record<string, unknown> } => {
+  expect(mockWriteMessageAnalytics).toHaveBeenCalledTimes(1);
+  return mockWriteMessageAnalytics.mock.calls[0][0];
+};
 
 describe('a resumed side that asks again', () => {
   beforeEach(() => stubChime([{ MemberArn: USER }]));
@@ -205,6 +226,61 @@ describe('a resumed side that asks again', () => {
     // so neither message may claim the turn finished - on the question or on the receipt beside it.
     expect(phaseWrittenTo(PUBLIC_MESSAGE)).toBe('interim');
     expect(phaseWrittenTo(PRIVATE_PLACEHOLDER)).toBe('interim');
+  });
+});
+
+describe('a turn that asks a question still reports what it cost', () => {
+  // The clarification branch RETURNS. While the out-of-band write sat below it, a turn that ran a full
+  // Converse loop to compose a question archived with no tokens, no cost and no latency - and the
+  // dimension the question is measured FOR (asked vs. forged ahead) lost its cost half entirely.
+  // Measurement belongs to the TURN; it cannot depend on which delivery branch the turn took.
+
+  it('writes the analytics row on the clarification exit, keyed to the message holding the question', async () => {
+    stubChime([{ MemberArn: USER }]);
+    await finalize(true);
+
+    // Keyed on the turn's OUTPUT message, by the same rule the answer path follows: on a resumed chain
+    // that is the public message, not the private placeholder the turn started from.
+    expect(analyticsWrite().messageId).toBe(PUBLIC_MESSAGE);
+    expect(analyticsWrite().channelArn).toBe(CHANNEL);
+  });
+
+  it('the row carries the compute the question actually cost', async () => {
+    stubChime(undefined);
+    await finalize(false);
+
+    // Asserted as real values, not as "the row exists": a row present but empty is the same blind spot
+    // wearing a different shape.
+    expect(analyticsWrite().analytics).toEqual(
+      expect.objectContaining({ inputTokens: 10, outputTokens: 20, latencyMs: 100 }),
+    );
+    expect(Number(analyticsWrite().analytics.totalMs)).toBeGreaterThanOrEqual(0);
+  });
+
+  it('writes the row BEFORE the message it describes reaches the channel', async () => {
+    stubChime(undefined);
+    await finalize(false);
+
+    // Why the order matters: archival sees the message through Chime's Kinesis mirror and reads this
+    // row by message id. Written after the update, the row can lose the race and the question archives
+    // with no telemetry - the same outcome as not writing it at all, but intermittent.
+    expect(publishesAtAnalyticsWrite).toBe(0);
+    // And the turn really did publish, so the zero above is an ordering fact rather than a turn that
+    // never got that far.
+    expect(calls('Update').length).toBeGreaterThan(0);
+  });
+
+  it('reporting the cost does not let a question claim the turn finished', async () => {
+    stubChime(undefined);
+    await finalize(false);
+
+    // The guard on moving a telemetry write earlier. Finality is DECLARED, so the row may carry
+    // `totalMs` without closing the turn - but if the phase ever stopped being declared here, the
+    // archival fallback ("no phase + total_ms present -> final") would fire on this very row and freeze
+    // e2e at a question. This asserts the two together, because it is the PAIR that is safe.
+    expect(analyticsWrite().analytics.totalMs).toBeDefined();
+    expect(phaseWrittenTo(PRIVATE_PLACEHOLDER)).toBe('interim');
+    expect(analyticsWrite().analytics.respPhase).toBeUndefined();
   });
 });
 

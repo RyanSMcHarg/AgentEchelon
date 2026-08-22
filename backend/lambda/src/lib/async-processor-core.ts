@@ -3087,6 +3087,45 @@ export async function finalizePlaceholderResponse(params: {
       && { targetedSender: event.senderArn }),
   };
 
+  // Out-of-band analytics (Phase 1): persist the FULL analytics blob keyed by
+  // this message id BEFORE the Chime update, so the row is in place before the
+  // (slimmed) message can reach archival via Chime's Kinesis mirror. No-op when
+  // the store is unavailable (Athena mode) — see messageMetadata above.
+  // steps[] (per-Converse-iteration telemetry) lives ONLY here, never inline:
+  // it would blow the 1024 Metadata cap and only archival/admin consume it.
+  //
+  // ABOVE THE CLARIFICATION BRANCH, AND THAT PLACEMENT IS THE POINT. That branch RETURNS, so while
+  // this write sat below it a round-1 clarification produced no analytics row at all: a turn that ran
+  // a full Converse loop to compose a question archived with no tokens, no cost, no steps[] and no
+  // latency, and the dimension the question is measured FOR (asked vs. forged ahead) lost its cost
+  // half. Every delivery branch burns the same compute, so every delivery branch records it - the
+  // write belongs to the TURN, not to the shape of its delivery.
+  //
+  // IT CANNOT FORGE A FINISH, which is the thing to check before moving a telemetry write earlier.
+  // Finality is DECLARED (`respPhase`), and the clarification update declares 'interim'; archival
+  // merges this record OVER the inline metadata but adds no `respPhase` of its own, so 'interim'
+  // stands and `agent_final_at` stays unset. The legacy `total_ms IS NOT NULL` fallback fires only
+  // when NO phase was declared, and `clearBattleWaitingMarker` re-sends the message's existing
+  // Metadata, so the later marker-clearing update re-declares 'interim' too. A turn that asked a
+  // question is now measured without being mistaken for one that answered.
+  await writeMessageAnalytics({
+    // The message the ANSWER is in, which on a broadcast resume is not the placeholder. Keyed on the
+    // wrong id, the analytics row would describe a message carrying an acknowledgement, and the
+    // archive would hold the answer with no telemetry attached to it. On the clarification branch it
+    // is the message the QUESTION is in, by the same rule: this turn's output.
+    messageId: deliveryMessageId,
+    channelArn: event.channelArn,
+    // steps + the latency split (model_ms/tool_ms) + processorEntryMs (server-clock handler entry, for
+    // inbound_ms) ride the out-of-band record only, never the size-capped Chime Metadata (LATENCY-TARGETS.md).
+    analytics: {
+      ...fullAnalytics,
+      ...(params.steps?.length ? { steps: params.steps } : {}),
+      ...(params.modelMs !== undefined ? { modelMs: params.modelMs } : {}),
+      ...(params.toolMs !== undefined ? { toolMs: params.toolMs } : {}),
+      processorEntryMs: startTime,
+    },
+  });
+
   // /battle round-1 clarification (SPEC-BATTLE.md "Clarification
   // Routing"). Whether a model asks a clarifying question vs. wrongly
   // forges ahead is a MEASURED battle dimension (see
@@ -3157,29 +3196,6 @@ export async function finalizePlaceholderResponse(params: {
       return;
     }
   }
-
-  // Out-of-band analytics (Phase 1): persist the FULL analytics blob keyed by
-  // this message id BEFORE the Chime update, so the row is in place before the
-  // (slimmed) message can reach archival via Chime's Kinesis mirror. No-op when
-  // the store is unavailable (Athena mode) — see messageMetadata above.
-  // steps[] (per-Converse-iteration telemetry) lives ONLY here, never inline:
-  // it would blow the 1024 Metadata cap and only archival/admin consume it.
-  await writeMessageAnalytics({
-    // The message the ANSWER is in, which on a broadcast resume is not the placeholder. Keyed on the
-    // wrong id, the analytics row would describe a message carrying an acknowledgement, and the
-    // archive would hold the answer with no telemetry attached to it.
-    messageId: deliveryMessageId,
-    channelArn: event.channelArn,
-    // steps + the latency split (model_ms/tool_ms) + processorEntryMs (server-clock handler entry, for
-    // inbound_ms) ride the out-of-band record only, never the size-capped Chime Metadata (LATENCY-TARGETS.md).
-    analytics: {
-      ...fullAnalytics,
-      ...(params.steps?.length ? { steps: params.steps } : {}),
-      ...(params.modelMs !== undefined ? { modelMs: params.modelMs } : {}),
-      ...(params.toolMs !== undefined ? { toolMs: params.toolMs } : {}),
-      processorEntryMs: startTime,
-    },
-  });
 
   // Update the message the answer lands in (non-clarification path). On a broadcast resume that is the
   // new untargeted message, and the private placeholder is then closed out with a one-line
