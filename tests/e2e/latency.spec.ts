@@ -42,7 +42,14 @@ suite('Full latency set populates on a real turn', () => {
     test.setTimeout(420_000); // turn (up to 180s) + generous archival-lag poll
 
     await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
+    // The channel this turn happens in, captured from the create response so the per-turn ledger
+    // audit below can be asked about THIS turn rather than about whatever the account did last.
+    const createResp = page.waitForResponse(
+      (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
+      { timeout: 30000 },
+    );
     await createConversation(page, `Latency e2e ${Date.now()}`, 'Premium');
+    const channelArn: string = (await (await createResp).json()).conversation.conversationArn;
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
     // A single-turn financial-figure question (the premium ARR canary): the assistant loads company
@@ -176,5 +183,57 @@ suite('Full latency set populates on a real turn', () => {
       + `(battle=${wBattle}, mention=${wMention}, other=${wUnreadable - wBattle - wMention}) `
       + `of unclosed=${wsum('unclosed_count')}, no_placeholder=${wsum('unclosed_no_placeholder')}`,
     );
+
+    // ── THE TURN LEDGER IS ANCHORED ON LIVE TRAFFIC (G11) ──
+    //
+    // `v_turn_latency` is the per-turn audit behind the console's drill-down, and it returned NULL
+    // for every latency on every LIVE row: the writer records a user message with no turn id - the
+    // processor is never handed the user's message id, so the binding is made later by pairing - and
+    // the anchor selected only rows that HAVE one, which excluded every row it was made of. The audit
+    // rendered blank on a freshly deployed cluster and read as a wiring fault.
+    //
+    // ASSERTED ON THE TURN THIS TEST JUST DROVE, not on whatever history the account happens to hold.
+    // A backfilled row would satisfy a "some row has a ttff" check while the live path stayed broken -
+    // which is the exact state this assertion exists to detect, so it would be the wrong check.
+    const audit = await signedAnalyticsPost(ANALYTICS_API, idToken!, {
+      queryType: 'turn_latency_audit',
+      channelArn,
+    });
+    const auditRows = (audit.data || []) as Array<Record<string, number | string | null>>;
+    expect(
+      auditRows.length,
+      `the turn ledger returned no rows for the channel this test just drove (${channelArn}). The `
+        + 'audit is unanchored or the ledger writer is not running.',
+    ).toBeGreaterThan(0);
+
+    // A row with a MEASURED wait, not merely a row. Before the anchor fix these rows existed and every
+    // latency on them was null, so counting rows would have passed against the defect.
+    const anchored = auditRows.filter((r) => Number(r.ttff_ms) > 0);
+    expect(
+      anchored.length,
+      'every ledger row for this turn has a NULL ttff_ms, which is the unanchored-ledger defect: the '
+        + 'rows are written but nothing binds them to the user message they answered.',
+    ).toBeGreaterThan(0);
+
+    // Provenance, so a pass here cannot be a backfilled row wearing a live one's clothes. A live turn
+    // is anchored by the exchange pairing; only the offline backfill produces 'ledger'.
+    const sources = [...new Set(auditRows.map((r) => String(r.anchor_source ?? 'none')))];
+    console.log(`[turn-ledger] ${auditRows.length} row(s), anchors: ${sources.join(', ')}, `
+      + `ttff=${anchored.map((r) => r.ttff_ms).join('/')}ms, ack=${auditRows.map((r) => r.ack_ms ?? '-').join('/')}`);
+    expect(
+      sources.some((s) => s === 'exchange' || s === 'ledger'),
+      `no ledger row names an anchor source (saw: ${sources.join(', ')}). A row with no anchor has no `
+        + 'measurable latency, whatever else it reports.',
+    ).toBeTruthy();
+
+    // ack_ms IS ttff_ms on a user-triggered turn - the same two instants by construction (G13). If
+    // these ever disagree on a user turn, the general metric has drifted from the SLO metric and the
+    // two numbers on the console are no longer comparable.
+    for (const r of anchored) {
+      expect(
+        Number(r.ack_ms),
+        'ack_ms and ttff_ms must agree on a user-triggered turn: they are the same two instants',
+      ).toBe(Number(r.ttff_ms));
+    }
   });
 });

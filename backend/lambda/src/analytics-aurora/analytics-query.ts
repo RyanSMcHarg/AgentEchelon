@@ -1677,8 +1677,25 @@ async function getLatencyMetrics(
      )
      SELECT
        DATE(m.created_at) AS date,
-       -- Fall back to the conversation tier so legacy/DIRECT exchanges do not group as 'unknown'.
-       COALESCE(e.agent_type, c.agent_type, 'unknown') AS agent_type,
+       -- THE TIER OF A TURN NOBODY ASKED FOR IS NOT UNKNOWN.
+       --
+       -- This read the exchange first and the conversation second, and a bot-INITIATED turn has
+       -- neither: a welcome, a round-2 rebuttal and a drift notice all answer something other than a
+       -- user message, so no exchange pairs them. They were therefore grouped as tier 'unknown' -
+       -- while the message row beside them recorded the tier that actually served the turn.
+       --
+       -- The message's own value is now the LAST resort before 'unknown' rather than absent from the
+       -- chain, which shrinks the unknown bucket to rows whose tier genuinely was not recorded. It is
+       -- placed last, not first, deliberately: the exchange and the conversation describe the turn's
+       -- CONTEXT, and where they disagree with a single message row they are the better answer for a
+       -- population being grouped by conversation tier.
+       --
+       -- This does NOT close the unattributed-compute bucket, and is not meant to. That bucket is
+       -- about delivery_option, which a bot-initiated turn genuinely does not have, and the fix
+       -- there is to NAME the interaction rather than to widen a coalesce.
+       -- (No backticks anywhere in this SQL: the whole statement is a JS template literal, so one
+       --  would end the string mid-query - which is exactly how this comment broke the build once.)
+       COALESCE(e.agent_type, c.agent_type, m.agent_type, 'unknown') AS agent_type,
        COALESCE(e.delivery_option, 'unknown') AS delivery_option,
        -- MISNAMED, AND KEPT ONLY BECAUSE THE COLUMN CONTRACT IS READ BY LatencyTab, alerts.ts AND
        -- metricTargets.ts. This has never been a count of EXCHANGES. There is a real exchanges table
@@ -2033,7 +2050,10 @@ async function getLatencyMetrics(
        -- nothing to AVG or PERCENTILE_CONT either way - but the counts beside them are now honest
        -- about what they are averaging over.
        AND m.created_at >= NOW() - INTERVAL '1 day' * $1
-     GROUP BY DATE(m.created_at), COALESCE(e.agent_type, c.agent_type, 'unknown'), e.delivery_option
+     -- MUST match the SELECT expression exactly. Postgres groups by the expression, not by the alias,
+     -- so a coalesce chain edited in one place and not the other is a hard error at query time - which
+     -- on this path means the whole Latency tab returns an error rather than a wrong number.
+     GROUP BY DATE(m.created_at), COALESCE(e.agent_type, c.agent_type, m.agent_type, 'unknown'), e.delivery_option
      ORDER BY date DESC, agent_type, delivery_option`,
     [days]
   );

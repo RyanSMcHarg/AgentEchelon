@@ -440,7 +440,22 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
     expect(declined.text.toLowerCase()).not.toContain('created a new conversation');
   });
 
-  test('battle suppression — drift does NOT fire in a battle-enabled channel', async ({ page }) => {
+  // BATTLE MODE BEING ON IS NOT AN EVENT, so it does not suppress drift.
+  //
+  // This test asserted the opposite until now, and it was RIGHT when it was written: suppression once
+  // asked `isBattleEnabled`, the moderator's channel-level mode flag. `827107e` deliberately narrowed
+  // it to a duel that is actually RUNNING, with the reason recorded in live-drift-flow.ts: the old
+  // check fired between duels with nothing in flight and told the person "the assistants are still
+  // comparing answers" when no assistant was doing anything.
+  //
+  // The test was last touched two days BEFORE that change and kept asserting the superseded rule, so
+  // it has been failing against correct behaviour. Inverted here rather than deleted, because the new
+  // rule had no coverage at all: nothing asserted that a channel with Battle Mode merely switched on
+  // still gets the ordinary drift offer, which is the whole point of the narrowing.
+  //
+  // Suppression DURING a live duel is a different assertion needing a real duel, and it belongs with
+  // the rest of the duel setup in battle.spec.ts rather than behind a hand-written config row here.
+  test('battle mode alone does NOT suppress drift — only a running duel does', async ({ page }) => {
     const table = resolveBattleConfigTable();
     test.skip(!table, 'AgentEchelonBattle ChannelBattleConfig table not found (battle not deployed).');
     const user = await getPremiumUser();
@@ -516,24 +531,25 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
         'no settled bot reply reached the channel wire after the drift trigger. The backend did not '
           + 'answer at all, which is a different failure from drift firing.',
       ).toBeTruthy();
-      console.log(`--- drift-battle-suppressed reply (WIRE) ---\n${settled}`);
-      expect(settled!.toLowerCase(), 'drift fired on the wire in a battle-enabled channel')
-        .not.toContain(SUGGESTION_MARKER);
-      expect(settled!, 'a NAVIGATE_CHANNEL marker reached the wire in a battle-enabled channel')
-        .not.toContain('NAVIGATE_CHANNEL');
+      console.log(`--- drift reply with battle mode on, no duel running (WIRE) ---\n${settled}`);
+      expect(
+        settled!.toLowerCase(),
+        'drift did NOT fire with Battle Mode merely switched on. Suppression is supposed to require a '
+          + 'RUNNING duel (827107e); if this fails, suppression has widened back to the mode flag and '
+          + 'people will be told the assistants are comparing answers when nothing is in flight.',
+      ).toContain(SUGGESTION_MARKER);
 
       // 2. THE DOM - the client rendered what the wire delivered. A failure here is a CLIENT fault
-      //    (a dropped or reconnecting WebSocket), not drift firing, and the message says which.
+      //    (a dropped or reconnecting WebSocket), not a drift regression, and the message says which.
       if (domError) {
         throw new Error(
-          'the backend suppressed drift correctly (asserted on the wire above) but the client never '
-            + 'rendered the reply. This is a CLIENT-side delivery fault, not a drift regression.\n'
+          'the backend offered the drift split correctly (asserted on the wire above) but the client '
+            + 'never rendered the reply. This is a CLIENT-side delivery fault, not a drift regression.\n'
             + `underlying: ${domError.message}`,
         );
       }
-      expect(domText.toLowerCase(), 'the drift suggestion rendered in a battle-enabled channel')
-        .not.toContain(SUGGESTION_MARKER);
-      expect(domText).not.toContain('NAVIGATE_CHANNEL');
+      expect(domText.toLowerCase(), 'the drift suggestion did not render in the client')
+        .toContain(SUGGESTION_MARKER);
     } finally {
       ddbWrite('delete-item', table!, '--key', { channelArn: { S: channelArn } });
     }
