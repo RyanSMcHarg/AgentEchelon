@@ -93,3 +93,70 @@ describe('safeMetadataString budget', () => {
     expect(safeMetadataString(undefined)).toBeUndefined();
   });
 });
+
+/**
+ * WHAT GETS SHED WHEN THE 1024-BYTE METADATA BUDGET IS EXCEEDED, AND IN WHAT ORDER.
+ *
+ * The analytics blob IS the Amazon Chime SDK Metadata - `async-processor-core.ts` states there is no
+ * separate emission - so every field added for measurement competes for the same 1024 encoded bytes,
+ * and on a heavy turn the shed loop drops keys one at a time until the rest fits.
+ *
+ * THE ORDERING RULE: a GROUPING KEY sheds last. Losing an ordinary field costs that field. Losing a
+ * field the analytics GROUP BY reads costs the whole ROW - it stops being attributable and lands in an
+ * `unknown` bucket, indistinguishable from a row the cross-batch fallback pairer reconstructed. That
+ * is the population the TTFF partition exists to hold out of the average, so shedding `deliveryOption`
+ * to preserve a step metric would manufacture the exact defect that partition was built to fix.
+ *
+ * This is a source-text guard because the order lives in a private literal, and the failure mode is
+ * someone appending a new metric to the END - which is where it lands by default, and which is
+ * precisely the wrong place.
+ */
+describe('the metadata shed order protects attribution before detail', () => {
+  const source = require('fs').readFileSync(
+    require('path').join(__dirname, '../../lambda/src/lib/async-processor-core.ts'),
+    'utf8',
+  ) as string;
+
+  /** The shed list, in order. First-listed is dropped first. */
+  const shedOrder = (): string[] => {
+    const m = /const METADATA_SHED_ORDER: readonly string\[\] = \[([\s\S]*?)\];/.exec(source);
+    // Non-vacuity: if the literal is renamed or reshaped, this fails rather than checking nothing.
+    expect(m).not.toBeNull();
+    return (m![1]
+      .split('\n')
+      .filter((l) => !l.trim().startsWith('//'))
+      .join(' ')
+      .match(/'([^']+)'/g) || []).map((s) => s.replace(/'/g, ''));
+  };
+
+  it('drops every step-latency diagnostic before the grouping key', () => {
+    const order = shedOrder();
+    const deliveryAt = order.indexOf('deliveryOption');
+    expect(deliveryAt).toBeGreaterThan(-1);
+    for (const metric of ['routerMs', 'classifierMs', 'guardMs', 'placeholderResolveMs', 'pollMs']) {
+      const at = order.indexOf(metric);
+      expect(at).toBeGreaterThan(-1);
+      expect(at).toBeLessThan(deliveryAt);
+    }
+  });
+
+  it('keeps the grouping key longer than the rest of the analytics attribution', () => {
+    // Non-vacuity in the other direction: it is not enough that deliveryOption is late, it must be the
+    // LAST of the analytics group - otherwise a future field could sit between and quietly outrank it.
+    const order = shedOrder();
+    const deliveryAt = order.indexOf('deliveryOption');
+    for (const attribution of ['systemPromptHash', 'configId', 'wasFallback', 'intentConfidence']) {
+      expect(order.indexOf(attribution)).toBeLessThan(deliveryAt);
+    }
+  });
+
+  it('still sheds the grouping key before anything a PERSON would notice', () => {
+    // The limit of the rule. An attachment or an active-task chip missing is visible to the user; a
+    // mis-attributed analytics row is not. User-facing degradation stays the last resort.
+    const order = shedOrder();
+    const deliveryAt = order.indexOf('deliveryOption');
+    for (const userFacing of ['activeTask', 'attachment', 'targetedSender']) {
+      expect(order.indexOf(userFacing)).toBeGreaterThan(deliveryAt);
+    }
+  });
+});

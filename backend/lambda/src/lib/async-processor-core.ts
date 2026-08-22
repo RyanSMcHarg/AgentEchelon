@@ -204,11 +204,25 @@ export function buildSystemBlocks(
 //
 // Shed order: first-listed dropped first. Everything NOT in this list is
 // always kept (the must-survive core).
+// A GROUPING KEY SHEDS LAST, AND THAT IS THE ORDERING PRINCIPLE HERE.
+//
+// Losing an ordinary field costs that field. Losing a field the analytics GROUP BY reads costs the
+// whole row: it stops being attributable and lands in an `unknown` bucket, taking its latency and its
+// counts with it. `deliveryOption` is exactly that - it is a grouping key in `latency_metrics`, and a
+// row without one is indistinguishable from a row the fallback pairer reconstructed. Shedding it to
+// save a step metric would manufacture the very population the TTFF partition exists to hold out.
+//
+// So the step-latency diagnostics go FIRST. They are per-turn detail, individually recoverable from
+// the next turn, and worth nothing if the row they describe cannot be attributed to a variant.
 const METADATA_SHED_ORDER: readonly string[] = [
+  // Step-latency diagnostics — the most droppable thing here. One turn's missing breakdown is a gap
+  // in a distribution; a missing grouping key is a mis-attributed row.
+  'routerMs', 'classifierMs', 'guardMs', 'placeholderResolveMs', 'pollMs',
   // Secondary analytics / config attribution — useful but reconstructable / low-value per-message.
   'systemPromptHash', 'intentPackVersion', 'personaVersion', 'configId',
-  'fallbackReason', 'retryCount', 'wasFallback', 'deliveryOption', 'intentConfidence', 'pollMs',
-  'placeholderResolveMs', 'guardMs', 'classifierMs', 'routerMs',
+  'fallbackReason', 'retryCount', 'wasFallback', 'intentConfidence',
+  // LAST of the secondary group: see the grouping-key note above.
+  'deliveryOption',
   // Bulky / UX-degrading-but-not-data-losing (battle metadata is droppable by
   // existing design; activeTask/attachment/targetedSender degrade UI, not the join).
   'battleContext', 'activeTask', 'attachment', 'targetedSender',
