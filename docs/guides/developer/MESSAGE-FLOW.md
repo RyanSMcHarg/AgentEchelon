@@ -608,17 +608,30 @@ Every hop leaves a trace. The join across them (intent × model × experiment ×
 | Point in the flow | What is measured | Where it lands |
 |---|---|---|
 | User's send (surface) | client events - optimistic render, UI actions, timing | `client_events` table (Aurora mode) |
-| Channel flow / Lex entry | routed? mention type, selected **delivery mode** | archive event + message metadata |
-| Fulfillment handler | resolved effectiveClassification `min(callerClearance, channelClassification)`, classified **intent**, chosen **model**, **experiment assignment** (variant vs `deterministic`) | coded message metadata + analytics record |
+| Channel flow / Lex entry | routed? mention type, selected **delivery mode** | **the dispatch payload and logs** - the placeholder's own Metadata carries only `botResponse` (+ `targetedSender` when targeted); the routing decision reaches the record via the reply row's `deliveryOption`, and the raw events ride Kinesis to the archive |
+| Fulfillment handler | resolved effectiveClassification `min(callerClearance, channelClassification)`, classified **intent**, chosen **model**, **experiment assignment** (variant vs `deterministic`), and the router's own `router_ms` / `classifier_ms` | **the dispatch payload**, folded into the processor's single record - the router writes no analytics row of its own |
 | effectiveClassification downgrade | `[SecurityEvent]` when a lower-clearance user is in a higher-classification room | logs / security-event trail |
-| Async processor - **per Converse step** | one `ConverseStep` per tool-loop iteration: model, tokens in/out, step latency, **estimated cost** (`estCostUsd`), and structured per-tool outcomes `tools[]` (name, ok, bounded `errorClass`, no payloads/PII) | out-of-band analytics, keyed by message id |
-| Async processor - reply | totals: input/output tokens, Bedrock time, guardrail action, config fingerprint | `MESSAGE_ANALYTICS_TABLE` (out-of-band, keyed by message id, 7-day TTL) |
+| Async processor - **per Converse step** | one `ConverseStep` per tool-loop iteration: model, tokens in/out, step latency, **estimated cost** (`estCostUsd`), and structured per-tool outcomes `tools[]` (name, ok, bounded `errorClass`, no payloads/PII) | accumulated in memory, written **once with the reply** - `steps[]` is a field of the reply's record, not a per-step emission |
+| Async processor - reply | totals: input/output tokens, Bedrock time, guardrail action, config fingerprint, the per-step latency ledger | `MESSAGE_ANALYTICS_TABLE` (out-of-band, keyed by message id, 7-day TTL) - **the flow's only analytics write site**, `async-processor-core.ts` |
 | Every channel event | full event stream (message/redact/membership/channel) | Kinesis → conversation archive (Athena/Aurora) |
 | Drift / proactive analysis | conversation drift, tier/violation flags | archive-backed analysis (Aurora mode) |
 
-**Two rules keep the measurement trustworthy:**
-- **Decoupled from delivery.** The heavy analytics (tokens, latencies, per-step cost, config fingerprint, experiment join) do **not** ride the size-capped Amazon Chime SDK `Metadata`. The processor writes the full blob to `MESSAGE_ANALYTICS_TABLE` keyed by message id; only the small fields the surface renders (`pickFrontendMetadata`) go on the message. So an over-budget reply never drops its analytics or the experiment join (ADR-016; see MESSAGE-DELIVERY-GUIDE + SPEC-MESSAGE-METADATA-CODEBOOK).
-- **Fails open.** The analytics writes are env-gated (`MESSAGE_ANALYTICS_TABLE`) and never block or fail a reply - **measurement is best-effort; delivery is not.** The deliberate inverse of the guardrail rule.
+Three trigger paths reach a turn other than through the plain Lex fulfillment of an addressed user
+message, and each one bends what the reply row's numbers mean:
+
+| Trigger | What starts it | Measurement consequence |
+|---|---|---|
+| Battle round 2 (rebuttal) | the orchestrator dispatches straight to the worker - **no user message and no classifier in front of it** | `classifier_ms` is absent and the intent is **inherited** from round 1 rather than declared; the "wait" began at the rival's answer, not at a send |
+| Task handover (`handOverToOwningAssistant`) | a person's message answers work a **different** assistant owns; the receiving router re-dispatches the same turn to the owning assistant's router over the bypass | the turn runs through **two router invocations** but the reply row records only the owning one - the receiving router's leg is invisible in `router_ms` |
+| Post-processing task-answer repair (`task-answer-repair.ts`, ADR-032) | a person answers a task **without addressing anyone**, so `InvokedBy` invokes nothing; post-processing detects it off the message stream and hands the turn to the owning router | the wait began at the send but the path only starts when post-processing notices, so the true inbound hop **includes the whole Kinesis + detection delay** - far larger than any measured leg, and split across both clocks |
+
+In all three the reply row itself is ordinary - the same processor writes it the same way. What differs
+is the *trigger instant* the durations should be anchored to, which is why the ledger records instants
+with an explicit `clock` rather than pre-computed durations ([LATENCY-TARGETS.md](LATENCY-TARGETS.md)).
+
+**Two rules keep the measurement trustworthy, and both are narrower than they first read:**
+- **Decoupled from delivery, in Aurora mode.** The heavy analytics (tokens, latencies, per-step cost, config fingerprint, experiment join) do **not** ride the size-capped Amazon Chime SDK `Metadata`: the processor writes the full blob to `MESSAGE_ANALYTICS_TABLE` keyed by message id, and only the small fields the surface renders (`pickFrontendMetadata`) go on the message. So an over-budget reply never drops its analytics or the experiment join (ADR-016; see MESSAGE-DELIVERY-GUIDE + SPEC-MESSAGE-METADATA-CODEBOOK). **In Athena mode there is no out-of-band store**, the full blob is spread onto the message verbatim, and `METADATA_SHED_ORDER` decides what survives the cap. The decoupling is a property of the deployed mode, not of the code path.
+- **Fails open, but does not run out of band.** The analytics write is env-gated (`MESSAGE_ANALYTICS_TABLE`) and its errors are swallowed, so it never **fails** a reply - **measurement is best-effort; delivery is not.** It does, however, **block** one: the write is awaited immediately before the message update, so its latency sits inside the person's wait. That ordering is deliberate - the row must exist before the message can reach archival through Chime's Kinesis mirror - but "fails open" is not the same as "free".
 
 The admin dashboard (Overview / Quality / Models / Experiments) reads this telemetry. Because control and measurement ride the **same** path, every enforced decision (tier downgrade, guardrail intervention, model choice) is also a recorded, queryable event - you can *prove* what the harness did, not just assert it.
 

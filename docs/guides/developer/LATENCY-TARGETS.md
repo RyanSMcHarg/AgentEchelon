@@ -19,12 +19,16 @@ user message                                                          final answ
      |<---------------------------- e2e_ms -------------------------------->|
      |<-------- ttff_ms -------->|                                          |
      |                           | placeholder                              |
-     |                           |<---------- total_ms (worker) ----------->|
+     |                           |<------- total_ms (worker) ------->| post |
      |                                                                      |
      |  ingest + flow + Lex  |   router_ms   |  guard | resolve |  latency_ms  | tail |
      |  (no column; bounded  |  classifier_ms|        |  poll_ms|  model + tool|      |
      |   by inbound_ms)      |  + other      |        | (if any)|              |      |
 ```
+
+The `post` sliver - the analytics write and the final `UpdateChannelMessage` - is inside `e2e_ms` but
+outside `total_ms`, because `total_ms` is written into the metadata that update carries (see Worker
+compute below).
 
 - **Nesting, not addition.** `classifier_ms` is inside `router_ms`. `poll_ms` is inside
   `placeholder_resolve_ms`. `model_ms` and `tool_ms` are inside `latency_ms`. Adding a parent to its
@@ -41,7 +45,7 @@ user message                                                          final answ
 
 ## Metric definitions (what each number means and why it matters)
 
-Source of truth: the processor stamps deltas into the Amazon Chime SDK message Metadata field via `buildAnalyticsMetadata` (`async-processor-core.ts`); the archival Lambda (`kinesis-archival.ts`) writes them to `messages.*` and derives `exchanges.response_latency_ms` from message timestamps; `getLatencyMetrics` (`analytics-query.ts`) aggregates them for the tab. There are two clock domains: **server wall-clock** (`Date.now()` inside one Lambda - exact deltas, no skew: `latency_ms`, `total_ms`, `poll_ms`) and **Amazon Chime SDK message timestamps** (one shared clock across messages: `response_latency_ms`).
+Source of truth: the processor stamps deltas via `buildAnalyticsMetadata` (`async-processor-core.ts`) - in Aurora mode they ride the out-of-band `MESSAGE_ANALYTICS_TABLE` record, in Athena mode the Amazon Chime SDK message Metadata (see "Where it rides" below); the archival Lambda (`kinesis-archival.ts`) writes them to `messages.*` and derives `exchanges.response_latency_ms` from message timestamps; `getLatencyMetrics` (`analytics-query.ts`) aggregates them for the tab. There are two clock domains: **server wall-clock** (`Date.now()` inside one Lambda - exact deltas, no skew: `latency_ms`, `total_ms`, `poll_ms`) and **Amazon Chime SDK message timestamps** (one shared clock across messages: `response_latency_ms`).
 
 ### TTFF - `response_latency_ms` (dashboard card: "TTFF")
 - **Definition:** time from the user's message to the assistant's **placeholder** appearing.
@@ -52,7 +56,8 @@ Source of truth: the processor stamps deltas into the Amazon Chime SDK message M
 
 ### Worker compute - `total_ms` (dashboard cards: "Worker compute", "P95 worker compute")
 - **Definition:** server-side wall-clock to produce and post the answer, inside one processor invocation.
-- **Measures:** placeholder resolution + history/context load + the Converse tool loop + the output guardrail + posting the reply. Starts at process-fn **entry**; ends right after the final `UpdateChannelMessage` returns.
+- **Measures:** admission + placeholder resolution + history/context load + prompt assembly + the Converse tool loop + the output guardrail. Starts at process-fn **entry**; ends when the answer content is assembled.
+- **It does NOT include posting the reply.** The stamp is taken ~300 lines before the final `UpdateChannelMessage`, because the value is written into the metadata that message carries - a number cannot include the cost of its own delivery. The out-of-band analytics write sits in that gap too. So the delivery step is unmeasured on the server clock; `e2e_ms` (Chime clock) is the only figure that contains it.
 - **Stamp:** `totalTime = Date.now() - startTime`, stamped `totalMs` -> `messages.total_ms`.
 - **Why it matters:** the **cost/efficiency of the turn** - the number to watch for slow turns, RAG-heavy turns, and model regressions. The closest existing proxy for answer latency.
 - **What it does NOT tell you (the trap):** it is NOT the user's wall-clock wait. It EXCLUDES the inbound hop, the processor's own cold-start init (before handler entry), and browser delivery. So it **understates** perceived wait, and it is stamped server-side, not tied to when the message actually updated in Amazon Chime SDK Messaging.
@@ -70,7 +75,7 @@ Source of truth: the processor stamps deltas into the Amazon Chime SDK message M
 - **Stamp:** `placeholderResolveMs` -> `messages.placeholder_resolve_ms`.
 - **Why it matters:** it is the cost of the placeholder handshake, and it is the number a handshake regression moves.
 
-### Placeholder scan - `poll_ms` (dashboard card: "Placeholder scan") and `poll_fallback_count`
+### Placeholder scan - `poll_ms` (dashboard card: "Placeholder scan rate") and `poll_fallback_count`
 - **Definition:** the **fallback scan only**, on turns where the channel flow's placeholder id did not resolve the target.
 - **Measures:** Amazon Chime SDK message scanning with retries. `NULL` (not `0`) when no scan runs, which is the common case.
 - **Stamp:** `pollMs` -> `messages.poll_ms`, written only when a scan actually runs.
@@ -84,7 +89,8 @@ Source of truth: the processor stamps deltas into the Amazon Chime SDK message M
 - **Why it matters:** it is unavoidable per-turn cost, and naming it is what lets the processor leg reconcile.
 
 ### Processor tail - `avg_processor_tail_ms` (derived, not stamped)
-- **Definition:** `total_ms - guard_ms - placeholder_resolve_ms - latency_ms`: the finalize, the message update and the archival dispatch.
+- **Definition:** `total_ms - guard_ms - placeholder_resolve_ms - latency_ms`, computed only over rows measured the new way: the conversation-history load (a billed `ListChannelMessages`), prompt assembly, and long-response handling.
+- **NOT the message update or the archival write.** Both happen after `total_ms` is stamped, so neither can be in a residual derived from it. Reading this number as "posting cost" sends optimisation at the wrong code: the weight here is the history read.
 - **Why it matters:** it closes the processor leg. Every millisecond of Worker compute is now in a named bucket, so an unexplained residual is visible rather than absorbed.
 - **A NEGATIVE value is a finding, not a display bug.** It means compute was attributed to the wrong turn, the same class `v_turn_latency.unattributed_ms` exists to expose. It is deliberately not clamped.
 
@@ -134,7 +140,7 @@ Each latency metric maps onto a hop in the message journey (see [`MESSAGE-FLOW.m
 | Send + Channel Flow (section 2) | The user message is received and released; conversation-level handling | negligible (ms) |
 | Fulfillment handler (section 4) | Resolve `min(callerClearance, channelClassification)`, classify intent (a fast Haiku call), resolve the model, pick a delivery mode, and RETURN THE PLACEHOLDER | **TTFF** |
 | Async processor tool loop (section 6.1) | Input guardrail, then the self-hosted loop: Bedrock call (reason), `load_company_context` retrieval, Bedrock call (answer), output guardrail | **avg / p95 total** and **avg Bedrock** |
-| Delivery (section 5) | `UpdateChannelMessage` swaps the placeholder for the answer | tail of total |
+| Delivery (section 5) | `UpdateChannelMessage` swaps the placeholder for the answer | `e2e_ms` only - `total_ms` is stamped before this step |
 
 **Why TTFF is small and total is seconds.** The fulfillment handler returns the placeholder before any answer-generation work, so TTFF is a fast path: a tier and intent resolve plus one lightweight classification. The answer runs an **agentic tool loop**: two or more Bedrock calls plus a retrieval plus two guardrail passes. That is inherently seconds, and Bedrock generation dominates it. So a 2s total target is not reachable for an answer that reasons and calls a tool; the honest target is the Nielsen 10s attention limit, held acceptable by the placeholder.
 
@@ -144,10 +150,10 @@ The Latency tab renders the full set as distinct cards, each with a tooltip stat
 
 - **TTFF** - "time to placeholder" (acknowledgment latency), not the answer.
 - **E2E** - the full user wait to the final answer (the real perceived latency); includes the inbound hop and cold start that Worker compute omits.
-- **Worker compute** - the async processor's server compute only (processor entry -> answer posted); always less than E2E, NOT the user's wall-clock time.
+- **Worker compute** - the async processor's server compute only (processor entry -> answer content ready; posting it is outside the stamp); always less than E2E, NOT the user's wall-clock time.
 - **Avg Model** / **Avg Tool** - the model-loop time split into model inference vs in-loop tool execution, so a RAG-heavy turn no longer reads as a slow model.
 - **Inbound** - the front-of-turn routing / cold-start hop (approximate, cross-clock).
-- **Avg Polling**, **P95 worker compute** - the placeholder handshake and the tail.
+- **Placeholder lookup** / **Placeholder scan rate**, **P95 worker compute** - the placeholder handshake and the tail. (These replaced the old "Avg Polling" card, which timed from worker entry and so could never read zero.)
 
 The header prose and the distribution rail describe the same framing, so an operator is not left to infer that Worker compute is server-only or that the model-loop number bundled tool time.
 
@@ -280,7 +286,11 @@ The complete set is captured, so the console is stable and no deployment migrate
   **How a migration reaches an existing cluster.** `schema-init` (the Custom Resource) bootstraps on Create only and can never reconnect - `IamAuthSetup` grants `rds_iam`, which disables the password auth it used. But `db-client.ensureSchema` applies any unapplied `schema/*.sql` at RUNTIME over the IAM connection, under an advisory lock, so a new migration lands on an existing cluster with no manual step. The catch: that only happens in Lambdas that CALL `ensureSchema`, so all eight Lambdas that bundle the schema files call it, pinned by `db-lambdas-apply-migrations.test.ts`. Runtime-applied migrations must be idempotent and transaction-safe (no `CREATE INDEX CONCURRENTLY`).
 - **Off the response path, but NOT off the message.** Every metric here is a `Date.now()` delta on work the turn was doing anyway, so none of it adds user-perceived latency: measure on-path, emit off-path.
 
-  **What it does cost is Metadata budget, and that is worth knowing before adding a field.** The per-message analytics blob IS the Amazon Chime SDK Metadata, capped at 1024 encoded bytes, and it is the single source for BOTH the frontend and the Aurora archival pipeline - `async-processor-core.ts` states there is no separate analytics emission. So a new measurement field competes with the existing ones and with product data, and on a heavy turn `METADATA_SHED_ORDER` drops keys until the rest fits.
+  **Where it rides depends on the analytics mode, and only one of the two costs Metadata budget.**
+
+  In **Aurora mode** (the deployed configuration) the rule from [`MESSAGE-FLOW.md`](MESSAGE-FLOW.md) §6.2 and ADR-016 holds exactly: the full blob goes to `MESSAGE_ANALYTICS_TABLE` out of band, and the Chime Metadata carries only `FRONTEND_METADATA_KEYS` - `bedrockModel`, `intent`, `experimentId`, `variantId`, `assignmentMode`, `activeTask`, `imageCount` - plus `attachment`, `targetedSender` and `respPhase`. **No latency field reaches the message.** Adding one genuinely costs nothing against the 1024-byte cap.
+
+  In **Athena mode**, where `MESSAGE_ANALYTICS_TABLE` is unset, there is no out-of-band store and `fullAnalytics` is spread onto the message verbatim. Every latency field then competes with product data for the cap, and `METADATA_SHED_ORDER` is the backstop that decides what survives.
 
   **The shed order encodes a rule: a GROUPING KEY sheds last among the analytics fields.** Losing an ordinary field costs that field; losing `delivery_option` costs the whole ROW, which stops being attributable and becomes indistinguishable from one the cross-batch pairer reconstructed - the population `ttff_reconstructed_count` exists to hold out of the average. Step-latency detail therefore sheds FIRST, and anything a person would notice missing (an attachment, a work-item chip) still sheds last of all. Guarded by `safe-metadata-string.test.ts`.
 

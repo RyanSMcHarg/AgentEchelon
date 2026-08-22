@@ -1717,8 +1717,11 @@ async function getLatencyMetrics(
        --   guard_ms                the dedup claim + the task-status write (admission)
        --   placeholder_resolve_ms  locating the message to answer on
        --   latency_ms              the model loop, itself split into model_ms + tool_ms
-       --   avg_processor_tail_ms   what is LEFT of total_ms - the finalize, the message update and
-       --                           the archival dispatch. Derived, not stamped, so it cannot drift
+       --   avg_processor_tail_ms   what is LEFT of total_ms - the conversation-history load (a billed
+       --                           ListChannelMessages), prompt assembly, and long-response handling.
+       --                           NOT the message update or the archival write: total_ms is stamped
+       --                           BEFORE both of those, so neither can be inside this residual.
+       --                           Derived, not stamped, so it cannot drift
        --                           from the total it is defined against.
        --
        -- The tail is the honest residual, and it is reported rather than assumed to be zero for the
