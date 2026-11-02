@@ -139,6 +139,45 @@
   gap: var(--space-5);
 }
 
+/* Redirect sign-in providers: secondary buttons above the password form. */
+.login-providers {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-bottom: var(--space-5);
+}
+
+/* A provider's name is the deployment's, so its length is unknown: the label wraps inside the button rather
+   than running past it, which the shared buttons' `nowrap` would otherwise force. */
+.login-provider {
+  width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+  text-align: center;
+}
+
+.login-divider {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  margin-top: var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+
+.login-divider::before,
+.login-divider::after {
+  content: '';
+  flex: 1;
+  border-top: 1px solid var(--surface-200);
+}
+
+.login-redirect-title {
+  margin: 0;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
 .form-group {
   display: flex;
   flex-direction: column;
@@ -214,3 +253,4 @@
     padding: var(--space-8) var(--space-6);
   }
 }
+

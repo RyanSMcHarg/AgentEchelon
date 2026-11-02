@@ -1,0 +1,73 @@
+/* ========================================
+   Admin console theme
+   ========================================
+   The console reads the shared tokens (design-tokens.css) and sets the few that differ for an operator
+   console, here, once, so every surface follows without a per-component size.
+
+   READING SIZE. The shared scale is dense (13px base) for the chat client. An operator reads forms,
+   tables and help text for minutes at a time, so the console reads at 16px body and form text, 15px
+   tables and buttons, and 14px secondary and help text. Nothing a person reads is set below 12px, and
+   12px is kept for monospace badges and counters.
+
+   CONTRAST. Secondary and tertiary text, control borders, links and accent text are set to meet WCAG
+   AA on both themes (4.5:1 for text, 3:1 for a control's edge). The shared light tertiary (#A1A1AA on
+   white, 2.6:1) does not, so the console darkens it; in dark mode the accent text and tint swap so an
+   accent label on an accent tint stays legible. */
+
+:root {
+  --text-xs: 0.75rem;     /* 12px: monospace badges and counters only */
+  --text-sm: 0.875rem;    /* 14px: help, captions, secondary text */
+  --text-base: 0.9375rem; /* 15px: tables, buttons, dense lists */
+  --text-md: 1rem;        /* 16px: body and form controls */
+  --text-lg: 1.125rem;    /* 18px: group headings */
+  --text-xl: 1.25rem;     /* 20px: section headings */
+  --text-2xl: 1.5rem;     /* 24px: page title */
+  --text-3xl: 2rem;       /* 32px: headline figures */
+
+  --text-secondary: #52525B;
+  --text-tertiary: #71717A;
+  /* MUTED TEXT IS TERTIARY TEXT. The console's stylesheets read `--text-muted`, which no token file
+     defined, so every use fell through to its hardcoded zinc and ignored the theme. Defined once here as
+     the tertiary token, it follows the theme (the overrides below set tertiary on the same element). */
+  --text-muted: var(--text-tertiary);
+
+  --control-height: 2.5rem;
+  --control-font-size: var(--text-base);
+  --control-border: #8B8B94;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --text-secondary: #A1A1AA;
+    --text-tertiary: #8E8E96;
+    --control-border: #6B6B74;
+    --accent-50: #1E1038;
+    --accent-100: #2E1065;
+    --accent-200: #4C1D95;
+    --accent-700: #DDD6FE;
+  }
+}
+
+:root[data-theme="dark"] {
+  --text-secondary: #A1A1AA;
+  --text-tertiary: #8E8E96;
+  --control-border: #6B6B74;
+  --accent-50: #1E1038;
+  --accent-100: #2E1065;
+  --accent-200: #4C1D95;
+  --accent-700: #DDD6FE;
+}
+
+/* A link is the link color in both themes, not the browser's default blue (unreadable on dark). */
+a {
+  color: var(--link-color);
+  text-underline-offset: 2px;
+}
+
+/* One look for a checkbox or radio: the accent, at a size a pointer can hit. */
+input[type="checkbox"],
+input[type="radio"] {
+  accent-color: var(--accent-500);
+  width: 1rem;
+  height: 1rem;
+}

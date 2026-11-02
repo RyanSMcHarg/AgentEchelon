@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { getBattleConfig, enableBattle, disableBattle } from './channelBattleService';
 
 const API_URL = 'https://api.example.com/channels/battle';
-vi.stubEnv('VITE_CHANNEL_BATTLE_API_URL', API_URL);
+vi.stubEnv('VITE_PERSON_API_URL', 'https://api.example.com/');
+vi.stubEnv('VITE_PERSON_API_CAPABILITIES', 'battle,core');
 
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
@@ -25,7 +26,7 @@ describe('getBattleConfig', () => {
       channelArn: 'arn:aws:chime:us-east-1:111:app-instance/i/channel/c1',
       enabled: true,
       experimentId: 'exp-9',
-      altBotSlotArn: 'arn:aws:chime:us-east-1:111:app-instance/i/bot/Alt0',
+      challengerAssistant: 'alt-primary-premium',
     };
     mockFetch.mockResolvedValueOnce(jsonOk(config));
 
@@ -61,7 +62,7 @@ describe('enableBattle', () => {
       enabled: true,
       channelArn: 'c1',
       experimentId: 'exp-9',
-      altBotSlotArn: 'arn:bot/Alt0',
+      challengerAssistant: 'alt-primary-premium',
       altBotDisplayName: 'Challenger',
     };
     mockFetch.mockResolvedValueOnce(jsonOk(apiResult));
@@ -80,7 +81,7 @@ describe('enableBattle', () => {
       enabled: true,
       channelArn: 'c1',
       experimentId: 'auto-resolved',
-      altBotSlotArn: 'arn:bot/Alt0',
+      challengerAssistant: 'alt-primary-premium',
       altBotDisplayName: 'Challenger',
     }));
 
@@ -142,5 +143,16 @@ describe('error handling', () => {
     mockGetItem.mockReturnValue(null);
     await expect(getBattleConfig('c1')).rejects.toThrow('Not authenticated');
     expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('refuses without a request when the person API does not serve battle', async () => {
+    vi.stubEnv('VITE_PERSON_API_CAPABILITIES', 'core,notifications');
+    try {
+      mockGetItem.mockReturnValue('tok');
+      await expect(getBattleConfig('c1')).rejects.toThrow('VITE_PERSON_API_CAPABILITIES');
+      expect(mockFetch).not.toHaveBeenCalled();
+    } finally {
+      vi.stubEnv('VITE_PERSON_API_CAPABILITIES', 'battle,core');
+    }
   });
 });

@@ -7,21 +7,34 @@
 
 /* ========================================
    Buttons
-   ======================================== */
+   ========================================
+   One control family. A variant class works on its own (`btn-primary`) or with the base
+   (`btn btn-primary`): both get the same height, padding, radius, focus ring and disabled state, so a
+   button never renders as a browser default because the base class was left off. Height and size
+   come from `--control-height` and `--control-font-size`, which an app may set (the admin console
+   does, in its own theme). */
 
-.btn {
+.btn,
+.btn-primary,
+.btn-secondary,
+.btn-ghost,
+.btn-danger,
+.btn-chrome,
+.btn-link {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
+  min-height: var(--control-height);
   font-family: var(--font-sans);
-  font-size: var(--text-base);
+  font-size: var(--control-font-size);
   font-weight: 500;
-  line-height: 1;
-  padding: var(--space-2) var(--space-4);
+  line-height: var(--leading-tight);
+  padding: var(--space-1) var(--space-4);
   border-radius: var(--radius-md);
   border: 1px solid transparent;
   cursor: pointer;
+  text-decoration: none;
   transition:
     background var(--duration-fast) var(--ease-in-out),
     border-color var(--duration-fast) var(--ease-in-out),
@@ -32,41 +45,49 @@
   user-select: none;
 }
 
-.btn:active {
+:is(.btn, .btn-primary, .btn-secondary, .btn-ghost, .btn-danger, .btn-chrome):active:not(:disabled) {
   transform: scale(0.98);
 }
 
-.btn:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-  transform: none;
+:is(.btn, .btn-primary, .btn-secondary, .btn-ghost, .btn-danger, .btn-chrome, .btn-link):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
 }
 
-/* Primary — amber accent, dark text */
+:is(.btn, .btn-primary, .btn-secondary, .btn-ghost, .btn-danger, .btn-chrome, .btn-link):disabled,
+:is(.btn, .btn-primary, .btn-secondary, .btn-ghost, .btn-danger, .btn-chrome, .btn-link)[aria-disabled="true"] {
+  opacity: 0.45;
+  cursor: not-allowed;
+  transform: none;
+  box-shadow: none;
+}
+
+/* Primary: the one action a view asks for. A deep violet fill, so its label passes WCAG AA. */
 .btn-primary {
-  background: var(--accent-400);
+  background: var(--btn-primary-bg);
   color: var(--text-on-accent);
-  border-color: var(--accent-500);
+  border-color: var(--btn-primary-bg);
 }
 
 .btn-primary:hover:not(:disabled) {
-  background: var(--accent-500);
+  background: var(--btn-primary-hover);
+  border-color: var(--btn-primary-hover);
   box-shadow: var(--shadow-glow);
 }
 
-/* Secondary — subtle, bordered */
+/* Secondary: every other action. */
 .btn-secondary {
   background: var(--surface-0);
   color: var(--text-primary);
-  border-color: var(--surface-200);
+  border-color: var(--control-border);
 }
 
 .btn-secondary:hover:not(:disabled) {
-  background: var(--surface-50);
-  border-color: var(--surface-300);
+  background: var(--surface-100);
+  border-color: var(--text-tertiary);
 }
 
-/* Ghost — no background */
+/* Ghost: a quiet action beside a primary one (Cancel). */
 .btn-ghost {
   background: transparent;
   color: var(--text-secondary);
@@ -77,19 +98,39 @@
   color: var(--text-primary);
 }
 
-/* Danger — red destructive */
+/* Danger: an action that removes something. Outlined at rest, so a table of rows does not read as a
+   page of alarms, and filled on hover, so the moment of commitment is unmistakable. */
 .btn-danger {
-  background: var(--error);
-  color: white;
-  border-color: var(--error);
+  background: var(--surface-0);
+  color: var(--danger-text);
+  border-color: var(--danger-border);
 }
 
 .btn-danger:hover:not(:disabled) {
-  background: #DC2626;
+  background: var(--danger-fill);
+  border-color: var(--danger-fill);
+  color: #FFFFFF;
   box-shadow: var(--shadow-glow-error);
 }
 
-/* Chrome button — for dark sidebar/header */
+/* Link: an action that navigates or reveals, set in running text or a table cell. Same focus ring and
+   disabled state as the rest; no box, so it sits on the text baseline. */
+.btn-link {
+  min-height: 0;
+  padding: 0;
+  border: none;
+  background: none;
+  color: var(--link-color);
+  font-size: inherit;
+  text-align: left;
+  white-space: normal;
+}
+
+.btn-link:hover:not(:disabled) {
+  text-decoration: underline;
+}
+
+/* Chrome button: for the dark sidebar and header */
 .btn-chrome {
   background: transparent;
   color: var(--chrome-text);
@@ -104,11 +145,13 @@
 
 /* Size variants */
 .btn-sm {
+  min-height: calc(var(--control-height) - 0.5rem);
   font-size: var(--text-sm);
   padding: var(--space-1) var(--space-3);
 }
 
 .btn-lg {
+  min-height: calc(var(--control-height) + 0.5rem);
   font-size: var(--text-md);
   padding: var(--space-3) var(--space-6);
 }
@@ -117,45 +160,61 @@
   padding: var(--space-2);
   width: 32px;
   height: 32px;
+  min-height: 0;
 }
 
 .btn-icon-sm {
   padding: var(--space-1);
   width: 28px;
   height: 28px;
+  min-height: 0;
 }
 
 /* ========================================
    Inputs
-   ======================================== */
+   ========================================
+   `.input`, `.select` and `.textarea` each stand alone and share one look: the same border, radius,
+   height and focus ring. `.select` adds its arrow; `.textarea` grows with its content. */
 
-.input {
+.input,
+.select,
+.textarea {
   font-family: var(--font-sans);
   font-size: var(--text-md);
   line-height: var(--leading-normal);
   color: var(--text-primary);
-  background: var(--surface-0);
-  border: 1px solid var(--surface-200);
+  background-color: var(--surface-0);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius-md);
   padding: var(--space-2) var(--space-3);
+  min-height: var(--control-height);
   width: 100%;
   transition:
     border-color var(--duration-fast) var(--ease-in-out),
     box-shadow var(--duration-fast) var(--ease-in-out);
 }
 
-.input::placeholder {
+:is(.input, .select, .textarea):hover:not(:disabled):not(:focus) {
+  border-color: var(--text-tertiary);
+}
+
+:is(.input, .textarea)::placeholder {
   color: var(--text-tertiary);
 }
 
-.input:focus {
+:is(.input, .select, .textarea):focus {
   outline: none;
   border-color: var(--accent-500);
   box-shadow: var(--shadow-glow);
 }
 
-.input:disabled {
-  background: var(--surface-100);
+:is(.input, .select, .textarea):focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+
+:is(.input, .select, .textarea):disabled {
+  background-color: var(--surface-100);
   color: var(--text-tertiary);
   cursor: not-allowed;
 }
@@ -174,14 +233,16 @@
   min-height: 80px;
 }
 
-/* Select */
+/* Select. The arrow is a token, redefined for dark mode, so it stays visible on a dark field. */
 .select {
   appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2371717A' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
+  background-image: var(--select-arrow);
   background-repeat: no-repeat;
   background-position: right var(--space-3) center;
   padding-right: var(--space-8);
+  cursor: pointer;
 }
+
 
 /* ========================================
    Labels
@@ -285,20 +346,11 @@
   color: var(--info);
 }
 
-/* Tier badges */
-.badge-basic {
-  background: var(--tier-basic-bg);
-  color: var(--tier-basic);
-}
-
-.badge-standard {
-  background: var(--tier-standard-bg);
-  color: var(--tier-standard);
-}
-
-.badge-premium {
-  background: var(--tier-premium-bg);
-  color: var(--tier-premium);
+/* Classification badges. The colors are the pair `classificationBadgeStyle` sets from the
+   classification's declared `badgeToken` (`--cls-fg`, `--cls-bg`), never a class per name. */
+.cls-badge {
+  background: var(--cls-bg, var(--surface-100));
+  color: var(--cls-fg, var(--text-tertiary));
 }
 
 /* ========================================
@@ -602,25 +654,17 @@
 }
 
 /* ============================================================
-   Tier Dot — reusable color marker for basic/standard/premium
-   ============================================================
-   Promoted from the conversation-header tier pill. Apply in
-   admin tables, member chips, conversation list — anywhere a
-   tier needs to be identifiable at a glance.
-*/
-.tier-dot {
+   Classification dot: a color marker in the classification's
+   badge color (`--cls-fg`, from `classificationBadgeStyle`)
+   ============================================================ */
+.cls-dot {
   display: inline-block;
   width: 8px;
   height: 8px;
   border-radius: var(--radius-full);
   flex-shrink: 0;
   vertical-align: middle;
-}
-.tier-dot--basic    { background: var(--tier-basic); }
-.tier-dot--standard { background: var(--tier-standard); }
-.tier-dot--premium  {
-  background: var(--tier-premium);
-  box-shadow: 0 0 8px color-mix(in srgb, var(--tier-premium) 50%, transparent);
+  background: var(--cls-fg, var(--text-tertiary));
 }
 
 .tier-label {

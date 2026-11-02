@@ -10,13 +10,16 @@
  * derive state from conversations it has loaded, so anything message-derived is blind to exactly the
  * case this exists for.
  *
- * The URL comes from VITE_USER_TASKS_API_URL (CDK output AgentEchelonFoundations.UserTasksApiUrl).
- * Unconfigured is NOT an error: a deployment that has not wired it simply has no queue, and the caller
- * renders nothing rather than an error the user cannot act on.
+ * The route is on the person API (VITE_PERSON_API_URL). Unconfigured is NOT an error: a deployment that
+ * has not wired it simply has no queue, and the caller renders nothing rather than an error the user
+ * cannot act on.
  */
+import { personApiServes, personUrl } from '@ae/shared';
 
 export interface OpenWorkItem {
   taskId: string;
+  /** The reference a person types to answer this item, `#<taskRef>` (ADR-035). Absent on older rows. */
+  taskRef?: number;
   taskType: string;
   channelArn: string;
   status: string;
@@ -33,10 +36,30 @@ export interface OpenWorkItem {
    * Absent on chains that record no assistant. The composer then sends normally.
    */
   assistantId?: string;
+  /**
+   * WHO THE ITEM IS FOR, which decides how an answer about it is addressed.
+   *
+   * `conversation` means the people in the room are waiting on this work and are entitled to see it
+   * change, so an answer is addressed OPENLY. Anything else - including ABSENT - is treated as
+   * private and answered targeted.
+   *
+   * Absent is read as private on purpose. It means a mirror row written before the server sent this,
+   * and the two ways of being wrong are not equal: guessing shared publishes a private answer to the
+   * room, and guessing private costs a targeted message that could have been public.
+   */
+  visibility?: 'conversation' | 'private';
+  /**
+   * What this step still needs from the person, as the machine declares it.
+   *
+   * Server-gated on the state awaiting somebody, so anything present here is genuinely theirs to
+   * answer. Absent means the step declares none - a confirmation or a single choice, where the step
+   * IS the answer - and the row simply does not offer a list.
+   */
+  needs?: string[];
 }
 
 export function isOpenWorkItemsConfigured(): boolean {
-  return Boolean(import.meta.env.VITE_USER_TASKS_API_URL);
+  return personApiServes('core');
 }
 
 /**
@@ -50,8 +73,8 @@ export function isOpenWorkItemsConfigured(): boolean {
  * not raise anything at the user, and the next poll fixes it.
  */
 export async function fetchOpenWorkItems(): Promise<OpenWorkItem[]> {
-  const url = import.meta.env.VITE_USER_TASKS_API_URL;
-  if (!url) return [];
+  if (!personApiServes('core')) return [];
+  const url = personUrl('/tasks/mine');
 
   const idToken = localStorage.getItem('idToken');
   if (!idToken) return [];

@@ -4,7 +4,7 @@
  * Tiering a target is a way to make a band informative, and it is one edit away from being a way to
  * excuse a slow deployment. These pin the difference.
  *
- * RULE 1 - THE CEILING IS INVARIANT. No tier may be given a band beyond the Nielsen abandon
+ * RULE 1 - THE LIMIT IS INVARIANT. No tier may be given a band beyond the Nielsen abandon
  * threshold. Past it the person has left, so a "warn" there describes a system nobody is waiting for.
  * A tier band may only ever TIGHTEN what is expected of cheaper work.
  *
@@ -12,24 +12,29 @@
  * person does not know which model answered them. Overriding those would relabel a worse experience
  * as an acceptable one, which is the failure mode this whole registry exists to prevent.
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, beforeAll, afterAll } from 'vitest';
+import { SAMPLE_CLASSIFICATIONS } from '@ae/shared/config/sampleClassifications.ts';
+import { setClassificationsForTest } from '@ae/shared';
 import {
   METRIC_TARGETS,
   TIER_TARGET_OVERRIDES,
-  ABANDON_CEILING_MS,
+  ABANDON_LIMIT_MS,
   targetFor,
   evaluateTarget,
   type LatencyTier,
 } from './metricTargets';
 
+// The sample deployment's classifications, whose assistants answer on the selection keys named after them.
 const TIERS: LatencyTier[] = ['basic', 'standard', 'premium'];
+beforeAll(() => setClassificationsForTest(SAMPLE_CLASSIFICATIONS));
+afterAll(() => setClassificationsForTest(null));
 
-describe('the abandon ceiling holds for every tier', () => {
+describe('the abandon limit holds for every tier', () => {
   it('no override sets a target or a warn beyond it', () => {
     for (const [key, byTier] of Object.entries(TIER_TARGET_OVERRIDES)) {
       for (const [tier, band] of Object.entries(byTier)) {
-        expect(band!.target, `${key}.${tier}.target`).toBeLessThanOrEqual(ABANDON_CEILING_MS);
-        expect(band!.warn, `${key}.${tier}.warn`).toBeLessThanOrEqual(ABANDON_CEILING_MS);
+        expect(band!.target, `${key}.${tier}.target`).toBeLessThanOrEqual(ABANDON_LIMIT_MS);
+        expect(band!.warn, `${key}.${tier}.warn`).toBeLessThanOrEqual(ABANDON_LIMIT_MS);
       }
     }
   });
@@ -91,9 +96,25 @@ describe('targetFor falls back rather than disappearing', () => {
     const premium = targetFor('avg_total_ms', 'premium')!;
     const basic = targetFor('avg_total_ms', 'basic')!;
     expect(premium.target).toBeGreaterThan(basic.target);
-    expect(premium.label).toContain('premium');
+    // The tier is returned as its own field now: a '(premium)' suffix baked into an English label is
+    // the half of the name a translator could never reach.
+    expect(premium.tierLabel).toBe('premium');
     // The same 12s turn is healthy premium work and a basic anomaly - the whole point of the split.
     expect(evaluateTarget(12000, premium)).not.toBe('bad');
     expect(evaluateTarget(12000, basic)).toBe('bad');
+  });
+});
+
+describe('a classification is banded by the default model it declares, whatever it is called', () => {
+  it('bands a deployment\'s own classification as the key it answers on, and an undeclared one by the global target', () => {
+    setClassificationsForTest([
+      { value: 'internal', displayName: 'Internal', audience: 'members', badgeToken: 'cls-1', grants: ['internal'], conversational: true, models: { selected: ['opus'], default: 'opus' } },
+    ]);
+    try {
+      expect(targetFor('avg_total_ms', 'internal')).toEqual(expect.objectContaining({ ...TIER_TARGET_OVERRIDES.avg_total_ms.opus, tierLabel: 'internal' }));
+      expect(targetFor('avg_total_ms', 'premium')).toEqual(METRIC_TARGETS.avg_total_ms);
+    } finally {
+      setClassificationsForTest(SAMPLE_CLASSIFICATIONS);
+    }
   });
 });

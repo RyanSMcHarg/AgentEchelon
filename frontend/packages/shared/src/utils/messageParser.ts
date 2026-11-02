@@ -38,16 +38,20 @@ export interface BattleMarker {
 }
 
 /**
- * A bot is blocked on the user mid-battle (SPEC-BATTLE.md
- * "Clarification Routing"). Set from the `<!--battlewaiting:-->` marker
- * the async processor puts on the placeholder it shows the channel in
- * place of the (privately, targeted) clarifying question. Drives the
- * composer's "Replying to:" affordance — distinct from `battle` (a
- * completed round reply / scorecard).
+ * A duel side is waiting on the person (DESIGN-BATTLE, "A side parked on the person"). Set from the
+ * `<!--battlewaiting:-->` marker the async processor puts on the message the side parks on: a clarifying
+ * question (ADR-029) or a task step its chain needs input for (ADR-026). Drives the side's "Reply to this
+ * side" control - distinct from `battle` (a round reply / scorecard).
  */
 export interface BattleWaiting {
   battleId: string;
   botArn: string;
+  /**
+   * The AppInstanceUser id of the person who ran `/battle`, the only person whose answer resumes the
+   * side. A display hint for who is offered the control; the router decides from the duel's own record.
+   * Absent on a marker written without one.
+   */
+  ownerId?: string;
 }
 
 // Generation-out has NO marker here by design: a generated image is delivered as a message
@@ -96,7 +100,7 @@ const LEX_MSGS_CONTENT_TYPE = 'application/amz-chime-lex-msgs';
  * Is this a Lex envelope carrying NO messages, i.e. nothing the user should see?
  *
  * The router returns `messages: []` to suppress a retried fulfillment (ADR-022). Amazon Chime SDK
- * posts that envelope into the channel regardless, so it is the CLIENT that has to recognise it as
+ * posts that envelope into the channel regardless, so it is the CLIENT that has to recognize it as
  * nothing - otherwise the user sees raw JSON, which is worse than the duplicate the suppression exists
  * to prevent.
  *
@@ -135,9 +139,63 @@ export function unwrapLexEnvelope(rawContent: string, contentType?: string): str
 }
 
 /**
+ * Does this message say it IS the answer, rather than a stand-in for one?
+ *
+ * The client decides "this is the async placeholder" from a `<!--corr:-->` marker, which was a
+ * complete rule while the only marked messages were placeholders. A turn the handler answers itself
+ * now carries the same marker so the pairing can be declared rather than guessed at, and it posts
+ * once with no update to follow - so read as a placeholder, its timings are dropped and the turn
+ * reports no answer at all.
+ *
+ * Mirrors `backend/lambda/src/lib/turn-declaration.ts`. The rule has to hold on both sides of the
+ * wire and there is no shared module across that boundary; `message-markers.ts` says the same thing
+ * about the marker set it mirrors.
+ *
+ * Content reaches a client in either form, so both are tested - the same reason the backend's Lex
+ * envelope reader checks the percent-decoded form.
+ */
+export function declaresFinalAnswer(rawContent: string | undefined | null): boolean {
+  if (!rawContent) return false;
+  const decoded = (() => {
+    try { return decodeURIComponent(rawContent); } catch { return rawContent; }
+  })();
+  for (const form of new Set([rawContent, decoded])) {
+    // Bounded and character-classed exactly as the writer builds it, so a crafted marker in prose
+    // cannot assert that somebody else's placeholder is finished.
+    //
+    // THE LAST DECLARATION WINS, which is the backend's rule and has to be this side's too. The
+    // writer strips any declaration already present before appending its own, so the real one is
+    // always last - and a crafted marker travelling in composed model text therefore sits BEFORE it.
+    // Reading the first match handed that forged one the answer: a finished DIRECT turn read as an
+    // unfinished placeholder, and its timings were dropped. Global match, last entry.
+    const all = [...form.matchAll(/<!--turn:([A-Za-z0-9._;=-]{1,512})-->/g)];
+    const declaration = all.length ? all[all.length - 1] : null;
+    if (declaration && declaration[1].split(';').includes('phase=final')) return true;
+  }
+  return false;
+}
+
+/**
  * Parse message content to extract active task markers, drift-redirect
  * markers, and clean up internal markers.
  */
+/**
+ * MESSAGE TEXT AS A PERSON SHOULD READ IT, whatever form it arrived in.
+ *
+ * Content reaches a client percent-encoded on most paths and raw on some, and raw text may hold a bare
+ * `%` ("usage down 30%"). `decodeURIComponent` throws on that, and two readers called it unguarded:
+ * the live message handler and the history loader. The throw dropped the message - measured live
+ * 2026-10-05, a duel prompt containing "30%" raised two uncaught "URI malformed" errors in the chat
+ * page. Every other reader already fell back to the raw text; this is that fallback, once.
+ */
+export function decodeMessageText(raw: string): string {
+  try {
+    return decodeURIComponent(raw);
+  } catch {
+    return raw;
+  }
+}
+
 export function parseMessageContent(rawContent: string): ParsedMessage {
   let content = rawContent;
   let activeTask: ActiveTask | null = null;
@@ -225,15 +283,14 @@ export function parseMessageContent(rawContent: string): ParsedMessage {
     content = content.replace(BATTLESTATS_MARKER_PATTERN, '');
   }
 
-  // Extract <!--battlewaiting:battleId=X,botArn=Y--> — set by the async
-  // processor on the placeholder shown to the channel in place of the
-  // (privately targeted) clarifying question. Standalone (no battle/
-  // battlestats marker on a waiting placeholder); drives the composer.
+  // Extract <!--battlewaiting:battleId=X,botArn=Y,owner=Z--> - set by the async processor on the
+  // message a duel side parks on (a clarifying question, or a task step that carries battlestats too).
+  // Drives the side's reply control.
   const waitingMatch = content.match(BATTLEWAITING_MARKER_PATTERN);
   if (waitingMatch) {
     const f = parseBattleFields(waitingMatch[1]);
     if (f.battleId && f.botArn) {
-      battleWaiting = { battleId: f.battleId, botArn: f.botArn };
+      battleWaiting = { battleId: f.battleId, botArn: f.botArn, ...(f.owner ? { ownerId: f.owner } : {}) };
     }
     content = content.replace(BATTLEWAITING_MARKER_PATTERN, '');
   }
@@ -249,9 +306,25 @@ export function parseMessageContent(rawContent: string): ParsedMessage {
   }
 
   // Strip <!--corr:uuid--> correlation ID markers
-  // Battle correlation IDs include extra prefix segments (e.g. "battle-r1-slot-0-...")
+  // Battle correlation IDs include extra prefix segments (e.g. "battle-r1-Alt-premium-...")
   // so we widen the pattern to accept any UUID-ish or hyphen-delimited token.
   content = content.replace(/<!--corr:[^>]+-->/g, '');
+
+  // Strip <!--turn:k=v;k=v--> declarations, which state what the turn answered and which phase it is.
+  //
+  // READ ABOVE, REMOVED HERE, and both are needed. `declaresFinalAnswer` takes the RAW content and so
+  // still sees this; what a person reads must not. Every other marker in this function is stripped
+  // because it is addressed to the platform rather than to the reader, and this one is no different.
+  //
+  // IT SURFACED ON THE HANDLER-ANSWERED PATH because that is the one where it survives. A placeholder
+  // carrying a declaration is replaced by its own update, so the marker goes with it; a turn the
+  // handler answers itself (`router-agent-handler.ts`, `withTurnDeclaration`) posts ONCE and is
+  // already final, so nothing ever rewrites the content. A clarification answer is exactly that
+  // shape, which is where it was seen.
+  //
+  // The pattern is the writer's, bounded and character-classed, so it cannot run away on crafted
+  // input - the same rule `declaresFinalAnswer` matches with.
+  content = content.replace(/<!--turn:[A-Za-z0-9._;=-]{1,512}-->/g, '');
 
   // Strip the guardrail MASK TOKEN, which is what Amazon Bedrock Guardrails leaves where it masked
   // one of the markers above: an ANONYMIZE match is replaced by the literal `{FILTER_NAME}`, so a
@@ -285,6 +358,8 @@ interface BattleFields {
   rivalArn?: string;
   rivalReplyMsgId?: string;
   botArn?: string;
+  /** battlewaiting only: the duel owner's AppInstanceUser id, URI-encoded in the marker. */
+  owner?: string;
   // battlestats-only fields
   responseMs?: number;
   estCostUsd?: number | null;
@@ -327,6 +402,13 @@ function parseBattleFields(raw: string): BattleFields {
         break;
       case 'botArn':
         result.botArn = value;
+        break;
+      case 'owner':
+        try {
+          result.owner = decodeURIComponent(value);
+        } catch {
+          result.owner = value;
+        }
         break;
       case 'responseMs': {
         const n = Number(value);

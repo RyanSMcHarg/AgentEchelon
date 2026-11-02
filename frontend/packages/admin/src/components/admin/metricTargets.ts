@@ -6,11 +6,54 @@
  * display-only.)
  */
 
+import type { DocLinkKey } from '../../config/docLinks';
+import { classificationOf } from '@ae/shared';
+
 export type TargetDirection = 'lower' | 'higher'; // lower-is-better | higher-is-better
 export type TargetStatus = 'good' | 'warn' | 'bad';
 
+/**
+ * WHERE A NUMBER COMES FROM, so a reader can check it instead of trusting the sentence.
+ *
+ * A description is a claim. Without a path to the computation, a stale claim is indistinguishable
+ * from a current one, and that failure is not hypothetical here: the "Latency by interaction"
+ * handover tooltip described the only producer that existed when it was written, stayed in place
+ * when a second producer started writing the same `trigger_kind`, and was then wrong about half the
+ * rows it counted. Nothing could have caught it, because nothing tied the sentence to the code.
+ *
+ * ── WHY THE LINE NUMBER IS GENERATED AND NEVER TYPED ─────────────────────────────────────────────
+ *
+ * The console links to the PUBLIC repo (see `config/docLinks.ts`), which is not this working tree.
+ * Measured 2026-10-01: `analytics-aurora/analytics-query.ts` is 3889 lines there and 7411 here, and
+ * three of four metric-computing symbols checked - `getLatencyByInteraction`, `getTurnKinds`,
+ * `ASSISTANT_TURN_SQL` - do not exist in the public file at all. So a hand-written `#L3295` taken
+ * from a local editor lands on unrelated code, and an operator who clicks it is misled with more
+ * confidence than if there had been no link.
+ *
+ * `publicLine` is therefore resolved from the public tree by `scripts/gen-metric-provenance.mjs` and
+ * asserted by `metric-help-is-short-and-sourced.test.ts`. When the symbol is not public, the field is
+ * absent and the console renders the path as TEXT rather than a link - precise, and unable to lie.
+ * Code reaching the public repo later upgrades the text to a link with no copy change.
+ */
+export interface MetricProvenance {
+  /** The guide that explains the metric in prose. A key of `DOC_LINKS`, so a moved doc is one edit. */
+  guide: DocLinkKey;
+  /** Repo-relative path of the file that COMPUTES the number. */
+  file: string;
+  /** The function, constant or view the computation lives in. Greppable, so it survives a move. */
+  symbol: string;
+  /** 1-based line of `symbol` IN THE PUBLIC TREE. GENERATED - do not hand-edit. */
+  publicLine?: number;
+}
+
 export interface MetricTarget {
-  label: string;
+  /**
+   * Locale key for the metric name. This registry is module scope and shared by every tab, so it NAMES
+   * its copy; `descriptionKey` beside it already worked this way and the label was the odd one out.
+   */
+  labelKey: string;
+  /** Set when `targetFor` narrowed this target to one tier, so a view can say which. */
+  tierLabel?: string;
   direction: TargetDirection;
   /** Boundary of "good" — at/under (lower) or at/over (higher) is good. */
   target: number;
@@ -18,9 +61,22 @@ export interface MetricTarget {
   warn: number;
   unit?: string;
   format?: (v: number) => string;
-  /** Plain-language explanation of what the metric measures and how it's
-   *  derived — surfaced as the metric's info tooltip in the console. */
-  description?: string;
+  /**
+   * LOCALE KEY for what the metric measures and how it is derived - the text lives in
+   * `shared/src/locales/en.json` under `admin.metrics.<id>.description`, never here.
+   *
+   * Copy in a `.ts` registry is copy that cannot be translated, and the console is being brought to
+   * where the chat client already is (`react-i18next`, one `en.json`). Keeping the KEY here and the
+   * text there also puts the three-sentence rule on the locale file, where one guard covers every
+   * admin string instead of only this registry.
+   *
+   * Three sentences because the tooltip is read while someone is interpreting a number, not studying:
+   * what it measures, what population it is over, and the one thing that would otherwise be misread.
+   * Anything longer belongs in the guide `provenance.guide` names.
+   */
+  descriptionKey?: string;
+  /** The guide and the code behind the number. Required alongside `descriptionKey` (gated by test). */
+  provenance?: MetricProvenance;
 }
 
 const fmtMs = (ms: number): string => (ms < 1000 ? `${Math.round(ms)}ms` : `${(ms / 1000).toFixed(1)}s`);
@@ -28,8 +84,8 @@ const fmtPct = (v: number): string => `${v.toFixed(v < 10 ? 1 : 0)}%`;
 
 /**
  * Registry keyed by a stable metric id. Targets are SOURCED to published industry
- * standards, NOT to a self-imposed ceiling. Full basis + citations in
- * docs/LATENCY-TARGETS.md. Summary:
+ * standards, NOT to a self-imposed limit. Full basis + citations in
+ * docs/guides/developer/LATENCY-TARGETS.md. Summary:
  *  - TTFF (time to first visible feedback) is the PRIMARY latency metric: <1s good,
  *    <2s warn (Nielsen Norman Group response-time limits). With a placeholder shown
  *    in <1s, TTFF is the latency the user actually perceives.
@@ -42,96 +98,148 @@ const fmtPct = (v: number): string => `${v.toFixed(v < 10 ? 1 : 0)}%`;
  */
 export const METRIC_TARGETS: Record<string, MetricTarget> = {
   // Time to first visible feedback - the primary, perceived-latency metric.
-  // Nielsen NNG: 1s keeps the user focused. (docs/LATENCY-TARGETS.md)
+  // Nielsen NNG: 1s keeps the user focused. (docs/guides/developer/LATENCY-TARGETS.md)
   ttff_ms: {
-    label: 'Time to first feedback', direction: 'lower', target: 1000, warn: 2000, format: fmtMs,
-    description:
-      'Time from the user sending a message to the first visible feedback — the placeholder bubble, not the finished answer. This is the latency users actually perceive. Target under 1s, warn under 2s (Nielsen Norman Group). A cold Lambda start adds one-off seconds; warm invocations are much faster.',
+    labelKey: 'admin.metrics.ttff_ms.label', direction: 'lower', target: 1000, warn: 2000, format: fmtMs,
+    descriptionKey: 'admin.metrics.ttff_ms.description',
+    provenance: {
+      guide: 'latencyTargets',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getLatencyMetrics', publicLine: 1638},
   },
   // Time to COMPLETE response (secondary). Nielsen NNG: 10s attention limit (good),
   // ~30s abandon threshold (warn). Agentic tool loops legitimately take seconds.
   avg_total_ms: {
-    label: 'Avg worker-compute latency', direction: 'lower', target: 10000, warn: 30000, format: fmtMs,
-    description:
-      'Mean async-processor compute for the turn, from processor entry to the answer content being ready (history load + tool loop + guardrail). NOT the user wall-clock wait: it excludes the inbound hop (router + classifier + invoke), cold start, posting the answer, and delivery, so it is always less than E2E — see E2E for the full wait. Agentic tool loops make multiple model calls, so multi-second values are normal.',
+    labelKey: 'admin.metrics.avg_total_ms.label', direction: 'lower', target: 10000, warn: 30000, format: fmtMs,
+    descriptionKey: 'admin.metrics.avg_total_ms.description',
+    provenance: {
+      guide: 'latencyTargets',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getLatencyMetrics', publicLine: 1638},
   },
   // The true user-perceived wait (user message -> final answer). Includes the inbound hop + cold start
-  // that total omits. Nielsen 10s attention limit (good), ~30s abandon (warn). docs/LATENCY-TARGETS.md.
+  // that total omits. Nielsen 10s attention limit (good), ~30s abandon (warn). docs/guides/developer/LATENCY-TARGETS.md.
   avg_e2e_ms: {
-    label: 'Avg end-to-end latency', direction: 'lower', target: 10000, warn: 30000, format: fmtMs,
-    description:
-      'Mean user-perceived wait from the message to the FINAL answer (agent_final_at − user_message_at, both on the Chime clock, so skew-free). Unlike worker compute, it includes the inbound hop and cold start — the real latency an SLA is about.',
+    labelKey: 'admin.metrics.avg_e2e_ms.label', direction: 'lower', target: 10000, warn: 30000, format: fmtMs,
+    descriptionKey: 'admin.metrics.avg_e2e_ms.description',
+    provenance: {
+      guide: 'latencyTargets',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getLatencyMetrics', publicLine: 1638},
   },
   p95_total_ms: {
-    label: 'P95 worker-compute latency', direction: 'lower', target: 15000, warn: 30000, format: fmtMs,
-    description:
-      '95th-percentile async-processor compute latency per turn: 95% of individual turns finish computing at or under this. By default multi-step tasks are excluded; when the response-type filter includes them, each task TURN counts individually (per-turn), never the whole multi-turn task cycle. More sensitive than the average to cold starts, long tool loops, and outliers, so it is the better tail signal.',
+    labelKey: 'admin.metrics.p95_total_ms.label', direction: 'lower', target: 15000, warn: 30000, format: fmtMs,
+    descriptionKey: 'admin.metrics.p95_total_ms.description',
+    provenance: {
+      guide: 'latencyTargets',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getLatencyMetrics', publicLine: 1638},
   },
   avg_bedrock_ms: {
-    label: 'Avg Bedrock latency', direction: 'lower', target: 6000, warn: 12000, format: fmtMs,
-    description:
-      'Mean time spent in Bedrock model inference per response, summed across every model call in the turn. Usually the dominant share of total latency, and the part that scales with model choice and output length.',
+    labelKey: 'admin.metrics.avg_bedrock_ms.label', direction: 'lower', target: 6000, warn: 12000, format: fmtMs,
+    descriptionKey: 'admin.metrics.avg_bedrock_ms.description',
+    provenance: {
+      guide: 'latencyTargets',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getLatencyMetrics', publicLine: 1638},
   },
   // Reliability (lower is better) — defaults; tune to your SLO.
   error_rate: {
-    label: 'Error rate', direction: 'lower', target: 1, warn: 5, unit: '%', format: fmtPct,
-    description: 'Share of requests that ended in an error over the window. A reliability default — tune the target to your own SLO.',
+    labelKey: 'admin.metrics.error_rate.label', direction: 'lower', target: 1, warn: 5, unit: '%', format: fmtPct,
+    descriptionKey: 'admin.metrics.error_rate.description',
+    provenance: {
+      guide: 'adminConsole',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getErrorRateDaily', publicLine: 1385},
   },
   reconnect_rate: {
-    label: 'WS reconnect rate', direction: 'lower', target: 5, warn: 15, unit: '%', format: fmtPct,
-    description: 'WebSocket reconnects as a share of connections. A rising rate is usually the first sign of Chime instability or browser-tab WS suspension at scale.',
-  },
-  // Quality — drift detection goal from AE ROADMAP (≥95% TPR, ≤5% FPR).
-  drift_tpr: {
-    label: 'Drift detection TPR', direction: 'higher', target: 95, warn: 90, unit: '%', format: fmtPct,
-    description: 'True-positive rate of drift detection: of the conversations that genuinely drifted topic, the share the detector caught. Goal ≥95%.',
-  },
-  drift_fpr: {
-    label: 'Drift false-positive rate', direction: 'lower', target: 5, warn: 10, unit: '%', format: fmtPct,
-    description: 'False-positive rate of drift detection: of the conversations that did not drift, the share wrongly flagged. Goal ≤5%.',
+    labelKey: 'admin.metrics.reconnect_rate.label', direction: 'lower', target: 5, warn: 15, unit: '%', format: fmtPct,
+    descriptionKey: 'admin.metrics.reconnect_rate.description',
+    provenance: {
+      guide: 'frontendObservability',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getConnectionHealthDaily', publicLine: 1479},
   },
   // Response relevance (higher is better) — 0-100 scale, matching the existing
   // EvaluationsTab.scoreColor bands (good ≥75, acceptable ≥50).
   relevance_score: {
-    label: 'Avg relevance score', direction: 'higher', target: 75, warn: 50, format: (v) => v.toFixed(1),
-    description:
-      'Automated 0–100 relevance score averaged across evaluated exchanges. Each turn is scored context-aware (with its preceding turns), so a correct contextual reply is not penalised as if isolated. Good ≥75, acceptable ≥50.',
+    labelKey: 'admin.metrics.relevance_score.label', direction: 'higher', target: 75, warn: 50, format: (v) => v.toFixed(1),
+    descriptionKey: 'admin.metrics.relevance_score.description',
+    provenance: {
+      guide: 'evaluationDesign',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getEvaluationMetrics', publicLine: 806},
   },
-  // Effectiveness dashboard (SPEC-ADMIN-CONSOLE-EFFECTIVENESS §5) — per-intent quality axes. Defaults;
+  // Effectiveness dashboard (SPEC-ADMIN-CONSOLE-EFFECTIVENESS, User Experience Description and
+  // Mocks) — per-intent quality axes. Defaults;
   // tune per deployment via this registry.
   intent_confidence: {
-    label: 'Classification confidence', direction: 'higher', target: 80, warn: 50, format: (v) => v.toFixed(0),
-    description:
-      'Average classifier confidence for this intent, mapped high/medium/low → 100/50/0. Low confidence means the router is unsure it routed the traffic correctly — a taxonomy or classifier signal, distinct from whether the work then succeeded.',
+    labelKey: 'admin.metrics.intent_confidence.label', direction: 'higher', target: 80, warn: 50, format: (v) => v.toFixed(0),
+    descriptionKey: 'admin.metrics.intent_confidence.description',
+    provenance: {
+      guide: 'effectiveness',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getIntentEffectiveness', publicLine: 2240},
   },
   task_completion_rate: {
-    label: 'Task completion rate', direction: 'higher', target: 80, warn: 60, unit: '%', format: fmtPct,
-    description:
-      'Share of this intent’s multi-step tasks that reached a success terminal state. The execution-quality signal for task-delivery intents (paired with the flow composite).',
-  },
-  intent_reroute_rate: {
-    label: 'Reroute rate', direction: 'lower', target: 10, warn: 25, unit: '%', format: fmtPct,
-    description:
-      'Share of this intent’s exchanges the router re-classified away from the original intent. A high rate points at a taxonomy overlap or a weak classifier boundary, not a runtime failure.',
+    labelKey: 'admin.metrics.task_completion_rate.label', direction: 'higher', target: 80, warn: 60, unit: '%', format: fmtPct,
+    descriptionKey: 'admin.metrics.task_completion_rate.description',
+    provenance: {
+      guide: 'effectiveness',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getIntentEffectiveness', publicLine: 2240},
   },
   cost_per_reply: {
-    label: 'Cost per reply', direction: 'lower', target: 0.01, warn: 0.05, format: (v) => `$${v.toFixed(4)}`,
-    description:
-      'Estimated USD per bot reply, derived from average tokens × the model’s published rate (not billing reconciliation). A decision column alongside quality: a cheap-but-wrong and an expensive-but-excellent intent are different problems.',
+    labelKey: 'admin.metrics.cost_per_reply.label', direction: 'lower', target: 0.01, warn: 0.05, format: (v) => `$${v.toFixed(4)}`,
+    descriptionKey: 'admin.metrics.cost_per_reply.description',
+    provenance: {
+      guide: 'effectiveness',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getModelEffectiveness', publicLine: 2145},
   },
   tool_error_rate: {
-    label: 'Tool error rate', direction: 'lower', target: 5, warn: 15, unit: '%', format: fmtPct,
-    description:
-      'Share of this intent’s tool calls that failed (per the structured per-tool step outcome). Tool use is the mechanism that produces the outcome, so a high tool-error rate is a distinct, actionable failure mode.',
+    labelKey: 'admin.metrics.tool_error_rate.label', direction: 'lower', target: 5, warn: 15, unit: '%', format: fmtPct,
+    descriptionKey: 'admin.metrics.tool_error_rate.description',
+    provenance: {
+      guide: 'effectiveness',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getIntentEffectiveness', publicLine: 2240},
+  },
+  /**
+   * USER SIGNAL: the share of RATED replies somebody marked "Needs work".
+   *
+   * The denominator is votes cast, not replies sent, and that is the whole subtlety. Voting is
+   * voluntary, so this measures the people who chose to speak - it is a floor on dissatisfaction,
+   * never a measure of satisfaction, and the unrated remainder is silence rather than approval.
+   *
+   * The thresholds are DEFAULTS and say so: no baseline has been agreed, and a flag rate is heavily
+   * shaped by how visible the control is and who is using the product. Read a change in it rather
+   * than the level, and tune these once a deployment has its own history to compare against.
+   */
+  user_flag_rate: {
+    labelKey: 'admin.metrics.user_flag_rate.label', direction: 'lower', target: 10, warn: 25, unit: '%', format: fmtPct,
+    descriptionKey: 'admin.metrics.user_flag_rate.description',
+    provenance: {
+      guide: 'evaluationDesign',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getFlaggedResponses', publicLine: 365},
   },
   // Engagement (higher is better) — defaults; tune.
   signup_conversion: {
-    label: 'Signup conversion', direction: 'higher', target: 60, warn: 40, unit: '%', format: fmtPct,
-    description: 'Share of sign-up funnel starts that completed. An engagement default — tune to your baseline.',
+    labelKey: 'admin.metrics.signup_conversion.label', direction: 'higher', target: 60, warn: 40, unit: '%', format: fmtPct,
+    descriptionKey: 'admin.metrics.signup_conversion.description',
+    provenance: {
+      guide: 'adminConsole',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getFunnelConversion', publicLine: 1404},
   },
   signin_conversion: {
-    label: 'Signin success', direction: 'higher', target: 95, warn: 85, unit: '%', format: fmtPct,
-    description: 'Share of sign-in attempts that succeeded. A low value can indicate credential or auth-flow friction.',
+    labelKey: 'admin.metrics.signin_conversion.label', direction: 'higher', target: 95, warn: 85, unit: '%', format: fmtPct,
+    descriptionKey: 'admin.metrics.signin_conversion.description',
+    provenance: {
+      guide: 'adminConsole',
+      file: 'backend/lambda/src/analytics-aurora/analytics-query.ts',
+      symbol: 'getFunnelConversion', publicLine: 1404},
   },
 };
 
@@ -141,7 +249,7 @@ export const METRIC_TARGETS: Record<string, MetricTarget> = {
  * THE GAP. Latency was targeted globally, so a premium turn - larger model, retrieval, a longer tool
  * loop - was held to the same band as a basic turn that runs one small model call and no tools. One
  * band cannot be right for both: set for premium it is so loose that a basic regression is invisible
- * inside it, and set for basic it marks healthy premium traffic as failing. Either way the colour on
+ * inside it, and set for basic it marks healthy premium traffic as failing. Either way the color on
  * the card stops carrying information, which is worse than having no band at all.
  *
  * WHAT MAY VARY BY TIER, AND WHAT MAY NOT. This is the whole design decision, so it is stated rather
@@ -155,39 +263,45 @@ export const METRIC_TARGETS: Record<string, MetricTarget> = {
  *   the person, not the system. Giving premium a slower "good" TTFF would not be a tuned target, it
  *   would be a worse experience relabelled as an acceptable one.
  *
- * THE CEILING IS INVARIANT. No override may exceed the Nielsen ~30s abandon threshold, whatever the
+ * THE LIMIT IS INVARIANT. No override may exceed the Nielsen ~30s abandon threshold, whatever the
  * tier: past it a person leaves, and a band that says otherwise is describing a system nobody is
  * still waiting for. Tiering therefore only ever TIGHTENS expectations for cheaper work; it never
  * buys a slower one permission to be slow. Pinned by metric-targets-tier-bands.test.ts.
  */
-export type LatencyTier = 'basic' | 'standard' | 'premium';
+/**
+ * THE KEY A BAND IS DECLARED UNDER: a model of the catalog, the default a classification's assistant answers on
+ * (`models.default` on a client classification), never a classification value. A classification reads the band
+ * of its default model (`targetFor`), so a deployment's own classification is banded as the model it runs on is,
+ * and one that declares none is held to the global target.
+ */
+export type LatencyTier = string;
 
 /** The Nielsen abandon threshold. No tier band may sit beyond it - see the note above. */
-export const ABANDON_CEILING_MS = 30000;
+export const ABANDON_LIMIT_MS = 30000;
 
 type Band = Pick<MetricTarget, 'target' | 'warn'>;
 
-export const TIER_TARGET_OVERRIDES: Record<string, Partial<Record<LatencyTier, Band>>> = {
+export const TIER_TARGET_OVERRIDES: Record<string, Record<LatencyTier, Band>> = {
   // A basic turn is a classification plus one small model call with no tool loop, so seconds of
   // compute is already an anomaly rather than a busy turn. Premium buys a bigger model AND retrieval,
   // and both are on the critical path.
   avg_total_ms: {
-    basic: { target: 4000, warn: 10000 },
-    standard: { target: 10000, warn: 20000 },
-    premium: { target: 15000, warn: ABANDON_CEILING_MS },
+    haiku: { target: 4000, warn: 10000 },
+    sonnet: { target: 10000, warn: 20000 },
+    opus: { target: 15000, warn: ABANDON_LIMIT_MS },
   },
   // The tail widens with the loop: a premium turn has more places to be slow (more iterations, a
   // retrieval that can miss cache), so its P95 sits further from its mean by construction.
   p95_total_ms: {
-    basic: { target: 8000, warn: 15000 },
-    standard: { target: 15000, warn: ABANDON_CEILING_MS },
-    premium: { target: 22000, warn: ABANDON_CEILING_MS },
+    haiku: { target: 8000, warn: 15000 },
+    sonnet: { target: 15000, warn: ABANDON_LIMIT_MS },
+    opus: { target: 22000, warn: ABANDON_LIMIT_MS },
   },
   // The model loop alone. Tracks the same shape as compute, since on most turns it IS most of it.
   avg_bedrock_ms: {
-    basic: { target: 2500, warn: 6000 },
-    standard: { target: 6000, warn: 12000 },
-    premium: { target: 10000, warn: 20000 },
+    haiku: { target: 2500, warn: 6000 },
+    sonnet: { target: 6000, warn: 12000 },
+    opus: { target: 10000, warn: 20000 },
   },
 };
 
@@ -195,7 +309,7 @@ export const TIER_TARGET_OVERRIDES: Record<string, Partial<Record<LatencyTier, B
  * The target for a metric, narrowed to one tier when the view is scoped to one.
  *
  * Returns the GLOBAL target when no tier is given, when the tier has no override, or when the tier is
- * unrecognised - so a new tier, or the 'unknown' bucket the latency query emits for legacy rows, is
+ * unrecognized - so a new tier, or the 'unknown' bucket the latency query emits for legacy rows, is
  * held to the published standard rather than to nothing. Falling back to no target would quietly drop
  * the band off the card, which reads as "this metric has no expectation" instead of "this tier has no
  * tuning yet".
@@ -203,9 +317,13 @@ export const TIER_TARGET_OVERRIDES: Record<string, Partial<Record<LatencyTier, B
 export function targetFor(key: string, tier?: string | null): MetricTarget | undefined {
   const base = METRIC_TARGETS[key];
   if (!base) return undefined;
-  const band = tier ? TIER_TARGET_OVERRIDES[key]?.[tier as LatencyTier] : undefined;
+  // `tier` is a CLASSIFICATION; the band is read under the default model it declares (`models.default`).
+  const selectionKey = tier ? classificationOf(tier)?.models?.default : undefined;
+  const band = selectionKey ? TIER_TARGET_OVERRIDES[key]?.[selectionKey] : undefined;
   if (!band) return base;
-  return { ...base, ...band, label: `${base.label} (${tier})` };
+  // The tier is RETURNED rather than appended to a string: '(premium)' inside an English label cannot
+  // be translated, and a view that needs the suffix composes it from `tierLabel`.
+  return { ...base, ...band, tierLabel: tier ?? undefined };
 }
 
 export function evaluateTarget(value: number, t: MetricTarget): TargetStatus {
@@ -233,3 +351,43 @@ export const STATUS_VAR: Record<TargetStatus, string> = {
 };
 const STATUS_GLYPH: Record<TargetStatus, string> = { good: '✓', warn: '⚠', bad: '✗' };
 export function statusGlyph(s: TargetStatus): string { return STATUS_GLYPH[s]; }
+
+/** A metric with a definition and no target: named, defined and sourced like a target, never judged. */
+export type MetricDefinition = Pick<MetricTarget, 'labelKey' | 'descriptionKey' | 'provenance'>;
+
+const AQ = 'backend/lambda/src/analytics-aurora/analytics-query.ts';
+const defined = (id: string, guide: DocLinkKey, symbol: string): MetricDefinition => ({
+  labelKey: `admin.metrics.${id}.label`,
+  descriptionKey: `admin.metrics.${id}.description`,
+  provenance: { guide, file: AQ, symbol },
+});
+
+/**
+ * THE REST OF THE GLOSSARY. Every figure the console prints has one definition, in `admin.metrics.*`,
+ * read by its card's tooltip; the ones with a band live in METRIC_TARGETS above, these have none.
+ * `metric-help-is-short-and-sourced.test.ts` holds both registries to the same rules.
+ */
+export const METRIC_DEFINITIONS: Record<string, MetricDefinition> = {
+  client_ttff_ms: defined('client_ttff_ms', 'latencyTargets', 'getClientServerLatency'),
+  inbound_ms: defined('inbound_ms', 'latencyTargets', 'getLatencyMetrics'),
+  router_ms: defined('router_ms', 'latencyTargets', 'getLatencyMetrics'),
+  classifier_ms: defined('classifier_ms', 'latencyTargets', 'getLatencyMetrics'),
+  cold_start_rate: defined('cold_start_rate', 'latencyTargets', 'getLatencyMetrics'),
+  placeholder_resolve_ms: defined('placeholder_resolve_ms', 'latencyTargets', 'getLatencyMetrics'),
+  guard_ms: defined('guard_ms', 'latencyTargets', 'getLatencyMetrics'),
+  poll_rate: defined('poll_rate', 'latencyTargets', 'getLatencyMetrics'),
+  poll_ms: defined('poll_ms', 'latencyTargets', 'getLatencyMetrics'),
+  model_ms: defined('model_ms', 'latencyTargets', 'getLatencyMetrics'),
+  tool_ms: defined('tool_ms', 'latencyTargets', 'getLatencyMetrics'),
+  tail_ms: defined('tail_ms', 'latencyTargets', 'getLatencyMetrics'),
+  grounded_rate: defined('grounded_rate', 'evaluationDesign', 'getIntentEffectiveness'),
+  compliance_rate: defined('compliance_rate', 'evaluationDesign', 'getIntentEffectiveness'),
+  passages_used: defined('passages_used', 'evaluationDesign', 'getIntentEffectiveness'),
+  flags_raised: defined('flags_raised', 'evaluationDesign', 'getFlaggedResponses'),
+  workflow_refusals: defined('workflow_refusals', 'effectiveness', 'getIntentEffectiveness'),
+  platform_actions: defined('platform_actions', 'effectiveness', 'getIntentEffectiveness'),
+  volume: defined('volume', 'effectiveness', 'getIntentEffectiveness'),
+  e2e_p95_ms: defined('e2e_p95_ms', 'effectiveness', 'getIntentEffectiveness'),
+  flow_score: defined('flow_score', 'effectiveness', 'getFlows'),
+  user_positive_rate: defined('user_positive_rate', 'evaluationDesign', 'getIntentEffectiveness'),
+};

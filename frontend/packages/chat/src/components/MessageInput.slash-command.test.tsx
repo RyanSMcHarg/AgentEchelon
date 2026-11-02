@@ -55,8 +55,12 @@ vi.mock('../providers/ConversationProvider.chime', () => ({
 }));
 // Full replacement, not importOriginal: the real @ae/shared barrel reaches AWS SDK modules that
 // never settle under jsdom and hang the run at import time.
+// The sender is the ARN the messaging client acts as, never a field of the signed-in user.
+vi.mock('../providers/AwsClientProvider', () => ({
+  useAwsClient: () => ({ userArn: SELF, isInitialized: true, error: null }),
+}));
 vi.mock('@ae/shared', () => ({
-  useAuth: () => ({ user: { userArn: SELF, isAdmin: false } }),
+  useAuth: () => ({ user: { id: 'self', isAdmin: false } }),
   trackEvent: () => {},
 }));
 vi.mock('../services/attachmentService', () => ({ uploadFile: vi.fn() }));

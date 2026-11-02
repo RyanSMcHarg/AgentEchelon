@@ -8,8 +8,12 @@ export interface FunnelStep {
   label: string;
   /** Total event count for this step (events.COUNT(*)). */
   eventCount: number;
-  /** Distinct sessions that hit this step (events.COUNT DISTINCT session_id). */
+  /** Distinct sessions that recorded this step at or after the funnel's first step, so every step is a
+   *  subset of the first (`backend/lambda/src/lib/session-funnels.ts`). */
   sessionCount: number;
+  /** Distinct sessions that recorded this step with no first step before it: reported apart, never
+   *  counted in `sessionCount`. */
+  outsideSessions?: number;
 }
 
 interface FunnelChartProps {

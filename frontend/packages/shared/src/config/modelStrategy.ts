@@ -1,14 +1,14 @@
-export type ModelTier = 'basic' | 'standard' | 'premium';
+// Mirrors the backend's Bedrock text catalog (`backend/lib/config/model-strategy.ts`), which names no classification:
+// which models a classification uses is its own selection (`models` on each entry of GET /classifications).
 export type ProviderKey = 'anthropic' | 'amazon' | 'openai' | 'deepseek';
 export type ModelStrategyKey =
-  | 'haiku' | 'sonnet' | 'opus' | 'titan' | 'gpt_oss_20b' | 'gpt_oss_120b' | 'deepseek_v3';
+  | 'haiku' | 'sonnet' | 'opus' | 'titan' | 'gpt_oss_20b' | 'gpt_oss_120b' | 'deepseek_v3' | 'deepseek_r1';
 
 export interface ModelStrategyCard {
   key: ModelStrategyKey;
   provider: ProviderKey;
   bedrockModelId: string;
   displayName: string;
-  allowedTiers: ModelTier[];
   strengths: string[];
   costClass: 'low' | 'medium' | 'high';
   latencyClass: 'fast' | 'balanced' | 'deep';
@@ -19,7 +19,6 @@ export interface ModelStrategyCard {
 export interface IntentStrategyCard {
   intent: string;
   label: string;
-  preferredTier: ModelTier;
   primaryModel: ModelStrategyKey;
   fallbackModel: ModelStrategyKey;
   rationale: string;
@@ -29,9 +28,8 @@ export const MODEL_STRATEGY_MODELS: ModelStrategyCard[] = [
   {
     key: 'haiku',
     provider: 'anthropic',
-    bedrockModelId: 'anthropic.claude-3-haiku-20240307-v1:0',
-    displayName: 'Claude Haiku',
-    allowedTiers: ['basic', 'standard', 'premium'],
+    bedrockModelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+    displayName: 'Claude Haiku 4.5',
     strengths: ['fast replies', 'low-cost triage', 'simple extraction'],
     costClass: 'low',
     latencyClass: 'fast',
@@ -43,7 +41,6 @@ export const MODEL_STRATEGY_MODELS: ModelStrategyCard[] = [
     provider: 'anthropic',
     bedrockModelId: 'anthropic.claude-sonnet-4-6',
     displayName: 'Claude Sonnet 4.6',
-    allowedTiers: ['standard', 'premium'],
     strengths: ['coding tasks', 'reasoning', 'tool reliability'],
     costClass: 'medium',
     latencyClass: 'balanced',
@@ -55,7 +52,6 @@ export const MODEL_STRATEGY_MODELS: ModelStrategyCard[] = [
     provider: 'anthropic',
     bedrockModelId: 'anthropic.claude-opus-4-6-v1',
     displayName: 'Claude Opus 4.6',
-    allowedTiers: ['premium'],
     strengths: ['deep analysis', 'complex architecture', 'high-stakes reasoning'],
     costClass: 'high',
     latencyClass: 'deep',
@@ -70,7 +66,6 @@ export const MODEL_STRATEGY_MODELS: ModelStrategyCard[] = [
     // unnoticed - the key kept working while the console advertised a retired model by name.
     bedrockModelId: 'amazon.nova-pro-v1:0',
     displayName: 'Amazon Nova Pro',
-    allowedTiers: ['standard', 'premium'],
     strengths: ['summaries', 'structured drafting', 'bedrock-native fallback'],
     costClass: 'medium',
     latencyClass: 'balanced',
@@ -82,7 +77,6 @@ export const MODEL_STRATEGY_MODELS: ModelStrategyCard[] = [
     provider: 'openai',
     bedrockModelId: 'openai.gpt-oss-20b-1:0',
     displayName: 'OpenAI GPT-OSS 20B',
-    allowedTiers: ['standard', 'premium'],
     strengths: ['low-cost coding support', 'fast drafting', 'OpenAI-on-Bedrock option'],
     costClass: 'medium',
     latencyClass: 'balanced',
@@ -94,7 +88,6 @@ export const MODEL_STRATEGY_MODELS: ModelStrategyCard[] = [
     provider: 'openai',
     bedrockModelId: 'openai.gpt-oss-120b-1:0',
     displayName: 'OpenAI GPT-OSS 120B',
-    allowedTiers: ['premium'],
     strengths: ['deeper coding analysis', 'larger open-weight reasoning', 'OpenAI-on-Bedrock experimentation'],
     costClass: 'high',
     latencyClass: 'deep',
@@ -106,7 +99,6 @@ export const MODEL_STRATEGY_MODELS: ModelStrategyCard[] = [
     provider: 'deepseek',
     bedrockModelId: 'deepseek.v3.2',
     displayName: 'DeepSeek V3.2 (Bedrock)',
-    allowedTiers: ['standard', 'premium'],
     strengths: ['Chinese fluency', 'strong reasoning', 'low-cost open-weight'],
     costClass: 'low',
     latencyClass: 'balanced',
@@ -116,13 +108,23 @@ export const MODEL_STRATEGY_MODELS: ModelStrategyCard[] = [
       + 'turn routes here and replies in Chinese. Was missing from this mirror while present in the backend '
       + 'catalog, which made it unselectable in the experiments form - see model-catalog-mirror.test.ts.',
   },
+  {
+    key: 'deepseek_r1',
+    provider: 'deepseek',
+    bedrockModelId: 'us.deepseek.r1-v1:0',
+    displayName: 'DeepSeek R1 (Bedrock)',
+    strengths: ['step-by-step reasoning', 'Chinese fluency'],
+    costClass: 'medium',
+    latencyClass: 'deep',
+    codingFit: 'good',
+    deploymentNotes: 'The reasoning model context routing sends a reasoning intent to (SPEC-CONTEXT-AWARE-MODEL-ROUTING).',
+  },
 ];
 
 export const INTENT_STRATEGY_CARDS: IntentStrategyCard[] = [
   {
-    intent: 'general_qa',
+    intent: 'general',
     label: 'General Q&A',
-    preferredTier: 'basic',
     primaryModel: 'haiku',
     fallbackModel: 'titan',
     rationale: 'Fast, low-cost answers should default to the cheapest capable model.',
@@ -130,7 +132,6 @@ export const INTENT_STRATEGY_CARDS: IntentStrategyCard[] = [
   {
     intent: 'code_generation',
     label: 'Code Generation',
-    preferredTier: 'standard',
     primaryModel: 'sonnet',
     fallbackModel: 'gpt_oss_20b',
     rationale: 'Coding tasks should be able to route to either Anthropic or OpenAI-on-Bedrock depending on deployment preference and observed quality.',
@@ -138,15 +139,13 @@ export const INTENT_STRATEGY_CARDS: IntentStrategyCard[] = [
   {
     intent: 'code_review',
     label: 'Code Review',
-    preferredTier: 'standard',
     primaryModel: 'gpt_oss_20b',
     fallbackModel: 'sonnet',
     rationale: 'Code review should expose an OpenAI-on-Bedrock option while keeping Sonnet as a same-tier fallback.',
   },
   {
-    intent: 'document_extraction',
+    intent: 'data_extraction',
     label: 'Document Extraction',
-    preferredTier: 'basic',
     primaryModel: 'haiku',
     fallbackModel: 'titan',
     rationale: 'Extraction should optimize for throughput and cost before premium reasoning.',
@@ -154,7 +153,6 @@ export const INTENT_STRATEGY_CARDS: IntentStrategyCard[] = [
   {
     intent: 'report_generation',
     label: 'Report Generation',
-    preferredTier: 'standard',
     primaryModel: 'titan',
     fallbackModel: 'sonnet',
     rationale: 'Structured drafting benefits from a stable drafting model with a stronger analytical fallback.',
@@ -162,15 +160,13 @@ export const INTENT_STRATEGY_CARDS: IntentStrategyCard[] = [
   {
     intent: 'strategic_analysis',
     label: 'Strategic Analysis',
-    preferredTier: 'premium',
     primaryModel: 'opus',
     fallbackModel: 'sonnet',
     rationale: 'Strategic work should route to the deepest reasoning model available.',
   },
   {
-    intent: 'workflow_actions',
+    intent: 'guided_troubleshooting',
     label: 'Workflow Actions',
-    preferredTier: 'standard',
     primaryModel: 'sonnet',
     fallbackModel: 'titan',
     rationale: 'Tool-heavy workflows should prioritize action-group reliability.',
@@ -191,12 +187,6 @@ export const PROVIDER_POSITIONING = [
     summary: 'Routing metadata is capability-first, so Bedrock-native OpenAI, Anthropic, Amazon, and later providers can all fit the same operating model.',
   },
 ];
-
-export const DEFAULT_TIER_MODEL_SELECTION: Record<ModelTier, ModelStrategyKey> = {
-  basic: 'haiku',
-  standard: 'sonnet',
-  premium: 'opus',
-};
 
 export function getModelStrategyLookup(): Record<ModelStrategyKey, ModelStrategyCard> {
   return Object.fromEntries(MODEL_STRATEGY_MODELS.map((model) => [model.key, model])) as Record<ModelStrategyKey, ModelStrategyCard>;
@@ -223,28 +213,57 @@ const IMAGE_GEN_MODEL_DISPLAY_NAMES: Record<string, string> = {
 /**
  * Resolve a raw model id (as recorded on analytics rows) to a friendly display name.
  * Prefers the text model catalog, then the image-gen display map, and falls back to
- * the raw id unchanged (honest — never a fabricated name) so an unrecognised or empty
+ * the raw id unchanged (honest — never a fabricated name) so an unrecognized or empty
  * id still renders as-is. Image turns record an image model id that the text catalog
  * cannot name, so this is what keeps them from showing a raw id in the dashboard.
  */
 export function modelDisplayName(modelId: string | null | undefined): string {
   if (!modelId) return '';
-  const text = MODEL_STRATEGY_MODELS.find((m) => m.bedrockModelId === modelId);
+  const id = profileIdFromArn(modelId);
+  const bare = id.replace(GEO_PREFIX, '');
+  const text = MODEL_STRATEGY_MODELS.find(
+    (m) => m.bedrockModelId === id || m.bedrockModelId.replace(GEO_PREFIX, '') === bare,
+  );
   if (text) return text.displayName;
-  return IMAGE_GEN_MODEL_DISPLAY_NAMES[modelId] ?? modelId;
+  return IMAGE_GEN_MODEL_DISPLAY_NAMES[id] ?? IMAGE_GEN_MODEL_DISPLAY_NAMES[bare] ?? id;
 }
 
-export function getTierModelSelection(): Record<ModelTier, ModelStrategyCard> {
-  const lookup = getModelStrategyLookup();
-  const resolve = (tier: ModelTier): ModelStrategyCard => {
-    const envKey = import.meta.env[`VITE_${tier.toUpperCase()}_MODEL_KEY` as 'VITE_BASIC_MODEL_KEY'];
-    const chosenKey = (envKey && lookup[envKey as ModelStrategyKey]) ? envKey as ModelStrategyKey : DEFAULT_TIER_MODEL_SELECTION[tier];
-    return lookup[chosenKey];
-  };
+/**
+ * THE ID AN ANALYTICS ROW CARRIES IS NOT ALWAYS A BARE MODEL ID.
+ *
+ * The battle path, and any inference-profile-only model, records the full profile ARN:
+ * `arn:aws:bedrock:us-east-1:123456789012:inference-profile/us.anthropic.claude-opus-4-6-v1`. That is
+ * around ninety characters, and a catalog lookup keyed on the bare id misses it — so it reaches a
+ * surface as the raw ARN, and one model makes a cost card's mix run several lines tall.
+ *
+ * Same rule the backend already applies (`backend/lambda/src/lib/model-rate-table.ts`,
+ * `profileIdFromArn`): take the segment after `inference-profile/`, and pass anything else through
+ * unchanged, so a bare model id or a bare profile id is untouched.
+ */
+function profileIdFromArn(id: string): string {
+  const marker = 'inference-profile/';
+  const i = id.indexOf(marker);
+  return i === -1 ? id : id.slice(i + marker.length);
+}
 
-  return {
-    basic: resolve('basic'),
-    standard: resolve('standard'),
-    premium: resolve('premium'),
-  };
+/**
+ * A cross-region inference profile prefixes the model id with its geography. The catalog stores some
+ * ids with the prefix (`us.anthropic.claude-haiku-...`) and some without (`anthropic.claude-sonnet-4-6`),
+ * so a lookup has to try both rather than assume one spelling.
+ */
+const GEO_PREFIX = /^(us|eu|apac|us-gov)\./;
+
+/**
+ * THE MODEL A CLASSIFICATION'S ASSISTANT ANSWERS ON BY DEFAULT, for the New conversation picker's label and
+ * the create call: its own declared default (`models.default`, carried in `GET /classifications`). Undefined
+ * for a classification that declares none, or a default this mirror cannot name.
+ */
+export function modelForClassification(c: { models?: { default: string } } | undefined): ModelStrategyCard | undefined {
+  const key = c?.models?.default;
+  return key ? getModelStrategyLookup()[key as ModelStrategyKey] : undefined;
+}
+
+/** Whether a classification selects this model (`models.selected`, carried in `GET /classifications`). */
+export function classificationSelectsModel(c: { models?: { selected: string[] } } | undefined, key: string): boolean {
+  return !!c?.models?.selected.includes(key);
 }

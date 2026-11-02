@@ -27,7 +27,7 @@ export function AwsClientProvider({ children }: { children: ReactNode }) {
 
       try {
         setError(null);
-        await chimeService.initialize(idToken, user.id);
+        await chimeService.initialize(idToken, user.userArn);
         setUserArn(chimeService.getUserArn());
         setIsInitialized(true);
       } catch (err) {

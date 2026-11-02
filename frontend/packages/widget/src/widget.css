@@ -1,0 +1,332 @@
+/*
+ * The widget frame's styles, on the shared design tokens (`@ae/shared/styles/design-tokens.css`,
+ * docs/guides/developer/DESIGN-SYSTEM.md). A host changes only the declared subset (theme.ts):
+ * `--accent-500`, the `--radius-*` scale, `--font-sans`, and light or dark.
+ */
+
+/* A host that asks for light gets light even when the person's system prefers dark. */
+[data-theme="light"] {
+  --surface-0: #FFFFFF;
+  --surface-50: #FAFAFA;
+  --surface-100: #F4F4F5;
+  --surface-200: #E4E4E7;
+  --surface-300: #D4D4D8;
+  --text-primary: #09090B;
+  --text-secondary: #71717A;
+  --text-tertiary: #A1A1AA;
+  --text-inverse: #FAFAFA;
+}
+
+html, body, #root {
+  margin: 0;
+  padding: 0;
+  height: 100%;
+  background: transparent;
+}
+
+.aeaw {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: flex-end;
+  justify-content: flex-end;
+  gap: var(--space-3);
+  padding: var(--space-2);
+  box-sizing: border-box;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--text-md, 14px);
+  line-height: var(--leading-normal, 1.5);
+}
+
+.aeaw *, .aeaw *::before, .aeaw *::after { box-sizing: border-box; }
+
+.aeaw__visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  overflow: hidden;
+  clip: rect(0 0 0 0);
+  white-space: nowrap;
+}
+
+.aeaw :focus-visible {
+  outline: 2px solid var(--accent-500);
+  outline-offset: 2px;
+}
+
+/* ── the launcher ─────────────────────────────────────────────────────────────────────────── */
+.aeaw__launcher {
+  flex: 0 0 auto;
+  width: 52px;
+  height: 52px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: var(--radius-full);
+  background: var(--accent-500);
+  color: var(--text-on-accent);
+  box-shadow: var(--shadow-lg);
+  cursor: pointer;
+  transition: background var(--duration-fast, 120ms) var(--ease-out, ease-out);
+}
+.aeaw__launcher:hover { background: var(--accent-600); }
+
+/* ── the panel ────────────────────────────────────────────────────────────────────────────── */
+.aeaw__window {
+  flex: 1 1 auto;
+  width: 100%;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--surface-0);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-xl);
+}
+
+.aeaw__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-bottom: 1px solid var(--surface-200);
+}
+.aeaw__title {
+  margin: 0;
+  font-size: var(--text-base);
+  font-weight: 600;
+}
+.aeaw__ctrl {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-1);
+  color: var(--text-secondary);
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+.aeaw__ctrl:hover { color: var(--text-primary); background: var(--surface-100); }
+
+.aeaw__body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+}
+
+/* ── the transcript ───────────────────────────────────────────────────────────────────────── */
+.aeaw__messages {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  padding: var(--space-3);
+}
+.aeaw__messages-content {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.aeaw__jump {
+  align-self: center;
+  margin: 0 0 var(--space-1);
+  padding: var(--space-1) var(--space-3);
+  border: none;
+  border-radius: var(--radius-lg);
+  background: var(--accent-500);
+  color: var(--text-on-accent);
+  font-size: var(--text-xs);
+  cursor: pointer;
+}
+.aeaw__row {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-width: 90%;
+}
+.aeaw__row--mine { align-self: flex-end; align-items: flex-end; }
+.aeaw__row--other { align-self: flex-start; align-items: flex-start; }
+.aeaw__meta {
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+.aeaw__msg {
+  padding: var(--space-2) var(--space-3);
+  border-radius: var(--radius-lg);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.aeaw__msg--mine { background: var(--accent-500); color: var(--text-on-accent); }
+.aeaw__msg--other { background: var(--surface-100); color: var(--text-primary); }
+.aeaw__msg .aeaw__p { margin: 0; white-space: pre-wrap; }
+.aeaw__msg .aeaw__p + .aeaw__p,
+.aeaw__msg .aeaw__p + .aeaw__ul,
+.aeaw__msg .aeaw__p + .aeaw__ol,
+.aeaw__msg .aeaw__ul + .aeaw__p,
+.aeaw__msg .aeaw__ol + .aeaw__p,
+.aeaw__msg .aeaw__h { margin-top: var(--space-2); }
+.aeaw__msg .aeaw__h { margin-bottom: 0; font-weight: 600; }
+.aeaw__msg .aeaw__ul, .aeaw__msg .aeaw__ol { margin: 0; padding-left: var(--space-5); }
+.aeaw__msg .aeaw__link { color: inherit; text-decoration: underline; }
+.aeaw__msg .aeaw__code {
+  font-family: var(--font-mono);
+  font-size: 0.85em;
+  background: var(--surface-200);
+  padding: 0 var(--space-1);
+  border-radius: var(--radius-sm);
+}
+.aeaw__msg .aeaw__img { max-width: 100%; border-radius: var(--radius-md); }
+
+.aeaw__status {
+  min-height: 1.25em;
+  padding: 0 var(--space-3);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+}
+
+/* ── the composer ─────────────────────────────────────────────────────────────────────────── */
+.aeaw__composer {
+  display: flex;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3) var(--space-3);
+  border-top: 1px solid var(--surface-200);
+}
+.aeaw__input {
+  flex: 1 1 auto;
+  resize: none;
+  max-height: var(--input-max-height, 200px);
+  padding: var(--space-2);
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--surface-0);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+}
+.aeaw__input:focus { border-color: var(--accent-500); box-shadow: var(--shadow-glow); outline: none; }
+.aeaw__send, .aeaw__action {
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+  font-weight: 600;
+  color: var(--text-on-accent);
+  background: var(--accent-500);
+  border: none;
+  border-radius: var(--radius-md);
+  cursor: pointer;
+}
+.aeaw__send:disabled, .aeaw__action:disabled { opacity: 0.5; cursor: default; }
+
+/* ── the notice, the hints and the refusals ───────────────────────────────────────────────── */
+.aeaw__notice, .aeaw__refusal, .aeaw__hint {
+  margin: auto var(--space-4);
+  padding: var(--space-4) 0;
+}
+.aeaw__notice-title, .aeaw__refusal-title { margin: 0 0 var(--space-2); font-size: var(--text-md, 14px); }
+.aeaw__notice-body, .aeaw__refusal-body { margin: 0 0 var(--space-3); color: var(--text-secondary); }
+.aeaw__notice-version { margin: 0 0 var(--space-3); font-size: var(--text-xs); color: var(--text-tertiary); }
+.aeaw__hint { color: var(--text-secondary); }
+.aeaw__captcha:empty { display: none; }
+.aeaw__captcha { padding: 0 var(--space-3) var(--space-3); }
+
+/* ── the invitation landing page (invite.html) ────────────────────────────────────────────── */
+body:has(.aeinv) { background: var(--surface-50); }
+.aeinv {
+  min-height: 100%;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: var(--space-4);
+  box-sizing: border-box;
+  color: var(--text-primary);
+  font-family: var(--font-sans);
+  font-size: var(--text-md, 14px);
+  line-height: var(--leading-normal, 1.5);
+}
+.aeinv *, .aeinv *::before, .aeinv *::after { box-sizing: border-box; }
+.aeinv :focus-visible { outline: 2px solid var(--accent-500); outline-offset: 2px; }
+.aeinv__card {
+  width: 100%;
+  max-width: 440px;
+  padding: var(--space-6);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-lg);
+  background: var(--surface-0);
+  box-shadow: var(--shadow-md);
+}
+.aeinv__title { margin: 0 0 var(--space-3); font-size: var(--text-lg, 18px); font-weight: 600; }
+.aeinv__body { margin: 0 0 var(--space-3); color: var(--text-primary); }
+.aeinv__body--quiet { color: var(--text-secondary); font-size: var(--text-sm); }
+.aeinv__conversation {
+  width: 100%;
+  max-width: 720px;
+  height: min(720px, calc(100vh - 2 * var(--space-4)));
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-lg);
+  background: var(--surface-0);
+  overflow: hidden;
+}
+.aeinv__banner {
+  margin: 0;
+  padding: var(--space-2) var(--space-3);
+  background: var(--surface-100);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  border-bottom: 1px solid var(--surface-200);
+}
+
+/* ── keeping the visit, and the secondary actions ─────────────────────────────────────────── */
+.aeaw__secondary {
+  display: inline-block;
+  margin-top: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  font: inherit;
+  color: var(--text-primary);
+  background: transparent;
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  cursor: pointer;
+  text-decoration: none;
+}
+.aeaw__secondary:hover { background: var(--surface-100); }
+.aeaw__link-action { display: inline-block; text-decoration: none; text-align: center; }
+.aeaw__refusal .aeaw__secondary { margin-left: var(--space-2); }
+/* The visit carrying over, in the conversation: signing in (path A) and leaving details (path B). */
+.aeaw__carry {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-2) var(--space-3);
+  border-top: 1px solid var(--surface-200);
+  max-height: 50%;
+  overflow-y: auto;
+}
+.aeaw__carry .aeaw__secondary { margin-top: 0; font-size: var(--text-sm); padding: var(--space-1) var(--space-2); align-self: flex-start; }
+.aeaw__carry-hint { margin: 0; font-size: var(--text-sm); color: var(--text-secondary); }
+.aeaw__register summary { cursor: pointer; font-size: var(--text-sm); color: var(--text-primary); }
+.aeaw__register form { display: flex; flex-direction: column; gap: var(--space-2); padding-top: var(--space-2); }
+.aeaw__keep {
+  margin: auto var(--space-4);
+  padding: var(--space-4) 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  overflow-y: auto;
+}
+.aeaw__field { display: flex; flex-direction: column; gap: var(--space-1); font-size: var(--text-sm); color: var(--text-secondary); }
+.aeaw__field input, .aeaw__field textarea {
+  padding: var(--space-2);
+  font: inherit;
+  color: var(--text-primary);
+  background: var(--surface-0);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+}
+.aeaw__field input:focus, .aeaw__field textarea:focus { border-color: var(--accent-500); box-shadow: var(--shadow-glow); outline: none; }
+.aeaw__field-error { margin: 0; color: var(--error); font-size: var(--text-sm); }

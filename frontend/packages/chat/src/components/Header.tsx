@@ -2,14 +2,17 @@ import React from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuth, ADMIN_APP_URL } from '@ae/shared';
 import ConnectionStatus from './ConnectionStatus';
+import AccountMenu from './AccountMenu';
 import './Header.css';
 
 interface HeaderProps {
   /** Return to the app home (brand click). */
   onHome?: () => void;
+  /** Open Account settings, from the account menu. */
+  onOpenSettings?: () => void;
 }
 
-const Header: React.FC<HeaderProps> = ({ onHome }) => {
+const Header: React.FC<HeaderProps> = ({ onHome, onOpenSettings }) => {
   const { t } = useTranslation();
   const { user, logout } = useAuth();
 
@@ -39,7 +42,9 @@ const Header: React.FC<HeaderProps> = ({ onHome }) => {
             The admin console is a separate app; this is only a URL, so the chat
             bundle carries no operator code (assert-no-admin-in-chat.mjs). Shown to
             admins when VITE_ADMIN_APP_URL is set; a deployer can point it at their
-            own admin surface. Opens in a new tab; the admin app enforces its own auth.
+            own admin surface. Opens in a new tab. `isAdmin` is a display hint that
+            grants nothing; the console's admin vend, with a console session and a
+            stated reason, is the only admin grant.
           */}
           {user?.isAdmin && ADMIN_APP_URL && (
             <a
@@ -53,13 +58,7 @@ const Header: React.FC<HeaderProps> = ({ onHome }) => {
             </a>
           )}
           {user && (
-            <button
-              className="header-logout-btn"
-              onClick={logout}
-              title={t('header.signOut')}
-            >
-              {t('header.signOut')}
-            </button>
+            <AccountMenu name={user.name || user.email || ''} onOpenSettings={onOpenSettings ?? (() => {})} onSignOut={logout} />
           )}
         </div>
       </div>

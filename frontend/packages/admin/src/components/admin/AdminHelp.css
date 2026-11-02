@@ -14,13 +14,13 @@
   display: inline-flex;
   align-items: center;
   justify-content: center;
-  width: 16px;
-  height: 16px;
+  width: 20px;
+  height: 20px;
   padding: 0;
   border: none;
   background: none;
   color: var(--text-tertiary);
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1;
   cursor: help;
   border-radius: var(--radius-full);
@@ -32,7 +32,12 @@
 .info-tip-trigger:focus-visible {
   color: var(--text-primary);
   background: var(--surface-100);
-  outline: none;
+}
+
+/* The trigger keeps the console focus ring: the background change alone is too faint to find. */
+.info-tip-trigger:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
 }
 
 .info-tip-content {
@@ -60,17 +65,75 @@
   animation: fadeIn var(--duration-fast) var(--ease-out);
 }
 
+/* A documentation link: the link color, set inside the sentence that gives its reason, so it takes the
+   size of that sentence rather than one of its own. */
 .doc-link {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  color: var(--accent-500);
-  font-size: var(--text-sm);
-  font-weight: 500;
-  text-decoration: none;
-  white-space: nowrap;
+  color: var(--link-color);
+  font-size: inherit;
+  font-weight: 600;
+  text-decoration: underline;
+  text-decoration-thickness: 1px;
+  text-underline-offset: 2px;
 }
 
 .doc-link:hover {
-  text-decoration: underline;
+  text-decoration-thickness: 2px;
+}
+
+/* The two lines under a metric explanation: where it is defined, and where it is computed. */
+.metric-provenance {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+}
+
+/* HELP BEHIND A ? CONTROL (HelpToggle). The button sits beside a heading; the panel it opens takes the full row under
+   it, so the help is read in place and never covers a control. `display: contents` lets both join the heading's row. */
+.admin-help-toggle {
+  display: contents;
+}
+.admin-help-toggle-button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.5rem;
+  height: 1.5rem;
+  padding: 0;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius-full);
+  background: var(--surface-0);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+}
+.admin-help-toggle-button:hover,
+.admin-help-toggle-button[aria-expanded="true"] {
+  border-color: var(--accent-500);
+  color: var(--accent-700);
+  background: var(--accent-50);
+}
+.admin-help-toggle-button:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 1px;
+}
+.admin-help-toggle-panel {
+  flex-basis: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  max-width: 72ch;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--info-border);
+  border-left: 3px solid var(--info);
+  border-radius: var(--radius-md);
+  background: var(--info-bg);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+}
+.admin-help-toggle-panel > p {
+  margin: 0;
 }

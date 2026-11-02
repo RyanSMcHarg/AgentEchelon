@@ -11,6 +11,7 @@ vi.mock('../../services/adminConversationService', () => ({
   listAdminConversationMessages: vi.fn(),
   listAdminConversationMembers: vi.fn(),
   getAdminMembershipHistory: vi.fn(),
+  getAdminConversationIdentities: vi.fn(),
   addAdminToConversation: vi.fn(),
   addAdminMember: vi.fn(),
   removeAdminMember: vi.fn(),
@@ -34,6 +35,9 @@ describe('ConversationsTab — redacted/deleted tombstones', () => {
     vi.mocked(svc.listAdminConversations).mockResolvedValue({ conversations: [], total: 0 });
     vi.mocked(svc.listAdminConversationMembers).mockResolvedValue([]);
     vi.mocked(svc.getAdminMembershipHistory).mockResolvedValue([]);
+    // No identity grant in these fixtures: the detail view renders participants by id, which is the
+    // default for every caller. See a-withheld-name-is-withheld-everywhere-it-rides.test.ts.
+    vi.mocked(svc.getAdminConversationIdentities).mockResolvedValue({});
     vi.mocked(svc.listAdminConversationMessages).mockResolvedValue(MESSAGES);
   });
 

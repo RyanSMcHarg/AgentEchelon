@@ -1,6 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import EffectivenessTab from './EffectivenessTab';
+import { EMPTY_FILTERS } from './PerformanceFilters';
 import type { AnalyticsResult } from '@ae/shared';
 import { queryAnalytics } from '../../services/analyticsService';
 
@@ -12,6 +13,16 @@ const result = (rows: Record<string, unknown>[]): AnalyticsResult =>
 
 // A bad-classification task intent + a healthy DIRECT intent. Worst-first ranking must float the bad
 // one above the healthy one despite the healthy one having far more volume.
+//
+// `report_generation` carries 40 exchanges rather than the 5 it once did. THE FIVE WAS DOING TWO JOBS
+// AND ONLY ONE WAS INTENDED: it made the row low-volume (the point - the healthy row still has 500,
+// so quality still has to beat volume) and it also put the row below MIN_RATE_POPULATION, where a
+// confidence of 30 is no longer reportable and therefore no longer ranks. This test is about ranking
+// by quality rather than volume, so the population is raised to where the rate is reportable and the
+// property it means to assert is the only one left in the fixture.
+//
+// The suppressed case is not dropped - it is asserted deliberately in EffectivenessTab.lowN.test.tsx,
+// where a low-n rate must NOT float an intent to the top.
 const L0 = result([
   {
     intent: 'general_query', exchange_count: 500, direct_count: 500, task_count: 0,
@@ -20,7 +31,7 @@ const L0 = result([
     tool_calls: 0, tool_errors: 0, tool_error_rate: 0,
   },
   {
-    intent: 'report_generation', exchange_count: 5, direct_count: 0, task_count: 5,
+    intent: 'report_generation', exchange_count: 40, direct_count: 0, task_count: 5,
     avg_confidence: 30, reroute_rate: 4, task_completion_rate: 90, flow_composite: 85,
     avg_total_ms: 2000, p95_total_ms: 3000, cost_per_reply_usd: 0.02,
     tool_calls: 4, tool_errors: 0, tool_error_rate: 0,
@@ -33,7 +44,7 @@ describe('EffectivenessTab', () => {
   beforeEach(() => mockQuery.mockReset());
 
   it('L0: ranks intents worst-first (bad classification above healthy high-volume)', () => {
-    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} />);
+    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} filters={EMPTY_FILTERS} onFiltersChange={() => {}} />);
     const report = screen.getByRole('button', { name: 'report_generation' });
     const general = screen.getByRole('button', { name: 'general_query' });
     // report_generation (bad classification) must appear before general_query in DOM order.
@@ -41,11 +52,11 @@ describe('EffectivenessTab', () => {
   });
 
   it('drills L0 → L1 (intent cards) → L2 (task list) → L3 (turn timeline + steps)', async () => {
-    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} />);
+    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} filters={EMPTY_FILTERS} onFiltersChange={() => {}} />);
 
     // L1: click the intent → its metric cards + a Tasks drill button (it is a task intent).
     fireEvent.click(screen.getByRole('button', { name: 'report_generation' }));
-    expect(screen.getByText('Classification confidence')).toBeTruthy();
+    expect(screen.getByText('Routing confidence')).toBeTruthy();
     const tasksBtn = screen.getByRole('button', { name: /Tasks \(5\)/ });
 
     // L2: task list is fetched with the intent filter.
@@ -82,7 +93,7 @@ describe('EffectivenessTab', () => {
   });
 
   it('L2 (DIRECT intent) folds the per-exchange judge verdict into the exchange list', async () => {
-    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} />);
+    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} filters={EMPTY_FILTERS} onFiltersChange={() => {}} />);
     // general_query is a DIRECT intent (task_count 0) → an Exchanges drill.
     fireEvent.click(screen.getByRole('button', { name: 'general_query' }));
     const exBtn = screen.getByRole('button', { name: /Exchanges \(500\)/ });
@@ -100,15 +111,15 @@ describe('EffectivenessTab', () => {
   });
 
   it('L1 tool lens aggregates per-tool usage (calls + errors) from execution_steps for the intent', async () => {
-    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} />);
-    // Queue the L1 tool-lens fetch (execution_steps) BEFORE the click that fires it.
-    mockQuery.mockResolvedValueOnce(result([
+    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} filters={EMPTY_FILTERS} onFiltersChange={() => {}} />);
+    // Answer the L1 tool-lens fetch (execution_steps) by its type: the L1 view reads its step breakdown beside it.
+    mockQuery.mockImplementation(async (type) => (type === 'execution_steps' ? result([
       { intent: 'report_generation', steps: [
         { tools: [{ name: 'load_company_context', ok: true }, { name: 'advance_task_state', ok: false }] },
         { tools: [{ name: 'load_company_context', ok: true }] },
       ] },
       { intent: 'general_query', steps: [{ tools: [{ name: 'search', ok: true }] }] }, // other intent — must be ignored
-    ]));
+    ]) : result([])));
 
     fireEvent.click(screen.getByRole('button', { name: 'report_generation' }));
     await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('execution_steps', range, { limit: '200' }));
@@ -126,7 +137,7 @@ describe('EffectivenessTab', () => {
       { intent: 'report_generation', steps: [{ tools: [{ name: 'load_company_context', ok: true }] }] },
       { intent: 'general_query', steps: [{ tools: [{ name: 'load_company_context', ok: false }, { name: 'web_search', ok: true }] }] },
     ]));
-    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} />);
+    render(<EffectivenessTab data={L0} dateRange={range} isLoading={false} filters={EMPTY_FILTERS} onFiltersChange={() => {}} />);
 
     await waitFor(() => expect(mockQuery).toHaveBeenCalledWith('execution_steps', range, { limit: '200' }));
     // Spans both intents: load_company_context (2 calls) + web_search (1 call, from a different intent).
@@ -136,7 +147,7 @@ describe('EffectivenessTab', () => {
   });
 
   it('shows a loading state', () => {
-    render(<EffectivenessTab data={null} dateRange={range} isLoading={true} />);
+    render(<EffectivenessTab data={null} dateRange={range} isLoading={true} filters={EMPTY_FILTERS} onFiltersChange={() => {}} />);
     expect(screen.getByText(/Loading effectiveness/i)).toBeTruthy();
   });
 });

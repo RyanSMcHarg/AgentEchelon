@@ -200,7 +200,20 @@ body {
   border-bottom: 1px solid var(--chrome-border);
 }
 
+/* THE PANEL LIVES IN THE DARK SIDEBAR, SO IT MUST STATE ITS OWN COLOUR.
+
+   Not one rule in this block declared `color`, so every line inherited app body text - which is
+   #09090B in light mode - and rendered near-black on the #0A0A0B chrome. The count chip and the go
+   button set their own colours and stayed visible, so the panel read as present but empty rather
+   than broken. Reported exactly that way: the text cannot be seen, but you can tell it is there.
+
+   Chrome tokens, like every other sidebar element, so it follows the sidebar rather than the page. */
+.open-work-items {
+  color: var(--chrome-text);
+}
+
 .open-work-items-summary {
+  color: var(--chrome-text-bright);
   display: flex;
   align-items: center;
   gap: var(--space-3);
@@ -249,6 +262,9 @@ body {
 }
 
 .open-work-items-item-title {
+  /* The row's name, and what somebody scans to choose which item to finish, so it takes the bright
+     token rather than the dimmed one the supporting lines use. */
+  color: var(--chrome-text-bright);
   font-size: var(--text-sm);
   overflow: hidden;
   text-overflow: ellipsis;
@@ -260,16 +276,52 @@ body {
   opacity: 0.7;
 }
 
+/* WHAT THE STEP NEEDS, readable rather than decorative. It is the line that tells somebody whether
+   they can answer now or need to go and find something, so it is not dimmed as far as the location
+   line: that one is context, this one is the request. */
+.open-work-items-item-needs {
+  display: block;
+  font-size: var(--text-xs);
+  opacity: 0.85;
+  margin-top: 0.15rem;
+  line-height: 1.35;
+}
+
+.open-work-items-item-needs-label {
+  font-weight: 600;
+  opacity: 0.75;
+  margin-right: 0.35rem;
+}
+
+/* THE ONE CONTROL IN THE PANEL, AND IT WAS INVISIBLE THREE WAYS.
+
+   A button does NOT inherit `color` from an ancestor - it takes the UA `buttontext` default - so the
+   colour added to `.open-work-items` fixed the text around it and left this reading near-black on
+   near-black. On top of that its border was `--chrome-border` (#27272A on #0A0A0B, about 1.3:1) and
+   its background transparent, so there was no edge and no fill either. Dark label, invisible
+   outline, nothing behind it: the only way to find it was to know it was there.
+
+   Stated explicitly here for that reason - this is the element a person clicks to get to the work,
+   and it is the last thing in the panel that should be guessed at. */
 .open-work-items-item-go {
   flex: none;
   margin-left: auto;
   padding: var(--space-1) var(--space-3);
-  border: 1px solid var(--chrome-border);
+  border: 1px solid color-mix(in srgb, var(--chrome-text) 45%, transparent);
   border-radius: var(--radius-sm);
   background: transparent;
+  color: var(--chrome-text-bright);
   font-family: var(--font-sans);
   font-size: var(--text-xs);
   cursor: pointer;
+  transition:
+    background var(--duration-fast) var(--ease-in-out),
+    border-color var(--duration-fast) var(--ease-in-out);
+}
+
+.open-work-items-item-go:hover:not(:disabled) {
+  background: var(--chrome-hover);
+  border-color: var(--chrome-text);
 }
 
 /* An item held back by a running battle: still readable, plainly not actionable. Dimmed rather than

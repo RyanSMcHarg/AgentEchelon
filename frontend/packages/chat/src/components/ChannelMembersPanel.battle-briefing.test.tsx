@@ -57,12 +57,14 @@ vi.mock('../services/chimeService', () => ({
 vi.mock('../services/conversationManagementService', () => ({ removeConversationMember: vi.fn() }));
 // A full replacement, NOT `importOriginal`: pulling the real @ae/shared barrel here hangs the run at
 // import time (it reaches AWS SDK modules that never settle under jsdom). The panel only needs these
-// two runtime symbols from it; `ChannelMember` is a type and erases.
+// runtime symbols below from it; `ChannelMember` is a type and erases.
 vi.mock('@ae/shared', () => ({
   useAuth: () => ({ user: { isAdmin: true } }),
   listExperiments: () => Promise.resolve([]),
+  // The person API serves battle in this deployment, so the panel loads its config.
+  personApiServes: (capability: string) => capability === 'battle' || capability === 'core',
 }));
-// i18n is not initialised in this harness; the panel's copy all carries defaultValue, so return that.
+// i18n is not initialized in this harness; the panel's copy all carries defaultValue, so return that.
 vi.mock('react-i18next', () => ({
   useTranslation: () => ({ t: (_k: string, o?: { defaultValue?: string }) => o?.defaultValue ?? '' }),
 }));
@@ -88,7 +90,7 @@ describe('the battle section gates on the profile capability', () => {
   });
 
   it('HIDES the toggle when the profile is not battle-eligible', async () => {
-    // The behaviour that was never wired. The panel used to gate on `modelTier === 'premium'` read from
+    // The behavior that was never wired. The panel used to gate on `modelTier === 'premium'` read from
     // mutable channel metadata, so `battleEligible` was unobservable here: turning it on for a
     // non-premium profile left the toggle invisible, and turning it OFF for premium still showed it.
     getBattleConfig.mockResolvedValue({ channelArn: ARN, enabled: false, battleEligible: false });
@@ -141,7 +143,7 @@ describe('the battle toggle publishes its config change', () => {
 
   it('does not report anything when the enable FAILS — no phantom briefing', async () => {
     const onBattleConfigChange = vi.fn();
-    enableBattle.mockRejectedValue(new Error('Slot is bound to another active battle experiment'));
+    enableBattle.mockRejectedValue(new Error('The challenger is named by another active battle experiment'));
 
     render(<ChannelMembersPanel isOpen onClose={vi.fn()} onBattleConfigChange={onBattleConfigChange} />);
     fireEvent.click(await battleButton(/turn on|enable/i));

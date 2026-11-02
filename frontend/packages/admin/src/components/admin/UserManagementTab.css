@@ -87,33 +87,6 @@
   gap: var(--space-2);
 }
 
-.um-refresh-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  padding: var(--space-2) var(--space-3);
-  background: var(--surface-0);
-  border: 1px solid var(--surface-200);
-  border-radius: var(--radius-md);
-  font-family: var(--font-sans);
-  font-size: var(--text-sm);
-  font-weight: 500;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition: all var(--duration-base) var(--ease-in-out);
-}
-
-.um-refresh-btn:hover:not(:disabled) {
-  background: var(--surface-100);
-  color: var(--text-primary);
-  border-color: var(--surface-300);
-}
-
-.um-refresh-btn:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-
 .um-refresh-icon {
   display: inline-block;
   width: 14px;
@@ -123,7 +96,7 @@
   border-radius: 50%;
 }
 
-.um-refresh-btn:disabled .um-refresh-icon {
+.btn-secondary:disabled .um-refresh-icon {
   animation: spin 0.8s linear infinite;
 }
 
@@ -219,22 +192,11 @@
   letter-spacing: var(--tracking-wide);
 }
 
-.um-avatar--basic {
-  background: var(--tier-basic-bg);
-  color: var(--tier-basic);
-  border: 1px solid var(--surface-200);
-}
-
-.um-avatar--standard {
-  background: var(--tier-standard-bg);
-  color: var(--tier-standard);
-  border: 1px solid var(--info-border);
-}
-
-.um-avatar--premium {
-  background: var(--tier-premium-bg);
-  color: var(--tier-premium);
-  border: 1px solid var(--accent-200);
+/* In the person's classification color (`classificationBadgeStyle` sets `--cls-fg` and `--cls-bg`). */
+.um-avatar--cls {
+  background: var(--cls-bg);
+  color: var(--cls-fg);
+  border: 1px solid color-mix(in srgb, var(--cls-fg) 30%, transparent);
 }
 
 .um-avatar--none {
@@ -263,7 +225,7 @@
   display: flex;
   align-items: center;
   gap: var(--space-3);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   color: var(--text-tertiary);
 }
 
@@ -288,19 +250,14 @@
   text-transform: uppercase;
 }
 
-.um-tier-badge--basic {
-  background: var(--tier-basic-bg);
-  color: var(--tier-basic);
+.um-tier-badge--cls {
+  background: var(--cls-bg);
+  color: var(--cls-fg);
 }
 
-.um-tier-badge--standard {
-  background: var(--tier-standard-bg);
-  color: var(--tier-standard);
-}
-
-.um-tier-badge--premium {
-  background: var(--tier-premium-bg);
-  color: var(--tier-premium);
+.um-tier-badge--none {
+  background: var(--surface-100);
+  color: var(--text-tertiary);
 }
 
 .um-tier-badge--none {
@@ -339,108 +296,6 @@
   flex-shrink: 0;
 }
 
-.um-tier-select {
-  padding: var(--space-1) var(--space-2);
-  padding-right: var(--space-4);
-  border: 1px solid var(--surface-200);
-  border-radius: var(--radius-md);
-  font-family: var(--font-mono);
-  font-size: var(--text-xs);
-  font-weight: 500;
-  background: var(--surface-0);
-  color: var(--text-primary);
-  cursor: pointer;
-  transition: border-color var(--duration-fast) var(--ease-in-out);
-  appearance: none;
-  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12' fill='none'%3E%3Cpath d='M3 5L6 8L9 5' stroke='%2371717A' stroke-width='1.5' stroke-linecap='round'/%3E%3C/svg%3E");
-  background-repeat: no-repeat;
-  background-position: right 6px center;
-}
-
-.um-tier-select:hover:not(:disabled) {
-  border-color: var(--surface-300);
-}
-
-.um-tier-select:focus {
-  border-color: var(--accent-500);
-  box-shadow: var(--shadow-glow);
-  outline: none;
-}
-
-.um-tier-select:disabled {
-  opacity: 0.4;
-  cursor: not-allowed;
-}
-
-.um-action-btn {
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  gap: var(--space-1);
-  padding: var(--space-2) var(--space-3);
-  border: none;
-  border-radius: var(--radius-md);
-  font-family: var(--font-sans);
-  font-size: var(--text-xs);
-  font-weight: 600;
-  cursor: pointer;
-  transition: all var(--duration-fast) var(--ease-in-out);
-  letter-spacing: var(--tracking-wide);
-  white-space: nowrap;
-}
-
-.um-action-btn:hover {
-  transform: translateY(-1px);
-  box-shadow: var(--shadow-sm);
-}
-
-.um-action-btn:active {
-  transform: translateY(0);
-}
-
-.um-action-btn--approve {
-  background: var(--success);
-  color: white;
-}
-
-.um-action-btn--approve:hover {
-  background: #16a34a;
-}
-
-.um-action-btn--reject {
-  background: transparent;
-  color: var(--text-tertiary);
-  border: 1px solid var(--surface-200);
-}
-
-.um-action-btn--reject:hover {
-  color: var(--error);
-  border-color: var(--error-border);
-  background: var(--error-bg);
-}
-
-.um-action-btn--enable {
-  background: transparent;
-  color: var(--info);
-  border: 1px solid var(--info-border);
-}
-
-.um-action-btn--enable:hover {
-  background: var(--info-bg);
-}
-
-.um-action-btn--disable {
-  background: transparent;
-  color: var(--text-tertiary);
-  border: 1px solid var(--surface-200);
-}
-
-.um-action-btn--disable:hover {
-  color: var(--error);
-  border-color: var(--error-border);
-  background: var(--error-bg);
-}
-
 /* ── Loading & empty ── */
 .um-loading {
   display: flex;
@@ -473,7 +328,7 @@
 }
 
 .um-empty-icon {
-  font-size: 2rem;
+  font-size: var(--text-3xl);
   margin-bottom: var(--space-2);
   opacity: 0.4;
 }
@@ -528,7 +383,7 @@
 
 .um-external-idp h3 {
   margin: 0 0 0.75rem;
-  font-size: 1.05rem;
+  font-size: var(--text-md);
 }
 
 .um-external-idp p {
@@ -537,7 +392,7 @@
 }
 
 .um-external-idp__detail {
-  font-size: 0.9rem;
+  font-size: var(--text-sm);
   opacity: 0.8;
 }
 
@@ -545,5 +400,40 @@
   padding: 0.1rem 0.35rem;
   border-radius: 4px;
   background: var(--surface-0, #09090b);
-  font-size: 0.85em;
+  /* A token rather than a relative size, for the reason recorded on .admin-chip: `em` compounds
+     against whatever container it lands in, so one rule produces several different sizes. */
+  font-size: var(--text-sm);
+}
+
+/* A membership group (e.g. ops): a toggle beside the clearance select. It grants nothing. */
+.um-group-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: var(--space-1) var(--space-2);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.um-group-toggle.is-on {
+  border-color: var(--accent-500);
+  color: var(--text-primary);
+}
+
+/* What offboarding keeps, stated above the list. */
+.um-offboarding-note {
+  margin: 0 0 1rem;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* A person's groups on their row, read-only; they are changed in the person's details. */
+.um-groups {
+  display: inline-flex;
+  flex-wrap: wrap;
+  gap: var(--space-1);
 }

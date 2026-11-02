@@ -48,6 +48,10 @@
   --chrome-hover: #1C1C1F;
   --chrome-active: #27272A;
 
+  /* The browser draws its own controls (buttons, inputs, selects, scrollbars) for this scheme, so their
+     default text follows the theme instead of staying dark on a dark surface. */
+  color-scheme: light;
+
   /* === Text === */
   --text-primary: #09090B;
   --text-secondary: #71717A;
@@ -86,13 +90,26 @@
   --status-info: #3b82f6;
   --status-neutral: #6b7280;
 
-  /* === Tier Colors === */
-  --tier-basic: #71717A;
-  --tier-basic-bg: #F4F4F5;
-  --tier-standard: #3B82F6;
-  --tier-standard-bg: #EFF6FF;
-  --tier-premium: #7C3AED;
-  --tier-premium-bg: #F5F3FF;
+  /* === Classification badge palette (categorical) ===
+     A classification's badge color is the token its definition names (`badgeToken`, backend
+     lib/config/profiles.ts), never its name. Categorical hues of similar weight, so no color reads as
+     higher than another. Each has a `-bg` tint; `.cls-badge` reads the pair. */
+  --cls-1: #0F766E;
+  --cls-1-bg: #CCFBF1;
+  --cls-2: #1D4ED8;
+  --cls-2-bg: #DBEAFE;
+  --cls-3: #C2410C;
+  --cls-3-bg: #FFEDD5;
+  --cls-4: #475569;
+  --cls-4-bg: #E2E8F0;
+  --cls-5: #BE185D;
+  --cls-5-bg: #FCE7F3;
+  --cls-6: #A16207;
+  --cls-6-bg: #FEF9C3;
+  --cls-7: #15803D;
+  --cls-7-bg: #DCFCE7;
+  --cls-8: #7E22CE;
+  --cls-8-bg: #F3E8FF;
 
   /* === Typography === */
   --font-sans: 'Geist', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
@@ -163,6 +180,21 @@
   --z-modal: 400;
   --z-toast: 500;
 
+  /* === Controls (buttons, inputs, selects) ===
+     One height and one label size for every control, so a button beside a field lines up with it. An
+     app sets these for its own density (the admin console raises them in admin-theme.css). */
+  --control-height: 2rem;
+  --control-font-size: var(--text-base);
+  --control-border: var(--surface-300);
+  --btn-primary-bg: var(--accent-600);
+  --btn-primary-hover: var(--accent-700);
+  --danger-text: #B91C1C;
+  --danger-border: #FCA5A5;
+  --danger-fill: #B91C1C;
+  --link-color: var(--accent-600);
+  --focus-ring: var(--accent-500);
+  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%2352525B' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
+
   /* === Layout === */
   --sidebar-width: 272px;
   --header-height: 52px;
@@ -175,6 +207,7 @@
    ======================================== */
 @media (prefers-color-scheme: dark) {
   :root {
+    color-scheme: dark;
     --surface-0: #09090B;
     --surface-50: #0F0F11;
     --surface-100: #18181B;
@@ -195,6 +228,29 @@
     --info-bg: #172554;
     --info-border: #1E3A8A;
 
+    --danger-text: #FCA5A5;
+    --danger-border: #7F1D1D;
+    --link-color: var(--accent-300);
+    --focus-ring: var(--accent-400);
+    --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23D4D4D8' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
+
+    --cls-1: #5EEAD4;
+    --cls-1-bg: #042F2E;
+    --cls-2: #93C5FD;
+    --cls-2-bg: #172554;
+    --cls-3: #FDBA74;
+    --cls-3-bg: #431407;
+    --cls-4: #CBD5E1;
+    --cls-4-bg: #1E293B;
+    --cls-5: #F9A8D4;
+    --cls-5-bg: #500724;
+    --cls-6: #FDE047;
+    --cls-6-bg: #422006;
+    --cls-7: #86EFAC;
+    --cls-7-bg: #052E16;
+    --cls-8: #D8B4FE;
+    --cls-8-bg: #3B0764;
+
     --shadow-xs: 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow-sm: 0 1px 3px rgba(0, 0, 0, 0.4), 0 1px 2px rgba(0, 0, 0, 0.3);
     --shadow-md: 0 4px 6px -1px rgba(0, 0, 0, 0.4), 0 2px 4px -2px rgba(0, 0, 0, 0.3);
@@ -207,6 +263,7 @@
    Force dark mode via data attribute
    ======================================== */
 [data-theme="dark"] {
+  color-scheme: dark;
   --surface-0: #09090B;
   --surface-50: #0F0F11;
   --surface-100: #18181B;
@@ -226,6 +283,29 @@
   --error-border: #991B1B;
   --info-bg: #172554;
   --info-border: #1E3A8A;
+
+  --danger-text: #FCA5A5;
+  --danger-border: #7F1D1D;
+  --link-color: var(--accent-300);
+  --focus-ring: var(--accent-400);
+  --select-arrow: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23D4D4D8' d='M3 4.5L6 7.5L9 4.5'/%3E%3C/svg%3E");
+
+  --cls-1: #5EEAD4;
+  --cls-1-bg: #042F2E;
+  --cls-2: #93C5FD;
+  --cls-2-bg: #172554;
+  --cls-3: #FDBA74;
+  --cls-3-bg: #431407;
+  --cls-4: #CBD5E1;
+  --cls-4-bg: #1E293B;
+  --cls-5: #F9A8D4;
+  --cls-5-bg: #500724;
+  --cls-6: #FDE047;
+  --cls-6-bg: #422006;
+  --cls-7: #86EFAC;
+  --cls-7-bg: #052E16;
+  --cls-8: #D8B4FE;
+  --cls-8-bg: #3B0764;
 }
 
 /* ========================================

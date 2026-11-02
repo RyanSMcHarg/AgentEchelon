@@ -1,0 +1,24 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <!--
+      The invitation landing page (M-5): every invitation's link opens it here, on the chat app's origin
+      (`invitationLandingFor`, backend/lib/config/app-origins.ts). Its token is in the URL fragment, which no
+      server receives. The ChatApp stack's distribution serves this path with its own headers:
+      a Content-Security-Policy with frame-ancestors 'none', X-Frame-Options: DENY and
+      Referrer-Policy: no-referrer (backend/lib/config/capabilities.ts). The meta tag below says the same to a
+      browser that reads the document before the header policy applies.
+    -->
+    <meta name="referrer" content="no-referrer" />
+    <meta http-equiv="X-Content-Type-Options" content="nosniff" />
+    <meta name="robots" content="noindex" />
+    <link rel="icon" type="image/svg+xml" href="/brand-mark.svg" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Invitation</title>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script type="module" src="/src/invite/main.tsx"></script>
+  </body>
+</html>

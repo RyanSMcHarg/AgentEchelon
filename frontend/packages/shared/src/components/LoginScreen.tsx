@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { trackEvent } from '../services/eventTrackingService';
+import { issuerDisplayName, type RedirectFailure, type SignInIssuer } from '../services/redirectSignIn';
 import './LoginScreen.css';
 
 interface LoginScreenProps {
@@ -21,6 +22,13 @@ interface LoginScreenProps {
   /** Visual surface. 'admin' applies the operator (amber) treatment plus an
    *  "Admin Console" badge so admin sign-in is unmistakable from the chat login. */
   variant?: 'chat' | 'admin';
+  /** The redirect issuers to offer above the password form, each by its localized display name. */
+  signInIssuers?: readonly SignInIssuer[];
+  /** Start a redirect sign-in (authorization code with PKCE) at one of them. */
+  onSignInWithIssuer?: (issuerId: string) => Promise<void> | void;
+  /** Why the last redirect sign-in did not finish. Replaces the form with its message and a way back. */
+  redirectError?: RedirectFailure | null;
+  onDismissRedirectError?: () => void;
 }
 
 export function LoginScreen({
@@ -32,8 +40,14 @@ export function LoginScreen({
   onCompleteMfa,
   onForgotPassword,
   variant = 'chat',
+  signInIssuers = [],
+  onSignInWithIssuer,
+  redirectError,
+  onDismissRedirectError,
 }: LoginScreenProps) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  // The issuer whose sign-in is being opened, so its button says so and the others wait.
+  const [redirectingTo, setRedirectingTo] = useState<string | null>(null);
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [isLoggingIn, setIsLoggingIn] = useState(false);
@@ -54,7 +68,6 @@ export function LoginScreen({
     setIsLoggingIn(true);
     try {
       await onCompleteMfa?.(mfaCode.trim());
-      trackEvent('signin_succeeded');
     } catch (err) {
       setError(err instanceof Error ? err.message : t('auth.mfa.error'));
     } finally {
@@ -62,6 +75,9 @@ export function LoginScreen({
     }
   };
 
+  // The sign-in funnel's entry step. Its success step, `signin_succeeded`, is recorded by AuthProvider
+  // where Cognito returns the tokens, because a password step that answers with an MFA or new-password
+  // challenge has not signed anyone in yet.
   useEffect(() => {
     trackEvent('signin_form_viewed');
   }, []);
@@ -80,7 +96,6 @@ export function LoginScreen({
     setIsLoggingIn(true);
     try {
       await onSetNewPassword?.(newPassword);
-      trackEvent('signin_succeeded');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Could not set the new password.');
     } finally {
@@ -101,7 +116,6 @@ export function LoginScreen({
     trackEvent('signin_submitted');
     try {
       await onLogin(email, password);
-      trackEvent('signin_succeeded');
     } catch (err) {
       const reason = err instanceof Error ? err.name || err.message.slice(0, 80) : 'unknown';
       trackEvent('signin_failed', { reason });
@@ -110,6 +124,38 @@ export function LoginScreen({
       setIsLoggingIn(false);
     }
   };
+
+  const handleIssuer = async (issuerId: string) => {
+    setError('');
+    setRedirectingTo(issuerId);
+    try {
+      await onSignInWithIssuer?.(issuerId);
+    } finally {
+      // Reached only when the tab did not leave: the provider shows why through redirectError.
+      setRedirectingTo(null);
+    }
+  };
+
+  const providers = signInIssuers.length > 0 && onSignInWithIssuer ? (
+    <div className="login-providers" role="group" aria-label={t('auth.redirect.providersLabel')}>
+      {signInIssuers.map((issuer) => {
+        const name = issuerDisplayName(issuer, i18n.language);
+        return (
+          <button
+            key={issuer.id}
+            type="button"
+            className="btn btn-secondary btn-lg login-provider"
+            onClick={() => void handleIssuer(issuer.id)}
+            disabled={isLoggingIn || redirectingTo !== null}
+            data-issuer={issuer.id}
+          >
+            {redirectingTo === issuer.id ? t('auth.redirect.redirecting', { name }) : t('auth.redirect.continueWith', { name })}
+          </button>
+        );
+      })}
+      <div className="login-divider"><span>{t('auth.redirect.orPassword')}</span></div>
+    </div>
+  ) : null;
 
   return (
     <div className={`login-screen${variant === 'admin' ? ' login-screen--admin' : ''}`}>
@@ -134,7 +180,15 @@ export function LoginScreen({
           </p>
         </div>
 
-        {passwordChallenge ? (
+        {redirectError ? (
+          <div className="login-form" role="alert" data-testid="redirect-error">
+            <p className="login-redirect-title">{t('auth.redirect.failedTitle')}</p>
+            <div className="error-message">{t(`auth.redirect.errors.${redirectError}`)}</div>
+            <button type="button" className="btn btn-primary btn-lg login-submit" onClick={onDismissRedirectError}>
+              {t('auth.redirect.backToSignIn')}
+            </button>
+          </div>
+        ) : passwordChallenge ? (
           <form onSubmit={handleSetNewPassword} className="login-form">
             <p className="login-footer-note" style={{ marginTop: 0 }}>
               Your account (<strong>{passwordChallenge.email}</strong>) was created with a
@@ -197,6 +251,8 @@ export function LoginScreen({
           </button>
         </form>
         ) : (
+        <>
+        {providers}
         <form onSubmit={handleSubmit} className="login-form">
           <div className="form-group">
             <label htmlFor="email" className="label">{t('auth.login.emailLabel')}</label>
@@ -240,9 +296,10 @@ export function LoginScreen({
             </div>
           )}
         </form>
+        </>
         )}
 
-        {!passwordChallenge && !mfaChallenge && onSwitchToRegister && (
+        {!redirectError && !passwordChallenge && !mfaChallenge && onSwitchToRegister && (
         <div className="login-register-link">
           {t('auth.login.noAccountPrompt')}{' '}
           <button onClick={onSwitchToRegister} className="link-button">
@@ -251,9 +308,11 @@ export function LoginScreen({
         </div>
         )}
 
+        {signInIssuers.length === 0 && (
         <div className="login-footer">
           <p className="login-footer-note">{t('auth.login.footerNote')}</p>
         </div>
+        )}
       </div>
     </div>
   );

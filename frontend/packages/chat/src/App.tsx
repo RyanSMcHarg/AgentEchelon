@@ -1,6 +1,11 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useTranslation } from 'react-i18next';
-import { AuthProvider, useAuth, LoginScreen, ForgotPasswordScreen, ErrorBoundary } from '@ae/shared';
+import {
+  AuthProvider, useAuth, LoginScreen, ForgotPasswordScreen, ErrorBoundary, takeInvitationOutcome, restorePendingInvitation,
+  peekPendingUpgrade, settlePendingUpgrade, takeUpgradeOutcome, type InvitationOutcome, type UpgradeOutcome,
+  useDeploymentClassificationsReady,
+} from '@ae/shared';
+import { ArrivalNotice } from './components/ArrivalNotice';
 import { AwsClientProvider, useAwsClient } from './providers/AwsClientProvider';
 import { MessagingProvider } from './providers/MessagingProvider';
 import { ConversationProvider, useConversations } from './providers/ConversationProvider.chime';
@@ -13,6 +18,8 @@ import ConversationInterface from './components/ConversationInterface';
 import MessageInput from './components/MessageInput';
 import NewConversationModal from './components/NewConversationModal';
 import DeploymentStatusBanner from './components/DeploymentStatusBanner';
+import AccountSettingsModal from './components/AccountSettingsModal';
+import { isEmailPreferencesConfigured } from './services/noticePreferencesService';
 import '@ae/shared/styles/App.css';
 import { requestMessageFocus } from './utils/focusMessage';
 
@@ -22,13 +29,28 @@ function AppContent() {
   const {
     isAuthenticated, isLoading, login, register, passwordChallenge, completeNewPassword,
     mfaChallenge, completeMfa, forgotPassword, confirmForgotPassword, resendCode,
+    signInIssuers, signInWithIssuer, redirectError, clearRedirectError, idToken, logout,
   } = useAuth();
   const { isInitialized } = useAwsClient();
+  // THE DEPLOYMENT'S CLASSIFICATIONS, loaded once signed in (`GET /classifications`); the build's fallback serves
+  // the registration screen before sign-in.
+  const classificationsReady = useDeploymentClassificationsReady(isAuthenticated ? idToken : null);
   const { t } = useTranslation();
   const { activeConversation, selectConversation, clearActiveConversation } = useConversations();
   const [isModalOpen, setIsModalOpen] = useState(false);
   const [authView, setAuthView] = useState<AuthView>('login');
   const [registeredEmail, setRegisteredEmail] = useState('');
+  // WHAT A SIGN-IN INVITATION CAME TO (M-10): the conversation it opened, or the settled refusal to show.
+  const [invitationOutcome, setInvitationOutcome] = useState<InvitationOutcome | null>(null);
+  // WHAT KEEPING A WIDGET VISIT CAME TO (paths A and B): the conversation it continues in, or why not.
+  const [upgradeOutcome, setUpgradeOutcome] = useState<UpgradeOutcome | null>(null);
+  const [upgradeRetrying, setUpgradeRetrying] = useState(false);
+  // One redemption at a time: a claim is single-use, so a second call in flight would read as used.
+  const claiming = useRef(false);
+  // ACCOUNT SETTINGS: opened from the account menu, or by `?settings=email-preferences`, the link an email's
+  // preference page carries, which lands on the email section. Email is offered only when the deployment sends it.
+  const emailPreferencesOffered = isEmailPreferencesConfigured();
+  const [settingsOpen, setSettingsOpen] = useState<null | 'account' | 'email'>(null);
 
   // Deep link: auto-select conversation from the `?conversation=<id>` query
   // param (share + proactive-briefing emails). selectConversation resolves the
@@ -57,6 +79,58 @@ function AppContent() {
       window.history.replaceState({}, '', window.location.pathname);
     });
   }, [isAuthenticated, isInitialized, selectConversation]);
+
+  // `?settings=email-preferences` opens the screen once the person is signed in, and the URL is cleaned.
+  useEffect(() => {
+    if (!isAuthenticated) return;
+    const params = new URLSearchParams(window.location.search);
+    if (params.get('settings') !== 'email-preferences') return;
+    if (emailPreferencesOffered) setSettingsOpen('email');
+    window.history.replaceState({}, '', window.location.pathname);
+  }, [isAuthenticated, emailPreferencesOffered]);
+
+  // A SIGN-IN INVITATION, once the first exchange has presented it: open its conversation, or say why not.
+  useEffect(() => {
+    if (!isAuthenticated || !isInitialized) return;
+    const outcome = takeInvitationOutcome();
+    if (!outcome) return;
+    setInvitationOutcome(outcome);
+    if ('joined' in outcome) void selectConversation(outcome.joined.split('/').pop() || '');
+  }, [isAuthenticated, isInitialized, selectConversation]);
+
+  // A VISIT KEPT FROM THE WIDGET, once the person is signed in: a bind's continuation is opened; a claim is
+  // redeemed now, and its conversation opened; anything else is said, with what to do next.
+  useEffect(() => {
+    if (!isAuthenticated || !isInitialized) return;
+    const open = (outcome: UpgradeOutcome) => {
+      setUpgradeOutcome(outcome);
+      if ('opened' in outcome) void selectConversation(outcome.opened.split('/').pop() || '');
+    };
+    const recorded = takeUpgradeOutcome();
+    if (recorded) open(recorded);
+    if (peekPendingUpgrade()?.kind !== 'claim' || !idToken || claiming.current) return;
+    claiming.current = true;
+    void settlePendingUpgrade(idToken)
+      .then((o) => { if (o) { takeUpgradeOutcome(); open(o); } })
+      .finally(() => { claiming.current = false; });
+  }, [isAuthenticated, isInitialized, selectConversation, idToken]);
+
+  const retryUpgrade = async () => {
+    if (!idToken || upgradeRetrying || claiming.current) return;
+    claiming.current = true;
+    setUpgradeRetrying(true);
+    try {
+      const outcome = await settlePendingUpgrade(idToken);
+      takeUpgradeOutcome();
+      if (outcome) {
+        setUpgradeOutcome(outcome);
+        if ('opened' in outcome) void selectConversation(outcome.opened.split('/').pop() || '');
+      }
+    } finally {
+      claiming.current = false;
+      setUpgradeRetrying(false);
+    }
+  };
 
   if (isLoading) {
     return (
@@ -136,17 +210,44 @@ function AppContent() {
         mfaChallenge={mfaChallenge}
         onCompleteMfa={completeMfa}
         onForgotPassword={() => setAuthView('forgot')}
+        signInIssuers={signInIssuers}
+        onSignInWithIssuer={signInWithIssuer}
+        redirectError={redirectError}
+        onDismissRedirectError={clearRedirectError}
       />
     );
   }
 
-  // The admin console is a SEPARATE app (AgentEchelonAdminFrontend, admin.html /
+  // The admin console is a SEPARATE app (AgentEchelonAdminApp, admin.html /
   // admin-main.tsx) served from its own origin — it is NOT a route in this chat
   // SPA. The chat bundle therefore carries no operator code or admin endpoints;
   // assert-no-admin-in-chat.mjs pins that invariant. See DESIGN-SEPARATE-ADMIN-APP.md.
+  // Signed in: conversations, badges and pickers render with the deployment's set once it has answered.
+  if (!classificationsReady) {
+    return (
+      <div className="app-loading">
+        <div className="app-loading-spinner"></div>
+        <p>Loading...</p>
+      </div>
+    );
+  }
+
   return (
     <div className="app">
-      <Header />
+      <Header onOpenSettings={() => setSettingsOpen('account')} />
+      <ArrivalNotice
+        invitation={invitationOutcome}
+        upgrade={upgradeOutcome}
+        retrying={upgradeRetrying}
+        onRetry={() => void retryUpgrade()}
+        onSignOutAndContinue={(token) => {
+          // The invitation is pending again for the next sign-in, which a new account makes; this account is not bound.
+          restorePendingInvitation(token);
+          setInvitationOutcome(null);
+          void logout();
+        }}
+        onDismiss={() => { setInvitationOutcome(null); setUpgradeOutcome(null); }}
+      />
       {/* `has-active` drives the mobile master-detail swap: below the breakpoint the
           list is shown until a conversation is active, then the detail pane takes over
           (the two panes stay side by side on desktop). */}
@@ -178,6 +279,12 @@ function AppContent() {
       </div>
 
       <NewConversationModal isOpen={isModalOpen} onClose={() => setIsModalOpen(false)} />
+      <AccountSettingsModal
+        isOpen={settingsOpen !== null}
+        onClose={() => setSettingsOpen(null)}
+        emailOffered={emailPreferencesOffered}
+        focusEmail={settingsOpen === 'email'}
+      />
     </div>
   );
 }

@@ -4,11 +4,12 @@
  * Frontend client for the pick-the-winner API
  * (POST /channels/battle/outcome, GET /channels/battle/outcome?battleId=).
  *
- * Used by the inline battle scorecard's quality axis. The endpoint URL
- * comes from VITE_BATTLE_OUTCOME_API_URL (CDK output
- * AgentEchelonBattle.BattleOutcomeApiUrl). chosenByUserSub is derived
- * server-side from the Cognito token — never sent from here.
+ * Used by the inline battle scorecard's quality axis. The routes are on the
+ * person API (VITE_PERSON_API_URL), served when VITE_PERSON_API_CAPABILITIES
+ * names `battle`. chosenByPersonId is derived server-side from the verified
+ * token, never sent from here.
  */
+import { personApiServes, personUrl } from '@ae/shared';
 
 export type BattleWinner = 'A' | 'B' | 'tie';
 
@@ -16,14 +17,16 @@ export interface BattleOutcome {
   battleId: string;
   /** A = control variant, B = treatment variant */
   winner: BattleWinner;
-  chosenByUserSub: string;
+  chosenByPersonId: string;
   chosenAt: string;
 }
 
-function getApiUrl(): string {
-  const url = import.meta.env.VITE_BATTLE_OUTCOME_API_URL;
-  if (!url) throw new Error('VITE_BATTLE_OUTCOME_API_URL not configured');
-  return url;
+/**
+ * The battle routes are served only when `VITE_PERSON_API_CAPABILITIES` names `battle`; without it
+ * there is no battle, and a call refuses with that named.
+ */
+function requireBattle(): void {
+  if (!personApiServes('battle')) throw new Error('Battle is not served here (VITE_PERSON_API_CAPABILITIES does not name battle)');
 }
 
 function getIdToken(): string {
@@ -32,9 +35,10 @@ function getIdToken(): string {
   return idToken;
 }
 
-async function apiCall<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function apiCall<T>(url: () => string, init: RequestInit = {}): Promise<T> {
+  requireBattle();
   const idToken = getIdToken();
-  const response = await fetch(`${getApiUrl()}${path}`, {
+  const response = await fetch(url(), {
     ...init,
     headers: {
       'Content-Type': 'application/json',
@@ -56,7 +60,7 @@ async function apiCall<T>(path: string, init: RequestInit = {}): Promise<T> {
 /** Read the recorded pick for a battle, or null if none yet. */
 export async function getBattleOutcome(battleId: string): Promise<BattleOutcome | null> {
   const res = await apiCall<{ outcome: BattleOutcome | null }>(
-    `?battleId=${encodeURIComponent(battleId)}`,
+    () => personUrl(`/channels/battle/outcome?battleId=${encodeURIComponent(battleId)}`),
   );
   return res.outcome;
 }
@@ -72,7 +76,7 @@ export async function recordBattleOutcome(
 ): Promise<BattleOutcome> {
   // channelArn is REQUIRED by the API (M2 membership check) — without it the
   // POST is rejected 400 MISSING_CHANNEL_ARN.
-  const res = await apiCall<{ outcome: BattleOutcome }>('', {
+  const res = await apiCall<{ outcome: BattleOutcome }>(() => personUrl('/channels/battle/outcome'), {
     method: 'POST',
     body: JSON.stringify({ battleId, winner, channelArn }),
   });

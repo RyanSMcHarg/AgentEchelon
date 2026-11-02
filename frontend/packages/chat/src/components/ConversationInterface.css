@@ -212,15 +212,16 @@
   max-width: 100%;
 }
 
-/* Tier pill with color dot — replaces the old model badge */
+/* The classification pill with its color dot. Its colors are the classification's declared badge token
+   (`classificationBadgeStyle` sets `--cls-fg` and `--cls-bg`), never a rule per classification name. */
 .conversation-header-tier {
   display: inline-flex;
   align-items: center;
   gap: var(--space-2);
   padding: 3px var(--space-2) 3px var(--space-2);
   border-radius: var(--radius-full);
-  background: var(--surface-100);
-  color: var(--text-secondary);
+  background: var(--cls-bg, var(--surface-100));
+  color: var(--cls-fg, var(--text-secondary));
   font-family: var(--font-mono);
   font-size: var(--text-xs);
   font-weight: 500;
@@ -233,30 +234,30 @@
   width: 6px;
   height: 6px;
   border-radius: var(--radius-full);
-  background: var(--tier-basic);
+  background: var(--cls-fg, var(--text-tertiary));
   flex-shrink: 0;
 }
 
-.conversation-header-tier--basic .conversation-header-tier-dot {
-  background: var(--tier-basic);
+/* AN OUTSIDE-AUDIENCE CONVERSATION (a guest's, a customer's) is marked on the header itself, so a person
+   holding an inside and an outside conversation open sees which one they are in before they type. */
+.conversation-header--outside {
+  box-shadow: inset 0 3px 0 0 var(--warning);
+  background: color-mix(in srgb, var(--warning-bg) 55%, var(--surface-0));
 }
 
-.conversation-header-tier--standard {
-  background: var(--tier-standard-bg);
-  color: var(--tier-standard);
-}
-
-.conversation-header-tier--standard .conversation-header-tier-dot {
-  background: var(--tier-standard);
-}
-
-.conversation-header-tier--premium {
-  background: var(--tier-premium-bg);
-  color: var(--tier-premium);
-}
-
-.conversation-header-tier--premium .conversation-header-tier-dot {
-  background: var(--tier-premium);
+.conversation-header-audience {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  padding: 3px var(--space-2);
+  border-radius: var(--radius-full);
+  border: 1px solid var(--warning-border);
+  background: var(--warning-bg);
+  color: var(--text-primary);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  white-space: nowrap;
+  flex-shrink: 0;
 }
 
 /* Member count, rendered INSIDE the members toggle button. It was previously a separate chip beside
@@ -271,6 +272,7 @@
 }
 
 .conversation-header-actions {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 2px;
@@ -284,9 +286,40 @@
   border-radius: var(--radius-md);
 }
 
-.conversation-header-btn:hover:not(:disabled) {
+.conversation-header-btn:hover:not(:disabled):not(.is-disabled) {
   background: var(--surface-100);
   color: var(--text-primary);
+}
+
+/* Unavailable, but still hoverable so its tooltip can say why (aria-disabled, not disabled). */
+.conversation-header-btn.is-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* Why Share is unavailable, shown on tap and focus. Present but hidden otherwise, so aria-describedby
+   still reaches a screen reader. */
+.share-disabled-reason {
+  position: absolute;
+  top: calc(100% + 4px);
+  right: 0;
+  z-index: var(--z-dropdown);
+  max-width: min(280px, calc(100vw - 32px));
+  padding: 8px 10px;
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  border-radius: var(--radius-md);
+  box-shadow: var(--shadow-md);
+  white-space: normal;
+  clip-path: inset(50%);
+  opacity: 0;
+  pointer-events: none;
+}
+
+.share-disabled-reason.is-visible {
+  clip-path: none;
+  opacity: 1;
 }
 
 .conversation-header-btn.is-active {
@@ -366,7 +399,9 @@
   overflow-x: hidden;
   padding: var(--space-6) var(--space-5);
   min-height: 0;
-  scroll-behavior: smooth;
+  /* No `scroll-behavior: smooth` here: following the newest message is an instant pin, and an animated
+     one passes through positions that read as the viewer scrolling up (`useFollowBottom`). The jump
+     affordance animates on its own call. */
 }
 
 .no-messages {
@@ -650,6 +685,57 @@
 .message-feedback-btn:disabled {
   opacity: 0.6;
   cursor: wait;
+}
+
+/* ── "What went wrong", shown after a Needs work vote is already recorded ──────────────────────
+   Unlike .message-feedback-row this is NOT hover-revealed: it appears because the person just
+   acted, and something that fades out when the pointer moves would be a prompt you cannot answer.
+   It wraps rather than scrolls, so all three reasons stay reachable at phone width. */
+.message-feedback-reason {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.message-feedback-reason-prompt {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+}
+
+.message-feedback-reason-btn {
+  background: var(--surface-0);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-full);
+  color: var(--text-secondary);
+  cursor: pointer;
+  font-size: var(--text-xs);
+  padding: 6px 10px;
+  transition: all var(--duration-fast) var(--ease-in-out);
+}
+
+.message-feedback-reason-btn:hover {
+  border-color: var(--accent-300);
+  color: var(--text-primary);
+}
+
+/* Skipping is deliberately quieter than answering: the vote already counted, so this is an exit,
+   not a third option with equal weight. */
+.message-feedback-reason-skip {
+  background: none;
+  border: none;
+  color: var(--text-tertiary, var(--text-secondary));
+  cursor: pointer;
+  font-size: var(--text-xs);
+  padding: 6px 4px;
+  text-decoration: underline;
+}
+
+.message-feedback-reason-thanks {
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  margin-top: var(--space-2);
 }
 
 /* Loading skeleton */
@@ -1007,4 +1093,118 @@
   .conversation-header-actions {
     margin-left: auto;
   }
+}
+
+/*
+ * A MESSAGE THAT IS WAITING TO BE READ (ADR-033).
+ *
+ * The person kept typing while the assistant was busy, which is exactly what queueing exists to
+ * permit, so this must read as "received, not yet read" rather than as an error or a failure to send.
+ * Muted and quiet: it is an ambient fact about timing, not something they need to act on.
+ *
+ * IT CLEARS FOR THE WHOLE BATCH AT ONCE, when triage runs. There is no per-message signal, because
+ * queued messages do not map one-to-one onto answers - three may be answered by one reply - and
+ * inventing a mapping would claim an attribution the platform cannot verify.
+ */
+.message.message-queued .message-content {
+  opacity: 0.72;
+  border-left: 2px solid var(--color-border-subtle, rgba(127, 127, 127, 0.35));
+  padding-left: 0.6rem;
+  transition: opacity 200ms ease;
+}
+
+
+/* Someone who has asked for less motion still gets the state, just not the fade. */
+@media (prefers-reduced-motion: reduce) {
+  .message.message-queued .message-content {
+    transition: none;
+  }
+}
+
+/*
+ * The waiting label is RENDERED, not injected by CSS.
+ *
+ * It began as `content: 'waiting'` on a pseudo-element, which put a user-facing English word
+ * somewhere no translation mechanism can reach: `t()` cannot see a stylesheet, and a locale file
+ * cannot override one. A string a person reads has to live where the strings live.
+ */
+.message.message-queued .message-waiting-label {
+  display: block;
+  margin-top: 0.25rem;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.6;
+}
+
+/*
+ * "Answering #n" above a person's message that names the item it answers (ADR-035). Read from the
+ * reference typed at the start of the message, so it shows the same whether the Answer action put it
+ * there or the person typed it.
+ */
+.message .message-answering-label {
+  display: block;
+  margin-bottom: 0.25rem;
+  font-size: 0.7rem;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  opacity: 0.7;
+}
+
+/* An inside conversation's audience: said quietly, beside the classification. */
+.conversation-header-audience-members {
+  color: var(--text-tertiary);
+  font-size: var(--text-xs);
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+
+/* THE CONFIRMATION CARD of a proposal addressed to this person (ADR-061 decision 8). */
+.proposal-card {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 8px;
+  padding: 12px;
+  border: 1px solid var(--border-color, #d0d7de);
+  border-radius: 8px;
+}
+.proposal-card-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.proposal-card-help,
+.proposal-card-expiry {
+  font-size: 0.85em;
+  opacity: 0.8;
+}
+.proposal-card-actions {
+  display: flex;
+  gap: 8px;
+}
+.proposal-card-status:empty {
+  display: none;
+}
+
+/* A duel side waiting on the person: its answer control, on the message it parked on. The control
+   uses the shared buttons; this only places it under the side's text. */
+.battle-side-reply {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+
+.battle-side-reply-button[aria-pressed='true'] {
+  border-color: var(--accent-500);
+  box-shadow: var(--shadow-glow);
+}
+
+/* What everyone other than the duel's owner reads: whom the side is waiting on. */
+.battle-side-reply-note {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
 }

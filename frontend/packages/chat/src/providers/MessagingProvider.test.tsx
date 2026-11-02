@@ -65,7 +65,10 @@ vi.mock('../services/messageLatencyTracker', () => ({
   markPlaceholderShown: vi.fn(),
 }));
 
-import { MessagingProvider } from './MessagingProvider';
+import { MessagingProvider, useMessaging } from './MessagingProvider';
+
+// The mocked tracker, so the assertions below can read what the provider did with a notice.
+import { markResponseReceived, markPlaceholderShown } from '../services/messageLatencyTracker';
 
 /**
  * Fire a lifecycle event on the CURRENT session's observer only.
@@ -194,5 +197,96 @@ describe('MessagingProvider — an unattended drop reconnects itself', () => {
       sessionStart.mock.calls.length,
       'an unmounted provider reconnected, which leaks a session nothing will ever stop',
     ).toBe(starts);
+  });
+});
+
+/**
+ * INVARIANT D (ADR-033): latency counts only turns a person actually waited for.
+ *
+ * A queue notice is written by the machine and rewritten by it as the drain advances and settles. It
+ * is not an answer, and every write of it that reaches the latency path reports a system faster than
+ * the one people use.
+ *
+ * Both of these were REGRESSIONS IN THE FIX for that: the guard went on the CREATE branch only, and
+ * on CREATE it pushed the notice into the placeholder arm instead of out of the tracking entirely.
+ */
+function fireMessage(eventType: string, payload: Record<string, unknown>) {
+  const current = observers[observers.length - 1];
+  act(() => {
+    current?.messagingSessionDidReceiveMessage?.({
+      headers: { 'x-amz-chime-event-type': eventType },
+      payload: JSON.stringify(payload),
+    });
+  });
+}
+
+const NOTICE_METADATA = JSON.stringify({ botResponse: true, respPhase: 'notice', queueDepth: 2 });
+
+describe('MessagingProvider — a queue notice is not a turn somebody waited for', () => {
+  it('does not record a round trip when the notice is rewritten', async () => {
+    vi.mocked(markResponseReceived).mockClear();
+    vi.mocked(markPlaceholderShown).mockClear();
+    await mount();
+
+    // advanceQueueNotice / settleQueueNotice rewrite the SAME message through UpdateChannelMessage.
+    // Counting it recorded a ~1s round trip and deleted the pending send, so the real answer two
+    // minutes later recorded nothing at all.
+    fireMessage('UPDATE_CHANNEL_MESSAGE', {
+      ChannelArn: 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c',
+      MessageId: 'notice-1',
+      Content: 'Two messages waiting',
+      Metadata: NOTICE_METADATA,
+      Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/user/bot', Name: 'bot' },
+    });
+
+    expect(markResponseReceived).not.toHaveBeenCalled();
+  });
+
+  it('does not latch the channel TTFF on a notice that carries no correlation id', async () => {
+    vi.mocked(markResponseReceived).mockClear();
+    vi.mocked(markPlaceholderShown).mockClear();
+    await mount();
+
+    // Excluded from trackBotResponse alone, the notice fell into the placeholder arm and called
+    // markPlaceholderShown with correlationId undefined, latching ttffReported for the channel. The
+    // real placeholder - the one carrying <!--corr:--> - then returned early, so the per-turn join
+    // contained no queued turns at all.
+    fireMessage('CREATE_CHANNEL_MESSAGE', {
+      ChannelArn: 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c',
+      MessageId: 'notice-1',
+      Content: 'Two messages waiting',
+      Metadata: NOTICE_METADATA,
+      Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/i/user/bot', Name: 'bot' },
+    });
+
+    expect(markPlaceholderShown).not.toHaveBeenCalled();
+    expect(markResponseReceived).not.toHaveBeenCalled();
+  });
+});
+
+/**
+ * sessionVersion: the communication-hub contract this app now follows. Anything holding data the
+ * session would have pushed re-reads when it changes, so it must go up on EVERY
+ * start - the first connect and each reconnect - and on nothing else.
+ */
+describe('MessagingProvider - sessionVersion counts session starts', () => {
+  const seen: number[] = [];
+  const Probe = () => {
+    const { sessionVersion } = useMessaging();
+    seen.push(sessionVersion);
+    return null;
+  };
+
+  it('starts at 0 and goes up by one on each session start, not on a stop', async () => {
+    seen.length = 0;
+    render(<MessagingProvider><Probe /></MessagingProvider>);
+    await act(async () => { await Promise.resolve(); });
+    expect(seen[seen.length - 1]).toBe(0);
+    fire('messagingSessionDidStart');
+    expect(seen[seen.length - 1]).toBe(1);
+    fire('messagingSessionDidStop');
+    expect(seen[seen.length - 1]).toBe(1);
+    fire('messagingSessionDidStart');
+    expect(seen[seen.length - 1]).toBe(2);
   });
 });

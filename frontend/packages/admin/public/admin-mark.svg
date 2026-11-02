@@ -1,0 +1,7 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" role="img" aria-label="AgentEchelon admin console">
+  <!-- The brand mark on the console's own tile, so the console and the chat app are told apart in a tab bar. -->
+  <rect x="2" y="2" width="28" height="28" rx="7" fill="#b45309"/>
+  <rect x="8" y="19" width="4" height="6" rx="1.2" fill="#fde68a"/>
+  <rect x="14" y="14" width="4" height="11" rx="1.2" fill="#fef3c7"/>
+  <rect x="20" y="9" width="4" height="16" rx="1.2" fill="#ffffff"/>
+</svg>

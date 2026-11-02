@@ -1,6 +1,7 @@
 import { defineConfig } from 'vitest/config'
 import react from '@vitejs/plugin-react'
 import { execSync } from 'child_process'
+import { resolve } from 'path'
 
 /**
  * The commit this bundle was built from, stamped into the bundle itself.
@@ -24,9 +25,11 @@ function builtFromCommit(): string {
 
 // @ae/chat — the chat SPA. Separate build/deploy target from @ae/admin
 // (packages/admin), but both run against the SAME Chime app instance +
-// Cognito user pool via @ae/shared (see packages/shared). Single entry
-// (index.html -> src/main.tsx); the chat bundle never pulls in admin code —
-// see scripts/assert-no-admin-in-chat.mjs at the workspace root.
+// Cognito user pool via @ae/shared (see packages/shared). Two entries:
+//   - index.html -> src/main.tsx: the app;
+//   - invite.html -> src/invite/main.tsx: the invitation landing page every invitation's link opens
+//     (`invitationLandingFor`), the page @ae/widget also serves, mounted on its own.
+// The chat bundle never pulls in admin code; see scripts/assert-no-admin-in-chat.mjs at the workspace root.
 export default defineConfig({
   plugins: [react()],
   define: {
@@ -38,6 +41,12 @@ export default defineConfig({
   },
   build: {
     outDir: 'dist',
+    rollupOptions: {
+      input: {
+        index: resolve(__dirname, 'index.html'),
+        invite: resolve(__dirname, 'invite.html'),
+      },
+    },
   },
   test: {
     globals: true,

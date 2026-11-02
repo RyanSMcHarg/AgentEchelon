@@ -1,4 +1,8 @@
-export type UserTier = 'premium' | 'standard' | 'basic';
+/**
+ * A classification value, one of the set the deployment declares (`GET /classifications`,
+ * `config/classifications.ts`). A string, because a deployment names its own classifications.
+ */
+export type UserTier = string;
 
 export type MessageStatus = 'sending' | 'sent' | 'failed';
 
@@ -16,7 +20,11 @@ export interface Conversation {
   title: string;
   modelId: string;
   modelName: string;
-  modelTier: UserTier;
+  /**
+   * The classification channel Metadata claims, for display only. Absent when Metadata names none: it is
+   * member-writable, so it is never defaulted and never decides access.
+   */
+  modelTier?: UserTier;
   createdAt: Date;
   updatedAt: Date;
   lastMessage?: string;
@@ -34,6 +42,10 @@ export interface Conversation {
    *  is retained, so members keep read-only access until the channel expires.
    *  Display mirror of the authoritative `archived` channel tag. */
   archived?: boolean;
+  /** Where this conversation's people come from when its type enforces it (`group:ops`), else absent.
+   *  A DISPLAY HINT from channel Metadata: the client disables Share and says why; the server refuses
+   *  the share from its own record whatever this says. */
+  membershipSource?: string;
 }
 
 export interface MessageSender {
@@ -81,6 +93,16 @@ export interface Message {
    * lets the parent conversation stay followable after the fact.
    */
   driftRedirect?: { childChannelArn: string; label: string };
+  /**
+   * A PROPOSAL ADDRESSED TO THIS PERSON (ADR-061 decision 8, rule 8): the handle of something an assistant proposed and
+   * only they may confirm, carried on the targeted message's Metadata and drawn as a confirmation card.
+   */
+  proposal?: { id: string; op: string; expiresAt: number };
+  /**
+   * A TASK A WORKFLOW ASSIGNED THIS PERSON (ADR-063 decision 2): the task's handle, the state the card was drawn in and the
+   * choices it offers, carried on the targeted message's Metadata and drawn as a task card.
+   */
+  taskCard?: { id: string; state: string; choices: string[]; expiresAt?: number };
   // True when the SendChannelMessage Target included the current user's ARN —
   // i.e., the message was targeted to us (and is invisible to other channel
   // members). Used to drive the sticky-mention follow-up behavior.
@@ -98,9 +120,48 @@ export interface Message {
    * Undefined for messages whose writer stamped no phase.
    */
   responsePhase?: string;
+  /**
+   * WHAT KIND OF MESSAGE THE TURN DECLARED THIS ONE TO BE (`turnKind` in the Chime metadata), when it
+   * declared one. Read for `receipt`: a duel side's private placeholder that became the person's
+   * receipt is no longer that side's answer, so it stops rendering as one (`battleAfterUpdate`).
+   */
+  turnKind?: string;
+  /**
+   * THE QUEUE'S STATE TOKEN, on a deferral notice (ADR-033). A count, never the queue itself.
+   *
+   * The notice is posted when messages start waiting, updated as more arrive, and updated to zero
+   * when the drain reads them - so this changes exactly when the queue does. A client watches it to
+   * know something CHANGED and then re-reads the record, which stays the only authority. Carrying the
+   * waiting ids here instead would grow with the queue, need rewriting on every send, and still tell
+   * a client that joined late nothing at all.
+   */
+  queueDepth?: number;
+  /**
+   * WHICH STAGE of working the queue this notice is reporting.
+   *
+   * Carried alongside the depth because the two answer different questions: the depth says how much
+   * is waiting, the stage says whether anything is happening to it. A queue being worked and a queue
+   * that is stuck look identical without this - the same messages, marked waiting, for as long as it
+   * takes - and the difference is the whole of the waiting person's experience of it.
+   *
+   * The visible words are already in the notice text, so a client that renders nothing from this
+   * still shows the person the stage. What it enables is BRANCHING on the stage without parsing
+   * prose that a deployment is free to have reworded, or to have written in another language.
+   */
+  queueStatus?: string;
+  /**
+   * The deployment's own wording for that stage, when it configured any.
+   *
+   * Present only when somebody deliberately chose words. It WINS over the client's translation,
+   * because a deployment that worded a stage on purpose must not have that replaced by a locale
+   * file; absent means nobody chose, and the client says it in the reader's language.
+   */
+  queueStatusLabel?: string;
   // Multi-part response grouping
   responseGroup?: string;
   continuation?: boolean;
+  /** The message a continuation part belongs to, so it is shown with it rather than wherever it was posted. */
+  parentMessageId?: string;
   part?: number;
   totalParts?: number;
   // Drift-confirm redirect — when the bot suggests switching/creating a
@@ -134,7 +195,7 @@ export interface Message {
       /** Model provider per step ('anthropic', 'amazon', 'openai'). */
       provider?: string;
     }>;
-    // Resolved variant displayName ("Atlas" / "Echo") from the
+    // The side's name from its profile, from the
     // battlestats `name=` field. The scorecard + variant chip prefer
     // this over the bot's generic Chime AppInstanceUser name.
     label?: string;
@@ -151,13 +212,11 @@ export interface Message {
     /** Generation-out: images produced - cost breakdown input. */
     imageCount?: number;
   };
-  // /battle clarification (SPEC-BATTLE.md) — set while a bot is blocked
-  // on the user (the placeholder shows "Assistant is waiting…" in place
-  // of the privately-targeted question). Cleared when the same message
-  // is updated with the resumed answer (2B-x-e reuses the placeholder),
-  // which is the "waiting ended" signal. Drives the composer's
-  // "Replying to:" affordance.
-  battleWaiting?: { battleId: string; botArn: string };
+  // A duel side waiting on the person (DESIGN-BATTLE, "A side parked on the person"): set while the
+  // message the side parked on carries its `<!--battlewaiting-->` marker, and cleared when the resume
+  // or the end of the duel takes the marker down. Drives the side's "Reply to this side" control;
+  // `ownerId` is the person it waits on.
+  battleWaiting?: { battleId: string; botArn: string; ownerId?: string };
   // /battle generation-out (SPEC-BATTLE.md) has no field of its own: a generated image arrives as
   // `attachment` like any other, and the scorecard's pick-the-winner works unchanged (the user
   // compares the two images). A failed/withheld reply simply carries no attachment.
@@ -212,7 +271,13 @@ export interface AdminConversationMessage {
   id: string;
   content: string;
   senderArn: string;
-  senderName: string;
+  /** WHO SENT IT IS A SEPARATE GRANT FROM WHAT WAS SENT, so this is OPTIONAL and a surface must not
+   *  assume it (SPEC-ADMIN-CONSOLE FR41). `Name` on an `AppInstanceUser` is the person's email, so
+   *  the server omits the field entirely for a caller without the identity capability rather than
+   *  sending a null - absent cannot be confused with "the server forgot", and an older client renders
+   *  nothing rather than the string "null". `senderArn` always identifies the sender: its last
+   *  segment is the Cognito sub, which is what a person-bearing surface renders by default. */
+  senderName?: string;
   timestamp: string;
   isBot: boolean;
   redacted?: boolean;
@@ -225,6 +290,18 @@ export interface AdminConversationMessage {
   moderatedAt?: string;
   modelId?: string;
   intent?: string;
+  /** True when an exchange claims this message as its answer. Only an answer can be flagged, because
+   *  the Flagged list reaches a flag through its exchange. Aurora mode only. */
+  answersTurn?: boolean;
+  /** The reason a moderator raised a flag on this response (`human_flag`, migration 059), and when.
+   *  Undefined when nobody has: unflagged is the absence of a flag, not a stored state. The closed
+   *  set is shared with the chat client's `FeedbackReason`, so a moderator's reason and an end
+   *  user's reason are the same vocabulary and count together. */
+  flagReason?: 'wrong_assistant' | 'poor_answer' | 'asked_again';
+  flaggedAt?: string;
+  /** Every version of an edited message, the original first and the latest last. Absent on a message
+   *  never edited, and on a removed one: a removal blanks every version with the message. */
+  versions?: Array<{ at: string; content: string }>;
   metadata?: Record<string, unknown>;
   /** Full archived message Payload (all fields incl raw Metadata + MessageAttributes) — for the inspect/"info" panel. */
   raw?: Record<string, unknown>;
@@ -234,7 +311,9 @@ export interface AdminConversationMessage {
 export interface AdminConversationEvent {
   eventType: string;
   messageId: string | null;
-  senderName: string | null;
+  /** Optional for the reason `AdminConversationMessage.senderName` is. Distinct from `null`, which
+   *  this field already used to mean "the archived event carried no sender": absent means withheld. */
+  senderName?: string | null;
   senderArn: string | null;
   targetArn: string | null;
   content: string | null;
@@ -247,8 +326,21 @@ export interface AdminConversationEvent {
 export interface AdminMembershipEvent {
   action: 'joined' | 'left' | 'granted_moderator' | 'revoked_moderator' | string;
   memberArn: string;
-  memberName: string;
+  /** Optional for the reason `AdminConversationMessage.senderName` is. */
+  memberName?: string;
+  /** The INVITER's display name, which is an email like every other `Name` here - so it is withheld
+   *  under the same grant. Unlike the member it describes, no ARN accompanies it: the archive row
+   *  carries only `sender_name`, so there is no id to fall back to and the surface omits the clause. */
   invitedBy?: string;
   timestamp: string;
   isBot: boolean;
+  /** True for a member the others could not see. Absent where the archive row predates recording it. */
+  hidden?: boolean;
+  /** True for the creating identity's own join, moderator grant and leave while it assembled the room. */
+  roomSetup?: boolean;
+  /** A subject change (`subject_added`, `subject_dropped`): the summarizer's label. */
+  subject?: string;
+  /** A drift flag (`subject_flagged`): the message that raised it, and how the offer ended. */
+  messageId?: string;
+  subjectOutcome?: string;
 }

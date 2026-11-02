@@ -7,7 +7,7 @@ describe('computeAlerts', () => {
       intentEffectiveness: [
         { intent: 'general', direct_count: 10, task_count: 0, direct_relevance: 90, avg_confidence: 95, tool_calls: 0 },
       ],
-      latency: [{ delivery_option: 'DIRECT', exchange_count: 100, avg_ttff_ms: 600, p95_total_ms: 8000 }],
+      latency: [{ delivery_option: 'DIRECT', assistant_turn_count: 100, avg_ttff_ms: 600, p95_total_ms: 8000 }],
       modelEffectiveness: [{ model: 'haiku', avg_score: 88 }],
       flagged: [],
       errorRate: [{ error_count: 0, total_count: 1000 }],
@@ -19,8 +19,8 @@ describe('computeAlerts', () => {
     const alerts = computeAlerts({
       // A slow TASK row must NOT drag the perceived TTFF; only the direct rows count.
       latency: [
-        { delivery_option: 'DIRECT', exchange_count: 100, avg_ttff_ms: 3200, p95_total_ms: 9000 },
-        { delivery_option: 'TASK_MULTI_STEP', exchange_count: 100, avg_ttff_ms: 90000, p95_total_ms: 120000 },
+        { delivery_option: 'DIRECT', assistant_turn_count: 100, avg_ttff_ms: 3200, p95_total_ms: 9000 },
+        { delivery_option: 'TASK_MULTI_STEP', assistant_turn_count: 100, avg_ttff_ms: 90000, p95_total_ms: 120000 },
       ],
     });
     const ttff = alerts.find((a) => a.id === 'lat-ttff');
@@ -59,7 +59,7 @@ describe('computeAlerts', () => {
   it('raises a runtime alert for error-response replies and sorts errors before warnings', () => {
     const alerts = computeAlerts({
       // A warn-tier latency + an error-tier runtime alert; error must sort first.
-      latency: [{ delivery_option: 'DIRECT', exchange_count: 10, avg_ttff_ms: 1500, p95_total_ms: 9000 }], // 1.5s -> warn
+      latency: [{ delivery_option: 'DIRECT', assistant_turn_count: 10, avg_ttff_ms: 1500, p95_total_ms: 9000 }], // 1.5s -> warn
       flagged: [{ classification: 'error_response' }, { classification: 'poor' }, { classification: 'error_response' }],
     });
     expect(alerts[0].severity).toBe('error');
@@ -77,5 +77,39 @@ describe('computeAlerts', () => {
     const exec = alerts.find((a) => a.id === 'q-exec-data_extraction');
     expect(exec).toBeDefined();               // 55% completion < warn 60 -> alert
     expect(exec?.title).toContain('completion');
+  });
+
+  it('raises on a BLOCKING compliance breach, on the count rather than a rate', () => {
+    // The only alert here that is not a threshold. A "blocking" rule means somebody needs to know today, so
+    // one occurrence is the alert - averaging it into a percentage of a good week is the thing the
+    // rule set's severity exists to prevent.
+    const alerts = computeAlerts({
+      intentEffectiveness: [
+        { intent: 'general_query', direct_count: 100, task_count: 0, direct_relevance: 95, avg_confidence: 95, tool_calls: 0, compliance_assessed_count: 100, violation_count: 3, blocking_violation_count: 1 },
+      ],
+    });
+    const a = alerts.find((x) => x.id === 'q-compliance-blocking');
+    expect(a?.severity).toBe('error');
+    expect(a?.title).toContain('1 blocking compliance breach');
+    expect(a?.tab).toBe('effectiveness');
+  });
+
+  it('stays silent on a NON-blocking breach, so the list keeps being read', () => {
+    const alerts = computeAlerts({
+      intentEffectiveness: [
+        { intent: 'general_query', direct_count: 100, task_count: 0, direct_relevance: 95, avg_confidence: 95, tool_calls: 0, compliance_assessed_count: 100, violation_count: 4, blocking_violation_count: 0 },
+      ],
+    });
+    expect(alerts.find((x) => x.id === 'q-compliance-blocking')).toBeUndefined();
+  });
+
+  it('raises no relevance alert when the gap from target is below what its conversations can detect (Appendix C4)', () => {
+    const row = { intent: 'general', direct_count: 5, task_count: 0, direct_relevance: 60, avg_confidence: 95, tool_calls: 0 };
+    // A wide spread over few conversations cannot tell 60 from the target.
+    expect(computeAlerts({ intentEffectiveness: [{ ...row, direct_relevance_mdd: 40 }] })
+      .find((a) => a.id === 'q-exec-general')).toBeUndefined();
+    // The same average over a population that can detect the gap alerts as before.
+    expect(computeAlerts({ intentEffectiveness: [{ ...row, direct_relevance_mdd: 3 }] })
+      .find((a) => a.id === 'q-exec-general')).toBeDefined();
   });
 });

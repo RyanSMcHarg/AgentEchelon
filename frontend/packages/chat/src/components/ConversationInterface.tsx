@@ -1,9 +1,15 @@
 import React, { useEffect, useRef, useState, useCallback, useMemo } from 'react';
+import { useTurnState } from '../hooks/useTurnState';
 import { useTranslation, Trans } from 'react-i18next';
 import { useConversations } from '../providers/ConversationProvider.chime';
+import { withPrivateAddressDisplayed, withMentionNamesDisplayed } from '../utils/mentionParser';
 import TaskStatusIndicator from './TaskStatusIndicator';
+import QueueStatusIndicator from './QueueStatusIndicator';
 import AttachmentDisplay from './AttachmentDisplay';
+import { ProposalCard } from './ProposalCard';
+import { TaskCard } from './TaskCard';
 import ShareConversationModal from './ShareConversationModal';
+import { shareDisabledReason } from './shareAvailability';
 import ArchiveConversationModal from './ArchiveConversationModal';
 import ChannelMembersPanel from './ChannelMembersPanel';
 import { useAwsClient } from '../providers/AwsClientProvider';
@@ -11,14 +17,26 @@ import { chimeService } from '../services/chimeService';
 import { getBattleConfig, type ChannelBattleConfig } from '../services/channelBattleService';
 import { CollapsibleText } from './CollapsibleText';
 import BattleScorecard, { type ScorecardVariant } from './BattleScorecard';
+import { battleOf, lastMessageIndexByBattleId, messagesById, opensRound2 } from './battleScorecardAnchor';
 import BattleTallyBar from './BattleTallyBar';
 import { computeBattleTally, type BattleRoundInput, type BattleWinner, type BattleTally } from '../utils/battleTally';
 import { submitMessageFeedback } from '@ae/shared';
+import { personApiServes } from '@ae/shared';
+import type { FeedbackReason } from '@ae/shared';
 import { shortenModelId } from '../utils/modelLabel';
 import { getModelGreeting } from '../utils/greeting';
 import type { Message } from '@ae/shared';
+import { orderContinuations } from '../utils/continuationOrder';
+import { taskReferenceOf } from '../utils/taskReference';
+import { botMessageLabel } from '../utils/senderLabel';
+import { duelSidesInOrder } from './duelSideOrder';
+import { useFollowBottom } from '@ae/shared/hooks/useFollowBottom.ts';
+import { BattleSideReply } from './BattleSideReply';
+import { mayAnswerSide, personIdOfArn, waitingSides } from '../utils/battleSideReply';
+import { AudienceLabel, ClassificationBadge, headerAudienceClass } from './ConversationClassification';
 import './ConversationInterface.css';
 import { clearMessageFocus, hasPendingMessageFocus, noteMessageFocusMiss, peekMessageFocus, scrollToMessage } from '../utils/focusMessage';
+import { conversationTitleFor, isUnnamedConversation } from '../utils/conversationTitle';
 
 /** Multi-day date divider: a divider
  *  separates messages when the calendar day changes vs the previous
@@ -47,20 +65,37 @@ function dayLabel(d: Date): string {
  *  this is mainly a safety net for any other long bot reply. */
 
 /** Map a round-1 battle reply to a scorecard variant. The label is the
- *  resolved variant displayName ("Atlas" / "Echo") carried on the
+ *  side's name from its profile (the challenger's marked when the two match) carried on the
  *  battlestats marker; it falls back to the bot's Chime sender name only
  *  when the marker didn't carry one. Response time / est. cost ride the
  *  same compact per-message battle summary. */
-function toScorecardVariant(m: Message): ScorecardVariant {
+export function toScorecardVariant(m: Message, fallbackLabel: string): ScorecardVariant {
   return {
-    // Header = the bot's Chime/AppInstanceUser name (stable identifier
-    // of the assistant principal). Different intents may invoke different
-    // models for the same assistant; the per-step expander shows what
-    // actually ran, the config expander shows what the assistant is
-    // CONFIGURED for. The variant displayName (admin-set persona) lives
-    // as a subtitle, not as the primary identifier.
-    label: m.sender?.name || 'Assistant',
-    persona: m.battle?.label,
+    // Header = the VARIANT, then the bot's own name. The two sides of a duel must be tellable
+    // apart from each other, which is a stronger requirement than naming the principal - and this
+    // is the one view whose entire job is the comparison.
+    //
+    // IT USED TO BE THE OTHER WAY AROUND, against this function's own description above. Building
+    // the label from `sender.name` alone made the columns read "Advisor" against "Alt-premium" -
+    // the live assistant's name against the alt's - while the bubbles directly above them read the
+    // two variant names. The alt's identity cannot be renamed toward the variant either: the
+    // rename applier is scoped to a single ARN (`RenameOwnIdentityOnly`) and the alt is not it. So
+    // the scorecard takes the battle label the bubbles already use, via the same resolver.
+    //
+    // The principal is not lost, it moves to the subtitle: different intents may invoke different
+    // models for the same assistant, and the per-step expander shows what actually ran while the
+    // config expander shows what it is CONFIGURED for - both of which are about the principal.
+    //
+    // The fallback is PASSED IN rather than written here: this is module scope, so it has no
+    // translator, and an English literal would be the one piece of this header nobody could localize.
+    label: botMessageLabel({
+      battleVariantLabel: m.battle?.label,
+      senderName: m.sender?.name,
+      fallback: fallbackLabel,
+    }),
+    // ONLY WHEN IT SAYS SOMETHING THE HEADER DOES NOT. With no battle label the header already IS
+    // the sender name, and filling the subtitle with it too renders the same string stacked twice.
+    persona: m.battle?.label ? m.sender?.name : undefined,
     intent: m.intent,
     modelId: m.modelId,
     responseMs: m.battle?.responseMs,
@@ -85,7 +120,7 @@ interface BattleSteering {
 }
 
 const BATTLE_STEERING: Record<string, BattleSteering> = {
-  general_qa: {
+  general: {
     coaching: 'Ask real questions your users ask.',
     chips: ['Explain X to a new hire', "What's the difference between A and B?"],
   },
@@ -97,7 +132,7 @@ const BATTLE_STEERING: Record<string, BattleSteering> = {
     coaching: 'Paste real code and ask for a review.',
     chips: ['Review this for bugs', 'Is this concurrency-safe?'],
   },
-  document_extraction: {
+  data_extraction: {
     coaching: 'Give a document and ask for specific fields.',
     chips: ['Extract the totals as a table', 'Pull every date + owner'],
   },
@@ -113,7 +148,7 @@ const BATTLE_STEERING: Record<string, BattleSteering> = {
     coaching: 'Pose a real judgment call.',
     chips: ['Pros/cons of migrating to …', 'What are the risks of …?'],
   },
-  workflow_actions: {
+  guided_troubleshooting: {
     coaching: 'Ask it to drive a multi-step task.',
     chips: ['Plan and track the steps to …', 'Walk me through …'],
   },
@@ -191,14 +226,40 @@ const battleBriefingStyles: Record<string, React.CSSProperties> = {
   },
 };
 
+/** When this person's newest message has had no assistant message after it: its time, else undefined. */
+function awaitingReplySinceOf(messages: readonly Message[], currentUserArn: string | null | undefined): number | undefined {
+  for (let i = messages.length - 1; i >= 0; i -= 1) {
+    const m = messages[i];
+    if (m.isBot) return undefined;
+    if (currentUserArn && m.sender?.arn === currentUserArn) return new Date(m.timestamp).getTime();
+  }
+  return undefined;
+}
+
 const ConversationInterface: React.FC = () => {
   const { t } = useTranslation();
-  const { activeConversation, messages, isLoadingMessages, isBotTyping, channelMembers, renameConversation, archiveConversation, selectConversation } = useConversations();
+  const { activeConversation, messages: loadedMessages, isLoadingMessages, isBotTyping, channelMembers, renameConversation, archiveConversation, selectConversation, battleWaitingBots = [], replyingToSides = [], replyToSides } = useConversations();
+  // A continuation part is shown with the message it continues, not wherever its creation time put it:
+  // a queue notice posted while the answer was generating otherwise lands between the two halves.
+  // Ordered once here so every index-based read below sees the same order.
+  const messages = useMemo(() => orderContinuations(loadedMessages), [loadedMessages]);
   const { userArn: currentUserArn } = useAwsClient();
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  // The message each waiting duel side waits on, so its answer control is drawn there and nowhere else.
+  const liveWaitingMessageIds = useMemo(
+    () => new Set(waitingSides(loadedMessages).map((side) => side.messageId)),
+    [loadedMessages],
+  );
   const containerRef = useRef<HTMLDivElement>(null);
-  const [showScrollBtn, setShowScrollBtn] = useState(false);
+  /** The list's content, whose height the follow-the-bottom rule observes. */
+  const contentRef = useRef<HTMLDivElement>(null);
   const [isShareModalOpen, setIsShareModalOpen] = useState(false);
+  // Sharing exists only where the person API serves it (`VITE_PERSON_API_CAPABILITIES` names `notifications`).
+  const shareServed = personApiServes('notifications');
+  // Share shows disabled, with the reason, where membership comes from a group or list (see shareAvailability).
+  const shareDisabledReasonText = shareDisabledReason(activeConversation?.membershipSource, t);
+  // A hover tooltip reaches neither a touch nor a keyboard user, so the reason is also shown on tap and focus.
+  const [showShareReason, setShowShareReason] = useState(false);
+  useEffect(() => { setShowShareReason(false); }, [activeConversation?.id]);
   const [isEditingTitle, setIsEditingTitle] = useState(false);
   const [titleDraft, setTitleDraft] = useState('');
   // Snapshot the Chime read-marker boundary once when a conversation is opened, BEFORE
@@ -210,17 +271,34 @@ const ConversationInterface: React.FC = () => {
     setUnreadBoundaryMs(lr ? lr.getTime() : 0);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeConversation?.id]);
+  /**
+   * A REFUSED RENAME HAS TO REACH THE PERSON WHO TRIED IT.
+   *
+   * The pencil is offered to every member, and Chime authorizes `UpdateChannel` only for a channel
+   * moderator - so a non-moderator is denied server-side, by design. This used to close the editor,
+   * swallow the error into `console.error`, and let the title snap back to its old value: the person saw
+   * their edit silently undone with no reason given, which reads as the product being broken rather than
+   * as a permission they do not have.
+   *
+   * The editor now stays OPEN on failure with the draft intact, so the text is not lost and the message
+   * sits beside the input that produced it. The server's own message is preferred when there is one,
+   * because "you are not a moderator of this conversation" is more use than any generic line this
+   * component could invent.
+   */
+  const [renameError, setRenameError] = useState<string | null>(null);
   const saveTitle = useCallback(async () => {
     if (!activeConversation) return;
     const name = titleDraft.trim();
-    setIsEditingTitle(false);
-    if (!name || name === activeConversation.title) return;
+    if (!name || name === activeConversation.title) { setIsEditingTitle(false); setRenameError(null); return; }
     try {
       await renameConversation(activeConversation.id, name);
+      setIsEditingTitle(false);
+      setRenameError(null);
     } catch (err) {
       console.error('Failed to rename conversation:', err);
+      setRenameError(err instanceof Error && err.message ? err.message : t('conversation.renameFailed'));
     }
-  }, [activeConversation, titleDraft, renameConversation]);
+  }, [activeConversation, titleDraft, renameConversation, t]);
   const [isMembersPanelOpen, setIsMembersPanelOpen] = useState(false);
   // Moderator status for the active conversation — read from Chime's live
   // moderator list (source of truth), gating the header Archive action. Same
@@ -246,6 +324,11 @@ const ConversationInterface: React.FC = () => {
   }, [activeConversation, archiveConversation]);
   const [isMentionBannerDismissed, setIsMentionBannerDismissed] = useState(false);
   const [feedbackState, setFeedbackState] = useState<Record<string, 'up' | 'down' | 'pending'>>({});
+  // The message whose "what went wrong" picker is open, and the one showing the acknowledgement
+  // after a reason was given. Both are single-valued: only the most recent down vote is being asked
+  // about, so opening one picker closes any other.
+  const [reasonPromptFor, setReasonPromptFor] = useState<string | null>(null);
+  const [reasonThanksFor, setReasonThanksFor] = useState<string | null>(null);
   // Live /battle tally: each scorecard reports its pick up here so the bar above
   // the stream can aggregate wins/speed/cost across every round in real time
   // (SPEC-BATTLE Battle Objectives, objective 2).
@@ -269,7 +352,8 @@ const ConversationInterface: React.FC = () => {
     // Eligibility comes from the config response (the profile's `battleEligible`), so the request is
     // no longer pre-gated on a hardcoded premium check against mutable metadata. A non-eligible
     // conversation simply gets `battleEligible: false` back and renders nothing.
-    if (!arn) { setBattleConfig(null); return; }
+    // Battle exists only where the person API serves it (`VITE_PERSON_API_CAPABILITIES` names `battle`).
+    if (!arn || !personApiServes('battle')) { setBattleConfig(null); return; }
     let cancelled = false;
     void getBattleConfig(arn)
       .then((cfg) => { if (!cancelled) setBattleConfig(cfg); })
@@ -311,8 +395,10 @@ const ConversationInterface: React.FC = () => {
     const rounds: BattleRoundInput[] = [];
     for (const [battleId, msgs] of byId) {
       if (msgs.length < 2) continue;
-      const a = toScorecardVariant(msgs[0]);
-      const b = toScorecardVariant(msgs[1]);
+      // A is the control and B the treatment, which is how the server credits a pick (`duelSideOrder.ts`).
+      const [first, second] = duelSidesInOrder(msgs);
+      const a = toScorecardVariant(first, t('tier.assistant'));
+      const b = toScorecardVariant(second, t('tier.assistant'));
       rounds.push({
         battleId,
         sideA: { label: a.label, responseMs: a.responseMs, costUsd: a.estCostUsd },
@@ -321,7 +407,9 @@ const ConversationInterface: React.FC = () => {
       });
     }
     return rounds;
-  }, [messages]);
+  // `t` is a dependency because the fallback label is now translated: without it a language
+  // change would leave the previous language's label on any side whose sender name was absent.
+  }, [messages, t]);
 
   // One STANDALONE tally per battle: each /battle prompt is scored on its own (A vs B
   // for THAT prompt, both rounds including the rebuttal), and the next prompt starts a
@@ -337,9 +425,117 @@ const ConversationInterface: React.FC = () => {
     return map;
   }, [battleRounds, battleWinners]);
 
+  /**
+   * The LAST message of each battle, by index, so its scorecard renders exactly once.
+   *
+   * THE BUG THIS REPLACES. The anchor was "the next message has a different battleId", which is the
+   * last message of a CONTIGUOUS RUN rather than of the battle. A duel's messages are only contiguous
+   * when nothing interleaves, and plenty does: the person can speak mid-duel, a second `/battle` is
+   * refused with an explained no-op, and round 2 arrives after all of it. Every interleaving splits
+   * one duel into two blocks, and because the scorecard's data is filtered from ALL messages by
+   * battleId rather than from the block, each block rendered the SAME scorecard again.
+   *
+   * Measured live: three scorecards for one duel in the single-active-battle e2e - the one test that
+   * deliberately interleaves a refusal into a running duel, which is why it is the one that caught
+   * this. It had failed once before without being root-caused, and was recorded as
+   * "do not file this as flaky" for exactly this reason.
+   *
+   * A MAP OF LAST INDEX, not a scan per message: the render loop is per message, so asking "is there
+   * a later message with this battleId" inline would be quadratic on a long conversation.
+   */
+  const messageById = useMemo(() => messagesById(messages), [messages]);
+  const lastIndexByBattleId = useMemo(() => lastMessageIndexByBattleId(messages, messageById), [messages, messageById]);
+
   const humanMemberCount = channelMembers.filter((m) => !m.isBot).length;
+
+  // WHAT IS WAITING HERE (ADR-033), read from the conversation's record rather than derived from
+  // the transcript: ordering is not a reliable encoding of set membership, and a client that
+  // reloaded with partial history or joined late would style the wrong messages.
+  //
+  // The FIRST bot member is the responder, because busy is a property of a responder and this is the
+  // one the composer addresses by default. A room with several assistants reports on that one; the
+  // alternative is a request per bot on every poll to answer a question nobody asked.
+  // EVERY assistant, not the first. Busy is a property of a responder, so a room with several has
+  // several queues - reading one of them styles a message queued behind any other as not waiting.
+  /**
+   * EVERY assistant that could be holding a turn here, from BOTH things that know.
+   *
+   * The roster is the obvious source and it is not sufficient on its own. It is fetched when the
+   * conversation is opened and refreshed on a membership event, and an assistant added around the
+   * moment the conversation is created can land in the gap between those two: the fetch ran before
+   * it joined, and no membership event for it followed. Measured against the deployment, that is not
+   * theoretical - the record held a waiting message, the endpoint returned it correctly, and the app
+   * asked ZERO times for the whole conversation, because this list was empty and the read returns
+   * before its request when there is nobody to ask about.
+   *
+   * The TRANSCRIPT is the other thing that knows, and it cannot miss: an assistant that is answering
+   * has, by definition, already posted into this conversation - the greeting, the placeholder, or
+   * the deferral notice itself. Taking the union means a roster that is late, incomplete, or never
+   * refreshed cannot silence the queue state, and neither can a transcript that starts mid-history.
+   */
+  const responderIds = useMemo(
+    () => {
+      const fromRoster = channelMembers
+        .filter((m) => m.isBot)
+        .map((m) => m.userArn.split('/').pop() || '');
+      const fromTranscript = messages
+        .filter((m) => m.sender?.arn?.includes('/bot/'))
+        .map((m) => m.sender.arn.split('/').pop() || '');
+      return Array.from(new Set([...fromRoster, ...fromTranscript])).filter(Boolean);
+    },
+    [channelMembers, messages],
+  );
+  // THE EVENT, from the messages this component already has. The deferral notice is an ordinary
+  // message: posted when the queue starts, updated as more arrive, updated again when the drain
+  // empties it. Its id and content together change exactly when the queue does, so watching them is
+  // subscribing to the state change rather than polling for it.
+  const noticeSignal = useMemo(
+    () => {
+      // THE NOTICE, when it can be recognized. The depth, not the text: a count is the state token
+      // the notification is supposed to carry, and content length was a proxy that would miss a
+      // change of the same size.
+      const notices = messages
+        .filter((m) => m.responsePhase === 'notice')
+        .map((m) => `${m.id}:${m.queueDepth ?? '?'}`)
+        .join('|');
+      // AND THE TRANSCRIPT ITSELF, because recognizing the notice depends on a single metadata field
+      // surviving the whole way from the sender to this component. Measured against the deployment:
+      // the record held a waiting message, the endpoint returned it correctly to this page, and the
+      // app read the endpoint exactly ONCE - at mount, before anything was queued - and never again,
+      // because this signal never changed. The person was never shown their message waiting.
+      //
+      // The transcript changing is a strict superset of the notice arriving, and it is still an
+      // EVENT rather than a timer: it is the same message subscription this component already has.
+      // A re-read costs one small request per assistant and only happens when something was said.
+      // AND AN UPDATE, NOT ONLY A NEW MESSAGE. A drain that clears the queue and then
+      // UPDATES its proposal in place changes no id and no count, so the last read stood from before
+      // the clear and two messages kept their "waiting" badge for good. The newest few messages'
+      // phase and length move when one of them is rewritten.
+      const recentUpdates = messages
+        .slice(-3)
+        .map((m) => `${m.id}:${m.responsePhase ?? ''}:${m.content?.length ?? 0}`)
+        .join(',');
+      return `${notices}#${messages.length}:${recentUpdates}`;
+    },
+    [messages],
+  );
+  // WHEN THIS PERSON IS STILL WAITING FOR AN ANSWER: their newest message, with no assistant message after
+  // it. The turn-state hook reads once more at two deadlines after it, so a turn that never started, or an
+  // answer that could not be delivered, is shown without a reload. Any assistant message after it clears this.
+  const awaitingReplySince = awaitingReplySinceOf(messages, currentUserArn);
+  const { queuedIds, dispatchFailed } = useTurnState({
+    // THE ARN, not the id. `Conversation.id` is the channel's short id - the ARN's last segment -
+    // and this endpoint checks that what it is given belongs to this deployment, so a short id is
+    // rejected with 400. Every call the app made was refused that way, and it went unnoticed because
+    // the hook had nothing to ask about and so made no calls at all until the responders were fixed.
+    channelArn: activeConversation?.conversationArn ?? null,
+    responderIds,
+    changeSignal: noticeSignal,
+    awaitingReplySince,
+  });
   const isMultiUser = humanMemberCount >= 2;
-  const showMentionBanner = isMultiUser && !isMentionBannerDismissed;
+  // Shown only where an assistant is present to answer; a room of people alone has nobody to mention.
+  const showMentionBanner = isMultiUser && channelMembers.some((m) => m.isBot) && !isMentionBannerDismissed;
 
   // Briefing fields ride on the battle config (DESIGN-EXPERIMENTS-BATTLE A.5),
   // snapshotted at enable time. Read them via a local augmentation so this stays
@@ -357,15 +553,25 @@ const ConversationInterface: React.FC = () => {
   const showBattleBriefing =
     !!battleConfig?.enabled && battleConfig.battleEligible !== false
     && !!briefingStatement && !isBattleBriefingDismissed;
-  const userScrolledRef = useRef(false);
-
-  const scrollToBottom = useCallback((smooth = true) => {
-    messagesEndRef.current?.scrollIntoView({ behavior: smooth ? 'smooth' : 'instant' });
-    userScrolledRef.current = false;
-    setShowScrollBtn(false);
-  }, []);
-
   const activeConversationId = activeConversation?.id;
+
+  // THE LIST FOLLOWS ITS NEWEST CONTENT WHILE THE VIEWER IS AT THE BOTTOM (`useFollowBottom`): a new
+  // message, an UPDATE that grows one (a placeholder replaced by its answer, a duel side's reply) and an
+  // image that loads all keep the newest content in view, and a viewer who scrolled up to read history
+  // is left there and offered the jump instead. Suspended while a deep link is still waiting to land, so
+  // it never scrolls away from the message the reader followed a link to reach.
+  const {
+    showJump: showScrollBtn,
+    jumpToBottom,
+    onScroll: handleScroll,
+    release: releaseFollow,
+  } = useFollowBottom({
+    containerRef,
+    contentRef,
+    changeKey: messages,
+    resetKey: activeConversationId,
+    isSuspended: () => hasPendingMessageFocus(activeConversationId),
+  });
 
   // A `#message=<id>` deep link (a drift conversation's link back to the message that caused it) records its
   // target before the conversation's history exists. This runs on every `messages` change, so it fires
@@ -375,53 +581,36 @@ const ConversationInterface: React.FC = () => {
   // Running FIRST is not what makes the deep link win - it is what made it LOSE. Effects run in
   // declaration order within a commit, so on the render where the target finally mounts this one
   // consumed the pending request and scrolled to the message, and then the auto-scroll effect below
-  // saw no pending focus, found `userScrolledRef` still false on a freshly loaded conversation, and
+  // saw no pending focus, found the list still following on a freshly loaded conversation, and
   // scrolled to the bottom - the last scroll applied, and the one that wins. Following a drift link
   // landed the reader at the newest message with a highlight they never saw.
   //
   // Marking the position as user-owned is what settles it: the viewport is now where the reader asked
   // to be, so the auto-scroll effect takes its "offer the jump-to-newest button" branch instead of
-  // yanking them away - on this render and on later ones, which is also the right behaviour while
+  // yanking them away - on this render and on later ones, which is also the right behavior while
   // someone is reading history.
   useEffect(() => {
     const id = peekMessageFocus(activeConversationId);
     if (!id) return;
     if (!scrollToMessage(id)) {
-      // Not rendered on this pass (a longer history still loading). Leave the request pending so the next
-      // render tries again, at the cost of one attempt from its budget.
-      noteMessageFocusMiss();
+      // NOT WHILE THE LIST IS STILL LOADING. A miss is meant to mean "the history rendered and the
+      // target was not in it", which is what the attempt budget exists to bound. While
+      // `isLoadingMessages` is true the list is a skeleton, so the target cannot be there and a miss
+      // says nothing - counting those spends the whole budget on the renders BEFORE the messages
+      // arrive, and the request is then gone by the time the target appears.
+      //
+      // That was latent until the drift back-link started navigating in place: the link used to open
+      // a new tab, so this path never ran for it. Measured live - the originating message rendered and
+      // never took the highlight.
+      if (!isLoadingMessages) noteMessageFocusMiss();
       return;
     }
     clearMessageFocus();
-    userScrolledRef.current = true;
+    releaseFollow();
     // `isLoadingMessages` is a dependency because the list is replaced by a skeleton while it is true: a
     // commit that swaps the skeleton back for the messages is a render where the target can appear, even
     // when the `messages` reference did not change again.
-  }, [messages, activeConversationId, isLoadingMessages]);
-
-  useEffect(() => {
-    // Skip the "jump to newest" behaviour while a deep link is still waiting to land, or it would scroll
-    // away from the message the user followed a link to reach. Once the request gives up this goes back to
-    // scrolling normally.
-    if (hasPendingMessageFocus(activeConversationId)) return;
-    if (!userScrolledRef.current) {
-      scrollToBottom();
-    } else {
-      setShowScrollBtn(true);
-    }
-  }, [messages, scrollToBottom, activeConversationId]);
-
-  const handleScroll = useCallback(() => {
-    const el = containerRef.current;
-    if (!el) return;
-    const distFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
-    if (distFromBottom > 100) {
-      userScrolledRef.current = true;
-    } else {
-      userScrolledRef.current = false;
-      setShowScrollBtn(false);
-    }
-  }, []);
+  }, [messages, activeConversationId, isLoadingMessages, releaseFollow]);
 
   const formatTimestamp = (date: Date) => {
     return date.toLocaleTimeString('en-US', {
@@ -473,6 +662,12 @@ const ConversationInterface: React.FC = () => {
         else next[message.id] = clicked;
         return next;
       });
+      // A vote that says a response was bad says nothing about WHAT was bad, and the three things a
+      // person is signalling - wrong assistant, bad answer, had to ask again - are three different
+      // problems with three different owners. So ask, but only AFTER the vote is already recorded:
+      // the picker refines a vote that has counted since the moment it was clicked, and ignoring it
+      // costs the person nothing and loses nothing that was captured before.
+      setReasonPromptFor(!isClear && clicked === 'down' ? message.id : null);
     } catch (error) {
       console.error('Failed to submit feedback:', error);
       setFeedbackState((prev) => {
@@ -482,6 +677,36 @@ const ConversationInterface: React.FC = () => {
         else delete next[message.id];
         return next;
       });
+    }
+  }, [activeConversation]);
+
+  /**
+   * Refine a `down` that is already recorded with the axis it indicts.
+   *
+   * Posted as a SECOND vote rather than an update: the feedback store appends every revision and
+   * counts only the latest per (voter, message), so this supersedes the bare vote without changing
+   * the sentiment it recorded and without erasing the fact that the person voted before they said
+   * why. Failure is silent by design - the vote is already safe, and an error toast here would
+   * punish somebody for volunteering more than they had to.
+   */
+  const handleFeedbackReason = useCallback(async (message: Message, reason: FeedbackReason) => {
+    if (!activeConversation) return;
+    setReasonPromptFor(null);
+    setReasonThanksFor(message.id);
+    try {
+      await submitMessageFeedback({
+        messageId: message.id,
+        channelArn: activeConversation.conversationArn,
+        modelId: message.modelId,
+        intent: message.intent,
+        feedback: 'down',
+        reason,
+        experimentId: message.experimentId,
+        variantId: message.variantId,
+        assignmentMode: message.assignmentMode,
+      });
+    } catch (error) {
+      console.error('Failed to submit feedback reason:', error);
     }
   }, [activeConversation]);
 
@@ -505,32 +730,42 @@ const ConversationInterface: React.FC = () => {
   return (
     <div className={`conversation-interface${isMembersPanelOpen ? ' with-members-panel' : ''}`}>
       <div className="conversation-interface-main">
-        <header className="conversation-header" role="banner">
+        <header className={`conversation-header${headerAudienceClass(activeConversation.modelTier)}`} role="banner">
           <div className="conversation-header-content">
             <div className="conversation-header-title-group">
               {isEditingTitle ? (
-                <input
-                  className="conversation-header-title-input"
-                  value={titleDraft}
-                  autoFocus
-                  maxLength={80}
-                  aria-label={t('conversation.renameTitle')}
-                  onChange={(e) => setTitleDraft(e.target.value)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter') { e.preventDefault(); void saveTitle(); }
-                    else if (e.key === 'Escape') setIsEditingTitle(false);
-                  }}
-                  onBlur={() => void saveTitle()}
-                />
+                <>
+                  <input
+                    className="conversation-header-title-input"
+                    value={titleDraft}
+                    autoFocus
+                    maxLength={80}
+                    aria-label={t('conversation.renameTitle')}
+                    aria-invalid={renameError ? true : undefined}
+                    onChange={(e) => { setTitleDraft(e.target.value); setRenameError(null); }}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter') { e.preventDefault(); void saveTitle(); }
+                      else if (e.key === 'Escape') { setIsEditingTitle(false); setRenameError(null); }
+                    }}
+                    /* No save on blur while a refusal is showing: blurring to read the message would
+                       retry the same denied call and close the editor, losing the draft and the reason. */
+                    onBlur={() => { if (!renameError) void saveTitle(); }}
+                  />
+                  {renameError && (
+                    <div className="alert alert-error conversation-header-rename-error" role="alert">
+                      {renameError}
+                    </div>
+                  )}
+                </>
               ) : (
                 <>
-                  <h2 className="conversation-header-title" title={activeConversation.title}>
-                    {activeConversation.title}
+                  <h2 className="conversation-header-title" title={conversationTitleFor(activeConversation.title, t('conversation.newConversation'))}>
+                    {conversationTitleFor(activeConversation.title, t('conversation.newConversation'))}
                   </h2>
                   <button
                     type="button"
                     className="btn btn-ghost btn-icon conversation-header-btn conversation-header-rename-btn"
-                    onClick={() => { setTitleDraft(activeConversation.title); setIsEditingTitle(true); }}
+                    onClick={() => { setTitleDraft(isUnnamedConversation(activeConversation.title) ? '' : activeConversation.title); setIsEditingTitle(true); }}
                     title={t('conversation.renameTitle')}
                     aria-label={t('conversation.renameTitle')}
                   >
@@ -540,26 +775,46 @@ const ConversationInterface: React.FC = () => {
                   </button>
                 </>
               )}
-              <span
-                className={`conversation-header-tier conversation-header-tier--${activeConversation.modelTier}`}
-                title={activeConversation.modelName}
-              >
-                <span className="conversation-header-tier-dot" aria-hidden="true" />
-                {t(`tier.${activeConversation.modelTier}`)}
-              </span>
+              {activeConversation.modelTier && (
+                <>
+                  <ClassificationBadge value={activeConversation.modelTier} title={activeConversation.modelName} />
+                  <AudienceLabel value={activeConversation.modelTier} />
+                </>
+              )}
             </div>
             <div className="conversation-header-actions">
+              {shareServed && (<>
               <button
                 type="button"
-                className="btn btn-ghost btn-icon conversation-header-btn"
-                onClick={() => setIsShareModalOpen(true)}
-                title={t('conversation.shareTitle')}
+                className={`btn btn-ghost btn-icon conversation-header-btn${shareDisabledReasonText ? ' is-disabled' : ''}`}
+                // aria-disabled rather than disabled: a disabled button receives no hover, so its tooltip -
+                // the reason Share is unavailable - would never show.
+                onClick={() => {
+                  // Show, never toggle: a tap focuses the button first, so a toggle here would hide what focus just showed.
+                  if (shareDisabledReasonText) setShowShareReason(true);
+                  else setIsShareModalOpen(true);
+                }}
+                onFocus={() => { if (shareDisabledReasonText) setShowShareReason(true); }}
+                onBlur={() => setShowShareReason(false)}
+                aria-disabled={shareDisabledReasonText ? true : undefined}
+                aria-describedby={shareDisabledReasonText ? 'share-disabled-reason' : undefined}
+                title={shareDisabledReasonText || t('conversation.shareTitle')}
                 aria-label={t('conversation.shareTitle')}
               >
                 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="16" height="16" aria-hidden="true">
                   <path d="M13 4.5a2.5 2.5 0 11.702 1.737L6.97 9.604a2.518 2.518 0 010 .792l6.733 3.367a2.5 2.5 0 11-.671 1.341l-6.733-3.367a2.5 2.5 0 110-3.474l6.733-3.367A2.52 2.52 0 0113 4.5z" />
                 </svg>
               </button>
+              {shareDisabledReasonText && (
+                <span
+                  id="share-disabled-reason"
+                  role="status"
+                  className={`share-disabled-reason${showShareReason ? ' is-visible' : ''}`}
+                >
+                  {shareDisabledReasonText}
+                </span>
+              )}
+              </>)}
               <button
                 type="button"
                 className={`btn btn-ghost btn-icon conversation-header-btn${isMembersPanelOpen ? ' is-active' : ''}`}
@@ -594,6 +849,26 @@ const ConversationInterface: React.FC = () => {
               )}
             </div>
           </div>
+          {/* ── A TURN THAT NEVER RAN, SAID BY THE APP RATHER THAN BY THE ASSISTANT ───────────────
+              The channel flow used to post this as the assistant. That put an infrastructure failure
+              in the transcript under the assistant's name and showed it to the whole room; this is
+              the person's own client telling them their message was delivered and nothing is coming.
+              `role="alert"` rather than `status`: they are waiting for a reply that will never
+              arrive, so it is worth interrupting for. The copy comes from i18n, keyed by the reason
+              code, with a generic line for a code this build does not recognise - a newer server must
+              degrade to an honest sentence rather than to silence. */}
+          {dispatchFailed && (
+            <div className="mention-banner" role="alert">
+              <div className="mention-banner-icon" aria-hidden="true">
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 20 20" fill="currentColor" width="14" height="14">
+                  <path fillRule="evenodd" d="M10 18a8 8 0 100-16 8 8 0 000 16zm.93-12.588a.75.75 0 10-1.49-.154l-.5 4.775a.75.75 0 001.49.154l.5-4.775zM10 15a1 1 0 100-2 1 1 0 000 2z" clipRule="evenodd" />
+                </svg>
+              </div>
+              <div className="mention-banner-body">
+                {t([`conversation.turnFailed.${dispatchFailed}`, 'conversation.turnFailed.generic'])}
+              </div>
+            </div>
+          )}
           {showMentionBanner && (
             <div className="mention-banner" role="status">
               <div className="mention-banner-icon" aria-hidden="true">
@@ -608,7 +883,7 @@ const ConversationInterface: React.FC = () => {
                     parsed out of a string. */}
                 <Trans
                   i18nKey="mentionBanner.body"
-                  components={[<strong key="assistant" />, <strong key="all" />]}
+                  components={[<strong key="all" />]}
                 />
               </div>
               <button
@@ -626,6 +901,7 @@ const ConversationInterface: React.FC = () => {
           )}
         </header>
       <div className="messages-container" ref={containerRef} onScroll={handleScroll}>
+        <div className="messages-content" ref={contentRef}>
         {/* Battle briefing (DESIGN-EXPERIMENTS-BATTLE §2.2): a compact,
             dismissible intro rendered above the first battle turn. It names the
             DECISION (objective statement) — never the models, keeping aliases
@@ -696,9 +972,9 @@ const ConversationInterface: React.FC = () => {
           // back to a generic empty string only if we somehow
           // don't have a tier yet.
           <div className="conversation-empty-state">
-            {activeConversation?.modelTier ? (
+            {activeConversation?.modelTier && getModelGreeting(activeConversation.modelTier, t) ? (
               <div className="conversation-empty-greeting">
-                {getModelGreeting(activeConversation.modelTier)
+                {(getModelGreeting(activeConversation.modelTier, t) ?? '')
                   .split('\n')
                   .map((line, i) => (
                     <p key={i} className={line.startsWith('•') ? 'greeting-bullet' : ''}>
@@ -737,14 +1013,12 @@ const ConversationInterface: React.FC = () => {
 
             // /battle: render a "Round 2: rebuttals" divider when consecutive
             // messages from the same battleId transition round 1 → round 2.
-            const showRound2Divider =
-              message.battle?.round === 2
-              && prevMessage?.battle?.battleId === message.battle.battleId
-              && prevMessage.battle.round === 1;
+            // A long round-1 answer ends in continuation parts, which belong to it (`battleOf`).
+            const showRound2Divider = opensRound2(message, prevMessage, messageById);
 
-            // /battle: variant chip on bot messages. Prefer the resolved
-            // variant displayName from the battlestats marker
-            // (message.battle.label, e.g. "Atlas"/"Echo"); fall back to
+            // /battle: variant chip on bot messages. Prefer the side's
+            // profile name from the battlestats marker
+            // (message.battle.label); fall back to
             // the bot's Chime sender name only when the marker didn't
             // carry one (e.g. a placeholder before the answer lands).
             const battleVariantLabel =
@@ -759,24 +1033,28 @@ const ConversationInterface: React.FC = () => {
             // shown is still the round-1 pair (the primary comparison);
             // we just delay where it renders so a multi-turn battle
             // doesn't show the scorecard wedged between rounds.
+            // THE LAST MESSAGE OF THE BATTLE, not of a contiguous run of it. Comparing against the
+            // NEXT message alone made every interleaved message - the person speaking mid-duel, a
+            // refused second `/battle`, anything arriving between rounds - start a new "block", and
+            // each block rendered its own copy of the same scorecard.
+            // A continuation part of the duel's last answer is the duel's last message (`battleOf`).
+            const ownBattle = battleOf(message, messageById);
             const isLastOfBattle =
-              !!message.battle &&
-              (!nextMessage?.battle ||
-                nextMessage.battle.battleId !== message.battle.battleId);
+              !!ownBattle && lastIndexByBattleId.get(ownBattle.battleId) === index;
             const battleRound1Msgs =
-              isLastOfBattle && message.battle
-                ? messages.filter(
+              isLastOfBattle && ownBattle
+                ? duelSidesInOrder(messages.filter(
                     (m) =>
-                      m.battle?.battleId === message.battle!.battleId &&
+                      m.battle?.battleId === ownBattle.battleId &&
                       m.battle?.round === 1,
-                  )
+                  ))
                 : [];
             const scorecard =
-              battleRound1Msgs.length >= 2
+              battleRound1Msgs.length >= 2 && ownBattle
                 ? {
-                    battleId: message.battle!.battleId,
-                    variantA: toScorecardVariant(battleRound1Msgs[0]),
-                    variantB: toScorecardVariant(battleRound1Msgs[1]),
+                    battleId: ownBattle.battleId,
+                    variantA: toScorecardVariant(battleRound1Msgs[0], t('tier.assistant')),
+                    variantB: toScorecardVariant(battleRound1Msgs[1], t('tier.assistant')),
                   }
                 : null;
 
@@ -816,26 +1094,70 @@ const ConversationInterface: React.FC = () => {
               // and sent its next message into a turn that was still generating, producing the report
               // twice. Absent when the writer stamped no phase.
               data-response-phase={message.responsePhase}
-              className={`message ${message.isBot ? 'assistant-message' : 'user-message'}${isContinuation || isGroupedWithPrev ? ' continuation' : ''}${message.battle ? ' battle-message' : ''}`}
+              // WAITING TO BE READ (ADR-033). From the conversation's RECORD, never derived from where
+              // this message sits in the transcript: a client that reloaded with partial history or
+              // joined late would get that wrong, and the styling would claim something false.
+              //
+              // It clears for the whole batch at once when triage runs, because that is when a message
+              // stops waiting - there is no per-message signal to wait for, and inventing one would
+              // mean claiming an attribution the platform cannot verify.
+              data-queued={queuedIds.has(message.id) ? 'true' : undefined}
+              className={`message ${message.isBot ? 'assistant-message' : 'user-message'}${isContinuation || isGroupedWithPrev ? ' continuation' : ''}${message.battle ? ' battle-message' : ''}${queuedIds.has(message.id) ? ' message-queued' : ''}`}
             >
               <div className="message-content">
+                {queuedIds.has(message.id) && (
+                  <span className="message-waiting-label">{t('conversation.messageWaiting')}</span>
+                )}
+                {!message.isBot && taskReferenceOf(message.content) !== null && (
+                  <span
+                    className="message-answering-label"
+                    aria-label={t('conversation.answeringRefA11y', { ref: taskReferenceOf(message.content) })}
+                  >
+                    {t('conversation.answeringRef', { ref: taskReferenceOf(message.content) })}
+                  </span>
+                )}
                 {showHeader && (
                 <div className="message-header">
                   <span className="message-role">
-                    {/* In a battle, name the specific variant (Atlas/Echo) so the two
-                        assistants are distinguishable, instead of a generic "assistant"
-                        for every bot. Falls back to the tier label off the battle path. */}
-                    {message.isBot ? (battleVariantLabel || t('tier.assistant')) : 'You'}
+                    {/* WHO SAID THIS, in the order of most specific to least.
+                        1. In a battle, the side's profile name (the challenger's marked), so the two sides are distinguishable.
+                        2. The ASSISTANT'S OWN NAME, carried on the message's Chime sender. This step
+                           was missing: the header rendered the constant `tier.assistant` for every
+                           bot off the battle path, so an assistant renamed through its profile still
+                           read as "Assistant" - and two assistants in one room read as the SAME word,
+                           which is a correctness problem the moment a classification holds more than
+                           one (DESIGN-SEPARATE-ASSISTANTS 3.0).
+                        3. The translated label, when the message carries no sender name. It stays a
+                           t() key rather than an English literal: the fallback is copy, only the name
+                           itself is data. */}
+                    {message.isBot
+                      ? botMessageLabel({ battleVariantLabel, senderName: message.sender?.name, fallback: t('tier.assistant') })
+                      : 'You'}
                   </span>
                   <span className="message-timestamp">
                     {formatTimestamp(message.timestamp)}
                   </span>
+                  {/*
+                    * THE MODEL THE TURN WAS ROUTED TO, and it does not claim to be the author of every
+                    * word.
+                    *
+                    * A bare "Opus" reads as "this reply is Opus". It is the turn's PRIMARY model: a
+                    * turn can fall back to another model mid-flight, run sub-steps on a different one,
+                    * or produce text the platform wrote rather than the model - and the badge said
+                    * "Opus" for all of them. The client cannot tell the difference either, because the
+                    * per-step models go out of band to analytics and only `bedrockModel` reaches here.
+                    *
+                    * So the chip is labeled as routing rather than authorship, and says so on hover.
+                    * Narrowing the claim is the honest fix available at this seam; showing which
+                    * models a turn ACTUALLY used needs the per-step list to reach the client, and that
+                    * is a metadata decision against the 4KB message budget rather than a copy change.
+                    */}
                   {message.isBot && shortenModelId(message.modelId) && (
                     <span
                       className="message-model-badge"
-                      title={message.modelId}
+                      title={t('message.routedToModel', { model: shortenModelId(message.modelId), id: message.modelId })}
                     >
-                      {shortenModelId(message.modelId)}
+                      {t('message.viaModel', { model: shortenModelId(message.modelId) })}
                     </span>
                   )}
                   {battleVariantLabel && message.battle?.round && (
@@ -863,7 +1185,7 @@ const ConversationInterface: React.FC = () => {
                     // attachment, so `attachment` alone covers what battleImage used to.
                     && !message.attachment;
                   if (isBattlePlaceholder) {
-                    const name = message.battle?.label || message.sender?.name || 'Assistant';
+                    const name = botMessageLabel({ battleVariantLabel: message.battle?.label, senderName: message.sender?.name, fallback: t('tier.assistant') });
                     return (
                       <div className="message-text battle-placeholder" role="status" aria-live="polite">
                         <span className="battle-placeholder-name">{name}</span>
@@ -872,7 +1194,42 @@ const ConversationInterface: React.FC = () => {
                       </div>
                     );
                   }
-                  return <CollapsibleText content={message.content} isBot={message.isBot} />;
+                  // THE ADDRESS IS SHOWN BY NAME, WITH THE ID TAKEN BACK OUT. The composer writes
+                  // `.<Name|id>` so the backend resolves the addressee by id rather than by matching a
+                  // display name; the id is for the server and not for the reader, and until this ran
+                  // a recipient read the literal token, pipe and brackets included.
+                  return (
+                    <CollapsibleText
+                      content={withMentionNamesDisplayed(withPrivateAddressDisplayed(message.content))}
+                      isBot={message.isBot}
+                    />
+                  );
+                })()}
+                {/* A DUEL SIDE WAITING ON THE PERSON (DESIGN-BATTLE, "A side parked on the person"): its
+                    answer control, on the step or question it parked on. Drawn from the message's own
+                    `<!--battlewaiting-->` marker, which comes down when the side is answered or the duel
+                    ends, so the control lives exactly as long as the wait. */}
+                {message.isBot && message.battleWaiting && liveWaitingMessageIds.has(message.id) && (() => {
+                  const waiting = message.battleWaiting;
+                  const sideName = botMessageLabel({ battleVariantLabel, senderName: message.sender?.name, fallback: t('tier.assistant') });
+                  const ownerName = waiting.ownerId
+                    ? channelMembers.find((m) => !m.isBot && personIdOfArn(m.userArn) === waiting.ownerId)?.name
+                    : undefined;
+                  const duelSidesWaitingOnMe = battleWaitingBots
+                    .filter((side) => side.battleId === waiting.battleId)
+                    .map((side) => side.botArn);
+                  return (
+                    <BattleSideReply
+                      sideArn={waiting.botArn}
+                      sideName={sideName}
+                      canAnswer={mayAnswerSide(waiting, currentUserArn)}
+                      {...(ownerName ? { ownerName } : {})}
+                      replying={replyingToSides.some((side) => side.botArn === waiting.botArn)}
+                      offerBoth={duelSidesWaitingOnMe.length > 1 && duelSidesWaitingOnMe.includes(waiting.botArn)}
+                      onReply={() => replyToSides?.([waiting.botArn])}
+                      onReplyBoth={() => replyToSides?.(duelSidesWaitingOnMe)}
+                    />
+                  );
                 })()}
                 {/*
                   A durable way into the conversation this one continued into. The `NAVIGATE_CHANNEL:` marker
@@ -895,6 +1252,16 @@ const ConversationInterface: React.FC = () => {
                     })}
                   </button>
                 )}
+                {/* A PROPOSAL ADDRESSED TO THIS PERSON (ADR-061 decision 8): its confirmation card, drawn from the targeted
+                    message's Metadata, which only they receive. Nothing happens until they answer it. */}
+                {message.isBot && message.proposal && (
+                  <ProposalCard proposal={message.proposal} onOpenConversation={(id) => void selectConversation(id)} />
+                )}
+                {/* A TASK A WORKFLOW ASSIGNED THIS PERSON (ADR-063 decision 2): its card, drawn from the targeted message's
+                    Metadata, which only they receive. They may answer on it or by writing here. */}
+                {message.isBot && message.taskCard && activeConversation?.conversationArn && (
+                  <TaskCard card={message.taskCard} channelArn={activeConversation.conversationArn} />
+                )}
                 {/* A generated image (battle generation-out, or any image_generation turn) arrives as
                     an ATTACHMENT and renders below, same as an uploaded one. */}
                 {message.attachment && (
@@ -902,6 +1269,14 @@ const ConversationInterface: React.FC = () => {
                 )}
                 {message.isBot && message.activeTask && (
                   <TaskStatusIndicator task={message.activeTask} />
+                )}
+                {/* The queue's stage, shown the same way and in the same place as a task's: to the
+                    person watching, a queue being worked and a task being worked are the same thing. */}
+                {message.isBot && message.queueStatus && (
+                  <QueueStatusIndicator
+                    status={message.queueStatus}
+                    {...(message.queueStatusLabel ? { label: message.queueStatusLabel } : {})}
+                  />
                 )}
                 {message.isBot && message.navigateChannel && (
                   <div className="message-redirect-banner" role="status">
@@ -920,21 +1295,49 @@ const ConversationInterface: React.FC = () => {
                       className={`message-feedback-btn ${feedbackState[message.id] === 'up' ? 'active' : ''}`}
                       onClick={() => handleFeedback(message, 'up')}
                       disabled={feedbackState[message.id] === 'pending'}
-                      title="Helpful response"
-                      aria-label={feedbackState[message.id] === 'pending' ? 'Submitting feedback' : 'Mark as helpful'}
+                      title={t('feedback.helpfulTitle')}
+                      aria-label={feedbackState[message.id] === 'pending' ? t('feedback.submitting') : t('feedback.helpfulAria')}
                     >
-                      Helpful
+                      {t('feedback.helpful')}
                     </button>
                     <button
                       className={`message-feedback-btn ${feedbackState[message.id] === 'down' ? 'active' : ''}`}
                       onClick={() => handleFeedback(message, 'down')}
                       disabled={feedbackState[message.id] === 'pending'}
-                      title="Unhelpful response"
-                      aria-label={feedbackState[message.id] === 'pending' ? 'Submitting feedback' : 'Mark as needs work'}
+                      title={t('feedback.needsWorkTitle')}
+                      aria-label={feedbackState[message.id] === 'pending' ? t('feedback.submitting') : t('feedback.needsWorkAria')}
                     >
-                      Needs work
+                      {t('feedback.needsWork')}
                     </button>
                   </div>
+                )}
+                {/* ── WHAT WENT WRONG, ASKED AFTER THE VOTE IS ALREADY IN ──────────────────────────
+                    Optional by construction: the down vote counted when it was clicked, so every
+                    exit from here (picking a reason, skipping, or ignoring it entirely) leaves a
+                    recorded vote behind. It is not a form and it does not block the conversation. */}
+                {showFeedback && reasonPromptFor === message.id && (
+                  <div className="message-feedback-reason" role="group" aria-label={t('feedback.reasonPrompt')}>
+                    <span className="message-feedback-reason-prompt">{t('feedback.reasonPrompt')}</span>
+                    <button className="message-feedback-reason-btn" onClick={() => handleFeedbackReason(message, 'wrong_assistant')}>
+                      {t('feedback.reasonWrongAssistant')}
+                    </button>
+                    <button className="message-feedback-reason-btn" onClick={() => handleFeedbackReason(message, 'poor_answer')}>
+                      {t('feedback.reasonPoorAnswer')}
+                    </button>
+                    <button className="message-feedback-reason-btn" onClick={() => handleFeedbackReason(message, 'asked_again')}>
+                      {t('feedback.reasonAskedAgain')}
+                    </button>
+                    <button
+                      className="message-feedback-reason-skip"
+                      onClick={() => setReasonPromptFor(null)}
+                      aria-label={t('feedback.reasonDismissAria')}
+                    >
+                      {t('feedback.reasonDismiss')}
+                    </button>
+                  </div>
+                )}
+                {showFeedback && reasonThanksFor === message.id && reasonPromptFor !== message.id && (
+                  <div className="message-feedback-reason-thanks">{t('feedback.reasonThanks')}</div>
                 )}
               </div>
             </div>
@@ -980,12 +1383,12 @@ const ConversationInterface: React.FC = () => {
             </div>
           </div>
         )}
-        <div ref={messagesEndRef} />
+        </div>
       </div>
       {showScrollBtn && (
         <button
           className="scroll-to-bottom-btn"
-          onClick={() => scrollToBottom()}
+          onClick={jumpToBottom}
           title={t('conversation.scrollToBottom')}
           aria-label={t('conversation.scrollToBottom')}
         >

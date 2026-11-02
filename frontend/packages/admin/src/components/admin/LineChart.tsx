@@ -1,3 +1,4 @@
+import i18n from '@ae/shared/i18n';
 import React from 'react';
 
 export interface LineSeries {
@@ -36,7 +37,7 @@ const SERIES_COLORS = ['var(--accent-500)', 'var(--status-good)', '#6366f1', '#d
  * Axis line chart (SVG, no chart lib) — multi-series with optional TARGET
  * reference lines. Token-driven so it adopts the dark theme. Richer than
  * Sparkline: y-axis ticks + labels, sparse x labels, gridlines, and dashed
- * target lines (e.g. an SLO) labelled at the right edge.
+ * target lines (e.g. an SLO) labeled at the right edge.
  */
 const LineChart: React.FC<LineChartProps> = ({
   series,
@@ -55,7 +56,7 @@ const LineChart: React.FC<LineChartProps> = ({
   const n = Math.max(...series.map((s) => s.points.length), 0);
 
   if (n < 2 || allValues.length === 0) {
-    return <div className="linechart-empty" style={{ width, height }} aria-label={label || 'Not enough data to chart'} />;
+    return <div className="linechart-empty" style={{ width, height }} aria-label={label || i18n.t('admin.lineChart.notEnoughDataToChart')} />;
   }
 
   const max = yMax ?? (Math.max(...allValues) * 1.12 || 1);
@@ -92,7 +93,7 @@ const LineChart: React.FC<LineChartProps> = ({
         ) : null
       ))}
 
-      {/* TARGET reference lines (dashed, labelled at right) */}
+      {/* TARGET reference lines (dashed, labeled at right) */}
       {referenceLines.map((r, i) => (
         <g key={`ref-${i}`}>
           <line

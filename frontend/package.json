@@ -1,6 +1,6 @@
 {
   "name": "agentechelon-frontend",
-  "description": "AgentEchelon frontend monorepo — @ae/shared, @ae/chat (chat SPA), @ae/admin (admin console)",
+  "description": "AgentEchelon frontend monorepo — @ae/shared, @ae/chat (chat SPA), @ae/admin (admin console), @ae/widget (embeddable widget)",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -8,11 +8,13 @@
     "packages/*"
   ],
   "scripts": {
-    "build": "npm run build:chat && npm run build:admin",
+    "build": "npm run build:chat && npm run build:admin && npm run build:widget",
     "build:chat": "npm -w @ae/chat run build",
     "build:admin": "npm -w @ae/admin run build",
+    "build:widget": "npm -w @ae/widget run build",
     "dev:chat": "npm -w @ae/chat run dev",
     "dev:admin": "npm -w @ae/admin run dev",
+    "dev:widget": "npm -w @ae/widget run dev",
     "assert-no-admin-in-chat": "node scripts/assert-no-admin-in-chat.mjs",
     "lint": "eslint .",
     "test": "npm -ws --if-present run test"

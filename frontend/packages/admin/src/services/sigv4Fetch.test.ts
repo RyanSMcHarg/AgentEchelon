@@ -1,13 +1,11 @@
 /**
- * Concurrent callers must share ONE Identity-Pool credential exchange.
+ * Concurrent callers must share ONE console-session request.
  *
- * The admin dashboard mounts and fires every section's analytics query at once. Each of the
- * seven-plus `identityPoolCredentials()` call sites used to invoke the Cognito provider before any
- * of them resolved, so Cognito saw ten identical GetId calls and answered
- * `TooManyRequestsException: Rate exceeded` on GetCredentialsForIdentity - a self-inflicted rate
- * limit on first paint. It was invisible in the product (the SDK retries, the tabs populate) and
- * showed up only as 400s in the browser console, which nothing was reading until the e2e console
- * guard was repaired.
+ * The admin dashboard mounts and fires every section's analytics query at once. Each of the seven-plus
+ * `consoleCredentials()` call sites would otherwise ask the credential exchange for a session before any
+ * of them resolved - a burst of identical requests on first paint, measured once as the credential
+ * source answering `TooManyRequestsException`. The session comes from the exchange, so the same burst
+ * would land there.
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -19,20 +17,31 @@ interface Pending {
 
 const state: { calls: number; pending: Pending | null } = { calls: 0, pending: null };
 
-vi.mock('@aws-sdk/client-cognito-identity', () => ({
-  CognitoIdentityClient: class {},
-}));
+/** The exchange's answer for a console session, built from the credentials a test resolves with. */
+const sessionResponse = (c: { accessKeyId: string; secretAccessKey: string; sessionToken: string; expiration: Date }) => ({
+  ok: true,
+  status: 200,
+  json: async () => ({
+    credentials: {
+      AccessKeyId: c.accessKeyId,
+      SecretAccessKey: c.secretAccessKey,
+      SessionToken: c.sessionToken,
+      Expiration: c.expiration.toISOString(),
+    },
+    identity: 'console',
+    role: 'admins',
+    capabilities: ['view-analytics'],
+  }),
+});
 
-vi.mock('@aws-sdk/credential-provider-cognito-identity', () => ({
-  fromCognitoIdentityPool: () => () => {
-    state.calls += 1;
-    return new Promise((resolve, reject) => {
-      state.pending = { resolve, reject };
-    });
-  },
-}));
+vi.stubGlobal('fetch', () => {
+  state.calls += 1;
+  return new Promise((resolve, reject) => {
+    state.pending = { resolve: (v) => resolve(sessionResponse(v as never)), reject };
+  });
+});
 
-// `sigv4Fetch` imports REGION / IDENTITY_POOL_ID / USER_POOL_ID / ensureFreshIdToken from the
+// `sigv4Fetch` imports REGION / USER_POOL_ID / ensureFreshIdToken from the
 // `@ae/shared` BARREL, so the barrel is what has to be mocked. An earlier version of this file
 // mocked '@ae/shared/services/ensureFreshToken' - a path the module never imports - so the mock
 // silently did nothing and these tests ran against the real shared module and whatever env the
@@ -40,13 +49,16 @@ vi.mock('@aws-sdk/credential-provider-cognito-identity', () => ({
 // keeps finding: green, having exercised something other than the thing under test.
 vi.mock('@ae/shared', () => ({
   REGION: 'us-east-1',
-  IDENTITY_POOL_ID: 'us-east-1:pool',
   USER_POOL_ID: 'us-east-1_pool',
   ApiError: class ApiError extends Error {},
   ensureFreshIdToken: async () => 'a-stable-id-token',
+  // The person exchange the console signs in at first. It answers at once: the call under count is the
+  // admin exchange's console session.
+  exchangeCredentials: async () => ({}),
 }));
+vi.stubEnv('VITE_ADMIN_API_URL', 'https://admin.example.com/');
 
-/** Let the awaits inside identityPoolCredentials run before inspecting call counts. */
+/** Let the awaits inside consoleCredentials run before inspecting call counts. */
 const flush = async (): Promise<void> => {
   for (let i = 0; i < 5; i += 1) await Promise.resolve();
 };
@@ -58,7 +70,7 @@ const CREDS = {
   expiration: new Date(Date.now() + 3_600_000),
 };
 
-describe('identityPoolCredentials — concurrent callers', () => {
+describe('consoleCredentials — concurrent callers', () => {
   beforeEach(() => {
     state.calls = 0;
     state.pending = null;
@@ -69,12 +81,12 @@ describe('identityPoolCredentials — concurrent callers', () => {
     mod.resetSignOnCredentials();
 
     // Ten callers with none resolved yet — the exact shape of dashboard mount.
-    const inFlight = Array.from({ length: 10 }, () => mod.identityPoolCredentials());
+    const inFlight = Array.from({ length: 10 }, () => mod.consoleCredentials());
     await flush();
 
     expect(
       state.calls,
-      'each concurrent caller triggered its own Cognito exchange; that is what produced '
+      'each concurrent caller triggered its own console-session request; that is what produced '
       + 'TooManyRequestsException on first paint',
     ).toBe(1);
 
@@ -90,12 +102,12 @@ describe('identityPoolCredentials — concurrent callers', () => {
     const mod = await import('./sigv4Fetch');
     mod.resetSignOnCredentials();
 
-    const first = mod.identityPoolCredentials();
+    const first = mod.consoleCredentials();
     await flush();
     state.pending!.resolve(CREDS);
     await first;
 
-    const second = await mod.identityPoolCredentials();
+    const second = await mod.consoleCredentials();
     expect(second.accessKeyId).toBe('AKIA');
     expect(state.calls, 'a cached, unexpired credential must not re-exchange').toBe(1);
   });
@@ -104,14 +116,14 @@ describe('identityPoolCredentials — concurrent callers', () => {
     const mod = await import('./sigv4Fetch');
     mod.resetSignOnCredentials();
 
-    const failing = mod.identityPoolCredentials();
+    const failing = mod.consoleCredentials();
     await flush();
     state.pending!.reject(new Error('TooManyRequestsException: Rate exceeded'));
     await expect(failing).rejects.toThrow(/Rate exceeded/);
 
     // The next caller must get a FRESH attempt. Caching the rejected promise would make a single
     // transient rate limit permanent for the life of the page.
-    const retry = mod.identityPoolCredentials();
+    const retry = mod.consoleCredentials();
     await flush();
     expect(state.calls, 'a failed exchange must not be cached').toBe(2);
 

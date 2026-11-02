@@ -107,6 +107,25 @@ describe('client TTFF', () => {
     expect(emitted('client_ttff_ms')).toHaveLength(1);
   });
 
+  it('carries the turn id, which is what makes the per-turn join possible', () => {
+    // Without this the client and server numbers can only be compared as averages. The correlation
+    // marker is the ONE identifier both sides hold, so a missing one does not fail loudly - the join
+    // simply returns nothing, which reads as "no correlated turns" rather than as a wiring fault.
+    markMessageSent(CHANNEL);
+    markPlaceholderShown(CHANNEL, 'abc123def4567890');
+
+    expect(emitted('client_ttff_ms')[0][2]).toEqual({ correlationId: 'abc123def4567890' });
+  });
+
+  it('sends no correlation key at all when the placeholder declared none', () => {
+    // Presence is what the join reads as meaning. An empty or blank key would pair the timing with
+    // nothing while looking like it had been correlated.
+    markMessageSent(CHANNEL);
+    markPlaceholderShown(CHANNEL);
+
+    expect(emitted('client_ttff_ms')[0][2]).toBeUndefined();
+  });
+
   it('is not emitted after the conversation is switched away from', () => {
     markMessageSent(CHANNEL);
     clearPending(CHANNEL);

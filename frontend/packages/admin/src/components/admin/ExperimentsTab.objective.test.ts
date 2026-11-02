@@ -66,6 +66,7 @@ describe('evaluateObjective', () => {
   it('accuracy: always pending until the classifier-accuracy eval exists', () => {
     const p = evaluateObjective({ metric: 'accuracy', target: 90 }, agg({ avg_score: 95 }), agg({ avg_score: 99 }));
     expect(p.status).toBe('pending');
-    expect(p.note).toMatch(/classifier-accuracy/);
+    // The note is named, not held: `evaluateObjective` is module scope, so the view resolves the key.
+    expect(p.noteKey).toBe('admin.experiments.objective.accuracyPending');
   });
 });

@@ -1,20 +1,22 @@
 /**
  * The open-items queue — what the user still owes, and the prompt that makes them notice.
  *
- * The behaviour that matters is not "a list renders". It is:
+ * The behavior that matters is not "a list renders". It is:
  *   - nothing is shown when nothing is owed (an empty affordance is noise that trains people to
  *     ignore the real one);
  *   - the count is stated without the user opening anything, because a queue nobody opens does not
  *     exist;
  *   - an item in ANOTHER conversation is listed and can be jumped to, which is the whole reason this
  *     is not derived from the loaded channel's messages;
- *   - an item in THIS conversation says so instead of offering to navigate somewhere you already are.
+ *   - an item in THIS conversation says so, and offers Answer instead of navigating where you already
+ *     are (ADR-035): a person with two items here has to be able to say which one a reply is for.
  */
 import { render, screen, fireEvent } from '@testing-library/react';
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { OpenWorkItems } from './OpenWorkItems';
 
 const selectConversation = vi.fn();
+const answerItem = vi.fn();
 let ctx: Record<string, unknown>;
 
 vi.mock('../providers/ConversationProvider.chime', () => ({
@@ -46,12 +48,15 @@ const item = (over: Record<string, unknown> = {}) => ({
 
 beforeEach(() => {
   selectConversation.mockReset();
+  answerItem.mockReset();
   ctx = {
     openWorkItems: [],
     conversations: [],
     selectConversation,
     activeConversation: null,
     battleWaitingBots: [],
+    answerItem,
+    answeringTaskId: null,
   };
 });
 
@@ -85,9 +90,13 @@ describe('OpenWorkItems', () => {
     // The point of the cross-conversation queue: the forgotten item is somewhere else, and one click
     // goes there.
     expect(selectConversation).toHaveBeenCalledWith('c9');
+    // And going there to finish it is choosing to answer it, so the composer is ready when it opens.
+    expect(answerItem).toHaveBeenCalledWith(expect.objectContaining({ taskId: 't1' }));
   });
 
-  it('does not offer to navigate to the conversation you are already in', () => {
+  it('offers Answer, not navigation, for an item in the conversation you are already in', () => {
+    // This required NO action here. With two items open in one conversation, a person then had no way
+    // to say which one their reply was for (ADR-035).
     ctx.openWorkItems = [item({ channelArn: 'arn:chan:here' })];
     ctx.conversations = [conversation('c1', 'This one', 'arn:chan:here')];
     ctx.activeConversation = conversation('c1', 'This one', 'arn:chan:here');
@@ -97,6 +106,18 @@ describe('OpenWorkItems', () => {
 
     expect(screen.getByText('workItems.here')).toBeTruthy();
     expect(screen.queryByText('workItems.finish')).toBeNull();
+    fireEvent.click(screen.getByText('workItems.answer'));
+    expect(answerItem).toHaveBeenCalledWith(expect.objectContaining({ taskId: 't1' }));
+    expect(selectConversation).not.toHaveBeenCalled();
+  });
+
+  it('shows each item by the reference a person types to answer it', () => {
+    ctx.openWorkItems = [item({ taskRef: 4 })];
+    render(<OpenWorkItems />);
+
+    fireEvent.click(screen.getByRole('button', { expanded: false }));
+
+    expect(screen.getByText('#4')).toBeTruthy();
   });
 
   it('can still TAKE YOU to an item whose conversation this client has not loaded', () => {
@@ -105,7 +126,7 @@ describe('OpenWorkItems', () => {
     // channel through the same deep-link path a navigation marker uses, and the conversation id is
     // the channel ARN's last segment.
     //
-    // The old behaviour was worst exactly where the queue matters most. Work you have forgotten is by
+    // The old behavior was worst exactly where the queue matters most. Work you have forgotten is by
     // definition in a conversation you are not looking at, which is the one least likely to be loaded -
     // so the item you most needed to reach was the one that offered no way to reach it.
     ctx.openWorkItems = [item({ channelArn: 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c-unloaded' })];

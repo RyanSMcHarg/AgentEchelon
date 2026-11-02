@@ -1,18 +1,18 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
-import { useAuth } from '@ae/shared';
 import { useConversations } from '../providers/ConversationProvider.chime';
 import { useAwsClient } from '../providers/AwsClientProvider';
 import { chimeService } from '../services/chimeService';
 import { removeConversationMember } from '../services/conversationManagementService';
 import type { ChannelMember } from '@ae/shared';
+import { personApiServes } from '@ae/shared';
 import {
   type ChannelBattleConfig,
   getBattleConfig,
   enableBattle,
   disableBattle,
 } from '../services/channelBattleService';
-import { listExperiments, type Experiment } from '@ae/shared';
+import type { Experiment } from '@ae/shared';
 import './ChannelMembersPanel.css';
 
 interface ChannelMembersPanelProps {
@@ -50,11 +50,10 @@ function initialsFrom(name: string): string {
 const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClose, onBattleConfigChange }) => {
   const { t } = useTranslation();
   const { activeConversation, channelMembers } = useConversations();
-  const { user } = useAuth();
   // Canonical caller ARN: AwsClientProvider exposes the reactive
-  // chimeService userArn (${APP_INSTANCE_ARN}/user/<sub>). useAuth().user
-  // never carries userArn — reading it there left isCurrentUserModerator
-  // permanently false, so the Battle Mode panel never rendered.
+  // chimeService userArn: the person's AppInstanceUser ARN, as the credential exchange returned it.
+  // Read from here rather than useAuth().user so every chat surface compares against the one value
+  // the messaging client acts as.
   const { userArn: currentUserArn } = useAwsClient();
   const [removingArn, setRemovingArn] = useState<string | null>(null);
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
@@ -79,7 +78,8 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
   // Loading is gated on the moderator check ALONE, because eligibility is a field on the config we are
   // about to fetch - pre-gating the fetch on a hardcoded premium check is what made `battleEligible`
   // unobservable to this panel. Rendering is gated on the fetched capability below.
-  const canLoadBattleConfig = isCurrentUserModerator;
+  // Battle exists only where the person API serves it (`VITE_PERSON_API_CAPABILITIES` names `battle`).
+  const canLoadBattleConfig = isCurrentUserModerator && personApiServes('battle');
 
   const [battleConfig, setBattleConfig] = useState<ChannelBattleConfig | null>(null);
   // The single battle-enabled experiment for this classification, when we can
@@ -105,20 +105,11 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
     let cancelled = false;
     (async () => {
       try {
-        // listExperiments hits /admin/experiments — the API authorizer rejects
-        // non-admin callers with 403 (browser logs each as a console error,
-        // which trips the E2E console-monitor gate). Restrict the call to
-        // admins; non-admin premium moderators still see the battle section
-        // and the current channel config, just no experiment picker (they
-        // couldn't enable a new battle from this UI either way until the
-        // backend grows a non-admin listing endpoint).
-        const canListExperiments = !!user?.isAdmin;
-        const [config, experiments] = await Promise.all([
-          getBattleConfig(activeConversation.conversationArn).catch(() => null),
-          canListExperiments
-            ? listExperiments().catch(() => [] as Experiment[])
-            : Promise.resolve([] as Experiment[]),
-        ]);
+        // The experiments API is an admin-console capability, signed with admin credentials the chat app
+        // never holds, so the panel reads only the conversation's battle config. The experiment itself is
+        // named and managed in the console.
+        const config = await getBattleConfig(activeConversation.conversationArn).catch(() => null);
+        const experiments: Experiment[] = [];
         if (cancelled) return;
         setBattleConfig(config);
         // Filter to battle-eligible (battleEnabled + active). The server
@@ -137,7 +128,7 @@ const ChannelMembersPanel: React.FC<ChannelMembersPanelProps> = ({ isOpen, onClo
     };
     // Depends on the LOAD gate, not the render gate: the render gate flips once this effect sets the
     // config, and depending on it would refetch for no reason.
-  }, [activeConversation, canLoadBattleConfig, user?.isAdmin]);
+  }, [activeConversation, canLoadBattleConfig]);
 
   const handleEnableBattle = async () => {
     if (!activeConversation) return;

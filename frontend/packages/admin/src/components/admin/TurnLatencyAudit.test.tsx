@@ -101,7 +101,7 @@ describe('TurnLatencyAudit', () => {
 
     await auditFor(ARN);
 
-    expect(await screen.findByText(/No ledger rows for this conversation/)).toBeTruthy();
+    expect(await screen.findByText(/No turns recorded for this conversation/)).toBeTruthy();
   });
 
   it('surfaces a payload error rather than showing it as no data', async () => {
@@ -118,5 +118,67 @@ describe('TurnLatencyAudit', () => {
     render(<TurnLatencyAudit dateRange={RANGE} />);
     expect(screen.getByRole('button', { name: 'Audit' })).toBeDisabled();
     expect(queryAnalytics).not.toHaveBeenCalled();
+  });
+
+  // ── A PROACTIVE TURN IS MEASURED DIFFERENTLY, NOT UNMEASURED ──
+  //
+  // The whole point of the general trigger-to-first-signal metric is that a turn nobody asked for
+  // still has a latency. If the table shows only TTFF, every one of them renders as a dash and the
+  // operator concludes the majority of assistant messages on a duel-heavy day are unmeasured - which
+  // is the state this was built to end.
+  describe('a turn nobody asked for', () => {
+    it('shows its Ack latency even though TTFF is blank', async () => {
+      vi.mocked(queryAnalytics).mockResolvedValue({
+        data: [row({
+          trigger_kind: 'orchestrator',
+          // No user message: TTFF is NULL by construction, and that is correct.
+          t0_user_at: null,
+          ttff_ms: null,
+          ack_ms: 880,
+          ack_source: 'derived',
+          anchor_source: null,
+        })],
+      } as never);
+
+      await auditFor(ARN);
+
+      expect(await screen.findByText('880ms')).toBeTruthy();
+      expect(screen.getByText('orchestrator')).toBeTruthy();
+    });
+
+    it('marks a DERIVED anchor, so a reconstruction is not read as an observation', async () => {
+      vi.mocked(queryAnalytics).mockResolvedValue({
+        data: [row({ trigger_kind: 'orchestrator', ttff_ms: null, ack_ms: 880, ack_source: 'derived' })],
+      } as never);
+
+      await auditFor(ARN);
+
+      // The mark rides the value rather than living in a legend: a column of bare numbers cannot say
+      // which of them were reconstructed.
+      const cell = (await screen.findByText('880ms')).closest('span');
+      expect(cell?.getAttribute('title')).toContain('Start estimated');
+    });
+
+    it('says an unanchored turn is unanchored rather than leaving it blank', async () => {
+      // A blank latency has two meanings - proactive, or nothing bound the turn - and they are
+      // different findings. Only one of them is a defect.
+      vi.mocked(queryAnalytics).mockResolvedValue({
+        data: [row({ anchor_source: null, ttff_ms: null, ack_ms: null })],
+      } as never);
+
+      await auditFor(ARN);
+
+      expect(await screen.findByText('none')).toBeTruthy();
+    });
+
+    it('names a live turn\'s anchor as the pairing that supplied it', async () => {
+      vi.mocked(queryAnalytics).mockResolvedValue({
+        data: [row({ anchor_source: 'exchange' })],
+      } as never);
+
+      await auditFor(ARN);
+
+      expect(await screen.findByText('exchange')).toBeTruthy();
+    });
   });
 });

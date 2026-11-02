@@ -1,9 +1,10 @@
 // Membership Audit (SPEC-CONVERSATION-SECURITY Layer 6) admin API client.
-// Endpoints hang off the analytics API (VITE_ANALYTICS_API_URL stage base), admin-authed.
-// A14 view-security: under IAM enforcement these routes are AWS_IAM-authorized, so
-// the calls are SigV4-signed with the operator's sign-on creds instead of a JWT.
-import { apiCall, ADMIN_IAM_ENFORCEMENT } from '@ae/shared';
-import { identityPoolCredentials, sigv4GetJson, sigv4PostJson } from './sigv4Fetch';
+// Endpoints are on the analytics surface of AdminApi (mounted at `/query`), admin-authed.
+// A14 view-security: these routes are AWS_IAM-authorized, so the calls are SigV4-signed
+// with the operator's sign-on creds instead of a JWT.
+import i18n from '@ae/shared/i18n';
+import { consoleCredentials, sigv4GetJson, sigv4PostJson } from './sigv4Fetch';
+import { adminApiConfigured, adminUrl } from './adminApi';
 
 export interface MembershipAuditFinding {
   pk: string;
@@ -11,62 +12,56 @@ export interface MembershipAuditFinding {
   kind: 'member' | 'assistant';
   channelArn: string;
   memberArn: string;
-  subjectTier: string;
-  channelTier: string;
+  /**
+   * THE PERSISTED KEY NAMES, which these did not match.
+   *
+   * `membership-audit.ts` writes a finding by spreading its own argument object, so the stored item
+   * carries `subjectClearance` and `channelClassification`. This interface declared `subjectTier` and
+   * `channelTier`, so both columns rendered EMPTY for every finding - a security audit whose two most
+   * load-bearing fields were blank, with nothing failing.
+   *
+   * Fixed on the READ side deliberately: the writer's names are already correct under ADR-046 (a
+   * clearance is what a holder has, a classification is what a channel is) and renaming them there
+   * would need a migration of every stored finding to gain nothing.
+   */
+  subjectClearance: string;
+  channelClassification: string;
   action: 'reported' | 'revoked';
+  /**
+   * `recorded-sign-in`: the member's issuer decides only from a token, and this finding was read from the
+   * credential exchange's record of their last sign-in rather than a live clearance. Always `reported`.
+   */
+  basis?: 'recorded-sign-in';
   ts: string;
   status: 'open' | 'revoked';
   reviewedBy?: string;
   reviewedAt?: string;
 }
 
-function getApiUrl(): string {
-  const url = import.meta.env.VITE_ANALYTICS_API_URL;
-  if (!url) throw new Error('VITE_ANALYTICS_API_URL not configured');
-  return url; // API Gateway stage base, ends with '/'
-}
-
-function auditUrl(path: string): string {
-  return `${getApiUrl().replace(/\/$/, '')}/${path}`;
+/** Throws the named configuration error when `AdminApi` is unconfigured. */
+function requireApi(): void {
+  if (!adminApiConfigured()) throw new Error(i18n.t('admin.membershipAuditService.vite_analytics_api_urlNotConfigured'));
 }
 
 export async function listFindings(): Promise<MembershipAuditFinding[]> {
-  if (ADMIN_IAM_ENFORCEMENT) {
-    const r = await sigv4GetJson<{ findings?: MembershipAuditFinding[] }>(auditUrl('membership-audit/findings'), {}, await identityPoolCredentials());
-    return r.findings || [];
-  }
-  const r = await apiCall<{ findings?: MembershipAuditFinding[] }>(getApiUrl(), 'membership-audit/findings');
+  requireApi();
+  const r = await sigv4GetJson<{ findings?: MembershipAuditFinding[] }>(adminUrl('analytics', '/membership-audit/findings'), {}, await consoleCredentials());
   return r.findings || [];
 }
 
 export async function getEnforce(): Promise<boolean> {
-  if (ADMIN_IAM_ENFORCEMENT) {
-    const r = await sigv4GetJson<{ enabled?: boolean }>(auditUrl('membership-audit/enforce'), {}, await identityPoolCredentials());
-    return !!r.enabled;
-  }
-  const r = await apiCall<{ enabled?: boolean }>(getApiUrl(), 'membership-audit/enforce');
+  requireApi();
+  const r = await sigv4GetJson<{ enabled?: boolean }>(adminUrl('analytics', '/membership-audit/enforce'), {}, await consoleCredentials());
   return !!r.enabled;
 }
 
 export async function setEnforce(enabled: boolean): Promise<boolean> {
-  if (ADMIN_IAM_ENFORCEMENT) {
-    const r = await sigv4PostJson<{ enabled?: boolean }>(auditUrl('membership-audit/enforce'), { enabled }, await identityPoolCredentials());
-    return !!r.enabled;
-  }
-  const r = await apiCall<{ enabled?: boolean }>(getApiUrl(), 'membership-audit/enforce', {
-    method: 'POST',
-    body: { enabled },
-  });
+  requireApi();
+  const r = await sigv4PostJson<{ enabled?: boolean }>(adminUrl('analytics', '/membership-audit/enforce'), { enabled }, await consoleCredentials());
   return !!r.enabled;
 }
 
 export async function revokeFinding(channelArn: string, memberArn: string, sk?: string): Promise<void> {
-  if (ADMIN_IAM_ENFORCEMENT) {
-    await sigv4PostJson(auditUrl('membership-audit/revoke'), { channelArn, memberArn, sk }, await identityPoolCredentials());
-    return;
-  }
-  await apiCall(getApiUrl(), 'membership-audit/revoke', {
-    method: 'POST',
-    body: { channelArn, memberArn, sk },
-  });
+  requireApi();
+  await sigv4PostJson(adminUrl('analytics', '/membership-audit/revoke'), { channelArn, memberArn, sk }, await consoleCredentials());
 }

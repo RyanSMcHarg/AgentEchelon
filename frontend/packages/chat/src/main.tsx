@@ -2,7 +2,17 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import '@ae/shared/styles/index.css'
 import '@ae/shared/i18n'
+import { capturePendingInvitation, capturePendingUpgrade, requestPendingBindSecret } from '@ae/shared'
 import App from './App.tsx'
+
+// A sign-in invitation's landing page sends its holder here with the token in the fragment. It leaves the
+// address bar before anything renders, and rides on the first sign-in (`pendingInvitation.ts`, M-10).
+capturePendingInvitation()
+// The widget sends a visitor here to keep the visit, with it in the fragment (`pendingUpgrade.ts`): path A's
+// hand-off nonce, whose secret the widget that opened this tab answers with, rides on the first sign-in;
+// path B's claim is redeemed once signed in.
+capturePendingUpgrade()
+void requestPendingBindSecret()
 
 /**
  * The commit this bundle was built from, published on `window` so the e2e suite can tell whether the

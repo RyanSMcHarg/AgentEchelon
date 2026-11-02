@@ -5,10 +5,12 @@
  * pair put in front of a human, both produce work and confidence that the data does not support -
  * and both look completely normal on screen.
  */
-import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
 import ClassifierGatePanel, { gateAuthorisesSplit, disagreementRate } from './ClassifierGatePanel';
 import { queryAnalytics } from '../../services/analyticsService';
+import { setClassificationsForTest } from '@ae/shared';
+import { SAMPLE_CLASSIFICATIONS } from '@ae/shared/config/sampleClassifications.ts';
 
 vi.mock('../../services/analyticsService', () => ({ queryAnalytics: vi.fn() }));
 const mockQuery = vi.mocked(queryAnalytics);
@@ -48,7 +50,12 @@ function prime(fixtures: Record<string, unknown>) {
   mockQuery.mockImplementation(async (qt: string) => (fixtures[qt] ?? { data: [] }) as never);
 }
 
-beforeEach(() => mockQuery.mockReset());
+// The panel offers the deployment's declared classifications; these cases run the sample deployment.
+beforeEach(() => {
+  mockQuery.mockReset();
+  setClassificationsForTest(SAMPLE_CLASSIFICATIONS);
+});
+afterEach(() => setClassificationsForTest(null));
 
 describe('gateAuthorisesSplit', () => {
   it('authorises only a FINISHED run with a clearing verdict', () => {
@@ -213,5 +220,26 @@ describe('ClassifierGatePanel', () => {
     await waitFor(() => expect(screen.getByText(/haiku/)).toBeTruthy());
     expect(screen.queryByText(/Could not load the replay/i)).toBeNull();
     expect(screen.queryByText(/never opened/i)).toBeNull();
+  });
+
+  it('starts a replay IN the classification the operator chose (tenet D12)', async () => {
+    // A replay reads one classification's traffic with that classification's models only, so the
+    // classification is part of the request and never left for the server to guess.
+    mockQuery.mockImplementation(async (qt: string) => {
+      if (qt === 'classifier_replay_start') return { run: { runId: 'run-2' }, started: true } as never;
+      if (qt === 'classifier_replay') return { run: run({ classification: 'premium' }), gate: gate() } as never;
+      if (qt === 'classifier_replays') return { data: [run({ classification: 'premium' })] } as never;
+      return { data: [] } as never;
+    });
+    render(<ClassifierGatePanel dateRange={range} />);
+    fireEvent.change(await screen.findByLabelText('Classification'), { target: { value: 'premium' } });
+    fireEvent.change(screen.getByLabelText('Incumbent model'), { target: { value: 'haiku' } });
+    fireEvent.change(screen.getByLabelText('Challenger model'), { target: { value: 'opus' } });
+    fireEvent.click(screen.getByRole('button', { name: /Run replay/i }));
+    await waitFor(() => expect(mockQuery.mock.calls.some(([qt]) => qt === 'classifier_replay_start')).toBe(true));
+    const start = mockQuery.mock.calls.find(([qt]) => qt === 'classifier_replay_start')!;
+    expect(start[2]).toEqual(expect.objectContaining({ classification: 'premium', incumbentModel: 'haiku', challengerModel: 'opus' }));
+    // And each run says which classification it is evidence about.
+    await waitFor(() => expect(screen.getAllByText(/premium/).length).toBeGreaterThan(0));
   });
 });

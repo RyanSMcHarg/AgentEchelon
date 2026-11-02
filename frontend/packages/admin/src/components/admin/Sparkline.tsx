@@ -1,3 +1,4 @@
+import i18n from '@ae/shared/i18n';
 import React from 'react';
 
 interface SparklineProps {
@@ -9,9 +10,9 @@ interface SparklineProps {
 }
 
 /**
- * Sparkline — single-pass SVG line + filled area for admin tab banners.
+ * Sparkline - single-pass SVG line + filled area for admin tab banners.
  *
- * Per docs/DESIGN-SYSTEM.md aesthetic: amber accent + gradient fill,
+ * Per docs/guides/developer/DESIGN-SYSTEM.md aesthetic: violet accent (`--accent-400`/`--accent-500`) + gradient fill,
  * no chart library. ~40 LOC of pure SVG; everything is CSS-token-driven
  * so it auto-adopts dark theme.
  */
@@ -31,7 +32,7 @@ export const Sparkline: React.FC<SparklineProps> = ({
       <div
         className="sparkline-empty"
         style={{ width, height }}
-        aria-label={label || 'Trend chart unavailable'}
+        aria-label={label || i18n.t('admin.sparkline.trendChartUnavailable')}
       />
     );
   }
@@ -77,7 +78,7 @@ export const Sparkline: React.FC<SparklineProps> = ({
         strokeLinejoin="round"
         strokeLinecap="round"
       />
-      {/* Endpoint marker — amber halo on the latest value. */}
+      {/* Endpoint marker - violet accent halo on the latest value. */}
       <circle
         cx={lastPoint[0]}
         cy={lastPoint[1]}

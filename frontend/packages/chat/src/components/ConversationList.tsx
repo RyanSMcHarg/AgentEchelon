@@ -2,7 +2,9 @@ import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useConversations } from '../providers/ConversationProvider.chime';
 import type { Conversation } from '@ae/shared';
+import { classificationBadgeStyle, classificationName } from '@ae/shared/config/classifications.ts';
 import './ConversationList.css';
+import { conversationTitleFor } from '../utils/conversationTitle';
 
 interface ConversationListProps {
   onNewConversation: () => void;
@@ -48,7 +50,6 @@ const ConversationList: React.FC<ConversationListProps> = ({ onNewConversation }
         key={conversation.id}
         className={[
           'conversation-item',
-          `conversation-item--${conversation.modelTier}`,
           isActive ? 'active' : '',
           unread ? 'unread' : '',
           conversation.archived ? 'conversation-item--archived' : '',
@@ -58,15 +59,17 @@ const ConversationList: React.FC<ConversationListProps> = ({ onNewConversation }
       >
         <div className="conversation-item-body">
           <div className="conversation-title">
-            {conversation.title}
+            {conversationTitleFor(conversation.title, t('conversation.newConversation'))}
           </div>
           <div className="conversation-meta">
-            <span
-              className="conversation-tier"
-              title={conversation.modelName}
-            >
-              {t(`tier.${conversation.modelTier}`)}
-            </span>
+            {conversation.modelTier && (
+              <span
+                className="conversation-tier"
+                style={classificationBadgeStyle(conversation.modelTier)}
+              >
+                {classificationName(conversation.modelTier)}
+              </span>
+            )}
             {conversation.archived && (
               <span className="conversation-archived-badge">{t('conversation.archivedBadge')}</span>
             )}

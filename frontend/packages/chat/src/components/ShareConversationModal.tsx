@@ -1,6 +1,8 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useConversations } from '../providers/ConversationProvider.chime';
+import { shareDisabledReason } from './shareAvailability';
+import InvitePanel from './InvitePanel';
 import './NewConversationModal.css';
 
 interface ShareConversationModalProps {
@@ -14,8 +16,7 @@ const ShareConversationModal: React.FC<ShareConversationModalProps> = ({ isOpen,
   const [isSharing, setIsSharing] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const [warning, setWarning] = useState<string | null>(null);
-  const { shareConversation } = useConversations();
+  const { shareConversation, activeConversation } = useConversations();
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -32,22 +33,20 @@ const ShareConversationModal: React.FC<ShareConversationModalProps> = ({ isOpen,
       setIsSharing(true);
       setError(null);
       setSuccess(null);
-      setWarning(null);
       const result = await shareConversation(trimmed);
       const successMsg = result.isNowMultiUser
         ? t('share.successMultiUser', { name: result.recipientName })
         : t('share.successPlain', { name: result.recipientName });
       setSuccess(successMsg);
-      if (!result.emailSent) {
-        setWarning(
-          result.emailError
-            ? t('share.emailWarningWithReason', { reason: result.emailError })
-            : t('share.emailWarningNoReason'),
-        );
-      }
       setEmail('');
     } catch (err) {
-      setError(err instanceof Error ? err.message : t('share.failureFallback'));
+      const refusal = err as { code?: string; membershipSource?: string };
+      if (refusal?.code === 'MEMBERSHIP_FROM_SOURCE') {
+        // The server's sentence is English; the reason shown is the client's own, localized (tenet D11).
+        setError(shareDisabledReason(refusal.membershipSource || 'list', t));
+      } else {
+        setError(err instanceof Error ? err.message : t('share.failureFallback'));
+      }
     } finally {
       setIsSharing(false);
     }
@@ -57,7 +56,6 @@ const ShareConversationModal: React.FC<ShareConversationModalProps> = ({ isOpen,
     setEmail('');
     setError(null);
     setSuccess(null);
-    setWarning(null);
     onClose();
   };
 
@@ -103,11 +101,6 @@ const ShareConversationModal: React.FC<ShareConversationModalProps> = ({ isOpen,
               {success}
             </div>
           )}
-          {warning && (
-            <div className="alert alert-warning">
-              {warning}
-            </div>
-          )}
           <div className="modal-actions">
             <button type="button" className="btn btn-secondary" onClick={handleClose}>
               {t('share.closeButton')}
@@ -121,6 +114,9 @@ const ShareConversationModal: React.FC<ShareConversationModalProps> = ({ isOpen,
             </button>
           </div>
         </form>
+        {/* Somebody with no account yet is invited instead (M-10). */}
+        {/* AN INVITATION LANDS IN THIS APP (`invite.html`, `invitationLandingFor`), so every deployment offers it; the invitations function decides what a conversation admits. */}
+        {activeConversation?.conversationArn && <InvitePanel channelArn={activeConversation.conversationArn} />}
       </div>
     </div>
   );

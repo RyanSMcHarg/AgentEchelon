@@ -77,6 +77,8 @@ const MESSAGING = { setChannelListener: () => {}, setGlobalListener: () => {} };
 vi.mock('@ae/shared', () => ({
   useAuth: () => AUTH,
   trackEvent: () => {},
+  // No person API in this harness: the open-work and turn-state reads stay unconfigured, as they do unset.
+  personApiServes: () => false,
 }));
 vi.mock('@ae/shared/i18n', () => ({ default: { t: (k: string) => k } }));
 vi.mock('./AwsClientProvider', () => ({ useAwsClient: () => AWS_CLIENT }));
@@ -135,7 +137,7 @@ describe('ConversationProvider — sticky target does not cross conversations', 
 
     // Creating a conversation swaps active WITHOUT going through selectConversation — the path the
     // sticky target used to survive.
-    await act(async () => { await ctxOf().createConversation('B', 'anthropic.claude-opus', 'Opus'); });
+    await act(async () => { await ctxOf().createConversation('B', 'anthropic.claude-opus', 'Opus', 'premium'); });
 
     await waitFor(() => expect(sticky()).toBe('NONE'));
   });

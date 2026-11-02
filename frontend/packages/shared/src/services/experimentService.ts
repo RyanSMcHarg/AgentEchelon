@@ -1,5 +1,3 @@
-import { apiCall } from '../api/apiCall';
-
 /** Generation-out image models (mirrors backend
  *  image-gen-models.ts ImageGenModelKey — kept a local union per the
  *  frontend's self-contained-types convention, like MODEL_OPTIONS).
@@ -17,15 +15,19 @@ export type ImageGenModelKey =
 
 export interface ExperimentVariant {
   variantId: string;
-  /** The model this variant runs. MUTUALLY EXCLUSIVE with `profileRef` (backend-validated). */
+  /** The model this variant runs. MUTUALLY EXCLUSIVE with `profileRef` (backend-validated). The control of an
+   *  intent, base_model or classification experiment may omit it: it is the live assistant's active version. */
   modelKey?: string;
   /** SPEC-PORTABLE-PROFILES §6: run an ENTIRE assistant profile version as the variant (its
    *  model/prompt/tools/… come from that version's definition). Omit `version` to track the active one.
    *  Mutually exclusive with `modelKey`. */
   profileRef?: { profileName: string; version?: number };
+  /** The treatment's candidate version (DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP §3.5), in the alt's history
+   *  `alt-{role}-{classification}`. Derived by the server when the experiment is armed; never sent by the console. */
+  altPin?: { profileName: string; version: number; configId?: string };
+  /** The control's version: the live assistant's active version, pinned by number when the experiment is armed. */
+  controlPin?: { profileName: string; version: number; configId?: string };
   weight: number;
-  /** v0.2.0 (/battle): per-variant display name shown to users + in rival prompts. Max 16 chars. */
-  displayName?: string;
   /** v0.2.0 (/battle): variant-specific addendum layered onto the tier's base system prompt. Sanitized server-side. Max 500 chars. */
   systemPromptAddendum?: string;
   /** /battle generation-out: when set, this variant generates
@@ -115,6 +117,8 @@ export interface Experiment {
   /** Defaults to 'intent' when absent. */
   experimentType?: ExperimentType;
   intent: string;
+  /** The one model of the intent an `intent` experiment varies (ADR-064 decision 6): text (default), image, or one step. */
+  target?: { kind?: 'text' | 'image'; step?: string };
   tiers: string[];
   variants: ExperimentVariant[];
   startDate: string;
@@ -128,12 +132,21 @@ export interface Experiment {
   decision?: ExperimentDecision;
   /** NEW (L7): append-only lifecycle audit (who paused/edited/completed, and when). */
   transitions?: ExperimentTransition[];
-  /** v0.2.0 (/battle): when true, this experiment powers /battle. Requires exactly 2 variants + displayName on each + altBotSlotId. */
+  /** v0.2.0 (/battle): when true, this experiment powers /battle. Requires exactly 2 variants + a challenger. Each duel side is named from its profile. */
   battleEnabled?: boolean;
-  altBotSlotId?: string;
-  altBotSlotArn?: string;
+  /** The challenger's assistant id, `alt-{role}-{classification}`, from `listChallengers`. */
+  challengerAssistant?: string;
   boundBy?: string;
   boundAt?: string;
+  /** Set by the server when the experiment is armed with two pinned versions (§3.5); only such an experiment can be promoted. */
+  servesVersions?: boolean;
+  /**
+   * Read-only, on a battle-enabled experiment: the name the duel gives each side, from its pinned version
+   * (the backend's `battleSidesOf`). A side whose name does not resolve is absent. Never sent back.
+   */
+  sideNames?: { control?: string; treatment?: string };
+  /** Set by the Promote action: the version a promotion activated in the live assistant (§3.6). */
+  promotion?: { profileName: string; version: number; configId: string; at: string; by: string };
 }
 
 /** Advisory recommendation carrying the COMPUTED statistics, not an LLM's self-assessed
@@ -163,7 +176,10 @@ export interface ExperimentRecommendation {
   /** The battle human-preference axis, when battle picks exist — a distinct signal, never
    *  merged into `primary` (§4.3). */
   human?: {
+    /** Decisive picks. */
     picks: number;
+    /** Duels those picks judged: the unit the interval is computed in. */
+    duels?: number;
     winRate: number;
     ci: [number, number];
     significant: boolean;
@@ -174,37 +190,34 @@ export interface ExperimentRecommendation {
     recommended: string;
     chosen?: ExperimentDecision['outcome'];
   };
-  /** Exchanges per variant this deployment requires before a verdict is decision-grade. Configurable
+  /** Conversations per variant this deployment requires before a verdict is decision-grade. Configurable
    *  (minSamplePerVariant), so a caller must read it rather than hardcode a threshold. */
   minSamplePerVariant?: number;
+  /** The unit of analysis (§4.2): every test, guardrail and the floor count conversations. */
+  unit?: 'conversation';
 }
 
-function getApiUrl(): string {
-  // Dedicated endpoint (CDK output AgentEchelonExperiments.ExperimentsApiUrl).
-  // It lives on the experiments API, NOT the admin-conversations API:
-  // the experiments table is owned by the AgentEchelonExperiments stack, which is
-  // downstream of the cognito-auth stack that hosts admin-conversations,
-  // so the API must be co-located with its table (no stack cycle).
-  const url = import.meta.env.VITE_EXPERIMENTS_API_URL;
-  if (!url) throw new Error('VITE_EXPERIMENTS_API_URL not configured');
-  return url; // already .../admin/experiments
+/**
+ * Whether a duel may run in a classification, as TWO facts rather than one.
+ *
+ * `capable` is what the deployment wired and no operator can change it from here; `enabled` is the
+ * setting they can. Both are returned so the console can show a classification its deployment never
+ * wired as UNAVAILABLE rather than as merely off - the difference between "you may turn this on" and
+ * "this deployment does not build it", which one boolean cannot say.
+ */
+export interface BattleSetting {
+  classification: string;
+  capable: boolean;
+  enabled: boolean;
 }
 
-export async function listExperiments(): Promise<Experiment[]> {
-  const result = await apiCall<{ experiments?: Experiment[] }>(getApiUrl());
-  return result.experiments || [];
-}
-
-export async function createExperiment(experiment: Omit<Experiment, 'createdAt'>): Promise<Experiment> {
-  return apiCall<Experiment>(getApiUrl(), '', {
-    method: 'POST',
-    body: experiment,
-  });
-}
-
-export async function updateExperimentStatus(experimentId: string, status: Experiment['status']): Promise<void> {
-  await apiCall(getApiUrl(), `/${experimentId}/status`, {
-    method: 'POST',
-    body: { status },
-  });
+/**
+ * A challenger a battle can name: one classification's alt, by assistant id, as its assignment record
+ * provisions it (`GET /admin/experiments/challengers`). `inUseBy` is the experiment holding it now.
+ */
+export interface BattleChallenger {
+  assistant: string;
+  classification: string;
+  role: string;
+  inUseBy: string | null;
 }

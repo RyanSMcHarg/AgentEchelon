@@ -2,7 +2,7 @@ import { describe, it, expect } from 'vitest';
 import { isResolvableBlocker, presentableBlockers } from './ExperimentsTab';
 import type { Experiment } from '@ae/shared';
 
-// The type-exclusion 409 (§3.2.1) names the experiments the SERVER believes hold the classification,
+// The classification-conflict 409 (§3.2.1) names the experiments the SERVER believes hold the classification,
 // read from an eventually-consistent scan. After the operator ends a blocker, the auto-retried create
 // can be refused again and the body can still name the row that was just freed. Presenting that row
 // re-opens a resolution the operator already performed, and its End/Pause buttons act on a terminal

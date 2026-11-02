@@ -1,6 +1,7 @@
 import { useMemo, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useConversations } from '../providers/ConversationProvider.chime';
+import { isUnnamedConversation } from '../utils/conversationTitle';
 
 /**
  * The work a person still owes, across every assistant and every conversation.
@@ -37,6 +38,7 @@ function readableTaskType(taskType: string | undefined): string {
 export function OpenWorkItems() {
   const {
     openWorkItems, conversations, selectConversation, activeConversation, battleWaitingBots,
+    answerItem, answeringTaskId,
   } = useConversations();
   const { t } = useTranslation();
   const [expanded, setExpanded] = useState(false);
@@ -100,14 +102,33 @@ export function OpenWorkItems() {
                 aria-disabled={blockedByBattle || undefined}
               >
                 <div className="open-work-items-item-text">
-                  <span className="open-work-items-item-title">{item.title || readableTaskType(item.taskType)}</span>
+                  <span className="open-work-items-item-title">
+                    {/* The reference a person types to answer it, on any channel (ADR-035). */}
+                    {item.taskRef ? <span className="open-work-items-item-ref">#{item.taskRef} </span> : null}
+                    {item.title || readableTaskType(item.taskType)}
+                  </span>
                   <span className="open-work-items-item-where">
                     {blockedByBattle
                       ? t('workItems.blockedByBattle')
                       : isHere
                         ? t('workItems.here')
-                        : conversation?.title || t('workItems.otherConversation')}
+                        : conversation?.title && !isUnnamedConversation(conversation.title) ? conversation.title : t('workItems.otherConversation')}
                   </span>
+                  {/*
+                    * WHAT FINISHING IT ACTUALLY INVOLVES, when the step declares it.
+                    *
+                    * The row said which work was outstanding and never what was being asked for, so a
+                    * person had to open the conversation and read back to find out - for every item,
+                    * including the ones they opened only to discover they could not answer yet. The
+                    * machine already declares this per state and the server sends it only for a state
+                    * that awaits somebody, so anything rendered here is genuinely theirs to answer.
+                    */}
+                  {item.needs?.length ? (
+                    <span className="open-work-items-item-needs">
+                      <span className="open-work-items-item-needs-label">{t('workItems.needsLabel')}</span>
+                      {item.needs.join(', ')}
+                    </span>
+                  ) : null}
                 </div>
                 {/*
                   * Offered whenever there is somewhere to go, which is whenever the item names a
@@ -121,11 +142,33 @@ export function OpenWorkItems() {
                   <button
                     type="button"
                     className="open-work-items-item-go"
-                    onClick={() => selectConversation(conversation?.id ?? targetId)}
+                    onClick={() => {
+                      // Going there to finish it IS choosing to answer it, so the composer is ready
+                      // with the reference when the conversation opens.
+                      answerItem(item);
+                      selectConversation(conversation?.id ?? targetId);
+                    }}
                     disabled={blockedByBattle}
                     title={blockedByBattle ? t('workItems.blockedByBattle') : undefined}
                   >
                     {t('workItems.finish')}
+                  </button>
+                )}
+                {/*
+                  * ANSWER, FOR AN ITEM IN THIS CONVERSATION (ADR-035). The list said "in this
+                  * conversation" and offered nothing, so a person with two items here had no way to say
+                  * which one their reply was for. This puts the item's reference at the start of the
+                  * composer, which is exactly what typing it does on any other channel.
+                  */}
+                {isHere && (
+                  <button
+                    type="button"
+                    className="open-work-items-item-go"
+                    onClick={() => answerItem(item)}
+                    disabled={blockedByBattle}
+                    aria-pressed={answeringTaskId === item.taskId}
+                  >
+                    {t('workItems.answer')}
                   </button>
                 )}
               </li>

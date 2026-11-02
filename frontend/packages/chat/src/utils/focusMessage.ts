@@ -7,11 +7,11 @@
  * `messages` changes, so an effect there fires at exactly the right time.
  *
  * The request is BOUNDED and SCOPED, because a pending request suppresses the auto-scroll-to-newest
- * behaviour while it waits:
+ * behavior while it waits:
  *
  * - Scoped to the conversation the link named. A request only ever matches that conversation, so switching
  *   conversations can never inherit someone else's stale target.
- * - Bounded by an attempt ceiling and a deadline. A target can be genuinely unreachable: deleted, redacted,
+ * - Bounded by an attempt limit and a deadline. A target can be genuinely unreachable: deleted, redacted,
  *   or beyond the loaded history page. Without a limit such a request stays pending forever and the reader
  *   never sees a new message scroll into view again. Once the budget runs out the request is dropped and
  *   auto-scroll resumes. Nothing is shown when a target cannot be found, matching the rest of the deep-link

@@ -1,6 +1,8 @@
 import React, { useMemo } from 'react';
+import { useTranslation } from 'react-i18next';
 import { computeAlerts, type Alert, type AlertSources } from './alerts';
 import { STATUS_VAR } from './metricTargets';
+import { type PerformanceFilters } from './PerformanceFilters';
 import { InfoTooltip } from './AdminHelp';
 import type { AnalyticsResult } from '@ae/shared';
 
@@ -17,6 +19,13 @@ interface AlertsTabProps {
   flagged: AnalyticsResult | null;
   errorRate: AnalyticsResult | null;
   isLoading: boolean;
+  /**
+   * The Performance surface's filters, so a latency alert describes the population the operator has
+   * narrowed to and is judged against that tier's band - the same rows and the same band the Latency
+   * tab shows them. Without it, an operator could read a green card on one tab and an alert about the
+   * same window on the other.
+   */
+  filters: PerformanceFilters;
   /** Navigate to a tab (the alert's drill target). */
   onNavigate: (tab: string) => void;
 }
@@ -28,6 +37,8 @@ const CATEGORY_LABEL: Record<Alert['category'], string> = {
 };
 
 const AlertRow: React.FC<{ alert: Alert; onNavigate: (tab: string) => void }> = ({ alert, onNavigate }) => {
+  // No translator here: this row renders an Alert whose title and detail were already resolved by
+  // `computeAlerts`, and its only other strings were a CSS border value that never belonged in a locale file.
   const color = STATUS_VAR[alert.severity === 'error' ? 'bad' : 'warn'];
   return (
     <button
@@ -66,8 +77,9 @@ const AlertRow: React.FC<{ alert: Alert; onNavigate: (tab: string) => void }> = 
 };
 
 const AlertsTab: React.FC<AlertsTabProps> = ({
-  intentEffectiveness, latency, modelEffectiveness, flagged, errorRate, isLoading, onNavigate,
+  intentEffectiveness, latency, modelEffectiveness, flagged, errorRate, filters, isLoading, onNavigate,
 }) => {
+  const { t } = useTranslation();
   const alerts = useMemo(() => {
     const sources: AlertSources = {
       intentEffectiveness: (intentEffectiveness?.data ?? []) as Array<Record<string, unknown>>,
@@ -75,14 +87,15 @@ const AlertsTab: React.FC<AlertsTabProps> = ({
       modelEffectiveness: (modelEffectiveness?.data ?? []) as Array<Record<string, unknown>>,
       flagged: (flagged?.data ?? []) as Array<Record<string, unknown>>,
       errorRate: (errorRate?.data ?? []) as Array<Record<string, unknown>>,
+      filters,
     };
     return computeAlerts(sources);
-  }, [intentEffectiveness, latency, modelEffectiveness, flagged, errorRate]);
+  }, [intentEffectiveness, latency, modelEffectiveness, flagged, errorRate, filters]);
 
   const errors = alerts.filter((a) => a.severity === 'error');
   const warnings = alerts.filter((a) => a.severity === 'warn');
 
-  if (isLoading) return <div className="admin-tab-loading">Scanning for alerts…</div>;
+  if (isLoading) return <div className="admin-tab-loading">{t('admin.alerts.scanningForAlerts')}</div>;
 
   return (
     <div className="admin-tab">
@@ -90,16 +103,16 @@ const AlertsTab: React.FC<AlertsTabProps> = ({
         <h3>
           Alerts{' '}
           <InfoTooltip
-            label="About Alerts"
-            content="Everything currently in bad or warn status against its target, plus literal error rows — runtime errors, missed latency SLOs, and intent/model quality regressions — in one place. Click an alert to open its drill. Assembled from data already loaded; not a separate query."
+            label={t('admin.alerts.aboutAlerts')}
+            content={t('admin.alerts.everythingCurrentlyInBadOr')}
           />
         </h3>
       </div>
 
       <p className="admin-tab-description">
         {alerts.length === 0
-          ? 'No active alerts. Every measured metric is within target for this window.'
-          : `${errors.length} ${errors.length === 1 ? 'error' : 'errors'} and ${warnings.length} ${warnings.length === 1 ? 'warning' : 'warnings'}. An alert is any metric in bad (error) or warn status against its target, plus literal error-response replies. Click one to open its drill.`}
+          ? t('admin.alerts.noActiveAlertsEveryMeasured')
+          : t('admin.alerts.andAnAlertIsAny', { errors: errors.length, errors2: errors.length === 1 ? 'error' : 'errors', warnings: warnings.length, warnings2: warnings.length === 1 ? 'warning' : 'warnings' })}
       </p>
 
       {alerts.length === 0 ? (

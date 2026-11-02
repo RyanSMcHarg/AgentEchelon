@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 /**
  * assert-no-admin-in-chat.mjs — the security-relevant invariant of the admin/chat
- * split (SPEC-SEPARATE-ADMIN-APP.md): the CHAT entry (packages/chat/src/main.tsx)
+ * split (DESIGN-SEPARATE-ADMIN-APP.md): the CHAT entry (packages/chat/src/main.tsx)
  * must never resolve a module physically under packages/admin/. If it did, the
  * public chat bundle would ship operator code again.
  *
@@ -131,7 +131,7 @@ async function main() {
 
   if (violations.length) {
     console.error('\n❌ Chat bundle taint: the chat entry imports admin-only code.');
-    console.error('   The public chat SPA must not carry operator code (SPEC-SEPARATE-ADMIN-APP.md).');
+    console.error('   The public chat SPA must not carry operator code (DESIGN-SEPARATE-ADMIN-APP.md).');
     console.error('   Offending import chains:');
     for (const v of violations) console.error(`     ${v}`);
     console.error('');

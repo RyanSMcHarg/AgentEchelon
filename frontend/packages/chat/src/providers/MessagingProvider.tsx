@@ -10,12 +10,18 @@ import { useAwsClient } from './AwsClientProvider';
 import { useAuth } from '@ae/shared';
 import { chimeService } from '../services/chimeService';
 import { markResponseReceived, markPlaceholderShown } from '../services/messageLatencyTracker';
+import { liftTurnStateFields } from '../services/turnStateFields';
+import { proposalFromMetadata } from '../services/proposalService';
+import { taskCardFromMetadata } from '../services/taskCardService';
 import { trackEvent } from '@ae/shared';
 import {
   parseMessageContent,
+  decodeMessageText,
   parseActiveTaskFromMetadata,
   parseMessageFeedbackFromMetadata,
   isEmptyLexEnvelope,
+  unwrapLexEnvelope,
+  declaresFinalAnswer,
 } from '@ae/shared';
 import type { Message } from '@ae/shared';
 
@@ -61,6 +67,14 @@ export interface GlobalMessageListener {
 
 interface MessagingContextType {
   isConnected: boolean;
+  /**
+   * Incremented each time a messaging session STARTS - the first connect and every reconnect.
+   *
+   * The same contract as communication-hub's `MessagingProvider.sessionVersion`: anything that holds
+   * data the session would have pushed lists this as a dependency and re-reads when it changes,
+   * because a message posted while no session was running is never pushed again.
+   */
+  sessionVersion: number;
   /** Register the single channel-event handler. Pass null to clear it. */
   setChannelListener: (callbacks: ChannelCallbacks | null) => void;
   setGlobalListener: (listener: GlobalMessageListener | null) => void;
@@ -77,15 +91,72 @@ const STALE_SESSION_THRESHOLD_MS = 5 * 60 * 1000;
 // response and strips the marker. Used to skip latency/analytics tracking on
 // the placeholder so the metric measures time-to-actual-response, not
 // time-to-acknowledgment.
+// AND A TURN THAT DECLARED IT IS FINISHED IS NOT ONE, however it is marked (2026-09-11). A greeting
+// answered by the handler now carries a correlation marker so its pairing can be declared rather
+// than guessed at downstream, and it posts once with no update to follow. Read as a placeholder, the
+// clock is never stopped and the turn reports no answer at all - which is the same one-directional
+// bias `isQueueNotice` below records, on the turns that are fastest rather than slowest.
 function isAsyncPlaceholder(rawContent: string | undefined): boolean {
   if (!rawContent) return false;
+  if (declaresFinalAnswer(rawContent)) return false;
   return rawContent.includes('<!--corr:') || rawContent.includes('%3C!--corr%3A');
+}
+
+/**
+ * The queue notice - "still working on your earlier message" - which is NOT an answer.
+ *
+ * It is bot-authored, it is a CREATE, and it carries no `corr` marker, because it is not a
+ * placeholder for a turn: it is a statement about a queue. So it satisfied every condition the
+ * response tracking used, and stopped the clock. `markResponseReceived` then deleted the pending
+ * send, so the REAL answer a minute later reported nothing at all, and `markPlaceholderShown`
+ * returned early so the client's time-to-first-feedback for that turn was lost too.
+ *
+ * The effect was not noise, it was bias in one direction: latency looked fastest on exactly the
+ * queued turns where the person waited longest.
+ *
+ * Read from Metadata rather than from the words, which are the assistant's own and translated.
+ */
+function isQueueNotice(rawMetadata: string | undefined): boolean {
+  if (!rawMetadata) return false;
+  try {
+    const decoded = (() => {
+      try { return decodeURIComponent(rawMetadata); } catch { return rawMetadata; }
+    })();
+    return (JSON.parse(decoded) as { respPhase?: unknown })?.respPhase === 'notice';
+  } catch {
+    // Unparseable metadata is not a notice. Guessing the other way would silently stop counting
+    // real answers, which is the more expensive mistake.
+    return false;
+  }
+}
+
+/**
+ * The turn id the placeholder declares, or undefined (G5).
+ *
+ * THE ONE IDENTIFIER THE BROWSER AND THE SERVER BOTH HOLD. The client never sees a Chime MessageId
+ * for its own send and the server never sees the click, so an aggregate comparison was the most the
+ * two sides could support. The correlation marker is on the placeholder the client just rendered and
+ * on the message row the server wrote, which makes it the join key for ONE turn.
+ *
+ * Both encodings are tried for the same reason `isAsyncPlaceholder` tries both: content arrives
+ * percent-encoded on some paths, and reading only the decoded form would silently stop correlating
+ * on exactly those.
+ */
+function correlationIdOf(rawContent: string | undefined): string | undefined {
+  if (!rawContent) return undefined;
+  const decoded = (() => {
+    try { return decodeURIComponent(rawContent); } catch { return rawContent; }
+  })();
+  // Same bounded character class the backend readers use: an id that does not match is not an id,
+  // and forwarding whatever followed the token would put unbounded message text into telemetry.
+  return /<!--corr:([A-Za-z0-9._-]{1,64})-->/.exec(decoded)?.[1];
 }
 
 export function MessagingProvider({ children }: { children: ReactNode }) {
   const { isInitialized, userArn } = useAwsClient();
   const { refreshCredentials } = useAuth();
   const [isConnected, setIsConnected] = useState(false);
+  const [sessionVersion, setSessionVersion] = useState(0);
   const sessionRef = useRef<MessagingSession | null>(null);
   const channelListenerRef = useRef<ChannelCallbacks | null>(null);
   const globalListenerRef = useRef<GlobalMessageListener | null>(null);
@@ -121,15 +192,21 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     // Empty envelope: the router suppressing a retried fulfillment (ADR-022). Same rule as the REST
     // history load, shared so a message cannot be dropped on one path and rendered on the other.
     if (isEmptyLexEnvelope(content, contentType)) return null;
-    if (contentType === 'application/amz-chime-lex-msgs') {
-      try {
-        const parsed = JSON.parse(content);
-        const first = parsed?.Messages?.[0]?.Content;
-        if (typeof first === 'string') content = first;
-      } catch {
-        // If we can't parse it, render the raw content as a fallback
-      }
-    }
+    /**
+     * ONE UNWRAP RULE, SHARED - not a second copy of it here.
+     *
+     * This path carried its own inline unwrap while the REST history load called
+     * `unwrapLexEnvelope`. The sibling rule above it was deliberately shared for exactly this reason,
+     * and its docstring says why: "They previously each carried their own copy, which is two places for
+     * the rule to drift and only one of them visible in any given bug report - a message dropped live but
+     * present on reload, or the reverse." That argument applies to the unwrap identically, and the two
+     * copies had already begun to differ (the inline one never checked that `Messages` was an array).
+     *
+     * Note what this does NOT fix: both paths gate on the Lex ContentType, so an envelope that arrives
+     * without it still renders verbatim. That is the remaining half of the raw-JSON report, and it belongs
+     * to whatever posts the message, not here.
+     */
+    content = unwrapLexEnvelope(content, contentType);
 
     let metadata: Record<string, unknown> = {};
     try {
@@ -141,11 +218,15 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     }
 
     const senderArn = (payload.Sender as Record<string, string>)?.Arn || '';
-    const senderName = (payload.Sender as Record<string, string>)?.Name || 'Unknown';
+    // THE NAME IS CARRIED, NOT INVENTED. This defaulted to 'Unknown' and then, for a bot, to
+    // 'Assistant' below - two English words produced by the data layer, where nothing can translate
+    // them and nothing can tell a substitute apart from an assistant genuinely called that. An absent
+    // name is now absent, and the VIEW supplies a translated label.
+    const senderName = (payload.Sender as Record<string, string>)?.Name || '';
     const isBot = !!metadata.botResponse || senderArn.includes('/bot/');
 
     // Apply the same parsing rules as history loading (chimeService.listMessages)
-    const decoded = decodeURIComponent(content);
+    const decoded = decodeMessageText(content);
     const { content: cleanContent, activeTask: contentTask, navigateChannel, battle, battleWaiting } = parseMessageContent(decoded);
     const metadataTask = parseActiveTaskFromMetadata(metadata);
     const currentUserArn = chimeService.getUserArn();
@@ -163,7 +244,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
     return {
       id: (payload.MessageId as string) || `msg-${Date.now()}`,
       content: cleanContent,
-      sender: { arn: senderArn, name: isBot ? senderName || 'Assistant' : senderName },
+      sender: { arn: senderArn, name: senderName },
       timestamp: payload.CreatedTimestamp ? new Date(payload.CreatedTimestamp as string) : new Date(),
       isBot,
       status: 'sent',
@@ -177,12 +258,17 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
       assignmentMode: typeof metadata.assignmentMode === 'string' ? metadata.assignmentMode : undefined,
       feedback: parseMessageFeedbackFromMetadata(metadata),
       targetedToUser: targetedToUser || undefined,
-      // The step of the answer this message is, as the backend declared it. Carried so a reader does
-      // not have to guess from the text whether the turn has settled - see `Message.responsePhase`.
-      responsePhase: typeof metadata.respPhase === 'string' ? metadata.respPhase : undefined,
+      // A proposal addressed to this person (ADR-061 decision 8), lifted as the history load lifts it.
+      proposal: proposalFromMetadata(metadata),
+      // A task a workflow assigned this person (ADR-063), lifted as the history load lifts it.
+      taskCard: taskCardFromMetadata(metadata),
+      // The answer's phase and the queue's depth and stage, lifted by the SAME function the history
+      // load uses (`liftTurnStateFields`), so a reload shows exactly what the live event showed.
+      ...liftTurnStateFields(metadata),
       // Multi-part response grouping
       responseGroup: typeof metadata.responseGroup === 'string' ? metadata.responseGroup : undefined,
       continuation: metadata.continuation === true,
+      parentMessageId: typeof metadata.parentMessageId === 'string' ? metadata.parentMessageId : undefined,
       part: typeof metadata.part === 'number' ? metadata.part : undefined,
       totalParts: typeof metadata.totalParts === 'number' ? metadata.totalParts : undefined,
       // Drift-confirm redirect signal
@@ -223,6 +309,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
           lastMessageTimeRef.current = Date.now();
           dropCountRef.current = 0;
           setIsConnected(true);
+          setSessionVersion((v) => v + 1);
           trackEvent(isReconnectRef.current ? 'websocket_reconnected' : 'websocket_connected');
           isReconnectRef.current = false;
         },
@@ -337,15 +424,29 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
             case 'CREATE_CHANNEL_MESSAGE': {
               const msg = parseMessagePayload(payload);
               if (msg) {
-                if (msg.isBot && !isAsyncPlaceholder(payload.Content as string | undefined)) {
+                // A NOTICE IS NOT A TURN, ON EITHER BRANCH.
+                //
+                // Excluding it from `trackBotResponse` alone dropped it into the placeholder arm
+                // below, where it called `markPlaceholderShown` with NO correlation id (a notice
+                // carries no `<!--corr:-->`) and latched `ttffReported` for the channel. The real
+                // placeholder, the one that does carry it, then returned early - so the per-turn
+                // client/server join contained no queued turns at all, silently. The guard that
+                // was meant to remove a bias removed the measurement instead.
+                const queueNotice = isQueueNotice(payload.Metadata as string | undefined);
+                if (msg.isBot
+                  && !isAsyncPlaceholder(payload.Content as string | undefined)
+                  && !queueNotice) {
                   trackBotResponse(true);
-                } else if (msg.isBot) {
+                } else if (msg.isBot && !queueNotice) {
                   // The placeholder, which is where the person's wait VISIBLY ends even though the
                   // answer has not arrived (G5). Measured here and not folded into the round trip:
                   // this is time-to-acknowledgment, the primary perceived-latency SLO under
                   // placeholder-then-update delivery, and the server's own TTFF has no way to see the
                   // WebSocket hop and the render that this includes.
-                  markPlaceholderShown(channelArn);
+                  // The correlation id rides the timing, so this browser-measured wait can be
+                  // joined to the server numbers for the SAME turn instead of only compared as an
+                  // average against an average.
+                  markPlaceholderShown(channelArn, correlationIdOf(payload.Content as string | undefined));
                 }
                 callbacks.onMessageCreate?.(channelArn, msg);
               }
@@ -358,7 +459,17 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
                 // arrives. markResponseReceived is idempotent (the pending
                 // send is deleted on first call), so this is also safe in
                 // the direct-CREATE path where the metric was already taken.
-                trackBotResponse(msg.isBot);
+                //
+                // AND THE NOTICE IS EXCLUDED HERE TOO. The guard went on the CREATE branch only,
+                // and `advanceQueueNotice` / `settleQueueNotice` rewrite that same message through
+                // UpdateChannelMessage - so queueing a second message recorded a ~1s round trip AND
+                // deleted the pending send, leaving the real answer two minutes later to record
+                // nothing. Exactly the bias the CREATE-side guard was written to remove, arriving
+                // through the UPDATE door. Every notice write carries respPhase: notice, so the
+                // same test works on both.
+                if (!isQueueNotice(payload.Metadata as string | undefined)) {
+                  trackBotResponse(msg.isBot);
+                }
                 callbacks.onMessageUpdate?.(channelArn, msg);
               }
               break;
@@ -510,7 +621,7 @@ export function MessagingProvider({ children }: { children: ReactNode }) {
   }, []);
 
   return (
-    <MessagingContext.Provider value={{ isConnected, setChannelListener, setGlobalListener }}>
+    <MessagingContext.Provider value={{ isConnected, sessionVersion, setChannelListener, setGlobalListener }}>
       {children}
     </MessagingContext.Provider>
   );

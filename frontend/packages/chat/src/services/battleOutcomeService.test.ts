@@ -2,7 +2,8 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { getBattleOutcome, recordBattleOutcome } from './battleOutcomeService';
 
 const API_URL = 'https://api.example.com/channels/battle/outcome';
-vi.stubEnv('VITE_BATTLE_OUTCOME_API_URL', API_URL);
+vi.stubEnv('VITE_PERSON_API_URL', 'https://api.example.com/');
+vi.stubEnv('VITE_PERSON_API_CAPABILITIES', 'battle,core');
 
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
@@ -24,7 +25,7 @@ const CHANNEL_ARN = 'arn:aws:chime:us-east-1:123456789012:app-instance/abc/chann
 const OUTCOME = {
   battleId: BATTLE_ID,
   winner: 'B' as const,
-  chosenByUserSub: 'sub-1',
+  chosenByPersonId: 'sub-1',
   chosenAt: '2026-05-15T00:00:00.000Z',
 };
 
@@ -60,8 +61,8 @@ describe('recordBattleOutcome', () => {
     expect(options.method).toBe('POST');
     // channelArn is REQUIRED by the API (M2 membership check).
     expect(JSON.parse(options.body)).toEqual({ battleId: BATTLE_ID, winner: 'B', channelArn: CHANNEL_ARN });
-    // chosenByUserSub is NEVER sent from the client (server-derived).
-    expect(JSON.parse(options.body)).not.toHaveProperty('chosenByUserSub');
+    // chosenByPersonId is NEVER sent from the client (server-derived).
+    expect(JSON.parse(options.body)).not.toHaveProperty('chosenByPersonId');
   });
 
   it('supports the tie outcome', async () => {

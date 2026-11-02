@@ -1,4 +1,6 @@
-import React, { useEffect, useState } from 'react';
+import i18n from '@ae/shared/i18n';
+import React, { useEffect, useRef, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import './DataTable.css';
 
 // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -13,6 +15,19 @@ export interface Column<T extends AnyRow = AnyRow> {
   mobileLabel?: string;
   render?: (value: unknown, row: T) => React.ReactNode;
   sortable?: boolean;
+  /**
+   * A PRIMARY grouping applied before the value, and NOT inverted by sort direction.
+   *
+   * Sorting reads the raw row value, which is right for a number a reader can see and wrong for one the
+   * cell is deliberately withholding. A column that renders "too few to report" for an unsupportable
+   * figure still sorts on the hidden number underneath, so ascending puts that row at position one with
+   * no number in it - and a reader takes the POSITION as the finding, which is the whole failure the
+   * withholding exists to prevent.
+   *
+   * Rows are ordered by this group first (lower first), then by the value within the group. Because it
+   * is not inverted, a group pushed to the bottom stays at the bottom in both directions.
+   */
+  sortGroup?: (row: T) => number;
 }
 
 interface DataTableProps<T extends AnyRow = AnyRow> {
@@ -25,7 +40,7 @@ interface DataTableProps<T extends AnyRow = AnyRow> {
    *  The row is a POINTER/keyboard convenience over the cell's inline link, not a control itself: it
    *  deliberately does NOT take `role="button"` (that would nest an interactive role around the inline
    *  buttons it contains). Keyboard and screen-reader users drill via the labeled inline link; the row
-   *  also honours Enter/Space when focused. Give such tables an inline link (e.g. the id/name cell) as
+   *  also honors Enter/Space when focused. Give such tables an inline link (e.g. the id/name cell) as
    *  the accessible drill control. */
   onRowClick?: (row: T) => void;
   /**
@@ -49,12 +64,22 @@ interface DataTableProps<T extends AnyRow = AnyRow> {
     onPageChange: (page: number) => void;
     loading?: boolean;
   };
+  /** A stable key per row, written to the row as `data-row-key`. Required for `focusKey`. */
+  rowKey?: (row: T) => string | null | undefined;
+  /**
+   * The row to bring into view: the table opens the client page that holds it, scrolls it into view once,
+   * and highlights it briefly. A key no row carries does nothing, so a caller can set it before its data arrives.
+   */
+  focusKey?: string | null;
 }
 
-function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No data available', onRowClick, pageSize = 25, serverPagination }: DataTableProps<T>) {
+function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = i18n.t('admin.dataTable.noDataAvailable'), onRowClick, pageSize = 25, serverPagination, rowKey, focusKey = null }: DataTableProps<T>) {
+  const { t } = useTranslation();
   const [sortKey, setSortKey] = useState<string | null>(null);
   const [sortDir, setSortDir] = useState<'asc' | 'desc'>('desc');
   const [page, setPage] = useState(0);
+  const wrapperRef = useRef<HTMLDivElement>(null);
+  const scrolledFor = useRef<string | null>(null);
 
   // A new client-side result set (row count changed) starts at the first page rather than stranding the
   // viewer on a now-out-of-range page. Sorting also returns to the first page (see handleSort). In
@@ -73,8 +98,15 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
 
   // NOTE: sorting is client-side over the rows currently in `data`. In server mode that is one page,
   // so a sort orders only the visible page (the server's ORDER BY is the authoritative overall order).
+  const sortGroup = sortKey ? columns.find((c) => c.key === sortKey)?.sortGroup : undefined;
   const sortedData = sortKey
     ? [...data].sort((a, b) => {
+        // The group is applied OUTSIDE the direction flip on purpose: a row whose value this column is
+        // withholding belongs at the bottom whichever way the reader sorts, not at the top on one click.
+        if (sortGroup) {
+          const grouped = sortGroup(a) - sortGroup(b);
+          if (grouped !== 0) return grouped;
+        }
         const aVal = (a as AnyRow)[sortKey];
         const bVal = (b as AnyRow)[sortKey];
         const cmp = typeof aVal === 'number' && typeof bVal === 'number'
@@ -83,6 +115,27 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
         return sortDir === 'asc' ? cmp : -cmp;
       })
     : data;
+
+  // THE FOCUSED ROW'S PAGE. Declared after the reset above, so when both run on one commit the focused
+  // row's page wins. Keyed on the row's position, so paging away by hand afterwards stays where it is put.
+  const focusIndex = focusKey && rowKey ? sortedData.findIndex((r) => rowKey(r) === focusKey) : -1;
+  useEffect(() => {
+    if (focusIndex < 0 || serverPagination || pageSize <= 0) return;
+    setPage(Math.floor(focusIndex / pageSize));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [focusKey, focusIndex, pageSize, data.length]);
+
+  // Scrolled into view once per key, after the render that shows it. Smooth unless the reader asked for less motion.
+  useEffect(() => {
+    if (!focusKey) { scrolledFor.current = null; return; }
+    if (scrolledFor.current === focusKey) return;
+    const row = Array.from(wrapperRef.current?.querySelectorAll<HTMLElement>('tr[data-row-key]') ?? [])
+      .find((el) => el.getAttribute('data-row-key') === focusKey);
+    if (!row) return;
+    scrolledFor.current = focusKey;
+    const reduce = typeof window.matchMedia === 'function' && window.matchMedia('(prefers-reduced-motion: reduce)').matches;
+    if (typeof row.scrollIntoView === 'function') row.scrollIntoView({ block: 'center', behavior: reduce ? 'auto' : 'smooth' });
+  });
 
   if (data.length === 0) {
     return <div className="data-table-empty">{emptyMessage}</div>;
@@ -135,7 +188,7 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
   const sortableCols = columns.filter((c) => c.sortable !== false);
 
   return (
-    <div className="data-table-wrapper">
+    <div className="data-table-wrapper" ref={wrapperRef}>
       {/*
         MOBILE SORT. Below 640px the stacked card layout hides `thead` entirely - and the column
         headers are the ONLY sort affordance this table has. So on a phone a long list could not be
@@ -147,14 +200,14 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
       */}
       {sortableCols.length > 0 && (
         <div className="data-table-mobile-sort">
-          <label className="data-table-mobile-sort-label" htmlFor="dt-sort">Sort</label>
+          <label className="data-table-mobile-sort-label" htmlFor="dt-sort">{t('admin.table.sort')}</label>
           <select
             id="dt-sort"
-            className="data-table-mobile-sort-select"
+            className="select"
             value={sortKey ?? ''}
             onChange={(e) => setSortKey(e.target.value || null)}
           >
-            <option value="">Default order</option>
+            <option value="">{t('admin.table.defaultOrder')}</option>
             {sortableCols.map((c) => (
               <option key={c.key} value={c.key}>
                 {typeof c.label === 'string' ? c.label : c.key}
@@ -165,7 +218,7 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
             type="button"
             className="data-table-mobile-sort-dir"
             disabled={!sortKey}
-            aria-label={sortDir === 'asc' ? 'Sort ascending, switch to descending' : 'Sort descending, switch to ascending'}
+            aria-label={sortDir === 'asc' ? t('admin.dataTable.sortAscendingSwitchToDescending') : t('admin.dataTable.sortDescendingSwitchToAscending')}
             onClick={() => setSortDir(sortDir === 'asc' ? 'desc' : 'asc')}
           >
             {sortDir === 'asc' ? '↑ Asc' : '↓ Desc'}
@@ -190,10 +243,15 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
           </tr>
         </thead>
         <tbody>
-          {pageRows.map((row, i) => (
+          {pageRows.map((row, i) => {
+            const key = rowKey?.(row) || undefined;
+            const focused = Boolean(focusKey && key === focusKey);
+            return (
             <tr
               key={`${curPage}_${i}`}
-              className={onRowClick ? 'data-table-row--clickable' : ''}
+              data-row-key={key}
+              aria-current={focused ? 'true' : undefined}
+              className={[onRowClick ? 'data-table-row--clickable' : '', focused ? 'data-table-row--focus' : ''].filter(Boolean).join(' ')}
               onClick={onRowClick
                 ? (e) => {
                     // Let nested buttons/links handle their own click; only a bare-row click drills.
@@ -218,7 +276,8 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
                 </td>
               ))}
             </tr>
-          ))}
+            );
+          })}
         </tbody>
       </table>
       {showPagination && (
@@ -229,10 +288,10 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
           <div className="data-table-pagination-controls">
             <button
               type="button"
-              className="data-table-page-btn"
+              className="btn-secondary"
               onClick={goPrev}
               disabled={controlsDisabled || curPage === 0}
-              aria-label="Previous page"
+              aria-label={t('admin.table.previousPage')}
             >
               &larr; Prev
             </button>
@@ -241,10 +300,10 @@ function DataTableInner<T extends AnyRow>({ columns, data, emptyMessage = 'No da
             </span>
             <button
               type="button"
-              className="data-table-page-btn"
+              className="btn-secondary"
               onClick={goNext}
               disabled={controlsDisabled || curPage >= totalPages - 1}
-              aria-label="Next page"
+              aria-label={t('admin.table.nextPage')}
             >
               Next &rarr;
             </button>

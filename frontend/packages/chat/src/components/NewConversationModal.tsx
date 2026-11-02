@@ -1,9 +1,9 @@
 import React, { useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import { useAuth } from '@ae/shared';
+import { creatableClassifications, deploymentClassifications, classificationBadgeStyle, type ClientClassification } from '@ae/shared/config/classifications.ts';
+import { modelForClassification } from '@ae/shared/config/modelStrategy.ts';
 import { useConversations } from '../providers/ConversationProvider.chime';
-import type { UserTier } from '@ae/shared';
-import { getTierModelSelection } from '@ae/shared';
 import './NewConversationModal.css';
 
 interface NewConversationModalProps {
@@ -11,71 +11,36 @@ interface NewConversationModalProps {
   onClose: () => void;
 }
 
-type ClassTierId = UserTier | 'open';
-
 interface ClassificationOption {
-  tier: ClassTierId;
+  tier: string;
   label: string;
   agentModel: string;
   modelId: string;
   description: string;
+  /** The sample's access copy for this classification, when the catalog carries it; empty otherwise. */
   contextAccess: string[];
   tools: string[];
   membershipRule: string;
-  minTier: UserTier;
 }
 
 /**
- * Classification data-only definition. Labels, descriptions, and
- * membership rules are resolved from i18n at render time — only the
- * tier identifier, contextAccess list, tools list, and minTier live
- * here, since those are security/policy attributes not UI copy.
+ * WHICH CONVERSATIONS TO OFFER, AND WHAT EACH IS CALLED: read from the deployment's declared set.
  *
- * The contextAccess + tools lists are kept as English-only arrays
- * because they reference data-system concepts that aren't translated
- * as a set. A future pass could move them into i18n too.
+ * The options are the conversational, members-audience classifications the person's own classification
+ * grants (`creatableClassifications`, from `GET /classifications`, the set `backend/lib/config/profiles.ts`
+ * declares), so a deployment declaring `legal` and `finance` offers those, by their declared names and in
+ * their declared badge colors, and an administrator is offered every one the admin plane grants. Who may
+ * join each is the declared classifications whose grants reach it.
+ *
+ * AN AFFORDANCE, never the enforcement: `lib/channel-creation.ts` refuses a classification the caller does
+ * not clear for, so a stale build costs a confusing offer, not access.
+ *
+ * The description and the access details are copy: the catalog carries the sample's for its three member
+ * classifications (`newConversation.class.<value>`), and a deployment adds its own the same way. A
+ * classification with none shows the generic description and no details.
  */
-const CLASSIFICATION_DATA: Array<Omit<ClassificationOption, 'agentModel' | 'modelId' | 'label' | 'description' | 'membershipRule'>> = [
-  {
-    tier: 'open',
-    contextAccess: ['Company overview', 'Product descriptions', 'Public FAQ'],
-    tools: ['Respond'],
-    minTier: 'basic',
-  },
-  {
-    tier: 'basic',
-    contextAccess: ['Company overview', 'Product descriptions', 'Public FAQ'],
-    tools: ['Respond'],
-    minTier: 'basic',
-  },
-  {
-    tier: 'standard',
-    contextAccess: ['Everything in Basic', 'Employee directory', 'Product roadmap', 'Support data', 'Internal processes'],
-    tools: ['Respond', 'Create conversations', 'Manage members', 'Load context'],
-    minTier: 'standard',
-  },
-  {
-    tier: 'premium',
-    contextAccess: ['Everything in Standard', 'Financial data', 'Customer accounts', 'Board summaries', 'Competitive intel', 'Team metrics'],
-    tools: ['All Standard tools', 'Query analytics', 'Share conversations'],
-    minTier: 'premium',
-  },
-];
-
-const TIER_RANK: Record<string, number> = { basic: 0, standard: 1, premium: 2 };
-
-function canAccessClassification(userTier: UserTier, classification: ClassificationOption): boolean {
-  return TIER_RANK[userTier] >= TIER_RANK[classification.minTier];
-}
-
-function getTierColorVar(tier: string): string {
-  switch (tier) {
-    case 'open': return 'var(--tier-basic)';
-    case 'basic': return 'var(--tier-basic)';
-    case 'standard': return 'var(--tier-standard)';
-    case 'premium': return 'var(--tier-premium)';
-    default: return 'var(--text-tertiary)';
-  }
+function membersOf(value: string, all: ClientClassification[]): string[] {
+  return all.filter((c) => c.grants.includes(value)).map((c) => c.displayName);
 }
 
 const NewConversationModal: React.FC<NewConversationModalProps> = ({
@@ -83,32 +48,29 @@ const NewConversationModal: React.FC<NewConversationModalProps> = ({
   onClose,
 }) => {
   const { t } = useTranslation();
-  // Title is optional. If the user names it, that name sticks (the bot's
-  // auto-derive only renames a channel still called "New conversation" —
-  // see channel-title.ts). Left blank, we default to "New conversation"
-  // and auto-derive from the first message.
-  const [title, setTitle] = useState('');
+  // NO TITLE STATE. A conversation is named from its own first turn, so there is nothing to collect
+  // here and nothing to carry - see the note on the form below.
   const [selectedClassification, setSelectedClassification] = useState<ClassificationOption | null>(null);
   const [isCreating, setIsCreating] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [showContextDetail, setShowContextDetail] = useState<string | null>(null);
   const { user } = useAuth();
   const { createConversation } = useConversations();
-  const tierModelSelection = getTierModelSelection();
 
-  const userTier = user?.tier || 'basic';
-  const classifications: ClassificationOption[] = CLASSIFICATION_DATA.map((classification) => {
-    const tierModel = classification.tier === 'open'
-      ? tierModelSelection.basic
-      : tierModelSelection[classification.tier];
-
+  const all = deploymentClassifications();
+  const availableClassifications: ClassificationOption[] = creatableClassifications(user?.tier).map((c) => {
+    const model = modelForClassification(c);
+    const copy = (key: string) => t(`newConversation.class.${c.value}.${key}`, { returnObjects: true, defaultValue: [] }) as unknown;
+    const list = (key: string) => { const v = copy(key); return Array.isArray(v) ? v.map(String) : []; };
     return {
-      ...classification,
-      label: t(`newConversation.class.${classification.tier}.label`),
-      description: t(`newConversation.class.${classification.tier}.description`),
-      membershipRule: t(`newConversation.class.${classification.tier}.membership`),
-      agentModel: tierModel.displayName,
-      modelId: tierModel.bedrockModelId,
+      tier: c.value,
+      label: c.displayName,
+      description: t(`newConversation.class.${c.value}.description`, { defaultValue: t('newConversation.genericDescription') }),
+      membershipRule: t('newConversation.membership', { names: membersOf(c.value, all).join(', ') }),
+      agentModel: model?.displayName ?? '',
+      modelId: model?.bedrockModelId ?? '',
+      contextAccess: list('contextAccess'),
+      tools: list('tools'),
     };
   });
 
@@ -118,16 +80,18 @@ const NewConversationModal: React.FC<NewConversationModalProps> = ({
       try {
         setIsCreating(true);
         setError(null);
-        // The classification tier determines the model — map to model ID.
-        // Title placeholder ("New conversation") is replaced on the first
-        // user message by the auto-derive in ConversationProvider.
+        // The chosen option names both the classification and its model; the classification is sent
+        // as chosen, never inferred from the model.
+        //
+        // NO TITLE: the server opens the room with the platform's own unnamed marker, which its first message
+        // replaces (`channel-title.ts`). Sending display text here would tie that rename to the reader's language.
         await createConversation(
-          title.trim() || t('newConversation.defaultTitle'),
+          undefined,
           selectedClassification.modelId,
-          selectedClassification.agentModel
+          selectedClassification.agentModel,
+          selectedClassification.tier,
         );
         setSelectedClassification(null);
-        setTitle('');
         onClose();
       } catch (err) {
         setError(err instanceof Error ? err.message : t('newConversation.errorFallback'));
@@ -146,9 +110,6 @@ const NewConversationModal: React.FC<NewConversationModalProps> = ({
 
   if (!isOpen) return null;
 
-  const availableClassifications = classifications.filter(c =>
-    canAccessClassification(userTier, c)
-  );
 
   return (
     <div className="modal-overlay" onClick={handleClose}>
@@ -167,21 +128,17 @@ const NewConversationModal: React.FC<NewConversationModalProps> = ({
         </div>
 
         <form onSubmit={handleSubmit}>
-          <div className="ncm-section">
-            <label className="ncm-label" htmlFor="ncm-title-input">
-              <span className="ncm-label-text">{t('newConversation.titleFieldLabel')}</span>
-              <span className="ncm-label-hint">{t('newConversation.titleFieldHint')}</span>
-            </label>
-            <input
-              id="ncm-title-input"
-              type="text"
-              className="ncm-input"
-              value={title}
-              onChange={(e) => setTitle(e.target.value)}
-              placeholder={t('newConversation.titleFieldPlaceholder')}
-              maxLength={80}
-            />
-          </div>
+          {/*
+            * NO TITLE FIELD. A conversation is named from what it turns out to be
+            * about, not from what someone guessed before it started - asking up front makes a person
+            * name a thing they have not had yet, and the name they invent is usually worse than the
+            * one the first message would have produced.
+            *
+            * The channel is created with the placeholder the auto-name looks for, and the first
+            * substantive turn replaces it (`channel-title.ts`). Measured over two days: 118 renames,
+            * no skips and no derivation failures, so the path this now depends on entirely is the one
+            * that was already doing the work.
+            */}
 
           {/* Classification selector */}
           <div className="ncm-section">
@@ -192,8 +149,8 @@ const NewConversationModal: React.FC<NewConversationModalProps> = ({
             <div className="ncm-classification-grid">
               {availableClassifications.map((classification) => {
                 const isSelected = selectedClassification?.tier === classification.tier;
-                const tierColor = getTierColorVar(classification.tier);
                 const isExpanded = showContextDetail === classification.tier;
+                const hasDetails = classification.contextAccess.length > 0 || classification.tools.length > 0;
 
                 return (
                   <div
@@ -206,13 +163,12 @@ const NewConversationModal: React.FC<NewConversationModalProps> = ({
                       setShowContextDetail(null);
                     }}
                     onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setSelectedClassification(classification); setShowContextDetail(null); }}}
-                    style={{ '--tier-accent': tierColor } as React.CSSProperties}
+                    style={classificationBadgeStyle(classification.tier)}
                   >
                     <div className="ncm-class-card-header">
-                      <div className="ncm-class-card-badge" style={{ background: tierColor }}>
+                      <div className="ncm-class-card-badge">
                         {classification.label}
                       </div>
-                      <span className="ncm-class-card-model">{classification.agentModel}</span>
                     </div>
 
                     <p className="ncm-class-card-desc">{classification.description}</p>
@@ -224,19 +180,21 @@ const NewConversationModal: React.FC<NewConversationModalProps> = ({
                         </svg>
                         <span>{classification.membershipRule}</span>
                       </div>
-                      <button
-                        type="button"
-                        className="ncm-class-card-detail-toggle"
-                        onClick={(e) => {
-                          e.stopPropagation();
-                          setShowContextDetail(isExpanded ? null : classification.tier);
-                        }}
-                      >
-                        {isExpanded ? t('newConversation.hideDetails') : t('newConversation.viewDetails')}
-                      </button>
+                      {hasDetails && (
+                        <button
+                          type="button"
+                          className="ncm-class-card-detail-toggle"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setShowContextDetail(isExpanded ? null : classification.tier);
+                          }}
+                        >
+                          {isExpanded ? t('newConversation.hideDetails') : t('newConversation.viewDetails')}
+                        </button>
+                      )}
                     </div>
 
-                    {isExpanded && (
+                    {isExpanded && hasDetails && (
                       <div className="ncm-class-card-details">
                         <div className="ncm-detail-group">
                           <span className="ncm-detail-label">{t('newConversation.contextAccessLabel')}</span>
@@ -272,7 +230,7 @@ const NewConversationModal: React.FC<NewConversationModalProps> = ({
 
           {/* Security context bar */}
           {selectedClassification && (
-            <div className="ncm-security-bar" style={{ '--tier-accent': getTierColorVar(selectedClassification.tier) } as React.CSSProperties}>
+            <div className="ncm-security-bar" style={classificationBadgeStyle(selectedClassification.tier)}>
               <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 16 16" fill="currentColor" width="14" height="14">
                 <path fillRule="evenodd" d="M8 1a3.5 3.5 0 00-3.5 3.5V7H3a1 1 0 00-1 1v5a1 1 0 001 1h10a1 1 0 001-1V8a1 1 0 00-1-1h-1.5V4.5A3.5 3.5 0 008 1zm2 6V4.5a2 2 0 10-4 0V7h4z" clipRule="evenodd" />
               </svg>

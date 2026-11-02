@@ -4,9 +4,12 @@ import { fetchOpenWorkItems, type OpenWorkItem } from '../services/openWorkItemS
 import { useAuth } from '@ae/shared';
 import { useAwsClient } from './AwsClientProvider';
 import { useMessaging } from './MessagingProvider';
+import { sidesWaitingOn, type WaitingSide } from '../utils/battleSideReply';
+import { isUnnamedConversation } from '../utils/conversationTitle';
 import i18n from '@ae/shared/i18n';
 import { chimeService, type ShareConversationResult } from '../services/chimeService';
 import { notificationService } from '../services/notificationService';
+import { battleAfterUpdate } from '../services/battleAfterUpdate';
 import { trackEvent } from '@ae/shared';
 import {
   archiveConversation as archiveConversationApi,
@@ -34,7 +37,7 @@ interface ConversationContextType {
    *  the active conversation (that one is always considered read while
    *  viewing). */
   isConversationUnread: (conv: Conversation) => boolean;
-  createConversation: (title: string, modelId: string, modelName: string, topic?: string) => Promise<void>;
+  createConversation: (title: string | undefined, modelId: string, modelName: string, classification: UserTier, topic?: string) => Promise<void>;
   selectConversation: (conversationId: string) => Promise<void>;
   /** Deselect the active conversation (return to the list) without removing it.
    *  Drives the mobile master-detail Back affordance. */
@@ -42,7 +45,7 @@ interface ConversationContextType {
   sendMessage: (
     content: string,
     attachment?: Attachment,
-    options?: { targetArn?: string; mentionBotArn?: string; taskId?: string },
+    options?: { targetArn?: string; mentionBotArn?: string; mentionArns?: string[]; taskId?: string },
   ) => Promise<void>;
   shareConversation: (recipientEmail: string) => Promise<ShareConversationResult>;
   deleteConversation: (conversationId: string) => void;
@@ -56,12 +59,20 @@ interface ConversationContextType {
   /** Sticky mention target: prepended on the next outbound message unless the user types their own @-mention. Set automatically when the bot replies with a targeted message; cleared on channel change or user dismiss. */
   stickyTarget: StickyMentionTarget | null;
   setStickyTarget: (target: StickyMentionTarget | null) => void;
-  /** Derived from messages: bots currently WAITING_FOR_USER in this
-   *  channel (battlewaiting marker live on their placeholder). Empty
-   *  when none. Drives the composer's "Replying to:" affordance; order
-   *  is message order so the LAST entry is the most-recent waiter
-   *  (composer default selection, SPEC-BATTLE.md §"Per-bot reply UX"). */
-  battleWaitingBots: Array<{ botArn: string; battleId: string }>;
+  /** Derived from messages: duel sides in this channel WAITING ON THIS PERSON (their battlewaiting
+   *  marker is live and names this viewer as the duel's owner, or names no owner). Empty when none.
+   *  Message order, so index 0 is the oldest waiter. A side waiting on somebody else is not here: it
+   *  is not this person's to answer, and nothing of theirs is held for it. */
+  battleWaitingBots: BattleWaitingSide[];
+  /** The duel sides the composer is replying to, chosen through a side's "Reply to this side" control
+   *  (DESIGN-BATTLE, "A side parked on the person"). Only sides still waiting on this person stay in
+   *  it, so a side that is answered or ends drops out on the message that says so. Empty when the
+   *  composer is not replying to a side. */
+  replyingToSides: BattleWaitingSide[];
+  /** Put the composer into reply-to-side mode for these sides (one, or every waiting side). */
+  replyToSides: (botArns: string[]) => void;
+  /** Leave reply-to-side mode; the next send is an ordinary message. */
+  clearReplyingToSides: () => void;
   /** Work items this user OWNS, across every conversation, oldest first (GET /tasks/mine).
    *  This is the cross-conversation half of "waiting on you": battleWaitingBots derives from the
    *  loaded channel's messages, so the item a user is most likely to have forgotten - the one in a
@@ -69,7 +80,19 @@ interface ConversationContextType {
   openWorkItems: OpenWorkItem[];
   /** Re-read the queue. Called after a send, because answering is what closes an item. */
   refreshOpenWorkItems: () => void;
+  /**
+   * THE ITEM THE PERSON CHOSE TO ANSWER (ADR-035), or null. Set only by the person, through an item's
+   * Answer action: nothing is attached to a message unless they chose it or typed its reference.
+   */
+  answeringTaskId: string | null;
+  /** Choose this item to answer; the composer inserts its `#<n>` once its conversation is open. */
+  answerItem: (item: OpenWorkItem) => void;
+  /** Stop answering the chosen item. */
+  clearAnswering: () => void;
 }
+
+/** A duel side waiting on the person, as its `<!--battlewaiting-->` marker states it. */
+export type BattleWaitingSide = WaitingSide;
 
 const ConversationContext = createContext<ConversationContextType | undefined>(undefined);
 
@@ -93,8 +116,8 @@ function reflectConversationInUrl(conversationId: string | null): void {
 
 export function ConversationProvider({ children }: { children: ReactNode }) {
   const { user } = useAuth();
-  const { isInitialized } = useAwsClient();
-  const { setChannelListener, setGlobalListener } = useMessaging();
+  const { isInitialized, userArn: viewerArn } = useAwsClient();
+  const { setChannelListener, setGlobalListener, sessionVersion } = useMessaging();
 
   const [conversations, setConversations] = useState<Conversation[]>([]);
   const [activeConversation, setActiveConversation] = useState<Conversation | null>(null);
@@ -162,6 +185,23 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
    * away, or after the budget. Merges by id so an optimistic user message is never dropped, and
    * only ever ADDS - it cannot remove a message the socket delivered.
    */
+  /**
+   * Merge messages read from history into the rendered list: ADD the ones not already shown, never
+   * remove or reorder what the socket delivered except by timestamp. Returns how many were added.
+   * Shared by the create-time welcome reconcile and the catch-up on (re)connect.
+   */
+  const mergeFetchedMessages = useCallback((fetched: Message[], why: string): void => {
+    setMessages((prev) => {
+      const seen = new Set(prev.map((m) => m.id));
+      const missing = fetched.filter((m) => !seen.has(m.id));
+      if (missing.length === 0) return prev;
+      console.warn(`[ConversationProvider] recovered ${missing.length} message(s) missed ${why}`);
+      return [...prev, ...missing].sort(
+        (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
+      );
+    });
+  }, []);
+
   const reconcileNewConversationWelcome = useCallback(async (channelArn: string) => {
     const DELAYS_MS = [400, 800, 1500, 2500, 4000];
 
@@ -176,23 +216,13 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         if (activeConversationRef.current?.conversationArn !== channelArn) return;
         if (!fetched.some((m) => m.isBot)) continue;
 
-        setMessages((prev) => {
-          const seen = new Set(prev.map((m) => m.id));
-          const missing = fetched.filter((m) => !seen.has(m.id));
-          if (missing.length === 0) return prev;
-          console.warn(
-            `[ConversationProvider] recovered ${missing.length} message(s) missed during conversation create`,
-          );
-          return [...prev, ...missing].sort(
-            (a, b) => new Date(a.timestamp).getTime() - new Date(b.timestamp).getTime(),
-          );
-        });
+        mergeFetchedMessages(fetched, 'during conversation create');
         return;
       } catch (err) {
         console.warn('[ConversationProvider] welcome reconcile attempt failed:', err);
       }
     }
-  }, []);
+  }, [mergeFetchedMessages]);
 
   // Load conversations when AWS clients are initialized
   useEffect(() => {
@@ -204,15 +234,34 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
 
       try {
         setIsInitializing(true);
-        const userConversations = await chimeService.listConversations();
-
-        const filteredConversations = userConversations.filter((conv) => {
-          if (user.tier === 'premium') return true;
-          if (user.tier === 'standard') return conv.modelTier !== 'premium';
-          return conv.modelTier === 'basic';
-        });
-
-        setConversations(filteredConversations);
+        /**
+         * THE LIST IS THE MEMBERSHIPS THE PLATFORM GRANTED. The client does not subtract from it.
+         *
+         * This used to filter the result through a hardcoded basic/standard/premium rank, which was wrong
+         * three ways. `listConversations` already asks
+         * `ListChannelMembershipsForAppInstanceUser` with the person's own bearer, so the server has
+         * already answered "which conversations is this person in" and enforced it; filtering afterwards
+         * could only remove conversations they are legitimately a member of, including ones they created.
+         * It ranked on `modelTier`, which comes from channel Metadata that members can write
+         * (`chime:UpdateChannel`) - the same reason `useAttachmentCapability` refuses to read it. And it
+         * failed OPEN: `modelTier` defaults to 'basic' when metadata is missing or unparseable, which is
+         * exactly the bucket a basic-tier reader was allowed to see.
+         *
+         * It also made the same conversation appear or not depending on how someone arrived, because a
+         * deep link resolves a channel directly and folds it in with no filter applied.
+         *
+         * The backend removed the classification ladder; this was the last place imposing it.
+         */
+        /**
+         * RENDERED PAGE BY PAGE, so startup does not wait on the whole account.
+         *
+         * `listConversations` follows every page, which is what stopped the sidebar truncating silently.
+         * Awaiting all of it before the first render made startup linear in membership count - six
+         * sequential round trips on an account with 289 of them, before anything appeared. The callback
+         * hands over the accumulated list after each page, so the first page is on screen while the rest
+         * arrive, and the final value is still the complete list.
+         */
+        setConversations(await chimeService.listConversations(setConversations));
       } catch (error) {
         console.error('Failed to load conversations:', error);
       } finally {
@@ -302,13 +351,22 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         // conversation to unread on the next render
         setUnreadTicks((prev) => ({ ...prev, [channelArn]: Date.now() }));
 
-        // Browser notification — only when the tab is hidden or the
-        // channel isn't currently visible. Find the conversation so we
-        // can show its title and route the click back to it. We don't
-        // put the model name in the title/body: the router picks models
-        // per-intent within a tier, so "Sonnet replied" can be wrong.
+        // ── A BROWSER NOTIFICATION IS FOR SOMEBODY WHO IS NOT LOOKING ─────────
+        //
+        // This fired whenever the message was not in the ACTIVE channel, focus notwithstanding, so a
+        // person reading conversation A got an OS notification for conversation B while watching the
+        // sidebar flip it to unread in front of them. Two signals for one event, one of which
+        // interrupts the desktop.
+        //
+        // The unread state above is the in-app signal and it is already correct for this case. The
+        // notification is for the case the app cannot cover: the tab is hidden, or the window is
+        // behind something else. So it is gated on the document, not on which channel is open.
+        if (isDocumentFocused) return;
+        // Find the conversation so we can show its title and route the click back to it. We don't
+        // put the model name in the title/body: the router picks models per-intent within a tier, so
+        // "Sonnet replied" can be wrong.
         const conv = conversations.find((c) => c.conversationArn === channelArn);
-        const title = conv?.title || i18n.t('notifications.newMessageTitle');
+        const title = conv?.title && !isUnnamedConversation(conv.title) ? conv.title : i18n.t('notifications.newMessageTitle');
         const isBot = senderArn.includes('/bot/');
         const body = isBot
           ? i18n.t('notifications.botReplied')
@@ -379,7 +437,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     if (msg.targetedToUser) {
       setStickyTarget({
         userArn: msg.sender.arn,
-        name: msg.sender.name || (msg.isBot ? 'Assistant' : 'Member'),
+        name: msg.sender.name || (msg.isBot ? i18n.t('tier.assistant') : 'Member'),
         isBot: msg.isBot,
         isAll: false,
       });
@@ -405,7 +463,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     if (msg.targetedToUser) {
       setStickyTarget({
         userArn: msg.sender.arn,
-        name: msg.sender.name || (msg.isBot ? 'Assistant' : 'Member'),
+        name: msg.sender.name || (msg.isBot ? i18n.t('tier.assistant') : 'Member'),
         isBot: msg.isBot,
         isAll: false,
       });
@@ -452,9 +510,10 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         // placeholder-derived battle (keep battleId/round/rivalArn from
         // the placeholder; add responseMs/estCostUsd/steps) — never a
         // wholesale replace, which would drop the placeholder identity.
-        battle: msg.battle
-          ? { ...(updated[idx].battle ?? {}), ...msg.battle }
-          : updated[idx].battle,
+        // A placeholder that became a receipt carries no duel identity
+        // at all (`battleAfterUpdate`).
+        battle: battleAfterUpdate(updated[idx].battle, msg),
+        turnKind: msg.turnKind ?? updated[idx].turnKind,
         // battleWaiting is the OPPOSITE of battle: REPLACE, never
         // preserve. The waiting marker rides the placeholder UPDATE
         // (2B-vii); when the bot resumes, 2B-x-e reuses that SAME
@@ -470,6 +529,22 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
         // about, and it cost three e2e runs to find, because the attribute simply never appeared and a
         // guard reading it skipped silently.
         responsePhase: msg.responsePhase ?? updated[idx].responsePhase,
+        // HOW MANY ARE WAITING, from the UPDATE for exactly the reason above. The deferral notice is
+        // posted with a depth, updated as more messages queue, and updated to ZERO when the drain
+        // empties it - and that last update is the event the client watches to clear the waiting
+        // styling. Omitted from this list, the depth stayed at whatever the CREATE said, the signal
+        // derived from it never changed, and the styling never cleared: the same failure this
+        // merge's comment warns about, one field along. `??` keeps a real 0, which is the value
+        // that matters most here.
+        queueDepth: msg.queueDepth ?? updated[idx].queueDepth,
+        // KEPT ACROSS UPDATES, because a stage arrives on one message among many and the merge would
+        // otherwise drop it - but NOT past the point where the queue is empty. A settled notice that
+        // carried no stage left the last one showing forever, pulsing under a notice that said the
+        // opposite. An empty queue has no stage by definition, whatever the server did or did not say.
+        queueStatus: msg.queueDepth === 0
+          ? undefined
+          : msg.queueStatus ?? updated[idx].queueStatus,
+        queueStatusLabel: msg.queueStatusLabel ?? updated[idx].queueStatusLabel,
         attachment: msg.attachment ?? updated[idx].attachment,
         modelId: msg.modelId ?? updated[idx].modelId,
         intent: msg.intent ?? updated[idx].intent,
@@ -518,6 +593,54 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       setActiveConversation((prev) => (prev ? { ...prev, title: name } : prev));
     }
   }, []);
+
+  /**
+   * RE-READ WHAT THE SESSION WOULD HAVE PUSHED, EACH TIME A SESSION STARTS.
+   *
+   * The pattern is communication-hub's: its views list `sessionVersion` (or the session itself) as a
+   * dependency and re-read on every (re)connect - `ChannelView` re-lists the channel's messages before
+   * it re-subscribes, `ChannelList` and `MeetingList` re-fetch. A message posted while no session was
+   * running is never pushed again. Measured live 2026-10-05: on a slow page the session endpoint
+   * returned 5 s after the conversation opened, the person sent before the socket was up, and the
+   * assistant's targeted reply landed in that gap - delivered, readable in history, never shown.
+   *
+   * ONE DIFFERENCE, AND IT IS THIS APP'S SHAPE RATHER THAN A NEW DESIGN. communication-hub replaces
+   * its per-view list; this app has ONE app-level handler and one list, so the open conversation is
+   * MERGED: a message not shown is added, and one shown with different content goes through the same
+   * path a live UPDATE takes (most answers arrive as an update to a placeholder, so a missed UPDATE
+   * would otherwise leave "One moment..." on screen). Replacing the list would drop an optimistic
+   * message the history read has not caught up with yet.
+   *
+   * The sidebar re-fetches on a RECONNECT only (sessionVersion > 1): the first session starts right
+   * after the initial load, which already read it. It is read whole rather than page by page, so a
+   * refresh never shows the list shrunk to its first page.
+   */
+  useEffect(() => {
+    if (!sessionVersion) return;
+    const channelArn = activeConversationRef.current?.conversationArn;
+    if (channelArn) {
+      void chimeService.listMessages(channelArn)
+        .then((fetched) => {
+          if (activeConversationRef.current?.conversationArn !== channelArn) return;
+          const shown = new Map(messagesRef.current.map((m) => [m.id, m]));
+          for (const m of fetched) {
+            const current = shown.get(m.id);
+            if (current && current.content !== m.content) handleMessageUpdate(m);
+          }
+          mergeFetchedMessages(fetched, 'while no messaging session was running');
+        })
+        .catch((err) => {
+          console.warn('[ConversationProvider] catch-up after the session started failed:', err);
+        });
+    }
+    if (sessionVersion > 1) {
+      void chimeService.listConversations()
+        .then((all) => setConversations(all))
+        .catch((err) => {
+          console.warn('[ConversationProvider] conversation list refresh after reconnect failed:', err);
+        });
+    }
+  }, [sessionVersion, mergeFetchedMessages, handleMessageUpdate]);
 
   /**
    * The single channel-event handler, registered once for the whole app.
@@ -631,19 +754,18 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   selectConversationRef.current = selectConversation;
 
   const createConversation = useCallback(async (
-    title: string,
+    title: string | undefined,
     modelId: string,
     modelName: string,
+    classification: UserTier,
     topic?: string,
   ): Promise<void> => {
     if (!user) return;
 
     try {
-      let modelTier: UserTier = 'basic';
-      if (modelId.includes('opus')) modelTier = 'premium';
-      else if (modelId.includes('sonnet') || modelId.includes('titan')) modelTier = 'standard';
-
-      const newConversation = await chimeService.createConversation(title, modelId, modelName, modelTier, topic);
+      // THE CLASSIFICATION THE PERSON CHOSE, sent as chosen. It is never inferred from the model, and
+      // the server refuses a creation that names none (ADR-046).
+      const newConversation = await chimeService.createConversation(title, modelId, modelName, classification, topic);
 
       // J (cross-chat leak) is now structural rather than a step that can be forgotten: the single
       // handler renders only the ACTIVE conversation, so a previous channel's in-flight battle
@@ -691,7 +813,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       // So poll briefly for the assistant's first message, and stop the moment it appears. On the
       // healthy path the socket has already delivered it and the first check exits immediately.
       void reconcileNewConversationWelcome(newConversation.conversationArn);
-      trackEvent('conversation_created', { modelId, modelName, modelTier });
+      trackEvent('conversation_created', { modelId, modelName, modelTier: classification });
     } catch (error) {
       console.error('Failed to create conversation:', error);
       throw error;
@@ -705,7 +827,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
   const sendMessage = useCallback(async (
     content: string,
     attachment?: Attachment,
-    options?: { targetArn?: string; mentionBotArn?: string; taskId?: string },
+    options?: { targetArn?: string; mentionBotArn?: string; mentionArns?: string[]; taskId?: string },
   ): Promise<void> => {
     if (!activeConversationRef.current || !user) return;
 
@@ -851,19 +973,32 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
 
   const clearSendError = useCallback(() => setSendError(null), []);
 
-  // Derived: bots currently waiting on the user. A bot's battlewaiting
-  // marker lives on its placeholder until 2B-x-e reuses that message for
-  // the resumed answer (UPDATE replace clears battleWaiting), so a
-  // message still carrying it ⇒ that bot is genuinely waiting. Keyed by
-  // botArn (one waiting placeholder per bot); Map insertion = message
-  // order, so the last value is the most-recent waiter.
   // The user's own open items, across every conversation. Polled rather than pushed: an item can be
   // opened by an assistant in a channel this client is not subscribed to, so there is no event here to
   // listen for. The interval is deliberately slow - this is an ambient reminder, not a live feed - and
   // a send refreshes it immediately, because answering is what closes an item.
   const [openWorkItems, setOpenWorkItems] = useState<OpenWorkItem[]>([]);
+  // ── ONLY THE NEWEST ANSWER IS INSTALLED (code review, 2026-09-09) ─────────────────────────────
+  //
+  // This became event-driven - the effect below re-reads on every `messages` identity change - and
+  // `handleMessageUpdate` returns a fresh array on every UPDATE: placeholder, interim, final, each
+  // notice rewrite, each battle round. So one answer can put three of these in flight at once, and
+  // they can resolve in any order. An OLDER list that still contained the item the person just
+  // closed would then overwrite the fresher one and the item reappeared in the left nav until the
+  // five-minute sweep corrected it.
+  //
+  // The fingerprint below does not help with this: the stale array has a DIFFERENT fingerprint from
+  // the fresh one, so it is installed rather than skipped.
+  //
+  // A sequence number rather than an abort: the request is a plain read with no side effect, so the
+  // cheapest correct thing is to let a superseded one finish and discard it.
+  const openWorkSeqRef = useRef(0);
   const refreshOpenWorkItems = useCallback(() => {
+    const seq = ++openWorkSeqRef.current;
     void fetchOpenWorkItems().then((items) => {
+      // SUPERSEDED. Something newer has been asked since this went out, so this answer is already
+      // known to be stale - installing it would be a step backwards.
+      if (seq !== openWorkSeqRef.current) return;
       // KEEP REFERENTIAL IDENTITY when nothing changed. openWorkItems is a dependency of the
       // provider-value useMemo, so a freshly parsed (always-new) array here invalidated the context
       // value and re-rendered every useConversations consumer once a minute even when the queue was
@@ -871,7 +1006,7 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       // moves at least one of these.
       setOpenWorkItems((prev) => {
         const fingerprint = (list: OpenWorkItem[]) =>
-          list.map((i) => `${i.taskId}|${i.status}|${i.taskState ?? ''}|${i.updatedAt ?? ''}`).join('\n');
+          list.map((i) => `${i.taskId}|${i.taskRef ?? ''}|${i.status}|${i.taskState ?? ''}|${i.updatedAt ?? ''}`).join('\n');
         return fingerprint(prev) === fingerprint(items) ? prev : items;
       });
     });
@@ -882,17 +1017,54 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
       return;
     }
     refreshOpenWorkItems();
-    const timer = setInterval(refreshOpenWorkItems, 60_000);
+    // A RECONCILIATION SWEEP, not the mechanism. Tenet D6 allows one BEHIND an event path, and there
+    // is now an event path: `messages` below re-reads whenever this conversation says anything, and
+    // an assistant that opens, advances or closes a task says so in the conversation it opened it
+    // in. What the event cannot cover is a task opened in a channel this client is not subscribed
+    // to, which is why the sweep stays - and why it is slow rather than the every-minute poll it
+    // was, which was doing the whole job on its own.
+    const timer = setInterval(refreshOpenWorkItems, 5 * 60_000);
     return () => clearInterval(timer);
   }, [user, refreshOpenWorkItems]);
 
-  const battleWaitingBots = useMemo(() => {
-    const byBot = new Map<string, { botArn: string; battleId: string }>();
-    for (const m of messages) {
-      if (m.battleWaiting) byBot.set(m.battleWaiting.botArn, m.battleWaiting);
-    }
-    return Array.from(byBot.values());
-  }, [messages]);
+  // THE EVENT HALF. The open-work list is what the left nav renders, and it went stale for up to a
+  // minute after the assistant said the thing that changed it - the person watched a task they had
+  // just answered sit open. This is the same message subscription the transcript already has, so it
+  // costs one read when something was actually said rather than one a minute forever.
+  useEffect(() => {
+    if (!user || !messages.length) return;
+    refreshOpenWorkItems();
+  }, [user, messages, refreshOpenWorkItems]);
+
+  // THE ITEM THE PERSON CHOSE TO ANSWER (ADR-035). Held here rather than in the composer because the
+  // choice is made in the open-items list, which is a different component. Choosing only records the
+  // item; the list opens its conversation when it is elsewhere, and the composer acts on it once the
+  // item's conversation is the one in front of the person.
+  const [answeringTaskId, setAnsweringTaskId] = useState<string | null>(null);
+  const answerItem = useCallback((item: OpenWorkItem) => setAnsweringTaskId(item.taskId), []);
+  const clearAnswering = useCallback(() => setAnsweringTaskId(null), []);
+
+  // WHICH SIDES WAIT ON THIS PERSON, from the messages the sides parked on. A side's marker comes down
+  // when it is answered or the duel ends, and the update that takes it down is the event this re-derives
+  // on, so nothing here is polled. Only the duel's owner is waited on (`mayAnswerSide`); a marker that
+  // names no owner is offered to everyone and the router decides whose answer counts.
+  const battleWaitingBots = useMemo(() => sidesWaitingOn(messages, viewerArn), [messages, viewerArn]);
+
+  // THE SIDES THE PERSON CHOSE TO REPLY TO, held here because the choice is made on a message and acted
+  // on in the composer, which are different components (the same shape as `answeringTaskId`). Kept as
+  // ids and resolved against the live waiting set, so a side that stops waiting leaves the reply mode
+  // on its own and the composer never targets a side that is no longer listening.
+  const [replyingToSideArns, setReplyingToSideArns] = useState<string[]>([]);
+  const replyToSides = useCallback((botArns: string[]) => setReplyingToSideArns(botArns), []);
+  const clearReplyingToSides = useCallback(() => setReplyingToSideArns([]), []);
+  const replyingToSides = useMemo(
+    () => battleWaitingBots.filter((side) => replyingToSideArns.includes(side.botArn)),
+    [battleWaitingBots, replyingToSideArns],
+  );
+  // A reply mode belongs to the conversation it was chosen in.
+  useEffect(() => {
+    setReplyingToSideArns([]);
+  }, [activeConversation?.conversationArn]);
 
   // Deselect the active conversation (return to the list) without removing it —
   // the mobile Back affordance. Unlike deleteConversation it deletes nothing; it
@@ -931,8 +1103,14 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     stickyTarget,
     setStickyTarget,
     battleWaitingBots,
+    replyingToSides,
+    replyToSides,
+    clearReplyingToSides,
     openWorkItems,
     refreshOpenWorkItems,
+    answeringTaskId,
+    answerItem,
+    clearAnswering,
   }), [
     conversations, activeConversation, messages, isLoadingMessages,
     isInitializing, isSending, isBotTyping, sendError, channelMembers,
@@ -941,8 +1119,14 @@ export function ConversationProvider({ children }: { children: ReactNode }) {
     deleteConversation, archiveConversation, leaveConversation, renameConversation, clearSendError,
     stickyTarget,
     battleWaitingBots,
+    replyingToSides,
+    replyToSides,
+    clearReplyingToSides,
     openWorkItems,
     refreshOpenWorkItems,
+    answeringTaskId,
+    answerItem,
+    clearAnswering,
   ]);
 
   return <ConversationContext.Provider value={value}>{children}</ConversationContext.Provider>;

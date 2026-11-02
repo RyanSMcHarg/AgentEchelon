@@ -39,6 +39,13 @@
   min-width: 0;
 }
 
+/* The analytics mode: plain, muted text, not a status badge. */
+.admin-header-mode {
+  font-size: var(--text-xs);
+  color: var(--text-tertiary);
+  white-space: nowrap;
+}
+
 .admin-header h2 {
   font-size: var(--text-lg);
   font-weight: 600;
@@ -49,30 +56,6 @@
 }
 
 /* Back button — ghost icon+label, matches main header icon buttons */
-.admin-back-btn {
-  display: inline-flex;
-  align-items: center;
-  gap: var(--space-2);
-  background: transparent;
-  border: 1px solid var(--surface-200);
-  border-radius: var(--radius-md);
-  padding: 6px var(--space-3);
-  font-size: var(--text-base);
-  font-family: var(--font-sans);
-  font-weight: 500;
-  color: var(--text-secondary);
-  cursor: pointer;
-  transition:
-    background var(--duration-fast) var(--ease-in-out),
-    border-color var(--duration-fast) var(--ease-in-out),
-    color var(--duration-fast) var(--ease-in-out);
-}
-
-.admin-back-btn:hover {
-  background: var(--surface-100);
-  border-color: var(--surface-300);
-  color: var(--text-primary);
-}
 
 /* (Aurora mode badge migrated to .status-badge .status-badge--live —
    the shared primitive in components.css. Back-compat .admin-mode-badge
@@ -198,11 +181,35 @@
   animation: fadeIn var(--duration-slow) var(--ease-out);
 }
 
+/* THE HEADING SCALE. A page title, then section, group and sub-group headings, each one step down in
+   size and all the same weight, so the order of a page is visible before a word of it is read. */
 .admin-tab h3 {
-  font-size: var(--text-lg);
+  font-size: var(--text-xl);
   font-weight: 600;
+  line-height: var(--leading-tight);
   color: var(--text-primary);
   letter-spacing: var(--tracking-tight);
+  margin: 0;
+}
+
+.admin-tab > h3,
+.admin-tab > .admin-tab-header h3 {
+  font-size: var(--text-2xl);
+}
+
+.admin-tab h4 {
+  font-size: var(--text-lg);
+  font-weight: 600;
+  line-height: var(--leading-tight);
+  color: var(--text-primary);
+  margin: 0;
+}
+
+.admin-tab h5 {
+  font-size: var(--text-md);
+  font-weight: 600;
+  line-height: var(--leading-tight);
+  color: var(--text-primary);
   margin: 0;
 }
 
@@ -224,27 +231,10 @@
   background: var(--error-bg);
   border: 1px solid var(--error-border);
   border-radius: var(--radius-md);
-  color: var(--error);
+  color: var(--danger-text);
   font-size: var(--text-base);
+  gap: var(--space-3);
   animation: fadeIn var(--duration-slow) var(--ease-out);
-}
-
-.admin-error button {
-  background: transparent;
-  border: 1px solid var(--error-border);
-  border-radius: var(--radius-sm);
-  padding: 4px var(--space-3);
-  font-size: var(--text-xs);
-  font-family: var(--font-sans);
-  font-weight: 500;
-  color: var(--error);
-  cursor: pointer;
-  transition: background var(--duration-fast) var(--ease-in-out);
-}
-
-.admin-error button:hover {
-  background: var(--error-border);
-  color: var(--text-inverse);
 }
 
 .admin-info-banner {
@@ -282,6 +272,18 @@
   gap: var(--space-3);
 }
 
+/* The dialog surface (the access-reason prompt, the experiment confirm). Opaque, so the page behind
+   the overlay does not read through the question; scrolls within a short phone viewport. */
+.admin-modal {
+  background: var(--surface-0);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-xl);
+  box-shadow: var(--shadow-xl);
+  padding: var(--space-5);
+  max-height: calc(100vh - var(--space-8));
+  overflow-y: auto;
+}
+
 .admin-tab-header,
 .admin-conversation-header,
 .admin-inline-actions {
@@ -303,7 +305,7 @@
     justify-content: flex-start;
     gap: var(--space-2);
   }
-  .admin-inline-actions .admin-inline-btn {
+  .admin-inline-actions :is(.btn-primary, .btn-secondary, .btn-danger) {
     flex: 1 1 auto;
     min-width: 44%;
     min-height: 40px;
@@ -324,18 +326,22 @@
   flex-wrap: wrap;
 }
 
-.admin-filter-btn,
-.admin-inline-btn {
+/* A FILTER OR TOGGLE CHIP: one of a set, pressed or not. Actions are the shared btn-* classes; a chip
+   is a choice among options, so it reads differently from an action and carries its state in
+   aria-pressed (or .active), never in an inline style. Same height as every other control. */
+.admin-filter-btn {
   display: inline-flex;
   align-items: center;
   justify-content: center;
   gap: var(--space-2);
-  border-radius: var(--radius-md);
-  border: 1px solid var(--surface-200);
+  min-height: calc(var(--control-height) - 0.25rem);
+  padding: var(--space-1) var(--space-3);
+  border-radius: var(--radius-full);
+  border: 1px solid var(--control-border);
   background: var(--surface-0);
-  color: var(--text-secondary);
+  color: var(--text-primary);
   font-family: var(--font-sans);
-  font-size: var(--text-base);
+  font-size: var(--text-sm);
   font-weight: 500;
   cursor: pointer;
   transition:
@@ -344,26 +350,33 @@
     color var(--duration-fast) var(--ease-in-out);
 }
 
-.admin-filter-btn {
-  padding: var(--space-2) var(--space-3);
-}
-
-.admin-inline-btn {
-  padding: 6px var(--space-3);
+.admin-filter-btn:hover:not(:disabled) {
+  border-color: var(--accent-500);
 }
 
 .admin-filter-btn.active,
-.admin-filter-btn:hover,
-.admin-inline-btn:hover {
-  border-color: var(--accent-400);
+.admin-filter-btn[aria-pressed="true"] {
+  border-color: var(--accent-500);
   background: var(--accent-50);
   color: var(--accent-700);
+  font-weight: 600;
 }
 
-.admin-inline-btn.danger:hover {
-  border-color: var(--error-border);
-  background: var(--error-bg);
-  color: var(--error);
+.admin-filter-btn:focus-visible {
+  outline: 2px solid var(--focus-ring);
+  outline-offset: 2px;
+}
+
+.admin-filter-btn:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+/* The caption before a group of chips. */
+.admin-filter-label {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  font-weight: 500;
 }
 
 /* Status filter for the Experiments list.
@@ -425,7 +438,7 @@
   background: var(--accent-500);
   color: var(--text-on-accent);
   font-family: var(--font-mono);
-  font-size: 10px;
+  font-size: var(--text-xs);
   font-weight: 700;
   letter-spacing: 0;
 }
@@ -456,7 +469,7 @@
   margin: 4px 0 0;
   color: var(--text-tertiary);
   font-family: var(--font-mono);
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   word-break: break-all;
 }
 
@@ -510,15 +523,54 @@
   transition: transform var(--duration-base) var(--ease-out);
 }
 
-.metric-card:hover {
+/* ── HOVER IS AN AFFORDANCE, SO ONLY AN INTERACTIVE CARD GETS ONE ─────────────────────────────────
+   This used to apply to EVERY metric card. A lift, a shadow and an amber accent stripe under the
+   pointer is the canonical "press me" treatment, and not one of the cards had a handler - so the
+   console invited a click on fourteen cards that ignored it, with the cursor still an arrow to make
+   it that bit more confusing. Reported as components that "appear clickable" and are not.
+
+   The same mistake was fixed for table rows earlier and recorded in DataTable.css; it survived here
+   because the two live in different stylesheets. Tying the treatment to `--interactive`, which only
+   `MetricCard` sets when it is given an `onDrill`, means the look and the behavior cannot drift apart
+   again without someone deleting the prop that produces both. */
+.metric-card--interactive {
+  cursor: pointer;
+  /* It is a <button> now, so the browser's own control styling has to be undone: a card is not a
+     chrome button, and it lays its own contents out. */
+  appearance: none;
+  background: inherit;
+  font: inherit;
+  color: inherit;
+  text-align: left;
+  width: 100%;
+}
+
+.metric-card--interactive:hover {
   border-color: var(--surface-300);
   box-shadow: var(--shadow-sm);
   transform: translateY(-1px);
 }
 
-.metric-card:hover::before {
+.metric-card--interactive:hover::before {
   transform: scaleY(1);
 }
+
+/* Keyboard parity: reaching the card by Tab has to look like reaching it by pointer, or the card is
+   pressable only for people using a mouse. */
+.metric-card--interactive:focus-visible {
+  outline: 2px solid var(--accent-500);
+  outline-offset: 2px;
+}
+
+.metric-card-drill-glyph {
+  margin-left: auto;
+  padding-left: var(--space-2);
+  color: var(--accent-600);
+  font-size: var(--text-xs);
+}
+
+/* The unconditional stripe-on-hover moved up into the --interactive block, for the reason recorded
+   there: it is half of the "press me" treatment, and a card with no handler must not wear it. */
 
 .metric-card-title {
   font-family: var(--font-mono);
@@ -540,7 +592,7 @@
 }
 
 .metric-card-subtitle {
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   color: var(--text-tertiary);
   letter-spacing: var(--tracking-wide);
 }
@@ -657,22 +709,20 @@
   padding: 3px var(--space-2);
 }
 
-.strategy-chip-basic,
-.strategy-pill-basic {
-  background: var(--tier-basic-bg);
-  color: var(--tier-basic);
+/* A cost, latency or fit grade: low, middle or high. Not a classification, so not its palette. */
+.strategy-chip-low {
+  background: var(--surface-100);
+  color: var(--text-secondary);
 }
 
-.strategy-chip-standard,
-.strategy-pill-standard {
-  background: var(--tier-standard-bg);
-  color: var(--tier-standard);
+.strategy-chip-mid {
+  background: var(--info-bg);
+  color: var(--info);
 }
 
-.strategy-chip-premium,
-.strategy-pill-premium {
-  background: var(--tier-premium-bg);
-  color: var(--tier-premium);
+.strategy-chip-high {
+  background: var(--accent-50, var(--surface-100));
+  color: var(--accent-600, var(--text-primary));
 }
 
 .strategy-pill-neutral {
@@ -792,7 +842,7 @@
 }
 .distribution-bar-marker-unit {
   margin-left: 2px;
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   color: var(--text-tertiary);
 }
 .distribution-bar-marker--primary .distribution-bar-marker-label {
@@ -861,19 +911,20 @@
 }
 
 /* Each field is a label (text + control) or a wrapping div (Tiers). The
-   container carries the small uppercase field-label look; the control resets
-   to normal body text below. */
+   container carries the field-label look (14px, semibold, sentence case: an
+   uppercase 11px caption was the hardest text on the page to read); the control
+   resets to body text below. */
 .admin-form-grid > label,
 .admin-form-grid > div {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   min-width: 0;
-  font-size: var(--text-xs);
+  font-size: var(--text-sm);
   font-weight: 600;
-  letter-spacing: var(--tracking-wide);
-  text-transform: uppercase;
-  color: var(--text-secondary);
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-primary);
 }
 
 /* Description spans the full width for breathing room. */
@@ -881,8 +932,13 @@
   grid-column: 1 / -1;
 }
 
-.admin-form-grid input[type="text"],
-.admin-form-grid input:not([type]),
+/* EVERY TEXTUAL CONTROL, not a list of the types somebody happened to use. The selector used to name
+   input[type="text"] and input:not([type]), which silently missed type="number" and type="checkbox":
+   a number field fell through to the raw browser default, a white box on a dark theme, sitting beside
+   siblings that were themed correctly. A field is styled here because it is a field, so adding one of
+   a new type does not require remembering to come back and widen a selector. The types that carry
+   their own appearance - checkbox, radio, range, file - are excluded and handled below. */
+.admin-form-grid input:not([type="checkbox"]):not([type="radio"]):not([type="range"]):not([type="file"]),
 .admin-form-grid select,
 .admin-form-grid textarea {
   font-family: var(--font-sans);
@@ -891,10 +947,11 @@
   letter-spacing: normal;
   text-transform: none;
   color: var(--text-primary);
-  background: var(--surface-0);
-  border: 1px solid var(--surface-200);
+  background-color: var(--surface-0);
+  border: 1px solid var(--control-border);
   border-radius: var(--radius-md);
   padding: var(--space-2) var(--space-3);
+  min-height: var(--control-height);
   width: 100%;
   transition:
     border-color var(--duration-fast) var(--ease-in-out),
@@ -928,6 +985,69 @@
   letter-spacing: var(--tracking-wide);
   text-transform: none;
   color: var(--accent-700);
+}
+
+/* A CHECKBOX IS A CONTROL AND IS NOT INHERITED INTO. It carries its own appearance, so it is excluded
+   from the field rule above; without this it kept the browser's default blue on a dark amber theme. */
+.admin-form-grid input[type="checkbox"] {
+  accent-color: var(--accent-500);
+  width: auto;
+  flex: none;
+  margin: 0;
+}
+
+/* ── UPPERCASE IS A LABEL TREATMENT, NOT A CONTENT ONE ────────────────────────────────────────────
+   The container rule above sets text-transform on the whole field so its caption reads as a caption,
+   and every DIRECT child control resets it. Anything nested deeper inherited it, which was fine until
+   a field's body held literal code: tool names and intent identifiers are snake_case strings a person
+   has to type somewhere else, and they rendered as LOAD_COMPANY_CONTEXT. That is not a style choice,
+   it is the console showing a different string from the one the system uses. Content elements opt
+   back out here rather than each call site fighting the cascade inline. */
+.admin-form-grid code,
+.admin-form-grid td,
+.admin-form-grid th,
+.admin-form-grid p {
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+.admin-form-grid code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: 400;
+  color: var(--text-primary);
+}
+
+/* A hint or counter under a field: secondary, small, and NOT swept up by the mono/amber rule above,
+   which was written for the traffic-split percentage readout. Replaces inline `fontSize: '0.8em'`,
+   which compounded against the field label's own 11px and rendered at about 9px. */
+.admin-field-hint {
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  font-weight: 400;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-secondary);
+}
+
+.admin-form-grid > label > span.admin-field-hint {
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  font-weight: 400;
+  color: var(--text-secondary);
+}
+
+/* The persona is prose the operator writes and reads back, often hundreds of words. Monospace because
+   it is a system prompt whose whitespace matters; resizable because only the person typing knows how
+   much of it they need to see. Size comes from .input, never from here. */
+.profiles-persona-input {
+  font-family: var(--font-mono);
+  resize: vertical;
+}
+
+/* A draft-editor field that spans the grid: the persona, the per-intent table, the tools, the actions. */
+.admin-form-grid > .profiles-persona-field {
+  grid-column: 1 / -1;
 }
 
 .experiment-battle-toggle {
@@ -1087,16 +1207,16 @@
   background: linear-gradient(180deg, var(--accent-300), transparent);
 }
 
-.experiment-battle-slot {
+.experiment-battle-challenger {
   display: flex;
   flex-direction: column;
   gap: var(--space-2);
   position: relative;
 }
-.experiment-battle-slot .select {
+.experiment-battle-challenger .select {
   max-width: 200px;
 }
-.experiment-battle-slot-help {
+.experiment-battle-challenger-help {
   margin: 0;
   font-size: var(--text-sm);
   color: var(--text-tertiary);
@@ -1197,7 +1317,7 @@
 }
 
 .admin-tab-tier-chip-label {
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-weight: 600;
   letter-spacing: 0.06em;
   text-transform: uppercase;
@@ -1207,15 +1327,13 @@
 .admin-tab-tier-chip-value {
   font-family: var(--font-mono, ui-monospace, monospace);
   font-variant-numeric: tabular-nums;
-  font-size: 16px;
+  font-size: var(--text-md);
   font-weight: 600;
   color: var(--text-primary, var(--zinc-900, #18181b));
 }
 
-/* Tier-tinted left border — keeps the existing tier-colour language. */
-.admin-tab-tier-chip--premium { box-shadow: inset 3px 0 0 0 var(--tier-premium, var(--accent-600, #7c3aed)); }
-.admin-tab-tier-chip--standard { box-shadow: inset 3px 0 0 0 var(--tier-standard, var(--accent-400, #8b5cf6)); }
-.admin-tab-tier-chip--basic { box-shadow: inset 3px 0 0 0 var(--tier-basic, var(--zinc-400, #a1a1aa)); }
+/* The classification's badge color as a left border (`classificationBadgeStyle` sets `--cls-fg`). */
+.admin-tab-tier-chip { box-shadow: inset 3px 0 0 0 var(--cls-fg, var(--surface-300)); }
 
 /* Page-load (web-vitals) stack on the Latency tab. */
 .admin-pageload-stack {
@@ -1242,14 +1360,14 @@
 }
 
 .admin-pageload-row-label {
-  font-size: 14px;
+  font-size: var(--text-sm);
   font-weight: 600;
   color: var(--text-primary, var(--zinc-900, #18181b));
 }
 
 .admin-pageload-row-sub {
   font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 11px;
+  font-size: var(--text-sm);
   color: var(--text-tertiary, var(--zinc-500, #71717a));
   margin-top: 2px;
 }
@@ -1261,7 +1379,7 @@
 
 .admin-pageload-threshold {
   font-family: var(--font-mono, ui-monospace, monospace);
-  font-size: 10px;
+  font-size: var(--text-sm);
   font-weight: 600;
   letter-spacing: 0.04em;
   padding: 2px 6px;
@@ -1285,7 +1403,7 @@
   border: 1px dashed var(--border-subtle, var(--zinc-300, #d4d4d8));
   border-radius: 10px;
   color: var(--text-muted, var(--zinc-500, #71717a));
-  font-size: 13px;
+  font-size: var(--text-sm);
   text-align: center;
 }
 
@@ -1296,12 +1414,12 @@
   gap: var(--space-2, 8px);
   margin-top: var(--space-3, 12px);
 }
-.admin-add-member-row .input { flex: 1; font-family: var(--font-mono, monospace); font-size: 12px; }
+.admin-add-member-row .input { flex: 1; font-family: var(--font-mono, monospace); font-size: var(--text-md); }
 
 .admin-mono-id,
 .admin-mono-arn {
   font-family: var(--font-mono, monospace);
-  font-size: 11px;
+  font-size: var(--text-sm);
   color: var(--text-muted, var(--zinc-500, #71717a));
   word-break: break-all;
 }
@@ -1344,14 +1462,14 @@
 .admin-drawer-content {
   white-space: pre-wrap;
   word-break: break-word;
-  font-size: 13px;
+  font-size: var(--text-sm);
   line-height: 1.5;
   background: var(--surface-50, #fafafa);
   border: 1px solid var(--border-subtle, var(--zinc-200, #e4e4e7));
   border-radius: 8px;
   padding: var(--space-3, 12px);
 }
-.admin-kv-table { width: 100%; border-collapse: collapse; font-family: var(--font-mono, monospace); font-size: 11px; }
+.admin-kv-table { width: 100%; border-collapse: collapse; font-family: var(--font-mono, monospace); font-size: var(--text-sm); }
 .admin-kv-table td { padding: 3px 6px; border-bottom: 1px solid var(--border-subtle, var(--zinc-100, #f4f4f5)); vertical-align: top; }
 .admin-kv-key { color: var(--text-muted, var(--zinc-500, #71717a)); white-space: nowrap; }
 .admin-kv-val { word-break: break-all; }
@@ -1360,7 +1478,7 @@
   max-height: 280px;
   overflow: auto;
   font-family: var(--font-mono, monospace);
-  font-size: 11px;
+  font-size: var(--text-sm);
   line-height: 1.45;
   background: var(--chrome-bg, #0a0a0b);
   color: #e4e4e7;
@@ -1383,9 +1501,9 @@
 .admin-timeline-dot--join { background: var(--status-good, #16a34a); }
 .admin-timeline-dot--leave { background: var(--status-bad, #dc2626); }
 .admin-timeline-dot--mod { background: var(--accent-500, #e5a00d); }
-.admin-timeline-body { display: flex; flex-direction: column; gap: 2px; font-size: 13px; }
+.admin-timeline-body { display: flex; flex-direction: column; gap: 2px; font-size: var(--text-sm); }
 .admin-timeline-action { color: var(--text-muted, var(--zinc-500, #71717a)); }
-.admin-timeline-meta { color: var(--text-muted, var(--zinc-500, #71717a)); font-size: 12px; }
+.admin-timeline-meta { color: var(--text-muted, var(--zinc-500, #71717a)); font-size: var(--text-sm); }
 
 /* ── Two-level admin navigation: section rail + sub-tabs ── */
 .admin-section-rail {
@@ -1407,7 +1525,7 @@
   background: transparent;
   border-radius: 7px;
   font: inherit;
-  font-size: 13px;
+  font-size: var(--text-sm);
   font-weight: 600;
   color: var(--text-muted, var(--zinc-500, #71717a));
   cursor: pointer;
@@ -1442,7 +1560,7 @@
   border-bottom: 2px solid transparent;
   margin-bottom: -1px;
   font: inherit;
-  font-size: 13px;
+  font-size: var(--text-sm);
   color: var(--text-muted, var(--zinc-500, #71717a));
   cursor: pointer;
   transition: color 120ms ease, border-color 120ms ease;
@@ -1458,7 +1576,7 @@
 .metric-card-target {
   margin-top: 6px;
   font-family: var(--font-mono, monospace);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-muted, var(--zinc-500, #71717a));
   letter-spacing: 0.01em;
 }
@@ -1469,12 +1587,12 @@
 }
 .linechart-axis-label {
   font-family: var(--font-mono, monospace);
-  font-size: 10px;
+  font-size: var(--text-xs);
   fill: var(--text-muted, var(--zinc-500, #71717a));
 }
 .linechart-ref-label {
   font-family: var(--font-mono, monospace);
-  font-size: 10px;
+  font-size: var(--text-xs);
   font-weight: 600;
 }
 
@@ -1490,7 +1608,7 @@
   display: inline-flex;
   align-items: center;
   gap: var(--space-2, 8px);
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-secondary, var(--zinc-600, #52525b));
   cursor: pointer;
   user-select: none;
@@ -1516,14 +1634,14 @@
 .exp-compare-title { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
 .exp-compare-id {
   font-family: var(--font-mono, monospace);
-  font-size: 13px;
+  font-size: var(--text-sm);
   font-weight: 600;
   color: var(--text-primary, var(--zinc-900, #18181b));
   letter-spacing: var(--tracking-tight, -0.01em);
 }
 .exp-compare-meta {
   font-family: var(--font-mono, monospace);
-  font-size: 11px;
+  font-size: var(--text-xs);
   color: var(--text-muted, var(--zinc-500, #71717a));
   text-transform: uppercase;
   letter-spacing: 0.04em;
@@ -1534,7 +1652,7 @@
   border-radius: var(--radius-md, 8px);
   background: color-mix(in srgb, var(--accent-500, #e5a00d) 10%, transparent);
   border: 1px solid var(--accent-200, #f1d49a);
-  font-size: 12px;
+  font-size: var(--text-sm);
   color: var(--text-secondary, var(--zinc-700, #3f3f46));
 }
 
@@ -1550,7 +1668,7 @@
   border-radius: var(--radius-md, 8px);
   border: 1px solid var(--surface-200, var(--zinc-200, #e4e4e7));
   background: var(--surface-100, var(--zinc-50, #fafafa));
-  font-size: 12px;
+  font-size: var(--text-sm);
 }
 .exp-objective[data-status='met'] {
   border-color: color-mix(in srgb, var(--success-500, #16a34a) 35%, transparent);
@@ -1563,7 +1681,7 @@
 .exp-objective-label { font-weight: 600; color: var(--text-primary, var(--zinc-900, #18181b)); }
 .exp-objective-current { font-family: var(--font-mono, monospace); color: var(--text-secondary, var(--zinc-700, #3f3f46)); }
 .exp-objective-badge {
-  font-size: 10px;
+  font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: 0.06em;
   padding: 1px 6px;
@@ -1575,7 +1693,7 @@
 .exp-objective[data-status='not_met'] .exp-objective-badge { background: color-mix(in srgb, var(--accent-500, #e5a00d) 22%, transparent); }
 .exp-objective-tag {
   margin-left: auto;
-  font-size: 10px;
+  font-size: var(--text-sm);
   font-style: italic;
   color: var(--text-muted, var(--zinc-500, #71717a));
 }
@@ -1595,19 +1713,19 @@
 .exp-variant-head { display: flex; flex-direction: column; gap: 3px; text-align: center; }
 .exp-variant-side {
   font-family: var(--font-mono, monospace);
-  font-size: 10px;
+  font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: 0.08em;
   color: var(--text-muted, var(--zinc-500, #71717a));
 }
 .exp-variant-model {
-  font-size: 14px;
+  font-size: var(--text-sm);
   font-weight: 600;
   color: var(--text-primary, var(--zinc-900, #18181b));
 }
 .exp-vs {
   font-family: var(--font-mono, monospace);
-  font-size: 12px;
+  font-size: var(--text-xs);
   font-weight: 700;
   color: var(--accent-500, #e5a00d);
   letter-spacing: 0.1em;
@@ -1618,7 +1736,7 @@
 .exp-metric-row--sample { border-bottom: none; opacity: 0.7; }
 .exp-metric-label {
   font-family: var(--font-mono, monospace);
-  font-size: 11px;
+  font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: 0.04em;
   color: var(--text-muted, var(--zinc-500, #71717a));
@@ -1631,10 +1749,10 @@
   gap: 6px;
   justify-content: center;
   font-variant-numeric: tabular-nums;
-  font-size: 15px;
+  font-size: var(--text-md);
   color: var(--text-secondary, var(--zinc-700, #3f3f46));
 }
-.exp-metric-row--headline .exp-metric-val { font-size: 22px; font-weight: 600; }
+.exp-metric-row--headline .exp-metric-val { font-size: var(--text-xl); font-weight: 600; }
 .exp-metric-val:first-child { justify-content: flex-end; }
 .exp-metric-val:last-child { justify-content: flex-start; }
 .exp-metric-val.is-winner {
@@ -1647,7 +1765,7 @@
   color: var(--accent-500, #e5a00d);
   transform: translateY(-2px);
 }
-.exp-hint { font-size: 10px; font-style: normal; color: var(--text-muted, var(--zinc-400, #a1a1aa)); }
+.exp-hint { font-size: var(--text-sm); font-style: normal; color: var(--text-muted, var(--zinc-400, #a1a1aa)); }
 
 /* Recommendation card */
 .exp-reco {
@@ -1669,7 +1787,7 @@
   margin-bottom: 8px;
 }
 .exp-reco-badge {
-  font-size: 12px;
+  font-size: var(--text-xs);
   font-weight: 700;
   letter-spacing: 0.01em;
   color: var(--text-primary, var(--zinc-900, #18181b));
@@ -1677,71 +1795,27 @@
 .exp-reco[data-tone="win"]  .exp-reco-badge { color: #15803d; }
 .exp-reco-confidence {
   font-family: var(--font-mono, monospace);
-  font-size: 10px;
+  font-size: var(--text-xs);
   text-transform: uppercase;
   letter-spacing: 0.06em;
   color: var(--text-muted, var(--zinc-500, #71717a));
 }
 .exp-reco-tag {
   margin-left: auto;
-  font-size: 10px;
+  font-size: var(--text-sm);
   color: var(--text-muted, var(--zinc-400, #a1a1aa));
 }
 .exp-reco-rationale {
   margin: 0;
-  font-size: 13px;
+  font-size: var(--text-sm);
   line-height: 1.55;
   color: var(--text-secondary, var(--zinc-700, #3f3f46));
 }
 
-/* Battle-scoped effectiveness (SPEC-BATTLE): a per-variant scorecard from /battle turns only,
-   visually distinct from the 1fr-auto-1fr A/B comparison above (a plain table, amber-accented). */
-.exp-battle {
-  margin-top: var(--space-4, 16px);
-  padding-top: var(--space-4, 16px);
-  border-top: 1px dashed var(--surface-200, var(--zinc-200, #e4e4e7));
-}
-.exp-battle-head {
-  display: flex;
-  align-items: center;
-  gap: var(--space-3, 12px);
-  flex-wrap: wrap;
-  margin-bottom: var(--space-3, 12px);
-}
-.exp-battle-sub {
-  font-size: 11px;
-  font-style: italic;
-  color: var(--text-muted, var(--zinc-500, #71717a));
-}
-.exp-battle-table-wrap { overflow-x: auto; }
-.exp-battle-table {
-  width: 100%;
-  border-collapse: collapse;
-  font-size: 13px;
-}
-.exp-battle-table th,
-.exp-battle-table td {
-  padding: 8px 12px;
-  text-align: left;
-  border-bottom: 1px solid var(--surface-100, var(--zinc-100, #f4f4f5));
-  white-space: nowrap;
-}
-.exp-battle-table th {
-  font-family: var(--font-mono, monospace);
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  color: var(--text-muted, var(--zinc-500, #71717a));
-  font-weight: 600;
-}
-.exp-battle-table td.num,
-.exp-battle-table th.num { text-align: right; font-variant-numeric: tabular-nums; }
-.exp-battle-variant-name { font-weight: 600; color: var(--text-primary, var(--zinc-900, #18181b)); }
-.exp-battle-variant-id {
-  font-family: var(--font-mono, monospace);
-  font-size: 11px;
-  color: var(--text-muted, var(--zinc-500, #71717a));
-}
+/* An experiment's page: its title, the list's name link, and the Battles section's summary. */
+.experiment-page-title { display: flex; align-items: center; gap: var(--space-2, 8px); margin: 0 0 var(--space-3, 12px); }
+.experiment-name-link { font-weight: 600; text-align: left; }
+.battle-summary { margin: 0 0 var(--space-3, 12px); font-size: var(--text-md); }
 
 /* ── Classification shadow gate (DESIGN-EXPERIMENTS-BATTLE §5) ───────────────────────────────── */
 .cgate { margin-top: var(--space-5, 20px); }
@@ -1754,7 +1828,7 @@
 .cgate-start input { min-width: 8rem; flex: 1 1 8rem; }
 .cgate-runs { list-style: none; padding: 0; margin: 0 0 var(--space-3, 12px); }
 .cgate-runs li { display: flex; gap: var(--space-2, 8px); align-items: baseline; flex-wrap: wrap; }
-.cgate-run-meta { font-size: 11px; color: var(--text-muted, var(--zinc-500, #71717a)); }
+.cgate-run-meta { font-size: var(--text-sm); color: var(--text-muted, var(--zinc-500, #71717a)); }
 .cgate-detail {
   border-top: 1px dashed var(--surface-200, var(--zinc-200, #e4e4e7));
   padding-top: var(--space-3, 12px);
@@ -1763,7 +1837,7 @@
 .cgate-incomplete {
   padding: 8px 12px;
   border-radius: 6px;
-  font-size: 12px;
+  font-size: var(--text-sm);
   margin-bottom: var(--space-2, 8px);
   border: 1px solid color-mix(in srgb, var(--status-warn, #b26a00) 50%, transparent);
   background: color-mix(in srgb, var(--status-warn, #b26a00) 10%, transparent);
@@ -1782,14 +1856,14 @@
 .cgate-verdict-label { font-weight: 600; }
 .cgate-verdict-margin,
 .cgate-verdict-detail {
-  font-size: 11px;
+  font-size: var(--text-sm);
   font-family: var(--font-mono, monospace);
   color: var(--text-muted, var(--zinc-500, #71717a));
 }
 .cgate-rationale,
 .cgate-corpus,
 .cgate-sizing {
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.5;
   max-width: 78ch;
   margin: var(--space-2, 8px) 0 0;
@@ -1799,11 +1873,11 @@
   display: flex;
   flex-wrap: wrap;
   gap: var(--space-3, 12px);
-  font-size: 12px;
+  font-size: var(--text-sm);
   margin-top: var(--space-2, 8px);
 }
-.cgate-queue-title { margin: var(--space-4, 16px) 0 4px; font-size: 13px; }
-.cgate-queue { width: 100%; border-collapse: collapse; font-size: 13px; }
+.cgate-queue-title { margin: var(--space-4, 16px) 0 4px; font-size: var(--text-sm); }
+.cgate-queue { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
 .cgate-queue th,
 .cgate-queue td {
   padding: 8px 12px;
@@ -1818,7 +1892,7 @@
    explains — a single control next to the verdict would be wrong for at least two of the axes. */
 .exp-drill-btn {
   display: block;
-  font-size: 11px;
+  font-size: var(--text-sm);
   margin-top: 2px;
   white-space: nowrap;
 }
@@ -1834,17 +1908,17 @@
   gap: var(--space-3, 12px);
   flex-wrap: wrap;
 }
-.exp-drill-title { margin: 0 0 4px; font-size: 14px; }
+.exp-drill-title { margin: 0 0 4px; font-size: var(--text-sm); }
 .exp-drill-variant {
   font-family: var(--font-mono, monospace);
-  font-size: 12px;
+  font-size: var(--text-xs);
   color: var(--text-muted, var(--zinc-500, #71717a));
 }
 /* The population statement. Never collapsed to a tooltip: which set is on screen is the difference
    between evidence and a plausible-looking list. */
 .exp-drill-population {
   margin: 0 0 var(--space-3, 12px);
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.5;
   max-width: 78ch;
   color: var(--text-muted, var(--zinc-500, #71717a));
@@ -1856,7 +1930,7 @@
   gap: var(--space-2, 8px);
   padding: 8px 12px;
   border-radius: 6px;
-  font-size: 12px;
+  font-size: var(--text-sm);
   border: 1px solid var(--surface-200, var(--zinc-200, #e4e4e7));
 }
 .exp-drill-recon[data-status='ok'] {
@@ -1870,7 +1944,7 @@
 .exp-drill-recon-verdict { font-weight: 600; }
 .exp-drill-recon-line {
   font-family: var(--font-mono, monospace);
-  font-size: 11px;
+  font-size: var(--text-sm);
 }
 .exp-drill-recon-line[data-agrees='false'] { color: var(--status-bad, #c62828); font-weight: 600; }
 .exp-drill-recon-note {
@@ -1880,7 +1954,7 @@
 }
 .exp-drill-note {
   margin: var(--space-2, 8px) 0 0;
-  font-size: 12px;
+  font-size: var(--text-sm);
   line-height: 1.5;
   max-width: 78ch;
   color: var(--text-muted, var(--zinc-500, #71717a));
@@ -1889,7 +1963,7 @@
 /* A withheld transcript is LABELLED, not blank: the row still counted, and the operator needs to
    know the content was retracted rather than missing. */
 .exp-drill-withheld {
-  font-size: 11px;
+  font-size: var(--text-xs);
   font-family: var(--font-mono, monospace);
   color: var(--status-warn, #b26a00);
   text-transform: uppercase;
@@ -1901,25 +1975,16 @@
 @media (max-width: 640px) {
   .exp-variant-row,
   .exp-metric-row { gap: var(--space-2, 8px); }
-  .exp-metric-row--headline .exp-metric-val { font-size: 18px; }
+  .exp-metric-row--headline .exp-metric-val { font-size: var(--text-lg); }
   .exp-reco-tag { margin-left: 0; flex-basis: 100%; }
   .exp-drill-recon { flex-direction: column; align-items: flex-start; }
 }
 
 /* Effectiveness drill (SPEC-ADMIN-CONSOLE-EFFECTIVENESS): inline-link buttons + breadcrumb. */
-.admin-link-btn {
-  background: none;
-  border: none;
-  padding: 0;
-  color: var(--accent, #2f6fed);
-  cursor: pointer;
-  font: inherit;
-  text-align: left;
-}
-.admin-link-btn:hover { text-decoration: underline; }
+
 .admin-breadcrumb {
-  font-size: 13px;
-  color: var(--status-neutral, #8a8a8a);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
   display: flex;
   align-items: center;
   gap: 2px;
@@ -1930,15 +1995,51 @@
 .admin-muted {
   color: var(--text-secondary);
 }
+/* ── THE READ-ONLY CONFIGURATION PANEL SETS ITS OWN SIZE ──────────────────────────────────────────
+   This is the view an operator lands on when they open an assistant, and it had no font-size of its
+   own - it took whatever it inherited, and the values inside it were written as relative `em`, which
+   compounds against whatever that turns out to be. Reported as "small text and not properly styled".
+
+   --text-md, the same size the form controls use, because this panel and the draft editor show THE
+   SAME FIELDS: one is what the assistant is, the other is what it will become. Reading one at 11px
+   and the other at 14px makes them look like different kinds of thing. */
+.admin-config-list {
+  font-size: var(--text-md);
+  line-height: var(--leading-normal);
+  display: grid;
+  grid-template-columns: minmax(9rem, 14rem) minmax(0, 1fr);
+  gap: var(--space-3) var(--space-6);
+  margin: 0;
+}
 .admin-config-list dt {
   color: var(--text-secondary);
-  font-weight: 500;
+  font-size: var(--text-sm);
+  font-weight: 600;
+  padding-top: 0.125rem;
+}
+@media (max-width: 640px) {
+  .admin-config-list {
+    grid-template-columns: minmax(0, 1fr);
+    gap: var(--space-1);
+  }
+  .admin-config-list dd {
+    margin-bottom: var(--space-3);
+  }
 }
 .admin-config-list dd {
   margin: 0;
+  color: var(--text-primary);
+  min-width: 0;
+  word-break: break-word;
+}
+/* Values are identifiers - model keys, ARNs, role names - so they read as code rather than prose. */
+.admin-config-list dd code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
 }
 .admin-config-list a {
-  color: var(--accent-600, #2563eb);
+  color: var(--link-color);
   text-decoration: none;
 }
 .admin-config-list a:hover {
@@ -1950,5 +2051,1251 @@
   border-radius: var(--radius-sm);
   border: 1px solid var(--surface-200);
   background: var(--surface-50, var(--surface-0));
-  font-size: 0.85em;
+  /* A TOKEN, NOT `0.85em`. A relative size compounds against whichever container the chip lands in,
+     so the same chip rendered at three different sizes across the console - and inside a field label,
+     which is deliberately 11px, it came out at about 9px. */
+  font-size: var(--text-sm);
+}
+
+/* The per-intent routing table header. Was an inline 0.85em inside .admin-form-grid, which compounded
+   against the field label's own 11px and rendered at about 9px. */
+.profiles-intent-head {
+  text-align: left;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  letter-spacing: var(--tracking-wide);
+}
+
+/* The read-only persona readout. Monospace and wrapped, matching the editor it mirrors, and capped so
+   a long system prompt does not push the rest of the panel off the screen. */
+.profiles-persona-readout {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+  max-height: 20em;
+  overflow-y: auto;
+}
+
+/* ── TWO FORMS WHOSE CLASSES NAMED NOTHING ────────────────────────────────────────────────────────
+   `.turn-latency-audit-form` and `.admin-review-actions` were referenced in the markup and defined in
+   no stylesheet in the repo, so both rendered as raw browser defaults on the dark theme. Their
+   controls now carry the shared .input primitives, which fixes the fields; these rules give the
+   containers the layout the markup was written expecting. */
+
+.turn-latency-audit-form {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-end;
+  gap: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-4);
+}
+
+/* The ARN is long and the whole point of the field is seeing enough of it to check it, so it takes
+   the slack rather than sitting at a default width beside a button. */
+.turn-latency-audit-form .input {
+  flex: 1 1 24rem;
+  min-width: 0;
+}
+
+/* The label sits above its own field rather than inline, so the row still reads as a labelled field
+   once the layout wraps on a narrow window. */
+.turn-latency-audit-form .label {
+  flex: 0 0 100%;
+  margin-bottom: calc(var(--space-2) * -1 + 2px);
+}
+
+.admin-review-actions {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-3);
+}
+
+/* Review notes are prose a moderator types, so the box is tall enough to write in and growable, and
+   never shrinks below something you can read back. */
+.admin-review-actions .textarea {
+  min-height: 5em;
+  resize: vertical;
+}
+
+/* ── THREE CLASSES THAT WERE IN THE MARKUP AND IN NO STYLESHEET ───────────────────────────────────
+   `.admin-metrics-row`, `.admin-metric-drill` and `.admin-latency-legend` are used across the
+   Performance tabs and were defined nowhere in the repo, so each rendered as whatever its parent
+   happened to do. The metric rows in particular were laid out by inheritance rather than as a grid,
+   which is why fourteen cards read as an undifferentiated block. */
+
+.admin-metrics-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: var(--space-4);
+  margin-bottom: var(--space-5);
+  align-items: stretch;
+}
+
+/* A breakdown opened from a card. Indented and rule-marked on the accent so it reads as belonging to
+   the card above rather than as the next section down the page. */
+.admin-metric-drill {
+  margin: calc(var(--space-3) * -1) 0 var(--space-5);
+  padding: var(--space-4);
+  border: 1px solid var(--surface-200);
+  border-left: 3px solid var(--accent-500);
+  border-radius: var(--radius-md);
+  background: var(--surface-50, var(--surface-0));
+}
+
+.admin-metric-drill > h4,
+.admin-metric-drill > h5 {
+  margin: 0 0 var(--space-2);
+}
+
+.admin-latency-legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2) var(--space-4);
+  margin-bottom: var(--space-3);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+
+/* ── THREE MORE OF THE SAME, MISSED BY THAT SWEEP ─────────────────────────────────────────────────
+   `.admin-metric-card`, `.admin-metric-value` and `.admin-metric-label` are the hand-rolled siblings
+   of the `MetricCard` component's classes, used in `ConversationsTab`, `EffectivenessTab` and
+   `GroundTruthTab`. They matched no rule anywhere and appeared zero times in the built bundle, so
+   those cards rendered as bare text - including the Ground Truth agreement rate and its error, which
+   are the numbers a judge's trustworthiness is read off.
+
+   Styled to match `.metric-card` / `-title` / `-value` rather than given a look of their own, because
+   they sit beside real MetricCards on the same screens and the goal is that a reader cannot tell which
+   is which. The proper fix is to delete these three and use the component; this makes the surfaces
+   correct now without a refactor that touches three tabs. */
+
+.admin-metric-card {
+  background: var(--surface-0);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-lg);
+  padding: var(--space-5);
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+
+.admin-metric-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  color: var(--text-tertiary);
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wider);
+}
+
+.admin-metric-value {
+  font-size: var(--text-3xl);
+  font-weight: 700;
+  color: var(--text-primary);
+  letter-spacing: var(--tracking-tight);
+  /* Tabular figures, so a rate that changes between polls does not shift the layout under the reader. */
+  font-feature-settings: 'tnum';
+  line-height: 1;
+  margin-top: var(--space-1);
+}
+
+/* ── THE TTFF CONTRIBUTION BARS ───────────────────────────────────────────────────────────────────
+   A row per component, sized by its share of the router leg. Bars rather than a table because the
+   question the tab is asked is "which of these is the big one", and a proportion answers that faster
+   than four numbers do. The numbers stay beside each bar, because the proportion alone cannot be
+   compared against a target. */
+.ttff-waterfall {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: var(--space-3) 0;
+}
+
+.ttff-waterfall-row {
+  display: grid;
+  grid-template-columns: minmax(9rem, 14rem) 1fr minmax(7rem, auto);
+  gap: var(--space-3);
+  align-items: center;
+}
+
+.ttff-waterfall-label {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  min-width: 0;
+}
+
+.ttff-waterfall-track {
+  position: relative;
+  height: 0.75rem;
+  border-radius: var(--radius-sm);
+  background: var(--surface-100);
+  overflow: hidden;
+}
+
+.ttff-waterfall-fill {
+  position: absolute;
+  inset: 0 auto 0 0;
+  border-radius: var(--radius-sm);
+  background: var(--accent-500);
+}
+
+/* The unmeasured remainder is drawn differently on purpose: it is a bound, not a measurement, and a
+   solid bar beside three solid bars would claim otherwise. */
+.ttff-waterfall-row--estimated .ttff-waterfall-fill {
+  background: repeating-linear-gradient(
+    45deg,
+    var(--surface-300) 0,
+    var(--surface-300) 4px,
+    var(--surface-200) 4px,
+    var(--surface-200) 8px
+  );
+}
+
+.ttff-waterfall-value {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  color: var(--text-primary);
+  text-align: right;
+  white-space: nowrap;
+}
+
+.ttff-waterfall-note {
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  margin: var(--space-2) 0 0;
+}
+
+/* ── ANOTHER CLASS THAT NAMED NOTHING ─────────────────────────────────────────────────────────────
+   `.admin-panel` is used by Queue Health and was defined in no stylesheet, so the panel rendered into
+   unstyled markup - no card, no spacing, its heading colliding with the table under it. Reported as
+   the tab being empty, which is what an unstyled panel with a dash in most of its value column looks
+   like. Same family of defect as `.admin-metrics-row` and `.admin-metric-drill`. */
+.admin-panel {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  background: var(--surface-50, var(--surface-0));
+}
+
+.admin-panel > h3 {
+  margin: 0;
+  font-size: var(--text-lg);
+  color: var(--text-primary);
+}
+
+/* Text a screen reader announces and the screen does not show: a column header for a column of buttons. */
+.visually-hidden {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}
+
+/* The de-identified conversation (CleanConversationView): one timeline of messages and membership
+   changes. A removed message keeps its place, muted, so its answer still has a question. */
+.admin-clean-timeline {
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.admin-clean-message {
+  overflow-wrap: anywhere;
+}
+.admin-clean-membership {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+.admin-clean-removed {
+  color: var(--text-secondary);
+}
+
+/* The operator's reach on the Access log tab (FR0e): capability keys as wrapped identifiers. */
+.admin-reach {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  margin-bottom: var(--space-4);
+}
+.admin-reach h4,
+.admin-reach h5 {
+  margin: 0;
+}
+.admin-reach-list {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  list-style: none;
+  margin: var(--space-2) 0 0;
+  padding: 0;
+}
+.admin-reach-list code {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  background: var(--surface-100);
+  border-radius: var(--radius-sm);
+  padding: 0 var(--space-1);
+}
+
+/* ── ASSISTANTS: ONE LIST, ONE CREATE FLOW, ONE CONFIGURATION ──────────────────────────────────────
+   The assistant is the top-level object. The list is a toolbar (team filter, count, actions) over one
+   table; opening an assistant shows its configuration as labeled groups; creating one is a numbered
+   sequence of steps. Tokens only, from design-tokens.css and admin-theme.css. */
+.admin-assistants-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.admin-assistants-toolbar-group {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+.admin-assistants-count {
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+}
+.admin-assistants-empty {
+  padding: var(--space-5);
+  border: 1px dashed var(--control-border);
+  border-radius: var(--radius-lg);
+  color: var(--text-secondary);
+}
+.admin-assistants-empty strong {
+  display: block;
+  color: var(--text-primary);
+  margin-bottom: var(--space-1);
+}
+/* One team selector everywhere the console scopes by team: a select when there is a choice, a fixed
+   label when there is one team. Inline in a toolbar; stacked like any other field inside a form. */
+.admin-team-select {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  color: var(--text-primary);
+  text-transform: none;
+  letter-spacing: normal;
+}
+.admin-team-select select {
+  width: auto;
+  min-width: 12rem;
+}
+.admin-form-grid .admin-team-select {
+  display: flex;
+  flex-direction: column;
+  align-items: stretch;
+}
+.admin-form-grid .admin-team-select select {
+  width: 100%;
+}
+.admin-team-select-fixed {
+  color: var(--text-primary);
+  font-weight: 600;
+}
+
+/* A select inside a form keeps room for its arrow: the field rule's padding would otherwise run the
+   text under it. */
+.admin-form-grid select {
+  padding-right: var(--space-8);
+}
+
+/* THE STEPS OF A FLOW. A bar over each step fills as the flow advances: done steps carry a check, the
+   current step is the filled number and the bold label, and later steps are muted. The step a person
+   is on is also announced (aria-current="step") and named in the heading under the bar. */
+.admin-steps {
+  display: flex;
+  gap: var(--space-3);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  counter-reset: admin-step;
+}
+.admin-step {
+  counter-increment: admin-step;
+  flex: 1 1 0;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  padding-top: var(--space-3);
+  border-top: 3px solid var(--surface-200);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+}
+.admin-step::before {
+  content: counter(admin-step);
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 1.75rem;
+  height: 1.75rem;
+  border-radius: var(--radius-full);
+  border: 2px solid var(--control-border);
+  background: var(--surface-0);
+  color: var(--text-secondary);
+  font-size: var(--text-xs);
+  font-weight: 700;
+}
+.admin-step--current {
+  border-top-color: var(--accent-500);
+  color: var(--text-primary);
+  font-weight: 600;
+}
+.admin-step--current::before {
+  background: var(--btn-primary-bg);
+  border-color: var(--btn-primary-bg);
+  color: var(--text-on-accent);
+}
+.admin-step--done {
+  border-top-color: var(--accent-500);
+  color: var(--text-primary);
+}
+.admin-step--done::before {
+  content: "\2713";
+  content: "\2713" / "";
+  background: var(--accent-50);
+  border-color: var(--accent-500);
+  color: var(--accent-700);
+}
+@media (max-width: 640px) {
+  .admin-steps {
+    flex-direction: column;
+    gap: var(--space-2);
+  }
+  .admin-step {
+    border-top: none;
+    border-left: 3px solid var(--surface-200);
+    padding: 0 0 0 var(--space-3);
+  }
+  .admin-step--current,
+  .admin-step--done {
+    border-left-color: var(--accent-500);
+  }
+}
+
+/* A labeled group of configuration: the create flow, and each section of an assistant. A card with a
+   heading, a line of help under it, and its fields; the actions sit on a rule at the foot. */
+.admin-config-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  padding: var(--space-5) var(--space-6);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-lg);
+  background: var(--surface-0);
+  box-shadow: var(--shadow-xs);
+  scroll-margin-top: var(--space-4);
+}
+.admin-config-group > h4,
+.admin-config-group > h5 {
+  margin: 0;
+}
+.admin-config-group > h4 + .admin-config-group-help {
+  margin-top: calc(-1 * var(--space-3));
+}
+.admin-config-group-help {
+  margin: 0;
+  max-width: 72ch;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+}
+.admin-config-groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+.admin-config-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+  justify-content: flex-end;
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--surface-200);
+}
+
+/* Export and import of one assistant's versions: the two controls in a row, and the preview of a chosen
+   manifest as an inset card under them, confirmed or cancelled before anything is written. */
+.admin-import-version {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.admin-import-version > .admin-review-buttons {
+  justify-content: flex-start;
+}
+.admin-import-preview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  background: var(--surface-50);
+}
+.admin-import-preview > h5,
+.admin-import-preview > p {
+  margin: 0;
+}
+
+/* The sections of one assistant, as a row of jump links under its name. */
+.admin-config-nav {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-2);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.admin-config-nav a {
+  display: inline-flex;
+  align-items: center;
+  min-height: calc(var(--control-height) - 0.25rem);
+  padding: 0 var(--space-3);
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius-full);
+  background: var(--surface-0);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+  font-weight: 500;
+  text-decoration: none;
+}
+.admin-config-nav a:hover {
+  border-color: var(--accent-500);
+  color: var(--accent-700);
+}
+
+/* A note set apart from the fields around it: what the console cannot do here, and where it is done
+   instead. Tinted and ruled on the left, so it reads as an aside and not as one more field. */
+.admin-callout {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--info-border);
+  border-left: 3px solid var(--info);
+  border-radius: var(--radius-md);
+  background: var(--info-bg);
+  color: var(--text-primary);
+}
+.admin-callout > h5 {
+  margin: 0;
+}
+.admin-callout > p {
+  margin: 0;
+  max-width: 72ch;
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+}
+
+/* THE GUIDES A SURFACE POINTS TO. Each is a sentence saying why a reader would open it, ending in a link
+   that names the guide, so a list of links never reads as a row of bare arrows. */
+.admin-guides {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+  color: var(--text-secondary);
+}
+.admin-guides > li {
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--accent-200);
+}
+
+/* A field caption that carries an info tip: the caption and its tip on one line, in the label look
+   rather than the monospace readout look the direct-span rule above gives a traffic-split value. */
+.admin-form-grid > label > span.admin-field-label {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  font-weight: 600;
+  letter-spacing: normal;
+  color: var(--text-primary);
+}
+
+/* A checkbox and its name, side by side: one of a set of options in a form. */
+.admin-check {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: calc(var(--control-height) - 0.5rem);
+  padding-right: var(--space-3);
+  font-weight: 400;
+  cursor: pointer;
+}
+
+/* A row of actions at the foot of a form or a review: in a line, primary last, never stretched to the
+   width of the form. */
+.admin-review-buttons,
+.admin-form-grid > .admin-review-buttons {
+  display: flex;
+  flex-direction: row;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: flex-end;
+  gap: var(--space-3);
+}
+
+/* An action set beside a value in the configuration list (Rename in draft) keeps its distance. */
+.admin-config-list dd > .btn-secondary {
+  margin-left: var(--space-3);
+}
+
+/* A CHOICE BETWEEN A FEW WAYS TO START, each with the sentence that says what it means. One card per option, so
+   the explanation sits beside the control rather than below the whole group. */
+.admin-choice-group {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.admin-choice-group > legend {
+  margin-bottom: var(--space-2);
+  font-weight: 600;
+}
+.admin-choice {
+  display: flex;
+  gap: var(--space-3);
+  align-items: flex-start;
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  background: var(--surface-0);
+  cursor: pointer;
+}
+.admin-choice:has(input:checked) {
+  border-color: var(--accent-500);
+  background: var(--accent-50);
+}
+.admin-choice > input {
+  margin-top: 0.2rem;
+}
+.admin-choice > span {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+
+/* Every assistant's workflows above the ones it can open, each group with what a person can do about it. */
+.admin-workflow-groups {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+.admin-workflow-groups h6 {
+  margin: 0 0 var(--space-1);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.admin-workflow-groups p {
+  margin: 0 0 var(--space-2);
+}
+
+/* How an assistant's opening is made, under the box that writes it. */
+.admin-welcome-guide {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  margin-top: var(--space-2);
+}
+.admin-welcome-guide h6 {
+  margin: var(--space-2) 0 0;
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+.admin-welcome-example,
+.admin-welcome-preview {
+  margin: 0;
+  padding: var(--space-3);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  background: var(--surface-50);
+  font-size: var(--text-sm);
+  white-space: pre-wrap;
+}
+
+/* ── Performance, one view: overview cards, the message flow, and the detail a click opens ───────── */
+.perf-card-row { display: flex; flex-direction: column; gap: var(--space-2); }
+.perf-card-row-title { font-size: var(--text-sm); font-weight: 600; color: var(--text-secondary); }
+.perf-card-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(160px, 1fr)); gap: var(--space-2); }
+.perf-card {
+  /* A button does not inherit text color; without this mobile browsers draw it dark on a dark card. */
+  font: inherit; color: var(--text-primary); text-align: left; cursor: pointer; min-height: 44px;
+  display: flex; flex-direction: column; gap: 2px;
+  background: var(--surface-0); border: 1px solid var(--surface-200); border-radius: 10px; padding: 12px 14px;
+}
+.perf-card:hover, .perf-card:focus-visible { border-color: var(--accent-500, #6D28D9); }
+.perf-stat-label { display: inline-flex; align-items: center; gap: 4px; }
+.perf-card-wrap { position: relative; display: flex; }
+.perf-card-wrap > .perf-card { flex: 1; padding-right: 32px; }
+.perf-card-help { position: absolute; top: 8px; right: 8px; }
+.perf-card-label { font-size: var(--text-xs); color: var(--text-secondary); font-weight: 500; }
+.perf-card-value { font-size: var(--text-xl); font-weight: 700; }
+.perf-card-sub { font-size: var(--text-xs); color: var(--text-muted); }
+.perf-flow { display: flex; flex-direction: column; gap: var(--space-3); background: var(--surface-0); border: 1px solid var(--surface-200); border-radius: 10px; padding: var(--space-3); }
+.perf-flow-head { display: flex; justify-content: space-between; align-items: flex-start; gap: var(--space-3); flex-wrap: wrap; }
+.perf-welcome { margin-bottom: var(--space-4); padding-bottom: var(--space-3); border-bottom: 1px solid var(--surface-200); }
+.perf-flow-scroll { overflow-x: auto; }
+.perf-flow-columns { display: flex; justify-content: space-between; font-size: var(--text-xs); font-weight: 600; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.05em; padding-bottom: var(--space-2); }
+.perf-flow-node {
+  position: absolute; font: inherit; color: var(--text-primary); cursor: pointer; min-height: 44px; padding: 3px 6px;
+  background: color-mix(in srgb, var(--surface-0) 90%, transparent); border: 1px solid transparent; border-radius: 6px;
+}
+.perf-flow-node[aria-pressed="true"] { border-color: var(--accent-500, #6D28D9); background: var(--surface-50); }
+.perf-flow-node-label { display: block; font-size: var(--text-sm); font-weight: 600; }
+.perf-flow-node-sub { display: block; font-size: var(--text-xs); color: var(--text-secondary); }
+.perf-flow-legend, .perf-bar-legend { display: flex; flex-wrap: wrap; gap: var(--space-3); font-size: var(--text-xs); color: var(--text-secondary); padding-top: var(--space-2); }
+.perf-flow-legend i, .perf-bar-legend i, .perf-steps i { display: inline-block; width: 12px; height: 9px; border-radius: 2px; margin-right: 6px; opacity: 0.6; }
+.perf-detail { display: flex; flex-direction: column; gap: var(--space-3); background: var(--surface-0); border: 1px solid var(--surface-200); border-radius: 10px; padding: var(--space-4); }
+.perf-crumbs { display: flex; flex-wrap: wrap; align-items: center; gap: var(--space-2); font-size: var(--text-sm); }
+.perf-close { margin-left: auto; }
+.perf-slice, .perf-turn, .perf-embedded { display: flex; flex-direction: column; gap: var(--space-3); }
+.perf-stat-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: var(--space-2); }
+.perf-stat { display: flex; flex-direction: column; gap: 2px; padding: 2px 0; font-size: var(--text-xs); color: var(--text-secondary); }
+.perf-stat strong { font-size: var(--text-lg); color: var(--text-primary, inherit); }
+.perf-bar { display: flex; height: 22px; border-radius: 5px; overflow: hidden; background: var(--surface-100); }
+.perf-bar span { height: 100%; }
+.perf-split { display: flex; flex-wrap: wrap; gap: var(--space-2); }
+.perf-turn-head { display: flex; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; gap: var(--space-3); }
+.perf-steps { width: 100%; border-collapse: collapse; font-size: var(--text-sm); }
+.perf-steps th { text-align: left; color: var(--text-secondary); font-weight: 600; padding: 6px 8px; border-bottom: 1px solid var(--surface-200); }
+.perf-steps td { padding: 6px 8px; border-bottom: 1px solid var(--surface-100); }
+.perf-closes { font-weight: 600; color: var(--accent-700, #4C1D95); }
+.perf-turn-panels { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--space-3); }
+.perf-kv { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; font-size: var(--text-sm); }
+.perf-kv li { display: flex; justify-content: space-between; gap: var(--space-3); border-bottom: 1px solid var(--surface-100); padding-bottom: 4px; }
+
+.admin-assistants-retired-toggle { display: inline-flex; align-items: center; gap: var(--space-1); font-size: var(--text-sm); color: var(--text-secondary); cursor: pointer; }
+
+/* ========================================
+   Conditions, the variable picker and template options (ADR-060, ADR-062)
+   ======================================== */
+
+/* A condition: its alternatives (joined by OR) stacked, each a bordered group of keys (joined by AND). */
+.admin-condition {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+}
+
+.admin-condition-alternative {
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md, 6px);
+  padding: var(--space-3);
+  background: var(--surface-0);
+}
+
+/* The variable picker opens in place beside the field it fills. */
+.admin-variable-picker {
+  margin: var(--space-2) 0;
+}
+
+.admin-variable-picker > summary {
+  cursor: pointer;
+  color: var(--text-secondary);
+}
+
+/* A checkbox with its label on one line. */
+.admin-checkbox {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+  cursor: pointer;
+}
+
+/* THE DRAFT, ONE CARD PER AREA. A grid of cards, each its name, one sentence about what the draft holds, a
+   Changed mark against the active version, and Edit; under them the diff, then Validate and Activate. */
+.admin-edit-cards-wrap {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-5);
+}
+.admin-edit-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(16rem, 1fr));
+  gap: var(--space-4);
+  list-style: none;
+  margin: 0;
+  padding: 0;
+}
+.admin-edit-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4) var(--space-5);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  background: var(--surface-50);
+}
+.admin-edit-card:hover {
+  border-color: var(--surface-300);
+}
+.admin-edit-card > div:last-child {
+  margin-top: auto;
+}
+/* A heading and what sits beside it (a Changed mark, a ? control); help opened from the ? takes the full row under it. */
+.admin-edit-card-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.admin-edit-card-head > h4,
+.admin-edit-card-head > h5 {
+  margin: 0;
+}
+.admin-edit-card-summary {
+  margin: 0;
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+}
+/* One area open alone: its controls, then the sentence its card will say, then the actions on a rule. */
+.admin-edit-step {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.admin-edit-preview {
+  margin: 0;
+  padding: var(--space-3) var(--space-4);
+  border-left: 3px solid var(--accent-400);
+  border-radius: var(--radius-sm);
+  background: var(--accent-50);
+  color: var(--text-primary);
+  font-size: var(--text-sm);
+}
+.admin-edit-diff {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding-top: var(--space-4);
+  border-top: 1px solid var(--surface-200);
+}
+.admin-edit-diff > h5 {
+  margin: 0;
+}
+.admin-edit-diff ul {
+  margin: 0;
+  padding-left: var(--space-5);
+  font-size: var(--text-sm);
+  line-height: var(--leading-relaxed);
+}
+
+/* THE CREATION WIZARD: the step's controls, and beside them the live preview of every choice so far. */
+.admin-wizard-body {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(14rem, 1fr);
+  gap: var(--space-5);
+  align-items: start;
+}
+.admin-wizard-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+  min-width: 0;
+}
+.admin-wizard-preview {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  padding: var(--space-4);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  background: var(--surface-50);
+  font-size: var(--text-sm);
+}
+.admin-wizard-preview > h5 {
+  margin: 0;
+}
+@media (max-width: 900px) {
+  .admin-wizard-body {
+    grid-template-columns: 1fr;
+  }
+}
+/* A field's caption with its info control on the same line. */
+.admin-field-caption {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-1);
+  font-weight: 600;
+}
+
+/* ── ONE ASSISTANT'S PAGE (AssistantPage.tsx) ─────────────────────────────────────────────────────
+   A header with the active version and the draft toggle, the draft's banner, then a menu of sections beside the
+   one section shown. The menu wraps above the section on a narrow screen, and every field stacks label, help, value. */
+.admin-assistant-page {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+.admin-assistant-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-4);
+}
+.admin-assistant-title {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  min-width: 0;
+}
+.admin-assistant-name {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+.admin-assistant-name > h3 {
+  margin: 0;
+  font-size: var(--text-2xl);
+}
+.admin-assistant-perf {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-1) var(--space-4);
+  font-size: var(--text-sm);
+}
+.admin-assistant-perf a {
+  color: var(--link-color);
+}
+.admin-assistant-mode {
+  display: inline-flex;
+  border: 1px solid var(--control-border);
+  border-radius: var(--radius-lg);
+  overflow: hidden;
+  background: var(--surface-0);
+}
+.admin-mode-btn {
+  min-height: var(--control-height);
+  padding: 0 var(--space-4);
+  border: 0;
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-base);
+  font-weight: 500;
+  cursor: pointer;
+}
+.admin-mode-btn:disabled {
+  color: var(--text-tertiary);
+  cursor: default;
+}
+.admin-mode-btn.active {
+  background: var(--text-primary);
+  color: var(--text-inverse);
+}
+.admin-mode-draft.active {
+  background: var(--accent-600);
+  color: var(--text-on-accent);
+}
+.admin-badge-active {
+  background: var(--success-bg);
+  border-color: var(--success-border);
+  color: var(--text-primary);
+}
+.admin-draft-banner {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--accent-400);
+  border-radius: var(--radius-lg);
+  background: var(--accent-50);
+}
+.admin-draft-banner-text {
+  font-size: var(--text-sm);
+  max-width: 72ch;
+}
+.admin-draft-banner-actions {
+  padding-top: 0;
+  border-top: 0;
+}
+.admin-draft-banner-diff {
+  flex-basis: 100%;
+  font-size: var(--text-sm);
+}
+/* The draft's run against the golden set, a full-width row of the banner (ADR-065). */
+.admin-golden-run {
+  flex-basis: 100%;
+  font-size: var(--text-sm);
+}
+/* Activating past the golden gate: the refusal confirmed and a reason, set apart from the row it answers (ADR-065). */
+.admin-golden-past-gate {
+  margin-top: var(--space-2);
+  padding: var(--space-3);
+  border: 1px solid var(--warning-border);
+  border-radius: var(--radius-md);
+}
+.admin-golden-past-gate textarea {
+  display: block;
+  width: 100%;
+}
+.admin-golden-coverage {
+  margin-top: var(--space-2);
+}
+.admin-golden-coverage-thin td {
+  color: var(--warning);
+  font-weight: 600;
+}
+.admin-golden-upload {
+  margin-top: var(--space-4);
+  padding-top: var(--space-3);
+  border-top: 1px solid var(--control-border);
+}
+.admin-golden-upload input[type='file'] {
+  display: block;
+  margin: var(--space-1) 0 var(--space-2);
+}
+.admin-assistant-layout {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: var(--space-5);
+}
+.admin-assistant-menu {
+  flex: 1 1 15rem;
+  max-width: 18rem;
+}
+.admin-assistant-menu ul {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.admin-assistant-menu-btn {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-2);
+  width: 100%;
+  min-height: var(--control-height);
+  padding: 0 var(--space-3);
+  border: 0;
+  border-radius: var(--radius-md);
+  background: transparent;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: var(--text-base);
+  text-align: left;
+  cursor: pointer;
+}
+.admin-assistant-menu-btn:hover {
+  background: var(--surface-100);
+}
+.admin-assistant-menu-btn.active {
+  background: var(--text-primary);
+  color: var(--text-inverse);
+}
+.admin-assistant-menu-note {
+  margin: 0;
+  padding: 0 var(--space-3) var(--space-2);
+  color: var(--text-secondary);
+  font-size: var(--text-sm);
+  line-height: var(--leading-normal);
+}
+.admin-changed-dot {
+  flex: none;
+  width: 0.5rem;
+  height: 0.5rem;
+  border-radius: var(--radius-full);
+  background: var(--warning);
+}
+.admin-assistant-main {
+  flex: 999 1 32rem;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-4);
+}
+/* Every field stacks: label, then help, then the value, on every width. */
+.admin-config-stack {
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-1);
+  max-width: 48rem;
+}
+.admin-config-stack dd {
+  margin-bottom: var(--space-4);
+}
+.admin-config-stack-wrap .admin-config-list {
+  grid-template-columns: minmax(0, 1fr);
+  gap: var(--space-1);
+  max-width: 48rem;
+}
+.admin-config-stack-wrap .admin-config-list dd {
+  margin-bottom: var(--space-4);
+}
+.admin-config-value {
+  margin-top: var(--space-1);
+}
+.admin-stacked-field {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  max-width: 48rem;
+}
+.admin-chip-own {
+  background: var(--success-bg);
+  border-color: var(--success-border);
+}
+.admin-chip-platform {
+  background: var(--surface-100);
+}
+.admin-chip-multi {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+}
+.admin-workflow-ownership {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--space-3);
+}
+.admin-workflow-list,
+.admin-machine-steps {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-3);
+  max-width: 52rem;
+}
+.admin-workflow-item {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+  padding: var(--space-3) var(--space-4);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  background: var(--surface-0);
+  font-size: var(--text-sm);
+}
+.admin-workflow-item-platform {
+  border-style: dashed;
+  background: var(--surface-50);
+}
+.admin-workflow-item-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-2);
+}
+.admin-workflow-item-head > h4 {
+  margin: 0;
+}
+.admin-workflow-item-head code {
+  font-family: var(--font-mono);
+  font-weight: 600;
+}
+.admin-workflow-item-head .btn-sm {
+  margin-left: auto;
+}
+/* An event workflow's steps, one line in the order a run reaches them. */
+.admin-workflow-steps {
+  color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+/* A welcome's opening as the person reads it, composed by the router's composer. */
+.admin-welcome-says {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.admin-opening-preview {
+  padding: var(--space-3);
+  border: 1px solid var(--surface-200);
+  border-left: 3px solid var(--accent-400);
+  border-radius: var(--radius-md);
+  background: var(--surface-50);
+  color: var(--text-primary);
+  overflow-wrap: anywhere;
+}
+.admin-opening-preview > * {
+  margin: 0;
+}
+.admin-opening-preview > * + * {
+  margin-top: var(--space-2);
+}
+.admin-opening-preview ul {
+  padding-left: var(--space-5);
+}
+.admin-opening-preview blockquote {
+  padding-left: var(--space-3);
+  border-left: 2px solid var(--surface-300);
+  color: var(--text-secondary);
+}
+/* The Assistants list's event workflows, by the event that starts each. */
+.admin-assistants-workflows {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+}
+.admin-tool-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-2);
+}
+.admin-pre-line {
+  white-space: pre-line;
+  margin: var(--space-2) 0 0;
+}
+.admin-intent-purpose {
+  margin: 0;
+  color: var(--text-primary);
+}
+.admin-intent-models {
+  display: flex;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+.admin-intent-models > * {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  flex: 1 1 12rem;
+  min-width: 0;
+}
+/* An intent's workflow steps on its card, each with what it produces and the model it runs on (ADR-064). */
+.admin-intent-steps {
+  display: flex;
+  flex-direction: column;
+  gap: var(--space-1);
+  margin-top: var(--space-2);
+  min-width: 0;
 }

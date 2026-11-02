@@ -1,4 +1,5 @@
 import React from 'react';
+import { Trans, useTranslation } from 'react-i18next';
 import MetricCard from './MetricCard';
 import DataTable from './DataTable';
 import Sparkline from './Sparkline';
@@ -28,6 +29,7 @@ const OverviewTab: React.FC<OverviewTabProps> = ({
   errorRateData,
   isLoading,
 }) => {
+  const { t } = useTranslation();
   if (isLoading) {
     return (
       <div className="admin-tab">
@@ -104,17 +106,17 @@ const OverviewTab: React.FC<OverviewTabProps> = ({
       {messageTrend.length >= 2 && (
         <div className="admin-tab-banner">
           <div className="admin-tab-banner-label">
-            <span className="admin-tab-banner-label-text">Message volume · trailing window</span>
+            <span className="admin-tab-banner-label-text">{t('admin.overview.messageVolumeTrailingWindow')}</span>
             <span className="admin-tab-banner-label-value">{totalMessages.toLocaleString()}</span>
           </div>
-          <Sparkline data={messageTrend} width={320} height={56} label="Message volume trend" />
+          <Sparkline data={messageTrend} width={320} height={56} label={t('admin.overview.messageVolumeTrend')} />
         </div>
       )}
       <div className="metric-cards-grid">
-        <MetricCard title="Total Messages" value={totalMessages.toLocaleString()} />
-        <MetricCard title="Active Conversations" value={totalConversations.toLocaleString()} />
-        <MetricCard title="Active Days" value={uniqueDates} />
-        <MetricCard title="Avg Messages/Day" value={uniqueDates > 0 ? Math.round(totalMessages / uniqueDates) : 0} />
+        <MetricCard title={t('admin.overview.totalMessages')} value={totalMessages.toLocaleString()} />
+        <MetricCard title={t('admin.overview.activeConversations')} value={totalConversations.toLocaleString()} />
+        <MetricCard title={t('admin.overview.activeDays')} value={uniqueDates} />
+        <MetricCard title={t('admin.overview.avgMessagesDay')} value={uniqueDates > 0 ? Math.round(totalMessages / uniqueDates) : 0} />
       </div>
 
       {/* Health row — three signals on one glance: who signed in,
@@ -124,62 +126,61 @@ const OverviewTab: React.FC<OverviewTabProps> = ({
       <div className="admin-tab-banner-row admin-tab-banner-row--three">
         <div className="admin-tab-banner admin-tab-banner--compact">
           <div className="admin-tab-banner-label">
-            <span className="admin-tab-banner-label-text">Signed-in users · sessions</span>
+            <span className="admin-tab-banner-label-text">{t('admin.overview.signedInUsersSessions')}</span>
             <span className="admin-tab-banner-label-value">{dauLatest.toLocaleString()}</span>
           </div>
           {dauTrend.length >= 2 ? (
-            <Sparkline data={dauTrend} width={200} height={42} label="Signed-in users trend" />
+            <Sparkline data={dauTrend} width={200} height={42} label={t('admin.overview.signedInUsersTrend')} />
           ) : (
-            <span className="admin-tab-banner-empty">No session data yet</span>
+            <span className="admin-tab-banner-empty">{t('admin.overview.noSessionDataYet')}</span>
           )}
         </div>
         <div className="admin-tab-banner admin-tab-banner--compact admin-tab-banner--accented">
           <div className="admin-tab-banner-label">
-            <span className="admin-tab-banner-label-text">Messaging users · engaged</span>
+            <span className="admin-tab-banner-label-text">{t('admin.overview.messagingUsersEngaged')}</span>
             <span className="admin-tab-banner-label-value">{mauLatest.toLocaleString()}</span>
           </div>
           {mauTrend.length >= 2 ? (
-            <Sparkline data={mauTrend} width={200} height={42} label="Messaging-users trend" />
+            <Sparkline data={mauTrend} width={200} height={42} label={t('admin.overview.messagingUsersTrend')} />
           ) : (
-            <span className="admin-tab-banner-empty">No messaging data yet</span>
+            <span className="admin-tab-banner-empty">{t('admin.overview.noMessagingDataYet')}</span>
           )}
         </div>
         <div className="admin-tab-banner admin-tab-banner--compact">
           <div className="admin-tab-banner-label">
-            <span className="admin-tab-banner-label-text">Error rate · trailing</span>
+            <span className="admin-tab-banner-label-text">{t('admin.overview.errorRateTrailing')}</span>
             <span className="admin-tab-banner-label-value">
               {errorPct.toFixed(2)}<small style={{ fontSize: '0.6em', fontWeight: 500, marginLeft: 4 }}>%</small>
             </span>
           </div>
           {errorTrend.length >= 2 ? (
-            <Sparkline data={errorTrend} width={200} height={42} label="Errors per day" />
+            <Sparkline data={errorTrend} width={200} height={42} label={t('admin.overview.errorsPerDay')} />
           ) : (
-            <span className="admin-tab-banner-empty">No error data yet</span>
+            <span className="admin-tab-banner-empty">{t('admin.overview.noErrorDataYet')}</span>
           )}
         </div>
       </div>
 
       {!activeUsersData && !messagingUsersData && !errorRateData && (
         <p className="admin-tab-description" style={{ marginTop: 0 }}>
-          These bands populate once frontend events flow through the new <code>/events</code>
-          ingestion path. Until then, they stay honest-empty.
+          <Trans i18nKey="admin.overview.bandsPending" components={{ c: <code /> }} />
         </p>
       )}
 
       <div className="metric-cards-grid">
-        <MetricCard title="Signed-in (window)" value={dauTotal.toLocaleString()} subtitle="any Cognito session" />
+        <MetricCard title={t('admin.overview.signedInWindow')} value={dauTotal.toLocaleString()} subtitle={t('admin.overview.anyCognitoSession')} />
         <MetricCard
-          title="Messaging (window)"
+          title={t('admin.overview.messagingWindow')}
           value={mauTrend.reduce((a, b) => a + b, 0).toLocaleString()}
-          subtitle={dauTotal > 0 ? `${Math.round((mauTrend.reduce((a, b) => a + b, 0) / dauTotal) * 100)}% of signed-in` : 'engaged at least once'}
+          subtitle={dauTotal > 0 ? t('admin.overview.ofSignedIn', { dauTotal: Math.round((mauTrend.reduce((a, b) => a + b, 0) / dauTotal) * 100) }) : t('admin.overview.engagedAtLeastOnce')}
         />
-        <MetricCard title="Errors (window)" value={totalErrors.toLocaleString()} subtitle={`${totalEvents.toLocaleString()} total events`} />
-        <MetricCard title="Error %" value={`${errorPct.toFixed(2)}%`} target={METRIC_TARGETS.error_rate} rawValue={errorPct} />
+        <MetricCard title={t('admin.overview.errorsWindow')} value={totalErrors.toLocaleString()} subtitle={t('admin.overview.totalEvents', { totalEvents: totalEvents.toLocaleString() })} />
+        <MetricCard title={t('admin.overview.error')} value={`${errorPct.toFixed(2)}%`} target={METRIC_TARGETS.error_rate} rawValue={errorPct} />
       </div>
 
       {volumeData && volumeData.data.length > 0 && (
         <div className="admin-section">
-          <h3>Message Volume by Date</h3>
+          <h3>{t('admin.overview.messageVolumeByDate')}</h3>
           <DataTable
             columns={[
               { key: 'date', label: 'Date' },
@@ -193,7 +194,7 @@ const OverviewTab: React.FC<OverviewTabProps> = ({
 
       {intentData && intentData.data.length > 0 && (
         <div className="admin-section">
-          <h3>Intent Distribution</h3>
+          <h3>{t('admin.overview.intentDistribution')}</h3>
           <DataTable
             columns={[
               { key: 'intent', label: 'Intent' },

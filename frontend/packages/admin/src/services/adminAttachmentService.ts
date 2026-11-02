@@ -14,9 +14,11 @@
  *   - attachments/…     → 'attachment-read-uploads'  USER-UPLOADED input, PII (moderation grade)
  * A key under neither prefix is not an admin-reviewable attachment and is rejected.
  */
+import i18n from '@ae/shared/i18n';
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
-import { CREDENTIAL_EXCHANGE_API_URL, ensureFreshIdToken } from '@ae/shared';
+import { requireAdminApi, vendAdminCapability } from './sigv4Fetch';
+import { reasonFor } from './adminReason';
 
 /** Which exchange capability a given attachment key requires, or null if it is not reviewable. */
 export function attachmentCapabilityForKey(
@@ -32,20 +34,6 @@ export function isUserUploadedAttachment(fileKey: string): boolean {
   return attachmentCapabilityForKey(fileKey) === 'attachment-read-uploads';
 }
 
-interface S3VendResponse {
-  credentials: { AccessKeyId: string; SecretAccessKey: string; SessionToken: string; Expiration?: string };
-  bucket: string;
-  region: string;
-  scopedTo?: string | null;
-}
-
-function exchangeUrl(): string {
-  if (!CREDENTIAL_EXCHANGE_API_URL) {
-    throw new Error('Attachment review requires VITE_CREDENTIAL_EXCHANGE_API_URL');
-  }
-  return `${CREDENTIAL_EXCHANGE_API_URL.replace(/\/$/, '')}/exchange-credentials`;
-}
-
 /**
  * Vend channel-scoped S3 creds for `fileKey` in `channelArn` and return a short-lived presigned
  * GET URL the caller can open. Throws if the key is not an admin-reviewable attachment, the
@@ -56,34 +44,18 @@ export async function getAdminAttachmentDownloadUrl(
   fileKey: string,
 ): Promise<string> {
   const capability = attachmentCapabilityForKey(fileKey);
-  if (!capability) throw new Error('Not an admin-reviewable attachment key');
+  if (!capability) throw new Error(i18n.t('admin.adminAttachmentService.notAnAdminReviewableAttachment'));
 
-  const idToken = await ensureFreshIdToken();
-  if (!idToken) throw new Error('Not authenticated');
-
-  const resp = await fetch(exchangeUrl(), {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
-    // identity comes from the validated token, never the body (IDOR guard); the body only NARROWS.
-    body: JSON.stringify({ identity: 'admin', channelArn, capabilities: [capability] }),
-  });
-  if (!resp.ok) {
-    const err = await resp.json().catch(() => ({} as { error?: string }));
-    throw new Error(err.error || `Attachment credential exchange failed: ${resp.status}`);
-  }
-  const data = (await resp.json()) as S3VendResponse;
+  // The capability's own IAM-authorized route, with the reason the conversation was opened for. Opening
+  // an attachment is part of reading the conversation, so it reuses that reason.
+  requireAdminApi(i18n.t('admin.adminAttachmentService.attachmentReviewRequiresVite_credential_exchange_api_url'));
+  const reason = await reasonFor({ capability, channelArn, kind: 'read' });
+  const data = await vendAdminCapability(capability, { channelArn, reason });
   if (!data.bucket || !data.region || !data.credentials) {
-    throw new Error('Attachment vend returned no S3 target');
+    throw new Error(i18n.t('admin.adminAttachmentService.attachmentVendReturnedNoS3'));
   }
 
-  const s3 = new S3Client({
-    region: data.region,
-    credentials: {
-      accessKeyId: data.credentials.AccessKeyId,
-      secretAccessKey: data.credentials.SecretAccessKey,
-      sessionToken: data.credentials.SessionToken,
-    },
-  });
+  const s3 = new S3Client({ region: data.region, credentials: data.credentials });
   // 5 minutes is ample to open/download; the vended creds themselves also expire well before their
   // moderation-grade TTL, so the URL cannot outlive the audited session by much.
   return getSignedUrl(s3, new GetObjectCommand({ Bucket: data.bucket, Key: fileKey }), { expiresIn: 300 });

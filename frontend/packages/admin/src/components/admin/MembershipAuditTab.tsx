@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback } from 'react';
+import { useTranslation } from 'react-i18next';
 import {
   listFindings,
   getEnforce,
@@ -7,28 +8,15 @@ import {
   type MembershipAuditFinding,
 } from '../../services/membershipAuditService';
 import DataTable from './DataTable';
-import { DocLink } from './AdminHelp';
-import { DOC_LINKS } from '../../config/docLinks';
+import { GuideLinks, guide } from './AdminHelp';
 
 function shortArn(arn: string): string {
   const i = arn.indexOf('/');
   return i === -1 ? arn : arn.slice(i + 1);
 }
 
-// Segmented toggle, using design tokens (violet accent — matches the system,
-// not the old undefined `--accent-color` that fell back to blue).
-const toggleBtn = (active: boolean): React.CSSProperties => ({
-  padding: '6px 14px',
-  border: `1px solid ${active ? 'var(--accent-500)' : 'var(--surface-200)'}`,
-  background: active ? 'var(--accent-500)' : 'var(--surface-0)',
-  color: active ? 'var(--text-on-accent)' : 'var(--text-secondary)',
-  borderRadius: 'var(--radius-md)',
-  fontSize: 'var(--text-sm)',
-  fontWeight: 500,
-  cursor: 'pointer',
-});
-
 const MembershipAuditTab: React.FC = () => {
+  const { t: translate } = useTranslation();
   const [findings, setFindings] = useState<MembershipAuditFinding[]>([]);
   const [enforce, setEnforceState] = useState(false);
   const [isLoading, setIsLoading] = useState(true);
@@ -83,47 +71,52 @@ const MembershipAuditTab: React.FC = () => {
   return (
     <div className="admin-tab">
       <div className="admin-tab-header">
-        <h3>Membership audit</h3>
-        <div role="group" aria-label="Enforcement mode" style={{ display: 'flex', gap: 6 }}>
-          <button style={toggleBtn(!enforce)} disabled={busy === 'enforce'} onClick={() => toggleEnforce(false)}>
+        <h3>{translate('admin.membershipAudit.membershipAudit')}</h3>
+        <div role="group" aria-label={translate('admin.membershipAudit.enforcementMode')} className="admin-filter-group">
+          <button className="admin-filter-btn" aria-pressed={!enforce} disabled={busy === 'enforce'} onClick={() => toggleEnforce(false)}>
             Report only
           </button>
-          <button style={toggleBtn(enforce)} disabled={busy === 'enforce'} onClick={() => toggleEnforce(true)}>
+          <button className="admin-filter-btn" aria-pressed={enforce} disabled={busy === 'enforce'} onClick={() => toggleEnforce(true)}>
             Auto-revoke
           </button>
         </div>
       </div>
 
       <p className="admin-tab-description" style={{ maxWidth: 640 }}>
-        Over-tier members and assistants flagged by the Layer 6 audit — a membership whose tier
-        exceeds the conversation's classification. Enforcement is a runtime toggle: report-only
+        Members and assistants flagged by the Layer 6 audit as not cleared for the conversation's
+        classification. Enforcement is a runtime toggle: report-only
         alerts a security event; auto-revoke removes the membership. Review a finding, then revoke
-        it to remove the over-tier member.{' '}
-        <DocLink href={DOC_LINKS.adminIdentity}>How this works</DocLink>
+        it to remove the member.
       </p>
+      <GuideLinks guides={[guide(translate('admin.guides.membershipAudit.identity'), 'adminIdentity')]} />
 
       {error && (
         <div className="admin-error">
           <span>{error}</span>
-          <button onClick={() => setError(null)}>Dismiss</button>
+          <button className="btn-secondary" onClick={() => setError(null)}>Dismiss</button>
         </div>
       )}
 
       {isLoading ? (
-        <div className="admin-tab-loading">Loading findings…</div>
+        <div className="admin-tab-loading">{translate('admin.membershipAudit.loadingFindings')}</div>
       ) : (
         <DataTable
           data={open}
           emptyMessage={
             enforce
-              ? 'No open findings. Auto-revoke is on.'
-              : 'No open findings. Report-only: findings are alerted, not revoked.'
+              ? translate('admin.membershipAudit.noOpenFindingsAutoRevoke')
+              : translate('admin.membershipAudit.noOpenFindingsReportOnly')
           }
           columns={[
             { key: 'ts', label: 'When', render: (v) => new Date(v as string | number).toLocaleString() },
             { key: 'kind', label: 'Type' },
-            { key: 'subjectTier', label: 'Subject tier' },
-            { key: 'channelTier', label: 'Channel tier' },
+            // The keys the finding is actually STORED under (`membership-audit.ts` spreads them in).
+            // These read `subjectTier` / `channelTier`, which the record has never carried, so both
+            // columns were blank on every row. The labels follow ADR-046 too: a holder has a
+            // clearance, a channel has a classification, and this console is an operator surface
+            // where that internal vocabulary is the correct one.
+            { key: 'subjectClearance', label: translate('admin.membershipAudit.subjectClearance') },
+            { key: 'channelClassification', label: translate('admin.membershipAudit.channelClassification') },
             {
               key: 'memberArn',
               label: 'Member',
@@ -143,17 +136,7 @@ const MembershipAuditTab: React.FC = () => {
               render: (_v, row) => {
                 const f = row as MembershipAuditFinding;
                 return (
-                  <button
-                    style={{
-                      padding: '4px 10px',
-                      border: '1px solid var(--surface-200)',
-                      background: 'var(--surface-0)',
-                      color: 'var(--status-bad)',
-                      borderRadius: 'var(--radius-sm)',
-                      fontSize: 'var(--text-sm)',
-                      fontWeight: 500,
-                      cursor: 'pointer',
-                    }}
+                  <button className="btn-danger"
                     disabled={busy === f.sk}
                     onClick={() => revoke(f)}
                   >

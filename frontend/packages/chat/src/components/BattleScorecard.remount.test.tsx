@@ -42,13 +42,13 @@ import BattleScorecard from './BattleScorecard';
 const BATTLE_ID = 'battle-abc123';
 const ARN = 'arn:aws:chime:us-east-1:111:app-instance/i/channel/c1';
 const VARIANT_A = { label: 'Assistant', persona: 'Atlas', modelId: 'anthropic.claude-sonnet' };
-const VARIANT_B = { label: 'AltSlotO', persona: 'Echo', modelId: 'anthropic.claude-opus' };
+const VARIANT_B = { label: 'Alt-premium', persona: 'Echo', modelId: 'anthropic.claude-opus' };
 
 const pickButton = (choice: 'A' | 'B') =>
   document.querySelector(`[data-pick="${choice}"]`) as HTMLButtonElement;
 
 beforeEach(() => {
-  // The race being modelled: the mount fetch resolves with NO recorded pick, because the POST that
+  // The race being modeled: the mount fetch resolves with NO recorded pick, because the POST that
   // recorded it has not landed (or its read is not yet consistent).
   getBattleOutcome.mockReset().mockResolvedValue(null);
   recordBattleOutcome.mockReset().mockResolvedValue(undefined);

@@ -117,3 +117,88 @@
   border-color: var(--accent-500);
   color: var(--accent-200);
 }
+
+/* The account menu: the person's name, opening Account settings and Sign out. */
+.account-menu {
+  position: relative;
+}
+
+.account-menu-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--space-2);
+  min-height: 36px;
+  padding: 4px var(--space-3) 4px 4px;
+  background: transparent;
+  border: 1px solid var(--chrome-border);
+  border-radius: var(--radius-full);
+  color: var(--chrome-text);
+  font: 500 var(--text-base) var(--font-sans);
+  cursor: pointer;
+  transition: background var(--duration-fast) var(--ease-in-out), border-color var(--duration-fast) var(--ease-in-out);
+}
+
+.account-menu-trigger:hover,
+.account-menu-trigger[aria-expanded='true'] {
+  background: var(--chrome-hover);
+  border-color: var(--accent-500);
+  color: var(--chrome-text-bright);
+}
+
+.account-menu-initial {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border-radius: var(--radius-full);
+  background: var(--accent-500);
+  color: var(--surface-0);
+  font-size: var(--text-sm);
+  font-weight: 600;
+}
+
+.account-menu-name {
+  max-width: 160px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.account-menu-list {
+  position: absolute;
+  right: 0;
+  top: calc(100% + 6px);
+  min-width: 200px;
+  display: flex;
+  flex-direction: column;
+  padding: var(--space-1);
+  background: var(--surface-0);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.12);
+  z-index: 50;
+}
+
+.account-menu-item {
+  text-align: left;
+  min-height: 40px;
+  padding: var(--space-2) var(--space-3);
+  border: none;
+  border-radius: var(--radius-sm);
+  background: transparent;
+  color: var(--text-primary);
+  font: 400 var(--text-sm) var(--font-sans);
+  cursor: pointer;
+}
+
+.account-menu-item:hover,
+.account-menu-item:focus-visible {
+  background: var(--surface-100);
+  outline: none;
+}
+
+@media (max-width: 640px) {
+  .account-menu-name { display: none; }
+  .account-menu-trigger { padding: 4px; }
+}

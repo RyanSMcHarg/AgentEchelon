@@ -1,0 +1,187 @@
+{
+  "widget": {
+    "frameTitle": "Assistant",
+    "launcher": "Open the assistant",
+    "panelTitle": "Assistant",
+    "close": "Close the assistant",
+    "transcript": "Conversation",
+    "you": "You",
+    "assistant": "Assistant",
+    "someone": "Someone",
+    "composer": {
+      "label": "Message",
+      "placeholder": "Type a message",
+      "send": "Send"
+    },
+    "status": {
+      "connecting": "Connecting",
+      "reconnecting": "Reconnecting",
+      "sendFailed": "Your message was not sent. Try again."
+    },
+    "notice": {
+      "heading": "Before you start",
+      "body": "Sample notice: this conversation is kept for one day after its last message and is used to answer your questions. Replace this text with the deployment's own privacy notice.",
+      "version": "Notice {{version}}",
+      "accept": "Start the conversation"
+    },
+    "starting": "Starting the conversation",
+    "refused": {
+      "paused": {
+        "title": "The assistant is paused",
+        "body": "The assistant is not taking new conversations right now. Please come back later."
+      },
+      "rate_limited": {
+        "title": "Too many conversations started",
+        "body": "Too many conversations were started from your network. Try again in {{seconds}} seconds."
+      },
+      "captcha_failed": {
+        "title": "The check did not pass",
+        "body": "We could not confirm you are a person. Try the check again."
+      },
+      "unavailable": {
+        "title": "The assistant is unavailable",
+        "body": "Something the assistant depends on is not answering. Try again in a few minutes."
+      },
+      "network": {
+        "title": "No connection",
+        "body": "The assistant could not be reached. Check your connection and try again."
+      },
+      "invalid_request": {
+        "title": "The conversation could not start",
+        "body": "Reload the page and try again."
+      },
+      "replayed": {
+        "title": "This conversation was opened elsewhere",
+        "body": "It continues in the other window. Reload to start a new conversation here."
+      },
+      "revoked": {
+        "title": "This conversation was opened elsewhere",
+        "body": "It continues in the other window. Reload to start a new conversation here."
+      },
+      "expired": {
+        "title": "This conversation has ended",
+        "body": "Reload to start a new conversation."
+      },
+      "ended": {
+        "title": "This conversation has ended",
+        "body": "Reload to start a new conversation."
+      },
+      "not_provisioned": {
+        "title": "You are not set up for the assistant",
+        "body": "Ask your administrator to give you access."
+      },
+      "refused": {
+        "title": "The assistant could not open",
+        "body": "Open it from a record, or ask your administrator."
+      }
+    },
+    "actions": {
+      "retry": "Try again",
+      "reload": "Start a new conversation",
+      "contact": "Contact us"
+    },
+    "waitingForHost": "Waiting for your sign-in from the page",
+    "noGuestStart": "This assistant opens inside an application that signs you in.",
+    "carry": {
+      "label": "Continue from your own account",
+      "signIn": "Sign in",
+      "signInHint": "New here? Signing in for the first time makes this conversation part of your account.",
+      "back": "Back to the conversation",
+      "register": {
+        "title": "Leave your details",
+        "body": "We will email you a sign-in link. Signing in from it continues this conversation in your account.",
+        "name": "Name",
+        "email": "Email",
+        "company": "Company (optional)",
+        "role": "Role (optional)",
+        "note": "Anything we should know (optional)",
+        "submit": "Send my link",
+        "submitting": "Saving your details",
+        "sent": "We emailed a sign-in link to {{email}}. Sign in from it and this conversation continues in your account.",
+        "awaiting": "Thank you. Once your details are reviewed, we will email a sign-in link to {{email}}.",
+        "refused": {
+          "invalid": "Add your name and an email address to continue.",
+          "claimed": "This conversation was already carried into an account.",
+          "refused": "Your details could not be saved from here. Reload the page and try again.",
+          "unavailable": "Your details could not be saved right now. Try again in a few minutes.",
+          "unsent": "Your details are saved, and the email could not be sent. Send them again to get your link.",
+          "network": "No connection. Check your connection and try again."
+        }
+      },
+      "continued": {
+        "title": "Continue in the new tab",
+        "body": "Sign in there and this conversation continues in your account. If no tab opened, open the sign-in page below.",
+        "open": "Open the sign-in page"
+      }
+    },
+    "jumpToNewest": "Jump to the newest message"
+  },
+  "invitation": {
+    "pageTitle": "Invitation",
+    "loading": "Opening the invitation",
+    "heading": "{{inviter}} invited you to \"{{conversation}}\"",
+    "as": "You are invited as {{name}}.",
+    "untitled": "a conversation",
+    "someone": "Someone",
+    "signInExplained": "Sign in, or create an account, to join. The invitation can be used once.",
+    "linkExplained": "You join as a guest in this one conversation, for {{minutes}} minutes, without signing in. The invitation can be used once.",
+    "signInToJoin": "Sign in to join",
+    "join": "Join the conversation",
+    "joining": "Joining",
+    "banner": "You are joined as a guest to this conversation only, for a short while.",
+    "refused": {
+      "expired": {
+        "title": "This invitation has expired",
+        "body": "Ask {{inviter}} for a new invitation."
+      },
+      "redeemed": {
+        "title": "This invitation was already used",
+        "body": "An invitation can be used once. Ask {{inviter}} for a new one."
+      },
+      "redeemed_elsewhere": {
+        "title": "This invitation was already used",
+        "body": "Somebody joined with this link already. Ask {{inviter}} for a new invitation."
+      },
+      "revoked": {
+        "title": "This invitation was withdrawn",
+        "body": "It can no longer be used. Ask {{inviter}} if you still need to join."
+      },
+      "wrong_account": {
+        "title": "This invitation is for a new account",
+        "body": "You are signed in with an account that already exists. Ask {{inviter}} to add that account to the conversation, or sign out and continue with a new one."
+      },
+      "wrong_mode": {
+        "title": "This invitation cannot be opened here",
+        "body": "Ask {{inviter}} for a new invitation."
+      },
+      "ended": {
+        "title": "Your visit has ended",
+        "body": "A guest visit lasts a short while. Ask {{inviter}} for a new invitation to join again."
+      },
+      "unknown": {
+        "title": "This link is not recognized",
+        "body": "Open the link exactly as it arrived, or ask the person who invited you for a new one."
+      },
+      "paused": {
+        "title": "Invitations are paused",
+        "body": "Joining by link is paused right now. Please come back later."
+      },
+      "rate_limited": {
+        "title": "Too many attempts",
+        "body": "Too many invitations were opened from your network. Try again in {{seconds}} seconds."
+      },
+      "captcha_failed": {
+        "title": "The check did not pass",
+        "body": "We could not confirm you are a person. Reload the page and try again."
+      },
+      "unavailable": {
+        "title": "The invitation could not be opened",
+        "body": "Something it depends on is not answering. Try again in a few minutes."
+      },
+      "network": {
+        "title": "No connection",
+        "body": "The invitation could not be reached. Check your connection and try again."
+      }
+    }
+  }
+}

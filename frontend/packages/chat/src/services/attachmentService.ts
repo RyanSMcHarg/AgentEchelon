@@ -1,7 +1,15 @@
 import type { Attachment } from '@ae/shared';
 import { trackEvent } from '@ae/shared';
+import { personUrl } from '@ae/shared';
 
-const MAX_FILE_SIZE = 10 * 1024 * 1024; // 10MB
+// 10 MiB, matching the presigner's MAX_FILE_BYTES (backend/lambda/presigned-url/index.js).
+//
+// KNOWINGLY ABOVE WHAT AN ASSISTANT CAN READ. A model takes at most 3,000,000 raw bytes per
+// attachment (backend/lambda/src/lib/attachment-budget.ts). A file between the two uploads, is stored,
+// and is downloadable by everyone in the conversation; the turn that asks an assistant about it
+// degrades at send time and says the file went unread. If this cap is ever lowered to the model
+// budget, the presigner and the upload-time copy have to move with it.
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
 const ALLOWED_TYPES = [
   'text/plain',
@@ -21,16 +29,12 @@ const ALLOWED_TYPES = [
 ];
 
 function getPresignedUrlEndpoint(): string {
-  const url = import.meta.env.VITE_PRESIGNED_URL_API_URL;
-  if (!url) {
-    throw new Error('VITE_PRESIGNED_URL_API_URL not configured');
-  }
-  return url;
+  return personUrl('/presigned-url');
 }
 
 /**
  * Browsers report `file.type === ''` for extensions they don't know (`.md` on Windows is the common
- * case). The old behaviour admitted those and sent 'application/octet-stream', which the presigner
+ * case). The old behavior admitted those and sent 'application/octet-stream', which the presigner
  * categorically rejects - a guaranteed late 400 for a file this function had just accepted. The type
  * is inferred from the extension instead, and a file that is STILL unknown is refused here, with the
  * reason, before anything is uploaded.
@@ -99,7 +103,7 @@ export async function uploadFile(
 
   // Presigned POST (fields present): the S3 mechanism built for browser uploads, whose
   // content-length-range condition is a true size cap. The signed fields go ahead of the file part,
-  // verbatim. (The previous presigned PUT signed an exact ContentLength believing it was a ceiling,
+  // verbatim. (The previous presigned PUT signed an exact ContentLength believing it was a maximum,
   // so every real upload failed SignatureDoesNotMatch.) The PUT branch remains only for a backend
   // that predates the POST shape.
   let uploadResponse: Response;

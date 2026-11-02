@@ -4,9 +4,10 @@
  * Frontend client for the channel-battle admin API
  * (POST /channels/battle/enable, /disable; GET /channels/battle).
  *
- * Used by the MembersPanel "Battle Mode" toggle. The endpoint URL
- * comes from VITE_CHANNEL_BATTLE_API_URL (CDK output).
+ * Used by the MembersPanel "Battle Mode" toggle. The routes are on the person API
+ * (VITE_PERSON_API_URL), served when VITE_PERSON_API_CAPABILITIES names `battle`.
  */
+import { personApiServes, personUrl } from '@ae/shared';
 
 export interface ChannelBattleConfig {
   channelArn: string;
@@ -20,9 +21,31 @@ export interface ChannelBattleConfig {
    *  requires `enabled`, only checks `!== false`, so a missing field does not blank the briefing on a
    *  battle that is demonstrably running. */
   battleEligible?: boolean;
+  /**
+   * Whether the assistant in this conversation can READ a file the sender attaches.
+   *
+   * From the profile's `attachmentsReadable` flag, which is the same fact that decides whether the
+   * turn's IAM role carries `s3:GetObject` on the attachments prefix - so this is not a second
+   * opinion about the boundary, it is the boundary reporting itself.
+   *
+   * FAILS CLOSED ON ABSENT: a client talking to an older backend reads `undefined` as "cannot read".
+   *
+   * ── WHAT THE CLIENT ACTUALLY DOES WITH IT, WHICH IS NOT HIDING THE CONTROL ──────────────────────
+   *
+   * This said the composer hides the paperclip. It does not, and must not: sending a colleague a file
+   * needs no assistant, so hiding it would trade an invisible wrong answer for a visible missing
+   * capability. The file always stages; what changes is that `MessageInput` renders a NOTICE beside
+   * it saying the assistant here cannot read files.
+   *
+   * And the notice is withheld while the capability is still in flight (`useAttachmentCapability`
+   * returns `undefined`, not `false`, until the answer lands), because the notice is a statement of
+   * fact and there is no fact yet. Fail-closed is right for withholding an affordance and wrong for
+   * asserting a limitation.
+   */
+  attachmentsReadable?: boolean;
   experimentId?: string;
-  altBotSlotArn?: string;
-  altBotSlotId?: string;
+  /** The challenger's assistant id, `alt-{role}-{classification}`. */
+  challengerAssistant?: string;
   enabledBy?: string;
   enabledAt?: string;
 }
@@ -31,14 +54,17 @@ export interface EnableBattleResult {
   enabled: true;
   channelArn: string;
   experimentId: string;
-  altBotSlotArn: string;
+  challengerAssistant: string;
+  /** The challenger's name, from its profile (the server's `battleSideNames`); never an experiment alias. */
   altBotDisplayName: string;
 }
 
-function getApiUrl(): string {
-  const url = import.meta.env.VITE_CHANNEL_BATTLE_API_URL;
-  if (!url) throw new Error('VITE_CHANNEL_BATTLE_API_URL not configured');
-  return url;
+/**
+ * The battle routes are served only when `VITE_PERSON_API_CAPABILITIES` names `battle`; without it
+ * there is no battle, and a call refuses with that named.
+ */
+function requireBattle(): void {
+  if (!personApiServes('battle')) throw new Error('Battle is not served here (VITE_PERSON_API_CAPABILITIES does not name battle)');
 }
 
 function getIdToken(): string {
@@ -47,9 +73,10 @@ function getIdToken(): string {
   return idToken;
 }
 
-async function apiCall<T>(path: string, init: RequestInit = {}): Promise<T> {
+async function apiCall<T>(url: () => string, init: RequestInit = {}): Promise<T> {
+  requireBattle();
   const idToken = getIdToken();
-  const response = await fetch(`${getApiUrl()}${path}`, {
+  const response = await fetch(url(), {
     ...init,
     headers: {
       'Content-Type': 'application/json',
@@ -67,7 +94,7 @@ async function apiCall<T>(path: string, init: RequestInit = {}): Promise<T> {
 }
 
 export async function getBattleConfig(channelArn: string): Promise<ChannelBattleConfig> {
-  return apiCall<ChannelBattleConfig>(`?channelArn=${encodeURIComponent(channelArn)}`);
+  return apiCall<ChannelBattleConfig>(() => personUrl(`/channels/battle?channelArn=${encodeURIComponent(channelArn)}`));
 }
 
 /**
@@ -76,14 +103,14 @@ export async function getBattleConfig(channelArn: string): Promise<ChannelBattle
  * single active battle-enabled experiment for the channel's classification.
  */
 export async function enableBattle(channelArn: string, experimentId?: string): Promise<EnableBattleResult> {
-  return apiCall<EnableBattleResult>('/enable', {
+  return apiCall<EnableBattleResult>(() => personUrl('/channels/battle/enable'), {
     method: 'POST',
     body: JSON.stringify(experimentId ? { channelArn, experimentId } : { channelArn }),
   });
 }
 
 export async function disableBattle(channelArn: string): Promise<{ enabled: false; channelArn: string }> {
-  return apiCall<{ enabled: false; channelArn: string }>('/disable', {
+  return apiCall<{ enabled: false; channelArn: string }>(() => personUrl('/channels/battle/disable'), {
     method: 'POST',
     body: JSON.stringify({ channelArn }),
   });

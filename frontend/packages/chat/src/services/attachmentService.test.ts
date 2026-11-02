@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { uploadFile, getDownloadUrl } from './attachmentService';
 
 // Mock import.meta.env
-vi.stubEnv('VITE_PRESIGNED_URL_API_URL', 'https://api.example.com/presigned-url');
+vi.stubEnv('VITE_PERSON_API_URL', 'https://api.example.com/');
 
 const mockFetch = vi.fn();
 vi.stubGlobal('fetch', mockFetch);
@@ -70,7 +70,7 @@ describe('uploadFile', () => {
 
   it('uploads via presigned POST when the backend returns policy fields', async () => {
     // The current backend shape. A presigned PUT signed an exact ContentLength believing it was a
-    // ceiling, so every real upload failed SignatureDoesNotMatch (measured live); a POST policy's
+    // maximum, so every real upload failed SignatureDoesNotMatch (measured live); a POST policy's
     // content-length-range is a true cap. The signed fields must be posted verbatim, ahead of the
     // file part - S3 ignores any field after the file.
     const pdf = createFile('doc.pdf', 1024, 'application/pdf');
@@ -100,7 +100,7 @@ describe('uploadFile', () => {
 
   it('infers the type from the extension when the browser reports none', async () => {
     // Browsers report '' for extensions they don't know (.md on Windows is the common case). The old
-    // behaviour admitted these and sent application/octet-stream, which the presigner categorically
+    // behavior admitted these and sent application/octet-stream, which the presigner categorically
     // rejects - a guaranteed LATE 400 for a file this function had just accepted. The type is
     // inferred and the real type is what reaches the presigner and S3.
     const md = createFile('notes.md', 1024, '');

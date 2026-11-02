@@ -36,7 +36,9 @@ describe('reconcile - the self-check that makes the view evidence', () => {
     // (or fewer) exchanges than the number beside it was computed from.
     const r = reconcile('metrics', { total: 55, avg_score: 72.4 }, { count: 40, mean: 72.4 });
     expect(r.status).toBe('mismatch');
-    expect(r.lines.find((l) => l.label === 'Exchanges')?.agrees).toBe(false);
+    // Asserted on the KEY, not the rendered word: `reconcile` runs outside a component and names its
+    // copy rather than holding it, so the key is what identifies the line.
+    expect(r.lines.find((l) => l.labelKey === 'admin.experimentDrill.axis.metrics.countLabel')?.agrees).toBe(false);
   });
 
   it('FAILS on a mean mismatch even when the counts agree', () => {
@@ -108,8 +110,8 @@ describe('ExperimentDrillDown', () => {
         onClose={() => {}}
       />,
     );
-    await waitFor(() => expect(screen.getByText(/DOES NOT reconcile/i)).toBeTruthy());
-    expect(screen.getByText(/Treat the verdict as unverified/i)).toBeTruthy();
+    await waitFor(() => expect(screen.getByText(/Does not match the result above/i)).toBeTruthy());
+    expect(screen.getByText(/Treat the result as unverified/i)).toBeTruthy();
   });
 
   it('confirms agreement when the figures match', async () => {
@@ -123,7 +125,7 @@ describe('ExperimentDrillDown', () => {
         onClose={() => {}}
       />,
     );
-    await waitFor(() => expect(screen.getByText(/Reconciles with the result above/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/Matches the result above/i)).toBeTruthy());
   });
 
   it('states the FULL N when it is showing a page', async () => {
@@ -162,7 +164,7 @@ describe('ExperimentDrillDown', () => {
       />,
     );
     await waitFor(() => expect(screen.getByText(/3 of 10 rows have a redacted or deleted message/i)).toBeTruthy());
-    // The row keeps its numbers; only the transcript is withheld, and it is labelled as such.
+    // The row keeps its numbers; only the transcript is withheld, and it is labeled as such.
     expect(screen.getByText('redacted')).toBeTruthy();
     expect(screen.queryByRole('button', { name: 'View' })).toBeNull();
   });
@@ -200,7 +202,7 @@ describe('ExperimentDrillDown', () => {
     render(
       <ExperimentDrillDown target={target} aggregate={{ count: 100, mean: 40 }} dateRange={range} includeBattle={false} onClose={() => {}} />,
     );
-    await waitFor(() => expect(screen.getByText(/45 of 100 exchanges carry no evaluator score/i)).toBeTruthy());
+    await waitFor(() => expect(screen.getByText(/45 of 100 exchanges have no evaluation score/i)).toBeTruthy());
   });
 
   it('the picks axis warns about picks it cannot trace to a conversation', async () => {

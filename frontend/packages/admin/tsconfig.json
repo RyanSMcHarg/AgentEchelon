@@ -1,7 +1,17 @@
 {
   "extends": "../../tsconfig.base.json",
   "compilerOptions": {
-    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tsbuildinfo"
+    "tsBuildInfoFile": "./node_modules/.tmp/tsconfig.tsbuildinfo",
+    // `node` is here for the TESTS, not for the app. Two guards in this package assert against source
+    // and stylesheet text on disk - that every documentation link resolves to a file that exists, and
+    // that no form control sizes itself inline - because neither fact is observable from a rendered
+    // component: jsdom applies no stylesheet, and a dead external link returns whatever its host feels
+    // like. Reading a file is how you check those, and that needs `fs`.
+    //
+    // It does NOT loosen the app: Vite builds the browser bundle and would fail on a node import from
+    // application code, so the boundary is still enforced, just by the bundler rather than by the
+    // absence of a type.
+    "types": ["vite/client", "node"]
   },
   "include": ["src"]
 }

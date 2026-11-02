@@ -20,6 +20,21 @@
   text-align: center;
 }
 
+/* The staged file will reach people but not the assistant. Built on the archived notice's tokens
+   rather than new values, so the two read as the same KIND of thing - a statement of what this
+   conversation will do, not an error the person caused. Left-aligned because it sits under the file
+   it is about and reads as a caption, where the read-only notice is centered about the whole
+   composer. No warning color: nothing has gone wrong yet, and the send is still legitimate. */
+.message-input-attachment-notice {
+  padding: var(--space-2) var(--space-3);
+  margin-bottom: var(--space-2);
+  font-size: var(--text-sm);
+  color: var(--text-secondary);
+  background: var(--surface-100);
+  border: 1px solid var(--surface-200);
+  border-radius: var(--radius-md);
+}
+
 .message-input-form {
   display: flex;
   align-items: flex-end;
@@ -200,6 +215,46 @@
   animation: fadeIn var(--duration-base) var(--ease-out);
 }
 
+/* THE PRIVACY PICKER WEARS THE SAME CLOTHES AS THE PRIVACY CHIP.
+   The list that applies a Target and the list that does not differ in who can READ the message, and
+   that is the consequence a person cannot take back. Reusing the `--chrome-*` family the "Private to"
+   chip already uses makes the picker and the decoration legible as one act rather than two unrelated
+   widgets that happen to appear in sequence. */
+.mention-dropdown--private {
+  background: var(--chrome-bg);
+  border-color: var(--chrome-border);
+}
+
+.mention-dropdown--private .mention-option {
+  color: var(--chrome-text-bright);
+}
+
+.mention-dropdown--private .mention-option:hover,
+.mention-dropdown--private .mention-option--active {
+  background: var(--chrome-surface);
+}
+
+.mention-dropdown--private .mention-option-name {
+  font-family: var(--font-mono);
+}
+
+.mention-dropdown--private .mention-option-badge {
+  background: var(--chrome-surface);
+  color: var(--chrome-text);
+}
+
+/* Says what the list DOES before it lists names, because "Sam" and "Sam" look identical and only the
+   heading distinguishes addressing him from addressing him privately. */
+.mention-dropdown-heading {
+  padding: var(--space-2) var(--space-3) var(--space-1);
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: var(--tracking-wide);
+  color: var(--chrome-text);
+}
+
 .mention-option {
   display: flex;
   align-items: center;
@@ -283,6 +338,60 @@
 .message-input-sticky-target-chip--bot {
   background: var(--accent-50);
   color: var(--accent-700);
+}
+
+/* ── PRIVATE IS NOT A VARIANT OF ADDRESSING, SO IT IS NOT A VARIANT OF THE CHIP ──
+   The chips above are light `--accent-*` tints, and they distinguish WHO a message addresses -
+   being wrong there costs a notification. This one says the conversation cannot read the message,
+   and being wrong there cannot be undone, so it reads as a different KIND rather than a different
+   hue: solid chrome fill against their tint, which also survives greyscale and colour-blindness
+   because the difference is fill versus tint rather than one colour versus another.
+
+   FOUR REDUNDANT CUES, deliberately, because no single one may be load-bearing: the solid fill, the
+   heavier weight, the monospace name, and the leading dot. */
+.message-input-sticky-target-chip--private {
+  background: var(--chrome-bg);
+  color: var(--chrome-text-bright);
+  border: 1px solid var(--chrome-border);
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: 600;
+  letter-spacing: var(--tracking-normal);
+}
+
+/* The dot the person typed becomes the mark on the chip. The token and its decoration are the same
+   gesture, so the chip is legible as the consequence of `.name` rather than as a separate badge. */
+.message-input-sticky-target-chip--private::before {
+  content: '.';
+  opacity: 0.55;
+  margin-right: 0.1em;
+}
+
+/* THE FIELD ITSELF CHANGES, not only the chip above it.
+   People look at what they are typing into, not at the banner over it - so the strongest protection
+   against sending privately by accident is that the composer does not look the way it usually does.
+   Kept to a rail and a tint so it reads as a mode rather than as an error state. */
+.message-input-form--private .message-textarea {
+  border-color: var(--chrome-border);
+  box-shadow: inset 3px 0 0 0 var(--chrome-bg);
+}
+
+.message-input-form--private .message-input-sticky-target {
+  background: var(--surface-50);
+  border-left: 3px solid var(--chrome-bg);
+}
+
+@media (prefers-reduced-motion: no-preference) {
+  .message-input-sticky-target-chip--private {
+    animation: private-chip-in var(--duration-fast) var(--ease-out);
+  }
+}
+
+/* The one moment worth animating: privacy being APPLIED. It is the instant the person needs to
+   notice, and a chip that simply appears is easy to miss mid-sentence. */
+@keyframes private-chip-in {
+  from { transform: translateY(1px) scale(0.96); opacity: 0; }
+  to { transform: none; opacity: 1; }
 }
 
 .message-input-sticky-target-clear {

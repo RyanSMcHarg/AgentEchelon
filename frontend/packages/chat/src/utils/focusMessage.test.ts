@@ -70,10 +70,10 @@ describe('a pending focus request', () => {
     expect(hasPendingMessageFocus(CONV)).toBe(false);
   });
 
-  it('gives up after the attempt ceiling so auto-scroll recovers', () => {
+  it('gives up after the attempt limit so auto-scroll recovers', () => {
     requestMessageFocus(TARGET, CONV);
 
-    // The ceiling leaves room for more than one render, or the late-arrival case would break.
+    // The limit leaves room for more than one render, or the late-arrival case would break.
     noteMessageFocusMiss();
     noteMessageFocusMiss();
     expect(hasPendingMessageFocus(CONV)).toBe(true);

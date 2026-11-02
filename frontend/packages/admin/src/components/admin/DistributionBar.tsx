@@ -1,4 +1,5 @@
 import React from 'react';
+import { useTranslation } from 'react-i18next';
 
 interface DistributionBarProps {
   /** Lower bound of the axis (e.g., 0 ms). */
@@ -38,6 +39,7 @@ export const DistributionBar: React.FC<DistributionBarProps> = ({
   unit = '',
   width = '100%',
 }) => {
+  const { t } = useTranslation();
   const range = max - min || 1;
   const pct = (v: number) => Math.max(0, Math.min(100, ((v - min) / range) * 100));
 
@@ -63,7 +65,7 @@ export const DistributionBar: React.FC<DistributionBarProps> = ({
           );
         })}
       </div>
-      <div className="distribution-bar-rail" role="img" aria-label="Distribution">
+      <div className="distribution-bar-rail" role="img" aria-label={t('admin.chart.distribution')}>
         {markers.map((m, i) => (
           <span
             key={i}

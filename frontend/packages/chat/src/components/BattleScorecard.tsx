@@ -22,11 +22,14 @@ import { INTENT_STRATEGY_CARDS, getModelStrategyLookup } from '@ae/shared';
 import './BattleScorecard.css';
 
 export interface ScorecardVariant {
-  /** Header label — the bot's stable Chime name (e.g. "AltSlotO" /
-   *  "Assistant"). The persistent assistant principal identity. */
+  /** Header label — what tells this side from the other. The side's name from its profile
+   *  (the challenger's marked when the two match) when the duel carried one, else the bot's own Amazon Chime SDK
+   *  sender name. Resolved by `botMessageLabel`, the same rule the message bubbles use, so a
+   *  side cannot be called one thing above and another thing here. */
   label: string;
-  /** Admin-set persona (e.g. "Atlas" / "Echo"). Shown as a small
-   *  subtitle under the Chime name; not the primary identifier. */
+  /** The assistant principal behind that side (e.g. "Advisor" / "Alt-premium"). Shown as a
+   *  small subtitle; it identifies WHO answered, which the config and per-step expanders are
+   *  about, while the header identifies WHICH ARM it is. */
   persona?: string;
   /** Classified intent for the current turn — surfaced in the config
    *  inspector and per-step rows so the user can see which intent
@@ -164,7 +167,17 @@ const BattleScorecard: React.FC<BattleScorecardProps> = ({ battleId, channelArn,
   );
 
   return (
-    <div className="battle-scorecard" role="group" aria-label={t('battle.scorecard.title', { defaultValue: 'Battle scorecard' })}>
+    // WHICH DUEL THIS SCORECARD IS ABOUT, in the DOM. The component has always held `battleId` and
+    // never exposed it, so two scorecards in one conversation were indistinguishable to anything
+    // reading the page - including the test whose whole subject is that a repeated /battle opens a
+    // FRESH duel rather than reusing the last one's state. Counting cards cannot tell those apart;
+    // comparing ids can.
+    <div
+      className="battle-scorecard"
+      data-battle-id={battleId}
+      role="group"
+      aria-label={t('battle.scorecard.title', { defaultValue: 'Battle scorecard' })}
+    >
       <div className="battle-scorecard-grid">
         <div className="battle-scorecard-corner" />
         <div className="battle-scorecard-head">

@@ -1,0 +1,25 @@
+{
+  "name": "@ae/widget",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "exports": {
+    "./invitation-landing": "./src/invite/landing.tsx"
+  },
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc -b && vite build && vite build -c vite.embed.config.ts",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@ae/shared": "*",
+    "@aws-sdk/client-chime-sdk-messaging": "^3.972.0",
+    "amazon-chime-sdk-js": "^3.31.0",
+    "i18next": "^26.0.4",
+    "react": "^19.2.0",
+    "react-dom": "^19.2.0",
+    "react-i18next": "^17.0.2"
+  }
+}

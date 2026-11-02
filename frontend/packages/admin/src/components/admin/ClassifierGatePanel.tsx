@@ -13,8 +13,10 @@
  *    whatever the truth, and putting them in a queue is the cost this whole design avoids.
  */
 import { useCallback, useEffect, useState } from 'react';
+import { useTranslation } from 'react-i18next';
 import { queryAnalytics } from '../../services/analyticsService';
-import { MODEL_STRATEGY_MODELS } from '@ae/shared';
+import { useCan } from '../../capabilities';
+import { MODEL_STRATEGY_MODELS, classificationName, memberConversationalClassifications } from '@ae/shared';
 import type { AnalyticsDateRange } from '@ae/shared';
 
 /** The gate verdicts the backend can return. */
@@ -30,6 +32,10 @@ interface ReplayRun {
   experimentId: string | null;
   incumbentModel: string;
   challengerModel: string;
+  /** The classification the run read and ran in. Null on a run from before runs named one. */
+  classification?: string | null;
+  /** The assistant whose classifier was compared. */
+  assistant?: string | null;
   windowStart: string;
   windowEnd: string;
   messagesConsidered: number;
@@ -46,6 +52,8 @@ interface GateResult {
   marginPct: number;
   accuracyDelta: number | null;
   accuracyDeltaCi: [number, number] | null;
+  /** Conversations the informative disagreements came from: McNemar's interval is computed per conversation. */
+  informativeConversations?: number;
   summary: {
     total: number;
     concordant: number;
@@ -67,15 +75,22 @@ interface QueueRow {
   proposedLabel: string | null;
 }
 
-export const VERDICT_META: Record<GateVerdict, { label: string; tone: string; authorises: boolean }> = {
-  challenger_better: { label: 'Challenger is better', tone: 'win', authorises: true },
-  non_inferior: { label: 'Not worse (within margin)', tone: 'hold', authorises: true },
-  worse: { label: 'Worse, or cannot rule out worse', tone: 'bad', authorises: false },
-  indistinguishable: { label: 'Indistinguishable on this corpus', tone: 'wait', authorises: false },
-  insufficient: { label: 'Not enough evidence', tone: 'wait', authorises: false },
+/**
+ * What a verdict MEANS, and what it is called.
+ *
+ * `labelKey` rather than a label: this map is module scope, so it has no hook, and resolving at load time
+ * would freeze the language. `tone` and `authorises` are behavior and stay here - `authorises` in
+ * particular decides whether a traffic split is allowed, which must never depend on a display string.
+ */
+export const VERDICT_META: Record<GateVerdict, { labelKey: string; tone: string; authorises: boolean }> = {
+  challenger_better: { labelKey: 'admin.classifierGate.verdict.challengerBetter', tone: 'win', authorises: true },
+  non_inferior: { labelKey: 'admin.classifierGate.verdict.nonInferior', tone: 'hold', authorises: true },
+  worse: { labelKey: 'admin.classifierGate.verdict.worse', tone: 'bad', authorises: false },
+  indistinguishable: { labelKey: 'admin.classifierGate.verdict.indistinguishable', tone: 'wait', authorises: false },
+  insufficient: { labelKey: 'admin.classifierGate.verdict.insufficient', tone: 'wait', authorises: false },
 };
 
-/** A gate result only authorises a traffic split when the run FINISHED and its verdict clears. */
+/** A gate result only authorizes a traffic split when the run FINISHED and its verdict clears. */
 export function gateAuthorisesSplit(run: ReplayRun | null, gate: GateResult | null): boolean {
   if (!run || !gate) return false;
   if (run.status !== 'complete') return false;
@@ -105,7 +120,17 @@ const shortDate = (s: string) => (s ? new Date(s).toLocaleDateString() : '—');
  */
 const MODEL_OPTIONS = MODEL_STRATEGY_MODELS.map((m) => ({ value: m.key, label: m.displayName }));
 
+/**
+ * The classification a replay runs in, from the same list the experiment form offers: the deployment's
+ * declared member conversational classifications (`memberConversationalClassifications`). A replay reads one
+ * classification's traffic with that classification's models only (tenet D12), so it is evidence about that
+ * classification, and the experiment form looks for a passing run per classification its split covers.
+ */
+
 export default function ClassifierGatePanel({ dateRange }: { dateRange: AnalyticsDateRange }) {
+  const { t } = useTranslation();
+  // Each control renders only for a role holding its capability (SPEC-ADMIN-CONSOLE FR0f, FR36).
+  const can = useCan();
   const [runs, setRuns] = useState<ReplayRun[]>([]);
   const [selected, setSelected] = useState<string | null>(null);
   const [detail, setDetail] = useState<{ run: ReplayRun; gate: GateResult } | null>(null);
@@ -113,7 +138,8 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
   const [queueTotal, setQueueTotal] = useState(0);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [form, setForm] = useState({ incumbentModel: '', challengerModel: '', windowDays: '30', limit: '200' });
+  const classificationOptions = memberConversationalClassifications().map((c) => c.value);
+  const [form, setForm] = useState({ classification: classificationOptions[0] ?? '', incumbentModel: '', challengerModel: '', windowDays: '30', limit: '200' });
   const [otherLabel, setOtherLabel] = useState<Record<string, string>>({});
 
   const loadRuns = useCallback(async () => {
@@ -121,7 +147,7 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
       const res = await queryAnalytics('classifier_replays', dateRange, {});
       setRuns(((res.data as unknown) as ReplayRun[]) ?? []);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not load replay runs');
+      setError(e instanceof Error ? e.message : t('admin.classifierGate.couldNotLoadReplayRuns'));
     }
   }, [dateRange]);
 
@@ -138,7 +164,7 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
       setQueue(((q.data as unknown) as QueueRow[]) ?? []);
       setQueueTotal(Number(q.total ?? 0));
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not load the replay');
+      setError(e instanceof Error ? e.message : t('admin.classifierGate.couldNotLoadTheReplay'));
     }
   }, [dateRange]);
 
@@ -176,6 +202,7 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
     setError(null);
     try {
       const res = (await queryAnalytics('classifier_replay_start', dateRange, {
+        classification: form.classification,
         incumbentModel: form.incumbentModel.trim(),
         challengerModel: form.challengerModel.trim(),
         windowDays: form.windowDays,
@@ -183,7 +210,7 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
       })) as unknown as { run: ReplayRun };
       const runId = res?.run?.runId;
       if (!runId) {
-        setError('The replay was accepted but no run id came back');
+        setError(t('admin.classifierGate.theReplayWasAcceptedBut'));
         return;
       }
       const opened = await waitForRun(runId);
@@ -192,12 +219,12 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
         setSelected(runId);
       } else {
         setError(
-          'The replay was accepted but its run never opened. Nothing was replayed — check the ' +
-            'replay function’s logs before reading any earlier run as current.',
+          t('admin.classifierGate.theReplayWasAcceptedBut2') +
+            t('admin.classifierGate.replayFunctionSLogsBefore'),
         );
       }
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not start the replay');
+      setError(e instanceof Error ? e.message : t('admin.classifierGate.couldNotStartTheReplay'));
     } finally {
       setBusy(false);
     }
@@ -210,7 +237,7 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
       await queryAnalytics('classifier_replay_adjudicate', dateRange, { labelId, trueLabel: trueLabel.trim() });
       await loadDetail(selected);
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'Could not record the ruling');
+      setError(e instanceof Error ? e.message : t('admin.classifierGate.couldNotRecordTheRuling'));
     } finally {
       setBusy(false);
     }
@@ -223,7 +250,7 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
 
   return (
     <div className="admin-section cgate">
-      <h4>Classifier accuracy gate</h4>
+      <h4>{t('admin.classifierGate.classifierAccuracyGate')}</h4>
       <p className="admin-tab-description">
         Replays archived messages through two classifier candidates and compares them on the pairs
         where they disagree. No user is exposed: nothing here runs on a live turn. A passing gate
@@ -244,36 +271,49 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
           AccessDenies at the model call.
         */}
         <select
-          aria-label="Incumbent model"
+          className="select input"
+          aria-label={t('admin.classifierGate.classificationField')}
+          value={form.classification}
+          onChange={(e) => setForm({ ...form, classification: e.target.value })}
+        >
+          {classificationOptions.map((c) => <option key={c} value={c}>{classificationName(c)}</option>)}
+        </select>
+        <select
+          className="select input"
+          aria-label={t('admin.classifierGate.incumbentModelField')}
           value={form.incumbentModel}
           onChange={(e) => setForm({ ...form, incumbentModel: e.target.value })}
         >
-          <option value="">incumbent model…</option>
+          <option value="">{t('admin.classifierGate.incumbentModel')}</option>
           {MODEL_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
         <select
-          aria-label="Challenger model"
+          className="select input"
+          aria-label={t('admin.classifierGate.challengerModelField')}
           value={form.challengerModel}
           onChange={(e) => setForm({ ...form, challengerModel: e.target.value })}
         >
-          <option value="">challenger model…</option>
+          <option value="">{t('admin.classifierGate.challengerModel')}</option>
           {MODEL_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
         </select>
         <input
-          aria-label="Window (days)"
+          className="input"
+          aria-label={t('admin.classifierGate.windowDays')}
           type="number"
           value={form.windowDays}
           onChange={(e) => setForm({ ...form, windowDays: e.target.value })}
         />
         <input
-          aria-label="Messages"
+          className="input"
+          aria-label={t('admin.classifierGate.messages')}
           type="number"
           value={form.limit}
           onChange={(e) => setForm({ ...form, limit: e.target.value })}
         />
         <button
-          className="admin-inline-btn"
-          disabled={busy || !form.incumbentModel.trim() || !form.challengerModel.trim()}
+          className="btn-secondary"
+          disabled={busy || !form.incumbentModel.trim() || !form.challengerModel.trim() || !can('run-classifier-replay')}
+          title={can('run-classifier-replay') ? undefined : t('admin.refusal.lacksCapability', { capability: 'run-classifier-replay' })}
           onClick={startReplay}
         >
           Run replay
@@ -282,22 +322,21 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
 
       {runs.length === 0 ? (
         <p className="admin-tab-description">
-          No replay has been run. A classification experiment measured without one is judged on the
-          answer rather than on the labelling it actually changed.
+          {t('admin.classifierGate.noReplayHasBeenRun')}
         </p>
       ) : (
         <ul className="cgate-runs">
           {runs.map((r) => (
             <li key={r.runId}>
               <button
-                className="admin-link-btn"
+                className="btn-link"
                 aria-pressed={selected === r.runId}
                 onClick={() => setSelected(r.runId)}
               >
                 {r.incumbentModel} vs {r.challengerModel}
               </button>
               <span className="cgate-run-meta">
-                {shortDate(r.windowStart)}–{shortDate(r.windowEnd)} · {r.status}
+                {r.classification ?? t('admin.classifierGate.everyClassification')} · {shortDate(r.windowStart)}–{shortDate(r.windowEnd)} · {r.status}
                 {r.status === 'running' && ' (replaying…)'}
               </span>
             </li>
@@ -317,7 +356,7 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
           )}
 
           <div className="cgate-verdict" data-tone={meta?.tone}>
-            <span className="cgate-verdict-label">{meta?.label}</span>
+            <span className="cgate-verdict-label">{meta ? t(meta.labelKey) : null}</span>
             <span className="cgate-verdict-margin">margin {gate.marginPct} points</span>
             {gate.accuracyDelta != null && gate.accuracyDeltaCi && (
               <span className="cgate-verdict-detail">
@@ -332,23 +371,26 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
           <p className="cgate-corpus">
             Replayed {run.messagesReplayed.toLocaleString()} of {run.messagesConsidered.toLocaleString()} messages
             from {shortDate(run.windowStart)} to {shortDate(run.windowEnd)}.
-            {run.messagesRetracted > 0 && ` ${run.messagesRetracted.toLocaleString()} were retracted by a redaction or deletion and were never replayed.`}
-            {run.messagesFastPath > 0 && ` ${run.messagesFastPath.toLocaleString()} are answered without a model (greetings and acknowledgements) and are excluded.`}
+            {run.messagesRetracted > 0 && t('admin.classifierGate.wereRetractedByARedaction', { messagesRetracted: run.messagesRetracted.toLocaleString() })}
+            {run.messagesFastPath > 0 && t('admin.classifierGate.areAnsweredWithoutAModel', { messagesFastPath: run.messagesFastPath.toLocaleString() })}
           </p>
 
           <div className="cgate-cells">
-            <span>Agreed: <strong>{gate.summary.concordant.toLocaleString()}</strong></span>
-            <span>Disagreed: <strong>{gate.summary.discordant.toLocaleString()}</strong></span>
-            <span>Challenger right: <strong>{gate.summary.challengerOnlyRight.toLocaleString()}</strong></span>
-            <span>Incumbent right: <strong>{gate.summary.incumbentOnlyRight.toLocaleString()}</strong></span>
-            <span>Both wrong: <strong>{gate.summary.bothWrong.toLocaleString()}</strong></span>
+            <span>{t('admin.classifierGate.agreed')} <strong>{gate.summary.concordant.toLocaleString()}</strong></span>
+            <span>{t('admin.classifierGate.disagreed')} <strong>{gate.summary.discordant.toLocaleString()}</strong></span>
+            <span>{t('admin.classifierGate.challengerRight')} <strong>{gate.summary.challengerOnlyRight.toLocaleString()}</strong></span>
+            <span>{t('admin.classifierGate.incumbentRight')} <strong>{gate.summary.incumbentOnlyRight.toLocaleString()}</strong></span>
+            <span>{t('admin.classifierGate.bothWrong')} <strong>{gate.summary.bothWrong.toLocaleString()}</strong></span>
+            {gate.informativeConversations != null && (
+              <span>{t('admin.classifierGate.informativeConversations')} <strong>{gate.informativeConversations.toLocaleString()}</strong></span>
+            )}
           </div>
 
           {/* §5.4: the gate sizes the split before it runs. */}
           {disagreement != null && (
             <p className="cgate-sizing">
               The two models disagreed on {pct(disagreement)} of the replayed messages.
-              {disagreement < 0.01 && ' At that rate an online split has almost nothing to detect, and is probably not worth running.'}
+              {disagreement < 0.01 && t('admin.classifierGate.atThatRateAnOnline')}
             </p>
           )}
 
@@ -356,15 +398,14 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
             <>
               <h5 className="cgate-queue-title">
                 Adjudication queue · {gate.summary.pending.toLocaleString()} pending
-                {queueTotal > queue.length && ` (showing ${queue.length} of ${queueTotal.toLocaleString()})`}
+                {queueTotal > queue.length && t('admin.classifierGate.showingOf', { queue: queue.length, queueTotal: queueTotal.toLocaleString() })}
               </h5>
               <p className="admin-tab-description">
-                Only the disagreements are here. Where both models said the same thing the pair cannot
-                favour either, so it is never queued. Rule for whichever is correct, or for neither.
+                {t('admin.classifierGate.onlyTheDisagreementsAreHere')}
               </p>
               <table className="cgate-queue">
                 <thead>
-                  <tr><th>Incumbent said</th><th>Challenger said</th><th>Correct label</th></tr>
+                  <tr><th>{t('admin.classifierGate.incumbentSaid')}</th><th>{t('admin.classifierGate.challengerSaid')}</th><th>{t('admin.classifierGate.correctLabel')}</th></tr>
                 </thead>
                 <tbody>
                   {queue.map((row) => (
@@ -372,23 +413,24 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
                       <td><code>{row.incumbentLabel}</code></td>
                       <td><code>{row.challengerLabel}</code></td>
                       <td className="cgate-queue-actions">
-                        <button className="admin-inline-btn" disabled={busy} onClick={() => adjudicate(row.id, row.incumbentLabel)}>
+                        <button className="btn-secondary" disabled={busy || !can('label-ground-truth')} onClick={() => adjudicate(row.id, row.incumbentLabel)}>
                           {row.incumbentLabel}
                         </button>
-                        <button className="admin-inline-btn" disabled={busy} onClick={() => adjudicate(row.id, row.challengerLabel)}>
+                        <button className="btn-secondary" disabled={busy || !can('label-ground-truth')} onClick={() => adjudicate(row.id, row.challengerLabel)}>
                           {row.challengerLabel}
                         </button>
                         {/* 'Neither' is a real outcome. Forcing a choice between the two predictions
                             would manufacture a winner from a pair that has none. */}
                         <input
-                          aria-label={`Neither, for pair ${row.id}`}
-                          placeholder="neither — correct label"
+                          className="input"
+                          aria-label={t('admin.classifierGate.neitherForPair', { id: row.id })}
+                          placeholder={t('admin.classifierGate.neitherCorrectLabel')}
                           value={otherLabel[row.id] ?? ''}
                           onChange={(e) => setOtherLabel({ ...otherLabel, [row.id]: e.target.value })}
                         />
                         <button
-                          className="admin-inline-btn"
-                          disabled={busy || !(otherLabel[row.id] ?? '').trim()}
+                          className="btn-secondary"
+                          disabled={busy || !(otherLabel[row.id] ?? '').trim() || !can('label-ground-truth')}
                           onClick={() => adjudicate(row.id, otherLabel[row.id] ?? '')}
                         >
                           Neither
@@ -402,8 +444,8 @@ export default function ClassifierGatePanel({ dateRange }: { dateRange: Analytic
           ) : (
             <p className="admin-tab-description">
               {gate.summary.discordant === 0
-                ? 'The models agreed on every replayed message, so there is nothing to adjudicate.'
-                : 'Every disagreement has been ruled on.'}
+                ? t('admin.classifierGate.theModelsAgreedOnEvery')
+                : t('admin.classifierGate.everyDisagreementHasBeenRuled')}
             </p>
           )}
         </div>

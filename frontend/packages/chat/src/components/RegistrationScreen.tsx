@@ -1,7 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useTranslation } from 'react-i18next';
 import type { UserTier } from '@ae/shared';
-import { trackEvent } from '@ae/shared';
+import { trackEvent, memberConversationalClassifications } from '@ae/shared';
 import './RegistrationScreen.css';
 
 interface RegistrationScreenProps {
@@ -14,7 +14,10 @@ const RegistrationScreen: React.FC<RegistrationScreenProps> = ({ onRegister, onS
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
   const [confirmPassword, setConfirmPassword] = useState('');
-  const [selectedTier, setSelectedTier] = useState<UserTier>('basic');
+  // THE DEPLOYMENT'S OWN CONVERSATIONAL CLASSIFICATIONS, in declaration order, by their declared names. A sign-up
+  // only REQUESTS one: an administrator approves the clearance, and a value the deployment does not declare lands in no clearance group.
+  const tierOptions = memberConversationalClassifications();
+  const [selectedTier, setSelectedTier] = useState<UserTier>(tierOptions[0]?.value ?? '');
   const [isLoading, setIsLoading] = useState(false);
   const [error, setError] = useState('');
   const [showPasswordHelp, setShowPasswordHelp] = useState(false);
@@ -138,50 +141,22 @@ const RegistrationScreen: React.FC<RegistrationScreenProps> = ({ onRegister, onS
             <div className="form-group">
               <label>{t('auth.register.tierLabel')}</label>
               <div className="tier-selection">
-                <label className={`tier-option ${selectedTier === 'basic' ? 'selected' : ''}`}>
-                  <input
-                    type="radio"
-                    name="tier"
-                    value="basic"
-                    checked={selectedTier === 'basic'}
-                    onChange={() => setSelectedTier('basic')}
-                    disabled={isLoading}
-                  />
-                  <div className="tier-info">
-                    <span className="tier-name">{t('auth.register.tierBasic')}</span>
-                    <span className="tier-models">{t('auth.register.tierBasicModels')}</span>
-                  </div>
-                </label>
-
-                <label className={`tier-option ${selectedTier === 'standard' ? 'selected' : ''}`}>
-                  <input
-                    type="radio"
-                    name="tier"
-                    value="standard"
-                    checked={selectedTier === 'standard'}
-                    onChange={() => setSelectedTier('standard')}
-                    disabled={isLoading}
-                  />
-                  <div className="tier-info">
-                    <span className="tier-name">{t('auth.register.tierStandard')}</span>
-                    <span className="tier-models">{t('auth.register.tierStandardModels')}</span>
-                  </div>
-                </label>
-
-                <label className={`tier-option ${selectedTier === 'premium' ? 'selected' : ''}`}>
-                  <input
-                    type="radio"
-                    name="tier"
-                    value="premium"
-                    checked={selectedTier === 'premium'}
-                    onChange={() => setSelectedTier('premium')}
-                    disabled={isLoading}
-                  />
-                  <div className="tier-info">
-                    <span className="tier-name">{t('auth.register.tierPremium')}</span>
-                    <span className="tier-models">{t('auth.register.tierPremiumModels')}</span>
-                  </div>
-                </label>
+                {tierOptions.map((c) => (
+                  <label key={c.value} className={`tier-option ${selectedTier === c.value ? 'selected' : ''}`}>
+                    <input
+                      type="radio"
+                      name="tier"
+                      value={c.value}
+                      checked={selectedTier === c.value}
+                      onChange={() => setSelectedTier(c.value)}
+                      disabled={isLoading}
+                    />
+                    <div className="tier-info">
+                      <span className="tier-name">{c.displayName}</span>
+                      <span className="tier-models">{t(`auth.register.classModels.${c.value}`, { defaultValue: '' })}</span>
+                    </div>
+                  </label>
+                ))}
               </div>
             </div>
 

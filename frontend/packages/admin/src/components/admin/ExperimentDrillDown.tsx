@@ -13,6 +13,8 @@
  * carries its own query, its own predicate and its own statement of what is being shown.
  */
 import { useEffect, useMemo, useState } from 'react';
+import { useTranslation } from 'react-i18next';
+import type { TFunction } from 'i18next';
 import DataTable from './DataTable';
 import { queryAnalytics } from '../../services/analyticsService';
 import type { AnalyticsDateRange, AnalyticsResult, QueryType } from '@ae/shared';
@@ -39,59 +41,32 @@ export interface DrillAggregate {
   mean: number | null;
 }
 
+/**
+ * What an axis IS, as opposed to what it is called.
+ *
+ * The copy - title, population, and the two column labels - lives in `en.json` under
+ * `admin.experimentDrill.axis.<axis>`, because this map is module scope and cannot hold a hook. What
+ * stays here is behavior: which query to run, which params it needs, and whether the axis has a mean at
+ * all. `hasMean` replaced a nullable `meanLabel` whose null-ness was doing the deciding - a label
+ * standing in for a flag reads as copy and gets translated away by accident.
+ */
 interface AxisMeta {
   queryType: QueryType;
-  title: string;
-  /** What the operator is looking at, in the terms that make the population unambiguous. */
-  population: string;
-  countLabel: string;
-  meanLabel: string | null;
+  /** A picks axis reconciles on its count alone; there is no mean to compare. */
+  hasMean: boolean;
   /** Extra params beyond experimentId/variantId/paging. */
   params?: Record<string, string>;
 }
 
+/** Copy for an axis, by the field the view asks for. */
+export const axisKey = (axis: DrillAxis, field: 'title' | 'population' | 'countLabel' | 'meanLabel'): string =>
+  `admin.experimentDrill.axis.${axis}.${field}`;
+
 export const AXES: Record<DrillAxis, AxisMeta> = {
-  metrics: {
-    queryType: 'experiment_exchanges',
-    title: 'Exchanges behind the metrics',
-    population:
-      'Randomly assigned turns only. Battle turns are excluded, exactly as they are from the A/B '
-      + 'averages beside this - a battle variant is chosen rather than assigned, so counting those '
-      + 'turns here would show evidence the comparison did not use.',
-    countLabel: 'Exchanges',
-    meanLabel: 'Quality (avg)',
-    params: { axis: 'metrics' },
-  },
-  battle: {
-    queryType: 'experiment_exchanges',
-    title: 'Battle turns',
-    population:
-      'Battle turns only - the replies produced inside a duel. These are what the battle scorecard '
-      + 'averages. They are NOT the picks: a duel produces a turn from each side and at most one '
-      + 'pick per person.',
-    countLabel: 'Turns',
-    meanLabel: 'Quality (avg)',
-    params: { axis: 'battle' },
-  },
-  approval: {
-    queryType: 'experiment_feedback',
-    title: 'Ratings behind the approval rate',
-    population:
-      'One row per counted vote on ordinary traffic. Thumbs are self-selected, so only a fraction of '
-      + 'exchanges carry one. A voter who changed their mind appears once, on the thumb they ended '
-      + 'on; a withdrawn thumb is not shown because it is not counted.',
-    countLabel: 'Votes',
-    meanLabel: 'Approval',
-  },
-  picks: {
-    queryType: 'experiment_picks',
-    title: 'Head-to-head picks',
-    population:
-      'One row per counted pick. A tie credits neither side and is therefore not counted and not '
-      + 'shown - this list is shorter than the number of duels run.',
-    countLabel: 'Picks',
-    meanLabel: null,
-  },
+  metrics: { queryType: 'experiment_exchanges', hasMean: true, params: { axis: 'metrics' } },
+  battle: { queryType: 'experiment_exchanges', hasMean: true, params: { axis: 'battle' } },
+  approval: { queryType: 'experiment_feedback', hasMean: true },
+  picks: { queryType: 'experiment_picks', hasMean: false },
 };
 
 // ---------------------------------------------------------------------------
@@ -99,7 +74,8 @@ export const AXES: Record<DrillAxis, AxisMeta> = {
 // ---------------------------------------------------------------------------
 
 export interface ReconLine {
-  label: string;
+  /** Locale key for the line's label. `reconcile` runs outside a component, so it names copy, never holds it. */
+  labelKey: string;
   /** What the drill-down's own full-match figures say. */
   shown: string;
   /** What the console displays beside the verdict. */
@@ -110,7 +86,8 @@ export interface ReconLine {
 export interface Reconciliation {
   status: 'ok' | 'mismatch' | 'unavailable';
   lines: ReconLine[];
-  note?: string;
+  /** Locale key for the note, for the same reason `ReconLine` carries a key. */
+  noteKey?: string;
 }
 
 /** Means are compared with a tolerance because the aggregate rounds per row before weighting them;
@@ -130,7 +107,7 @@ export function reconcile(
   stats: Record<string, number | string | null> | undefined,
   aggregate: DrillAggregate,
 ): Reconciliation {
-  if (!stats) return { status: 'unavailable', lines: [], note: 'The drill-down returned no totals to check against.' };
+  if (!stats) return { status: 'unavailable', lines: [], noteKey: 'admin.experimentDrill.recon.noTotals' };
 
   const num = (v: unknown): number | null => {
     const n = Number(v);
@@ -141,20 +118,19 @@ export function reconcile(
   const shownCount = num(stats.total);
   if (shownCount != null && aggregate.count != null) {
     lines.push({
-      label: AXES[axis].countLabel,
+      labelKey: axisKey(axis, 'countLabel'),
       shown: shownCount.toLocaleString(),
       aggregate: aggregate.count.toLocaleString(),
       agrees: shownCount === aggregate.count,
     });
   }
 
-  const meanLabel = AXES[axis].meanLabel;
-  if (meanLabel) {
+  if (AXES[axis].hasMean) {
     const shownMean = axis === 'approval' ? num(stats.approval_rate) : num(stats.avg_score);
     if (shownMean != null && aggregate.mean != null) {
       const suffix = axis === 'approval' ? '%' : '';
       lines.push({
-        label: meanLabel,
+        labelKey: axisKey(axis, 'meanLabel'),
         shown: `${Math.round(shownMean * 10) / 10}${suffix}`,
         aggregate: `${Math.round(aggregate.mean * 10) / 10}${suffix}`,
         agrees: Math.abs(shownMean - aggregate.mean) <= MEAN_TOLERANCE,
@@ -163,26 +139,25 @@ export function reconcile(
   }
 
   if (!lines.length) {
-    return {
-      status: 'unavailable',
-      lines,
-      note: 'Nothing to check yet - the console has no aggregate for this variant on this axis.',
-    };
+    return { status: 'unavailable', lines, noteKey: 'admin.experimentDrill.recon.noAggregate' };
   }
   return { status: lines.every((l) => l.agrees) ? 'ok' : 'mismatch', lines };
 }
 
-/** Unscored exchanges count as ZERO in the mean, because that is what the aggregate does. Stating it
- *  is the difference between an operator being able to reproduce the number and merely seeing it. */
-function scoringNote(stats: Record<string, number | string | null> | undefined): string | null {
+/**
+ * Unscored exchanges count as ZERO in the mean, because that is what the aggregate does. Stating it
+ * is the difference between an operator being able to reproduce the number and merely seeing it.
+ *
+ * Returns the two counts rather than the sentence: the sentence is interpolated at the view, where a
+ * `t()` is in scope and a translator can reorder the clause around the numbers.
+ */
+function scoringCoverage(stats: Record<string, number | string | null> | undefined): { unscored: number; total: number } | null {
   if (!stats) return null;
   const total = Number(stats.total);
   const scored = Number(stats.scored_count);
   if (!Number.isFinite(total) || !Number.isFinite(scored) || total === 0) return null;
   if (scored >= total) return null;
-  return `${(total - scored).toLocaleString()} of ${total.toLocaleString()} exchanges carry no evaluator score. `
-    + 'They count as 0 in the mean above, matching the aggregate - so part of this average is scoring '
-    + 'coverage rather than reply quality.';
+  return { unscored: total - scored, total };
 }
 
 // ---------------------------------------------------------------------------
@@ -202,43 +177,52 @@ function TranscriptCell({
   row: Row;
   onOpenConversation?: (channelArn: string) => void;
 }) {
+  const { t: translate } = useTranslation();
   const arn = row.channel_arn ? String(row.channel_arn) : '';
   const withheld = row.deleted === true || row.redacted === true;
   if (withheld) {
     // Redaction and deletion carry through: the row still counted toward the score, so it stays, but
     // the content it contributed was retracted and must not be reachable from here.
     return (
-      <span className="exp-drill-withheld" title="This exchange counted toward the score. Its content was redacted or deleted, so the transcript is withheld.">
+      <span className="exp-drill-withheld" title={translate('admin.experimentDrill.thisExchangeCountedTowardThe')}>
         {row.deleted === true ? 'deleted' : 'redacted'}
       </span>
     );
   }
   if (!arn || !onOpenConversation) return <span className="exp-drill-muted">—</span>;
   return (
-    <button className="admin-link-btn" onClick={(e) => { e.stopPropagation(); onOpenConversation(arn); }}>
+    <button className="btn-link" onClick={(e) => { e.stopPropagation(); onOpenConversation(arn); }}>
       View
     </button>
   );
 }
 
-function columnsFor(axis: DrillAxis, onOpenConversation?: (arn: string) => void) {
+/**
+ * `t` is a parameter because this builds column headers outside a component, and a header is copy a
+ * person reads. Leaving these as English beside a translated body is the half-converted state that
+ * reads as finished.
+ */
+function columnsFor(axis: DrillAxis, t: TFunction, onOpenConversation?: (arn: string) => void) {
+  const col = (key: string) => t(`admin.experimentDrill.column.${key}`);
   const transcript = {
     key: 'channel_arn',
-    label: 'Transcript',
+    label: col('transcript'),
     sortable: false,
     render: (_v: unknown, row: Row) => <TranscriptCell row={row} onOpenConversation={onOpenConversation} />,
   };
 
   if (axis === 'approval') {
     return [
-      { key: 'created_at', label: 'When', render: fmtWhen },
-      { key: 'variant_id', label: 'Variant' },
-      { key: 'intent', label: 'Intent' },
+      { key: 'created_at', label: col('when'), render: fmtWhen },
+      { key: 'variant_id', label: col('variant') },
+      { key: 'intent', label: col('intent') },
       {
         key: 'feedback',
-        label: 'Vote',
+        label: col('vote'),
         render: (v: unknown) => (
-          <span className="exp-drill-vote" data-vote={String(v)}>{v === 'up' ? '👍 up' : '👎 down'}</span>
+          <span className="exp-drill-vote" data-vote={String(v)}>
+            {v === 'up' ? t('admin.experimentDrill.vote.up') : t('admin.experimentDrill.vote.down')}
+          </span>
         ),
       },
       transcript,
@@ -246,28 +230,30 @@ function columnsFor(axis: DrillAxis, onOpenConversation?: (arn: string) => void)
   }
   if (axis === 'picks') {
     return [
-      { key: 'chosen_at', label: 'When', render: fmtWhen },
-      { key: 'variant_id', label: 'Picked' },
-      { key: 'intent', label: 'Intent' },
-      { key: 'battle_id', label: 'Battle', render: (v: unknown) => (v ? String(v).slice(0, 8) : '—') },
+      { key: 'chosen_at', label: col('when'), render: fmtWhen },
+      { key: 'variant_id', label: col('picked') },
+      { key: 'intent', label: col('intent') },
+      { key: 'battle_id', label: col('battle'), render: (v: unknown) => (v ? String(v).slice(0, 8) : '—') },
       transcript,
     ];
   }
   return [
-    { key: 'created_at', label: 'When', render: fmtWhen },
-    { key: 'variant_id', label: 'Variant' },
+    { key: 'created_at', label: col('when'), render: fmtWhen },
+    { key: 'variant_id', label: col('variant') },
     {
       key: 'relevance_score',
-      label: 'Quality',
+      label: col('quality'),
       sortable: true,
       // An unscored exchange is '—' here and 0 in the mean. Showing 0 would misreport it as a bad
       // reply rather than an unjudged one.
-      render: (v: unknown) => (v == null ? <span className="exp-drill-muted" title="not scored — counts as 0 in the mean">—</span> : String(v)),
+      render: (v: unknown) => (v == null
+        ? <span className="exp-drill-muted" title={t('admin.experimentDrill.notScoredTitle')}>—</span>
+        : String(v)),
     },
-    { key: 'total_ms', label: 'Latency', sortable: true, render: fmtMs },
-    { key: 'input_tokens', label: 'In', sortable: true },
-    { key: 'output_tokens', label: 'Out', sortable: true },
-    { key: 'bedrock_model', label: 'Model', render: (v: unknown) => (v ? String(v) : '—') },
+    { key: 'total_ms', label: col('latency'), sortable: true, render: fmtMs },
+    { key: 'input_tokens', label: col('tokensIn'), sortable: true },
+    { key: 'output_tokens', label: col('tokensOut'), sortable: true },
+    { key: 'bedrock_model', label: col('model'), render: (v: unknown) => (v ? String(v) : '—') },
     transcript,
   ];
 }
@@ -297,6 +283,7 @@ export default function ExperimentDrillDown({
   onClose: () => void;
   onOpenConversation?: (channelArn: string) => void;
 }) {
+  const { t: translate } = useTranslation();
   const [page, setPage] = useState(0);
   const [result, setResult] = useState<AnalyticsResult | null>(null);
   const [loading, setLoading] = useState(false);
@@ -326,7 +313,7 @@ export default function ExperimentDrillDown({
       } catch (e) {
         if (!cancelled) {
           setResult(null);
-          setError(e instanceof Error ? e.message : 'Failed to load the exchanges behind this result');
+          setError(e instanceof Error ? e.message : translate('admin.experimentDrill.failedToLoadTheExchanges'));
         }
       } finally {
         if (!cancelled) setLoading(false);
@@ -344,18 +331,18 @@ export default function ExperimentDrillDown({
   const recon = useMemo(() => reconcile(target.axis, stats, aggregate), [target.axis, stats, aggregate]);
   const withheld = Number(stats?.withheld_count ?? 0);
   const unresolved = Number(stats?.unresolved_conversations ?? 0);
-  const coverage = scoringNote(stats);
+  const coverage = scoringCoverage(stats);
 
   return (
     <div className="exp-drill">
       <div className="exp-drill-head">
         <div>
           <h5 className="exp-drill-title">
-            {meta.title} · <span className="exp-drill-variant">{target.variantId}</span>
+            {translate(axisKey(target.axis, 'title'))} · <span className="exp-drill-variant">{target.variantId}</span>
           </h5>
-          <p className="exp-drill-population">{meta.population}</p>
+          <p className="exp-drill-population">{translate(axisKey(target.axis, 'population'))}</p>
         </div>
-        <button className="admin-inline-btn" onClick={onClose}>Close</button>
+        <button className="btn-secondary" onClick={onClose}>Close</button>
       </div>
 
       {error && <div className="admin-error"><span>{error}</span></div>}
@@ -363,23 +350,26 @@ export default function ExperimentDrillDown({
       {!error && (
         <div className="exp-drill-recon" data-status={recon.status}>
           {recon.status === 'unavailable' ? (
-            <span className="exp-drill-recon-note">{recon.note}</span>
+            <span className="exp-drill-recon-note">{recon.noteKey ? translate(recon.noteKey) : null}</span>
           ) : (
             <>
               <span className="exp-drill-recon-verdict">
                 {recon.status === 'ok'
-                  ? 'Reconciles with the result above'
-                  : 'DOES NOT reconcile with the result above'}
+                  ? translate('admin.experimentDrill.recon.reconciles')
+                  : translate('admin.experimentDrill.recon.doesNotReconcile')}
               </span>
               {recon.lines.map((l) => (
-                <span className="exp-drill-recon-line" data-agrees={l.agrees} key={l.label}>
-                  {l.label}: {l.shown} here vs {l.aggregate} shown
+                <span className="exp-drill-recon-line" data-agrees={l.agrees} key={l.labelKey}>
+                  {translate('admin.experimentDrill.recon.line', {
+                    label: translate(l.labelKey),
+                    shown: l.shown,
+                    aggregate: l.aggregate,
+                  })}
                 </span>
               ))}
               {recon.status === 'mismatch' && (
                 <span className="exp-drill-recon-note">
-                  These should be identical - they are two readings of the same set. Treat the
-                  verdict as unverified until they agree.
+                  {translate('admin.experimentDrill.theseShouldBeIdenticalThey')}
                 </span>
               )}
             </>
@@ -387,7 +377,14 @@ export default function ExperimentDrillDown({
         </div>
       )}
 
-      {coverage && <p className="exp-drill-note">{coverage}</p>}
+      {coverage && (
+        <p className="exp-drill-note">
+          {translate('admin.experimentDrill.scoringCoverage', {
+            unscored: coverage.unscored.toLocaleString(),
+            total: coverage.total.toLocaleString(),
+          })}
+        </p>
+      )}
 
       {withheld > 0 && (
         <p className="exp-drill-note">
@@ -413,12 +410,12 @@ export default function ExperimentDrillDown({
       )}
 
       <DataTable
-        columns={columnsFor(target.axis, onOpenConversation)}
+        columns={columnsFor(target.axis, translate, onOpenConversation)}
         data={rows}
         emptyMessage={
           loading
             ? 'Loading…'
-            : `No ${meta.countLabel.toLowerCase()} recorded for ${target.variantId} on this axis in this window.`
+            : translate('admin.experimentDrill.noRecordedForOnThis', { countLabel: translate(axisKey(target.axis, 'countLabel')).toLowerCase(), variantId: target.variantId })
         }
         serverPagination={{ page, pageSize: PAGE_SIZE, total, onPageChange: setPage, loading }}
       />

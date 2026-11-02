@@ -1,4 +1,5 @@
 import React, { useState, useEffect } from 'react';
+import { useTranslation } from 'react-i18next';
 import DataTable from './DataTable';
 import type { AnalyticsResult } from '@ae/shared';
 
@@ -12,6 +13,21 @@ interface FlaggedResponsesTabProps {
    *  before walking tab history (same pattern as ConversationsTab). */
   registerBack?: (close: (() => void) | null) => void;
 }
+
+/**
+ * Who raised a flag, and why, in words rather than in the stored identifiers.
+ *
+ * `person` is deliberately not "user": the row is one human's opinion of one answer, and calling it
+ * a user makes it sound like a population. The reason labels match the ones a moderator picks in
+ * Oversight, so the same reason reads identically wherever it was raised.
+ */
+/**
+ * Flag sources and reasons - now `admin.flagged.source.*` and `admin.flagged.reason.*` in en.json.
+ *
+ * READ WITH `defaultValue`, NOT A FALLBACK KEY. These are labels: a source or reason this console does
+ * not know about is still a real flag, and rendering the raw token lets somebody search for it, which a
+ * substituted label would prevent.
+ */
 
 function severityBadge(classification: string): React.ReactNode {
   const colors: Record<string, string> = {
@@ -28,7 +44,7 @@ function severityBadge(classification: string): React.ReactNode {
         color,
         padding: '2px 8px',
         borderRadius: '4px',
-        fontSize: '12px',
+        fontSize: 'var(--text-sm)',
         fontWeight: 600,
       }}
     >
@@ -52,7 +68,7 @@ function statusBadge(status: string): React.ReactNode {
         color,
         padding: '2px 8px',
         borderRadius: '4px',
-        fontSize: '12px',
+        fontSize: 'var(--text-sm)',
         fontWeight: 600,
       }}
     >
@@ -62,6 +78,7 @@ function statusBadge(status: string): React.ReactNode {
 }
 
 const FlaggedResponsesTab: React.FC<FlaggedResponsesTabProps> = ({ data, isLoading, onReview, onOpenConversation, registerBack }) => {
+  const { t } = useTranslation();
   // Keyed by exchange_id (stable across filter changes), not a row index — the row
   // index broke when the filter re-sliced the list, which left the review panel
   // permanently unreachable (nothing could open it).
@@ -76,7 +93,7 @@ const FlaggedResponsesTab: React.FC<FlaggedResponsesTabProps> = ({ data, isLoadi
   }, [expandedId, registerBack]);
 
   if (isLoading) {
-    return <div className="admin-tab-loading">Loading flagged responses...</div>;
+    return <div className="admin-tab-loading">{t('admin.flagged.loadingFlaggedResponses')}</div>;
   }
 
   const filteredData = (data?.data ?? []).filter((row) => {
@@ -91,57 +108,58 @@ const FlaggedResponsesTab: React.FC<FlaggedResponsesTabProps> = ({ data, isLoadi
     return (
       <div className="admin-tab">
         <div className="admin-tab-header">
-          <nav className="admin-breadcrumb" aria-label="Review path">
-            <button className="admin-link-btn" onClick={() => setExpandedId(null)}>← Flagged responses</button>
+          <nav className="admin-breadcrumb" aria-label={t('admin.flagged.reviewPath')}>
+            <button className="btn-link" onClick={() => setExpandedId(null)}>← Flagged responses</button>
             <span> / </span>
             <span>Review {String(expanded.intent || 'exchange')}</span>
           </nav>
         </div>
         <div className="admin-review-panel">
           <div className="admin-conversation-header">
-            <h4>Review Exchange</h4>
+            <h4>{t('admin.flagged.reviewExchange')}</h4>
             {expanded.channel_arn && onOpenConversation && (
-              <button className="admin-inline-btn" onClick={() => onOpenConversation(String(expanded.channel_arn))}>
+              <button className="btn-secondary" onClick={() => onOpenConversation(String(expanded.channel_arn))}>
                 Open conversation ↗
               </button>
             )}
           </div>
           <div className="admin-review-messages">
             <div className="admin-review-message user">
-              <strong>User:</strong>
+              <strong>{t('admin.flagged.user')}</strong>
               <p>{String(expanded.user_message)}</p>
             </div>
             <div className="admin-review-message agent">
-              <strong>Assistant:</strong>
+              <strong>{t('admin.flagged.assistant')}</strong>
               <p>{String(expanded.agent_response)}</p>
             </div>
           </div>
           <div className="admin-review-reasoning">
-            <strong>Evaluation Reasoning:</strong>
+            <strong>{t('admin.flagged.evaluationReasoning')}</strong>
             <p>{String(expanded.reasoning)}</p>
           </div>
           {expanded.compliance_categories && (
             <div className="admin-review-compliance">
-              <strong>Compliance Categories:</strong>
+              <strong>{t('admin.flagged.complianceCategories')}</strong>
               <p>{String(expanded.compliance_categories)}</p>
             </div>
           )}
           {onReview && expanded.review_status === 'pending' && (
             <div className="admin-review-actions">
               <textarea
-                placeholder="Review notes (optional)"
+                className="textarea input"
+                placeholder={t('admin.flagged.reviewNotesOptional')}
                 value={reviewNotes}
                 onChange={(e) => setReviewNotes(e.target.value)}
               />
               <div className="admin-review-buttons">
                 <button
-                  className="admin-btn admin-btn-approve"
+                  className="btn-primary"
                   onClick={() => { onReview(String(expanded.exchange_id), 'approved', reviewNotes); setExpandedId(null); setReviewNotes(''); }}
                 >
                   Approve
                 </button>
                 <button
-                  className="admin-btn admin-btn-reject"
+                  className="btn-danger"
                   onClick={() => { onReview(String(expanded.exchange_id), 'rejected', reviewNotes); setExpandedId(null); setReviewNotes(''); }}
                 >
                   Reject
@@ -157,7 +175,7 @@ const FlaggedResponsesTab: React.FC<FlaggedResponsesTabProps> = ({ data, isLoadi
   return (
     <div className="admin-tab">
       <div className="admin-tab-header">
-        <h3>Flagged Responses</h3>
+        <h3>{t('admin.flagged.flaggedResponses')}</h3>
         <div className="admin-filter-group">
           {(['pending', 'reviewed', 'all'] as const).map((f) => (
             <button
@@ -179,16 +197,45 @@ const FlaggedResponsesTab: React.FC<FlaggedResponsesTabProps> = ({ data, isLoadi
       <DataTable
         columns={[
           { key: 'flagged_at', label: 'Date', render: (v) => new Date(String(v)).toLocaleDateString() },
-          { key: 'agent_type', label: 'Assistant' },
+          { key: 'assistant', label: 'Assistant' },
           { key: 'intent', label: 'Intent' },
+          {
+            // WHO RAISED IT. The list used to have exactly one author, so the column would have been
+            // a constant; now a row can come from the judge, from a moderator in Oversight, or from
+            // a person clicking "Needs work", and those are not the same claim. A reader deciding
+            // what to do about a row needs to know whether a machine scored it low or a colleague
+            // said it was wrong.
+            key: 'flag_sources',
+            label: 'Raised by',
+            render: (v, row) => {
+              const sources = Array.isArray(v) ? (v as string[]) : [];
+              const reasons = Array.isArray(row.flag_reasons) ? (row.flag_reasons as string[]) : [];
+              return (
+                <>
+                  {sources.map((s) => (
+                    <span key={s} className="admin-flag-chip">{t(`admin.flagged.source.${s}`, { defaultValue: s })}</span>
+                  ))}
+                  {reasons.map((r) => (
+                    <span key={r} className="admin-flag-chip">{t(`admin.flagged.reason.${r}`, { defaultValue: r })}</span>
+                  ))}
+                </>
+              );
+            },
+          },
           {
             key: 'relevance_score',
             label: 'Score',
-            render: (v) => (
-              <span style={{ color: Number(v) < 30 ? '#ef4444' : '#f59e0b', fontWeight: 600 }}>
-                {Number(v).toFixed(0)}
-              </span>
-            ),
+            render: (v) => {
+              // A human can flag a response the judge never scored. Number(null).toFixed(0) is "0",
+              // which would render an unscored row as the worst possible score - a confident number
+              // standing in for a measurement that does not exist. Say so instead.
+              if (v === null || v === undefined || v === '') return <span className="admin-muted">{t('admin.flagged.notScored')}</span>;
+              return (
+                <span style={{ color: Number(v) < 30 ? '#ef4444' : '#f59e0b', fontWeight: 600 }}>
+                  {Number(v).toFixed(0)}
+                </span>
+              );
+            },
           },
           { key: 'classification', label: 'Classification', render: (v) => severityBadge(String(v)) },
           {
@@ -210,7 +257,7 @@ const FlaggedResponsesTab: React.FC<FlaggedResponsesTabProps> = ({ data, isLoadi
               const id = String(row.exchange_id);
               return (
                 <button
-                  className="admin-inline-btn"
+                  className="btn-secondary"
                   onClick={() => setExpandedId(expandedId === id ? null : id)}
                 >
                   {expandedId === id ? 'Hide' : 'Review'}
@@ -220,7 +267,7 @@ const FlaggedResponsesTab: React.FC<FlaggedResponsesTabProps> = ({ data, isLoadi
           },
         ]}
         data={filteredData}
-        emptyMessage={filter === 'pending' ? 'No pending reviews' : 'No flagged responses for this period'}
+        emptyMessage={filter === 'pending' ? t('admin.flaggedResponses.noPendingReviews') : t('admin.flaggedResponses.noFlaggedResponsesForThis')}
       />
     </div>
   );

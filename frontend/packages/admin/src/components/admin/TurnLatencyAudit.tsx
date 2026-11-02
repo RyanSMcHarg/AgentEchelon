@@ -22,6 +22,7 @@
  * looking at.
  */
 import { useCallback, useEffect, useState } from 'react';
+import { Trans, useTranslation } from 'react-i18next';
 import DataTable from './DataTable';
 import { queryAnalytics } from '../../services/analyticsService';
 import type { AnalyticsDateRange, AnalyticsResult } from '@ae/shared';
@@ -38,6 +39,8 @@ interface AuditRow extends Record<string, unknown> {
   turn_id: string | null;
   response_id: string | null;
   turn_id_source: string | null;
+  /** Which source supplied the turn anchor: 'ledger' (recorded) | 'exchange' (paired) | null. */
+  anchor_source: string | null;
   trigger_kind: string | null;
   battle_round: number | null;
   responder: string | null;
@@ -45,6 +48,10 @@ interface AuditRow extends Record<string, unknown> {
   t2_placeholder_at: string | null;
   t3_final_at: string | null;
   ttff_ms: number | null;
+  /** Trigger -> first signal, for EVERY response. Equals ttff_ms on a user turn by construction. */
+  ack_ms: number | null;
+  /** 'declared' (a real user message) | 'derived' (the rule found the cause) | null (nothing did). */
+  ack_source: string | null;
   e2e_ms: number | null;
   answer_ms: number | null;
   unattributed_ms: number | null;
@@ -61,6 +68,7 @@ const fmtAt = (v: unknown): string =>
   typeof v === 'string' && v ? new Date(v).toISOString().replace('T', ' ').slice(0, 23) : '—';
 
 export function TurnLatencyAudit({ dateRange, initialChannelArn }: Props) {
+  const { t } = useTranslation();
   const [channelArn, setChannelArn] = useState(initialChannelArn ?? '');
   const [submitted, setSubmitted] = useState(initialChannelArn ?? '');
   const [rows, setRows] = useState<AuditRow[]>([]);
@@ -83,7 +91,7 @@ export function TurnLatencyAudit({ dateRange, initialChannelArn }: Props) {
       if (payloadError) setError(payloadError);
       setRows(((res.data ?? []) as unknown as AuditRow[]));
     } catch (e) {
-      setError(e instanceof Error ? e.message : 'The audit query failed.');
+      setError(e instanceof Error ? e.message : t('admin.turnLatencyAudit.theAuditQueryFailed'));
       setRows([]);
     } finally {
       setLoading(false);
@@ -96,28 +104,30 @@ export function TurnLatencyAudit({ dateRange, initialChannelArn }: Props) {
   }, [submitted, dateRange, load]);
 
   return (
-    <section className="turn-latency-audit" aria-label="Audit one turn">
-      <h3>Audit a turn</h3>
+    <section className="turn-latency-audit" aria-label={t('admin.turnLatencyAudit.auditOneTurn')}>
+      <h3>{t('admin.turnLatencyAudit.auditATurn')}</h3>
       <p className="admin-help-text">
-        The calculation behind the averages, one row per turn, so a number can be checked against the
-        message stream rather than trusted. A negative <code>unattributed_ms</code> means compute was
-        attributed to the wrong turn.
+        <Trans i18nKey="admin.turnLatencyAudit.lead" components={{ c: <code /> }} />
+      </p>
+      <p className="admin-help-text">
+        <Trans i18nKey="admin.turnLatencyAudit.columns" components={{ b: <strong />, c: <code /> }} />
       </p>
 
       <form
         className="turn-latency-audit-form"
         onSubmit={(e) => { e.preventDefault(); setSubmitted(channelArn); }}
       >
-        <label htmlFor="audit-channel-arn">Conversation ARN</label>
+        <label className="label" htmlFor="audit-channel-arn">{t('admin.turnLatencyAudit.conversationArn')}</label>
         <input
           id="audit-channel-arn"
+          className="input"
           type="text"
           value={channelArn}
-          placeholder="arn:aws:chime:...:app-instance/.../channel/..."
+          placeholder={t('admin.turnLatencyAudit.arnAwsChimeAppInstance')}
           onChange={(e) => setChannelArn(e.target.value)}
         />
-        <button type="submit" disabled={!channelArn.trim() || loading}>
-          {loading ? 'Reading the ledger…' : 'Audit'}
+        <button className="btn-primary" type="submit" disabled={!channelArn.trim() || loading}>
+          {loading ? t('admin.turnLatencyAudit.readingTheLedger') : 'Audit'}
         </button>
       </form>
 
@@ -127,8 +137,7 @@ export function TurnLatencyAudit({ dateRange, initialChannelArn }: Props) {
         // An empty ledger for a real conversation is a finding, not a blank state: the turns happened,
         // so their absence here means the archival path did not record them.
         <p className="admin-help-text">
-          No ledger rows for this conversation. Turns are recorded from the archival batch, so this is
-          empty either because the conversation has no turns yet or because they were not archived.
+          {t('admin.turnLatencyAudit.noLedgerRowsForThis')}
         </p>
       )}
 
@@ -138,11 +147,65 @@ export function TurnLatencyAudit({ dateRange, initialChannelArn }: Props) {
             columns={[
               { key: 'turn_id', label: 'Turn' },
               { key: 'responder', label: 'Responder' },
-              { key: 'trigger_kind', label: 'Trigger' },
+              {
+                key: 'trigger_kind',
+                label: 'Trigger',
+                // A NULL trigger is not a missing value, it is the ordinary case: only the paths that
+                // are NOT a user message declare one, so an undeclared trigger means a user turn.
+                render: (v) => (typeof v === 'string' && v ? v : 'user'),
+              },
+              {
+                key: 'battle_round',
+                label: 'Battle',
+                // THE COLUMN WAS TYPED ON THE ROW AND NEVER RENDERED, so an operator reading this
+                // audit could not tell a duel turn from an ordinary one - while the Experiments tab
+                // was answering "how many battle turns" from a different fact entirely. Rendering it
+                // does not reconcile the two definitions (that is a product decision), but it stops
+                // this surface being unable to state which population a row belongs to.
+                //
+                // NULL IS THE ORDINARY TURN, not a missing value, so it reads as a dash rather than
+                // as an unmeasured duel.
+                render: (v) => (typeof v === 'number'
+                  ? <span title={t('admin.turnLatencyAudit.roundOfABattle', { v: v })}>R{v}</span>
+                  : '—'),
+              },
+              {
+                key: 'anchor_source',
+                label: 'Anchor',
+                // WHY A TURN HAS NO LATENCY IS A DIFFERENT FINDING FROM BEING SLOW, and without this
+                // the two are indistinguishable: a blank TTFF could mean the turn was proactive, or
+                // that nothing anchored it. 'exchange' is a live turn, 'ledger' a backfilled one.
+                render: (v) => (typeof v === 'string' && v
+                  ? v
+                  : <span className="status-warn" title={t('admin.turnLatencyAudit.nothingAnchoredThisTurnSo')}>none</span>),
+              },
               { key: 't0_user_at', label: 'User at', render: (v) => fmtAt(v) },
-              { key: 't2_placeholder_at', label: 'Placeholder at', render: (v) => fmtAt(v) },
+              { key: 't2_placeholder_at', label: t('admin.latency.shadowDiff.columns.when'), render: (v) => fmtAt(v) },
               { key: 't3_final_at', label: 'Final at', render: (v) => fmtAt(v) },
+              // TTFF and ACK SIT SIDE BY SIDE ON PURPOSE. On a user turn they are the same two
+              // instants and read identically; on a proactive turn TTFF is blank by construction -
+              // nobody was waiting - and Ack is the only latency that exists. Showing only TTFF is
+              // what made a rebuttal, a welcome and a notice look unmeasured rather than differently
+              // measured.
               { key: 'ttff_ms', label: 'TTFF', render: (v) => fmtMs(v) },
+              {
+                key: 'ack_ms',
+                label: 'Ack',
+                // The provenance rides the value, because a derived anchor and an observed one are
+                // not the same evidence and a column of bare numbers hides which is which.
+                render: (v, row) => {
+                  const src = row.ack_source;
+                  if (typeof v !== 'number' || !Number.isFinite(v)) return '—';
+                  return (
+                    <span title={src === 'derived'
+                      ? t('admin.turnLatencyAudit.anchorDerivedTheMostRecent')
+                      : t('admin.turnLatencyAudit.anchorDeclaredThisTurnAnswered')}>
+                      {fmtMs(v)}
+                      {src === 'derived' && <span className="status-warn"> ~</span>}
+                    </span>
+                  );
+                },
+              },
               { key: 'e2e_ms', label: 'End to end', render: (v) => fmtMs(v) },
               { key: 'answer_ms', label: 'Answer', render: (v) => fmtMs(v) },
               {

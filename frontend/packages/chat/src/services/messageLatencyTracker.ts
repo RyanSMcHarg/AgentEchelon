@@ -1,5 +1,6 @@
 /**
- * Tracks message latency as the BROWSER experiences it, from the user clicking send.
+ * Tracks message latency as the BROWSER experiences it, from the moment SendChannelMessage returns
+ * (after any attachment upload), not from the click.
  *
  * Two numbers come out of one send and they bracket different spans:
  *   `client_ttff_ms`         send -> the placeholder renders (the wait visibly ending)
@@ -62,7 +63,7 @@ export function markMessageSent(channelArn: string): void {
  * DOES NOT CONSUME THE PENDING SEND, so the round trip is still measured to the real answer. A
  * placeholder interrupts the silence; it does not end the wait.
  */
-export function markPlaceholderShown(channelArn: string): void {
+export function markPlaceholderShown(channelArn: string, correlationId?: string): void {
   try {
     if (ttffReported.has(channelArn)) return;
     const sentAt = pendingSends.get(channelArn);
@@ -71,7 +72,14 @@ export function markPlaceholderShown(channelArn: string): void {
     // report a wait nobody was having.
     if (sentAt === undefined) return;
     ttffReported.add(channelArn);
-    trackPerformance('client_ttff_ms', Math.round(performance.now() - sentAt));
+    // The turn id when the placeholder declared one. Omitted otherwise rather than sent empty: the
+    // join reads PRESENCE as meaning, and a blank key would pair this timing with nothing while
+    // looking like it had been correlated.
+    trackPerformance(
+      'client_ttff_ms',
+      Math.round(performance.now() - sentAt),
+      correlationId ? { correlationId } : undefined,
+    );
   } catch {
     // Never break the app for tracking
   }

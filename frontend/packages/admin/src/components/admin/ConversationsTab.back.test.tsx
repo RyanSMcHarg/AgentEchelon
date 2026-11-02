@@ -43,7 +43,7 @@ describe('ConversationsTab — global Back closes the detail first', () => {
     );
 
     // Detail opens (deep link) → the in-detail Back control appears.
-    const backControl = await screen.findByText('← Back to conversations');
+    const backControl = await screen.findByText('← Back');
     expect(backControl).toBeTruthy();
 
     // The parent was handed a real closer (so the console's global Back can use it).
@@ -56,7 +56,7 @@ describe('ConversationsTab — global Back closes the detail first', () => {
     // Invoking the closer returns to the list — the detail Back control is gone.
     act(() => closer());
     await waitFor(() => {
-      expect(screen.queryByText('← Back to conversations')).toBeNull();
+      expect(screen.queryByText('← Back')).toBeNull();
     });
 
     // And the parent is told there is no longer a detail to close.
@@ -77,13 +77,13 @@ describe('ConversationsTab — global Back closes the detail first', () => {
       />,
     );
 
-    // Opening the detail reports the channel ARN (parent writes ?conv=<id>).
-    await screen.findByText('← Back to conversations');
-    await waitFor(() => expect(onConversationChange).toHaveBeenCalledWith(CHANNEL));
+    // Opening the detail reports the channel ARN (parent writes ?conv=<id>), and no message, since none was linked.
+    await screen.findByText('← Back');
+    await waitFor(() => expect(onConversationChange).toHaveBeenCalledWith(CHANNEL, null));
 
     // Closing reports null (parent clears ?conv).
     const closer = registerBack.mock.calls.at(-1)![0] as () => void;
     act(() => closer());
-    await waitFor(() => expect(onConversationChange).toHaveBeenLastCalledWith(null));
+    await waitFor(() => expect(onConversationChange).toHaveBeenLastCalledWith(null, null));
   });
 });

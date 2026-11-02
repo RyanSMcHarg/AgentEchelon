@@ -29,7 +29,7 @@ async function openDriftView(driftData: AnalyticsResult) {
 /**
  * The drift view's job is to say whether the FEATURE was right. These assert the two ways a
  * presentational bug would make a broken or unmeasured feature look healthy - both are the same
- * class of mistake as the old badge that coloured high drift volume as bad.
+ * class of mistake as the old badge that colored high drift volume as bad.
  */
 describe('ConversationsTab — drift reports precision, not volume', () => {
   beforeEach(() => {

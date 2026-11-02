@@ -4,6 +4,8 @@ import {
   parseActiveTaskFromMetadata,
   isEmptyLexEnvelope,
   unwrapLexEnvelope,
+  declaresFinalAnswer,
+  decodeMessageText,
 } from './messageParser';
 
 const LEX = 'application/amz-chime-lex-msgs';
@@ -75,6 +77,34 @@ describe('parseMessageContent', () => {
   it('strips <!--corr:uuid--> markers', () => {
     const result = parseMessageContent('Hello<!--corr:a1b2c3d4-e5f6-7890-abcd-ef1234567890-->');
     expect(result.content).toBe('Hello');
+  });
+
+  it('strips the <!--turn:--> declaration, using the id shape Amazon Chime SDK actually issues', () => {
+    // Reported live, 2026-09-18: this reached the screen when answering a turn clarification. That is
+    // the handler-answered path, which posts once and is never rewritten by an update, so unlike a
+    // placeholder's marker nothing downstream removed it.
+    const result = parseMessageContent(
+      'Which quarter did you mean?<!--turn:answers=638da1616fc8361e574203efb374ed545f6f9dba8b95b93221161a9ac6debb96;phase=final-->'
+    );
+    expect(result.content).toBe('Which quarter did you mean?');
+  });
+
+  it('still reads the declaration off the RAW content after the stripper exists', () => {
+    // The two must not fight: `declaresFinalAnswer` reads raw content and the ledger depends on it.
+    // Stripping for display must not make a finished turn look unfinished.
+    const raw = 'Done.<!--turn:answers=abc123;phase=final-->';
+    expect(declaresFinalAnswer(raw)).toBe(true);
+    expect(parseMessageContent(raw).content).toBe('Done.');
+  });
+
+  it('strips a quoted marker too, exactly as the sibling markers do', () => {
+    // KNOWN AND DELIBERATE. A regex replace has no notion of a code fence, so an assistant answer
+    // that QUOTES the marker loses the quotation. That is the same behaviour `corr:` and ACTIVE_TASK
+    // have had all along, and matching them is worth more than a special case here: the alternative
+    // is a fence-aware stripper in one marker's path and not the others'. Recorded as a test so the
+    // trade is visible rather than discovered.
+    const raw = 'Use this shape:\n```\n<!--turn:answers=X-->\n```';
+    expect(parseMessageContent(raw).content).not.toContain('turn:answers');
   });
 
   it('strips multiple correlation markers', () => {
@@ -172,7 +202,7 @@ describe('parseMessageContent — NAVIGATE_CHANNEL marker (drift redirect)', () 
 
 describe('parseMessageContent — battle marker (/battle SPEC-BATTLE.md)', () => {
   const battleId = 'a1b2c3d4e5f60718';
-  const rivalArn = 'arn:aws:chime:us-east-1:111:app-instance/i/bot/AltSlot0';
+  const rivalArn = 'arn:aws:chime:us-east-1:111:app-instance/i/bot/Alt-premium';
 
   it('extracts a round-1 battle marker', () => {
     const raw = `One moment... <!--corr:battle-r1-default-1234--><!--battle:battleId=${battleId},round=1,total=2,rivalArn=${rivalArn}-->`;
@@ -222,7 +252,7 @@ describe('parseMessageContent — battle marker (/battle SPEC-BATTLE.md)', () =>
   });
 
   it('handles widened corr-marker pattern (battle correlation IDs have prefixes)', () => {
-    const raw = `My reply <!--corr:battle-r1-AltSlot0-1735000000000-abc123-->`;
+    const raw = `My reply <!--corr:battle-r1-Alt-premium-1735000000000-abc123-->`;
     const result = parseMessageContent(raw);
     expect(result.content).toBe('My reply');
   });
@@ -372,7 +402,7 @@ describe('parseActiveTaskFromMetadata', () => {
 
 describe('parseMessageContent — battlewaiting marker', () => {
   const BID = 'a1b2c3d4e5f60718';
-  const BOT = 'arn:aws:chime:us-east-1:111:app-instance/i/bot/AltSlot0';
+  const BOT = 'arn:aws:chime:us-east-1:111:app-instance/i/bot/Alt-premium';
 
   it('extracts battleWaiting and strips the marker from displayed content', () => {
     const r = parseMessageContent(
@@ -397,6 +427,81 @@ describe('parseMessageContent — battlewaiting marker', () => {
     const r = parseMessageContent(`x<!--battlewaiting:battleId=${BID},botArn=${BOT}-->`);
     expect(r.battleWaiting?.botArn).toBe(BOT);
   });
+
+  it('reads the duel owner the side waits on', () => {
+    const r = parseMessageContent(`x<!--battlewaiting:battleId=${BID},botArn=${BOT},owner=owner%2D1-->`);
+    expect(r.battleWaiting).toEqual({ battleId: BID, botArn: BOT, ownerId: 'owner-1' });
+  });
+
+  it('a task step the side parks on carries both its scorecard and its waiting state', () => {
+    const r = parseMessageContent(
+      'Who is the audience?'
+      + `<!--battlestats:battleId=${BID},round=1,responseMs=900,estCostUsd=,modelId=m1-->`
+      + `<!--battlewaiting:battleId=${BID},botArn=${BOT},owner=owner-1-->`,
+    );
+    expect(r.content).toBe('Who is the audience?');
+    expect(r.battle?.battleId).toBe(BID);
+    expect(r.battleWaiting).toEqual({ battleId: BID, botArn: BOT, ownerId: 'owner-1' });
+  });
 });
 
 
+
+/**
+ * A MARKED MESSAGE IS NO LONGER NECESSARILY A PLACEHOLDER.
+ *
+ * The client decides "this is the async placeholder" from a `<!--corr:-->` marker, which was a
+ * complete rule for as long as the only marked messages were placeholders. A turn the handler
+ * answers itself now carries the same marker so its pairing can be declared rather than guessed at
+ * downstream, and it posts once with no update to follow - so read as a placeholder, the clock is
+ * never stopped and the turn reports no answer at all.
+ */
+describe('declaresFinalAnswer', () => {
+  it('recognizes a turn that said it is already finished', () => {
+    expect(declaresFinalAnswer(
+      'Hey, what can I help you with? <!--corr:abcd1234--><!--turn:answers=m-1;delivery=DIRECT;phase=final-->',
+    )).toBe(true);
+  });
+
+  it('reads it through percent-encoding, because content arrives either way', () => {
+    expect(declaresFinalAnswer(
+      encodeURIComponent('Hi <!--corr:abcd1234--><!--turn:phase=final-->'),
+    )).toBe(true);
+  });
+
+  it('says nothing about an ordinary placeholder', () => {
+    expect(declaresFinalAnswer('One moment... <!--corr:abcd1234-->')).toBe(false);
+  });
+
+  it('says nothing about a declaration that named no phase', () => {
+    // A drift suggestion declares its target and its kind and deliberately declares no phase: it
+    // opens no response, so it closes none either.
+    expect(declaresFinalAnswer('Shall I split that out? <!--turn:answers=m-1;kind=drift-->')).toBe(false);
+  });
+
+  it('is not asserted by prose that merely contains the words', () => {
+    expect(declaresFinalAnswer('The phase=final flag is set in turn-declaration.ts.')).toBe(false);
+  });
+
+  it('is safe on empty and undefined content', () => {
+    expect(declaresFinalAnswer('')).toBe(false);
+    expect(declaresFinalAnswer(undefined)).toBe(false);
+  });
+});
+
+describe('decodeMessageText', () => {
+  it('decodes percent-encoded text', () => {
+    expect(decodeMessageText(encodeURIComponent('usage down 30% - renegotiate?'))).toBe('usage down 30% - renegotiate?');
+  });
+
+  // Measured live 2026-10-05: raw text holding a bare % threw "URI malformed" in two unguarded readers
+  // and the message was dropped. The reader returns the raw text instead of throwing.
+  it('returns raw text holding a bare % unchanged instead of throwing', () => {
+    expect(() => decodeMessageText('usage down 30% this year')).not.toThrow();
+    expect(decodeMessageText('usage down 30% this year')).toBe('usage down 30% this year');
+  });
+
+  it('leaves plain text alone', () => {
+    expect(decodeMessageText('no escapes here')).toBe('no escapes here');
+  });
+});
