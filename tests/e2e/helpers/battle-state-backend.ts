@@ -10,24 +10,8 @@
  * Uses the `aws` CLI through execFileSync, the same vantage `drift-backend.ts` uses, because the e2e
  * process holds a browser session rather than AWS credentials for these tables.
  */
-import { execFileSync } from 'child_process';
-
-const REGION = process.env.AWS_REGION || 'us-east-1';
-const INSTANCE = process.env.E2E_INSTANCE_NAME || 'agent-echelon';
-
-function aws(args: string[]): any {
-  const out = execFileSync('aws', [...args, '--region', REGION, '--output', 'json'], {
-    encoding: 'utf8',
-    maxBuffer: 20 * 1024 * 1024,
-    timeout: 60_000,
-    // PYTHONIOENCODING/PYTHONUTF8: the AWS CLI is Python, and on Windows its stdout encoder is the
-    // console codepage - a battle row whose content carries a non-ANSI character (a real answer
-    // used U+2192 '→') crashes the CLI itself with "'charmap' codec can't encode character",
-    // failing the poll that read it. Force UTF-8 so row CONTENT can never break row READS.
-    env: { ...process.env, MSYS_NO_PATHCONV: '1', PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
-  }).trim();
-  return out ? JSON.parse(out) : null;
-}
+import { INSTANCE } from './stack-prefix';
+import { awsv as aws } from './aws';
 
 const ssmCache = new Map<string, string>();
 function ssm(name: string): string {
@@ -60,6 +44,8 @@ export interface DuelSide {
   initiatorUserSub?: string;
   waitingMessageId?: string;
   enteredStateAt?: string;
+  /** How long the side has spent waiting on the person, accumulated by each resume. */
+  waitedMs?: number;
 }
 
 /**
@@ -93,6 +79,7 @@ export function readDuelSides(battleId: string): DuelSide[] {
       initiatorUserSub: s(i.initiatorUserSub),
       waitingMessageId: s(i.waitingMessageId),
       enteredStateAt: s(i.enteredStateAt),
+      waitedMs: i.waitedMs?.N !== undefined ? Number(i.waitedMs.N) : undefined,
     }));
 }
 
@@ -115,6 +102,24 @@ export function waitForActiveBattle(
     const a = readActiveBattle(channelId);
     return a.battleId ? a : null;
   }, timeoutMs);
+}
+
+/**
+ * Wait for the channel's pointer to name NO duel - the conversation is free again.
+ *
+ * THE INVERSE OF `waitForActiveBattle`, and it exists because ending a duel is not instantaneous.
+ * `/battle end` returns a reply as soon as the command is accepted, while releasing the pointer,
+ * abandoning the sides and clearing the waiting markers settle after it. A test that fires the next
+ * `/battle` on the strength of that reply is racing the release: the new command is refused because
+ * a duel is still live, nothing further renders, and the failure reads as "a second duel never
+ * started" rather than "the first one had not finished ending".
+ *
+ * Returns true when the pointer is clear, false on timeout - so a caller can assert the release
+ * itself rather than discovering it through whatever it tried to do next.
+ */
+export async function waitForNoActiveBattle(channelId: string, timeoutMs = 120_000): Promise<boolean> {
+  const cleared = await poll(() => (readActiveBattle(channelId).battleId ? null : true), timeoutMs);
+  return cleared === true;
 }
 
 /** Wait for ANY side of the duel to be blocked on the user. */
@@ -147,11 +152,10 @@ export async function holdsWaiting(battleId: string, botArn: string, forMs: numb
 /**
  * Send a reply `Target`-addressed at one bot, AS a given member.
  *
- * Not through the composer, deliberately. A side parked by a task step carries no
- * `<!--battlewaiting-->` marker (the task-step branch writes no `waitingMessageId` and posts nothing),
- * so `battleWaitingBots` is empty and NO member - owner included - is offered the targeted-reply
- * affordance. The message shape is identical to the composer's targeted send (`Target: [{MemberArn}]`,
- * STANDARD, PERSISTENT), so this exercises the server path the UI would exercise if it could.
+ * The same wire shape as the composer's reply to a side (`Target: [{MemberArn}]`, STANDARD, PERSISTENT).
+ * The chat app offers that reply only to the duel's owner, through the side's "Reply to this side"
+ * control (B-E7 answers through it), so this is how a test sends what the UI does not offer: a
+ * non-owner's targeted reply, which the router must refuse to treat as an answer.
  *
  * Sends with admin IAM credentials and the member's own `ChimeBearer`, which is what makes the message
  * genuinely FROM that person as far as the flow's sender check is concerned.
@@ -172,6 +176,30 @@ export function sendTargetedAs(
     '--target', `MemberArn=${targetBotArn}`,
   ]);
   return res?.MessageId as string;
+}
+
+/**
+ * Answer every side of the channel's duel once all of them are parked on the person, as the person who
+ * started it, with a reply targeted at each side.
+ *
+ * A task-shaped side runs its own chain and asks for its own input (ADR-026), so each side is answered on
+ * its own: the image workflow's `confirm` step is presented (ADR-064 decision G), and no image is drawn
+ * until the person confirms the brief that side recorded. Waiting for ALL sides first keeps the two
+ * answers one exchange apart, never one side's confirmation racing the other side's first leg.
+ *
+ * Returns the sides as they stood when answered, so a caller can assert there were two of them.
+ */
+export async function answerEverySide(channelId: string, content: string, timeoutMs = 420_000): Promise<DuelSide[]> {
+  const active = await waitForActiveBattle(channelId, 180_000);
+  if (!active?.battleId || !active.initiatorUserSub) return [];
+  const parked = await poll(() => {
+    const sides = readDuelSides(active.battleId!);
+    return sides.length >= 2 && sides.every((r) => r.state === 'WAITING_FOR_USER') ? sides : null;
+  }, timeoutMs);
+  if (!parked) return [];
+  const owner = personArnForRecordedId(active.initiatorUserSub);
+  for (const side of parked) sendTargetedAs(channelId, owner, side.botArn, content);
+  return parked;
 }
 
 /**
@@ -229,9 +257,12 @@ export function waitForSideState(
   return poll(() => (sideState(battleId, botArn) === state ? state : null), timeoutMs);
 }
 
-/** A member's app-instance-user ARN from their Cognito sub. */
-export function userArnFor(sub: string): string {
-  return `${appInstanceArn()}/user/${sub}`;
+/**
+ * The AppInstanceUser ARN for a person id a server record holds (the battle pointer's initiator). A
+ * test user's own ARN comes from `helpers/person.ts`, never from here.
+ */
+export function personArnForRecordedId(personId: string): string {
+  return `${appInstanceArn()}/user/${personId}`;
 }
 
 /** The human members of a channel, as ARNs (admin bearer reads any channel without joining). */
@@ -244,6 +275,29 @@ export function humanMembers(channelId: string): string[] {
   return (res?.ChannelMemberships || [])
     .map((m: any) => m?.Member?.Arn as string)
     .filter((arn: string) => arn && arn.includes('/user/'));
+}
+
+/**
+ * The id of the newest message `senderUserArn` sent with exactly this content, read as the sender, or
+ * null when none arrived inside the window. For a reply sent through the UI, whose id the test never saw.
+ */
+export async function messageIdSentBy(
+  channelId: string,
+  senderUserArn: string,
+  content: string,
+  timeoutMs = 30_000,
+): Promise<string | null> {
+  return poll(() => {
+    const res = aws([
+      'chime-sdk-messaging', 'list-channel-messages',
+      '--channel-arn', channelArnFor(channelId),
+      '--chime-bearer', senderUserArn,
+      '--max-results', '20',
+    ]);
+    const mine = (res?.ChannelMessages || []).find((m: any) => m?.Sender?.Arn === senderUserArn
+      && decodeURIComponent(m?.Content || '') === content);
+    return (mine?.MessageId as string | undefined) ?? null;
+  }, timeoutMs, 2_000);
 }
 
 /**
@@ -275,40 +329,66 @@ export function messageExistsForSender(channelId: string, senderUserArn: string,
  * messages and cannot see targeted ones. That makes it the right instrument for "is this answer
  * public?" - a targeted message is invisible here by construction.
  */
-export function publicMessages(channelId: string, limit = 10): Array<{ sender: string; content: string }> {
+export function publicMessages(
+  channelId: string,
+  limit = 10,
+): Array<{ sender: string; content: string; createdAtMs: number; metadata: Record<string, any> }> {
   const res = aws([
     'chime-sdk-messaging', 'list-channel-messages',
     '--channel-arn', channelArnFor(channelId),
     '--chime-bearer', ssm(`/${INSTANCE}/app-instance-admin-arn`),
     '--max-results', String(limit),
   ]);
-  return (res?.ChannelMessages || []).map((m: any) => ({
-    sender: m?.Sender?.Arn || '',
-    content: decodeURIComponent(m?.Content || ''),
-  }));
-}
-
-/** Wait for a side to LEAVE the waiting state (the owner's reply resuming it). */
-export async function waitForResume(battleId: string, botArn: string, timeoutMs = 240_000): Promise<string> {
-  const seen = await poll(() => {
-    const st = sideState(battleId, botArn);
-    return st && st !== 'WAITING_FOR_USER' ? st : null;
-  }, timeoutMs);
-  return seen ?? 'WAITING_FOR_USER';
+  return (res?.ChannelMessages || []).map((m: any) => {
+    let metadata: Record<string, any> = {};
+    try { metadata = m?.Metadata ? JSON.parse(m.Metadata) : {}; } catch { /* unreadable metadata reads as none */ }
+    return {
+      sender: m?.Sender?.Arn || '',
+      content: decodeURIComponent(m?.Content || ''),
+      createdAtMs: m?.CreatedTimestamp ? Date.parse(m.CreatedTimestamp) : 0,
+      metadata,
+    };
+  });
 }
 
 /**
- * Wait for a side to reach a TERMINAL state (COMPLETED/FAILED).
+ * When a message was created, on Amazon Chime SDK's clock, read as its sender.
  *
- * The distinction from waitForResume matters and is the whole reason this exists: a resumed side
- * used to leave WAITING_FOR_USER (INVOKED) and then strand forever, because the resumed turn ran
- * without battleContext and every terminal write sits behind it. "It resumed" was true while the
- * duel still never finished; only a terminal state proves the resumed turn ran AS a battle turn.
+ * The instant every "after the reply" comparison is made against. The battle and task rows are stamped
+ * by the backend, so comparing them to this test machine's clock would let a skew decide the result.
  */
-export async function waitForSideTerminal(battleId: string, botArn: string, timeoutMs = 300_000): Promise<string> {
-  const seen = await poll(() => {
-    const st = sideState(battleId, botArn);
-    return st === 'COMPLETED' || st === 'FAILED' ? st : null;
+export function messageCreatedAtMs(channelId: string, senderUserArn: string, messageId: string): number {
+  const res = aws([
+    'chime-sdk-messaging', 'get-channel-message',
+    '--channel-arn', channelArnFor(channelId),
+    '--message-id', messageId,
+    '--chime-bearer', senderUserArn,
+  ]);
+  return Date.parse(res?.ChannelMessage?.CreatedTimestamp || '') || 0;
+}
+
+/**
+ * Wait for a side to MOVE ON from a reply: a state entered after `sinceMs` that is settled.
+ *
+ * READ FROM THE ROW'S OWN TIMESTAMP, NOT FROM A STATE SAMPLE. A resumed side is `INVOKED` only while
+ * its turn runs, and a task-shaped side whose chain still has a step to go parks again in
+ * `WAITING_FOR_USER` when the turn ends. Measured on dev 2026-10-28: resumed at 03:34:06.95, parked
+ * again at 03:34:09.76, so a 5 s sample never saw it leave. `enteredStateAt` later than the reply is
+ * the record that it did.
+ *
+ * Settled means `COMPLETED`, `FAILED`, or `WAITING_FOR_USER` again (the side asked its next question).
+ * Null when nothing moved inside the window.
+ */
+export async function waitForSideMovedOn(
+  battleId: string,
+  botArn: string,
+  sinceMs: number,
+  timeoutMs = 300_000,
+): Promise<DuelSide | null> {
+  return poll(() => {
+    const row = readDuelSides(battleId).find((r) => r.botArn === botArn);
+    const enteredMs = row?.enteredStateAt ? Date.parse(row.enteredStateAt) : 0;
+    const settled = row?.state === 'COMPLETED' || row?.state === 'FAILED' || row?.state === 'WAITING_FOR_USER';
+    return row && settled && enteredMs > sinceMs ? row : null;
   }, timeoutMs);
-  return seen ?? (sideState(battleId, botArn) ?? 'MISSING');
 }

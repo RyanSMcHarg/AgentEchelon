@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './helpers/fixtures';
 import { navigateToApp, registerUser, isConnected } from './helpers/agent-helpers';
 import { getBasicUser, getStandardUser, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors, allowConsoleError } from './helpers/turn-guards';
@@ -108,7 +108,7 @@ test.describe.serial('Sign Up Flow', () => {
     test.setTimeout(90000);
 
     // Cognito answers the duplicate SignUpCommand with a 400, which the browser logs as a failed
-    // resource load. That rejection IS the behaviour under test, so it is declared here rather than
+    // resource load. That rejection IS the behavior under test, so it is declared here rather than
     // by loosening the guard for every spec - the point of the guard is that an UNDECLARED console
     // error fails the run, and a negative-path test is the one place a real one is expected.
     allowConsoleError(/cognito-idp\.[a-z0-9-]+\.amazonaws\.com/);

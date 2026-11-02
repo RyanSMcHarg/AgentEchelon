@@ -5,20 +5,23 @@
  * kinesis-archival-backfill unit test cannot cover (it asserts the SQL/params, not computed values).
  * Drives one tool-using turn, then reads the admin `latency_metrics` query and asserts the new metrics
  * are populated and distinct: e2e_ms (user -> final answer, skew-free), avg_total_ms (server compute),
- * avg_ttff_ms (time to placeholder), and the Bedrock split avg_model_ms.
+ * and the Bedrock split avg_model_ms — each read from the row for the CLASSIFICATION this test drove, because
+ * that query has no channel parameter. ttff_ms is asserted per-turn instead, from the channel-scoped
+ * `turn_latency_audit` further down, which is the only read here that can name this test's own turn.
  *
  * testAdmin (premium + admins group) drives it: the analytics API is admin-gated and IAM-enforced, so
  * the read is SigV4-signed (helpers/signed-analytics.ts). Same env contract as tasks.spec.
  *
  * Gated by LATENCY_E2E=1 (a validate.mjs phase). Runs against the live deployment.
- *   E2E_BASE_URL=<cf> LATENCY_E2E=1 VITE_ANALYTICS_API_URL=<url> VITE_USER_POOL_ID=<id> \
- *     VITE_IDENTITY_POOL_ID=<id> AWS_PROFILE=<p> npx playwright test e2e/latency.spec.ts
+ *   E2E_BASE_URL=<cf> LATENCY_E2E=1 VITE_ADMIN_API_URL=<url> VITE_USER_POOL_ID=<id> \
+ *     VITE_PERSON_API_URL=<url> AWS_PROFILE=<p> npx playwright test e2e/latency.spec.ts
  */
-import { test, expect } from '@playwright/test';
-import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
+import { test, expect } from './helpers/fixtures';
+import { signIn, createConversation, sendAndWaitForResponse, idTokenOf } from './helpers/agent-helpers';
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { ADMIN_API_URL, adminUrl } from './helpers/api-urls';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardConsoleErrors();
@@ -26,7 +29,19 @@ guardConsoleErrors();
 
 const RUN = process.env.LATENCY_E2E === '1';
 const suite = RUN ? test.describe : test.describe.skip;
-const ANALYTICS_API = process.env.VITE_ANALYTICS_API_URL || '';
+const ANALYTICS_API = ADMIN_API_URL ? adminUrl('analytics', '/') : '';
+
+// The classification this test drives, in the two spellings it is needed in: the label the
+// conversation picker shows a person, and the value archival records.
+//
+// SCOPED BY CLASSIFICATION, NOT BY ASSISTANT. This read `agent_type`, which held the classification
+// until assistants got their own identity; it names the ASSISTANT now, so matching
+// 'premium' against it would match nothing and this test would time out looking for its own traffic.
+// The classification is what the test actually drives - it picks a Premium conversation - so
+// `conversation_classification` is both correct and immune to an assistant being renamed.
+// Stated once so the row this test reads can never drift from the conversation it created.
+const DRIVEN_CLASSIFICATION_LABEL = 'Premium';
+const DRIVEN_CLASSIFICATION = 'premium';
 
 suite('Full latency set populates on a real turn', () => {
   // Fails a PASSING test that hid a server-side error (see helpers/turn-guards).
@@ -35,7 +50,7 @@ suite('Full latency set populates on a real turn', () => {
   let creds: TestCredentials;
   test.beforeAll(async () => {
     creds = await getTestCredentials();
-    expect(ANALYTICS_API, 'VITE_ANALYTICS_API_URL must be set').toBeTruthy();
+    expect(ANALYTICS_API, 'VITE_ADMIN_API_URL must be set').toBeTruthy();
   });
 
   test('a tool-using turn yields e2e_ms / total_ms / ttff_ms / model_ms > 0 (brackets distinct)', async ({ page }) => {
@@ -48,7 +63,7 @@ suite('Full latency set populates on a real turn', () => {
       (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
       { timeout: 30000 },
     );
-    await createConversation(page, `Latency e2e ${Date.now()}`, 'Premium');
+    await createConversation(page, `Latency e2e ${Date.now()}`, DRIVEN_CLASSIFICATION_LABEL);
     const channelArn: string = (await (await createResp).json()).conversation.conversationArn;
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
@@ -62,7 +77,7 @@ suite('Full latency set populates on a real turn', () => {
     );
     expect(resp.text && resp.text.length, 'the turn must return a response').toBeTruthy();
 
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     const end = new Date();
     const start = new Date(end.getTime() - 86_400_000);
     const q = async (): Promise<Array<Record<string, number | string>>> => {
@@ -75,23 +90,67 @@ suite('Full latency set populates on a real turn', () => {
 
     // Poll: archival (Chime -> Kinesis -> Aurora) buffers up to ~2 min, so a row carrying this turn's
     // e2e_ms appears minutes later. Wait for a row with the E2E + model split populated.
+    //
+    // ── THE ROW IS SCOPED TO THE CLASSIFICATION THIS TEST DROVE, AND MUST STAY SCOPED ──
+    //
+    // DO NOT "simplify" this back to `rows.find((r) => Number(r.avg_e2e_ms) > 0 && ...)`. On a shared
+    // deployment an unscoped row is another test's traffic. `latency_metrics` groups by
+    // (date, agent_type, delivery_option) and returns them `ORDER BY date DESC, agent_type,
+    // delivery_option`, so an unscoped find() takes whichever classification sorts FIRST - `basic` - and this
+    // test creates a Premium conversation. It then asserts about turns it never drove, and passes or
+    // fails on whatever else the deployment happened to be serving.
+    //
+    // FOUND LIVE 2026-09-15: this failed on `avg_ttff_ms > 0` against a basic-classification row produced by a
+    // concurrently running e2e phase, while the premium row the test had actually driven read
+    // avg_ttff_ms 2311 over 14 measured turns. It had been passing by luck, on someone else's turns.
+    //
+    // The classification is the NARROWEST scope this endpoint offers - `latency_metrics` takes a date range and
+    // nothing else, so there is no channel parameter to scope by. It is therefore the floor, not the
+    // proof: the per-turn proof is the channel-scoped `turn_latency_audit` block at the end of this
+    // test. delivery_option is deliberately NOT pinned as well, because it is chosen at runtime from
+    // the model's intent classification (selectDeliveryOption), so requiring a particular one would
+    // make this poll time out whenever the router picked another - a flake, not a finding.
     let hit: Record<string, number | string> | undefined;
     for (let i = 0; i < 30 && !hit; i++) {
       const rows = await q();
-      hit = rows.find((r) => Number(r.avg_e2e_ms) > 0 && Number(r.avg_model_ms) > 0);
+      hit = rows.find(
+        (r) => r.conversation_classification === DRIVEN_CLASSIFICATION
+          && Number(r.avg_e2e_ms) > 0
+          && Number(r.avg_model_ms) > 0,
+      );
       if (!hit) await page.waitForTimeout(6000);
     }
-    expect(hit, 'a latency_metrics row with avg_e2e_ms and avg_model_ms > 0 should appear after a real turn').toBeTruthy();
+    expect(
+      hit,
+      `a ${DRIVEN_CLASSIFICATION} latency_metrics row with avg_e2e_ms and avg_model_ms > 0 should appear `
+        + 'after a real turn on a conversation of that classification',
+    ).toBeTruthy();
 
     const row = hit!;
     console.log('[latency-e2e] row:', JSON.stringify(row));
-    // The metrics are distinct and non-zero: e2e (full wait) and total (server compute) both > 0, ttff
-    // (time to placeholder) > 0, and the model share of Bedrock present. tool_ms / inbound_ms are logged
-    // (tool_ms can be 0 when the model answers from pre-fetched RAG; inbound_ms is cross-clock/approximate).
+    // The metrics are distinct and non-zero: e2e (full wait) and total (server compute) both > 0, and
+    // the model share of Bedrock present. tool_ms / inbound_ms are logged (tool_ms can be 0 when the
+    // model answers from pre-fetched RAG; inbound_ms is cross-clock/approximate).
     expect(Number(row.avg_e2e_ms), 'avg_e2e_ms > 0 (user -> final answer)').toBeGreaterThan(0);
     expect(Number(row.avg_total_ms), 'avg_total_ms > 0 (server compute)').toBeGreaterThan(0);
-    expect(Number(row.avg_ttff_ms), 'avg_ttff_ms > 0 (time to placeholder)').toBeGreaterThan(0);
     expect(Number(row.avg_model_ms), 'avg_model_ms > 0 (model inference share of Bedrock)').toBeGreaterThan(0);
+    // ── avg_ttff_ms IS NOT ASSERTED FROM THE AGGREGATE, ON PURPOSE ──
+    //
+    // It is the one figure on this row that a driven turn is not guaranteed to reach. The TTFF average
+    // is taken `FILTER (WHERE mp.measured)`, which excludes any turn whose user/bot pairing fell to the
+    // swept pairer rather than being declared or made in-batch - and an excluded turn stays excluded,
+    // permanently. So a wait here would not be a wait for archival, it would be a wait for something
+    // that may never arrive, and dressing it up as one would be a lie about what this test checks.
+    // Loosening it (`>= 0`, or skipping when absent) would be worse: an assertion that cannot fail.
+    //
+    // TTFF is therefore asserted where it can be asserted honestly - per turn, on the channel this
+    // test created, in the ledger-audit block below (`anchored`, `ttff_ms > 0`). Logged here so a
+    // reader still sees what the classification's aggregate said on this run.
+    console.log(
+      `[latency-e2e] aggregate ttff for ${DRIVEN_CLASSIFICATION} (logged, asserted per-turn below): `
+      + `avg_ttff_ms=${row.avg_ttff_ms}, ttff_measured_count=${row.ttff_measured_count}, `
+      + `ttff_reconstructed_count=${row.ttff_reconstructed_count}`,
+    );
 
     // ────────────────────────────────────────────────────────────────────────────────────────────
     // EACH TURN IS COUNTED ONCE, asserted on real traffic because that is the only
@@ -127,7 +186,7 @@ suite('Full latency set populates on a real turn', () => {
 
     // ── THE UNCLOSED PARTITION HOLDS ON LIVE DATA, and the unreadable markers are attributed ──
     //
-    // Tracker row 103: 26 unclosed turns were classified `no_placeholder` ("nobody was promised an
+    // 26 unclosed turns were classified `no_placeholder` ("nobody was promised an
     // answer") while their content carried a correlation marker LONGER than the 64-character reader
     // bound - a person WAS promised an answer the platform structurally cannot deliver. The split now
     // separates them, and this is where that is measured: through the signed admin API, as testAdmin,
@@ -142,6 +201,12 @@ suite('Full latency set populates on a real turn', () => {
     const buckets = [
       'unclosed_no_placeholder', 'unclosed_unreadable_marker', 'unclosed_unobserved',
       'unclosed_disagreed', 'unclosed_errored', 'unclosed_superseded',
+      // CANCELLED IS A BUCKET THE API HAS AND THIS LIST DID NOT (2026-09-10). analytics-query.ts
+      // classifies nine kinds and returns `unclosed_cancelled` beside the rest; summing eight of
+      // them made the partition short by exactly the cancelled turns, and a `/stop` produces those on
+      // every sweep. The assertion then reported a correct partition as a gap, which is the one
+      // thing it must never do: its whole value is that a REAL gap means a turn shape nothing names.
+      'unclosed_cancelled',
       'unclosed_awaiting', 'unclosed_silent',
     ];
     const partitioned = buckets.reduce((n, b) => n + sum(b), 0);
@@ -162,8 +227,8 @@ suite('Full latency set populates on a real turn', () => {
     );
 
     // The HISTORICAL attribution, over the API's widest window (90 days). The mint-side fix means the
-    // last 24h should read zero - the population row 103 counted is older, and this read is the one
-    // that attributes it. Same partition assertion on the wide rows, because a partition that only
+    // last 24h should read zero - the over-long-marker turns described above are older, and this read is
+    // the one that attributes them. Same partition assertion on the wide rows, because a partition that only
     // holds on quiet days is not a partition.
     const wideJson = await signedAnalyticsPost(ANALYTICS_API, idToken!, {
       queryType: 'latency_metrics',
@@ -208,6 +273,10 @@ suite('Full latency set populates on a real turn', () => {
 
     // A row with a MEASURED wait, not merely a row. Before the anchor fix these rows existed and every
     // latency on them was null, so counting rows would have passed against the defect.
+    //
+    // THIS IS ALSO THE TEST'S TTFF ASSERTION, the whole of it: it is scoped to the channel above, so
+    // it is the only place a time-to-first-feedback can be asserted about the turn this test drove
+    // rather than about the classification's window average. See the note beside avg_ttff_ms further up.
     const anchored = auditRows.filter((r) => Number(r.ttff_ms) > 0);
     expect(
       anchored.length,

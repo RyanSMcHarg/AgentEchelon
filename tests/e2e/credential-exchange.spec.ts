@@ -7,50 +7,38 @@
  *
  * Requires: the exchange DEPLOYED + tier test users (`npm run provision-test-users`) +
  * the endpoint URL in env. Skips cleanly otherwise (so the suite is green pre-deploy).
- *   VITE_CREDENTIAL_EXCHANGE_API_URL (or EXCHANGE_API_URL) =
- *     CDK output AgentEchelonCognitoAuth.CredentialExchangeApiUrl
+ *   VITE_PERSON_API_URL =
+ *     CDK output AgentEchelonPersonApi.PersonApiUrl
  *
  * The BEARER-PIN enforcement (impersonation → AccessDenied) is an IAM property proven
  * by `backend/scripts/deny-test-credential-exchange.mjs`, not a UI/HTTP flow.
  */
-import { test, expect } from '@playwright/test';
-import { execSync } from 'child_process';
+import { test, expect } from './helpers/fixtures';
 import { getTestCredentials, hasTestCredentials } from './helpers/test-credentials';
+import { idTokenFor } from './helpers/person';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { PERSON_API_URL, personUrl } from './helpers/api-urls';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardBackendErrors('credential-exchange');
 guardConsoleErrors();
 
 
-const AWS_PROFILE = process.env.AWS_PROFILE || 'default';
-const REGION = 'us-east-1';
-const EXCHANGE_URL = (process.env.VITE_CREDENTIAL_EXCHANGE_API_URL || process.env.EXCHANGE_API_URL || '').replace(/\/$/, '');
-
-/** Get a Cognito ID token via the AWS CLI (mirrors test-credentials.ts's CLI approach,
- *  so the tests project needs no extra SDK dependency). */
-function getIdToken(email: string, password: string, clientId: string): string {
-  const raw = execSync(
-    `aws cognito-idp initiate-auth --auth-flow USER_PASSWORD_AUTH ` +
-      `--client-id "${clientId}" ` +
-      `--auth-parameters USERNAME="${email}",PASSWORD="${password}" ` +
-      `--query AuthenticationResult.IdToken --output text --region ${REGION}`,
-    { encoding: 'utf8', timeout: 20000, env: { ...process.env, AWS_PROFILE } },
-  ).trim();
-  if (!raw || raw === 'None') throw new Error(`No IdToken for ${email}`);
-  return raw;
-}
 
 const subOf = (idToken: string): string =>
   JSON.parse(Buffer.from(idToken.split('.')[1], 'base64').toString('utf8')).sub;
 
-const runnable = !!EXCHANGE_URL && hasTestCredentials();
+/** The person id the exchange mints is a UUID v7; a Cognito sub is a v4. */
+const V7 = /^[0-9a-f]{8}-[0-9a-f]{4}-7[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+const idOf = (userArn: string): string => userArn.split('/').pop() || '';
+
+const runnable = !!PERSON_API_URL && hasTestCredentials();
 
 test.describe('Credential Exchange API', () => {
-  test.skip(!runnable, 'Set VITE_CREDENTIAL_EXCHANGE_API_URL + provision test users (needs a deploy).');
+  test.skip(!runnable, 'Set VITE_PERSON_API_URL + provision test users (needs a deploy).');
 
   test('rejects an unauthenticated request (Cognito authorizer)', async ({ request }) => {
-    const resp = await request.post(`${EXCHANGE_URL}/exchange-credentials`, {
+    const resp = await request.post(personUrl('/exchange-credentials'), {
       data: {},
       headers: { 'Content-Type': 'application/json' },
     });
@@ -59,10 +47,10 @@ test.describe('Credential Exchange API', () => {
 
   test('vends scoped creds for the caller\'s own AppInstanceUser at their tier', async ({ request }) => {
     const creds = await getTestCredentials();
-    const idToken = getIdToken(creds.basicUser.email, creds.basicUser.password, creds.cognitoClientId);
+    const idToken = idTokenFor(creds.basicUser.email, creds.basicUser.password, creds.cognitoClientId);
     const sub = subOf(idToken);
 
-    const resp = await request.post(`${EXCHANGE_URL}/exchange-credentials`, {
+    const resp = await request.post(personUrl('/exchange-credentials'), {
       data: {},
       headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
     });
@@ -71,23 +59,32 @@ test.describe('Credential Exchange API', () => {
 
     expect(body.credentials?.AccessKeyId).toBeTruthy();
     expect(body.credentials?.SessionToken).toBeTruthy();
-    // The userArn is the caller's OWN AppInstanceUser (= their sub) — the pinned identity.
-    expect(body.userArn).toContain(`/user/${sub}`);
+    // The userArn is the caller's OWN AppInstanceUser: the person the exchange minted for their
+    // (issuer, sub), a UUID v7 and never the sub itself, and the same one provisioning recorded.
+    expect(idOf(body.userArn)).toMatch(V7);
+    expect(idOf(body.userArn)).not.toBe(sub);
+    expect(creds.basicUser.userArn, 'provisioning recorded no userArn for basicUser (run provision-test-users)').toBeTruthy();
+    expect(body.userArn).toBe(creds.basicUser.userArn);
     expect(body.tier).toBe('basic');
   });
 
   test('IDOR: a body-supplied sub/tier is ignored (identity from the validated token)', async ({ request }) => {
     const creds = await getTestCredentials();
-    const idToken = getIdToken(creds.basicUser.email, creds.basicUser.password, creds.cognitoClientId);
-    const sub = subOf(idToken);
+    const idToken = idTokenFor(creds.basicUser.email, creds.basicUser.password, creds.cognitoClientId);
+    const own = await request.post(personUrl('/exchange-credentials'), {
+      data: {},
+      headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
+    });
+    const ownArn = (await own.json()).userArn;
 
-    const resp = await request.post(`${EXCHANGE_URL}/exchange-credentials`, {
+    const resp = await request.post(personUrl('/exchange-credentials'), {
       data: { sub: 'attacker-sub', tier: 'premium' },
       headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
     });
     expect(resp.status()).toBe(200);
     const body = await resp.json();
-    expect(body.userArn).toContain(`/user/${sub}`); // not 'attacker-sub'
+    expect(body.userArn).toBe(ownArn); // the token's person, not 'attacker-sub'
+    expect(body.userArn).not.toContain('attacker-sub');
     expect(body.tier).toBe('basic');                // not 'premium'
   });
 });

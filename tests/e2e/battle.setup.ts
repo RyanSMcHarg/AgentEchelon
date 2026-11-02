@@ -18,7 +18,8 @@
 import { readFileSync } from 'node:fs';
 import { test as setup, expect } from '@playwright/test';
 import { getTestCredentials, getPremiumUser, getSecondPremiumUser } from './helpers/test-credentials';
-import { initBattleExpIds } from './helpers/battle-setup';
+import { initBattleExpIds, enableBattleForClassification } from './helpers/battle-setup';
+import { fillSecret } from './helpers/unrecorded-secret';
 // Single source of truth for the auth-file path lives in the config (a test file
 // importing the config is safe; the config importing this setup file is not —
 // that would run setup() outside a test context). Re-export for battle.spec.ts.
@@ -51,7 +52,7 @@ setup('authenticate admin on both origins', async ({ page }) => {
   await page.goto(CHAT_BASE_URL);
   await page.waitForSelector('input[type="email"]', { timeout: 15_000 });
   await page.locator('input[type="email"]').fill(creds.testAdmin.email);
-  await page.locator('input[type="password"]').fill(creds.testAdmin.password);
+  await fillSecret(page.locator('input[type="password"]'), creds.testAdmin.password);
   await page.locator('button[type="submit"]').click();
   await page.waitForSelector('.app-header', { timeout: 30_000 });
 
@@ -65,13 +66,21 @@ setup('authenticate admin on both origins', async ({ page }) => {
       .catch(() => false);
     if (needsLogin) {
       await page.locator('input[type="email"]').fill(creds.testAdmin.email);
-      await page.locator('input[type="password"]').fill(creds.testAdmin.password);
+      await fillSecret(page.locator('input[type="password"]'), creds.testAdmin.password);
       await page.locator('button[type="submit"]').click();
       await page.waitForSelector('.admin-dashboard, .admin-section-rail', { timeout: 30_000 });
     }
   }
 
   await page.context().storageState({ path: BATTLE_AUTH_FILE });
+
+  // TURN BATTLE ON, once, for the classification these duels run in.
+  //
+  // Battle is off until an operator turns it on (ADR-049), so without this every enable in the suite
+  // is refused with 403 TIER_FORBIDDEN and the failure reads like a product regression. It belongs
+  // here rather than in a beforeAll for the same reason the experiment ids do: it is a property of the
+  // RUN, and paying it once keeps the per-test path to the cheap steps.
+  await enableBattleForClassification(page, 'premium');
 
   // (c) The PREMIUM non-moderator, in its own context, persisted separately. B-E1 and B-E6 need a
   //     SECOND participant; pre-authenticating here means those tests open a context from
@@ -84,7 +93,7 @@ setup('authenticate admin on both origins', async ({ page }) => {
       await premiumPage.goto(CHAT_BASE_URL);
       await premiumPage.waitForSelector('input[type="email"]', { timeout: 15_000 });
       await premiumPage.locator('input[type="email"]').fill(premium.email);
-      await premiumPage.locator('input[type="password"]').fill(premium.password);
+      await fillSecret(premiumPage.locator('input[type="password"]'), premium.password);
       await premiumPage.locator('button[type="submit"]').click();
       await premiumPage.waitForSelector('.app-header', { timeout: 30_000 });
       await premiumCtx.storageState({ path: BATTLE_PREMIUM_AUTH_FILE });
@@ -93,9 +102,8 @@ setup('authenticate admin on both origins', async ({ page }) => {
     }
   }
 
-  // (d) A second member who is a DIFFERENT IDENTITY from the moderator. testAdmin and premiumUser are
-  //     the same account, so (c) alone cannot exercise anything that turns on two distinct users -
-  //     see BATTLE_SECOND_MEMBER_AUTH_FILE in playwright.config for what that silently defeated.
+  // (d) A second member who is a DIFFERENT IDENTITY from the moderator, so a test that turns on two distinct
+  //     users has two (BATTLE_SECOND_MEMBER_AUTH_FILE in playwright.config).
   //
   //     A FAILURE HERE MUST BE LOUD, and it used to be silent. The whole block was wrapped in
   //     `if (second?.password)`, so anything that stopped the second member being prepared - the key
@@ -122,7 +130,7 @@ setup('authenticate admin on both origins', async ({ page }) => {
     await secondPage.goto(CHAT_BASE_URL);
     await secondPage.waitForSelector('input[type="email"]', { timeout: 15_000 });
     await secondPage.locator('input[type="email"]').fill(second.email);
-    await secondPage.locator('input[type="password"]').fill(second.password);
+    await fillSecret(secondPage.locator('input[type="password"]'), second.password);
     await secondPage.locator('button[type="submit"]').click();
     // Fails the SETUP if this member cannot actually sign in, which is the point: the alternative is
     // writing a storage file for a session that never authenticated, and every test that loads it then

@@ -1,9 +1,15 @@
-import { test, expect, Page, BrowserContext } from '@playwright/test';
-import { signIn, createConversation } from './helpers/agent-helpers';
-import { getAdminUser, getBasicUser, getStandardUser, missingUserReason } from './helpers/test-credentials';
+import { test, expect } from './helpers/fixtures';
+import { Page, BrowserContext } from '@playwright/test';
+import { signIn, createConversation, idTokenOf } from './helpers/agent-helpers';
+import { getAdminUser, getBasicUser, getStandardUser, getPremiumUser, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import { assistantResponseCount, botMessagesForDiagnosis, assertNotAnErrorReply } from './helpers/drift-backend';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
+// WHAT THE ROOM CAN SEE, read from the service rather than from a browser. A privacy assertion made
+// against B's DOM cannot tell "B is not allowed to see it" from "B's socket dropped".
+import { messagesVisibleTo } from './helpers/third-party-view';
+import { personArnOf } from './helpers/person';
+import { ADMIN_API_URL, adminUrl } from './helpers/api-urls';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardBackendErrors('mentions');
@@ -17,14 +23,27 @@ guardConsoleErrors();
 // channel becomes multi-user, which is the regime where the new behavior
 // matters.
 //
-// Asserts:
-//   - `@assistant <q>` from A produces a bot reply targeted to A. Only A sees
-//     A's user message AND the bot reply (Target restricts visibility); B's
-//     DOM stays unchanged. The sticky chip auto-sets on A.
+// Asserts (ADR-034 — addressing a message and making it private are two acts):
+//   - `@<bot> <q>` from A is PUBLIC. Both A and B see the question and the reply.
+//   - `@<person>` from A addresses a colleague and starts NO assistant turn.
+//   - `.<bot> <q>` from A is PRIVATE. B cannot see it, checked server-side.
+//   - `.env is missing` is ordinary text, not an address, and B sees it.
 //   - `@all <q>` from A produces a broadcast bot reply both A and B see.
 //
-// Single-user channels can't exercise this — Lex broadcasts replies in 1:1, so
-// `targetedToUser` is always false and the chip never sets.
+// ── WHAT CHANGED HERE, AND WHY THE OLD ASSERTION WAS THE OPPOSITE ──
+//
+// The first test used to read "@<bot> produces a targeted reply visible only to A" and asserted
+// `B's message count did not grow`. That was the old contract, and it is exactly what ADR-034
+// declared it was breaking: an `@` mention set an Amazon Chime SDK `Target`, so naming the assistant
+// also hid the exchange from the rest of the room. People watched a colleague type a question to the
+// assistant and saw no answer.
+//
+// `@` now sets no `Target` and the channel flow routes it, so the question and the answer are both
+// readable by everyone. The dot is what makes a message private. This file is where that break is
+// observable end to end, which is why the inversion belongs here rather than in a unit test.
+//
+// Single-user channels can't exercise any of it: in a 1:1 Chime's AUTO trigger routes every message
+// regardless of addressing, so there is no room to be excluded from.
 
 /**
  * Open a conversation by its channel id (the last segment of the channel
@@ -60,6 +79,45 @@ async function openConversationById(page: Page, channelId: string) {
   );
 }
 
+/**
+ * Drop the sticky mention chip before a test that types its own address.
+ *
+ * The composer prepends the sticky target to a message that does not start with one, so a chip left
+ * by a previous test in this serial block would silently turn "@Dana ..." into "@Assistant @Dana ..."
+ * - and a test asserting that no assistant answered would then fail for a reason that has nothing to
+ * do with what it is testing.
+ */
+/**
+ * Leave both views on persisted history and STOPPED GROWING, before the next test in this serial
+ * block takes its baseline.
+ *
+ * MEASURED, not guessed. Channel history keeps streaming in for seconds after the textarea enables,
+ * so a baseline captured mid-stream is too low and the NEXT test's delta silently absorbs THIS test's
+ * messages - which is exactly how the `@all` test came to report "the room gained 1 message" for a
+ * broadcast that had in fact delivered both. It passes in isolation and fails after a neighbour, the
+ * signature of a baseline problem rather than a product one. The `@<bot>` test already documents the
+ * same hazard from the other side.
+ */
+async function settleViews(pages: Page[], channelId: string) {
+  for (const page of pages) {
+    await openConversationById(page, channelId);
+    let previous = -1;
+    for (let i = 0; i < 20; i++) {
+      const count = await page.locator('.message').count();
+      if (count === previous) break;
+      previous = count;
+      await page.waitForTimeout(1000);
+    }
+  }
+}
+
+async function clearSticky(page: Page) {
+  const clear = page.locator('.message-input-sticky-target-clear');
+  if (await clear.isVisible({ timeout: 1000 }).catch(() => false)) {
+    await clear.click();
+  }
+}
+
 test.describe.serial('Mentions — Multi-User', () => {
   let ctxA: BrowserContext;
   let ctxB: BrowserContext;
@@ -71,6 +129,16 @@ test.describe.serial('Mentions — Multi-User', () => {
   // by id rather than by list position.
   let channelId: string;
   let channelArn: string;
+  /**
+   * What this channel's assistant is actually CALLED, read from the picker rather than assumed.
+   *
+   * The bot's display name is whatever its `AppInstanceBot` was created with - Atlas, Echo,
+   * Assistant-basic - and a test that hardcodes one passes on the deployment it was written against
+   * and fails everywhere else for a reason that looks like a routing bug.
+   */
+  let botMentionName: string;
+  /** What B is called in this room, read from the picker for the same reason the bot's name is. */
+  let personMentionName: string;
 
   test.beforeAll(async ({ browser }) => {
     const userA = await getBasicUser();
@@ -97,7 +165,7 @@ test.describe.serial('Mentions — Multi-User', () => {
       (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
       { timeout: 30000 },
     );
-    await createConversation(pageA, conversationTitle, 'Claude Haiku');
+    await createConversation(pageA, conversationTitle, 'Basic');
     const createBody = await (await createRespPromise).json();
     channelArn = createBody.conversation.conversationArn as string;
     channelId = channelArn.split('/').pop()!;
@@ -108,7 +176,7 @@ test.describe.serial('Mentions — Multi-User', () => {
     await pageA.locator('button[aria-label="Share conversation"]').click();
     await expect(pageA.locator('#share-email')).toBeVisible({ timeout: 5000 });
     await pageA.locator('#share-email').fill(userB.email);
-    await pageA.locator('.modal-content button[type="submit"]').click();
+    await pageA.locator('form:has(#share-email) button[type="submit"]').click();
     await expect(pageA.locator('.alert-success')).toBeVisible({ timeout: 30000 });
 
     // Confirm A's UI flipped to multi-user.
@@ -129,6 +197,31 @@ test.describe.serial('Mentions — Multi-User', () => {
     // position. B must already be a member (the share above added them), so
     // the channel is in B's list and the deep-link handler can match it.
     await openConversationById(pageB, channelId);
+
+    // Resolve the assistant's real name ONCE, the way a person would: open the picker and read the
+    // BOT-badged entry. Every test below addresses it by that name.
+    await pageA.locator('.message-textarea').fill('@');
+    const botOption = pageA.locator('.mention-option', {
+      has: pageA.locator('.mention-option-badge', { hasText: 'BOT' }),
+    }).first();
+    await expect(botOption).toBeVisible({ timeout: 10000 });
+    botMentionName = ((await botOption.locator('.mention-option-name').textContent()) || '')
+      .trim()
+      .replace(/^@/, '');
+    expect(botMentionName, 'this channel must have an addressable assistant').toBeTruthy();
+
+    // The colleague, from the same list: the entry with no BOT badge.
+    const personOpt = pageA.locator('.mention-option', {
+      hasNot: pageA.locator('.mention-option-badge'),
+    }).first();
+    await expect(personOpt).toBeVisible({ timeout: 10000 });
+    personMentionName = ((await personOpt.locator('.mention-option-name').textContent()) || '')
+      .trim()
+      .replace(/^@/, '');
+    expect(personMentionName, 'this channel must have a second person in it').toBeTruthy();
+
+    await pageA.locator('.message-textarea').fill('');
+    console.log(`Channel members resolve to: @${botMentionName} (bot), @${personMentionName} (person)`);
   });
 
   test.afterAll(async () => {
@@ -136,7 +229,7 @@ test.describe.serial('Mentions — Multi-User', () => {
     await ctxB?.close();
   });
 
-  test('@<bot> produces a targeted reply visible only to A; sticky chip set on A', async () => {
+  test('@<bot> is PUBLIC: both A and B see the question and the reply; sticky chip set on A', async () => {
     // Stabilise B's view BEFORE capturing the baseline. The beforeAll
     // step opens B's conversation and waits for the textarea to enable,
     // but channel-history messages can still be streaming in for a few
@@ -181,20 +274,82 @@ test.describe.serial('Mentions — Multi-User', () => {
     const afterA = await pageA.locator('.message').count();
     console.log(`After @assistant: A=${afterA} (expected ≥${beforeA + 2})`);
 
-    // Sticky chip auto-sets on A from the bot's targeted reply.
+    // Sticky chip auto-sets on A from the mention A just sent. It is set by the composer on SEND
+    // (`mentions.mentionedArns[0]`), not derived from a targeted reply - which matters now that the
+    // reply is not targeted at all.
     await expect(pageA.locator('.message-input-sticky-target'))
       .toBeVisible({ timeout: 10000 });
 
-    // Privacy: a targeted message TO the bot results in a targeted reply
-    // FROM the bot back to the sender (TargetedMessages: ALL on the bot's
-    // Lex config). Neither A's outgoing @<bot> question (Target=[bot])
-    // nor the bot's reply (Target=[sender]) should be visible to B.
-    // Give B a generous window to (incorrectly) receive anything, then
-    // assert the message count did not grow.
-    await pageB.waitForTimeout(8000);
+    // ── THE INVERTED ASSERTION, AND THE POINT OF ADR-034 ──
+    //
+    // B MUST see both halves. This used to assert `afterB === beforeB` - that naming the assistant
+    // hid the whole exchange from the room - because an `@` mention set a `Target`. Addressing a
+    // message and making it private are now two different acts: `@` addresses in public, `.` is
+    // private. Asking one person a question in front of the group is how groups work, and the room
+    // seeing neither the question nor the answer was the defect, not the feature.
+    //
+    // Re-opened from persisted history rather than trusting live WebSocket state, the same way the
+    // `@all` test below does - a socket that dropped mid-test would otherwise read as "B saw
+    // nothing", which is the old bug's signature and would make this pass for the wrong reason.
+    await openConversationById(pageB, channelId);
+    await expect(async () => {
+      const countB = await pageB.locator('.message').count();
+      expect(countB).toBeGreaterThanOrEqual(beforeB + 2);
+    }).toPass({ timeout: 60000 });
+
     const afterB = await pageB.locator('.message').count();
-    console.log(`After wait: B=${afterB} (expected ${beforeB})`);
-    expect(afterB).toBe(beforeB);
+    console.log(`After @<bot>: B=${afterB} (expected >=${beforeB + 2} - the room sees a public mention)`);
+
+    // Hand the next test a settled view, or its baseline absorbs this test's messages.
+    await settleViews([pageA, pageB], channelId);
+  });
+
+  test('@<person> addresses a colleague and starts NO assistant turn', async () => {
+    // THE OTHER HALF OF "ADDRESSING IS NOT SUMMONING". An assistant that answered here would
+    // interrupt every conversation in a busy room, which is the reason silence is the default in a
+    // group at all. The flow resolves the mention, notifies the person, and dispatches nothing.
+    await clearSticky(pageA);
+
+    // Backend truth. The DOM cannot tell "no assistant answered" from "the answer has not arrived
+    // yet", and a lower bound on a message count cannot fail on an extra reply - so the property is
+    // read from the channel itself.
+    const botsBefore = await assistantResponseCount(channelArn);
+    const beforeB = await pageB.locator('.message').count();
+
+    // Pick the PERSON from the same list the bot was picked from, so the name is whatever B is
+    // actually called in this room rather than a guess this test hardcodes.
+    await pageA.locator('.message-textarea').fill('@');
+    const personOption = pageA.locator('.mention-option', {
+      hasNot: pageA.locator('.mention-option-badge'),
+    }).first();
+    await expect(personOption).toBeVisible({ timeout: 5000 });
+    const personLabel = (await personOption.locator('.mention-option-name').textContent())?.trim();
+    console.log(`\n--- multi-user @<person> --- resolved to: ${personLabel}`);
+    await personOption.click();
+    await pageA.locator('.message-textarea').press('End');
+    await pageA.locator('.message-textarea').pressSequentially(' could you take a look at this?');
+    await pageA.keyboard.press('Enter');
+
+    // Long enough that an assistant turn would have landed. A turn answers in seconds; this waits
+    // well past that, so a zero here is silence rather than impatience.
+    await pageA.waitForTimeout(25000);
+
+    const botsAfter = await assistantResponseCount(channelArn);
+    console.log(`Assistant responses: before=${botsBefore} after=${botsAfter} (expected unchanged)`);
+    expect(
+      botsAfter,
+      'an @ mention of a PERSON must not start an assistant turn',
+    ).toBe(botsBefore);
+
+    // And the message still reaches the room, with the token intact - the token is how the addressed
+    // person sees it was meant for them.
+    await openConversationById(pageB, channelId);
+    await expect(async () => {
+      const countB = await pageB.locator('.message').count();
+      expect(countB).toBeGreaterThanOrEqual(beforeB + 1);
+    }).toPass({ timeout: 30000 });
+
+    await settleViews([pageA, pageB], channelId);
   });
 
   test('@all produces a broadcast reply both A and B see', async () => {
@@ -276,10 +431,260 @@ test.describe.serial('Mentions — Multi-User', () => {
     }
   });
 
+  test('.<bot> is PRIVATE: the room cannot see it', async () => {
+    // THE HALF THAT CANNOT BE TAKEN BACK IF IT FAILS, so it is checked against the service rather
+    // than against a browser. A DOM assertion on B's page proves less than it looks: a socket that
+    // dropped, a page that did not refresh, a render that lagged all look exactly like "B cannot see
+    // it". Amazon Chime SDK returns a targeted message only to its sender and its target, so listing
+    // the channel AS B is the room's view by construction, whatever any client believes.
+    //
+    // B IS THE THIRD PARTY HERE. The private message goes from A to the ASSISTANT, so B is neither
+    // sender nor target and is exactly the person who must not see it - no extra member needed.
+    await clearSticky(pageA);
+
+    const userB = await getStandardUser();
+    const arnB = await personArnOf(userB);
+    expect(arnB, 'B must resolve to an app-instance user, or the room view below is not B').toContain('/user/');
+
+    // A codename, so the search below cannot match incidental words the assistant happens to use.
+    const secret = `PRIVATEMENTION${Date.now().toString(36).toUpperCase()}`;
+
+    // Pick the assistant from the PRIVACY picker, which is the gesture a person actually performs:
+    // a dot opens a member list of its own, and picking from it is what guarantees the token matches
+    // a real member in full. Typing the name by hand would test a different thing.
+    await pageA.locator('.message-textarea').fill('.');
+    const privateList = pageA.locator('.mention-dropdown--private');
+    await expect(privateList, 'a dot opens the privacy picker').toBeVisible({ timeout: 5000 });
+    const botOption = privateList.locator('.mention-option', {
+      has: pageA.locator('.mention-option-badge', { hasText: 'BOT' }),
+    }).first();
+    await expect(botOption).toBeVisible({ timeout: 5000 });
+    const label = (await botOption.locator('.mention-option-name').textContent())?.trim();
+    console.log(`\n--- multi-user .<bot> --- privacy picker resolved to: ${label}`);
+    await botOption.click();
+
+    // The chip is the person's confirmation that privacy was applied BEFORE they commit to sending.
+    await expect(
+      pageA.locator('.message-input-sticky-target-chip--private'),
+      'the privacy decoration must appear once the token resolves',
+    ).toBeVisible({ timeout: 5000 });
+
+    await pageA.locator('.message-textarea').press('End');
+    await pageA.locator('.message-textarea').pressSequentially(`please remember the codename ${secret}`);
+    await pageA.keyboard.press('Enter');
+
+    // Let it land and be answered before asking what the room can see.
+    await pageA.waitForTimeout(25000);
+
+    // ── AND THE ABSENCE BELOW IS ALSO THE PROOF THAT LEX ANSWERED, NOT THE FLOW ──
+    //
+    // The two entries are told apart by the VISIBILITY of the reply, not by the correlation id: the
+    // Lex DIRECT path mints `mention-<messageId>` exactly as the flow's dispatch does, so the marker
+    // cannot discriminate between them. What differs is who can read the answer. The flow answers a
+    // mention through `handOffTurnToRouter(broadcast: true)` - an UNTARGETED reply the whole room
+    // sees - while Amazon Chime SDK answering a targeted message replies targeted, to the sender
+    // alone.
+    //
+    // So an answer the room cannot see is an answer the flow did not produce. `.member` is routed by
+    // `TargetedMessages: ALL` and the flow deliberately stands off it (`flowOwnsTheTurn` is false for
+    // a dot), which is exactly what this measures from the outside.
+    const roomSees = messagesVisibleTo(channelArn, arnB);
+    // NOT VACUOUS. A read that returns nothing - wrong bearer, denied call, empty channel - would
+    // satisfy the absence below without proving anything. The room must be able to see SOMETHING
+    // before its not seeing the secret means something.
+    expect(
+      roomSees.length,
+      'B must see the conversation at all, or this proves nothing about what B cannot see',
+    ).toBeGreaterThan(0);
+
+    const leaked = roomSees.filter((c) => c.includes(secret));
+    console.log(`[.private] the room sees ${roomSees.length} message(s), ${leaked.length} carrying the secret`);
+    expect(
+      leaked,
+      'a `.member` message reached somebody who was neither its sender nor its target',
+    ).toEqual([]);
+  });
+
+  test('an assistant named ALONGSIDE a person still answers', async () => {
+    // THE TURN NOBODY ANSWERED. The mention resolver returns the earliest token, which answers "who
+    // is this addressed to" and not "must an assistant answer". Naming a colleague first therefore
+    // made the flow take the human branch and dispatch nothing, while the handler stood down because
+    // a member WAS named - so Lex was invoked and silenced, and the message simply sat there.
+    // Reversing the two names worked, which is the kind of difference nobody reproduces on purpose.
+    //
+    // Only an e2e sees this: both halves are individually behaving as designed, and the failure is
+    // the ABSENCE of a reply.
+    await clearSticky(pageA);
+    const botsBefore = await assistantResponseCount(channelArn);
+
+    // Pick the person from the list, then type the assistant's name after them, so the person's
+    // token genuinely comes first in the text.
+    await pageA.locator('.message-textarea').fill('@');
+    const personOption = pageA.locator('.mention-option', {
+      hasNot: pageA.locator('.mention-option-badge'),
+    }).first();
+    await expect(personOption).toBeVisible({ timeout: 5000 });
+    await personOption.click();
+    await pageA.locator('.message-textarea').press('End');
+    await pageA.locator('.message-textarea').pressSequentially(` and @${botMentionName} what is 2+2?`);
+    await pageA.keyboard.press('Enter');
+
+    await expect(async () => {
+      expect(await assistantResponseCount(channelArn)).toBeGreaterThan(botsBefore);
+    }).toPass({ timeout: 90_000 });
+
+    const botsAfter = await assistantResponseCount(channelArn);
+    console.log(`\n--- @person + @assistant --- responses ${botsBefore} -> ${botsAfter}`);
+    // EXACTLY ONE. The complement still has to hold: the flow answers and the handler stands down.
+    expect(
+      botsAfter - botsBefore,
+      'naming a colleague alongside the assistant must not take the turn away, nor answer it twice',
+    ).toBe(1);
+
+    await settleViews([pageA, pageB], channelId);
+  });
+
+  test('a private address resolves by id, not by display name', async () => {
+    // THE ID IS THE REFERENCE, THE NAME IS ONLY WHAT THE READER SEES. A display name is not unique
+    // and can hold any character, so the picker writes `.<Name|id>` and the composer and the flow
+    // resolve the member by the id first (`privatePrefixFor`, `parseMentions`). This asserts the id is
+    // what was written, and that the message it addresses stays private - not what characters a test
+    // user's name happens to contain.
+    await clearSticky(pageA);
+
+    const secret = `PRIVATEID${Date.now().toString(36).toUpperCase()}`;
+    const userB = await getStandardUser();
+    const arnB = await personArnOf(userB);
+    expect(arnB, 'B must resolve to an app-instance user').toContain('/user/');
+
+    // Pick the ASSISTANT privately, and assert B - who is neither sender nor target - cannot see it.
+    // Addressing B directly would make B the target, and a privacy assertion read from the target's
+    // own view proves nothing.
+    await pageA.locator('.message-textarea').fill('.');
+    const privateList = pageA.locator('.mention-dropdown--private');
+    await expect(privateList, 'a dot opens the privacy picker').toBeVisible({ timeout: 5000 });
+    const botOption = privateList.locator('.mention-option', {
+      has: pageA.locator('.mention-option-badge', { hasText: 'BOT' }),
+    }).first();
+    await expect(botOption).toBeVisible({ timeout: 5000 });
+    await botOption.click();
+    await expect(
+      pageA.locator('.message-input-sticky-target-chip--private'),
+      'the privacy decoration must appear once the token resolves',
+    ).toBeVisible({ timeout: 5000 });
+    // THE PICK WROTE THE MEMBER'S ID beside its name, so who reads the message is decided by the id.
+    const written = await pageA.locator('.message-textarea').inputValue();
+    expect(written, `the private pick wrote no id, only a name: "${written}"`).toMatch(/^\.<[^>|]+\|[^>|]+> /);
+
+    await pageA.locator('.message-textarea').press('End');
+    await pageA.locator('.message-textarea').pressSequentially(`please remember the codename ${secret}`);
+    await pageA.keyboard.press('Enter');
+    await pageA.waitForTimeout(25000);
+
+    const roomSees = messagesVisibleTo(channelArn, arnB);
+    expect(
+      roomSees.length,
+      'B must see the conversation at all, or this proves nothing about what B cannot see',
+    ).toBeGreaterThan(0);
+    expect(
+      roomSees.filter((c) => c.includes(secret)),
+      'a private message reached somebody who was neither its sender nor its target',
+    ).toEqual([]);
+
+    await settleViews([pageA, pageB], channelId);
+  });
+
+  test('a person can send another person a file, and they receive it', async () => {
+    // USER TO USER, WITH NO ASSISTANT IN IT. Every other attachment test in this suite is about
+    // whether a MODEL got the file. This one is about whether a colleague did - which is the more
+    // basic promise of a shared conversation, and the one nothing here asserted.
+    //
+    // It also pins the half of `@<person>` that is easy to lose: addressing a colleague starts no
+    // assistant turn, and that must not come at the cost of the message or its attachment.
+    await clearSticky(pageA);
+    const botsBefore = await assistantResponseCount(channelArn);
+    const marker = `HANDOFF-${Date.now().toString(36).toUpperCase()}`;
+
+    await pageA.locator('.file-input-hidden').setInputFiles({
+      name: 'handoff-note.txt',
+      mimeType: 'text/plain',
+      buffer: Buffer.from(`Handover note.\n\nReference ${marker}.\n`),
+    });
+    await pageA.locator('.message-textarea').fill(`@${personMentionName} here is the note, reference ${marker}`);
+    await pageA.keyboard.press('Enter');
+
+    // B RECEIVES IT. Read from persisted history rather than live socket state, for the reason the
+    // `@all` test gives: a dropped socket and "never delivered" look identical in a DOM.
+    await openConversationById(pageB, channelId);
+    await expect(
+      pageB.locator('.message', { hasText: marker }).first(),
+      'the addressed colleague must actually receive the message',
+    ).toBeVisible({ timeout: 60_000 });
+
+    // AND THE FILE CAME WITH IT, not just the caption. `AttachmentDisplay` renders `.attachment-display`
+    // INSIDE the message, as a sibling of the text, so this is a descendant lookup rather than a walk
+    // up to a guessed parent - and the class is the one the component actually emits.
+    await expect(
+      pageB.locator('.message', { hasText: marker }).first().locator('.attachment-display').first(),
+      'the file must arrive with the message, not only the words about it',
+    ).toBeVisible({ timeout: 30_000 });
+    await expect(
+      pageB.locator('.message', { hasText: marker }).first().locator('.attachment-name').first(),
+      'the recipient sees what the file is called',
+    ).toContainText('handoff-note.txt', { timeout: 15_000 });
+
+    // AND NO ASSISTANT ANSWERED. Addressing a colleague is not summoning the assistant, and an
+    // attachment does not change that.
+    expect(
+      await assistantResponseCount(channelArn),
+      'a file sent to a person must not start an assistant turn',
+    ).toBe(botsBefore);
+
+    await settleViews([pageA, pageB], channelId);
+  });
+
+  test('a dot that names nobody is ordinary text, and the room sees it', async () => {
+    // THE RULE THAT MAKES THE FEATURE LIVABLE. The prefix grammar matches far more than names, and
+    // this used to REFUSE to send anything it could not resolve - so in a room where people discuss
+    // code, `.env is missing` and `.gitignore needs a line` could not be sent at all.
+    //
+    // A dot applies a Target only when it is followed by an actual member's name in full. Anything
+    // else is a sentence that happens to begin with a dot, and it goes to the room as written.
+    await clearSticky(pageA);
+    const beforeB = await pageB.locator('.message').count();
+
+    await pageA.locator('.message-textarea').fill('.env is missing a value');
+
+    // No decoration, because nothing resolved - and the ABSENCE of the chip is what tells the person
+    // this message is not private. That is the signal the refusal used to provide.
+    await expect(
+      pageA.locator('.message-input-sticky-target-chip--private'),
+      'nothing resolved, so nothing may claim to be private',
+    ).toBeHidden({ timeout: 3000 });
+
+    await pageA.keyboard.press('Enter');
+
+    // It SENDS. The composer used to block here with "That name is not in this conversation".
+    await expect(async () => {
+      expect(await pageA.locator('.message-textarea').inputValue()).toBe('');
+    }).toPass({ timeout: 15000 });
+
+    // And it reaches the room, unedited - the dot is part of what the person wrote.
+    await openConversationById(pageB, channelId);
+    await expect(async () => {
+      const countB = await pageB.locator('.message').count();
+      expect(countB).toBeGreaterThanOrEqual(beforeB + 1);
+    }).toPass({ timeout: 30000 });
+    await expect(
+      pageB.locator('.message', { hasText: '.env is missing a value' }).first(),
+      'the room sees the sentence exactly as it was typed',
+    ).toBeVisible({ timeout: 15000 });
+  });
+
 });
 
 // ─────────────────────────────────────────────────────────────────────────────
-// THE ACCEPTANCE TEST FOR THE `@all` HANDOFF (MESSAGE-FLOW §3.1).
+// THE ACCEPTANCE TEST FOR THE `@all` HANDOFF (MESSAGE-FLOW §6.1).
 //
 // Every test above passes whether or not the handoff landed, because they all ask "did `@all`
 // answer?" - and it answered before the handoff too. That is exactly the failure mode §3.1 exists to
@@ -308,9 +713,9 @@ test.describe('the @all handoff: a bypass turn is classified like any other', ()
 
   test('an @all turn is CLASSIFIED, not hardcoded to general', async ({ page, browser }) => {
     test.setTimeout(420_000);
-    const ANALYTICS_API = process.env.VITE_ANALYTICS_API_URL || process.env.ANALYTICS_API_URL || '';
+    const ANALYTICS_API = ADMIN_API_URL ? adminUrl('analytics', '/') : '';
     const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || '';
-    test.skip(!ANALYTICS_API, 'Needs VITE_ANALYTICS_API_URL (gen-frontend-env writes it).');
+    test.skip(!ANALYTICS_API, 'Needs VITE_ADMIN_API_URL (gen-frontend-env writes it).');
     test.skip(!ADMIN_BASE_URL, 'Needs E2E_ADMIN_BASE_URL - the archive read is admin-plane.');
 
     const user = await getStandardUser();
@@ -326,7 +731,7 @@ test.describe('the @all handoff: a bypass turn is classified like any other', ()
     let idToken = '';
     try {
       await signIn(adminPage, admin.email, admin.password);
-      idToken = (await adminPage.evaluate(() => localStorage.getItem('idToken'))) || '';
+      idToken = await idTokenOf(adminPage);
       expect(idToken, 'admin idToken for the analytics read').toBeTruthy();
     } finally {
       await adminCtx.close();
@@ -360,7 +765,7 @@ test.describe('the @all handoff: a bypass turn is classified like any other', ()
       (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
       { timeout: 30000 },
     );
-    await createConversation(page, `E2E All Intent ${Date.now()}`, 'Claude Sonnet');
+    await createConversation(page, `E2E All Intent ${Date.now()}`, 'Standard');
     const channelArn = (await (await createRespPromise).json()).conversation.conversationArn as string;
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
@@ -408,6 +813,48 @@ test.describe('the @all handoff: a bypass turn is classified like any other', ()
   //
   // A GENERAL prompt on purpose: its delivery is PLACEHOLDER_UPDATE, one reply updated in place, so
   // the response count means "how many responders" rather than "how many task steps".
+  test('an ORDINARY 1:1 message is answered exactly once', async ({ page }) => {
+    // THE PLAIN CASE, which nothing asserted. Every 1:1 test in this file addresses the assistant
+    // somehow - `@all`, an attachment caption - so the most common turn in the product, a person
+    // simply typing a question in their own conversation, had no end-to-end coverage at all.
+    //
+    // At this size Amazon Chime SDK's AUTO trigger routes EVERY message to Lex regardless of
+    // addressing, and the flow stands aside for all of them. That makes ONE the whole assertion: two
+    // responses means both entries ran, none means the guard silenced the only one that could.
+    test.setTimeout(180_000);
+    const user = await getStandardUser();
+    test.skip(!user.password, missingUserReason('standardUser'));
+
+    await signIn(page, user.email, user.password);
+    await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
+    const createRespPromise = page.waitForResponse(
+      (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
+      { timeout: 30000 },
+    );
+    await createConversation(page, `E2E Plain 1:1 ${Date.now()}`, 'Basic');
+    const oneToOneArn = (await (await createRespPromise).json()).conversation.conversationArn as string;
+    await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
+
+    // Let the welcome settle, or it counts as this turn's reply.
+    await expect(async () => {
+      expect(await assistantResponseCount(oneToOneArn)).toBeGreaterThanOrEqual(1);
+    }).toPass({ timeout: 90_000 });
+    const before = await assistantResponseCount(oneToOneArn);
+
+    await page.locator('.message-textarea').fill('what is 2+2? Answer with the number only.');
+    await page.keyboard.press('Enter');
+
+    await expect(async () => {
+      expect(await assistantResponseCount(oneToOneArn)).toBeGreaterThan(before);
+    }).toPass({ timeout: 90_000 });
+
+    // Settle, so a second response that is merely SLOW is still counted rather than missed.
+    await page.waitForTimeout(15_000);
+    const after = await assistantResponseCount(oneToOneArn);
+    console.log(`\n--- plain 1:1 --- responses ${before} -> ${after}`);
+    expect(after - before, 'a 1:1 turn is answered by exactly one entry').toBe(1);
+  });
+
   test('a 1:1 @all is answered exactly once, by one entry', async ({ page }) => {
     test.setTimeout(300_000);
     const user = await getStandardUser();
@@ -419,7 +866,7 @@ test.describe('the @all handoff: a bypass turn is classified like any other', ()
       (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
       { timeout: 30000 },
     );
-    await createConversation(page, `E2E All Once ${Date.now()}`, 'Claude Sonnet');
+    await createConversation(page, `E2E All Once ${Date.now()}`, 'Standard');
     const channelArn = (await (await createRespPromise).json()).conversation.conversationArn as string;
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
@@ -450,7 +897,7 @@ test.describe('the @all handoff: a bypass turn is classified like any other', ()
 
     // COUNT MESSAGES THAT SAY SOMETHING, not bot messages.
     //
-    // Amazon Chime SDK materialises a message even from a Lex fulfillment that returned an EMPTY
+    // Amazon Chime SDK materializes a message even from a Lex fulfillment that returned an EMPTY
     // `Messages` array (verified 2026-08-06, ADR-022). So a raw bot-message count used to read 2 on a
     // perfectly healthy 1:1 `@all` - one silent envelope, one real answer - and asserting on it
     // reported a duplicate that did not exist.
@@ -525,7 +972,7 @@ test.describe('the @all handoff: a bypass turn is classified like any other', ()
       (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
       { timeout: 30000 },
     );
-    await createConversation(page, `E2E All Attach ${Date.now()}`, 'Claude Sonnet');
+    await createConversation(page, `E2E All Attach ${Date.now()}`, 'Standard');
     const channelArn = (await (await createRespPromise).json()).conversation.conversationArn as string;
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
@@ -572,6 +1019,127 @@ test.describe('the @all handoff: a bypass turn is classified like any other', ()
       .toBe(true);
     for (const m of (await botMessagesForDiagnosis(channelArn)).slice(-3)) {
       console.log(`[1:1 @all attach] bot message: ${JSON.stringify(m.slice(0, 160))}`);
+    }
+  });
+
+  // THE SAME ASSERTION FOR THE OTHER TOKEN. `@all` takes the flow's bypass; an `@<member>` naming the
+  // assistant does not, so it reaches the turn by a different route and needs its own recovery. It
+  // was measured as broken before that recovery existed: an attachment rides message Metadata, Amazon
+  // Chime SDK sends a Lex turn three request attributes and Metadata is not one of them, so the Lex
+  // path has no route for a file at all. Two producers can supply it - the flow's direct invoke and
+  // the handler reading the stored message back - and for an `@<member>` token neither ran.
+  //
+  // IT LIVES HERE, AND NOT IN THE MULTI-USER SUITE ABOVE, because that suite signs in as a basic user
+  // and opens a Haiku conversation - and `concierge`, the basic assistant, declares
+  // `attachmentsReadable: false` (`backend/lib/config/profiles.ts:319`). Its IAM role holds no
+  // `s3:GetObject` on `attachments/*`, so the answer it gives is the one the product intends. Asserted
+  // there, this test demanded a capability the deployment deliberately withholds and failed on correct
+  // behavior, which is worse than not asserting it: it reported a designed boundary as a defect.
+  test('an @<member> mention carries its attachment to the turn', async ({ browser }) => {
+    test.setTimeout(300_000);
+    // TWO HUMANS, AND THAT IS NOT INCIDENTAL. The mention picker builds its list from the members
+    // other than you (`getMentionOptions`, MessageInput.tsx), and the dropdown renders only when that
+    // list is non-empty. In a 1:1 there is nobody else to offer, so no picker opens and an
+    // `@<member>` mention is not expressible through the UI at all - measured live: the textarea held
+    // "@" and no `.mention-option` rendered for a full minute. The original home of this test was a
+    // shared room for that reason, and moving it to a 1:1 made it unable to perform the action it
+    // asserts.
+    const userA = await getStandardUser();
+    const userB = await getPremiumUser();
+    test.skip(
+      !userA.password || !userB.password,
+      !userA.password ? missingUserReason('standardUser') : missingUserReason('premiumUser'),
+    );
+
+    const ctxA = await browser.newContext();
+    const ctxB = await browser.newContext();
+    const pageA = await ctxA.newPage();
+    const pageB = await ctxB.newPage();
+    try {
+      await signIn(pageA, userA.email, userA.password);
+      await signIn(pageB, userB.email, userB.password);
+
+      const createRespPromise = pageA.waitForResponse(
+        (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
+        { timeout: 30000 },
+      );
+      // SONNET, so the serving assistant is `analyst` - the classification whose profile declares
+      // `attachmentsReadable: true` (`config/profiles.ts`). The basic assistant `concierge` declares
+      // false and holds no `s3:GetObject` on `attachments/*`, so asserting this against it demanded a
+      // capability the deployment deliberately withholds and failed on correct behavior.
+      await createConversation(pageA, `E2E Mention Attach ${Date.now()}`, 'Standard');
+      const channelArn = (await (await createRespPromise).json()).conversation.conversationArn as string;
+      const channelId = channelArn.split('/').pop()!;
+      await expect(pageA.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
+
+      // A shares with B, which is what puts a second human in the room and makes the picker offer
+      // anything at all.
+      await pageA.locator('button[aria-label="Share conversation"]').click();
+      await expect(pageA.locator('#share-email')).toBeVisible({ timeout: 5000 });
+      await pageA.locator('#share-email').fill(userB.email);
+      await pageA.locator('form:has(#share-email) button[type="submit"]').click();
+      await expect(pageA.locator('.alert-success')).toBeVisible({ timeout: 30000 });
+      await expect(pageA.locator('.conversation-header-btn-count')).toBeVisible({ timeout: 15000 });
+      await pageA.locator('.modal-close-btn').click();
+      await expect(pageA.locator('.modal-content')).toBeHidden({ timeout: 5000 });
+      await openConversationById(pageB, channelId);
+
+      await expect(async () => {
+        expect(await assistantResponseCount(channelArn)).toBeGreaterThanOrEqual(1);
+      }).toPass({ timeout: 90_000 });
+      const botsBefore = await assistantResponseCount(channelArn);
+
+      // Resolve the assistant's real name the way a person would, by reading the BOT-badged entry out
+      // of the picker. Hardcoding it would pin a display name this deployment is free to change.
+      await pageA.locator('.message-textarea').fill('@');
+      const botOption = pageA.locator('.mention-option', {
+        has: pageA.locator('.mention-option-badge', { hasText: 'BOT' }),
+      }).first();
+      await expect(botOption).toBeVisible({ timeout: 10000 });
+      const botMention = ((await botOption.locator('.mention-option-name').textContent()) || '')
+        .trim()
+        .replace(/^@/, '');
+      expect(botMention, 'this channel must have an addressable assistant').toBeTruthy();
+
+      // A nonce that exists ONLY in the file, so a caption-only answer cannot luck into it.
+      const codename = `MENTIONFAX-${Date.now().toString(36).toUpperCase()}`;
+      await pageA.locator('.file-input-hidden').setInputFiles({
+        name: 'mention-brief.txt',
+        mimeType: 'text/plain',
+        buffer: Buffer.from(
+          `Project brief.\n\nThe internal codename for this initiative is ${codename}.\n`
+          + 'Scope: a short pilot, one team, one quarter. Nothing else in this brief matters.\n',
+        ),
+      });
+
+      await pageA.locator('.message-textarea').fill(
+        `@${botMention} what is the internal codename stated in the attached document? Reply with the codename.`,
+      );
+      await pageA.keyboard.press('Enter');
+
+      await expect(async () => {
+        expect(await assistantResponseCount(channelArn)).toBeGreaterThan(botsBefore);
+      }).toPass({ timeout: 180_000 });
+
+      // POLL rather than sample once: the question can classify as data_extraction, whose delivery is
+      // a multi-step chain, so the grounded answer lands a message or two after the first reply. The
+      // codename survives percent-encoding verbatim (A-Z, digits, hyphen), so the stored content is
+      // searchable either way.
+      await expect
+        .poll(async () => (await botMessagesForDiagnosis(channelArn)).some((m) => m.includes(codename)), {
+          timeout: 180_000,
+          message:
+            'no assistant message contains the codename that exists only inside the attached document. '
+            + 'The reply was probably fluent - that is the failure mode: the attachment rides Metadata, '
+            + 'Lex never passes it, and a mention that recovers neither answers on the caption alone.',
+        })
+        .toBe(true);
+      for (const m of (await botMessagesForDiagnosis(channelArn)).slice(-3)) {
+        console.log(`[@member attach] bot message: ${JSON.stringify(m.slice(0, 160))}`);
+      }
+    } finally {
+      await ctxA.close();
+      await ctxB.close();
     }
   });
 });

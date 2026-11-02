@@ -14,22 +14,23 @@
  *
  * WHAT MAKES IT NON-VACUOUS. It opens tasks in TWO separate conversations and asserts the single queue
  * carries BOTH channel ARNs. A one-conversation assertion passes on any implementation that returns
- * the current channel's tasks, which is the pre-fix behaviour and the very thing the row is about.
+ * the current channel's tasks, which is the pre-fix behavior and the very thing the row is about.
  *
  * Gated by OPEN_WORK_E2E=1 (a validate.mjs phase). Runs against the live deployment.
- *   E2E_BASE_URL=<cf> OPEN_WORK_E2E=1 VITE_USER_TASKS_API_URL=<url> npx playwright test \
+ *   E2E_BASE_URL=<cf> OPEN_WORK_E2E=1 VITE_PERSON_API_URL=<url> npx playwright test \
  *     e2e/open-work-items.spec.ts
  */
-import { test, expect } from '@playwright/test';
-import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
+import { test, expect } from './helpers/fixtures';
+import { signIn, createConversation, sendAndWaitForResponse, idTokenOf } from './helpers/agent-helpers';
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { PERSON_API_URL, personUrl } from './helpers/api-urls';
 
 guardConsoleErrors();
 
 const RUN = process.env.OPEN_WORK_E2E === '1';
 const suite = RUN ? test.describe : test.describe.skip;
-const TASKS_API = process.env.VITE_USER_TASKS_API_URL || '';
+const TASKS_API = PERSON_API_URL ? personUrl('/tasks/mine') : '';
 
 // A report prompt with the scope deliberately left open. The assistant opens a task and comes back to
 // the user for scope, so the task's first state awaits THEM - which is the state that must be owned by
@@ -53,7 +54,7 @@ suite('open work items are one cross-conversation queue', () => {
   let creds: TestCredentials;
   test.beforeAll(async () => {
     creds = await getTestCredentials();
-    expect(TASKS_API, 'VITE_USER_TASKS_API_URL must be set').toBeTruthy();
+    expect(TASKS_API, 'VITE_PERSON_API_URL must be set').toBeTruthy();
   });
 
   test('a task opened in each of two conversations appears in one queue', async ({ page }) => {
@@ -85,7 +86,7 @@ suite('open work items are one cross-conversation queue', () => {
     // the token's `sub` - there is no parameter by which this could be asked for another user, which is
     // the whole access-control story for the endpoint.
     const queue = async (): Promise<OpenWorkItem[]> => {
-      const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+      const idToken = await idTokenOf(page);
       const body = await page.evaluate(
         async ([url, token]) => {
           const r = await fetch(url as string, {

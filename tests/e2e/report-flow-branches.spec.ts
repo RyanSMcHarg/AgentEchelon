@@ -29,7 +29,7 @@
  * Only then does the test assert the absence of the two drift templates, which on its own would pass
  * on a turn that never reached the backend at all.
  *
- * THE OTHER BRANCHES. `generating -> revising` and the terminal `-> completed` are the two edges the
+ * THE OTHER BRANCHES. `-> revising` (from `generating`, or the declared reopen from `completed`) and the terminal `-> completed` are the edges the
  * default machine declares and nothing drove: a report that is asked to change, and a report that
  * ends. Completion is asserted as a GRAPH EDGE plus the lifecycle ending, because the failure mode
  * being guarded is a task closed by something other than the machine - a walker that force-completed
@@ -46,26 +46,31 @@
  *   E2E_BASE_URL=<cf> TASKS_E2E=1 E2E_INSTANCE_NAME=<instance> AWS_PROFILE=<p> \
  *     npx playwright test e2e/report-flow-branches.spec.ts --config=playwright.config.ts
  */
-import { test, expect, type Page } from '@playwright/test';
-import { signIn, createConversation, sendAndWaitForResponse, looksLikeTaskPlaceholder } from './helpers/agent-helpers';
+import { test, expect } from './helpers/fixtures';
+import { type Page } from '@playwright/test';
+import { signIn, createConversation, sendAndWaitForResponse, looksLikeTaskPlaceholder, idTokenOf } from './helpers/agent-helpers';
 import { isPlaceholder } from './helpers/websocket-monitor';
 import { ChannelWireRecorder, type WireMessage } from './helpers/channel-wire';
 import { getPremiumUser, missingUserReason } from './helpers/test-credentials';
+import { personIdFromIdToken } from './helpers/person';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { openAndValidateAttachment } from './helpers/task-validation';
+import { checkDeliveredAgainstItsTemplate, lastDeliveryTemplate } from './helpers/delivered-template';
 import {
   REPORT_GENERATION,
   edgePath,
   graphEdges,
   hasEdge,
   isAuthorizedEdge,
+  isReopenEdge,
   isDeclaredState,
-  jwtSub,
   pollFor,
   readTask,
   resolveTaskTable,
   runTasksFor,
   terminalEntries,
   type TaskRow,
+  reportPromptForClassification,
 } from './helpers/task-backend';
 
 guardConsoleErrors();
@@ -75,13 +80,14 @@ const SKIP_REASON =
   'Set TASKS_E2E=1 (the validate.mjs "task-branches" phase). This suite drives a real report task '
   + 'through its branches against a live deployment and reads the task row back from DynamoDB.';
 
-/** Classified report_generation -> TASK_MULTI_STEP -> createTask (the prompt every report e2e uses). */
-const REPORT_PROMPT =
-  'Please compile a short report analyzing the pros and cons of a monorepo versus multi-repo for a 5-team org.';
+/** Classified report_generation -> TASK_MULTI_STEP -> createTask: the report premium offers its own
+ *  audience (helpers/task-backend reportPromptForClassification), read from the deployment. A report is scoped to
+ *  the classification it runs in, so the requirements and the revision below are premium's subject. */
+const reportPrompt = (): string => reportPromptForClassification('premium');
 
 /** The requirements the first step asks for: subject, audience, length or format. */
 const REQUIREMENTS_ANSWER =
-  'The audience is engineering leadership. Focus on delivery velocity, code ownership and CI cost, '
+  'The audience is the leadership team. Focus on ARR growth, net revenue retention and churn risk, '
   + 'and give me an outline first.';
 
 /**
@@ -176,19 +182,19 @@ test.describe('a report task follows its machine through every branch it declare
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15_000 });
 
     // Stage 1: open the task.
-    const opening = await sendAndWaitForResponse(page, REPORT_PROMPT, 180_000);
+    const opening = await sendAndWaitForResponse(page, reportPrompt(), 180_000);
     expect(opening.text && opening.text.length, 'the report turn must return a response').toBeTruthy();
 
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     expect(idToken, 'idToken should be present after sign-in').toBeTruthy();
-    const sub = jwtSub(idToken!);
+    const personId = await personIdFromIdToken(idToken!);
 
     const mine = await pollFor(
-      () => runTasksFor(userTable, sub, { taskType: 'report_generation', channelArn, since: runStart }),
+      () => runTasksFor(userTable, personId, { taskType: 'report_generation', channelArn, since: runStart }),
       (rows) => rows.length > 0,
       { timeoutMs: 90_000, intervalMs: 3_000 },
     );
-    expect(mine.length, `a report_generation task should exist for this conversation (sub=${sub})`).toBeGreaterThan(0);
+    expect(mine.length, `a report_generation task should exist for this conversation (personId=${personId})`).toBeGreaterThan(0);
     taskId = mine[0].taskId;
     console.log(`--- report-branches taskId ---\n${taskId}`);
 
@@ -337,7 +343,7 @@ test.describe('a report task follows its machine through every branch it declare
     expect(domText, 'a NAVIGATE_CHANNEL marker rendered mid-task').not.toContain('NAVIGATE_CHANNEL');
   });
 
-  test('a change asked for after delivery moves generating -> revising and re-delivers', async ({ page }) => {
+  test('a change asked for after delivery moves the report into revising and re-delivers', async ({ page }) => {
     test.setTimeout(900_000); // delivery drive (several 180s turns) + the revision turn
 
     expect(taskId, 'the opening stage must have established the task').toBeTruthy();
@@ -345,8 +351,9 @@ test.describe('a report task follows its machine through every branch it declare
 
     // Drive to a DELIVERED report. Premium carries the rich processor, so delivery is a downloadable
     // document; the approvals mirror tasks.spec.ts, with one difference that matters here: they say
-    // the report will be reviewed, so the model has no licence to close the task at delivery. A task
-    // already at `completed` is terminal, and the revision edge is then unreachable by design.
+    // the report will be reviewed. Delivery may still close the task (`generating -> completed`, the
+    // runtime's close on a delivered document); `completed` is terminal and declares the reopen
+    // `completed -> revising`, so the revision below is reachable either way.
     const attachment = page.locator('.assistant-message .attachment-display').last();
     const approvals = [
       'The outline works. Generate the full report and deliver it as a document - I will review it before we close this out.',
@@ -372,26 +379,36 @@ test.describe('a report task follows its machine through every branch it declare
     const attachmentsBefore = await page.locator('.assistant-message .attachment-display').count();
     const revisionReply = await sendAndWaitForResponse(
       page,
-      'Two changes please: cut the CI cost section down to a paragraph, and add a short recommendation '
+      'Two changes please: cut the churn risk section down to a paragraph, and add a short recommendation '
         + 'at the end. Revise the report and send me the updated version.',
       240_000,
     );
     expect(revisionReply.text && revisionReply.text.length, 'the revision request must be answered').toBeTruthy();
 
+    // THE EDGE INTO `revising` depends on whether delivery closed the task: `generating -> revising`
+    // while it was still open, or the declared reopen `completed -> revising` once it was closed.
+    const intoRevising = (t: TaskRow | undefined) =>
+      graphEdges(t).find((e) => e.to === 'revising' && (e.from === 'generating' || e.from === 'completed'));
     const revised = await pollFor(
       () => task(),
-      (t) => hasEdge(t, 'generating', 'revising'),
+      (t) => Boolean(intoRevising(t)),
       { timeoutMs: 180_000, intervalMs: 5_000 },
     );
+    const revisingEdge = intoRevising(revised);
     expect(
-      hasEdge(revised, 'generating', 'revising'),
+      revisingEdge,
       'a change requested after delivery did not move the machine into `revising`. Edges recorded: '
         + `[${edgePath(revised)}], current state ${revised?.taskState}. A path that ends at `
-        + '`generating->completed` means the task was closed at delivery, so the revision the person '
-        + 'asked for could not re-open it.',
-    ).toBe(true);
-    const revisingEdge = graphEdges(revised).find((e) => e.from === 'generating' && e.to === 'revising')!;
-    expect(['tool', 'system'], 'the revision edge must be machine-authored').toContain(revisingEdge.by);
+        + '`generating->completed` means the closed report was not reopened by the change the person '
+        + 'asked for.',
+    ).toBeTruthy();
+    expect(['tool', 'system'], 'the revision edge must be machine-authored').toContain(revisingEdge!.by);
+    if (revisingEdge!.from === 'completed') {
+      // A REOPEN is the person asking, so only the model's call may take it, and the edge says so.
+      expect(isReopenEdge(REPORT_GENERATION, revisingEdge!.from, revisingEdge!.to), 'completed -> revising must be a declared reopen').toBe(true);
+      expect(revisingEdge!.by, "a reopen is authored by the model's tool call, never by the runtime").toBe('tool');
+      expect(revisingEdge!.reopen, 'the reopen edge must be recorded as one').toBe(true);
+    }
 
     // AND THE PERSON GETS THE REVISED REPORT BACK. `revising` declares `delivers`, so a revision that
     // moves the machine and hands nothing over is the half-done case worth failing on.
@@ -407,6 +424,21 @@ test.describe('a report task follows its machine through every branch it declare
         + 'moves the machine and attaches nothing has told the person their changes were applied and '
         + 'given them no way to read them',
     ).toHaveCount(attachmentsBefore + 1, { timeout: 180_000 });
+
+    // AND THE REVISION KEEPS ITS TEMPLATE (SPEC-DOCUMENT-TEMPLATES FR3a, FR6). `revising` declares the
+    // same template as `generating`, and a revision keeps the recorded choice, so the revised file is
+    // compared by structure to the template its delivery record names, which is the one the first
+    // delivery used. Asked for "a short recommendation at the end", the model fits it into the template
+    // rather than adding a section the template does not have.
+    const revisedDoc = await openAndValidateAttachment(page, page.locator('.assistant-message .attachment-display').last(), {
+      namePattern: /\.(md|markdown)$/i, minLength: 400, mustMatch: [],
+    });
+    const afterRevision = await pollFor(() => task(), (t) => (t?.deliveries?.length ?? 0) > (atDelivery?.deliveries?.length ?? 0), { timeoutMs: 60_000, intervalMs: 5_000 });
+    const firstTemplate = lastDeliveryTemplate(atDelivery);
+    const { record, check } = checkDeliveredAgainstItsTemplate(afterRevision, 'premium', revisedDoc);
+    expect(record.name, 'a revision keeps the template the report was delivered in').toBe(firstTemplate?.name);
+    expect(check.missing, `the revised report must still carry "${record.name}"'s required sections in order`).toEqual([]);
+    expect(check.passed).toBe(true);
   });
 
   test('the task reaches its terminal state, and the machine is what closed it', async ({ page }) => {

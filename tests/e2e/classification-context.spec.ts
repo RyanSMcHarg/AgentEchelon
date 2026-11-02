@@ -3,18 +3,17 @@
  *
  * Proves the SPEC-DEMO-COMPANY tiering: the SAME question about Stratum is answered
  * differently by tier, because each tier's assistant reads only its own S3 context
- * prefix (enforced by IAM on the tier's async-processor role, not by the prompt).
+ * prefix (enforced by IAM on the classification's acting role, not by the prompt).
  * Stratum is a FICTIONAL company, so the model can only know its financials/people
  * from the seeded context - which makes the IAM boundary the thing that decides
- * whether a tier can answer. A negative assertion (no `$4.2M`) therefore proves the
- * lower tier genuinely could not read the higher tier's data.
+ * whether a classification can answer. A negative assertion (no `$4.2M`) therefore proves a
+ * classification not granted that data genuinely could not read it.
  *
  * REQUIRES the demo to be seeded first (`seed-demo.ts` uploads the Stratum context)
  * and the Stratum persona (`-c assistantSystemPrompt=...`). Run via `npm run validate`,
  * which seeds before this spec. Skipped when a tier's test user has no password.
  */
-import { test, expect } from '@playwright/test';
-import { execSync } from 'child_process';
+import { test, expect } from './helpers/fixtures';
 import {
   signIn,
   createConversation,
@@ -27,6 +26,9 @@ import {
 } from './helpers/agent-helpers';
 import { getBasicUser, getStandardUser, getPremiumUser, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors, allowConsoleError } from './helpers/turn-guards';
+import {
+  NO_AWS_REASON, awsReachable, actingRole, botFor, decide, sessionContext, processorRoleArn, contextBucket,
+} from './helpers/assistant-acting-role';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardConsoleErrors();
@@ -38,90 +40,62 @@ guardConsoleErrors();
 // utter $4.2M, therefore standard cannot read premium context". That is the consequence, not the
 // cause, and it is a weak proxy in both directions: a model can decline to repeat a figure it CAN
 // read (false pass), and a refusal for an unrelated reason reads identically to a working boundary.
-// The file's own header says the separation is "enforced by IAM on the classification's
-// async-processor role, not by the prompt" - and nothing verified that claim.
 //
-// `simulate-principal-policy` evaluates the real deployed policy and answers allowed /
-// implicitDeny / explicitDeny. It costs one API call, needs no model turn, and cannot be satisfied
-// by a model that simply chose not to answer.
+// The read is made on the assistant's session: the classification's acting role, tagged by the vend
+// with the assistant's `role`. Company context is granted per assistant role (`RoleContextRead<Slug>`,
+// conditioned on `aws:PrincipalTag/role`), so the principal asserted here is the acting role WITH the
+// tags a primary session carries. The processor's own role is bootstrap only and reads none.
+//
+// `simulate-principal-policy` evaluates the real deployed policy, boundary included, and answers
+// allowed / implicitDeny / explicitDeny. It costs one API call, needs no model turn, and cannot be
+// satisfied by a model that simply chose not to answer.
 // ─────────────────────────────────────────────────────────────────────────────
-
-function awsJson(args: string): any {
-  const out = execSync(`aws ${args} --region ${process.env.AWS_REGION || 'us-east-1'} --output json`, {
-    encoding: 'utf8',
-    timeout: 60000,
-    maxBuffer: 10 * 1024 * 1024,
-    env: { ...process.env, MSYS_NO_PATHCONV: '1' },
-  }).trim();
-  return out ? JSON.parse(out) : null;
-}
-
-/** `Ba` / `St` / `Pr` -> the deployed async-processor role ARN for that classification. */
-function processorRoleArn(abbrev: string): string | null {
-  const roles: Array<{ RoleName: string; Arn: string }> = awsJson(
-    `iam list-roles --query "Roles[?starts_with(RoleName,'AgentEchelonClassification-${abbrev}-ProcessorRole')].{RoleName:RoleName,Arn:Arn}"`,
-  ) || [];
-  return roles[0]?.Arn ?? null;
-}
-
-/** The bucket the context prefixes live under, read off a role's own ContextS3Read grant. */
-function contextBucketFrom(roleArn: string): string | null {
-  const roleName = roleArn.split('/').pop()!;
-  const stmts: any[] = awsJson(
-    `iam get-role-policy --role-name ${roleName} --policy-name ContextS3Read --query "PolicyDocument.Statement"`,
-  ) || [];
-  for (const s of stmts) {
-    const resources = Array.isArray(s.Resource) ? s.Resource : [s.Resource];
-    for (const r of resources) {
-      const m = /^arn:aws:s3:::([^/]+)\/context\//.exec(String(r));
-      if (m) return m[1];
-    }
-  }
-  return null;
-}
 
 test.describe('Classification context - the IAM boundary itself', () => {
   test('each classification can read its own context prefix and NOT the ones above it', async () => {
     test.setTimeout(180_000);
+    test.skip(!awsReachable(), NO_AWS_REASON);
 
     const CLASSIFICATIONS = [
-      { abbrev: 'Ba', name: 'basic', canRead: ['basic'], cannotRead: ['standard', 'premium'] },
-      { abbrev: 'St', name: 'standard', canRead: ['basic', 'standard'], cannotRead: ['premium'] },
-      { abbrev: 'Pr', name: 'premium', canRead: ['basic', 'standard', 'premium'], cannotRead: [] },
+      { name: 'basic', canRead: ['basic'], cannotRead: ['standard', 'premium'] },
+      { name: 'standard', canRead: ['basic', 'standard'], cannotRead: ['premium'] },
+      { name: 'premium', canRead: ['basic', 'standard', 'premium'], cannotRead: [] },
     ];
 
     const violations: string[] = [];
 
     for (const c of CLASSIFICATIONS) {
-      const roleArn = processorRoleArn(c.abbrev);
-      expect(roleArn, `no deployed async-processor role for ${c.name}`).toBeTruthy();
-      const bucket = contextBucketFrom(roleArn!);
-      expect(bucket, `${c.name} role has no context/* grant in ContextS3Read`).toBeTruthy();
+      const acting = actingRole(c.name);
+      expect(acting, `no deployed ${c.name} acting role`).toBeTruthy();
+      const processor = processorRoleArn(c.name);
+      const bucket = contextBucket(c.name);
+      expect(processor && bucket, `could not read the ${c.name} processor role and context bucket`).toBeTruthy();
+      // A real primary bot when one is assigned. The context grant does not compare the bot, so a
+      // placeholder keeps the session's tag set the same shape without changing the answer.
+      const primarySession = sessionContext(c.name, 'primary', botFor(c.name, 'primary')?.botId || 'primary-probe-bot');
 
-      const decide = (prefix: string): string => {
-        const res = awsJson(
-          `iam simulate-principal-policy --policy-source-arn ${roleArn} --action-names s3:GetObject `
-          + `--resource-arns "arn:aws:s3:::${bucket}/context/${prefix}/probe.json" `
-          + `--query "EvaluationResults[0].EvalDecision"`,
-        );
-        return String(res);
-      };
+      const read = (principal: string, prefix: string, context: string[]): string =>
+        decide(principal, 's3:GetObject', `arn:aws:s3:::${bucket}/context/${prefix}/probe.json`, context);
 
       for (const prefix of c.canRead) {
-        const d = decide(prefix);
-        if (d !== 'allowed') violations.push(`${c.name} CANNOT read context/${prefix}/ (${d}) - it should`);
+        const d = read(acting!.arn, prefix, primarySession);
+        if (d !== 'allowed') violations.push(`${c.name} primary session CANNOT read context/${prefix}/ (${d}) - it should`);
       }
       for (const prefix of c.cannotRead) {
-        const d = decide(prefix);
+        const d = read(acting!.arn, prefix, primarySession);
         if (d === 'allowed') {
           violations.push(
-            `${c.name} CAN read context/${prefix}/ - the classification boundary is OPEN. Every `
+            `${c.name} primary session CAN read context/${prefix}/ - the classification boundary is OPEN. Every `
             + 'model-output assertion in this file would still pass, because a model that simply '
             + 'chose not to quote the figure looks identical to one that could not reach it.',
           );
         }
       }
-      console.log(`[iam-boundary] ${c.name}: reads ${c.canRead.join('+')}, denied ${c.cannotRead.join('+') || '(none)'}`);
+      for (const prefix of ['basic', 'standard', 'premium']) {
+        const d = read(processor!, prefix, []);
+        if (d === 'allowed') violations.push(`${c.name} processor role CAN read context/${prefix}/ - it must read none`);
+      }
+      console.log(`[iam-boundary] ${c.name}: primary session reads ${c.canRead.join('+')}, denied ${c.cannotRead.join('+') || '(none)'}; processor reads none`);
     }
 
     expect(violations, 'the deployed IAM boundary does not match the classification model').toEqual([]);
@@ -177,7 +151,7 @@ const REFUSAL_MARKERS = [
 // Engineering, Product, Sales and Customer Success and no Legal function, and company-public.json
 // names no officers. Retrieval will still rank the directory first - it is the closest thing to a
 // "who holds role X" document - so the model IS handed a plausible passage that does not contain
-// the answer. Declining is the correct behaviour.
+// the answer. Declining is the correct behavior.
 const ABSENT_Q = "Who is Stratum Technologies' General Counsel? Give their name if you have it.";
 
 // Assert the FAILURE, not a phrasing of the success.
@@ -186,7 +160,7 @@ const ABSENT_Q = "Who is Stratum Technologies' General Counsel? Give their name 
 // failed on a live reply that declined perfectly - "the employee directory doesn't list a General
 // Counsel or a Legal department at all" - because "doesn't list" was not on the list. That is the same
 // defect this file's grounding assertion had: pinning one surface form of a correct answer, so the
-// test breaks when the model rephrases and says nothing about whether the behaviour is right.
+// test breaks when the model rephrases and says nothing about whether the behavior is right.
 //
 // The regression this exists for has ONE observable: the model names a person as the officer the
 // corpus does not contain. So assert that directly, and pair it with a deliberately broad negation
@@ -215,10 +189,11 @@ const FABRICATED_OFFICER = [
   new RegExp(`${NAME}\\b[^.\\n]{0,25}\\b(?:is|serves as|acts as)\\b[^.\\n]{0,25}${ROLE}`),
 ];
 // Any real decline contains one of these; a flat fabrication does not.
-const NEGATION = /\b(no|not|n't|none|never|lacks?|absent|unable|without)\b/i;
+// `n't` has no word boundary before it ("doesn't", "isn't"), so it is matched on its own.
+const NEGATION = /\b(no|not|none|never|lacks?|absent|unable|without)\b|n't\b/i;
 
 // The conversation's classification (the assistant chosen at creation) is a real
-// tier boundary: effective tier = min(userTier, channelTier). A premium USER in a
+// tier boundary: effective tier = the channel's classification. A premium USER in a
 // basic (Claude Haiku) conversation gets BASIC access. So each tier's test must
 // open a conversation with its OWN tier's assistant, not always Haiku, or it only
 // ever exercises basic tier. (Premium = Claude Opus, Standard = Claude Sonnet,
@@ -228,7 +203,7 @@ async function ask(
   ws: WebSocketMonitor,
   title: string,
   q: string,
-  assistant = 'Claude Haiku',
+  assistant = 'Basic',
 ) {
   await createConversation(page, title, assistant);
   await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
@@ -252,7 +227,7 @@ test.describe.serial('Classification context - Premium (full access)', () => {
   });
 
   test('premium CAN access financial data (ARR)', async ({ page }) => {
-    const r = await ask(page, ws, 'Tier Premium ARR', ARR_Q, 'Claude Opus');
+    const r = await ask(page, ws, 'Tier Premium ARR', ARR_Q, 'Premium');
     assertBotResponse(r, 'premium-arr');
     const issues = validateResponse(r.text, { mustContainAny: [ARR_FIGURE] });
     logResult('premium-arr', r, [], issues);
@@ -261,14 +236,14 @@ test.describe.serial('Classification context - Premium (full access)', () => {
   });
 
   // THE INVITE-TIME HALF OF THE BOUNDARY (SPEC-CONVERSATION-SECURITY §4b). The context tests above
-  // prove an under-clearance member cannot READ; this proves they are refused at the DOOR - the share
+  // prove a member not cleared for the classification cannot READ; this proves they are refused at the DOOR - the share
   // Lambda answers 403 TIER_FORBIDDEN rather than admitting a member Layer 1 would render inert.
   //
   // This assertion existed only BY ACCIDENT until 2026-08-18: task-answer.spec.ts shared a premium
   // conversation with the standard user in its SETUP, so every live run exercised the refusal - as an
   // unexplained setup failure. When that spec's setup was fixed, the accidental coverage went with
   // it; this is the deliberate replacement, asserting the refusal as the intended outcome.
-  test('an under-clearance user is refused at invite time, not admitted inert', async ({ page }) => {
+  test('a user not cleared for the classification is refused at invite time, not admitted inert', async ({ page }) => {
     const standard = await getStandardUser();
     test.skip(!standard.password, missingUserReason('standardUser'));
 
@@ -283,13 +258,13 @@ test.describe.serial('Classification context - Premium (full access)', () => {
     await page.locator('button[aria-label="Share conversation"]').click();
     await expect(page.locator('#share-email')).toBeVisible({ timeout: 5000 });
     await page.locator('#share-email').fill(standard.email);
-    await page.locator('.modal-content button[type="submit"]').click();
+    await page.locator('form:has(#share-email) button[type="submit"]').click();
 
     // The refusal must be EXPLAINED to the person, naming both levels - a silent no-op teaches the
     // sharer the button is broken, and a success would be the security failure this test exists for.
     const refusal = page.locator('.modal-content .alert-error, .modal-content .alert-warning');
     await expect(refusal, 'the share modal explains the refusal').toContainText(
-      /does not meet the conversation/i,
+      /does not include the premium tier this conversation requires/i,
       { timeout: 30000 },
     );
     await expect(page.locator('.modal-content .alert-success')).toHaveCount(0);
@@ -317,7 +292,7 @@ test.describe.serial('Classification context - Standard (internal ops, no financ
   // and the grounding tests below are the known-intermittent ones - ordered the other way, a flaky
   // refusal silently takes the security check with it and the run still reads as "1 failure".
   test('standard CANNOT access financials (IAM boundary below the prompt)', async ({ page }) => {
-    const r = await ask(page, ws, 'Classification Standard ARR', ARR_Q, 'Claude Sonnet');
+    const r = await ask(page, ws, 'Classification Standard ARR', ARR_Q, 'Standard');
     assertBotResponse(r, 'standard-arr');
     // No premium/* access -> cannot produce the fictional ARR figure.
     expect(r.text.toLowerCase(), 'standard tier must not surface premium financial data').not.toContain(ARR_FIGURE);
@@ -325,7 +300,7 @@ test.describe.serial('Classification context - Standard (internal ops, no financ
   });
 
   test('standard CAN name leadership (employee directory)', async ({ page }) => {
-    const r = await ask(page, ws, 'Classification Standard Lead', LEAD_Q, 'Claude Sonnet');
+    const r = await ask(page, ws, 'Classification Standard Lead', LEAD_Q, 'Standard');
     assertBotResponse(r, 'standard-lead');
     const issues = validateResponse(r.text, {
       mustContainAny: LEAD_ANSWERS,
@@ -341,7 +316,7 @@ test.describe.serial('Classification context - Standard (internal ops, no financ
   });
 
   test('standard DECLINES when the corpus does not hold the answer (over-grounding guard)', async ({ page }) => {
-    const r = await ask(page, ws, 'Classification Standard Absent', ABSENT_Q, 'Claude Sonnet');
+    const r = await ask(page, ws, 'Classification Standard Absent', ABSENT_Q, 'Standard');
     assertBotResponse(r, 'standard-absent');
     logResult('standard-absent', r, []);
 

@@ -19,6 +19,7 @@
 import { test } from '@playwright/test';
 import { assertNoBackendErrors } from './backend-errors';
 import { ConsoleMonitor } from './console-monitor';
+import { declaredBackendErrors } from './watchdog/current';
 
 /**
  * Assert, after each test, that no handler logged an error while it ran.
@@ -47,13 +48,19 @@ export function guardBackendErrors(label: string): void {
   test.beforeEach(() => {
     // A few seconds of lead-in: a turn's first request can reach the handler marginally before the
     // test body starts, and CloudWatch timestamps are the handler's clock, not ours.
-    if (!anyTestRan) windowStart = Date.now() - 5_000;
+    if (!anyTestRan) {
+      windowStart = Date.now() - 5_000;
+      declaredBackendErrors.length = 0;
+    }
     anyTestRan = true;
   });
 
   test.afterAll(async () => {
     if (!anyTestRan) return; // whole file skipped - nothing ran, nothing to check
-    await assertNoBackendErrors(windowStart, label);
+    // The backstop. The live check (`watchdog/run-watch.ts`, Live Tail) fails the test that was running
+    // the moment a line arrives; this sweep reads CloudWatch for the whole file's window and catches what
+    // the live stream could not: a line logged while a session was reopening, or one sampled out.
+    await assertNoBackendErrors(windowStart, label, { allowed: [...declaredBackendErrors] });
   });
 }
 

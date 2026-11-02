@@ -21,8 +21,8 @@
  * a `place_item` intent, which a deployment declares in its INTENT PACK; the platform default pack
  * this deployment runs declares the five enterprise intents and no work-item ones, and the work-item
  * tools are registered only for a conversation that carries a host plan (`domainContext`, written by
- * `federated-create-conversation`, which is gated on a `federatedUserPoolId` this deployment does not
- * set). So the test supplies those two host-side inputs and nothing else - the same technique
+ * the context create, which a one-conversation issuer's people reach and this deployment's
+ * trusted-issuer registry does not declare). So the test supplies those two host-side inputs and nothing else - the same technique
  * `bilingual-conversations.spec.ts` uses for `userLanguage`. Every runtime path under test is the
  * shipped one: the router's resume loop walks `Object.keys(taskStateMachines())` and so finds the
  * row, the processor registers the work-item tools off the stored plan, the proposal coupling
@@ -40,11 +40,13 @@
  *   E2E_BASE_URL=<cf> TASKS_E2E=1 E2E_INSTANCE_NAME=<instance> AWS_PROFILE=<p> \
  *     npx playwright test e2e/place-item-flow.spec.ts --config=playwright.config.ts
  */
-import { test, expect, type Page } from '@playwright/test';
-import { signIn, createConversation, sendAndWaitForResponse, looksLikeTaskPlaceholder } from './helpers/agent-helpers';
+import { test, expect } from './helpers/fixtures';
+import { type Page } from '@playwright/test';
+import { signIn, createConversation, sendAndWaitForResponse, looksLikeTaskPlaceholder, idTokenOf } from './helpers/agent-helpers';
 import { isPlaceholder } from './helpers/websocket-monitor';
 import { ChannelWireRecorder } from './helpers/channel-wire';
 import { getPremiumUser, missingUserReason } from './helpers/test-credentials';
+import { personArnFromIdToken } from './helpers/person';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import {
   PLACE_ITEM,
@@ -55,7 +57,6 @@ import {
   hasEdge,
   isAuthorizedEdge,
   isDeclaredState,
-  jwtSub,
   pollFor,
   proposalsIn,
   putPlanContext,
@@ -143,9 +144,9 @@ async function openPlanConversation(page: Page, label: string): Promise<ChannelW
   expect(channelArn, 'channelArn from create-conversation').toBeTruthy();
   await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15_000 });
 
-  const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+  const idToken = await idTokenOf(page);
   expect(idToken, 'idToken should be present after sign-in').toBeTruthy();
-  const sub = jwtSub(idToken!);
+  const personArn = await personArnFromIdToken(idToken!);
 
   // The two host-side inputs, written where production reads them.
   putPlanContext(contextTable, channelArn, PLAN);
@@ -153,7 +154,7 @@ async function openPlanConversation(page: Page, label: string): Promise<ChannelW
     agentTable,
     userTable,
     channelArn,
-    sub,
+    personArn,
     contextId: 'plan-q4-launch',
     requestExcerpt: 'Add a design review to the Q4 launch plan',
   });

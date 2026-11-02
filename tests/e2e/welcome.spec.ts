@@ -56,12 +56,14 @@
  * titled "New conversation" (the title is auto-derived from a first user message that never comes).
  * Nothing downstream keys on them, but they do accumulate in that user's sidebar across runs.
  */
-import { test, expect, Page } from '@playwright/test';
-import { execSync, execFileSync } from 'child_process';
+import { test, expect } from './helpers/fixtures';
+import { Page } from '@playwright/test';
+import { ensureOnboarded } from './helpers/profile-store';
 import { signIn, createConversation } from './helpers/agent-helpers';
 import { getAdminUser, hasTestCredentials, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import { ChannelWireRecorder } from './helpers/channel-wire';
+import { AGENT_HANDLER, physicalIdsInClassificationStacks } from './helpers/stack-prefix';
 // The SHIPPED composer and parser, imported rather than reimplemented. A local copy of the copy
 // rules would drift from the handler and the test would keep passing against its own fiction. The
 // `.ts` source is imported (not the sibling `.js`) because the compiled output is build-only and
@@ -72,6 +74,14 @@ import {
   composeWelcomeMessage,
   type WelcomeOrientation,
 } from '../../backend/lambda/src/lib/welcome-orientation';
+// Same reason as the composer above: the declaration the router appends is read with the router's own
+// reader, so a change to the marker vocabulary cannot leave this test asserting against a stale copy
+// of the pattern.
+import {
+  stripTurnDeclarations,
+  turnDeclarationOf,
+} from '../../backend/lambda/src/lib/turn-declaration';
+import { aws } from './helpers/aws';
 
 guardConsoleErrors();
 
@@ -94,70 +104,6 @@ const browserReason = 'Set WELCOME_E2E=1 to run the browser welcome tests (a val
 const HISTORICAL_DROP_RATE = 0.29;
 const REPEAT = Number(process.env.WELCOME_REPEAT || 6);
 
-function aws(args: string): any {
-  const out = execSync(`aws ${args} --region ${REGION} --output json`, {
-    encoding: 'utf8',
-    timeout: 60_000,
-    maxBuffer: 20 * 1024 * 1024,
-    env: { ...process.env, MSYS_NO_PATHCONV: '1' },
-  }).trim();
-  return out ? JSON.parse(out) : null;
-}
-
-/** `execFileSync`-style call for arguments that must not go through cmd.exe quoting (JSON keys, JMESPath
- *  expressions with spaces and quotes). The handover records those arriving MANGLED through a shell. */
-function awsArgv(args: string[]): string {
-  return execFileSync('aws', [...args, '--region', REGION], {
-    encoding: 'utf8',
-    timeout: 30_000,
-    env: { ...process.env, MSYS_NO_PATHCONV: '1' },
-  }).trim();
-}
-
-const USER_POOL_ID = process.env.VITE_USER_POOL_ID || process.env.USER_POOL_ID || '';
-
-/**
- * Make sure the creator is already onboarded before a STANDARD conversation is created.
- *
- * Standard is the one classification with an onboarding intake configured, and the intake REPLACES the
- * welcome for a user who has not been onboarded (`SPEC-USER-PROFILE-AND-ONBOARDING`). So the standard
- * welcome is a function of profile state, and a test that ignored that state would assert the
- * orientation copy on one run and the intake's first question on the next.
- *
- * This is the same `if_not_exists` write `e2e/global-setup.ts` already performs for every demo user, so
- * it changes nothing on a normal run - it exists so this test does not silently depend on global setup
- * having succeeded. A real `onboardedAt` and any collected facts are preserved.
- * Returns false when the profile store cannot be reached, so the caller can say so instead of guessing.
- */
-function ensureOnboarded(email: string): boolean {
-  try {
-    if (!USER_POOL_ID) return false;
-    const sub = awsArgv([
-      'cognito-idp', 'admin-get-user', '--user-pool-id', USER_POOL_ID, '--username', email,
-      '--query', "UserAttributes[?Name=='sub'].Value | [0]", '--output', 'text',
-    ]);
-    const table = awsArgv([
-      'ssm', 'get-parameter', '--name', '/agent-echelon/shared/tables/user-profile-name',
-      '--query', 'Parameter.Value', '--output', 'text',
-    ]);
-    if (!sub || sub === 'None' || !table || table === 'None') return false;
-
-    awsArgv([
-      'dynamodb', 'update-item', '--table-name', table,
-      '--key', JSON.stringify({ userSub: { S: sub } }),
-      '--update-expression', 'SET onboardedAt = if_not_exists(onboardedAt, :now)',
-      '--expression-attribute-values', JSON.stringify({ ':now': { S: new Date().toISOString() } }),
-    ]);
-    const raw = awsArgv([
-      'dynamodb', 'get-item', '--table-name', table,
-      '--key', JSON.stringify({ userSub: { S: sub } }), '--output', 'json',
-    ]);
-    return Boolean(raw && JSON.parse(raw)?.Item?.onboardedAt?.S);
-  } catch {
-    return false;
-  }
-}
-
 interface WelcomeWiring {
   classification: string;
   fn: string;
@@ -179,13 +125,11 @@ interface WelcomeWiring {
 }
 
 /** Discover the deployed per-classification handlers and everything their welcome path depends on.
- *  Projected field-by-field: `lambda list-functions` aborts with a charmap encode error on this
- *  account because one function's Description contains a `->`. */
+ *  The handlers are read from the classification stacks rather than matched on their generated names
+ *  (helpers/stack-prefix.ts), which also keeps `lambda list-functions` out of it: that call aborts
+ *  with a charmap encode error on this account because one function's Description contains a `->`. */
 function discoverWelcomeWiring(accountId: string): WelcomeWiring[] {
-  const names: string[] = aws(
-    `lambda list-functions --query "Functions[?contains(FunctionName,'AgentEchelonClassification') `
-    + `&& contains(FunctionName,'AgentHandler')].FunctionName"`,
-  ) || [];
+  const names: string[] = physicalIdsInClassificationStacks(AGENT_HANDLER);
 
   return names.map((rawName) => {
     const fn = rawName.trim();
@@ -403,7 +347,7 @@ test.describe('Welcome — the deployment\'s configured orientation reaches the 
   // (each has its own SSM parameter and its own access line), so premium passing says nothing about
   // whether basic's or standard's copy ever reaches a user. A per-classification claim needs a
   // per-classification test.
-  for (const [label, classification] of [['Open', 'basic'], ['Standard', 'standard'], ['Premium', 'premium']] as const) {
+  for (const [label, classification] of [['Basic', 'basic'], ['Standard', 'standard'], ['Premium', 'premium']] as const) {
     test(`[${classification}] the welcome on the wire is byte-for-byte this deployment's configured copy`, async ({ page }) => {
       test.skip(!BROWSER_RUN, browserReason);
       test.setTimeout(180_000);
@@ -420,11 +364,11 @@ test.describe('Welcome — the deployment\'s configured orientation reaches the 
       // intake's first question and report a product defect that is really a missing precondition.
       if (w!.onboardingConfigured) {
         expect(
-          ensureOnboarded(admin.email),
+          await ensureOnboarded(admin.email),
           `${classification} has an onboarding intake configured, so its welcome depends on whether the `
           + 'creator is already onboarded. The profile store could not be reached to pin that, so this '
-          + 'test cannot know which of the two welcomes to expect. Set VITE_USER_POOL_ID and ensure AWS '
-          + 'credentials reach Cognito plus the user-profile table.',
+          + 'test cannot know which of the two welcomes to expect. Ensure the test secret carries this user and AWS '
+          + 'credentials reach the user-profile table.',
         ).toBe(true);
       }
 
@@ -470,13 +414,29 @@ test.describe('Welcome — the deployment\'s configured orientation reaches the 
       // The bytes. Not a substring of the DOM: the exact string the shipped composer produces from
       // THIS deployment's own SSM parameter. Hardcoded copy in the handler fails this the moment the
       // parameter says anything else, which is the config-driven claim stated as an assertion.
+      //
+      // THE COPY IS COMPARED WITHOUT THE TURN DECLARATION, and the declaration is asserted separately
+      // below. A welcome carries `<!--turn:kind=welcome-->` (dbda2bf3), which is platform control data
+      // the client strips before display, not copy the deployment configured. Folding it into the
+      // expected string would pin this copy test to the marker vocabulary, so that adding a key to a
+      // declaration breaks a test about SSM-driven wording; dropping the check entirely would stop
+      // noticing whether the welcome declares itself at all. Both halves are kept, each asserted as
+      // what it is.
       expect(
-        delivered!.content,
+        stripTurnDeclarations(delivered!.content),
         `the welcome delivered for a ${classification} conversation is not what this deployment's `
         + `configuration composes to. Parameter: ${w!.paramName || '(none)'}. A mismatch means either `
         + 'the router is not reading the parameter (config-driven in name only) or the copy rules '
         + 'diverged from the shipped composer.',
       ).toBe(expected);
+
+      // A welcome answers nothing, and says so. Archival reads this to classify the turn, so a welcome
+      // that stopped declaring itself would be silently counted as an answer to whatever preceded it.
+      expect(
+        turnDeclarationOf(delivered!.content).kind,
+        `the ${classification} welcome reached the wire without declaring itself a welcome, so archival `
+        + 'cannot tell it apart from an answered turn.',
+      ).toBe('welcome');
 
       // And it reached the person, not just the socket. Keeping both halves is what separates
       // "delivered" from "displayed" when this fails.
@@ -521,7 +481,7 @@ test.describe('Welcome — the deployment\'s configured orientation reaches the 
       const { channelArn, welcomeRendered, renderError } = await createAndCaptureArn(
         page,
         `Welcome repeat ${i} ${Date.now()}`,
-        'Open',
+        'Basic',
         false,
       );
 

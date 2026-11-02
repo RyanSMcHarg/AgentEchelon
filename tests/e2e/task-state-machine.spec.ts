@@ -14,12 +14,10 @@
  * admin-console-effectiveness work). The `agent-tasks` row is where `advanceTaskStateTo` writes, so it
  * is the faithful anchor.
  *
- * Runs as the TIER USER (not testAdmin) so correlation is clean: the chat AppInstanceUser id == the
- * Cognito `sub` (AE convention, credential-exchange.ts), so this run's task is the newest
- * report_generation row under that sub in `user-tasks`, created after the run start (rules out legacy
- * rows). Basic runs the full task loop too (taskSupport: 'full'), but on Haiku it often persists just
- * the INITIAL state with no tool transitions; standard/premium MAY advance. Both shapes satisfy the
- * assertions above.
+ * Runs as the TIER USER (not testAdmin) so correlation is clean: the person id the credential exchange
+ * names for the page's token is the `user-tasks` partition, so this run's task is the newest
+ * report_generation row under that person, created after the run start (rules out legacy rows). Standard and premium only: basic offers no report (see TIERS). A task may persist just its
+ * INITIAL state or advance through tool transitions; both shapes satisfy the assertions above.
  *
  * Gated by TASKS_E2E=1 (a validate.mjs phase). Reads DynamoDB + SSM via the AWS CLI (AWS_PROFILE),
  * exactly like helpers/test-credentials.ts. Table names resolve from env (AGENT_TASKS_TABLE /
@@ -28,34 +26,30 @@
  *   E2E_BASE_URL=<cf> TASKS_E2E=1 E2E_INSTANCE_NAME=<instance> AWS_PROFILE=<p> \
  *     npx playwright test e2e/task-state-machine.spec.ts --config=playwright.config.ts
  */
-import { test, expect } from '@playwright/test';
-import { execSync } from 'child_process';
+import { test, expect } from './helpers/fixtures';
 import { writeFileSync, mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
+import { signIn, createConversation, sendAndWaitForResponse, idTokenOf } from './helpers/agent-helpers';
 import {
-  getBasicUser,
   getStandardUser,
   getPremiumUser,
   missingUserReason,
   type TestUser,
 } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { reportPromptForClassification } from './helpers/task-backend';
+import { personIdFromIdToken } from './helpers/person';
+import { aws } from './helpers/aws';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardConsoleErrors();
 
-
 const RUN = process.env.TASKS_E2E === '1';
 const suite = RUN ? test.describe : test.describe.skip;
-const AWS_PROFILE = process.env.AWS_PROFILE || 'default';
-const REGION = 'us-east-1';
 
-// A prompt the intent pack classifies as report_generation → delivery TASK_MULTI_STEP → createTask
-// (mirrors tasks.spec.ts). "report", "analysis", "compile" are its classifier keywords.
-const REPORT_PROMPT =
-  'Please compile a short report analyzing the pros and cons of a monorepo versus multi-repo for a 5-team org.';
+// Each tier asks for the report its own classification offers (helpers/task-backend reportPromptForClassification):
+// a premium report and a basic one are different work, not one request at two clearances.
 
 // Mirrors DEFAULT_TASK_STATE_MACHINES.report_generation (backend/lambda/src/lib/task-state-machines.ts).
 // Inlined so this deploy-gated spec needs no cross-package import; keep in sync if the machine changes.
@@ -67,16 +61,6 @@ const REPORT_GEN_EDGES: Record<string, string[]> = {
   completed: [],
 };
 const REPORT_STATES = new Set(Object.keys(REPORT_GEN_EDGES));
-
-/** Run the AWS CLI (JSON out) with the test AWS_PROFILE, same mechanism as test-credentials.ts. */
-function aws(args: string): any {
-  const out = execSync(`aws ${args} --region ${REGION} --output json`, {
-    encoding: 'utf8',
-    timeout: 20000,
-    env: { ...process.env, AWS_PROFILE },
-  }).trim();
-  return out ? JSON.parse(out) : null;
-}
 
 // AWS CLI JSON args (--expression-attribute-values, --key) must NOT be inlined as a
 // single-quoted string: on Windows execSync runs via cmd.exe, where '...' is not a string
@@ -119,20 +103,16 @@ function unmarshalItem(item: Record<string, any>): Record<string, any> {
   return Object.fromEntries(Object.entries(item).map(([k, v]) => [k, unmarshal(v)]));
 }
 
-/** Cognito `sub` from the id token's payload — the chat AppInstanceUser id, and the user-tasks PK. */
-function jwtSub(idToken: string): string {
-  const payload = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64').toString('utf8'));
-  return payload.sub;
-}
-
 const TIERS: Array<{
-  tier: 'basic' | 'standard' | 'premium';
+  tier: 'standard' | 'premium';
   classification: string;
   getUser: () => Promise<TestUser>;
   /** The secret entry this tier reads, so a credential gate can name what is missing. */
-  secretKey: 'basicUser' | 'standardUser' | 'premiumUser';
+  secretKey: 'standardUser' | 'premiumUser';
 }> = [
-  { tier: 'basic', classification: 'Open', getUser: getBasicUser, secretKey: 'basicUser' },
+  // Basic is not here: it offers no report. It cannot hand over a document (`richProcessor: false`),
+// so its intent pack has no `report_generation` and a report request is answered inline
+// (guarded by backend/test/lib/intent-pack-extends.test.ts).
   { tier: 'standard', classification: 'Standard', getUser: getStandardUser, secretKey: 'standardUser' },
   { tier: 'premium', classification: 'Premium', getUser: getPremiumUser, secretKey: 'premiumUser' },
 ];
@@ -161,14 +141,22 @@ suite('Task machine state persists to the source of truth (SPEC-TASK-STATE-TRANS
       const runStart = Date.now() - 60_000; // small skew cushion vs. the row's createdAt
 
       await signIn(page, user.email, user.password);
+      const createResp = page.waitForResponse(
+        (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
+        { timeout: 30_000 },
+      );
       await createConversation(page, `Task-state e2e ${tc.tier} ${Date.now()}`, tc.classification);
+      // THIS CONVERSATION'S TASKS ONLY. Another spec in the same phase signs in as the same user and asks
+      // for the same report a minute earlier, so a per-user time window counted its task as a duplicate.
+      const thisChannel = ((await (await createResp).json())?.conversation?.conversationArn as string) || '';
+      expect(thisChannel, `[${tc.tier}] the create-conversation response names the conversation`).toBeTruthy();
 
-      const resp = await sendAndWaitForResponse(page, REPORT_PROMPT, 180_000);
+      const resp = await sendAndWaitForResponse(page, reportPromptForClassification(tc.tier), 180_000);
       expect(resp.text && resp.text.length, `[${tc.tier}] the report turn must return a response`).toBeTruthy();
 
-      const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+      const idToken = await idTokenOf(page);
       expect(idToken, `[${tc.tier}] idToken should be present after sign-in`).toBeTruthy();
-      const sub = jwtSub(idToken!);
+      const personId = await personIdFromIdToken(idToken!);
 
       // Correlate THIS run's task: the newest report_generation row for this user, created after
       // runStart (a task is created synchronously at send time; a short poll covers write visibility).
@@ -177,18 +165,19 @@ suite('Task machine state persists to the source of truth (SPEC-TASK-STATE-TRANS
       for (let i = 0; i < 20 && !userRow; i++) {
         const q = aws(
           `dynamodb query --table-name "${userTable}" ` +
-            `--key-condition-expression "userSub = :u" ` +
-            `--expression-attribute-values ${jsonArg({ ':u': { S: sub } })}`,
+            `--key-condition-expression "principalId = :u" ` +
+            `--expression-attribute-values ${jsonArg({ ':u': { S: personId } })}`,
         );
         runRows = ((q?.Items ?? []) as Array<Record<string, any>>)
           .map(unmarshalItem)
           .filter((r) => r.taskType === 'report_generation')
+          .filter((r) => r.channelArn === thisChannel)
           .filter((r) => new Date(r.createdAt || 0).getTime() >= runStart)
           .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
         userRow = runRows[0];
         if (!userRow) await page.waitForTimeout(3000);
       }
-      expect(userRow, `[${tc.tier}] a report_generation task row for this run should exist (sub=${sub})`).toBeTruthy();
+      expect(userRow, `[${tc.tier}] a report_generation task row for this run should exist (personId=${personId})`).toBeTruthy();
 
       // NO DUPLICATE TASKS at the SOURCE OF TRUTH (T1): this single ask, by this user, in this window must
       // have created EXACTLY ONE report_generation task row — not a duplicate from the getActiveTask

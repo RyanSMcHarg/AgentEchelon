@@ -19,30 +19,33 @@
  * WHY testAdmin drives every tier: the analytics API is ADMIN-gated, so the
  * task_details read needs an admin token. testAdmin is premium AND in the admins
  * group, so it can also CREATE every tier's conversation — the conversation's
- * classification (Open/Standard/Premium) selects the tier's bot + handler
- * (effective tier = min(userTier, channelTier)), so an 'Open' conversation routes
+ * classification (Basic/Standard/Premium) selects the tier's bot + handler
+ * (effective tier = the channel's classification), so a 'Basic' conversation routes
  * to the BASIC handler even though testAdmin is premium. Using a tier user's token
  * instead would 401 the analytics read (they are not admins) — the reason an
  * earlier version of this test never actually reached its assertion.
  *
  * Gated by TASKS_E2E=1 (a validate.mjs phase). Runs against the live deployment.
  *
- *   E2E_BASE_URL=<cf> TASKS_E2E=1 VITE_ANALYTICS_API_URL=<url> AWS_PROFILE=<p> \
+ *   E2E_BASE_URL=<cf> TASKS_E2E=1 VITE_ADMIN_API_URL=<url> AWS_PROFILE=<p> \
  *     npx playwright test e2e/tasks.spec.ts --config=playwright.config.ts
  */
-import { test, expect, request as pwRequest } from '@playwright/test';
-import { signIn, createConversation, sendAndWaitForResponse, looksLikeTaskPlaceholder } from './helpers/agent-helpers';
+import { test, expect } from './helpers/fixtures';
+import { request as pwRequest } from '@playwright/test';
+import { signIn, createConversation, sendAndWaitForResponse, looksLikeTaskPlaceholder, idTokenOf } from './helpers/agent-helpers';
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
+import { personIdFromIdToken } from './helpers/person';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { assertNoDuplicateTasks, openAndValidateAttachment } from './helpers/task-validation';
+import { checkDeliveredAgainstItsTemplate } from './helpers/delivered-template';
 import {
-  resolveTaskTable, readUserTasks, readTask, jwtSub, REPORT_GENERATION, type TaskRow,
+  resolveTaskTable, readUserTasks, readTask, REPORT_GENERATION, type TaskRow, reportPromptForClassification,
 } from './helpers/task-backend';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { ADMIN_API_URL, adminUrl } from './helpers/api-urls';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardConsoleErrors();
-
 
 const RUN = process.env.TASKS_E2E === '1';
 // A gate that STATES ITS REASON. `test.describe.skip` records none, so a run without the flag reports
@@ -52,24 +55,19 @@ const suite = test.describe;
 const SKIP_REASON =
   'Set TASKS_E2E=1 (the validate.mjs "tasks" phase). This suite drives real multi-step tasks against a '
   + 'live deployment and reads them back through the admin analytics API.';
-const ANALYTICS_API = process.env.VITE_ANALYTICS_API_URL || '';
-
-// A prompt the intent pack classifies as report_generation (delivery
-// TASK_MULTI_STEP) — the words "report", "analysis", "compile" are its keywords,
-// so both the LLM classifier (standard/premium) AND the keyword classifier
-// (basic) emit report_generation → TASK_MULTI_STEP → createTask.
-const REPORT_PROMPT =
-  'Please compile a short report analyzing the pros and cons of a monorepo versus multi-repo for a 5-team org.';
+const ANALYTICS_API = ADMIN_API_URL ? adminUrl('analytics', '/') : '';
 
 // tier → the conversation classification card that binds the channel (and thus the
 // handler) to that tier. testAdmin creates all three (premium sees every card).
-const TIER_CASES: Array<{ tier: 'basic' | 'standard' | 'premium'; classification: string }> = [
-  { tier: 'basic', classification: 'Open' },
+// Basic is not here: it offers no report. It cannot hand over a document (`richProcessor: false`),
+// so its intent pack has no `report_generation` and a report request is answered inline
+// (guarded by backend/test/lib/intent-pack-extends.test.ts).
+const TIER_CASES: Array<{ tier: 'standard' | 'premium'; classification: string }> = [
   { tier: 'standard', classification: 'Standard' },
   { tier: 'premium', classification: 'Premium' },
 ];
 
-suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () => {
+suite('Multi-step task produces task_id data (Tasks + Flows) — every tier that offers a report', () => {
   test.skip(!RUN, SKIP_REASON);
   // Fails a PASSING test that hid a server-side error (see helpers/turn-guards).
   guardBackendErrors('tasks');
@@ -77,7 +75,7 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
   let creds: TestCredentials;
   test.beforeAll(async () => {
     creds = await getTestCredentials();
-    expect(ANALYTICS_API, 'VITE_ANALYTICS_API_URL must be set').toBeTruthy();
+    expect(ANALYTICS_API, 'VITE_ADMIN_API_URL must be set').toBeTruthy();
   });
 
   for (const tc of TIER_CASES) {
@@ -93,7 +91,7 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
       const testStart = Date.now() - 60_000; // 60s skew buffer (task is created slightly before the reply lands)
       // Send the report prompt. A TASK_MULTI_STEP turn posts progress then the
       // deliverable; we just need the turn to complete so the task is archived.
-      const resp = await sendAndWaitForResponse(page, REPORT_PROMPT, 180_000);
+      const resp = await sendAndWaitForResponse(page, reportPromptForClassification(tc.tier), 180_000);
       expect(resp.text && resp.text.length, `[${tc.tier}] the report turn must return a response`).toBeTruthy();
 
       // VACUITY GUARD (must come first). A TASK_MULTI_STEP turn posts a progress placeholder that is
@@ -144,12 +142,12 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
         `[${tc.tier}] no sticky @-mention chip should appear after a 1:1 assistant reply`,
       ).toHaveCount(0);
 
-      const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+      const idToken = await idTokenOf(page);
       const api = await pwRequest.newContext({ extraHTTPHeaders: { Authorization: `Bearer ${idToken}` } });
 
       const end = new Date();
       const start = new Date(end.getTime() - 1 * 86_400_000);
-      // Analytics API is IAM-enforced (adminIamEnforcement) — sign the request; Bearer JWT 403s.
+      // Analytics API is AWS_IAM, like every admin API — sign the request; Bearer JWT 403s.
       const q = async (queryType: string) => {
         const j = await signedAnalyticsPost(ANALYTICS_API, idToken!, { queryType, dateRange: { start: start.toISOString(), end: end.toISOString() } });
         return j.data || [];
@@ -202,7 +200,9 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     // Kick off, then approve/answer each step until the model DELIVERS a downloadable document.
     await sendAndWaitForResponse(
       page,
-      'Compile a concise 1-page report on the pros and cons of a monorepo vs multi-repo setup for a 5-team engineering org.',
+      // The report premium offers its own audience (reportPromptForClassification): a report is scoped to the
+      // classification it runs in, so the requirements and the content checks below are premium's subject.
+      reportPromptForClassification('premium'),
       180_000,
     );
 
@@ -211,15 +211,15 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     // task completes (a terminal state awaits nobody, so there is no hand-back). A capture attempted at
     // the end therefore finds an empty partition and reports "no task" for a task that closed perfectly
     // - which is exactly how this assertion failed while the table showed `completed`.
-    const reportIdToken = await page.evaluate(() => localStorage.getItem('idToken'));
-    const reportSub = jwtSub(reportIdToken!);
+    const reportIdToken = await idTokenOf(page);
+    const reportPersonId = await personIdFromIdToken(reportIdToken!);
     const reportUserTable = resolveTaskTable('user-tasks');
     const reportAgentTable = resolveTaskTable('agent-tasks');
     expect(reportUserTable && reportAgentTable, 'the task tables must resolve - the phase needs E2E_INSTANCE_NAME')
       .toBeTruthy();
     let reportRef: { taskId: string; channelArn: string } | undefined;
     for (let i = 0; i < 12 && !reportRef; i++) {
-      const mine = readUserTasks(reportUserTable!, reportSub)
+      const mine = readUserTasks(reportUserTable!, reportPersonId)
         .filter((t) => String(t.taskType) === 'report_generation')
         .filter((t) => new Date(String(t.createdAt ?? 0)).getTime() >= reportStart)
         .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))[0];
@@ -230,8 +230,13 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
       .toBeTruthy();
 
     const attachment = page.locator('.assistant-message .attachment-display').last();
+    // WORDED FOR THE INPUT GUARDRAIL. "Audience is the leadership team. Focus on ARR growth, net revenue
+    // retention, and churn risk. Keep it concise." scores PROMPT_ATTACK at LOW confidence, which the
+    // filter's HIGH input strength blocks (ApplyGuardrail on every classification's guardrail,
+    // 2026-10-22). The requirements answer never reached the model, and the flow it gates never
+    // delivered. The same request as one polite sentence scores NONE.
     const approvals = [
-      'Audience is engineering leadership. Focus on delivery velocity, code ownership, and CI cost. Keep it concise.',
+      'The audience is the leadership team. Please cover ARR growth, net revenue retention, and churn risk, and keep it concise.',
       'The outline looks good — generate the full report now and deliver it as a downloadable document.',
       'Yes, generate and attach the report as a file.',
     ];
@@ -255,13 +260,13 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
           re: /(^|\n)#{1,3}\s|\n\s*[-*]\s|\n\s*\d+\.\s/,
           because: 'the report must have markdown structure (headings / bullets / numbered sections)',
         },
-        { re: /mono-?repo|multi-?repo|repositor/, because: 'the report must be ON-TOPIC (mono/multi-repo)', lower: true },
+        { re: /\barr\b|annual recurring revenue/, because: 'the report must be ON-TOPIC (ARR performance)', lower: true },
         // THE THREE THINGS THIS TEST ASKED FOR. Structure and a topic word are satisfied by a table of
         // section titles; covering the requested subjects is not. This is the cheapest assertion that
         // separates a report from a proposal to write one.
-        { re: /velocity/, because: 'the report must cover DELIVERY VELOCITY, which the request named', lower: true },
-        { re: /ownership/, because: 'the report must cover CODE OWNERSHIP, which the request named', lower: true },
-        { re: /\bci\b|continuous integration|build (time|cost)/, because: 'the report must cover CI COST, which the request named', lower: true },
+        { re: /growth|grew|increase/, because: 'the report must cover ARR GROWTH, which the request named', lower: true },
+        { re: /net revenue retention|\bnrr\b/, because: 'the report must cover NET REVENUE RETENTION, which the request named', lower: true },
+        { re: /churn/, because: 'the report must cover CHURN RISK, which the request named', lower: true },
       ],
     });
 
@@ -345,7 +350,7 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     // reaches Aurora through Kinesis and archival - a lossy copy on a lag, so the assertion could fail
     // on a task that had genuinely closed. The row is the system of record for a status and it is
     // immediate. (Its sibling assertion in the `/stop` test was converted first; this one was left
-    // behind, which is why it kept failing after the behaviour was fixed.)
+    // behind, which is why it kept failing after the behavior was fixed.)
     //
     // Correlated to THIS test's task, and captured while the person still holds it: the per-user mirror
     // is partitioned by the current OWNER, and ownership moves to the assistant at the first answer.
@@ -386,6 +391,17 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
       'the closure must follow a DELIVERY. A task that reached an ending without handing anything over '
         + 'is a different event, and this test is about the report arriving.',
     ).toBeGreaterThan(0);
+
+    // AND IT IS IN ITS TEMPLATE'S SHAPE (SPEC-DOCUMENT-TEMPLATES FR6, FR8). Every report delivers in a
+    // template, so the delivery record names the one it was checked against, and the delivered file is
+    // compared to that stored version by structure: the template's required sections in its order, by
+    // heading level, with each declared table's columns. Which template is read from the record, so this
+    // holds for the platform's `report`, a deployment's replacement, and premium's choice alike.
+    const { record, check } = checkDeliveredAgainstItsTemplate(row, 'premium', report);
+    console.log(`--- delivered in template ${record.name} ${record.contentHash.slice(0, 12)} (${record.outcome}) ---`);
+    expect(['passed', 'passed_after_correction'], 'the delivery check must have passed the attached report').toContain(record.outcome);
+    expect(check.missing, `the delivered report must carry "${record.name}"'s required sections in order, by level and table columns`).toEqual([]);
+    expect(check.passed).toBe(true);
   });
 
   // ONE THREAD PER PIECE OF WORK (SPEC-TASK-STATE-TRANSITIONS §13). A message that arrives while the
@@ -407,16 +423,15 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
 
     await sendAndWaitForResponse(
       page,
-      'Compile a concise 1-page report on the pros and cons of a monorepo vs multi-repo setup for a '
-        + '5-team engineering org.',
+      reportPromptForClassification('premium'),
       180_000,
     );
     // CAPTURE THE TASK NOW, while the person still holds it. The mirror is partitioned by the current
     // OWNER, and every answer below hands the task to the assistant - so this is the last moment its id
     // can be read from this person's partition. Taken here rather than at the end for that reason, not
     // for convenience.
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
-    const sub = jwtSub(idToken!);
+    const idToken = await idTokenOf(page);
+    const personId = await personIdFromIdToken(idToken!);
     const userTable = resolveTaskTable('user-tasks');
     // ASSERTED, because an unresolved table is indistinguishable from an absent task: the read returns
     // an empty list either way, and the poll below would spend its whole budget learning nothing. The
@@ -432,7 +447,7 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     // Newest-created after this test began, the same correlation `task-state-machine.spec.ts` uses.
     let taskRef: { taskId: string; channelArn: string } | undefined;
     for (let i = 0; i < 12 && !taskRef; i++) {
-      const mine = (userTable ? readUserTasks(userTable, sub) : [])
+      const mine = (userTable ? readUserTasks(userTable, personId) : [])
         .filter((t) => String(t.taskType) === 'report_generation')
         .filter((t) => new Date(String(t.createdAt ?? 0)).getTime() >= runStart)
         .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))[0];
@@ -446,18 +461,26 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     // a state the ASSISTANT owes, which is the window this test exists for.
     await sendAndWaitForResponse(
       page,
-      'Audience is engineering leadership. Focus on delivery velocity and CI cost. Keep it concise.',
+      'Audience is the leadership team. Focus on ARR growth and churn risk. Keep it concise.',
       180_000,
     );
 
+    // APPROVED STEP BY STEP, as the validity test above does. The outline step is put to the person, so
+    // a "looks good" sent before any outline exists is answered with the outline, and the report comes
+    // only after it is approved (measured live 2026-10-26: one message and a five-minute wait timed out
+    // with the outline on screen, and the model was right not to claim a report).
     const attachments = page.locator('.assistant-message .attachment-display');
-    await sendAndWaitForResponse(
-      page,
+    let delivered = false;
+    for (const step of [
       'The outline looks good - generate the full report now and deliver it as a downloadable document.',
-      300_000,
-    );
+      'Yes, generate and attach the report as a file.',
+    ]) {
+      await sendAndWaitForResponse(page, step, 300_000);
+      delivered = await attachments.first().isVisible({ timeout: 60_000 }).catch(() => false);
+      if (delivered) break;
+    }
     await expect(attachments, 'the report must be delivered before this test has anything to guard')
-      .toHaveCount(1, { timeout: 300_000 });
+      .toHaveCount(1, { timeout: 120_000 });
 
     // THE WINDOW THIS ACTUALLY GUARDS, and it is the one reported live: the report has been delivered,
     // the model never advanced the task, so it sits in a state the ASSISTANT owes - and every message
@@ -467,7 +490,7 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     // Note what this does NOT cover. The guard reads the task's RECORDED state, and the running turn is
     // what updates it, so two messages sent seconds apart can both arrive while the state still says the
     // person owes the step. Closing that window needs an in-flight marker, which is a different change;
-    // this asserts the behaviour that exists.
+    // this asserts the behavior that exists.
     await sendAndWaitForResponse(page, 'Is this task complete?', 180_000);
     await page.waitForTimeout(20_000);
     await expect(
@@ -492,7 +515,7 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     );
     let stopRef: { taskId: string; channelArn: string } | undefined;
     for (let i = 0; i < 12 && !stopRef; i++) {
-      const open = (userTable ? readUserTasks(userTable, sub) : [])
+      const open = (userTable ? readUserTasks(userTable, personId) : [])
         .filter((t) => String(t.taskType) === 'report_generation')
         .filter((t) => new Date(String(t.createdAt ?? 0)).getTime() >= stopStart)
         .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))[0];
@@ -501,32 +524,144 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
     }
     expect(stopRef, 'a second report task must be open before /stop has anything to end').toBeTruthy();
 
-    await sendAndWaitForResponse(page, '/stop', 120_000);
-
     // READ THE TASK ROW, NOT THE ANALYTICS PROJECTION. The first version polled `task_details`, which
-    // reaches Aurora through Kinesis and archival - so it asserted a cancel that HAD happened (the
-    // assistant confirmed it in the channel) and failed on lag. The row is the system of record for a
-    // task's status and it is immediate; the projection is a lossy copy of it.
-    // The task is read from the AUTHORITATIVE row, and its id is captured while the PERSON still
-    // holds it. The per-user mirror is partitioned by the task's CURRENT OWNER, and ownership moves to
-    // the assistant the moment an answer is given ( deletes the old partition's row and
-    // writes a new one) - so after  the person's partition is empty, and a test reading it
-    // learns something about ownership rather than about the task.
+    // reaches Aurora through Kinesis and archival, so it asserted a state that HAD been reached and
+    // failed on lag. The row is the system of record for a task's status and it is immediate; the
+    // projection is a lossy copy of it.
     const agentTable = resolveTaskTable('agent-tasks');
     expect(agentTable, 'the agent-tasks table must resolve for this assertion to mean anything').toBeTruthy();
+    const statusOf = (taskId: string): string => {
+      const row = readTask(agentTable!, taskId, stopRef!.channelArn) as Record<string, unknown> | undefined;
+      return String(row?.status ?? '');
+    };
+    const lastAssistantText = async (): Promise<string> => (
+      (await page.locator('.assistant-message .message-text').last().textContent().catch(() => '')) || ''
+    ).trim();
+    /** The next assistant message after `prior` that is not a placeholder. Empty on timeout. */
+    const nextAssistantMessage = async (prior: string, timeoutMs: number): Promise<string> => {
+      const until = Date.now() + timeoutMs;
+      while (Date.now() < until) {
+        const text = await lastAssistantText();
+        if (text && text !== prior && !looksLikeTaskPlaceholder(text) && !/^[.…\s]+$/.test(text)) return text;
+        await page.waitForTimeout(2000);
+      }
+      return '';
+    };
+    /**
+     * THE QUESTION A STOP ASKS, which must come AFTER its acknowledgment.
+     *
+     * The handler posts the acknowledgment and only then starts the question turn, so the order is fixed
+     * by the code rather than by a race. Measured before that change: the question arrived first on most
+     * stops.
+     *
+     * READ FROM THE ORDER ON THE PAGE, not from what the send helper returned: the helper waits for the
+     * conversation to settle and returns the newest message, which is the question when the two post a
+     * fraction of a second apart. The question declares itself (`interim`, it asks and does not close the
+     * turn), and the message immediately before it must be the acknowledgment, which asks nothing.
+     */
+    const stopQuestion = async (sentAfter: number): Promise<string> => {
+      const until = Date.now() + 180_000;
+      while (Date.now() < until) {
+        const messages = page.locator('.assistant-message:has(.message-text)');
+        const phases = await messages.evaluateAll((els) => els.map((e) => ({
+          phase: e.getAttribute('data-response-phase') || '',
+          text: (e.querySelector('.message-text')?.textContent || '').trim(),
+        })));
+        const q = phases.map((m) => m.phase).lastIndexOf('interim');
+        // Only a question that arrived after THIS stop was sent, with its acknowledgment also after it.
+        if (q > sentAfter) {
+          expect(
+            phases[q - 1].text,
+            'the stop acknowledgment comes first, immediately before the question it promises',
+          ).not.toMatch(/\?/);
+          return phases[q].text;
+        }
+        await page.waitForTimeout(2000);
+      }
+      return '';
+    };
+    /** The newest open report task for this person created at or after `since`, if any. */
+    const openReportSince = (since: number): { taskId: string; channelArn: string } | undefined => {
+      const open = (userTable ? readUserTasks(userTable, personId) : [])
+        .filter((t) => String(t.taskType) === 'report_generation')
+        .filter((t) => String(t.channelArn) === stopRef!.channelArn)
+        .filter((t) => new Date(String(t.createdAt ?? 0)).getTime() >= since)
+        .filter((t) => ['pending', 'in_progress'].includes(String(t.status ?? 'in_progress')))
+        .sort((a, b) => String(b.createdAt ?? '').localeCompare(String(a.createdAt ?? '')))[0];
+      return open ? { taskId: String(open.taskId), channelArn: String(open.channelArn) } : undefined;
+    };
 
-    let cancelledRow: Record<string, unknown> | undefined;
-    for (let i = 0; i < 12 && !cancelledRow; i++) {
-      const row = readTask(agentTable!, stopRef!.taskId, stopRef!.channelArn) as Record<string, unknown> | undefined;
-      if (String(row?.status) === 'cancelled') cancelledRow = row;
+    // ── COMPLETED WORK IS KEPT; WORK IN PROGRESS IS CANCELLED; THEN IT ASKS (ADR-033, owner 2026-09-14) ──
+    //
+    // `/stop` means "stop what you are doing", so the open report is cancelled at the stop. The report
+    // delivered earlier in this test is COMPLETE and is not in the set a stop selects, which is why the
+    // stop is exercised on a second, still-open report in its own conversation.
+    //
+    // Three things are asserted, because any one alone passes on a broken product: the stop is ANSWERED
+    // (silence after a stop is indistinguishable from the stop failing), the open work is CANCELLED,
+    // and the follow-up QUESTION arrives.
+    const beforeFirstStop = await page.locator('.assistant-message:has(.message-text)').count();
+    const stopReply = await sendAndWaitForResponse(page, '/stop', 120_000);
+    expect(
+      stopReply.text && stopReply.text.length,
+      'a `/stop` must be answered. Silence after a stop is indistinguishable from the stop not working, '
+        + 'and it is the one path where the person is already unsure whether anything happened.',
+    ).toBeTruthy();
+
+    let cancelled = false;
+    for (let i = 0; i < 12 && !cancelled; i++) {
+      if (statusOf(stopRef!.taskId) === 'cancelled') cancelled = true;
       else await page.waitForTimeout(5000);
     }
     expect(
-      cancelledRow,
-      '`/stop` must cancel the work this person started. It is the escape the decline guard names, so a '
-        + '`/stop` that does not land leaves a stalled task answering every message with the same '
-        + 'sentence and no way for the person to clear it.',
+      cancelled,
+      '`/stop` must cancel the work in progress. A stop that leaves the task open is the stalled task '
+        + 'that answers every message with the same sentence, which is what the escape hatch exists to end.',
     ).toBeTruthy();
+
+    const question = await stopQuestion(beforeFirstStop);
+    expect(
+      question,
+      'the stop must be followed by a question about how to proceed. The acknowledgment promised one; '
+        + 'an absent question is what a broken self-dispatch looks like from the outside.',
+    ).toBeTruthy();
+
+    // ── AND THE QUESTION OWNS ITS FOLLOW-UP ─────────────────────────────────────────────────────────
+    //
+    // Measured live: "Drop it, I do not want that report" was classified `intent: general` and answered
+    // conversationally, because ordinary routing read it as whatever it sounded like. The router now
+    // reads the answer against the question before routing. Both branches that change something are
+    // carried to their ending: "start it again" opens the work again, and "drop it" leaves it gone.
+    const restartAt = Date.now();
+    await sendAndWaitForResponse(page, 'Yes, start that report again, but only cover EMEA.', 180_000);
+    let restarted: { taskId: string; channelArn: string } | undefined;
+    for (let i = 0; i < 12 && !restarted; i++) {
+      restarted = openReportSince(restartAt - 5_000);
+      if (!restarted) await page.waitForTimeout(5000);
+    }
+    expect(
+      restarted,
+      'answering the stop with "start it again" must open the report again. Without this the question '
+        + 'offers a choice that nothing honors.',
+    ).toBeTruthy();
+    expect(restarted!.taskId, 'the restart is new work, not the cancelled row brought back').not.toBe(stopRef!.taskId);
+    expect(statusOf(stopRef!.taskId), 'the cancelled task stays cancelled').toBe('cancelled');
+
+    const beforeSecondStop = await page.locator('.assistant-message:has(.message-text)').count();
+    await sendAndWaitForResponse(page, '/stop', 120_000);
+    const secondQuestion = await stopQuestion(beforeSecondStop);
+    expect(secondQuestion, 'the second stop must ask how to proceed as well').toBeTruthy();
+
+    const dropAt = Date.now();
+    const dropReply = await sendAndWaitForResponse(page, 'Drop it, I do not want that report.', 180_000);
+    expect(dropReply.text, 'letting the work go must be acknowledged, not met with silence').toBeTruthy();
+    expect(statusOf(restarted!.taskId), 'answering "drop it" leaves the restarted work cancelled').toBe('cancelled');
+    await page.waitForTimeout(20_000);
+    expect(
+      openReportSince(dropAt),
+      '"drop it" must not be routed as a request. If it opens a report, the answer was handed to ordinary '
+        + 'routing instead of being read against the question it answers.',
+    ).toBeUndefined();
   });
 
   // OUTPUT VALIDITY — data_extraction: an extraction task must hand back a real, structured, on-topic
@@ -545,19 +680,38 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
         + 'name, ARR, and the reason each is at risk. Give it to me as a downloadable table.',
       180_000,
     );
-    const attachment = page.locator('.assistant-message .attachment-display').last();
+    const attachments = page.locator('.assistant-message .attachment-display');
+    const attachment = attachments.last();
+
+    // THE STEPS HOLD. The live incident delivered a file on the FIRST reply: one model call left the
+    // requirements step, invented where the data came from, and packaged its own greeting with the
+    // table. The opening step is presented (the requirements, and where each came from, for the person
+    // to confirm), and the records are presented at `validating` for the person to check, so no file
+    // exists until the person has said the results are right.
+    await expect(attachments, 'the first reply presents the requirements; it must not deliver a file')
+      .toHaveCount(0, { timeout: 5_000 });
+
+    // The message that VALIDATES the records is the second; the file may appear only after it is sent.
+    const VALIDATION_INDEX = 1;
     const approvals = [
       'Pull from the customer accounts I have access to. Include every at-risk enterprise account, sorted by ARR descending.',
       'The results look right — format the final table and deliver it as a downloadable document.',
       'Yes, attach the extracted table as a file.',
     ];
     let delivered = await attachment.isVisible({ timeout: 2000 }).catch(() => false);
-    for (const a of approvals) {
+    let deliveredAfter = -1;
+    for (const [i, a] of approvals.entries()) {
       if (delivered) break;
       await sendAndWaitForResponse(page, a, 180_000);
       delivered = await attachment.isVisible({ timeout: 3000 }).catch(() => false);
+      if (delivered) deliveredAfter = i;
     }
     expect(delivered, 'the extraction task must DELIVER a downloadable data document').toBe(true);
+    expect(
+      deliveredAfter,
+      'the file must appear only after the person VALIDATED the records, not while the requirements or '
+        + `the records were still being put to them (delivered after message ${deliveredAfter})`,
+    ).toBeGreaterThanOrEqual(VALIDATION_INDEX);
 
     // Open the presigned download and validate the CONTENT is a real structured extraction — a markdown
     // table with the requested fields, on-topic (churn / at-risk accounts), not a conversational summary.
@@ -565,6 +719,10 @@ suite('Multi-step task produces task_id data (Tasks + Flows) — all tiers', () 
       namePattern: /\.(md|markdown|txt|csv)$/i,
       minLength: 200,
       mustMatch: [
+        // STRUCTURAL, so it holds in any language: the file opens with its title or its table, never
+        // with a sentence to the person who asked. The incident's file opened "Hi <name>, I have
+        // everything I need".
+        { re: /^\s*(#{1,6}\s|\|)/, because: 'the extraction file must open with a heading or a table row, not a sentence to the person' },
         { re: /\|.*\|\s*\n\s*\|[-:\s|]+\|/, because: 'the extraction must be a markdown table (header row + separator rule)' },
         { re: /churn|at.risk|risk/, because: 'the extraction must be ON-TOPIC (churn / at-risk accounts)', lower: true },
       ],

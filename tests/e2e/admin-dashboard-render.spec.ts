@@ -15,7 +15,8 @@
  *   cd tests && npx playwright test e2e/admin-dashboard-render.spec.ts \
  *     --config=playwright.config.ts --reporter=list
  */
-import { test, expect, Page, Response } from '@playwright/test';
+import { test, expect } from './helpers/fixtures';
+import { Page, Response } from '@playwright/test';
 import { signIn } from './helpers/agent-helpers';
 import { getAdminUser } from './helpers/test-credentials';
 import { collectBanners } from './helpers/banner-check';
@@ -98,7 +99,7 @@ test.describe('Admin Dashboard - render validation (live)', () => {
     // rendering fine. Say what is actually wrong.
     expect(
       ANALYTICS_HOST,
-      'analytics host unresolved - set VITE_ANALYTICS_API_URL (validate.mjs reads it from '
+      'analytics host unresolved - set VITE_ADMIN_API_URL (validate.mjs reads it from '
         + 'packages/admin/.env) or E2E_ANALYTICS_HOST. Without it this spec captures no responses '
         + 'and cannot judge the dashboard.',
     ).toBeTruthy();
@@ -128,9 +129,9 @@ test.describe('Admin Dashboard - render validation (live)', () => {
       });
     });
 
-    // Overview is the default-active tab; its queries fire on dashboard mount.
+    // Operations is the default-active section; its queries fire on dashboard mount.
     // Arm its waiters BEFORE opening the console so we don't miss them.
-    const overviewWaiters = settleWaiters(page, SECTION_QUERIES.Overview);
+    const firstWaiters = settleWaiters(page, SECTION_QUERIES.Operations);
 
     await signIn(page, admin.email, admin.password);
     // Admin app renders the dashboard at root for an admin (no Admin button since
@@ -138,18 +139,21 @@ test.describe('Admin Dashboard - render validation (live)', () => {
     const rail = page.locator('.admin-section-rail');
     await expect(rail).toBeVisible({ timeout: 15000 });
     // Report Aurora vs Athena mode (drives which queries return unsupported).
-    const mode = (await page.locator('.status-badge--live:has-text("Aurora")').isVisible().catch(() => false))
+    const mode = (await page.locator('.admin-header-mode:has-text("Aurora")').isVisible().catch(() => false))
       ? 'aurora'
       : 'athena';
     console.log(`[render] analytics mode (per badge): ${mode}`);
 
-    const sections = ['Overview', 'Conversations', 'Effectiveness', 'Models', 'Experiments', 'Users'];
+    // The seven top-level sections, in rail order. Four of the names previously here (Overview,
+    // Conversations, Effectiveness, and the Security section) are now SUB-TABS, so the click below
+    // matched no rail button and this diagnostic failed before it could report anything.
+    const sections = ['Operations', 'Performance', 'Oversight', 'Models', 'Assistants', 'Experiments', 'Users'];
     const perSection: Record<string, { banners: { errors: string[]; notices: string[] }; metrics: Record<string, string>; headings: string[]; tableRows: number }> = {};
 
     for (const section of sections) {
-      // Arm response waiters BEFORE clicking (Overview already armed above).
+      // Arm response waiters BEFORE clicking (Operations already armed above).
       const waiters =
-        section === 'Overview' ? overviewWaiters : settleWaiters(page, SECTION_QUERIES[section]);
+        section === 'Operations' ? firstWaiters : settleWaiters(page, SECTION_QUERIES[section]);
 
       await rail.locator(`button:has-text("${section}")`).first().click();
       await expect(page.locator(`.admin-section-btn.active:has-text("${section}")`)).toBeVisible();
@@ -183,10 +187,10 @@ test.describe('Admin Dashboard - render validation (live)', () => {
       console.log(`  ${c.queryType.padEnd(30)} -> ${shape}`);
     }
 
-    // Print the FULL bodies for Overview + Quality (metrics + evaluation) as
+    // Print the FULL bodies for the operational dashboard + the evaluations as
     // required by the diagnosis.
     const dumpFor = new Set(['conversation_volumes', 'intent_distribution', 'evaluation_scores']);
-    console.log(`\n===== RAW BODIES (Overview volumes/intents + Quality evaluations) =====`);
+    console.log(`\n===== RAW BODIES (Operations volumes/intents + evaluations) =====`);
     for (const c of captured) {
       if (dumpFor.has(c.queryType)) {
         console.log(`\n--- ${c.queryType} (status ${c.status}) ---\n${c.bodySnippet}`);
@@ -200,13 +204,13 @@ test.describe('Admin Dashboard - render validation (live)', () => {
       .map(([s, v]) => `${s}: ${v.banners.errors.join(' | ')}`);
     expect(sectionsWithErrors, `Sections with error banners: ${sectionsWithErrors.join(' ; ')}`).toEqual([]);
 
-    // 2. Overview actually rendered real numbers (proves the frontend binds data,
+    // 2. The Operations dashboard actually rendered real numbers (proves the frontend binds data,
     //    not just "no banner"). conversation_volumes is confirmed populated.
     const overviewVolumes = captured.find((c) => c.queryType === 'conversation_volumes');
     expect(overviewVolumes?.status, 'conversation_volumes should be 200').toBe(200);
     // Total Messages card should reflect the data (non-"0" when rows exist).
     if ((overviewVolumes?.rows ?? 0) > 0) {
-      expect(perSection.Overview.metrics['Total Messages'], 'Overview Total Messages card should render').toBeTruthy();
+      expect(perSection.Operations.metrics['Total Messages'], 'Operations Total Messages card should render').toBeTruthy();
     }
   });
 });

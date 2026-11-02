@@ -16,18 +16,18 @@
  * (browser) and the admin archive (SigV4-signed read of the deployed API). A test that checked only
  * the DOM could not tell "archived" from "lost".
  */
-import { test, expect } from '@playwright/test';
-import { signIn, createConversation } from './helpers/agent-helpers';
+import { test, expect } from './helpers/fixtures';
+import { signIn, createConversation, idTokenOf } from './helpers/agent-helpers';
 import { getBasicUser, getAdminUser, hasTestCredentials, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
-import { signedAdminGet } from './helpers/signed-analytics';
+import { signedAdminGet, signedAdminContext } from './helpers/signed-analytics';
+import { ADMIN_API_URL, adminUrl } from './helpers/api-urls';
 
 guardConsoleErrors();
 
 const E2E_RUNNABLE = hasTestCredentials();
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || '';
-const ADMIN_CONVERSATIONS_API =
-  process.env.VITE_ADMIN_CONVERSATIONS_API_URL || process.env.ADMIN_CONVERSATIONS_API_URL || '';
+const ADMIN_CONVERSATIONS_API = ADMIN_API_URL ? adminUrl('admin-conversations', '/admin/conversations') : '';
 
 /** The archive control, gated on `isModerator` in ConversationInterface. */
 const ARCHIVE_BTN = 'button[aria-label="Archive conversation"]';
@@ -43,7 +43,7 @@ test.describe('Conversation archive — moderator gate and record survival', () 
 
     await signIn(page, user.email, user.password);
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
-    await createConversation(page, `Archive gate ${Date.now()}`, 'Open');
+    await createConversation(page, `Archive gate ${Date.now()}`, 'Basic');
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
     // "The channel creator is a moderator of their own channel" — the spec's stated basis for the
@@ -61,7 +61,7 @@ test.describe('Conversation archive — moderator gate and record survival', () 
     test.skip(!ADMIN_BASE_URL, 'Needs E2E_ADMIN_BASE_URL — the archive record is admin-plane.');
     test.skip(
       !ADMIN_CONVERSATIONS_API,
-      'Needs VITE_ADMIN_CONVERSATIONS_API_URL (frontend/packages/admin/.env).',
+      'Needs VITE_ADMIN_API_URL (frontend/packages/admin/.env).',
     );
 
     const user = await getBasicUser();
@@ -77,7 +77,7 @@ test.describe('Conversation archive — moderator gate and record survival', () 
       { timeout: 30000 },
     );
     const title = `Archive e2e ${Date.now()}`;
-    await createConversation(page, title, 'Open');
+    await createConversation(page, title, 'Basic');
     const channelArn: string = (await (await createResp).json())?.conversation?.conversationArn || '';
     expect(channelArn, 'channelArn from create-conversation').toBeTruthy();
     console.log(`\n--- archiving ---\n${channelArn}`);
@@ -102,14 +102,14 @@ test.describe('Conversation archive — moderator gate and record survival', () 
     let idToken = '';
     try {
       await signIn(adminPage, admin.email, admin.password);
-      idToken = (await adminPage.evaluate(() => localStorage.getItem('idToken'))) || '';
+      idToken = await idTokenOf(adminPage);
       expect(idToken, 'admin idToken').toBeTruthy();
     } finally {
       await adminCtx.close();
     }
 
     // Archiving is FAST — the flag reaches the admin archive in seconds, not minutes. The deadline
-    // is a ceiling for a slow day, not an expectation; the elapsed time is logged so a regression in
+    // is a limit for a slow day, not an expectation; the elapsed time is logged so a regression in
     // propagation latency is visible rather than hidden inside a generous timeout.
     const pollStart = Date.now();
     const deadline = pollStart + 60_000;
@@ -148,5 +148,69 @@ test.describe('Conversation archive — moderator gate and record survival', () 
       + 'The record survived but the archived flag did not propagate, so an operator reviewing the '
       + 'archive cannot tell an archived conversation from a live one.',
     ).toBe('archived');
+  });
+
+  test('an administrator archives it from the console, with a stated reason, and the record survives', async ({ page, browser }) => {
+    test.setTimeout(420_000);
+    test.skip(!ADMIN_BASE_URL, 'Needs E2E_ADMIN_BASE_URL - archiving from the console is admin-plane.');
+    test.skip(!ADMIN_CONVERSATIONS_API, 'Needs VITE_ADMIN_API_URL (frontend/packages/admin/.env).');
+
+    const user = await getBasicUser();
+    const admin = await getAdminUser();
+    test.skip(!user.password, missingUserReason('basicUser'));
+    test.skip(!admin.password, missingUserReason('testAdmin'));
+
+    await signIn(page, user.email, user.password);
+    await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
+    const createResp = page.waitForResponse(
+      (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
+      { timeout: 30000 },
+    );
+    const title = `Console archive e2e ${Date.now()}`;
+    await createConversation(page, title, 'Basic');
+    const channelArn: string = (await (await createResp).json())?.conversation?.conversationArn || '';
+    expect(channelArn, 'channelArn from create-conversation').toBeTruthy();
+
+    const adminCtx = await browser.newContext({ baseURL: ADMIN_BASE_URL });
+    const adminPage = await adminCtx.newPage();
+    let idToken = '';
+    try {
+      await signIn(adminPage, admin.email, admin.password);
+      idToken = await idTokenOf(adminPage);
+      expect(idToken, 'admin idToken').toBeTruthy();
+    } finally {
+      await adminCtx.close();
+    }
+
+    // The same signed route the console's Archive control calls (archive-conversation).
+    const api = signedAdminContext(idToken);
+    const archiveUrl = adminUrl('admin-conversations', `/admin/conversations/${encodeURIComponent(channelArn.split('/').pop()!)}/archive`);
+    const unexplained = await api.post(archiveUrl, { data: {} });
+    expect(unexplained.status(), `an archive with no reason answered ${unexplained.status()}: ${await unexplained.text()}`).toBe(400);
+    expect((await unexplained.json())?.code).toBe('REASON_REQUIRED');
+
+    const archived = await api.post(archiveUrl, { data: { reason: 'e2e: console archive' } });
+    expect(archived.status(), `the console archive answered ${archived.status()}: ${await archived.text()}`).toBe(200);
+    await api.dispose();
+
+    // USER SIDE: it leaves the person's active list live, with no reload, exactly as a moderator's archive does.
+    await expect(
+      page.locator(`.conversation-list-item:has-text("${title}")`),
+      'the conversation archived from the console is still in the person\'s active list',
+    ).toHaveCount(0, { timeout: 30000 });
+
+    // ADMIN SIDE: the record survives, marked archived.
+    const deadline = Date.now() + 60_000;
+    let row: any = null;
+    for (;;) {
+      const { status, body } = await signedAdminGet(ADMIN_CONVERSATIONS_API, idToken, { limit: '200', offset: '0' });
+      expect(body?.archiveError ?? null).toBeNull();
+      expect(status).toBe(200);
+      row = (body?.conversations ?? []).find((c: any) => String(c.channel_arn ?? c.channelArn) === channelArn);
+      if ((row && row.state === 'archived') || Date.now() > deadline) break;
+      await new Promise((r) => setTimeout(r, 3_000));
+    }
+    expect(row, 'the conversation archived from the console is absent from the admin archive').toBeTruthy();
+    expect(row?.state).toBe('archived');
   });
 });

@@ -10,26 +10,15 @@
  * Uses the Chime SDK directly with the app-instance-admin bearer (the moderator-of-everything), because that
  * is the only vantage point that can read BOTH channels without joining them.
  */
-import { execFileSync } from 'child_process';
-
-const REGION = process.env.AWS_REGION || 'us-east-1';
-
-function aws(args: string[]): any {
-  const out = execFileSync('aws', [...args, '--region', REGION, '--output', 'json'], {
-    encoding: 'utf8',
-    maxBuffer: 20 * 1024 * 1024,
-    timeout: 60_000,
-    env: { ...process.env, MSYS_NO_PATHCONV: '1' },
-  }).trim();
-  return out ? JSON.parse(out) : null;
-}
+import { SSM_ROOT, stackName } from './stack-prefix';
+import { awsv as aws } from './aws';
 
 let cachedAdmin: string | null = null;
 /** The app-instance-admin ARN, which can read any channel without being a member. */
 function adminArn(): string {
   if (cachedAdmin) return cachedAdmin;
   cachedAdmin = String(
-    aws(['ssm', 'get-parameter', '--name', '/agent-echelon/app-instance-admin-arn', '--query', 'Parameter.Value']),
+    aws(['ssm', 'get-parameter', '--name', `${SSM_ROOT}/app-instance-admin-arn`, '--query', 'Parameter.Value']),
   ).trim();
   return cachedAdmin;
 }
@@ -39,19 +28,6 @@ function appInstanceArn(): string {
   return adminArn().split('/user/')[0];
 }
 
-/**
- * The AppInstanceUser ARN for a signed-in page's Cognito user, derived the same way the client
- * derives its own (`chimeService`: `${APP_INSTANCE_ARN}/user/${sub}`). Needed wherever a count must
- * be taken AS a member: a TARGETED reply is visible only to its sender and target, so the admin
- * bearer's message list omits it by design, and an assertion counting as admin is blind to exactly
- * the reply shape composer-targeting produces.
- */
-export function userArnFromIdToken(idToken: string): string {
-  const payload = JSON.parse(Buffer.from(idToken.split('.')[1], 'base64').toString('utf8'));
-  if (!payload.sub) throw new Error('id token has no sub claim');
-  return `${appInstanceArn()}/user/${payload.sub}`;
-}
-
 let cachedContextTable: string | null = null;
 /** The server-only channel-context table, resolved from CFN so it survives a redeploy. */
 function channelContextTable(): string {
@@ -59,7 +35,7 @@ function channelContextTable(): string {
   const envName = process.env.CHANNEL_CONTEXT_TABLE;
   if (envName) { cachedContextTable = envName; return cachedContextTable; }
   const out = aws([
-    'cloudformation', 'describe-stacks', '--stack-name', 'AgentEchelonFoundations',
+    'cloudformation', 'describe-stacks', '--stack-name', stackName('Conversations'),
     '--query', "Stacks[0].Outputs[?contains(OutputKey,'ChannelContext')].OutputValue|[0]",
   ]);
   const name = typeof out === 'string' ? out.trim() : '';
@@ -282,7 +258,7 @@ export async function messageMatches(
  * {@link assistantResponseCount} counts, but readable.
  *
  * Exists because a COUNT cannot distinguish "answered twice" from "answered once, plus the empty Lex
- * envelope Amazon Chime SDK materialises from a silent fulfillment" (verified 2026-08-06; the router's
+ * envelope Amazon Chime SDK materializes from a silent fulfillment" (verified 2026-08-06; the router's
  * `@all` guard returns exactly such an envelope on the Lex entry in a 1:1). A test that reports the
  * first when the truth is the second sends the next session hunting a duplicate that does not exist.
  */

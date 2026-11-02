@@ -16,14 +16,15 @@
  * Reads go through the AWS CLI with the run's AWS_PROFILE, exactly like `helpers/test-credentials.ts`
  * and `helpers/drift-backend.ts`.
  */
-import { execSync } from 'child_process';
 import { mkdtempSync, writeFileSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
 import { randomUUID } from 'crypto';
+import { personIdOf } from './person';
+import { aws } from './aws';
+import { noteProgress, trackConversation } from './watchdog/current';
 
-const AWS_PROFILE = process.env.AWS_PROFILE || 'default';
-const REGION = process.env.AWS_REGION || 'us-east-1';
+export { aws };
 
 // ---------------------------------------------------------------------------
 // The machines under test (mirrors of the platform defaults)
@@ -32,6 +33,9 @@ const REGION = process.env.AWS_REGION || 'us-east-1';
 export interface MachineStateDef {
   transitions: string[];
   terminal?: 'success' | 'failure' | 'handoff';
+  /** A terminal state's declared reopen targets: where a finished task returns when its requester asks
+   *  for changes. */
+  reopens?: string[];
   /** Who the step awaits, as a reference. `awaitsUser?: boolean` is the deprecated spelling the
    *  backend still accepts and normalizes to the same thing. */
   awaits?: { party: 'requester' };
@@ -55,7 +59,8 @@ export const REPORT_GENERATION: Machine = {
     drafting_outline: { transitions: ['generating'], awaits: { party: 'requester' } },
     generating: { transitions: ['completed', 'revising'], delivers: true },
     revising: { transitions: ['completed', 'generating'], delivers: true },
-    completed: { transitions: [], terminal: 'success' },
+    // Terminal, and revisable: a change asked for after delivery reopens it into `revising`.
+    completed: { transitions: [], terminal: 'success', reopens: ['revising'] },
   },
 };
 
@@ -73,30 +78,22 @@ export function isDeclaredState(machine: Machine, state: unknown): boolean {
   return typeof state === 'string' && Boolean(machine.states[state]);
 }
 
+/** A declared reopen: `from` is a terminal state listing `to` in `reopens`. */
+export function isReopenEdge(machine: Machine, from: unknown, to: unknown): boolean {
+  if (typeof from !== 'string' || typeof to !== 'string') return false;
+  const def = machine.states[from];
+  return Boolean(def && def.transitions.length === 0 && def.reopens?.includes(to));
+}
+
+/** An ordinary declared transition, or a declared reopen out of a terminal state. */
 export function isAuthorizedEdge(machine: Machine, from: unknown, to: unknown): boolean {
   if (typeof from !== 'string' || typeof to !== 'string') return false;
-  return Boolean(machine.states[from]?.transitions.includes(to));
+  return Boolean(machine.states[from]?.transitions.includes(to)) || isReopenEdge(machine, from, to);
 }
 
 // ---------------------------------------------------------------------------
 // AWS CLI plumbing
 // ---------------------------------------------------------------------------
-
-/** Run the AWS CLI (JSON out) with the run's AWS_PROFILE. Returns null for an empty response. */
-export function aws(args: string): any {
-  const out = execSync(`aws ${args} --region ${REGION} --output json`, {
-    encoding: 'utf8',
-    timeout: 30_000,
-    // PYTHONIOENCODING IS NOT OPTIONAL ON WINDOWS. The AWS CLI is Python, and its default console
-    // codec is the system ANSI page - so a row containing any non-ASCII character kills the command
-    // rather than the read: a task whose transition reason said "generating -> revising" with a real
-    // arrow failed with `'charmap' codec can't encode character '→'`, which reads as a broken
-    // helper rather than as an encoding default. The task rows this reads are model-authored text, so
-    // non-ASCII in them is ordinary, not exceptional.
-    env: { ...process.env, AWS_PROFILE, MSYS_NO_PATHCONV: '1', PYTHONIOENCODING: 'utf-8' },
-  }).trim();
-  return out ? JSON.parse(out) : null;
-}
 
 // AWS CLI JSON arguments (--item, --key, --expression-attribute-values) must NOT be inlined as a
 // single-quoted string: on Windows execSync runs via cmd.exe, where '...' is not a string delimiter,
@@ -126,17 +123,39 @@ export function unmarshalItem(item: Record<string, any>): Record<string, any> {
   return Object.fromEntries(Object.entries(item).map(([k, v]) => [k, unmarshal(v)]));
 }
 
-/** Cognito `sub` from an id token, which is also the chat AppInstanceUser id (AE convention). */
-export function jwtSub(idToken: string): string {
-  return JSON.parse(Buffer.from(idToken.split('.')[1], 'base64').toString('utf8')).sub;
-}
-
-/** The AppInstanceUser ARN for a person in the app instance that owns `channelArn`. */
-export function userArnForChannel(channelArn: string, sub: string): string {
-  return `${channelArn.replace(/\/channel\/.*$/, '')}/user/${sub}`;
-}
-
 /** Resolve a shared table name from an explicit env override, else the shared SSM parameter. */
+/**
+ * The report a classification offers its own audience, read from the deployed welcome orientation
+ * (`/<instance>/assistant/<classification>/welcome-orientation`, the suggestions a person sees on a new
+ * conversation): the example that opens with "Compile", which the intent pack classifies as
+ * report_generation.
+ *
+ * A report task is scoped to the classification it runs in. A premium report draws on context a basic
+ * one cannot reach and is written for a different reader, so each classification asks for its own rather than all
+ * of them sharing one prompt. The shared one these specs used ("monorepo vs multi-repo") was declined as
+ * out of scope by the basic and premium personas, so no task opened and nothing past the opening turn
+ * was tested on those classifications.
+ *
+ * Throws rather than falling back: a deployment without the orientation has not said what its classification
+ * offers, and a guessed prompt would test a request nobody there makes.
+ *
+ * No basic: basic cannot hand over a document (`richProcessor: false`), so it offers no report and
+ * its intent pack carries no `report_generation`. Its "Compile ..." suggestion is an inline overview.
+ */
+export function reportPromptForClassification(classification: 'standard' | 'premium'): string {
+  const instance = process.env.E2E_INSTANCE_NAME || process.env.INSTANCE_NAME;
+  if (!instance) throw new Error('E2E_INSTANCE_NAME must be set to read the classification welcome orientation');
+  const name = `/${instance}/assistant/${classification}/welcome-orientation`;
+  const raw = aws(`ssm get-parameter --name "${name}"`)?.Parameter?.Value;
+  if (!raw) throw new Error(`${name} is missing: it is where the ${classification} classification states what it offers`);
+  const examples: unknown[] = JSON.parse(raw).examples ?? [];
+  const prompt = examples.find((e): e is string => typeof e === 'string' && /^compile\b/i.test(e));
+  if (!prompt) {
+    throw new Error(`${name} offers no "Compile ..." example, so the ${classification} classification names no report: ${JSON.stringify(examples)}`);
+  }
+  return prompt;
+}
+
 export function resolveTaskTable(kind: 'agent-tasks' | 'user-tasks'): string | null {
   const envKey = kind === 'agent-tasks' ? 'AGENT_TASKS_TABLE' : 'USER_TASKS_TABLE';
   if (process.env[envKey]) return process.env[envKey]!;
@@ -182,6 +201,8 @@ export interface HistoryEntry {
   ownerFrom?: string;
   ownerTo?: string;
   terminal?: string;
+  /** Set on a declared reopen edge out of a terminal state. */
+  reopen?: boolean;
 }
 
 /** The source-of-truth row (`agent-tasks`, keyed by taskId + channelArn), or undefined. */
@@ -193,12 +214,29 @@ export function readTask(agentTable: string, taskId: string, channelArn: string)
   return got?.Item ? unmarshalItem(got.Item) : undefined;
 }
 
+/**
+ * Every task row in one conversation, open or not, from the source-of-truth table's channel index
+ * (`channelArn-updatedAt-index`, the index `task-tracking.ts` lists a conversation's tasks by).
+ *
+ * The authority for "which task is this assistant running here": a row names its `assistantId`. A
+ * message's Metadata is not, because `activeTask` is shed first under the Chime Metadata cap when the
+ * reply also carries an attachment.
+ */
+export function channelTasks(agentTable: string, channelArn: string): TaskRow[] {
+  const q = aws(
+    `dynamodb query --table-name "${agentTable}" --index-name channelArn-updatedAt-index `
+      + '--key-condition-expression "channelArn = :c" '
+      + `--expression-attribute-values ${jsonArg({ ':c': { S: channelArn } })}`,
+  );
+  return ((q?.Items ?? []) as Array<Record<string, any>>).map(unmarshalItem);
+}
+
 /** The mirror rows in this person's partition, newest first. */
-export function readUserTasks(userTable: string, sub: string): TaskRow[] {
+export function readUserTasks(userTable: string, personId: string): TaskRow[] {
   const q = aws(
     `dynamodb query --table-name "${userTable}" ` +
-      '--key-condition-expression "userSub = :u" ' +
-      `--expression-attribute-values ${jsonArg({ ':u': { S: sub } })}`,
+      '--key-condition-expression "principalId = :u" ' +
+      `--expression-attribute-values ${jsonArg({ ':u': { S: personId } })}`,
   );
   return ((q?.Items ?? []) as Array<Record<string, any>>)
     .map(unmarshalItem)
@@ -208,10 +246,10 @@ export function readUserTasks(userTable: string, sub: string): TaskRow[] {
 /** Mirror rows of one type opened in one conversation during this run, newest first. */
 export function runTasksFor(
   userTable: string,
-  sub: string,
+  personId: string,
   opts: { taskType: string; channelArn?: string; since: number },
 ): TaskRow[] {
-  return readUserTasks(userTable, sub)
+  return readUserTasks(userTable, personId)
     .filter((r) => r.taskType === opts.taskType)
     .filter((r) => (opts.channelArn ? r.channelArn === opts.channelArn : true))
     .filter((r) => new Date(r.createdAt || 0).getTime() >= opts.since);
@@ -253,12 +291,29 @@ export function terminalEntries(task: TaskRow | undefined): HistoryEntry[] {
 // Polling
 // ---------------------------------------------------------------------------
 
+/** A comparable form of a read's answer, to tell a changed answer from a repeated one. */
+function fingerprint(v: unknown): string {
+  try {
+    return JSON.stringify(v) ?? String(v);
+  } catch {
+    return String(v);
+  }
+}
+
+/** Name every conversation a read mentions, so the backend lines about it count as the test's progress. */
+function trackChannelsIn(text: string): void {
+  for (const arn of new Set(text.match(/arn:aws:chime:[^"\\\s]+?\/channel\/[0-9a-f-]+/g) ?? [])) trackConversation(arn);
+}
+
 /**
  * Poll `read` until `done` accepts its value, then return that value; return the LAST value read on
  * timeout so the caller can assert on it and report what it actually saw.
  *
  * A single sample is the defect class this suite has been bitten by: a guard that reads once, while
  * the turn is still an interim placeholder, passes without exercising its intent.
+ *
+ * FOR STATE WITH NO EVENT THE RUNNER CAN SUBSCRIBE TO: a task row, a schedule, an archive projection. A wait on a
+ * room's messages has one, and takes `roomMessagesUntil` (`event-run-messages.ts`) instead.
  */
 export async function pollFor<T>(
   read: () => T | Promise<T>,
@@ -269,11 +324,21 @@ export async function pollFor<T>(
   const intervalMs = opts.intervalMs ?? 5_000;
   const deadline = Date.now() + timeoutMs;
   let last = await read();
+  let seen = fingerprint(last);
+  trackChannelsIn(seen);
   for (;;) {
     if (done(last)) return last;
     if (Date.now() > deadline) return last;
     await new Promise((r) => setTimeout(r, intervalMs));
     last = await read();
+    // A read whose answer CHANGED is progress, and tells the stall detector so; one that keeps answering the
+    // same is a wait, which the detector is right to end once its window passes with nothing else heard.
+    const now = fingerprint(last);
+    if (now !== seen) {
+      noteProgress('harness', `pollFor read changed: ${now.slice(0, 100)}`);
+      trackChannelsIn(now);
+    }
+    seen = now;
   }
 }
 
@@ -284,8 +349,8 @@ export async function pollFor<T>(
 /**
  * Stamp a plan (title + work items) into the SERVER-ONLY Channel Context store.
  *
- * `domainContext` is written there by `federated-create-conversation`, which is gated on a
- * `federatedUserPoolId` this deployment does not set (the same gap `bilingual-conversations.spec.ts`
+ * `domainContext` is written there by the context create, which a one-conversation issuer's people
+ * reach and this deployment's trusted-issuer registry does not declare (the same gap `bilingual-conversations.spec.ts`
  * works around for `userLanguage`). Everything downstream of the store is untouched production code:
  * `assembleHostGrounding` reads it, the router forwards it, and the processor registers the
  * work-item tools on the strength of it (`enableEditTools`).
@@ -334,7 +399,7 @@ export function clearPlanContext(table: string, channelArn: string): void {
 export interface SeededTask {
   taskId: string;
   channelArn: string;
-  sub: string;
+  personId: string;
 }
 
 /**
@@ -355,14 +420,16 @@ export function seedPlaceItemTask(args: {
   agentTable: string;
   userTable: string;
   channelArn: string;
-  sub: string;
+  /** The requester's AppInstanceUser, from `helpers/person.ts`. */
+  personArn: string;
   contextId: string;
   requestExcerpt: string;
 }): SeededTask {
   const taskId = randomUUID();
   const now = new Date().toISOString();
   const ttl = Math.floor(Date.now() / 1000) + 6 * 60 * 60;
-  const userArn = userArnForChannel(args.channelArn, args.sub);
+  const userArn = args.personArn;
+  const personId = personIdOf(userArn);
 
   aws(
     `dynamodb put-item --table-name "${args.agentTable}" --item ${jsonArg({
@@ -379,14 +446,15 @@ export function seedPlaceItemTask(args: {
       createdAt: { S: now },
       updatedAt: { S: now },
       ttl: { N: String(ttl) },
-      ownerId: { S: args.sub },
+      ownerId: { S: personId },
       ownerType: { S: 'user' },
+      ownerPersonId: { S: personId },
     })}`,
   );
 
   aws(
     `dynamodb put-item --table-name "${args.userTable}" --item ${jsonArg({
-      userSub: { S: args.sub },
+      principalId: { S: personId },
       ownerType: { S: 'user' },
       taskId: { S: taskId },
       taskType: { S: 'place_item' },
@@ -401,7 +469,7 @@ export function seedPlaceItemTask(args: {
     })}`,
   );
 
-  return { taskId, channelArn: args.channelArn, sub: args.sub };
+  return { taskId, channelArn: args.channelArn, personId };
 }
 
 /** Remove a seeded task and its mirror row, so a later run's queue reads clean. */
@@ -421,7 +489,7 @@ export function deleteSeededTask(
   try {
     aws(
       `dynamodb delete-item --table-name "${userTable}" ` +
-        `--key ${jsonArg({ userSub: { S: seeded.sub }, taskId: { S: seeded.taskId } })}`,
+        `--key ${jsonArg({ principalId: { S: seeded.personId }, taskId: { S: seeded.taskId } })}`,
     );
   } catch {
     /* best effort */

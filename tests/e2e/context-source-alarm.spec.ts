@@ -20,10 +20,11 @@
  * notification conversation and to the admin roster by email. It has no admin-console surface, so a
  * UI assertion would be theatre. The console-error coverage for the admin app lives in its own specs.
  */
-import { test, expect } from '@playwright/test';
+import { test, expect, expectAlarm } from './helpers/fixtures';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 import { guardBackendErrors } from './helpers/turn-guards';
+import { stackName, physicalIdsIn } from './helpers/stack-prefix';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardBackendErrors('context-source-alarm');
@@ -53,7 +54,7 @@ test.describe.serial('context source alarm delivers to a human', () => {
     test.setTimeout(120_000);
 
     const raw = await aws(
-      `cloudwatch describe-alarms --alarm-name-prefix agent-echelon-${CLASSIFICATION}-context-source `
+      `cloudwatch describe-alarms --alarm-name-prefix ${stackName(`Assistants-${CLASSIFICATION}`)}-context-source `
       + '--query "MetricAlarms[0].[AlarmName,StateValue,Threshold,length(AlarmActions),length(OKActions)]" --output text',
     );
     const [name, state, threshold, alarmActions, okActions] = raw.split(/\s+/);
@@ -87,21 +88,20 @@ test.describe.serial('context source alarm delivers to a human', () => {
     ).toBeGreaterThan(0);
   });
 
-  test('the notifier really posts to the admin conversation', async () => {
+  test('the notifier raises the alert, and the admin backend posts it to the admin conversation', async () => {
     test.setTimeout(180_000);
+    // The synthetic payload's own description, so a REAL context source alarm later in the run still fails it.
+    expectAlarm('E2E synthetic alarm.');
 
-    const fnName = await aws(
-      `cloudformation describe-stack-resources --stack-name AgentEchelonClassification-Standard `
-      + '--query "StackResources[?starts_with(LogicalResourceId,\'ContextSourceAlarmFunction\')]'
-      + '|[?ResourceType==\'AWS::Lambda::Function\'].PhysicalResourceId" --output text',
-    );
+    const [fnName] = physicalIdsIn([stackName('Assistants-standard')],
+      { type: 'AWS::Lambda::Function', logicalId: /^ContextSourceAlarmFunction/ });
     expect(fnName, 'the alarm notifier Lambda is not deployed').toBeTruthy();
 
     // A REAL CloudWatch alarm SNS payload, including an unbounded NewStateReason. If the notifier
     // does not cap the message, Chime rejects it and the alert is silently lost - so the oversized
     // reason is the point of this fixture, not incidental.
     const alarmMessage = JSON.stringify({
-      AlarmName: `agent-echelon-${CLASSIFICATION}-context-source-failure-rate`,
+      AlarmName: `${stackName(`Assistants-${CLASSIFICATION}`)}-context-source-failure-rate`,
       AlarmDescription: `E2E synthetic alarm. ${'Context source failure detail. '.repeat(80)}`,
       NewStateValue: 'ALARM',
       NewStateReason: `Threshold Crossed: 1 datapoint [42.0] was greater than the threshold (10.0). ${'padding '.repeat(200)}`,
@@ -129,7 +129,8 @@ test.describe.serial('context source alarm delivers to a human', () => {
     expect(fnError, 'the notifier threw').toMatch(/^(None)?$/);
 
     // StatusCode 200 only means the handler returned. It swallows delivery failures by design, so
-    // the log is the only place that distinguishes "posted" from "gave up".
+    // the log is the only place that distinguishes "raised" from "gave up". The notifier raises an
+    // ae.alert; the AdminServices stack's alert poster is what posts it, and logs its own receipt.
     const logGroup = `/aws/lambda/${fnName}`;
     let delivered = '';
     let failures = '';
@@ -137,7 +138,7 @@ test.describe.serial('context source alarm delivers to a human', () => {
       await new Promise((r) => setTimeout(r, 5_000));
       delivered = await aws(
         `logs filter-log-events --log-group-name ${logGroup} --start-time ${invokedAt} `
-        + '--filter-pattern "delivered" --query "events[].message" --output text',
+        + '--filter-pattern "raised" --query "events[].message" --output text',
       );
       failures = await aws(
         `logs filter-log-events --log-group-name ${logGroup} --start-time ${invokedAt} `
@@ -153,8 +154,22 @@ test.describe.serial('context source alarm delivers to a human', () => {
     ).toBe('');
     expect(
       delivered,
-      'no delivery confirmation. The alarm fired and nobody was told, which is the failure this '
-      + 'whole path exists to prevent.',
-    ).toContain('delivered');
+      'the notifier did not raise the alert. The alarm fired and nobody was told, which is the failure '
+      + 'this whole path exists to prevent.',
+    ).toContain('raised');
+
+    // AND THE ADMIN BACKEND POSTED IT: the one rule on the default bus delivers it to the poster.
+    const [posterName] = physicalIdsIn([stackName('AdminServices')],
+      { type: 'AWS::Lambda::Function', logicalId: /^AdminAlertPosterFunction/ });
+    expect(posterName, 'the AdminServices alert poster is not deployed').toBeTruthy();
+    let posted = '';
+    for (let attempt = 0; attempt < 12 && !posted; attempt++) {
+      await new Promise((r) => setTimeout(r, 5_000));
+      posted = await aws(
+        `logs filter-log-events --log-group-name /aws/lambda/${posterName} --start-time ${invokedAt} `
+        + '--filter-pattern "\\"posted cloudwatch_alarm\\"" --query "events[].message" --output text',
+      );
+    }
+    expect(posted, 'the ae.alert reached no admin conversation: the poster logged no post').toContain('posted cloudwatch_alarm');
   });
 });

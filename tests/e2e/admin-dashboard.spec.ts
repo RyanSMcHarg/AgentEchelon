@@ -1,29 +1,27 @@
 /**
  * Admin Console E2E Tests
  *
- * Tests all 13 admin console tabs (9 base + 4 Aurora-mode).
- * Requires a premium user to access the admin console.
+ * The console is SEVEN top-level sections, each opening on its first sub-tab. `SECTIONS` in
+ * `frontend/packages/admin/src/components/admin/AdminDashboard.tsx` is the source of truth; this
+ * list is a reader's summary of it and will go stale if the two are not changed together.
  *
- * Base tabs (always available):
- * - Overview: conversation volumes, intent distribution
- * - Models: model usage metrics
- * - Model Strategy: provider posture, routing guidance, fallback models
- * - Experiments: A/B model testing management and results
- * - Conversations: live browser, moderation, admin join controls
- * - Evaluations: evaluation scores
- * - Latency: response timing breakdown
- * - Users: user activity
- * - Manage Users: approval and tier operations
+ * - Operations  (overview, alerts, queue, client) - what is happening now, from CloudWatch
+ * - Performance (effectiveness, latency, evaluations, flagged, ground_truth) - how fast and how
+ *   good, over a chosen window, sharing one filter set
+ * - Oversight   (conversations, security) - the moderator view plus the membership audit
+ * - Models      (models, strategy)
+ * - Assistants  (profiles)
+ * - Experiments (experiments, battles)
+ * - Users       (users, user_management)
  *
- * Aurora-mode tabs (only when analyticsMode=aurora):
- * - Flows: multi-turn intent flow evaluation
- * - Flagged: flagged response review queue
- * - Ground Truth: human evaluation calibration
- * - Tasks: task completion tracking
- * - Conversations: drift detection analytics alongside the live browser
+ * Sub-tab ids did not change in the restructure, only their grouping, so every `?admin=<tab>`
+ * deep-link written against the old shape still resolves.
+ *
+ * Requires an admin user: the console renders only for a member of the `admins` group, and the
+ * analytics API is independently gated on the same group.
  */
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from './helpers/fixtures';
 import { signIn } from './helpers/agent-helpers';
 import { getTestCredentials } from './helpers/test-credentials';
 import { assertNoErrorBanners } from './helpers/banner-check';
@@ -67,38 +65,49 @@ test.describe('Admin Dashboard - Base Tabs', () => {
   });
 
   test('should open admin dashboard and show base sections', async ({ page }) => {
-    // Two-level nav: the section rail holds the 6 top-level sections; the
-    // former per-tab buttons (Models/Strategy/Evaluations/Latency/Manage Users)
-    // are now sub-tabs within a section.
+    // Two-level nav: the rail holds the SEVEN top-level sections, and what used to be a section is
+    // in several cases now a sub-tab inside one. Overview, Conversations, Effectiveness and
+    // Security were all rail buttons here and are not any more - they are the first tabs of
+    // Operations, Oversight, Performance and Oversight respectively.
     const rail = page.locator('.admin-section-rail');
-    await expect(rail.locator('button:has-text("Overview")')).toBeVisible();
-    await expect(rail.locator('button:has-text("Conversations")')).toBeVisible();
-    await expect(rail.locator('button:has-text("Effectiveness")')).toBeVisible();
+    await expect(rail.locator('button:has-text("Operations")')).toBeVisible();
+    await expect(rail.locator('button:has-text("Performance")')).toBeVisible();
+    await expect(rail.locator('button:has-text("Oversight")')).toBeVisible();
     await expect(rail.locator('button:has-text("Models")')).toBeVisible();
+    await expect(rail.locator('button:has-text("Assistants")')).toBeVisible();
     await expect(rail.locator('button:has-text("Experiments")')).toBeVisible();
     await expect(rail.locator('button:has-text("Users")').first()).toBeVisible();
-    await expect(rail.locator('button:has-text("Security")')).toBeVisible();
   });
 
-  test('Security section (Membership Audit) renders', async ({ page }) => {
-    // Admin app: the dashboard is at root after sign-in (no Admin button).
-
+  test('Operations leads the rail and opens first', async ({ page }) => {
+    // An operator arrives asking "is anything wrong right now". The section that answers that is
+    // the one the console opens on, and it is the leftmost, so the ordering and the default agree.
     const rail = page.locator('.admin-section-rail');
-    await rail.locator('button:has-text("Security")').click();
-    await expect(page.locator('.admin-section-btn.active:has-text("Security")')).toBeVisible();
+    await expect(rail.locator('.admin-section-btn').first()).toHaveText(/Operations/);
+    await expect(page.locator('.admin-section-btn.active:has-text("Operations")')).toBeVisible();
+  });
+
+  test('Membership Audit renders, under Oversight', async ({ page }) => {
+    // It used to be a top-level section called "Security" whose only child was labeled something
+    // else. It is now a sub-tab of Oversight, reached in two clicks rather than one.
+    const rail = page.locator('.admin-section-rail');
+    await rail.locator('button:has-text("Oversight")').click();
+    await expect(page.locator('.admin-section-btn.active:has-text("Oversight")')).toBeVisible();
+    // Labeled "Membership Audit", not "Security" - the section was renamed, the tab was not.
+    await page.locator('.admin-subtab-btn:has-text("Membership Audit")').click();
     // The Membership Audit surface loads: either the findings table + the
     // report-only/auto-revoke enforce control (audit enabled), or an honest
     // "not enabled on this deployment" notice. Both are acceptable; a broken
     // API-unavailable banner is not.
     await page.waitForTimeout(2000);
-    await assertNoErrorBanners(page, 'admin section "Security"');
+    await assertNoErrorBanners(page, 'Oversight > Security');
   });
 
-  test('should display Overview tab with date range selector', async ({ page }) => {
+  test('should display Operations dashboard with date range selector', async ({ page }) => {
     // Admin app: the dashboard is at root after sign-in (no Admin button).
 
-    // Overview section is active by default
-    await expect(page.locator('.admin-section-btn.active:has-text("Overview")')).toBeVisible();
+    // Operations is the section the console opens on.
+    await expect(page.locator('.admin-section-btn.active:has-text("Operations")')).toBeVisible();
 
     // Date range selector should be present
     await expect(page.locator('button:has-text("Last 7 days")')).toBeVisible();
@@ -107,11 +116,11 @@ test.describe('Admin Dashboard - Base Tabs', () => {
   });
 
   test('no error banners on any section (banners are picked up)', async ({ page }) => {
-    // Overview is the default-active tab; its analytics POSTs fire on dashboard
+    // Operations is the default-active section; its analytics POSTs fire on dashboard
     // mount. Arm its response waiters BEFORE opening the console so the first
     // section's settle isn't missed (clicking an already-active section does
     // not re-fire the queries).
-    const overviewWaiters = armSettle(page, SECTION_QUERIES.Overview);
+    const firstWaiters = armSettle(page, SECTION_QUERIES.Operations);
 
     // Admin app: the dashboard is at root after sign-in (no Admin button).
 
@@ -119,7 +128,10 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     // Every top-level section must render without a broken-view banner
     // ("Analytics API unavailable", .admin-error). "Not implemented in this
     // mode" / "no data" notices are surfaced (logged) but allowed.
-    for (const section of ['Overview', 'Conversations', 'Effectiveness', 'Models', 'Experiments', 'Users']) {
+    // Every one of the seven, in rail order. This list used to name four surfaces that are now
+    // sub-tabs, so the loop failed on the click rather than on a banner - a navigation change broke
+    // the test that was supposed to notice a broken view.
+    for (const section of ['Operations', 'Performance', 'Oversight', 'Models', 'Assistants', 'Experiments', 'Users']) {
       // Arm response waiters BEFORE the click that triggers the load, so we
       // deterministically wait for the section's analytics queries to SETTLE
       // instead of racing a fixed 2.5s timeout (one real query runs ~3.4s
@@ -128,7 +140,7 @@ test.describe('Admin Dashboard - Base Tabs', () => {
       // cache on switch (the analytics POST does not always re-fire), so a hard
       // 25s wait per section would sum past the test timeout. 10s still lets a real
       // query (~3.4s) settle; the banner check below is what actually validates.
-      const waiters = section === 'Overview' ? overviewWaiters : armSettle(page, SECTION_QUERIES[section], 10000);
+      const waiters = section === 'Operations' ? firstWaiters : armSettle(page, SECTION_QUERIES[section], 10000);
       await rail.locator(`button:has-text("${section}")`).first().click();
       await expect(page.locator(`.admin-section-btn.active:has-text("${section}")`)).toBeVisible();
       // Wait for every expected analytics response, then let React flush the
@@ -157,20 +169,23 @@ test.describe('Admin Dashboard - Base Tabs', () => {
     await expect(page.locator('h3:has-text("A/B Experiments")')).toBeVisible();
     await expect(page.locator('button:has-text("New Experiment")')).toBeVisible();
 
-    // Conversations section
-    await rail.locator('button:has-text("Conversations")').click();
-    await expect(page.locator('.admin-section-btn.active:has-text("Conversations")')).toBeVisible();
+    // Conversations, which is the first TAB of Oversight rather than a section of its own.
+    await rail.locator('button:has-text("Oversight")').click();
+    await expect(page.locator('.admin-section-btn.active:has-text("Oversight")')).toBeVisible();
     await expect(page.locator('h3:has-text("Conversations")')).toBeVisible();
     await expect(page.locator('.admin-filter-btn:has-text("Browser")')).toBeVisible();
     await expect(page.locator('.admin-filter-btn:has-text("Drift Detection")')).toBeVisible();
 
-    // Effectiveness section → Evaluations is the (only, in Athena) sub-view
-    await rail.locator('button:has-text("Effectiveness")').click();
-    await expect(page.locator('.admin-section-btn.active:has-text("Effectiveness")')).toBeVisible();
+    // Performance opens on its Overview: the cards and the message flow.
+    await rail.locator('button:has-text("Performance")').click();
+    await expect(page.locator('.admin-section-btn.active:has-text("Performance")')).toBeVisible();
+    await expect(page.locator('.admin-subtab-btn.active:has-text("Overview")')).toBeVisible();
+    await expect(page.getByText('Message flow')).toBeVisible();
 
-    // Overview section → Latency sub-tab
-    await rail.locator('button:has-text("Overview")').click();
-    await page.locator('.admin-subtab-btn:has-text("Latency")').click();
+    // Latency is a drill of that view, opened from it, not a tab of its own.
+    await expect(page.locator('.admin-subtab-btn:has-text("Latency")')).toHaveCount(0);
+    await page.getByRole('button', { name: 'Full flow and latency' }).click();
+    await expect(page.locator('h3:has-text("Response Latency")')).toBeVisible({ timeout: 15000 });
 
     // Users section → Manage Users sub-tab
     await rail.locator('button:has-text("Users")').first().click();
@@ -241,11 +256,15 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
   // views as sub-tabs under the "Effectiveness" section.
   async function openAdmin(page: import('@playwright/test').Page) {
     // Admin app renders the dashboard at root; just confirm Aurora is live.
-    await expect(page.locator('.status-badge--live')).toBeVisible({ timeout: 20000 });
+    await expect(page.locator('.admin-header-mode:has-text("Aurora")')).toBeVisible({ timeout: 20000 });
   }
   async function openEffectiveness(page: import('@playwright/test').Page) {
-    await page.locator('.admin-section-btn:has-text("Effectiveness")').click();
+    // The Performance overview is the first tab of Performance; its Effectiveness drill (every intent
+    // and evaluation reading) opens from a quality card.
+    await page.locator('.admin-section-btn:has-text("Performance")').click();
     await expect(page.locator('.admin-subtabs')).toBeVisible();
+    await expect(page.locator('.admin-subtab-btn.active:has-text("Overview")')).toBeVisible();
+    await page.getByRole('button', { name: /^Relevance .*open the detail/ }).click();
   }
 
   test('the Effectiveness section folds Tasks/Flows/Steps into the drill (merged sub-tabs)', async ({ page }) => {
@@ -268,11 +287,14 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
     test.setTimeout(120000);
     await openAdmin(page);
     await openEffectiveness(page);
-    await page.locator('#admin-tab-effectiveness').click();
     // Wait for the async analytics query to settle (the intent table or its empty state) before probing —
     // counting too early reads 0 and skips a populated window. Skip ONLY on a genuinely empty window.
     await page.locator('.data-table-row--clickable, .data-table-empty').first().waitFor({ timeout: 20000 });
-    if (await page.locator('.data-table-empty').first().isVisible().catch(() => false)) {
+    // Empty means no intent ROW, not "an empty state somewhere": the page carries other tables whose
+    // empty state renders before the intent table has loaded, so wait on the rows themselves.
+    const hasRows = await page.locator('.data-table-row--clickable').first()
+      .waitFor({ timeout: 20000 }).then(() => true, () => false);
+    if (!hasRows) {
       test.skip(true, 'no effectiveness data in window'); return;
     }
 
@@ -341,7 +363,7 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
     page.on('response', (r) => {
       if (/conversation/i.test(r.url())) console.log('[net] RESPONSE', r.status(), r.request().method(), r.url());
     });
-    const convTab = page.locator('.admin-section-rail button:has-text("Conversations")');
+    const convTab = page.locator('.admin-section-rail button:has-text("Oversight")');
     await convTab.click();
     await expect(page.locator('h3:has-text("Conversations")')).toBeVisible();
 
@@ -354,7 +376,8 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
     await expect(page.locator('.admin-tab-loading')).toHaveCount(0, { timeout: 25000 });
 
     // If the list failed to load, surface the actual error (the reason, e.g. "Failed to fetch") before
-    // asserting — a shell-only check would have missed this entirely (tracker C3).
+    // asserting — a shell-only check would have missed this entirely: a test that only asserts the
+    // shell renders passes while the list it exists to show fails to load.
     const failed = page.getByText(/Couldn't load conversations/i);
     if (await failed.count()) {
       console.log('[conversations] LOAD FAILED:', (await failed.first().innerText()).replace(/\s+/g, ' ').trim());
@@ -370,7 +393,7 @@ test.describe('Admin Dashboard - Aurora Tabs', () => {
 
     // C1: opening a conversation must LOAD its detail (messages endpoint = exchange-vended creds, a
     // distinct path from the list). Assert the detail panel renders and there is no "failed to fetch".
-    await rows.first().locator('.admin-inline-btn:has-text("View")').click();
+    await rows.first().getByRole('button', { name: 'View' }).click();
     await expect(page.locator('.admin-conversation-panel')).toBeVisible({ timeout: 20000 });
     await expect(page.getByText(/failed to fetch/i)).toHaveCount(0);
     // Messages either render or show the honest empty — not an error state.

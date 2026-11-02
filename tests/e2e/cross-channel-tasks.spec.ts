@@ -6,7 +6,7 @@
  * none of them can see this — a single-channel run passes identically whether the resume lookup is
  * channel-scoped or not. Only a two-channel drive falsifies it.
  *
- * The mechanism under test is `getActiveTask(userSub, type, { channelArn })` in
+ * The mechanism under test is `getActiveTask(personId, type, { channelArn })` in
  * `router-agent-handler.ts` — the resume candidate is filtered by the CURRENT channel. Out-of-channel
  * work reaches the model only as the terse prompt hint built by `buildCrossChannelTasksHint`
  * (assistant-async-processor.ts), never as an auto-resume.
@@ -26,25 +26,21 @@
  *   E2E_BASE_URL=<cf> TASKS_E2E=1 E2E_INSTANCE_NAME=<instance> AWS_PROFILE=<p> \
  *     npx playwright test e2e/cross-channel-tasks.spec.ts --config=playwright.config.ts
  */
-import { test, expect } from '@playwright/test';
-import { execSync } from 'child_process';
+import { test, expect } from './helpers/fixtures';
 import { writeFileSync, mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
+import { signIn, createConversation, sendAndWaitForResponse, idTokenOf } from './helpers/agent-helpers';
 import { getStandardUser, missingUserReason } from './helpers/test-credentials';
+import { personIdFromIdToken } from './helpers/person';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { reportPromptForClassification } from './helpers/task-backend';
+import { aws } from './helpers/aws';
 
 guardConsoleErrors();
 
 const RUN = process.env.TASKS_E2E === '1';
 const suite = RUN ? test.describe : test.describe.skip;
-const AWS_PROFILE = process.env.AWS_PROFILE || 'default';
-const REGION = 'us-east-1';
-
-/** Classified report_generation → delivery TASK_MULTI_STEP → createTask (mirrors tasks.spec.ts). */
-const REPORT_PROMPT =
-  'Please compile a short report analyzing the pros and cons of a monorepo versus multi-repo for a 5-team org.';
 
 /**
  * A bare ANSWER: no subject of its own, no verb asking for anything new. If the resume lookup were
@@ -53,15 +49,6 @@ const REPORT_PROMPT =
  * focus on?".
  */
 const CONTINUATION_PROMPT = 'Engineering leadership, and focus on CI cost.';
-
-function aws(args: string): any {
-  const out = execSync(`aws ${args} --region ${REGION} --output json`, {
-    encoding: 'utf8',
-    timeout: 20000,
-    env: { ...process.env, AWS_PROFILE },
-  }).trim();
-  return out ? JSON.parse(out) : null;
-}
 
 // See task-state-machine.spec.ts: JSON CLI args must go through file:// — cmd.exe strips the inner
 // quotes out of a single-quoted argument and the JSON arrives mangled.
@@ -97,10 +84,6 @@ function unmarshal(av: any): any {
 }
 function unmarshalItem(item: Record<string, any>): Record<string, any> {
   return Object.fromEntries(Object.entries(item).map(([k, v]) => [k, unmarshal(v)]));
-}
-
-function jwtSub(idToken: string): string {
-  return JSON.parse(Buffer.from(idToken.split('.')[1], 'base64').toString('utf8')).sub;
 }
 
 /** The fields a resume would necessarily move. Compared as one object so the diff names the field. */
@@ -155,20 +138,20 @@ suite('A task does not resume in another conversation (CROSS-CHANNEL-TASKS)', ()
 
     // --- Conversation A: open the multi-step task -------------------------------------------
     const arnA = await createAndCaptureArn(page, `Cross-channel A ${stamp}`, 'Standard');
-    const respA = await sendAndWaitForResponse(page, REPORT_PROMPT, 180_000);
+    const respA = await sendAndWaitForResponse(page, reportPromptForClassification('standard'), 180_000);
     expect(respA.text && respA.text.length, 'the report turn in A must return a response').toBeTruthy();
 
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     expect(idToken, 'idToken should be present after sign-in').toBeTruthy();
-    const sub = jwtSub(idToken!);
+    const personId = await personIdFromIdToken(idToken!);
 
     // Correlate THIS run's task in A. A task is created synchronously at send time; the short poll
     // covers write visibility only.
     let rowA: Record<string, any> | undefined;
     for (let i = 0; i < 20 && !rowA; i++) {
       const q = aws(
-        `dynamodb query --table-name "${userTable}" --key-condition-expression "userSub = :u" ` +
-          `--expression-attribute-values ${jsonArg({ ':u': { S: sub } })}`,
+        `dynamodb query --table-name "${userTable}" --key-condition-expression "principalId = :u" ` +
+          `--expression-attribute-values ${jsonArg({ ':u': { S: personId } })}`,
       );
       rowA = ((q?.Items ?? []) as Array<Record<string, any>>)
         .map(unmarshalItem)
@@ -178,7 +161,7 @@ suite('A task does not resume in another conversation (CROSS-CHANNEL-TASKS)', ()
         .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''))[0];
       if (!rowA) await page.waitForTimeout(3000);
     }
-    expect(rowA, `a report_generation task pinned to conversation A should exist (sub=${sub})`).toBeTruthy();
+    expect(rowA, `a report_generation task pinned to conversation A should exist (personId=${personId})`).toBeTruthy();
     const taskId: string = rowA!.taskId;
     console.log(`\n--- task ${taskId} pinned to ---\n${arnA}`);
 
@@ -202,7 +185,7 @@ suite('A task does not resume in another conversation (CROSS-CHANNEL-TASKS)', ()
     if (!['pending', 'in_progress'].includes(String(unmarshalItem(beforeItem).status))) {
       console.log(`--- reopening task (was ${unmarshalItem(beforeItem).status}) so a resume is possible ---`);
       for (const [table, key] of [
-        [userTable!, { userSub: { S: sub }, taskId: { S: taskId } }],
+        [userTable!, { principalId: { S: personId }, taskId: { S: taskId } }],
         [agentTable!, { taskId: { S: taskId }, channelArn: { S: arnA } }],
       ] as const) {
         aws(
@@ -248,7 +231,7 @@ suite('A task does not resume in another conversation (CROSS-CHANNEL-TASKS)', ()
     // Close the arranged task. Leaving a re-opened report task active for this shared test user
     // would let it leak into a later run's resume lookup in the conversation it belongs to.
     for (const [table, key] of [
-      [userTable!, { userSub: { S: sub }, taskId: { S: taskId } }],
+      [userTable!, { principalId: { S: personId }, taskId: { S: taskId } }],
       [agentTable!, { taskId: { S: taskId }, channelArn: { S: arnA } }],
     ] as const) {
       aws(

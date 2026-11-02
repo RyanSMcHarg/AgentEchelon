@@ -18,24 +18,14 @@
  * by SSM only" is what allows the independent deploy cadence, and a dangling parameter breaks it in
  * a way nothing else reports.
  */
-import { test, expect } from '@playwright/test';
-import { execSync } from 'child_process';
+import { test, expect } from './helpers/fixtures';
 import { hasTestCredentials } from './helpers/test-credentials';
 import { guardBackendErrors } from './helpers/turn-guards';
+import { AGENT_HANDLER, physicalIdsInClassificationStacks } from './helpers/stack-prefix';
+import { aws } from './helpers/aws';
 
 const E2E_RUNNABLE = hasTestCredentials();
-const REGION = process.env.AWS_REGION || 'us-east-1';
 const EXPECTED = ['basic', 'standard', 'premium'];
-
-function aws(args: string): any {
-  const out = execSync(`aws ${args} --region ${REGION} --output json`, {
-    encoding: 'utf8',
-    timeout: 60000,
-    maxBuffer: 20 * 1024 * 1024,
-    env: { ...process.env, MSYS_NO_PATHCONV: '1' },
-  }).trim();
-  return out ? JSON.parse(out) : null;
-}
 
 interface Handler {
   fn: string;
@@ -45,13 +35,11 @@ interface Handler {
   ssmRoot: string;
 }
 
-/** Discover the deployed per-classification handlers. Parsed as JSON, never shell-split: the
+/** Discover the deployed per-classification handlers, read from the classification stacks rather than
+ *  matched on their generated names (helpers/stack-prefix.ts). Parsed as JSON, never shell-split: the
  *  function names come back with trailing whitespace under Git Bash and silently fail validation. */
 function discoverHandlers(): Handler[] {
-  const names: string[] = aws(
-    `lambda list-functions --query "Functions[?contains(FunctionName,'AgentEchelonClassification') `
-    + `&& contains(FunctionName,'AgentHandler')].FunctionName"`,
-  ) || [];
+  const names: string[] = physicalIdsInClassificationStacks(AGENT_HANDLER);
 
   return names.map((raw) => {
     const fn = raw.trim();

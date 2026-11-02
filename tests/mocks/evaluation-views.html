@@ -1,0 +1,332 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Evaluation views - mock</title>
+
+<!--
+  MOCK, NOT A BUILD. Two unbuilt evaluation views (SPEC-EVALUATION FR19 and FR20), drawn with the
+  admin console's OWN stylesheets and class names so a reviewer is looking at this design system
+  rather than at a wireframe that will not survive contact with it.
+
+  The stylesheets below are the tracked SOURCE files, deliberately not the built
+  admin/dist/assets/index-<hash>.css: that filename carries a content hash and dist is gitignored,
+  so linking it would rot on the next build.
+
+  Rendered to PNG by ./render-mocks.mjs. Regenerate after touching this file.
+-->
+<link rel="stylesheet" href="../../frontend/packages/shared/src/styles/index.css">
+<link rel="stylesheet" href="../../frontend/packages/admin/src/components/admin/AdminDashboard.css">
+<link rel="stylesheet" href="../../frontend/packages/admin/src/components/admin/DataTable.css">
+
+<style>
+  /* MOCK-ONLY overrides. The real shell is a flex column that scrolls internally
+     (.admin-dashboard is overflow:hidden, flex:1); a screenshot needs the whole view laid out at
+     once, so height and overflow are released here and nowhere else. */
+  html, body { height: auto; overflow: visible; background: var(--surface-50); }
+  .mock-view { overflow: visible; height: auto; flex: none; background: var(--surface-0);
+               border: 1px solid var(--surface-200); }
+  .mock-view .admin-content { overflow: visible; padding: var(--space-6) var(--space-8); }
+  .mock-caption { font: 600 var(--text-sm)/1.4 var(--font-sans); color: var(--text-secondary);
+                  text-transform: uppercase; letter-spacing: var(--tracking-wider);
+                  margin: 0 0 var(--space-2); }
+  .mock-wrap { padding: var(--space-4); }
+  /* A narrow rule-marked note calling out the one behavior a static image cannot show. */
+  .mock-note { border-left: 3px solid var(--accent-500); background: var(--accent-50);
+               padding: var(--space-2) var(--space-3); margin: var(--space-3) 0;
+               font: var(--text-sm)/1.5 var(--font-sans); color: var(--text-primary); }
+  .assistant-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(260px, 1fr));
+               gap: var(--space-3); margin-bottom: var(--space-5); }
+  .assistant-card { border: 1px solid var(--surface-200); border-radius: var(--radius-lg);
+               padding: var(--space-3); background: var(--surface-0); }
+  .assistant-card--selected { border-color: var(--accent-500); box-shadow: var(--shadow-sm); }
+  .assistant-card h4 { margin: 0 0 var(--space-2); font: 600 var(--text-md)/1.3 var(--font-sans); }
+  .assistant-row { display: flex; align-items: center; justify-content: space-between;
+              gap: var(--space-2); padding: 3px 0; font: var(--text-sm)/1.5 var(--font-sans); }
+</style>
+</head>
+<body>
+<div id="root">
+
+<!-- ════════════════════════════════════════════════════════════════════════════════════════════
+     A1 - FR19: the platform-wide view. Every assistant, worst first.
+     ═══════════════════════════════════════════════════════════════════════════════════════════ -->
+<div class="mock-wrap">
+<p class="mock-caption">A1 &mdash; Platform-wide view (FR19)</p>
+<div class="admin-dashboard mock-view" data-mock="platform">
+
+  <header class="admin-header">
+    <div class="admin-header-left">
+      <strong>AgentEchelon</strong>
+      <span class="status-badge status-badge--live">Aurora mode</span>
+    </div>
+    <div class="admin-header-left">
+      <span class="admin-muted">admin@example.com</span>
+    </div>
+  </header>
+
+  <nav class="admin-section-rail" role="tablist" aria-label="Sections">
+    <button role="tab" class="admin-section-btn">Overview</button>
+    <button role="tab" class="admin-section-btn active" aria-selected="true">Effectiveness</button>
+    <button role="tab" class="admin-section-btn">Conversations</button>
+    <button role="tab" class="admin-section-btn">Experiments</button>
+    <button role="tab" class="admin-section-btn">Security</button>
+  </nav>
+
+  <div class="admin-content">
+    <h3>Evaluation &mdash; all assistants, all classifications</h3>
+    <p class="admin-tab-description">
+      One row per assistant in one classification, judged against the profile and context it
+      was given there. Worst first. Every rate carries the population it was computed over.
+    </p>
+
+    <div class="admin-filter-group">
+      <button class="admin-filter-btn">Classification: all</button>
+      <button class="admin-filter-btn">Assistant: all</button>
+      <button class="admin-filter-btn">Intent: all</button>
+      <button class="admin-filter-btn">Last 7 days</button>
+    </div>
+
+    <div class="metric-cards-grid">
+      <div class="metric-card">
+        <div class="metric-card-title">Assistants measured</div>
+        <div class="metric-card-value">14</div>
+        <div class="metric-card-subtitle">of 17 deployed &mdash; 3 below reporting threshold</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-card-title">Judged / seen</div>
+        <div class="metric-card-value">511 / 4,775</div>
+        <div class="metric-card-subtitle">always 43 + sampled 10%</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-card-title">Judge agreement</div>
+        <div class="metric-card-value">78%</div>
+        <div class="metric-card-subtitle">over 166 human verdicts</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-card-title">Assistants below target</div>
+        <div class="metric-card-value">3</div>
+        <div class="metric-card-subtitle">relevance target 70</div>
+      </div>
+    </div>
+
+    <div class="data-table-wrapper">
+      <table class="data-table data-table--rows-clickable">
+        <thead>
+          <tr>
+            <th class="sortable">Assistant</th>
+            <th class="sortable">Classification</th>
+            <th class="sortable">Intent</th>
+            <th class="sortable active">Relevance <span class="sort-indicator">&#9650;</span></th>
+            <th>Judged / seen</th>
+            <th>Agreement</th>
+            <th>Tool use</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr class="data-table-row--clickable">
+            <td>hr-assistant</td>
+            <td><span class="admin-tab-tier-chip admin-tab-tier-chip--premium"><span class="admin-tab-tier-chip-value">premium</span></span></td>
+            <td>policy_lookup</td>
+            <td data-numeric="true">41</td>
+            <td data-numeric="true">128 / 1,204</td>
+            <td data-numeric="true">62% <span class="admin-muted">(n=34)</span></td>
+            <td><span class="status-badge status-badge--error">31% errored</span></td>
+          </tr>
+          <tr class="data-table-row--clickable">
+            <td>finance-assistant</td>
+            <td><span class="admin-tab-tier-chip admin-tab-tier-chip--standard"><span class="admin-tab-tier-chip-value">standard</span></span></td>
+            <td>report_request</td>
+            <td data-numeric="true">58</td>
+            <td data-numeric="true">96 / 890</td>
+            <td data-numeric="true">81% <span class="admin-muted">(n=51)</span></td>
+            <td><span class="status-badge status-badge--success">ok</span></td>
+          </tr>
+          <tr class="data-table-row--clickable">
+            <td>hr-assistant</td>
+            <td><span class="admin-tab-tier-chip admin-tab-tier-chip--standard"><span class="admin-tab-tier-chip-value">standard</span></span></td>
+            <td>policy_lookup</td>
+            <td data-numeric="true">66</td>
+            <td data-numeric="true">74 / 612</td>
+            <td data-numeric="true"><span class="admin-muted">too few (n=4)</span></td>
+            <td><span class="status-badge status-badge--success">ok</span></td>
+          </tr>
+          <tr class="data-table-row--clickable">
+            <td>it-helpdesk</td>
+            <td><span class="admin-tab-tier-chip admin-tab-tier-chip--basic"><span class="admin-tab-tier-chip-value">basic</span></span></td>
+            <td>password_reset</td>
+            <td data-numeric="true">88</td>
+            <td data-numeric="true">210 / 2,011</td>
+            <td data-numeric="true">84% <span class="admin-muted">(n=77)</span></td>
+            <td><span class="status-badge status-badge--success">ok</span></td>
+          </tr>
+          <tr class="data-table-row--clickable">
+            <td>onboarding-bot</td>
+            <td><span class="admin-tab-tier-chip admin-tab-tier-chip--basic"><span class="admin-tab-tier-chip-value">basic</span></span></td>
+            <td>orientation</td>
+            <td data-numeric="true"><span class="admin-muted">too few to report</span></td>
+            <td data-numeric="true">3 / 58</td>
+            <td data-numeric="true"><span class="admin-muted">&mdash;</span></td>
+            <td><span class="admin-muted">&mdash;</span></td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+
+    <div class="admin-metric-drill">
+      <h4>hr-assistant &middot; premium &middot; policy_lookup</h4>
+      <div class="assistant-row"><span>Population</span><span>128 judged of 1,204 seen &mdash; always 12, sampled 10% (116)</span></div>
+      <div class="assistant-row"><span>Rubric</span><span>r-8f21c4 &nbsp;&middot;&nbsp; unchanged for 14 days</span></div>
+      <div class="assistant-row"><span>Evaluator model</span><span>one model across the window</span></div>
+      <div class="assistant-row"><span>Agreement</span><span>62% over 34 human verdicts</span></div>
+      <p class="mock-note">
+        Agreement is 62%, so the 41 above is <strong>not yet evidence</strong>. The surface says so
+        here rather than letting a reader act on an unconfirmed score.
+      </p>
+      <button class="admin-inline-btn">Review a judged exchange &#8599;</button>
+      <button class="admin-inline-btn">Sampling and cost levers &#8599;</button>
+    </div>
+  </div>
+</div>
+</div>
+
+<!-- ════════════════════════════════════════════════════════════════════════════════════════════
+     A2 - FR20: a team's own assistants. Entered from the profile, or from this list.
+     ═══════════════════════════════════════════════════════════════════════════════════════════ -->
+<div class="mock-wrap">
+<p class="mock-caption">A2 &mdash; A team's own assistants (FR20)</p>
+<div class="admin-dashboard mock-view" data-mock="team">
+
+  <header class="admin-header">
+    <div class="admin-header-left">
+      <strong>AgentEchelon</strong>
+      <span class="status-badge status-badge--info">people-ops</span>
+    </div>
+    <div class="admin-header-left">
+      <span class="admin-muted">ai-developer@example.com</span>
+    </div>
+  </header>
+
+  <nav class="admin-section-rail" role="tablist" aria-label="Sections">
+    <button role="tab" class="admin-section-btn">Profiles</button>
+    <button role="tab" class="admin-section-btn active" aria-selected="true">Effectiveness</button>
+    <button role="tab" class="admin-section-btn">Ground Truth</button>
+    <button role="tab" class="admin-section-btn">Flagged</button>
+  </nav>
+
+  <div class="admin-content">
+    <h3>people-ops &mdash; assistants my team manages</h3>
+    <p class="admin-tab-description">
+      2 assistants, 3 instances. Scoped where the request is served, not filtered in the browser.
+      <button class="admin-link-btn">Arrived from the hr-assistant profile &#8599;</button>
+    </p>
+
+    <div class="assistant-grid">
+      <div class="assistant-card assistant-card--selected">
+        <h4>hr-assistant</h4>
+        <div class="assistant-row">
+          <span><span class="admin-tab-tier-chip admin-tab-tier-chip--premium"><span class="admin-tab-tier-chip-value">premium</span></span></span>
+          <span>relevance <strong>41</strong> &nbsp; <span class="status-badge status-badge--error">tool errors 31%</span></span>
+        </div>
+        <div class="assistant-row">
+          <span><span class="admin-tab-tier-chip admin-tab-tier-chip--standard"><span class="admin-tab-tier-chip-value">standard</span></span></span>
+          <span>relevance <strong>66</strong> &nbsp; <span class="status-badge status-badge--success">ok</span></span>
+        </div>
+        <p class="admin-muted">Two instances, two profiles, two verdicts. Never pooled.</p>
+      </div>
+      <div class="assistant-card">
+        <h4>finance-assistant</h4>
+        <div class="assistant-row">
+          <span><span class="admin-tab-tier-chip admin-tab-tier-chip--standard"><span class="admin-tab-tier-chip-value">standard</span></span></span>
+          <span>relevance <strong>58</strong> &nbsp; <span class="status-badge status-badge--warn">below target</span></span>
+        </div>
+      </div>
+    </div>
+
+    <h4>hr-assistant &middot; premium &mdash; three readings, three owners</h4>
+    <div class="metric-cards-grid">
+      <div class="metric-card">
+        <div class="metric-card-title">Adherence</div>
+        <div class="metric-card-value">72</div>
+        <div class="metric-card-subtitle">persona followed, 2 instruction misses &middot; owner: instructions</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-card-title">Correctness</div>
+        <div class="metric-card-value">44</div>
+        <div class="metric-card-subtitle">grounded in 61% of answers &middot; owner: retrieval or model</div>
+      </div>
+      <div class="metric-card">
+        <div class="metric-card-title">Fitness</div>
+        <div class="metric-card-value">68</div>
+        <div class="metric-card-subtitle">68% of tracked tasks completed &middot; owner: taxonomy</div>
+      </div>
+    </div>
+
+    <h4>Tool use</h4>
+    <div class="data-table-wrapper">
+      <table class="data-table">
+        <thead>
+          <tr><th>Outcome</th><th>Calls</th><th>Owner</th><th>What it means</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Never called</td><td data-numeric="true">4</td><td>instructions</td>
+            <td class="admin-muted">The tool was available and the assistant did not reach for it</td>
+          </tr>
+          <tr>
+            <td>Errored</td><td data-numeric="true">39</td><td><strong>hris-system</strong></td>
+            <td class="admin-muted">Called correctly; the system behind it failed</td>
+          </tr>
+          <tr>
+            <td>Empty or stale</td><td data-numeric="true">12</td><td><strong>hris-system</strong></td>
+            <td class="admin-muted">Answered, with nothing usable in it</td>
+          </tr>
+          <tr>
+            <td>Contradicted by the answer</td><td data-numeric="true">2</td><td>retrieval or model</td>
+            <td class="admin-muted">The reply asserted what the tool did not return &mdash; fabrication</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="mock-note">
+      39 errored calls belong to <strong>hris-system</strong>, not to this team. Without this row the
+      team rewrites instructions that were already correct.
+    </p>
+
+    <h4>Worst intent: policy_lookup</h4>
+    <div class="data-table-wrapper">
+      <table class="data-table data-table--rows-clickable">
+        <thead>
+          <tr><th>Exchange</th><th>Verdict</th><th>Why</th></tr>
+        </thead>
+        <tbody>
+          <tr class="data-table-row--clickable">
+            <td>1f2a</td>
+            <td><span class="status-badge status-badge--success">Correct refusal</span></td>
+            <td class="admin-muted">Off remit, and no reachable assistant covered it. Not counted as a miss</td>
+          </tr>
+          <tr class="data-table-row--clickable">
+            <td>3c8d</td>
+            <td><span class="status-badge status-badge--error">Contradicted</span></td>
+            <td class="admin-muted">Answered from a tool that returned empty</td>
+          </tr>
+          <tr class="data-table-row--clickable">
+            <td>7b41</td>
+            <td><span class="status-badge status-badge--warn">Missed delegation</span></td>
+            <td class="admin-muted">Declined, but benefits-assistant advertises this intent</td>
+          </tr>
+          <tr class="data-table-row--clickable">
+            <td>9e02</td>
+            <td><span class="status-badge status-badge--info">Not charged here</span></td>
+            <td class="admin-muted">Misled by a sibling's input; the finding belongs to that assistant</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+</div>
+
+</div>
+</body>
+</html>

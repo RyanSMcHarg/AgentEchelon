@@ -1,4 +1,4 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './helpers/fixtures';
 import {
   signIn,
   createConversation,
@@ -12,15 +12,23 @@ import {
   BotResponse,
   WebSocketMonitor,
   ConsoleMonitor,
+  idTokenOf,
 } from './helpers/agent-helpers';
 import { getBasicUser, getStandardUser, getPremiumUser, getAdminUser, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { assistantResponseCount } from './helpers/drift-backend';
+import { ADMIN_API_URL, adminUrl } from './helpers/api-urls';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardConsoleErrors();
 
+/**
+ * A strategic-analysis question grounded in the seeded context: the Q3 roadmap holds three StratumFlow
+ * items at three statuses, so answering means weighing them. Standard refuses it; premium answers it.
+ */
+const ROADMAP_RISK_QUESTION =
+  'Looking at the StratumFlow items on the Q3 roadmap, which are most at risk of slipping, and why?';
 
 test.describe.serial('Agent Intents — Basic Tier', () => {
   // Fails a PASSING test that hid a server-side error (see helpers/turn-guards).
@@ -39,7 +47,7 @@ test.describe.serial('Agent Intents — Basic Tier', () => {
   });
 
   test('should create a new conversation', async ({ page }) => {
-    await createConversation(page, 'E2E Basic Test', 'Claude Haiku');
+    await createConversation(page, 'E2E Basic Test', 'Basic');
 
     await expect(page.locator('.conversation-header')).toBeVisible({ timeout: 15000 });
     console.log('\n--- create-conversation ---');
@@ -49,7 +57,7 @@ test.describe.serial('Agent Intents — Basic Tier', () => {
   });
 
   test('should receive greeting message in new conversation', async ({ page }) => {
-    await createConversation(page, 'E2E Greeting Test', 'Claude Haiku');
+    await createConversation(page, 'E2E Greeting Test', 'Basic');
 
     // The bot now ALWAYS welcomes on channel create — contextual when a
     // topic was supplied, generic otherwise (create-conversation
@@ -74,7 +82,7 @@ test.describe.serial('Agent Intents — Basic Tier', () => {
       (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
       { timeout: 30000 },
     );
-    await createConversation(page, 'E2E General Q', 'Claude Haiku');
+    await createConversation(page, 'E2E General Q', 'Basic');
     const channelArn = (await (await createResp).json()).conversation.conversationArn as string;
 
     // Wait for conversation to be ready (greeting message visible)
@@ -100,7 +108,7 @@ test.describe.serial('Agent Intents — Basic Tier', () => {
     // failed in the third, on identical code, purely on how the model chose to handle an off-topic
     // question that turn. A test that a working deployment fails at random is worse than no test.
     //
-    // The off-topic rejection is DESIRED behaviour the grounding and drift specs assert positively,
+    // The off-topic rejection is DESIRED behavior the grounding and drift specs assert positively,
     // so demanding the answer here put two suites in direct conflict. What this test can honestly
     // claim about a basic-tier turn is that it answered promptly, briefly and coherently; the intent
     // and model claims belong to the archive block at the foot of this file, which asserts them
@@ -118,7 +126,7 @@ test.describe.serial('Agent Intents — Basic Tier', () => {
 
     // EXACTLY ONE assistant RESPONSE for one normal turn.
     //
-    // This is the NORMAL Lex path: Chime materialises a placeholder from the Lex fulfillment response,
+    // This is the NORMAL Lex path: Chime materializes a placeholder from the Lex fulfillment response,
     // and the async processor UPDATES that same message in place with the answer. A second response
     // means a duplicate fulfillment produced its own placeholder and its own answer, which is the
     // defect the derived correlation id and the router's `fulfil-<corr>` claim exist to prevent
@@ -131,7 +139,7 @@ test.describe.serial('Agent Intents — Basic Tier', () => {
     //
     // Nothing else in the suite watched this. Every other reply assertion is about CONTENT (the text
     // came back, it was short enough, it was quick enough), all of which a duplicated reply satisfies
-    // perfectly. `fulfillment-retry.spec.ts` asserts exactly-one only when the test itself injects a
+    // perfectly. `a-replayed-turn-claims-once.spec.ts` asserts exactly-one only when the test itself injects a
     // duplicate; this asserts it for an ordinary turn nobody interfered with.
     //
     // The settle wait is load-bearing - a duplicate lands AFTER the winner, so counting the instant the
@@ -156,7 +164,7 @@ test.describe.serial('Agent Intents — Basic Tier', () => {
   });
 
   test('follow-up — should maintain conversation context', async ({ page }) => {
-    await createConversation(page, 'E2E Context Test', 'Claude Haiku');
+    await createConversation(page, 'E2E Context Test', 'Basic');
 
     // Wait for conversation to be ready
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
@@ -179,10 +187,55 @@ test.describe.serial('Agent Intents — Basic Tier', () => {
     // so drift stays out of the way (the off-topic elephants triggered a "shifting topics" suggestion
     // and the follow-up was never answered at all), and getting it back proves the turn carried prior
     // context rather than re-derived something the platform already knew.
+    // ── AND IT IS PHRASED SO IT CANNOT BE READ AS A QUESTION (2026-09-09) ──────────────────────
+    //
+    // "I am reviewing the billing migration and the cutover date is March 14" is a STATEMENT, but a
+    // small model can read it as a request for information about a billing migration - and Haiku
+    // does, roughly half the time: "I'm afraid I don't have any information about a billing migration
+    // or cutover date." The setup then carries a deflection instead of the fact, so the follow-up
+    // correctly reports no record and the test fails on a coin flip rather than on a defect. Measured
+    // on a live sweep, 2026-09-09.
+    //
+    // The drift-decline below was added for the same symptom reached another way, and it does not
+    // cover this one: nothing was declined because drift never fired. An explicit instruction to
+    // remember removes the ambiguity at the source, and keeps every property the probe was chosen
+    // for - the fact exists only in this conversation, it is not the user's identity, and it is
+    // in-domain so drift stays out of the way.
     const firstResponse = await sendAndWaitForResponse(
-      page, 'I am reviewing the billing migration and the cutover date is March 14.', 60000, wsMonitor
+      page,
+      'Please make a note of this for later in our conversation: the cutover date for the billing '
+      + 'migration is March 14. Just confirm you have noted it.',
+      60000,
+      wsMonitor,
     );
     assertBotResponse(firstResponse, 'context-setup');
+
+    // THE PREMISE, CHECKED WHERE IT IS ESTABLISHED. If the setup was deflected there is no fact in
+    // the thread to recall, so the follow-up cannot prove anything and "missing keywords" would blame
+    // the context window for something that went wrong a turn earlier. Failing HERE says which turn
+    // actually broke.
+    //
+    // ── ASSERTED BY WHAT THE REPLY CONTAINS, NOT BY WHAT IT AVOIDS SAYING (2026-10-02) ──
+    //
+    // This failed on a reply that was exactly what the test needs. The check scanned the WHOLE reply
+    // for deflection language, and the assistant accepts the fact and then adds a caveat about its
+    // own limits: "I've noted that the cutover date for the billing migration is March 14."
+    // followed by "However, I should mention: I don't have the ability to store notes or maintain
+    // state between separate conversations." The fact was in the thread, and the guard called that a
+    // deflection. Measured live against the deployment.
+    //
+    // What the follow-up needs is the DATE in the thread, so that is what is asserted. A trailing
+    // caveat cannot defeat a positive check, and a real deflection still fails here rather than a
+    // turn later - the deflection phrases are kept, but only to say WHICH of the two failures it is.
+    const setupCarriesTheFact = /March 14(?:th)?|03\/14|3\/14/i.test(firstResponse.text);
+    const setupDeflected = /do(?:es)? ?n[o']t have|no information|not have any (?:information|record)|unable to/i
+      .test(firstResponse.text);
+    expect(
+      setupCarriesTheFact,
+      setupDeflected
+        ? 'the setup turn DEFLECTED the fact instead of accepting it - the follow-up has nothing to recall'
+        : 'the setup turn did not repeat the date, so nothing in the thread carries it for the follow-up',
+    ).toBe(true);
 
     // Follow-up referencing prior context
     let response = await sendAndWaitForResponse(
@@ -225,18 +278,29 @@ test.describe.serial('Agent Intents — Basic Tier', () => {
   });
 
   test('concise response — should not be overly verbose for simple questions', async ({ page }) => {
-    await createConversation(page, 'E2E Concise Test', 'Claude Haiku');
+    await createConversation(page, 'E2E Concise Test', 'Basic');
 
     // Wait for conversation to be ready
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
-    const response = await sendAndWaitForResponse(page, 'What is 2 + 2?', 60000, wsMonitor);
+    // A PRICE, NOT ARITHMETIC. This test is about CONCISENESS, and the prompt has to be something
+    // the assistant will answer at all: the demo persona treats general knowledge and trivia as off
+    // topic and declines them by design, so "what is 2 + 2" measured the refusal, not the length.
+    // A single plan's price is in the public context every basic conversation is grounded in, and it
+    // is the right shape for this assertion because the verbose failure is available - a padded reply
+    // walks all three tiers rather than answering the one that was asked about.
+    const response = await sendAndWaitForResponse(
+      page,
+      'What does the StratumFlow Starter plan cost per user?',
+      60000,
+      wsMonitor,
+    );
     assertBotResponse(response, 'concise-response');
     validateResponseTime(response);
 
     const qualityIssues = validateBaseQuality(response.text);
     const contentIssues = validateResponse(response.text, {
-      mustContainAny: ['4', 'four'],
+      mustContainAny: ['$29', '29/user', '29 per user'],
       maxSentences: 3,
     });
 
@@ -262,31 +326,27 @@ test.describe.serial('Agent Intents — Standard Tier', () => {
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
   });
 
-  test('analysis request — should provide detailed analysis', async ({ page }) => {
-    await createConversation(page, 'E2E Analysis Test', 'Claude Sonnet');
-
-    // Wait for conversation to be ready
+  test('strategic analysis — is refused, because standard does not offer it', async ({ page }) => {
+    // Weighing which roadmap items will slip is strategic analysis, a premium capability: the model
+    // strategy routes it to Opus with preferred clearance premium, and standard's model boundary
+    // denies Opus. Standard's assistant does not offer the intent, so the handler refuses it before
+    // any model runs. The same question is answered, and its quality asserted, in the premium block.
+    await createConversation(page, 'E2E Analysis Refused', 'Standard');
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
-    const response = await sendAndWaitForResponse(
-      page,
-      'Analyze the pros and cons of using microservices vs monolithic architecture.',
-      90000,
-      wsMonitor,
-    );
-    assertBotResponse(response, 'analysis-request');
-    validateResponseTime(response);
+    const response = await sendAndWaitForResponse(page, ROADMAP_RISK_QUESTION, 90000, wsMonitor);
+    assertBotResponse(response, 'analysis-refused');
+    logResult('analysis-refused', response, []);
 
-    const qualityIssues = validateBaseQuality(response.text);
-    const contentIssues = validateResponse(response.text, {
-      mustContainAny: ['microservice', 'monolith', 'scalab', 'complex'],
-      minLength: 100,
-    });
-
-    logResult('analysis-request', response, qualityIssues, contentIssues);
-
-    expect(qualityIssues).toHaveLength(0);
-    expect(contentIssues).toHaveLength(0);
+    // The declaration on the wire, not the copy: the refusal wording is per-profile, the REFUSED
+    // delivery is what makes it a refusal and what the analytics count (DESIGN-CAPABILITY-REFUSAL).
+    expect(
+      response.wsTimings?.responseContent ?? '',
+      `standard answered a strategic-analysis question instead of refusing it: "${response.text.slice(0, 160)}"`,
+    ).toMatch(/REFUSED/);
+    // Refused by the handler, so no model produced it.
+    const servedBy = String(wsMonitor.lastBotMetadata?.bedrockModel ?? '');
+    expect(servedBy, `a model (${servedBy}) ran a turn standard should have refused`).toBe('');
 
     consoleMonitor.assertNoErrors();
   });
@@ -302,7 +362,7 @@ test.describe.serial('Agent Intents — Standard Tier', () => {
     // respond" instead of "did Bedrock happen to be warm."
     test.setTimeout(240000);
 
-    await createConversation(page, 'E2E Task Tracking', 'Claude Sonnet');
+    await createConversation(page, 'E2E Task Tracking', 'Standard');
 
     // Wait for conversation to be ready
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
@@ -333,7 +393,7 @@ test.describe.serial('Agent Intents — Standard Tier', () => {
   });
 
   test('code generation — should generate working code', async ({ page }) => {
-    await createConversation(page, 'E2E Code Gen', 'Claude Sonnet');
+    await createConversation(page, 'E2E Code Gen', 'Standard');
 
     // Wait for conversation to be ready
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
@@ -377,7 +437,7 @@ test.describe.serial('Agent Intents — Premium Tier', () => {
   });
 
   test('should access Opus model', async ({ page }) => {
-    await createConversation(page, 'E2E Opus Test', 'Claude Opus');
+    await createConversation(page, 'E2E Opus Test', 'Premium');
 
     // Wait for conversation to be ready
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
@@ -417,7 +477,7 @@ test.describe.serial('Agent Intents — Premium Tier', () => {
     // answers a physics question. On a GROUNDED deployment it correctly does not: the seeded persona
     // is an internal assistant for a specific company, and it declined with "I appreciate the
     // curiosity, but my role here ...". That is the off-topic rejection the drift and grounding specs
-    // assert elsewhere as desired behaviour, so keeping the keyword check here meant two suites
+    // assert elsewhere as desired behavior, so keeping the keyword check here meant two suites
     // demanding opposite things, and this one failing whenever grounding was working.
     //
     // The keyword check was never evidence for this test's claim anyway - its own comment above says
@@ -433,6 +493,33 @@ test.describe.serial('Agent Intents — Premium Tier', () => {
     consoleMonitor.assertNoErrors();
   });
 
+  test('strategic analysis — should weigh grounded facts, not restate one', async ({ page }) => {
+    // The premium half of the standard refusal above: the same question, from a classification that
+    // offers strategic analysis. The Q3 roadmap holds three StratumFlow items at three statuses, so
+    // an answer has to compare them, which is what the keyword and length checks are for. Premium
+    // reads standard's context too, so the facts are in reach.
+    await createConversation(page, 'E2E Analysis Test', 'Premium');
+    await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
+
+    const response = await sendAndWaitForResponse(page, ROADMAP_RISK_QUESTION, 120000, wsMonitor);
+    assertBotResponse(response, 'analysis-request');
+    validateResponseTime(response);
+
+    expect(response.wsTimings?.responseContent ?? '', 'premium refused a strategic-analysis question').not.toMatch(/REFUSED/);
+    const qualityIssues = validateBaseQuality(response.text);
+    const contentIssues = validateResponse(response.text, {
+      mustContainAny: ['Salesforce', 'versioning', 'branching', 'scoping'],
+      minLength: 100,
+    });
+
+    logResult('analysis-request', response, qualityIssues, contentIssues);
+
+    expect(qualityIssues).toHaveLength(0);
+    expect(contentIssues).toHaveLength(0);
+
+    consoleMonitor.assertNoErrors();
+  });
+
   test('corporate travel — should engage the booking (action_item) flow', async ({ page }) => {
     // Exercises the corporate-travel booking example (the mock `search_corporate_travel`
     // executed tool + the generic action_item flow). The tool is OPT-IN, so:
@@ -441,7 +528,7 @@ test.describe.serial('Agent Intents — Premium Tier', () => {
     //  - Strict (E2E_TRAVEL_TOOL=true, i.e. the deployment set ENABLE_TRAVEL_TOOL +
     //    a book_travel intent pack): additionally assert it surfaces bookable options
     //    with a portal booking link.
-    await createConversation(page, 'E2E Corporate Travel', 'Claude Opus');
+    await createConversation(page, 'E2E Corporate Travel', 'Premium');
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
     const response = await sendAndWaitForResponse(
@@ -478,7 +565,7 @@ test.describe.serial('Agent Intents — Premium Tier', () => {
   });
 
   test('no internal markers — should strip all metadata from display', async ({ page }) => {
-    await createConversation(page, 'E2E Marker Strip', 'Claude Haiku');
+    await createConversation(page, 'E2E Marker Strip', 'Basic');
 
     // Wait for conversation to be ready
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
@@ -561,7 +648,7 @@ test.describe.serial('Agent Intents — Premium Tier', () => {
 test.describe('Agent Intents — the classifier reaches the archive', () => {
   guardBackendErrors('agent-intents-classifier');
 
-  const ANALYTICS_API = process.env.VITE_ANALYTICS_API_URL || process.env.ANALYTICS_API_URL || '';
+  const ANALYTICS_API = ADMIN_API_URL ? adminUrl('analytics', '/') : '';
 
   const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || '';
 
@@ -569,7 +656,7 @@ test.describe('Agent Intents — the classifier reaches the archive', () => {
     test.setTimeout(420_000);
     test.skip(
       !ANALYTICS_API,
-      'Needs VITE_ANALYTICS_API_URL (written into frontend/packages/admin/.env by gen-frontend-env).',
+      'Needs VITE_ADMIN_API_URL (written into frontend/packages/admin/.env by gen-frontend-env).',
     );
     test.skip(!ADMIN_BASE_URL, 'Needs E2E_ADMIN_BASE_URL — the archive read is admin-plane.');
 
@@ -589,7 +676,7 @@ test.describe('Agent Intents — the classifier reaches the archive', () => {
     let idToken = '';
     try {
       await signIn(adminPage, admin.email, admin.password);
-      idToken = (await adminPage.evaluate(() => localStorage.getItem('idToken'))) || '';
+      idToken = await idTokenOf(adminPage);
       expect(idToken, 'admin idToken for the analytics read').toBeTruthy();
     } finally {
       await adminCtx.close();
@@ -624,7 +711,7 @@ test.describe('Agent Intents — the classifier reaches the archive', () => {
     const before = await intentCount('data_extraction');
     console.log(`[intent] data_extraction before: ${before}`);
 
-    await createConversation(page, `E2E Intent Extract ${Date.now()}`, 'Claude Sonnet');
+    await createConversation(page, `E2E Intent Extract ${Date.now()}`, 'Standard');
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
     // Phrased to sit squarely inside the pack's data_extraction description (STRUCTURED / BULK),

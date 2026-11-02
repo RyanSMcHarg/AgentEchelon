@@ -12,7 +12,7 @@
  *   E2E_BASE_URL=<cloudfront> FEEDBACK_E2E=1 AWS_PROFILE=<p> \
  *     npx playwright test e2e/feedback.spec.ts --config=playwright.config.ts
  */
-import { test, expect } from '@playwright/test';
+import { test, expect } from './helpers/fixtures';
 import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';

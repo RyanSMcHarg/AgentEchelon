@@ -14,16 +14,21 @@
  * confirm the assignment→experiment_results path end to end (part of #39 is
  * verifying that assignment actually lands, so a failure here IS the finding).
  *
- *   E2E_BASE_URL=<cf> EXPERIMENTS_E2E=1 VITE_EXPERIMENTS_API_URL=<url> \
- *   VITE_ANALYTICS_API_URL=<url> AWS_PROFILE=<p> \
+ *   E2E_BASE_URL=<cf> EXPERIMENTS_E2E=1 VITE_ADMIN_API_URL=<url> \
+ *   VITE_ADMIN_API_CAPABILITIES=admin,experiments AWS_PROFILE=<p> \
  *     npx playwright test e2e/experiments.spec.ts --config=playwright.config.ts
  */
-import { test, expect, request as pwRequest, type Page, type APIRequestContext } from '@playwright/test';
-import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
+import { test, expect } from './helpers/fixtures';
+import { request as pwRequest, type Browser, type Page } from '@playwright/test';
+import { signIn, createConversation, sendAndWaitForResponse, idTokenOf } from './helpers/agent-helpers';
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
-import { signedAnalyticsPost } from './helpers/signed-analytics';
+import { signedAnalyticsPost, signedAdminContext, type SignedAdminContext } from './helpers/signed-analytics';
+import { retireStrandedE2eExperiments } from './helpers/experiment-sweep';
 import { WebSocketMonitor } from './helpers/websocket-monitor';
+import { liveAssistantFor } from './helpers/battle-setup';
 import { guardBackendErrors, guardConsoleErrors, allowConsoleError } from './helpers/turn-guards';
+import { ADMIN_API_URL, adminApiServes, adminUrl } from './helpers/api-urls';
+import { fillSecret } from './helpers/unrecorded-secret';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardConsoleErrors();
@@ -32,12 +37,30 @@ guardConsoleErrors();
 const RUN = process.env.EXPERIMENTS_E2E === '1';
 const suite = RUN ? test.describe : test.describe.skip;
 
-const EXPERIMENTS_API = process.env.VITE_EXPERIMENTS_API_URL || '';
-const ANALYTICS_API = process.env.VITE_ANALYTICS_API_URL || '';
+const EXPERIMENTS_API = adminApiServes('experiments') ? adminUrl('assistant-admin', '/admin/experiments') : '';
+const ANALYTICS_API = ADMIN_API_URL ? adminUrl('analytics', '/') : '';
+
+/** Retire experiments an earlier, killed run left live: every test here creates on premium, and the
+ *  classification refuses a second live experiment (§3.2.1). See helpers/experiment-sweep. */
+async function sweepStranded(browser: Browser, creds: TestCredentials): Promise<void> {
+  const page = await browser.newPage();
+  try {
+    await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
+    const idToken = await idTokenOf(page);
+    const api = signedAdminContext(idToken!);
+    try {
+      await retireStrandedE2eExperiments(api, EXPERIMENTS_API, { label: 'experiments' });
+    } finally {
+      await api.dispose();
+    }
+  } finally {
+    await page.close().catch(() => undefined);
+  }
+}
 
 // A minimal, valid non-battle base_model experiment on the premium tier: two
 // weighted variants naming a model each. (Battle experiments have extra rules —
-// exactly 2 variants + an alt-bot slot + a bound tier — which this deliberately
+// exactly 2 variants + a challenger + a bound tier — which this deliberately
 // avoids; this is plain A/B traffic assignment.)
 function draftExperiment() {
   const id = `e2e-ab-basemodel-${Date.now()}`;
@@ -51,8 +74,8 @@ function draftExperiment() {
     // Bedrock `modelId`. A wrong field left modelKey undefined → catalog[undefined] →
     // resolution returned null → the conversation was never assigned → 0 result rows.
     variants: [
-      { variantId: 'control', displayName: 'A', weight: 50, modelKey: 'haiku' },
-      { variantId: 'treatment', displayName: 'B', weight: 50, modelKey: 'sonnet' },
+      { variantId: 'control', weight: 50 },
+      { variantId: 'treatment', weight: 50, modelKey: 'sonnet' },
     ],
   };
 }
@@ -62,10 +85,11 @@ suite('A/B experiment produces experiment_results', () => {
   guardBackendErrors('experiments');
 
   let creds: TestCredentials;
-  test.beforeAll(async () => {
+  test.beforeAll(async ({ browser }) => {
     creds = await getTestCredentials();
-    expect(EXPERIMENTS_API, 'VITE_EXPERIMENTS_API_URL must be set').toBeTruthy();
-    expect(ANALYTICS_API, 'VITE_ANALYTICS_API_URL must be set').toBeTruthy();
+    expect(EXPERIMENTS_API, 'VITE_ADMIN_API_CAPABILITIES must name experiments').toBeTruthy();
+    expect(ANALYTICS_API, 'VITE_ADMIN_API_URL must be set').toBeTruthy();
+    await sweepStranded(browser, creds);
   });
 
   test('create experiment, run a conversation, see a result row', async ({ page }) => {
@@ -73,10 +97,10 @@ suite('A/B experiment produces experiment_results', () => {
 
     // 1. Admin auth (get an idToken) + create the experiment via the admin API.
     await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     expect(idToken, 'admin idToken in localStorage').toBeTruthy();
 
-    const api = await pwRequest.newContext({ extraHTTPHeaders: { Authorization: `Bearer ${idToken}` } });
+    const api = signedAdminContext(idToken!);
     const draft = draftExperiment();
     const created = await api.post(EXPERIMENTS_API, { data: draft });
     expect(created.ok(), `create experiment: ${created.status()} ${await created.text()}`).toBeTruthy();
@@ -84,7 +108,7 @@ suite('A/B experiment produces experiment_results', () => {
     try {
       // 2. Drive a premium-tier conversation so a turn is assigned to a variant. The
       //    experiment targets tiers:['premium'], so the conversation MUST be the Premium
-      //    classification — createConversation defaults to 'Open' (basic), which the premium
+      //    classification — createConversation defaults to 'Basic', which the premium
       //    experiment never assigns, so pass 'Premium' explicitly.
       await createConversation(page, `Exp e2e ${Date.now()}`, 'Premium');
       const resp = await sendAndWaitForResponse(page, 'In one sentence, what is a feature flag?');
@@ -97,8 +121,8 @@ suite('A/B experiment produces experiment_results', () => {
       // Archival (Chime -> Kinesis -> Firehose -> Aurora) buffers, so a single exchange can take
       // up to ~60-90s to land. Poll generously within the 180s test budget.
       for (let i = 0; i < 20 && !row; i++) {
-        // The analytics API is IAM-enforced (adminIamEnforcement) — sign the request with the
-        // admin's Identity-Pool creds; a Bearer JWT is rejected (403).
+        // The analytics API is AWS_IAM, like every admin API — sign the request with the
+        // admin's console session; a Bearer JWT is rejected (403).
         const j = await signedAnalyticsPost(ANALYTICS_API, idToken!, {
           queryType: 'experiment_results', dateRange: { start: start.toISOString(), end: end.toISOString() },
         });
@@ -108,7 +132,7 @@ suite('A/B experiment produces experiment_results', () => {
       expect(row, `experiment_results should include ${draft.experimentId} after a conversation`).toBeTruthy();
     } finally {
       // 4. Cleanup — mark completed so it stops assigning traffic.
-      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(draft.experimentId)}/status`, { data: { status: 'completed' } }).catch(() => {});
+      await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(draft.experimentId)}/status`), { data: { status: 'completed' } }).catch(() => {});
       await api.dispose();
     }
   });
@@ -123,9 +147,9 @@ suite('A/B experiment produces experiment_results', () => {
     test.setTimeout(12 * 60_000);
 
     await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     expect(idToken, 'admin idToken in localStorage').toBeTruthy();
-    const api = await pwRequest.newContext({ extraHTTPHeaders: { Authorization: `Bearer ${idToken}` } });
+    const api = signedAdminContext(idToken!);
 
     const draft = draftExperiment();
     const created = await api.post(EXPERIMENTS_API, { data: draft });
@@ -161,7 +185,17 @@ suite('A/B experiment produces experiment_results', () => {
       // the tail turn's row can trail the answer by minutes. 150s lost this race intermittently -
       // with 8 independent assignments, a genuinely unassigned variant is a 0.4% event, so a missing
       // one here is nearly always lag, and the poll must outlast the pipeline rather than the model.
-      for (let i = 0; i < 40 && variants.size < 2; i++) {
+      // RAISED TO 60 x 6s = 360s (2026-09-10). 240s lost this race on a sweep, and then a re-run of
+      // the same build lost it on the OTHER test in this file while this one passed - three different
+      // tests failing across two runs with nothing changed but time. The pipeline is the clock here,
+      // not the model: Firehose buffers up to ~90s, the exchange pairs on the bot's UPDATE row, and
+      // the tail turn of eight is the one that trails. A bound that the pipeline can exceed reports a
+      // correct product as broken, which is how a phase stops meaning anything.
+      //
+      // NOT solved by triggering archival. That would make this prove something the product does not
+      // do for a real reader, who also waits for the projection.
+      const waitStarted = Date.now();
+      for (let i = 0; i < 60 && variants.size < 2; i++) {
         const j = await signedAnalyticsPost(ANALYTICS_API, idToken!, {
           queryType: 'experiment_results', dateRange: { start: start.toISOString(), end: end.toISOString() },
         });
@@ -173,10 +207,18 @@ suite('A/B experiment produces experiment_results', () => {
         );
         if (variants.size < 2) await page.waitForTimeout(6000); // archival + pairing lag
       }
+      // THE FAILURE HAS TO NAME WHICH OF THE TWO IT IS. Seeing one arm can mean the projection is
+      // still behind, or that all eight independent assignments genuinely landed on one variant - a
+      // 0.4% draw, rare but not impossible, and the two want opposite responses. Reporting the wait
+      // and the arms seen is what lets the next reader tell them apart without re-running blind.
+      const waitedSec = Math.round((Date.now() - waitStarted) / 1000);
       expect(
         Array.from(variants).sort(),
         `both variants should appear in experiment_results for ${draft.experimentId}`
-          + ` (saw: ${Array.from(variants).sort().join(', ') || 'none'})`,
+          + ` (saw: ${Array.from(variants).sort().join(', ') || 'none'} after ${waitedSec}s).`
+          + ' One arm after a full wait is either the projection still trailing - raise the bound and'
+          + ' say why - or the 0.4% case where eight independent assignments all fell one way, which'
+          + ' is not a defect and wants a re-run, not a fix.',
       ).toEqual(['control', 'treatment']);
 
       // 3. Ship recommendation — the LLM verdict over the collapsed per-variant rows.
@@ -198,7 +240,7 @@ suite('A/B experiment produces experiment_results', () => {
 
       // 4. Complete the lifecycle and confirm the transition (a completed experiment
       // stops assigning traffic).
-      const done = await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(draft.experimentId)}/status`, { data: { status: 'completed' } });
+      const done = await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(draft.experimentId)}/status`), { data: { status: 'completed' } });
       expect(done.ok(), `complete experiment: ${done.status()}`).toBeTruthy();
       const listed = await api.get(EXPERIMENTS_API);
       expect(listed.ok(), `list experiments: ${listed.status()}`).toBeTruthy();
@@ -212,7 +254,7 @@ suite('A/B experiment produces experiment_results', () => {
       );
       expect(mine?.status, `experiment ${draft.experimentId} is completed`).toBe('completed');
     } finally {
-      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(draft.experimentId)}/status`, { data: { status: 'completed' } }).catch(() => {});
+      await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(draft.experimentId)}/status`), { data: { status: 'completed' } }).catch(() => {});
       await api.dispose();
     }
   });
@@ -233,9 +275,9 @@ suite('A/B experiment produces experiment_results', () => {
     test.setTimeout(8 * 60_000);
 
     await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     expect(idToken, 'admin idToken in localStorage').toBeTruthy();
-    const api = await pwRequest.newContext({ extraHTTPHeaders: { Authorization: `Bearer ${idToken}` } });
+    const api = signedAdminContext(idToken!);
 
     const draft = draftExperiment();
     const created = await api.post(EXPERIMENTS_API, { data: draft });
@@ -331,7 +373,7 @@ suite('A/B experiment produces experiment_results', () => {
       });
       expect((unscoped.data || []).length, 'no experimentId returns an empty set').toBe(0);
     } finally {
-      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(draft.experimentId)}/status`, { data: { status: 'completed' } }).catch(() => {});
+      await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(draft.experimentId)}/status`), { data: { status: 'completed' } }).catch(() => {});
       await api.dispose();
     }
   });
@@ -344,9 +386,9 @@ suite('A/B experiment produces experiment_results', () => {
   test('a past-endDate active experiment auto-completes on read (L5 lazy reconcile)', async ({ page }) => {
     test.setTimeout(60_000);
     await signIn(page, creds.testAdmin.email, creds.testAdmin.password);
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     expect(idToken, 'admin idToken in localStorage').toBeTruthy();
-    const api = await pwRequest.newContext({ extraHTTPHeaders: { Authorization: `Bearer ${idToken}` } });
+    const api = signedAdminContext(idToken!);
 
     // Active now, but expiring ~6s out (valid at create; lapsed by the time we read).
     const draft = { ...draftExperiment(), endDate: new Date(Date.now() + 6_000).toISOString() };
@@ -365,7 +407,7 @@ suite('A/B experiment produces experiment_results', () => {
       expect(autoTransition, `an auto:endDate system transition was appended: ${JSON.stringify(reconciled?.transitions)}`).toBeTruthy();
       expect(autoTransition?.by, 'the auto-completion is attributed to the system').toBe('system');
     } finally {
-      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(draft.experimentId)}/status`, { data: { status: 'completed' } }).catch(() => {});
+      await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(draft.experimentId)}/status`), { data: { status: 'completed' } }).catch(() => {});
       await api.dispose();
     }
   });
@@ -388,7 +430,7 @@ suite('A/B experiment produces experiment_results', () => {
 // admin app, DESIGN-SEPARATE-ADMIN-APP.md); the data-producing checks drive a
 // chat conversation on E2E_BASE_URL and SigV4-sign the analytics read via
 // helpers/signed-analytics.ts, exactly as the smoke tests do. All go through
-// the admin experiments API (VITE_EXPERIMENTS_API_URL, Bearer id token) for
+// the admin experiments routes (on VITE_ADMIN_API_URL, SigV4-signed) for
 // fast setup + audit verification.
 //
 // SOME of these are the design's NOT-YET-BUILT acceptance criteria (the
@@ -416,7 +458,7 @@ async function openAdminExperiments(page: Page): Promise<void> {
     // Auth is per-origin (localStorage); sign in against the form already on screen — do NOT
     // delegate to the shared signIn(), which navigates to the CHAT baseURL.
     await page.locator('input[type="email"]').fill(adminCreds.testAdmin.email);
-    await page.locator('input[type="password"]').fill(adminCreds.testAdmin.password);
+    await fillSecret(page.locator('input[type="password"]'), adminCreds.testAdmin.password);
     await page.locator('button[type="submit"]').click();
     await page.waitForSelector('.admin-dashboard, .admin-section-rail', { timeout: 30_000 });
     await page.goto(new URL('/?admin=experiments', ADMIN_BASE_URL).toString());
@@ -427,28 +469,28 @@ async function openAdminExperiments(page: Page): Promise<void> {
 
 /** The admin id token from the (admin-origin) localStorage — usable as a Bearer for the experiments API. */
 async function adminIdToken(page: Page): Promise<string> {
-  const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+  const idToken = await idTokenOf(page);
   expect(idToken, 'admin idToken in localStorage (admin origin)').toBeTruthy();
   return idToken!;
 }
 
 /** A Bearer-authed request context for the admin experiments API. */
-async function bearerApi(idToken: string): Promise<APIRequestContext> {
-  return pwRequest.newContext({ extraHTTPHeaders: { Authorization: `Bearer ${idToken}` } });
+async function bearerApi(idToken: string): Promise<SignedAdminContext> {
+  return signedAdminContext(idToken);
 }
 
 /** Create an experiment straight through the admin API (fast setup for the UI flows). */
-async function createExperimentApi(api: APIRequestContext, body: Record<string, unknown>) {
+async function createExperimentApi(api: SignedAdminContext, body: Record<string, unknown>) {
   const resp = await api.post(EXPERIMENTS_API, { data: body });
   return resp;
 }
 
 /**
  * Complete any lingering active/paused experiments so a lifecycle test starts from a clean
- * classification slot. Prior failed runs and battle arming leave active experiments that would
+ * classification. Prior failed runs and battle arming leave active experiments that would
  * otherwise spuriously conflict (the type-exclusion rule) and cascade failures between tests.
  */
-async function clearActiveExperiments(api: APIRequestContext): Promise<void> {
+async function clearActiveExperiments(api: SignedAdminContext): Promise<void> {
   const listed = await api.get(EXPERIMENTS_API);
   if (!listed.ok()) return;
   const body = await listed.json();
@@ -456,13 +498,13 @@ async function clearActiveExperiments(api: APIRequestContext): Promise<void> {
   for (const e of (Array.isArray(experiments) ? experiments : [])) {
     const id = e.experimentId ?? e.experiment_id ?? e.id;
     if (id && (e.status === 'active' || e.status === 'paused')) {
-      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } }).catch(() => {});
+      await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } }).catch(() => {});
     }
   }
 }
 
 /** GET the experiments list and find one by id (tolerant of the {experiments}/{data}/bare-array shapes). */
-async function getExperimentApi(api: APIRequestContext, id: string): Promise<any | undefined> {
+async function getExperimentApi(api: SignedAdminContext, id: string): Promise<any | undefined> {
   const listed = await api.get(EXPERIMENTS_API);
   if (!listed.ok()) return undefined;
   const body = await listed.json();
@@ -479,7 +521,7 @@ async function getExperimentApi(api: APIRequestContext, id: string): Promise<any
  * still reports the actual observed status).
  */
 async function waitForExperimentStatus(
-  api: APIRequestContext,
+  api: SignedAdminContext,
   id: string,
   status: string,
   timeoutMs = 15_000,
@@ -502,8 +544,8 @@ function premiumBlocker(id: string) {
     experimentType: 'base_model',
     tiers: ['premium'],
     variants: [
-      { variantId: 'control', displayName: 'A', weight: 50, modelKey: 'haiku' },
-      { variantId: 'treatment', displayName: 'B', weight: 50, modelKey: 'sonnet' },
+      { variantId: 'control', weight: 50 },
+      { variantId: 'treatment', weight: 50, modelKey: 'sonnet' },
     ],
     startDate: new Date().toISOString(),
     // Written objective (§1) — a base_model quality objective with a statement.
@@ -512,12 +554,11 @@ function premiumBlocker(id: string) {
 }
 
 /**
- * A CLASSIFICATION-type blocker on premium. The type-exclusion rule (§3.2.1,
- * experiment-manager.findTypeExclusionConflicts) fires only when EXACTLY ONE side
- * is a `classification` experiment — so a classification blocker vs the `intent`
- * experiment the create form produces is a genuine conflict (two same-family
- * types, e.g. base_model + intent, intentionally do NOT conflict). Classification
- * tests the classifier's accuracy, so its objective metric is `accuracy`.
+ * A CLASSIFICATION-type blocker on premium. Any live experiment holds its classification
+ * (§3.2.1, experiment-manager.findClassificationConflicts), so this blocks the `intent`
+ * experiment the create form produces exactly as a base_model one would; the type is
+ * kept because these tests also exercise the accuracy objective. Classification tests
+ * the classifier's accuracy, so its objective metric is `accuracy`.
  */
 function premiumClassificationBlocker(id: string) {
   return {
@@ -528,22 +569,27 @@ function premiumClassificationBlocker(id: string) {
   };
 }
 
-/** Set the create-form tier toggles to exactly `tiers` (the form defaults to ['standard']). */
+/**
+ * Select the create form's ONE classification (the form starts on the first declared one).
+ *
+ * The picker is single-select: an experiment compares two versions of one assistant, and an assistant
+ * acts in one classification (`ExperimentsTab.tsx`, ONE CLASSIFICATION). Clicking the wanted one is the
+ * whole action; the others are then off by construction, which is checked rather than assumed.
+ */
 async function setCreateFormTiers(page: Page, tiers: string[]): Promise<void> {
+  expect(tiers.length, 'an experiment runs in exactly one classification').toBe(1);
+  const [wanted] = tiers;
   const btn = (t: string) => page.locator(`.admin-filter-group button:has-text("${t}")`).first();
   const isActive = async (t: string) =>
     /\bactive\b/.test((await btn(t).getAttribute('class').catch(() => '')) ?? '');
+  // A click can be dropped mid-render under load, which once left a new experiment on the default
+  // classification so it never conflicted with the premium blocker. Click until it takes.
+  for (let i = 0; i < 4 && !(await isActive(wanted)); i++) {
+    await btn(wanted).click();
+    await page.waitForTimeout(150);
+  }
   for (const t of ['basic', 'standard', 'premium']) {
-    const want = tiers.includes(t);
-    // A single toggle click can be dropped mid-render / under load, silently leaving the tier in
-    // the wrong state — the flaky root of the conflict-panel tests (a new experiment landed on the
-    // default tier, so it never conflicted with the premium blocker). Click-then-verify with retries.
-    for (let i = 0; i < 4 && (await isActive(t)) !== want; i++) {
-      await btn(t).click();
-      await page.waitForTimeout(150);
-    }
-    // Fail loudly if the toggle never took, rather than proceeding to create on the wrong tier.
-    expect(await isActive(t), `create-form tier "${t}" should be ${want ? 'on' : 'off'}`).toBe(want);
+    expect(await isActive(t), `create-form classification "${t}" should be ${t === wanted ? 'on' : 'off'}`).toBe(t === wanted);
   }
 }
 
@@ -567,10 +613,11 @@ function objectiveTargetField(page: Page) {
 }
 
 suite('Experiments — objective, lifecycle conflict-resolution & decision loop (§8 E1–E7)', () => {
-  test.beforeAll(async () => {
+  test.beforeAll(async ({ browser }) => {
     adminCreds = await getTestCredentials();
-    expect(EXPERIMENTS_API, 'VITE_EXPERIMENTS_API_URL must be set').toBeTruthy();
-    expect(ANALYTICS_API, 'VITE_ANALYTICS_API_URL must be set').toBeTruthy();
+    expect(EXPERIMENTS_API, 'VITE_ADMIN_API_CAPABILITIES must name experiments').toBeTruthy();
+    expect(ANALYTICS_API, 'VITE_ADMIN_API_URL must be set').toBeTruthy();
+    await sweepStranded(browser, adminCreds);
   });
 
   // E1 — As an operator, I want to author the objective (the decision this test
@@ -587,6 +634,9 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       await page.locator('button:has-text("New Experiment")').click();
       await expect(page.locator('h4:has-text("Create Experiment")')).toBeVisible();
       await page.locator('label:has-text("Experiment ID") input').fill(id);
+      // Named, not inherited: the form starts on the first declared classification, and what this test
+      // checks (the objective) does not depend on which one. Standard selects the form's treatment models.
+      await setCreateFormTiers(page, ['standard']);
 
       // (a) Empty objective statement must BLOCK create (statement required in the form, §1.2/§1.4).
       await page.locator('button:has-text("Create & Activate")').click();
@@ -619,7 +669,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       ).toBeTruthy();
       expect(rec.objective.guardrails[0].metric, 'guardrail metric persisted').toBe('cost');
     } finally {
-      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } }).catch(() => {});
+      await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } }).catch(() => {});
       await api.dispose();
     }
   });
@@ -639,7 +689,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
     const newId = `e2e-new-end-${Date.now()}`;
 
     try {
-      await clearActiveExperiments(api); // start from a clean premium slot
+      await clearActiveExperiments(api); // start from a clean premium classification
       // Occupy premium with an active CLASSIFICATION experiment (the blocker), so the intent
       // experiment the create form makes below is a genuine type-exclusion conflict.
       const b = await createExperimentApi(api, premiumClassificationBlocker(blockerId));
@@ -688,7 +738,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       expect(newRec?.status, 'the new experiment activated after auto-retry').toBe('active');
     } finally {
       for (const id of [blockerId, newId]) {
-        await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } }).catch(() => {});
+        await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } }).catch(() => {});
       }
       await api.dispose();
     }
@@ -708,7 +758,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
     const newId = `e2e-new-pause-${Date.now()}`;
 
     try {
-      await clearActiveExperiments(api); // start from a clean premium slot
+      await clearActiveExperiments(api); // start from a clean premium classification
       const b = await createExperimentApi(api, premiumClassificationBlocker(blockerId));
       expect(b.ok(), `create blocker: ${b.status()}`).toBeTruthy();
       await page.reload();
@@ -733,12 +783,19 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       await dialog.getByRole('button', { name: /Pause|Confirm/i }).click();
 
       // Create proceeds; blocker is paused (data preserved, not terminal).
-      await expect(page.locator(`text=${newId}`).first()).toBeVisible({ timeout: 20_000 });
+      //
+      // The row locator, not `text=${newId}`: the conflict panel's own '"<id>" can't start' line matches
+      // the bare text, so that passed before the client-side retry (pause -> list -> create) had created
+      // anything, and the Complete below then answered 404 for an experiment that did not exist yet. The
+      // new experiment stayed active, and premium refused the Resume as a second live experiment.
+      await expect(page.locator(`tr:has-text("${newId}")`).first()).toBeVisible({ timeout: 30_000 });
       expect((await waitForExperimentStatus(api, blockerId, 'paused'))?.status, 'blocker paused').toBe('paused');
+      expect((await waitForExperimentStatus(api, newId, 'active', 30_000))?.status, 'the new experiment activated').toBe('active');
 
       // Later: Resume the paused blocker → back to active with its data intact. (Complete the
       // conflicting one first so premium is free for the resume.)
-      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(newId)}/status`, { data: { status: 'completed' } });
+      const freed = await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(newId)}/status`), { data: { status: 'completed' } });
+      expect(freed.ok(), `complete the new experiment: ${freed.status()} ${await freed.text()}`).toBeTruthy();
       await api.get(EXPERIMENTS_API); // best-effort: let the pause settle before the UI reads it
       await page.reload();
       await openAdminExperiments(page);
@@ -757,7 +814,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       expect((await waitForExperimentStatus(api, blockerId, 'active'))?.status, 'blocker resumed to active').toBe('active');
     } finally {
       for (const id of [blockerId, newId]) {
-        await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } }).catch(() => {});
+        await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } }).catch(() => {});
       }
       await api.dispose();
     }
@@ -776,24 +833,24 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
     const ranId = `e2e-del-ran-${Date.now()}`;
 
     try {
-      await clearActiveExperiments(api); // start from a clean premium slot
+      await clearActiveExperiments(api); // start from a clean premium classification
       // (a) A never-started DRAFT → hard delete: the row is gone and the id is reusable.
       const d = await createExperimentApi(api, { ...premiumBlocker(draftId), status: 'draft' });
       expect(d.ok(), `create draft: ${d.status()} ${await d.text()}`).toBeTruthy();
-      const delDraft = await api.delete(`${EXPERIMENTS_API}/${encodeURIComponent(draftId)}`);
+      const delDraft = await api.delete(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(draftId)}`));
       expect(delDraft.ok(), `DELETE draft: ${delDraft.status()}`).toBeTruthy();
       expect(await getExperimentApi(api, draftId), 'draft is hard-gone from the list').toBeFalsy();
       // Hard-gone ⇒ the id is free to reuse (a soft tombstone would remain terminal under the same id).
       const reuse = await createExperimentApi(api, { ...premiumBlocker(draftId), status: 'draft' });
       expect(reuse.ok(), 'the hard-deleted id is reusable').toBeTruthy();
-      await api.delete(`${EXPERIMENTS_API}/${encodeURIComponent(draftId)}`).catch(() => {});
+      await api.delete(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(draftId)}`)).catch(() => {});
 
       // (b) A test that RAN (was active) → soft-delete tombstone: hidden from the default list,
       // but NOT a hard remove — the record survives so historical exchanges keep their variant
       // labels in analytics. The DELETE response reports the mode (soft) and the freed classification.
       const r = await createExperimentApi(api, premiumBlocker(ranId));
       expect(r.ok(), `create ran experiment: ${r.status()}`).toBeTruthy();
-      const delRan = await api.delete(`${EXPERIMENTS_API}/${encodeURIComponent(ranId)}`);
+      const delRan = await api.delete(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(ranId)}`));
       expect(delRan.ok(), `DELETE ran experiment: ${delRan.status()}`).toBeTruthy();
       const delBody = await delRan.json().catch(() => ({} as Record<string, unknown>));
       // Soft-delete signal (server-side hard/soft choice) + the classification is freed for auto-retry.
@@ -808,8 +865,8 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       ).toBeTruthy();
     } finally {
       for (const id of [draftId, ranId]) {
-        await api.delete(`${EXPERIMENTS_API}/${encodeURIComponent(id)}`).catch(() => {});
-        await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } }).catch(() => {});
+        await api.delete(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}`)).catch(() => {});
+        await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } }).catch(() => {});
       }
       await api.dispose();
     }
@@ -860,7 +917,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       expect(rec?.decision?.outcome, 'recorded decision is "no_decision"').toBe('no_decision');
       expect(rec?.decision?.by, 'the deciding admin (actor) is recorded').toBeTruthy();
     } finally {
-      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } }).catch(() => {});
+      await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } }).catch(() => {});
       await api.dispose();
     }
   });
@@ -920,7 +977,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       expect('powered' in rec.primary, 'primary block reports whether the test is powered (§4.2-D)').toBeTruthy();
       expect(['low', 'medium', 'high']).toContain(rec.confidence);
     } finally {
-      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } }).catch(() => {});
+      await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } }).catch(() => {});
       await api.dispose();
     }
   });
@@ -949,7 +1006,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       // Record the operator's decision on close — explicitly "no_decision" (may DIFFER from the
       // computed verdict). The picker default (§3.2.1) is exercised by E5; here we drive the API to
       // pin a known chosen value for the recommended-vs-chosen comparison.
-      const done = await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(id)}/status`, {
+      const done = await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), {
         data: { status: 'completed', decision: { outcome: 'no_decision', note: 'e2e recommended-vs-chosen' } },
       });
       expect(done.ok(), `complete with decision: ${done.status()}`).toBeTruthy();
@@ -975,7 +1032,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       ).toBeTruthy();
       if (rvc?.chosen) expect(rvc.chosen).toBe('no_decision');
     } finally {
-      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } }).catch(() => {});
+      await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } }).catch(() => {});
       await api.dispose();
     }
   });
@@ -1012,7 +1069,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
         experimentType: 'intent',
         tiers: ['premium'],
         variants: [
-          { variantId: 'control', modelKey: 'haiku', weight: 50 },
+          { variantId: 'control', weight: 50 },
           { variantId: 'treatment', modelKey: 'sonnet', weight: 50 },
         ],
         objective: { metric: 'quality', target: 8, statement: 'E8: intent scoping.' },
@@ -1025,22 +1082,22 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
         experimentId: okId,
         status: 'active',
         experimentType: 'intent',
-        intent: 'general_qa',
+        intent: 'general',
         tiers: ['premium'],
         variants: [
-          { variantId: 'control', modelKey: 'haiku', weight: 50 },
+          { variantId: 'control', weight: 50 },
           { variantId: 'treatment', modelKey: 'sonnet', weight: 50 },
         ],
-        objective: { metric: 'quality', target: 8, statement: 'E8: decide the general_qa model.' },
+        objective: { metric: 'quality', target: 8, statement: 'E8: decide the general model.' },
       });
       expect(created.ok(), `create intent experiment: ${created.status()} ${await created.text()}`).toBeTruthy();
 
       const rec = await getExperimentApi(api, okId);
       expect(rec?.experimentType, 'the stored type is intent').toBe('intent');
-      expect(rec?.intent, 'the stored row keeps the intent it scopes to').toBe('general_qa');
+      expect(rec?.intent, 'the stored row keeps the intent it scopes to').toBe('general');
     } finally {
       for (const id of [okId, badId]) {
-        await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } }).catch(() => {});
+        await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } }).catch(() => {});
       }
       await api.dispose();
     }
@@ -1058,6 +1115,8 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
     try {
       await clearActiveExperiments(api);
 
+      // A profile is named for its ASSISTANT, never its classification, so it is read from the assignment record.
+      const liveAssistant = liveAssistantFor('premium');
       // Both variants name the SAME profile at (potentially) different versions - the realistic shape:
       // "does the version I just built beat the one that is live?". `version` omitted means "active".
       const created = await createExperimentApi(api, {
@@ -1066,8 +1125,8 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
         experimentType: 'profile',
         tiers: ['premium'],
         variants: [
-          { variantId: 'control', profileRef: { profileName: 'premium' }, weight: 50, displayName: 'Live' },
-          { variantId: 'treatment', profileRef: { profileName: 'premium' }, weight: 50, displayName: 'Candidate' },
+          { variantId: 'control', profileRef: { profileName: liveAssistant }, weight: 50 },
+          { variantId: 'treatment', profileRef: { profileName: liveAssistant }, weight: 50 },
         ],
         objective: { metric: 'quality', target: 8, statement: 'E9: decide the premium profile version.' },
       });
@@ -1079,7 +1138,10 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
       const rec = await getExperimentApi(api, id);
       expect(rec?.experimentType, 'the stored type is profile').toBe('profile');
       const refs = (rec?.variants ?? []).map((v: any) => v.profileRef?.profileName);
-      expect(refs, 'both variants kept their profileRef through the write').toEqual(['premium', 'premium']);
+      // The control is the live assistant's version; the candidate is held in the alt's history, so its
+      // reference may name the alt rather than the live assistant. Both must survive the write.
+      expect(refs[0], 'the control kept its profileRef through the write').toBe(liveAssistant);
+      expect(refs[1], 'the candidate kept a profileRef through the write').toBeTruthy();
 
       // A live premium turn must still be SERVED while a profile experiment is active. The assertion
       // is model attribution from the turn's own metadata, not the prose: a reply that reads fine
@@ -1097,7 +1159,7 @@ suite('Experiments — objective, lifecycle conflict-resolution & decision loop 
         'the turn carried no model attribution, so this cannot show a profile-resolved variant ran',
       ).not.toBe('');
     } finally {
-      await api.post(`${EXPERIMENTS_API}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } }).catch(() => {});
+      await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } }).catch(() => {});
       await api.dispose();
     }
   });

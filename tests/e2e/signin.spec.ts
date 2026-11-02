@@ -1,6 +1,6 @@
-import { test, expect } from '@playwright/test';
+import { test, expect } from './helpers/fixtures';
 import { navigateToApp, signIn, isConnected } from './helpers/agent-helpers';
-import { getBasicUser, getStandardUser, getPremiumUser, missingUserReason } from './helpers/test-credentials';
+import { getBasicUser, getStandardUser, getAdminUser, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors, allowConsoleError } from './helpers/turn-guards';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
@@ -92,14 +92,15 @@ test.describe.serial('Sign In Flow', () => {
     console.log(`Signed in as standard user: ${user.email}`);
   });
 
-  test('should sign in premium user and see admin button', async ({ page }) => {
-    const user = await getPremiumUser();
-    test.skip(!user.password, missingUserReason('premiumUser'));
+  test('an administrator signs in and sees the link to the admin console', async ({ page }) => {
+    // THE ADMINISTRATOR IS testAdmin (`admins` + `premium`). The premium test user is provisioned into
+    // `premium` only (`provision-test-users.mjs`), so it is not an administrator and sees no link.
+    const user = await getAdminUser();
+    test.skip(!user.password, missingUserReason('testAdmin'));
 
     await signIn(page, user.email, user.password);
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
 
-    // The premium demo user is in the `admins` group (seed-demo), so it IS an admin.
     // Post the D split the chat app has no embedded admin console; an admin's only
     // affordance is the link-OUT to the separate console (`.header-admin-link`, shown
     // when VITE_ADMIN_APP_URL is set and user.isAdmin). So an admin sees exactly this
@@ -108,8 +109,8 @@ test.describe.serial('Sign In Flow', () => {
     const adminVisible = await adminLink.isVisible({ timeout: 5000 }).catch(() => false);
     expect(adminVisible).toBe(true);
 
-    console.log(`\n--- signin-premium ---`);
-    console.log(`Signed in as premium (admin) user: ${user.email}; admin link-out present, as expected`);
+    console.log(`\n--- signin-admin ---`);
+    console.log(`Signed in as the administrator: ${user.email}; admin link-out present, as expected`);
   });
 
   test('should sign out successfully', async ({ page }) => {

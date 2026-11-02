@@ -4,7 +4,7 @@
  * WHY ANY OF THIS EXISTS. `emitEmfMetric` wrote `Metrics: [{name, unit}]` where the EMF schema
  * requires `{Name, Unit}`. CloudWatch discards a malformed document SILENTLY - the log line is still
  * written, so every log looks healthy - and the result was that no metric in any AgentEchelon
- * namespace had ever materialised. `AgentEchelon/Drift` returned zero from `list-metrics` after
+ * namespace had ever materialized. `AgentEchelon/Drift` returned zero from `list-metrics` after
  * months of drift detection running on every turn, and an alarm over one of those metrics would have
  * sat in INSUFFICIENT_DATA forever instead of firing.
  *

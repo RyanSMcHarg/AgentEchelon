@@ -5,7 +5,7 @@
  *  1. A CI-safe documentation/inventory anchor (always runs) pinning the
  *     Phase-0 marker-survival finding.
  *  2. Behavioral tests that drive a REAL duel against a live battle-enabled
- *     deploy (AgentEchelonBattle stack: alt-bot slot pool + orchestrator +
+ *     deploy (the classification's alt, the AgentEchelonBattle orchestrator +
  *     channel-battle API). These hard-assert the duel UX and are SKIPPED unless
  *     BATTLE_E2E=1 — plain `npm test` (no battle deploy guaranteed, real model
  *     duels are slow) never runs them. Each runs the full admin-arm → enable →
@@ -20,13 +20,16 @@
  * timeout and runs only under BATTLE_E2E, never in the default unit suite).
  */
 
-import { test, expect, type Page, type BrowserContext } from '@playwright/test';
+import { test, expect, declareWait } from './helpers/fixtures';
+import { type Page, type BrowserContext } from '@playwright/test';
 import {
   requireBattleE2E,
   BATTLE_E2E_ENABLED,
   ensureBattleExperimentExists,
   activateBattleExperiment,
+  altBotArnFor,
   newBattleChannel,
+  newBattleChannelWithId,
   fireBattle,
   battleExpId,
   battleImageExpId,
@@ -37,12 +40,14 @@ import {
 import { getSecondPremiumUser, getStandardUser } from './helpers/test-credentials';
 import {
   waitForActiveBattle,
+  waitForNoActiveBattle,
   waitForWaitingSide,
   holdsWaiting,
-  waitForResume,
-  waitForSideTerminal,
+  waitForSideMovedOn,
+  messageCreatedAtMs,
+  channelArnFor,
   sendTargetedAs,
-  userArnFor,
+  personArnForRecordedId,
   humanMembers,
   messageExistsForSender,
   publicMessages,
@@ -52,14 +57,82 @@ import {
   holdsPointer,
   waitForPointerCleared,
   waitForSideState,
+  answerEverySide,
+  messageIdSentBy,
 } from './helpers/battle-state-backend';
+import { channelTasks, readTask, resolveTaskTable, historyOf, pollFor } from './helpers/task-backend';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
-import { signIn, createConversation } from './helpers/agent-helpers';
+import { signIn, createConversation, sendAndWaitForResponse, idTokenOf } from './helpers/agent-helpers';
 import { ChannelWireRecorder } from './helpers/channel-wire';
 // From the config, NOT from e2e/battle.setup.ts: Playwright forbids one test file
 // importing another (battle.setup.ts is a test file); the config is the shared home.
 import { BATTLE_AUTH_FILE, BATTLE_SECOND_MEMBER_AUTH_FILE } from '../playwright.config';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { personArnFromIdToken } from './helpers/person';
+import { assistantNameIn, assistantsIn } from './helpers/third-party-view';
+import { ADMIN_API_URL, adminUrl } from './helpers/api-urls';
+
+/**
+ * THE PROMPT EVERY DUEL IN THIS FILE FIRES, and it has to be a question this assistant is actually
+ * for.
+ *
+ * It used to be "Tabs or spaces for indentation?", which is nobody's use case here. The premium
+ * assistant is Stratum Technologies' leadership assistant - financials, customer accounts,
+ * competitive intelligence - so both sides correctly declined it, and the evaluator then scored both
+ * refusals `irrelevant`. That verdict is not wrong about the answer: a decline IS irrelevant to the
+ * question asked. It was wrong about what was being measured. Every duel this file ran fed the
+ * evaluation corpus a pair of refusals, so the quality columns on the Experiments and Effectiveness
+ * surfaces were scoring how politely two models say no.
+ *
+ * WHY THIS QUESTION. Three properties, and dropping any one brings the defect back:
+ *
+ *  1. IT IS IN THE TAXONOMY. `competitive_intel` in `backend/demo/intent-packs.ts` is exactly "why do
+ *     we lose deals to Y", and the brief in `demo/context/premium/competitive-intel.json` records
+ *     Zapier at a 38% win rate with three loss reasons. The assistant can answer it from context, so
+ *     neither side has to decline and neither has to invent.
+ *  2. IT IS SINGLE-TURN. That intent carries `delivery: 'PLACEHOLDER_UPDATE'`, not
+ *     `TASK_MULTI_STEP`, so round 2 stays completion-gated on the round-1 pair the way the tests that
+ *     fire this constant need.
+ *
+ *     THIS IS A TEST TIMING CHOICE, NOT A PRODUCT LIMIT, and the earlier wording here said the
+ *     opposite ("a task-shaped prompt would change the flow, not just the text"), which is wrong and
+ *     was worth correcting because it reads as a reason not to test the task path at all. A
+ *     task-shaped duel is fully supported: ADR-026 dispatches it with everything a placeholder-shaped
+ *     one gets, and `backend/test/task-shaped-battle-parity.test.ts` is the ratchet that keeps both
+ *     dispatch paths at parity. What a task-shaped prompt changes is WHEN round 2 can be observed -
+ *     a task chain with legs left parks on the person instead of completing - so it is the right
+ *     shape where a test needs a side WAITING (B-E7, B-E9) and the wrong shape where a test needs
+ *     round 1 to resolve on its own. See `TASK_BATTLE_PROMPT` below for the other default.
+ *  3. IT HAS A JUDGMENT IN IT. A duel compares two models, so a prompt with one right answer is
+ *     wasted on it: asked for a single figure, both sides return the same number and every duel is a
+ *     draw. The brief lists three loss reasons and this asks which one dominates, which is a real
+ *     question with defensible different answers - the thing a duel is for.
+ *
+ * Kept as ONE constant because it is fired from nine places in this file. It was nine string
+ * literals, and that is why a prompt nobody would ask survived in all of them.
+ */
+const BATTLE_PROMPT = 'Why do we lose deals to Zapier? One short paragraph, and name the single biggest reason.';
+
+/**
+ * THE TASK-SHAPED DEFAULT, for the tests that need a side to PARK ON THE USER.
+ *
+ * B-E7 (only the duel's owner may answer a waiting side) and B-E9 (only the owner may end a duel)
+ * both need a duel that is genuinely in flight and blocked on a person. A single-turn duel cannot
+ * give them that: it races to completion, and "the side is waiting" becomes indistinguishable from
+ * "the side has not answered yet". A task chain with legs left parks on the person by construction
+ * (ADR-026, `reason: 'task-step'`), which is the state those tests are about.
+ *
+ * Same taxonomy rule as `BATTLE_PROMPT`, for the same reason: this is `report_generation` in the
+ * premium pack (`backend/demo/intent-packs.ts`), which reaches financials, named accounts and the
+ * competitive brief - so both sides can actually build it, and neither has to decline. It is also
+ * one of the three headline prompts the demo's own welcome message advertises, so a duel fired here
+ * exercises what the deployment tells people to ask for.
+ *
+ * Deliberately under-specified. A report request that already names its audience, period and
+ * sections has nothing left to ask about, and a chain with nothing to ask does not park - which is
+ * exactly the condition under which B-E7 and B-E9 assert nothing.
+ */
+const TASK_BATTLE_PROMPT = 'Compile a one-page report on our Q2 ARR performance for the leadership team.';
 
 /**
  * The input guardrail's block reply, as a duel side would post it.
@@ -79,7 +152,7 @@ guardConsoleErrors();
 
 // Analytics + experiments read endpoints for the human-pick assertions (B-E4, B-E6). Same env the
 // experiments suite uses; the signed POST mirrors the admin app's IAM-enforced analytics read.
-const ANALYTICS_API = process.env.VITE_ANALYTICS_API_URL || '';
+const ANALYTICS_API = ADMIN_API_URL ? adminUrl('analytics', '/') : '';
 
 // Image generation-out is the slowest + flakiest battle path (real dual image gen + the deploy-dependent
 // image-model create form). Run it ONLY when actually testing image generation; a normal battle run is
@@ -129,12 +202,13 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     const ctx = await browser.newContext({ storageState: BATTLE_AUTH_FILE });
     const page = await ctx.newPage();
     try {
-      await ensureBattleExperimentExists(page, { slot: 'slot-0' }); // text
+      // THE PREMIUM ALT, checked against its assignment record. These duels run in a PREMIUM
+      // conversation and an alt belongs to one classification. See `challengerFor`.
+      await ensureBattleExperimentExists(page, {}); // text; defaults to the premium alt
       // The image experiment (form-based create) is set up ONLY when the image path is opted in — it is
       // the slow/flaky part, and text-only runs never touch it (the generation-out test self-skips too).
       if (RUN_IMAGE_BATTLE) {
         await ensureBattleExperimentExists(page, {
-          slot: 'slot-0',
           expId: battleImageExpId(),
           image: true,
         });
@@ -161,13 +235,14 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     wire.attach(page);
 
     await activateBattleExperiment(page, battleExpId());
-    await newBattleChannel(page, 'E2E caching battle');
+    await newBattleChannel(page, 'E2E competitive-intel battle');
 
     // A single-turn opinion prompt (not a TASK_*) so round-2 is completion-
     // gated on the round-1 pair, which resolves deterministically here.
+    const cardsBefore = await scorecardCount(page);
     const count = await fireBattle(
       page,
-      '/battle Tabs or spaces for indentation? Answer in one short paragraph with a clear pick.',
+      `/battle ${BATTLE_PROMPT}`,
     );
     expect(count).toBeGreaterThanOrEqual(2);
 
@@ -263,11 +338,84 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     // reply UPDATE (the Phase-0 finding), so reloaded (marker-less) history does
     // NOT reconstruct the scorecard. We therefore assert the in-session pick,
     // not a post-reload re-render (which the product intentionally doesn't do).
-    const card = page.locator('.battle-scorecard').last();
+    const card = await newScorecard(page, cardsBefore);
     await expect(card).toBeVisible();
     const pickB = card.locator('[data-pick="B"]');
     await pickB.click();
     await expect(pickB).toHaveAttribute('aria-pressed', 'true', { timeout: 10_000 });
+  });
+
+  // USER APPROVAL, END TO END. The duel's owner rates one side's reply up and the other's down through the
+  // reply's own thumbs, and each vote reaches the approval_rate of the variant that served that reply, read
+  // through the same experiment_results query the Experiments and Battles views read (includeBattle). The
+  // vote travels: the reply's Metadata attribution -> handleFeedback -> UserFeedback -> the experiment
+  // feedback join (`feedbackColumnsFor`) onto the variant's Aurora row.
+  test('user approval: a thumbs vote on each side reaches that variant\'s approval_rate', async ({ page }) => {
+    test.setTimeout(9 * 60_000);
+    const wire = new ChannelWireRecorder();
+    wire.attach(page);
+    const experimentId = battleExpId();
+    await activateBattleExperiment(page, experimentId);
+    await newBattleChannel(page, 'E2E battle user approval');
+    const idToken = await idTokenOf(page);
+    // What the window already holds for this experiment, so the assertion is on THIS test's two votes.
+    const before = await readApproval(idToken, experimentId);
+
+    await fireBattle(page, `/battle ${BATTLE_PROMPT}`);
+
+    // Each side's round-1 reply, by the attribution its own Metadata carries.
+    const replyOf = (variant: string): string | undefined => wire.all
+      .filter((m) => m.isBot && m.metadata?.experimentId === experimentId && m.metadata?.variantId === variant
+        && String(m.metadata?.battleRound ?? '1') === '1')
+      .map((m) => m.messageId)
+      .pop();
+    await expect.poll(() => [replyOf('control'), replyOf('treatment')].every(Boolean), { timeout: 120_000 }).toBe(true);
+    const replies = { control: replyOf('control')!, treatment: replyOf('treatment')! };
+
+    // The vote, through the reply's own button, and the request it sends.
+    const vote = async (variant: 'control' | 'treatment', feedback: 'up' | 'down') => {
+      const messageId = replies[variant];
+      const button = page.locator(`[data-message-id="${messageId}"] .message-feedback-btn`).nth(feedback === 'up' ? 0 : 1);
+      await expect(button, `the ${variant} reply shows its thumbs`).toBeVisible({ timeout: 30_000 });
+      const [resp] = await Promise.all([
+        page.waitForResponse((r) => r.request().method() === 'POST' && (r.request().postData() ?? '').includes(messageId), { timeout: 20_000 }),
+        button.click(),
+      ]);
+      expect(resp.ok(), `the ${variant} vote was refused: ${resp.status()}`).toBeTruthy();
+      expect(JSON.parse(resp.request().postData() || '{}'), 'the vote carries the variant that served the reply')
+        .toMatchObject({ messageId, feedback, experimentId, variantId: variant, assignmentMode: 'battle' });
+      await expect(button).toHaveClass(/active/, { timeout: 10_000 });
+    };
+    await vote('control', 'up');
+    await vote('treatment', 'down');
+
+    // Each vote is recorded against its own variant, read from the vote store under the same predicate the rate uses.
+    const drill = await signedAnalyticsPost(ANALYTICS_API, idToken, {
+      queryType: 'experiment_feedback', experimentId, includeBattle: 'true', ...todayRange(),
+    });
+    const recorded = ((drill?.data ?? []) as any[]).filter((r) => r.message_id === replies.control || r.message_id === replies.treatment);
+    expect(recorded.map((r) => `${r.variant_id}:${r.feedback}:${r.assignment_mode}`).sort())
+      .toEqual(['control:up:battle', 'treatment:down:battle']);
+
+    // The variant rows the votes attach to are the duel's exchanges, which reach Aurora through archival. The read is
+    // of an archive projection with no event the runner can subscribe to, so it is a declared wait read by `pollFor`.
+    declareWait('the duel replies archiving into the experiment rows', Date.now() + 3 * 60_000);
+    const after = await pollFor(
+      () => readApproval(idToken, experimentId),
+      (a) => a.control.up >= before.control.up + 1 && a.treatment.down >= before.treatment.down + 1,
+      { timeoutMs: 3 * 60_000, intervalMs: 10_000 },
+    );
+    expect(after.control.up - before.control.up, 'the control reply\'s thumbs up counts for control').toBe(1);
+    expect(after.control.down - before.control.down, 'and nothing else moved on control').toBe(0);
+    expect(after.treatment.down - before.treatment.down, 'the treatment reply\'s thumbs down counts for treatment').toBe(1);
+    expect(after.treatment.up - before.treatment.up, 'and nothing else moved on treatment').toBe(0);
+    // approval_rate is thumbs_up over the votes on each row that carries them.
+    for (const r of after.rows) {
+      if (!Number(r.feedback_count)) continue;
+      expect(Number(r.approval_rate)).toBeCloseTo(Math.round((Number(r.thumbs_up) / Number(r.feedback_count)) * 1000) / 10, 1);
+    }
+    expect(after.control.rate, 'control\'s approval includes the up vote').toBeGreaterThan(0);
+    expect(after.treatment.rate, 'treatment\'s approval includes the down vote').toBeLessThan(100);
   });
 
   test('round-2: a "Round 2 — rebuttals" divider renders after both round-1 complete', async ({
@@ -281,9 +429,13 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     wire.attach(page);
 
     await activateBattleExperiment(page, battleExpId());
-    await newBattleChannel(page, 'E2E round-2 battle');
+    const channelId = await newBattleChannelWithId(page, 'E2E round-2 battle');
 
-    await fireBattle(page, '/battle Is REST or GraphQL the better default for a new internal API? One paragraph.');
+    // Its own prompt rather than `BATTLE_PROMPT`, so a run's transcript shows this duel apart from
+    // the others - but the same two properties the constant documents: `competitive_intel` in the
+    // premium pack, so neither side declines, and a judgment call rather than a lookup, so the two
+    // sides have something to disagree about. Single-turn, which is what the paragraph below depends on.
+    await fireBattle(page, '/battle Zapier or Make - which is the bigger threat to our enterprise pipeline? One paragraph.');
     // Round 2 fires once both round-1 replies are terminal. For a single-turn
     // (non-TASK_*) prompt this is deterministic; allow a generous budget for
     // the orchestrator fan-out + the second generation.
@@ -308,7 +460,12 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
 
     const BATTLE_ROUND = /<!--battle:[^>]*round=(\d)/;
     const idsPerAssistantRound = new Map<string, Set<string>>();
-    for (const m of wire.all.filter((x) => x.isBot)) {
+    // THIS CONVERSATION'S FRAMES ONLY. The session receives every channel the person is in, and the
+    // previous test's duel can still be landing its round 2 while this one runs: on dev 2026-10-28 the
+    // prior test's two rebuttals (01149e3f29ba, 202d03ab3b93, in its own conversation) arrived 25 s
+    // into this test and were counted here as duplicates of this duel's. Its own conversation held
+    // exactly one reply per assistant per round.
+    for (const m of wire.botMessagesFor(channelArnFor(channelId))) {
       const matched = BATTLE_ROUND.exec(m.content);
       if (!matched) continue; // an ordinary bot message, or an UPDATE whose marker is already stripped
       const key = `${m.senderArn.split('/').pop()}#round${matched[1]}`;
@@ -351,7 +508,7 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     page,
   }) => {
     // Multi-turn = the conversation holds MORE THAN ONE battle. Each /battle is
-    // its own duel (distinct battleId), reusing the same channel + alt-slot
+    // its own duel (distinct battleId), reusing the same channel + alt
     // member. This guards that a second battle turn works after the first (no
     // stale battle-state / sentinel reuse across turns). Two duels → budget high.
     //
@@ -361,21 +518,93 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     test.setTimeout(14 * 60_000);
 
     await activateBattleExperiment(page, battleExpId());
-    await newBattleChannel(page, 'E2E multi-turn battle');
+    const channelId = await newBattleChannelWithId(page, 'E2E multi-turn battle');
 
-    await fireBattle(page, '/battle Tabs or spaces for indentation? One short paragraph with a clear pick.');
+    await fireBattle(page, `/battle ${BATTLE_PROMPT}`);
     // Exactly one duel so far → one scorecard.
     await expect(page.locator('.battle-scorecard')).toHaveCount(1, { timeout: 10_000 });
 
     // A SECOND battle turn produces a fresh duel → a SECOND scorecard. (Can't
     // reuse fireBattle's readiness wait here — duel-1's bubbles + scorecard
     // already satisfy it; the new scorecard is the unambiguous second-duel signal.)
+    // A DIFFERENT question from the first duel's, on purpose. This test is about a SECOND duel being
+    // fresh rather than stale state replayed, and two duels carrying the same text would make a
+    // transcript in which the stale outcome is the hard one to spot. Single-turn (`account_status`),
+    // so neither duel parks on the user while the other is being started.
     await page.locator('.message-textarea').fill(
-      '/battle Monorepo or polyrepo for a five-team org? One short paragraph with a clear pick.',
+      '/battle Greenfield Energy renews in November with usage down 30%. Renegotiate or hold the price? '
+      + 'One short paragraph with a clear pick.',
       { timeout: 30_000 },
     );
     await page.keyboard.press('Enter');
-    await expect(page.locator('.battle-scorecard')).toHaveCount(2, { timeout: 260_000 });
+
+    // ── A DUEL IS NOT OVER AT THE SCORECARD ─────────────────────────────────
+    //
+    // This expected a second scorecard straight away and timed out on one. The flow was right to
+    // refuse: DESIGN-BATTLE sequences a duel as "round 2, the scorecard, the pick", WAITING_FOR_USER
+    // is explicitly non-terminal, and a second /battle on top of a live duel is answered
+    // "A battle is already running in this conversation. Send /battle end to end it and start this
+    // one instead." 2a-i designs that refusal in detail, because a duel any member could restart
+    // would leave the assistants taking competing instructions from several people at once.
+    //
+    // So the duel is ENDED first, the way the product tells its initiator to. That is the multi-turn
+    // guarantee this test is actually for - no stale battle-state or sentinel reuse across turns -
+    // and it was never the claim that a duel can be interrupted by starting another.
+    //
+    // ── WHY THE REFUSAL IS NOT ASSERTED, AND MUST NOT BE (2026-09-21) ───────────────────────────
+    //
+    // It was, and the assertion was unsound. Seeing that refusal requires duel 1 to still be LIVE at
+    // the moment the second /battle lands, and nothing here establishes that: a duel that has
+    // finished its rounds legitimately stops being live, and `activateBattleExperiment` - called by
+    // this very test - COMPLETES other active experiments to free the classification (decision-loop
+    // §3.2.1), which can retire the experiment this duel depends on while the test is still running.
+    // The harness has a "recorded experiment id was terminal; re-minted once per run" recovery for
+    // exactly that, which is how long it has been true.
+    //
+    // So the test failed or passed on timing - it failed in isolation and passed inside a full run,
+    // at DIFFERENT lines - while the product did the right thing either way. B-E3 covers the refusal
+    // directly, with a duel it has just started and therefore knows is live; asserting it a second
+    // time here bought nothing and cost a flake.
+    //
+    // The second /battle is still SENT, because sending it is what makes the end-then-restart
+    // sequence below realistic. Its outcome is simply not asserted: whether it is refused (duel
+    // still live) or accepted (duel already over) is a race this test has no business pinning.
+    await sendAndWaitForResponse(page, '/battle end', 120_000);
+
+    // ENDING IS NOT INSTANT, AND THE RESTART USED TO RACE IT. `/battle end` replies as soon as the
+    // command is accepted; releasing the channel pointer, abandoning the sides and clearing the
+    // waiting markers settle after that. Firing the next `/battle` on the strength of the reply got
+    // it refused for a duel that was still live, nothing further rendered, and the failure read as
+    // "a second duel never started" - which is what this test is about, so it looked like a real
+    // finding rather than a race.
+    expect(
+      await waitForNoActiveBattle(channelId, 120_000),
+      'ending a duel releases the channel pointer, which is what lets the next /battle start',
+    ).toBe(true);
+
+    await fireBattle(
+      page,
+      '/battle Greenfield Energy renews in November with usage down 30%. Renegotiate or hold the price? '
+      + 'One short paragraph with a clear pick.',
+    );
+
+    // AT LEAST TWO, NOT EXACTLY TWO. The guarantee is that a repeated /battle produces a FRESH duel
+    // rather than reusing stale battle state - so more duels than expected is this test's claim
+    // holding, not failing. Pinning the exact count re-imports the timing this test just stopped
+    // depending on: whether the un-asserted second /battle above opened a duel of its own decides
+    // whether the total is two or three, and neither answer says anything about staleness.
+    await expect
+      .poll(() => page.locator('.battle-scorecard').count(), { timeout: 260_000 })
+      .toBeGreaterThanOrEqual(2);
+
+    // AND THEY ARE DIFFERENT DUELS. The count alone would be satisfied by one scorecard rendered
+    // twice; distinct battle ids are what says the second /battle started something new, which is
+    // the sentinel-reuse defect this test is named for.
+    const battleIds = await page.locator('.battle-scorecard').evaluateAll((els) =>
+      els.map((el) => el.getAttribute('data-battle-id') || el.id || ''));
+    expect(new Set(battleIds.filter(Boolean)).size,
+      `each /battle should open its own duel; saw ids ${JSON.stringify(battleIds)}`)
+      .toBeGreaterThanOrEqual(2);
   });
 
   test('winner pick is RECORDED server-side (BattleOutcome persists), not just UI state', async ({
@@ -389,9 +618,10 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     await activateBattleExperiment(page, battleExpId());
     await newBattleChannel(page, 'E2E battle outcome recorded');
 
-    await fireBattle(page, '/battle Tabs or spaces for indentation? One short paragraph with a clear pick.');
+    const cardsBefore = await scorecardCount(page);
+    await fireBattle(page, `/battle ${BATTLE_PROMPT}`);
 
-    const card = page.locator('.battle-scorecard').last();
+    const card = await newScorecard(page, cardsBefore);
     await expect(card).toBeVisible();
     const pickB = card.locator('[data-pick="B"]');
 
@@ -420,7 +650,7 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     expect(battleId, 'the recorded outcome must name its battle').toBeTruthy();
 
     const outcomeUrl = new URL(outcomeResp.url());
-    const idTokenForRead = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idTokenForRead = await idTokenOf(page);
     const readBack = await page.request.get(
       `${outcomeUrl.origin}${outcomeUrl.pathname}?battleId=${encodeURIComponent(battleId)}`,
       { headers: { Authorization: `Bearer ${idTokenForRead}` } },
@@ -441,19 +671,14 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     // but this test does no admin round-trip, so nothing has navigated to the chat app yet - land on it
     // first (the removed per-test signInAdmin used to do this).
     await page.goto('/');
-    await page.locator('button.app-new-conversation-btn').click();
-    await page.waitForSelector('.ncm-modal', { timeout: 8000 });
-    const premiumCard = page.locator('.ncm-class-card:has-text("Premium")').first();
-    if (await premiumCard.isVisible({ timeout: 3000 }).catch(() => false)) {
-      await premiumCard.click();
-    } else {
-      await page.locator('.ncm-class-card').first().click();
-    }
-    await page.locator('button:has-text("Create Conversation")').click();
-    await page.waitForSelector('.conversation-header', { timeout: 20_000 });
+    await createConversation(page, 'E2E Battle', 'Premium');
     await page.locator('.message-textarea').waitFor({ state: 'visible', timeout: 15_000 });
 
-    await page.locator('.message-textarea').fill('/battle What is the best caching strategy?');
+    // The shared constant, because the prompt never reaches a model here: the not-enabled gate answers
+    // the command before any fan-out. It is still a real Stratum question rather than a placeholder,
+    // for the reason `BATTLE_PROMPT` records - a `/battle` that IS accepted by a future change to this
+    // gate must not start feeding the evaluation corpus a pair of refusals.
+    await page.locator('.message-textarea').fill(`/battle ${BATTLE_PROMPT}`);
     await page.keyboard.press('Enter');
 
     // A normal single reply with the not-enabled hint; NO battle fan-out.
@@ -471,16 +696,21 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     // Auth comes from the shared storageState; this test does no admin round-trip, so navigate to the
     // chat app first (nothing else lands here).
     await page.goto('/');
-    await page.locator('button.app-new-conversation-btn').click();
-    await page.waitForSelector('.ncm-modal', { timeout: 8000 });
-    await page.locator('.ncm-class-card').first().click();
-    await page.locator('button:has-text("Create Conversation")').click();
-    await page.waitForSelector('.conversation-header', { timeout: 20_000 });
+    await createConversation(page, 'E2E Battle', 'Premium');
     await page.locator('.message-textarea').waitFor({ state: 'visible', timeout: 15_000 });
 
     const before = await page.locator('.message').count();
     // "/battle" mid-sentence must NOT trigger a battle (detection is ^\s*\/battle\b).
-    await page.locator('.message-textarea').fill('what about /battle mode — how does it work?');
+    //
+    // A REAL QUESTION WRAPPED AROUND THE TOKEN, not a question about the token. The point of this
+    // test is that the turn is answered as ORDINARY conversation, so whatever is sent here is a real
+    // turn that lands in the evaluation corpus - and "what about /battle mode" is not something this
+    // assistant is for, so it was answered with a decline and scored as one. The financial_metric
+    // question in front of the token is answerable from context, and the token still sits
+    // mid-sentence, which is the only property the detection regex cares about.
+    await page.locator('.message-textarea').fill(
+      'What is our current net revenue retention, and can I /battle that question to compare two answers?',
+    );
     await page.keyboard.press('Enter');
     await expect
       .poll(async () => page.locator('.message').count(), { timeout: 120_000 })
@@ -502,10 +732,17 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
 
     // Its own experiment with an image-gen model on BOTH variants (SPEC-BATTLE generation-out).
     await activateBattleExperiment(page, battleImageExpId());
-    await newBattleChannel(page, 'E2E image battle', battleImageExpId());
+    const channelId = await newBattleChannelWithId(page, 'E2E image battle', battleImageExpId());
 
-    const count = await fireBattle(page, '/battle Generate an image of a serene mountain lake at sunrise.');
+    const count = await fireBattle(page, '/battle Generate an oil painting of a serene mountain lake at sunrise, wide landscape framing, no people. Show me the brief before you draw it.');
     expect(count).toBeGreaterThanOrEqual(2); // two variant bubbles
+
+    // THE SIDE THAT CONFIRMS. A complete brief is drawn in its first turn (ADR-064 decision G), and this one asks to see
+    // the brief first, so each side records it, puts it to the person at `confirm` and parks (ADR-026). The person who
+    // started the duel confirms each side with a reply targeted at it, and that confirming turn runs the side's
+    // `generate` step. The image duel spec covers the complete brief drawn with no confirmation.
+    const confirmed = await answerEverySide(channelId, 'Yes, that is exactly it. Go ahead.');
+    expect(confirmed, 'both sides park on the person at the confirm step').toHaveLength(2);
 
     // Generation-out: at least one variant renders a real generated image (both is the norm; allow one
     // provider to honest-fail). Every image that DOES render must have a real source — never a broken/empty
@@ -560,9 +797,15 @@ test.describe('/battle — behavioral E2E (live, BATTLE_E2E=1)', () => {
     //
     // That deletion was correct: how many questions a side asks belongs to its INTENT's task flow, not
     // to a battle-side prompt rule (ADR-029; DESIGN-BATTLE "Per-bot generation"). This test therefore
-    // asserts today's behaviour AND names its cause, so if a future prompt reinstates clarification the
+    // asserts today's behavior AND names its cause, so if a future prompt reinstates clarification the
     // failure points at the prompt rather than at "clarification routing is gone".
-    const count = await fireBattle(page, '/battle Which one is better?');
+    // AMBIGUOUS ON PURPOSE, and Stratum-shaped on purpose. "Which one is better?" named nothing at
+    // all, so the only thing either side could say was that it does not answer questions outside
+    // Stratum - an ambiguity test whose result was a decline, which proves nothing about ambiguity.
+    // This names no accounts either, so it is just as under-specified, but it sits squarely in
+    // `account_status` and the churn-risk list gives both sides something to pick from. What is
+    // asserted is unchanged: both sides answer, and neither parks on the user.
+    const count = await fireBattle(page, '/battle Which account is more at risk?');
     expect(count).toBeGreaterThanOrEqual(2);
 
     // No side is blocked on the user, so the composer shows no waiting queue.
@@ -620,24 +863,34 @@ async function shareChannelWith(page: Page, email: string): Promise<void> {
   await page.locator('button[aria-label="Share conversation"]').click();
   await expect(page.locator('#share-email')).toBeVisible({ timeout: 5_000 });
   await page.locator('#share-email').fill(email);
-  await page.locator('.modal-content button[type="submit"]').click();
+  await page.locator('form:has(#share-email) button[type="submit"]').click();
   await expect(page.locator('.alert-success')).toBeVisible({ timeout: 30_000 });
   await page.locator('.modal-close-btn').click().catch(() => {});
   await page.locator('.modal-content').waitFor({ state: 'hidden', timeout: 5_000 }).catch(() => {});
 }
 
-/** Enable battle on a fresh premium channel AND capture its channel id (for a second member to open). */
-async function newBattleChannelWithId(page: Page, title: string): Promise<string> {
-  const createResp = page.waitForResponse(
-    (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
-    { timeout: 30_000 },
-  );
-  await newBattleChannel(page, title);
-  const body = await (await createResp).json();
-  return (body.conversation.conversationArn as string).split('/').pop()!;
+/** Type + send a /battle prompt with NO readiness wait (for the guard's back-to-back fire). */
+/** How many scorecards the page shows now. Read BEFORE firing a duel, to find that duel's own card. */
+async function scorecardCount(page: Page): Promise<number> {
+  return page.locator('.battle-scorecard').count();
 }
 
-/** Type + send a /battle prompt with NO readiness wait (for the guard's back-to-back fire). */
+/**
+ * THE DUEL'S OWN SCORECARD: the first one rendered after `before`, a count taken before the duel was fired.
+ *
+ * `.battle-scorecard').last()` re-resolved on every assertion and could name an EARLIER duel's card. Seen
+ * live 2026-10-08 in B-E4, which fires several duels in one room: the test clicked a card while the last
+ * duel's card had not rendered yet, so the pick landed on an earlier duel ("You picked Atlas" on that
+ * card), the last duel's card then appeared beneath it unpicked, and `aria-pressed` read the new card and
+ * failed. Waiting for the count to pass `before` and taking index `before` names the card this duel
+ * produced, because a later card is appended after it, never before.
+ */
+async function newScorecard(page: Page, before: number, timeout = 260_000) {
+  const all = page.locator('.battle-scorecard');
+  await expect.poll(() => all.count(), { timeout }).toBeGreaterThan(before);
+  return all.nth(before);
+}
+
 async function fireBattleNoWait(page: Page, prompt: string): Promise<void> {
   await page.locator('.message-textarea').fill(prompt, { timeout: 30_000 });
   await page.keyboard.press('Enter');
@@ -661,6 +914,34 @@ async function readBattleWins(idToken: string, experimentId: string): Promise<Re
   return wins;
 }
 
+/** The last day as the analytics API's date range: the window every read in one test shares. */
+function todayRange(): { dateRange: { start: string; end: string } } {
+  const end = new Date();
+  const start = new Date(end.getTime() - 86_400_000);
+  return { dateRange: { start: start.toISOString(), end: end.toISOString() } };
+}
+
+interface VariantApproval { up: number; down: number; rate: number | null }
+
+/**
+ * Each variant's thumbs on an experiment's battle replies, summed over its experiment_results rows (one per intent and
+ * model), with the approval rate those sums give, and the rows themselves. Read the way the Experiments and Battles
+ * views read it: the signed analytics API, `includeBattle`.
+ */
+async function readApproval(idToken: string, experimentId: string): Promise<{ control: VariantApproval; treatment: VariantApproval; rows: any[] }> {
+  const j = await signedAnalyticsPost(ANALYTICS_API, idToken, {
+    queryType: 'experiment_results', experimentId, includeBattle: 'true', ...todayRange(),
+  });
+  const rows = ((j?.data ?? []) as any[]).filter((r) => (r.experiment_id ?? r.experimentId) === experimentId);
+  const of = (variant: string): VariantApproval => {
+    const mine = rows.filter((r) => (r.variant_id ?? r.variantId) === variant);
+    const up = mine.reduce((n, r) => n + (Number(r.thumbs_up) || 0), 0);
+    const down = mine.reduce((n, r) => n + (Number(r.thumbs_down) || 0), 0);
+    return { up, down, rate: up + down ? Math.round((up / (up + down)) * 1000) / 10 : null };
+  };
+  return { control: of('control'), treatment: of('treatment'), rows };
+}
+
 test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E6)', () => {
   test.beforeEach(() => requireBattleE2E());
 
@@ -670,7 +951,9 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     const ctx = await browser.newContext({ storageState: BATTLE_AUTH_FILE });
     const page = await ctx.newPage();
     try {
-      await ensureBattleExperimentExists(page, { slot: 'slot-0' });
+      // The premium alt, for the reason given at the other call site: these duels are premium and an
+      // alt serves exactly one classification.
+      await ensureBattleExperimentExists(page, {});
     } finally {
       await ctx.close();
     }
@@ -685,9 +968,8 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     test.setTimeout(9 * 60_000);
     await activateBattleExperiment(page, battleExpId());
     // Moderator (admin) opens a battle channel and shares it with a NON-moderator.
-    // That member must be a DIFFERENT identity: testAdmin and premiumUser are the same account, so
-    // sharing with the premium user handed the channel back to the person who just created it - its
-    // own moderator - and the test could not see what a non-moderator sees.
+    // That member is a DIFFERENT identity from the channel's creator and moderator, so the test sees what a
+    // non-moderator sees.
     const second = await getSecondPremiumUser();
     // NOT a skip. `battle.setup` fails loudly when this credential is missing, so by the time a test
     // runs it is guaranteed - and a skip here would have reported a claim about two DISTINCT PEOPLE as
@@ -715,7 +997,10 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
       // once they start a battle (the inline round-1 banner). Either way it must appear to THIS member.
       const briefing = pageB.locator('.battle-briefing');
       if (!(await briefing.isVisible({ timeout: 8_000 }).catch(() => false))) {
-        await fireBattleNoWait(pageB, '/battle Explain feature flags to a new hire.');
+        // Only fired to force the inline round-1 banner when the enable broadcast did not carry the
+        // briefing. Nothing here is asserted about the ANSWER - but a duel still runs, so it is a
+        // `competitive_intel` question this assistant can answer rather than one it has to decline.
+        await fireBattleNoWait(pageB, '/battle Where are we ahead of Zapier, and where are we behind? One short paragraph.');
       }
       await expect(briefing).toBeVisible({ timeout: 120_000 });
 
@@ -740,7 +1025,7 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
   // B-E2 — As an END USER, the suggested prompts should be STEERED by the
   // experiment's target intent, so the battle exercises what the experiment
   // measures rather than random prompts (§2.2). The shipped text battle is an
-  // `intent` experiment (general_qa); its chips must match that intent's row in
+  // `intent` experiment (general); its chips must match that intent's row in
   // the steering table (code_generation is the design's illustrative example).
   test('B-E2: prompt steering — the briefing chips match the experiment intent', async ({ page }) => {
     test.setTimeout(9 * 60_000);
@@ -749,15 +1034,18 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
 
     const briefing = page.locator('.battle-briefing');
     if (!(await briefing.isVisible({ timeout: 8_000 }).catch(() => false))) {
-      await fireBattleNoWait(page, '/battle What is the difference between a container and a VM?');
+      // Same role as in B-E1: this only forces the briefing to render, and the chips - not the answer -
+      // are what this test is about. It is still a duel that runs, so it asks a comparison the
+      // competitive brief actually covers (Make's recorded weakness is enterprise features).
+      await fireBattleNoWait(page, '/battle How do we compare to Make on enterprise security?');
     }
     await expect(briefing).toBeVisible({ timeout: 120_000 });
 
-    // The steering is intent-derived: for general_qa the coaching line is "Ask real questions your
+    // The steering is intent-derived: for general the coaching line is "Ask real questions your
     // users ask." and the chips are concrete Q&A starters. Assert the intent-appropriate coaching
     // copy is present and the chips are real /battle prefills (deployment-overridable defaults).
     const text = (await briefing.innerText()).toLowerCase();
-    expect(text, 'coaching line is steered to the general_qa intent row').toMatch(/questions your users ask|real questions|ask real/);
+    expect(text, 'coaching line is steered to the general intent row').toMatch(/questions your users ask|real questions|ask real/);
     const chips = page.locator('.battle-briefing-chip');
     expect(await chips.count(), 'intent row seeds concrete starter chips').toBeGreaterThanOrEqual(2);
     await chips.first().click();
@@ -775,11 +1063,14 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     await newBattleChannel(page, 'E2E single-active guard');
 
     // Fire the first battle and wait only until its round-1 bubbles START (mid-flight), then fire again.
-    await fireBattleNoWait(page, '/battle Tabs or spaces for indentation? One short paragraph with a clear pick.');
+    await fireBattleNoWait(page, `/battle ${BATTLE_PROMPT}`);
     await expect
       .poll(async () => page.locator('.message.battle-message').count(), { timeout: 120_000 })
       .toBeGreaterThanOrEqual(1);
-    await fireBattleNoWait(page, '/battle Monorepo or polyrepo for a five-team org? One short paragraph.');
+    // The one that must be REFUSED. It never reaches a model if the guard holds - but it is written
+    // as a real question anyway, because the day the guard regresses is the day this prompt runs, and
+    // a regression that also poisons the evaluation corpus is two findings instead of one.
+    await fireBattleNoWait(page, '/battle Which competitor costs us the most enterprise deals? One short paragraph.');
 
     // The sender gets an explained no-op hint (mirrors the FR5 explained-no-op shape).
     await expect
@@ -808,7 +1099,7 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     // The duel, plus a 90s read-back. Kinesis delivery is near real time, so a row that is coming has
     // long since arrived; a longer budget cannot turn a failure into a pass.
     test.setTimeout(12 * 60_000);
-    expect(ANALYTICS_API, 'VITE_ANALYTICS_API_URL must be set').toBeTruthy();
+    expect(ANALYTICS_API, 'VITE_ADMIN_API_URL must be set').toBeTruthy();
     await activateBattleExperiment(page, battleExpId());
     await newBattleChannel(page, 'E2E human pick axis');
 
@@ -818,18 +1109,42 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     // supplies real repeated traffic instead of expecting a read the product is right to refuse. The
     // deployment under test lowers the floor (`-c minSamplePerVariant=...`) so five is enough; the
     // shipped default stays 30.
+    //
+    // FIVE DISTINCT QUESTIONS, and distinctness is the load-bearing part: this is the one test that
+    // produces repeated traffic, so whatever is fired here is the largest single contribution this
+    // suite makes to the evaluation corpus. Five copies of one prompt would measure one question five
+    // times. Each is single-turn (`competitive_intel`, `account_status` or `financial_metric`, all
+    // `PLACEHOLDER_UPDATE`) so every duel resolves to a scorecard without parking on the user, and
+    // each asks for a PICK rather than a figure - two models that look up the same number produce a
+    // draw, and a win-rate built out of draws is what the Wilson CI below would be computed from.
     const PROMPTS = [
-      '/battle Tabs or spaces for indentation? One short paragraph with a clear pick.',
-      '/battle Is a monorepo better than many repos? One short paragraph, pick a side.',
-      '/battle Should code review block merges? One short paragraph with a clear pick.',
-      '/battle Are feature flags worth their complexity? One short paragraph, pick a side.',
-      '/battle Is TypeScript worth it on a small team? One short paragraph with a clear pick.',
+      `/battle ${BATTLE_PROMPT}`,
+      '/battle Coastal Health Systems is evaluating Zapier Enterprise. What is the strongest case for '
+      + 'keeping them? One short paragraph.',
+      // NOT a question about "our accounts": that reads as a lookup, and a side classified it
+      // `data_extraction`, opened a task and parked on the user, so round 2 never fired (measured live
+      // 2026-10-13). A pick between two named options needs no data and asks nothing back.
+      '/battle Zapier just cut its Enterprise price by 20%. Should we match it or hold our price? One '
+      + 'short paragraph with a clear pick.',
+      '/battle Our NPS is 62 against a target of 65. What is the single thing to fix first? One short '
+      + 'paragraph, pick one.',
+      '/battle Do we grow faster by upgrading Professional customers to Enterprise, or by adding licenses '
+      + 'in the accounts we already have? One short paragraph with a clear pick.',
     ];
+    // EACH DUEL MUST REACH ROUND 2 BEFORE THE NEXT IS FIRED. The conversation holds one battle until its
+    // rebuttals are dispatched (`round2:full`), and `fireBattle` returns when round 1's scorecard has
+    // numbers - seconds earlier. Fired then, the next four were each refused as "a battle is already in
+    // flight" (measured live 2026-10-13), so the room held one duel and the last card never came.
     for (const prompt of PROMPTS.slice(0, PROMPTS.length - 1)) {
+      const dividersBefore = await page.locator('.battle-round-divider').count();
       await fireBattle(page, prompt);
+      await expect.poll(() => page.locator('.battle-round-divider').count(), { timeout: 260_000 })
+        .toBeGreaterThan(dividersBefore);
     }
+    // THIS duel's card, not an earlier one: several duels share this room.
+    const cardsBefore = await scorecardCount(page);
     await fireBattle(page, PROMPTS[PROMPTS.length - 1]);
-    const card = page.locator('.battle-scorecard').last();
+    const card = await newScorecard(page, cardsBefore);
     await expect(card).toBeVisible();
     const pickB = card.locator('[data-pick="B"]');
 
@@ -858,14 +1173,14 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
 
     await expect(pickB).toHaveAttribute('aria-pressed', 'true', { timeout: 10_000 });
 
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     expect(idToken, 'admin idToken in localStorage').toBeTruthy();
 
     // ARCHIVAL IS THE LONG POLE FOR BOTH SURFACES, and it is worth being exact about why, because the
     // obvious reading is wrong. The recommendation's human axis reads BattleOutcome DIRECTLY
     // (`scanBattleWins`), so the picks themselves need no archival - but the axis is only EMITTED once
     // the comparison is viable, and viability is measured from Aurora traffic rows. Until both variants'
-    // turns have travelled Kinesis -> archival -> Aurora, the recommendation answers "Only one variant
+    // turns have traveled Kinesis -> archival -> Aurora, the recommendation answers "Only one variant
     // has recorded traffic, so there is nothing to compare yet" and carries no `human` block at all.
     //
     // So this test polls on a realistic archival window rather than seconds. What it no longer does is
@@ -878,17 +1193,41 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     const end = new Date();
     const start = new Date(end.getTime() - 86_400_000);
     let reco: any;
-    // 90 seconds, not nine minutes. An earlier version waited nine, sized from a theory that archival
-    // was slow - which measurement disproved: the Kinesis batching window is 5 SECONDS. If the row is
-    // coming it is here in well under a minute, so a longer wait cannot turn a failure into a pass, it
-    // only makes the failure take nine minutes to report. Fast failure is the point.
-    for (let i = 0; i < 18 && !reco?.human; i++) {
+    // ── IT WAITS ON THE PROJECTION SETTLING, NOT ON A WALL CLOCK ─────────────────────────────────
+    //
+    // This polled for a fixed 90 seconds, on the stated reasoning that the Kinesis batching window is
+    // five seconds so "if the row is coming it is here in well under a minute". MEASURED, and that is
+    // not reliably true: a run that failed here with "only 1 variant(s) have ARCHIVED rows yet" had
+    // BOTH variants in `experiment_results` when the table was read afterwards, one row each. The
+    // evidence was not missing; it had not landed inside the budget.
+    //
+    // A longer budget is still the wrong fix, and for the reason the old comment gave: it turns a
+    // fast failure into a slow one and settles nothing. So the loop asks a different question. It
+    // keeps waiting while the projection is still ADVANCING - the archived-variant count rising is
+    // proof that rows are still arriving - and gives up only once that count has been STILL for
+    // several consecutive polls, which is the observable form of "this is as complete as it gets".
+    //
+    // A run where rows are flowing therefore waits exactly as long as it needs to, and a run where
+    // nothing is coming fails in about half a minute instead of ninety seconds. The hard cap is a
+    // safety net for a projection that never settles, not the thing the test is timing.
+    const STILL_POLLS_BEFORE_SETTLED = 6; // ~30s of no movement
+    const HARD_CAP_POLLS = 72; // ~6 minutes, only reachable while rows keep arriving
+    let archivedVariants = -1;
+    let stillFor = 0;
+    for (let i = 0; i < HARD_CAP_POLLS && !reco?.human; i++) {
       reco = await signedAnalyticsPost(ANALYTICS_API, idToken!, {
         queryType: 'experiment_recommendation',
         experimentId: battleExpId(),
         dateRange: { start: start.toISOString(), end: end.toISOString() },
       });
-      if (!reco?.human) await page.waitForTimeout(5000);
+      if (reco?.human) break;
+      const seen = Array.isArray(reco?.variants) ? reco.variants.length : 0;
+      // ADVANCING RESETS THE PATIENCE, so the wait is bounded by the pipeline going quiet rather than
+      // by a guess about how fast it should have been.
+      stillFor = seen > archivedVariants ? 0 : stillFor + 1;
+      archivedVariants = Math.max(archivedVariants, seen);
+      if (stillFor >= STILL_POLLS_BEFORE_SETTLED) break;
+      await page.waitForTimeout(5000);
     }
     // NAME THE PRECONDITION THAT FAILED, don't print a truncated blob.
     //
@@ -903,7 +1242,10 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
         Array.isArray(reco?.variants) ? reco.variants : [];
       const wins = vs.reduce((n, v) => n + (Number(v.battle_wins) || 0), 0);
       const why = vs.length < 2
-        ? `only ${vs.length} variant(s) have ARCHIVED rows yet (Kinesis -> Aurora projection behind after ${18 * 5}s)`
+        ? `only ${vs.length} variant(s) have ARCHIVED rows, and the count stopped rising for `
+          + `${STILL_POLLS_BEFORE_SETTLED * 5}s before this gave up - so the projection has SETTLED `
+          + 'incomplete rather than merely being behind. A duel that archived one side looks exactly '
+          + 'like this, and so does a duel that never ran its second side.'
         : wins === 0
           ? 'both variants are archived but NO decisive pick is attributed to them (a lost pick, not latency)'
           : 'variants and picks are both present — the axis is being withheld for another reason';
@@ -926,12 +1268,13 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
   // which is what the combined assertion said for weeks.
   test('B-E4b: the battle pick reaches experiment_results once the turn is archived', async ({ page }) => {
     test.setTimeout(6 * 60_000);
-    expect(ANALYTICS_API, 'VITE_ANALYTICS_API_URL must be set').toBeTruthy();
+    expect(ANALYTICS_API, 'VITE_ADMIN_API_URL must be set').toBeTruthy();
     await activateBattleExperiment(page, battleExpId());
     await newBattleChannel(page, 'E2E tally after archival');
 
-    await fireBattle(page, '/battle Tabs or spaces for indentation? One short paragraph with a clear pick.');
-    const card = page.locator('.battle-scorecard').last();
+    const cardsBefore = await scorecardCount(page);
+    await fireBattle(page, `/battle ${BATTLE_PROMPT}`);
+    const card = await newScorecard(page, cardsBefore);
     await expect(card).toBeVisible();
 
     const [outcomeResp] = await Promise.all([
@@ -943,7 +1286,7 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     ]);
     expect(outcomeResp.ok(), 'the pick must be recorded before the tally can ever show it').toBeTruthy();
 
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     await expect
       // 90s: the Kinesis batching window is 5 seconds, so a row that is coming has long arrived.
       .poll(async () => (await readBattleWins(idToken!, battleExpId())).treatment ?? 0, { timeout: 90_000 })
@@ -960,7 +1303,14 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     await activateBattleExperiment(page, battleExpId());
     await newBattleChannel(page, 'E2E fail-loud');
 
-    await fireBattleNoWait(page, '/battle Is REST or GraphQL the better default for a new internal API? One paragraph.');
+    // Single-turn (`financial_metric` reasoned over, not looked up), because the terminal state this
+    // test waits for is a scorecard or an explicit failure - and a task-shaped duel has a third,
+    // legitimate resting place (parked on the user) that is neither, which would make the poll below
+    // report a healthy duel as a silent stall.
+    await fireBattleNoWait(
+      page,
+      '/battle Is our 118% net revenue retention better explained by expansion or by low churn? One paragraph.',
+    );
 
     // Bounded well UNDER the 10-min silent TTL: within this budget the battle must reach a visible
     // terminal state. Silence past it (no scorecard AND no failure turn) is the B2 regression.
@@ -982,12 +1332,11 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
   // (§3.4 B3): two members picking different sides on the SAME battle both count.
   test('B-E6: per-user picks are tallied — two members, different sides, both retained', async ({ page, browser }) => {
     test.setTimeout(12 * 60_000);
-    expect(ANALYTICS_API, 'VITE_ANALYTICS_API_URL must be set').toBeTruthy();
+    expect(ANALYTICS_API, 'VITE_ADMIN_API_URL must be set').toBeTruthy();
     await activateBattleExperiment(page, battleExpId());
     const channelId = await newBattleChannelWithId(page, 'E2E per-user picks');
-    // A DIFFERENT identity from the moderator. testAdmin and premiumUser are the same account, and
-    // picks are keyed by the chooser's sub, so sharing with the premium user made this one person
-    // picking twice: the second pick overwrote the first and only one variant could ever hold a win.
+    // A DIFFERENT identity from the moderator: picks are keyed by the chooser, so two people's picks are two
+    // picks, and each variant can hold a win.
     const second = await getSecondPremiumUser();
     // NOT a skip. `battle.setup` fails loudly when this credential is missing, so by the time a test
     // runs it is guaranteed - and a skip here would have reported a claim about two DISTINCT PEOPLE as
@@ -1010,12 +1359,14 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
       await openConversationById(pageB, channelId);
 
       // Moderator fires ONE battle; both members are present in-session for the SAME duel.
-      await fireBattle(page, '/battle Tabs or spaces for indentation? One short paragraph with a clear pick.');
-      const cardA = page.locator('.battle-scorecard').last();
+      const cardsBeforeA = await scorecardCount(page);
+      const cardsBeforeB = await scorecardCount(pageB);
+      await fireBattle(page, `/battle ${BATTLE_PROMPT}`);
+      const cardA = await newScorecard(page, cardsBeforeA);
       await expect(cardA).toBeVisible();
       // Member B must also see the SAME battle's scorecard (per-user picks require both present).
-      const cardB = pageB.locator('.battle-scorecard').last();
-      await expect(cardB).toBeVisible({ timeout: 260_000 });
+      const cardB = await newScorecard(pageB, cardsBeforeB);
+      await expect(cardB).toBeVisible();
 
       // Different sides: A picks A (control), B picks B (treatment).
       const pickA = cardA.locator('[data-pick="A"]');
@@ -1027,7 +1378,7 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
 
       // BOTH picks are retained + tallied — not last-write-wins (which would leave only ONE variant with
       // a win). The tally therefore shows a win on BOTH variants (2 distinct users, one battle).
-      const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+      const idToken = await idTokenOf(page);
       expect(idToken, 'admin idToken in localStorage').toBeTruthy();
       await expect
         .poll(
@@ -1057,11 +1408,17 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
   // its own task chain, and a chain with legs left parks on the person (ADR-026, `reason: 'task-step'`).
   // Same `WAITING_FOR_USER` state, same continuation path, same rule.
   //
-  // THE NEGATIVE IS NOT VACUOUS, which matters more here than usual: the waiting affordance is derived
-  // from the channel's MESSAGES, so it renders for every member and the second member's composer really
-  // does send a `Target`-ed continuation. The test asserts that affordance is present before sending -
-  // otherwise "nothing resumed" would only prove nothing was attempted - and it ends with the owner's
-  // identical reply DOING resume the side, which is what makes the two halves a comparison.
+  // THE NEGATIVE IS NOT VACUOUS, which matters more here than usual. Both members send the SAME
+  // `Target`-ed reply, so the only difference between the two halves is who sent it. The non-owner's
+  // reply leaves the side waiting; the owner's identical reply is applied to the awaited task and moves
+  // the side on, which is what makes the two halves a comparison rather than two unrelated observations.
+  //
+  // HOW THE REPLY REACHES THE SIDE. A `Target`-ed message invokes the targeted assistant's Amazon Lex
+  // (`TargetedMessages: ALL`, ADR-041 Appendix A), and the handler resumes the side
+  // (`resumeDuelSideIfWaiting`) only when the sender is the duel's initiator, read from the channel's
+  // battle pointer. Measured on dev 2026-10-28 UTC (battle 8c9ef799c8503d0f): the owner's reply was
+  // applied to the awaited task (`deferred_to_model` from `collecting_requirements`) and resumed the
+  // side; the non-owner's ran as an ordinary turn and resumed nothing.
   test('B-E7: a waiting side is answerable ONLY by the person who started the duel', async ({ page, browser }) => {
     test.setTimeout(15 * 60_000);
     const second = await getSecondPremiumUser();
@@ -1075,11 +1432,10 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     await shareChannelWith(page, second!.email);
 
     // Task-shaped on purpose (see above): a report chain collects requirements before it can draft.
-    await fireBattleNoWait(
-      page,
-      '/battle Compile a concise 1-page report on the pros and cons of a monorepo vs multi-repo '
-      + 'setup for a 5-team engineering org.',
-    );
+    // `TASK_BATTLE_PROMPT` is the shared definition of that shape, and it is under-specified on
+    // purpose - a request that already states its audience, period and sections leaves nothing to ask
+    // about, the chain never parks, and the `waitForWaitingSide` assertion below has nothing to find.
+    await fireBattleNoWait(page, `/battle ${TASK_BATTLE_PROMPT}`);
 
     const active = await waitForActiveBattle(channelId, 180_000);
     expect(active?.battleId, 'the fan-out stamps the channel pointer').toBeTruthy();
@@ -1094,20 +1450,21 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
       + 'refuse, and this test would be asserting nothing',
     ).toBeTruthy();
 
-    // Both replies are sent as Chime messages `Target`-ed at the waiting side, rather than typed into
-    // the composer, because a task-step wait offers NO composer affordance to anyone: that branch
-    // writes no `waitingMessageId` and posts no `<!--battlewaiting-->` marker, so `battleWaitingBots`
-    // is empty for every member including the owner. The wire shape is the composer's own targeted
-    // send, so the server path under test is the same one.
-    const ownerArn = userArnFor(active!.initiatorUserSub!);
+    // THE OWNER ANSWERS THROUGH THE APP, the non-owner through a raw send. The side's message carries
+    // its `<!--battlewaiting-->` marker naming the owner, and the chat app offers "Reply to this side" to
+    // that person alone (DESIGN-BATTLE, "A side parked on the person"). A non-owner is offered no reply,
+    // so their targeted message is sent as a Chime message with the composer's own wire shape: what is
+    // under test there is the server's refusal, which no UI can stand in for.
+    const ownerArn = personArnForRecordedId(active!.initiatorUserSub!);
     const nonOwner = humanMembers(channelId).find((arn) => arn !== ownerArn);
     expect(nonOwner, 'the channel has a second human member to answer as').toBeTruthy();
 
     // ── the NON-OWNER answers ──────────────────────────────────────────────────────────────────
-    const strangerMsgId = sendTargetedAs(
-      channelId, nonOwner!, waiting!.botArn,
-      'Audience is engineering leadership; focus on delivery velocity.',
-    );
+    // THE SAME TEXT THE OWNER SENDS BELOW, so the sender is the only variable. It is a reply the
+    // deployment's input guardrail passes today. Whether the guardrail is right to refuse other benign
+    // requirement answers is a separate question, tracked on its own; this test is about who may answer.
+    const REPLY = 'Audience is the leadership team; focus on ARR growth and plan mix.';
+    const strangerMsgId = sendTargetedAs(channelId, nonOwner!, waiting!.botArn, REPLY);
 
     const stateAfterNonOwner = await holdsWaiting(active!.battleId!, waiting!.botArn, 90_000);
     expect(
@@ -1124,73 +1481,100 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     ).toBe(true);
 
     // ── the OWNER answers ──────────────────────────────────────────────────────────────────────
-    // THE POSITIVE CONTROL, and it is the half that matters. Without it, "the side stayed waiting" is
-    // equally consistent with a continuation path that is broken for everyone - which is exactly what
-    // running this found: the flow callback carries no `Target`, so no reply of any kind reaches the
-    // continuation branch. Until that is fixed this assertion FAILS, and it should: the owner rule
-    // cannot be said to work when nothing can resume a duel at all.
-    const ownerMsgId = sendTargetedAs(
-      channelId, ownerArn, waiting!.botArn,
-      'Audience is engineering leadership; focus on delivery velocity and CI cost.',
-    );
-
-    const resumed = await waitForResume(active!.battleId!, waiting!.botArn, 300_000);
-    expect(resumed, "the owner's identical reply DOES resume the side").not.toBe('WAITING_FOR_USER');
+    // THE POSITIVE CONTROL, and it is the half that matters: without it, "the side stayed waiting" is
+    // equally consistent with a continuation path that is broken for everyone.
+    // The side's own control, on the step it parked on. Choosing it puts the composer into a reply to
+    // that side, labeled with its name; the send goes out targeted at the side, as the router expects.
+    const sideControl = page.locator(`.battle-side-reply[data-side-arn="${waiting!.botArn}"]`);
+    await expect(sideControl, "the owner is offered the waiting side's reply control").toBeVisible({ timeout: 60_000 });
+    await sideControl.locator('.battle-side-reply-button').click();
+    await expect(page.locator('.message-input-sticky-target--battle-side')).toBeVisible();
+    await page.locator('.message-textarea').fill(REPLY);
+    await page.locator('.send-button').click();
+    const ownerMsgId = await messageIdSentBy(channelId, ownerArn, REPLY);
+    expect(ownerMsgId, "the owner's reply reached the channel").toBeTruthy();
+    // Answered, so the reply mode ends with the send.
+    await expect(page.locator('.message-input-sticky-target--battle-side')).toHaveCount(0);
+    // Chime's clock, not this machine's: every "after the reply" below compares backend timestamps.
+    const ownerSentAtMs = messageCreatedAtMs(channelId, ownerArn, ownerMsgId!);
+    expect(ownerSentAtMs, "the owner's reply has a creation time").toBeGreaterThan(0);
 
     // The reply itself is DELIVERED, not denied. Its privacy is Chime's `Target` doing its job - the
-    // rival never sees it - and nothing needs to swallow the message to achieve that. Keeping it also
-    // keeps the exchange reconstructable afterwards, which the denial cost (ADR-029, SPEC-BATTLE's
-    // open question about retaining the verbatim Q and A).
+    // rival never sees it - and keeping it keeps the exchange reconstructable afterwards (ADR-029).
     expect(
-      messageExistsForSender(channelId, ownerArn, ownerMsgId),
+      messageExistsForSender(channelId, ownerArn, ownerMsgId!),
       "the owner's answer is delivered privately, not swallowed",
     ).toBe(true);
 
-    // AND THE ANSWER COMES BACK IN PUBLIC. A duel is a comparison, so a side's answer has to be
-    // readable by the channel; the private acknowledgement is not the answer. Read with the admin
-    // bearer, which cannot see targeted messages at all - so anything visible here is genuinely public.
+    // THE SIDE MOVES ON, read from the row's own timestamp. A resumed task-shaped side is `INVOKED`
+    // only while its turn runs (about three seconds on dev), so a state sample cannot see it; a state
+    // entered after the reply can. What the design guarantees after the owner's answer: the side
+    // either completes, or asks its next question and waits again. It never stays parked on the
+    // question that was just answered.
+    const movedOn = await waitForSideMovedOn(active!.battleId!, waiting!.botArn, ownerSentAtMs, 300_000);
+    expect(
+      movedOn,
+      "the owner's reply must move the side on: a state entered after the reply, not the original wait",
+    ).toBeTruthy();
+    expect(['COMPLETED', 'WAITING_FOR_USER'], `the side settled as ${movedOn?.state}`).toContain(movedOn!.state);
+
+    // THE ANSWER WAS APPLIED TO THE AWAITED TASK. Applying a reply hands the work back to the side's
+    // assistant (`applyUserResponseToTask`), which the task's append-only history records as an
+    // ownership entry after the reply; a turn that moved the machine records a graph edge instead.
+    //
+    // The side's task is found in the source-of-truth table, by this conversation and the side's
+    // assistant: each side runs its own chain, so `assistantId` picks it out. Not from the reply's
+    // Metadata, which sheds `activeTask` under the Chime cap when the reply also carries a document.
+    const sideAssistantId = waiting!.botArn.split('/').pop()!;
+    const agentTasks = resolveTaskTable('agent-tasks');
+    expect(agentTasks, 'the agent-tasks table resolves for this deployment').toBeTruthy();
+    const sideTasks = channelTasks(agentTasks!, channelArnFor(channelId))
+      .filter((t) => t.assistantId === sideAssistantId);
+    expect(sideTasks, "the waiting side runs exactly one task in this conversation").toHaveLength(1);
+    const task = readTask(agentTasks!, String(sideTasks[0].taskId), channelArnFor(channelId));
+    const afterReply = historyOf(task).filter((e) => Date.parse(e.at || '') >= ownerSentAtMs);
+    expect(
+      afterReply.some((e) => e.ownerTo === `assistant:${sideAssistantId}` || (e.from && e.to)),
+      `the owner's reply is applied to the awaited task; history after the reply: ${JSON.stringify(afterReply)}`,
+    ).toBe(true);
+
+    // AND WHAT THE SIDE SAID COMES BACK IN PUBLIC, after the reply. A duel is a comparison, so a side's
+    // answer (or its next question) has to be readable by the channel; the private receipt is not it.
+    // Read with the admin bearer, which cannot see targeted messages at all, so anything visible here
+    // is genuinely public. Newer than the reply, so the side's round-1 post cannot satisfy it.
     await expect
       .poll(
-        () => publicMessages(channelId, 12).some((m) => m.sender === waiting!.botArn && m.content.length > 120),
+        () => publicMessages(channelId, 12).some((m) => m.sender === waiting!.botArn
+          // `final` is an answer and `interim` is the next question; a `placeholder` is neither.
+          && m.createdAtMs > ownerSentAtMs && ['final', 'interim'].includes(m.metadata?.respPhase)),
         {
           timeout: 240_000,
-          message: "the resumed side's answer must be broadcast, not buried in the private reply",
+          message: "the resumed side's reply must be broadcast, not buried in the private receipt",
         },
       )
       .toBe(true);
 
-    // AND THE RECEIPT STAYS PRIVATE. The other half of the same rule, and the half that has actually
-    // been wrong on the deployment: broadcasting the answer from a placeholder that was ALREADY public
-    // put the answer in the channel and a note beside it saying the answer was elsewhere. Two public
-    // messages for one turn, both delivered, nothing logged. The admin bearer cannot see targeted
-    // messages at all, so the receipt appearing here at all is the defect.
+    // AND THE RECEIPT STAYS PRIVATE. Broadcasting the answer from a placeholder that was ALREADY public
+    // once put the answer in the channel and a note beside it saying the answer was elsewhere. The
+    // admin bearer cannot see targeted messages at all, so the receipt appearing here is the defect.
     expect(
-      publicMessages(channelId, 12).filter((m) => m.content.includes('My answer is in the conversation')),
+      publicMessages(channelId, 12).filter((m) => m.content.includes('My answer is in the conversation')
+        || m.content.includes('I have asked you something in the conversation')),
       'the receipt is targeted at the person who answered, so it must not be readable in the channel',
     ).toHaveLength(0);
-
-    // AND THE DUEL FINISHES. Leaving WAITING_FOR_USER is not the same as completing: a resumed side
-    // used to flip to INVOKED and then strand to TTL, because the resumed turn ran as an ordinary
-    // turn with no battleContext and every terminal write in the processor sits behind one. The
-    // side reaching a terminal state is what proves the resume synthesized its battle context and
-    // the turn ran AS a battle turn - the half of the resume nothing above can see.
-    const terminal = await waitForSideTerminal(active!.battleId!, waiting!.botArn, 300_000);
-    expect(
-      terminal,
-      'the resumed side must COMPLETE, not merely leave the waiting state - a stranded INVOKED row '
-      + 'is exactly the defect the synthesized battle context fixed',
-    ).toBe('COMPLETED');
   });
 
-  // B-E8 — BATTLES ARE NOT PREMIUM-ONLY BY DESIGN (owner ruling 2026-08-18). Eligibility is the
-  // PROFILE's battleEligible capability, read per classification from the immutable tag - so what a
-  // below-premium /battle must NEVER do is run silently on premium machinery, which is exactly how
-  // the alt-slot hardwire failed: the turn still answered, so nothing errored.
+  // B-E8 — BATTLES ARE NOT PREMIUM-ONLY BY DESIGN (owner ruling 2026-08-18), but they are not
+  // ambient either. Whether a duel may run is the CLASSIFICATION's `battleCapable` plus a runtime
+  // setting an operator turns on (ADR-049), read per classification from the immutable tag - so what
+  // a below-premium /battle must NEVER do is run silently on premium machinery, which is exactly how
+  // the hardwired premium alt failed: the turn still answered, so nothing errored.
   //
   // The test asserts the boundary on whatever the deployment's configuration is, without a vacuous
-  // skip: on the DEFAULT config (standard battleEligible: false) the capability gate must refuse
-  // with its explanatory targeted reply; on a deployment whose operator marked standard
-  // battle-eligible, the not-enabled hint answers instead (this channel never enabled Battle Mode).
+  // skip. On a default run this suite turns battle on for PREMIUM only, so `standard` is capable but
+  // switched off and the gate must refuse with its explanatory targeted reply; on a deployment where
+  // an operator has also turned standard on, the not-enabled hint answers instead (this channel never
+  // enabled Battle Mode).
   // Either way the command is ANSWERED - a refusal that explains itself, never silence - and either
   // way NO duel starts: the channel pointer stays empty. This runs in the full-validation battle
   // suite only, deliberately not in the fresh-install dashboard-populate flow (owner ruling).
@@ -1229,7 +1613,7 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
         .split('/').pop()!;
       await pageStd.locator('.message-textarea').waitFor({ state: 'visible', timeout: 15_000 });
 
-      await pageStd.locator('.message-textarea').fill('/battle Tabs or spaces? One short paragraph with a clear pick.');
+      await pageStd.locator('.message-textarea').fill(`/battle ${BATTLE_PROMPT}`);
       await pageStd.keyboard.press('Enter');
 
       // The command is ANSWERED, by one of the two explanatory refusals. Which one depends on the
@@ -1282,11 +1666,7 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     // Task-shaped, so a side parks on the user and the duel stays genuinely IN FLIGHT for the whole
     // test. A plain duel would race to completion and then "the pointer cleared" could not be told
     // apart from an ordinary finish.
-    await fireBattleNoWait(
-      page,
-      '/battle Compile a concise 1-page report comparing trunk-based development against long-lived '
-      + 'release branches for a 5-team engineering org.',
-    );
+    await fireBattleNoWait(page, `/battle ${TASK_BATTLE_PROMPT}`);
 
     const active = await waitForActiveBattle(channelId, 180_000);
     expect(active?.battleId, 'the fan-out stamps the channel pointer').toBeTruthy();
@@ -1299,7 +1679,7 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
       + 'duel to end, and this test would be asserting nothing',
     ).toBeTruthy();
 
-    const ownerArn = userArnFor(active!.initiatorUserSub!);
+    const ownerArn = personArnForRecordedId(active!.initiatorUserSub!);
     const nonOwner = humanMembers(channelId).find((arn) => arn !== ownerArn);
     expect(nonOwner, 'the channel has a second human member to try this as').toBeTruthy();
 
@@ -1334,10 +1714,13 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
     // side of that window would report "no new battle started" for a duel that ran perfectly. A duel
     // that parks on the user holds its pointer until somebody ends it, which makes the observation
     // stable instead of a race this test would lose intermittently.
+    //
+    // A DIFFERENT task from the ended one, and `data_extraction` rather than `report_generation`, so
+    // the transcript cannot be read as the ended duel still answering. It parks for the same reason:
+    // which columns, and which definition of "flagged", are requirements this request does not carry.
     await fireBattleNoWait(
       page,
-      '/battle Compile a short summary of the tradeoffs between tabs and spaces for indentation in a '
-      + 'shared codebase.',
+      '/battle Extract the enterprise accounts flagged as churn risk as a table.',
     );
     const next = await waitForActiveBattle(channelId, 180_000);
     expect(next?.battleId, 'a new /battle starts after the old duel was ended').toBeTruthy();
@@ -1345,6 +1728,82 @@ test.describe('/battle — briefing, steering, guard & human pick (§8 B-E1..B-E
       next!.battleId,
       'and it is a genuinely NEW duel, not the ended one still holding the channel',
     ).not.toBe(active!.battleId);
+  });
+
+  // B-E10 — ADDRESSING THE ALT REACHES THE ALT, NOT THE PRIMARY.
+  //
+  // A battle-enabled room is the only place two assistants of one classification are both members,
+  // so it is the only place this can be exercised. Observed live 2026-09-21: `@Alt-premium-primary
+  // answer here` was answered by Advisor, the primary. The mention resolved correctly and the ARN
+  // stopped at the flow - `handOffTurnToRouter` invoked the classification's router, which resolved
+  // its OWN identity. The flow's own comment recorded the limit ("it does not yet choose which
+  // assistant runs the turn") and the seam to close it already existed: `TurnRequest.botArn` is
+  // forwarded to the router and validated there against its assignment records.
+  //
+  // ASSERTED ON THE WIRE, not the pixels. Two assistants post into this room, so "an answer appeared"
+  // proves nothing about WHO answered - which is the entire claim. The frame carries the sender ARN.
+  test('B-E10: addressing the alt is answered BY the alt, not by the primary', async ({ page }) => {
+    test.setTimeout(9 * 60_000);
+    const wire = new ChannelWireRecorder();
+    wire.attach(page);
+
+    await activateBattleExperiment(page, battleExpId());
+    const channelId = await newBattleChannelWithId(page, 'E2E mention the alt');
+
+    // The alt that serves this room, read from its assignment record - never a hardcoded name, for
+    // the same reason `challengerFor` exists.
+    const altArn = await altBotArnFor('premium');
+    expect(altArn, 'the premium alt must have an assignment record for this test to mean anything').toBeTruthy();
+
+    // ITS NAME, FROM THE LIVE ROSTER, AND CHECKED AGAINST THE PROFILE RULE. A side is
+    // named by its profile, never an alias: the challenger's pinned version is a copy of the live one
+    // with no name of its own, so it carries the live assistant's name marked as the challenger
+    // (`battleSideNames`, `battleAltName`). Both names change at runtime with their versions, so they
+    // are read from the room's membership, which is what the composer resolves a mention against.
+    const channelArn = `${altArn.split('/bot/')[0]}/channel/${channelId}`;
+    const me = await personArnFromIdToken(await idTokenOf(page));
+    let altName = '';
+    await expect.poll(() => (altName = assistantNameIn(channelArn, me, altArn)), {
+      message: 'the alt joins the room when Battle Mode turns on', timeout: 30_000,
+    }).toBeTruthy();
+    const liveName = assistantsIn(channelArn, me).find((a) => a.arn !== altArn)?.name || '';
+    expect(liveName, 'the room has its live assistant beside the challenger').toBeTruthy();
+    expect(altName, 'the room tells the challenger from the live assistant').not.toBe(liveName);
+    expect(altName, "the challenger carries the live assistant's profile name, marked as the challenger")
+      .toBe(`${liveName} (alt)`);
+
+    // THE CLIENT'S LIVE ROSTER AGREES. The members panel is the app's own copy, refreshed on the
+    // membership event the alt's join sent; a mention resolves against it, so it must show the name.
+    await page.getByRole('button', { name: 'Show channel members' }).click();
+    await expect(page.locator('.channel-members-panel-name', { hasText: altName }),
+      "the members panel shows the challenger by its profile's name").toBeVisible({ timeout: 15_000 });
+    // The panel's own close button: while it is open the header toggle carries the same label.
+    await page.locator('.channel-members-panel-close').click();
+
+    // A one-line `financial_metric` question, not a general-knowledge one. What is asserted is WHICH
+    // assistant answered, so the content is free - but this is an ordinary (non-`/battle`) turn that
+    // is archived and evaluated like any other, and a question outside the premium taxonomy is
+    // answered with a decline that the evaluator then scores as irrelevant. Typed by name, the way a
+    // person would: `@Advisor (alt)` also contains `@Advisor`, and the longer name must win.
+    await sendAndWaitForResponse(page, `@${altName} In one sentence, what is our current net revenue retention?`, 240_000);
+
+    // MATCHED ON THE ID SUFFIX, because `newBattleChannelWithId` returns the channel ID and the wire
+    // records the full ARN. Passing the id to `botMessagesFor` matched nothing and the test failed
+    // with "the addressed assistant must answer" against a room where it had answered - a harness
+    // fault that reads exactly like the product defect this case is for.
+    const botFrames = wire.all.filter(
+      (m) => m.isBot && m.channelArn.endsWith(`/${channelId}`) && (m.content || '').trim().length > 0,
+    );
+    expect(botFrames.length, 'the addressed assistant must answer').toBeGreaterThan(0);
+
+    // THE CLAIM. An answer from the primary here is the reported defect, and it looks identical to a
+    // correct one in the transcript.
+    const answeredByAlt = botFrames.some((m) => m.senderArn === altArn);
+    expect(
+      answeredByAlt,
+      `addressing ${altName} must be answered by that assistant. Senders seen: `
+      + `${[...new Set(botFrames.map((m) => m.senderArn))].join(', ')}`,
+    ).toBe(true);
   });
 });
 

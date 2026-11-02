@@ -21,6 +21,8 @@ export interface TestUser {
   email: string;
   password: string;
   tier: 'basic' | 'standard' | 'premium';
+  /** The AppInstanceUser the credential exchange vended at provisioning, when the run recorded one. */
+  userArn?: string;
 }
 
 export interface TestCredentials {
@@ -29,10 +31,9 @@ export interface TestCredentials {
   standardUser: TestUser;
   premiumUser: TestUser;
   /**
-   * A premium account that is NOT `testAdmin`. In the deployed secret `testAdmin` and `premiumUser`
-   * are the same address, so anything needing two distinct people had only one. Optional because a
-   * deployment provisioned before this key existed still has four entries; callers gate on it rather
-   * than fail the whole suite.
+   * A second premium account, distinct from `premiumUser`, for anything that needs two people at one
+   * classification. Optional because a deployment provisioned before this key existed has no entry; callers
+   * gate on it rather than fail the whole suite.
    */
   secondPremiumUser?: TestUser;
   /**
@@ -43,43 +44,78 @@ export interface TestCredentials {
    * pre-onboards every one of them (any of them may open a standard conversation, which would
    * otherwise trigger an intake mid-suite), and the handler caches a positive onboarded result for a
    * few minutes, so a reset performed seconds before the test can still be invisible to a container
-   * warmed by an earlier phase. Both are correct behaviours that simply make a shared user unusable
+   * warmed by an earlier phase. Both are correct behaviors that simply make a shared user unusable
    * here. Optional: a deployment provisioned before this key skips the spec with a stated reason.
    */
   onboardingUser?: TestUser;
+  /** Premium-cleared and in the `ops` membership group: the person an `ops` event names. */
+  opsLeadUser?: TestUser;
+  /** A second premium-cleared `ops` member. */
+  opsEngineerUser?: TestUser;
+  /** In `team-members` and `team-ops`: an admin-console team member whose reach is the ops team's assistants. */
+  teamOpsUser?: TestUser;
   cognitoUserPoolId: string;
   cognitoClientId: string;
+  /**
+   * Where the test users' mail lands: an SES receipt rule writes every message for `domain` to
+   * `s3://bucket/prefix`. Absent when the deployment configured no inbox, and the delivery tests skip
+   * naming how to add one (`helpers/test-inbox.ts`).
+   */
+  testInbox?: { bucket: string; prefix: string; domain: string };
 }
 
-let cachedCredentials: TestCredentials | null = null;
+const cachedSecrets = new Map<string, unknown>();
 
 /**
- * Load test credentials from Secrets Manager.
- * Results are cached — subsequent calls return the same object.
+ * A provisioning secret, read from Secrets Manager BY NAME and cached per name for the run. The e2e users'
+ * secret (`agent-interface/test-credentials`) and the demo cast's (`agent-interface/demo-credentials`,
+ * `helpers/demo-credentials.ts`) are both written by `provision-test-users.mjs` and read here.
  */
-export async function getTestCredentials(): Promise<TestCredentials> {
-  if (cachedCredentials) {
-    return cachedCredentials;
-  }
-
+export async function readCredentialsSecret<T>(secretName: string): Promise<T> {
+  if (cachedSecrets.has(secretName)) return cachedSecrets.get(secretName) as T;
   try {
     const raw = execSync(
       `aws secretsmanager get-secret-value ` +
-        `--secret-id "${SECRET_NAME}" ` +
+        `--secret-id "${secretName}" ` +
         `--query SecretString --output text ` +
         `--region ${REGION}`,
-      { encoding: 'utf8', timeout: 15000, env: { ...process.env, AWS_PROFILE } }
+      // UTF-8 both ways; see `task-backend.aws` for why the AWS CLI needs both on Windows.
+      { encoding: 'utf8', timeout: 15000,
+        env: { ...process.env, AWS_PROFILE, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' } }
     ).trim();
-
-    cachedCredentials = JSON.parse(raw) as TestCredentials;
-    return cachedCredentials;
+    const parsed = JSON.parse(raw) as T;
+    cachedSecrets.set(secretName, parsed);
+    return parsed;
   } catch (error) {
     throw new Error(
-      `Failed to load test credentials from Secrets Manager (${SECRET_NAME}). ` +
+      `Failed to load credentials from Secrets Manager (${secretName}). ` +
         `Ensure AWS_PROFILE=${AWS_PROFILE} is configured and the secret exists.\n` +
         `Original error: ${error}`
     );
   }
+}
+
+/** Whether a secret exists, without reading it or throwing. Useful for test.skip() guards. */
+export function hasCredentialsSecret(secretName: string): boolean {
+  try {
+    execSync(
+      `aws secretsmanager describe-secret ` +
+        `--secret-id "${secretName}" --region ${REGION}`,
+      { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'],
+        env: { ...process.env, AWS_PROFILE, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' } }
+    );
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Load test credentials from Secrets Manager.
+ * Results are cached: subsequent calls return the same object.
+ */
+export async function getTestCredentials(): Promise<TestCredentials> {
+  return readCredentialsSecret<TestCredentials>(SECRET_NAME);
 }
 
 /** Get admin user (premium tier) */
@@ -126,6 +162,18 @@ export async function getOnboardingUser(): Promise<TestUser | null> {
 }
 
 /** Get premium tier user */
+/** The ops lead, or null when this deployment's secret carries none (provision-test-users --only opsLeadUser). */
+export async function getOpsLeadUser(): Promise<TestUser | null> {
+  const creds = await getTestCredentials();
+  return creds.opsLeadUser ?? null;
+}
+
+/** The second ops member, or null when none is provisioned. */
+export async function getOpsEngineerUser(): Promise<TestUser | null> {
+  const creds = await getTestCredentials();
+  return creds.opsEngineerUser ?? null;
+}
+
 export async function getPremiumUser(): Promise<TestUser> {
   const creds = await getTestCredentials();
   return creds.premiumUser;
@@ -140,7 +188,7 @@ export async function getPremiumUser(): Promise<TestUser> {
  * why attached — use it everywhere a missing test user is the condition.
  */
 export function missingUserReason(
-  secretKey: 'basicUser' | 'standardUser' | 'premiumUser' | 'testAdmin' | 'secondPremiumUser' | 'onboardingUser',
+  secretKey: 'basicUser' | 'standardUser' | 'premiumUser' | 'testAdmin' | 'secondPremiumUser' | 'onboardingUser' | 'opsLeadUser' | 'opsEngineerUser' | 'teamOpsUser',
 ): string {
   return (
     `No provisioned ${secretKey}: the "${secretKey}" entry in the ${SECRET_NAME} secret `
@@ -153,14 +201,5 @@ export function missingUserReason(
  * Useful for test.skip() guards.
  */
 export function hasTestCredentials(): boolean {
-  try {
-    execSync(
-      `aws secretsmanager describe-secret ` +
-        `--secret-id "${SECRET_NAME}" --region ${REGION}`,
-      { encoding: 'utf8', timeout: 10000, stdio: ['ignore', 'pipe', 'ignore'], env: { ...process.env, AWS_PROFILE } }
-    );
-    return true;
-  } catch {
-    return false;
-  }
+  return hasCredentialsSecret(SECRET_NAME);
 }

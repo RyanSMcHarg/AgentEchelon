@@ -19,7 +19,7 @@
  * EVERY channel size, so a 1:1 was the cheapest way to reach the dispatcher. It no longer is: in a 1:1
  * the flow now stands aside and the Lex entry answers, because Amazon Chime SDK's AUTO trigger invokes
  * Lex for every message at that size and BOTH entries were handling the turn - which produced two
- * placeholders, one of them stranded (tracker rows 1 and 85). Flow dispatch is therefore reachable
+ * placeholders, one of them stranded. Flow dispatch is therefore reachable
  * only above 1:1, which is what this spec now sets up.
  *
  * The old version documented the duplicate as though it were expected: "an @all yields TWO bot
@@ -38,7 +38,7 @@
  * `backend/test/lib/battle-classification-routing.test.ts`, which is where a reintroduced hardcode
  * would be caught.
  */
-import { test, expect } from '@playwright/test';
+import { test, expect } from './helpers/fixtures';
 import { signIn, createConversation } from './helpers/agent-helpers';
 import { WebSocketMonitor } from './helpers/websocket-monitor';
 import { ChannelWireRecorder } from './helpers/channel-wire';
@@ -84,7 +84,7 @@ test.describe('Flow dispatch routes on the channel classification', () => {
       (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
       { timeout: 30_000 },
     );
-    await createConversation(page, 'E2E Dispatch Routing', 'Claude Haiku');
+    await createConversation(page, 'E2E Dispatch Routing', 'Basic');
     const body = await (await createResp).json();
     const channelArn: string = body.conversation.conversationArn;
     expect(channelArn, 'channelArn from create-conversation').toBeTruthy();
@@ -97,7 +97,7 @@ test.describe('Flow dispatch routes on the channel classification', () => {
     await page.locator('button[aria-label="Share conversation"]').click();
     await expect(page.locator('#share-email')).toBeVisible({ timeout: 5_000 });
     await page.locator('#share-email').fill(shareTarget.email);
-    await page.locator('.modal-content button[type="submit"]').click();
+    await page.locator('form:has(#share-email) button[type="submit"]').click();
     await expect(page.locator('.alert-success')).toBeVisible({ timeout: 30_000 });
 
     // The member-joined announcement is a bot message and would otherwise be mistaken for this turn's

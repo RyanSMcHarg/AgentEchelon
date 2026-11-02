@@ -23,9 +23,9 @@
  *     E2E_ADMIN_BASE_URL=https://<admin-dist>.cloudfront.net \
  *     npx playwright test e2e/admin-flow.spec.ts --reporter=list
  */
-import { test, expect, Page } from '@playwright/test';
-import { signIn } from './helpers/agent-helpers';
-import { getAdminUser } from './helpers/test-credentials';
+import { test, expect } from './helpers/fixtures';
+import { Page } from '@playwright/test';
+import { signInAsAdmin } from './helpers/agent-helpers';
 import { assertNoErrorBanners } from './helpers/banner-check';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 
@@ -54,18 +54,16 @@ async function cardValue(page: Page, title: string): Promise<string> {
   return (await card.locator('.metric-card-value').first().innerText()).trim();
 }
 
-async function signInAsAdmin(page: Page): Promise<void> {
-  const admin = await getAdminUser();
-  await signIn(page, admin.email, admin.password);
-  await expect(page.locator('.admin-section-rail')).toBeVisible({ timeout: 15000 });
+async function signInAsAdminLive(page: Page): Promise<void> {
+  await signInAsAdmin(page, { rail: true });
   // The Aurora badge gates the analytics drills; confirm the mode is live before the journey.
-  await expect(page.locator('.status-badge--live')).toBeVisible({ timeout: 20000 });
+  await expect(page.locator('.admin-header-mode:has-text("Aurora")')).toBeVisible({ timeout: 20000 });
 }
 
 test.describe('Admin console — operator flows (live)', () => {
   test('triage loop: land → read alerts → each alert drills to its own target', async ({ page }) => {
     test.setTimeout(150000);
-    await signInAsAdmin(page);
+    await signInAsAdminLive(page);
 
     await page.goto('/?admin=alerts');
     await expect(page.locator('.admin-subtab-btn.active')).toHaveText(/Alerts/i);
@@ -112,7 +110,7 @@ test.describe('Admin console — operator flows (live)', () => {
 
   test('investigate effectiveness: an intent drills to its tasks + flow detail (folded in, not tabs)', async ({ page }) => {
     test.setTimeout(120000);
-    await signInAsAdmin(page);
+    await signInAsAdminLive(page);
 
     await page.goto('/?admin=effectiveness');
     await expect(page.locator('.admin-subtabs')).toBeVisible({ timeout: 15000 });
@@ -124,6 +122,8 @@ test.describe('Admin console — operator flows (live)', () => {
       await expect(page.locator(`#admin-tab-${present}`)).toBeVisible();
     }
 
+    // The intent table is the Performance view's quality detail, opened from a quality card.
+    await page.getByRole('button', { name: /^Relevance .*open the detail/ }).click();
     // Wait for the intent table to settle before probing; skip only on a genuinely empty window.
     await page.locator('.data-table-row--clickable, .data-table-empty').first().waitFor({ timeout: 20000 });
     if (await page.locator('.data-table-empty').first().isVisible().catch(() => false)) {
@@ -155,30 +155,35 @@ test.describe('Admin console — operator flows (live)', () => {
 
   test('latency health: perceived-latency (TTFF/P95) renders and P95 is single-reply, not task-inflated', async ({ page }) => {
     test.setTimeout(90000);
-    await signInAsAdmin(page);
+    await signInAsAdminLive(page);
 
+    // Latency is the Performance view's latency drill; the old link still lands on it.
     await page.goto('/?admin=latency');
     await expect(page.locator('h3:has-text("Response Latency")')).toBeVisible({ timeout: 15000 });
     await page.locator('.admin-metrics-row').first().waitFor({ timeout: 20000 });
 
     // TTFF is the PRIMARY perceived-latency metric (the placeholder appearing); P95 is the tail.
     const ttff = await cardValue(page, 'TTFF');
+    // P95 is part of the worker-compute breakdown, which opens from the Worker compute card.
+    await page.getByRole('button', { name: /Worker compute — show breakdown/ }).click();
+    await page.getByRole('region', { name: /Worker compute breakdown/i }).waitFor({ timeout: 10000 });
     const p95 = await cardValue(page, 'P95 worker compute');
     expect(msOf(ttff), `TTFF renders a real time value (got "${ttff}")`).toBeGreaterThan(0);
     const p95ms = msOf(p95);
     expect(p95ms, `P95 renders a real time value (got "${p95}")`).toBeGreaterThan(0);
     // Regression guard for the P95 fix: the old aggregation was Math.max over per-group rows INCLUDING
     // multi-step tasks (which run 90s+), so P95 read in the minutes. Task-excluded + traffic-weighted
-    // keeps the single-reply P95 sane. 120s ceiling catches a regression to the task-inflated number.
+    // keeps the single-reply P95 sane. 120s limit catches a regression to the task-inflated number.
     expect(p95ms, `P95 must be single-reply latency, not task-inflated (got "${p95}")`).toBeLessThan(120000);
   });
 
   test('mobile triage: the whole effectiveness row is a tap target', async ({ page }) => {
     test.setTimeout(90000);
     await page.setViewportSize({ width: 390, height: 800 });
-    await signInAsAdmin(page);
+    await signInAsAdminLive(page);
 
     await page.goto('/?admin=effectiveness');
+    await page.getByRole('button', { name: /^Relevance .*open the detail/ }).click();
     await page.locator('.data-table-row--clickable, .data-table-empty').first().waitFor({ timeout: 20000 });
     const row = page.locator('.data-table-row--clickable').first();
     if (!(await row.count())) {

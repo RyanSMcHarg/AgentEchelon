@@ -18,46 +18,36 @@
  *      membership change first and then requires that specific channel to have a record - an
  *      assertion that cannot be satisfied by an archive that returns nothing.
  *
- * The archive endpoints are AWS_IAM-authorized (A14 `adminIamEnforcement`), so the request is
+ * The archive endpoints are AWS_IAM-authorized, like every admin API, so the request is
  * SigV4-signed Node-side via `helpers/signed-analytics.ts`. A Cognito Bearer token is rejected 403
  * and the browser cannot sign it.
  */
-import { test, expect } from '@playwright/test';
-import { execSync } from 'child_process';
-import { signIn, createConversation } from './helpers/agent-helpers';
+import { test, expect } from './helpers/fixtures';
+import { signIn, createConversation, idTokenOf } from './helpers/agent-helpers';
 import { getBasicUser, getAdminUser, hasTestCredentials, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 import { signedAdminGet } from './helpers/signed-analytics';
+import { STACK_PREFIX, instanceStacks, physicalIdsIn } from './helpers/stack-prefix';
+import { aws } from './helpers/aws';
+import { ADMIN_API_URL, adminUrl } from './helpers/api-urls';
 
 guardConsoleErrors();
 
 const E2E_RUNNABLE = hasTestCredentials();
-const REGION = process.env.AWS_REGION || 'us-east-1';
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || '';
-const ADMIN_CONVERSATIONS_API =
-  process.env.VITE_ADMIN_CONVERSATIONS_API_URL || process.env.ADMIN_CONVERSATIONS_API_URL || '';
-
-function aws(args: string): any {
-  const out = execSync(`aws ${args} --region ${REGION} --output json`, {
-    encoding: 'utf8',
-    timeout: 30000,
-    env: { ...process.env, MSYS_NO_PATHCONV: '1' },
-  }).trim();
-  return out ? JSON.parse(out) : null;
-}
+const ADMIN_CONVERSATIONS_API = ADMIN_API_URL ? adminUrl('admin-conversations', '/admin/conversations') : '';
 
 test.describe('Access auditing — the capture path is deployed and enabled', () => {
   test.skip(!E2E_RUNNABLE, 'Needs AWS credentials to read the deployed event-source wiring.');
   guardBackendErrors('access-auditing-wiring');
 
   test('the archival consumer is subscribed to the channel event stream, and ENABLED', async () => {
-    const fns: string[] = aws(
-      `lambda list-functions --query "Functions[?contains(FunctionName,'AgentEchelon') `
-      + `&& (contains(FunctionName,'Archival') || contains(FunctionName,'KinesisArchival'))].FunctionName"`,
-    );
+    // Read from this instance's stacks by construct id, not matched on the generated name: see
+    // helpers/stack-prefix.ts.
+    const fns = physicalIdsIn(instanceStacks(), { type: 'AWS::Lambda::Function', logicalId: /^(Kinesis)?ArchivalLambda/ });
     expect(
-      fns?.length,
-      'no AgentEchelon archival Lambda found. The audit record is produced by the Chime channel '
+      fns.length,
+      `no ${STACK_PREFIX} archival Lambda found. The audit record is produced by the Chime channel `
       + 'event stream -> Kinesis -> archival path; without that consumer there is no append-only '
       + 'record at all, however healthy the console looks.',
     ).toBeGreaterThan(0);
@@ -90,7 +80,7 @@ test.describe('Access auditing — a membership change lands in the record', () 
   test.skip(!ADMIN_BASE_URL, 'Needs E2E_ADMIN_BASE_URL (the admin console origin) to obtain an admin token.');
   test.skip(
     !ADMIN_CONVERSATIONS_API,
-    'Needs VITE_ADMIN_CONVERSATIONS_API_URL. It is written into frontend/packages/admin/.env by '
+    'Needs VITE_ADMIN_API_URL. It is written into frontend/packages/admin/.env by '
     + 'gen-frontend-env; export it, or source that file, before running.',
   );
   guardBackendErrors('access-auditing-record');
@@ -118,7 +108,7 @@ test.describe('Access auditing — a membership change lands in the record', () 
         { timeout: 30000 },
       );
       const title = `Audit e2e ${Date.now()}`;
-      await createConversation(chatPage, title, 'Open');
+      await createConversation(chatPage, title, 'Basic');
       const body = await (await createResp).json();
       channelArn = body?.conversation?.conversationArn || '';
       expect(channelArn, 'channelArn from the create-conversation response').toBeTruthy();
@@ -135,7 +125,7 @@ test.describe('Access auditing — a membership change lands in the record', () 
     let idToken = '';
     try {
       await signIn(adminPage, admin.email, admin.password);
-      idToken = (await adminPage.evaluate(() => localStorage.getItem('idToken'))) || '';
+      idToken = await idTokenOf(adminPage);
       expect(idToken, 'admin idToken after signing in to the admin console').toBeTruthy();
     } finally {
       await adminCtx.close();
@@ -149,7 +139,7 @@ test.describe('Access auditing — a membership change lands in the record', () 
     let history: any[] = [];
 
     for (;;) {
-      last = await signedAdminGet(ADMIN_CONVERSATIONS_API + '/membership-history', idToken, { channelArn });
+      last = await signedAdminGet(adminUrl('admin-conversations', '/admin/conversations/membership-history'), idToken, { channelArn });
 
       // Fail-quiet path #1: a 200 carrying archiveError is a BROKEN read, not an empty history.
       expect(

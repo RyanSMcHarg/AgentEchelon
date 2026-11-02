@@ -15,8 +15,8 @@
  *     -> "Respond in Simplified Chinese (简体中文) unless the user writes to you in a different
  *        language" injected into the system prompt (lib/async-processor-core.ts).
  *
- * In a host integration `userLanguage` is written by federated-create-conversation, which is gated on
- * a `federatedUserPoolId` this deployment does not set. So the test writes the store row itself. The
+ * In a host integration `userLanguage` is written by the context create, which a one-conversation
+ * issuer's people reach and this deployment's trusted-issuer registry does not declare. So the test writes the store row itself. The
  * path from the store onwards is untouched production code.
  *
  * IT ALSO DRIVES THE NEGATIVE CONTROL, and that is the more valuable half. `userLanguage` used to be
@@ -25,7 +25,7 @@
  * call, so IAM cannot separate a rename from a metadata rewrite. A member could therefore choose which
  * model answered their own turns. So this test stamps a CONFLICTING `userLanguage` into Metadata using
  * exactly that capability and requires the reply to follow the STORE anyway. Without the negative
- * control the positive case passes just as well against the old, member-writable behaviour.
+ * control the positive case passes just as well against the old, member-writable behavior.
  *
  * The assertion is deterministic, not a prose judgement: a Simplified Chinese reply contains Han
  * characters and an English one contains none. Counting them is objective in a way that "the reply
@@ -33,19 +33,21 @@
  *
  *   AWS_PROFILE=<p> E2E_BASE_URL=<cf> npx playwright test e2e/bilingual-conversations.spec.ts
  */
-import { test, expect } from '@playwright/test';
+import { test, expect } from './helpers/fixtures';
 import { execSync } from 'child_process';
 import { writeFileSync, mkdtempSync } from 'fs';
 import { tmpdir } from 'os';
 import { join } from 'path';
-import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
+import { signIn, createConversation, sendAndWaitForResponse, idTokenOf } from './helpers/agent-helpers';
 import { getStandardUser, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { stackName } from './helpers/stack-prefix';
+import { exchange } from './helpers/admin-api';
+import { PERSON_API_URL } from './helpers/api-urls';
 
 guardConsoleErrors();
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
-const EXCHANGE_URL = (process.env.VITE_CREDENTIAL_EXCHANGE_API_URL || process.env.EXCHANGE_API_URL || '').replace(/\/$/, '');
 
 /** An ENGLISH question. The reply language must come from configuration, not from mirroring. */
 const ENGLISH_PROMPT = 'In two or three sentences, what is the main benefit of using a code review checklist?';
@@ -60,19 +62,6 @@ function jsonFileArg(obj: unknown): string {
   const f = join(_tmp, `arg-${process.hrtime.bigint()}.json`);
   writeFileSync(f, JSON.stringify(obj), 'utf8');
   return `file://${f.replace(/\\/g, '/')}`;
-}
-
-async function exchange(idToken: string, payload: unknown): Promise<{ status: number; body: any }> {
-  // Bearer scheme, and on `/exchange-credentials` rather than the API root — see moderation.spec.ts,
-  // where getting either wrong produced a 403 that read like a refusal and proved nothing.
-  const resp = await fetch(`${EXCHANGE_URL}/exchange-credentials`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${idToken}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify(payload),
-  });
-  const text = await resp.text();
-  try { return { status: resp.status, body: JSON.parse(text) }; }
-  catch { return { status: resp.status, body: { raw: text } }; }
 }
 
 /**
@@ -136,9 +125,9 @@ test.describe('The assistant replies in the user\'s configured language (SPEC-BI
 
     const user = await getStandardUser();
     test.skip(!user.password, missingUserReason('standardUser'));
-    test.skip(!EXCHANGE_URL, 'needs VITE_CREDENTIAL_EXCHANGE_API_URL for the UpdateChannel capability');
+    test.skip(!PERSON_API_URL, 'needs VITE_PERSON_API_URL for the UpdateChannel capability');
     const contextTable = resolveChannelContextTable();
-    test.skip(!contextTable, 'ChannelContextTable not found (deploy AgentEchelonFoundations).');
+    test.skip(!contextTable, `ChannelContextTable not found (deploy ${stackName('Conversations')}).`);
 
     await signIn(page, user.email, user.password);
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
@@ -153,7 +142,7 @@ test.describe('The assistant replies in the user\'s configured language (SPEC-BI
     expect(channelArn, 'channelArn from create-conversation').toBeTruthy();
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     expect(idToken, 'idToken after sign-in').toBeTruthy();
 
     // `rename` vends chime:UpdateChannel WITHOUT delete — the capability the rename UI already holds.

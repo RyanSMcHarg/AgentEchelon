@@ -66,6 +66,7 @@ function unwrapContent(rawContent: string): string {
 
 export class ChannelWireRecorder {
   private readonly messages: WireMessage[] = [];
+  private readonly arrivals = new Set<(m: WireMessage) => void>();
   private socketSeen = false;
 
   attach(page: Page): void {
@@ -113,7 +114,7 @@ export class ChannelWireRecorder {
         metadata = typeof payload.Metadata === 'string' ? JSON.parse(payload.Metadata) : payload.Metadata;
       } catch { /* leave undefined */ }
     }
-    this.messages.push({
+    const message: WireMessage = {
       channelArn: payload.ChannelArn || '',
       messageId: payload.MessageId || '',
       content: unwrapContent(raw),
@@ -123,7 +124,9 @@ export class ChannelWireRecorder {
       eventType,
       metadata,
       atMs: Date.now(),
-    });
+    };
+    this.messages.push(message);
+    for (const l of this.arrivals) l(message);
   }
 
   /** Every bot message seen for a channel, in arrival order. */
@@ -141,13 +144,44 @@ export class ChannelWireRecorder {
    * "nothing arrived" is a result the caller has to distinguish from "arrived but did not render",
    * and an exception here would collapse the two.
    */
-  async waitForBotMessage(channelArn: string, timeoutMs = 20_000): Promise<WireMessage | null> {
-    const deadline = Date.now() + timeoutMs;
-    for (;;) {
-      const found = this.botMessagesFor(channelArn)[0];
-      if (found) return found;
-      if (Date.now() > deadline) return null;
-      await new Promise((r) => setTimeout(r, 250));
-    }
+  waitForBotMessage(channelArn: string, timeoutMs = 20_000): Promise<WireMessage | null> {
+    const found = this.botMessagesFor(channelArn)[0];
+    if (found) return Promise.resolve(found);
+    // Woken by the frame itself: the recorder hears every message the page's socket receives.
+    return new Promise((resolve) => {
+      const onArrival = (m: WireMessage) => {
+        if (!m.isBot || m.channelArn !== channelArn) return;
+        this.arrivals.delete(onArrival);
+        clearTimeout(timer);
+        resolve(m);
+      };
+      const timer = setTimeout(() => {
+        this.arrivals.delete(onArrival);
+        resolve(null);
+      }, timeoutMs);
+      this.arrivals.add(onArrival);
+    });
+  }
+
+  /**
+   * Every frame seen so far, once `done` accepts them: checked now, then again on each frame the page's socket
+   * receives. Resolves with the last view when `timeoutMs` passes rather than throwing, so the caller's assertion
+   * reports what did arrive.
+   */
+  waitUntil(done: (all: WireMessage[]) => boolean, timeoutMs = 60_000): Promise<WireMessage[]> {
+    if (done(this.all)) return Promise.resolve(this.all);
+    return new Promise((resolve) => {
+      const onArrival = () => {
+        if (!done(this.all)) return;
+        this.arrivals.delete(onArrival);
+        clearTimeout(timer);
+        resolve(this.all);
+      };
+      const timer = setTimeout(() => {
+        this.arrivals.delete(onArrival);
+        resolve(this.all);
+      }, timeoutMs);
+      this.arrivals.add(onArrival);
+    });
   }
 }

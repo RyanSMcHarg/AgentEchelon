@@ -33,6 +33,18 @@ const PLACEHOLDER_REGEXES = [
  * Check if a message is a placeholder/intermediate message from the bot.
  */
 export function isPlaceholder(text: string): boolean {
+  // ── UNLESS THE TURN DECLARED IT IS ALREADY FINISHED (2026-09-11) ─────────────────────────────
+  //
+  // A handler-answered turn now carries a `<!--corr:-->` marker so its pairing can be declared
+  // rather than guessed at downstream, and it posts once with no update to follow. Matched as a
+  // placeholder here, a greeting test waits for a second message that will never arrive and fails
+  // as a timeout - which reads as the assistant never answering.
+  //
+  // Mirrors `backend/lambda/src/lib/turn-declaration.ts`; bounded and character-classed exactly as
+  // the writer builds it, so prose quoting the words asserts nothing.
+  const declaration = text.match(/<!--turn:([A-Za-z0-9._;=-]{1,512})-->/);
+  if (declaration && declaration[1].split(';').includes('phase=final')) return false;
+
   const lower = text.toLowerCase().trim();
   if (PLACEHOLDER_STRINGS.some(p => lower.includes(p))) return true;
   if (PLACEHOLDER_REGEXES.some(r => r.test(text.trim()))) return true;
@@ -84,6 +96,8 @@ function parseChimeFrame(data: string): {
   senderArn: string;
   content: string;
   messageId: string;
+  /** Which conversation the frame belongs to. The socket carries every channel this user is in. */
+  channelArn: string;
   /**
    * The message's `Metadata`, parsed. This carries the turn's analytics — including which model
    * actually served it (`bedrockModel`) and the classified `intent`.
@@ -129,7 +143,14 @@ function parseChimeFrame(data: string): {
       }
     } catch { /* metadata is best-effort; a turn without it is not a failure */ }
 
-    return { eventType, senderArn, content, messageId: payload.MessageId || '', metadata };
+    return {
+      eventType,
+      senderArn,
+      content,
+      messageId: payload.MessageId || '',
+      channelArn: payload.ChannelArn || '',
+      metadata,
+    };
   } catch {
     return null;
   }
@@ -159,6 +180,14 @@ export class WebSocketMonitor {
   private responseContent = '';
   /** The phase the accepted frame declared, or null when it carried none. */
   private responsePhase: string | null = null;
+  /**
+   * The conversation this turn is in, learned from the user's own echo.
+   *
+   * Null until the echo arrives, and a null means "accept any" - a monitor watching for something
+   * the user did not send (a proactive message, another member's turn) has nothing to lock onto and
+   * must not be silenced by this.
+   */
+  private activeChannelArn: string | null = null;
   private placeholderMessageId: string | null = null;
 
   /**
@@ -180,6 +209,13 @@ export class WebSocketMonitor {
     return this.lastBotMessageIdValue;
   }
 
+  /** The conversation the most recent bot message arrived in: the handle an archived turn is found by. */
+  private lastBotChannelArnValue: string | null = null;
+
+  get lastBotChannelArn(): string | null {
+    return this.lastBotChannelArnValue;
+  }
+
   /**
    * Attach to the page to capture the Chime SDK WebSocket when it opens.
    * Must be called BEFORE the WebSocket is created (before widget opens or
@@ -194,8 +230,76 @@ export class WebSocketMonitor {
         // Persistent frame listener -- only processes when monitoring is active
         ws.on('framereceived', (event: { payload: string | Buffer }) => {
           this.handleFrame(event);
+          this.handleChannelUpdate(event);
+          this.handleDriftRedirect(event);
         });
       }
+    });
+  }
+
+  // ── CHANNEL RENAMES, AS THE CLIENT RECEIVES THEM ─────────────────────────────────────────────────
+  //
+  // A conversation's derived title reaches every member as an Amazon Chime SDK `UPDATE_CHANNEL` event on
+  // this socket, and the chat app applies it from there. Waiting on that event is the person's own path,
+  // so a spec asserts the rename without reading the channel on a timer.
+  private channelNames = new Map<string, string>();
+  private renameWaiters: Array<{ channelArn: string; resolve: (name: string) => void }> = [];
+
+  private handleChannelUpdate(event: { payload: string | Buffer }): void {
+    try {
+      const json = JSON.parse(typeof event.payload === 'string' ? event.payload : event.payload.toString('utf8'));
+      if (json.Headers?.['x-amz-chime-event-type'] !== 'UPDATE_CHANNEL') return;
+      const payload = typeof json.Payload === 'string' ? JSON.parse(json.Payload) : json.Payload;
+      const arn: string = payload?.ChannelArn || '';
+      const name: string = payload?.Name || '';
+      if (!arn || !name) return;
+      this.channelNames.set(arn, name);
+      for (const w of this.renameWaiters.filter((x) => x.channelArn === arn && name !== 'New conversation')) {
+        w.resolve(name);
+      }
+      this.renameWaiters = this.renameWaiters.filter((x) => !(x.channelArn === arn && name !== 'New conversation'));
+    } catch { /* not a frame this listener reads */ }
+  }
+
+  /** The name an `UPDATE_CHANNEL` event gave this conversation, other than the placeholder; rejects on timeout. */
+  waitForChannelRename(channelArn: string, timeoutMs = 60000): Promise<string> {
+    const seen = this.channelNames.get(channelArn);
+    if (seen && seen !== 'New conversation') return Promise.resolve(seen);
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => reject(new Error(`no UPDATE_CHANNEL renamed ${channelArn} within ${timeoutMs}ms`)), timeoutMs);
+      this.renameWaiters.push({ channelArn, resolve: (name) => { clearTimeout(timer); resolve(name); } });
+    });
+  }
+
+  // ── A DRIFT SPLIT, AS THE PARENT RECEIVES IT ─────────────────────────────────────────────────────
+  //
+  // Accepting a drift offer posts a message into the parent whose Metadata carries
+  // `driftRedirect.childChannelArn`, and it reaches every member on this socket. Waiting on it is the
+  // person's own path; reading the channel through the CLI is the backup when the event is missed.
+  private driftRedirects = new Map<string, { childChannelArn: string; label: string }>();
+  private redirectWaiters: Array<{ parentArn: string; resolve: (link: { childChannelArn: string; label: string }) => void }> = [];
+
+  private handleDriftRedirect(event: { payload: string | Buffer }): void {
+    const parsed = parseChimeFrame(typeof event.payload === 'string' ? event.payload : event.payload.toString('utf8'));
+    const link = (parsed?.metadata as { driftRedirect?: { childChannelArn?: string; label?: string } } | null)?.driftRedirect;
+    if (!parsed?.channelArn || !link?.childChannelArn) return;
+    const found = { childChannelArn: link.childChannelArn, label: link.label || '' };
+    this.driftRedirects.set(parsed.channelArn, found);
+    for (const w of this.redirectWaiters.filter((x) => x.parentArn === parsed.channelArn)) w.resolve(found);
+    this.redirectWaiters = this.redirectWaiters.filter((x) => x.parentArn !== parsed.channelArn);
+  }
+
+  /** The drift link the parent received on this socket; resolves null on timeout, so the caller can fall back. */
+  waitForDriftRedirect(parentArn: string, timeoutMs = 60000): Promise<{ childChannelArn: string; label: string } | null> {
+    const seen = this.driftRedirects.get(parentArn);
+    if (seen) return Promise.resolve(seen);
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        this.redirectWaiters = this.redirectWaiters.filter((x) => x.resolve !== done);
+        resolve(null);
+      }, timeoutMs);
+      const done = (link: { childChannelArn: string; label: string }) => { clearTimeout(timer); resolve(link); };
+      this.redirectWaiters.push({ parentArn, resolve: done });
     });
   }
 
@@ -217,6 +321,7 @@ export class WebSocketMonitor {
     this.ttfrMs = null;
     this.responseContent = '';
     this.responsePhase = null;
+    this.activeChannelArn = null;
     this.placeholderMessageId = null;
     this.startTime = Date.now();
 
@@ -248,14 +353,45 @@ export class WebSocketMonitor {
 
     const elapsed = Date.now() - this.startTime;
     const isBot = parsed.senderArn.includes('/bot/');
+
+    // NOT THIS TURN'S CONVERSATION, so not this turn's answer. Checked before any branch reads the
+    // frame, because both the CREATE and UPDATE paths were reachable by a stranger's message.
+    if (isBot && this.activeChannelArn && parsed.channelArn
+      && parsed.channelArn !== this.activeChannelArn) {
+      console.log(
+        `[WsMonitor] Ignoring a bot frame from another conversation `
+        + `(${parsed.channelArn.split('/').pop()})`,
+      );
+      return;
+    }
     if (isBot && parsed.metadata) this.lastBotMetadataValue = parsed.metadata;
     if (isBot && parsed.messageId) this.lastBotMessageIdValue = parsed.messageId;
+    if (isBot && parsed.channelArn) this.lastBotChannelArnValue = parsed.channelArn;
 
     if (parsed.eventType === 'CREATE_CHANNEL_MESSAGE') {
       if (!isBot && this.userEchoMs === null) {
         // User's own message echoed back
         this.userEchoMs = elapsed;
+        // ── AND IT NAMES THE CONVERSATION THIS TURN IS IN (2026-09-09) ──────────────────────────
+        //
+        // The socket carries EVERY channel this user belongs to, and nothing here filtered on that:
+        // the first bot frame to arrive was taken as the answer, whichever conversation produced it.
+        // A slow reply from an earlier test therefore landed in a later test's wait and was asserted
+        // against. Seen on a live sweep: the drift decline test received a Q3 revenue analysis
+        // ending "where would you like to go from here?" - the answer to a conversation created by
+        // the test before it - and reported drift as broken. The DOM check that would have caught it
+        // is best-effort and only warns ("WS response received but not found in DOM").
+        //
+        // The user's own echo is the honest anchor: it is this test's message, so the channel it
+        // arrives on is the conversation this turn is in. Locking here needs nothing from the caller,
+        // so every existing call site is scoped without changing one.
+        this.activeChannelArn = parsed.channelArn || null;
         console.log(`[WsMonitor] User echo: ${elapsed}ms`);
+      } else if (isBot && parsed.metadata?.respPhase === 'notice') {
+        // A QUEUE NOTICE IS NOT THIS TURN'S FIRST FEEDBACK OR ITS ANSWER (ADR-033). It says a message is
+        // waiting behind other work, and the answer arrives later as its own message. Taking it as the
+        // first frame would pin this monitor to the notice's id and ignore the answer when it posts.
+        console.log(`[WsMonitor] Ignoring queue notice [msgId=${parsed.messageId.substring(0, 8)}]`);
       } else if (isBot && this.ttffMs === null) {
         // First bot message -- either placeholder or DIRECT response
         this.ttffMs = elapsed;
@@ -297,7 +433,8 @@ export class WebSocketMonitor {
       // The text test remains as a FALLBACK for a frame with no phase: other writers post messages
       // (the channel flow's handed-back placeholder, a battle notice) and not all of them stamp one.
       const phase = typeof parsed.metadata?.respPhase === 'string' ? parsed.metadata.respPhase : null;
-      if (phase === 'placeholder' || phase === 'progress') {
+      // `notice` too: a queue notice rewritten in place is still waiting, never the answer.
+      if (phase === 'placeholder' || phase === 'progress' || phase === 'notice') {
         console.log(`[WsMonitor] Ignoring ${phase} update for msgId=${parsed.messageId.substring(0, 8)}`);
         return;
       }

@@ -17,73 +17,33 @@
  * Best-effort: skips silently when the AWS wiring is absent (no profile store, no creds), so a purely
  * local run or a deployment without onboarding is unaffected.
  */
-import { execFileSync } from 'child_process';
-import { getTestCredentials } from './helpers/test-credentials';
-
-const AWS_PROFILE = process.env.AWS_PROFILE || 'default';
-const REGION = process.env.AWS_REGION || 'us-east-1';
-const USER_POOL_ID = process.env.VITE_USER_POOL_ID || '';
-
-function aws(args: string[]): string {
-  return execFileSync('aws', [...args, '--region', REGION, '--profile', AWS_PROFILE], {
-    encoding: 'utf8',
-    timeout: 20000,
-  }).trim();
-}
-
-/** Resolve a user's Cognito sub by email (username). Returns '' on any failure. */
-function subForEmail(email: string): string {
-  try {
-    const sub = aws([
-      'cognito-idp', 'admin-get-user', '--user-pool-id', USER_POOL_ID, '--username', email,
-      '--query', "UserAttributes[?Name=='sub'].Value | [0]", '--output', 'text',
-    ]);
-    return sub && sub !== 'None' ? sub : '';
-  } catch {
-    return '';
-  }
-}
+import { getTestCredentials, type TestUser } from './helpers/test-credentials';
+import { ensureOnboarded, profileTable } from './helpers/profile-store';
 
 export default async function globalSetup(): Promise<void> {
-  if (!process.env.E2E_BASE_URL || !USER_POOL_ID) return; // not a live run
-  let table = '';
+  if (!process.env.E2E_BASE_URL) return; // not a live run
   try {
-    table = aws([
-      'ssm', 'get-parameter', '--name', '/agent-echelon/shared/tables/user-profile-name',
-      '--query', 'Parameter.Value', '--output', 'text',
-    ]);
+    profileTable();
   } catch {
     return; // no profile store on this deployment
   }
-  if (!table || table === 'None') return;
 
   // Every distinct demo user in the test-credentials secret. Any of them may create a standard-tier
   // conversation, which triggers the standard onboarding intake for its creator.
-  let emails: string[] = [];
+  let users: TestUser[] = [];
   try {
     const creds = await getTestCredentials();
-    emails = [...new Set([
-      creds.basicUser?.email, creds.standardUser?.email, creds.premiumUser?.email, creds.testAdmin?.email,
-    ].filter(Boolean) as string[])];
+    const seen = new Set<string>();
+    users = [creds.basicUser, creds.standardUser, creds.premiumUser, creds.testAdmin]
+      .filter((u): u is TestUser => !!u?.email && !seen.has(u.email) && !!seen.add(u.email));
   } catch {
     return;
   }
 
-  const now = new Date().toISOString();
-  for (const email of emails) {
-    const sub = subForEmail(email);
-    if (!sub) continue;
-    try {
-      // if_not_exists keeps a real onboardedAt (and facts) intact if the user already onboarded.
-      aws([
-        'dynamodb', 'update-item', '--table-name', table,
-        '--key', JSON.stringify({ userSub: { S: sub } }),
-        '--update-expression', 'SET onboardedAt = if_not_exists(onboardedAt, :now), updatedAt = :now',
-        '--expression-attribute-values', JSON.stringify({ ':now': { S: now } }),
-      ]);
-      console.log(`[global-setup] ensured ${email} (${sub}) is onboarded in ${table}`);
-    } catch (err) {
-      console.warn(`[global-setup] could not pre-onboard ${email} (continuing):`, (err as Error).message);
-    }
+  // The row is keyed by the person id the exchange minted, and `if_not_exists` keeps a real
+  // onboardedAt (and facts) intact if the user already onboarded.
+  for (const user of users) {
+    if (await ensureOnboarded(user.email)) console.log(`[global-setup] ensured ${user.email} is onboarded`);
+    else console.warn(`[global-setup] could not pre-onboard ${user.email} (continuing)`);
   }
 }

@@ -19,7 +19,7 @@
  * CI fails on SHA drift.
  */
 
-import { test, expect } from '@playwright/test';
+import { test, expect } from './helpers/fixtures';
 import * as fs from 'fs';
 import * as path from 'path';
 import * as os from 'os';
@@ -30,6 +30,7 @@ import { WebSocketMonitor, isPlaceholder } from './helpers/websocket-monitor';
 import { ChannelWireRecorder } from './helpers/channel-wire';
 import { getPremiumUser, hasTestCredentials, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { stackName, physicalIdsIn } from './helpers/stack-prefix';
 import {
   assistantResponseCount,
   channelMetadata,
@@ -169,17 +170,12 @@ const DRIFT_TRIGGER = "let's start a new conversation about quarterly revenue fo
 const SUGGESTION_MARKER = 'start a separate conversation for this';
 const E2E_RUNNABLE = hasTestCredentials();
 
-/** Resolve the AgentEchelon (NOT a look-alike instance in the same account) ChannelBattleConfig
- *  table name from DynamoDB. Returns null if it can't be found. */
+/** Resolve this instance's (NOT a look-alike instance in the same account) ChannelBattleConfig
+ *  table name from its Battle stack (helpers/stack-prefix.ts). Returns null if it can't be found. */
 function resolveBattleConfigTable(): string | null {
   try {
-    const raw = execSync(
-      `aws dynamodb list-tables --region us-east-1 ` +
-        `--query "TableNames[?starts_with(@, 'AgentEchelonBattle-ChannelBattleConfig')]" --output json`,
-      { encoding: 'utf8', timeout: 20000, env: process.env },
-    );
-    const names: string[] = JSON.parse(raw);
-    return names[0] || null;
+    const [name] = physicalIdsIn([stackName('Battle')], { type: 'AWS::DynamoDB::Table', logicalId: /^ChannelBattleConfigTable/ });
+    return name || null;
   } catch {
     return null;
   }
@@ -216,7 +212,7 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
       (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
       { timeout: 30000 },
     );
-    await createConversation(page, 'E2E Drift Confirm', 'Claude Opus');
+    await createConversation(page, 'E2E Drift Confirm', 'Premium');
     const originArn: string = (await (await createResp).json())?.conversation?.conversationArn || '';
     expect(originArn, 'origin channelArn from create-conversation').toBeTruthy();
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
@@ -232,21 +228,27 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
     // the welcome shape as interim copy to poll past — but accepting a drift suggestion navigates the user
     // into a NEW conversation whose only message IS a welcome. So the helper polls to its timeout on a flow
     // that is working correctly. Send the confirmation directly and assert the outcome instead.
+    // Listen first, so the link cannot arrive before anything is waiting for it.
+    const pushedLink = wsMonitor.waitForDriftRedirect(originArn, 60000);
     await page.locator('.message-textarea').fill('yes');
     await page.keyboard.press('Enter');
 
-    // Step 4: the assistant created the new conversation. Resolved from the BACKEND by parent pointer, and
-    // polled, because channel creation completes asynchronously after the confirm reply returns.
+    // Step 4: the assistant created the new conversation. Taken from the PERSON'S OWN SOCKET: the parent
+    // receives a message whose Metadata links the child, so waiting on it is the path the app itself is on.
+    // The CLI read by parent pointer is the BACKUP for a missed event only. Each CLI read costs seconds here,
+    // and a loop of twenty of them used up this test's whole budget on 2026-10-16 while the flow was working.
+    // `meta.parentChannelArn` below still proves, independently of the link, that the child names this parent.
     //
     // Deliberately NOT inferred from the DOM. The obvious UI check - "the header is no longer the origin
     // title" - is VACUOUS here: `createConversation` no longer sets a title, so the origin is auto-renamed
     // from its own first message and the header changes whether or not navigation happened. That check
     // passed while the page was still on the parent, and the test then read the PARENT's welcome and
     // reported the drift context missing from a flow that was working.
-    let child: string | null = null;
-    for (let i = 0; i < 20 && !child; i++) {
+    const pushed = await pushedLink;
+    let child: string | null = pushed?.childChannelArn ?? null;
+    for (let i = 0; i < 5 && !child; i++) {
       child = await driftChannelForParent(originArn);
-      if (!child) await page.waitForTimeout(1500);
+      if (!child) await page.waitForTimeout(2000);
     }
     expect(child, 'no drift-created channel names this conversation as its parent').not.toBeNull();
 
@@ -265,6 +267,14 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
     //
     // `assistantResponseCount` filters `continuation === true`, so it counts RESPONSES. The claim here
     // is "the drift child opens with one assistant response", and that is what it now asserts.
+    //
+    // SETTLED FIRST, THEN COUNTED. The child is known from the pushed link the moment it is created, and
+    // its welcome is materialized by Amazon Chime SDK from the router's Lex return a moment later, so a
+    // count taken at once can read 0 on a working flow (observed live 2026-10-27: counted 0, and the
+    // channel held exactly one response seconds later). Wait for the response to exist, then assert that
+    // there is exactly one - the duplicate this guards against would show as 2 after the wait, not before.
+    await expect.poll(() => assistantResponseCount(child!), { timeout: 30000, intervals: [1000, 2000] })
+      .toBeGreaterThan(0);
     expect(await assistantResponseCount(child!), 'the drift conversation should open with exactly one assistant response')
       .toBe(1);
 
@@ -291,7 +301,7 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
     // Navigation the OTHER way: the parent carries a durable, followable link to the child. In METADATA,
     // because the NAVIGATE_CHANNEL marker is stripped before display - so without this the parent keeps the
     // announcement and loses the way to reach what it announced.
-    const link = await driftRedirectMessage(originArn);
+    const link = pushed ?? await driftRedirectMessage(originArn);
     expect(link, 'the parent has no message carrying a driftRedirect link to the child').not.toBeNull();
     expect(link!.childChannelArn, 'the parent link points at the child that was created').toBe(child);
 
@@ -304,7 +314,21 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
     // "Hi - I'm your assistant at <company>" pushes the only line that matters below an introduction
     // they were just given. So the company line is asserted ABSENT here, not present.
     expect(welcome, 'a spawned conversation must not re-introduce the assistant').not.toMatch(/i'm your assistant at/i);
-    expect(welcome, 'a spawned conversation must not repeat the company orientation').not.toMatch(/stratum/i);
+    // THE COMPANY NAME IS NO LONGER A PROXY FOR THE ORIENTATION, so it is not asserted absent.
+    //
+    // This line used to read `.not.toMatch(/stratum/i)` and was correct while the welcome was a
+    // TERMINAL message: nothing but orientation copy could have named the company. The welcome now
+    // FOLDS THE ANSWER to the question that spawned the conversation (`messagePrefix`, the router's
+    // WelcomeIntent branch), so this one message carries the continuity lines and then a real reply -
+    // and a reply about this deployment's own business legitimately names its products. Measured live:
+    // the orientation was correctly absent and the assertion failed on "StratumAnalytics" inside a Q2
+    // revenue table.
+    //
+    // What actually has to hold is that the orientation is not the OPENING, which the next assertion
+    // states directly and positively. Keeping a banned substring here would mean the test fails
+    // whenever the assistant does its job well.
+    expect(welcome, 'a spawned conversation must not carry the company blurb line')
+      .not.toMatch(/you're working with/i);
     // It opens directly on the continuity.
     expect(welcome.trimStart(), 'the welcome opens on why this conversation exists').toMatch(/^this conversation picks up/i);
     expect(welcome, "the welcome quotes the user's own message back").toMatch(/quarterly revenue forecasting/i);
@@ -353,18 +377,29 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
     // class afterwards is a race the test loses whenever the app is a little slow - which is exactly how
     // this failed intermittently. Recording the transition as it happens removes the race without
     // weakening the assertion or lengthening a product timer to suit a test.
-    await page.evaluate((id) => {
+    //
+    // THE LINK IS A FULL DOCUMENT LOAD (`CollapsibleText` renders it as a plain same-tab anchor), so an
+    // observer installed with `page.evaluate` dies with the old document and the race comes straight back.
+    // `addInitScript` runs it again in every new document, before the app's own scripts, so the
+    // transition is recorded on the page the link actually lands on.
+    const watchFocus = (id: string) => {
       const w = window as unknown as { __focusSeen?: boolean };
       w.__focusSeen = false;
       const seen = () => {
         const el = document.querySelector(`[data-message-id="${id}"]`);
         if (el?.classList.contains('message--focused')) w.__focusSeen = true;
       };
-      new MutationObserver(seen).observe(document.body, {
-        subtree: true, childList: true, attributes: true, attributeFilter: ['class'],
-      });
-      seen();
-    }, originatingMessageId);
+      const start = () => {
+        new MutationObserver(seen).observe(document.documentElement, {
+          subtree: true, childList: true, attributes: true, attributeFilter: ['class'],
+        });
+        seen();
+      };
+      if (document.documentElement) start();
+      else document.addEventListener('DOMContentLoaded', start);
+    };
+    await page.addInitScript(watchFocus, originatingMessageId);
+    await page.evaluate(watchFocus, originatingMessageId);
 
     await page.locator('.assistant-message .message-text a', { hasText: 'the conversation it came from' })
       .first()
@@ -426,7 +461,7 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
     const wsMonitor = new WebSocketMonitor();
     await signIn(page, user.email, user.password, wsMonitor);
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
-    await createConversation(page, 'E2E Drift Decline', 'Claude Opus');
+    await createConversation(page, 'E2E Drift Decline', 'Premium');
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
     const suggestion = await sendAndWaitForResponse(page, DRIFT_TRIGGER, 60000, wsMonitor);
@@ -449,7 +484,7 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
   // comparing answers" when no assistant was doing anything.
   //
   // The test was last touched two days BEFORE that change and kept asserting the superseded rule, so
-  // it has been failing against correct behaviour. Inverted here rather than deleted, because the new
+  // it has been failing against correct behavior. Inverted here rather than deleted, because the new
   // rule had no coverage at all: nothing asserted that a channel with Battle Mode merely switched on
   // still gets the ordinary drift offer, which is the whole point of the narrowing.
   //
@@ -457,7 +492,7 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
   // the rest of the duel setup in battle.spec.ts rather than behind a hand-written config row here.
   test('battle mode alone does NOT suppress drift — only a running duel does', async ({ page }) => {
     const table = resolveBattleConfigTable();
-    test.skip(!table, 'AgentEchelonBattle ChannelBattleConfig table not found (battle not deployed).');
+    test.skip(!table, `${stackName('Battle')} ChannelBattleConfig table not found (battle not deployed).`);
     const user = await getPremiumUser();
     test.skip(!user.password, missingUserReason('premiumUser'));
     const wsMonitor = new WebSocketMonitor();
@@ -478,7 +513,7 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
       (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
       { timeout: 30000 },
     );
-    await createConversation(page, 'E2E Drift Battle', 'Claude Opus');
+    await createConversation(page, 'E2E Drift Battle', 'Premium');
     const body = await (await createResp).json();
     const channelArn: string = body.conversation.conversationArn;
     console.log(`\n--- drift-battle channelArn (written to ChannelBattleConfig) ---\n${channelArn}`);
@@ -486,7 +521,7 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
 
     // Enable /battle on THIS channel via a direct DDB write BEFORE the first
     // message, so no negative "not-enabled" cache is warm when the handler
-    // checks. isBattleEnabled only inspects `enabled`, so no experiment/slot
+    // checks. isBattleEnabled only inspects `enabled`, so no experiment/challenger
     // infra is needed to exercise suppression.
     ddbWrite('put-item', table!, '--item', {
       channelArn: { S: channelArn },
@@ -565,7 +600,7 @@ test.describe('Drift live-suggestion E2E (live, explicit-routing fast-path)', ()
 // would have sat in INSUFFICIENT_DATA rather than fired. Every unit test passed the whole time,
 // because a unit test asserts the shape the emitter produces and the schema is an external contract.
 //
-// The tests above would also have stayed green: drift's user-visible behaviour was correct
+// The tests above would also have stayed green: drift's user-visible behavior was correct
 // throughout. Only reading the metric BACK from CloudWatch can see this class of defect.
 //
 // NOTE: `AgentEchelon/Tasks` has no equivalent assertion, and deliberately so. It declares exactly
@@ -592,10 +627,10 @@ test.describe('Drift metrics materialise in CloudWatch (EMF contract)', () => {
     const wsMonitor = new WebSocketMonitor();
     await signIn(page, user.email, user.password, wsMonitor);
     await expect(page.locator('.app-header')).toBeVisible({ timeout: 30000 });
-    await createConversation(page, `E2E Drift Metrics ${Date.now()}`, 'Claude Opus');
+    await createConversation(page, `E2E Drift Metrics ${Date.now()}`, 'Premium');
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15000 });
 
-    // Same deterministic trigger the behavioural tests use: the explicit-routing fast-path fires on
+    // Same deterministic trigger the behavioral tests use: the explicit-routing fast-path fires on
     // the first message with no dependency on the ~30-min summary updater.
     const suggestion = await sendAndWaitForResponse(page, DRIFT_TRIGGER, 60000, wsMonitor);
     expect(

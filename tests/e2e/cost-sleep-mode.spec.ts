@@ -22,33 +22,21 @@
  *
  *   AWS_PROFILE=<p> E2E_BASE_URL=<cf> npx playwright test e2e/cost-sleep-mode.spec.ts
  */
-import { test, expect } from '@playwright/test';
-import { execSync } from 'child_process';
+import { test, expect } from './helpers/fixtures';
 import { signIn } from './helpers/agent-helpers';
 import { getStandardUser, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { stackName } from './helpers/stack-prefix';
+import { aws } from './helpers/aws';
+import { PERSON_API_URL, personUrl } from './helpers/api-urls';
 
 guardConsoleErrors();
 
 const AWS_PROFILE = process.env.AWS_PROFILE || '';
-const REGION = process.env.AWS_REGION || 'us-east-1';
-const AURORA_STACK = process.env.E2E_AURORA_STACK || 'AgentEchelonAnalyticsAurora';
+const AURORA_STACK = process.env.E2E_AURORA_STACK || stackName('Archive');
 const haveCreds = () => Boolean(AWS_PROFILE || process.env.AWS_ACCESS_KEY_ID || process.env.AWS_SESSION_TOKEN);
 
 const STATE_PATH = '/deployment/state';
-
-function aws(args: string): any {
-  const out = execSync(`aws ${args} --region ${REGION} --output json`, {
-    encoding: 'utf8',
-    timeout: 30000,
-    env: {
-      ...process.env,
-      ...(AWS_PROFILE ? { AWS_PROFILE } : {}),
-      MSYS_NO_PATHCONV: '1',
-    },
-  }).trim();
-  return out ? JSON.parse(out) : null;
-}
 
 test.describe('Cost sleep mode is deployed exactly as far as its flag says (SPEC-COST-SLEEP-MODE)', () => {
   guardBackendErrors('cost-sleep-mode');
@@ -71,19 +59,21 @@ test.describe('Cost sleep mode is deployed exactly as far as its flag says (SPEC
     ).toBeDefined();
     const enabled = flag === 'true';
 
-    const apiUrl = outputs.find((o) => o.OutputKey === 'AnalyticsApiUrl')?.OutputValue;
-    expect(apiUrl, 'AnalyticsApiUrl output should resolve').toBeTruthy();
-    const restApiId = new URL(apiUrl!).hostname.split('.')[0];
+    // The person API, which serves the state probe when sleep mode is deployed. This check needs the API
+    // either way, so it is the API's own URL rather than the probe's.
+    expect(PERSON_API_URL, 'VITE_PERSON_API_URL must be set').toBeTruthy();
+    const apiId = new URL(PERSON_API_URL).hostname.split('.')[0];
 
-    console.log(`\n--- sleep mode: ${enabled ? 'ENABLED' : 'disabled'} (api ${restApiId}) ---`);
+    console.log(`\n--- sleep mode: ${enabled ? 'ENABLED' : 'disabled'} (api ${apiId}) ---`);
 
     // 2) BACKEND — the route exists if and only if the flag says so. Read from API Gateway rather
     //    than by probing over HTTP: a 403 from a missing route and a 403 from an authorizer are
     //    indistinguishable to a client, which is exactly how this drifts unnoticed.
-    const paths: string[] = (aws(`apigateway get-resources --rest-api-id ${restApiId}`)?.items ?? []).map(
-      (i: any) => i.path,
+    // An HTTP API names a route by its key, `GET /deployment/state`.
+    const routeKeys: string[] = (aws(`apigatewayv2 get-routes --api-id ${apiId}`)?.Items ?? []).map(
+      (i: any) => i.RouteKey,
     );
-    const routeExists = paths.includes(STATE_PATH);
+    const routeExists = routeKeys.includes(`GET ${STATE_PATH}`);
     console.log(`  ${STATE_PATH} present on the API: ${routeExists}`);
 
     expect(
@@ -114,7 +104,7 @@ test.describe('Cost sleep mode is deployed exactly as far as its flag says (SPEC
       ).toBeGreaterThan(0);
 
       // With the feature on, the endpoint must also answer with a state the banner understands.
-      const res = await page.request.get(new URL(STATE_PATH.slice(1), apiUrl!).toString());
+      const res = await page.request.get(personUrl('/deployment/state'));
       expect(res.status(), `${STATE_PATH} should answer (it is public by design)`).toBe(200);
       const body = await res.json();
       expect(

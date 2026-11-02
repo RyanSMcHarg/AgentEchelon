@@ -11,11 +11,11 @@
  *      out from a per-turn `not-in-catalog` metric - a silently partial assistant.
  *   2. A version's persona must fit its cap. Which cap that is CHANGED, and the two cases below are
  *      deliberately kept as a pair. The persona used to ride inside the definition parameter, so the
- *      parameter's 4096-character limit was the real ceiling while the schema advertised 20000 - a
+ *      parameter's 4096-character limit was the real limit while the schema advertised 20000 - a
  *      persona in that gap validated cleanly and then failed at PutParameter with an opaque AWS
  *      ValidationException. The body now lives in S3 and the definition holds a pointer, so a persona
  *      in that gap is STORABLE and the first case asserts it is accepted; MAX_PERSONA_LENGTH is still
- *      the ceiling, and the second asserts a persona past it is still refused by name. Asserting only
+ *      the limit, and the second asserts a persona past it is still refused by name. Asserting only
  *      the second would let the indirection silently regress: an implementation that quietly kept the
  *      body inline would pass it.
  *
@@ -27,11 +27,13 @@
  * test persona live on the deployment because its rollback swallowed errors, so the cleanup here
  * verifies by READ-BACK rather than trusting the call to have worked.
  */
-import { test, expect } from '@playwright/test';
-import { signIn } from './helpers/agent-helpers';
+import { test, expect } from './helpers/fixtures';
+import { assistantServing } from './helpers/assistant-identity';
+import { signIn, idTokenOf } from './helpers/agent-helpers';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { getAdminUser, missingUserReason } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { ADMIN_API_URL, adminUrl, profileActionUrl } from './helpers/api-urls';
 
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
 test.use({ baseURL: ADMIN_BASE_URL });
@@ -39,9 +41,12 @@ test.use({ baseURL: ADMIN_BASE_URL });
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardConsoleErrors();
 
-const PROFILE = 'standard';
+/** Resolved in `beforeAll`, NOT at import. Playwright loads every spec during collection, before any
+ *  skip condition runs, so resolving this at module scope made a machine without AWS credentials fail
+ *  three specs at IMPORT - specs designed to skip - and charged every unrelated run for the lookup. */
+let PROFILE = '';
 
-const MANAGE_PROFILES_API = process.env.VITE_MANAGE_PROFILES_API_URL || '';
+const MANAGE_PROFILES_API = ADMIN_API_URL ? adminUrl('assistant-admin', '/admin/profiles') : '';
 
 /**
  * Node-side SigV4 POST to the live manage-profiles API, matching profile-config.spec.ts.
@@ -52,7 +57,7 @@ const MANAGE_PROFILES_API = process.env.VITE_MANAGE_PROFILES_API_URL || '';
  */
 async function api(idToken: string, action: string, body: Record<string, unknown>): Promise<any> {
   try {
-    return await signedAnalyticsPost(`${MANAGE_PROFILES_API}${action}`, idToken, body);
+    return await signedAnalyticsPost(profileActionUrl(action), idToken, body);
   } catch (err) {
     // The API answers 4xx for a REJECTED draft, which is the expected result in most cases here.
     return { __error: String((err as Error).message || err) };
@@ -63,15 +68,18 @@ test.describe.serial('portable profile write-path gates', () => {
   guardBackendErrors('portable-profile-gates');
 
   // Needs the IAM-enforced manage-profiles API, same gate profile-config uses.
-  test.skip(!MANAGE_PROFILES_API, 'VITE_MANAGE_PROFILES_API_URL must be set (run via validate.mjs)');
+  test.skip(!MANAGE_PROFILES_API, 'VITE_ADMIN_API_URL must be set (run via validate.mjs)');
 
   let idToken = '';
 
   test.beforeEach(async ({ page }) => {
     const admin = await getAdminUser();
     test.skip(!admin.password, missingUserReason('testAdmin'));
+    // Resolved HERE, after the skip gates above: the lookup needs AWS credentials, and doing it at
+    // import time would fail specs that are meant to skip without them.
+    PROFILE = assistantServing('standard');
     await signIn(page, admin.email, admin.password);
-    idToken = (await page.evaluate(() => localStorage.getItem('idToken'))) || '';
+    idToken = await idTokenOf(page);
     expect(idToken, 'admin idToken').toBeTruthy();
   });
 
@@ -79,13 +87,18 @@ test.describe.serial('portable profile write-path gates', () => {
     test.setTimeout(120_000);
     await page.goto('/?admin=profiles');
 
-    await expect(page.locator('h3:has-text("Assistant Profiles")')).toBeVisible({ timeout: 20000 });
+    await expect(page.locator('h3:has-text("Assistants")')).toBeVisible({ timeout: 20000 });
     await expect(page.locator('.admin-tab-loading')).toHaveCount(0, { timeout: 20000 });
 
-    const rows = page.locator('.admin-content table tbody tr');
-    await expect(rows.first()).toBeVisible({ timeout: 15000 });
-    const listed = (await page.locator('.admin-content table').innerText()).toLowerCase();
-    expect(listed, 'the seeded profiles should be listed').toMatch(/basic|standard|premium/);
+    // The Assistants list is the tab's one table: every assistant, however it was created.
+    const profileTable = page.locator('.admin-content table').first();
+    await expect(profileTable.locator('tbody tr').first()).toBeVisible({ timeout: 15000 });
+    const listed = (await profileTable.innerText()).toLowerCase();
+    // THE ASSISTANT THIS DEPLOYMENT ACTUALLY DECLARES, not a guess at what it is named. This asserted
+    // /basic|standard|premium/, which was the CLASSIFICATION list and matched only while profiles were
+    // named after the classification they serve. Asserting the resolved name keeps the check meaningful
+    // through a rename instead of pinning the coincidence (DESIGN-SEPARATE-ASSISTANTS 3.0).
+    expect(listed, 'the assistant serving standard should be listed').toContain(PROFILE.toLowerCase());
   });
 
   test('activation is REFUSED for a context key this deployment does not publish', async () => {
@@ -145,8 +158,8 @@ test.describe.serial('portable profile write-path gates', () => {
   test('a persona over the persona CAP is still refused, with an actionable message', async () => {
     test.setTimeout(180_000);
 
-    // The storage indirection removed the parameter's limit as the persona's ceiling; it did not
-    // remove the ceiling. MAX_PERSONA_LENGTH (20000) still bounds what a version may carry, so an
+    // The storage indirection removed the parameter's limit as the persona's limit; it did not
+    // remove the limit. MAX_PERSONA_LENGTH (20000) still bounds what a version may carry, so an
     // import or edit cannot smuggle an unbounded prompt into a turn. Asserted on the EDIT because
     // that is where the operator's change is, and a bare 500 here would name neither field nor size.
     await api(idToken, '/version', { profileName: PROFILE });

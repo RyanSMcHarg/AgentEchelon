@@ -17,13 +17,14 @@
  * section and the turn still succeeds, so a broken catalog looks like a healthy conversation from the
  * outside. The backend guard is what sees the difference.
  */
-import { test, expect } from '@playwright/test';
+import { test, expect } from './helpers/fixtures';
 import {
   signIn,
   createConversation,
   sendAndWaitForResponse,
   WebSocketMonitor,
   ConsoleMonitor,
+  idTokenOf,
 } from './helpers/agent-helpers';
 import { getStandardUser, getAdminUser, missingUserReason } from './helpers/test-credentials';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
@@ -35,22 +36,26 @@ import {
   metricCheckEnabled,
   METRIC_CHECK_DISABLED,
 } from './helpers/context-source-metrics';
+import { SSM_ROOT } from './helpers/stack-prefix';
+import { ADMIN_API_URL, adminUrl, profileActionUrl } from './helpers/api-urls';
 
 // Watch the two blind spots an e2e assertion leaves: the server, and the browser console.
 guardConsoleErrors();
 
 
-/** The reference deployment's standard profile selects `company-docs`. */
+/** The classification the turn runs in, and the assistant that serves it: profiles are named per
+ *  ASSISTANT, so the selection is made on `analyst`, while the metric is dimensioned by classification. */
 const CLASSIFICATION = 'standard';
+const PROFILE_NAME = 'analyst';
 const SOURCE_KEY = 'company-docs';
-const MANAGE_PROFILES_API = (process.env.VITE_MANAGE_PROFILES_API_URL || '').replace(/\/$/, '');
+const MANAGE_PROFILES_API = ADMIN_API_URL ? adminUrl('assistant-admin', '/admin/profiles') : '';
 
 /** The version the `active` label points at for the standard profile — the suite's restore target. */
 function activeStandardVersion(): number | null {
   try {
     const raw = execSync(
       'aws ssm get-parameter-history --region ' + (process.env.AWS_REGION || 'us-east-1')
-      + ' --name "/agent-echelon/assistant/' + CLASSIFICATION + '/definition"'
+      + ` --name "${SSM_ROOT}/assistant/` + PROFILE_NAME + '/definition"'
       + ' --query "Parameters[?Labels!=null].{v:Version,labels:Labels}" --output json',
       { encoding: 'utf8', timeout: 30000, env: { ...process.env, MSYS_NO_PATHCONV: '1' } },
     );
@@ -93,17 +98,17 @@ test.describe.serial('context sources reach a live turn', () => {
     const page = await ctx.newPage();
     try {
       await signIn(page, admin.email, admin.password);
-      const idToken = (await page.evaluate(() => localStorage.getItem('idToken')))!;
+      const idToken = await idTokenOf(page);
       const post = (action: string, body: unknown) =>
-        signedAnalyticsPost(`${MANAGE_PROFILES_API}${action}`, idToken, body);
+        signedAnalyticsPost(profileActionUrl(action), idToken, body);
 
       originalActiveVersion = activeStandardVersion();
-      await post('/version', { profileName: CLASSIFICATION });
-      await post('/draft', { profileName: CLASSIFICATION, patch: { contextSources: [SOURCE_KEY] } });
-      const activated = await post('/activate', { profileName: CLASSIFICATION });
+      await post('/version', { profileName: PROFILE_NAME });
+      await post('/draft', { profileName: PROFILE_NAME, patch: { contextSources: [SOURCE_KEY] } });
+      const activated = await post('/activate', { profileName: PROFILE_NAME });
       expect(
         activated?.version,
-        `could not select '${SOURCE_KEY}' on the ${CLASSIFICATION} profile: ${JSON.stringify(activated)}`,
+        `could not select '${SOURCE_KEY}' on the ${PROFILE_NAME} profile: ${JSON.stringify(activated)}`,
       ).toBeTruthy();
     } finally {
       await ctx.close();
@@ -119,9 +124,9 @@ test.describe.serial('context sources reach a live turn', () => {
     const page = await ctx.newPage();
     try {
       await signIn(page, admin.email, admin.password);
-      const idToken = (await page.evaluate(() => localStorage.getItem('idToken')))!;
-      await signedAnalyticsPost(`${MANAGE_PROFILES_API}/rollback`, idToken, {
-        profileName: CLASSIFICATION,
+      const idToken = await idTokenOf(page);
+      await signedAnalyticsPost(adminUrl('assistant-admin', '/admin/profiles/rollback'), idToken, {
+        profileName: PROFILE_NAME,
         version: originalActiveVersion,
       }).catch(() => { /* teardown must not fail a green suite; the next run re-selects anyway */ });
     } finally {
@@ -142,7 +147,7 @@ test.describe.serial('context sources reach a live turn', () => {
     test.setTimeout(300_000); // the turn, plus EMF ingestion latency on the metric poll
 
     turnStartedAt = Date.now() - 60_000; // lead-in: the handler clock is not ours
-    await createConversation(page, 'E2E Context Sources', 'Claude Sonnet');
+    await createConversation(page, 'E2E Context Sources', 'Standard');
 
     // A question that has to be answered from company knowledge rather than general knowledge.
     // Stratum is fictional, so an ungrounded model has nothing to say.

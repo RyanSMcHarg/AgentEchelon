@@ -2,13 +2,13 @@
  * Battle E2E setup helpers.
  *
  * The /battle behavioral specs require a live battle-enabled deploy: the
- * AgentEchelonBattle stack (alt-bot slot pool + orchestrator + channel-battle API)
+ * AgentEchelonBattle stack (orchestrator + channel-battle API; each classification stack provisions its alt)
  * and a premium/admin test user. Plain `cd tests && npm test` must NOT run them
  * (no battle deploy guaranteed, real model duels are slow), so every battle
  * behavioral test calls `requireBattleE2E()` and is SKIPPED unless BATTLE_E2E=1.
  *
  * Run them against a provisioned stack (frontend dev server up + backend
- * deployed with enableBattle):
+ * deployed with battle in capabilities):
  *   cd tests
  *   BATTLE_E2E=1 AWS_PROFILE=<your-profile> npx playwright test e2e/battle.spec.ts \
  *     --config=playwright.config.ts
@@ -17,13 +17,19 @@
  * channel, and fire a real duel — hard-asserting the UX. The selectors are the
  * real frontend ones.
  */
+import { signedAdminContext, type SignedAdminContext } from './signed-analytics';
 import { Page, expect, test, request } from '@playwright/test';
 import * as fs from 'fs';
 import * as path from 'path';
-import { signIn } from './agent-helpers';
+import { signIn, idTokenOf, createConversation } from './agent-helpers';
 import { getTestCredentials } from './test-credentials';
+import { aws } from './task-backend';
 import { BATTLE_EXP_FILE } from '../../playwright.config';
 import { raceBackendErrors } from './backend-errors';
+import { retireStrandedE2eExperiments } from './experiment-sweep';
+import { SSM_ROOT } from './stack-prefix';
+import { adminApiServes, adminUrl, personApiServes } from './api-urls';
+import { fillSecret } from './unrecorded-secret';
 
 export const BATTLE_E2E_ENABLED = process.env.BATTLE_E2E === '1' || process.env.BATTLE_E2E === 'true';
 
@@ -32,6 +38,12 @@ export function requireBattleE2E(): void {
   test.skip(
     !BATTLE_E2E_ENABLED,
     'Battle E2E — set BATTLE_E2E=1 and point at a deployed battle-enabled stack (frontend running)',
+  );
+  // The deployment states whether it serves battle: the person API lists `battle` among its capabilities
+  // when the battle routes exist. Without it there is no battle to drive, so the suite has nothing to test.
+  test.skip(
+    !personApiServes('battle'),
+    'this deployment does not serve battle (VITE_PERSON_API_CAPABILITIES does not name battle)',
   );
 }
 
@@ -97,13 +109,31 @@ export function remintBattleExpIds(): { text: string; image: string } {
   return ids;
 }
 
+/**
+ * Ids THIS PROCESS has armed. The retire loop below skips them.
+ *
+ * The persisted pair is not sufficient for that skip, and the gap is what completed a live experiment
+ * mid-run. The file is shared mutable state: `initBattleExpIds`, `readOrMintExpIds` and
+ * `remintBattleExpIds` all write it, `path.resolve` makes it cwd-relative, and a re-mint that hits the
+ * once-per-process guard returns its cached pair WITHOUT rewriting it. So `battleExpId()` can answer
+ * with a pair this process never armed, the skip misses, and the loop completes the experiment the
+ * beforeAll just armed - which then reads `completed` mid-run with the challenger still named, and the duel
+ * that followed had no armed experiment to run against.
+ *
+ * What this process armed is not inferable from a file; record it directly.
+ */
+const armedThisProcess = new Set<string>();
+
 /** This run's TEXT battle experiment id. */
 export function battleExpId(): string {
-  return readOrMintExpIds().text;
+  // The RE-MINTED pair wins over the file. Once this process has re-minted, those are its ids whatever
+  // another process wrote afterwards, and every caller that defaults to this accessor (activate, enable,
+  // retire) must agree with the arm that actually happened.
+  return remintedThisProcess?.text ?? readOrMintExpIds().text;
 }
 /** This run's IMAGE generation-out experiment id (both variants carry an image-gen model). */
 export function battleImageExpId(): string {
-  return readOrMintExpIds().image;
+  return remintedThisProcess?.image ?? readOrMintExpIds().image;
 }
 /**
  * Mint a FRESH pair for this run (called by the setup project), so every test in the run agrees on
@@ -164,7 +194,7 @@ async function openAdminExperiments(page: Page): Promise<void> {
     // per-origin (localStorage), so the admin origin must be signed into here,
     // directly against the form in front of us.
     await page.locator('input[type="email"]').fill(creds.testAdmin.email);
-    await page.locator('input[type="password"]').fill(creds.testAdmin.password);
+    await fillSecret(page.locator('input[type="password"]'), creds.testAdmin.password);
     await page.locator('button[type="submit"]').click();
     // Admin auth lands on the dashboard shell; then re-deep-link to Experiments.
     await page.waitForSelector('.admin-dashboard, .admin-section-rail', { timeout: 30_000 });
@@ -185,10 +215,99 @@ async function leaveAdmin(page: Page): Promise<void> {
  * They clicked Pause/Resume in the admin table and each began "row not present -> nothing to do".
  * Every run leaves two completed `e2e-battle-*` rows behind and nothing prunes them, so once the table
  * paginated past them both helpers no-oped in silence and the failure appeared at the channel enable
- * instead: "Slot is bound to another active battle experiment" (sibling never paused) or "Experiment is
+ * instead: "The challenger is named by another active battle experiment" (sibling never paused) or "Experiment is
  * not active" (own never resumed). `activateBattleExperiment` now drives the admin API, which is the
  * same authority the arming read-back already uses for the same stated reason.
  */
+
+/**
+ * THE ALT'S ASSIGNMENT RECORD FOR A CLASSIFICATION, as its classification stack publishes it (§3.7):
+ * `${SSM_ROOT}/assistant-assignments/{classification}/primary/alt`, naming the alt's bot and its own
+ * Amazon Lex bot. Asserted present, because a battle arms only where the classification provisions one.
+ */
+function altRecordFor(classification: string): { botArn?: string; lexBotId?: string } {
+  const name = `${SSM_ROOT}/assistant-assignments/${classification}/primary/alt`;
+  const raw = aws(`ssm get-parameter --name "${name}"`)?.Parameter?.Value;
+  const record = JSON.parse(raw || '{}') as { botArn?: string; lexBotId?: string };
+  expect(
+    record.botArn,
+    `no alt is provisioned for '${classification}' (${name} is ${raw || 'unreadable'}). Deploy the `
+    + `${classification} classification stack with battle enabled, which provisions its alt.`,
+  ).toBeTruthy();
+  return record;
+}
+
+/**
+ * THE ASSISTANT THAT HOLDS A CLASSIFICATION'S ROLE LIVE, by its profile name, read from its assignment
+ * record. A profile is named for its assistant (`advisor`), never for its classification (`premium`), and a
+ * deployment may rename it, so a spec reads it rather than spelling it.
+ */
+export function liveAssistantFor(classification: string, role = 'primary'): string {
+  // The declared assistant's record, at the one path every live assistant's record has (ADR-048, amended
+  // 2026-10-23); the declared one is the record that is not a console-created (`runtime`) one.
+  const name = `${SSM_ROOT}/assistant-assignments/${classification}/${role}/assistants`;
+  const values = (aws(`ssm get-parameters-by-path --path "${name}"`)?.Parameters ?? []) as Array<{ Value?: string }>;
+  const records = values.map((p) => { try { return JSON.parse(p.Value || '{}') as { assistant?: string; source?: string }; } catch { return {}; } });
+  const assistant = records.find((r) => r.source !== 'runtime' && r.assistant)?.assistant || '';
+  expect(assistant, `no declared assistant holds '${classification}' ${role} live (${name})`).toBeTruthy();
+  return assistant;
+}
+
+/**
+ * THE CHALLENGER AN EXPERIMENT NAMES, as `challengerAssistant`: the alt of the experiment's own
+ * classification, by assistant id, checked against a provisioned alt so a spec cannot arm a battle the
+ * deployment cannot field. The server refuses any other id for that classification.
+ */
+export function challengerFor(classification: string): string {
+  altRecordFor(classification);
+  return `alt-primary-${classification}`;
+}
+
+/**
+ * THE ALT BOT SERVING A CLASSIFICATION, read from its assignment record, never hardcoded. The name is
+ * what its classification stack gives the bot, so a test that addressed a name of its own invention
+ * would pass or fail on the fixture rather than on the product.
+ */
+export function altBotArnFor(classification: string): string {
+  return altRecordFor(classification).botArn || '';
+}
+
+/**
+ * TURN BATTLE ON for a classification, through the deployed admin API.
+ *
+ * Battle is OFF until an operator turns it on (ADR-049), classification-level and runtime, so a fresh
+ * or upgraded deployment refuses every enable until this runs. Without it the whole battle suite fails
+ * at `newBattleChannel` with 403 `TIER_FORBIDDEN`, which reads like a product regression and is not.
+ *
+ * THROUGH THE SIGNED API, NOT BY WRITING THE PARAMETER. The route refuses a classification the
+ * deployment did not wire, and that refusal is part of what this suite should be exercising; reaching
+ * around it with a direct SSM write would arrange a state the product would not have allowed and prove
+ * nothing about the path an operator actually takes.
+ */
+export async function enableBattleForClassification(page: Page, classification = 'premium'): Promise<void> {
+  const experimentsApi = adminApiServes('experiments') ? adminUrl('assistant-admin', '/admin/experiments') : '';
+  expect(
+    experimentsApi,
+    'VITE_ADMIN_API_CAPABILITIES must name experiments to turn battle on (run via validate.mjs, or export it)',
+  ).toBeTruthy();
+  await page.goto(CHAT_BASE_URL);
+  const idToken = await idTokenOf(page);
+  expect(idToken, 'no idToken on the current origin - enableBattleForClassification needs a signed-in page').toBeTruthy();
+  const api = signedAdminContext(idToken!);
+  try {
+    const resp = await api.post(adminUrl('assistant-admin', `/admin/experiments/battle-settings`), {
+      data: { classification, enabled: true },
+    });
+    // FAIL LOUD. A 409 here means this deployment does not build battle for the classification, which
+    // is a real answer and not something to retry around: the suite cannot run and should say why.
+    expect(
+      resp.ok(),
+      `turn battle on for '${classification}': ${resp.status()} ${await resp.text()}`,
+    ).toBeTruthy();
+  } finally {
+    await api.dispose();
+  }
+}
 
 /**
  * Ensure a battle-enabled premium experiment EXISTS (create-if-missing) — the expensive form-fill create
@@ -199,9 +318,9 @@ async function leaveAdmin(page: Page): Promise<void> {
  */
 export async function ensureBattleExperimentExists(
   page: Page,
-  opts: { slot?: string; control?: string; treatment?: string; expId?: string; image?: boolean } = {},
+  opts: { challenger?: string; control?: string; treatment?: string; expId?: string; image?: boolean } = {},
 ): Promise<void> {
-  const slot = opts.slot ?? 'slot-0';
+  const challenger = opts.challenger ?? challengerFor('premium');
   const expId = opts.expId ?? battleExpId();
   await openAdminExperiments(page);
 
@@ -229,21 +348,45 @@ export async function ensureBattleExperimentExists(
   // An image battle is an `intent` experiment on `image_generation` (the frontend's own
   // `isImageIntentExperiment`), with the image model carried per variant.
   {
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     // REQUIRED, not best-effort. This defaulted to '' when unset, and a POST to an empty URL still
     // satisfied `resp.ok()` - so arming silently created nothing and the suite failed much later
     // looking like a product bug. `validate.mjs` injects this; a bare `npx playwright test` does not,
     // which is exactly when the silent version bit.
-    const experimentsApi = process.env.VITE_EXPERIMENTS_API_URL || '';
+    const experimentsApi = adminApiServes('experiments') ? adminUrl('assistant-admin', '/admin/experiments') : '';
     expect(
       experimentsApi,
-      'VITE_EXPERIMENTS_API_URL must be set to arm a battle experiment (run via validate.mjs, or export it)',
+      'VITE_ADMIN_API_CAPABILITIES must name experiments to arm a battle experiment (run via validate.mjs, or export it)',
     ).toBeTruthy();
-    const api = await request.newContext({ extraHTTPHeaders: { Authorization: `Bearer ${idToken}` } });
+    const api = signedAdminContext(idToken!);
     try {
+      // FREE PREMIUM BEFORE ARMING. The create below is `active` on premium, and a classification holds
+      // one live experiment (§3.2.1), so anything live there turns it into a 409. Two sources: this
+      // run's own sibling (the text and image battles are a pair, and only one may be active - the
+      // same rule activateBattleExperiment applies), which is PAUSED so it can be resumed; and any
+      // `e2e-` experiment a killed run stranded, which is retired.
+      const sibling = expId === battleExpId() ? battleImageExpId() : battleExpId();
+      const before = await api.get(experimentsApi);
+      expect(before.ok(), `list experiments before arming ${expId}: ${before.status()}`).toBeTruthy();
+      const beforeBody = await before.json().catch(() => ({} as Record<string, unknown>));
+      const beforeRows = beforeBody.experiments ?? beforeBody.data ?? beforeBody;
+      const siblingRow = (Array.isArray(beforeRows) ? beforeRows : []).find(
+        (e: Record<string, unknown>) => (e.experimentId ?? e.id) === sibling,
+      );
+      if (siblingRow?.status === 'active') {
+        const paused = await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(sibling)}/status`), { data: { status: 'paused' } });
+        expect(paused.ok(), `pause sibling ${sibling} before arming: ${paused.status()} ${await paused.text()}`).toBeTruthy();
+      }
+      await retireStrandedE2eExperiments(api, experimentsApi, {
+        keep: [battleExpId(), battleImageExpId(), ...armedThisProcess],
+        label: 'battle-setup',
+      });
+
       let armId = expId;
-      const armOnce = (id: string) => api.post(experimentsApi, {
-        data: {
+      // A BATTLE ARMS IN ONE CALL (§3.7), the same call the console makes: the experiment is created
+      // `active` as set, and the server derives both duel sides' pinned versions as it arms it (the control
+      // under the live assistant, the treatment under the alt) and stores them on the variants.
+      const armBody = (id: string) => ({
           experimentId: id,
           status: 'active',
           // An image battle is an `intent` experiment on `image_generation`; a text battle varies
@@ -255,29 +398,43 @@ export async function ensureBattleExperimentExists(
           // explicitly - so this changes the briefing and nothing else. Without it the banner falls back
           // to GENERIC steering, and B-E2 ("chips match the experiment intent") asserts a claim the
           // arranged experiment never made.
-          intent: opts.image ? 'image_generation' : 'general_qa',
+          intent: opts.image ? 'image_generation' : 'general',
           tiers: ['premium'], // BATTLE_TIER_PREMIUM_ONLY guard
           battleEnabled: true,
-          altBotSlotId: slot,
+          challengerAssistant: challenger,
           variants: [
             // The two AWS-hosted Stability image models from IMAGE_GEN_MODELS. Named directly rather than
             // discovered through a dropdown: the catalog is in the repo, and neither needs an external
             // API key, so an image battle arms on any deployment that has Bedrock.
             ...(opts.image
               ? [
-                { variantId: 'control', modelKey: opts.control ?? 'sonnet', imageGenModelKey: 'stability_image_core', weight: 50, displayName: 'Atlas' },
-                { variantId: 'treatment', modelKey: opts.treatment ?? 'sonnet', imageGenModelKey: 'stability_image_ultra', weight: 50, displayName: 'Echo' },
+                { variantId: 'control', ...(opts.control ? { modelKey: opts.control } : {}), imageGenModelKey: 'stability_image_core', weight: 50 },
+                { variantId: 'treatment', modelKey: opts.treatment ?? 'sonnet', imageGenModelKey: 'stability_image_ultra', weight: 50 },
               ]
               : [
-                { variantId: 'control', modelKey: opts.control ?? 'sonnet', weight: 50, displayName: 'Atlas' },
-                { variantId: 'treatment', modelKey: opts.treatment ?? 'opus', weight: 50, displayName: 'Echo' },
+                // The control is the live assistant's active version (§3.5); it names a model only when asked to.
+                { variantId: 'control', ...(opts.control ? { modelKey: opts.control } : {}), weight: 50 },
+                { variantId: 'treatment', modelKey: opts.treatment ?? 'opus', weight: 50 },
               ]),
           ],
           objective: { metric: 'quality', target: 10, statement: 'E2E battle: decide the premium base model.' },
-        },
       });
+      const armOnce = (id: string) => api.post(experimentsApi, { data: armBody(id) });
 
-      let resp = await armOnce(armId);
+      // AN EXPERIMENT THIS RUN ALREADY ARMED IS REUSED, not re-armed. Active with both sides pinned is
+      // already armed; paused (its sibling took premium) is resumed, which derives again and reuses the pins
+      // that still say the same thing. Anything else is armed in one call.
+      const selfRow = (Array.isArray(beforeRows) ? beforeRows : []).find(
+        (e: Record<string, unknown>) => (e.experimentId ?? e.id) === armId,
+      ) as Record<string, unknown> | undefined;
+      const selfVariants = Array.isArray(selfRow?.variants) ? selfRow!.variants as Array<Record<string, unknown>> : [];
+      const selfPinned = selfVariants.some((v) => v.variantId === 'treatment' && !!v.altPin)
+        && selfVariants.some((v) => v.variantId === 'control' && !!v.controlPin);
+      let resp = selfRow?.status === 'active' && selfPinned
+        ? before
+        : selfRow?.status === 'paused' && selfPinned
+          ? await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(armId)}/status`), { data: { status: 'active' } })
+          : await armOnce(armId);
       // A TERMINAL id means the recorded pair belongs to a finished run — the setup project did not
       // run for this invocation (a `--grep` filters it out like any other test). Re-mint and arm
       // again, once, so the suite does not depend on how it was started. Any other failure is real
@@ -287,6 +444,7 @@ export async function ensureBattleExperimentExists(
         resp = await armOnce(armId);
       }
       expect(resp.ok(), `arm battle experiment via API: ${resp.status()} ${await resp.text()}`).toBeTruthy();
+      armedThisProcess.add(armId);
 
       // Verify against the API, NOT the admin table. The table was the original check and it is the
       // wrong authority twice over: the list can filter or paginate a row out, and a 2xx create whose
@@ -305,24 +463,27 @@ export async function ensureBattleExperimentExists(
       );
       const status = armed?.status as string | undefined;
 
-      // RETIRE PREVIOUS RUNS' BATTLE EXPERIMENTS. There is ONE alt-bot slot, and enabling a channel
+      // RETIRE PREVIOUS RUNS' BATTLE EXPERIMENTS. There is ONE challenger per classification, and enabling a channel
       // binds it to THE single active battle experiment; a second active one makes that ambiguous and
-      // the enable fails with "Slot is bound to another active battle experiment".
+      // the enable fails with "The challenger is named by another active battle experiment".
       //
       // The old fixed-id design got this for free by reusing one experiment forever - which is exactly
       // why it could never recover once that row went terminal. Per-run ids fix the terminal trap but
-      // reintroduce slot contention unless each run cleans up after the last, so it does that here.
+      // reintroduce challenger contention unless each run cleans up after the last, so it does that here.
       //
       // Scoped to `e2e-battle-*` ids and skipping THIS run's pair, so an operator's own experiment is
       // never completed by a test run.
       for (const row of (Array.isArray(rows) ? rows : [])) {
         const id = (row.experimentId ?? row.id) as string | undefined;
         if (!id || !/^e2e-battle-/.test(id)) continue;
-        if (id === battleExpId() || id === battleImageExpId()) continue;
+        // Skip this run's pair AND anything this process armed. The second half is the one that binds:
+        // `armId` may be a re-minted id that the persisted pair no longer names (see `armedThisProcess`),
+        // and completing it here retires the experiment the duel is about to run on.
+        if (id === battleExpId() || id === battleImageExpId() || armedThisProcess.has(id)) continue;
         if (row.status !== 'active' && row.status !== 'paused') continue;
-        await api.post(`${experimentsApi}/${encodeURIComponent(id)}/status`, {
+        await api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), {
           data: { status: 'completed' },
-        }).catch(() => { /* best-effort: a leftover we cannot retire will surface as a slot conflict */ });
+        }).catch(() => { /* best-effort: a leftover we cannot retire will surface as a challenger conflict */ });
       }
       expect(
         status,
@@ -348,7 +509,7 @@ export async function ensureBattleExperimentExists(
  * Make `expId` the SOLE ACTIVE battle experiment for its classification — the cheap per-test step
  * (no form fill; the row already exists from the beforeAll create). Preserves the exclusivity
  * invariant: only ONE battle experiment may be active at a time (the channel enable auto-resolves the
- * single active one, and the alt-bot slot binds only an active one), so this PAUSES the sibling e2e
+ * single active one, and the challenger is named by only an active one), so this PAUSES the sibling e2e
  * battle experiment and RESUMES `expId` if it was paused. Idempotent + independent per test: a test
  * that ran before may have paused this one for its own exclusivity, so re-activating here keeps each
  * test self-contained (one failure never leaves the wrong experiment active for the next).
@@ -359,10 +520,10 @@ export async function ensureBattleExperimentExists(
  */
 export async function activateBattleExperiment(page: Page, expId: string = battleExpId()): Promise<void> {
   const sibling = expId === battleExpId() ? battleImageExpId() : battleExpId();
-  const experimentsApi = process.env.VITE_EXPERIMENTS_API_URL || '';
+  const experimentsApi = adminApiServes('experiments') ? adminUrl('assistant-admin', '/admin/experiments') : '';
   expect(
     experimentsApi,
-    'VITE_EXPERIMENTS_API_URL must be set to activate a battle experiment (run via validate.mjs, or export it)',
+    'VITE_ADMIN_API_CAPABILITIES must name experiments to activate a battle experiment (run via validate.mjs, or export it)',
   ).toBeTruthy();
   // Land on the CHAT origin first, and do it unconditionally. Two things depend on it and both used to
   // happen by accident: the duel runs here (newBattleChannel drives the chat app immediately after this
@@ -375,19 +536,19 @@ export async function activateBattleExperiment(page: Page, expId: string = battl
   // REQUIRED, not best-effort: a null token still produces a syntactically valid `Bearer null` header,
   // the calls 401, and the failure surfaces later as a battle enable error - the same class of
   // silent-empty bug the arming path records above.
-  const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+  const idToken = await idTokenOf(page);
   expect(
     idToken,
     'no idToken on the current origin - activateBattleExperiment must run on a signed-in page',
   ).toBeTruthy();
-  const api = await request.newContext({ extraHTTPHeaders: { Authorization: `Bearer ${idToken}` } });
+  const api = signedAdminContext(idToken!);
   try {
     // Read the CURRENT statuses from the API and drive the transitions there. This used to click Pause
     // and Resume in the admin table, which is the wrong authority for exactly the reason the arming
     // read-back above already records: the list paginates. Every e2e run leaves two completed rows
     // behind and nothing prunes them, so `tr:has-text(<id>)` eventually matches nothing, both helpers
     // took their "row not present -> nothing to do" branch, and the run failed at the CHANNEL ENABLE
-    // with "Slot is bound to another active battle experiment" (sibling never paused) or "Experiment is
+    // with "The challenger is named by another active battle experiment" (sibling never paused) or "Experiment is
     // not active" (own never resumed). A silent no-op in a setup helper reads as a product fault.
     const list = await api.get(experimentsApi);
     expect(list.ok(), `list experiments to activate ${expId}: ${list.status()}`).toBeTruthy();
@@ -398,11 +559,11 @@ export async function activateBattleExperiment(page: Page, expId: string = battl
         ?.status as string | undefined;
 
     const setStatus = (id: string, status: 'active' | 'paused') =>
-      api.post(`${experimentsApi}/${encodeURIComponent(id)}/status`, { data: { status } });
+      api.post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status } });
 
     // Exclusivity: at most ONE active battle experiment per classification. The channel enable carries
     // no experimentId (the toggle has no picker), so the backend auto-resolves the single active one -
-    // two actives is ambiguous and one active sibling binds the slot.
+    // two actives is ambiguous and one active sibling holds the challenger.
     const siblingStatus = statusOf(sibling);
     if (siblingStatus === 'active') {
       const resp = await setStatus(sibling, 'paused');
@@ -429,21 +590,13 @@ export async function activateBattleExperiment(page: Page, expId: string = battl
 
 /**
  * Create a premium conversation and enable Battle Mode on it for this run's battle experiment.
- * Throws (fails the test) if the alt-bot slot pool / battle API is unreachable —
+ * Throws (fails the test) if the alt or the battle API is unreachable —
  * that IS the regression signal for the AgentEchelonBattle relocation.
  */
 export async function newBattleChannel(page: Page, title: string, expId: string = battleExpId()): Promise<void> {
-  await page.locator('button.app-new-conversation-btn').click();
-  await page.waitForSelector('.ncm-modal', { timeout: 8000 });
-  const premiumCard = page.locator('.ncm-class-card:has-text("Premium")').first();
-  if (await premiumCard.isVisible({ timeout: 3000 }).catch(() => false)) {
-    await premiumCard.click();
-  } else {
-    await page.locator('.ncm-class-card').first().click();
-  }
-  void title;
-  await page.locator('button:has-text("Create Conversation")').click();
-  await page.waitForSelector('.conversation-header', { timeout: 20_000 });
+  // THE PREMIUM CARD BY ITS NAME (`createConversation`), or a failure naming what was offered - never the
+  // first card, which opened a conversation where battle does not exist and failed every test after it.
+  await createConversation(page, title, 'Premium');
   await page.locator('.message-textarea').waitFor({ state: 'visible', timeout: 15_000 });
 
   await page.locator('button[aria-label="Show channel members"]').click();
@@ -480,8 +633,22 @@ export async function newBattleChannel(page: Page, title: string, expId: string 
 }
 
 /**
+ * `newBattleChannel`, returning the new conversation's channel id, by which the backend addresses the duel
+ * pointer, each side's state and a reply targeted at a side.
+ */
+export async function newBattleChannelWithId(page: Page, title: string, expId: string = battleExpId()): Promise<string> {
+  const createResp = page.waitForResponse(
+    (r) => r.url().includes('/create-conversation') && r.request().method() === 'POST',
+    { timeout: 30_000 },
+  );
+  await newBattleChannel(page, title, expId);
+  const body = await (await createResp).json();
+  return (body.conversation.conversationArn as string).split('/').pop()!;
+}
+
+/**
  * Fire a /battle prompt and wait for the dual reply to RESOLVE. Returns the
- * number of .battle-message bubbles. Resolution is signalled by the scorecard's
+ * number of .battle-message bubbles. Resolution is signaled by the scorecard's
  * first response-time cell carrying a digit (the per-bot placeholders + an
  * empty-dash scorecard render immediately, so bubble count alone lies).
  */
@@ -535,12 +702,12 @@ export async function fireBattle(page: Page, prompt: string, timeoutMs = 260_000
  * must not turn a green suite red at teardown.
  */
 export async function retireThisRunsBattleExperiments(page: Page): Promise<void> {
-  const experimentsApi = process.env.VITE_EXPERIMENTS_API_URL || '';
+  const experimentsApi = adminApiServes('experiments') ? adminUrl('assistant-admin', '/admin/experiments') : '';
   if (!experimentsApi) {
     // Loudly, not silently. This returned quietly for as long as it has existed, so a run that
     // retired NOTHING was indistinguishable from one that retired everything.
     console.warn(
-      '[battle-setup] VITE_EXPERIMENTS_API_URL is unset, so this run\'s battle experiments were NOT '
+      '[battle-setup] VITE_ADMIN_API_CAPABILITIES does not name experiments, so this run\'s battle experiments were NOT '
       + 'retired and premium routing stays split. Regenerate the per-package env (gen-frontend-env).',
     );
     return;
@@ -563,11 +730,11 @@ export async function retireThisRunsBattleExperiments(page: Page): Promise<void>
     return;
   }
 
-  const api = await request.newContext({ extraHTTPHeaders: { Authorization: `Bearer ${idToken}` } });
+  const api = signedAdminContext(idToken!);
   try {
     for (const id of [battleExpId(), battleImageExpId()]) {
       const resp = await api
-        .post(`${experimentsApi}/${encodeURIComponent(id)}/status`, { data: { status: 'completed' } })
+        .post(adminUrl('assistant-admin', `/admin/experiments/${encodeURIComponent(id)}/status`), { data: { status: 'completed' } })
         .catch(() => null);
       if (resp?.ok()) continue;
 

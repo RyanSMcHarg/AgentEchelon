@@ -18,6 +18,8 @@
  */
 import { execSync, exec } from 'child_process';
 import { promisify } from 'util';
+import { STACK_PREFIX } from './stack-prefix';
+import { isTurnFailure, matches, type Pattern } from './watchdog/logic';
 
 const execAsync = promisify(exec);
 const AWS_PROFILE = process.env.AWS_PROFILE || '';
@@ -46,36 +48,10 @@ export function backendErrorCheckEnabled(): boolean {
 let announcedDisabled = false;
 
 /**
- * Log lines that are real, but are NOT a failure of the turn under test.
- *
- * Kept deliberately short and each one justified. This list is exactly the mechanism that let the
- * console monitor hide real React defects, so the bar is "cannot possibly indicate a broken turn",
- * not "noisy".
+ * Log lines that are real, but are NOT a failure of the turn under test: `NOT_A_TURN_FAILURE` in
+ * `watchdog/logic.ts`, shared with the live Live Tail check so the two can never disagree about what an
+ * error is.
  */
-const NOT_A_TURN_FAILURE: { pattern: string; why: string }[] = [
-  {
-    pattern: 'NodeVersionSupportWarning',
-    why: 'AWS SDK v3 deprecation notice logged at ERROR level by the Aurora Lambdas. Real '
-      + 'forward-looking work (runtime is node20, SDK wants >=22 after early 2027), but it is '
-      + 'emitted on every cold start regardless of the turn and says nothing about this request.',
-  },
-  {
-    pattern: 'No placeholder for correlationId after the answer was ready',
-    why: 'Expected whenever a fulfillment response is never materialised into a channel message, '
-      + 'which `fulfillment-retry.spec.ts` induces DELIBERATELY by invoking the Lex handler directly '
-      + '(bypassing Amazon Chime SDK, so nothing creates a placeholder). The winning invocation still '
-      + 'dispatches a processor, which now runs inference before discovering it cannot deliver - the '
-      + 'trade for resolving the placeholder at answer time instead of giving up before the model '
-      + 'call. NOTE THE COST OF THIS ENTRY: a REAL undeliverable answer logs the same line and is no '
-      + 'longer caught here. It is still caught by the turn assertions (the reply never arrives) and '
-      + 'by the task being marked failed, so this is not the only net - but if that changes, this '
-      + 'entry is the first thing to remove.',
-  },
-];
-
-function isTurnFailure(line: string): boolean {
-  return !NOT_A_TURN_FAILURE.some((e) => line.includes(e.pattern));
-}
 
 /**
  * Handler log groups, resolved once and cached for the process.
@@ -92,10 +68,10 @@ function isTurnFailure(line: string): boolean {
 /**
  * The function families a turn actually runs through.
  *
- * `DataPlaneLambda` is here because the earlier prefix (`AgentEchelonClassification`) could not
- * reach it: the data plane ships with the AnalyticsAurora stack, and drift, retrieval and the
+ * `DataPlaneLambda` is here because a prefix naming only the assistant stacks cannot
+ * reach it: the data plane ships with the Archive stack in Aurora mode, and drift, retrieval and the
  * summary updater all execute there. That is not a hypothetical blind spot - a drift fix was
- * deployed to the Classification stacks, ran nowhere, and stayed green, because the code that
+ * deployed to the assistant stacks, ran nowhere, and stayed green, because the code that
  * would have logged the failure lives in a log group nothing was reading.
  *
  * `ChannelFlowProcessor` is here for the SAME reason, found the same way on 2026-08-07: every inbound
@@ -108,15 +84,18 @@ function isTurnFailure(line: string): boolean {
  * empties one of these filters otherwise, which is the same class of bug as the `lastEventTimestamp`
  * regression described below: the check keeps passing, having stopped checking.
  */
-const TURN_PATH_FAMILIES = ['AgentHandler', 'AsyncProcessor', 'DataPlaneLambda', 'ChannelFlowProcessor'];
+export const TURN_PATH_FAMILIES = ['AgentHandler', 'AsyncProcessor', 'DataPlaneLambda', 'ChannelFlowProcessor'];
 
 function handlerLogGroups(): string[] {
   if (cachedGroups) return cachedGroups;
 
   const out = execSync(
-    'aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/AgentEchelon" '
+    `aws logs describe-log-groups --log-group-name-prefix "/aws/lambda/${STACK_PREFIX}" `
       + `--query "logGroups[].logGroupName" --output text ${AWS_PROFILE ? `--profile ${AWS_PROFILE}` : ''}`,
-    { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'], env: { ...process.env, MSYS_NO_PATHCONV: '1' } },
+    // UTF-8 both ways; see `task-backend.aws` for why the AWS CLI needs both on Windows. Log events
+    // carry model-authored prose, so non-ASCII in them is ordinary.
+    { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, MSYS_NO_PATHCONV: '1', PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' } },
   );
 
   const all = out.split(/\s+/).filter((g) => g.length > 0);
@@ -129,7 +108,7 @@ function handlerLogGroups(): string[] {
   for (const family of TURN_PATH_FAMILIES) {
     if (!cachedGroups.some((g) => g.includes(family))) {
       console.warn(
-        `[backend-errors] no log group matched "${family}" (${all.length} AgentEchelon groups seen). `
+        `[backend-errors] no log group matched "${family}" (${all.length} ${STACK_PREFIX} groups seen). `
           + 'That half of the turn path is UNWATCHED this run - check for a construct rename.',
       );
     }
@@ -146,7 +125,7 @@ function handlerLogGroups(): string[] {
 export async function assertNoBackendErrors(
   sinceEpochMs: number,
   context: string,
-  opts: { settleMs?: number } = {},
+  opts: { settleMs?: number; allowed?: Pattern[] } = {},
 ): Promise<void> {
   if (!backendErrorCheckEnabled()) {
     // Say so. A guard that turns itself off without a word is the failure mode this whole file
@@ -167,7 +146,7 @@ export async function assertNoBackendErrors(
 
   await new Promise((r) => setTimeout(r, opts.settleMs ?? 2000));
 
-  const found = await scanBackendErrors(sinceEpochMs);
+  const found = await scanBackendErrors(sinceEpochMs, opts.allowed ?? []);
   if (found.length > 0) throw new Error(formatBackendFailure(found, context));
 }
 
@@ -179,7 +158,7 @@ export async function assertNoBackendErrors(
  * fast check that disagreed with the sweep would be worse than no fast check - it would fail runs the
  * authoritative guard considers clean.
  */
-async function scanBackendErrors(sinceEpochMs: number): Promise<string[]> {
+async function scanBackendErrors(sinceEpochMs: number, allowed: Pattern[] = []): Promise<string[]> {
   const found: string[] = [];
   let groups: string[];
   try {
@@ -210,7 +189,8 @@ async function scanBackendErrors(sinceEpochMs: number): Promise<string[]> {
         `aws logs filter-log-events --log-group-name "${group}" --start-time ${sinceEpochMs} `
           + `--filter-pattern "?ERROR ?Exception ?AccessDenied ?Denied" `
           + `--query "events[].message" --output json ${AWS_PROFILE ? `--profile ${AWS_PROFILE}` : ''}`,
-        { env: { ...process.env, MSYS_NO_PATHCONV: '1' }, maxBuffer: 8 * 1024 * 1024 },
+        { env: { ...process.env, MSYS_NO_PATHCONV: '1', PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+          maxBuffer: 8 * 1024 * 1024 },
       );
       let messages: string[] = [];
       try {
@@ -223,7 +203,8 @@ async function scanBackendErrors(sinceEpochMs: number): Promise<string[]> {
       }
       messages
         .map((l) => l.trim())
-        .filter((l) => l.length > 0 && isTurnFailure(l))
+        // A line a spec declared it causes on purpose (`allowBackendError`) is not a failure here either.
+        .filter((l) => l.length > 0 && isTurnFailure(l) && !allowed.some((p) => matches(l, p)))
         .forEach((l) => found.push(`${group.split('/').pop()}: ${l.slice(0, 400)}`));
     } catch {
       // One unreadable group must not mask the others.

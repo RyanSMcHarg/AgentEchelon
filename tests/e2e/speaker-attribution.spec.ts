@@ -32,8 +32,9 @@
  * Gated by ATTRIBUTION_E2E=1 (a validate.mjs phase). Runs against the live deployment.
  *   E2E_BASE_URL=<cf> ATTRIBUTION_E2E=1 npx playwright test e2e/speaker-attribution.spec.ts
  */
-import { test, expect, type Page } from '@playwright/test';
-import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
+import { test, expect } from './helpers/fixtures';
+import { type Page } from '@playwright/test';
+import { signIn, createConversation, sendAndWaitForResponse, idTokenOf } from './helpers/agent-helpers';
 import {
   getTestCredentials,
   getSecondPremiumUser,
@@ -41,6 +42,8 @@ import {
   type TestCredentials,
 } from './helpers/test-credentials';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { assistantNameIn } from './helpers/third-party-view';
+import { personArnFromIdToken } from './helpers/person';
 
 guardConsoleErrors();
 
@@ -102,20 +105,23 @@ suite('a merged turn carries its speaker, and the convention stays out of the ch
       { timeout: 30_000 },
     );
     await createConversation(page, `Attribution multiparty ${Date.now()}`, 'Premium');
-    const channelId = ((await (await createResp).json()).conversation.conversationArn as string)
-      .split('/')
-      .pop()!;
+    const conversationArn = (await (await createResp).json()).conversation.conversationArn as string;
+    const channelId = conversationArn.split('/').pop()!;
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15_000 });
 
     // Bring in a SECOND PERSON. Two people is the minimum that makes a label mean anything, and it is
     // the exact condition under which the merge applies one.
     await shareChannelWith(page, second!.email);
 
+    // THE ASSISTANT'S NAME FROM THE LIVE ROSTER: it comes from its profile version and changes at runtime.
+    const assistantName = assistantNameIn(conversationArn, await personArnFromIdToken(await idTokenOf(page)));
+    expect(assistantName, 'the conversation has an assistant member to address').toBeTruthy();
+
     // Person A contributes a distinctive fact. ADDRESSED, because this is now a multi-user room and
     // silence-by-default is the rule - the join notice itself says 'mention @assistant or @all to
     // get a response'. The spec's first live run forgot that and timed out waiting for a reply the
     // router was correctly refusing to give.
-    await sendAndWaitForResponse(page, '@Assistant-premium for the record: the migration window is codenamed HARBOUR.', 120_000);
+    await sendAndWaitForResponse(page, `@${assistantName} for the record: the migration window is codenamed HARBOUR.`, 120_000);
 
     // Person B, in their own context, contributes a different one. A bare context signs in normally -
     // there is no storageState here to suppress the login form.
@@ -127,7 +133,7 @@ suite('a merged turn carries its speaker, and the convention stays out of the ch
       await signIn(pageB, second!.email, second!.password);
       await openConversationById(pageB, channelId);
       await expect(pageB.locator('.message-textarea')).toBeEnabled({ timeout: 20_000 });
-      await sendAndWaitForResponse(pageB, '@Assistant-premium and the rollback owner is codenamed PELICAN.', 120_000);
+      await sendAndWaitForResponse(pageB, `@${assistantName} and the rollback owner is codenamed PELICAN.`, 120_000);
     } finally {
       await ctxB.close();
     }
@@ -135,7 +141,7 @@ suite('a merged turn carries its speaker, and the convention stays out of the ch
     // Now a turn whose transcript genuinely carries two people. This is the turn that can leak.
     const resp = await sendAndWaitForResponse(
       page,
-      '@Assistant-premium summarise what each of us just told you, in one sentence each.',
+      `@${assistantName} summarise what each of us just told you, in one sentence each.`,
       180_000,
     );
     const text = resp.text || '';
@@ -161,7 +167,7 @@ async function shareChannelWith(page: Page, email: string): Promise<void> {
   await page.locator('button[aria-label="Share conversation"]').click();
   await expect(page.locator('#share-email')).toBeVisible({ timeout: 5_000 });
   await page.locator('#share-email').fill(email);
-  await page.locator('.modal-content button[type="submit"]').click();
+  await page.locator('form:has(#share-email) button[type="submit"]').click();
   await expect(page.locator('.alert-success')).toBeVisible({ timeout: 30_000 });
   await page.locator('.modal-close-btn').click().catch(() => {});
   await page.locator('.modal-content').waitFor({ state: 'hidden', timeout: 5_000 }).catch(() => {});

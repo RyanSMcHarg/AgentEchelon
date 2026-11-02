@@ -18,9 +18,9 @@
  *     E2E_ADMIN_BASE_URL=https://<admin-dist>.cloudfront.net \
  *     npx playwright test e2e/admin-attachments.spec.ts --reporter=list
  */
-import { test, expect, request as pwRequest, Page } from '@playwright/test';
-import { signIn } from './helpers/agent-helpers';
-import { getAdminUser } from './helpers/test-credentials';
+import { test, expect } from './helpers/fixtures';
+import { request as pwRequest, Page } from '@playwright/test';
+import { signInAsAdmin } from './helpers/agent-helpers';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
 
 const ADMIN_BASE_URL = process.env.E2E_ADMIN_BASE_URL || process.env.E2E_BASE_URL || 'http://localhost:5174';
@@ -33,11 +33,6 @@ guardConsoleErrors();
 const MAX_CONVERSATIONS = 12; // bound the scan for runtime
 const MAX_MESSAGES = 15;      // per conversation
 
-async function signInAsAdmin(page: Page): Promise<void> {
-  const admin = await getAdminUser();
-  await signIn(page, admin.email, admin.password);
-  await expect(page.locator('.admin-section-rail')).toBeVisible({ timeout: 15000 });
-}
 
 test.describe('Admin console — conversation attachment review (live)', () => {
   test('opening a message attachment vends scoped creds and serves the real document', async ({ page }) => {
@@ -46,7 +41,7 @@ test.describe('Admin console — conversation attachment review (live)', () => {
     // the scan never stalls, whichever attachment kind we land on first.
     page.on('dialog', (d) => d.accept().catch(() => {}));
 
-    await signInAsAdmin(page);
+    await signInAsAdmin(page, { rail: true });
     await page.goto('/?admin=conversations');
     await expect(page.locator('.admin-tab').first()).toBeVisible({ timeout: 20000 });
 

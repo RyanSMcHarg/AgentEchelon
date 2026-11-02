@@ -13,29 +13,34 @@
  *
  * WHY IT IS SAFE TO RUN ON A LIVE DEPLOYMENT. Activation changes which assistant definition serves
  * traffic, so this suite never activates EDITED content. It activates a clone of whatever is already
- * active - byte-identical behaviour, a new version number - proves the pointer moved, then rolls back
+ * active - byte-identical behavior, a new version number - proves the pointer moved, then rolls back
  * to the original version and verifies the pointer by READ-BACK. The draft-edit path is proven
  * separately without activating, the way the gates suite does it. If this file fails midway, the worst
  * state it can leave is an unactivated draft, which `afterAll` resets.
  *
  * Ordered, not independent: each stage consumes the previous stage's state, which is what a lifecycle
- * IS. Serial also keeps two tests from fighting over one profile's single draft slot.
+ * IS. Serial also keeps two tests from fighting over one profile's single draft.
  */
-import { test, expect } from '@playwright/test';
+import { test, expect } from './helpers/fixtures';
 import { execSync } from 'child_process';
-import { signIn } from './helpers/agent-helpers';
+import { assistantServing } from './helpers/assistant-identity';
+import { signIn, idTokenOf } from './helpers/agent-helpers';
 import { getAdminUser, missingUserReason } from './helpers/test-credentials';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { SSM_ROOT } from './helpers/stack-prefix';
+import { ADMIN_API_URL, adminUrl, profileActionUrl } from './helpers/api-urls';
 
 guardConsoleErrors();
 
-const MANAGE_PROFILES_API = process.env.VITE_MANAGE_PROFILES_API_URL || '';
-/** `standard` is the profile the other portable-profile specs drive, so the blast radius is shared. */
-const PROFILE = 'standard';
+const MANAGE_PROFILES_API = ADMIN_API_URL ? adminUrl('assistant-admin', '/admin/profiles') : '';
+/** Resolved in `beforeAll`, NOT at import. Playwright loads every spec during collection, before any
+ *  skip condition runs, so resolving this at module scope made a machine without AWS credentials fail
+ *  three specs at IMPORT - specs designed to skip - and charged every unrelated run for the lookup. */
+let PROFILE = '';
 const REGION = process.env.AWS_REGION || 'us-east-1';
-const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-const DEFINITION_PARAM = `${SSM_ROOT}/assistant/${PROFILE}/definition`;
+/** Derived from PROFILE, so it is built where PROFILE is known rather than at import. */
+function definitionParam(): string { return `${SSM_ROOT}/assistant/${PROFILE}/definition`; }
 
 /**
  * Node-side SigV4 call to the IAM-enforced manage-profiles API (the browser cannot sign one).
@@ -44,7 +49,7 @@ const DEFINITION_PARAM = `${SSM_ROOT}/assistant/${PROFILE}/definition`;
  */
 async function api(idToken: string, action: string, body: Record<string, unknown> = {}): Promise<any> {
   try {
-    return await signedAnalyticsPost(`${MANAGE_PROFILES_API}${action}`, idToken, body);
+    return await signedAnalyticsPost(profileActionUrl(action), idToken, body);
   } catch (err) {
     return { __error: String((err as Error).message || err) };
   }
@@ -62,7 +67,7 @@ async function api(idToken: string, action: string, body: Record<string, unknown
  */
 function activeVersionFromSsm(): number | null {
   const raw = execSync(
-    `aws ssm get-parameter-history --region ${REGION} --name "${DEFINITION_PARAM}" `
+    `aws ssm get-parameter-history --region ${REGION} --name "${definitionParam()}" `
       + `--query "Parameters[?Labels!=null].{v:Version,labels:Labels}" --output json`,
     { encoding: 'utf8', timeout: 30000, env: { ...process.env, MSYS_NO_PATHCONV: '1' } },
   );
@@ -74,7 +79,7 @@ function activeVersionFromSsm(): number | null {
 test.describe.serial('portable profiles — set up, improve, export, import, promote, roll back', () => {
   guardBackendErrors('portable-profile-lifecycle');
 
-  test.skip(!MANAGE_PROFILES_API, 'VITE_MANAGE_PROFILES_API_URL must be set (run via validate.mjs)');
+  test.skip(!MANAGE_PROFILES_API, 'VITE_ADMIN_API_URL must be set (run via validate.mjs)');
 
   let idToken = '';
   /** The version that was active before this suite touched anything — the rollback target. */
@@ -85,11 +90,14 @@ test.describe.serial('portable profiles — set up, improve, export, import, pro
   test.beforeAll(async ({ browser }) => {
     const admin = await getAdminUser();
     test.skip(!admin.password, missingUserReason('testAdmin'));
+    // Resolved HERE, after the skip gates above: the lookup needs AWS credentials, and doing it at
+    // import time would fail specs that are meant to skip without them.
+    PROFILE = assistantServing('standard');
     const ctx = await browser.newContext();
     const page = await ctx.newPage();
     try {
       await signIn(page, admin.email, admin.password);
-      idToken = (await page.evaluate(() => localStorage.getItem('idToken'))) || '';
+      idToken = await idTokenOf(page);
       expect(idToken, 'admin idToken').toBeTruthy();
     } finally {
       await ctx.close();
@@ -135,7 +143,8 @@ test.describe.serial('portable profiles — set up, improve, export, import, pro
     test.setTimeout(120_000);
     expect(exportedManifest, 'needs the exported manifest').toBeTruthy();
 
-    const imported = await api(idToken, '/import', { manifest: exportedManifest });
+    // The target is named, as every import must: the manifest's own name never decides where it lands.
+    const imported = await api(idToken, '/import', { manifest: exportedManifest, targetProfileName: PROFILE });
     expect(JSON.stringify(imported), 'import rejected the manifest this deployment just exported')
       .not.toMatch(/__error/);
     expect(imported.imported, 'import names the profile it landed').toBe(PROFILE);
@@ -153,13 +162,26 @@ test.describe.serial('portable profiles — set up, improve, export, import, pro
     // Fresh draft from the active version, then a small, legal edit.
     const versioned = await api(idToken, '/version', { profileName: PROFILE });
     expect(JSON.stringify(versioned)).not.toMatch(/__error/);
+    expect(versioned.draftConfigId, 'the fresh draft names its configId').toBeTruthy();
 
+    // THE EDIT IS PROVEN KEPT BY THE DRAFT'S OWN ID. `configId` hashes what a version says, so a kept
+    // edit to a body key changes it, and a key the body does not hold (`description`) leaves it as it was:
+    // a patch the API dropped would pass every other check here.
+    const ignored = await api(idToken, '/draft', { profileName: PROFILE, patch: { description: `ignored ${Date.now()}` } });
+    expect(ignored.draftConfigId, 'a key that is not part of a version changes nothing').toBe(versioned.draftConfigId);
+
+    // The persona addendum is a short, free-text body key, so a unique marker is always a change. (What the assistant
+    // says is its message templates, ADR-062: a `copy` line is refused at the draft, so it cannot be the probe.)
     const marker = `E2E lifecycle probe ${Date.now()}`;
     const edited = await api(idToken, '/draft', {
       profileName: PROFILE,
-      patch: { description: marker },
+      patch: { systemPromptAddendum: marker },
     });
+    // A refusal arrives either as a transport error or as a 4xx body naming its `error`.
     expect(JSON.stringify(edited), 'the draft edit was refused').not.toMatch(/__error/);
+    expect(edited.error, 'the draft edit was refused').toBeUndefined();
+    expect(edited.draftConfigId, 'a kept edit gives the draft a new configId').toBeTruthy();
+    expect(edited.draftConfigId).not.toBe(versioned.draftConfigId);
 
     const validated = await api(idToken, '/validate', { profileName: PROFILE });
     expect(

@@ -17,26 +17,22 @@
  * non-null value is the part that can only come from this deploy's `task_opened`.
  *
  * Gated by TASK_RESOLUTION_E2E=1 (a validate.mjs phase). Runs against the live deployment.
- *   E2E_BASE_URL=<cf> TASK_RESOLUTION_E2E=1 VITE_ANALYTICS_API_URL=<url> VITE_USER_POOL_ID=<id> \
- *     VITE_IDENTITY_POOL_ID=<id> AWS_PROFILE=<p> npx playwright test e2e/task-resolution.spec.ts
+ *   E2E_BASE_URL=<cf> TASK_RESOLUTION_E2E=1 VITE_ADMIN_API_URL=<url> VITE_USER_POOL_ID=<id> \
+ *     VITE_PERSON_API_URL=<url> AWS_PROFILE=<p> npx playwright test e2e/task-resolution.spec.ts
  */
-import { test, expect } from '@playwright/test';
-import { signIn, createConversation, sendAndWaitForResponse } from './helpers/agent-helpers';
+import { test, expect } from './helpers/fixtures';
+import { signIn, createConversation, sendAndWaitForResponse, idTokenOf } from './helpers/agent-helpers';
 import { getTestCredentials, type TestCredentials } from './helpers/test-credentials';
 import { signedAnalyticsPost } from './helpers/signed-analytics';
 import { guardBackendErrors, guardConsoleErrors } from './helpers/turn-guards';
+import { reportPromptForClassification } from './helpers/task-backend';
+import { ADMIN_API_URL, adminUrl } from './helpers/api-urls';
 
 guardConsoleErrors();
 
 const RUN = process.env.TASK_RESOLUTION_E2E === '1';
 const suite = RUN ? test.describe : test.describe.skip;
-const ANALYTICS_API = process.env.VITE_ANALYTICS_API_URL || '';
-
-// The same multi-step report prompt tasks.spec uses to open a task. A task-shaped turn is the
-// precondition for the whole assertion: a turn that answers inline opens nothing and would leave the
-// view legitimately empty, which is indistinguishable from the defect.
-const REPORT_PROMPT =
-  'Please compile a short report analyzing the pros and cons of a monorepo versus multi-repo for a 5-team org.';
+const ANALYTICS_API = ADMIN_API_URL ? adminUrl('analytics', '/') : '';
 
 interface ResolutionRow {
   task_id: string;
@@ -57,7 +53,7 @@ suite('task resolution is measured on a real task', () => {
   let creds: TestCredentials;
   test.beforeAll(async () => {
     creds = await getTestCredentials();
-    expect(ANALYTICS_API, 'VITE_ANALYTICS_API_URL must be set').toBeTruthy();
+    expect(ANALYTICS_API, 'VITE_ADMIN_API_URL must be set').toBeTruthy();
   });
 
   test('a task-shaped turn appears in v_task_resolution with a populated opened_at', async ({ page }) => {
@@ -78,10 +74,10 @@ suite('task resolution is measured on a real task', () => {
 
     await expect(page.locator('.message-textarea')).toBeEnabled({ timeout: 15_000 });
 
-    const resp = await sendAndWaitForResponse(page, REPORT_PROMPT, 180_000);
+    const resp = await sendAndWaitForResponse(page, reportPromptForClassification('premium'), 180_000);
     expect(resp.text && resp.text.length, 'the report turn must return a response').toBeTruthy();
 
-    const idToken = await page.evaluate(() => localStorage.getItem('idToken'));
+    const idToken = await idTokenOf(page);
     const end = new Date();
     const start = new Date(end.getTime() - 86_400_000); // -> days=1
 
@@ -128,7 +124,7 @@ suite('task resolution is measured on a real task', () => {
     expect(Number(row.transitions), 'transitions is a non-negative number').toBeGreaterThanOrEqual(0);
 
     // Resolution is NOT asserted. A report task stays open until the user accepts or abandons it, so
-    // requiring `is_resolved` here would fail on correct behaviour. What this test owns is that the
+    // requiring `is_resolved` here would fail on correct behavior. What this test owns is that the
     // task is MEASURED; the terminal half belongs to a test that drives a task to a terminal state.
   });
 });

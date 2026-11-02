@@ -1,48 +1,52 @@
 /**
- * SigV4-signed POST to the admin analytics API.
+ * SigV4-signed calls to the admin APIs, as the admin app makes them.
  *
- * Under A14 IAM enforcement (`adminIamEnforcement`) the analytics API is AWS_IAM-authorized:
- * a Bearer Cognito JWT is rejected (403) — the admin app SIGNS its requests with the caller's
- * Identity-Pool credentials. This helper mirrors that for the e2e tests: it exchanges the
- * signed-in user's id token for Identity-Pool credentials (via the AWS CLI the tests already
- * use — no extra SDK dependency) and SigV4-signs the request with @smithy/signature-v4.
+ * Every admin route is AWS_IAM-authorized (SPEC-ADMIN-CONSOLE FR43): a Bearer Cognito JWT is refused.
+ * The admin app trades the signed-in operator's id token for a console session at the admin credential
+ * exchange and signs with that; these helpers do the same, then SigV4-sign with @smithy/signature-v4.
  *
- * Needs: VITE_IDENTITY_POOL_ID (or IDENTITY_POOL_ID) + VITE_USER_POOL_ID (or USER_POOL_ID) +
- * AWS_PROFILE + AWS_REGION.
+ * Needs: VITE_PERSON_API_URL and VITE_ADMIN_API_URL + AWS_REGION.
  */
-import { execSync } from 'child_process';
 import { SignatureV4 } from '@smithy/signature-v4';
 import { HttpRequest } from '@smithy/protocol-http';
 import { Sha256 } from '@aws-crypto/sha256-js';
+import { consoleSession } from './admin-api';
+import { ADMIN_API_URL } from './api-urls';
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
-const AWS_PROFILE = process.env.AWS_PROFILE || 'default';
 
-function aws(args: string): any {
-  const out = execSync(`aws ${args} --region ${REGION} --output json`, {
-    encoding: 'utf8',
-    timeout: 20000,
-    env: { ...process.env, AWS_PROFILE },
-  }).trim();
-  return out ? JSON.parse(out) : null;
+/**
+ * CACHED PER ID TOKEN, because a poll calls this every few seconds. A console session lasts an hour; a
+ * cached one is reused for 45 minutes.
+ */
+type Creds = { accessKeyId: string; secretAccessKey: string; sessionToken: string };
+const credsCache = new Map<string, { at: number; creds: Promise<Creds> }>();
+const CREDS_TTL_MS = 45 * 60_000;
+
+/**
+ * THE CONSOLE SESSION for a signed-in operator (SPEC-ADMIN-CONSOLE FR45): the credentials the admin app
+ * signs with. A person's own chat credential holds no admin route, so signing with it is refused at the
+ * gateway exactly as the deny-test proves; the console role is what carries the caller's capabilities.
+ */
+export function consoleCreds(idToken: string): Promise<Creds> {
+  const hit = credsCache.get(idToken);
+  if (hit && Date.now() - hit.at < CREDS_TTL_MS) return hit.creds;
+  const creds = fetchConsoleCreds(idToken);
+  credsCache.set(idToken, { at: Date.now(), creds });
+  creds.catch(() => credsCache.delete(idToken));
+  return creds;
 }
 
-/** Identity-Pool credentials for a signed-in user's id token (mirrors the admin app's sign-on). */
-function identityPoolCreds(idToken: string): { accessKeyId: string; secretAccessKey: string; sessionToken: string } {
-  const pool = process.env.VITE_USER_POOL_ID || process.env.USER_POOL_ID;
-  const idPool = process.env.VITE_IDENTITY_POOL_ID || process.env.IDENTITY_POOL_ID;
-  if (!pool || !idPool) {
-    throw new Error('signed-analytics needs VITE_USER_POOL_ID + VITE_IDENTITY_POOL_ID (or the un-prefixed vars)');
-  }
-  // A Cognito login map entry: `<provider>=<idToken>`. The provider has no spaces and a JWT has
-  // no `=`, so the CLI shorthand parses cleanly with no quoting (Windows-safe).
-  const login = `cognito-idp.${REGION}.amazonaws.com/${pool}`;
-  const idResp = aws(`cognito-identity get-id --identity-pool-id "${idPool}" --logins ${login}=${idToken}`);
-  const identityId = idResp?.IdentityId;
-  const credResp = aws(`cognito-identity get-credentials-for-identity --identity-id "${identityId}" --logins ${login}=${idToken}`);
-  const c = credResp?.Credentials;
-  if (!c?.AccessKeyId) throw new Error('failed to obtain Identity-Pool credentials for signed analytics');
-  return { accessKeyId: c.AccessKeyId, secretAccessKey: c.SecretKey, sessionToken: c.SessionToken };
+async function fetchConsoleCreds(idToken: string): Promise<Creds> {
+  if (!ADMIN_API_URL) throw new Error('signed admin calls need VITE_ADMIN_API_URL for the console session');
+  const session = await consoleSession(idToken);
+  if (session.status !== 200) throw new Error(`console session refused (${session.status}): ${JSON.stringify(session.body).slice(0, 300)}`);
+  const c = session.body.credentials ?? {};
+  const accessKeyId = c.accessKeyId ?? c.AccessKeyId;
+  const secretAccessKey = c.secretAccessKey ?? c.SecretAccessKey;
+  const sessionToken = c.sessionToken ?? c.SessionToken;
+  if (!accessKeyId || !secretAccessKey) throw new Error('the console session returned no usable credentials');
+  return { accessKeyId, secretAccessKey, sessionToken };
 }
 
 /**
@@ -50,7 +54,7 @@ function identityPoolCreds(idToken: string): { accessKeyId: string; secretAccess
  * on a non-JSON/error body). `idToken` is the caller's Cognito id token (localStorage `idToken`).
  */
 export async function signedAnalyticsPost(analyticsUrl: string, idToken: string, body: unknown): Promise<any> {
-  const creds = identityPoolCreds(idToken);
+  const creds = await consoleCreds(idToken);
   const u = new URL(analyticsUrl);
   const signer = new SignatureV4({ credentials: creds, region: REGION, service: 'execute-api', sha256: Sha256 });
   const bodyStr = JSON.stringify(body);
@@ -91,7 +95,7 @@ export async function signedAdminGet(
   idToken: string,
   query: Record<string, string> = {},
 ): Promise<{ status: number; body: any }> {
-  const creds = identityPoolCreds(idToken);
+  const creds = await consoleCreds(idToken);
   const u = new URL(url);
   for (const [k, v] of Object.entries(query)) u.searchParams.set(k, v);
 
@@ -114,4 +118,63 @@ export async function signedAdminGet(
   } catch {
     return { status: resp.status, body: { raw: text } };
   }
+}
+
+/**
+ * A SIGNED STAND-IN FOR PLAYWRIGHT'S `APIRequestContext`, for the admin APIs.
+ *
+ * Every admin route is IAM-authorized (SPEC-ADMIN-CONSOLE FR43), so a Cognito Bearer token is refused
+ * at the gateway on the experiments, battle-settings, profile and user-management routes as it is on
+ * analytics. The specs that drove those routes held a Playwright request context with a Bearer header;
+ * this answers the same `get` / `post` / `delete` / `dispose` calls with SigV4-signed requests on the
+ * caller's Identity-Pool credentials, so a spec swaps its context and keeps its assertions.
+ *
+ * Only the response surface those specs read is implemented: `ok()`, `status()`, `json()`, `text()`.
+ */
+export interface SignedResponse {
+  ok(): boolean;
+  status(): number;
+  json(): Promise<any>;
+  text(): Promise<string>;
+}
+export interface SignedAdminContext {
+  get(url: string, opts?: { params?: Record<string, string | number> }): Promise<SignedResponse>;
+  post(url: string, opts?: { data?: unknown }): Promise<SignedResponse>;
+  delete(url: string): Promise<SignedResponse>;
+  dispose(): Promise<void>;
+}
+
+export function signedAdminContext(idToken: string): SignedAdminContext {
+  let creds: Creds | null = null;
+  const send = async (method: string, url: string, data?: unknown, params?: Record<string, string | number>) => {
+    creds = creds ?? await consoleCreds(idToken);
+    const u = new URL(url);
+    for (const [k, v] of Object.entries(params ?? {})) u.searchParams.set(k, String(v));
+    const body = data === undefined ? undefined : JSON.stringify(data);
+    const signer = new SignatureV4({ credentials: creds, region: REGION, service: 'execute-api', sha256: Sha256 });
+    const signed = await signer.sign(new HttpRequest({
+      method,
+      protocol: u.protocol,
+      hostname: u.hostname,
+      path: u.pathname,
+      query: Object.fromEntries(u.searchParams),
+      headers: { host: u.hostname, ...(body ? { 'content-type': 'application/json' } : {}) },
+      ...(body ? { body } : {}),
+    }));
+    const resp = await fetch(u.toString(), { method, headers: signed.headers as Record<string, string>, ...(body ? { body } : {}) });
+    const text = await resp.text();
+    const response: SignedResponse = {
+      ok: () => resp.ok,
+      status: () => resp.status,
+      text: async () => text,
+      json: async () => JSON.parse(text),
+    };
+    return response;
+  };
+  return {
+    get: (url, opts) => send('GET', url, undefined, opts?.params),
+    post: (url, opts) => send('POST', url, opts?.data ?? {}),
+    delete: (url) => send('DELETE', url),
+    dispose: async () => { creds = null; },
+  };
 }

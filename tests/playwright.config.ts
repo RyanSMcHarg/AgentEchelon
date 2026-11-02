@@ -73,6 +73,12 @@ export default defineConfig({
   // absorbs harness flake without masking a real, consistent failure.
   retries: process.env.PW_RETRIES ? Number(process.env.PW_RETRIES) : 0,
   workers: 1,
+  // ONE TEST, OR ONE SLICE, PER INVOCATION. A live turn-queue test waits on a real assistant and can
+  // run for minutes, so a whole phase is long enough that a backgrounded run on this machine is
+  // killed before it reports - which costs every verdict, not the one it was on. `E2E_GREP` is the
+  // same answer the backend suite already takes with `--only=N`: make a kill cost one test.
+  // Absent, everything in the selected specs runs, so this changes no existing invocation.
+  ...(process.env.E2E_GREP ? { grep: new RegExp(process.env.E2E_GREP) } : {}),
   // 'list' for the live view; skip-visibility for what the live view cannot tell you - which tests did
   // NOT run, and why. Most of this suite is gated on provisioned credentials, so a run without them
   // silently no-ops a large fraction of it and still prints green. See e2e/reporters/skip-visibility.ts.
@@ -80,15 +86,23 @@ export default defineConfig({
   preserveOutput: 'always',
   use: {
     // Defaults to the local dev server; set E2E_BASE_URL to run against a
-    // deployed origin (e.g. the AgentEchelonFrontend CloudFront URL).
+    // deployed origin (e.g. the AgentEchelonChatApp CloudFront URL).
     baseURL: process.env.E2E_BASE_URL || 'http://localhost:5173',
-    trace: 'on',
+    // KEPT FOR A FAILURE ONLY. A passing test's trace is deleted when it ends, which also keeps a long
+    // run's memory and disk down. A trace never holds a password whatever the mode: every password is
+    // typed with `fillSecret` (e2e/helpers/unrecorded-secret.ts), and trace-holds-no-password.spec.ts
+    // reads a produced trace back to prove it.
+    trace: 'retain-on-failure',
     video: {
       mode: 'on',
       size: { width: 1280, height: 720 },
     },
   },
-  outputDir: './test-results',
+  // PER PHASE when validate.mjs names one (E2E_OUTPUT_DIR). Playwright clears its output folder at the
+  // start of every run, and validate runs one invocation per phase, so a single shared folder let each
+  // phase wipe the previous phase's traces, videos and snapshots - three failures in one sweep
+  // (2026-10-05) could only be diagnosed from a log line because of it. Unset, it is the usual folder.
+  outputDir: process.env.E2E_OUTPUT_DIR || './test-results',
   // Two ordered projects: the admin-console specs run AFTER the chat specs, because
   // the admin dashboard verifies data that the chat flows create (conversations,
   // events, tasks) and needs the admin app reachable. With workers:1 + fullyParallel
@@ -100,12 +114,25 @@ export default defineConfig({
       // Battle runs under its own `battle` project (storageState-authed on both
       // origins). Other chat specs sign in as DIFFERENT demo users, so battle's
       // admin storageState must NOT leak onto them — keep battle.spec out of chat.
-      testIgnore: [/admin-.*\.spec\.ts/, /battle\.spec\.ts/],
+      testIgnore: [/admin-.*\.spec\.ts/, /battle\.spec\.ts/, /queue-demo\.spec\.ts/],
     },
     {
       name: 'admin',
       use: { ...devices['Desktop Chrome'] },
       testMatch: /admin-.*\.spec\.ts/,
+    },
+    // THE DEMO NEEDS A PROJECT OF ITS OWN (code review, 2026-09-09). It is kept out of `chat` above
+    // so an unattended sweep never runs a spec that ends by handing you the browser and waiting -
+    // which is right - but no other project matched it either, so `--project=chat` (what
+    // `validate.mjs --only=queue-demo` passed) matched ZERO tests and Playwright exited non-zero.
+    // The documented invocation reported a failure for a spec it never ran.
+    //
+    // Reached only when it is named: `validate.mjs` marks the phase `manualOnly`, and no other
+    // phase names this project.
+    {
+      name: 'queue-demo',
+      use: { ...devices['Desktop Chrome'] },
+      testMatch: /queue-demo.spec.ts/,
     },
     // Signs the admin user into BOTH origins once and persists the combined
     // storageState (BATTLE_AUTH_FILE); the `battle` project depends on it.

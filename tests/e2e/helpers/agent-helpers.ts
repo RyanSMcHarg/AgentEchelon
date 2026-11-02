@@ -1,6 +1,8 @@
 import { Page, expect } from '@playwright/test';
 import { WebSocketMonitor, WebSocketTimings, isPlaceholder } from './websocket-monitor';
 import { ConsoleMonitor } from './console-monitor';
+import { getAdminUser } from './test-credentials';
+import { fillSecret } from './unrecorded-secret';
 
 // Re-export monitors so tests can access them directly
 export { WebSocketMonitor, WebSocketTimings } from './websocket-monitor';
@@ -120,8 +122,8 @@ export async function registerUser(
 
   // Fill registration form
   await page.locator('input[type="email"]').fill(email);
-  await page.locator('#password').fill(password);
-  await page.locator('#confirmPassword').fill(password);
+  await fillSecret(page.locator('#password'), password);
+  await fillSecret(page.locator('#confirmPassword'), password);
 
   // Select tier if available
   const tierSelect = page.locator(`[data-tier="${tier}"], input[value="${tier}"]`);
@@ -141,6 +143,37 @@ export async function registerUser(
  * @param consoleMonitor Optional ConsoleMonitor -- attaches before navigation
  *   to capture all browser console errors and warnings.
  */
+/**
+ * Answer the admin console's reason prompt whenever it appears (SPEC-ADMIN-CONSOLE FR51).
+ *
+ * Every per-conversation admin credential - opening a conversation's messages, its live members, an
+ * attachment, a redaction - waits for the operator's stated reason. A spec reaching a conversation is a
+ * test run, so it gives that as its reason; the exchange records it like any other. Registered as a
+ * locator handler, so it answers wherever in a flow the dialog opens, and a spec that asserts on the
+ * dialog itself can still find it by removing the handler first.
+ */
+export async function answerAdminReasonPrompts(page: Page, reason = 'automated end-to-end verification'): Promise<void> {
+  await page.addLocatorHandler(page.locator('[data-testid="admin-reason-dialog"]'), async (dialog) => {
+    await dialog.locator('[data-testid="admin-reason-input"]').fill(reason);
+    await dialog.locator('[data-testid="admin-reason-confirm"]').click();
+  });
+}
+
+/**
+ * The id token a signed-in page holds, or '' when it holds none. The person it names comes from the
+ * credential exchange (`helpers/person.ts`), never from decoding it.
+ */
+export async function idTokenOf(page: Page): Promise<string> {
+  return (await page.evaluate(() => localStorage.getItem('idToken'))) || '';
+}
+
+/** Sign in as the suite's admin; `rail` also waits for the admin console's section rail. */
+export async function signInAsAdmin(page: Page, opts: { rail?: boolean } = {}): Promise<void> {
+  const admin = await getAdminUser();
+  await signIn(page, admin.email, admin.password);
+  if (opts.rail) await expect(page.locator('.admin-section-rail')).toBeVisible({ timeout: 15000 });
+}
+
 export async function signIn(
   page: Page,
   email: string,
@@ -148,6 +181,8 @@ export async function signIn(
   monitor?: WebSocketMonitor,
   consoleMonitor?: ConsoleMonitor,
 ): Promise<void> {
+  // The admin console asks for a reason before it reaches a conversation; a run answers it.
+  await answerAdminReasonPrompts(page);
   // Attach monitors BEFORE any navigation
   if (consoleMonitor) {
     consoleMonitor.attach(page);
@@ -162,7 +197,7 @@ export async function signIn(
   await page.waitForSelector('input[type="email"]', { timeout: 10000 });
 
   await page.locator('input[type="email"]').fill(email);
-  await page.locator('input[type="password"]').fill(password);
+  await fillSecret(page.locator('input[type="password"]'), password);
   await page.locator('button[type="submit"]').click();
 
   // Wait for authenticated UI. Post the admin/chat split (DESIGN-SEPARATE-ADMIN-APP.md) this helper
@@ -177,7 +212,7 @@ export async function signIn(
 export async function createConversation(
   page: Page,
   title: string,
-  classificationOrModel: string = 'Open'
+  classification: string = 'Basic'
 ): Promise<void> {
   // Click new conversation button. Use the class selector, NOT
   // button:has-text("New conversation") — the latter strict-matches the
@@ -187,15 +222,27 @@ export async function createConversation(
   await page.locator('button.app-new-conversation-btn').click();
   await page.waitForSelector('.ncm-modal', { timeout: 5000 });
 
-  // Select classification card — matches by classification name or model name
-  // (card text contains both, e.g. "Open Claude Haiku Public information only...")
-  const classCard = page.locator(`.ncm-class-card:has-text("${classificationOrModel}")`);
-  if (await classCard.first().isVisible({ timeout: 3000 }).catch(() => false)) {
-    await classCard.first().click();
-  } else {
-    // Click the first available classification
-    await page.locator('.ncm-class-card').first().click();
+  // THE CARD ASKED FOR, OR A FAILURE NAMING WHAT WAS OFFERED. `isVisible` does not wait (its `timeout` is
+  // ignored), so the cards were checked before they rendered and the first card, basic, was clicked
+  // instead: a premium test then ran in a basic conversation and failed far from the cause, or passed on
+  // the wrong classification.
+  await page.locator('.ncm-class-card').first().waitFor({ state: 'visible', timeout: 15000 });
+  // BY THE CARD'S OWN NAME, never any other text on it: every card says who may join ("Open to: Basic,
+  // Standard, Premium"), so a match on the whole card's text took the basic card for "Premium". A
+  // classification is not a model (an intent may route a turn to another), so a card is never picked by one.
+  const wanted = classification.trim().toLowerCase();
+  const classCard = page.locator('.ncm-class-card').filter({
+    has: page.locator('.ncm-class-card-badge').filter({
+      hasText: new RegExp(`^\\s*${wanted.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*$`, 'i'),
+    }),
+  });
+  try {
+    await classCard.first().waitFor({ state: 'visible', timeout: 5000 });
+  } catch {
+    const offered = await page.locator('.ncm-class-card-badge').allTextContents();
+    throw new Error(`createConversation: no classification card is named "${classification}"; offered: ${offered.join(', ') || 'none'}`);
   }
+  await classCard.first().click();
 
   // Title input was removed in commit 8377f1c (auto-derive title
   // from first user message). The `title` argument is retained for caller
@@ -219,7 +266,13 @@ export async function createConversation(
   // to the WRONG channel (confirmed via trace: the Chime SendChannelMessage
   // POST targeted the prior channel's ARN). Gating on the modal close makes the
   // active-conversation swap a happens-before for the send.
-  await page.locator('.ncm-modal').waitFor({ state: 'hidden', timeout: 5000 });
+  //
+  // 30s, not 5s: a create that lands on a cold ConversationCreator spends about 3.7s in the function
+  // alone (measured 2026-10-22: 740ms init plus 2.9s duration, against roughly 0.5s warm), and the
+  // modal closes only after the provider also activates the new channel. 5s failed a correct create
+  // that was still "Creating...". A failed create keeps the modal open with its error, so this still
+  // fails then.
+  await page.locator('.ncm-modal').waitFor({ state: 'hidden', timeout: 30_000 });
 
   // Wait for conversation to load
   await page.waitForSelector('.conversation-header', { timeout: 10000 });
@@ -353,6 +406,12 @@ export async function sendAndWaitForResponse(
   const priorLastText = (
     (await page.locator('.assistant-message .message-text').last().textContent().catch(() => '')) || ''
   ).trim();
+  // AND ITS ID. Text alone cannot tell a new reply from the last one when they read the same: a revised
+  // report is delivered under the same title, and its message showed exactly the text the original did,
+  // so this waited out its whole timeout with the revision on screen (measured live, 2026-10-16).
+  const lastAssistantId = () => page.locator('.assistant-message:has(.message-text)').last()
+    .getAttribute('data-message-id', { timeout: 2_000 }).catch(() => null);
+  const priorLastId = await lastAssistantId();
 
   // Type and send message
   await page.locator('.message-textarea').fill(message);
@@ -457,10 +516,13 @@ export async function sendAndWaitForResponse(
     const lastPhase = await page.locator('.assistant-message:has(.message-text)').last()
       .getAttribute('data-response-phase');
     if (lastPhase) {
-      // Only these two mean "still working". `final` is the answer, `interim` is a message the person
-      // may have to act on (a duel's clarifying question), `error` ended their wait - all settle.
+      // These mean "still working". `final` is the answer, `interim` is a message the person may
+      // have to act on (a duel's clarifying question), `error` ended their wait - all settle.
+      //
+      // `notice` is the queue saying the message is waiting behind other work (ADR-033). Its answer
+      // posts later as its own message, so settling on the notice counted a reply that had not come.
       expect(
-        ['placeholder', 'progress'].includes(lastPhase),
+        ['placeholder', 'progress', 'notice'].includes(lastPhase),
         `still mid-turn (phase=${lastPhase}): "${trimmed.slice(0, 60)}"`,
       ).toBe(false);
     }
@@ -471,7 +533,10 @@ export async function sendAndWaitForResponse(
     expect(looksLikeTaskPlaceholder(trimmed), `still on a task placeholder: "${trimmed}"`).toBe(false);
     // Must be a genuinely NEW bot reply, not the pre-send welcome re-read
     // (exact match) nor the welcome in any other rendered/envelope form.
-    expect(trimmed).not.toBe(priorLastText);
+    // A different MESSAGE is a new reply whatever it says; the same message is new only if its text moved.
+    const lastId = await lastAssistantId();
+    const isNewMessage = Boolean(lastId && priorLastId && lastId !== priorLastId);
+    if (!isNewMessage) expect(trimmed).not.toBe(priorLastText);
     expect(looksLikeWelcomeOrEnvelope(trimmed)).toBe(false);
     // Settle: the same value must persist on a re-read a beat later, so a
     // still-streaming partial can't satisfy the gate prematurely (the guard the
