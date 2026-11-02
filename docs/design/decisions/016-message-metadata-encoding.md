@@ -4,13 +4,13 @@ status: Accepted
 scope: Phase 0 (graceful-shedding backstop and budget guard) and phase 1 (out-of-band analytics keyed by message id). Technique A, coded state values, is specified for a later phase.
 date: 2026-07-16
 related:
-  - "../../specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md"
+  - "../../specs/communication/SPEC-MESSAGE-METADATA-CODEBOOK.md"
   - "../../../backend/lambda/src/analytics-aurora/kinesis-archival.ts"
 ---
 
 # ADR-016: Compact message-metadata encoding (coded states + out-of-band analytics)
 
-> **Status:** Accepted, partially implemented (governs `docs/specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md`). Phase 0 (graceful-shedding backstop + budget guard) and **Phase 1 (Technique B - out-of-band analytics keyed by message id)** are shipped; Technique A (coded state values) is designed, not yet built.
+> **Status:** Accepted, partially implemented (governs `docs/specs/communication/SPEC-MESSAGE-METADATA-CODEBOOK.md`). Phase 0 (graceful-shedding backstop + budget guard) and **Phase 1 (Technique B - out-of-band analytics keyed by message id)** are shipped; Technique A (coded state values) is designed, not yet built.
 
 ## Context
 
@@ -48,8 +48,8 @@ Contract rules:
 
 ## Related
 
-- `docs/specs/interaction/conversation/SPEC-MESSAGE-METADATA-CODEBOOK.md` - the full design + OSS replication recipe.
+- `docs/specs/communication/SPEC-MESSAGE-METADATA-CODEBOOK.md` - the full design + OSS replication recipe.
 - `docs/guides/developer/MESSAGE-DELIVERY-GUIDE.md` - the encoded caps this works within.
-- `docs/specs/interaction/assistant-config/SPEC-CONFIGURABLE-INTENT-PACK.md` - the per-deployment intent domain (the intent codebook) + the SSM contract pattern reused for codebook distribution.
+- `docs/specs/interaction/assistants/SPEC-CONFIGURABLE-INTENT-PACK.md` - the per-deployment intent domain (the intent codebook) + the SSM contract pattern reused for codebook distribution.
 - `backend/lambda/src/lib/async-processor-core.ts` - `safeMetadataString`, the cap constants, the emission point.
 - `backend/lambda/src/analytics-aurora/kinesis-archival.ts` - the second consumer reading the same metadata today.

@@ -2,113 +2,85 @@
 
 The non-negotiables. Every architectural decision in the project traces back to one of these, and where two designs competed, the tenet broke the tie.
 
-The platform **invariants** in `docs/specs/interaction/SPEC-INTERACTION-LAYER.md` §6 elaborate the governance, forward-compatibility, and integration tenets (4, 3, and 6); the remaining tenets (shared control plane, context, fine-grained control) are design commitments these invariants sit beneath rather than restate.
+There are two tiers. The **project tenets** (P1-P5) are what the platform is for, general enough to settle a decision anywhere in it. The **design tenets** (D1-D15) are the rules that follow from them and settle day-to-day implementation choices: which source to read, whether to add infrastructure, whether a schedule is warranted, whether a thing may be shared, and where a boundary sits. They are applied at a different altitude, not because they are lesser, and each has been broken in practice with the break shipping green. A tenet is cited by its id (`P4`, `D6`), which does not change when a tenet is added.
+
+The platform **invariants** in `docs/specs/interaction/SPEC-INTERACTION-LAYER.md` §6 elaborate the governance, forward-compatibility and integration tenets (P4, P3 and P5).
 
 ---
 
-1. **Humans and assistants share one control plane** - People from any surface (chat and outbound email today, with voice and more as they come online) and configurable assistants with their agents are managed in the same conversations through the same access model utilizing repeatable configuration.
+## Project tenets
 
-2. **Context compounds, is shared, but bounded** - A conversation is the unit of context: it builds across every turn and, per user, across their conversations, so no participant starts from zero. Everyone in it: the external user, the internal member who joins, and the assistant work from the same live picture, and that is the efficiency. A user never repeats themselves, whoever steps in is already caught up, and the assistant answers with full awareness.
+**P1. Humans and assistants share one control plane** - People from any surface and configurable assistants with their agents work in the same conversations, through the same access model and the same repeatable configuration. It is one deployed, wired platform (routing, resilience, experiments, evaluation and an admin console together), not a library to assemble or a new silo per team, and an assistant is a reusable building block, configured once and plugged into the same monitoring and control.
 
-3. **The harness outlives the model** - Build the infrastructure once and treat the reasoning model as a replaceable function call, pulled in per step and per experience as the builder needs. The hard parts - context, access, action, observation, delivery - are model-agnostic, and forward-compatibility is by contract (a conversation snapshots its policy, behavior keys are open registries, schema evolves additively), so the catalog of experiences grows without breaking a deployed conversation.
+**P2. Context compounds, is shared, but bounded** - A conversation is the unit of context: it builds across every turn and, per person, across their conversations, so no participant starts from zero. Everyone in it, the external user, the member who joins and the assistant, works from the same live picture: nobody repeats themselves, whoever steps in is already caught up, and the assistant answers with full awareness, within what each of them may see.
 
-4. **Governance is infrastructure - secure, layered, delegable** Access is enforced by AWS IAM and resource policies before a request runs, identity is bearer-pinned so an actor can only act as itself, `classification` is the only closed ordered axis IAM evaluates, and isolation is provable with a deny-test rather than a code review. Every sensitive operation carries at least two enforcement layers so a basic user cannot reach a premium model even through a direct API call, and one missed check is not a breach. Capabilities are scoped and delegated by narrowing a vended, recorded grant rather than by rewriting the policy.
+**P3. The harness outlives the model** - Build the infrastructure once and treat the reasoning model as a replaceable function call, pulled in per step and per experience as the builder needs. The hard parts, context, access, action, observation and delivery, are model-agnostic, and forward-compatibility is by contract, so the catalog of experiences grows without breaking a deployed conversation.
 
-5. **Fine-grained control at every step: cost, performance, quality, and policy** The builder controls each leg of the interaction: which model runs where (cost and performance), quality measured at every step, and adherence to the business's own policies and needs. The experience is exactly what they intend rather than whatever a model defaults to. When a dependency fails, the assistant degrades to a helpful response instead of failing silently or leaking an error, and best-effort side paths never block a reply.
+**P4. Governance is infrastructure, layered and provable** - Access is enforced by AWS IAM and resource policies before a request runs, every actor can only act as itself, and `classification` is the access IAM evaluates for every principal. Every sensitive operation carries at least two enforcement layers, so one missed check is not a breach, and isolation is proven by a test that is refused, not by a code review.
 
-6. **One central, reusable platform: integrate, don't migrate** Customizable to any use case, it is the single place AI integrates with humans in the loop. A deployed, wired platform (routing, resilience, A/B experiments, evaluation, and an admin console together), not a library to assemble or a new silo per team. Assistants are themselves reusable building blocks, each configured once through the platform's standard assistant onboarding and plugged into the same monitoring and control. It integrates with the business's existing identity provider and routing today, with per-tenant-isolated connectors to systems of record - reading each source of truth live rather than rebuilding or duplicating it - designed and seamed.
+**P5. The builder decides, and the platform integrates rather than migrates** - The builder controls each leg of the interaction: which model runs where (cost and performance), quality measured at every step, and adherence to the business's own policies, so the experience is exactly what they intend rather than whatever a model defaults to. The platform works with the business's existing identity provider and the groups kept there, and reaches its systems of record where they are: a provider or a connector is declared, not coded, and what it reaches is the deployment's to decide.
 
-## Implementation tenets
+---
 
-Tenets 1-6 are the commitments a design is judged against. These five are the mechanics that follow
-from them and settle day-to-day implementation choices - which source to read, whether to add
-infrastructure, whether a schedule is warranted. They are listed separately because they are applied
-at a different altitude, not because they are lesser, and because each has been violated in practice
-with the violation shipping green.
+## Design tenets
 
-7. **Event-driven, not polling** - If a system already emits an event for a state change, subscribe to
-it rather than re-deriving that state on a timer. A schedule that recomputes what an event stream
-already delivers is duplicated logic with added latency and a second way to be wrong. Two
-qualifications keep this honest. First, **you cannot event-source the absence of an event**: detecting
-that nothing happened (abandonment, idle-sleep) is inherently time-based, and so is anything genuinely
-periodic (a daily briefing, batch evaluation deliberately batched for cost). Second, events get
-dropped and handlers fail, so a **low-frequency reconciliation sweep behind an event path is correct
-design** - the sweep is a correctness backstop, never the primary mechanism.
+**D1. An actor can only act as itself** - Identity is bearer-pinned: a person's credential names their own AppInstanceUser and an assistant's names its own bot, through the session tag the vend sets, and no role a person or an assistant holds can bear another. A credential that could act as anybody (`.../user/*`) is never vended.
 
-8. **Know which of the three stores answers your question, and use one source per question** - There
-are three, with different jobs, and treating any of them as a cache of another produces numbers that
-disagree:
+**D2. A classification is a declared set of grants, not a ladder** ([ADR-046](../design/decisions/046-classifications-are-a-set-not-a-ladder.md)) - There is no rank: a classification reaches exactly what it declares, and an undeclared grant set is an unknown classification that reaches nothing rather than falling back to a floor.
 
-   - **Amazon Chime SDK Messaging** - authoritative for *current* conversation state: content,
-     membership, name. It streams both as events. It is NOT durable beyond the channel's life and
-     holds none of the platform's own telemetry.
-   - **The S3 / Athena conversation archive** - the system of record. Append-only, survives channel
-     deletion, holds the full event sequence (including what a message said before it was edited or
-     redacted) *and* everything the Amazon Chime SDK never knew: model used, tokens, latency,
-     guardrail decisions, evaluation scores, experiment attribution.
-   - **The Aurora projection** - a fast, lossy, rebuildable query surface for similarity search and
-     analytical joins.
+**D3. Every sensitive operation has two enforcement layers** - A classification that does not grant `premium` cannot reach a premium model even through a direct API call, and one missed check is not a breach.
 
-   Read current conversation state from the Amazon Chime SDK rather than a copy: a projection inherits
-   its pipeline's lag, and at read time that is indistinguishable from the conversation having been
-   quiet. Read history, telemetry, and anything that must outlive the channel from the archive - "go
-   to the source, not the copy" is about current state, and must not talk anyone out of using the
-   archive for what only the archive has. And when the caller already holds the data in memory,
-   consult neither.
+**D4. Delegate by narrowing a vended, recorded grant** - Capabilities are scoped and delegated by narrowing a session the vend records, never by rewriting the policy, and an assistant's declared reach is enforced inside its session ([DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION](../specs/interaction/assistants/DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION.md)).
 
-   **One source per question, per mode.** Within a deployment, every caller asking the same question
-   must read the same place: in Aurora mode that is consistently Aurora, in Athena mode consistently
-   Athena. Two surfaces answering "how many messages" from different stores will disagree, and the
-   operator has no way to tell which is right. If a number is shown in more than one place, it comes
-   from one query.
+**D5. Degrade to a helpful reply, and never block one on a side path** - When a dependency fails, the assistant answers helpfully rather than failing silently or leaking an error, and a best-effort side path (analytics, a notification, a metric) never holds up the reply.
 
-   **Say what a number counts.** Operators reconcile these figures against an AWS bill and against
-   each other, so a count must state its own semantics. "Messages" that counts message-created events
-   includes messages later deleted or redacted - correct for "how much did we process and pay for",
-   wrong for "how many are in this conversation now". Both are legitimate questions; a figure that
-   does not say which one it answers will be read as whichever the reader had in mind.
+**D6. Event-driven, not polling** - If a system already emits an event for a state change, subscribe to it rather than re-deriving that state on a timer. A schedule that recomputes what an event stream already delivers is duplicated logic with added latency and a second way to be wrong. Two qualifications keep this honest. First, **you cannot event-source the absence of an event**: detecting that nothing happened (abandonment, idle-sleep) is inherently time-based, and so is anything genuinely periodic (a daily briefing, batch evaluation deliberately batched for cost). Second, events get dropped and handlers fail, so a **low-frequency reconciliation sweep behind an event path is correct design** - the sweep is a correctness backstop, never the primary mechanism.
 
-9. **Reuse before building** - Prefer an existing seam, construct, or native service feature over new
-infrastructure. Before adding a resource, check whether the platform already solved this: the
-non-VPC-handler to data-plane-Lambda seam takes a new `op` rather than a new VPC endpoint; the Amazon
-Chime SDK supplies channel flows, moderation, membership events, and streaming config rather than
-app-level reimplementations of them; the migration runner applies a new SQL file with no manual step.
-New infrastructure carries a standing cost and a standing failure mode, so it should be the conclusion
-of an argument, not the opening move.
+**D7. Know which of the three stores answers your question, and use one source per question** - There are three, with different jobs, and treating any of them as a cache of another produces numbers that disagree:
 
-10. **Consistent designs for similar functionality** - Two features of the same kind should be built
-the same way. When a second instance of a pattern diverges, both become harder to reason about and a
-fix to one silently leaves the other broken. If a new case genuinely does not fit the established
-pattern, change the pattern or record why it does not apply - do not quietly fork it. This applies to
-where a resource lives (a stack owns a capability, not a technology), to how a surface authorizes, and
-to how a value is stored: a versioned row may hold provenance, never current state.
+- **Amazon Chime SDK Messaging** - authoritative for *current* conversation state: content, membership, name. It streams both as events. It is not durable beyond the channel's life and holds none of the platform's own telemetry.
+- **The S3 / Athena conversation archive** - the system of record. Append-only, survives channel deletion, holds the full event sequence (including what a message said before it was edited or redacted) *and* everything the Amazon Chime SDK never knew: model used, tokens, latency, guardrail decisions, evaluation scores, experiment attribution.
+- **The Aurora projection** - a fast, lossy, rebuildable query surface for similarity search and analytical joins.
 
-11. **Build for more than one language: no decision depends on recognising a phrase** - The
-deployment's language, the person's language, and the model's working language are three independent
-variables (`SPEC-BILINGUAL-CONVERSATIONS`), and the platform holds none of them constant. Matching
-something the platform itself wrote is pattern work and stays: a `<!--corr:-->` marker, a SQLSTATE, an
-ARN. Matching what a person or a model SAID, to decide what happens next, is a language judgement
-wearing a regex, and it is wrong in every language nobody tested.
+Read current conversation state from the Amazon Chime SDK rather than a copy: a projection inherits its pipeline's lag, and at read time that is indistinguishable from the conversation having been quiet. Read history, telemetry, and anything that must outlive the channel from the archive - "go to the source, not the copy" is about current state, and must not talk anyone out of using the archive for what only the archive has. And when the caller already holds the data in memory, consult neither.
 
-    **When something must be understood, the component that understands it decides - once.** A model
-    reads the sentence in context; the runtime does not. So the model resolves the meaning at the
-    point it is established and records it as data - a number, an enum, a declared intent - and every
-    later reader gets the data. A report's agreed length is the worked example: the model turns "a
-    concise 1-page report" into `minWords`/`maxWords` when the requirement is confirmed, and the
-    delivering check compares against numbers. The rejected alternative, and the first thing built,
-    was to store the sentence and re-parse it downstream, which moves an agreement out of prose and
-    then puts it back.
+- **One source per question, per mode.** Within a deployment, every caller asking the same question reads the same place: in Aurora mode consistently Aurora, in Athena mode consistently Athena. If a number is shown in more than one place, it comes from one query.
+- **Say what a number counts.** A count states its own semantics. "Messages" that counts message-created events includes messages later deleted or redacted: correct for "how much did we process and pay for", wrong for "how many are in this conversation now".
+- **A derived copy declares its own expiry.** An embedding, a summary or a projection row outlives the thing that classified it and nothing else will expire it, so a derived artifact either carries an expiry or records that it is deliberately permanent.
 
-    **Failing safe is a requirement, not an excuse.** A language-dependent check that fails safe - it
-    does not fire, and the unchecked thing proceeds - may ship, but it must say so where an operator
-    will find it. A guard that silently enforces nothing for two thirds of a deployment's users is
-    worse than no guard, because it is on the diagram. The delivered-document checks are exactly this
-    today and are documented as such in
-    [`HOW-TO-ADD-OR-MANAGE-A-PROFILE.md`](../guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md).
+**D8. Reuse before building** - Prefer an existing seam, construct, or native service feature over new infrastructure. Before adding a resource, check whether the platform already solved this: the non-VPC-handler to data-plane-Lambda seam takes a new `op` rather than a new VPC endpoint; the Amazon Chime SDK supplies channel flows, moderation, membership events, and streaming config rather than app-level reimplementations of them; the migration runner applies a new SQL file with no manual step. New infrastructure carries a standing cost and a standing failure mode, so it should be the conclusion of an argument, not the opening move.
 
-    **The pivot is the deadline.** `isDocumentRequest` (an English phrase list deciding whether a reply
-    is packaged as a file) and the three delivered-document rules are limitations today and become
-    defects when the bilingual Level 2 pivot ships, because the text inside the loop stops being the
-    text the person typed. The precedent is already in the tree: `solicitsInput` decided
-    attachment-versus-inline by English openers until a non-English deployment defeated it in both
-    directions, and it now runs in shadow only, deciding nothing.
+**D9. Consistent designs for similar functionality** - Two features of the same kind are built the same way. When a second instance of a pattern diverges, both become harder to reason about and a fix to one silently leaves the other broken. If a new case genuinely does not fit the established pattern, change the pattern or record why it does not apply; do not quietly fork it. This applies to where a resource lives (a stack owns a capability, not a technology), to how a surface authorizes, and to how a value is stored: a versioned row may hold provenance, never current state.
+
+**D10. A deployment stands up only the capabilities it declares** - A capability that is not declared leaves no stack, no route and no required setting behind, and one capability is replaced without editing another. The declared list is `capabilities` in `deploy.config.json`, read through one registry (`backend/lib/config/capabilities.ts`), and synth refuses a capability whose prerequisite is not declared. Guarded by the configuration matrix (`backend/test/deploy-matrix/`).
+
+**D11. No decision depends on recognizing a phrase** - The deployment's language, the person's language, and the model's working language are three independent variables (`SPEC-BILINGUAL-CONVERSATIONS`), and the platform holds none of them constant. Matching something the platform itself wrote is pattern work and stays: a `<!--corr:-->` marker, a SQLSTATE, an ARN. Matching what a person or a model said, to decide what happens next, is a language judgement wearing a regex, and it is wrong in every language nobody tested.
+
+- **When something must be understood, the component that understands it decides, once.** The model resolves the meaning at the point it is established and records it as data (a number, an enum, a declared intent), and every later reader gets the data. A report's agreed length is the worked example: the model turns "a concise 1-page report" into `minWords`/`maxWords` when the requirement is confirmed, and the delivering check compares numbers.
+- **Failing safe is a requirement, not an excuse.** A language-dependent check that fails safe, so that it does not fire and the unchecked thing proceeds, may ship, but it says so where an operator will find it. A guard that silently enforces nothing for most of a deployment's users is worse than no guard, because it is on the diagram.
+
+**D12. If factoring out a repetition would put several classifications' data on one principal, the repetition is the enforcement** - The instinct to collapse near-identical things into one is usually right, and here it is the strongest wrong answer, because the thing being duplicated is the boundary: a single principal serving three classifications holds all three classifications' data at once, which is the cross-classification principal [ADR-042](../design/decisions/042-an-assistant-acts-in-exactly-one-classification.md) refuses ([DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION](../specs/interaction/assistants/DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION.md) §3.5).
+
+- **The test is the data reach of one ambient principal, not whether a classification appears in its policy.** A Lambda's execution role is ambient for the whole invocation, so a shared component would hold the union of every classification's reach, with only a branch between a `basic` turn and a `premium` corpus ([ADR-054](../design/decisions/054-compute-is-per-classification-and-an-assistant-is-data.md)). A shared role carrying `aws:ResourceTag/classification` over the declared set, which fails closed on an untagged channel, is not a violation, and neither is a shared stack minting one pinned role per classification: the unit is the **principal**, never the stack.
+- **A component may be instantiated per classification to be the object of a boundary rather than the holder of one.** The task service names no classification in its own policy; one is deployed per classification stack and only that stack's roles may invoke it, so the invoke is refused at IAM rather than inside the handler.
+- **Where neither shape can be made true, the boundary moves off IAM, is declared at the grant, and is proven by denial.** The Aurora projection is the example: a reader role per classification plus `FORCE ROW LEVEL SECURITY`, because without a database privilege a wrongly written query would cross the line. An undeclared non-IAM boundary is worse than a declared one, because the diagram still shows IAM holding a line it is not holding.
+
+**D13. State is keyed by the conversation or the principal; a classification is carried, not sharded on** - The axis a store shards on is the axis IAM can name. No table and no archive partition is keyed by classification: the channel context, the task tables, turn state, abuse controls, battle state and the conversation actions log are keyed by conversation or by principal, and the classification is carried on the row and read from the conversation's immutable tag. S3 prefixes and SSM paths do shard by classification (`context/{classification}/`, `assistant-assignments/{classification}/...`), precisely because a prefix is nameable in an IAM resource and a partition key is not. The question is never "should this be per classification" in the abstract; it is "can IAM refuse the crossing case on this shape". A feature owns no store for what the conversation already answers: the active meeting is a field on the channel-context item, not a table of its own (D7 applied to infrastructure).
+
+**D14. A person is their AppInstanceUser id, whichever identity provider signed them in** - An issuer and its subject are only a way to obtain a session as that AppInstanceUser, so a record a person makes or owns is keyed by the AppInstanceUser id and never by a claim one identity provider issues. The id is minted once per issuer and subject by the credential exchange and recorded in `Identities`, and identity is resolved once per request, at the edge or from the vended session; a handler names the caller through `callerPersonId` (`backend/lambda/src/lib/auth.ts`) and parses no token. Guarded by `backend/test/a-person-is-their-app-instance-user.test.ts`.
+
+**D15. An artifact's key names its owner, and lifecycle, write scope and deletion follow the owner** - A key family carries one provenance, because the control inside it is written for that provenance: one bucket shared by several families is correct (a prefix plus an IAM condition is deny-testable), but an artifact may not be dropped into a family written for a different author. `attachments/<conversationId>/<personId>/` requires the key's third segment to equal the reading member's own AppInstanceUser id, so a platform-written transcript is never given a key that could impersonate a member. A classified artifact carries its classification in the key, so its grant comes from the same resolver the corpus uses. A lifecycle rule is scoped to the prefix it is named for, a write grant is narrowed to the owner's prefix, and a store that outlives what it describes says whose job it is to delete. Key layout cannot be revised cheaply once keys exist, so it is decided before the first write.
+
+---
+
+## How these are enforced
+
+A tenet nobody is reminded of is a tenet that gets reasoned past, and rarely by disagreement: the common failure is making a choice one of these already settles without having it in mind. Two mechanisms, deliberately different in kind.
+
+**A hook that nudges.** `.claude/hooks/tenets.js` runs on every prompt and, when the request is shaped like a decision one of these covers, injects the relevant tenets read from THIS file. It cannot block. A gate that refuses work on a keyword match produces false positives, and false positives train people to route around the gate until it catches nothing.
+
+**A test that refuses.** `backend/test/tenets-are-enforced.test.ts` fails the build on the rules that can be checked mechanically: no polling where an event exists (D6), no metric counting what the ledger already counts (D7), no decision taken from unmarked prose (D11), no module on the turn path reading the task table directly, a lifecycle rule scoped to its prefix (D15), and the guards D10 and D14 name kept binding (the configuration matrix with no expected failure, and the person-key guard over every tree a caller could be read in).
+
+Most of these tenets cannot be checked by a test, and that test does not pretend otherwise. It guards the places a rule has already been broken once, because a guard is worth most where a mistake has proven it is easy to make.
+
+Neither mechanism is the point on its own. Either alone fails in a predictable way: a hook without a test catches nothing that matters, and a test without a hook catches it only after somebody wrote it.

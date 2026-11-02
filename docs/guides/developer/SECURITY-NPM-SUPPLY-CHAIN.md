@@ -2,25 +2,28 @@
 
 This project treats every npm dependency as untrusted code that runs on your machine and in CI. This document records the controls the repo ships, why they exist, and how to work with them.
 
-## Why this matters
+## Threat
 
-npm packages can execute arbitrary code at install time through lifecycle scripts (`preinstall`, `install`, `postinstall`, `prepare`). A single compromised dependency, direct or transitive, runs that code with your shell's privileges the moment you install it. Through 2026 this became the dominant attack pattern, with several high-profile compromises of extremely popular packages:
+npm packages can execute arbitrary code at install time through lifecycle scripts (`preinstall`, `install`, `postinstall`, `prepare`). A single compromised dependency, direct or transitive, runs that code with your shell's privileges the moment you install it. The common patterns are a hijacked maintainer account publishing a poisoned release, a phantom dependency added to an otherwise legitimate package, and typosquat or dependency-confusion packages built to harvest credentials from the install environment.
 
-- **axios** (March 2026): the maintainer's npm account was hijacked and poisoned versions `axios@1.14.1` and `axios@0.30.4` were published, pulling a phantom dependency (`plain-crypto-js@4.2.1`) that dropped a cross-platform remote-access trojan. Safe versions are `>= 1.14.0` on the 1.x line (anything except `1.14.1`) and `0.30.3` on the legacy line.
-- **Red Hat "Miasma"** (June 2026): around 32 `@redhat-cloud-services/*` packages were trojanized via a hijacked maintainer account, executing an obfuscated dropper through an npm `preinstall` hook and self-spreading via a phantom `binding-gyp` dependency.
-- **Typosquat / dependency-confusion bursts** (May 2026): dozens of packages purpose-built to harvest AWS credentials, Vault tokens, and CI/CD secrets from the install environment.
-
-The common thread is install-time script execution and credential theft. This repo is an AWS CDK project, so a poisoned dependency running where deploy credentials live is exactly the prize these payloads hunt for. The controls below are aimed squarely at that threat.
+This repo is an AWS CDK project, so a poisoned dependency running where deploy credentials live is exactly what these payloads look for. The controls below target install-time script execution and credential theft.
 
 ## Controls this repo ships
 
-**Install-time scripts are blocked by default.** Every install root carries an `.npmrc` with `ignore-scripts=true` (repo root, `frontend/`, `backend/`, `tests/`, and each `backend/lambda/*` subproject). `npm ci` and `npm install` will not run any dependency's lifecycle scripts. This neutralizes the primary infection vector for the attacks above. CI inherits this automatically because the `.npmrc` files are committed and CI installs from the same working directories.
+**Install-time scripts are blocked.** Every install root carries an `.npmrc` with `ignore-scripts=true` (repo root, `frontend/`, `backend/`, `tests/`, and each `backend/lambda/*` subproject). `npm ci` and `npm install` do not run any dependency's lifecycle scripts. CI inherits this because the `.npmrc` files are committed and CI installs from the same working directories.
 
-**Deterministic installs.** Use `npm ci`, never `npm install`, to set up or refresh dependencies. `npm ci` installs the exact tree recorded in the committed lockfile and fails if `package.json` and the lockfile disagree, instead of silently resolving newer (possibly poisoned) versions. All documented setup commands use `npm ci`, and CI already enforces it.
+**Deterministic installs.** Use `npm ci`, never `npm install`, to set up or refresh dependencies. `npm ci` installs the exact tree recorded in the committed lockfile and fails if `package.json` and the lockfile disagree, instead of resolving newer (possibly poisoned) versions. All documented setup commands use `npm ci`, and the CI jobs (`.github/workflows/ci.yml`) run `npm ci` in `backend/` and `frontend/`.
 
-**Exact version pins.** The same `.npmrc` sets `save-exact=true`, so adding a dependency records an exact version (no `^` range). Combined with the committed lockfile, a malicious patch or minor release cannot be picked up by a fresh resolve.
+**Exact pins for new dependencies.** The same `.npmrc` sets `save-exact=true`, so a dependency added with `npm install <pkg>` records an exact version. It does not rewrite existing entries: the committed manifests carry `^` ranges, and what bounds them is the committed lockfile installed with `npm ci`. A fresh resolve (`npm install`, or deleting the lockfile) can still adopt a new patch or minor release inside those ranges.
 
-**Committed lockfiles.** Every install root commits its `package-lock.json`. The lockfile is the single source of truth for what gets installed; review changes to it in PRs the same way you review source.
+**Committed lockfiles.** Every install root with a `package.json` commits its `package-lock.json` (`backend/`, `frontend/` covering its workspace packages, `tests/`, and each `backend/lambda/*` subproject). The root `.npmrc` is a safety net; there is no root `package.json`. The lockfile is the single source of truth for what gets installed; review changes to it in PRs the same way you review source.
+
+**Overrides.** `backend/package.json` and `frontend/package.json` carry an `overrides` block that forces minimum versions of specific transitive dependencies (for example `fast-xml-parser`) regardless of what the depending package asks for. Add an override when a vulnerable transitive version cannot be removed by updating its parent, and remove it once the parent ships the fix.
+
+## CI coverage
+
+- **OPEN:** the `tests/` (Playwright e2e) job in `.github/workflows/ci.yml` is commented out, so CI does not install or exercise the `tests/` tree.
+- **NOT BUILT:** CI runs no `npm audit` step, and no Dependabot or Renovate configuration is committed. Auditing and update cadence are manual (below).
 
 ## Working with these controls
 
@@ -28,32 +31,29 @@ The common thread is install-time script execution and credential theft. This re
 
 **When a package legitimately needs an install script.** Some packages (native modules, tools that download a platform binary) rely on a postinstall step. With `ignore-scripts=true` that step is skipped, which can leave such a package non-functional. Handle it explicitly rather than disabling the protection globally:
 
-- Prefer packages that ship prebuilt platform binaries as optional dependencies (no script needed). Modern `esbuild` / Vite, used by the frontend, work this way and build fine with scripts ignored.
+- Prefer packages that ship prebuilt platform binaries as optional dependencies (no script needed). `esbuild` and Vite, used by the frontend, work this way and build with scripts ignored.
 - If a build step is truly required, run it as an explicit, named command after install (for example a dedicated `npm run rebuild` you can read before running) so the executed code is visible and intentional. Do not flip `ignore-scripts` off for the whole project.
 
 **Auditing.** Run `npm audit` to surface known-vulnerable versions and `npm audit signatures` to verify the registry provenance/signatures of your installed tree. Treat high-severity findings as release blockers.
 
-**Adopt new releases on a delay.** Most of these compromises are detected and the bad versions yanked within hours to days. Do not auto-adopt brand-new releases. If you use a bot like Renovate or Dependabot, configure a minimum release age (a few days) so you skip the window when a poisoned version is live.
+**Adopt new releases on a delay.** Compromised versions are usually detected and pulled within hours to days. Do not adopt brand-new releases immediately. If you add an automated update tool, configure a minimum release age (a few days) so you skip the window when a poisoned version is live.
 
 ## Protect the credentials these payloads target
 
-The May 2026 campaigns specifically scraped AWS keys and CI secrets out of the install environment, so credential hygiene is part of supply-chain defense:
+Supply-chain payloads commonly scrape AWS keys and CI secrets from the install environment, so credential hygiene is part of supply-chain defense:
 
 - Use short-lived, federated credentials for CDK deploys and CI (OIDC-assumed roles) rather than long-lived `AKIA...` access keys stored as secrets.
-- Keep `.env` out of git (it already is) and avoid running `npm install` / `npm ci` in a shell that has full deploy credentials exported when you can avoid it.
-- If you ever publish internal scoped packages, configure the scope's registry in `.npmrc` so npm cannot be tricked into pulling a public impostor of an internal name (the dependency-confusion vector).
+- Keep `.env` files out of git (they are ignored) and avoid running `npm install` / `npm ci` in a shell that has full deploy credentials exported when you can avoid it.
+- If you publish internal scoped packages, configure the scope's registry in `.npmrc` so npm cannot be tricked into pulling a public impostor of an internal name (the dependency-confusion vector).
 
 ## Checking whether you are affected
 
-To check this repo (or any project) against the known 2026 compromises, scan the committed manifests and lockfiles. These catch transitive pulls too, and skip `node_modules`:
+When an advisory names a compromised package or version, scan the committed manifests and lockfiles. Lockfiles catch transitive pulls too:
 
 ```bash
-# Indicators of compromise: phantom deps + hijacked namespaces
-grep -rE 'plain-crypto-js|@redhat-cloud-services|"binding-gyp"' . \
-  --include=package.json --include=package-lock.json | grep -v node_modules
-
-# The specific poisoned axios releases
-grep -rE '"version": "(1\.14\.1|0\.30\.4)"' . --include=package-lock.json | grep -i axios
+# Replace <package> and <version> with the advisory's indicators
+grep -rE '"<package>"' . --include=package.json --include=package-lock.json | grep -v node_modules
+grep -rE '"node_modules/<package>"' -A2 . --include=package-lock.json | grep -E '"version": "<version>"'
 ```
 
-No output from both means no known-compromised package is pinned. If a match appears: remove `node_modules`, pin a safe version in `package.json`, run `npm ci`, rotate any credentials that were present on a machine where the bad version was installed, and review the lockfile diff before committing.
+If a match appears: remove `node_modules`, pin a safe version in `package.json` (or add an override for a transitive dependency), run `npm ci`, rotate any credentials that were present on a machine where the bad version was installed, and review the lockfile diff before committing.

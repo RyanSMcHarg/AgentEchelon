@@ -3,10 +3,8 @@ title: "ADR-011: Agent routing mechanism - self-hosted vs managed agent runtime"
 status: Accepted 2026-07-16 - Option D (Converse + native tool use); implemented
 date: 2026-07-16
 related:
-  - SPEC-PER-PROFILE-OWNERSHIP.md
-  - ../../../backend/lib/stacks/basic-classification-stack.ts
-  - ../../../backend/lib/stacks/standard-classification-stack.ts
-  - ../../../backend/lib/stacks/premium-classification-stack.ts
+  - ../../specs/interaction/assistants/SPEC-PER-PROFILE-OWNERSHIP.md
+  - ../../../backend/lib/stacks/assistant-profile-stack.ts
   - ../../../backend/lib/stacks/agent-classification-common.ts
   - ../../../backend/lambda/src/router-agent-handler.ts
   - ../../../backend/lambda/src/lib/async-processor-core.ts
@@ -18,10 +16,7 @@ related:
 
 ## Issue & the state that forced the decision
 
-> **This section records the state at decision time, not today's.** Option D is implemented: the
-> terminal model call offers tool specs and runs a self-hosted, in-Lambda tool loop
-> (`lib/async-processor-core.ts:1491-1701`), and `load_company_context` is one of the tools it answers
-> (`:1656`). The gap described below, a tool that is deployed but never fires, is closed.
+> **This section records the state at decision time, not today's.** Option D is implemented: the terminal model call offers tool specs and runs a self-hosted, in-Lambda tool loop (`lib/async-processor-core.ts:1478-1688`), and `load_company_context` is one of the tools it answers (`:1656`). The gap described below, a tool that is deployed but never fires, is closed.
 
 What a team wants from this layer is an assistant that answers grounded in the right, access-appropriate company knowledge, while the deployer keeps fine-grained control over which model (and which provider) handles each kind of request and what it costs. The build-vs-adopt question underneath is whether to hand that orchestration to a managed runtime (Bedrock Agents) or keep it in AE's own pipeline - the decision this ADR makes. Current state is what forces the question: AE's per-tier Bedrock Agents and their action groups - notably the tier-scoped `load_company_context` (PR #16) - are **deployed but never executed at runtime**. The terminal model call is the **Converse API with no tool loop**, so the tool never fires. That breaks the product's defense-in-depth story (basic should decline product questions; premium should cite financials) because nothing invokes the tier-scoped retrieval.
 
@@ -46,7 +41,7 @@ Three constraints shape the fix:
 Option D keeps a **self-hosted agent loop** - Converse plus a tool loop AE runs in its own `async-processor` Lambda - instead of adopting the managed **Bedrock Agents** runtime. Concretely: keep the assistant = **AE's orchestration pipeline**, and add **native Converse tool use** (`toolConfig`) so `load_company_context` fires - with the *same* tier-scoped IAM isolation - while `intent → {delivery option, task state machine, per-intent model}` stays intact. Layer **prompt caching**, **selective tool invocation**, and the **existing RAG path** to be cost/latency-competitive with (or better than) a managed agent.
 
 - **Unwind** the spiked Option-B swap (the InvokeAgent terminal call in `agent-invoke.ts` + the processor `InvokeAgent` IAM).
-- **Keep** the per-tier classification-stack agent-role IAM fix (`{basic,standard,premium}-classification-stack.ts` via `agent-classification-common.ts`: `InvokeModel` + `InvokeModelWithResponseStream` + `ApplyGuardrail`) and the guardrail-ARN export - correct regardless, and doc-corroborated ([Appendix G](#appendix-g--aws-feature-reference)).
+- **Keep** the per-tier classification-stack agent-role IAM fix (`assistant-profile-stack.ts`, one stack per classification, via `agent-classification-common.ts`: `InvokeModel` + `InvokeModelWithResponseStream` + `ApplyGuardrail`) and the guardrail-ARN export - correct regardless, and doc-corroborated ([Appendix G](#appendix-g--aws-feature-reference)).
 - **Reserve** Bedrock Agents / multi-agent collaboration for a *future, explicit* decision to cede orchestration to the managed layer.
 
 ## Why (high-level rationale)
@@ -208,7 +203,7 @@ Line numbers below are as of decision time; the functions are the durable refere
 |---|---|
 | Delivery option | `intentToDeliveryOption(intent)` (472); `selectDeliveryOption(intent, hasActiveTask)` (535) |
 | Task tracking | active-task lookup (524-529); `TASK_MULTI_STEP` → `taskType` from intent → `createTask` (548-567) |
-| Context retrieval | `maybeRetrieveContext(userMessage, tier, intent)` (545) |
+| Context retrieval | `resolveTurnGrounding({ userMessage, classification, intent })` (`lib/turn-grounding.ts`; called by the processor since the grounding fetch moved off the pre-placeholder path) |
 | A/B experiment | `resolveExperimentModel(tier, intent, …)` (482) |
 | **Model** | `resolveModelForIntent(intent)` (in the async-processor) |
 
@@ -238,7 +233,7 @@ The agent execution role created in CDK granted only `bedrock:InvokeModel`; ever
 1. `bedrock:InvokeModelWithResponseStream` - InvokeAgent streams the model.
 2. `bedrock:ApplyGuardrail` - the agent enforces its attached guardrail.
 
-AWS docs confirm the agent service role needs exactly these, and that the console/managed creation flow adds them automatically - which is why AE's hand-rolled CDK role failed. The per-tier classification-stack fix (`{basic,standard,premium}-classification-stack.ts` + `agent-classification-common.ts`) matches the documented requirement and **stays regardless of the C/D/B decision** ([Appendix H](#appendix-h--sources--references)).
+AWS docs confirm the agent service role needs exactly these, and that the console/managed creation flow adds them automatically - which is why AE's hand-rolled CDK role failed. The per-tier classification-stack fix (`assistant-profile-stack.ts` + `agent-classification-common.ts`) matches the documented requirement and **stays regardless of the C/D/B decision** ([Appendix H](#appendix-h--sources--references)).
 
 ## Appendix E - Cross-cutting requirements
 
@@ -247,7 +242,7 @@ Every assistant-reply path should share one chokepoint. Conversational turns (no
  - so the tool-use change lands in **one** function. The lightweight one-shot utterances (welcome, share recap, channel-title derive) stay on a single guarded direct-model helper and apply the guardrail out-of-band, so there is one agent/tool path and one utility path - not six bespoke calls.
 
 ### Security requirement (hard invariant)
-Tier data isolation is enforced by the per-tier action-group Lambda's IAM role (basic's `load_company_context` physically cannot read `context/premium/*`). This holds under Option D because the router already dispatches to the `min(userTier, channelTier)` tier processor, which invokes *its* tier's tool. Keep this as a tested invariant, not a convention.
+Tier data isolation is enforced by the per-tier action-group Lambda's IAM role (basic's `load_company_context` physically cannot read `context/premium/*`). This holds under Option D because the router already dispatches to the channel classification's tier processor, which invokes *its* tier's tool. Keep this as a tested invariant, not a convention.
 
 ### Operational characteristics
 - **Telemetry:** Converse returns usage inline (today's scorecard reads it directly); the tool loop sums usage across the 1 - 2 Converse calls. No trace parser needed (unlike InvokeAgent).
@@ -301,7 +296,7 @@ Three efficiency questions surfaced while the decision was being worked; this ap
 - History window: `async-processor-core.ts` (`loadChannelHistory`)
 - Orchestration router: `router-agent-handler.ts` (lines cited in [Appendix D](#appendix-d--spike-results--code-evidence))
 - Resilience: `bedrock-resilience.ts` (`invokeBedrockWithFallback`)
-- Agent-role IAM: the per-tier stacks (`lib/stacks/{basic,standard,premium}-classification-stack.ts` + `agent-classification-common.ts`); guardrail ARN: `lib/constructs/bedrock-guardrails.ts`
+- Agent-role IAM: the per-tier stacks (`lib/stacks/assistant-profile-stack.ts`, one per classification, + `agent-classification-common.ts`); guardrail ARN: `lib/constructs/bedrock-guardrails.ts`
 - Measurement script: `backend/scripts/spike-invoke-agent.ts`
 
 ## Open questions

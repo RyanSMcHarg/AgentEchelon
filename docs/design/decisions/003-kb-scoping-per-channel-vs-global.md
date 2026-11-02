@@ -1,14 +1,19 @@
 ---
 title: "ADR-003: KB scoping - per-channel vs global"
-status: Decided 2026-04-28
+status: >-
+  Superseded by ADR-028. Decided 2026-04-28 and never built as written: no Bedrock Knowledge Base, `kbFilters` or `KnowledgeBasePanel` exists; RAG is a direct pgvector implementation scoped per classification.
 date: 2026-04-28
 related:
   - 007-kb-permission-metadata-filters.md
+  - 001-kb-backing-aurora-vs-oss.md
+  - 028-vector-store-classification-boundary.md
 blocks:
   - Phase 1 (RAG ships)
 ---
 
 # ADR-003: KB scoping - per-channel vs global
+
+**Status:** Superseded by [ADR-028](./028-vector-store-classification-boundary.md). **Outcome:** RAG shipped as a direct pgvector implementation reusing the Aurora cluster, with no Bedrock Knowledge Base (see [ADR-001](./001-kb-backing-aurora-vs-oss.md)), and retrieval is scoped by each chunk's classification and a per-classification database privilege. The decision below is kept as written.
 
 ## Context
 

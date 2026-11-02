@@ -114,11 +114,9 @@ jobs:
           VITE_AWS_REGION: us-east-1
           VITE_USER_POOL_ID: placeholder
           VITE_CLIENT_ID: placeholder
-          VITE_IDENTITY_POOL_ID: placeholder
           VITE_APP_INSTANCE_ARN: placeholder
           VITE_BOT_ARN: placeholder
           VITE_CREATE_CONVERSATION_API_URL: https://placeholder.example.com
-          VITE_ADD_BOT_API_URL: https://placeholder.example.com
           VITE_SHARE_CONVERSATION_API_URL: https://placeholder.example.com
           VITE_PRESIGNED_URL_API_URL: https://placeholder.example.com
           VITE_ANALYTICS_API_URL: https://placeholder.example.com

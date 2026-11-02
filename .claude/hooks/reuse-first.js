@@ -47,6 +47,22 @@ const CAPABILITIES = [
     canonical: 'backend/lambda/src/lib/channel-creation.ts' },
   { label: 'make someone a moderator', command: 'CreateChannelModeratorCommand',
     canonical: 'backend/lambda/src/lib/channel-creation.ts' },
+  { label: 'create a person (an AppInstanceUser)', command: 'CreateAppInstanceUserCommand',
+    canonical: 'backend/lambda/src/lib/person-identity.ts' },
+  { label: 'read a channel\'s tags', command: 'ListTagsForResourceCommand',
+    canonical: 'backend/lambda/src/lib/channel-classification.ts' },
+  { label: 'list a conversation\'s history', command: 'ListChannelMessagesCommand',
+    canonical: 'backend/lambda/src/lib/chime/history.ts' },
+  { label: 'build an Amazon Chime SDK messaging client', command: 'ChimeSDKMessagingClient',
+    canonical: 'backend/lambda/src/lib/chime/clients.ts' },
+  { label: 'build an Amazon Chime SDK identity client', command: 'ChimeSDKIdentityClient',
+    canonical: 'backend/lambda/src/lib/chime/clients.ts' },
+  { label: 'run an Athena query over the archive', command: 'StartQueryExecutionCommand',
+    canonical: 'backend/lambda/src/lib/archive-reader.ts' },
+  { label: 'post a message into a conversation', command: 'SendChannelMessageCommand',
+    canonical: 'backend/lambda/src/lib/chime/send.ts' },
+  { label: 'send an email (the one fan-out, by person)', command: 'SendEmailCommand',
+    canonical: 'backend/lambda/src/lib/channel-notify.ts (emailPeople), over lib/notification.ts' },
 ];
 
 function sourceFiles(root) {
@@ -66,6 +82,8 @@ function sourceFiles(root) {
     }
   };
   walk(path.join(root, 'backend', 'lambda'));
+  // The scripts too: a provisioning script that creates a person is the copy this exists to catch.
+  walk(path.join(root, 'backend', 'scripts'));
   return out;
 }
 

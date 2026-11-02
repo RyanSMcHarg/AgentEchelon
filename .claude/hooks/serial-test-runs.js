@@ -6,7 +6,7 @@
  * Jest process runs 4 workers holding a full TypeScript program with `cache: false`, so four
  * shards is 16 compiling workers plus their parents. It has cost a session's uncommitted work.
  * The repo has known this for a while - `backend/jest.config.js` caps the worker pool for the same
- * reason, and the tracker records "ONE shard per Bash call" - but knowing it only helped when
+ * reason, and AGENTS.md says one shard per call - but knowing it only helped when
  * someone remembered. This refuses instead.
  *
  * It denies four shapes:

@@ -12,7 +12,7 @@ profile using one is portable only to a deployment that agreed on it.
 | Key | Title / description | Use when | Fields | Availability | Trust | Scope |
 |---|---|---|---|---|---|---|
 | `company-docs` | **Company knowledge** - Titles and one-line summaries of the documents this classification may read | Deciding whether an answer exists in company knowledge before answering generally | `digest` (The per-classification document menu (title + one-liner each)) | always | operator | reserved |
-| `user-profile` | **About this person** - Who the signed-in user is and what they told us during onboarding | Personalising a greeting, or tailoring an answer to their company or role | `displayName` (Preferred name for addressing them), `company?` (Employer they gave at onboarding), `role?` (Their job role, not their role in this conversation) | identity-settled | platform | reserved |
+| `user-profile` | **About this person** - Who the signed-in user is and what they told us during onboarding | Personalising a greeting, or tailoring an answer to their company or role | `displayName` (Preferred name for addressing them; member trust), `company?` (Employer they gave at onboarding; member trust), `role?` (Their job role, not their role in this conversation; member trust) | identity-settled | member | reserved |
 
 ## Field contracts
 

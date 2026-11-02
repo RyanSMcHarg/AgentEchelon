@@ -5,20 +5,20 @@ date: 2026-08-09
 related:
   - "./023-battle-round-coordination.md"
   - "./026-task-shaped-battle-rounds.md"
-  - "../../specs/capabilities/DESIGN-BATTLE.md"
+  - "../../specs/interaction/quality/DESIGN-BATTLE.md"
   - "../../specs/interaction/conversation/CROSS-CHANNEL-TASKS.md"
-  - "../../specs/interaction/conversation/SPEC-NOTIFICATION-BRIDGE.md"
+  - "../../specs/communication/SPEC-NOTIFICATION-BRIDGE.md"
   - "../../../backend/lambda/src/lib/task-tracking.ts"
   - "../../../backend/lambda/src/lib/task-notify.ts"
   - "../../../backend/lambda/src/lib/battle-state.ts"
   - "../../../backend/lambda/src/lib/async-processor-core.ts"
   - "../../../backend/lambda/src/router-agent-handler.ts"
   - "../../../backend/lambda/src/analytics-aurora/schema/010-task-state-machine.sql"
-  - "../../../backend/lib/stacks/foundations-stack.ts"
+  - "../../../backend/lib/stacks/conversations-stack.ts"
   - "../../../backend/lib/stacks/assistant-profile-stack.ts"
 tracking: |
   BUILT AND DEPLOYED (all eight migration steps; see "The migration"). New rows carry
-  `ownerId`/`ownerType` behind the single `setTaskOwner` writer, `createBattleTask` is deleted, the
+  `assigneeId`/`assigneeType` behind the single `setTaskAssignee` writer, `createBattleTask` is deleted, the
   battle state row carries no `taskId`, and `channelArn-updatedAt-index` is live. Raised by the
   owner's task model: a task has a state and steps, is assigned to a human or an assistant, the
   assignment can change per step, and it can be owned by only one at a time. The pre-migration shape
@@ -39,8 +39,7 @@ tracking: |
 
 ## Status
 
-**All six decisions are set (owner, 2026-08-09), and the migration is built and deployed
-(2026-08-10; all eight steps, see "The migration").**
+**All six decisions are set (maintainer, 2026-08-09), and the migration is built and deployed (2026-08-10; all eight steps, see "The migration").**
 
 | | Question | State |
 |---|---|---|
@@ -51,212 +50,110 @@ tracking: |
 | D5 | what a task stores of the message | **decided:** what the task requires - a bounded excerpt, plus the id of the **user's** message that created it, resolvable or absent |
 | D6 | where tasks live | **decided:** DynamoDB only. Every read works in Athena mode, and nothing goes to Aurora that DynamoDB already answers |
 
-Nothing gates the migration now. D2 turned on one trade and it was settled in favour of keeping the
-strongly consistent duplicate-task guard.
+Nothing gates the migration now. D2 turned on one trade and it was settled in favor of keeping the strongly consistent duplicate-task guard.
 
 ## Context
 
-The owner's model: *"tasks should have a state, steps, and can be assigned to humans or assistants.
-this can change depending on the step, but can only be owned by one at a time."*
+The owner's model: *"tasks should have a state, steps, and can be assigned to humans or assistants. this can change depending on the step, but can only be owned by one at a time."*
 
 The current shape cannot express it, and the reason is structural rather than a missing check.
 
 ### What existed at decision time
 
-The shape below is the PRE-MIGRATION state this ADR was decided against; the migration has since
-replaced it (new rows carry `ownerId`/`ownerType`, and `createBattleTask` is deleted).
+The shape below is the PRE-MIGRATION state this ADR was decided against; the migration has since replaced it (new rows carry `assigneeId`/`assigneeType`, and `createBattleTask` is deleted).
 
-Two tables, both defined in `foundations-stack.ts:63-100`, and all access to both is contained in
-`lib/task-tracking.ts` (verified at decision time: no other file under `backend/lambda/src` reads either table):
+Two tables, both defined in `conversations-stack.ts:82-141`, and all access to both is contained in `lib/task-tracking.ts` (verified at decision time: no other file under `backend/lambda/src` reads either table):
 
 | Table | Key | Indexes | Role |
 |---|---|---|---|
 | `AgentTasksTable` | PK `taskId`, SK `channelArn` | `contextId-index` (sparse, plan cascade) | source of truth |
-| `UserTasksTable` | PK `userSub`, SK `taskId` | `userSub-taskType-index` | active-task lookup, a mirror |
+| `UserTasksTable` | PK `principalId`, SK `taskId` | `principalId-taskType-index` | active-task lookup, a mirror |
 
 Three fields carry something ownership-shaped on `Task` (`task-tracking.ts:108-160`):
 
-- **`userArn`** - the requester. Always set. Its derived sub is the mirror's partition key at create
-  time (`task-tracking.ts:275-277`).
-- **`assigneeUserSub`** - the human owner. Set by exactly one caller, and it sets it to the
-  requester: `router-agent-handler.ts:1721-1727` assigns an `action_item` to whoever asked for it.
-- **`assignedBotArn`** - the assistant owner. Set by exactly one caller, `createBattleTask`
-  (`task-tracking.ts:321-368`).
+- **`userArn`** - the requester. Always set. Its derived sub is the mirror's partition key at create time (`task-tracking.ts:275-277`).
+- **`assigneePersonId`** - the human owner. Set by exactly one caller, and it sets it to the requester: `router-agent-handler.ts:1724-1730` assigns an `action_item` to whoever asked for it.
+- **`assignedBotArn`** - the assistant owner. Set by exactly one caller, `createBattleTask` (`task-tracking.ts:321-368`).
 
-**Two fields for one concept means "owned by one at a time" is not representable, let alone
-enforced**, and there is no notion of ownership changing at a step boundary. `stateHistory`
-(`task-tracking.ts:56-63`) records who requested each transition (`tool` or `system`) but never who
-owned the task across it.
+**Two fields for one concept means "owned by one at a time" is not representable, let alone enforced**, and there is no notion of ownership changing at a step boundary. `stateHistory` (`task-tracking.ts:56-63`) records who requested each transition (`tool` or `system`) but never who owned the task across it.
 
 ### Four things found while grounding this ADR
 
-Stated because a migration that does not address them ships reassignment broken. **All four are since
-fixed by the migration**: findings 1 and 2 by the owner re-partition (one id to key on, migration step
-3), finding 3 by `reassignTask` replacing the uncalled `updateTaskAssignee` as a deliberate, tested,
-documented affordance (step 5), and finding 4 by `createBattleTask` collapsing into `createTask` with
-an assistant owner, so battle tasks enter the mirror. As found, **three of the four
-were latent rather than live**, and they were latent for one reason only: the single assignee-setting
-caller set the assignee to the requester, so the two ids coincided.
+Stated because a migration that does not address them ships reassignment broken. **All four are since fixed by the migration**: findings 1 and 2 by the owner re-partition (one id to key on, migration step 3), finding 3 by `reassignTask` replacing the uncalled `updateTaskAssignee` as a deliberate, tested, documented affordance (step 5), and finding 4 by `createBattleTask` collapsing into `createTask` with an assistant owner, so battle tasks enter the mirror. As found, **three of the four were latent rather than live**, and they were latent for one reason only: the single assignee-setting caller set the assignee to the requester, so the two ids coincided.
 
-1. **The mirror is partitioned by the REQUESTER at create and by the ASSIGNEE afterwards.**
-   `createTask` writes the mirror row under `userArn`'s sub (`:275-277`) even when
-   `opts.assigneeUserSub` is supplied, while `mirrorTaskStatus` (`:679-694`),
-   `cancelTasksForStop` (`:652`) and `updateTaskAssignee` (`:757`) all prefer `assigneeUserSub`. The
-   two writers disagree about which partition the row lives in.
-2. **The status mirror is an upsert, so the disagreement creates a second, partial row.**
-   `mirrorTaskStatus` issues an `UpdateCommand` keyed on the assignee's partition; if no row is there
-   it creates one carrying `status` and `updatedAt` and nothing else. That row has **no `ttl`, so it
-   never expires**, no `taskType`, so it is absent from `userSub-taskType-index`, and no
-   `channelArn`, so the channel-scoped filter drops it. Meanwhile the requester's row keeps the stale
-   status, and `getActiveTask` reads status off the mirror.
-3. **`updateTaskAssignee` has no callers.** It is exported, carefully written, and referenced by
-   nothing in `backend/` (source or test). **Per-step reassignment does not exist today**; the
-   function is the shape a future caller would use, not a working path.
-4. **A battle task is in neither index.** `createBattleTask` deliberately skips the mirror
-   (`:315-320, :366`) because two bots on one user and one task type collide on
-   `userSub-taskType-index`. So there is no "active task owned by this assistant" lookup at all, and
-   the battle state row's `taskId` is the stand-in for one.
+1. **The mirror is partitioned by the REQUESTER at create and by the ASSIGNEE afterwards.** `createTask` writes the mirror row under `userArn`'s sub (`:275-277`) even when `opts.assigneePersonId` is supplied, while `mirrorTaskStatus` (`:679-694`), `cancelTasksForStop` (`:652`) and `updateTaskAssignee` (`:757`) all prefer `assigneePersonId`. The two writers disagree about which partition the row lives in.
+2. **The status mirror is an upsert, so the disagreement creates a second, partial row.** `mirrorTaskStatus` issues an `UpdateCommand` keyed on the assignee's partition; if no row is there it creates one carrying `status` and `updatedAt` and nothing else. That row has **no `ttl`, so it never expires**, no `taskType`, so it is absent from `principalId-taskType-index`, and no `channelArn`, so the channel-scoped filter drops it. Meanwhile the requester's row keeps the stale status, and `getActiveTask` reads status off the mirror.
+3. **`updateTaskAssignee` has no callers.** It is exported, carefully written, and referenced by nothing in `backend/` (source or test). **Per-step reassignment does not exist today**; the function is the shape a future caller would use, not a working path.
+4. **A battle task is in neither index.** `createBattleTask` deliberately skips the mirror (`:315-320, :366`) because two bots on one user and one task type collide on `principalId-taskType-index`. So there is no "active task owned by this assistant" lookup at all, and the battle state row's `taskId` is the stand-in for one.
 
-**"Battle task" is a category that should not survive this.** A battle is not a task (DESIGN-BATTLE
-§2a); a battle *turn* may open one because its intent was task-shaped, and that task then proceeds on
-its own. What actually distinguishes those rows is that **an assistant owns them** - which is the
-whole of D1. Under one owner field, `createBattleTask` collapses into `createTask` with an assistant
-owner, and the separate constructor goes with it.
+**"Battle task" is a category that should not survive this.** A battle is not a task (DESIGN-BATTLE §2a); a battle *turn* may open one because its intent was task-shaped, and that task then proceeds on its own. What actually distinguishes those rows is that **an assistant owns them** - which is the whole of D1. Under one owner field, `createBattleTask` collapses into `createTask` with an assistant owner, and the separate constructor goes with it.
 
-**A duel side DOES continue the chain it owns** ([ADR-026](./026-task-shaped-battle-rounds.md), owner
-2026-08-10). This paragraph used to cite a never-continue rule (`dd909a7`) as a second distinguishing
-characteristic. That rule was written when the only lookup available asked about the USER,
-where continuing would have absorbed the person's unrelated open task. Asking by OWNER - the whole of D2 -
-removes the hazard the rule existed for: a duel side's `getActiveTaskForOwner` result is that side's own
-chain, never the human's and never the rival's. The rule then became actively harmful, because it made a
-resumed side restart its state machine from step 0 every turn. Continuing is now the behaviour, and the
-separate constructor being a second creation door is precisely what kept the wrong branch first. **Whether `battleId` should stay on the task row is then a live question**
-and the answer looks like no: which duel a turn belonged to is battle state's business, the per-side
-collision is prevented by the owner rather than by the battle id, and a task carrying it is the same
-fusion §2a removed everywhere else. Worth settling when the constructor is collapsed, not before.
+**A duel side DOES continue the chain it owns** ([ADR-026](./026-task-shaped-battle-rounds.md), owner 2026-08-10). This paragraph used to cite a never-continue rule (`dd909a7`) as a second distinguishing characteristic. That rule was written when the only lookup available asked about the USER, where continuing would have absorbed the person's unrelated open task. Asking by OWNER - the whole of D2 - removes the hazard the rule existed for: a duel side's `getActiveTaskForOwner` result is that side's own chain, never the human's and never the rival's. The rule then became actively harmful, because it made a resumed side restart its state machine from step 0 every turn. Continuing is now the behavior, and the separate constructor being a second creation door is precisely what kept the wrong branch first. **Whether `battleId` should stay on the task row is then a live question** and the answer looks like no: which duel a turn belonged to is battle state's business, the per-side collision is prevented by the owner rather than by the battle id, and a task carrying it is the same fusion §2a removed everywhere else. Worth settling when the constructor is collapsed, not before.
 
 ### Why this blocks the battle work
 
-DESIGN-BATTLE §2a settles that battle state is not task state, so the battle row carries no `taskId`.
-The two resume paths that read that field to find a duelling side's task chain are
-`planBattleResume` and `resumeBotFromWaiting`, both in `lib/battle-state.ts` (`:722` and `:432`
-respectively; the latter is called from `channel-flow-processor.ts:904`). Removing the field leaves
-them with no lookup - unless one exists that answers **"the active task owned by this actor in this
-channel"**, which is the same question for a duelling assistant and for a person holding a work
-item. One index then serves both, and the battle row needs nothing.
+DESIGN-BATTLE §2a settles that battle state is not task state, so the battle row carries no `taskId`. The two resume paths that read that field to find a duelling side's task chain are `planBattleResume` and `resumeBotFromWaiting`, both in `lib/battle-state.ts` (`:722` and `:432` respectively; the latter is called from `channel-flow-processor.ts:898`). Removing the field leaves them with no lookup - unless one exists that answers **"the active task owned by this actor in this channel"**, which is the same question for a duelling assistant and for a person holding a work item. One index then serves both, and the battle row needs nothing.
 
-`planBattleResume` is retired by the continuation handoff: the flow no longer plans a delivery option,
-so nothing calls it, and `flow-does-not-run-the-turn.test.ts` pins the symbol out of the flow.
+`planBattleResume` is retired by the continuation handoff: the flow no longer plans a delivery option, so nothing calls it, and `flow-does-not-run-the-turn.test.ts` pins the symbol out of the flow.
 
-**The index that was nearly built was the wrong shape.** `userSub-botArn-taskType-index` would have
-been a battle-specific index standing in for a general ownership concept, and it would have kept the
-`(user, taskType)` collision alive by adding a bot to the key rather than replacing the subject.
+**The index that was nearly built was the wrong shape.** `userSub-botArn-taskType-index` would have been a battle-specific index standing in for a general ownership concept, and it would have kept the `(user, taskType)` collision alive by adding a bot to the key rather than replacing the subject.
 
 ## What must be true of any answer
 
-- **One owner, structurally.** Not two fields plus a rule. A second field is a second source of
-  truth, and the finding above is what that costs.
-- **The owner can be a human or an assistant, distinguishable without parsing the id.** Today's ids
-  are already heterogeneous: an `AppInstanceUserId` is a raw pool sub for a native user, a `fed_`
-  one-way hash for a federated one (`backend/lambda/src/membership-audit.ts:94`), and an assistant is a `/bot/` ARN.
-  Deciding "is this a person?" by inspecting the string is a rule that breaks the first time an id
-  format changes.
-- **Ownership can change at a step, and the change is recorded.** The append-only log already exists
-  for state; ownership belongs in the same record or beside it, or a reassigned task loses its
-  history of who held it.
-- **"The active task owned by this actor in this channel" is ONE lookup**, with the same shape for
-  both actor types.
-- **Visibility is scoped by conversation membership, not by ownership (owner, 2026-08-09).** Every
-  task in a conversation is visible to that conversation's current members whatever its current
-  owner. **Ownership decides who must act next; it never decides who can see.** See D4 - this is a
-  second lookup, and no option below provides it.
-- **The duplicate-task guard survives.** `getActiveTask` falls back to a **strongly consistent
-  base-table read** (`:412-417`) precisely because the GSI is eventually consistent and a rapid
-  follow-up turn would otherwise start a second `data_extraction` or `report_generation`. That guard
-  works only because the mirror's **base table** is partitioned by the subject of the lookup. **A
-  global secondary index can never be read consistently**, so any answer that moves the owner lookup
-  onto a GSI gives this up and pays for it in duplicated model calls.
-- **Existing tasks keep working across the change.** Plan tasks carry `TRIP_TASK_TTL_SECONDS`, about
-  200 days (`:196`), so "wait for the rows to expire" is not a migration strategy.
-- **The requester is not the owner.** They coincide today by default. A battle task already
-  separates them (`userArn` is the person who ran `/battle`, `assignedBotArn` is the side that owns
-  the chain), so the distinction is real before any of this is built.
+- **One owner, structurally.** Not two fields plus a rule. A second field is a second source of truth, and the finding above is what that costs.
+- **The owner can be a human or an assistant, distinguishable without parsing the id.** Today's ids are already heterogeneous: an `AppInstanceUserId` is a raw pool sub for a native user, a `fed_` one-way hash for a federated one (`backend/lambda/src/membership-audit.ts:95`), and an assistant is a `/bot/` ARN. Deciding "is this a person?" by inspecting the string is a rule that breaks the first time an id format changes.
+- **Ownership can change at a step, and the change is recorded.** The append-only log already exists for state; ownership belongs in the same record or beside it, or a reassigned task loses its history of who held it.
+- **"The active task owned by this actor in this channel" is ONE lookup**, with the same shape for both actor types.
+- **Visibility is scoped by conversation membership, not by ownership (maintainer, 2026-08-09).** Every task in a conversation is visible to that conversation's current members whatever its current owner. **Ownership decides who must act next; it never decides who can see.** See D4 - this is a second lookup, and no option below provides it.
+- **The duplicate-task guard survives.** `getActiveTask` falls back to a **strongly consistent base-table read** (`:412-417`) precisely because the GSI is eventually consistent and a rapid follow-up turn would otherwise start a second `data_extraction` or `report_generation`. That guard works only because the mirror's **base table** is partitioned by the subject of the lookup. **A global secondary index can never be read consistently**, so any answer that moves the owner lookup onto a GSI gives this up and pays for it in duplicated model calls.
+- **Existing tasks keep working across the change.** Plan tasks carry `TRIP_TASK_TTL_SECONDS`, about 200 days (`:196`), so "wait for the rows to expire" is not a migration strategy.
+- **The requester is not the owner.** They coincide today by default. A battle task already separates them (`userArn` is the person who ran `/battle`, `assignedBotArn` is the side that owns the chain), so the distinction is real before any of this is built.
 
-## D1. How an owner is represented (owner decision, 2026-08-09: DECIDED, R2)
+## D1. How an owner is represented (maintainer decision, 2026-08-09: DECIDED, R2)
 
-**The owner is the app-instance principal's unique id.** Not an ARN, not a composite key, not a
-type-prefixed string: the bare unique id, the same identifier the channel membership uses.
+**The owner is the app-instance principal's unique id.** Not an ARN, not a composite key, not a type-prefixed string: the bare unique id, the same identifier the channel membership uses.
 
-**One point of precision, because the wording matters at the assistant end.** AE's assistants are
-**`AppInstanceBot`s**, not `AppInstanceUser`s (`assistant-profile-stack.ts:1077, 1104`;
-`battle-stack.ts:237` for the alt slots), and the two are sibling resource types under one app
-instance. So the decision reads as *the app-instance principal's* unique id: an `AppInstanceUserId`
-for a person, an `AppInstanceBotId` for an assistant. It is not a humans-only rule, and reading it
-as one would put ownership back where it started.
+**One point of precision, because the wording matters at the assistant end.** AE's assistants are **`AppInstanceBot`s**, not `AppInstanceUser`s (`assistant-profile-stack.ts`, for the live assistants and the alt alike), and the two are sibling resource types under one app instance. So the decision reads as *the app-instance principal's* unique id: an `AppInstanceUserId` for a person, an `AppInstanceBotId` for an assistant. It is not a humans-only rule, and reading it as one would put ownership back where it started.
 
-**This is R2, and it makes the backfill an attribute addition.** Existing mirror rows are already
-keyed on exactly this value (`task-tracking.ts:276`, `userArn.split('/user/').pop()`), so no live row
-is re-keyed - which is what a 200-day plan TTL demanded.
+**This is R2, and it makes the backfill an attribute addition.** Existing mirror rows are already keyed on exactly this value (`task-tracking.ts:276`, `userArn.split('/user/').pop()`), so no live row is re-keyed - which is what a 200-day plan TTL demanded.
 
-**`ownerType` is still required, and it follows from the decision rather than qualifying it.** The
-unique id alone **cannot be turned back into an ARN**, because the ARN needs `/user/` or `/bot/` in
-its path, and an ARN is what every Amazon Chime SDK call takes. It is not that inferring the type from the id
-would be fragile; it is that the id does not contain the information at all. So the stored pair is
-`ownerId` (unique id, opaque) plus `ownerType` (`'user' | 'assistant'`), and the ARN is reconstructed
-as `${appInstanceArn}/user/${ownerId}` or `${appInstanceArn}/bot/${ownerId}`.
+**`assigneeType` is still required, and it follows from the decision rather than qualifying it.** The unique id alone **cannot be turned back into an ARN**, because the ARN needs `/user/` or `/bot/` in its path, and an ARN is what every Amazon Chime SDK call takes. It is not that inferring the type from the id would be fragile; it is that the id does not contain the information at all. So the stored pair is `assigneeId` (unique id, opaque) plus `assigneeType` (`'user' | 'assistant'`), and the ARN is reconstructed as `${appInstanceArn}/user/${assigneeId}` or `${appInstanceArn}/bot/${assigneeId}`.
 
 **Consequently ruled out:**
 
-- **R1, one composite key string** (`user#<id>`): the type would be inside the key and could not be
-  lost, but every existing row is keyed on a bare id, so it is a **re-key** of live data - a backfill
-  plus a read-both window rather than an expiry, against a 200-day TTL.
-- **R3, store the member ARN and read the type from its path**: it makes the ARN prefix load-bearing
-  for a correctness decision, and it stores a derived value next to the id it is derived from.
+- **R1, one composite key string** (`user#<id>`): the type would be inside the key and could not be lost, but every existing row is keyed on a bare id, so it is a **re-key** of live data - a backfill plus a read-both window rather than an expiry, against a 200-day TTL.
+- **R3, store the member ARN and read the type from its path**: it makes the ARN prefix load-bearing for a correctness decision, and it stores a derived value next to the id it is derived from.
 
-**The one thing to hold at the writer:** `ownerId` and `ownerType` are two attributes for one fact,
-so "`ownerType` is always present" is a writer rule rather than a structural guarantee. One
-constructor and no direct writes is what makes it hold, and all task access already sits behind a
-single module.
+**The one thing to hold at the writer:** `assigneeId` and `assigneeType` are two attributes for one fact, so "`assigneeType` is always present" is a writer rule rather than a structural guarantee. One constructor and no direct writes is what makes it hold, and all task access already sits behind a single module.
 
 ## D2. Where the owner lookup lives
 
 ### I1. Generalize the mirror: its partition key becomes the OWNER (recommended)
 
-The mirror's PK holds the owner id rather than the requester's sub, battle tasks are mirrored too,
-and the lookup is a base-table query on the owner with a channel filter.
+The mirror's PK holds the owner id rather than the requester's sub, battle tasks are mirrored too, and the lookup is a base-table query on the owner with a channel filter.
 
-- **For it:** it is the only option that keeps the strongly consistent recheck, because the subject
-  of the lookup stays a **base-table** partition key. It also collapses the resume path from **three
-  GSI queries per turn** (`router-agent-handler.ts:1333-1338` loops over three task types, each of
-  which can fall through to a second consistent read) to one query on the owner.
-- **Against it, and it is the real cost:** the table's partition key attribute is literally named
-  `userSub`, and **DynamoDB cannot rename a key attribute**. Either an assistant's id is stored in a
-  field called `userSub` - drift-inviting, and exactly the sort of thing that reads as a defect two
-  sessions later - or the table is replaced (I3).
+- **For it:** it is the only option that keeps the strongly consistent recheck, because the subject of the lookup stays a **base-table** partition key. It also collapses the resume path from **three GSI queries per turn** (`router-agent-handler.ts:1336-1341` loops over three task types, each of which can fall through to a second consistent read) to one query on the owner.
+- **Against it, and it is the real cost:** the table's partition key is `personId`, so while an assistant holds the work an assistant's id is stored in a field named for a person. Either that is accepted and stated beside the field, or the table is replaced by an owner-keyed one (I3).
 
 ### I2. A GSI on `AgentTasksTable` keyed by owner
 
-`PK ownerId`, `SK channelArn`, on the source of truth, and the mirror stops being the answer.
+`PK assigneeId`, `SK channelArn`, on the source of truth, and the mirror stops being the answer.
 
-- **For it:** one table, no mirror to keep consistent, and the mirror's split-brain finding above
-  disappears rather than being fixed.
-- **Against it:** a GSI cannot be read consistently, so the duplicate-task guard is lost. That guard
-  exists because losing it doubles the cost of the two most expensive intents.
+- **For it:** one table, no mirror to keep consistent, and the mirror's split-brain finding above disappears rather than being fixed.
+- **Against it:** a GSI cannot be read consistently, so the duplicate-task guard is lost. That guard exists because losing it doubles the cost of the two most expensive intents.
 
 ### I3. A new owner-keyed table, replacing the mirror
 
-`PK ownerId`, `SK taskId`, plus `ownerType`; the current mirror is backfilled into it and retired.
+`PK assigneeId`, `SK taskId`, plus `assigneeType`; the current mirror is backfilled into it and retired.
 
 - **For it:** keeps I1's consistency property and gets an honestly named key. The clean end state.
-- **Against it:** the largest change - a new table, a backfill of live rows, a dual-write or
-  dual-read window while both exist, and a retirement step that is easy to leave half-done.
+- **Against it:** the largest change - a new table, a backfill of live rows, a dual-write or dual-read window while both exist, and a retirement step that is easy to leave half-done.
 
-### I4. Add `ownerType` only, and change no keys
+### I4. Add `assigneeType` only, and change no keys
 
 The minimum. Ownership becomes readable but the lookup does not change.
 
-- **Against it:** the battle lookup still has no answer, so the work this unblocks stays blocked.
-  Recorded because it is the tempting small step, and it buys nothing that is needed.
+- **Against it:** the battle lookup still has no answer, so the work this unblocks stays blocked. Recorded because it is the tempting small step, and it buys nothing that is needed.
 
 | | Owner lookup | Consistent recheck survives | Battle tasks findable | Live-data migration |
 |---|---|---|---|---|
@@ -265,173 +162,78 @@ The minimum. Ownership becomes readable but the lookup does not change.
 | I3 | base-table query on a new table | **yes** | yes | new table plus backfill and cutover |
 | I4 | unchanged | yes | **no** | none |
 
-## D3. Where ownership history is recorded (owner decision, 2026-08-09: DECIDED, H1)
+## D3. Where ownership history is recorded (maintainer decision, 2026-08-09: DECIDED, H1)
 
-**Ownership changes are entries in the task log, which already has a home:** `Task.stateHistory`
-(`task-tracking.ts:118`), the append-only log of SPEC-TASK-STATE-TRANSITIONS §6, appended at
-`:940` and projected into Aurora per turn. No second log (H2) and not nothing (H3).
+**Ownership changes are entries in the task log, which already has a home:** `Task.stateHistory` (`task-tracking.ts:118`), the append-only log of SPEC-TASK-STATE-TRANSITIONS §6, appended at `:940` and projected into Aurora per turn. No second log (H2) and not nothing (H3).
 
-**What that requires of the entry shape, because an ownership change is not a graph edge.** A
-`StateTransition` is `{from, to, at, by, reason?, messageId?}` where `from` and `to` are declared
-machine states. Two additions:
+**What that requires of the entry shape, because an ownership change is not a graph edge.** A `StateTransition` is `{from, to, at, by, reason?, messageId?}` where `from` and `to` are declared machine states. Two additions:
 
-- Every entry carries the **owner in force**, so each state edge is attributable to whoever held the
-  task when it was traversed.
-- An ownership change is recorded with **`ownerFrom` / `ownerTo`, leaving `from` and `to` absent**,
-  rather than reusing `from`/`to` behind a discriminator. A consumer that reads `from` then gets
-  nothing rather than a principal id in a field every other reader treats as a state name. Fail to
-  read the discriminator and you get an absent value, not a plausible wrong one.
+- Every entry carries the **owner in force**, so each state edge is attributable to whoever held the task when it was traversed.
+- An ownership change is recorded with **`ownerFrom` / `ownerTo`, leaving `from` and `to` absent**, rather than reusing `from`/`to` behind a discriminator. A consumer that reads `from` then gets nothing rather than a principal id in a field every other reader treats as a state name. Fail to read the discriminator and you get an absent value, not a plausible wrong one.
 
-**Two live consumers make this concrete, and both are ways a reassignment could silently corrupt
-task analytics if it is appended through the state path:**
+**Two live consumers make this concrete, and both are ways a reassignment could silently corrupt task analytics if it is appended through the state path:**
 
-1. **The projected edge.** `taskTransition` is the **net** edge over the turn's in-memory
-   `transitions` array, `{from: transitions[0].from, to: transitions[last].to}`
-   (`async-processor-core.ts:2424-2428`, pushed at `:1677`), and it lands in Aurora as
-   `exchanges.task_transition`, whose declared meaning is "the authorized edge this turn applied"
-   (`schema/010-task-state-machine.sql`). Push a reassignment into that array and the projected edge
-   spans an owner id and a state name, so the Effectiveness L3 timeline shows an edge that never
-   happened.
-2. **The stall signal.** That same array is the test for "the tool advanced the task this turn"
-   (`async-processor-core.ts:3028, :3050`), which is what clears `turnsInState`. A reassignment
-   counted there clears the stall counter, so a task that was handed over but never progressed reads
-   as progressing - and `turnsInState` is precisely the signal the deferred chaser idea would run on.
+1. **The projected edge.** `taskTransition` is the **net** edge over the turn's in-memory `transitions` array, `{from: transitions[0].from, to: transitions[last].to}` (`async-processor-core.ts:2411-2415`, pushed at `:1677`), and it lands in Aurora as `exchanges.task_transition`, whose declared meaning is "the authorized edge this turn applied" (`schema/010-task-state-machine.sql`). Push a reassignment into that array and the projected edge spans an owner id and a state name, so the Effectiveness L3 timeline shows an edge that never happened.
+2. **The stall signal.** That same array is the test for "the tool advanced the task this turn" (`async-processor-core.ts:3027, :3050`), which is what clears `turnsInState`. A reassignment counted there clears the stall counter, so a task that was handed over but never progressed reads as progressing - and `turnsInState` is precisely the signal the deferred chaser idea would run on.
 
-**So the append is its own write.** `advanceTaskStateTo` couples the log append to `taskState = :to`
-and `turnsInState = 0` under an optimistic condition on `from` (`:936-962`). An ownership entry goes
-through a separate append that touches neither, and does not enter the turn's `transitions` array.
+**So the append is its own write.** `advanceTaskStateTo` couples the log append to `taskState = :to` and `turnsInState = 0` under an optimistic condition on `from` (`:936-962`). An ownership entry goes through a separate append that touches neither, and does not enter the turn's `transitions` array.
 
-**One bound to set while adding a writer to this log.** `stateHistory` grows by `list_append` with
-**no cap and no trim anywhere** (`:940`), on an item that can live about 200 days
-(`TRIP_TASK_TTL_SECONDS`), against DynamoDB's 400KB item limit. The log is already unbounded; D3 adds
-a second class of writer to it. A long-lived plan task that is reassigned repeatedly is the shape
-that reaches the limit first, and an item that hits it fails the **write**, which on this path is the
-transition itself. Either cap the retained entries or state the expected ceiling; do not add the
-writer and leave the bound unexamined.
+**One bound to set while adding a writer to this log.** `stateHistory` grows by `list_append` with **no cap and no trim anywhere** (`:940`), on an item that can live about 200 days (`TRIP_TASK_TTL_SECONDS`), against DynamoDB's 400KB item limit. The log is already unbounded; D3 adds a second class of writer to it. A long-lived plan task that is reassigned repeatedly is the shape that reaches the limit first, and an item that hits it fails the **write**, which on this path is the transition itself. Either cap the retained entries or state the expected maximum; do not add the writer and leave the bound unexamined.
 
-## D4. The conversation-scoped read (owner decision, 2026-08-09: settled in principle, unbuilt)
+## D4. The conversation-scoped read (maintainer decision, 2026-08-09: settled in principle, unbuilt)
 
-**Tasks are visible to the current members of their conversation regardless of who owns them.** The
-principle is decided; what it needs is not built, and it is worth being exact about how far from
-built it is.
+**Tasks are visible to the current members of their conversation regardless of who owns them.** The principle is decided; what it needs is not built, and it is worth being exact about how far from built it is.
 
-**There is no conversation-keyed read of tasks today.** `AgentTasksTable` is PK `taskId`, SK
-`channelArn` (`foundations-stack.ts:63-65`), so the channel is a **sort** key and cannot be queried
-on its own. Nothing anywhere asks "the tasks in this conversation":
+**There is no conversation-keyed read of tasks today.** `AgentTasksTable` is PK `taskId`, SK `channelArn` (`conversations-stack.ts:82-85`), so the channel is a **sort** key and cannot be queried on its own. Nothing anywhere asks "the tasks in this conversation":
 
-- `getActiveTask` keys on the subject and applies `channelArn` as a post-read **filter**
-  (`task-tracking.ts:439-442`), so it can only narrow one actor's tasks to a channel.
+- `getActiveTask` keys on the subject and applies `channelArn` as a post-read **filter** (`task-tracking.ts:439-442`), so it can only narrow one actor's tasks to a channel.
 - `getActiveTasksForUser` queries the mirror by user across all channels (`:493-504`).
-- `contextId-index` is the closest thing and answers a different question for a subset: it is
-  **sparse** (only work-item tasks carry `contextId`) and keyed by **plan**, which is deliberately
-  cross-conversation, not by conversation.
+- `contextId-index` is the closest thing and answers a different question for a subset: it is **sparse** (only work-item tasks carry `contextId`) and keyed by **plan**, which is deliberately cross-conversation, not by conversation.
 - `scanActiveDueTasks` is a full **Scan** (`:816-836`), which is what a missing index looks like.
 
-**Where it goes, since the ADR is precise elsewhere and an implementer should not have to guess:** on
-`AgentTasksTable`, the source of truth, because the mirror has no conversation partition to hang it
-from and a conversation's tasks span owners. `PK channelArn`; the sort key wants to make "what is
-**open** here" cheap, so `status` or `updatedAt` rather than `taskId`, and the choice is worth one
-measurement rather than a coin toss. It is not sparse: every task has a `channelArn`.
+**Where it goes, since the ADR is precise elsewhere and an implementer should not have to guess:** on `AgentTasksTable`, the source of truth, because the mirror has no conversation partition to hang it from and a conversation's tasks span owners. `PK channelArn`; the sort key wants to make "what is **open** here" cheap, so `status` or `updatedAt` rather than `taskId`, and the choice is worth one measurement rather than a coin toss. It is not sparse: every task has a `channelArn`.
 
-So this requirement is a **second index**, `PK channelArn`, orthogonal to D1 and D2: every option
-above fails it equally, and whichever wins pays for this one too. The two reads then split cleanly
-by question - **by owner, "what must I act on"; by conversation, "what is open here"** - and the
-owner lookup stops being asked to do double duty, which is what the channel filter on
-`getActiveTask` is today.
+So this requirement is a **second index**, `PK channelArn`, orthogonal to D1 and D2: every option above fails it equally, and whichever wins pays for this one too. The two reads then split cleanly by question - **by owner, "what must I act on"; by conversation, "what is open here"** - and the owner lookup stops being asked to do double duty, which is what the channel filter on `getActiveTask` is today.
 
-**This settles the resume-subject question in the migration below, and it splits it in two.** Read
-scope is the conversation, so a member who owns nothing still sees the conversation's tasks and the
-assistant can speak about them. Whether a turn **advances** a task someone else owns is the separate
-question, and ownership is what answers it.
+**This settles the resume-subject question in the migration below, and it splits it in two.** Read scope is the conversation, so a member who owns nothing still sees the conversation's tasks and the assistant can speak about them. Whether a turn **advances** a task someone else owns is the separate question, and ownership is what answers it.
 
-**The confidentiality boundary is unchanged, and that is why this is safe.** A task's
-`userMessage` and `details` carry conversation content, and the conversation already is the boundary
-(membership plus channel classification). A task inherits that boundary rather than being narrowed
-further by who happens to hold it. **Membership is read live, never from a stored roster copy**, and
-the cross-conversation hint stays deliberately terse (counts and task types, no content:
-`task-tracking.ts:515-560`), because that one crosses the boundary and this one does not.
+**The confidentiality boundary is unchanged, and that is why this is safe.** A task's `userMessage` and `details` carry conversation content, and the conversation already is the boundary (membership plus channel classification). A task inherits that boundary rather than being narrowed further by who happens to hold it. **Membership is read live, never from a stored roster copy**, and the cross-conversation hint stays deliberately terse (counts and task types, no content: `task-tracking.ts:515-560`), because that one crosses the boundary and this one does not.
 
-**"Current" is doing real work in that sentence, so state both edges.** Visibility follows membership
-**at read time**, not membership at task creation: someone who joins later sees the tasks already
-open in the conversation, and someone removed from it stops seeing them. That matches how the
-conversation's own history already behaves, which is the reason it is the right rule, but the
-alternative reading - members as of creation - is a different feature and should not be arrived at by
-accident.
+**"Current" is doing real work in that sentence, so state both edges.** Visibility follows membership **at read time**, not membership at task creation: someone who joins later sees the tasks already open in the conversation, and someone removed from it stops seeing them. That matches how the conversation's own history already behaves, which is the reason it is the right rule, but the alternative reading - members as of creation - is a different feature and should not be arrived at by accident.
 
 ### What D4 exposes: the task record, not the text behind it
 
-**The mechanism first, because the risk is easy to state and easy to overstate.** A task row keeps a
-**verbatim copy** of the message that started it (`Task.userMessage`, set from the transcript at
-`task-tracking.ts:249`), and `details` accumulates what the task collected since. Redaction removes a
-message's content from the conversation, but nothing under `lib/task-*` participates in redaction, so
-that copy is untouched. Today it only ever surfaces on the requester's own turn. **Widen the read to
-every member and the assistant could surface text from a message the user watched disappear.**
+**The mechanism first, because the risk is easy to state and easy to overstate.** A task row keeps a **verbatim copy** of the message that started it (`Task.userMessage`, set from the transcript at `task-tracking.ts:249`), and `details` accumulates what the task collected since. Redaction removes a message's content from the conversation, but nothing under `lib/task-*` participates in redaction, so that copy is untouched. Today it only ever surfaces on the requester's own turn. **Widen the read to every member and the assistant could surface text from a message the user watched disappear.**
 
-**A cascade is also impractical here, and for a concrete reason.** Following a redaction through to
-the task would mean finding the task from the redacted message, and there is no dependable mapping:
-on the router path `Task.messageId` holds the turn's **correlationId, not an Amazon Chime SDK message id**
-(`router-agent-handler.ts:1729-1731`), which is documented at the call site and is a correlation key
-by design. **D5 addresses the copy itself rather than the cascade**, and shrinks what is at stake
-here from a full transcript to a bounded excerpt.
+**A cascade is also impractical here, and for a concrete reason.** Following a redaction through to the task would mean finding the task from the redacted message, and there is no dependable mapping: on the router path `Task.messageId` holds the turn's **correlationId, not an Amazon Chime SDK message id** (`router-agent-handler.ts:1732-1734`), which is documented at the call site and is a correlation key by design. **D5 addresses the copy itself rather than the cascade**, and shrinks what is at stake here from a full transcript to a bounded excerpt.
 
-**So the question is smaller than it first looks: does conversation-scoped visibility expose the
-task's stored text, or only the task record?** Recommended answer, and it is the same one the
-prompt-context consequence already reaches independently: **the record only** - type, state, owner,
-due date, and whether it is open. The stored copy stays exactly as reachable as it is today, which
-means **nothing has to cascade**, because D4 grants sight of a task, not of the message behind it.
-The narrow read is also the cheaper one to build.
+**So the question is smaller than it first looks: does conversation-scoped visibility expose the task's stored text, or only the task record?** Recommended answer, and it is the same one the prompt-context consequence already reaches independently: **the record only** - type, state, owner, due date, and whether it is open. The stored copy stays exactly as reachable as it is today, which means **nothing has to cascade**, because D4 grants sight of a task, not of the message behind it. The narrow read is also the cheaper one to build.
 
-**What choosing the other way would cost, stated so the choice is real:** exposing the text needs a
-redaction-aware read, and that needs a message-to-task mapping this data model does not have.
+**What choosing the other way would cost, stated so the choice is real:** exposing the text needs a redaction-aware read, and that needs a message-to-task mapping this data model does not have.
 
-## D5. What a task stores of the message that started it (owner decision, 2026-08-09)
+## D5. What a task stores of the message that started it (maintainer decision, 2026-08-09)
 
-**A task stores what the task requires. It does not require the full text, and it turns out barely to
-use it.**
+**A task stores what the task requires. It does not require the full text, and it turns out barely to use it.**
 
-**`Task.userMessage` has exactly one consumer**, `buildTaskContextForPrompt`
-(`task-tracking.ts:1141-1159`), and it reads **`.substring(0, 200)`**. Every other `userMessage` in
-the codebase is the *event's* field - the live turn's message on its way to the processor - which is
-a different thing that happens to share a name. So the row stores an unbounded verbatim transcript
-and 200 characters of it are ever read.
+**`Task.userMessage` has exactly one consumer**, `buildTaskContextForPrompt` (`task-tracking.ts:1141-1159`), and it reads **`.substring(0, 200)`**. Every other `userMessage` in the codebase is the *event's* field - the live turn's message on its way to the processor - which is a different thing that happens to share a name. So the row stores an unbounded verbatim transcript and 200 characters of it are ever read.
 
-**Storing a bounded excerpt is therefore not a trade, it is a strict reduction.** At the excerpt
-length the single consumer already truncates to, the prompt it builds is byte-identical, so there is
-no behaviour to preserve and nothing to weigh against the smaller copy. Name the length beside that
-consumer rather than repeating a bare `200` at the writer, or the two drift and the excerpt silently
-stops matching what is read.
+**Storing a bounded excerpt is therefore not a trade, it is a strict reduction.** At the excerpt length the single consumer already truncates to, the prompt it builds is byte-identical, so there is no behavior to preserve and nothing to weigh against the smaller copy. Name the length beside that consumer rather than repeating a bare `200` at the writer, or the two drift and the excerpt silently stops matching what is read.
 
-**`details` stays as it is.** It holds what the task collected - the task's own state, not a copy of
-somebody's message - which is exactly the "what the task requires" test.
+**`details` stays as it is.** It holds what the task collected - the task's own state, not a copy of somebody's message - which is exactly the "what the task requires" test.
 
 ### The pointer is the USER's message, and it must be available
 
-**The requirement (owner): the task carries the id of the user's message that created it.** Not the
-assistant's response, and not a correlation key that labels the assistant's placeholder - which is
-what `Task.messageId` holds today, and the reason the distinction has to be stated rather than
-assumed.
+**The requirement (maintainer): the task carries the id of the user's message that created it.** Not the assistant's response, and not a correlation key that labels the assistant's placeholder - which is what `Task.messageId` holds today, and the reason the distinction has to be stated rather than assumed.
 
-**The concept already exists and is already named.** `TurnRequest.userMessageId`
-(`router-agent-handler.ts:645, 753, 788`) is exactly this: the inbound user message id, declared by
-callers that hold one. Today it is consumed only to derive a correlation id (`:1499-1503`) and then
-dropped. **On `@all` and `/battle` the handler is already holding the user's message id at the moment
-it creates the task**, so storing it there is a field, not a mechanism.
+**The concept already exists and is already named.** `TurnRequest.userMessageId` (`router-agent-handler.ts:645, 753, 788`) is exactly this: the inbound user message id, declared by callers that hold one. Today it is consumed only to derive a correlation id (`:1499-1503`) and then dropped. **On `@all` and `/battle` the handler is already holding the user's message id at the moment it creates the task**, so storing it there is a field, not a mechanism.
 
-**On the ordinary Lex path it is absent in both places you would look, and that is the whole
-difficulty:**
+**On the ordinary Lex path it is absent in both places you would look, and that is the whole difficulty:**
 
-- The handler receives **exactly three request attributes** from Amazon Chime SDK - channel arn, sender arn, lex
-  platform - and the message id is not among them (`router-agent-handler.ts:1484-1486`). This is why
-  `Task.messageId` holds a correlation id there: an absent input, not an oversight.
-- The processor does not have it either. Its `messageId` is the **assistant's placeholder**, which it
-  resolves from the correlation mapping and then updates in place (`async-processor-core.ts:2128-2159`).
-- The flow sees the user's message and its id, but the control row it writes
-  (`claimPlaceholderMapping`, `channel-flow-processor.ts:270`) is claimed when it sees the
-  **assistant's placeholder** carrying `<!--corr:...-->`. It never learns which correlation id belongs
-  to which user message, because the handler derives that id from the turn.
+- The handler receives **exactly three request attributes** from Amazon Chime SDK - channel arn, sender arn, lex platform - and the message id is not among them (`router-agent-handler.ts:1487-1489`). This is why `Task.messageId` holds a correlation id there: an absent input, not an oversight.
+- The processor does not have it either. Its `messageId` is the **assistant's placeholder**, which it resolves from the correlation mapping and then updates in place (`async-processor-core.ts:2115-2146`).
+- The flow sees the user's message and its id, but the control row it writes (`claimPlaceholderMapping`, `channel-flow-processor.ts:264`) is claimed when it sees the **assistant's placeholder** carrying `<!--corr:...-->`. It never learns which correlation id belongs to which user message, because the handler derives that id from the turn.
 
-**So on the ordinary path the id must be recovered rather than received.** Four ways, and one cost
-decides between them:
+**So on the ordinary path the id must be recovered rather than received.** Four ways, and one cost decides between them:
 
 | | How | Cost |
 |---|---|---|
@@ -440,58 +242,30 @@ decides between them:
 | C | the flow declares it | needs a keying story first: on this path the flow cannot tell which correlation id belongs to which user message. Not simply "add a field" |
 | D | take it from the archive | the exchange already pairs user and agent messages at no runtime cost, but it lands seconds later and only in Aurora, so a runtime reader still has nothing |
 
-**Recommended: B**, with A ruled out on TTFF grounds rather than on taste. A task whose turn dies
-before the stamp lands then has no pointer, which is the correct degradation.
+**Recommended: B**, with A ruled out on TTFF grounds rather than on taste. A task whose turn dies before the stamp lands then has no pointer, which is the correct degradation.
 
-**The invariant that matters more than the mechanism:** the field is **either a resolvable user
-message id or absent**. It is never filled with the correlation id as a fallback. That substitution
-is exactly what produced today's misleading `Task.messageId`, and repeating it would launder a
-correlation key into a field readers will follow.
+**The invariant that matters more than the mechanism:** the field is **either a resolvable user message id or absent**. It is never filled with the correlation id as a fallback. That substitution is exactly what produced today's misleading `Task.messageId`, and repeating it would launder a correlation key into a field readers will follow.
 
 **So two fields rather than one overloaded one, and `Task.messageId` does not survive:**
 
-- `correlationId` - always present, derived when it cannot be declared. What ties the task to the
-  rest of its turn.
-- `userMessageId` - the resolvable Amazon Chime SDK message id of the user's message, or absent. What a reader
-  can actually follow back.
+- `correlationId` - always present, derived when it cannot be declared. What ties the task to the rest of its turn.
+- `userMessageId` - the resolvable Amazon Chime SDK message id of the user's message, or absent. What a reader can actually follow back.
 
-A field named `messageId` that holds a correlation key on the path that creates most tasks will
-mislead every future reader; the comment at the call site (`router-agent-handler.ts:1729-1731`)
-exists because it already has.
+A field named `messageId` that holds a correlation key on the path that creates most tasks will mislead every future reader; the comment at the call site (`router-agent-handler.ts:1732-1734`) exists because it already has.
 
-**What this does to the redaction question above:** the residue shrinks from a full transcript to a
-bounded excerpt, and D4's read exposes no text at all, so no non-owner can reach even the excerpt.
-Where a `userMessageId` exists, a reader resolves the live message and gets its redacted state rather
-than a stale copy, which is the outcome a cascade was reaching for without the cascade.
+**What this does to the redaction question above:** the residue shrinks from a full transcript to a bounded excerpt, and D4's read exposes no text at all, so no non-owner can reach even the excerpt. Where a `userMessageId` exists, a reader resolves the live message and gets its redacted state rather than a stale copy, which is the outcome a cascade was reaching for without the cascade.
 
-## D6. Tasks stay in DynamoDB, and so does cross-conversation context (owner decision, 2026-08-09)
+## D6. Tasks stay in DynamoDB, and so does cross-conversation context (maintainer decision, 2026-08-09)
 
-**Tasks stay in DynamoDB, and ownership is not projected into Aurora at all.** Aurora is a deployment
-mode and the default is `athena` (`backend/bin/backend.ts:69-70`), with precedent that
-Aurora-requiring features go inert in the other mode (`enableLiveDrift`). Every task read named below
-is a key-value read that DynamoDB already answers, so there is nothing for a second store to add.
+**Tasks stay in DynamoDB, and ownership is not projected into Aurora at all.** Aurora is a deployment mode and the default is `athena` (`backend/bin/backend.ts:89-90`), with precedent that Aurora-requiring features go inert in the other mode (`enableLiveDrift`). Every task read named below is a key-value read that DynamoDB already answers, so there is nothing for a second store to add.
 
-**The rule, stated so it is not re-litigated per feature: do not put a task read in Aurora when
-DynamoDB already answers it.** The cost is not the column, it is the second copy - a projection lags,
-so it invites a live decision being made from stale ownership, and it splits a feature across two
-stores where one deployment mode has only one of them.
+**The rule, stated so it is not re-litigated per feature: do not put a task read in Aurora when DynamoDB already answers it.** The cost is not the column, it is the second copy - a projection lags, so it invites a live decision being made from stale ownership, and it splits a feature across two stores where one deployment mode has only one of them.
 
-**Consequence, accepted:** ownership reaches no dashboard. "Who held this task when it stalled" is
-answerable only from the DynamoDB log. If that is ever wanted in the console it is a separate
-decision, made on its own merits rather than absorbed into this one.
+**Consequence, accepted:** ownership reaches no dashboard. "Who held this task when it stalled" is answerable only from the DynamoDB log. If that is ever wanted in the console it is a separate decision, made on its own merits rather than absorbed into this one.
 
-**Cross-conversation task context already works, and it is DynamoDB-only.**
-`getActiveTasksForUser` is a Query on the mirror's **partition key**, no GSI and no scan
-(`task-tracking.ts:484-513`), and `buildCrossChannelTasksHint` (`:533-560`) turns it into a terse
-prompt fragment - counts and task types, no content, current conversation excluded - injected at
-`assistant-async-processor.ts:680-688`. That read exists **only because the mirror is partitioned by
-the subject**: `AgentTasksTable` is PK `taskId` / SK `channelArn`, so "this actor's tasks everywhere"
-is a scan without it. It is also an argument for D2 keeping a subject-partitioned base table.
+**Cross-conversation task context already works, and it is DynamoDB-only.** `getActiveTasksForUser` is a Query on the mirror's **partition key**, no GSI and no scan (`task-tracking.ts:484-513`), and `buildCrossChannelTasksHint` (`:533-560`) turns it into a terse prompt fragment - counts and task types, no content, current conversation excluded - injected at `assistant-async-processor.ts:680-688`. That read exists **only because the mirror is partitioned by the subject**: `AgentTasksTable` is PK `taskId` / SK `channelArn`, so "this actor's tasks everywhere" is a scan without it. It is also an argument for D2 keeping a subject-partitioned base table.
 
-**What D1 and D2 change here is the meaning, not the mechanism.** Keyed by owner, this read becomes
-*"work I hold, everywhere"* rather than "tasks whose mirror row happens to sit under me" - which,
-per finding 1, is the requester at create and the assignee afterwards. It sharpens a read that is
-currently ambiguous.
+**What D1 and D2 change here is the meaning, not the mechanism.** Keyed by owner, this read becomes *"work I hold, everywhere"* rather than "tasks whose mirror row happens to sit under me" - which, per finding 1, is the requester at create and the assignee afterwards. It sharpens a read that is currently ambiguous.
 
 ### Three reads, two indexes
 
@@ -503,148 +277,68 @@ currently ambiguous.
 
 **Two consequences, stated because neither is a refactor:**
 
-- **A task you created but no longer own leaves your cross-conversation hint**, and stays visible to
-  you in the conversation where it lives. Correct under "owner is who must act next", and a second
-  behaviour change on top of the resume one.
-- **Battle tasks enter the mirror for the first time** (`createBattleTask` skips it today), so an
-  assistant gains a cross-conversation view of its own work. **Nothing consumes it yet**, and that is
-  precisely the shape a queue consumer would read.
+- **A task you created but no longer own leaves your cross-conversation hint**, and stays visible to you in the conversation where it lives. Correct under "owner is who must act next", and a second behavior change on top of the resume one.
+- **Battle tasks enter the mirror for the first time** (`createBattleTask` skips it today), so an assistant gains a cross-conversation view of its own work. **Nothing consumes it yet**, and that is precisely the shape a queue consumer would read.
 
-**What stays Aurora-only is semantic context, not task context.** Drift and similar-conversation
-detection need pgvector and already require `analyticsMode=aurora`. Cross-conversation *task* context
-is a key-value read and does not follow them.
+**What stays Aurora-only is semantic context, not task context.** Drift and similar-conversation detection need pgvector and already require `analyticsMode=aurora`. Cross-conversation *task* context is a key-value read and does not follow them.
 
 ### On queuing, since ownership is half of it
 
-Recorded so the distance is measured rather than assumed. After D1, D2 and D4 the model is
-queue-**shaped**: the owner index is "this actor's queue", `status` and `dueBy` are eligibility, and
-the log is the audit trail. **It is not a queue, and the gap is larger than it looks:**
+Recorded so the distance is measured rather than assumed. After D1, D2 and D4 the model is queue-**shaped**: the owner index is "this actor's queue", `status` and `dueBy` are eligibility, and the log is the audit trail. **It is not a queue, and the gap is larger than it looks:**
 
-- **Nothing consumes.** `scanActiveDueTasks` and `markTaskReminded` have **no callers** anywhere in
-  `backend/`, and there is no scheduled rule for one. The comment at `task-tracking.ts:157-159`
-  saying "the scheduled reminder uses it" describes an intent, not a wiring, and should be corrected
-  rather than inherited.
-- **Nothing enqueues outside a turn.** Both creators are turn-triggered and the only task tool is
-  `advance_task_state`. A queue that can only be filled by a live user turn is a per-turn record.
-- **No discipline.** `getActiveTask` returns the most recently updated active task of a type, and the
-  model is one active per `(owner, taskType)` - a slot, not a backlog. No ordering, no lease, no
-  redelivery. The one-owner invariant is the nearest thing to a lease and it never expires.
+- **Nothing consumes.** `scanActiveDueTasks` and `markTaskReminded` have **no callers** anywhere in `backend/`, and there is no scheduled rule for one. The comment at `task-tracking.ts:157-159` saying "the scheduled reminder uses it" describes an intent, not a wiring, and should be corrected rather than inherited.
+- **Nothing enqueues outside a turn.** Both creators are turn-triggered and the only task tool is `advance_task_state`. A queue that can only be filled by a live user turn is a per-turn record.
+- **No discipline.** `getActiveTask` returns the most recently updated active task of a type, and the model is one active per `(owner, taskType)` - one place, not a backlog. No ordering, no lease, no redelivery. The one-owner invariant is the nearest thing to a lease and it never expires.
 
-**So this ADR makes queuing possible and does not make it exist.** What is missing is an actor and a
-discipline, which is the deferred chaser question seen from the other side.
+**So this ADR makes queuing possible and does not make it exist.** What is missing is an actor and a discipline, which is the deferred chaser question seen from the other side.
 
-## D2 decided (owner, 2026-08-09): I1, the mirror re-partitioned by owner
+## D2 decided (maintainer, 2026-08-09): I1, the mirror re-partitioned by owner
 
-**The mirror keeps being a base table and its partition becomes the owner.** The reasoning is a single
-trade: the strongly consistent recheck is a real guard against a real cost (a duplicated
-`data_extraction` or `report_generation`), and it can only be kept by leaving the subject of the
-lookup as a **base-table** partition key. Three things follow at no extra cost - cross-conversation
-is the same partition query (D6), the backfill is an attribute add rather than a re-key because D1's
-id is what those rows already hold, and the resume path collapses from up to three GSI queries per
-turn (`router-agent-handler.ts:1333-1338`) to one.
+**The mirror keeps being a base table and its partition becomes the owner.** The reasoning is a single trade: the strongly consistent recheck is a real guard against a real cost (a duplicated `data_extraction` or `report_generation`), and it can only be kept by leaving the subject of the lookup as a **base-table** partition key. Three things follow at no extra cost - cross-conversation is the same partition query (D6), the backfill is an attribute add rather than a re-key because D1's id is what those rows already hold, and the resume path collapses from up to three GSI queries per turn (`router-agent-handler.ts:1336-1341`) to one.
 
-**I2 is ruled out on the guard**, not on taste: a global secondary index can never be read
-consistently, so an owner GSI on the source-of-truth table drops the duplicate-task protection
-silently and pays for it in repeated expensive model calls.
+**I2 is ruled out on the guard**, not on taste: a global secondary index can never be read consistently, so an owner GSI on the source-of-truth table drops the duplicate-task protection silently and pays for it in repeated expensive model calls.
 
-**The cost is accepted and must be written down where it will be seen.** The mirror's partition key
-attribute is named `userSub` and **DynamoDB cannot rename a key attribute**, so an assistant's id
-lives in a field called `userSub`. It is contained - all task access sits behind one module - but it
-is visible to anyone reading the table in the console, which is exactly where it misleads. The field
-carries a comment saying what it actually holds, and **I3 (a new owner-keyed table) stays the honest
-end state** if that name is ever judged worth a migration: same behaviour, correct key, at the cost of
-a table, a backfill, a dual-write window and a retirement step that is easy to leave half-done.
+**The cost is accepted and written down where it is seen.** The mirror's partition key is `personId`, a principal id: a person's AppInstanceUser id, or an assistant's `AppInstanceBotId` while the assistant holds the work, and `assigneeType` says which. It is contained (all task access sits behind one module), and the field carries a comment saying what it holds. **I3 (a new owner-keyed table) stays the alternative** if a separate partition per kind of actor is ever judged worth a table: same behavior, a key named for each actor, at the cost of a second table and a dual-write window.
 
-**D4's conversation index is independent of all of this**, so it can land in parallel rather than in
-sequence.
+**D4's conversation index is independent of all of this**, so it can land in parallel rather than in sequence.
 
-**Correction, made while building it:** an earlier draft of this ADR said that index also retires the
-`scanActiveDueTasks` Scan. **It does not.** That sweep is global - every plan, every channel, filtered
-on `dueBy` - and a `channelArn`-partitioned index cannot answer a cross-channel question without
-querying every channel. What retires it is a **sparse `dueBy` index**, which the code comment at
-`:811-815` already names as the scale path and which is a different index. It is also moot today,
-since nothing calls the Scan.
+**Correction, made while building it:** an earlier draft of this ADR said that index also retires the `scanActiveDueTasks` Scan. **It does not.** That sweep is global - every plan, every channel, filtered on `dueBy` - and a `channelArn`-partitioned index cannot answer a cross-channel question without querying every channel. What retires it is a **sparse `dueBy` index**, which the code comment at `:811-815` already names as the scale path and which is a different index. It is also moot today, since nothing calls the Scan.
 
 ## The migration
 
-**Status: ALL EIGHT STEPS BUILT AND DEPLOYED.** `channelArn-updatedAt-index` is live on the
-agent-tasks table (`IndexStatus: ACTIVE`), read back off the deployment rather than inferred from a
-successful stack update. The ownership rules are pinned by `task-ownership.test.ts`,
-`battle-task.test.ts` and `battle-continuation-keeps-its-variant.test.ts`, the last of which exists
-because swapping the battle task lookup from the bot owner to the human passed every other test in the
-repo. The four-shard backend suite has not been run to completion on the settled tree.
+**Status: ALL EIGHT STEPS BUILT AND DEPLOYED.** `channelArn-updatedAt-index` is live on the agent-tasks table (`IndexStatus: ACTIVE`), read back off the deployment rather than inferred from a successful stack update. The ownership rules are pinned by `task-ownership.test.ts`, `battle-task.test.ts` and `a-battle-turn-resolves-its-task-by-the-answering-assistant.test.ts`, the last of which exists because swapping the battle task lookup from the bot owner to the human passed every other test in the repo. The four-shard backend suite has not been run to completion on the settled tree.
 
 In order, and the first two are prerequisites rather than steps:
 
-1. **One writer.** A single `setTaskOwner` used by `createTask`, `createBattleTask` and reassignment,
-   which is where the one-owner invariant is enforced and where `ownerId` and `ownerType` are only
-   ever written together (D1). `assignedBotArn` and `assigneeUserSub` become derived reads during
-   the transition and are then deleted.
-2. **Backfill.** Existing rows get `ownerType: 'user'` and keep their id untouched, since it is
-   already the app-instance principal's unique id. Battle tasks get `ownerType: 'assistant'` with
-   `ownerId` taken from `assignedBotArn`'s **last ARN segment**, not the ARN, and are written into
-   the mirror for the first time.
-3. **Fix the split partition** (finding 1) and **the ttl-less upsert** (finding 2) as part of the
-   move, not after it. Under one owner they cannot recur, because there is one id to key on.
-4. **Repoint the battle lookup.** `planBattleResume` takes the owner lookup; `taskId` leaves the
-   battle state row; `resumeBotFromWaiting` stops reading it.
-5. **Reassignment ships as a forward-looking affordance, unwired (owner, 2026-08-09).** It is not
-   needed yet and is expected soon, so `reassignTask` replaces `updateTaskAssignee` and waits for a
-   caller rather than being deleted and rebuilt. **This is not finding 3 repeating**, and the
-   difference is worth stating because the two look identical from outside: finding 3 was uncalled by
-   accident, undocumented and untested, so nobody could tell whether reassignment worked or had
-   simply never run. This one is uncalled on purpose, says so at the definition, and is covered by
-   tests. When a caller arrives it also decides whether the hand-off announces itself.
-6. **Split the resume subject from the read subject (D4).** Today `getActiveTask` is called with the
-   **sender's** sub (`router-agent-handler.ts:1335`), so one lookup serves both "what can I see" and
-   "what do I resume". Under D4 they separate: the conversation index answers what is open here, and
-   ownership answers what this turn advances. A task assigned to someone else stops being resumed
-   when its creator speaks, and stays visible to them throughout. **That is a behaviour change, and
-   it is the point rather than a side effect** - a member seeing work they do not own is the
-   requirement.
-7. **Add the conversation index** (`PK channelArn`, D4), and repoint the visibility reads onto it.
-   It is a separate index from the owner one and neither substitutes for the other. Sorted by
-   `updatedAt`, which is a judgement rather than a measurement: recency answers "what is open here"
-   in one ordered query, where a `status` sort key needs one query per active status and still does
-   not order them.
-8. **Bound what the row stores of the message (D5)**, split `Task.messageId` into `correlationId` and
-   an optional `userMessageId`, and have the bypass paths store the id they already hold. Existing
-   rows keep whatever they hold: the prompt builder reads the excerpt or falls back to the old field.
+1. **One writer.** A single `setTaskAssignee` used by `createTask`, `createBattleTask` and reassignment, which is where the one-owner invariant is enforced and where `assigneeId` and `assigneeType` are only ever written together (D1). `assignedBotArn` and `assigneePersonId` become derived reads during the transition and are then deleted.
+2. **Backfill.** Existing rows get `assigneeType: 'user'` and keep their id untouched, since it is already the app-instance principal's unique id. Battle tasks get `assigneeType: 'assistant'` with `assigneeId` taken from `assignedBotArn`'s **last ARN segment**, not the ARN, and are written into the mirror for the first time.
+3. **Fix the split partition** (finding 1) and **the ttl-less upsert** (finding 2) as part of the move, not after it. Under one owner they cannot recur, because there is one id to key on.
+4. **Repoint the battle lookup.** `planBattleResume` takes the owner lookup; `taskId` leaves the battle state row; `resumeBotFromWaiting` stops reading it.
+5. **Reassignment ships as a forward-looking affordance, unwired (maintainer, 2026-08-09).** It is not needed yet and is expected soon, so `reassignTask` replaces `updateTaskAssignee` and waits for a caller rather than being deleted and rebuilt. **This is not finding 3 repeating**, and the difference is worth stating because the two look identical from outside: finding 3 was uncalled by accident, undocumented and untested, so nobody could tell whether reassignment worked or had simply never run. This one is uncalled on purpose, says so at the definition, and is covered by tests. When a caller arrives it also decides whether the hand-off announces itself.
+6. **Split the resume subject from the read subject (D4).** Today `getActiveTask` is called with the **sender's** sub (`router-agent-handler.ts:1338`), so one lookup serves both "what can I see" and "what do I resume". Under D4 they separate: the conversation index answers what is open here, and ownership answers what this turn advances. A task assigned to someone else stops being resumed when its creator speaks, and stays visible to them throughout. **That is a behavior change, and it is the point rather than a side effect** - a member seeing work they do not own is the requirement.
+7. **Add the conversation index** (`PK channelArn`, D4), and repoint the visibility reads onto it. It is a separate index from the owner one and neither substitutes for the other. Sorted by `updatedAt`, which is a judgement rather than a measurement: recency answers "what is open here" in one ordered query, where a `status` sort key needs one query per active status and still does not order them.
+8. **Bound what the row stores of the message (D5)**, split `Task.messageId` into `correlationId` and an optional `userMessageId`, and have the bypass paths store the id they already hold. Existing rows keep whatever they hold: the prompt builder reads the excerpt or falls back to the old field.
 
-   **Built, with one part deferred and named rather than quietly skipped:** the bypass paths declare
-   the user's message id, and the Lex path leaves it **absent**. Recovering it there needs the
-   processor's second write (option B), which is a separate change on a different path; absent is the
-   honest value in the meantime, and the invariant that it is never the correlation id standing in is
-   what the test pins.
+   **Built, with one part deferred and named rather than quietly skipped:** the bypass paths declare the user's message id, and the Lex path leaves it **absent**. Recovering it there needs the processor's second write (option B), which is a separate change on a different path; absent is the honest value in the meantime, and the invariant that it is never the correlation id standing in is what the test pins.
 
 ### What is left
 
-**Nothing in the migration.** Two things it deliberately did not do, named so they are not mistaken
-for oversights:
+**Nothing in the migration.** Two things it deliberately did not do, named so they are not mistaken for oversights:
 
-- **The Lex path leaves `userMessageId` absent.** Recovering it needs the processor's second write,
-  which is a separate change on a different path.
+- **The Lex path leaves `userMessageId` absent.** Recovering it needs the processor's second write, which is a separate change on a different path.
 - **Reassignment has no caller**, by decision (step 5).
 
-**Half of step 6 turned out to be already done**, and the reason is worth keeping: the resume lookup
-is keyed by the sender, and once the mirror was re-partitioned by owner that same call means "the
-task this actor OWNS" rather than "the task whose mirror row happens to sit under them". The subject
-moved with the partition rather than needing its own change.
+**Half of step 6 turned out to be already done**, and the reason is worth keeping: the resume lookup is keyed by the sender, and once the mirror was re-partitioned by owner that same call means "the task this actor OWNS" rather than "the task whose mirror row happens to sit under them". The subject moved with the partition rather than needing its own change.
 
 ## How this gets proven
 
-**Three existing suites pin the two-field shape and move with the migration rather than after it**,
-so they are part of the change and not follow-up work: `test/lib/battle-task.test.ts` (nine
-references, the assistant half), `test/lib/task-tracking-cross-channel.test.ts` (seven, the mirror
-and its GSI) and `test/lib/task-tracking-interrupt-resume.test.ts` (the pause/resume mirror path,
-which is where finding 2 lives). Deleting `assignedBotArn` and `assigneeUserSub` without them is how
-a green suite stops meaning anything.
+**Three existing suites pin the two-field shape and move with the migration rather than after it**, so they are part of the change and not follow-up work: `test/lib/battle-task.test.ts` (nine references, the assistant half), `test/lib/task-tracking-cross-channel.test.ts` (seven, the mirror and its GSI) and `test/lib/task-tracking-interrupt-resume.test.ts` (the pause/resume mirror path, which is where finding 2 lives). Deleting `assignedBotArn` and `assigneePersonId` without them is how a green suite stops meaning anything.
 
 | Invariant | The test that can fail |
 |---|---|
 | One owner at a time | Set an assistant owner on a task that has a human owner; assert the writer rejects it. Reintroduce a second ownership field and it must go red |
-| Owner type is not inferred from the id | Own a task with an id that looks like the other type (a `fed_` id, a bare sub); assert the type is read from `ownerType` alone, and that the ARN rebuilt for an Amazon Chime SDK call takes its `/user/` or `/bot/` segment from it |
-| An owner is a unique id, never an ARN | Assert a stored `ownerId` contains no `arn:` prefix and no path segments, including on a battle task backfilled from `assignedBotArn` |
+| Owner type is not inferred from the id | Own a task with an id that looks like the other type (an id from another issuer, a bare sub); assert the type is read from `assigneeType` alone, and that the ARN rebuilt for an Amazon Chime SDK call takes its `/user/` or `/bot/` segment from it |
+| An owner is a unique id, never an ARN | Assert a stored `assigneeId` contains no `arn:` prefix and no path segments, including on a battle task backfilled from `assignedBotArn` |
 | A reassignment is not a state edge | Reassign without advancing; assert `stateHistory` gains an entry with `ownerFrom`/`ownerTo` and no `from`/`to`, that `taskState` is unchanged, and that **`turnsInState` is NOT cleared**. Route the append through the state path and the stall signal must go red |
 | A reassignment projects no edge | Assert the turn's `taskTransition` is absent, so `exchanges.task_transition` stays null and the L3 timeline shows no edge |
 | Every state edge names its holder | Advance a task, reassign it, advance again; assert the log attributes each edge to the owner in force at the time |
@@ -653,7 +347,7 @@ a green suite stops meaning anything.
 | Reassignment moves the row and leaves nothing behind | Reassign, then assert exactly one mirror row exists, under the new owner, carrying `ttl`, `taskType` and `channelArn`. Findings 1 and 2 are both red against this today |
 | Ownership history survives reassignment | Reassign mid-chain; assert the log names both holders and the step at which it changed |
 | A battle side's task is findable without `taskId` | Drop the field from the row; assert the resume still finds the chain |
-| Migrated rows keep working | A pre-migration row with no `ownerType` resolves to its human owner and stays resumable |
+| Migrated rows keep working | A pre-migration row with no `assigneeType` resolves to its human owner and stays resumable |
 | A member sees work they do not own (D4) | Two members, one task, owned by the other; assert the non-owner's turn sees it. Key the visibility read by owner and it must go red |
 | Cross-conversation follows the owner (D6) | Reassign a task to another member; assert it leaves the creator's cross-conversation hint, appears in the new owner's, and stays visible to both in the conversation it lives in |
 | Every task read works without Aurora (D6) | Run the owner, conversation and cross-conversation reads with no Aurora configured; assert all three answer. Take any of them through the projection and it must go red in Athena mode |
@@ -664,53 +358,99 @@ a green suite stops meaning anything.
 | The pointer is resolvable or absent, never a correlation key | Assert it is set on a bypass-created task, and that a task created where no id was available leaves it **absent** rather than falling back to the correlation id |
 | Seeing is not advancing | The non-owner speaks; assert the task is visible to that turn and is NOT resumed or advanced by it |
 
+> **Amended 2026-10-17:** the owner-type test names "an id from another issuer" where it named a `fed_` id. A person is one AppInstanceUser with an opaque id whichever issuer signed them in, so the invariant is that no id shape, from any issuer, decides the owner type.
+
+## D7. Which open item a plain reply is about (maintainer decision, 2026-09-04)
+
+The lookups above answer "what does this person hold here". They do not answer "which of it is this message about", and for a while nothing did: the router resumed `getAssigneeChannelTasks(...).live[0]`, the newest.
+
+Holding more than one open item is ordinary rather than exotic. A long request opens a `report_generation` in `collecting_requirements`; a queued message opens a `queued_clarification` in `asked`. Measured on the turn-queue e2e, of fourteen answers applied TWELVE went to `collecting_requirements` and one to `asked`: the clarification the assistant had just asked about stayed open while the person believed they had answered it.
+
+When somebody answers from the work item the client addresses the reply with `Metadata.task.id` and there is nothing to work out. This decision is about the other case, the plain message.
+
+**Recency is not evidence.** It is the arrival order of the WORK, and the question is about the MESSAGE. Nothing in the router has read the message: it must return fast and spends no model call.
+
+**`awaits` is weak evidence, not strong.** It had become the strongest signal available, because it is the license to read a message as an answer at all - so "I am blocked on this person" quietly became "the next thing this person says is the answer". A task the assistant is ACTIVELY working is a MORE likely referent than one parked awaiting a reply: a question just asked is answered or it is not, while a question parked a while is one the person may have moved on from.
+
+**So the runtime ranks and the assistant decides.** The router orders the candidates - this assistant's own chain first (an ownership rule, so it outranks the rest), then work in flight ahead of a parked question, then recency only as a tiebreak - and carries the ordered set to the turn as an assumption. The turn holds the message, so it is the only thing that can decide. It names the one it read the message as addressing, through a `task_id` on `advance_task_state` whose enum is the router's set.
+
+**And it asks when it cannot tell.** Asking is a declared outcome, not a fallback. The asymmetry is the argument: a guess advances a machine, and a state advanced by a message that did not address it is a step nobody completed, which the person has to notice and undo. Asking costs a sentence.
+
+The set is CLOSED and built by the runtime, so a redirect cannot reach work the speaker does not own in this conversation. A private request travels without its excerpt, because the reply this turn writes is conversation-visible.
+
+HOW that set is read is settled by D8 below, which this decision exposed. Built from the assignee partition, as it was first, the set can only ever contain PARKED work, because work in flight is assigned to the assistant. The ranking rule above then has nothing active to rank and is inert. D8 gives the task an owner that holds still, which is what makes this one answerable.
+
+Same shape as the queue drain (ADR-033): rank deterministically, let the model make the judgement that needs the words, and give it a first-class way to say it cannot tell.
+
+## D8. Three roles, named for what they do (maintainer decision, 2026-09-04)
+
+D1 gave a task an owner and an assigned assistant. Two roles were one too few, and the shortfall showed up as a question the model could not answer: which of somebody's open work a plain reply is about.
+
+**What "owner" meant was the ASSIGNEE.** `assigneeId`/`assigneeType` say who must act next, and `reassignTask` is what flips them between the person and the assistant at every `awaits` boundary. A field that changes hands several times per task is not an owner in any ordinary sense, and reading it as one is what made the rest of this hard to see.
+
+**The human the work belongs to had no field.** `userArn` carried the requester and was doing the job: private-task disclosure is gated on it. But a requester is a fact about how a task started, not a position somebody holds, so it can never be handed on. Work that is delegated has no way to say so.
+
+So a task names three roles, changing at three different rates (SPEC-TASK-STATE-TRANSITIONS §2):
+
+| Role | Field | Changes |
+| --- | --- | --- |
+| Assigned assistant | `assistantId` | never |
+| Owner | `ownerPersonId` | on a handover |
+| Assignee | `assigneeId`/`assigneeType` | at every `awaits` boundary |
+
+### What this settles
+
+**The referent question becomes one lookup instead of two.** "Which of my work here is this person's" reads the assigned assistant and the OWNER, and does not care who holds the next step. Asked of the assignee, as it was, it needs two reads (one per owner partition) and can still only see PARKED work, because in-flight work is assigned to the assistant. That is not a lookup shape that can be tuned into correctness: the row does not carry the person while the assistant is working.
+
+**And it makes the ranking rule in D7 sound.** "Work in flight ranks above a parked question" needs a candidate set that can contain both. Built from the assignee partition it never can.
+
+**Disclosure follows the owner, not the requester.** Being handed work whose contents are withheld is not a handover. The original requester keeps read access to what they asked for: they wrote it, so withdrawing it hides a person's own words from them and protects nothing.
+
+### Storage
+
+`ownerPersonId` is mirrored onto the task row and indexed by `(channelArn, assistantId)`. The mirror stays partitioned by ASSIGNEE, because that partition is what makes "what do I owe" a read rather than a filter (D2), and that property is worth keeping. The new index is what makes the conversation-scoped question answerable at all: neither table could answer "the tasks in this conversation" before, the mirror being partitioned by assignee and the task table by `taskId`.
+
+**And the index is NOT the boundary, which is the part worth being explicit about.** The assignee partition used to make cross-person access impossible by construction, and a conversation index does not. That protection is not replaced by a filter in whatever calls the read, which would be one layer provable only by reading it. It is replaced by the arrangement tenet D3 asks for:
+
+1. **IAM decides who may run the read at all**, before the request runs. The read lives behind the task service; a person cannot invoke it, only the roles that run turns for a classification can.
+2. **The service refuses a conversation whose classification it does not answer for**, from its own environment rather than from anything the caller claims, before any read happens.
+3. **The owner narrowing is a condition on the query itself**, not a step in a caller, so a second caller cannot forget it.
+4. **The owner is bearer-pinned**: it is carried from the message sender, which Amazon Chime SDK stamps, never composed from anything a person typed. An actor is only ever asked about as itself.
+
+### The operator surface
+
+Two cross-conversation reads, because there are two roles and they return different sets:
+
+| Route | Answers | Capability |
+| --- | --- | --- |
+| `GET /admin/tasks/owned-by/{ownerPersonId}` | what this person OWNS | `tasks-read-owned-by` |
+| `GET /admin/tasks/assignee/{assigneeId}` | what this principal is ASSIGNED | `tasks-read-assignee` |
+| `POST /admin/tasks/channel/{channelId}/owner` | hand a task to a different owner | `tasks-reassign-owner` |
+
+**`/admin/tasks/owner/` is retired, not repurposed (maintainer, 2026-09-04).** It served the ASSIGNEE read under the wrong word. The tempting move was to keep the path and give it the owner meaning, which saves moving a vended capability and an IAM boundary. It was rejected: a word must not change meaning. One route naming two different facts either side of a deploy leaves an operator's script, a saved query, and every audit line already written against it silently referring to something else, with nothing afterwards to tell the two apart.
+
+So the read moved to the word it always meant, the owner read took a path that has never meant anything else, and the old path is gone. A caller still on it gets a 404 and a caller still asking for `tasks-read-owner` gets a refusal: loud, immediate, and cheap to fix.
+
+The same rule retired the wire op. `adminListOwnerTasks` named the assignee read and was NOT kept as an alias, because an alias preserves exactly the confusion the rename exists to remove. It has one caller and a deploy order we control: the task service ships before admin-tasks.
+
+**Handing work over has its own capability rather than widening `tasks-manage`.** Stopping a task and giving it to somebody else are different authorities, and a boundary of `POST /admin/tasks/channel/*` would additionally grant whatever task write is added to that prefix next. It is channel-scoped because a task is keyed by `(taskId, channelArn)`: the conversation is what a session policy can pin, and pinning it puts this write behind the same classification refusal as every other task write. The person receiving the work is body content rather than a scope, because scoping to them would authorize by the destination of a handover rather than by the work being handed.
+
+**A handover does not move the assignee.** Who owns the work and who owes its next step are separate axes, which is the whole of D8: handing a report to a colleague does not decide whether the assistant or a person acts next. It does not rewrite the requester either, which stays true however many times the work changes hands and is what keeps the original requester able to read what they wrote.
+
+**Proven by deny-tests rather than by this paragraph.** `test/task-service.test.ts` asserts that a conversation above the classification returns nothing AND reads nothing, that an absent owner is refused rather than widened to the whole conversation, that an absent assistant is refused, and that the owner reaches the query. Removing the service guard leaves the classification refusal failing and the owner and assistant requirements still passing, because the store read refuses those too: that is the redundancy the tenet asks for by name, and it is recorded so neither layer is later deleted as duplication.
+
+**No backfill.** Task rows carry a TTL and age out, so new rows carry the field and old ones expire. This is deliberately unlike the D2 partition-key rename, which could not be done in place and left a misleading name behind: an attribute can simply be added.
+
+**The old names are not left in place.** Leaving `assigneeId` meaning "assignee" beside a new `ownerPersonId` meaning "owner" would be two confusable names for two different roles.
+
 ## Consequences
 
-- **The person-owed lookup is the one a task-shaped chain takes, and anything that must happen when a
-  chain is ANSWERED belongs on it.** Ownership follows the state a chain starts in, and every
-  report, extraction and troubleshooting chain starts in one that awaits the person, so they hold it
-  from its first moment. The assistant-held branch therefore does not run for those chains at all.
-  This is easy to get wrong in a way nothing reports: a duel's resume was written on the assistant-held
-  branch, and after this ADR the response was accepted, the task advanced, and both sides of a live
-  duel sat in `WAITING_FOR_USER` with round 2 suppressed. See
-  [ADR-030](./030-a-message-is-answered-by-the-assistant-whose-work-it-answers.md).
-- **A held chain is what makes the refusal structural.** The person-owed lookup only ever returns a
-  chain THIS speaker holds, so a member who did not start a duel finds nothing and advances nothing,
-  without a comparison that could be got wrong.
-- **A state can declare what it needs before it releases the person**
-  ([ADR-031](./031-a-step-says-what-it-needs.md)). `awaits` says who holds the work; `requires`
-  says what they still owe, which is what lets a partial answer be recognised as one.
-- **The battle work unblocks in this order:** this ADR, then `taskId` leaves the battle row, then
-  ADR-023's per-`(battleId, botArn, round)` claim and bounded wait. Nothing above the ADR is safe to
-  build first, because the lookup shape decides the rest.
-- **Analytics: ownership reaches no dashboard, by decision (D6) and by construction (D3).** The
-  per-turn projection is built from the turn's in-memory `transitions` array as `{from, to}` and
-  nothing else (`async-processor-core.ts:2424-2428`), and D3 keeps ownership entries out of that
-  array. `stateHistory` in DynamoDB is the only place ownership history exists. Stated so nobody
-  assumes the existing projection picked it up.
-- **The notification bridge keeps its mechanism and gains a distinction it is missing today.**
-  `matchAssigneeInRoster` (`task-notify.ts:26`) reverse-matches the owner id against the live channel
-  roster to recover a resolvable identity, and that is unchanged for a human owner. An assistant
-  owner has no roster match and must not be notified. **Today that is a silent fallthrough rather
-  than a branch:** `postTaskHandoffNotice` returns false on no match
-  (`async-processor-core.ts:3072-3073`), which will cover both "the owner is an assistant" (normal)
-  and "the human owner has left the conversation" (a dropped notification nobody hears about). A
-  stored `ownerType` separates them, so this is a small correctness gain rather than only a port.
-- **A reassignment does not announce itself, and that is accepted for now (owner, 2026-08-09).** A
-  hand-off is user-visible today - an in-channel message plus an email `notify` directive
-  (`async-processor-core.ts:3076-3089`) - but it fires on a task entering `awaiting_completion`, not
-  on reassignment. Reassignment therefore lands silent, and it ships that way rather than growing a
-  notification path alongside the ownership change. **It is an optimisation, not a gap left
-  unnoticed:** the mechanism already exists and takes a target recovered from the roster, so wiring
-  it later is a caller, not a design. Worth doing when reassignment is used in anger, since the
-  person who has just acquired a task is the one who most needs telling.
-- **What the assistant can say about a conversation's work changes (D4).** Today the only in-channel
-  task context a turn carries is the sender's own resumed task, and other members' tasks are
-  invisible to it. Under conversation-scoped visibility an assistant can answer "what is open here"
-  for the conversation rather than for the speaker, which is a prompt-context change as well as an
-  index one, and it should stay a summary rather than replaying another member's task content.
-- **The deferred chaser question stays deferred, and this ADR keeps it possible.** Whether every task
-  should have an assistant that chases whoever is not moving it forward is the owner's "ADR for
-  another day". It is compatible with one owner only if a chaser is **not** an owner: owner is who
-  must act next, chaser is who ensures it moves. Conflate them and the two-fields-one-concept defect
-  returns wearing a different name.
+- **The person-owed lookup is the one a task-shaped chain takes, and anything that must happen when a chain is ANSWERED belongs on it.** Ownership follows the state a chain starts in, and every report, extraction and troubleshooting chain starts in one that awaits the person, so they hold it from its first moment. The assistant-held branch therefore does not run for those chains at all. This is easy to get wrong in a way nothing reports: a duel's resume was written on the assistant-held branch, and after this ADR the response was accepted, the task advanced, and both sides of a live duel sat in `WAITING_FOR_USER` with round 2 suppressed. See [ADR-030](./030-a-message-is-answered-by-the-assistant-whose-work-it-answers.md).
+- **A held chain is what makes the refusal structural.** The person-owed lookup only ever returns a chain THIS speaker holds, so a member who did not start a duel finds nothing and advances nothing, without a comparison that could be got wrong.
+- **A state can declare what it needs before it releases the person** ([ADR-031](./031-a-step-says-what-it-needs.md)). `awaits` says who holds the work; `requires` says what they still owe, which is what lets a partial answer be recognized as one.
+- **The battle work unblocks in this order:** this ADR, then `taskId` leaves the battle row, then ADR-023's per-`(battleId, botArn, round)` claim and bounded wait. Nothing above the ADR is safe to build first, because the lookup shape decides the rest.
+- **Analytics: ownership reaches no dashboard, by decision (D6) and by construction (D3).** The per-turn projection is built from the turn's in-memory `transitions` array as `{from, to}` and nothing else (`async-processor-core.ts:2411-2415`), and D3 keeps ownership entries out of that array. `stateHistory` in DynamoDB is the only place ownership history exists. Stated so nobody assumes the existing projection picked it up.
+- **The notification bridge keeps its mechanism and gains a distinction it is missing today.** `matchAssigneeInRoster` (`task-notify.ts`) checks that the owner is still in the live channel roster, and the notice then names them by AppInstanceUser ARN for the directory to resolve. An assistant owner has no roster match and must not be notified. **Today that is a silent fallthrough rather than a branch:** `postTaskHandoffNotice` returns false on no match (`async-processor-core.ts:3059-3060`), which will cover both "the owner is an assistant" (normal) and "the human owner has left the conversation" (a dropped notification nobody hears about). A stored `assigneeType` separates them, so this is a small correctness gain rather than only a port.
+- **A reassignment does not announce itself, and that is accepted for now (maintainer, 2026-08-09).** A hand-off is user-visible today - an in-channel message plus an email `notify` directive (`async-processor-core.ts:3063-3076`) - but it fires on a task entering `awaiting_completion`, not on reassignment. Reassignment therefore lands silent, and it ships that way rather than growing a notification path alongside the ownership change. **It is an optimization, not a gap left unnoticed:** the mechanism already exists and takes a target recovered from the roster, so wiring it later is a caller, not a design. Worth doing when reassignment is used in anger, since the person who has just acquired a task is the one who most needs telling.
+- **What the assistant can say about a conversation's work changes (D4).** Today the only in-channel task context a turn carries is the sender's own resumed task, and other members' tasks are invisible to it. Under conversation-scoped visibility an assistant can answer "what is open here" for the conversation rather than for the speaker, which is a prompt-context change as well as an index one, and it should stay a summary rather than replaying another member's task content.
+- **The deferred chaser question stays deferred, and this ADR keeps it possible.** Whether every task should have an assistant that chases whoever is not moving it forward is the owner's "ADR for another day". It is compatible with one owner only if a chaser is **not** an owner: owner is who must act next, chaser is who ensures it moves. Conflate them and the two-fields-one-concept defect returns wearing a different name.

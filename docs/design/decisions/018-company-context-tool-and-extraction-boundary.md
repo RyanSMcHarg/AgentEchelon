@@ -4,13 +4,13 @@ status: Accepted
 date: 2026-07-21
 related:
   - "./011-agent-routing-mechanism.md"
-  - "../../specs/interaction/assistant-config/SPEC-WELCOME-AND-CONTEXT.md"
+  - "../../specs/interaction/assistants/SPEC-WELCOME-AND-CONTEXT.md"
   - "../../guides/developer/GUIDE-ASSISTANT-CONTEXT.md"
 ---
 
 # ADR-018: Company-context tool selection and the extraction boundary
 
-> **Status:** Accepted. Extends [ADR-011](011-agent-routing-mechanism.md) (tool-use retrieval) and the welcome/context design ([SPEC-WELCOME-AND-CONTEXT](../../specs/interaction/assistant-config/SPEC-WELCOME-AND-CONTEXT.md), [GUIDE-ASSISTANT-CONTEXT](../../guides/developer/GUIDE-ASSISTANT-CONTEXT.md)). Records why a company or financial question must be answered inline via a single company-context tool, and why a single-fact lookup must NOT be routed to a multi-step extraction task.
+> **Status:** Accepted. Extends [ADR-011](011-agent-routing-mechanism.md) (tool-use retrieval) and the welcome/context design ([SPEC-WELCOME-AND-CONTEXT](../../specs/interaction/assistants/SPEC-WELCOME-AND-CONTEXT.md), [GUIDE-ASSISTANT-CONTEXT](../../guides/developer/GUIDE-ASSISTANT-CONTEXT.md)). Records why a company or financial question must be answered inline via a single company-context tool, and why a single-fact lookup must NOT be routed to a multi-step extraction task.
 
 ## Context
 

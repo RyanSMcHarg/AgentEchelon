@@ -4,17 +4,17 @@ status: Accepted
 scope: The catalog attribute. The bilingual pivot that consumes it is specified separately (SPEC-BILINGUAL-CONVERSATIONS level 2).
 date: 2026-07-16
 related:
-  - "../../specs/interaction/assistant-config/SPEC-BILINGUAL-CONVERSATIONS.md"
+  - "../../specs/interaction/assistants/SPEC-BILINGUAL-CONVERSATIONS.md"
   - "../../../backend/lib/config/model-strategy.ts"
 ---
 
 # ADR-014: Model `workingLanguage` as a catalog attribute
 
-> **Status:** Accepted - the catalog attribute ships; the pivot that consumes it does not. `workingLanguage` is a required field on every entry in the model catalog (`backend/lib/config/model-strategy.ts`), so the catalog stays exhaustive and parity-testable, and one non-`'en'` model is already published (DeepSeek V3.2, `'zh'`). What is NOT built is the translate-in / translate-back pivot that reads it: `resolve-model-plan.ts` still returns a hardcoded `workingLanguage` rather than the catalog's, so the field changes no current behaviour. The pivot remains design input for `docs/specs/interaction/assistant-config/SPEC-BILINGUAL-CONVERSATIONS.md` Level 2.
+> **Status:** Accepted - the catalog attribute ships; the pivot that consumes it does not. `workingLanguage` is a required field on every entry in the model catalog (`backend/lib/config/model-strategy.ts`), so the catalog stays exhaustive and parity-testable, and one non-`'en'` model is already published (DeepSeek V3.2, `'zh'`). What is NOT built is the translate-in / translate-back pivot that reads it: `resolve-model-plan.ts` still returns a hardcoded `workingLanguage` rather than the catalog's, so the field changes no current behavior. The pivot remains design input for `docs/specs/interaction/assistants/SPEC-BILINGUAL-CONVERSATIONS.md` Level 2.
 
 ## Context
 
-A user who converses in a non-English language gets better, more accurate answers when their turn is handled by a model that actually reasons well in that language - and letting a deployment optimize model-per-locale that way is the user benefit behind this change. To do it, the bilingual pivot (`docs/specs/interaction/assistant-config/SPEC-BILINGUAL-CONVERSATIONS.md` Level 2, "pivot to the model's strong language") needs to know, per model, **which language that model reasons best in**, so it can decide whether to translate a turn into the model's language before inference and back afterwards. Today nothing in the catalog expresses this.
+A user who converses in a non-English language gets better, more accurate answers when their turn is handled by a model that actually reasons well in that language - and letting a deployment optimize model-per-locale that way is the user benefit behind this change. To do it, the bilingual pivot (`docs/specs/interaction/assistants/SPEC-BILINGUAL-CONVERSATIONS.md` Level 2, "pivot to the model's strong language") needs to know, per model, **which language that model reasons best in**, so it can decide whether to translate a turn into the model's language before inference and back afterwards. Today nothing in the catalog expresses this.
 
 The model catalog is `backend/lib/config/model-strategy.ts`. A model entry (`BackendModelDefinition`, lines 13 - 32) already carries explicit, exhaustive, parity-testable attributes: `strengths`, `costClass`, `latencyClass`, and a **required** `visionCapable: boolean` (deliberately required "so the catalog stays exhaustive and parity-testable"). AgentEchelon is multi-provider (`docs/guides/developer/MODEL_STRATEGY.md` - Claude, Nova, GPT-OSS, and future CN-tuned Bedrock models) and routes per intent/tier, so the language a model is strongest in is a real per-model property, independent of the user's language.
 
@@ -56,6 +56,6 @@ The companion `translation` routing key (a new `RouteKey` + `INTENT_ROUTE_STRATE
 
 ## Related
 
-- `docs/specs/interaction/assistant-config/SPEC-BILINGUAL-CONVERSATIONS.md` - Level 2 pivot, the consumer.
+- `docs/specs/interaction/assistants/SPEC-BILINGUAL-CONVERSATIONS.md` - Level 2 pivot, the consumer.
 - `docs/guides/developer/MODEL_STRATEGY.md` - the catalog + intent-routing layer.
 - `backend/lib/config/model-strategy.ts` - `BackendModelDefinition` (the `visionCapable` precedent this follows).

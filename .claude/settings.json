@@ -6,7 +6,11 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node .claude/hooks/serial-test-runs.js"
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/serial-test-runs.js\""
+          },
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/deploy-through-the-guard.js\""
           }
         ]
       }
@@ -16,11 +20,15 @@
         "hooks": [
           {
             "type": "command",
-            "command": "node .claude/hooks/doc-context.js"
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/doc-context.js\""
           },
           {
             "type": "command",
-            "command": "node .claude/hooks/reuse-first.js"
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/reuse-first.js\""
+          },
+          {
+            "type": "command",
+            "command": "node \"$CLAUDE_PROJECT_DIR/.claude/hooks/tenets.js\""
           }
         ]
       }

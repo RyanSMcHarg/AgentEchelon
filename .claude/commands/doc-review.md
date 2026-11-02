@@ -4,6 +4,27 @@ description: "Review docs as team members to find inconsistencies and recommend 
 
 Perform a documentation review with the following parameters: $ARGUMENTS
 
+## Four checks that come before the role perspectives
+
+Every review runs these first, in this order, whatever `--as` roles are selected. They are not a role's opinion; they are the bar the document has to clear.
+
+1. **Project tenets.** Read [`../../docs/overview/TENETS.md`](../../docs/overview/TENETS.md) and check adherence rather than assuming it. Where a tenet settles a question the document raises, name the tenet.
+2. **Project style.** No em-dashes (use " - "). American English. Present tense describing the as-built state, with no past-state narration and no dated status blocks. Not hard-wrapped: one line per paragraph. No first person, no chat asides. Anything unbuilt is bold **NOT BUILT** / **ROADMAP** / **OPEN**. A `Status: Implemented` claim requires cited code plus a named `Verified by:` test.
+3. **What is unique about this project, including the security posture - considered FIRST, before any generic feature description.** Classification as the IAM-evaluated axis, bearer pinning, permissions boundaries as limits, isolation proven by deny-test rather than by review, and the three-store split with one source per question. A document that would read the same for any AI platform has missed the point of this one, and that is a finding.
+4. **Does the feature meet or exceed the industry bar?** Assess it, and check that the answer is recorded in the right place, because it splits:
+   - **The public document carries only the consequence**, as a keep-or-cut `Priority` column on the Functional Requirements table: `Table stakes`, `Differentiator`, `Gap - prioritize`, `Above bar - optional`, `Optional - attach instead`, `Enabler`. Priority is judged against what the field expects, not against how interesting the work is. A requirement with no priority is a finding.
+   - **The explicit "here is the bar and here is where we sit" belongs in the gitignored `private/` directory**, bar by bar, with a buy-versus-build call per gap aimed at OSS users. A published spec must not carry a competitive self-assessment. If a document under review contains one, that is a finding: move it and leave the priority behind.
+
+   Reuse the framing the repo already uses rather than inventing another: attach an external tool where the job is offline analysis over history; build where it is on the reply path, writes to the system of record, or encodes this deployment's own rules. A declined item stays declined, with its reasoning intact - a gap nobody intends to close must not sit in a backlog looking like work.
+
+## The structure a spec is reviewed against
+
+Overview; Business Problem (3 to 4 sentences); Personas, each with its goal and a table of that persona's use cases; Functional Requirements and Acceptance Criteria as a table naming the validating e2e test and a status; Non-Goals - Out of Scope as a table linking the spec that does cover each item; User Experience Description and Mocks; Related Documents.
+
+A design doc references its spec, is efficient with words, and carries labelled diagrams - Mermaid especially - in preference to prose describing a flow.
+
+The machine-parsed header block above the first section (`**Status:**`, `**Coverage:**`, `**Related:**`, `**Site section:**`) is required on top of that structure, and `backend/test/e2e-coverage-matrix.test.ts` enforces it.
+
 ## Argument Parsing
 
 - If no arguments: review all project documentation

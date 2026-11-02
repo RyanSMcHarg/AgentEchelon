@@ -1,14 +1,19 @@
 ---
 title: "ADR-007: KB permission gating via metadata filters"
-status: Decided 2026-04-28
+status: >-
+  Superseded by ADR-028 (the vector store's classification boundary is a database privilege) and ADR-046 (classifications are a set, not a ladder). Decided 2026-04-28 and never built as Bedrock Knowledge Base metadata filters; no `visibility` field exists.
 date: 2026-04-28
 related:
   - 003-kb-scoping-per-channel-vs-global.md
+  - 028-vector-store-classification-boundary.md
+  - 046-classifications-are-a-set-not-a-ladder.md
 blocks:
   - Phase 0
 ---
 
 # ADR-007: KB permission gating via metadata filters
+
+**Status:** Superseded by [ADR-028](./028-vector-store-classification-boundary.md) and [ADR-046](./046-classifications-are-a-set-not-a-ladder.md). Retrieval is bounded by each chunk's classification and a per-classification database privilege, never by a `visibility` ladder. The decision below is kept as written.
 
 ## Context
 

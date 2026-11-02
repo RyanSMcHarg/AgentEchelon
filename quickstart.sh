@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # AgentEchelon Quick Start
-# Validates prerequisites, deploys the backend, populates the frontend .env,
+# Validates prerequisites, deploys through npm run deploy (which writes each frontend package .env),
 # creates a test admin user, and starts the dev server.
 #
 # Usage:
@@ -81,67 +81,23 @@ npx --yes cdk bootstrap "aws://$AWS_ACCOUNT/$AWS_REGION" 2>&1 | tail -3
 info "CDK bootstrapped"
 
 # --- Deploy ---
-header "Deploying AgentEchelon (~14 stacks)"
+header "Deploying AgentEchelon"
 
-cd backend
-npx cdk deploy --all --require-approval never \
-  --outputs-file ../cdk-outputs.json \
-  2>&1 | grep -E "✅|Outputs|error|fail" || true
-cd ..
+# npm run deploy is the guarded deploy: it reads backend/deploy.config.json, refuses a stack outside
+# this instance, writes frontend/packages/{chat,admin}/.env from the live outputs and publishes each
+# declared app. A first run starts from the example, which declares chat, admin, notifications,
+# experiments and battle.
+if [[ ! -f backend/deploy.config.json ]]; then
+  cp backend/deploy.config.example.json backend/deploy.config.json
+  warn "Created backend/deploy.config.json from the example. Review senderEmail and capabilities in it."
+fi
 
-[[ -f cdk-outputs.json ]] || fail "Deploy failed — cdk-outputs.json not generated."
-info "All stacks deployed"
+(cd backend && AWS_REGION="$AWS_REGION" npm run deploy) || fail "Deploy failed; the output above names the step."
+info "All stacks deployed; frontend/packages/{chat,admin}/.env written from their outputs"
 
-# --- Populate frontend .env ---
-header "Configuring frontend"
-
-# Extract outputs from the JSON
-get_output() {
-  local stack="$1" key="$2"
-  python3 -c "
-import json, sys
-data = json.load(open('cdk-outputs.json'))
-stack_data = data.get('$stack', {})
-for k, v in stack_data.items():
-    if '$key' in k:
-        print(v)
-        sys.exit(0)
-sys.exit(1)
-" 2>/dev/null || echo ""
-}
-
-USER_POOL_ID=$(get_output AgentEchelonCognitoAuth UserPoolId)
-CLIENT_ID=$(get_output AgentEchelonCognitoAuth UserPoolClientId)
-IDENTITY_POOL_ID=$(get_output AgentEchelonCognitoAuth IdentityPoolId)
-APP_INSTANCE_ARN=$(get_output AgentEchelonChimeMessaging AppInstanceArn)
-CRED_EXCHANGE_URL=$(get_output AgentEchelonCognitoAuth CredentialExchangeApiUrl)
-CREATE_CONV_URL=$(get_output AgentEchelonFoundations CreateConversationApiUrl)
-ADD_BOT_URL=$(get_output AgentEchelonFoundations AddAgentApiUrl)
-PRESIGNED_URL=$(get_output AgentEchelonS3Storage PresignedUrlApiUrl)
-SHARE_URL=$(get_output AgentEchelonNotifications ShareApiUrl)
-ANALYTICS_URL=$(get_output AgentEchelonAnalytics AnalyticsApiUrl)
-USER_MGMT_URL=$(get_output AgentEchelonCognitoAuth UserManagementApiUrl)
-ADMIN_CONV_URL=$(get_output AgentEchelonCognitoAuth AdminConversationApiUrl)
-FEEDBACK_URL=$(get_output AgentEchelonCognitoAuth UserFeedbackApiUrl)
-
-cat > frontend/.env << ENVEOF
-VITE_AWS_REGION=$AWS_REGION
-VITE_USER_POOL_ID=$USER_POOL_ID
-VITE_CLIENT_ID=$CLIENT_ID
-VITE_IDENTITY_POOL_ID=$IDENTITY_POOL_ID
-VITE_APP_INSTANCE_ARN=$APP_INSTANCE_ARN
-VITE_CREDENTIAL_EXCHANGE_API_URL=$CRED_EXCHANGE_URL
-VITE_CREATE_CONVERSATION_API_URL=$CREATE_CONV_URL
-VITE_ADD_BOT_API_URL=$ADD_BOT_URL
-VITE_PRESIGNED_URL_API_URL=$PRESIGNED_URL
-VITE_SHARE_CONVERSATION_API_URL=$SHARE_URL
-VITE_ANALYTICS_API_URL=$ANALYTICS_URL
-VITE_USER_MANAGEMENT_API_URL=$USER_MGMT_URL
-VITE_ADMIN_CONVERSATIONS_API_URL=$ADMIN_CONV_URL
-VITE_USER_FEEDBACK_API_URL=$FEEDBACK_URL
-ENVEOF
-
-info "frontend/.env populated with stack outputs"
+# This deployment's stack-name prefix, from the same resolver every operator script uses
+# (backend/scripts/lib/stack-lookup.cjs), so the shell and the scripts never disagree about it.
+STACK_PREFIX=$(node -e "process.stdout.write(require(require('path').resolve(process.argv[1])).resolveStackPrefix())"   "$SCRIPT_DIR/backend/scripts/lib/stack-lookup.cjs") || fail "Could not resolve the stack prefix."
 
 # --- Create test admin user ---
 header "Creating test admin user"
@@ -168,28 +124,20 @@ info "Admin user ready: $ADMIN_EMAIL"
 # --- Summary ---
 header "AgentEchelon is ready"
 
-echo -e "  ${BOLD}Frontend:${NC}  cd frontend && npm run dev"
+echo -e "  ${BOLD}Frontend:${NC}  cd frontend && npm run dev:chat"
 echo -e "  ${BOLD}Login:${NC}     $ADMIN_EMAIL"
 echo -e "  ${BOLD}Temp password:${NC}  $ADMIN_TEMP_PASSWORD  ${BOLD}(you'll set a permanent one on first sign-in)${NC}"
 echo -e "  ${BOLD}Tier:${NC}      premium (admin)"
 echo ""
 echo -e "  Open ${BOLD}http://localhost:5173${NC} after starting the dev server."
 echo ""
-echo -e "  ${BOLD}Production hosting:${NC} the AgentEchelonFrontend stack (CloudFront + S3) was"
-echo -e "  deployed above. Publish the built app to it with: ${BOLD}cd backend && npm run deploy-frontend${NC}"
-echo -e "  Then set ${BOLD}--context appUrl=https://<DistributionUrl>${NC} and redeploy for CORS."
-echo -e "  Full guide: docs/FRONTEND-DEPLOY.md"
+echo -e "  ${BOLD}Production hosting:${NC} npm run deploy published the chat app to the ${STACK_PREFIX}ChatApp stack"
+echo -e "  (CloudFront + S3) and allowed its origin; the URL is in the deploy summary above."
+echo -e "  Full guide: docs/guides/user/FRONTEND-DEPLOY.md"
 echo ""
-
-# Optionally publish to CloudFront (the AgentEchelonFrontend bucket + distribution
-# already exist from the deploy above; this builds + syncs + invalidates).
-read -rp "Publish the frontend to CloudFront now? [y/N] " PUBLISH_CF
-if [[ "${PUBLISH_CF:-N}" =~ ^[Yy]$ ]]; then
-  (cd backend && npm run deploy-frontend)
-fi
 
 # Optionally start dev server
 read -rp "Start the dev server now? [Y/n] " START_DEV
 if [[ "${START_DEV:-Y}" =~ ^[Yy]?$ ]]; then
-  cd frontend && npm run dev
+  cd frontend && npm run dev:chat
 fi

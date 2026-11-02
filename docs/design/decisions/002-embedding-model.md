@@ -78,3 +78,5 @@ Current state qualifies the answer: AE's dormant pgvector schemas declare 1536-d
 - Cost projection for typical corpora: Titan v2 charges $0.00002 / 1K tokens. A 10K-page wiki at ~500 tokens/page = ~$0.10 to embed once. Re-embedding on schema changes is cheap; not a TTL driver.
 - Phase 3 (pgvector revival) embeds conversation summaries with the same model, keeping document and conversation vectors in the same space - enables future unified queries without dual-space complexity.
 - Multilingual support: deferred. If a customer requests it, the override path to Cohere is documented and the schema doesn't need to change (Cohere also outputs 1024-dim).
+
+**Outcome:** built as Titan Text Embeddings v2 at 1024 dimensions, with no `embeddingModel` context key and no `KnowledgeBaseConstruct`. The stacks set the model id `amazon.titan-embed-text-v2:0` as the `DRIFT_EMBEDDING_MODEL_ID` environment variable (`backend/lib/stacks/archive-stack-aurora.ts`, `backend/lib/constructs/classification-archive-functions.ts`), and the column change to `vector(1024)` is migration 008 (`backend/lambda/src/analytics-aurora/schema/008-document-embeddings.sql`).

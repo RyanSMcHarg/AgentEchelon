@@ -39,6 +39,14 @@ Closes #
 
 If this change requires a migration or manual step, describe it here:
 
+## Layers (see CONTRIBUTING.md, "The four layers" and "Deploy only what you declare")
+
+- [ ] The change names its layer (Interface, Communication, Interaction, Foundations) and keeps to that layer's job
+- [ ] The core still deploys and answers with no optional capability declared
+- [ ] Any reach into the core is an attach point declared in `backend/lib/config/capabilities.ts`, read as optional
+- [ ] A new capability has its registry entry, a deploy-matrix configuration, and its docs
+- [ ] The deploy matrix passes (`npm run test:slice -- test/deploy-matrix`)
+
 ## Security / Compliance
 
 - [ ] No new IAM permissions

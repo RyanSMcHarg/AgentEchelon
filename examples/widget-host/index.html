@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <meta name="referrer" content="strict-origin-when-cross-origin" />
+    <title>Sample widget host</title>
+    <style>
+      :root { color-scheme: light dark; font-family: system-ui, sans-serif; line-height: 1.5; }
+      body { margin: 0; padding: 2rem 1rem; }
+      main { max-width: 40rem; margin: 0 auto; }
+      code { font-family: ui-monospace, monospace; }
+      [role="status"] { margin-top: 1.5rem; padding: 0.75rem 1rem; border-left: 4px solid currentColor; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>Sample widget host</h1>
+      <p>
+        This page embeds the AgentEchelon assistant widget the way a customer's website does: it loads
+        <code>embed.js</code> from the widget's own origin, and the widget opens in a frame in the corner.
+        The page is served from a different origin than the widget, so the widget's
+        <code>frame-ancestors</code> policy decides whether it may be framed here.
+      </p>
+      <p>Open the assistant button in the bottom-right corner to start a visit.</p>
+      <div id="widget-status" role="status" aria-live="polite" hidden></div>
+    </main>
+    <script src="host-config.js"></script>
+    <script src="host.js"></script>
+  </body>
+</html>
