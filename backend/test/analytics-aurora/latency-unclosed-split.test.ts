@@ -30,6 +30,7 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
 }));
 
 import { handler } from '../../lambda/src/analytics-aurora/analytics-query';
+import { edgeContext } from '../helpers/edge-context';
 
 function postEvent(body: unknown): APIGatewayProxyEvent {
   return {
@@ -37,7 +38,7 @@ function postEvent(body: unknown): APIGatewayProxyEvent {
     path: '/query',
     body: JSON.stringify(body),
     requestContext: {
-      authorizer: { claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' } },
+      authorizer: edgeContext({ claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' } }),
     },
   } as unknown as APIGatewayProxyEvent;
 }
@@ -60,6 +61,9 @@ const BUCKETS = [
   'unclosed_disagreed',
   'unclosed_errored',
   'unclosed_superseded',
+  // The person stopped it. An explanation, not a defect - and its own bucket so a /stop stops being
+  // counted as an answer that went missing.
+  'unclosed_cancelled',
   'unclosed_awaiting',
   'unclosed_silent',
 ] as const;
@@ -103,7 +107,7 @@ describe('unclosed turns are split by what the ledger observed', () => {
     // What the CASE can produce.
     const cte = sql.slice(sql.indexOf('WITH resp_ledger'), sql.indexOf('END AS outcome'));
     const produced = new Set((cte.match(/THEN '([a-z_]+)'/g) || []).map((m) => m.slice(6, -1)));
-    // The ELSE is what makes it total - without it an unrecognised event pattern yields NULL and is
+    // The ELSE is what makes it total - without it an unrecognized event pattern yields NULL and is
     // silently miscounted as "the ledger holds nothing", i.e. a defect disguised as an absence.
     expect(cte).toMatch(/ELSE '([a-z_]+)'\s*$/m);
     const elseVal = /ELSE '([a-z_]+)'/.exec(cte)![1];
@@ -181,8 +185,10 @@ describe('unclosed turns are split by what the ledger observed', () => {
     // are exactly what this replaced - they could drift apart one at a time.
     const bucketCase = sql.slice(sql.indexOf('END AS outcome'), sql.indexOf('END AS unclosed_bucket'));
     expect(bucketCase).toMatch(/WHEN e\.id IS NULL OR e\.e2e_ms IS NOT NULL\s+THEN NULL/);
-    // And it is the FIRST arm, so nothing upstream of it can classify a closed row.
-    expect(/WHEN[\s\S]*?THEN/.exec(bucketCase.slice(bucketCase.indexOf('SELECT CASE')))![0]).toContain('e.id IS NULL');
+    // And it is the FIRST arm, so nothing upstream of it can classify a closed row. The LAST CASE
+    // before the alias, because the turn-kind and turn-span laterals sit between the ledger CTE and
+    // this one and open CASEs of their own.
+    expect(/WHEN[\s\S]*?THEN/.exec(bucketCase.slice(bucketCase.lastIndexOf('SELECT CASE')))![0]).toContain('e.id IS NULL');
     for (const bucket of BUCKETS) {
       expect(sql.indexOf(`AS ${bucket}`)).toBeGreaterThan(-1);
     }
@@ -205,7 +211,7 @@ describe('unclosed turns are split by what the ledger observed', () => {
 
   it('separates a DISAGREEMENT from a lost answer', async () => {
     // A ledger-declared final against a null e2e_ms means the two derivations disagree - the shadow
-    // diff of rollout step 4, arriving early. Counting it as a lost answer would send an investigation
+    // diff between the derived path and the ledger, arriving early. Counting it as a lost answer would send an investigation
     // after the wrong system, so it outranks every other outcome.
     const { sql } = await latencyQuery();
     const cte = sql.slice(sql.indexOf('WITH resp_ledger'), sql.indexOf('END AS outcome'));
@@ -218,7 +224,7 @@ describe('unclosed turns are split by what the ledger observed', () => {
     // is not, and this boundary is where that would otherwise go unnoticed.
     const { body } = await latencyQuery();
     const cols = body.columns as string[];
-    expect(cols.slice(0, 4)).toEqual(['date', 'agent_type', 'delivery_option', 'exchange_count']);
+    expect(cols.slice(0, 4)).toEqual(['date', 'assistant', 'delivery_option', 'assistant_turn_count']);
     expect(cols).toEqual(expect.arrayContaining([...BUCKETS]));
     // Appended AFTER the count they explain, so a reader meets the total before the breakdown.
     expect(cols.indexOf('unclosed_unobserved')).toBeGreaterThan(cols.indexOf('unclosed_count'));
@@ -229,9 +235,9 @@ describe('unclosed turns are split by what the ledger observed', () => {
     // must still add up - here, 12 unclosed turns of which 7 are merely un-observed and 2 are lost.
     const row = {
       date: '2026-08-16',
-      agent_type: 'premium',
+      assistant: 'premium',
       delivery_option: 'ASYNC',
-      exchange_count: 40,
+      assistant_turn_count: 40,
       closed_count: 28,
       unclosed_count: 12,
       unclosed_no_placeholder: 6,
@@ -240,6 +246,7 @@ describe('unclosed turns are split by what the ledger observed', () => {
       unclosed_disagreed: 1,
       unclosed_errored: 1,
       unclosed_superseded: 0,
+      unclosed_cancelled: 0,
       unclosed_awaiting: 1,
       unclosed_silent: 2,
     };

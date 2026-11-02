@@ -4,6 +4,7 @@
  * edges the old linear arrays could not express, and the intent-pack
  * machines-carry with a malformed-override fallback.
  */
+import { deliversDocument } from '../lambda/src/lib/task-state-machines';
 import {
   DEFAULT_TASK_STATE_MACHINES,
   validateTaskStateMachine,
@@ -24,19 +25,19 @@ import { shouldMarkTaskCompleted } from '../lambda/src/lib/task-tracking.js';
 
 describe('shouldMarkTaskCompleted — lifecycle status follows the machine terminal (AT6)', () => {
   it('is FALSE for a machine-backed task in a non-terminal state (no more Completed-vs-extracting)', () => {
-    expect(shouldMarkTaskCompleted('data_extraction', 'extracting')).toBe(false);
-    expect(shouldMarkTaskCompleted('data_extraction', 'collecting_requirements')).toBe(false);
-    expect(shouldMarkTaskCompleted('report_generation', 'generating')).toBe(false);
+    expect(shouldMarkTaskCompleted('data_extraction', 'extracting', DEFAULT_TASK_STATE_MACHINES)).toBe(false);
+    expect(shouldMarkTaskCompleted('data_extraction', 'collecting_requirements', DEFAULT_TASK_STATE_MACHINES)).toBe(false);
+    expect(shouldMarkTaskCompleted('report_generation', 'generating', DEFAULT_TASK_STATE_MACHINES)).toBe(false);
   });
   it('is TRUE once the machine reaches a terminal state', () => {
-    expect(shouldMarkTaskCompleted('data_extraction', 'completed')).toBe(true);
-    expect(shouldMarkTaskCompleted('report_generation', 'completed')).toBe(true);
-    expect(shouldMarkTaskCompleted('guided_troubleshooting', 'resolved')).toBe(true);
-    expect(shouldMarkTaskCompleted('guided_troubleshooting', 'escalated')).toBe(true);
+    expect(shouldMarkTaskCompleted('data_extraction', 'completed', DEFAULT_TASK_STATE_MACHINES)).toBe(true);
+    expect(shouldMarkTaskCompleted('report_generation', 'completed', DEFAULT_TASK_STATE_MACHINES)).toBe(true);
+    expect(shouldMarkTaskCompleted('guided_troubleshooting', 'resolved', DEFAULT_TASK_STATE_MACHINES)).toBe(true);
+    expect(shouldMarkTaskCompleted('guided_troubleshooting', 'escalated', DEFAULT_TASK_STATE_MACHINES)).toBe(true);
   });
   it('is TRUE for a task with NO state machine (lightweight/single-turn completes as before)', () => {
-    expect(shouldMarkTaskCompleted('general', 'anything')).toBe(true);
-    expect(shouldMarkTaskCompleted(undefined, undefined)).toBe(true);
+    expect(shouldMarkTaskCompleted('general', 'anything', DEFAULT_TASK_STATE_MACHINES)).toBe(true);
+    expect(shouldMarkTaskCompleted(undefined, undefined, DEFAULT_TASK_STATE_MACHINES)).toBe(true);
   });
 });
 
@@ -64,27 +65,27 @@ describe('task state machine graphs', () => {
 
   it('expresses the guided_troubleshooting regression + outcome-branch edges', () => {
     // regression: diagnosing can fall back to collecting_symptoms (need more info)
-    expect(legalTransitionsFrom('guided_troubleshooting', 'diagnosing')).toEqual(
+    expect(legalTransitionsFrom('guided_troubleshooting', 'diagnosing', DEFAULT_TASK_STATE_MACHINES)).toEqual(
       expect.arrayContaining(['proposing_solutions', 'collecting_symptoms']),
     );
     // outcome branch from awaiting_result: worked / didn't / give up
-    expect(isLegalTransition('guided_troubleshooting', 'awaiting_result', 'resolved')).toBe(true);
-    expect(isLegalTransition('guided_troubleshooting', 'awaiting_result', 'diagnosing')).toBe(true);
-    expect(isLegalTransition('guided_troubleshooting', 'awaiting_result', 'escalated')).toBe(true);
+    expect(isLegalTransition('guided_troubleshooting', 'awaiting_result', 'resolved', DEFAULT_TASK_STATE_MACHINES)).toBe(true);
+    expect(isLegalTransition('guided_troubleshooting', 'awaiting_result', 'diagnosing', DEFAULT_TASK_STATE_MACHINES)).toBe(true);
+    expect(isLegalTransition('guided_troubleshooting', 'awaiting_result', 'escalated', DEFAULT_TASK_STATE_MACHINES)).toBe(true);
     // an edge the graph does not declare
-    expect(isLegalTransition('guided_troubleshooting', 'collecting_symptoms', 'resolved')).toBe(false);
+    expect(isLegalTransition('guided_troubleshooting', 'collecting_symptoms', 'resolved', DEFAULT_TASK_STATE_MACHINES)).toBe(false);
     // report_generation revising -> generating loop edge
-    expect(isLegalTransition('report_generation', 'revising', 'generating')).toBe(true);
+    expect(isLegalTransition('report_generation', 'revising', 'generating', DEFAULT_TASK_STATE_MACHINES)).toBe(true);
   });
 
   it('reports initial state and terminal disposition', () => {
-    expect(initialStateFor('data_extraction')).toBe('collecting_requirements');
-    expect(terminalKindOf('guided_troubleshooting', 'resolved')).toBe('success');
-    expect(terminalKindOf('guided_troubleshooting', 'escalated')).toBe('handoff');
-    expect(terminalKindOf('guided_troubleshooting', 'diagnosing')).toBeUndefined();
-    expect(isDeclaredState('report_generation', 'revising')).toBe(true);
-    expect(isDeclaredState('report_generation', 'nope')).toBe(false);
-    expect(initialStateFor('unknown_type')).toBeUndefined();
+    expect(initialStateFor('data_extraction', DEFAULT_TASK_STATE_MACHINES)).toBe('collecting_requirements');
+    expect(terminalKindOf('guided_troubleshooting', 'resolved', DEFAULT_TASK_STATE_MACHINES)).toBe('success');
+    expect(terminalKindOf('guided_troubleshooting', 'escalated', DEFAULT_TASK_STATE_MACHINES)).toBe('handoff');
+    expect(terminalKindOf('guided_troubleshooting', 'diagnosing', DEFAULT_TASK_STATE_MACHINES)).toBeUndefined();
+    expect(isDeclaredState('report_generation', 'revising', DEFAULT_TASK_STATE_MACHINES)).toBe(true);
+    expect(isDeclaredState('report_generation', 'nope', DEFAULT_TASK_STATE_MACHINES)).toBe(false);
+    expect(initialStateFor('unknown_type', DEFAULT_TASK_STATE_MACHINES)).toBeUndefined();
   });
 });
 
@@ -110,12 +111,12 @@ describe('a machine does not start producing before the person has answered', ()
   const boundaryEdges = (machine: TaskStateMachine): Array<{ from: string; to: string; awaits: boolean }> => {
     const edges: Array<{ from: string; to: string; awaits: boolean }> = [];
     for (const [from, def] of Object.entries(machine.states)) {
-      if (def.delivers) continue; // delivering -> delivering is production continuing, not starting
+      if (deliversDocument(def)) continue; // delivering -> delivering is production continuing, not starting
       for (const to of def.transitions) {
         // Through the normalizer, so the property holds for a machine authored in either form. Read
         // off `awaitsUser` this check passed vacuously the moment the shipped machines moved to
         // `awaits`, which is the failure this whole change is about.
-        if (machine.states[to]?.delivers) edges.push({ from, to, awaits: awaitedPartyOf(def) !== null });
+        if (deliversDocument(machine.states[to])) edges.push({ from, to, awaits: awaitedPartyOf(def) !== null });
       }
     }
     return edges;
@@ -143,7 +144,7 @@ describe('a machine does not start producing before the person has answered', ()
       initial: 'outline',
       states: {
         outline: { transitions: ['writing'] }, // awaits nobody
-        writing: { transitions: ['done'], delivers: true },
+        writing: { transitions: ['done'], produces: 'document' as const },
         done: { transitions: [], terminal: 'success' },
       },
     };
@@ -268,5 +269,87 @@ describe('intent pack carries and validates machines', () => {
     expect(taskStateMachines(pack)).toBe(DEFAULT_TASK_STATE_MACHINES);
     expect(spy).toHaveBeenCalled(); // logged loudly
     spy.mockRestore();
+  });
+});
+
+/**
+ * A STEP THAT WAITS ON SOMEBODY DOES NOT DELIVER, AND THE EXTRACTION'S STEPS HOLD.
+ *
+ * Measured live: a `data_extraction` task advanced out of requirements gathering into `extracting`,
+ * which delivered, on the turn that opened it, and the greeting, narration and table written beside
+ * the call were packaged as the file. The records are shown to the person at `validating` and only
+ * `formatting` hands over a document; a state that awaits somebody is putting something to them, which
+ * is conversation, so it cannot also be the file.
+ */
+describe('delivering is the assistant\'s own step, never one that waits on somebody', () => {
+  it('data_extraction delivers only from formatting', () => {
+    const states = DEFAULT_TASK_STATE_MACHINES.data_extraction.states;
+    const delivering = Object.entries(states).filter(([, d]) => deliversDocument(d)).map(([name]) => name);
+    expect(delivering).toEqual(['formatting']);
+    // `validating` presents the records for checking and holds until the person answers.
+    expect(awaitedPartyOf(states.validating)).toEqual({ party: 'requester' });
+    expect(states.validating.presented).toBe(true);
+  });
+
+  it('no shipped machine declares a state that both awaits somebody and delivers', () => {
+    for (const [name, machine] of Object.entries(DEFAULT_TASK_STATE_MACHINES)) {
+      for (const [state, def] of Object.entries(machine.states)) {
+        if (deliversDocument(def)) expect({ name, state, awaits: awaitedPartyOf(def) }).toEqual({ name, state, awaits: null });
+      }
+    }
+  });
+
+  it('the validator refuses a state that awaits somebody and delivers, in either wait form', () => {
+    for (const wait of [{ awaits: { party: 'requester' as const } }, { awaitsUser: true }]) {
+      const machine: TaskStateMachine = {
+        initial: 'checking',
+        states: {
+          checking: { transitions: ['done'], produces: 'document' as const, ...wait },
+          done: { transitions: [], terminal: 'success' },
+        },
+      };
+      expect(() => validateTaskStateMachine('bad', machine)).toThrow(/awaits somebody, so it cannot also deliver/);
+    }
+  });
+
+  it('the validator refuses a presented state that awaits nobody', () => {
+    const machine: TaskStateMachine = {
+      initial: 'shown',
+      states: {
+        shown: { transitions: ['done'], presented: true },
+        done: { transitions: [], terminal: 'success' },
+      },
+    };
+    expect(() => validateTaskStateMachine('bad', machine)).toThrow(/is presented but awaits nobody/);
+  });
+
+  it('the opening requirements step of every shipped document workflow is presented', () => {
+    for (const type of ['report_generation', 'data_extraction', 'code_delivery', 'technical_design', 'guided_troubleshooting']) {
+      const machine = DEFAULT_TASK_STATE_MACHINES[type];
+      expect({ type, presented: machine.states[machine.initial].presented }).toEqual({ type, presented: true });
+    }
+  });
+
+  it('a pack machine that awaits and delivers on one state is refused whole, and the defaults stand', () => {
+    const spy = jest.spyOn(console, 'error').mockImplementation(() => {});
+    process.env.ASSISTANT_INTENT_PACK = JSON.stringify({
+      intents: [{ key: 'pack_flow', description: 'd', keywords: ['x'], delivery: 'TASK_MULTI_STEP' }],
+      machines: {
+        pack_flow: {
+          initial: 'checking',
+          states: {
+            checking: { transitions: ['done'], awaits: { party: 'requester' }, produces: 'document' as const },
+            done: { transitions: [], terminal: 'success' },
+          },
+        },
+      },
+    });
+    _resetIntentPackCache();
+    const pack = getIntentPack();
+    expect(pack.machines).toBeUndefined();
+    expect(taskStateMachines(pack)).toBe(DEFAULT_TASK_STATE_MACHINES);
+    spy.mockRestore();
+    delete process.env.ASSISTANT_INTENT_PACK;
+    _resetIntentPackCache();
   });
 });

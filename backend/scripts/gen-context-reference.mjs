@@ -25,7 +25,7 @@ const OUT = path.join(REPO_ROOT, 'docs', 'reference', 'context-catalog-reference
 // Placeholder identifiers: the reference documents KEYS and CONTRACTS, never resources. Real ARNs
 // would put one account's identifiers into a tracked document for no reader benefit.
 const { entries, source } = loadContextSourceCatalog({
-  classification: 'standard',
+  classification: '<classification>',
   attachmentsBucketArn: 'arn:aws:s3:::<attachments-bucket>',
   attachmentsBucketName: '<attachments-bucket>',
   userProfileTableArn: 'arn:aws:dynamodb:<region>:<account>:table/<user-profile>',

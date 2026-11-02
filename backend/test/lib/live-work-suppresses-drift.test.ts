@@ -26,6 +26,12 @@ const mockMessagingSend = jest.fn();
 const mockLambdaSend = jest.fn();
 const mockSsmSend = jest.fn();
 
+// The abuse gate admits: this file is not about the gate, which fails closed with no control table
+// (`abuse-controls.test.ts` pins that) and would refuse every turn here before the behavior under test.
+jest.mock('../../lambda/src/lib/abuse-controls.js', () => ({
+  ...jest.requireActual('../../lambda/src/lib/abuse-controls.js'),
+  evaluateAbuseGate: async () => ({ allowed: true }),
+}), { virtual: true });
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn().mockImplementation(() => ({ send: mockMessagingSend })),
   SendChannelMessageCommand: jest.fn().mockImplementation((args) => ({ __type: 'SendMessage', input: args })),
@@ -48,6 +54,8 @@ jest.mock('@aws-sdk/client-lambda', () => ({
 jest.mock('@aws-sdk/client-ssm', () => ({
   SSMClient: jest.fn().mockImplementation(() => ({ send: mockSsmSend })),
   GetParameterCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetParam', input: args })),
+  // The assignment records the router resolves the turn's assistant from.
+  GetParametersByPathCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetByPath', input: args })),
 }), { virtual: true });
 
 const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/abc';
@@ -56,8 +64,7 @@ const BOT_SELF = `${APP}/bot/premium-bot`;
 const HUMAN = `${APP}/user/alice`;
 const principalIdOf = (arn: string) => arn.split('/').pop() || arn;
 
-const ROSTER_PARAM = '/agent-echelon/alt-bot-slots/roster';
-const SELF_FUNCTION = 'AgentEchelonClassification-Premium-AgentHandler';
+const SELF_FUNCTION = 'AgentEchelonAssistants-premium-AgentHandler';
 
 const mockGetOwnerChannelTasks = jest.fn();
 const mockGetActiveTaskForOwner = jest.fn();
@@ -69,10 +76,13 @@ jest.mock('../../lambda/src/lib/task-tracking.js', () => {
   const actual = jest.requireActual('../../lambda/src/lib/task-tracking.js');
   return {
     ...actual,
-    getOwnerChannelTasks: (...a: unknown[]) => mockGetOwnerChannelTasks(...a),
+    getAssigneeChannelTasks: (...a: unknown[]) => mockGetOwnerChannelTasks(...a),
     getActiveTaskForOwner: (...a: unknown[]) => mockGetActiveTaskForOwner(...a),
     getActiveTask: (...a: unknown[]) => mockGetActiveTask(...a),
     getTask: (...a: unknown[]) => mockGetTask(...a),
+    // A turn that opens its own work gets a task of its own (only the new-work case reaches it).
+    createTask: async (_e: unknown, _d: unknown, taskType?: string) =>
+      ({ taskId: 't-new', taskType, taskState: 'collecting', status: 'in_progress' }),
     applyUserResponseToTask: (...a: unknown[]) => mockApplyUserResponseToTask(...a),
   };
 }, { virtual: true });
@@ -97,15 +107,18 @@ jest.mock('../../lambda/src/lib/battle-state.js', () => {
 const mockRunLiveDriftFlow = jest.fn();
 jest.mock('../../lambda/src/lib/live-drift-flow.js', () => ({
   runLiveDriftFlow: (...a: unknown[]) => mockRunLiveDriftFlow(...a),
+  // Read only when a turn OPENS a task (the inbound id it records); the turn here declares its own.
+  resolveOriginatingMessage: async () => ({ messageId: 'm-1' }),
 }), { virtual: true });
 
 /** The messages here are sentences, not tokens, so the fast path does not settle them. Stubbed rather
  *  than left to Bedrock: this file is about what the router does with the turn, not how it labels it. */
+const mockClassifiedIntent = jest.fn<string | undefined, []>(() => undefined);
 jest.mock('../../lambda/src/lib/intent-classifier.js', () => {
   const actual = jest.requireActual('../../lambda/src/lib/intent-classifier.js');
   return {
     ...actual,
-    classifyIntent: async () => ({ intent: actual.IntentType.GENERAL, confidence: 'high' }),
+    classifyIntent: async () => ({ intent: mockClassifiedIntent() ?? actual.IntentType.GENERAL, confidence: 'high' }),
   };
 }, { virtual: true });
 
@@ -117,14 +130,14 @@ const driftInput = () => mockRunLiveDriftFlow.mock.calls[0]?.[0] as {
 
 const minutesAgo = (n: number) => new Date(Date.now() - n * 60 * 1000).toISOString();
 
-/** A task mirror row. `ownerSub` is the OWNER's partition key, a bot id for assistant-held work. */
-const mirrorRow = (ownerSub: string, taskState: string, status = 'in_progress', taskId = 't-report') => ({
+/** A task mirror row. `ownerPersonId` is the OWNER's partition key, a bot id for assistant-held work. */
+const mirrorRow = (ownerPersonId: string, taskState: string, status = 'in_progress', taskId = 't-report') => ({
   taskId,
   taskType: 'report_generation',
   taskState,
   channelArn: CHANNEL,
   status,
-  userSub: ownerSub,
+  personId: ownerPersonId,
   assistantId: principalIdOf(BOT_SELF),
   updatedAt: minutesAgo(1),
 });
@@ -157,13 +170,11 @@ describe('work in this conversation suppresses drift', () => {
     jest.clearAllMocks();
 
     process.env.AWS_LAMBDA_FUNCTION_NAME = SELF_FUNCTION;
-    process.env.ALT_BOT_SLOTS_ROSTER_PARAM = ROSTER_PARAM;
+    // THE ROUTER IS DEPLOYED AS A CLASSIFICATION; a handler with none declines the turn (ADR-046).
+    process.env.CLASSIFICATION = 'premium';
     delete process.env.ABUSE_CONTROLS_TABLE;
 
-    mockSsmSend.mockImplementation(async (cmd: { input?: { Name?: string } }) =>
-      cmd?.input?.Name === ROSTER_PARAM
-        ? { Parameter: { Value: JSON.stringify([]) } }
-        : { Parameter: { Value: BOT_SELF } });
+    mockSsmSend.mockImplementation(async () => ({ Parameter: { Value: BOT_SELF } }));
 
     mockMessagingSend.mockImplementation(async (cmd: { __type?: string }) => {
       if (cmd?.__type === 'ListTags') return { Tags: [{ Key: 'classification', Value: 'premium' }] };
@@ -180,6 +191,7 @@ describe('work in this conversation suppresses drift', () => {
     mockGetTask.mockResolvedValue(null);
     mockApplyUserResponseToTask.mockResolvedValue({ applied: true });
     mockRunLiveDriftFlow.mockResolvedValue(null);
+    mockClassifiedIntent.mockReturnValue(undefined);
 
     ({ handler: routerHandler } = await import('../../lambda/src/router-agent-handler.js'));
   });
@@ -189,8 +201,8 @@ describe('work in this conversation suppresses drift', () => {
       // The first reported transcript. `generating` awaits nobody, exactly as `drafting_outline` used
       // to, so the chain sits in the assistant's partition and the person's queue is empty. Keyed on
       // ownership, the router reported no live task and the answer to its own question read as a pivot.
-      mockGetOwnerChannelTasks.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(BOT_SELF)
+      mockGetOwnerChannelTasks.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(BOT_SELF)
           ? { live: [mirrorRow(principalIdOf(BOT_SELF), 'generating')], recentlyEnded: [] }
           : noTasksAnywhere());
 
@@ -201,8 +213,8 @@ describe('work in this conversation suppresses drift', () => {
     });
 
     it('still suppresses when the person holds the task (the narrow case is not lost)', async () => {
-      mockGetOwnerChannelTasks.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN)
+      mockGetOwnerChannelTasks.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN)
           ? { live: [mirrorRow(principalIdOf(HUMAN), 'collecting_requirements')], recentlyEnded: [] }
           : noTasksAnywhere());
 
@@ -224,8 +236,8 @@ describe('work in this conversation suppresses drift', () => {
       // one on the assistant's when that finds nothing. Both now ask for the ended half as well, which
       // is free - the filter runs after the read. The log confirmation is NOT paid when live work
       // already settles the question.
-      mockGetOwnerChannelTasks.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(BOT_SELF)
+      mockGetOwnerChannelTasks.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(BOT_SELF)
           ? { live: [mirrorRow(principalIdOf(BOT_SELF), 'generating')], recentlyEnded: [] }
           : noTasksAnywhere());
 
@@ -244,8 +256,8 @@ describe('work in this conversation suppresses drift', () => {
     beforeEach(() => {
       // Nothing live anywhere; the report's mirror row sits finished in the ASSISTANT's partition,
       // because a report is handed back to the assistant before it completes.
-      mockGetOwnerChannelTasks.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(BOT_SELF)
+      mockGetOwnerChannelTasks.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(BOT_SELF)
           ? { live: [], recentlyEnded: [mirrorRow(principalIdOf(BOT_SELF), 'completed', 'completed')] }
           : noTasksAnywhere());
     });
@@ -284,6 +296,66 @@ describe('work in this conversation suppresses drift', () => {
       expect(driftInput().activeTaskInProgress).toBe(false);
     });
 
+    /** The worker payloads this turn dispatched. */
+    const dispatched = () => mockLambdaSend.mock.calls
+      .map((c) => (c[0] as { __type?: string; input?: { Payload?: unknown } }))
+      .filter((c) => c.__type === 'Invoke' && c.input?.Payload)
+      .map((c) => JSON.parse(Buffer.from(c.input!.Payload as Uint8Array).toString()))
+      .filter((p) => p && typeof p === 'object' && 'correlationId' in p);
+
+    /** The finished report, requested by this sender of this assistant (a report is revisable). */
+    const revisableReport = (endedMinutesAgo: number, requester = principalIdOf(HUMAN)) => ({
+      ...endedTask(endedMinutesAgo),
+      ownerPersonId: requester,
+      assistantId: principalIdOf(BOT_SELF),
+    });
+
+    it('hands a follow-up from the requester the finished report, so a change can reopen it', async () => {
+      mockGetTask.mockResolvedValue(revisableReport(2));
+
+      await routerHandler(turn('Can you add a section on churn to that report?'));
+
+      const payloads = dispatched();
+      expect(payloads).toHaveLength(1);
+      expect(payloads[0]).toMatchObject({ taskId: 't-report', taskType: 'report_generation', isTaskContinuation: true });
+      // Offered, not reopened: the router moves nothing, and the drift reading is still "just ended".
+      expect(driftInput().taskSignal).toBe('recently_ended');
+    });
+
+    it('does not merge NEW work of another kind into the finished report', async () => {
+      // Same requester, inside the window, not an acknowledgment: the only difference is that this
+      // turn asks for a different workflow. It opens its own task rather than continuing the report.
+      mockGetTask.mockResolvedValue(revisableReport(2));
+      mockClassifiedIntent.mockReturnValue('data_extraction');
+
+      await routerHandler(turn('Now extract the table from this PDF.'));
+
+      const payloads = dispatched();
+      expect(payloads).toHaveLength(1);
+      expect(payloads[0]).toMatchObject({ taskId: 't-new', taskType: 'data_extraction' });
+      expect(payloads[0].isTaskContinuation).not.toBe(true);
+    });
+
+    it('does not hand the finished report to somebody else in the conversation', async () => {
+      mockGetTask.mockResolvedValue(revisableReport(2, 'bob'));
+
+      await routerHandler(turn('Can you add a section on churn to that report?'));
+
+      // A turn is still dispatched, as an ordinary one: asserted so this cannot pass on no dispatch.
+      expect(dispatched()).toHaveLength(1);
+      expect(dispatched()[0].taskId).toBeUndefined();
+    });
+
+    it('does not hand over a finished report outside the window', async () => {
+      mockGetTask.mockResolvedValue(revisableReport(120));
+
+      await routerHandler(turn('Can you add a section on churn to that report?'));
+
+      // A turn is still dispatched, as an ordinary one: asserted so this cannot pass on no dispatch.
+      expect(dispatched()).toHaveLength(1);
+      expect(dispatched()[0].taskId).toBeUndefined();
+    });
+
     it('does not suppress on a task whose log records no ending', async () => {
       // A row that is closed in the mirror but has no terminal entry cannot say WHEN it ended, and a
       // guard that assumed "recently" would suppress on a task closed months ago.
@@ -295,3 +367,5 @@ describe('work in this conversation suppresses drift', () => {
     });
   });
 });
+
+afterAll(() => { delete process.env.CLASSIFICATION; });

@@ -2,7 +2,7 @@
  * A channel message as the Kinesis mirror of the Amazon Chime SDK message stream delivers it.
  *
  * WHY THIS SHAPE IS ITS OWN MODULE. The stream and the channel flow see DIFFERENT messages, and the
- * difference decides where a rule can live (ADR-032, MESSAGE-FLOW Appendix A). The flow's callback
+ * difference decides where a rule can live (ADR-032, MESSAGE-FLOW Appendix B). The flow's callback
  * carries no `Target` and cannot set one, so it cannot tell an addressed message from an unaddressed
  * one; the stream carries `Target` and `Metadata` intact. Any rule that reasons about how a message
  * was ADDRESSED can therefore only run here, after the fact.
@@ -39,6 +39,16 @@ export interface StreamChannelMessage {
    * mention ARNs, alongside `Target` when set and omitting it when not.
    */
   MessageAttributes?: Record<string, { StringValues?: string[] }> | null;
+  /**
+   * WHEN THE PERSON ACTUALLY SENT IT, on the shared Chime clock.
+   *
+   * Added for the repair's trigger instant (G13). A repaired turn is dispatched seconds to minutes
+   * after the message it re-drives - the whole detection delay sits between them - so measuring it
+   * from the dispatch would report a fast turn for a person who waited through all of it. This is the
+   * only instant that describes their wait, and post-processing is the only place that can see it:
+   * the channel flow's callback carries no timestamp either.
+   */
+  CreatedTimestamp?: string;
   Type?: string;
   Persistence?: string;
 }

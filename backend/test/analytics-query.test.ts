@@ -29,6 +29,10 @@ jest.mock('@aws-sdk/client-athena', () => ({
 }));
 
 import { handler, __testing } from '../lambda/src/analytics-query';
+import { analyticsPathFor as pathFor } from './helpers/analytics-path';
+import { edgeContext } from './helpers/edge-context';
+
+
 
 function event(body: unknown): APIGatewayProxyEvent {
   // The handler requires admin claims.
@@ -37,12 +41,12 @@ function event(body: unknown): APIGatewayProxyEvent {
   // authz boundary should pass a custom event without the admins group.
   return {
     httpMethod: 'POST',
-    path: '/query',
+    path: pathFor(body),
     body: JSON.stringify(body),
     requestContext: {
-      authorizer: {
+      authorizer: edgeContext({
         claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' },
-      },
+      }),
     },
   } as unknown as APIGatewayProxyEvent;
 }
@@ -152,7 +156,7 @@ describe('buildQuery — evaluation_scores aliases match EvaluationScoreData', (
     // EvaluationScoreData fields: date, agent_type, intent_type,
     // avg_relevance_score, count. The frontend tab keys off these.
     expect(sql).toMatch(/as\s+date/i);
-    expect(sql).toMatch(/as\s+agent_type/i);
+    expect(sql).toMatch(/as\s+assistant/i);
     expect(sql).toMatch(/as\s+intent_type/i);
     expect(sql).toMatch(/as\s+avg_relevance_score/i);
     expect(sql).toMatch(/as\s+count/i);
@@ -182,7 +186,7 @@ describe('buildQuery — client-events rollups', () => {
     expect(sql).toBeTruthy();
     expect(sql).toMatch(/from\s+client_events/i);
     expect(sql).toMatch(/event_type\s*=\s*'session_started'/);
-    expect(sql).toMatch(/COUNT\(DISTINCT\s+user_id\)/i);
+    expect(sql).toMatch(/COUNT\(DISTINCT\s+person_id\)/i);
     expect(sql).toMatch(/as\s+active_users/i);
   });
 
@@ -195,7 +199,7 @@ describe('buildQuery — client-events rollups', () => {
     expect(sql).toMatch(/channel_messages_listed/);
     // Must NOT collapse to session_started — that's the wrong signal here.
     expect(sql).not.toMatch(/session_started/);
-    expect(sql).toMatch(/COUNT\(DISTINCT\s+user_id\)/i);
+    expect(sql).toMatch(/COUNT\(DISTINCT\s+person_id\)/i);
     expect(sql).toMatch(/as\s+active_messaging_users/i);
   });
 
@@ -205,6 +209,9 @@ describe('buildQuery — client-events rollups', () => {
     expect(sql).toMatch(/event_type\s*=\s*'message_sent'/);
     expect(sql).toMatch(/as\s+message_count/i);
     expect(sql).toMatch(/order\s+by\s+message_count\s+desc/i);
+    // The person is their id, and the rollup carries no address.
+    expect(sql).toMatch(/GROUP BY person_id, user_tier/);
+    expect(sql).not.toMatch(/email/i);
   });
 
   it('messages_per_tier_daily groups by date + tier', () => {

@@ -1,5 +1,5 @@
 /**
- * FrontendStack (AgentEchelonFrontend) synthesis tests.
+ * FrontendStack (the ChatApp and AdminApp stacks) synthesis tests.
  *
  * The stack hosts the SPA on CloudFront + private S3. It must synthesize with
  * NO dependency on a built frontend (the build is synced out-of-band by
@@ -11,7 +11,7 @@ import { FrontendStack } from '../lib/stacks/frontend-stack';
 
 const env = { account: '123456789012', region: 'us-east-1' };
 
-describe('FrontendStack (AgentEchelonFrontend)', () => {
+describe('FrontendStack (the ChatApp and AdminApp stacks)', () => {
   it('synthesizes a private bucket + CloudFront distribution + managed-rules WAF by default', () => {
     const app = new cdk.App();
     const stack = new FrontendStack(app, 'TestFrontend', { env });

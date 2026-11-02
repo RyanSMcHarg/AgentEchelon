@@ -7,6 +7,7 @@
  * URL (`/admin/conversations` → `/admin/experiments`) and calls:
  *
  *   GET    /admin/experiments                        → { experiments: [...] }
+ *   GET    /admin/experiments/challengers             → { challengers: [{ assistant, classification, role, inUseBy }] }
  *   POST   /admin/experiments             (Experiment) → the stored Experiment
  *   POST   /admin/experiments/{id}/status  { status,   → { ok, status, freedClassification? }
  *                                            decision? }
@@ -20,7 +21,7 @@
  * append-only `transitions` audit on every change (L7). Activating an experiment whose
  * `endDate` has passed is refused (409 `EXPERIMENT_WINDOW_ENDED`) instead of reported as a
  * resume that resolves no traffic. DELETE hard-removes a never-started draft, else writes a
- * soft-delete tombstone (L8); both free the classification and release any bound alt-bot slot.
+ * soft-delete tombstone (L8); both free the classification and release the challenger it named.
  *
  * Every write is a read-modify-write of one row, pinned to the row it was decided from
  * (`optimisticGuard`), so overlapping admin actions cannot drop each other's audit entries or
@@ -31,13 +32,10 @@
  * **server-authoritative** — set from the caller, never trusted from the
  * client (audit attribution for who armed a battle experiment).
  *
- * Battle-arming responsibility (per experiment-manager.ts:
- * "altBotSlotArn … computed at admin-write time from altBotSlotId + the
- * SSM roster"): for a battleEnabled experiment this resolves
- * `altBotSlotId` → `altBotSlotArn` from the alt-bot slot roster SSM
- * parameter and denormalizes it onto the row, so the runtime
- * resolveBattleVariantBySlotArn lookup works and channel-battle enable
- * doesn't reject with "missing altBotSlotArn".
+ * Battle-arming responsibility: a battleEnabled experiment names its challenger by assistant id
+ * (`challengerAssistant`, `alt-{role}-{classification}`). Arming checks that the classification's
+ * assignment record provisions that alt (`lib/alt-assignment.ts`); the alt's bot ARN is read from the
+ * record by whoever needs it and is never stored on the row.
  */
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import {
@@ -48,23 +46,33 @@ import {
   GetCommand,
   DeleteCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import { SSMClient, GetParameterCommand, PutParameterCommand } from '@aws-sdk/client-ssm';
+import { LambdaClient, InvokeCommand, InvocationType } from '@aws-sdk/client-lambda';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import {
   validateAndSanitizeExperiment,
-  findTypeExclusionConflicts,
+  findClassificationConflicts,
   ExperimentValidationError,
   MAX_ACTIVE_EXPERIMENTS,
   isAllowedTransition,
   EXPERIMENT_STATUSES,
   appendTransition,
   sanitizeObjectiveStatement,
+  battleSidesOf,
   type Experiment,
   type ExperimentVariant,
   type ExperimentDecision,
 } from './lib/experiment-manager.js';
-import { parseJsonBody, callerIsAdmin } from './lib/auth.js';
+import { parseJsonBody, callerIsAdmin, callerCanManageProfiles, callerPersonId } from './lib/auth.js';
 import { modelCatalogKeys } from '../../lib/config/model-strategy.js';
+import { defaultProfileRegistry as profilesRegistry } from '../../lib/profile-registry';
+import { isBattleOn, __clearBattleEnablementCache } from './lib/battle-enablement.js';
+import { requireOwnedAssistant, isRefusal } from './lib/assistant-scope.js';
+import { experimentBelongsTo } from './lib/experiment-ownership.js';
+import { readAltAssignment, DUEL_ROLE, challengerOf, type AltAssignment, type LegacyBattleBinding } from './lib/alt-assignment.js';
+import { userArnFor } from './lib/person-arn.js';
+import { responder, originsFrom, DEV_ORIGIN } from './lib/http-response.js';
+import { loadProfileRegistry } from '../../lib/profile-registry';
 
 // removeUndefinedValues: validateAndSanitizeExperiment leaves optional
 // fields undefined (a blank systemPromptAddendum, imageGenModelKey on a
@@ -75,12 +83,15 @@ const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
 });
 const ssmClient = new SSMClient({});
+const lambdaClient = new LambdaClient({});
+/** The profile writer this handler asks to pin an experiment's two versions, to promote its candidate, and to name the alt as its duel side while a battle holds it. */
+const MANAGE_PROFILES_FUNCTION = process.env.MANAGE_PROFILES_FUNCTION_NAME || '';
 
 const EXPERIMENTS_TABLE = process.env.EXPERIMENTS_TABLE || '';
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
-const ALT_BOT_SLOTS_ROSTER_PARAM =
-  process.env.ALT_BOT_SLOTS_ROSTER_PARAM || '/agent-echelon/alt-bot-slots/roster';
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || 'http://localhost:5173').split(',');
+/** The SSM prefix the assignment records and the alt's versions live under, as the stack sets it. */
+const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
+const ALLOWED_ORIGINS = originsFrom(process.env.ALLOWED_ORIGIN, DEV_ORIGIN);
 
 // Statuses a caller may REQUEST via POST /{id}/status (End/Pause/Resume/Activate).
 // `draft` is a create-time state and `deleted` goes through DELETE, so neither is
@@ -92,25 +103,9 @@ const VALID_STATUS = ['active', 'paused', 'completed'] as const;
 // honestly (INV-1/INV-3) — the API never forces a winner.
 const DECISION_OUTCOMES = ['promoted_treatment', 'kept_control', 'no_decision'] as const;
 
-function corsHeaders(origin?: string): Record<string, string> {
-  const allowed = origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-  return {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': allowed,
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-    'Access-Control-Allow-Methods': 'GET,POST,DELETE,OPTIONS',
-    Vary: 'Origin',
-  };
-}
+const http = responder({ origin: { allow: ALLOWED_ORIGINS }, methods: 'GET,POST,DELETE,OPTIONS' });
 
-function respond(statusCode: number, body: unknown, origin?: string): APIGatewayProxyResult {
-  return { statusCode, headers: corsHeaders(origin), body: JSON.stringify(body) };
-}
-
-function getCallerSub(event: APIGatewayProxyEvent): string | null {
-  const claims = (event.requestContext.authorizer?.claims || {}) as Record<string, string>;
-  return claims.sub || null;
-}
+const respond = http.respond;
 
 /**
  * Server-authoritative actor ARN for audit attribution (transitions, decision,
@@ -118,7 +113,7 @@ function getCallerSub(event: APIGatewayProxyEvent): string | null {
  * instance is known, else the bare sub. Never trusted from the client.
  */
 function callerArn(callerSub: string): string {
-  return APP_INSTANCE_ARN ? `${APP_INSTANCE_ARN}/user/${callerSub}` : callerSub;
+  return APP_INSTANCE_ARN ? userArnFor(APP_INSTANCE_ARN, callerSub) : callerSub;
 }
 
 /** Fetch a stored experiment by id (null when absent). Used to drive update/edit
@@ -126,7 +121,9 @@ function callerArn(callerSub: string): string {
  *  and Delete's hard-vs-soft decision. */
 async function getExistingExperiment(experimentId: string): Promise<Experiment | null> {
   const res = (await ddb.send(
-    new GetCommand({ TableName: EXPERIMENTS_TABLE, Key: { experimentId } }),
+    // Strongly consistent: a lifecycle write right after a create (the console pauses, ends or completes what
+    // it just made) must find the row, and an eventually consistent read can answer 404 for it.
+    new GetCommand({ TableName: EXPERIMENTS_TABLE, Key: { experimentId }, ConsistentRead: true }),
   )) as { Item?: Experiment } | undefined;
   return res?.Item ?? null;
 }
@@ -145,9 +142,17 @@ async function reconcileExpiredExperiments(experiments: Experiment[]): Promise<v
   const nowIso = now.toISOString();
   await Promise.all(
     experiments.map(async (exp) => {
-      if (exp.status !== 'active' || !exp.endDate || new Date(exp.endDate) > now) return;
+      // PAUSED EXPIRES TOO, and it did not.
+      //
+      // This read `active` only, so an experiment paused before its end date passed kept the label
+      // `paused` for ever - suggesting something a person could Resume, when the window it would
+      // resume into has closed. The runtime already agreed it was over: isLiveForClassification
+      // stops resolving on `endDate > now` regardless of status, so only the LABEL was behind.
+      const expiring = exp.status === 'active' || exp.status === 'paused';
+      if (!expiring || !exp.endDate || new Date(exp.endDate) > now) return;
       const transitions = appendTransition(exp.transitions, {
-        from: 'active',
+        // The status actually read, so the audit says which state it expired OUT OF.
+        from: exp.status,
         to: 'completed',
         by: 'system',
         at: nowIso,
@@ -159,17 +164,17 @@ async function reconcileExpiredExperiments(experiments: Experiment[]): Promise<v
             TableName: EXPERIMENTS_TABLE,
             Key: { experimentId: exp.experimentId },
             UpdateExpression: 'SET #s = :s, #t = :t',
-            // Still `active`, AND the audit is the one this reconcile read: `transitions` is written
-            // back whole, so without the length check an edit or status change that appended between
+            // Still in the state this reconcile READ, AND the audit is the one it read: `transitions`
+            // is written back whole, so without the length check an edit or status change appended between
             // the Scan and this write is erased by it. A failed condition is already the benign path
             // (the row is presented as completed either way, and the next read reconciles it).
             ConditionExpression:
-              '#s = :active AND (attribute_not_exists(#t) OR size(#t) = :expectedTransitions)',
+              '#s = :from AND (attribute_not_exists(#t) OR size(#t) = :expectedTransitions)',
             ExpressionAttributeNames: { '#s': 'status', '#t': 'transitions' },
             ExpressionAttributeValues: {
               ':s': 'completed',
               ':t': transitions,
-              ':active': 'active',
+              ':from': exp.status,
               ':expectedTransitions': (exp.transitions ?? []).length,
             },
           }),
@@ -183,6 +188,21 @@ async function reconcileExpiredExperiments(experiments: Experiment[]): Promise<v
         }
       }
       exp.status = 'completed';
+
+      // THE FOURTH EXIT, and the one with no operator behind it. The state machine has four ways out
+      // of `active` - End, Pause, Delete and this one - and an alt released on only the first
+      // three is an alt that outlives its experiment whenever the experiment simply ran out of time,
+      // which is the ordinary way a test ends rather than an edge case.
+      //
+      // Unconditional on the write above succeeding: the endDate is authoritative either way (this
+      // function presents the row as completed regardless), so the projection follows the fact rather
+      // than the write that recorded it. A losing race re-vacates an already-vacant alt, which is a
+      // no-op.
+      await setAltAssignment({
+        exp,
+        experimentId: exp.experimentId,
+        occupied: false,
+      });
     }),
   );
 }
@@ -307,14 +327,13 @@ function variantIdentity(v: ExperimentVariant): string {
     modelKey: v.modelKey ?? null,
     profileRef: v.profileRef ?? null,
     imageGenModelKey: v.imageGenModelKey ?? null,
-    displayName: v.displayName ?? null,
     systemPromptAddendum: v.systemPromptAddendum ?? null,
   });
 }
 
 /** True when the incoming variant set changes the models or the variant count vs the
  *  stored record — i.e. anything but per-variant weight (DESIGN §3.2 L1 / §7). Compare
- *  AFTER sanitizing the incoming variants so display/addendum normalization matches. */
+ *  AFTER sanitizing the incoming variants so addendum normalization matches. */
 function variantModelOrCountChanged(
   incoming: ExperimentVariant[],
   existing: ExperimentVariant[],
@@ -329,7 +348,28 @@ function variantModelOrCountChanged(
   return false;
 }
 
-/** Shape the type-exclusion conflicts for the 409 body the console drives the
+/**
+ * True when an edit changes WHAT THE EXPERIMENT COMPARES: its variant models and count
+ * (`variantModelOrCountChanged`), or anything else the pinned versions were derived from (§3.5): the
+ * experiment type and intent (which recipe derives the candidate from the variants) and the classification
+ * (whose live assistant the control pins). An armed row's pins describe exactly these, so an edit that
+ * keeps the pins must keep these too.
+ */
+function comparisonChanged(incoming: Experiment, existing: Experiment): boolean {
+  const tiersOf = (e: Experiment) => JSON.stringify([...(e.tiers ?? [])].map(String).sort());
+  return variantModelOrCountChanged(incoming.variants || [], existing.variants || [])
+    || (incoming.experimentType ?? 'intent') !== (existing.experimentType ?? 'intent')
+    || (incoming.intent ?? '') !== (existing.intent ?? '')
+    || tiersOf(incoming) !== tiersOf(existing);
+}
+
+/** The 409 message when a classification already holds a live experiment. The code stays
+ *  `EXPERIMENT_TYPE_CONFLICT` because the console and API clients key on it. */
+const CLASSIFICATION_OCCUPIED =
+  'A classification runs one experiment at a time, and this one already has a live experiment. '
+  + 'Complete, pause, or delete the conflicting experiment(s) first.';
+
+/** Shape the classification conflicts for the 409 body the console drives the
  *  End/Pause/Delete resolution from (DESIGN §3.2.1 / A.7). */
 function conflictBody(conflicts: Experiment[]): Array<{
   experimentId: string;
@@ -382,25 +422,267 @@ async function countActiveExperimentsExcluding(excludeId: string): Promise<numbe
   return count;
 }
 
-let cachedRoster: Array<{ slotId: string; botArn: string }> | null = null;
-async function resolveSlotArn(slotId: string): Promise<string | null> {
-  if (!cachedRoster) {
-    try {
-      const res = await ssmClient.send(
-        new GetParameterCommand({ Name: ALT_BOT_SLOTS_ROSTER_PARAM }),
-      );
-      cachedRoster = JSON.parse(res.Parameter?.Value || '[]');
-    } catch (err) {
-      console.warn('[admin-experiments] roster read failed:', err);
-      cachedRoster = [];
-    }
+/**
+ * THE ALT A BATTLE EXPERIMENT NAMES: the challenger of its one classification's primary role, from the
+ * record that classification's stack writes (§3.7). A battle runs in exactly one classification (the
+ * validator refuses any other), and the row names the alt by assistant id (`challengerOf`). Null for a
+ * row that names no challenger, or when the classification provisions none. A record that cannot be read
+ * throws.
+ */
+async function altOf(exp: { challengerAssistant?: string; tiers?: unknown } & LegacyBattleBinding): Promise<AltAssignment | null> {
+  if (!challengerOf(exp)) return null;
+  const classification = Array.isArray(exp.tiers) && exp.tiers.length === 1 ? String(exp.tiers[0]) : '';
+  if (!classification) return null;
+  return readAltAssignment(ssmClient, SSM_ROOT, classification, DUEL_ROLE);
+}
+
+/**
+ * AN EXPERIMENT ARMS ONLY WITH ITS TWO VERSIONS PINNED (DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP §3.5, ADR-050).
+ *
+ * Every experiment, battle or not, compares two complete versions of one assistant. The control (variants[0])
+ * pins the live assistant's active version by number (`controlPin`); a `profile` experiment's control pins its
+ * referenced version. The treatment (variants[1]) pins a candidate in the alt's history (`altPin`) whose
+ * `derivedFrom` says this experiment and that variant produced it. A side with no pin, a pin to another
+ * assistant, or a candidate derived for some other experiment is refused: that side would otherwise serve
+ * something no experiment measured. Returns null when it may arm.
+ *
+ * The derivation is a profile write, and the writer of every profile is `manage-profiles` (§7), so this handler
+ * checks the pins and never derives them itself (`deriveVersions` asks).
+ */
+async function armRefusal(exp: Experiment): Promise<{ error: string; code: string } | null> {
+  const classification = exp.tiers?.length === 1 ? exp.tiers[0] : undefined;
+  const type = exp.experimentType ?? 'intent';
+  const controlName = type === 'profile' ? exp.variants?.[0]?.profileRef?.profileName : undefined;
+  const role = controlName ? profilesRegistry.roleOfAssistant(controlName) : (classification ? { classification, role: DUEL_ROLE } : undefined);
+  const alt = role ? profilesRegistry.altAssistantName(role.classification, role.role) : undefined;
+  const treatmentCode = exp.battleEnabled ? 'BATTLE_TREATMENT_MUST_PIN_ALT_VERSION' : 'TREATMENT_MUST_PIN_CANDIDATE_VERSION';
+  const controlCode = exp.battleEnabled ? 'BATTLE_CONTROL_MUST_PIN_LIVE_VERSION' : 'CONTROL_MUST_PIN_LIVE_VERSION';
+  if (!alt) {
+    return { error: 'The experiment has no alt this deployment declares, so its treatment has no candidate history.', code: treatmentCode };
   }
-  return cachedRoster!.find((s) => s.slotId === slotId)?.botArn || null;
+  const treatmentRefusal = await pinRefusal(exp, 1, alt, treatmentCode);
+  if (treatmentRefusal) return treatmentRefusal;
+  const live = controlName ?? (role ? profilesRegistry.roleAssistantName(role.classification, role.role) : undefined);
+  if (!live) {
+    return { error: "The experiment's role has no live assistant this deployment declares, so its control has no version.", code: controlCode };
+  }
+  const pin = exp.variants?.[0]?.controlPin;
+  if (!pin || pin.profileName !== live || !Number.isInteger(pin.version) || pin.version < 1) {
+    return { error: `The control must pin a version of ${live}, the live assistant's active version when the experiment is armed.`, code: controlCode };
+  }
+  return null;
+}
+
+/**
+ * ARMING PINS BOTH VERSIONS (§3.5): asks the profile writer for the control's pin (the live active version, a
+ * reference) and the treatment's candidate, and returns the variants with `controlPin` and `altPin` set, or a
+ * refusal. A deployment that has not wired the function derives nothing here, and `armRefusal` then refuses
+ * the arm by name.
+ */
+async function deriveVersions(
+  exp: Experiment,
+  actor: string,
+): Promise<{ variants: ExperimentVariant[] } | { refusal: { status: number; error: string; code: string } }> {
+  if (!MANAGE_PROFILES_FUNCTION) return { variants: exp.variants };
+  let answer: { ok?: boolean; controlPin?: ExperimentVariant['controlPin']; altPin?: ExperimentVariant['altPin']; status?: number; error?: string; code?: string };
+  try {
+    const res = await lambdaClient.send(new InvokeCommand({
+      FunctionName: MANAGE_PROFILES_FUNCTION,
+      InvocationType: InvocationType.RequestResponse,
+      Payload: Buffer.from(JSON.stringify({ aeDeriveExperimentVersions: { experiment: exp, actor } })),
+    }));
+    answer = res.Payload ? JSON.parse(Buffer.from(res.Payload).toString() || '{}') : {};
+    if (res.FunctionError) answer = { ok: false, error: answer.error || 'the profile writer failed', code: 'DERIVATION_FAILED' };
+  } catch (err) {
+    console.error('[admin-experiments] could not ask the profile writer to pin the experiment\'s versions', err);
+    return { refusal: { status: 503, error: "The experiment's versions could not be pinned; try again.", code: 'DERIVATION_UNAVAILABLE' } };
+  }
+  if (!answer.ok || !answer.controlPin || !answer.altPin) {
+    return {
+      refusal: {
+        status: answer.status && answer.status >= 400 && answer.status < 600 ? answer.status : 422,
+        error: `The experiment's versions could not be pinned: ${answer.error || 'no reason given'}`,
+        code: answer.code || 'DERIVATION_FAILED',
+      },
+    };
+  }
+  const [control, treatment] = exp.variants;
+  return { variants: [{ ...control, controlPin: answer.controlPin }, { ...treatment, altPin: answer.altPin }] };
+}
+
+/** One side's pin checked against the version it names: the right assistant, a concrete version, derived for this variant. */
+async function pinRefusal(
+  exp: Experiment,
+  at: 0 | 1,
+  assistant: string,
+  code: string,
+): Promise<{ error: string; code: string } | null> {
+  const variant = exp.variants?.[at];
+  const pin = at === 1 ? variant?.altPin : variant?.controlPin;
+  const side = at === 1 ? 'treatment' : 'control';
+  if (!pin || pin.profileName !== assistant || !Number.isInteger(pin.version) || (pin.version as number) < 1) {
+    return { error: `The ${side} must pin a version of ${assistant}, derived for this experiment through variant-version, before the battle can run.`, code };
+  }
+  let derivedFrom: { experimentId?: string; variantId?: string } | undefined;
+  try {
+    const res = await ssmClient.send(new GetParameterCommand({ Name: `${SSM_ROOT}/assistant/${assistant}/definition:${pin.version}` }));
+    derivedFrom = (JSON.parse(res.Parameter?.Value || '{}') as { derivedFrom?: typeof derivedFrom }).derivedFrom;
+  } catch {
+    return { error: `Version ${pin.version} of ${assistant} could not be read.`, code };
+  }
+  if (derivedFrom?.experimentId !== exp.experimentId || derivedFrom?.variantId !== variant?.variantId) {
+    return { error: `Version ${pin.version} of ${assistant} was not derived for this experiment's ${variant?.variantId} variant.`, code };
+  }
+  return null;
+}
+
+
+/**
+ * ── THE ALT IS ASSIGNED FOR THE LIFE OF THE EXPERIMENT, AND ONLY THEN ─────────────────────────
+ *
+ * A battle is an OPTION ON AN EXPERIMENT (DESIGN-BATTLE anchor 2): the two sides are that
+ * experiment's variants, so an alt assistant exists because an experiment is running and stops
+ * existing when it stops. That is the relationship this function keeps.
+ *
+ * The classification stack provisions the ALT at deploy - its bot and its Amazon Lex bot, recorded with
+ * `assistant: null`, which is the honest between-battles state. This writes the ASSISTANT when an
+ * experiment is armed and clears it when the experiment ends, so `(classification, role, alt)` answers
+ * "who is challenging the live assistant right now" rather than "a bot exists". Everything else on the
+ * record is the stack's and is written back as read, so the Lex bot a targeted reply arrives on stays
+ * resolvable while an experiment holds the alt.
+ *
+ * WHY IT IS BEST-EFFORT AND NEVER FAILS THE WRITE. The experiment row is the source of truth for
+ * what runs - `battleEnabled` plus the variants - and the assignment record is a projection of it
+ * for readers that ask "who is this role's alt". A projection that cannot be written must not stop
+ * the experiment being armed or ended: refusing to END an experiment because a parameter write
+ * failed would leave a battle running that the operator has already stopped, which is the worse of
+ * the two failures by a distance. It is logged loudly instead.
+ */
+async function setAltAssignment(args: {
+  /** The experiment row: the alt it binds is its classification's (`altOf`). */
+  exp: Experiment & LegacyBattleBinding;
+  experimentId: string;
+  /**
+   * True while the experiment is armed and running; false when it ends, pauses or disarms.
+   *
+   * The NAME of the assistant is not the caller's to choose: it is `alt-{role}-{classification}` for the
+   * role (`altAssistantName`). Deriving it here is what stops two call sites inventing two spellings for
+   * one assistant.
+   */
+  occupied: boolean;
+}): Promise<void> {
+  if (!challengerOf(args.exp)) return;
+  try {
+    const record = await altOf(args.exp);
+    if (!record) {
+      console.warn(
+        '[admin-experiments] the experiment\'s classification provisions no alt; the assignment record '
+        + 'is left untouched.',
+        { experimentId: args.experimentId, tiers: args.exp.tiers },
+      );
+      return;
+    }
+    const altName = profilesRegistry.altAssistantName(record.classification, record.role);
+    if (args.occupied && !altName) {
+      console.warn('[admin-experiments] the alt names a role this deployment does not declare; the record is left untouched', {
+        classification: record.classification, role: record.role,
+      });
+      return;
+    }
+    await ssmClient.send(new PutParameterCommand({
+      Name: `${SSM_ROOT}/assistant-assignments/${record.classification}/${record.role}/alt`,
+      Overwrite: true,
+      Type: 'String',
+      Value: JSON.stringify({
+        ...record,
+        // NULL WHEN THE EXPERIMENT ENDS, not the last assistant left behind. A stale name reads
+        // as "a challenger is live" to anything asking, which is exactly wrong between battles.
+        //
+        // THE ALT'S NAME, `alt-{role}-{classification}` (ADR-050): an assistant with its own profile,
+        // derived through this experiment and published under this name. The classification is in it
+        // because an assistant's name is instance-wide and a role is not.
+        assistant: args.occupied ? altName : null,
+        // WHICH experiment put it there, so an assignment can be traced to the thing that justifies
+        // it. Cleared with the assistant.
+        experimentId: args.occupied ? args.experimentId : null,
+      }),
+    }));
+  } catch (err) {
+    console.error(
+      '[admin-experiments] could not update the alt assignment record; the experiment row still '
+      + 'decides what runs, so this is a stale projection rather than a stale battle.',
+      { experimentId: args.experimentId, err },
+    );
+  }
+  await applyAltAlias(args.exp, args.occupied, args.experimentId);
+}
+
+/**
+ * THE ALT'S IDENTITY CARRIES ITS PROFILE'S NAME WHILE THE EXPERIMENT HOLDS IT, the name
+ * the duel gives it (`battleSideNames`): its pinned version's `displayName`, else the live assistant's, marked
+ * as the challenger when the two match. So the room and its members panel name the challenger as the duel
+ * does, a mention of that name resolves, and its provisioned name comes back when the experiment releases
+ * it. The live identity's name is never changed for a battle. The rename is the profile writer's
+ * (it holds the name applier); best-effort like the record above, and logged when it does not land.
+ */
+async function applyAltAlias(
+  exp: Experiment & LegacyBattleBinding,
+  occupied: boolean,
+  experimentId?: string,
+): Promise<void> {
+  const challenger = challengerOf(exp);
+  if (!challenger || !MANAGE_PROFILES_FUNCTION) return;
+  const classification = Array.isArray(exp.tiers) && exp.tiers.length === 1 ? String(exp.tiers[0]) : '';
+  const alt = classification ? profilesRegistry.altAssistantName(classification, DUEL_ROLE) : undefined;
+  if (!alt) return;
+  // FROM THE EXPERIMENT IN HAND (`battleSidesOf`), never a search for the live battle: `occupied` is this
+  // experiment's status and arming, so one whose start date is still ahead holds the alt, and its identity
+  // carries the duel's name from the moment it does.
+  const alias = occupied
+    ? (await battleSidesOf(exp).catch((err) => {
+      console.warn("[admin-experiments] the challenger's name could not be resolved; the alt keeps its name", { alt, experimentId, err });
+      return null;
+    }))?.treatment?.displayName
+    : undefined;
+  try {
+    const res = await lambdaClient.send(new InvokeCommand({
+      FunctionName: MANAGE_PROFILES_FUNCTION,
+      InvocationType: InvocationType.RequestResponse,
+      Payload: Buffer.from(JSON.stringify({ aeApplyAltAlias: { alt, ...(alias ? { alias } : {}) } })),
+    }));
+    const out = res.Payload ? JSON.parse(Buffer.from(res.Payload).toString() || '{}') as { identityRename?: string; identityRenameError?: string } : {};
+    if (res.FunctionError || out.identityRename === 'failed') {
+      console.error("[admin-experiments] the alt identity's battle name did not land", { alt, alias, err: out.identityRenameError ?? res.FunctionError });
+    }
+  } catch (err) {
+    console.error("[admin-experiments] could not ask for the alt identity's battle name", { alt, alias, err });
+  }
+}
+
+/**
+ * A BATTLE EXPERIMENT AS THE CONSOLE READS IT: the row, plus the name the duel gives each side
+ * (`battleSidesOf`, the resolver the room and the alt's identity use), keyed by side. Derived on read from
+ * the sides' pinned versions and never stored (`validateAndSanitizeExperiment` drops it), so a rename of a
+ * version shows here as it shows in the room. A side whose name does not resolve is absent, and the console
+ * shows its variant id alone. Only a battle-enabled row that is not deleted is read for names.
+ */
+async function withSideNames(exp: Experiment): Promise<Experiment & { sideNames?: { control?: string; treatment?: string } }> {
+  if (exp.battleEnabled !== true || exp.status === 'deleted') return exp;
+  const sides = await battleSidesOf(exp).catch((err) => {
+    console.warn('[admin-experiments] the battle sides did not resolve; the console shows their variant ids', { experimentId: exp.experimentId, err });
+    return null;
+  });
+  const control = sides?.control?.displayName?.trim();
+  const treatment = sides?.treatment?.displayName?.trim();
+  if (!control && !treatment) return exp;
+  return { ...exp, sideNames: { ...(control ? { control } : {}), ...(treatment ? { treatment } : {}) } };
 }
 
 export const handler = async (
   event: APIGatewayProxyEvent,
 ): Promise<APIGatewayProxyResult> => {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   const origin = event.headers?.origin || event.headers?.Origin;
   const method = event.httpMethod;
   const path = event.path || '';
@@ -410,12 +692,13 @@ export const handler = async (
   if (!EXPERIMENTS_TABLE) {
     return respond(500, { error: 'EXPERIMENTS_TABLE not configured' }, origin);
   }
-  const callerSub = getCallerSub(event);
+  // The routes are IAM-authorized, so the person is the one the signed session names.
+  const callerSub = await callerPersonId(event);
   if (!callerSub) return respond(401, { error: 'Unauthorized' }, origin);
 
   // Require admin, not just a valid sub — otherwise any signed-in basic user
   // could create / arm / pause / activate experiments, including battle-enabled
-  // experiments that bind alt-bot slots and let attackers hijack model routing.
+  // experiments that name a challenger and let attackers hijack model routing.
   // The admin gate is the shared, IdP-agnostic check (honors ADMIN_GROUP_NAMES
   // + service mode).
   if (!callerIsAdmin(event)) {
@@ -423,7 +706,99 @@ export const handler = async (
     return respond(403, { error: 'Admin access required' }, origin);
   }
 
+  // A TEAM MEMBER'S ROUTE NAMES ONE ASSISTANT. Its experiments are the ones `experimentBelongsTo`
+  // admits; an experiment id outside that set answers as if it did not exist, and a create that is not
+  // the assistant's own is refused.
+  const scope = await requireOwnedAssistant(event, origin);
+  if (isRefusal(scope)) return scope;
+  const scopedId = scope ? event.pathParameters?.experimentId : undefined;
+  if (scope && scopedId) {
+    const target = await getExistingExperiment(scopedId);
+    if (!target || !experimentBelongsTo(target, scope)) {
+      return respond(404, { error: `Experiment "${scopedId}" not found` }, origin);
+    }
+  }
+
   try {
+    // ── BATTLE ON/OFF, PER CLASSIFICATION (ADR-049) ──────────────────────────────────────────────
+    //
+    // Battle eligibility is a classification-level setting, not a property of an assistant, and it is
+    // OFF until an operator turns it on ("typically only used for internal users", owner 2026-09-21).
+    // It lives here because this is the surface an operator already uses to arm the experiment a duel
+    // runs on, so turning battle on and arming the comparison are one visit rather than two.
+    //
+    // CAPABILITY IS NOT NEGOTIABLE FROM HERE. A classification whose deployment wires no battle
+    // plumbing cannot be switched on, because the switch would promise what its IAM role cannot back -
+    // which is exactly the defect this split fixes. The GET reports both, so the console can render a
+    // classification as unavailable rather than as merely off.
+    if (path.endsWith('/battle-settings')) {
+      const conversational = profilesRegistry.classificationValues().filter((c) => profilesRegistry.isConversational(c));
+      if (method === 'GET') {
+        const settings = await Promise.all(conversational.map(async (classification) => ({
+          classification,
+          capable: profilesRegistry.isBattleCapable(classification),
+          enabled: await isBattleOn(classification),
+        })));
+        return respond(200, { settings }, origin);
+      }
+      if (method === 'POST') {
+        const parsed = parseJsonBody<{ classification?: string; enabled?: boolean }>(event, origin);
+        if ('statusCode' in parsed) return parsed;
+        const { classification, enabled } = parsed.body;
+        if (!classification || typeof enabled !== 'boolean') {
+          return respond(400, { error: 'classification and enabled (boolean) are required' }, origin);
+        }
+        if (!profilesRegistry.isBattleCapable(classification)) {
+          return respond(409, {
+            error: `Battle cannot be turned on for '${classification}': this deployment does not wire battle for it`,
+            code: 'BATTLE_NOT_CAPABLE',
+            classification,
+          }, origin);
+        }
+        await ssmClient.send(new PutParameterCommand({
+          Name: `${SSM_ROOT}/battle/${classification}/enabled`,
+          Value: String(enabled),
+          Type: 'String',
+          Overwrite: true,
+        }));
+        // DROP THIS CONTAINER'S CACHED ANSWER, or the console's own re-read contradicts the write it
+        // just made. `isBattleOn` memoizes per classification for 30 seconds and the GET above is what
+        // fills that cache, so an operator who opens the tab (caching `false`), ticks the box and gets
+        // re-read by the same warm container would watch the checkbox snap back and conclude the save
+        // failed. Other containers still take up to the TTL, which is what `appliesWithinSeconds` says.
+        __clearBattleEnablementCache();
+        console.log('[admin-experiments] battle setting written', { classification, enabled, by: callerSub });
+        return respond(200, { classification, enabled, appliesWithinSeconds: 30 }, origin);
+      }
+    }
+
+    // ── THE CHALLENGERS A BATTLE CAN NAME ────────────────────────────────────────────────────────────
+    //
+    // One per battle-capable classification: the alt of its duel role, by assistant id, from the record
+    // its classification stack writes. The console offers these rather than a list of its own, so it can
+    // only name an assistant the deployment provisioned. `inUseBy` is the experiment the record says holds
+    // the alt now, so the console can say which classification is taken. `?classification=` narrows it.
+    if (method === 'GET' && path.endsWith('/challengers')) {
+      const only = event.queryStringParameters?.classification;
+      const classifications = profilesRegistry.classificationValues()
+        .filter((c) => profilesRegistry.isBattleCapable(c) && (!only || c === only));
+      const challengers: Array<{ assistant: string; classification: string; role: string; inUseBy: string | null }> = [];
+      for (const classification of classifications) {
+        const assistant = profilesRegistry.altAssistantName(classification, DUEL_ROLE);
+        if (!assistant) continue;
+        let record: AltAssignment | null;
+        try {
+          record = await readAltAssignment(ssmClient, SSM_ROOT, classification, DUEL_ROLE);
+        } catch (err) {
+          console.error('[admin-experiments] an alt assignment record could not be read', { classification, err });
+          return respond(503, { error: 'The challengers could not be read; try again.' }, origin);
+        }
+        if (!record) continue; // the classification provisions no alt, so a battle cannot run there
+        challengers.push({ assistant, classification, role: DUEL_ROLE, inUseBy: record.experimentId ?? null });
+      }
+      return respond(200, { challengers }, origin);
+    }
+
     // GET /admin/experiments → list
     if (method === 'GET') {
       // Paginate the scan: a single Scan returns at most one page (≤1MB), so with enough
@@ -439,7 +814,104 @@ export const handler = async (
         exclusiveStartKey = result.LastEvaluatedKey as Record<string, unknown> | undefined;
       } while (exclusiveStartKey);
       await reconcileExpiredExperiments(experiments);
-      return respond(200, { experiments }, origin);
+      const visible = scope ? experiments.filter((e) => experimentBelongsTo(e, scope)) : experiments;
+      return respond(200, { experiments: await Promise.all(visible.map(withSideNames)) }, origin);
+    }
+
+    // POST /admin/experiments/{id}/promote → copy the measured candidate into the live assistant (§3.6)
+    //
+    // An ACTIVATION of the live assistant's profile, through the profile writer: the route is in the
+    // `activate-profiles` capability (IAM refuses a caller holding only the experiment capabilities), and
+    // the handler re-checks that capability beside the experiment-admin check above. The profile writer
+    // refuses unless the live active version is still the pinned control and the copy hashes to the
+    // candidate's `configId`, before it writes anything. On success the experiment is completed with the
+    // decision `promoted_treatment`, the promoted version is recorded on the row, and the alt is released
+    // (its history keeps the candidate). Conversations enrolled in the experiment keep their pinned
+    // versions (ADR-050).
+    if (method === 'POST' && path.endsWith('/promote')) {
+      const experimentId = event.pathParameters?.experimentId;
+      if (!experimentId) return respond(400, { error: 'experimentId required' }, origin);
+      if (!callerCanManageProfiles(event)) {
+        return respond(403, { error: 'Promotion activates a profile version, which needs the activate-profiles capability', code: 'PROMOTION_NEEDS_ACTIVATE_PROFILES' }, origin);
+      }
+      const parsed = parseJsonBody<{ note?: string }>(event, origin);
+      if ('statusCode' in parsed) return parsed;
+      let note: string | undefined;
+      try {
+        note = sanitizeObjectiveStatement(parsed.body.note);
+      } catch (err) {
+        if (err instanceof ExperimentValidationError) return respond(400, { error: err.message, code: err.code }, origin);
+        throw err;
+      }
+      const existing = await getExistingExperiment(experimentId);
+      if (!existing) return respond(404, { error: `Experiment "${experimentId}" not found` }, origin);
+      if (existing.status !== 'active' && existing.status !== 'paused') {
+        return respond(409, { error: `Experiment "${experimentId}" is '${existing.status}'; only a running or paused experiment is promoted`, code: 'EXPERIMENT_NOT_RUNNING' }, origin);
+      }
+      if (!existing.servesVersions) {
+        return respond(409, {
+          error: 'This experiment was armed before experiments pinned two versions, so it has no measured candidate. Pause and resume it to pin them, or record the decision by ending it.',
+          code: 'PROMOTION_NEEDS_TWO_VERSIONS',
+        }, origin);
+      }
+      if (!MANAGE_PROFILES_FUNCTION) {
+        return respond(503, { error: 'The profile writer is not configured, so nothing can be promoted', code: 'PROMOTION_UNAVAILABLE' }, origin);
+      }
+      const actor = callerArn(callerSub);
+      let answer: { ok?: boolean; status?: number; error?: string; code?: string; profileName?: string; version?: number; configId?: string; identityRename?: string };
+      try {
+        const res = await lambdaClient.send(new InvokeCommand({
+          FunctionName: MANAGE_PROFILES_FUNCTION,
+          InvocationType: InvocationType.RequestResponse,
+          Payload: Buffer.from(JSON.stringify({ aePromoteCandidate: { experiment: existing, actor } })),
+        }));
+        answer = res.Payload ? JSON.parse(Buffer.from(res.Payload).toString() || '{}') : {};
+        if (res.FunctionError) answer = { ok: false, error: answer.error || 'the profile writer failed', code: 'PROMOTION_FAILED' };
+      } catch (err) {
+        console.error('[admin-experiments] could not ask the profile writer to promote', err);
+        return respond(503, { error: 'The promotion could not be requested; nothing was activated. Try again.', code: 'PROMOTION_UNAVAILABLE' }, origin);
+      }
+      if (!answer.ok || !answer.profileName || !Number.isInteger(answer.version) || !answer.configId) {
+        const status = answer.status && answer.status >= 400 && answer.status < 600 ? answer.status : 422;
+        return respond(status, { error: answer.error || 'The promotion was refused', code: answer.code || 'PROMOTION_FAILED' }, origin);
+      }
+      const now = new Date().toISOString();
+      const decision: ExperimentDecision = { outcome: 'promoted_treatment', by: actor, at: now, ...(note !== undefined && { note }) };
+      const promotion = { profileName: answer.profileName, version: answer.version as number, configId: answer.configId, at: now, by: actor };
+      const transitions = appendTransition(existing.transitions, { from: existing.status, to: 'completed', by: actor, at: now, reason: 'promote' });
+      const guard = optimisticGuard(existing);
+      try {
+        await ddb.send(new UpdateCommand({
+          TableName: EXPERIMENTS_TABLE,
+          Key: { experimentId },
+          UpdateExpression: 'SET #s = :s, #t = :t, #d = :d, #p = :p',
+          ExpressionAttributeNames: { ...guard.names, '#d': 'decision', '#p': 'promotion' },
+          ExpressionAttributeValues: { ...guard.values, ':s': 'completed', ':t': transitions, ':d': decision, ':p': promotion },
+          ConditionExpression: guard.ConditionExpression,
+        }));
+      } catch (err) {
+        if (isConditionalCheckFailed(err)) {
+          // THE VERSION IS ALREADY ACTIVE; only the experiment row moved under this request. Said plainly,
+          // so the operator ends the experiment rather than promoting twice.
+          console.error('[admin-experiments] promoted, but the experiment row changed before it could be completed', { experimentId, promotion });
+          return respond(409, {
+            error: `Version ${promotion.version} of ${promotion.profileName} is active, but the experiment changed while it was promoted and was not completed. Reload it and end it.`,
+            code: 'PROMOTED_BUT_NOT_COMPLETED',
+            promotion,
+          }, origin);
+        }
+        throw err;
+      }
+      await setAltAssignment({ exp: existing, experimentId, occupied: false });
+      return respond(200, {
+        ok: true,
+        status: 'completed',
+        decision,
+        promotion,
+        ...(answer.identityRename && { identityRename: answer.identityRename }),
+        freedClassification: (existing.tiers || [])[0],
+        freedClassifications: existing.tiers || [],
+      }, origin);
     }
 
     // POST /admin/experiments/{id}/status → guarded lifecycle transition
@@ -478,6 +950,8 @@ export const handler = async (
         }, origin);
       }
 
+      // The variants with both duel sides pinned, when this transition arms a battle; written with the status.
+      let armedVariants: ExperimentVariant[] | undefined;
       if (to === 'active') {
         // An experiment whose `endDate` has passed has no window left to run in: resolution already
         // refuses it (`isLiveForClassification` gates on `endDate`), and the next list read
@@ -501,6 +975,8 @@ export const handler = async (
           }, origin);
         }
 
+        // EVERY CHEAP REFUSAL RUNS BEFORE ANYTHING IS DERIVED. Deriving publishes a candidate version in the
+        // alt's history, so an arm refused after it would leave a version no experiment measures.
         // Refuse to reactivate beyond the cap (excludes the row being touched).
         const activeCount = await countActiveExperimentsExcluding(experimentId);
         if (activeCount >= MAX_ACTIVE_EXPERIMENTS) {
@@ -511,21 +987,26 @@ export const handler = async (
         }
         // §3.2.1 / A.7: activating into an occupied classification returns the
         // conflicts so the console can drive End/Pause/Delete + auto-retry.
-        const typeConflicts = await findTypeExclusionConflicts({
-          experimentType: existing.experimentType ?? 'intent',
+        const conflicts = await findClassificationConflicts({
           tiers: existing.tiers || [],
           excludeExperimentId: experimentId,
         });
-        if (typeConflicts.length > 0) {
+        if (conflicts.length > 0) {
           return respond(409, {
-            error:
-              'A classification experiment cannot run alongside another experiment type on the same classification. '
-              + 'Complete, pause, or delete the conflicting experiment(s) first.',
+            error: CLASSIFICATION_OCCUPIED,
             code: 'EXPERIMENT_TYPE_CONFLICT',
-            conflicts: conflictBody(typeConflicts),
-            conflictingExperimentIds: typeConflicts.map((e) => e.experimentId),
+            conflicts: conflictBody(conflicts),
+            conflictingExperimentIds: conflicts.map((e) => e.experimentId),
           }, origin);
         }
+
+        // THE TWO VERSIONS ARE PINNED HERE, AT ARM (§3.5), and written with the status below. A resume pins
+        // again, so a row armed before versions were pinned is armed this way when it is resumed.
+        const derived = await deriveVersions(existing, callerArn(callerSub));
+        if ('refusal' in derived) return respond(derived.refusal.status, { error: derived.refusal.error, code: derived.refusal.code, from: existing.status, to }, origin);
+        armedVariants = derived.variants;
+        const refused = await armRefusal({ ...existing, variants: armedVariants });
+        if (refused) return respond(409, { ...refused, from: existing.status, to }, origin);
       }
 
       const now = new Date().toISOString();
@@ -571,6 +1052,13 @@ export const handler = async (
       const names: Record<string, string> = { ...guard.names };
       const values: Record<string, unknown> = { ':s': to, ':t': transitions, ...guard.values };
       let setExpr = 'SET #s = :s, #t = :t';
+      if (armedVariants) {
+        names['#v'] = 'variants';
+        values[':v'] = armedVariants;
+        names['#sv'] = 'servesVersions';
+        values[':sv'] = true;
+        setExpr += ', #v = :v, #sv = :sv';
+      }
       if (decision) {
         names['#d'] = 'decision';
         values[':d'] = decision;
@@ -599,6 +1087,15 @@ export const handler = async (
         }
         throw err;
       }
+      // THE ALT FOLLOWS THE STATUS. End or Pause vacates the alt; Resume/Activate assigns it again,
+      // but only if this experiment is battle-armed at all - a non-battle experiment never had a
+      // challenger to assign.
+      await setAltAssignment({
+        exp: existing,
+        experimentId,
+        occupied: to === 'active' && existing.battleEnabled === true,
+      });
+
       // Pausing/completing frees the classification; return it so the console can
       // auto-retry a blocked create (§3.2.1). Activating occupies, so no freed set.
       return respond(200, {
@@ -681,8 +1178,21 @@ export const handler = async (
       }
 
       // Either path frees the classification; a soft-delete row is active-only
-      // scanned out of runtime resolution AND the battle-slot resolver, so the
-      // bound alt-bot slot is released without an extra write.
+      // scanned out of runtime resolution AND the battle side resolver, so the
+      // challenger it named is released without an extra write.
+      //
+      // THE ASSIGNMENT RECORD IS THE EXCEPTION, and it is why this call exists (§3.2: "Delete frees
+      // the classification and releases the challenger it named"). Release used to be implicit
+      // precisely because nothing stored the binding outside the experiment row - the resolver
+      // scanned active experiments and a deleted one simply stopped matching. The assignment record
+      // is a stored projection, so it does not stop matching on its own: left alone it would say a
+      // challenger holds the alt for an experiment that no longer exists.
+      await setAltAssignment({
+        exp: existing,
+        experimentId,
+        occupied: false,
+      });
+
       return respond(200, {
         ok: true,
         mode: neverStarted ? 'hard' : 'soft',
@@ -701,6 +1211,23 @@ export const handler = async (
       const input = parsed.body;
       if (!input.experimentId) {
         return respond(400, { error: 'experimentId is required' }, origin);
+      }
+      if (scope) {
+        // A battle names the classification's challenger: an admin decision.
+        if (input.battleEnabled) {
+          return respond(403, { error: 'Battle is set for a classification by an admin', code: 'BATTLE_IS_CLASSIFICATION_LEVEL' }, origin);
+        }
+        if (!experimentBelongsTo(input, scope)) {
+          return respond(403, {
+            error: 'A team creates only profile experiments whose every variant is its own assistant, on the classifications it serves',
+            code: 'EXPERIMENT_OUTSIDE_ASSISTANT',
+          }, origin);
+        }
+        // An edit must not take over an experiment that is someone else's.
+        const prior = await getExistingExperiment(input.experimentId);
+        if (prior && !experimentBelongsTo(prior, scope)) {
+          return respond(404, { error: `Experiment "${input.experimentId}" not found` }, origin);
+        }
       }
 
       // Read any existing row so an edit gets update semantics: preserve
@@ -754,24 +1281,54 @@ export const handler = async (
         createdAt: existing?.createdAt || now,
         status: input.status || existing?.status || 'active',
       };
+      // THE PINS, THE SHAPE MARKER AND THE PROMOTION RECORD ARE THE SERVER'S. Arming writes the pins and
+      // `servesVersions`, and the Promote action writes `promotion`, so a client never supplies them. An edit
+      // of a row that was armed keeps the pins it was armed with, WHATEVER ITS STATUS: the live version may
+      // have moved since, and an edit (weights, end date, objective) must not change what the experiment
+      // compares. A paused experiment is the common case: dropping its pins on an edit left Promote refusing
+      // it as never armed. What the pins were derived from cannot change on an armed row: that edit is
+      // refused below (`comparisonChanged`), so a kept pin always describes the row it is kept on.
+      delete draft.servesVersions;
+      delete draft.promotion;
+      const keepPins = !!existing && existing.servesVersions === true;
+      draft.variants = (Array.isArray(draft.variants) ? draft.variants : []).map((v, i) => {
+        const { controlPin: _c, altPin: _a, ...rest } = v ?? ({} as ExperimentVariant);
+        void _c; void _a;
+        const prior = keepPins ? existing!.variants?.find((p) => p.variantId === rest.variantId) : undefined;
+        return {
+          ...rest,
+          ...(prior?.controlPin && i === 0 ? { controlPin: prior.controlPin } : {}),
+          ...(prior?.altPin && i === 1 ? { altPin: prior.altPin } : {}),
+        } as ExperimentVariant;
+      });
+      if (keepPins) draft.servesVersions = true;
 
-      // Battle arming: server-set audit attribution + denormalize the
-      // slot ARN from the roster (so runtime variant resolution works).
+      // Battle arming: server-set audit attribution, and the challenger must be one the classification's
+      // assignment record provisions. The row names it by assistant id; its bot ARN stays on the record.
       if (draft.battleEnabled) {
         draft.boundBy = callerArn(callerSub);
         draft.boundAt = now;
-        if (draft.altBotSlotId) {
-          const slotArn = await resolveSlotArn(draft.altBotSlotId);
-          if (!slotArn) {
+        // ONE CLASSIFICATION NAMES THE ALT. A battle with any other number of classifications is the
+        // validator's refusal below, which says so better than a missing alt would.
+        if (challengerOf(draft) && Array.isArray(draft.tiers) && draft.tiers.length === 1) {
+          let alt: AltAssignment | null;
+          try {
+            alt = await altOf(draft);
+          } catch (err) {
+            console.error('[admin-experiments] the alt assignment record could not be read', err);
+            return respond(503, { error: 'The alt assistant\'s record could not be read; try again.' }, origin);
+          }
+          if (!alt) {
             return respond(
               400,
               {
-                error: `Alt-bot slot "${draft.altBotSlotId}" is not provisioned (check the alt-bot slot pool / roster).`,
+                error: `The ${String(draft.tiers[0])} classification provisions no alt assistant, so a battle `
+                  + 'cannot run there (is battle deployed for it?).',
+                code: 'ALT_NOT_PROVISIONED',
               },
               origin,
             );
           }
-          draft.altBotSlotArn = slotArn;
         }
       }
 
@@ -798,15 +1355,28 @@ export const handler = async (
       if (
         existing
         && existing.status !== 'draft'
-        && variantModelOrCountChanged(sanitized.variants, existing.variants || [])
+        && comparisonChanged(sanitized, existing)
       ) {
         return respond(409, {
           error:
-            `Experiment "${existing.experimentId}" is live and has collected data, so its variant `
-            + 'models and count are locked. Change only the weights, end date, or objective — or '
-            + 'create a new experiment (new id) to compare different models.',
+            `Experiment "${existing.experimentId}" is live and has collected data, so what it compares `
+            + '(its type, intent, classification, and variant models and count) is locked. Change only the '
+            + 'weights, end date, or objective, or create a new experiment (new id) to compare something else.',
           code: 'EXPERIMENT_LIVE_EDIT_LOCKED',
         }, origin);
+      }
+      // A ROW THAT HOLDS PINS BUT NEVER RAN (a draft) may change what it compares, and its pins then describe
+      // a comparison it no longer makes. They are removed here, explicitly, and arming derives new ones.
+      if (keepPins && existing && existing.status === 'draft' && comparisonChanged(sanitized, existing)) {
+        sanitized.variants = sanitized.variants.map((v) => {
+          const { controlPin: _c, altPin: _a, ...rest } = v;
+          void _c; void _a;
+          return rest as ExperimentVariant;
+        });
+        delete sanitized.servesVersions;
+        console.log('[admin-experiments] a draft changed what it compares; its pins are re-derived when it is armed', {
+          experimentId: existing.experimentId,
+        });
       }
 
       // Carry forward the recorded decision (set only via the status endpoint on
@@ -824,10 +1394,12 @@ export const handler = async (
       // Cap active experiments. Excludes the current row so an idempotent
       // re-create of an existing active
       // experiment is not punished. Placed AFTER validation so 400
-      // responses (validation, slot-not-provisioned) don't pay an
+      // responses (validation, alt-not-provisioned) don't pay an
       // unnecessary Scan, and BEFORE the Put so an over-cap write is
       // refused with 429.
       if (sanitized.status === 'active') {
+        // EVERY CHEAP REFUSAL RUNS BEFORE ANYTHING IS DERIVED. Deriving publishes a candidate version in the
+        // alt's history, so an arm refused after it would leave a version no experiment measures.
         const activeCount = await countActiveExperimentsExcluding(sanitized.experimentId);
         if (activeCount >= MAX_ACTIVE_EXPERIMENTS) {
           return respond(429, {
@@ -836,24 +1408,33 @@ export const handler = async (
           }, origin);
         }
 
-        // Type-exclusion rule: a classification experiment cannot be active
-        // alongside any other type on a shared classification (and vice versa).
-        const typeConflicts = await findTypeExclusionConflicts({
-          experimentType: sanitized.experimentType ?? 'intent',
+        // One live experiment per classification, whatever its type.
+        const conflicts = await findClassificationConflicts({
           tiers: sanitized.tiers || [],
           excludeExperimentId: sanitized.experimentId,
         });
-        if (typeConflicts.length > 0) {
+        if (conflicts.length > 0) {
           return respond(409, {
-            error:
-              'A classification experiment cannot run alongside another experiment type on the same classification. '
-              + 'Complete, pause, or delete the conflicting experiment(s) first.',
+            error: CLASSIFICATION_OCCUPIED,
             code: 'EXPERIMENT_TYPE_CONFLICT',
             // §3.2.1 / A.7: the console drives End/Pause/Delete + auto-retry off this.
-            conflicts: conflictBody(typeConflicts),
-            conflictingExperimentIds: typeConflicts.map((e) => e.experimentId),
+            conflicts: conflictBody(conflicts),
+            conflictingExperimentIds: conflicts.map((e) => e.experimentId),
           }, origin);
         }
+
+        // THE TWO VERSIONS ARE PINNED HERE, AT ARM (§3.5), and stored on the variants this Put writes. An edit
+        // of an experiment that is already running keeps its pins (above) and pins nothing new. An edit that
+        // ARMS the row (a create, or a paused or draft row set active) pins again, as Resume on the status
+        // route does: the profile writer reuses a candidate that still says the same thing.
+        if (!sanitized.servesVersions || existing?.status !== 'active') {
+          const derived = await deriveVersions(sanitized, callerArn(callerSub));
+          if ('refusal' in derived) return respond(derived.refusal.status, { error: derived.refusal.error, code: derived.refusal.code }, origin);
+          sanitized.variants = derived.variants;
+          sanitized.servesVersions = true;
+        }
+        const refused = await armRefusal(sanitized);
+        if (refused) return respond(409, refused, origin);
       }
 
       // An EDIT rewrites the whole row from what the Get returned, including the status it read and
@@ -889,6 +1470,17 @@ export const handler = async (
         }
         throw err;
       }
+
+      // ── THE ALT FOLLOWS THE EXPERIMENT ───────────────────────────────────────────────────────
+      //
+      // A battle is an option ON an experiment, so the challenger exists exactly while that
+      // experiment is armed and running. Assigned when both are true; vacated the moment either
+      // stops being true - a paused experiment runs no duels, and a disarmed one has no second side.
+      await setAltAssignment({
+        exp: sanitized,
+        experimentId: sanitized.experimentId,
+        occupied: sanitized.status === 'active' && sanitized.battleEnabled === true,
+      });
       return respond(200, sanitized, origin);
     }
 

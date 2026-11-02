@@ -15,6 +15,7 @@ import {
   formatDomainContextForPrompt,
   formatUserProfileForPrompt,
 } from './async-processor-core.js';
+import { renderWhoIsHere, type WhoIsHere } from './who-is-here.js';
 
 /** The per-turn input the host resolvers read (a superset of AsyncProcessorEvent's grounding fields). */
 export interface HostContextInput {
@@ -40,5 +41,23 @@ export function createHostContextRegistry(): ContextResolverRegistry<HostContext
     .register({
       contextType: 'participant-profile',
       render: (input) => formatUserProfileForPrompt(input),
+    });
+}
+
+/** The per-turn input of the sections rendered after the cache boundary. */
+export interface TurnContextInput {
+  whoIsHere?: WhoIsHere;
+}
+
+/**
+ * The context sections that change within a conversation, rendered after the cache boundary so the cached
+ * prefix stays shared by every conversation. Registration order IS prompt order: the roster of who is
+ * here (`lib/who-is-here.ts`).
+ */
+export function createTurnContextRegistry(): ContextResolverRegistry<TurnContextInput> {
+  return new ContextResolverRegistry<TurnContextInput>()
+    .register({
+      contextType: 'who-is-here',
+      render: (input) => renderWhoIsHere(input.whoIsHere),
     });
 }

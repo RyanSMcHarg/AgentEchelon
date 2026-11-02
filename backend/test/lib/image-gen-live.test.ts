@@ -16,15 +16,40 @@
  *     IMAGE_GEN_KEYS_SECRET_ARN=arn:aws:secretsmanager:...:agent-echelon/image-gen-keys-XXXX \
  *     npx jest image-gen-live
  *
- * Reality: the Bedrock Amazon image models
- * (titan/nova) are legacy-locked and Stability base generators are
- * us-west-2 only, so generation-out from a us-east-1 deployment runs
- * through these external providers (keys in Secrets Manager).
+ * WHAT THIS FILE COVERS, AND WHAT IT DOES NOT. Every active image model in the registry comes from a
+ * third-party provider - AWS's own generators (`titan_image_g1`, `nova_canvas`) are both
+ * `lifecycle: 'legacy'` and legacy-locked by AWS. But "third-party provider" and "external HTTP" are
+ * two different axes, and conflating them is how this header previously claimed that generation-out
+ * always runs through these two:
+ *
+ *   - `hosting: 'external-http'` - OpenAI gpt-image-1 and FAL FLUX 1.1 Pro. Provider's own API, key
+ *     from Secrets Manager. THIS FILE.
+ *   - `hosting: 'aws-bedrock'` - Stability Image Core and Ultra, `lifecycle: 'active'`, invoked
+ *     through Bedrock with IAM auth and no API key. They are `region: 'us-west-2'`, which is a
+ *     cross-region Bedrock call from a us-east-1 deployment, not a reason to bypass Bedrock - and it
+ *     is why `ImageGuardrailStack` is instantiated per region from the registry
+ *     (`bin/backend.ts`). The battle e2e drives exactly these two.
+ *
+ * So a us-east-1 deployment reaches Stability through Bedrock cross-region and OpenAI/FAL over
+ * HTTPS. This file proves the second pair only; the first pair is covered by the battle suite.
  */
 
-import { invokeImageGenModel } from '../../lambda/src/lib/image-gen-models';
+import { IMAGE_GEN_MODELS, invokeImageGenModel } from '../../lambda/src/lib/image-gen-models';
 
 const LIVE = process.env.RUN_LIVE_IMAGE_GEN === '1';
+
+// The processor reads only the key fields its stack names in IMAGE_GEN_KEY_FIELDS (the providers its
+// classification selects). This file exercises every external-http provider, so it names each one's field,
+// read from the registry, as a stack that selects them all does.
+if (LIVE && !process.env.IMAGE_GEN_KEY_FIELDS) {
+  process.env.IMAGE_GEN_KEY_FIELDS = [
+    ...new Set(
+      Object.values(IMAGE_GEN_MODELS)
+        .filter((m) => m.hosting === 'external-http' && m.authEnvVar)
+        .map((m) => m.authEnvVar as string),
+    ),
+  ].join(',');
+}
 const d = LIVE ? describe : describe.skip;
 
 /** PNG files start with the 8-byte signature 89 50 4E 47 0D 0A 1A 0A. */

@@ -115,7 +115,7 @@ describe('the input guardrail scores the turn, not the transcript tail', () => {
   });
 
   it('falls back to the transcript tail when the caller cannot name the turn text', async () => {
-    // Prior behaviour is preserved for any path that does not set it, so this is additive.
+    // Prior behavior is preserved for any path that does not set it, so this is additive.
     const result = await invokeBedrock('system', transcript(), { ...baseConfig });
 
     expect(result.response).toBe(BLOCK_MESSAGE);

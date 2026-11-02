@@ -11,6 +11,8 @@
  * wrap it for the SPEC-DRIFT-CONVERGENCE.md observability requirements.
  */
 
+import type { Classification } from '../../../lib/config/model-strategy.js';
+
 const DRIFT_NAMESPACE = 'AgentEchelon/Drift';
 
 type DriftStage =
@@ -24,9 +26,15 @@ type DriftStage =
 type DriftCounter =
   | 'drift_fired'
   | 'drift_skipped_unavailable'
-  | 'drift_skipped_declined_neighborhood'
+  // The message is near a topic this conversation already holds - one the person kept by declining to
+  // split it out (SPEC-DRIFT-CONVERGENCE step 6). Not a failure: it is drift correctly not offered.
+  | 'drift_skipped_known_topic'
   | 'drift_skipped_intent'
   | 'drift_skipped_no_summary'
+  // An anchor exists but it is the turn-one seed, built from a single exchange, so there is no topic
+  // yet for a message to have drifted from. Counted apart from no_summary: an operator raising the
+  // minimum anchor version needs to see how many offers that decision is the one suppressing.
+  | 'drift_skipped_thin_topic'
   | 'drift_skipped_active_task'
   // Suppressed because work FINISHED here a moment ago, not because work is running. Counted apart
   // from the live case: they are the same decision resting on different evidence, and an operator
@@ -38,7 +46,7 @@ type DriftCounter =
 
 interface DriftEmitOpts {
   /** Clearance of the requesting user; adds a UserClearance dimension when set */
-  userClearance?: 'basic' | 'standard' | 'premium';
+  userClearance?: Classification;
   /** Classified intent at fire time; adds an Intent dimension when set */
   intent?: string;
 }
@@ -70,7 +78,7 @@ export function emitEmfMetric(args: {
             // healthy, and no metric is ever created.
             //
             // This emitted `{name, unit}` for as long as it has existed. The result is that NO
-            // metric in any AgentEchelon namespace has ever materialised - `list-metrics` on
+            // metric in any AgentEchelon namespace has ever materialized - `list-metrics` on
             // AgentEchelon/Drift returned zero after months of drift detection running, and any
             // alarm over one of these would sit in INSUFFICIENT_DATA forever rather than fire.
             //

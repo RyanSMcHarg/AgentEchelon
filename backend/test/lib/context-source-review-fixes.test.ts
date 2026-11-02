@@ -6,6 +6,7 @@
  * guard, a grant, or a signal that LOOKED present and was not.
  */
 import {
+  NO_RECORD,
   readPublishedCatalog,
   renderSourceSection,
   type PublishedContextSource,
@@ -73,18 +74,18 @@ describe('a DENIED catalog read is not silently an empty catalog', () => {
 });
 
 describe('dotted `from` paths reach nested records', () => {
-  // The built-in profile store writes `{ userSub, onboardedAt, facts: {…} }`, so a catalog that could
+  // The built-in profile store writes `{ personId, onboardedAt, facts: {…} }`, so a catalog that could
   // only name top-level attributes read nothing. The shipped `user-profile` entry declared `company`
   // and `role`, found neither, and resolved to absent on every turn for every user.
   const item = {
-    userSub: { S: 'user-123' },
+    personId: { S: 'user-123' },
     onboardedAt: { S: '2026-01-01' },
     facts: { M: { name: { S: 'Priya' }, company: { S: 'Stratum' }, headcount: { N: '42' } } },
   };
   const ddb = () => ({ send: jest.fn(async () => ({ Item: item })) });
 
   it('reads a value nested under `facts`', async () => {
-    const read = createSourceReader({ classification: 'standard', userSub: 'user-123' }, { ddb: ddb() as never });
+    const read = createSourceReader({ classification: 'standard', personId: 'user-123' }, { ddb: ddb() as never });
     const values = await read(source({
       fields: {
         displayName: { type: 'string', from: 'facts.name', description: 'name' },
@@ -95,7 +96,7 @@ describe('dotted `from` paths reach nested records', () => {
   });
 
   it('still reads a TOP-LEVEL attribute, so existing catalogs keep working', async () => {
-    const read = createSourceReader({ classification: 'standard', userSub: 'user-123' }, { ddb: ddb() as never });
+    const read = createSourceReader({ classification: 'standard', personId: 'user-123' }, { ddb: ddb() as never });
     const values = await read(source({
       fields: { onboardedAt: { type: 'string', description: 'when' } },
     }));
@@ -103,14 +104,14 @@ describe('dotted `from` paths reach nested records', () => {
   });
 
   it('yields nothing for a path that runs into a scalar or a missing key', async () => {
-    // A mistyped path must read as an absent field, never as a wrong value.
-    const read = createSourceReader({ classification: 'standard', userSub: 'user-123' }, { ddb: ddb() as never });
+    // A mistyped path must read as no value, never as a wrong one: the record yields none of the declared fields.
+    const read = createSourceReader({ classification: 'standard', personId: 'user-123' }, { ddb: ddb() as never });
     expect(await read(source({
-      fields: { displayName: { type: 'string', from: 'userSub.nope', description: 'x' } },
-    }))).toBeNull();
+      fields: { displayName: { type: 'string', from: 'personId.nope', description: 'x' } },
+    }))).toBe(NO_RECORD);
     expect(await read(source({
       fields: { displayName: { type: 'string', from: 'facts.absent', description: 'x' } },
-    }))).toBeNull();
+    }))).toBe(NO_RECORD);
   });
 });
 

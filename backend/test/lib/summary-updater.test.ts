@@ -6,7 +6,7 @@
  *   - `name` was inserted as a literal NULL, so the column existed but nothing ever populated it.
  *   - `participant_count` was inserted as a literal 0, so every conversation read as unattended.
  * and the rule that makes `name` safe to write at all: a conversation is named ONCE. A scheduled
- * re-summarise must never rename a conversation the user already knows by its current name.
+ * re-summarize must never rename a conversation the user already knows by its current name.
  *
  * The assertions are on the actual INSERT parameter array, because that is where the defect lived -
  * a test that only checked the parsed model output would have passed against the broken writer.
@@ -69,7 +69,7 @@ function summaryInsertSql(): string {
 
 /**
  * Drive one channel through the updater. `existingRow` is the current
- * conversation_summaries row (undefined = never summarised).
+ * conversation_summaries row (undefined = never summarized).
  */
 async function runUpdater(existingRow?: Record<string, unknown>) {
   jest.resetModules();
@@ -108,7 +108,7 @@ describe('summary-updater conversation_summaries write', () => {
   it('does NOT write a conversation name into the summary row', async () => {
     // The Amazon Chime SDK channel is authoritative for the name and `channel_registry.channel_name`
     // already mirrors it live from Kinesis. A summary row is versioned and never rewritten, so a
-    // name copied here would freeze at one summarisation and could disagree with the name the user
+    // name copied here would freeze at one summarization and could disagree with the name the user
     // actually sees. Worse, letting the summariser generate one creates a SECOND, divergent name.
     // The column is DROPPED (migration 015), so it must not appear in the INSERT at all.
     await runUpdater(undefined);
@@ -142,6 +142,44 @@ describe('summary-updater conversation_summaries write', () => {
     expect(summaryInsertParams()).not.toContain(12);
     const counted = mockQuery.mock.calls.some((c) => /COUNT\(\*\)::text AS count|channel_membership/i.test(String(c[0])));
     expect(counted).toBe(false);
+  });
+});
+
+/**
+ * A VERSION ANOTHER WRITER ALREADY HOLDS. Two updaters can read the same current version and both try
+ * to write the next one; `UNIQUE (channel_arn, version)` keeps one. The loser's INSERT must be a
+ * no-op rather than a unique-violation error, so the channel is not reported as failed and no
+ * embedding is written for a version this run did not write.
+ */
+describe('summary-updater when another writer already wrote the next version', () => {
+  async function runAgainstAWinner() {
+    jest.resetModules();
+    mockQuery.mockReset();
+    mockWriteSummaryEmbedding.mockReset().mockResolvedValue({ written: true });
+    mockSend.mockReset().mockResolvedValue(bedrockReply(MODEL_OUTPUT));
+    const route = routeSql({ version: 2 });
+    mockQuery.mockImplementation(async (sql: string, params?: unknown[]) => {
+      if (sql.includes('INSERT INTO conversation_summaries')) {
+        // What Postgres does with a row whose (channel_arn, version) is already taken.
+        if (!/ON CONFLICT \(channel_arn, version\) DO NOTHING\s+RETURNING/.test(sql)) {
+          throw Object.assign(new Error('duplicate key value violates unique constraint "conversation_summaries_channel_arn_version_key"'), { code: '23505' });
+        }
+        return { rows: [] };
+      }
+      return route(sql);
+    });
+    const mod = await import('../../lambda/src/analytics-aurora/summary-updater');
+    return mod.handler({});
+  }
+
+  it('is a no-op, not a failed channel', async () => {
+    await expect(runAgainstAWinner()).resolves.toEqual({ processed: 1, failed: 0 });
+  });
+
+  it('writes no embedding for the version it did not write', async () => {
+    await runAgainstAWinner();
+    expect(summaryInsertSql()).toMatch(/ON CONFLICT \(channel_arn, version\) DO NOTHING/);
+    expect(mockWriteSummaryEmbedding).not.toHaveBeenCalled();
   });
 });
 

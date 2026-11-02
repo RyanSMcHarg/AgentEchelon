@@ -8,7 +8,7 @@
  * same functions the recommendation path calls.
  *
  * WHEN THIS FAILS, the spec is wrong, not the test. Recompute the example, update the document, and
- * check whether the change of behaviour was intended before doing either.
+ * check whether the change of behavior was intended before doing either.
  */
 
 import {

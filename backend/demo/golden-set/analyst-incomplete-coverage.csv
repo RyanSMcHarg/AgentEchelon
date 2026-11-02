@@ -1,0 +1,5 @@
+intent,request,reference
+report_generation,"Write a short summary of support ticket trends for the last quarter.","Ticket volume rose 8% quarter over quarter, led by billing questions."
+report_generation,"Summarize this month's incident reviews for the leadership update.",
+report_generation,"Draft a one-page update on the migration project, with risks.",
+data_extraction,"Give me the onboarding checklist as a table with owner and due day.",

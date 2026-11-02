@@ -6,7 +6,7 @@
  * server-only channel-context item as `memberCount`. Nothing read that
  * attribute: `ChannelContext` never declared it and no read accessor exists,
  * because a count derived from `channel_membership` collapses assistants into
- * the human roster (that table keys on `user_sub`, projected from `/user/`
+ * the human roster (that table keys on `person_id`, projected from `/user/`
  * ARNs, so a battle channel of one user and two bots reports 2). The `@all`
  * responder branch therefore resolves size live through
  * `lib/channel-size.ts`, and the derived count cost a query per touched
@@ -131,7 +131,7 @@ describe('nothing advertises a consumer for a stored member count', () => {
   const archival = read('lambda', 'src', 'analytics-aurora', 'kinesis-archival.ts');
   const contextClient = read('lambda', 'src', 'lib', 'channel-context-client.ts');
   const channelSize = read('lambda', 'src', 'lib', 'channel-size.ts');
-  const auroraStack = read('lib', 'stacks', 'analytics-stack-aurora.ts');
+  const auroraStack = read('lib', 'stacks', 'archive-stack-aurora.ts');
 
   it('the archival path does not import the channel-context store', () => {
     // The import is the whole coupling: this Lambda has no other use for that table, so its presence

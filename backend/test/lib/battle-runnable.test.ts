@@ -15,7 +15,7 @@
  * Pure by design: `channel-flow-processor` has no unit harness (it is only reached by source-scanning
  * tests), so the rule lives here where it can be driven directly.
  */
-import { battleIsRunnable } from '../../lambda/src/lib/battle-state';
+import { battleIsRunnable, battleIsRunnableConfirmed } from '../../lambda/src/lib/battle-state';
 
 const ACTIVE = { experimentId: 'exp-live', status: 'active' };
 const DONE = { experimentId: 'exp-done', status: 'completed' };
@@ -59,5 +59,42 @@ describe('battleIsRunnable', () => {
   it('does not treat an empty experiment list as permission to run', () => {
     // The list being empty means nothing is active - not that the check is unavailable.
     expect(battleIsRunnable(cfg(), [])).toBe(false);
+  });
+});
+
+/**
+ * A REFUSAL IS CONFIRMED FRESH, AN ALLOW IS NOT. The experiments memo is a minute behind; a stale
+ * "ended" for an experiment just re-activated refused the duel and told the room the experiment had
+ * ended, which was false (seen live in the battle e2e, 2026-10-08).
+ */
+describe('battleIsRunnableConfirmed', () => {
+  const reads = (cachedList: unknown[], freshList: unknown[]) => {
+    const cached = jest.fn(async () => cachedList as never);
+    const fresh = jest.fn(async () => freshList as never);
+    return { cached, fresh };
+  };
+
+  it('allows from the cache and never pays for a fresh read', async () => {
+    const { cached, fresh } = reads([ACTIVE], [DONE]);
+    expect(await battleIsRunnableConfirmed(cfg(), cached, fresh)).toBe(true);
+    expect(fresh).not.toHaveBeenCalled();
+  });
+
+  it('a stale "ended" is re-checked fresh, and a re-activated experiment runs', async () => {
+    const { cached, fresh } = reads([{ experimentId: 'exp-live', status: 'completed' }], [ACTIVE]);
+    expect(await battleIsRunnableConfirmed(cfg(), cached, fresh)).toBe(true);
+    expect(fresh).toHaveBeenCalledTimes(1);
+  });
+
+  it('an experiment that really ended still refuses, after the fresh read agrees', async () => {
+    const { cached, fresh } = reads([{ experimentId: 'exp-live', status: 'completed' }], [{ experimentId: 'exp-live', status: 'completed' }]);
+    expect(await battleIsRunnableConfirmed(cfg(), cached, fresh)).toBe(false);
+  });
+
+  it('a refusal that does not come from the experiments pays for no second read', async () => {
+    const { cached, fresh } = reads([], [ACTIVE]);
+    expect(await battleIsRunnableConfirmed(cfg({ enabled: false }), cached, fresh)).toBe(false);
+    expect(await battleIsRunnableConfirmed(null, cached, fresh)).toBe(false);
+    expect(fresh).not.toHaveBeenCalled();
   });
 });

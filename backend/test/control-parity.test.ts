@@ -19,6 +19,7 @@
  * it to parity with the others.
  */
 import * as fs from 'fs';
+import { stripComments } from './helpers/strip-comments';
 import * as path from 'path';
 
 const SRC = path.join(__dirname, '..', 'lambda', 'src');
@@ -27,6 +28,18 @@ const SRC = path.join(__dirname, '..', 'lambda', 'src');
 // gate + fail-closed classification + dedup key + length cap; the async-processor SINK runs the input +
 // output guardrails and the dedup CLAIM. A symbol is matched as a substring (covers the shared helper
 // and any in-file wrapper, e.g. router's resolveChannelClassificationTag wraps the shared one).
+//
+// THE CLASSIFICATION CONTROL IS NAMED BY ITS SUFFIX, `ChannelClassificationTag`, because the read is
+// what matters and there is now one spelling of it: `readChannelClassificationTag`, which returns
+// `undefined` for a tag it cannot read. Matching the suffix keeps the guard working if a path wraps it.
+//
+// `failClosedValue` IS NO LONGER A CONTROL, AND ITS ABSENCE IS THE POINT (ADR-046).
+// It used to be required of the flow separately, because that path applied the fail-closed default
+// itself and the read could drift from the default. There is no default: classifications are a set
+// with no floor, so an unreadable tag is REFUSED rather than resolved to the least-privileged value.
+// Requiring the symbol now would demand the very substitution the boundary work removed - a guard
+// that fails the build for doing the right thing. What replaces it as the thing that must not drift
+// is the refusal itself, which each path states at its own call site.
 const DISPATCH_PATHS: Array<{ file: string; controls: string[]; role: string }> = [
   {
     file: 'router-agent-handler.ts',
@@ -39,7 +52,7 @@ const DISPATCH_PATHS: Array<{ file: string; controls: string[]; role: string }> 
     //   - mentionCorrelationId - the bypass entry, DECLARED from the message id the flow hands over.
     //     It moved here from channel-flow-processor.ts with the @all handoff; it was not dropped.
     controls: [
-      'evaluateAbuseGate', 'resolveChannelClassificationTag', 'capUserMessage',
+      'evaluateAbuseGate', 'ChannelClassificationTag', 'capUserMessage',
       'turnCorrelationId', 'mentionCorrelationId',
     ],
   },
@@ -51,7 +64,7 @@ const DISPATCH_PATHS: Array<{ file: string; controls: string[]; role: string }> 
     // id. Drop it and the router silently falls back to the 90-second time-bucket derivation, so a
     // cross-container redelivery that straddles a bucket boundary answers twice again. That is the same
     // bug the original mentionCorrelationId entry guarded, one component upstream.
-    controls: ['evaluateAbuseGate', 'resolveChannelClassificationTag', 'userMessageId'],
+    controls: ['evaluateAbuseGate', 'ChannelClassificationTag', 'userMessageId'],
   },
   {
     file: 'assistant-async-processor.ts',
@@ -83,23 +96,42 @@ describe('control parity: every model-dispatch path runs the shared controls', (
 });
 
 describe('both entries meter the same person by the same rule', () => {
-  // The router charges an ordinary turn at min(channel, clearance); the flow charges the /battle
-  // fan-out - the most expensive dispatch - for the same sender. While the flow had no clearance
-  // input it charged at the CHANNEL classification, so a basic-clearance member of a premium channel
-  // who was over their own ceiling could keep spending via /battle. Failed open: the duel still
-  // answered, which is why nothing surfaced it.
+  // WHAT THIS GUARDS IS PARITY, AND THE RULE IT IS PARITY ON CHANGED (maintainer, 2026-08-31).
+  //
+  // It asserted that each side capped its metering input at min(channel, clearance). That cap is
+  // gone from both: one channel has one classification, and IAM decides it (ADR-033). The
+  // channel-scoped Allow is applied to the Cognito USER roles as well as the assistant roles,
+  // tag-gated and fail-closed, so the state the cap guarded - a basic-clearance member spending in a
+  // premium channel - is unreachable; they hold no grant on that channel at all.
+  //
+  // And the cap cost the case that IS reachable: resolveUserClearance answers `basic` for ANY
+  // failure, so a Cognito throttle metered a legitimate premium turn against basic limits.
+  //
+  // So the parity still holds and is still worth pinning - both sides now meter at the CHANNEL -
+  // and this asserts the new rule on both rather than being deleted with the old one.
   const routerSrc = fs.readFileSync(path.join(SRC, 'router-agent-handler.ts'), 'utf8');
   const flowSrc = fs.readFileSync(path.join(SRC, 'channel-flow-processor.ts'), 'utf8');
 
-  it('each side applies the effective-min rule to its metering input', () => {
-    expect(routerSrc).toMatch(/minRank\(channelClassification, userClearance\)/);
-    expect(flowSrc).toMatch(/profiles\.min\(classification, \(await resolveUserClearance\(userSub\)\)\.clearance\)/);
+  it('neither side caps its metering input at the speaker clearance', () => {
+    // COMMENT-STRIPPED, because both files RECORD the old rule in prose. The note explaining why the
+    // cap was removed contains the very expression this forbids, so a scan of the raw source is
+    // satisfied by the explanation rather than by the code - the check would pass on a file that had
+    // been reverted, as long as it still carried the comment. Same reason
+    // task-shaped-battle-parity.test.ts reads through stripComments.
+    expect(stripComments(routerSrc)).not.toMatch(/minRank\(channelClassification, userClearance\)/);
+    expect(stripComments(flowSrc)).not.toMatch(/profiles\.min\(classification,/);
   });
 
-  it('clearance has ONE implementation, imported by both, so the two cannot drift', () => {
+  it('both meter at the channel classification, which is the rule they must share', () => {
+    expect(routerSrc).toContain('const effectiveClassification = channelClassification;');
+    expect(flowSrc).toContain('const effective = classification;');
+  });
+
+  it('neither dispatch file grows its own group lookup', () => {
+    // The router still resolves clearance - the abuse-exemption isAdmin flag reads it - and must keep
+    // taking it from the one implementation. The flow needs no clearance at all now, so the
+    // assertion that binds it is the negative one: it must not grow a lookup of its own back.
     expect(routerSrc).toContain("from './lib/user-clearance.js'");
-    expect(flowSrc).toContain("from './lib/user-clearance.js'");
-    // Neither dispatch file may grow its own group lookup back.
     expect(routerSrc).not.toContain('AdminListGroupsForUserCommand');
     expect(flowSrc).not.toContain('AdminListGroupsForUserCommand');
   });

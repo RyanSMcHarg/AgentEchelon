@@ -4,7 +4,7 @@
  * Two backing tables (provisioned in battle-stack.ts):
  *
  *   - `ChannelBattleConfig` — PK channelArn. Records whether a channel
- *     has /battle enabled and which experiment+slot is bound. Read by
+ *     has /battle enabled and which experiment and challenger it runs. Read by
  *     drift detection (suppression) and channel-flow-processor (gating).
  *
  *   - `BattleState` — PK battleId, SK botArn. Per-bot state-machine row
@@ -20,6 +20,7 @@
 
 import { createHash } from 'crypto';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
+import { BOUNDED_REQUEST_HANDLER } from './bounded-request-handler.js';
 import {
   DynamoDBDocumentClient,
   GetCommand,
@@ -27,6 +28,8 @@ import {
   QueryCommand,
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
+import { sessionDocumentClient } from './assistant-session.js';
+import type { LegacyBattleBinding } from './alt-assignment.js';
 
 const CHANNEL_BATTLE_CONFIG_TABLE = process.env.CHANNEL_BATTLE_CONFIG_TABLE || '';
 const BATTLE_STATE_TABLE = process.env.BATTLE_STATE_TABLE || '';
@@ -137,7 +140,7 @@ export function battleRowTtl(nowMs: number = Date.now()): number {
 // round1MessageId / correlationId straight into the Item — all undefined
 // on the FAILED path (a bot that errored before replying). Without this
 // the marshaller throws and the conditional transition is lost.
-const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+const ddb = sessionDocumentClient({ requestHandler: BOUNDED_REQUEST_HANDLER }, {
   marshallOptions: { removeUndefinedValues: true },
 });
 
@@ -161,11 +164,14 @@ export function deriveBattleId(channelArn: string, userMessageId: string): strin
 // ChannelBattleConfig — is /battle enabled on this channel?
 // ---------------------------------------------------------------------------
 
-export interface ChannelBattleConfig {
+export interface ChannelBattleConfig extends LegacyBattleBinding {
   channelArn: string;
   enabled: boolean;
   experimentId?: string;
-  altBotSlotArn?: string;
+  /** The challenger's assistant id, `alt-{role}-{classification}`. */
+  challengerAssistant?: string;
+  /** The challenger's bot the enable added to this room, so disable removes exactly that member. */
+  challengerBotArn?: string;
   enabledBy?: string;
   enabledAt?: string;
   /**
@@ -191,6 +197,14 @@ export interface ChannelBattleConfig {
   activeBattleInitiator?: string;
 }
 
+/**
+ * The challenger's bot an enable added to the room, from a config row of either shape: the current
+ * `challengerBotArn`, or the attribute a row written before the re-key carries.
+ */
+export function challengerBotArnOf(config: ChannelBattleConfig | undefined | null): string | undefined {
+  return config?.challengerBotArn || config?.altBotSlotArn || undefined;
+}
+
 interface ConfigCacheEntry {
   config: ChannelBattleConfig | null;
   expires: number;
@@ -206,7 +220,7 @@ export async function isBattleEnabled(channelArn: string): Promise<boolean> {
 /**
  * Can this channel still run a duel? Pure, so the rule is testable without the processor.
  *
- * `ChannelBattleConfig` is a SNAPSHOT written at enable time (slot arn, experiment id, briefing), and
+ * `ChannelBattleConfig` is a SNAPSHOT written at enable time (challenger, experiment id, briefing), and
  * nothing re-checked the experiment afterwards. A channel enabled while an experiment was active
  * therefore kept fanning out duels forever after that experiment ended, recording human picks against
  * a completed experiment where they can never reach a recommendation - while enabling a NEW channel
@@ -225,6 +239,28 @@ export function battleIsRunnable(
   if (config?.enabled !== true) return false;
   if (!config.experimentId) return true;
   return experiments.some((e) => e.experimentId === config.experimentId && e.status === 'active');
+}
+
+/**
+ * IS THE BOUND EXPERIMENT LIVE, read through the cache for an ALLOW and confirmed fresh before a REFUSAL.
+ *
+ * The experiments memo is a minute behind, and its two stale directions cost different things. Stale
+ * "active" lets a duel start up to a minute after an operator ends the experiment, which is the bounded
+ * window `listExperimentsCached` documents. Stale "ended" refuses a duel for an experiment that was just
+ * re-activated, and tells the room the experiment has ended when it has not - a false statement to a
+ * person, for a minute, per container. So a refusal that came from the experiments is re-checked against a
+ * fresh read before it is sent; an allow is not. Refusals are rare, so the fresh read costs one scan only
+ * on that path. The same asymmetry `loadChannelBattleConfig` applies to its own negative entries.
+ */
+export async function battleIsRunnableConfirmed(
+  config: ChannelBattleConfig | null,
+  cached: () => Promise<Array<{ experimentId: string; status?: string }>>,
+  fresh: () => Promise<Array<{ experimentId: string; status?: string }>>,
+): Promise<boolean> {
+  if (battleIsRunnable(config, await cached())) return true;
+  // A refusal that does not depend on the experiments needs no second read.
+  if (config?.enabled !== true || !config.experimentId) return false;
+  return battleIsRunnable(config, await fresh());
 }
 
 export async function loadChannelBattleConfig(channelArn: string): Promise<ChannelBattleConfig | null> {
@@ -328,7 +364,7 @@ export async function setActiveBattle(args: {
  * would otherwise clear the new duel's pointer and strand it exactly as an overwrite would have. The
  * condition makes a late release a no-op instead.
  *
- * Non-fatal, like `setActiveBattle`: a failure here degrades to the old behaviour (the pointer stands
+ * Non-fatal, like `setActiveBattle`: a failure here degrades to the old behavior (the pointer stands
  * until the backstop clock releases it) and must never take down the path that is ending the duel.
  */
 export async function clearActiveBattle(args: {
@@ -443,7 +479,15 @@ export interface BattleStateRow {
   botArn: string;
   state: BattleBotStatus;
   /**
-   * The person who ran /battle. A duel HAS AN OWNER (owner, 2026-08-13): they are who a waiting side
+   * The channel this duel ran in. Written ONLY on the `__round1__` sentinel, by
+   * `tryClaimRound1Fanout`, and read by `readBattleChannel`.
+   *
+   * Deliberately not on the per-bot rows: those are replaced wholesale by `transitionBotState`, so a
+   * field parked on them survives only until the side it describes finishes.
+   */
+  channelArn?: string;
+  /**
+   * The person who ran /battle. A duel HAS AN OWNER (maintainer, 2026-08-13): they are who a waiting side
    * is waiting on, who its task is assigned to, and the only person whose reply resumes it.
    *
    * Without it the continuation matched on the mentioned BOT alone, so any member could answer a
@@ -643,7 +687,7 @@ export async function transitionBotState(args: {
 
 /**
  * Transition a bot's row INVOKED → WAITING_FOR_USER (SPEC-BATTLE.md
- * "Clarification Routing in Multi-Bot Channels"). Used when a battle
+ * the live-suggestion flow, clarification routing in multi-assistant channels). Used when a battle
  * round-1 reply is a clarifying question rather than a complete answer:
  * the bot is NOT terminal, so the round-2 orchestrator must NOT fire
  * until this bot later completes. The user's directed reply (per-bot
@@ -734,7 +778,7 @@ export async function markBotWaitingForUser(args: {
 
 /**
  * Transition a bot's row WAITING_FOR_USER → INVOKED when the user's
- * directed reply arrives (SPEC-BATTLE.md "Per-bot reply UX"). Returns
+ * directed reply arrives (SPEC-BATTLE.md "Per-assistant reply UX"). Returns
  * the bot to active generation so its resumed turn can complete and
  * `transitionBotState` later moves it to COMPLETED (whose conditional
  * already accepts `WAITING_FOR_USER`/`INVOKED`).
@@ -845,6 +889,29 @@ export async function readBattleRows(battleId: string): Promise<BattleStateRow[]
 }
 
 /**
+ * WHICH CHANNEL A BATTLE BELONGS TO, read off rows already in hand, or null if that is not recorded.
+ *
+ * `battleId` is `sha256(channelArn + ':' + userMessageId)`, so the channel is inside it and cannot be
+ * recovered from it. Anything holding a battleId and a channelArn therefore has two independent
+ * claims, and this is what joins them.
+ *
+ * TAKES ROWS RATHER THAN READING ITS OWN. The one caller has already queried them, and a second
+ * single-item read would need `dynamodb:GetItem` where the caller's role is granted `Query` alone -
+ * so it would return null on AccessDenied and the check it exists to make would silently never fire.
+ * That is the exact failure the grant's own comment warns about one table over.
+ *
+ * NULL IS "NOT RECORDED", NEVER "DOES NOT MATCH", and the distinction is the whole contract: a duel
+ * that predates the binding, one whose rows have passed their TTL, and a deployment with no state
+ * table all yield null. A caller must treat null as unknown and decide for itself; only a returned
+ * ARN that differs from the one in hand is evidence of a mismatch.
+ */
+export function battleChannelFrom(rows: BattleStateRow[]): string | null {
+  const sentinel = rows.find((r) => r.botArn === '__round1__');
+  const arn = sentinel?.channelArn;
+  return typeof arn === 'string' && arn ? arn : null;
+}
+
+/**
  * Single-item read of one bot's row (PK battleId + SK botArn). Cheaper
  * than `readBattleRows` when only the caller's own row is needed — e.g.
  * the finalize tail reading `clarificationCount`/`waitedMs` to surface
@@ -918,8 +985,11 @@ export async function tryClaimOrchestratorFire(battleId: string): Promise<boolea
  * tryClaimOrchestratorFire: a conditional-write sentinel row; only the first
  * caller returns true. deriveBattleId keys this on channelArn+userMessageId, so
  * the same message always claims the same battleId.
+ *
+ * It also RECORDS THE DUEL'S CHANNEL (see the item below), because this is the one write per battle
+ * that happens once and is never replaced. `readBattleChannel` is the reader.
  */
-export async function tryClaimRound1Fanout(battleId: string): Promise<boolean> {
+export async function tryClaimRound1Fanout(battleId: string, channelArn?: string): Promise<boolean> {
   if (!BATTLE_STATE_TABLE) return true; // no state table: cannot dedupe, fan out (dev/athena)
   // Outlives the DUEL, not one leg. This sentinel is the only thing stopping a redelivered `/battle`
   // fanning out twice, and a duel that now legitimately runs for an hour would otherwise outlive its own
@@ -934,6 +1004,17 @@ export async function tryClaimRound1Fanout(battleId: string): Promise<boolean> {
           botArn: '__round1__',
           state: 'COMPLETED',
           enteredStateAt: new Date().toISOString(),
+          // WHICH CHANNEL THIS DUEL BELONGS TO, recorded here and nowhere else.
+          //
+          // This row is the only one in the table with exactly one writer and no rewrite: the
+          // conditional put below admits the first caller and refuses every later one, and no
+          // transition touches it. The per-bot rows cannot carry it - `transitionBotState` replaces
+          // the whole item, which is precisely how `initiatorUserSub` came to read as `undefined`
+          // for everybody.
+          //
+          // The reader is the outcome API, which has a `channelArn` from the client and a `battleId`
+          // from the client and, without this, no way to know the two describe the same duel.
+          ...(channelArn && { channelArn }),
           ttl,
         },
         ConditionExpression: 'attribute_not_exists(botArn)',
@@ -1014,11 +1095,17 @@ export function duelIsResolved(rows: BattleStateRow[]): boolean {
  * Alive means: sides exist, not every one of them has been abandoned, and the orchestrator has not yet
  * written the resolution marker. That marker is the only durable record of "there is no further
  * orchestrated phase", which is exactly the question being asked.
+ *
+ * A DUEL A PERSON ENDED IS NOT LIVE EITHER, read from the `__abandoned__` sentinel (`duelWasAbandoned`).
+ * An end that lands after both sides completed round 1 abandons no side row (they had already stopped)
+ * and takes the orchestrator's claim, so the resolution marker is never written. The sentinel is then
+ * the only record that nothing further will happen.
  */
 export function duelIsLive(rows: BattleStateRow[]): boolean {
   const bots = botRowsOnly(rows);
   if (bots.length === 0) return false;
   if (bots.every((r) => r.state === 'ABANDONED')) return false;
+  if (duelWasAbandoned(rows)) return false;
   return !duelIsResolved(rows);
 }
 
@@ -1114,10 +1201,8 @@ export function isPastDeadline(row: BattleStateRow, nowMs: number = Date.now()):
 /**
  * Pure. The bot ARNs a message is `Target`-addressed to (Chime
  * targeted delivery). Filters to AppInstanceBot ARNs (`/bot/`) so a
- * reply that also targets a human can't be mistaken for a bot
- * continuation. Deduped, order preserved. Feeds `planBattleContinuation`
- * as the addressed-bots set (it is source-agnostic — `CHIME.mentions`
- * vs. `Target` is the caller's concern). Pure → unit-test.
+ * message that also targets a human is counted by its bots only.
+ * Deduped, order preserved. Pure → unit-test.
  */
 export function extractTargetedBotArns(
   target: { MemberArn?: string }[] | undefined,
@@ -1132,89 +1217,6 @@ export function extractTargetedBotArns(
     }
   }
   return out;
-}
-
-export interface BattleContinuationPlan {
-  /**
-   * Bots whose `WAITING_FOR_USER` turn this reply resumes, in the order
-   * they were addressed. **Empty ⇒ this is NOT a battle continuation**
-   * — the caller (brick 2B-x, channel-flow-processor) falls through to
-   * normal routing and the message is ordinary channel chatter.
-   */
-  resumeBotArns: string[];
-}
-
-/**
- * Pure. SPEC-BATTLE.md "Per-bot reply UX": given a user reply's
- * `CHIME.mentions` set and the current battle rows, decide which bot(s)
- * this reply resumes. Strict per-bot isolation
- * (project-battle-clarification-measured-dimension): a reply resumes
- * ONLY bots that are BOTH explicitly addressed AND currently
- * `WAITING_FOR_USER`.
- *
- *  - A waiting bot the user did NOT address stays waiting — it must not
- *    free-ride on a rival's clarification (that would contaminate the
- *    measured "asks vs. forges ahead" signal).
- *  - An addressed bot that already finished round 1 (not waiting) is
- *    ignored — it has nothing to resume.
- *  - The user MAY deliberately address several waiting bots ("all" in
- *    the composer). That is an explicit human choice, not system
- *    broadcast, so the full intersection is returned (mention order
- *    preserved, deduped).
- *
- * The `__orchestrator__` sentinel is excluded via `botRowsOnly`; the
- * `WAITING_FOR_USER` definition is encapsulated here so the caller just
- * passes `readBattleRows(...)` output. Pure → unit-test.
- */
-export function planBattleContinuation(
-  rows: BattleStateRow[],
-  mentions: string[] | undefined,
-  /**
-   * Who is speaking. A DUEL HAS ONE OWNER (owner, 2026-08-13): the person who ran `/battle` is who a
-   * waiting side is waiting on, and the only one whose reply resumes it.
-   *
-   * This used to match on the mentioned BOT alone, so any member of the channel could answer a
-   * question they were never asked and steer a comparison they did not start - and the initiator, who
-   * did start it, would find their duel already moved on. A non-owner's message is not refused here,
-   * it simply does not resume anything: it falls through and is answered as an ordinary turn.
-   *
-   * Omitted, or a battle recorded before owners existed, resumes as before rather than blocking - an
-   * old duel with no recorded owner must not become unanswerable by anyone.
-   */
-  speakerUserSub?: string,
-  /**
-   * The owner as the CALLER resolved it — from the channel pointer (`resolveActiveBattle`), which is
-   * where a duel's owner durably lives.
-   *
-   * This parameter is the fix for an enforcement that shipped inert. The owner used to be read from the
-   * rows below and only from there, and the rows do not keep it: the terminal transition rewrote the
-   * whole item, so a duel's owner was erased by its own completion and the comparison below ran against
-   * `undefined` — passing for every member, which is the hole it exists to close.
-   *
-   * The row scan stays as a fallback, for an in-flight duel whose pointer predates the field.
-   */
-  ownerUserSub?: string,
-): BattleContinuationPlan {
-  const botRows = botRowsOnly(rows);
-  const owner = ownerUserSub ?? botRows.find((r) => r.initiatorUserSub)?.initiatorUserSub;
-  if (owner && speakerUserSub && owner !== speakerUserSub) {
-    return { resumeBotArns: [] };
-  }
-
-  const waiting = new Set(
-    botRows
-      .filter((r) => r.state === 'WAITING_FOR_USER')
-      .map((r) => r.botArn),
-  );
-  const seen = new Set<string>();
-  const resumeBotArns: string[] = [];
-  for (const arn of mentions ?? []) {
-    if (waiting.has(arn) && !seen.has(arn)) {
-      seen.add(arn);
-      resumeBotArns.push(arn);
-    }
-  }
-  return { resumeBotArns };
 }
 
 /**

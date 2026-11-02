@@ -3,7 +3,7 @@
  * Demo Seed Script
  *
  * Creates demo users, uploads context files to S3, and validates identity
- * preconditions (tier groups + the premium admin). Real conversations are produced
+ * preconditions (tier groups; no seeded user is an admin; the e2e testAdmin is). Real conversations are produced
  * by the e2e validation (`npm run validate`) as actual user->assistant turns - never
  * faked here.
  * Run after CDK deploy with: npx ts-node scripts/seed-demo.ts
@@ -15,23 +15,24 @@
  * Usage:
  *   npx ts-node scripts/seed-demo.ts
  *   AWS_PROFILE=myprofile npx ts-node scripts/seed-demo.ts
+ *   npx ts-node scripts/seed-demo.ts --dry-run   # reads nothing from AWS, changes nothing, prints the plan
+ *
+ * Each demo user is signed in through the credential exchange, and the `userArn` it answers with is
+ * written into the e2e secret beside the login, as `provision-test-users.mjs` does, so the suite acts
+ * as the person the exchange named. A user the exchange could not name fails the run, after the secret
+ * holds the password, so a re-run converges.
  */
 
 import {
   CognitoIdentityProviderClient,
   AdminCreateUserCommand,
-  AdminGetUserCommand,
   AdminSetUserPasswordCommand,
   AdminUpdateUserAttributesCommand,
   AdminAddUserToGroupCommand,
   AdminConfirmSignUpCommand,
   AdminListGroupsForUserCommand,
-  ListUserPoolClientsCommand,
+  InitiateAuthCommand,
 } from '@aws-sdk/client-cognito-identity-provider';
-import {
-  ChimeSDKIdentityClient,
-  CreateAppInstanceUserCommand,
-} from '@aws-sdk/client-chime-sdk-identity';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import {
   CloudFormationClient,
@@ -45,29 +46,54 @@ import {
 } from '@aws-sdk/client-secrets-manager';
 import { SSMClient, PutParameterCommand, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { seedAllProfileDefinitions } from '../lambda/src/lib/seed-profile-definitions.js';
+import { writeClassificationPack } from '../lambda/src/lib/intent-pack.js';
+import { putTemplate, readTemplatePointer, activateTemplate } from '../lambda/src/lib/template-store.js';
 import * as fs from 'fs';
 import * as path from 'path';
 import { randomBytes } from 'crypto';
+
+// The one stack-name resolver every operator script uses. CommonJS, and ts-node runs this file as CommonJS.
+const { resolveStackPrefix, resolveInstanceName } = require('./lib/stack-lookup.cjs') as {
+  resolveStackPrefix: (env?: NodeJS.ProcessEnv) => string;
+  resolveInstanceName: (env?: NodeJS.ProcessEnv) => string;
+};
+// Sign in, then call the credential exchange: the one path that creates a person.
+const { signInAndExchange } = require('./lib/sign-in-exchange.cjs') as {
+  signInAndExchange: (args: Record<string, unknown>) => Promise<string>;
+};
+// Which administrator the e2e secret names, and the identity preconditions: pure rules, unit-tested in
+// test/provision-test-users-secret.test.ts.
+type SecretUser = { email: string; password?: string; tier?: string; userArn?: string };
+const { keptTestAdmin, identityPreconditionProblems } = require('./lib/test-user-secret.cjs') as {
+  keptTestAdmin: (existing: Record<string, unknown>, seededEmails: string[]) => SecretUser | null;
+  identityPreconditionProblems: (
+    users: { email: string; tier: string; groups: string[] }[],
+    admin: { email: string; groups: string[] } | null,
+  ) => string[];
+};
 // Demo (Stratum) personas. Their own module because seed-demo runs main() at import, so nothing can
 // read them from here without running the whole seeder - and they are the portable payload a profile
 // export carries to another instance.
-import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA } from '../demo/personas.js';
+import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA, OPS_PERSONA } from '../demo/personas.js';
 // Demo intent packs, same reason and same place as the personas above - and kept measurable, so a
 // pack that outgrows its parameter fails a unit test instead of a deploy's seed step.
-import { stratumIntentPack } from '../demo/intent-packs.js';
+import { stratumIntentPack, opsIntentPack, PREMIUM_REPORT_TEMPLATES } from '../demo/intent-packs.js';
+import { BASIC_ONBOARDING, STANDARD_ONBOARDING } from '../demo/onboarding.js';
+import { BASIC_BOUNDARY, STANDARD_BOUNDARY, PREMIUM_BOUNDARY, OPS_BOUNDARY } from '../demo/boundaries.js';
+import { OPS_WELCOME, ADVISOR_WELCOME } from '../demo/welcomes.js';
 
 const region = process.env.AWS_REGION || 'us-east-1';
+const DRY_RUN = process.argv.includes('--dry-run');
 const cognitoClient = new CognitoIdentityProviderClient({ region });
 const s3Client = new S3Client({ region });
 const cfnClient = new CloudFormationClient({ region });
 const smClient = new SecretsManagerClient({ region });
-const chimeIdentityClient = new ChimeSDKIdentityClient({ region });
 const ssmClient = new SSMClient({ region });
 
-// SSM root for this instance's params. MUST match the CDK's SSM_ROOT (agent-classification-common.ts:
-// `/${AE_INSTANCE_NAME || 'agent-echelon'}`) — the handler reads the welcome orientation from
+// SSM root for this instance's params. MUST match the CDK's SSM_ROOT (agent-classification-common.ts,
+// `/<instance>`), so it comes from the same instance resolver as every operator script - the handler reads the welcome orientation from
 // `${SSM_ROOT}/assistant/{tier}/welcome-orientation`, so a case/name mismatch means it never loads.
-const SSM_ROOT = `/${(process.env.AE_INSTANCE_NAME || 'agent-echelon').trim()}`;
+const SSM_ROOT = `/${resolveInstanceName(process.env)}`;
 
 /**
  * The demo-user password. Overridable via the `DEMO_PASSWORD` env var (set it to a known value if you
@@ -91,6 +117,9 @@ interface StackOutputs {
   userPoolId: string;
   bucketName: string;
   appInstanceArn: string;
+  /** The app client a demo user signs in with, and the exchange that makes them a person. */
+  clientId: string;
+  exchangeUrl: string;
   // Aurora mode only: the archive bucket whose `rag/` prefix the DocumentIngestion
   // Lambda watches. Company docs are seeded under `rag/company/{tier}/` here so
   // they are embedded and retrievable (ADR-017). Absent in Athena mode.
@@ -109,6 +138,7 @@ function isStackNotFound(error: unknown): boolean {
 
 async function getStackOutputs(): Promise<StackOutputs> {
   const outputs: Record<string, string> = {};
+  const prefix = resolveStackPrefix(process.env);
 
   // Read a stack's outputs into `outputs`. Returns true if the stack exists.
   // A genuine not-found is returned as false WITHOUT logging (the caller decides
@@ -127,20 +157,12 @@ async function getStackOutputs(): Promise<StackOutputs> {
     }
   };
 
-  // Always-present stacks (every deployment mode creates these).
-  for (const s of ['AgentEchelonCognitoAuth', 'AgentEchelonS3Storage', 'AgentEchelonChimeMessaging']) {
+  // The required core: every deployment creates these, the archive under one name in either mode.
+  for (const s of ['Identity', 'Conversations', 'Messaging', 'PersonApi'].map((n) => `${prefix}${n}`)) {
     await collect(s);
   }
-
-  // Analytics is deployed in exactly ONE mode — Aurora (`…AnalyticsAurora`) or
-  // Athena (`…Analytics`). Probe in order and stop at the first that exists; the
-  // OTHER is legitimately absent for this deployment, so we never log about it.
-  let analyticsFound = false;
-  for (const s of ['AgentEchelonAnalyticsAurora', 'AgentEchelonAnalytics']) {
-    if (await collect(s)) { analyticsFound = true; break; }
-  }
-  if (!analyticsFound) {
-    console.log('  (no analytics stack deployed — analytics outputs unavailable; continuing)');
+  if (!(await collect(`${prefix}Archive`))) {
+    console.log('  (no archive stack deployed — analytics outputs unavailable; continuing)');
   }
 
   const userPoolId = outputs['UserPoolId'];
@@ -150,23 +172,26 @@ async function getStackOutputs(): Promise<StackOutputs> {
   // an output logical-id rename.
   const appInstanceArn = outputs['AppInstanceArn'] || outputs['AppInstanceArnOutput'];
   const archiveBucketName = outputs['ArchiveBucketName']; // Aurora mode only
+  const clientId = outputs['UserPoolClientId'];
+  // The person credential exchange is a route on PersonApi, at its base URL.
+  const exchangeUrl = outputs['PersonApiUrl'];
 
-  if (!userPoolId || !bucketName || !appInstanceArn) {
-    console.error('Missing required stack outputs:', { userPoolId, bucketName, appInstanceArn });
+  if (!userPoolId || !bucketName || !appInstanceArn || !clientId || !exchangeUrl) {
+    console.error('Missing required stack outputs:', { userPoolId, bucketName, appInstanceArn, clientId, exchangeUrl });
     console.error('Available outputs:', outputs);
     throw new Error('Deploy the CDK stacks first (e.g. `npm run deploy`).');
   }
 
-  return { userPoolId, bucketName, appInstanceArn, archiveBucketName };
+  return { userPoolId, bucketName, appInstanceArn, clientId, exchangeUrl, archiveBucketName };
 }
 
 async function createDemoUser(
   userPoolId: string,
-  appInstanceArn: string,
+  login: { clientId: string; exchangeUrl: string },
   email: string,
   tier: string,
   displayName: string
-): Promise<void> {
+): Promise<string> {
   console.log(`  Creating user: ${email} (${tier})`);
 
   try {
@@ -228,9 +253,10 @@ async function createDemoUser(
   // Assign Cognito groups — the AUTHORITATIVE tier/admin signal (custom:tier
   // alone is not enough; router/handlers gate on group membership). Without
   // this the demo users have no effective tier and can't reach gated features.
-  // The premium persona doubles as the demo operator, so it also gets `admins`
-  // (it drives the admin console — experiments, /battle arming — in the demos).
-  const groups = tier === 'premium' ? [tier, 'admins'] : [tier];
+  // Each persona gets its tier group alone: none of them is an administrator. The admin console is
+  // driven by a dedicated identity (`testAdmin` from provision-test-users for the e2e, `demoAdmin` from
+  // the demo cast for a presenter), and validateIdentity below refuses a persona that holds `admins`.
+  const groups = [tier];
   for (const group of groups) {
     try {
       await cognitoClient.send(
@@ -242,42 +268,57 @@ async function createDemoUser(
   }
   console.log(`  ✓ ${email} groups: ${groups.join(', ')}`);
 
-  // Chime AppInstanceUser — the messaging identity. Admin-created + admin-set-password users do NOT
-  // fire the Cognito post-confirmation trigger that provisions this for a normal sign-up, so without
-  // it the user has a valid login but no messaging identity: the app connects, fails to open a Chime
-  // session, and sits on "Reconnecting…". Create it here (mirrors provision-admin.mjs). Idempotent.
+  // THE PERSON: signed in through the credential exchange, which mints their AppInstanceUser (an opaque
+  // UUID v7 id) on the first run and resolves the same one on every run after. This script never creates
+  // an AppInstanceUser itself, and never prints the password.
   try {
-    const got = await cognitoClient.send(new AdminGetUserCommand({ UserPoolId: userPoolId, Username: email }));
-    const sub = got.UserAttributes?.find((a) => a.Name === 'sub')?.Value;
-    if (sub) {
-      await chimeIdentityClient.send(
-        new CreateAppInstanceUserCommand({ AppInstanceArn: appInstanceArn, AppInstanceUserId: sub, Name: email }),
-      );
-      console.log(`  ✓ ${email} Chime AppInstanceUser created (${sub})`);
-    }
+    const userArn = await signInAndExchange({
+      cognito: cognitoClient, InitiateAuthCommand, clientId: login.clientId, exchangeUrl: login.exchangeUrl,
+      email, password: DEMO_PASSWORD,
+    });
+    console.log(`  ✓ ${email} person ${userArn}`);
+    return userArn;
   } catch (err: any) {
-    if (err?.name === 'ConflictException') {
-      console.log(`  - ${email} Chime AppInstanceUser already exists`);
-    } else {
-      console.warn(`  ! could not create Chime AppInstanceUser for ${email}: ${err?.name || err}`);
-    }
+    console.error(`  ✗ ${email} could not sign in through the credential exchange: ${err?.message || err}`);
+    return '';
   }
 }
 
 /**
+ * THE DOMAIN THE DEMO USERS' ADDRESSES ARE ON. These users are also the e2e's basic, standard and
+ * premium users (the secret below is re-pointed at them), so when provisioning recorded a test inbox,
+ * they have to be on its domain or no notification to them can be read back: the delivery checks then
+ * fail on users the seed itself moved off the inbox. TEST_EMAIL_DOMAIN wins, as it does at provisioning.
+ */
+async function demoEmailDomain(): Promise<string> {
+  const declared = (process.env.TEST_EMAIL_DOMAIN || '').trim().toLowerCase();
+  if (declared) return declared;
+  try {
+    const current = await smClient.send(new GetSecretValueCommand({ SecretId: TEST_SECRET_NAME }));
+    const inbox = (JSON.parse(current.SecretString || '{}') as { testInbox?: { domain?: string } }).testInbox;
+    if (inbox?.domain) return inbox.domain.trim().toLowerCase();
+  } catch {
+    // No secret yet: no inbox was recorded, so nothing has to be read back.
+  }
+  return 'stratum.example.com';
+}
+
+/**
  * Sync the e2e test-credentials secret with the users this seed just provisioned + the live pool.
- * testAdmin maps to the premium demo user (createDemoUser also puts it in the `admins` group).
+ * Returns the administrator the secret names after the write, or null when it names none.
  */
 async function writeTestCredentialsSecret(
   userPoolId: string,
-  users: { email: string; tier: string }[],
-): Promise<void> {
-  const clients = await cognitoClient.send(
-    new ListUserPoolClientsCommand({ UserPoolId: userPoolId, MaxResults: 10 }),
-  );
-  const clientId = clients.UserPoolClients?.[0]?.ClientId || '';
-  const emailFor = (t: string) => users.find((u) => u.tier === t)?.email || '';
-  const u = (tier: string) => ({ email: emailFor(tier), password: DEMO_PASSWORD, tier });
+  clientId: string,
+  users: { email: string; tier: string; userArn: string }[],
+): Promise<SecretUser | null> {
+  // The chat app client the users just signed in with (Identity `UserPoolClientId`), not the first
+  // client the pool lists: a pool publishes the admin client too, and tokens for the wrong audience fail
+  // at the API.
+  const u = (tier: string) => {
+    const user = users.find((x) => x.tier === tier);
+    return { email: user?.email || '', password: DEMO_PASSWORD, tier, ...(user?.userArn ? { userArn: user.userArn } : {}) };
+  };
 
   // MERGE onto whatever is already there, rather than replacing it.
   //
@@ -289,8 +330,10 @@ async function writeTestCredentialsSecret(
   // run itself had just deleted - and it only happened inside a full sweep, because running those
   // suites alone never triggers a seed.
   //
-  // The seeder owns the four demo users and the pool/client ids. Anything else in the secret belongs
-  // to whoever put it there.
+  // The seeder owns the three demo users and the pool/client ids. Anything else in the secret belongs
+  // to whoever put it there, `testAdmin` included: provision-test-users provisions it as a dedicated
+  // account in `admins`. An entry naming one of the seed's own users is dropped, because none of them
+  // is an administrator, and validateIdentity then says how to provision the real one.
   let existing: Record<string, unknown> = {};
   try {
     const current = await smClient.send(new GetSecretValueCommand({ SecretId: TEST_SECRET_NAME }));
@@ -299,15 +342,17 @@ async function writeTestCredentialsSecret(
     // No secret yet, or unreadable — the create path below writes a fresh one.
   }
 
-  const payload = {
+  const testAdmin = keptTestAdmin(existing, users.map((x) => x.email));
+  const payload: Record<string, unknown> = {
     ...existing,
-    testAdmin: u('premium'), // the premium demo user is also in the `admins` group
     basicUser: u('basic'),
     standardUser: u('standard'),
     premiumUser: u('premium'),
     cognitoUserPoolId: userPoolId,
     cognitoClientId: clientId,
   };
+  if (testAdmin) payload.testAdmin = testAdmin;
+  else delete payload.testAdmin;
   const SecretString = JSON.stringify(payload);
   try {
     await smClient.send(new PutSecretValueCommand({ SecretId: TEST_SECRET_NAME, SecretString }));
@@ -319,6 +364,10 @@ async function writeTestCredentialsSecret(
     }
   }
   console.log(`  ✓ wrote ${TEST_SECRET_NAME} (pool ${userPoolId}, client ${clientId || 'NONE'})`);
+  console.log(testAdmin
+    ? `  ✓ testAdmin kept: ${testAdmin.email}`
+    : `  ! testAdmin: none (the secret named no dedicated administrator); run \`npm run provision-test-users -- --only testAdmin\``);
+  return testAdmin;
 }
 
 // Per-tier welcome orientation — the config-driven copy the assistant opens a NEW conversation with
@@ -355,7 +404,9 @@ const WELCOME_ORIENTATION: Record<'basic' | 'standard' | 'premium', unknown> = {
   premium: {
     companyName: 'Stratum Technologies',
     companyBlurb: STRATUM_BLURB,
-    accessBlurb: 'You have leadership access: financials, team metrics, customer accounts, the board summary, and competitive intel.',
+    // WHAT IS REACHABLE, NOT WHO IS ASKING. A classification is a set of grants (ADR-046); "leadership
+    // access" named an audience and read as though premium were an org level.
+    accessBlurb: 'You have full internal access: financials, team metrics, customer accounts, the board summary, and competitive intel.',
     examples: [
       // This example used to grade the answer in advance, in the one place a person reads before they
       // have seen any output: the suggested prompts. The assistant writes a structured, grounded
@@ -461,19 +512,41 @@ async function writeStandardAssistantConfig(): Promise<void> {
 }
 
 /**
- * Seed the per-tier Stratum intent pack (SSM), write-if-absent. Each classification stack that carries
+ * Seed the per-tier Stratum intent pack (S3 body plus SSM pointer), write-if-absent. Each classification stack that carries
  * `intentPackParam: true` (basic, standard, premium) reads its own
  * `${SSM_ROOT}/assistant/{tier}/assistant-intent-pack`; absent ⇒ the platform DEFAULT pack. Seeding the
  * Stratum pack here makes the demo's admin console show domain intents (financial_metric, account_status,
  * directory_lookup, …) instead of an all-`general` breakdown. Write-if-absent, so an operator's
  * `-c assistantIntentPack` is never clobbered. NOTE: premium only reads this once its classification
- * stack is deployed with `intentPackParam: true` (premium-classification-stack.ts) — a redeploy, not just
+ * stack is deployed with `intentPackParam: true` (its topology in lib/config/profiles.ts) — a redeploy, not just
  * a re-seed, is required for premium to pick up its pack.
  */
-async function writeStratumIntentPacks(): Promise<void> {
+/**
+ * The templates premium's report workflow offers a choice of (`PREMIUM_REPORT_TEMPLATES`, declared on the
+ * workflow in its pack), stored for premium and activated where no version is active yet, so a re-seed
+ * never moves a version an operator activated. The platform's own `report` template is the deploy's to
+ * write, for every classification whose workflows declare it.
+ */
+async function writeExampleTemplates(bucketName: string): Promise<void> {
+  const deps = { s3: s3Client, ssm: ssmClient, bucket: bucketName, ssmRoot: SSM_ROOT };
+  for (const name of PREMIUM_REPORT_TEMPLATES) {
+    const source = fs.readFileSync(path.join(__dirname, '..', 'demo', 'templates', `${name}.md`), 'utf8');
+    const put = await putTemplate('premium', source, deps);
+    const pointer = await readTemplatePointer('premium', put.name, deps);
+    if (!pointer) await activateTemplate('premium', put.name, put.contentHash, deps);
+    console.log(`  ✓ premium template ${put.name} ${put.contentHash.slice(0, 12)}`
+      + (pointer ? ` stored; ${pointer.active.slice(0, 12)} stays active` : ' stored and active'));
+  }
+}
+
+async function writeStratumIntentPacks(bucketName: string): Promise<void> {
   for (const tier of ['basic', 'standard', 'premium'] as const) {
-    const name = `${SSM_ROOT}/assistant/${tier}/assistant-intent-pack`;
-    await putParamIfAbsent(name, JSON.stringify(stratumIntentPack(tier)), `${tier} intent pack`);
+    // The body to `classification-packs/{tier}/...` in the attachments bucket, then the pointer to the
+    // parameter (`writeClassificationPack`), so the pack's size is not the parameter's value limit.
+    const wrote = await writeClassificationPack(
+      ssmClient, SSM_ROOT, tier, JSON.stringify(stratumIntentPack(tier)), { s3: s3Client, bucket: bucketName }, { ifAbsent: true },
+    );
+    console.log(wrote ? `  ✓ ${tier} intent pack → s3://${bucketName}/classification-packs/${tier}/` : `  - ${tier} intent pack already set - leaving it`);
   }
 }
 
@@ -594,32 +667,43 @@ async function uploadCompanyRag(archiveBucketName: string): Promise<void> {
  * tier/admin signal (router + handlers gate on it, not on custom:tier). The `admins`
  * group is also the precondition for the two-plane admin identity: on an
  * identity:'admin' request the credential exchange vends the caller's own
- * `${sub}-admin` app-instance-admin (provisioned on first vend). This asserts each
- * demo user has the right groups; the full chat-vs-admin plane vend is exercised e2e
- * by credential-exchange.spec.ts. Throws (fails the seed) on any mismatch.
+ * `<personId>-admin` app-instance-admin (provisioned on first vend). This asserts each
+ * demo user holds its tier group and NOT `admins`, and that the administrator the e2e
+ * secret names (`testAdmin`, a dedicated account) holds `admins`; the full chat-vs-admin
+ * plane vend is exercised e2e by credential-exchange.spec.ts. Throws (fails the seed)
+ * on any mismatch.
  */
 async function validateIdentity(
   userPoolId: string,
   users: { email: string; tier: string }[],
+  admin: SecretUser | null,
 ): Promise<void> {
-  let failures = 0;
+  const groupsOf = async (email: string): Promise<string[]> => {
+    try {
+      const res = await cognitoClient.send(new AdminListGroupsForUserCommand({ UserPoolId: userPoolId, Username: email }));
+      return (res.Groups || []).map((g) => g.GroupName || '');
+    } catch (err: any) {
+      if (err?.name === 'UserNotFoundException') return [];
+      throw err;
+    }
+  };
+  const seeded: { email: string; tier: string; groups: string[] }[] = [];
   for (const user of users) {
-    const res = await cognitoClient.send(
-      new AdminListGroupsForUserCommand({ UserPoolId: userPoolId, Username: user.email }),
-    );
-    const groups = (res.Groups || []).map((g) => g.GroupName || '');
-    const hasTier = groups.includes(user.tier);
-    const expectAdmin = user.tier === 'premium';
-    const hasAdmin = groups.includes('admins');
-    const ok = hasTier && (!expectAdmin || hasAdmin);
-    console.log(`  ${ok ? '✓' : '✗'} ${user.email}: [${groups.join(', ')}]${expectAdmin ? ` (admin: ${hasAdmin})` : ''}`);
-    if (!hasTier) { console.error(`    MISSING tier group '${user.tier}'`); failures++; }
-    if (expectAdmin && !hasAdmin) { console.error(`    MISSING 'admins' group (premium is the demo admin)`); failures++; }
+    const groups = await groupsOf(user.email);
+    console.log(`  ${user.email}: [${groups.join(', ')}]`);
+    seeded.push({ email: user.email, tier: user.tier, groups });
   }
-  if (failures > 0) {
-    throw new Error(`Identity validation failed: ${failures} issue(s). Check the group assignments and re-run.`);
+  let adminGroups: { email: string; groups: string[] } | null = null;
+  if (admin?.email) {
+    adminGroups = { email: admin.email, groups: await groupsOf(admin.email) };
+    console.log(`  ${admin.email} (testAdmin): [${adminGroups.groups.join(', ')}]`);
   }
-  console.log('  ✓ identity preconditions OK (tier groups present; premium holds admins)');
+  const problems = identityPreconditionProblems(seeded, adminGroups);
+  for (const p of problems) console.error(`  ✗ ${p}`);
+  if (problems.length > 0) {
+    throw new Error(`Identity validation failed: ${problems.length} issue(s). Check the group assignments and re-run.`);
+  }
+  console.log('  ✓ identity preconditions OK (tier groups present; no seeded identity holds admins; testAdmin does)');
 }
 
 async function main(): Promise<void> {
@@ -631,7 +715,7 @@ async function main(): Promise<void> {
 
   // Step 1: Get stack outputs
   console.log('Step 1: Reading CDK stack outputs...');
-  const { userPoolId, bucketName, appInstanceArn, archiveBucketName } = await getStackOutputs();
+  const { userPoolId, bucketName, appInstanceArn, clientId, exchangeUrl, archiveBucketName } = await getStackOutputs();
   console.log(`  ✓ User Pool: ${userPoolId}`);
   console.log(`  ✓ S3 Bucket: ${bucketName}`);
   console.log(`  ✓ App Instance: ${appInstanceArn}`);
@@ -640,21 +724,29 @@ async function main(): Promise<void> {
 
   // Step 2: Create demo users
   console.log('Step 2: Creating demo users...');
+  const domain = await demoEmailDomain();
+  console.log(`  addresses on ${domain}`);
   const users = [
-    { email: 'basic@stratum.example.com', tier: 'basic', name: 'Demo Basic' },
-    { email: 'standard@stratum.example.com', tier: 'standard', name: 'Demo Standard' },
-    { email: 'premium@stratum.example.com', tier: 'premium', name: 'Demo Premium' },
+    { email: `basic@${domain}`, tier: 'basic', name: 'Demo Basic' },
+    { email: `standard@${domain}`, tier: 'standard', name: 'Demo Standard' },
+    { email: `premium@${domain}`, tier: 'premium', name: 'Demo Premium' },
   ];
 
+  const people: { email: string; tier: string; userArn: string }[] = [];
   for (const user of users) {
-    await createDemoUser(userPoolId, appInstanceArn, user.email, user.tier, user.name);
+    people.push({ ...user, userArn: await createDemoUser(userPoolId, { clientId, exchangeUrl }, user.email, user.tier, user.name) });
   }
   console.log('');
 
   // Step 2b: keep the e2e test-credentials secret in sync with these users + this pool, so the
-  // Playwright suite (which reads the secret) can actually sign in after a fresh deploy.
+  // Playwright suite (which reads the secret) can actually sign in after a fresh deploy. Written before
+  // the person check below, so the secret always holds the password the users now have.
   console.log('Step 2b: Syncing e2e test-credentials secret...');
-  await writeTestCredentialsSecret(userPoolId, users);
+  const testAdmin = await writeTestCredentialsSecret(userPoolId, clientId, people);
+  const unnamed = people.filter((p) => !p.userArn).map((p) => p.email);
+  if (unnamed.length) {
+    throw new Error(`the credential exchange named no person for ${unnamed.join(', ')}; the e2e acts as the person the exchange names, so fix the exchange and re-run`);
+  }
   console.log('');
 
   // Step 2c: per-tier welcome orientation (what a first-time user sees + can try).
@@ -679,8 +771,38 @@ async function main(): Promise<void> {
   // breakdown. Inline intents deliver in one turn (PLACEHOLDER_UPDATE) per ADR-018; the DEFAULT task
   // intents are kept so multi-step flows are unchanged. Write-if-absent. (Premium needs its stack
   // deployed with intentPackParam: true to read its pack — a redeploy, not just a re-seed.)
-  console.log('Step 2c-iii: Writing per-tier Stratum intent packs to SSM...');
-  await writeStratumIntentPacks();
+  // NOT WRITTEN ANY MORE, and the omission is the point. The pack now rides each profile's VERSION
+  // (step 2d below), which is the source of truth for the taxonomy. Writing the per-classification
+  // parameter as well would be two answers to one question (tenet D7) that drift the moment either is
+  // edited, and the parameter is the one an operator cannot version, roll back or export.
+  //
+  // It also does not FIT: a materialized premium pack is 5208 characters against that parameter's 4096,
+  // because a profile now declares its whole taxonomy rather than inheriting the platform set. On the
+  // version that is not a constraint - the pack is offloaded to S3 as a body (`intentPackRef`).
+  //
+  // The parameter remains a supported seam, read when a version carries no pack of its own, and it is the
+  // only place a classification's MACHINES live: a version does not read `machines`. The one demo
+  // classification that redeclares a workflow is premium (its report's choice of templates), so step
+  // 2c-iv writes premium's pack there. `writeStratumIntentPacks` is kept and still exercised by the
+  // budget test.
+  console.log('');
+
+  // Step 2c-iv: the document templates premium's report workflow offers (SPEC-DOCUMENT-TEMPLATES FR3a),
+  // stored for premium and made active when no version is. Premium's pack redeclares `report_generation`
+  // with `templates` on its delivering states, so the person chooses between a quarterly account review
+  // and a one-page executive summary; every other classification's reports follow the platform's
+  // `report` template, which the deploy writes (HOW-TO-ADD-OR-MANAGE-A-PROFILE, "Document templates").
+  console.log('Step 2c-iv: Storing the premium report templates...');
+  await writeExampleTemplates(bucketName);
+  // The workflow that offers them, on the parameter a classification's machines are read from. The same
+  // pack the version carries, so the two cannot disagree about the taxonomy. Write-if-absent, so an
+  // operator's `-c assistantIntentPack` is never clobbered.
+  const wrotePremiumPack = await writeClassificationPack(
+    ssmClient, SSM_ROOT, 'premium', JSON.stringify(stratumIntentPack('premium')), { s3: s3Client, bucket: bucketName }, { ifAbsent: true },
+  );
+  console.log(wrotePremiumPack
+    ? `  ✓ premium intent pack (its report workflow's template choice) → s3://${bucketName}/classification-packs/premium/`
+    : '  - premium intent pack already set - leaving it');
   console.log('');
 
   // Step 2d: seed each profile's ACTIVE version (SPEC-PORTABLE-PROFILES P0). Writes the
@@ -697,11 +819,54 @@ async function main(): Promise<void> {
   // `profiles/{name}/{configId}/persona` and the parameter carries a pointer. Resolved from the stack
   // outputs rather than an env var: this runs as an operator script, not in a Lambda, so there is no
   // PROFILE_BODY_BUCKET/CONTEXT_BUCKET in its environment to fall back to.
+  // The intent pack is folded in the same way, and it matters more here than the persona does: the
+  // `assistant-intent-pack` parameter above is write-if-absent and its CDK writer only exists under
+  // `-c assistantIntentPack`, so on a deployment that passes neither, editing `stratumIntentPack()` in
+  // code can never reach SSM. On the version it can, and it converges within the profile cache TTL.
   for (const r of await seedAllProfileDefinitions(ssmClient, SSM_ROOT, {
-    basic: BASIC_PERSONA,
-    standard: STANDARD_PERSONA,
-    premium: PREMIUM_PERSONA,
-  }, { bucket: bucketName })) {
+    concierge: BASIC_PERSONA,
+    analyst: STANDARD_PERSONA,
+    advisor: PREMIUM_PERSONA,
+    // THE `ops` ROLE'S ASSISTANT, keyed by profile name like every other entry here - which is the only
+    // way it CAN be keyed: it is a second assistant inside `premium`, so there is no classification to
+    // hang it on. Without these two entries it had an identity, a Lex bot and an assignment record, and answered in
+    // premium's built-in tier voice with premium's taxonomy (see demo/personas.ts OPS_PERSONA).
+    'ops-premium': OPS_PERSONA,
+  }, { bucket: bucketName }, {
+    concierge: stratumIntentPack('basic'),
+    analyst: stratumIntentPack('standard'),
+    advisor: stratumIntentPack('premium'),
+    'ops-premium': opsIntentPack(),
+  }, {
+    // The assistant's opening differs by what the assistant can reach - see demo/onboarding.ts. Seeded
+    // onto the version for the same reason the pack is: the per-deployment parameter is one config for
+    // every assistant, so it could only ever make them introduce themselves identically.
+    concierge: BASIC_ONBOARDING,
+    analyst: STANDARD_ONBOARDING,
+    // Advisor carries no intake: its welcome opens with no onboarding question.
+    // PREMIUM_ONBOARDING stays authored in demo/onboarding.ts for when premium onboarding returns.
+  }, {
+    // What each assistant does NOT reach. Authored rather than derived: a pack says what an assistant
+    // recognizes and nothing about what it does not, so absence has no phrase to assemble from.
+    concierge: BASIC_BOUNDARY,
+    analyst: STANDARD_BOUNDARY,
+    advisor: PREMIUM_BOUNDARY,
+    // The ops role's assistant, which was missing from this map and from the onboarding one above while
+    // it had a persona and a pack - so it could say what it recognizes and not what it cannot reach.
+    'ops-premium': OPS_BOUNDARY,
+  }, {
+    // WELCOME WORKFLOWS (W1), and only for the assistants that need their own.
+    //
+    // The three primaries' ordinary openings are their classification's parameter, seeded above; a copy here
+    // would be two sources for one sentence. 'ops-premium' is the case this map exists for: the premium
+    // parameter is the ADVISOR's copy, so before this the ops assistant opened by introducing itself as
+    // the Stratum leadership assistant and offering to compile ARR reports, one second after the primary
+    // had said the same words. show-ops-rollout.mjs reports the cause in its own output.
+    // The premium PRIMARY gets welcomes for the ops rooms ONLY - none for an ordinary room, so its
+    // normal opening stays the classification parameter that was written for it.
+    advisor: ADVISOR_WELCOME,
+    'ops-premium': OPS_WELCOME,
+  })) {
     console.log(`  ✓ ${r.profileName} definition v${r.version} labeled active`);
   }
   console.log('');
@@ -732,7 +897,7 @@ async function main(): Promise<void> {
   // Step 4: Validate identity preconditions (belt-and-suspenders; the full
   // chat-vs-admin plane vend is exercised e2e by credential-exchange.spec.ts).
   console.log('Step 4: Validating identity...');
-  await validateIdentity(userPoolId, users);
+  await validateIdentity(userPoolId, users, testAdmin);
   console.log('');
 
   // Done
@@ -753,7 +918,23 @@ async function main(): Promise<void> {
   console.log('');
 }
 
-main().catch((error) => {
-  console.error('Seed script failed:', error);
-  process.exit(1);
-});
+/** What a run would do, from the environment alone. No AWS call is made. */
+function printDryRun(): void {
+  const prefix = resolveStackPrefix(process.env);
+  console.log('seed-demo --dry-run (no AWS call is made, nothing is changed)');
+  console.log(`  instance        ${resolveInstanceName(process.env)} (SSM root ${SSM_ROOT})`);
+  console.log(`  reads outputs   ${prefix}Identity, ${prefix}Conversations, ${prefix}Messaging and ${prefix}Archive`);
+  console.log('  users           basic@, standard@, premium@ the demo domain (each in its tier group only, none in admins), each signed in through the credential exchange');
+  console.log(`  writes secret   ${TEST_SECRET_NAME}: basicUser, standardUser, premiumUser with each userArn, merged; testAdmin kept from provision-test-users`);
+  console.log(`  writes SSM      welcome orientation, onboarding intake, the standard persona (if absent), each profile's active definition`);
+  console.log('  uploads         classification context files, and the company RAG corpus in Aurora mode');
+}
+
+if (DRY_RUN) {
+  printDryRun();
+} else {
+  main().catch((error) => {
+    console.error('Seed script failed:', error);
+    process.exit(1);
+  });
+}

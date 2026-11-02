@@ -1,5 +1,5 @@
 /**
- * A migration's DATA step must have a ceiling, and a migration that cannot finish in one go must be
+ * A migration's DATA step must have a bound, and a migration that cannot finish in one go must be
  * able to resume.
  *
  * THE DEFECT THIS PINS. `applyPendingMigrations` runs every pending `schema/*.sql` file AND the
@@ -41,7 +41,7 @@ const EXEMPT: Record<string, string> = {
   '021-embeddings-classification-column.sql':
     'Its predicate requires the `classification` key AND a NULL column. The only producer of that pair '
     + 'is 020, which is bounded to one batch and runs immediately before it in the same transaction; '
-    + 'document-ingestion writes the key and the column together and produces none. The ceiling is '
+    + 'document-ingestion writes the key and the column together and produces none. The bound is '
     + "020's batch.",
 };
 

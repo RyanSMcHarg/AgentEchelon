@@ -7,41 +7,15 @@
  * assertion the battle e2e made was satisfied by a dead side, and the experiment recorded a loss
  * against a model that never ran.
  *
- * The cause is fixed (ADR-027 part 4). This pins the two things that keep a recurrence loud:
- * the predicate that recognises a block reply, and the fact that the e2e's copy of the pattern still
+ * The cause is fixed (ADR-027 part 4). This pins what keeps a recurrence loud: the block travels as a
+ * structural flag rather than being recognized from its text, and the e2e's copy of the pattern still
  * matches the message the backend actually posts.
  */
 import * as fs from 'fs';
 import * as path from 'path';
-import {
-  GUARDRAIL_BLOCK_FALLBACK,
-  isGuardrailBlockReply,
-} from '../../lambda/src/lib/async-processor-core';
+import { GUARDRAIL_BLOCK_FALLBACK } from '../../lambda/src/lib/async-processor-core';
 
 const BATTLE_SPEC = path.resolve(__dirname, '..', '..', '..', 'tests', 'e2e', 'battle.spec.ts');
-
-describe('isGuardrailBlockReply', () => {
-  it('recognises the exact reply a blocked side posts', () => {
-    expect(isGuardrailBlockReply(GUARDRAIL_BLOCK_FALLBACK)).toBe(true);
-  });
-
-  it('recognises it after the transport trims or truncates it', () => {
-    // What was actually observed live was a truncated render: "I cannot process that request. Please re…"
-    expect(isGuardrailBlockReply('  I cannot process that request. Please re')).toBe(true);
-  });
-
-  it('does NOT fire on an answer that happens to discuss processing', () => {
-    // A keyword search would have failed here, which is why this is a prefix test.
-    expect(isGuardrailBlockReply(
-      'Spaces - and specifically 4 of them. Some build systems cannot process tabs consistently.',
-    )).toBe(false);
-  });
-
-  it('does not fire on an empty reply (that is a different defect, and it has its own guard)', () => {
-    expect(isGuardrailBlockReply('')).toBe(false);
-    expect(isGuardrailBlockReply('   ')).toBe(false);
-  });
-});
 
 describe('the e2e guard still matches what the backend posts', () => {
   it('battle.spec.ts holds a pattern, and the real block message matches it', () => {
@@ -58,22 +32,24 @@ describe('the e2e guard still matches what the backend posts', () => {
 });
 
 describe('the block is a STRUCTURAL fact, not a text shape', () => {
-  // The prefix test above guards only the default deployment: `applyInputGuardrail` returns the
+  // A text prefix would guard only the default deployment: `applyInputGuardrail` returns the
   // guardrail's own masked copy when one is configured (`masked || GUARDRAIL_BLOCK_FALLBACK`), and
   // custom blockedInputMessaging - the normal enterprise case - never matches the English prefix.
   // The structural fact therefore rides the invoke result and lands in the analytics metadata, so
-  // no consumer has to recognise deployment-specific copy by shape.
+  // no consumer has to recognize deployment-specific copy by shape.
   const read = (rel: string) =>
     fs.readFileSync(path.join(__dirname, '..', '..', 'lambda', 'src', rel), 'utf8');
 
   it('the blocked early-return declares itself on the result', () => {
-    expect(read('lib/async-processor-core.ts')).toMatch(/steps, inputGuardBlocked: true \};/);
+    // The FLAG on the early return, not the punctuation after it. Pinning `inputGuardBlocked: true };`
+    // pinned the field's position in the literal as well as its presence, so adding the findings
+    // beside it - which is the same fact told in more detail - read as the flag being removed.
+    expect(read('lib/async-processor-core.ts')).toMatch(/steps, inputGuardBlocked: true[,}]/);
   });
 
   it('the processor forwards the fact into finalize, never re-deriving it from text', () => {
     const processor = read('assistant-async-processor.ts');
     expect(processor).toMatch(/guardrailBlocked: bedrockResult\.inputGuardBlocked/);
-    expect(processor).not.toMatch(/isGuardrailBlockReply/);
   });
 
   it('the metadata stamps it, so archival and the battle reads can see a dead side', () => {
@@ -90,9 +66,13 @@ describe('the block is a STRUCTURAL fact, not a text shape', () => {
     // Scanned rather than named, so a THIRD provider path added later is held to the same rule instead
     // of inheriting the omission silently. The block copy is deployment-specific
     // (`blockedInputMessaging`), so nothing downstream can recover the fact from the text.
+    // The bound is generous and the match is LAZY, so it still stops at the first `};` and cannot run
+    // past the object. It was 800, which silently stopped finding the external path once that result
+    // grew - a scan that finds one path instead of two reports "every path declares it" while looking
+    // at half of them, which is the vacuous pass the length assertion below exists to catch.
     const files = ['lib/async-processor-core.ts', 'assistant-async-processor.ts'];
     const blockResults = files.flatMap((f) =>
-      (read(f).match(/response: [A-Za-z]*[Gg]uard[A-Za-z]*\.message[\s\S]{0,800}?\};/g) ?? [])
+      (read(f).match(/response: [A-Za-z]*[Gg]uard[A-Za-z]*\.message[\s\S]{0,3000}?\};/g) ?? [])
         .map((body) => ({ f, body })),
     );
     // A zero-match scan would pass vacuously, which is the failure mode this line exists to stop.

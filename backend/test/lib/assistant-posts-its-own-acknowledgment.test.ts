@@ -2,9 +2,9 @@
  * The assistant posts its own acknowledgment on a bypass (ADR-025).
  *
  * THE PROPERTY. The turn resolves what the acknowledgment SAYS from its profile version
- * (`getQuickResponse` / `getTaskPlaceholder`), so the turn is what should say it. Before this the
+ * (`quickReply` / `getTaskPlaceholder`), so the turn is what should say it. Before this the
  * words were authored in the handler and the ACT was performed elsewhere - by Amazon Chime SDK on the
- * Lex path, by the channel flow on a bypass - which is one profile-resolved behaviour reaching the
+ * Lex path, by the channel flow on a bypass - which is one profile-resolved behavior reaching the
  * channel by two routes.
  *
  * WHAT IS NOT CLAIMED, and is asserted here so it is not re-argued as a cleanup: this buys nothing for
@@ -19,6 +19,12 @@ const mockChimeSend = jest.fn();
 const mockLambdaSend = jest.fn();
 const mockSsmSend = jest.fn();
 
+// The abuse gate admits: this file is not about the gate, which fails closed with no control table
+// (`abuse-controls.test.ts` pins that) and would refuse every turn here before the behavior under test.
+jest.mock('../../lambda/src/lib/abuse-controls.js', () => ({
+  ...jest.requireActual('../../lambda/src/lib/abuse-controls.js'),
+  evaluateAbuseGate: async () => ({ allowed: true }),
+}), { virtual: true });
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn().mockImplementation(() => ({ send: mockChimeSend })),
   SendChannelMessageCommand: jest.fn().mockImplementation((args) => ({ __type: 'SendMessage', input: args })),
@@ -38,6 +44,7 @@ jest.mock('@aws-sdk/client-lambda', () => ({
 jest.mock('@aws-sdk/client-ssm', () => ({
   SSMClient: jest.fn().mockImplementation(() => ({ send: mockSsmSend })),
   GetParameterCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetParam', input: args })),
+  GetParametersByPathCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetByPath', input: args })),
 }), { virtual: true });
 
 // Stub only the billed model call, exactly as `all-mention-single-path.test.ts` does. Replacing the
@@ -68,7 +75,16 @@ describe('a bypass turn posts its own message', () => {
   beforeEach(async () => {
     jest.resetModules();
     jest.clearAllMocks();
-    mockSsmSend.mockResolvedValue({ Parameter: { Value: BOT } });
+    // THE ROUTER IS DEPLOYED AS A CLASSIFICATION. Unset, it falls through to reading the channel tag,
+    // which this fixture does not stamp - and an unreadable tag is now refused rather than resolved
+    // to a floor (ADR-045 decision 2, ADR-046). Stating it here is what the deployment states.
+    process.env.CLASSIFICATION = 'premium';
+    // The bot parameter, and the assignment record naming the assistant on that bot: the router
+    // resolves the turn's assistant from it and declines a turn whose assistant it cannot name.
+    mockSsmSend.mockResolvedValue({
+      Parameter: { Value: BOT },
+      Parameters: [{ Value: JSON.stringify({ botArn: BOT, assistant: 'advisor', role: 'primary', occupancy: 'live' }) }],
+    });
     mockChimeSend.mockResolvedValue({ MessageId: 'posted-1' });
     ({ handler } = await import('../../lambda/src/router-agent-handler.js'));
   });
@@ -117,8 +133,8 @@ describe('a bypass turn posts its own message', () => {
     // a real message. `isSanctionedBattleBot` rejects it and the turn falls back to its own bot.
     const IMPOSTOR = 'arn:aws:chime:us-east-1:111122223333:app-instance/abc/bot/not-mine';
     mockSsmSend.mockImplementation(async (cmd: { input?: { Name?: string } }) => {
-      // The alt-slot roster is what sanctions an alternate identity; an empty roster sanctions none.
-      if ((cmd?.input?.Name || '').includes('alt-bot-slots')) return { Parameter: { Value: '[]' } };
+      // The assignment records are what sanction an alternate identity; none names this one.
+      if ((cmd as { __type?: string })?.__type === 'GetByPath') return { Parameters: [] };
       return { Parameter: { Value: BOT } };
     });
 
@@ -167,7 +183,16 @@ describe('the Lex path is untouched', () => {
   beforeEach(async () => {
     jest.resetModules();
     jest.clearAllMocks();
-    mockSsmSend.mockResolvedValue({ Parameter: { Value: BOT } });
+    // THE ROUTER IS DEPLOYED AS A CLASSIFICATION. Unset, it falls through to reading the channel tag,
+    // which this fixture does not stamp - and an unreadable tag is now refused rather than resolved
+    // to a floor (ADR-045 decision 2, ADR-046). Stating it here is what the deployment states.
+    process.env.CLASSIFICATION = 'premium';
+    // The bot parameter, and the assignment record naming the assistant on that bot: the router
+    // resolves the turn's assistant from it and declines a turn whose assistant it cannot name.
+    mockSsmSend.mockResolvedValue({
+      Parameter: { Value: BOT },
+      Parameters: [{ Value: JSON.stringify({ botArn: BOT, assistant: 'advisor', role: 'primary', occupancy: 'live' }) }],
+    });
     mockChimeSend.mockResolvedValue({ MessageId: 'posted-1' });
     ({ handler } = await import('../../lambda/src/router-agent-handler.js'));
   });
@@ -180,10 +205,12 @@ describe('the Lex path is untouched', () => {
 
   it('returns the message for Chime to materialise, and sends nothing itself', async () => {
     // THE HALF MOST LIKELY TO BREAK. Nothing else can produce the Lex path's message: if the turn
-    // posted here too, Chime would materialise a SECOND message from the same return.
+    // posted here too, Chime would materialize a SECOND message from the same return.
     const res = await handler(lex('what is the billing policy?'));
 
     expect(res.messages?.[0]?.content).toBeTruthy();
     expect(sends()).toHaveLength(0);
   });
 });
+
+afterAll(() => { delete process.env.CLASSIFICATION; });

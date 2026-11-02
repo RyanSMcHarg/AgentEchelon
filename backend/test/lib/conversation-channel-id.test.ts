@@ -15,12 +15,10 @@
  * These assert the two properties that matter, not the format: ids do not repeat under same-millisecond
  * generation, and they stay legal as Chime channel ids.
  */
-import { newDriftChannelId } from '../../lambda/src/lib/channel-creation';
-
-// The primary path is a standalone CommonJS Lambda asset (its own esbuild bundle, no TS imports), so it is
-// required rather than imported. Requiring it constructs AWS clients at module load, which performs no I/O.
-// eslint-disable-next-line @typescript-eslint/no-var-requires
-const { newConversationChannelId } = require('../../lambda/create-conversation/index.js');
+// BOTH GENERATORS NOW LIVE IN ONE MODULE, which is the ADR-053 consolidation. The primary one was
+// `require`d out of a raw CommonJS asset because that handler could not import TypeScript; the asset is
+// retired and the id generator moved to the canonical creator with its format unchanged.
+import { newConversationChannelId, newDriftChannelId } from '../../lambda/src/lib/channel-creation';
 
 /** Chime channel ids accept alphanumerics, hyphens and underscores, and are bounded well under 64 chars. */
 const CHIME_LEGAL = /^[A-Za-z0-9_-]{1,64}$/;

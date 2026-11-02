@@ -19,13 +19,15 @@ import { ensureSchema } from './db-client.js';
 import { retrieveContext } from './document-retrieval.js';
 import {
   detectDrift,
+  resolveDriftRival,
   recordDriftFire,
   recordDriftOutcome,
   getLatestSummary,
+  adoptOfferedTopic,
 } from './drift-detection.js';
-// The first-turn summary seed. Runs HERE because the write, the Bedrock summarisation, and the
+// The first-turn summary seed. Runs HERE because the write, the Bedrock summarization, and the
 // embedding are all Aurora-side work; the non-VPC caller only supplies the exchange text.
-import { seedSummaryFromExchange } from './summary-updater.js';
+import { seedSummaryFromExchange, seedSummaryFromDriftTopic } from './summary-updater.js';
 // The pending-drift-suggestion task lifecycle (open/read/close) is Aurora work
 // too, so it runs HERE — not in the non-VPC handler, where a direct query() has
 // no DB access (`DB_SECRET_ARN not configured`). ADR-013 consistency.
@@ -41,11 +43,15 @@ import {
   type BackfillOptions,
 } from './placeholder-backfill.js';
 import { backfillProfileAttribution, type ProfileBackfillInput } from './profile-backfill.js';
+// The exchange pairing pass, exported from the archival module so the backfill runs the SAME
+// statement the hot path does rather than a second copy of "what counts as an answer".
+import { backfillExchangePairings } from './kinesis-archival.js';
 // Turn-event ledger: the backfill that proves the event shape against real history, and the
 // derivation comparison the rollout's go/no-go depends on. Aurora work, so it belongs on this seam.
 import {
   backfillTurnEvents,
   compareLatencyDerivations,
+  queueAcknowledgementSample,
   type TurnEventsBackfillOptions,
 } from './turn-events-backfill.js';
 // Admin Conversations read path (Aurora): the Athena archive query is too slow
@@ -59,17 +65,14 @@ import {
 // Client-events ingest (Aurora mode has no Firehose pipeline; /events writes here
 // via the data-plane so the Overview session/user/WebSocket rollups populate). #A.
 import { ingestClientEvents, type ClientEventRecord } from './client-events-ingest.js';
-// The classification shadow gate (DESIGN §5). Aurora AND Bedrock, in the VPC — the combination this
-// Lambda exists for. It is deliberately OFF the request path: a classifier comparison must never
-// spend a user's latency, so the admin console starts a run here and reads the result later.
+// The classification shadow gate (DESIGN §5): its READS only. A run is opened and executed by the replay
+// function of its own classification (`classifier-replay-handler.ts`), whose role can invoke only that
+// classification's models; this shared function holds no such reach and runs no replay (tenet D12).
 import {
-  openClassifierReplay,
-  executeClassifierReplay,
   listReplayLabels,
   adjudicateReplayLabel,
   getReplayRun,
   listReplayRuns,
-  type StartReplayInput,
   type AdjudicateInput,
 } from './classifier-replay.js';
 // ADR-028. The classification a channel carries is an Amazon Chime SDK tag, and this VPC has no route
@@ -78,36 +81,59 @@ import {
 // is the only place FORCE ROW LEVEL SECURITY and `current_user` actually mean anything.
 import { recordChannelClassifications, type ChannelClassificationRecord } from './channel-classification.js';
 import { verifyClassificationBoundary } from './classification-boundary-verify.js';
+import { bindTurnRequest } from './turn-data-plane-binding.js';
+import { complianceAgreement } from './compliance-agreement.js';
+import { cleanCopyPending, cleanCopySource, cleanCopyWrite, cleanCopyRecordRun, adminCleanConversation } from './clean-copy.js';
+import { erasePersonProjection } from './person-erasure.js';
+// The RAG sync's read of which corpus objects hold chunks (rag-coverage.ts): Aurora work, so it rides this seam.
+import { ragSourceCoverage, type RagSourceCoverageInput } from './rag-coverage.js';
+import { loadProfileRegistry } from '../../../lib/profile-registry';
 
 /** The request envelope the client sends. `input` is the op's own input type. */
 export interface DataPlaneRequest {
   op:
     | 'retrieve'
     | 'detectDrift'
+    | 'resolveDriftRival'
     | 'recordDriftFire'
     | 'recordDriftOutcome'
+    | 'adoptOfferedTopic'
     | 'getSummary'
     | 'seedSummary'
+    | 'seedDriftTopic'
     | 'savePendingSuggestion'
     | 'readPendingSuggestion'
     | 'resolvePendingSuggestion'
     | 'backfillPlaceholders'
     | 'backfillProfileAttribution'
     | 'backfillTurnEvents'
+    | 'backfillExchangePairings'
+    | 'queueAcknowledgementSample'
     | 'compareLatencyDerivations'
+    | 'complianceAgreement'
     | 'adminListConversations'
     | 'adminListMessages'
     | 'adminMembershipHistory'
     | 'ingestClientEvents'
-    | 'openClassifierReplay'
-    | 'executeClassifierReplay'
     | 'listClassifierReplays'
     | 'getClassifierReplay'
     | 'setChannelClassifications'
     | 'verifyClassificationBoundary'
     | 'listClassifierReplayLabels'
-    | 'adjudicateClassifierLabel';
+    | 'adjudicateClassifierLabel'
+    // The de-identified copy (clean-copy.ts): the batch's reads and writes, and the console's read.
+    | 'cleanCopyPending'
+    | 'cleanCopySource'
+    | 'cleanCopyWrite'
+    | 'cleanCopyRecordRun'
+    | 'adminCleanConversation'
+    // Offboarding's erasure of the person's own rows (person-erasure.ts), asked from outside the VPC.
+    | 'erasePerson'
+    // Which corpus objects under a rag/ prefix hold chunks (rag-coverage.ts), for the RAG sync.
+    | 'ragSourceCoverage';
   input: unknown;
+  /** The routing record of the turn this call serves; a classification's turn data plane requires it. */
+  routeId?: string;
 }
 
 /**
@@ -116,7 +142,13 @@ export interface DataPlaneRequest {
  * FunctionError, which the client treats as an infra failure and degrades from
  * (honest-empty retrieval, no-fire drift). Keep this thin: no business logic.
  */
-export async function handler(req: DataPlaneRequest): Promise<unknown> {
+export async function handler(incoming: DataPlaneRequest): Promise<unknown> {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
+  // A CLASSIFICATION'S TURN DATA PLANE serves only a turn routed to that classification, at that
+  // classification, in the conversation the turn names (`turn-data-plane-binding.ts`). Checked before
+  // any database work, so a refused call costs nothing. The shared data plane passes through unchanged.
+  const req = await bindTurnRequest(incoming);
   // Apply any pending migration before dispatching, exactly as the other two DB Lambdas do
   // (`analytics-query.ts`, `kinesis-archival.ts`). Memoized per instance, so this is one no-op check
   // per cold start on the hot path.
@@ -155,6 +187,9 @@ export async function handler(req: DataPlaneRequest): Promise<unknown> {
       }
       return detectDrift(input);
     }
+    case 'resolveDriftRival':
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return resolveDriftRival(req.input as any);
     case 'recordDriftFire':
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return recordDriftFire(req.input as any);
@@ -162,11 +197,16 @@ export async function handler(req: DataPlaneRequest): Promise<unknown> {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       await recordDriftOutcome(req.input as any);
       return { ok: true };
+    case 'adoptOfferedTopic':
+      return adoptOfferedTopic(req.input as { channelArn: string; correlationId: string });
     case 'getSummary':
       return getLatestSummary((req.input as { channelArn: string }).channelArn);
     case 'seedSummary':
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return seedSummaryFromExchange(req.input as any);
+    case 'seedDriftTopic':
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      return seedSummaryFromDriftTopic(req.input as any);
     case 'savePendingSuggestion':
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       return savePendingSuggestion(req.input as any);
@@ -179,31 +219,46 @@ export async function handler(req: DataPlaneRequest): Promise<unknown> {
       return { ok: true };
     case 'backfillPlaceholders':
       return backfillPlaceholders((req.input as BackfillOptions) || {});
+    // The mention-marker pairing only ever reached turns arriving after it shipped, because the hot
+    // path is scoped to the current batch's channels and the last 24 hours. This re-runs that exact
+    // statement over a wider window so the answers it already knows how to pair stop being invisible.
+    case 'backfillExchangePairings':
+      return backfillExchangePairings((req.input as { days?: number }) || {});
     case 'backfillTurnEvents':
       return backfillTurnEvents((req.input as TurnEventsBackfillOptions) || {});
+    case 'queueAcknowledgementSample':
+      return queueAcknowledgementSample((req.input as { limit?: number })?.limit);
+    case 'complianceAgreement':
+      // Pass C Step 3. Read through the existing seam rather than a new endpoint (tenet D8).
+      return complianceAgreement((req.input as { days?: number })?.days ?? 30);
     case 'compareLatencyDerivations':
       return compareLatencyDerivations((req.input as { days?: number })?.days ?? 7);
     case 'backfillProfileAttribution':
       return backfillProfileAttribution((req.input as ProfileBackfillInput) || { attribution: {} });
     case 'adminListConversations': {
-      const i = (req.input as { limit?: number; offset?: number; allowedClassifications?: string[] | null }) || {};
-      return adminListConversations(i.limit, i.offset, i.allowedClassifications ?? null);
+      const i = (req.input as { limit?: number; offset?: number; allowedClassifications?: string[] | null; channelArn?: string | null; memberArns?: string[] | null }) || {};
+      return adminListConversations(i.limit, i.offset, i.allowedClassifications ?? null, i.channelArn ?? null, i.memberArns ?? null);
     }
     case 'adminListMessages':
       return adminListMessages((req.input as { channelArn: string }).channelArn);
     case 'adminMembershipHistory':
       return adminMembershipHistory((req.input as { channelArn: string }).channelArn);
+    case 'cleanCopyPending':
+      return cleanCopyPending(req.input as Parameters<typeof cleanCopyPending>[0]);
+    case 'cleanCopySource':
+      return cleanCopySource(req.input as Parameters<typeof cleanCopySource>[0]);
+    case 'cleanCopyWrite':
+      return cleanCopyWrite(req.input as Parameters<typeof cleanCopyWrite>[0]);
+    case 'cleanCopyRecordRun':
+      return cleanCopyRecordRun(req.input as Parameters<typeof cleanCopyRecordRun>[0]);
+    case 'adminCleanConversation':
+      return adminCleanConversation(req.input as Parameters<typeof adminCleanConversation>[0]);
     case 'ingestClientEvents':
       return ingestClientEvents((req.input as { records: ClientEventRecord[] }).records);
-    // Two ops, not one, because the work outlives an API request (see openClassifierReplay). The
-    // console opens a run synchronously and gets an id back; the execute is invoked as an Event and
-    // may take minutes.
-    case 'openClassifierReplay':
-      return openClassifierReplay(req.input as StartReplayInput);
-    case 'executeClassifierReplay': {
-      const i = req.input as { runId: string; limit?: number };
-      return executeClassifierReplay(i.runId, i.limit);
-    }
+    case 'erasePerson':
+      return erasePersonProjection(req.input as { personId?: unknown });
+    case 'ragSourceCoverage':
+      return ragSourceCoverage(req.input as RagSourceCoverageInput);
     case 'listClassifierReplays':
       return listReplayRuns((req.input as { experimentId?: string })?.experimentId);
     case 'getClassifierReplay':

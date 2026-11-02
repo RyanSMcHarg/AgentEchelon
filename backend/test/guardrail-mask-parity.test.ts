@@ -14,7 +14,7 @@
  * `attribution-pattern-parity.test.ts` exists for, and the same one a corrupted guardrail escape
  * produced once already.
  *
- * It compares BEHAVIOUR, not source text: the SPA's parser is run over the token the backend declares.
+ * It compares BEHAVIOR, not source text: the SPA's parser is run over the token the backend declares.
  */
 import * as fs from 'fs';
 import * as path from 'path';

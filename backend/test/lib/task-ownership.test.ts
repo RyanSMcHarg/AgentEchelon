@@ -7,6 +7,7 @@
  */
 
 import { DeliveryOption } from '../../lambda/src/lib/delivery-options';
+import { DEFAULT_TASK_STATE_MACHINES } from '../../lambda/src/lib/task-state-machines';
 
 const mockSend = jest.fn();
 jest.mock('@aws-sdk/lib-dynamodb', () => ({
@@ -45,33 +46,33 @@ describe('an owner is a principal id plus a stored type (D1)', () => {
   it('defaults to the requester, as a user owner', async () => {
     const { createTask } = await import('../../lambda/src/lib/task-tracking');
     const task = await createTask(EVENT, DeliveryOption.TASK_MULTI_STEP, 'report_generation');
-    expect(task.ownerId).toBe(REQUESTER);
-    expect(task.ownerType).toBe('user');
+    expect(task.assigneeId).toBe(REQUESTER);
+    expect(task.assigneeType).toBe('user');
   });
 
   it('rejects a half-written owner rather than storing an id with no type', async () => {
-    const { setTaskOwner } = await import('../../lambda/src/lib/task-tracking');
-    expect(() => setTaskOwner({ id: '', type: 'user' })).toThrow();
+    const { setTaskAssignee } = await import('../../lambda/src/lib/task-tracking');
+    expect(() => setTaskAssignee({ id: '', type: 'user' })).toThrow();
     // The pair is written together or not at all: an unknown type cannot reach the row, where it
     // would decide "invoke or wait" for whatever read it later.
-    expect(() => setTaskOwner({ id: 'x', type: 'nobody' as never })).toThrow();
+    expect(() => setTaskAssignee({ id: 'x', type: 'nobody' as never })).toThrow();
   });
 
-  it('reads the type from ownerType, never from the shape of the id', async () => {
-    const { resolveTaskOwner } = await import('../../lambda/src/lib/task-tracking');
+  it('reads the type from assigneeType, never from the shape of the id', async () => {
+    const { resolveTaskAssignee } = await import('../../lambda/src/lib/task-tracking');
     // A federated human id and a bot id are both opaque strings; only the stored type separates them.
-    expect(resolveTaskOwner({ ownerId: OTHER, ownerType: 'user' })).toEqual({ id: OTHER, type: 'user' });
-    expect(resolveTaskOwner({ ownerId: OTHER, ownerType: 'assistant' })).toEqual({ id: OTHER, type: 'assistant' });
+    expect(resolveTaskAssignee({ assigneeId: OTHER, assigneeType: 'user' })).toEqual({ id: OTHER, type: 'user' });
+    expect(resolveTaskAssignee({ assigneeId: OTHER, assigneeType: 'assistant' })).toEqual({ id: OTHER, type: 'assistant' });
   });
 
   it('resolves a pre-migration row from whichever legacy field it carries', async () => {
-    const { resolveTaskOwner } = await import('../../lambda/src/lib/task-tracking');
-    expect(resolveTaskOwner({ assignedBotArn: 'arn:aws:chime:..:app-instance/i/bot/AltSlot0' }))
+    const { resolveTaskAssignee } = await import('../../lambda/src/lib/task-tracking');
+    expect(resolveTaskAssignee({ assignedBotArn: 'arn:aws:chime:..:app-instance/i/bot/AltSlot0' }))
       .toEqual({ id: 'AltSlot0', type: 'assistant' });
-    expect(resolveTaskOwner({ assigneeUserSub: OTHER })).toEqual({ id: OTHER, type: 'user' });
-    expect(resolveTaskOwner({ userArn: `arn:aws:chime:..:app-instance/i/user/${REQUESTER}` }))
+    expect(resolveTaskAssignee({ assigneePersonId: OTHER })).toEqual({ id: OTHER, type: 'user' });
+    expect(resolveTaskAssignee({ userArn: `arn:aws:chime:..:app-instance/i/user/${REQUESTER}` }))
       .toEqual({ id: REQUESTER, type: 'user' });
-    expect(resolveTaskOwner({})).toBeNull();
+    expect(resolveTaskAssignee({})).toBeNull();
   });
 });
 
@@ -84,8 +85,8 @@ describe('the mirror is partitioned by the owner (D2)', () => {
     // FINDING 1: this used to key on the requester while every later writer keyed on the assignee,
     // so the row a status update touched was not the row create had written.
     const mirror = puts('user-tasks-test')[0];
-    expect(mirror.input.Item.userSub).toBe(OTHER);
-    expect(mirror.input.Item.ownerType).toBe('user');
+    expect(mirror.input.Item.principalId).toBe(OTHER);
+    expect(mirror.input.Item.assigneeType).toBe('user');
   });
 
   it('a status mirror carries a whole row, so it can never leave a ttl-less orphan', async () => {
@@ -100,8 +101,8 @@ describe('the mirror is partitioned by the owner (D2)', () => {
       createdAt: '2026-01-01T00:00:00.000Z',
       updatedAt: '2026-01-01T00:00:00.000Z',
       ttl: 1893456000,
-      ownerId: OTHER,
-      ownerType: 'user' as const,
+      assigneeId: OTHER,
+      assigneeType: 'user' as const,
     };
     mockSend.mockResolvedValueOnce({ Item: task }); // getTask
     const { pauseTask } = await import('../../lambda/src/lib/task-tracking');
@@ -111,7 +112,7 @@ describe('the mirror is partitioned by the owner (D2)', () => {
       .map((c) => c[0])
       .find((c) => c.input.TableName === 'user-tasks-test');
     expect(update).toBeDefined();
-    expect(update!.input.Key.userSub).toBe(OTHER);
+    expect(update!.input.Key.principalId).toBe(OTHER);
     // FINDING 2: the upsert used to set status + updatedAt only. Landing in a partition with no row
     // it created one with no ttl (never expires), no taskType (invisible to the lookup GSI) and no
     // channelArn (dropped by the channel filter).
@@ -146,8 +147,11 @@ describe('what a task stores of the message that opened it (D5)', () => {
     );
     // The one consumer already truncated to this length, so the reduction trades nothing away. If
     // the stored bound and the read bound ever drift, this is what notices.
-    expect(buildTaskContextForPrompt(bounded))
-      .toBe(buildTaskContextForPrompt({ ...bounded, requestExcerpt: undefined, userMessage: LONG }));
+    // The platform set, passed EXPLICITLY. This relied on the parameter default, which ADR-047 removed
+    // because a defaulted set answers a different question than the caller asked without saying so.
+    // Here the platform graphs genuinely are the subject, so naming them is the decision.
+    expect(buildTaskContextForPrompt(bounded, DEFAULT_TASK_STATE_MACHINES))
+      .toBe(buildTaskContextForPrompt({ ...bounded, requestExcerpt: undefined, userMessage: LONG }, DEFAULT_TASK_STATE_MACHINES));
   });
 
   it('separates the correlation key from the user message id', async () => {
@@ -175,7 +179,7 @@ describe('the owner lookup: the active task owned by this actor here', () => {
 
     const q = mockSend.mock.calls[0][0];
     expect(q.__t).toBe('Query');
-    expect(q.input.KeyConditionExpression).toBe('userSub = :owner');
+    expect(q.input.KeyConditionExpression).toBe('principalId = :owner');
     expect(q.input.ExpressionAttributeValues[':owner']).toBe('AltSlot0');
     expect(q.input.FilterExpression).toContain('channelArn = :ch');
     expect(q.input.ExpressionAttributeValues[':ch']).toBe('arn:chan/c1');
@@ -223,13 +227,15 @@ describe('the conversation read: what is open here, whoever owns it (D4)', () =>
   const row = (over: Record<string, unknown> = {}) => ({
     taskId: 't-9',
     channelArn: 'arn:chan/c1',
+    // Shared work: an absent visibility reads as private.
+    visibility: 'conversation',
     status: 'in_progress',
     taskType: 'action_item',
     taskState: 'awaiting_completion',
     userMessage: 'SECRET: the original message text',
     details: { collected: 'SECRET: extracted values' },
-    ownerId: OTHER,
-    ownerType: 'user',
+    assigneeId: OTHER,
+    assigneeType: 'user',
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-02-01T00:00:00.000Z',
     ...over,
@@ -249,12 +255,12 @@ describe('the conversation read: what is open here, whoever owns it (D4)', () =>
   });
 
   it('returns work owned by someone else', async () => {
-    mockSend.mockResolvedValueOnce({ Items: [row({ ownerId: OTHER })] });
+    mockSend.mockResolvedValueOnce({ Items: [row({ assigneeId: OTHER })] });
     const { getOpenTasksForConversation } = await import('../../lambda/src/lib/task-tracking');
     const [task] = await getOpenTasksForConversation('arn:chan/c1');
     expect(task.taskId).toBe('t-9');
-    expect(task.ownerId).toBe(OTHER);
-    expect(task.ownerType).toBe('user');
+    expect(task.assigneeId).toBe(OTHER);
+    expect(task.assigneeType).toBe('user');
   });
 
   it('carries NO message text, which is what makes a redaction cascade unnecessary', async () => {
@@ -271,12 +277,12 @@ describe('the conversation read: what is open here, whoever owns it (D4)', () =>
 
   it('resolves the owner of a pre-migration row rather than dropping it', async () => {
     mockSend.mockResolvedValueOnce({
-      Items: [row({ ownerId: undefined, ownerType: undefined, assignedBotArn: 'arn:..:bot/AltSlot0' })],
+      Items: [row({ assigneeId: undefined, assigneeType: undefined, assignedBotArn: 'arn:..:bot/AltSlot0' })],
     });
     const { getOpenTasksForConversation } = await import('../../lambda/src/lib/task-tracking');
     const [task] = await getOpenTasksForConversation('arn:chan/c1');
-    expect(task.ownerId).toBe('AltSlot0');
-    expect(task.ownerType).toBe('assistant');
+    expect(task.assigneeId).toBe('AltSlot0');
+    expect(task.assigneeType).toBe('assistant');
   });
 });
 
@@ -295,9 +301,9 @@ describe('the conversation hint: seeing is not advancing (D4)', () => {
     const { buildConversationTasksHint } = await import('../../lambda/src/lib/task-tracking');
     const hint = buildConversationTasksHint(
       [
-        task({ taskId: 'a', ownerId: REQUESTER, ownerType: 'user' }),
-        task({ taskId: 'b', ownerId: OTHER, ownerType: 'user' }),
-        task({ taskId: 'c', ownerId: 'AltSlot0', ownerType: 'assistant' }),
+        task({ taskId: 'a', assigneeId: REQUESTER, assigneeType: 'user' }),
+        task({ taskId: 'b', assigneeId: OTHER, assigneeType: 'user' }),
+        task({ taskId: 'c', assigneeId: 'AltSlot0', assigneeType: 'assistant' }),
       ],
       { id: REQUESTER },
     );
@@ -313,7 +319,7 @@ describe('the conversation hint: seeing is not advancing (D4)', () => {
 
   it('tells the model that seeing is not advancing', async () => {
     const { buildConversationTasksHint } = await import('../../lambda/src/lib/task-tracking');
-    const hint = buildConversationTasksHint([task({ ownerId: OTHER, ownerType: 'user' })], { id: REQUESTER });
+    const hint = buildConversationTasksHint([task({ assigneeId: OTHER, assigneeType: 'user' })], { id: REQUESTER });
     expect(hint).toContain('Only the holder can move one forward');
   });
 
@@ -344,8 +350,8 @@ describe('reassignment (D1) and its log entry (D3)', () => {
     createdAt: '2026-01-01T00:00:00.000Z',
     updatedAt: '2026-01-01T00:00:00.000Z',
     ttl: 1893456000,
-    ownerId: REQUESTER,
-    ownerType: 'user' as const,
+    assigneeId: REQUESTER,
+    assigneeType: 'user' as const,
   };
 
   it('moves the mirror row and leaves nothing behind', async () => {
@@ -354,14 +360,14 @@ describe('reassignment (D1) and its log entry (D3)', () => {
     await reassignTask('t-2', 'arn:chan/c1', { id: OTHER, type: 'user' });
 
     const mirrorPut = puts('user-tasks-test')[0];
-    expect(mirrorPut.input.Item.userSub).toBe(OTHER);
+    expect(mirrorPut.input.Item.principalId).toBe(OTHER);
     // The new row is whole - a partial row here is finding 2 in a different disguise.
     expect(mirrorPut.input.Item.ttl).toBe(1893456000);
     expect(mirrorPut.input.Item.taskType).toBe('action_item');
     expect(mirrorPut.input.Item.channelArn).toBe('arn:chan/c1');
 
     const del = mockSend.mock.calls.map((c) => c[0]).find((c) => c.__t === 'Delete');
-    expect(del.input.Key).toEqual({ userSub: REQUESTER, taskId: 't-2' });
+    expect(del.input.Key).toEqual({ principalId: REQUESTER, taskId: 't-2' });
   });
 
   it('logs the change with ownerFrom/ownerTo and NO from/to, and does not touch the machine', async () => {
@@ -390,5 +396,52 @@ describe('reassignment (D1) and its log entry (D3)', () => {
     const { reassignTask } = await import('../../lambda/src/lib/task-tracking');
     await reassignTask('t-2', 'arn:chan/c1', { id: REQUESTER, type: 'user' });
     expect(mockSend.mock.calls.map((c) => c[0]).filter((c) => c.__t !== 'Get')).toEqual([]);
+  });
+});
+
+/**
+ * A ROW WRITTEN BEFORE THE RENAME IS STILL RESUMABLE (ADR-024 D8).
+ *
+ * D8 split one field called `owner` into an OWNER and an ASSIGNEE, and the stored attribute that used
+ * to be `ownerId`/`ownerType` is now `assigneeId`/`assigneeType`. Live tasks were written under the old
+ * names and carry a TTL, so for one cycle both shapes exist in the table at once.
+ *
+ * `resolveTaskAssignee` therefore reads the new pair first and the old pair next, one more link in a
+ * chain it already had for older shapes. Without that link a task mid-flight loses its assignee and
+ * falls through to the requester, which silently hands the assistant's in-flight work back to the
+ * person and makes it look answerable when it is not.
+ *
+ * These were covered only incidentally, by fixtures that happened to use the old names, until the
+ * rename swept those fixtures. Incidental coverage of a back-compat path disappears exactly when the
+ * migration it protects begins, so it is written down here instead.
+ */
+describe('the assignee of a row written before the rename', () => {
+  it('reads the pre-D8 pair when the new one is absent', async () => {
+    const { resolveTaskAssignee } = await import('../../lambda/src/lib/task-tracking');
+    expect(resolveTaskAssignee({ ownerId: OTHER, ownerType: 'user' }))
+      .toEqual({ id: OTHER, type: 'user' });
+    expect(resolveTaskAssignee({ ownerId: 'AltSlot0', ownerType: 'assistant' }))
+      .toEqual({ id: 'AltSlot0', type: 'assistant' });
+  });
+
+  it('prefers the new pair when a row carries both', async () => {
+    // A row touched after the migration carries the new names; the old copy is left where it is
+    // rather than deleted, so the two can disagree and the new one has to win.
+    const { resolveTaskAssignee } = await import('../../lambda/src/lib/task-tracking');
+    expect(resolveTaskAssignee({
+      assigneeId: REQUESTER, assigneeType: 'user', ownerId: OTHER, ownerType: 'user',
+    })).toEqual({ id: REQUESTER, type: 'user' });
+  });
+
+  it('does not fall through to the requester while an OLD row names an assistant', async () => {
+    // The failure this link prevents: losing the assignee mid-flight hands the assistant's running
+    // work back to the person, where it looks like something they can answer.
+    const { resolveTaskAssignee } = await import('../../lambda/src/lib/task-tracking');
+    const resolved = resolveTaskAssignee({
+      ownerId: 'AltSlot0',
+      ownerType: 'assistant',
+      userArn: `arn:aws:chime:us-east-1:1:app-instance/i/user/${REQUESTER}`,
+    });
+    expect(resolved).toEqual({ id: 'AltSlot0', type: 'assistant' });
   });
 });

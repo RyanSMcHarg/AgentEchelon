@@ -6,9 +6,10 @@
  * missing section into a broken turn or a leak.
  */
 import { createSourceReader } from '../../lambda/src/lib/context-source-readers';
+import { NO_RECORD } from '../../lambda/src/lib/context-sources-runtime';
 import type { PublishedContextSource } from '../../lambda/src/lib/context-sources-runtime';
 
-const CTX = { classification: 'standard', userSub: 'user-123' };
+const CTX = { classification: 'standard', personId: 'user-123' };
 
 /**
  * Shaped like a real AWS SDK v3 error: the service's CODE is the error `name`, with `$metadata`
@@ -213,7 +214,7 @@ describe('dynamodb-table reader', () => {
 
   it('projects only the DECLARED fields, keyed by the caller', async () => {
     const ddb = ddbWith({
-      userSub: { S: 'user-123' },
+      personId: { S: 'user-123' },
       displayName: { S: 'Priya' },
       company: { S: 'Stratum' },
       // Present on the item but NOT declared in the catalog: must not reach the prompt.
@@ -234,9 +235,18 @@ describe('dynamodb-table reader', () => {
     expect(ddb.send).not.toHaveBeenCalled();
   });
 
-  it('returns null when the user has no profile row', async () => {
+  it('reports NO_RECORD when the user has no profile row', async () => {
+    // Distinct from null: the resolver counts it from the entry's declared `perPerson`, so a person
+    // with no record yet is a skip rather than a failed read.
     const read = createSourceReader(CTX, { ddb: ddbWith(undefined) as never });
-    expect(await read(ddbSource())).toBeNull();
+    expect(await read(ddbSource())).toBe(NO_RECORD);
+  });
+
+  it('reports NO_RECORD when the row exists but carries none of the declared fields', async () => {
+    // An onboarding marker with no facts is a person who has told the platform nothing this source reads: the
+    // resolver counts it as a per-person source's `no-record` skip, never as a failed read that pages an operator.
+    const read = createSourceReader(CTX, { ddb: ddbWith({ personId: { S: 'user-123' }, onboardedAt: { S: '2026-10-30T00:00:00Z' } }) as never });
+    expect(await read(ddbSource())).toBe(NO_RECORD);
   });
 
   it('reads a numeric attribute as its string form', async () => {

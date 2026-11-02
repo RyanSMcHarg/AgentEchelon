@@ -22,6 +22,11 @@ import {
   UpdateResourcePolicyCommand,
 } from '@aws-sdk/client-lex-models-v2';
 import { CloudFormationClient, DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { resolveStackPrefix } = require('./lib/stack-lookup.cjs');
+const { botArnFor } = require('./lib/person-arn.cjs');
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const account = process.env.AWS_ACCOUNT_ID;
@@ -36,7 +41,7 @@ if (botIds.length === 0) {
 }
 
 async function getAppInstanceArn() {
-  const r = await cfn.send(new DescribeStacksCommand({ StackName: 'AgentEchelonChimeMessaging' }));
+  const r = await cfn.send(new DescribeStacksCommand({ StackName: `${resolveStackPrefix(process.env)}Messaging` }));
   const o = {};
   for (const x of r.Stacks?.[0]?.Outputs || []) if (x.OutputKey && x.OutputValue) o[x.OutputKey] = x.OutputValue;
   return o['AppInstanceArnOutput'] || o['AppInstanceArn'];
@@ -55,7 +60,7 @@ function policyFor(resourceArn, appInstanceArn, acct) {
         Condition: {
           StringEquals: { 'AWS:SourceAccount': acct },
           // ArnLike (not ArnEquals) so the app-instance/bot/* wildcard matches.
-          ArnLike: { 'AWS:SourceArn': `${appInstanceArn}/bot/*` },
+          ArnLike: { 'AWS:SourceArn': botArnFor(appInstanceArn, '*') },
         },
       },
     ],

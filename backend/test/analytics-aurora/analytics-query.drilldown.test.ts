@@ -8,6 +8,7 @@
  * the numbers the console displays, or an operator cannot check the result they are shipping on.
  */
 import type { APIGatewayProxyEvent } from 'aws-lambda';
+import { edgeContext } from '../helpers/edge-context';
 
 const mockDbQuery = jest.fn();
 const mockSend = jest.fn();
@@ -39,7 +40,7 @@ function postEvent(body: unknown): APIGatewayProxyEvent {
     httpMethod: 'POST',
     path: '/query',
     body: JSON.stringify(body),
-    requestContext: { authorizer: { claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' } } },
+    requestContext: { authorizer: edgeContext({ claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' } }) },
   } as unknown as APIGatewayProxyEvent;
 }
 
@@ -104,6 +105,21 @@ describe('experiment_exchanges reports the FULL-MATCH aggregate, not the page', 
     const body = await call({ queryType: 'experiment_exchanges', experimentId: 'exp1' });
     expect(body.total).toBe(0);
     expect(body.stats.avg_score).toBeNull();
+  });
+
+  it('names the definition that served each turn, and null where a turn carries no attribution', async () => {
+    // The view an operator promotes from: a treatment turn names the candidate in the alt's history,
+    // whose version numbers are its own, so the name and configId travel with the version.
+    mockDbQuery.mockResolvedValueOnce({
+      rows: [
+        row({ variant_id: 'treatment', profile_name: 'alt-primary-premium', profile_version: '4', profile_config_id: 'cfg-cand' }),
+        row({ exchange_id: 'ex2' }),
+      ],
+    });
+    const body = await call({ queryType: 'experiment_exchanges', experimentId: 'exp1' });
+    expect(body.columns).toEqual(expect.arrayContaining(['profile_name', 'profile_version', 'profile_config_id']));
+    expect(body.data[0]).toMatchObject({ profile_name: 'alt-primary-premium', profile_version: 4, profile_config_id: 'cfg-cand' });
+    expect(body.data[1]).toMatchObject({ profile_name: null, profile_version: null, profile_config_id: null });
   });
 
   it('echoes the axis and variant it actually served', async () => {
@@ -237,7 +253,7 @@ describe('experiment_picks returns the picks behind battle_wins', () => {
 
   it('is a DIFFERENT population from the battle turns — picks, not exchanges', async () => {
     // C3: one link cannot serve both. A duel produces two turns and at most one pick per user, so a
-    // view that showed turns while labelling them picks would misreport the human axis.
+    // view that showed turns while labeling them picks would misreport the human axis.
     mockSend.mockResolvedValueOnce({ Items: [outcome('b1'), outcome('b2')] });
     mockDbQuery.mockResolvedValueOnce({ rows: [] });
     const body = await call({ queryType: 'experiment_picks', experimentId: 'exp1' });

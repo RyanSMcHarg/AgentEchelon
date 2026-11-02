@@ -4,7 +4,7 @@
  * Covers:
  *   1. Empty / whitespace query short-circuits without DB or Bedrock
  *   2. Embedding failure returns signalAvailable:false, no DB call
- *   3. Tier-scope filter is applied at SQL level (not post-filter)
+ *   3. Classification-scope filter is applied at SQL level (not post-filter)
  *   4. minSimilarity filters out chunks below threshold
  *   5. Citations deduplicate by sourceId (multiple chunks → one citation)
  *   6. buildRetrievedContextHint shape: [N] markers + sources block
@@ -44,6 +44,11 @@ jest.mock('../../lambda/src/analytics-aurora/classification-boundary', () => ({
 
 function mockRows<T extends QueryResultRow>(rows: T[]): QueryResult<T> {
   return { rows, rowCount: rows.length, command: '', oid: 0, fields: [] as never } as QueryResult<T>;
+}
+
+/** A candidate row the vector leg returned at `rank` and the lexical leg did not. */
+function vectorRow<T extends object>(row: T, rank: number): T & { vector_rank: number; lexical_rank: null; lexical_coverage: null } {
+  return { ...row, vector_rank: rank, lexical_rank: null, lexical_coverage: null };
 }
 
 function mockEmbedSuccess(values: number[] = new Array(1024).fill(0.1)) {
@@ -86,10 +91,8 @@ describe('retrieveContext', () => {
 
   it('applies the classification-scope filter at SQL level when provided', async () => {
     mockEmbedSuccess();
-    mockDbQuery.mockResolvedValueOnce(mockRows<{
-      source_id: string; source_type: string; title: string | null; chunk_index: number | null; content: string; similarity: number;
-    }>([
-      { source_id: 's3://b/rag/wiki/a.md', source_type: 'wiki', title: 'A', chunk_index: 0, content: 'aaa', similarity: 0.9 },
+    mockDbQuery.mockResolvedValueOnce(mockRows([
+      vectorRow({ source_id: 's3://b/rag/wiki/a.md', source_type: 'wiki', title: 'A', chunk_index: 0, content: 'aaa', similarity: 0.9 }, 1),
     ]));
 
     const { retrieveContext } = await import('../../lambda/src/analytics-aurora/document-retrieval');
@@ -134,8 +137,8 @@ describe('retrieveContext', () => {
   it('drops chunks below minSimilarity threshold', async () => {
     mockEmbedSuccess();
     mockDbQuery.mockResolvedValueOnce(mockRows([
-      { source_id: 'doc-a', source_type: 'wiki', title: 'A', chunk_index: 0, content: 'good match', similarity: 0.8 },
-      { source_id: 'doc-b', source_type: 'wiki', title: 'B', chunk_index: 0, content: 'weak match', similarity: 0.2 },
+      vectorRow({ source_id: 'doc-a', source_type: 'wiki', title: 'A', chunk_index: 0, content: 'good match', similarity: 0.8 }, 1),
+      vectorRow({ source_id: 'doc-b', source_type: 'wiki', title: 'B', chunk_index: 0, content: 'weak match', similarity: 0.2 }, 2),
     ]));
 
     const { retrieveContext } = await import('../../lambda/src/analytics-aurora/document-retrieval');
@@ -147,9 +150,9 @@ describe('retrieveContext', () => {
   it('deduplicates citations by sourceId across multiple chunks', async () => {
     mockEmbedSuccess();
     mockDbQuery.mockResolvedValueOnce(mockRows([
-      { source_id: 'doc-a', source_type: 'wiki', title: 'A', chunk_index: 0, content: 'chunk 1 of A', similarity: 0.9 },
-      { source_id: 'doc-a', source_type: 'wiki', title: 'A', chunk_index: 1, content: 'chunk 2 of A', similarity: 0.7 },
-      { source_id: 'doc-b', source_type: 'wiki', title: 'B', chunk_index: 0, content: 'chunk 1 of B', similarity: 0.6 },
+      vectorRow({ source_id: 'doc-a', source_type: 'wiki', title: 'A', chunk_index: 0, content: 'chunk 1 of A', similarity: 0.9 }, 1),
+      vectorRow({ source_id: 'doc-a', source_type: 'wiki', title: 'A', chunk_index: 1, content: 'chunk 2 of A', similarity: 0.7 }, 2),
+      vectorRow({ source_id: 'doc-b', source_type: 'wiki', title: 'B', chunk_index: 0, content: 'chunk 1 of B', similarity: 0.6 }, 3),
     ]));
 
     const { retrieveContext } = await import('../../lambda/src/analytics-aurora/document-retrieval');
@@ -165,7 +168,7 @@ describe('retrieveContext', () => {
 
 /**
  * The hint must carry BOTH directives, because each guards the opposite failure and dropping either
- * one is a silent behaviour change.
+ * one is a silent behavior change.
  *
  * The original wording had only the negative half - cite "when your answer draws on them", ignore if
  * irrelevant, never fabricate - and no instruction to actually use the passages. Traced live on

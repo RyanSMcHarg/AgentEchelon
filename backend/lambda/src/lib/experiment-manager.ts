@@ -8,29 +8,37 @@
  */
 
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
-import { DynamoDBDocumentClient, ScanCommand, PutCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
+import { DynamoDBDocumentClient, ScanCommand, PutCommand, UpdateCommand, GetCommand } from '@aws-sdk/lib-dynamodb';
 import { createHash } from 'crypto';
 import type { BackendModelDefinition, BackendModelKey, Classification } from '../../../lib/config/model-strategy.js';
 import { bedrockInvokeId } from '../../../lib/config/model-strategy.js';
 import { IMAGE_GEN_MODELS, type ImageGenModelKey } from './image-gen-models.js';
-import { intentTypeToRouteKey } from './model-resolver.js';
-import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
+import { imagePrimaryForIntent } from './image-route.js';
+import { imageRouteKeyOf } from './experiment-image-route.js';
+import { modelFits } from '../../../lib/config/model-availability.js';
+import { answersThroughGeneral, GENERAL_ROUTE_KEY, retiredRouteKeyError } from './model-resolver.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
 import { SSMClient } from '@aws-sdk/client-ssm';
-import { lookupProfileVersion, lookupProfileVersionModelKey } from './profile-version-lookup.js';
+import { concreteProfileVersion, lookupProfileVersion, lookupProfileVersionModelKey } from './profile-version-lookup.js';
 import type { ProfileDefinition } from './active-profile.js';
+import { noticeLine } from './assistant-notice.js';
+import { BOUNDED_REQUEST_HANDLER } from './bounded-request-handler.js';
+import { sessionClient, sessionDocumentClient } from './assistant-session.js';
+import type { ConversationEnrollment } from './channel-context-client.js';
+import { DUEL_ROLE, challengerOf, withoutLegacyBinding, type LegacyBattleBinding } from './alt-assignment.js';
 
 // removeUndefinedValues: createExperiment persists the validated record
 // directly, and validateAndSanitizeExperiment leaves optional fields
 // undefined (blank systemPromptAddendum, text-only imageGenModelKey,
 // absent endDate/description/boundBy). Same class of bug as the
 // admin-experiments handler — this is the legacy/direct create path.
-const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+const ddb = sessionDocumentClient({ requestHandler: BOUNDED_REQUEST_HANDLER }, {
   marshallOptions: { removeUndefinedValues: true },
 });
 const EXPERIMENTS_TABLE = process.env.EXPERIMENTS_TABLE || '';
-// SPEC-PORTABLE-PROFILES §6: a profileRef variant resolves its model from the referenced
+// SPEC-PORTABLE-PROFILES FR11: a profileRef variant resolves its model from the referenced
 // profile version's SSM definition. Own client (like the ddb one above); read-only + fail-safe.
-const ssmClient = new SSMClient({});
+const ssmClient = sessionClient(SSMClient, { requestHandler: BOUNDED_REQUEST_HANDLER });
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
 
 // ============================================================
@@ -43,15 +51,30 @@ export interface ExperimentVariant {
    *  varies either a bare model (+ optional prompt-addendum) OR an entire profile version, not both. */
   modelKey?: BackendModelKey;
   /**
-   * SPEC-PORTABLE-PROFILES §6: run an ENTIRE profile version as the variant. The variant's
+   * SPEC-PORTABLE-PROFILES FR11: run an ENTIRE profile version as the variant. The variant's
    * model (and, once the AssistantConfig unification lands, its prompt/pack/tools/guardrail) come from
    * that version's definition. Resolved at runtime via lookupProfileVersionModelKey. Mutually exclusive
    * with `modelKey`.
    */
   profileRef?: { profileName: string; version?: number };
+  /**
+   * THE TREATMENT'S CANDIDATE VERSION, on variants[1] (DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP §3.5,
+   * ADR-050). Derived when the experiment is armed: the control plus the experiment type's recipe,
+   * published in the candidate history, the role's alt `alt-{role}-{classification}`. A conversation
+   * enrolled in the treatment is served this version on every turn (`pinFor`), and a duel's treatment
+   * side serves it from the alt identity. The persisted name predates its use outside battles.
+   */
+  altPin?: { profileName: string; version: number; configId?: string };
+  /**
+   * THE CONTROL'S VERSION, on variants[0] (§3.5): the live assistant's ACTIVE version, pinned by number
+   * when the experiment is armed. A reference; nothing is published under the live name. A conversation
+   * enrolled in the control is served it, and a duel's control side serves it from the live identity.
+   * A `profile` experiment's control is its referenced version. A battle armed before experiments pinned
+   * two versions holds a version derived under the live name here instead, and keeps reading it until it
+   * is paused and resumed, which re-arms it.
+   */
+  controlPin?: { profileName: string; version: number; configId?: string };
   weight: number; // 0-100, all variants should sum to 100
-  /** Display name surfaced to users + in the rival prompt during a battle. Required when the parent experiment.battleEnabled is true. Max ~16 chars. */
-  displayName?: string;
   /** Variant-specific addendum to the system prompt. Sanitized server-side
    *  (length-cap, control-char strip, no closing-delimiter); the async
    *  processor wraps it in <persona_addendum>...</persona_addendum> tags
@@ -126,7 +149,7 @@ export interface ExperimentDecision {
 
 /**
  * One append-only lifecycle-audit entry (DESIGN §3.2 L7). Every status change and
- * guarded edit appends one, so the lifecycle is auditable (TENET 4). `from` may be
+ * guarded edit appends one, so the lifecycle is auditable (TENET P4). `from` may be
  * the pseudo-state 'create' for the record's first entry.
  */
 export interface ExperimentTransition {
@@ -148,7 +171,7 @@ export interface ExperimentTransition {
  * any intent on the classification), and 'classification' via `resolveClassificationExperiment`
  * (it swaps the intent-classifier model).
  */
-// 'profile' (SPEC-PORTABLE-PROFILES §6) pits two whole assistant PROFILE versions against each
+// 'profile' (SPEC-PORTABLE-PROFILES FR11, FR15) pits two whole assistant PROFILE versions against each
 // other via profileRef variants. It swaps the assistant's base model across every intent, so it matches
 // and conflicts exactly like 'base_model' — the difference is provenance (a versioned profile, not a bare
 // model key), which the variant's profileRef carries.
@@ -166,6 +189,12 @@ export interface Experiment {
   /** Defaults to 'intent' when absent. */
   experimentType?: ExperimentType;
   intent: string;
+  /**
+   * WHICH MODEL OF THE INTENT AN `intent` EXPERIMENT VARIES (ADR-064 decision 6): its text model (the default), its image
+   * model (`kind: 'image'`, the route's image part, the variant's `modelKey` an image model), or one step's model
+   * (`step`, the route's step override). The recipe changes only that model, so the one-variable rule holds.
+   */
+  target?: ExperimentTarget;
   tiers: Classification[];
   variants: ExperimentVariant[];
   /** BEHAVIOR (L5): now enforced at resolve time — an experiment isn't live before startDate. */
@@ -181,13 +210,16 @@ export interface Experiment {
   /** NEW (L7): append-only lifecycle audit. Every status change / guarded edit appends one entry. */
   transitions?: ExperimentTransition[];
   /** v0.2.0 (SPEC-BATTLE.md): when true, this experiment can power
-   *  /battle. Requires exactly 2 variants and a defined altBotSlotId. */
+   *  /battle. Requires exactly 2 variants and a challenger. */
   battleEnabled?: boolean;
-  /** Stable id of the alt-bot pool slot the treatment variant occupies, e.g. "slot-0". */
-  altBotSlotId?: string;
-  /** Denormalized slot ARN for fast async-processor lookup. Computed at admin-write time from altBotSlotId + the SSM roster. */
-  altBotSlotArn?: string;
-  /** User ARN of the admin who last bound this experiment to its slot. Required when battleEnabled. */
+  /**
+   * The challenger the treatment variant runs as: the assistant id of its classification's alt,
+   * `alt-{role}-{classification}` (ADR-050). One challenger per `(classification, role)` is structural (it
+   * is the assignment record's key), so the id names it; its bot ARN is read from that record when needed,
+   * never stored here. Rows written before this field are read through `challengerOf`.
+   */
+  challengerAssistant?: string;
+  /** User ARN of the admin who last armed this experiment. Required when battleEnabled. */
   boundBy?: string;
   /**
    * B: long-form battle behavior toggle.
@@ -201,6 +233,16 @@ export interface Experiment {
   longFormMode?: 'one-shot' | 'outline-first';
   /** ISO timestamp of the last binding write. */
   boundAt?: string;
+  /**
+   * SET WHEN THE EXPERIMENT IS ARMED WITH TWO PINNED VERSIONS (DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP §3.5):
+   * the control's `controlPin` (the live active version) and the treatment's `altPin` (the candidate). Such
+   * an experiment enrolls conversations and serves each its assigned version whole. A row without it was
+   * armed before; an `intent` or `base_model` one keeps resolving its variant's model per turn until it is
+   * paused and resumed, which arms it this way.
+   */
+  servesVersions?: boolean;
+  /** Set by the Promote action: the version a promotion activated in the live assistant (§3.6). */
+  promotion?: { profileName: string; version: number; configId: string; at: string; by: string };
 }
 
 export interface ExperimentResolution {
@@ -216,7 +258,7 @@ export interface ExperimentResolution {
    */
   imageGenModelKey?: ImageGenModelKey;
   /**
-   * The variant's FULL profile definition, for a `profileRef` variant (SPEC-PORTABLE §6). A variant is
+   * The variant's FULL profile definition, for a `profileRef` variant (SPEC-PORTABLE-PROFILES FR11). A variant is
    * not a model: persona, tools, classifier mode, guardrail selection, task machines and context sources
    * all ride the version, which is what lets profile-vs-profile answer "do these tools earn their place"
    * — two versions that differ ONLY in `tools`. Serving just `modelKey` makes that experiment resolve to
@@ -224,16 +266,26 @@ export interface ExperimentResolution {
    *
    * Undefined for a lightweight `modelKey` variant, which stays exactly as it was.
    *
-   * The classification ceiling needs no widening to carry this, because every dimension is ALREADY
+   * The classification boundary needs no widening to carry this, because every dimension is ALREADY
    * bounded per classification, and none of them by this resolution: the model by
-   * `allowedClassifications` (checked below), tools by the serving Lambda's own IAM (a tool reads only
+   * the classification's selection (checked below), tools by the serving Lambda's own IAM (a tool reads only
    * what that classification's role can read), the guardrail by the per-classification ApplyGuardrail
    * grant (an unprovisioned selection AccessDenies and falls back loudly, never fails open), and context
    * sources by the published per-classification catalog (a source outside it is skipped, not served).
    */
   variantProfile?: ProfileDefinition;
+  /**
+   * THE NUMBER OF THE VERSION `variantProfile` IS: the parameter version its reference pins, so a turn it
+   * serves is attributed to that number as an ordinary turn is to the active one. Undefined when the
+   * reference names no concrete version; the attribution then leaves the number out rather than guess it.
+   */
+  variantVersion?: number;
   /** The variant version's attribution key, so analytics slices by the version that actually served. */
   configId?: string;
+  /** The experiment's type, so the router attributes a turn by the type's rule (an `intent` experiment counts its intent's turns). */
+  experimentType?: ExperimentType;
+  /** An `intent` experiment's intent (and a `base_model` row's stored value), for that rule. */
+  intent?: string;
 }
 
 // ============================================================
@@ -276,6 +328,373 @@ async function loadExperiments(forceRefresh = false): Promise<Experiment[]> {
     console.error('[ExperimentManager] Failed to load experiments:', error);
     return experimentCache?.experiments || [];
   }
+}
+
+/**
+ * HOW STALE A "NOTHING IS LIVE" ANSWER MAY BE before the cache is re-read once. Much shorter than
+ * `CACHE_TTL_MS` because a classification holds one live experiment at a time (DESIGN §3.2.1): the
+ * minute the cache can lag is the minute a newly started experiment receives no traffic.
+ */
+const NOTHING_LIVE_RECHECK_MS = 10_000;
+
+/**
+ * WHETHER AN EXPERIMENT IS HELD FOR A CONVERSATION'S LIFE (ADR-050).
+ *
+ * An experiment that serves versions swaps what a person is served between turns and splits one
+ * conversation's turns across two `configId`s, so it applies only to conversations enrolled in it, and an
+ * enrolled conversation keeps its variant. That is every experiment armed with two pinned versions
+ * (`servesVersions`, §3.5), any with a pinned version (a battle armed before that), a `profile`
+ * experiment, and any with a `profileRef` variant. Only an `intent` or `base_model` row armed before
+ * versions were pinned still resolves per turn.
+ */
+export function isConversationScoped(exp: Experiment): boolean {
+  return exp.servesVersions === true
+    || exp.experimentType === 'profile'
+    || exp.variants.some((v) => !!v.profileRef || !!v.altPin || !!v.controlPin);
+}
+
+let enrollableCache: CachedExperiments | null = null;
+
+/**
+ * Every conversation-scoped experiment that could have been live at some instant: active, paused or
+ * completed. Completed ones are included because a conversation created while an experiment ran is
+ * enrolled in it even when its first turn arrives after the experiment ends. Draft and deleted never
+ * enrolled anyone.
+ *
+ * `coveringInstant` is the instant the caller decides about (a conversation's `createdAt`). A cache
+ * loaded BEFORE that instant cannot hold an experiment armed between the load and the instant, so it is
+ * reloaded, with a consistent read: otherwise a conversation created just after an arm is decided
+ * unenrolled on its first turn and enrolled on a later one, the mid-conversation swap enrollment exists
+ * to prevent.
+ */
+/**
+ * THE ENROLLABLE EXPERIMENTS THIS CONTAINER ALREADY HOLDS, with no read: the list `listEnrollableExperiments` cached,
+ * while it is fresh. Undefined when this container has not read it, or its copy has expired.
+ */
+export function cachedEnrollableExperiments(): Experiment[] | undefined {
+  return enrollableCache && Date.now() - enrollableCache.loadedAt < CACHE_TTL_MS ? enrollableCache.experiments : undefined;
+}
+
+/** Seed the container's cached list. For tests. */
+export function __setEnrollableExperimentsForTests(experiments: Experiment[] | null): void {
+  enrollableCache = experiments ? { experiments, loadedAt: Date.now() } : null;
+}
+
+export async function listEnrollableExperiments(coveringInstant?: string): Promise<Experiment[]> {
+  const covering = coveringInstant ? Date.parse(coveringInstant) : NaN;
+  const covers = !enrollableCache || !Number.isFinite(covering) || enrollableCache.loadedAt > covering;
+  if (enrollableCache && covers && Date.now() - enrollableCache.loadedAt < CACHE_TTL_MS) return enrollableCache.experiments;
+  if (!EXPERIMENTS_TABLE) return [];
+  try {
+    const items: Experiment[] = [];
+    let ExclusiveStartKey: Record<string, unknown> | undefined;
+    do {
+      const page = await ddb.send(new ScanCommand({
+        TableName: EXPERIMENTS_TABLE,
+        FilterExpression: '#s IN (:active, :paused, :completed)',
+        ExpressionAttributeNames: { '#s': 'status' },
+        ExpressionAttributeValues: { ':active': 'active', ':paused': 'paused', ':completed': 'completed' },
+        ExclusiveStartKey,
+        ConsistentRead: true,
+      }));
+      items.push(...((page.Items || []) as Experiment[]));
+      ExclusiveStartKey = page.LastEvaluatedKey as Record<string, unknown> | undefined;
+    } while (ExclusiveStartKey);
+    const experiments = items.filter(isConversationScoped);
+    enrollableCache = { experiments, loadedAt: Date.now() };
+    return experiments;
+  } catch (error) {
+    console.error('[ExperimentManager] Failed to load enrollable experiments:', error);
+    return enrollableCache?.experiments || [];
+  }
+}
+
+/**
+ * The pin for a variant: what it serves NOW, frozen. A ref that tracks the `active` label is resolved to
+ * the version the label points at, so the conversation keeps serving that version. Null when the ref
+ * names no active version, which leaves the conversation unenrolled rather than pinned to nothing.
+ */
+export async function pinFor(experiment: Experiment, variant: ExperimentVariant): Promise<ConversationEnrollment | null> {
+  // A PINNED VERSION IS WHAT THE VARIANT SERVES, whole (§3.5): the control's live active version or the
+  // treatment's candidate. Its image model is the version's `models.image`, so nothing rides beside it.
+  const versionPin = variant.altPin ?? variant.controlPin;
+  if (versionPin) {
+    return { experimentId: experiment.experimentId, variantId: variant.variantId, profileRef: { profileName: versionPin.profileName, version: versionPin.version } };
+  }
+  const base = {
+    experimentId: experiment.experimentId,
+    variantId: variant.variantId,
+    ...(variant.imageGenModelKey ? { imageGenModelKey: variant.imageGenModelKey } : {}),
+  };
+  if (variant.profileRef) {
+    const version = await concreteProfileVersion(ssmClient, SSM_ROOT, variant.profileRef);
+    if (version === null) {
+      console.warn('[ExperimentManager] variant profile has no active version; not enrolling', base);
+      return null;
+    }
+    return { ...base, profileRef: { profileName: variant.profileRef.profileName, version } };
+  }
+  return variant.modelKey ? { ...base, modelKey: variant.modelKey } : null;
+}
+
+const pinnedExperimentCache = new Map<string, { exp: Experiment | null; loadedAt: number }>();
+
+/** One experiment by id for a pinned conversation, cached per container for the usual minute. */
+async function readPinnedExperiment(experimentId: string): Promise<Experiment | null> {
+  const hit = pinnedExperimentCache.get(experimentId);
+  if (hit && Date.now() - hit.loadedAt < CACHE_TTL_MS) return hit.exp;
+  const exp = await readExperimentFresh(experimentId);
+  pinnedExperimentCache.set(experimentId, { exp, loadedAt: Date.now() });
+  return exp;
+}
+
+/**
+ * WHETHER AN ENROLLMENT STILL HOLDS (ADR-050 as amended).
+ *
+ * Only an ACTIVE experiment holds a conversation to its arm. The experiment must be `active` and inside its
+ * window now, and must not have left `active` at any point since the conversation was enrolled: a pause
+ * releases every enrolled conversation for good, so a resume enrolls only conversations created after it.
+ * A released conversation is served the live assistant's active version from its next turn, which after a
+ * promotion is the winner and otherwise the control. A record with no transitions (it predates the audit)
+ * is judged by its status and window alone.
+ */
+export function enrollmentHolds(
+  exp: Experiment,
+  classification: Classification,
+  enrolledAt?: string,
+  now: Date = new Date(),
+): boolean {
+  if (!isLiveForClassification(exp, classification, now)) return false;
+  if (!enrolledAt) return true;
+  const since = Date.parse(enrolledAt);
+  if (Number.isNaN(since)) return true;
+  return !(exp.transitions ?? []).some((t) => Date.parse(t.at) > since && t.to !== 'active');
+}
+
+/**
+ * The variant a pinned conversation serves, or null when the pin no longer resolves or no longer holds:
+ * the experiment was deleted, does not cover this classification, no longer has the variant, or is not
+ * active (`enrollmentHolds`). The experiment is read through the per-container cache, so a pause or an end
+ * reaches a conversation within `CACHE_TTL_MS` (one minute) of the write.
+ */
+async function resolveEnrolledVariant(
+  enrollment: ConversationEnrollment,
+  classification: Classification,
+  channelArn: string,
+  catalog: Record<BackendModelKey, BackendModelDefinition>,
+): Promise<ExperimentResolution | null> {
+  let exp: Experiment | null;
+  try {
+    exp = await readPinnedExperiment(enrollment.experimentId);
+  } catch (error) {
+    console.warn('[ExperimentManager] pinned experiment unreadable; serving no experiment this turn', {
+      experimentId: enrollment.experimentId, err: (error as Error)?.message,
+    });
+    return null;
+  }
+  if (!exp || exp.status === 'deleted' || !exp.tiers.includes(classification)) {
+    console.warn('[ExperimentManager] enrollment no longer resolves', { ...enrollment, status: exp?.status ?? 'missing' });
+    return null;
+  }
+  if (!enrollmentHolds(exp, classification, enrollment.enrolledAt)) {
+    console.log('[ExperimentManager] enrollment released: the experiment is not active, or left active after enrollment', {
+      experimentId: enrollment.experimentId, variantId: enrollment.variantId, status: exp.status, endDate: exp.endDate,
+    });
+    return null;
+  }
+  // THE PIN, NOT THE EXPERIMENT'S CURRENT VARIANT: an edit to the experiment after enrollment does not
+  // reach a conversation already running on it.
+  const pinned: ExperimentVariant = {
+    variantId: enrollment.variantId,
+    weight: 100,
+    ...(enrollment.profileRef ? { profileRef: enrollment.profileRef } : { modelKey: enrollment.modelKey as BackendModelKey }),
+    ...(enrollment.imageGenModelKey ? { imageGenModelKey: enrollment.imageGenModelKey as ImageGenModelKey } : {}),
+  };
+  if (!pinned.profileRef && !pinned.modelKey) return null;
+  return resolveVariantForProfile(exp, classification, channelArn, catalog, pinned);
+}
+
+/**
+ * WHETHER A TURN SERVED BY AN EXPERIMENT'S VERSION COUNTS TOWARD THE EXPERIMENT (§3.5, "What an experiment
+ * counts"). Every turn of an enrolled conversation is served its arm's version, and each type keeps the
+ * meaning its attribution had when it was assigned per turn:
+ *  - `intent`: only turns of its intent, matched as the resolver serves it (the intent's own route, or `general`
+ *    for an intent that answers through it). Other turns are served the same route in both arms.
+ *  - `classification`: only turns the version's classifier labeled (not the fast-path greeting).
+ *  - `base_model`: every turn but the fast-path greeting and acknowledgment.
+ *  - `profile`, or an alt's own turn: every turn.
+ */
+/** The one model of an intent an `intent` experiment varies (ADR-064 decision 6). */
+export interface ExperimentTarget {
+  kind?: 'text' | 'image';
+  step?: string;
+}
+
+/** Why an experiment's target is refused as written, or null. */
+export function experimentTargetError(target: unknown, experimentType: string | undefined): string | null {
+  if (target === undefined) return null;
+  if (!target || typeof target !== 'object' || Array.isArray(target)) return 'target must be { kind?, step? }';
+  if ((experimentType ?? 'intent') !== 'intent') return 'target names one model of an intent, so only an intent experiment carries it';
+  const t = target as Record<string, unknown>;
+  for (const k of Object.keys(t)) if (k !== 'kind' && k !== 'step') return `target.${k} is not a target field; a target is { kind?, step? }`;
+  if (t.kind !== undefined && t.kind !== 'text' && t.kind !== 'image') return "target.kind is 'text' or 'image'";
+  if (t.step !== undefined && (typeof t.step !== 'string' || !/^[a-z][a-z0-9_]{0,31}$/.test(t.step))) return 'target.step names a state of the intent\'s workflow';
+  return null;
+}
+
+/**
+ * THE ARM A TASK WAS OPENED UNDER (ADR-064 decision J), recorded on the task by the router (`Task.experimentArm`, a
+ * field only the platform writes, mirrored on the task's copy). Null when the task records none.
+ */
+export function experimentArmOf(task: { experimentArm?: unknown } | null | undefined): { experimentId: string; variantId: string; configId?: string } | null {
+  const arm = task?.experimentArm as Record<string, unknown> | undefined;
+  return arm && typeof arm.experimentId === 'string' && arm.experimentId && typeof arm.variantId === 'string' && arm.variantId
+    ? { experimentId: arm.experimentId, variantId: arm.variantId, ...(typeof arm.configId === 'string' ? { configId: arm.configId } : {}) }
+    : null;
+}
+
+/**
+ * WHETHER A TASK'S ARM IS STILL SERVED (ADR-064 decision J): while its experiment runs, a task stays on the arm it was
+ * opened under. The experiment runs when it is `active`, covers the classification, is inside its window, still holds
+ * the arm, and has not left `active` since the task opened (the rule an enrollment follows, `enrollmentHolds`). Once it
+ * stops, the losing version is no longer served, so the task carries on with the live version; where the task's arm is
+ * the version that became live, that is the version it was already on.
+ */
+export function taskArmServes(
+  exp: Experiment | null | undefined,
+  classification: Classification,
+  arm: { experimentId: string; variantId: string },
+  openedAt: string | undefined,
+  now: Date = new Date(),
+): boolean {
+  if (!exp || exp.experimentId !== arm.experimentId || exp.status === 'deleted') return false;
+  if (!exp.variants.some((v) => v.variantId === arm.variantId)) return false;
+  return enrollmentHolds(exp, classification, openedAt, now);
+}
+
+/**
+ * THE VERSION A TASK'S TURN IS SERVED, from the arm the task was opened under (decision J), or null when that arm is no
+ * longer served (`taskArmServes`) and the turn takes the live version. Read through the per-container experiment cache,
+ * so an experiment that stops reaches a task within the minute it reaches a conversation.
+ */
+export async function resolveTaskArm(
+  arm: { experimentId: string; variantId: string },
+  openedAt: string | undefined,
+  classification: Classification,
+  channelArn: string,
+  catalog: Record<BackendModelKey, BackendModelDefinition>,
+): Promise<ExperimentResolution | null> {
+  let exp: Experiment | null;
+  try {
+    exp = await readPinnedExperiment(arm.experimentId);
+  } catch (error) {
+    console.warn("[ExperimentManager] the task's experiment is unreadable; the task takes the live version this turn", {
+      experimentId: arm.experimentId, err: (error as Error)?.message,
+    });
+    return null;
+  }
+  if (!taskArmServes(exp, classification, arm, openedAt)) return null;
+  const variant = exp!.variants.find((v) => v.variantId === arm.variantId)!;
+  const pin = await pinFor(exp!, variant);
+  return pin ? resolveEnrolledVariant({ ...pin, ...(openedAt ? { enrolledAt: openedAt } : {}) }, classification, channelArn, catalog) : null;
+}
+
+/**
+ * Whether an `intent` experiment on `experimentIntent` covers a turn classified `turnIntent`: the same intent, or
+ * the `general` route's experiment for an intent that answers through `general` (ADR-064 decision A), so it
+ * covers the turns that route serves. A version that routes such an intent on its own still counts it here: the
+ * experiment's arms differ only on the route it names.
+ */
+export function experimentIntentMatches(experimentIntent: string, turnIntent: string | undefined): boolean {
+  if (!turnIntent) return false;
+  return experimentIntent === turnIntent || (experimentIntent === GENERAL_ROUTE_KEY && answersThroughGeneral(turnIntent));
+}
+
+export function countsTowardExperiment(
+  served: Pick<ExperimentResolution, 'experimentType' | 'intent'>,
+  turnIntent: string,
+  classifierRan: boolean,
+  /** The type of the task the turn is bound to: a task's turns count by its type, whatever each message was (ADR-064 decision 6). */
+  taskType?: string,
+): boolean {
+  switch (served.experimentType) {
+    case 'intent':
+      return !!served.intent && (experimentIntentMatches(served.intent, turnIntent) || (!!taskType && served.intent === taskType));
+    case 'classification':
+      return classifierRan;
+    case 'base_model':
+      return turnIntent !== 'greeting' && turnIntent !== 'acknowledgment';
+    default:
+      return true;
+  }
+}
+
+/**
+ * WHAT AN ENROLLED CONVERSATION IS SERVED, resolved before the turn is classified (§3.5). The router reads
+ * it first so the version's classifier, intent pack and workflow selection decide the turn, exactly as a
+ * duel side's version does. Null when the pin no longer resolves.
+ */
+export async function resolveEnrollment(
+  enrollment: ConversationEnrollment,
+  classification: Classification,
+  channelArn: string,
+  catalog: Record<BackendModelKey, BackendModelDefinition>,
+): Promise<ExperimentResolution | null> {
+  return resolveEnrolledVariant(enrollment, classification, channelArn, catalog);
+}
+
+/** The one experiment, read past the cache. Consistent, because a status change must be seen at once. */
+async function readExperimentFresh(experimentId: string): Promise<Experiment | null> {
+  if (!EXPERIMENTS_TABLE) return null;
+  const res = await ddb.send(new GetCommand({
+    TableName: EXPERIMENTS_TABLE,
+    Key: { experimentId },
+    ConsistentRead: true,
+  }));
+  return (res.Item as Experiment | undefined) ?? null;
+}
+
+/**
+ * PICK AN EXPERIMENT FROM THE CACHE, BUT NEVER ONE THAT HAS ENDED.
+ *
+ * The cache is per container and the write happens in another Lambda, so nothing can clear it at the
+ * moment an operator ends a test. Measured live 2026-10-05: an experiment completed before its
+ * successor was created kept receiving turns for 25 s, and the successor received none - with one
+ * live experiment per classification, every handover lost its first minute to the test that was closed.
+ *
+ * So the cache is checked where it is USED, which is the only point the turn can afford a read:
+ *  - a turn about to be assigned re-reads THAT experiment (one consistent GetItem). If it is no longer
+ *    live, the cache reloads and the pick runs again - which is how the successor is found;
+ *  - a turn that finds NOTHING live reloads once when the cache is older than NOTHING_LIVE_RECHECK_MS,
+ *    so a newly started experiment begins taking traffic within seconds rather than a minute.
+ *
+ * A FAILED CHECK KEEPS THE CACHED PICK. The read is a freshness check on an answer the cache already
+ * gave, so an unreadable table leaves the turn exactly where the cache put it rather than dropping
+ * experiment attribution for every turn while the table is unavailable.
+ */
+async function pickFresh(
+  pick: (experiments: Experiment[]) => Experiment | undefined,
+  classification: Classification,
+): Promise<Experiment | undefined> {
+  const cached = pick(await loadExperiments());
+  if (!cached) {
+    const age = experimentCache ? Date.now() - experimentCache.loadedAt : Infinity;
+    return age > NOTHING_LIVE_RECHECK_MS ? pick(await loadExperiments(true)) : undefined;
+  }
+  let current: Experiment | null;
+  try {
+    current = await readExperimentFresh(cached.experimentId);
+  } catch (error) {
+    console.warn('[ExperimentManager] freshness check failed; keeping the cached experiment', {
+      experimentId: cached.experimentId, err: (error as Error)?.message,
+    });
+    return cached;
+  }
+  if (current && isLiveForClassification(current, classification)) return cached;
+  console.log('[ExperimentManager] cached experiment is no longer live; reloading', {
+    experimentId: cached.experimentId, status: current?.status ?? 'deleted',
+  });
+  return pick(await loadExperiments(true));
 }
 
 // ============================================================
@@ -345,10 +764,18 @@ export async function resolveExperimentModel(
   intent: string,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
+  enrollment?: ConversationEnrollment | null,
 ): Promise<ExperimentResolution | null> {
-  const experiments = await loadExperiments();
+  // AN ENROLLED CONVERSATION SERVES ITS PIN FIRST (ADR-050), ahead of anything armed since, because a
+  // conversation's profile does not change under the person in it.
+  if (enrollment) {
+    const pinned = await resolveEnrolledVariant(enrollment, classification, channelArn, catalog);
+    if (pinned) return pinned;
+  }
   const now = new Date();
-  const isLive = (exp: Experiment): boolean => isLiveForClassification(exp, classification, now);
+  // A conversation-scoped experiment reaches a turn only through the pin above, never by being live.
+  const isLive = (exp: Experiment): boolean =>
+    isLiveForClassification(exp, classification, now) && !isConversationScoped(exp);
 
   // Resolution order: an intent-specific experiment wins over a base-model
   // experiment when both apply. A base-model experiment swaps the classification default
@@ -357,27 +784,23 @@ export async function resolveExperimentModel(
   // base-model experiments exist. Classification experiments resolve separately
   // (resolveClassificationExperiment) and never match here.
   //
-  // Intent match normalizes the coarse classifier intent (e.g. 'general') to the
-  // fine-grained RouteKey ('general_qa') the admin UI stores on the experiment —
-  // the SAME mapping the model resolver applies — so an intent experiment matches
-  // the route the turn actually resolves to. Comparing the raw classifier intent
-  // here silently never matched (classifier vocabulary ≠ route-key vocabulary).
-  const routeKey = intentTypeToRouteKey(intent);
-  const experiment =
+  // The write path admits one live experiment per classification (findClassificationConflicts), so
+  // this order only decides between rows that predate that rule.
+  //
+  // AN INTENT EXPERIMENT MATCHES THE ROUTE THE TURN IS SERVED ON: the turn's own intent, or `general` for an
+  // intent that answers through it (ADR-064 decision A). Routes are keyed by intent, so there is one vocabulary.
+  const experiment = await pickFresh((experiments) =>
     experiments.find(
-      // Text intents match via the normalized route key; `image_generation` is NOT a text RouteKey
-      // (it isn't in INTENT_TYPE_TO_ROUTE_KEY, so routeKey falls through to general_qa), so it matches
-      // on the raw intent string instead - letting an image_generation experiment bind an image turn.
       (exp) =>
         (exp.experimentType ?? 'intent') === 'intent' &&
-        (exp.intent === routeKey || exp.intent === intent) &&
+        typeof exp.intent === 'string' && experimentIntentMatches(exp.intent, intent) &&
         isLive(exp),
     ) ??
     experiments.find(
       (exp) =>
         (exp.experimentType === 'base_model' || exp.experimentType === 'profile') &&
         isLive(exp),
-    );
+    ), classification);
 
   if (!experiment) return null;
 
@@ -398,13 +821,15 @@ export async function resolveClassificationExperiment(
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
 ): Promise<ExperimentResolution | null> {
-  const experiments = await loadExperiments();
   const now = new Date();
-  const experiment = experiments.find(
+  const experiment = await pickFresh((experiments) => experiments.find(
     (exp) =>
       exp.experimentType === 'classification' &&
+      // An experiment that serves versions classifies with its version's classifier, reached through the
+      // conversation's enrollment; only a row armed before then swaps the classifier per turn here.
+      !isConversationScoped(exp) &&
       isLiveForClassification(exp, classification, now),
-  );
+  ), classification);
   if (!experiment) return null;
   return resolveVariantForProfile(experiment, classification, channelArn, catalog);
 }
@@ -415,7 +840,7 @@ export async function resolveClassificationExperiment(
  * Returns null on an unknown model key or a classification-disallowed model.
  */
 /**
- * The model a variant runs: its `modelKey`, or — for a profileRef variant (§6) — the referenced profile
+ * The model a variant runs: its `modelKey`, or — for a profileRef variant (SPEC-PORTABLE-PROFILES FR11) — the referenced profile
  * version's modelKey, read from SSM at runtime. null when neither resolves (fail-safe: the caller skips).
  */
 async function effectiveModelKeyOf(variant: ExperimentVariant): Promise<BackendModelKey | null> {
@@ -453,16 +878,22 @@ async function resolveVariantForProfile(
   classification: Classification,
   channelArn: string,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
+  fixedVariant?: ExperimentVariant,
 ): Promise<ExperimentResolution | null> {
-  const variant = assignVariant(experiment.experimentId, channelArn, experiment.variants);
+  const variant = fixedVariant ?? assignVariant(experiment.experimentId, channelArn, experiment.variants);
 
-  // §6: a profileRef variant runs an entire profile VERSION — model, persona, tools, classifier mode,
-  // guardrail selection, machines and context sources, not just a model. Read once, so the served
-  // model and the served tool set can never come from different versions.
-  // Fail-safe: an unresolvable variant skips the experiment (deterministic default holds).
+  // A VERSION IS SERVED WHOLE (SPEC-PORTABLE-PROFILES FR11): model routes, persona, tools, guardrail
+  // selection, workflows and context sources, not just a model. Read once, so the served model and the
+  // served tool set can never come from different versions. A pinned version reaches this only through a
+  // conversation's enrollment (`pinFor`), which hands it over as `profileRef`; no version is chosen per
+  // turn here. Fail-safe: an unresolvable variant skips the experiment (deterministic default holds).
   const variantProfile = await variantDefinitionOf(variant);
   if (variant.profileRef && !variantProfile) return null; // already logged by variantDefinitionOf
-  const effectiveModelKey = (variantProfile?.modelKey ?? variant.modelKey) as BackendModelKey | undefined;
+  // A VERSION'S BASE MODEL, for attribution and the routing record only: the turn answers through the
+  // version's own routes. The `'default'` sentinel tracks the classification default.
+  const effectiveModelKey = (variantProfile
+    ? (concreteKey(variantProfile.models?.default) ?? concreteKey(variantProfile.modelKey) ?? profiles.defaultModelOf(classification))
+    : variant.modelKey) as BackendModelKey | undefined;
   if (!effectiveModelKey) {
     console.error('[ExperimentManager] variant has neither modelKey nor a resolvable profileRef; skipping');
     return null;
@@ -474,75 +905,56 @@ async function resolveVariantForProfile(
     return null;
   }
 
-  // Classification ceiling still binds — a version can never exceed the channel's classification (§6, min-cap).
-  if (!model.allowedClassifications.includes(classification)) {
-    console.warn(`[ExperimentManager] Model ${effectiveModelKey} not allowed for classification ${classification}, skipping experiment`);
+  // THE CLASSIFICATION'S SELECTION STILL BINDS: a version uses only what the channel's classification selects.
+  if (!profiles.selectsModel(classification, effectiveModelKey)) {
+    console.warn(`[ExperimentManager] Model ${effectiveModelKey} is not selected by classification ${classification}, skipping experiment`);
     return null;
   }
 
   return {
     experimentId: experiment.experimentId,
     variantId: variant.variantId,
+    experimentType: experiment.experimentType ?? 'intent',
+    ...(experiment.experimentType !== 'profile' && experiment.intent ? { intent: experiment.intent } : {}),
     modelKey: effectiveModelKey,
     bedrockModelId: bedrockInvokeId(model),
-    // Carry the variant's image model so an image_generation turn serves it in the normal flow. A
-    // profileRef variant carries its image model on the VERSION (`models.image`), so it is read from
-    // there; an explicit `imageGenModelKey` on the variant still wins, which is what an image-only
-    // experiment sets and what the battle image duel arms.
-    ...((variant.imageGenModelKey ?? variantProfile?.models?.image)
-      ? { imageGenModelKey: (variant.imageGenModelKey ?? variantProfile?.models?.image) as ImageGenModelKey }
+    // A variant with no version behind it (a row armed before versions were pinned) carries its image model
+    // per turn, only when it is an image model this classification allows (`modelFits`). A served version's
+    // own `models.image` reaches the turn with the version itself (`variantProfile`).
+    ...(!variantProfile && variant.imageGenModelKey && modelFits(variant.imageGenModelKey, classification, 'image') === null
+      ? { imageGenModelKey: variant.imageGenModelKey }
       : {}),
-    // §6: the whole definition rides the resolution, plus the version's attribution key.
+    // SPEC-PORTABLE-PROFILES FR11: the whole definition rides the resolution, plus the version's attribution key.
     ...(variantProfile ? { variantProfile, configId: variantProfile.configId } : {}),
+    ...(variantProfile && pinnedVersionOf(variant.profileRef) !== undefined ? { variantVersion: pinnedVersionOf(variant.profileRef) } : {}),
   };
+}
+
+/** The concrete version a reference pins, or undefined for one that follows a label. */
+function pinnedVersionOf(ref: { version?: unknown } | undefined): number | undefined {
+  const v = ref?.version;
+  return typeof v === 'number' && Number.isInteger(v) && v > 0 ? v : undefined;
 }
 
 // ============================================================
 // CRUD Operations (for admin API)
 // ============================================================
 
-export async function createExperiment(
-  experiment: Omit<Experiment, 'createdAt'>,
-  /** Catalog keys, so an unknown variant `modelKey` is a 400 here rather than a silent same-model duel. */
-  validModelKeys?: ReadonlySet<string>,
-): Promise<Experiment> {
-  // Sanitize + validate before persistence. Throws ExperimentValidationError
-  // on rule breaks (admin API surfaces these as 4xx). Battle-mode rules
-  // (variant count, displayName, slot binding) are enforced here.
-  const sanitized = validateAndSanitizeExperiment({
-    ...experiment,
-    createdAt: new Date().toISOString(),
-  } as Experiment, validModelKeys);
-
-  const record: Experiment = {
-    ...sanitized,
-    // Stamp boundAt server-side when battle binding is being set.
-    ...(sanitized.battleEnabled && !sanitized.boundAt && { boundAt: new Date().toISOString() }),
-  };
-
-  await ddb.send(new PutCommand({
-    TableName: EXPERIMENTS_TABLE,
-    Item: record,
-  }));
-
-  // Invalidate cache
-  experimentCache = null;
-
-  return record;
-}
-
-export async function updateExperimentStatus(experimentId: string, status: Experiment['status']): Promise<void> {
-  await ddb.send(new UpdateCommand({
-    TableName: EXPERIMENTS_TABLE,
-    Key: { experimentId },
-    UpdateExpression: 'SET #s = :status',
-    ExpressionAttributeNames: { '#s': 'status' },
-    ExpressionAttributeValues: { ':status': status },
-  }));
-
-  // Invalidate cache
-  experimentCache = null;
-}
+// `createExperiment` and `updateExperimentStatus` USED TO LIVE HERE, and are deleted.
+//
+// Neither had a caller anywhere in the repo. The live admin path (admin-experiments.ts) imports the
+// guards from this file - validateAndSanitizeExperiment, isAllowedTransition, appendTransition,
+// findClassificationConflicts - and issues its own Put/Get/Delete, so these two were a second way in
+// that nothing used.
+//
+// They are removed rather than left dead because the names are a trap: the frontend service exports
+// functions called exactly this (frontend/packages/shared/src/services/experimentService.ts), which
+// ARE live, so a reader finds callers and concludes these are the same path. And the pair was weaker
+// than the path it looked like: updateExperimentStatus wrote any status with no isAllowedTransition
+// check at all, and createExperiment validated but skipped the conflict and active-count rules the
+// admin handler applies.
+//
+// If a non-admin writer is ever needed, add it THROUGH those guards rather than beside them.
 
 export async function listExperiments(): Promise<Experiment[]> {
   if (!EXPERIMENTS_TABLE) return [];
@@ -554,6 +966,56 @@ export async function listExperiments(): Promise<Experiment[]> {
   return (result.Items || []) as Experiment[];
 }
 
+/**
+ * How long a container may answer "which experiments are live" from what it already read.
+ *
+ * THE SAME 60 s `lib/battle-state.ts` gives the channel battle config, and deliberately the same
+ * number rather than a second one that happens to be similar (tenet D9). The only caller pairs the two
+ * reads in one decision - is this channel's BOUND experiment still active - so a shorter window here
+ * would buy freshness the other half of the pair does not have, and a longer one would make the pair
+ * disagree about how stale it is willing to be.
+ */
+const EXPERIMENTS_CACHE_TTL_MS = 60_000;
+let experimentsCache: { experiments: Experiment[]; expires: number } | null = null;
+
+/**
+ * Every experiment, from a per-container memo refreshed at most once a minute.
+ *
+ * WHY THIS EXISTS. `listExperiments` is an unfiltered DynamoDB `Scan`, and the channel flow ran one on
+ * every `/battle` inside a gate chain that is otherwise ordered cheapest-first: a cached `GetItem` came
+ * before it and a `Query` after it. A duel is the most expensive dispatch in the system, so a scan is
+ * not what makes it expensive - but it is the one read in that chain whose cost grows with the
+ * deployment's history rather than with the duel, and it was answering a question whose other half was
+ * already being read from a 60 s cache.
+ *
+ * WHAT ONE MINUTE OF STALENESS CAN COST, stated rather than assumed, because the rule this feeds is
+ * "ending an experiment stops the duels". For up to a minute after an operator ends one, a channel
+ * bound to it can still start a duel. That window already existed and is not widened here: the bound
+ * id comes from `loadChannelBattleConfig`, cached for the same 60 s, so the decision could never have
+ * been fresher than a minute on both halves at once. A duel that starts inside the window records its
+ * outcome against the ended experiment, which is the defect `battleIsRunnable` exists for - bounded to
+ * one minute, per container, rather than forever.
+ *
+ * NOT FOR A WRITER. Anything that must read its own write (the admin API issues its own Get after a
+ * Put) calls `listExperiments` directly. This is the read for a gate, and a gate is exactly the caller
+ * that can afford to be a minute behind.
+ *
+ * A FAILED SCAN CACHES NOTHING and throws to the caller, unchanged: an empty list is not the same
+ * answer as an unreadable table, and pinning one for a minute would let a transient outage read as
+ * "no experiment is active" for every duel in that window.
+ */
+export async function listExperimentsCached(): Promise<Experiment[]> {
+  if (experimentsCache && experimentsCache.expires > Date.now()) return experimentsCache.experiments;
+  const experiments = await listExperiments();
+  experimentsCache = { experiments, expires: Date.now() + EXPERIMENTS_CACHE_TTL_MS };
+  return experiments;
+}
+
+/** Drop the memo. For a test, and for a writer that needs the next read to see its own write. */
+export function invalidateExperimentsCache(): void {
+  experimentsCache = null;
+}
+
 // ============================================================
 // Battle support (SPEC-BATTLE.md)
 // ============================================================
@@ -563,9 +1025,6 @@ export async function listExperiments(): Promise<Experiment[]> {
  * Spec: "Length cap: maximum 500 characters after whitespace normalization."
  */
 export const MAX_PROMPT_ADDENDUM_LENGTH = 500;
-
-/** Maximum length for displayName. Spec: max ~16 chars. */
-export const MAX_DISPLAY_NAME_LENGTH = 16;
 
 /** Maximum length for objective.statement and ExperimentDecision.note (DESIGN §1.2 / §3.2.1). */
 export const MAX_OBJECTIVE_STATEMENT_LENGTH = 500;
@@ -641,28 +1100,6 @@ export function sanitizePromptAddendum(raw: string | undefined): string | undefi
 }
 
 /**
- * Sanitize a variant.displayName value.
- * Strips control chars + normalizes whitespace + caps length.
- */
-export function sanitizeDisplayName(raw: string | undefined): string | undefined {
-  if (raw === undefined || raw === null) return undefined;
-  if (typeof raw !== 'string') {
-    throw new ExperimentValidationError('displayName must be a string', 'DISPLAY_NAME_TYPE');
-  }
-  // eslint-disable-next-line no-control-regex
-  const stripped = raw.replace(/[\x00-\x08\x0B-\x0C\x0E-\x1F\x7F]/g, '');
-  const normalized = stripped.replace(/\s+/g, ' ').trim();
-  if (normalized.length === 0) return undefined;
-  if (normalized.length > MAX_DISPLAY_NAME_LENGTH) {
-    throw new ExperimentValidationError(
-      `displayName exceeds ${MAX_DISPLAY_NAME_LENGTH} chars (got ${normalized.length})`,
-      'DISPLAY_NAME_TOO_LONG',
-    );
-  }
-  return normalized;
-}
-
-/**
  * Sanitize free-prose objective/decision text (DESIGN §1.2 / §3.2.1): strip ASCII
  * control chars, collapse whitespace, trim, and length-cap at
  * MAX_OBJECTIVE_STATEMENT_LENGTH. Returns undefined for absent/blank input so the
@@ -694,11 +1131,10 @@ export function sanitizeObjectiveStatement(raw: string | undefined): string | un
  *
  * Battle-mode rules (per spec):
  *   - battleEnabled=true requires exactly 2 variants.
- *   - Both variants must have a non-empty displayName.
- *   - altBotSlotId must be defined.
+ *   - the challenger must be this classification's alt (`challengerAssistant`, `alt-{role}-{classification}`).
  *   - boundBy must be set so we can attribute the binding.
  *
- * Returns a new Experiment with sanitized addendum + displayName fields.
+ * Returns a new Experiment with sanitized addendum fields.
  */
 export function validateAndSanitizeExperiment(
   input: Experiment,
@@ -706,32 +1142,45 @@ export function validateAndSanitizeExperiment(
    * The deployment's model-catalog keys. When supplied, a variant's `modelKey` must be one of them.
    *
    * OPTIONAL so the ~40 existing call sites that test unrelated rules keep working, and so a caller with
-   * no catalog to hand degrades to the previous behaviour rather than being unable to validate anything.
+   * no catalog to hand degrades to the previous behavior rather than being unable to validate anything.
    * The WRITE path supplies it (`createExperiment`, and the admin update handler), which is where an
    * unknown key would otherwise be persisted.
    */
   validModelKeys?: ReadonlySet<string>,
 ): Experiment {
-  const variants = input.variants.map((v) => ({
-    ...v,
-    displayName: sanitizeDisplayName(v.displayName),
-    systemPromptAddendum: sanitizePromptAddendum(v.systemPromptAddendum),
-  }));
+  // A RETIRED ROUTE KEY is refused, naming the intent that keys the route now (ADR-064 decision 1).
+  const retired = typeof input.intent === 'string' ? retiredRouteKeyError(input.intent, 'intent') : null;
+  if (retired) throw new ExperimentValidationError(retired, 'INTENT_RETIRED_ROUTE_KEY');
+  const targetWhy = experimentTargetError((input as { target?: unknown }).target, input.experimentType);
+  if (targetWhy) throw new ExperimentValidationError(targetWhy, 'TARGET_INVALID');
+  // AN IMAGE TARGET'S VARIANTS NAME IMAGE MODELS IN `modelKey`, so the image model is varied one way (tenet D9).
+  const imageTarget = input.target?.kind === 'image';
+  // A VARIANT CARRIES NO NAME: a duel side is named from its profile
+  // (`battleSideNames`). A request that still sends a variant `displayName` (an older console or e2e
+  // helper) is accepted and the field is DROPPED here, never stored, so nothing persists a name that
+  // would then be ignored.
+  const variants = input.variants.map((raw) => {
+    const { displayName: _dropped, ...v } = raw as ExperimentVariant & { displayName?: unknown };
+    return { ...v, systemPromptAddendum: sanitizePromptAddendum(v.systemPromptAddendum) };
+  });
 
   // Each variant runs EITHER a bare model OR an entire profile version (SPEC-PORTABLE-PROFILES
-  // §6) — exactly one of modelKey / profileRef, never both, never neither. A bare modelKey is a catalog
+  // FR11) — exactly one of modelKey / profileRef, never both, never neither. A bare modelKey is a catalog
   // key ('haiku'/'sonnet'); a profileRef {profileName, version?} runs that version's definition. Reject a
   // mis-specified variant at create time (400) instead of producing a mystery 0-row result.
   variants.forEach((v, i) => {
     const hasModel = typeof v.modelKey === 'string' && v.modelKey.trim().length > 0;
     const hasRef = !!v.profileRef && typeof v.profileRef.profileName === 'string' && v.profileRef.profileName.trim().length > 0;
-    if (hasModel === hasRef) {
+    // THE CONTROL OF A MODEL EXPERIMENT IS THE LIVE ACTIVE VERSION (DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP
+    // §3.5), so it may leave its model unnamed; one it names must be the live one, which arming checks.
+    const controlIsLive = i === 0 && (input.experimentType ?? 'intent') !== 'profile' && !hasModel && !hasRef;
+    if (hasModel === hasRef && !controlIsLive) {
       throw new ExperimentValidationError(
         `variant index ${i} requires EXACTLY ONE of modelKey (a catalog key like 'haiku'/'sonnet') or profileRef {profileName, version?} — not both, not neither`,
         'VARIANT_MODEL_KEY_REQUIRED',
       );
     }
-    // THE KEY MUST BE IN THE CATALOG (owner, 2026-08-10).
+    // THE KEY MUST BE IN THE CATALOG (maintainer, 2026-08-10).
     //
     // Presence was checked and membership was not, and the failure is silent in the worst possible way.
     // At resolution `catalog[modelKey]` returns undefined for an unknown key, so no variant model is
@@ -744,15 +1193,70 @@ export function validateAndSanitizeExperiment(
     //
     // The KEY is what is stored, not a resolved Bedrock id - a version and a variant must both stay
     // instance-agnostic (SPEC-PORTABLE §5), and the id is resolved per-deployment at runtime.
-    if (hasModel && validModelKeys && !validModelKeys.has(v.modelKey!.trim())) {
+    if (hasModel && !imageTarget && validModelKeys && !validModelKeys.has(v.modelKey!.trim())) {
       const offered = [...validModelKeys].sort().map((k) => `'${k}'`).join(', ');
       throw new ExperimentValidationError(
         `variant index ${i} modelKey '${v.modelKey}' is not in this deployment's model catalog; one of: ${offered}`,
         'VARIANT_MODEL_KEY_UNKNOWN',
       );
     }
+    // EVERY MODEL A VARIANT NAMES IS ONE EACH OF ITS CLASSIFICATIONS ALLOWS, FIT FOR ITS USE (`modelFits`):
+    // the `modelKey` is a text model (the base model, or the classifier on a `classification` experiment)
+    // and the `imageGenModelKey` an image model. Refused here rather than skipped at resolution, where a
+    // disallowed variant silently ran both arms on the same model and reported "no difference".
+    const variantTiers = Array.isArray(input.tiers) ? (input.tiers as string[]) : [];
+    for (const tier of variantTiers) {
+      const textWhy = hasModel ? modelFits(v.modelKey!.trim(), tier, imageTarget ? 'image' : 'text') : null;
+      if (textWhy && (!validModelKeys || validModelKeys.has(v.modelKey!.trim()))) {
+        throw new ExperimentValidationError(`variant index ${i} modelKey ${textWhy}`, 'VARIANT_MODEL_NOT_ALLOWED');
+      }
+      const imageWhy = v.imageGenModelKey ? modelFits(v.imageGenModelKey, tier, 'image') : null;
+      if (imageWhy) {
+        throw new ExperimentValidationError(`variant index ${i} imageGenModelKey ${imageWhy}`, 'VARIANT_IMAGE_MODEL_NOT_ALLOWED');
+      }
+    }
     if (hasRef && v.profileRef!.version !== undefined && (!Number.isInteger(v.profileRef!.version) || v.profileRef!.version < 1)) {
       throw new ExperimentValidationError(`variant index ${i} profileRef.version must be a positive integer (omit for the active version)`, 'VARIANT_PROFILE_REF_VERSION');
+    }
+    // A VARIANT SERVES A VERSION OF AN ASSISTANT OF THE EXPERIMENT'S OWN CLASSIFICATION (ADR-042). A
+    // version selects that classification's guardrails, tools and context sources, so a premium turn
+    // served another classification's version was refused its guardrail by IAM and fell back to the
+    // default, quietly comparing something other than what was armed (measured live 2026-10-13). IAM is the
+    // second layer; this is the first. A name the registry does not place (a runtime assistant) is left
+    // to that second layer rather than guessed at.
+    if (hasRef) {
+      const served = profiles.classificationOfAssistant(v.profileRef!.profileName);
+      const tiers = Array.isArray(input.tiers) ? (input.tiers as string[]) : [];
+      if (served && tiers.length && !tiers.every((t) => t === served)) {
+        throw new ExperimentValidationError(
+          `variant index ${i} profileRef '${v.profileRef!.profileName}' is an assistant of ${served}; this experiment runs in ${tiers.join(', ')}`,
+          'VARIANT_PROFILE_REF_CLASSIFICATION',
+        );
+      }
+    }
+    // THE ALT PIN BELONGS TO THE TREATMENT AND NOTHING ELSE (ADR-050), and names an alt and a concrete
+    // version. Arming derives it; whether that version was derived for this experiment is checked there.
+    if (v.altPin !== undefined) {
+      const pin = v.altPin as { profileName?: unknown; version?: unknown };
+      if (i !== 1) {
+        throw new ExperimentValidationError(`variant index ${i} altPin is the treatment's (variants[1]) only`, 'VARIANT_ALT_PIN_PLACEMENT');
+      }
+      if (typeof pin.profileName !== 'string' || !pin.profileName.startsWith('alt-')
+        || !Number.isInteger(pin.version) || (pin.version as number) < 1) {
+        throw new ExperimentValidationError(`variant index ${i} altPin names an alt and a version (>=1)`, 'VARIANT_ALT_PIN_INVALID');
+      }
+    }
+    // THE CONTROL PIN BELONGS TO THE CONTROL AND NOTHING ELSE, and names the live assistant (never an alt)
+    // and a concrete version. Arming sets it to the live active version.
+    if (v.controlPin !== undefined) {
+      const pin = v.controlPin as { profileName?: unknown; version?: unknown };
+      if (i !== 0) {
+        throw new ExperimentValidationError(`variant index ${i} controlPin is the control's (variants[0]) only`, 'VARIANT_CONTROL_PIN_PLACEMENT');
+      }
+      if (typeof pin.profileName !== 'string' || !pin.profileName || pin.profileName.startsWith('alt-')
+        || !Number.isInteger(pin.version) || (pin.version as number) < 1) {
+        throw new ExperimentValidationError(`variant index ${i} controlPin names the live assistant and a version (>=1)`, 'VARIANT_CONTROL_PIN_INVALID');
+      }
     }
   });
 
@@ -793,6 +1297,17 @@ export function validateAndSanitizeExperiment(
       'EXPERIMENT_INTENT_REQUIRED',
     );
   }
+  // A REFERENCED PROFILE IS NEVER AN INTENT EXPERIMENT'S VARIANT (ADR-050, as amended). An intent experiment
+  // DOES serve a whole version to every turn of an enrolled conversation: its candidate, which differs from
+  // the live version in one route only (`models.byIntent[<intent>].primary`), so no person sees the
+  // assistant change and the turns of other intents answer exactly as the control's. A referenced version
+  // may differ in anything, which is a `profile` experiment, not an intent one.
+  if (experimentType === 'intent' && (input.variants || []).some((v) => v?.profileRef)) {
+    throw new ExperimentValidationError(
+      'an intent experiment cannot run a profileRef variant: its candidate differs from the live version in one route; comparing whole versions is a profile experiment',
+      'PROFILE_REF_ON_INTENT_EXPERIMENT',
+    );
+  }
 
   // L5: startDate/endDate are load-bearing at resolve time (isLiveForClassification). A non-empty but
   // UNPARSEABLE date makes `new Date(x) <= now` a NaN compare (false), silently stranding the experiment -
@@ -808,11 +1323,16 @@ export function validateAndSanitizeExperiment(
 
   if (input.battleEnabled) {
     // A battle runs head-to-head in ONE channel, so it must target exactly one classification — never a
-    // mixed set (structural). But `battleEligible` is now a HINT, not a gate
-    // (SPEC-PORTABLE-PROFILES §1/§6): an OPERATOR-driven comparison may battle any profile/version at
-    // any classification.
-    // The classification CEILING still binds — resolveVariantForProfile rejects a model not allowed for
-    // the channel's classification (min-cap) — so allowing a non-"battleEligible" target never escalates.
+    // mixed set (structural).
+    //
+    // CAPABILITY IS A GATE; POLICY IS NOT CHECKED HERE (ADR-049). This block used to say eligibility was
+    // "a HINT, not a gate", on the reasoning that an operator-driven comparison may battle any
+    // profile at any classification. That reasoning survives for the POLICY half, which is why nothing
+    // here asks whether battle is switched on: an operator may arm a comparison before turning it on,
+    // and the turn path reads the setting fresh. It does NOT survive for capability, which is a fact
+    // about what the deployment built and cannot be changed by arming anything.
+    // The classification boundary still binds — resolveVariantForProfile rejects a model not allowed for
+    // the channel's classification (min-cap) — so this never escalates either way.
     // (Error code kept as BATTLE_TIER_PREMIUM_ONLY for the API/UI contract.)
     const tiers = input.tiers || [];
     if (tiers.length !== 1) {
@@ -821,8 +1341,17 @@ export function validateAndSanitizeExperiment(
         'BATTLE_TIER_PREMIUM_ONLY',
       );
     }
-    if (!profiles.profileFor(tiers[0]).battleEligible) {
-      console.log('[ExperimentManager] operator-driven battle on a non-battleEligible classification (battleEligible is now a hint):', tiers[0]);
+    // CAPABILITY IS A GATE, NOT A HINT (ADR-049). This logged and proceeded, on the reasoning that an
+    // operator-driven comparison may battle any profile at any classification. That reasoning holds
+    // for POLICY and not for capability: arming a battle on a classification whose deployment wires no
+    // battle plumbing produces an experiment that can never run a duel, and the operator finds out
+    // from a permissions error rather than from this refusal. Whether battle is turned ON is checked
+    // on the turn path, where an operator can change the answer without re-arming.
+    if (!profiles.isBattleCapable(tiers[0])) {
+      throw new ExperimentValidationError(
+        `battleEnabled experiments require a classification whose deployment wires battle; '${tiers[0]}' does not`,
+        'BATTLE_TIER_PREMIUM_ONLY',
+      );
     }
     if (variants.length !== 2) {
       throw new ExperimentValidationError(
@@ -830,10 +1359,21 @@ export function validateAndSanitizeExperiment(
         'BATTLE_VARIANT_COUNT',
       );
     }
-    if (!input.altBotSlotId) {
+    // THE CHALLENGER IS THIS CLASSIFICATION'S ALT, BY ID. One challenger per (classification, role) is the
+    // assignment record's key, so the only id a battle in this classification may name is the one the
+    // registry composes for it; any other is a typo or another classification's assistant.
+    const challenger = challengerOf(input);
+    if (!challenger) {
       throw new ExperimentValidationError(
-        'battleEnabled experiments require altBotSlotId',
-        'BATTLE_SLOT_REQUIRED',
+        'battleEnabled experiments require challengerAssistant',
+        'BATTLE_CHALLENGER_REQUIRED',
+      );
+    }
+    const expected = profiles.altAssistantName(tiers[0], DUEL_ROLE);
+    if (challenger !== expected) {
+      throw new ExperimentValidationError(
+        `the challenger of a ${tiers[0]} battle is ${expected ?? 'not declared'}, not ${challenger}`,
+        'BATTLE_CHALLENGER_MISMATCH',
       );
     }
     if (!input.boundBy) {
@@ -841,14 +1381,6 @@ export function validateAndSanitizeExperiment(
         'battleEnabled experiments require boundBy (ARN of the admin)',
         'BATTLE_BOUND_BY',
       );
-    }
-    for (const [i, v] of variants.entries()) {
-      if (!v.displayName) {
-        throw new ExperimentValidationError(
-          `battleEnabled experiments require displayName on every variant (variant index ${i} missing)`,
-          'BATTLE_DISPLAY_NAME',
-        );
-      }
     }
     // Phase-4 generation-out: it's a gen-out battle iff BOTH variants
     // name a registered image model. Half-configured (one variant only)
@@ -872,7 +1404,19 @@ export function validateAndSanitizeExperiment(
     }
   }
 
-  return { ...input, experimentType, objective, variants };
+  // THE ROW IS WRITTEN IN THE CURRENT SHAPE: the challenger by id, and none of the attributes the re-key
+  // retires, so an edit of an old row migrates it.
+  const challengerAssistant = input.battleEnabled ? challengerOf(input) : input.challengerAssistant;
+  // `sideNames` is what the console's read derives from the profiles (`battleSidesOf`); a request that sends
+  // it back is not naming anything, so it is dropped rather than stored.
+  const { sideNames: _derived, ...stored } = input as Experiment & { sideNames?: unknown };
+  return {
+    ...withoutLegacyBinding(stored as Experiment & LegacyBattleBinding),
+    ...(challengerAssistant && { challengerAssistant }),
+    experimentType,
+    objective,
+    variants,
+  };
 }
 
 /** Canonical experiment types. */
@@ -1059,20 +1603,22 @@ function validateGuardrail(g: ObjectiveGuardrail | undefined, index: number): Ob
 }
 
 /**
- * Mutual-exclusion rule: a classification
- * experiment cannot be active on a classification while any other type is active on that
- * classification, and vice versa — changing the classifier shifts routing for every
- * intent and confounds the other tests. Returns the active experiments that
- * conflict with the candidate over any shared classification (empty ⇒ no conflict).
- * DB-backed (mirrors findBattleSlotConflicts); the admin write path calls it
- * and converts a non-empty result to 409.
+ * One live experiment per classification (DESIGN §3.2.1): returns the live experiments that
+ * share any classification with the candidate, whatever either one's type (empty ⇒ no conflict).
+ * DB-backed (mirrors findChallengerConflicts); the admin write path calls it and converts a
+ * non-empty result to 409.
+ *
+ * Type does not matter because the resolver can only measure one. `resolveExperimentModel` takes
+ * the first live match from a table scan, so a second live experiment on the classification was
+ * accepted and then received no traffic at all, and which of the two won was scan order. That was
+ * measured live: three base_model experiments created beside a stale one each
+ * collected zero result rows. A classification experiment was already exclusive for its own
+ * reason (changing the classifier shifts routing for every intent); this widens that to every type.
  */
-export async function findTypeExclusionConflicts(args: {
-  experimentType: ExperimentType;
+export async function findClassificationConflicts(args: {
   tiers: Classification[];
   excludeExperimentId?: string;
 }): Promise<Experiment[]> {
-  const candidateType = args.experimentType ?? 'intent';
   const tiers = new Set(args.tiers || []);
   // Fresh read (bypass the 60s cache): this is the write-path conflict gate, so a blocker
   // created seconds ago must be seen or two conflicting experiments both activate.
@@ -1082,187 +1628,212 @@ export async function findTypeExclusionConflicts(args: {
     // An expired or not-yet-started experiment resolves NO traffic (isLiveForClassification), so it no
     // longer occupies the classification and must not block a replacement. Match the resolver's liveness
     // window (active + startDate<=now<endDate), not just the raw `active` status, or a dead experiment
-    // wedges the slot until an operator manually ends it.
+    // holds the classification until an operator manually ends it.
     if (e.status !== 'active') return false;
     if (e.startDate && new Date(e.startDate) > now) return false;
     if (e.endDate && new Date(e.endDate) <= now) return false;
     if (e.experimentId === args.excludeExperimentId) return false;
-    const otherType = e.experimentType ?? 'intent';
-    const sharesClassification = (e.tiers || []).some((t) => tiers.has(t));
-    if (!sharesClassification) return false;
-    // Conflict iff exactly one side is a classification experiment.
-    return (candidateType === 'classification') !== (otherType === 'classification');
+    return (e.tiers || []).some((t) => tiers.has(t));
   });
 }
 
 /**
- * Resolve a battle-bound alt-bot slot ARN to its variant config — the
- * hot path the async processor calls on every alt-bot invocation. Reads
- * from the existing 60s-cached experiments scan so this is effectively
- * free after a warm hit.
+ * ONE SIDE OF A DUEL, AS ITS PINNED VERSION (DESIGN-SEPARATE-ASSISTANTS §3.7, ADR-050).
  *
- * Returns null when no active battle-enabled experiment claims the slot.
+ * Both sides of a battle are pinned when the experiment is armed (DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP
+ * §3.5): the control is the live assistant's active version (`controlPin`), served from the live identity,
+ * and the treatment the candidate in the alt's history (`altPin`), served from the alt identity. A side's
+ * turn serves that one version, its routes included, like any assistant serves its version.
+ *
+ * `modelKey` and `imageGenModelKey` are read from the version: projections the router records so the vend
+ * narrows the side's session to what the version serves. `displayName` is the side's name as its profile
+ * gives it (`battleSideNames`): it names the side in the room, its placeholder, the rival's prompt and the
+ * scorecard.
  */
-export async function resolveBattleVariantBySlotArn(
-  slotArn: string,
-): Promise<{
+export interface BattleSide {
   experimentId: string;
   variantId: string;
+  /** The version's base model (`models.default`, else `modelKey`). */
   modelKey: BackendModelKey;
-  displayName: string;
-  systemPromptAddendum?: string;
-  /** Phase-2: the variant's IMAGE-generation model, stamped into battleContext.variantImageModelKey so
-   *  the worker runs its normal image path for an image battle (no battle-specific image branch). */
+  /**
+   * THE SIDE'S NAME IS ITS PROFILE'S, never an alias on the experiment row: the pinned
+   * version's `displayName`, else its assistant's configured one. A runtime rename of the version reaches
+   * the duel. The challenger's version is usually a copy of the live one, so when the two names match the
+   * challenger's carries the `battleAltName` marker, and the scorecard's columns differ.
+   */
+  displayName?: string;
+  /** The primary of the version's image route for the experiment's image intent (`imageRouteKeyOf`), when it names one. */
   imageGenModelKey?: ImageGenModelKey;
   longFormMode?: 'one-shot' | 'outline-first';
-  /** §6: the variant's whole profile VERSION, for a profileRef variant. Battle is the headline
-   *  profile-vs-profile surface, so serving only a model here would make the duel compare two
-   *  identical assistants whenever the versions differ in tools, persona or classifier mode. */
-  variantProfile?: ProfileDefinition;
-} | null> {
-  if (!slotArn) return null;
-  // FRESH, not the 60s cache. These resolvers decide WHAT THE DUEL IS, and they run once per battle
-  // turn - not per ordinary turn - so the cache buys nothing here and costs correctness. The e2e image
-  // duel is the worked example: `activateBattleExperiment` had just made the IMAGE experiment the sole
-  // active one, but this read still saw the TEXT experiment on the same slot, `.find()` returned it, it
-  // carried no imageGenModelKey, and the duel silently degraded to a text battle - no image, no error,
-  // and nothing in any log to say why. Same defect as the enable race, in the sibling call sites that
-  // fix did not reach.
-  const experiments = await loadExperiments(true);
-  const exp = experiments.find(
-    (e) => e.battleEnabled === true && e.altBotSlotArn === slotArn,
-  );
-  if (!exp) return null;
-  // variants[0] = control (default bot); variants[1] = treatment (alt slot).
-  const treatment = exp.variants[1];
-  if (!treatment) return null;
-  // §6: ONE read for the whole version, so this side's model and its tool set always come from the
-  // same version. An unresolvable profileRef fails the side closed, exactly as before.
-  const variantProfile = await variantDefinitionOf(treatment);
-  if (treatment.profileRef && !variantProfile) return null;
-  const treatmentModelKey = (variantProfile?.modelKey ?? treatment.modelKey) as BackendModelKey | undefined;
-  if (!treatmentModelKey) return null;
-  return {
-    experimentId: exp.experimentId,
-    variantId: treatment.variantId,
-    modelKey: treatmentModelKey,
-    displayName: treatment.displayName ?? treatment.variantId,
-    systemPromptAddendum: treatment.systemPromptAddendum,
-    ...((treatment.imageGenModelKey ?? variantProfile?.models?.image)
-      ? { imageGenModelKey: (treatment.imageGenModelKey ?? variantProfile?.models?.image) as ImageGenModelKey }
-      : {}),
-    longFormMode: exp.longFormMode,
-    ...(variantProfile && { variantProfile }),
-  };
+  /** The pinned version this side serves. */
+  variantProfile: ProfileDefinition;
+  /** Its number, from the side's pin, so the side's turns are attributed to it (`ExperimentResolution.variantVersion`). */
+  variantVersion?: number;
+}
+
+/** Which pin a side reads: the control's (`variants[0].controlPin`) or the treatment's (`variants[1].altPin`). */
+type DuelSideName = 'control' | 'treatment';
+
+/**
+ * Whether `e` is the LIVE battle whose challenger is `challengerAssistant`: battle-enabled, `active`, and
+ * inside its window. An end date that has passed ends the experiment as surely as a status change,
+ * so a duel never serves a side of an experiment that has ended or paused.
+ */
+function isLiveBattleOf(e: Experiment, challengerAssistant: string, now = new Date()): boolean {
+  return e.status === 'active' && e.battleEnabled === true && challengerOf(e) === challengerAssistant
+    && (!e.startDate || new Date(e.startDate) <= now)
+    && (!e.endDate || new Date(e.endDate) > now);
 }
 
 /**
- * Resolve the CONTROL side (variants[0]) of the battle bound to
- * `altSlotArn`. The default bot IS the control side; from its
- * invocation `battleContext.rivalBotArn` is the alt-slot ARN, so the
- * async processor resolves the experiment by the rival's ARN here.
+ * The battle experiment whose challenger is `challengerAssistant` (`alt-{role}-{classification}`), READ
+ * ONCE AND FRESH. Null when no live battle names the challenger.
  *
- * Honoring the experiment's configured control variant (model +
- * displayName + addendum) makes `/battle` a faithful head-to-head of
- * the two configured variants — the Design Anchor in SPEC-BATTLE.md.
- * This generalizes the older SPEC-BATTLE §413 ("control = normal
- * classification+intent resolution"): callers fall back to classification+intent resolution
- * only when there is no bound experiment or it pins no control modelKey
- * (treated as `null` here → caller keeps its existing default).
+ * BY ID WHEN THE CALLER KNOWS IT: the channel's battle config binds the experiment at enable, so a duel turn
+ * reads that one row with a consistent GetItem rather than scanning the table. Without an id (a config
+ * written before the binding, or a caller with no conversation) it reads one scan of the active rows.
+ * Never the 60s cache: this decides WHAT THE DUEL IS, and a read that still saw an experiment the operator
+ * had just replaced on the same alt would duel the wrong one, with nothing in any log to say why.
  *
- * Same 60s-cached scan as resolveBattleVariantBySlotArn — free after a
- * warm hit. Returns null when no active battle-enabled experiment
- * claims the slot.
+ * A BOUND ROW THAT IS NOT LIVE IS CONFIRMED BY THE SCAN before it ends a duel. The id comes from a config
+ * the caller may hold cached, so a conversation re-bound to a new experiment a moment ago could still name
+ * the old one; ending its duel on that would be a false answer. Refusals are rare, so the scan costs a
+ * read only on that path, the same asymmetry `battleIsRunnableConfirmed` applies.
  */
-export async function resolveBattleControlVariantByAltSlotArn(
-  altSlotArn: string,
-): Promise<{
-  experimentId: string;
-  variantId: string;
-  modelKey: BackendModelKey;
-  displayName: string;
-  systemPromptAddendum?: string;
-  /** Phase-2: the control variant's IMAGE-generation model (see resolveBattleVariantBySlotArn). */
-  imageGenModelKey?: ImageGenModelKey;
-  longFormMode?: 'one-shot' | 'outline-first';
-  /** §6: the control variant's whole profile VERSION (see resolveBattleVariantBySlotArn). Both sides
-   *  must resolve the same way, or a profile-vs-profile duel compares a full definition against a
-   *  bare model and reports a difference that is an artifact of the resolution. */
-  variantProfile?: ProfileDefinition;
-} | null> {
-  if (!altSlotArn) return null;
-  // FRESH, not the 60s cache. These resolvers decide WHAT THE DUEL IS, and they run once per battle
-  // turn - not per ordinary turn - so the cache buys nothing here and costs correctness. The e2e image
-  // duel is the worked example: `activateBattleExperiment` had just made the IMAGE experiment the sole
-  // active one, but this read still saw the TEXT experiment on the same slot, `.find()` returned it, it
-  // carried no imageGenModelKey, and the duel silently degraded to a text battle - no image, no error,
-  // and nothing in any log to say why. Same defect as the enable race, in the sibling call sites that
-  // fix did not reach.
+async function battleChallengedBy(challengerAssistant: string, experimentId?: string): Promise<Experiment | null> {
+  if (!challengerAssistant) return null;
+  if (experimentId) {
+    const exp = await readExperimentFresh(experimentId);
+    if (exp && isLiveBattleOf(exp, challengerAssistant)) return exp;
+  }
   const experiments = await loadExperiments(true);
-  const exp = experiments.find(
-    (e) => e.battleEnabled === true && e.altBotSlotArn === altSlotArn,
-  );
-  if (!exp) return null;
-  // variants[0] = control (default bot); variants[1] = treatment (alt slot).
-  const control = exp.variants[0];
-  if (!control) return null;
-  const variantProfile = await variantDefinitionOf(control); // §6: one read for the whole version
-  if (control.profileRef && !variantProfile) return null;
-  const controlModelKey = (variantProfile?.modelKey ?? control.modelKey) as BackendModelKey | undefined;
-  if (!controlModelKey) return null;
-  return {
-    experimentId: exp.experimentId,
-    variantId: control.variantId,
-    modelKey: controlModelKey,
-    displayName: control.displayName ?? control.variantId,
-    systemPromptAddendum: control.systemPromptAddendum,
-    ...((control.imageGenModelKey ?? variantProfile?.models?.image)
-      ? { imageGenModelKey: (control.imageGenModelKey ?? variantProfile?.models?.image) as ImageGenModelKey }
-      : {}),
-    longFormMode: exp.longFormMode,
-    ...(variantProfile && { variantProfile }),
-  };
+  return experiments.find((e) => isLiveBattleOf(e, challengerAssistant)) ?? null;
 }
 
 /**
- * Phase-4 generation-out: resolve the battle bound to `altSlotArn` to
- * its per-side Bedrock image-gen model ids — the hot path the `/battle`
- * fan-out calls once to populate each bot's
- * `battleContext.imageGenModelId`. `control` = `variants[0]` (the
- * default bot), `treatment` = `variants[1]` (the alt slot). Returns
- * `null` when the slot isn't battle-bound OR the bound experiment is a
- * text battle (no `imageGenModelKey`) — the fan-out then leaves
- * `imageGenModelId` unset and the processor runs a normal text battle
- * (honest fall-through, validated both-or-neither at write time so a
- * single side never carries it). Same 60s-cached scan as
- * resolveBattleVariantBySlotArn — effectively free after a warm hit.
+ * One side of the battle `exp` as its pinned version.
+ *
+ * NULL WHEN THE SIDE HAS NO PIN, OR ITS PIN DOES NOT RESOLVE, and the arm path refuses a battle without
+ * both pins (`battleArmRefusal`), so this is reached only by a battle armed before the control was
+ * pinned or by a version that has since become unreadable. The caller then serves the side's assistant
+ * as it is, which the vend refuses for an alt with no pinned version.
  */
-export async function resolveBattleImageGenPair(
-  altSlotArn: string,
-): Promise<{ controlModelId: string; treatmentModelId: string } | null> {
-  if (!altSlotArn) return null;
-  // FRESH, not the 60s cache. These resolvers decide WHAT THE DUEL IS, and they run once per battle
-  // turn - not per ordinary turn - so the cache buys nothing here and costs correctness. The e2e image
-  // duel is the worked example: `activateBattleExperiment` had just made the IMAGE experiment the sole
-  // active one, but this read still saw the TEXT experiment on the same slot, `.find()` returned it, it
-  // carried no imageGenModelKey, and the duel silently degraded to a text battle - no image, no error,
-  // and nothing in any log to say why. Same defect as the enable race, in the sibling call sites that
-  // fix did not reach.
-  const experiments = await loadExperiments(true);
-  const exp = experiments.find(
-    (e) => e.battleEnabled === true && e.altBotSlotArn === altSlotArn,
-  );
-  if (!exp) return null;
-  const controlKey = exp.variants[0]?.imageGenModelKey;
-  const treatmentKey = exp.variants[1]?.imageGenModelKey;
-  if (!controlKey || !treatmentKey) return null; // text battle
-  const control = IMAGE_GEN_MODELS[controlKey];
-  const treatment = IMAGE_GEN_MODELS[treatmentKey];
-  if (!control || !treatment) return null; // unknown key — honest skip
+async function battleSideOf(exp: Experiment, side: DuelSideName): Promise<BattleSide | null> {
+  // variants[0] = control (the live assistant); variants[1] = treatment (the alt).
+  const variant = exp.variants[side === 'control' ? 0 : 1];
+  if (!variant) return null;
+  const pin = side === 'control' ? variant.controlPin : variant.altPin;
+  if (!pin) {
+    console.warn('[ExperimentManager] battle side has no pinned version; re-arm the experiment to derive one', {
+      experimentId: exp.experimentId, side, variantId: variant.variantId,
+    });
+    return null;
+  }
+  const version = await variantDefinitionOf({ ...variant, profileRef: pin });
+  if (!version) return null; // already logged by variantDefinitionOf
+  const modelKey = (concreteKey(version.models?.default) ?? concreteKey(version.modelKey)) as BackendModelKey | undefined;
+  if (!modelKey) return null;
+  // The primary of the image route the experiment's variant writes (`imageRouteKeyOf`), else the
+  // `image_generation` route's, the legacy `models.image` included.
+  const image = imagePrimaryForIntent(version.models, imageRouteKeyOf(exp)) as ImageGenModelKey | undefined;
   return {
-    controlModelId: control.bedrockModelId,
-    treatmentModelId: treatment.bedrockModelId,
+    experimentId: exp.experimentId,
+    variantId: variant.variantId,
+    modelKey,
+    // The version's own name, or its assistant's configured one; the challenger's is settled against the
+    // control's in `battleSideNames`, because only both together say whether the two would read the same.
+    ...(side === 'control'
+      ? { displayName: profiles.displayNameFor(pin.profileName, version.displayName) }
+      : version.displayName?.trim() ? { displayName: version.displayName.trim() } : {}),
+    ...(image && image in IMAGE_GEN_MODELS ? { imageGenModelKey: image } : {}),
+    longFormMode: exp.longFormMode,
+    variantProfile: version,
+    ...(pinnedVersionOf(pin) !== undefined ? { variantVersion: pinnedVersionOf(pin) } : {}),
   };
+}
+
+/** A model key, unless it is blank or the `'default'` sentinel a version uses to track the platform default. */
+function concreteKey(key: string | undefined): string | undefined {
+  return key && key !== 'default' ? key : undefined;
+}
+
+/**
+ * BOTH SIDES OF A BATTLE, AND WHETHER IT IS STILL ACTIVE, FROM ONE READ OF ITS EXPERIMENT.
+ *
+ * `active` is false once the experiment is paused, completed, deleted or past its end date: an unjudged or
+ * decided treatment must not keep answering in a duel, so a duel turn that reads it
+ * false ends the duel. Each side is null when its pin is absent or does not resolve, and a side that fails
+ * to resolve does not take the other with it. Throws only when the experiment itself cannot be read, which
+ * the caller treats as "serve both sides as they are", never as an ended experiment.
+ */
+export interface BattleSides {
+  active: boolean;
+  control: BattleSide | null;
+  treatment: BattleSide | null;
+}
+
+export async function resolveBattleSides(
+  challengerAssistant: string,
+  opts: { experimentId?: string } = {},
+): Promise<BattleSides> {
+  const exp = await battleChallengedBy(challengerAssistant, opts.experimentId);
+  if (!exp) return { active: false, control: null, treatment: null };
+  return { active: true, ...(await battleSidesOf(exp)) };
+}
+
+/**
+ * BOTH SIDES OF THE BATTLE `exp`, FROM THE EXPERIMENT IN HAND, named as the duel names them
+ * (`battleSideNames`). For a caller that already holds the row: enabling Battle Mode in a room, naming the
+ * alt's identity when an experiment is armed (its start date may still be ahead), and the console's read of
+ * an experiment. It neither re-reads the experiment nor asks whether it is live: the caller holds the row
+ * and has answered that already. Each side is null when its pin is absent or does not resolve, and a side
+ * that fails to resolve is logged and does not take the other with it.
+ */
+export async function battleSidesOf(exp: Experiment): Promise<{ control: BattleSide | null; treatment: BattleSide | null }> {
+  const sideOf = (side: DuelSideName): Promise<BattleSide | null> => battleSideOf(exp, side).catch((err) => {
+    console.warn('[ExperimentManager] a battle side did not resolve; it serves its assistant as it is', {
+      experimentId: exp.experimentId, side, err: (err as Error)?.message,
+    });
+    return null;
+  });
+  const [control, treatment] = await Promise.all([sideOf('control'), sideOf('treatment')]);
+  return battleSideNames(control, treatment);
+}
+
+/**
+ * THE TWO SIDES' NAMES, SETTLED TOGETHER. The challenger takes its version's name, else the control's; when
+ * the two read the same (case aside) the challenger's is marked with the `battle-alt-name` template,
+ * so a person can tell which is the challenger without an alias. Exported for the tests.
+ */
+export function battleSideNames(
+  control: BattleSide | null,
+  treatment: BattleSide | null,
+): { control: BattleSide | null; treatment: BattleSide | null } {
+  if (!treatment) return { control, treatment };
+  const controlName = control?.displayName?.trim();
+  const own = treatment.displayName?.trim() || controlName;
+  if (!own) return { control, treatment };
+  const name = controlName && own.toLowerCase() === controlName.toLowerCase()
+    ? noticeLine(undefined, 'battleAltName', { name: own })
+    : own;
+  return { control, treatment: { ...treatment, displayName: name } };
+}
+
+/**
+ * The TREATMENT side (variants[1], the alt) of the battle whose challenger is `challengerAssistant`: its
+ * `altPin` version. Also how a caller asks "is this alt armed": null when no battle-enabled experiment
+ * names it. A duel turn reads both sides at once (`resolveBattleSides`); this serves a turn the alt
+ * answers outside a duel.
+ */
+export async function resolveBattleTreatment(challengerAssistant: string): Promise<BattleSide | null> {
+  const exp = await battleChallengedBy(challengerAssistant);
+  if (!exp) return null;
+  // Both sides, because the challenger's name is settled against the control's (`battleSideNames`).
+  const [control, treatment] = await Promise.all([
+    battleSideOf(exp, 'control').catch(() => null),
+    battleSideOf(exp, 'treatment'),
+  ]);
+  return battleSideNames(control, treatment).treatment;
 }
 
 /**
@@ -1282,7 +1853,7 @@ export async function resolveActiveBattleExperimentForClassification(
   classification: string,
 ): Promise<Experiment | null> {
   // forceRefresh, for the same reason the create/activate conflict gate uses it (see loadExperiments):
-  // this read BINDS A SLOT, so it is correctness-critical, not a hot-path lookup.
+  // this read BINDS A CHALLENGER, so it is correctness-critical, not a hot-path lookup.
   //
   // The caller (`channel-battle.ts`) resolves an experiment HERE and then validates it with a direct,
   // uncached `GetCommand`. With the 60s cache those two reads disagree for up to a minute after any
@@ -1294,7 +1865,7 @@ export async function resolveActiveBattleExperimentForClassification(
   // Share the resolver's liveness window rather than re-deriving it from raw `status`. Gating on
   // `active` alone auto-selected an EXPIRED (past-endDate) or not-yet-started experiment when an
   // operator enabled /battle on a channel - one that resolves no traffic, so the battle would arm
-  // against an experiment the resolver ignores. `findTypeExclusionConflicts` was updated to the
+  // against an experiment the resolver ignores. `findClassificationConflicts` was updated to the
   // window and this was not, which also made the two disagree about which experiments are occupying
   // a classification.
   const matches = experiments.filter(
@@ -1312,44 +1883,18 @@ export async function resolveActiveBattleExperimentForClassification(
 }
 
 /**
- * Find any other active battle-enabled experiments bound to the same
- * altBotSlotId. Used by the admin-API enable path to enforce the "one
- * experiment per slot" rule (returns conflicts as 409).
+ * Find any other battle-enabled experiments that name the same challenger. Used to enforce "one
+ * experiment per challenger" (returns conflicts as 409).
  */
-export async function findBattleSlotConflicts(args: {
-  altBotSlotId: string;
+export async function findChallengerConflicts(args: {
+  challengerAssistant: string;
   excludeExperimentId?: string;
 }): Promise<Experiment[]> {
   const experiments = await loadExperiments();
   return experiments.filter(
     (e) =>
       e.battleEnabled === true
-      && e.altBotSlotId === args.altBotSlotId
+      && challengerOf(e) === args.challengerAssistant
       && e.experimentId !== args.excludeExperimentId,
   );
-}
-
-/**
- * Look up the resolved display name for a bot ARN within a battle
- * context. For the alt-slot bot: the treatment variant's displayName.
- * For the default bot: the control variant's displayName (resolved via
- * `altSlotArn`, since the experiment is keyed by the alt-slot ARN) —
- * NOT the generic "the default assistant" anymore, so the rival name
- * woven into the round-1/round-2 system prompt and the scorecard match
- * what the user sees (e.g. "Atlas"). Falls back gracefully when the
- * battle/variant can't be resolved.
- */
-export async function resolveBotDisplayName(args: {
-  thisBotArn: string;
-  defaultBotArn: string;
-  /** The battle's alt-slot ARN — the experiment is keyed by it, so the
-   *  control side needs it to resolve variants[0].displayName. */
-  altSlotArn: string;
-}): Promise<string> {
-  if (args.thisBotArn === args.defaultBotArn) {
-    const control = await resolveBattleControlVariantByAltSlotArn(args.altSlotArn);
-    return control?.displayName ?? 'the default assistant';
-  }
-  const variant = await resolveBattleVariantBySlotArn(args.thisBotArn);
-  return variant?.displayName ?? 'the other assistant';
 }

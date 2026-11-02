@@ -11,7 +11,9 @@
  * 2. Parse NDJSON lines, extract user messages and agent responses
  * 3. Pair into exchanges (user message + next agent response)
  * 4. Score each exchange with Bedrock Haiku
- * 5. Write evaluation results as NDJSON to S3 evaluations/ prefix
+ * 5. When the reply delivered a document, copy it into the archive and grade it as its own row
+ *    (`evaluationType: 'document'`, SPEC-EVALUATION FR22)
+ * 6. Write evaluation results as NDJSON to S3 evaluations/ prefix
  */
 
 import {
@@ -26,9 +28,30 @@ import {
 } from '@aws-sdk/client-bedrock-runtime';
 import { S3Client, PutObjectCommand } from '@aws-sdk/client-s3';
 import { stripMessageMarkers } from '../lib/message-markers.js';
+import { declaresFinalAnswer } from '../lib/turn-declaration.js';
+import { renderPrompt } from '../lib/render-prompt.js';
+import { UTILITY_MODEL_ID } from '../../../lib/config/model-strategy.js';
+import { decodeContent } from '../lib/chime/history.js';
+import { loadProfileRegistry } from '../../../lib/profile-registry';
+import { fetchAttachmentBytes } from '../lib/attachment-bytes.js';
+import {
+  DELIVERED_DOCUMENTS_PREFIX,
+  DOCUMENT_FRAMING,
+  deliveredDocumentOf,
+  documentRequirementsText,
+  documentSha256,
+  type DeliveredDocumentReference,
+  type DocumentSkip,
+} from '../lib/delivered-document.js';
+import { archiveDeliveredDocument } from '../analytics-aurora/delivered-document-archive.js';
 
 const region = process.env.AWS_REGION_NAME || process.env.AWS_REGION || 'us-east-1';
 const ARCHIVE_BUCKET = process.env.ARCHIVE_BUCKET || '';
+// The conversation's deliverables (`generated-docs/`), read once per delivered document to make the
+// archive's own copy. Unset: no document is copied, and each is recorded as not archived.
+const ATTACHMENTS_BUCKET = process.env.ATTACHMENTS_BUCKET || '';
+/** The longest document the judge is shown, in characters; the same bound the Aurora runner applies. */
+const JUDGE_DOCUMENT_MAX_CHARS = Number(process.env.EVAL_DOCUMENT_MAX_CHARS || 100_000);
 const ATHENA_WORKGROUP = process.env.ATHENA_WORKGROUP || 'agent-echelon-analytics';
 const ATHENA_DATABASE = process.env.ATHENA_DATABASE || 'agent_echelon';
 
@@ -36,41 +59,30 @@ const athenaClient = new AthenaClient({ region });
 const bedrockClient = new BedrockRuntimeClient({ region });
 const s3Client = new S3Client({ region });
 
-// Intent weights for composite scoring
-const AGENT_INTENT_WEIGHTS: Record<string, Record<string, number>> = {
-  basic: {
-    'general': 0.60,
-    'greeting': 0.20,
-    'acknowledgment': 0.20,
-  },
-  standard: {
-    'guided_troubleshooting': 0.30,
-    'data_extraction': 0.25,
-    'report_generation': 0.25,
-    'general': 0.15,
-    'greeting': 0.025,
-    'acknowledgment': 0.025,
-  },
-  premium: {
-    'guided_troubleshooting': 0.30,
-    'data_extraction': 0.25,
-    'report_generation': 0.25,
-    'general': 0.15,
-    'greeting': 0.025,
-    'acknowledgment': 0.025,
-  },
+// Intent weights for composite scoring, by INTENT and the same for every assistant. A score's
+// `agentType` is the assistant's own name (`concierge`, a deployment's own), never a classification
+// value, so a table keyed by classification names matched no assistant at all. An intent not listed
+// weighs `UNLISTED_INTENT_WEIGHT`.
+const INTENT_WEIGHTS: Record<string, number> = {
+  'guided_troubleshooting': 0.30,
+  'data_extraction': 0.25,
+  'report_generation': 0.25,
+  'general': 0.15,
+  'greeting': 0.025,
+  'acknowledgment': 0.025,
 };
+const UNLISTED_INTENT_WEIGHT = 0.02;
 
 interface Exchange {
   channelArn: string;
-  userType: string;
+  conversationClassification: string;
   agentType: string;
   intent: string;
   userMessage: string;
   agentResponse: string;
   userMessageAt: string;
   agentResponseAt: string;
-  // Model + experiment + telemetry fields denormalised from the bot
+  // Model + experiment + telemetry fields denormalized from the bot
   // reply's metadata so per-exchange eval rows can power admin queries
   // (Models, Latency, Model Effectiveness, Experiment Results) without
   // a second join back to the conversations table. All optional —
@@ -86,12 +98,17 @@ interface Exchange {
   wasFallback?: boolean;
   assignmentMode?: string;
   deliveryOption?: string;
-  // Config attribution — denormalised from the bot reply's
+  // Config attribution — denormalized from the bot reply's
   // analytics metadata so an eval row is sliceable by config (persona/pack), not just model.
   configId?: string;
   personaVersion?: string;
   intentPackVersion?: string;
   systemPromptHash?: string;
+  /**
+   * The document this reply delivered, from the reference the turn put on the inline Metadata
+   * (`inlineDeliveredDocument`: Athena mode has no out-of-band store). Graded as its own row.
+   */
+  deliveredDocument?: DeliveredDocumentReference;
 }
 
 interface RelevanceResult {
@@ -111,11 +128,12 @@ interface EvaluationResult {
   channelArn: string;
   intentType: string;
   agentType: string;
-  relevanceScore: number;
-  classification: string;
-  reasoning: string;
+  /** Absent on a `document_skipped` row, which records that no score was given. */
+  relevanceScore?: number;
+  classification?: string;
+  reasoning?: string;
   evaluatedAt: string;
-  // Mirror of Exchange's denormalised metadata. The eval row is the
+  // Mirror of Exchange's denormalized metadata. The eval row is the
   // unit the admin dashboard rolls up per (model, intent, experiment),
   // so capturing telemetry here means the analytics queries never need
   // to re-parse conversations metadata. Null when the bot reply lacked
@@ -136,6 +154,20 @@ interface EvaluationResult {
   personaVersion?: string;
   intentPackVersion?: string;
   systemPromptHash?: string;
+  /**
+   * WHICH ARTIFACT THE ROW IS ABOUT (SPEC-EVALUATION FR22). `exchange` is the chat reply; `document` is
+   * the file the reply delivered, graded from the archive's copy; `document_skipped` is a delivered
+   * document that was not graded, with `skipReason`, and carries no score. Every reader of reply scores
+   * keeps to `exchange`, so a document score is never pooled into a reply rate.
+   */
+  evaluationType: 'exchange' | 'document' | 'document_skipped';
+  /** On a document row: the archive key of the copy the judge read, and the SHA-256 of its bytes. */
+  artifactKey?: string;
+  artifactSha256?: string;
+  /** On a document row: what kind of document (the producing task type, else `document`). */
+  documentKind?: string;
+  /** On a `document_skipped` row: why it was not graded. */
+  skipReason?: DocumentSkip;
 }
 
 // Relevance evaluation prompt
@@ -144,8 +176,8 @@ const RELEVANCE_PROMPT = `You are an expert evaluator assessing whether an AI ag
 ## Context
 
 Agent Type: {{agentType}}
-User Type: {{userType}}
-
+Conversation Classification: {{conversationClassification}}
+{{documentFraming}}
 ## Current Exchange
 
 User Message: {{userMessage}}
@@ -298,7 +330,7 @@ ORDER BY channel_arn, created_at
     const next: Msg = {
       messageId: id,
       channelArn: row[1] || existing?.channelArn || '',
-      content: tryDecode(row[2] || ''),
+      content: decodeContent(row[2] || ''),
       senderArn: row[3] || existing?.senderArn || '',
       metadata: row[4] || existing?.metadata || '',
       // Preserve the CREATE timestamp; UPDATEs would shift ordering.
@@ -320,10 +352,18 @@ ORDER BY channel_arn, created_at
   // both of these; instead we walk forward from each user message to
   // find the next non-placeholder bot reply in the same channel that
   // arrives before the user's next message in that channel.
+  //
+  // AND A TURN THAT DECLARED IT IS FINISHED IS NOT ONE, however it is marked (2026-09-11). A DIRECT
+  // answer now carries a correlation marker so it can be paired; it posts once and no update
+  // follows. Skipped as a placeholder, the walk below would keep going and hand this user message to
+  // somebody ELSE'S reply to be judged against - a mispairing inside the judge, which is worse than
+  // not judging the turn at all.
   const isPlaceholder = (content: string): boolean =>
-    content.includes('<!--corr:') ||
-    content === 'One moment...' ||
-    content === 'Analyzing...';
+    !declaresFinalAnswer(content) && (
+      content.includes('<!--corr:') ||
+      content === 'One moment...' ||
+      content === 'Analyzing...'
+    );
 
   const exchanges: Exchange[] = [];
 
@@ -348,20 +388,22 @@ ORDER BY channel_arn, created_at
     // Extract analytics metadata from bot response
     let agentType = 'unknown';
     let intent = 'unknown';
-    let userType = 'unknown';
-    // Config attribution (P4) — denormalise the config fingerprint so eval rows slice by config.
+    let conversationClassification = 'unknown';
+    // Config attribution (P4) — denormalize the config fingerprint so eval rows slice by config.
     let configId: string | undefined;
     let personaVersion: string | undefined;
     let intentPackVersion: string | undefined;
     let systemPromptHash: string | undefined;
+    let deliveredDocument: DeliveredDocumentReference | undefined;
 
     if (next.metadata) {
       try {
         const meta = JSON.parse(next.metadata);
+        deliveredDocument = deliveredDocumentOf(meta);
         const analytics = meta.analytics || meta;
         agentType = analytics.agentType || 'unknown';
         intent = analytics.intent || 'unknown';
-        userType = analytics.userType || 'unknown';
+        conversationClassification = analytics.classification || 'unknown';
         configId = analytics.configId;
         personaVersion = analytics.personaVersion;
         intentPackVersion = analytics.intentPackVersion;
@@ -373,7 +415,7 @@ ORDER BY channel_arn, created_at
 
     exchanges.push({
       channelArn: current.channelArn,
-      userType,
+      conversationClassification,
       agentType,
       intent,
       userMessage: current.content,
@@ -384,6 +426,7 @@ ORDER BY channel_arn, created_at
       ...(personaVersion && { personaVersion }),
       ...(intentPackVersion && { intentPackVersion }),
       ...(systemPromptHash && { systemPromptHash }),
+      ...(deliveredDocument && { deliveredDocument }),
     });
   }
 
@@ -391,21 +434,32 @@ ORDER BY channel_arn, created_at
 }
 
 /**
- * Evaluate a single exchange using Bedrock Haiku
+ * Evaluate a single exchange using Bedrock Haiku.
+ *
+ * `artifact` is a delivered document (SPEC-EVALUATION FR22): the same rubric, with the document in the
+ * place of the reply and the shared document framing (`DOCUMENT_FRAMING`) in the context. Absent, the
+ * reply is scored and the framing placeholder renders empty.
  */
-async function evaluateExchange(exchange: Exchange): Promise<RelevanceResult> {
-  // Strip internal markers from content before evaluation
+async function evaluateExchange(exchange: Exchange, artifact?: { text: string; framing: string }): Promise<RelevanceResult> {
+  // Strip internal markers from content before evaluation. A document is a file, not a chat message:
+  // it carries no markers, and stripping would rewrite content the judge has to see as delivered.
   const cleanUserMessage = stripMarkers(exchange.userMessage);
-  const cleanAgentResponse = stripMarkers(exchange.agentResponse);
+  const cleanAgentResponse = artifact ? artifact.text : stripMarkers(exchange.agentResponse);
 
-  const prompt = RELEVANCE_PROMPT
-    .replace('{{agentType}}', exchange.agentType)
-    .replace('{{userType}}', exchange.userType)
-    .replace('{{userMessage}}', cleanUserMessage)
-    .replace('{{agentResponse}}', cleanAgentResponse);
+  // THE SAME RENDERER THE AURORA RUNNER USES, and this file is the reason the fix has to reach both:
+  // it is the runner Athena mode deploys, Athena mode is the default, and a chained `.replace` lets a
+  // message containing `` $` `` splice the surrounding rubric into the evidence. See
+  // `lib/render-prompt.ts` for the two defects and why one pass through a replacer closes both.
+  const prompt = renderPrompt(RELEVANCE_PROMPT, {
+    agentType: exchange.agentType,
+    conversationClassification: exchange.conversationClassification,
+    documentFraming: artifact ? artifact.framing : '',
+    userMessage: cleanUserMessage,
+    agentResponse: cleanAgentResponse,
+  });
 
   const command = new InvokeModelCommand({
-    modelId: 'anthropic.claude-3-haiku-20240307-v1:0',
+    modelId: UTILITY_MODEL_ID,
     contentType: 'application/json',
     accept: 'application/json',
     body: JSON.stringify({
@@ -473,20 +527,23 @@ async function writeAgentScores(
 
   // Group by agent type and intent
   const byAgent: Record<string, Record<string, number[]>> = {};
+  // REPLIES ONLY. An agent score is a reply score; a delivered document's grade is a different
+  // artifact and is reported on its own rows, never averaged into this one.
   for (const result of results) {
+    if (result.evaluationType !== 'exchange' || typeof result.relevanceScore !== 'number') continue;
     if (!byAgent[result.agentType]) byAgent[result.agentType] = {};
     if (!byAgent[result.agentType][result.intentType]) byAgent[result.agentType][result.intentType] = [];
     byAgent[result.agentType][result.intentType].push(result.relevanceScore);
   }
 
   for (const [agentType, intents] of Object.entries(byAgent)) {
-    const weights = AGENT_INTENT_WEIGHTS[agentType] || {};
+    const weights = INTENT_WEIGHTS;
     let weightedSum = 0;
     let totalWeight = 0;
 
     for (const [intent, scores] of Object.entries(intents)) {
       const avgScore = scores.reduce((a, b) => a + b, 0) / scores.length;
-      const weight = weights[intent] || 0.02;
+      const weight = weights[intent] || UNLISTED_INTENT_WEIGHT;
       weightedSum += avgScore * weight;
       totalWeight += weight;
     }
@@ -504,7 +561,7 @@ async function writeAgentScores(
     Body: JSON.stringify({
       date: dateStr,
       scores: agentScores,
-      totalExchanges: results.length,
+      totalExchanges: results.filter((r) => r.evaluationType === 'exchange').length,
     }),
     ContentType: 'application/json',
   }));
@@ -516,19 +573,86 @@ async function writeAgentScores(
 // SPA parser + the Aurora eval runner), so the judge never sees a raw marker.
 const stripMarkers = stripMessageMarkers;
 
-function tryDecode(content: string): string {
+/**
+ * GRADE THE DOCUMENT A REPLY DELIVERED, AS ITS OWN ROW (SPEC-EVALUATION FR22), in Athena mode.
+ *
+ * THE ARCHIVE COPY IS MADE HERE. In Aurora mode archival copies the document into the archive as it
+ * archives the message; the Firehose that archives messages in Athena mode delivers records to S3 and
+ * runs no code that could read a second object. This runner is the first code in this mode that sees the
+ * reference, so it makes the same copy with the same module (`archiveDeliveredDocument`: only a file
+ * under the conversation's own `generated-docs/<conversationId>/`, verified against the recorded
+ * SHA-256, written to `delivered-documents/<classification>/<conversationId>/<sha256>`), then reads the
+ * archive's copy back and grades that. The copy is keyed by content, so re-running a day writes the
+ * same object again.
+ *
+ * NOT GRADED, AND SAID SO, on the same grounds as Aurora mode: a private task's document, no copy, a
+ * copy that does not match or cannot be read, an empty one or one longer than the judge is shown. Each
+ * writes a `document_skipped` row naming the reason and carrying no score. A judge call that throws is
+ * counted as an error and writes nothing; this mode has no attempt ledger, and re-running the day
+ * (`{ "targetDate": "YYYY-MM-DD" }`) grades it again.
+ */
+async function gradeDeliveredDocument(exchange: Exchange, exchangeId: string): Promise<EvaluationResult> {
+  const doc = exchange.deliveredDocument!;
+  const base: EvaluationResult = {
+    exchangeId,
+    channelArn: exchange.channelArn,
+    intentType: exchange.intent,
+    agentType: exchange.agentType,
+    evaluatedAt: new Date().toISOString(),
+    evaluationType: 'document_skipped',
+    artifactSha256: doc.sha256,
+    documentKind: doc.kind || 'document',
+    ...(exchange.configId && { configId: exchange.configId }),
+    ...(exchange.personaVersion && { personaVersion: exchange.personaVersion }),
+    ...(exchange.intentPackVersion && { intentPackVersion: exchange.intentPackVersion }),
+    ...(exchange.systemPromptHash && { systemPromptHash: exchange.systemPromptHash }),
+  };
+  const skip = (why: DocumentSkip): EvaluationResult => {
+    console.warn(`[eval] document for exchange ${exchangeId} not graded: ${why}`);
+    return { ...base, skipReason: why };
+  };
+  if (doc.private) return skip('private');
+
+  const archived = await archiveDeliveredDocument({
+    s3: s3Client as never,
+    attachmentsBucket: ATTACHMENTS_BUCKET,
+    archiveBucket: ARCHIVE_BUCKET,
+    channelArn: exchange.channelArn,
+    classification: exchange.conversationClassification !== 'unknown' ? exchange.conversationClassification : undefined,
+    reference: doc,
+  });
+  const archiveKey = archived.archiveKey;
+  if (!archiveKey || !archiveKey.startsWith(DELIVERED_DOCUMENTS_PREFIX)) return skip('not-archived');
+
+  let bytes: Uint8Array;
   try {
-    if (content.includes('%')) return decodeURIComponent(content);
+    bytes = await fetchAttachmentBytes(s3Client, ARCHIVE_BUCKET, archiveKey);
   } catch {
-    // Not encoded
+    return skip('unreadable');
   }
-  return content;
+  if (documentSha256(bytes) !== doc.sha256) return skip('hash-mismatch');
+  const text = Buffer.from(bytes).toString('utf-8');
+  if (!text.trim()) return skip('empty');
+  if (text.length > JUDGE_DOCUMENT_MAX_CHARS) return skip('too-long');
+
+  const framing = renderPrompt(DOCUMENT_FRAMING, { requirements: documentRequirementsText(doc) });
+  const relevance = await evaluateExchange(exchange, { text, framing });
+  return {
+    ...base,
+    evaluationType: 'document',
+    relevanceScore: relevance.relevanceScore,
+    classification: relevance.classification,
+    reasoning: relevance.reasoning,
+    artifactKey: archiveKey,
+  };
 }
 
 /**
  * Main handler
  */
 export async function handler(event: unknown): Promise<{ statusCode: number; body: string }> {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   console.log('Evaluation runner invoked');
 
   // Manual invocations may pass { targetDate: "YYYY-MM-DD" } to score a
@@ -553,6 +677,7 @@ export async function handler(event: unknown): Promise<{ statusCode: number; bod
     // Evaluate each exchange
     const results: EvaluationResult[] = [];
     const errors: string[] = [];
+    let documentErrors = 0;
 
     for (const exchange of exchanges) {
       try {
@@ -568,6 +693,7 @@ export async function handler(event: unknown): Promise<{ statusCode: number; bod
           classification: relevance.classification,
           reasoning: relevance.reasoning,
           evaluatedAt: new Date().toISOString(),
+          evaluationType: 'exchange',
           // Config attribution (P4) — carry the fingerprint onto the eval row.
           ...(exchange.configId && { configId: exchange.configId }),
           ...(exchange.personaVersion && { personaVersion: exchange.personaVersion }),
@@ -576,6 +702,19 @@ export async function handler(event: unknown): Promise<{ statusCode: number; bod
         });
       } catch (err) {
         errors.push(`Exchange evaluation failed: ${err instanceof Error ? err.message : 'Unknown'}`);
+        continue;
+      }
+
+      // THE DELIVERED DOCUMENT, after its reply and only when the reply was scored, so the document is
+      // drawn from the same population. Its own try: a document that fails leaves the reply's row as it is.
+      if (exchange.deliveredDocument) {
+        const exchangeId = `${exchange.channelArn.split('/').pop()}-${exchange.userMessageAt}`;
+        try {
+          results.push(await gradeDeliveredDocument(exchange, exchangeId));
+        } catch (err) {
+          documentErrors += 1;
+          console.warn(`[eval] document for exchange ${exchangeId} could not be graded:`, err instanceof Error ? err.message : String(err));
+        }
       }
     }
 
@@ -585,15 +724,20 @@ export async function handler(event: unknown): Promise<{ statusCode: number; bod
     // Compute and write agent scores
     const agentScores = await writeAgentScores(results);
 
-    const avgScore = results.length > 0
-      ? Math.round(results.reduce((sum, r) => sum + r.relevanceScore, 0) / results.length * 10) / 10
+    // Reply rows only: the headline average is a reply score, and a document's grade is not one.
+    const replies = results.filter((r) => r.evaluationType === 'exchange');
+    const avgScore = replies.length > 0
+      ? Math.round(replies.reduce((sum, r) => sum + (r.relevanceScore ?? 0), 0) / replies.length * 10) / 10
       : 0;
 
     const summary = {
-      evaluated: results.length,
+      evaluated: replies.length,
       errors: errors.length,
       avgRelevanceScore: avgScore,
       agentScores,
+      documentsScored: results.filter((r) => r.evaluationType === 'document').length,
+      documentsSkipped: results.filter((r) => r.evaluationType === 'document_skipped').length,
+      documentErrors,
     };
 
     console.log('Evaluation complete:', summary);

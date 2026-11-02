@@ -36,14 +36,15 @@ import {
   markBattleAbandoned,
   type BattleStateRow,
 } from './battle-state.js';
-import { clearBattleWaitingMarker } from './battle-waiting-marker.js';
+import { requestMarkerClear, type WaitingMarker } from './battle-marker-clear.js';
 
 /** Why a duel was ended. Recorded on the pointer's release and carried into the logs. */
 export type BattleEndReason =
   | 'abandoned:drift'          // the person changed the subject and chose to leave
   | 'abandoned:new-battle'     // the person started another duel in the same channel
   | 'abandoned:battle-mode-off' // a moderator turned Battle Mode off
-  | 'abandoned:requested';     // an explicit `/battle end`
+  | 'abandoned:requested'      // an explicit `/battle end`
+  | 'abandoned:experiment-ended'; // its experiment paused, completed, was deleted or passed its end date
 
 export interface BattleEndResult {
   /** Sides moved to `ABANDONED` by this call. Empty when the duel had already stopped. */
@@ -77,6 +78,21 @@ export async function endBattle(args: {
   reason: BattleEndReason;
   /** The person who ended it. Retained on the release for the audit. */
   endedBy?: string;
+  /** The conversation's classification, whose router takes the waiting markers down as the sides. */
+  classification: string;
+  /**
+   * Whether to wait for the markers to be cleared. A caller that removes a side from the room next waits,
+   * because an edit by a non-member fails; every other caller asks and moves on.
+   */
+  waitForMarkers?: boolean;
+  /**
+   * HOW THE WAITING MARKERS COME DOWN WHEN THE CALLER IS THE ROUTER ITSELF. The router is the one speaker for
+   * the sides (`clearDuelMarkers`), so when it ends a duel it clears them in place: asking a router by
+   * invoke resolves `routerArnForClassification`, which a router's own environment does not carry, so a
+   * router that asked itself would clear nothing. Every other caller leaves this unset and the markers are
+   * named to the classification's router (`requestMarkerClear`). Returns how many were cleared.
+   */
+  clearMarkers?: (req: { channelArn: string; battleId: string; markers: WaitingMarker[] }) => Promise<number>;
 }): Promise<BattleEndResult> {
   const { channelArn, battleId, reason, endedBy } = args;
   const result: BattleEndResult = { abandoned: [], markersCleared: 0, round2Suppressed: false };
@@ -135,10 +151,23 @@ export async function endBattle(args: {
   //
   //    Only a side that was WAITING has one. The question text stays in the transcript - it was a real
   //    part of the duel - and only the control that made it answerable goes.
-  for (const row of rows) {
-    if (row.state !== 'WAITING_FOR_USER' || !row.waitingMessageId) continue;
-    const cleared = await clearBattleWaitingMarker(channelArn, row.waitingMessageId, row.botArn);
-    if (cleared) result.markersCleared += 1;
+  //    NAMED TO THE ROUTER, which speaks for the sides (`battle-marker-clear.ts`): the edit is said as each
+  //    side's assistant, and the API and flow callers of this function hold no assistant session. A router
+  //    ending a duel itself passes `clearMarkers` and clears them in place. The router checks
+  //    each marker against this duel's rows, so the end recorded above comes first.
+  const markers = rows
+    .filter((row) => row.state === 'WAITING_FOR_USER' && row.waitingMessageId)
+    .map((row) => ({ messageId: row.waitingMessageId as string, botArn: row.botArn }));
+  if (markers.length) {
+    if (args.clearMarkers) {
+      // In place, as the router: never throws past here, a marker left standing is cosmetic.
+      result.markersCleared = await args.clearMarkers({ channelArn, battleId, markers }).catch((err) => {
+        console.warn('[battle-end] the waiting markers could not be cleared in place', { battleId, message: (err as Error)?.message });
+        return 0;
+      });
+    } else {
+      result.markersCleared = await requestMarkerClear({ channelArn, battleId, classification: args.classification, markers, wait: !!args.waitForMarkers });
+    }
   }
 
   // 5. Release the channel. Conditional on this battleId, so a late call cannot clear a newer duel.

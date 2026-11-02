@@ -7,6 +7,7 @@
  * its already-constructed client.
  */
 import { GetObjectCommand } from '@aws-sdk/client-s3';
+import { personIdFromArn } from './person-arn.js';
 
 /**
  * Object-level authorization for attachment-in reads. The fileKey arrives on user-controlled
@@ -21,10 +22,33 @@ export function senderOwnsAttachmentKey(
   fileKey: string | undefined,
   senderArn: string | undefined,
 ): boolean {
-  const senderSub = senderArn?.split('/user/').pop() || '';
+  const senderSub = personIdFromArn(senderArn) || '';
   if (!senderSub) return false;
   const parts = (fileKey || '').split('/');
   return parts[0] === 'attachments' && parts.length >= 4 && parts[2] === senderSub;
+}
+
+/**
+ * Object-level authorization for an image re-read from conversation HISTORY (the round-2 rebuttal's
+ * vision path). Every message in the window carries its own user-controlled Metadata, so the key on
+ * each is checked against the message that carried it and the conversation being answered:
+ *  - `attachments/<conversationId>/<senderSub>/...` - the message's sender uploaded it here;
+ *  - `battle-images/<conversationId>/...` - generated for this conversation (persistImageGenOutput),
+ *    so it belongs to the conversation rather than to one sender, as the presigned-url download allows.
+ * A key naming another conversation, or another member's upload, is refused: without this a forged
+ * history message got the rebuttal to describe an image from a conversation the asker cannot read.
+ */
+export function conversationHoldsHistoryImageKey(
+  fileKey: string | undefined,
+  channelArn: string | undefined,
+  senderArn: string | undefined,
+): boolean {
+  const conversationId = (channelArn || '').split('/').pop() || '';
+  if (!conversationId) return false;
+  const parts = (fileKey || '').split('/');
+  if (parts[1] !== conversationId) return false;
+  if (parts[0] === 'battle-images') return parts.length >= 3;
+  return senderOwnsAttachmentKey(fileKey, senderArn);
 }
 
 export interface S3GetClient {

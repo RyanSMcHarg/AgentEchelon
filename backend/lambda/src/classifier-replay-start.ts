@@ -18,46 +18,86 @@
 import { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { randomUUID } from 'crypto';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
-import { requireAdmin, iamCallerSub } from './lib/auth.js';
-import { validateReplayInput } from './lib/classifier-replay-input.js';
+import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import { requireAdmin } from './lib/auth.js';
+import { responder, originsFrom } from './lib/http-response.js';
+import { validateReplayInput, replayArnEnvName } from './lib/classifier-replay-input.js';
+import { resolveActiveProfile } from './lib/active-profile.js';
+import { parseIntentPack, resolvePackParameterValue, type IntentPack } from './lib/intent-pack.js';
+import { loadProfileRegistry } from '../../lib/profile-registry';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = originsFrom(process.env.ALLOWED_ORIGINS, '', { trim: true, dropEmpty: true });
+const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
 
-/** Read per request, not at module load, so the "not configured" branch is reachable in a test. */
-const replayArn = () => process.env.CLASSIFIER_REPLAY_ARN || '';
-
+/**
+ * The replay function of ONE classification. Read per request, not at module load, so the "not
+ * configured" branch is reachable in a test. There is no shared function to fall back to: a run executes
+ * with its own classification's reach or not at all (tenet D12).
+ */
 const lambdaClient = new LambdaClient({ region: AWS_REGION });
-
-function cors(origin?: string): Record<string, string> {
-  const allow = origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0] || '*';
-  return {
-    'Access-Control-Allow-Origin': allow,
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-    'Access-Control-Allow-Methods': 'POST,OPTIONS',
-    Vary: 'Origin',
-  };
+const ssmClient = new SSMClient({ region: AWS_REGION });
+const replayArns = new Map<string, string>();
+/** For tests: forget the replay functions found. */
+export function forgetReplayFunctions(): void {
+  replayArns.clear();
 }
 
-function respond(status: number, body: unknown, origin?: string): APIGatewayProxyResult {
-  return { statusCode: status, headers: { 'Content-Type': 'application/json', ...cors(origin) }, body: JSON.stringify(body) };
+/**
+ * The classification's replay function, its classification's own stack's: found under the key that stack publishes
+ * (`<CLASSIFIER_REPLAY_PARAM_ROOT>/<classification>/classifier-replay-arn`) at call time and kept for the container,
+ * so this function's environment names no classification. The shape is `resolveRouterArn`'s: an explicit
+ * variable (`CLASSIFIER_REPLAY_ARN_<C>`) wins where one is set. Empty when none is published.
+ */
+async function replayArnFor(classification: string): Promise<string> {
+  const explicit = process.env[replayArnEnvName(classification)];
+  if (explicit) return explicit;
+  const cached = replayArns.get(classification);
+  if (cached) return cached;
+  const root = (process.env.CLASSIFIER_REPLAY_PARAM_ROOT || '').trim();
+  if (!root) return '';
+  try {
+    const arn = ((await ssmClient.send(new GetParameterCommand({ Name: `${root}/${classification}/classifier-replay-arn` }))).Parameter?.Value || '').trim();
+    if (arn) replayArns.set(classification, arn);
+    return arn;
+  } catch (err) {
+    console.error('[classifier-replay-start] the replay function parameter could not be read', { classification, err: (err as Error)?.name });
+    return '';
+  }
 }
+
+/**
+ * The intent pack the assistant serves: its active version's, else its classification's deployment pack,
+ * else the platform's. The same order a live turn of that assistant resolves (`router-agent-handler.ts`
+ * reads the version's pack and falls back to the classification's `assistant-intent-pack`). Resolved
+ * here, outside the VPC, because the replay function has no route to SSM.
+ */
+export async function servedIntentPack(assistant: string, classification: string, ssm: Pick<SSMClient, 'send'> = ssmClient): Promise<IntentPack> {
+  const active = await resolveActiveProfile(assistant, { ssm: ssm as SSMClient, ssmRoot: SSM_ROOT });
+  if (active.intentPack) return active.intentPack;
+  try {
+    const res = await ssm.send(new GetParameterCommand({ Name: `${SSM_ROOT}/assistant/${classification}/assistant-intent-pack` }));
+    return parseIntentPack(await resolvePackParameterValue(res.Parameter?.Value, classification));
+  } catch (err) {
+    // Not every classification publishes a deployment pack; one that does not serves the platform's.
+    if ((err as { name?: string })?.name === 'ParameterNotFound') return parseIntentPack(undefined);
+    throw err;
+  }
+}
+
+const http = responder({ origin: { allow: ALLOWED_ORIGINS, fallback: '*' }, methods: 'POST,OPTIONS' });
+const respond = http.respond;
 
 export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   const origin = (event.headers?.origin || event.headers?.Origin) as string | undefined;
   if (event.httpMethod === 'OPTIONS') return respond(200, {}, origin);
 
   // The gateway authorizer authenticates; this gates on admin authority, in whichever mode the
   // deployment runs (Cognito group / federated / IAM-signed). Never rely on the authorizer alone.
-  const auth = requireAdmin(event);
-  if ('statusCode' in auth) return { ...auth, headers: { ...auth.headers, ...cors(origin) } };
-
-  const replayFunctionArn = replayArn();
-  if (!replayFunctionArn) {
-    // Nothing is opened in this case, deliberately: a run row with no function to execute it is the
-    // "ships inert but reports success" failure the gate is supposed to make impossible.
-    return respond(503, { error: 'The classifier replay function is not configured for this deployment' }, origin);
-  }
+  const auth = await requireAdmin(event);
+  if ('statusCode' in auth) return { ...auth, headers: { ...auth.headers, ...http.headers(origin) } };
 
   let body: Record<string, unknown>;
   try {
@@ -74,6 +114,8 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     validated = validateReplayInput({
       incumbentModel: body.incumbentModel as string,
       challengerModel: body.challengerModel as string,
+      classification: body.classification as string,
+      assistant: (body.assistant as string) || undefined,
       windowDays: Number(body.windowDays) || undefined,
       limit: Number(body.limit) || undefined,
     });
@@ -81,10 +123,30 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     return respond(400, { error: e instanceof Error ? e.message : 'Invalid replay request' }, origin);
   }
 
+  const replayFunctionArn = await replayArnFor(validated.classification);
+  if (!replayFunctionArn) {
+    // Nothing is opened in this case, deliberately: a run row with no function to execute it is the
+    // "ships inert but reports success" failure the gate is supposed to make impossible.
+    return respond(503, { error: `The classifier replay function for ${validated.classification} is not configured for this deployment` }, origin);
+  }
+
+  // THE TAXONOMY BOTH CANDIDATES CLASSIFY AGAINST, resolved now so a run that cannot have one is refused
+  // while the operator is listening rather than recorded as a failure later.
+  let intentPack: IntentPack;
+  try {
+    intentPack = await servedIntentPack(validated.assistant, validated.classification);
+  } catch (e) {
+    const message = e instanceof Error ? e.message : String(e);
+    console.error('[classifier-replay-start] could not resolve the assistant\'s intent pack', { assistant: validated.assistant, message });
+    return /no seed profile named/.test(message)
+      ? respond(400, { error: `'${validated.assistant}' is not an assistant this replay can compare` }, origin)
+      : respond(503, { error: 'Could not read the assistant\'s intent pack' }, origin);
+  }
+
   const runId = randomUUID();
-  // Attribution is server-side, like every other admin write here: the operator's own sub under IAM
-  // enforcement, otherwise the verified claims. The body never names the actor.
-  const startedBy = iamCallerSub(event) || auth.claims.sub || null;
+  // Attribution is server-side, like every other admin write here: the person the signed session names,
+  // or the signing principal when it is not a person. The body never names the actor.
+  const startedBy = auth.claims.actor || null;
 
   try {
     await lambdaClient.send(new InvokeCommand({
@@ -98,6 +160,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
         open: {
           incumbentModel: validated.incumbentModel,
           challengerModel: validated.challengerModel,
+          classification: validated.classification,
+          assistant: validated.assistant,
+          intentPack,
           experimentId: (body.experimentId as string) || undefined,
           windowDays: Number(body.windowDays) || undefined,
           limit: validated.limit,
@@ -119,6 +184,8 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
     startedBy,
     incumbentModel: validated.incumbentModel,
     challengerModel: validated.challengerModel,
+    classification: validated.classification,
+    assistant: validated.assistant,
   }));
 
   // `data: []` keeps the analytics-result shape the console's `queryAnalytics` unwraps. The window is
@@ -131,6 +198,8 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
       runId,
       incumbentModel: validated.incumbentModel,
       challengerModel: validated.challengerModel,
+      classification: validated.classification,
+      assistant: validated.assistant,
       limit: validated.limit,
       status: 'running',
     },

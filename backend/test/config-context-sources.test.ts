@@ -9,6 +9,7 @@ import {
   validateContextSourceCatalog,
   assertValidContextSourceCatalog,
   loadContextSourceCatalog,
+  publishableContextSource,
   RESERVED_CONTRACTS,
   DEPLOYMENT_KEY_PREFIX,
   type ContextSourceEntry,
@@ -117,7 +118,7 @@ describe('context source catalog validation', () => {
 
     // The two are separate fields for a reason: the ARN is the grant resource and is usually a CFN
     // token, the locator is the name the reader resolves. An entry with a grant but no locator would
-    // publish, be authorised, and read nothing.
+    // publish, be authorized, and read nothing.
     it('rejects a missing locator', () => {
       expect(validateContextSourceCatalog([entry({ locator: '' })]))
         .toContainEqual({ key: 'user-profile', problem: 'locator is required (the name the reader resolves)' });
@@ -169,6 +170,17 @@ describe('context source catalog validation', () => {
       // mislabelling it does not cause a wait, it puts a wrong or empty name in the first message.
       const e = loadContextSourceCatalog({ classification: 'standard', attachmentsBucketArn: 'arn:aws:s3:::test-bucket', attachmentsBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' }).entries.find((s) => s.key === 'user-profile');
       expect(e?.availability).toBe('identity-settled');
+    });
+
+    it('the example declares user-profile per-person, and the published entry keeps the declaration', () => {
+      // The declaration is what turns "this person has no record yet" into a skip instead of a failed
+      // read. Lost at publication, every turn by a person not yet onboarded would page the alarm.
+      const { entries } = loadContextSourceCatalog({ classification: 'standard', attachmentsBucketArn: 'arn:aws:s3:::test-bucket', attachmentsBucketName: 'test-bucket', userProfileTableArn: 'arn:aws:dynamodb:us-east-1:123456789012:table/UserProfile', userProfileTableName: 'UserProfile', region: 'us-east-1', account: '123456789012' });
+      const profile = entries.find((s) => s.key === 'user-profile')!;
+      expect(profile.perPerson).toBe(true);
+      expect(publishableContextSource(profile).perPerson).toBe(true);
+      // A shared source carries no such declaration, so its missing content still counts as a failure.
+      expect(entries.filter((s) => s.key !== 'user-profile').every((s) => !s.perPerson)).toBe(true);
     });
   });
 

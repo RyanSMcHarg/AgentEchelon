@@ -1,0 +1,533 @@
+{
+  "project": "AgentEchelon",
+  "license": "MIT",
+  "author": "Ryan McHarg",
+  "since": "2025",
+  "repository": "https://github.com/RyanSMcHarg/AgentEchelon",
+  "purpose": "AgentEchelon is a governed, multi-party, multi-channel AI platform you deploy into your own AWS account. This context lets the assistant answer questions about the platform itself - what it is, how it works, and where a topic is documented.",
+  "overview": "AgentEchelon is a governed, multi-party agentic AI platform that runs in your own AWS account and serves internal and customer-facing use cases from one place. A core feature is that agent governance can be enforced with AWS's own identity primitives instead of a bolted-on policy engine. Every user, assistant, and conversation is an AWS resource with an ARN; every actor holds a bearer-pinned ident",
+  "answering_guidance": "Answer from these summaries and, when deployed in Aurora mode, from the retrieved full docs. Point the user at the named doc path for detail. Do not fabricate; if it is not here, say so. The `author`, `since`, `license` and `repository` fields above answer questions about who made the platform and where its source is - answer those from here rather than from the deploying company's documents, which do not carry them. You cannot browse the web or read that repository: cite it as where the source lives, and do not offer to look anything up in it.",
+  "docs": [
+    {
+      "title": "Agent Echelon",
+      "summary": "**Agent Echelon is a self-hosted agent control plane: a governed, multi-party agentic AI platform that runs entirely in your own AWS account and serves your internal and customer-facing use cases from one place.** It is the governed layer between your agents and everything they touch (the harness around your models), deciding who may act, which model answers, where the context lives, and what gets",
+      "path": "README.md"
+    },
+    {
+      "title": "AgentEchelon Documentation",
+      "summary": "The map of everything under `docs/`. For what AgentEchelon is and why, start at the root [`README.md`](../README.md) and [`overview/PLATFORM-OVERVIEW.md`](overview/PLATFORM-OVERVIEW.md) - this page does not repeat the overview, it points you to the right document for a task.",
+      "path": "docs/DOCUMENTATION.md"
+    },
+    {
+      "title": "Admin Console Guide",
+      "summary": "How operators use the AgentEchelon admin dashboard to check platform health, review how the assistants are performing, and administer conversations. Written to be portable - it describes behavior, not any specific AWS account.",
+      "path": "docs/guides/admin/ADMIN-GUIDE.md"
+    },
+    {
+      "title": "Bringing Your Own Admin Console and Admin Auth",
+      "summary": "This guide explains how to run AgentEchelon's operator surface - analytics, administration, evaluations, experiments - **behind your own application's admin console and admin authentication**, instead of the built-in console and the deployment's own Cognito groups.",
+      "path": "docs/guides/admin/ADMIN-INTEGRATION-GUIDE.md"
+    },
+    {
+      "title": "Aurora Mode Guide",
+      "summary": "AgentEchelon ships with two analytics backends. **Athena mode** (default) is serverless and cheap at low volume. **Aurora mode** adds a VPC with Aurora PostgreSQL Serverless v2 for sub-second dashboard queries, multi-turn evaluation, drift detection, and cross-conversation context search.",
+      "path": "docs/guides/admin/AURORA-MODE-GUIDE.md"
+    },
+    {
+      "title": "The Guest Issuer",
+      "summary": "How a deployment admits an anonymous visitor, what holds the visitor to their own conversation, how a visitor becomes a person, and how an operator runs it: the kill switch, the signing key's rotation and the alarms. This guide describes what is built.",
+      "path": "docs/guides/admin/GUEST-ISSUER.md"
+    },
+    {
+      "title": "A/B Testing and Running Battles",
+      "summary": "How to run real A/B model experiments on your own traffic, measure which model wins, promote the winner, and use Battle Mode to put two assistants head to head on the same prompt.",
+      "path": "docs/guides/admin/GUIDE-AB-TESTING-AND-BATTLES.md"
+    },
+    {
+      "title": "Image Generation Providers",
+      "summary": "**Audience:** Deployers configuring image generation. Image generation is a normal profile capability - an intent routed to an image model in a profile's `models.byIntent` (the `image_generation` intent as shipped) - and the image A/B experiments and battles are built on top of it. Anything that calls `invokeImageGenModel`.",
+      "path": "docs/guides/admin/IMAGE-GEN-PROVIDERS.md"
+    },
+    {
+      "title": "Infrastructure and cost model",
+      "summary": "**Audience:** deployers and operators sizing an AgentEchelon instance, and anyone reviewing what each piece of infrastructure is for and what it costs to run.",
+      "path": "docs/guides/admin/INFRASTRUCTURE-COST.md"
+    },
+    {
+      "title": "Resource Tagging & Cost Attribution",
+      "summary": "This platform deploys as **multiple independent instances** (one per `AE_INSTANCE_NAME`). For cost attribution to work, each instance's resources must carry **its own** identity - so the tagging rule is:",
+      "path": "docs/guides/admin/TAGGING.md"
+    },
+    {
+      "title": "API Guide",
+      "summary": "**Audience:** developers calling a deployed AgentEchelon over HTTP from their own client, instead of using the chat and admin front ends this repo ships.",
+      "path": "docs/guides/developer/API-GUIDE.md"
+    },
+    {
+      "title": "Amazon Chime SDK Integration",
+      "summary": "The frontend talks to AWS through Amazon Chime SDK Messaging. A user authenticates with Cognito, exchanges the ID token at the backend **Credential Exchange** for short-lived, bearer-pinned AWS credentials, and uses those credentials to send messages, list conversations and receive real-time updates. Conversations are created by the backend (`/create-conversation`), not by the browser. Assistant r",
+      "path": "docs/guides/developer/CHIME_SDK_INTEGRATION.md"
+    },
+    {
+      "title": "AgentEchelon Design System",
+      "summary": "The design tokens and shared component classes described here are implemented in `frontend/packages/shared/src/styles/`. The [Migration Guide](#migration-guide) below is the reference for bringing a component's CSS onto the system.",
+      "path": "docs/guides/developer/DESIGN-SYSTEM.md"
+    },
+    {
+      "title": "Developer Guide",
+      "summary": "**Audience:** engineers building on or extending AgentEchelon. **Status:** hub / index. Points to the authoritative doc for each task; it does not restate them.",
+      "path": "docs/guides/developer/DEVELOPER-GUIDE.md"
+    },
+    {
+      "title": "E2E watchdog",
+      "summary": "**Audience:** engineers writing or running the Playwright e2e suite. **Code:** `tests/e2e/helpers/fixtures.ts` and `tests/e2e/helpers/watchdog/`. **Guard:** `backend/test/e2e-watchdog.test.ts`.",
+      "path": "docs/guides/developer/E2E-WATCHDOG.md"
+    },
+    {
+      "title": "Guide: Building and operating assistant context",
+      "summary": "**Audience:** developers building an assistant for a new use case, and admins/deployers who load and scope the content an assistant reads.",
+      "path": "docs/guides/developer/GUIDE-ASSISTANT-CONTEXT.md"
+    },
+    {
+      "title": "How to add or manage an assistant profile",
+      "summary": "A practical guide to what an assistant profile is made of, how its context and onboarding are configured, and how to add a new profile or change an existing one. The code is the authority for everything here; each field names the file that defines it and the code that reads it.",
+      "path": "docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md"
+    },
+    {
+      "title": "How to configure compliance rules",
+      "summary": "**Status: BUILT.** The rule set is `backend/lib/config/compliance-rules.ts`. The verdict is computed by `complianceVerdictFor` and written as `is_compliant` in the same `evaluation_results` insert as the relevance score, inside the evaluation runner's Pass A loop (`backend/lambda/src/analytics-aurora/evaluation-runner.ts`); the judged breaches come back from the same Pass A judge call. No reader c",
+      "path": "docs/guides/developer/HOW-TO-CONFIGURE-COMPLIANCE-RULES.md"
+    },
+    {
+      "title": "Latency metrics and targets",
+      "summary": "The admin console's Latency tab reports several latency numbers, and its targets (`frontend/packages/admin/src/components/admin/metricTargets.ts` and `LatencyTab.latencyColor`) are set to published industry standards, not a self-imposed limit. This doc (a) defines each metric precisely - what it measures, where it is stamped, and why it matters - (b) records the targets and their basis, (c) states",
+      "path": "docs/guides/developer/LATENCY-TARGETS.md"
+    },
+    {
+      "title": "Message delivery & size: how assistant output reaches Amazon Chime SDK",
+      "summary": "Canonical implementation: `backend/lambda/src/lib/chime/send.ts` (the one send, the caps and the one splitter) and `backend/lambda/src/lib/async-processor-core.ts` (the answer path).",
+      "path": "docs/guides/developer/MESSAGE-DELIVERY-GUIDE.md"
+    },
+    {
+      "title": "Message flow",
+      "summary": "AgentEchelon is a **multiparty** substrate: people and assistants share Amazon Chime SDK channels. The path below is what lets a channel be a plain human-to-human room, a 1:1 conversation with an assistant, or a mixed room where an assistant answers only when addressed, all with the same primitives and differing only in assistant configuration and in who is addressed. The path does not rely on the",
+      "path": "docs/guides/developer/MESSAGE-FLOW.md"
+    },
+    {
+      "title": "Metadata and Tags: What Goes Where",
+      "summary": "This guide is the rule for storing data on Amazon Chime SDK channels and users, and for using resource tags. The wrong choice leaks information to other members or weakens the classification boundary. Read it before you add a field to a channel, a user, or a tag.",
+      "path": "docs/guides/developer/METADATA-AND-TAGS.md"
+    },
+    {
+      "title": "Model Strategy",
+      "summary": "AgentEchelon treats model routing as a capability-first concern, not a classification-only choice.",
+      "path": "docs/guides/developer/MODEL_STRATEGY.md"
+    },
+    {
+      "title": "Performance optimization (reducing latency)",
+      "summary": "AgentEchelon ships with **cost-lean defaults**, not latency-optimized ones. Out of the box every request path is serverless and scales to zero: Lambdas are on-demand (no provisioned concurrency), Aurora runs at a 0.5 ACU minimum, RDS Proxy is off, and the intent classifier is a live model call. That reduces cost for idle and low-traffic deployments, but it means the first request after a quiet per",
+      "path": "docs/guides/developer/PERFORMANCE-OPTIMIZATION.md"
+    },
+    {
+      "title": "RAG - Document Retrieval",
+      "summary": "**Audience:** deployers who want the assistant to ground its responses in project documentation (wiki pages, runbooks, design docs) rather than just the LLM's training data.",
+      "path": "docs/guides/developer/RAG.md"
+    },
+    {
+      "title": "npm Supply-Chain Hardening",
+      "summary": "This project treats every npm dependency as untrusted code that runs on your machine and in CI. This document records the controls the repo ships, why they exist, and how to work with them.",
+      "path": "docs/guides/developer/SECURITY-NPM-SUPPLY-CHAIN.md"
+    },
+    {
+      "title": "Demo setup and post-deploy validation",
+      "summary": "A runbook for standing up the **Stratum Technologies** demo and running the end-to-end validation that exercises every tier flow with real (measured, recorded) conversations, then verifies the admin dashboard. This is the POC surface: read it to understand how the platform behaves, and modify the demo data / tests for your own use case. For the demo company design, see [`SPEC-DEMO-COMPANY.md`](../",
+      "path": "docs/guides/user/DEMO-AND-VALIDATION.md"
+    },
+    {
+      "title": "Deploying the frontend (CloudFront + S3)",
+      "summary": "The AgentEchelon SPA deploys to **CloudFront + private S3 by default**. The `<prefix>ChatApp` stack (`AgentEchelonChatApp` for the default instance name) creates the hosting; a separate build-and-publish step uploads the app. Local development uses the Vite dev server (`cd frontend && npm run dev:chat`, or `npm run dev:admin`); this guide covers a real, shareable deploy.",
+      "path": "docs/guides/user/FRONTEND-DEPLOY.md"
+    },
+    {
+      "title": "Integrating Your Identity Provider",
+      "summary": "A deployment trusts an identity provider by declaring it once, in the trusted-issuer registry (`issuers` in `backend/deploy.config.json`, validated at synth by `backend/lib/config/issuers.ts`). This guide covers what an entry declares, the issuer kinds and what each one's people reach, and the steps for each kind: an organization's SSO over SAML or OIDC federated into the deployment's Amazon Cogni",
+      "path": "docs/guides/user/IDENTITY-PROVIDER-GUIDE.md"
+    },
+    {
+      "title": "AgentEchelon Troubleshooting Guide",
+      "summary": "All `aws` examples assume credentials for **your target account** are already configured (via `AWS_PROFILE`, environment variables, SSO, or an instance role). Examples omit `--profile`; export `AWS_PROFILE=<your-profile>` (or set creds) for the shell first. Confirm with:",
+      "path": "docs/guides/user/TROUBLESHOOTING.md"
+    },
+    {
+      "title": "Architecture Guide",
+      "summary": "This document explains how AgentEchelon works end-to-end. It covers every major flow, how the CDK stacks connect, and where to look when extending or debugging the system.",
+      "path": "docs/overview/ARCHITECTURE.md"
+    },
+    {
+      "title": "Personas",
+      "summary": "The canonical people AgentEchelon serves. Specs reference these by name and link here; they do NOT re-define personas inline. This is the single source of truth for who the product is for.",
+      "path": "docs/overview/PERSONAS.md"
+    },
+    {
+      "title": "AgentEchelon Overview",
+      "summary": "AgentEchelon is a governed, multi-party agentic AI platform that runs in your own AWS account and serves internal and customer-facing use cases from one place. A core feature is that agent governance can be enforced with AWS's own identity primitives instead of a bolted-on policy engine. Every user, assistant, and conversation is an AWS resource with an ARN; every actor holds a bearer-pinned ident",
+      "path": "docs/overview/PLATFORM-OVERVIEW.md"
+    },
+    {
+      "title": "Site map: product surfaces to the specs behind them",
+      "summary": "Every surface a participant actually touches, mapped to the spec that defines it and the platform layer underneath. The layer tree it mirrors is in [`../DOCUMENTATION.md`](../DOCUMENTATION.md); the composition model is [`../specs/interaction/SPEC-INTERACTION-LAYER.md`](../specs/interaction/SPEC-INTERACTION-LAYER.md). Personas are defined once in [`PERSONAS.md`](PERSONAS.md).",
+      "path": "docs/overview/SITE-MAP.md"
+    },
+    {
+      "title": "Stacks: what each one owns, what it depends on, and what deploys when",
+      "summary": "**Audience:** anyone deploying AgentEchelon into their own AWS account, or deciding where a new resource belongs.",
+      "path": "docs/overview/STACKS.md"
+    },
+    {
+      "title": "AgentEchelon Tenets",
+      "summary": "The non-negotiables. Every architectural decision in the project traces back to one of these, and where two designs competed, the tenet broke the tie.",
+      "path": "docs/overview/TENETS.md"
+    },
+    {
+      "title": "API contract reference",
+      "summary": "Do not edit by hand. Generated by synthesizing the CDK app in `backend/bin/backend.ts` and reading every `AWS::ApiGatewayV2::Route` out of the resulting CloudFormation templates. Regenerate with:",
+      "path": "docs/reference/api-contract.md"
+    },
+    {
+      "title": "Context catalog reference",
+      "summary": "What an assistant can reference by key, and what each key yields. A profile selects from this by setting `contextSources`; the deployment decides which keys exist, per classification.",
+      "path": "docs/reference/context-catalog-reference.md"
+    },
+    {
+      "title": "End-to-end coverage matrix",
+      "summary": "Do not edit by hand. Generated from the `**Coverage:**` line of every document under `docs/specs/` and the spec files under `tests/e2e/`. Regenerate with:",
+      "path": "docs/reference/e2e-coverage-matrix.md"
+    },
+    {
+      "title": "Reference: the message path and the analytics that measure it",
+      "summary": "Two questions come up constantly and their answers are spread across three directories: **what happens to a message**, and **where the numbers about it come from**. This page is the index for both. It holds no rules of its own, so where it disagrees with a document it points at, that document is right.",
+      "path": "docs/reference/message-path-and-analytics-map.md"
+    },
+    {
+      "title": "DESIGN: Telephony and SMS over Twilio, with no Amazon Chime SDK",
+      "summary": "**Status:** Draft design (**NOT BUILT**). Nothing here is implemented; the connector registry refuses the `twilio` vendor, and `IngressApi` does not exist. This is how the requirements in [SPEC-TELEPHONY.md](./SPEC-TELEPHONY.md) would be built, worked through one delivery from start to finish.",
+      "path": "docs/specs/communication/DESIGN-TELEPHONY.md"
+    },
+    {
+      "title": "SPEC: Connectors - integrate with the business's systems, don't replace them",
+      "summary": "**Status:** Design, with the runtime built and enabled only where a deployment declares a connector. A deployment whose `connectors` is empty has no `Connectors` stack. Built: the connector registry, the `Connectors` stack with one Amazon EventBridge rule per subscribing connector on its vendor's partner event bus, the PagerDuty and Salesforce adapters, the replay record, resolution through `Ident",
+      "path": "docs/specs/communication/SPEC-CONNECTORS.md"
+    },
+    {
+      "title": "SPEC: Compact message metadata - a coded codebook + out-of-band lookup",
+      "summary": "**Status:** Partial. The `safeMetadataString` cap-shedding backstop, the out-of-band analytics record (Technique B) and the content declaration (Technique C) are in the tree; the coded-state codebook (Technique A) is specified here and has no implementation.",
+      "path": "docs/specs/communication/SPEC-MESSAGE-METADATA-CODEBOOK.md"
+    },
+    {
+      "title": "SPEC: Conversation ↔ transport notification bridge (email now; SMS + voice/PSTN next)",
+      "summary": "**Status:** Partial (outbound email, email preferences with one-click unsubscribe, reply tokens and the email reply poster ship; SMS, voice and per-conversation email are design, and the requirements table states which is which). The reply poster and the preference page are **NOT VERIFIED** on a live deployment: the reply subdomain's MX and DMARC records are owner setup.",
+      "path": "docs/specs/communication/SPEC-NOTIFICATION-BRIDGE.md"
+    },
+    {
+      "title": "SPEC: Telephony and SMS - a call or a text is part of a conversation, and a phone number is never an identity",
+      "summary": "**Status:** Draft design (**NOT BUILT**). No telephony or SMS code exists. The connector registry (`backend/lib/config/connectors.ts`) refuses the `twilio` vendor as NOT BUILT, and `provideComms` is a declared capability with no consumer. `IngressApi` is **NOT BUILT**: the PagerDuty and Salesforce connectors receive their events through Amazon EventBridge partner event sources, and Twilio, which h",
+      "path": "docs/specs/communication/SPEC-TELEPHONY.md"
+    },
+    {
+      "title": "SPEC: Optional Aurora PostgreSQL + VPC Deployment Mode",
+      "summary": "**Status:** Implemented (opt-in deployment mode).",
+      "path": "docs/specs/foundations/SPEC-AURORA-VPC-MODE.md"
+    },
+    {
+      "title": "SPEC: Cost Sleep Mode (auto-sleep / wake)",
+      "summary": "**Status:** Partial. The opt-in mode, the idle checker, the manual transitions and the failure alert are in place; the requirements table states what is delivered, what is partial and what each is validated by.",
+      "path": "docs/specs/foundations/SPEC-COST-SLEEP-MODE.md"
+    },
+    {
+      "title": "DESIGN: Adding an assistant role, from onboarding a context to a product manager reading its results",
+      "summary": "**Status:** Partially implemented, and the worked case answers. `(premium, ops)` is built where the deployment declares it (`ops-premium` in `profiles`): it has its own identity, its own Amazon Lex bot resource, its own assistant role on the classification's acting role, its own profile and its own reach, it answers a turn in a premium conversation from live CloudWatch, and its numbers appear in t",
+      "path": "docs/specs/interaction/assistants/DESIGN-ADDING-AN-ASSISTANT-ROLE.md"
+    },
+    {
+      "title": "DESIGN-ASSISTANT: Meetings assistant",
+      "summary": "**Status:** NOT BUILT, under consideration. Draft / planning - the design is not finalized and none of the meeting itself is built; the invitation chase (FR32) is built for any conversation. The Phase 1 WebRTC meeting is **NOT BUILT** in this codebase, and [SPEC-ASSISTANT-MEETINGS.md](./SPEC-ASSISTANT-MEETINGS.md), \"Phase 1 scope\", states what it covers. **BLOCKED** on sub-agent identity, then the",
+      "path": "docs/specs/interaction/assistants/DESIGN-ASSISTANT-MEETINGS.md"
+    },
+    {
+      "title": "DESIGN: Refusing what a classification cannot produce",
+      "summary": "**Status:** Partial - sections 1, 3 to 6, 8 and 9 are built and deployed; section 2's document half (the generated-docs grant reading `produces`; the image half is built, from the model catalog), section 7 (the guards) and the read surfaces in section 8 are not. What is delivered per requirement is in the spec.",
+      "path": "docs/specs/interaction/assistants/DESIGN-CAPABILITY-REFUSAL.md"
+    },
+    {
+      "title": "DESIGN: Meeting sub-agents for onboarding and live incident work",
+      "summary": "**Status:** Partial. Two parts are built (ADR-061 slice 3e) and **NOT VERIFIED** on a deployment: the room's first look as an `incident_first_look` task (section 2) and the alarm state change as an ADR-061 event, `alarm-state-changed`, that starts the room's workflow in the ops room that watches the alarm (sections 4.1 and 4.2). Everything else is a draft design for review and **NOT BUILT**. The d",
+      "path": "docs/specs/interaction/assistants/DESIGN-MEETING-ONBOARDING-AND-INCIDENT-SUBAGENTS.md"
+    },
+    {
+      "title": "DESIGN: Multi-Agent Orchestration",
+      "summary": "**Status:** Design (alignment doc), not scheduled - the backend swarm is not being built yet (owner, 2026-09-19). This proposes a structure and a set of explicit decisions to confirm. Every \"Recommendation\" below is a starting position, not a committed design, and Decision 2 (sub-agent identity) is an OPEN question rather than a recommendation - the identity mechanism this doc originally leaned on",
+      "path": "docs/specs/interaction/assistants/DESIGN-MULTI-AGENT-ORCHESTRATION.md"
+    },
+    {
+      "title": "DESIGN: Multi-agent fan-out on Strands, the runtime",
+      "summary": "**Status:** NOT BUILT, under consideration. Draft design for review; no code, infrastructure or tests exist for anything this document proposes. Proposes a buildable runtime for the fan-out that [DESIGN-MULTI-AGENT-ORCHESTRATION.md](./DESIGN-MULTI-AGENT-ORCHESTRATION.md) specifies at the level of shape and decisions. Every recommendation here is a starting position, not a decision. Nothing is buil",
+      "path": "docs/specs/interaction/assistants/DESIGN-MULTI-AGENT-STRANDS-RUNTIME.md"
+    },
+    {
+      "title": "DESIGN: Multi-Assistant Turn Engine",
+      "summary": "**Status:** NOT BUILT, under consideration. A design target for generalizing `/battle`.",
+      "path": "docs/specs/interaction/assistants/DESIGN-MULTI-ASSISTANT-TURN-ENGINE.md"
+    },
+    {
+      "title": "DESIGN: Separate assistants, separately owned, and how work reaches the right one",
+      "summary": "**Status:** Partially implemented. Phases 2 and 4 are built, Phase 1b is built (see its NOT BUILT list), Phase 1 is built and partly wired, and Phase 3 is **NOT BUILT**. This completes [`SPEC-PORTABLE-PROFILES.md`](./SPEC-PORTABLE-PROFILES.md), which defines a profile as what an assistant is and names a classification hosting several assistants as the model, with one assistant per classification a",
+      "path": "docs/specs/interaction/assistants/DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION.md"
+    },
+    {
+      "title": "SPEC: Assistant configuration - what the assistant is, per experience",
+      "summary": "**Status:** Implemented. The per-classification config seams ship, and the unified `AssistantConfig` bundle rides the versioned profile definition ([`SPEC-PORTABLE-PROFILES.md`](./SPEC-PORTABLE-PROFILES.md)). The versioned definition carries a per-profile **`models` bundle** (`default` plus optional `classifier` / `image` / `byIntent` overrides), a per-profile **`tools`** surface, a per-profile **",
+      "path": "docs/specs/interaction/assistants/SPEC-ASSISTANT-CONFIG.md"
+    },
+    {
+      "title": "SPEC-ASSISTANT: Meetings assistant",
+      "summary": "**Status:** NOT BUILT, under consideration. Draft / planning - the design is not finalized and none of the meeting itself is built; the invitation chase (FR32) is built for any conversation. The Phase 1 WebRTC meeting (start, join, end and the lifecycle events behind the roster) is **NOT BUILT** in this codebase; \"Phase 1 scope\" states what that phase covers and what it does not. **BLOCKED**, in a",
+      "path": "docs/specs/interaction/assistants/SPEC-ASSISTANT-MEETINGS.md"
+    },
+    {
+      "title": "SPEC: Bilingual conversations (reply-language, pivot, dual delivery)",
+      "summary": "**Status:** Partial (reply-language ships; the deployment's closed language map, a person's own language and messages said in the reader's language are built and not deployed; the inference pivot and dual delivery are design).",
+      "path": "docs/specs/interaction/assistants/SPEC-BILINGUAL-CONVERSATIONS.md"
+    },
+    {
+      "title": "SPEC: Capability profiles and deployment-defined classifications",
+      "summary": "**Status:** Implemented. Classifications and assistant profiles are deployment configuration (`backend/lib/config/profiles.ts`), and `backend/lib/profile-registry.ts` is the only module that interprets a classification value: no rank table, group list or hardcoded classification set exists anywhere else. The model catalog names no classification: each classification selects the models it uses from",
+      "path": "docs/specs/interaction/assistants/SPEC-CAPABILITY-PROFILES.md"
+    },
+    {
+      "title": "SPEC: Refusing what a classification cannot produce",
+      "summary": "**Status:** Partial - the refusal itself (FR1-FR6, FR8, FR9, FR14, FR16-FR19) is built and deployed; FR20 and FR21 (platform questions and off-topic requests) are built and unit-tested, not exercised against a deployment; FR7 (the stacks reading `produces`) and FR11 (reading back the archived exchange row) are partly built; the read surfaces (FR12, FR13), the configuration guards (FR15) and per-la",
+      "path": "docs/specs/interaction/assistants/SPEC-CAPABILITY-REFUSAL.md"
+    },
+    {
+      "title": "SPEC: Configurable assistants - three per-assistant config axes on one governed boundary",
+      "summary": "**Status:** Implemented",
+      "path": "docs/specs/interaction/assistants/SPEC-CONFIGURABLE-ASSISTANTS.md"
+    },
+    {
+      "title": "SPEC: Configurable intent pack (per-deployment intent taxonomy)",
+      "summary": "**Status:** Implemented (the taxonomy mechanism; the domain taxonomy is per-deployment config).",
+      "path": "docs/specs/interaction/assistants/SPEC-CONFIGURABLE-INTENT-PACK.md"
+    },
+    {
+      "title": "SPEC: Context-aware model routing (RoutingContext + provider adapter)",
+      "summary": "**Status:** Partial, and gated off - the routing feature ships behind an opt-in flag that no deployment in this repo sets, so none of it has run in service. **Built:** `RoutingContext` + `resolveModelPlan` (`lib/resolve-model-plan.ts`), the CN context rule in both of its forms - a Bedrock-served model whose working language is Chinese as the preferred in-AWS path, and an OpenAI-compatible external",
+      "path": "docs/specs/interaction/assistants/SPEC-CONTEXT-AWARE-MODEL-ROUTING.md"
+    },
+    {
+      "title": "SPEC: Context sources and stores, and what restricts each one",
+      "summary": "**Status:** Partial. Every path below marked \"as built\" is described from the code that implements it, with the file named. Three paths are not built and say so in place: the external approved-link allowlist, the two-tier RAG pointer design, and the meetings/operations telemetry sources. ADR-028's database boundary (sections 5.1 and 5.2) is verified against the deployment; every other guard here i",
+      "path": "docs/specs/interaction/assistants/SPEC-CONTEXT-SOURCES-AND-STORES.md"
+    },
+    {
+      "title": "SPEC: Drift Detection (Drift Convergence)",
+      "summary": "**Status:** Partial. The embedding-based signal, the confirm and decline flow, the summary updater (refreshed after each archived assistant reply, with a scheduled backstop), related-conversation retrieval, the per-stage telemetry, active-task suppression, the per-subject comparison on every turn and the per-turn subject decision on the analytics record are in place in Aurora mode, with the live-s",
+      "path": "docs/specs/interaction/assistants/SPEC-DRIFT-CONVERGENCE.md"
+    },
+    {
+      "title": "SPEC: Per-profile ownership (`AgentEchelonAssistants-*`)",
+      "summary": "**Status:** Implemented.",
+      "path": "docs/specs/interaction/assistants/SPEC-PER-PROFILE-OWNERSHIP.md"
+    },
+    {
+      "title": "SPEC: Portable, versioned assistant profiles",
+      "summary": "**Status:** Implemented and deployed. The versioning lifecycle (create / edit / activate / rollback, and discarding a draft, built and not deployed), A/B and battle over any profile version (`profileRef`), and export / import with manifest signing are built - `lib/profile-lifecycle.ts`, `lib/profile-manifest.ts`, `lib/profile-version-lookup.ts`, `manage-profiles.ts`, and the admin Profiles tab. Ex",
+      "path": "docs/specs/interaction/assistants/SPEC-PORTABLE-PROFILES.md"
+    },
+    {
+      "title": "SPEC: Welcome flow and assistant context",
+      "summary": "**Status:** Partial (the welcome wiring ships; the welcome as the one workflow `WelcomeIntent` starts (FR22), with its template step (FR23), its prompt step (FR24) and steps that greet and then continue (FR25), is built, **NOT VERIFIED** on a deployment, the version's separate `welcome` retired behind `npm run migrate-legacy-welcome`; later context phases are design).",
+      "path": "docs/specs/interaction/assistants/SPEC-WELCOME-AND-CONTEXT.md"
+    },
+    {
+      "title": "Cross-Channel Task Continuity",
+      "summary": "**Status:** Implemented.",
+      "path": "docs/specs/interaction/conversation/CROSS-CHANNEL-TASKS.md"
+    },
+    {
+      "title": "DESIGN: Conversation Types",
+      "summary": "**Status:** Section 2 is built on one creation path. Section 6 (membership) is built for the manual and group modes, with group and list sources; the hybrid mode is **NOT BUILT**, and participant roles (section 6.1) are built, not verified on a deployment, for every source except `resolveVia`, which is **NOT BUILT**. Sections 5, 7 and 8 are **NOT BUILT**. Sections 3 and 4 are an enumeration of wha",
+      "path": "docs/specs/interaction/conversation/DESIGN-CONVERSATION-TYPES.md"
+    },
+    {
+      "title": "DESIGN: Task access, and where the queue's work happens",
+      "summary": "**Status:** Built, and each row cites what it claims. The access half: the task service is the only holder of the tables, every turn-path caller goes through the seam, triage runs on message arrival, and an operator can see and stop a stalled task. The open lock question in section 9 is resolved and recorded there.",
+      "path": "docs/specs/interaction/conversation/DESIGN-TASK-ACCESS-AND-QUEUE-PROCESSING.md"
+    },
+    {
+      "title": "SPEC: Conversation Archive and Member Removal (moderator)",
+      "summary": "**Status:** Partial (archive and remove-member ship with their controls; the leave route and its provider action ship with no control in the client, so a member cannot leave from this app). Meeting events and transcript segments reaching the archive first, and rebuilding the projection from the archive, are design: FR18 is **NOT BUILT** and FR19 is **OPEN**.",
+      "path": "docs/specs/interaction/conversation/SPEC-CONVERSATION-ARCHIVE-AND-MEMBERSHIP.md"
+    },
+    {
+      "title": "SPEC: Conversation Types",
+      "summary": "**Status:** Partial. A conversation is a type rather than only a classification: the canonical creator records the resolved type key on the conversation and resolves its policy by that key, and the turn path reads the same stamp. No type key is a classification value; the shipped types are `general` (the ordinary conversation every person opens and every drift split spawns), `ops`, `ops-team`, `gu",
+      "path": "docs/specs/interaction/conversation/SPEC-CONVERSATION-TYPES.md"
+    },
+    {
+      "title": "SPEC: Document templates",
+      "summary": "**Status:** Partial (the template format, storage behind an active-version pointer, the workflow declaration and the choice, the rendered guidance, the structural check, the recording and the platform fill, a tool-result binding included, ship, and so does the platform's `report` template, which the platform report workflow declares and the deploy writes for each classification serving it; the man",
+      "path": "docs/specs/interaction/conversation/SPEC-DOCUMENT-TEMPLATES.md"
+    },
+    {
+      "title": "SPEC: Task state transitions",
+      "summary": "**Status:** Partial (the machine, the tools, the delivery check, a step's declared tools and its declared action ship; the event-started workflows of ADR-061 slice 1 are built, not verified on a deployment; a workflow step that assigns a task to a person or an assistant, the card that completes it, its deadline, and an idle assistant taking up its own work are built, **NOT VERIFIED** on a deployme",
+      "path": "docs/specs/interaction/conversation/SPEC-TASK-STATE-TRANSITIONS.md"
+    },
+    {
+      "title": "SPEC: The Turn Queue - managing multiple requests to a single assistant in conversations",
+      "summary": "**Status:** Partial. The conversation-level claim, the deferral notice and its measurement, the deterministic stop, triage on arrival, the judged reading with a scoped tool surface, task creation from the reading, the split offer and the drain state machine are in place. The requirements table below states what is delivered, what is partial and what each row is validated by, and it is the authorit",
+      "path": "docs/specs/interaction/conversation/SPEC-TURN-QUEUE.md"
+    },
+    {
+      "title": "SPEC: User profile store and once-per-user onboarding",
+      "summary": "**Status:** Partial (the store, the swap seam, the once-per-user gate and the participant rule ship; identity provenance through the `Identities` index and the guest's two upgrade paths are built; the resolution model, SMS consent, and the record lifecycle are design, and the requirements table states which is which). Email preferences and unsubscribe by AppInstanceUser ship (FR26).",
+      "path": "docs/specs/interaction/conversation/SPEC-USER-PROFILE-AND-ONBOARDING.md"
+    },
+    {
+      "title": "Access control by example: blocked interactions, the policy that blocks them, and the experience",
+      "summary": "**Status:** Implemented (reference: worked examples of the live IAM enforcement).",
+      "path": "docs/specs/interaction/governance/ACCESS-CONTROL-BY-EXAMPLE.md"
+    },
+    {
+      "title": "DESIGN: Admin-Action IAM Enforcement",
+      "summary": "**Status:** Built, deployed and validated. Every route in the admin capability catalog is `AWS_IAM` in every deployment, and there is no opt-out.",
+      "path": "docs/specs/interaction/governance/DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md"
+    },
+    {
+      "title": "DESIGN: Admin Assistant and Admin Notification Channel",
+      "summary": "**Status:** Not built end-to-end. The code is complete and unit-tested; no alert has ever been posted as the admin assistant and seen to land, in-app or by email, against a deployment. That last step is the one the service app-instance-admin cannot perform, so it is the one that decides whether this path works.",
+      "path": "docs/specs/interaction/governance/DESIGN-ADMIN-AGENT-NOTIFICATIONS.md"
+    },
+    {
+      "title": "Identity and Access Model",
+      "summary": "**Status:** Partial (the groups, the three admins, the bearer pin and the classification-bound exchange ship; the person-identity contract in §1a is built and **NOT VERIFIED** on a deployment, row by row in its table).",
+      "path": "docs/specs/interaction/governance/IDENTITY-AND-ACCESS-MODEL.md"
+    },
+    {
+      "title": "SPEC: Abuse Controls (rate limiting, spend budgets, request dedup)",
+      "summary": "**Status:** Partial. The five controls and the shared table they ride are in place; the requirements table states what is delivered, what is partial and what each is validated by.",
+      "path": "docs/specs/interaction/governance/SPEC-ABUSE-CONTROLS.md"
+    },
+    {
+      "title": "SPEC: Access and Controls Auditing",
+      "summary": "**Status:** Implemented (audit capture and the membership-history view; forward extensions noted inline).",
+      "path": "docs/specs/interaction/governance/SPEC-ACCESS-AND-CONTROLS-AUDITING.md"
+    },
+    {
+      "title": "SPEC: Add a user to a conversation (eligible-member invite and assistant escalation)",
+      "summary": "**Status:** DESIGN (not yet built).",
+      "path": "docs/specs/interaction/governance/SPEC-ADD-USER-ESCALATION.md"
+    },
+    {
+      "title": "SPEC: Admin Identity",
+      "summary": "**Status:** Implemented (with a small set of tracked gaps, named in the Delivered column of the requirements table)",
+      "path": "docs/specs/interaction/governance/SPEC-ADMIN-IDENTITY.md"
+    },
+    {
+      "title": "SPEC: Conversation Security, Membership and Information Isolation",
+      "summary": "**Status:** Partial (Layers 1-6 ship; Layer 7 mixed-trust visibility is partial; caller resolution (§4e) and the audience rule's declared grants and outward guard are NOT BUILT).",
+      "path": "docs/specs/interaction/governance/SPEC-CONVERSATION-SECURITY.md"
+    },
+    {
+      "title": "SPEC: Credential Exchange",
+      "summary": "**Status:** Partial (the person half is bearer-pinned; the opaque person id, the `Identities` index (§4b), the trusted-issuer registry and the edge authorizer that verifies its tokens are built and **NOT VERIFIED** on a deployment; every turn the async processor runs acts on a vended assistant session pinned to one bot, with no fallback identity; services that speak outside a user turn speak on ve",
+      "path": "docs/specs/interaction/governance/SPEC-CREDENTIAL-EXCHANGE.md"
+    },
+    {
+      "title": "SPEC: Federated Participants",
+      "summary": "**Status:** Design, built (an external issuer declared in the trusted-issuer registry with the one-conversation session is served by the one exchange and the one create path); enabled only where a deployment declares a one-conversation issuer; **NOT VERIFIED** on a deployment, and no e2e spec drives it yet; the per-connector group map is **NOT BUILT**",
+      "path": "docs/specs/interaction/governance/SPEC-FEDERATED-PARTICIPANTS.md"
+    },
+    {
+      "title": "SPEC: Moderation",
+      "summary": "**Status:** Partial (the built content-moderation surfaces plus the can-work design; assistant-neutral).",
+      "path": "docs/specs/interaction/governance/SPEC-MODERATION.md"
+    },
+    {
+      "title": "DESIGN: Battle Mode (`/battle`) - Technical Design",
+      "summary": "**Status:** Partial. The two-version battle (section 1a), the alt as a classification-stack assistant and the router-owned round 2 are built and deployed. The battle e2e ran against a deployment with both sides pinned on 2026-10-27, 20 of 21 passed: two-sided battles, round 2, server-recorded picks, and the alt answering as the alt (B-E10). B-E7, FR10's answer-then-resume round trip, failed that r",
+      "path": "docs/specs/interaction/quality/DESIGN-BATTLE.md"
+    },
+    {
+      "title": "DESIGN: Evaluation",
+      "summary": "**Status:** Partial. This document describes the design for first release. Per requirement, what is delivered and what is not is stated in [SPEC-EVALUATION](./SPEC-EVALUATION.md), Functional Requirements, and nowhere else.",
+      "path": "docs/specs/interaction/quality/DESIGN-EVALUATION.md"
+    },
+    {
+      "title": "DESIGN: Experiments and Battle - Objective, Briefing, Lifecycle, and Decision Loop",
+      "summary": "**Status:** Partial. §1 to §4 are implemented. The §4.3 drill-down's real-data reconciliation is verified live by `tests/e2e/experiments.spec.ts` (\"the drill-down reproduces the aggregate: same count, same mean, per variant\"); `tests/e2e/experiment-results-trust.spec.ts` extends that check to every experiment type through the admin console, 4 of 4 on a deployment (2026-10-27). The two-version mode",
+      "path": "docs/specs/interaction/quality/DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP.md"
+    },
+    {
+      "title": "SPEC: Battle Mode (`/battle`) - Product Specification",
+      "summary": "**Status:** Partial. The battle path ships. Three rows are partly delivered (FR3, FR9, FR10), FR11 and FR12 are deployed and verified on a deployment, and FR13 is **ROADMAP**; the requirements table is the authority on which. FR10 stays partly delivered: on a deployment the owner's reply reaches the waiting side and resumes it, and a non-owner's does not, but B-E7 has not yet passed end to end (se",
+      "path": "docs/specs/interaction/quality/SPEC-BATTLE.md"
+    },
+    {
+      "title": "SPEC: Evaluation",
+      "summary": "**Status:** Partial. This document describes the design for first release; the requirements table states what is delivered and what is not.",
+      "path": "docs/specs/interaction/quality/SPEC-EVALUATION.md"
+    },
+    {
+      "title": "The AgentEchelon Interaction Layer - platform composition model",
+      "summary": "**Status:** Design overview.",
+      "path": "docs/specs/interaction/SPEC-INTERACTION-LAYER.md"
+    },
+    {
+      "title": "DESIGN: Admin Console",
+      "summary": "**Status:** Partial (7 sections built; Aurora-only quality views ship their scoring passes incrementally). Per requirement, what is delivered and what is not is stated in [SPEC-ADMIN-CONSOLE](./SPEC-ADMIN-CONSOLE.md), Functional Requirements, and nowhere else.",
+      "path": "docs/specs/interface/DESIGN-ADMIN-CONSOLE.md"
+    },
+    {
+      "title": "DESIGN: Chat Application",
+      "summary": "**Status:** Implemented",
+      "path": "docs/specs/interface/DESIGN-CHAT-APP.md"
+    },
+    {
+      "title": "DESIGN: Separate Admin App",
+      "summary": "**Status:** Partial (frontend workspace split and CORS/env split built through P3; further docs and hardening remain)",
+      "path": "docs/specs/interface/DESIGN-SEPARATE-ADMIN-APP.md"
+    },
+    {
+      "title": "SPEC: Admin console effectiveness, the intent-anchored drill",
+      "summary": "**Status:** The intent spine is implemented. The Effectiveness section is one intent-anchored drill served by the `intent_effectiveness`, `intent_exchanges`, `task_details`, `task_timeline` and `intent_steps` queries; the requirements table states, per requirement, what is delivered and what is not.",
+      "path": "docs/specs/interface/SPEC-ADMIN-CONSOLE-EFFECTIVENESS.md"
+    },
+    {
+      "title": "SPEC: Admin Console",
+      "summary": "**Status:** Partial. This document describes the design for first release; the requirements table states what is delivered and what is not.",
+      "path": "docs/specs/interface/SPEC-ADMIN-CONSOLE.md"
+    },
+    {
+      "title": "SPEC: Chat Application",
+      "summary": "**Status:** Implemented",
+      "path": "docs/specs/interface/SPEC-CHAT-APP.md"
+    },
+    {
+      "title": "SPEC: Embeddable widget - an assistant on someone else's page, with no account or with the host's sign-in",
+      "summary": "**Status:** Built, not deployed. The widget is `frontend/packages/widget` and its hosting is the `Widget` stack (`backend/lib/stacks/widget-stack.ts`, the `widget` capability). It signs people in through the guest issuer ([GUEST-ISSUER](../../guides/admin/GUEST-ISSUER.md)) and the `host-assertion` issuer ([SPEC-CREDENTIAL-EXCHANGE](../interaction/governance/SPEC-CREDENTIAL-EXCHANGE.md), \"The host ",
+      "path": "docs/specs/interface/SPEC-EMBEDDABLE-WIDGET.md"
+    },
+    {
+      "title": "SPEC: Per-Page Frontend Observability",
+      "summary": "**Status:** Proposed, under consideration. The per-page attribution this document adds is **NOT BUILT**; the shared telemetry seam it extends is built (FR10, and FR7, FR8, FR12 and FR13 in part or whole).",
+      "path": "docs/specs/interface/SPEC-FRONTEND-OBSERVABILITY.md"
+    }
+  ],
+  "blog": [],
+  "generated_from": {
+    "repo_docs": 103,
+    "public_blog_posts": 0,
+    "blog_vault_used": false
+  }
+}

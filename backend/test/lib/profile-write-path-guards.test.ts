@@ -16,9 +16,6 @@ const anyModel = Object.keys(catalog)[0];
 function body(over: Partial<ProfileDefinitionBody> = {}): Partial<ProfileDefinitionBody> {
   return {
     modelKey: anyModel,
-    classifierMode: 'llm',
-    timeoutSeconds: 30,
-    taskSupport: 'full',
     ...over,
   };
 }
@@ -65,14 +62,14 @@ describe('context source keys are verified before a version can activate', () =>
   // client exercises the actual path.
   const ssmWithDraft = (draftBody: Partial<ProfileDefinitionBody>) => ({
     send: async () => ({
-      Parameter: { Value: JSON.stringify({ profileName: 'standard', configId: 'cfg-1', ...draftBody }) },
+      Parameter: { Value: JSON.stringify({ profileName: 'analyst', configId: 'cfg-1', ...draftBody }) },
     }),
   }) as never;
 
   const selecting = ssmWithDraft(body({ contextSources: ['company-docs', 'x-not-published'] }));
 
   it('rejects a key the deployment does not publish, naming what it does offer', async () => {
-    const { errors } = await validateDraft(selecting, '/root', 'standard', catalog,
+    const { errors } = await validateDraft(selecting, '/root', 'analyst', catalog,
       async () => [{ key: 'company-docs' }]);
     expect(errors.join(' ')).toMatch(/'x-not-published' is not published/);
     expect(errors.join(' ')).toMatch(/'company-docs'/);
@@ -81,13 +78,13 @@ describe('context source keys are verified before a version can activate', () =>
   it('accepts a selection the deployment DOES publish', async () => {
     // Falsification: a check that rejected every key would pass the test above and block all use of
     // the feature.
-    const { errors } = await validateDraft(selecting, '/root', 'standard', catalog,
+    const { errors } = await validateDraft(selecting, '/root', 'analyst', catalog,
       async () => [{ key: 'company-docs' }, { key: 'x-not-published' }]);
     expect(errors).toEqual([]);
   });
 
   it('FAILS CLOSED when the catalog cannot be read, matching import', async () => {
-    const { errors } = await validateDraft(selecting, '/root', 'standard', catalog,
+    const { errors } = await validateDraft(selecting, '/root', 'analyst', catalog,
       async () => { throw new Error('AccessDenied'); });
     expect(errors.join(' ')).toMatch(/could not be read/);
     expect(errors.join(' ')).toMatch(/refusing to activate/);
@@ -96,14 +93,14 @@ describe('context source keys are verified before a version can activate', () =>
   it('does not consult the catalog when a profile selects NOTHING', async () => {
     // An unrelated SSM problem must not block a profile that uses none of this.
     const readCatalog = jest.fn();
-    const { errors } = await validateDraft(ssmWithDraft(body()), '/root', 'standard', catalog, readCatalog as never);
+    const { errors } = await validateDraft(ssmWithDraft(body()), '/root', 'analyst', catalog, readCatalog as never);
     expect(errors).toEqual([]);
     expect(readCatalog).not.toHaveBeenCalled();
   });
 
   it('gates ACTIVATION too, not just validate', async () => {
     // A caller can skip validate entirely, so activate is the gate that matters.
-    await expect(activateDraft(selecting, '/root', 'standard', catalog, 'actor',
+    await expect(activateDraft(selecting, '/root', 'analyst', catalog, 'actor',
       async () => [{ key: 'company-docs' }])).rejects.toThrow(/x-not-published/);
   });
 });

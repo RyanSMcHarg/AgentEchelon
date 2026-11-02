@@ -114,7 +114,7 @@ describe('isDeliverableDocument', () => {
   });
 
   it('does NOT deliver a long bulleted question list with no heading and no table', () => {
-    // Exercises the SECOND signal specifically: no recognised solicitation opener, so only the
+    // Exercises the SECOND signal specifically: no recognized solicitation opener, so only the
     // "several questions in a body with no heading and no table" clause can reject it. It clears
     // the list-only structural branch, so without that clause it would be delivered as a file.
     const questions = 'Thanks for the request. The shape of this document changes a lot depending '

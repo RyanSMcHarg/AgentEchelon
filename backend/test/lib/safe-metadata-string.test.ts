@@ -23,7 +23,7 @@ const encodedLen = (s: string) => encodeURIComponent(s).length;
 // future field pushes the must-keep core past the cap, this fails.
 const maximal = (): Record<string, unknown> => ({
   messageNumber: 42,
-  userType: 'premium',
+  classification: 'premium',
   role: 'assistant',
   timestamp: '2026-06-20T00:00:00.000Z',
   agentType: 'premium',
@@ -54,7 +54,7 @@ const maximal = (): Record<string, unknown> => ({
 describe('safeMetadataString budget', () => {
   it('passes a normal blob through unchanged and within budget', () => {
     const normal = {
-      messageNumber: 5, userType: 'premium', role: 'assistant',
+      messageNumber: 5, classification: 'premium', role: 'assistant',
       timestamp: '2026-06-20T00:00:00.000Z', intent: 'general',
       bedrockModel: 'anthropic.claude-3-5-sonnet-20241022-v2:0',
       inputTokens: 100, outputTokens: 200, assignmentMode: 'probabilistic',
@@ -128,6 +128,13 @@ describe('the metadata shed order protects attribution before detail', () => {
       .join(' ')
       .match(/'([^']+)'/g) || []).map((s) => s.replace(/'/g, ''));
   };
+
+  it('sheds the router step log FIRST of all', () => {
+    // It is the only field on the blob that is an array of objects rather than a scalar, so it is the
+    // biggest single saving, and it is a breakdown OF routerMs - shedding it leaves the figure it
+    // decomposes intact. Anything dropped ahead of it would be a worse trade by both measures.
+    expect(shedOrder()[0]).toBe('routerSteps');
+  });
 
   it('drops every step-latency diagnostic before the grouping key', () => {
     const order = shedOrder();

@@ -31,10 +31,25 @@ import {
   emitContextSourceFieldFailure,
 } from '../../lambda/src/lib/context-source-outcomes';
 import { recordNoTransitionTurn, TASK_STALL_TURNS, type Task } from '../../lambda/src/lib/task-tracking';
-import { recordWelcomeConfigDefect } from '../../lambda/src/lib/welcome-metrics';
+import { recordWelcomeConfigDefect, recordWelcomePromptOutcome } from '../../lambda/src/lib/welcome-metrics';
+import { recordClassificationBoundaryRefusal } from '../../lambda/src/lib/access-denial';
+import { recordUnauditableChannel } from '../../lambda/src/membership-audit';
 import { emitArchivalHealth } from '../../lambda/src/analytics-aurora/archival-health';
+import * as queueMetrics from '../../lambda/src/lib/turn-queue-metrics';
 import { repairTaskAnswer } from '../../lambda/src/lib/task-answer-repair';
+import {
+  recordPrivateMessageTargetMismatch,
+  recordPrivateMessageWithoutTarget,
+} from '../../lambda/src/lib/private-command';
+import { recordAttachmentOverBudget } from '../../lambda/src/lib/attachment-budget';
+import { recordNotificationOutcome } from '../../lambda/src/lib/notify-on-delivery';
 import { DeliveryOption } from '../../lambda/src/lib/delivery-options';
+import { countReplyOutcome } from '../../lambda/src/email-reply';
+import { guestMetric } from '../../lambda/src/guest-session';
+import { countAssertionRefused } from '../../lambda/src/lib/host-assertion-metric';
+import { invitationMetric } from '../../lambda/src/lib/invitations';
+import { scheduleInvitationDeadline } from '../../lambda/src/router-agent-handler';
+import { PLATFORM_EVENT_WORKFLOWS } from '../../lambda/src/lib/event-workflow';
 
 interface EmfDoc {
   _aws: {
@@ -180,6 +195,173 @@ describe('the EMF envelope matches the schema CloudWatch parses', () => {
  */
 const CALLERS: Array<{ module: string; label: string; emit: () => Promise<EmfDoc[]> }> = [
   {
+    // An inbound email reply's outcome. Dimensionless: one series per outcome, which an alarm watches as is.
+    module: 'lambda/src/email-reply.ts',
+    label: 'countReplyOutcome (posted and refused)',
+    emit: async () => capture(() => { countReplyOutcome('Posted'); countReplyOutcome('Refused_unknown-token'); }),
+  },
+  {
+    // A guest start refused, by reason, and a signing throttle with no reason: `Instance` must be present
+    // on both, or the alarm's series drops the point.
+    module: 'lambda/src/guest-session.ts',
+    label: 'guestMetric (with and without a reason)',
+    emit: async () => capture(() => { guestMetric('GuestRefused', { Reason: 'unavailable' }); guestMetric('GuestSigningThrottled'); }),
+  },
+  {
+    // A host assertion refused, by the check that refused it, with and without the issuer.
+    module: 'lambda/src/lib/host-assertion-metric.ts',
+    label: 'countAssertionRefused',
+    emit: async () => capture(() => countAssertionRefused('acme-host', 'audience')),
+  },
+  {
+    // An invitation redemption refused, by reason.
+    module: 'lambda/src/lib/invitations.ts',
+    label: 'invitationMetric (by reason)',
+    emit: async () => capture(() => invitationMetric('InvitationRefused', { Reason: 'expired' })),
+  },
+  {
+    // An invitation's deadline that could not be scheduled after every attempt (ADR-061 decision 1). The
+    // classification's alarm watches the `Classification` series, so the value must be on the line, driven
+    // here through the router's own default emitter rather than an injected one.
+    module: 'lambda/src/router-agent-handler.ts',
+    label: 'scheduleInvitationDeadline (every create attempt fails)',
+    emit: async () => captureAsync(async () => {
+      const err = jest.spyOn(console, 'error').mockImplementation(() => {});
+      const app = 'arn:aws:chime:us-east-1:111122223333:app-instance/ai';
+      try {
+        await scheduleInvitationDeadline({
+          channelArn: `${app}/channel/ch-1`, invitationId: '0b7f2a52-0000-4000-8000-000000000001', conversationType: 'general',
+          expiresAt: 1_800_000_000 + 7 * 86_400,
+        } as never, { chase: PLATFORM_EVENT_WORKFLOWS['chase-unredeemed'] }, {
+          wiring: { group: 'ae-standard-event-deadlines', roleArn: 'arn:aws:iam::111122223333:role/d', routerArn: 'arn:aws:lambda:us-east-1:111122223333:function:r' },
+          create: async () => { throw Object.assign(new Error('no'), { name: 'AccessDeniedException' }); },
+          now: () => 1_800_000_000_000,
+          sleep: async () => undefined,
+        });
+      } finally { err.mockRestore(); }
+    }),
+  },
+  {
+    // A membership the audit could not evaluate, because the channel's classification tag was
+    // unreadable (ADR-045 decision 2). `MemberKind` is the dimension an operator filters on, so it
+    // must be present on both values or that metric is dropped in silence - which for a DETECTIVE
+    // control means its blind spots look exactly like clean results.
+    module: 'lambda/src/membership-audit.ts',
+    label: 'recordUnauditableChannel (member and assistant)',
+    emit: async () => capture(() => {
+      const err = jest.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        recordUnauditableChannel('arn:chan', 'arn:member', 'member');
+        recordUnauditableChannel('arn:chan', 'arn:bot', 'assistant');
+      } finally { err.mockRestore(); }
+    }),
+  },
+  {
+    // The classification boundary refusing an assistant (ADR-045 decision 1). The single dimension is
+    // `Assistant`, so an operator alarms on one metric and filters rather than watching one series per
+    // classification. `Assistant` must therefore be present in the properties on EVERY call, including
+    // the one where the handler has no CLASSIFICATION set - hence the empty-string case below, which
+    // is the one that would silently drop the point an alarm is waiting for.
+    module: 'lambda/src/lib/access-denial.ts',
+    label: 'recordClassificationBoundaryRefusal (named and unnamed assistant)',
+    emit: async () => capture(() => {
+      const err = jest.spyOn(console, 'error').mockImplementation(() => {});
+      try {
+        recordClassificationBoundaryRefusal({
+          channelArn: 'arn:chan', assistant: 'premium', refusedAt: 'channel-size:mention-or-bypass',
+        });
+        recordClassificationBoundaryRefusal({
+          channelArn: 'arn:chan', assistant: '', refusedAt: 'channel-classification:first-read',
+        });
+      } finally { err.mockRestore(); }
+    }),
+  },
+  {
+    // A private address that arrived without a Target. The DIMENSIONLESS set is the
+    // one an alarm watches, and the Disposition set says who was addressed; both must carry values.
+    // It was a `Path` set until 2026-09-16, when this branch stopped deleting the message: there is no
+    // longer a way it "ended" to dimension on, and the dimension that decides what happens next is
+    // whether an assistant was named.
+    module: 'lambda/src/lib/private-command.ts',
+    label: 'recordPrivateMessageWithoutTarget (each disposition)',
+    emit: async () => capture(() => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        for (const disposition of ['addressee-is-an-assistant', 'addressee-is-a-person'] as const) {
+          recordPrivateMessageWithoutTarget({
+            channelArn: 'arn:chan', messageId: 'm-1', addresseeIsBot: disposition === 'addressee-is-an-assistant', disposition,
+          });
+        }
+      } finally { warn.mockRestore(); }
+    }),
+  },
+  {
+    // The other half of the same check: a private address whose Target named the WRONG member. Its own
+    // metric name, driven separately, because a caller sharing a module with another emitter is not
+    // exercised by it - the dimension sets are declared per call site.
+    module: 'lambda/src/lib/private-command.ts',
+    label: 'recordPrivateMessageTargetMismatch (each disposition)',
+    emit: async () => capture(() => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        for (const disposition of ['addressee-is-an-assistant', 'addressee-is-a-person'] as const) {
+          recordPrivateMessageTargetMismatch({
+            channelArn: 'arn:chan', messageId: 'm-1', addresseeIsBot: disposition === 'addressee-is-an-assistant', disposition,
+          });
+        }
+      } finally { warn.mockRestore(); }
+    }),
+  },
+  {
+    // An attachment the model was never given (the byte budget, or the pixel edge). The DIMENSIONLESS
+    // set is what an alarm watches; Path says which of the three ways it was refused and Reason says
+    // which limit refused it, and every one of them must carry every dimension value or that metric is
+    // dropped without a word.
+    module: 'lambda/src/lib/attachment-budget.ts',
+    label: 'recordAttachmentOverBudget (each path)',
+    emit: async () => capture(() => {
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      try {
+        recordAttachmentOverBudget({ path: 'current-turn', byteLength: 9_000_000, contentType: 'image/png', classification: 'premium' });
+        recordAttachmentOverBudget({ path: 'history', byteLength: 9_000_000, contentType: 'image/jpeg', classification: 'standard' });
+        recordAttachmentOverBudget({ path: 'evaluation', byteLength: 9_000_000, contentType: 'image/png', classification: 'basic' });
+        // The pixel-edge refusal, which shares this counter: `Reason` is a dimension, so a path that
+        // stopped populating it would drop the metric rather than mislabel it.
+        recordAttachmentOverBudget({ path: 'current-turn', byteLength: 120_000, reason: 'dimensions', dimensions: { width: 12_000, height: 400 }, contentType: 'image/png', classification: 'premium' });
+        // No classification and no content type: the realistic way a named dimension ends up without a
+        // value, which drops the metric silently. The reason is also omitted, so its default is proved
+        // to be a value and not an absence.
+        recordAttachmentOverBudget({ path: 'history', byteLength: 4_000_000 });
+      } finally { warn.mockRestore(); }
+    }),
+  },
+  {
+    module: 'lambda/src/lib/turn-queue-metrics.ts',
+    label: 'the queue metrics: every emitter, one per line',
+    // ALL of them, not a representative one. Each declares the same dimension set, so a future
+    // emitter that forgets to populate  would drop silently while its neighbors
+    // kept working - which is the failure this file exists to catch, one layer up.
+    emit: async () => capture(() => {
+      queueMetrics.recordQueued('standard', 2);
+      queueMetrics.recordOverflowDrop('standard');
+      queueMetrics.recordDrainDepth('standard', 3);
+      queueMetrics.recordQueueWait('standard', 1200);
+      queueMetrics.recordTriageTasks('standard', 2);
+      queueMetrics.recordTakeover('standard');
+      // Added with the drain-lifetime work: the healthy counterpart to a takeover, and the refusal
+      // that says the judged half is not running.
+      queueMetrics.recordAwaitedAnswer('standard');
+      queueMetrics.recordReadingRefused('standard', 'no-machine-lines');
+    }),
+  },
+  {
+    module: 'lambda/src/lib/turn-queue-metrics.ts',
+    label: 'the queue metrics: an unknown classification still carries the dimension',
+    // A dimension named in the set but absent from the properties drops the metric SILENTLY. An
+    // empty classification is the realistic way that happens, so it is exercised rather than assumed.
+    emit: async () => capture(() => queueMetrics.recordQueued('', 1)),
+  },
+  {
     module: 'lambda/src/lib/emf-metrics.ts',
     label: 'emitDriftCounter (no options)',
     emit: async () => capture(() => emitDriftCounter('drift_fired', 'corr-1')),
@@ -267,6 +449,11 @@ const CALLERS: Array<{ module: string; label: string; emit: () => Promise<EmfDoc
     })),
   },
   {
+    module: 'lambda/src/lib/welcome-metrics.ts',
+    label: 'recordWelcomePromptOutcome (fallback)',
+    emit: async () => capture(() => recordWelcomePromptOutcome('fallback:deadline')),
+  },
+  {
     module: 'lambda/src/lib/task-tracking.ts',
     label: 'recordNoTransitionTurn (task_state_stalled)',
     // The stall counter fires only at the threshold, so the task is seeded one turn short of it.
@@ -305,6 +492,20 @@ const CALLERS: Array<{ module: string; label: string; emit: () => Promise<EmfDoc
         Sender: { Arn: 'arn:aws:chime:us-east-1:1:app-instance/a/user/u-emf', Name: 'A' },
       },
     } as never)),
+  },
+  {
+    // The notification fan-out's outcome counts (ADR-041 decision 7). The fan-out collects its send
+    // failures rather than raising them and its caller never surfaced them, so these are the only
+    // place a failed notification is visible - which makes a silently dropped document the same
+    // defect as no metric at all. The set is DIMENSIONLESS because that is the series the
+    // post-processing stack's alarm watches, and a set nothing publishes can never fire an alarm.
+    module: 'lambda/src/lib/notify-on-delivery.ts',
+    label: 'recordNotificationOutcome (every count, and a zero that must not publish)',
+    emit: async () => capture(() => {
+      recordNotificationOutcome({ emailed: 2, skipped: 1, failed: 1 });
+      // A fan-out that reached everybody publishes one document, not three empty ones.
+      recordNotificationOutcome({ emailed: 1, skipped: 0, failed: 0 });
+    }),
   },
 ];
 

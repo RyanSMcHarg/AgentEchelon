@@ -21,7 +21,7 @@ ALTER TABLE embeddings ADD COLUMN IF NOT EXISTS classification TEXT;
 -- carry the `classification` key AND have no column value, and there are two sources of those: 020,
 -- which is itself bounded to one batch and runs immediately before this file in the same transaction,
 -- and document-ingestion, which writes the key and the column in the same INSERT and so produces none.
--- The ceiling is therefore 020's batch. `migration-data-steps-are-bounded.test.ts` records the
+-- The bound is therefore 020's batch. `migration-data-steps-are-bounded.test.ts` records the
 -- exemption so that a future edit which widens the predicate has to argue for it.
 UPDATE embeddings
    SET classification = metadata ->> 'classification'

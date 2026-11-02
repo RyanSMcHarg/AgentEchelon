@@ -11,7 +11,8 @@
  */
 
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { callerIsAdmin } from './lib/auth.js';
+import { callerIsAdmin, callerPersonId } from './lib/auth.js';
+import { responder, DEV_ORIGIN } from './lib/http-response.js';
 import {
   getDeploymentState,
   setDeploymentState,
@@ -21,6 +22,7 @@ import {
   notify,
   DeploymentState,
 } from './lib/sleep-mode.js';
+import { loadProfileRegistry } from '../../lib/profile-registry';
 
 const DEFAULT_IDLE_MS = 2 * 3_600_000; // 2h fallback
 const WAKE_MIN_ACU = Number(process.env.AURORA_WAKE_MIN_ACU || '0.5');
@@ -74,20 +76,15 @@ async function runIdleCheck(): Promise<void> {
 
 // --- HTTP API --------------------------------------------------------------
 
+// The configured value as-is, read per response, with no Allow-Headers or Allow-Methods header.
+const http = responder({ origin: { fixed: () => process.env.ALLOWED_ORIGINS || DEV_ORIGIN }, allowHeaders: null });
+
 function json(statusCode: number, body: unknown): APIGatewayProxyResult {
-  return {
-    statusCode,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': process.env.ALLOWED_ORIGINS || '*',
-    },
-    body: JSON.stringify(body),
-  };
+  return http.respond(statusCode, body);
 }
 
-function adminSub(event: APIGatewayProxyEvent): string {
-  const claims = (event.requestContext as any)?.authorizer?.claims;
-  return claims?.sub || claims?.['cognito:username'] || 'admin';
+async function adminSub(event: APIGatewayProxyEvent): Promise<string> {
+  return (await callerPersonId(event)) || 'admin';
 }
 
 async function handleHttp(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
@@ -116,7 +113,7 @@ async function handleHttp(event: APIGatewayProxyEvent): Promise<APIGatewayProxyR
       return json(403, { error: 'Admin access required' });
     }
     const target = path.endsWith('/deployment/sleep') ? 'asleep' : 'awake';
-    const changedBy = `admin:${adminSub(event)}`;
+    const changedBy = `admin:${await adminSub(event)}`;
     try {
       const r = await transition(target, changedBy);
       return json(200, { ok: true, ...r });
@@ -146,6 +143,8 @@ async function handleHttp(event: APIGatewayProxyEvent): Promise<APIGatewayProxyR
 // --- Entry -----------------------------------------------------------------
 
 export const handler = async (event: any): Promise<APIGatewayProxyResult | void> => {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   // API Gateway REST events carry httpMethod; EventBridge scheduled events do not.
   if (event && typeof event.httpMethod === 'string') {
     try {

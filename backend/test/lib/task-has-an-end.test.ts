@@ -1,5 +1,5 @@
 /**
- * A TASK MUST SAY WHEN IT ENDED, AND THE QUEUE MUST LEARN IT (tracker rows 49/50, ADR-024).
+ * A TASK MUST SAY WHEN IT ENDED, AND THE QUEUE MUST LEARN IT (ADR-024).
  *
  * Two halves of one defect, and neither errored:
  *
@@ -42,8 +42,8 @@ const TASK_ROW = {
   channelArn: CHANNEL,
   status: 'completed',
   taskType: 'report_generation',
-  ownerId: OWNER,
-  ownerType: 'user',
+  assigneeId: OWNER,
+  assigneeType: 'user',
 };
 
 beforeEach(() => {
@@ -139,7 +139,7 @@ describe('the queue lets go when the work ends', () => {
 
     const mirrored = writes('user-tasks-test');
     expect(mirrored).toHaveLength(1);
-    expect(mirrored[0].input.Key).toEqual({ userSub: OWNER, taskId: 't-1' });
+    expect(mirrored[0].input.Key).toEqual({ principalId: OWNER, taskId: 't-1' });
     expect(mirrored[0].input.ExpressionAttributeValues[':s']).toBe('completed');
   });
 

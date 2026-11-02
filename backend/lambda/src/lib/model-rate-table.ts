@@ -56,6 +56,8 @@ export const MODEL_RATE_TABLE: Record<BackendModelKey, TextModelRate> = {
   gpt_oss_120b: { inputPer1kUsd: 0.0008, outputPer1kUsd: 0.0024 },
   // DeepSeek V3.1 on Bedrock — approximate; reconcile against AWS pricing.
   deepseek_v3: { inputPer1kUsd: 0.00058, outputPer1kUsd: 0.00168 },
+  // DeepSeek R1 on Bedrock - approximate; reconcile against AWS pricing.
+  deepseek_r1: { inputPer1kUsd: 0.00135, outputPer1kUsd: 0.0054 },
 };
 
 // Phase 4 model decision made: per-image rates live in
@@ -103,10 +105,42 @@ function profileIdFromArn(s: string): string {
  * key. Accepts a bare model id, a bare inference-profile id, or a full
  * inference-profile ARN (the battle path records the ARN).
  */
+/**
+ * Models this deployment RAN that the catalog no longer offers.
+ *
+ * ── WHY THIS EXISTS ─────────────────────────────────────────────────────────
+ *
+ * The reverse map is built from the live catalog, so a model that has since been retired resolves to
+ * no key and prices as null. That is the honesty contract working as designed for an UNKNOWN model -
+ * and wrong for one whose rate is perfectly well known and which is sitting in the history being
+ * priced.
+ *
+ * Measured live: every experiment CONTROL arm read cost = null, because the controls ran
+ * claude-3-haiku and the catalog has moved to Haiku 4.5. An operator comparing arms on cost had a
+ * number for one side and a blank for the other, on the surface whose entire job is that comparison.
+ *
+ * SEPARATE FROM THE CATALOG ON PURPOSE. Adding a retired model back to the catalog would make it
+ * selectable again, which is a different decision with deployment consequences. Pricing history is
+ * not the same act as offering a model.
+ *
+ * A retired id maps to the family key whose published rate it shares. The table's own caveat applies:
+ * these are approximate and a deployer reconciles them against AWS pricing.
+ */
+const RETIRED_MODEL_IDS: Record<string, BackendModelKey> = {
+  // Claude 3 Haiku: $0.00025 / $0.00125 per 1k, the same published rate as the haiku entry.
+  'anthropic.claude-3-haiku-20240307-v1:0': 'haiku',
+  'us.anthropic.claude-3-haiku-20240307-v1:0': 'haiku',
+};
+
 export function bedrockModelIdToKey(modelId: string | undefined | null): BackendModelKey | null {
   if (!modelId) return null;
   const map = getReverseMap();
-  return map.get(modelId) ?? map.get(profileIdFromArn(modelId)) ?? null;
+  const profileId = profileIdFromArn(modelId);
+  return map.get(modelId)
+    ?? map.get(profileId)
+    ?? RETIRED_MODEL_IDS[modelId]
+    ?? RETIRED_MODEL_IDS[profileId]
+    ?? null;
 }
 
 export interface StepCostInput {

@@ -20,7 +20,7 @@ const env = { account: '123456789012', region: 'us-east-1' };
 const props = {
   env,
   appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/11111111-2222-3333-4444-555555555555',
-  userPoolId: 'us-east-1_TESTPOOL',
+  selfPoolId: 'us-east-1_TESTPOOL',
   appUrl: 'https://example.test',
 };
 
@@ -60,6 +60,13 @@ describe('BattleStack — battle-outcome experiment attribution wiring', () => {
     expect(ref).toBeDefined();
     expect(ref).toMatch(/ChannelBattleConfigTable/);
     expect(template.toJSON().Resources[ref].Type).toBe('AWS::DynamoDB::Table');
+  });
+
+  it('writes no per-voter record: a pick is kept when its voter is offboarded', () => {
+    const template = synth();
+    const { fn } = outcomeFunction(template);
+    expect(fn.Properties.Environment.Variables.BATTLE_VOTER_INDEX_TABLE).toBeUndefined();
+    expect(JSON.stringify(template.toJSON().Resources)).not.toContain('BattleVoterIndexTable');
   });
 
   it('grants the outcome role read on the config table', () => {
@@ -145,11 +152,23 @@ describe('BattleStack - a duel can actually be ended, not just told to end', () 
 
     // Finishing a duel releases the `activeBattleId` pointer. Without the name the release returns
     // immediately; without the grant it AccessDenies into a caught warning. Either way the channel
-    // stays locked to a duel that is over until the backstop clock expires - the exact behaviour the
+    // stays locked to a duel that is over until the backstop clock expires - the exact behavior the
     // recorded release replaced.
     expect(fnEnv(template, /BattleOrchestrator/).CHANNEL_BATTLE_CONFIG_TABLE).toBeDefined();
     expect(actionsOn(template, /BattleOrchestratorRole/, /ChannelBattleConfigTable/))
       .toContain('dynamodb:UpdateItem');
+  });
+
+  it('lets the ORCHESTRATOR read the experiment the conversation bound, and only by key', () => {
+    const template = synth();
+
+    // Round 2 names both sides from the experiment bound at enable, read off the config row with a
+    // GetItem. Without the grant the read AccessDenies into a caught warning on every duel and the
+    // sides resolve without the bound experiment (dev, 2026-10-28: "not authorized to perform:
+    // dynamodb:GetItem on resource: .../agent-echelon-channel-battle-config"). The row is read and
+    // its pointer cleared; it is never replaced, deleted, queried or scanned.
+    expect(actionsOn(template, /BattleOrchestratorRole/, /ChannelBattleConfigTable/).sort())
+      .toEqual(['dynamodb:GetItem', 'dynamodb:UpdateItem']);
   });
 
   it('lets TURNING BATTLE MODE OFF end the duel that is running, not just release it', () => {
@@ -174,7 +193,7 @@ describe('BattleStack - a duel can actually be ended, not just told to end', () 
 
     // The refusal is what keeps an unfinished comparison out of the human-pick axis. Unset, the read
     // returns [] and the `rows.length > 0` guard makes the whole check unreachable - present in the
-    // source, absent in behaviour.
+    // source, absent in behavior.
     expect(fnEnv(template, /BattleOutcomeFunction/).BATTLE_STATE_TABLE).toBeDefined();
 
     // Read-only, deliberately: this Lambda judges a duel, it never changes one.

@@ -8,7 +8,7 @@
  * for) in a shared channel, then reports the latency distribution + any
  * throttle/error count. Exercises the real Converse tool-loop turn under load.
  *
- *   APP_INSTANCE_ARN=… BOT_ARN=… FN=<tier processor name> N=20 \
+ *   APP_INSTANCE_ARN=… BOT_ARN=… FN=<tier processor name> CLASSIFICATION=standard N=20 \
  *     AWS_PROFILE=… npx ts-node scripts/concurrency-check.ts
  */
 
@@ -26,6 +26,8 @@ const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN!;
 const BOT_ARN = process.env.BOT_ARN!;
 const FN = process.env.FN!;
 const N = parseInt(process.env.N || '20', 10);
+// No default: a classification is set or not (ADR-046).
+const CLASSIFICATION = (process.env.CLASSIFICATION || '').trim();
 const QUESTION = 'Give me a concise 2-sentence overview of the company.';
 
 const chime = new ChimeSDKMessagingClient({ region });
@@ -38,8 +40,8 @@ function pct(sorted: number[], p: number): number {
 }
 
 async function main(): Promise<void> {
-  if (!APP_INSTANCE_ARN || !BOT_ARN || !FN) {
-    throw new Error('Set APP_INSTANCE_ARN, BOT_ARN, FN');
+  if (!APP_INSTANCE_ARN || !BOT_ARN || !FN || !CLASSIFICATION) {
+    throw new Error('Set APP_INSTANCE_ARN, BOT_ARN, FN, CLASSIFICATION');
   }
   console.log(`Concurrency check: N=${N} concurrent invocations of ${FN}`);
 
@@ -80,7 +82,7 @@ async function main(): Promise<void> {
           correlationId,
           userMessage: QUESTION,
           userName: 'LoadTest',
-          userType: process.env.USER_TYPE || 'standard',
+          classification: CLASSIFICATION,
           botArn: BOT_ARN,
           senderArn: BOT_ARN,
         })),

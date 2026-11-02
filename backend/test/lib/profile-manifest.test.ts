@@ -51,43 +51,54 @@ async function seedActiveVersion(
 describe('profile manifest P3', () => {
   it('exports an instance-agnostic manifest — no ARNs, account ids, or region', async () => {
     const { client } = fakeSsmStore();
-    await seedActiveVersion(client, 'standard', 'opus');
-    const manifest = await exportManifest(client, ROOT, 'standard');
+    await seedActiveVersion(client, 'analyst', 'titan');
+    const manifest = await exportManifest(client, ROOT, 'analyst');
     const json = JSON.stringify(manifest);
+    // The account-id sweep runs over the manifest MINUS its two hex digests. `configId` is 12 hex
+    // characters, so roughly one in 140 of them is all decimal digits and reads exactly like an
+    // account id to a `\d{12}` scan - a fixture-dependent failure that says nothing about
+    // portability. The digests are checked for their own shape below instead.
+    const { contentHash: _h, provenance: { exportedConfigId: _c, ...prov }, ...rest } = manifest;
+    const scanned = JSON.stringify({ ...rest, provenance: prov });
     expect(manifest.kind).toBe('assistant-profile');
-    expect(manifest.body.modelKey).toBe('opus'); // logical catalog key, not an ARN
+    expect(manifest.body.modelKey).toBe('titan'); // logical catalog key, not an ARN
     expect(json).not.toMatch(/arn:aws/);
-    expect(json).not.toMatch(/\b\d{12}\b/); // no 12-digit account id
+    expect(scanned).not.toMatch(/\b\d{12}\b/); // no 12-digit account id
+    expect(manifest.provenance.exportedConfigId).toMatch(/^[0-9a-f]{12}$/);
     expect(json).not.toMatch(/us-east-1|us-west-2/); // no region
-    expect(manifest.provenance.sourceProfileName).toBe('standard');
+    expect(manifest.provenance.sourceProfileName).toBe('analyst');
     expect(manifest.contentHash).toMatch(/^[0-9a-f]{64}$/);
   });
 
   it('round-trips: export from A, import into B lands as a DRAFT (never active), then activate serves it', async () => {
     const a = fakeSsmStore();
-    await seedActiveVersion(a.client, 'premium', 'opus');
-    const manifest = await exportManifest(a.client, ROOT, 'premium');
+    await seedActiveVersion(a.client, 'advisor', 'opus');
+    const manifest = await exportManifest(a.client, ROOT, 'advisor');
 
     const b = fakeSsmStore();
     const draft = await importManifest(b.client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR });
     expect(draft.modelKey).toBe('opus');
     // Landed as a DRAFT — nothing is active on B yet.
-    const listing = await listProfile(b.client, ROOT, 'premium');
+    const listing = await listProfile(b.client, ROOT, 'advisor');
     expect(listing.activeVersion).toBeNull();
     expect(listing.hasDraft).toBe(true);
     // Provenance audit chain preserved.
     expect((draft as unknown as Record<string, unknown>).provenance).toBeTruthy();
     // A human activation is still required (P1 lifecycle).
-    const r = await activateDraft(b.client, ROOT, 'premium', CATALOG, ACTOR);
+    const r = await activateDraft(b.client, ROOT, 'advisor', CATALOG, ACTOR);
     expect(r.version).toBe(1);
   });
 
-  it('carries a machine whose wait is spelled the OLD way through export, import and activation', async () => {
-    // THE REASON THE SHAPE CHANGED NOW RATHER THAN LATER. `machines` lives inside a versioned profile
-    // definition and travels in the manifest, so a stored version predating the declared form has to
-    // keep working: it validates on import, activates, and resolves to the same reference the declared
-    // form does (SPEC-TASK-STATE-TRANSITIONS §12.6). If it did not, an existing deployment's own
-    // profile would stop importing the day the platform changed the spelling.
+  it('a manifest cannot carry task graphs onto a version, and the OLD wait spelling still resolves', async () => {
+    // THIS TEST CHANGED SHAPE WITH THE DECISION IT GUARDS. It used to prove that a version's own
+    // `machines` survived export, import and activation - the round trip that kept a deployment's
+    // legacy machine working. Task graphs are global workflows now: a version
+    // neither defines nor carries them, so the round trip it protected no longer exists, and IMPORT is
+    // the other door into per-assistant graphs that had to be closed alongside the edit path.
+    //
+    // What survives is the half that still matters: a machine whose wait is spelled the OLD way must
+    // still resolve to the same reference the declared form does (SPEC-TASK-STATE-TRANSITIONS 12.6),
+    // because a deployment whose CLASSIFICATION pack predates the declared form keeps running.
     const legacyMachines = {
       report_generation: {
         initial: 'collecting_requirements',
@@ -97,26 +108,37 @@ describe('profile manifest P3', () => {
             awaitsUser: true,
             requires: ['the audience'],
           },
-          generating: { transitions: ['completed'], delivers: true },
+          generating: { transitions: ['completed'], produces: 'document' as const },
           completed: { transitions: [], terminal: 'success' },
         },
       },
     };
 
-    const a = fakeSsmStore();
-    await seedActiveVersion(a.client, 'standard', 'opus', { machines: legacyMachines });
-    const manifest = await exportManifest(a.client, ROOT, 'standard');
-    expect(manifest.body.machines).toEqual(legacyMachines);
-
+    // A manifest that arrives carrying graphs lands a draft without them - not a rejection, because
+    // the manifest is otherwise valid and a target that refused it could never accept a body exported
+    // from a deployment that predates this rule.
+    const manifest = {
+      schemaVersion: MANIFEST_SCHEMA_VERSION,
+      kind: 'assistant-profile',
+      profileName: 'analyst',
+      body: {
+        // `sonnet`, not `opus`: the target is `analyst`, which serves `standard`, and a premium-only
+        // model is now refused on a standard target. This case is about machines being dropped, so it
+        // must not also be exercising the model boundary.
+        modelKey: 'sonnet', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'full',
+        machines: legacyMachines,
+      },
+      provenance: { sourceProfileName: 'analyst', sourceVersion: 'active', exportedConfigId: 'x' },
+      contentHash: 'deadbeef',
+    };
     const b = fakeSsmStore();
     const draft = await importManifest(b.client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR });
-    expect(draft.machines).toEqual(legacyMachines);
-    // Activation runs the same validation again, including the rule that refuses `requires` on a step
-    // awaiting nobody - which is exactly the rule a reader left on the declared form would fire here.
-    const activated = await activateDraft(b.client, ROOT, 'standard', CATALOG, ACTOR);
+    expect(draft.machines).toBeUndefined();
+    const activated = await activateDraft(b.client, ROOT, 'analyst', CATALOG, ACTOR);
     expect(activated.version).toBe(1);
 
-    expect(awaitedPartyOf(draft.machines!.report_generation.states.collecting_requirements))
+    // The reader still understands the old spelling, wherever the graph now lives.
+    expect(awaitedPartyOf(legacyMachines.report_generation.states.collecting_requirements as never))
       .toEqual({ party: 'requester' });
   });
 
@@ -125,13 +147,41 @@ describe('profile manifest P3', () => {
     const manifest = {
       schemaVersion: MANIFEST_SCHEMA_VERSION,
       kind: 'assistant-profile',
-      profileName: 'standard',
+      profileName: 'analyst',
       body: { modelKey: 'some-unlisted-model', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'full' },
-      provenance: { sourceProfileName: 'standard', sourceVersion: 'active', exportedConfigId: 'x' },
+      provenance: { sourceProfileName: 'analyst', sourceVersion: 'active', exportedConfigId: 'x' },
       contentHash: 'deadbeef',
     };
     await expect(importManifest(client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR }))
       .rejects.toMatchObject({ errors: expect.arrayContaining([expect.stringMatching(/not in the target's model catalog/)]) });
+  });
+
+  it('rejects an image model the target classification is not allowed (one rule for every model)', async () => {
+    const { client } = fakeSsmStore();
+    const manifest = {
+      schemaVersion: MANIFEST_SCHEMA_VERSION,
+      kind: 'assistant-profile',
+      profileName: 'analyst',
+      body: { modelKey: 'sonnet', models: { default: 'sonnet', image: 'stability_image_core' } },
+      provenance: { sourceProfileName: 'advisor', sourceVersion: 'active', exportedConfigId: 'x' },
+      contentHash: 'x',
+    };
+    await expect(importManifest(client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR }))
+      .rejects.toMatchObject({ errors: expect.arrayContaining([expect.stringMatching(/models\.image .*not selected by the standard classification/)]) });
+  });
+
+  it('lands a draft without the routes the target cannot invoke, so it can be activated', async () => {
+    const { client } = fakeSsmStore();
+    const manifest = {
+      schemaVersion: MANIFEST_SCHEMA_VERSION,
+      kind: 'assistant-profile',
+      profileName: 'analyst',
+      body: { modelKey: 'sonnet', models: { default: 'sonnet', byIntent: { general: { primary: 'haiku' }, strategic_analysis: { primary: 'opus', fallback: 'sonnet' } } } },
+      provenance: { sourceProfileName: 'advisor', sourceVersion: 'active', exportedConfigId: 'x' },
+      contentHash: 'x',
+    };
+    const draft = await importManifest(client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR });
+    expect(draft.models?.byIntent).toEqual({ general: { primary: 'haiku' } });
   });
 
   it('rejects a manifest whose target profile is not provisioned on this instance', async () => {
@@ -158,18 +208,58 @@ describe('profile manifest P3', () => {
 
   it('an operator can REMAP a manifest onto a different provisioned profile', async () => {
     const src = fakeSsmStore();
-    await seedActiveVersion(src.client, 'premium', 'opus');
-    const manifest = await exportManifest(src.client, ROOT, 'premium');
+    // THE SOURCE IS THE BASIC ASSISTANT, NOT THE PREMIUM ONE, and the swap is the finding rather than
+    // a convenience. This read `advisor` (premium) remapped onto `analyst` (standard) and asserted the
+    // draft kept `opus` - a premium-only model landing on a standard target, which is the defect the
+    // case below now locks out. Re-pointing it at `sonnet` was not enough either: export backfills the
+    // COMPLETE models bundle (`ensureModelsBundle`), so a premium profile's per-intent routes name
+    // premium models whatever its base key is, and the whole bundle is judged. A premium definition
+    // therefore cannot land on a standard target without hand-editing the manifest, which §5 names as
+    // the intended operator workflow. What remains a pure remap is a source whose every selection the
+    // target also declares.
+    await seedActiveVersion(src.client, 'concierge', 'haiku');
+    const manifest = await exportManifest(src.client, ROOT, 'concierge');
     const { client } = fakeSsmStore();
-    const draft = await importManifest(client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR, targetProfileName: 'standard' });
-    expect(draft.profileName).toBe('standard');
-    expect((await getDraft(client, ROOT, 'standard'))!.modelKey).toBe('opus');
+    const draft = await importManifest(client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR, targetProfileName: 'analyst' });
+    expect(draft.profileName).toBe('analyst');
+    expect((await getDraft(client, ROOT, 'analyst'))!.modelKey).toBe('haiku');
+  });
+
+  /**
+   * THE REMAP CANNOT CARRY A MODEL THE TARGET CLASSIFICATION IS DENIED.
+   *
+   * The deployment catalog is shared by every classification, so `mk in catalog` - all this checked
+   * once - is true for a premium-only model on a standard target. The deployed importer accepted
+   * `advisor`'s opus definition onto `analyst` and answered `{"imported":"analyst","landedAs":"draft"}`;
+   * activating that draft degrades every turn on an AccessDenied, because standard's processor role is
+   * denied opus by IAM (`a-classification-is-denied-a-model-it-does-not-declare.spec.ts` proves the
+   * denial against AWS). §7 says reject or remap, never widen, so the refusal belongs at import.
+   *
+   * The ACCEPTING case above is half of this pair: without it, an importer that refused every remap
+   * would satisfy this test and break the feature.
+   */
+  it('rejects a remap carrying a model the TARGET classification does not declare', async () => {
+    const src = fakeSsmStore();
+    await seedActiveVersion(src.client, 'advisor', 'opus');
+    const manifest = await exportManifest(src.client, ROOT, 'advisor');
+    const { client } = fakeSsmStore();
+    await expect(importManifest(client, ROOT, manifest, {
+      catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS,
+      contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR, targetProfileName: 'analyst',
+    })).rejects.toMatchObject({
+      errors: expect.arrayContaining([
+        expect.stringMatching(/'opus' is not available to the target classification 'standard'/),
+      ]),
+    });
+    // AND IT LANDED NOTHING. A refusal that still wrote the draft would leave the unreachable model
+    // one activation away, which is the state the refusal exists to prevent.
+    expect(await getDraft(client, ROOT, 'analyst')).toBeNull();
   });
 
   it('export carries a COMPLETE editable models bundle (not just a hash) so the manifest can be hand-edited', async () => {
     const { client } = fakeSsmStore();
-    await seedActiveVersion(client, 'standard', 'sonnet');
-    const manifest = await exportManifest(client, ROOT, 'standard');
+    await seedActiveVersion(client, 'analyst', 'sonnet');
+    const manifest = await exportManifest(client, ROOT, 'analyst');
     expect(manifest.body.models?.default).toBe('sonnet');
     expect(manifest.body.models?.classifier).toBeDefined(); // explicit (the 'default' sentinel), not absent
     expect(Object.keys(manifest.body.models?.byIntent ?? {}).length).toBeGreaterThan(0);
@@ -177,8 +267,8 @@ describe('profile manifest P3', () => {
 
   it('ACCEPTS a hand-edited (contentHash-mismatched) UNSIGNED manifest — export→edit→import is the workflow', async () => {
     const src = fakeSsmStore();
-    await seedActiveVersion(src.client, 'premium', 'opus');
-    const manifest = await exportManifest(src.client, ROOT, 'premium');
+    await seedActiveVersion(src.client, 'advisor', 'opus');
+    const manifest = await exportManifest(src.client, ROOT, 'advisor');
     // Operator hand-edits a model in the exported body WITHOUT recomputing contentHash.
     manifest.body.models!.default = 'sonnet';
     manifest.body.modelKey = 'sonnet';
@@ -202,8 +292,8 @@ describe('P4 — optional manifest signing', () => {
   // the manifest carried an opaque id the target had never heard of.
   it('export rewrites a stored guardrail id into its portable selection KEY', async () => {
     const { client } = fakeSsmStore();
-    await seedActiveVersion(client, 'premium', 'opus', { guardrailId: 'gr-target-strict' });
-    const manifest = await exportManifest(client, ROOT, 'premium', undefined, GUARDRAILS);
+    await seedActiveVersion(client, 'advisor', 'opus', { guardrailId: 'gr-target-strict' });
+    const manifest = await exportManifest(client, ROOT, 'advisor', undefined, GUARDRAILS);
     expect(manifest.body.guardrailId).toBe('strict');
     // The instance-agnostic promise this field used to break: an opaque resolved id is not an ARN, not
     // an account id, and not a region, so the existing check could never have caught it.
@@ -212,10 +302,10 @@ describe('P4 — optional manifest signing', () => {
 
   it('export→import across instances round-trips the SELECTION onto the target\'s own guardrail', async () => {
     const a = fakeSsmStore();
-    await seedActiveVersion(a.client, 'premium', 'opus', { guardrailId: 'gr-source-abc123' });
+    await seedActiveVersion(a.client, 'advisor', 'opus', { guardrailId: 'gr-source-abc123' });
     // Instance A resolves 'strict' to its own id; instance B resolves it to a DIFFERENT one.
     const sourceCatalog = async () => [{ key: 'strict', guardrailId: 'gr-source-abc123' }];
-    const manifest = await exportManifest(a.client, ROOT, 'premium', undefined, sourceCatalog);
+    const manifest = await exportManifest(a.client, ROOT, 'advisor', undefined, sourceCatalog);
     const b = fakeSsmStore();
     const draft = await importManifest(b.client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR });
     expect(draft.guardrailId).toBe('gr-target-strict'); // B's id, not A's — no manual edit needed
@@ -223,16 +313,16 @@ describe('P4 — optional manifest signing', () => {
 
   it('export without a catalog emits the selection verbatim (no throw, import stays the gate)', async () => {
     const { client } = fakeSsmStore();
-    await seedActiveVersion(client, 'premium', 'opus', { guardrailId: 'gr-target-strict' });
-    const manifest = await exportManifest(client, ROOT, 'premium');
+    await seedActiveVersion(client, 'advisor', 'opus', { guardrailId: 'gr-target-strict' });
+    const manifest = await exportManifest(client, ROOT, 'advisor');
     expect(manifest.body.guardrailId).toBe('gr-target-strict');
   });
 
   it('export does not fail when the guardrail catalog is unreadable', async () => {
     const { client } = fakeSsmStore();
-    await seedActiveVersion(client, 'premium', 'opus', { guardrailId: 'gr-target-strict' });
+    await seedActiveVersion(client, 'advisor', 'opus', { guardrailId: 'gr-target-strict' });
     const unreadable = async () => { throw new Error('ParameterNotFound'); };
-    await expect(exportManifest(client, ROOT, 'premium', undefined, unreadable)).resolves.toBeTruthy();
+    await expect(exportManifest(client, ROOT, 'advisor', undefined, unreadable)).resolves.toBeTruthy();
   });
 
   // GUARDRAIL SELECTION (§7 reject-or-remap). `guardrailId` is a deployment-RESOLVED id, so it is the
@@ -242,8 +332,8 @@ describe('P4 — optional manifest signing', () => {
   // profile says it selected.
   it('REMAPS a guardrail selection key to this instance\'s resolved id (what makes it portable)', async () => {
     const { client } = fakeSsmStore();
-    await seedActiveVersion(client, 'premium', 'opus');
-    const manifest = await exportManifest(client, ROOT, 'premium');
+    await seedActiveVersion(client, 'advisor', 'opus');
+    const manifest = await exportManifest(client, ROOT, 'advisor');
     manifest.body.guardrailId = 'strict'; // the stable key, not an id
     const b = fakeSsmStore();
     const draft = await importManifest(b.client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR });
@@ -252,8 +342,8 @@ describe('P4 — optional manifest signing', () => {
 
   it('ACCEPTS a guardrail id already provisioned on this target, unchanged', async () => {
     const { client } = fakeSsmStore();
-    await seedActiveVersion(client, 'premium', 'opus');
-    const manifest = await exportManifest(client, ROOT, 'premium');
+    await seedActiveVersion(client, 'advisor', 'opus');
+    const manifest = await exportManifest(client, ROOT, 'advisor');
     manifest.body.guardrailId = 'gr-target-default';
     const b = fakeSsmStore();
     const draft = await importManifest(b.client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR });
@@ -262,8 +352,8 @@ describe('P4 — optional manifest signing', () => {
 
   it('REJECTS a guardrail id from ANOTHER deployment rather than landing an unappliable selection', async () => {
     const { client } = fakeSsmStore();
-    await seedActiveVersion(client, 'premium', 'opus');
-    const manifest = await exportManifest(client, ROOT, 'premium');
+    await seedActiveVersion(client, 'advisor', 'opus');
+    const manifest = await exportManifest(client, ROOT, 'advisor');
     manifest.body.guardrailId = 'gr-source-instance-abc123'; // resolved on the SOURCE, meaningless here
     const b = fakeSsmStore();
     await expect(importManifest(b.client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR }))
@@ -278,8 +368,8 @@ describe('P4 — optional manifest signing', () => {
 
   it('FAILS CLOSED when the target guardrail catalog cannot be read (never lands an unverifiable one)', async () => {
     const { client } = fakeSsmStore();
-    await seedActiveVersion(client, 'premium', 'opus');
-    const manifest = await exportManifest(client, ROOT, 'premium');
+    await seedActiveVersion(client, 'advisor', 'opus');
+    const manifest = await exportManifest(client, ROOT, 'advisor');
     manifest.body.guardrailId = 'strict';
     const b = fakeSsmStore();
     const unreadable = async () => { throw new Error('ParameterNotFound'); };
@@ -289,8 +379,8 @@ describe('P4 — optional manifest signing', () => {
 
   it('a manifest with NO guardrail selection imports untouched (inherits the deployment default)', async () => {
     const { client } = fakeSsmStore();
-    await seedActiveVersion(client, 'premium', 'opus');
-    const manifest = await exportManifest(client, ROOT, 'premium');
+    await seedActiveVersion(client, 'advisor', 'opus');
+    const manifest = await exportManifest(client, ROOT, 'advisor');
     delete (manifest.body as { guardrailId?: string }).guardrailId;
     const b = fakeSsmStore();
     // The catalog is never consulted, so even an unreadable one must not block this path.
@@ -302,8 +392,8 @@ describe('P4 — optional manifest signing', () => {
   it('exports a SIGNED manifest when a secret is configured; the secret never travels', async () => {
     process.env.MANIFEST_SIGNING_SECRET = SECRET;
     const { client } = fakeSsmStore();
-    await seedActiveVersion(client, 'standard', 'opus');
-    const manifest = await exportManifest(client, ROOT, 'standard');
+    await seedActiveVersion(client, 'analyst', 'titan');
+    const manifest = await exportManifest(client, ROOT, 'analyst');
     expect(manifest.signature).toMatch(/^[0-9a-f]{64}$/);
     expect(JSON.stringify(manifest)).not.toContain(SECRET);
   });
@@ -311,8 +401,8 @@ describe('P4 — optional manifest signing', () => {
   it('imports a validly-signed manifest and REJECTS a tampered one', async () => {
     process.env.MANIFEST_SIGNING_SECRET = SECRET;
     const src = fakeSsmStore();
-    await seedActiveVersion(src.client, 'premium', 'opus');
-    const manifest = await exportManifest(src.client, ROOT, 'premium');
+    await seedActiveVersion(src.client, 'advisor', 'opus');
+    const manifest = await exportManifest(src.client, ROOT, 'advisor');
 
     const b = fakeSsmStore();
     await expect(importManifest(b.client, ROOT, manifest, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR })).resolves.toBeTruthy();
@@ -327,9 +417,9 @@ describe('P4 — optional manifest signing', () => {
     process.env.MANIFEST_REQUIRE_SIGNATURE = 'true';
     const { client } = fakeSsmStore();
     const unsigned = {
-      schemaVersion: MANIFEST_SCHEMA_VERSION, kind: 'assistant-profile', profileName: 'standard',
+      schemaVersion: MANIFEST_SCHEMA_VERSION, kind: 'assistant-profile', profileName: 'analyst',
       body: { modelKey: 'sonnet', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'full' },
-      provenance: { sourceProfileName: 'standard', sourceVersion: 'active', exportedConfigId: 'x' }, contentHash: 'x',
+      provenance: { sourceProfileName: 'analyst', sourceVersion: 'active', exportedConfigId: 'x' }, contentHash: 'x',
     };
     await expect(importManifest(client, ROOT, unsigned, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR }))
       .rejects.toMatchObject({ errors: expect.arrayContaining([expect.stringMatching(/unsigned/)]) });
@@ -338,10 +428,10 @@ describe('P4 — optional manifest signing', () => {
   it('rejects a signed manifest when this instance has no secret to verify with', async () => {
     // exporter signed with a secret; importer has none configured → cannot verify → reject (never trust).
     const signed = {
-      schemaVersion: MANIFEST_SCHEMA_VERSION, kind: 'assistant-profile', profileName: 'standard',
+      schemaVersion: MANIFEST_SCHEMA_VERSION, kind: 'assistant-profile', profileName: 'analyst',
       body: { modelKey: 'sonnet', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'full' },
-      provenance: { sourceProfileName: 'standard', sourceVersion: 'active', exportedConfigId: 'x' }, contentHash: 'x',
-      signature: signManifest({ profileName: 'standard' }, SECRET),
+      provenance: { sourceProfileName: 'analyst', sourceVersion: 'active', exportedConfigId: 'x' }, contentHash: 'x',
+      signature: signManifest({ profileName: 'analyst' }, SECRET),
     };
     const { client } = fakeSsmStore();
     await expect(importManifest(client, ROOT, signed, { catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR }))
@@ -355,9 +445,9 @@ describe('P4 — optional manifest signing', () => {
     const ctxManifest = (over = {}) => ({
       schemaVersion: MANIFEST_SCHEMA_VERSION,
       kind: 'assistant-profile',
-      profileName: 'standard',
+      profileName: 'analyst',
       body: { modelKey: 'sonnet', classifierMode: 'llm', timeoutSeconds: 30, taskSupport: 'full', contextSources: ['user-profile'] },
-      provenance: { sourceProfileName: 'standard', sourceVersion: 'active', exportedConfigId: 'x' },
+      provenance: { sourceProfileName: 'analyst', sourceVersion: 'active', exportedConfigId: 'x' },
       contentHash: 'x',
       ...over,
     });
@@ -422,4 +512,51 @@ describe('P4 — optional manifest signing', () => {
     });
   });
 
+});
+
+describe('an import never moves an assistant (classification, role, reach and owner are not part of a profile)', () => {
+  const opts = (targetProfileName?: string) => ({
+    catalog: CATALOG, knownProfile: known, guardrailCatalog: GUARDRAILS, contextSourceCatalog: CONTEXT_SOURCES, actor: ACTOR,
+    ...(targetProfileName ? { targetProfileName } : {}),
+  });
+
+  it.each([
+    ['classification', { classification: 'basic' }],
+    ['role', { role: 'ops' }],
+    ['grants', { grants: ['premium'] }],
+    ['reach', { reach: ['context/finance/'] }],
+    ['ownerTeam', { ownerTeam: 'finance' }],
+  ])('refuses a manifest whose body carries %s, by name, and lands nothing', async (key, extra) => {
+    const { client } = fakeSsmStore();
+    await seedActiveVersion(client, 'analyst', 'titan');
+    const manifest = await exportManifest(client, ROOT, 'analyst');
+    const tampered = { ...manifest, body: { ...manifest.body, ...extra } };
+    const before = await getDraft(client, ROOT, 'analyst');
+    await expect(importManifest(client, ROOT, tampered, opts()))
+      .rejects.toMatchObject({ errors: expect.arrayContaining([expect.stringContaining(`${key} is not part of a profile`)]) });
+    expect(await getDraft(client, ROOT, 'analyst')).toEqual(before);
+  });
+
+  it('refuses the same keys beside the body, where a hand-edited manifest might put them', async () => {
+    const { client } = fakeSsmStore();
+    await seedActiveVersion(client, 'analyst', 'titan');
+    const manifest = await exportManifest(client, ROOT, 'analyst');
+    await expect(importManifest(client, ROOT, { ...manifest, classification: 'premium', ownerTeam: 'finance' }, opts()))
+      .rejects.toMatchObject({ errors: expect.arrayContaining([
+        expect.stringContaining('classification is not part of a profile'),
+        expect.stringContaining('ownerTeam is not part of a profile'),
+      ]) });
+  });
+
+  it('lands a clean manifest on its target, whose classification it does not change', async () => {
+    const { client } = fakeSsmStore();
+    await seedActiveVersion(client, 'analyst', 'titan');
+    const { classificationServedBy } = await import('../../lambda/src/lib/profile-lifecycle');
+    const before = classificationServedBy('analyst');
+    const manifest = await exportManifest(client, ROOT, 'analyst');
+    const draft = await importManifest(client, ROOT, manifest, opts('analyst'));
+    expect(draft.profileName).toBe('analyst');
+    for (const k of ['classification', 'role', 'grants', 'reach', 'ownerTeam']) expect(draft).not.toHaveProperty(k);
+    expect(classificationServedBy('analyst')).toBe(before);
+  });
 });

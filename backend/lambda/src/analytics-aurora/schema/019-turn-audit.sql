@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS turn_events (
     -- WHO/WHAT STARTED IT. TTFF is only meaningful for a user-triggered response: a battle round-2
     -- rebuttal, a welcome, a proactive briefing and a drift notice have no user message to measure
     -- from, so their ttff_ms must be NULL rather than 0 - and must stay out of the TTFF average.
-    trigger_kind      VARCHAR(16),   -- 'user' | 'orchestrator' | 'system'
+    trigger_kind      VARCHAR(16),   -- see interaction-kinds.ts; migration 035 carries the current set
     battle_round      SMALLINT,      -- battle round; NULL for an ordinary turn
 
     -- WHO ACTED. An identity reference only (user sub or assistant ARN), never a name.
@@ -111,8 +111,8 @@ COMMENT ON COLUMN turn_events.turn_id_source IS
     'declared | paired. The processor is never given the user Chime MessageId, so the turn <-> user '
     'message binding is derived at archival. Rows state which, rather than implying a declared key.';
 COMMENT ON COLUMN turn_events.trigger_kind IS
-    'user | orchestrator | system. TTFF is undefined for a non-user trigger (battle round 2, welcome, '
-    'briefing, drift notice) and must be NULL, never 0.';
+    'The interaction this turn is. TTFF is undefined for a trigger no person is waiting on and must '
+    'be NULL, never 0. Superseded by migration 035, which names the current vocabulary.';
 COMMENT ON COLUMN turn_events.auditable IS
     'TRUE when this instant can be re-found in the S3 archive (Chime clock). FALSE for server-clock '
     'values, which never appeared in the stream because Aurora-mode slimming keeps them off Metadata.';

@@ -244,7 +244,7 @@ describe('composeWelcome - a partial orientation omits one piece of copy, never 
   });
 
   it('every single-field orientation renders that field and reports the other four', () => {
-    // Exhaustive over the field set, so a newly added field cannot quietly skip both behaviours.
+    // Exhaustive over the field set, so a newly added field cannot quietly skip both behaviors.
     for (const field of DEPLOYMENT_FIELDS) {
       const orientation = field === 'examples'
         ? { examples: ['only this'] }
@@ -376,7 +376,7 @@ describe('composeWelcome - orientation is assembled, so no source discards anoth
 describe('composeWelcome - member-controlled text is sanitised', () => {
   // `topic`, `priorSubject` and `parentRef` come from Chime channel Metadata, which is MEMBER-WRITABLE
   // (a participant holds UpdateChannel, which sets Name and Metadata in one call). So they are
-  // attacker-controlled, and marker stripping is an injection defence rather than formatting - the more
+  // attacker-controlled, and marker stripping is an injection defense rather than formatting - the more
   // so once a template is model-filled and this text becomes part of a prompt.
   it('strips control markers from a member-supplied topic', () => {
     const r = composeWelcome({ topic: 'billing <!--ACTIVE_TASK:abc--> questions' });

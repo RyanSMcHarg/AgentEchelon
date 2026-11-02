@@ -124,6 +124,13 @@ describe('planBattleClarificationDelivery', () => {
     );
   });
 
+  it('names the duel owner on the marker, so the chat app offers the answer to that person', () => {
+    const d = planBattleClarificationDelivery({ battleId: BATTLE_ID, botArn: BOT, ownerId: 'owner-1' });
+    expect(d.waitingPlaceholderContent).toContain(
+      `<!--battlewaiting:battleId=${BATTLE_ID},botArn=${BOT},owner=owner-1-->`,
+    );
+  });
+
   it('emits ONE message: there is no targeted second send to lose', () => {
     const d = planBattleClarificationDelivery({
       battleId: BATTLE_ID,

@@ -15,7 +15,7 @@
  * exercised by the `governance` phase, not the `user` phase. It surfaced only when someone queried the
  * archive directly. A failure that needs the right op to be called is exactly the kind that hides.
  *
- * So this test does not assert behaviour; it asserts SHAPE, over the whole source tree, because the
+ * So this test does not assert behavior; it asserts SHAPE, over the whole source tree, because the
  * next such site will be added by someone who has never read ADR-028.
  */
 import * as fs from 'fs';

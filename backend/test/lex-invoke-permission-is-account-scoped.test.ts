@@ -20,11 +20,9 @@
 import * as cdk from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 import { BattleStack } from '../lib/stacks/battle-stack';
-import { BasicClassificationStack } from '../lib/stacks/basic-classification-stack';
-import { StandardClassificationStack } from '../lib/stacks/standard-classification-stack';
-import { PremiumClassificationStack } from '../lib/stacks/premium-classification-stack';
-import { CognitoAuthStack } from '../lib/stacks/cognito-auth-stack';
-import { DEFAULT_PROFILE_MODEL_SELECTION } from '../lib/config/model-strategy';
+import { IdentityStack } from '../lib/stacks/identity-stack';
+import { assistantsOf } from './helpers/assistants';
+import { adminAnalyticsTemplate, adminServicesTemplate, assistantAdministrationTemplate } from './helpers/synth';
 
 const env = { account: '123456789012', region: 'us-east-1' };
 const appInstanceArn = 'arn:aws:chime:us-east-1:123456789012:app-instance/test';
@@ -34,7 +32,6 @@ const classificationProps = {
   appInstanceArn,
   attachmentsBucketName: 'agent-echelon-attachments-test',
   attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
-  profileModelSelection: DEFAULT_PROFILE_MODEL_SELECTION,
 };
 
 /** Every stack that creates an `AWS::Lambda::Permission`, each synthesized in its own app. */
@@ -47,12 +44,19 @@ function stacksWithLambdaPermissions(): Array<{ name: string; template: Template
   };
 
   add('AgentEchelonBattle', (app) => new BattleStack(app, 'AgentEchelonBattle', {
-    env, appInstanceArn, userPoolId: 'us-east-1_testpool', appUrl: 'https://app.example.com',
+    env, appInstanceArn, selfPoolId: 'us-east-1_testpool', appUrl: 'https://app.example.com',
   }));
-  add('Classification-Basic', (app) => new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', classificationProps));
-  add('Classification-Standard', (app) => new StandardClassificationStack(app, 'AgentEchelonClassification-Standard', classificationProps));
-  add('Classification-Premium', (app) => new PremiumClassificationStack(app, 'AgentEchelonClassification-Premium', classificationProps));
-  add('CognitoAuth', (app) => new CognitoAuthStack(app, 'AgentEchelonCognitoAuth', { env, appInstanceArn }));
+  add('Assistants-basic', (app) => assistantsOf('basic')(app, 'AgentEchelonAssistants-basic', classificationProps));
+  add('Assistants-standard', (app) => assistantsOf('standard')(app, 'AgentEchelonAssistants-standard', classificationProps));
+  add('Assistants-premium', (app) => assistantsOf('premium')(app, 'AgentEchelonAssistants-premium', classificationProps));
+  add('Identity', (app) => new IdentityStack(app, 'AgentEchelonIdentity', { env, appInstanceArn }));
+  // THE SWEEP IS ONLY AS WIDE AS THIS LIST, and that is how the admin plane's own Lex handler shipped
+  // unconditioned while this file stayed green: it creates an `AWS::Lambda::Permission` and was not
+  // enumerated here. A stack that creates one belongs in this list on the commit that creates it.
+  // The admin backend: the admin assistant's Lex handler, the alert rule's target and every admin API's invoke.
+  out.push({ name: 'AdminServices', template: adminServicesTemplate() });
+  out.push({ name: 'AdminServices/AssistantAdministration', template: assistantAdministrationTemplate() });
+  out.push({ name: 'AdminServices/Analytics', template: adminAnalyticsTemplate() });
 
   return out;
 }
@@ -91,11 +95,11 @@ describe('service-principal Lambda permissions are source-scoped', () => {
     }
   });
 
-  it('both Lex-invoked handlers specifically carry the account condition', () => {
-    // Named rather than left to the sweep above: these two are the ones that reach a turn, and the
-    // handler one gates message authorship. A future stack losing its condition should fail the sweep;
-    // these two failing should be unmistakable.
-    for (const name of ['AgentEchelonBattle', 'Classification-Premium']) {
+  it('the Lex-invoked router specifically carries the account condition', () => {
+    // Named rather than left to the sweep above: the router is the handler every assistant's Amazon Lex
+    // bot reaches a turn through, a duel's alt included, and it gates message authorship. A future stack
+    // losing its condition should fail the sweep; this failing should be unmistakable.
+    for (const name of ['Assistants-premium']) {
       const template = stacks.find((s) => s.name === name)!.template;
       const lex = Object.values(template.findResources('AWS::Lambda::Permission'))
         .map((r) => (r as { Properties?: Record<string, unknown> }).Properties ?? {})

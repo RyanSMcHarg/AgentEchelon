@@ -40,6 +40,20 @@ export interface FrontendDistributionProps {
    * 403/404 SPA fallback so deep links resolve on the admin origin too.
    */
   rootDocument?: string;
+  /**
+   * For a document other origins frame (the widget, `lib/stacks/widget-stack.ts`): its
+   * Content-Security-Policy, `frame-ancestors` included. Set, the distribution sends this policy and no
+   * `X-Frame-Options` (the policy's `frame-ancestors` decides who may frame it), and denies every powerful
+   * feature. Unset, the document may not be framed at all.
+   */
+  framedDocumentPolicy?: string;
+  /**
+   * Documents on this distribution that read a credential from their URL fragment and are never framed
+   * (the widget's invitation landing page, M-5): each path is served with its own Content-Security-Policy,
+   * `X-Frame-Options: DENY` and `Referrer-Policy: no-referrer`, so no page can frame its button and no
+   * request it makes names the page it came from.
+   */
+  tokenDocuments?: Array<{ path: string; contentSecurityPolicy: string }>;
 }
 
 /**
@@ -98,12 +112,11 @@ export class FrontendDistribution extends Construct {
           override: true,
         },
         contentTypeOptions: { override: true }, // X-Content-Type-Options: nosniff
-        frameOptions: {
-          // Standalone app must not be framed (clickjacking). The app is
-          // a document and should deny framing outright.
-          frameOption: cloudfront.HeadersFrameOption.DENY,
-          override: true,
-        },
+        // Standalone app must not be framed (clickjacking): it denies framing outright. A framed
+        // document says who may frame it in its own policy instead.
+        ...(props.framedDocumentPolicy
+          ? { contentSecurityPolicy: { contentSecurityPolicy: props.framedDocumentPolicy, override: true } }
+          : { frameOptions: { frameOption: cloudfront.HeadersFrameOption.DENY, override: true } }),
         referrerPolicy: {
           referrerPolicy: cloudfront.HeadersReferrerPolicy.STRICT_ORIGIN_WHEN_CROSS_ORIGIN,
           override: true,
@@ -119,8 +132,9 @@ export class FrontendDistribution extends Construct {
             // connect-src origins, so it is left as a deployer hardening step
             // rather than a default that could brick the SPA on first load.
             header: 'Permissions-Policy',
-            value:
-              'accelerometer=(), camera=(self), display-capture=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(self), payment=(), usb=()',
+            value: props.framedDocumentPolicy
+              ? 'accelerometer=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()'
+              : 'accelerometer=(), camera=(self), display-capture=(self), geolocation=(), gyroscope=(), magnetometer=(), microphone=(self), payment=(), usb=()',
             override: true,
           },
         ],
@@ -217,12 +231,43 @@ export class FrontendDistribution extends Construct {
       webAclArn = webAcl.attrArn;
     }
 
+    // A DOCUMENT THAT READS A TOKEN: its own headers, on its own path, never framed and never a referrer.
+    const s3Origin = origins.S3BucketOrigin.withOriginAccessControl(this.bucket);
+    const additionalBehaviors: Record<string, cloudfront.BehaviorOptions> = {};
+    (props.tokenDocuments ?? []).forEach((doc, i) => {
+      const policy = new cloudfront.ResponseHeadersPolicy(this, `TokenDocumentHeaders${i}`, {
+        responseHeadersPolicyName: `${cdk.Stack.of(this).stackName}-TokenDocument${i}`,
+        securityHeadersBehavior: {
+          strictTransportSecurity: { accessControlMaxAge: cdk.Duration.days(365), includeSubdomains: true, preload: true, override: true },
+          contentTypeOptions: { override: true },
+          contentSecurityPolicy: { contentSecurityPolicy: doc.contentSecurityPolicy, override: true },
+          frameOptions: { frameOption: cloudfront.HeadersFrameOption.DENY, override: true },
+          referrerPolicy: { referrerPolicy: cloudfront.HeadersReferrerPolicy.NO_REFERRER, override: true },
+        },
+        customHeadersBehavior: {
+          customHeaders: [
+            { header: 'Permissions-Policy', value: 'accelerometer=(), camera=(), display-capture=(), geolocation=(), gyroscope=(), magnetometer=(), microphone=(), payment=(), usb=()', override: true },
+            { header: 'Cache-Control', value: 'no-store', override: true },
+          ],
+        },
+      });
+      additionalBehaviors[doc.path.replace(/^\/+/, '')] = {
+        origin: s3Origin,
+        compress: true,
+        allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
+        viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,
+        cachePolicy: cloudfront.CachePolicy.CACHING_DISABLED,
+        responseHeadersPolicy: policy,
+      };
+    });
+
     this.distribution = new cloudfront.Distribution(this, 'Distribution', {
       comment: `${cdk.Stack.of(this).stackName} frontend`,
+      ...(Object.keys(additionalBehaviors).length ? { additionalBehaviors } : {}),
       defaultBehavior: {
         // OAC: CloudFront signs origin requests with SigV4; the bucket policy
         // grants only this distribution. CDK wires the bucket policy for us.
-        origin: origins.S3BucketOrigin.withOriginAccessControl(this.bucket),
+        origin: s3Origin,
         compress: true,
         allowedMethods: cloudfront.AllowedMethods.ALLOW_GET_HEAD_OPTIONS,
         viewerProtocolPolicy: cloudfront.ViewerProtocolPolicy.REDIRECT_TO_HTTPS,

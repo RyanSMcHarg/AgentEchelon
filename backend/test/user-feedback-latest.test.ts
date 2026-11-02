@@ -15,15 +15,22 @@ jest.mock('@aws-sdk/lib-dynamodb', () => ({
 process.env.FEEDBACK_TABLE = 'test-feedback';
 import { handler } from '../lambda/src/user-feedback';
 
+// The summary is an AWS_IAM admin route answered only for an admin console session.
 const ev = (): any => ({
   httpMethod: 'GET',
   queryStringParameters: { days: '30' },
   headers: {},
-  requestContext: { authorizer: { claims: { sub: 'admin1', 'cognito:groups': 'admins' } } },
+  requestContext: {
+    identity: { userArn: 'arn:aws:sts::123456789012:assumed-role/agent-echelon-admin-console/console-11111111-2222-3333-4444-555555555555' },
+  },
 });
 
 describe('user-feedback rollup — latest vote wins', () => {
-  beforeEach(() => jest.clearAllMocks());
+  beforeEach(() => {
+    jest.clearAllMocks();
+    process.env.ADMIN_IAM_ENFORCEMENT = 'true';
+  });
+  afterAll(() => { delete process.env.ADMIN_IAM_ENFORCEMENT; });
 
   it('counts the latest vote per (user,message); clear un-counts; superseded ignored', async () => {
     const t = (min: number) => new Date(Date.now() - min * 60_000).toISOString();
@@ -49,5 +56,30 @@ describe('user-feedback rollup — latest vote wins', () => {
     expect(haiku).toMatchObject({ thumbs_up: 1, thumbs_down: 0, feedback_count: 1 }); // only m2's latest (up); m1 cleared
     const sonnet = data.find((r: any) => r.model_name === 'sonnet');
     expect(sonnet).toMatchObject({ thumbs_up: 0, thumbs_down: 1, feedback_count: 1 });
+  });
+
+  it('reads every page of the table, so a large table is not undercounted', async () => {
+    const t = (min: number) => new Date(Date.now() - min * 60_000).toISOString();
+    mockSend
+      .mockResolvedValueOnce({
+        Items: [{ userSub: 'u1', messageId: 'm1', feedback: 'up', modelId: 'haiku', intent: 'general', createdAt: t(5) }],
+        LastEvaluatedKey: { pk: 'page-1' },
+      })
+      .mockResolvedValueOnce({
+        Items: [{ userSub: 'u2', messageId: 'm2', feedback: 'down', modelId: 'haiku', intent: 'general', createdAt: t(4) }],
+      });
+
+    const res = await handler(ev());
+    expect(res.statusCode).toBe(200);
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    expect(mockSend.mock.calls[1][0].__scan.ExclusiveStartKey).toEqual({ pk: 'page-1' });
+    const haiku = JSON.parse(res.body).data.find((r: any) => r.model_name === 'haiku');
+    expect(haiku).toMatchObject({ thumbs_up: 1, thumbs_down: 1, feedback_count: 2 });
+  });
+
+  it.each(['abc', '0', '181', '2.5', ''])('refuses days=%p rather than counting a window nobody asked for', async (days) => {
+    const res = await handler({ ...ev(), queryStringParameters: { days } });
+    expect(res.statusCode).toBe(400);
+    expect(mockSend).not.toHaveBeenCalled();
   });
 });

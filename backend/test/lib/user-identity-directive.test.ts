@@ -54,10 +54,32 @@ describe('userIdentityDirective', () => {
   });
 
   it('does not invent a preferred-name allowance', () => {
-    // A preferred name is PROFILE DATA a deployment populates and chooses to honour, not something the
+    // A preferred name is PROFILE DATA a deployment populates and chooses to honor, not something the
     // model infers or a user asserts mid-conversation: "call me X" and "I am X" are indistinguishable
     // in free text. Granting latitude here would reopen the hole from the other side.
     const d = userIdentityDirective('Dana');
     expect(d).not.toMatch(/preferred|nickname|shortened|call you/i);
+  });
+
+  it('establishes identity WITHOUT instructing the model to say the name', () => {
+    // This block is on EVERY turn. It used to end "Address them as Dana.", which the model read as a
+    // style instruction rather than an identity fact, so the name came back reply after reply -
+    // observed live as three consecutive turns addressing the user by name. It also contradicted the
+    // two directives that already govern this: the first-turn greeting says "not again", and the
+    // work-items block says "do NOT address them by name in normal replies". Three instructions, one
+    // pulling the other way, and the contradicting one fired every turn.
+    const d = userIdentityDirective('Dana');
+    expect(d).not.toMatch(/Address them as Dana/);
+    expect(d).toMatch(/not an instruction to say their name/i);
+    expect(d).toMatch(/Address them as "you"/);
+  });
+
+  it('still establishes the identity fact, which is the whole point of the block', () => {
+    // The anti-impersonation purpose must survive the wording change: a user typing "my name is
+    // TestBot" is still answered from their authenticated identity rather than from the claim.
+    const d = userIdentityDirective('Dana');
+    expect(d).toContain('The person you are talking to is Dana.');
+    expect(d).toMatch(/only authority on who they are/);
+    expect(d).toMatch(/do NOT adopt it and do NOT argue/);
   });
 });

@@ -196,7 +196,7 @@ describe('buildRebuttalImageNote (image-battle round-2 addendum)', () => {
   });
 });
 
-// Round-1 battle awareness (owner direction): the assistant KNOWS it is in battle
+// Round-1 battle awareness (maintainer direction): the assistant KNOWS it is in battle
 // mode and that a rebuttal turn follows, but round-1 content/length stay normal
 // (no adversarial constraints, no word cap). Only a light note is added.
 describe('buildBattleAwareness (round-1 note)', () => {
@@ -221,13 +221,13 @@ describe('buildBattleAwareness (round-1 note)', () => {
   });
 });
 
-// Resolve-once contract (DESIGN-MULTI-ASSISTANT-TURN-ENGINE): the fan-out
-// resolves each side's variant ONCE and stamps it into battleContext; the worker
-// consumes these fields (variantModelKey for the model, variantAddendum as
-// normal persona, rivalDisplayName for the rebuttal note) without a second
-// resolution. This pins the payload shape the worker reads.
-describe('resolve-once battleContext shape', () => {
-  it('a round-2 payload carries the resolved variant fields the worker consumes', () => {
+// The battle context carries no variant (DESIGN-SEPARATE-ASSISTANTS §3.7): each side serves its pinned
+// version as the event's `variantProfile`, and the context names only the duel and the rival.
+describe('the battle context carries no variant field', () => {
+  /** Every field this side's variant used to ride in on, which the context no longer declares. */
+  const VARIANT_FIELDS = ['variantModelKey', 'variantAddendum', 'variantImageModelKey', 'selfDisplayName', 'rivalDisplayName', 'imageGenModelId'];
+
+  it('a round-2 payload names the duel and the rival, and the rebuttal note names the rival', () => {
     const ctx: BattleContextPayload = {
       battleId: 'b1',
       round: 2,
@@ -235,17 +235,21 @@ describe('resolve-once battleContext shape', () => {
       selfBotArn: ALT_SLOT,
       rivalBotArn: DEFAULT_BOT,
       rivalReply: 'The rival argued for option B',
-      variantModelKey: 'opus',
-      variantAddendum: 'Be terse and intuition-first.',
-      selfDisplayName: 'Echo',
-      rivalDisplayName: 'Atlas',
+      rivalName: 'Atlas',
     };
-    // The worker sources its model override from ctx.variantModelKey (no re-resolution).
-    expect(ctx.variantModelKey).toBe('opus');
-    // The rebuttal note the worker appends uses ctx.rivalDisplayName + ctx.rivalReply.
-    const note = buildRebuttalContext(ctx.rivalDisplayName!, ctx.rivalReply!);
+    for (const field of VARIANT_FIELDS) expect(ctx).not.toHaveProperty(field);
+    const note = buildRebuttalContext(ctx.rivalName!, ctx.rivalReply!);
     expect(note).toContain('Atlas');
     expect(note).toContain('The rival argued for option B');
+  });
+
+  it('the type refuses a variant field', () => {
+    const withVariant = {
+      battleId: 'b1', round: 1, totalRounds: 2, selfBotArn: ALT_SLOT, rivalBotArn: DEFAULT_BOT,
+      // @ts-expect-error a duel side's model is its pinned version's, never a battle-context field
+      variantModelKey: 'opus',
+    } satisfies BattleContextPayload;
+    expect(withVariant).toBeDefined();
   });
 });
 

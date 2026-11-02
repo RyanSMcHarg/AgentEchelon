@@ -60,7 +60,7 @@ describe('pauseTask — interrupt (break out of the sequence)', () => {
     const sourceUpdate = u.find((c) => c.input.TableName === 'tasks-test');
     const mirrorUpdate = u.find((c) => c.input.TableName === 'user-tasks-test');
     expect(sourceUpdate.input.ExpressionAttributeValues[':status']).toBe('abandoned');
-    expect(mirrorUpdate.input.Key).toEqual({ userSub: USER_SUB, taskId: TASK_ID });
+    expect(mirrorUpdate.input.Key).toEqual({ principalId: USER_SUB, taskId: TASK_ID });
     expect(mirrorUpdate.input.ExpressionAttributeValues[':s']).toBe('abandoned');
   });
 

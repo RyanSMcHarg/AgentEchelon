@@ -95,7 +95,7 @@ describe('advanceTaskStateTo — optimistic concurrency on the persisted transit
   it('an illegal edge is still rejected before any write is attempted', async () => {
     // `resolved` IS a declared state of this machine, just not reachable from `collecting_symptoms`,
     // so this exercises the illegal-edge branch rather than the unknown-state one. The condition
-    // added above must not become the only line of defence: authorization still short-circuits first.
+    // added above must not become the only line of defense: authorization still short-circuits first.
     const { advanceTaskStateTo } = await import('../lambda/src/lib/task-tracking');
     const res = await advanceTaskStateTo({ task: baseTask(), toState: 'resolved' });
 

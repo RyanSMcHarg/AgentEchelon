@@ -36,7 +36,7 @@ const secretsClient = new SecretsManagerClient({ region: DB_REGION });
 // `rejectUnauthorized: true` fails with "unable to get local issuer certificate".
 // (RDS Proxy happened to validate against the default store; the cluster does
 // not.) Load the RDS CA bundle shipped alongside this Lambda — `certs/rds-bundle.pem`,
-// copied into the bundle by the cert commandHook in analytics-stack-aurora.ts —
+// copied into the bundle by the cert commandHook in archive-stack-aurora.ts —
 // so the direct connection verifies properly. Defensive: absent (e.g. unit
 // tests, non-DB contexts) → undefined, i.e. fall back to the default store.
 const RDS_CA_BUNDLE: string | undefined = (() => {
@@ -62,7 +62,7 @@ interface TokenCache {
  * semantics. When the runtime connected as the owner, the live verification's owner-defeat check
  * failed with no explanation the catalog could account for.
  *
- * The fallback is deliberate: with `DB_APP_USER` unset, both resolve to the owner and behaviour is
+ * The fallback is deliberate: with `DB_APP_USER` unset, both resolve to the owner and behavior is
  * exactly what it was before this split. That matters for the deploy ORDER. The boundary bootstrap is
  * what CREATES the runtime role, and it runs as the owner, so the first cold start after this ships
  * must be able to connect before the role it will later use exists.
@@ -180,8 +180,29 @@ async function getPool(user: string = DB_APP_USER): Promise<Pool> {
   }
 
   try {
+    // ── THE TOKEN IS FETCHED PER CONNECTION, NOT PER POOL (diagnosed 2026-09-04) ────────────────
+    //
+    // An IAM auth token is valid for 15 minutes. This resolved one HERE and handed `pg` the string,
+    // and `pg` reuses whatever it was given for every physical connection the pool ever opens - while
+    // the pool itself is cached for the whole warm life of the Lambda. The 10-minute refresh in
+    // `getAuthToken` was therefore unreachable: nothing asked it again.
+    //
+    // `idleTimeoutMillis` is 30s, so a warm container drops its connections within a minute of going
+    // quiet. Any request arriving more than 15 minutes after the pool was built then opened a NEW
+    // connection with the ORIGINAL token and got `PAM authentication failed for user "ae_app"`.
+    //
+    // That is why it looked random: it needs a container warm past the token's life AND idle long
+    // enough to have dropped its connections. Measured six times in seven days, five of them in one
+    // burst - one container failing repeatedly, which is exactly the shape this predicts.
+    //
+    // What it cost is invisible by design. The data plane serves drift, retrieval and summary, so a
+    // failed invoke means the turn silently loses whichever of those it needed and answers anyway:
+    // nobody can attribute the worse answer to anything.
+    //
+    // `pg` accepts a FUNCTION here and calls it for each new connection, which is what finally makes
+    // the cache above do the job it was written for.
     const password = USE_IAM_AUTH
-      ? await getAuthToken(user)
+      ? () => getAuthToken(user)
       : await getPasswordFromSecrets();
 
     const created = new Pool({
@@ -511,14 +532,49 @@ async function applyPendingMigrations(): Promise<void> {
     // means no Lambda can reach a role assumption before the role exists. A per-caller bootstrap would
     // have to be added to all ten call sites and would be missing from the eleventh.
     //
-    // It is NOT recorded in `_migrations`: it is generated from deployment config (the classification
-    // ladder), so unlike a fixed `.sql` file its content legitimately changes between deploys and must
-    // re-apply. Every statement is idempotent for exactly that reason.
+    // It is generated from deployment config (the classification ladder), so unlike a fixed `.sql`
+    // file its content legitimately changes between deploys and must re-apply. Every statement is
+    // idempotent for exactly that reason.
+    //
+    // ── APPLIED WHEN IT CHANGES, NOT ONCE PER CONTAINER ─────────────────────────────────────────
+    //
+    // It used to run all of these on every cold start, and MEASURED on the development deployment
+    // that is ~900 ms. The cost is not paid by a background job: `ensureSchema()` is on the cold path
+    // of every Lambda that touches a bounded table, which includes the data plane that live drift
+    // calls, which sits in front of the placeholder - so it was ~900 ms of somebody's time to first
+    // feedback, spent re-asserting a boundary that had not changed since the last deploy.
+    //
+    // So the generated set is checksummed and recorded under a key that is deliberately NOT a
+    // filename on disk, which is why it cannot collide with a real migration: `applied` above is
+    // built from the same table and only ever compared against `schema/*.sql` names.
+    //
+    // RE-ASSERTED ON A BOUND ANYWAY, because this is a security boundary (ADR-028, tenet P4) and a
+    // checksum only proves what THIS deployment last wrote, not what the database currently has. A
+    // grant revoked out of band would otherwise stand until the next deploy. The bound makes the
+    // repair periodic rather than per-container: the difference is how often it costs 900 ms, not
+    // whether the boundary is re-established.
     const statements = boundaryStatements();
-    for (const sql of statements) {
-      await client.query(sql);
+    const boundaryChecksum = migrationChecksum(statements.join('\n'));
+    const priorBoundary = await client.query(
+      'SELECT checksum, applied_at FROM _migrations WHERE filename = $1',
+      [BOUNDARY_MIGRATION_KEY],
+    );
+    const prior = priorBoundary.rows[0] as { checksum: string | null; applied_at: Date } | undefined;
+    const decision = boundaryNeedsApplying(prior ?? null, boundaryChecksum);
+
+    if (decision.apply) {
+      for (const sql of statements) {
+        await client.query(sql);
+      }
+      await client.query(
+        `INSERT INTO _migrations (filename, checksum) VALUES ($1, $2)
+         ON CONFLICT (filename) DO UPDATE SET applied_at = NOW(), checksum = $2`,
+        [BOUNDARY_MIGRATION_KEY, boundaryChecksum],
+      );
+      console.log(`[classification-boundary] applied (${statements.length} statements, ${decision.why})`);
+    } else {
+      console.log('[classification-boundary] unchanged since the last apply; not re-running');
     }
-    console.log(`[classification-boundary] applied (${statements.length} statements)`);
   }, DB_OWNER_USER);
 }
 
@@ -544,6 +600,44 @@ async function migrationRemainingWork(client: PoolClient, file: string): Promise
 }
 
 /** Small non-crypto checksum for tracking migration file content (parity with schema-init.ts). */
+/**
+ * The `_migrations` key the classification boundary records itself under. NOT a filename on disk,
+ * deliberately: the pending-migration scan compares that table against `schema/*.sql`, so a key that
+ * can never be a file name can never be mistaken for an applied migration.
+ */
+const BOUNDARY_MIGRATION_KEY = '__classification-boundary__';
+
+/**
+ * How long a recorded boundary is trusted before it is re-asserted even though nothing changed.
+ * Twelve hours: long enough that an ordinary cold start never pays the ~900 ms, short enough that an
+ * out-of-band grant change is repaired without waiting for a deploy.
+ */
+const BOUNDARY_REASSERT_MS = 12 * 60 * 60 * 1000;
+
+/**
+ * Whether the generated classification boundary has to be re-applied, given what the database says was
+ * applied last. Pure, and exported so the rule is testable without a cluster: the three reasons are
+ * never having applied it, the generated definition having changed, and the re-assert bound elapsing.
+ *
+ * `null` prior means no record at all, which is a first run and always applies.
+ */
+export function boundaryNeedsApplying(
+  prior: { checksum: string | null; applied_at: Date | string | null } | null | undefined,
+  checksum: string,
+  now: number = Date.now(),
+  reassertMs: number = BOUNDARY_REASSERT_MS,
+): { apply: boolean; why: 'first run' | 'definition changed' | 're-assert bound reached' | 'unchanged' } {
+  if (!prior) return { apply: true, why: 'first run' };
+  if (prior.checksum !== checksum) return { apply: true, why: 'definition changed' };
+  // A record with no timestamp cannot be shown to be fresh, so it is treated as stale rather than
+  // trusted: the fail direction for a security boundary is to re-assert it.
+  const appliedAt = prior.applied_at ? new Date(prior.applied_at).getTime() : NaN;
+  if (!Number.isFinite(appliedAt) || now - appliedAt > reassertMs) {
+    return { apply: true, why: 're-assert bound reached' };
+  }
+  return { apply: false, why: 'unchanged' };
+}
+
 function migrationChecksum(content: string): string {
   let hash = 0;
   for (let i = 0; i < content.length; i++) {

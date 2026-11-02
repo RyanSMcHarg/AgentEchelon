@@ -27,9 +27,10 @@ jest.mock('@aws-sdk/lib-dynamodb', () => {
   };
 });
 
-const mockClearMarker = jest.fn();
-jest.mock('../../lambda/src/lib/battle-waiting-marker', () => ({
-  clearBattleWaitingMarker: (...args: unknown[]) => mockClearMarker(...args),
+// The markers are cleared by the router, named through `battle-marker-clear.ts`, which answers how many.
+const mockClearMarker = jest.fn(async (..._args: unknown[]) => 1);
+jest.mock('../../lambda/src/lib/battle-marker-clear', () => ({
+  requestMarkerClear: (...args: unknown[]) => mockClearMarker(...args),
 }));
 
 const CHANNEL = 'arn:aws:chime:us-east-1:111:app-instance/i/channel/c1';
@@ -40,7 +41,7 @@ const BOT_B = 'arn:aws:chime:us-east-1:111:app-instance/i/bot/AltSlot0';
 beforeEach(() => {
   jest.resetModules();
   mockSend.mockReset();
-  mockClearMarker.mockReset().mockResolvedValue(true);
+  mockClearMarker.mockReset().mockResolvedValue(1);
   process.env.BATTLE_STATE_TABLE = 'BattleState';
   process.env.CHANNEL_BATTLE_CONFIG_TABLE = 'ChannelBattleConfig';
 });
@@ -127,6 +128,22 @@ describe('ABANDONED is an end, and never a completion', () => {
     expect(duelIsLive([
       { battleId: BATTLE_ID, botArn: BOT_A, state: 'ABANDONED' },
       { battleId: BATTLE_ID, botArn: BOT_B, state: 'ABANDONED' },
+    ])).toBe(false);
+  });
+
+  it('is NOT live once a person ended it, even when both sides had already completed', async () => {
+    const { duelIsLive } = await import('../../lambda/src/lib/battle-state');
+    // `/battle end` landing between round 1 and round 2: both sides had reached COMPLETED, so their
+    // abandon transitions fail, and `endBattle` takes the orchestrator's claim, so `__complete__` is
+    // never written. The `__abandoned__` sentinel is the only record that the duel is over, and
+    // without reading it the duel stayed "live" until its rows expired: every later `/battle` in the
+    // conversation was refused as "already running" (live, battle e2e, 2026-10-28, battle
+    // 7e272a2d8bfef50c, read through another container's cached pointer).
+    expect(duelIsLive([
+      { battleId: BATTLE_ID, botArn: BOT_A, state: 'COMPLETED' },
+      { battleId: BATTLE_ID, botArn: BOT_B, state: 'COMPLETED' },
+      { battleId: BATTLE_ID, botArn: '__orchestrator__', state: 'COMPLETED' },
+      { battleId: BATTLE_ID, botArn: '__abandoned__', state: 'ABANDONED' },
     ])).toBe(false);
   });
 
@@ -252,7 +269,7 @@ describe('endBattle does all four writes, or the end is only half done', () => {
 
   it('abandons only the sides that had not already stopped', async () => {
     const { endBattle } = await loadWithRows(liveRows);
-    const out = await endBattle({ channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:requested' });
+    const out = await endBattle({ channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:requested', classification: 'premium' });
 
     // A side that genuinely produced its answer keeps it. Rewriting a real completion as abandoned
     // would erase work to make the row set tidy.
@@ -263,19 +280,35 @@ describe('endBattle does all four writes, or the end is only half done', () => {
 
   it('TAKES DOWN THE WAITING AFFORDANCE, so an ended duel stops asking', async () => {
     const { endBattle } = await loadWithRows(liveRows);
-    const out = await endBattle({ channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:drift' });
+    const out = await endBattle({ channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:drift', classification: 'premium' });
 
     // The defect this exists to prevent: the marker is the frontend's live "Replying to:" control and
     // was cleared in exactly one place, the resume. End a duel while a side is waiting and the question
     // stayed answerable forever, attached to a duel that no longer existed.
-    expect(mockClearMarker).toHaveBeenCalledWith(CHANNEL, 'question-msg-1', BOT_B);
+    // Named to the router, which edits the marker as that side's assistant; not waited for by default.
+    expect(mockClearMarker).toHaveBeenCalledWith({
+      channelArn: CHANNEL, battleId: BATTLE_ID, classification: 'premium', markers: [{ messageId: 'question-msg-1', botArn: BOT_B }], wait: false,
+    });
+    expect(out.markersCleared).toBe(1);
+  });
+
+  it('a router ending the duel itself clears the markers in place and invokes no router', async () => {
+    // The router's environment carries no `routerArnForClassification` mapping, so naming the markers to
+    // "the classification's router" from inside it cleared nothing.
+    const { endBattle } = await loadWithRows(liveRows);
+    const inPlace = jest.fn().mockResolvedValue(1);
+    const out = await endBattle({
+      channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:experiment-ended', classification: 'premium', clearMarkers: inPlace,
+    });
+    expect(inPlace).toHaveBeenCalledWith({ channelArn: CHANNEL, battleId: BATTLE_ID, markers: [{ messageId: 'question-msg-1', botArn: BOT_B }] });
+    expect(mockClearMarker).not.toHaveBeenCalled();
     expect(out.markersCleared).toBe(1);
   });
 
   it('releases the pointer with the reason and the person who ended it', async () => {
     const { endBattle } = await loadWithRows(liveRows);
     await endBattle({
-      channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:battle-mode-off', endedBy: 'mod-1',
+      channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:battle-mode-off', endedBy: 'mod-1', classification: 'premium',
     });
 
     expect(mockClearActiveBattle).toHaveBeenCalledWith({
@@ -285,7 +318,7 @@ describe('endBattle does all four writes, or the end is only half done', () => {
 
   it('reports honestly when the round-2 claim was already taken', async () => {
     const { endBattle } = await loadWithRows(liveRows, false);
-    const out = await endBattle({ channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:requested' });
+    const out = await endBattle({ channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:requested', classification: 'premium' });
 
     // A lost claim means the rebuttal is already dispatched and cannot be recalled. The duel still ends
     // and its pick is still refused - but a caller must be able to tell, because promising "no more
@@ -308,7 +341,7 @@ describe('endBattle does all four writes, or the end is only half done', () => {
     // Leaving the pointer standing would lock the channel out of new battles until the backstop clock
     // fired - the exact failure this whole change removes.
     await expect(
-      endBattle({ channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:requested' }),
+      endBattle({ channelArn: CHANNEL, battleId: BATTLE_ID, reason: 'abandoned:requested', classification: 'premium' }),
     ).resolves.toBeDefined();
     expect(mockClearActiveBattle).toHaveBeenCalled();
   });

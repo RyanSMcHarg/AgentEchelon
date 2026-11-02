@@ -32,20 +32,32 @@ jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
   InvokeModelCommand: jest.fn((input: unknown) => input),
 }));
 
-import { handler, resolveReplyCostUsd, battlePickAxis, approvalAxis } from '../../lambda/src/analytics-aurora/analytics-query';
+import { handler, resolveReplyCostUsd, battlePickAxis, approvalAxis, successTerminalStates } from '../../lambda/src/analytics-aurora/analytics-query';
+import { clusterMomentsOf } from '../../lambda/src/lib/experiment-stats';
+import { analyticsPathFor } from '../helpers/analytics-path';
+import { DEFAULT_COMPLIANCE_RULES } from '../../lib/config/compliance-rules';
+import { edgeContext } from '../helpers/edge-context';
+
+/** The blocking rule ids the effectiveness query is handed, derived the same way the query derives
+ *  them. Listing them literally here would let a rule's severity change in the config and not in the
+ *  test, which is the drift the config exists to prevent. */
+const BLOCKING_IDS = DEFAULT_COMPLIANCE_RULES.filter((r) => r.severity === 'blocking').map((r) => r.id);
 
 function postEvent(body: unknown): APIGatewayProxyEvent {
   return {
     httpMethod: 'POST',
-    path: '/query',
+    // Posted where the console posts it: the queryType's own capability resource.
+    path: analyticsPathFor(body),
     body: JSON.stringify(body),
     requestContext: {
-      authorizer: { claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' } },
+      authorizer: edgeContext({ claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' } }),
     },
   } as unknown as APIGatewayProxyEvent;
 }
 
 const VALID_RANGE = { start: '2026-05-13', end: '2026-05-20' };
+/** The range VALID_RANGE runs as: both named days included, so the upper bound is the day after the end. */
+const VALID_WINDOW = '[2026-05-13T00:00:00.000Z,2026-05-21T00:00:00.000Z)';
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -157,7 +169,7 @@ describe('Aurora analytics-query: experiment_results carries a battle-scoped eff
       rows: [
         {
           experiment_id: 'exp-battle', variant_id: 'control', model_name: 'anthropic.claude-sonnet-4-6',
-          intent: 'general_qa', agent_type: 'premium', exchange_count: '40', avg_score: '82',
+          intent: 'general', assistant: 'premium', exchange_count: '40', avg_score: '82',
           avg_total_ms: '1200', p95_total_ms: '1800', avg_input_tokens: '1000', avg_output_tokens: '500',
           avg_tokens: '1500', avg_image_count: null, compliance_rate: '100', fallback_count: '0',
           task_count: '0', task_completed_count: '0',
@@ -186,15 +198,41 @@ describe('Aurora analytics-query: experiment_results carries a battle-scoped eff
     expect(body.data).toHaveLength(1);
     expect(body.data[0]).toMatchObject({ experiment_id: 'exp-battle', variant_id: 'control' });
 
-    // Two DB queries: the A/B rollup (battle EXCLUDED), then the battle-scoped one (filter INVERTED),
-    // keyed by (experiment, variant) with the variant's dominant model via MODE().
-    expect(mockDbQuery).toHaveBeenCalledTimes(2);
-    const abSql = String(mockDbQuery.mock.calls[0][0]);
-    const battleSql = String(mockDbQuery.mock.calls[1][0]);
-    expect(abSql).toMatch(/= 'probabilistic'/);
-    expect(battleSql).toMatch(/= 'battle'/);
+    // THREE DB queries: the A/B rollup (battle EXCLUDED), the battle-scoped one (filter INVERTED),
+    // and the duel-dimension lookup that credits each win to the row that earned it.
+    //
+    // FOUND BY CONTENT, NOT BY INDEX. This asserted `calls[1]` was the battle SQL, which is true only
+    // while the count and the order both hold - so adding a third query failed it for a reason that
+    // had nothing to do with what it is about. Two of these issue concurrently; pinning their order
+    // pins a scheduling detail.
+    // A FOURTH read, the per-conversation units (§4.2), states each variant's sample in conversations
+    // beside its exchanges; it fails open in this view, so the unmocked call here leaves the table intact.
+    const sqls = mockDbQuery.mock.calls.map((c: unknown[]) => String(c[0]));
+    expect(sqls).toHaveLength(4);
+    expect(sqls.some((s: string) => /GROUP BY experiment_id, variant_id, conversation/.test(s))).toBe(true);
+    const abSql = sqls.find((s: string) => /= 'probabilistic'/.test(s) && !/per_conversation/.test(s))!;
+    const battleSql = sqls.find((s: string) => /= 'battle'/.test(s))!;
+    const dimsSql = sqls.find((s: string) => /SELECT DISTINCT e\.battle_id/.test(s))!;
+    expect(abSql).toBeDefined();
+    expect(battleSql).toBeDefined();
+    expect(dimsSql).toBeDefined();
     expect(battleSql).not.toMatch(/= 'probabilistic'/);
-    expect(battleSql).toMatch(/GROUP BY m\.experiment_id, m\.variant_id/);
+    // ONE ROW PER TURN. The probabilistic sibling has excluded queued turns since the column existed
+    // and this query did not, so a turn answered out of the queue was counted by its own exchange AND
+    // its queued one - inflating turn_count and double-weighting that turn in the average a duel is
+    // entirely made of.
+    expect(battleSql).toMatch(/e\.queued_as IS NULL/);
+    // The dimensions are GROUPED, not merely filtered: a reviewer who cannot see which rooms a
+    // variant was tried in cannot tell a real win from one that only ever ran in the easy room.
+    expect(battleSql).toMatch(/GROUP BY m\.experiment_id, m\.variant_id,/);
+    for (const dim of ['e.conversation_classification', 'e.assistant', 'e.assistant_role', 'e.profile_version']) {
+      expect(battleSql).toContain(dim);
+    }
+    // A VERSION IS GROUPED BY ITS FINGERPRINT (DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP §3.5): a candidate is
+    // served under the live identity, so (assistant, profile_version) alone cannot tell it from the live
+    // assistant's own version, and the duel-dimension lookup keys on the same tuple.
+    expect(battleSql).toMatch(/GROUP BY m\.experiment_id, m\.variant_id,[^`]*e\.profile_config_id\n/);
+    expect(dimsSql).toContain('e.profile_config_id');
     expect(battleSql).toMatch(/MODE\(\) WITHIN GROUP/);
 
     // The battle-scoped section rides ALONGSIDE `data`, never folded into it.
@@ -213,6 +251,123 @@ describe('Aurora analytics-query: experiment_results carries a battle-scoped eff
   });
 });
 
+describe('Aurora analytics-query — battle_results: one row per DUEL', () => {
+  const duelRow = {
+    battle_id: 'b-1',
+    fought_at: '2026-05-14T10:00:00.000Z',
+    channel_arn: 'arn:aws:chime:us-east-1:1:app-instance/a/channel/c',
+    conversation_classification: 'premium',
+    experiment_id: 'exp-1',
+    rounds: '2',
+    sides: '2',
+    turn_count: '4',
+    contenders: [
+      { variant_id: 'control', assistant: 'advisor', assistant_role: 'primary', profile_version: 7, profile_config_id: 'cfg-live', model_name: 'm1', turn_count: '2', avg_score: '80' },
+      { variant_id: 'treatment', assistant: 'advisor', assistant_role: 'primary', profile_version: 9, profile_config_id: 'cfg-cand', model_name: 'm2', turn_count: '2', avg_score: null },
+    ],
+  };
+
+  it('nests the sides under the duel, so nothing has to re-pair them', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [duelRow] });
+
+    const res = await handler(postEvent({ queryType: 'battle_results', dateRange: VALID_RANGE }));
+    expect(res.statusCode).toBe(200);
+    const body = JSON.parse(res.body);
+
+    expect(body.data).toHaveLength(1);
+    const d = body.data[0];
+    expect(d).toMatchObject({ battle_id: 'b-1', rounds: 2, sides: 2, turn_count: 4 });
+    // Each side keeps its OWN version. That the two differ is frequently the whole experiment, and a
+    // per-variant rollup cannot show it against a specific duel.
+    expect(d.contenders.map((c: any) => c.profile_version)).toEqual([7, 9]);
+    // And its fingerprint, which is what tells a candidate from the live version it was derived from.
+    expect(d.contenders.map((c: any) => c.profile_config_id)).toEqual(['cfg-live', 'cfg-cand']);
+    // An unscored side reports null, never 0 — the honesty contract the rollup holds too.
+    expect(d.contenders[1].avg_score).toBeNull();
+  });
+
+  it('NOT JUDGED is not a tie, and an unjudged duel still renders', async () => {
+    // A duel nobody voted on has no pick at all. Reporting that as a tie would turn every unwatched
+    // duel into evidence of parity, which is a conclusion nobody drew.
+    mockDbQuery.mockResolvedValueOnce({ rows: [duelRow] });
+
+    const res = await handler(postEvent({ queryType: 'battle_results', dateRange: VALID_RANGE }));
+    const body = JSON.parse(res.body);
+    expect(body.data[0].winner_variant_id).toBeNull();
+    expect(body.data[0].decided_at).toBeNull();
+  });
+
+  it('SCOPES BY DUEL, not by row, so a filter cannot return half a comparison', async () => {
+    // THE DEFECT THIS SHAPE AVOIDS. Filtering the turn rows directly would return the side that
+    // matched and drop its rival — so asking for version 9 would show a duel with one contender and
+    // no comparison, which is the only reason the row exists. The filter therefore selects BATTLE
+    // IDS and the body loads every side of the battles that matched.
+    mockDbQuery.mockResolvedValueOnce({ rows: [] });
+
+    await handler(postEvent({
+      queryType: 'battle_results',
+      dateRange: VALID_RANGE,
+      profileVersion: '9',
+      conversationClassification: 'premium',
+      assistantRole: 'primary',
+      agentType: 'advisor',
+    }));
+
+    const sql = String(mockDbQuery.mock.calls[0][0]);
+    const params = mockDbQuery.mock.calls[0][1] as unknown[];
+    // The scope lands inside the id-selecting CTE...
+    expect(sql).toMatch(/WITH matched AS \(\s*SELECT DISTINCT e\.battle_id/);
+    // ...and the body joins back to it, rather than repeating the predicates.
+    expect(sql).toMatch(/JOIN matched ON matched\.battle_id = e\.battle_id/);
+    // Every filter is a bound parameter with a fixed SQL text — no value is concatenated in.
+    expect(params).toEqual(expect.arrayContaining(['premium', 'advisor', 'primary', 9]));
+    expect(sql).not.toContain("'premium'");
+    // One row per turn here too: a queued duplicate would double a side's turn_count.
+    expect(sql).toMatch(/e\.queued_as IS NULL/);
+  });
+
+  it('names the /battle message that started the duel, by its Amazon Chime SDK MessageId and its own time', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [] });
+    await handler(postEvent({ queryType: 'battle_results', dateRange: VALID_RANGE }));
+    const sql = String(mockDbQuery.mock.calls[0][0]);
+
+    // Read through a round-one exchange's user_message_id: that is the person's /battle message.
+    expect(sql).toMatch(/JOIN messages um ON um\.id = se\.user_message_id/);
+    expect(sql).toMatch(/se\.battle_id = b\.battle_id/);
+    expect(sql).toMatch(/COALESCE\(se\.battle_round, 1\) = 1/);
+    // message_id is the Chime id the viewer matches; created_at is the message's own time.
+    expect(sql).toMatch(/um\.message_id AS start_message_id/);
+    expect(sql).toMatch(/um\.created_at AS started_at/);
+    // A LEFT lookup, so a duel with no start message is still listed, and fought_at stands in.
+    expect(sql).toMatch(/LEFT JOIN LATERAL \(\s*SELECT um\.created_at/);
+    expect(sql).toMatch(/COALESCE\(s\.started_at, b\.fought_at\) AS started_at/);
+    // The population and its order are the duel's, unchanged.
+    expect(sql).toMatch(/ORDER BY b\.fought_at DESC\s+LIMIT \$8 OFFSET \$9/);
+  });
+
+  it('returns started_at and start_message_id per duel, and fought_at when no message was found', async () => {
+    mockDbQuery.mockResolvedValueOnce({
+      rows: [
+        { ...duelRow, started_at: '2026-05-14T09:59:58.000Z', start_message_id: 'chime-msg-1' },
+        { ...duelRow, battle_id: 'b-2', started_at: undefined, start_message_id: null },
+      ],
+    });
+    const res = await handler(postEvent({ queryType: 'battle_results', dateRange: VALID_RANGE }));
+    const body = JSON.parse(res.body);
+    expect(body.data[0]).toMatchObject({ started_at: '2026-05-14T09:59:58.000Z', start_message_id: 'chime-msg-1' });
+    expect(body.data[1]).toMatchObject({ started_at: duelRow.fought_at, start_message_id: null });
+    expect(body.columns).toEqual(expect.arrayContaining(['started_at', 'start_message_id']));
+  });
+
+  it('a non-numeric version is EVERY version, not a cast that errors the review', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [] });
+    await handler(postEvent({ queryType: 'battle_results', dateRange: VALID_RANGE, profileVersion: 'latest' }));
+    const params = mockDbQuery.mock.calls[0][1] as unknown[];
+    expect(params).toContain(null);
+    expect(params).not.toContain('latest');
+  });
+});
+
 describe('Aurora analytics-query — intent_effectiveness (Effectiveness L0)', () => {
   it('runs the per-intent rollup and stamps cost_per_reply_usd on every row', async () => {
     mockDbQuery.mockResolvedValueOnce({
@@ -221,6 +376,10 @@ describe('Aurora analytics-query — intent_effectiveness (Effectiveness L0)', (
         { intent: 'general_query', exchange_count: '30', dominant_model: 'not-a-real-model', avg_input_tokens: '200', avg_output_tokens: '120', tool_error_rate: '5.0' },
       ],
     });
+    // The vote-scope read: which agent messages are in THIS page's filtered population, so the
+    // thumbs fold counts only votes left on them. It is a second query by necessity - the thumbs
+    // live in DynamoDB and can only be narrowed from Aurora.
+    mockDbQuery.mockResolvedValueOnce({ rows: [] });
 
     const res = await handler(postEvent({ queryType: 'intent_effectiveness', dateRange: VALID_RANGE }));
 
@@ -238,9 +397,44 @@ describe('Aurora analytics-query — intent_effectiveness (Effectiveness L0)', (
     expect(sql).toMatch(/tool_agg AS/);
     expect(sql).toMatch(/\* 0\.30/); // outcome weight in the flow composite
     expect(sql).toMatch(/WHEN 'high' THEN 100 WHEN 'medium' THEN 50 WHEN 'low' THEN 0/);
-    expect(sql).toMatch(/NOW\(\) - INTERVAL '1 day' \* \$1/);
-    // L0 = no intent filter → $2 is NULL (7-day window from VALID_RANGE); $3 agentType NULL (unscoped).
-    expect(args).toEqual([7, null, null]);
+    expect(sql).toMatch(/e\.created_at >= lower\(\$1::tstzrange\) AND e\.created_at < upper\(\$1::tstzrange\)/);
+    // $1 is VALID_RANGE with both days included. L0 = no intent filter → $2 is NULL; $3 agentType NULL (unscoped).
+    // $4 is the BLOCKING rule ids, read off the rule set rather than listed here - a second list of
+    // 'the important ones' in a test is how a rule gets downgraded in one place and not the other.
+    // $5 is the ROOM's classification, which became its own filter when $3 (agent_type) stopped
+    // carrying the classification and started naming the assistant that answered.
+    expect(args).toEqual([VALID_WINDOW, null, null, BLOCKING_IDS, null, null, null, null, null, null, null]);
+  });
+
+  it('filters the ROOM CLASSIFICATION separately from the ASSISTANT that answered', async () => {
+    // These were the same filter while `agent_type` carried the classification, and the console sent
+    // its classification dropdown as `agentType`. That column names the ASSISTANT now,
+    // so a classification sent there would filter by an assistant nobody is called and return an empty
+    // dashboard. The two are separate parameters against separate columns.
+    mockDbQuery.mockResolvedValueOnce({ rows: [] });
+    mockDbQuery.mockResolvedValueOnce({ rows: [] }); // the vote-scope read
+
+    const res = await handler(postEvent({
+      queryType: 'intent_effectiveness',
+      conversationClassification: 'premium',
+      agentType: 'advisor',
+      dateRange: VALID_RANGE,
+    }));
+
+    expect(res.statusCode).toBe(200);
+    const [sql, args] = mockDbQuery.mock.calls[0];
+    expect(sql).toMatch(/\$3::varchar IS NULL OR e\.assistant = \$3/);
+    expect(sql).toMatch(/\$5::varchar IS NULL OR e\.conversation_classification = \$5/);
+    // The assistant lands in $3 and the room's classification in $5 - never the same slot.
+    expect(args).toEqual([VALID_WINDOW, null, 'advisor', BLOCKING_IDS, 'premium', null, null, null, null, null, null]);
+
+    // AND THE VOTE SCOPE CARRIES THE SAME FILTERS. This is the whole point of the second read: the
+    // thumbs scan cannot filter on an assistant, so if this query does not narrow, every user-signal
+    // column on the page is somebody else's.
+    const [scopeSql, scopeArgs] = mockDbQuery.mock.calls[1];
+    expect(scopeSql).toMatch(/\$3::varchar IS NULL OR e\.assistant = \$3/);
+    expect(scopeSql).toMatch(/\$4::varchar IS NULL OR e\.conversation_classification = \$4/);
+    expect(scopeArgs).toEqual([VALID_WINDOW, null, 'advisor', 'premium', null, null, null, null, null, null]);
   });
 
   it('L1: an intent param drills to one intent via the $2 IS NULL OR filter', async () => {
@@ -250,9 +444,65 @@ describe('Aurora analytics-query — intent_effectiveness (Effectiveness L0)', (
 
     expect(res.statusCode).toBe(200);
     const [sql, args] = mockDbQuery.mock.calls[0];
-    expect(sql).toMatch(/\$2::varchar IS NULL OR e\.intent = \$2/);
-    expect(args).toEqual([7, 'report_generation', null]);
+    expect(sql).toMatch(/\$2::varchar IS NULL OR COALESCE\(e\.task_type, e\.intent\) = \$2/);
+    expect(args).toEqual([VALID_WINDOW, 'report_generation', null, BLOCKING_IDS, null, null, null, null, null, null, null]);
     expect(JSON.parse(res.body).data[0]).toHaveProperty('cost_per_reply_usd', null);
+  });
+
+  it('a WORKFLOW REFUSAL is counted on its own and is not a tool error', async () => {
+    // The task workflow refusing a move it forbids (`illegal_transition`, `requirement_unsourced`...)
+    // is recorded on the step as `errorClass: 'workflow_refusal'`. The model corrects it in the same
+    // loop and nothing failed, so an intent whose workflow holds the model to its steps must not read
+    // as a broken tool.
+    mockDbQuery.mockResolvedValueOnce({
+      rows: [{ intent: 'data_extraction', exchange_count: '4', dominant_model: null, tool_calls: '6', tool_errors: '0', workflow_refusals: '2', tool_error_rate: '0.0' }],
+    });
+    mockDbQuery.mockResolvedValueOnce({ rows: [] }); // the vote-scope read
+
+    const res = await handler(postEvent({ queryType: 'intent_effectiveness', dateRange: VALID_RANGE }));
+
+    expect(res.statusCode).toBe(200);
+    const sql = String(mockDbQuery.mock.calls[0][0]);
+    const toolAgg = sql.slice(sql.indexOf('tool_agg AS'), sql.indexOf('FROM exchanges e', sql.indexOf('tool_agg AS')));
+    // Errors are the failed calls that are NOT refusals; a step with no class (written before the
+    // class existed) stays an error, which is why the predicate is IS DISTINCT FROM and not <>.
+    expect(toolAgg).toMatch(/FILTER \(WHERE \(t->>'ok'\) = 'false'\s+AND \(t->>'errorClass'\) IS DISTINCT FROM 'workflow_refusal'\) AS tool_errors/);
+    expect(toolAgg).toMatch(/FILTER \(WHERE \(t->>'ok'\) = 'false'\s+AND \(t->>'errorClass'\) = 'workflow_refusal'\) AS workflow_refusals/);
+    // The rate is still failures over every call, so a refusal neither raises it nor hides the call.
+    expect(sql).toMatch(/ROUND\(\(ta\.tool_errors \* 100\.0 \/ NULLIF\(ta\.tool_calls, 0\)\)::numeric, 1\) AS tool_error_rate/);
+    expect(sql).toMatch(/COALESCE\(ta\.workflow_refusals, 0\) AS workflow_refusals/);
+
+    const body = JSON.parse(res.body);
+    expect(body.columns).toEqual(expect.arrayContaining(['tool_errors', 'tool_error_rate', 'workflow_refusals']));
+    expect(body.data[0]).toMatchObject({ tool_errors: '0', workflow_refusals: '2' });
+  });
+
+  it('a PLATFORM ACTION is counted per intent from steps[].action, apart from the model\'s tool calls', async () => {
+    // A declared step action (SPEC-TASK-STATE-TRANSITIONS FR29) is recorded as its own step carrying an
+    // `action` object and no `tools`, so it can never land in tool_calls; it is counted on its own.
+    mockDbQuery.mockResolvedValueOnce({
+      rows: [{ intent: 'report_generation', exchange_count: '3', dominant_model: null, tool_calls: '2', tool_errors: '0', workflow_refusals: '0', platform_actions: '4' }],
+    });
+    mockDbQuery.mockResolvedValueOnce({ rows: [] }); // the vote-scope read
+
+    const res = await handler(postEvent({ queryType: 'intent_effectiveness', dateRange: VALID_RANGE }));
+
+    expect(res.statusCode).toBe(200);
+    const sql = String(mockDbQuery.mock.calls[0][0]);
+    const actionAgg = sql.slice(sql.indexOf('action_agg AS'), sql.indexOf('GROUP BY COALESCE(e.task_type, e.intent)', sql.indexOf('action_agg AS')));
+    expect(actionAgg).toMatch(/COUNT\(\*\) AS platform_actions/);
+    // Read from the steps array of the answer's sibling row, one row per step that carries an action.
+    expect(actionAgg).toMatch(/jsonb_array_elements\(/);
+    expect(actionAgg).toMatch(/jsonb_typeof\(s->'action'\) = 'object'/);
+    // The same population as tool_agg: one row per turn, the folded queue rows excluded.
+    expect(actionAgg).toMatch(/e\.queued_as IS NULL/);
+    expect(actionAgg).not.toMatch(/s->'tools'/);
+    expect(sql).toMatch(/COALESCE\(aa\.platform_actions, 0\) AS platform_actions/);
+    expect(sql).toMatch(/LEFT JOIN action_agg aa ON aa\.intent = ex_agg\.intent/);
+
+    const body = JSON.parse(res.body);
+    expect(body.columns).toEqual(expect.arrayContaining(['platform_actions']));
+    expect(body.data[0]).toMatchObject({ tool_calls: '2', platform_actions: '4' });
   });
 });
 
@@ -265,11 +515,11 @@ describe('Aurora analytics-query — L2 drills (intent_exchanges + task_details 
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).data).toHaveLength(1);
     const [sql, args] = mockDbQuery.mock.calls[0];
-    expect(sql).toMatch(/WHERE e\.intent = \$1/);
+    expect(sql).toMatch(/WHERE COALESCE\(e\.task_type, e\.intent\) = \$1/);
     expect(sql).toMatch(/ORDER BY e\.created_at DESC/);
     expect(sql).toMatch(/LIMIT \$3 OFFSET \$5/);
     // intent, window, default limit, agentType (unscoped), offset (page 0)
-    expect(args).toEqual(['general_query', 7, 100, null, 0]);
+    expect(args).toEqual(['general_query', VALID_WINDOW, 100, null, 0]);
   });
 
   it('intent_exchanges without an intent → honest empty, no DB call', async () => {
@@ -285,7 +535,7 @@ describe('Aurora analytics-query — L2 drills (intent_exchanges + task_details 
 
     expect(res.statusCode).toBe(200);
     const [sql, args] = mockDbQuery.mock.calls[0];
-    expect(sql).toMatch(/\$3::varchar IS NULL OR intent = \$3/);
+    expect(sql).toMatch(/\$3::varchar IS NULL OR COALESCE\(task_type, intent\) = \$3/);
     expect(args[2]).toBe('report_generation');
   });
 });
@@ -324,8 +574,9 @@ describe('Aurora is a strict superset — no metric is Athena-only', () => {
     await handler(postEvent({ queryType: 'signup_funnel_conversion', dateRange: VALID_RANGE }));
 
     const [, params] = mockDbQuery.mock.calls[0];
-    // days + the 5 signup steps, bound (never interpolated).
-    expect(params).toEqual(expect.arrayContaining(['signup_form_viewed', 'signup_confirmation_completed']));
+    // the window, the 5 signup steps and the entry step, bound (never interpolated).
+    expect(params[1]).toEqual(expect.arrayContaining(['signup_form_viewed', 'signup_confirmation_completed']));
+    expect(params[2]).toBe('signup_form_viewed');
   });
 });
 
@@ -477,7 +728,7 @@ describe('experiment_exchanges', () => {
 
   it('scopes on experiment_id, NOT on the intent string', async () => {
     // The stored exchange intent is the CLASSIFIER intent ('general'); the experiment stores the
-    // ROUTE KEY ('general_qa'). Matching on the string would silently return nothing.
+    // ROUTE KEY ('general'). Matching on the string would silently return nothing.
     const { sql, params } = await call({ experimentId: 'exp1' });
     expect(sql).toContain('m.experiment_id = $2');
     expect(params).toContain('exp1');
@@ -502,6 +753,15 @@ describe('experiment_exchanges', () => {
     }
   });
 
+  it('reads the served definition from the archived columns first, the metadata after', async () => {
+    // The row an exchange joins to is the placeholder's CREATE, whose metadata carries none of the three;
+    // archival folds them onto it as columns, so a read of the metadata alone is null on an answered turn.
+    const { sql } = await call({ experimentId: 'exp1' });
+    expect(sql).toContain("COALESCE(e.profile_name, m.profile_name, m.metadata->>'profileName') AS profile_name");
+    expect(sql).toContain("COALESCE(e.profile_version, m.profile_version, NULLIF(m.metadata->>'profileVersion', '')::int) AS profile_version");
+    expect(sql).toContain("COALESCE(e.profile_config_id, m.profile_config_id, m.metadata->>'profileConfigId') AS profile_config_id");
+  });
+
   it('carries redaction flags but KEEPS the row — it still counted toward the score', async () => {
     // Dropping redacted rows would break reconciliation and misrepresent what the verdict used.
     const { sql } = await call({ experimentId: 'exp1' });
@@ -521,7 +781,8 @@ describe('experiment_exchanges', () => {
     const { sql } = await call({ experimentId: 'exp1' });
     expect(sql).toContain('REDACT_CHANNEL_MESSAGE');
     expect(sql).toContain('DELETE_CHANNEL_MESSAGE');
-    expect(sql).toMatch(/regexp_replace\(m\.message_id, '-\(UPD\|RED\|DEL\)\$', ''\) \|\| '-RED'/);
+    // Every archival suffix, a per-event update id (migration 084) among them, strips to the base id.
+    expect(sql).toContain("regexp_replace(m.message_id, '-(UPD(-[0-9a-f]{12})?|RED|DEL)$', '') || '-RED'");
     expect(sql).not.toMatch(/JOIN\s+moderation_actions/i);
   });
 
@@ -545,8 +806,8 @@ describe('experiment_results — the rollup resolves one evaluation per exchange
     experiment_id: 'exp-1',
     variant_id: 'control',
     model_name: 'anthropic.claude-sonnet-4-6',
-    intent: 'general_qa',
-    agent_type: 'premium',
+    intent: 'general',
+    assistant: 'premium',
     exchange_count: '40',
     scored_count: '40',
     avg_score: '80',
@@ -594,6 +855,28 @@ describe('experiment_results — the rollup resolves one evaluation per exchange
   });
 });
 
+/**
+ * A row of the per-conversation units read (fetchExperimentUnits), built from per-conversation value lists
+ * the way the SQL builds it, so a test states its data as conversations rather than as moments. The same
+ * values stand for the score, the latency and the tokens.
+ */
+function unitsRowFromClusters(variantId: string, clusters: number[][], experimentId = 'exp-1') {
+  const m = clusterMomentsOf(clusters);
+  return {
+    experiment_id: experimentId,
+    variant_id: variantId,
+    conversation_count: String(m.clusters),
+    exchange_count: String(m.n),
+    n_sq: String(m.clusterSizeSq),
+    lat_sum: m.sum, lat_sumsq: m.sumSq, lat_tot_sq: m.clusterTotalSq, lat_tot_n: m.clusterTotalTimesSize,
+    tok_sum: m.sum, tok_sumsq: m.sumSq, tok_tot_sq: m.clusterTotalSq, tok_tot_n: m.clusterTotalTimesSize,
+    scored_conversation_count: String(m.clusters),
+    scored_count: String(m.n),
+    sn_sq: String(m.clusterSizeSq),
+    sc_sum: m.sum, sc_sumsq: m.sumSq, sc_tot_sq: m.clusterTotalSq, sc_tot_n: m.clusterTotalTimesSize,
+  };
+}
+
 // ---------------------------------------------------------------------------
 // experiment_recommendation — what the verdict is allowed to claim.
 //
@@ -605,8 +888,8 @@ describe('experiment_recommendation', () => {
     experiment_id: 'exp-1',
     variant_id: variantId,
     model_name: 'anthropic.claude-sonnet-4-6',
-    intent: 'general_qa',
-    agent_type: 'premium',
+    intent: 'general',
+    assistant: 'premium',
     exchange_count: '40',
     scored_count: '40',
     avg_score: '80',
@@ -626,8 +909,18 @@ describe('experiment_recommendation', () => {
     ...over,
   });
 
-  const recommend = async (rows: unknown[], body: Record<string, unknown> = {}) => {
+  /** The per-conversation units read for a variant whose every conversation holds ONE exchange (design
+   *  effect 1), so the per-exchange figures above are also the per-conversation ones. */
+  const singletonUnits = (variantId: string, n = 40) => unitsRowFromClusters(
+    variantId,
+    Array.from({ length: n }, (_, i) => [80 + ((i % 5) - 2) * 4]),
+  );
+
+  const recommend = async (rows: unknown[], body: Record<string, unknown> = {}, units?: unknown[]) => {
     mockDbQuery.mockResolvedValueOnce({ rows });
+    mockDbQuery.mockResolvedValueOnce({
+      rows: units ?? (rows as Array<{ variant_id: string }>).map((r) => singletonUnits(r.variant_id)),
+    });
     const res = await handler(
       postEvent({ queryType: 'experiment_recommendation', experimentId: 'exp-1', dateRange: VALID_RANGE, ...body }),
     );
@@ -671,5 +964,90 @@ describe('experiment_recommendation', () => {
     expect(body.guardrails[0]).toMatchObject({ metric: 'latency', bound: 10, held: false, breached: false });
     expect(String(body.rationale)).toMatch(/not established/i);
     expect(String(body.rationale)).not.toMatch(/Guardrails held/);
+  });
+
+  // ── THE UNIT OF ANALYSIS (§4.2) ─────────────────────────────────────────────────────────────────
+  //
+  // Two hundred exchanges a side, five quality points apart. Counted per exchange that is significant.
+  // If those exchanges are ten conversations of twenty turns, each conversation consistent within itself
+  // and conversations far apart, it is ten observations a side and not significant.
+  const LEVELS = [50, 58, 66, 74, 82, 90, 98, 106, 114, 122];
+  const arm = (shift: number) => LEVELS.map((l) => Array.from({ length: 20 }, (_, j) => l + shift + ((j % 3) - 1) * 0.5));
+  const correlatedRows = [
+    variantRow('control', { exchange_count: '200', scored_count: '200', avg_score: '86', score_sd: '23.04' }),
+    variantRow('treatment', { exchange_count: '200', scored_count: '200', avg_score: '91', score_sd: '23.04' }),
+  ];
+
+  it('counted as two hundred independent conversations, the five points would promote the treatment', async () => {
+    const body = await recommend(correlatedRows, {}, [singletonUnits('control', 200), singletonUnits('treatment', 200)]);
+    expect(body.primary.significant).toBe(true);
+    expect(body.verdict).toBe('promote_treatment');
+  });
+
+  it('as the ten conversations a side they are, the same five points are not significant', async () => {
+    const body = await recommend(correlatedRows, {}, [
+      unitsRowFromClusters('control', arm(0)),
+      unitsRowFromClusters('treatment', arm(5)),
+    ]);
+    expect(body.primary.significant).toBe(false);
+    expect(body.verdict).not.toBe('promote_treatment');
+    expect(body.primary.deltaPct).toBeCloseTo(5.8, 1); // the point estimate is the per-exchange one
+  });
+
+  it('reports the unit and both counts, so an operator sees conversations beside exchanges', async () => {
+    const body = await recommend(correlatedRows, {}, [
+      unitsRowFromClusters('control', arm(0)),
+      unitsRowFromClusters('treatment', arm(5)),
+    ]);
+    expect(body.unit).toBe('conversation');
+    const control = body.variants.find((v: any) => v.variant_id === 'control');
+    expect(control).toMatchObject({ unit: 'conversation', conversation_count: 10, exchange_count: 200, scored_conversation_count: 10 });
+    expect(String(body.rationale)).toMatch(/Tested per conversation: control 10 conversations \(200 exchanges\)/);
+  });
+
+  it('the sample floor counts conversations: thirty exchanges in three conversations is below a floor of five', async () => {
+    const three = Array.from({ length: 3 }, () => Array.from({ length: 10 }, () => 80));
+    const body = await recommend(
+      [variantRow('control', { exchange_count: '30' }), variantRow('treatment', { exchange_count: '30' })],
+      {},
+      [unitsRowFromClusters('control', three), unitsRowFromClusters('treatment', three)],
+    );
+    expect(body.verdict).toBe('inconclusive');
+    expect(String(body.rationale)).toMatch(/3 conversations, below the 5-conversation floor/);
+  });
+
+  it('the units read counts the population the rollup counts, grouped by conversation, with no intent clause', async () => {
+    // An `intent` experiment counts only turns of its intent because the router stamps only those
+    // (`countsTowardExperiment`); the reader relies on that stamp and adds no intent predicate of its own,
+    // which would miss the route-key/intent renaming the stamp already resolved.
+    await recommend([variantRow('control'), variantRow('treatment')]);
+    const [rowsSql, rowsParams] = mockDbQuery.mock.calls[0] as [string, unknown[]];
+    const [unitsSql, unitsParams] = mockDbQuery.mock.calls[1] as [string, unknown[]];
+    expect(unitsSql).toMatch(/GROUP BY experiment_id, variant_id, conversation/);
+    expect(unitsSql).toContain('COALESCE(e.channel_arn, e.id::text) AS conversation');
+    // The same population parameters; the rollup binds one more, the success states its completion count reads.
+    expect(rowsParams.slice(0, unitsParams.length)).toEqual(unitsParams);
+    expect(rowsParams.slice(unitsParams.length)).toEqual([successTerminalStates()]);
+    const start = rowsSql.indexOf('WHERE m.experiment_id IS NOT NULL');
+    const rowsWhere = rowsSql.slice(start, rowsSql.indexOf('GROUP BY', start)).trim();
+    expect(unitsSql).toContain(rowsWhere);
+    expect(rowsWhere).toContain('m.experiment_id = $2');
+    expect(rowsWhere).not.toMatch(/e\.intent/);
+  });
+});
+
+describe('Aurora analytics-query — unserved_subjects: candidates for new intents', () => {
+  it('counts general and off-topic turns, offer turns included, against their conversation subjects', async () => {
+    mockDbQuery.mockResolvedValueOnce({ rows: [{ subject: 'vendor contracts', intent: 'general', turns: '14', conversations: '6' }] });
+    const res = await handler(postEvent({ queryType: 'unserved_subjects', dateRange: VALID_RANGE }));
+    expect(res.statusCode).toBe(200);
+    expect(JSON.parse(res.body).data[0]).toMatchObject({ subject: 'vendor contracts', turns: '14' });
+    const [sql] = mockDbQuery.mock.calls[0] as [string];
+    // Answered turns from exchanges, and the turns a drift offer answered, which are never exchanges.
+    expect(sql).toContain("e.intent IN ('general', 'off_topic')");
+    expect(sql).toContain('FROM drift_events d');
+    expect(sql).toContain("COALESCE(d.source, 'live') = 'live'");
+    // Against the conversation's latest subjects.
+    expect(sql).toContain('DISTINCT ON (channel_arn) channel_arn, topics');
   });
 });

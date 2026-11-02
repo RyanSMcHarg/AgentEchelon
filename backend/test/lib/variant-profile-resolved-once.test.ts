@@ -1,7 +1,7 @@
 /**
  * A `profileRef` variant's version IS the definition for the turn, and it is resolved EXACTLY ONCE.
  *
- * WHY THIS GUARD EXISTS. The processor resolved the profile twice. The first resolution honoured
+ * WHY THIS GUARD EXISTS. The processor resolved the profile twice. The first resolution honored
  * `event.variantProfile` (SPEC-PORTABLE §6) and fed the persona; the second called
  * `resolveActiveProfile` again, unconditionally, and fed everything else - the tool allowlist, the
  * guardrail selection, per-intent model routing, the base model and the attribution `configId`. So a
@@ -35,27 +35,37 @@ const PROCESSOR = path.join(__dirname, '..', '..', 'lambda', 'src', 'assistant-a
 const code = stripComments(fs.readFileSync(PROCESSOR, 'utf8'));
 
 describe('the serving profile version is resolved once per turn', () => {
-  it('calls resolveActiveProfile exactly once', () => {
+  it('calls resolveActiveProfile exactly once for the serving definition', () => {
     // Two calls is the defect itself: the second one cannot see `event.variantProfile`, so it serves
     // the profile's ACTIVE version to every consumer downstream of it.
+    // No other read of the active version sits beside it: the external provider is the classification's
+    // selection (`externalProviderSelected`), not a field on any version.
     const calls = (code.match(/\bresolveActiveProfile\s*\(/g) || []).length;
     expect(calls).toBe(1);
   });
 
   it('that one call is the variant-aware branch', () => {
-    // The single call must sit on the `event.variantProfile ? … : …` fallback, so a variant turn never
-    // reaches SSM for the active version at all.
-    expect(code).toMatch(/event\.variantProfile[\s\S]{0,200}resolveFromDefinition[\s\S]{0,200}resolveActiveProfile/);
+    // The single call must sit on the `event.variantProfile ? … : …` fallback, so a variant turn's
+    // serving definition never comes from the active version.
+    // The vend's narrowed version (`resolveProfileVersion`) sits between them: still one expression, so
+    // a variant turn still never reaches SSM for any other version.
+    expect(code).toMatch(/event\.variantProfile[\s\S]{0,200}resolveFromDefinition[\s\S]{0,300}resolveProfileVersion[\s\S]{0,200}resolveActiveProfile/);
+  });
+
+  it('the narrowed version is resolved once too', () => {
+    expect((code.match(/\bresolveProfileVersion\s*\(/g) || []).length).toBe(1);
   });
 
   it('every downstream consumer reads the resolved object, not a second lookup', () => {
     // The consumers that made this matter. Each one must be fed from the binding, so adding a consumer
     // later inherits the variant automatically rather than needing to remember.
-    // A fixed window after the binding rather than a delimiter search: the consumers sit within a few
-    // dozen lines, and a blank-line delimiter moves every time someone reformats.
+    // From the binding to the turn's attribution log, which names the version that served it: the turns that run alone
+    // (an event step, a voice send, a prompt welcome) sit between them, so a fixed window no longer reaches the log.
     const from = code.indexOf('const active = ');
     expect(from).toBeGreaterThan(-1);
-    const window = code.slice(from, from + 3000);
+    const to = code.indexOf("'[AssistantAsyncProcessor] active profile'", from);
+    expect(to).toBeGreaterThan(from);
+    const window = code.slice(from, to + 200);
     expect(window).toMatch(/const active = activeProfile;/);
     for (const consumer of ['active.profile.modelKey', 'active.models', 'active.tools', 'active.guardrailId', 'active.configId']) {
       expect(window).toContain(consumer);

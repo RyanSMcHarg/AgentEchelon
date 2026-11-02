@@ -19,6 +19,41 @@
 const mockMessagingSend = jest.fn();
 const mockLambdaSend = jest.fn();
 const mockSsmSend = jest.fn();
+const mockRecordDispatchFailure = jest.fn().mockResolvedValue(true);
+
+// Spread, not enumerate: only the one write this file observes is overridden, so adding
+// an export to `turn-lock` cannot break tests that have nothing to say about it.
+// THE ASSISTANT SESSION (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION, Phase 1b). Every message this code posts goes out as an assistant on a session the
+// vend mints from a recorded routing decision. Those are unit-tested on their own
+// (`a-turn-acts-as-the-assistant-it-was-routed-to.test.ts`); here the decision is recorded and the
+// session minted without AWS, and the clients stay the mocked ones.
+//
+// The abuse gate admits: this file is about which entry answers @all, and the gate fails closed with no
+// control table (`abuse-controls.test.ts` pins that), which would refuse every turn here before routing.
+jest.mock('../../lambda/src/lib/abuse-controls.js', () => ({
+  ...jest.requireActual('../../lambda/src/lib/abuse-controls.js'),
+  evaluateAbuseGate: async () => ({ allowed: true }),
+}), { virtual: true });
+jest.mock('../../lambda/src/lib/assistant-session', () => {
+  const actual = jest.requireActual('../../lambda/src/lib/assistant-session');
+  const session = (botArn: string) => ({
+    assistant: 'test-assistant', role: 'primary', botArn,
+    credentials: { accessKeyId: 'AKIATEST', secretAccessKey: 'test', sessionToken: 'test' },
+  });
+  return {
+    ...actual,
+    speakAsRoutedAssistant: jest.fn(async (input: { botArn: string }) => session(input.botArn)),
+    sessionForRoutedAssistant: jest.fn(async (input: { botArn: string }) => session(input.botArn)),
+  };
+});
+jest.mock('../../lambda/src/lib/turn-routing', () => ({
+  ...jest.requireActual('../../lambda/src/lib/turn-routing'),
+  recordTurnRouting: jest.fn(async () => undefined),
+}));
+jest.mock('../../lambda/src/lib/turn-lock.js', () => ({
+  ...jest.requireActual('../../lambda/src/lib/turn-lock.js'),
+  recordDispatchFailure: (...a: unknown[]) => mockRecordDispatchFailure(...a),
+}));
 
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn().mockImplementation(() => ({ send: mockMessagingSend })),
@@ -109,13 +144,12 @@ describe('the channel flow answers @all, at every channel size', () => {
   beforeEach(async () => {
     jest.resetModules();
     jest.clearAllMocks();
-    process.env.ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:standard';
-    process.env.BASIC_ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:basic';
-    process.env.PREMIUM_ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:premium';
-    process.env.ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:router-standard';
+    process.env.STANDARD_ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:router-standard';
     process.env.BASIC_ROUTER_ARN = ROUTER_BASIC;
     process.env.PREMIUM_ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:router-premium';
-    mockSsmSend.mockResolvedValue({ Parameter: { Value: BOT } });
+    // The ASSIGNMENT record's shape: the flow resolves the live occupant of the primary role through
+    // it rather than reading a bare bot ARN from a classification-keyed key.
+    mockSsmSend.mockResolvedValue({ Parameter: { Value: JSON.stringify({ role: 'primary', occupancy: 'live', assistant: 'advisor', botArn: BOT }) } });
     // The router's real return shape: a Lex response whose messages[0].content is the placeholder.
     mockLambdaSend.mockResolvedValue({
       Payload: Buffer.from(JSON.stringify({
@@ -148,7 +182,7 @@ describe('the channel flow answers @all, at every channel size', () => {
     expect(listedMemberships()).toBe(true);
   });
 
-  it('STANDS ASIDE in a 1:1, because AUTO routes every message to Lex at that size', async () => {
+  it('CLAIMS a 1:1 @all, because nothing else is invoked at that size', async () => {
     // The other half of the complement. Nothing is dispatched here, and that is correct rather than a
     // dropped turn: Amazon Chime SDK invokes Lex for every message in a 1:1 regardless of mentions, so
     // the Lex entry runs and answers. Dispatching as well is what produced the duplicate.
@@ -163,7 +197,10 @@ describe('the channel flow answers @all, at every channel size', () => {
 
     await handler(flowEvent('@all what is the billing policy?'));
 
-    expect(handedOff()).toBe(false);
+    // THE PREMISE OF THE OLD ANSWER IS GONE. This stood aside because `StandardMessages: AUTO` invoked
+    // the Amazon Lex entry for every message at this size, so claiming it too meant two answers. Every
+    // assistant now carries `NONE`, so nothing else is invoked and standing aside would answer nobody.
+    expect(handedOff()).toBe(true);
     // ALLOWED, never denied: a denied message is not persisted, so the user's own `@all` would vanish
     // from the channel and from the assistant's history.
     expect(allowed()).toBe(true);
@@ -172,7 +209,7 @@ describe('the channel flow answers @all, at every channel size', () => {
   it('runs NONE of the turn itself: no processor dispatch, no intent, no delivery option', async () => {
     await handler(flowEvent('@all what is the billing policy?'));
 
-    // MESSAGE-FLOW §3.1: bypassing Lex is the only sanctioned difference. Before the handoff this path
+    // MESSAGE-FLOW §6.1: bypassing Lex is the only sanctioned difference. Before the handoff this path
     // invoked the PROCESSOR directly with a hardcoded `intent: 'general'` and its own
     // `deliveryOption` - a second turn path that could diverge from the Lex one silently, because the
     // turn still answers either way. Exactly one invoke, to the router, carrying no turn decisions.
@@ -183,16 +220,45 @@ describe('the channel flow answers @all, at every channel size', () => {
     expect(calls[0].type).toBe('RequestResponse');
     expect(calls[0].payload.aeTurn.intent).toBeUndefined();
     expect(calls[0].payload.aeTurn.deliveryOption).toBeUndefined();
-    expect(calls[0].payload.aeTurn.userType).toBeUndefined();
+    expect(calls[0].payload.aeTurn.classification).toBeUndefined();
   });
 
   it('answers at the CHANNEL classification, never a hardwired one', async () => {
     // A basic channel's @all must reach the basic router. Routing to standard would answer with the
     // standard model and standard-tier company context - the cross-classification leak the split
-    // exists to prevent, and `basic` deliberately has no upward fallback.
+    // exists to prevent, and no classification falls back to another's router (ADR-046).
     await handler(flowEvent('@all what is the billing policy?'));
 
     expect(invokes()[0].fn).toBe(ROUTER_BASIC);
+  });
+
+  it('DECLINES when the channel classification has no router of its own, and invokes no other (ADR-046)', async () => {
+    // Standard and premium routers are wired; basic's is not. The turn is recorded as a dispatch
+    // failure and the person's message is still released, but no router answers it.
+    delete process.env.BASIC_ROUTER_ARN;
+    await handler(flowEvent('@all what is the billing policy?'));
+
+    expect(invokes()).toEqual([]);
+    expect(mockRecordDispatchFailure).toHaveBeenCalledWith(expect.objectContaining({ reason: 'assistant_unreachable' }));
+    expect(allowed()).toBe(true);
+  });
+
+  it('declines a PREMIUM channel whose router is unset rather than answering it on the standard router', async () => {
+    mockMessagingSend.mockImplementation((cmd: any) => {
+      if (cmd.__type === 'ListTags') return Promise.resolve({ Tags: [{ Key: 'classification', Value: 'premium' }] });
+      return Promise.resolve({ ChannelMessage: { MessageId: 'placeholder-1' }, MessageId: 'placeholder-1' });
+    });
+    // Positive control: wired, the premium channel reaches the premium router.
+    await handler(flowEvent('@all what is the billing policy?'));
+    expect(invokes().map((i) => i.fn)).toEqual(['arn:aws:lambda:us-east-1:111122223333:function:router-premium']);
+
+    mockLambdaSend.mockClear();
+    mockRecordDispatchFailure.mockClear();
+    delete process.env.PREMIUM_ROUTER_ARN;
+    await handler(flowEvent('@all and what about refunds?'));
+
+    expect(invokes()).toEqual([]);
+    expect(mockRecordDispatchFailure).toHaveBeenCalledWith(expect.objectContaining({ reason: 'assistant_unreachable' }));
   });
 
   it('declares the inbound message id, so the dedup key is stable across a redelivery', async () => {
@@ -205,18 +271,14 @@ describe('the channel flow answers @all, at every channel size', () => {
     expect(invokes()[0].payload.aeTurn.userMessageId).toBe(event.ChannelMessage.MessageId);
   });
 
-  it('posts the placeholder the ROUTER handed back, rather than composing its own', async () => {
-    // THIS IS THE FALLBACK PATH NOW, not the normal one. Under ADR-025 the turn posts its own
-    // acknowledgment and returns an empty array, so the flow posts only when the turn hands the
-    // message BACK - it had no resolved identity, or its own send failed. The mock returns a
-    // non-empty response, which is exactly that case.
-    //
-    // The property is unchanged and still worth pinning: whatever the flow does post is the TURN'S
-    // text, carrying the turn's marker. Composing one here would mint a second correlation id that
-    // the duplicate-placeholder guard and the processor are not listening for.
+  it('posts NOTHING even when the router hands a message back', async () => {
+    // The flow never speaks. A message the router hands back means the
+    // turn could not post its own acknowledgment; that is recorded on the turn (`recordDispatchFailure`)
+    // and the client re-reads turn state at its deadlines. The flow only logs it, and posts nothing as
+    // any assistant, so it holds no assistant session to post with.
     await handler(flowEvent('@all what is the billing policy?'));
 
-    expect(posted()).toContain(PLACEHOLDER);
+    expect(posted()).toEqual([]);
   });
 
   it('posts NOTHING when the router returns an empty messages array', async () => {
@@ -237,9 +299,17 @@ describe('the channel flow answers @all, at every channel size', () => {
     expect(posted()).toEqual([]);
   });
 
-  it('says something when the router FAILS, instead of going silent', async () => {
+  it('does not go silent when the router FAILS, and does not speak as the assistant either', async () => {
     // The old shape posted the placeholder FIRST, so a failed dispatch stranded a "One moment..." that
-    // never resolved. Nothing is posted before the invoke now, so the failure must speak for itself.
+    // never resolved. Nothing is posted before the invoke now, so the failure must be reported.
+    //
+    // WHAT CHANGED IS WHO REPORTS IT. The flow used to post the notice as the assistant, which put an
+    // infrastructure failure in the transcript under the assistant's name and showed the whole room a
+    // failure that happened to one person. A channel flow releases or denies the sender's message; it
+    // does not author one. So the failure is recorded for that person and their own client renders it.
+    //
+    // NOT SILENT IS STILL THE PROPERTY - it has simply moved from "a message was posted" to "a
+    // failure was recorded". A flow that recorded nothing here would leave somebody waiting forever.
     mockLambdaSend.mockResolvedValue({
       FunctionError: 'Unhandled',
       Payload: Buffer.from(JSON.stringify({ errorMessage: 'boom', errorType: 'Error' })),
@@ -247,12 +317,16 @@ describe('the channel flow answers @all, at every channel size', () => {
 
     await handler(flowEvent('@all what is the billing policy?'));
 
-    const messages = posted();
-    expect(messages).toHaveLength(1);
+    expect(posted()).toEqual([]);
+    expect(mockRecordDispatchFailure).toHaveBeenCalledWith(
+      expect.objectContaining({ reason: 'handoff_failed' }),
+    );
     // Specifically NOT the raw error payload: a handler that threw still returns HTTP 200, so an
-    // unchecked post puts a stack trace in the channel as the user's answer.
-    expect(messages[0]).not.toContain('errorMessage');
-    expect(messages[0]).not.toContain('boom');
+    // unchecked report would carry a stack trace to the person as their answer. A closed set of reason
+    // codes cannot, which is half of why the API sends a code rather than prose.
+    const recorded = JSON.stringify(mockRecordDispatchFailure.mock.calls);
+    expect(recorded).not.toContain('errorMessage');
+    expect(recorded).not.toContain('boom');
   });
 
   it('forwards an attachment, which is the only way one can reach the turn', async () => {
@@ -288,7 +362,16 @@ describe('the router does NOT answer @all, so a 1:1 is not answered twice', () =
   beforeEach(async () => {
     jest.resetModules();
     jest.clearAllMocks();
-    mockSsmSend.mockResolvedValue({ Parameter: { Value: BOT } });
+    // The router dispatches only its own classification's turns (it writes only that routing table), and
+    // these channels are tagged basic.
+    process.env.CLASSIFICATION = 'basic';
+    mockMessagingSend.mockImplementation((cmd: any) => {
+      if (cmd.__type === 'ListTags') return Promise.resolve({ Tags: [{ Key: 'classification', Value: 'basic' }] });
+      return Promise.resolve({ ChannelMessage: { MessageId: 'placeholder-1' }, MessageId: 'placeholder-1' });
+    });
+    // The ASSIGNMENT record's shape: the flow resolves the live occupant of the primary role through
+    // it rather than reading a bare bot ARN from a classification-keyed key.
+    mockSsmSend.mockResolvedValue({ Parameter: { Value: JSON.stringify({ role: 'primary', occupancy: 'live', assistant: 'advisor', botArn: BOT }) } });
     ({ handler: routerHandler } = await import('../../lambda/src/router-agent-handler.js'));
   });
 
@@ -353,10 +436,14 @@ describe('the router does NOT answer @all, so a 1:1 is not answered twice', () =
    * unchanged** - that the flow entry is not silenced, that the text round-trips, that a real turn was
    * dispatched - only where the evidence lives has moved.
    */
-  const postedContent = (): string | undefined => mockMessagingSend.mock.calls
-    .map((c) => c[0])
-    .filter((c) => c?.__type === 'SendMessage')
-    .pop()?.input?.Content;
+  // Read as the client reads it: every platform message is posted percent-encoded.
+  const postedContent = (): string | undefined => {
+    const raw = mockMessagingSend.mock.calls
+      .map((c) => c[0])
+      .filter((c) => c?.__type === 'SendMessage')
+      .pop()?.input?.Content as string | undefined;
+    return raw === undefined ? raw : decodeURIComponent(raw);
+  };
 
   it('does NOT silence a flow handoff whose text still contains @all', async () => {
     // The token SURVIVING matters, and this is the case the exemption exists for. The flow strips the

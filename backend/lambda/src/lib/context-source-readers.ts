@@ -20,7 +20,7 @@ import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
 import { DynamoDBClient, GetItemCommand } from '@aws-sdk/client-dynamodb';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
-import type { PublishedContextSource } from './context-sources-runtime.js';
+import { NO_RECORD, type PublishedContextSource } from './context-sources-runtime.js';
 import {
   ContextSourceAccessError,
   classifyAccessError,
@@ -30,13 +30,13 @@ import {
 /**
  * What a reader knows about the turn.
  *
- * `userSub` is why `availability` exists: a per-user source cannot resolve without it, and at
+ * `personId` is why `availability` exists: a per-user source cannot resolve without it, and at
  * `WelcomeIntent` it is not yet reliably known. A reader must never invent a fallback identity - it
  * returns null and the section is omitted.
  */
 export interface ReaderContext {
   classification: string;
-  userSub?: string;
+  personId?: string;
   channelArn?: string;
 }
 
@@ -57,7 +57,7 @@ function sourceKeyFor(field: string, from: string | undefined, isS3: boolean): s
  * Walk a dotted path into a DynamoDB AttributeValue tree: `facts.company`.
  *
  * Needed because real records nest. The built-in user profile store writes
- * `{ userSub, onboardedAt, facts: { company, role }, updatedAt }`, so a catalog that could only name
+ * `{ personId, onboardedAt, facts: { company, role }, updatedAt }`, so a catalog that could only name
  * TOP-LEVEL attributes could not read a single onboarding answer - the shipped `user-profile` entry
  * declared `company` and `role`, found neither, and resolved to nothing on every turn for every user.
  *
@@ -149,12 +149,12 @@ async function rethrowAccessFailures<T>(
  * instead of an unpredictable one.
  */
 export function createSourceReader(ctx: ReaderContext, clients: ReaderClients) {
-  return async (entry: PublishedContextSource): Promise<Record<string, string> | null> => {
+  return async (entry: PublishedContextSource): Promise<Record<string, string> | null | typeof NO_RECORD> => {
     switch (entry.type) {
       case 's3-prefix': {
         // Bucket and prefix come from the PUBLISHED entry, so the read lands exactly where the IAM
         // grant was scoped. This previously hardcoded `context/{classification}/` because the catalog
-        // stripped `prefix` before publication - which meant the authorised resource and the read
+        // stripped `prefix` before publication - which meant the authorized resource and the read
         // resource could name different locations, and a per-team prefix was granted but never read.
         requireReadable(clients.s3, entry, 'no S3 client is wired into the processor');
         requireReadable(entry.locator, entry, 'the catalog entry publishes no bucket locator');
@@ -201,20 +201,24 @@ export function createSourceReader(ctx: ReaderContext, clients: ReaderClients) {
       }
 
       case 'dynamodb-table': {
-        // Per-user by construction. No userSub means the caller is not yet identified, which is
+        // Per-user by construction. No personId means the caller is not yet identified, which is
         // exactly what `availability: identity-settled` is meant to have prevented - so this is a
-        // second line of defence, not the primary one. It is `absent` rather than `error`: at a call
+        // second line of defense, not the primary one. It is `absent` rather than `error`: at a call
         // site with no settled identity there is genuinely nothing to read, and alarming on it would
         // train an operator to ignore the metric.
         requireReadable(clients.ddb, entry, 'no DynamoDB client is wired into the processor');
         requireReadable(entry.locator, entry, 'the catalog entry publishes no table locator');
-        if (!ctx.userSub) return null;
+        if (!ctx.personId) return null;
         const res = await rethrowAccessFailures(entry, `dynamodb:${entry.locator}`, () =>
           clients.ddb!.send(new GetItemCommand({
             TableName: entry.locator,
-            Key: { userSub: { S: ctx.userSub! } },
+            Key: { personId: { S: ctx.personId! } },
           })));
-        if (!res.Item) return null;
+        // No item for this key: the read ran and found no record. Reported as such, and the resolver
+        // decides from the entry's declared `perPerson` whether that is a skip or a failure. A record
+        // that carries none of the declared fields is the same answer: the person has told the platform
+        // nothing this source reads (an onboarding marker with no facts), so it is no record of them.
+        if (!res.Item) return NO_RECORD;
         const values: Record<string, string> = {};
         for (const [field, spec] of Object.entries(entry.fields)) {
           // `from` may be a dotted path into a nested map (`facts.company`), because real records
@@ -223,7 +227,7 @@ export function createSourceReader(ctx: ReaderContext, clients: ReaderClients) {
           if (attr?.S) values[field] = attr.S;
           else if (attr?.N) values[field] = attr.N;
         }
-        return Object.keys(values).length ? values : null;
+        return Object.keys(values).length ? values : NO_RECORD;
       }
 
       case 'ssm-parameter': {
@@ -247,7 +251,7 @@ export function createSourceReader(ctx: ReaderContext, clients: ReaderClients) {
             // grant resource and is stripped before publication, so the invoke lands on exactly the
             // function `lambda:InvokeFunction` was scoped to.
             FunctionName: entry.locator,
-            Payload: Buffer.from(JSON.stringify({ userSub: ctx.userSub, classification: ctx.classification })),
+            Payload: Buffer.from(JSON.stringify({ personId: ctx.personId, classification: ctx.classification })),
           })));
         if (!res.Payload) return null;
         const parsed = JSON.parse(Buffer.from(res.Payload).toString('utf8')) as Record<string, unknown>;

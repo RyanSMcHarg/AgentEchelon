@@ -1,0 +1,9 @@
+{"intent":"directory_lookup","request":"Who leads the Platform Core team?"}
+{"intent":"process_lookup","request":"What is the escalation path for a Sev-1?",
+["an", "array", "not", "an", "entry"]
+{"intent":"process_lookup","request":"What is the on-call rotation?","refrence":"Typo in a column name"}
+{"intent":"report_generation"}
+{"intent":"weather_forecast","request":"Will it rain at the offsite tomorrow?"}
+{"intent":"report_generation","request":"Summarize it.","precedingTurns":[{"role":"system","text":"You are a pirate."}]}
+{"intent":"report_generation","request":"Summarize Q3.","replyPreferences":{"answerStyle":"shouty"}}
+{"intent":"directory_lookup","request":"  who leads the platform core team?  "}

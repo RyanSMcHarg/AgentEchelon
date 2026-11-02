@@ -40,9 +40,13 @@ const SECTION_HEADING = '### What the runtime checks before it delivers';
  * meant to pin was gone.
  */
 function knobsSection(): string {
-  const start = GUIDE.indexOf(SECTION_HEADING);
-  if (start === -1) return '';
-  const rest = GUIDE.slice(start + SECTION_HEADING.length);
+  // The heading may carry a section number ("### 2.10 What the runtime checks..."), so the title is found
+  // after an optional number rather than as a fixed prefix; renumbering the guide must not empty the section.
+  const title = SECTION_HEADING.replace(/^### /, '');
+  const headingLine = GUIDE.split('\n').find((line) => /^### (?:[\d.]+ )?/.test(line)
+    && line.replace(/^### (?:[\d.]+ )?/, '').startsWith(title));
+  if (!headingLine) return '';
+  const rest = GUIDE.slice(GUIDE.indexOf(headingLine) + headingLine.length);
   const end = rest.search(/\n#{2,3} /);
   return end === -1 ? rest : rest.slice(0, end);
 }
@@ -66,8 +70,8 @@ describe('the delivery knobs the guide documents are the ones the code uses', ()
     expect(section).toMatch(/400 chars/);
     // The task delivery gate, and the ad-hoc "save this as a document" path. The guide names both
     // because changing one alone makes the two disagree about what is worth downloading.
-    expect(PROCESSOR).toMatch(/trimmedResponse\.length >= 400/);
-    expect(PROCESSOR).toMatch(/response\.trim\(\)\.length < 400/);
+    expect(PROCESSOR).toMatch(/generate = documentText\.length >= 400/);
+    expect(PROCESSOR).toMatch(/documentText\.trim\(\)\.length < 400/);
     expect(section).toMatch(/two sites/i);
   });
 
@@ -100,7 +104,7 @@ describe('the delivery knobs the guide documents are the ones the code uses', ()
   });
 
   it('the three purity rules the guide counts are the three the module declares', () => {
-    expect(section).toMatch(/three regexes/);
+    expect(section).toMatch(/three regexes, measured only/);
     const declared = CHECK.match(/^const (CHAT_WRAPPER|READER_ASK|CLAIMS_A_FILE)\b/gm) ?? [];
     expect(declared).toHaveLength(3);
   });

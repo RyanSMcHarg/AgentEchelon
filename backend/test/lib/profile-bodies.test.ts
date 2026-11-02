@@ -29,46 +29,46 @@ beforeEach(() => {
 
 describe('key shape', () => {
   it('is content-addressed by configId, so two versions never collide', () => {
-    const a = bodyKey('premium', 'abc123', 'persona');
-    const b = bodyKey('premium', 'def456', 'persona');
+    const a = bodyKey('advisor', 'abc123', 'persona');
+    const b = bodyKey('advisor', 'def456', 'persona');
     expect(a).not.toBe(b);
     expect(a).toContain('abc123');
-    expect(a.startsWith('profiles/premium/')).toBe(true);
+    expect(a.startsWith('profiles/advisor/')).toBe(true);
   });
 
   it('separates fields within a version', () => {
-    expect(bodyKey('premium', 'abc123', 'persona'))
-      .not.toBe(bodyKey('premium', 'abc123', 'intentPack'));
+    expect(bodyKey('advisor', 'abc123', 'persona'))
+      .not.toBe(bodyKey('advisor', 'abc123', 'intentPack'));
   });
 });
 
 describe('putBody', () => {
   it('writes to the content-addressed key and returns a pointer carrying the configId', async () => {
-    const ref = await putBody('premium', 'abc123', 'persona', 'You are…', { s3: fakeS3(), bucket: 'b' });
-    expect(ref).toEqual({ key: 'profiles/premium/abc123/persona', configId: 'abc123' });
+    const ref = await putBody('advisor', 'abc123', 'persona', 'You are…', { s3: fakeS3(), bucket: 'b' });
+    expect(ref).toEqual({ key: 'profiles/advisor/abc123/persona', configId: 'abc123' });
     expect(sent[0].input.Bucket).toBe('b');
-    expect(sent[0].input.Key).toBe('profiles/premium/abc123/persona');
+    expect(sent[0].input.Key).toBe('profiles/advisor/abc123/persona');
     expect(sent[0].input.Body).toBe('You are…');
   });
 
   it('THROWS when no bucket is configured rather than silently keeping the body inline', async () => {
     // The silent-skip version of this would re-impose the 4096 definition cap, and the failure would
     // surface much later as an unstorable definition rather than here.
-    await expect(putBody('premium', 'abc123', 'persona', 'x', { s3: fakeS3() }))
+    await expect(putBody('advisor', 'abc123', 'persona', 'x', { s3: fakeS3() }))
       .rejects.toThrow(/no body bucket configured/i);
   });
 
   it('is idempotent for the same version: same key, same bytes', async () => {
     const s3 = fakeS3();
-    const a = await putBody('premium', 'abc123', 'persona', 'same', { s3, bucket: 'b' });
-    const b = await putBody('premium', 'abc123', 'persona', 'same', { s3, bucket: 'b' });
+    const a = await putBody('advisor', 'abc123', 'persona', 'same', { s3, bucket: 'b' });
+    const b = await putBody('advisor', 'abc123', 'persona', 'same', { s3, bucket: 'b' });
     expect(a).toEqual(b);
     expect(sent[0].input.Key).toBe(sent[1].input.Key);
   });
 });
 
 describe('getBody', () => {
-  const ref: ProfileBodyRef = { key: 'profiles/premium/abc123/persona', configId: 'abc123' };
+  const ref: ProfileBodyRef = { key: 'profiles/advisor/abc123/persona', configId: 'abc123' };
 
   it('returns the stored body', async () => {
     const s3 = fakeS3(() => ({ Body: { transformToString: async () => 'You are…' } }));

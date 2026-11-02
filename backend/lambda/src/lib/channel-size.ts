@@ -40,6 +40,8 @@
  * ---------------------------------------------------------------------------------------------
  */
 
+import type { BypassMember } from './flow-bypass.js';
+import { isAccessDenial } from './access-denial.js';
 import {
   ChimeSDKMessagingClient,
   ListChannelMembershipsCommand,
@@ -58,12 +60,46 @@ import {
  */
 export const ONE_TO_ONE_MEMBER_COUNT = 2;
 
+/**
+ * How many pages of membership to read. At 50 per page this is 500 members, which is past any
+ * conversation this product is shaped for, and it bounds a read that sits on a request path.
+ */
+const MEMBERSHIP_PAGE_LIMIT = 10;
+
 export interface ChannelSize {
   memberCount: number;
+  /**
+   * The roster this count was taken from, for resolving an `@<member>` token (ADR-034).
+   *
+   * CARRIED RATHER THAN RE-READ. The membership list is already fetched to count it and was
+   * previously discarded, so both callers - the flow deciding whether to act, the handler deciding
+   * whether to stand down - get the names for nothing. A second read would also be a second ANSWER:
+   * two reads moments apart can disagree about who is in the room, and the two sides would then
+   * resolve the same mention differently, which is the drift `flowOwnsTheTurn` exists to prevent.
+   *
+   * EMPTY WHEN THE COUNT COULD NOT BE READ, alongside `unknown`. A mention then resolves to nobody
+   * and the flow does not claim the turn, which is the same direction `isOneToOne: false` fails in:
+   * the ordinary Lex path still answers.
+   */
+  members: BypassMember[];
   /** True when the flow must stand aside and let the Lex entry answer. */
   isOneToOne: boolean;
   /** True when the count could not be read. See `resolveChannelSize`. */
   unknown: boolean;
+  /**
+   * True when the read was REFUSED rather than merely failing: the classification boundary spoke.
+   *
+   * SEPARATE FROM `unknown` BECAUSE THEY POINT OPPOSITE WAYS. `unknown` means "carry on with the
+   * group shape", which is this module's deliberate fail-toward-answering choice and is right for a
+   * throttle. A refusal is not a degraded read of a channel this assistant may act in; it is AWS
+   * saying the assistant may not act in this channel at all. Continuing then is not resilience, it
+   * is the boundary being enforced and ignored (ADR-045 decision 1).
+   *
+   * Every refusal is also `unknown: true`, so a caller that has not been taught about `refused`
+   * keeps its previous behavior rather than silently reading a refusal as a successful count of
+   * zero. Callers that must stop check this field.
+   */
+  refused: boolean;
 }
 
 /**
@@ -71,11 +107,20 @@ export interface ChannelSize {
  *
  * FAILS TOWARD THE GROUP SHAPE, and the choice is deliberate. If the count cannot be read we report
  * `isOneToOne: false`, which means the flow keeps the bypass and the router keeps standing down - in
- * other words, EXACTLY the behaviour that shipped before this branch existed. An unreadable count
+ * other words, EXACTLY the behavior that shipped before this branch existed. An unreadable count
  * therefore degrades to the previous design rather than to silence, and a turn is always answered by
  * someone. Failing the other way would risk a conversation where nothing replies at all, which is the
  * worse outcome of the two: a duplicate is visible and annoying, an unanswered turn looks like the
  * product is broken.
+ *
+ * WITH ONE EXCEPTION, AND IT IS NOT A DEGRADATION (ADR-045 decision 1). The paragraph above weighs a
+ * duplicate against a silence, and both of those assume the assistant is entitled to answer this
+ * channel at all. When the read is REFUSED it is not. `refused: true` is then set alongside
+ * `unknown`, and a caller that honors it ends the turn: silence is the correct outcome, not the
+ * lesser evil. The trade this makes is stated once so it is not rediscovered as a bug - an assistant
+ * refused by the boundary says nothing, which to a person looks the same as the flow-failure silence
+ * that has no monitoring answer yet. The SecurityEvent and the count are what
+ * distinguish them to an operator.
  */
 export async function resolveChannelSize(
   client: ChimeSDKMessagingClient,
@@ -101,27 +146,70 @@ export async function resolveChannelSize(
   // about, and both callers run this same code against that same source. It is paid only on a turn
   // carrying a bypass token, and since `/battle` does not consult size at all (the flow owns it at
   // every size), that means `@all` turns alone.
+  // PAGINATED, WHICH IT DID NOT USED TO BE. One page answered the only question this module asked -
+  // "is this channel exactly two members?" - because a first page of 50 settles that for every channel
+  // that exists. It does NOT settle WHO is in the room. Stopping at one page would make the 51st
+  // member unmentionable: their name resolves to nobody, the flow does not claim the turn, and
+  // nothing says so. Bounded below rather than unbounded, because this runs on a request path.
+  const members: BypassMember[] = [];
+  let memberCount = 0;
   try {
-    const resp = await client.send(
-      new ListChannelMembershipsCommand({
-        ChannelArn: channelArn,
-        ChimeBearer: bearerArn,
-        MaxResults: 50,
-      }),
-    );
-    const memberCount = (resp.ChannelMemberships || []).length;
+    let nextToken: string | undefined;
+    for (let page = 0; page < MEMBERSHIP_PAGE_LIMIT; page++) {
+      const resp = await client.send(
+        new ListChannelMembershipsCommand({
+          ChannelArn: channelArn,
+          ChimeBearer: bearerArn,
+          MaxResults: 50,
+          ...(nextToken ? { NextToken: nextToken } : {}),
+        }),
+      );
+      for (const m of resp.ChannelMemberships || []) {
+        memberCount++;
+        const arn = m.Member?.Arn;
+        const name = m.Member?.Name;
+        if (arn && name) members.push({ arn, name, isBot: arn.includes('/bot/') });
+      }
+      nextToken = resp.NextToken;
+      if (!nextToken) break;
+    }
+    if (nextToken) {
+      // A channel larger than the bound. The count is still right for the 1:1 branch (it is far past
+      // it), and the roster is a prefix - so a mention of somebody on a later page resolves to nobody.
+      // Said out loud rather than discovered by a person being ignored in front of the room.
+      console.warn(
+        '[channel-size] roster truncated at',
+        members.length,
+        'members; an @ mention of a later member will not resolve',
+      );
+    }
     // Zero is not a real answer: a channel always has at least its creator. Treat it as unreadable
     // rather than as "smaller than a 1:1", which would flip the branch on an empty response.
     if (memberCount === 0) {
-      return { memberCount: 0, isOneToOne: false, unknown: true };
+      return { memberCount: 0, members: [], isOneToOne: false, unknown: true, refused: false };
     }
     return {
       memberCount,
+      members,
       isOneToOne: memberCount <= ONE_TO_ONE_MEMBER_COUNT,
       unknown: false,
+      refused: false,
     };
   } catch (err) {
+    // A REFUSAL IS NOT A FAILED READ. This is the first channel-scoped action most turns take, so for
+    // an assistant in a room of another classification it is where IAM's exactly-own grant fires
+    // (ADR-042). Measured live on 2026-09-17: the deployed premium router is implicitDeny here for a
+    // basic-tagged channel and allowed for a premium one. Before ADR-045 this catch reported that
+    // denial as "treat the channel as a group" and the turn ran to completion.
+    if (isAccessDenial(err)) {
+      console.error(
+        '[channel-size] ListChannelMemberships REFUSED; the channel classification boundary denied '
+        + 'this assistant. The caller must end the turn rather than degrade.',
+        err,
+      );
+      return { memberCount: 0, members: [], isOneToOne: false, unknown: true, refused: true };
+    }
     console.warn('[channel-size] ListChannelMemberships failed; treating the channel as a group', err);
-    return { memberCount: 0, isOneToOne: false, unknown: true };
+    return { memberCount: 0, members: [], isOneToOne: false, unknown: true, refused: false };
   }
 }

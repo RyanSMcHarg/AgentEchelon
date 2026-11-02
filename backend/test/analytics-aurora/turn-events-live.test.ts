@@ -10,6 +10,7 @@
  * exercised, and this one decides whether a turn is closed at all.
  */
 import { ledgerRowsFor, kindForPhase, declaredTurnId } from '../../lambda/src/analytics-aurora/turn-events-live';
+import { edgeContext } from '../helpers/edge-context';
 
 const CHANNEL = 'arn:aws:chime:us-east-1:111:app-instance/i/channel/c1';
 const BOT = 'arn:aws:chime:us-east-1:111:app-instance/i/bot/premium';
@@ -163,7 +164,7 @@ describe('the ledger has readers', () => {
 
   const post = (body: unknown) => ({
     httpMethod: 'POST', path: '/query', body: JSON.stringify(body),
-    requestContext: { authorizer: { claims: { sub: 'admin', 'cognito:groups': 'admins' } } },
+    requestContext: { authorizer: edgeContext({ claims: { sub: 'admin', 'cognito:groups': 'admins' } }) },
   } as any);
 
   beforeEach(() => { mockDbQuery.mockReset(); mockDbQuery.mockResolvedValue({ rows: [] }); });
@@ -192,5 +193,62 @@ describe('the ledger has readers', () => {
     // flatter the turn numbers or damn the workflow.
     expect(body.columns).toEqual(expect.arrayContaining(['resolve_ms', 'agent_ms', 'is_resolved']));
     expect(body.columns).not.toContain('avg_ttff_ms');
+  });
+});
+
+describe('the first notice of a queue episode is recorded as a notice', () => {
+  /**
+   * THE SHORTEST QUEUE EPISODE WAS THE ONE THE MEASUREMENT COULD NOT SEE.
+   *
+   * The deferral notice is one message updated in place, so this file read it as a placeholder on the
+   * way in and as a notice only on the way out. But the FIRST notice of every episode is a fresh send:
+   * `turn-queue-notice.ts` posts one when there is no `noticeId` to update, and `turn-lock.ts` clears
+   * `noticeId` on each drain, so every episode starts without one.
+   *
+   * A queue that formed and cleared with a single message therefore produced exactly one notice,
+   * created and never updated, and `v_queue_acknowledgement` had no row for it at all - which reads
+   * as the acknowledgement mechanism never having run rather than as a gap.
+   */
+  const notice = (over: Record<string, unknown> = {}) => rec({
+    resp_phase: 'notice',
+    // A notice carries no correlation marker: it answers nobody, which is the whole point of it.
+    content: 'Two messages are waiting. I will get to them in order.',
+    acknowledges: 'm-user-2',
+    queue_status: 'queued',
+    ...over,
+  });
+
+  it('records a CREATE notice as notice_posted, not as a placeholder', () => {
+    const [row] = ledgerRowsFor([notice()]);
+    expect(row.kind).toBe('notice_posted');
+    expect(row.acknowledges).toBe('m-user-2');
+    expect(row.queue_status).toBe('queued');
+  });
+
+  it('leaves turn_id null, because a notice answers nobody', () => {
+    // The notice belongs to the queue rather than to a turn: the person it acknowledges is waiting on
+    // work that is not theirs. Inventing a turn id here would put a deferral inside somebody else's
+    // measured turn.
+    const [row] = ledgerRowsFor([notice()]);
+    expect(row.turn_id).toBeNull();
+    expect(row.turn_id_source).toBeNull();
+  });
+
+  it('still records an UPDATE notice the same way, so one episode is one kind throughout', () => {
+    const [row] = ledgerRowsFor([notice({
+      event_type: 'UPDATE_CHANNEL_MESSAGE',
+      message_id: 'm-1-UPD',
+      last_updated_at: '2026-08-15T00:00:09.000Z',
+      queue_status: 'settled',
+    })]);
+    expect(row.kind).toBe('notice_posted');
+    expect(row.queue_status).toBe('settled');
+  });
+
+  it('does not turn an ordinary placeholder into a notice', () => {
+    // Non-vacuity: a rule that matched every bot CREATE would pass the assertions above and destroy
+    // the placeholder population.
+    const [row] = ledgerRowsFor([rec()]);
+    expect(row.kind).toBe('placeholder_posted');
   });
 });

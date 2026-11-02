@@ -2,13 +2,12 @@
  * Company-context retrieval (shared)
  *
  * Classification-scoped company/product/pricing/FAQ/financial document retrieval from
- * the attachments bucket under `context/{basic,standard,premium}/*`.
+ * the attachments bucket under `context/{classification}/*`, one prefix per declared classification.
  *
  * **Defense-in-depth is enforced at IAM, not here.** The caller's execution
- * role grants `s3:GetObject` only for the prefixes its classification may read (basic →
- * context/basic/*; standard → +standard; premium → all three). This module
- * walks every known prefix and returns whatever it could read — an
- * AccessDenied on a higher classification's prefix is the boundary working, and that
+ * role grants `s3:GetObject` only for the prefixes its classification's `grants` set names. This module
+ * walks every prefix the classification is granted and returns whatever it could read; an
+ * AccessDenied on a prefix outside the caller's set is the boundary working, and that
  * document is silently omitted.
  *
  * Used by both the Bedrock-Agent action-group Lambda
@@ -22,26 +21,44 @@ import {
   ListObjectsV2Command,
   GetObjectCommand,
 } from '@aws-sdk/client-s3';
-import { defaultProfileRegistry } from '../../../lib/profile-registry.js';
+import { defaultProfileRegistry } from '../../../lib/profile-registry';
+import type { AwsCredentialIdentity } from '@aws-sdk/types';
+import { sessionClient } from './assistant-session.js';
 
-const s3 = new S3Client({});
+const s3 = sessionClient(S3Client, {});
+
+/** An S3 client on an assistant's credentials, for a read the assistant is granted and the shared role is not. */
+export function roleContextS3Client(credentials: AwsCredentialIdentity): S3Client {
+  return new S3Client({ credentials });
+}
 
 /**
  * The `context/{classification}/` prefixes a caller may read, derived from the SAME
- * `scopeAtOrBelow` resolver the IAM statement generator consumes (registry.contextPrefixesAtOrBelow)
+ * `grantsFor` resolver the IAM statement generator consumes (registry.contextPrefixesGranted)
  * — NOT a hardcoded classification list. That closes the drift the old `CLASSIFICATION_PREFIXES`
- * const had: a renamed/added classification now moves IAM and retrieval together. Ordered
- * highest-classification-first so, if the total-chars cap is hit, the caller's own documents survive.
- * IAM still enforces every GetObject; this only skips prefixes the caller could not read anyway.
+ * const had: a renamed/added classification now moves IAM and retrieval together. Taken in REVERSE of
+ * the declared order, which on a prefix-shaped deployment puts the caller's own classification first,
+ * so its documents survive the total-chars cap. IAM still enforces every GetObject; this only skips
+ * prefixes the caller could not read anyway.
  */
 function contextPrefixesFor(classification: string): string[] {
-  return defaultProfileRegistry.contextPrefixesAtOrBelow(classification, { highestFirst: true });
+  return defaultProfileRegistry.contextPrefixesGranted(classification, { reversed: true });
 }
 // Platform self-knowledge (about the AgentEchelon product itself) lives OUTSIDE
 // the company `context/` tree so a company/business question never loads it.
 // Retrieved separately via loadPlatformInfo (exposed as the load_platform_info
 // tool) only when the user asks about the platform.
 export const PLATFORM_PREFIX = 'platform-knowledge/';
+
+/**
+ * THE PLATFORM PREFIXES A CLASSIFICATION READS: `platform-knowledge/{c}/` for each classification it grants.
+ * Platform documentation is internal material; the external classification is granted a
+ * public overview only. IAM enforces the same set on the role and the vended session, so this only avoids
+ * asking for what would be refused.
+ */
+export function platformPrefixesFor(classification: string): string[] {
+  return [...defaultProfileRegistry.grantsFor(classification)].reverse().map((c) => `${PLATFORM_PREFIX}${c}/`);
+}
 // Per-doc cap so one huge file can't blow the model's context window.
 const MAX_DOC_CHARS = 8_000;
 // Total cap so the invoke budget stays bounded.
@@ -49,7 +66,8 @@ const MAX_TOTAL_CHARS = 24_000;
 
 export interface CompanyDoc {
   source: string;
-  classification: 'basic' | 'standard' | 'premium' | 'unknown';
+  /** The declared classification whose prefix holds the document (`classificationFromKey`). */
+  classification: string;
   content: string;
   truncated: boolean;
 }
@@ -60,11 +78,19 @@ export interface CompanyContextResult {
   documents: CompanyDoc[];
 }
 
-function classificationFromKey(key: string): CompanyDoc['classification'] {
-  if (key.startsWith('context/basic/')) return 'basic';
-  if (key.startsWith('context/standard/')) return 'standard';
-  if (key.startsWith('context/premium/')) return 'premium';
-  return 'unknown';
+/**
+ * THE CLASSIFICATION A DOCUMENT'S KEY FILES IT UNDER: the segment after `context/` or `platform-knowledge/`,
+ * when it names a classification this deployment declares (an alias reads as the classification it names).
+ * `undefined` for any other key, and such a document is not loaded: content under a prefix no declared
+ * classification names has no classification to be read at.
+ */
+export function classificationFromKey(key: string): string | undefined {
+  for (const root of ['context/', PLATFORM_PREFIX]) {
+    if (!key.startsWith(root)) continue;
+    const [segment, ...rest] = key.slice(root.length).split('/');
+    return segment && rest.join('/') ? defaultProfileRegistry.resolveClassification(segment) : undefined;
+  }
+  return undefined;
 }
 
 function isAccessDenied(err: unknown): boolean {
@@ -72,11 +98,11 @@ function isAccessDenied(err: unknown): boolean {
   return name === 'AccessDenied' || name === 'AccessDeniedException';
 }
 
-async function listAccessibleKeys(bucket: string, prefixes: string[]): Promise<string[]> {
+async function listAccessibleKeys(bucket: string, prefixes: string[], client: S3Client = s3): Promise<string[]> {
   const keys: string[] = [];
   for (const Prefix of prefixes) {
     try {
-      const resp = await s3.send(new ListObjectsV2Command({ Bucket: bucket, Prefix }));
+      const resp = await client.send(new ListObjectsV2Command({ Bucket: bucket, Prefix }));
       for (const obj of resp.Contents || []) {
         // Skip `_`-prefixed files (e.g. `_digest.json`, the per-classification context
         // digest). They are metadata about the corpus, not corpus documents, so
@@ -96,16 +122,21 @@ async function listAccessibleKeys(bucket: string, prefixes: string[]): Promise<s
   return keys;
 }
 
-async function fetchDoc(bucket: string, key: string): Promise<CompanyDoc | null> {
+async function fetchDoc(bucket: string, key: string, client: S3Client = s3): Promise<CompanyDoc | null> {
   try {
-    const resp = await s3.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
+    const resp = await client.send(new GetObjectCommand({ Bucket: bucket, Key: key }));
     const body = await resp.Body?.transformToString('utf-8');
     if (!body) return null;
     const truncated = body.length > MAX_DOC_CHARS;
     const content = truncated
       ? body.slice(0, MAX_DOC_CHARS) + '\n[truncated — document exceeds per-doc cap]'
       : body;
-    return { source: key, classification: classificationFromKey(key), content, truncated };
+    const classification = classificationFromKey(key);
+    if (!classification) {
+      console.warn(`[company-context] ${key} is under no declared classification's prefix; not loaded`);
+      return null;
+    }
+    return { source: key, classification, content, truncated };
   } catch (err: unknown) {
     if (isAccessDenied(err)) return null; // boundary in action
     console.warn(`[company-context] GetObject failed for ${key}:`, err);
@@ -123,8 +154,9 @@ async function loadDocsFromPrefixes(
   prefixes: string[],
   logLabel: string,
   docFilter?: Set<string>,
+  client: S3Client = s3,
 ): Promise<CompanyContextResult> {
-  const allKeys = await listAccessibleKeys(bucket, prefixes);
+  const allKeys = await listAccessibleKeys(bucket, prefixes, client);
   // SELECTIVE load (GUIDE-ASSISTANT-CONTEXT): when the model named the document(s) it needs (by filename,
   // from the digest), fetch ONLY those instead of the whole corpus — the cost win. An empty/unmatched
   // filter falls through to loading everything (recall-safe: a broad question still gets the full set).
@@ -139,7 +171,7 @@ async function loadDocsFromPrefixes(
       console.log(`[${logLabel}] total-chars cap reached at ${docs.length} docs`);
       break;
     }
-    const doc = await fetchDoc(bucket, key);
+    const doc = await fetchDoc(bucket, key, client);
     if (!doc) continue;
     docs.push(doc);
     totalChars += doc.content.length;
@@ -175,7 +207,16 @@ export function __clearCompanyContextCache(): void {
 export async function loadCompanyContext(
   bucket: string,
   classification: string,
-  opts?: { documents?: string[] },
+  opts?: {
+    documents?: string[];
+    /**
+     * THE ROLE'S OWN PREFIXES and THE ASSISTANT'S CREDENTIALS (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION Phase 1b).
+     * The live processor always passes both: the shared Lambda role holds no `context/` grant, so a read
+     * without the assistant's credentials is refused by IAM. Absent, the classification's prefixes on the ambient client.
+     */
+    prefixes?: string[];
+    credentials?: AwsCredentialIdentity;
+  },
 ): Promise<CompanyContextResult> {
   // The model names the specific documents it needs (filenames from the digest). Only those are fetched —
   // scoping ingestion to the task instead of dumping every doc each turn. No selection ⇒ load-all (bounded).
@@ -183,10 +224,14 @@ export async function loadCompanyContext(
     ? new Set(opts.documents.map((d) => d.split('/').pop() || d))
     : undefined;
   // Cache per (bucket, classification, doc set): different classifications resolve different prefix sets.
-  const cacheKey = `${bucket}::${classification}::${docFilter ? [...docFilter].sort().join(',') : 'ALL'}`;
+  const prefixes = opts?.prefixes ?? contextPrefixesFor(classification);
+  // KEYED ON THE PREFIX SET, not the classification: two roles of one classification read different
+  // context, and a cache keyed on the classification would serve one role's documents to the other.
+  const cacheKey = `${bucket}::${prefixes.join('|')}::${docFilter ? [...docFilter].sort().join(',') : 'ALL'}`;
   const cached = companyContextCache.get(cacheKey);
   if (cached && Date.now() - cached.at < COMPANY_CONTEXT_CACHE_TTL_MS) return cached.result;
-  const result = await loadDocsFromPrefixes(bucket, contextPrefixesFor(classification), 'company-context', docFilter);
+  const client = opts?.credentials ? roleContextS3Client(opts.credentials) : s3;
+  const result = await loadDocsFromPrefixes(bucket, prefixes, 'company-context', docFilter, client);
   companyContextCache.set(cacheKey, { result, at: Date.now() });
   return result;
 }
@@ -197,8 +242,13 @@ export async function loadCompanyContext(
  * `load_platform_info` tool and called ONLY when the user asks about the
  * platform itself, not for company/business questions.
  */
-export async function loadPlatformInfo(bucket: string): Promise<CompanyContextResult> {
-  return loadDocsFromPrefixes(bucket, [PLATFORM_PREFIX], 'platform-info');
+export async function loadPlatformInfo(
+  bucket: string,
+  classification: string,
+  opts?: { credentials?: AwsCredentialIdentity },
+): Promise<CompanyContextResult> {
+  const client = opts?.credentials ? roleContextS3Client(opts.credentials) : s3;
+  return loadDocsFromPrefixes(bucket, platformPrefixesFor(classification), 'platform-info', undefined, client);
 }
 
 // ---------------------------------------------------------------------------
@@ -208,7 +258,7 @@ export async function loadPlatformInfo(bucket: string): Promise<CompanyContextRe
 // document (via load_company_context) or rely on the deterministic router
 // retrieval, rather than guessing or dumping the whole corpus. The digest is
 // precomputed at seed/ingestion time and stored at `context/{classification}/_digest.json`
-// (cumulative: premium includes standard + basic); the caller reads only its own
+// (cumulative: it lists every document the classification's grants reach); the caller reads only its own
 // classification's file, so the IAM prefix boundary scopes the digest exactly like the
 // documents it describes.
 // ---------------------------------------------------------------------------
@@ -222,20 +272,51 @@ export interface DigestEntry {
   title: string;
   /** One-line description of what the document contains. */
   description: string;
-  /** The classification that owns the document (basic|standard|premium). */
-  classification: 'basic' | 'standard' | 'premium';
+  /** The declared classification that owns the document. */
+  classification: string;
 }
 
 /** Warm-container cache: the digest is static per deployment, so read it once
  *  per classification and reuse it, rather than re-fetching from S3 every turn. */
 const digestCache = new Map<string, DigestEntry[]>();
+/** The role-scoped digests, keyed on the prefix set (see `loadContextDigest`). */
+const roleDigestCache = new Map<string, DigestEntry[]>();
 
 /** Load the caller classification's context digest (`context/{classification}/_digest.json`).
  *  Returns [] if none is present (older seed, or no company docs). Cached warm. */
 export async function loadContextDigest(
   bucket: string,
-  classification: 'basic' | 'standard' | 'premium',
+  classification: string,
+  opts?: { prefixes?: string[]; credentials?: AwsCredentialIdentity },
 ): Promise<DigestEntry[]> {
+  // A ROLE'S DIGEST is the union of the digests under its own prefixes, read on its assistant's credentials. Each
+  // classification's digest lists only what that classification may read, so the union lists exactly the
+  // documents the role may read and none it may not (a prefix outside the role's set never reaches its digest).
+  if (opts?.prefixes) {
+    const key = `${bucket}::${opts.prefixes.join('|')}`;
+    const hit = roleDigestCache.get(key);
+    if (hit) return hit;
+    const client = opts.credentials ? roleContextS3Client(opts.credentials) : s3;
+    const seen = new Set<string>();
+    const union: DigestEntry[] = [];
+    for (const prefix of opts.prefixes) {
+      try {
+        const resp = await client.send(new GetObjectCommand({ Bucket: bucket, Key: `${prefix}_digest.json` }));
+        const body = await resp.Body?.transformToString('utf-8');
+        const entries = body ? (JSON.parse(body) as DigestEntry[]) : [];
+        for (const e of Array.isArray(entries) ? entries : []) {
+          const id = e.file || e.title;
+          if (!seen.has(id)) { seen.add(id); union.push(e); }
+        }
+      } catch (err: unknown) {
+        if (!isAccessDenied(err) && (err as { name?: string }).name !== 'NoSuchKey') {
+          console.warn(`[company-context] digest load failed for ${prefix}_digest.json:`, err);
+        }
+      }
+    }
+    roleDigestCache.set(key, union);
+    return union;
+  }
   const cached = digestCache.get(classification);
   if (cached) return cached;
   const key = `context/${classification}/_digest.json`;

@@ -20,6 +20,32 @@ const mockMessagingSend = jest.fn();
 const mockLambdaSend = jest.fn();
 const mockSsmSend = jest.fn();
 
+// THE ASSISTANT SESSION (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION, Phase 1b). Every message this code posts goes out as an assistant on a session the
+// vend mints from a recorded routing decision. Those are unit-tested on their own
+// (`a-turn-acts-as-the-assistant-it-was-routed-to.test.ts`); here the decision is recorded and the
+// session minted without AWS, and the clients stay the mocked ones.
+// The abuse gate admits: this file is not about the gate, which fails closed with no control table
+// (`abuse-controls.test.ts` pins that) and would refuse every turn here before the behavior under test.
+jest.mock('../../lambda/src/lib/abuse-controls.js', () => ({
+  ...jest.requireActual('../../lambda/src/lib/abuse-controls.js'),
+  evaluateAbuseGate: async () => ({ allowed: true }),
+}), { virtual: true });
+jest.mock('../../lambda/src/lib/assistant-session', () => {
+  const actual = jest.requireActual('../../lambda/src/lib/assistant-session');
+  const session = (botArn: string) => ({
+    assistant: 'test-assistant', role: 'primary', botArn,
+    credentials: { accessKeyId: 'AKIATEST', secretAccessKey: 'test', sessionToken: 'test' },
+  });
+  return {
+    ...actual,
+    speakAsRoutedAssistant: jest.fn(async (input: { botArn: string }) => session(input.botArn)),
+    sessionForRoutedAssistant: jest.fn(async (input: { botArn: string }) => session(input.botArn)),
+  };
+});
+jest.mock('../../lambda/src/lib/turn-routing', () => ({
+  ...jest.requireActual('../../lambda/src/lib/turn-routing'),
+  recordTurnRouting: jest.fn(async () => undefined),
+}));
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn().mockImplementation(() => ({ send: mockMessagingSend })),
   SendChannelMessageCommand: jest.fn().mockImplementation((args) => ({ __type: 'SendMessage', input: args })),
@@ -42,6 +68,8 @@ jest.mock('@aws-sdk/client-lambda', () => ({
 jest.mock('@aws-sdk/client-ssm', () => ({
   SSMClient: jest.fn().mockImplementation(() => ({ send: mockSsmSend })),
   GetParameterCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetParam', input: args })),
+  // The assignment records the router resolves the turn's assistant from.
+  GetParametersByPathCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetByPath', input: args })),
 }), { virtual: true });
 
 const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/abc';
@@ -53,8 +81,7 @@ const BOT_OTHER = `${APP}/bot/AltSlot0`;
 const HUMAN = `${APP}/user/alice`;
 const principalIdOf = (arn: string) => arn.split('/').pop() || arn;
 
-const ROSTER_PARAM = '/agent-echelon/alt-bot-slots/roster';
-const SELF_FUNCTION = 'AgentEchelonClassification-Premium-AgentHandler';
+const SELF_FUNCTION = 'AgentEchelonAssistants-premium-AgentHandler';
 
 /** What the deployment answers a bare acknowledgement with, when nothing is waiting. */
 const CANNED_ACKNOWLEDGEMENT = 'Let me know if you have other questions.';
@@ -79,7 +106,7 @@ jest.mock('../../lambda/src/lib/task-tracking.js', () => {
     },
     // The same one query, in the shape the router reads it: live work plus anything that ended here
     // recently. These tests model no finished work, so the second list is always empty.
-    getOwnerChannelTasks: async (...a: unknown[]) => {
+    getAssigneeChannelTasks: async (...a: unknown[]) => {
       const list = await mockGetActiveTasksForOwnerInChannel(...a);
       if (list !== undefined) return { live: list, recentlyEnded: [] };
       const t = await mockGetActiveTaskForOwner(...a);
@@ -89,6 +116,13 @@ jest.mock('../../lambda/src/lib/task-tracking.js', () => {
     applyUserResponseToTask: (...a: unknown[]) => mockApplyUserResponseToTask(...a),
   };
 }, { virtual: true });
+
+// THE DUEL'S EXPERIMENT IS ACTIVE here, with no pinned sides: a duel turn reads it once (`resolveBattleSides`),
+// and a duel whose experiment has ended is ended rather than answered, which is not what this file is about.
+jest.mock('../../lambda/src/lib/experiment-manager.js', () => ({
+  ...jest.requireActual('../../lambda/src/lib/experiment-manager.js'),
+  resolveBattleSides: async () => ({ active: true, control: null, treatment: null }),
+}), { virtual: true });
 
 const mockResolveActiveBattle = jest.fn();
 const mockReadBattleRows = jest.fn();
@@ -113,14 +147,23 @@ const invokes = () => mockLambdaSend.mock.calls
 /** The async processor dispatch, or undefined when the turn dispatched no work. */
 const worker = () => invokes().find((p) => !p?.aeTurn);
 
-/** The turn handed to another assistant, or undefined when nothing was handed over. */
-const handover = () => invokes().find((p) => p?.aeTurn?.handedOverFrom)?.aeTurn;
+/**
+ * The handover to another assistant, or undefined when nothing was handed over. A handover is a posted
+ * MESSAGE targeted at the receiver and marked in its Metadata (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION
+ * §3.4), never an invoke, so it is read from what this turn posted.
+ */
+const handover = () => {
+  const c = mockMessagingSend.mock.calls.map((x) => x[0])
+    .find((x) => x?.__type === 'SendMessage' && String(x.input?.Metadata || '').includes('"aeHandover"'));
+  return c ? { botArn: c.input.Target?.[0]?.MemberArn as string } : undefined;
+};
 
-/** Everything this turn posted to the channel. */
+/** Everything this turn posted to the channel, its Content read as the client reads it. */
 const posts = () => mockMessagingSend.mock.calls
   .map((c) => c[0])
   .filter((c) => c?.__type === 'SendMessage')
-  .map((c) => c.input as { Content: string; Target?: Array<{ MemberArn: string }> });
+  .map((c) => c.input as { Content: string; Target?: Array<{ MemberArn: string }> })
+  .map((m) => ({ ...m, Content: (() => { try { return decodeURIComponent(m.Content); } catch { return m.Content; } })() }));
 
 /** A chain the PERSON holds, blocked on them, belonging to `assistantId`. */
 const heldTask = (assistantId: string, taskId = 't-waiting') => ({
@@ -129,7 +172,7 @@ const heldTask = (assistantId: string, taskId = 't-waiting') => ({
   taskState: 'collecting_requirements',
   channelArn: CHANNEL,
   status: 'in_progress',
-  userSub: principalIdOf(HUMAN),
+  personId: principalIdOf(HUMAN),
   assistantId,
 });
 
@@ -144,7 +187,13 @@ const turn = (userMessage: string) => ({
  */
 const ROUTER_ENV: Record<string, string | undefined> = {
   AWS_LAMBDA_FUNCTION_NAME: SELF_FUNCTION,
-  ALT_BOT_SLOTS_ROSTER_PARAM: ROSTER_PARAM,
+  // THE ROOM THIS HANDLER SERVES. The identity guard reads this classification's alt record, so an unset value
+  // admits no alt and the handover below is refused for a reason that has nothing to do with the
+  // short answer this file is about.
+  CLASSIFICATION: 'premium',
+  // THE ROLE THIS HANDLER SERVES. The identity guard admits the alt of this (classification, role)
+  // and no other, so an unset role admits no alt and the handover below is refused for the wrong reason.
+  ASSISTANT_ROLE: 'primary',
   // No dedup table, so every claim in the turn fails open and none of these assertions depends on
   // one. Cleared rather than assumed absent: the table name is read at import time, and an ambient
   // value would otherwise put a real DynamoDB call on this turn's path.
@@ -179,9 +228,11 @@ describe('a short message is read as an answer when something is waiting on the 
 
     applyEnv(ROUTER_ENV);
 
-    mockSsmSend.mockImplementation(async (cmd: { input?: { Name?: string } }) =>
-      cmd?.input?.Name === ROSTER_PARAM
-        ? { Parameter: { Value: JSON.stringify([{ slotId: 'AltSlot0', botArn: BOT_OTHER }]) } }
+    mockSsmSend.mockImplementation(async (cmd: { __type?: string; input?: { Name?: string } }) =>
+      cmd?.__type === 'GetByPath'
+        // This classification's alt record: an alt belongs to ONE (classification, role), and the guard
+        // reads it from the records of the classification this handler serves.
+        ? { Parameters: [{ Value: JSON.stringify({ botArn: BOT_OTHER, classification: 'premium', role: 'primary', occupancy: 'alt', assistant: 'alt-primary' }) }] }
         : { Parameter: { Value: BOT_SELF } });
 
     mockMessagingSend.mockImplementation(async (cmd: { __type?: string }) => {
@@ -203,8 +254,8 @@ describe('a short message is read as an answer when something is waiting on the 
 
   describe('answering this assistant\'s own waiting chain', () => {
     beforeEach(() => {
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_SELF)) : null);
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_SELF)) : null);
     });
 
     it('applies "ok" to the task that was waiting on them', async () => {
@@ -240,8 +291,8 @@ describe('a short message is read as an answer when something is waiting on the 
 
   describe('answering a chain a DIFFERENT assistant owns', () => {
     it('hands "ok" to the assistant whose question it answers', async () => {
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OTHER)) : null);
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OTHER)) : null);
 
       await routerHandler(turn('ok'));
 
@@ -290,8 +341,8 @@ describe('a short message is read as an answer when something is waiting on the 
   // now reads the same continuation fact.
   describe('when the person holds work that is not waiting on them', () => {
     beforeEach(() => {
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_SELF)) : null);
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_SELF)) : null);
       mockApplyUserResponseToTask.mockResolvedValue({ applied: false, reason: 'not_awaiting', from: 'collecting' });
     });
 

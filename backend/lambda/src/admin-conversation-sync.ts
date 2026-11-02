@@ -1,7 +1,9 @@
 /**
  * Admin conversation membership sync (SPEC-ADMIN-IDENTITY section 8).
  *
- * Scheduled reconcile. Resolves the admin set from the Cognito `admins` group and syncs each
+ * Runs when the `admins` group changes - a Cognito group event delivered through the platform trail and
+ * EventBridge - and on a daily backstop schedule for an event that was dropped (tenet D6: the sweep is the
+ * backstop, never the primary mechanism). Resolves the admin set from the Cognito `admins` group and syncs each
  * configured admin conversation's Chime MEMBERSHIP — which is the whole roster; no second copy is
  * written anywhere, and the notification bridge reads membership directly. Runs as the SERVICE
  * app-instance-admin (an automated, no-human path). It also de-provisions
@@ -9,15 +11,8 @@
  * backstop, so a demoted user loses cross-channel authority even if their last
  * exchange did not drop the elevation).
  */
-import { CognitoIdentityProviderClient, ListUsersInGroupCommand } from '@aws-sdk/client-cognito-identity-provider';
-import {
-  ChimeSDKMessagingClient,
-  ListChannelMembershipsCommand,
-  CreateChannelMembershipCommand,
-  DeleteChannelMembershipCommand,
-  DescribeChannelCommand,
-  UpdateChannelCommand,
-} from '@aws-sdk/client-chime-sdk-messaging';
+import { ChimeSDKMessagingClient } from '@aws-sdk/client-chime-sdk-messaging';
+import { reconcileHumans } from './lib/membership-reconcile.js';
 import {
   ChimeSDKIdentityClient,
   ListAppInstanceAdminsCommand,
@@ -25,18 +20,32 @@ import {
   DeleteAppInstanceUserCommand,
 } from '@aws-sdk/client-chime-sdk-identity';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import { ADMIN_ROLE_GROUP, rolesNeedingAdministrationIdentity } from '../../lib/config/admin-capabilities.js';
+import { defaultDirectory } from './lib/membership-source.js';
+import { chimeMessagingClient, chimeIdentityClient, appInstanceAdminBearer } from './lib/chime/clients.js';
+import { loadProfileRegistry } from '../../lib/profile-registry';
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
-const USER_POOL_ID = process.env.USER_POOL_ID || '';
-const ADMIN_GROUP = process.env.ADMIN_GROUP_NAME || 'admins';
+/**
+ * WHO HOLDS THE ADMINISTRATION IDENTITY: the people in a group whose role is granted a capability that
+ * needs it (`rolesNeedingAdministrationIdentity`). Separate from the admin issuers' admin groups, who sit in the
+ * admin conversations; the identity follows the capability, not that group's name.
+ */
+const IDENTITY_GROUPS = [...new Set(rolesNeedingAdministrationIdentity().map((r) => ADMIN_ROLE_GROUP[r]))];
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
 const ADMIN_CONVERSATION_ARNS = (process.env.ADMIN_CONVERSATION_ARNS || '')
   .split(',').map((s) => s.trim()).filter(Boolean);
 const ADMIN_ARN_PARAM = process.env.ADMIN_ARN_PARAM || '/agent-echelon/app-instance-admin-arn';
+/**
+ * THE ADMIN NOTIFICATION CHANNEL, kept to the admins on the same schedule. Its provisioner adds the admins
+ * it finds when the channel is created, and on a fresh deployment that is nobody, because people are
+ * provisioned after the stacks; without this the channel stays empty and every alert reaches no one.
+ * Members only: its creator, the admin assistant, moderates it.
+ */
+const ADMIN_NOTIFICATION_CHANNEL_ARN = (process.env.ADMIN_NOTIFICATION_CHANNEL_ARN || '').trim();
 
-const cognito = new CognitoIdentityProviderClient({ region: REGION });
-const messaging = new ChimeSDKMessagingClient({ region: REGION });
-const identity = new ChimeSDKIdentityClient({ region: REGION });
+const messaging = chimeMessagingClient({ region: REGION });
+const identity = chimeIdentityClient({ region: REGION });
 const ssm = new SSMClient({ region: REGION });
 
 const errName = (e: unknown): string => (e as { name?: string })?.name || '';
@@ -56,84 +65,48 @@ const errDetail = (e: unknown): string => {
   return err?.message ? `${err.name || 'Error'}: ${err.message}` : (err?.name || String(e));
 };
 
-let cachedAdminArn = '';
-async function serviceAdminArn(): Promise<string> {
-  if (cachedAdminArn) return cachedAdminArn;
-  const r = await ssm.send(new GetParameterCommand({ Name: ADMIN_ARN_PARAM }));
-  cachedAdminArn = r.Parameter?.Value || '';
-  return cachedAdminArn;
+const serviceAdminArn = appInstanceAdminBearer({ ssm, param: ADMIN_ARN_PARAM, onFailure: 'throw' });
+
+/**
+ * The groups' ENABLED members, as the people they sign in as (`Directory.personsInGroup`). A disabled
+ * user stays in the group, so without the filter disabling an admin would remove nothing - the same rule
+ * the group-membership reconcile applies (lib/membership-source.ts). A member who has never signed in
+ * has no AppInstanceUser and is in no channel, so leaving them out removes nobody.
+ */
+async function resolveAdminUserArns(groups?: string[]): Promise<Set<string>> {
+  // EVERY ISSUER DECLARING `admin: true` (C2): its admin groups (`adminGroups`, default `admins`), or the
+  // groups named, in its own directory. A staff pool's admins sit in the admin rooms beside the
+  // deployment pool's.
+  return new Set((await defaultDirectory().admins(groups)).persons);
 }
 
-/** The `admins` group members, resolved to their app-instance-user ARNs (id == sub). */
-async function resolveAdminUserArns(): Promise<Set<string>> {
-  const arns = new Set<string>();
-  let NextToken: string | undefined;
-  do {
-    const res = await cognito.send(new ListUsersInGroupCommand({
-      UserPoolId: USER_POOL_ID, GroupName: ADMIN_GROUP, NextToken,
-    }));
-    for (const u of res.Users || []) {
-      const sub = (u.Attributes || []).find((a) => a.Name === 'sub')?.Value;
-      if (sub) arns.add(`${APP_INSTANCE_ARN}/user/${sub}`);
-    }
-    NextToken = res.NextToken;
-  } while (NextToken);
-  return arns;
-}
-
-/** Sync one admin conversation: add missing admins and remove humans no longer admins
- *  (bots/assistants are left alone). Membership IS the roster — nothing else is written; see the
- *  note at the end of this function for why the Metadata copy was removed. */
-async function syncConversation(channelArn: string, adminArns: Set<string>, bearer: string): Promise<void> {
-  const currentHumans = new Set<string>();
-  let NextToken: string | undefined;
-  do {
-    const res = await messaging.send(new ListChannelMembershipsCommand({
-      ChannelArn: channelArn, ChimeBearer: bearer, MaxResults: 50, NextToken,
-    }));
-    for (const m of res.ChannelMemberships || []) {
-      const arn = m.Member?.Arn || '';
-      if (arn.includes('/user/')) currentHumans.add(arn); // humans only; never touch bots
-    }
-    NextToken = res.NextToken;
-  } while (NextToken);
-
-  for (const arn of adminArns) {
-    if (currentHumans.has(arn)) continue;
-    try {
-      await messaging.send(new CreateChannelMembershipCommand({
-        ChannelArn: channelArn, MemberArn: arn, Type: 'DEFAULT', ChimeBearer: bearer,
-      }));
-    } catch (e) { if (errName(e) !== 'ConflictException') throw e; }
+/**
+ * Sync one admin conversation: its humans become exactly the admins, and every admin moderates it.
+ *
+ * AN ADMIN IS A MODERATOR OF AN ADMIN CONVERSATION, not merely a member of it. Moderation is
+ * channel-scoped (SPEC-MODERATION), so this grants nothing outside this channel and is NOT the chat
+ * identity being elevated to cross-channel administration - that stays on the separate `${personId}-admin`
+ * plane. Without it the admin assistant bot is the only moderator, and the humans in an admin channel could
+ * not rename it, archive it, or redact a message in it.
+ *
+ * The reconcile itself - humans only, membership as the roster, the measured moderator coupling - is
+ * `lib/membership-reconcile.ts`, shared with the group-membership reconcile.
+ */
+async function syncConversation(
+  channelArn: string, adminArns: Set<string>, bearer: string,
+  moderators: 'all-allowed' | 'revoke-only' = 'all-allowed',
+): Promise<void> {
+  const res = await reconcileHumans({ messaging, channelArn, bearer, allowed: adminArns, moderators });
+  if (res.added.length || res.removed.length || res.moderatorsRemoved.length) {
+    console.log(JSON.stringify({ _auditEvent: 'admin_conversation_membership_change', channelArn, ...res }));
   }
-  for (const arn of currentHumans) {
-    if (adminArns.has(arn)) continue;
-    try {
-      await messaging.send(new DeleteChannelMembershipCommand({
-        ChannelArn: channelArn, MemberArn: arn, ChimeBearer: bearer,
-      }));
-    } catch (e) { if (errName(e) !== 'NotFoundException') throw e; }
-  }
-
-  // NO Metadata roster refresh. This used to rewrite `Metadata.participants` on every sync so the
-  // notification bridge had a recipient list. Both halves of that are now wrong:
-  //
-  //   - IDENTITY IN METADATA. It wrote every admin's `sub` into a blob readable by every channel
-  //     member and writable by any moderator. METADATA-AND-TAGS §1 puts identity on the never list.
-  //   - IT WAS A COPY THAT DRIFTED. The membership calls above are the real change; the roster was a
-  //     second representation of the same fact, and any sync that updated one and failed the other
-  //     left them disagreeing — with the stale copy deciding who got emailed.
-  //
-  // `channel-notify.ts` now derives recipients from live `ListChannelMemberships`, so the membership
-  // work above IS the update. These are native subs (AppInstanceUser id == sub), so no issuer hint is
-  // needed either.
 }
 
 /**
  * Demotion + migration backstop. Human admin authority lives on the SEPARATE
- * `${sub}-admin` identity (the two-identity model). Keep an app-instance-admin only when
- * it is a `${sub}-admin` whose human is still in the admins group, plus the service admin.
- * Remove it from everything else: demoted admins (and delete their orphaned `${sub}-admin`
+ * `${personId}-admin` identity (the two-identity model). Keep an app-instance-admin only when
+ * it is a `${personId}-admin` whose human is still in the admins group, plus the service admin.
+ * Remove it from everything else: demoted admins (and delete their orphaned `${personId}-admin`
  * identity), and any LEGACY elevation left on a bare chat identity `${sub}` (chat
  * identities must never be app-instance-admins).
  */
@@ -153,7 +126,7 @@ async function deprovisionDemotedAdmins(adminArns: Set<string>): Promise<void> {
       try {
         await identity.send(new DeleteAppInstanceAdminCommand({ AppInstanceArn: APP_INSTANCE_ARN, AppInstanceAdminArn: arn }));
       } catch (e) { if (errName(e) !== 'NotFoundException') throw e; }
-      // Delete the orphaned admin identity itself (ONLY a `${sub}-admin` user; never a
+      // Delete the orphaned admin identity itself (ONLY a `${personId}-admin` user; never a
       // chat identity, which the human still needs for their own participation).
       if (isAdminIdentity) {
         try {
@@ -166,8 +139,10 @@ async function deprovisionDemotedAdmins(adminArns: Set<string>): Promise<void> {
 }
 
 export const handler = async (): Promise<{ ok: boolean; admins: number; conversations: number }> => {
-  if (!USER_POOL_ID || !APP_INSTANCE_ARN) {
-    console.warn('[AdminConvSync] USER_POOL_ID / APP_INSTANCE_ARN not set; skipping');
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
+  if (!APP_INSTANCE_ARN) {
+    console.warn('[AdminConvSync] APP_INSTANCE_ARN not set; skipping');
     return { ok: false, admins: 0, conversations: 0 };
   }
   const adminArns = await resolveAdminUserArns();
@@ -178,8 +153,15 @@ export const handler = async (): Promise<{ ok: boolean; admins: number; conversa
       try { await syncConversation(channelArn, adminArns, bearer); }
       catch (e) { console.error('[AdminConvSync] conversation sync failed', channelArn, errDetail(e)); }
     }
+    if (ADMIN_NOTIFICATION_CHANNEL_ARN && !ADMIN_CONVERSATION_ARNS.includes(ADMIN_NOTIFICATION_CHANNEL_ARN)) {
+      try { await syncConversation(ADMIN_NOTIFICATION_CHANNEL_ARN, adminArns, bearer, 'revoke-only'); }
+      catch (e) { console.error('[AdminConvSync] notification channel sync failed', ADMIN_NOTIFICATION_CHANNEL_ARN, errDetail(e)); }
+    }
   }
-  try { await deprovisionDemotedAdmins(adminArns); }
+  // The identity follows the capability: its holders are the enabled people in every group whose role
+  // needs it, which may differ from who sits in the admin conversations.
+  const identityHolders = await resolveAdminUserArns(IDENTITY_GROUPS);
+  try { await deprovisionDemotedAdmins(identityHolders); }
   catch (e) { console.error('[AdminConvSync] deprovision sweep failed', errDetail(e)); }
 
   console.log(JSON.stringify({

@@ -11,68 +11,62 @@
  * nothing in the template review could either, because a missing variable looks like every other
  * variable that is deliberately absent.
  *
- * Asserted from the TEMPLATE rather than as a list of expected functions, so a new IAM-authorized
- * admin route is covered the day it is added instead of the day someone remembers this file.
+ * Asserted from the TEMPLATES rather than as a list of expected functions, so a new IAM-authorized
+ * admin route is covered the day it is added instead of the day someone remembers this file. A route is
+ * on `AdminApi` and its handler in the stack that owns it, so the route's integration names the handler's
+ * construct (`RouteTableApi` writes it as the integration's description), and the function is found by
+ * that construct id in whichever template holds it.
  */
-import * as cdk from 'aws-cdk-lib';
-import { Template } from 'aws-cdk-lib/assertions';
+import { auroraAppTemplates } from './helpers/synth';
 
-const env = { account: '123456789012', region: 'us-east-1' };
+/** A function's logical id is its construct id and CDK's eight-hex uniqueness suffix. */
+const isConstruct = (logicalId: string, constructId: string): boolean => new RegExp(`^${constructId}[0-9A-F]{8}$`).test(logicalId);
 
-/** The logical ids a `Fn::GetAtt`/`Fn::Sub` integration URI refers to. */
-function referencedLogicalIds(node: unknown, out: Set<string> = new Set()): Set<string> {
-  if (Array.isArray(node)) {
-    for (const n of node) referencedLogicalIds(n, out);
-    return out;
-  }
-  if (node && typeof node === 'object') {
-    for (const [k, v] of Object.entries(node as Record<string, unknown>)) {
-      if (k === 'Fn::GetAtt' && Array.isArray(v) && typeof v[0] === 'string') out.add(v[0]);
-      else referencedLogicalIds(v, out);
-    }
-  }
-  return out;
-}
+/**
+ * THE HANDLERS THAT NEVER ASK `requireAdmin`, each with the reason. They read the person from the console
+ * session the gateway authenticated (`consoleSessionOf`, `callerPersonId`) and decide from that, so the
+ * setting this guard checks is not one they read.
+ */
+const READS_THE_SESSION_ITSELF: Array<{ id: RegExp; why: string }> = [
+  { id: /^AdminCredentialExchangeFunction/, why: 'the admin credential exchange: it names the console sessions it reads (consoleSessionCaller)' },
+  { id: /^AssistantOwnershipFunction/, why: 'ownership: the actor is the signed console session (callerPersonId), and IAM refuses a role without the route' },
+  { id: /^ConversationManagementFunction/, why: 'the console archive: it accepts the route only from an admin console session (isAdminConsoleSession), and the same function serves the person routes' },
+];
 
 describe('an IAM-authorized admin route always tells its Lambda that IAM is enforced', () => {
-  it('every function behind an AWS_IAM analytics method carries ADMIN_IAM_ENFORCEMENT', async () => {
-    const { AnalyticsStackAurora } = await import('../lib/stacks/analytics-stack-aurora');
-    const app = new cdk.App({
-      context: {
-        adminIamEnforcement: true,
-        adminAppUrl: 'https://admin.example.com',
-        appUrl: 'https://chat.example.com',
-      },
-    });
-    const stack = new AnalyticsStackAurora(app, 'TestAnalyticsIamEnforcement', {
-      env,
-      appInstanceArn: 'arn:aws:chime:us-east-1:123456789012:app-instance/test',
-      userPoolId: 'us-east-1_TestPoolId',
-      adminIamEnforcement: true,
-    } as never);
-
-    const template = Template.fromStack(stack);
-    const methods = template.findResources('AWS::ApiGateway::Method');
-    const functions = template.findResources('AWS::Lambda::Function');
-
-    const iamAuthedFunctionIds = new Set<string>();
-    for (const method of Object.values(methods)) {
-      if ((method.Properties as Record<string, unknown>)?.AuthorizationType !== 'AWS_IAM') continue;
-      for (const id of referencedLogicalIds((method.Properties as Record<string, unknown>).Integration)) {
-        if (functions[id]) iamAuthedFunctionIds.add(id);
+  it('every function behind an AWS_IAM route, in every template of the app, carries ADMIN_IAM_ENFORCEMENT', () => {
+    // Every admin route is on AdminApi, read on the Aurora archive with sleep mode on, which is where the
+    // most admin routes are.
+    const templates = auroraAppTemplates();
+    const functions = Object.entries(templates).flatMap(([stack, t]) =>
+      Object.entries(t.findResources('AWS::Lambda::Function')).map(([id, fn]) => ({ stack, id, fn })));
+    const iamAuthed: Array<{ stack: string; id: string; vars?: Record<string, unknown>; api: string }> = [];
+    for (const [api, template] of Object.entries(templates)) {
+      const routes = template.findResources('AWS::ApiGatewayV2::Route');
+      const integrations = template.findResources('AWS::ApiGatewayV2::Integration');
+      for (const route of Object.values(routes)) {
+        const props = route.Properties as Record<string, any>;
+        if (props?.AuthorizationType !== 'AWS_IAM') continue;
+        const integrationId = /"Ref":"([A-Za-z0-9]+)"/.exec(JSON.stringify(props.Target))?.[1];
+        const handler = integrationId ? (integrations[integrationId]?.Properties as Record<string, any> | undefined)?.Description : undefined;
+        for (const f of functions.filter((x) => handler && isConstruct(x.id, handler))) {
+          const vars = ((f.fn.Properties as Record<string, unknown>)?.Environment as { Variables?: Record<string, unknown> } | undefined)?.Variables;
+          iamAuthed.push({ stack: f.stack, id: f.id, vars, api });
+        }
       }
     }
 
-    // If this is empty the test is vacuous — it would pass while asserting nothing at all.
-    expect(iamAuthedFunctionIds.size).toBeGreaterThan(0);
-
-    const missing = [...iamAuthedFunctionIds].filter((id) => {
-      const vars = ((functions[id].Properties as Record<string, unknown>)?.Environment as
-        | { Variables?: Record<string, unknown> }
-        | undefined)?.Variables;
-      return vars?.ADMIN_IAM_ENFORCEMENT !== 'true';
-    });
-
-    expect(missing).toEqual([]);
-  });
+    // If this is empty the test is vacuous: it would pass while asserting nothing at all. The analytics
+    // query, the replay starter and the membership-audit review are among them.
+    expect(iamAuthed.length).toBeGreaterThan(10);
+    expect(iamAuthed.some((f) => f.id.startsWith('ClassifierReplayStartFn'))).toBe(true);
+    // Every IAM-authorized route is on the admin API: the person API holds none.
+    expect([...new Set(iamAuthed.map((f) => f.api))]).toEqual(['AdminApi']);
+    const missing = iamAuthed
+      .filter((f) => !READS_THE_SESSION_ITSELF.some((e) => e.id.test(f.id)))
+      .filter((f) => f.vars?.ADMIN_IAM_ENFORCEMENT !== 'true');
+    expect([...new Set(missing.map((f) => `${f.stack}/${f.id}`))]).toEqual([]);
+    // And every exemption still names a function behind an IAM route, so the list stays the inventory.
+    for (const e of READS_THE_SESSION_ITSELF) expect([String(e.id), iamAuthed.some((f) => e.id.test(f.id))]).toEqual([String(e.id), true]);
+  }, 600_000);
 });

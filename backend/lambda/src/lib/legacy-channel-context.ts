@@ -115,10 +115,10 @@ function stripDeep(value: unknown, depth = 0): unknown {
 }
 
 /**
- * The promotable subset of one channel's Metadata, bounded and sanitised.
+ * The promotable subset of one channel's Metadata, bounded and sanitized.
  *
  * Bounds come from the WRITE path (`boundedDomainContext`, `boundedOtherContexts`, and the same 80/600
- * character caps `federated-create-conversation.ts` applies), because the failure they prevent is on the
+ * character caps the context create in `create-conversation-at-classification.ts` applies), because the failure they prevent is on the
  * READ side: the router spreads the whole grounding into a 256KB `Event` invoke, and an oversized value
  * makes every turn in that conversation stick on the placeholder forever. A backfill that skipped the
  * bounds would recover a conversation into exactly that state.
@@ -137,7 +137,7 @@ function promotableFrom(meta: Record<string, unknown>, logPrefix: string): Chann
   // The two routing signals get a SHAPE check on top of the bound, which the host API does not apply.
   // They select the model and the reply language, so a malformed value is not a cosmetic problem: the
   // right failure is to leave the conversation on the deployment default rather than to route it
-  // somewhere on a value nothing recognises.
+  // somewhere on a value nothing recognizes.
   const userLanguage = typeof meta.userLanguage === 'string' ? meta.userLanguage.trim() : '';
   if (LANGUAGE_TAG.test(userLanguage)) patch.userLanguage = userLanguage;
 
@@ -181,7 +181,7 @@ function promotableFrom(meta: Record<string, unknown>, logPrefix: string): Chann
  *     `null` on the create/edit path also re-stamps the channel's Metadata WITHOUT the cleared field, so
  *     in practice a cleared field usually has nothing left in Metadata to resurrect and lands on rule 3
  *     regardless. The override is not reckless; it is narrower than it looks.
- *  3. Otherwise promote whatever Metadata still carries, bounded and sanitised. Unparseable Metadata,
+ *  3. Otherwise promote whatever Metadata still carries, bounded and sanitized. Unparseable Metadata,
  *     or Metadata carrying none of the six, is `nothing-to-promote`.
  *
  * @param metadata the channel's raw `Metadata` string from `DescribeChannel` (JSON, or not)

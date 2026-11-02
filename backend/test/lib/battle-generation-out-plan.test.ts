@@ -11,6 +11,7 @@ import {
   resolveTurnImageGenModelId,
 } from '../../lambda/src/lib/async-processor-core';
 import { IMAGE_GEN_MODELS } from '../../lambda/src/lib/image-gen-models';
+import { ensureModelsBundle, type ProfileDefinitionBody } from '../../lambda/src/lib/active-profile';
 
 const TITAN = 'amazon.titan-image-generator-v2:0';
 const NOVA = 'amazon.nova-canvas-v1:0';
@@ -54,14 +55,13 @@ describe('resolveBattleGenerationOutPlan', () => {
     expect(resolveBattleGenerationOutPlan).toBe(resolveGenerationOutPlan);
   });
 });
-
-// The normal-turn generation trigger (Phase 2). Precedence: battle variant image model >
-// legacy battle imageGenModelId > the active profile's models.image on an image_generation turn.
+// The normal-turn generation trigger. Precedence: the experiment variant's image model > the served
+// version's models.image, on an image_generation turn only. A duel side's image model is its pinned
+// version's models.image, so a battle has no source of its own (DESIGN-SEPARATE-ASSISTANTS §3.7).
 describe('resolveTurnImageGenModelId — the normal-turn generation trigger', () => {
-  it("a NON-battle image_generation turn uses the profile's models.image", () => {
+  it("an image_generation turn uses the served version's models.image", () => {
     expect(
-      resolveTurnImageGenModelId({
-        battleOn: false,
+      resolveTurnImageGenModelId({ classification: 'premium',
         intent: 'image_generation',
         profileImageModelKey: 'stability_image_core',
       }),
@@ -71,60 +71,27 @@ describe('resolveTurnImageGenModelId — the normal-turn generation trigger', ()
   it('the profile image model only fires on the image_generation intent (not other intents)', () => {
     for (const intent of ['general', 'report_generation', undefined]) {
       expect(
-        resolveTurnImageGenModelId({ battleOn: false, intent, profileImageModelKey: 'stability_image_core' }),
+        resolveTurnImageGenModelId({ classification: 'premium', intent, profileImageModelKey: 'stability_image_core' }),
       ).toBeUndefined();
     }
   });
 
   it('a profile with no image capability yields undefined (text turn)', () => {
     expect(
-      resolveTurnImageGenModelId({ battleOn: false, intent: 'image_generation', profileImageModelKey: undefined }),
+      resolveTurnImageGenModelId({ classification: 'premium', intent: 'image_generation', profileImageModelKey: undefined }),
     ).toBeUndefined();
   });
 
-  it('a battle variant image model WINS over the profile image model', () => {
-    expect(
-      resolveTurnImageGenModelId({
-        battleOn: true,
-        intent: 'image_generation',
-        variantImageModelKey: 'stability_image_ultra',
-        profileImageModelKey: 'stability_image_core',
-      }),
-    ).toBe(STABILITY_ULTRA);
+  it('a duel side serves the image model its pinned version carries', () => {
+    // Each side's version carries its own variant's image model, so the two sides of an image duel
+    // reach this function with different profile image models and nothing else.
+    expect(resolveTurnImageGenModelId({ classification: 'premium', intent: 'image_generation', profileImageModelKey: 'titan_image' })).toBe(TITAN);
+    expect(resolveTurnImageGenModelId({ classification: 'premium', intent: 'image_generation', profileImageModelKey: 'nova_canvas' })).toBe(NOVA);
   });
 
-  it('the legacy battle imageGenModelId path still works (below the variant, above the profile)', () => {
-    // No variant image key ⇒ the legacy resolveBattleImageGenPair id is used.
-    expect(
-      resolveTurnImageGenModelId({ battleOn: true, intent: 'general', battleImageGenModelId: TITAN }),
-    ).toBe(TITAN);
-    // A variant image key still wins over the legacy id.
-    expect(
-      resolveTurnImageGenModelId({
-        battleOn: true,
-        intent: 'general',
-        variantImageModelKey: 'nova_canvas',
-        battleImageGenModelId: TITAN,
-      }),
-    ).toBe(NOVA);
-  });
-
-  it('battle-sourced image ids are ignored when battleOn is false', () => {
-    expect(
-      resolveTurnImageGenModelId({
-        battleOn: false,
-        intent: 'image_generation',
-        variantImageModelKey: 'stability_image_ultra',
-        battleImageGenModelId: TITAN,
-        // Only the profile path applies off-battle.
-        profileImageModelKey: 'stability_image_core',
-      }),
-    ).toBe(STABILITY_CORE);
-  });
-
-  it('an unknown variant/profile image key resolves to a text plan (validated downstream)', () => {
+  it('an unknown profile image key resolves to a text plan (validated downstream)', () => {
     const id = resolveTurnImageGenModelId({
-      battleOn: false,
+      classification: 'premium',
       intent: 'image_generation',
       profileImageModelKey: 'not_a_real_image_model',
     });
@@ -132,12 +99,11 @@ describe('resolveTurnImageGenModelId — the normal-turn generation trigger', ()
     expect(resolveGenerationOutPlan({ imageGenModelId: id }).action).toBe('text');
   });
 
-  // A non-battle image experiment: the resolved variant's image model serves the turn in the NORMAL
-  // flow, so probabilistic traffic A/Bs the variants' image models (battle is just UI+scoring on top).
-  it("a NON-battle experiment image model WINS over the profile's models.image", () => {
+  // An image experiment: the resolved variant's image model serves the turn in the NORMAL flow, so
+  // probabilistic traffic A/Bs the variants' image models.
+  it("an experiment image model WINS over the served version's models.image", () => {
     expect(
-      resolveTurnImageGenModelId({
-        battleOn: false,
+      resolveTurnImageGenModelId({ classification: 'premium',
         intent: 'image_generation',
         experimentImageModelKey: 'stability_image_ultra',
         profileImageModelKey: 'stability_image_core',
@@ -148,19 +114,60 @@ describe('resolveTurnImageGenModelId — the normal-turn generation trigger', ()
   it('the experiment image model only fires on an image_generation turn', () => {
     for (const intent of ['general', 'report_generation', undefined]) {
       expect(
-        resolveTurnImageGenModelId({ battleOn: false, intent, experimentImageModelKey: 'stability_image_ultra' }),
+        resolveTurnImageGenModelId({ classification: 'premium', intent, experimentImageModelKey: 'stability_image_ultra' }),
       ).toBeUndefined();
     }
   });
+});
 
-  it('a battle variant image model still wins over a non-battle experiment image model', () => {
+// AN IMAGE MODEL IS RESOLVED ONLY WHERE THE CATALOG ALLOWS THE CLASSIFICATION ONE, whatever names it: a
+// version, an experiment variant, or a duel side's pinned version all reach this one gate.
+describe('resolveTurnImageGenModelId: only an image model the classification allows', () => {
+  it.each(['basic', 'standard'])('%s, allowed no image model, resolves none from any source', (classification) => {
+    expect(resolveTurnImageGenModelId({
+      classification, intent: 'image_generation',
+      experimentImageModelKey: 'stability_image_ultra', profileImageModelKey: 'stability_image_core',
+    })).toBeUndefined();
+  });
+
+  it('premium resolves the same sources', () => {
+    expect(resolveTurnImageGenModelId({
+      classification: 'premium', intent: 'image_generation', profileImageModelKey: 'stability_image_core',
+    })).toBe(STABILITY_CORE);
+  });
+
+  it('a TEXT model named as the image model is never used for an image', () => {
+    expect(resolveTurnImageGenModelId({
+      classification: 'premium', intent: 'image_generation', profileImageModelKey: 'opus',
+    })).toBeUndefined();
+  });
+
+  it('an intent the served pack says needs an image counts, and one that needs none does not', () => {
+    expect(resolveTurnImageGenModelId({
+      classification: 'premium', intent: 'draw_me_a_chart', need: 'image', profileImageModelKey: 'stability_image_core',
+    })).toBe(STABILITY_CORE);
+    expect(resolveTurnImageGenModelId({
+      classification: 'premium', intent: 'image_generation', need: 'document', profileImageModelKey: 'stability_image_core',
+    })).toBeUndefined();
+  });
+});
+
+// A TEXT QUESTION TO A BATTLE SIDE IS ANSWERED AS TEXT, even when that side's pinned version carries an
+// image model: modality follows the intent, never the version.
+describe('resolveTurnImageGenModelId: a battle side answers a text question as text', () => {
+  const pinnedVersion = ensureModelsBundle({ modelKey: 'opus', models: { image: 'stability_image_core' } } as ProfileDefinitionBody);
+
+  it('a text intent on a side whose version carries an image model resolves NO image model', () => {
+    for (const intent of ['general', 'financial_metric', 'general', undefined]) {
+      const id = resolveTurnImageGenModelId({ classification: 'premium', intent, profileImageModelKey: pinnedVersion.models?.image });
+      expect(id).toBeUndefined();
+      expect(resolveGenerationOutPlan({ imageGenModelId: id })).toEqual({ action: 'text' });
+    }
+  });
+
+  it('the same side still generates an image on an image_generation turn', () => {
     expect(
-      resolveTurnImageGenModelId({
-        battleOn: true,
-        intent: 'image_generation',
-        variantImageModelKey: 'stability_image_core',
-        experimentImageModelKey: 'stability_image_ultra',
-      }),
+      resolveTurnImageGenModelId({ classification: 'premium', intent: 'image_generation', profileImageModelKey: pinnedVersion.models?.image }),
     ).toBe(STABILITY_CORE);
   });
 });

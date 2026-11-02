@@ -46,3 +46,61 @@ describe('guardrailCatalog', () => {
     expect(new Set(names).size).toBe(names.length);
   });
 });
+
+/**
+ * WHAT THE PII POLICY REDACTS, AND WHAT IT DELIBERATELY DOES NOT.
+ *
+ * THIS IS THE PROJECT'S POSITION AND NOT A PER-DEPLOYMENT SETTING, which is why it is asserted here
+ * rather than left to configuration. AgentEchelon is used inside an organization, where colleagues
+ * share names, email addresses and phone numbers as the ordinary content of work. `EMAIL` and `PHONE`
+ * were `ANONYMIZE` and that made the assistant worse at its job in two ways: it could not repeat a
+ * colleague's address back ("email Jo at {EMAIL}"), and the phone detector fired on ordinary
+ * arithmetic - measured 2026-09-17, "what is three plus three?" was answered `{PHONE} is six.`
+ *
+ * An external-facing use case is the trigger to revisit it, as a decision record rather than a flag.
+ *
+ * A payment card number and a social security number are a different kind of thing: there is no
+ * legitimate reason to type either to an assistant, and they are the classic target of a
+ * prompt-injection exfiltration. They stay, and they BLOCK rather than ANONYMIZE, so the person is
+ * told the turn was refused instead of quietly getting rewritten text.
+ *
+ * This test exists so loosening the contact entities cannot silently become loosening everything.
+ */
+describe('the PII policy protects money and identity, not contact details', () => {
+  const pii = (): Array<{ type: string; action: string }> =>
+    (buildGuardrailPolicy({ name: 'x' }).sensitiveInformationPolicyConfig as
+      { piiEntitiesConfig: Array<{ type: string; action: string }> }).piiEntitiesConfig;
+
+  it('BLOCKS payment card and social security numbers, rather than masking them', () => {
+    for (const type of ['CREDIT_DEBIT_CARD_NUMBER', 'US_SOCIAL_SECURITY_NUMBER']) {
+      const entry = pii().find((e) => e.type === type);
+      // Named in the assertion rather than in a message argument, so a failure says which one went.
+      expect(`${type}: ${entry ? 'present' : 'MISSING from the PII policy'}`).toBe(`${type}: present`);
+      // ANONYMIZE would rewrite the message and say nothing; BLOCK tells the person it was refused.
+      expect(entry!.action).toBe('BLOCK');
+    }
+  });
+
+  it('does NOT redact the contact details colleagues legitimately exchange', () => {
+    const types = pii().map((e) => e.type);
+    expect(types).not.toContain('EMAIL');
+    expect(types).not.toContain('PHONE');
+    expect(types).not.toContain('NAME');
+    expect(types).not.toContain('ADDRESS');
+  });
+
+  it('every remaining entity is a BLOCK, so nothing silently rewrites a person\'s words', () => {
+    // The whole point of the change is that quiet substitution was the harm. If a future entity is
+    // added as ANONYMIZE, this fails and the author has to argue for it.
+    expect(pii().filter((e) => e.action !== 'BLOCK')).toEqual([]);
+  });
+
+  it('keeps the metadata-marker regex, which is a control marker and not PII', () => {
+    // That one IS an ANONYMIZE and is deliberately in the regex list rather than the entity list:
+    // the mask is the intended output and the marker stripper reads the same shared declaration.
+    const regexes = (buildGuardrailPolicy({ name: 'x' }).sensitiveInformationPolicyConfig as
+      { regexesConfig: Array<{ action: string }> }).regexesConfig;
+    expect(regexes.length).toBeGreaterThan(0);
+    expect(regexes.some((r) => r.action === 'ANONYMIZE')).toBe(true);
+  });
+});

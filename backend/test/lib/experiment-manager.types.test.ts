@@ -4,8 +4,8 @@
  * These cover the PURE validation
  * surface only (no DynamoDB): the experimentType discriminator default +
  * shape rules, and the advisory objective's metric/target/type pairing.
- * The DB-backed mutual-exclusion rule (findTypeExclusionConflicts) is
- * exercised in the broader suite (see the test-update task).
+ * The DB-backed one-experiment-per-classification rule (findClassificationConflicts) is
+ * exercised in experiment-manager.conflicts.test.ts.
  */
 
 // Mock the AWS SDK — only available at Lambda runtime.
@@ -32,11 +32,11 @@ import {
 const base: Experiment = {
   experimentId: 'exp-test',
   status: 'active',
-  intent: 'general_qa',
+  intent: 'general',
   tiers: ['standard'],
   variants: [
     { variantId: 'control', modelKey: 'sonnet', weight: 50 },
-    { variantId: 'treatment', modelKey: 'opus', weight: 50 },
+    { variantId: 'treatment', modelKey: 'haiku', weight: 50 },
   ],
   startDate: '2026-06-19T00:00:00Z',
   createdAt: '2026-06-19T00:00:00Z',
@@ -51,7 +51,7 @@ describe('experimentType validation', () => {
   it('preserves each canonical type', () => {
     for (const t of EXPERIMENT_TYPES) {
       // base_model/classification do not need an intent
-      const intent = t === 'intent' ? 'general_qa' : '';
+      const intent = t === 'intent' ? 'general' : '';
       const out = validateAndSanitizeExperiment({ ...base, experimentType: t, intent });
       expect(out.experimentType).toBe(t);
     }

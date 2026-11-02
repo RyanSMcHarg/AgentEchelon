@@ -27,14 +27,18 @@ import {
 } from '@aws-sdk/client-athena';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { parseJsonBody, requireAdmin, isAdminIamEnforcedCall } from './lib/auth';
+import { responder } from './lib/http-response';
 import { queryTypeAllowedOnPath } from './lib/admin-capability-map';
-import { ceilingForRequest, scopeAnalyticsRows } from './lib/caller-scope';
+import { scopeForRequest, scopeAnalyticsRows } from './lib/caller-scope';
+import { RECORDED_FUNNEL_STAGES } from './lib/funnel-stages';
+import { SIGNIN_FUNNEL, SIGNUP_FUNNEL, type SessionFunnel } from './lib/session-funnels';
+import { loadProfileRegistry } from '../../lib/profile-registry';
 
 const athena = new AthenaClient({});
 const WORKGROUP = process.env.ATHENA_WORKGROUP || 'agent-echelon-analytics';
 const DATABASE = process.env.ATHENA_DATABASE || 'agent_echelon';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
-// A14 Scoped: the pool the caller's classification ceiling is resolved against.
+// A14 Scoped: the pool the caller's classification scope is resolved against.
 const USER_POOL_ID = process.env.USER_POOL_ID || '';
 
 // ---------------------------------------------------------------------------
@@ -53,7 +57,7 @@ const USER_POOL_ID = process.env.USER_POOL_ID || '';
 //
 // Future: queries that the contract requires Athena to serve but the current
 // Glue schema can't satisfy without column work (model_usage→model_name,
-// user_activity→user_id, latency_metrics→avg_total_ms) will move into a
+// user_activity→person_id, latency_metrics→avg_total_ms) will move into a
 // third "pending schema" set with its own honest-empty reason. They're left
 // in SUPPORTED for now because the queries do execute and return a
 // degraded-but-non-zero result — the dashboard shows a no-data banner
@@ -65,6 +69,8 @@ const SUPPORTED_TYPES = new Set<string>([
   'conversation_volumes',
   'model_usage',
   'evaluation_scores',
+  // A delivered document's own scores, by intent and task type (SPEC-EVALUATION FR22).
+  'document_evaluation',
   'intent_distribution',
   'user_activity',
   'latency_metrics',
@@ -78,6 +84,9 @@ const SUPPORTED_TYPES = new Set<string>([
   'error_rate_daily',
   'signup_funnel_conversion',
   'signin_funnel_conversion',
+  // The guest-to-customer funnel (B12): server stages the platform appends to the same table.
+  'guest_to_customer_funnel',
+  'guest_refusals',
   'page_load_metrics',
   'connection_health_daily',
 ]);
@@ -93,11 +102,39 @@ const AURORA_ONLY_TYPES = new Set<string>([
   'task_timeline',
   'intent_effectiveness',
   'intent_exchanges',
+  // An intent's step and model breakdown (ADR-064) reads the Aurora columns task_step and steps[]; not built for Athena.
+  'intent_steps',
+  // Per-turn evidence behind one row of the latency breakdown: exchanges joined to the turn ledger,
+  // both Aurora-side.
+  'latency_exchanges',
+  // Thumbs live in DynamoDB but the reply they name lives in Aurora, so the join is Aurora-side.
+  'user_ratings',
   'conversation_summaries',
   'drift_events',
   'cross_conversation_context',
   'model_effectiveness',
   'experiment_results',
+  // ── THE LATENCY TAB'S THREE, WHICH WERE IN NEITHER SET (code review, 2026-09-09) ──────────────
+  //
+  // `latency_by_interaction`, `client_server_latency` and `router_steps` are served only by the
+  // Aurora query registry, but they were never listed here - so in Athena mode they fell past this
+  // check to the "genuinely unknown queryType" 400 below. The console rendered that raw error string
+  // in a red `role="alert"`, on a tab whose own banner promises those cards "will stay empty - that
+  // is the deployment mode, not a system with no traffic". An operator was told the opposite of what
+  // the page above it said.
+  //
+  // Listing them makes the unsupported answer the honest one this file already had.
+  'latency_by_interaction',
+  'client_server_latency',
+  'router_steps',
+  // Same reason, one panel later: the turn-kind breakdown reads a column the Aurora projection owns,
+  // so in Athena mode the honest answer is "this view requires Aurora" and not a raw unknown-type 400.
+  'turn_kinds',
+  // The derived-path-versus-ledger shadow diff compares two Aurora-side derivations of one turn, so
+  // Athena mode has neither side to compare.
+  'turn_latency_shadow_diff',
+  // Reads exchanges, drift events and summary versions, all Aurora-side.
+  'unserved_subjects',
 ]);
 
 const AURORA_REASON =
@@ -127,17 +164,10 @@ function validateDate(value: unknown): string | null {
 // Response helpers
 // ---------------------------------------------------------------------------
 
+const http = responder({ origin: { fixed: ALLOWED_ORIGIN }, methods: 'POST,OPTIONS' });
+
 function respond(statusCode: number, body: unknown): APIGatewayProxyResult {
-  return {
-    statusCode,
-    headers: {
-      'Content-Type': 'application/json',
-      'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
-      'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-      'Access-Control-Allow-Methods': 'POST,OPTIONS',
-    },
-    body: JSON.stringify(body),
-  };
+  return http.respond(statusCode, body);
 }
 
 function unsupportedResponse(reason: string): APIGatewayProxyResult {
@@ -153,7 +183,45 @@ function unsupportedResponse(reason: string): APIGatewayProxyResult {
 // SQL builders
 // ---------------------------------------------------------------------------
 
-function buildQuery(queryType: string, startDate: string, endDate: string): string | null {
+/**
+ * A SESSION-ORDERED FUNNEL (`lib/session-funnels.ts`), the Athena twin of the Aurora mode's
+ * `getFunnelConversion`: each step counted among the sessions that recorded the entry step at or before
+ * it, so every step is a subset of the entry step and a conversion read off it stays within 100% by
+ * construction. A session that recorded a step with no entry step before it is returned apart as
+ * `sessions_outside_funnel`. The event time is the ISO-8601 `timestamp` the ingestion stamps, which
+ * orders as a string. The steps are a fixed internal list, never input.
+ */
+function sessionFunnelSql(funnel: SessionFunnel, startDate: string, endDate: string): string {
+  const inList = funnel.steps.map((st) => `'${st}'`).join(', ');
+  const orderCase = funnel.steps.map((st, i) => `WHEN '${st}' THEN ${i + 1}`).join(' ');
+  return `
+        WITH ev AS (
+          SELECT session_id, event_type, "timestamp" as at
+          FROM client_events
+          WHERE event_type IN (${inList})
+            AND session_id IS NOT NULL
+            AND CONCAT(year,'-',month,'-',day) BETWEEN '${startDate}' AND '${endDate}'
+        ),
+        entered AS (
+          SELECT session_id, MIN(at) as entered_at
+          FROM ev
+          WHERE event_type = '${funnel.entryStep}'
+          GROUP BY session_id
+        )
+        SELECT
+          ev.event_type as step,
+          COUNT_IF(ev.at >= entered.entered_at) as event_count,
+          COUNT(DISTINCT CASE WHEN ev.at >= entered.entered_at THEN ev.session_id END) as session_count,
+          COUNT(DISTINCT ev.session_id)
+            - COUNT(DISTINCT CASE WHEN ev.at >= entered.entered_at THEN ev.session_id END) as sessions_outside_funnel
+        FROM ev
+        LEFT JOIN entered ON entered.session_id = ev.session_id
+        GROUP BY ev.event_type
+        ORDER BY CASE ev.event_type ${orderCase} ELSE 99 END
+      `;
+}
+
+function buildQuery(queryType: string, startDate: string, endDate: string, journey?: string): string | null {
   switch (queryType) {
     case 'conversation_volumes':
       return `
@@ -184,14 +252,74 @@ function buildQuery(queryType: string, startDate: string, endDate: string): stri
       return `
         SELECT
           CONCAT(year,'-',month,'-',day) as date,
-          agentType as agent_type,
+          agentType as assistant,
           intentType as intent_type,
           AVG(CAST(relevanceScore AS DOUBLE)) as avg_relevance_score,
           COUNT(*) as count
         FROM evaluation_results
         WHERE CONCAT(year,'-',month,'-',day) BETWEEN '${startDate}' AND '${endDate}'
+          -- REPLIES ONLY. A delivered document is graded in a row of its own (SPEC-EVALUATION FR22)
+          -- and read by document_evaluation; NULL is a row written before the column, which was a reply.
+          AND COALESCE(evaluationType, 'exchange') = 'exchange'
         GROUP BY year, month, day, agentType, intentType
-        ORDER BY year, month, day, agent_type
+        ORDER BY year, month, day, assistant
+      `;
+
+    case 'document_evaluation':
+      // A DELIVERED DOCUMENT'S OWN SCORES (SPEC-EVALUATION FR22), by intent and by task type, the same
+      // two dimensions and column names Aurora mode returns, as far as this mode records them: the
+      // relevance score and whether it was graded. Groundedness and compliance are not judged in Athena
+      // mode, for documents or replies, so their columns are absent rather than zero. The reply's
+      // relevance on the same exchanges travels beside the document's and is never averaged with it.
+      return `
+        WITH docs AS (
+          SELECT exchangeId, intentType,
+                 COALESCE(NULLIF(documentKind, ''), 'document') AS task_type,
+                 evaluationType, skipReason, relevanceScore
+          FROM evaluation_results
+          WHERE CONCAT(year,'-',month,'-',day) BETWEEN '${startDate}' AND '${endDate}'
+            AND evaluationType IN ('document', 'document_skipped')
+        ),
+        replies AS (
+          SELECT exchangeId, MAX(relevanceScore) AS reply_relevance
+          FROM evaluation_results
+          WHERE CONCAT(year,'-',month,'-',day) BETWEEN '${startDate}' AND '${endDate}'
+            AND COALESCE(evaluationType, 'exchange') = 'exchange'
+          GROUP BY exchangeId
+        ),
+        joined AS (
+          SELECT d.*, r.reply_relevance FROM docs d LEFT JOIN replies r ON r.exchangeId = d.exchangeId
+        )
+        SELECT 'intent' AS dimension, intentType AS group_key,
+               COUNT(*) AS documents_delivered,
+               COUNT_IF(evaluationType = 'document') AS documents_scored,
+               COUNT_IF(evaluationType = 'document_skipped') AS documents_skipped,
+               COUNT_IF(skipReason = 'private') AS skipped_private,
+               COUNT_IF(skipReason = 'not-archived') AS skipped_not_archived,
+               COUNT_IF(skipReason = 'hash-mismatch') AS skipped_hash_mismatch,
+               COUNT_IF(skipReason = 'too-long') AS skipped_too_long,
+               COUNT_IF(skipReason = 'empty') AS skipped_empty,
+               COUNT_IF(skipReason = 'unreadable') AS skipped_unreadable,
+               ROUND(AVG(CASE WHEN evaluationType = 'document' THEN CAST(relevanceScore AS DOUBLE) END), 1) AS doc_avg_relevance,
+               ROUND(AVG(CAST(reply_relevance AS DOUBLE)), 1) AS reply_avg_relevance,
+               COUNT(reply_relevance) AS reply_scored_count
+        FROM joined GROUP BY intentType
+        UNION ALL
+        SELECT 'task_type' AS dimension, task_type AS group_key,
+               COUNT(*) AS documents_delivered,
+               COUNT_IF(evaluationType = 'document') AS documents_scored,
+               COUNT_IF(evaluationType = 'document_skipped') AS documents_skipped,
+               COUNT_IF(skipReason = 'private') AS skipped_private,
+               COUNT_IF(skipReason = 'not-archived') AS skipped_not_archived,
+               COUNT_IF(skipReason = 'hash-mismatch') AS skipped_hash_mismatch,
+               COUNT_IF(skipReason = 'too-long') AS skipped_too_long,
+               COUNT_IF(skipReason = 'empty') AS skipped_empty,
+               COUNT_IF(skipReason = 'unreadable') AS skipped_unreadable,
+               ROUND(AVG(CASE WHEN evaluationType = 'document' THEN CAST(relevanceScore AS DOUBLE) END), 1) AS doc_avg_relevance,
+               ROUND(AVG(CAST(reply_relevance AS DOUBLE)), 1) AS reply_avg_relevance,
+               COUNT(reply_relevance) AS reply_scored_count
+        FROM joined GROUP BY task_type
+        ORDER BY dimension, documents_delivered DESC
       `;
 
     case 'intent_distribution':
@@ -203,11 +331,11 @@ function buildQuery(queryType: string, startDate: string, endDate: string): stri
       `;
 
     case 'user_activity':
-      // NOTE: no user_id column in the current Glue schema; aggregates by
-      // user_type partition only. Real per-user activity blocked on Glue
-      // schema work.
+      // NOTE: the conversations Glue table has no person_id column; aggregates by
+      // user_type partition only, which holds the conversation's
+      // classification. Real per-user activity blocked on Glue schema work.
       return `
-        SELECT user_type, COUNT(*) as messages,
+        SELECT user_type AS classification, COUNT(*) as messages,
                COUNT(DISTINCT day) as active_days
         FROM conversations
         WHERE CONCAT(year,'-',month,'-',day) BETWEEN '${startDate}' AND '${endDate}'
@@ -236,14 +364,14 @@ function buildQuery(queryType: string, startDate: string, endDate: string): stri
     // which is the honest contract — better than fake numbers.
 
     case 'active_users_daily':
-      // Session DAU — distinct user_id that auth-resolved at least once per
+      // Session DAU — distinct person_id that auth-resolved at least once per
       // day. Includes signed-in-and-bounced users; not the right signal for
       // "actually engaged with messaging" (see active_messaging_users_daily).
       return `
         SELECT
           CONCAT(year,'-',month,'-',day) as date,
           user_tier,
-          COUNT(DISTINCT user_id) as active_users
+          COUNT(DISTINCT person_id) as active_users
         FROM client_events
         WHERE event_type = 'session_started'
           AND CONCAT(year,'-',month,'-',day) BETWEEN '${startDate}' AND '${endDate}'
@@ -252,7 +380,7 @@ function buildQuery(queryType: string, startDate: string, endDate: string): stri
       `;
 
     case 'active_messaging_users_daily':
-      // Engaged-messaging DAU — distinct user_id that did at least one of:
+      // Engaged-messaging DAU — distinct person_id that did at least one of:
       //   - connected to the Chime messaging WebSocket
       //   - sent a message
       //   - listed channel messages (read intent without typing)
@@ -263,7 +391,7 @@ function buildQuery(queryType: string, startDate: string, endDate: string): stri
         SELECT
           CONCAT(year,'-',month,'-',day) as date,
           user_tier,
-          COUNT(DISTINCT user_id) as active_messaging_users
+          COUNT(DISTINCT person_id) as active_messaging_users
         FROM client_events
         WHERE event_type IN ('websocket_connected', 'message_sent', 'channel_messages_listed')
           AND CONCAT(year,'-',month,'-',day) BETWEEN '${startDate}' AND '${endDate}'
@@ -276,14 +404,13 @@ function buildQuery(queryType: string, startDate: string, endDate: string): stri
       // events (user-originated), not message_received (bot-originated).
       return `
         SELECT
-          user_id,
-          user_email,
+          person_id,
           user_tier,
           COUNT(*) as message_count
         FROM client_events
         WHERE event_type = 'message_sent'
           AND CONCAT(year,'-',month,'-',day) BETWEEN '${startDate}' AND '${endDate}'
-        GROUP BY user_id, user_email, user_tier
+        GROUP BY person_id, user_tier
         ORDER BY message_count DESC
       `;
 
@@ -317,60 +444,38 @@ function buildQuery(queryType: string, startDate: string, endDate: string): stri
       `;
 
     case 'signup_funnel_conversion':
-      // Each funnel step's count + distinct-sessions, ordered by the
-      // canonical sequence so the dashboard can render a left-to-right
-      // bar with step names as-is.
-      return `
-        SELECT
-          event_type as step,
-          COUNT(*) as event_count,
-          COUNT(DISTINCT session_id) as session_count
-        FROM client_events
-        WHERE event_type IN (
-          'signup_form_viewed',
-          'signup_submitted',
-          'signup_confirmation_required',
-          'signup_confirmation_completed',
-          'signup_failed'
-        )
-          AND CONCAT(year,'-',month,'-',day) BETWEEN '${startDate}' AND '${endDate}'
-        GROUP BY event_type
-        ORDER BY
-          CASE event_type
-            WHEN 'signup_form_viewed' THEN 1
-            WHEN 'signup_submitted' THEN 2
-            WHEN 'signup_confirmation_required' THEN 3
-            WHEN 'signup_confirmation_completed' THEN 4
-            WHEN 'signup_failed' THEN 5
-            ELSE 99
-          END
-      `;
+      return sessionFunnelSql(SIGNUP_FUNNEL, startDate, endDate);
 
     case 'signin_funnel_conversion':
+      return sessionFunnelSql(SIGNIN_FUNNEL, startDate, endDate);
+
+    case 'guest_to_customer_funnel':
+      // THE GUEST-TO-CUSTOMER FUNNEL (B12): per recorded stage, the distinct journeys that reached it. A
+      // journey is the visitor's conversation, carried on every stage, so path B is joined by conversation
+      // and never by an address. The stage names are a fixed internal list, never input.
       return `
         SELECT
           event_type as step,
-          COUNT(*) as event_count,
-          COUNT(DISTINCT session_id) as session_count
+          COUNT(DISTINCT json_extract_scalar(properties, '$.journey')) as journeys,
+          COUNT(*) as event_count
         FROM client_events
-        WHERE event_type IN (
-          'signin_form_viewed',
-          'signin_submitted',
-          'signin_succeeded',
-          'signin_failed',
-          'signin_password_reset_initiated'
-        )
+        WHERE event_type IN (${RECORDED_FUNNEL_STAGES.map((st) => `'${st}'`).join(', ')})
           AND CONCAT(year,'-',month,'-',day) BETWEEN '${startDate}' AND '${endDate}'
+          ${journey ? `AND json_extract_scalar(properties, '$.journey') = '${journey}'` : ''}
         GROUP BY event_type
-        ORDER BY
-          CASE event_type
-            WHEN 'signin_form_viewed' THEN 1
-            WHEN 'signin_submitted' THEN 2
-            WHEN 'signin_succeeded' THEN 3
-            WHEN 'signin_failed' THEN 4
-            WHEN 'signin_password_reset_initiated' THEN 5
-            ELSE 99
-          END
+      `;
+
+    case 'guest_refusals':
+      // Guest starts refused, by the reason code the widget was shown (B12, L16).
+      return `
+        SELECT
+          json_extract_scalar(properties, '$.reason') as reason,
+          COUNT(*) as refusals
+        FROM client_events
+        WHERE event_type = 'guest_refused'
+          AND CONCAT(year,'-',month,'-',day) BETWEEN '${startDate}' AND '${endDate}'
+        GROUP BY json_extract_scalar(properties, '$.reason')
+        ORDER BY refusals DESC
       `;
 
     case 'page_load_metrics':
@@ -468,18 +573,20 @@ async function runQuery(sql: string): Promise<{ data: Record<string, string>[]; 
 // ---------------------------------------------------------------------------
 
 export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   console.log('[AnalyticsQuery]', event.httpMethod, event.path);
 
   // Lambda-side admin check is defense-in-depth on top of the API Gateway
   // Cognito authorizer. Without this, any signed-in basic-tier user could query
   // analytics.
-  const auth = requireAdmin(event);
+  const auth = await requireAdmin(event);
   if ('statusCode' in auth) return auth;
 
   // parseJsonBody returns a 400 with the generic "Invalid JSON body" message
   // instead of letting JSON.parse throw into the outer catch (which would
   // surface a 500 + leak SyntaxError text).
-  const parsed = parseJsonBody<{ queryType?: unknown; dateRange?: { start?: unknown; end?: unknown } }>(event);
+  const parsed = parseJsonBody<{ queryType?: unknown; action?: unknown; dateRange?: { start?: unknown; end?: unknown }; journey?: unknown }>(event);
   if ('statusCode' in parsed) return parsed;
 
   try {
@@ -489,19 +596,11 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return respond(400, { error: 'queryType (string) required' });
     }
 
-    // A14: under per-resource IAM enforcement the gateway authorized this request
-    // as the capability of THIS resource path; reject a queryType belonging to a
-    // different capability (e.g. an A13 user-activity query on the low-sensitivity
-    // analytics resource). No-op in Cognito mode (single root resource).
-    // KNOWN LIMITATION (Athena mode): this stack exposes a SINGLE `POST /query` with no
-    // per-capability sub-paths (unlike the Aurora analytics stack), so `capabilityForPath`
-    // always resolves to `view-analytics`. Under enforcement, any queryType mapped to a
-    // finer capability (events-log / user-activity / moderation-audit) is therefore DENIED
-    // here - coarser than the section-3b matrix, fail-CLOSED. Athena reaches parity by
-    // splitting these sub-paths on the stack + exposing the queryTypes; the data itself is
-    // in the Athena archive (the system of record). See DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT.md
-    // section 10.
-    if (isAdminIamEnforcedCall(event) && !queryTypeAllowedOnPath(queryType, event.path || '')) {
+    // Every analytics route is IAM-authorized, and the resource the gateway admitted the caller to names
+    // one capability, so the body must ask for that capability's work. A write is decided by its
+    // `action` as well as its queryType (admin-capability-map.ts).
+    const action = typeof parsed.body.action === 'string' ? parsed.body.action : undefined;
+    if (!queryTypeAllowedOnPath(queryType, event.path || '', action)) {
       return respond(403, { error: 'queryType not permitted on this resource' });
     }
 
@@ -538,19 +637,25 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return respond(400, { error: `Unknown queryType: ${queryType}` });
     }
 
-    const sql = buildQuery(queryType, start, end);
+    // ONE JOURNEY of the guest funnel, when asked (B12): a channel id, validated before it is interpolated,
+    // since Athena's StartQueryExecution takes no parameters.
+    const journey = parsed.body.journey;
+    if (journey !== undefined && (typeof journey !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(journey))) {
+      return respond(400, { error: 'journey is a conversation id' });
+    }
+    const sql = buildQuery(queryType, start, end, journey as string | undefined);
     if (!sql) {
       // SUPPORTED_TYPES claimed support but no SQL - bug, not user error.
       return respond(500, { error: `Internal: no SQL for supported queryType ${queryType}` });
     }
 
     const result = await runQuery(sql);
-    // A14 Scoped: narrow rows to the caller's classification ceiling (rows with a
+    // A14 Scoped: narrow rows to the caller's classification scope (rows with a
     // tier dimension; global aggregates pass through). Full on a Cognito-JWT call;
     // an enforced call fails closed to the floor if the caller is unidentifiable.
     if (isAdminIamEnforcedCall(event)) {
-      const ceiling = await ceilingForRequest(event, USER_POOL_ID);
-      result.data = scopeAnalyticsRows(result.data, ceiling);
+      const callerScope = await scopeForRequest(event, USER_POOL_ID);
+      result.data = scopeAnalyticsRows(result.data, callerScope);
     }
     return respond(200, result);
 

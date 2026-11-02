@@ -1,0 +1,7 @@
+{"intent":"directory_lookup","request":"Who leads the Platform Core team?","reference":"Platform Core is led by its engineering manager, named in the employee directory with their role."}
+{"intent":"directory_lookup","request":"Who should I contact about access to the data warehouse? My email is pat.lee@example.com if they need it.","reference":"Contact the Data Platform team's on-call alias listed in the directory."}
+{"intent":"process_lookup","request":"What is the escalation path for a Sev-1 incident?","reference":"1. Page the on-call engineer. 2. Open an incident channel. 3. Escalate to the incident commander within 15 minutes. The SRE team owns the process."}
+{"intent":"process_lookup","request":"What is our response-time SLA for a premium support ticket?"}
+{"intent":"data_extraction","request":"Give me the onboarding checklist as a table with owner and due day."}
+{"intent":"report_generation","request":"Write a short summary of last quarter's support ticket trends for the leadership update."}
+{"intent":"report_generation","request":"And break that down by region.","precedingTurns":[{"role":"user","text":"Summarize last quarter's support ticket trends."},{"role":"assistant","text":"Ticket volume rose 8% quarter over quarter, led by billing questions."}],"replyPreferences":{"answerStyle":"brief"}}

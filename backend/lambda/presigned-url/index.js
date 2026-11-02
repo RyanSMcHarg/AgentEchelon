@@ -1,6 +1,10 @@
 const { S3Client, GetObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 const { createPresignedPost } = require('@aws-sdk/s3-presigned-post');
+// Bundled from the TypeScript source (the stack builds this function with esbuild): who the caller is
+// comes from the one resolver every handler uses.
+const { callerPersonId } = require('../src/lib/auth');
+const { responder, originsFrom, DEV_ORIGIN } = require('../src/lib/http-response');
 
 const s3Client = new S3Client({});
 const BUCKET_NAME = process.env.BUCKET_NAME;
@@ -11,7 +15,17 @@ const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
 // userId, conversationId, fileName (path traversal), or fileType (no MIME
 // allow-list) without
 // a size cap on the presigned PUT.
-const MAX_FILE_BYTES = 10 * 1024 * 1024; // 10 MiB; matches frontend cap
+// 10 MiB; matches the frontend cap in frontend/packages/chat/src/services/attachmentService.ts.
+//
+// DELIBERATELY HIGHER THAN WHAT A MODEL CAN READ (owner decision, 2026-09-15). The per-attachment
+// budget for Amazon Bedrock is 3,750,000 raw bytes (5 MB base64), stated once in
+// backend/lambda/src/lib/attachment-budget.ts. This cap is NOT lowered to match it, because an
+// attachment has uses beyond being read by a model: a 6 MB PDF is still stored, still downloadable by
+// every member, and still the thing the conversation is about. The turn degrades at SEND time instead -
+// the assistant answers without the file and says so, in configured copy - so the person is told at the
+// point the difference bites. Lowering this cap would mean moving the frontend cap and the upload-time
+// copy with it, in one change.
+const MAX_FILE_BYTES = 10 * 1024 * 1024;
 
 // Allow-list keyed to what the frontend can actually upload. Matches the
 // list in frontend/src/services/attachmentService.ts ALLOWED_TYPES.
@@ -38,20 +52,8 @@ const ALLOWED_MIME_TYPES = new Set([
 // into a peer prefix even though S3 doesn't normalise.
 const UNSAFE_FILENAME_RE = /[\x00-\x1f\\/]|^\.\.?$|^\.\.[\\/]/;
 
-function corsHeaders(origin) {
-  const allowed = origin && ALLOWED_ORIGIN.split(',').includes(origin) ? origin : ALLOWED_ORIGIN.split(',')[0];
-  return {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': allowed,
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-    'Access-Control-Allow-Methods': 'POST,OPTIONS',
-    'Vary': 'Origin',
-  };
-}
-
-function respond(statusCode, body, origin) {
-  return { statusCode, headers: corsHeaders(origin), body: JSON.stringify(body) };
-}
+const http = responder({ origin: { allow: originsFrom(ALLOWED_ORIGIN, DEV_ORIGIN) }, methods: 'POST,OPTIONS' });
+const respond = http.respond;
 
 /**
  * Lambda handler for generating presigned URLs for S3 upload/download.
@@ -63,11 +65,10 @@ exports.handler = async (event) => {
   const origin = event.headers?.origin || event.headers?.Origin;
 
   try {
-    // Caller identity must come from the JWT claims, not the request body. If
-    // userId were body-supplied, an authed user A could write attachments under
-    // user B's storage prefix.
-    const claims = event.requestContext?.authorizer?.claims || {};
-    const callerSub = claims.sub || claims['cognito:username'];
+    // Caller identity must come from the verified token, resolved to the person
+    // (`callerPersonId`), not the request body. If userId were body-supplied, an
+    // authed user A could write attachments under user B's storage prefix.
+    const callerSub = await callerPersonId(event);
     if (!callerSub) {
       return respond(401, { error: 'Unauthorized' }, origin);
     }
@@ -121,13 +122,13 @@ exports.handler = async (event) => {
         }, origin);
       }
 
-      // Server-composed key — userId is the caller's JWT sub, NOT the
+      // Server-composed key — userId is the caller's person id, NOT the
       // body. Timestamp + sanitised fileName tail.
       const key = `attachments/${conversationId}/${callerSub}/${Date.now()}-${fileName}`;
 
       // PRESIGNED POST, not a presigned PUT, and the difference is the size cap actually working.
       // The previous shape signed ContentLength: MAX_FILE_BYTES on a PutObjectCommand believing it
-      // capped the upload - but a signed content-length is an EXACT pin, not a ceiling, so every
+      // capped the upload - but a signed content-length is an EXACT pin, not a maximum, so every
       // real upload (whose length is never exactly 10 MiB) failed SignatureDoesNotMatch and user
       // uploads were broken wholesale (measured live; found by the 1:1 @all attachment e2e).
       // POST policies are the S3 mechanism built for browser uploads: content-length-range is a

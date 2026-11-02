@@ -5,7 +5,7 @@
  * Tests the transport + auth + validation contract. Storage semantics
  * (LWW, server-stamped chosenAt) are covered in battle-outcome.test.ts;
  * here lib/battle-outcome is mocked so we pin:
- *   - chosenByUserSub comes from the Cognito token, NEVER the body
+ *   - chosenByPersonId comes from the verified token, NEVER the body
  *   - 401 without a sub; 400 on missing battleId / invalid winner /
  *     bad JSON; 503 when the store is unavailable after valid input
  *   - GET returns { outcome } (possibly null = "no pick yet")
@@ -24,6 +24,7 @@ jest.mock('../lambda/src/lib/battle-outcome', () => ({
 }));
 
 import { handler } from '../lambda/src/battle-outcome-api';
+import { asPerson, edgeContext } from './helpers/edge-context';
 
 const BATTLE_ID = 'a1b2c3d4e5f60718';
 const SUB = 'user-sub-1';
@@ -48,18 +49,18 @@ function makeEvent(opts: {
     body: opts.body === undefined ? null : typeof opts.body === 'string' ? opts.body : JSON.stringify(opts.body),
     queryStringParameters: opts.query ?? null,
     headers: { origin: opts.origin ?? 'http://localhost:5173' },
-    requestContext: { authorizer: { claims } },
+    requestContext: { authorizer: edgeContext({ claims }) },
   } as unknown as APIGatewayProxyEvent;
 }
 
 beforeEach(() => jest.clearAllMocks());
 
 describe('POST /channels/battle/outcome', () => {
-  it('records a pick with chosenByUserSub from the TOKEN, not the body', async () => {
+  it('records a pick with chosenByPersonId from the TOKEN, not the body', async () => {
     mockRecord.mockResolvedValueOnce({
       battleId: BATTLE_ID,
       winner: 'B',
-      chosenByUserSub: SUB,
+      chosenByPersonId: SUB,
       chosenAt: '2026-05-15T00:00:00.000Z',
     });
 
@@ -67,7 +68,7 @@ describe('POST /channels/battle/outcome', () => {
       makeEvent({
         method: 'POST',
         // Attacker tries to attribute the pick to someone else via body:
-        body: { battleId: BATTLE_ID, winner: 'B', channelArn: CHANNEL_ARN, chosenByUserSub: 'victim-sub' },
+        body: { battleId: BATTLE_ID, winner: 'B', channelArn: CHANNEL_ARN, chosenByPersonId: 'victim-sub' },
         sub: SUB,
       }),
     );
@@ -77,11 +78,24 @@ describe('POST /channels/battle/outcome', () => {
     expect(mockRecord).toHaveBeenCalledWith({
       battleId: BATTLE_ID,
       winner: 'B',
-      chosenByUserSub: SUB, // from claims, body value ignored
+      chosenByPersonId: SUB, // from claims, body value ignored
     });
   });
 
-  it('401 when there is no Cognito sub', async () => {
+  it('records the pick as the PERSON the token resolves to, never the token sub or a person the body names', async () => {
+    // The exchange mints a person id that is not the token's sub; the vote is that person's.
+    const PERSON = '0190f5c2-7b3a-7c11-9d2e-5a6b7c8d9e0f';
+    mockRecord.mockResolvedValueOnce({ battleId: BATTLE_ID, winner: 'A', chosenByPersonId: PERSON, chosenAt: '2026-05-15T00:00:00.000Z' });
+    const res = await handler(asPerson(makeEvent({
+      method: 'POST',
+      body: { battleId: BATTLE_ID, winner: 'A', channelArn: CHANNEL_ARN, chosenByPersonId: 'victim-person', personId: 'victim-person' },
+      sub: SUB,
+    }), PERSON));
+    expect(res.statusCode).toBe(200);
+    expect(mockRecord).toHaveBeenCalledWith({ battleId: BATTLE_ID, winner: 'A', chosenByPersonId: PERSON });
+  });
+
+  it('401 when the sign-in names no person', async () => {
     const res = await handler(
       makeEvent({ method: 'POST', body: { battleId: BATTLE_ID, winner: 'A' }, sub: null }),
     );
@@ -131,9 +145,9 @@ describe('POST /channels/battle/outcome', () => {
 
 describe('GET /channels/battle/outcome', () => {
   it('returns the caller\'s own recorded pick', async () => {
-    // readUserBattleOutcome returns the caller's vote row (userSub); the handler shapes it into the
-    // response outcome, mapping userSub -> chosenByUserSub (never another member's sub).
-    mockRead.mockResolvedValueOnce({ winner: 'A', userSub: SUB, chosenAt: '2026-05-15T00:00:00.000Z' });
+    // readUserBattleOutcome returns the caller's vote row (personId); the handler shapes it into the
+    // response outcome, mapping personId -> chosenByPersonId (never another member's).
+    mockRead.mockResolvedValueOnce({ winner: 'A', personId: SUB, chosenAt: '2026-05-15T00:00:00.000Z' });
     const res = await handler(
       makeEvent({ method: 'GET', query: { battleId: BATTLE_ID } }),
     );
@@ -141,7 +155,7 @@ describe('GET /channels/battle/outcome', () => {
     expect(JSON.parse(res.body).outcome).toEqual({
       battleId: BATTLE_ID,
       winner: 'A',
-      chosenByUserSub: SUB,
+      chosenByPersonId: SUB,
       chosenAt: '2026-05-15T00:00:00.000Z',
     });
     expect(mockRead).toHaveBeenCalledWith(BATTLE_ID, SUB); // scoped to the caller's sub

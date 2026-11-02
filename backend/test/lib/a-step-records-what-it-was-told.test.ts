@@ -42,11 +42,23 @@ describe('the tool carries the needs of the step it is called from', () => {
     expect(json.required).toEqual(expect.arrayContaining(['to_state', 'reason']));
   });
 
-  // A step with no declared needs gets the plain tool. Every task turn pays for the tool schema in
-  // tokens, so a step that needs nothing must not carry an empty checklist.
+  // A step with no declared needs and no move that hands over a document gets the plain tool. Every
+  // task turn pays for the tool schema in tokens, so a step that needs nothing must not carry an empty
+  // checklist.
   it('is the unchanged spec for a state that declares no requirements', () => {
-    const [spec] = taskToolSpecsFor('report_generation', DEFAULT_TASK_STATE_MACHINES, 'generating');
+    const [spec] = taskToolSpecsFor('guided_troubleshooting', DEFAULT_TASK_STATE_MACHINES, 'diagnosing');
     expect(spec).toBe(ADVANCE_TASK_STATE_TOOL_SPEC);
+  });
+
+  // A step whose moves hand over a document names them, because the `document` argument is required
+  // on exactly those moves and the model cannot see the machine. It is also offered the rewrite
+  // declaration, since the task sits in a delivering step.
+  it('names the moves that hand over a document, and offers the rewrite declaration in a delivering step', () => {
+    const specs = taskToolSpecsFor('report_generation', DEFAULT_TASK_STATE_MACHINES, 'generating');
+    expect(specs.map((s) => s.toolSpec.name)).toEqual(['advance_task_state', 'deliver_document']);
+    expect(specs[0].toolSpec.description).toContain('"completed" or "revising" hands over the finished document');
+    expect((specs[0].toolSpec.inputSchema.json as unknown as { properties: Record<string, unknown> }).properties.document)
+      .toBeDefined();
   });
 
   it('is the unchanged spec when the caller names no state at all', () => {
@@ -60,6 +72,8 @@ describe('the tool carries the needs of the step it is called from', () => {
 });
 
 describe('the answers are read tolerantly, because a model supplies them', () => {
+  // `requirement` is the name the field had before needs carried their source. An input in that shape
+  // still records its values, and records no source, so it cannot satisfy a step that requires one.
   it('maps requirement to value', () => {
     expect(collectedRequirements([
       { requirement: 'the audience', value: 'engineering leadership' },
@@ -68,6 +82,20 @@ describe('the answers are read tolerantly, because a model supplies them', () =>
       requirements: {
         'the audience': 'engineering leadership',
         'the length or format': '1-2 pages',
+      },
+      sourced: {},
+    });
+  });
+
+  it('records a need with its source and evidence when both are given', () => {
+    expect(collectedRequirements([
+      { need: 'the audience', value: 'the board', source: 'message', evidence: '"for the board"' },
+      { need: 'where it comes from', value: 'the CRM export', source: 'context', evidence: 'crm/accounts.json' },
+    ])).toEqual({
+      requirements: { 'the audience': 'the board', 'where it comes from': 'the CRM export' },
+      sourced: {
+        'the audience': { value: 'the board', source: 'message', evidence: '"for the board"' },
+        'where it comes from': { value: 'the CRM export', source: 'context', evidence: 'crm/accounts.json' },
       },
     });
   });
@@ -88,12 +116,12 @@ describe('the answers are read tolerantly, because a model supplies them', () =>
     expect(collectedRequirements([
       { requirement: 'the audience', value: 'the board' },
       { requirement: 'the subject', value: 42 },
-    ])).toEqual({ requirements: { 'the audience': 'the board' } });
+    ])).toEqual({ requirements: { 'the audience': 'the board' }, sourced: {} });
   });
 
   it('trims, so a copied requirement with stray whitespace still matches its declaration', () => {
     expect(collectedRequirements([{ requirement: '  the audience  ', value: '  the board  ' }]))
-      .toEqual({ requirements: { 'the audience': 'the board' } });
+      .toEqual({ requirements: { 'the audience': 'the board' }, sourced: {} });
   });
 });
 
@@ -126,6 +154,7 @@ describe('a size is recorded as a range, not as a sentence to be parsed later', 
         'the audience': 'engineering leadership',
         'the length or format': '1-2 pages',
       },
+      sourced: {},
       lengthTarget: { minWords: 600, maxWords: 900, source: '1-2 pages' },
     });
   });
@@ -234,8 +263,9 @@ describe('a size is recorded as a range, not as a sentence to be parsed later', 
     expect(items.properties.sizeLabel).toBeDefined();
     expect(items.properties.minWords.description).toMatch(/only when this requirement fixes a SIZE/i);
     expect(items.properties.sizeLabel.description).toMatch(/never the whole of what they said/i);
-    // Optional: a requirement that names no size must not force the model to invent one.
-    expect(items.required).toEqual(['requirement', 'value']);
+    // Optional: a requirement that names no size must not force the model to invent one. The need,
+    // its value, and where it came from are always required.
+    expect(items.required).toEqual(['need', 'value', 'source', 'evidence']);
   });
 });
 
@@ -271,7 +301,9 @@ describe('what the tool wrote is handed back to the turn that wrote it', () => {
         to_state: 'extracting',
         reason: 'the person supplied the last requirement',
         collected: [
-          { requirement: 'the output format', value: 'a table, at most 200 words', minWords: 120, maxWords: 200, sizeLabel: 'at most 200 words' },
+          { need: 'what data to pull', value: 'churn-risk accounts', source: 'message', evidence: 'flagged as churn risk' },
+          { need: 'where it comes from', value: 'the CRM export', source: 'context', evidence: 'crm/accounts.json' },
+          { need: 'the output format', value: 'a table, at most 200 words', source: 'message', evidence: 'a table, 200 words max', minWords: 120, maxWords: 200, sizeLabel: 'at most 200 words' },
         ],
       },
     });
@@ -279,17 +311,26 @@ describe('what the tool wrote is handed back to the turn that wrote it', () => {
     expect(out.details).toEqual({
       requirements: {
         'the subject': 'churn risk',           // the earlier step's answer survives
+        'what data to pull': 'churn-risk accounts',
+        'where it comes from': 'the CRM export',
         'the output format': 'a table, at most 200 words',
+      },
+      collectedRequirements: {
+        'what data to pull': { value: 'churn-risk accounts', source: 'message', evidence: 'flagged as churn risk' },
+        'where it comes from': { value: 'the CRM export', source: 'context', evidence: 'crm/accounts.json' },
+        'the output format': { value: 'a table, at most 200 words', source: 'message', evidence: 'a table, 200 words max' },
       },
       lengthTarget: { minWords: 120, maxWords: 200, source: 'at most 200 words' },
     });
   });
 
   it('returns no details when the call recorded nothing, so the caller overwrites nothing', async () => {
+    // From a step that declares no needs, so the call is applied and genuinely records nothing.
     const out = await handleAdvanceTaskStateTool({
-      task,
-      input: { to_state: 'extracting', reason: 'moving on' },
+      task: { ...task, taskState: 'extracting' },
+      input: { to_state: 'validating', reason: 'moving on' },
     });
+    expect(out.result.ok).toBe(true);
     expect(out.details).toBeUndefined();
   });
 
@@ -300,6 +341,11 @@ describe('what the tool wrote is handed back to the turn that wrote it', () => {
     const core = require('fs').readFileSync(
       require('path').join(__dirname, '../../lambda/src/lib/async-processor-core.ts'), 'utf8',
     );
-    expect(core).toContain('if (writtenDetails) taskContext.task.details = writtenDetails;');
+    // ONTO THE TARGET, which is `taskContext.task` unless the model named a different piece of
+    // their open work this turn (ADR-024 D7). The rule is unchanged - what the tool wrote is
+    // handed back to the turn that wrote it - and it now follows the task that was actually moved.
+    expect(core).toContain('if (writtenDetails) targetTask.details = writtenDetails;');
+    // Still conditional, so a call that recorded nothing cannot blank the details.
+    expect(core).not.toContain('targetTask.details = writtenDetails ??');
   });
 });

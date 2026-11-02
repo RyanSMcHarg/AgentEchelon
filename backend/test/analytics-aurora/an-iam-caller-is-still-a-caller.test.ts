@@ -1,8 +1,8 @@
 /**
- * UNDER IAM ENFORCEMENT THERE ARE NO JWT CLAIMS, AND THE ADMIN IS STILL A NAMED PERSON.
+ * ON AN IAM-AUTHORIZED ROUTE THERE ARE NO JWT CLAIMS, AND THE ADMIN IS STILL A NAMED PERSON.
  *
- * `adminIamEnforcement` defaults ON, and with it the analytics API is AWS_IAM authorized: the admin
- * console SigV4-signs with its Identity-Pool credentials and a Bearer JWT is rejected outright. So
+ * The analytics API is AWS_IAM authorized in every deployment: the admin console SigV4-signs with its
+ * console session and a Bearer JWT is rejected outright. So
  * `requestContext.authorizer.claims` is empty on every real request, and `callerSub` - which read
  * only those claims - was the empty string.
  *
@@ -15,8 +15,8 @@
  *   - the MODERATION AUDIT records its actor as blank. That one is worse, because it succeeds: a
  *     redaction is performed and written with nobody's name against it.
  *
- * `iamCallerSub` recovers the same server-verified sub from the request identity's Cognito
- * authentication provider. It is a different ROUTE to the same fact, not a weaker one - and it is
+ * `callerPersonId`, the one resolver, recovers the person from the console session's role-session name,
+ * or resolves the request identity's Cognito authentication provider (the shape these tests send). It is a different ROUTE to the same fact, not a weaker one - and it is
  * emphatically not a body-supplied value, which is what the last test here pins.
  */
 import type { APIGatewayProxyEvent } from 'aws-lambda';
@@ -37,6 +37,10 @@ jest.mock('../../lambda/src/analytics-aurora/classifier-replay', () => ({
 }));
 
 import { handler } from '../../lambda/src/analytics-aurora/analytics-query';
+import { edgeContext } from '../helpers/edge-context';
+
+// The pool is this deployment's own: the trusted-issuer registry a function with no TRUSTED_ISSUERS reads.
+process.env.USER_POOL_ID = 'us-east-1_pool';
 
 const SUB = '7f1c2a44-0000-4000-8000-abcdefabcdef';
 
@@ -44,16 +48,15 @@ const SUB = '7f1c2a44-0000-4000-8000-abcdefabcdef';
 function iamEvent(body: unknown): APIGatewayProxyEvent {
   return {
     httpMethod: 'POST',
-    path: '/query',
+    path: '/ground-truth', // an adjudication is a label-ground-truth write, on its own resource
     body: JSON.stringify(body),
     requestContext: {
       // No `authorizer` at all - this is the shape the defect was invisible in.
       identity: {
         // `iamPrincipal` reads userArn/caller/accountId - this is what makes the call
         // recognisably IAM-signed, and therefore admin under enforcement.
-        userArn: 'arn:aws:sts::123456789012:assumed-role/AdminConsole/CognitoIdentityCredentials',
-        cognitoAuthenticationProvider:
-          `cognito-idp.us-east-1.amazonaws.com/us-east-1_pool,cognito-idp.us-east-1.amazonaws.com/us-east-1_pool:CognitoSignIn:${SUB}`,
+        // The admin console's session, which the exchange names after the person.
+        userArn: `arn:aws:sts::123456789012:assumed-role/agent-echelon-admin-console/console-${SUB}`,
       },
     },
   } as unknown as APIGatewayProxyEvent;
@@ -102,19 +105,16 @@ describe('the caller is server-verified, whichever route names them', () => {
     expect(mockAdjudicate).not.toHaveBeenCalledWith(expect.objectContaining({ adjudicatedBy: 'somebody-else' }));
   });
 
-  it('a JWT claim still wins when there is one, so the unenforced path is unchanged', async () => {
-    // Non-regression for a deployment running with `adminIamEnforcement` off, where the authorizer
-    // is present and the claims are the right source.
+  it('a Cognito-authorized call resolves through its token, so the unenforced path still names its caller', async () => {
+    // One resolver for both shapes: with no signed identity, the token's subject resolves to the person.
+    // No deployed analytics route carries a Cognito authorizer (every one is AWS_IAM), so this is
+    // handler-level only.
     const jwtEvent = {
       httpMethod: 'POST',
-      path: '/query',
+      path: '/ground-truth',
       body: JSON.stringify({ queryType: 'classifier_replay_adjudicate', labelId: 'lbl-1', status: 'agreed' }),
       requestContext: {
-        authorizer: { claims: { sub: 'jwt-sub', 'cognito:groups': 'admins' } },
-        identity: {
-          cognitoAuthenticationProvider:
-            `cognito-idp.us-east-1.amazonaws.com/p,cognito-idp.us-east-1.amazonaws.com/p:CognitoSignIn:${SUB}`,
-        },
+        authorizer: edgeContext({ claims: { sub: 'jwt-sub', iss: 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_pool', 'cognito:groups': 'admins' } }),
       },
     } as unknown as APIGatewayProxyEvent;
     await handler(jwtEvent);

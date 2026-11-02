@@ -19,8 +19,9 @@ import {
   ChimeSDKMessagingClient,
   ListChannelModeratorsCommand,
 } from '@aws-sdk/client-chime-sdk-messaging';
+import { sessionClient } from './assistant-session.js';
 
-const messagingClient = new ChimeSDKMessagingClient({});
+const messagingClient = sessionClient(ChimeSDKMessagingClient, {});
 
 /**
  * True iff `callerArn` is a current moderator of `channelArn`.

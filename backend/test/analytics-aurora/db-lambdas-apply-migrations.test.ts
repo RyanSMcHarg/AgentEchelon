@@ -12,8 +12,10 @@
  *      reconnect. On every later deploy it fires as an Update and no-ops, BY DESIGN.
  *   2. `dbLambdaCommandHooks()` copies `schema/*.sql` into the bundle of every DB Lambda. That is what
  *      makes runtime application POSSIBLE.
- *   3. `ensureSchema()` is what makes it HAPPEN - and it was called by only 3 of the 8 Lambdas that
- *      bundled the files.
+ *   3. `ensureSchema()` is what makes it HAPPEN - and it was called by only 2 of the 8 Lambdas that
+ *      bundled the files. (The fix added it to six: the data plane, the evaluation runner, the summary
+ *      updater, the abandonment detector, document ingestion and the classifier-replay handler. This
+ *      line read "only 3 of the 8" against that same list of six, which does not add up.)
  *
  * Bundling the schema reads as "this Lambda can apply migrations" and is not the same claim. The
  * system stayed apparently healthy because `kinesis-archival` calls `ensureSchema` and runs on every
@@ -21,7 +23,7 @@
  * that runs FIRST needed a new table.
  *
  * SOURCE-LEVEL, like `control-parity.test.ts`: it asserts the entry module references `ensureSchema`.
- * It cannot prove the call is reached on every branch - that is what the behavioural tests cover - but
+ * It cannot prove the call is reached on every branch - that is what the behavioral tests cover - but
  * it does catch the failure that actually happened, which was no call at all.
  *
  * ADDING A DB LAMBDA? Add its entry file here. The list is derived from the stack below, so a new one
@@ -32,10 +34,17 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const SRC = path.join(__dirname, '..', '..', 'lambda', 'src', 'analytics-aurora');
-const STACK = path.join(__dirname, '..', '..', 'lib', 'stacks', 'analytics-stack-aurora.ts');
+// The archive builds the shared data-plane Lambdas, each classification's stack builds its own turn data plane
+// and classifier replay, and the admin backend builds the analytics query in its VPC.
+const STACKS = [
+  path.join(__dirname, '..', '..', 'lib', 'stacks', 'archive-stack-aurora.ts'),
+  path.join(__dirname, '..', '..', 'lib', 'constructs', 'classification-archive-functions.ts'),
+  path.join(__dirname, '..', '..', 'lib', 'constructs', 'admin-analytics.ts'),
+];
 
 /**
- * The entry modules of every Lambda the Aurora stack builds with `dbLambdaCommandHooks()`.
+ * The entry modules of every Lambda built with `dbLambdaCommandHooks()`: the Aurora archive's, and the
+ * admin backend's analytics query.
  *
  * `schema-init.ts` is deliberately ABSENT: it is the bootstrap itself, applies the files directly,
  * and must not call `ensureSchema` (which runs on the IAM connection it does not have).
@@ -63,8 +72,7 @@ describe('every schema-bundling Lambda applies pending migrations', () => {
     // The list above is hand-maintained, which is exactly how the original gap survived: someone adds
     // a ninth DB Lambda and nothing notices. Count the real uses in the stack and hold the list to it,
     // so a new one fails HERE rather than silently inheriting the defect.
-    const stack = fs.readFileSync(STACK, 'utf8');
-    const uses = (stack.match(/commandHooks:\s*dbLambdaCommandHooks\(\)/g) || []).length;
+    const uses = STACKS.reduce((n, f) => n + (fs.readFileSync(f, 'utf8').match(/commandHooks:\s*dbLambdaCommandHooks\(\)/g) || []).length, 0);
     expect(uses).toBe(DB_LAMBDA_ENTRIES.length);
   });
 });

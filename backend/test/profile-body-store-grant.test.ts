@@ -16,25 +16,11 @@
  * same class of failure as the alt-bot roster read, which shipped inert because every test exercised the
  * code and none exercised the deployment.
  */
-import * as cdk from 'aws-cdk-lib';
-import { Template } from 'aws-cdk-lib/assertions';
-import { ExperimentsStack } from '../lib/stacks/experiments-stack';
-import { BasicClassificationStack } from '../lib/stacks/basic-classification-stack';
-import { DEFAULT_PROFILE_MODEL_SELECTION } from '../lib/config/model-strategy';
+import { adminServicesTemplate, assistantAdministrationTemplate, basicClassificationTemplate } from './helpers/synth';
 
-const env = { account: '123456789012', region: 'us-east-1' };
-const APP_INSTANCE_ARN = 'arn:aws:chime:us-east-1:123456789012:app-instance/test';
-const BUCKET_ARN_PARAM = '/agentechelon/shared/attachments-bucket-arn';
-
-function experimentsTemplate(props: { attachmentsBucketArnParam?: string }) {
-  const app = new cdk.App();
-  const stack = new ExperimentsStack(app, 'AgentEchelonExperiments', {
-    env,
-    appInstanceArn: APP_INSTANCE_ARN,
-    userPoolId: 'us-east-1_TESTPOOL',
-    ...props,
-  });
-  return Template.fromStack(stack).toJSON() as Record<string, never>;
+/** Assistant administration (manage-profiles), the admin backend's, with or without experiments declared. */
+function profilesTemplate(): Record<string, never> {
+  return assistantAdministrationTemplate({ noExperiments: true }).toJSON() as Record<string, never>;
 }
 
 /** The manage-profiles function, found by its entry rather than a logical id. */
@@ -48,7 +34,7 @@ function manageProfilesEnv(json: Record<string, never>): Record<string, string> 
 
 describe('the profile body store is wired end to end', () => {
   it('manage-profiles is granted BOTH s3 verbs on the profiles prefix', () => {
-    const raw = JSON.stringify(experimentsTemplate({ attachmentsBucketArnParam: BUCKET_ARN_PARAM }));
+    const raw = JSON.stringify(profilesTemplate());
     // Read as well as write: editing a draft, cloning the active version and exporting all read the
     // persona back. A write-only grant would land the body and then fail every subsequent edit.
     expect(raw).toContain('s3:PutObject');
@@ -57,29 +43,21 @@ describe('the profile body store is wired end to end', () => {
   });
 
   it('manage-profiles carries PROFILE_BODY_BUCKET, or it silently keeps personas inline', () => {
-    const vars = manageProfilesEnv(experimentsTemplate({ attachmentsBucketArnParam: BUCKET_ARN_PARAM }));
+    const vars = manageProfilesEnv(profilesTemplate());
     expect(Object.keys(vars)).toContain('PROFILE_BODY_BUCKET');
   });
 
-  it('FAILS the way it is meant to: no bucket param ⇒ no env, no grant', () => {
-    // Proving the two assertions above can fail. Without this, a template that never contained either
-    // string would pass them by accident and the guard would be decorative.
-    const json = experimentsTemplate({});
-    expect(Object.keys(manageProfilesEnv(json))).not.toContain('PROFILE_BODY_BUCKET');
-    expect(JSON.stringify(json)).not.toContain('/profiles/*');
+  it('FAILS the way it is meant to: a template without manage-profiles carries neither', () => {
+    // Proving the two assertions above can fail. Without this, a template that contained both strings
+    // everywhere would pass them by accident and the guard would be decorative. The admin backend's own
+    // template holds no profile writer: that is its nested assistant administration.
+    const json = adminServicesTemplate({ noExperiments: true }).toJSON() as Record<string, never>;
+    expect(JSON.stringify(json)).not.toContain('PROFILE_BODY_BUCKET');
+    expect(() => manageProfilesEnv(json)).toThrow(/exactly one ManageProfilesFunction/);
   });
 
   it('the async processor can READ the prefix its definition points into', () => {
-    const app = new cdk.App();
-    const stack = new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', {
-      env,
-      appInstanceArn: APP_INSTANCE_ARN,
-      attachmentsBucketName: 'test-bucket',
-      attachmentsBucketArn: 'arn:aws:s3:::test-bucket',
-      profileModelSelection: DEFAULT_PROFILE_MODEL_SELECTION,
-    } as never);
-
-    const json = Template.fromStack(stack).toJSON() as Record<string, never>;
+    const json = basicClassificationTemplate().toJSON() as Record<string, never>;
     const resources: Record<string, { Type: string; Properties?: Record<string, unknown> }> = json.Resources;
 
     // The grant must sit on a statement that actually carries s3:GetObject — asserting the ARN alone
@@ -110,16 +88,7 @@ describe('the profile body store is wired end to end', () => {
     // the persona pointer cannot be followed. So a router without this env + grant does not error: it
     // classifies with the deployment default forever while the processor runs the activated version.
     // That is the third silent way this store ships inert, and it shipped exactly that way.
-    const app = new cdk.App();
-    const stack = new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', {
-      env,
-      appInstanceArn: APP_INSTANCE_ARN,
-      attachmentsBucketName: 'test-bucket',
-      attachmentsBucketArn: 'arn:aws:s3:::test-bucket',
-      profileModelSelection: DEFAULT_PROFILE_MODEL_SELECTION,
-    } as never);
-
-    const json = Template.fromStack(stack).toJSON() as Record<string, never>;
+    const json = basicClassificationTemplate().toJSON() as Record<string, never>;
     const resources: Record<string, { Type: string; Properties?: Record<string, unknown> }> = json.Resources;
 
     // The router function, found by its router-only env key. It must know the bucket.

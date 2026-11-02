@@ -2,7 +2,7 @@
  * Context source OUTCOMES: the classifier and the CloudWatch signal.
  *
  * This exists because the feature degrades silently on purpose, so its only safety property for an
- * operator is that the degrade is COUNTED and correctly labelled. Two failures in particular must not
+ * operator is that the degrade is COUNTED and correctly labeled. Two failures in particular must not
  * be confused: `denied` (a boundary refused a read) and `absent` (nobody uploaded the document). One
  * is a security event, the other is a content gap, and before this module both arrived as `null`.
  *
@@ -28,7 +28,7 @@ function sdkError(name: string, httpStatusCode?: number): Error {
 describe('classifyAccessError', () => {
   describe('denied - the outcome an alarm fires on', () => {
     // The SDKs are not consistent about the name, which is exactly how a refusal ends up
-    // unrecognised and silently reclassified as a content gap.
+    // unrecognized and silently reclassified as a content gap.
     it.each([
       ['S3', 'AccessDenied'],
       ['most services', 'AccessDeniedException'],
@@ -137,6 +137,7 @@ describe('emitContextSourceOutcome', () => {
     ['error', 'ContextSourceFailed'],
     ['not-in-catalog', 'ContextSourceSkipped'],
     ['unavailable', 'ContextSourceSkipped'],
+    ['no-record', 'ContextSourceSkipped'],
   ] as const)('maps outcome %s to metric %s', (outcome, metric) => {
     emitContextSourceOutcome({ classification: 'standard', sourceKey: 'k', outcome });
     const doc = emitted();

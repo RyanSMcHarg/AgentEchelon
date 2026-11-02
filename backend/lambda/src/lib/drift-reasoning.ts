@@ -32,6 +32,8 @@
  */
 
 import { BedrockRuntimeClient, ConverseCommand } from '@aws-sdk/client-bedrock-runtime';
+import { UTILITY_MODEL_ID } from '../../../lib/config/model-strategy.js';
+import { sessionClient } from './assistant-session.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 
@@ -40,7 +42,7 @@ const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 // as premium (ADR-013).
 const REASONING_MODEL = process.env.DRIFT_REASONING_MODEL_ID
   || process.env.CLASSIFIER_MODEL_ID
-  || 'anthropic.claude-3-haiku-20240307-v1:0';
+  || UTILITY_MODEL_ID;
 
 // Messages shorter than this can't carry a topic shift worth acting on; skip the
 // model call entirely (greetings, "ok", "thanks").
@@ -71,7 +73,7 @@ export type DriftJudgeInvoke = (prompt: string) => Promise<string>;
 let _client: BedrockRuntimeClient | undefined;
 function defaultInvoke(): DriftJudgeInvoke {
   return async (prompt: string) => {
-    _client = _client || new BedrockRuntimeClient({ region: AWS_REGION });
+    _client = _client || sessionClient(BedrockRuntimeClient, { region: AWS_REGION });
     const response = await _client.send(new ConverseCommand({
       modelId: REASONING_MODEL,
       messages: [{ role: 'user', content: [{ text: prompt }] }],

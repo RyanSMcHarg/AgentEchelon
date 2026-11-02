@@ -48,10 +48,61 @@ beforeEach(() => {
 describe('abandonment-detector handler', () => {
   it('no candidates → returns { checked: 0, abandoned: 0 }', async () => {
     mockedQuery.mockResolvedValueOnce(mockRows<{ event_id: string; parent_channel_arn: string; new_channel_arn: string }>([]));
+    mockedQuery.mockResolvedValueOnce(mockRows<{ event_id: string }>([]));
     const { handler } = await import('../../lambda/src/analytics-aurora/abandonment-detector');
     const result = await handler();
     expect(result).toEqual({ checked: 0, abandoned: 0 });
-    expect(mockedQuery).toHaveBeenCalledTimes(1);
+    // TWO statements even with nothing to do: the candidate SELECT, and the unanswered-offer sweep.
+    // The sweep is not conditional on the first having found something - the rows it closes are
+    // precisely the ones the first query's `new_channel_arn IS NOT NULL` gate can never return.
+    expect(mockedQuery).toHaveBeenCalledTimes(2);
+  });
+
+  /**
+   * THE OFFERS NOBODY ANSWERED AT ALL, which could never reach a terminal state.
+   *
+   * The candidate query gates on `new_channel_arn IS NOT NULL`, because it asks whether a person who
+   * ACCEPTED then engaged. An offer nobody answered creates no channel, so it never matched, kept
+   * `outcome IS NULL` forever, and was counted in no outcome - present in the table and missing from
+   * every rate computed over it, which flatters all of them.
+   */
+  describe('the unanswered-offer sweep', () => {
+    const sweepCall = () => mockedQuery.mock.calls.find(([sql]) => String(sql).includes('UPDATE drift_events')
+      && String(sql).includes('new_channel_arn IS NULL'));
+
+    it('closes offers with no channel and no answer, and counts them', async () => {
+      mockedQuery.mockResolvedValueOnce(mockRows<{ event_id: string; parent_channel_arn: string; new_channel_arn: string }>([]));
+      mockedQuery.mockResolvedValueOnce(mockRows([{ event_id: 'e1' }, { event_id: 'e2' }]));
+
+      const { handler } = await import('../../lambda/src/analytics-aurora/abandonment-detector');
+      expect(await handler()).toEqual({ checked: 0, abandoned: 2 });
+    });
+
+    it('is bounded and guards on the state it expects, so a late answer wins', async () => {
+      mockedQuery.mockResolvedValueOnce(mockRows<{ event_id: string; parent_channel_arn: string; new_channel_arn: string }>([]));
+      mockedQuery.mockResolvedValueOnce(mockRows<{ event_id: string }>([]));
+
+      const { handler } = await import('../../lambda/src/analytics-aurora/abandonment-detector');
+      await handler();
+
+      const [sql, params] = sweepCall()!;
+      // The `outcome IS NULL` guard on the UPDATE itself, not only in the subquery: a person who
+      // answers between the SELECT and the write keeps their own answer.
+      expect(String(sql)).toMatch(/AND outcome IS NULL\s*$|AND outcome IS NULL\s*\n\s*RETURNING/);
+      expect(String(sql)).toContain('LIMIT $2');
+      // Hours, not the five MINUTES the first sweep uses - the two windows measure different things.
+      expect(String(sql)).toContain("' hours')::interval");
+      expect(params as unknown[]).toEqual(['24', 100]);
+    });
+
+    it('does not fail the run when the sweep itself errors', async () => {
+      mockedQuery.mockResolvedValueOnce(mockRows<{ event_id: string; parent_channel_arn: string; new_channel_arn: string }>([]));
+      mockedQuery.mockRejectedValueOnce(new Error('deadlock detected (simulated)'));
+
+      const { handler } = await import('../../lambda/src/analytics-aurora/abandonment-detector');
+      // Best-effort, like the rest of this job: the next five-minute run reprocesses the same rows.
+      expect(await handler()).toEqual({ checked: 0, abandoned: 0 });
+    });
   });
 
   it('marks a candidate abandoned when its new channel has zero user messages', async () => {
@@ -68,6 +119,10 @@ describe('abandonment-detector handler', () => {
     const result = await handler();
 
     expect(result).toEqual({ checked: 1, abandoned: 1 });
+
+    // MESSAGES ONLY. A room the service admin created carries channel and membership rows sent by that
+    // admin, with is_bot false; counted, they made every such room look used before anybody spoke.
+    expect(String(mockedQuery.mock.calls[1][0])).toMatch(/event_type = 'CREATE_CHANNEL_MESSAGE'/);
 
     // 3rd query is the UPDATE → outcome='abandoned'
     const [updateSql, updateParams] = mockedQuery.mock.calls[2];
@@ -159,6 +214,46 @@ describe('abandonment-detector handler', () => {
     const [countSql, countParams] = mockedQuery.mock.calls[1];
     expect(countSql).toMatch(/FROM messages/);
     expect(countSql).toMatch(/is_bot = FALSE/);
-    expect(countParams).toEqual([CHANNEL_NEW_A]);
+    // No move time on this row, so the count is unbounded; a real row carries it (see below).
+    expect(countParams).toEqual([CHANNEL_NEW_A, null]);
+  });
+
+  it('counts only messages since the move, so a redirect into an existing conversation is judged on what happened after it', async () => {
+    mockedQuery
+      .mockResolvedValueOnce(mockRows([{ event_id: 'e-r', parent_channel_arn: CHANNEL_PARENT, new_channel_arn: CHANNEL_NEW_A, moved_at: '2026-10-15T10:00:00Z' }]))
+      .mockResolvedValueOnce(mockRows([{ count: '0' }]))
+      .mockResolvedValueOnce(mockRows([]));
+    const { handler } = await import('../../lambda/src/analytics-aurora/abandonment-detector');
+    await handler();
+    const [countSql, countParams] = mockedQuery.mock.calls[1];
+    expect(countSql).toContain('created_at >= $2::timestamptz');
+    expect(countParams).toEqual([CHANNEL_NEW_A, '2026-10-15T10:00:00Z']);
+  });
+
+  it('closes only live offers nobody answered; an archival score has no answer to wait for', async () => {
+    mockedQuery.mockResolvedValueOnce(mockRows([])).mockResolvedValueOnce(mockRows([]));
+    const { handler } = await import('../../lambda/src/analytics-aurora/abandonment-detector');
+    await handler();
+    const sweep = mockedQuery.mock.calls.map((c) => String(c[0])).find((q) => q.includes('new_channel_arn IS NULL'));
+    expect(sweep).toContain("COALESCE(source, 'live') = 'live'");
+  });
+});
+
+// A MOVE IS CHECKED ONCE, AND EVERY OUTCOME SAYS WHEN (migration 077). Accepting writes `accepted` at once, so
+// reading only empty outcomes never saw a move and an unused new conversation was never recorded.
+describe('accepted moves are checked for engagement, once', () => {
+  it('reads unsettled moves, accepted ones included, and settles them with the time decided', async () => {
+    mockedQuery
+      .mockResolvedValueOnce(mockRows([{ event_id: 'e-m', parent_channel_arn: CHANNEL_PARENT, new_channel_arn: CHANNEL_NEW_A }]))
+      .mockResolvedValueOnce(mockRows([{ count: '0' }]))
+      .mockResolvedValueOnce(mockRows([]))
+      .mockResolvedValueOnce(mockRows([]));
+    const { handler } = await import('../../lambda/src/analytics-aurora/abandonment-detector');
+    await handler();
+    const [select] = mockedQuery.mock.calls[0] as [string];
+    expect(select).toMatch(/engagement_settled = FALSE/);
+    expect(select).toMatch(/outcome IS NULL OR outcome = 'accepted'/);
+    const [update] = mockedQuery.mock.calls[2] as [string];
+    expect(update).toMatch(/SET outcome = 'abandoned', outcome_at = NOW\(\), engagement_settled = TRUE/);
   });
 });

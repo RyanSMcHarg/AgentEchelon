@@ -52,6 +52,19 @@ describe('admin-conversations-aurora', () => {
     expect(sql).toMatch(/LIMIT \$1 OFFSET \$2/);
   });
 
+  it('scopes to a team\'s assistants by membership, and an empty scope matches nothing rather than everything', async () => {
+    mockedQuery.mockResolvedValue({ rows: [], rowCount: 0 } as any);
+    await adminListConversations(50, 0, null, null, ['arn:bot:ops']);
+    let [sql, params] = mockedQuery.mock.calls[0] as [string, unknown[]];
+    expect(sql).toMatch(/target_arn = ANY\(\$5\)/);
+    expect(params[4]).toEqual(['arn:bot:ops']);
+    mockedQuery.mockClear();
+    await adminListConversations(50, 0, null, null, []);
+    [sql, params] = mockedQuery.mock.calls[0] as [string, unknown[]];
+    expect(params[4]).toEqual([]);
+    mockedQuery.mockReset();
+  });
+
   it('derives lifecycle state: deleted wins over archived, else archived, else live', async () => {
     mockedQuery.mockResolvedValueOnce({
       rows: [
@@ -166,6 +179,46 @@ describe('admin-conversations-aurora', () => {
     expect(out[1]).toMatchObject({ action: 'revoked_moderator', memberName: 'Bot', isBot: true });
   });
 
+  it('marks the creating admin\'s own setup events, and not the same admin joining later to oversee', async () => {
+    const ADMIN = 'i/user/agent-echelon-admin';
+    const base = { creator_arn: ADMIN, channel_created_at: '2026-10-14T00:00:00Z', invited_by: null };
+    mockedQuery.mockResolvedValueOnce({
+      rows: [
+        { ...base, event_type: 'CREATE_CHANNEL_MEMBERSHIP', member_arn: ADMIN, member_name: 'Admin', at: '2026-10-14T00:00:01Z' },
+        { ...base, event_type: 'CREATE_CHANNEL_MEMBERSHIP', member_arn: 'i/bot/advisor', member_name: 'Advisor', at: '2026-10-14T00:00:02Z' },
+        { ...base, event_type: 'DELETE_CHANNEL_MEMBERSHIP', member_arn: ADMIN, member_name: 'Admin', at: '2026-10-14T00:00:04Z' },
+        { ...base, event_type: 'CREATE_CHANNEL_MEMBERSHIP', member_arn: ADMIN, member_name: 'Admin', at: '2026-10-15T09:00:00Z' },
+      ],
+      rowCount: 4,
+    } as any);
+    const out = await adminMembershipHistory('c1');
+    expect(out.map((e) => e.roomSetup === true)).toEqual([true, false, true, false]);
+  });
+
+  it('shows when the subject changed: a drift flag with its outcome, and the subjects each summary added or dropped', async () => {
+    mockedQuery
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any) // membership events
+      .mockResolvedValueOnce({ rows: [{ occurred_at: '2026-10-14T10:05:00Z', originating_message_id: 'm2', outcome: 'declined' }], rowCount: 1 } as any)
+      .mockResolvedValueOnce({
+        rows: [
+          { version: 1, topics: ['AgentEchelon platform'], created_at: '2026-10-14T10:01:00Z' },
+          { version: 2, topics: ['AgentEchelon platform', 'Net revenue retention'], created_at: '2026-10-14T10:06:00Z' },
+          { version: 3, topics: ['Net revenue retention'], created_at: '2026-10-14T10:20:00Z' },
+        ],
+        rowCount: 3,
+      } as any);
+    const out = await adminMembershipHistory('c1');
+    expect(out.map((e) => [e.action, e.subject ?? e.subjectOutcome])).toEqual([
+      ['subject_added', 'AgentEchelon platform'],
+      ['subject_flagged', undefined],
+      ['subject_resolved', 'declined'],
+      ['subject_added', 'Net revenue retention'],
+      ['subject_dropped', 'AgentEchelon platform'],
+    ]);
+    // Live offers only: an archival score was never shown to anybody.
+    expect(String(mockedQuery.mock.calls[1][0])).toMatch(/COALESCE\(source, 'live'\) = 'live'/);
+  });
+
   it('event log blanks moderated content on EVERY message-content row incl. the -UPD finalized row', async () => {
     // A redacted bot reply: CREATE (placeholder), UPDATE (`-UPD`, the finalized text), and the REDACT
     // event. `moderated` is true for the message-content rows (the base has a -RED sibling). Content
@@ -181,8 +234,9 @@ describe('admin-conversations-aurora', () => {
     } as any);
     const out = await adminListEvents('c1');
     const [sql] = mockedQuery.mock.calls[0] as [string];
-    // The moderation check must key off the BASE id (strip the -UPD/-RED/-DEL suffix), not the row id.
-    expect(sql).toMatch(/regexp_replace\(m\.message_id, '-\(UPD\|RED\|DEL\)\$'/);
+    // The moderation check must key off the BASE id (strip the -UPD, -UPD-<hash>, -RED or -DEL suffix),
+    // not the row id.
+    expect(sql).toContain("regexp_replace(m.message_id, '-(UPD(-[0-9a-f]{12})?|RED|DEL)$'");
     expect(out[0].content).toBe(''); // CREATE placeholder blanked
     expect(out.find((e) => e.messageId === 'm1-UPD')!.content).toBe(''); // the finalized text must NOT leak
     expect(out.find((e) => e.messageId === 'm2-UPD')!.content).toBe('a normal visible answer'); // non-moderated shows

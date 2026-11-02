@@ -26,6 +26,9 @@ import {
 } from '@aws-sdk/client-bedrock-agent-runtime';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 
+const { resolveInstanceName } = require('./lib/stack-lookup.cjs') as { resolveInstanceName: (env?: NodeJS.ProcessEnv) => string };
+const SSM_ROOT = `/${resolveInstanceName(process.env)}`;
+
 const region = process.env.AWS_REGION || 'us-east-1';
 const agentRt = new BedrockAgentRuntimeClient({ region });
 const ssm = new SSMClient({ region });
@@ -68,8 +71,8 @@ interface Measurement {
 
 async function getBasicAgent(): Promise<{ agentId: string; aliasId: string }> {
   const [id, alias] = await Promise.all([
-    ssm.send(new GetParameterCommand({ Name: '/agent-echelon/bedrock-agent/basic/agent-id' })),
-    ssm.send(new GetParameterCommand({ Name: '/agent-echelon/bedrock-agent/basic/alias-id' })),
+    ssm.send(new GetParameterCommand({ Name: `${SSM_ROOT}/bedrock-agent/basic/agent-id` })),
+    ssm.send(new GetParameterCommand({ Name: `${SSM_ROOT}/bedrock-agent/basic/alias-id` })),
   ]);
   return { agentId: id.Parameter!.Value!, aliasId: alias.Parameter!.Value! };
 }

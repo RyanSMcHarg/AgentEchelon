@@ -11,46 +11,51 @@
  * so a member could add a sub and have the assistant's messages emailed to that person. Membership is
  * not forgeable that way.
  *
- * The roster survives ONLY as an issuer hint. A federated member's AppInstanceUser id is
- * `deriveFederatedSub(iss, sub)`, a one-way hash, so membership alone cannot say which IdP to query
- * for their contact; the roster supplies that `iss`, and only for ids that are already members.
+ * CONTACT DETAILS are resolved by person at send time, never stored: `Directory.contactFor`
+ * (`lib/membership-source.ts`) finds the person's issuer subjects through `Identities` and asks that
+ * issuer's directory. Nothing here reads an id's shape or a stored issuer hint, so a person of any
+ * trusted issuer is reached the same way. Best-effort: reuses `lib/notification.sendEmailNotifications`;
+ * failures are collected, never thrown.
  *
- * CONTACT DETAILS are resolved from the IdP (`AdminGetUser`) by (iss, sub) at send time, never stored.
- * Best-effort: reuses `lib/notification.sendEmailNotifications`; failures are collected, never thrown.
+ * THE ONE FAN-OUT. A path that emails people it names directly (the share invitation, the briefing, an
+ * alarm) calls `emailPeople` with their AppInstanceUser ARNs, so every email the platform sends resolves
+ * its recipients the same way, and the directive that asks the bridge for one is built once
+ * (`notifyDirective`).
  *
  * The on-channel message stays in the conversation (the in-app surface); this just adds the
  * out-of-band transport for members who aren't watching it.
  */
 import { ChimeSDKMessagingClient, DescribeChannelCommand, ListChannelMembershipsCommand } from '@aws-sdk/client-chime-sdk-messaging';
-import { CognitoIdentityProviderClient, AdminGetUserCommand } from '@aws-sdk/client-cognito-identity-provider';
-import { sendEmailNotifications, type EmailRecipient } from './notification.js';
-import { deriveFederatedSub, isFederatedSub } from './federated-identity.js';
-import { getChannelContext } from './channel-context-client.js';
+import { sendEmailNotifications, escapeHtml, type EmailRecipient, type NotificationResult } from './notification.js';
+import { isAdminNotificationChannel } from './admin-channel-kind.js';
+import { BOUNDED_REQUEST_HANDLER } from './bounded-request-handler.js';
+import { sessionClient } from './assistant-session.js';
+import { delimitedMentionTokens } from './flow-bypass.js';
+import { appInstanceArnOf, isPersonArn, personIdFromArn, rosterOf, userArnFor } from './person-arn.js';
+import { defaultDirectory, type Directory } from './membership-source.js';
+import { conversationDeepLink, isDirectiveNoticeKind, notifyDirective, type DirectiveNoticeKind } from './notify-directive.js';
+import { randomUUID } from 'crypto';
+import { isTransactional, mayNotify, type NoticeKind } from './notice-preferences.js';
+import { defaultEmailConsent, type EmailConsent } from './email-consent.js';
+import { defaultEmailVoice, emailLine, emailVoiceForRoom, type EmailVoice } from './email-copy.js';
+
+export { conversationDeepLink, notifyDirective };
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
+/** The chat app's origin, for a link into a conversation. Absent ⇒ the email carries no link. */
+const APP_URL = process.env.APP_URL || '';
 
 export interface NotifyOptions {
   email?: boolean;
-  sms?: boolean;
 }
 
-/** A delivery target: an IDP subject plus (optionally) the issuer it belongs to. `iss` is what makes
- *  a `sub` unambiguous when members come from MULTIPLE IDPs — for a Cognito issuer the user pool id is
- *  embedded in it (see poolIdFromIssuer). Absent `iss` ⇒ resolve against the deployment's primary
- *  pool (the single-IDP common case). It's a routing key, never identity content, so carrying it does
- *  not violate "don't persist email/name". */
+/**
+ * A delivery target: a PERSON, by AppInstanceUser ARN (or a bare person id in the channel's app
+ * instance). Who they are on an issuer, and where to reach them, is resolved at send time by the
+ * directory; a target carries no subject, issuer or address.
+ */
 export interface NotifyTarget {
-  sub: string;
-  iss?: string;
-  /**
-   * The issuer-side subject, for a federated member.
-   *
-   * `sub` is the AppInstanceUser id read off the membership ARN, which for a federated member is
-   * `deriveFederatedSub(iss, rawSub)` - a one-way SHA-256. The issuer pool has never heard of it, so
-   * an AdminGetUser keyed on it fails for EVERY federated recipient and the notification silently
-   * reaches nobody outside the primary pool. The raw subject is what that pool can actually answer.
-   */
-  rawSub?: string;
+  person: string;
 }
 
 /** A notify directive parsed off a channel message's Metadata. */
@@ -58,36 +63,14 @@ export interface NotifyDirective {
   notify: NotifyOptions;
   /** Email subject; a sensible default is used when absent. */
   subject?: string;
-  /** Limit delivery to these targets (e.g. a task assignee, or a just-shared member); omit ⇒ all
-   *  participants. Each target may name its issuer so cross-IDP sends resolve the right pool. */
+  /** Limit delivery to these people (e.g. a task assignee, or a just-shared member); omit ⇒ all
+   *  participants. */
   targets?: NotifyTarget[];
-}
-
-/** A participant from the channel roster. Membership + role + home-IDP pointer only — identity
- *  (name/email) is NOT here; it's resolved from the IDP by (iss, sub) at send time (single source of
- *  truth). `iss` is optional for back-compat (absent ⇒ primary pool). */
-export interface RosterParticipant {
-  sub: string;
-  iss?: string;
-  role?: string;
-}
-
-/** Trusted-pool resolution config: the primary pool to use when a target has no `iss`, plus the set
- *  of pools an issuer is allowed to resolve to. IAM is the hard boundary, but we also gate here so a
- *  crafted `iss` can't steer a lookup at an unintended pool. */
-export interface PoolResolution {
-  defaultPoolId: string;
-  allowedPoolIds: Set<string>;
-}
-
-/** Map an OIDC issuer to a Cognito user pool id. Cognito issuers embed the pool:
- *    https://cognito-idp.<region>.amazonaws.com/<poolId>
- * Returns null for non-Cognito issuers (Google/Okta/etc.) — those can't be resolved via AdminGetUser
- * and need an account-level contact fallback (SPEC-NOTIFICATION-BRIDGE, not yet built). */
-export function poolIdFromIssuer(iss?: string): string | null {
-  if (!iss) return null;
-  const m = /cognito-idp\.[a-z0-9-]+\.amazonaws\.com\/([A-Za-z0-9_-]+)\/?$/.exec(iss);
-  return m ? m[1] : null;
+  /** The channel id of a conversation the email should link INTO (`notifyConversationId`). Only an id:
+   *  the link is built by {@link conversationDeepLink} from this deployment's own app origin. */
+  conversationId?: string;
+  /** The kind an addressed email is sent as (`notifyKind`), read with `targets` only; absent is `conversation`. */
+  kind?: DirectiveNoticeKind;
 }
 
 /**
@@ -99,44 +82,48 @@ export function parseNotifyDirective(metadata?: string): NotifyDirective | null 
   if (!metadata) return null;
   try {
     const m = JSON.parse(metadata) as Record<string, unknown>;
-    const n = m.notify as { email?: unknown; sms?: unknown } | undefined;
-    if (!n || (!n.email && !n.sms)) return null;
-    // Preferred multi-IDP shape: notifyTargets = [{sub, iss}]. Legacy single-pool shape:
-    // notifyTargetSubs = [sub] (iss omitted ⇒ resolved against the primary pool).
+    const n = m.notify as { email?: unknown } | undefined;
+    if (!n || !n.email) return null;
+    // notifyTargets = [{person}], each a person ARN (or a bare person id in the channel's instance).
     let targets: NotifyTarget[] | undefined;
     if (Array.isArray(m.notifyTargets)) {
       targets = (m.notifyTargets as unknown[])
         .map((t) => (t && typeof t === 'object' ? (t as Record<string, unknown>) : {}))
-        .filter((t) => typeof t.sub === 'string' && t.sub)
-        .map((t) => ({ sub: t.sub as string, ...(typeof t.iss === 'string' ? { iss: t.iss as string } : {}) }));
-    } else if (Array.isArray(m.notifyTargetSubs)) {
-      targets = (m.notifyTargetSubs as unknown[])
-        .filter((s): s is string => typeof s === 'string' && !!s)
-        .map((sub) => ({ sub }));
+        .filter((t) => typeof t.person === 'string' && t.person)
+        .map((t) => ({ person: t.person as string }));
     }
     return {
-      notify: { email: !!n.email, sms: !!n.sms },
+      notify: { email: true },
       subject: typeof m.notifySubject === 'string' ? (m.notifySubject as string) : undefined,
       ...(targets && targets.length ? { targets } : {}),
+      ...(typeof m.notifyConversationId === 'string' && m.notifyConversationId
+        ? { conversationId: m.notifyConversationId as string } : {}),
+      // A kind outside the directive's set (a transactional one, a typo) is ignored, never honored.
+      ...(targets && targets.length && isDirectiveNoticeKind(m.notifyKind) ? { kind: m.notifyKind } : {}),
     };
   } catch {
     return null;
   }
 }
 
-/** Pure: the roster participants to notify — deduped by sub, requiring a sub, filtered to `targetSubs`
- *  when given (an empty/absent targetSubs means "all participants"). */
-export function selectNotifyRecipients(
-  roster: RosterParticipant[],
-  targetSubs?: string[],
-): RosterParticipant[] {
+/**
+ * The people a message @mentions by id, in order, once each. Only the delimited `@<Name|id>` the
+ * composer writes counts: a bare `@Name` names nobody this can resolve without guessing, and an email
+ * sent on a guess goes to the wrong person.
+ */
+export function mentionedMemberIds(text: string): string[] {
   const seen = new Set<string>();
-  const out: RosterParticipant[] = [];
-  for (const p of roster) {
-    if (!p || !p.sub || seen.has(p.sub)) continue;
-    if (targetSubs && targetSubs.length && !targetSubs.includes(p.sub)) continue;
-    seen.add(p.sub);
-    out.push(p);
+  return delimitedMentionTokens(text || '').tokens
+    .map((t) => t.id || '')
+    .filter((id) => id && !seen.has(id) && seen.add(id));
+}
+
+/** The text as a reader sees it: `@<Name|id>` becomes `@Name`. An email has no mention chip to render
+ *  the token into, so the raw grammar would reach the reader as punctuation and an opaque id. */
+export function readableMentions(text: string): string {
+  let out = text || '';
+  for (const t of [...delimitedMentionTokens(out).tokens].reverse()) {
+    out = `${out.slice(0, t.at)}@${t.name}${out.slice(t.at + t.raw.length + 3)}`;
   }
   return out;
 }
@@ -173,11 +160,7 @@ async function readMemberIds(
         MaxResults: 50,
         ...(nextToken ? { NextToken: nextToken } : {}),
       }));
-      ids.push(...(r.ChannelMemberships || [])
-        .map((m) => m.Member?.Arn || '')
-        .filter((arn) => arn && !arn.includes('/bot/'))
-        .map((arn) => arn.split('/user/').pop() || '')
-        .filter(Boolean));
+      ids.push(...rosterOf(r.ChannelMemberships).filter((m) => m.kind === 'person').map((m) => m.id));
       nextToken = r.NextToken;
     } while (nextToken);
     return ids;
@@ -187,115 +170,189 @@ async function readMemberIds(
   }
 }
 
+
+/** A target as an AppInstanceUser ARN in the channel's instance, or null when it names nobody. */
+function targetArn(person: string, channelArn: string): string | null {
+  if (isPersonArn(person)) return person;
+  const app = appInstanceArnOf(channelArn);
+  return app && person && !person.includes('/') ? userArnFor(app, person) : null;
+}
+
 /**
- * Issuer hints, keyed by AppInstanceUser id, read from the channel's Metadata roster.
+ * THE FAN-OUT, for a path that names its recipients: email each person, resolved by the directory at
+ * send time. Who could not be reached is returned by person id in `skipped`, never dropped silently.
  *
- * ONLY an `iss` LOOKUP, never a recipient list. A federated member's AppInstanceUser id is
- * `deriveFederatedSub(iss, sub)` - a one-way SHA-256 of `issuer|subject` - so membership alone cannot
- * tell us which IdP to query for their contact details. That is the reason the roster was stamped into
- * Metadata in the first place, and it is still the only place that mapping exists.
+ * EVERY MAIL NAMES ITS KIND (B9, `lib/notice-preferences.ts`). A kind outside the transactional set goes
+ * only to a person whose preferences allow it, and only with its unsubscribe headers: a person who muted
+ * it, a preference that cannot be read, or a link that cannot be minted sends nothing to that person, and
+ * they are counted in `skipped` and `muted`. A mail about a conversation (`channelArn`) carries the
+ * person's own reply address when the deployment takes replies (M-8).
  *
- * Demoting it to a hint is what makes it safe. The recipient set is fixed by membership before this is
- * consulted, so a forged roster can no longer ADD anyone; the worst a tampered entry can do is point a
- * real member at the wrong pool, where `resolvePoolForTarget` rejects an untrusted issuer and
- * `AdminGetUser` simply fails to resolve - that member is skipped, not misdelivered.
+ * A person offboarded, or disabled at their issuer's pool, receives nothing: `Directory.contactFor`
+ * answers no address for them.
  */
-async function readIssuerHints(channelArn: string): Promise<Map<string, { iss: string; rawSub: string }>> {
-  const hints = new Map<string, { iss: string; rawSub: string }>();
-  const ctx = await getChannelContext(channelArn);
-  for (const p of ctx?.memberIdentities || []) {
-    if (!p || typeof p.sub !== 'string' || !p.sub || typeof p.iss !== 'string' || !p.iss) continue;
-    // Keyed by the id membership reports: a roster entry carries the RAW (iss, sub), and the member id
-    // it corresponds to is the derived one.
-    // The RAW sub is kept alongside the issuer - the sibling roster read in host-grounding.ts does
-    // the same, and for the same reason: the derived id identifies the member, the raw one is the
-    // only thing the issuer pool can be queried with.
-    hints.set(deriveFederatedSub(p.iss, p.sub), { iss: p.iss, rawSub: p.sub });
+export async function emailPeople(args: {
+  personArns: string[];
+  /** What kind of notice this is, which decides whether a person can stop it. */
+  kind: NoticeKind;
+  subject: string;
+  bodyText: string;
+  bodyHtml?: string;
+  /** A conversation to link into, by channel id; the link is built from this deployment's origin. */
+  conversationId?: string;
+  /** The conversation the mail is about, for its reply address and its assistant's voice. */
+  channelArn?: string;
+  appUrl?: string;
+  /** Whose words wrap the mail. Default: the voice of `channelArn`'s assistant, or the stand-in copy. */
+  voice?: EmailVoice;
+  deps?: { directory?: Directory; send?: typeof sendEmailNotifications; consent?: EmailConsent };
+}): Promise<{ emailed: string[]; skipped: string[]; failed: string[]; muted: string[]; notSentBecause?: string }> {
+  const directory = args.deps?.directory ?? defaultDirectory();
+  const send = args.deps?.send ?? sendEmailNotifications;
+  const consent = args.deps?.consent ?? defaultEmailConsent();
+  const voice = args.voice ?? (args.channelArn ? await emailVoiceForRoom(args.channelArn) : defaultEmailVoice());
+  const { copy } = voice;
+  const transactional = isTransactional(args.kind);
+  const noticeId = randomUUID();
+  const toSend: EmailRecipient[] = [];
+  const skipped: string[] = [];
+  const muted: string[] = [];
+  const seen = new Set<string>();
+  for (const arn of args.personArns) {
+    if (!arn || seen.has(arn)) continue;
+    seen.add(arn);
+    const who = personIdFromArn(arn) || arn;
+    const contact = await directory.contactFor(arn, 'email');
+    if (!contact) { skipped.push(who); continue; }
+    let unsubscribeUrl: string | undefined;
+    if (!transactional) {
+      const allowed = mayNotify(await consent.preferences(arn), 'email', args.kind);
+      if (!allowed.ok) {
+        console.log('[channel-notify] not emailed: the person has not consented to this kind', { kind: args.kind, reason: allowed.reason });
+        skipped.push(who);
+        muted.push(who);
+        continue;
+      }
+      const url = await consent.unsubscribeUrl({ personArn: arn, kind: args.kind, ...(args.channelArn ? { channelArn: args.channelArn } : {}), copy });
+      if (!url) {
+        console.warn('[channel-notify] not emailed: no unsubscribe link could be minted, and this kind needs one', { kind: args.kind });
+        skipped.push(who);
+        continue;
+      }
+      unsubscribeUrl = url;
+    }
+    const replyTo = args.channelArn
+      ? await consent.replyAddress({ personArn: arn, channelArn: args.channelArn, noticeId, kind: args.kind })
+      : null;
+    toSend.push({
+      email: contact.address,
+      name: contact.name || '',
+      ...(replyTo ? { replyTo } : {}),
+      ...(unsubscribeUrl ? { unsubscribeUrl } : {}),
+    });
   }
-  return hints;
-}
+  if (!toSend.length) return { emailed: [], skipped, failed: [], muted };
 
-/** Resolve which trusted pool a target belongs to: its issuer's pool when given + allowed, else the
- *  primary pool. Returns null when the issuer maps to a pool we don't trust (or a non-Cognito IDP we
- *  can't query) — the caller then skips that recipient rather than guessing. */
-export function resolvePoolForTarget(target: NotifyTarget, pools: PoolResolution): string | null {
-  if (target.iss) {
-    const poolId = poolIdFromIssuer(target.iss);
-    if (!poolId) return null; // non-Cognito issuer — needs account-level fallback (not yet built)
-    return pools.allowedPoolIds.has(poolId) ? poolId : null;
+  // THE DEEP LINK, when the caller names a conversation and the deployment knows its own origin. One
+  // link, worded and styled the same, everywhere an email opens a conversation.
+  const link = conversationDeepLink(args.appUrl ?? APP_URL, args.conversationId);
+  if (args.conversationId && !link) {
+    console.warn('[channel-notify] a conversation link was asked for and cannot be built; sending without it', {
+      hasAppUrl: Boolean(args.appUrl ?? APP_URL),
+    });
   }
-  return pools.allowedPoolIds.has(pools.defaultPoolId) ? pools.defaultPoolId : null;
-}
-
-/** Resolve a target's contact (email + display name) from the IDP by (iss, sub) via AdminGetUser at
- *  send time — the single source of truth; nothing is persisted. `email` is null when not found or the
- *  target's IDP is untrusted/unqueryable. */
-async function resolveContact(
-  cognito: CognitoIdentityProviderClient,
-  target: NotifyTarget,
-  pools: PoolResolution,
-): Promise<{ email: string | null; name: string }> {
-  const poolId = resolvePoolForTarget(target, pools);
-  if (!poolId) {
-    console.warn(
-      `[channel-notify] no trusted pool for sub ${target.sub.slice(0, 8)}… (iss=${target.iss || 'default'}); skipping`,
-    );
-    return { email: null, name: 'Member' };
-  }
-  try {
-    // The RAW subject when this is a federated member, because the derived id is a hash the issuer
-    // pool cannot resolve. Falls back to `sub` for a native user, where the two are the same thing.
-    const u = await cognito.send(new AdminGetUserCommand({
-      UserPoolId: poolId, Username: target.rawSub || target.sub,
-    }));
-    const attr = (u.UserAttributes || []).reduce<Record<string, string>>((a, x) => {
-      if (x.Name && x.Value !== undefined) a[x.Name] = x.Value;
-      return a;
-    }, {});
-    const name =
-      attr.name ||
-      [attr.given_name, attr.family_name].filter(Boolean).join(' ').trim() ||
-      'Member';
-    return { email: attr.email || null, name };
-  } catch (err) {
-    console.warn(`[channel-notify] contact lookup failed for sub ${target.sub.slice(0, 8)}…:`, err);
-    return { email: null, name: 'Member' };
-  }
+  const button = link
+    ? `<p style="margin: 24px 0;"><a href="${escapeHtml(link)}" style="background: #2d2d2d; color: #fff; `
+      + `padding: 12px 24px; border-radius: 6px; text-decoration: none; display: inline-block;">${escapeHtml(copy.openConversation)}</a></p>`
+    : '';
+  const res: NotificationResult = await send(toSend, {
+    subject: args.subject,
+    bodyText: link ? `${args.bodyText}\n\n${emailLine(voice, 'viewItHere', { link })}` : args.bodyText,
+    ...(link || args.bodyHtml ? { bodyHtml: (args.bodyHtml ?? `<p>${escapeHtml(args.bodyText)}</p>`) + button } : {}),
+    voice,
+  });
+  return { emailed: res.sent, skipped, failed: res.failed.map((f) => f.email), muted, ...(res.skipped ? { notSentBecause: res.skipped } : {}) };
 }
 
 /**
  * Fan a channel notification out to the conversation's participants over the requested transports.
- * v1 = email (SMS is logged as not-yet-wired). Best-effort; returns who was reached/skipped/failed.
+ * Email is the one transport. Best-effort; returns who was reached/skipped/failed, by person id.
  */
 export async function fanOutChannelNotification(args: {
   channelArn: string;
   bearerArn: string;
-  /** Primary/default pool — used for targets without an explicit issuer (the single-IDP case). */
-  userPoolId: string;
-  /** Additional trusted pools for cross-IDP rosters; the primary is always trusted. */
-  allowedPoolIds?: string[];
   messageText: string;
   directive: NotifyDirective;
+  /**
+   * A PERSON wrote the message, not an assistant. Their directive is member-writable Metadata, so it
+   * may reach only the members they @mention: its `notifyTargets` are ignored (they bypass membership)
+   * and it never becomes a membership-wide email, even in the admin conversation.
+   */
+  personSent?: boolean;
+  /** Who wrote it, so mentioning yourself does not email you. */
+  senderArn?: string;
+  /** The chat app's origin for a conversation link. Defaults to `APP_URL`. */
+  appUrl?: string;
   deps?: {
     chime?: ChimeSDKMessagingClient;
-    cognito?: CognitoIdentityProviderClient;
+    directory?: Directory;
     send?: typeof sendEmailNotifications;
+    isEmailConversation?: (chime: ChimeSDKMessagingClient, channelArn: string) => Promise<boolean>;
+    consent?: EmailConsent;
+    voice?: EmailVoice;
   };
-}): Promise<{ emailed: string[]; skipped: string[]; failed: string[] }> {
-  const { channelArn, bearerArn, userPoolId, messageText, directive } = args;
-  const chime = args.deps?.chime ?? new ChimeSDKMessagingClient({ region: AWS_REGION });
-  const cognito = args.deps?.cognito ?? new CognitoIdentityProviderClient({ region: AWS_REGION });
-  const send = args.deps?.send ?? sendEmailNotifications;
-  const pools: PoolResolution = {
-    defaultPoolId: userPoolId,
-    allowedPoolIds: new Set([userPoolId, ...(args.allowedPoolIds || [])].filter(Boolean)),
-  };
+}): Promise<{ emailed: string[]; skipped: string[]; failed: string[]; emailOff?: boolean }> {
+  const { channelArn, bearerArn, messageText, directive } = args;
+  const chime = args.deps?.chime ?? sessionClient(ChimeSDKMessagingClient, { region: AWS_REGION, requestHandler: BOUNDED_REQUEST_HANDLER });
 
-  if (directive.notify.sms) console.log('[channel-notify] SMS transport requested — not yet wired (email only in v1)');
   if (!directive.notify.email) return { emailed: [], skipped: [], failed: [] };
-  if (!userPoolId) {
-    console.warn('[channel-notify] no userPoolId — cannot resolve emails');
-    return { emailed: [], skipped: [], failed: [] };
+
+  // ── ONLY THE ADMIN CONVERSATION SENDS EMAIL ──────────────────────────────────
+  //
+  // A `notify` directive asks for email; whether the conversation sends any is decided from the live
+  // channel, by the immutable `aeChannelKind` tag its provisioner stamps at creation - never from a
+  // copy, and never from Metadata, which members can write. A tag that cannot be read is not the admin
+  // conversation: an unreadable answer must not become an email to every member.
+  //
+  // FUTURE SCOPE, not built: per-conversation email for other conversations, and "email only when the
+  // recipient is not connected when the message is sent" (email in place of an unfocused-tab browser
+  // notification is roadmap). The admin conversation and the communication-hub project hold the start
+  // of that design.
+  // ── THE GATE IS ABOUT A BROADCAST, SO IT GATES THE BROADCAST (review, 2026-09-17) ───────────────
+  //
+  // Applied to EVERY directive, this also blocked the one notification that is not a broadcast at
+  // all: a host's add-member (`membershipHandler`) posts a `notify.email` with an explicit `notifyTargets` into the
+  // conversation it just created, and that is the invitation - the one email an invited person cannot
+  // discover any other way. The gate silently dropped it, because a new conversation is not the admin
+  // conversation.
+  //
+  // The risk this gate names is "an unreadable answer must not become an email to every member", and
+  // an explicit server-side target list is not that. It also cannot be forged: `decideNotify` fans out
+  // only a message whose sender ARN carries `/bot/`, so a person's hand-crafted Metadata never reaches
+  // here. So the membership-derived fan-out stays admin-only and an addressed notification is allowed
+  // through, which keeps both halves of the 2026-09-15 decision rather than trading one for the other.
+  //
+  // ── A MENTION ADDRESSES ITS EMAIL ───────────────────────────────────────────
+  //
+  // "The single recipient email should be message with mention triggering single email" - and only
+  // when the directive asks for email, so a mention alone sends nothing. Anyone's mention may, people
+  // included. It is addressed rather than a broadcast, so it passes the gate above for the same reason
+  // an explicit target list does, and it is bounded by live MEMBERSHIP below: a mention of somebody who
+  // is not in the room reaches nobody, because the id in the token is text the writer chose.
+  const senderId = personIdFromArn(args.senderArn) || '';
+  const mentioned = mentionedMemberIds(messageText).filter((id) => id !== senderId);
+  const explicitlyTargeted = !args.personSent && Boolean(directive.targets && directive.targets.length);
+  const mentionTargeted = !explicitlyTargeted && mentioned.length > 0;
+  if (args.personSent && !mentionTargeted) {
+    console.log('[channel-notify] a person\'s email reaches only the members they mention; not sending', { channelArn });
+    return { emailed: [], skipped: [], failed: [], emailOff: true };
+  }
+  const isEmailConversation = args.deps?.isEmailConversation ?? isAdminNotificationChannel;
+  if (!explicitlyTargeted && !mentionTargeted && !(await isEmailConversation(chime, channelArn).catch(() => false))) {
+    console.log('[channel-notify] a membership-wide email is sent only in the admin conversation; not sending', {
+      channelArn,
+    });
+    return { emailed: [], skipped: [], failed: [], emailOff: true };
   }
 
   // Recipients: explicit `targets` resolve DIRECTLY (a targeted recipient — e.g. a just-shared
@@ -304,45 +361,56 @@ export async function fanOutChannelNotification(args: {
   //
   // Otherwise the recipient set is the channel's live MEMBERSHIP. It used to be the Metadata roster,
   // which a member could rewrite to have conversation content emailed to someone of their choosing —
-  // see `readMemberIds`. The roster now contributes only the `iss` needed to resolve a federated
-  // member's contact, and only for ids that are already members.
-  let targets: NotifyTarget[];
-  if (directive.targets && directive.targets.length) {
-    const seen = new Set<string>();
-    targets = directive.targets.filter((t) => t.sub && !seen.has(t.sub) && seen.add(t.sub));
+  // see `readMemberIds`.
+  let personArns: string[];
+  // ACCOUNTED FOR, NOT JUST LOGGED (review, 2026-09-17). A dropped recipient that appeared in neither
+  // `emailed` nor `failed` nor `skipped` let the caller's own record - which `notify-on-delivery` logs
+  // and turns into a metric - say the fan-out reached everyone it could.
+  const notReached: string[] = [];
+  if (explicitlyTargeted && directive.targets) {
+    personArns = [];
+    for (const t of directive.targets) {
+      const arn = targetArn(t.person, channelArn);
+      if (arn) personArns.push(arn);
+      else notReached.push(t.person);
+    }
   } else {
     const memberIds = await readMemberIds(chime, channelArn, bearerArn);
-    // Only pay for the Metadata read when a federated member is actually present; a single-IdP
-    // deployment never needs an issuer hint.
-    const hints = memberIds.some(isFederatedSub)
-      ? await readIssuerHints(channelArn)
-      : new Map<string, { iss: string; rawSub: string }>();
-    const seen = new Set<string>();
-    targets = memberIds
-      .filter((id) => !seen.has(id) && seen.add(id))
-      .map((id) => {
-        const hint = hints.get(id);
-        return hint ? { sub: id, iss: hint.iss, rawSub: hint.rawSub } : { sub: id };
-      })
-      // A federated member with no issuer hint cannot be resolved to a contact — `sub` is a one-way
-      // hash, so querying the default pool would find nothing (or, worse, a same-named native user).
-      // Skipping is the honest outcome; `resolveContact` would only fail later anyway.
-      .filter((t) => !isFederatedSub(t.sub) || !!t.iss);
+    let reachable = memberIds;
+    if (mentionTargeted) {
+      reachable = memberIds.filter((id) => mentioned.includes(id));
+      const notMembers = mentioned.filter((id) => !memberIds.includes(id));
+      if (notMembers.length) {
+        // Accounted for in `skipped`: a mention that emailed nobody must not read as a fan-out that
+        // reached everyone it could.
+        notReached.push(...notMembers);
+        console.log('[channel-notify] mentioned but not a member of this conversation; not emailed', {
+          channelArn, count: notMembers.length,
+        });
+      }
+    }
+    personArns = reachable.map((id) => targetArn(id, channelArn)).filter((a): a is string => Boolean(a));
   }
-  if (!targets.length) return { emailed: [], skipped: [], failed: [] };
+  if (!personArns.length) return { emailed: [], skipped: [...notReached], failed: [] };
 
-  const toSend: EmailRecipient[] = [];
-  const skipped: string[] = [];
-  for (const target of targets) {
-    const { email, name } = await resolveContact(cognito, target, pools);
-    if (email) toSend.push({ email, name });
-    else skipped.push(target.sub);
-  }
-  if (!toSend.length) return { emailed: [], skipped, failed: [] };
-
-  const res = await send(toSend, {
-    subject: directive.subject || 'An update from your assistant',
-    bodyText: messageText,
+  // ONE FAN-OUT. Each person's contact is resolved by the directory, through `Identities`, whichever
+  // trusted issuer they sign in with; the deep link is built there from the directive's channel id.
+  // In the words of the conversation's assistant, and replyable as the person (M-8).
+  const voice = args.deps?.voice ?? await emailVoiceForRoom(channelArn);
+  // THE DIRECTIVE NAMES THE KIND ONLY WHEN IT ADDRESSES ITS RECIPIENTS: the welcome to a person just added
+  // to a conversation is `conversation-shared`, so muting that kind stops it. A broadcast or a mention is
+  // always `conversation`.
+  const kind: NoticeKind = explicitlyTargeted && directive.kind ? directive.kind : 'conversation';
+  const res = await emailPeople({
+    personArns,
+    kind,
+    subject: directive.subject || voice.copy.defaultSubject,
+    bodyText: readableMentions(messageText),
+    channelArn,
+    voice,
+    ...(directive.conversationId ? { conversationId: directive.conversationId } : {}),
+    ...(args.appUrl !== undefined ? { appUrl: args.appUrl } : {}),
+    deps: { directory: args.deps?.directory, send: args.deps?.send, consent: args.deps?.consent },
   });
-  return { emailed: res.sent, skipped, failed: res.failed.map((f) => f.email) };
+  return { emailed: res.emailed, skipped: [...notReached, ...res.skipped], failed: res.failed };
 }

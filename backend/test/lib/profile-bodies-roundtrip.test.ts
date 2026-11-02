@@ -67,7 +67,7 @@ const ACTOR = 'admin-sub-123';
 const BUCKET = 'ae-attachments';
 
 /** Comfortably past the 4096-character parameter limit, comfortably inside MAX_PERSONA_LENGTH.
- *  Trimmed at the source because the seed path normalises whitespace before hashing. */
+ *  Trimmed at the source because the seed path normalizes whitespace before hashing. */
 const BIG_PERSONA = `You are the Stratum Technologies assistant. ${'Ground every answer in company policy. '.repeat(250)}`.trim();
 
 beforeEach(() => {
@@ -93,32 +93,32 @@ describe('a persona too large for the parameter', () => {
     expect(BIG_PERSONA.length).toBeGreaterThan(SSM_STANDARD_TIER_MAX);
     const { client, store } = fakeSsmStore();
 
-    await createDraft(client, ROOT, 'standard', ACTOR);
-    await editDraft(client, ROOT, 'standard', { persona: BIG_PERSONA }, ACTOR);
-    await activateDraft(client, ROOT, 'standard', CATALOG, ACTOR);
+    await createDraft(client, ROOT, 'analyst', ACTOR);
+    await editDraft(client, ROOT, 'analyst', { persona: BIG_PERSONA }, ACTOR);
+    await activateDraft(client, ROOT, 'analyst', CATALOG, ACTOR);
 
     // The resolved profile answers with the whole persona.
     __clearActiveProfileCache();
-    const resolved = await resolveActiveProfile('standard', { ssm: client, ssmRoot: ROOT });
+    const resolved = await resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT });
     expect(resolved.persona).toBe(BIG_PERSONA);
     expect(resolved.configId).not.toBe('seed');
 
     // And the parameter itself is small: the persona is not in it, a pointer is.
-    const raw = storedValue(store, definitionParamName(ROOT, 'standard'));
+    const raw = storedValue(store, definitionParamName(ROOT, 'analyst'));
     expect(raw.length).toBeLessThanOrEqual(SSM_STANDARD_TIER_MAX);
     const stored = JSON.parse(raw) as ProfileDefinition;
     expect(stored.persona).toBeUndefined();
-    expect(stored.personaRef?.key).toBe(`profiles/standard/${stored.configId}/persona`);
+    expect(stored.personaRef?.key).toBe(`profiles/analyst/${stored.configId}/persona`);
   });
 
   it('is not what the parameter cap measures any more (the pre-change write is what failed)', async () => {
     // Same content, no body store: the definition must be REJECTED with the actionable message rather
-    // than sent to AWS to fail as an opaque ValidationException. This is the behaviour that remains for
+    // than sent to AWS to fail as an opaque ValidationException. This is the behavior that remains for
     // a deployment with no bucket wired, and it is what the offload replaces.
     delete process.env.PROFILE_BODY_BUCKET;
     const { client } = fakeSsmStore();
-    await createDraft(client, ROOT, 'standard', ACTOR);
-    await expect(editDraft(client, ROOT, 'standard', { persona: BIG_PERSONA }, ACTOR))
+    await createDraft(client, ROOT, 'analyst', ACTOR);
+    await expect(editDraft(client, ROOT, 'analyst', { persona: BIG_PERSONA }, ACTOR))
       .rejects.toThrow(/over the 4096-character SSM Standard-tier limit/);
   });
 
@@ -126,8 +126,8 @@ describe('a persona too large for the parameter', () => {
     // configId is the attribution key analytics slices by, and it is the hash of the body INCLUDING the
     // persona. If moving the persona out changed it, migrating a deployment onto the body store would
     // split one version's history into two ids and invalidate every exported manifest.
-    const body = { ...bodyFrom(JSON.parse(serializeSeedDefinition('standard') as string)), persona: BIG_PERSONA };
-    const inline = buildDefinition('standard', body);
+    const body = { ...bodyFrom(JSON.parse(serializeSeedDefinition('analyst') as string)), persona: BIG_PERSONA };
+    const inline = buildDefinition('analyst', body);
     const offloaded = await offloadBodies(inline);
     expect(offloaded.configId).toBe(inline.configId);
     expect(offloaded.persona).toBeUndefined();
@@ -141,12 +141,12 @@ describe('back-compat and failure', () => {
   it('a definition written BEFORE the indirection (inline persona) still resolves', async () => {
     const { client } = fakeSsmStore();
     // Exactly the shape live deployments hold today: persona inline, no pointer, nothing in S3.
-    const legacy = JSON.parse(serializeSeedDefinition('standard', 'I am the legacy persona.') as string) as ProfileDefinition;
+    const legacy = JSON.parse(serializeSeedDefinition('analyst', 'I am the legacy persona.') as string) as ProfileDefinition;
     expect(legacy.persona).toBe('I am the legacy persona.');
-    await seedRaw(client, 'standard', legacy);
+    await seedRaw(client, 'analyst', legacy);
 
     __clearActiveProfileCache();
-    const resolved = await resolveActiveProfile('standard', { ssm: client, ssmRoot: ROOT });
+    const resolved = await resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT });
     expect(resolved.persona).toBe('I am the legacy persona.');
     // No pointer ⇒ no S3 call at all, so an existing deployment needs no bucket to keep working.
     expect(mockS3Calls).toEqual([]);
@@ -154,13 +154,13 @@ describe('back-compat and failure', () => {
 
   it('an unreadable body falls back to the SEED, never to a personaless profile', async () => {
     const { client } = fakeSsmStore();
-    await createDraft(client, ROOT, 'standard', ACTOR);
-    await editDraft(client, ROOT, 'standard', { persona: BIG_PERSONA, rateLimitPerHour: 777 }, ACTOR);
-    await activateDraft(client, ROOT, 'standard', CATALOG, ACTOR);
+    await createDraft(client, ROOT, 'analyst', ACTOR);
+    await editDraft(client, ROOT, 'analyst', { persona: BIG_PERSONA, tools: ['add_item'] }, ACTOR);
+    await activateDraft(client, ROOT, 'analyst', CATALOG, ACTOR);
 
     mockS3GetError = Object.assign(new Error('denied'), { name: 'AccessDenied' });
     __clearActiveProfileCache();
-    const resolved = await resolveActiveProfile('standard', { ssm: client, ssmRoot: ROOT });
+    const resolved = await resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT });
 
     // The whole version is refused, not just its persona: serving the rest would run an assistant that
     // reports this configId while answering as the generic default.
@@ -169,33 +169,52 @@ describe('back-compat and failure', () => {
     expect(resolved.profile.rateLimitPerHour).not.toBe(777);
   });
 
+  it('a read for the version\'s own fields (an email\'s copy) reads no body, and serves the version, not the seed', async () => {
+    // An email sender reads the copy and the name, which are the version's own fields; it holds no grant on
+    // the body store. Hydrating anyway failed every such read and served the seed's copy instead.
+    const { client } = fakeSsmStore();
+    await createDraft(client, ROOT, 'analyst', ACTOR);
+    await editDraft(client, ROOT, 'analyst', { persona: BIG_PERSONA, tools: ['add_item'] }, ACTOR);
+    const active = await activateDraft(client, ROOT, 'analyst', CATALOG, ACTOR);
+
+    mockS3GetError = Object.assign(new Error('denied'), { name: 'AccessDenied' });
+    mockS3Calls.length = 0;
+    __clearActiveProfileCache();
+    const resolved = await resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT, withoutBodies: true });
+
+    expect(resolved.configId).toBe(active.configId);
+    expect(mockS3Calls.filter((c) => c.verb === 'get')).toEqual([]);
+    // Cached apart: a full read after it still hydrates, and still refuses an unreadable body.
+    expect((await resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT })).configId).toBe('seed');
+  });
+
   it('rollback re-points at an existing body and writes nothing', async () => {
     const { client } = fakeSsmStore();
-    await createDraft(client, ROOT, 'standard', ACTOR);
-    await editDraft(client, ROOT, 'standard', { persona: `${BIG_PERSONA} v1` }, ACTOR);
-    const v1 = await activateDraft(client, ROOT, 'standard', CATALOG, ACTOR);
-    await createDraft(client, ROOT, 'standard', ACTOR);
-    await editDraft(client, ROOT, 'standard', { persona: `${BIG_PERSONA} v2` }, ACTOR);
-    await activateDraft(client, ROOT, 'standard', CATALOG, ACTOR);
+    await createDraft(client, ROOT, 'analyst', ACTOR);
+    await editDraft(client, ROOT, 'analyst', { persona: `${BIG_PERSONA} v1` }, ACTOR);
+    const v1 = await activateDraft(client, ROOT, 'analyst', CATALOG, ACTOR);
+    await createDraft(client, ROOT, 'analyst', ACTOR);
+    await editDraft(client, ROOT, 'analyst', { persona: `${BIG_PERSONA} v2` }, ACTOR);
+    await activateDraft(client, ROOT, 'analyst', CATALOG, ACTOR);
 
     const putsBefore = mockS3Calls.filter((c) => c.verb === 'put').length;
-    await activateExistingVersion(client, ROOT, 'standard', v1.version, ACTOR);
+    await activateExistingVersion(client, ROOT, 'analyst', v1.version, ACTOR);
     expect(mockS3Calls.filter((c) => c.verb === 'put').length).toBe(putsBefore);
 
     // And v1's body survived v2 being written — content-addressing is what makes that true.
     __clearActiveProfileCache();
-    expect((await resolveActiveProfile('standard', { ssm: client, ssmRoot: ROOT })).persona).toBe(`${BIG_PERSONA} v1`);
+    expect((await resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT })).persona).toBe(`${BIG_PERSONA} v1`);
   });
 });
 
 describe('portability', () => {
   it('export INLINES the body and names no bucket, account or region', async () => {
     const { client } = fakeSsmStore();
-    await createDraft(client, ROOT, 'standard', ACTOR);
-    await editDraft(client, ROOT, 'standard', { persona: BIG_PERSONA }, ACTOR);
-    await activateDraft(client, ROOT, 'standard', CATALOG, ACTOR);
+    await createDraft(client, ROOT, 'analyst', ACTOR);
+    await editDraft(client, ROOT, 'analyst', { persona: BIG_PERSONA }, ACTOR);
+    await activateDraft(client, ROOT, 'analyst', CATALOG, ACTOR);
 
-    const manifest = await exportManifest(client, ROOT, 'standard');
+    const manifest = await exportManifest(client, ROOT, 'analyst');
     expect(manifest.body.persona).toBe(BIG_PERSONA);
     const serialized = JSON.stringify(manifest);
     // A leaked bucket name would aim a target instance at THIS account's storage.
@@ -206,10 +225,10 @@ describe('portability', () => {
 
   it('import lands the body in the TARGET store and keeps a target-local pointer', async () => {
     const source = fakeSsmStore();
-    await createDraft(source.client, ROOT, 'standard', ACTOR);
-    await editDraft(source.client, ROOT, 'standard', { persona: BIG_PERSONA }, ACTOR);
-    await activateDraft(source.client, ROOT, 'standard', CATALOG, ACTOR);
-    const manifest = await exportManifest(source.client, ROOT, 'standard');
+    await createDraft(source.client, ROOT, 'analyst', ACTOR);
+    await editDraft(source.client, ROOT, 'analyst', { persona: BIG_PERSONA }, ACTOR);
+    await activateDraft(source.client, ROOT, 'analyst', CATALOG, ACTOR);
+    const manifest = await exportManifest(source.client, ROOT, 'analyst');
 
     // A different instance, with its own bucket.
     process.env.PROFILE_BODY_BUCKET = 'target-instance-attachments';
@@ -218,11 +237,12 @@ describe('portability', () => {
       catalog: CATALOG,
       knownProfile: () => true,
       guardrailCatalog: async () => [],
-      contextSourceCatalog: async () => [],
+      // The target publishes the `user-profile` source every seed selects.
+      contextSourceCatalog: async () => [{ key: 'user-profile' }],
       actor: ACTOR,
     });
 
-    const raw = storedValue(target.store, `${ROOT}/assistant/standard/draft`);
+    const raw = storedValue(target.store, `${ROOT}/assistant/analyst/draft`);
     expect(raw.length).toBeLessThanOrEqual(SSM_STANDARD_TIER_MAX);
     const stored = JSON.parse(raw) as ProfileDefinition;
     expect(stored.persona).toBeUndefined();
@@ -235,19 +255,19 @@ describe('portability', () => {
 describe('the seeder', () => {
   it('seeds a persona that could never fit in the parameter', async () => {
     const { client, store } = fakeSsmStore();
-    const r = await seedActiveProfileDefinition(client, ROOT, 'standard', BIG_PERSONA, { bucket: BUCKET });
+    const r = await seedActiveProfileDefinition(client, ROOT, 'analyst', BIG_PERSONA, { bucket: BUCKET });
     expect(r?.labeled).toBe(true);
 
-    const raw = storedValue(store, definitionParamName(ROOT, 'standard'));
+    const raw = storedValue(store, definitionParamName(ROOT, 'analyst'));
     expect(raw.length).toBeLessThanOrEqual(SSM_STANDARD_TIER_MAX);
     __clearActiveProfileCache();
-    expect((await resolveActiveProfile('standard', { ssm: client, ssmRoot: ROOT })).persona).toBe(BIG_PERSONA);
+    expect((await resolveActiveProfile('analyst', { ssm: client, ssmRoot: ROOT })).persona).toBe(BIG_PERSONA);
   });
 
   it('still refuses an oversize definition when the deployment has NO body store', async () => {
     delete process.env.PROFILE_BODY_BUCKET;
     const { client } = fakeSsmStore();
-    await expect(seedActiveProfileDefinition(client, ROOT, 'standard', BIG_PERSONA))
+    await expect(seedActiveProfileDefinition(client, ROOT, 'analyst', BIG_PERSONA))
       .rejects.toThrow(/over the 4096-char SSM Standard-tier parameter limit/);
   });
 });

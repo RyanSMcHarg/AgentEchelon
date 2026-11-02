@@ -18,16 +18,16 @@
  *   - Only premium-classification channels accept enable
  *
  * Side effects on enable:
- *   - Verifies the experiment exists, is battle-enabled, and has an
- *     altBotSlotArn bound
- *   - CreateChannelMembership for the alt-bot slot (the bot principal
- *     becomes a real channel member)
+ *   - Verifies the experiment exists, is battle-enabled, and names this
+ *     classification's challenger (`challengerAssistant`)
+ *   - CreateChannelMembership for the challenger's bot, read from its
+ *     assignment record (the alt becomes a real channel member)
  *   - Writes ChannelBattleConfig row
  *   - Posts a system message announcing the addition (broadcast as the
- *     default bot so all members see it)
+ *     room's primary so all members see it)
  *
- * Disable reverses: DeleteChannelMembership for the slot, deletes the
- * config row, posts a leaving system message.
+ * Disable reverses: DeleteChannelMembership for the challenger the enable
+ * added, deletes the config row, posts a leaving system message.
  *
  * The router and channel-flow processor read ChannelBattleConfig on a
  * 60s cache, so a toggle propagates within that window.
@@ -41,7 +41,6 @@ import {
   DescribeChannelMembershipCommand,
   ListChannelModeratorsCommand,
   ListTagsForResourceCommand,
-  SendChannelMessageCommand,
   ChannelMessageType,
   ChannelMessagePersistenceType,
 } from '@aws-sdk/client-chime-sdk-messaging';
@@ -53,68 +52,97 @@ import {
   DeleteCommand,
   ScanCommand,
 } from '@aws-sdk/lib-dynamodb';
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import { SSMClient } from '@aws-sdk/client-ssm';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { parseJsonBody } from './lib/auth.js';
-import { defaultProfileRegistry as profiles } from '../../lib/profile-registry.js';
-import { resolveChannelClassificationTag as resolveChannelClassificationTagShared } from './lib/channel-classification.js';
-import { resolveActiveBattleExperimentForClassification } from './lib/experiment-manager.js';
+import { parseJsonBody, callerPersonId } from './lib/auth.js';
+import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
+import { readChannelClassificationTag } from './lib/channel-classification.js';
+import { resolveActiveBattleExperimentForClassification, battleSidesOf, type Experiment as ManagedExperiment } from './lib/experiment-manager.js';
+import { noticeLine } from './lib/assistant-notice.js';
 import { endBattle } from './lib/battle-end.js';
+import { sayThroughRouter } from './lib/say-through-router.js';
+import { primaryAssistantOf, memoizedTagReader } from './lib/conversation-primary.js';
+import { canRunBattle } from './lib/battle-enablement.js';
+import { readAltAssignment, challengerOf, DUEL_ROLE, type LegacyBattleBinding } from './lib/alt-assignment.js';
+import { challengerBotArnOf, type ChannelBattleConfig } from './lib/battle-state.js';
+import { userArnFor } from './lib/person-arn.js';
+import { responder, originsFrom, DEV_ORIGIN } from './lib/http-response.js';
+import { chimeMessagingClient } from './lib/chime/clients.js';
+import { parseChannelMetadata } from './lib/chime/channel-meta.js';
+import { loadProfileRegistry } from '../../lib/profile-registry';
 
-const messagingClient = new ChimeSDKMessagingClient({});
+const messagingClient = chimeMessagingClient({});
+/** One tag read per conversation: the classification gate and the room's primary read the same tags. */
+const tagReader = memoizedTagReader(messagingClient);
 const ssmClient = new SSMClient({});
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
 const CHANNEL_BATTLE_CONFIG_TABLE = process.env.CHANNEL_BATTLE_CONFIG_TABLE || '';
 const EXPERIMENTS_TABLE = process.env.EXPERIMENTS_TABLE || '';
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || 'http://localhost:5173').split(',');
+const ALLOWED_ORIGINS = originsFrom(process.env.ALLOWED_ORIGIN, DEV_ORIGIN);
 
-function corsHeaders(origin?: string): Record<string, string> {
-  const allowed = origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-  return {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': allowed,
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Vary': 'Origin',
-  };
-}
+const http = responder({ origin: { allow: ALLOWED_ORIGINS }, methods: 'GET,POST,OPTIONS' });
 
-function respond(statusCode: number, body: unknown, origin?: string): APIGatewayProxyResult {
-  return { statusCode, headers: corsHeaders(origin), body: JSON.stringify(body) };
-}
+const respond = http.respond;
 
 // Resolve the channel's PER-CLASSIFICATION bot (its real creator+member). Each classification owns
 // its own bot; no shared bot is a channel member, so bot-attributed sends (add
-// alt-bot, announce) must run as the per-classification bot. Battle is premium-only, so in
-// practice this is the premium bot. There is NO shared-bot fallback — a missing
-// per-classification key returns '' and the caller surfaces "bot ARN not configured".
+// alt-bot, announce) must run as the per-classification bot. Every conversational classification is
+// battle-eligible (2026-09-17), so this is the bot of whichever classification the room carries and
+// not, as this comment used to say, the premium one in practice. There is NO shared-bot fallback — a
+// missing per-classification key returns '' and the caller surfaces "bot ARN not configured".
 const SSM_ROOT = process.env.SSM_ROOT || '/agent-echelon';
-const botArnCache: Record<string, string> = {};
-async function resolveBotArn(classification: string): Promise<string> {
-  if (botArnCache[classification]) return botArnCache[classification];
+/**
+ * THE PRIMARY ASSISTANT OF THIS CONVERSATION (ADR-030).
+ *
+ * Named for what it resolves rather than for how it currently finds it, because the old name -
+ * "the bot arn" - claimed to answer "which assistant acts for this room" while actually answering
+ * "which bot does this classification have". Those are the same answer only while a room has one
+ * assistant, and the name is what hid that assumption from every call site.
+ *
+ * THE ROLE IS THE ANSWER, NOT THE CLASSIFICATION. What a caller needs is the assistant holding the
+ * PRIMARY role in this conversation: the one that takes a turn nobody addressed, and the one that
+ * may hand work to another assistant when the work is not its own. Classification decides what an
+ * assistant may DO - it is the access boundary and stays tag-authoritative - and it stops deciding
+ * WHO acts, which was only ever a coincidence of there being one of them.
+ *
+ * TODAY the role is implied: a classification has exactly one assistant, that assistant is the
+ * channel's creator and member, so it holds every role there is. The lookup below is therefore
+ * correct and will stay correct for single-assistant rooms after the role record exists - which is
+ * what makes replacing it a behavior-neutral first step rather than a migration.
+ */
+/**
+ * THE ROOM'S PRIMARY, which speaks for the room: Battle Mode's on and off notices and adding the alt
+ * (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION §3.8). Empty when it cannot be resolved, or is not an assistant
+ * of the classification this request was checked against, and the caller refuses.
+ */
+async function resolvePrimaryBotArn(channelArn: string, classification: string): Promise<string> {
   try {
-    const resp = await ssmClient.send(
-      new GetParameterCommand({ Name: `${SSM_ROOT}/assistant/${classification}/bot-arn` }),
-    );
-    botArnCache[classification] = resp.Parameter?.Value || '';
-    return botArnCache[classification];
+    const primary = await primaryAssistantOf(channelArn, tagReader, '[channel-battle]');
+    return primary.classification === classification ? primary.botArn : '';
   } catch (err) {
-    console.warn(`[channel-battle] per-classification bot param for ${classification} missing:`, (err as Error).name);
+    console.warn('[channel-battle] the room has no resolvable primary', { channelArn, err: (err as Error).message });
     return '';
   }
 }
 
-function getCallerSub(event: APIGatewayProxyEvent): string | null {
-  const claims = (event.requestContext.authorizer?.claims || {}) as Record<string, string>;
-  return claims.sub || null;
+/**
+ * THIS CONVERSATION'S CHALLENGER: the alt of its classification's primary role, from the record its
+ * classification stack writes (§3.7). Null when the classification provisions no alt or the record cannot
+ * be read, and the caller refuses: a duel with no second side is not one to start.
+ */
+async function resolveRoomAlt(classification: string): Promise<{ botArn: string } | null> {
+  try {
+    return await readAltAssignment(ssmClient, SSM_ROOT, classification);
+  } catch (err) {
+    console.warn('[channel-battle] could not read the alt assignment record', {
+      classification, error: (err as Error).name,
+    });
+    return null;
+  }
 }
 
-function callerUserArn(event: APIGatewayProxyEvent): string {
-  const sub = getCallerSub(event);
-  return sub ? `${APP_INSTANCE_ARN}/user/${sub}` : '';
-}
 
 function isValidChannelArn(channelArn: string): boolean {
   if (!APP_INSTANCE_ARN || !channelArn.startsWith(`${APP_INSTANCE_ARN}/channel/`)) return false;
@@ -123,7 +151,8 @@ function isValidChannelArn(channelArn: string): boolean {
 }
 
 interface ChannelMetadata {
-  modelTier?: 'basic' | 'standard' | 'premium';
+  /** Member-writable metadata: never read for a decision (the gate reads the classification tag). */
+  modelTier?: string;
   createdBy?: string;
   modelId?: string;
   modelName?: string;
@@ -134,7 +163,9 @@ async function readChannelMetadata(channelArn: string, botArn: string): Promise<
     const channel = await messagingClient.send(
       new DescribeChannelCommand({ ChannelArn: channelArn, ChimeBearer: botArn }),
     );
-    return JSON.parse(channel.Channel?.Metadata || '{}') as ChannelMetadata;
+    const meta = parseChannelMetadata(channel.Channel?.Metadata);
+    if (!meta) console.warn('[channel-battle] the channel Metadata is not a JSON object');
+    return (meta as ChannelMetadata | undefined) ?? null;
   } catch (err) {
     console.warn('[channel-battle] DescribeChannel failed:', err);
     return null;
@@ -143,23 +174,28 @@ async function readChannelMetadata(channelArn: string, botArn: string): Promise<
 
 // The battle classification gate keys on the IMMUTABLE `classification` tag, NOT `metadata.modelTier`.
 // Metadata is mutable via the owner rename cap (chime:UpdateChannel), so trusting it would let
-// a moderator tamper the classification up to open premium battles on a lower-classification channel. The tag cannot
-// be changed by UpdateChannel. Fail-closed to the floor classification (not battle-eligible), so a
-// missing/unreadable tag denies the battle rather than opening it.
-async function resolveChannelClassification(channelArn: string): Promise<string> {
-  return resolveChannelClassificationTagShared(messagingClient, channelArn, '[channel-battle]');
+// a moderator rewrite the classification to open premium battles on a channel not cleared for them.
+// The tag cannot be changed by UpdateChannel.
+//
+// IT NO LONGER FAILS CLOSED TO THE FLOOR, AND IT CANNOT (ADR-045 decision 2). The old guarantee was
+// "a missing or unreadable tag denies the battle rather than opening it", and it rested entirely on
+// the floor classification not being battle-eligible. Every conversational classification is
+// battle-eligible as of 2026-09-17, so substituting the floor would now OPEN a duel on a tag nobody
+// could read - the safety property inverted the moment that config changed, silently, in a different
+// file. An unreadable tag is `undefined` here and the caller refuses.
+async function resolveChannelClassification(channelArn: string): Promise<string | undefined> {
+  return readChannelClassificationTag(tagReader as unknown as ChimeSDKMessagingClient, channelArn, '[channel-battle]');
 }
 
-interface Experiment {
+interface Experiment extends LegacyBattleBinding {
   experimentId: string;
   status: 'active' | 'paused' | 'completed';
   /** Target intent this experiment scopes to (drives the briefing's prompt steering, DESIGN §2.2). */
   intent?: string;
   tiers: string[];
   battleEnabled?: boolean;
-  altBotSlotId?: string;
-  altBotSlotArn?: string;
-  variants?: Array<{ displayName?: string }>;
+  /** The challenger's assistant id, `alt-{role}-{classification}`; read through `challengerOf`. */
+  challengerAssistant?: string;
   /** Written objective (DESIGN §1.2). Only `statement` is read here, for the battle briefing (§2.2). */
   objective?: { statement?: string };
 }
@@ -212,9 +248,9 @@ async function callerIsModerator(channelArn: string, callerArn: string): Promise
   }
 }
 
-async function findSlotConflicts(altBotSlotId: string, excludeExperimentId: string): Promise<string[]> {
-  // Used to enforce "one experiment per slot." Scans active experiments;
-  // small table, infrequent admin path, so the cost is fine.
+async function findChallengerConflicts(challengerAssistant: string, excludeExperimentId: string): Promise<string[]> {
+  // Used to enforce "one experiment per challenger", keyed by the challenger's assistant id. Scans active
+  // experiments; small table, infrequent admin path.
   if (!EXPERIMENTS_TABLE) return [];
   try {
     const result = await ddb.send(new ScanCommand({ TableName: EXPERIMENTS_TABLE }));
@@ -222,13 +258,13 @@ async function findSlotConflicts(altBotSlotId: string, excludeExperimentId: stri
       .filter(
         (e) =>
           e.battleEnabled === true
-          && e.altBotSlotId === altBotSlotId
+          && challengerOf(e) === challengerAssistant
           && e.experimentId !== excludeExperimentId
           && e.status === 'active',
       )
       .map((e) => e.experimentId);
   } catch (err) {
-    console.warn('[channel-battle] findSlotConflicts scan failed:', err);
+    console.warn('[channel-battle] findChallengerConflicts scan failed:', err);
     return [];
   }
 }
@@ -250,7 +286,7 @@ interface PromptSteering {
 }
 
 const PROMPT_STEERING: Record<string, PromptSteering> = {
-  general_qa: {
+  general: {
     coachingLine: 'Ask real questions your users ask.',
     examples: ['Explain X to a new hire', "What's the difference between A and B?"],
   },
@@ -262,7 +298,7 @@ const PROMPT_STEERING: Record<string, PromptSteering> = {
     coachingLine: 'Paste real code and ask for a review.',
     examples: ['Review this for bugs', 'Is this concurrency-safe?'],
   },
-  document_extraction: {
+  data_extraction: {
     coachingLine: 'Give a document and ask for specific fields.',
     examples: ['Extract the totals as a table', 'Pull every date + owner'],
   },
@@ -278,7 +314,7 @@ const PROMPT_STEERING: Record<string, PromptSteering> = {
     coachingLine: 'Pose a real judgment call.',
     examples: ['Pros/cons of migrating to …', 'What are the risks of …?'],
   },
-  workflow_actions: {
+  guided_troubleshooting: {
     coachingLine: 'Ask it to drive a multi-step task.',
     examples: ['Plan and track the steps to …', 'Walk me through …'],
   },
@@ -296,7 +332,7 @@ function endWithPeriod(s: string): string {
 /**
  * Build the battle-start briefing sentence(s) from the experiment's written
  * objective + target intent (DESIGN §2.2). Semi-blind by design: it names the
- * DECISION, never which alias is which model (INV-4 / §2.4). Returns null when
+ * DECISION, never which side is which model (INV-4 / §2.4). Returns null when
  * there is no objective statement to brief on, so callers fall back to today's
  * announcement (INV-2: absent ⇒ prior behavior).
  */
@@ -343,11 +379,11 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
   // the channel classification's single battle below. An explicit id is still
   // honored (back-compat) and takes precedence.
 
-  const callerSub = getCallerSub(event);
+  const callerSub = await callerPersonId(event);
   if (!callerSub) {
-    return respond(401, { error: 'Unauthorized — no Cognito sub on the request' }, origin);
+    return respond(401, { error: 'Unauthorized: this sign-in names no person' }, origin);
   }
-  const callerArn = callerUserArn(event);
+  const callerArn = userArnFor(APP_INSTANCE_ARN, callerSub);
 
   // Channel access + moderator check. Read metadata as the CALLER (a member):
   // no shared bot is a channel member, so the per-classification bot can't DescribeChannel.
@@ -357,7 +393,19 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
   }
   // Access confirmed above (caller could DescribeChannel). Classification comes from the tag.
   const channelClassification = await resolveChannelClassification(channelArn);
-  if (!profiles.profileFor(channelClassification).battleEligible) {
+  if (!channelClassification) {
+    // Unreadable is not a classification, and with every classification now battle-eligible there is
+    // no safe value to stand in for one. Refuse the enable rather than guess which room this is.
+    return respond(403, {
+      error: 'Battle Mode cannot be enabled: this conversation\'s classification could not be read',
+      code: 'CLASSIFICATION_UNREADABLE',
+    }, origin);
+  }
+  // CAPABILITY AND POLICY, IN THAT ORDER (ADR-049). This read `battleEligible` off the assistant
+  // profile, which was `true` for basic while basic's stack wires no battle plumbing at all - so an
+  // enable here succeeded and the duel had no grants to run with. `canRunBattle` refuses unless the
+  // deployment wired battle for this classification AND an operator turned it on.
+  if (!(await canRunBattle(channelClassification))) {
     return respond(403, {
       error: `Battle Mode is not available on ${channelClassification}-classification channels`,
       code: 'TIER_FORBIDDEN',
@@ -365,9 +413,8 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
     }, origin);
   }
   // Act as the channel's per-classification bot (its creator+member) for the alt-bot
-  // membership add + announcement. Premium by default; the channel's own classification
-  // when /battle is opened to other classifications.
-  const botArn = await resolveBotArn(channelClassification);
+  // membership add + announcement: always the channel's own classification's bot, or none.
+  const botArn = await resolvePrimaryBotArn(channelArn, channelClassification);
   if (!botArn) {
     return respond(500, { error: `${channelClassification} bot ARN not configured` }, origin);
   }
@@ -408,10 +455,31 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
       code: 'EXPERIMENT_NOT_BATTLE',
     }, origin);
   }
-  if (!exp.altBotSlotArn || !exp.altBotSlotId) {
+  const challengerAssistant = challengerOf(exp);
+  if (!challengerAssistant) {
     return respond(400, {
-      error: 'Experiment is missing altBotSlotArn (re-save it to bind a slot)',
-      code: 'EXPERIMENT_NO_SLOT',
+      error: 'Experiment names no challenger (re-save it to name one)',
+      code: 'EXPERIMENT_NO_CHALLENGER',
+    }, origin);
+  }
+  // THE DUEL'S SECOND SIDE COMES FROM THIS ROOM'S OWN CLASSIFICATION (ADR-045 decision 7).
+  //
+  // An alt is an assistant OF a classification, and adding one to a room of a different classification
+  // is the out-of-band membership this whole record is about - it would be refused by IAM at its first
+  // channel read.
+  //
+  // Checked here rather than left to IAM because this is the moment a person can be TOLD. A refusal
+  // at the first read is silent by design; a 400 at the enable names the mismatch while somebody is
+  // looking at the screen.
+  //
+  // The experiment's classification is the alt's, because the alt is the experiment's classification's own
+  // assistant; and the challenger it names must be the one this room's classification provisions today.
+  const altClassification = exp.tiers?.[0];
+  if (altClassification && altClassification !== channelClassification) {
+    return respond(400, {
+      error: `That experiment runs in ${altClassification} and this conversation is `
+        + `${channelClassification}. Choose a ${channelClassification} experiment and try again.`,
+      code: 'CHALLENGER_CLASSIFICATION_MISMATCH',
     }, origin);
   }
   if (exp.status !== 'active') {
@@ -421,22 +489,32 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
     }, origin);
   }
 
-  // Slot-conflict check (defense in depth — admin write path also enforces).
-  const conflicts = await findSlotConflicts(exp.altBotSlotId, exp.experimentId);
+  // The challenger's bot comes from its assignment record, never from the experiment row.
+  const roomAlt = await resolveRoomAlt(channelClassification);
+  if (!roomAlt || challengerAssistant !== profiles.altAssistantName(channelClassification, DUEL_ROLE)) {
+    return respond(400, {
+      error: `The experiment's challenger is not this deployment's ${channelClassification} alt `
+        + 'assistant. Re-save the experiment to name it again.',
+      code: 'EXPERIMENT_NO_CHALLENGER',
+    }, origin);
+  }
+
+  // Challenger-conflict check (defense in depth — admin write path also enforces).
+  const conflicts = await findChallengerConflicts(challengerAssistant, exp.experimentId);
   if (conflicts.length > 0) {
     return respond(409, {
-      error: 'Slot is bound to another active battle experiment',
-      code: 'SLOT_BOUND',
+      error: 'The challenger is named by another active battle experiment',
+      code: 'CHALLENGER_BOUND',
       conflictingExperimentIds: conflicts,
     }, origin);
   }
 
-  // Add the alt-slot bot as a channel member.
+  // Add the challenger as a channel member.
   try {
     await messagingClient.send(
       new CreateChannelMembershipCommand({
         ChannelArn: channelArn,
-        MemberArn: exp.altBotSlotArn,
+        MemberArn: roomAlt.botArn,
         Type: 'DEFAULT',
         ChimeBearer: botArn,
       }),
@@ -460,12 +538,16 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
   // config GET, without a per-render experiment read. Both fields are optional and
   // added only when present: this DocumentClient does not strip `undefined`, and a
   // record without them keeps working (INV-2).
+  //
+  // `challengerBotArn` is the member this enable ADDED to this room, recorded so disable removes exactly
+  // that member even if the alt's record names another bot by then. It is a fact about this room's
+  // membership, not a copy of the record for readers: a turn reads the challenger from the record.
   const configItem: Record<string, unknown> = {
     channelArn,
     enabled: true,
     experimentId: exp.experimentId,
-    altBotSlotId: exp.altBotSlotId,
-    altBotSlotArn: exp.altBotSlotArn,
+    challengerAssistant,
+    challengerBotArn: roomAlt.botArn,
     enabledBy: callerArn,
     enabledAt: new Date().toISOString(),
   };
@@ -483,32 +565,35 @@ async function handleEnable(event: APIGatewayProxyEvent, origin?: string): Promi
   //
   // When the experiment carries a written objective, brief battling users on WHAT
   // is being decided and which prompts help (DESIGN §2.2) — semi-blind: the copy
-  // names the decision, never the models, so the aliases stay opaque (§2.4 / INV-4).
+  // names the decision, never the models, so the side names stay opaque (§2.4 / INV-4).
   // With no objective statement we fall back to today's announcement (INV-2:
   // absent ⇒ prior behavior).
-  const variantDisplayName = exp.variants?.[1]?.displayName || 'an alternative assistant';
-  const briefing = buildBattleBriefing(exp.objective?.statement, exp.intent);
-  const announcement = briefing
-    ?? `Battle Mode is now ON. ${variantDisplayName} has joined the channel. Try \`/battle <your prompt>\` to compare both assistants.`;
-  try {
-    await messagingClient.send(
-      new SendChannelMessageCommand({
-        ChannelArn: channelArn,
-        Content: announcement,
-        Type: ChannelMessageType.STANDARD,
-        Persistence: ChannelMessagePersistenceType.PERSISTENT,
-        ChimeBearer: botArn,
-      }),
-    );
-  } catch (err) {
-    console.warn('[channel-battle][enable] System message send failed (non-fatal):', err);
+  // THE CHALLENGER'S NAME IS ITS PROFILE'S (`battleSideNames`), the name the room's members panel shows,
+  // read from the experiment this enable already holds rather than a second scan for it. A name that does
+  // not resolve is said as the catalog's line for an unnamed challenger, never as its assistant id.
+  const sides = await battleSidesOf(exp as unknown as ManagedExperiment).catch((err) => {
+    console.warn('[channel-battle][enable] the battle sides did not resolve', { experimentId: exp.experimentId, err: (err as Error)?.message });
+    return null;
+  });
+  let variantDisplayName = sides?.treatment?.displayName?.trim();
+  if (!variantDisplayName) {
+    console.warn("[channel-battle][enable] the challenger's name did not resolve; it is announced unnamed", {
+      experimentId: exp.experimentId, challengerAssistant,
+    });
+    variantDisplayName = noticeLine(undefined, 'battleChallengerUnnamed');
   }
+  const briefing = buildBattleBriefing(exp.objective?.statement, exp.intent);
+  // NAMED, NOT SAID: the room's assistant says it through its router, in its own copy
+  // (`say-through-router.ts`). This API speaks as no assistant.
+  await sayThroughRouter(channelClassification, briefing
+    ? { kind: 'battleModeBriefing', channelArn, botArn, to: [], vars: { briefing } }
+    : { kind: 'battleModeOn', channelArn, botArn, to: [], vars: { variant: variantDisplayName } });
 
   return respond(200, {
     enabled: true,
     channelArn,
     experimentId: exp.experimentId,
-    altBotSlotArn: exp.altBotSlotArn,
+    challengerAssistant,
     altBotDisplayName: variantDisplayName,
   }, origin);
 }
@@ -528,11 +613,11 @@ async function handleDisable(event: APIGatewayProxyEvent, origin?: string): Prom
     return respond(400, { error: 'Invalid or missing channelArn' }, origin);
   }
 
-  const callerSub = getCallerSub(event);
+  const callerSub = await callerPersonId(event);
   if (!callerSub) {
-    return respond(401, { error: 'Unauthorized — no Cognito sub on the request' }, origin);
+    return respond(401, { error: 'Unauthorized: this sign-in names no person' }, origin);
   }
-  const callerArn = callerUserArn(event);
+  const callerArn = userArnFor(APP_INSTANCE_ARN, callerSub);
 
   // Read metadata as the CALLER (a member); no shared bot is a channel member.
   // Then resolve the channel's per-classification bot for the bot-attributed delete +
@@ -541,7 +626,18 @@ async function handleDisable(event: APIGatewayProxyEvent, origin?: string): Prom
   if (!meta) {
     return respond(404, { error: 'Channel not found or inaccessible' }, origin);
   }
-  const botArn = await resolveBotArn(await resolveChannelClassification(channelArn));
+  const disableClassification = await resolveChannelClassification(channelArn);
+  if (!disableClassification) {
+    // DISABLE REFUSES TOO, and that is worth a sentence because the instinct is to let a teardown
+    // through. The bot ARN is resolved FROM the classification, so an unreadable tag would pick some
+    // other classification's assistant to act as - posting the leaving message and deleting the
+    // membership as an identity that was never in this room.
+    return respond(403, {
+      error: 'Battle Mode cannot be changed: this conversation\'s classification could not be read',
+      code: 'CLASSIFICATION_UNREADABLE',
+    }, origin);
+  }
+  const botArn = await resolvePrimaryBotArn(channelArn, disableClassification);
   // See handleEnable — live moderator list.
   if (!(await callerIsModerator(channelArn, callerArn))) {
     return respond(403, {
@@ -550,28 +646,15 @@ async function handleDisable(event: APIGatewayProxyEvent, origin?: string): Prom
     }, origin);
   }
 
-  // Load the current config to find the slot ARN to remove.
+  // Load the current config to find the challenger the enable added. A row written before the re-key
+  // names it under its old attribute (`challengerBotArnOf`).
   if (!CHANNEL_BATTLE_CONFIG_TABLE) {
     return respond(500, { error: 'CHANNEL_BATTLE_CONFIG_TABLE not configured' }, origin);
   }
   const config = await ddb.send(
     new GetCommand({ TableName: CHANNEL_BATTLE_CONFIG_TABLE, Key: { channelArn } }),
   );
-  const altBotSlotArn = (config.Item as { altBotSlotArn?: string } | undefined)?.altBotSlotArn;
-
-  if (altBotSlotArn) {
-    try {
-      await messagingClient.send(
-        new DeleteChannelMembershipCommand({
-          ChannelArn: channelArn,
-          MemberArn: altBotSlotArn,
-          ChimeBearer: botArn,
-        }),
-      );
-    } catch (err) {
-      console.warn('[channel-battle][disable] DeleteChannelMembership (non-fatal):', err);
-    }
-  }
+  const challengerBotArn = challengerBotArnOf(config.Item as ChannelBattleConfig | undefined);
 
   // END THE DUEL BEFORE THE CONFIG ROW GOES, and the order is the whole point.
   //
@@ -592,28 +675,35 @@ async function handleDisable(event: APIGatewayProxyEvent, origin?: string): Prom
       battleId: activeBattleId,
       reason: 'abandoned:battle-mode-off',
       endedBy: callerArn,
+      // The orchestrator takes down each side's waiting marker as that side's assistant, and this waits for it:
+      // the alt is removed from the room next, and an edit by a non-member fails.
+      classification: disableClassification,
+      waitForMarkers: true,
     });
+  }
+
+  // THE ALT LEAVES AFTER THE DUEL HAS ENDED, so its marker could still be cleared while it was a member.
+  if (challengerBotArn) {
+    try {
+      await messagingClient.send(
+        new DeleteChannelMembershipCommand({
+          ChannelArn: channelArn,
+          MemberArn: challengerBotArn,
+          ChimeBearer: botArn,
+        }),
+      );
+    } catch (err) {
+      console.warn('[channel-battle][disable] DeleteChannelMembership (non-fatal):', err);
+    }
   }
 
   await ddb.send(
     new DeleteCommand({ TableName: CHANNEL_BATTLE_CONFIG_TABLE, Key: { channelArn } }),
   );
 
-  try {
-    await messagingClient.send(
-      new SendChannelMessageCommand({
-        ChannelArn: channelArn,
-        Content: activeBattleId
-          ? 'Battle Mode is now OFF. The battle that was running has ended, along with anything it was collecting.'
-          : 'Battle Mode is now OFF.',
-        Type: ChannelMessageType.STANDARD,
-        Persistence: ChannelMessagePersistenceType.PERSISTENT,
-        ChimeBearer: botArn,
-      }),
-    );
-  } catch (err) {
-    console.warn('[channel-battle][disable] System message send failed (non-fatal):', err);
-  }
+  await sayThroughRouter(disableClassification, {
+    kind: activeBattleId ? 'battleModeOffEnded' : 'battleModeOff', channelArn, botArn, to: [],
+  });
 
   return respond(200, { enabled: false, channelArn }, origin);
 }
@@ -628,11 +718,11 @@ async function handleGet(event: APIGatewayProxyEvent, origin?: string): Promise<
   }
 
   // Verify the caller is a channel member before disclosing battle config
-  // (enabled flag, experimentId, altBotSlotArn) — otherwise any signed-in user
+  // (enabled flag, experimentId, challenger) — otherwise any signed-in user
   // could read any channel's config just by knowing the ARN.
-  const callerSub = getCallerSub(event);
+  const callerSub = await callerPersonId(event);
   if (callerSub && APP_INSTANCE_ARN) {
-    const callerUserArn = `${APP_INSTANCE_ARN}/user/${callerSub}`;
+    const callerUserArn = userArnFor(APP_INSTANCE_ARN, callerSub);
     try {
       await messagingClient.send(new DescribeChannelMembershipCommand({
         ChannelArn: channelArn,
@@ -654,15 +744,42 @@ async function handleGet(event: APIGatewayProxyEvent, origin?: string): Promise<
   // on. Returned so the UI can hide the Battle surfaces on capability rather than on a hardcoded
   // `modelTier === 'premium'` — which read mutable channel metadata and ignored `battleEligible`
   // entirely, so marking a non-premium profile eligible left the toggle invisible.
-  const battleEligible = profiles.profileFor(
-    await resolveChannelClassification(channelArn),
-  ).battleEligible === true;
+  // A READ, SO AN UNREADABLE TAG REPORTS "NOT ELIGIBLE" RATHER THAN REFUSING THE WHOLE RESPONSE.
+  // This endpoint answers several capability questions at once for the composer; failing all of them
+  // because one could not be resolved would blank the UI. Reporting the capability as absent hides
+  // the Battle surfaces, which is the same direction the gate takes and costs a person a toggle
+  // rather than a working conversation.
+  const statusClassification = await resolveChannelClassification(channelArn);
+  // The SAME question the enable path asks, so the composer never offers a toggle the enable would
+  // refuse. Reporting it as absent when the classification is unreadable is unchanged.
+  const battleEligible = await canRunBattle(statusClassification);
+  /**
+   * Whether the assistant here can READ a file the user attaches (attachment-in).
+   *
+   * WHY IT RIDES THIS RESPONSE. The composer needs a per-conversation capability answer, and this is
+   * already the endpoint that has one: it is MEMBER-gated rather than admin- or moderator-gated, and
+   * it resolves the classification from the IMMUTABLE TAG (`resolveChannelClassification`) rather
+   * than from `metadata.modelTier`, which members can write. The alternative was for the client to
+   * decide from the tier name it holds - which is that mutable metadata, and would have put a
+   * capability rule in one client for a boundary IAM enforces.
+   *
+   * THE ENDPOINT'S NAME IS NOW NARROWER THAN ITS JOB, and that is worth saying rather than quietly
+   * accepting: it answers "what may this conversation do", of which battle is one case. Renaming it
+   * is a breaking change to a live route, so the name stays and this comment carries the intent.
+   *
+   * It is an AFFORDANCE, never the enforcement. The grant is: a profile without
+   * `attachmentsReadable` has no `s3:GetObject` on `attachments/*`, so a client that ignores this
+   * field still cannot make the turn read the file - it only makes a person wonder why not.
+   */
+  const attachmentsReadable = statusClassification
+    ? profiles.requireProfileFor(statusClassification).attachmentsReadable === true
+    : false;
 
   const result = await ddb.send(
     new GetCommand({ TableName: CHANNEL_BATTLE_CONFIG_TABLE, Key: { channelArn } }),
   );
   if (!result.Item) {
-    return respond(200, { enabled: false, channelArn, battleEligible }, origin);
+    return respond(200, { enabled: false, channelArn, battleEligible, attachmentsReadable }, origin);
   }
   // Return only the member-relevant fields. NOT the raw Item: it carries `enabledBy` (the enabling
   // admin's user ARN) and `enabledAt`, which would deanonymize the operator to every channel member.
@@ -671,8 +788,9 @@ async function handleGet(event: APIGatewayProxyEvent, origin?: string): Promise<
     channelArn,
     enabled: item.enabled ?? false,
     battleEligible,
+    attachmentsReadable,
     experimentId: item.experimentId,
-    altBotSlotArn: item.altBotSlotArn,
+    ...(item.challengerAssistant ? { challengerAssistant: item.challengerAssistant } : {}),
     ...(item.briefingStatement ? { briefingStatement: item.briefingStatement } : {}),
     ...(item.briefingIntent ? { briefingIntent: item.briefingIntent } : {}),
   }, origin);
@@ -683,6 +801,8 @@ async function handleGet(event: APIGatewayProxyEvent, origin?: string): Promise<
 // ---------------------------------------------------------------------------
 
 export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   const origin = event.headers?.origin || event.headers?.Origin;
   const path = event.path || '';
   const method = event.httpMethod;

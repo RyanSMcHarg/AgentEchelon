@@ -1,0 +1,21 @@
+-- EVERY VERSION OF A MESSAGE (SPEC-ADMIN-CONSOLE FR55, DESIGN-ADMIN-CONSOLE 4.2).
+--
+-- An edit arrives as its own UPDATE_CHANNEL_MESSAGE event, archived as one `<id>-UPD` row per message:
+-- a second edit of the same message collides with the first on `(message_id, channel_arn)` and is
+-- dropped, and the fold overwrites `updated_content` with the latest text. So the record kept the
+-- original and the latest, and lost every version between them - which is the version an assistant
+-- may have answered.
+--
+-- ON THE MESSAGE'S OWN ROW, NOT A TABLE OF ITS OWN. Migration 068 allows message text in three places:
+-- the message itself, the Aurora archive, and S3. A versions table would be a fourth copy, out of reach
+-- of the read-time redaction join; a column on the CREATE row is covered by that join like the
+-- message's own content is.
+--
+-- Each element is `{"at": <the update's LastUpdatedTimestamp>, "content": <the text>}`, appended in
+-- arrival order by `backfillFromUpdateEvents`. A redelivered event appends nothing (the append is
+-- guarded on the element already being present). NULL on a message never edited. The original is
+-- `content`, and the latest is also `updated_content`, which every other reader keeps using.
+--
+-- Idempotent and transaction-safe: it applies at runtime on a cold start (`ensureSchema`).
+
+ALTER TABLE messages ADD COLUMN IF NOT EXISTS content_versions JSONB;

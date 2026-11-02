@@ -11,21 +11,27 @@
  *
  * THIS IS NEVER THE AUTHORITY FOR A LIVE DECISION (ADR-012). It is a copy, and a copy can be stale or
  * absent. It supplies a value at WRITE time - what classification to stamp on a row - and every caller
- * is required to choose its own fallback for "I don't know", because the safe fallback differs by
- * direction and getting it backwards is silent:
+ * is required to decide for itself what "I don't know" means, because the two directions do not have
+ * the same answer and getting it backwards is silent:
  *
- *   - Stamping CONTENT      -> fall back to `mostRestrictiveValue`. The row becomes readable only at
- *                              the top of the ladder. Withheld, never leaked.
- *   - Choosing a READER role -> fall back to `failClosedValue`, the LOWEST. A reader role sees its own
- *                              classification AND everything below, so defaulting a reader to the most
- *                              restrictive value would hand it the entire table. Same phrase,
- *                              opposite end of the ladder.
+ *   - Stamping CONTENT       -> fall back to `failClosedContentValue`: the classification the FEWEST
+ *                               holders reach. A stamp HAS to be some value or the row cannot be
+ *                               written at all, so this direction always has an answer. Withheld from
+ *                               the most holders possible, and not withheld from everyone.
+ *   - Choosing a READER role -> THERE IS NO FALLBACK. Refuse. An access decision, unlike a write, has
+ *                               the option of saying no, and it must take it.
+ *
+ * THERE IS NO LADDER, AND SO NO "LOWEST" TO DEFAULT A READER TO ([ADR-046]). A classification is a
+ * declared set of grants and reaches exactly what it declares; `legal` and `finance` are peers, with
+ * neither above the other. `failClosedValue` was definable only while the set had a bottom, and it is
+ * DELETED with nothing replacing it - so a reader role defaulted on an unreadable tag is not a cautious
+ * choice, it is a guess about which data a person may see.
  *
  * So this module deliberately returns `null` rather than defaulting on the caller's behalf.
  */
 
 import { query } from './db-client.js';
-import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
 
 /** How a recorded classification was obtained. Provenance, so a reader can weigh it. */
 export type ClassificationSource = 'router' | 'backfill';
@@ -44,7 +50,7 @@ export async function lookupChannelClassification(channelArn: string): Promise<s
   );
   const value = result.rows[0]?.classification;
   if (!value || !profiles.isKnownClassification(value)) return null;
-  return profiles.resolveClassification(value);
+  return profiles.resolveClassification(value)!; // guarded by isKnownClassification above
 }
 
 export interface ChannelClassificationRecord {

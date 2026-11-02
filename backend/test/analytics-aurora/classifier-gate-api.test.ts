@@ -38,13 +38,16 @@ process.env.CLASSIFIER_REPLAY_ARN = 'arn:aws:lambda:us-east-1:123456789012:funct
 
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const { handler } = require('../../lambda/src/analytics-aurora/analytics-query');
+import { analyticsPathFor as pathFor } from '../helpers/analytics-path';
+import { edgeContext } from '../helpers/edge-context';
+
 
 function postEvent(body: unknown): APIGatewayProxyEvent {
   return {
     httpMethod: 'POST',
-    path: '/query',
+    path: pathFor(body),
     body: JSON.stringify(body),
-    requestContext: { authorizer: { claims: { sub: 'admin-sub-1', 'cognito:groups': 'admins' } } },
+    requestContext: { authorizer: edgeContext({ claims: { sub: 'admin-sub-1', 'cognito:groups': 'admins' } }) },
   } as unknown as APIGatewayProxyEvent;
 }
 

@@ -35,20 +35,46 @@ const placeholder = (over: Partial<LedgerSourceRecord> = {}): LedgerSourceRecord
 });
 
 describe('the analytics record carries what the producer declared', () => {
-  it('keeps an orchestrator trigger', () => {
+  it('keeps a declared interaction kind', () => {
+    // `rebuttal`, not the retired `orchestrator`: the vocabulary now names the INTERACTION rather
+    // than the dispatcher, because 'orchestrator' covered both a battle rebuttal and a
+    // post-processing repair - two turns that answer the question "is a person waiting?" in
+    // opposite ways.
     const md = buildAnalyticsMetadata({
       messageNumber: 2,
-      userType: 'premium',
+      classification: 'premium',
       role: 'assistant',
-      trigger: 'orchestrator',
+      trigger: 'rebuttal',
     });
-    expect(md.trigger).toBe('orchestrator');
+    expect(md.trigger).toBe('rebuttal');
+  });
+
+  it('carries the declared cause INSTANT beside the kind', () => {
+    // A kind without an instant is a name with nothing to measure from. This is what gives a turn
+    // nobody asked for a latency at all.
+    const md = buildAnalyticsMetadata({
+      messageNumber: 2,
+      classification: 'premium',
+      role: 'assistant',
+      trigger: 'rebuttal',
+      triggerAtMs: 1_756_000_000_000,
+    });
+    expect(md.triggerAtMs).toBe(1_756_000_000_000);
+  });
+
+  it('omits the instant when the producer could not supply one', () => {
+    // Absent is legal and means "not measurable", which is the honest answer. A default here would
+    // report the fastest possible reaction for exactly the turns least understood.
+    const md = buildAnalyticsMetadata({
+      messageNumber: 2, classification: 'premium', role: 'assistant', trigger: 'rebuttal',
+    });
+    expect(md.triggerAtMs).toBeUndefined();
   });
 
   it('omits it entirely when nothing declared one - it is never defaulted here', () => {
     // A default invented at the carrier layer is indistinguishable from a declaration, and the whole
     // value of this field is that it was DECLARED by the path that knows.
-    const md = buildAnalyticsMetadata({ messageNumber: 1, userType: 'standard', role: 'assistant' });
+    const md = buildAnalyticsMetadata({ messageNumber: 1, classification: 'standard', role: 'assistant' });
     expect(md.trigger).toBeUndefined();
   });
 });

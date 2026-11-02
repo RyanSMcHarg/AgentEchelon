@@ -14,7 +14,7 @@ jest.mock('@aws-sdk/lib-dynamodb', () => ({
   UpdateCommand: jest.fn().mockImplementation((args) => ({ __type: 'Update', input: args })),
 }), { virtual: true });
 
-import { getChannelContext, getParticipantContext, putChannelContext } from '../../lambda/src/lib/channel-context-client';
+import { getChannelContext, getParticipantContext, putChannelContext, advanceOnboardingIntake } from '../../lambda/src/lib/channel-context-client';
 
 const ARN = 'arn:aws:chime:us-east-1:111:app-instance/i/channel/c1';
 
@@ -49,11 +49,19 @@ describe('channel-context-client', () => {
 
   it('put ignores keys outside the owned set — a member-readable bit can never be persisted here', async () => {
     mockDdbSend.mockResolvedValue({});
-    // Cast: the type forbids these keys; the runtime guard is what we are pinning. `topic` and
+    // Cast: the type forbids these keys; the runtime guard is what we are pinning. `createdBy` and
     // `contextType` stay in member-readable Metadata and have no business in this store.
-    await putChannelContext(ARN, { participantProfile: 'x', topic: 'leaky', contextType: 'plan' } as never);
+    //
+    // THIS TEST USED `topic` AS ITS EXAMPLE, AND `topic` IS NOW OWNED HERE - a deliberate reversal, not
+    // a weakening of this guard. The rule the store enforces is not "no member-authored text": the
+    // store already owns `priorSubject`, which is also the member's own words. It is "server-written,
+    // and readable when it has to be read". `topic`'s only reader is `WelcomeIntent`, which fires on
+    // the assistant's automatic membership at creation - the moment channel Metadata is least reliably
+    // readable - so a Metadata-only `topic` lost the welcome's grounding intermittently. It is written
+    // to BOTH now: this copy for the read, and Metadata so a member can still edit their own subject.
+    await putChannelContext(ARN, { participantProfile: 'x', createdBy: 'leaky', contextType: 'plan' } as never);
     const vals = mockDdbSend.mock.calls[0][0].input.ExpressionAttributeValues;
-    expect(vals).not.toHaveProperty(':topic');
+    expect(vals).not.toHaveProperty(':createdBy');
     expect(vals).not.toHaveProperty(':contextType');
     expect(vals[':participantProfile']).toBe('x');
   });
@@ -99,13 +107,13 @@ describe('channel-context-client', () => {
 
   it('put no-ops without throwing when the table is unset', async () => {
     delete process.env.CHANNEL_CONTEXT_TABLE;
-    await expect(putChannelContext(ARN, { participantProfile: 'x' })).resolves.toBeUndefined();
+    await expect(putChannelContext(ARN, { participantProfile: 'x' })).resolves.toBe(false);
     expect(mockDdbSend).not.toHaveBeenCalled();
   });
 
   it('put swallows a store error (best-effort, never leaks)', async () => {
     mockDdbSend.mockRejectedValue(new Error('boom'));
-    await expect(putChannelContext(ARN, { participantProfile: 'x' })).resolves.toBeUndefined();
+    await expect(putChannelContext(ARN, { participantProfile: 'x' })).resolves.toBe(false);
   });
 
   it('get round-trips the stored item', async () => {
@@ -193,5 +201,58 @@ describe('channel-context-client - participant shape', () => {
   it('getParticipantContext fails soft to null on a store error', async () => {
     mockDdbSend.mockRejectedValue(new Error('boom'));
     await expect(getParticipantContext(ARN)).resolves.toBeNull();
+  });
+});
+
+// AN INTAKE IS ADVANCED ONLY FROM THE STATE THAT WAS READ (code review, 2026-09-12). Two deliveries of one
+// answer each read the same state; an unconditional write let the second file the answer under the next
+// question.
+describe('advanceOnboardingIntake', () => {
+  const next = { subject: 'alice', cursor: 1, collected: { company: 'Acme' }, phase: 'collecting' as const };
+
+  it('writes conditionally on the cursor, phase and subject it advanced from', async () => {
+    mockDdbSend.mockResolvedValue({});
+
+    expect(await advanceOnboardingIntake(ARN, { cursor: 0, phase: 'collecting', subject: 'alice' }, next)).toBe('advanced');
+
+    const cmd = mockDdbSend.mock.calls[0][0];
+    expect(cmd.input.ConditionExpression).toBe('#intake.#cursor = :cursor AND #intake.#phase = :phase AND #intake.#subject = :subject');
+    expect(cmd.input.ExpressionAttributeValues).toEqual(expect.objectContaining({
+      ':cursor': 0, ':phase': 'collecting', ':subject': 'alice', ':next': next,
+    }));
+  });
+
+  it('reports a lost race rather than overwriting the turn that won it', async () => {
+    mockDdbSend.mockRejectedValue(Object.assign(new Error('condition'), { name: 'ConditionalCheckFailedException' }));
+    expect(await advanceOnboardingIntake(ARN, { cursor: 0, phase: 'collecting', subject: 'alice' }, next)).toBe('lost');
+  });
+
+  it('reports a store failure as failed, not as lost', async () => {
+    mockDdbSend.mockRejectedValue(Object.assign(new Error('throttled'), { name: 'ProvisionedThroughputExceededException' }));
+    expect(await advanceOnboardingIntake(ARN, { cursor: 0, phase: 'collecting', subject: 'alice' }, next)).toBe('failed');
+  });
+});
+
+describe('putChannelContext reports whether it wrote', () => {
+  it('true on a write, false when the store refused it', async () => {
+    mockDdbSend.mockResolvedValueOnce({});
+    expect(await putChannelContext(ARN, { userName: 'Alice' })).toBe(true);
+    mockDdbSend.mockRejectedValueOnce(Object.assign(new Error('x'), { name: 'ResourceNotFoundException' }));
+    expect(await putChannelContext(ARN, { userName: 'Alice' })).toBe(false);
+  });
+});
+
+describe('a conversation is created once and enrolled once (ADR-050)', () => {
+  it('writes createdAt and enrollment only where absent, so a re-stamp keeps the first value', async () => {
+    mockDdbSend.mockResolvedValue({});
+    await putChannelContext(ARN, {
+      createdAt: '2026-10-12T00:00:00.000Z',
+      enrollment: { experimentId: 'e1', variantId: 'treatment' },
+      userName: 'Alice',
+    });
+    const expr = mockDdbSend.mock.calls[0][0].input.UpdateExpression as string;
+    expect(expr).toContain('#createdAt = if_not_exists(#createdAt, :createdAt)');
+    expect(expr).toContain('#enrollment = if_not_exists(#enrollment, :enrollment)');
+    expect(expr).toContain('#userName = :userName');
   });
 });

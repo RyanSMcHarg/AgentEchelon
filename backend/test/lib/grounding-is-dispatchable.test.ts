@@ -80,7 +80,7 @@ describe('a plan that is still too large after trimming is DROPPED, not sent par
     // test is supposed to catch. Verified by raising the cap - this line reddens, the self-referential
     // version did not.
     //
-    // 128KB is half the 256KB `Event`-invoke ceiling, leaving room for the transcript, RAG chunks and
+    // 128KB is half the 256KB `Event`-invoke limit, leaving room for the transcript, RAG chunks and
     // the summary that share the payload.
     const ABSOLUTE_DISPATCH_BUDGET = 128 * 1024;
     const ctx = boundedDomainContext<Plan>({ items: Array.from({ length: 400 }, (_, i) => item(i)) }, '[test]');

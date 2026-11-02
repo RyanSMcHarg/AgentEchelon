@@ -23,6 +23,10 @@ import { readFileSync, writeFileSync, unlinkSync, existsSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
 import { execSync } from 'child_process';
+import { createRequire } from 'module';
+
+const require = createRequire(import.meta.url);
+const { resolveStackPrefix } = require('./lib/stack-lookup.cjs');
 
 const __dirname = dirname(fileURLToPath(import.meta.url));
 const ROOT = join(__dirname, '..', '..');
@@ -37,13 +41,21 @@ const profile = profileIdx >= 0 ? args[profileIdx + 1] : null;
 const bucketIdx = args.indexOf('--bucket');
 let bucket = bucketIdx >= 0 ? args[bucketIdx + 1] : null;
 
-// Auto-detect bucket from CDK outputs if not specified. Athena mode publishes
-// ArchiveBucketName on AgentEchelonAnalytics; Aurora mode swaps that stack for
-// AgentEchelonAnalyticsAurora, which exposes the same output. Try both so the
-// helper is analytics-mode agnostic.
+// Auto-detect bucket from CDK outputs if not specified. The archive stack (AgentEchelonArchive on the
+// default instance) publishes ArchiveBucketName in both analytics modes, so the helper is
+// analytics-mode agnostic. The prefix is this instance's, from the resolver every operator
+// script shares (AE_STACK_PREFIX / AE_INSTANCE_NAME, or the STACK_PREFIX deploy.mjs passes), so a
+// non-default instance never syncs into the default instance's bucket, run alone or from deploy.mjs.
+let prefix;
 if (!bucket) {
+  try {
+    prefix = resolveStackPrefix(process.env);
+  } catch (err) {
+    console.error(err.message);
+    process.exit(1);
+  }
   const profileFlag = profile ? `--profile ${profile}` : '';
-  for (const stack of ['AgentEchelonAnalytics', 'AgentEchelonAnalyticsAurora']) {
+  for (const stack of [`${prefix}Archive`]) {
     try {
       const output = execSync(
         `aws cloudformation describe-stacks --stack-name ${stack} ${profileFlag} --query "Stacks[0].Outputs[?OutputKey=='ArchiveBucketName'].OutputValue" --output text`,
@@ -60,7 +72,7 @@ if (!bucket) {
 }
 
 if (!bucket) {
-  console.error('Could not determine S3 bucket. Pass --bucket or ensure the analytics stack (AgentEchelonAnalytics or AgentEchelonAnalyticsAurora) is deployed.');
+  console.error(`Could not determine S3 bucket. Pass --bucket or ensure the analytics stack (${prefix}Archive) is deployed.`);
   process.exit(1);
 }
 

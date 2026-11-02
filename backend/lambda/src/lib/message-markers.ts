@@ -69,6 +69,20 @@ export function stripMessageMarkers(content: string | null | undefined): string 
 }
 
 /**
+ * A DISPLAY NAME AS AN INERT MENTION (ADR-060 decision 7, ADR-061 decision 6): markers, `@` handles, angle and
+ * square brackets and links are neutralized, so a name can address no assistant, target no member and carry no
+ * link. Capped.
+ */
+export function inertMention(name: string | undefined): string {
+  return stripMessageMarkers(String(name ?? ''))
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/[@<>[\]{}()`*_|#\\]/g, '')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .slice(0, 64);
+}
+
+/**
  * Reasoning-tag scaffolding a model sometimes leaks into its FINAL answer — a
  * `<thinking>…</thinking>` block, or a `<result>…</result>` wrapper around the
  * real answer. These are internal scaffolding, never intended for the human, but

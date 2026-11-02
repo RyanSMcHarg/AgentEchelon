@@ -2,7 +2,8 @@
  * POST-PROCESSING RULE: a task answer that reached no assistant (ADR-032, ADR-030).
  *
  * THE DEFECT IT MEASURES. A person answers a question an assistant asked them, in a conversation with
- * more than one member, and addresses nobody. `InvokedBy` routes on mentions and targeting, so nothing
+ * more than one member, and addresses nobody. `InvokedBy` (`StandardMessages: NONE`) invokes Lex only
+ * for a targeted message, and above a 1:1 the channel flow dispatches only an addressed one, so nothing
  * is invoked: their answer sits in the channel, the chain it would unblock stays blocked, and nothing
  * errors. The conversation simply stops, and the person is left re-reading what they typed.
  *
@@ -14,7 +15,7 @@
  * the fact this costs time only in the broken case, where the same rule inline would cost every turn
  * in every conversation to buy nothing on the ones that were already right.
  *
- * It also could not run there. The channel flow callback carries no `Target` at all (* and the table in MESSAGE-FLOW Appendix A), so the flow cannot tell an addressed message from an
+ * It also could not run there. The channel flow callback carries no `Target` at all (* and the table in MESSAGE-FLOW Appendix B), so the flow cannot tell an addressed message from an
  * unaddressed one; the message stream carries both `Target` and `Metadata`. Any rule about how a
  * message was ADDRESSED can only run after the fact.
  *
@@ -31,26 +32,32 @@
 import { ChimeSDKMessagingClient } from '@aws-sdk/client-chime-sdk-messaging';
 import { LambdaClient, InvokeCommand, InvocationType } from '@aws-sdk/client-lambda';
 import { extractTaskAnswerHint } from './task-answer-metadata.js';
-import { getTask, principalIdFromArn, resolveTaskOwner } from './task-tracking.js';
-import { claimCorrelation } from './abuse-controls.js';
-import { resolveChannelClassificationTag } from './channel-classification.js';
+// TASKS GO THROUGH THE STORE SEAM, not the table. Same signatures; the boundary is inside.
+import { getTask } from './task-store.js';
+import { principalIdFromArn, resolveTaskAssignee } from './task-tracking.js';
+import { claimCorrelation, flowDeliveryKey, hasCorrelationClaim } from './abuse-controls.js';
+import { readChannelClassificationTag } from './channel-classification.js';
 import { resolveChannelSize } from './channel-size.js';
 import { flowBypassToken } from './flow-bypass.js';
+import { parseTaskReference } from './task-reference.js';
 import type { MessageStreamEvent } from './message-stream-event.js';
 import type { TurnRequest } from '../router-agent-handler.js';
-import { routerArnForClassification } from './router-arn.js';
+import { resolveRouterArn } from './router-arn.js';
 import { emitEmfMetric } from './emf-metrics.js';
+import { sessionClient } from './assistant-session.js';
+import { appInstanceArnOf, botArnFor } from './person-arn.js';
+import { decodeContent } from './chime/history.js';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
-const messagingClient = new ChimeSDKMessagingClient({ region: AWS_REGION });
-const lambdaClient = new LambdaClient({ region: AWS_REGION });
+const messagingClient = sessionClient(ChimeSDKMessagingClient, { region: AWS_REGION });
+const lambdaClient = sessionClient(LambdaClient, { region: AWS_REGION });
 
 /** EMF namespace. One metric name per outcome, so an alarm needs no log-metric-filter. */
 const METRIC_NAMESPACE = 'AgentEchelon/TaskAnswerRepair';
 
 /**
- * The message attribute Amazon Chime SDK routes mentions on. The frontend stamps it with the
- * mentioned member's ARN, and a mention naming a bot invokes that bot's Lex.
+ * The message attribute that carries mentions. The frontend stamps it with the mentioned member's
+ * ARN. Under `StandardMessages: NONE` it invokes no Lex; the channel flow routes the `@<member>`.
  */
 const CHIME_MENTIONS_ATTRIBUTE = 'CHIME.mentions';
 
@@ -65,7 +72,7 @@ function emit(metricName: string, dimensions: Record<string, string> = {}): void
   try {
     // Delegated to the ONE EMF emitter, because a hand-rolled envelope here sat outside
     // emf-schema.test.ts's drift guard - and CloudWatch rejects a malformed document SILENTLY, which
-    // once cost months of a metric never materialising. The DIMENSIONLESS set is emitted alongside
+    // once cost months of a metric never materializing. The DIMENSIONLESS set is emitted alongside
     // the per-classification one, and it is load-bearing: the post-processing stack's repair-rate
     // alarm watches the metric with no dimensions, and EMF dimension sets are distinct metrics - the
     // alarm over a dimensionless series that nothing published could structurally never fire.
@@ -89,11 +96,16 @@ export type SkipReason =
   | 'no-task-hint'
   | 'targeted'
   | 'mentioned'
-  | 'bypass-token';
+  | 'bypass-token'
+  | 'task-reference';
 
 export type RepairDecision =
   | { repair: false; reason: SkipReason }
-  | { repair: true; taskId: string; messageId: string; channelArn: string; senderArn: string; content: string };
+  | { repair: true; taskId: string; messageId: string; channelArn: string; senderArn: string; content: string;
+      /** When the PERSON sent it (epoch ms), so the repaired turn measures their wait and not the
+       *  dispatch that happened after the detection delay. Absent when the record carried no
+       *  timestamp - omitted rather than defaulted to now, which would report the wait as zero. */
+      sentAtMs?: number };
 
 /**
  * Everything that can be decided from the record alone, and nothing that needs a lookup.
@@ -116,6 +128,12 @@ export function decideRepair(event: MessageStreamEvent): RepairDecision {
   const senderArn = p.Sender?.Arn || '';
   if (!senderArn || senderArn.includes('/bot/')) return { repair: false, reason: 'bot-authored' };
 
+  // Parsed BEFORE the address checks so the value is available on the one return that needs it, and
+  // NaN-guarded: an unparseable timestamp is an absent one, never a 1970 instant that would report a
+  // wait of fifty-odd years.
+  const parsed = p.CreatedTimestamp ? Date.parse(p.CreatedTimestamp) : NaN;
+  const sentAtMs = Number.isFinite(parsed) ? parsed : undefined;
+
   const hint = extractTaskAnswerHint(p.Metadata);
   if (!hint) return { repair: false, reason: 'no-task-hint' };
 
@@ -130,7 +148,7 @@ export function decideRepair(event: MessageStreamEvent): RepairDecision {
   // the live stream rather than assumed:
   //
   //   1. `Target`            -> Chime routes it to the addressed bot's Lex (`TargetedMessages: ALL`)
-  //   2. `CHIME.mentions`    -> the same, with NO `Target` on the message at all
+  //   2. `CHIME.mentions`    -> NO `Target`; the CHANNEL FLOW routes the `@<member>` it carries
   //   3. `@all` / `/battle`  -> neither field is set; the CHANNEL FLOW claims the turn from content
   //
   // THE CHECKS ARE DELIBERATELY OVER-INCLUSIVE, and the asymmetry is the reason. Skipping something
@@ -151,11 +169,17 @@ export function decideRepair(event: MessageStreamEvent): RepairDecision {
   const mentions = p.MessageAttributes?.[CHIME_MENTIONS_ATTRIBUTE]?.StringValues || [];
   if (mentions.length > 0) return { repair: false, reason: 'mentioned' };
 
-  const content = p.Content ? safeDecode(p.Content) : '';
+  const content = p.Content ? decodeContent(p.Content) : '';
   // The SAME tokens the flow claims and the router stands down for, from the module that exists so
   // the two cannot drift (`flow-bypass.ts`). Post-processing is the third component in that seam, and
   // it stands down for the same reason the router does: something else already has this turn.
   if (p.Content && flowBypassToken(p.Content, content)) return { repair: false, reason: 'bypass-token' };
+  // A MESSAGE THAT STARTS WITH A TASK REFERENCE BELONGS TO THE CHANNEL FLOW (ADR-035). The flow routes
+  // it after the task service confirms the sender may answer that item, and a reference it declined to
+  // route is one the sender may not answer, so a repair here would either answer the message twice or
+  // answer what the flow refused. Measured live as a double entry: the second turn found the first one
+  // busy and queued the message behind its own answer.
+  if (parseTaskReference(content)) return { repair: false, reason: 'task-reference' };
 
   return {
     repair: true,
@@ -164,17 +188,10 @@ export function decideRepair(event: MessageStreamEvent): RepairDecision {
     channelArn: p.ChannelArn,
     senderArn,
     content,
+    ...(sentAtMs !== undefined ? { sentAtMs } : {}),
   };
 }
 
-/** Chime carries message content URL-encoded. A blob that will not decode is passed through as sent. */
-function safeDecode(content: string): string {
-  try {
-    return decodeURIComponent(content);
-  } catch {
-    return content;
-  }
-}
 
 /**
  * The bot ARN of an assistant in this channel's app instance.
@@ -185,15 +202,14 @@ function safeDecode(content: string): string {
  * stored prefix would be a second copy of that fact, free to disagree with the wiring it describes.
  *
  * DERIVING IT IS NOT TRUSTING IT. The ARN goes to the router as `TurnRequest.botArn`, which validates
- * every caller-supplied identity against this classification's own bot plus the published alt-slot
+ * every caller-supplied identity against this classification's own bot plus its classification's
  * roster (`isSanctionedBattleBot`). A task carrying a junk or foreign `assistantId` therefore cannot
  * make a handler answer as an arbitrary bot; it fails the sanction check and the turn declines.
  */
 export function botArnInChannel(channelArn: string, assistantId: string): string | undefined {
-  const marker = '/channel/';
-  const at = channelArn.indexOf(marker);
-  if (at < 0 || !assistantId) return undefined;
-  return `${channelArn.substring(0, at)}/bot/${assistantId}`;
+  const appInstanceArn = channelArn.includes('/channel/') ? appInstanceArnOf(channelArn) : null;
+  if (!appInstanceArn || !assistantId) return undefined;
+  return botArnFor(appInstanceArn, assistantId);
 }
 
 /**
@@ -208,17 +224,7 @@ export async function repairTaskAnswer(event: MessageStreamEvent): Promise<void>
   const decision = decideRepair(event);
   if (!decision.repair) return;
 
-  const { taskId, messageId, channelArn, senderArn, content } = decision;
-
-  // ONCE PER MESSAGE, and it is a DURABLE claim rather than a per-container one: Kinesis delivery is
-  // at-least-once and a retried batch runs on whichever container is free, so two deliveries of the
-  // same message can be repaired by two containers that each believe they are the first. Fails OPEN
-  // like every other claim on this platform - a control-table hiccup must not swallow a person's
-  // answer, and the cost of the rare double is one duplicated turn.
-  if (!(await claimCorrelation(`repair-${messageId}`))) {
-    console.log('[TaskAnswerRepair] a duplicate delivery of a message already repaired', { messageId });
-    return;
-  }
+  const { taskId, messageId, channelArn, senderArn, content, sentAtMs } = decision;
 
   try {
     // THE TASK IS THE AUTHORITY, and the hint is only what made us look. A hint naming a task that
@@ -242,7 +248,7 @@ export async function repairTaskAnswer(event: MessageStreamEvent): Promise<void>
     // see - from advancing someone else's work. It is the stream-side equivalent of the refusal the
     // router gets structurally: its person-owed lookup can only ever return a chain THIS person holds,
     // and here the same question has to be asked out loud because the task was named rather than found.
-    const owner = resolveTaskOwner(task);
+    const owner = resolveTaskAssignee(task);
     if (owner?.type !== 'user' || owner.id !== principalIdFromArn(senderArn)) {
       console.log('[TaskAnswerRepair] the speaker does not hold this task; leaving it alone', { taskId, messageId });
       emit('Unresolved', { Reason: 'not-the-owner' });
@@ -256,12 +262,22 @@ export async function repairTaskAnswer(event: MessageStreamEvent): Promise<void>
       return;
     }
 
-    // A 1:1 IS NOT BROKEN AND MUST NOT BE REPAIRED. At that size Amazon Chime SDK's AUTO trigger routes
-    // every message to Lex regardless of addressing, so the answer already reached the assistant and a
-    // dispatch here would be the SECOND turn on one message. `resolveChannelSize` fails toward the
+    // A 1:1 IS NOT BROKEN AND MUST NOT BE REPAIRED. At that size the channel flow owns every turn
+    // (`flowOwnsTheTurn`) and dispatches an unaddressed message to the primary assistant
+    // (`claimedWithoutAToken`), so the answer already reached the assistant and a dispatch here would
+    // be the SECOND turn on one message. `resolveChannelSize` fails toward the
     // group shape for its own caller, so an unreadable count is checked explicitly and declines: the
     // cheaper mistake is a repair that did not happen, which leaves the person exactly where they were.
     const size = await resolveChannelSize(messagingClient, channelArn, botArn);
+    if (size.refused) {
+      // Separated from `size-unknown` because it is a different thing to chase: the boundary refused
+      // this component the read, rather than the service failing it (ADR-045 decision 1).
+      console.error('[TaskAnswerRepair][SecurityEvent] refused by the channel classification boundary; not repairing', {
+        channelArn, messageId,
+      });
+      emit('Unresolved', { Reason: 'refused' });
+      return;
+    }
     if (size.unknown) {
       console.warn('[TaskAnswerRepair] the channel size could not be read; not repairing', { channelArn, messageId });
       emit('Unresolved', { Reason: 'size-unknown' });
@@ -273,13 +289,89 @@ export async function repairTaskAnswer(event: MessageStreamEvent): Promise<void>
     }
 
     // The channel's IMMUTABLE classification tag, exactly as every other component reads it - never
-    // mutable channel metadata, which a member holding `UpdateChannel` could raise to put the turn on
-    // a higher-classification assistant. Fails closed to `basic`.
-    const classification = await resolveChannelClassificationTag(messagingClient, channelArn, '[TaskAnswerRepair]');
-    const routerArn = routerArnForClassification(classification);
+    // mutable channel metadata, which a member holding `UpdateChannel` could rewrite to put the turn on
+    // another classification's assistant.
+    //
+    // IT NO LONGER FAILS CLOSED TO `basic`, BECAUSE THE FLOOR IS NOT A SAFE ANSWER HERE (ADR-045
+    // decision 2). This path re-drives a transcript through the router it names, so substituting the
+    // floor on an unreadable tag put a PREMIUM conversation's transcript through the BASIC router.
+    // An unreadable tag now declines the repair, which leaves the person exactly where they were -
+    // the same cheaper-mistake argument the size check above already makes.
+    const classification = await readChannelClassificationTag(messagingClient, channelArn, '[TaskAnswerRepair]');
+    if (!classification) {
+      console.warn('[TaskAnswerRepair] the channel classification could not be read; not repairing', {
+        channelArn, messageId,
+      });
+      emit('Unresolved', { Reason: 'classification-unreadable' });
+      return;
+    }
+    const routerArn = await resolveRouterArn(classification);
     if (!routerArn) {
       console.error('[TaskAnswerRepair] no router is wired for this classification; cannot repair', { classification });
       emit('Unresolved', { Reason: 'no-router' });
+      return;
+    }
+
+    // ONCE PER MESSAGE, and it is a DURABLE claim rather than a per-container one: Kinesis delivery is
+    // at-least-once and a retried batch runs on whichever container is free, so two deliveries of the
+    // same message can be repaired by two containers that each believe they are the first. Fails OPEN
+    // like every other claim on this platform - a control-table hiccup must not swallow a person's
+    // answer, and the cost of the rare double is one duplicated turn.
+    //
+    // TAKEN AFTER THE CHECKS, NOT BEFORE THEM (ADR-045 decision 2). It used to be the first thing this
+    // function did, so a repair refused by the classification boundary or by an unreadable size still
+    // burned the message's only claim - and the retry that should have succeeded once the throttle
+    // passed was then declined as a duplicate of a repair that never happened. Everything above this
+    // line is reads, so paying for them twice on a genuine duplicate is cheaper than losing the
+    // person's answer to a claim taken on behalf of work that was never done.
+    // ── THE CHANNEL FLOW MAY ALREADY HAVE DISPATCHED THIS MESSAGE ──────────────────────────────
+    //
+    // LOSING means the flow owns this turn and this repair must stand down; WINNING means nothing
+    // dispatched and the message really did reach nobody, which is what this component exists for.
+    //
+    // THIS COMMENT USED TO CLAIM THE ORDER GUARANTEED IT, and that was wrong (code review,
+    // 2026-09-22). It read "the flow claims `flow-<MessageId>` before it releases", so the claim
+    // "either exists or never will" by the time this runs. The flow releases FIRST on the ordinary
+    // path (`channel-flow-processor.ts`, `releasedEarly`) and claims only at the dispatch decision,
+    // after the roster read - so a message could reach this stream with the claim not yet taken, and
+    // whoever won dispatched. No double answer, because the claim is a real mutex, but the two
+    // dispatch differently: this one posts publicly under the assignee-only rule (ADR-030), and the
+    // flow standing down also swallows the private-address notice it owes the sender.
+    //
+    // The flow now holds its release until after the claim for exactly the shape this component acts
+    // on - a message whose `Metadata` names an item - so the ordering the old comment asserted is now
+    // true for the messages it needed to be true for, and is stated there rather than assumed here.
+    //
+    // WHY THIS REPLACED A CONTENT CHECK. `decideRepair` stands down for a message whose TEXT starts
+    // with a `#<n>`, because the flow routes those (ADR-035). The flow now routes on the task id in
+    // `Metadata` as well, and that message's text carries no reference at all - so the content check
+    // saw an unaddressed message and this would have dispatched a SECOND turn for one the flow had
+    // already dispatched. The free checks cannot see the flow's decision; this claim is the decision.
+    //
+    // Fails OPEN like the claim below, in the same direction and for the same reason.
+    if (!(await claimCorrelation(flowDeliveryKey(messageId)))) {
+      // ── WHOSE CLAIM IS IT, BECAUSE A REDELIVERY FINDS ITS OWN ────────────────────────────────
+      //
+      // Kinesis delivery is at-least-once, so a message this component already repaired comes back -
+      // and on the second pass it reads the `flow-` claim IT took on the first, then reported the
+      // dispatch as the channel flow's. Harmless to behavior, because the `repair-` claim below
+      // stands it down either way, and corrupting to the one number this key exists to produce: the
+      // count of turns the flow took from under the repair.
+      //
+      // Read rather than claimed, so asking the question does not answer it.
+      if (await hasCorrelationClaim(`repair-${messageId}`)) {
+        console.log('[TaskAnswerRepair] a duplicate delivery of a message already repaired', { messageId });
+        return;
+      }
+      console.log('[TaskAnswerRepair] the channel flow already dispatched this message; nothing to repair', {
+        messageId,
+      });
+      emit('Unresolved', { Reason: 'flow-dispatched' });
+      return;
+    }
+
+    if (!(await claimCorrelation(`repair-${messageId}`))) {
+      console.log('[TaskAnswerRepair] a duplicate delivery of a message already repaired', { messageId });
       return;
     }
 
@@ -300,7 +392,16 @@ export async function repairTaskAnswer(event: MessageStreamEvent): Promise<void>
       // declaration the turn archives as user-triggered and is measured as one very slow answer -
       // the exact misread the trigger field's contract says it exists to prevent. This is one of the
       // two producers 'orchestrator' shipped without.
-      trigger: 'orchestrator',
+      // NAMED BY INTERACTION (interaction-kinds.ts). This was 'orchestrator', which named the
+      // dispatcher and made a repair indistinguishable from a battle rebuttal - two turns with
+      // opposite answers to 'is somebody waiting for this?'. A repair re-drives a message a PERSON
+      // sent and is still waiting on; a rebuttal answers another assistant.
+      trigger: 'repair',
+      // THEIR SEND, NOT THIS DISPATCH. Everything between the two - the Kinesis hop and the
+      // detection - is wait they experienced, and it is the largest part of a repaired turn's
+      // latency. Measuring from here would report the repair as fast and hide the delay it exists
+      // to recover from.
+      ...(sentAtMs !== undefined ? { triggerAtMs: sentAtMs } : {}),
     };
     await lambdaClient.send(new InvokeCommand({
       FunctionName: routerArn,

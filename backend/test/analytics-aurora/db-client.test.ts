@@ -163,7 +163,7 @@ describe('DB Client', () => {
    * invocation, and `ensureSchema` rethrows with nothing committed if that invocation runs out. A data
    * backfill over an existing table is the one migration shape whose cost scales with the deployment,
    * so it does a BOUNDED batch and reports what is left in `_migration_progress`. The runner has to
-   * honour that report: recording the file as applied after one batch strands every remaining row,
+   * honor that report: recording the file as applied after one batch strands every remaining row,
    * which is a migration marked done whose effect is partial.
    */
   describe('resumable migrations', () => {
@@ -193,10 +193,19 @@ describe('DB Client', () => {
     }
 
     /** Filenames this run recorded as applied. */
+    /**
+     * The MIGRATION FILES recorded in `_migrations`, which is what these cases are about.
+     *
+     * The classification boundary also records itself in that table, under a key that is deliberately
+     * not a filename (`__classification-boundary__`), so that it can never be mistaken for an applied
+     * migration by the pending scan. Filtering to `.sql` here is the same distinction from the other
+     * side: a case asking "which migrations were recorded" must not see it.
+     */
     function recorded(pg: any): string[] {
       return pg.__mockClient.query.mock.calls
         .filter((c: any[]) => /INSERT INTO _migrations/.test(String(c[0])))
-        .map((c: any[]) => c[1][0]);
+        .map((c: any[]) => c[1][0])
+        .filter((name: string) => name.endsWith('.sql'));
     }
 
     afterEach(() => {

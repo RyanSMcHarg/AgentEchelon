@@ -17,6 +17,7 @@
 
 import { query, ownerQuery } from './db-client.js';
 import { stripMessageMarkers } from '../lib/message-markers.js';
+import { ARCHIVAL_SUFFIX_SQL } from './update-events.js';
 
 export interface AdminConvSummary {
   channelArn: string;
@@ -36,7 +37,10 @@ export interface AdminConvMessage {
   id: string;
   content: string;
   senderArn: string;
-  senderName: string;
+  /** OPTIONAL: who a participant is, is a separate grant from what they said (SPEC-ADMIN-CONSOLE
+   *  FR41). `admin-conversations` withholds it for a caller without the identity capability, on this
+   *  path as well as the archive one. `senderArn` always identifies the sender. */
+  senderName?: string;
   timestamp: string;
   isBot: boolean;
   redacted: boolean;
@@ -45,11 +49,17 @@ export interface AdminConvMessage {
   deleted?: boolean;
   modelId?: string;
   intent?: string;
+  /** True when an exchange claims this message as its answer: the only messages a flag can reach the
+   *  Flagged list from. Aurora mode only; absent on the Athena path. */
+  answersTurn?: boolean;
   /** Who performed the moderation + when — taken from the -RED/-DEL sibling EVENT's own
    *  sender (the actor who redacted/deleted), not the original author. Undefined if not moderated. */
   moderatedByName?: string;
   moderatedByArn?: string;
   moderatedAt?: string;
+  /** Every version of an edited message, the original first and the latest last. Absent on a message
+   *  never edited, and on a removed one: a removal blanks every version with the message. */
+  versions?: Array<{ at: string; content: string }>;
   metadata: Record<string, unknown>;
   raw?: Record<string, unknown>;
 }
@@ -57,10 +67,22 @@ export interface AdminConvMessage {
 export interface AdminMembershipEvent {
   action: string;
   memberArn: string;
-  memberName: string;
+  /** OPTIONAL for the reason `AdminConvMessage.senderName` is. */
+  memberName?: string;
+  /** The INVITER's display name, withheld under the same grant. No ARN accompanies it: the archive
+   *  row carries only `sender_name`, so there is no id to fall back to. */
   invitedBy?: string;
   timestamp: string;
   isBot: boolean;
+  /** True for a member the others could not see. Absent where the archive row predates recording it. */
+  hidden?: boolean;
+  /** True for the creating identity's own join, moderator grant and leave while it assembled the room. */
+  roomSetup?: boolean;
+  /** A subject change (`subject_added`, `subject_dropped`): the summarizer's label. */
+  subject?: string;
+  /** A drift flag (`subject_flagged`): the message that raised it, and how the offer ended. */
+  messageId?: string;
+  subjectOutcome?: string;
 }
 
 export interface AdminConvPage {
@@ -70,7 +92,7 @@ export interface AdminConvPage {
 
 /**
  * One page of the admin conversation list, plus the TOTAL match count (server-side pagination).
- * `allowedClassifications` pushes the caller's classification-ceiling scope INTO the SQL so the
+ * `allowedClassifications` pushes the caller's classification scope INTO the SQL so the
  * page and total are consistent for a scoped admin (null = full access, no filter). COUNT(*) OVER()
  * returns the total in the same round-trip.
  */
@@ -78,6 +100,13 @@ export async function adminListConversations(
   limit = 50,
   offset = 0,
   allowedClassifications: string[] | null = null,
+  /** One conversation by its ARN: the lookup by id (SPEC-ADMIN-CONSOLE FR52), under the same scope as the list. */
+  channelArn: string | null = null,
+  /**
+   * Only conversations one of these identities was ever made a member of: a team's assistant
+   * (SPEC-ADMIN-CONSOLE FR48). From the archived membership events, the same record the history reads.
+   */
+  memberArns: string[] | null = null,
 ): Promise<AdminConvPage> {
   const lim = Math.min(Math.max(1, limit), 200);
   const off = Math.max(0, offset);
@@ -119,7 +148,10 @@ export async function adminListConversations(
      ),
      agg AS (
        SELECT channel_arn,
-              MAX(user_type) AS classification,
+              -- The conversation's classification as its turns declared it. The deprecated user_type
+              -- (migration 050) held the same value on messages archived before that column, so it
+              -- answers for them - and keeps them inside the caller's classification scope below.
+              COALESCE(MAX(conversation_classification), MAX(user_type)) AS classification,
               COUNT(*) FILTER (WHERE event_type = 'CREATE_CHANNEL_MESSAGE') AS message_count,
               MAX(created_at) FILTER (WHERE event_type = 'CREATE_CHANNEL_MESSAGE') AS last_message_at
          FROM messages
@@ -169,11 +201,17 @@ export async function adminListConversations(
        LEFT JOIN members mem ON mem.channel_arn = a.channel_arn
        LEFT JOIN lifecycle lc ON lc.channel_arn = a.channel_arn
       WHERE a.message_count > 0
-        -- Classification-ceiling scope in SQL, so LIMIT/OFFSET/total match what a scoped admin sees.
+        -- Classification scope in SQL, so LIMIT/OFFSET/total match what a scoped admin sees.
         AND ($3::text[] IS NULL OR a.classification = ANY($3))
+        AND ($4::text IS NULL OR a.channel_arn = $4)
+        AND ($5::text[] IS NULL OR a.channel_arn IN (
+              SELECT channel_arn FROM messages
+               WHERE event_type = 'CREATE_CHANNEL_MEMBERSHIP' AND target_arn = ANY($5)))
       ORDER BY a.last_message_at DESC NULLS LAST
       LIMIT $1 OFFSET $2`,
-    [lim, off, allowed],
+    // An EMPTY member list is a scope with nobody in it and matches no conversation; only null means
+    // unscoped. Collapsing [] to null would have answered a team with every conversation.
+    [lim, off, allowed, channelArn, memberArns],
   );
   const total = res.rows[0]?.total_count != null ? Number(res.rows[0].total_count) : res.rows.length;
   const conversations = res.rows.map((r) => ({
@@ -239,7 +277,9 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
     bedrock_model: string | null; input_tokens: number | null; output_tokens: number | null;
     total_ms: number | null; redacted: boolean | null; deleted: boolean | null;
     metadata: Record<string, unknown> | null; intent: string | null;
+    original_content: string | null; content_versions: Array<{ at: string; content: string }> | null;
     moderated_by_name: string | null; moderated_by_arn: string | null; moderated_at: string | null;
+    flag_reason: string | null; flagged_at: string | null; answers_turn: boolean | null;
   }>(
     // Moderation (redact + delete) is archived as a sibling row, NOT a column on
     // the CREATE row: kinesis-archival suffixes the event's MessageId (`-RED` for
@@ -252,6 +292,8 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
     // already-bootstrapped live DB — schema-init is create-only (no-op on Update).
     `SELECT m.message_id,
             COALESCE(m.updated_content, m.content) AS content,
+            -- Every version (migration 070): the original, then each edit in arrival order.
+            m.content AS original_content, m.content_versions,
             m.sender_name, m.sender_arn, m.created_at, m.is_bot, m.bedrock_model,
             m.input_tokens, m.output_tokens, m.total_ms, m.metadata,
             -- Intent lives ONLY on the exchange (there is no messages.intent column, and it is
@@ -260,12 +302,20 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
             (SELECT ex.intent FROM exchanges ex
               WHERE ex.agent_message_id = m.id OR ex.user_message_id = m.id
               LIMIT 1) AS intent,
+            -- Whether this message is the answer of an exchange. Only an answer reaches the Flagged list,
+            -- so the transcript offers the flag on nothing else.
+            EXISTS (SELECT 1 FROM exchanges ex WHERE ex.agent_message_id = m.id) AS answers_turn,
             (red.message_id IS NOT NULL) AS redacted,
             (del.message_id IS NOT NULL) AS deleted,
             -- Attribution: the ACTUAL actor comes from moderation_actions, written by the analytics
             -- API at action time with the server-verified admin identity. The Chime redact/delete
             -- event keeps the original author, so it can't attribute the moderator; this can.
-            ma.actor_name AS moderated_by_name, ma.actor_arn AS moderated_by_arn, ma.created_at AS moderated_at
+            ma.actor_name AS moderated_by_name, ma.actor_arn AS moderated_by_arn, ma.created_at AS moderated_at,
+            -- A flag a moderator raised on this response (human_flag, migration 059). Projected so
+            -- the transcript can show the control as already-flagged after a reload: without it the
+            -- button state would live only in component memory, and a moderator who refreshed would
+            -- be invited to flag the same response again.
+            hf.reason AS flag_reason, hf.flagged_at AS flagged_at
        FROM messages m
        LEFT JOIN messages red
               ON red.channel_arn = m.channel_arn
@@ -281,6 +331,8 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
                WHERE channel_arn = m.channel_arn AND message_id = m.message_id
                ORDER BY created_at DESC LIMIT 1
             ) ma ON true
+       LEFT JOIN human_flag hf
+              ON hf.channel_arn = m.channel_arn AND hf.message_id = m.message_id
       WHERE m.channel_arn = $1 AND m.event_type = 'CREATE_CHANNEL_MESSAGE'
       ORDER BY m.created_at ASC`,
     [channelArn],
@@ -295,6 +347,13 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
     // superseding REDACT/DELETE row carries empty Content). `redacted` stays the
     // distinct flag the UI renders; `deleted` blanks content the same way.
     const content = redacted || deleted ? '' : stripMessageMarkers(r.content);
+    // EVERY VERSION, ONLY WHILE THE MESSAGE IS THERE. A removal blanks every version with the message,
+    // because each one is what was said. Absent on a message never edited.
+    const edits = Array.isArray(r.content_versions) ? r.content_versions : [];
+    const versions = redacted || deleted || edits.length === 0
+      ? undefined
+      : [{ at: r.created_at, content: r.original_content ?? '' }, ...edits]
+          .map((v) => ({ at: v.at, content: stripMessageMarkers(v.content ?? '') }));
     // Attribution from the moderation_actions audit (server-verified actor). Null when no
     // audit row exists (bot self-delete, or a moderation before audit logging) → the UI
     // falls back to the role ("by an admin" / "by a moderator").
@@ -315,6 +374,12 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
       moderatedByName: moderatedByName || undefined,
       moderatedByArn: moderatedByArn || undefined,
       moderatedAt: moderatedAt || undefined,
+      // Absent when nobody has flagged this response. Unflagged is the ABSENCE of a flag, not a
+      // stored 'clear', so there is no third state to render.
+      answersTurn: r.answers_turn === true,
+      flagReason: r.flag_reason || undefined,
+      flaggedAt: r.flagged_at || undefined,
+      versions,
       metadata,
       // Inspect-drawer payload: the faithful stored projection of this message.
       raw: {
@@ -339,7 +404,9 @@ export async function adminListMessages(channelArn: string): Promise<AdminConvMe
 export interface AdminConvEvent {
   eventType: string;
   messageId: string | null;
-  senderName: string | null;
+  /** OPTIONAL for the reason `AdminConvMessage.senderName` is. `null` keeps its existing meaning -
+   *  the archived event carried no sender - while ABSENT means withheld. */
+  senderName?: string | null;
   senderArn: string | null;
   targetArn: string | null;
   content: string | null;
@@ -352,9 +419,9 @@ export interface AdminConvEvent {
  * The COMPLETE archived event log for a channel — every event_type (message
  * create/update/redact/delete, membership create/update/delete, channel create/update/delete)
  * ordered by time. For the dev-persona "all events" view. A redacted/deleted message must not leak
- * content through ANY of its rows: the finalized text lives on the `-UPD` row (a bot reply is a
+ * content through ANY of its rows: the finalized text lives on an update row (a bot reply is a
  * placeholder finalized via UpdateChannelMessage), so blank the content of every message-content row
- * (CREATE and UPDATE) whose BASE message has a `-RED`/`-DEL` sibling, not just the CREATE row.
+ * (CREATE and each UPDATE) whose BASE message has a `-RED`/`-DEL` sibling, not just the CREATE row.
  */
 export async function adminListEvents(channelArn: string): Promise<AdminConvEvent[]> {
   const res = await query<{
@@ -363,10 +430,13 @@ export async function adminListEvents(channelArn: string): Promise<AdminConvEven
     created_at: string; is_bot: boolean | null; metadata: Record<string, unknown> | null;
     moderated: boolean | null;
   }>(
-    // The `-RED`/`-DEL` sibling keys off the BASE Chime MessageId. A row is a CREATE (`<base>`), an
-    // UPDATE (`<base>-UPD`), or a moderation event (`<base>-RED`/`-DEL`); strip any suffix to the base
-    // before checking, so the finalized-content `-UPD` row is caught too (the earlier version keyed
-    // on the row's own id and missed it).
+    // The `-RED`/`-DEL` sibling keys off the BASE Chime MessageId. A row is a CREATE (`<base>`), one of
+    // its UPDATEs (`<base>-UPD-<hash>`, one row per update event since migration 084, or `<base>-UPD`
+    // before it), or a moderation event (`<base>-RED`/`-DEL`); strip any suffix to the base before
+    // checking, so every update row, the finalized content among them, is caught too.
+    //
+    // EVERY UPDATE ROW IS LISTED: this is the event log, and each update is an event. They share the
+    // message's CreatedTimestamp, so they are ordered among themselves by their own instant.
     `SELECT m.event_type, m.message_id, m.sender_name, m.sender_arn, m.target_arn,
             COALESCE(m.updated_content, m.content) AS content, m.created_at, m.is_bot, m.metadata,
             EXISTS (
@@ -374,12 +444,12 @@ export async function adminListEvents(channelArn: string): Promise<AdminConvEven
                WHERE x.channel_arn = m.channel_arn
                  AND x.event_type IN ('REDACT_CHANNEL_MESSAGE','DELETE_CHANNEL_MESSAGE')
                  AND x.message_id IN (
-                       regexp_replace(m.message_id, '-(UPD|RED|DEL)$', '') || '-RED',
-                       regexp_replace(m.message_id, '-(UPD|RED|DEL)$', '') || '-DEL')
+                       regexp_replace(m.message_id, ${ARCHIVAL_SUFFIX_SQL}, '') || '-RED',
+                       regexp_replace(m.message_id, ${ARCHIVAL_SUFFIX_SQL}, '') || '-DEL')
             ) AS moderated
        FROM messages m
       WHERE m.channel_arn = $1
-      ORDER BY m.created_at ASC, m.event_type ASC`,
+      ORDER BY m.created_at ASC, m.event_type ASC, m.last_updated_at ASC NULLS FIRST, m.message_id ASC`,
     [channelArn],
   );
   return res.rows.map((r) => {
@@ -409,12 +479,27 @@ const MEMBERSHIP_ACTION: Record<string, string> = {
   DELETE_CHANNEL_MODERATOR: 'revoked_moderator',
 };
 
+/** How long after CREATE_CHANNEL the creating identity's own membership events count as assembling the room. */
+const ROOM_SETUP_WINDOW_MS = 2 * 60_000;
+
 export async function adminMembershipHistory(channelArn: string): Promise<AdminMembershipEvent[]> {
+  // WHO CREATED THE ROOM, AND WHEN. A person-created conversation is created by the service admin, which
+  // joins, is made moderator by the service, and leaves once the room is assembled (channel-creation.ts
+  // CREATOR_BEARER_ARN). Those rows are true and stay in the record; they are marked as room setup so
+  // the console does not read them as somebody entering the conversation. Only the creating PERSON
+  // identity's own events, and only inside the window: the same admin joining later, to oversee, is not
+  // setup and is not marked.
   const res = await query<{
     event_type: string; member_arn: string | null; member_name: string | null;
-    invited_by: string | null; at: string;
+    invited_by: string | null; at: string; membership_type: string | null;
+    creator_arn?: string | null; channel_created_at?: string | null;
   }>(
     `SELECT event_type,
+            (SELECT c.sender_arn FROM messages c WHERE c.channel_arn = $1 AND c.event_type = 'CREATE_CHANNEL'
+              ORDER BY c.created_at ASC LIMIT 1) AS creator_arn,
+            (SELECT MIN(c.created_at) FROM messages c WHERE c.channel_arn = $1 AND c.event_type = 'CREATE_CHANNEL')
+              AS channel_created_at,
+            metadata->>'membershipType' AS membership_type,
             target_arn  AS member_arn,
             content     AS member_name,
             sender_name AS invited_by,
@@ -426,8 +511,10 @@ export async function adminMembershipHistory(channelArn: string): Promise<AdminM
       ORDER BY created_at ASC`,
     [channelArn],
   );
-  return res.rows.map((r) => {
+  const membership: AdminMembershipEvent[] = res.rows.map((r) => {
     const memberArn = r.member_arn || '';
+    const setupBy = (r.creator_arn || '').includes('/user/') ? r.creator_arn : '';
+    const createdAt = Date.parse(String(r.channel_created_at ?? '')) || 0;
     return {
       action: MEMBERSHIP_ACTION[r.event_type] || r.event_type,
       memberArn,
@@ -435,6 +522,80 @@ export async function adminMembershipHistory(channelArn: string): Promise<AdminM
       invitedBy: r.invited_by || undefined,
       timestamp: r.at,
       isBot: memberArn.includes('/bot/'),
+      ...(setupBy && memberArn === setupBy && (Date.parse(String(r.at)) || 0) - createdAt <= ROOM_SETUP_WINDOW_MS
+        ? { roomSetup: true } : {}),
+      // Known only for events archived since the type was kept; older rows answer undefined, not false.
+      ...(r.membership_type ? { hidden: r.membership_type === 'HIDDEN' } : {}),
     };
   });
+  const subjects = await subjectTimeline(channelArn);
+  if (!subjects.length) return membership;
+  const at = (e: AdminMembershipEvent) => Date.parse(e.timestamp) || 0;
+  return [...membership, ...subjects].sort((a, b) => at(a) - at(b));
+}
+
+/**
+ * WHEN THE CONVERSATION'S SUBJECT CHANGED, read from what is already stored, so no
+ * turn pays for it: a drift flag and how it ended (`drift_events`, live offers only), and the subjects each
+ * summary version added or dropped against the one before (`conversation_summaries` keeps every version).
+ *
+ * Folded into the membership timeline as its own actions, so the conversation record shows a context change
+ * where it happened. "Kept here" is the flag's outcome rather than its own row: the adoption time lives on a
+ * classification-bounded vector table this read is not a role for. Best-effort: a failed read leaves the
+ * membership timeline as it was.
+ */
+async function subjectTimeline(channelArn: string): Promise<AdminMembershipEvent[]> {
+  try {
+    const [flags, versions] = await Promise.all([
+      query<{ occurred_at: string; originating_message_id: string | null; outcome: string | null; new_channel_arn: string | null; outcome_at: string | null }>(
+        `SELECT occurred_at, originating_message_id, outcome, new_channel_arn, outcome_at FROM drift_events
+          WHERE parent_channel_arn = $1 AND COALESCE(source, 'live') = 'live'
+          ORDER BY occurred_at ASC`,
+        [channelArn],
+      ),
+      query<{ version: number; topics: string[] | null; created_at: string }>(
+        `SELECT version, topics, created_at FROM conversation_summaries
+          WHERE channel_arn = $1 ORDER BY version ASC`,
+        [channelArn],
+      ),
+    ]);
+    // THE FLAG AND ITS OUTCOME ARE TWO ROWS, each at its own time (migration 077 records when an outcome was
+    // decided); a row written before that falls back to the flag's time.
+    const out: AdminMembershipEvent[] = [];
+    for (const f of flags?.rows ?? []) {
+      out.push({
+        action: 'subject_flagged',
+        memberArn: '',
+        timestamp: String(f.occurred_at),
+        isBot: false,
+        ...(f.originating_message_id ? { messageId: f.originating_message_id } : {}),
+      });
+      if (f.outcome) {
+        out.push({
+          action: 'subject_resolved',
+          memberArn: '',
+          timestamp: String(f.outcome_at ?? f.occurred_at),
+          isBot: false,
+          // `abandoned` covers two endings: a split-out conversation nobody used, and an offer nobody answered
+          // (abandonment-detector.ts). Only the first has a new conversation, so that is what tells them apart.
+          subjectOutcome: f.outcome === 'abandoned' && !f.new_channel_arn ? 'unanswered' : f.outcome,
+        });
+      }
+    }
+    let previous = new Map<string, string>();
+    for (const v of versions?.rows ?? []) {
+      const current = new Map((v.topics ?? []).map((t) => [t.trim().toLowerCase(), t.trim()] as const).filter(([k]) => k));
+      for (const [key, subject] of current) {
+        if (!previous.has(key)) out.push({ action: 'subject_added', memberArn: '', subject, timestamp: String(v.created_at), isBot: false });
+      }
+      for (const [key, subject] of previous) {
+        if (!current.has(key)) out.push({ action: 'subject_dropped', memberArn: '', subject, timestamp: String(v.created_at), isBot: false });
+      }
+      previous = current;
+    }
+    return out;
+  } catch (err) {
+    console.warn('[admin-conversations] subject timeline unavailable', { err: (err as { name?: string })?.name });
+    return [];
+  }
 }

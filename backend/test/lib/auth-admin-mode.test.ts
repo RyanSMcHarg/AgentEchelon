@@ -5,6 +5,7 @@
  * so each env scenario re-imports the module via jest.resetModules().
  */
 import type { APIGatewayProxyEvent } from 'aws-lambda';
+import { edgeContext } from '../helpers/edge-context';
 
 type AuthModule = typeof import('../../lambda/src/lib/auth');
 
@@ -29,51 +30,63 @@ function loadAuth(env: Record<string, string | undefined>): AuthModule {
   return mod!;
 }
 
+// A person's token reaches a handler as the edge authorizer's context; an IAM-signed call carries an identity.
 function eventWith(claims: Record<string, unknown> | null, identity?: Record<string, unknown>) {
   return {
     requestContext: {
-      authorizer: claims ? { claims } : undefined,
+      authorizer: claims ? edgeContext({ claims }) : undefined,
       identity,
     },
   } as unknown as APIGatewayProxyEvent;
 }
 
 describe('callerIsAdmin — ae-cognito (default)', () => {
-  test('admin when cognito:groups contains the default "admins", even without sub', () => {
+  test('admin when cognito:groups contains the default "admins"', () => {
     const auth = loadAuth({ ADMIN_GROUP_NAMES: undefined, ADMIN_AUTH_MODE: undefined });
-    expect(auth.callerIsAdmin(eventWith({ 'cognito:groups': 'admins,premium' }))).toBe(true);
-    expect(auth.callerIsAdmin(eventWith({ 'cognito:groups': ['admins'] }))).toBe(true);
+    expect(auth.callerIsAdmin(eventWith({ sub: 'a1', 'cognito:groups': 'admins,premium' }))).toBe(true);
+    expect(auth.callerIsAdmin(eventWith({ sub: 'a1', 'cognito:groups': ['admins'] }))).toBe(true);
+  });
+
+  test('not admin when the edge resolved no subject, whatever groups the claims carry', () => {
+    // The edge admits a token only with the subject its issuer declares, so a context without one names nobody.
+    const auth = loadAuth({ ADMIN_GROUP_NAMES: undefined, ADMIN_AUTH_MODE: undefined });
+    expect(auth.callerIsAdmin(eventWith({ 'cognito:groups': 'admins' }))).toBe(false);
   });
 
   test('not admin for non-admin groups or missing claims', () => {
     const auth = loadAuth({ ADMIN_GROUP_NAMES: undefined, ADMIN_AUTH_MODE: undefined });
-    expect(auth.callerIsAdmin(eventWith({ 'cognito:groups': 'premium,standard' }))).toBe(false);
+    expect(auth.callerIsAdmin(eventWith({ sub: 'u1', 'cognito:groups': 'premium,standard' }))).toBe(false);
     expect(auth.callerIsAdmin(eventWith({ sub: 'u1' }))).toBe(false);
     expect(auth.callerIsAdmin(eventWith(null))).toBe(false);
   });
 });
 
-describe('callerIsAdmin — ADMIN_GROUP_NAMES override (federated)', () => {
+describe('callerIsAdmin — ADMIN_GROUP_NAMES override', () => {
   test('admin keys on the configured claim, not the literal "admins"', () => {
-    const auth = loadAuth({ ADMIN_GROUP_NAMES: 'operators,partner-admins', ADMIN_AUTH_MODE: 'federated' });
-    expect(auth.callerIsAdmin(eventWith({ 'cognito:groups': 'operators' }))).toBe(true);
-    expect(auth.callerIsAdmin(eventWith({ 'cognito:groups': ['partner-admins'] }))).toBe(true);
+    const auth = loadAuth({ ADMIN_GROUP_NAMES: 'operators,partner-admins', ADMIN_AUTH_MODE: 'ae-cognito' });
+    expect(auth.callerIsAdmin(eventWith({ sub: 'a1', 'cognito:groups': 'operators' }))).toBe(true);
+    expect(auth.callerIsAdmin(eventWith({ sub: 'a1', 'cognito:groups': ['partner-admins'] }))).toBe(true);
     // The legacy "admins" group is NOT admin once overridden.
-    expect(auth.callerIsAdmin(eventWith({ 'cognito:groups': 'admins' }))).toBe(false);
+    expect(auth.callerIsAdmin(eventWith({ sub: 'a1', 'cognito:groups': 'admins' }))).toBe(false);
   });
 });
 
 describe('admin auth — service mode (IAM-signed)', () => {
-  test('an IAM-signed call is admin even with no Cognito claims', () => {
+  test('an IAM-signed call is admin even with no Cognito claims', async () => {
     const auth = loadAuth({ ADMIN_AUTH_MODE: 'service' });
     const ev = eventWith(null, { userArn: 'arn:aws:iam::111:role/host-proxy' });
     expect(auth.isServiceAdminCall(ev)).toBe(true);
     expect(auth.callerIsAdmin(ev)).toBe(true);
-    const guard = auth.requireAdmin(ev);
+    const guard = await auth.requireAdmin(ev);
     expect('claims' in guard).toBe(true);
     if ('claims' in guard) {
-      expect(guard.claims.sub).toBe('arn:aws:iam::111:role/host-proxy');
-      expect(guard.claims.clearance).toBe('admins');
+      expect(guard.claims.personId).toBeNull();
+      expect(guard.claims.actor).toBe('arn:aws:iam::111:role/host-proxy');
+      // THE CLASSIFICATION, not the group name. This expected `admins`, which is the Cognito GROUP;
+      // the classification the shipped config maps that group to is `admin`, and the registry
+      // resolves it rather than this file naming either one.
+      expect(guard.claims.clearance).toBe('admin');
+      expect(guard.claims.groups).toEqual(['admins']);
     }
   });
 
@@ -95,17 +108,18 @@ describe('admin auth — service mode (IAM-signed)', () => {
 describe('admin auth — A14 per-resource IAM enforcement (adminIamEnforcement)', () => {
   const iamEv = eventWith(null, { userArn: 'arn:aws:sts::111:assumed-role/AdminAuthenticatedRole/abc' });
 
-  test('an IAM-signed call is trusted when ADMIN_IAM_ENFORCEMENT=true (gateway already vetted the capability)', () => {
+  test('an IAM-signed call is trusted when ADMIN_IAM_ENFORCEMENT=true (gateway already vetted the capability)', async () => {
     const auth = loadAuth({ ADMIN_AUTH_MODE: 'ae-cognito', ADMIN_IAM_ENFORCEMENT: 'true' });
     expect(auth.isAdminIamEnforcedCall(iamEv)).toBe(true);
     expect(auth.callerIsAdmin(iamEv)).toBe(true);
     expect(auth.callerCanReadArchive(iamEv)).toBe(true);
-    const guard = auth.requireAdmin(iamEv);
+    const guard = await auth.requireAdmin(iamEv);
     expect('claims' in guard).toBe(true);
     if ('claims' in guard) {
       // Actor derived from the signed principal.
-      expect(guard.claims.sub).toBe('arn:aws:sts::111:assumed-role/AdminAuthenticatedRole/abc');
-      expect(guard.claims.clearance).toBe('admins');
+      expect(guard.claims.personId).toBeNull();
+      expect(guard.claims.actor).toBe('arn:aws:sts::111:assumed-role/AdminAuthenticatedRole/abc');
+      expect(guard.claims.clearance).toBe('admin');
     }
   });
 
@@ -124,17 +138,17 @@ describe('admin auth — A14 per-resource IAM enforcement (adminIamEnforcement)'
 
   test('a Cognito-JWT call under the flag still resolves via the group gate (fallback)', () => {
     const auth = loadAuth({ ADMIN_AUTH_MODE: 'ae-cognito', ADMIN_IAM_ENFORCEMENT: 'true' });
-    expect(auth.callerCanReadArchive(eventWith({ 'cognito:groups': 'admins' }))).toBe(true);
-    expect(auth.callerCanReadArchive(eventWith({ 'cognito:groups': 'standard' }))).toBe(false);
+    expect(auth.callerCanReadArchive(eventWith({ sub: 'a1', 'cognito:groups': 'admins' }))).toBe(true);
+    expect(auth.callerCanReadArchive(eventWith({ sub: 'u1', 'cognito:groups': 'standard' }))).toBe(false);
   });
 });
 
 describe('requireAdmin — Cognito modes', () => {
-  test('returns claims for an admin and a 403 result for a non-admin', () => {
+  test('returns claims for an admin and a 403 result for a non-admin', async () => {
     const auth = loadAuth({ ADMIN_AUTH_MODE: undefined });
-    const ok = auth.requireAdmin(eventWith({ sub: 'a1', 'cognito:groups': 'admins' }));
+    const ok = await auth.requireAdmin(eventWith({ sub: 'a1', 'cognito:groups': 'admins' }));
     expect('claims' in ok).toBe(true);
-    const denied = auth.requireAdmin(eventWith({ sub: 'u1', 'cognito:groups': 'standard' }));
+    const denied = await auth.requireAdmin(eventWith({ sub: 'u1', 'cognito:groups': 'standard' }));
     expect('statusCode' in denied && denied.statusCode).toBe(403);
   });
 });

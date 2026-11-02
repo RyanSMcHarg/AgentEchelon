@@ -17,38 +17,27 @@ import { DynamoDBDocumentClient, QueryCommand, GetCommand, PutCommand, UpdateCom
 import { ChimeSDKMessagingClient, DeleteChannelMembershipCommand } from '@aws-sdk/client-chime-sdk-messaging';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { requireAdmin } from './lib/auth.js';
+import { responder, originsFrom } from './lib/http-response.js';
+import { chimeMessagingClient, appInstanceAdminBearer } from './lib/chime/clients.js';
+import { loadProfileRegistry } from '../../lib/profile-registry';
 
 const AWS_REGION = process.env.AWS_REGION || 'us-east-1';
 const AUDIT_TABLE = process.env.AUDIT_TABLE || '';
 const ADMIN_ARN_PARAM = process.env.ADMIN_ARN_PARAM || '/agent-echelon/app-instance-admin-arn';
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGINS || '').split(',').map((s) => s.trim()).filter(Boolean);
+const ALLOWED_ORIGINS = originsFrom(process.env.ALLOWED_ORIGINS, '', { trim: true, dropEmpty: true });
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: AWS_REGION }));
-const chime = new ChimeSDKMessagingClient({ region: AWS_REGION });
+const chime = chimeMessagingClient({ region: AWS_REGION });
 const ssm = new SSMClient({ region: AWS_REGION });
 
-function cors(origin?: string): Record<string, string> {
-  const allow = origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0] || '*';
-  return {
-    'Access-Control-Allow-Origin': allow,
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    Vary: 'Origin',
-  };
-}
-function respond(status: number, body: unknown, origin?: string): APIGatewayProxyResult {
-  return { statusCode: status, headers: { 'Content-Type': 'application/json', ...cors(origin) }, body: JSON.stringify(body) };
-}
+const http = responder({ origin: { allow: ALLOWED_ORIGINS, fallback: '*' }, methods: 'GET,POST,OPTIONS' });
+const respond = http.respond;
 
-let cachedAdminArn: string | null = null;
-async function getAdminArn(): Promise<string> {
-  if (cachedAdminArn) return cachedAdminArn;
-  const r = await ssm.send(new GetParameterCommand({ Name: ADMIN_ARN_PARAM }));
-  cachedAdminArn = r.Parameter?.Value || '';
-  return cachedAdminArn;
-}
+const getAdminArn = appInstanceAdminBearer({ ssm, param: ADMIN_ARN_PARAM, onFailure: 'throw' });
 
 export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   const origin = (event.headers?.origin || event.headers?.Origin) as string | undefined;
   const method = event.httpMethod;
   const path = event.path || '';
@@ -59,9 +48,9 @@ export async function handler(event: APIGatewayProxyEvent): Promise<APIGatewayPr
   // Enforce admin authority via the project's mode-aware check (Cognito `admins` group /
   // ADMIN_GROUP_NAMES / a federated host pool / an IAM-signed service call). The API-Gateway
   // authorizer only authenticates; this is what gates on admin. Do NOT rely on the authorizer alone.
-  const auth = requireAdmin(event);
-  if ('statusCode' in auth) return { ...auth, headers: { ...auth.headers, ...cors(origin) } };
-  const adminSub = auth.claims.sub;
+  const auth = await requireAdmin(event);
+  if ('statusCode' in auth) return { ...auth, headers: { ...auth.headers, ...http.headers(origin) } };
+  const adminSub = auth.claims.actor;
 
   try {
     if (method === 'GET' && path.endsWith('/findings')) {

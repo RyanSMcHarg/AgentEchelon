@@ -53,7 +53,7 @@ describe('summarizeReplay', () => {
   it('counts BOTH-WRONG separately instead of forcing it onto a side', () => {
     // A human may rule that neither prediction was right. Folding that into either cell would invent
     // a winner from a pair that has none.
-    const s = summarizeReplay(disagree('document_extraction', 5));
+    const s = summarizeReplay(disagree('data_extraction', 5));
     expect(s.adjudicated).toBe(5);
     expect(s.bothWrong).toBe(5);
     expect(s.challengerOnlyRight).toBe(0);
@@ -73,7 +73,7 @@ describe('summarizeReplay', () => {
 describe('evaluateClassifierGate', () => {
   it('refuses to conclude while the queue still has pairs in it', () => {
     // Unadjudicated pairs could fall either way. Reporting a verdict over the adjudicated subset
-    // would let whoever stopped labelling choose the answer.
+    // would let whoever stopped labeling choose the answer.
     const g = evaluateClassifierGate([
       ...agree('general', 300),
       ...disagree('code_generation', 30),
@@ -93,7 +93,7 @@ describe('evaluateClassifierGate', () => {
   });
 
   it('reports INSUFFICIENT when every disagreement was adjudicated to a third label', () => {
-    const g = evaluateClassifierGate([...agree('general', 100), ...disagree('workflow_actions', 20)]);
+    const g = evaluateClassifierGate([...agree('general', 100), ...disagree('guided_troubleshooting', 20)]);
     expect(g.verdict).toBe('insufficient');
     expect(g.summary.bothWrong).toBe(20);
     expect(g.rationale).toMatch(/neither model produced/);
@@ -114,7 +114,7 @@ describe('evaluateClassifierGate', () => {
   it('passes the §5.3 worked example: 42 to 18 reads as CHALLENGER BETTER', () => {
     const g = evaluateClassifierGate([
       ...agree('general', 300),
-      ...disagree('document_extraction', 40), // both wrong: the 40 "both wrong" cell
+      ...disagree('data_extraction', 40), // both wrong: the 40 "both wrong" cell
       ...disagree('code_generation', 42),
       ...disagree('general', 18),
     ]);
@@ -131,7 +131,7 @@ describe('evaluateClassifierGate', () => {
   });
 
   it('states that a pass authorises the split rather than being its result', () => {
-    // §5.4: the gate measures labelling on a fixed corpus. Whether users are better served is a
+    // §5.4: the gate measures labeling on a fixed corpus. Whether users are better served is a
     // question about live traffic, and the wording must not let the proxy stand in for the outcome.
     const g = evaluateClassifierGate([
       ...agree('general', 300),

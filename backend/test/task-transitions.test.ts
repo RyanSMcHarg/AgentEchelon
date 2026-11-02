@@ -5,6 +5,7 @@
  * no DynamoDB call). The persist path (stateHistory append) is exercised by the wiring tests.
  */
 import { authorizeTransition } from '../lambda/src/lib/task-state-machines.js';
+import { DEFAULT_TASK_STATE_MACHINES } from '../lambda/src/lib/task-state-machines';
 import { advanceTaskStateTo, type Task } from '../lambda/src/lib/task-tracking.js';
 import { DeliveryOption } from '../lambda/src/lib/delivery-options.js';
 
@@ -26,25 +27,25 @@ const baseTask = (over: Partial<Task> = {}): Task => ({
 
 describe('authorizeTransition (pure §3 checks 2-3)', () => {
   it('authorizes a declared edge', () => {
-    const a = authorizeTransition('guided_troubleshooting', 'collecting_symptoms', 'diagnosing');
+    const a = authorizeTransition('guided_troubleshooting', 'collecting_symptoms', 'diagnosing', DEFAULT_TASK_STATE_MACHINES);
     expect(a).toEqual({ ok: true, from: 'collecting_symptoms', to: 'diagnosing', terminal: undefined });
   });
 
   it('rejects an undeclared target as unknown_state, echoing the legal set', () => {
-    const a = authorizeTransition('guided_troubleshooting', 'collecting_symptoms', 'teleport');
+    const a = authorizeTransition('guided_troubleshooting', 'collecting_symptoms', 'teleport', DEFAULT_TASK_STATE_MACHINES);
     expect(a).toMatchObject({ ok: false, error: 'unknown_state', from: 'collecting_symptoms', legal: ['diagnosing'] });
   });
 
   it('rejects a declared-but-illegal edge as illegal_transition, echoing the legal set', () => {
     // 'resolved' is a real state, but not reachable directly from collecting_symptoms
-    const a = authorizeTransition('guided_troubleshooting', 'collecting_symptoms', 'resolved');
+    const a = authorizeTransition('guided_troubleshooting', 'collecting_symptoms', 'resolved', DEFAULT_TASK_STATE_MACHINES);
     expect(a).toMatchObject({ ok: false, error: 'illegal_transition', from: 'collecting_symptoms', legal: ['diagnosing'] });
   });
 
   it('reports the terminal disposition when the target is terminal', () => {
-    expect(authorizeTransition('guided_troubleshooting', 'awaiting_result', 'resolved'))
+    expect(authorizeTransition('guided_troubleshooting', 'awaiting_result', 'resolved', DEFAULT_TASK_STATE_MACHINES))
       .toEqual({ ok: true, from: 'awaiting_result', to: 'resolved', terminal: 'success' });
-    expect(authorizeTransition('guided_troubleshooting', 'awaiting_result', 'escalated'))
+    expect(authorizeTransition('guided_troubleshooting', 'awaiting_result', 'escalated', DEFAULT_TASK_STATE_MACHINES))
       .toEqual({ ok: true, from: 'awaiting_result', to: 'escalated', terminal: 'handoff' });
   });
 });

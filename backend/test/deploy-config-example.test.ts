@@ -15,13 +15,30 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import { resolveDeploymentProfiles } from '../lib/config/profiles';
 
 const BACKEND_DIR = path.join(__dirname, '..');
 const EXAMPLE_PATH = path.join(BACKEND_DIR, 'deploy.config.example.json');
 
-/** Every distinct `tryGetContext('key')` literal under the given roots. */
+/**
+ * Every context key the app reads, INCLUDING the ones it reads through a helper.
+ *
+ * A DIRECT-LITERAL SCAN WAS NOT ENOUGH, and what it missed was the spend controls. The classification
+ * stacks read context through a local `ctxNum(k)` wrapper that supplies a default, so the only literal
+ * is at the CALL SITE and `tryGetContext` itself never sees one. `bedrockUserHourlyBudget` and
+ * `bedrockGlobalHourlyBudget` were therefore invisible here, missing from the example, and missing
+ * from the real deploy config - so both shipped as "0", which `checkAndConsumeBudget` reads as "not
+ * configured" and switches the entire spend limit off. The guard that exists to stop a flag hiding
+ * in the source hid the two that bound cost.
+ *
+ * Same shape as the DynamoDB command guard beside it: resolve ONE hop, because one hop is where these
+ * hide.
+ */
 function contextKeysInSource(roots: string[]): Map<string, string> {
   const found = new Map<string, string>();
+  const add = (key: string, file: string): void => {
+    if (!found.has(key)) found.set(key, path.relative(BACKEND_DIR, file));
+  };
   const walk = (dir: string): void => {
     for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
       const full = path.join(dir, entry.name);
@@ -29,13 +46,38 @@ function contextKeysInSource(roots: string[]): Map<string, string> {
         walk(full);
       } else if (entry.name.endsWith('.ts') && !entry.name.endsWith('.d.ts')) {
         const src = fs.readFileSync(full, 'utf8');
-        for (const m of src.matchAll(/tryGetContext\(\s*'([^']+)'/g)) {
-          if (!found.has(m[1])) found.set(m[1], path.relative(BACKEND_DIR, full));
+        for (const m of src.matchAll(/tryGetContext\(\s*'([^']+)'/g)) add(m[1], full);
+
+        // A helper whose body reads `tryGetContext` with a NON-literal argument is a reader by proxy,
+        // so the keys live at its call sites instead. Named declarations only, and only within the
+        // file that declares them, so a same-named function elsewhere cannot invent a key.
+        const helpers = new Set<string>();
+        for (const m of src.matchAll(/(?:const|function)\s+([A-Za-z_$][\w$]*)\s*(?:=|\()/g)) {
+          const body = src.slice(m.index ?? 0, (m.index ?? 0) + 400);
+          if (/tryGetContext\(\s*[A-Za-z_$]/.test(body)) helpers.add(m[1]);
+        }
+        for (const name of helpers) {
+          for (const m of src.matchAll(new RegExp(name + "\\(\\s*'([^']+)'", 'g'))) add(m[1], full);
         }
       }
     }
   };
   for (const r of roots) walk(path.join(BACKEND_DIR, r));
+  return found;
+}
+
+/**
+ * The keys a provisioning script reads from the deployer's `deploy.config.json` itself (`config.<key>` in
+ * `scripts/lib`), such as the demo cast's `presenterMailbox`. Documented beside the context flags, because
+ * the deployer sets them in the same file; read by a script, never by the stacks.
+ */
+function scriptConfigKeys(): Set<string> {
+  const dir = path.join(BACKEND_DIR, 'scripts', 'lib');
+  const found = new Set<string>();
+  for (const name of fs.readdirSync(dir).filter((f) => f.endsWith('.cjs'))) {
+    const src = fs.readFileSync(path.join(dir, name), 'utf8');
+    for (const m of src.matchAll(/\bconfig\.([a-z][A-Za-z0-9]*)\b/g)) found.add(m[1]);
+  }
   return found;
 }
 
@@ -69,12 +111,13 @@ describe('deploy.config.example.json documents the real deploy context', () => {
 
   it('documents no flag the app does not read (catches typos and retired flags)', () => {
     const inSource = contextKeysInSource(['bin', 'lib']);
-    const stale = [...documentedKeys()].filter((k) => !inSource.has(k)).sort();
+    const byScripts = scriptConfigKeys();
+    const stale = [...documentedKeys()].filter((k) => !inSource.has(k) && !byScripts.has(k)).sort();
 
     if (stale.length > 0) {
       throw new Error(
         'These keys are documented in deploy.config.example.json but no longer read anywhere in\n'
-          + 'bin/ or lib/. Either the key is misspelled (so setting it would silently do nothing) or\n'
+          + 'bin/, lib/ or a provisioning script in scripts/lib/. Either the key is misspelled (so setting it would silently do nothing) or\n'
           + 'the flag was retired and its entry should be removed:\n'
           + stale.map((k) => `  ${k}`).join('\n'),
       );
@@ -91,5 +134,28 @@ describe('deploy.config.example.json documents the real deploy context', () => {
         throw new Error(`${key} must have a concrete value; use "" to mean "take the default".`);
       }
     }
+  });
+});
+
+/**
+ * THE EXAMPLE'S CUSTOM SET IS RUN, NOT READ. A deployer copies it, so it goes through the same resolution and
+ * validation a deployment's `profiles` does, and a key the validator retires fails here before it fails a synth.
+ */
+describe('deploy.config.example.json shows a profiles value that synthesizes', () => {
+  const raw = JSON.parse(fs.readFileSync(EXAMPLE_PATH, 'utf8')) as Record<string, unknown>;
+
+  it('resolves the custom-set example through the deployment validator', () => {
+    const example = raw._profilesCustomSetExample;
+    expect(example).toEqual(expect.objectContaining({ classifications: expect.any(Array) }));
+    const resolved = resolveDeploymentProfiles(example);
+    expect(resolved.classifications.map((c) => c.value)).toContain('legal');
+  });
+
+  it('resolves the custom-set example passed as a JSON string, the form a context value takes', () => {
+    expect(() => resolveDeploymentProfiles(JSON.stringify(raw._profilesCustomSetExample))).not.toThrow();
+  });
+
+  it('names no retired profiles key in its prose', () => {
+    expect(String(raw._profiles)).not.toMatch(/modelSelectionKey|externalProviderAllowed/);
   });
 });

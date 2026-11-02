@@ -9,6 +9,7 @@
  */
 
 import type { QueryCommandOutput } from '@aws-sdk/lib-dynamodb';
+import { defaultProfileRegistry } from '../../lib/profile-registry';
 
 const mockSend = jest.fn();
 jest.mock('@aws-sdk/lib-dynamodb', () => ({
@@ -43,24 +44,24 @@ describe('resolveExperimentModel — type ordering', () => {
   it('returns null when no experiment matches', async () => {
     mockSend.mockResolvedValueOnce({ Items: [] } as unknown as QueryCommandOutput);
     const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
-    expect(await resolveExperimentModel('standard', 'general_qa', 'arn:chan', catalog)).toBeNull();
+    expect(await resolveExperimentModel('standard', 'general', 'arn:chan', catalog)).toBeNull();
   });
 
   it('resolves an intent experiment for the matching intent (legacy/default type)', async () => {
     mockSend.mockResolvedValueOnce({
       Items: [
-        { experimentId: 'exp-intent', status: 'active', intent: 'general_qa', tiers: ['standard'], variants: variants('sonnet', 'haiku') },
+        { experimentId: 'exp-intent', status: 'active', intent: 'general', tiers: ['standard'], variants: variants('sonnet', 'haiku') },
       ],
     } as unknown as QueryCommandOutput);
     const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
-    const res = await resolveExperimentModel('standard', 'general_qa', 'arn:chan', catalog);
+    const res = await resolveExperimentModel('standard', 'general', 'arn:chan', catalog);
     expect(res?.experimentId).toBe('exp-intent');
     expect(res?.variantId).toBe('control');
     expect(res?.modelKey).toBe('sonnet');
   });
 
   it('resolves an image_generation experiment on the RAW intent and carries the variant image model', async () => {
-    // image_generation is NOT a text RouteKey (it normalizes to general_qa), so the resolver must match
+    // image_generation is NOT a text RouteKey (it normalizes to general), so the resolver must match
     // it on the raw intent string. The assigned variant's imageGenModelKey rides the resolution so the
     // NORMAL flow serves the variant's image model (non-battle image A/B).
     mockSend.mockResolvedValueOnce({
@@ -82,15 +83,47 @@ describe('resolveExperimentModel — type ordering', () => {
     expect(res?.imageGenModelKey).toBe('stability_image_core');
   });
 
+  it('never carries an image model the classification is not allowed, even one a stored variant names', async () => {
+    // A row stored before the experiment write path refused it: an image experiment on standard, which
+    // the catalog allows no image model. The resolution still serves the variant's text model and carries
+    // no image model, so no turn in standard can reach one (`modelFits`).
+    mockSend.mockResolvedValueOnce({
+      Items: [
+        {
+          experimentId: 'exp-img-std', status: 'active', experimentType: 'intent', intent: 'image_generation',
+          tiers: ['standard'],
+          variants: [
+            { variantId: 'control', modelKey: 'sonnet', imageGenModelKey: 'stability_image_core', weight: 100 },
+            { variantId: 'treatment', modelKey: 'sonnet', imageGenModelKey: 'stability_image_ultra', weight: 0 },
+          ],
+        },
+      ],
+    } as unknown as QueryCommandOutput);
+    const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
+    const res = await resolveExperimentModel('standard', 'image_generation', 'arn:chan', catalog);
+    expect(res?.modelKey).toBe('sonnet');
+    expect(res).not.toHaveProperty('imageGenModelKey');
+  });
+
+  it('never returns a text model the classification is not allowed', async () => {
+    mockSend.mockResolvedValueOnce({
+      Items: [
+        { experimentId: 'exp-basic-opus', status: 'active', experimentType: 'base_model', tiers: ['basic'], variants: variants('opus', 'haiku') },
+      ],
+    } as unknown as QueryCommandOutput);
+    const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
+    expect(await resolveExperimentModel('basic', 'general', 'arn:chan', catalog)).toBeNull();
+  });
+
   it('matches an intent experiment when the router passes the RAW classifier intent', async () => {
     // Regression (#9): the router calls resolveExperimentModel with the coarse
     // classifier intent ('general'), but the admin stores experiments with the
-    // fine-grained RouteKey ('general_qa'). Resolution must normalize the former
+    // fine-grained RouteKey ('general'). Resolution must normalize the former
     // to the latter — comparing them raw silently never matched, so no intent
     // experiment ever fired and experiment_results stayed empty.
     mockSend.mockResolvedValueOnce({
       Items: [
-        { experimentId: 'exp-intent', status: 'active', intent: 'general_qa', tiers: ['standard'], variants: variants('sonnet', 'haiku') },
+        { experimentId: 'exp-intent', status: 'active', intent: 'general', tiers: ['standard'], variants: variants('sonnet', 'haiku') },
       ],
     } as unknown as QueryCommandOutput);
     const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
@@ -99,10 +132,10 @@ describe('resolveExperimentModel — type ordering', () => {
     expect(res?.modelKey).toBe('sonnet');
   });
 
-  it('normalizes a mapped classifier intent (data_extraction → document_extraction) before matching', async () => {
+  it('normalizes a mapped classifier intent (data_extraction → data_extraction) before matching', async () => {
     mockSend.mockResolvedValueOnce({
       Items: [
-        { experimentId: 'exp-doc', status: 'active', intent: 'document_extraction', tiers: ['standard'], variants: variants('sonnet', 'haiku') },
+        { experimentId: 'exp-doc', status: 'active', intent: 'data_extraction', tiers: ['standard'], variants: variants('sonnet', 'haiku') },
       ],
     } as unknown as QueryCommandOutput);
     const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
@@ -117,7 +150,7 @@ describe('resolveExperimentModel — type ordering', () => {
       ],
     } as unknown as QueryCommandOutput);
     const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
-    expect(await resolveExperimentModel('standard', 'general_qa', 'arn:chan', catalog)).toBeNull();
+    expect(await resolveExperimentModel('standard', 'general', 'arn:chan', catalog)).toBeNull();
   });
 
   it('resolves a base_model experiment for ANY intent on the tier', async () => {
@@ -127,7 +160,7 @@ describe('resolveExperimentModel — type ordering', () => {
       ],
     } as unknown as QueryCommandOutput);
     const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
-    const res = await resolveExperimentModel('standard', 'general_qa', 'arn:chan', catalog);
+    const res = await resolveExperimentModel('standard', 'general', 'arn:chan', catalog);
     expect(res?.experimentId).toBe('exp-base');
   });
 
@@ -135,11 +168,11 @@ describe('resolveExperimentModel — type ordering', () => {
     mockSend.mockResolvedValueOnce({
       Items: [
         { experimentId: 'exp-base', status: 'active', experimentType: 'base_model', intent: '', tiers: ['standard'], variants: variants('haiku', 'titan') },
-        { experimentId: 'exp-intent', status: 'active', experimentType: 'intent', intent: 'general_qa', tiers: ['standard'], variants: variants('sonnet', 'titan') },
+        { experimentId: 'exp-intent', status: 'active', experimentType: 'intent', intent: 'general', tiers: ['standard'], variants: variants('sonnet', 'titan') },
       ],
     } as unknown as QueryCommandOutput);
     const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
-    const res = await resolveExperimentModel('standard', 'general_qa', 'arn:chan', catalog);
+    const res = await resolveExperimentModel('standard', 'general', 'arn:chan', catalog);
     expect(res?.experimentId).toBe('exp-intent');
   });
 
@@ -150,24 +183,24 @@ describe('resolveExperimentModel — type ordering', () => {
       ],
     } as unknown as QueryCommandOutput);
     const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
-    expect(await resolveExperimentModel('standard', 'general_qa', 'arn:chan', catalog)).toBeNull();
+    expect(await resolveExperimentModel('standard', 'general', 'arn:chan', catalog)).toBeNull();
   });
 
   it('skips a model the tier may not use (tier safety)', async () => {
     // Config-driven: pick a model the 'standard' tier is NOT allowed to use per the actual
-    // catalog (allowedClassifications), rather than hardcoding a model presumed premium-only. A standard
+    // registry (the classification's selection), rather than hardcoding a model presumed premium-only. A standard
     // experiment pinning that model must be skipped.
     const restrictedKey = Object.keys(catalog).find(
-      (k) => !catalog[k as keyof typeof catalog].allowedClassifications.includes('standard'),
+      (k) => !defaultProfileRegistry.selectsModel('standard', k),
     );
-    if (!restrictedKey) throw new Error('tier-safety test needs a model not allowed for the standard tier');
+    if (!restrictedKey) throw new Error('tier-safety test needs a model the standard classification does not select');
     mockSend.mockResolvedValueOnce({
       Items: [
-        { experimentId: 'exp-bad', status: 'active', intent: 'general_qa', tiers: ['standard'], variants: variants(restrictedKey, restrictedKey) },
+        { experimentId: 'exp-bad', status: 'active', intent: 'general', tiers: ['standard'], variants: variants(restrictedKey, restrictedKey) },
       ],
     } as unknown as QueryCommandOutput);
     const { resolveExperimentModel } = await import('../../lambda/src/lib/experiment-manager');
-    expect(await resolveExperimentModel('standard', 'general_qa', 'arn:chan', catalog)).toBeNull();
+    expect(await resolveExperimentModel('standard', 'general', 'arn:chan', catalog)).toBeNull();
   });
 });
 

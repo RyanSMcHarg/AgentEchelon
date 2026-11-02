@@ -1,15 +1,64 @@
 /**
- * The empty Lex envelope, recognised without a ContentType.
+ * The empty Lex envelope, recognized without a ContentType.
  *
  * The channel flow drops these so no client has to know the shape exists. The flow event
  * carries no ContentType, so detection is STRUCTURAL - and the risk that buys is eating real user
- * content. Most of this file is therefore about what must NOT be recognised.
+ * content. Most of this file is therefore about what must NOT be recognized.
  */
 import {
+  chimeStatusArtifactCode,
   isEmptyLexEnvelope,
   unwrapLexEnvelope,
   unwrapLexEnvelopeForChannel,
 } from '../../lambda/src/lib/lex-envelope';
+
+describe('chimeStatusArtifactCode', () => {
+  it('recognises the codes measured on this deployment', () => {
+    // 500: a fulfillment closed with no message (a silent WelcomeIntent).
+    expect(chimeStatusArtifactCode('{"Code":500}')).toBe(500);
+    // 429: the invocation timed out, which is how the VPC-attach breakage presented itself.
+    expect(chimeStatusArtifactCode('{"Code":429}')).toBe(429);
+  });
+
+  it('recognises it percent-encoded and with surrounding whitespace, as the flow sees it', () => {
+    expect(chimeStatusArtifactCode(encodeURIComponent('{"Code":500}'))).toBe(500);
+    expect(chimeStatusArtifactCode('  {"Code":500}\n')).toBe(500);
+  });
+
+  it('returns the code rather than a boolean, so the caller can log WHICH defect it saw', () => {
+    // The whole point of dropping these is that they stay visible in the log. A boolean would make
+    // a timeout and a silent fulfillment indistinguishable in the one record that survives.
+    expect(chimeStatusArtifactCode('{"Code":429}')).not.toBe(chimeStatusArtifactCode('{"Code":500}'));
+  });
+
+  // ── What must NOT be dropped. Each of these would be a user-visible message destroyed. ──
+
+  it('does NOT recognise an empty envelope, which the sibling guard owns', () => {
+    expect(chimeStatusArtifactCode('{"Messages":[]}')).toBeNull();
+  });
+
+  it('does NOT recognise prose that merely mentions a code', () => {
+    expect(chimeStatusArtifactCode('The API returned {"Code":500} - here is what that means.')).toBeNull();
+    expect(chimeStatusArtifactCode('I got a 500 back from the endpoint.')).toBeNull();
+  });
+
+  it('does NOT recognise an object that carries anything besides the code', () => {
+    // The narrowness clause. An object with a second key is somebody's data, not an artifact.
+    expect(chimeStatusArtifactCode('{"Code":500,"Message":"Internal error"}')).toBeNull();
+    expect(chimeStatusArtifactCode('{"Code":200,"body":"result"}')).toBeNull();
+  });
+
+  it('does NOT recognise a non-numeric code, nor an array, nor empty input', () => {
+    expect(chimeStatusArtifactCode('{"Code":"500"}')).toBeNull();
+    expect(chimeStatusArtifactCode('[{"Code":500}]')).toBeNull();
+    expect(chimeStatusArtifactCode('')).toBeNull();
+    expect(chimeStatusArtifactCode(null)).toBeNull();
+  });
+
+  it('does NOT recognise a fenced code block containing one, which is ordinary assistant output', () => {
+    expect(chimeStatusArtifactCode('```json\n{"Code":500}\n```')).toBeNull();
+  });
+});
 
 describe('isEmptyLexEnvelope', () => {
   it('recognises the empty envelope a silent fulfillment produces', () => {
@@ -28,7 +77,7 @@ describe('isEmptyLexEnvelope', () => {
   // ── What must NOT be dropped. Each of these would be a user-visible message destroyed. ──
 
   it('does NOT recognise an envelope that CARRIES a message', () => {
-    // The placeholder path depends on this: Chime materialises the placeholder from a fulfillment
+    // The placeholder path depends on this: Chime materializes the placeholder from a fulfillment
     // response, and dropping that would drop the turn.
     const placeholder = JSON.stringify({
       Messages: [{ Content: 'One moment... <!--corr:abc-->', ContentType: 'PlainText' }],

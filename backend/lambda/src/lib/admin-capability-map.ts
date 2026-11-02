@@ -37,10 +37,33 @@ export type AnalyticsCapabilityKey =
   | 'view-events'
   | 'view-user-activity'
   | 'view-moderation-audit'
+  | 'record-moderation'
+  | 'triage-responses'
+  | 'label-ground-truth'
   | 'view-analytics';
 
-/** The complete raw event log (A3) — its own capability. */
-const VIEW_EVENTS_QUERIES = ['channel_events'];
+/**
+ * Conversation CONTENT — a separable authorization from the aggregate bundle.
+ *
+ * `channel_events` is the complete raw event log (A3).
+ *
+ * `cross_conversation_context` is here because of what it RETURNS, not what it is named: the
+ * conversation's summary and subject labels, for every conversation a named `userSub` has had. It was
+ * never listed, so it fell to the default bundle - whose rule, three paragraphs down, is that its
+ * reads "carry labels and counts, never message content". A query serving conversation content from
+ * the low-sensitivity bundle is the accountability gap `view-messages` is exchange-vended to prevent,
+ * arriving on a different plane.
+ *
+ * IT STAYS HERE AFTER MIGRATION 068, which removed the stored copy of the message: the row now holds
+ * a classification and a message id, and the endpoint joins `conversation_summaries` for the text. A
+ * model-written summary of a conversation is still that conversation's content, so the capability is
+ * unchanged. What changed is that the content is read from the one place it lives rather than from a
+ * duplicate nothing could redact.
+ *
+ * Moving a queryType to a finer capability only tightens access (the deployer note above), so this
+ * cannot break a role that was correctly scoped.
+ */
+const VIEW_EVENTS_QUERIES = ['channel_events', 'cross_conversation_context'];
 
 /** Identity / signup+signin funnels (A13, PII) — denied to AI dev + Manager. */
 const VIEW_USER_ACTIVITY_QUERIES = [
@@ -51,10 +74,33 @@ const VIEW_USER_ACTIVITY_QUERIES = [
   'messages_per_tier_daily',
   'signup_funnel_conversion',
   'signin_funnel_conversion',
+  // The guest-to-customer funnel and the guest refusals (B12): who visited, registered and became a customer.
+  'guest_to_customer_funnel',
+  'guest_refusals',
 ];
 
-/** Who redacted / deleted, and the moderation-attribution write (A5). */
-const VIEW_MODERATION_AUDIT_QUERIES = ['record_moderation', 'moderation_audit'];
+/** Who redacted / deleted (A5). The attribution WRITE is its own capability, `record-moderation`. */
+const VIEW_MODERATION_AUDIT_QUERIES = ['moderation_audit'];
+
+/**
+ * WRITES THAT RIDE A READ QUERY TYPE. A flag, a review verdict, a human label and a classifier
+ * adjudication are each sent as the queryType of the read they belong to, with an `action` naming the
+ * write. Each is its own capability on its own resource, so a role that may read quality data is not
+ * thereby allowed to change it (SPEC-ADMIN-CONSOLE FR46).
+ */
+const WRITE_ACTIONS: Record<string, { actions: string[]; capability: AnalyticsCapabilityKey }> = {
+  flagged_responses: { actions: ['flag', 'unflag', 'review'], capability: 'triage-responses' },
+  ground_truth: { actions: ['submit'], capability: 'label-ground-truth' },
+  // Nominating, retiring and promoting a golden-set entry are the same act as a label: a person deciding
+  // what a good answer is (SPEC-EVALUATION FR16).
+  golden_set: { actions: ['nominate', 'retire', 'promote'], capability: 'label-ground-truth' },
+};
+
+/** Writes that are a queryType of their own. */
+const WRITE_QUERIES: Record<string, AnalyticsCapabilityKey> = {
+  record_moderation: 'record-moderation',
+  classifier_replay_adjudicate: 'label-ground-truth',
+};
 
 /**
  * queryType → capability. Anything NOT listed falls to `view-analytics` (the
@@ -78,8 +124,11 @@ export const ANALYTICS_QUERY_CAPABILITY: Record<string, AnalyticsCapabilityKey> 
 
 export const DEFAULT_ANALYTICS_CAPABILITY: AnalyticsCapabilityKey = 'view-analytics';
 
-/** The capability a `queryType` requires. */
-export function capabilityForQueryType(queryType: string): AnalyticsCapabilityKey {
+/** The capability a `queryType` requires, given the `action` it carries when it is a write. */
+export function capabilityForQueryType(queryType: string, action?: string): AnalyticsCapabilityKey {
+  if (WRITE_QUERIES[queryType]) return WRITE_QUERIES[queryType];
+  const write = WRITE_ACTIONS[queryType];
+  if (write && action && write.actions.includes(action)) return write.capability;
   return ANALYTICS_QUERY_CAPABILITY[queryType] ?? DEFAULT_ANALYTICS_CAPABILITY;
 }
 
@@ -94,6 +143,9 @@ export const ANALYTICS_CAPABILITY_PATH: Record<AnalyticsCapabilityKey, string> =
   'view-events': 'events-log',
   'view-user-activity': 'user-activity',
   'view-moderation-audit': 'moderation-audit',
+  'record-moderation': 'moderation-record',
+  'triage-responses': 'triage',
+  'label-ground-truth': 'ground-truth',
 };
 
 /** All non-root capability paths (the resources the CDK must create). */
@@ -117,9 +169,8 @@ export function capabilityForPath(path: string): AnalyticsCapabilityKey {
 /**
  * A `queryType` may run on a resource ONLY if the resource's capability is the
  * one the queryType requires — so the gateway's per-resource IAM grant is the
- * real control. Enforce this only under IAM enforcement (single-plane Cognito
- * mode keeps the queryType free on the one root resource, gated by the group).
+ * real control. Every analytics route is IAM-authorized, so this always applies.
  */
-export function queryTypeAllowedOnPath(queryType: string, path: string): boolean {
-  return capabilityForQueryType(queryType) === capabilityForPath(path);
+export function queryTypeAllowedOnPath(queryType: string, path: string, action?: string): boolean {
+  return capabilityForQueryType(queryType, action) === capabilityForPath(path);
 }

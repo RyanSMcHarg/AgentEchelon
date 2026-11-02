@@ -2,10 +2,9 @@
  * Unit tests for the conversation-type config registry
  * (lib/config/conversation-types.ts).
  *
- * Conversation type is a configurable policy bundle (drift on/off, default
- * agents, available channels) that CARRIES a security classification rather
- * than being one — the classification axis stays a small total order for the
- * IAM Layer-1 boundary while types proliferate. These tests pin that contract.
+ * Conversation type is a configurable policy bundle (drift on/off, default agents, membership,
+ * retention) that may CONSTRAIN the security classification but is never one: the classification is
+ * an input at creation and the only axis IAM evaluates, while types proliferate. These tests pin that.
  */
 
 import {
@@ -14,45 +13,122 @@ import {
   resolveConversationTypeKey,
   getConversationTypeConfig,
   isDriftEnabledForType,
-  resolveWelcomeConfig,
+  resolveMessageFlowKey,
+  DEFAULT_MESSAGE_FLOW,
+  classificationAllowedForType,
+  membershipSourceFor,
+  membershipSourceStamp,
+  membershipSourceGroups,
+  typesSourcedFromGroup,
   type ConversationTypeConfig,
 } from '../lib/config/conversation-types';
 
 describe('conversation-types registry', () => {
-  it('ships the three classification types, each carrying a matching classification', () => {
-    for (const classification of ['basic', 'standard', 'premium'] as const) {
-      expect(CONVERSATION_TYPES[classification]).toBeDefined();
-      // type ≡ classification today: the shipped types map to the same classification.
-      expect(CONVERSATION_TYPES[classification].classification).toBe(classification);
+  it('ships the ordinary type, the ops types, the guest visitor type and the customer engagement type, none named after a classification', () => {
+    // A type never shares a value with a classification. The full guard, over the
+    // deployment's declared classifications, is conversation-type-keys-are-not-classifications.test.ts.
+    expect(Object.keys(CONVERSATION_TYPES).sort()).toEqual(['customer-engagement', 'general', 'guest-visitor', 'ops', 'ops-team']);
+  });
+
+  it('the ordinary type takes any classification as input, keeps drift on, and has manual membership', () => {
+    const general = CONVERSATION_TYPES.general;
+    expect(general.classifications).toBeUndefined();
+    expect(general.driftEnabled).toBe(true);
+    expect(membershipSourceFor('general')).toBeUndefined();
+    for (const classification of ['basic', 'standard', 'premium']) {
+      expect(classificationAllowedForType('general', classification)).toBe(true);
     }
   });
 
-  it('has drift ON by default for every shipped type (all-classification, on-by-default)', () => {
+  it('ops and the ops team permit premium only, and take their people from the ops group', () => {
+    for (const key of ['ops', 'ops-team']) {
+      expect(classificationAllowedForType(key, 'premium')).toBe(true);
+      expect(classificationAllowedForType(key, 'basic')).toBe(false);
+      expect(membershipSourceFor(key)).toEqual({ group: 'ops' });
+      expect(membershipSourceStamp(key)).toBe('group:ops');
+    }
+  });
+
+  it('knows which groups are sourced at a classification, and which types each one feeds', () => {
+    expect(membershipSourceGroups('premium')).toEqual(['ops']);
+    expect(membershipSourceGroups('basic')).toEqual([]);
+    expect(typesSourcedFromGroup('ops', 'premium').sort()).toEqual(['ops', 'ops-team']);
+    expect(typesSourcedFromGroup('ops', 'basic')).toEqual([]);
+  });
+
+  it('stamps a list source, and a group plus a list, distinctly', () => {
+    CONVERSATION_TYPES['tmp-list'] = { driftEnabled: true, membershipSource: { list: ['a'] } };
+    CONVERSATION_TYPES['tmp-both'] = { driftEnabled: true, membershipSource: { group: 'g', list: ['a'] } };
+    try {
+      expect(membershipSourceStamp('tmp-list')).toBe('list');
+      expect(membershipSourceStamp('tmp-both')).toBe('group:g+list');
+    } finally {
+      delete CONVERSATION_TYPES['tmp-list'];
+      delete CONVERSATION_TYPES['tmp-both'];
+    }
+  });
+
+  it('an unknown type permits no classification', () => {
+    // A policy read degrades to the default type; an authorization check must not.
+    expect(classificationAllowedForType('nothing-registered', 'basic')).toBe(false);
+  });
+
+  it('a type that declares no source, an empty source, or an unknown key is manual', () => {
+    CONVERSATION_TYPES['tmp-no-membership'] = { driftEnabled: true };
+    CONVERSATION_TYPES['tmp-empty'] = { driftEnabled: true, membershipSource: { group: ' ', list: [] } };
+    try {
+      expect(membershipSourceFor('tmp-no-membership')).toBeUndefined();
+      expect(membershipSourceFor('tmp-empty')).toBeUndefined();
+      // A typo must never make a conversation start removing its members.
+      expect(membershipSourceFor('nothing-registered')).toBeUndefined();
+    } finally {
+      delete CONVERSATION_TYPES['tmp-no-membership'];
+      delete CONVERSATION_TYPES['tmp-empty'];
+    }
+  });
+
+  it('names which message flow it associates, and every shipped type names the same one', () => {
+    // The dimension is a SELECTOR, never a switch: there is no value meaning "no flow", because a
+    // conversation nobody can address is broken rather than configured. Every type naming the same flow is
+    // the expected state today - the dimension exists so a deployment can carry two later without a
+    // creator learning about it.
     for (const key of Object.keys(CONVERSATION_TYPES)) {
-      expect(CONVERSATION_TYPES[key].driftEnabled).toBe(true);
+      expect(resolveMessageFlowKey(key)).toBe(DEFAULT_MESSAGE_FLOW);
     }
   });
 
-  it('the default conversation type exists in the registry', () => {
+  it('resolves the project default for a type nobody registered', () => {
+    // An unknown type must not resolve to "no routing". It degrades to the default conversation type,
+    // which names the default flow - so an unregistered key produces an addressable conversation.
+    expect(resolveMessageFlowKey('nothing-registered-under-this-name')).toBe(DEFAULT_MESSAGE_FLOW);
+  });
+
+  it('the default conversation type is the ordinary one, and exists in the registry', () => {
+    expect(DEFAULT_CONVERSATION_TYPE).toBe('general');
     expect(CONVERSATION_TYPES[DEFAULT_CONVERSATION_TYPE]).toBeDefined();
   });
 });
 
 describe('resolveConversationTypeKey', () => {
-  it('prefers an explicit, registered type over the classification', () => {
-    expect(resolveConversationTypeKey({ explicitType: 'premium', classification: 'basic' })).toBe('premium');
+  it('returns a stamped, registered type', () => {
+    expect(resolveConversationTypeKey({ explicitType: 'ops' })).toBe('ops');
   });
 
-  it('falls back to the classification when no explicit type is given (non-breaking: type ≡ classification)', () => {
-    expect(resolveConversationTypeKey({ classification: 'standard' })).toBe('standard');
+  it('returns the ordinary type when nothing is stamped', () => {
+    expect(resolveConversationTypeKey({})).toBe('general');
   });
 
-  it('ignores an explicit type that is not in the registry (typo cannot silently disable policy)', () => {
-    expect(resolveConversationTypeKey({ explicitType: 'engagment', classification: 'premium' })).toBe('premium');
+  it('degrades an unregistered stamp to the ordinary type (a typo cannot silently disable policy)', () => {
+    expect(resolveConversationTypeKey({ explicitType: 'engagment' })).toBe('general');
   });
 
-  it('falls back to the default type when even the classification is unknown', () => {
-    expect(resolveConversationTypeKey({ classification: 'enterprise' })).toBe(DEFAULT_CONVERSATION_TYPE);
+  it('reads a stamp from before the rename (a classification name) as the ordinary type it was', () => {
+    // Conversations stamped basic, standard or premium were all ordinary conversations. None of those
+    // keys is registered, so they resolve to general with no migration - and never to a type chosen by
+    // the classification.
+    for (const legacy of ['basic', 'standard', 'premium']) {
+      expect(resolveConversationTypeKey({ explicitType: legacy })).toBe('general');
+    }
   });
 });
 
@@ -61,102 +137,26 @@ describe('getConversationTypeConfig / isDriftEnabledForType', () => {
     expect(getConversationTypeConfig('nope')).toBe(CONVERSATION_TYPES[DEFAULT_CONVERSATION_TYPE]);
   });
 
-  it('reports drift enabled for the shipped classification types', () => {
-    expect(isDriftEnabledForType('basic')).toBe(true);
-    expect(isDriftEnabledForType('premium')).toBe(true);
+  it('reports drift on for the ordinary type and off for ops', () => {
+    expect(isDriftEnabledForType('general')).toBe(true);
+    expect(isDriftEnabledForType('ops')).toBe(false);
   });
 
   it('honours a driftEnabled:false override (drift is a per-type property, not per-classification)', () => {
-    const original = CONVERSATION_TYPES['basic'].driftEnabled;
+    const original = CONVERSATION_TYPES.general.driftEnabled;
     try {
-      CONVERSATION_TYPES['basic'].driftEnabled = false;
-      expect(isDriftEnabledForType('basic')).toBe(false);
-      // The classification axis is independent of the drift toggle.
-      expect(getConversationTypeConfig('basic').classification).toBe('basic');
+      CONVERSATION_TYPES.general.driftEnabled = false;
+      expect(isDriftEnabledForType('general')).toBe(false);
     } finally {
-      CONVERSATION_TYPES['basic'].driftEnabled = original;
+      CONVERSATION_TYPES.general.driftEnabled = original;
     }
   });
 });
 
-describe('resolveWelcomeConfig', () => {
-  /** Register a temporary type so a test never mutates a shipped one. */
-  function withType(key: string, config: ConversationTypeConfig, run: () => void): void {
-    CONVERSATION_TYPES[key] = config;
-    try {
-      run();
-    } finally {
-      delete CONVERSATION_TYPES[key];
+describe('a welcome is the assistant\'s, never the conversation type\'s (ADR-061)', () => {
+  it('no conversation type declares a welcome: the designed and uncalled WelcomeConfig is retired', () => {
+    for (const [key, config] of Object.entries(CONVERSATION_TYPES)) {
+      expect({ key, welcome: (config as unknown as Record<string, unknown>).welcome }).toEqual({ key, welcome: undefined });
     }
-  }
-
-  it('defaults every shipped type to the interpolated built-in assembly', () => {
-    // THE LOAD-BEARING TEST FOR THIS FIELD. Adding `welcome` must not change a single existing
-    // deployment's welcome, and "no welcome config" is the state every shipped type is in. If this
-    // regresses, every conversation on every deployment silently changes its opening copy - or starts
-    // spending a Bedrock call it never used to.
-    for (const key of Object.keys(CONVERSATION_TYPES)) {
-      expect(resolveWelcomeConfig(key)).toEqual({
-        mode: 'interpolated',
-        template: undefined,
-        contextKeys: [],
-      });
-    }
-  });
-
-  it('defaults an unknown type the same way, rather than throwing', () => {
-    expect(resolveWelcomeConfig('no-such-type').mode).toBe('interpolated');
-  });
-
-  it('honours a generated mode with a template and context keys', () => {
-    withType('incident', {
-      classification: 'standard',
-      driftEnabled: false,
-      welcome: {
-        mode: 'generated',
-        template: 'Open with the incident state, then who is here.',
-        contextKeys: ['x-incident', 'user-profile'],
-      },
-    }, () => {
-      expect(resolveWelcomeConfig('incident')).toEqual({
-        mode: 'generated',
-        template: 'Open with the incident state, then who is here.',
-        contextKeys: ['x-incident', 'user-profile'],
-      });
-    });
-  });
-
-  it('degrades an unrecognised mode to interpolated rather than to generated', () => {
-    // Failing towards the deterministic path costs richness. Failing towards `generated` would spend a
-    // Bedrock call on every new conversation because of a typo in a config file.
-    withType('typo', {
-      classification: 'basic',
-      driftEnabled: false,
-      welcome: { mode: 'genrated' as unknown as 'generated' },
-    }, () => {
-      expect(resolveWelcomeConfig('typo').mode).toBe('interpolated');
-    });
-  });
-
-  it('treats a blank template as absent, so it falls back to the built-in assembly', () => {
-    // A blank template must not render a blank welcome. "Welcome always lands" outranks honouring
-    // whitespace an operator left in a config file.
-    withType('blank', {
-      classification: 'basic',
-      driftEnabled: false,
-      welcome: { template: '   ' },
-    }, () => {
-      expect(resolveWelcomeConfig('blank').template).toBeUndefined();
-    });
-  });
-
-  it('drops blank context keys instead of asking the catalog for an empty key', () => {
-    withType('sloppy', {
-      classification: 'basic',
-      driftEnabled: false,
-      welcome: { contextKeys: ['  user-profile  ', '', '   '] },
-    }, () => {
-      expect(resolveWelcomeConfig('sloppy').contextKeys).toEqual(['user-profile']);
-    });
   });
 });

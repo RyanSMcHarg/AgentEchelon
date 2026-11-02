@@ -1,7 +1,21 @@
 /**
- * Relevance Evaluation Prompt Template
+ * Relevance Evaluation Prompt Template.
  *
- * Used by the evaluation runner to score agent responses.
+ * ── THIS IS NOT THE RUBRIC THAT SCORES ANYTHING. ─────────────────────────────────────────────────
+ *
+ * Nothing imports this file. The live rubric is `RELEVANCE_PROMPT` inside
+ * `analytics-aurora/evaluation-runner.ts`, and that is the one whose text `RELEVANCE_RUBRIC_VERSION`
+ * hashes, so it is the one an edit has to land in.
+ *
+ * Kept only because the header comment on `getIntentEffectiveness` cited it as the definition of the
+ * six classifications, and a reader following that citation has to arrive somewhere that tells them
+ * the truth rather than at a plausible second copy they might edit instead. That citation now names
+ * the live file; this note is the backstop for anyone who reaches here by search.
+ *
+ * It has already drifted. The live rubric scores an out-of-remit decline as an Appropriate Refusal;
+ * the "Adversarial Input Detection" section below still reaches that band only for a jailbreak,
+ * which is the defect that made correct refusals count as poor.
+ *
  * Dimensions: Direct Relevance (0-40), Context Awareness (0-20),
  * Completeness (0-20), Focus (0-20)
  */
@@ -11,7 +25,7 @@ export const RELEVANCE_PROMPT = `You are an expert evaluator assessing whether a
 ## Context
 
 Agent Type: {{agentType}}
-User Type: {{userType}}
+Conversation Classification: {{conversationClassification}}
 {{#if conversationHistory}}
 Conversation History:
 {{conversationHistory}}
@@ -78,14 +92,14 @@ Respond with JSON only:
  */
 export function buildEvaluationPrompt(params: {
   agentType: string;
-  userType: string;
+  conversationClassification: string;
   userMessage: string;
   agentResponse: string;
   conversationHistory?: string;
 }): string {
   let prompt = RELEVANCE_PROMPT
     .replace('{{agentType}}', params.agentType)
-    .replace('{{userType}}', params.userType)
+    .replace('{{conversationClassification}}', params.conversationClassification)
     .replace('{{userMessage}}', params.userMessage)
     .replace('{{agentResponse}}', params.agentResponse);
 

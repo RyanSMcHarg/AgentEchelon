@@ -18,7 +18,7 @@ import { getModelCatalog } from '../../lib/config/model-strategy';
 const catalog = getModelCatalog('us-east-1', '123456789012');
 
 function baseCtx(over: Partial<AnalyticsContext> = {}): AnalyticsContext {
-  return { messageNumber: 1, userType: 'premium', role: 'assistant', ...over };
+  return { messageNumber: 1, classification: 'premium', role: 'assistant', ...over };
 }
 
 describe('buildAnalyticsMetadata — assignmentMode rollup-safety invariant', () => {
@@ -73,8 +73,8 @@ describe('buildAnalyticsMetadata — assignmentMode rollup-safety invariant', ()
   });
 
   it('stamps portable-profile attribution (assistant + profile version) when provided', () => {
-    const md = buildAnalyticsMetadata(baseCtx({ profileAttribution: { profileName: 'premium', profileConfigId: 'abc123def456', profileVersion: 4 } }));
-    expect(md.profileName).toBe('premium');
+    const md = buildAnalyticsMetadata(baseCtx({ profileAttribution: { profileName: 'advisor', profileConfigId: 'abc123def456', profileVersion: 4 } }));
+    expect(md.profileName).toBe('advisor');
     expect(md.profileConfigId).toBe('abc123def456'); // the VERSION fingerprint, distinct from configId
     expect(md.profileVersion).toBe(4);
   });
@@ -152,5 +152,41 @@ describe('makeConverseStep — estCostUsd wired from MODEL_RATE_TABLE', () => {
     });
     expect(step.estCostUsd).toBeNull();
     expect(step.imageCount).toBe(2);
+  });
+});
+
+/**
+ * ── A DUEL MUST BE RECONSTRUCTABLE FROM THE EVENT ITSELF ──────────────────────────────────────
+ *
+ * Observed 2026-09-21 on `conv-1789948530750-b1475e52217c`: both rounds ran and the rebuttal is
+ * plainly in the log ("Both answers land on the same correct pick"), and NOTHING in the event said
+ * which round it was. The round existed only in a `<!--battleround:N-->` content marker, which is
+ * stripped before the events log returns it, so the admin raw log could not tell a rebuttal from a
+ * round-1 reply. Aurora had the column because archival reads the raw record before stripping; the
+ * log read what was left.
+ */
+describe('buildAnalyticsMetadata — a duel names itself', () => {
+  const battleContext: AnalyticsBattleContext = {
+    battleId: 'b1b2c3d4', round: 2, selfBotArn: 'arn:self', rivalBotArn: 'arn:rival',
+  };
+
+  it('stamps battleId and battleRound as flat fields', () => {
+    const md = buildAnalyticsMetadata(baseCtx({ battleContext }));
+    expect(md.battleId).toBe('b1b2c3d4');
+    expect(md.battleRound).toBe(2);
+  });
+
+  it('derives them from the context, so the two cannot disagree', () => {
+    const md = buildAnalyticsMetadata(baseCtx({ battleContext }));
+    expect(md.battleId).toBe(md.battleContext!.battleId);
+    expect(md.battleRound).toBe(md.battleContext!.round);
+  });
+
+  it('sets neither on an ordinary turn', () => {
+    // A non-duel turn must not carry a duel's fields, or every turn looks like round `undefined`
+    // of some battle and the grid gains a bucket that means nothing.
+    const md = buildAnalyticsMetadata(baseCtx({}));
+    expect(md.battleId).toBeUndefined();
+    expect(md.battleRound).toBeUndefined();
   });
 });

@@ -22,6 +22,7 @@
  */
 import { PutObjectCommand, GetObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
+import { sessionClient } from './assistant-session.js';
 
 /** Minimal structural surface of `S3Client.send` the uploader needs. */
 export interface S3PutClient {
@@ -119,7 +120,7 @@ export function buildImageGenAttachment(input: {
 let _s3: S3Client | undefined;
 function defaultPresign(bucket: string, key: string, expiresIn: number): Promise<string> {
   if (!_s3) {
-    _s3 = new S3Client({ region: process.env.AWS_REGION || 'us-east-1' });
+    _s3 = sessionClient(S3Client, { region: process.env.AWS_REGION || 'us-east-1' });
   }
   return getSignedUrl(_s3, new GetObjectCommand({ Bucket: bucket, Key: key }), { expiresIn });
 }

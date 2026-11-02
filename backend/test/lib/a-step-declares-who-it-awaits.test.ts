@@ -50,12 +50,12 @@ const ownerWrites = () =>
   cmds()
     .filter((c) => c.__type === 'Update')
     .map((c) => String(c.input.UpdateExpression ?? ''))
-    .filter((e) => e.includes('ownerId'));
+    .filter((e) => e.includes('assigneeId'));
 
 /**
  * The same three-state workflow, said twice. `waiting` is the step blocked on the person; `working` is
  * the assistant getting on with it. Nothing else differs between the two machines, so any difference in
- * behaviour is the reading of the declaration and nothing else.
+ * behavior is the reading of the declaration and nothing else.
  */
 const machineDeclaring = (waitingStateDef: TaskStateDef): Record<string, TaskStateMachine> => ({
   parity_flow: {
@@ -94,8 +94,8 @@ function taskIn(taskState: string, over: Partial<Task> = {}): Task {
     taskState,
     status: 'in_progress' as const,
     userArn: `arn:aws:chime:us-east-1:111:app-instance/i/user/${REQUESTER}`,
-    ownerId: BOT_ID,
-    ownerType: 'assistant' as const,
+    assigneeId: BOT_ID,
+    assigneeType: 'assistant' as const,
     createdAt: '2026-08-18T00:00:00.000Z',
     updatedAt: '2026-08-18T00:00:00.000Z',
     deliveryOption: DeliveryOption.TASK_MULTI_STEP,
@@ -143,14 +143,33 @@ describe('the two accepted declarations normalize to one reference', () => {
 });
 
 describe('every shipped machine says who it awaits, in the declared form', () => {
+  /**
+   * THE ONE MACHINE THAT MUST NEVER WAIT (maintainer, 2026-09-03).
+   *
+   * A drain is not somebody's workflow, it is the assistant reading a queue - and a drain that waits
+   * is a QUEUE that lives until somebody answers, while every message still in it is somebody else's
+   * wait too. It asks, records the work, and clears on the assistant's own timescale.
+   *
+   * The question is not dropped by not being held: each queued message that became work opens a
+   * `queued_request` in `proposed`, which does await the requester, so the follow-up is owned and in
+   * their list. Named here rather than skipped, so the exception is asserted in both directions.
+   */
+  // `incident_first_look` is opened by an event, which has no requester, so no step of it waits on one (ADR-061
+  // decision 8, `EVENT_TASK_MACHINES`); it rests as the room's work.
+  const NEVER_WAITS = ['queue_drain', 'incident_first_look'];
+
+  const WORKER_MACHINES = ['approval', 'acknowledgement'];
   it('resolves a party for every waiting state in every shipped machine', () => {
     for (const [name, machine] of Object.entries(DEFAULT_TASK_STATE_MACHINES)) {
       const waiting = Object.entries(machine.states).filter(([, def]) => awaitedPartyOf(def));
-      // These are the examples a deployment copies, so each has to have a wait to copy.
-      expect({ machine: name, waiting: waiting.length > 0 }).toEqual({ machine: name, waiting: true });
+      // These are the examples a deployment copies, so each has to have a wait to copy - except the
+      // one whose whole point is that it has none.
+      const shouldWait = !NEVER_WAITS.includes(name);
+      expect({ machine: name, waiting: waiting.length > 0 }).toEqual({ machine: name, waiting: shouldWait });
       for (const [state, def] of waiting) {
         expect({ machine: name, state, party: awaitedPartyOf(def) })
-          .toEqual({ machine: name, state, party: { party: 'requester' } });
+          // The reference machines a workflow's task step opens await the worker it names (ADR-063); every other awaits the requester.
+          .toEqual({ machine: name, state, party: { party: WORKER_MACHINES.includes(name) ? 'worker' : 'requester' } });
       }
     }
   });
@@ -180,8 +199,8 @@ describe('a task is created with the same first owner from either form', () => {
       machines,
       owner: { id: BOT_ID, type: 'assistant' },
     });
-    expect({ ownerId: task.ownerId, ownerType: task.ownerType })
-      .toEqual({ ownerId: REQUESTER, ownerType: 'user' });
+    expect({ assigneeId: task.assigneeId, assigneeType: task.assigneeType })
+      .toEqual({ assigneeId: REQUESTER, assigneeType: 'user' });
   });
 
   it('honours the caller\'s owner when the first step awaits nobody', async () => {
@@ -191,8 +210,8 @@ describe('a task is created with the same first owner from either form', () => {
       machines: AWAITS_NOBODY,
       owner: { id: BOT_ID, type: 'assistant' },
     });
-    expect({ ownerId: task.ownerId, ownerType: task.ownerType })
-      .toEqual({ ownerId: BOT_ID, ownerType: 'assistant' });
+    expect({ assigneeId: task.assigneeId, assigneeType: task.assigneeType })
+      .toEqual({ assigneeId: BOT_ID, assigneeType: 'assistant' });
   });
 });
 
@@ -230,7 +249,7 @@ describe('the ownership boundary falls in the same place for either form', () =>
 
   it.each(FORMS)('hands it back to the assistant on leaving the wait, declared in %s', async (_label, machines) => {
     const { advanceTaskStateTo } = await import('../../lambda/src/lib/task-tracking');
-    const task = taskIn('waiting', { ownerId: REQUESTER, ownerType: 'user' });
+    const task = taskIn('waiting', { assigneeId: REQUESTER, assigneeType: 'user' });
     mockSend.mockImplementation((cmd: Cmd) =>
       cmd.__type === 'Get' ? Promise.resolve({ Item: task }) : Promise.resolve({}),
     );
@@ -262,7 +281,7 @@ describe('the ownership boundary falls in the same place for either form', () =>
 describe('a reply is read as the answer to the step under either form', () => {
   it.each(FORMS)('hands the work back and moves no state, declared in %s', async (_label, machines) => {
     const { applyUserResponseToTask } = await import('../../lambda/src/lib/task-tracking');
-    const task = taskIn('waiting', { ownerId: REQUESTER, ownerType: 'user' });
+    const task = taskIn('waiting', { assigneeId: REQUESTER, assigneeType: 'user' });
     mockSend.mockImplementation((cmd: Cmd) =>
       cmd.__type === 'Get' ? Promise.resolve({ Item: task }) : Promise.resolve({}),
     );
@@ -277,7 +296,7 @@ describe('a reply is read as the answer to the step under either form', () => {
 
   it('treats the message as ordinary conversation when the step awaits nobody', async () => {
     const { applyUserResponseToTask } = await import('../../lambda/src/lib/task-tracking');
-    const task = taskIn('waiting', { ownerId: REQUESTER, ownerType: 'user' });
+    const task = taskIn('waiting', { assigneeId: REQUESTER, assigneeType: 'user' });
     mockSend.mockImplementation((cmd: Cmd) =>
       cmd.__type === 'Get' ? Promise.resolve({ Item: task }) : Promise.resolve({}),
     );
@@ -329,7 +348,7 @@ describe('a deployment pack carries the wait through in either form', () => {
   });
 
   it('refuses a pack machine that awaits a party nothing resolves', async () => {
-    // Falling back to the defaults is the declared behaviour for a malformed machines block: better a
+    // Falling back to the defaults is the declared behavior for a malformed machines block: better a
     // deployment runs the reference workflows than one whose steps can never find an owner.
     process.env.ASSISTANT_INTENT_PACK = packWith({ awaits: { party: 'whoever-is-around' } });
     const { taskStateMachines, _resetIntentPackCache } = await import('../../lambda/src/lib/intent-pack');

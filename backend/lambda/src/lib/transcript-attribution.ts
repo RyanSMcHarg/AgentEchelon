@@ -125,7 +125,7 @@ export function hasAttributionPrefix(content: string): boolean {
 /**
  * Render one contribution for inclusion in a (possibly merged) turn.
  *
- * `attribute` false ⇒ the sanitised content alone, which is what keeps a 1:1 unchanged. Sanitisation
+ * `attribute` false ⇒ the sanitized content alone, which is what keeps a 1:1 unchanged. Sanitisation
  * happens either way: a forged label must not survive just because this turn had nothing to
  * disambiguate.
  */
@@ -155,7 +155,7 @@ export function needsAttribution(entries: Array<{ speaker?: Speaker; isSelf?: bo
 /**
  * The stable principal id inside an Amazon Chime SDK ARN.
  *
- * WHY NORMALISE AT ALL, when both sides look like the same ARN. The two construction sites read the
+ * WHY NORMALIZE AT ALL, when both sides look like the same ARN. The two construction sites read the
  * sender from different places - history from `ChannelMessage.Sender.Arn`, the current turn from the
  * event the router forwarded - and `needsAttribution` decides on IDENTITY EQUALITY. If those two ever
  * disagree by so much as a prefix, one person becomes two speakers, and a 1:1 conversation starts

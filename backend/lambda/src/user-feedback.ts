@@ -3,36 +3,48 @@ import { DynamoDBDocumentClient, PutCommand, ScanCommand } from '@aws-sdk/lib-dy
 import { ChimeSDKMessagingClient, DescribeChannelMembershipCommand } from '@aws-sdk/client-chime-sdk-messaging';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
 import { randomUUID } from 'crypto';
-import { parseJsonBody, callerIsAdmin } from './lib/auth.js';
+import { parseJsonBody, callerIsAdmin, callerPersonId, isAdminConsoleSession, signedAsPerson, isServiceAdminCall } from './lib/auth.js';
+import { userArnFor } from './lib/person-arn.js';
+import { responder, originsFrom, DEV_ORIGIN } from './lib/http-response.js';
+import { chimeMessagingClient } from './lib/chime/clients.js';
+import { loadProfileRegistry } from '../../lib/profile-registry';
 
 const APP_INSTANCE_ARN_FB = process.env.APP_INSTANCE_ARN || '';
-const messagingClientFb = new ChimeSDKMessagingClient({});
+const messagingClientFb = chimeMessagingClient({});
 
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}));
 
-const FEEDBACK_TABLE = process.env.FEEDBACK_TABLE || '';
-const ALLOWED_ORIGINS = (process.env.ALLOWED_ORIGIN || 'http://localhost:5173').split(',');
+/**
+ * Why a person said a response needed work. CLOSED, and validated here rather than trusted from the
+ * client, because the whole value of the field is that it groups: these are the three axes
+ * effectiveness is judged on (routing, answer quality, having to re-ask), so an unrecognized value
+ * is dropped to null instead of being stored and quietly splitting a rollup.
+ *
+ * Mirrors `FeedbackReason` in `frontend/packages/shared/src/services/feedbackService.ts`.
+ */
+const FEEDBACK_REASONS = ['wrong_assistant', 'poor_answer', 'asked_again'] as const;
+type FeedbackReason = (typeof FEEDBACK_REASONS)[number];
 
-function corsHeaders(origin?: string) {
-  const allowed = origin && ALLOWED_ORIGINS.includes(origin) ? origin : ALLOWED_ORIGINS[0];
-  return {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': allowed,
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-    'Access-Control-Allow-Methods': 'GET,POST,OPTIONS',
-    'Vary': 'Origin',
-  };
+function normalizeReason(raw: unknown): FeedbackReason | null {
+  return typeof raw === 'string' && (FEEDBACK_REASONS as readonly string[]).includes(raw)
+    ? (raw as FeedbackReason)
+    : null;
 }
+
+const FEEDBACK_TABLE = process.env.FEEDBACK_TABLE || '';
+const ALLOWED_ORIGINS = originsFrom(process.env.ALLOWED_ORIGIN, DEV_ORIGIN);
+
+const http = responder({ origin: { allow: ALLOWED_ORIGINS }, methods: 'GET,POST,OPTIONS' });
 
 function isAllowedOrigin(origin?: string): boolean {
   return !origin || ALLOWED_ORIGINS.includes(origin);
 }
 
-function respond(statusCode: number, body: unknown, origin?: string): APIGatewayProxyResult {
-  return { statusCode, headers: corsHeaders(origin), body: JSON.stringify(body) };
-}
+const respond = http.respond;
 
 export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   const origin = event.headers?.origin || event.headers?.Origin;
   if (event.httpMethod === 'OPTIONS') {
     return respond(200, {}, origin);
@@ -46,10 +58,17 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return submitFeedback(event, origin);
     }
     if (event.httpMethod === 'GET') {
-      // Admin summary. Gate via the mode-aware check (Cognito `admins` group /
-      // ADMIN_GROUP_NAMES / federated host pool / IAM service caller), not a
-      // hardcoded group on raw claims.
-      if (!callerIsAdmin(event)) {
+      // Admin summary: an AWS_IAM catalog route (`view-analytics`), so the gateway has already
+      // refused a principal that does not hold it. `callerIsAdmin` trusts that signed principal
+      // because the stack sets ADMIN_IAM_ENFORCEMENT on this function. The handler then refuses on its
+      // own as well (tenet D3): the summary counts every assistant together and has no team route, so
+      // only an ADMIN console session is admitted, or, under `adminAuthMode=service`, the deployer's
+      // trusted proxy (a signed principal that names no person). A team console session, an
+      // Identity-Pool principal and any other signed principal get 403 here even if a gateway grant
+      // admits them.
+      const adminSession = isAdminConsoleSession(event)
+        || (isServiceAdminCall(event) && !signedAsPerson(event));
+      if (!callerIsAdmin(event) || !adminSession) {
         return respond(403, { error: 'Admin access required' }, origin);
       }
       return summarizeFeedback(event, origin);
@@ -65,8 +84,7 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 };
 
 async function submitFeedback(event: APIGatewayProxyEvent, origin?: string): Promise<APIGatewayProxyResult> {
-  const claims = event.requestContext.authorizer?.claims || {};
-  const userSub = claims.sub;
+  const userSub = await callerPersonId(event);
   if (!userSub) {
     return respond(400, { error: 'Unable to determine user' }, origin);
   }
@@ -78,6 +96,7 @@ async function submitFeedback(event: APIGatewayProxyEvent, origin?: string): Pro
     feedback?: string;
     modelId?: string;
     intent?: string;
+    reason?: string;
     note?: string;
     // Feedback join: the experiment + variant this message was served by (from
     // the bot message's analytics metadata),
@@ -104,7 +123,7 @@ async function submitFeedback(event: APIGatewayProxyEvent, origin?: string): Pro
   // call DescribeChannelMembership for their own membership without
   // needing admin/moderator privilege.
   if (APP_INSTANCE_ARN_FB) {
-    const callerUserArn = `${APP_INSTANCE_ARN_FB}/user/${userSub}`;
+    const callerUserArn = userArnFor(APP_INSTANCE_ARN_FB, userSub);
     try {
       await messagingClientFb.send(new DescribeChannelMembershipCommand({
         ChannelArn: body.channelArn,
@@ -134,6 +153,9 @@ async function submitFeedback(event: APIGatewayProxyEvent, origin?: string): Pro
     channelArn: body.channelArn,
     messageId: body.messageId,
     feedback: body.feedback, // 'up' | 'down' | 'clear'
+    // Only a 'down' can carry a reason: there is nothing to attribute about approval, and a reason
+    // riding an 'up' or a 'clear' would be a leftover from the picker the previous vote opened.
+    reason: body.feedback === 'down' ? normalizeReason(body.reason) : null,
     modelId: body.modelId || null,
     intent: body.intent || null,
     note: body.note || null,
@@ -153,19 +175,36 @@ async function submitFeedback(event: APIGatewayProxyEvent, origin?: string): Pro
 }
 
 async function summarizeFeedback(event: APIGatewayProxyEvent, origin?: string): Promise<APIGatewayProxyResult> {
-  const days = Math.min(Number(event.queryStringParameters?.days || '30'), 180);
+  // A window the caller cannot have meant is refused rather than read as some other window: a
+  // non-numeric `days` would otherwise become NaN and silently count nothing.
+  const rawDays = event.queryStringParameters?.days ?? '30';
+  const days = Number(rawDays);
+  if (!Number.isInteger(days) || days < 1 || days > 180) {
+    return respond(400, { error: 'days must be a whole number from 1 to 180' }, origin);
+  }
   const since = Date.now() - (days * 24 * 60 * 60 * 1000);
 
-  const result = await ddb.send(new ScanCommand({
-    TableName: FEEDBACK_TABLE,
-    ProjectionExpression: 'userSub, messageId, modelId, intent, feedback, createdAt',
-  }));
+  // EVERY PAGE. One Scan returns at most 1 MB, so a single call undercounts as soon as the table
+  // outgrows it, and the summary would still look complete.
+  // LIMIT: every call reads the whole table inside the function's 15 s timeout, so a very large
+  // table times out with a 502 rather than returning an undercount.
+  const items: Record<string, unknown>[] = [];
+  let exclusiveStartKey: Record<string, unknown> | undefined;
+  do {
+    const page = await ddb.send(new ScanCommand({
+      TableName: FEEDBACK_TABLE,
+      ProjectionExpression: 'userSub, messageId, modelId, intent, feedback, createdAt',
+      ...(exclusiveStartKey ? { ExclusiveStartKey: exclusiveStartKey } : {}),
+    }));
+    items.push(...(page.Items || []));
+    exclusiveStartKey = page.LastEvaluatedKey;
+  } while (exclusiveStartKey);
 
   // Count only the LATEST vote per (user, message): the store appends every vote
   // (change/clear included) for the audit trail, but a message reflects a user's
   // CURRENT sentiment — superseded up/down votes and 'clear' must not be counted.
   const latest = new Map<string, { ts: number; feedback: string; modelId: string; intent: string }>();
-  for (const item of result.Items || []) {
+  for (const item of items) {
     const ts = Date.parse(String(item.createdAt || ''));
     if (!Number.isFinite(ts)) continue;
     const key = `${String(item.userSub || '')}#${String(item.messageId || '')}`;

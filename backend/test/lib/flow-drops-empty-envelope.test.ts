@@ -1,7 +1,7 @@
 /**
  * THE EMPTY LEX ENVELOPE IS DROPPED AT THE FLOW, so no client has to know it exists.
  *
- * Chime materialises a channel message from a bot's Lex fulfillment even when that fulfillment
+ * Chime materializes a channel message from a bot's Lex fulfillment even when that fulfillment
  * returned `messages: []`, and the flow IS invoked for it - verified live 2026-08-06 with the
  * MessageId. So the flow can see the non-message and deny it, which is the one exclusive power it has.
  *
@@ -40,7 +40,7 @@ jest.mock('../../lambda/src/lib/intent-classifier.js', () => ({
 
 // The placeholder claim is a real DynamoDB write. Mocked so a message CARRYING a `corr` marker can be
 // driven through the branch at all - the un-mocked call would fail on credentials and hide the
-// behaviour under test. Returns "you own it", the non-duplicate case.
+// behavior under test. Returns "you own it", the non-duplicate case.
 const mockClaimPlaceholderMapping = jest.fn();
 jest.mock('../../lambda/src/lib/abuse-controls.js', () => ({
   claimPlaceholderMapping: (corr: string, messageId: string) =>
@@ -94,7 +94,7 @@ beforeEach(async () => {
   jest.clearAllMocks();
   process.env.ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:standard';
   process.env.BASIC_ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:basic';
-  mockSsmSend.mockResolvedValue({ Parameter: { Value: BOT } });
+  mockSsmSend.mockResolvedValue({ Parameter: { Value: JSON.stringify({ role: 'primary', occupancy: 'live', assistant: 'advisor', botArn: BOT }) } });
   mockLambdaSend.mockResolvedValue({});
   // "you own the correlation" - the ordinary, non-duplicate case.
   mockClaimPlaceholderMapping.mockImplementation((_corr: string, messageId: string) => messageId);
@@ -159,7 +159,7 @@ describe('a CARRYING envelope is stored as its text, not the wrapper', () => {
 
   it('STILL TAKES THE DUPLICATE-PLACEHOLDER CLAIM on a wrapped placeholder', async () => {
     // The regression this pins is one this change introduced and then fixed: unwrapping and returning
-    // straight to the callback skipped the claim below - and the Lex-materialised placeholder is
+    // straight to the callback skipped the claim below - and the Lex-materialized placeholder is
     // itself a carrying envelope, so ADR-022's one-placeholder-per-turn enforcement would have been
     // disabled for exactly the message it protects. The marker must survive into the stored content
     // AND the claim must still run.

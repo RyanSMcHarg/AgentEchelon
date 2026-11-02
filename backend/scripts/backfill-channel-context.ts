@@ -24,7 +24,7 @@
  *     neither any of the six nor an `updatedAt` stamp.
  *   - NOT RECOVERED, and unrecoverable: a channel whose Metadata has since been re-stamped without the
  *     legacy fields. The post-move create/edit path rewrites Metadata AND writes the store in the same
- *     call, so those channels have already healed themselves. `federated-add-member` also rewrites
+ *     call, so those channels have already healed themselves. A host's add-member also rewrites
  *     Metadata on its conflict path but only writes the store fields its own event carried, so a legacy
  *     channel whose only post-deploy touch was an add-member call carrying no grounding has lost the
  *     Metadata copy for good. That window closes for the whole population the moment this runs, which is
@@ -66,6 +66,7 @@ import {
   planLegacyPromotion,
   type PromotionSkipReason,
 } from '../lambda/src/lib/legacy-channel-context.js';
+import { appInstanceArnOf } from '../lambda/src/lib/person-arn.js';
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
 const DRY_RUN = process.argv.includes('--dry-run');
@@ -73,11 +74,13 @@ const ONLY_CHANNEL = (process.argv.find((a) => a.startsWith('--channel=')) || ''
 const INCLUDE_STORE_OWNED = process.argv.includes('--include-store-owned');
 
 /**
- * SSM root for this instance. Mirrors `SSM_ROOT` in `lib/stacks/agent-classification-common.ts` rather
+ * SSM root for this instance, from the instance resolver every operator script uses
+ * (scripts/lib/stack-lookup.cjs). It mirrors `SSM_ROOT` in `lib/stacks/agent-classification-common.ts` rather
  * than importing it: that module is evaluated inside the CDK app and pulls the whole CDK library in with
  * it, which an operator script has no reason to load.
  */
-const SSM_ROOT = `/${(process.env.AE_INSTANCE_NAME || 'agent-echelon').trim()}`;
+const { resolveInstanceName } = require('./lib/stack-lookup.cjs') as { resolveInstanceName: (env?: NodeJS.ProcessEnv) => string };
+const SSM_ROOT = `/${resolveInstanceName(process.env)}`;
 
 const messaging = new ChimeSDKMessagingClient({ region: REGION });
 const ssm = new SSMClient({ region: REGION });
@@ -158,7 +161,8 @@ async function main(): Promise<void> {
   if (!bearer) throw new Error(`app-instance admin ARN not found in SSM (${SSM_ROOT}/app-instance-admin-arn)`);
   const table = await getParam(`${SSM_ROOT}/shared/tables/channel-context-name`);
   if (!table) throw new Error(`channel-context table name not found in SSM (${SSM_ROOT}/shared/tables/channel-context-name)`);
-  const appInstanceArn = bearer.split('/user/')[0];
+  const appInstanceArn = appInstanceArnOf(bearer);
+  if (!appInstanceArn) throw new Error(`app-instance admin ARN names no app instance: ${bearer}`);
 
   console.log('App instance:', appInstanceArn);
   console.log('Context table:', table);

@@ -29,10 +29,16 @@ export interface FrontendStackProps extends cdk.StackProps {
    * when both are merged (gen-frontend-env keys outputs by name).
    */
   outputPrefix?: string;
+  /**
+   * Documents that read a credential from their URL fragment, each served on its own path, never framed and
+   * with no referrer (`FrontendDistribution.tokenDocuments`). The chat app passes the invitation landing page
+   * (`invite.html`), which every invitation's link opens (`invitationLandingFor`).
+   */
+  tokenDocuments?: Array<{ path: string; contentSecurityPolicy: string }>;
 }
 
 /**
- * AgentEchelonFrontend — hosts the AgentEchelon SPA on CloudFront + private S3.
+ * AgentEchelonChatApp — hosts the AgentEchelon SPA on CloudFront + private S3.
  *
  * This is the DEFAULT production frontend path (`cdk deploy --all` includes
  * it). It provisions an empty origin bucket + distribution only; the build is
@@ -61,6 +67,7 @@ export class FrontendStack extends cdk.Stack {
       wafRateLimit: props.wafRateLimit,
       wafAllowedIps: props.wafAllowedIps,
       rootDocument: props.rootDocument,
+      tokenDocuments: props.tokenDocuments,
     });
 
     this.distributionBucketName = frontend.bucketName;

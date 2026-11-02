@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * Regenerate the end-to-end coverage matrix from the spec corpus and the e2e suite.
+ * Regenerate the end-to-end coverage matrix from the spec corpus, the e2e suite and the deny-test
+ * inventory (`lib/docs/deny-test-inventory.ts`).
  *
  *   npm run gen-coverage-matrix
  *
@@ -28,13 +29,18 @@ import {
   validateCoverage,
   MATRIX_PATH,
 } from '../lib/docs/spec-coverage.js';
+import { DENY_TEST_INVENTORY, fileExists, isPresent } from '../lib/docs/deny-test-inventory.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 
 const specs = readSpecCoverage(REPO_ROOT);
 const e2eSpecs = listE2eSpecs(REPO_ROOT);
-const rendered = renderCoverageMatrix(specs, e2eSpecs, (f) => countTests(REPO_ROOT, f));
+const rendered = renderCoverageMatrix(specs, e2eSpecs, (f) => countTests(REPO_ROOT, f), {
+  rows: DENY_TEST_INVENTORY,
+  present: (row) => isPresent(REPO_ROOT, row),
+  fileExists: (file) => fileExists(REPO_ROOT, file),
+});
 
 const out = path.join(REPO_ROOT, MATRIX_PATH);
 mkdirSync(path.dirname(out), { recursive: true });

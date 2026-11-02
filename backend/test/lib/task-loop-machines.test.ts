@@ -7,6 +7,7 @@
  * that merge: override the same taskType, inherit the rest, and no-op when the profile carries none.
  */
 import type { TaskStateMachine } from '../../lambda/src/lib/task-state-machines';
+import { DEFAULT_TASK_STATE_MACHINES } from '../../lambda/src/lib/task-state-machines';
 
 // getTask is the only task-tracking call buildTaskLoopContext makes; stub it so the loop context builds
 // without DynamoDB. requireActual keeps every other export async-processor-core imports from the module.
@@ -43,7 +44,7 @@ const taskRow = (taskType: string) => ({
   taskState: 'collecting_requirements',
 });
 
-describe('buildTaskLoopContext — per-assistant machines override the deployment pack (4.5 runtime precedence)', () => {
+describe(`buildTaskLoopContext takes the turn machines it is handed and uses exactly them (ADR-047)`, () => {
   beforeEach(() => mockGetTask.mockReset());
 
   it('a profile machine OVERRIDES the deployment-pack machine for the same taskType', async () => {
@@ -59,26 +60,34 @@ describe('buildTaskLoopContext — per-assistant machines override the deploymen
     expect(Object.keys(ctx!.machines!.report_generation!.states)).toContain('legal_review');
   });
 
-  it('INHERITS the deployment pack for taskTypes the profile does not override', async () => {
+  it(`DOES NOT merge the caller set over the deployment pack, which is what made a narrowing a no-op`, async () => {
+    // THIS ASSERTED THE OPPOSITE: that a set passed here was MERGED over the full deployment pack, so a
+    // taskType absent from it still resolved. Those are override semantics - a profile supplies a
+    // subset and inherits the rest - and they are why passing a narrowed set was a no-op that read
+    // like a fix: spreading it over the full set yields the full set back (ADR-047).
+    //
+    // The caller now passes the turn's COMPLETE set, so a taskType that is not in it is not available,
+    // which is the only way a narrowing can mean anything.
     mockGetTask.mockResolvedValue(taskRow('data_extraction') as any);
     const ctx = await buildTaskLoopContext({
       taskId: 't1',
       taskType: 'data_extraction',
       channelArn: taskRow('data_extraction').channelArn,
-      machines: CUSTOM_MACHINES, // overrides only report_generation
+      machines: CUSTOM_MACHINES, // holds report_generation only
     });
-    expect(ctx).toBeDefined();
-    // data_extraction was not in the override → it comes straight from the deployment pack.
-    expect(Object.keys(ctx!.machines!.data_extraction!.states)).not.toContain('legal_review');
-    expect(ctx!.machines!.data_extraction!.states.completed).toBeDefined();
+    expect(ctx).toBeUndefined();
   });
 
-  it('with NO profile machines, runs the deployment pack unchanged (byte-identical to pre-4.5)', async () => {
+  it('runs the deployment pack when that is what it is handed', async () => {
     mockGetTask.mockResolvedValue(taskRow('report_generation') as any);
     const ctx = await buildTaskLoopContext({
       taskId: 't1',
       taskType: 'report_generation',
       channelArn: taskRow('report_generation').channelArn,
+      // THE DEPLOYMENT SET, PASSED (ADR-047). This relied on the argument being optional, which is the
+      // shape that let a consumer read a different set without saying so. Naming it keeps the test
+      // about what it is called: running the pack unchanged.
+      machines: DEFAULT_TASK_STATE_MACHINES,
     });
     expect(ctx).toBeDefined();
     expect(Object.keys(ctx!.machines!.report_generation!.states)).not.toContain('legal_review');

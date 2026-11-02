@@ -2,11 +2,19 @@
  * Post-Processing Stack
  *
  * The platform's after-the-fact half (ADR-032 tenet 4): one consumer on the Amazon Chime SDK message
- * stream that acts on messages DELIVERY DID NOT ROUTE. Today it carries one rule - a person answers a
- * task in a shared conversation, addresses nobody, and their answer reaches no assistant at all
- * (`lambda/src/lib/task-answer-repair.ts`). ADR-023's B-stream, an assistant-to-assistant message that
- * Amazon Chime SDK delivers and persists but routes to no handler, is the same shape and belongs here
- * as a second rule rather than as a second consumer.
+ * stream. It carries two kinds of rule.
+ *
+ * Rules that act on messages DELIVERY DID NOT ROUTE: a person answers a task in a shared
+ * conversation, addresses nobody, and their answer reaches no assistant at all
+ * (`lambda/src/lib/task-answer-repair.ts`); and triage on arrival, which reads a queue from the
+ * deferral notice that announced it (`lambda/src/lib/triage-on-arrival.ts`). ADR-023's B-stream, an
+ * assistant-to-assistant message that Amazon Chime SDK delivers and persists but routes to no
+ * handler, is the same shape and belongs here as a further rule rather than as a second consumer.
+ *
+ * The notification fan-out, which reaches members over email when an assistant's message carries a
+ * `notify` directive, is a second consumer of the same stream, in the Notifications stack, which holds
+ * the deployment's only SES send grant: a deployment that does not declare `notifications` sends no email
+ * and carries no grant to send one.
  *
  * WHY IT IS ITS OWN STACK, AND NOT PART OF THE CHANNEL FLOW OR OF ANALYTICS.
  *
@@ -15,12 +23,10 @@
  * a state that should not exist has to cost time only in the broken case. Putting it in the flow's
  * stack would also invite the next reader to put it in the flow's Lambda.
  *
- * Not the analytics stacks, because there are TWO of them (Athena and Aurora) and the wiring would
- * have to be duplicated and kept in step - and neither can resolve what this needs: analytics deploys
- * BEFORE foundations and the classification stacks (`foundationsStack.addDependency(analyticsStack)`),
- * so the tasks table and the router ARNs it reads from SSM at deploy do not exist yet at that point.
- * Both analytics modes expose `kinesisStreamArn` identically, so the stream comes in as a prop and
- * this stack sits after the ones that publish what it reads.
+ * Not the archive, because the archive has two implementations (Athena and Aurora) and the wiring would
+ * have to be duplicated and kept in step - and the archive deploys BEFORE the assistant stacks, so the
+ * router ARNs this reads from SSM at deploy do not exist yet at that point. The stream is the Messaging
+ * stack's, taken by reference, and this stack sits after the ones that publish what it reads.
  *
  * IT IS ENTIRELY OPTIONAL. Remove it and the platform behaves exactly as it did before: an
  * unaddressed task answer strands, which is the defect this measures rather than a regression it
@@ -29,7 +35,7 @@
 
 import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
-import * as kinesis from 'aws-cdk-lib/aws-kinesis';
+import type * as kinesis from 'aws-cdk-lib/aws-kinesis';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as lambdaEventSources from 'aws-cdk-lib/aws-lambda-event-sources';
@@ -39,16 +45,27 @@ import * as path from 'path';
 import {
   SSM_ROOT,
   STACK_PREFIX,
-  routerArnKey,
+  routerByNameEnvironment,
+  routerByNameStatements,
   resolveSharedSSM,
+  turnQueueWiring,
+  speakAsAssistantStatements,
+  speakAsAssistantEnv,
+  EVERY_CLASSIFICATION,
 } from './agent-classification-common';
-import * as ssm from 'aws-cdk-lib/aws-ssm';
+import { defaultProfileRegistry as profiles } from '../profile-registry';
 
 export interface PostProcessingStackProps extends cdk.StackProps {
   /** The app instance whose channels this may read. Scopes every Chime grant. */
   appInstanceArn: string;
-  /** The Chime message stream. Published identically by both analytics modes. */
-  kinesisStreamArn: string;
+  /** The message stream, from the Messaging stack. */
+  messageStream: kinesis.IStream;
+  /**
+   * The bucket holding profile BODIES (an active version's persona lives under `profiles/*`). Needed
+   * because arrival triage resolves the active profile for its configured copy.
+   */
+  attachmentsBucketName: string;
+  attachmentsBucketArn: string;
 }
 
 export class PostProcessingStack extends cdk.Stack {
@@ -58,15 +75,16 @@ export class PostProcessingStack extends cdk.Stack {
     super(scope, id, props);
 
     const shared = resolveSharedSSM(this);
+    // The queue record and the kill switch, so triage-on-arrival is inert wherever queueing is.
+    const turnQueue = turnQueueWiring(this, shared.turnStateArn, shared.turnStateName);
 
     // The turn is handed to the ROUTER for the channel's classification - the same Lambda Lex fulfills
-    // into and the same one the flow's `@all` bypass uses. Resolved at deploy from the SSM contract the
-    // classification stacks publish, so there is no second routing table to drift.
-    const basicRouterArn = ssm.StringParameter.valueForStringParameter(this, routerArnKey('basic'));
-    const standardRouterArn = ssm.StringParameter.valueForStringParameter(this, routerArnKey('standard'));
-    const premiumRouterArn = ssm.StringParameter.valueForStringParameter(this, routerArnKey('premium'));
+    // into and the same one the flow's `@all` bypass uses. Found by name at call time from the parameter
+    // each classification stack publishes (`resolveRouterArn`), so there is no second routing table to
+    // drift and this stack takes no deploy-time value from the classification stacks. A classification
+    // reaches only its own router.
 
-    const messageStream = kinesis.Stream.fromStreamArn(this, 'MessageStream', props.kinesisStreamArn);
+    const messageStream = props.messageStream;
 
     const postProcessingRole = new iam.Role(this, 'PostProcessingRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
@@ -84,7 +102,7 @@ export class PostProcessingStack extends cdk.Stack {
                 'kinesis:DescribeStreamSummary',
                 'kinesis:ListShards',
               ],
-              resources: [props.kinesisStreamArn],
+              resources: [props.messageStream.streamArn],
             }),
           ],
         }),
@@ -98,6 +116,43 @@ export class PostProcessingStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['chime:ListTagsForResource', 'chime:ListChannelMemberships'],
               resources: [`${props.appInstanceArn}/*`],
+            }),
+          ],
+        }),
+        // TRIAGE ON ARRIVAL (ADR-033). Reads the queue record, decides whether it may serve the
+        // conversation, and reads the queued messages themselves - all as this component, which
+        // already dispatches turns through the routers.
+        //
+        // NO WRITE TO THE TASK TABLES here, deliberately: the dispatched turn creates the tasks, and
+        // it does so through the task service. This one reads a queue and hands it on.
+        TriageOnArrival: new iam.PolicyDocument({
+          statements: [
+            // A tag READ cannot itself be tag-gated - it is how the classification is learned - so it
+            // is unconditioned and read-only, the same statement and reasoning the router carries.
+            new iam.PolicyStatement({
+              actions: ['chime:ListTagsForResource'],
+              resources: [`${props.appInstanceArn}/channel/*`],
+            }),
+            // The queued messages are read, and the notice settled, AS THE ASSISTANT whose queue it
+            // is: on a session its classification's vend mints for that one bot. So this role reads
+            // no message content and edits nothing itself. (It held GetChannelMessage bearing any bot.)
+            ...speakAsAssistantStatements(this, EVERY_CLASSIFICATION),
+          ],
+        }),
+        // THE ASSISTANT'S CONFIGURED WORDS. Arrival triage resolves the active profile version
+        // for its copy, and without these the read was refused (`AccessDeniedException`, measured on
+        // the premium profile 2026-09-14) and every notice it wrote fell back to shipped English. The
+        // same READ-ONLY grants the router carries: the definition namespace, and `profiles/*` for the
+        // persona body a version points at. Reading a definition is behavior, not a boundary.
+        ProfileRead: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['ssm:GetParameter', 'ssm:GetParameterHistory'],
+              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/definition`],
+            }),
+            new iam.PolicyStatement({
+              actions: ['s3:GetObject'],
+              resources: [`${props.attachmentsBucketArn}/profiles/*`],
             }),
           ],
         }),
@@ -122,20 +177,17 @@ export class PostProcessingStack extends cdk.Stack {
             }),
           ],
         }),
-        // The routers are `${STACK_PREFIX}Classification-*` functions, so one wildcard covers all
-        // three. Named by prefix rather than by a pattern built from a stack name: CloudFormation
-        // truncates a generated physical name at 64 characters, and a grant built from the full name
-        // deploys green and denies at runtime.
+        // THE ROUTERS, AND NOTHING ELSE IN THE CLASSIFICATION STACKS. The rules dispatch turns through each
+        // classification's router and need no other function there: the router's construct id, bounded to
+        // this instance's functions that carry a classification, read by name (`routerByNameStatements`).
         RouterInvoke: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({
-              actions: ['lambda:InvokeFunction'],
-              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Classification-*`],
-            }),
-          ],
+          statements: routerByNameStatements(this, EVERY_CLASSIFICATION),
         }),
       },
     });
+
+    // Read AND write on the queue record: triage claims the right to read it, then releases.
+    turnQueue.grant(postProcessingRole);
 
     const postProcessingFn = new lambdaNodeJs.NodejsFunction(this, 'MessagePostProcessing', {
       entry: path.join(__dirname, '../../lambda/src/message-post-processing.ts'),
@@ -147,11 +199,13 @@ export class PostProcessingStack extends cdk.Stack {
       memorySize: 256,
       role: postProcessingRole,
       environment: {
-        SSM_ROOT,
-        ROUTER_ARN: standardRouterArn,
-        BASIC_ROUTER_ARN: basicRouterArn,
-        PREMIUM_ROUTER_ARN: premiumRouterArn,
+        ...speakAsAssistantEnv(),
+        PROFILE_BODY_BUCKET: props.attachmentsBucketName,
+        ...routerByNameEnvironment(),
         TASKS_TABLE: shared.agentTasksName,
+        // The queue record triage reads, and the same kill switch every other queue path honors -
+        // so this rule is inert on a deployment that has not enabled queueing, like the rest of it.
+        ...turnQueue.env,
         ABUSE_CONTROLS_TABLE: shared.abuseControlsName,
       },
       bundling: { minify: false, forceDockerBundling: false },

@@ -5,9 +5,9 @@
  * straight to the worker - the orchestrator fires it, not a person - so no classifier ever runs on
  * it, and every rebuttal in the analytics carried an intent nobody derived.
  *
- * It was the odd one out in its own payload: `trigger`, `userType`, `experimentId`, `variantId` and
+ * It was the odd one out in its own payload: `trigger`, `classification`, `experimentId`, `variantId` and
  * `variantProfile` are each resolved beside it with a comment explaining why. And the repo already
- * records this exact hardcode being REMOVED from the flow (`channel-flow-processor.ts:892`): *"the
+ * records this exact hardcode being REMOVED from the flow (`channel-flow-processor.ts:885`): *"the
  * greeting/acknowledgment fast path, the abuse gate, the correlation id, `intent: 'general'`, ... was
  * a second implementation of decisions the router already makes, and a second implementation diverges
  * SILENTLY: the turn still answers, so nothing errors."* The flow was cleaned up; the orchestrator was
@@ -65,9 +65,9 @@ describe('round 1 records the intent for round 2 to inherit', () => {
   });
 
   it('EVERY caller of the terminal helper supplies it, not just the happy path', () => {
-    // Tracker rule 2: a fix touching one call site enumerates them all. There are two - the opt-out
+    // A fix touching one call site enumerates them all. There are two - the opt-out
     // path (response null) and the answered path - and a rebuttal after the opt-out path is exactly
-    // the case that would silently keep the old behaviour if only one were updated.
+    // the case that would silently keep the old behavior if only one were updated.
     const calls = core.match(/recordBattleTerminalAndFireOrchestrator\(\{[\s\S]*?\n\s*\}\);/g) || [];
     expect(calls.length).toBe(2);
     for (const c of calls) expect(c).toMatch(/intent:\s*event\.intent/);

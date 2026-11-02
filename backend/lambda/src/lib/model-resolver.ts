@@ -3,8 +3,8 @@
  *
  * Maps classified intents to specific Bedrock models using the
  * INTENT_ROUTE_STRATEGY from model-strategy.ts. Enforces classification-based
- * access control at the code level — a basic-classification request will never
- * resolve to a premium-only model even if the strategy says so.
+ * access control at the code level: a request never resolves to a model whose
+ * allow-list does not name its classification, even if the strategy says so.
  *
  * Used by async processors to select the right model per intent.
  */
@@ -15,86 +15,77 @@ import type {
   RouteKey,
   IntentRouteDefinition,
   Classification,
-  ProfileModelSelection,
 } from '../../../lib/config/model-strategy.js';
 import { bedrockInvokeId } from '../../../lib/config/model-strategy.js';
+import type { ClassificationModels } from '../../../lib/config/profiles.js';
 
 // Re-export for convenience
 export type { BackendModelKey, Classification };
 
 /**
- * The RouteKeys a strategy can carry. An intent whose key IS one of these routes to it directly —
- * see `intentTypeToRouteKey` for why that identity case matters.
+ * THE ROUTE AN INTENT WITH NO ROUTE OF ITS OWN ANSWERS THROUGH, when it is one of {@link ANSWERS_THROUGH_GENERAL}
+ * (ADR-064 decision A). A route is keyed by the intent it serves; there is no rename table.
  */
-const ROUTE_KEYS = new Set<string>([
-  'general_qa',
-  'code_generation',
-  'code_review',
-  'document_extraction',
-  'report_generation',
-  'strategic_analysis',
-  'workflow_actions',
-]);
+export const GENERAL_ROUTE_KEY = 'general';
 
 /**
- * LEGACY RENAMES from classifier intent to RouteKey.
- *
- * This is not the taxonomy — it is a compatibility shim for the handful of places where the two
- * names genuinely differ (`data_extraction` vs `document_extraction`, `guided_troubleshooting` vs
- * `workflow_actions`) plus the universal intents that all mean general QA.
- *
- * The DESIGN is that they are one namespace: `IntentDef.key` is documented as "the classified intent
- * value + INTENT_ROUTE_STRATEGY key", and `report_generation` is both. Treating this table as the
- * whole mapping broke that: because the resolver consulted ONLY this map and fell through to
- * `general_qa` on a miss, `code_generation`, `code_review` and `strategic_analysis` were
- * unreachable. An operator could configure a dedicated model for code generation - and the admin
- * Experiments tab offers exactly those as selectable intents - and it could never be selected. The
- * per-deployment intent pack (SPEC-CONFIGURABLE-INTENT-PACK) is supposed to let a deployment add
- * `code_generation` and have routing follow; it could not.
+ * THE PLATFORM INTENTS THAT ANSWER THROUGH THE `general` ROUTE when the version gives them no route of their own:
+ * ordinary conversation and the platform's own short replies. Declared beside the platform intents
+ * (`PLATFORM_INTENT_NEEDS`, re-exported from `intent-pack.ts`) and shown in the console's Platform intents group.
+ * Every other intent with no route of its own answers on the version's base model.
  */
-const INTENT_TYPE_TO_ROUTE_KEY: Record<string, RouteKey> = {
-  general: 'general_qa',
-  guided_troubleshooting: 'workflow_actions',
-  data_extraction: 'document_extraction',
-  report_generation: 'report_generation',
-  greeting: 'general_qa',
-  acknowledgment: 'general_qa',
-};
+export const ANSWERS_THROUGH_GENERAL: readonly string[] = [
+  'general',
+  'greeting',
+  'acknowledgment',
+  'conversation_summary',
+  'set_preference',
+  'show_preferences',
+  'off_topic',
+  'platform_question',
+];
+const ANSWERS_THROUGH_GENERAL_SET = new Set<string>(ANSWERS_THROUGH_GENERAL);
 
-/**
- * Normalize a coarse classifier intent to the fine-grained RouteKey the
- * strategy (and admin-defined experiments) key on. Mirrors the mapping this
- * module applies for model selection, so any consumer that needs to match a
- * turn against a route-keyed config (e.g. intent A/B experiments) sees the
- * SAME route the model resolver would pick. Unmapped intents fall through to
- * 'general_qa', exactly as resolveModelForIntent's default resolution does.
- */
-export function intentTypeToRouteKey(intent: string | undefined): RouteKey {
-  if (!intent) return 'general_qa';
-  const renamed = INTENT_TYPE_TO_ROUTE_KEY[intent];
-  if (renamed) return renamed;
-  // Identity: an intent key that IS a RouteKey routes to it. This is the documented contract on
-  // `IntentDef.key`, and it is what makes a per-deployment pack able to add `code_generation`.
-  if (ROUTE_KEYS.has(intent)) return intent as RouteKey;
-  return 'general_qa';
+/** Whether an intent with no route of its own answers through the `general` route. */
+export function answersThroughGeneral(intent: string | undefined): boolean {
+  return !!intent && ANSWERS_THROUGH_GENERAL_SET.has(intent);
 }
 
-// Ordinal capability/cost ranking, reusing each catalog entry's `costClass`.
-// Used to enforce the classification floor: never resolve below the classification's default model.
+/**
+ * THE ROUTE KEYS RETIRED BY ADR-064 decision 1, each with the intent key that now keys its route. Read only to
+ * refuse a version or experiment that names one, naming the key to write instead; nothing resolves through them.
+ */
+export const RETIRED_ROUTE_KEYS: Readonly<Record<string, string>> = {
+  general_qa: 'general',
+  workflow_actions: 'guided_troubleshooting',
+  document_extraction: 'data_extraction',
+};
+
+/** The refusal for a retired route key at `path` (`models.byIntent['general_qa']`, `intent`), or null. */
+export function retiredRouteKeyError(key: string, path: string): string | null {
+  const now = RETIRED_ROUTE_KEYS[key];
+  return now ? '`' + path + '` is a retired route key; the route is keyed by the intent, `' + now + '`.' : null;
+}
+
+// Ordinal cost ranking, reusing each catalog entry's `costClass`. The resolver no longer reads it: it is
+// what `routesAsServedByTheFloor` uses to write down, once, what the retired classification floor served.
 const COST_RANK: Record<'low' | 'medium' | 'high', number> = { low: 0, medium: 1, high: 2 };
 
-// Trivial intents that should stay on the cheapest capable model for ALL classifications —
-// a greeting or "thanks" does not warrant a premium-grade invoke. Everything else
-// is subject to the classification floor below.
-const TRIVIAL_INTENTS = new Set<string>(['greeting', 'acknowledgment']);
+/**
+ * The intents a STANDALONE turn of which takes a route of its own (`greeting`, `acknowledgment`) when the version
+ * has one. A version that routes them separately answers "thanks" on a different model from a general question; one
+ * that does not answers both through `general`. A greeting inside work in flight answers through `general`.
+ */
+export const TRIVIAL_ROUTE_KEYS: readonly string[] = ['greeting', 'acknowledgment'];
+const TRIVIAL_INTENTS = new Set<string>(TRIVIAL_ROUTE_KEYS);
 
 /**
  * What the TURN is doing, as distinct from what the incoming message looks like.
  *
  * The intent classifies the user's message; it does not describe the work the reply has to do. Those
- * two came apart live: "Looks good" classified as `acknowledgment`, the trivial bypass below kept the
- * cheap model, and the reply that followed was a full multi-section board report generated on Haiku.
- * The shape of a four-word message decided the model for work that was already in flight.
+ * two came apart live: "Looks good" classified as `acknowledgment`, a cheap route answered it, and the
+ * reply that followed was a full multi-section board report generated on Haiku. The shape of a four-word
+ * message decided the model for work that was already in flight.
  */
 export interface TurnContext {
   /**
@@ -110,12 +101,58 @@ export interface TurnContext {
 }
 
 /**
- * Does the trivial-intent bypass apply to this turn? Only when the intent is trivial AND the turn is
- * not carrying live work. Exported so the same question has one answer wherever it is asked.
+ * Is this a standalone greeting or acknowledgment? Only when the intent is trivial AND the turn is not
+ * carrying live work. Such a turn is answered through its own route (`greeting`, `acknowledgment`) when
+ * the version has one; any other turn through the route its intent maps to.
  */
 export function isTrivialTurn(intent: string | undefined, turn: TurnContext = {}): boolean {
   if (!intent || !TRIVIAL_INTENTS.has(intent)) return false;
   return !turn.continuesActiveWork;
+}
+
+/**
+ * ── WHAT THE RETIRED CLASSIFICATION FLOOR SERVED, WRITTEN DOWN AS ROUTES ─────────────────────────────
+ *
+ * The resolver used to raise, on every non-trivial turn, a route whose primary model was cheaper than the
+ * version's base model to that base model: a version said `general → haiku` and a premium turn was
+ * answered on Opus. The served model was not the saved one. Routes are now served as written, so a body's
+ * routes are rewritten ONCE to say what the floor served (seeds and the backfill of a body with no routes;
+ * nothing else), and nothing changes for a person:
+ *  - a route cheaper than the base model becomes the base model as its primary (its fallback is kept);
+ *  - standalone greetings and acknowledgments were exempt from the floor and answered on the `general`
+ *    route as written, so when that route is raised they get routes of their own (`greeting`,
+ *    `acknowledgment`) carrying it as written, unless the body already routes them.
+ * Pure; `raised` names each route this changed, for the caller to log or report. A route whose model the
+ * catalog does not know, or a base that is not concrete, is left as it is.
+ */
+export function routesAsServedByTheFloor(
+  byIntent: Record<string, { primary: string; fallback?: string }> | undefined,
+  baseModelKey: string | undefined,
+  catalog: Record<string, Pick<BackendModelDefinition, 'costClass'>>,
+): { byIntent: Record<string, { primary: string; fallback?: string }> | undefined; raised: string[] } {
+  const base = baseModelKey ? catalog[baseModelKey] : undefined;
+  if (!byIntent || !base || !baseModelKey) return { byIntent, raised: [] };
+  const raised: string[] = [];
+  const out: Record<string, { primary: string; fallback?: string }> = {};
+  for (const [intent, route] of Object.entries(byIntent)) {
+    const primary = catalog[route.primary];
+    // A trivial key's own route was never floored: it is what a standalone greeting is answered on.
+    if (!TRIVIAL_INTENTS.has(intent) && primary && COST_RANK[primary.costClass] < COST_RANK[base.costClass]) {
+      out[intent] = { ...route, primary: baseModelKey };
+      raised.push(intent);
+    } else {
+      out[intent] = route;
+    }
+  }
+  if (raised.includes(GENERAL_ROUTE_KEY)) {
+    for (const trivial of TRIVIAL_ROUTE_KEYS) {
+      if (!out[trivial]) {
+        out[trivial] = { ...byIntent[GENERAL_ROUTE_KEY] };
+        raised.push(trivial);
+      }
+    }
+  }
+  return { byIntent: out, raised };
 }
 
 export interface ModelResolution {
@@ -123,18 +160,21 @@ export interface ModelResolution {
   primaryModelKey: BackendModelKey;
   fallbackModelId: string | null;
   fallbackModelKey: BackendModelKey | null;
-  routeKey: RouteKey;
+  /** The route this turn resolved to: an intent key, the intent's own or `general` (ADR-064 decision 1). */
+  routeKey: string;
   resolvedFromStrategy: boolean;
+  /** Which rule chose the model: the intent's own route, the `general` route it answers through, or the base model. */
+  from: 'route' | 'general' | 'base';
 }
 
 /**
  * Resolve the best model for a given intent and classification.
  *
- * 1. Maps the classifier's IntentType string to an RouteKey
- * 2. Looks up the INTENT_ROUTE_STRATEGY for that key
- * 3. Checks that the strategy's primaryModel is allowed for this classification
- * 4. Falls back to the classification's default model if not allowed
- * 5. Same logic for fallbackModel
+ * 1. Looks up the intent's own route (a standalone greeting or acknowledgment's own; any other intent's own), else
+ *    the `general` route for an intent that answers through it (`ANSWERS_THROUGH_GENERAL`)
+ * 2. Checks that the strategy's primaryModel is allowed for this classification
+ * 3. Falls back to the classification's default model if not allowed
+ * 4. Same logic for fallbackModel
  *
  * `turn` carries what the TURN is doing (see {@link TurnContext}); omitted ⇒ intent alone decides,
  * which is the historical behavior.
@@ -144,30 +184,37 @@ export function resolveModelForIntent(
   classification: Classification,
   catalog: Record<BackendModelKey, BackendModelDefinition>,
   strategy: IntentRouteDefinition[],
-  profileDefaults: ProfileModelSelection,
+  models: ClassificationModels | undefined,
   turn: TurnContext = {},
 ): ModelResolution {
-  const defaultModel = catalog[profileDefaults[classification]];
+  // THE CLASSIFICATION'S OWN SELECTION AND DEFAULT (`models` on its registry entry; the profile's active base
+  // model in place of the default where it chose one). A classification this deployment does not declare has
+  // none: the turn is refused, never answered on a default that belongs to another classification.
+  const defaultModel = models && models.selected.includes(models.default) ? catalog[models.default as BackendModelKey] : undefined;
+  if (!defaultModel) {
+    throw new Error(`[model-resolver] classification "${classification}" has no default model in its selection`);
+  }
+  const selects = (key: string) => models!.selected.includes(key);
   const defaultResolution: ModelResolution = {
     primaryModelId: bedrockInvokeId(defaultModel),
     primaryModelKey: defaultModel.key,
     fallbackModelId: null,
     fallbackModelKey: null,
-    routeKey: 'general_qa',
+    routeKey: GENERAL_ROUTE_KEY,
     resolvedFromStrategy: false,
+    from: 'base',
   };
 
   if (!intent) return defaultResolution;
 
-  // A rename, or an intent whose key IS a RouteKey (the documented `IntentDef.key` contract).
-  // A genuinely UNKNOWN intent still returns the profile default rather than being force-routed
-  // through general_qa - that is long-standing behaviour and changing it would silently re-route
-  // every unrecognised intent in every deployment, far beyond the three unreachable keys this
-  // change exists to fix.
-  const routeKey = INTENT_TYPE_TO_ROUTE_KEY[intent] ?? (ROUTE_KEYS.has(intent) ? (intent as RouteKey) : undefined);
-  if (!routeKey) return defaultResolution;
-
-  const route = strategy.find((r) => r.intent === routeKey);
+  // THE INTENT'S OWN ROUTE (ADR-064 decision 1). A greeting or acknowledgment takes its own only as a standalone
+  // turn; inside work in flight it answers as the general reply it is. An intent with no route of its own answers
+  // through `general` when it is one that does (decision A), else on the base model.
+  const trivial = TRIVIAL_INTENTS.has(intent);
+  const own = !trivial || isTrivialTurn(intent, turn) ? strategy.find((r) => r.intent === intent) : undefined;
+  const general = !own && answersThroughGeneral(intent) ? strategy.find((r) => r.intent === GENERAL_ROUTE_KEY) : undefined;
+  const route = own ?? general;
+  const routeKey = route ? route.intent : intent;
   if (!route) return { ...defaultResolution, routeKey };
 
   // Resolve primary model — must be allowed for this classification
@@ -175,23 +222,14 @@ export function resolveModelForIntent(
   let primaryModelId: string;
   let primaryModelKey: BackendModelKey;
 
-  if (primaryDef && primaryDef.allowedClassifications.includes(classification)) {
-    // Classification floor: a strategy primary can be allowed for a classification yet weaker than
-    // that classification's default model (e.g. general_qa → haiku, which IS allowed for
-    // premium). For any non-trivial turn, never resolve below the classification default,
-    // so a premium user gets a premium-grade response instead of silently
-    // dropping to Haiku. Lower classifications still degrade to their own (cheaper) floor;
-    // a standalone greeting/acknowledgment bypasses the floor and stays on Haiku for everyone.
-    // A greeting-shaped message that CONTINUES a live task is not standalone and keeps the floor
-    // (isTrivialTurn): the reply owes the task's work, not the incoming message's word count.
-    const belowFloor = COST_RANK[primaryDef.costClass] < COST_RANK[defaultModel.costClass];
-    if (intent && !isTrivialTurn(intent, turn) && belowFloor) {
-      primaryModelId = bedrockInvokeId(defaultModel);
-      primaryModelKey = defaultModel.key;
-    } else {
-      primaryModelId = bedrockInvokeId(primaryDef);
-      primaryModelKey = primaryDef.key;
-    }
+  // THE ROUTE IS SERVED AS WRITTEN, provided the classification allows its model. There is no silent
+  // floor: a version that routes a simple intent to a cheaper model than its base is answered on that model,
+  // because an assistant manager chose it. Routes that predate this were rewritten to say what the floor
+  // served (`routesAsServedByTheFloor`). A classification minimum, if one is ever wanted, is an explicit
+  // admin setting refused on write, never a swap here.
+  if (primaryDef && selects(primaryDef.key)) {
+    primaryModelId = bedrockInvokeId(primaryDef);
+    primaryModelKey = primaryDef.key;
   } else {
     // Primary not allowed for this classification — use classification default
     primaryModelId = bedrockInvokeId(defaultModel);
@@ -203,7 +241,7 @@ export function resolveModelForIntent(
   let fallbackModelKey: BackendModelKey | null = null;
 
   const fallbackDef = catalog[route.fallbackModel];
-  if (fallbackDef && fallbackDef.allowedClassifications.includes(classification) && fallbackDef.key !== primaryModelKey) {
+  if (fallbackDef && selects(fallbackDef.key) && fallbackDef.key !== primaryModelKey) {
     fallbackModelId = bedrockInvokeId(fallbackDef);
     fallbackModelKey = fallbackDef.key;
   }
@@ -215,6 +253,8 @@ export function resolveModelForIntent(
     fallbackModelKey,
     routeKey,
     resolvedFromStrategy: true,
+    // A route whose primary the classification does not select served the base model in its place.
+    from: primaryModelKey !== route.primaryModel ? 'base' : own ? 'route' : 'general',
   };
 }
 
@@ -268,22 +308,3 @@ export function visionRejectMessage(modelKey: string): string {
   );
 }
 
-/**
- * Collect all Bedrock ARNs that a given classification might need access to.
- * Used by CDK to generate IAM policies from the catalog rather than hardcoding.
- */
-export function collectArnsForClassification(
-  classification: Classification,
-  catalog: Record<BackendModelKey, BackendModelDefinition>,
-): string[] {
-  const arns: string[] = [];
-  for (const model of Object.values(catalog)) {
-    if (model.allowedClassifications.includes(classification)) {
-      arns.push(...model.foundationModelArns);
-      if (model.inferenceProfileArns) {
-        arns.push(...model.inferenceProfileArns);
-      }
-    }
-  }
-  return arns;
-}

@@ -11,7 +11,9 @@
  * block at the end of `assembleHostGrounding`).
  */
 import { getChannelContext } from './channel-context-client.js';
-import { deriveFederatedSub } from './federated-identity.js';
+import { resolvePerson } from './person-identity.js';
+import { issuerIdOf } from './trusted-issuers.js';
+import { personIdFromArn } from './person-arn.js';
 
 export interface HostGrounding {
   /** Forwarded to the async processor; rendered into the system prompt by the host-context resolvers. */
@@ -68,8 +70,8 @@ export interface GroundedParticipant {
 export interface ParticipantResolvers {
   /** The channel's HUMAN member ids, live from `ListChannelMemberships`. */
   listHumanMemberSubs: () => Promise<string[]>;
-  /** Display name for one member; `hint` carries the raw (iss, sub) when the member is federated. */
-  resolveName: (memberSub: string, hint?: { iss: string; rawSub: string }) => Promise<string | undefined>;
+  /** Display name for one member, by the id membership reports. */
+  resolveName: (memberId: string) => Promise<string | undefined>;
 }
 
 /**
@@ -109,6 +111,9 @@ export async function assembleHostGrounding(
       domainGrounding.userLanguage = priv.userLanguage;
     }
     if (priv.segment && typeof priv.segment === 'object') domainGrounding.segment = priv.segment;
+    // The conversation's type as the row records it (ADR-053), which a turn's conditions read as `conversation:type`
+    // (ADR-060). Never the member-writable tag.
+    if (typeof priv.conversationType === 'string' && priv.conversationType) domainGrounding.conversationType = priv.conversationType;
   }
 
   // WHO is in the conversation: CHANNEL MEMBERSHIP, resolved live, never a stored copy.
@@ -118,27 +123,36 @@ export async function assembleHostGrounding(
   // who joined, and does it with the confidence of stated fact. A roster written at creation time
   // drifts the moment anybody is added or removed, and nothing ever corrects it.
   //
-  // Membership is the record; the IdP owns names. The stored roster survives only as a HINT for the
-  // two things neither can supply:
-  //   - `iss`, the home-IdP issuer. A federated member's AppInstanceUser id is
-  //     `deriveFederatedSub(iss, sub)`, a one-way hash, so membership alone cannot say which IdP to
-  //     ask for their name. This is the same demotion `channel-notify.readIssuerHints` already
-  //     applies on the delivery path, and it is safe for the same reason: the roster is fixed by
-  //     membership before the hint is consulted, so a tampered entry cannot ADD anyone — at worst it
-  //     points a real member at the wrong pool, where the lookup fails and the name is simply absent.
-  //   - `role`, which is host-supplied and exists nowhere else.
+  // Membership is the record; the directory owns names (`Directory.displayNameFor`, which reaches the
+  // person's issuer through `Identities`). The stored roster survives only as a HINT for the one thing
+  // neither can supply, the host-supplied `role`, with the issuer it was recorded under. It is safe:
+  // the roster is fixed by membership before the hint is consulted, so a tampered entry cannot ADD
+  // anyone, and at worst attaches a role to a real member.
   //
   // A member the stored roster has never heard of still appears, with no `iss` and no `role`. That is
   // the case the old shape got wrong: they were in the conversation and invisible to the assistant.
   if (participants) {
-    const hints = new Map<string, { iss: string; rawSub: string; role?: string }>();
+    const hints = new Map<string, { iss: string; role?: string }>();
     for (const p of (priv?.memberIdentities || [])) {
       if (!p || typeof p.sub !== 'string' || !p.sub) continue;
       if (typeof p.iss === 'string' && p.iss) {
-        // Keyed by the id MEMBERSHIP reports: the roster holds the raw pair, membership the derived id.
-        hints.set(deriveFederatedSub(p.iss, p.sub), { iss: p.iss, rawSub: p.sub, role: p.role });
+        // Keyed by the id MEMBERSHIP reports. The roster holds the issuer's subject, and the subject
+        // becomes a person only through `Identities`, exactly as at sign-in; one that resolves to
+        // nobody (never signed in, or offboarded) is in no membership and hints nothing.
+        let personId: string | null = null;
+        try {
+          // The host names the issuer by its `iss` (or registry id); one the registry does not declare
+          // resolves to nobody and hints nothing.
+          const issuerId = issuerIdOf(p.iss);
+          personId = issuerId ? personIdFromArn(await resolvePerson(issuerId, p.sub)) : null;
+        } catch (err) {
+          console.warn('[host-grounding] a member hint could not be resolved; that member goes without it', {
+            err: (err as Error)?.name,
+          });
+        }
+        if (personId) hints.set(personId, { iss: p.iss, role: p.role });
       } else {
-        hints.set(p.sub, { iss: '', rawSub: p.sub, role: p.role });
+        hints.set(p.sub, { iss: '', role: p.role });
       }
     }
 
@@ -147,10 +161,7 @@ export async function assembleHostGrounding(
       const roster: GroundedParticipant[] = [];
       for (const sub of memberSubs) {
         const hint = hints.get(sub);
-        const name = await participants.resolveName(
-          sub,
-          hint?.iss ? { iss: hint.iss, rawSub: hint.rawSub } : undefined,
-        );
+        const name = await participants.resolveName(sub);
         const entry: GroundedParticipant = { sub };
         if (hint?.iss) entry.iss = hint.iss;
         if (hint?.role) entry.role = hint.role;
@@ -179,7 +190,7 @@ export async function assembleHostGrounding(
   //
   // Reading them back out of Metadata would fix the degradation and open a worse hole: a channel's
   // creator is a moderator of their own channel and holds `chime:UpdateChannel` (granted for owner
-  // RENAME - see cognito-auth-stack), and Chime's UpdateChannel writes Name and Metadata in the SAME
+  // RENAME - see identity-stack), and Chime's UpdateChannel writes Name and Metadata in the SAME
   // call, which IAM cannot separate. A member can therefore set Metadata freely, so any private field
   // sourced from it is attacker-controlled input landing directly in the assistant's system-prompt
   // grounding. That is why the read half takes these ONLY from the server-only store, and why a
@@ -195,7 +206,7 @@ export async function assembleHostGrounding(
   // reported nothing for exactly those channels - the legacy conversations the platform has touched
   // since, which are the ones most likely to still be in use.
   //
-  // Degrading is the correct behaviour; degrading INVISIBLY is not. Log once per turn so the size of the
+  // Degrading is the correct behavior; degrading INVISIBLY is not. Log once per turn so the size of the
   // legacy population is observable and the backfill is a decision rather than a discovery. Values are
   // never logged - only which keys were present.
   const hasStoredGrounding = PRIVATE_GROUNDING_FIELDS.some((k) => isSet(priv?.[k]));
@@ -273,7 +284,7 @@ export function boundedDomainContext<T extends object>(
   return ctx;
 }
 
-/** Side contexts bounded by count. Non-arrays are dropped, matching the callers' prior behaviour. */
+/** Side contexts bounded by count. Non-arrays are dropped, matching the callers' prior behavior. */
 export function boundedOtherContexts(raw: unknown): unknown[] | undefined {
   if (!Array.isArray(raw)) return undefined;
   return raw.slice(0, MAX_OTHER_CONTEXTS);

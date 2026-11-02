@@ -9,14 +9,10 @@
  *  - all shipped conversation types carry the 90-day LAST_MESSAGE_TIMESTAMP TTL.
  */
 
-import * as cdk from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
-import { ChimeMessagingStack } from '../lib/stacks/chime-messaging-stack';
-import { CognitoAuthStack } from '../lib/stacks/cognito-auth-stack';
-import { FoundationsStack } from '../lib/stacks/foundations-stack';
-import { CONVERSATION_TYPES } from '../lib/config/conversation-types';
+import { CONVERSATION_TYPES, MAX_CONVERSATION_TTL_DAYS } from '../lib/config/conversation-types';
+import { identityTemplate, conversationsStacks, conversationsTemplate } from './helpers/synth';
 
-const env = { account: '123456789012', region: 'us-east-1' };
 
 /** Every IAM statement rendered in a template (inline role policies + managed policies). */
 interface Statement {
@@ -50,18 +46,11 @@ function isArchivedDeny(s: Statement): boolean {
   );
 }
 
-describe('archived read-only IAM Deny (CognitoAuth)', () => {
-  function cognitoTemplate() {
-    const app = new cdk.App();
-    const chime = new ChimeMessagingStack(app, 'Chime', { env, appInstanceName: 'test' });
-    const cog = new CognitoAuthStack(app, 'Cog', { env, appInstanceArn: chime.appInstanceArn });
-    return Template.fromStack(cog);
-  }
-
+describe('archived read-only IAM Deny (Identity)', () => {
   it('denies Send/Update on archived channels across the chat-plane exchange roles', () => {
-    const denies = allStatements(cognitoTemplate()).filter(isArchivedDeny);
-    // One per tier rung (basic/standard/premium via classificationChannelScopedAllow) + the
-    // restricted/admin chat rung. So multiple — assert it is present and covers
+    const denies = allStatements(identityTemplate()).filter(isArchivedDeny);
+    // One per tier role (basic/standard/premium via classificationChannelScopedAllow) + the
+    // restricted/admin chat role. So multiple — assert it is present and covers
     // BOTH message-write actions.
     expect(denies.length).toBeGreaterThanOrEqual(2);
     for (const d of denies) {
@@ -74,7 +63,7 @@ describe('archived read-only IAM Deny (CognitoAuth)', () => {
   it('does not deny plain (non-archived) sends — the Deny is tag-scoped only', () => {
     // Every archived Deny must carry the archived-tag condition (never an
     // unconditioned Deny that would break normal messaging).
-    for (const s of allStatements(cognitoTemplate())) {
+    for (const s of allStatements(identityTemplate())) {
       if (s.Effect === 'Deny' && asArray(s.Action).includes('chime:SendChannelMessage')) {
         expect(s.Condition?.StringEquals?.['aws:ResourceTag/archived']).toBe('true');
       }
@@ -82,48 +71,52 @@ describe('archived read-only IAM Deny (CognitoAuth)', () => {
   });
 });
 
-describe('conversation-management API (Foundations)', () => {
-  function foundationsTemplate() {
-    const app = new cdk.App();
-    const chime = new ChimeMessagingStack(app, 'Chime', { env, appInstanceName: 'test' });
-    // Foundations now hosts the user-feedback API (moved out of the identity stack), so it needs the
-    // pool for the authorizer and the feedback TABLE by reference - the table deliberately stayed in
-    // CognitoAuth, because relocating a DynamoDB table between stacks REPLACES it.
-    const cog = new CognitoAuthStack(app, 'CogForFound', { env, appInstanceArn: chime.appInstanceArn });
-    const found = new FoundationsStack(app, 'Found', {
-      env,
-      appInstanceArn: chime.appInstanceArn,
-      userPoolId: 'us-east-1_TestPool',
-      userPool: cog.userPool,
-      feedbackTable: cog.feedbackTable,
-    });
-    return Template.fromStack(found);
-  }
-
-  it('provisions the three /conversations/* resources + an audit table', () => {
-    const t = foundationsTemplate();
-    const paths = Object.values(t.findResources('AWS::ApiGateway::Resource')).map(
-      (r) => (r as { Properties?: { PathPart?: string } }).Properties?.PathPart,
-    );
-    expect(paths).toEqual(expect.arrayContaining(['conversations', 'archive', 'remove-member', 'leave']));
+describe('conversation-management routes (Conversations)', () => {
+  // Conversations hosts the conversation handlers, and declares their routes for PersonApi.
+  it('declares the three /conversations/* routes on one handler, behind the edge, and an audit table', () => {
+    const { conversations } = conversationsStacks();
+    const routes = conversations.routes.filter((r) => r.path.startsWith('/conversations/'));
+    expect(routes.map((r) => `${r.method} ${r.path}`).sort())
+      .toEqual(['POST /conversations/archive', 'POST /conversations/leave', 'POST /conversations/remove-member']);
+    expect(new Set(routes.map((r) => r.handler)).size).toBe(1);
+    expect(routes.every((r) => r.api === 'person' && (r.auth ?? 'person') === 'person')).toBe(true);
     // Task tables + abuse-controls + the new conversation-actions audit table.
-    const tables = Object.keys(t.findResources('AWS::DynamoDB::Table'));
+    const tables = Object.keys(conversationsTemplate().findResources('AWS::DynamoDB::Table'));
     expect(tables.length).toBeGreaterThanOrEqual(4);
-  });
-
-  it('returns CORS headers on gateway error responses (4XX/5XX)', () => {
-    const t = foundationsTemplate();
-    const responses = Object.values(t.findResources('AWS::ApiGateway::GatewayResponse')).map(
-      (r) => (r as { Properties?: { ResponseType?: string } }).Properties?.ResponseType,
-    );
-    expect(responses).toEqual(expect.arrayContaining(['DEFAULT_4XX', 'DEFAULT_5XX']));
   });
 });
 
 describe('conversation-type retention default', () => {
-  it('every shipped type expires 90 days after last message', () => {
+  // WHAT THIS GUARDS, NARROWED. It used to assert that EVERY shipped type expires at 90 days, which
+  // encoded "no conversation type may ever declare its own retention" - the opposite of what the
+  // dimension is for. Retention per experience is the requirement (SPEC-CONVERSATION-TYPES FR4), so a
+  // type declaring less is the feature working, not a regression.
+  //
+  // The platform-wide default is still worth pinning, because it is what an ORDINARY conversation gets
+  // and changing it silently changes what every deployment retains. So the default is asserted on the
+  // ordinary type, and the bound that applies to every type -
+  // `MAX_CONVERSATION_TTL_DAYS` - is asserted in `no-type-exceeds-the-retention-limit`.
+  it('an ordinary conversation expires nine months after its last message', () => {
+    // ASSERTED AGAINST THE CONSTANT, not against 90. The literal was correct until the two retention
+    // axes were separated: the conversation lifetime moved to nine months while MESSAGE retention stayed
+    // at ninety days, and this test was the thing that caught the change - which is what it is for. A
+    // literal here would have to be edited every time the policy moves, and the edit is where a test
+    // stops describing the policy and starts describing whatever made it pass.
+    for (const key of ['general']) {
+      expect(CONVERSATION_TYPES[key].expiration).toEqual({
+        days: MAX_CONVERSATION_TTL_DAYS,
+        criterion: 'LAST_MESSAGE_TIMESTAMP',
+      });
+    }
+  });
+
+  it('a type that declares its own retention declares LESS, never more', () => {
+    // The direction is the whole point: a type may keep a conversation for a shorter time than the
+    // platform's default and never longer, so data minimization cannot be undone by adding a type.
+    const platformDefault = CONVERSATION_TYPES.general.expiration!.days;
     for (const [key, cfg] of Object.entries(CONVERSATION_TYPES)) {
-      expect(cfg.expiration).toEqual({ days: 90, criterion: 'LAST_MESSAGE_TIMESTAMP' });
+      if (!cfg.expiration) continue;
+      expect(cfg.expiration.days).toBeLessThanOrEqual(platformDefault);
       expect(key).toBeTruthy();
     }
   });

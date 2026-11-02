@@ -14,7 +14,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 
 const STACK = fs.readFileSync(
-  path.join(__dirname, '../../lib/stacks/foundations-stack.ts'),
+  path.join(__dirname, '../../lib/stacks/conversations-stack.ts'),
   'utf8',
 );
 const TASK_CODE = fs.readFileSync(
@@ -44,7 +44,7 @@ describe('task index names line up with the stack', () => {
     const declared = declaredIndexes();
     // Named explicitly rather than derived, so REMOVING a read does not quietly permit removing the
     // index it used - these three each carry a decision.
-    expect(declared).toContain('userSub-taskType-index'); // the type-scoped active lookup
+    expect(declared).toContain('principalId-taskType-index'); // the type-scoped active lookup
     expect(declared).toContain('contextId-index'); // cascade-cancel across a plan
     expect(declared).toContain('channelArn-updatedAt-index'); // ADR-024 D4, what is open in this conversation
   });
@@ -54,8 +54,8 @@ describe('task index names line up with the stack', () => {
     // read consistently, so an IndexName appearing on this query would silently drop the guard that
     // stops a rapid follow-up turn starting a second expensive task.
     // Both list helpers are projections of ONE query; the query - and so the index discipline -
-    // lives in getOwnerChannelTasks, which they delegate to.
-    const fn = TASK_CODE.slice(TASK_CODE.indexOf('export async function getOwnerChannelTasks'));
+    // lives in getAssigneeChannelTasks, which they delegate to.
+    const fn = TASK_CODE.slice(TASK_CODE.indexOf('export async function getAssigneeChannelTasks'));
     const body = fn.slice(0, fn.indexOf('\n}\n'));
     expect(body).toContain('ConsistentRead');
     expect(body).not.toContain('IndexName');

@@ -14,6 +14,9 @@
  *   Wilson, robust at small n).
  * - Continuous metrics use Welch's t-test (unequal variance) → p-value + CI.
  * - Power/MDE uses the standard z-based sample-size formula for ~80% power.
+ * - The unit of analysis is the enrolled conversation (or the duel, for a battle pick): clustered
+ *   observations enter every test through a design effect (`clusterDesignEffect`,
+ *   `proportionDesignEffect`), which keeps the per-exchange point estimate and widens the variance.
  *
  * All math (normal/t CDFs, incomplete beta, log-gamma) is implemented locally so
  * the analytics Lambda pulls in no numeric dependency.
@@ -236,7 +239,13 @@ export interface TwoProportionResult {
  * Fisher's exact two-sided p-value for a 2×2 table. Sums hypergeometric
  * probabilities of all tables (same margins) no more likely than the observed.
  */
-function fisherExactTwoSided(xA: number, nA: number, xB: number, nB: number): number {
+function fisherExactTwoSided(xA0: number, nA0: number, xB0: number, nB0: number): number {
+  // An exact test counts whole observations. A clustered caller passes effective (design-effect-divided)
+  // counts, which are rounded here; integer counts pass through unchanged.
+  const nA = Math.round(nA0);
+  const nB = Math.round(nB0);
+  const xA = Math.min(nA, Math.round(xA0));
+  const xB = Math.min(nB, Math.round(xB0));
   const N = nA + nB;
   const k = xA + xB; // total successes
   const logHyper = (a: number): number => logChoose(nA, a) + logChoose(nB, k - a) - logChoose(N, k);
@@ -377,6 +386,162 @@ export function poolGroups(groups: GroupStat[]): GroupStat {
 }
 
 // ---------------------------------------------------------------------------
+// The unit of analysis: the conversation (§4.2, "the unit of analysis")
+// ---------------------------------------------------------------------------
+//
+// An experiment holds an enrolled CONVERSATION to one arm while it is active (ADR-050), so every counted turn of one conversation
+// is served the same version and shares its person, topic and context. Those turns are not independent
+// observations, and a test that treats them as independent divides the variance by the number of turns
+// when the evidence is closer to the number of conversations: ten turns from one person read as ten
+// people agreeing. The fix is the standard one for clustered data.
+//
+// THE POINT ESTIMATE IS UNCHANGED. Means and rates stay the per-exchange ratio (total over exchanges), so
+// every figure still reconciles row for row with the per-exchange drill-down (§4.3). Only the VARIANCE
+// changes: it is the cluster-robust (sandwich) variance of that ratio, with the conversation as the
+// cluster, and the test's sample size is the number of conversations. Expressed as a design effect
+// (cluster-robust variance over the independent-exchange variance), floored at 1, so the clustered test
+// never claims MORE confidence than the per-exchange one did. When every conversation contributes one
+// exchange the design effect is exactly 1 and the clustered test equals the per-exchange test.
+
+/** Sufficient statistics of one metric over clustered observations, computable in one SQL pass. */
+export interface ClusterMoments {
+  /** Clusters (conversations) with at least one observation. */
+  clusters: number;
+  /** Observations (exchanges) across all clusters. */
+  n: number;
+  /** Sum of the observations. */
+  sum: number;
+  /** Sum of the squared observations. */
+  sumSq: number;
+  /** Sum over clusters of (the cluster's total)^2. */
+  clusterTotalSq: number;
+  /** Sum over clusters of (the cluster's total) x (the cluster's size). */
+  clusterTotalTimesSize: number;
+  /** Sum over clusters of (the cluster's size)^2. */
+  clusterSizeSq: number;
+}
+
+/** The moments of a metric from its observations grouped by cluster (the pure-code twin of the SQL). */
+export function clusterMomentsOf(clusters: number[][]): ClusterMoments {
+  const m: ClusterMoments = { clusters: 0, n: 0, sum: 0, sumSq: 0, clusterTotalSq: 0, clusterTotalTimesSize: 0, clusterSizeSq: 0 };
+  for (const values of clusters) {
+    const obs = values.filter((v) => Number.isFinite(v));
+    if (obs.length === 0) continue;
+    const total = obs.reduce((s, v) => s + v, 0);
+    m.clusters += 1;
+    m.n += obs.length;
+    m.sum += total;
+    m.sumSq += obs.reduce((s, v) => s + v * v, 0);
+    m.clusterTotalSq += total * total;
+    m.clusterTotalTimesSize += total * obs.length;
+    m.clusterSizeSq += obs.length * obs.length;
+  }
+  return m;
+}
+
+/**
+ * The design effect of a clustered mean: the cluster-robust variance of the per-observation mean over its
+ * independent-observation variance, floored at 1.
+ *
+ * Cluster-robust variance of the ratio mean = sum / n (CR1 small-sample factor k/(k-1)):
+ *   V_cr = k/(k-1) x sum_i (T_i - mean x n_i)^2 / n^2
+ * Independent variance: V_iid = s^2 / n, with s^2 the unbiased sample variance. With one observation per
+ * cluster the two are equal, so the design effect is exactly 1. A single cluster carries one observation's
+ * worth of evidence, so its design effect is its size.
+ */
+export function clusterDesignEffect(m: ClusterMoments): number {
+  if (!(m.n >= 2) || !(m.clusters >= 1)) return 1;
+  if (m.clusters < 2) return m.n;
+  const mean = m.sum / m.n;
+  const iidVar = Math.max(0, (m.sumSq - m.n * mean * mean) / (m.n - 1)) / m.n;
+  if (!(iidVar > 0)) return 1;
+  const crSs = Math.max(0, m.clusterTotalSq - 2 * mean * m.clusterTotalTimesSize + mean * mean * m.clusterSizeSq);
+  const crVar = (m.clusters / (m.clusters - 1)) * crSs / (m.n * m.n);
+  return Math.max(1, crVar / iidVar);
+}
+
+/**
+ * Re-express a per-observation stat in cluster units for the Welch test and the power calculation.
+ *
+ * The mean stays the per-observation mean; `n` becomes the number of clusters; `sd` becomes the per-cluster
+ * spread that reproduces the clustered variance (sd_eff^2 / clusters = sd^2 x deff / n). Welch then runs on
+ * clusters - 1 degrees of freedom per side, and `requiredSampleForMean` answers in clusters.
+ */
+export function clusterAdjust(stat: GroupStat, designEffect: number, clusters: number): GroupStat {
+  if (!(stat.n > 0)) return { n: 0, mean: stat.mean, sd: stat.sd };
+  const k = Math.max(0, Math.min(Math.round(clusters), stat.n));
+  if (k === 0) return { n: 0, mean: stat.mean, sd: stat.sd };
+  const deff = Number.isFinite(designEffect) ? Math.max(1, designEffect) : 1;
+  const sd = Number.isFinite(stat.sd) ? stat.sd : 0;
+  return { n: k, mean: stat.mean, sd: sd * Math.sqrt((deff * k) / stat.n) };
+}
+
+/** One cluster of a binary outcome: how many of its `n` observations were successes. */
+export interface ProportionCluster {
+  successes: number;
+  n: number;
+}
+
+/**
+ * The design effect of a clustered proportion (Rao-Scott), floored at 1. Same construction as
+ * {@link clusterDesignEffect}, with the binary outcome's own variance: V_iid = p(1-p) / (N-1), so one
+ * observation per cluster gives exactly 1.
+ */
+export function proportionDesignEffect(clusters: ProportionCluster[]): number {
+  const used = clusters.filter((c) => c.n > 0);
+  const N = used.reduce((s, c) => s + c.n, 0);
+  const X = used.reduce((s, c) => s + c.successes, 0);
+  const k = used.length;
+  if (N < 2 || k < 1) return 1;
+  if (k < 2) return N;
+  const p = X / N;
+  const iidVar = (p * (1 - p)) / (N - 1);
+  if (!(iidVar > 0)) return 1;
+  const ss = used.reduce((s, c) => s + (c.successes - p * c.n) ** 2, 0);
+  const crVar = (k / (k - 1)) * ss / (N * N);
+  return Math.max(1, crVar / iidVar);
+}
+
+/** A clustered two-proportion comparison: the per-observation rates, tested on the effective counts. */
+export interface ClusteredTwoProportionResult extends TwoProportionResult {
+  /** Clusters (conversations) behind each side. */
+  unitsA: number;
+  unitsB: number;
+  /** Observations (votes) behind each side. */
+  nA: number;
+  nB: number;
+  /** The design effect applied to each side. */
+  designEffectA: number;
+  designEffectB: number;
+}
+
+/**
+ * {@link twoProportionTest} with each side's observations clustered (Rao-Scott): each side's counts are
+ * divided by its design effect before the Wilson, Newcombe, z or Fisher machinery runs, which keeps the
+ * small-sample behavior of those methods and widens the interval by exactly the clustering. The rates and
+ * the delta are the per-observation ones. A = the first argument (the treatment, by the callers' convention).
+ */
+export function clusteredTwoProportionTest(a: ProportionCluster[], b: ProportionCluster[]): ClusteredTwoProportionResult {
+  const sum = (cs: ProportionCluster[], f: (c: ProportionCluster) => number) => cs.reduce((s, c) => s + f(c), 0);
+  const xA = sum(a, (c) => c.successes);
+  const nA = sum(a, (c) => c.n);
+  const xB = sum(b, (c) => c.successes);
+  const nB = sum(b, (c) => c.n);
+  const dA = proportionDesignEffect(a);
+  const dB = proportionDesignEffect(b);
+  const r = twoProportionTest(xA / dA, nA / dA, xB / dB, nB / dB);
+  return {
+    ...r,
+    unitsA: a.filter((c) => c.n > 0).length,
+    unitsB: b.filter((c) => c.n > 0).length,
+    nA,
+    nB,
+    designEffectA: dA,
+    designEffectB: dB,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // Power / minimum detectable effect
 // ---------------------------------------------------------------------------
 
@@ -423,6 +588,22 @@ export function requiredSampleForProportion(
     currentN,
     additionalNeeded: Math.max(0, requiredN - currentN),
   };
+}
+
+/**
+ * The smallest gap between a mean and a fixed target that `n` observations with SD `sd` can detect at
+ * ~`power` and two-sided `alpha` (one-sample: n = (zSum·sd/δ)², so δ = zSum·sd/√n). An alert on a judged
+ * mean is only worth raising when the mean sits further from its target than this (SPEC-EVALUATION
+ * Appendix C4). Infinity when there is nothing to measure.
+ */
+export function minimumDetectableDifference(
+  sd: number,
+  n: number,
+  opts: { power?: number; alpha?: number } = {},
+): number {
+  if (!(n > 0) || !(sd >= 0) || !Number.isFinite(sd)) return Infinity;
+  if (sd === 0) return 0;
+  return (powerZ(opts.power ?? 0.8, opts.alpha ?? 0.05) * sd) / Math.sqrt(n);
 }
 
 /**
@@ -511,7 +692,10 @@ export interface HumanPickResult {
 }
 
 /** Two-sided exact binomial p-value for `wins` of `n` against p₀ = 0.5. */
-function binomialTwoSidedP(wins: number, n: number): number {
+function binomialTwoSidedP(wins0: number, n0: number): number {
+  // Whole observations, as in fisherExactTwoSided: a clustered caller's effective counts are rounded.
+  const n = Math.round(n0);
+  const wins = Math.min(n, Math.round(wins0));
   if (n <= 0) return 1;
   const logP = (k: number): number => logChoose(n, k) + n * Math.log(0.5);
   const pObs = logP(wins);
@@ -580,7 +764,7 @@ export const DEFAULT_ACCURACY_MARGIN_PCT = 2;
  *
  * Two classifiers label the same message. Once adjudicated each message falls into one of four cells:
  * both right, both wrong, or exactly one right. **Only the discordant cells carry information about
- * which model is better** - where both agree, the pair cannot favour either, whatever the truth. So the
+ * which model is better** - where both agree, the pair cannot favor either, whatever the truth. So the
  * agreements are dropped and the question becomes: among the messages where exactly one was right, did
  * the challenger win more often than chance?
  *
@@ -602,6 +786,43 @@ export function mcnemarTest(
   const discordant = challengerOnlyRight + incumbentOnlyRight;
   if (discordant <= 0) return null;
   return humanPickTest(challengerOnlyRight, discordant);
+}
+
+/** A binomial preference result computed over clustered observations. */
+export interface ClusteredPickResult extends HumanPickResult {
+  /** Clusters behind `picks` (duels for a battle pick, conversations for a replayed message). */
+  units: number;
+  /** The design effect the interval and p-value were computed under (1 = the clusters were independent). */
+  designEffect: number;
+}
+
+/**
+ * {@link humanPickTest} over clustered observations: each cluster is `{ successes: wins for side A,
+ * n: decisive observations }`. The win rate is the per-observation rate; the interval and the exact
+ * p-value run on the effective counts (Rao-Scott), so several judgments of ONE duel count as roughly one
+ * duel's evidence rather than as independent duels. With one observation per cluster this is exactly
+ * {@link humanPickTest}.
+ */
+export function clusteredHumanPickTest(clusters: ProportionCluster[], z = 1.959963985): ClusteredPickResult {
+  const used = clusters.filter((c) => c.n > 0);
+  const wins = used.reduce((s, c) => s + c.successes, 0);
+  const decisive = used.reduce((s, c) => s + c.n, 0);
+  const deff = proportionDesignEffect(used);
+  const r = humanPickTest(wins / deff, decisive / deff, z);
+  if (decisive <= 0) return { ...r, units: 0, designEffect: 1 };
+  return { ...r, picks: decisive, wins, winRate: wins / decisive, units: used.length, designEffect: deff };
+}
+
+/**
+ * {@link mcnemarTest} with the discordant pairs clustered by conversation: messages of one conversation
+ * share a person and a topic, so their labels are not independent either. Each cluster is
+ * `{ successes: pairs the challenger got right, n: informative discordant pairs }`. Null when no
+ * informative pair exists, as with the unclustered test.
+ */
+export function clusteredMcnemarTest(clusters: ProportionCluster[]): ClusteredPickResult | null {
+  const used = clusters.filter((c) => c.n > 0);
+  if (used.length === 0) return null;
+  return clusteredHumanPickTest(used);
 }
 
 // ---------------------------------------------------------------------------
@@ -649,7 +870,7 @@ export interface GuardrailEval {
   /** Proven past the margin: the CI on the difference lies entirely beyond the bound. Vetoes a ship. */
   breached: boolean;
   /** The guardrail's own direction, carried so a caller can narrate a breach as what it is: a
-   *  `no_worse_than` breach is a regression past a ceiling, an `at_least` breach is a miss of a floor. */
+   *  `no_worse_than` breach is a regression past a maximum, an `at_least` breach is a miss of a minimum. */
   direction?: 'no_worse_than' | 'at_least';
   /** The point estimate alone is within bound. DISPLAY ONLY - never sufficient to ship. */
   pointWithinBound: boolean;
@@ -793,6 +1014,14 @@ export interface VariantStats {
    * absent leaves the gate off. The analytics read supplies it for every variant.
    */
   scoredCount?: number;
+  /**
+   * The unit the GroupStats above are expressed in. `'conversation'` means each `n` counts conversations
+   * and each `sd` is the per-conversation spread that reproduces the cluster-robust variance
+   * ({@link clusterAdjust}); `score.n` then counts conversations with at least one scored exchange, so
+   * power is gated on scored conversations. Absent means `'exchange'`: every exchange an independent
+   * observation, the convention this function had before conversations were the unit.
+   */
+  unit?: 'conversation' | 'exchange';
 }
 
 /**
@@ -932,6 +1161,12 @@ export function evaluateExperimentOutcome(input: {
   objective?: OutcomeObjective;
   /** Head-to-head /battle picks per side (the human axis). */
   battleWins?: { treatment: number; control: number };
+  /**
+   * The same picks grouped by DUEL: one cluster per duel, `successes` the picks for the treatment and `n`
+   * the decisive picks. When present the human axis is tested per duel ({@link clusteredHumanPickTest}),
+   * so several people judging one duel are not counted as independent duels; `battleWins` is then ignored.
+   */
+  battleDuels?: ProportionCluster[];
 }): OutcomeEvaluation {
   const { control, treatment, objective } = input;
   const primaryMetric: ObjectiveMetric = objective?.metric ?? 'quality';
@@ -950,7 +1185,24 @@ export function evaluateExperimentOutcome(input: {
       : welch.delta < 0 ? 'treatment' : 'control';
 
   // Power: MDE tied to objective.target (§4.2-D). Absent/zero target ⇒ N-floor powered.
-  const minN = Math.min(c.n, t.n);
+  //
+  // THE N IS THE MEASUREMENT, NOT THE TRAFFIC, and on a score axis those are different numbers by a
+  // wide margin: judging is a sample and a backlog, so a variant can carry five hundred exchanges
+  // and a handful of scores. Counting exchanges here let one scored exchange out of five hundred
+  // clear the power gate, and the Welch test it cleared ran on a mean of 499 placeholder zeros plus
+  // one real observation. The rule below already refused the all-zero case; this refuses the much
+  // commoner case of nearly-all-zero, which looked powered and was not.
+  //
+  // In conversation units `score.n` already counts scored conversations (see VariantStats.unit), which is
+  // the measurement in the unit the test runs in; `scoredCount` still decides whether anything was scored.
+  const clustered = control.unit === 'conversation' || treatment.unit === 'conversation';
+  const scoredMinN =
+    axis.key === 'score' && control.scoredCount != null && treatment.scoredCount != null
+      ? clustered
+        ? Math.min(c.n, t.n, control.scoredCount, treatment.scoredCount)
+        : Math.min(control.scoredCount, treatment.scoredCount)
+      : null;
+  const minN = scoredMinN ?? Math.min(c.n, t.n);
   let powered = true;
   if (objective && Number.isFinite(objective.target) && objective.target !== 0) {
     const mdeAbs = (Math.abs(objective.target as number) / 100) * Math.abs(c.mean);
@@ -969,9 +1221,11 @@ export function evaluateExperimentOutcome(input: {
   // Scoring coverage is the evidence here, so a comparison needs at least one scored exchange on EACH
   // side; with none, no power claim is possible and the honest state is not powered, which the
   // decision rule reports as keep_running (not enough evidence yet) rather than as an answer.
-  if (axis.key === 'score' && control.scoredCount != null && treatment.scoredCount != null) {
-    if (Math.min(control.scoredCount, treatment.scoredCount) <= 0) powered = false;
-  }
+  //
+  // Kept as its own rule even though `minN` above now counts scores, because the N floor applies
+  // only when the objective names a target: an objective without one would otherwise skip the power
+  // calculation entirely and call two unscored variants equivalent.
+  if (scoredMinN != null && scoredMinN <= 0) powered = false;
 
   const primary: PrimaryEval = {
     metric: axis.label,
@@ -988,7 +1242,10 @@ export function evaluateExperimentOutcome(input: {
   const tWins = input.battleWins?.treatment ?? 0;
   const cWins = input.battleWins?.control ?? 0;
   const decisive = tWins + cWins;
-  const human = decisive > 0 ? humanPickTest(tWins, decisive) : null;
+  const duels = (input.battleDuels ?? []).filter((x) => x.n > 0);
+  const human: HumanPickResult | null = duels.length > 0
+    ? clusteredHumanPickTest(duels)
+    : decisive > 0 ? humanPickTest(tWins, decisive) : null;
   const humanPickWeight = objective?.humanPickWeight ?? 0;
 
   const v = decideVerdict({

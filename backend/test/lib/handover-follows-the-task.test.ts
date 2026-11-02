@@ -1,5 +1,5 @@
 /**
- * ROUTING FOLLOWS THE TASK, NEVER THE TARGET (owner, 2026-08-14).
+ * ROUTING FOLLOWS THE TASK, NEVER THE TARGET (maintainer, 2026-08-14).
  *
  * Whether a person addressed nobody or addressed the wrong assistant is the SAME case. Targeting is a
  * delivery concern the client settled at send - it says who can see a message, not what the message is
@@ -21,6 +21,26 @@ const mockMessagingSend = jest.fn();
 const mockLambdaSend = jest.fn();
 const mockSsmSend = jest.fn();
 
+// THE ASSISTANT SESSION (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION, Phase 1b). Every message this code posts goes out as an assistant on a session the
+// vend mints from a recorded routing decision. Those are unit-tested on their own
+// (`a-turn-acts-as-the-assistant-it-was-routed-to.test.ts`); here the decision is recorded and the
+// session minted without AWS, and the clients stay the mocked ones.
+jest.mock('../../lambda/src/lib/assistant-session', () => {
+  const actual = jest.requireActual('../../lambda/src/lib/assistant-session');
+  const session = (botArn: string) => ({
+    assistant: 'test-assistant', role: 'primary', botArn,
+    credentials: { accessKeyId: 'AKIATEST', secretAccessKey: 'test', sessionToken: 'test' },
+  });
+  return {
+    ...actual,
+    speakAsRoutedAssistant: jest.fn(async (input: { botArn: string }) => session(input.botArn)),
+    sessionForRoutedAssistant: jest.fn(async (input: { botArn: string }) => session(input.botArn)),
+  };
+});
+jest.mock('../../lambda/src/lib/turn-routing', () => ({
+  ...jest.requireActual('../../lambda/src/lib/turn-routing'),
+  recordTurnRouting: jest.fn(async () => undefined),
+}));
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn().mockImplementation(() => ({ send: mockMessagingSend })),
   SendChannelMessageCommand: jest.fn().mockImplementation((args) => ({ __type: 'SendMessage', input: args })),
@@ -43,21 +63,24 @@ jest.mock('@aws-sdk/client-lambda', () => ({
 jest.mock('@aws-sdk/client-ssm', () => ({
   SSMClient: jest.fn().mockImplementation(() => ({ send: mockSsmSend })),
   GetParameterCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetParam', input: args })),
+  // The assignment records the router resolves the turn's assistant from.
+  GetParametersByPathCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetByPath', input: args })),
 }), { virtual: true });
 
 const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/abc';
 const CHANNEL = `${APP}/channel/c1`;
 /** The assistant the message REACHES: this classification's own bot. */
 const BOT_SELF = `${APP}/bot/premium-bot`;
-/** The assistant that OWNS the waiting chain. A sanctioned alt slot, so a handover to it is allowed. */
-const BOT_OWNER = `${APP}/bot/AltSlot0`;
-/** Named by a task but in no roster: the impersonation case. */
+/** The assistant that OWNS the waiting chain. This room's own alt slot, so a handover to it is allowed. */
+const BOT_OWNER = `${APP}/bot/Alt-premium`;
+/** Named by a task but in no assignment record: the impersonation case. */
 const BOT_STRANGER = `${APP}/bot/NotOnTheRoster`;
+/** A REAL, sanctioned alt - of a DIFFERENT classification. Roster membership alone would admit it. */
+const BOT_FOREIGN_ALT = `${APP}/bot/Alt-basic`;
 const HUMAN = `${APP}/user/alice`;
 const principalIdOf = (arn: string) => arn.split('/').pop() || arn;
 
-const ROSTER_PARAM = '/agent-echelon/alt-bot-slots/roster';
-const SELF_FUNCTION = 'AgentEchelonClassification-Premium-AgentHandler';
+const SELF_FUNCTION = 'AgentEchelonAssistants-premium-AgentHandler';
 
 /**
  * THE ENVIRONMENT THIS FILE RUNS THE ROUTER IN, DECLARED RATHER THAN INHERITED.
@@ -75,7 +98,12 @@ const SELF_FUNCTION = 'AgentEchelonClassification-Premium-AgentHandler';
  */
 const ROUTER_ENV: Record<string, string | undefined> = {
   AWS_LAMBDA_FUNCTION_NAME: SELF_FUNCTION,
-  ALT_BOT_SLOTS_ROSTER_PARAM: ROSTER_PARAM,
+  // THE ROOM THIS HANDLER SERVES. The identity guard reads its records, so an unset value
+  // admits no alt at all and every handover below would be refused for the wrong reason.
+  CLASSIFICATION: 'premium',
+  // THE ROLE THIS HANDLER SERVES. The identity guard admits the alt of this (classification, role)
+  // and no other, so an unset role admits no alt and the handover below is refused for the wrong reason.
+  ASSISTANT_ROLE: 'primary',
   ENABLE_LIVE_DRIFT: undefined,
 };
 
@@ -106,17 +134,22 @@ jest.mock('../../lambda/src/lib/abuse-controls.js', () => {
       return true;
     },
     hasCorrelationClaim: async (key: string) => mockAlreadyClaimed.has(key),
+    // The gate admits: it fails closed with no control table (abuse-controls.test.ts pins that).
+    evaluateAbuseGate: async () => ({ allowed: true }),
   };
 }, { virtual: true });
 
-/** The variant bound to a slot, which is the name a duel shows in the channel. */
+/** The treatment side of the challenger's battle, which is the name a duel shows in the channel. */
 const mockResolveVariant = jest.fn();
 
 jest.mock('../../lambda/src/lib/experiment-manager.js', () => {
   const actual = jest.requireActual('../../lambda/src/lib/experiment-manager.js');
   return {
     ...actual,
-    resolveBattleVariantBySlotArn: (...a: unknown[]) => mockResolveVariant(...a),
+    resolveBattleTreatment: (...a: unknown[]) => mockResolveVariant(...a),
+    // ONE READ answers both duel sides and whether the duel's experiment is active. Active here; an ended
+    // one ends the duel (an-ended-experiment-releases-its-conversations).
+    resolveBattleSides: async (...a: unknown[]) => ({ active: true, control: null, treatment: await mockResolveVariant(...a) }),
   };
 }, { virtual: true });
 
@@ -158,7 +191,7 @@ jest.mock('../../lambda/src/lib/task-tracking.js', () => {
     },
     // The same one query, in the shape the router reads it: live work plus anything that ended here
     // recently. These tests model no finished work, so the second list is always empty.
-    getOwnerChannelTasks: async (...a: unknown[]) => {
+    getAssigneeChannelTasks: async (...a: unknown[]) => {
       const list = await mockGetActiveTasksForOwnerInChannel(...a);
       if (list !== undefined) return { live: list, recentlyEnded: [] };
       const t = await mockGetActiveTaskForOwner(...a);
@@ -178,13 +211,33 @@ const invokes = () => mockLambdaSend.mock.calls
     payload: JSON.parse(Buffer.from(c.input.Payload).toString()),
   }));
 
-/** The turn handed to another assistant, or undefined when nothing was handed over. */
-const handover = () => invokes().find((i) => i.payload?.aeTurn?.handedOverFrom)?.payload.aeTurn;
+/** A posted HANDOVER message (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION §3.4): marked in its Metadata. */
+const isHandoverPost = (c: any) => c?.__type === 'SendMessage' && String(c.input?.Metadata || '').includes('"aeHandover"');
 
-/** Every message this turn POSTED itself (as opposed to returned for Amazon Chime SDK to materialise). */
+/**
+ * The handover this turn posted, or undefined when nothing was handed over. A handover is a MESSAGE
+ * targeted at the owning assistant, never an invoke: read back here in the shape the old payload had, so
+ * each assertion still says what reached the owner.
+ */
+const handover = () => {
+  const c = mockMessagingSend.mock.calls.map((x) => x[0]).find(isHandoverPost);
+  if (!c) return undefined;
+  const marker = JSON.parse(c.input.Metadata).aeHandover;
+  const content = decodeURIComponent(c.input.Content as string);
+  return {
+    botArn: c.input.Target?.[0]?.MemberArn as string,
+    fromBotArn: c.input.ChimeBearer as string,
+    userMessage: content.replace(/^\s*\.<[^<>\n]{1,128}>\s?/, ''),
+    senderArn: marker.personSenderArn as string,
+    userMessageId: marker.personMessageId as string,
+    kind: marker.kind as string,
+  };
+};
+
+/** Every message this turn POSTED itself, other than the handover (which only the owner can read). */
 const posts = () => mockMessagingSend.mock.calls
   .map((c) => c[0])
-  .filter((c) => c?.__type === 'SendMessage')
+  .filter((c) => c?.__type === 'SendMessage' && !isHandoverPost(c))
   .map((c) => c.input as { Content: string; Target?: Array<{ MemberArn: string }> });
 
 /** A task the PERSON holds, blocked on them, belonging to `assistantId`. */
@@ -194,7 +247,7 @@ const heldTask = (assistantId: string | undefined, taskId = 't-waiting') => ({
   taskState: 'collecting_requirements',
   channelArn: CHANNEL,
   status: 'in_progress',
-  userSub: principalIdOf(HUMAN),
+  personId: principalIdOf(HUMAN),
   ...(assistantId ? { assistantId } : {}),
 });
 
@@ -229,11 +282,13 @@ describe('a message answering another assistant\'s work is handed to that assist
 
     applyEnv(ROUTER_ENV);
 
-    // The roster is what makes an identity sanctionable, so it is mocked per-parameter rather than
-    // blanket: a blanket mock would make the security test below pass for the wrong reason.
-    mockSsmSend.mockImplementation(async (cmd: { input?: { Name?: string } }) =>
-      cmd?.input?.Name === ROSTER_PARAM
-        ? { Parameter: { Value: JSON.stringify([{ slotId: 'AltSlot0', botArn: BOT_OWNER }]) } }
+    // The assignment records are what make an identity sanctionable, so they are mocked per-command
+    // rather than blanket: a blanket mock would make the security test below pass for the wrong reason.
+    mockSsmSend.mockImplementation(async (cmd: { __type?: string; input?: { Name?: string } }) =>
+      // THE ASSIGNMENT RECORDS, as the deployment publishes them: the owner's bot is premium's alt,
+      // which is what lets the router run its turn (on the primary's profile) rather than decline it.
+      cmd?.__type === 'GetByPath'
+        ? { Parameters: [{ Value: JSON.stringify({ botArn: BOT_OWNER, role: 'primary', occupancy: 'alt', assistant: 'alt-primary' }) }] }
         : { Parameter: { Value: BOT_SELF } });
 
     mockMessagingSend.mockImplementation(async (cmd: { __type?: string }) => {
@@ -263,8 +318,8 @@ describe('a message answering another assistant\'s work is handed to that assist
 
   describe('when the chain belongs to a DIFFERENT assistant', () => {
     beforeEach(() => {
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OWNER)) : null);
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OWNER)) : null);
     });
 
     it('hands the turn to the assistant the task names', async () => {
@@ -272,8 +327,12 @@ describe('a message answering another assistant\'s work is handed to that assist
 
       const handed = handover();
       expect(handed).toBeTruthy();
-      expect(handed.botArn).toBe(BOT_OWNER);
-      expect(handed.handedOverFrom).toBe(principalIdOf(BOT_SELF));
+      expect(handed!.botArn).toBe(BOT_OWNER);
+      // FROM this assistant, as its own bearer: the receiver reads the sender off the message, not a payload.
+      expect(handed!.fromBotArn).toBe(BOT_SELF);
+      expect(handed!.kind).toBe('task');
+      // AND NO INVOKE OF ANOTHER ASSISTANT'S TURN: the router never starts one itself.
+      expect(invokes().filter((i) => i.payload?.aeTurn?.trigger === 'handover')).toHaveLength(0);
     });
 
     it('carries the person\'s actual message, not a summary of it', async () => {
@@ -281,9 +340,9 @@ describe('a message answering another assistant\'s work is handed to that assist
 
       // The owning assistant has to run the turn on what the person SAID. Anything reconstructed here
       // would make the handover a second interpretation of the message, and the two would diverge.
-      expect(handover().userMessage).toBe('the audience is engineering leadership');
-      expect(handover().senderArn).toBe(HUMAN);
-      expect(handover().userMessageId).toBe('m-1');
+      expect(handover()!.userMessage).toBe('the audience is engineering leadership');
+      expect(handover()!.senderArn).toBe(HUMAN);
+      expect(handover()!.userMessageId).toBe('m-1');
     });
 
     it('does NOT absorb the answer into a chain it does not own', async () => {
@@ -303,12 +362,14 @@ describe('a message answering another assistant\'s work is handed to that assist
       // Targeted by the CODE. The inbound here is untargeted, so inheritance would have broadcast it -
       // telling the whole channel about a message it never saw.
       expect(receipts[0].Target).toEqual([{ MemberArn: HUMAN }]);
-      // By the name the person SEES. In a duel that is the variant's, resolved here as "Atlas".
+      // By the name the person SEES. In a duel that is the side's profile name, resolved here as "Atlas".
       expect(decodeURIComponent(receipts[0].Content)).toContain('Atlas');
+      // The challenger is named by assistant id; its bot is the one its assignment record names.
+      expect(mockResolveVariant).toHaveBeenCalledWith('alt-primary-premium');
     });
 
     it('never names the assistant by its principal id', async () => {
-      // `AltSlot0` is a slot in a pool, not a name anyone has been shown. Printing it in the one
+      // A bot's principal id is not a name anyone has been shown. Printing it in the one
       // message whose job is to say where the answer went names something the person has never seen.
       mockResolveVariant.mockResolvedValue(null);
 
@@ -323,7 +384,7 @@ describe('a message answering another assistant\'s work is handed to that assist
     it('says nothing through Lex, so the receipt is not doubled', async () => {
       const response = await routerHandler(turn());
 
-      // Amazon Chime SDK materialises a message from whatever the fulfillment returns. Returning the
+      // Amazon Chime SDK materializes a message from whatever the fulfillment returns. Returning the
       // receipt here as well as posting it is two receipts, and the returned one would carry the
       // inbound's targeting rather than the one the rule requires.
       expect(response.messages ?? []).toHaveLength(0);
@@ -356,8 +417,8 @@ describe('a message answering another assistant\'s work is handed to that assist
 
   describe('what must NOT be handed over', () => {
     it('answers its own chain rather than handing it anywhere', async () => {
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_SELF)) : null);
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_SELF)) : null);
 
       await routerHandler(turn());
 
@@ -372,8 +433,8 @@ describe('a message answering another assistant\'s work is handed to that assist
       // a message that was meant here.
       // The person holds BOTH sides' chains; the list is newest-first, so the other side's is the
       // newest and "the active task" as an implicit notion would name it.
-      mockGetActiveTasksForOwnerInChannel.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN)
+      mockGetActiveTasksForOwnerInChannel.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN)
           ? [heldTask(principalIdOf(BOT_OWNER), 't-theirs'), heldTask(principalIdOf(BOT_SELF), 't-mine')]
           : []);
 
@@ -385,9 +446,9 @@ describe('a message answering another assistant\'s work is handed to that assist
 
     it('does not hand over a chain with no assistant recorded', async () => {
       // A row written before `assistantId` existed. Nobody is named, so there is nobody to hand it to,
-      // and the receiving assistant answering is the only behaviour that is not a dead end.
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(undefined) : null);
+      // and the receiving assistant answering is the only behavior that is not a dead end.
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(undefined) : null);
 
       await routerHandler(turn());
 
@@ -395,31 +456,49 @@ describe('a message answering another assistant\'s work is handed to that assist
       expect(mockApplyUserResponseToTask).toHaveBeenCalled();
     });
 
-    it('REFUSES an assistant this deployment does not sanction, and answers instead of dropping', async () => {
+    it('REFUSES an assistant this deployment does not sanction, and does not answer in its place', async () => {
       // The impersonation seam. A task carrying a junk or foreign `assistantId` must not be able to
       // make this handler invoke a turn as an arbitrary bot in the app instance - `isSanctionedBattleBot`
       // is the same gate that guards a caller-supplied identity, and this is the path that reaches it
       // from stored data rather than from a caller.
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_STRANGER)) : null);
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_STRANGER)) : null);
 
       await routerHandler(turn());
 
       expect(handover()).toBeUndefined();
       // No handover RECEIPT, which is the message that would have promised the person an answer from
-      // an assistant this deployment never dispatched to. The turn's own acknowledgement is a different
-      // message and is expected.
+      // an assistant this deployment never dispatched to.
       expect(posts().filter((p) => p.Target)).toHaveLength(0);
-      // Refusing to hand over is not refusing to answer: the person still gets a turn.
-      expect(mockApplyUserResponseToTask).toHaveBeenCalled();
+      // A FAILED HANDOVER DOES NOT ANSWER AND DOES NOT REASSIGN. Applying the
+      // response as this assistant would move the chain onto it; dispatching a worker would answer work
+      // this assistant does not own.
+      expect(mockApplyUserResponseToTask).not.toHaveBeenCalled();
+      expect(invokes().filter((i) => !i.payload?.aeTurn)).toHaveLength(0);
+    });
+
+    it('REFUSES an assistant that is sanctioned, but for ANOTHER classification', async () => {
+      // `BOT_FOREIGN_ALT` is a real alt - just not this room's: basic's, which premium's records do not
+      // name. Answering a premium conversation with it would reach what premium reaches. An assistant
+      // acts in exactly one classification (ADR-042); the guard reads only this classification's
+      // records, so this is refused exactly like a stranger.
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_FOREIGN_ALT)) : null);
+
+      await routerHandler(turn());
+
+      expect(handover()).toBeUndefined();
+      expect(posts().filter((p) => p.Target)).toHaveLength(0);
+      expect(mockApplyUserResponseToTask).not.toHaveBeenCalled();
+      expect(invokes().filter((i) => !i.payload?.aeTurn)).toHaveLength(0);
     });
 
     it('never hands over a turn that ARRIVED by handover', async () => {
       // The loop bound, and it is structural rather than a counter each side declares for itself -
       // which is the weakness ADR-023's hop cap has, measured on the deployment. Exercised with a task
       // that still names another assistant, so the guard cannot pass by the branch being unreachable.
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OWNER)) : null);
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OWNER)) : null);
 
       await routerHandler(turn({ botArn: BOT_OWNER, handedOverFrom: principalIdOf(BOT_SELF) }));
 
@@ -439,8 +518,8 @@ describe('a message answering another assistant\'s work is handed to that assist
   // because nobody could.
   describe('answering a chain the person holds also resumes the duel side', () => {
     beforeEach(() => {
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_SELF)) : null);
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_SELF)) : null);
       mockResolveActiveBattle.mockResolvedValue({ battleId: 'b-1', initiatorUserSub: principalIdOf(HUMAN) });
       mockReadBattleRows.mockResolvedValue([
         { battleId: 'b-1', botArn: BOT_SELF, state: 'WAITING_FOR_USER' },
@@ -505,8 +584,8 @@ describe('a message answering another assistant\'s work is handed to that assist
   // "the first handover stands", so no invoke was ever issued and nobody answered the person at all.
   describe('the receipt follows the dispatch that makes it true', () => {
     beforeEach(() => {
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OWNER)) : null);
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OWNER)) : null);
     });
 
     /** The receipt: the only message this turn TARGETS at the person. */
@@ -524,20 +603,22 @@ describe('a message answering another assistant\'s work is handed to that assist
       return at < 0 ? Number.POSITIVE_INFINITY : mock.mock.invocationCallOrder[at];
     };
 
-    const isHandoverInvoke = (c: any) => c?.__type === 'Invoke'
-      && JSON.parse(Buffer.from(c.input.Payload).toString())?.aeTurn?.handedOverFrom;
-
-    /** The owning assistant's Lambda is unreachable; the worker dispatch still works. */
-    const handoverDispatchFails = () => mockLambdaSend.mockImplementation(async (cmd: any) => {
-      if (isHandoverInvoke(cmd)) throw new Error('Lambda unavailable');
-      return { Payload: Buffer.from(JSON.stringify({ messages: [] })) };
-    });
+    /** The handover cannot be posted; everything else the turn sends still works. */
+    let workingMessaging: ((cmd: any) => unknown) | undefined;
+    const handoverDispatchFails = () => {
+      const original = mockMessagingSend.getMockImplementation();
+      workingMessaging = original;
+      mockMessagingSend.mockImplementation(async (cmd: any) => {
+        if (isHandoverPost(cmd)) throw new Error('Chime unavailable');
+        return original ? original(cmd) : {};
+      });
+    };
 
     it('dispatches before it tells the person where their answer went', async () => {
       await routerHandler(turn());
 
-      expect(orderOf(mockLambdaSend, isHandoverInvoke))
-        .toBeLessThan(orderOf(mockMessagingSend, (c) => c?.__type === 'SendMessage'));
+      expect(orderOf(mockMessagingSend, isHandoverPost))
+        .toBeLessThan(orderOf(mockMessagingSend, (c) => c?.__type === 'SendMessage' && !isHandoverPost(c)));
     });
 
     it('says nothing about a handover that did not happen', async () => {
@@ -548,12 +629,16 @@ describe('a message answering another assistant\'s work is handed to that assist
       // THE DISPATCH WAS ATTEMPTED, asserted first because everything below it is also true of a turn
       // that never reached the handover at all. Without this the test passes on a mislabelled task, a
       // stale lookup, or a branch that stopped being reachable, and reports the ordering as sound.
-      expect(mockLambdaSend.mock.calls.some((c) => isHandoverInvoke(c[0]))).toBe(true);
+      expect(mockMessagingSend.mock.calls.some((c) => isHandoverPost(c[0]))).toBe(true);
       // The receipt names an assistant and promises its reply. Sent for a dispatch that threw, it is
       // a message the person can only read as an answer being on its way from someone it is not.
       expect(receipts()).toHaveLength(0);
-      // And the fallback still stands: refusing to promise is not refusing to answer.
-      expect(mockApplyUserResponseToTask).toHaveBeenCalled();
+      // AND NOBODY ANSWERS IN THE OWNER'S PLACE. The chain stays with its owner and
+      // the person is told the owner could not be reached, rather than being answered by an assistant
+      // that does not own the work.
+      expect(mockApplyUserResponseToTask).not.toHaveBeenCalled();
+      expect(invokes().filter((i) => !i.payload?.aeTurn)).toHaveLength(0);
+      expect(posts().some((p) => decodeURIComponent(p.Content).includes("couldn't reach"))).toBe(true);
     });
 
     it('leaves a failed handover for the redelivery to make', async () => {
@@ -564,6 +649,8 @@ describe('a message answering another assistant\'s work is handed to that assist
       mockMessagingSend.mockClear();
       mockApplyUserResponseToTask.mockClear();
       mockLambdaSend.mockResolvedValue({ Payload: Buffer.from(JSON.stringify({ messages: [] })) });
+      if (workingMessaging) mockMessagingSend.mockImplementation(workingMessaging as any);
+      else mockMessagingSend.mockReset();
 
       await routerHandler(turn());
 
@@ -596,8 +683,8 @@ describe('a message answering another assistant\'s work is handed to that assist
       // The receiving assistant already told the person, naming this one as the assistant acting. A
       // second receipt says the same message was picked up twice, by two assistants, and the second
       // contradicts the first about who is doing the work.
-      mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-        ownerId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OWNER)) : null);
+      mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+        assigneeId === principalIdOf(HUMAN) ? heldTask(principalIdOf(BOT_OWNER)) : null);
 
       await routerHandler(turn({ botArn: BOT_OWNER, handedOverFrom: principalIdOf(BOT_SELF) }));
 

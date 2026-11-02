@@ -2,7 +2,7 @@
  * Spec-to-e2e coverage: the parser, the rules, and the rendered matrix.
  *
  * WHY THIS EXISTS. Every spec document carries a machine-readable `**Status:**` line, and a document
- * that says `Implemented` is read as a promise that the behaviour works. Nothing connected that claim
+ * that says `Implemented` is read as a promise that the behavior works. Nothing connected that claim
  * to a test. The mapping lived in one person's head and in four specs that happened to name their e2e
  * file in prose, so "is this covered?" was answerable only by re-deriving it - which is how a coverage
  * matrix gets written twice, disagrees with itself, and is trusted anyway.
@@ -16,7 +16,7 @@
  *
  * WHAT IT PROVES, EXACTLY. That a named e2e spec file EXISTS for a claim. Not that the test is good,
  * not that it ran on the last execution (a credential-gated test that skipped still reads as covered),
- * and not that it asserts anything meaningful. It is the floor, not the ceiling - a spec can declare
+ * and not that it asserts anything meaningful. It is the minimum, not the maximum - a spec can declare
  * `none - <reason>` and the reason is recorded in the matrix rather than argued about in review. What
  * the guard removes is the third option: saying nothing.
  *
@@ -33,6 +33,15 @@
  */
 import * as fs from 'fs';
 import * as path from 'path';
+import { renderDenyTestInventory, type DenyTestRow } from './deny-test-inventory';
+
+/** The deny-test inventory the matrix renders as its last section, and how a row is judged present. */
+export interface DenyTestSection {
+  rows: readonly DenyTestRow[];
+  present: (row: DenyTestRow) => boolean;
+  /** True when a repository-relative file exists. */
+  fileExists: (file: string) => boolean;
+}
 
 /** Where the spec corpus lives, relative to the repo root. */
 export const SPECS_DIR = path.join('docs', 'specs');
@@ -41,13 +50,13 @@ export const E2E_DIR = path.join('tests', 'e2e');
 /** The generated matrix, relative to the repo root. */
 export const MATRIX_PATH = path.join('docs', 'reference', 'e2e-coverage-matrix.md');
 
-/** Documents in the spec tree that are navigation, not claims about behaviour. */
+/** Documents in the spec tree that are navigation, not claims about behavior. */
 const NON_SPEC_FILES = new Set(['_README.md']);
 
 /**
  * How a spec's `Status:` line reads, reduced to the only distinction the guard acts on.
  *
- * `implemented` and `partial` are claims that some behaviour is live, so an unnamed coverage decision
+ * `implemented` and `partial` are claims that some behavior is live, so an unnamed coverage decision
  * is a gap. `design` documents describe something not built, where "no test" is the expected answer -
  * they still have to SAY so, because a design doc that quietly ships is exactly how an untested
  * feature reaches a deployment.
@@ -55,7 +64,7 @@ const NON_SPEC_FILES = new Set(['_README.md']);
 export type StatusClass = 'implemented' | 'partial' | 'design' | 'unknown';
 
 export interface SpecRecord {
-  /** Repo-relative path with forward slashes, e.g. `docs/specs/ops/SPEC-ABUSE-CONTROLS.md`. */
+  /** Repo-relative path with forward slashes, e.g. `docs/specs/interaction/governance/SPEC-ABUSE-CONTROLS.md`. */
   path: string;
   /** The `# ` heading, or the filename when a document has none. */
   title: string;
@@ -97,12 +106,23 @@ export function listSpecDocs(repoRoot: string): string[] {
   return out.sort();
 }
 
+/**
+ * Files that live beside the e2e specs and are NOT coverage.
+ *
+ * `queue-demo.spec.ts` is a manual walkthrough: it is gated behind `QUEUE_DEMO=1`, excluded from the
+ * chat project's `testIgnore`, and ends by handing the browser to a person. It never runs unattended
+ * and it asserts almost nothing. Counting it here would add a file and a test to the headline this
+ * repo publishes as its e2e coverage, which is the same overclaim as counting a skipped spec - and
+ * this file exists to stop exactly that.
+ */
+const NOT_COVERAGE = new Set(['queue-demo.spec.ts']);
+
 /** Every e2e spec file, as the `tests/`-relative path a `Coverage:` line names. */
 export function listE2eSpecs(repoRoot: string): string[] {
   const dir = path.join(repoRoot, E2E_DIR);
   return fs
     .readdirSync(dir)
-    .filter((f) => f.endsWith('.spec.ts'))
+    .filter((f) => f.endsWith('.spec.ts') && !NOT_COVERAGE.has(f))
     .map((f) => `e2e/${f}`)
     .sort();
 }
@@ -284,6 +304,7 @@ export function renderCoverageMatrix(
   specs: SpecRecord[],
   e2eSpecs: string[],
   testCount: (e2eSpec: string) => number,
+  denyTests: DenyTestSection,
 ): string {
   const lines: string[] = [];
   const covered = specs.filter((s) => s.coverage.length > 0);
@@ -315,7 +336,7 @@ export function renderCoverageMatrix(
   lines.push(`| Spec documents | ${specs.length} |`);
   lines.push(`| ...naming at least one e2e spec | ${covered.length} |`);
   lines.push(`| ...declaring none, with a reason | ${uncovered.length} |`);
-  lines.push(`| Documents claiming live behaviour (Implemented / Partial) | ${liveClaims.length} |`);
+  lines.push(`| Documents claiming live behavior (Implemented / Partial) | ${liveClaims.length} |`);
   lines.push(`| ...of those, with no e2e spec | ${liveUncovered.length} |`);
   lines.push(`| e2e spec files | ${e2eSpecs.length} |`);
   lines.push(`| e2e tests declared | ${totalTests} |`);
@@ -356,5 +377,6 @@ export function renderCoverageMatrix(
     }
   }
   lines.push('');
+  lines.push(...renderDenyTestInventory(denyTests.rows, denyTests.present, denyTests.fileExists));
   return lines.join('\n');
 }

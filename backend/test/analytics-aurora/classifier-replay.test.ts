@@ -18,14 +18,22 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
 }));
 
 // The real fast-path predicate, deliberately NOT mocked: the exclusion it drives has to agree with
-// the classifier's own behaviour, and stubbing it would test a copy of the rule instead of the rule.
+// the classifier's own behavior, and stubbing it would test a copy of the rule instead of the rule.
 jest.mock('../../lambda/src/lib/intent-classifier', () => {
   const actual = jest.requireActual('../../lambda/src/lib/intent-classifier');
   return { ...actual, classifyIntent: mockClassify };
 });
 
+// THIS FUNCTION'S CLASSIFICATION. Each replay function serves one, from its environment, and refuses a
+// run of any other (tenet D12). `standard` allows both `haiku` and `sonnet`.
+process.env.REPLAY_CLASSIFICATION = 'standard';
 // eslint-disable-next-line @typescript-eslint/no-var-requires
-const { startClassifierReplay, openClassifierReplay, adjudicateReplayLabel, listReplayLabels } =
+const { DEFAULT_INTENT_PACK } = require('../../lambda/src/lib/intent-pack');
+/** What every run names: its classification and the served pack both candidates classify against. */
+const RUN = { classification: 'standard', intentPack: DEFAULT_INTENT_PACK };
+
+// eslint-disable-next-line @typescript-eslint/no-var-requires
+const { startClassifierReplay, openClassifierReplay, adjudicateReplayLabel, listReplayLabels, executeClassifierReplay } =
   require('../../lambda/src/analytics-aurora/classifier-replay');
 // eslint-disable-next-line @typescript-eslint/no-var-requires
 const replayHandler = require('../../lambda/src/analytics-aurora/classifier-replay-handler');
@@ -82,7 +90,7 @@ describe('startClassifierReplay: what it refuses to replay', () => {
       candidate({ exchange_id: 'ex-3', retracted: true }),
     ]);
 
-    const out = await startClassifierReplay({ incumbentModel: 'haiku', challengerModel: 'sonnet' });
+    const out = await startClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' });
 
     expect(out.status).toBe('complete');
     expect(out.messagesConsidered).toBe(3);
@@ -107,7 +115,7 @@ describe('startClassifierReplay: what it refuses to replay', () => {
       candidate({ exchange_id: 'ex-4', content: 'what is our refund policy?' }),
     ]);
 
-    const out = await startClassifierReplay({ incumbentModel: 'haiku', challengerModel: 'sonnet' });
+    const out = await startClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' });
 
     expect(out.messagesFastPath).toBe(3);
     expect(out.messagesReplayed).toBe(1);
@@ -120,7 +128,7 @@ describe('startClassifierReplay: what it refuses to replay', () => {
       candidate({ exchange_id: 'ex-2', content: '   ' }),
       candidate({ exchange_id: 'ex-3' }),
     ]);
-    const out = await startClassifierReplay({ incumbentModel: 'haiku', challengerModel: 'sonnet' });
+    const out = await startClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' });
     // '   ' trims to empty, which the fast path answers as a greeting rather than sending to a model.
     expect(out.messagesReplayed).toBe(1);
     expect(labelWrites).toHaveLength(1);
@@ -130,7 +138,7 @@ describe('startClassifierReplay: what it refuses to replay', () => {
     // The audit table records only WHO acted, is written best-effort, and is keyed on the Chime
     // message id rather than the messages PK. The sibling row is the authority.
     primeQueries([candidate()]);
-    await startClassifierReplay({ incumbentModel: 'haiku', challengerModel: 'sonnet' });
+    await startClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' });
     const selectSql = mockQuery.mock.calls.map((c) => String(c[0])).find((s) => /FROM exchanges e/.test(s))!;
     expect(selectSql).toContain('REDACT_CHANNEL_MESSAGE');
     expect(selectSql).toContain('DELETE_CHANNEL_MESSAGE');
@@ -144,7 +152,7 @@ describe('startClassifierReplay: the pairing and the window', () => {
     // conclusion needs far less traffic than a split. Classifying different messages would throw it
     // away silently and still produce a plausible-looking result.
     primeQueries([candidate({ content: 'draft the Q3 summary' })]);
-    await startClassifierReplay({ incumbentModel: 'haiku', challengerModel: 'sonnet' });
+    await startClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' });
 
     expect(mockClassify).toHaveBeenCalledTimes(2);
     const [firstMsg, firstOpts] = mockClassify.mock.calls[0];
@@ -174,13 +182,14 @@ describe('startClassifierReplay: the pairing and the window', () => {
     // variant: confirm the model is in the catalog at the point it is selected.
     primeQueries([candidate()]);
     await expect(
-      startClassifierReplay({ incumbentModel: 'haiku', challengerModel: 'gpt-9-turbo' }),
+      startClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'gpt-9-turbo' }),
     ).rejects.toThrow(/not a model catalog key/);
   });
 
   it('records the window on the run, because a stale corpus is not evidence about today', async () => {
     primeQueries([candidate()]);
     const out = await startClassifierReplay({
+      ...RUN,
       incumbentModel: 'haiku',
       challengerModel: 'sonnet',
       windowDays: 7,
@@ -197,7 +206,7 @@ describe('startClassifierReplay: the pairing and the window', () => {
       .mockResolvedValueOnce({ intent: 'general', confidence: 'medium' })
       .mockResolvedValueOnce({ intent: 'data_extraction', confidence: 'high' });
 
-    await startClassifierReplay({ incumbentModel: 'haiku', challengerModel: 'sonnet' });
+    await startClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' });
 
     expect(labelWrites).toHaveLength(2);
     expect(labelWrites[0][5]).toBe(true);
@@ -208,13 +217,13 @@ describe('startClassifierReplay: the pairing and the window', () => {
     // Not a spend guard: it would produce a corpus of agreements and an "indistinguishable" verdict
     // that says nothing about anything.
     await expect(
-      startClassifierReplay({ incumbentModel: 'haiku', challengerModel: 'haiku' }),
+      startClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'haiku' }),
     ).rejects.toThrow(/must differ/);
     expect(mockQuery).not.toHaveBeenCalled();
   });
 
   it('requires both models', async () => {
-    await expect(startClassifierReplay({ incumbentModel: '', challengerModel: 'sonnet' })).rejects.toThrow();
+    await expect(startClassifierReplay({ ...RUN, incumbentModel: '', challengerModel: 'sonnet' })).rejects.toThrow();
   });
 });
 
@@ -234,6 +243,7 @@ describe('opening a run under a CALLER-SUPPLIED id', () => {
     });
 
     const out = await openClassifierReplay({
+      ...RUN,
       incumbentModel: 'haiku',
       challengerModel: 'sonnet',
       runId: 'supplied-run-id',
@@ -245,7 +255,7 @@ describe('opening a run under a CALLER-SUPPLIED id', () => {
 
   it('still lets the database mint one when no id is supplied', async () => {
     mockQuery.mockResolvedValue({ rows: [{ id: 'db-minted' }] });
-    const out = await openClassifierReplay({ incumbentModel: 'haiku', challengerModel: 'sonnet' });
+    const out = await openClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' });
     expect(out.runId).toBe('db-minted');
   });
 
@@ -254,6 +264,7 @@ describe('opening a run under a CALLER-SUPPLIED id', () => {
     // the second time; reading that as "failed to open" would mark a perfectly good run as broken.
     mockQuery.mockResolvedValue({ rows: [] });
     const out = await openClassifierReplay({
+      ...RUN,
       incumbentModel: 'haiku',
       challengerModel: 'sonnet',
       runId: 'already-there',
@@ -264,7 +275,7 @@ describe('opening a run under a CALLER-SUPPLIED id', () => {
   it('fails loudly when there is no id from either side', async () => {
     mockQuery.mockResolvedValue({ rows: [] });
     await expect(
-      openClassifierReplay({ incumbentModel: 'haiku', challengerModel: 'sonnet' }),
+      openClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' }),
     ).rejects.toThrow(/failed to open/);
   });
 });
@@ -279,13 +290,14 @@ describe('the batch handler opens the run it was asked to open', () => {
         return { rows: [{
           id: 'run-9', experiment_id: null, incumbent_model: 'haiku', challenger_model: 'sonnet',
           window_start: new Date().toISOString(), window_end: new Date().toISOString(),
+          classification: 'standard', assistant: 'analyst', intent_pack: DEFAULT_INTENT_PACK,
         }] };
       }
       if (/FROM exchanges e/.test(sql)) return { rows: [] };
       return { rows: [] };
     });
 
-    await replayHandler.handler({ runId: 'run-9', limit: 5, open: { incumbentModel: 'haiku', challengerModel: 'sonnet' } });
+    await replayHandler.handler({ runId: 'run-9', limit: 5, open: { ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' } });
 
     // The order matters: executing first would read a run that does not exist yet and record a
     // failure against an id whose row is about to appear.
@@ -299,6 +311,7 @@ describe('the batch handler opens the run it was asked to open', () => {
         return { rows: [{
           id: 'run-9', experiment_id: null, incumbent_model: 'haiku', challenger_model: 'sonnet',
           window_start: new Date().toISOString(), window_end: new Date().toISOString(),
+          classification: 'standard', assistant: 'analyst', intent_pack: DEFAULT_INTENT_PACK,
         }] };
       }
       return { rows: [] };
@@ -317,7 +330,7 @@ describe('the batch handler opens the run it was asked to open', () => {
     });
 
     await expect(
-      replayHandler.handler({ runId: 'run-9', open: { incumbentModel: 'haiku', challengerModel: 'sonnet' } }),
+      replayHandler.handler({ runId: 'run-9', open: { ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' } }),
     ).rejects.toThrow(/aurora unavailable/);
   });
 });
@@ -332,7 +345,7 @@ describe('startClassifierReplay: failure', () => {
       return { rows: [] };
     });
 
-    const out = await startClassifierReplay({ incumbentModel: 'haiku', challengerModel: 'sonnet' });
+    const out = await startClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' });
     expect(out.status).toBe('failed');
     expect(out.error).toMatch(/aurora unavailable/);
     expect(String(updateParams)).toMatch(/aurora unavailable/);
@@ -342,7 +355,7 @@ describe('startClassifierReplay: failure', () => {
 describe('adjudication', () => {
   it('will not accept a ruling on a CONCORDANT pair', async () => {
     // A concordant pair carries no comparative signal whatever the truth, so a ruling on one is
-    // labelling effort that moves no number - and accepting it would imply the queue was incomplete.
+    // labeling effort that moves no number - and accepting it would imply the queue was incomplete.
     mockQuery.mockResolvedValue({ rows: [], rowCount: 0 });
     const res = await adjudicateReplayLabel({
       labelId: 'label-1',
@@ -410,5 +423,93 @@ describe('replay to gate, end to end', () => {
       { incumbentLabel: 'general', challengerLabel: 'data_extraction' },
     ];
     expect(evaluateClassifierGate(labels).verdict).toBe('insufficient');
+  });
+});
+
+describe('a run reaches one classification only (tenet D12, ADR-054 decision 5)', () => {
+  it("reads only its classification's exchanges, answered by the assistant under test", async () => {
+    primeQueries([candidate()]);
+    await startClassifierReplay({ ...RUN, assistant: 'analyst', incumbentModel: 'haiku', challengerModel: 'sonnet' });
+    const call = mockQuery.mock.calls.find((c) => /FROM exchanges e/.test(String(c[0])))!;
+    const sql = String(call[0]).replace(/\s+/g, ' ');
+    expect(sql).toContain('AND e.conversation_classification = $4');
+    expect(sql).toContain('AND e.assistant = $5');
+    expect(call[1]).toEqual(expect.arrayContaining(['standard', 'analyst']));
+  });
+
+  it('defaults the assistant to the classification primary, and records both on the run', async () => {
+    let insert: unknown[] = [];
+    mockQuery.mockImplementation(async (sql: string, params: unknown[]) => {
+      if (/INSERT INTO classifier_replay_runs/.test(sql)) { insert = params; return { rows: [{ id: 'r' }] }; }
+      return { rows: [] };
+    });
+    const out = await openClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' });
+    expect(out.classification).toBe('standard');
+    expect(out.assistant).toBeTruthy();
+    expect(insert).toEqual(expect.arrayContaining(['standard', out.assistant]));
+    // The pack is kept on the run, so a re-execution asks the question the first one did.
+    expect(insert.some((p) => typeof p === 'string' && p.includes('"intents"'))).toBe(true);
+  });
+
+  it("refuses a run of another classification: this function cannot reach that classification's models", async () => {
+    primeQueries([candidate()]);
+    await expect(
+      startClassifierReplay({ ...RUN, classification: 'premium', incumbentModel: 'haiku', challengerModel: 'sonnet' }),
+    ).rejects.toThrow(/runs standard replays only/);
+    expect(mockQuery.mock.calls.some((c) => /INSERT INTO classifier_replay_runs/.test(String(c[0])))).toBe(false);
+    expect(mockClassify).not.toHaveBeenCalled();
+  });
+
+  it('refuses a model its classification does not allow (modelFits), before anything is opened', async () => {
+    primeQueries([candidate()]);
+    // `opus` is premium only.
+    await expect(
+      startClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'opus' }),
+    ).rejects.toThrow(/not selected by the standard classification/);
+    expect(mockQuery).not.toHaveBeenCalled();
+    expect(mockClassify).not.toHaveBeenCalled();
+  });
+
+  it('refuses a run with no classification, or one that holds no conversations', async () => {
+    await expect(startClassifierReplay({ ...RUN, classification: '', incumbentModel: 'haiku', challengerModel: 'sonnet' }))
+      .rejects.toThrow(/classification is required/);
+    await expect(startClassifierReplay({ ...RUN, classification: 'nonesuch', incumbentModel: 'haiku', challengerModel: 'sonnet' }))
+      .rejects.toThrow(/not a conversational classification/);
+  });
+
+  it('refuses to run at all on a function deployed without a classification', async () => {
+    const saved = process.env.REPLAY_CLASSIFICATION;
+    delete process.env.REPLAY_CLASSIFICATION;
+    try {
+      await expect(startClassifierReplay({ ...RUN, incumbentModel: 'haiku', challengerModel: 'sonnet' }))
+        .rejects.toThrow(/serves no classification/);
+    } finally {
+      process.env.REPLAY_CLASSIFICATION = saved;
+    }
+  });
+
+  it('will not execute a stored run of another classification, or one opened before runs named one', async () => {
+    for (const classification of ['premium', null]) {
+      mockQuery.mockReset();
+      mockQuery.mockImplementation(async (sql: string) => (/FROM classifier_replay_runs/.test(sql)
+        ? { rows: [{ id: 'old', incumbent_model: 'haiku', challenger_model: 'sonnet', window_start: new Date().toISOString(),
+          window_end: new Date().toISOString(), classification, assistant: 'analyst', intent_pack: DEFAULT_INTENT_PACK }] }
+        : { rows: [] }));
+      await expect(executeClassifierReplay('old')).rejects.toThrow(/runs standard replays only/);
+      expect(mockQuery.mock.calls.some((c) => /FROM exchanges e/.test(String(c[0])))).toBe(false);
+    }
+  });
+
+  it("classifies against the assistant's served pack, not the deployment's", async () => {
+    primeQueries([candidate({ content: 'draft the Q3 summary' })]);
+    const pack = { intents: [{ ...DEFAULT_INTENT_PACK.intents[0], key: 'quarterly_close' }, ...DEFAULT_INTENT_PACK.intents] };
+    await startClassifierReplay({ ...RUN, intentPack: pack, incumbentModel: 'haiku', challengerModel: 'sonnet' });
+    expect(mockClassify).toHaveBeenCalledTimes(2);
+    for (const [, opts] of mockClassify.mock.calls) expect(opts.pack).toBe(pack);
+  });
+
+  it('refuses a run with no pack rather than falling back to the deployment pack', async () => {
+    await expect(startClassifierReplay({ ...RUN, intentPack: undefined, incumbentModel: 'haiku', challengerModel: 'sonnet' }))
+      .rejects.toThrow(/no intent pack/);
   });
 });

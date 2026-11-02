@@ -131,8 +131,9 @@ export async function handler(
         if (existing.rows.length > 0) {
           // Skip already-applied migrations (standard forward-only behavior).
           // Re-running every file each deploy is unsafe once a migration is
-          // destructive — e.g. 006 drops drift_detection, which a re-run of 003
-          // (matview FROM drift_detection) would then fail to recreate.
+          // destructive: a later file drops what an earlier one created or read
+          // (006 drops drift_detection, 072 drops the materialized rollups), so
+          // re-running the earlier file would fail or recreate what was removed.
           console.log(`Migration already applied, skipping: ${file}`);
           continue;
         }

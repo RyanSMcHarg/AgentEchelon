@@ -32,8 +32,8 @@ const PUBLISHED = [
 const guardrailCatalog = async () => PUBLISHED;
 
 async function draftWithGuardrail(client: Parameters<typeof createDraft>[0], guardrailId: string) {
-  await createDraft(client, ROOT, 'premium', 'operator');
-  await editDraft(client, ROOT, 'premium', { modelKey: 'sonnet', guardrailId }, 'operator');
+  await createDraft(client, ROOT, 'advisor', 'operator');
+  await editDraft(client, ROOT, 'advisor', { modelKey: 'sonnet', guardrailId }, 'operator');
 }
 
 describe('an unresolvable guardrail selection is refused', () => {
@@ -41,7 +41,7 @@ describe('an unresolvable guardrail selection is refused', () => {
     const { client } = fakeSsmStore();
     await draftWithGuardrail(client, 'gr-does-not-exist');
 
-    const { errors } = await validateDraft(client, ROOT, 'premium', CATALOG, undefined, guardrailCatalog);
+    const { errors } = await validateDraft(client, ROOT, 'advisor', CATALOG, undefined, guardrailCatalog);
     expect(errors.join(' ')).toMatch(/guardrailId 'gr-does-not-exist' matches no guardrail/);
     // Naming the alternatives is the difference between an error an operator can act on and one they
     // have to go read the catalog for.
@@ -53,7 +53,7 @@ describe('an unresolvable guardrail selection is refused', () => {
     await draftWithGuardrail(client, 'gr-does-not-exist');
 
     await expect(
-      activateDraft(client, ROOT, 'premium', CATALOG, 'operator', undefined, guardrailCatalog),
+      activateDraft(client, ROOT, 'advisor', CATALOG, 'operator', undefined, guardrailCatalog),
     ).rejects.toThrow(ProfileValidationError);
   });
 });
@@ -62,31 +62,31 @@ describe('what must still be accepted', () => {
   it('a catalog KEY activates — it is what an exported manifest carries', async () => {
     const { client } = fakeSsmStore();
     await draftWithGuardrail(client, 'strict');
-    const r = await activateDraft(client, ROOT, 'premium', CATALOG, 'operator', undefined, guardrailCatalog);
+    const r = await activateDraft(client, ROOT, 'advisor', CATALOG, 'operator', undefined, guardrailCatalog);
     expect(r.version).toBeGreaterThan(0);
   });
 
   it('an already-resolved id activates', async () => {
     const { client } = fakeSsmStore();
     await draftWithGuardrail(client, 'gr-def456');
-    const r = await activateDraft(client, ROOT, 'premium', CATALOG, 'operator', undefined, guardrailCatalog);
+    const r = await activateDraft(client, ROOT, 'advisor', CATALOG, 'operator', undefined, guardrailCatalog);
     expect(r.version).toBeGreaterThan(0);
   });
 
   it('a profile selecting NO guardrail is unaffected', async () => {
     const { client } = fakeSsmStore();
-    await createDraft(client, ROOT, 'premium', 'operator');
-    await editDraft(client, ROOT, 'premium', { modelKey: 'sonnet' }, 'operator');
-    const r = await activateDraft(client, ROOT, 'premium', CATALOG, 'operator', undefined, guardrailCatalog);
+    await createDraft(client, ROOT, 'advisor', 'operator');
+    await editDraft(client, ROOT, 'advisor', { modelKey: 'sonnet' }, 'operator');
+    const r = await activateDraft(client, ROOT, 'advisor', CATALOG, 'operator', undefined, guardrailCatalog);
     expect(r.version).toBeGreaterThan(0);
   });
 
   it('no catalog supplied ⇒ no new check, so an unrelated caller is not broken', async () => {
-    // The parameter is optional. A caller that cannot supply a catalog keeps its previous behaviour
+    // The parameter is optional. A caller that cannot supply a catalog keeps its previous behavior
     // rather than being unable to activate anything.
     const { client } = fakeSsmStore();
     await draftWithGuardrail(client, 'gr-whatever');
-    const r = await activateDraft(client, ROOT, 'premium', CATALOG, 'operator');
+    const r = await activateDraft(client, ROOT, 'advisor', CATALOG, 'operator');
     expect(r.version).toBeGreaterThan(0);
   });
 });
@@ -98,7 +98,7 @@ describe('an unverifiable selection fails CLOSED', () => {
     const throwing = async () => { throw new Error('SSM unavailable'); };
 
     await expect(
-      activateDraft(client, ROOT, 'premium', CATALOG, 'operator', undefined, throwing),
+      activateDraft(client, ROOT, 'advisor', CATALOG, 'operator', undefined, throwing),
     ).rejects.toThrow(/could not be read/);
   });
 });

@@ -29,6 +29,22 @@ describe('user-profile-client', () => {
     delete process.env.USER_PROFILE_SERVICE_ARN;
   });
 
+  describe('onboardingStatus', () => {
+    it('hands back the stored facts from the same read, for a person not yet onboarded', async () => {
+      // The welcome checks `assertedBy: ['profile']` against these, so the check costs no second read.
+      send.mockResolvedValueOnce({ Item: { personId: 'sub-1', facts: { company: 'Acme' } } });
+      const { onboardingStatus } = await load();
+      expect(await onboardingStatus('sub-1')).toEqual({ onboarded: false, facts: { company: 'Acme' }, preferences: null });
+      expect(send).toHaveBeenCalledTimes(1);
+    });
+
+    it('returns no facts when there is no profile', async () => {
+      send.mockResolvedValueOnce({});
+      const { onboardingStatus } = await load();
+      expect(await onboardingStatus('sub-1')).toEqual({ onboarded: false, facts: null, preferences: null });
+    });
+  });
+
   describe('hasOnboarded (built-in DynamoDB)', () => {
     it('is false when there is no profile item', async () => {
       send.mockResolvedValueOnce({}); // GetItem → no Item
@@ -37,19 +53,19 @@ describe('user-profile-client', () => {
     });
 
     it('is false when a profile exists but was never onboarded', async () => {
-      send.mockResolvedValueOnce({ Item: { userSub: 'sub-1' } });
+      send.mockResolvedValueOnce({ Item: { personId: 'sub-1' } });
       const { hasOnboarded } = await load();
       expect(await hasOnboarded('sub-1')).toBe(false);
     });
 
     it('is true when onboardedAt is set', async () => {
-      send.mockResolvedValueOnce({ Item: { userSub: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
+      send.mockResolvedValueOnce({ Item: { personId: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
       const { hasOnboarded } = await load();
       expect(await hasOnboarded('sub-1')).toBe(true);
     });
 
     it('caches a positive result — a second check does not re-hit the store', async () => {
-      send.mockResolvedValueOnce({ Item: { userSub: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
+      send.mockResolvedValueOnce({ Item: { personId: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
       const { hasOnboarded } = await load();
       expect(await hasOnboarded('sub-1')).toBe(true);
       expect(await hasOnboarded('sub-1')).toBe(true);
@@ -62,7 +78,7 @@ describe('user-profile-client', () => {
       // request, or a test restoring its precondition all un-onboard a user. With an unbounded entry
       // the deletion was invisible for hours - the user was never re-onboarded, and the handler
       // reported "already onboarded" about a profile that no longer existed.
-      send.mockResolvedValueOnce({ Item: { userSub: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
+      send.mockResolvedValueOnce({ Item: { personId: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
       const { hasOnboarded } = await load();
       expect(await hasOnboarded('sub-1')).toBe(true);
       expect(send).toHaveBeenCalledTimes(1);
@@ -82,7 +98,7 @@ describe('user-profile-client', () => {
     it('drops the cached positive when the store says not onboarded', async () => {
       // Belt and braces for the same failure: even inside the TTL, a read that comes back negative
       // must not leave a stale yes behind for the next caller.
-      send.mockResolvedValueOnce({ Item: { userSub: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
+      send.mockResolvedValueOnce({ Item: { personId: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
       const { hasOnboarded, __clearUserProfileCache } = await load();
       expect(await hasOnboarded('sub-1')).toBe(true);
 
@@ -96,7 +112,7 @@ describe('user-profile-client', () => {
     it('does NOT cache a negative — a later onboarding is still seen', async () => {
       send
         .mockResolvedValueOnce({}) // first check: not onboarded
-        .mockResolvedValueOnce({ Item: { userSub: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
+        .mockResolvedValueOnce({ Item: { personId: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } });
       const { hasOnboarded } = await load();
       expect(await hasOnboarded('sub-1')).toBe(false);
       expect(await hasOnboarded('sub-1')).toBe(true);
@@ -140,7 +156,7 @@ describe('user-profile-client', () => {
     it('delegates getUserProfile to the external service and never touches DynamoDB', async () => {
       process.env.USER_PROFILE_SERVICE_ARN = 'arn:aws:lambda:us-east-1:1:function:their-store';
       lambdaSend.mockResolvedValueOnce({
-        Payload: new TextEncoder().encode(JSON.stringify({ success: true, data: { userSub: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } })),
+        Payload: new TextEncoder().encode(JSON.stringify({ success: true, data: { personId: 'sub-1', onboardedAt: '2026-01-01T00:00:00Z' } })),
       });
       const { hasOnboarded } = await load();
       expect(await hasOnboarded('sub-1')).toBe(true);

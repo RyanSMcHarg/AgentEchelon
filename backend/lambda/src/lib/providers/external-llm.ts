@@ -9,11 +9,13 @@
  * bedrock-resilience the spec requires). Cost: computed from a per-provider rate card and
  * returned so the caller can record `billedBy:'external'` (spend is invisible to AWS billing).
  *
- * SECURITY: the API key is read from Secrets Manager (never an env literal) and cached.
+ * SECURITY: the API key is read from Secrets Manager (never an env literal) through the shared five-minute
+ * cache (`lib/secret-cache.ts`).
  * GUARDRAIL: Bedrock Guardrails do NOT apply here — the caller must apply a compensating
  * output check before this path is enabled for real users (spec Invariant).
  */
-import { SecretsManagerClient, GetSecretValueCommand } from '@aws-sdk/client-secrets-manager';
+import { SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import { SecretUnavailable, readCachedSecret } from '../secret-cache.js';
 import type { ConversationMessage } from './../async-processor-core.js';
 
 const secrets = new SecretsManagerClient({});
@@ -42,14 +44,13 @@ export interface ExternalInvokeResult {
   billedBy: 'external';
 }
 
-const keyCache = new Map<string, string>();
 async function getApiKey(secretId: string): Promise<string> {
-  const cached = keyCache.get(secretId);
-  if (cached) return cached;
-  const r = await secrets.send(new GetSecretValueCommand({ SecretId: secretId }));
-  const key = (r.SecretString || '').trim();
+  const raw = await readCachedSecret({ secretId }, { secrets }).catch((err) => {
+    if (err instanceof SecretUnavailable && err.reason === 'empty') return '';
+    throw err;
+  });
+  const key = raw.trim();
   if (!key) throw new Error(`external-llm: secret ${secretId} is empty`);
-  keyCache.set(secretId, key);
   return key;
 }
 

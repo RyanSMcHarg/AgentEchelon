@@ -7,13 +7,14 @@
 import {
   getModelCatalog,
   INTENT_ROUTE_STRATEGY,
-  DEFAULT_PROFILE_MODEL_SELECTION,
 } from '../../lib/config/model-strategy';
+import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
 import { resolveModelForIntent } from '../../lambda/src/lib/model-resolver';
 import { resolveModelPlan } from '../../lambda/src/lib/resolve-model-plan';
 
 const catalog = getModelCatalog('us-east-1', '123456789012');
-const deps = { catalog, strategy: INTENT_ROUTE_STRATEGY, profileDefaults: DEFAULT_PROFILE_MODEL_SELECTION };
+// Each classification's own selection; the standard one where a case names no other.
+const deps = { catalog, strategy: INTENT_ROUTE_STRATEGY, models: profiles.modelsOf('standard') };
 
 const TIERS = ['basic', 'standard', 'premium'] as const;
 const INTENTS = [
@@ -30,8 +31,8 @@ describe('resolveModelPlan — backward compatibility (empty context)', () => {
   for (const classification of TIERS) {
     for (const intent of INTENTS) {
       it(`classification=${classification} intent=${intent ?? 'none'} → matches resolveModelForIntent`, () => {
-        const today = resolveModelForIntent(intent, classification, catalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION);
-        const plan = resolveModelPlan({ classification, intent }, deps);
+        const today = resolveModelForIntent(intent, classification, catalog, INTENT_ROUTE_STRATEGY, profiles.modelsOf(classification));
+        const plan = resolveModelPlan({ classification, intent }, { ...deps, models: profiles.modelsOf(classification) });
 
         // The invocation input (model id) is the thing that must be identical.
         expect(plan.ref.modelId).toBe(today.primaryModelId);
@@ -48,22 +49,27 @@ describe('resolveModelPlan — backward compatibility (empty context)', () => {
 });
 
 describe('resolveModelPlan — a turn that continues live work', () => {
-  it('carries continuesActiveWork into the intent resolution, so an acknowledgment keeps the floor', () => {
-    // The generalized resolver must not be a cheaper door than the baseline one. Both are called
-    // from the same processor turn, and a plan that dropped to Haiku here would undo the fix for any
-    // deployment with context routing on.
+  it('carries continuesActiveWork into the intent resolution, so an acknowledgment that continues a task is answered on the general route', () => {
+    // The generalized resolver must not be a cheaper door than the baseline one. A version that routes
+    // standalone acknowledgments to Haiku and general work to Opus answers a continuation on Opus.
+    const own = [
+      { ...INTENT_ROUTE_STRATEGY[0], intent: 'acknowledgment' as never, primaryModel: 'haiku' as never, fallbackModel: 'haiku' as never },
+      { ...INTENT_ROUTE_STRATEGY[0], intent: 'general' as never, primaryModel: 'opus' as never, fallbackModel: 'sonnet' as never },
+    ];
+    const ownDeps = { ...deps, strategy: own, models: profiles.modelsOf('premium') };
     const plan = resolveModelPlan(
       { classification: 'premium', intent: 'acknowledgment', continuesActiveWork: true },
-      deps,
+      ownDeps,
     );
     const continued = resolveModelForIntent(
-      'acknowledgment', 'premium', catalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION,
+      'acknowledgment', 'premium', catalog, own, profiles.modelsOf('premium'),
       { continuesActiveWork: true },
     );
-    const standalone = resolveModelPlan({ classification: 'premium', intent: 'acknowledgment' }, deps);
+    const standalone = resolveModelPlan({ classification: 'premium', intent: 'acknowledgment' }, ownDeps);
 
     expect(plan.ref.modelId).toBe(continued.primaryModelId);
-    expect(plan.ref.modelId).not.toBe(standalone.ref.modelId);
+    expect(plan.ref.modelId).toBe(resolveModelForIntent('general', 'premium', catalog, own, profiles.modelsOf('premium')).primaryModelId);
+    expect(standalone.ref.modelId).not.toBe(plan.ref.modelId);
   });
 });
 
@@ -73,30 +79,30 @@ describe('resolveModelPlan — experiment override (rule 1)', () => {
     const plan = resolveModelPlan({ classification: 'standard', intent: 'general', experimentModelId }, deps);
     expect(plan.ref.modelId).toBe(experimentModelId);
     // Fallback still comes from the intent/classification resolution (unchanged).
-    const today = resolveModelForIntent('general', 'standard', catalog, INTENT_ROUTE_STRATEGY, DEFAULT_PROFILE_MODEL_SELECTION);
+    const today = resolveModelForIntent('general', 'standard', catalog, INTENT_ROUTE_STRATEGY, profiles.modelsOf('standard'));
     expect(plan.fallback?.modelId ?? null).toBe(today.fallbackModelId);
   });
 });
 
 describe('resolveModelPlan — new signals are inert when routing is disabled', () => {
-  it('a CN segment + consent does NOT change the plan when deps lack enabled/cnProvider', () => {
-    const ctx = { classification: 'standard' as const, intent: 'general', segment: { country: 'CN' }, externalModelConsent: true };
-    const withSeg = resolveModelPlan(ctx, deps); // deps has no `enabled`/`cnProvider`
+  it('a CN segment does NOT change the plan when deps lack enabled/cnProvider, even with the version allowing it', () => {
+    const ctx = { classification: 'standard' as const, intent: 'general', segment: { country: 'CN' } };
+    const withSeg = resolveModelPlan(ctx, { ...deps, externalProviderSelected: true }); // no `enabled`/`cnProvider`
     const without = resolveModelPlan({ classification: 'standard', intent: 'general' }, deps);
     expect(withSeg.ref.modelId).toBe(without.ref.modelId);
     expect(withSeg.ref.provider).toBe('bedrock');
   });
 });
 
-describe('resolveModelPlan — CN routing rule (enabled + external provider)', () => {
+describe('resolveModelPlan — CN routing rule (enabled + external provider, allowed by the answering version)', () => {
   const cnDeps = {
     ...deps,
     enabled: true,
     cnProvider: { provider: 'deepseek' as const, modelId: 'deepseek-chat' },
-    externalConsentDefault: true,
+    externalProviderSelected: true,
   };
 
-  it('zh user + consent default → routes to the external CN provider, Bedrock as fallback', () => {
+  it('zh user + the answering version allows it → routes to the external CN provider, Bedrock as fallback', () => {
     const plan = resolveModelPlan({ classification: 'standard', intent: 'general', userLanguage: 'zh' }, cnDeps);
     expect(plan.ref.provider).toBe('deepseek');
     expect(plan.ref.modelId).toBe('deepseek-chat');
@@ -109,9 +115,9 @@ describe('resolveModelPlan — CN routing rule (enabled + external provider)', (
     expect(plan.ref.provider).toBe('deepseek');
   });
 
-  it('explicit consent=false blocks the external provider (stays Bedrock)', () => {
-    const plan = resolveModelPlan({ classification: 'standard', intent: 'general', userLanguage: 'zh', externalModelConsent: false }, cnDeps);
-    expect(plan.ref.provider).toBe('bedrock');
+  it('an allowed external route is not marked withheld', () => {
+    const plan = resolveModelPlan({ classification: 'standard', intent: 'general', userLanguage: 'zh' }, cnDeps);
+    expect(plan.externalProviderWithheld).toBeUndefined();
   });
 
   it('en + non-CN segment stays on Bedrock', () => {
@@ -124,13 +130,56 @@ describe('resolveModelPlan — CN routing rule (enabled + external provider)', (
     expect(plan.ref.provider).toBe('bedrock');
   });
 
-  it('consent default false (public phase) keeps a zh turn on Bedrock until the user opts in', () => {
-    const plan = resolveModelPlan({ classification: 'standard', intent: 'general', userLanguage: 'zh' }, { ...cnDeps, externalConsentDefault: false });
+});
+
+describe('resolveModelPlan — the external provider is closed unless the answering version allows it', () => {
+  const configured = {
+    ...deps,
+    enabled: true,
+    cnProvider: { provider: 'deepseek' as const, modelId: 'deepseek-chat' },
+  };
+  const baseline = resolveModelPlan({ classification: 'standard', intent: 'general' }, deps);
+
+  it('ABSENT (every seed, every version before the field) keeps a zh turn on the Bedrock baseline', () => {
+    const plan = resolveModelPlan({ classification: 'standard', intent: 'general', userLanguage: 'zh' }, configured);
+    expect(plan.ref.provider).toBe('bedrock');
+    expect(plan.ref.modelId).toBe(baseline.ref.modelId);
+    expect(plan.fallback?.modelId).toBe(baseline.fallback?.modelId);
+    expect(plan.workingLanguage).toBe('en');
+    expect(plan.externalProviderWithheld).toBe(true);
+  });
+
+  it('FALSE keeps a zh turn and a CN-segment turn on Bedrock, marked withheld', () => {
+    const off = { ...configured, externalProviderSelected: false };
+    const zh = resolveModelPlan({ classification: 'standard', intent: 'general', userLanguage: 'zh' }, off);
+    const cn = resolveModelPlan({ classification: 'standard', intent: 'general', segment: { country: 'CN' } }, off);
+    for (const plan of [zh, cn]) {
+      expect(plan.ref.provider).toBe('bedrock');
+      expect(plan.ref.modelId).toBe(baseline.ref.modelId);
+      expect(plan.externalProviderWithheld).toBe(true);
+    }
+  });
+
+  it('a non-Chinese turn is not marked withheld, because rule 2b never applied to it', () => {
+    const plan = resolveModelPlan({ classification: 'standard', intent: 'general', userLanguage: 'en' }, configured);
+    expect(plan.ref.provider).toBe('bedrock');
+    expect(plan.externalProviderWithheld).toBeUndefined();
+  });
+
+  it('no configured provider means nothing is withheld, even for a zh turn', () => {
+    const plan = resolveModelPlan({ classification: 'standard', intent: 'general', userLanguage: 'zh' }, { ...deps, enabled: true });
+    expect(plan.externalProviderWithheld).toBeUndefined();
+  });
+
+  it('an end-user consent field, if a caller still sent one, opens nothing', () => {
+    // The per-person flag is gone from RoutingContext; a stale caller is a type error, and at runtime it is ignored.
+    const ctx = { classification: 'standard' as const, intent: 'general', userLanguage: 'zh', externalModelConsent: true } as never;
+    const plan = resolveModelPlan(ctx, configured);
     expect(plan.ref.provider).toBe('bedrock');
   });
 });
 
-describe('resolveModelPlan — DeepSeek-on-Bedrock CN routing (intent-routed, no consent gate)', () => {
+describe('resolveModelPlan — DeepSeek-on-Bedrock CN routing (intent-routed, no external-provider gate)', () => {
   const cnBedrock = {
     chatModelId: 'deepseek.v3.2',
     reasoningModelId: 'us.deepseek.r1-v1:0',
@@ -155,10 +204,10 @@ describe('resolveModelPlan — DeepSeek-on-Bedrock CN routing (intent-routed, no
     expect(plan.reasoning).toBeFalsy();
   });
 
-  it('NO consent gate: zh turn routes to Bedrock DeepSeek even with externalModelConsent=false', () => {
+  it('NO external-provider gate: zh turn routes to Bedrock DeepSeek even when the version does not allow an external provider', () => {
     const plan = resolveModelPlan(
-      { classification: 'standard', intent: 'report_generation', userLanguage: 'zh', externalModelConsent: false },
-      cnDeps,
+      { classification: 'standard', intent: 'report_generation', userLanguage: 'zh' },
+      { ...cnDeps, externalProviderSelected: false },
     );
     expect(plan.ref.modelId).toBe('us.deepseek.r1-v1:0');
   });

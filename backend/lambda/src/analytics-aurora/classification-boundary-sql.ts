@@ -55,21 +55,45 @@
  * configuration (`config/profiles.ts`), not constants: a deployment may rename them, add one, or ship
  * a different ladder. The CDK already generates per-classification IAM from this same registry
  * precisely so a renamed classification cannot drift IAM apart from retrieval
- * (`contextPrefixesAtOrBelow`). A hardcoded `ae_reader_basic|standard|premium` in a `.sql` file would
+ * (`contextPrefixesGranted`). A hardcoded `ae_reader_basic|standard|premium` in a `.sql` file would
  * reintroduce exactly that drift on the one path where the consequence is a cross-classification read.
- * The ladder each role may read is `scopeAtOrBelow`, the same resolver retrieval and IAM consume.
+ * The set each role may read is `grantsFor`, the same resolver retrieval and IAM consume.
  *
  * WHAT THIS DELIBERATELY DOES NOT DO. It does not replace the existing `WHERE` filters. ADR-028 keeps
- * them as defence in depth: a correct query AND a correct privilege, so either one failing alone is
+ * them as defense in depth: a correct query AND a correct privilege, so either one failing alone is
  * survivable. It also does not fix ingest-time MISLABELLING - content written to the wrong
  * classification is served faithfully from it, and that is a separate control.
  */
 
-import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
-import type { ProfileRegistry } from '../../../lib/profile-registry.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
+import type { ProfileRegistry } from '../../../lib/profile-registry';
 
-/** The tables whose rows are partitioned by classification. Both carry a `classification` column. */
-export const BOUNDED_TABLES = ['embeddings', 'summary_embeddings'] as const;
+/**
+ * The tables whose rows are partitioned by classification. Each carries a `classification` column.
+ *
+ * `cross_conversation_context` joined them in migration 068. It holds no message text - a row says
+ * that a person has a conversation and which message last touched it - but "which conversations does
+ * this person have" is itself a fact that must not cross a classification boundary, and it is read
+ * to decide what an assistant is told about elsewhere.
+ *
+ * `golden_set_entries` joined them in migration 089. It holds de-identified text from a classification's
+ * conversations, and a draft version's gate reads it under that classification's own role (SPEC-EVALUATION
+ * Appendix C1), so another classification's role is refused it.
+ *
+ * `golden_runs` and `golden_run_attempts` joined them in migration 094: a draft's run against the set holds answers
+ * generated from that set, so it is bounded exactly like the set (ADR-065). `golden_batches` joined them in migration 095: the
+ * report of an upload or a generation into one classification's set.
+ */
+export const BOUNDED_TABLES = [
+  'embeddings',
+  'summary_embeddings',
+  'conversation_topic_embeddings',
+  'cross_conversation_context',
+  'golden_set_entries',
+  'golden_runs',
+  'golden_run_attempts',
+  'golden_batches',
+] as const;
 
 /**
  * The single write role. Every writer assumes it; the owner is NOT given a write policy, because a
@@ -86,7 +110,7 @@ export const WRITER_ROLE = 'ae_writer';
  * WHY THIS EXISTS, AND WHY IT IS NOT A WORKAROUND. When the runtime connected as `evaladmin` the
  * live verification failed its owner-defeat check: an unroled query read every row despite
  * `relforcerowsecurity` being true, with no `BYPASSRLS` on the role and correct policies in the
- * catalog. That behaviour was never explained (ADR-028, "Verification: what the run found"). A
+ * catalog. That behavior was never explained (ADR-028, "Verification: what the run found"). A
  * non-owner does not depend on the explanation: row-level security applies to it through the ordinary
  * path, with no reliance on FORCE or on owner-exemption semantics.
  *
@@ -128,7 +152,7 @@ export function readerRoleFor(classification: string, registry: ProfileRegistry 
 /**
  * Role names are interpolated into DDL (`CREATE ROLE`, `GRANT`) where a bind parameter is not
  * accepted, so the classification value they are built from is validated rather than trusted. The
- * value comes from deployment config, not from user input, which makes this a defence against a
+ * value comes from deployment config, not from user input, which makes this a defense against a
  * careless config edit rather than against an attacker - but a boundary that is only correct when its
  * configuration is well-formed is worth exactly as much as the config review that never happened.
  */
@@ -147,7 +171,7 @@ function assertSafeIdentifier(value: string): void {
  * How many unstamped rows the fail-closed stamp converts per application (step 6 below).
  *
  * A single-column write is cheap per row, so this is generous - the point is only that the statement
- * has a ceiling at all, since it runs inside the shared cold-start migration transaction.
+ * has a time limit at all, since it runs inside the shared cold-start migration transaction.
  */
 const NULL_STAMP_BATCH = 20000;
 
@@ -160,7 +184,7 @@ function sqlLiteral(value: string): string {
  * The scope-resolution function the policies call.
  *
  * It maps a ROLE NAME to the classification values that role may read, straight from
- * `scopeAtOrBelow` - so the ladder is expressed once and a config change moves the privilege with it.
+ * `grantsFor` - so the reach is expressed once and a config change moves the privilege with it.
  *
  * `ELSE ARRAY[]::text[]` is the load-bearing line: any identity that is not one of the declared
  * reader roles - the owner on an unroled query, a future Lambda connecting as something else, a role
@@ -174,7 +198,15 @@ export function scopeFunctionSql(registry: ProfileRegistry = profiles): string {
   const branches = registry
     .classificationValues()
     .map((value) => {
-      const scope = registry.scopeAtOrBelow(value).map(sqlLiteral).join(', ');
+      // THE HOLDER SET, the same resolver IAM's channel condition and the S3 context prefixes use.
+      //
+      // This read `scopeAtOrBelow` - the ORDER question - while the other two generators moved to
+      // `grantsFor`. Identical output for a pure ladder, and silently divergent the moment a
+      // deployment declares a non-contiguous grant set: IAM would let a holder act on a channel and
+      // read its context while this function withheld the same classification from their reader role,
+      // so retrieval returned nothing with no error anywhere. One boundary meaning two things
+      // depending on which half evaluated the request.
+      const scope = registry.grantsFor(value).map(sqlLiteral).join(', ');
       return `    WHEN ${sqlLiteral(readerRoleFor(value, registry))} THEN ARRAY[${scope}]::text[]`;
     })
     .join('\n');
@@ -268,7 +300,7 @@ END $do$;`,
   //    The runtime role gets DML on every table because it serves roughly two dozen data-plane ops
   //    over the whole analytics schema, not just the two bounded ones. What it deliberately does NOT
   //    get is ownership or DDL: it cannot create, alter or drop, which is the separation this role
-  //    exists for. On the two bounded tables this grant is the floor, not the ceiling, since RLS then
+  //    exists for. On the two bounded tables this grant is the minimum, not the maximum, since RLS then
   //    narrows it to nothing until a reader or writer role is assumed.
   //
   //    ALTER DEFAULT PRIVILEGES covers tables a LATER migration creates. Without it, the runtime
@@ -352,7 +384,11 @@ END $$;`);
   //    make the next cold start repeat the lot. Bounding it costs nothing that matters: this bootstrap
   //    re-runs on every cold start, so the stamp converges on its own, and the rows it has not reached
   //    yet are NULL, which is STRICTER than the value it is about to write, not looser.
-  const mostRestrictive = registry.mostRestrictiveValue;
+  // THE VALUE A READER CAN STILL REACH, not the admin plane. This stamps EVERY bounded
+  // table's NULL rows, so picking the admin plane here would make the whole pre-classification corpus
+  // unreadable in every user conversation at once - the widest possible blast radius for a value that
+  // is only ever chosen because nothing better is known.
+  const mostRestrictive = registry.failClosedContentValue;
   assertSafeIdentifier(mostRestrictive);
   statements.push(`SET LOCAL ROLE ${WRITER_ROLE};`);
   for (const table of BOUNDED_TABLES) {

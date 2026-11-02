@@ -1,7 +1,7 @@
 /**
  * A duel's task — an ordinary task whose OWNER is an assistant (ADR-024 D1/D2).
  *
- * Each side gets its OWN taskId, owned by that side as `{ ownerId: <AppInstanceBotId>, ownerType:
+ * Each side gets its OWN taskId, owned by that side as `{ assigneeId: <AppInstanceBotId>, assigneeType:
  * 'assistant' }`, with the state machine's initial state.
  *
  * IT IS MIRRORED NOW, and that reversal is the point of the change these tests moved with. The
@@ -83,16 +83,17 @@ describe("a duel side's task, through the one creation path", () => {
   it('writes the task held by the PERSON who owes the first step, and stamped with the assistant whose work it is', async () => {
     const task = await createSideTask();
 
-    const put = mockSend.mock.calls.find((c) => c[0].input.TableName === 'tasks-test')![0];
+    // The task PUT, not the reference counter's ADD that precedes it on the same table (ADR-035).
+    const put = mockSend.mock.calls.find((c) => c[0].input.TableName === 'tasks-test' && c[0].__t === 'Put')![0];
     expect(put.__t).toBe('Put');
     expect(put.input.Item.taskId).toBe(task.taskId);
-    // TWO FIELDS, TWO QUESTIONS (owner, 2026-08-14). The OWNER is who must act next, and
+    // TWO FIELDS, TWO QUESTIONS (maintainer, 2026-08-14). The OWNER is who must act next, and
     // `report_generation` starts at `collecting_requirements`, which the machine declares
     // `awaits` - so the chain is blocked on the person from its first moment and they hold it.
-    // Owning it is what puts it in their queue; the caller's assistant owner is honoured only for a
+    // Owning it is what puts it in their queue; the caller's assistant owner is honored only for a
     // first step the assistant actually owes.
-    expect(put.input.Item.ownerId).toBe(principalIdOfUser);
-    expect(put.input.Item.ownerType).toBe('user');
+    expect(put.input.Item.assigneeId).toBe(principalIdOfUser);
+    expect(put.input.Item.assigneeType).toBe('user');
     // The ASSISTANT whose work it is, which never moves. This is what tells two duel sides apart now
     // that both wait on the same person - previously the owner did that job, and it could not do both.
     expect(put.input.Item.assistantId).toBe('AltSlot0');
@@ -114,10 +115,10 @@ describe("a duel side's task, through the one creation path", () => {
       .map((c) => c[0])
       .find((c) => c.input.TableName === 'user-tasks-test');
     expect(mirror).toBeDefined();
-    // The partition is the OWNER. The attribute is still called `userSub` because DynamoDB cannot
-    // rename a key attribute (ADR-024 D2); what it holds is the bot's principal id.
-    expect(mirror!.input.Item.userSub).toBe(principalIdOfUser);
-    expect(mirror!.input.Item.ownerType).toBe('user');
+    // The partition is the OWNER (`principalId`, ADR-024 D2); what it holds here is the principal id of
+    // whoever holds the work.
+    expect(mirror!.input.Item.principalId).toBe(principalIdOfUser);
+    expect(mirror!.input.Item.assigneeType).toBe('user');
     // Carried onto the mirror so the assistant can find its own chain inside the person's partition
     // without reading every candidate's full row.
     expect(mirror!.input.Item.assistantId).toBe('AltSlot0');
@@ -138,13 +139,13 @@ describe("a duel side's task, through the one creation path", () => {
     // a side from resuming its rival's chain, so that is what this asserts.
     expect(a.assistantId).toBe('default');
     expect(b.assistantId).toBe('AltSlot0');
-    expect(a.ownerId).toBe(principalIdOfUser);
-    expect(b.ownerId).toBe(principalIdOfUser);
+    expect(a.assigneeId).toBe(principalIdOfUser);
+    expect(b.assigneeId).toBe(principalIdOfUser);
 
     const mirrored = mockSend.mock.calls
       .map((c) => c[0])
       .filter((c) => c.input.TableName === 'user-tasks-test')
-      .map((c) => ({ partition: c.input.Item.userSub, assistant: c.input.Item.assistantId }));
+      .map((c) => ({ partition: c.input.Item.principalId, assistant: c.input.Item.assistantId }));
     expect(mirrored).toEqual([
       { partition: principalIdOfUser, assistant: 'default' },
       { partition: principalIdOfUser, assistant: 'AltSlot0' },
@@ -154,7 +155,7 @@ describe("a duel side's task, through the one creation path", () => {
   it('is resilient: a tasks-table failure does not throw (returns the task object)', async () => {
     mockSend.mockRejectedValueOnce(new Error('DDB down'));
     const task = await createSideTask();
-    expect(task.ownerId).toBe(principalIdOfUser);
+    expect(task.assigneeId).toBe(principalIdOfUser);
     expect(task.assistantId).toBe('AltSlot0');
   });
 
@@ -185,8 +186,8 @@ describe('a side resolves ITS OWN chain out of the holder\'s partition', () => {
   const CHANNEL = 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c1';
 
   const rows = [
-    { userSub: HOLDER, taskId: 't-rival', assistantId: 'AltSlot0', taskType: 'report_generation', channelArn: CHANNEL, status: 'in_progress', updatedAt: '2026-08-14T00:00:02Z' },
-    { userSub: HOLDER, taskId: 't-mine', assistantId: 'default', taskType: 'report_generation', channelArn: CHANNEL, status: 'in_progress', updatedAt: '2026-08-14T00:00:01Z' },
+    { principalId: HOLDER, taskId: 't-rival', assistantId: 'AltSlot0', taskType: 'report_generation', channelArn: CHANNEL, status: 'in_progress', updatedAt: '2026-08-14T00:00:02Z' },
+    { principalId: HOLDER, taskId: 't-mine', assistantId: 'default', taskType: 'report_generation', channelArn: CHANNEL, status: 'in_progress', updatedAt: '2026-08-14T00:00:01Z' },
   ];
 
   beforeEach(() => {

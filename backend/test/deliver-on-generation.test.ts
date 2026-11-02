@@ -1,5 +1,5 @@
 /**
- * THE DELIVERY CONTRACT IS DECLARED, NOT INFERRED (owner decision 2026-08-18).
+ * THE DELIVERY CONTRACT IS DECLARED, NOT INFERRED (maintainer decision 2026-08-18).
  *
  * This file used to pin the opposite: `advanceDeliveredTaskToCompletion` walked a task to its
  * terminal state whenever the OUTPUT looked deliverable-shaped, and `completeOnDelivery` keyed
@@ -17,6 +17,7 @@
  * commit that reintroduces either removed door.
  */
 import * as fs from 'fs';
+import { DEFAULT_TASK_STATE_MACHINES } from '../lambda/src/lib/task-state-machines';
 import * as path from 'path';
 import { stripComments } from './helpers/strip-comments';
 import { isDeliverableDocument, solicitsInput } from '../lambda/src/lib/async-processor-core';
@@ -59,9 +60,9 @@ describe('why the heuristic was demoted: the live fixture defeats it', () => {
   });
 
   it('the machine gate answers the same fixture correctly: drafting_outline does not complete', () => {
-    expect(shouldMarkTaskCompleted('report_generation', 'drafting_outline')).toBe(false);
-    expect(shouldMarkTaskCompleted('report_generation', 'generating')).toBe(false);
-    expect(shouldMarkTaskCompleted('report_generation', 'completed')).toBe(true);
+    expect(shouldMarkTaskCompleted('report_generation', 'drafting_outline', DEFAULT_TASK_STATE_MACHINES)).toBe(false);
+    expect(shouldMarkTaskCompleted('report_generation', 'generating', DEFAULT_TASK_STATE_MACHINES)).toBe(false);
+    expect(shouldMarkTaskCompleted('report_generation', 'completed', DEFAULT_TASK_STATE_MACHINES)).toBe(true);
   });
 });
 
@@ -94,46 +95,68 @@ describe('the second completion door stays removed (source ratchets)', () => {
     const shadowMentions = region.match(/deliverable_shaped_without_declared_state/g) || [];
     expect(mentions.length).toBe(1);
     expect(shadowMentions.length).toBe(1);
-    // Two doors, both machine-anchored, plus the minimum artifact size: a DECLARED transition, or
-    // an in-state rewrite - a follow-up inside a delivering state has no legal transition to
-    // declare, and requiring one posted whole rewritten reports as chat walls. The in-state door
-    // carries the trailing-question veto, the one language-neutral structural residue of the
-    // retired heuristic (the live incident that demoted it ended with exactly such a question).
-    // The English-opener phrase list (solicitsInput) stays out of the live gate.
-    expect(region).toMatch(/generate = \(declaredDelivery \|\| inStateRewrite\) && trimmedResponse\.length >= 400/);
+    // Two doors, both machine-anchored, and both DECLARED: a transition that hands over a document,
+    // or an in-state rewrite inside a delivering step, and in either case the file is the document the
+    // turn declared (`document` on the advance, or `deliver_document`), never the reply. Then the
+    // minimum artifact size. Nothing reads the reply's shape: the trailing-question veto that guarded
+    // the in-state door is gone with the reply-as-document it guarded against. The English-opener
+    // phrase list (solicitsInput) stays out of the live gate.
+    expect(region).toMatch(/documentText = declaredDelivery \|\| inStateRewrite \? declaredDocument : ''/);
+    expect(region).toMatch(/generate = documentText\.length >= 400/);
     expect(region).toMatch(/deliveryStates\.includes\(startState\)/);
-    expect(region).toMatch(/transitions \?\? \[\]\)\.length === 0/);
+    // THE ACTIVE TASK'S transitions. A tagged entry belongs to a task the model redirected to
+    // (ADR-024 D7), and counting one here would read another task's movement as this one having
+    // delivered.
+    expect(region).toMatch(/transitions \?\? \[\]\)\.filter\(\(t\) => !t\.taskId\)\.some/);
     expect(region).not.toMatch(/solicitsInput/);
+    expect(region).not.toMatch(/textBesideTaskAdvance/);
   });
 
-  it('which states deliver comes from the MACHINE, so per-profile machines can declare their own', () => {
+  it('which states deliver comes from the MACHINE, not from a hardcoded list', () => {
     // The hardcoded per-taskType list of default-machine state names could never match a renamed
     // state or a new document-producing task type: every such deliverable shipped as unattached chat
-    // text, silently. The machines are merged the same way the advance tool's authorization merges
-    // them, and the `delivers` flag is read off the merged machine.
+    // text, silently. The `delivers` flag is read off the resolved machine instead.
+    //
+    // THE SOURCE THIS PINS MOVED WITH THE GLOBAL-WORKFLOWS DECISION (2026-09-20). It asserted the
+    // literal per-assistant merge of taskStateMachines() with activeProfile.machines - a merge that no
+    // longer exists, because a version cannot define a task graph. What the test actually protects is
+    // that the flag comes from the MACHINE rather than a list, so it pins the resolver every consumer
+    // now goes through.
     expect(processorSrc).not.toMatch(/DOC_DELIVERY_STATES/);
-    expect(processorSrc).toMatch(/\{ \.\.\.taskStateMachines\(\), \.\.\.\(activeProfile\.machines \?\? \{\}\) \}/);
-    expect(processorSrc).toMatch(/filter\(\(\[, d\]\) => d\.delivers\)/);
+    // PINNED TO THE ONE RESOLUTION (ADR-047). This pinned a per-assistant merge, then a `workflowsFor`
+    // narrowing; both are gone. The selection gates what may be OPENED, in the router, so the processor
+    // resolves the turn's machines ONCE and every consumer reads that value - which is the property
+    // worth holding here, because the defect this file guards is two consumers disagreeing.
+    // The version's confirmation setting is applied to that one resolution (ADR-064 decision G), so every consumer still
+    // reads the single value `taskStateMachines()` returns, resolved once.
+    expect(processorSrc).toMatch(/const turnMachines = withConfirmBrief\(taskStateMachines\(\), activeProfile\.confirmBrief\)/);
+    expect(processorSrc.match(/taskStateMachines\(\)/g)).toHaveLength(1);
+    expect(processorSrc).toMatch(/mergedMachines = turnMachines/);
+    expect(processorSrc).toMatch(/filter\(\(\[, d\]\) => deliversDocument\(d\)\)/);
   });
 
-  it('the default machines declare the same delivery states the retired list named', () => {
-    // The refactor must be behavior-preserving for the default deployment: exactly these states, no
-    // more, carry the flag.
+  it('the default machines declare exactly these delivery states', () => {
+    // Exactly these states, no more, carry the flag. The extraction delivers only from `formatting`:
+    // its records are shown for checking at `validating`, which awaits the person and so cannot
+    // deliver (`validateTaskStateMachine`).
     const { DEFAULT_TASK_STATE_MACHINES } = jest.requireActual('../lambda/src/lib/task-state-machines');
     const flagged: Record<string, string[]> = {};
-    for (const [type, machine] of Object.entries(DEFAULT_TASK_STATE_MACHINES) as [string, { states: Record<string, { delivers?: boolean }> }][]) {
-      const states = Object.entries(machine.states).filter(([, d]) => d.delivers).map(([n]) => n);
+    for (const [type, machine] of Object.entries(DEFAULT_TASK_STATE_MACHINES) as [string, { states: Record<string, { produces?: string }> }][]) {
+      const states = Object.entries(machine.states).filter(([, d]) => d.produces === 'document').map(([n]) => n);
       if (states.length) flagged[type] = states;
     }
     expect(flagged).toEqual({
       report_generation: ['generating', 'revising'],
-      data_extraction: ['extracting', 'validating', 'formatting'],
+      data_extraction: ['formatting'],
+      // The task-based code deliverable and design intents (SPEC-CONFIGURABLE-INTENT-PACK, Appendix A).
+      code_delivery: ['generating', 'revising'],
+      technical_design: ['generating', 'revising'],
     });
   });
 });
 
 describe('every task-state writer is a DECLARATION (the exclusivity test §8 never had)', () => {
-  it('advanceTaskStateTo has exactly the three declared callers', () => {
+  it('advanceTaskStateTo has exactly the three declared callers, plus transport that proves it is transport', () => {
     // SPEC-TASK-STATE-TRANSITIONS §8's invariant table tests the behavior of the one authorized
     // path, but nothing tested that no OTHER writer exists - which is precisely how the removed
     // walker lived for a month: every hop it took was individually legal, so edge-level tests
@@ -152,7 +175,7 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
     // structure or from what the output looked like. Add it here with that argument stated, or the
     // commit that adds it fails this test - which is the point.
     //
-    //   assistant-async-processor.ts x1   the delivered-step close (owner, 2026-08-20)
+    //   assistant-async-processor.ts x1   the delivered-step close (maintainer, 2026-08-20)
     //
     // AND IT DOES NOT MEET THE RULE ABOVE, which is stated plainly rather than argued around. It is an
     // inference from structure: the machine declares the state `delivers`, a document was uploaded, so
@@ -177,6 +200,72 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
     //
     // If that gating is ever loosened, this entry should be removed rather than widened: the value of
     // this test is that a third writer had to argue for itself in writing, and a fourth must too.
+    //
+    //   lib/queue-drain-task.ts x4        the drain's stage, and its close (maintainer, 2026-09-03)
+    //
+    // FOUR CALLS, TWO DECISIONS. One mirrors the stage. The other three are the close: it asks for
+    // `settled`, and when the machine refuses - a drain that asked something sits in `clarifying` -
+    // it walks the declared path `clearing` then `settled` rather than forcing past the refusal.
+    // Three writes expressing ONE decision that the queue is empty, not three decisions; if that ever
+    // becomes a choice about WHICH ending to take, it stops being covered by the argument below.
+    //
+    // THE ARGUMENT, since the rule above demands one. The danger this test guards is a workflow
+    // advancing on inference while a PERSON's words were the only thing entitled to move it - the
+    // removed walker read what the output looked like and closed steps nobody had answered.
+    //
+    // A drain cannot have that failure mode, and the reason is a property of the machine rather than
+    // a promise about the code: `queue_drain` declares no `awaits` at any step (maintainer, 2026-09-03 -
+    // a drain that waits is a queue that lives until somebody answers). There is no party whose
+    // answer could be annexed, because no step of a drain is ever waiting for one. That is asserted
+    // directly, in `a-step-declares-who-it-awaits.test.ts`, which names this machine as the single
+    // shipped exception to every-machine-has-a-wait.
+    //
+    // Neither call is an inference from structure either:
+    //   - the stage write MIRRORS a decision already made and validated elsewhere. The conditional
+    //     advance on the turn record refuses an illegal predecessor and settles the real race; this
+    //     runs only when that write ACCEPTED the move, so it adds no judgement of its own. Asking the
+    //     machine a second time here is precisely what it declines to do;
+    //   - the close is driven by an observed FACT with no reading in it - the queue is empty - and it
+    //     is the same fact, at the same moment, that settles the notice a person is looking at.
+    //
+    // If a drain ever gains a waiting step, this entry must be removed rather than kept: the whole
+    // argument above rests on there being none.
+    //
+    //   lib/async-processor-core.ts x1   the merge that a combination answered (maintainer, 2026-09-03)
+    //
+    // THE ARGUMENT. `queued_combination` asks two people whether their requests are one thing and who
+    // would own the result. The model declares `merging` on a state that AWAITS a person, having read
+    // their answer - so the decision is a person's, relayed by an actor that read what they said,
+    // which is exactly what the rule above requires.
+    //
+    // This call is the step after: it advances `merging -> merged` once the merged item actually
+    // exists. That is not an inference about what anybody meant. It is the runtime recording a fact it
+    // observed about its OWN work - `mergeCombinedRequests` returned an id - and it is gated on that
+    // id, so a failed merge leaves the task in `merging` rather than claiming a success with nothing
+    // behind it. Recording it any other way would put the two halves out of step, which is the reason
+    // `merging` is a declared state instead of something done quietly inside the transition.
+    //
+    // The state it advances FROM awaits nobody, so no answer can be annexed here.
+    //
+    //   lib/state-actions.ts x1           a declared step action's outcome edge (SPEC-TASK-STATE-TRANSITIONS FR29)
+    //
+    // THE ARGUMENT. A state that declares `action` is the workflow's author saying the step is the
+    // platform's: the tool runs on entry, and `onSuccess` or `onFailure`, each a declared transition,
+    // is where the task goes on its outcome. The edge is chosen by an observed FACT about the platform's
+    // own work (the tool returned a result or an error), never by reading what anybody wrote, and the
+    // state it advances FROM awaits nobody: validation refuses an action on a step that awaits somebody,
+    // so there is no answer to annex. The entry is logged as `by: 'system'` with the action that caused
+    // it, and a turn takes at most MAX_RUNTIME_MOVES_PER_TURN of them.
+    //
+    //   assistant-async-processor.ts +1    an event step's task, past the first step it ran (ADR-061 decision 8)
+    //
+    // THE ARGUMENT. An `agent` step that names `workflow:` has the runtime open a task in the room and run
+    // its first step as the step's turn. Once that turn POSTED (an observed fact about the platform's own
+    // work, the step's claim recorded `posted`, never a reading of what it said), the runtime takes the
+    // first step's one declared transition, so the task rests on its next step as the room's work. It is
+    // gated on the machine being one an event may open (`EVENT_TASK_MACHINES`), whose first step awaits
+    // nobody, so there is no person whose answer could be annexed; on a fallback it advances nothing; and
+    // a first step with two ways on is a choice the runtime does not make. Its premise is asserted below.
     const SRC = path.join(__dirname, '../lambda/src');
     const counts: Record<string, number> = {};
     const walk = (dir: string): void => {
@@ -191,9 +280,75 @@ describe('every task-state writer is a DECLARATION (the exclusivity test §8 nev
       }
     };
     walk(SRC);
+
+    // ── TRANSPORT IS NOT A WRITER, AND IS SEPARATED RATHER THAN ADMITTED ────────────────────────
+    //
+    // The task store seam and the service behind it both name this function, and neither declares
+    // anything: the store either forwards to the direct implementation or hands the same call across
+    // a Lambda hop, and the service is the far end of that hop, reloading the row and calling the
+    // real function. It is ONE declaration traveling, not two more of them.
+    //
+    // Widening the expected set to four names would be the wrong fix, and precisely the fix this test
+    // exists to refuse: a genuine fourth writer added inside either file would then be invisible,
+    // hiding behind an entry that was granted for routing. So they are listed apart and each is
+    // required to PROVE it is transport - one call, and its arguments passed through rather than
+    // constructed. A file that started deciding a target state would fail here even though its call
+    // count never changed.
+    const TRANSPORT = ['lib/task-store.ts', 'task-service.ts'];
+    for (const file of TRANSPORT) {
+      expect(counts[file]).toBe(1);
+      const src = stripComments(fs.readFileSync(path.join(SRC, file), 'utf8'));
+      const call = /(?<!function )advanceTaskStateTo\(([^;]*?)\)/s.exec(src);
+      expect(call).not.toBeNull();
+      // Forwarded whole (`(args)`) or spread (`{ task, ...rest }`). Either way the caller's own
+      // decision arrives intact instead of being remade here.
+      expect(call![1]).toMatch(/\.\.\.|^\s*args\s*$/);
+      delete counts[file];
+    }
+
+    // THE DRAIN'S ENTRY CHECKS ITS OWN PREMISE. Its argument above is that no step of a drain ever
+    // waits on anybody, so there is no answer to annex. A comment claiming that would rot the moment
+    // somebody added an `awaits`, and the entry would go on being granted for a reason that had
+    // stopped being true - so the premise is asserted here, beside the grant that depends on it.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { DEFAULT_TASK_STATE_MACHINES } = require('../lambda/src/lib/task-state-machines');
+    const drainWaits = Object.entries(
+      DEFAULT_TASK_STATE_MACHINES.queue_drain.states as Record<string, { awaits?: unknown }>,
+    ).filter(([, def]) => def.awaits).map(([name]) => name);
+    expect({ premise: 'a drain waits on nobody', waiting: drainWaits })
+      .toEqual({ premise: 'a drain waits on nobody', waiting: [] });
+
+    // THE EVENT TASK'S ENTRY CHECKS ITS OWN PREMISE: every machine an event may open starts on a step that awaits
+    // nobody and has one way on.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { EVENT_TASK_MACHINES } = require('../lambda/src/lib/event-workflow');
+    for (const key of EVENT_TASK_MACHINES as string[]) {
+      const m = DEFAULT_TASK_STATE_MACHINES[key] as { initial: string; states: Record<string, { awaits?: unknown; transitions: string[] }> };
+      expect({ machine: key, awaits: m.states[m.initial].awaits, ways: m.states[m.initial].transitions.length })
+        .toEqual({ machine: key, awaits: undefined, ways: 1 });
+    }
+
+    // THE CARD PRESS (ADR-063 decision 2) IS A PERSON'S DECISION RELAYED THROUGH THE TRANSPORT, never a new writer: the task
+    // service's `advanceAsAssignee` forwards it through `advanceTask`, the one call above, only along a choice the state
+    // declares, and a state may declare choices only where it awaits somebody, so the move is the awaited person's own. The
+    // premise is asserted here, beside the route that depends on it.
+    const service = stripComments(fs.readFileSync(path.join(SRC, 'task-service.ts'), 'utf8'));
+    const cardPress = service.slice(service.indexOf('export async function advanceAsAssignee('), service.indexOf('async function cancelForDeadline('));
+    expect(cardPress).toMatch(/await advanceTask\(\{/);
+    expect(cardPress).not.toMatch(/advanceTaskStateTo\(/);
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { awaitedPartyOf } = require('../lambda/src/lib/task-state-machines');
+    const unawaitedChoices = Object.entries(DEFAULT_TASK_STATE_MACHINES as Record<string, { states: Record<string, { choices?: string[] }> }>)
+      .flatMap(([m, def]) => Object.entries(def.states).filter(([, st]) => st.choices && !awaitedPartyOf(st)).map(([s]) => `${m}.${s}`));
+    expect({ premise: 'a choice is put to the party a step awaits', unawaitedChoices }).toEqual({ premise: 'a choice is put to the party a step awaits', unawaitedChoices: [] });
+
+    // What is left is the DECLARED set, unchanged.
     expect(counts).toEqual({
       'lib/task-tools.ts': 2,
-      'assistant-async-processor.ts': 1,
+      'assistant-async-processor.ts': 2,
+      'lib/queue-drain-task.ts': 4,
+      'lib/async-processor-core.ts': 1,
+      'lib/state-actions.ts': 1,
     });
   });
 });
@@ -205,7 +360,8 @@ describe('the attachment bytes declare their encoding', () => {
     const coreSrc = fs.readFileSync(
       path.join(__dirname, '../lambda/src/lib/async-processor-core.ts'), 'utf8',
     );
-    expect(coreSrc).toMatch(/ContentType: 'text\/markdown; charset=utf-8'/);
+    // A code file carries its own type (`fileForAnswer`, also with a charset); the Markdown default keeps one.
+    expect(coreSrc).toMatch(/ContentType: file\?\.contentType \|\| 'text\/markdown; charset=utf-8'/);
     expect(coreSrc).not.toMatch(/ContentType: 'text\/markdown',/);
   });
 });

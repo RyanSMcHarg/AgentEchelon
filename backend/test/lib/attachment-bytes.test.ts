@@ -9,7 +9,7 @@ jest.mock('@aws-sdk/client-s3', () => ({
   GetObjectCommand: jest.fn().mockImplementation((args) => ({ __t: 'Get', input: args })),
 }), { virtual: true });
 
-import { fetchAttachmentBytes, senderOwnsAttachmentKey } from '../../lambda/src/lib/attachment-bytes';
+import { conversationHoldsHistoryImageKey, fetchAttachmentBytes, senderOwnsAttachmentKey } from '../../lambda/src/lib/attachment-bytes';
 
 const s3 = { send: mockS3Send };
 
@@ -69,5 +69,34 @@ describe('senderOwnsAttachmentKey (attachment-in object-level authz)', () => {
     expect(senderOwnsAttachmentKey(OWN_KEY, 'arn-with-no-user-segment')).toBe(false);
     expect(senderOwnsAttachmentKey(undefined, SENDER)).toBe(false);
     expect(senderOwnsAttachmentKey('attachments/only/two', SENDER)).toBe(false);
+  });
+});
+
+describe('conversationHoldsHistoryImageKey (a history image re-read for a rebuttal)', () => {
+  const CHANNEL = 'arn:aws:chime:us-east-1:1:app-instance/app/channel/conv-1';
+  const ALICE = 'arn:aws:chime:us-east-1:1:app-instance/app/user/sub-alice';
+  const RIVAL = 'arn:aws:chime:us-east-1:1:app-instance/app/bot/rival';
+
+  it("accepts the sender's own upload in this conversation", () => {
+    expect(conversationHoldsHistoryImageKey('attachments/conv-1/sub-alice/1-pic.png', CHANNEL, ALICE)).toBe(true);
+  });
+
+  it("accepts an image generated for this conversation, whoever posted it (the rival's round-1 image)", () => {
+    expect(conversationHoldsHistoryImageKey('battle-images/conv-1/1700000000-0.png', CHANNEL, RIVAL)).toBe(true);
+  });
+
+  it("refuses a key from another conversation, even the sender's own upload there", () => {
+    expect(conversationHoldsHistoryImageKey('attachments/conv-9/sub-alice/1-pic.png', CHANNEL, ALICE)).toBe(false);
+    expect(conversationHoldsHistoryImageKey('battle-images/conv-9/1700000000-0.png', CHANNEL, RIVAL)).toBe(false);
+  });
+
+  it("refuses another member's upload named on a message they did not send", () => {
+    expect(conversationHoldsHistoryImageKey('attachments/conv-1/sub-bob/1-pic.png', CHANNEL, ALICE)).toBe(false);
+  });
+
+  it('refuses any other prefix, and fails closed with no conversation or key', () => {
+    expect(conversationHoldsHistoryImageKey('generated-docs/conv-1/x.png', CHANNEL, ALICE)).toBe(false);
+    expect(conversationHoldsHistoryImageKey('battle-images/conv-1/1.png', undefined, RIVAL)).toBe(false);
+    expect(conversationHoldsHistoryImageKey(undefined, CHANNEL, ALICE)).toBe(false);
   });
 });

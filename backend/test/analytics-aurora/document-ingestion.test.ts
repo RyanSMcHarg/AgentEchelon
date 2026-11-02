@@ -214,3 +214,38 @@ describe('handler (S3-event entry point)', () => {
 
 // Make this file a module so project-mode tsc isolates its top-level test scaffolding.
 export {};
+
+/**
+ * A DELETED OBJECT TAKES ITS CHUNKS WITH IT.
+ *
+ * Moving the platform documentation out of the classification every assistant reads needed its old chunks
+ * gone; an object deleted from `rag/` used to leave them retrievable. The S3 delete event is the signal.
+ */
+describe('an object removed from the corpus', () => {
+  it('deletes its chunks, as the writer role, and fetches and embeds nothing', async () => {
+    mockDbQuery.mockResolvedValue({ rows: [], rowCount: 12 });
+    const { handler } = await import('../../lambda/src/analytics-aurora/document-ingestion');
+    const event = {
+      Records: [{
+        eventName: 'ObjectRemoved:Delete',
+        s3: { bucket: { name: 'test-bucket' }, object: { key: 'rag/agentechelon/basic/MESSAGE-FLOW.md' } },
+      }],
+    };
+    const result = await handler(event as never);
+
+    expect(result.ingested).toEqual([]);
+    const sql = mockDbQuery.mock.calls.map((c) => String(c[0]));
+    expect(sql).toContain('DELETE FROM embeddings WHERE source_id = $1 AND source_type = $2');
+    expect(mockDbQuery.mock.calls.find((c) => String(c[0]).startsWith('DELETE'))?.[1])
+      .toEqual(['s3://test-bucket/rag/agentechelon/basic/MESSAGE-FLOW.md', 'agentechelon']);
+    expect(mockAssumedRoles).toContain('ae_writer');
+    expect(mockBedrockSend).not.toHaveBeenCalled();
+  });
+
+  it('the stack sends removal events under rag/ to the ingestion function', () => {
+    const fs = require('fs') as typeof import('fs');
+    const path = require('path') as typeof import('path');
+    const stack = fs.readFileSync(path.join(__dirname, '../../lib/stacks/archive-stack-aurora.ts'), 'utf8');
+    expect(stack).toContain("archiveBucket.addObjectRemovedNotification(\n      new s3n.LambdaDestination(documentIngestionLambda),\n      { prefix: 'rag/' },");
+  });
+});

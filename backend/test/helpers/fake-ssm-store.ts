@@ -2,7 +2,7 @@
  * A versioned, labeled in-memory SSM stand-in for the profile-lifecycle / manifest tests. Models exactly
  * the SSM semantics those modules rely on: PutParameter appends a monotonic version; LabelParameterVersion
  * MOVES a label onto one version; GetParameter resolves `name` (latest), `name:label` OR `name:version`;
- * GetParameterHistory PAGES like the real API. NOT a jest test file (no `.test.` — jest ignores it).
+ * GetParameterHistory PAGES like the real API; DeleteParameter removes every version. NOT a jest test file (no `.test.` — jest ignores it).
  *
  * THE PAGING IS THE POINT, and it was missing. This fake used to return every version from
  * `GetParameterHistory` in one page with no `NextToken`, which is more generous than the real API and is
@@ -11,12 +11,13 @@
  * `NextToken` to continue. Three call sites read the first page only and therefore could not see any
  * version past the tenth: a pinned experiment variant resolved to null and was silently skipped, a
  * manifest export failed with "version not found", and ROLLBACK refused a version the console had just
- * offered. Modelling the page boundary here is what makes that class of bug fail in CI.
+ * offered. Modeling the page boundary here is what makes that class of bug fail in CI.
  */
 import {
   PutParameterCommand,
   LabelParameterVersionCommand,
   GetParameterHistoryCommand,
+  DeleteParameterCommand,
 } from '@aws-sdk/client-ssm';
 import type { SSMClient } from '@aws-sdk/client-ssm';
 
@@ -58,6 +59,13 @@ export function fakeSsmStore() {
         for (const l of Labels) target.labels.add(l);
         return {};
       }
+      if (cmd instanceof DeleteParameterCommand) {
+        // Removes the parameter and every version of it, as the real API does. Without this branch the
+        // fallthrough below would answer a delete as a read and the parameter would survive it.
+        const { Name } = cmd.input as { Name: string };
+        if (!store.delete(Name)) notFound();
+        return {};
+      }
       if (cmd instanceof GetParameterHistoryCommand) {
         const { Name, MaxResults, NextToken } = cmd.input as { Name: string; MaxResults?: number; NextToken?: string };
         const vers = store.get(Name);
@@ -85,7 +93,11 @@ export function fakeSsmStore() {
           ? vers.find((v) => v.version === Number(selector))
           : vers.find((v) => v.labels.has(selector));
       if (!chosen) notFound();
-      return { Parameter: { Value: chosen.value } };
+      // `Version` IS PART OF A REAL GetParameter ANSWER, including a read through a label - which is
+      // how a caller learns WHICH version the `active` label currently points at without paging the
+      // history. Omitting it here made the fake unable to express something the code under test
+      // reads, so a correct implementation failed against the stand-in rather than against SSM.
+      return { Parameter: { Value: chosen.value, Version: chosen.version } };
     }),
   };
 

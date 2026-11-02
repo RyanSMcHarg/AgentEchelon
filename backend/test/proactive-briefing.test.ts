@@ -2,30 +2,31 @@
  * Proactive Briefing Lambda — unit tests.
  *
  * This is the proactive-workflow test that was explicitly missing. It
- * pins: an EventBridge fire (no user) creates a bot-owned conversation,
- * adds members, renders the on-the-fly page to S3 + signs a URL, seeds
- * the conversation, and emails members via the notification workflow —
- * resiliently (a member-add failure doesn't abort) and degrading
- * cleanly when REPORT_BUCKET / recipients are absent.
+ * pins: an EventBridge fire (no user) creates a conversation through the
+ * shared creator as the service admin, adds members, seeds the conversation, and emails members a link
+ * INTO the conversation (never a presigned page) via the notification workflow, resiliently (a
+ * member-add failure doesn't abort) and cleanly when no recipients are configured.
  *
  * Mocks the AWS SDK clients + the notification module so the test is
- * pure (no SES/Chime/S3). Mirrors channel-battle.test.ts mocking +
+ * pure (no SES/Chime). Mirrors channel-battle.test.ts mocking +
  * battle-state.test.ts reset-modules-per-test (the Lambda captures
  * several env vars at module load).
  */
 
 const mockChimeSend = jest.fn();
 const mockSsmSend = jest.fn();
-const mockS3Send = jest.fn();
-const mockGetSignedUrl = jest.fn();
 const mockSendEmail = jest.fn();
 
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   ChimeSDKMessagingClient: jest.fn().mockImplementation(() => ({ send: mockChimeSend })),
   CreateChannelCommand: jest.fn().mockImplementation((i) => ({ __t: 'CreateChannel', i })),
   CreateChannelMembershipCommand: jest.fn().mockImplementation((i) => ({ __t: 'AddMember', i })),
+  CreateChannelModeratorCommand: jest.fn().mockImplementation((i) => ({ __t: 'AddModerator', i })),
+  DeleteChannelMembershipCommand: jest.fn().mockImplementation((i) => ({ __t: 'Leave', i })),
+  DeleteChannelModeratorCommand: jest.fn().mockImplementation((i) => ({ __t: 'DropModerator', i })),
   AssociateChannelFlowCommand: jest.fn().mockImplementation((i) => ({ __t: 'AssocFlow', i })),
   SendChannelMessageCommand: jest.fn().mockImplementation((i) => ({ __t: 'SendMsg', i })),
+  ListTagsForResourceCommand: jest.fn().mockImplementation((i) => ({ __t: 'ListTags', i })),
   ChannelMessageType: { STANDARD: 'STANDARD' },
   ChannelMessagePersistenceType: { PERSISTENT: 'PERSISTENT' },
 }), { virtual: true });
@@ -35,24 +36,49 @@ jest.mock('@aws-sdk/client-ssm', () => ({
   GetParameterCommand: jest.fn().mockImplementation((i) => ({ __t: 'GetParam', i })),
 }), { virtual: true });
 
-jest.mock('@aws-sdk/client-s3', () => ({
-  S3Client: jest.fn().mockImplementation(() => ({ send: mockS3Send })),
-  PutObjectCommand: jest.fn().mockImplementation((i) => ({ __t: 'Put', i })),
-  GetObjectCommand: jest.fn().mockImplementation((i) => ({ __t: 'Get', i })),
-}), { virtual: true });
 
-jest.mock('@aws-sdk/s3-request-presigner', () => ({
-  getSignedUrl: (...a: unknown[]) => mockGetSignedUrl(...a),
-}), { virtual: true });
-
+// The seed line is named to the router, which says it as the conversation's assistant.
+const mockSay = jest.fn(async (..._args: unknown[]) => ({ posted: true }));
+jest.mock('../lambda/src/lib/say-through-router', () => ({ sayThroughRouter: (...a: unknown[]) => mockSay(...a) }));
 jest.mock('../lambda/src/lib/notification', () => ({
+  ...jest.requireActual('../lambda/src/lib/notification'),
   sendEmailNotifications: (...a: unknown[]) => mockSendEmail(...a),
 }));
 
+// THE RECIPIENTS ARE PEOPLE, by AppInstanceUser ARN. Their names and addresses are the directory's,
+// resolved at run time; the configuration carries neither.
 const MEMBERS = [
-  { userArn: 'arn:user/a', email: 'a@stratum.example.com', name: 'Demo Basic' },
-  { userArn: 'arn:user/b', email: 'b@stratum.example.com', name: 'Demo Standard' },
+  { userArn: 'arn:aws:chime:us-east-1:111:app-instance/i/user/a', email: 'a@stratum.example.com', name: 'Demo Basic' },
+  { userArn: 'arn:aws:chime:us-east-1:111:app-instance/i/user/b', email: 'b@stratum.example.com', name: 'Demo Standard' },
 ];
+const byArn = new Map(MEMBERS.map((m) => [m.userArn, m]));
+
+/** The handler, with the directory answering for the members above. */
+async function loadHandler() {
+  const ms = await import('../lambda/src/lib/membership-source');
+  ms.__setDefaultDirectoryForTests({
+    personsInGroup: async () => ({ persons: [], unminted: [] }),
+    personOf: async () => null,
+    admins: async () => ({ persons: [], unminted: [] }),
+    clearanceOf: async () => ({ state: 'none' as const }),
+    listGroups: async () => [],
+    groupsFor: async () => [],
+    clearedByGroups: async () => null,
+    findByAddress: async () => null,
+    accountState: async () => 'active' as const,
+    displayNameFor: async (arn) => byArn.get(arn)?.name ?? null,
+    contactFor: async (arn) => (byArn.get(arn) ? { route: 'email', address: byArn.get(arn)!.email, name: byArn.get(arn)!.name } : null),
+  });
+  return (await import('../lambda/src/proactive-briefing')).handler;
+}
+const ADMIN = 'arn:aws:chime:us-east-1:111:app-instance/i/user/ae-admin';
+const ADMIN_PARAM = '/agent/app-instance-admin-arn';
+
+/** The service admin by its parameter; every other read is the standard assistant's bot. */
+function answerSsm(admin = ADMIN): void {
+  mockSsmSend.mockImplementation(async (cmd: { i: { Name: string } }) =>
+    ({ Parameter: { Value: cmd.i.Name === ADMIN_PARAM ? admin : 'arn:bot/default' } }));
+}
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -60,32 +86,30 @@ beforeEach(() => {
   process.env.APP_INSTANCE_ARN = 'arn:aws:chime:us-east-1:111:app-instance/i';
   process.env.BOT_ARN_PARAM = '/agent/bot-arn';
   process.env.CHANNEL_FLOW_ARN_PARAM = '/agent/flow-arn';
-  process.env.REPORT_BUCKET = 'briefings-bucket';
+  process.env.CREATOR_BEARER_ARN_PARAM = ADMIN_PARAM;
   process.env.APP_URL = 'https://app.example';
-  process.env.BRIEFING_RECIPIENTS = JSON.stringify(MEMBERS);
-  mockSsmSend.mockResolvedValue({ Parameter: { Value: 'arn:bot/default' } });
+  process.env.BRIEFING_RECIPIENT_ARNS = MEMBERS.map((m) => m.userArn).join(',');
+  answerSsm();
   mockChimeSend.mockImplementation((cmd) =>
     cmd.__t === 'CreateChannel'
       ? Promise.resolve({ ChannelArn: 'arn:channel/proactive-1' })
       : Promise.resolve({}),
   );
-  mockS3Send.mockResolvedValue({});
-  mockGetSignedUrl.mockResolvedValue('https://s3.example/briefings/x.html?sig');
   mockSendEmail.mockResolvedValue({ sent: ['a@stratum.example.com', 'b@stratum.example.com'], failed: [] });
 });
 
 describe('proactive-briefing handler', () => {
   it('no recipients configured → ok, and nothing is created', async () => {
-    process.env.BRIEFING_RECIPIENTS = '[]';
-    const { handler } = await import('../lambda/src/proactive-briefing');
+    process.env.BRIEFING_RECIPIENT_ARNS = '';
+    const handler = await loadHandler();
     const res = await handler({ source: 'aws.events' });
     expect(res.ok).toBe(true);
     expect(mockChimeSend).not.toHaveBeenCalled();
     expect(mockSendEmail).not.toHaveBeenCalled();
   });
 
-  it('creates a bot-owned RESTRICTED/PRIVATE conversation and adds every member', async () => {
-    const { handler } = await import('../lambda/src/proactive-briefing');
+  it('creates a RESTRICTED/PRIVATE standard conversation as the service admin and adds every member', async () => {
+    const handler = await loadHandler();
     const res = await handler({ source: 'aws.events', 'detail-type': 'Scheduled Event' });
 
     expect(res.ok).toBe(true);
@@ -94,81 +118,83 @@ describe('proactive-briefing handler', () => {
     const create = mockChimeSend.mock.calls.find((c) => c[0].__t === 'CreateChannel')![0];
     expect(create.i.Mode).toBe('RESTRICTED');
     expect(create.i.Privacy).toBe('PRIVATE');
-    expect(create.i.ChimeBearer).toBe('arn:bot/default');
-    expect(JSON.parse(create.i.Metadata).createdViaProactive).toBe(true);
+    // THE SHARED CREATOR, AS THE SERVICE ADMIN: never as the assistant.
+    expect(create.i.ChimeBearer).toBe(ADMIN);
+    expect(JSON.parse(create.i.Metadata)).toEqual(expect.objectContaining({ createdViaProactive: true, modelTier: 'standard' }));
+    expect(create.i.Tags).toEqual(expect.arrayContaining([
+      { Key: 'classification', Value: 'standard' },
+      { Key: 'conversationType', Value: 'general' },
+    ]));
 
+    // The assistant and both recipients are added; every membership change bears the admin, which leaves.
     const adds = mockChimeSend.mock.calls.filter((c) => c[0].__t === 'AddMember');
-    expect(adds.map((a) => a[0].i.MemberArn).sort()).toEqual(['arn:user/a', 'arn:user/b']);
+    expect(adds.map((a) => a[0].i.MemberArn).sort()).toEqual(['arn:aws:chime:us-east-1:111:app-instance/i/user/a', 'arn:aws:chime:us-east-1:111:app-instance/i/user/b', 'arn:bot/default']);
+    const writes = mockChimeSend.mock.calls.map((c) => c[0]).filter((c) => ['CreateChannel', 'AssocFlow', 'AddMember', 'AddModerator', 'Leave', 'DropModerator'].includes(c.__t));
+    expect([...new Set(writes.map((c) => c.i.ChimeBearer))]).toEqual([ADMIN]);
+    expect(mockChimeSend.mock.calls.some((c) => c[0].__t === 'Leave' && c[0].i.MemberArn === ADMIN)).toBe(true);
+    // Nobody opened a briefing, so no recipient is made a moderator: only the assistant is.
+    const moderators = mockChimeSend.mock.calls.filter((c) => c[0].__t === 'AddModerator').map((c) => c[0].i.ChannelModeratorArn);
+    expect(moderators).toEqual(['arn:bot/default']);
   });
 
-  it('renders the page to S3 and signs a GET URL (created on the fly)', async () => {
-    const { handler } = await import('../lambda/src/proactive-briefing');
+  it('with no service admin, creates nothing: a conversation is never created as the assistant', async () => {
+    answerSsm('');
+    const error = jest.spyOn(console, 'error').mockImplementation(() => {});
+    const handler = await loadHandler();
     const res = await handler({ source: 'aws.events' });
-
-    const put = mockS3Send.mock.calls.find((c) => c[0].__t === 'Put')![0];
-    expect(put.i.Bucket).toBe('briefings-bucket');
-    expect(put.i.Key).toMatch(/^briefings\/conv-proactive-\d+\.html$/);
-    expect(put.i.ContentType).toContain('text/html');
-    expect(String(put.i.Body)).toContain('PROACTIVE');
-    expect(res.reportUrl).toBe('https://s3.example/briefings/x.html?sig');
+    error.mockRestore();
+    expect(res.ok).toBe(false);
+    expect(mockChimeSend.mock.calls.some((c) => c[0].__t === 'CreateChannel')).toBe(false);
+    expect(mockSendEmail).not.toHaveBeenCalled();
   });
 
-  it('emails every member via the notification workflow with both links', async () => {
-    const { handler } = await import('../lambda/src/proactive-briefing');
+  it('emails every member a link into the conversation, and no presigned page', async () => {
+    const handler = await loadHandler();
     await handler({ source: 'aws.events' });
 
     expect(mockSendEmail).toHaveBeenCalledTimes(1);
     const [recipients, content] = mockSendEmail.mock.calls[0];
-    expect(recipients).toEqual([
-      { email: 'a@stratum.example.com', name: 'Demo Basic' },
-      { email: 'b@stratum.example.com', name: 'Demo Standard' },
+    expect(recipients.map((r: { email: string; name: string }) => [r.email, r.name])).toEqual([
+      ['a@stratum.example.com', 'Demo Basic'],
+      ['b@stratum.example.com', 'Demo Standard'],
     ]);
-    expect(content.subject).toContain('Proactive Operational Briefing');
-    expect(content.bodyText).toContain('https://s3.example/briefings/x.html?sig');
+    // A briefing is a mail a person can stop, so each carries its unsubscribe link.
+    for (const r of recipients) expect(r.unsubscribeUrl).toMatch(/\/email\/preferences\?t=/);
+    expect(content.subject).toMatch(/^Proactive briefing for \d{4}-\d{2}-\d{2}$/);
     expect(content.bodyText).toContain('https://app.example?conversation=conv-proactive-');
-    expect(content.bodyHtml).toContain('<a href="https://s3.example/briefings/x.html?sig">');
+    expect(JSON.stringify(content)).not.toMatch(/X-Amz-|s3\./);
   });
 
-  it('seeds the conversation with a message linking the page', async () => {
-    const { handler } = await import('../lambda/src/proactive-briefing');
+  it('names the seed line to the router as the conversation assistant, with no link in it', async () => {
+    const handler = await loadHandler();
     await handler({ source: 'aws.events' });
-    const seed = mockChimeSend.mock.calls.find((c) => c[0].__t === 'SendMsg')![0];
-    expect(seed.i.ChimeBearer).toBe('arn:bot/default');
-    expect(seed.i.Content).toContain('https://s3.example/briefings/x.html?sig');
-    expect(seed.i.Content).toContain('proactive');
+    expect(mockChimeSend.mock.calls.some((c) => c[0].__t === 'SendMsg')).toBe(false);
+    const [classification, notice] = mockSay.mock.calls[mockSay.mock.calls.length - 1] as [string, { kind: string; botArn: string; vars: Record<string, string> }];
+    expect(classification).toBe('standard');
+    expect(notice.kind).toBe('briefingReady');
+    expect(notice.botArn).toBe('arn:bot/default');
+    expect(notice.vars).toEqual({ source: 'aws.events / Scheduled' });
   });
 
   it('is resilient: a member-add failure does not abort the run', async () => {
     mockChimeSend.mockImplementation((cmd) => {
       if (cmd.__t === 'CreateChannel') return Promise.resolve({ ChannelArn: 'arn:channel/p' });
-      if (cmd.__t === 'AddMember' && cmd.i.MemberArn === 'arn:user/a') {
+      if (cmd.__t === 'AddMember' && cmd.i.MemberArn === 'arn:aws:chime:us-east-1:111:app-instance/i/user/a') {
         return Promise.reject(new Error('not a member of app instance'));
       }
       return Promise.resolve({});
     });
-    const { handler } = await import('../lambda/src/proactive-briefing');
+    const handler = await loadHandler();
     const res = await handler({ source: 'aws.events' });
     expect(res.ok).toBe(true);
     expect(mockSendEmail).toHaveBeenCalledTimes(1); // still emailed
-  });
-
-  it('degrades cleanly when REPORT_BUCKET is unset (no page, still conv + email)', async () => {
-    delete process.env.REPORT_BUCKET;
-    const { handler } = await import('../lambda/src/proactive-briefing');
-    const res = await handler({ source: 'aws.events' });
-    expect(res.ok).toBe(true);
-    expect(res.reportUrl).toBeUndefined();
-    expect(mockS3Send).not.toHaveBeenCalled();
-    expect(mockSendEmail).toHaveBeenCalledTimes(1);
-    const [, content] = mockSendEmail.mock.calls[0];
-    expect(content.bodyText).not.toContain('Briefing page:');
   });
 
   it('top-level failure returns ok:false (no throw → no EventBridge retry storm)', async () => {
     mockChimeSend.mockImplementation((cmd) =>
       cmd.__t === 'CreateChannel' ? Promise.reject(new Error('Chime down')) : Promise.resolve({}),
     );
-    const { handler } = await import('../lambda/src/proactive-briefing');
+    const handler = await loadHandler();
     const res = await handler({ source: 'aws.events' });
     expect(res.ok).toBe(false);
     expect(res.error).toContain('Chime down');
@@ -181,21 +207,67 @@ export {};
 /**
  * The channel flow must be associated BEFORE any membership.
  *
- * The assistant is a member from `CreateChannel` itself (it is the acting bearer), so Lex can fire
- * WelcomeIntent from that instant and every message created before the association bypasses the flow.
- * `CreateChannel` takes no channel-flow field, so immediately after creation is the earliest point.
- *
- * Same defect `39208b5` fixed in `create-conversation/index.js` — fixed there only, and left standing
- * in this path plus two others because nothing held the six creation paths to a single order.
+ * Lex fires WelcomeIntent the moment the assistant becomes a member, and every message created before
+ * the association bypasses the flow. The service admin creates, so the assistant is first added after
+ * the association (`lib/channel-creation.ts`).
  */
 describe('channel-flow association ordering', () => {
   it('associates the flow before adding any member', async () => {
-    const { handler } = await import('../lambda/src/proactive-briefing');
+    const handler = await loadHandler();
     await handler({ source: 'aws.events' });
     const order = mockChimeSend.mock.calls.map((c) => (c[0] as { __t: string }).__t);
     // Guard against a vacuous pass: if no association is issued at all, the ordering below is
     // meaningless. CHANNEL_FLOW_ARN_PARAM is set in beforeEach, so it must appear.
     expect(order).toContain('AssocFlow');
     expect(order.indexOf('AssocFlow')).toBeLessThan(order.indexOf('AddMember'));
+  });
+});
+
+/**
+ * THE BRIEFING IS HELD AT THE CLASSIFICATION THAT DECLARES IT (`holdsBriefing`), whatever
+ * its classifications are called, and a deployment that declares none creates nothing.
+ */
+describe('the briefing classification is declared', () => {
+  const topology = { timeoutSeconds: 30, memorySize: 512, reservedConcurrency: 5, maxTokens: 1024,
+    streaming: false, contextRouting: false, systemPromptParam: false, intentPackParam: true, richProcessor: false, handlerExperimentsIndex: false };
+  const ownSet = (briefing?: string) => ({
+    classifications: [
+      { value: 'internal', profile: 'colleague', grants: ['internal'], topology, models: { selected: ['haiku', 'sonnet', 'titan', 'gpt_oss_20b', 'deepseek_v3'], default: 'sonnet' }, holdsBriefing: briefing === 'internal' },
+      { value: 'partner', profile: 'envoy', grants: ['partner'], topology, models: { selected: ['haiku'], default: 'haiku' }, holdsBriefing: briefing === 'partner' },
+    ],
+    profiles: [
+      { name: 'colleague', modelKey: 'sonnet', classifierMode: 'llm' as const, timeoutSeconds: 30, contextScope: 'granted' as const },
+      { name: 'envoy', modelKey: 'haiku', classifierMode: 'llm' as const, timeoutSeconds: 30, contextScope: 'granted' as const },
+    ],
+    groupClearance: { staff: 'internal', partners: 'partner' },
+  });
+  // The deployment's set, as the handler reads it at runtime: the rows its stacks publish.
+  const install = async (briefing?: string) => {
+    const { resolveDeploymentProfiles } = await import('../lib/config/profiles');
+    const { seedRegistryRows } = await import('./helpers/registry-rows');
+    seedRegistryRows(resolveDeploymentProfiles(ownSet(briefing)));
+  };
+  afterEach(async () => {
+    const { clearRegistryRows } = await import('./helpers/registry-rows');
+    clearRegistryRows();
+  });
+
+  it('creates the conversation at the declared classification and names the seed line to its router', async () => {
+    await install('partner');
+    const handler = await loadHandler();
+    const res = await handler({ source: 'aws.events' });
+    expect(res.ok).toBe(true);
+    const create = mockChimeSend.mock.calls.find((c) => c[0].__t === 'CreateChannel')![0];
+    expect(create.i.Tags).toEqual(expect.arrayContaining([{ Key: 'classification', Value: 'partner' }]));
+    expect(mockSay.mock.calls[mockSay.mock.calls.length - 1][0]).toBe('partner');
+  });
+
+  it('creates nothing when the deployment declares no briefing classification', async () => {
+    await install(undefined);
+    const handler = await loadHandler();
+    const res = await handler({ source: 'aws.events' });
+    expect(res).toEqual(expect.objectContaining({ ok: false, error: 'no briefing classification is declared' }));
+    expect(mockChimeSend).not.toHaveBeenCalled();
+    expect(mockSay).not.toHaveBeenCalled();
   });
 });

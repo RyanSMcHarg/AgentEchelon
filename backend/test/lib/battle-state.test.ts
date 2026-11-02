@@ -556,7 +556,7 @@ describe('resolveActiveBattleId (continuation pre-filter)', () => {
   });
 
   it('STILL HOLDS the pointer past ten minutes — a task-shaped duel runs at human pace (ADR-026)', async () => {
-    // This is the behaviour change, and it is the half worth pinning. The bound was a flat
+    // This is the behavior change, and it is the half worth pinning. The bound was a flat
     // ten minutes, which is the right order for a single-turn duel and wrong for one
     // collecting requirements from a person: it released the single-active-battle pointer mid-duel, so a
     // SECOND `/battle` could start alongside the first. An over-long bound is safe here by design (the
@@ -600,63 +600,6 @@ describe('extractTargetedBotArns (Target → bot ARNs — pure)', () => {
     expect(extractTargetedBotArns(undefined)).toEqual([]);
     expect(extractTargetedBotArns([])).toEqual([]);
     expect(extractTargetedBotArns([{}, { MemberArn: '' }])).toEqual([]);
-  });
-});
-
-describe('planBattleContinuation (per-bot resume routing — pure)', () => {
-  // Pure — no DDB. The strict-isolation cases are the load-bearing ones:
-  // a waiting bot the user did NOT address must never resume.
-  const waiting = (botArn: string) =>
-    ({ battleId: BATTLE_ID, botArn, state: 'WAITING_FOR_USER' as const });
-  const completed = (botArn: string) =>
-    ({ battleId: BATTLE_ID, botArn, state: 'COMPLETED' as const });
-
-  it('resumes a single addressed waiting bot', async () => {
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    expect(planBattleContinuation([waiting(BOT_A), completed(BOT_B)], [BOT_A]))
-      .toEqual({ resumeBotArns: [BOT_A] });
-  });
-
-  it('ISOLATION: a waiting bot the user did NOT address stays waiting', async () => {
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    // Both waiting; user replied only to A. B must NOT resume — it must
-    // not free-ride on A's clarification (measured-dimension integrity).
-    expect(planBattleContinuation([waiting(BOT_A), waiting(BOT_B)], [BOT_A]))
-      .toEqual({ resumeBotArns: [BOT_A] });
-  });
-
-  it('an addressed bot that already finished round 1 is ignored (not a continuation)', async () => {
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    expect(planBattleContinuation([completed(BOT_A), waiting(BOT_B)], [BOT_A]))
-      .toEqual({ resumeBotArns: [] });
-  });
-
-  it('explicit "all" — user deliberately addresses both waiting bots → both resume, mention order preserved', async () => {
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    expect(planBattleContinuation([waiting(BOT_A), waiting(BOT_B)], [BOT_B, BOT_A]))
-      .toEqual({ resumeBotArns: [BOT_B, BOT_A] });
-  });
-
-  it('no mentions / undefined mentions → empty (ordinary chatter, not a continuation)', async () => {
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    expect(planBattleContinuation([waiting(BOT_A)], []).resumeBotArns).toEqual([]);
-    expect(planBattleContinuation([waiting(BOT_A)], undefined).resumeBotArns).toEqual([]);
-  });
-
-  it('dedupes repeated mentions and excludes the __orchestrator__ sentinel', async () => {
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    const rows = [
-      waiting(BOT_A),
-      { battleId: BATTLE_ID, botArn: '__orchestrator__', state: 'WAITING_FOR_USER' as const },
-    ];
-    expect(planBattleContinuation(rows, [BOT_A, BOT_A, '__orchestrator__']))
-      .toEqual({ resumeBotArns: [BOT_A] });
-  });
-
-  it('mentions with no battle waiting at all → empty', async () => {
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    expect(planBattleContinuation([completed(BOT_A), completed(BOT_B)], [BOT_A, BOT_B]))
-      .toEqual({ resumeBotArns: [] });
   });
 });
 
@@ -709,82 +652,6 @@ describe('getBotRow (single-item self-row read)', () => {
     const { getBotRow } = await import('../../lambda/src/lib/battle-state');
     expect(await getBotRow(BATTLE_ID, BOT_A)).toBeNull();
     expect(mockSend).not.toHaveBeenCalled();
-  });
-});
-
-/**
- * A DUEL HAS ONE OWNER: the person who ran `/battle` (owner, 2026-08-13).
- *
- * The continuation used to match on the mentioned BOT alone, so any member of the channel could answer
- * a question they were never asked and steer a comparison they did not start — while the person who
- * did start it found their duel already moved on. Ownership is what makes "whose reply counts" have one
- * answer, and it is the same answer the task queue gives, because the waiting side's task is assigned
- * to that person.
- */
-describe('planBattleContinuation — only the initiator resumes a duel', () => {
-  const OWNER = 'user-owner';
-  const OTHER = 'user-other';
-  const BOT = 'arn:aws:chime:us-east-1:1:app-instance/i/bot/Atlas';
-
-  const waitingRow = (over: Record<string, unknown> = {}) => ({
-    battleId: 'b1',
-    botArn: BOT,
-    state: 'WAITING_FOR_USER' as const,
-    initiatorUserSub: OWNER,
-    ...over,
-  });
-
-  it('resumes for the owner', async () => {
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    const plan = planBattleContinuation([waitingRow()], [BOT], OWNER);
-    expect(plan.resumeBotArns).toEqual([BOT]);
-  });
-
-  it('resumes NOTHING for another member, who falls through to an ordinary turn', async () => {
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    const plan = planBattleContinuation([waitingRow()], [BOT], OTHER);
-    expect(plan.resumeBotArns).toEqual([]);
-  });
-
-  it('resumes for a duel recorded before owners existed, rather than becoming unanswerable', async () => {
-    // An in-flight battle written by the previous build carries no initiator. Blocking it would strand
-    // the duel with nobody able to answer it — worse than the openness being fixed.
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    const plan = planBattleContinuation([waitingRow({ initiatorUserSub: undefined })], [BOT], OTHER);
-    expect(plan.resumeBotArns).toEqual([BOT]);
-  });
-
-  it('resumes when the speaker is unknown, for the same reason', async () => {
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    const plan = planBattleContinuation([waitingRow()], [BOT], undefined);
-    expect(plan.resumeBotArns).toEqual([BOT]);
-  });
-
-  /**
-   * THE ENFORCEMENT WAS INERT AS SHIPPED, and this is the half that makes it real.
-   *
-   * The owner was read off the ROWS, and the rows do not reliably keep it: `transitionBotState`
-   * rewrote the whole item on every terminal transition, so a duel's recorded owner was erased by its
-   * own completion. Live rows carried `owner=(none)` half an hour after the deploy that added the
-   * field. A check whose comparand is empty passes for EVERYONE — the exact hole it was added to close.
-   *
-   * The owner is on the CHANNEL POINTER, written once at fan-out by the one writer that knows it, and
-   * every live duel had it. So the caller resolves it there and hands it in.
-   */
-  it('takes the owner the CALLER resolved, when the rows have lost theirs', async () => {
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    const rowsWithNoOwner = [waitingRow({ initiatorUserSub: undefined })];
-
-    // The shape that shipped: no owner on the row, a stranger replying.
-    expect(planBattleContinuation(rowsWithNoOwner, [BOT], OTHER, OWNER).resumeBotArns).toEqual([]);
-    expect(planBattleContinuation(rowsWithNoOwner, [BOT], OWNER, OWNER).resumeBotArns).toEqual([BOT]);
-  });
-
-  it('still enforces a row-recorded owner when the caller resolved none', async () => {
-    // Defence in depth, and the path an in-flight duel takes across the deploy: the pointer may
-    // predate the field while the rows carry it.
-    const { planBattleContinuation } = await import('../../lambda/src/lib/battle-state');
-    expect(planBattleContinuation([waitingRow()], [BOT], OTHER, undefined).resumeBotArns).toEqual([]);
   });
 });
 

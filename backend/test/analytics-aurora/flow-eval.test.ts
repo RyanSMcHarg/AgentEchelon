@@ -36,7 +36,7 @@ describe('flow-eval (Pass B)', () => {
     // 1) Pass A: no unscored exchanges. 2) Pass B: one flow to score. 3) its turns. 4) upsert.
     mockedQuery
       .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any) // getUnscoredExchanges (Pass A)
-      .mockResolvedValueOnce({ rows: [{ task_id: 'task-1', channel_arn: 'c1', intent: 'general', user_type: 'human', agent_type: 'premium', exchange_count: 2, first_at: '2026-07-15T00:00:00Z', last_at: '2026-07-15T00:05:00Z' }], rowCount: 1 } as any) // getFlowsToScore
+      .mockResolvedValueOnce({ rows: [{ task_id: 'task-1', channel_arn: 'c1', intent: 'general', assistant: 'premium', exchange_count: 2, first_at: '2026-07-15T00:00:00Z', last_at: '2026-07-15T00:05:00Z' }], rowCount: 1 } as any) // getFlowsToScore
       .mockResolvedValueOnce({ rows: [{ user_message: 'build me a report', agent_response: 'starting…' }, { user_message: 'yes', agent_response: 'Done — report ready.' }], rowCount: 2 } as any) // getTaskExchanges
       .mockResolvedValueOnce({ rows: [], rowCount: 1 } as any); // upsert
 
@@ -60,6 +60,9 @@ describe('flow-eval (Pass B)', () => {
     const [upSql, upParams] = mockedQuery.mock.calls[3] as [string, unknown[]];
     expect(upSql).toMatch(/INSERT INTO intent_flows/);
     expect(upSql).toMatch(/ON CONFLICT \(task_id\) DO UPDATE/);
+    // `intent_flows.user_type` is deprecated (migration 050) and no longer written.
+    expect(upSql).not.toMatch(/user_type/);
+    expect(selSql).not.toMatch(/user_type/);
     expect(upParams).toEqual(expect.arrayContaining(['task-1', 'c1', 'general', 'completed', 90, 70, 85, 75, 80]));
     // turn_count = messages ≈ 2 × exchanges (2 turns → 4)
     expect(upParams).toContain(4);
@@ -67,8 +70,8 @@ describe('flow-eval (Pass B)', () => {
 
   it('Pass A stamps the flow join keys (task_id + flow_id subquery) at write time [P1]', async () => {
     mockedQuery
-      .mockResolvedValueOnce({ rows: [{ id: 'ex-1', channel_arn: 'c1', agent_type: 'premium', user_type: 'human', intent: 'report_generation', task_id: 'task-1', created_at: '2026-07-15T00:00:00Z', user_message: 'build me a report', agent_response: 'starting…' }], rowCount: 1 } as any) // getUnscoredExchanges
-      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any) // getPriorTurns (context)
+      .mockResolvedValueOnce({ rows: [{ id: 'ex-1', channel_arn: 'c1', assistant: 'premium', conversation_classification: 'premium', intent: 'report_generation', task_id: 'task-1', created_at: '2026-07-15T00:00:00Z', user_message: 'build me a report', agent_response: 'starting…' }], rowCount: 1 } as any) // getUnscoredExchanges
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any) // getPriorMessages (context)
       .mockResolvedValueOnce({ rows: [], rowCount: 1 } as any) // INSERT evaluation_results
       .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any); // getFlowsToScore (Pass B: nothing)
     mockSend.mockResolvedValueOnce(bedrockJson({ relevanceScore: 88, classification: 'good', reasoning: 'on task' }));
@@ -87,7 +90,7 @@ describe('flow-eval (Pass B)', () => {
   it('Pass B backfills flow_id onto Pass A rows scored before the flow existed [P1]', async () => {
     mockedQuery
       .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any) // Pass A: none
-      .mockResolvedValueOnce({ rows: [{ task_id: 'task-1', channel_arn: 'c1', intent: 'general', user_type: 'human', agent_type: 'premium', exchange_count: 2, first_at: '2026-07-15T00:00:00Z', last_at: '2026-07-15T00:05:00Z' }], rowCount: 1 } as any) // getFlowsToScore
+      .mockResolvedValueOnce({ rows: [{ task_id: 'task-1', channel_arn: 'c1', intent: 'general', assistant: 'premium', exchange_count: 2, first_at: '2026-07-15T00:00:00Z', last_at: '2026-07-15T00:05:00Z' }], rowCount: 1 } as any) // getFlowsToScore
       .mockResolvedValueOnce({ rows: [{ user_message: 'build me a report', agent_response: 'starting…' }, { user_message: 'yes', agent_response: 'done' }], rowCount: 2 } as any) // getTaskExchanges
       .mockResolvedValueOnce({ rows: [], rowCount: 1 } as any) // upsert intent_flows
       .mockResolvedValueOnce({ rows: [], rowCount: 3 } as any); // backfill UPDATE evaluation_results
@@ -106,7 +109,7 @@ describe('flow-eval (Pass B)', () => {
   it('invalid status from the judge falls back to completed', async () => {
     mockedQuery
       .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)
-      .mockResolvedValueOnce({ rows: [{ task_id: 't2', channel_arn: 'c1', intent: null, user_type: null, agent_type: null, exchange_count: 1, first_at: '2026-07-15T00:00:00Z', last_at: '2026-07-15T00:00:10Z' }], rowCount: 1 } as any)
+      .mockResolvedValueOnce({ rows: [{ task_id: 't2', channel_arn: 'c1', intent: null, assistant: null, exchange_count: 1, first_at: '2026-07-15T00:00:00Z', last_at: '2026-07-15T00:00:10Z' }], rowCount: 1 } as any)
       .mockResolvedValueOnce({ rows: [{ user_message: 'hi', agent_response: 'hello' }], rowCount: 1 } as any)
       .mockResolvedValueOnce({ rows: [], rowCount: 1 } as any);
     mockSend.mockResolvedValueOnce(bedrockJson({ outcomeScore: 50, informationScore: 50, efficiencyScore: 50, contextRetentionScore: 50, uxScore: 50, outcome: 'x', status: 'nonsense', reasoning: '' }));
@@ -115,5 +118,75 @@ describe('flow-eval (Pass B)', () => {
     const [, upParams] = mockedQuery.mock.calls[3] as [string, unknown[]];
     expect(upParams).toContain('completed'); // status coerced
     expect(upParams).toContain('unknown'); // null intent → 'unknown' (NOT NULL column)
+  });
+
+  /**
+   * Pass D: the flows that stopped rather than finished.
+   *
+   * A FLOW'S STATUS IS A VERDICT ON A MOMENT AND NOTHING REVISITED IT. The judge may answer
+   * `in_progress`, which is correct at the time; if the conversation then goes quiet the flow gains
+   * no turns, so it is never re-scored, so that verdict stands forever. Measured on the reference
+   * deployment: 32 of 50 flows over a fortnight, 64%, in a state with no exit.
+   */
+  describe('the stale-flow sweep (Pass D)', () => {
+    const sweepCall = () => mockedQuery.mock.calls.find(([sql]) => /UPDATE intent_flows/.test(sql as string)
+      && /status = 'abandoned'/.test(sql as string));
+
+    /** Pass A empty, Pass B empty, Pass C empty - so only the sweep does anything. */
+    function onlyTheSweep(sweptRows: { id: string }[]) {
+      mockedQuery
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)  // Pass A
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)  // Pass B
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)  // Pass E
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)  // Pass C
+        .mockResolvedValueOnce({ rows: sweptRows, rowCount: sweptRows.length } as any);
+    }
+
+    it('closes in_progress flows nothing has touched, and reports how many', async () => {
+      onlyTheSweep([{ id: 'f1' }, { id: 'f2' }]);
+      const res = await handler({});
+      expect(JSON.parse(res.body).staleFlowsClosed).toBe(2);
+      expect(sweepCall()).toBeDefined();
+    });
+
+    it('reaches only in_progress rows, is bounded, and calls no model', async () => {
+      onlyTheSweep([]);
+      await handler({});
+
+      const [sql, params] = sweepCall() as [string, unknown[]];
+      // ONLY `in_progress`. A completed or failed flow has an answer already, and a sweep that
+      // overwrote one would replace a judged verdict with a clerical one.
+      expect(sql).toMatch(/WHERE status = 'in_progress'/);
+      // Idle measured from the last TURN, falling back to creation for a flow that never got one.
+      expect(sql).toMatch(/COALESCE\(last_exchange_at, created_at\)/);
+      expect(sql).toContain('LIMIT $3');
+      // THE HOURS ARE PASSED TWICE, AS INT AND AS TEXT, AND THAT IS DELIBERATE. Postgres deduces a
+      // parameter's type independently at each use, so one placeholder read as `::int` in the jsonb
+      // and as text inside `($n || ' hours')` fails the whole statement - the trap already recorded
+      // against $9 in the Pass A insert.
+      expect(params).toEqual([48, '48', 200]);
+      // A CLEANUP, NOT A RE-SCORE: no Bedrock call, and no dimension score in the statement. An
+      // abandoned flow has no outcome to score, and stamping one puts a number on work nobody did.
+      expect(mockSend).not.toHaveBeenCalled();
+      expect(sql).not.toMatch(/outcome_score/);
+    });
+
+    it('records what closed the row, so a swept flow is distinguishable from a judged one', async () => {
+      onlyTheSweep([]);
+      await handler({});
+      expect((sweepCall() as [string, unknown[]])[0]).toContain('stale-flow-sweep');
+    });
+
+    it('does not fail the run when the sweep errors', async () => {
+      mockedQuery
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)
+        .mockResolvedValueOnce({ rows: [], rowCount: 0 } as any)
+        .mockRejectedValueOnce(new Error('deadlock detected (simulated)'));
+
+      const res = await handler({});
+      expect(res.statusCode).toBe(200);
+      expect(JSON.parse(res.body).staleFlowsClosed).toBe(0);
+    });
   });
 });

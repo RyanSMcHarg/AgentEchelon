@@ -18,7 +18,9 @@
  *     (lib/correlation.ts) - so `turn_id` is genuinely declared for those rows, not guessed;
  *   - a user CREATE paired to that placeholder through `exchanges` is the turn's anchor, and its
  *     `turn_id` is therefore PAIRED, which the row records rather than implying it was declared;
- *   - `agent_final_at` on the canonical row is the final answer's Chime instant.
+ *   - `agent_final_at` on the canonical row is the final answer's Chime instant;
+ *   - a duel side's placeholder carries `<!--battle:...round=N...-->`, so the round is a declared
+ *     fact about that row too, and NULL on every message that is not a duel side.
  *
  * Deliberately NOT backfilled: `processor_entry`. Only `exchanges.inbound_ms` survives for history,
  * which is a duration, not an instant; reconstructing a timestamp from it would put a computed value
@@ -60,7 +62,8 @@ export async function backfillTurnEvents(
   const placeholders = await query(
     `INSERT INTO turn_events (
         kind, turn_id, response_id, turn_id_source, trigger_kind, actor,
-        source_message_id, source_event_type, channel_arn, occurred_at, clock, auditable)
+        source_message_id, source_event_type, channel_arn, occurred_at, clock, auditable,
+        battle_round)
      SELECT 'placeholder_posted',
             substring(c.content from '<!--corr:([A-Za-z0-9._-]{1,64})-->'),
             c.message_id,
@@ -72,7 +75,17 @@ export async function backfillTurnEvents(
             c.channel_arn,
             c.created_at,
             'chime',
-            TRUE
+            TRUE,
+            -- THE DUEL ROUND, FROM THE SAME MARKER THE LIVE WRITER READS. History holds the
+            -- placeholder's own content on the CREATE row, so the marker survives here even though
+            -- the answer update overwrote what the person sees. NULL on every ordinary turn, which
+            -- is what the column means to every reader of it.
+            --
+            -- Four digits and a trailing constraint, matching battleRoundOf in turn-events-live.ts:
+            -- the column is a SMALLINT and a wider number would fail the statement, so a marker
+            -- claiming one is refused rather than truncated to its first four digits. Sourced from
+            -- content rather than from metadata for the reason stated on that function.
+            substring(c.content from '<!--battle:[^>]*?round=([0-9]{1,4})(?![0-9])')::smallint
        FROM messages c
        LEFT JOIN LATERAL (
             SELECT e.id FROM exchanges e WHERE e.agent_message_id = c.id ORDER BY e.created_at LIMIT 1
@@ -112,8 +125,25 @@ export async function backfillTurnEvents(
       WHERE c.event_type = 'CREATE_CHANNEL_MESSAGE'
         AND um.created_at >= NOW() - INTERVAL '1 day' * $1
         AND substring(c.content from '<!--corr:([A-Za-z0-9._-]{1,64})-->') IS NOT NULL
+        -- A REBUTTAL IS NEVER BOUND TO THE PERSON'S MESSAGE, the rule migration 064 applies to the
+        -- view's anchor lateral and 071 keeps, applied here to the ledger's own rows. Its exchange carries the
+        -- message the duel began from, and binding that message to the round-2 turn would give the
+        -- ledger a person anchor two rounds early. Round two anchors on its declared trigger instead.
+        AND COALESCE(e.battle_round, 1) <= 1
       ORDER BY um.message_id, um.channel_arn, e.created_at
-     ON CONFLICT (source_message_id, source_event_type, occurred_at, kind)
+     -- (No backticks in this SQL: the statement is a JS template literal, so one ends the string
+     --  mid-query. The same note guards the SQL in analytics-query.ts, for the same reason.)
+     -- THE ARBITER AS IT NOW IS (code review, 2026-09-11). This named 024's four-column key, which
+     -- migration 041 DROPPED and replaced with an expression index carrying COALESCE(step_name, '').
+     -- A conflict target that matches no unique index is not a no-op: Postgres raises 42P10 and the
+     -- whole statement fails, so this pass errored on every run and no live-archived user_message row
+     -- was ever bound to its turn. Since the migrations apply on cold start, shipping 041 broke this
+     -- silently in the same deploy.
+     --
+     -- The bare DO NOTHING that writeTurnEvents uses is not available here: this pass has to DO
+     -- UPDATE to bind a turn_id onto the row the live writer already laid down, and DO UPDATE
+     -- requires a target. So it names the new index exactly, expression included.
+     ON CONFLICT (source_message_id, source_event_type, occurred_at, kind, COALESCE(step_name, ''))
      DO UPDATE SET turn_id = EXCLUDED.turn_id
       WHERE turn_events.turn_id IS NULL`,
     [days],
@@ -132,7 +162,8 @@ export async function backfillTurnEvents(
   const finalResponses = await query(
     `INSERT INTO turn_events (
         kind, turn_id, response_id, turn_id_source, actor,
-        source_message_id, source_event_type, channel_arn, occurred_at, clock, auditable)
+        source_message_id, source_event_type, channel_arn, occurred_at, clock, auditable,
+        battle_round)
      SELECT 'final_response',
             substring(c.content from '<!--corr:([A-Za-z0-9._-]{1,64})-->'),
             c.message_id,
@@ -143,7 +174,12 @@ export async function backfillTurnEvents(
             c.channel_arn,
             c.agent_final_at,
             'chime',
-            TRUE
+            TRUE,
+            -- The same round on the close as on the placeholder, which is the pairing the live
+            -- writer makes for a turn that closes itself: one event, one round, and an asymmetry
+            -- between the two rows would read as a fact about the close rather than about the turn.
+            -- Read from c.content, the CREATE row's own text, for the same reason.
+            substring(c.content from '<!--battle:[^>]*?round=([0-9]{1,4})(?![0-9])')::smallint
        FROM messages c
       WHERE c.event_type = 'CREATE_CHANNEL_MESSAGE'
         AND c.is_bot = TRUE
@@ -216,4 +252,45 @@ export async function compareLatencyDerivations(days = 7): Promise<{
   const rows = res.rows as Array<{ response_id: string; ledger_e2e_ms: number | null; legacy_e2e_ms: number | null }>;
   const disagreed = rows.filter((r) => (r.ledger_e2e_ms ?? null) !== (r.legacy_e2e_ms ?? null));
   return { compared: rows.length, agreed: rows.length - disagreed.length, disagreed: disagreed.slice(0, 50) };
+}
+
+/**
+ * WHAT THE DEFERRAL MEASUREMENT ACTUALLY RECORDED, read back so it can be believed.
+ *
+ * `v_queue_acknowledgement` was created by migration 039 and nothing could read it: there is no
+ * generic query op, and the admin surfaces do not know about it. A view nobody can select from is
+ * indistinguishable from a view that returns nothing, which is precisely the state the whole
+ * deferral-measurement change was fixing - a number that is absent rather than wrong.
+ *
+ * Read-only and bounded. It answers one question: for recently queued messages, was the
+ * acknowledgement recorded, and how long did the person wait for it.
+ */
+export async function queueAcknowledgementSample(limit = 20): Promise<{
+  rows: number;
+  withAck: number;
+  sample: Array<{
+    message_id: string;
+    ack_ms: number | null;
+    drained_ms: number | null;
+    acknowledged_at: string | null;
+  }>;
+}> {
+  const capped = Math.max(1, Math.min(200, Math.floor(limit)));
+  const res = await query(
+    `SELECT message_id, ack_ms, drained_ms, acknowledged_at
+       FROM v_queue_acknowledgement
+      ORDER BY acknowledged_at DESC NULLS LAST
+      LIMIT $1`,
+    [capped],
+  );
+  const sample = (res.rows ?? []) as Array<{
+    message_id: string; ack_ms: number | null; drained_ms: number | null; acknowledged_at: string | null;
+  }>;
+  return {
+    rows: sample.length,
+    // A row with a NULL ack_ms means the acknowledgement was recorded but the SEND was not matched -
+    // worth separating, because it is a different failure from no rows at all.
+    withAck: sample.filter((r) => r.ack_ms !== null).length,
+    sample,
+  };
 }

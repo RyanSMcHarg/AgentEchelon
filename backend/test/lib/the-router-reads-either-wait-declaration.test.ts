@@ -2,7 +2,7 @@
  * The router's "does this person owe an answer" check reads BOTH accepted wait declarations
  * (SPEC-TASK-STATE-TRANSITIONS §12.6).
  *
- * This is the consumer with the widest blast radius and the quietest failure. The licence to read an
+ * This is the consumer with the widest blast radius and the quietest failure. The license to read an
  * ordinary message as the answer to a step is the machine declaring that it cannot go further without
  * one; a router that reads only `awaitsUser` decides that a machine authored with `awaits` blocks on
  * nobody, so a person's answer to the assistant's own question becomes an unrelated turn. Nothing
@@ -35,6 +35,7 @@ jest.mock('@aws-sdk/client-lambda', () => ({
 jest.mock('@aws-sdk/client-ssm', () => ({
   SSMClient: jest.fn().mockImplementation(() => ({ send: mockSsmSend })),
   GetParameterCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetParam', input: args })),
+  GetParametersByPathCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetByPath', input: args })),
 }), { virtual: true });
 
 const mockGetActiveTaskForOwner = jest.fn();
@@ -50,7 +51,7 @@ jest.mock('../../lambda/src/lib/task-tracking.js', () => {
       const t = await mockGetActiveTaskForOwner(...a);
       return t ? [t] : [];
     },
-    getOwnerChannelTasks: async (...a: unknown[]) => {
+    getAssigneeChannelTasks: async (...a: unknown[]) => {
       const t = await mockGetActiveTaskForOwner(...a);
       return { live: t ? [t] : [], recentlyEnded: [] };
     },
@@ -91,8 +92,8 @@ const turn = (userMessage: string) => ({
 
 /** The assistant holds the chain; the person holds nothing, so the assistant's own chain is consulted. */
 const assistantHolds = (taskState: string) =>
-  mockGetActiveTaskForOwner.mockImplementation(async (ownerId: string) =>
-    ownerId === principalIdOf(BOT)
+  mockGetActiveTaskForOwner.mockImplementation(async (assigneeId: string) =>
+    assigneeId === principalIdOf(BOT)
       ? { taskId: 't-parity', taskType: 'parity_flow', taskState, channelArn: CHANNEL }
       : null);
 
@@ -100,9 +101,15 @@ async function loadRouter(packMachineWait: Record<string, unknown>) {
   jest.resetModules();
   jest.clearAllMocks();
   process.env.ASSISTANT_INTENT_PACK = packWith(packMachineWait);
-  process.env.ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:router-standard';
+  process.env.STANDARD_ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:router-standard';
   process.env.PREMIUM_ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:router-premium';
-  mockSsmSend.mockResolvedValue({ Parameter: { Value: BOT } });
+  process.env.CLASSIFICATION = 'premium';
+  // The bot parameter, and the assignment record naming the assistant on that bot: the router
+  // resolves the turn's assistant from it and declines a turn whose assistant it cannot name.
+  mockSsmSend.mockResolvedValue({
+    Parameter: { Value: BOT },
+    Parameters: [{ Value: JSON.stringify({ botArn: BOT, assistant: 'advisor', role: 'primary', occupancy: 'live' }) }],
+  });
   mockMessagingSend.mockImplementation(async (cmd: { __type?: string }) => {
     if (cmd?.__type === 'ListTags') return { Tags: [{ Key: 'classification', Value: 'premium' }] };
     return { MessageId: 'sent-1' };
@@ -142,3 +149,5 @@ describe('a chain blocked on a person is resumed however the machine spelled the
     expect(mockApplyUserResponseToTask).not.toHaveBeenCalled();
   });
 });
+
+afterAll(() => { delete process.env.CLASSIFICATION; });

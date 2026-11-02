@@ -3,7 +3,7 @@
  *
  * When the router suppresses a RETRIED fulfillment it still has to return something: Amazon Chime SDK
  * posts the Lex envelope into the channel either way, so the only question is whether the client
- * recognises it as nothing. Both client ingestion paths drop a Lex envelope whose `Messages` is present
+ * recognizes it as nothing. Both client ingestion paths drop a Lex envelope whose `Messages` is present
  * AND empty; an ABSENT field leaves `parsed.Messages` undefined, falls through that guard, and renders
  * the raw envelope to the user.
  *
@@ -33,7 +33,7 @@ describe('formatLexSilentResponse', () => {
   });
 
   it('serialises to the exact envelope the client suppression matches', () => {
-    // Asserted on the serialised form because that is what crosses the wire and what the client
+    // Asserted on the serialized form because that is what crosses the wire and what the client
     // JSON.parses back out, rather than on the object the function happens to return.
     const parsed = JSON.parse(JSON.stringify(formatLexSilentResponse(EVENT)));
     expect(parsed.messages).toEqual([]);

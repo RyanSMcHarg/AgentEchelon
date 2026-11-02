@@ -136,7 +136,11 @@ describe('guardrail selection + fail-safe fallback (SPEC-CONFIGURABLE-ASSISTANTS
 
   it('empty text is a no-op (no ApplyGuardrail call at all)', async () => {
     await applyOutputGuardrail('', 'gr-profile');
-    expect(await applyInputGuardrail('', 'gr-profile')).toEqual({ blocked: false, message: '' });
+    // NO FINDINGS, not an absent field. The result carries which policies intervened as well as
+    // whether it blocked, and a no-op has to say "nothing intervened" rather than leave that
+    // unanswered - the findings are compliance evidence, and an absent list would read downstream as
+    // a turn nobody looked at rather than a turn with nothing to report.
+    expect(await applyInputGuardrail('', 'gr-profile')).toEqual({ blocked: false, message: '', findings: [] });
     expect(applyCalls()).toHaveLength(0);
   });
 });

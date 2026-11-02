@@ -21,6 +21,7 @@
 
 import { ensureSchema } from './db-client.js';
 import { executeClassifierReplay, openClassifierReplay, type StartReplayInput } from './classifier-replay.js';
+import { loadProfileRegistry } from '../../../lib/profile-registry';
 
 export interface ClassifierReplayEvent {
   /** The run to execute. With `open`, the id to open it UNDER; without, a run that already exists. */
@@ -35,6 +36,8 @@ export interface ClassifierReplayEvent {
 }
 
 export async function handler(event: ClassifierReplayEvent) {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   const runId = (event?.runId || '').trim();
   if (!runId) throw new Error('[classifier-replay] runId is required');
 

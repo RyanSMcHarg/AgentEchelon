@@ -26,11 +26,15 @@ jest.mock('../lambda/src/lib/sleep-mode', () => ({
 }));
 
 const mockCallerIsAdmin = jest.fn();
+// Who asked is the person the one resolver names; here, the admin the event was built for.
+const mockCallerPersonId = jest.fn();
 jest.mock('../lambda/src/lib/auth', () => ({
   callerIsAdmin: (...a: unknown[]) => mockCallerIsAdmin(...a),
+  callerPersonId: (...a: unknown[]) => mockCallerPersonId(...a),
 }));
 
 import { handler } from '../lambda/src/deployment-sleep';
+import { edgeContext } from './helpers/edge-context';
 
 const ADMIN_SUB = 'admin-sub-1';
 
@@ -39,7 +43,7 @@ function makeEvent(path: string, sub: string = ADMIN_SUB): APIGatewayProxyEvent 
     httpMethod: 'POST',
     path,
     resource: path,
-    requestContext: { authorizer: { claims: { sub } } },
+    requestContext: { authorizer: edgeContext({ claims: { sub } }) },
   } as unknown as APIGatewayProxyEvent;
 }
 
@@ -51,6 +55,7 @@ function failureAlerts(): Array<[string, string]> {
 beforeEach(() => {
   jest.clearAllMocks();
   mockCallerIsAdmin.mockReturnValue(true);
+  mockCallerPersonId.mockResolvedValue(ADMIN_SUB);
   mockGetState.mockResolvedValue({ state: 'awake', lastActivityAt: 1 });
   mockSetState.mockResolvedValue(undefined);
   mockSetAurora.mockResolvedValue(undefined);

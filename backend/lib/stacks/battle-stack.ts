@@ -1,63 +1,83 @@
 /**
  * BattleStack (`AgentEchelonBattle`) — the /battle head-to-head feature, an
- * independently-deployable, **opt-in** stack. A deployer who doesn't want
- * /battle simply doesn't deploy this stack (and sets `-c enableBattle=false`);
- * the classification processors + channel-flow then run with no battle plumbing and fail
- * open.
+ * independently-deployable stack created when the deployment declares the `battle` capability
+ * (`lib/config/capabilities.ts`). Without it the assistant stacks and channel-flow are built with no
+ * battle plumbing.
  *
  * Owns end-to-end:
  *   - Battle tables: `BattleState` (per-bot round state), `ChannelBattleConfig`
  *     (per-channel enable flag), `BattleOutcome` (the user's winner pick).
- *   - A battle-OWNED Lex bot + the alt-slot fulfillment handler
- *     (`battle-alt-slot-handler.ts`). The alt-slots run on THIS Lex, which keeps
- *     battle self-contained and is what avoids a battle<->premium deploy cycle.
- *     Round-1 replies come from the channel flow handing the turn to the router;
- *     a USER answering an alt side arrives through this Lex, and the handler hands
- *     that turn to the same router with the slot's own identity attached.
- *   - The alt-bot slot pool (AppInstanceBots with no static persona; the
- *     model/prompt each serves is read at runtime from the bound experiment
- *     variant) + per-slot + roster SSM.
- *   - The battle orchestrator Lambda (drives round-2 fan-out; invokes the
- *     premium classification processor resolved at runtime from SSM).
+ *   - The battle orchestrator Lambda (drives round-2 fan-out through each
+ *     classification's router, resolved at deploy from that router's published
+ *     ARN; the router posts every line of the duel, so the orchestrator speaks as
+ *     no assistant).
  *   - The channel-battle admin API (`/channels/battle` GET/enable/disable) and
  *     the battle-outcome API (`/channels/battle/outcome` GET/POST).
- *   - Publishes the shared SSM contract the per-classification processors/handlers
- *     resolve: `/agent-echelon/shared/tables/{battle-state-arn,battle-state-name,
- *     channel-battle-config-name}` + `/agent-echelon/shared/battle-orchestrator-arn`.
+ *   - The grant on its tables held by the channel flow's role.
+ *   - The shared SSM contract `<SSM root>/shared/tables/{battle-state-arn,battle-state-name,
+ *     channel-battle-config-name, battle-outcome-*}` + `<SSM root>/shared/battle-orchestrator-arn`, for an
+ *     operator and a script to find them.
  *
- * Reads (does not own) the experiments table via the shared SSM contract that
- * AgentEchelonExperiments publishes, so this stack deploys AFTER the experiments
- * owner and BEFORE the per-classification stacks (which consume the battle SSM this stack
- * publishes). The dependency graph is acyclic — the alt-slots' own-Lex is what
- * avoids a battle↔premium deploy cycle.
+ * NOT A CLASSIFICATION'S PART. Each battle-capable classification's alt (its Amazon Lex bot, its
+ * `AppInstanceBot`, its `(classification, role, alt)` assignment record and its name applier) and the
+ * grants a duel runs on, on that classification's acting role and router role, are built by its own
+ * `Assistants-<classification>` stack (`attachBattle`, `classification-capabilities.ts`), so this stack
+ * names no classification and a classification is added or removed without it.
  *
- * **Classification-configurable, premium by default.** A profile's `battleEligible`
- * flag (default true only for premium) is what channel-battle.ts checks, so /battle
- * can be opened to other classifications by config without code changes.
+ * DEPLOYED AFTER THE CHANNEL FLOW IT ATTACHES TO. The tables and the orchestrator carry fixed names
+ * (`CAPABILITY_RESOURCES`), which the assistant stacks and the channel flow are told in their environment;
+ * this stack attaches its grant to the channel flow's role, and each battle-capable classification's stack builds
+ * its own part on the same names (STACKS.md, additivity). It reads (does not own) the experiments
+ * table, by its fixed name. It names each classification's router (Battle Mode's notices, its marker clears,
+ * and the orchestrator's rounds and notices) BY NAME at call time (`resolveRouterArn`).
+ *
+ * **Classification-configurable, premium by default.** Every caller asks `canRunBattle`
+ * (`lambda/src/lib/battle-enablement.ts:98`), which answers two questions in order (ADR-049): whether
+ * the deployment WIRED battle for this classification, then whether an operator TURNED IT ON. So
+ * /battle can be opened to other classifications by config without code changes.
+ *
+ * It is not a single `battleEligible` flag on the assistant profile any more. That flag answered only
+ * the policy half, and answered `true` for a classification whose stack wires no battle plumbing - so
+ * the surface promised what the role could not back.
  */
 import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
+import { grantIssuerRegistry } from '../constructs/trusted-issuers';
+import type { RouteSource, RouteSpec } from '../constructs/http-api';
 import * as dynamodb from 'aws-cdk-lib/aws-dynamodb';
-import * as apigateway from 'aws-cdk-lib/aws-apigateway';
-import * as cognito from 'aws-cdk-lib/aws-cognito';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
+import { dataRemovalPolicy as dataRemovalPolicyOf } from '../config/environment';
 import * as path from 'path';
-import { apiAccessLogConfig } from '../constructs/api-access-logging';
-import { SHARED_SSM, SSM_ROOT, STACK_PREFIX, INSTANCE_SSM, processorArnKey } from './agent-classification-common';
+import {
+  SHARED_SSM, SSM_ROOT, CAPABILITY_RESOURCES, roomPrimaryReadStatements, sayThroughRouterWiring,
+  membershipAsAssistantStatements, experimentsResourcesOf, battleResourcesOf,
+  EVERY_CLASSIFICATION,
+  anyClassificationTagged,
+} from './agent-classification-common';
+import { attachableRole } from './experiments-stack';
 
 export interface BattleStackProps extends cdk.StackProps {
-  /** Shared Chime AppInstance ARN (from AgentEchelonChimeMessaging). */
+  /** Shared Chime AppInstance ARN (from AgentEchelonMessaging). */
   appInstanceArn: string;
-  /** User Pool ID for the channel-battle + battle-outcome API authorizer. */
-  userPoolId: string;
+  /** This deployment's own pool, or `''` when the registry declares none (L15). */
+  selfPoolId: string;
   /** Frontend URL for CORS (defaults to the `appUrl` context / localhost). */
   appUrl?: string;
+  /** The channel flow's processor role: it writes a duel's first rows and reads Battle Mode's flag. */
+  channelFlowRole?: iam.IRole;
+  /**
+   * Offboarding's role (Identity): it removes an erased person's name from the battle settings they enabled
+   * (`enabledBy`, SPEC-CREDENTIAL-EXCHANGE §5b). Absent for a stack built alone for a test.
+   */
+  offboardingRoleArn?: string;
 }
 
-export class BattleStack extends cdk.Stack {
+export class BattleStack extends cdk.Stack implements RouteSource {
+  /** The channel-battle and battle-outcome routes, on `PersonApi`. */
+  public readonly routes: RouteSpec[] = [];
   /** Battle table name/ARN — passed to ChannelFlow for INVOKED row writes + config reads. */
   public readonly battleStateTableName: string;
   public readonly battleStateTableArn: string;
@@ -68,16 +88,12 @@ export class BattleStack extends cdk.Stack {
   constructor(scope: Construct, id: string, props: BattleStackProps) {
     super(scope, id, props);
 
-    const isProduction = this.node.tryGetContext('environment') === 'production';
-    const dataRemovalPolicy = isProduction ? cdk.RemovalPolicy.RETAIN : cdk.RemovalPolicy.DESTROY;
+    const dataRemovalPolicy = dataRemovalPolicyOf(this);
     const appUrl = this.node.tryGetContext('appUrl') || props.appUrl || 'http://localhost:5173';
 
-    // Experiments table lives in the always-deployed experiments owner
-    // (AgentEchelonExperiments). Resolve it via the shared SSM contract at deploy
-    // time (dynamic ref, NOT Fn::importValue), so this stack deploys decoupled
-    // from the experiments owner.
-    const experimentsTableArn = ssm.StringParameter.valueForStringParameter(this, SHARED_SSM.experimentsArn);
-    const experimentsTableName = ssm.StringParameter.valueForStringParameter(this, SHARED_SSM.experimentsName);
+    // The experiments table, owned by `Experiments` (which `battle` requires), by its fixed name.
+    const { experimentsArn: experimentsTableArn, experimentsName: experimentsTableName } = experimentsResourcesOf(this);
+    const names = battleResourcesOf(this);
 
     // ============================================================
     // DynamoDB Tables for /battle (SPEC-BATTLE.md)
@@ -91,6 +107,7 @@ export class BattleStack extends cdk.Stack {
     // row deleted while a SIBLING side is still legitimately in flight makes a
     // half-read set look like a finished battle.
     const battleStateTable = new dynamodb.Table(this, 'BattleStateTable', {
+      tableName: CAPABILITY_RESOURCES.battleStateTable,
       partitionKey: { name: 'battleId', type: dynamodb.AttributeType.STRING },
       sortKey: { name: 'botArn', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
@@ -102,6 +119,7 @@ export class BattleStack extends cdk.Stack {
     // ChannelBattleConfigTable: per-channel feature state. Drift detection reads
     // this via lib/battle-state.ts to suppress live drift in battle-enabled channels.
     const channelBattleConfigTable = new dynamodb.Table(this, 'ChannelBattleConfigTable', {
+      tableName: CAPABILITY_RESOURCES.channelBattleConfigTable,
       partitionKey: { name: 'channelArn', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: dataRemovalPolicy,
@@ -111,9 +129,9 @@ export class BattleStack extends cdk.Stack {
     // BattleOutcomeTable: every channel member's explicit head-to-head pick per
     // battle (SPEC-BATTLE.md §"Battle Scoring & Per-Step Telemetry", decision 3;
     // DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP.md §3.4 B3 + A.4). PK battleId, ONE
-    // item per battle holding a per-user `votes` MAP keyed by the chooser's Cognito
-    // sub (see lib/battle-outcome.ts). Each member's pick is retained (re-picking
-    // overwrites only that user's map entry via an atomic `SET votes.<sub>`), and
+    // item per battle holding a per-person `votes` MAP keyed by the chooser's
+    // AppInstanceUser id (see lib/battle-outcome.ts). Each member's pick is retained (re-picking
+    // overwrites only that person's map entry via an atomic `SET votes.<personId>`), and
     // the winner is a TALLY of decisive picks, not the last click. No TTL — the
     // pick is the durable scorecard record. Descriptive only; never read back into
     // variant selection.
@@ -124,6 +142,7 @@ export class BattleStack extends cdk.Stack {
     // (extractPicks) is versioned and tolerates a legacy v1 single-pick row during
     // cutover, so no backfill is required.
     const battleOutcomeTable = new dynamodb.Table(this, 'BattleOutcomeTable', {
+      tableName: CAPABILITY_RESOURCES.battleOutcomeTable,
       partitionKey: { name: 'battleId', type: dynamodb.AttributeType.STRING },
       billingMode: dynamodb.BillingMode.PAY_PER_REQUEST,
       removalPolicy: dataRemovalPolicy,
@@ -135,261 +154,41 @@ export class BattleStack extends cdk.Stack {
     this.channelBattleConfigTableName = channelBattleConfigTable.tableName;
     this.channelBattleConfigTableArn = channelBattleConfigTable.tableArn;
 
-    // ============================================================
-    // Battle-owned Lex bot + silent alt-slot fulfillment handler
-    // ============================================================
-    //
-    // The alt-slots need a valid Lex `InvokedBy`. We mint a battle-owned Lex
-    // (NOT a per-classification one) so battle stays self-contained and we avoid a
-    // battle↔premium deploy cycle (premium consumes battle SSM at deploy; if
-    // battle consumed premium's Lex at deploy, neither could go first). The
-    // handler is intentionally silent — battle replies are driven by
-    // channel-flow → premium async-processor.
-    const altSlotHandler = new lambdaNodeJs.NodejsFunction(this, 'AltSlotHandler', {
-      entry: path.join(__dirname, '../../lambda/src/battle-alt-slot-handler.ts'),
-      handler: 'handler',
-      runtime: lambda.Runtime.NODEJS_20_X,
-      // A real turn is now handed to the classification router and awaited, so this outlives a
-      // silent close. 30s, NOT more: Lex's code-hook wait is 30s, so a handler still working past
-      // that returns to nobody - Lex has already surfaced a visible error while the handler burned
-      // the extra 30s for nothing. The invoke itself is aborted earlier still (25s, in the handler)
-      // so the degrade is OUR silent close, inside Lex's window, not Lex's error.
-      timeout: cdk.Duration.seconds(30),
-      memorySize: 256,
-      environment: {
-        SSM_ROOT: SSM_ROOT,
-        ALT_BOT_SLOTS_ROSTER_PARAM: `${SSM_ROOT}/alt-bot-slots/roster`,
-        // WHICH SLOT AM I is answered from the battle state (the side WAITING on the person), not
-        // from the Lex event: every slot shares one Lex bot/alias, so the event cannot name a slot.
-        BATTLE_STATE_TABLE: battleStateTable.tableName,
-        CHANNEL_BATTLE_CONFIG_TABLE: channelBattleConfigTable.tableName,
-      },
-      bundling: { minify: false, forceDockerBundling: false },
-    });
-    battleStateTable.grantReadData(altSlotHandler);
-    channelBattleConfigTable.grantReadData(altSlotHandler);
-    // RESOLVED AT RUNTIME, NOT AT DEPLOY. Reading a classification router's ARN at synth would make
-    // this stack depend on the classification stacks, which already depend on this one through the
-    // battle SSM contract - neither could then go first. So the handler reads the channel's own
-    // classification tag when a turn arrives and resolves THAT classification's router parameter
-    // (battles are not premium-only), and the grant is name-pattern scoped for the same reason:
-    // the ARNs are unknown here.
-    altSlotHandler.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['ssm:GetParameter'],
-      resources: [
-        `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/alt-bot-slots/roster`,
-        `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/router-arn`,
-      ],
-    }));
-    // The classification gate reads the IMMUTABLE `classification` tag (never mutable metadata),
-    // same as every other turn path; channel-scoped, not instance-wide.
-    altSlotHandler.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['chime:ListTagsForResource'],
-      resources: [`${props.appInstanceArn}/channel/*`],
-    }));
-    // SCOPED TO THIS DEPLOYMENT'S OWN HANDLERS, which is not the same as scoped to a plausible name.
-    // This previously read `function:*AgentHandler*`, and the leading wildcard made it account-wide in
-    // an account that hosts several products: it matched other deployments' agent handlers as well as
-    // this one's. That is worse than an ordinary over-grant, because our identity guard
-    // (`isSanctionedBattleBot`) runs INSIDE our handler - another product's handler never runs it, so
-    // nothing on the far side of the grant applied our sanction model, loop guard or budget.
-    //
-    // One target: the premium classification router, resolved from SSM at runtime (see the comment
-    // above on why the ARN cannot be known here). `${STACK_PREFIX}Classification-*` is the same pattern
-    // the sibling grants in this file, channel-flow-stack and post-processing-stack already use, and
-    // being a PREFIX it is safe against the CloudFormation name truncation ADR-030 records - truncation
-    // removes characters from the end, which a prefix pattern still matches.
-    altSlotHandler.addToRolePolicy(new iam.PolicyStatement({
-      actions: ['lambda:InvokeFunction'],
-      resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Classification-*`],
-    }));
-    // `sourceAccount`, for the same reason as the classification handler's own Lex permission (see
-    // `assistant-profile-stack.ts`): the Lex SERVICE principal alone accepts an invoke originating from
-    // ANY account. This handler is deliberately silent, so the impact here is far smaller - but the
-    // condition is added on both because "which of our Lex-invoked handlers is harmless" is not a
-    // property worth tracking, and a silent handler is one edit away from not being silent.
-    new lambda.CfnPermission(this, 'AltSlotHandlerLexInvoke', {
-      action: 'lambda:InvokeFunction',
-      functionName: altSlotHandler.functionName,
-      principal: 'lexv2.amazonaws.com',
-      sourceAccount: cdk.Stack.of(this).account,
-    });
-    const altSlotHandlerArn = altSlotHandler.functionArn;
-
-    const lexBotRole = new iam.Role(this, 'LexBotRole', {
-      assumedBy: new iam.CompositePrincipal(
-        new iam.ServicePrincipal('lexv2.amazonaws.com'),
-        new iam.ServicePrincipal('chime.amazonaws.com'),
-      ),
-      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('AmazonLexRunBotsOnly')],
-      inlinePolicies: {
-        LambdaInvokePolicy: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({ actions: ['lambda:InvokeFunction'], resources: [altSlotHandlerArn] }),
-          ],
-        }),
-      },
-    });
-
-    const createLexBotRole = new iam.Role(this, 'CreateLexBotRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      inlinePolicies: {
-        LexBotPolicy: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({
-              actions: [
-                'lex:CreateBot', 'lex:CreateBotLocale', 'lex:CreateIntent', 'lex:CreateSlotType',
-                'lex:BuildBotLocale', 'lex:CreateBotVersion', 'lex:CreateBotAlias',
-                'lex:DescribeBotLocale', 'lex:DeleteBot', 'lex:ListBots', 'lex:ListBotAliases',
-                'lex:ListIntents', 'lex:ListBotLocales', 'lex:UpdateIntent', 'lex:UpdateBotAlias',
-                'lex:CreateResourcePolicy', 'lex:UpdateResourcePolicy',
-              ],
-              resources: [`arn:aws:lex:${this.region}:${this.account}:*`],
-            }),
-            new iam.PolicyStatement({ actions: ['iam:PassRole'], resources: [lexBotRole.roleArn] }),
-          ],
-        }),
-      },
-      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')],
-    });
-
-    const createLexBotFn = new lambdaNodeJs.NodejsFunction(this, 'CreateLexBotFunction', {
-      entry: path.join(__dirname, '../../lambda/lex-bot/create-lex-bot.ts'),
-      environment: {
-        LEX_BOT_ROLE_ARN: lexBotRole.roleArn,
-        AWS_ACCOUNT_ID: this.account,
-        BOT_HANDLER_LAMBDA_ARN: altSlotHandlerArn,
-        APP_INSTANCE_ARN: props.appInstanceArn,
-      },
-      handler: 'handler',
-      role: createLexBotRole,
-      runtime: lambda.Runtime.NODEJS_20_X,
-      timeout: cdk.Duration.minutes(10),
-      bundling: { minify: false, forceDockerBundling: false },
-    });
-
-    const lexProvider = new cdk.custom_resources.Provider(this, 'CreateLexBotProvider', {
-      onEventHandler: createLexBotFn,
-    });
-    const lexResource = new cdk.CustomResource(this, 'CreateLexBotResource', {
-      serviceToken: lexProvider.serviceToken,
-      removalPolicy: cdk.RemovalPolicy.DESTROY,
-      properties: { botName: 'AltSlotBattle' },
-    });
-    const lexBotAliasArn = lexResource.getAtt('LexBotAliasArn').toString();
-
-    // ============================================================
-    // Alt-Bot Slot Pool (SPEC-BATTLE.md)
-    // ============================================================
-    //
-    // Pre-provisioned pool of additional AppInstanceBots. Each slot has no
-    // static persona — the model + system-prompt addendum it serves is read at
-    // runtime from the bound experiment variant. v0.2.0 ships ALT_BOT_SLOT_COUNT
-    // = 2; raise via CDK context. Bots accumulate (RETAIN) — don't shrink
-    // without manual cleanup.
-    const createBotRole = new iam.Role(this, 'CreateBotRole', {
-      assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
-      inlinePolicies: {
-        CreateBotPolicy: new iam.PolicyDocument({
-          statements: [
-            // Create for new slots; Update so a redeploy can re-apply config (e.g. drop
-            // WelcomeIntent) to the existing RETAINed alt-slot bots via UpdateAppInstanceBot.
-            new iam.PolicyStatement({ actions: ['chime:CreateAppInstanceBot', 'chime:UpdateAppInstanceBot'], resources: [props.appInstanceArn, `${props.appInstanceArn}/bot/*`] }),
-          ],
-        }),
-      },
-      managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')],
-    });
-
-    const altBotSlotCountContext = this.node.tryGetContext('altBotSlotCount');
-    const altBotSlotCount = Number.isFinite(Number(altBotSlotCountContext))
-      ? Number(altBotSlotCountContext)
-      : 2;
-
-    const altBotSlotArns: string[] = [];
-    for (let i = 0; i < altBotSlotCount; i++) {
-      const slotId = `slot-${i}`;
-      const slotBotName = `AltSlot${i}`;
-      const slotHandler = new lambdaNodeJs.NodejsFunction(this, `CreateAltBotFunction${i}`, {
-        entry: path.join(__dirname, '../../lambda/lex-bot/create-bot.ts'),
-        environment: {
-          APP_INSTANCE_ARN: props.appInstanceArn,
-          BOT_HANDLER_LAMBDA_ARN: altSlotHandlerArn,
-          LEX_BOT_ALIAS_ARN: lexBotAliasArn,
-          BOT_NAME: slotBotName,
-          // Alt-slots must stay SILENT on join: omit the Chime Lex WelcomeIntent so Chime
-          // does not invoke the (message-less) alt-slot fulfillment on channel-add, which
-          // posted `{"Code":500}`. Real battle replies come from the channel-flow →
-          // premium async-processor, not this Lex. (Default bots leave this unset.)
-          WELCOME_INTENT: '',
-        },
-        handler: 'handler',
-        role: createBotRole,
-        runtime: lambda.Runtime.NODEJS_20_X,
-        timeout: cdk.Duration.seconds(30),
-        bundling: { minify: false, forceDockerBundling: false },
-      });
-
-      const slotProvider = new cdk.custom_resources.Provider(this, `CreateAltBotProvider${i}`, {
-        onEventHandler: slotHandler,
-      });
-      const slotResource = new cdk.CustomResource(this, `CreateAltBotResource${i}`, {
-        serviceToken: slotProvider.serviceToken,
-        removalPolicy: cdk.RemovalPolicy.RETAIN,
-        // Bump to trigger a CustomResource Update so the config change (omitting the
-        // WelcomeIntent that 500'd on join) is re-applied to the existing RETAINed bot
-        // via UpdateAppInstanceBot — a Create-only resource would otherwise skip it.
-        properties: { configVersion: 'v3-altslot-no-welcome-intent' },
-      });
-      // Slots depend on the battle Lex existing first.
-      slotResource.node.addDependency(lexResource);
-
-      const slotArn = slotResource.getAtt('AppInstanceBotArn').toString();
-      altBotSlotArns.push(slotArn);
-
-      new ssm.StringParameter(this, `AltBotSlot${i}Parameter`, {
-        parameterName: INSTANCE_SSM.altBotSlotBotArn(slotId),
-        stringValue: slotArn,
-        description: `AppInstanceBot ARN for alt-bot slot ${slotId} (battle feature)`,
-      });
+    // OFFBOARDING REMOVES THE PERSON WHO ENABLED A BATTLE SETTING FROM IT (lib/offboarding.ts): the rows naming
+    // them are found by a scan, and `enabledBy` is removed from each; the setting is the conversation's and
+    // stays. The grant sits with the table, on the role Identity owns, as Conversations grants it on its own.
+    if (props.offboardingRoleArn) {
+      const offboarding = iam.Role.fromRoleArn(this, 'ImportedOffboardingRole', props.offboardingRoleArn, { mutable: true });
+      offboarding.addToPrincipalPolicy(new iam.PolicyStatement({
+        actions: ['dynamodb:Scan'],
+        resources: [channelBattleConfigTable.tableArn],
+      }));
+      offboarding.addToPrincipalPolicy(new iam.PolicyStatement({
+        actions: ['dynamodb:UpdateItem'],
+        resources: [channelBattleConfigTable.tableArn],
+        conditions: { 'ForAllValues:StringEquals': { 'dynamodb:Attributes': ['channelArn', 'enabledBy'] } },
+      }));
     }
-
-    // Roster JSON for one-call lookup: [{ slotId: "slot-0", botArn: "arn:..." }, ...]
-    // Built lazily so the CFN tokens resolve at deploy time.
-    const rosterValue = cdk.Fn.join('', [
-      '[',
-      ...altBotSlotArns.flatMap((arn, idx) => {
-        const entry = cdk.Fn.join('', [`{"slotId":"slot-${idx}","botArn":"`, arn, '"}']);
-        return idx === 0 ? [entry] : [',', entry];
-      }),
-      ']',
-    ]);
-    new ssm.StringParameter(this, 'AltBotSlotRosterParameter', {
-      parameterName: INSTANCE_SSM.altBotSlotsRoster,
-      stringValue: rosterValue,
-      description: 'JSON roster of alt-bot slots: [{slotId, botArn}, ...]',
-    });
 
     // ============================================================
     // Battle Orchestrator Lambda (SPEC-BATTLE.md)
     // ============================================================
     //
     // Coordinates round-2 fan-out after both bots reach round-1 terminal state.
-    // Invoked async from the premium async processor on the last transition.
-    // Sends per-bot round-2 placeholders, invokes the premium classification processor
-    // (AgentEchelonClassification-Premium) — resolved at RUNTIME from SSM (param NAME passed in
-    // env) so there is no deploy-time ordering cycle with the premium stack.
+    // Invoked async from the duel classification's processor on the last transition.
+    // Hands each rebuttal round to the duel classification's router, which posts the side's round-2
+    // placeholder, and names the duel's closing lines to that router as notices. It speaks as no
+    // assistant: no vend, no routing record, no Amazon Chime SDK send.
+    //
+    // Each conversational classification's router, read by name at call time (`resolveRouterArn`): the
+    // classification stacks that publish the `router-arn` parameters deploy after this one.
+    const orchestratorRouters = sayThroughRouterWiring(this, EVERY_CLASSIFICATION, { resolvesPrimary: false });
     const battleOrchestratorRole = new iam.Role(this, 'BattleOrchestratorRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       inlinePolicies: {
-        ChimePolicy: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({
-              actions: ['chime:SendChannelMessage'],
-              resources: [`${props.appInstanceArn}/*`],
-            }),
-          ],
-        }),
+        // NO CHIME GRANT AND NO VEND. Every line of a duel outside a turn - a rebuttal placeholder, "didn't
+        // finish in time", the close notice, an ended duel's marker clears - is said by the duel
+        // classification's router as that side's assistant, on a speak route of the router's own.
         BattleStatePolicy: new iam.PolicyDocument({
           statements: [
             new iam.PolicyStatement({
@@ -400,9 +199,11 @@ export class BattleStack extends cdk.Stack {
             // `activeBattleId` pointer, which lives on the CONFIG table - a table this Lambda had no
             // reason to touch until the pointer stopped being released by a clock.
             //
-            // UpdateItem only: it clears a pointer, it never reads or replaces the row.
+            // GetItem as well: round 2 resolves both sides' variants from the experiment the
+            // conversation bound at enable (`loadChannelBattleConfig(channelArn).experimentId`), a single
+            // read by the table's key, so no index. Never replaces or deletes the row.
             new iam.PolicyStatement({
-              actions: ['dynamodb:UpdateItem'],
+              actions: ['dynamodb:GetItem', 'dynamodb:UpdateItem'],
               resources: [channelBattleConfigTable.tableArn],
             }),
           ],
@@ -421,37 +222,42 @@ export class BattleStack extends cdk.Stack {
           ],
         }),
         LambdaInvokePolicy: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({
-              actions: ['lambda:InvokeFunction'],
-              // Invokes the premium classification processor (AgentEchelonClassification-Premium) for round-2.
-              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Classification-*`],
-            }),
-          ],
+          // THE ROUTERS, AND ONLY THE ROUTERS: a rebuttal round is validated, its placeholder posted, and
+          // the round recorded and dispatched by the duel classification's router, and the duel's closing
+          // lines are notices that router says (`sayThroughRouter`). Granted by the router's construct id
+          // on this instance's classification functions (`ownInstanceFunctions`), with the read of each
+          // classification's `router-arn` parameter. A pattern over a whole assistant stack also reaches every
+          // classification's processor, which the orchestrator never invokes.
+          statements: orchestratorRouters.statements,
         }),
         SSMPolicy: new iam.PolicyDocument({
           statements: [
+            // THE VERSION EACH DUEL SIDE SERVES (ADR-050). A rebuttal round carries its side's variant,
+            // and the vend narrows that round's session to the variant's definition: the alt has no
+            // other version to serve. Without this read the pin resolved to nothing, round 2 went out
+            // with no variant, and the vend refused the alt's rebuttal on every duel (measured live
+            // 2026-10-13, `profileRef alt-primary-premium@32 unresolved`). Any assistant's definition, under the
+            // path wildcard, read only: a duel fields a classification's live assistant and its alt, whichever
+            // classification it runs in, so the read names none and declaring one changes nothing here.
             new iam.PolicyStatement({
+              sid: 'ReadTheDuelSidesVersions',
               actions: ['ssm:GetParameter'],
-              // EVERY classification's processor parameter, matching the env above - battles are not
-              // premium-only. This listed only premium while the env named all three, so a standard
-              // or basic duel's round-2 lookup got AccessDenied, the catch returned '', and the
-              // rebuttal silently never fired. Name-pattern scoped for the same synth-order reason
-              // as the alt-slot handler's router grant: the ARNs are unknown at deploy.
-              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/processor-arn`],
+              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/definition`],
             }),
           ],
         }),
       },
       managedPolicies: [iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole')],
     });
+    // A duel's closing line is said by the room's primary (§3.8): the room's tags and the assignment records.
+    for (const stmt of roomPrimaryReadStatements(this, EVERY_CLASSIFICATION)) battleOrchestratorRole.addToPolicy(stmt);
 
     // Deterministic name so the ARN can be published to SSM as a constructed
     // string (the classification processors resolve it via /agent-echelon/shared/
     // battle-orchestrator-arn). The orchestrator itself invokes the premium classification
     // processor via an SSM dynamic ref, so there is no GetAtt cycle to break.
-    const battleOrchestratorName = `${this.stackName}-BattleOrchestrator`;
-    const battleOrchestratorArn = `arn:aws:lambda:${this.region}:${this.account}:function:${battleOrchestratorName}`;
+    const battleOrchestratorName = names.battleOrchestratorName;
+    const battleOrchestratorArn = names.battleOrchestratorArn;
 
     const battleOrchestrator = new lambdaNodeJs.NodejsFunction(this, 'BattleOrchestrator', {
       entry: path.join(__dirname, '../../lambda/src/battle-orchestrator.ts'),
@@ -467,16 +273,11 @@ export class BattleStack extends cdk.Stack {
         // returns at its first line and the release silently never happens - the whole point of the
         // change, inert, with no error to notice. The env var and the grant above go together.
         CHANNEL_BATTLE_CONFIG_TABLE: channelBattleConfigTable.tableName,
-        // ALL THREE, so round 2 answers at the duel's own classification. It used to receive only the
-        // premium param and so answered every rebuttal on the premium processor - an escalation for
-        // any duel a `battleEligible` profile enabled below premium, which is an operator setting
-        // rather than an impossibility. The invoke grant is already a `Classification-*` wildcard, so
-        // this needs no IAM change.
-        PREMIUM_PROCESSOR_ARN_PARAM: processorArnKey('premium'),
-        STANDARD_PROCESSOR_ARN_PARAM: processorArnKey('standard'),
-        BASIC_PROCESSOR_ARN_PARAM: processorArnKey('basic'),
         // Resolve-once round-2 variant resolution (loadExperiments reads this table).
         EXPERIMENTS_TABLE: experimentsTableName,
+        // Each classification's router: the rebuttal round and the duel's notices go to it.
+        ...orchestratorRouters.env,
+        SSM_ROOT,
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
@@ -484,9 +285,9 @@ export class BattleStack extends cdk.Stack {
 
     // ============================================================
     // Shared SSM contract for the per-classification stacks (SPEC-PER-PROFILE-OWNERSHIP.md).
-    // AgentEchelonClassification-{Standard,Premium} resolve these at DEPLOY time via
-    // valueForStringParameter (dynamic ref, NOT Fn::importValue) — but ONLY when
-    // their own `enableBattle` is set, so a classification can deploy with battle off.
+    // The battle-capable assistant stacks resolve these at DEPLOY time via
+    // valueForStringParameter (dynamic ref, NOT Fn::importValue), and only when the
+    // deployment declares `battle`, so an assistant stack deploys without this stack.
     // ============================================================
     const sharedParams: Array<[string, string, string]> = [
       ['SharedBattleStateArnParam', SHARED_SSM.battleStateArn, battleStateTable.tableArn],
@@ -502,28 +303,101 @@ export class BattleStack extends cdk.Stack {
     }
 
     // ============================================================
-    // Channel Battle Admin API + Battle-Outcome API
+    // The channel-battle and battle-outcome routes
     // ============================================================
-    const importedUserPool = cognito.UserPool.fromUserPoolId(this, 'ImportedUserPool', props.userPoolId);
 
+    // Battle Mode's lines are named to the router of the conversation's classification, read by name at
+    // call time because the classification stacks that publish the router ARNs deploy after this one.
+    const battleNotices = sayThroughRouterWiring(this, EVERY_CLASSIFICATION);
     const channelBattleRole = new iam.Role(this, 'ChannelBattleRole', {
       assumedBy: new iam.ServicePrincipal('lambda.amazonaws.com'),
       inlinePolicies: {
         ChimePolicy: new iam.PolicyDocument({
           statements: [
+            // ── CHANNEL ACTIONS, FAIL-CLOSED ON THE CLASSIFICATION TAG ──────────────────────────
+            //
+            // This role serves EVERY classification - a duel runs in whatever room it was called in -
+            // so unlike an assistant role it cannot be pinned to one value. What it can do, and did
+            // not, is refuse an UNTAGGED channel. Ungated on `${appInstanceArn}/*` this role could
+            // send into any channel in the app instance including one carrying no classification at
+            // all, which is the one shape every other boundary in the platform treats as the failure
+            // case (ADR-042; SPEC-CONVERSATION-SECURITY Layer 1 is fail-closed for exactly this).
+            //
+            // Conditioning on the declared set keeps every legitimate duel working and removes the
+            // untagged channel from reach, so the boundary fails the same way here as everywhere else.
+            //
+            // DescribeChannel: caller-scoped access check (is the caller a member).
+            // ListTagsForResource: the classification gate reads the IMMUTABLE `classification` tag,
+            // not mutable metadata, so a tampered modelTier cannot open battles.
             new iam.PolicyStatement({
+              sid: 'BattleChannelActionsOnClassifiedChannels',
               actions: [
-                'chime:CreateChannelMembership',
-                'chime:DeleteChannelMembership',
-                // DescribeChannel: caller-scoped access check (is the caller a member).
-                // ListTagsForResource: the classification gate reads the IMMUTABLE `classification`
-                // tag, not mutable metadata, so a tampered modelTier cannot open battles.
                 'chime:DescribeChannel',
                 'chime:ListTagsForResource',
-                'chime:DescribeChannelMembership',
                 'chime:ListChannelModerators',
-                'chime:SendChannelMessage',
               ],
+              resources: [`${props.appInstanceArn}/channel/*`],
+              conditions: {
+                // ADR-045 DECISION 7 SAYS THIS BECOMES EXACTLY-OWN. IT MUST NOT, AND THE RECORD IS
+                // WRONG ABOUT WHICH PRINCIPAL THIS IS (verified 2026-09-17).
+                //
+                // This is not an alt assistant's grant. It is the role of `channel-battle.ts`, the
+                // ADMINISTRATIVE API a channel moderator calls to turn Battle Mode on or off in their
+                // own conversation - ONE function serving every classification, which acts as the
+                // room's own per-classification bot through `ChimeBearer`. The IAM principal is this
+                // single shared role, so there is no "own" classification to pin it to:
+                // `aws:PrincipalTag` would need one tag per classification on one role, and a literal
+                // would break every other classification's moderators.
+                //
+                // Administration is cross-channel by definition; moderation is channel-scoped. The
+                // narrowing decision 7 asks for belongs to the alt ASSISTANTS' identities, and that is
+                // where it went: each alt bot is now tagged at creation, so the exactly-own boundary
+                // is enforced on the identity that answers the turn rather than on the API that
+                // enables the feature. Splitting this into one role per classification would buy
+                // nothing: the caller is already authorized as the channel's moderator above.
+                ...anyClassificationTagged(),
+              },
+            }),
+            // ── AND THE SAME ACTIONS AGAINST THE BEARER IDENTITY ────────────────────────────────
+            //
+            // Amazon Chime SDK authorizes a channel action against BOTH resources: the channel, and
+            // the `ChimeBearer` the call is made as. The statement above covers only the channel, so
+            // without this one every action in it is denied on the bearer leg and Battle Mode cannot
+            // be turned on or off at all - `channel-battle.ts`'s first `DescribeChannel` fails. The
+            // stack deploys green and the feature is dead, which is exactly how this was missed.
+            //
+            // READS ONLY. Amazon Chime SDK does not bind the `ChimeBearer` to the caller, so this role
+            // could once post as any user or assistant through this leg. The ON/OFF notices now go out on
+            // the room assistant's vended session, so no send is granted here at all. The caller's own
+            // `/user/*` leg serves the moderator check; the `/bot/*` leg is pinned to classified
+            // assistants by the identity tag every bot now carries.
+            new iam.PolicyStatement({
+              sid: 'BattleChannelReadsAsTheCaller',
+              effect: iam.Effect.ALLOW,
+              actions: ['chime:DescribeChannel', 'chime:ListTagsForResource', 'chime:ListChannelModerators'],
+              resources: [`${props.appInstanceArn}/user/*`],
+            }),
+            new iam.PolicyStatement({
+              sid: 'BattleChannelReadsAsTheRoomAssistant',
+              effect: iam.Effect.ALLOW,
+              actions: ['chime:DescribeChannel', 'chime:ListTagsForResource', 'chime:ListChannelModerators'],
+              resources: [`${props.appInstanceArn}/bot/*`],
+              conditions: anyClassificationTagged(),
+            }),
+            // NO SPEAKING: Battle Mode's lines are named to the router (`sayThroughRouter`).
+            ...battleNotices.statements,
+            // ── ADDING AND REMOVING THE ALT, AS THE ROOM'S ASSISTANT, IN A CLASSIFIED CONVERSATION ──
+            //
+            // Conditioned on the conversation's classification and on a bearer carrying one (step 24).
+            // The alt being added or removed is `MemberArn`, a parameter IAM never sees, so which
+            // assistant joins is decided by `channel-battle.ts`'s experiment check against the room's alt
+            // assignment record (read under `battleNotices`' assignment grant) and seen by the membership audit.
+            ...membershipAsAssistantStatements('BattleAltMembership', props.appInstanceArn, EVERY_CLASSIFICATION),
+            // The caller's own membership, read as the caller to confirm they are in the room. A read,
+            // and the caller's `/user/*` bearer, so it keeps its app-instance scope.
+            new iam.PolicyStatement({
+              sid: 'BattleMembershipReadAsTheCaller',
+              actions: ['chime:DescribeChannelMembership'],
               resources: [`${props.appInstanceArn}/*`],
             }),
           ],
@@ -563,9 +437,15 @@ export class BattleStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['ssm:GetParameter'],
               resources: [
-                // The per-classification bot keys channel-battle.ts resolves (resolveBotArn).
+                // The per-classification bot keys channel-battle.ts resolves (resolvePrimaryBotArn).
                 // Every classification owns its own bot; there is no shared /agent-echelon/bot-arn.
                 `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
+                // WHETHER BATTLE IS TURNED ON for a classification (ADR-049): the policy half of
+                // `canRunBattle`, which this handler asks on both the enable path and the composer's
+                // status read. WITHOUT THIS THE READ FAILS CLOSED AND BATTLE IS OFF EVERYWHERE - the
+                // safe direction, and a silent one, so it is granted rather than left to be diagnosed
+                // as a product fault. Scoped to the leaf; the capability half needs no read at all.
+                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/battle/*/enabled`,
               ],
             }),
           ],
@@ -582,7 +462,7 @@ export class BattleStack extends cdk.Stack {
       memorySize: 256,
       role: channelBattleRole,
       environment: {
-        SSM_ROOT,
+        ...battleNotices.env,
         APP_INSTANCE_ARN: props.appInstanceArn,
         CHANNEL_BATTLE_CONFIG_TABLE: channelBattleConfigTable.tableName,
         // Turning Battle Mode off ends the duel that is running, and every helper that does so returns
@@ -591,6 +471,9 @@ export class BattleStack extends cdk.Stack {
         BATTLE_STATE_TABLE: battleStateTable.tableName,
         EXPERIMENTS_TABLE: experimentsTableName,
         ALLOWED_ORIGIN: appUrl,
+        // Turning Battle Mode off names the duel's waiting markers to the conversation's router, which takes
+        // them down as each side's assistant (`battle-marker-clear.ts`): the router is read by name and the
+        // invoke granted under `battleNotices`, since this API speaks as no assistant for an ending.
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
@@ -617,6 +500,13 @@ export class BattleStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['dynamodb:Query'],
               resources: [battleStateTable.tableArn],
+            }),
+            // READ-ONLY on the experiment row, so a pick records the two versions that fought: the
+            // configIds pinned on the experiment's control and treatment (DESIGN-EXPERIMENTS-BATTLE-
+            // DECISION-LOOP §3.5). Without it a pick is recorded without them, as before.
+            new iam.PolicyStatement({
+              actions: ['dynamodb:GetItem'],
+              resources: [experimentsTableArn],
             }),
           ],
         }),
@@ -655,6 +545,8 @@ export class BattleStack extends cdk.Stack {
         APP_INSTANCE_ARN: props.appInstanceArn,
         BATTLE_OUTCOME_TABLE: battleOutcomeTable.tableName,
         CHANNEL_BATTLE_CONFIG_TABLE: channelBattleConfigTable.tableName,
+        // The experiment row, for the configIds of the two versions a pick judges.
+        EXPERIMENTS_TABLE: experimentsTableName,
         // The duel's rows, read to refuse a pick on an ABANDONED battle. Unset, `readBattleRows`
         // returns [] and the refusal is unreachable - the check would look present and do nothing.
         BATTLE_STATE_TABLE: battleStateTable.tableName,
@@ -663,61 +555,36 @@ export class BattleStack extends cdk.Stack {
       bundling: { minify: false, forceDockerBundling: false },
     });
 
-    const channelBattleAuthorizer = new apigateway.CognitoUserPoolsAuthorizer(this, 'ChannelBattleAuthorizer', {
-      cognitoUserPools: [importedUserPool],
-    });
+    // Who called is the edge authorizer's context, read through the registry (callerPersonId).
+    grantIssuerRegistry(channelBattleFn, props.selfPoolId);
+    grantIssuerRegistry(battleOutcomeFn, props.selfPoolId);
+    channelBattleFn.addEnvironment('APP_INSTANCE_ARN', props.appInstanceArn);
+    battleOutcomeFn.addEnvironment('APP_INSTANCE_ARN', props.appInstanceArn);
+    const battleThrottle = { rate: 10, burst: 20 };
+    this.routes.push(
+      { api: 'person', method: 'GET', path: '/channels/battle', handler: channelBattleFn, capability: 'battle', throttle: battleThrottle },
+      { api: 'person', method: 'POST', path: '/channels/battle/enable', handler: channelBattleFn, capability: 'battle', throttle: battleThrottle },
+      { api: 'person', method: 'POST', path: '/channels/battle/disable', handler: channelBattleFn, capability: 'battle', throttle: battleThrottle },
+      // /channels/battle/outcome: POST a pick, GET the recorded pick.
+      { api: 'person', method: 'POST', path: '/channels/battle/outcome', handler: battleOutcomeFn, capability: 'battle', throttle: battleThrottle },
+      { api: 'person', method: 'GET', path: '/channels/battle/outcome', handler: battleOutcomeFn, capability: 'battle', throttle: battleThrottle },
+    );
 
-    const channelBattleApi = new apigateway.RestApi(this, 'ChannelBattleApi', {
-      restApiName: 'Agent Echelon Channel Battle',
-      defaultCorsPreflightOptions: {
-        allowOrigins: [appUrl],
-        allowMethods: ['GET', 'POST', 'OPTIONS'],
-        allowHeaders: ['Content-Type', 'Authorization'],
-      },
-      deployOptions: {
-        throttlingBurstLimit: 20,
-        throttlingRateLimit: 10,
-        ...apiAccessLogConfig(this, 'ChannelBattleApiAccessLogs'),
-      },
-    });
-
-    const channelBattleIntegration = new apigateway.LambdaIntegration(channelBattleFn);
-    const channelsResource = channelBattleApi.root.addResource('channels');
-    const battleResource = channelsResource.addResource('battle');
-    battleResource.addMethod('GET', channelBattleIntegration, {
-      authorizer: channelBattleAuthorizer,
-      authorizationType: apigateway.AuthorizationType.COGNITO,
-    });
-    battleResource.addResource('enable').addMethod('POST', channelBattleIntegration, {
-      authorizer: channelBattleAuthorizer,
-      authorizationType: apigateway.AuthorizationType.COGNITO,
-    });
-    battleResource.addResource('disable').addMethod('POST', channelBattleIntegration, {
-      authorizer: channelBattleAuthorizer,
-      authorizationType: apigateway.AuthorizationType.COGNITO,
-    });
-
-    // /channels/battle/outcome — POST a pick, GET the recorded pick.
-    const battleOutcomeIntegration = new apigateway.LambdaIntegration(battleOutcomeFn);
-    const outcomeResource = battleResource.addResource('outcome');
-    outcomeResource.addMethod('POST', battleOutcomeIntegration, {
-      authorizer: channelBattleAuthorizer,
-      authorizationType: apigateway.AuthorizationType.COGNITO,
-    });
-    outcomeResource.addMethod('GET', battleOutcomeIntegration, {
-      authorizer: channelBattleAuthorizer,
-      authorizationType: apigateway.AuthorizationType.COGNITO,
-    });
-
-    new cdk.CfnOutput(this, 'ChannelBattleApiUrl', {
-      value: `${channelBattleApi.url}channels/battle`,
-      description: 'Channel battle admin API URL (frontend reads this for Battle Mode toggle)',
-      exportName: `${this.stackName}-ChannelBattleApiUrl`,
-    });
-    new cdk.CfnOutput(this, 'BattleOutcomeApiUrl', {
-      value: `${channelBattleApi.url}channels/battle/outcome`,
-      description: 'Battle outcome (pick-the-winner) API URL (frontend scorecard reads/writes this)',
-      exportName: `${this.stackName}-BattleOutcomeApiUrl`,
+    // THE CHANNEL FLOW writes a duel's first INVOKED rows, reads Battle Mode's flag, and reads whether an operator
+    // turned battle on for the conversation's classification (ADR-049, `canRunBattle`), the policy half of its
+    // `/battle` gate.
+    if (props.channelFlowRole) new iam.Policy(this, 'BattleOnTheChannelFlow', {
+      roles: [attachableRole(this, 'ChannelFlowRole', props.channelFlowRole)],
+      statements: [
+        new iam.PolicyStatement({
+          actions: ['dynamodb:GetItem', 'dynamodb:PutItem', 'dynamodb:UpdateItem', 'dynamodb:Query'],
+          resources: [battleStateTable.tableArn, channelBattleConfigTable.tableArn],
+        }),
+        new iam.PolicyStatement({
+          actions: ['ssm:GetParameter'],
+          resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/battle/*/enabled`],
+        }),
+      ],
     });
 
     cdk.Tags.of(this).add('Component', 'Battle');

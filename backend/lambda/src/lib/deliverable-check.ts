@@ -5,7 +5,7 @@
  * have saved, attached, created, uploaded or exported a file" since the first deploy of this work, and
  * the report that arrived opened: "Here's your report, Test - delivered as a downloadable markdown
  * document." An instruction the model can ignore is not a control. The e2e caught it; the runtime did
- * not, because nothing checked. So the loop writes, CHECKS, and corrects (owner, 2026-08-20).
+ * not, because nothing checked. So the loop writes, CHECKS, and corrects (maintainer, 2026-08-20).
  *
  * WHAT IT CHECKS AGAINST, and why the source matters. Length is a REQUIREMENT the step declares
  * (`report_generation.collecting_requirements` lists "the length or format") and the person answers.
@@ -19,12 +19,20 @@
  * they cannot answer from a file, and a claim about a download that the runtime - not the model -
  * decides, are all wrong regardless of what was asked for.
  *
+ * WHAT DECIDES IS STRUCTURAL (tenet D11). The document arrives declared, separate from the reply
+ * (`advance_task_state`'s `document`), which is what keeps the conversation out of it. The one purity
+ * check that acts is whether the document opens as a document, read from its markup
+ * (`opensAsADocument`). The English phrase patterns that once decided are measured only
+ * (`phraseShadowKinds`): they read words a model wrote, and a deployment in another language passed
+ * them in both directions.
+ *
  * PURE, and deliberately: no AWS clients and no model calls, so every rule here is unit-testable
  * against real documents. The one model call this feature makes belongs to the caller.
  */
 // Pure too, and load-bearing: anything from this module that reaches a POSTED message is stripped of
 // control markers first. See `recordedLengthTarget` and `correctionProgressLine`.
 import { stripMessageMarkers } from './message-markers.js';
+import { checkAgainstTemplate, describeMissingStructure, type ParsedTemplate } from './document-template.js';
 
 /**
  * The size the person agreed to, as the numbers it was recorded as.
@@ -62,7 +70,7 @@ export function recordedLengthTarget(details: unknown): LengthTarget | null {
   if (minWords <= 0 || maxWords < minWords) return null;
   const min = Math.round(minWords);
   const max = Math.round(maxWords);
-  // SANITISED ON THE WAY OUT, not only on the way in. `source` is model-authored text that this
+  // SANITIZED ON THE WAY OUT, not only on the way in. `source` is model-authored text that this
   // module hands to a string which is POSTED INTO THE CHANNEL, and the write-side bound cannot protect
   // this read: rows already exist that were written before that bound, by a hand edit, or by an
   // imported fixture. A control marker reaching a bot message is not cosmetic - the chat client parses
@@ -89,7 +97,19 @@ export function documentWordCount(doc: string): number {
     .filter((w) => /[a-z0-9]/i.test(w)).length;
 }
 
-export type DeliverableIssueKind = 'too_short' | 'too_long' | 'chat_wrapper' | 'reader_ask' | 'claims_a_file';
+export type DeliverableIssueKind = 'too_short' | 'too_long' | 'chat_wrapper' | 'reader_ask' | 'claims_a_file' | 'template_structure';
+
+/**
+ * The kinds that are about the document being a DOCUMENT rather than a conversation, as opposed to its
+ * agreed size. A correction for these alone is judged by whether the document's structure survived
+ * (`acceptCorrection`), and a document still carrying one after the bounded correction posts inline.
+ */
+const PURITY_KINDS: ReadonlySet<DeliverableIssueKind> = new Set(['chat_wrapper', 'reader_ask', 'claims_a_file']);
+
+/** Whether this issue is about the document's purity rather than its agreed size. */
+export function isPurityIssue(issue: DeliverableIssue): boolean {
+  return PURITY_KINDS.has(issue.kind);
+}
 
 export interface DeliverableIssue {
   kind: DeliverableIssueKind;
@@ -110,14 +130,95 @@ const CLAIMS_A_FILE =
   /\b(?:downloadable|attached (?:above|below|document|file|here)|i(?:'ve| have) (?:attached|uploaded|saved|exported)|download (?:it|the file|below))\b/i;
 
 /**
- * Everything wrong with this document, in the order a reader would notice it.
+ * THE ENGLISH PHRASE CHECKS, AS A MEASUREMENT ONLY (tenet D11).
  *
- * `target` is null when no size was recorded, which suppresses the length pair only - the purity
- * checks always apply.
+ * These three patterns decided whether a document was rewritten and what shipped, and they read
+ * English a model wrote: a deployment in another language passed them in both directions. They are
+ * kept because the rate at which a declared document still opens with a greeting, asks its reader
+ * something or claims a file is worth knowing, and they are logged for that (`[shadow]` in the delivery
+ * gate). Nothing is decided from them.
  */
-export function deliverableIssues(doc: string, target: LengthTarget | null): DeliverableIssue[] {
-  const issues: DeliverableIssue[] = [];
+export function phraseShadowKinds(doc: string): DeliverableIssueKind[] {
   const firstBlock = (doc.split(/\n\s*\n/)[0] || '').trim();
+  const kinds: DeliverableIssueKind[] = [];
+  if (CHAT_WRAPPER.test(firstBlock)) kinds.push('chat_wrapper');
+  if (READER_ASK.test(doc)) kinds.push('reader_ask');
+  if (CLAIMS_A_FILE.test(doc)) kinds.push('claims_a_file');
+  return kinds;
+}
+
+/**
+ * DOES THE DOCUMENT OPEN AS A DOCUMENT? Read from markup, never from words, so it says the same thing
+ * in every language.
+ *
+ * A document opens with a title or with its content: a heading, a table row, a fenced block, a bold
+ * title line, a setext heading, a CSV header row (a delimited line followed by a row with the same
+ * number of delimiters), or structured data (`{`, `[`, `<`, front matter). A conversation opens with
+ * a sentence to somebody. The opening line of the incident this guards ("Hi <name>, I have everything
+ * I need...") is none of the above.
+ */
+export function opensAsADocument(doc: string): boolean {
+  const lines = doc.split('\n').map((l) => l.trim());
+  const at = lines.findIndex((l) => l.length > 0);
+  if (at < 0) return false;
+  const first = lines[at];
+  if (/^#{1,6}\s+\S/.test(first)) return true;
+  if (first.startsWith('|')) return true;
+  if (/^(```|~~~)/.test(first)) return true;
+  if (/^(\*\*|__)[^*_].*(\*\*|__)\s*:?$/.test(first)) return true;
+  if (/^(=+|-+)$/.test(lines[at + 1] ?? '')) return true;
+  if (/^[[{<]/.test(first) || first === '---') return true;
+  // A CSV-SHAPED EXTRACTION. Counted by delimiter, so it is the shape of the data that answers and
+  // not what the cells say: a header and the rows directly under it (no blank line between, which is
+  // what separates prose paragraphs) carry the same number of separators. One separator per line is
+  // also what a sentence with a comma looks like, so a single-separator shape needs two rows.
+  const row1 = lines[at + 1] ?? '';
+  const row2 = lines[at + 2] ?? '';
+  for (const sep of [',', '\t', ';']) {
+    const count = (s: string) => s.split(sep).length - 1;
+    const n = count(first);
+    if (n >= 1 && count(row1) === n && (n >= 2 || count(row2) === n)) return true;
+  }
+  return false;
+}
+
+/**
+ * The structure a correction must not lose, counted from markup: table rows, headings and fenced
+ * blocks. Language-neutral by construction, and what a person actually downloads the document for.
+ */
+export function documentStructure(doc: string): { tableRows: number; headings: number; fences: number } {
+  const lines = doc.split('\n').map((l) => l.trim());
+  return {
+    tableRows: lines.filter((l) => l.startsWith('|') && !/^\|?[\s:|-]+\|?$/.test(l)).length,
+    headings: lines.filter((l) => /^#{1,6}\s+\S/.test(l)).length,
+    fences: lines.filter((l) => /^(```|~~~)/.test(l)).length,
+  };
+}
+
+/**
+ * Everything wrong with this document that the delivery acts on, in the order a reader would notice it.
+ *
+ * `target` is null when no size was recorded, which suppresses the length pair only. The opening check
+ * is structural (`opensAsADocument`) and is skipped for a code deliverable (`opts.code`), which is code
+ * wherever it starts. The English phrase checks are not here: they are `phraseShadowKinds`, measured
+ * and never acted on.
+ */
+export function deliverableIssues(
+  doc: string,
+  target: LengthTarget | null,
+  opts: { code?: boolean; template?: ParsedTemplate } = {},
+): DeliverableIssue[] {
+  const issues: DeliverableIssue[] = [];
+
+  // THE TEMPLATE'S STRUCTURE, when the delivering step declares one (SPEC-DOCUMENT-TEMPLATES FR6): its
+  // required sections in order by position and heading level, and its tables by column count. Never
+  // the heading text, so a document in the conversation's language passes.
+  if (opts.template && doc.trim()) {
+    const check = checkAgainstTemplate(doc, opts.template);
+    if (!check.passed) {
+      issues.push({ kind: 'template_structure', fix: describeMissingStructure(check.missing, opts.template.name) });
+    }
+  }
 
   if (target) {
     const words = documentWordCount(doc);
@@ -138,26 +239,13 @@ export function deliverableIssues(doc: string, target: LengthTarget | null): Del
     }
   }
 
-  if (CHAT_WRAPPER.test(firstBlock)) {
+  if (!opts.code && doc.trim() && !opensAsADocument(doc)) {
     issues.push({
       kind: 'chat_wrapper',
-      fix: 'It opens with a greeting or an announcement of itself. Start with the document: a title, '
-        + 'then the content. Nobody reading the file later is in the conversation it came from.',
-    });
-  }
-  if (READER_ASK.test(doc)) {
-    issues.push({
-      kind: 'reader_ask',
-      fix: 'It puts a question or an offer to the reader. A finished document states; it does not ask '
-        + 'the reader to decide. Remove the question - anything you want to offer belongs in the '
-        + 'conversation, not in the file.',
-    });
-  }
-  if (CLAIMS_A_FILE.test(doc)) {
-    issues.push({
-      kind: 'claims_a_file',
-      fix: 'It refers to itself as attached or downloadable. Whether this arrives as a file or as text '
-        + 'is decided after you answer, so the document cannot describe its own packaging.',
+      fix: 'It opens with a sentence to the reader instead of the document. Start with the document: a '
+        + 'title heading, then the content. Remove any greeting, any offer or question to the reader, '
+        + 'and anything about files or downloads. Nobody reading the file later is in the conversation '
+        + 'it came from.',
     });
   }
   return issues;
@@ -193,6 +281,7 @@ export function correctionProgressLine(issues: DeliverableIssue[], target: Lengt
   if (kinds.has('too_short')) {
     return target ? `Expanding the report to ${size}...` : 'Expanding the report to the agreed length...';
   }
+  if (kinds.has('template_structure')) return 'Fitting the document to its template...';
   return 'Tidying the document before delivering it...';
 }
 
@@ -205,12 +294,21 @@ export function correctionProgressLine(issues: DeliverableIssue[], target: Lengt
  * therefore ZERO issues. It won on a count and the person received it as their report. Deleting the
  * document is not a way of fixing it.
  *
- * So acceptance needs a floor on CONTENT as well as a ceiling on faults. The floor is relative to what
+ * So acceptance needs a floor on CONTENT as well as a limit on faults. The floor is relative to what
  * was written, not absolute: the model wrote the document, and a correction is meant to adjust it, not
  * to replace it with something a fraction of the size.
  *
  * The exception is a document that was too long, where shrinking IS the correction - there the floor
  * is the agreed minimum instead, because that is the length the person asked for.
+ *
+ * AND A CORRECTION THAT ONLY REMOVES CONVERSATION IS JUDGED BY STRUCTURE, NOT BY WORDS. When every
+ * issue is a purity issue (`isPurityIssue`), the fix is to take out a greeting, a narration and an
+ * apology, and in a short document those can be most of the words. Measured live: a 162-word
+ * extraction whose table was wrapped in a greeting and a closing offer was correctly rewritten to 82
+ * words, the table intact, and the 60% floor rejected it, so the wrapped original shipped. For those
+ * faults the rewrite is accepted when the document's countable structure survived (`documentStructure`:
+ * table rows, headings, fenced blocks, none fewer than before). A document with no countable structure
+ * keeps the word floor, because then there is nothing else to say what was lost.
  */
 export function acceptCorrection(args: {
   original: string;
@@ -231,6 +329,25 @@ export function acceptCorrection(args: {
 
   const before = documentWordCount(original);
   const after = documentWordCount(rewritten);
+
+  const was = documentStructure(original);
+  const hasStructure = was.tableRows + was.headings + was.fences > 0;
+  if (issuesBefore.length > 0 && issuesBefore.every(isPurityIssue) && hasStructure) {
+    const now = documentStructure(rewritten);
+    const lost = (['tableRows', 'headings', 'fences'] as const).filter((k) => now[k] < was[k]);
+    if (lost.length) {
+      return {
+        accept: false,
+        reason: `the rewrite lost the document's structure: ${lost.map((k) => `${k} ${was[k]} -> ${now[k]}`).join(', ')}`,
+      };
+    }
+    return {
+      accept: true,
+      reason: `structure kept (${was.tableRows} table rows, ${was.headings} headings, ${was.fences} fences), `
+        + `${before} -> ${after} words, ${issuesBefore.length} -> ${issuesAfter.length} issues`,
+    };
+  }
+
   const wasTooLong = issuesBefore.some((i) => i.kind === 'too_long');
   const floor = wasTooLong
     ? (target?.minWords ?? Math.round(before * 0.3))
@@ -253,4 +370,42 @@ export function correctionInstruction(issues: DeliverableIssue[], doc: string): 
     + 'Return ONLY the corrected document - no preamble, no explanation of what you changed, no '
     + 'closing remark. Keep everything that is already right: the structure, the findings, the data '
     + 'and the wording that is not at fault.\n\n---\n\n' + doc;
+}
+
+/**
+ * WHAT A DECLARED DOCUMENT THAT STILL FAILS AFTER THE BOUNDED CORRECTION COMES TO (SPEC-TASK-STATE-
+ * TRANSITIONS §4; SPEC-DOCUMENT-TEMPLATES FR6). One decision, read by the delivery gate, so the rule is
+ * testable on its own:
+ *  - `template_structure`: it still does not follow its template, so it is NOT attached. A file of this
+ *    kind is one readers scan for its sections; posted inline, it is read in the conversation, and the
+ *    next turn can produce the file in the declared shape.
+ *  - `purity`: it still reads as conversation, so it is NOT attached either.
+ *  - `mismatch`: only its agreed length is off, so the best version is attached and the shortfall logged.
+ *  - null: nothing is left to fix.
+ * Only a DECLARED document (`replyBesideFile`) is withheld: where the reply itself is the file there is no
+ * separate reply to post it beside.
+ */
+export function stillFailingPackaging(
+  issues: DeliverableIssue[],
+  replyBesideFile: boolean,
+): 'template_structure' | 'purity' | 'mismatch' | null {
+  if (replyBesideFile && issues.some((i) => i.kind === 'template_structure')) return 'template_structure';
+  if (replyBesideFile && issues.some(isPurityIssue)) return 'purity';
+  return issues.length > 0 ? 'mismatch' : null;
+}
+
+/** The template check's recorded outcome (SPEC-DOCUMENT-TEMPLATES FR8), decided once the packaging is. */
+export function templateCheckOutcome(args: {
+  filled: boolean;
+  attached: boolean;
+  corrected: boolean;
+}): 'filled_by_platform' | 'posted_inline' | 'passed_after_correction' | 'passed' {
+  if (args.filled) return 'filled_by_platform';
+  if (!args.attached) return 'posted_inline';
+  return args.corrected ? 'passed_after_correction' : 'passed';
+}
+
+/** A declared document that is not packaged posts inline AFTER the reply, so neither text is lost. */
+export function postInline(reply: string, documentText: string): string {
+  return reply.trim() ? `${reply.trim()}\n\n${documentText}` : documentText;
 }

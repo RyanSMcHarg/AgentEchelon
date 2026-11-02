@@ -23,6 +23,8 @@ export interface StandardTagsOptions {
 }
 
 export const PROJECT_TAG = 'Project';
+/** The deployment instance a resource belongs to. Invoke grants by name pattern are scoped by it (`ownInstanceFunctions`). */
+export const INSTANCE_TAG = 'Instance';
 
 /**
  * Apply the standard tags ONCE at the app/root scope. Do NOT re-add `Project` per-stack
@@ -30,12 +32,21 @@ export const PROJECT_TAG = 'Project';
  * inside a stack. Pair with {@link collectProjectTagValues} to fail synth on regressions.
  */
 export function applyStandardTags(scope: IConstruct, o: StandardTagsOptions): void {
+  const standardTags: Record<string, string> = { [PROJECT_TAG]: o.project };
+  if (o.codebase) standardTags.Codebase = o.codebase;
+  if (o.instance) standardTags[INSTANCE_TAG] = o.instance;
+  standardTags.ManagedBy = o.managedBy ?? 'CDK';
+  standardTags.Environment = o.environment;
+
   const tags = cdk.Tags.of(scope);
-  tags.add(PROJECT_TAG, o.project);
-  if (o.codebase) tags.add('Codebase', o.codebase);
-  if (o.instance) tags.add('Instance', o.instance);
-  tags.add('ManagedBy', o.managedBy ?? 'CDK');
-  tags.add('Environment', o.environment);
+  for (const [key, value] of Object.entries(standardTags)) tags.add(key, value);
+  // The stack carries the same set as its resources. Under `@aws-cdk/core:explicitStackTags` (cdk.json) a stack
+  // takes only the tags set on it directly, so each stack under the scope is given the set here, as it is visited.
+  cdk.Aspects.of(scope).add({
+    visit(node: IConstruct) {
+      if (cdk.Stack.isStack(node)) for (const [key, value] of Object.entries(standardTags)) node.tags.setTag(key, value);
+    },
+  });
 }
 
 /**

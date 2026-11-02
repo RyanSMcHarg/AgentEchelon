@@ -58,6 +58,8 @@ const call = () => resolveScopedChannelArns({ currentChannelArn: CHANNEL, bearer
 
 beforeEach(() => mockSend.mockReset());
 
+afterEach(() => jest.restoreAllMocks());
+
 describe('resolveScopedChannelArns', () => {
   it('asks the messaging service for the channels ALL human members share', async () => {
     prime([userArn('a'), userArn('b'), `${APP}/bot/premium`], [CHANNEL, `${APP}/channel/other`]);
@@ -77,18 +79,19 @@ describe('resolveScopedChannelArns', () => {
     expect(search.input.Fields[0].Values.filter((v: string) => v.includes('/bot/'))).toEqual([BOT]);
   });
 
-  it('searches AS A MEMBER, because the service rejects any other bearer', async () => {
-    // Verified against the live API: searching as the assistant's bot returns
-    // `BadRequestException: AppInstanceUser must include its own ARN for MEMBERS field`. The bearer
-    // has to be one of the people in the filter — which also bounds the search to channels that
-    // member already belongs to. The membership read keeps the bot bearer, where it works.
+  it('searches AS THE ASSISTANT, whose own ARN is already a filter value', async () => {
+    // This once asserted a HUMAN bearer, on the reading that `BadRequestException: AppInstanceUser
+    // must include its own ARN for MEMBERS field` meant a bot cannot bear. Measured against the live
+    // API 2026-09-30: a bot bears `SearchChannels` and AND-filters identically. That error is about
+    // the BEARER needing its own ARN among the values, which the assistant satisfies by being an
+    // intersection term. Counted to exhaustion, bot-bearer and human-bearer returned the same 265.
     prime([userArn('a'), userArn('b')], [CHANNEL]);
     await call();
 
     const list = mockSend.mock.calls.map((c) => c[0]).find((c) => c.__type === 'ListMemberships');
     const search = mockSend.mock.calls.map((c) => c[0]).find((c) => c.__type === 'Search');
     expect(list.input.ChimeBearer).toBe(BOT);
-    expect(search.input.ChimeBearer).toBe(userArn('a'));
+    expect(search.input.ChimeBearer).toBe(BOT);
     // The constraint the service enforces: the bearer's own ARN is in the MEMBERS values.
     expect(search.input.Fields[0].Values).toContain(search.input.ChimeBearer);
   });
@@ -144,6 +147,27 @@ describe('resolveScopedChannelArns', () => {
     expect(search.input.Fields[0].Values).toEqual([userArn('a'), userArn('b'), BOT]);
   });
 
+  it('stops at the page cap and keeps only conversations that matched the full filter', async () => {
+    // A history shared with the assistant costs one search per 50 conversations. 597 measured 12
+    // sequential searches a turn and was throttled under a burst; the cap bounds that. Stopping early
+    // keeps pages that each satisfied the WHOLE filter, so the scope can only narrow.
+    // eslint-disable-next-line @typescript-eslint/no-var-requires
+    const { MAX_SCOPE_PAGES } = require('../../lambda/src/lib/scoped-channels');
+    const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+    let searchPage = 0;
+    mockSend.mockImplementation(async (cmd: any) => {
+      if (cmd.__type === 'ListMemberships') return { ChannelMemberships: [{ Member: { Arn: userArn('a') } }] };
+      searchPage++;
+      return { Channels: [{ ChannelArn: `${APP}/channel/p${searchPage}` }], NextToken: `s${searchPage + 1}` };
+    });
+
+    const arns = await call();
+
+    expect(searchPage).toBe(MAX_SCOPE_PAGES);
+    expect(arns).toEqual(Array.from({ length: MAX_SCOPE_PAGES }, (_, i) => `${APP}/channel/p${i + 1}`));
+    expect(warn.mock.calls.some((c) => String(c[0]).includes(`stopped at ${MAX_SCOPE_PAGES} pages`))).toBe(true);
+  });
+
   describe('the serving assistant is part of the intersection', () => {
     // Without the assistant in the filter, the scope is "channels every human shares" - which can
     // include a conversation THIS assistant was never added to. The related-conversation lookup reads
@@ -154,8 +178,8 @@ describe('resolveScopedChannelArns', () => {
       await call();
       const search = mockSend.mock.calls.map((c) => c[0]).find((c) => c.__type === 'Search');
       expect(search.input.Fields[0].Values).toEqual([userArn('a'), userArn('b'), BOT]);
-      // The bearer stays a HUMAN: a bot is not an AppInstanceUser and the service refuses it.
-      expect(search.input.ChimeBearer).toBe(userArn('a'));
+      // And it BEARS the search too, so the term and the bearer are the same principal.
+      expect(search.input.ChimeBearer).toBe(BOT);
     });
 
     it('leaves room for the assistant in the filter cap', async () => {
@@ -166,35 +190,20 @@ describe('resolveScopedChannelArns', () => {
     });
   });
 
-  describe('when a search bearer exceeds the channel-membership limit', () => {
-    // Measured on this deployment: the search refuses at 1038 channels for the bearer. The limit is a
-    // property of the PERSON, and only the BEARER is checked - so another member can answer the same
-    // question. Live error text, 2026-08-08.
+  describe('when the ASSISTANT exceeds the channel-membership limit', () => {
+    // Measured on this deployment: the search refuses at 1038 channels for the bearer, and the
+    // assistant sat at 388 when it took over the bearing (2026-09-30). It is the principal that
+    // grows fastest - one membership per conversation of its classification - so it is the one that
+    // will cross first. Rotation is gone with the human bearer, so there is nothing to fall back to
+    // and EVERY conversation loses drift at once. Owner accepted that risk; the requirement here is
+    // that it is not silent. Live error text, 2026-08-08.
     const limitError = Object.assign(
       new Error('Primary search user arn:...:user/x exceeds channel membership limit to perform search.'),
       { name: 'BadRequestException' },
     );
 
-    it('retries with a DIFFERENT human, because the answer is bearer-independent', async () => {
-      mockSend.mockImplementation(async (cmd: any) => {
-        if (cmd.__type === 'ListMemberships') {
-          return { ChannelMemberships: [{ Member: { Arn: userArn('heavy') } }, { Member: { Arn: userArn('light') } }] };
-        }
-        if (cmd.input.ChimeBearer === userArn('heavy')) throw limitError;
-        return { Channels: [{ ChannelArn: CHANNEL }] };
-      });
-
-      expect(await call()).toEqual([CHANNEL]);
-      const searches = mockSend.mock.calls.map((c) => c[0]).filter((c) => c.__type === 'Search');
-      expect(searches.map((s: any) => s.input.ChimeBearer)).toEqual([userArn('heavy'), userArn('light')]);
-      // The retry asks the SAME question - the assistant term must survive it.
-      expect(searches[1].input.Fields[0].Values).toContain(BOT);
-    });
-
-    it('fails CLOSED when EVERY human is over the limit', async () => {
-      // The per-member-list fallback is deliberately not used here: it cannot apply the assistant
-      // term, so it would answer a WIDER question than the primary path on exactly the heaviest
-      // accounts. A fallback less safe than the path it backs up is worse than none.
+    it('fails CLOSED and says the ASSISTANT is the one over the limit', async () => {
+      const err = jest.spyOn(console, 'error').mockImplementation(() => {});
       mockSend.mockImplementation(async (cmd: any) => {
         if (cmd.__type === 'ListMemberships') {
           return { ChannelMemberships: [{ Member: { Arn: userArn('a') } }, { Member: { Arn: userArn('b') } }] };
@@ -202,11 +211,68 @@ describe('resolveScopedChannelArns', () => {
         throw limitError;
       });
       expect(await call()).toEqual([]);
+      // A deployment-wide outage of the feature must not read as 'no suggestion today'. The old
+      // per-person limit was a warning because another member could answer; this one cannot be.
+      const said = err.mock.calls.flat().join(' ');
+      expect(said).toMatch(/SERVING ASSISTANT IS OVER THE CHANNEL MEMBERSHIP LIMIT/);
     });
 
-    it('does NOT retry another bearer for an unrelated BadRequestException', async () => {
-      // Anything other than the membership limit is about the REQUEST, and would fail identically for
-      // every member; retrying would just multiply the same failure.
+    it('falls back to a HUMAN bearer, asking the IDENTICAL filter', async () => {
+      // The fallback that was rejected intersected each member's own channel list and could not carry
+      // the assistant term, so it answered a WIDER question. Changing the bearer changes only who asks:
+      // measured 2026-09-30, human bearer with [human, bot] returned the same 265 as bot bearer with
+      // [human, bot]. So this must re-ask with the values UNCHANGED, which is what the last assertion pins.
+      mockSend.mockImplementation(async (cmd: any) => {
+        if (cmd.__type === 'ListMemberships') {
+          return { ChannelMemberships: [{ Member: { Arn: userArn('a') } }, { Member: { Arn: userArn('b') } }] };
+        }
+        if (cmd.input.ChimeBearer === BOT) throw limitError;
+        return { Channels: [{ ChannelArn: CHANNEL }] };
+      });
+
+      expect(await call()).toEqual([CHANNEL]);
+      const searches = mockSend.mock.calls.map((c) => c[0]).filter((c: any) => c.__type === 'Search');
+      expect(searches.map((x: any) => x.input.ChimeBearer)).toEqual([BOT, userArn('a')]);
+      // The assistant term must survive the handover, or the fallback would widen the scope.
+      expect(searches[1].input.Fields[0].Values).toEqual(searches[0].input.Fields[0].Values);
+      expect(searches[1].input.Fields[0].Values).toContain(BOT);
+    });
+
+    it('tries the next human when one of them is over the limit too', async () => {
+      mockSend.mockImplementation(async (cmd: any) => {
+        if (cmd.__type === 'ListMemberships') {
+          return { ChannelMemberships: [{ Member: { Arn: userArn('heavy') } }, { Member: { Arn: userArn('light') } }] };
+        }
+        if (cmd.input.ChimeBearer === userArn('light')) return { Channels: [{ ChannelArn: CHANNEL }] };
+        throw limitError;
+      });
+      expect(await call()).toEqual([CHANNEL]);
+      const bearers = mockSend.mock.calls.map((c) => c[0]).filter((c: any) => c.__type === 'Search')
+        .map((x: any) => x.input.ChimeBearer);
+      expect(bearers).toEqual([BOT, userArn('heavy'), userArn('light')]);
+    });
+
+    it('fails CLOSED, and says so as an ERROR, when the assistant AND every human are over', async () => {
+      // The assistant being over the limit is a deployment-wide condition: every conversation it serves
+      // then depends on a human under the limit. That is worth an error, because the symptom is silence.
+      const err = jest.spyOn(console, 'error').mockImplementation(() => {});
+      mockSend.mockImplementation(async (cmd: any) => {
+        if (cmd.__type === 'ListMemberships') {
+          return { ChannelMemberships: [{ Member: { Arn: userArn('a') } }, { Member: { Arn: userArn('b') } }] };
+        }
+        throw limitError;
+      });
+      expect(await call()).toEqual([]);
+      expect(err.mock.calls.flat().join(' ')).toMatch(/OVER THE CHANNEL MEMBERSHIP LIMIT and so is every/);
+    });
+
+    it('does NOT fall back for an unrelated BadRequestException', async () => {
+      // Anything other than the membership limit is about the REQUEST and would fail identically for
+      // every bearer, so a fallback would multiply one failure instead of answering it. It must also
+      // not borrow the deployment-wide wording, which would send the reader after a capacity problem
+      // they do not have.
+      const warn = jest.spyOn(console, 'warn').mockImplementation(() => {});
+      const err = jest.spyOn(console, 'error').mockImplementation(() => {});
       let searches = 0;
       mockSend.mockImplementation(async (cmd: any) => {
         if (cmd.__type === 'ListMemberships') {
@@ -217,6 +283,8 @@ describe('resolveScopedChannelArns', () => {
       });
       expect(await call()).toEqual([]);
       expect(searches).toBe(1);
+      expect(err.mock.calls.flat().join(' ')).not.toMatch(/OVER THE CHANNEL MEMBERSHIP LIMIT/);
+      expect(warn.mock.calls.flat().join(' ')).toMatch(/channel search failed/);
     });
   });
 });

@@ -1,4 +1,15 @@
-export type Classification = 'basic' | 'standard' | 'premium';
+/**
+ * THE BEDROCK TEXT MODELS OF THE INSTANCE'S CATALOG (`model-catalog.ts`): every one the platform allows, by key, with
+ * no classification on any of them. Which a classification may use is its own `models` selection
+ * (`lib/config/profiles.ts`), and its stack grants exactly those.
+ */
+/**
+ * A CLASSIFICATION VALUE THIS DEPLOYMENT DECLARES (`profiles`, `lib/config/profiles.ts`). A string, never a
+ * union of the shipped sample's names: a classification is configuration, so which values exist is the
+ * registry's answer (`ProfileRegistry.isKnownClassification`), and a value it does not know is refused
+ * where it arrives rather than narrowed by a cast.
+ */
+export type Classification = string;
 export type ProviderKey = 'anthropic' | 'amazon' | 'openai' | 'deepseek';
 export type BackendModelKey =
   | 'haiku'
@@ -7,15 +18,13 @@ export type BackendModelKey =
   | 'titan'
   | 'gpt_oss_20b'
   | 'gpt_oss_120b'
-  | 'deepseek_v3';
-export type RouteKey =
-  | 'general_qa'
-  | 'code_generation'
-  | 'code_review'
-  | 'document_extraction'
-  | 'report_generation'
-  | 'strategic_analysis'
-  | 'workflow_actions';
+  | 'deepseek_v3'
+  | 'deepseek_r1';
+/**
+ * A ROUTE IS KEYED BY THE INTENT IT SERVES (ADR-064 decision 1): the classifier's intent key, the same key the intent
+ * pack declares, the console's card shows and an analytics row records. There is no second vocabulary.
+ */
+export type RouteKey = string;
 
 export interface BackendModelDefinition {
   key: BackendModelKey;
@@ -24,7 +33,12 @@ export interface BackendModelDefinition {
   bedrockModelId: string;
   foundationModelArns: string[];
   inferenceProfileArns?: string[];
-  allowedClassifications: Classification[];
+  /**
+   * WHAT THE MODEL IS FOR: every model in this catalog answers in text. Image models carry `'image'` in the
+   * image registry, and a model serves only uses whose need matches its output (`modelFits` in
+   * `model-availability.ts`). Required, so a new entry cannot leave its purpose unstated.
+   */
+  output: 'text';
   strengths: string[];
   costClass: 'low' | 'medium' | 'high';
   latencyClass: 'fast' | 'balanced' | 'deep';
@@ -43,7 +57,7 @@ export interface BackendModelDefinition {
    * Level 2 / ADR-014): when a turn's userLanguage !== the resolved model's
    * workingLanguage, the input is translated into workingLanguage for inference
    * and the output back. Default 'en' for current models — a no-op for English
-   * users, so the field changes no current behaviour until a non-'en' model is
+   * users, so the field changes no current behavior until a non-'en' model is
    * added.
    */
   workingLanguage: string;
@@ -54,14 +68,7 @@ export interface IntentRouteDefinition {
   label: string;
   primaryModel: BackendModelKey;
   fallbackModel: BackendModelKey;
-  preferredClearance: Classification;
   rationale: string;
-}
-
-export interface ProfileModelSelection {
-  basic: BackendModelKey;
-  standard: BackendModelKey;
-  premium: BackendModelKey;
 }
 
 /**
@@ -111,6 +118,40 @@ export function modelCatalogKeys(): ReadonlySet<string> {
  * this set is account-independent and portable. Re-verify with that
  * CLI if AWS changes a profile's member set.
  */
+/**
+ * THE SMALL, FAST MODEL EVERY UTILITY STEP USES, named once.
+ *
+ * Intent classification, conversation titling, drift reasoning, conversation summaries, analytics
+ * recommendations and the evaluation judge are all the same shape of work: a short prompt, a short
+ * answer, running either on somebody's turn or on a batch nobody is watching. They do not each get to
+ * pick a model.
+ *
+ * WHY THIS CONSTANT EXISTS. They DID each pick, by writing the same literal into fourteen files, and
+ * on 2026-09-17 that literal turned out to be `anthropic.claude-3-haiku-20240307-v1:0`, which Amazon
+ * Bedrock reports as "This model version has reached the end of its life". It still invoked through a
+ * legacy inference profile, so nothing had failed and nothing had noticed. Fourteen copies is fourteen
+ * chances to miss the next one. This is tenet D7 applied to a model id.
+ *
+ * ON-DEMAND THROUGHPUT FOR THIS MODEL IS SERVED THROUGH A CROSS-REGION PROFILE, so the id a caller
+ * hands Bedrock is the PROFILE id, and IAM has to cover the profile plus every member region it can
+ * route to. `utilityModelArns` builds that set; it is not hand-written at the call site.
+ */
+export const UTILITY_MODEL_ID = 'us.anthropic.claude-haiku-4-5-20251001-v1:0';
+
+/** The underlying foundation model behind {@link UTILITY_MODEL_ID}, which is what IAM names. */
+export const UTILITY_MODEL_FOUNDATION_ID = 'anthropic.claude-haiku-4-5-20251001-v1:0';
+
+/**
+ * Every ARN a principal needs in order to invoke {@link UTILITY_MODEL_ID}: the account's inference
+ * profile, and the foundation model in each region that profile is allowed to route to.
+ */
+export function utilityModelArns(region: string, account: string): string[] {
+  return [
+    ...crossRegionFoundationModelArns(region, UTILITY_MODEL_FOUNDATION_ID),
+    `arn:aws:bedrock:${region}:${account}:inference-profile/${UTILITY_MODEL_ID}`,
+  ];
+}
+
 export const US_CROSS_REGION_PROFILE_REGIONS = [
   'us-east-1',
   'us-east-2',
@@ -121,7 +162,7 @@ export const US_CROSS_REGION_PROFILE_REGIONS = [
  * Foundation-model ARNs for a model invoked through a `us.` cross-region
  * inference profile: the deploy region plus every profile member region,
  * deduped. Consumed by the catalog so the IAM grant
- * (`collectArnsForClassification` → `foundationModelArns`) covers every region the
+ * (`modelArnsForClassification` → `foundationModelArns`) covers every region the
  * profile can fan out to. A non-US deploy region is unioned in defensively
  * (the catalog still hardcodes `us.` profiles — a true non-US deployment
  * is out of scope and documented elsewhere).
@@ -136,16 +177,36 @@ export function getModelCatalog(region: string, account: string): Record<Backend
     haiku: {
       key: 'haiku',
       provider: 'anthropic',
-      displayName: 'Claude Haiku',
-      bedrockModelId: 'anthropic.claude-3-haiku-20240307-v1:0',
-      foundationModelArns: [
-        `arn:aws:bedrock:${region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0`,
+      displayName: 'Claude Haiku 4.5',
+      // CLAUDE 3 HAIKU IS END OF LIFE ON AMAZON BEDROCK, AND THAT DECIDES THIS (2026-09-17).
+      //
+      // `GetFoundationModel` on `anthropic.claude-3-haiku-20240307-v1:0` answers
+      // `ResourceNotFoundException: This model version has reached the end of its life`, and no
+      // Claude 3 model appears in `ListFoundationModels` at all. It still INVOKES through its legacy
+      // inference profile, which is why nothing had failed yet - an availability that ends without
+      // this deployment doing anything.
+      //
+      // THE LATENCY GOES THE WRONG WAY AND IS ACCEPTED. This entry also sets `CLASSIFIER_MODEL_ID`
+      // (`assistant-profile-stack.ts`), and the intent classifier is the largest step in front of a
+      // person's first feedback. Measured through the deployed path on the probe classification:
+      // Haiku 4.5 at 728, 689 and 708 ms against Claude 3 Haiku at 360 to 627 ms. A one-word
+      // classification gains nothing from a larger model and pays a higher latency floor, so this is
+      // roughly +80 ms on every turn whose message misses `fastPathIntent`. It is paid because the
+      // alternative is a model that is scheduled to stop answering.
+      //
+      // Cross-region profile (`us.`), like sonnet below: on-demand throughput for this model is
+      // served through the profile, so `bedrockModelId` is the PROFILE id and IAM must cover every
+      // member region the profile can route to, not just the deploy region.
+      bedrockModelId: 'us.anthropic.claude-haiku-4-5-20251001-v1:0',
+      foundationModelArns: crossRegionFoundationModelArns(region, 'anthropic.claude-haiku-4-5-20251001-v1:0'),
+      inferenceProfileArns: [
+        `arn:aws:bedrock:${region}:${account}:inference-profile/us.anthropic.claude-haiku-4-5-20251001-v1:0`,
       ],
-      allowedClassifications: ['basic', 'standard', 'premium'],
       strengths: ['fast replies', 'low-cost triage', 'simple extraction'],
       costClass: 'low',
       latencyClass: 'fast',
       visionCapable: true,
+      output: 'text',
       workingLanguage: 'en',
     },
     sonnet: {
@@ -160,11 +221,11 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       inferenceProfileArns: [
         `arn:aws:bedrock:${region}:${account}:inference-profile/us.anthropic.claude-sonnet-4-6`,
       ],
-      allowedClassifications: ['standard', 'premium'],
       strengths: ['coding tasks', 'reasoning', 'tool reliability'],
       costClass: 'medium',
       latencyClass: 'balanced',
       visionCapable: true,
+      output: 'text',
       workingLanguage: 'en',
     },
     opus: {
@@ -179,11 +240,11 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       inferenceProfileArns: [
         `arn:aws:bedrock:${region}:${account}:inference-profile/us.anthropic.claude-opus-4-6-v1`,
       ],
-      allowedClassifications: ['premium'],
       strengths: ['deep analysis', 'complex architecture', 'high-stakes reasoning'],
       costClass: 'high',
       latencyClass: 'deep',
       visionCapable: true,
+      output: 'text',
       workingLanguage: 'en',
     },
     titan: {
@@ -199,11 +260,11 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/amazon.nova-pro-v1:0`,
       ],
-      allowedClassifications: ['standard', 'premium'],
       strengths: ['summaries', 'structured drafting', 'bedrock-native fallback'],
       costClass: 'medium',
       latencyClass: 'balanced',
       visionCapable: false,
+      output: 'text',
       workingLanguage: 'en',
     },
     gpt_oss_20b: {
@@ -214,11 +275,11 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/openai.gpt-oss-20b-1:0`,
       ],
-      allowedClassifications: ['standard', 'premium'],
       strengths: ['low-cost coding support', 'fast drafting', 'OpenAI-on-Bedrock option'],
       costClass: 'medium',
       latencyClass: 'balanced',
       visionCapable: false,
+      output: 'text',
       workingLanguage: 'en',
     },
     gpt_oss_120b: {
@@ -229,16 +290,16 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/openai.gpt-oss-120b-1:0`,
       ],
-      allowedClassifications: ['premium'],
       strengths: ['deeper coding analysis', 'larger open-weight reasoning', 'OpenAI-on-Bedrock experimentation'],
       costClass: 'high',
       latencyClass: 'deep',
       visionCapable: false,
+      output: 'text',
       workingLanguage: 'en',
     },
     // DeepSeek V3.2 — served IN-AWS via Amazon Bedrock (on-demand, Converse API), so it gets
-    // Bedrock Guardrails + AWS billing and needs NO external API key / cross-border consent gate
-    // (unlike the external `provider:'deepseek'` adapter in providers/external-llm.ts).
+    // Bedrock Guardrails + AWS billing and needs NO external API key (unlike the external DeepSeek adapter,
+    // `deepseek_api` in `model-catalog.ts`, which a classification selects and its stack grants the key of).
     // workingLanguage 'zh': strong Chinese fluency/reasoning — the Bedrock-native CN option for the
     // bilingual pivot / context-aware routing.
     //
@@ -256,61 +317,47 @@ export function getModelCatalog(region: string, account: string): Record<Backend
       foundationModelArns: [
         `arn:aws:bedrock:${region}::foundation-model/deepseek.v3.2`,
       ],
-      allowedClassifications: ['standard', 'premium'],
       strengths: ['Chinese fluency', 'strong reasoning', 'low-cost open-weight'],
       costClass: 'low',
       latencyClass: 'balanced',
       visionCapable: false,
+      output: 'text',
+      workingLanguage: 'zh',
+    },
+    // DeepSeek R1, the reasoning model the context-routing path sends a reasoning intent to
+    // (SPEC-CONTEXT-AWARE-MODEL-ROUTING), through its `us.` cross-region inference profile.
+    deepseek_r1: {
+      key: 'deepseek_r1',
+      provider: 'deepseek',
+      displayName: 'DeepSeek R1 (Bedrock)',
+      bedrockModelId: 'us.deepseek.r1-v1:0',
+      foundationModelArns: crossRegionFoundationModelArns(region, 'deepseek.r1-v1:0'),
+      inferenceProfileArns: [
+        `arn:aws:bedrock:${region}:${account}:inference-profile/us.deepseek.r1-v1:0`,
+      ],
+      strengths: ['step-by-step reasoning', 'Chinese fluency'],
+      costClass: 'medium',
+      latencyClass: 'deep',
+      visionCapable: false,
+      output: 'text',
       workingLanguage: 'zh',
     },
   };
 }
 
-export const DEFAULT_PROFILE_MODEL_SELECTION: ProfileModelSelection = {
-  basic: 'haiku',
-  standard: 'sonnet',
-  premium: 'opus',
-};
-
-export function parseProfileModelSelection(
-  requested: Partial<Record<Classification, string | undefined>>,
-  catalog: Record<BackendModelKey, BackendModelDefinition>,
-): ProfileModelSelection {
-  const selection: ProfileModelSelection = { ...DEFAULT_PROFILE_MODEL_SELECTION };
-
-  for (const classification of Object.keys(selection) as Classification[]) {
-    const requestedKey = requested[classification] as BackendModelKey | undefined;
-    if (!requestedKey) continue;
-
-    const model = catalog[requestedKey];
-    if (!model) {
-      throw new Error(`Unknown model key "${requestedKey}" for classification "${classification}"`);
-    }
-    if (!model.allowedClassifications.includes(classification)) {
-      throw new Error(`Model "${requestedKey}" is not allowed for classification "${classification}"`);
-    }
-
-    selection[classification] = requestedKey;
-  }
-
-  return selection;
-}
-
 export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
   {
-    intent: 'general_qa',
+    intent: 'general',
     label: 'General Q&A',
     primaryModel: 'haiku',
     fallbackModel: 'sonnet',
-    preferredClearance: 'basic',
-    rationale: 'Fast, low-cost answers default to the cheapest capable model; fall back within Anthropic (Sonnet) rather than cross-provider. Basic classification (Sonnet not allowed) simply gets no fallback.',
+    rationale: 'Fast, low-cost answers default to the cheapest capable model; fall back within Anthropic (Sonnet) rather than cross-provider. A classification that selects no Sonnet simply gets no fallback.',
   },
   {
     intent: 'code_generation',
     label: 'Code Generation',
     primaryModel: 'sonnet',
     fallbackModel: 'gpt_oss_20b',
-    preferredClearance: 'standard',
     rationale: 'Coding work should support both Anthropic and OpenAI-on-Bedrock paths without forcing a premium-only default.',
   },
   {
@@ -318,15 +365,13 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Code Review',
     primaryModel: 'gpt_oss_20b',
     fallbackModel: 'sonnet',
-    preferredClearance: 'standard',
     rationale: 'Detailed review should expose an OpenAI-on-Bedrock option while keeping a strong Anthropic fallback at the same classification.',
   },
   {
-    intent: 'document_extraction',
+    intent: 'data_extraction',
     label: 'Document Extraction',
     primaryModel: 'haiku',
     fallbackModel: 'sonnet',
-    preferredClearance: 'basic',
     rationale: 'Extraction and parsing optimize for throughput and cost; fall back within Anthropic (Sonnet) rather than cross-provider.',
   },
   {
@@ -334,7 +379,6 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Report Generation',
     primaryModel: 'titan',
     fallbackModel: 'sonnet',
-    preferredClearance: 'standard',
     rationale: 'Structured drafting and summaries benefit from a stable drafting model with a stronger reasoning fallback.',
   },
   {
@@ -342,15 +386,13 @@ export const INTENT_ROUTE_STRATEGY: IntentRouteDefinition[] = [
     label: 'Strategic Analysis',
     primaryModel: 'opus',
     fallbackModel: 'sonnet',
-    preferredClearance: 'premium',
     rationale: 'Executive and strategic work should route to the deepest reasoning model available.',
   },
   {
-    intent: 'workflow_actions',
+    intent: 'guided_troubleshooting',
     label: 'Workflow Actions',
     primaryModel: 'sonnet',
     fallbackModel: 'haiku',
-    preferredClearance: 'standard',
     rationale: 'Tool-heavy workflows prefer the strongest action-group model; fall back within Anthropic (Haiku) rather than cross-provider.',
   },
 ];

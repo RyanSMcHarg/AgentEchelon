@@ -39,6 +39,10 @@ jest.mock('../lambda/src/lib/abuse-controls.js', () => ({
     mockClaims.push(key);
     return !mockAlreadyClaimed.has(key);
   },
+  // The real key, not a stand-in: the repair competes for the CHANNEL FLOW's claim to find out
+  // whether the flow already dispatched this message, so a mock that spelled it differently would
+  // make every one of these tests pass against a key nothing else ever takes.
+  flowDeliveryKey: (messageId: string) => `flow-${messageId}`,
 }), { virtual: true });
 
 const mockGetTask = jest.fn();
@@ -58,9 +62,9 @@ const BYSTANDER = `${APP}/user/bob`;
 const OWNING_BOT = `${APP}/bot/AltSlot0`;
 const SOME_BOT = `${APP}/bot/premium-bot`;
 
-process.env.ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:AgentEchelonClassification-Standard-Handler';
-process.env.PREMIUM_ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:AgentEchelonClassification-Premium-Handler';
-process.env.BASIC_ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:AgentEchelonClassification-Basic-Handler';
+process.env.STANDARD_ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:AgentEchelonAssistants-standard-Handler';
+process.env.PREMIUM_ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:AgentEchelonAssistants-premium-Handler';
+process.env.BASIC_ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:AgentEchelonAssistants-basic-Handler';
 
 // Exercised through the post-processing ENTRY rather than by calling the rule directly: the entry is
 // what Kinesis invokes, and a rule that works when called by hand but is not wired into the consumer
@@ -95,8 +99,8 @@ const task = (overrides: Record<string, unknown> = {}) => ({
   status: 'in_progress',
   taskState: 'collecting_requirements',
   assistantId: 'AltSlot0',
-  ownerId: 'alice',
-  ownerType: 'user',
+  assigneeId: 'alice',
+  assigneeType: 'user',
   ...overrides,
 });
 
@@ -116,6 +120,14 @@ const metrics = () => (console.log as jest.Mock).mock.calls
   .filter((line): line is string => typeof line === 'string' && line.includes('"_aws"'))
   .map((line) => JSON.parse(line))
   .flatMap((doc) => doc._aws.CloudWatchMetrics[0].Metrics.map((m: { Name: string }) => m.Name));
+
+/** The `Reason` each emitted `Unresolved` metric carried. */
+const unresolvedReasons = () => (console.log as jest.Mock).mock.calls
+  .map((c) => c[0])
+  .filter((line): line is string => typeof line === 'string' && line.includes('"_aws"'))
+  .map((line) => JSON.parse(line))
+  .filter((doc) => doc.Unresolved === 1)
+  .map((doc) => doc.Reason);
 
 beforeEach(() => {
   jest.clearAllMocks();
@@ -178,6 +190,17 @@ describe('what the record alone decides', () => {
       .toEqual({ repair: false, reason: 'bypass-token' });
     expect(decideRepair(answer({ Content: encodeURIComponent('/battle tabs or spaces?') })))
       .toEqual({ repair: false, reason: 'bypass-token' });
+  });
+
+  it('leaves a message that starts with a task reference alone - the CHANNEL FLOW routes those (ADR-035)', () => {
+    // The composer sends a shared item's `#n` reply with the task id and no mention, because the flow
+    // routes it from the text. Repairing it too answered the message twice: measured live, the second
+    // entry found the first turn busy and queued the message behind its own answer.
+    expect(decideRepair(answer({ Content: encodeURIComponent('#2 EMEA only, one page') })))
+      .toEqual({ repair: false, reason: 'task-reference' });
+    // Only at the start: a sentence that mentions a number is still repairable.
+    expect(decideRepair(answer({ Content: encodeURIComponent('we ranked it #1 last quarter') })).repair)
+      .toBe(true);
   });
 
   it('ignores an ordinary message with no task reference', () => {
@@ -298,9 +321,50 @@ describe('what it refuses to repair', () => {
     expect(dispatches()).toHaveLength(0);
     expect(metrics()).toContain('Unresolved');
   });
+
+  it('DECLINES a premium conversation whose router is unwired, and never borrows standard\'s (ADR-046)', async () => {
+    const saved = process.env.PREMIUM_ROUTER_ARN;
+    delete process.env.PREMIUM_ROUTER_ARN;
+    try {
+      await handler({ Records: [record(answer())] });
+      expect(dispatches()).toHaveLength(0);
+      // THE REASON, not merely that it was unresolved: an unreadable tag or a size refusal also emits
+      // `Unresolved`, and only `no-router` says the router table declined.
+      expect(unresolvedReasons()).toContain('no-router');
+    } finally {
+      process.env.PREMIUM_ROUTER_ARN = saved;
+    }
+  });
 });
 
 describe('one message, one repair', () => {
+  // ── THE FLOW MAY ALREADY OWN THIS TURN, AND THE TEXT NO LONGER SAYS SO ────────────────────────
+  //
+  // `decideRepair` stands down for a message whose TEXT starts with a `#<n>`, because the channel
+  // flow routes those. The flow now also routes on the task id in `Metadata`, and such a message
+  // carries NO reference in its text - so every free check here sees an ordinary unaddressed message
+  // and this would dispatch a second turn for one the flow already dispatched.
+  //
+  // The flow claims `flow-<MessageId>` before releasing the message, and a message reaches this
+  // stream only after release, so losing that claim is proof the flow dispatched, not a race.
+  it('stands down when the channel flow already claimed the message', async () => {
+    mockAlreadyClaimed.add('flow-m-1');
+
+    await handler({ Records: [record(answer())] });
+
+    expect(dispatches()).toHaveLength(0);
+    // And it did NOT burn the repair's own claim on a repair it never performed, so a later genuine
+    // repair of this message is still possible.
+    expect(mockClaims).not.toContain('repair-m-1');
+  });
+
+  it('repairs when the flow did not claim it, which is what it exists for', async () => {
+    await handler({ Records: [record(answer())] });
+
+    expect(dispatches()).toHaveLength(1);
+    expect(mockClaims).toContain('flow-m-1');
+  });
+
   it('claims the message durably, so a redelivery on another container dispatches nothing', async () => {
     // Kinesis delivery is at-least-once and a retried batch runs on whichever container is free. An
     // in-memory claim is per container, so both deliveries would believe they were first - the exact
@@ -315,10 +379,28 @@ describe('one message, one repair', () => {
     expect(dispatches()).toHaveLength(0);
   });
 
-  it('claims before it reads, so a duplicate costs nothing', async () => {
+  // THIS PINNED THE CLAIM BEING TAKEN FIRST, AND ADR-045 DECISION 2 MOVED IT AFTER THE CHECKS.
+  //
+  // "A duplicate costs nothing" was the right instinct applied at the wrong point. Claiming before
+  // the checks meant a repair REFUSED by the classification boundary, or declined on an unreadable
+  // size, still consumed the message's only durable claim - so the retry that should have succeeded
+  // once the throttle passed was turned away as a duplicate of a repair that never happened. The
+  // person's answer was then lost for good, which is the outcome the claim exists to prevent.
+  //
+  // What the claim still guarantees is unchanged and is asserted below: at most one DISPATCH per
+  // message. What it no longer does is charge for work that was declined. The cost of the new order
+  // is that a genuine duplicate re-runs the reads above the claim, and those are all reads.
+  it('still dispatches only once for a duplicate delivery', async () => {
     mockAlreadyClaimed.add('repair-m-1');
     await handler({ Records: [record(answer())] });
-    expect(mockGetTask).not.toHaveBeenCalled();
+    expect(dispatches()).toHaveLength(0);
+  });
+
+  it('reads the task before claiming, so a declined repair leaves the claim for a retry', async () => {
+    mockAlreadyClaimed.add('repair-m-1');
+    await handler({ Records: [record(answer())] });
+    // The inversion of the old assertion, and the point of the change: the checks run first now.
+    expect(mockGetTask).toHaveBeenCalled();
   });
 });
 

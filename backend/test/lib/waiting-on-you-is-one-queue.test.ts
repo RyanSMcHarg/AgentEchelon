@@ -38,7 +38,7 @@ const DUEL_CHANNEL = 'arn:aws:chime:us-east-1:1:app-instance/i/channel/duel';
 
 /** A mirror row as the user-tasks table stores it: partitioned by whoever owes the step. */
 const row = (over: Record<string, unknown> = {}) => ({
-  userSub: PRIYA,
+  principalId: PRIYA,
   taskId: 't1',
   channelArn: PLAN_CHANNEL,
   taskType: 'report_generation',
@@ -73,7 +73,7 @@ describe('the queue is one list, whatever opened the item', () => {
     expect(items.map((t) => t.taskId).sort()).toEqual(['duel-1', 'extract-1', 'report-1']);
     // ONE partition read answers it - not one call per workflow, and not one per conversation.
     expect(mockSend).toHaveBeenCalledTimes(1);
-    expect(mockSend.mock.calls[0][0].input.ExpressionAttributeValues[':userSub']).toBe(PRIYA);
+    expect(mockSend.mock.calls[0][0].input.ExpressionAttributeValues[':principalId']).toBe(PRIYA);
   });
 
   it('an item in a conversation the person is not looking at is still theirs', async () => {
@@ -96,7 +96,7 @@ describe('the queue is keyed on WHO OWES IT, not who asked', () => {
     // the item to the person who is NOT blocked and hide it from the one who is - worse than having no
     // queue, because it looks like it works.
     mockSend.mockResolvedValueOnce({
-      Items: [row({ taskId: 'sam-asked', userSub: PRIYA, requesterSub: SAM })],
+      Items: [row({ taskId: 'sam-asked', principalId: PRIYA, requesterPersonId: SAM })],
     });
     const { getActiveTasksForUser } = await import('../../lambda/src/lib/task-tracking');
 
@@ -104,7 +104,7 @@ describe('the queue is keyed on WHO OWES IT, not who asked', () => {
 
     expect(items.map((t) => t.taskId)).toEqual(['sam-asked']);
     const values = mockSend.mock.calls[0][0].input.ExpressionAttributeValues;
-    expect(values[':userSub']).toBe(PRIYA);
+    expect(values[':principalId']).toBe(PRIYA);
     expect(Object.values(values)).not.toContain(SAM);
   });
 

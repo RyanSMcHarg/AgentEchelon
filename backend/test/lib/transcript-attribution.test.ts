@@ -8,7 +8,7 @@
  *
  * Three properties matter and each is asserted directly:
  *   1. a merge across DIFFERENT speakers keeps the boundary,
- *   2. a 1:1 is byte-identical to the old behaviour (this is what makes it safe everywhere),
+ *   2. a 1:1 is byte-identical to the old behavior (this is what makes it safe everywhere),
  *   3. a forged label never survives, on ANY participant's content including an assistant's.
  */
 import {

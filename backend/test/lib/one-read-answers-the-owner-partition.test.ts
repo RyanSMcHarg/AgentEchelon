@@ -2,11 +2,11 @@
  * A CHANNEL TURN ASKS AN OWNER'S PARTITION ONCE, AND THE PER-TYPE FALLBACK IS NOT A SECOND ANSWER.
  *
  * The router's last task lookup is a loop over every declared machine, calling
- * `getActiveTask(userSub, type, { channelArn })`. Its comment describes it as the requester-keyed
+ * `getActiveTask(personId, type, { channelArn })`. Its comment describes it as the requester-keyed
  * question - "what has this person open at all", as distinct from "what is waiting on them" - and
  * that WAS the distinction before ADR-024. It is not one now. The mirror row is partitioned by the
  * CURRENT OWNER (`putMirrorRow`, task-tracking.ts), so both lookups read the same partition, and the
- * channel-scoped read above it (`getOwnerChannelTasks`) already returns every live row in it for this
+ * channel-scoped read above it (`getAssigneeChannelTasks`) already returns every live row in it for this
  * channel: unbounded, paginated, strongly consistent, and NOT narrowed by task type.
  *
  * So on a channel turn the loop is strictly weaker than a read the turn has already made. It cannot
@@ -16,7 +16,7 @@
  *
  * WHAT THIS FILE PINS, in both directions:
  *   - with a channel, the fallback does not run: the channel read is the answer;
- *   - without one, it still does. That path has no `getOwnerChannelTasks` to lean on, so removing the
+ *   - without one, it still does. That path has no `getAssigneeChannelTasks` to lean on, so removing the
  *     loop outright would remove the only lookup a channel-less turn makes.
  *
  * The mock harness follows `live-work-suppresses-drift.test.ts` in this directory, which exercises
@@ -49,6 +49,8 @@ jest.mock('@aws-sdk/client-lambda', () => ({
 jest.mock('@aws-sdk/client-ssm', () => ({
   SSMClient: jest.fn().mockImplementation(() => ({ send: mockSsmSend })),
   GetParameterCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetParam', input: args })),
+  // The assignment records the router resolves the turn's assistant from.
+  GetParametersByPathCommand: jest.fn().mockImplementation((args) => ({ __type: 'GetByPath', input: args })),
 }), { virtual: true });
 
 const APP = 'arn:aws:chime:us-east-1:111122223333:app-instance/abc';
@@ -57,8 +59,7 @@ const BOT_SELF = `${APP}/bot/premium-bot`;
 const HUMAN = `${APP}/user/alice`;
 const principalIdOf = (arn: string) => arn.split('/').pop() || arn;
 
-const ROSTER_PARAM = '/agent-echelon/alt-bot-slots/roster';
-const SELF_FUNCTION = 'AgentEchelonClassification-Premium-AgentHandler';
+const SELF_FUNCTION = 'AgentEchelonAssistants-premium-AgentHandler';
 
 const mockGetOwnerChannelTasks = jest.fn();
 const mockGetActiveTaskForOwner = jest.fn();
@@ -70,7 +71,7 @@ jest.mock('../../lambda/src/lib/task-tracking.js', () => {
   const actual = jest.requireActual('../../lambda/src/lib/task-tracking.js');
   return {
     ...actual,
-    getOwnerChannelTasks: (...a: unknown[]) => mockGetOwnerChannelTasks(...a),
+    getAssigneeChannelTasks: (...a: unknown[]) => mockGetOwnerChannelTasks(...a),
     getActiveTaskForOwner: (...a: unknown[]) => mockGetActiveTaskForOwner(...a),
     getActiveTask: (...a: unknown[]) => mockGetActiveTask(...a),
     getTask: (...a: unknown[]) => mockGetTask(...a),
@@ -120,13 +121,14 @@ describe('the per-type task fallback and the channel read', () => {
     jest.clearAllMocks();
 
     process.env.AWS_LAMBDA_FUNCTION_NAME = SELF_FUNCTION;
-    process.env.ALT_BOT_SLOTS_ROSTER_PARAM = ROSTER_PARAM;
+    // THE ROUTER IS DEPLOYED AS A CLASSIFICATION, so its own is not optional. A channel-less turn has
+    // no room to read one from and is served as this handler itself; before ADR-046 an unset value
+    // silently resolved to the fail-closed floor, which is how this test passed without ever saying
+    // which assistant it was exercising. There is no floor now, so the environment states it.
+    process.env.CLASSIFICATION = 'premium';
     delete process.env.ABUSE_CONTROLS_TABLE;
 
-    mockSsmSend.mockImplementation(async (cmd: { input?: { Name?: string } }) =>
-      cmd?.input?.Name === ROSTER_PARAM
-        ? { Parameter: { Value: JSON.stringify([]) } }
-        : { Parameter: { Value: BOT_SELF } });
+    mockSsmSend.mockImplementation(async () => ({ Parameter: { Value: BOT_SELF } }));
 
     mockMessagingSend.mockImplementation(async (cmd: { __type?: string }) => {
       if (cmd?.__type === 'ListTags') return { Tags: [{ Key: 'classification', Value: 'premium' }] };

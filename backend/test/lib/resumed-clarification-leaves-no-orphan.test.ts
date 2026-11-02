@@ -73,7 +73,7 @@ jest.mock('@aws-sdk/lib-dynamodb', () => ({
 
 jest.mock('@aws-sdk/client-dynamodb', () => ({ DynamoDBClient: jest.fn() }));
 
-// The battle row is state this turn writes, not behaviour it decides, so it is stubbed and asserted on.
+// The battle row is state this turn writes, not behavior it decides, so it is stubbed and asserted on.
 jest.mock('../../lambda/src/lib/battle-state', () => ({
   markBotWaitingForUser: (...args: unknown[]) => mockMarkBotWaitingForUser(...args),
   getBotRow: jest.fn().mockResolvedValue(null),
@@ -89,7 +89,7 @@ jest.mock('../../lambda/src/lib/message-analytics', () => ({
 }));
 
 import { finalizePlaceholderResponse } from '../../lambda/src/lib/async-processor-core';
-import { RESUMED_CHAIN_ACKNOWLEDGEMENT } from '../../lambda/src/lib/resumed-chain-delivery';
+import { RESUMED_CHAIN_QUESTION_ACKNOWLEDGEMENT } from '../../lambda/src/lib/resumed-chain-delivery';
 
 const CHANNEL = 'arn:aws:chime:us-east-1:111:app-instance/i/channel/c1';
 const BOT = 'arn:aws:chime:us-east-1:111:app-instance/i/bot/AltSlot0';
@@ -136,7 +136,7 @@ const finalize = (broadcastAnswer: boolean) =>
       channelArn: CHANNEL,
       correlationId: 'corr-1',
       userMessage: 'Q3 please',
-      userType: 'standard',
+      classification: 'standard',
       botArn: BOT,
       senderArn: USER,
       broadcastAnswer,
@@ -205,7 +205,8 @@ describe('a resumed side that asks again', () => {
       expect(contentWrittenTo(id)).toBeDefined();
       expect(contentWrittenTo(id)).not.toBe('...');
     }
-    expect(contentWrittenTo(PRIVATE_PLACEHOLDER)).toBe(RESUMED_CHAIN_ACKNOWLEDGEMENT);
+    // The receipt points at the QUESTION that was posted, never at an answer that does not exist yet.
+    expect(contentWrittenTo(PRIVATE_PLACEHOLDER)).toBe(RESUMED_CHAIN_QUESTION_ACKNOWLEDGEMENT);
   });
 
   it('marks the side waiting on the message that actually holds the question', async () => {

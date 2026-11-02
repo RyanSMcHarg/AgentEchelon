@@ -15,12 +15,13 @@ describe('Lambda handler entry points', () => {
     { path: 'cognito-triggers/post-confirmation.js', exportName: 'handler' },
     { path: 'cognito-triggers/pre-authentication.js', exportName: 'handler' },
     { path: 'presigned-url/index.js', exportName: 'handler' },
-    { path: 'create-conversation/index.js', exportName: 'handler' },
-    { path: 'add-agent-to-conversation/index.js', exportName: 'handler' },
     { path: 'share-conversation/index.js', exportName: 'handler' },
   ];
 
   const tsHandlers = [
+    // The person-facing create path. Was `create-conversation/index.js`, raw JS deployed with
+    // `Code.fromAsset`; bundled now so it can import the registry and the canonical creator (ADR-053).
+    'src/create-conversation.ts',
     // Single shared Lex-fulfillment handler for ALL tiers (deployed per-tier via TIER=<tier>).
     // The former per-tier {basic,standard,premium}-agent-handler.ts were divergent copies —
     // basic's was actually deployed (a bug: no tasks), the other two pure dead code. Retired.
@@ -100,11 +101,41 @@ describe('Lambda handler entry points', () => {
       expect(fs.existsSync(schemaDir)).toBe(true);
     });
 
-    it.each(['001-initial.sql', '002-pgvector.sql', '003-materialized-views.sql'])(
+    it.each(['001-initial.sql', '002-pgvector.sql'])(
       '%s exists',
       (file) => {
         expect(fs.existsSync(path.join(schemaDir, file))).toBe(true);
       }
     );
+
+    // SPEC-AURORA-VPC-MODE FR24 (declined): every dashboard figure is a live query, so the schema holds
+    // no materialized rollup with a second definition of the same number.
+    describe('no materialized rollups (FR24)', () => {
+      const sqlOnly = (s: string): string => s.replace(/--[^\n]*/g, '');
+      const schemaFiles = (): string[] => fs.readdirSync(schemaDir).filter((f) => f.endsWith('.sql')).sort();
+
+      it('072-no-materialized-rollups.sql drops daily_metrics, agent_performance and drift_summary', () => {
+        const file = path.join(schemaDir, '072-no-materialized-rollups.sql');
+        expect(fs.existsSync(file)).toBe(true);
+        const sql = sqlOnly(fs.readFileSync(file, 'utf8'));
+        for (const view of ['daily_metrics', 'agent_performance', 'drift_summary']) {
+          expect(sql).toMatch(new RegExp(`DROP\\s+MATERIALIZED\\s+VIEW\\s+IF\\s+EXISTS\\s+${view}\\s*;`, 'i'));
+        }
+      });
+
+      it('no schema file creates a materialized view', () => {
+        const files = schemaFiles();
+        // A check that scans nothing passes forever.
+        expect(files.length).toBeGreaterThan(60);
+        const creators = files.filter((f) =>
+          /CREATE\s+(?:OR\s+REPLACE\s+)?MATERIALIZED\s+VIEW/i.test(sqlOnly(fs.readFileSync(path.join(schemaDir, f), 'utf8'))));
+        expect(creators).toEqual([]);
+      });
+
+      it('detects a materialized view when one is created, proving the check can fail', () => {
+        expect(/CREATE\s+(?:OR\s+REPLACE\s+)?MATERIALIZED\s+VIEW/i.test(sqlOnly('CREATE MATERIALIZED VIEW IF NOT EXISTS x AS SELECT 1;'))).toBe(true);
+        expect(/CREATE\s+(?:OR\s+REPLACE\s+)?MATERIALIZED\s+VIEW/i.test(sqlOnly('-- CREATE MATERIALIZED VIEW x\n'))).toBe(false);
+      });
+    });
   });
 });

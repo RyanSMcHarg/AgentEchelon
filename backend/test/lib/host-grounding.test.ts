@@ -213,11 +213,23 @@ describe('assembleHostGrounding — P1 read split', () => {
  */
 describe('assembleHostGrounding — the roster is channel membership', () => {
   const FED_ISS = 'https://cognito-idp.us-east-1.amazonaws.com/us-east-1_partner';
-  // What membership reports for that federated member: the DERIVED id, not the raw sub.
+  // The partner's pool, declared in the trusted-issuer registry beside this deployment's own.
+  beforeAll(() => {
+    process.env.TRUSTED_ISSUERS = JSON.stringify([
+      { id: 'partner', kind: 'cognito-pool', pool: 'us-east-1_partner', iss: FED_ISS, subject: ['sub'], clearance: { oneChannel: 'basic', classifications: ['basic'] }, admin: false, groupsClaim: 'cognito:groups' },
+    ]);
+  });
+  afterAll(() => { delete process.env.TRUSTED_ISSUERS; });
+  // What membership reports for that member: the person the issuer's subject resolves to through
+  // `Identities`, never the raw subject.
+  const PARTNER_PERSON = '0192f0e0-0000-7000-8000-00000000abcd';
   const federatedId = () => {
     // eslint-disable-next-line @typescript-eslint/no-var-requires
-    const { deriveFederatedSub } = require('../../lambda/src/lib/federated-identity');
-    return deriveFederatedSub(FED_ISS, 'raw-partner-sub');
+    const { resolvePerson } = require('../../lambda/src/lib/person-identity');
+    (resolvePerson as jest.Mock).mockImplementationOnce(async (iss: string, sub: string) =>
+      // Keyed by the partner pool's registry id, which the roster's `iss` resolves to.
+      (iss === 'partner' && sub === 'raw-partner-sub' ? `arn:aws:chime:us-east-1:111:app-instance/x/user/${PARTNER_PERSON}` : null));
+    return PARTNER_PERSON;
   };
 
   const resolvers = (memberSubs: string[], names: Record<string, string> = {}) => ({
@@ -248,7 +260,7 @@ describe('assembleHostGrounding — the roster is channel membership', () => {
     mockDdbSend.mockResolvedValue({
       Item: {
         channelArn: ARN,
-        // The roster holds the RAW pair; membership reports the derived id. The join must survive it.
+        // The roster holds the issuer's pair; membership reports the person it resolves to.
         memberIdentities: [{ sub: 'raw-partner-sub', iss: FED_ISS, role: 'reviewer' }],
       },
     });
@@ -259,8 +271,8 @@ describe('assembleHostGrounding — the roster is channel membership', () => {
     expect(domainGrounding.participants).toEqual([
       { sub: derived, iss: FED_ISS, role: 'reviewer', name: 'Partner Person' },
     ]);
-    // The name lookup was told which IdP to ask, with the RAW sub — the derived id resolves nowhere.
-    expect(r.resolveName).toHaveBeenCalledWith(derived, { iss: FED_ISS, rawSub: 'raw-partner-sub' });
+    // The name is asked of the person; the directory finds their issuer through `Identities`.
+    expect(r.resolveName).toHaveBeenCalledWith(derived);
   });
 
   it('an unresolved name leaves the member IN the roster, unnamed', async () => {

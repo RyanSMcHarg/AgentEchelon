@@ -5,7 +5,7 @@
  * redact/update/delete, membership, moderator, channel) that the Chime message
  * stream carries: Kinesis -> Firehose -> S3 (`conversations/`) -> Glue table ->
  * Athena workgroup. This is the SYSTEM OF RECORD for conversation history and the
- * audit trail (docs/MESSAGE-FLOW.md section 6.3), read by the admin console's
+ * audit trail (docs/guides/developer/MESSAGE-FLOW.md section 11.2), read by the admin console's
  * Conversations tab (`admin-conversations.ts`) and by Legal/HR audit.
  *
  * It is DELIBERATELY independent of the analytics engine. The Athena analytics
@@ -15,7 +15,7 @@
  * it collapses membership to current-state and does not capture moderator events.
  *
  * Names (bucket, Glue database, Athena workgroup) come from the shared constants
- * so the admin-conversations Lambda's IAM (in cognito-auth-stack) and env resolve
+ * so the admin-conversations Lambda's IAM (in identity-stack) and env resolve
  * to this archive unchanged in both modes.
  */
 import * as cdk from 'aws-cdk-lib';
@@ -29,6 +29,8 @@ import * as logs from 'aws-cdk-lib/aws-logs';
 import * as s3 from 'aws-cdk-lib/aws-s3';
 import { Construct } from 'constructs';
 import { ANALYTICS_PREFIX, ANALYTICS_DB_NAME, ATHENA_WORKGROUP_NAME } from '../stacks/agent-classification-common';
+import { registerArchivePartitions } from './archive-partitions';
+
 
 export interface ConversationArchiveProps {
   /** The Chime message event stream (Kinesis) to archive. */
@@ -46,7 +48,7 @@ export class ConversationArchive extends Construct {
     const { account, region } = cdk.Stack.of(this);
 
     // Archive bucket. Deterministic name matches the admin-conversations role's
-    // resource ARN (cognito-auth-stack) and the Athena analytics stack's bucket,
+    // resource ARN (identity-stack) and the Athena analytics stack's bucket,
     // so exactly one exists per deployment (analytics mode is either/or).
     const archiveBucket = new s3.Bucket(this, 'Bucket', {
       bucketName: `${ANALYTICS_PREFIX}-conversation-archive-${account}-${region}`,
@@ -119,10 +121,18 @@ export class ConversationArchive extends Construct {
               parameters: [
                 {
                   parameterName: 'MetadataExtractionQuery',
-                  // buildAnalyticsMetadata() emits FLAT metadata: `.userType` at the
-                  // top level (not nested). Falls back to `unknown` when absent.
+                  // The `user_type` partition holds the CONVERSATION'S CLASSIFICATION; the name is
+                  // the S3 layout, the source is the turn's `classification`. A nested `.analytics`
+                  // block (an admin alert) first, else the FLAT top-level key
+                  // buildAnalyticsMetadata() emits. `unknown` when absent.
+                  //
+                  // THIS READS THE MESSAGE AND NOTHING ELSE, which is why `classification` has to
+                  // stay in FRONTEND_METADATA_KEYS. Archival compensates for Aurora-mode slimming by
+                  // re-reading the full blob from DynamoDB; Firehose has no such hop, so a key
+                  // slimmed out of the Chime Metadata is simply gone here. It was, and every record
+                  // partitioned as `unknown` until it was put back.
                   parameterValue:
-                    '{user_type:(if .Payload.Metadata then (.Payload.Metadata | fromjson | .userType // "unknown") else "unknown" end)}',
+                    '{user_type:(if .Payload.Metadata then (.Payload.Metadata | fromjson | .analytics.classification // .classification // "unknown") else "unknown" end)}',
                 },
                 { parameterName: 'JsonParsingEngine', parameterValue: 'JQ-1.6' },
               ],
@@ -137,7 +147,7 @@ export class ConversationArchive extends Construct {
     });
     deliveryStream.node.addDependency(firehoseRole);
 
-    // Glue catalog: database + the `conversations` table (partition projection),
+    // Glue catalog: database + the `conversations` table (partitions registered as they are written),
     // read by admin-conversations.ts over Athena.
     const glueDatabase = new glue.CfnDatabase(this, 'GlueDatabase', {
       catalogId: account,
@@ -154,18 +164,10 @@ export class ConversationArchive extends Construct {
         name: 'conversations',
         tableType: 'EXTERNAL_TABLE',
         parameters: {
-          'projection.enabled': 'true',
-          'projection.user_type.type': 'enum',
-          'projection.user_type.values': 'basic,standard,premium,unknown',
-          'projection.year.type': 'integer',
-          'projection.year.range': '2024,2030',
-          'projection.month.type': 'integer',
-          'projection.month.range': '1,12',
-          'projection.month.digits': '2',
-          'projection.day.type': 'integer',
-          'projection.day.range': '1,31',
-          'projection.day.digits': '2',
-          'storage.location.template': `s3://${archiveBucket.bucketName}/conversations/user_type=\${user_type}/year=\${year}/month=\${month}/day=\${day}/`,
+          // REGISTERED, NOT PROJECTED. A projected `user_type` would enumerate the deployment's classifications here,
+          // so adding one would change this table, and an injected one would refuse every query that scans across
+          // classifications. Each partition is created by the archival path as it is written
+          // (`registerArchivePartitions`, `lib/constructs/archive-partitions.ts`).
         },
         storageDescriptor: {
           columns: [{ name: 'line', type: 'string' }],
@@ -185,6 +187,8 @@ export class ConversationArchive extends Construct {
         ],
       },
     }).addDependency(glueDatabase);
+    // Each partition of that table, registered as the archive's Firehose writes it (`registerArchivePartitions`).
+    registerArchivePartitions(this, archiveBucket);
 
     // Athena workgroup used by admin-conversations.ts (results land in the bucket).
     new athena.CfnWorkGroup(this, 'AthenaWorkgroup', {

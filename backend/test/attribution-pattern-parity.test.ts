@@ -7,7 +7,7 @@
  * been fooled that way once: a corrupted escape in a guardrail pattern was caught only because a parity
  * test compared the e2e's copy against the backend's.
  *
- * This compares BEHAVIOUR rather than source text. Two regexes can differ character-by-character and
+ * This compares BEHAVIOR rather than source text. Two regexes can differ character-by-character and
  * agree on every input; what matters is that the e2e rejects exactly what the backend strips.
  */
 import * as fs from 'fs';

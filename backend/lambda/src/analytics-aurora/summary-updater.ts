@@ -8,8 +8,10 @@
  *
  * Per SPEC-DRIFT-CONVERGENCE.md "Summary Updater (Prerequisite)":
  *
- * - Time-based trigger only. No fire-and-forget invocation from
- *   kinesis-archival; this Lambda owns all summary generation.
+ * - Event-driven first: archival calls `summarizeChannelsNow` for the conversations
+ *   whose new messages it has just written, so a summary follows the conversation turn by turn. This
+ *   scheduled scan is the reconciliation backstop (tenet D6) for what that path deferred or failed, not
+ *   the primary mechanism. Both run the same `processChannel`, so there is one summary writer.
  * - Bedrock Haiku at temperature 0 for determinism. Prompt produces
  *   structured JSON (summary, purpose, topics, key_points).
  * - UPSERT with version guard. Concurrent writers are race-safe via
@@ -28,8 +30,11 @@ import {
 import { query, ensureSchema } from './db-client.js';
 import { writeSummaryEmbedding } from './embedding-writer.js';
 import { emitDriftCounter, emitDriftTiming, newCorrelationId } from '../lib/emf-metrics.js';
+import { UTILITY_MODEL_ID } from '../../../lib/config/model-strategy.js';
+import { loadProfileRegistry } from '../../../lib/profile-registry';
+import { supersededUpdateSql } from './update-events.js';
 
-const SUMMARY_MODEL_ID = process.env.SUMMARY_MODEL_ID || 'anthropic.claude-3-haiku-20240307-v1:0';
+const SUMMARY_MODEL_ID = process.env.SUMMARY_MODEL_ID || UTILITY_MODEL_ID;
 const SUMMARY_MAX_MESSAGES = Number(process.env.SUMMARY_MAX_MESSAGES || '50');
 const SUMMARY_BATCH_LIMIT = Number(process.env.SUMMARY_BATCH_LIMIT || '20'); // max channels per run
 const SUMMARY_BEDROCK_TIMEOUT_MS = 8000;
@@ -51,6 +56,8 @@ interface ActiveChannel {
 }
 
 export async function handler(event: SummaryUpdaterEvent = {}): Promise<{ processed: number; failed: number }> {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   const startedAt = Date.now();
   console.log('[summary-updater] run start', { event });
 
@@ -93,6 +100,67 @@ export async function handler(event: SummaryUpdaterEvent = {}): Promise<{ proces
  * Idempotent: a conversation that already has ANY summary is left alone, so a caller may invoke this
  * without tracking whether the turn was genuinely the first.
  */
+/**
+ * Seed a SPLIT-OUT conversation's summary from the topic that created it, before it has any messages.
+ *
+ * A conversation created by accepting a drift offer is the one case where the topic is known ahead of
+ * the first turn: the person was asked "shall I move that to a separate conversation?" and said yes,
+ * so the subject is settled and in their own words. Writing it down at creation means drift in the new
+ * conversation has a real anchor from its very first message, instead of comparing message two against
+ * a seed built from message one - which is the thin-anchor case `detectDrift` refuses.
+ *
+ * NO MODEL CALL. Every other summary is written by Bedrock because it has to compress a transcript;
+ * this one has nothing to compress. The topic label and the person's own words ARE the summary, so
+ * asking a model to restate them would add a call, a failure mode and a latency to the creation path
+ * in exchange for nothing.
+ *
+ * Stamped `drift-spawn` rather than `summary-seed`, which is what lets drift tell the two version-1
+ * anchors apart. Idempotent in the same way as the turn-one seed: an existing summary wins.
+ */
+export async function seedSummaryFromDriftTopic(input: {
+  channelArn: string;
+  topicLabel: string;
+  originatingMessageText?: string;
+}): Promise<{ seeded: boolean; reason?: string }> {
+  const { channelArn, topicLabel } = input;
+  const originating = (input.originatingMessageText || '').trim();
+  if (!channelArn || !topicLabel.trim()) return { seeded: false, reason: 'no-topic' };
+
+  const existing = await query<{ version: number }>(
+    `SELECT version FROM conversation_summaries WHERE channel_arn = $1 LIMIT 1`,
+    [channelArn],
+  );
+  if (existing.rows.length > 0) return { seeded: false, reason: 'already-summarised' };
+
+  // The person's words carry more of the subject than the label, which is truncated for a sidebar.
+  // Both, when both exist, so the embedding sees the full subject and a reader sees a clean purpose.
+  const summaryText = originating ? `${topicLabel}. ${originating}` : topicLabel;
+
+  const inserted = await query<{ version: number }>(
+    `INSERT INTO conversation_summaries (
+       channel_arn, purpose, summary, topics, key_points, version, generated_by, model_used
+     ) VALUES ($1, $2, $3, $4::text[], $5::text[], 1, 'drift-spawn', NULL)
+     ON CONFLICT (channel_arn, version) DO NOTHING
+     RETURNING version`,
+    [channelArn, topicLabel.slice(0, 64), summaryText, [topicLabel.slice(0, 64)], []],
+  );
+  if (inserted.rows.length === 0) return { seeded: false, reason: 'already-summarised' };
+
+  try {
+    // `drift-spawn`, matching the row written just above: this conversation was split out of another
+    // one, so it has its topic before its first message. The anchor has to say so, or a reader at
+    // version 1 cannot tell it from an ordinary new conversation with nothing to drift from.
+    await writeSummaryEmbedding({ channelArn, summaryText, fromVersion: 1, generatedBy: 'drift-spawn' });
+  } catch (err) {
+    // The row is what marks this anchor as a real topic; the embedding writer catches up on the next
+    // scheduled run. Do not fail the seed over it - the conversation already exists either way.
+    console.warn(`[summary-updater][drift-seed] embedding write failed for ${channelArn}:`, err);
+  }
+
+  console.log(`[summary-updater][drift-seed] seeded v1 from the drift topic for ${channelArn}`);
+  return { seeded: true };
+}
+
 export async function seedSummaryFromExchange(input: {
   channelArn: string;
   userMessage: string;
@@ -123,7 +191,7 @@ export async function seedSummaryFromExchange(input: {
 
   // `name`, `message_count` and `participant_count` were DROPPED (ADR-020, migration 015): each
   // described CHANNEL STATE, and this row is versioned and never rewritten, so a value copied here
-  // was frozen at one summarisation. Their live homes are the Amazon Chime SDK channel /
+  // was frozen at one summarization. Their live homes are the Amazon Chime SDK channel /
   // `channel_registry`, `messages`, and `channel_membership`.
   const inserted = await query<{ version: number }>(
     `INSERT INTO conversation_summaries (
@@ -144,7 +212,9 @@ export async function seedSummaryFromExchange(input: {
   if (inserted.rows.length === 0) return { seeded: false, reason: 'already-summarised' };
 
   try {
-    await writeSummaryEmbedding({ channelArn, summaryText: parsed.summary, fromVersion: 1 });
+    await writeSummaryEmbedding({
+      channelArn, summaryText: parsed.summary, fromVersion: 1, generatedBy: 'summary-seed', topics: parsed.topics,
+    });
   } catch (err) {
     // The row is what unblocks drift's cold start; the embedding writer will catch up on the next
     // scheduled run. Do not fail the seed over it.
@@ -153,6 +223,44 @@ export async function seedSummaryFromExchange(input: {
 
   console.log(`[summary-updater][seed] seeded v1 for ${channelArn}`);
   return { seeded: true };
+}
+
+/** How many conversations one archival batch summarizes at once; the rest wait for the scheduled scan. */
+const SUMMARY_ON_ARCHIVE_MAX = Number(process.env.SUMMARY_ON_ARCHIVE_MAX || '3');
+
+/**
+ * SUMMARIZE THESE CONVERSATIONS NOW, because their new messages were just archived.
+ *
+ * The summary used to move only on the 30-minute schedule, so a conversation's subjects lagged it by up
+ * to half an hour, and drift compared each turn against a picture of the conversation that old. Archival
+ * is where new messages land, so it calls this once the batch is written: the transcript is already in
+ * Aurora, and `processChannel` reads it through the same filter that keeps a privately addressed message
+ * out of the summary everyone reads. An in-memory refresh would skip that filter, which is why this reads
+ * the store.
+ *
+ * BOUNDED, and the schedule catches up: at most `SUMMARY_ON_ARCHIVE_MAX` conversations per batch, each one
+ * only if it has a message newer than its latest summary. Never throws: a failed summary is the
+ * scheduled scan's to repeat, and archival must not fail over it.
+ */
+export async function summarizeChannelsNow(channelArns: string[]): Promise<{ summarized: number; deferred: number }> {
+  const unique = [...new Set(channelArns.filter(Boolean))];
+  const now = unique.slice(0, SUMMARY_ON_ARCHIVE_MAX);
+  let summarized = 0;
+  for (const channelArn of now) {
+    try {
+      const [channel] = await findActiveChannels(channelArn);
+      if (!channel) continue;
+      const lastSummary = Date.parse(channel.last_summary_at ?? '');
+      if (Number.isFinite(lastSummary) && lastSummary >= Date.parse(channel.newest_message_at)) continue;
+      await processChannel(channel);
+      summarized++;
+    } catch (err) {
+      console.warn('[summary-updater] event-driven summary failed; the scheduled scan will retry', {
+        channelArn, err: (err as { name?: string })?.name ?? err,
+      });
+    }
+  }
+  return { summarized, deferred: unique.length - now.length };
 }
 
 async function findActiveChannels(specificArn?: string): Promise<ActiveChannel[]> {
@@ -215,16 +323,51 @@ async function processChannel(channel: ActiveChannel): Promise<void> {
     content: string | null;
     created_at: string;
   }>(
+    // A TARGETED MESSAGE IS NOT PART OF THE CONVERSATION'S SHARED SUBJECT. Targeted content never
+    // enters a shared summary, so what one member said to another stays between them.
+    //
+    // `target_arn` holds the one member a message was addressed to (ADR-034: addressing a message is
+    // not the same as making it private, and `Target` carries exactly one member). This select had no
+    // predicate on it, so a privately-addressed question AND the assistant's targeted reply to it were
+    // both summarized into the channel-wide summary - the one every member can read through the
+    // console, and the one drift builds its anchor from.
+    //
+    // THE BLAST RADIUS IS WIDER THAN THE SUMMARY TEXT, which is why this is the right place to fix it
+    // rather than at a reader. `summary_embeddings` is embedded FROM this summary, and the per-subject
+    // rows in `conversation_topic_embeddings` are embedded from the `topics[]` it returned. Filtering
+    // here keeps private content out of all three with one predicate; filtering at each consumer would
+    // be three chances to forget.
+    //
+    // IT IS THE ROOM'S SUBJECT THAT IS BEING SUMMARIZED. A message sent to one person is not evidence
+    // about what the room is discussing, so excluding it is not only a privacy rule - it also stops a
+    // side conversation dragging the anchor off the subject everybody else is on.
     `SELECT sender_name, is_bot, content, created_at
-       FROM messages
+       FROM messages m
       WHERE channel_arn = $1
+        AND event_type IN ('CREATE_CHANNEL_MESSAGE', 'UPDATE_CHANNEL_MESSAGE')
+        -- ONE UPDATE PER MESSAGE, ITS LATEST (migration 084). Every update is its own row, and a
+        -- placeholder's queue notice or receipt is not what the room said; the latest is the text the
+        -- message holds now.
+        AND NOT (event_type = 'UPDATE_CHANNEL_MESSAGE' AND ${supersededUpdateSql('m')})
         AND content IS NOT NULL
         AND content <> ''
+        AND target_arn IS NULL
       ORDER BY created_at DESC
       LIMIT $2`,
     [channel.channel_arn, SUMMARY_MAX_MESSAGES],
   );
   emitDriftTiming('summary_fetch', Date.now() - tMsgStart, correlationId);
+
+  // NO PERSON HAS SPOKEN, SO THERE IS NO SUBJECT YET. A conversation holding only the assistant's welcome
+  // was summarized from the welcome, and that summary became drift's anchor: the person's first real
+  // question then read as a change of subject and drew an offer instead of an answer. The summary waits
+  // for the first message a person sends. Messages only, above: channel and membership events carry a
+  // channel or member name in `content`, and with the service admin as their sender they read as a
+  // person speaking.
+  if (!messages.rows.some((m) => !m.is_bot)) {
+    console.log('[summary-updater] no message from a person yet; nothing to summarize', { channelArn: channel.channel_arn });
+    return;
+  }
 
   if (messages.rows.length === 0) {
     emitDriftCounter('drift_skipped_no_summary', correlationId); // reusing closest counter
@@ -237,8 +380,9 @@ async function processChannel(channel: ActiveChannel): Promise<void> {
     summary: string | null;
     purpose: string | null;
     topics: string[] | null;
+    generated_by: string | null;
   }>(
-    `SELECT version, summary, purpose, topics
+    `SELECT version, summary, purpose, topics, generated_by
        FROM conversation_summaries
       WHERE channel_arn = $1
       ORDER BY version DESC
@@ -248,6 +392,30 @@ async function processChannel(channel: ActiveChannel): Promise<void> {
   const previous = existingSummary.rows[0];
   const previousVersion = previous?.version || 0;
 
+  // ── A TURN-ONE SEED IS NOT CARRIED FORWARD, AND THAT IS WHAT KEEPS THE TARGETING FILTER HONEST ──
+  //
+  // The filter on the transcript above excludes a message addressed to one member. It cannot reach
+  // `seedSummaryFromExchange`, which is handed the opening exchange IN MEMORY precisely to avoid the
+  // archival lag, so a targeted first turn still seeds version 1 from private content. Feeding that
+  // version forward as `previousSummary` would carry it into every later version and past the filter
+  // permanently - the transcript would be clean and the anchor context would not.
+  //
+  // Dropping it costs nothing in the ordinary case: the seed was built from the same opening exchange
+  // that is in the transcript, so a rebuild sees it anyway. In the case that matters the exchange is
+  // absent from the transcript BECAUSE it was targeted, and it should be absent from the summary too.
+  //
+  // `drift-spawn` IS carried forward, and the difference is not arbitrary. That version 1 is seeded
+  // from the topic the person accepted when they agreed to split the conversation out - their own
+  // words about what the new conversation is for, shared by construction - and a split-out
+  // conversation may have no messages of its own yet, so dropping it would leave the anchor empty.
+  const previousIsTurnOneSeed = previous?.generated_by === 'summary-seed';
+  const carried = previousIsTurnOneSeed ? undefined : previous;
+  if (previousIsTurnOneSeed) {
+    console.log('[summary-updater] rebuilding from the transcript rather than extending the turn-one seed', {
+      channelArn: channel.channel_arn, previousVersion,
+    });
+  }
+
   // Build the Bedrock prompt.
   const reversedMessages = messages.rows.slice().reverse(); // chronological
   const transcript = reversedMessages
@@ -256,9 +424,9 @@ async function processChannel(channel: ActiveChannel): Promise<void> {
 
   const prompt = buildSummaryPrompt({
     transcript,
-    previousSummary: previous?.summary || undefined,
-    previousPurpose: previous?.purpose || undefined,
-    previousTopics: previous?.topics || undefined,
+    previousSummary: carried?.summary || undefined,
+    previousPurpose: carried?.purpose || undefined,
+    previousTopics: carried?.topics || undefined,
   });
 
   // Call Bedrock.
@@ -280,11 +448,12 @@ async function processChannel(channel: ActiveChannel): Promise<void> {
 
   // `name`, `participant_count` and `message_count` were DROPPED (ADR-020, migration 015) - all three
   // described CHANNEL STATE, and this row is versioned and never rewritten, so any value copied here
-  // was frozen at one summarisation and wrong from the next change onward.
+  // was frozen at one summarization and wrong from the next change onward.
   const inserted = await query<{ version: number }>(
     `INSERT INTO conversation_summaries (
        channel_arn, purpose, summary, topics, key_points, version, generated_by, model_used
      ) VALUES ($1, $2, $3, $4::text[], $5::text[], $6, 'summary-updater', $7)
+     ON CONFLICT (channel_arn, version) DO NOTHING
      RETURNING version`,
     [
       channel.channel_arn,
@@ -298,7 +467,11 @@ async function processChannel(channel: ActiveChannel): Promise<void> {
   );
 
   if (inserted.rows.length === 0) {
-    // Another writer won the race; their version is in place. No-op.
+    // Another writer won the race; their version is in place. No-op: no embedding is written for a
+    // version this run did not write, and the channel is not counted as failed.
+    console.log('[summary-updater] another writer holds this version; nothing to write', {
+      channelArn: channel.channel_arn, version: newVersion,
+    });
     return;
   }
 
@@ -307,6 +480,10 @@ async function processChannel(channel: ActiveChannel): Promise<void> {
     channelArn: channel.channel_arn,
     summaryText: parsed.summary,
     fromVersion: newVersion,
+    generatedBy: 'summary-updater',
+    // FR5: the subjects THEMSELVES, not only their average. Same version, same call, so the anchor
+    // and the subjects can never describe different summaries.
+    topics: parsed.topics,
   });
   if (!embedResult.written) {
     console.warn(`[summary-updater] embedding skipped for ${channel.channel_arn}: ${embedResult.reason}`);
@@ -400,7 +577,7 @@ function parseSummaryJson(text: string): ParsedSummary | null {
 // `name`, `message_count` and `participant_count` are DELIBERATELY left NULL on conversation_summaries.
 //
 // All three describe CHANNEL STATE, and a conversation_summaries row is VERSIONED and never
-// rewritten - so a value copied in here is frozen at one summarisation and wrong from the next
+// rewritten - so a value copied in here is frozen at one summarization and wrong from the next
 // change onward. Unfixable by construction, not merely hard to keep in sync (ADR-020):
 //
 //   name              -> the Amazon Chime SDK channel is authoritative (set on the first turn by

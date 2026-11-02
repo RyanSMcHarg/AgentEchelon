@@ -1,13 +1,12 @@
 /**
- * findTypeExclusionConflicts — the type-exclusion / classification-slot rule (DESIGN §3.2.1).
+ * findClassificationConflicts - one live experiment per classification (DESIGN §3.2.1).
  *
- * The DB-backed mutual-exclusion gate that decides whether a new/activating experiment
- * conflicts with one already active on a shared classification. The rule: a conflict fires
- * when EXACTLY ONE side is a `classification`-type experiment (testing the classifier itself)
- * and the two share a targeted classification. Two same-family types (intent + base_model +
- * profile, in any combination) coexist. This suite exercises the full type MATRIX plus single
- * vs MULTIPLE targeted classifications and the active-only status filter — the exact cases the
- * live conflict-resolution UX depends on, previously untested (only its inputs were validated).
+ * The DB-backed gate that decides whether a new or activating experiment conflicts with one
+ * already live on a shared classification. Any two live experiments that share a classification
+ * conflict, whatever their types: the resolver measures only one, so a second was accepted and
+ * then received no traffic. The suite covers the full type matrix, single vs
+ * MULTIPLE targeted classifications, and the active-only status filter - the cases the live
+ * conflict-resolution UX depends on.
  */
 import type { QueryCommandOutput } from '@aws-sdk/lib-dynamodb';
 
@@ -34,79 +33,53 @@ async function conflicts(
   existing: ReturnType<typeof exp>[],
 ): Promise<string[]> {
   mockSend.mockResolvedValueOnce({ Items: existing } as unknown as QueryCommandOutput);
-  const { findTypeExclusionConflicts } = await import('../../lambda/src/lib/experiment-manager');
+  const { findClassificationConflicts } = await import('../../lambda/src/lib/experiment-manager');
   // `tiers` are validated Classification strings ('basic'|'standard'|'premium') — cast at the mock boundary.
-  const res = await findTypeExclusionConflicts(candidate as Parameters<typeof findTypeExclusionConflicts>[0]);
+  const { experimentType: _ignored, ...args } = candidate;
+  const res = await findClassificationConflicts(args as Parameters<typeof findClassificationConflicts>[0]);
   return res.map((e) => e.experimentId);
 }
 
-describe('findTypeExclusionConflicts — type matrix (classification XOR other)', () => {
+describe('findClassificationConflicts — type matrix (every pair conflicts)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.EXPERIMENTS_TABLE = 'experiments-test';
     jest.resetModules();
   });
 
-  it('classification vs a NON-classification type on a shared classification CONFLICTS', async () => {
-    // A classification candidate conflicts with an active intent/base_model/profile experiment.
-    for (const otherType of ['intent', 'base_model', 'profile'] as Type[]) {
-      expect(
-        await conflicts(
-          { experimentType: 'classification', tiers: ['premium'], excludeExperimentId: 'self' },
-          [exp('other', otherType, ['premium'])],
-        ),
-      ).toEqual(['other']);
+  const TYPES: Type[] = ['intent', 'base_model', 'classification', 'profile'];
+
+  it('ANY two types on a shared classification conflict, including two of the same type', async () => {
+    for (const a of TYPES) {
+      for (const b of TYPES) {
+        expect(
+          await conflicts(
+            { experimentType: a, tiers: ['premium'], excludeExperimentId: 'self' },
+            [exp('other', b, ['premium'])],
+          ),
+        ).toEqual(['other']);
+      }
     }
   });
 
-  it('a NON-classification candidate conflicts with an active CLASSIFICATION experiment (symmetric)', async () => {
-    for (const candType of ['intent', 'base_model', 'profile'] as Type[]) {
-      expect(
-        await conflicts(
-          { experimentType: candType, tiers: ['premium'], excludeExperimentId: 'self' },
-          [exp('cls', 'classification', ['premium'])],
-        ),
-      ).toEqual(['cls']);
-    }
-  });
-
-  it('two NON-classification types NEVER conflict (intent/base_model/profile coexist)', async () => {
-    const pairs: [Type, Type][] = [
-      ['intent', 'base_model'],
-      ['intent', 'intent'],
-      ['intent', 'profile'],
-      ['base_model', 'profile'],
-      ['base_model', 'base_model'],
-      ['profile', 'profile'],
-    ];
-    for (const [a, b] of pairs) {
-      expect(
-        await conflicts(
-          { experimentType: a, tiers: ['premium'], excludeExperimentId: 'self' },
-          [exp('other', b, ['premium'])],
-        ),
-      ).toEqual([]);
-    }
-  });
-
-  it('classification vs classification does NOT conflict (XOR is false when both are classification)', async () => {
+  it('two base_model experiments conflict - the pair that starved one silently on the deployment', async () => {
     expect(
       await conflicts(
-        { experimentType: 'classification', tiers: ['premium'], excludeExperimentId: 'self' },
-        [exp('cls2', 'classification', ['premium'])],
+        { experimentType: 'base_model', tiers: ['premium'], excludeExperimentId: 'new' },
+        [exp('stale', 'base_model', ['premium'])],
       ),
-    ).toEqual([]);
+    ).toEqual(['stale']);
   });
 });
 
-describe('findTypeExclusionConflicts — single vs multiple classifications (tier overlap)', () => {
+describe('findClassificationConflicts — single vs multiple classifications (tier overlap)', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.EXPERIMENTS_TABLE = 'experiments-test';
     jest.resetModules();
   });
 
-  it('no shared classification ⇒ no conflict even across the exclusive types', async () => {
+  it('no shared classification ⇒ no conflict, whatever the types', async () => {
     expect(
       await conflicts(
         { experimentType: 'classification', tiers: ['standard'], excludeExperimentId: 'self' },
@@ -138,17 +111,17 @@ describe('findTypeExclusionConflicts — single vs multiple classifications (tie
     const ids = await conflicts(
       { experimentType: 'classification', tiers: ['premium', 'standard'], excludeExperimentId: 'self' },
       [
-        exp('a', 'intent', ['premium']),        // conflicts (classification XOR intent, premium overlap)
+        exp('a', 'intent', ['premium']),        // conflicts (premium overlap)
         exp('b', 'base_model', ['standard']),   // conflicts (standard overlap)
         exp('c', 'profile', ['basic']),         // no overlap → skip
-        exp('d', 'classification', ['premium']),// both classification → skip
+        exp('d', 'classification', ['premium']),// conflicts (premium overlap, same type)
       ],
     );
-    expect(ids.sort()).toEqual(['a', 'b']);
+    expect(ids.sort()).toEqual(['a', 'b', 'd']);
   });
 });
 
-describe('findTypeExclusionConflicts — status + self filters', () => {
+describe('findClassificationConflicts — status + self filters', () => {
   beforeEach(() => {
     jest.clearAllMocks();
     process.env.EXPERIMENTS_TABLE = 'experiments-test';

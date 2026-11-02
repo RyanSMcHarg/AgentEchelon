@@ -23,23 +23,55 @@ describe('stack-name prefix resolution', () => {
 
   it('follows the instance name the stacks themselves read', () => {
     // lib/stacks/agent-classification-common.ts derives STACK_PREFIX from AE_INSTANCE_NAME the same
-    // way, so a deployment named `acme` has `AcmeFrontend`, not `AgentEchelonFrontend`.
+    // way, so a deployment named `acme` has `AcmeChatApp`, not `AgentEchelonChatApp`.
     expect(resolveStackPrefix({ AE_INSTANCE_NAME: 'acme' })).toBe('Acme');
     expect(resolveStackPrefix({ AE_INSTANCE_NAME: 'acme-two' })).toBe('AcmeTwo');
     expect(pascal('a_b c')).toBe('ABC');
   });
 
-  it('honours every override the rest of the tooling honours', () => {
-    // AE_STACK_PREFIX is the stacks' own override; STACK_PREFIX is what gen-frontend-env.mjs reads;
-    // FRONTEND_STACK_NAME is what deploy.mjs derives its safety-gate prefix from.
+  it('honors the explicit prefix override, in both spellings', () => {
+    // AE_STACK_PREFIX is the stacks' own override; STACK_PREFIX is the script-only spelling deploy.mjs
+    // passes to its child steps.
     expect(resolveStackPrefix({ AE_STACK_PREFIX: 'Zed', AE_INSTANCE_NAME: 'acme' })).toBe('Zed');
     expect(resolveStackPrefix({ STACK_PREFIX: 'Zed', AE_INSTANCE_NAME: 'acme' })).toBe('Zed');
-    expect(resolveStackPrefix({ FRONTEND_STACK_NAME: 'AcmeFrontend' })).toBe('Acme');
+    expect(resolveStackPrefix({ AE_STACK_PREFIX: 'Zed', STACK_PREFIX: 'Zed' })).toBe('Zed');
   });
 
-  it('prefers the e2e harness instance vars, which the validate phases already pass through', () => {
-    expect(resolveInstanceName({ E2E_INSTANCE_NAME: 'acme', AE_INSTANCE_NAME: 'other' })).toBe('acme');
+  it('never derives the prefix from FRONTEND_STACK_NAME, which overrides the chat target only', () => {
+    // Deriving the prefix from the chat override is what let it redirect the admin publish.
+    expect(resolveStackPrefix({ FRONTEND_STACK_NAME: 'AcmeChatApp' })).toBe('AgentEchelon');
+    expect(resolveStackPrefix({ FRONTEND_STACK_NAME: 'AcmeChatApp', AE_INSTANCE_NAME: 'other' })).toBe('Other');
+  });
+
+  it('reads the instance from any variable that names it: the stacks\' own and the e2e harness\'s', () => {
+    expect(resolveInstanceName({ E2E_INSTANCE_NAME: 'acme' })).toBe('acme');
+    expect(resolveInstanceName({ INSTANCE_NAME: 'acme' })).toBe('acme');
     expect(resolveInstanceName({ SSM_ROOT: '/acme' })).toBe('acme');
+    expect(resolveInstanceName({ E2E_INSTANCE_NAME: 'acme', AE_INSTANCE_NAME: 'acme', SSM_ROOT: '/acme' })).toBe('acme');
+    expect(resolveStackPrefix({ E2E_INSTANCE_NAME: 'acme-two' })).toBe('AcmeTwo');
+  });
+
+  it('refuses variables that name different instances rather than letting one win', () => {
+    // A deploy or a publish resolved from the "winning" variable lands on another instance's stacks.
+    expect(() => resolveInstanceName({ E2E_INSTANCE_NAME: 'acme', AE_INSTANCE_NAME: 'other' }))
+      .toThrow(/AE_INSTANCE_NAME=other, E2E_INSTANCE_NAME=acme name different instances/);
+    expect(() => resolveInstanceName({ AE_INSTANCE_NAME: 'acme', SSM_ROOT: '/other' })).toThrow(/different instances/);
+    expect(() => resolveStackPrefix({ AE_STACK_PREFIX: 'Zed', STACK_PREFIX: 'Acme' })).toThrow(/different instances/);
+  });
+
+  it('is the one resolver every operator script uses', () => {
+    // deploy-guards.cjs (deploy.mjs, deploy-frontend.mjs) re-exports it rather than deriving its own.
+    const guards = require('../scripts/lib/deploy-guards.cjs');
+    expect(guards.resolveInstancePrefix).toBe(resolveStackPrefix);
+    const fs = require('fs');
+    const path = require('path');
+    for (const script of ['sync-context.mjs', 'gen-frontend-env.mjs', 'validate.mjs']) {
+      const src = fs.readFileSync(path.join(__dirname, '..', 'scripts', script), 'utf8');
+      expect(src).toMatch(/require\('\.\/lib\/stack-lookup\.cjs'\)/);
+      expect(src).toMatch(/resolveStackPrefix\(process\.env\)/);
+      // No script falls back to its own default prefix.
+      expect(src).not.toMatch(/STACK_PREFIX \|\| 'AgentEchelon'|\|\| 'AgentEchelon'/);
+    }
   });
 
   it('ignores an empty override rather than resolving to an empty prefix', () => {
@@ -57,7 +89,7 @@ describe('describe-stacks result classification', () => {
     const r = classifyStackLookup({
       status: 254,
       stderr: 'An error occurred (ValidationError) when calling the DescribeStacks operation: '
-        + 'Stack with id AcmeAnalyticsAurora does not exist',
+        + 'Stack with id AcmeArchive does not exist',
     });
     expect(r.presence).toBe('absent');
   });

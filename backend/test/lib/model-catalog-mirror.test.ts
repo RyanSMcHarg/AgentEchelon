@@ -78,20 +78,9 @@ describe('the admin model mirror tracks the backend catalog', () => {
     expect(actual).toEqual(expected);
   });
 
-  it('agrees with the backend on which classifications may use each model', () => {
-    // allowedTiers drives what the console offers per classification; a mirror that over-permits lets an
-    // operator build an experiment the backend will refuse to resolve (resolveVariantForProfile enforces
-    // the real ceiling), which surfaces as an experiment that silently serves nothing.
-    const catalog = getModelCatalog('us-east-1', '111122223333') as Record<string, {
-      allowedClassifications: string[];
-    }>;
-    const expected: Record<string, string> = {};
-    const actual: Record<string, string> = {};
-    for (const key of backendKeys) {
-      expected[key] = [...catalog[key].allowedClassifications].sort().join(',');
-      actual[key] = [...(cardFor(key).match(/allowedTiers: \[([^\]]*)\]/)?.[1] ?? '')
-        .matchAll(/'([a-z]+)'/g)].map((m) => m[1]).sort().join(',');
-    }
-    expect(actual).toEqual(expected);
+  it('names no classification on any model: what a classification may use is its own selection', () => {
+    // The console offers each classification the models it selects (`models` in GET /classifications), so a card
+    // that named classifications would be a second answer to the same question, and drift from the first.
+    for (const key of backendKeys) expect({ key, allowedTiers: /allowedTiers/.test(cardFor(key)) }).toEqual({ key, allowedTiers: false });
   });
 });

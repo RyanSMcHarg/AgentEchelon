@@ -1,5 +1,5 @@
 /**
- * A REDELIVERED bypass message is recognised ACROSS CONTAINERS.
+ * A REDELIVERED bypass message is recognized ACROSS CONTAINERS.
  *
  * Amazon Chime SDK invokes a channel flow asynchronously, and async Lambda invocation is at-least-once.
  * A redelivery is therefore a SEPARATE invocation, usually on a separate container, and the two can
@@ -9,7 +9,7 @@
  * THE DEFECT THIS PINS. The guard was a module-scope `Set`, so it lived in one container's memory.
  * Both attempts read an empty set, both believed they were the first, and the duplicate did its work
  * again. It was named "idempotency gate" throughout, which is what kept anyone from looking: a dedup
- * that lives in a process is a same-container optimisation wearing the label of a control.
+ * that lives in a process is a same-container optimization wearing the label of a control.
  *
  * The fix is the control the rest of the codebase already uses for at-least-once delivery
  * (`lib/correlation.ts`, SPEC-ABUSE-CONTROLS, ADR-022): a key a redelivery provably replays, claimed
@@ -99,14 +99,14 @@ async function coldContainer() {
   jest.resetModules();
   process.env.ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:standard';
   process.env.BASIC_ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:basic';
-  process.env.ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:router';
+  process.env.STANDARD_ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:router';
   process.env.BASIC_ROUTER_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:router-basic';
-  mockSsmSend.mockResolvedValue({ Parameter: { Value: BOT } });
+  mockSsmSend.mockResolvedValue({ Parameter: { Value: JSON.stringify({ role: 'primary', occupancy: 'live', assistant: 'advisor', botArn: BOT }) } });
   mockLambdaSend.mockResolvedValue({ Payload: Buffer.from(JSON.stringify({ messages: [] })) });
   mockMessagingSend.mockImplementation((cmd: { __type?: string }) => {
     if (cmd.__type === 'ListTags') return Promise.resolve({ Tags: [{ Key: 'classification', Value: 'basic' }] });
     if (cmd.__type === 'ListMemberships') {
-      // TWO humans. The flow stands aside for a 1:1 `@all` (MESSAGE-FLOW section 3.1), so a
+      // TWO humans. The flow stands aside for a 1:1 `@all` (MESSAGE-FLOW section 4.5), so a
       // single-human roster would make every assertion below pass against a bypass that never ran.
       return Promise.resolve({
         ChannelMemberships: [{ Member: { Arn: HUMAN } }, { Member: { Arn: HUMAN_B } }, { Member: { Arn: BOT } }],

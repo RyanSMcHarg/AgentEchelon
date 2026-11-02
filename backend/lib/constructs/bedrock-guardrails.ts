@@ -47,21 +47,43 @@ export function buildGuardrailPolicy(opts: { name: string; description?: string;
       ],
     },
     sensitiveInformationPolicyConfig: {
+      // ── CONTACT DETAILS ARE NOT REDACTED; PAYMENT AND IDENTITY NUMBERS ARE BLOCKED ──────────────
+      //
+      // THIS IS THE PROJECT'S POSITION, NOT A DEPLOYMENT'S SETTING. AgentEchelon is a platform people
+      // use INSIDE an organization: colleagues share names, email addresses and phone numbers because
+      // that is the ordinary content of work, and an assistant that cannot repeat a colleague's
+      // address back is worse at its job for no privacy gained. There is no knob here on purpose. If
+      // an external-facing use case is added - a platform serving the public, or one handling customer
+      // records rather than colleagues - that is the moment to revisit this policy, and the revisit is
+      // a decision record rather than a configuration flag somebody sets differently by accident.
+      //
+      // THE MASK WAS ALSO NOT ACCURATE. Measured 2026-09-17: "what is three plus three?" was answered
+      // `{PHONE} is six.` and "what is five plus five?" `{PHONE} is ten.` - the digits of ordinary
+      // arithmetic matched the phone detector, so asking the assistant to compute anything returned a
+      // masked answer. A filter that fires on "3 + 3" is not buying privacy, it is removing meaning.
+      //
+      // WHAT STAYS, AND WHY IT IS A DIFFERENT KIND OF THING. A payment card number and a social
+      // security number are not ordinary work content: there is no legitimate reason to type either to
+      // an assistant, and they are the classic target of a prompt-injection exfiltration. They BLOCK
+      // rather than ANONYMIZE, because a person whose message was refused needs to know it was refused
+      // instead of silently receiving rewritten text.
       piiEntitiesConfig: [
-        { type: 'EMAIL', action: 'ANONYMIZE' },
-        { type: 'PHONE', action: 'ANONYMIZE' },
         { type: 'US_SOCIAL_SECURITY_NUMBER', action: 'BLOCK' },
         { type: 'CREDIT_DEBIT_CARD_NUMBER', action: 'BLOCK' },
       ],
       regexesConfig: [
         {
           // The NAME is the mask: Bedrock Guardrails substitutes `{MetadataMarkerFilter}` for an
-          // ANONYMIZE match, so the name is a user-visible string the runtime has to recognise and
+          // ANONYMIZE match, so the name is a user-visible string the runtime has to recognize and
           // remove. It comes from the shared declaration (`config/guardrail-masks`) that the marker
           // stripper reads, so the provisioned filter and the stripped token cannot drift apart.
           name: METADATA_MARKER_FILTER_NAME,
           description: 'Mask internal metadata markers if they leak into a response',
-          pattern: '<!--(?:ACTIVE_TASK|corr):[^>]*-->',
+          // `turn` is the declaration a turn makes about itself (lib/turn-declaration.ts): what it
+          // answers, how it was delivered, what kind it is. It is masked here for the same reason
+          // the other two are - a model that echoes one back is leaking a control marker - and
+          // because a forged declaration is an assertion about who answered what.
+          pattern: '<!--(?:ACTIVE_TASK|corr|turn):[^>]*-->',
           action: 'ANONYMIZE',
         },
       ],

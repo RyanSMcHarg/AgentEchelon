@@ -9,7 +9,7 @@ describe('task-state analytics metadata', () => {
   it('stamps taskState and taskTransition when provided', () => {
     const m = buildAnalyticsMetadata({
       messageNumber: 3,
-      userType: 'standard',
+      classification: 'standard',
       role: 'assistant',
       taskState: 'diagnosing',
       taskTransition: { from: 'collecting_symptoms', to: 'diagnosing' },
@@ -21,7 +21,7 @@ describe('task-state analytics metadata', () => {
   it('omits taskTransition on a turn that did not transition', () => {
     const m = buildAnalyticsMetadata({
       messageNumber: 4,
-      userType: 'standard',
+      classification: 'standard',
       role: 'assistant',
       taskState: 'diagnosing',
     });
@@ -32,7 +32,7 @@ describe('task-state analytics metadata', () => {
   it('keeps task-state fields out of the frontend Metadata (analytics-only)', () => {
     const m = buildAnalyticsMetadata({
       messageNumber: 3,
-      userType: 'standard',
+      classification: 'standard',
       role: 'assistant',
       taskState: 'diagnosing',
       taskTransition: { from: 'collecting_symptoms', to: 'diagnosing' },
@@ -41,13 +41,20 @@ describe('task-state analytics metadata', () => {
     expect(slim.taskState).toBeUndefined();
     expect(slim.taskTransition).toBeUndefined();
   });
+
+  it('carries the task trajectory for analytics and keeps it out of the frontend Metadata (Appendix C2)', () => {
+    const taskTrajectory = { taskType: 'report', edges: 3, shortestEdges: 3, regressions: 0, platformMoves: 1, turnsInState: 0, terminal: 'success' as const };
+    const m = buildAnalyticsMetadata({ messageNumber: 5, classification: 'standard', role: 'assistant', taskTrajectory });
+    expect(m.taskTrajectory).toEqual(taskTrajectory);
+    expect(pickFrontendMetadata(m as unknown as Record<string, unknown>).taskTrajectory).toBeUndefined();
+  });
 });
 
 describe('image-generation analytics metadata (per-image cost is priceable)', () => {
   it('carries imageCount when provided (an image turn reports 0 tokens)', () => {
     const m = buildAnalyticsMetadata({
       messageNumber: 2,
-      userType: 'premium',
+      classification: 'premium',
       role: 'assistant',
       intent: 'image_generation',
       bedrockResponse: { model: 'gpt-image-1', inputTokens: 0, outputTokens: 0 },
@@ -60,7 +67,7 @@ describe('image-generation analytics metadata (per-image cost is priceable)', ()
   it('omits imageCount on a text turn (undefined, not 0)', () => {
     const m = buildAnalyticsMetadata({
       messageNumber: 1,
-      userType: 'standard',
+      classification: 'standard',
       role: 'assistant',
       bedrockResponse: { model: 'anthropic.claude-sonnet-4-6', inputTokens: 100, outputTokens: 50 },
     });
@@ -70,7 +77,7 @@ describe('image-generation analytics metadata (per-image cost is priceable)', ()
   it('keeps imageCount in the slim frontend Metadata (survives Aurora-mode slimming)', () => {
     const m = buildAnalyticsMetadata({
       messageNumber: 2,
-      userType: 'premium',
+      classification: 'premium',
       role: 'assistant',
       bedrockResponse: { model: 'gpt-image-1', inputTokens: 0, outputTokens: 0 },
       imageCount: 1,

@@ -107,7 +107,7 @@ describe('a duplicate delivery does not fail the flow', () => {
     jest.clearAllMocks();
     process.env.ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:standard';
     process.env.BASIC_ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111122223333:function:basic';
-    mockSsmSend.mockResolvedValue({ Parameter: { Value: BOT } });
+    mockSsmSend.mockResolvedValue({ Parameter: { Value: JSON.stringify({ role: 'primary', occupancy: 'live', assistant: 'advisor', botArn: BOT }) } });
     mockLambdaSend.mockResolvedValue({});
     mockMessagingSend.mockImplementation((cmd: { __type?: string }) => {
       if (cmd.__type === 'ListTags') return Promise.resolve({ Tags: [{ Key: 'classification', Value: 'basic' }] });

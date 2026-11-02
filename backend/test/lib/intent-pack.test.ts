@@ -20,7 +20,6 @@ import {
   responseSettingsForIntent,
   clampResponseMaxTokens,
 } from '../../lambda/src/lib/intent-pack';
-import { intentTypeToRouteKey } from '../../lambda/src/lib/model-resolver';
 
 // An example custom domain pack (a recipe assistant) — stands in for any deployment's own taxonomy.
 const DOMAIN_PACK = JSON.stringify([
@@ -66,11 +65,11 @@ describe('intent pack — back-compat (DEFAULT)', () => {
     expect(classifyByPackKeywords('what is the capital of France')).toBeNull();
   });
 
-  test('image_generation is a first-class DEFAULT intent (PLACEHOLDER_UPDATE)', () => {
+  test('image_generation is a first-class DEFAULT intent (a multi-step task, ADR-064)', () => {
     _resetIntentPackCache();
     expect(knownIntentKeys().has('image_generation')).toBe(true);
-    // A generated image is one reply updated in place — not a multi-step task.
-    expect(deliveryClassForIntent('image_generation')).toBe('PLACEHOLDER_UPDATE');
+    // Gather, confirm, generate on the image model, revise (ADR-064 decision G).
+    expect(deliveryClassForIntent('image_generation')).toBe('TASK_MULTI_STEP');
     expect(intentPackCategoryLines()).toContain('- IMAGE_GENERATION:');
   });
 
@@ -85,6 +84,16 @@ describe('intent pack — back-compat (DEFAULT)', () => {
     expect(classifyByPackKeywords('please generate an image of a graph')).toBe('image_generation');
     // A plain report ask still classifies as report_generation (no image keyword present).
     expect(classifyByPackKeywords('generate a report on Q2 sales')).toBe('report_generation');
+  });
+
+  test('a request for an image that does not yet say what it shows is image_generation, so the task gathers it (ADR-064 decision G)', () => {
+    _resetIntentPackCache();
+    // The gather step exists for this request, and the LLM classifier decides from the description, so the
+    // description claims it rather than limiting the intent to a request that already carries a description.
+    const image = DEFAULT_INTENT_PACK.intents.find((d) => d.key === 'image_generation')!;
+    expect(image.description).toContain('even one that does not yet say what it shows');
+    expect(image.description).not.toContain('from a text description');
+    expect(intentPackCategoryLines()).toContain('even one that does not yet say what it shows');
   });
 });
 
@@ -146,7 +155,7 @@ describe('intent pack — SSM hydration (large packs)', () => {
   });
 
   test('hydrated SSM value takes precedence over env + DEFAULT', async () => {
-    process.env.ASSISTANT_INTENT_PACK_PARAM = '/agent-echelon/assistant/standard/assistant-intent-pack';
+    process.env.ASSISTANT_INTENT_PACK_PARAM = '/agent-echelon/assistant/analyst/assistant-intent-pack';
     _resetIntentPackCache();
     await hydrateIntentPackFromSsm({ getParameter: async () => DOMAIN_PACK });
     expect(knownIntentKeys().has('find_recipe')).toBe(true);
@@ -159,11 +168,26 @@ describe('intent pack — SSM hydration (large packs)', () => {
     expect(getIntentPack()).toBe(DEFAULT_INTENT_PACK);
   });
 
-  test('SSM fetch failure falls back to env/DEFAULT', async () => {
-    process.env.ASSISTANT_INTENT_PACK_PARAM = '/agent-echelon/assistant/standard/assistant-intent-pack';
+  test('SSM fetch failure falls back to env/DEFAULT, and says so', async () => {
+    process.env.ASSISTANT_INTENT_PACK_PARAM = '/agent-echelon/assistant/analyst/assistant-intent-pack';
     _resetIntentPackCache();
+    const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
     await hydrateIntentPackFromSsm({ getParameter: async () => { throw new Error('ssm down'); } });
     expect(getIntentPack()).toBe(DEFAULT_INTENT_PACK);
+    expect(error).toHaveBeenCalled();
+    error.mockRestore();
+  });
+
+  test('an absent parameter is "not set": the DEFAULT stays and nothing is logged as an error', async () => {
+    // The classification's pack is an optional seam the demo leaves unwritten (a version carries the pack).
+    // Logged as an ERROR, every cold start of a fresh deployment tripped the e2e backend-error guard.
+    process.env.ASSISTANT_INTENT_PACK_PARAM = '/agent-echelon/assistant/basic/assistant-intent-pack';
+    _resetIntentPackCache();
+    const error = jest.spyOn(console, 'error').mockImplementation(() => undefined);
+    await hydrateIntentPackFromSsm({ getParameter: async () => { throw Object.assign(new Error('UnknownError'), { name: 'ParameterNotFound' }); } });
+    expect(getIntentPack()).toBe(DEFAULT_INTENT_PACK);
+    expect(error).not.toHaveBeenCalled();
+    error.mockRestore();
   });
 });
 
@@ -209,20 +233,20 @@ describe('intent pack — P3 per-intent response settings (maxTokens / verbosity
     expect(responseSettingsForIntent('nope')).toEqual({});
   });
 
-  test('clampResponseMaxTokens: per-intent budget wins, clamped to ceiling, reasoning floor', () => {
-    const CEILING = 4096;
-    // requested under the ceiling wins (the whole point — tight answers)
-    expect(clampResponseMaxTokens(700, CEILING, false)).toBe(700);
-    expect(clampResponseMaxTokens(1600, CEILING, false)).toBe(1600);
-    // absent ⇒ the tier ceiling (today's default — unchanged behavior)
-    expect(clampResponseMaxTokens(undefined, CEILING, false)).toBe(CEILING);
-    // a request above the ceiling is clamped down
-    expect(clampResponseMaxTokens(9000, CEILING, false)).toBe(CEILING);
-    // junk ⇒ ceiling
-    expect(clampResponseMaxTokens(0, CEILING, false)).toBe(CEILING);
+  test('clampResponseMaxTokens: per-intent budget wins, clamped to the limit, reasoning floor', () => {
+    const LIMIT = 4096;
+    // requested under the limit wins (the whole point — tight answers)
+    expect(clampResponseMaxTokens(700, LIMIT, false)).toBe(700);
+    expect(clampResponseMaxTokens(1600, LIMIT, false)).toBe(1600);
+    // absent ⇒ the classification's token limit (today's default — unchanged behavior)
+    expect(clampResponseMaxTokens(undefined, LIMIT, false)).toBe(LIMIT);
+    // a request above the limit is clamped down
+    expect(clampResponseMaxTokens(9000, LIMIT, false)).toBe(LIMIT);
+    // junk ⇒ limit
+    expect(clampResponseMaxTokens(0, LIMIT, false)).toBe(LIMIT);
     // reasoning turns keep a higher floor even if the intent asked for fewer
-    expect(clampResponseMaxTokens(700, CEILING, true)).toBe(4000);
-    expect(clampResponseMaxTokens(undefined, CEILING, true)).toBe(CEILING);
+    expect(clampResponseMaxTokens(700, LIMIT, true)).toBe(4000);
+    expect(clampResponseMaxTokens(undefined, LIMIT, true)).toBe(LIMIT);
   });
 });
 
@@ -254,14 +278,12 @@ describe('code_generation / code_review are in the default pack', () => {
     const lines = intentPackCategoryLines();
     // The distinctions that matter are stated, not implied: authoring vs critique, and neither
     // is diagnosis. If these disappear the LLM has nothing to discriminate on.
-    expect(lines).toMatch(/CODE_GENERATION:[^\n]*WRITE or MODIFY code/i);
+    // A snippet and a code deliverable are separate intents, and each names the other.
+    expect(lines).toMatch(/CODE_GENERATION:[^\n]*short piece of code/i);
+    expect(lines).toMatch(/CODE_GENERATION:[^\n]*code_delivery/i);
+    expect(lines).toMatch(/CODE_DELIVERY:[^\n]*complete program/i);
     expect(lines).toMatch(/CODE_REVIEW:[^\n]*REVIEW, critique/i);
     expect(lines).toMatch(/CODE_GENERATION:[^\n]*guided_troubleshooting/i);
-  });
-
-  it('routes both to their own model-strategy key', () => {
-    expect(intentTypeToRouteKey('code_generation')).toBe('code_generation');
-    expect(intentTypeToRouteKey('code_review')).toBe('code_review');
   });
 
   // Fallback-only coverage. Ordering matters HERE because classifyByPackKeywords returns the first
@@ -290,18 +312,19 @@ describe('code_generation / code_review are in the default pack', () => {
 describe('the default pack covers every RouteKey', () => {
   it('leaves no route without an intent that can produce it', () => {
     const ALL_ROUTE_KEYS = [
-      'general_qa',
+      'general',
       'code_generation',
       'code_review',
-      'document_extraction',
+      'data_extraction',
       'report_generation',
       'strategic_analysis',
-      'workflow_actions',
+      'guided_troubleshooting',
     ];
 
     // Everything the classifier can emit: the universal three plus the pack's domain intents.
     const emittable = [...knownIntentKeys(DEFAULT_INTENT_PACK)];
-    const reachable = new Set(emittable.map((k) => intentTypeToRouteKey(k)));
+    // A route is keyed by the intent it serves (ADR-064 decision 1).
+    const reachable = new Set<string>(emittable);
 
     const dead = ALL_ROUTE_KEYS.filter((rk) => !reachable.has(rk as never));
     if (dead.length) {
@@ -349,12 +372,15 @@ describe('the default pack covers every RouteKey', () => {
  * write-if-absent — an over-size pack on an existing deployment is silently never applied. That
  * silence is what this budget exists to break.
  *
- * The durable fix is on the roadmap in SPEC-CONFIGURABLE-INTENT-PACK: an `extends` pack form so the
- * defaults (already compiled into the Lambda) stop being round-tripped through SSM at all. Until
- * that lands, this keeps the platform side honest.
+ * `extends` has since landed (FR2, FR11): an extending pack stores none of the defaults. What still
+ * copies them is a REPLACING pack, which lists platform intents by value - in a profile version's S3
+ * body (bounded by the pack limit) or in the per-deployment parameter, which is written on the
+ * Advanced tier (8 KB). Each platform intent now carries its instructions and answer guidance
+ * (FR18-FR21), so the budget is the Advanced tier: a replacing pack that copied every default must
+ * still leave room for the deployment's own intents.
  */
 describe('intent pack size budget (SSM value limits are hard)', () => {
-  const SSM_STANDARD_LIMIT = 4096;
+  const SSM_STANDARD_LIMIT = 8192;
   /** Bytes reserved for a deployment's own domain intents + the JSON envelope, inside Standard tier. */
   const DOMAIN_RESERVE = 900;
   const PLATFORM_BUDGET = SSM_STANDARD_LIMIT - DOMAIN_RESERVE;
@@ -364,7 +390,7 @@ describe('intent pack size budget (SSM value limits are hard)', () => {
     if (size > PLATFORM_BUDGET) {
       throw new Error(
         `DEFAULT_INTENT_PACK.intents is ${size} bytes; the budget is ${PLATFORM_BUDGET} `
-        + `(SSM Standard ${SSM_STANDARD_LIMIT} minus ${DOMAIN_RESERVE} reserved for a deployment's own `
+        + `(SSM Advanced ${SSM_STANDARD_LIMIT} minus ${DOMAIN_RESERVE} reserved for a deployment's own `
         + 'intents).\n'
         + 'Every byte here is spent again in EVERY classification\'s parameter, and an over-size pack '
         + 'is silently never applied by the write-if-absent seeder.\n'
@@ -380,7 +406,8 @@ describe('intent pack size budget (SSM value limits are hard)', () => {
     // finding it as "the pack no longer fits" rather than "this entry got long".
     const oversized = DEFAULT_INTENT_PACK.intents
       .map((i) => ({ key: i.key, size: JSON.stringify(i).length }))
-      .filter((i) => i.size > 700);
+      // 1,000: a description for the classifier, plus the instructions and answer guidance (FR18-FR21).
+      .filter((i) => i.size > 1000);
     expect(oversized.map((i) => `${i.key}=${i.size}`)).toEqual([]);
   });
 });

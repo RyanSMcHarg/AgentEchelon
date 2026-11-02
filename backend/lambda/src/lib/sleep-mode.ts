@@ -17,6 +17,7 @@ import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, GetCommand, UpdateCommand } from '@aws-sdk/lib-dynamodb';
 import { RDSClient, ModifyDBClusterCommand } from '@aws-sdk/client-rds';
 import { SNSClient, PublishCommand } from '@aws-sdk/client-sns';
+import { sessionClient, sessionDocumentClient } from './assistant-session.js';
 
 export type DeploymentState = 'awake' | 'asleep';
 
@@ -84,11 +85,11 @@ export function shouldSleep(
 // AWS-touching helpers.
 // ---------------------------------------------------------------------------
 
-const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: AWS_REGION }), {
+const ddb = sessionDocumentClient({ region: AWS_REGION }, {
   marshallOptions: { removeUndefinedValues: true },
 });
-const rds = new RDSClient({ region: AWS_REGION });
-const sns = new SNSClient({ region: AWS_REGION });
+const rds = sessionClient(RDSClient, { region: AWS_REGION });
+const sns = sessionClient(SNSClient, { region: AWS_REGION });
 
 function stateTableName(): string {
   const t = process.env.DEPLOYMENT_STATE_TABLE;

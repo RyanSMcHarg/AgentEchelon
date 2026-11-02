@@ -142,7 +142,7 @@ describe('planLegacyPromotion - it never overwrites the store', () => {
  * A channel's creator is a moderator of their own channel and holds `chime:UpdateChannel`, which writes
  * Name and Metadata in ONE call - IAM cannot separate them. So everything promoted here was writable by
  * a member, and it lands in the assistant's system prompt. The recovery therefore applies the write
- * path's bounds AND the injection defence a context source gets, rather than trusting the source because
+ * path's bounds AND the injection defense a context source gets, rather than trusting the source because
  * an operator invoked the run.
  */
 describe('planLegacyPromotion - the promoted values are sanitised and bounded', () => {
@@ -193,7 +193,7 @@ describe('planLegacyPromotion - the promoted values are sanitised and bounded', 
     expect(plan.patch.otherContexts).toHaveLength(MAX_OTHER_CONTEXTS);
   });
 
-  // The two routing signals decide WHICH MODEL answers, so a value nothing recognises must leave the
+  // The two routing signals decide WHICH MODEL answers, so a value nothing recognizes must leave the
   // conversation on the deployment default rather than being carried through on the chance it is right.
   it('discards a malformed routing signal instead of promoting it', () => {
     const plan = planLegacyPromotion(JSON.stringify({

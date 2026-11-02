@@ -11,8 +11,8 @@ import * as cdk from 'aws-cdk-lib';
 import * as sqs from 'aws-cdk-lib/aws-sqs';
 import { Template, Match } from 'aws-cdk-lib/assertions';
 import { applyStandardTags, collectProjectTagValues } from '../lib/tagging';
-import { ChimeMessagingStack } from '../lib/stacks/chime-messaging-stack';
-import { CognitoAuthStack } from '../lib/stacks/cognito-auth-stack';
+import { MessagingStack } from '../lib/stacks/messaging-stack';
+import { IdentityStack } from '../lib/stacks/identity-stack';
 
 const env = { account: '123456789012', region: 'us-east-1' };
 
@@ -29,8 +29,8 @@ function templateFor(project: string) {
 function realStackTemplates(project: string) {
   const app = new cdk.App();
   applyStandardTags(app, { project, codebase: 'AgentEchelon', instance: 'acme', environment: 'Production' });
-  const chime = new ChimeMessagingStack(app, 'Chime', { env, appInstanceName: 'test' });
-  const cog = new CognitoAuthStack(app, 'Cog', { env, appInstanceArn: chime.appInstanceArn });
+  const chime = new MessagingStack(app, 'Chime', { env, appInstanceName: 'test' });
+  const cog = new IdentityStack(app, 'Cog', { env, appInstanceArn: chime.appInstanceArn });
   return [chime, cog].map((s) => Template.fromStack(s).toJSON());
 }
 
@@ -52,6 +52,16 @@ describe('Tagging standard', () => {
     templateFor('AcmeBot').hasResourceProperties('AWS::SQS::Queue', {
       Tags: Match.arrayWith([{ Key: 'Project', Value: 'AcmeBot' }]),
     });
+  });
+
+  it('every stack carries the standard set too, under the flags cdk.json deploys with', () => {
+    // The stack itself is a tagged resource (AWS Config's required-tags rule evaluates CloudFormation stacks), and
+    // `@aws-cdk/core:explicitStackTags` keeps app-level tags off it unless they are set on the stack.
+    const app = new cdk.App({ context: require('../cdk.json').context });
+    applyStandardTags(app, { project: 'Acme', codebase: 'AgentEchelon', instance: 'acme', environment: 'Production' });
+    new sqs.Queue(new cdk.Stack(app, 'Created', { env }), 'Q');
+    const artifact = app.synth().getStackByName('Created');
+    expect(artifact.tags).toEqual({ Project: 'Acme', Codebase: 'AgentEchelon', Instance: 'acme', ManagedBy: 'CDK', Environment: 'Production' });
   });
 
   it('GUARDRAIL: no stack carries a Project value other than the derived one', () => {

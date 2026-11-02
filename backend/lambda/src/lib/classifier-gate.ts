@@ -4,18 +4,18 @@
  * A `classification` experiment changes which model LABELS a message. Scored the ordinary way it is
  * judged on the evaluator's opinion of the ANSWER, which is a downstream proxy: the routing changes
  * for real users while the measurement watches a shadow of the effect. The gate replaces the proxy
- * with the question actually being asked - **is the challenger's labelling better?** - by having both
+ * with the question actually being asked - **is the challenger's labeling better?** - by having both
  * candidates label the SAME archived messages and adjudicating only where they disagree.
  *
  * Pure. The replay job supplies the rows; nothing here reads a database or calls a model, so the
  * counting rules and the ship criterion are testable in isolation.
  *
- * **A passing gate authorises the online split (§5.4). It does not replace it.** The gate measures
- * labelling on a fixed corpus; whether users are better served is a question about live traffic, and
+ * **A passing gate authorizes the online split (§5.4). It does not replace it.** The gate measures
+ * labeling on a fixed corpus; whether users are better served is a question about live traffic, and
  * §5.4 exists so the intermediate metric is never mistaken for the outcome.
  */
 
-import { mcnemarTest, DEFAULT_ACCURACY_MARGIN_PCT, type HumanPickResult } from './experiment-stats.js';
+import { clusteredMcnemarTest, DEFAULT_ACCURACY_MARGIN_PCT, type HumanPickResult, type ProportionCluster } from './experiment-stats.js';
 
 /** One replayed message: what each candidate said, and what the human decided if asked. */
 export interface ReplayLabel {
@@ -23,6 +23,12 @@ export interface ReplayLabel {
   challengerLabel: string;
   /** The adjudicated answer. Absent until a human rules; only ever set for discordant pairs. */
   trueLabel?: string | null;
+  /**
+   * The conversation the message came from. Messages of one conversation share a person and a topic, so
+   * their labels are not independent: the test clusters on this. Absent means the message is its own
+   * cluster, which is the unclustered test.
+   */
+  conversationId?: string | null;
 }
 
 export interface ReplaySummary {
@@ -43,7 +49,7 @@ export interface ReplaySummary {
   /**
    * Adjudicated discordant pairs where the true label matched NEITHER prediction.
    *
-   * These are real and must be counted separately: both models were wrong, so the pair cannot favour
+   * These are real and must be counted separately: both models were wrong, so the pair cannot favor
    * either, and folding it into either cell would invent a winner. Forcing the adjudicator to choose
    * one of the two predictions would do the same thing earlier in the pipeline, which is why
    * 'neither' is an allowed outcome.
@@ -92,7 +98,7 @@ export function summarizeReplay(rows: ReplayLabel[]): ReplaySummary {
 export type GateVerdict =
   /** The challenger is better, and the interval says so. */
   | 'challenger_better'
-  /** Not worse by more than the margin. Enough to authorise the online split, not to declare a win. */
+  /** Not worse by more than the margin. Enough to authorize the online split, not to declare a win. */
   | 'non_inferior'
   /** The challenger is worse by more than the margin can excuse, or the data cannot rule that out. */
   | 'worse'
@@ -104,8 +110,10 @@ export type GateVerdict =
 export interface GateResult {
   verdict: GateVerdict;
   summary: ReplaySummary;
-  /** McNemar over the informative discordant cells; null when none exist. */
+  /** McNemar over the informative discordant cells, clustered by conversation; null when none exist. */
   mcnemar: HumanPickResult | null;
+  /** Conversations the informative discordant pairs came from: the unit the McNemar interval is computed in. */
+  informativeConversations: number;
   /**
    * Paired accuracy difference (challenger minus incumbent) over the WHOLE corpus, as a proportion.
    * Derived from the discordant cells because the concordant ones cancel exactly: they contribute the
@@ -153,6 +161,7 @@ export function evaluateClassifierGate(rows: ReplayLabel[], opts: GateOptions = 
   const base = {
     summary,
     mcnemar: null,
+    informativeConversations: 0,
     accuracyDelta: null,
     accuracyDeltaCi: null,
     marginPct,
@@ -180,8 +189,10 @@ export function evaluateClassifierGate(rows: ReplayLabel[], opts: GateOptions = 
     };
   }
 
-  const mcnemar = mcnemarTest(summary.challengerOnlyRight, summary.incumbentOnlyRight);
+  const clusters = informativeClusters(rows);
+  const mcnemar = clusteredMcnemarTest(clusters);
   const informative = summary.challengerOnlyRight + summary.incumbentOnlyRight;
+  const informativeConversations = clusters.length;
 
   if (!mcnemar || informative < minAdjudicated) {
     const reason = !mcnemar
@@ -190,6 +201,7 @@ export function evaluateClassifierGate(rows: ReplayLabel[], opts: GateOptions = 
     return {
       ...base,
       mcnemar,
+      informativeConversations,
       verdict: 'insufficient',
       rationale:
         `Not enough evidence to decide: ${reason}. `
@@ -208,7 +220,7 @@ export function evaluateClassifierGate(rows: ReplayLabel[], opts: GateOptions = 
     (2 * mcnemar.ci[1] - 1) * scale,
   ];
   const margin = marginPct / 100;
-  const result = { ...base, mcnemar, accuracyDelta, accuracyDeltaCi };
+  const result = { ...base, mcnemar, informativeConversations, accuracyDelta, accuracyDeltaCi };
 
   // Worse by more than the margin can excuse, or too uncertain to rule that out. Both land here, and
   // the rationale distinguishes them so an operator knows whether to collect more or to stop.
@@ -231,6 +243,7 @@ export function evaluateClassifierGate(rows: ReplayLabel[], opts: GateOptions = 
       verdict: 'challenger_better',
       rationale:
         `The challenger won ${summary.challengerOnlyRight} of ${informative} informative disagreements `
+        + `from ${informativeConversations} conversation${informativeConversations === 1 ? '' : 's'} `
         + `(${pct(mcnemar.winRate)}, 95% CI ${pct(mcnemar.ci[0])} to ${pct(mcnemar.ci[1])}, p=${mcnemar.pValue.toFixed(4)}), `
         + `a ${pct(accuracyDelta)} accuracy gain on this corpus. This authorises an online split; it is not the result of one.`,
     };
@@ -244,6 +257,27 @@ export function evaluateClassifierGate(rows: ReplayLabel[], opts: GateOptions = 
       + `(accuracy difference ${pct(accuracyDelta)}, 95% CI ${pct(accuracyDeltaCi[0])} to ${pct(accuracyDeltaCi[1])}), `
       + 'without being measurably better. This authorises an online split; it does not recommend one.',
   };
+}
+
+/**
+ * The informative discordant pairs grouped by conversation, the cluster McNemar's interval is computed
+ * over. A pair with no conversation is its own cluster.
+ */
+export function informativeClusters(rows: ReplayLabel[]): ProportionCluster[] {
+  const byConversation = new Map<string, ProportionCluster>();
+  rows.forEach((row, i) => {
+    if (row.incumbentLabel === row.challengerLabel) return;
+    const truth = (row.trueLabel ?? '').trim();
+    if (!truth) return;
+    const challengerRight = truth === row.challengerLabel;
+    if (!challengerRight && truth !== row.incumbentLabel) return;
+    const key = (row.conversationId ?? '').trim() || `#${i}`;
+    const c = byConversation.get(key) || { successes: 0, n: 0 };
+    c.n += 1;
+    if (challengerRight) c.successes += 1;
+    byConversation.set(key, c);
+  });
+  return [...byConversation.values()];
 }
 
 /** True when the gate's verdict permits the online confirm to start (§5.4). */

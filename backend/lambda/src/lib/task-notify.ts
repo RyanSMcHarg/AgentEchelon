@@ -3,42 +3,41 @@
  *
  * Pure logic for turning assignable work-item tasks into channel notices that the notification
  * bridge (lib/channel-notify.ts, via the channel-flow processor) fans out to the assignee's email:
- *   - matchAssigneeInRoster — recover the resolvable {sub, iss} for a task's assignee from the
- *     channel roster (the task only stores the one-way `fed_` Chime id; see Task.assigneeUserSub).
+ *   - matchAssigneeInRoster — whether a task's assignee is still in the conversation's grounded roster.
  *   - selectTasksToRemind — which open, dated tasks are due-soon / overdue this run (cooldown-gated).
- *   - buildAssignmentNotice / buildReminderNotice — the channel message + email subject, carrying the
- *     metadata.notify directive that targets the assignee.
+ *   - buildAssignmentNotice — the channel message and email subject, rendered from the `task-assigned` message
+ *     template (ADR-062 decision 6).
  *
  * No AWS here — the scheduled lambda + processor wire these to Dynamo/Chime; this stays unit-testable.
  */
-import { deriveFederatedSub } from './federated-identity.js';
-import type { NotifyTarget, RosterParticipant } from './channel-notify.js';
 import type { Task, TaskStatus } from './task-tracking.js';
 import { ACTIVE_TASK_STATUSES } from './task-tracking.js';
+import type { ParsedTemplate } from './document-template.js';
+import { renderMessageTemplate } from './message-template.js';
+import { shippedMessageTemplate } from './shipped-message-templates.js';
 
 /**
- * Recover the assignee's resolvable {sub, iss} from the channel roster. A task's `assigneeUserSub` is
- * the assignee's Chime/AppInstanceUser id — for a FEDERATED member that's `deriveFederatedSub(iss, sub)`
- * (a one-way hash), for a NATIVE member it's the raw sub. We can't invert the hash, so we match by
- * recomputing it for each roster member (carrying raw {sub, iss}). Returns null when no member matches
- * (e.g. the roster was shed for size, or the assignee left the conversation).
+ * One member of the roster a turn is grounded on (`lib/host-grounding.ts`): the person id live
+ * membership reports, with the host-supplied role when one was recorded.
+ */
+export interface RosterParticipant {
+  sub: string;
+  iss?: string;
+  role?: string;
+}
+
+/**
+ * The assignee's person id when they are still in the conversation's roster, else null (the roster
+ * was shed for size, or the assignee left). A task's `assigneePersonId` is the assignee's AppInstanceUser
+ * id, which is the id membership reports, so this is a membership test and nothing more: where to reach
+ * them is the directory's question at send time.
  */
 export function matchAssigneeInRoster(
-  assigneeUserSub: string | undefined,
+  assigneePersonId: string | undefined,
   roster: RosterParticipant[],
-): NotifyTarget | null {
-  if (!assigneeUserSub) return null;
-  for (const p of roster) {
-    if (!p?.sub) continue;
-    if (p.iss) {
-      // Federated member: channel id = deriveFederatedSub(iss, sub).
-      if (deriveFederatedSub(p.iss, p.sub) === assigneeUserSub) return { sub: p.sub, iss: p.iss };
-    } else if (p.sub === assigneeUserSub) {
-      // Native member: channel id IS the raw sub.
-      return { sub: p.sub };
-    }
-  }
-  return null;
+): string | null {
+  if (!assigneePersonId) return null;
+  return roster.some((p) => p?.sub === assigneePersonId) ? assigneePersonId : null;
 }
 
 export type DueKind = 'due_soon' | 'overdue';
@@ -77,14 +76,27 @@ export function selectTasksToRemind(
   return out;
 }
 
-/** Short human label for what a task is, from its collected details / type (best-effort). */
-function taskLabel(task: Task): string {
+/**
+ * What a task is called in its notice: the name its details carry, else the template's label for its kind
+ * (`label.actionItem`, `label.workItem`, `label.item`), so the fallback is worded where the rest of the notice is.
+ */
+function taskLabel(task: Task, template: ParsedTemplate): string {
   const d = (task.details || {}) as Record<string, unknown>;
   const named = [d.title, d.name, d.what].find((v) => typeof v === 'string' && v) as string | undefined;
   if (named) return named;
-  if (task.taskType === 'action_item') return 'an action item';
-  if (task.taskType === 'place_item') return 'a work item';
-  return 'an item';
+  const labels = template.messageSections ?? {};
+  if (task.taskType === 'action_item') return labels['label.actionItem'] ?? '';
+  if (task.taskType === 'place_item') return labels['label.workItem'] ?? '';
+  return labels['label.item'] ?? '';
+}
+
+/** A task notice rendered from its template: the chat line, and the email subject the bridge sends it under. */
+function taskNotice(task: Task, template: ParsedTemplate, resolved: Record<string, string> = {}): TaskNotice {
+  const rendered = renderMessageTemplate(template, { ...resolved, what: taskLabel(task, template), dueBy: formatDueBy(task.dueBy) }, {
+    sections: ['chat', 'email.subject'], refusedValue: 'empty',
+  });
+  const s = rendered.ok ? rendered.sections : {};
+  return { subject: s['email.subject'] ?? '', content: s.chat ?? '' };
 }
 
 /** Format a `dueBy` ISO value as a friendly date (UTC date only; time-of-day rarely matters here). */
@@ -102,38 +114,20 @@ export interface TaskNotice {
   subject: string;
 }
 
+/** The template each task notice is said from (ADR-062 decision 6). */
+export const TASK_NOTICE_TEMPLATES = { assigned: 'task-assigned' } as const;
+
 /**
- * The "you're set to handle this" message posted when an action item becomes the assignee's to
- * act on. Carries no PII — the bridge resolves the assignee's address from the IDP.
+ * The "you're set to handle this" message posted when an action item becomes the assignee's to act on, from
+ * the `task-assigned` template: the one `template` selected, else the shipped one. Carries no PII; the bridge
+ * resolves the assignee's address from the IDP.
  */
-export function buildAssignmentNotice(task: Task): TaskNotice {
-  const what = taskLabel(task);
-  const by = formatDueBy(task.dueBy);
-  const byClause = by ? ` by ${by}` : '';
-  return {
-    subject: `You're set to handle ${what}`,
-    content:
-      `You're down to handle ${what}${byClause}. Open the conversation and I'll walk you through ` +
-      `the steps — I'll keep the details with the work item.`,
-  };
+export function buildAssignmentNotice(
+  task: Task,
+  template: ParsedTemplate = shippedMessageTemplate(TASK_NOTICE_TEMPLATES.assigned),
+  /** The text a field bound to a source or a version variable inserts, read by the caller's resolver. */
+  resolved: Record<string, string> = {},
+): TaskNotice {
+  return taskNotice(task, template, resolved);
 }
 
-/** The due-soon / overdue reminder message. */
-export function buildReminderNotice(task: Task, kind: DueKind): TaskNotice {
-  const what = taskLabel(task);
-  const by = formatDueBy(task.dueBy);
-  if (kind === 'overdue') {
-    return {
-      subject: `Overdue: ${what}`,
-      content:
-        `Heads up — ${what} was due${by ? ` ${by}` : ''} and still isn't done. ` +
-        `Want me to help finish it, or should we drop it from the list?`,
-    };
-  }
-  return {
-    subject: `Reminder: ${what}${by ? ` by ${by}` : ''}`,
-    content:
-      `Reminder: ${what} is coming up${by ? ` (due ${by})` : ''}. ` +
-      `Reply here and I'll help you get it done.`,
-  };
-}

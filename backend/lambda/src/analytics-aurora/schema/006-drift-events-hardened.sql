@@ -24,9 +24,9 @@
 -- preserve historical data, snapshot drift_detection before applying this
 -- migration; this is a fresh-design table, not a column refactor.
 
--- CASCADE: 003-materialized-views.sql builds a materialized view FROM
--- drift_detection; that obsolete rollup must come down with the table (drift
--- analytics read drift_events directly after this migration).
+-- CASCADE: an older database holds a materialized view (`drift_summary`) built
+-- FROM drift_detection; it comes down with the table (drift analytics read
+-- drift_events directly).
 DROP TABLE IF EXISTS drift_detection CASCADE;
 
 CREATE TABLE IF NOT EXISTS drift_events (

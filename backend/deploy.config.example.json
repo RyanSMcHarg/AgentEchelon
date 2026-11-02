@@ -1,18 +1,54 @@
 {
   "_comment": "Copy to deploy.config.json (gitignored) and set your values. Read by scripts/deploy.mjs and forwarded to cdk as --context k=v (CLI --context flags override). Keys are cdk context flags; `_`-prefixed keys are comments and are ignored. An EMPTY value is skipped entirely, so it means 'take the built-in default' and can never change behaviour. This file lists EVERY context flag the app reads, so a flag is discoverable here and not only in the source; deploy-config-example.test.ts fails if the two drift apart.",
 
-  "_WHY_COMPLETE": "Forward this WHOLE set on every deploy, including single-stack ones. Many flags gate resources that already exist, and an ABSENT flag reads as 'off', so deploying a stack without them DELETES things: enableAdminPersonas / adminIamEnforcement drop the execute-api teeth on the shared admin roles (breaking every admin surface, not just the stack you deployed), enableLiveDrift unwires Aurora RAG and drift, and appUrl / adminAppUrl reset each API's CORS allowlist to localhost. Always run `cdk diff --exclusively` with the full set before deploying a single stack.",
+  "_WHY_COMPLETE": "Forward this WHOLE set on every deploy, including single-stack ones. Many flags gate resources that already exist, and an ABSENT flag reads as 'off', so deploying a stack without them DELETES things: enableLiveDrift unwires Aurora RAG and drift, and appUrl / adminAppUrl reset each API's CORS allowlist to localhost. Always run `cdk diff --exclusively` with the full set before deploying a single stack.",
+
+  "_cognitoEmail": "WHO YOUR USERS HEAR FROM. Left off, the user pool uses Cognito's built-in sender: every user-facing message - the admin invitation, the self-signup verification code, a password reset - comes from no-reply@verificationemail.com, and the account is capped at 50 of them a day. senderEmail does NOT cover this on its own; it feeds the alert/notification paths and the SES IAM scoping, not the pool. Set cognitoEmailFromSender=true to send those from senderEmail instead. ONLY do that if senderEmail resolves to a VERIFIED SES identity (the address, or a verified domain covering it) AND your account has SES production access: inside the SES sandbox a send to an unverified recipient fails, so a self-signup verification code would never arrive and the person could not register. cognitoEmailFromName sets the display name (default AgentEchelon). cognitoEmailVerifiedDomain decides WHICH SES identity the pool claims: leave empty if you verified the ADDRESS, and set it to the domain if you verified the DOMAIN instead - SES authorizes against the identity it resolves the From address to, so naming an address identity that was never verified is refused at send time.",
+  "cognitoEmailFromSender": false,
+  "cognitoEmailFromName": "",
+  "cognitoEmailVerifiedDomain": "",
+
+  "_capabilities": "WHAT THIS DEPLOYMENT STANDS UP beyond the required core (lib/config/capabilities.ts). The core is always deployed: Messaging, Identity, Conversations, Archive, the channel flow, post-processing, and one Assistants-<classification> stack per classification the profile registry declares. Each name here adds its own stacks and nothing else: chat (the ChatApp hosting), admin (the AdminServices stack - every admin handler, the admin credential exchange, the admin notification channel and the ae.alert rule - and the AdminApp console hosting), notifications (email: sharing, the briefing, the email bridge and the archival alarm), experiments (A/B experiments data; their admin routes join AdminServices when admin is declared too), battle (duels; requires experiments), operations (the deployment-wide dashboard; every stack keeps its own alarms either way), connectors (the Connectors stack for the vendors declared in connectors, below: an EventBridge rule on its partner event bus for each one that subscribes to vendor events, and the per-person grants), widget (the embeddable widget hosting, framed only by the hosts the issuers declare in allowedOrigins). meetings is NOT BUILT and synth refuses it. An empty list deploys the core alone, and ABSENT is refused by deploy.mjs because a missing list removes every stack outside the core. A name that is unknown, not built, or missing what it requires fails the synth.",
+  "capabilities": ["chat", "admin", "notifications", "experiments", "battle"],
+  "_profiles": "THE CLASSIFICATIONS AND ASSISTANT PROFILES THIS DEPLOYMENT RUNS (lib/config/profiles.ts, resolveDeploymentProfiles). Each conversational classification gets its own Assistants-<classification> stack. The sample declares the premium ops assistant beside the shipped three: ops-premium is owned by the ops team (its ownerTeam), so a team-ops member manages it in the admin console. Empty takes the shipped catalog minus its outside classifications: basic, standard and premium, with the admin plane, and no Assistants-guest or Assistants-customer. Each classification reaches exactly the grants it declares (ADR-046). The shipped basic, standard and premium sets nest only because the sample is configured that way; sets need not nest, and in many deployments should not: customer and guest are disjoint from every member set, and synth refuses a member classification that grants them. A list picks from the shipped catalog, e.g. [\"basic\", \"standard\", \"premium\", \"guest\", \"customer\"]: each brings its shipped profile and the clearance and membership groups that name it, and grants narrow to the list. A ROLE IS DECLARED BY NAMING ITS ASSISTANT beside its classification, and a declared role is deployed: [\"basic\", \"standard\", \"premium\", \"ops-premium\"] deploys the premium ops assistant (its own identity, Amazon Lex bot, acting role and reach) in Assistants-premium, and a classification named alone holds only its primary. npm run add-assistant-role adds the name and deploys that stack; --remove takes it back out. A custom set declares roles on its classification entries (roles: [\"primary\", \"ops\"]) and a profile named <role>-<classification> for each. An object replaces the shipped catalog with a fully custom set, as in _profilesCustomSetExample below: each classification declares its own topology and its own models: { selected: [<catalog keys>], default: <a Bedrock text model it selects> }, and each profile's modelKey is a Bedrock text model its classification selects (docs/guides/developer/HOW-TO-ADD-OR-MANAGE-A-PROFILE.md). The admin plane (the admin classification, the admin-agent profile and the admins group) is in every set, and a custom set declares none of its own. Synth refuses a set validateProfilesConfig refuses, and anything that names a classification the set does not declare: an issuer's classifications, the guest issuer (it needs guest, and customer for its path B claim), an invitation-link issuer's link classifications, and a conversation type served here. guest and customer deploy only when listed. The notifications capability needs standard (the briefing runs as it).",
+  "profiles": ["basic", "standard", "premium", "ops-premium"],
+  "_profilesCustomSetExample": {
+    "classifications": [
+      {
+        "value": "legal", "profile": "counsel", "grants": ["legal"], "displayName": "Legal",
+        "models": { "selected": ["haiku", "sonnet"], "default": "sonnet" },
+        "topology": {
+          "timeoutSeconds": 60, "memorySize": 512, "reservedConcurrency": 10, "maxTokens": 4096,
+          "streaming": false, "contextRouting": false, "systemPromptParam": false, "intentPackParam": true,
+          "richProcessor": false, "handlerExperimentsIndex": false
+        }
+      }
+    ],
+    "profiles": [
+      { "name": "counsel", "displayName": "Counsel", "modelKey": "sonnet", "classifierMode": "llm", "timeoutSeconds": 60, "contextScope": "granted" }
+    ],
+    "groupClearance": { "legal": "legal" }
+  },
 
   "_required": "Minimal Athena-mode deploy: just set senderEmail.",
   "senderEmail": "you@example.com",
   "senderEmailPreVerified": false,
+  "_replies": "REPLIES BY EMAIL (opt-in, needs notifications). replyDomain is a subdomain used ONLY for replies (e.g. replies.example.com): every conversation notice then carries a Reply-To on it, and a reply is posted into the conversation as the person who sent it, only with a valid reply token, DMARC passing and the From address their identity provider holds. replyRuleSet names your account's ACTIVE SES receipt rule set (one per region; the stack adds its rule to it and activates nothing). Point the subdomain's MX record at inbound-smtp.<region>.amazonaws.com (the ReplyDomainMx output prints it). Set replyDomainVerified=true when the subdomain is already a verified SES identity. Empty: no mail carries a reply address.",
+  "replyDomain": "",
+  "replyRuleSet": "",
+  "replyDomainVerified": false,
+  "_languages": "THE LANGUAGES THIS DEPLOYMENT SPEAKS (lib/config/languages.ts), its own language first, e.g. [\"en\", \"es\", \"zh\"]. The closed set a reply-language instruction names (a tag outside it is never put into a prompt), a person's language setting offers, a condition on signal:userLanguage or person:preferredLanguage decides over, and a message template's language order resolves to (ADR-062 decision 4). Each tag must be one the platform's language catalog names; synth refuses any other. Empty speaks English first, then Simplified Chinese.",
+  "languages": "",
+  "_environment": "dev or production, and nothing else (synth refuses any other value). production retains every table, the message stream and the Aurora cluster when a stack is deleted, and turns on the cluster's deletion protection; dev destroys them, so a teardown leaves nothing that blocks a fresh deploy.",
   "environment": "dev",
 
-  "_urls": "Both are derived by deploy.mjs from the live CloudFront distributions, which closes the CORS loop for you. Leave EMPTY unless you serve the apps from custom domains, in which case set them before the first deploy. A CORS-bearing stack deployed without these falls back to http://localhost:5173 and CORS-blocks the hosted SPA.",
+  "_urls": "Both are derived by deploy.mjs from the live CloudFront distributions (adminAppUrl when admin is in capabilities), which closes the CORS loop for you. Leave EMPTY unless you serve the apps from custom domains, in which case set them before the first deploy. A CORS-bearing stack deployed without these falls back to http://localhost:5173 and CORS-blocks the hosted SPA.",
   "appUrl": "",
   "adminAppUrl": "",
+  "_widgetUrl": "The widget frame's own origin (the Widget stack's WidgetDistributionUrl output), which PersonApi admits in CORS when widget is in capabilities. deploy.mjs derives it from the live distribution, as it does appUrl, with one extra backend pass on that distribution's first deploy; leave it empty unless you serve the widget from your own domain.",
+  "widgetUrl": "",
 
-  "_analytics": "Aurora mode adds a VPC + Aurora (advanced analytics, pgvector retrieval, live drift). To reuse an existing VPC set analyticsVpcId + analyticsVpcSubnetType and createVpcEndpoints=false. enableRdsProxy adds a standing hourly cost; leave off unless you need it.",
+  "_analytics": "Aurora mode adds a VPC + Aurora (advanced analytics, pgvector retrieval, live drift). analyticsMode is CHOSEN ON THE FIRST DEPLOY and switching an existing deployment is not supported (both archive modes create the same fixed-name resources): deploy.mjs records the mode as _analyticsModeChosenAtFirstDeploy in this file and refuses a later deploy that asks for the other one. To change modes, tear down and deploy fresh (docs/guides/admin/AURORA-MODE-GUIDE.md, Switching modes). To reuse an existing VPC set analyticsVpcId + analyticsVpcSubnetType and createVpcEndpoints=false. enableRdsProxy adds a standing hourly cost; leave off unless you need it.",
   "analyticsMode": "athena",
   "analyticsVpcId": "",
   "analyticsVpcSubnetType": "isolated",
@@ -24,7 +60,17 @@
 
   "_features": "enableLiveDrift is an EXPLICIT opt-in and REQUIRES analyticsMode=aurora. It wires BOTH Aurora RAG retrieval and live drift, so deploying the assistant stacks without it sets those env vars to null and silently disables both.",
   "enableLiveDrift": false,
-  "enableBattle": true,
+
+  "_turnQueue": "One turn at a time per responder (ADR-033). OFF by default: it adds a conditional write to the critical path of every turn, so a deployment ships the code, confirms nothing changed, and only then enables it. With it off nothing ever queues - a second message while the assistant is working starts a second turn, which is the behaviour that predates the lock. turnQueueMax bounds how many messages one conversation may hold; the OLDEST is dropped on overflow and the person is told. The turn-queue e2e phase needs turnQueue=true or it fails rather than passing vacuously.",
+  "turnQueue": "",
+  "turnQueueMax": "",
+
+  "_taskIndexWave": "UPGRADES ONLY, and only once. DynamoDB permits one GSI creation per UpdateTable, and ADR-024 D8 adds TWO indexes to the pre-existing user-tasks table. A FRESH deployment is unaffected - CreateTable accepts every index at once - so leave this EMPTY, which adds both. Upgrading an EXISTING deployment from a release before D8: deploy once with taskIndexWave=1 (ownerSub-index only), then deploy again with it empty to add channelArn-assistantId-index. Attempting both at once fails the update and rolls it back, loudly and cleanly, so it costs a deploy rather than a repair. Nothing breaks in between: both reads that use these indexes catch their own failure and return an empty list, degrading to the behaviour that existed before them. Any value other than 1 - including a typo - means 'all of them', because the default has to be the whole shape.",
+  "taskIndexWave": "",
+
+  "_replaceAdminNotificationChannel": "RECOVERY ONLY. The admin notification channel belongs to the AdminServices stack, and no other stack reads it: every alert reaches it as an ae.alert event that stack posts. If the recorded channel is unreadable (deleted by hand) the provisioner refuses to invent one and says so. To replace it, redeploy AdminServices with replaceAdminNotificationChannel=true. Leave EMPTY at all other times; it is not a setting, it is a one-off repair step.",
+  "replaceAdminNotificationChannel": "",
+
   "sleepMode": false,
   "sleepAfterIdle": "2h",
   "sleepCheckRate": "rate(15 minutes)",
@@ -35,73 +81,85 @@
   "wafRateLimit": "",
   "wafAllowedIps": "",
 
-  "_adminConsole": "The operator console is a separate app on its own origin (opt-in). adminAppClient defaults to a dedicated Cognito app-client on the same pool; set it to 'shared' to reuse the chat client.",
-  "enableAdminApp": false,
+  "_adminConsole": "The operator console is a separate app on its own origin, deployed with the admin capability. adminAppClient defaults to a dedicated Cognito app-client on the same pool; set it to 'shared' to reuse the chat client.",
   "adminAppClient": "",
+  "_adminSyncRate": "Backstop schedule for the admin-conversation sync, default rate(1 day). The sync runs on the Cognito user and group change events delivered through the platform trail.",
   "adminSyncRate": "",
+
+  "_cleanCopySchedule": "When the de-identified conversation copy is brought up to date (SPEC-ADMIN-CONSOLE FR54), as an EventBridge schedule expression. Empty means daily at 02:00 UTC. The detector charges per character, so a fresher copy, e.g. rate(6 hours), costs little more. Aurora mode only.",
+  "cleanCopySchedule": "",
+
+  "_platformTrail": "THE CLOUDTRAIL TRAIL THE PLATFORM ASSUMES. On by default: the Identity stack creates a trail logging management events and, unless trailDataEvents=false, data events to an S3 bucket (file validation on, retained trailRetentionDays, default 400). It is the control-plane audit layer and the event source that keeps group-sourced conversations and the admin conversations in sync without polling. Set platformTrail=false ONLY if an organization trail already covers this account (a second trail is charged for a second copy of management events). validate --only=audit-trail checks one is logging.",
+  "platformTrail": "",
+  "trailRetentionDays": "",
+  "_trailDataEvents": "The platform trail records management events (which include the Amazon Chime SDK messaging calls, Bedrock InvokeModel/Converse, Cognito and SSM) AND data events: Lambda invokes, DynamoDB item access, S3 object access (except the trail bucket) and Kinesis records. Data events are charged per event; set trailDataEvents=false to keep management events only. Requests to the platform's own API Gateway APIs are never CloudTrail events - each API's access log records them.",
+  "trailDataEvents": "",
+
   "adminConversationArns": "",
 
-  "_adminIdentity": "Admin authority. adminIamEnforcement flips admin API routes to AWS_IAM and grants execute-api teeth on the shared sign-on and persona roles; enableAdminPersonas creates the example persona groups and roles. Omitting either on a redeploy REMOVES those grants and cascades to every admin surface. adminAuthMode=federated additionally needs hostAdminPoolId.",
-  "adminIamEnforcement": false,
-  "enableAdminPersonas": false,
+  "_adminIdentity": "Admin authority. Every admin route is AWS_IAM-authorized and each admin role (admins, team-members) is granted exactly the capabilities backend/lib/config/admin-capabilities.ts gives it; there is no switch for either, and GET /feedback is one of those routes. adminAuthMode selects no authorizer: it sets ADMIN_AUTH_MODE on the admin handlers, and only adminAuthMode=service changes what they do (an IAM-signed caller is trusted as admin).",
   "adminAuthMode": "",
-  "hostAdminPoolId": "",
-  "adminGroupNames": "",
 
-  "_adminNotifications": "Creates a dedicated admin conversation channel that operational alerts (errors, latency SLA, eval-quality breaches) are posted into, with the admins group as members. Off means those alerts stay log-only.",
-  "enableAdminNotificationChannel": false,
 
-  "_membershipAudit": "Always deployed. Report-only until membershipAuditEnforce=true; alerts are log-only until an admin channel ARN is set.",
+  "_testInbox": "OPT-IN mailbox the e2e suite reads, so notification tests assert an email was delivered and the demo cast's mail is checked (README, Test inbox). testInboxDomain is the domain the test users' and the demo cast's addresses are on. AN INBOX YOU ALREADY HAVE: set testInboxBucket to the S3 bucket an SES receipt rule you do not manage here writes that domain's mail into, and testInboxPrefix to the key prefix it writes under; no TestInbox stack is created, and provision-test-users reads these keys (TEST_EMAIL_DOMAIN, TEST_INBOX_BUCKET and TEST_INBOX_PREFIX in the environment override them for one run). A NEW ONE: leave testInboxBucket empty and testInboxDomain creates the TestInbox stack on a domain used only for tests. testInboxRuleSet names the region's ACTIVE SES receipt rule set (one active set per region; without it the stack creates an inactive one). testInboxDomainVerified=true when the domain is already a verified SES identity. The hosted-zone pair lets the stack write the DKIM and MX records. Leave testInboxDomain EMPTY for no inbox.",
+  "testInboxDomain": "",
+  "testInboxBucket": "",
+  "testInboxPrefix": "",
+  "testInboxRuleSet": "",
+  "testInboxDomainVerified": "",
+  "testInboxHostedZoneId": "",
+  "testInboxHostedZoneName": "",
+  "_presenterMailbox": "The mailbox the demo cast's logins are plus-addressed on when no test inbox resolves (npm run provision-test-users -- --cast ops-demo): each person signs in as <local>+<who>@<domain>, so their mail lands in one mailbox the presenter can open on camera. Read by the provisioning script, never by the stacks. Empty means presenter@example.com, a reserved domain that receives nothing.",
+  "presenterMailbox": "",
+
+  "_membershipAudit": "Always deployed. Report-only until membershipAuditEnforce=true. Its findings are ae.alert events, posted into the admin notification channel when the deployment declares the admin capability.",
   "membershipAuditEnforce": false,
-  "membershipAuditAlertChannelArn": "",
 
-  "_identity": "identityProvider names the IdP governing END USERS ('cognito' enables the User Management tab; any other value renders a pointer to that IdP). federatedUserPoolId and notifyAdditionalUserPoolIds wire additional pools.",
-  "identityProvider": "cognito",
-  "federatedUserPoolId": "",
-  "notifyAdditionalUserPoolIds": "",
+  "_issuers": "THE TRUSTED-ISSUER REGISTRY (lib/config/issuers.ts): every identity provider a person may sign in through, one entry each. Absent, the deployment trusts its own pool alone; declared, it is the whole list, so keep the deployment entry. Every entry declares a clearance source - groups (a cognito-pool's own groups), mapping { claim, values }, fixed [classifications] or oneChannel '<classification>' - AND the classifications it may grant; synth refuses an entry without them. Kinds: cognito-pool (pool: self or a pool id; a pool other than self declares audience, the app client ids its tokens are issued to, which the edge authorizer checks), cognito-federated (a SAML or OIDC providerName on a pool: every generic OIDC provider and a single-tenant Entra ID go this way) and oidc-entra (tenants, tokenVersion, discoveryUrl, audience: an allowlist of several Entra tenants, or any Entra tenant on a deployment with no pool of its own). A generic oidc entry is refused at synth, pointing to cognito-federated (a test fixture excepted), and so is a single-tenant oidc-entra entry where the deployment has a pool. A mapping clearance may declare recordMaxAgeDays (1 to 365, default 30): how old the exchange's record of its last decision may be before the membership audit, the reconcile and the router flag it as stale. guest is the platform's own issuer for an anonymous visitor (docs/guides/admin/GUEST-ISSUER.md): { \"id\": \"guest\", \"kind\": \"guest\", \"clearance\": { \"fixed\": [\"guest\"], \"classifications\": [\"guest\"] }, \"allowedOrigins\": [\"https://www.example.com\"], \"guest\": { \"captcha\": { \"vendor\": \"turnstile\", \"siteKey\": \"<site key>\", \"secretName\": \"<Secrets Manager secret>\" } } }; a guest issuer needs guest and customer in profiles (guest-visitor conversations are at guest, and its path B claim opens customer-engagement ones at customer); a guest issuer's allowedOrigins may also name \"widget-host\", the sample host page (examples/widget-host/), which stands up the test-only WidgetHost stack and is named in the widget's frame-ancestors by its own origin, refused in production (backend/deploy.config.guest-widget.example.json is a whole deployment that uses it); outside production a guest with no captcha uses the vendor's test keys, and production refuses them, any guest setting it does not know and a limit of 0. host-assertion is a host application that signs a short-lived assertion for its own signed-in user, such as a Salesforce org (docs/guides/user/IDENTITY-PROVIDER-GUIDE.md#salesforce): { \"id\": \"salesforce-org\", \"kind\": \"host-assertion\", \"issuer\": \"https://example.my.salesforce.com\", \"allowedOrigins\": [\"https://example.lightning.force.com\"], \"hostAssertion\": { \"publicKeys\": { \"<kid>\": \"<base64 DER public key>\" }, \"maxMinutes\": 5 }, \"clearance\": { \"mapping\": { \"claim\": \"permsets\", \"values\": { \"<permission set>\": \"standard\" } }, \"classifications\": [\"basic\", \"standard\"] } }; the keys are pinned (one or two, rotated by declaring the next beside the current), aud is this deployment's id, its jti is accepted once, and it is provisioned-only: a subject reaches only a person pre-assigned with POST /users/provision or by a connector naming it as its personIssuer, and an unknown subject is refused. provisioning provisioned-only is also accepted on another issuer (never this deployment's own pool or a oneChannel issuer). invitation-link is the platform's own issuer for a person who joins a conversation from a link invitation with no sign-in (docs/guides/user/IDENTITY-PROVIDER-GUIDE.md#invitations): { \"id\": \"invitation\", \"kind\": \"invitation-link\", \"clearance\": { \"fixed\": [\"basic\", \"standard\"], \"classifications\": [\"basic\", \"standard\"] }, \"invitationLink\": { \"captcha\": { \"vendor\": \"turnstile\", \"siteKey\": \"<site key>\", \"secretName\": \"<Secrets Manager secret>\" } } }; it signs no token, its fixed set is where a 15 minute link session may be vended, and production refuses the captcha test keys as for a guest; invitations need the widget origin (widgetUrl) for their landing page. provisioning scim and lifecycle scim or connector:* are NOT BUILT. The Apex signer and the widget a host assertion is posted into are NOT BUILT. admin: true lets an issuer's people hold an admin role (never on guest, invitation-link or host-assertion); adminGroups names the group that marks an admin (default admins). The admin capability needs an issuer that is not the guest. A host app embedding the assistant declares its own pool with the one-conversation session, which is all its people reach: { \"id\": \"host\", \"kind\": \"cognito-pool\", \"pool\": \"us-east-1_XXXXXXXXX\", \"audience\": \"<the host app client id>\", \"clearance\": { \"oneChannel\": \"basic\", \"classifications\": [\"basic\"] }, \"displayName\": { \"en\": \"Host app\" } }. Every oneChannel issuer names the same classification. The email bridge resolves recipients in every cognito-pool entry's pool, and the admin console names the provider of a cognito-federated entry as governing end users. directory names where a person's name, contact and groups are read (C5): cognito (the entry's pool, read live; a Cognito kind's default), claims (an issuer with no directory of its own: the contact claims of the last sign-in, kept encrypted with a customer managed key in the user-profile table, expired 90 days after it and erased with the person) or none (named by the AppInstanceUser alone; every other kind's default); identity-store, graph, scim and connector:<id> are NOT BUILT and refused at synth. npm run doctor checks each pool exists and each discovery URL answers.",
+  "issuers": [{"id":"deployment","kind":"cognito-pool","pool":"self","clearance":{"groups":true,"classifications":["basic","standard","premium","admin"]},"admin":true,"displayName":{"en":"Sign in"}}],
+  "_connectors": "THE CONNECTOR REGISTRY (lib/config/connectors.ts), read only beside the connectors capability: every external vendor this deployment integrates with, one entry each, and synth refuses either one declared without the other. Vendors: pagerduty and salesforce; twilio, servicenow, aws-support, jira-servicedesk and servicetitan are NOT BUILT. An entry is { id, vendor } plus: subscribes (the vendor event types it receives: pagerduty incident.trigger, incident.acknowledge, incident.unacknowledge, incident.resolve, incident.assign, incident.escalate, incident.delegate, incident.annotate; salesforce the API names of the relayed Platform Events (<Name>__e) and Change Data Capture events (<Object>ChangeEvent)), with eventSource (the full name of the vendor's Amazon EventBridge partner event source, which the operator associates with its partner event bus BEFORE the deploy: aws.partner/salesforce.com/<org id>/<event relay id> from a Salesforce Event Relay, aws.partner/pagerduty.com/<subdomain>-<name> from the PagerDuty EventBridge integration; one rule per connector matches that source and the subscribed events, and each event is recorded by its vendor event id so a replay is dropped; no vendor reaches an HTTP route) and classification (the classification of the conversations those events concern: each person an event names is admitted only when their clearance reaches it, within their issuer's classifications); personIssuer (a registry issuer whose declared subject is the vendor's own user id, through the same single sign-on; absent, a vendor user id resolves under the connector's own id; under a provisioned-only personIssuer, a person the vendor names who has no row is pre-assigned as a pending row and admitted nowhere until they sign in); grants { redirectUris, scopes } (per-person OAuth grants, kept KMS-encrypted keyed by person id, revocable by the person and revoked at the vendor at offboarding); loginUrl (salesforce: the org's https://<my-domain>.my.salesforce.com). A person a vendor names is resolved only through Identities and never by an email address; without an Identities row they would be reached by an invitation, which is NOT BUILT. Secrets are never inline: for a connector with grants, create <instance>/connector/<id>/oauth-client ({ \"clientId\", \"clientSecret\" }) in Secrets Manager; a teardown never deletes it. Receiving events needs no secret. Example: [{ \"id\": \"pagerduty\", \"vendor\": \"pagerduty\", \"subscribes\": [\"incident.trigger\", \"incident.resolve\"], \"eventSource\": \"aws.partner/pagerduty.com/acme-agent-echelon\", \"classification\": \"standard\" }]. Leave EMPTY with no connectors capability.",
+  "connectors": [],
+  "_userProfileService": "OPTIONAL, beside the registry: the ARN of a Lambda function that serves the per-person profile (the onboarding gate and its facts) in place of the built-in user-profile table (SPEC-USER-PROFILE-AND-ONBOARDING). Declaring it sets USER_PROFILE_SERVICE_ARN on each classification's router and grants it lambda:InvokeFunction on that function, with no code change. Leave EMPTY to keep the built-in table. A value that is not a Lambda function ARN fails the synth.",
+  "userProfileService": "",
 
   "_assistantConfig": "Per-deployment assistant configuration. An empty assistantSystemPrompt means the generic default persona (off-brand, no host grounding); an empty assistantIntentPack means the generic default intents. assistantParamWriter grants a principal write access to those SSM params.",
   "assistantSystemPrompt": "",
   "assistantIntentPack": "",
   "assistantParamWriter": "",
-  "assistantTier": "",
 
-  "_models": "Override a profile's default model from the catalog. Empty takes the catalog default.",
-  "basicModelKey": "",
-  "standardModelKey": "",
-  "premiumModelKey": "",
+  "_models": "MODELS ARE NOT CONTEXT FLAGS. The platform allows (the instance's model catalog, lib/config/model-catalog.ts: every Bedrock, external and image model, by key, naming no classification), the classification selects (models: { selected: [<catalog keys>], default: <a Bedrock text model it selects> } on its entry in profiles above; each shipped classification declares its own selection in lib/config/profiles.ts), and the profile uses only what its classification selects. A classification's stack grants exactly its selection: the Bedrock ARNs of its Bedrock models and the key secret of an external one. The retired basicModelKey, standardModelKey, premiumModelKey, guestModelKey and customerModelKey keys fail the synth.",
 
-  "_contextRouting": "External/CN model routing (SPEC-CONTEXT-AWARE-MODEL-ROUTING), standard profile only. Active at runtime only when enableContextRouting is on.",
+  "_contextRouting": "External/CN model routing (SPEC-CONTEXT-AWARE-MODEL-ROUTING), on a classification whose topology sets contextRouting and which selects a Chinese path: deepseek_v3 on Bedrock (the shipped standard) or the external deepseek_api. Synth refuses context routing on a classification that selects neither. When it selects deepseek_v3, a Chinese turn takes the in-AWS path, so synth refuses deepseek_api beside it (and on a classification that does not route by context), where no turn would reach it. Active at runtime only when enableContextRouting is on. Whether a turn may use the external (non-AWS) DeepSeek provider is whether its classification selects deepseek_api, which also creates and grants its key secret; a profile enables nothing. cnBedrockReasoningIntents names the intents sent to the reasoning model. The retired externalConsentDefault, cnBedrockChatModel, cnBedrockReasoningModel and deepseekModel keys fail the synth.",
   "enableContextRouting": "",
-  "cnBedrockChatModel": "",
-  "cnBedrockReasoningModel": "",
   "cnBedrockReasoningIntents": "",
-  "deepseekModel": "",
-  "externalConsentDefault": "",
 
-  "_imageGen": "REQUIRED for /battle image generation-out with EXTERNAL providers (OpenAI, FAL): the ARN of a Secrets Manager secret holding a JSON object of provider keys ({\"OPENAI_API_KEY\":\"...\",\"FAL_KEY\":\"...\"}). Without it the premium (imageGen:true) processor still gets the image guardrail but CANNOT authenticate to a provider, so image battles silently honest-empty. Alternatively export OPENAI_API_KEY / FAL_KEY in the deploy shell.",
+  "_imageGen": "REQUIRED for /battle image generation-out with EXTERNAL providers (OpenAI, FAL): the ARN of a Secrets Manager secret holding a JSON object of provider keys ({\"OPENAI_API_KEY\":\"...\",\"FAL_KEY\":\"...\"}); each classification's processor reads only the fields of the providers it selects. Without it the premium (imageGen:true) processor still gets the image guardrail but CANNOT authenticate to a provider, so image battles silently honest-empty. Alternatively export OPENAI_API_KEY / FAL_KEY in the deploy shell.",
   "imageGenKeysSecretArn": "",
   "imageGenRegion": "",
 
-  "_battle": "Battle alt-bot slot count and per-image limits.",
-  "altBotSlotCount": "",
+  "_battle": "Battle per-image limits. There is no alt count: one alt is provisioned per (classification, role), so the number of alts follows the roles a classification declares.",
   "battleImageMaxImages": "",
   "battleImageMaxDimension": "",
 
-  "_notifications": "Recipients for the scheduled briefing and the analytics alerts.",
-  "briefingRecipients": "",
+  "_notifications": "Recipients for the scheduled briefing and the analytics alerts, as AppInstanceUser ARNs, comma-separated. Each address is read from the person's identity provider at send time, so a person must have signed in once.",
+  "briefingRecipientArns": "",
   "briefingScheduleRate": "",
-  "alertRecipients": "",
+  "alertRecipientArns": "",
 
-  "_contextSourceAlerting": "Context source failure-rate alarm (needs enableAdminNotificationChannel; delivers to the admin conversation). Percentage of reads that must fail over 5 minutes before alerting, and the minimum attempts in that window before the percentage is trusted at all.",
+  "_contextSourceAlerting": "Context source failure-rate alarm (needs the admin capability, which creates the admin notification channel it delivers to). Percentage of reads that must fail over 5 minutes before alerting, and the minimum attempts in that window before the percentage is trusted at all.",
   "contextSourceAlertThresholdPercent": "",
   "contextSourceAlertMinAttempts": "",
+
+  "_spend": "THE LIMIT ON MODEL SPEND, and it is ON BY DEFAULT. Counts of dispatched model TURNS per rolling hour, counted in DynamoDB. EMPTY here means TAKE THE BUILT-IN DEFAULT, which is 500 global / 100 per user - chosen to bound a runaway rather than to ration ordinary use. An EXPLICIT 0 is how you turn a limit off, deliberately and visibly. It used to be the other way round: absent meant 0 meant no bound at all, and the flags were not even documented here, so a deployment following this file ran with nothing capping its Bedrock bill. Name your own numbers for anything real. bedrockGlobalHourlyBudget applies to EVERYONE including exempt admins, because it protects the account rather than a person, and it is also what wires the circuit-trip param that sheds load at the edge. bedrockUserHourlyBudget is per user and is the one an admin exemption skips. These count TURNS, so one message that triages in several passes costs several, and a full e2e sweep will exceed a small global limit - raise it for that run rather than leaving it raised. Note the count is turns, not tokens: 500 Haiku turns and 500 Opus turns are very different bills, so this bounds blast radius rather than dollars.",
+  "bedrockGlobalHourlyBudget": "",
+  "bedrockUserHourlyBudget": "",
+  "bedrockCircuitTripThreshold": "",
+
+  "_maxUserMessageLength": "Inbound characters accepted from one message; longer is truncated. Defaults to 16000 (~4k tokens), deliberately generous because report and extraction prompts are legitimately long. 0 disables the cap.",
+  "maxUserMessageLength": "",
 
   "_abuse": "Per-user hourly budget exemptions (these never exempt the global budget).",
   "abuseExemptAdmins": "",
   "abuseExemptAdminGroups": "",
-  "budgetCannedResponse": "",
-
-  "_misc": "isProduction gates production-only behaviour on the experiments stack.",
-  "isProduction": ""
+  "budgetCannedResponse": ""
 }

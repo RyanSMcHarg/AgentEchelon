@@ -17,11 +17,14 @@
  *   ContextSourceResolved   Outcome=resolved                        the value reached the prompt
  *   ContextSourceFailed     Outcome=denied|absent|timeout|error     it was selected and did not
  *   ContextSourceSkipped    Outcome=not-in-catalog|unavailable      it was never attempted
+ *                           Outcome=no-record                       a per-person source has no
+ *                                                                   record for this person yet
  *
  * `resolved` carries an Outcome dimension too, which is redundant on its own but keeps every metric in
  * this namespace the same shape - an operator writes one alarm expression, not three.
  */
 import { emitEmfMetric } from './emf-metrics.js';
+import { isAccessDenial } from './access-denial.js';
 
 export const CONTEXT_SOURCE_NAMESPACE = 'AgentEchelon/ContextSources';
 
@@ -36,14 +39,19 @@ export const CONTEXT_SOURCE_NAMESPACE = 'AgentEchelon/ContextSources';
 export type ContextSourceFailure = 'denied' | 'absent' | 'timeout' | 'error';
 
 /**
- * A source was never attempted.
+ * A source produced no value, for a reason that is not a failure.
  *
  * `not-in-catalog` the profile names a key this classification does not publish. Expected during a
  *                  removal, a standing defect otherwise - it recurs on EVERY turn.
  * `unavailable`    `availability` is unmet at this call site. Normal, and the reason it is measured is
  *                  that a source unavailable on every turn is a mislabelled source.
+ * `no-record`      the catalog declares the source `perPerson`, it was read, and the requesting person
+ *                  has no record in it yet. That is the normal state of everyone who has not completed
+ *                  onboarding, so it stays out of the failure rate; counted as `absent`, every turn by a
+ *                  new person reads as a broken source. A SHARED source that is not there remains
+ *                  `absent`, because a company document is expected to exist for everyone.
  */
-export type ContextSourceSkip = 'not-in-catalog' | 'unavailable';
+export type ContextSourceSkip = 'not-in-catalog' | 'unavailable' | 'no-record';
 
 export type ContextSourceOutcome = 'resolved' | ContextSourceFailure | ContextSourceSkip;
 
@@ -67,6 +75,7 @@ const METRIC_BY_OUTCOME: Record<ContextSourceOutcome, string> = {
   error: 'ContextSourceFailed',
   'not-in-catalog': 'ContextSourceSkipped',
   unavailable: 'ContextSourceSkipped',
+  'no-record': 'ContextSourceSkipped',
 };
 
 /**
@@ -102,7 +111,9 @@ export function classifyAccessError(err: unknown): ContextSourceFailure {
   const name = String(e?.name || e?.Code || '');
   const status = e?.$metadata?.httpStatusCode;
 
-  if (/AccessDenied|Unauthorized|Forbidden|NotAuthorized/i.test(name) || status === 403) return 'denied';
+  // The denial shapes live in `lib/access-denial.ts` so the router and this classifier cannot drift
+  // about what a refusal looks like (ADR-045).
+  if (isAccessDenial(err)) return 'denied';
   if (/NoSuchKey|NoSuchBucket|NotFound|ParameterNotFound|ResourceNotFound/i.test(name) || status === 404) {
     return 'absent';
   }

@@ -81,7 +81,7 @@ describe('the catalog is consulted, not just the field', () => {
     expect(() => validateAndSanitizeExperiment(
       exp([
         { variantId: 'control', modelKey: 'sonnet', weight: 50 },
-        { variantId: 'treatment', profileRef: { profileName: 'premium', version: 3 }, weight: 50 },
+        { variantId: 'treatment', profileRef: { profileName: 'advisor', version: 3 }, weight: 50 },
       ]),
       KEYS,
     )).not.toThrow();

@@ -3,9 +3,9 @@
  * Telemetry", Scope Revision decision 3; DESIGN-EXPERIMENTS-BATTLE §3.4 B3).
  *
  * Backing table `BattleOutcome` — PK battleId, ONE row per battle. The row
- * now holds a PER-USER `votes` map keyed by the chooser's Cognito sub:
+ * now holds a PER-USER `votes` map keyed by the chooser's person id (their AppInstanceUser id):
  *
- *   { battleId, schemaVersion: 2, votes: { <userSub>: { winner, chosenAt, ... } } }
+ *   { battleId, schemaVersion: 2, votes: { <personId>: { winner, chosenAt, ... } } }
  *
  * This closes the last-write-wins data loss of the original single-pick row: in
  * a multi-user channel each member's pick is retained (re-picking still
@@ -13,7 +13,7 @@
  * TALLY (majority of decisive A/B picks), not whoever clicked last. A
  * single-user battle is unchanged — one entry, that user's pick.
  *
- * Writes are per-key UpdateExpressions (`SET votes.<sub> = ...`), which are
+ * Writes are per-key UpdateExpressions (`SET votes.<personId> = ...`), which are
  * atomic on the nested path and never clobber a sibling user's vote, so two
  * members voting concurrently both persist. The map keeps the SAME PK
  * (battleId), so this is a purely ADDITIVE, item-level change — no table re-key,
@@ -21,7 +21,8 @@
  *
  * Versioned read: `extractPicks` tolerates a LEGACY v1 single-row outcome
  * (top-level `winner`/`chosenByUserSub`, no `votes` map) during cutover — it is
- * read as one pick keyed by its `chosenByUserSub`. A v2 votes map and a v1
+ * read as one pick keyed by its `chosenByUserSub`, a stored attribute name the analytics readers
+ * also read, so it keeps its spelling; it holds the voter's person id. A v2 votes map and a v1
  * top-level pick can even coexist on one row (a legacy row later voted into);
  * the votes map wins for a user present in both.
  *
@@ -41,10 +42,11 @@ import {
   UpdateCommand,
 } from '@aws-sdk/lib-dynamodb';
 import type { BattleOutcome } from './analytics-metadata.js';
+import { sessionDocumentClient } from './assistant-session.js';
 
 const BATTLE_OUTCOME_TABLE = process.env.BATTLE_OUTCOME_TABLE || '';
 
-const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
+const ddb = sessionDocumentClient({}, {
   marshallOptions: { removeUndefinedValues: true },
 });
 
@@ -55,7 +57,7 @@ export type BattleWinner = BattleOutcome['winner']; // 'A' | 'B' | 'tie'
 
 const VALID_WINNERS: ReadonlySet<BattleWinner> = new Set(['A', 'B', 'tie']);
 
-/** One user's stored pick inside the per-battle `votes` map (no userSub — that's the key). */
+/** One user's stored pick inside the per-battle `votes` map (no person id: that is the key). */
 export interface BattleVote {
   winner: BattleWinner;
   chosenAt: string; // ISO, server-stamped
@@ -66,9 +68,9 @@ export interface BattleVote {
   intent?: string;
 }
 
-/** A per-user pick with its userSub attached — the read-side shape. */
+/** A per-user pick with its voter's person id attached: the read-side shape. */
 export interface PerUserPick extends BattleVote {
-  userSub: string;
+  personId: string;
 }
 
 /**
@@ -90,7 +92,7 @@ export interface BattleTally {
 export interface RecordBattleOutcomeArgs {
   battleId: string;
   winner: BattleWinner;
-  chosenByUserSub: string;
+  chosenByPersonId: string;
   // P4 config attribution — the config fingerprints of the two sides that fought. Optional: the pick
   // still records without them (fail-open), but supplying them makes the outcome sliceable by config.
   controlConfigId?: string;
@@ -144,26 +146,26 @@ function extractPicks(item: Record<string, unknown> | null | undefined): PerUser
 
   const votes = item.votes as Record<string, Record<string, unknown>> | undefined;
   if (votes && typeof votes === 'object') {
-    for (const [userSub, raw] of Object.entries(votes)) {
+    for (const [personId, raw] of Object.entries(votes)) {
       const winner = raw?.winner as BattleWinner | undefined;
-      if (!userSub || !winner || !VALID_WINNERS.has(winner)) continue;
+      if (!personId || !winner || !VALID_WINNERS.has(winner)) continue;
       picks.push({
-        userSub,
+        personId,
         winner,
         chosenAt: typeof raw.chosenAt === 'string' ? raw.chosenAt : '',
         ...pickExtras(raw),
       });
-      seen.add(userSub);
+      seen.add(personId);
     }
   }
 
   // Legacy v1 single-row pick, tolerated during cutover. Keyed by its
   // chosenByUserSub; skipped if that user already has an entry in the votes map.
   const legacyWinner = item.winner as BattleWinner | undefined;
-  const legacySub = typeof item.chosenByUserSub === 'string' ? item.chosenByUserSub : undefined;
-  if (legacyWinner && VALID_WINNERS.has(legacyWinner) && legacySub && !seen.has(legacySub)) {
+  const legacyVoter = typeof item.chosenByUserSub === 'string' ? item.chosenByUserSub : undefined;
+  if (legacyWinner && VALID_WINNERS.has(legacyWinner) && legacyVoter && !seen.has(legacyVoter)) {
     picks.push({
-      userSub: legacySub,
+      personId: legacyVoter,
       winner: legacyWinner,
       chosenAt: typeof item.chosenAt === 'string' ? item.chosenAt : '',
       ...pickExtras(item),
@@ -180,7 +182,7 @@ function extractPicks(item: Record<string, unknown> | null | undefined): PerUser
  * (bad winner / missing ids — logged, not thrown) or the store is unavailable
  * (fail-open).
  *
- * Per-user: the write sets `votes.<userSub>`, so a re-pick overwrites only that
+ * Per-user: the write sets `votes.<personId>`, so a re-pick overwrites only that
  * user's entry and a different user's pick is retained (no cross-user
  * last-write-wins). Two round-trips — one idempotent init that ensures the
  * `votes` map exists (concurrency-safe via `if_not_exists`), then the per-user
@@ -190,12 +192,12 @@ export async function recordBattleOutcome(
   args: RecordBattleOutcomeArgs,
 ): Promise<BattleOutcome | null> {
   const battleId = (args.battleId || '').trim();
-  const chosenByUserSub = (args.chosenByUserSub || '').trim();
+  const chosenByPersonId = (args.chosenByPersonId || '').trim();
 
-  if (!battleId || !chosenByUserSub || !VALID_WINNERS.has(args.winner)) {
+  if (!battleId || !chosenByPersonId || !VALID_WINNERS.has(args.winner)) {
     console.warn('[battle-outcome] recordBattleOutcome rejected invalid input', {
       hasBattleId: !!battleId,
-      hasUserSub: !!chosenByUserSub,
+      hasPersonId: !!chosenByPersonId,
       winner: args.winner,
     });
     return null;
@@ -244,7 +246,7 @@ export async function recordBattleOutcome(
         TableName: BATTLE_OUTCOME_TABLE,
         Key: { battleId },
         UpdateExpression: 'SET votes.#u = :vote, lastChosenAt = :now',
-        ExpressionAttributeNames: { '#u': chosenByUserSub },
+        ExpressionAttributeNames: { '#u': chosenByPersonId },
         ExpressionAttributeValues: { ':vote': vote, ':now': chosenAt },
       }),
     );
@@ -258,7 +260,7 @@ export async function recordBattleOutcome(
   return {
     battleId,
     winner: vote.winner,
-    chosenByUserSub,
+    chosenByPersonId,
     chosenAt,
     ...(vote.controlConfigId && { controlConfigId: vote.controlConfigId }),
     ...(vote.treatmentConfigId && { treatmentConfigId: vote.treatmentConfigId }),
@@ -299,12 +301,12 @@ export async function readBattleOutcomes(battleId: string): Promise<BattleTally 
 /** Read a single user's own pick for a battle (the scorecard "you picked" state), or null. */
 export async function readUserBattleOutcome(
   battleId: string,
-  userSub: string,
+  personId: string,
 ): Promise<PerUserPick | null> {
-  const sub = (userSub || '').trim();
-  if (!sub) return null;
+  const voter = (personId || '').trim();
+  if (!voter) return null;
   const item = await readOutcomeItem(battleId);
-  return extractPicks(item).find((p) => p.userSub === sub) ?? null;
+  return extractPicks(item).find((p) => p.personId === voter) ?? null;
 }
 
 /**

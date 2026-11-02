@@ -22,7 +22,7 @@ import {
   readerRoleFor,
   scopeFunctionSql,
 } from '../../lambda/src/analytics-aurora/classification-boundary-sql';
-import { ProfileRegistry } from '../../lib/profile-registry';
+import { ProfileRegistry, defaultProfileRegistry } from '../../lib/profile-registry';
 import { DEFAULT_PROFILES_CONFIG } from '../../lib/config/profiles';
 
 const all = (registry?: ProfileRegistry) => boundaryStatements(registry).join('\n\n');
@@ -72,14 +72,21 @@ describe('classification boundary — the generated SQL', () => {
     expect(scopeFunctionSql()).toContain('ELSE ARRAY[]::text[]');
   });
 
-  it('gives each reader exactly its scopeAtOrBelow ladder, and no more', () => {
+  it('gives each reader exactly its grant set, and no more', () => {
     const registry = new ProfileRegistry(DEFAULT_PROFILES_CONFIG);
     const sql = scopeFunctionSql(registry);
     // basic reads only basic; premium reads the union. Asserted against the registry rather than a
     // hardcoded list, so a deployment that reorders or renames its ladder moves this with it.
     expect(sql).toContain("WHEN 'ae_reader_basic' THEN ARRAY['basic']::text[]");
     expect(sql).toContain("WHEN 'ae_reader_standard' THEN ARRAY['basic', 'standard']::text[]");
+    // SPELLED OUT RATHER THAN DERIVED, deliberately: this is a READ boundary, and a classification
+    // added to or removed from the registry SHOULD make somebody re-read which rows each reader can
+    // see. `probe` was removed on 2026-09-17, and updating these two lines is exactly the re-reading
+    // this case exists to force - the other guards in this tree were switched to derive from the
+    // registry for the same change, and this one is left literal on purpose.
     expect(sql).toContain("WHEN 'ae_reader_premium' THEN ARRAY['basic', 'standard', 'premium']::text[]");
+    // And nothing grants a reader a classification the deployment no longer declares.
+    expect(sql).not.toContain("ae_reader_probe");
   });
 
   it('follows a renamed or extended classification ladder from config alone', () => {
@@ -88,13 +95,14 @@ describe('classification boundary — the generated SQL', () => {
     // a hardcoded role list here would reintroduce that drift on the read path.
     const registry = new ProfileRegistry({
       ...DEFAULT_PROFILES_CONFIG,
+      // Its own classifications, so none of the default's membership groups (ops requires premium) applies.
+      membershipGroups: {},
       classifications: [
-        { value: 'public', rank: 1, profile: 'basic' },
-        { value: 'internal', rank: 2, profile: 'standard' },
-        { value: 'secret', rank: 3, profile: 'premium' },
-        { value: 'topsecret', rank: 4, profile: 'premium' },
+        { value: 'public', profile: 'concierge', grants: ['public'] },
+        { value: 'internal', profile: 'analyst', grants: ['public', 'internal'] },
+        { value: 'secret', profile: 'advisor', grants: ['public', 'internal', 'secret'] },
+        { value: 'topsecret', profile: 'advisor', grants: ['public', 'internal', 'secret', 'topsecret'] },
       ],
-      failClosedTo: 'public',
       groupClearance: { 'ae-public': 'public' },
     });
     const sql = all(registry);
@@ -115,8 +123,15 @@ describe('classification boundary — the generated SQL', () => {
     expect(() => readerRoleFor(null as unknown as string)).toThrow();
     expect(() => readerRoleFor('undefined')).toThrow(/not a classification this deployment declares/);
     expect(() => readerRoleFor('null')).toThrow();
-    // ...and the error names what IS declared, so the reader is not left guessing.
-    expect(() => readerRoleFor('undefined')).toThrow(/basic, standard, premium/);
+    // ...and the error names what IS declared, so the reader is not left guessing. DERIVED, because
+    // the property under test is "the message lists the real set", not which classifications a
+    // deployment happens to declare - a literal here fails on any registry change while the message
+    // is still correct.
+    // Through `classificationValues()`, which is the accessor the message itself uses, so the two
+    // agree on ORDER as well as membership. Reading the raw config array instead would pass today and
+    // fail the moment a deployment declares a classification out of rank order.
+    const declared = new ProfileRegistry(DEFAULT_PROFILES_CONFIG).classificationValues().join(', ');
+    expect(() => readerRoleFor('undefined')).toThrow(declared);
   });
 
   it('refuses to build a role name from a classification value that is not a safe identifier', () => {
@@ -176,9 +191,22 @@ describe('classification boundary — the generated SQL', () => {
       // re-runs on every cold start, so the stamp converges; the rows it has not reached are NULL,
       // which is stricter than the value it is about to write.
       expect(statements[update]).toMatch(/LIMIT \d+\);$/);
-      // Fail-closed direction: the TOP of the ladder, never the bottom. Stamping 'basic' here would
+      // FAIL-CLOSED DIRECTION: UP the ladder, never the bottom. Stamping the floor here would
       // publish every pre-existing summary to every classification in one statement.
-      expect(statements[update]).toContain(`'${DEFAULT_PROFILES_CONFIG.classifications.slice(-1)[0].value}'`);
+      //
+      // But it stops at the last classification a conversation is SERVED at. This asserted the last
+      // DECLARED classification, which became the admin plane - a value no user conversation runs at
+      // - so this one statement would have made the entire pre-classification corpus unreadable
+      // everywhere at once. The widest blast radius in the system, for a value chosen only because
+      // nothing better was known. FROM THE REGISTRY rather than recomputed: this used to reduce over
+      // `rank` to find the highest ordinary classification, which is a definition the registry no
+      // longer has.
+      const conversational = DEFAULT_PROFILES_CONFIG.classifications.filter((c) => !c.adminPlane);
+      const stamp = defaultProfileRegistry.failClosedContentValue;
+      expect(statements[update]).toContain(`'${stamp}'`);
+      // Non-vacuous: the stamp must not be the most widely reachable one, or it withholds nothing.
+      expect(conversational.length).toBeGreaterThan(1);
+      expect(defaultProfileRegistry.grantsFor(stamp)).toContain(stamp);
       // Between the role assumption and its reset. By this point FORCE RLS is on and the owner has
       // no write policy, so an unroled UPDATE would report success having changed nothing.
       expect(update).toBeGreaterThan(setRole);

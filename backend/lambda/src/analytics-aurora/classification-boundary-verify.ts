@@ -31,7 +31,7 @@
 import { query, transaction } from './db-client.js';
 import { withReaderRole, withWriterRole } from './classification-boundary.js';
 import { readerRoleFor, BOUNDED_TABLES, WRITER_ROLE } from './classification-boundary-sql.js';
-import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
 
 export interface BoundaryCheck {
   name: string;
@@ -154,9 +154,14 @@ async function diagnoseOwnerBypass(): Promise<string> {
 }
 
 export async function verifyClassificationBoundary(): Promise<VerifyBoundaryResult> {
-  const classifications = profiles.classificationValues();
+  // THE ADMIN PLANE IS NOT PART OF THIS PROOF: it grants itself alone and no member classification reaches it,
+  // so no reader contains it beside the others (its own reader role reads its own rows only).
+  const plane = new Set(profiles.adminPlaneValues());
+  const classifications = profiles.classificationValues().filter((v) => !plane.has(v));
   const lowest = classifications[0];
-  const highest = profiles.mostRestrictiveValue;
+  // The classification whose reach contains every other. On a ladder that is the top one; between
+  // peers there may be none, and the proof below then has nothing to assert against.
+  const highest = profiles.widestReachingValue;
   const probeSourceId = `boundary-probe://${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
   const checks: BoundaryCheck[] = [];
 
@@ -166,9 +171,29 @@ export async function verifyClassificationBoundary(): Promise<VerifyBoundaryResu
       classifications,
       probeSourceId,
       checks: [{
-        name: 'ladder-has-two-rungs',
+        name: 'at-least-two-classifications',
         passed: false,
         detail: `only ${classifications.length} classification declared; there is no boundary to verify.`,
+      }],
+    };
+  }
+
+  // THIS PROOF NEEDS A CLASSIFICATION THAT REACHES EVERY OTHER, and a peer taxonomy may not have
+  // one. It asserts that the widest reader sees a narrower reader's content and that the narrow one
+  // does not see the wide one's - which presupposes containment. Between `legal` and `finance` there
+  // is no containment to assert, so the honest answer is that this proof does not apply rather than
+  // a pass nobody should read as reassurance.
+  if (!highest) {
+    return {
+      ok: false,
+      classifications,
+      probeSourceId,
+      checks: [{
+        name: 'a-classification-reaches-every-other',
+        passed: false,
+        detail: 'no declared classification grants every other, so containment cannot be asserted. '
+          + 'This deployment\'s classifications are peers; the per-pair reach is what to verify here, '
+          + 'and this check does not yet do that.',
       }],
     };
   }
@@ -311,6 +336,61 @@ export async function verifyClassificationBoundary(): Promise<VerifyBoundaryResu
         + `then as ${readerRoleFor(lowest)} saw ${leak.second} (want 1)`,
     });
 
+    // ---- 5. THE GOLDEN SET (SPEC-EVALUATION Appendix C1) ------------------------------------------
+    // The same boundary on the set a draft version's gate reads: one probe entry per classification,
+    // written as the write role, and the narrowest reader must not see the widest one's entry while the
+    // widest sees it. Marked by its nominator so cleanup cannot touch a real entry.
+    await withWriterRole(async (client) => {
+      for (const classification of classifications) {
+        await client.query(
+          `INSERT INTO golden_set_entries (classification, purpose, request_text, nominated_by)
+           VALUES ($1, 'regression', $2, $3)`,
+          [classification, `boundary probe for ${classification}`, probeSourceId],
+        );
+      }
+    });
+    const goldenLowSeesHigh = await withReaderRole(lowest, (client) => client.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM golden_set_entries WHERE nominated_by = $1 AND classification = $2`,
+      [probeSourceId, highest],
+    ));
+    const goldenHighSeesHigh = await withReaderRole(highest, (client) => client.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM golden_set_entries WHERE nominated_by = $1 AND classification = $2`,
+      [probeSourceId, highest],
+    ));
+    checks.push({
+      name: 'golden:low-reader-cannot-see-high-entry',
+      passed: Number(goldenLowSeesHigh.rows[0]?.n ?? -1) === 0 && Number(goldenHighSeesHigh.rows[0]?.n ?? 0) === 1,
+      detail: `${readerRoleFor(lowest)} saw ${goldenLowSeesHigh.rows[0]?.n} golden entr(ies) classified '${highest}' (want 0); `
+        + `${readerRoleFor(highest)} saw ${goldenHighSeesHigh.rows[0]?.n} (want 1)`,
+    });
+
+    // ---- 6. A DRAFT'S RUN AGAINST THE SET (ADR-065) -----------------------------------------------
+    // The run record holds answers generated from the set, so the same boundary holds on it: one probe run per
+    // classification, and the narrowest reader must not see the widest one's while the widest sees it.
+    await withWriterRole(async (client) => {
+      for (const classification of classifications) {
+        await client.query(
+          `INSERT INTO golden_runs (id, classification, assistant, draft_config_id, k, status, started_by)
+           VALUES (uuid_generate_v4(), $1, 'boundary-probe', 'probe', 1, 'complete', $2)`,
+          [classification, probeSourceId],
+        );
+      }
+    });
+    const runLowSeesHigh = await withReaderRole(lowest, (client) => client.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM golden_runs WHERE started_by = $1 AND classification = $2`,
+      [probeSourceId, highest],
+    ));
+    const runHighSeesHigh = await withReaderRole(highest, (client) => client.query<{ n: string }>(
+      `SELECT COUNT(*)::text AS n FROM golden_runs WHERE started_by = $1 AND classification = $2`,
+      [probeSourceId, highest],
+    ));
+    checks.push({
+      name: 'golden:low-reader-cannot-see-high-run',
+      passed: Number(runLowSeesHigh.rows[0]?.n ?? -1) === 0 && Number(runHighSeesHigh.rows[0]?.n ?? 0) === 1,
+      detail: `${readerRoleFor(lowest)} saw ${runLowSeesHigh.rows[0]?.n} golden run(s) classified '${highest}' (want 0); `
+        + `${readerRoleFor(highest)} saw ${runHighSeesHigh.rows[0]?.n} (want 1)`,
+    });
+
     return { ok: checks.every((c) => c.passed), checks, classifications, probeSourceId };
   } finally {
     // Always, including after a thrown assertion — a failed verification must not leave probe rows
@@ -322,6 +402,19 @@ export async function verifyClassificationBoundary(): Promise<VerifyBoundaryResu
       ));
     } catch (err) {
       console.error('[classification-boundary-verify] PROBE CLEANUP FAILED — remove by hand:', probeSourceId, err);
+    }
+    try {
+      await withWriterRole((client) => client.query(
+        `DELETE FROM golden_set_entries WHERE nominated_by = $1`,
+        [probeSourceId],
+      ));
+    } catch (err) {
+      console.error('[classification-boundary-verify] GOLDEN PROBE CLEANUP FAILED — remove by hand:', probeSourceId, err);
+    }
+    try {
+      await withWriterRole((client) => client.query(`DELETE FROM golden_runs WHERE started_by = $1`, [probeSourceId]));
+    } catch (err) {
+      console.error('[classification-boundary-verify] GOLDEN RUN PROBE CLEANUP FAILED - remove by hand:', probeSourceId, err);
     }
   }
 }

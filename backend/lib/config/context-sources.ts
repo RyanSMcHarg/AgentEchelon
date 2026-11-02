@@ -21,6 +21,10 @@
  * without its grant fails at runtime, which is a failure that fails OPEN.
  */
 
+import { TRUST_ORDER, entryFenceTrust } from './context-source-trust';
+
+export { entryFenceTrust, fieldTrust, lowerTrust } from './context-source-trust';
+
 /**
  * How the resolver reads a source. An ARN implies the service, never the access pattern.
  *
@@ -83,6 +87,13 @@ export interface ContextSourceField {
    * role, not their role in this conversation".
    */
   description: string;
+  /**
+   * This field's own trust, when it is lower than the entry's (ADR-060 decision 2): an onboarding answer is text the
+   * person wrote, whatever store holds it. It may only LOWER the entry's trust, never raise it, and it is what the
+   * field's variable `ctx:<key>.<field>` decides by. The prompt fences the entry at its lowest trust
+   * (`entryFenceTrust`), so a member-written field is never inside a fence labelled platform.
+   */
+  trust?: ContextSourceTrust;
 }
 
 /** One selectable context source. */
@@ -113,6 +124,17 @@ export interface ContextSourceEntry {
   locator: string;
   /** `s3-prefix` only: the key prefix within the bucket this entry exposes. Published, and READ. */
   prefix?: string;
+  /**
+   * The source holds one record PER PERSON, keyed by the requesting person, rather than one value
+   * shared by everyone in the classification.
+   *
+   * It decides what a missing record means. For a shared source (a company document, a parameter) a
+   * missing value is a configuration or content gap and counts as a failure. For a per-person source it
+   * is the normal state of a person who has no record yet, and is counted as the `no-record` skip so it
+   * stays out of the failure-rate alarm. Declared rather than inferred from the key or the type: a
+   * deployment that swaps the built-in store for its own `lambda-service` keeps the same meaning.
+   */
+  perPerson?: boolean;
   trust: ContextSourceTrust;
   availability: ContextSourceAvailability;
   /** Cap on the resolved value, so one source cannot push the persona out of the prompt. */
@@ -120,6 +142,12 @@ export interface ContextSourceEntry {
   fields: Record<string, ContextSourceField>;
   /** Reserved keys only: bumped major when a field is removed or retyped. Import checks the major. */
   contractVersion?: string;
+  /**
+   * False when the source holds no fact about a person, so its fields may reach a message the whole room
+   * reads (ADR-060 decision 7). Absent means it describes a person, the safe reading: such a value reaches
+   * only a message addressed to that person. Each field becomes the variable source `ctx:<key>.<field>`.
+   */
+  describesPerson?: boolean;
 }
 
 /** Deployment-defined keys carry this prefix; everything else must match a reserved contract. */
@@ -184,11 +212,20 @@ export function validateContextSourceCatalog(entries: ContextSourceEntry[]): Cat
       errors.push({ key, problem: "type 's3-prefix' requires a prefix" });
     }
     if (!(e.maxBytes > 0)) errors.push({ key, problem: 'maxBytes must be a positive number' });
+    if (e.describesPerson !== undefined && typeof e.describesPerson !== 'boolean') {
+      errors.push({ key, problem: 'describesPerson is true or false' });
+    }
 
     const fieldNames = Object.keys(e.fields || {});
     if (fieldNames.length === 0) errors.push({ key, problem: 'at least one field is required' });
     for (const [name, f] of Object.entries(e.fields || {})) {
       if (!f.description?.trim()) errors.push({ key, problem: `field '${name}' needs a description` });
+      if (f.trust !== undefined) {
+        if (!TRUST_ORDER.includes(f.trust)) errors.push({ key, problem: `field '${name}' trust is platform, operator or member` });
+        else if (TRUST_ORDER.indexOf(f.trust) > TRUST_ORDER.indexOf(e.trust)) {
+          errors.push({ key, problem: `field '${name}' declares ${f.trust} trust, above its entry's ${e.trust}; a field may only lower it` });
+        }
+      }
     }
 
     const reserved = RESERVED_CONTRACTS[key];
@@ -265,7 +302,7 @@ export function contextSourceGrant(entry: ContextSourceEntry): ContextSourceGran
  * Stripping them was a misapplied rule. The no-instance-identifiers constraint exists because a profile
  * MANIFEST travels between deployments; this parameter never leaves its own deployment. The cost of the
  * mistake was concrete: with no prefix to read, the S3 reader hardcoded `context/{classification}/`, so
- * the resource the IAM grant authorised and the resource actually read could name different locations.
+ * the resource the IAM grant authorized and the resource actually read could name different locations.
  * Publishing a locator grants nothing - IAM remains the gate, and a catalog naming a resource the role
  * cannot read fails closed.
  */
@@ -325,7 +362,7 @@ export function loadContextSourceCatalog(
    * A test cannot exercise the absent-versus-broken branch by writing a real
    * `context-sources.local.ts`: module resolution is cached per worker in both directions, and the
    * file lives on a path other test FILES read concurrently, so a filesystem-based test both lies to
-   * itself and breaks its neighbours.
+   * itself and breaks its neighbors.
    */
   modules: {
     resolve?: (mod: string) => unknown;
@@ -378,14 +415,14 @@ export function loadContextSourceCatalog(
  * `_digest.json` files are built from.
  */
 export function renderCatalogReference(entries: ContextSourceEntry[]): string {
-  const field = (name: string, f: ContextSourceField) =>
-    `\`${name}${f.optional ? '?' : ''}\` (${f.description})`;
+  const field = (name: string, f: ContextSourceField, e: ContextSourceEntry) =>
+    `\`${name}${f.optional ? '?' : ''}\` (${f.description}${f.trust && f.trust !== e.trust ? `; ${f.trust} trust` : ''})`;
 
   const rows = entries.map((e) => {
-    const fields = Object.entries(e.fields).map(([n, f]) => field(n, f)).join(', ');
+    const fields = Object.entries(e.fields).map(([n, f]) => field(n, f, e)).join(', ');
     const reserved = RESERVED_CONTRACTS[e.key] ? 'reserved' : 'deployment-defined';
     return `| \`${e.key}\` | **${e.title}** - ${e.description} | ${e.useWhen} | ${fields} `
-      + `| ${e.availability} | ${e.trust} | ${reserved} |`;
+      + `| ${e.availability} | ${entryFenceTrust(e)} | ${reserved} |`;
   });
 
   return [

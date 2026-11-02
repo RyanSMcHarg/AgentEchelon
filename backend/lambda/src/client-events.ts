@@ -4,8 +4,8 @@
  * Receives batched client-side events from the frontend
  * `eventTrackingService.ts` and forwards them to Kinesis Firehose for
  * delivery to S3 (Athena-queryable). One Firehose record per accepted
- * event. Cognito-authed via API Gateway; the user identity is stamped
- * from the authorizer claims so the payload cannot impersonate.
+ * event. Cognito-authed via API Gateway; the person is stamped from
+ * the one resolver (`callerPersonId`) so the payload cannot impersonate.
  *
  * Request shape (matches eventTrackingService.sendPayload):
  *   {
@@ -20,60 +20,58 @@
  *
  * Design notes:
  *   - Accepts a batched payload and puts to Firehose so it works in Athena mode (the default).
- *   - Events all originate post-auth, so this Lambda hard-requires Cognito claims
- *     (`event.requestContext.authorizer.claims`) and pulls userId / clearance from there.
+ *   - Events all originate post-auth, so this Lambda hard-requires a resolved person: the person comes
+ *     from `callerPersonId` (the one resolver), never from the authorizer claims, and the clearance from
+ *     the verified token's groups.
  *   - Allow-list is the relevant event slice.
  */
 
-import {
-  FirehoseClient,
-  PutRecordBatchCommand,
-  type _Record,
-} from '@aws-sdk/client-firehose';
 import type { APIGatewayProxyEvent, APIGatewayProxyResult } from 'aws-lambda';
-import { VALID_EVENT_TYPES as VALID_EVENT_TYPE_LIST } from './lib/client-event-types.js';
-// Aurora-mode delivery: in Aurora mode there is no client-events Firehose, so
-// write straight to Aurora `client_events` via the VPC data-plane Lambda (#A).
-import { hasDataPlane, ingestClientEvents } from './lib/data-plane-client.js';
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import {
+  VALID_EVENT_TYPES as VALID_EVENT_TYPE_LIST,
+  VALID_PERF_METRICS as VALID_PERF_METRIC_LIST,
+  PERF_METRIC_PROPERTIES,
+  PERF_VALUE_MAX,
+  type ClientPerfMetric,
+} from './lib/client-event-types.js';
+import { callerHolderToken, callerPersonId } from './lib/auth.js';
+// Delivery: Aurora `client_events` through the data plane in Aurora mode, else the Firehose (lib/event-archive.ts).
+import { deliverToArchive, MAX_RECORD_BYTES, type ArchiveRecord } from './lib/event-archive.js';
+import { responder } from './lib/http-response.js';
+import { loadProfileRegistry } from '../../lib/profile-registry';
 
-const firehose = new FirehoseClient({});
-const ssm = new SSMClient({});
-
-const DELIVERY_STREAM = process.env.CLIENT_EVENTS_DELIVERY_STREAM || '';
 const ALLOWED_ORIGIN = process.env.ALLOWED_ORIGIN || 'http://localhost:5173';
 
-// Resolve the Aurora data-plane ARN once (cold start) from SSM — same decoupling
-// as admin-conversations (a direct CDK prop would be circular). When present we
-// deliver to Aurora; otherwise fall back to the Firehose (Athena mode).
-let dataPlaneResolved = false;
-async function ensureDataPlaneArn(): Promise<void> {
-  if (dataPlaneResolved || process.env.AURORA_DATA_PLANE_ARN) { dataPlaneResolved = true; return; }
-  const paramName = process.env.AURORA_DATA_PLANE_ARN_PARAM;
-  if (!paramName) { dataPlaneResolved = true; return; }
-  try {
-    const r = await ssm.send(new GetParameterCommand({ Name: paramName }));
-    if (r.Parameter?.Value) process.env.AURORA_DATA_PLANE_ARN = r.Parameter.Value;
-  } catch { /* absent (Athena mode) → Firehose path */ }
-  dataPlaneResolved = true;
-}
-
 // Allow-list mirrors EventName in frontend/src/services/eventTrackingService.ts
-// and the Glue projection enum in analytics-stack.ts (single source of truth
+// and the Glue projection enum in archive-stack.ts (single source of truth
 // in lib/client-event-types.ts — audit M7). Anything outside is rejected per
 // event so the event_type Glue partition key cannot be polluted by typos
 // or a hostile client.
 const VALID_EVENT_TYPES = new Set<string>(VALID_EVENT_TYPE_LIST);
 
-// Performance metric names are not allow-listed (web_vital_*, arbitrary timer
-// labels). They land in a separate `client_perf` prefix and the metric column
-// is stored as a free-form string.
+// Performance metric names ARE allow-listed, from the same module. A timing's
+// name becomes its row's event_type and the page-load panel's GROUP BY key, and
+// `client_ttff_ms` is joined to the server's TTFF for the same turn - so a free
+// -form name let any signed-in client mint rows under any name, or post TTFF
+// rows of its choosing. Each metric also declares the properties it may carry
+// (PERF_METRIC_PROPERTIES); anything else is dropped and counted.
+const VALID_PERF_METRICS = new Set<string>(VALID_PERF_METRIC_LIST);
+
+/**
+ * Why a record was rejected or a property dropped. Counted per request and logged, so a client that
+ * sends the wrong thing is visible as a reason rather than as a quietly smaller number.
+ */
+type RejectReason =
+  | 'unknown_event_type'
+  | 'unknown_perf_metric'
+  | 'perf_value_not_finite'
+  | 'perf_value_out_of_range'
+  | 'perf_property_dropped';
 
 // Per-batch caps. Firehose PutRecordBatch is hard-capped at 500 records and
 // 4 MiB; we keep well below to leave room for the wrapper.
 const MAX_EVENTS_PER_REQUEST = 200;
 const MAX_PERF_PER_REQUEST = 200;
-const MAX_RECORD_BYTES = 100 * 1024; // 100 KiB per record (well under Firehose's 1 MiB limit)
 
 interface IncomingEvent {
   name?: unknown;
@@ -99,19 +97,15 @@ interface IncomingPerf {
   value?: unknown;
   timestamp?: unknown;
   sessionId?: unknown;
+  /** Correlating context, e.g. the turn a client-side timing belongs to (G5). Same shape and same
+   *  sanitising as an event's properties - a timing is not a different kind of untrusted input. */
+  properties?: unknown;
 }
 
-function corsHeaders(): Record<string, string> {
-  return {
-    'Content-Type': 'application/json',
-    'Access-Control-Allow-Origin': ALLOWED_ORIGIN,
-    'Access-Control-Allow-Headers': 'Content-Type,Authorization',
-    'Access-Control-Allow-Methods': 'POST,OPTIONS',
-  };
-}
+const http = responder({ origin: { fixed: ALLOWED_ORIGIN }, methods: 'POST,OPTIONS' });
 
 function respond(statusCode: number, body: unknown): APIGatewayProxyResult {
-  return { statusCode, headers: corsHeaders(), body: JSON.stringify(body) };
+  return http.respond(statusCode, body);
 }
 
 function isIsoTimestamp(s: unknown): s is string {
@@ -129,62 +123,92 @@ function partitionDateParts(iso: string): { year: string; month: string; day: st
   };
 }
 
-interface AuthorizedClaims {
-  userId: string;
-  email: string | null;
+interface CallerFacts {
+  personId: string;
   clearance: string;
 }
 
-function extractClaims(event: APIGatewayProxyEvent): AuthorizedClaims | null {
-  const claims = event.requestContext?.authorizer?.claims as Record<string, string> | undefined;
-  if (!claims) return null;
-  const userId = claims.sub || claims['cognito:username'];
-  if (!userId) return null;
-  // Group claim shape varies: 'cognito:groups' is a comma-separated string in
-  // the JWT or a JSON array when the authorizer rehydrates it. Pick the most
-  // privileged clearance the user holds; default to unknown.
-  const rawGroups = claims['cognito:groups'];
-  let groups: string[] = [];
-  if (Array.isArray(rawGroups)) {
-    groups = rawGroups as unknown as string[];
-  } else if (typeof rawGroups === 'string') {
-    groups = rawGroups.split(',').map((g) => g.trim()).filter(Boolean);
-  }
-  const classificationOrder = ['admins', 'premium', 'standard', 'basic'];
-  const clearance = classificationOrder.find((t) => groups.includes(t)) || 'unknown';
-  return { userId, email: claims.email ?? null, clearance };
+/**
+ * THE CLEARANCE IS THE REGISTRY'S HOLDER TOKEN, and the group parsing is the shared one.
+ *
+ * This carried its own `['admins', 'premium', 'standard', 'basic']` and took the first entry the
+ * caller's groups contained, a second copy of the list `lib/auth.ts` held. Both are gone: a
+ * classification is a declared set of grants rather than a level (ADR-046), so the question is which
+ * declared classification means exactly what this person holds, which is `resolveHolderToken`.
+ *
+ * THE PERSON AND THE CLASSIFICATION COME FROM THE EDGE AUTHORIZER'S CONTEXT (`callerHolderToken`), through
+ * the caller's issuer's clearance source and the classifications it may grant, so an event from any issuer's person is keyed
+ * by their AppInstanceUser and stamped with what their issuer clears them for.
+ *
+ * `unknown` survives as the recorded value for a person no declared classification covers, because it
+ * is a persisted analytics dimension that existing rows and queries already use; it is written where
+ * the resolver answers nothing, not chosen as a classification.
+ */
+async function callerFacts(event: APIGatewayProxyEvent): Promise<CallerFacts | null> {
+  const personId = await callerPersonId(event);
+  if (!personId) return null;
+  return {
+    personId,
+    clearance: callerHolderToken(event) || 'unknown',
+  };
 }
 
-interface NormalizedEvent {
-  record_type: 'event' | 'performance';
-  event_type: string;
-  user_id: string;
-  user_email: string | null;
-  user_tier: string;
-  session_id: string | null;
-  timestamp: string;
-  properties: Record<string, string | number | boolean> | null;
-  perf_value: number | null;
-}
+type NormalizedEvent = ArchiveRecord;
 
 interface NormalizeResult {
   records: { partitionKey: string; payload: NormalizedEvent }[];
+  /** Records refused outright. A dropped property does not count here: its timing was kept. */
   rejected: number;
+  /** Every refusal and every dropped property, by reason. */
+  reasons: Partial<Record<RejectReason, number>>;
+}
+
+/**
+ * The declared properties of one timing, and only those.
+ *
+ * A key the metric does not declare, or a value that fails its rule, is dropped and counted; the timing
+ * itself is kept, because a real measurement with a malformed tag is still a real measurement. Returns
+ * null when nothing survives, so a record never carries an empty object that reads as "correlated".
+ */
+function sanitizePerfProperties(
+  metric: ClientPerfMetric,
+  raw: unknown,
+  count: (reason: RejectReason) => void,
+): Record<string, string> | null {
+  if (raw === undefined || raw === null) return null;
+  if (typeof raw !== 'object' || Array.isArray(raw)) {
+    count('perf_property_dropped');
+    return null;
+  }
+  const rules = PERF_METRIC_PROPERTIES[metric];
+  const out: Record<string, string> = {};
+  for (const [key, value] of Object.entries(raw as Record<string, unknown>)) {
+    const rule = Object.prototype.hasOwnProperty.call(rules, key) ? rules[key] : undefined;
+    if (!rule || typeof value !== rule.type || !rule.pattern.test(value as string)) {
+      count('perf_property_dropped');
+      continue;
+    }
+    out[key] = value as string;
+  }
+  return Object.keys(out).length > 0 ? out : null;
 }
 
 function normalize(
   body: { events?: unknown; performance?: unknown },
-  claims: AuthorizedClaims,
+  caller: CallerFacts,
 ): NormalizeResult {
   const records: { partitionKey: string; payload: NormalizedEvent }[] = [];
   let rejected = 0;
+  const reasons: NormalizeResult['reasons'] = {};
+  const count = (reason: RejectReason) => { reasons[reason] = (reasons[reason] ?? 0) + 1; };
+  const reject = (reason: RejectReason) => { rejected++; count(reason); };
 
   const rawEvents = Array.isArray(body.events)
     ? (body.events as IncomingEvent[]).slice(0, MAX_EVENTS_PER_REQUEST)
     : [];
   for (const e of rawEvents) {
     if (typeof e?.name !== 'string' || !VALID_EVENT_TYPES.has(e.name)) {
-      rejected++;
+      reject('unknown_event_type');
       continue;
     }
     const ts = isIsoTimestamp(e.timestamp) ? e.timestamp : new Date().toISOString();
@@ -197,9 +221,8 @@ function normalize(
       payload: {
         record_type: 'event',
         event_type: e.name,
-        user_id: claims.userId,
-        user_email: claims.email,
-        user_tier: claims.clearance,
+        person_id: caller.personId,
+        user_tier: caller.clearance,
         session_id: safeSessionId(e.sessionId),
         timestamp: ts,
         properties: props,
@@ -212,89 +235,59 @@ function normalize(
     ? (body.performance as IncomingPerf[]).slice(0, MAX_PERF_PER_REQUEST)
     : [];
   for (const p of rawPerf) {
-    if (typeof p?.metric !== 'string' || !p.metric) {
-      rejected++;
+    if (typeof p?.metric !== 'string' || !VALID_PERF_METRICS.has(p.metric)) {
+      reject('unknown_perf_metric');
       continue;
     }
+    const metric = p.metric as ClientPerfMetric;
     if (typeof p?.value !== 'number' || !Number.isFinite(p.value)) {
-      rejected++;
+      reject('perf_value_not_finite');
+      continue;
+    }
+    // BOUNDED, because one absurd value moves every average it lands in and no real wait is negative.
+    if (p.value < 0 || p.value > PERF_VALUE_MAX) {
+      reject('perf_value_out_of_range');
       continue;
     }
     const ts = isIsoTimestamp(p.timestamp) ? p.timestamp : new Date().toISOString();
+    // A timing can carry the turn it belongs to (G5), which is what lets a browser-measured wait be
+    // joined to the server's own numbers for the SAME turn rather than only compared in aggregate.
+    // Only the properties its metric DECLARES, each matching its rule: this is client-supplied, and
+    // the join trusts `correlationId` enough to pair it with a server row.
+    const perfProps = sanitizePerfProperties(metric, p.properties, count);
     records.push({
       partitionKey: 'performance',
       payload: {
         record_type: 'performance',
-        event_type: p.metric,
-        user_id: claims.userId,
-        user_email: claims.email,
-        user_tier: claims.clearance,
+        event_type: metric,
+        person_id: caller.personId,
+        user_tier: caller.clearance,
         session_id: safeSessionId(p.sessionId),
         timestamp: ts,
-        properties: null,
+        properties: perfProps,
         perf_value: p.value,
       },
     });
   }
 
-  return { records, rejected };
-}
-
-async function deliverToFirehose(
-  records: { partitionKey: string; payload: NormalizedEvent }[],
-): Promise<{ delivered: number; dropped: number }> {
-  if (records.length === 0) return { delivered: 0, dropped: 0 };
-  if (!DELIVERY_STREAM) throw new Error('CLIENT_EVENTS_DELIVERY_STREAM not configured');
-
-  // Build Firehose records. Each becomes one S3 line. The wrapper carries
-  // the partition key so the Firehose MetadataExtraction processor can route
-  // it to the right S3 prefix (event_type=… for events, performance for perf).
-  const firehoseRecords: _Record[] = records.map(({ partitionKey, payload }) => {
-    const wire = JSON.stringify({ partitionKey, ...payload }) + '\n';
-    return { Data: new TextEncoder().encode(wire) };
-  });
-
-  // Drop oversized records defensively (Firehose's per-record cap is 1 MiB
-  // but anything over MAX_RECORD_BYTES is almost certainly junk).
-  let dropped = 0;
-  const safe = firehoseRecords.filter((r) => {
-    const size = r.Data?.byteLength || 0;
-    if (size > MAX_RECORD_BYTES) {
-      dropped++;
-      return false;
-    }
-    return true;
-  });
-  if (safe.length === 0) return { delivered: 0, dropped };
-
-  // PutRecordBatch caps at 500 records / 4 MiB. We already limited inputs;
-  // chunking guard is here for forward-compat if caps are raised.
-  let delivered = 0;
-  for (let i = 0; i < safe.length; i += 500) {
-    const chunk = safe.slice(i, i + 500);
-    const result = await firehose.send(
-      new PutRecordBatchCommand({ DeliveryStreamName: DELIVERY_STREAM, Records: chunk }),
-    );
-    delivered += chunk.length - (result.FailedPutCount || 0);
-    dropped += result.FailedPutCount || 0;
-  }
-
-  return { delivered, dropped };
+  return { records, rejected, reasons };
 }
 
 export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayProxyResult> => {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   console.log('[ClientEvents]', event.httpMethod, event.path);
 
   if (event.httpMethod === 'OPTIONS') {
-    return { statusCode: 200, headers: corsHeaders(), body: '' };
+    return http.empty(200);
   }
   if (event.httpMethod !== 'POST') {
     return respond(405, { error: 'Method not allowed' });
   }
 
   try {
-    const claims = extractClaims(event);
-    if (!claims) {
+    const caller = await callerFacts(event);
+    if (!caller) {
       // Should not happen — API Gateway Cognito authorizer blocks unauth'd
       // requests upstream. Guard exists for defense in depth + local testing.
       return respond(401, { error: 'Unauthorized' });
@@ -307,20 +300,15 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
       return respond(400, { error: 'Invalid JSON body' });
     }
 
-    const { records, rejected } = normalize(body, claims);
+    const { records, rejected, reasons } = normalize(body, caller);
+    // NAMED BY REASON, and never by content: what was refused is client-supplied and is not echoed.
+    if (Object.keys(reasons).length > 0) {
+      console.warn('[ClientEvents] refused or trimmed client input', { personId: caller.personId, reasons });
+    }
     const eventCount = records.filter((r) => r.payload.record_type === 'event').length;
     const perfCount = records.filter((r) => r.payload.record_type === 'performance').length;
 
-    // Aurora mode → write to Aurora `client_events` via the data-plane; else Firehose.
-    await ensureDataPlaneArn();
-    let delivered = 0;
-    let dropped = 0;
-    if (hasDataPlane()) {
-      const { inserted } = await ingestClientEvents(records.map((r) => r.payload));
-      delivered = inserted;
-    } else {
-      ({ delivered, dropped } = await deliverToFirehose(records));
-    }
+    const { delivered, dropped } = await deliverToArchive(records);
 
     return respond(200, {
       recorded: eventCount,
@@ -338,10 +326,11 @@ export const handler = async (event: APIGatewayProxyEvent): Promise<APIGatewayPr
 // Exported for unit tests only.
 export const __testing = {
   VALID_EVENT_TYPES,
+  VALID_PERF_METRICS,
   MAX_EVENTS_PER_REQUEST,
   MAX_PERF_PER_REQUEST,
   MAX_RECORD_BYTES,
-  extractClaims,
+  callerFacts,
   normalize,
   partitionDateParts,
   isIsoTimestamp,

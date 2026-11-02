@@ -48,7 +48,7 @@ describe('resolveTaskContinuity', () => {
 
   it('INTERIM: a genuinely new subject during a live task is not offered its own conversation', () => {
     // Not a bug report - the accepted cost of erring toward continuity, written down so the two-axis
-    // change has an assertion that must be revisited rather than a silent behaviour to rediscover.
+    // change has an assertion that must be revisited rather than a silent behavior to rediscover.
     // When task-relatedness gains a signal, this case becomes `continueHere: false` and this test is
     // the one that should fail.
     expect(decide({ liveTaskInChannel: true }).continueHere).toBe(true);

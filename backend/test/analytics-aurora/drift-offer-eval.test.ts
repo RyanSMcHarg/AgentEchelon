@@ -22,11 +22,12 @@ function bedrockJson(obj: unknown) {
   return { body: new TextEncoder().encode(payload) };
 }
 
-/** Pass A (no exchanges) then Pass B (no flows), so only Pass C does work. */
+/** Pass A (no exchanges), Pass B (no flows) and Pass E (no tool calls), so only Pass C does work. */
 function skipPassesAandB() {
   mockedQuery
     .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never) // getUnscoredExchanges
-    .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never); // getFlowsToScore
+    .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never) // getFlowsToScore
+    .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never); // getToolExchanges (Pass E)
 }
 
 const OFFER = {
@@ -50,8 +51,11 @@ describe('drift-offer evaluation (Pass C)', () => {
     expect(res.statusCode).toBe(200);
     expect(JSON.parse(res.body).driftOffersScored).toBe(1);
 
-    const update = mockedQuery.mock.calls.at(-1)!;
-    expect(String(update[0])).toContain('UPDATE drift_events');
+    // FOUND BY ITS SQL, NOT BY POSITION. `.at(-1)` meant this assertion named whichever pass happened
+    // to run last, so adding Pass D after Pass C failed it while Pass C was working correctly.
+    const update = mockedQuery.mock.calls.find(([sql]) => String(sql).includes('UPDATE drift_events'))!;
+    // Pass C must write its verdict back to drift_events.
+    expect(update).toBeDefined();
     expect(String(update[0])).toContain('evaluated_at = NOW()');
     expect((update[1] as unknown[])[0]).toBe(true); // evaluated_correct
     expect((update[1] as unknown[])[3]).toBe('evt-1');
@@ -66,7 +70,7 @@ describe('drift-offer evaluation (Pass C)', () => {
 
     await handler({});
 
-    const select = String(mockedQuery.mock.calls[2][0]);
+    const select = String(mockedQuery.mock.calls.find(([sql]) => String(sql).includes('FROM drift_events'))?.[0]);
     expect(select).toContain("d.source = 'live'");
     expect(select).toContain('d.evaluated_at IS NULL');
     expect(select).toContain('m.content IS NOT NULL');

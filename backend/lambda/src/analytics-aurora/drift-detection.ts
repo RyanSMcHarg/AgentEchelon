@@ -19,19 +19,17 @@
  * - Per-stage EMF metrics on every invocation (success or skip).
  */
 
-import {
-  BedrockRuntimeClient,
-  InvokeModelCommand,
-} from '@aws-sdk/client-bedrock-runtime';
+import { embedText, EMBEDDING_TIMEOUT_LIVE_MS } from './embed-text.js';
 import { query } from './db-client.js';
-import { withReaderRole } from './classification-boundary.js';
-import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
+import { withReaderRole, withWriterRole } from './classification-boundary.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
 import {
   emitDriftTiming,
   emitDriftCounter,
   newCorrelationId,
 } from '../lib/emf-metrics.js';
 import { detectExplicitRoutingRequest } from '../lib/explicit-routing.js';
+import type { Classification } from '../../../lib/config/model-strategy.js';
 
 // ---------------------------------------------------------------------------
 // Public types
@@ -48,7 +46,11 @@ export type Intent =
 
 export interface DetectDriftInput {
   channelArn: string;
-  messageId: string;
+  // NO messageId. It was required here and read nowhere in this function, so every caller had to
+  // invent one - the live path minted a randomUUID() per turn and shipped it across a Lambda
+  // invoke, and archival passed the real row id. A required field that nothing reads does not
+  // merely waste a field: it looks like the id this drift row will be keyed on, and it is not.
+  // The row is keyed by the id `recordDriftFire` is given separately, resolved for that purpose.
   latestMessage: string;
   intent: Intent;
   /**
@@ -60,14 +62,21 @@ export interface DetectDriftInput {
    * Optional caller-supplied clearance dimension for EMF. When omitted, metrics
    * aggregate across clearances.
    */
-  userClearance?: 'basic' | 'standard' | 'premium';
+  userClearance?: Classification;
   /**
-   * Set of `(distance ± 0.05)` cosine values the user has recently declined.
-   * When the current distance falls inside any band, drift is suppressed.
-   * The live drift flow (`lib/live-drift-flow.ts`, reached from the router) reads
-   * these out of `routingState` and passes them in.
+   * KEEP THE MESSAGE EMBEDDING WHEN AN OFFER FIRES, so a decline can adopt it as a topic of this
+   * conversation (`adoptOfferedTopic`, migration 044).
+   *
+   * Set only by the LIVE flow, and only when an offer will actually be shown. Archival scoring shows
+   * nothing to anyone, so nothing it scores can be declined; a battle turn reports drift without
+   * offering a split. Absent means nothing is stored, which is also what an older caller gets: its
+   * declines simply adopt nothing.
+   *
+   * REPLACES `declinedDistances`. That list suppressed any message whose distance from the summary
+   * sat within 0.05 of a declined one - a match on a NUMBER, not a subject, kept in the Amazon Lex
+   * session. A declined topic is now part of the conversation and is compared as a topic.
    */
-  declinedDistances?: number[];
+  retainOfferEmbedding?: boolean;
   /**
    * True when this CHANNEL has a LIVE task (status pending/in_progress), whichever principal holds it.
    *
@@ -106,7 +115,7 @@ export interface DetectDriftInput {
    *
    * ADDITIVE ON PURPOSE. An older data plane that has never heard of this field still reads the
    * boolean and still suppresses; it loses only the finer counter. Carrying the distinction in a
-   * SECOND boolean instead would have made an unrecognised field mean "do not suppress", which is the
+   * SECOND boolean instead would have made an unrecognized field mean "do not suppress", which is the
    * silent-regression shape this input's own history is a record of.
    */
   taskSignal?: 'live' | 'recently_ended';
@@ -127,6 +136,23 @@ export interface DetectDriftInput {
    * Absent ⇒ no related conversation is suggested. There is deliberately no fallback to the archive.
    */
   scopedChannelArns?: string[];
+  /**
+   * DO NOT LOOK FOR A RELATED CONVERSATION HERE; HAND THE QUESTION BACK.
+   *
+   * The scope above costs one `SearchChannels` page per 50 conversations the room shares with the
+   * assistant, and the live flow used to resolve it on EVERY turn, before detection - although only a
+   * turn that fires drift ever asks question 3. Measured 2026-10-05: a test person and the premium
+   * assistant shared 597 conversations, so every turn paid 12 sequential searches, and a burst of turns
+   * was throttled by the service.
+   *
+   * With this set, a turn that fires returns `relatedLookupPending` instead of running the lookup, and
+   * the caller resolves the scope live only then and calls `resolveDriftRival`. The scope is still read
+   * from Amazon Chime SDK Messaging at the moment it is used; nothing is cached.
+   *
+   * ADDITIVE ON THE WIRE. An older data plane ignores the field and runs the lookup against the absent
+   * scope, which suggests nothing: the turn degrades to `confirm`, never wider.
+   */
+  deferRelatedLookup?: boolean;
   /**
    * REQUIRED. The current channel's classification, used to select the database reader role both
    * summary-embedding reads run as (ADR-028).
@@ -153,35 +179,43 @@ export interface DriftResult {
   confidence: 'low' | 'medium' | 'high';
   signalAvailable: boolean;
   correlationId: string;
-  suggestionTemplate?: string;
+  /** The message template of the offer (`drift-offer` or `drift-redirect-offer`), which the router renders. */
+  suggestionTemplate?: 'drift-offer' | 'drift-redirect-offer';
   rivalConversationArn?: string;
   /** Internal — true iff the explicit-routing fast-path matched, never cosine. */
   viaExplicitIntent?: boolean;
   /** Internal — set when viaExplicitIntent is true. */
   explicitTopicHint?: string;
+  /**
+   * Set only when the caller asked for `deferRelatedLookup` and drift fired: question 3 has not been
+   * asked. The caller resolves the scope and passes this embedding to `resolveDriftRival`.
+   */
+  relatedLookupPending?: { messageEmbedding: number[] };
 }
 
 // ---------------------------------------------------------------------------
 // Config (env-tunable; sensible defaults per spec)
 // ---------------------------------------------------------------------------
 
-const EMBEDDING_MODEL_ID = process.env.DRIFT_EMBEDDING_MODEL_ID || 'amazon.titan-embed-text-v2:0';
-const EMBEDDING_DIM = 1024;
-const EMBEDDING_TIMEOUT_MS = 500;
-const DRIFT_DISTANCE_THRESHOLD = Number(process.env.DRIFT_DISTANCE_THRESHOLD || '0.35');
+// The model, the dimension and the live timeout now live in `embed-text.ts`, which is the one Titan
+// call every consumer of this vector space shares (ADR-002, ADR-004). They were declared here and
+// again, identically, in `embedding-writer.ts`.
+// THE THRESHOLD IS MEASURED, NOT ASSUMED (2026-10-15). Scored against the curated cases with
+// `scripts/score-drift-fixture.mjs` under the nearest-anchor rule: at the former 0.35 every drift-negative case
+// fired (100% false offers), because Titan distances between a question and an on-topic summary sit near 0.75;
+// the turn-two skip and the 30-minute summary wait had hidden that. At 0.84, 92% of real pivots fire and 12%
+// of on-topic messages do. 0.86 lowers false offers to 8% at the same catch rate, but live turn-two pivots
+// measured 0.844, 0.867 and 0.904, so 0.86 would miss the lowest. Re-score after changing the embedding model.
+const DRIFT_DISTANCE_THRESHOLD = Number(process.env.DRIFT_DISTANCE_THRESHOLD || '0.84');
 const REROUTE_SIMILARITY_THRESHOLD = Number(process.env.DRIFT_REROUTE_THRESHOLD || '0.80');
-const DECLINED_DISTANCE_BAND = 0.05;
 
-const SUGGESTION_CONFIRM_TEMPLATE =
-  "It looks like you're shifting topics. Want me to start a separate conversation for this so we keep both threads clean? Reply 'yes' to create one, or anything else to keep going here.";
-const SUGGESTION_REDIRECT_TEMPLATE =
-  "It looks like you're shifting to something we covered in another conversation. Want me to take you there? Reply 'yes' to switch, or 'no' to keep going here.";
+// THE OFFER IS A MESSAGE TEMPLATE THE ROUTER SAYS (ADR-062 decision 6). The data plane holds no assistant's
+// templates, so it names which offer applies and the router renders it in the assistant's words.
+const SUGGESTION_CONFIRM_TEMPLATE = 'drift-offer';
+const SUGGESTION_REDIRECT_TEMPLATE = 'drift-redirect-offer';
 
-// ---------------------------------------------------------------------------
-// Bedrock client (module-singleton; reused across warm invocations)
-// ---------------------------------------------------------------------------
-
-const bedrockClient = new BedrockRuntimeClient({});
+// The Bedrock client is a module-singleton inside `embed-text.ts`, reused across warm invocations
+// exactly as it was here. This file no longer calls Bedrock directly.
 
 // ---------------------------------------------------------------------------
 // Public: detectDrift
@@ -276,20 +310,43 @@ export async function detectDrift(input: DetectDriftInput): Promise<DriftResult>
   }
 
   // Fetch summary embedding (PK lookup; fast).
+  // ── EVERY TURN IS COMPARED WITH THE CONVERSATION'S OWN SUBJECTS ────────────
+  //
+  // The decision used to be the distance from the summary alone, an AVERAGE that no single subject sits
+  // near, with the subjects consulted only once that distance was already past the threshold, and turn two
+  // skipped outright because its summary was the one-exchange seed. That missed the plainest pivot there
+  // is ("What is AgentEchelon?" then a revenue figure) and left the subjects as an afterthought.
+  //
+  // Now every turn measures the message against each subject the conversation has (those a summary
+  // established, those the person kept by declining a split, and the opening seed's) and against the
+  // summary, and is the same subject when it is near ANY of them. A message far from all of them is a new
+  // subject. Including the summary only ever fires less often than the subjects alone: a subject is a
+  // short label, and a full question can sit far from a label it is plainly about.
+  //
+  // The seed is compared against, not skipped. The thin-anchor skip (2026-09-23) existed because the seed
+  // summary was the only anchor; the seed's subjects now stand beside it, so a second message continuing
+  // the first sits near one of them, and a second message on a new subject is far from all of them.
+  //
+  // A FAILED READ DOES NOT SUPPRESS: with no anchor readable there is nothing to compare, so the turn
+  // continues and says why; with some anchors readable, the comparison uses those.
   const tSummaryStart = Date.now();
   let summaryEmbedding: number[] | null = null;
   try {
-    summaryEmbedding = await loadSummaryEmbedding(input.channelArn, input.classification);
+    summaryEmbedding = (await loadSummaryEmbedding(input.channelArn, input.classification))?.embedding ?? null;
   } catch (err) {
     console.warn('[drift] summary_embeddings lookup failed:', err);
   }
+  let subjects: number[][] = [];
+  try {
+    subjects = await loadAdoptedTopicEmbeddings(input.channelArn, input.classification);
+  } catch (err) {
+    console.warn('[drift] subject lookup failed; comparing against the summary alone:', err);
+  }
   emitDriftTiming('summary_fetch', Date.now() - tSummaryStart, correlationId, emfOpts);
 
-  if (!summaryEmbedding) {
-    // No anchor to compare against. Either the conversation is brand-new,
-    // or the embedding-writer hasn't caught up. In either case: skip the
-    // signal. Lazy-compute is a future optimization — for now, we trust
-    // the writer to land within seconds of summary updates.
+  const anchors = summaryEmbedding ? [summaryEmbedding, ...subjects] : subjects;
+  if (anchors.length === 0) {
+    // Nothing to compare against: the conversation's first turn, before its seed is written.
     emitDriftCounter('drift_skipped_no_summary', correlationId, emfOpts);
     emitDriftTiming('total', Date.now() - tStart, correlationId, emfOpts);
     return baseResult;
@@ -299,7 +356,7 @@ export async function detectDrift(input: DetectDriftInput): Promise<DriftResult>
   const tEmbedStart = Date.now();
   let messageEmbedding: number[] | null = null;
   try {
-    messageEmbedding = await embedText(text);
+    messageEmbedding = await embedText(text, { timeoutMs: EMBEDDING_TIMEOUT_LIVE_MS });
   } catch (err) {
     console.warn('[drift] message embedding failed:', err);
   }
@@ -313,34 +370,57 @@ export async function detectDrift(input: DetectDriftInput): Promise<DriftResult>
     return { ...baseResult, signalAvailable: false };
   }
 
-  // Compute cosine distance in-process — both vectors are already in memory.
-  // (The cosine-NN related-conversation lookup uses pgvector since it ranks
-  // many candidates; the single message-vs-summary comparison is cheaper here.)
+  // The nearest anchor decides. Computed in-process: every vector is already in memory.
   const tCmpStart = Date.now();
-  const distance = cosineDistance(messageEmbedding, summaryEmbedding);
+  let distance = Number.POSITIVE_INFINITY;
+  for (const anchor of anchors) {
+    const d = cosineDistance(messageEmbedding, anchor);
+    if (Number.isFinite(d) && d < distance) distance = d;
+  }
   emitDriftTiming('comparison', Date.now() - tCmpStart, correlationId, emfOpts);
 
-  // Decline-suppression: if the distance is inside a previously-declined
-  // band, suppress the suggestion. The user has already said no in this
-  // neighborhood recently.
-  if (input.declinedDistances && input.declinedDistances.length > 0) {
-    for (const declined of input.declinedDistances) {
-      if (Math.abs(distance - declined) <= DECLINED_DISTANCE_BAND) {
-        emitDriftCounter('drift_skipped_declined_neighborhood', correlationId, emfOpts);
-        emitDriftTiming('total', Date.now() - tStart, correlationId, emfOpts);
-        return { ...baseResult, driftScore: distance };
-      }
-    }
-  }
-
-  // Threshold check.
-  const isDrift = distance > DRIFT_DISTANCE_THRESHOLD;
-  if (!isDrift) {
+  if (!(distance > DRIFT_DISTANCE_THRESHOLD)) {
+    emitDriftCounter('drift_skipped_known_topic', correlationId, emfOpts);
     emitDriftTiming('total', Date.now() - tStart, correlationId, emfOpts);
-    return { ...baseResult, driftScore: distance };
+    return { ...baseResult, driftScore: Number.isFinite(distance) ? distance : NaN };
   }
 
   emitDriftCounter('drift_fired', correlationId, emfOpts);
+
+  // The offer's embedding, kept so a decline can adopt it. Best-effort: losing it costs only the
+  // adoption of this one topic, never the offer itself.
+  if (input.retainOfferEmbedding) {
+    try {
+      await storeOfferedTopicEmbedding({
+        channelArn: input.channelArn,
+        correlationId,
+        embedding: messageEmbedding,
+        classification: input.classification,
+      });
+    } catch (err) {
+      console.warn('[drift] could not keep the offered topic embedding (non-fatal):', err);
+    }
+  }
+
+  // Confidence is derived from how far past the threshold we are.
+  const margin = distance - DRIFT_DISTANCE_THRESHOLD;
+  // Bands over the range left above the threshold (distance tops out near 1), not fixed widths.
+  const headroom = Math.max(1 - DRIFT_DISTANCE_THRESHOLD, 0.01);
+  const confidence: DriftResult['confidence'] = margin < headroom / 3 ? 'low' : margin < (2 * headroom) / 3 ? 'medium' : 'high';
+
+  // Question 3 deferred to the caller, which resolves the scope only now that it is needed.
+  if (input.deferRelatedLookup) {
+    emitDriftTiming('total', Date.now() - tStart, correlationId, emfOpts);
+    return {
+      ...baseResult,
+      isDrift: true,
+      driftScore: distance,
+      suggestedAction: 'confirm',
+      confidence,
+      suggestionTemplate: SUGGESTION_CONFIRM_TEMPLATE,
+      relatedLookupPending: { messageEmbedding },
+    };
+  }
 
   // Related-conversation lookup. May upgrade `confirm` → `redirect` if an
   // existing channel matches well enough.
@@ -360,10 +440,6 @@ export async function detectDrift(input: DetectDriftInput): Promise<DriftResult>
 
   const total = Date.now() - tStart;
   emitDriftTiming('total', total, correlationId, emfOpts);
-
-  // Confidence is derived from how far past the threshold we are.
-  const margin = distance - DRIFT_DISTANCE_THRESHOLD;
-  const confidence: DriftResult['confidence'] = margin < 0.1 ? 'low' : margin < 0.2 ? 'medium' : 'high';
 
   if (rivalConversationArn) {
     return {
@@ -395,7 +471,7 @@ export interface RecordDriftInput {
   result: DriftResult;
   channelArn: string;
   messageId: string;
-  userSub?: string;
+  personId?: string;
   intent: Intent;
   /**
    * Which path produced this row, and it is REQUIRED because the two mean different things.
@@ -411,11 +487,23 @@ export interface RecordDriftInput {
 }
 
 export async function recordDriftFire(input: RecordDriftInput): Promise<string> {
-  const { result, channelArn, messageId, userSub, intent, source } = input;
+  const { result, channelArn, messageId, personId, intent, source } = input;
+  // A MOVE REJECTED WHERE IT LANDED (migration 077). When a live offer fires in a conversation that was
+  // created by accepting one, and that move is not yet settled, the person moved and at once raised another
+  // subject there: the parent offer is `rejected_in_new_channel`. In the same statement as the flag, so the
+  // turn pays no extra round trip.
   const rows = await query<{ event_id: string }>(
-    `INSERT INTO drift_events (
+    `WITH rejected AS (
+       UPDATE drift_events
+          SET outcome = 'rejected_in_new_channel', outcome_at = NOW(), engagement_settled = TRUE
+        WHERE new_channel_arn = $2
+          AND outcome = 'accepted'
+          AND engagement_settled = FALSE
+          AND $10::text = 'live'
+     )
+     INSERT INTO drift_events (
        outcome, cosine_distance, parent_channel_arn, rival_conversation_arn,
-       user_sub, originating_message_id, intent, confidence, correlation_id,
+       person_id, originating_message_id, intent, confidence, correlation_id,
        created_via_explicit_intent, source
      ) VALUES (NULL, $1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
      RETURNING event_id`,
@@ -423,7 +511,7 @@ export async function recordDriftFire(input: RecordDriftInput): Promise<string> 
       Number.isFinite(result.driftScore) ? result.driftScore : null,
       channelArn,
       result.rivalConversationArn || null,
-      userSub || null,
+      personId || null,
       messageId,
       intent,
       result.confidence,
@@ -445,12 +533,21 @@ export async function recordDriftOutcome(input: {
   outcome: 'declined' | 'rejected_in_new_channel' | 'accepted';
   newChannelArn?: string;
 }): Promise<void> {
+  // WHEN IT WAS DECIDED (migration 077), and a decline is final at once. An acceptance is a move whose
+  // engagement the abandonment detector still checks, so it stays unsettled.
+  //
+  // SETTLED IS ITS OWN PARAMETER. Reusing `$1` for the comparison made Postgres deduce two types for one
+  // parameter (`varchar(32)` from the column, `text` from the literal), and it refuses the statement
+  // with "inconsistent types deduced for parameter $1". The router swallows the failure, so no outcome
+  // was ever recorded.
   await query(
     `UPDATE drift_events
        SET outcome = $1,
-           new_channel_arn = COALESCE($2, new_channel_arn)
+           new_channel_arn = COALESCE($2, new_channel_arn),
+           outcome_at = NOW(),
+           engagement_settled = $4
      WHERE event_id = $3`,
-    [input.outcome, input.newChannelArn || null, input.eventId],
+    [input.outcome, input.newChannelArn || null, input.eventId, input.outcome !== 'accepted'],
   );
 }
 
@@ -474,10 +571,89 @@ export async function getLatestSummary(channelArn: string): Promise<string | nul
 }
 
 // ---------------------------------------------------------------------------
+// Public: adoptOfferedTopic - a declined offer's subject becomes a topic of the conversation
+// ---------------------------------------------------------------------------
+
+/**
+ * Make the subject of a declined drift offer one of this conversation's topics.
+ *
+ * Declining to split a subject out is the person saying it belongs here, so a later message about it
+ * must not be offered as drift again - for the life of the conversation, not for a window.
+ *
+ * Returns whether a topic was adopted. False is not an error: the offer may predate migration 044, the
+ * fire may have failed to keep its embedding, or the offer was already adopted by a redelivered turn.
+ */
+export async function adoptOfferedTopic(input: {
+  channelArn: string;
+  correlationId: string;
+}): Promise<{ adopted: boolean }> {
+  if (!input?.channelArn || !input?.correlationId) return { adopted: false };
+  const result = await withWriterRole((client) => client.query(
+    `UPDATE conversation_topic_embeddings
+        SET status = 'adopted', adopted_at = NOW()
+      WHERE channel_arn = $1 AND topic_key = $2 AND status = 'offered'`,
+    [input.channelArn, offerTopicKey(input.correlationId)],
+  ));
+  return { adopted: (result.rowCount ?? 0) > 0 };
+}
+
+// ---------------------------------------------------------------------------
 // Internals
 // ---------------------------------------------------------------------------
 
-async function loadSummaryEmbedding(channelArn: string, classification: string): Promise<number[] | null> {
+/** The topic key a drift offer's embedding is stored under. */
+function offerTopicKey(correlationId: string): string {
+  return `drift:${correlationId}`;
+}
+
+async function storeOfferedTopicEmbedding(input: {
+  channelArn: string;
+  correlationId: string;
+  embedding: number[];
+  classification: string;
+}): Promise<void> {
+  // ADR-028: written as the writer role and stamped with the channel's classification, so the row is
+  // readable only by roles whose ladder includes it. ON CONFLICT DO NOTHING: a redelivered turn that
+  // fires the same offer must not reset a topic that has already been adopted.
+  await withWriterRole((client) => client.query(
+    `INSERT INTO conversation_topic_embeddings
+       (channel_arn, topic_key, origin, status, embedding, classification)
+     VALUES ($1, $2, 'drift_offer', 'offered', $3::vector, $4)
+     ON CONFLICT (channel_arn, topic_key) DO NOTHING`,
+    [input.channelArn, offerTopicKey(input.correlationId), `[${input.embedding.join(',')}]`, input.classification],
+  ));
+}
+
+async function loadAdoptedTopicEmbeddings(channelArn: string, classification: string): Promise<number[][]> {
+  // Read as the channel's reader role, like the summary anchor: the rows are this channel's own, so the
+  // role narrows nothing in the normal case and hides a row whose classification is not what it should be.
+  // ANYTHING THAT IS NOT A PENDING OFFER IS A SUBJECT OF THIS CONVERSATION (FR5).
+  //
+  // This read `status = 'adopted'`, which was the whole of the truth while the only rows were declined
+  // offers. The summarizer now writes its `topics[]` as `established` rows (migration 067), and those
+  // are subjects by the plainest reading - the conversation is about them - so an equality on
+  // `adopted` would have silently ignored every one of them and left FR5 "Partly" with the writer
+  // built.
+  //
+  // Stated as "not `offered`" rather than a list of the two accepted values, because that IS the rule:
+  // a row is a subject unless it is a proposal still waiting on an answer. A new status added later is
+  // then included by default, which is the safe direction here - more subjects means more suppression,
+  // and the spec records continuity as the cheaper failure (section 366).
+  const result = await withReaderRole(classification, (client) => client.query<{ embedding_text: string }>(
+    `SELECT embedding::text AS embedding_text
+       FROM conversation_topic_embeddings
+      WHERE channel_arn = $1 AND status <> 'offered'`,
+    [channelArn],
+  ));
+  return result.rows
+    .map((row) => (row.embedding_text ? parsePgVector(row.embedding_text) : []))
+    .filter((vector) => vector.length > 0);
+}
+
+async function loadSummaryEmbedding(
+  channelArn: string,
+  classification: string,
+): Promise<{ embedding: number[] | null; fromVersion: number; generatedBy: string } | null> {
   // pgvector returns the embedding as a string like "[0.1,0.2,...]".
   // We cast to text and parse rather than relying on a pgvector node driver.
   //
@@ -485,50 +661,105 @@ async function loadSummaryEmbedding(channelArn: string, classification: string):
   // this very classification and is in scope by construction - the role changes nothing here in the
   // normal case. It matters when the row is NOT what it should be: a summary stamped fail-closed to
   // the most restrictive value (because the Chime-sourced classification never arrived) becomes
-  // invisible to a lower-classification channel, and drift skips rather than comparing against an
+  // invisible to every channel whose classification does not reach it, and drift skips rather than comparing against an
   // anchor whose provenance is unknown.
-  const result = await withReaderRole(classification, (client) => client.query<{ embedding_text: string | null }>(
-    `SELECT embedding::text AS embedding_text
-       FROM summary_embeddings
-      WHERE channel_arn = $1`,
+  // WHO WROTE THE SUMMARY comes back with it, in the same round trip. The caller's decision is about
+  // whether this anchor is a topic or a single message, and the version alone cannot answer that: a
+  // conversation SPLIT OUT of another one has its topic before its first message, and is seeded at
+  // version 1 from that topic. `generated_by` separates the two version-1 cases; the join is on the
+  // exact version the embedding was built from, so it describes THAT summary and not a later one.
+  // READ FROM THE ANCHOR ALONE, AND THE JOIN THAT WAS HERE IS THE REASON.
+  //
+  // This ran as the channel's reader role and joined `conversation_summaries` for `generated_by`.
+  // Reader roles hold SELECT on the three BOUNDED tables only, and that is not one of them, so the
+  // whole statement was refused - `permission denied for table conversation_summaries` - and the
+  // caller's catch turned a refusal into a null anchor. Drift then compared against nothing and
+  // reported no drift, which is indistinguishable from a conversation that has not changed subject.
+  //
+  // It cannot be fixed by widening the grant: `conversation_summaries` carries no classification, so
+  // RLS has nothing to scope it by and every reader would see every classification's summary text.
+  // The provenance moved onto the anchor instead (migration 065), which is already classification-
+  // keyed and already bounded.
+  const result = await withReaderRole(classification, (client) => client.query<{
+    embedding_text: string | null;
+    embedded_from_version: number | null;
+    generated_by: string | null;
+  }>(
+    `SELECT se.embedding::text AS embedding_text,
+            se.embedded_from_version,
+            se.generated_by
+       FROM summary_embeddings se
+      WHERE se.channel_arn = $1`,
     [channelArn],
   ));
-  const text = result.rows[0]?.embedding_text;
+  const row = result.rows[0];
+  const text = row?.embedding_text;
   if (!text) return null;
-  return parsePgVector(text);
+  return {
+    embedding: parsePgVector(text),
+    fromVersion: Number(row?.embedded_from_version ?? 0),
+    // An anchor whose summary row cannot be read is treated as the thin case. The alternative is
+    // firing on an anchor of unknown provenance, which is the failure this gate exists to stop.
+    generatedBy: row?.generated_by ?? 'summary-seed',
+  };
 }
 
-async function embedText(text: string): Promise<number[] | null> {
-  // Truncate to the model's input cap; Titan v2 takes up to ~8k tokens
-  // but we don't need anywhere near that for a single chat message.
-  const input = text.slice(0, 8000);
+export interface ResolveDriftRivalInput {
+  /** The result `detectDrift` returned with `relatedLookupPending` set. */
+  result: DriftResult;
+  channelArn: string;
+  messageEmbedding: number[];
+  /** Resolved live by the caller, at the moment of use (see `deferRelatedLookup`). */
+  scopedChannelArns?: string[];
+  /** Selects the reader role, exactly as in `detectDrift` (ADR-028). */
+  classification: string;
+  userClearance?: Classification;
+  intent?: Intent;
+}
 
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), EMBEDDING_TIMEOUT_MS);
-
-  try {
-    const response = await bedrockClient.send(
-      new InvokeModelCommand({
-        modelId: EMBEDDING_MODEL_ID,
-        body: JSON.stringify({ inputText: input, dimensions: EMBEDDING_DIM, normalize: true }),
-        contentType: 'application/json',
-        accept: 'application/json',
-      }),
-      { abortSignal: controller.signal },
+/**
+ * Question 3 on its own: is the subject this turn moved to already a conversation the room can open?
+ *
+ * The second half of a deferred `detectDrift`. Upgrades `confirm` to `redirect` when a scoped
+ * conversation is close enough, and otherwise returns the offer unchanged. Never returns the pending
+ * embedding, so the result can be logged and stored like any other.
+ */
+export async function resolveDriftRival(input: ResolveDriftRivalInput): Promise<DriftResult> {
+  if (!profiles.isKnownClassification(input?.classification)) {
+    throw new Error(
+      `[drift] classification is required and must be declared by this deployment; got `
+      + `${JSON.stringify(input?.classification)}.`,
     );
-    clearTimeout(timer);
-
-    const body = JSON.parse(new TextDecoder().decode(response.body));
-    const embedding = body?.embedding;
-    if (!Array.isArray(embedding) || embedding.length !== EMBEDDING_DIM) {
-      return null;
-    }
-    return embedding as number[];
-  } catch {
-    clearTimeout(timer);
-    return null;
   }
+  const { relatedLookupPending: _pending, ...offer } = input.result;
+  const tRelStart = Date.now();
+  let rivalConversationArn: string | undefined;
+  try {
+    rivalConversationArn = await findRelatedConversation({
+      currentChannelArn: input.channelArn,
+      messageEmbedding: input.messageEmbedding,
+      scopedChannelArns: input.scopedChannelArns,
+      classification: input.classification,
+    });
+  } catch (err) {
+    console.warn('[drift] related-conversation lookup failed:', err);
+  }
+  emitDriftTiming('related_conv_lookup', Date.now() - tRelStart, offer.correlationId, {
+    userClearance: input.userClearance, intent: input.intent,
+  });
+  if (!rivalConversationArn) return offer;
+  return {
+    ...offer,
+    suggestedAction: 'redirect',
+    suggestionTemplate: SUGGESTION_REDIRECT_TEMPLATE,
+    rivalConversationArn,
+  };
 }
+
+// `embedText` moved to `embed-text.ts` byte-for-byte, with the timeout as its argument. It stays
+// SILENT on failure here - no `label` is passed - because this runs inside a live turn and the caller
+// already records the skip through its own metric; a warning per slow Titan call would be noise on a
+// path that is designed to degrade.
 
 interface FindRelatedInput {
   currentChannelArn: string;
@@ -558,13 +789,23 @@ async function findRelatedConversation(input: FindRelatedInput): Promise<string 
   // CLASSIFICATION - what this channel is permitted to surface. Membership alone let a basic channel
   // point at a premium one whenever the members happened to hold premium elsewhere; classification
   // alone would ignore who is actually present. Neither subsumes the other, so both are applied.
+  // THE SAME ANCHORS AS THE DRIFT CHECK: a conversation is near the message when its summary OR any of its
+  // subjects is. Matching the summary alone missed a conversation whose summary is about something broader
+  // than the one subject the message names. A pending offer (`offered`) is not yet a subject, as in step 6b.
   const vectorLiteral = `[${input.messageEmbedding.join(',')}]`;
   const result = await withReaderRole(input.classification, (client) => client.query<{ channel_arn: string; similarity: number }>(
-    `SELECT channel_arn,
-            1 - (embedding <=> $1::vector) AS similarity
-       FROM summary_embeddings
-      WHERE channel_arn = ANY($2::text[])
-      ORDER BY embedding <=> $1::vector
+    `SELECT channel_arn, 1 - MIN(distance) AS similarity
+       FROM (
+         SELECT channel_arn, embedding <=> $1::vector AS distance
+           FROM summary_embeddings
+          WHERE channel_arn = ANY($2::text[])
+         UNION ALL
+         SELECT channel_arn, embedding <=> $1::vector AS distance
+           FROM conversation_topic_embeddings
+          WHERE channel_arn = ANY($2::text[]) AND status <> 'offered'
+       ) anchors
+      GROUP BY channel_arn
+      ORDER BY MIN(distance)
       LIMIT 1`,
     [vectorLiteral, candidateArns],
   ));

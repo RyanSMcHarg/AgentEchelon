@@ -10,7 +10,7 @@
  * Module access is injected rather than exercised on disk. Writing a real `context-sources.local.ts`
  * cannot test this: resolution is cached per jest worker in BOTH directions (a resolved path keeps
  * resolving after deletion, a failed one keeps failing after creation), and the path is read
- * concurrently by other test files, so such a test asserts against a cache and breaks its neighbours.
+ * concurrently by other test files, so such a test asserts against a cache and breaks its neighbors.
  */
 import { loadContextSourceCatalog, type ContextSourceEntry } from '../../lib/config/context-sources';
 

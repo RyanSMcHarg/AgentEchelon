@@ -12,7 +12,7 @@ import { IntentType } from '../lambda/src/lib/intent-classifier';
 import {
   DeliveryOption,
   selectDeliveryOption,
-  getQuickResponse,
+  quickReply,
   getTaskPlaceholder,
 } from '../lambda/src/lib/delivery-options';
 
@@ -54,43 +54,19 @@ describe('selectDeliveryOption', () => {
   });
 });
 
-describe('getQuickResponse', () => {
-  it.each(['hi', 'hello', 'hey', 'good morning'])(
-    'returns greeting response for "%s"',
-    (msg) => {
-      const response = getQuickResponse('greeting', msg);
-      expect(response).toBe('Hey, what can I help you with?');
-    }
-  );
-
-  it.each(['thanks', 'thank you'])(
-    'returns thank-you response for "%s"',
-    (msg) => {
-      const response = getQuickResponse('acknowledgment', msg);
-      expect(response).toContain('Happy to help');
-    }
-  );
-
-  it.each(['ok', 'okay', 'got it', 'great', 'perfect', 'cool'])(
-    'returns acknowledgment response for "%s"',
-    (msg) => {
-      const response = getQuickResponse('acknowledgment', msg);
-      expect(response).toContain('other questions');
-    }
-  );
-
-  it('returns goodbye response', () => {
-    expect(getQuickResponse('acknowledgment', 'bye')).toContain('Goodbye');
-    expect(getQuickResponse('acknowledgment', 'goodbye')).toContain('Goodbye');
+describe('quickReply: chosen by the intent and the kind the classifier recorded (ADR-062 decision 7)', () => {
+  it('answers a greeting from its template', () => {
+    expect(quickReply({ intent: 'greeting' })).toBe('Hey, what can I help you with?');
   });
 
-  it('returns null for unrecognized messages', () => {
-    expect(getQuickResponse('general', 'What is AI?')).toBeNull();
+  it('answers thanks, a farewell and any other acknowledgment each from its form', () => {
+    expect(quickReply({ intent: 'acknowledgment', acknowledgment: 'thanks' })).toContain('Happy to help');
+    expect(quickReply({ intent: 'acknowledgment', acknowledgment: 'confirmation' })).toContain('other questions');
+    expect(quickReply({ intent: 'acknowledgment', acknowledgment: 'farewell' })).toContain('Goodbye');
   });
 
-  it('strips trailing punctuation before matching', () => {
-    expect(getQuickResponse('greeting', 'hello!')).toBe('Hey, what can I help you with?');
-    expect(getQuickResponse('acknowledgment', 'thanks?')).toContain('Happy to help');
+  it('returns null for an intent that is not a greeting or an acknowledgment', () => {
+    expect(quickReply({ intent: 'general' })).toBeNull();
   });
 });
 

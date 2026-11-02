@@ -19,7 +19,7 @@ import {
 describe('pickFrontendMetadata', () => {
   const full = buildAnalyticsMetadata({
     messageNumber: 7,
-    userType: 'premium',
+    classification: 'premium',
     role: 'assistant',
     agentType: 'premium',
     intent: 'report_generation',
@@ -60,10 +60,19 @@ describe('pickFrontendMetadata', () => {
       'inputTokens', 'outputTokens', 'latencyMs', 'totalMs', 'pollMs',
       'intentConfidence', 'deliveryOption', 'wasFallback', 'fallbackReason', 'retryCount',
       'configId', 'personaVersion', 'intentPackVersion', 'systemPromptHash',
-      'messageNumber', 'timestamp', 'role', 'userType', 'agentType',
+      'messageNumber', 'timestamp', 'role', 'agentType',
     ]) {
       expect(slim[dropped]).toBeUndefined();
     }
+  });
+
+  it('KEEPS classification, because the S3 archive partitions on it', () => {
+    // This key used to be in the list above. It is analytics-shaped, but it is not analytics-only:
+    // the conversation archive's Firehose sets its `user_type` partition from a JQ expression over
+    // this Metadata, and Firehose cannot follow the out-of-band hop to DynamoDB the way the archival
+    // Lambda does. While it was slimmed out, every record in the system of record partitioned as
+    // `user_type=unknown`. See `a-partition-key-survives-the-slimming.test.ts`.
+    expect(pickFrontendMetadata(full).classification).toBe(full.classification);
   });
 
   it('emits no keys outside the declared allow-list', () => {
@@ -87,5 +96,34 @@ describe('pickFrontendMetadata', () => {
       steps: [{ stepLabel: 'generate', modelId: 'm', startedAt: 'a', endedAt: 'b' }],
     });
     expect('steps' in slim).toBe(false);
+  });
+});
+
+describe('a duel survives slimming, but its full context does not', () => {
+  // THE FIX THIS PINS (2026-09-21). The admin raw log reads the channel event, so anything slimmed
+  // out is invisible to it. `battleContext` is deliberately dropped - two bot ARNs and the rival's
+  // reply, against a ~1KB cap - and the round lived ONLY in a content marker that is stripped before
+  // the log returns it. So a rebuttal and a round-1 reply were indistinguishable in the raw log of a
+  // duel where both rounds demonstrably ran.
+  const full = {
+    messageNumber: 1,
+    classification: 'premium',
+    role: 'assistant' as const,
+    assignmentMode: 'battle' as const,
+    variantId: 'treatment',
+    battleId: 'b1b2c3d4',
+    battleRound: 2,
+    battleContext: { battleId: 'b1b2c3d4', round: 2, selfBotArn: 'arn:self', rivalBotArn: 'arn:rival' },
+  } as unknown as Parameters<typeof pickFrontendMetadata>[0];
+
+  it('keeps battleId and battleRound, so the event can name its own duel and round', () => {
+    const slim = pickFrontendMetadata(full) as Record<string, unknown>;
+    expect(slim.battleId).toBe('b1b2c3d4');
+    expect(slim.battleRound).toBe(2);
+  });
+
+  it('still drops the heavy battleContext, so this does not re-inflate toward the cap', () => {
+    const slim = pickFrontendMetadata(full) as Record<string, unknown>;
+    expect(slim.battleContext).toBeUndefined();
   });
 });

@@ -2,7 +2,7 @@
  * The channel flow's timeout must EXCEED the router's.
  *
  * `@all` hands the turn to `router-agent-handler` and waits for it (`RequestResponse`), because the
- * placeholder comes back from the turn (MESSAGE-FLOW §3.1). That makes the two budgets a pair: a
+ * placeholder comes back from the turn (MESSAGE-FLOW §4.9). That makes the two budgets a pair: a
  * caller that dies before its callee produces the worst failure shape in this system, and it is
  * completely silent.
  *

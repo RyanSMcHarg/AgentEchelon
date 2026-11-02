@@ -33,7 +33,7 @@ import {
   InvokeModelCommand,
   ConverseCommand,
 } from '@aws-sdk/client-bedrock-runtime';
-import { handler, isVisionCapableJudgeId } from '../../lambda/src/analytics-aurora/evaluation-runner';
+import { handler, isImageTurn, isVisionCapableJudgeId } from '../../lambda/src/analytics-aurora/evaluation-runner';
 
 const mockedQuery = query as jest.MockedFunction<typeof query>;
 const ConverseMock = ConverseCommand as unknown as jest.Mock;
@@ -52,8 +52,8 @@ function invokeJson(obj: unknown) {
 const IMAGE_EXCHANGE = {
   id: 'ex-img',
   channel_arn: 'c1',
-  agent_type: 'premium',
-  user_type: 'human',
+  assistant: 'premium',
+  conversation_classification: 'premium',
   intent: 'image_generation',
   task_id: null,
   created_at: '2026-07-15T00:00:00Z',
@@ -65,8 +65,8 @@ const IMAGE_EXCHANGE = {
 const TEXT_EXCHANGE = {
   id: 'ex-txt',
   channel_arn: 'c1',
-  agent_type: 'premium',
-  user_type: 'human',
+  assistant: 'premium',
+  conversation_classification: 'premium',
   intent: 'general',
   task_id: null,
   created_at: '2026-07-15T00:00:00Z',
@@ -118,6 +118,10 @@ describe('image-turn evaluation routing', () => {
     expect(converseInput.modelId).toBe('anthropic.claude-3-haiku-20240307-v1:0');
     const blocks = converseInput.messages[0].content;
     expect(blocks.some((b) => 'text' in b)).toBe(true);
+    // The judge is told the conversation's classification, under that name.
+    const promptText = String(blocks.find((b) => 'text' in b)?.text);
+    expect(promptText).toContain('Conversation Classification: premium');
+    expect(promptText).not.toContain('User Type');
     expect(blocks).toContainEqual({ image: { format: 'png', source: { bytes: new Uint8Array([1, 2, 3]) } } });
 
     // The image score is written into the SAME columns as a text score (evaluator_model = the vision judge).
@@ -132,7 +136,7 @@ describe('image-turn evaluation routing', () => {
   it('routes a text turn to the TEXT judge (InvokeModel), not the vision judge', async () => {
     mockedQuery
       .mockResolvedValueOnce({ rows: [TEXT_EXCHANGE], rowCount: 1 } as never) // getUnscoredExchanges
-      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never) // getPriorTurns (context)
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never) // getPriorMessages (context)
       .mockResolvedValueOnce({ rows: [], rowCount: 1 } as never) // INSERT evaluation_results
       .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never); // getFlowsToScore
     mockSend.mockResolvedValueOnce(invokeJson({ relevanceScore: 90, classification: 'excellent', reasoning: 'correct' }));
@@ -152,7 +156,8 @@ describe('image-turn evaluation routing', () => {
   });
 
   it('SKIPS an image turn with no attachment — no misleading score is written', async () => {
-    const noAttachment = { ...IMAGE_EXCHANGE, id: 'ex-img-noatt', agent_metadata: {} };
+    // An image generation that persisted nothing records `imageCount: 0` and attaches nothing.
+    const noAttachment = { ...IMAGE_EXCHANGE, id: 'ex-img-noatt', agent_metadata: { imageCount: 0 } };
     mockedQuery
       .mockResolvedValueOnce({ rows: [noAttachment], rowCount: 1 } as never) // getUnscoredExchanges
       .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never); // getFlowsToScore (Pass B) — NO insert in between
@@ -167,6 +172,30 @@ describe('image-turn evaluation routing', () => {
     expect(InvokeMock).not.toHaveBeenCalled();
     expect(mockS3Send).not.toHaveBeenCalled();
     expect(findInsert()).toBeUndefined();
+  });
+
+  it('an image turn is recognized by what it recorded, whatever its intent is called', () => {
+    expect(isImageTurn({ imageCount: 1 })).toBe(true);
+    expect(isImageTurn({ imageCount: 0 })).toBe(true);
+    expect(isImageTurn(JSON.stringify({ attachment: { fileKey: 'battle-images/c1/a.png', name: 'a.png', size: 1, type: 'image/png' } }))).toBe(true);
+    // A generated document, and a reply that recorded no image, are text turns.
+    expect(isImageTurn({ attachment: { fileKey: 'docs/c1/r.pdf', name: 'r.pdf', size: 1, type: 'application/pdf' } })).toBe(false);
+    expect(isImageTurn({})).toBe(false);
+    expect(isImageTurn(undefined)).toBe(false);
+  });
+
+  it('routes a pack intent routed to an image model (logo) to the VISION judge', async () => {
+    const logo = { ...IMAGE_EXCHANGE, id: 'ex-logo', intent: 'logo', agent_metadata: { ...IMAGE_EXCHANGE.agent_metadata, imageCount: 1 } };
+    mockedQuery
+      .mockResolvedValueOnce({ rows: [logo], rowCount: 1 } as never) // getUnscoredExchanges
+      .mockResolvedValueOnce({ rows: [], rowCount: 1 } as never) // INSERT evaluation_results
+      .mockResolvedValueOnce({ rows: [], rowCount: 0 } as never); // getFlowsToScore
+    mockSend.mockResolvedValueOnce(converseJson({ relevanceScore: 75, classification: 'good', reasoning: 'a logo' }));
+
+    const body = JSON.parse((await handler({})).body);
+    expect(body.evaluated).toBe(1);
+    expect(ConverseMock).toHaveBeenCalledTimes(1);
+    expect(InvokeMock).not.toHaveBeenCalled();
   });
 
   it('SKIPS an image turn when the image fetch fails (degrades safely)', async () => {

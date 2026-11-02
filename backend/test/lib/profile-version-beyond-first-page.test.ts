@@ -33,9 +33,9 @@ const VERSIONS = SSM_HISTORY_PAGE_SIZE + 4;
 /** Activate `VERSIONS` versions of `premium`, alternating the model so each is identifiable. */
 async function seedManyVersions(client: Parameters<typeof createDraft>[0]) {
   for (let i = 1; i <= VERSIONS; i++) {
-    await createDraft(client, ROOT, 'premium', 'a');
-    await editDraft(client, ROOT, 'premium', { modelKey: i % 2 === 0 ? 'sonnet' : 'opus' }, 'a');
-    await activateDraft(client, ROOT, 'premium', CATALOG, 'a');
+    await createDraft(client, ROOT, 'advisor', 'a');
+    await editDraft(client, ROOT, 'advisor', { modelKey: i % 2 === 0 ? 'sonnet' : 'opus' }, 'a');
+    await activateDraft(client, ROOT, 'advisor', CATALOG, 'a');
   }
 }
 
@@ -45,7 +45,7 @@ describe('a version past the SSM history page boundary', () => {
     await seedManyVersions(client);
 
     const beyond = VERSIONS; // the newest, well past page 1
-    const def = await lookupProfileVersion(client, ROOT, { profileName: 'premium', version: beyond });
+    const def = await lookupProfileVersion(client, ROOT, { profileName: 'advisor', version: beyond });
 
     // The assertion that matters: NOT null. Null is what made the experiment run control-only.
     expect(def).not.toBeNull();
@@ -57,8 +57,8 @@ describe('a version past the SSM history page boundary', () => {
     const { client } = fakeSsmStore();
     await seedManyVersions(client);
 
-    const onPageOne = await lookupProfileVersion(client, ROOT, { profileName: 'premium', version: 1 });
-    const beyond = await lookupProfileVersion(client, ROOT, { profileName: 'premium', version: VERSIONS });
+    const onPageOne = await lookupProfileVersion(client, ROOT, { profileName: 'advisor', version: 1 });
+    const beyond = await lookupProfileVersion(client, ROOT, { profileName: 'advisor', version: VERSIONS });
     // Assert non-null BEFORE comparing. Without this the comparison passes vacuously when `beyond` is
     // null - undefined !== a real configId - so a broken read would satisfy the very test meant to
     // catch it. Verified by reverting the read path: this line is what turns it red.
@@ -71,7 +71,7 @@ describe('a version past the SSM history page boundary', () => {
   it('is exportable as a manifest', async () => {
     const { client } = fakeSsmStore();
     await seedManyVersions(client);
-    const manifest = await exportManifest(client, ROOT, 'premium', VERSIONS);
+    const manifest = await exportManifest(client, ROOT, 'advisor', VERSIONS);
     expect(manifest.provenance.sourceVersion).toBe(VERSIONS);
   });
 
@@ -81,25 +81,25 @@ describe('a version past the SSM history page boundary', () => {
 
     // Roll back to a version past the boundary but NOT the newest, which is the real operator action.
     const target = SSM_HISTORY_PAGE_SIZE + 1;
-    const rolled = await activateExistingVersion(client, ROOT, 'premium', target, 'operator');
+    const rolled = await activateExistingVersion(client, ROOT, 'advisor', target, 'operator');
     expect(rolled.version).toBe(target);
     expect(rolled.configId).toBeTruthy();
 
     // The console offers whatever `listProfile` returns, so anything it lists must be activatable.
     // A confirm step that pages differently from the list is how rollback refused its own options:
     // `listProfile` follows `NextToken`, the confirm step read page 1. This asserts they agree.
-    const listing = await listProfile(client, ROOT, 'premium');
+    const listing = await listProfile(client, ROOT, 'advisor');
     expect(listing.versions.length).toBeGreaterThan(SSM_HISTORY_PAGE_SIZE);
     for (const v of listing.versions) {
-      await expect(activateExistingVersion(client, ROOT, 'premium', v.version, 'operator')).resolves.toBeTruthy();
+      await expect(activateExistingVersion(client, ROOT, 'advisor', v.version, 'operator')).resolves.toBeTruthy();
     }
   });
 
   it('a version that genuinely does not exist still fails closed', async () => {
     const { client } = fakeSsmStore();
     await seedManyVersions(client);
-    expect(await lookupProfileVersion(client, ROOT, { profileName: 'premium', version: VERSIONS + 50 })).toBeNull();
-    await expect(exportManifest(client, ROOT, 'premium', VERSIONS + 50)).rejects.toThrow(/not found/);
-    await expect(activateExistingVersion(client, ROOT, 'premium', VERSIONS + 50, 'operator')).rejects.toThrow(/not found/);
+    expect(await lookupProfileVersion(client, ROOT, { profileName: 'advisor', version: VERSIONS + 50 })).toBeNull();
+    await expect(exportManifest(client, ROOT, 'advisor', VERSIONS + 50)).rejects.toThrow(/not found/);
+    await expect(activateExistingVersion(client, ROOT, 'advisor', VERSIONS + 50, 'operator')).rejects.toThrow(/not found/);
   });
 });

@@ -84,6 +84,16 @@ describe('aggregateVariantFeedback', () => {
     expect(map.get(feedbackKey('exp1', 'control', 'research'))?.feedback_count).toBe(1);
   });
 
+  it('drops records at or after the end of a past window', () => {
+    const map = aggregateVariantFeedback(
+      [item({ createdAt: ISO(20 * DAY) }), item({ createdAt: ISO(1 * DAY) })],
+      since(),
+      false,
+      Date.now() - 10 * DAY,
+    );
+    expect(map.get(feedbackKey('exp1', 'control', 'research'))?.feedback_count).toBe(1);
+  });
+
   it('excludes battle traffic by default, includes it when asked', () => {
     const rows = [item({ assignmentMode: 'probabilistic' }), item({ assignmentMode: 'battle' })];
     expect(aggregateVariantFeedback(rows, since(), false).get(feedbackKey('exp1', 'control', 'research'))?.feedback_count).toBe(1);
@@ -170,6 +180,13 @@ describe('aggregateBattleWinsByVariant (battle-scoped effectiveness key)', () =>
     );
     expect(map.get(battleWinKey('exp1', 'control'))).toBe(1);
     expect(map.size).toBe(1);
+  });
+
+  it('drops picks at or after the end of a past window', () => {
+    const until = Date.now() - 10 * DAY;
+    const items = [pick({ chosenAt: ISO(20 * DAY) }), pick({ chosenAt: ISO(1 * DAY) })];
+    expect(aggregateBattleWinsByVariant(items, since(), until).get(battleWinKey('exp1', 'control'))).toBe(1);
+    expect(selectBattlePicks(items, since(), null, until)).toHaveLength(1);
   });
 });
 

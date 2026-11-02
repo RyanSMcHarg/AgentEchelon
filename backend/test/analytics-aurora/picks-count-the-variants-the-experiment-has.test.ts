@@ -41,13 +41,14 @@ jest.mock('@aws-sdk/client-dynamodb', () => ({ DynamoDBClient: jest.fn() }), { v
 process.env.BATTLE_OUTCOME_TABLE = 'battle-outcome-test';
 
 import { handler } from '../../lambda/src/analytics-aurora/analytics-query';
+import { edgeContext } from '../helpers/edge-context';
 
 function postEvent(body: unknown): APIGatewayProxyEvent {
   return {
     httpMethod: 'POST',
     path: '/query',
     body: JSON.stringify(body),
-    requestContext: { authorizer: { claims: { sub: 'admin-sub', 'cognito:groups': 'admins' } } },
+    requestContext: { authorizer: edgeContext({ claims: { sub: 'admin-sub', 'cognito:groups': 'admins' } }) },
   } as unknown as APIGatewayProxyEvent;
 }
 
@@ -86,7 +87,7 @@ describe('experiment picks report the wins that exist', () => {
   });
 
   it('counts CUSTOM variant ids instead of reporting nobody voted', async () => {
-    // The defect. With ids the platform does not recognise, both counts read 0 - which reads as "no
+    // The defect. With ids the platform does not recognize, both counts read 0 - which reads as "no
     // human picked a winner" rather than "this rollup cannot name your variants".
     const body = await picksFor([pick('haiku-fast', 'b1'), pick('opus-deep', 'b2'), pick('opus-deep', 'b3')]);
     expect(body.stats.treatment_wins + body.stats.control_wins).toBe(3);

@@ -13,9 +13,16 @@ import {
   correctionInstruction,
   correctionProgressLine,
   deliverableIssues,
+  documentStructure,
   documentWordCount,
+  opensAsADocument,
+  phraseShadowKinds,
+  postInline,
   recordedLengthTarget,
+  stillFailingPackaging,
+  templateCheckOutcome,
 } from '../../lambda/src/lib/deliverable-check';
+import { parseTemplate } from '../../lambda/src/lib/document-template';
 
 /** The extraction that shipped with a chat wrapper around real data (live, 2026-08-20). */
 const WRAPPED_EXTRACTION = `Hi Test, I have everything I need from the churn-risk data already in context. Here's your downloadable table:
@@ -78,11 +85,21 @@ describe('the agreed size is read as numbers, never parsed out of prose', () => 
 });
 
 describe('the checks, against documents this deployment actually produced', () => {
-  it('catches the chat wrapper, the closing offer, and the download claim in one pass', () => {
-    const kinds = deliverableIssues(WRAPPED_EXTRACTION, null).map((i) => i.kind);
-    expect(kinds).toContain('chat_wrapper');
-    expect(kinds).toContain('reader_ask');
-    expect(kinds).toContain('claims_a_file');
+  // WHAT DECIDES IS THE MARKUP (tenet D11). The document opens with a sentence to the person, which
+  // its structure shows in any language; the greeting, the offer and the file claim are English
+  // phrases, measured by the shadow and never acted on.
+  it('catches the wrapper structurally, and measures the phrases without acting on them', () => {
+    expect(deliverableIssues(WRAPPED_EXTRACTION, null).map((i) => i.kind)).toEqual(['chat_wrapper']);
+    const shadow = phraseShadowKinds(WRAPPED_EXTRACTION);
+    expect(shadow).toContain('chat_wrapper');
+    expect(shadow).toContain('reader_ask');
+    expect(shadow).toContain('claims_a_file');
+  });
+
+  it('acts on no phrase: a document that opens as a document is not sent back for one', () => {
+    const doc = '# Findings\n\nThe two high-risk accounts warrant attention. Let me know if you would like more.';
+    expect(deliverableIssues(doc, null)).toEqual([]);
+    expect(phraseShadowKinds(doc)).toEqual(['reader_ask']);
   });
 
   it('passes the same data with the conversation stripped off it', () => {
@@ -141,9 +158,12 @@ describe('the correction instruction asks for a document, not a conversation abo
   const instruction = correctionInstruction(issues, WRAPPED_EXTRACTION);
 
   it('names every issue it found', () => {
-    expect(instruction).toContain('greeting or an announcement of itself');
-    expect(instruction).toContain('question or an offer to the reader');
-    expect(instruction).toContain('attached or downloadable');
+    // The length it was agreed at, and the structural opening, which asks for the conversation out.
+    expect(issues.map((i) => i.kind)).toEqual(['too_short', 'chat_wrapper']);
+    expect(instruction).toContain('The agreed length is');
+    expect(instruction).toContain('opens with a sentence to the reader instead of the document');
+    expect(instruction).toContain('any offer or question to the reader');
+    expect(instruction).toContain('anything about files or downloads');
   });
 
   it('demands the corrected document alone', () => {
@@ -176,7 +196,7 @@ describe('a rewrite is accepted only if it is better AND still the document', ()
   const BLOCK_COPY = 'I cannot process that request. Please rephrase your message.';
 
   it('refuses the guardrail refusal, even though it has no faults at all', () => {
-    expect(deliverableIssues(BLOCK_COPY, null)).toEqual([]);
+    expect(phraseShadowKinds(BLOCK_COPY)).toEqual([]);
     const v = acceptCorrection({
       original: GOOD, rewritten: BLOCK_COPY, issuesBefore, issuesAfter: [], target: null, blocked: true,
     });
@@ -340,5 +360,192 @@ describe('model-authored text cannot carry a control marker into a posted messag
       lengthTarget: { minWords: 600, maxWords: 900, source: 'x'.repeat(500) },
     });
     expect(t!.source.length).toBeLessThanOrEqual(60);
+  });
+});
+
+/**
+ * THE INCIDENT THAT MOVED THE CORRECTION OFF A WORD COUNT (premium extraction, live).
+ *
+ * The document shipped as greeting + narration + table + "I can't generate a downloadable file". The
+ * check flagged it, the model's correction was right - the table under a title, the conversation gone -
+ * and it was REJECTED, because taking out the conversation took out half the words and the floor was
+ * 60% of them. The wrapped original shipped. For purity faults the question is whether the document's
+ * structure survived, and here every table row did.
+ */
+describe('a correction that only removes conversation is judged by the structure it kept', () => {
+  const INCIDENT = [
+    'Hi Ryan, I have everything I need to pull this together. I searched the account records that were '
+      + 'available in context and filtered them to enterprise customers whose health score marks them as a '
+      + 'churn risk this quarter, then sorted them by annual recurring revenue so the largest exposure is at '
+      + 'the top.',
+    '',
+    '| Account | ARR | Risk | Signal |',
+    '|---------|-----|------|--------|',
+    '| Coastal Health Systems | $155K | High | Evaluating a competitor |',
+    '| Precision Analytics | $89K | High | Champion left the company |',
+    '| Northwind Logistics | $132K | Medium | Usage down 40% in 90 days |',
+    '| Brightline Retail | $86K | Medium | Renewal contact unresponsive |',
+    '',
+    "I can't generate a downloadable file directly from here, but you can copy this table into a "
+      + 'spreadsheet and it will keep its columns. Let me know if you would like me to add owners, next '
+      + 'actions or renewal dates to each account, or if you would like the list sliced differently by '
+      + 'region or by product line.',
+  ].join('\n');
+
+  const CORRECTED = [
+    '# Enterprise Accounts at Churn Risk',
+    '',
+    '| Account | ARR | Risk | Signal |',
+    '|---------|-----|------|--------|',
+    '| Coastal Health Systems | $155K | High | Evaluating a competitor |',
+    '| Precision Analytics | $89K | High | Champion left the company |',
+    '| Northwind Logistics | $132K | Medium | Usage down 40% in 90 days |',
+    '| Brightline Retail | $86K | Medium | Renewal contact unresponsive |',
+  ].join('\n');
+
+  it('is the incident: the correction took out about half the words', () => {
+    const before = documentWordCount(INCIDENT);
+    const after = documentWordCount(CORRECTED);
+    expect(before).toBeGreaterThanOrEqual(140);
+    expect(after).toBeLessThan(before * 0.6); // the old floor would have refused it
+  });
+
+  it('accepts the wrapper-only correction because every table row survived', () => {
+    const issuesBefore = deliverableIssues(INCIDENT, null);
+    expect(issuesBefore.map((i) => i.kind)).toEqual(['chat_wrapper']);
+    const issuesAfter = deliverableIssues(CORRECTED, null);
+    expect(issuesAfter).toEqual([]);
+
+    const v = acceptCorrection({ original: INCIDENT, rewritten: CORRECTED, issuesBefore, issuesAfter, target: null });
+    expect(v.accept).toBe(true);
+    expect(v.reason).toContain('structure kept');
+  });
+
+  it('refuses a purity correction that lost table rows', () => {
+    const lostRows = CORRECTED.split('\n').slice(0, 6).join('\n');
+    expect(documentStructure(lostRows).tableRows).toBeLessThan(documentStructure(INCIDENT).tableRows);
+    const v = acceptCorrection({
+      original: INCIDENT,
+      rewritten: lostRows,
+      issuesBefore: deliverableIssues(INCIDENT, null),
+      issuesAfter: deliverableIssues(lostRows, null),
+      target: null,
+    });
+    expect(v.accept).toBe(false);
+    expect(v.reason).toContain('tableRows 5 -> 3');
+  });
+
+  it('keeps the word floor for a length fault, where words are what was agreed', () => {
+    const v = acceptCorrection({
+      original: INCIDENT,
+      rewritten: CORRECTED,
+      issuesBefore: [{ kind: 'too_short', fix: 'x' }, { kind: 'chat_wrapper', fix: 'y' }],
+      issuesAfter: [{ kind: 'too_short', fix: 'x' }],
+      target: { minWords: 600, maxWords: 900, source: '1-2 pages' },
+    });
+    expect(v.accept).toBe(false);
+    expect(v.reason).toContain('60% of the original');
+  });
+});
+
+/**
+ * WHAT COUNTS AS OPENING AS A DOCUMENT, read from markup. It must never fail a correct deliverable:
+ * a code file is code wherever it starts, and an extraction may be CSV-shaped.
+ */
+describe('a document opens as a document, in markup any language shares', () => {
+  it.each([
+    ['a heading', '# Churn risk\n\nThe accounts.'],
+    ['a table row', '| Account | ARR |\n|---|---|\n| Coastal | $155K |'],
+    ['a fenced code block', '```ts\nexport const x = 1;\n```'],
+    ['a bold title line', '**Churn risk accounts**\n\nThe accounts.'],
+    ['a setext heading', 'Churn risk accounts\n===================\n\nThe accounts.'],
+    ['a CSV header and rows', 'account,arr,risk\nCoastal Health,155000,high\nPrecision Analytics,89000,high'],
+    ['a tab-separated extraction', 'account\tarr\nCoastal\t155000\nPrecision\t89000'],
+    ['JSON', '{\n  "accounts": []\n}'],
+  ])('accepts %s', (_label: string, doc: string) => {
+    expect(opensAsADocument(doc)).toBe(true);
+    expect(deliverableIssues(doc, null)).toEqual([]);
+  });
+
+  it.each([
+    ['a greeting', 'Hi Ryan, here is what I found.\n\n| a |\n|---|\n| 1 |'],
+    ['a sentence with one comma above another', 'Sure, I pulled the records.\nThey are below, sorted by ARR.\n\n| a |'],
+    ['a narration', 'I searched the account records and found four.'],
+  ])('flags %s', (_label: string, doc: string) => {
+    expect(opensAsADocument(doc)).toBe(false);
+    expect(deliverableIssues(doc, null).map((i) => i.kind)).toEqual(['chat_wrapper']);
+  });
+
+  it('never fails a code deliverable, wherever its code starts', () => {
+    const rawCode = 'import fs from "fs";\n\nexport function read(p: string) {\n  return fs.readFileSync(p, "utf8");\n}';
+    expect(deliverableIssues(rawCode, null, { code: true })).toEqual([]);
+    const fenced = '```python\nprint("hi")\n```';
+    expect(deliverableIssues(fenced, null)).toEqual([]);
+  });
+});
+
+/**
+ * A DECLARED DOCUMENT THAT STILL FAILS AFTER CORRECTION POSTS INLINE, NOT ATTACHED. The decision is one
+ * pure function the delivery gate reads (`stillFailingPackaging`), so it is exercised here on real
+ * documents, the template case included (SPEC-DOCUMENT-TEMPLATES FR6); the source pins only that the gate
+ * reads it and withholds the file on its answer.
+ */
+describe('a declared document still failing after correction posts inline', () => {
+  const proc = require('fs').readFileSync(
+    require('path').join(__dirname, '../../lambda/src/assistant-async-processor.ts'), 'utf8',
+  ) as string;
+
+  const TEMPLATE = parseTemplate([
+    '---',
+    JSON.stringify({ name: 'account-review', description: 'A review.' }),
+    '---',
+    '# Account review',
+    '## Summary',
+    '## Risks',
+    '| Risk | Owner |',
+    '|---|---|',
+  ].join('\n'));
+  // A real document with a heading, a summary and no risks table: it opens as a document and misses
+  // the template's second section.
+  const MISSING_A_SECTION = '# Coastal Health review\n\n## Summary\n\nRenewal is on track for Q1, with expansion into two new sites.';
+
+  it('withholds the file for a document that still does not follow its template, and posts it after the reply', () => {
+    const issues = deliverableIssues(MISSING_A_SECTION, null, { template: TEMPLATE });
+    expect(issues.map((i) => i.kind)).toEqual(['template_structure']);
+    expect(stillFailingPackaging(issues, true)).toBe('template_structure');
+    expect(templateCheckOutcome({ filled: false, attached: false, corrected: false })).toBe('posted_inline');
+    expect(postInline('Here is where it stands.', MISSING_A_SECTION)).toBe(`Here is where it stands.\n\n${MISSING_A_SECTION}`);
+    expect(postInline('  ', MISSING_A_SECTION)).toBe(MISSING_A_SECTION);
+  });
+
+  it('withholds the file for a remaining purity fault on a declared document', () => {
+    expect(stillFailingPackaging([{ kind: 'chat_wrapper', fix: '' } as never], true)).toBe('purity');
+  });
+
+  it('attaches the best version when only the agreed length is off, and withholds nothing where the reply is the file', () => {
+    expect(stillFailingPackaging([{ kind: 'too_long', fix: '' } as never], true)).toBe('mismatch');
+    expect(stillFailingPackaging([{ kind: 'template_structure', fix: '' } as never], false)).toBe('mismatch');
+    expect(stillFailingPackaging([], true)).toBeNull();
+  });
+
+  it('records the outcome a template check came to', () => {
+    expect(templateCheckOutcome({ filled: true, attached: true, corrected: false })).toBe('filled_by_platform');
+    expect(templateCheckOutcome({ filled: false, attached: true, corrected: true })).toBe('passed_after_correction');
+    expect(templateCheckOutcome({ filled: false, attached: true, corrected: false })).toBe('passed');
+  });
+
+  it('is the decision the gate reads, and the gate withholds the file on it', () => {
+    const at = proc.indexOf('const stillFailing = stillFailingPackaging(issues, replyBesideFile);');
+    expect(at).toBeGreaterThan(-1);
+    const branch = proc.slice(at, at + 2500);
+    expect(branch).toMatch(/stillFailing === 'template_structure'[\s\S]*?generate = false;/);
+    expect(branch).toMatch(/stillFailing === 'purity'[\s\S]*?generate = false;/);
+    expect(proc).toContain('if (!generate && replyBesideFile && documentText) {');
+    expect(proc).toContain('response = postInline(response, documentText);');
+  });
+
+  it('logs the English phrase checks as a shadow and decides nothing from them', () => {
+    expect(proc).toContain("'[AssistantAsyncProcessor][shadow] deliverable_phrase_check'");
+    expect(proc).not.toMatch(/if \([^)]*phraseShadowKinds/);
   });
 });

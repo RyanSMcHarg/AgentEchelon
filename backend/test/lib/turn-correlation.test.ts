@@ -51,17 +51,31 @@ describe('turnCorrelationId', () => {
     // same session on a retry, which is undocumented and was never measured.
     //
     // Asserted at SOURCE level (the pattern control-parity.test.ts uses) because the risk is someone
-    // reintroducing the field, and a behavioural test cannot see an input that is merely ignored.
+    // reintroducing the field, and a behavioral test cannot see an input that is merely ignored.
     const src = fs.readFileSync(
       path.join(__dirname, '..', '..', 'lambda', 'src', 'lib', 'correlation.ts'),
       'utf8',
     );
-    const hashed = /\.update\(\[([^\]]*)\]/.exec(src);
-    expect(hashed).not.toBeNull();
-    expect(hashed![1]).not.toContain('sessionId');
+    // ── ONE DERIVATION, AND IT IS THE WINDOW (2026-09-10) ──────────────────────────────────────
+    //
+    // A second, id-derived form was added here on the belief that a Lex turn carries
+    // `CHIME.message.id`. It does not - Amazon Chime SDK sends exactly `CHIME.channel.arn`,
+    // `CHIME.sender.arn` and `x-amz-lex:channels:platform`, confirmed against fourteen days of Lex
+    // conversation logs on every classification - and the one call site that could have supplied an
+    // id was unreachable, because the branch above it already routes every declared id to
+    // `mentionCorrelationId`. So the form was dead on arrival and has been removed.
+    //
+    // Pinned at EXACTLY ONE so a future addition has to come back through this test rather than
+    // slipping in beside the guarded derivation, which is how the dead one got here.
+    const hashes = src.split('.update([').slice(1).map((rest) => rest.split(']')[0]);
+    expect(hashes.length).toBe(1);
+
+    // The rule itself: nothing a retry can vary may enter the hash.
+    expect(hashes[0]).not.toContain('sessionId');
+
     // And the inputs that must be there, are.
     for (const input of ['channelArn', 'senderArn', 'userMessage', 'bucket']) {
-      expect(hashed![1]).toContain(input);
+      expect(hashes[0]).toContain(input);
     }
   });
 

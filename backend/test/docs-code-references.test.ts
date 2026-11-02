@@ -10,7 +10,7 @@
  *    decision records that name the code implementing the decision. A newer ADR in the same directory
  *    used the correct `../../../backend/…`, so the convention was right and the copies drifted.
  *  - **A transposed filename.** `SPEC-DRIFT-CONVERGENCE` cited
- *    `backend/lib/stacks/analytics-aurora-stack.ts`; the file is `analytics-stack-aurora.ts`.
+ *    `backend/lib/stacks/analytics-aurora-stack.ts`; the file is `archive-stack-aurora.ts`.
  *
  * A path that names something not yet built is fine — the bilingual spec's `translation.ts` is a
  * design-level hook point — but it must SAY so, which is why the allowlist below carries a reason
@@ -31,19 +31,24 @@ const NOT_YET_BUILT: Record<string, string> = {
   'backend/lambda/src/lib/translation.ts':
     'SPEC-BILINGUAL-CONVERSATIONS level 2 (the inference pivot) is design, not built. The spec marks '
     + 'the path as not existing yet, so a reader is not misled.',
-  'backend/lib/stacks/enterprise-classification-stack.ts':
-    'HOW-TO-ADD-OR-MANAGE-A-PROFILE tells the reader to CREATE this file ("Create `…` mirroring '
-    + 'premium-classification-stack.ts"). Prescriptive, not a claim that it exists.',
-  'backend/lambda/cognito-triggers/post-authentication.js':
-    'IDENTITY-PROVIDER-GUIDE offers it as a "Lambda handler sketch" for the reader to add. Its '
-    + 'sibling `post-confirmation.js` DOES exist and is checked by this guard.',
-  'tests/e2e/demo/post2-abtest-battle.demo.spec.ts':
-    'A TROUBLESHOOTING entry about a demo driver that is not present in this repository; the entry '
-    + 'now says so explicitly rather than pointing at nothing.',
 };
+
+/**
+ * Directories no walk in this file enters.
+ *
+ * `.claude` IS THE ONE THAT IS NOT OBVIOUS, and it is why this list exists in one place rather than
+ * being spelled out at each walk. A git worktree created under `.claude/worktrees/` is a SECOND FULL
+ * CHECKOUT INSIDE THE REPOSITORY: every source file then appears twice, and every unqualified
+ * `file.ts:NN` citation in the docs resolves to two candidates and is reported "AMBIGUOUS". That
+ * produced 118 failures on a repository whose docs had not been touched - the guard describing the
+ * checkout layout rather than the documentation. Working in a worktree is normal here, so a guard
+ * that breaks in one is a guard people learn to disbelieve.
+ */
+const SKIP_DIRS = new Set(['node_modules', '.git', '.claude', 'cdk.out', 'dist', 'coverage']);
 
 function markdownFiles(dir: string, out: string[] = []): string[] {
   for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+    if (SKIP_DIRS.has(e.name)) continue;
     const p = path.join(dir, e.name);
     if (e.isDirectory()) markdownFiles(p, out);
     else if (e.name.endsWith('.md')) out.push(p);
@@ -112,7 +117,7 @@ describe('docs cite code paths that exist', () => {
     const all: string[] = [];
     const walk = (d: string) => {
       for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        if (['node_modules', '.git', 'cdk.out', 'dist', 'coverage'].includes(e.name)) continue;
+        if (SKIP_DIRS.has(e.name)) continue;
         const p = path.join(d, e.name);
         if (e.isDirectory()) walk(p);
         else all.push(path.relative(ROOT, p).replace(/\\/g, '/'));
@@ -149,7 +154,7 @@ describe('docs cite code paths that exist', () => {
     const basenames = new Set<string>();
     const walk = (d: string) => {
       for (const e of fs.readdirSync(d, { withFileTypes: true })) {
-        if (['node_modules', '.git', 'cdk.out', 'dist', 'coverage'].includes(e.name)) continue;
+        if (SKIP_DIRS.has(e.name)) continue;
         const p = path.join(d, e.name);
         if (e.isDirectory()) walk(p);
         else basenames.add(e.name);
@@ -169,10 +174,9 @@ describe('docs cite code paths that exist', () => {
       'tier-stack.ts': 'ADR-011 historical record, pre the tier -> classification rename.',
       'iam-policies-stack.ts': 'Removed. Named in ADR history only.',
       'manage-conversation.ts': 'Never existed; retained here only if a doc references it historically.',
-      'post-authentication.js': 'IDENTITY-PROVIDER-GUIDE offers it as a handler sketch to add.',
-      'post2-abtest-battle.demo.spec.ts': 'A demo driver not present in this repository.',
       'translation.ts': 'SPEC-BILINGUAL level 2 is design, not built.',
-      'enterprise-classification-stack.ts': 'HOW-TO guide tells the reader to CREATE it.',
+      'host-config.js': 'Generated at publish, not a source file: deploy-frontend.mjs --widget-host writes it (HOST_CONFIG) with the widget origin.',
+
     };
     const allowedBase = new Set(
       Object.keys(ALLOWED).map((k) => k.split('/').pop() as string),

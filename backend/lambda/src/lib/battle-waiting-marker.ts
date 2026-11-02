@@ -22,8 +22,9 @@ import {
   GetChannelMessageCommand,
   UpdateChannelMessageCommand,
 } from '@aws-sdk/client-chime-sdk-messaging';
+import { sessionClient } from './assistant-session.js';
 
-const messagingClient = new ChimeSDKMessagingClient({});
+const messagingClient = sessionClient(ChimeSDKMessagingClient, {});
 
 /** `<!--battlewaiting:...-->`, the only marker this clear touches. */
 const BATTLE_WAITING_MARKER = /<!--battlewaiting:[^>]*-->/g;
@@ -48,9 +49,11 @@ export async function clearBattleWaitingMarker(
   channelArn: string,
   messageId: string,
   botArn: string,
+  /** The assistant's own client, when the caller speaks for it on a session of its own (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION, Phase 1b). */
+  client: Pick<ChimeSDKMessagingClient, 'send'> = messagingClient,
 ): Promise<boolean> {
   try {
-    const current = await messagingClient.send(new GetChannelMessageCommand({
+    const current = await client.send(new GetChannelMessageCommand({
       ChannelArn: channelArn,
       MessageId: messageId,
       ChimeBearer: botArn,
@@ -65,7 +68,7 @@ export async function clearBattleWaitingMarker(
     }
     BATTLE_WAITING_MARKER.lastIndex = 0;
     const cleared = decoded.replace(BATTLE_WAITING_MARKER, '').trimEnd();
-    await messagingClient.send(new UpdateChannelMessageCommand({
+    await client.send(new UpdateChannelMessageCommand({
       ChannelArn: channelArn,
       MessageId: messageId,
       Content: encodeURIComponent(cleared),

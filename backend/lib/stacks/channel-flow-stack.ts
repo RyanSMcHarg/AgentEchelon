@@ -10,89 +10,95 @@
 
 import * as cdk from 'aws-cdk-lib';
 import * as iam from 'aws-cdk-lib/aws-iam';
+import * as cloudwatch from 'aws-cdk-lib/aws-cloudwatch';
 import * as lambda from 'aws-cdk-lib/aws-lambda';
 import * as lambdaNodeJs from 'aws-cdk-lib/aws-lambda-nodejs';
 import * as ssm from 'aws-cdk-lib/aws-ssm';
 import { Construct } from 'constructs';
 import * as path from 'path';
-import { sesSenderIdentityArns } from '../ses-identity';
 import {
   SSM_ROOT,
   STACK_PREFIX,
-  INSTANCE_SSM,
-  processorArnKey,
-  routerArnKey,
+  RES_PREFIX,
+  routerByNameEnvironment,
+  routerByNameStatements,
+  taskServiceByNameEnvironment,
+  taskServiceByNameStatements,
   CHANNEL_FLOW_ARN_SSM_KEY,
   resolveSharedSSM,
   abuseControlsWiring,
+  turnQueueWiring,
+  roomPrimaryReadStatements,
+  battleResourcesOf,
+  experimentsResourcesOf,
+  EVERY_CLASSIFICATION,
 } from './agent-classification-common';
+import { defaultProfileRegistry as profiles } from '../profile-registry';
+import { utilityModelArns } from '../config/model-strategy';
 
 /** SSM parameter key for the channel flow ARN. Read at runtime by create-conversation
- *  so we avoid a circular stack dependency with FoundationsStack. Re-exported from the
+ *  so we avoid a circular stack dependency with ConversationsStack. Re-exported from the
  *  namespace foundation so existing `from './channel-flow-stack'` imports keep working. */
 export { CHANNEL_FLOW_ARN_SSM_KEY };
 
 export interface ChannelFlowStackProps extends cdk.StackProps {
   appInstanceArn: string;
-  /** BattleStateTable name + ARN for initial INVOKED row writes and orchestrator state queries */
-  battleStateTableName?: string;
-  battleStateTableArn?: string;
-  /** ChannelBattleConfigTable for reading whether a channel has /battle enabled */
-  channelBattleConfigTableName?: string;
-  channelBattleConfigTableArn?: string;
-  /** ExperimentsTable name + ARN. The /battle fan-out reads it (Scan) to resolve a
-   *  generation-out battle's per-variant image-gen models (resolveBattleImageGenPair).
-   *  Without it, loadExperiments() returns [] inside channel-flow and every image
-   *  battle silently falls through to a text battle. */
-  experimentsTableName?: string;
-  experimentsTableArn?: string;
-  /** PRIMARY IDP user pool — the processor resolves participant emails by sub (AdminGetUser) when
-   *  fanning a notify-tagged channel message out over email, for targets without an explicit issuer.
-   *  Identity is never persisted; it is the single source of truth resolved at send time. */
+  /**
+   * The deployment declares `battle`: the flow is told the battle tables' fixed names
+   * (`CAPABILITY_RESOURCES`), and the `Battle` stack grants its role on them (`processorRole`).
+   */
+  battle?: boolean;
+  /**
+   * The deployment declares `experiments`: the /battle fan-out reads the experiments table (Scan) to resolve a
+   * generation-out battle's per-variant image-gen models (resolveBattleImageGenPair); the `Experiments` stack
+   * grants the read. Without it, loadExperiments() returns [] and every image battle falls to a text battle.
+   */
+  experiments?: boolean;
+  /** PRIMARY IDP user pool — the sender's clearance for the `@all` and `/battle` abuse gate is
+   *  derived from the server-verified group list (`AdminListGroupsForUser`) in this pool.
+   *
+   *  The NOTIFICATION fan-out used to resolve recipient contacts here too, and no longer does: it
+   *  runs on the message stream (`post-processing-stack.ts`, ADR-041 decision 7), so this stack
+   *  grants no `AdminGetUser` and no SES send. */
   userPoolId?: string;
-  /** Additional trusted IDP pools, for conversations whose members span MULTIPLE IDPs. A notify
-   *  target's issuer is resolved to its pool and must be in this set (∪ primary) to be looked up. */
-  additionalUserPoolIds?: string[];
-  /** Verified SES sender for the outbound notification transport (SPEC-NOTIFICATION-BRIDGE P1). */
-  senderEmail?: string;
+  /** The bucket an active profile version's persona body lives in (`profiles/*`). The flow resolves the
+   *  active version for the ASSISTANT'S CONFIGURED COPY of the notices it sends itself; absent, a
+   *  version with a persona pointer fails closed to the compiled seed's copy. */
+  attachmentsBucketName?: string;
+  attachmentsBucketArn?: string;
 }
 
 export class ChannelFlowStack extends cdk.Stack {
   public readonly channelFlowArn: string;
   public readonly processorFunctionArn: string;
+  /** The processor's role, which `Battle` and `Experiments` attach their table grants to. */
+  public readonly processorRole: iam.IRole;
 
   constructor(scope: Construct, id: string, props: ChannelFlowStackProps) {
     super(scope, id, props);
 
-    // @all fan-out and /battle target the per-classification async-processors
-    // (AgentEchelonClassification-{Standard,Premium}), resolved at deploy from the SSM
-    // contract those stacks publish (dynamic ref, not Fn::importValue).
-    const basicProcessorArn = ssm.StringParameter.valueForStringParameter(
-      this, processorArnKey('basic'));
-    const standardProcessorArn = ssm.StringParameter.valueForStringParameter(
-      this, processorArnKey('standard'));
-    const premiumProcessorArn = ssm.StringParameter.valueForStringParameter(
-      this, processorArnKey('premium'));
     // The per-classification ROUTER (`router-agent-handler`). `@all` hands the turn to it rather than
-    // running the turn itself (MESSAGE-FLOW §3.1), so the flow needs the same three-way routing table
-    // it already has for processors. Published by the classification stacks alongside processor-arn;
-    // no new SSM contract.
-    const basicRouterArn = ssm.StringParameter.valueForStringParameter(
-      this, routerArnKey('basic'));
-    const standardRouterArn = ssm.StringParameter.valueForStringParameter(
-      this, routerArnKey('standard'));
-    const premiumRouterArn = ssm.StringParameter.valueForStringParameter(
-      this, routerArnKey('premium'));
+    // running the turn itself (MESSAGE-FLOW §6.1). Found by name at call time from the `router-arn` parameter
+    // each classification stack publishes (`resolveRouterArn`), as is the task service, so this stack takes
+    // no deploy-time value from the classification stacks and deploys before or without any one of them; no
+    // classification borrows another's router.
+    // NAMED, NEVER GRANTED HERE (`CAPABILITY_RESOURCES`): the `Battle` and `Experiments` stacks own the grants.
+    const battle = props.battle ? battleResourcesOf(this) : undefined;
+    const experiments = props.experiments ? experimentsResourcesOf(this) : undefined;
 
     // Abuse-controls plane (SPEC-ABUSE-CONTROLS). @all/@assistant mentions and /battle fan-outs are
     // dispatched HERE, before the Lex router that gates the 1:1 tier turn - so the channel-flow
     // processor must enforce the SAME per-user rate limit + per-user/global spend budget, or a group
     // channel becomes a budget-bypass path to the model. Same shared control table + budget envs the
-    // classification processors wire; the `classification` arg is unused by the helper (this shared
-    // flow discovers classification per message at runtime), so any value is fine.
+    // classification processors wire. This shared flow discovers the classification per message at
+    // runtime, so it is wired under its own name.
     const shared = resolveSharedSSM(this);
     const abuse = abuseControlsWiring(
-      this, shared.abuseControlsArn, shared.abuseControlsName, 'standard', this.region, this.account);
+      this, shared.abuseControlsArn, shared.abuseControlsName, 'channel-flow', this.region, this.account);
+    // THE TURN STATE A FAILED DISPATCH IS RECORDED IN. A turn the flow cannot start (`assistant_unreachable`,
+    // `handoff_failed`) is recorded there for the sender's own client to show; without the table those
+    // records were written nowhere and the person saw silence.
+    const turnQueue = turnQueueWiring(this, shared.turnStateArn, shared.turnStateName);
 
     // ============================================================
     // Channel Flow Processor Lambda
@@ -106,7 +112,10 @@ export class ChannelFlowStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: [
                 'chime:ChannelFlowCallback',
-                'chime:SendChannelMessage',
+                // NO SEND AND NO EDIT. Everything the flow says in a conversation - a handed-back
+                // placeholder, a notice, a duel's waiting marker cleared - goes out as the assistant on
+                // that assistant's own vended session (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION, Phase 1b), which can act only as that bot. This
+                // role, holding `${appInstanceArn}/*`, could otherwise post as ANY bot in ANY channel.
                 'chime:ListChannelMemberships',
                 // `/battle end` asks whether the sender is a channel MODERATOR, because ending a duel
                 // destroys work in flight for everyone in it (DESIGN-BATTLE 2a-i). The check is
@@ -124,11 +133,21 @@ export class ChannelFlowStack extends cdk.Stack {
                 // defect the shared marker module was extracted to fix, silently reintroduced by a
                 // missing grant rather than by any change to the code.
                 'chime:GetChannelMessage',
-                'chime:UpdateChannelMessage',
+                // A PRIVATE ADDRESS THAT DISAGREES WITH ITS STORED `Target`. After
+                // release the flow reads the stored message back as the assistant to see its `Target`
+                // (GetChannelMessage, above) and tells the sender what happened
+                // (`lib/private-command.ts`).
+                //
+                // NO `chime:DeleteChannelMessage` HERE, and its absence is the enforcement rather than an
+                // omission. The flow used to delete such a message as the app-instance admin; neither
+                // disagreement deletes any more, because the delete
+                // never unsent anything and destroyed the sender's words to fix their client's bug. The
+                // grant is withdrawn with the behavior, so re-adding the delete without re-deciding the
+                // policy fails on permissions rather than quietly working.
                 // The classification decision (which assistant responds + the /battle premium
                 // gate) reads the IMMUTABLE `classification` tag via ListTagsForResource,
                 // NOT mutable metadata, so a moderator cannot tamper the classification up. Without
-                // this grant the catch fails closed to 'basic'. DescribeChannel is no
+                // this grant the read fails and nothing is dispatched. DescribeChannel is no
                 // longer needed here (the classification no longer comes from channel metadata).
                 'chime:ListTagsForResource',
               ],
@@ -148,7 +167,7 @@ export class ChannelFlowStack extends cdk.Stack {
             new iam.PolicyStatement({
               actions: ['bedrock:InvokeModel'],
               resources: [
-                `arn:aws:bedrock:${this.region}::foundation-model/anthropic.claude-3-haiku-20240307-v1:0`,
+                ...utilityModelArns(this.region, this.account),
               ],
             }),
           ],
@@ -161,92 +180,71 @@ export class ChannelFlowStack extends cdk.Stack {
                 // The processor resolves the channel's per-classification bot (the real
                 // member) to send @all broadcasts + member counts. No shared
                 // cross-classification bot.
-                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/bot-arn`,
+                // THE ASSIGNMENT RECORD is how the flow resolves which assistant serves a role
+                // (DESIGN-SEPARATE-ASSISTANTS 3.0), and it is the ONLY parameter this processor reads.
+                //
+                // The `/assistant/*/bot-arn` grant that stood here is removed rather than kept "for
+                // the other reads": there are none. `channel-flow-processor.ts` has one
+                // `GetParameterCommand` call site and it is the assignment. A grant justified by a
+                // reader that does not exist is how a wildcard outlives its reason.
+                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant-assignments/*/*/*`,
+                // WHETHER BATTLE IS TURNED ON for a classification (ADR-049) is the Battle stack's grant on this
+                // role (`BattleOnTheChannelFlow`), present exactly where `battle` is declared.
               ],
             }),
           ],
         }),
-        // @all hands off to the classification ROUTER; /battle fans out to the classification
-        // processor. Both are ${STACK_PREFIX}Classification-* functions, so one wildcard covers them.
+        // NO ROUTING-TABLE WRITE AND NO VEND: the flow speaks as no assistant, so it never asks for a session.
+        // THE ASSISTANT'S CONFIGURED WORDS for the notices the flow sends itself: telling a sender their
+        // private message did not carry the `Target` its text named (`lib/private-command.ts`). The same
+        // READ-ONLY grants the router and arrival triage carry: the definition namespace, and
+        // `profiles/*` for the persona body a version points at. Without them the read is refused and
+        // the notice falls back to shipped English.
+        ProfileRead: new iam.PolicyDocument({
+          statements: [
+            new iam.PolicyStatement({
+              actions: ['ssm:GetParameter', 'ssm:GetParameterHistory'],
+              resources: [`arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/assistant/*/definition`],
+            }),
+            ...(props.attachmentsBucketArn ? [new iam.PolicyStatement({
+              actions: ['s3:GetObject'],
+              resources: [`${props.attachmentsBucketArn}/profiles/*`],
+            })] : []),
+          ],
+        }),
+        // THE ROUTERS AND TASK SERVICES, BY THEIR CONSTRUCT IDS, and nothing else in the classification stacks.
+        // `@all` and `/battle` hand off to the router, an ended duel's waiting markers are named to it
+        // (`battle-marker-clear.ts`), and a task answer goes to the task service. Each is read from its
+        // classification's parameter and invoked on its own pattern, bounded to this instance's functions that
+        // carry a classification, so neither reaches a classification's vend or processor.
         LambdaInvokePolicy: new iam.PolicyDocument({
           statements: [
-            new iam.PolicyStatement({
-              actions: ['lambda:InvokeFunction'],
-              resources: [`arn:aws:lambda:${this.region}:${this.account}:function:${STACK_PREFIX}Classification-*`],
-            }),
+            ...routerByNameStatements(this, EVERY_CLASSIFICATION),
+            ...taskServiceByNameStatements(this, EVERY_CLASSIFICATION),
           ],
         }),
-        // /battle: write initial INVOKED state rows + read ChannelBattleConfig
-        ...(props.battleStateTableArn && props.channelBattleConfigTableArn && {
-          BattleTablesPolicy: new iam.PolicyDocument({
-            statements: [
-              new iam.PolicyStatement({
-                actions: [
-                  'dynamodb:GetItem',
-                  'dynamodb:PutItem',
-                  'dynamodb:UpdateItem',
-                  'dynamodb:Query',
-                ],
-                resources: [props.battleStateTableArn, props.channelBattleConfigTableArn],
-              }),
-            ],
-          }),
-        }),
-        // /battle generation-out: read the ExperimentsTable to resolve a battle's
-        // per-variant image-gen models (loadExperiments does a Scan). Without this,
-        // an image battle can't resolve its models in the fan-out and falls to text.
-        ...(props.experimentsTableArn && {
-          ExperimentsReadPolicy: new iam.PolicyDocument({
-            statements: [
-              new iam.PolicyStatement({
-                actions: ['dynamodb:Scan', 'dynamodb:GetItem'],
-                resources: [props.experimentsTableArn],
-              }),
-            ],
-          }),
-        }),
-        // SSM lookup for the alt-bot slot roster (channel-flow needs to know
-        // which channel members are alt-slot bots when fanning out /battle).
-        SSMRosterPolicy: new iam.PolicyDocument({
-          statements: [
-            new iam.PolicyStatement({
-              actions: ['ssm:GetParameter', 'ssm:GetParametersByPath'],
-              resources: [
-                `arn:aws:ssm:${this.region}:${this.account}:parameter${SSM_ROOT}/alt-bot-slots/*`,
-              ],
-            }),
-          ],
-        }),
-        // Notification bridge (SPEC-NOTIFICATION-BRIDGE P1, outbound): a notify-tagged
-        // channel message fans out over email. The processor resolves each participant's
-        // email from the IDP by (iss, sub) (AdminGetUser — single source of truth, never
-        // stored) then sends via SES. AdminGetUser is granted on the FULL set of trusted
-        // pools (primary ∪ additional) so cross-IDP rosters resolve. Only wired when a
-        // primary user pool is provided.
+        // /battle's INVOKED state rows and ChannelBattleConfig reads, and the experiments read of a duel's
+        // per-variant image models, are granted on this role by the `Battle` and `Experiments` stacks.
+        // THE SENDER'S CLEARANCE, and nothing else this pool can answer.
+        //
+        // The /battle and @all abuse gate meters the sender against the limits for a
+        // classification, and clearance is derived from the server-verified group list rather
+        // than from anything the client says. Primary pool only: clearance is an AE-pool concept,
+        // and a federated sender never reaches the lookup.
+        //
+        // THIS USED TO CARRY THE NOTIFICATION BRIDGE AS WELL - `AdminGetUser` on every trusted pool
+        // and `ses:SendEmail` on the sender identity - because the fan-out was awaited in front of
+        // `ChannelFlowCallback`. It runs on the message stream now (ADR-041 decision 7), so the
+        // grants moved with it rather than being left behind on a role that no longer sends.
         ...(props.userPoolId && {
-          NotifyBridgePolicy: new iam.PolicyDocument({
+          SenderClearancePolicy: new iam.PolicyDocument({
             statements: [
               new iam.PolicyStatement({
-                // AdminListGroupsForUser: the /battle and @all abuse gate meters the sender at
-                // min(channel, clearance) - the same rule the router applies to ordinary turns -
-                // and clearance is derived from the server-verified group list. Primary pool only:
-                // clearance is an AE-pool concept, and federated senders never reach the lookup.
-                actions: ['cognito-idp:AdminGetUser', 'cognito-idp:AdminListGroupsForUser'],
-                resources: [...new Set([props.userPoolId, ...(props.additionalUserPoolIds || [])])].map(
-                  (poolId) => `arn:aws:cognito-idp:${this.region}:${this.account}:userpool/${poolId}`,
-                ),
-              }),
-              new iam.PolicyStatement({
-                actions: ['ses:SendEmail', 'ses:SendRawEmail'],
-                // Scope to the configured sender identity (matching notification-stack),
-                // not '*' — a '*' would let the processor send as any verified SES
-                // identity in the account. Both the address and its parent domain, since
-                // SES authorizes against whichever it resolves the From address to.
-                resources: sesSenderIdentityArns(
-                  this.region,
-                  this.account,
-                  props.senderEmail || 'noreply@example.com',
-                ),
+                // ListUsers resolves a federated person's `sub` to their pool username (`bySubjectOrUsername`, cognito-pool-directory.ts).
+                actions: ['cognito-idp:AdminListGroupsForUser', 'cognito-idp:ListUsers'],
+                resources: [
+                  `arn:aws:cognito-idp:${this.region}:${this.account}:userpool/${props.userPoolId}`,
+                ],
               }),
             ],
           }),
@@ -256,7 +254,13 @@ export class ChannelFlowStack extends cdk.Stack {
         iam.ManagedPolicy.fromAwsManagedPolicyName('service-role/AWSLambdaBasicExecutionRole'),
       ],
     });
+    // THE ROOM'S PRIMARY (§3.8): `primaryAssistantOf` reads the room's tags and enumerates the assignment
+    // records (`GetParametersByPath`), which the single-key grant above does not cover.
+    for (const stmt of roomPrimaryReadStatements(this, EVERY_CLASSIFICATION)) processorRole.addToPolicy(stmt);
 
+    // The processor's reserved concurrency, sized in the note on `reservedConcurrentExecutions` below
+    // and read again by the occupancy alarm, so the alarm moves with the reservation.
+    const processorConcurrency = 50;
     const processorFn = new lambdaNodeJs.NodejsFunction(this, 'ChannelFlowProcessor', {
       entry: path.join(__dirname, '../../lambda/src/channel-flow-processor.ts'),
       handler: 'handler',
@@ -270,77 +274,64 @@ export class ChannelFlowStack extends cdk.Stack {
       // Pinned by `channel-flow-outlasts-router.test.ts`.
       timeout: cdk.Duration.seconds(35),
       memorySize: 256,
-      // THE 35s CEILING ABOVE DOES NOT SIZE THIS NUMBER. Concurrency is consumed by DURATION, not by
+      // THE 35s LIMIT ABOVE DOES NOT SIZE THIS NUMBER. Concurrency is consumed by DURATION, not by
       // the timeout, and the `@all` handoff returns at TTFF: the router classifies, dispatches the
       // async processor and returns the placeholder, so it is back in the SLO's 1s target / 2s
-      // threshold (LATENCY-TARGETS), not at the 35s ceiling. At the 2s threshold, 50 slots sustain 25
-      // `@all` turns per second; an ordinary message takes the `callbackAllow` path and frees its slot
+      // threshold (LATENCY-TARGETS), not at the 35s limit. At the 2s threshold, 50 executions sustain 25
+      // `@all` turns per second; an ordinary message takes the `callbackAllow` path and frees its execution
       // in well under a second. The battle round-1 fan-out invokes the two sides with `Promise.all`,
-      // so a duel still occupies ONE slot for one TTFF, not two in series.
+      // so a duel still holds ONE execution for one TTFF, not two in series.
       //
       // RAISING THIS MAKES A BURST WORSE, WHICH IS WHY IT IS NOT RAISED. A reservation is a hard
       // carve-out from the account's concurrency pool, and `AgentHandler` - the router this function
-      // invokes and WAITS on - holds no reservation of its own. Extra slots here therefore come out of
+      // invokes and WAITS on - holds no reservation of its own. Extra reserved executions here therefore come out of
       // the pool the callee draws from, and a throttled `RequestResponse` invoke throws rather than
       // being retried, so the added capacity lands on the caller and the failure lands on the callee.
-      // A duel doubles that pressure: one flow slot issues two concurrent router invokes.
+      // A duel doubles that pressure: one flow execution issues two concurrent router invokes.
       //
       // What a burst past 50 actually does: Amazon Chime SDK invokes this processor ASYNC with
       // `FallbackAction: CONTINUE` (below), so a throttled invocation is retried from Lambda's async
       // queue rather than dropped, and only a wait past the flow's own deadline delivers the message
       // unprocessed. Sustained saturation here is a router-latency incident, not a sizing one - the
-      // signal to act on is `@all` occupancy climbing toward the ceiling, not this number.
-      reservedConcurrentExecutions: 50,
+      // signal to act on is `@all` occupancy climbing toward the limit, not this number.
+      reservedConcurrentExecutions: processorConcurrency,
       role: processorRole,
       environment: {
-        // @all fan-out (standard) + /battle fan-out (premium) → classification processors,
-        // resolved from SSM at deploy. lib/battle-state.ts fails open if these
-        // are absent, so a partial rollout never throws at runtime.
         SSM_ROOT,
-        // @all routes to the processor MATCHING the channel classification (F1): basic→basic,
-        // standard→standard (the ASYNC_PROCESSOR_ARN default), premium→premium. Without the basic ARN
-        // an @all in a basic channel would run on the standard processor and leak standard-tier context.
-        ASYNC_PROCESSOR_ARN: standardProcessorArn,
-        BASIC_ASYNC_PROCESSOR_ARN: basicProcessorArn,
-        PREMIUM_ASYNC_PROCESSOR_ARN: premiumProcessorArn,
         // @all hands the turn to the classification's ROUTER, which classifies, resolves the profile
-        // and variant, and dispatches the processor - the same code Lex fulfills into. Same
-        // three-way routing rule as the processors above, and covered by the SAME invoke grant: the
-        // routers are ${STACK_PREFIX}Classification-* functions too.
-        ROUTER_ARN: standardRouterArn,
-        BASIC_ROUTER_ARN: basicRouterArn,
-        PREMIUM_ROUTER_ARN: premiumRouterArn,
-        ...(props.battleStateTableName && {
-          BATTLE_STATE_TABLE: props.battleStateTableName,
-        }),
-        ...(props.channelBattleConfigTableName && {
-          CHANNEL_BATTLE_CONFIG_TABLE: props.channelBattleConfigTableName,
-        }),
+        // and variant, and dispatches the processor - the same code Lex fulfills into. Each
+        // classification reaches only its own router (`lib/router-arn.ts`), found by name at call time.
+        ...routerByNameEnvironment(),
+        // ADR-035: a bare `#<n>` in a group is routed only when the task service of the conversation's
+        // classification says its sender may answer that item, found by name like the router
+        // (`resolveTaskServiceArn`). No fallback across classifications.
+        ...taskServiceByNameEnvironment(),
+        ...(battle ? { BATTLE_STATE_TABLE: battle.battleStateName, CHANNEL_BATTLE_CONFIG_TABLE: battle.channelBattleConfigName } : {}),
         // /battle generation-out: lets loadExperiments() resolve a battle's image-gen
         // models in the fan-out. Absent ⇒ loadExperiments returns [] ⇒ text battle.
-        ...(props.experimentsTableName && {
-          EXPERIMENTS_TABLE: props.experimentsTableName,
-        }),
-        ALT_BOT_SLOTS_ROSTER_PARAM: INSTANCE_SSM.altBotSlotsRoster,
-        // Notification bridge (P1): resolve participant emails by (iss, sub) + send via SES.
-        // NOTIFY_ALLOWED_POOL_IDS = the trusted pools an issuer may resolve to (multi-IDP).
+        ...(experiments ? { EXPERIMENTS_TABLE: experiments.experimentsName } : {}),
+        // The pool the sender's clearance is read from (`lib/clearance-source.ts`). The notification
+        // bridge's own variables - the additional trusted pools and the SES sender - moved to the
+        // post-processing stack with the fan-out (ADR-041 decision 7).
         ...(props.userPoolId && { USER_POOL_ID: props.userPoolId }),
-        ...(props.additionalUserPoolIds && props.additionalUserPoolIds.length && {
-          NOTIFY_ALLOWED_POOL_IDS: props.additionalUserPoolIds.join(','),
-        }),
-        ...(props.senderEmail && { SENDER_EMAIL: props.senderEmail }),
+        // The persona body store, so resolving the active profile version for its copy can follow a
+        // persona pointer (`hydrateBodies`) instead of failing closed to the seed.
+        ...(props.attachmentsBucketName && { PROFILE_BODY_BUCKET: props.attachmentsBucketName }),
         // Abuse controls: ABUSE_CONTROLS_TABLE + budget/rate/circuit envs, so enforceAbuseGate can
-        // meter the @all/battle dispatch paths. No-op until the budget ceilings are set via context.
+        // meter the @all/battle dispatch paths. No-op until the budget limits are set via context.
         ...abuse.env,
+        ...turnQueue.env,
       },
       bundling: { minify: false, forceDockerBundling: false },
     });
 
     this.processorFunctionArn = processorFn.functionArn;
+    this.processorRole = processorRole;
 
     // Grant the processor role PutItem/UpdateItem/GetItem on the shared abuse-controls table (+ the
     // circuit SSM param when a global budget is wired) so the rate-limit / budget counters can bump.
     abuse.grant(processorRole);
+    turnQueue.grant(processorRole);
 
     // Grant Chime SDK permission to invoke the processor
     processorFn.addPermission('ChimeInvoke', {
@@ -464,6 +455,63 @@ exports.handler = async (event) => {
       parameterName: CHANNEL_FLOW_ARN_SSM_KEY,
       stringValue: this.channelFlowArn,
       description: 'Channel flow ARN used by create-conversation to AssociateChannelFlow',
+    });
+
+    // ============================================================
+    // Alarms
+    // ============================================================
+    //
+    // THE FLOW SITS IN FRONT OF EVERY MESSAGE, AND ITS FAILURES ARE QUIET. Amazon Chime SDK invokes the
+    // processor with `FallbackAction: CONTINUE`, so a processor that errors, is throttled or runs past
+    // the flow's deadline still lets the person's message through - it just reaches no assistant. The
+    // room sees an unanswered message and nothing else does, so these three are the only places the
+    // failure shows. Left without an action, like the stack's other alarms: existing and visible is the
+    // floor, and wiring a destination is the deployer's choice.
+    const FIVE_MINUTES = cdk.Duration.minutes(5);
+    new cloudwatch.Alarm(this, 'ChannelFlowProcessorErrorsAlarm', {
+      alarmName: `${STACK_PREFIX}-channel-flow-processor-errors`,
+      alarmDescription:
+        'The channel-flow processor threw. Its fallback lets the message through, so the person sees '
+        + 'their message delivered and unanswered. Read the processor log group for the failing '
+        + 'invocation; a refusal from the classification boundary is logged as a [SecurityEvent].',
+      metric: processorFn.metricErrors({ period: FIVE_MINUTES, statistic: 'Sum' }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    new cloudwatch.Alarm(this, 'ChannelFlowProcessorThrottlesAlarm', {
+      alarmName: `${STACK_PREFIX}-channel-flow-processor-throttles`,
+      alarmDescription:
+        'The channel-flow processor was throttled at its reserved concurrency. A throttled invocation '
+        + 'is retried from the async queue, and one that waits past the flow deadline delivers the '
+        + 'message unprocessed. Sustained throttling is a router-latency incident: check the router '
+        + 'duration before raising the reservation (see the note on reservedConcurrentExecutions).',
+      metric: processorFn.metricThrottles({ period: FIVE_MINUTES, statistic: 'Sum' }),
+      threshold: 1,
+      evaluationPeriods: 1,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
+    });
+    // OCCUPANCY CLIMBING TOWARD THE RESERVATION is the signal the sizing note names, and it comes
+    // before the throttles: 80% of the reserved concurrency, held across two periods.
+    new cloudwatch.Alarm(this, 'ChannelFlowProcessorOccupancyAlarm', {
+      alarmName: `${STACK_PREFIX}-channel-flow-processor-occupancy`,
+      alarmDescription:
+        'The channel-flow processor is using 80% of its reserved concurrency. Turns that wait on the '
+        + 'router (@all, /battle) hold an execution for the router time, so rising occupancy means the router '
+        + 'is slow before it means traffic is high. Throttling follows at 100%.',
+      metric: new cloudwatch.Metric({
+        namespace: 'AWS/Lambda',
+        metricName: 'ConcurrentExecutions',
+        dimensionsMap: { FunctionName: processorFn.functionName },
+        statistic: 'Maximum',
+        period: FIVE_MINUTES,
+      }),
+      threshold: Math.floor(processorConcurrency * 0.8),
+      evaluationPeriods: 2,
+      comparisonOperator: cloudwatch.ComparisonOperator.GREATER_THAN_OR_EQUAL_TO_THRESHOLD,
+      treatMissingData: cloudwatch.TreatMissingData.NOT_BREACHING,
     });
 
     // ============================================================

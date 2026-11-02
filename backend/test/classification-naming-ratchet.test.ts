@@ -38,6 +38,68 @@ const SCAN_EXTENSIONS = new Set(['.ts', '.tsx', '.mjs', '.sql']);
  */
 const EXEMPT: Array<{ pattern: RegExp; why: string }> = [
   {
+    // The template text only, by the field it qualifies, so code and prose in that file are still checked.
+    pattern: /\{\{classification\}\} tier\)|\{\{(classification|clearance)\}\}-tier\b/,
+    why: 'The operator notices the admin channel receives (`admin-notice-templates.ts`, ADR-062 decision 6), word for '
+      + 'word what their emitters said before they were templates. They are copy an operator reads, reworded through the '
+      + 'admin assistant\'s own template family, not an internal name.',
+  },
+  {
+    // The CDK property only, so a classification called "tier" beside it is still caught.
+    pattern: /\btier: [^\n]*ssm\.ParameterTier\./,
+    why: 'The SSM parameter tier (STANDARD or ADVANCED) is the AWS property\'s own name, and has nothing to do '
+      + 'with a classification.',
+  },
+  {
+    // The SDK request field only, written as a PutParameter input.
+    pattern: /\bTier: 'Intelligent-Tiering'/,
+    why: 'The SSM PutParameter Tier value is the AWS API\'s own name, and has nothing to do with a classification.',
+  },
+  {
+    // The member access and the type key only, so a local named after it is still caught.
+    pattern: /\.tiers\b|'tiers'/,
+    why: 'The PERSISTED attribute an experiment record stores its classifications under, read by the '
+      + 'resolver, the console and the handlers alike. Renaming it is a data migration on every stored '
+      + 'experiment, not an internal rename, so the access is exempt rather than the file grandfathered.',
+  },
+  {
+    // The quoted message only, so the code around it is still checked.
+    pattern: /`Your tier \(/,
+    why: 'The 403 message `create-conversation.ts` returns to a PERSON who asked for a conversation '
+      + 'their clearance does not reach. "Tier" is the customer-facing word, and this is the sentence '
+      + 'they read.',
+  },
+  {
+    // The literal code only, in caps. A prose mention of "tier" beside it is still caught.
+    pattern: /\bTIER_FORBIDDEN\b/,
+    why: 'A WIRE error code the deployed API returns, not an internal name. The e2e helpers quote it '
+      + 'verbatim so a reader recognizes the 403 they will see in a failure; renaming the quote '
+      + 'without renaming the code would make the test describe a response that does not exist. '
+      + 'Renaming the code itself is a customer-facing API change, so it belongs with userTier and '
+      + 'modelTier above rather than in GRANDFATHERED.',
+  },
+  {
+    // The key name only, so the prose and code around it are still checked.
+    pattern: /\bassistantTier\b/,
+    why: 'A RETIRED deploy-context key. It is named where synth refuses it (`RETIRED_CONTEXT_KEYS`) and '
+      + 'where the docs drift guard bans it, so a deployer still passing it is told what replaced it; the '
+      + 'name is the key operators typed, not an internal one to rename.',
+  },
+  {
+    // The exchange answer's field only, with the values it carries, so prose around it is still caught.
+    pattern: /\btier\??: (string|'admin'|'team'|'restricted'|accessClass|roleKey)(?!\w)/,
+    why: 'The WIRE field of every credential exchange answer (`tier`), which the chat app and the admin '
+      + 'console read; its value is the caller\'s classification. Renaming it is a coordinated API change '
+      + 'across both exchanges and both clients, the same class as userTier and modelTier below.',
+  },
+  {
+    // The pool's attribute and the console route that sets it, by their literal names only.
+    pattern: /withCustomAttributes\('tier'\)|'approve', 'reject', 'tier'/,
+    why: 'The Cognito user pool attribute custom:tier (a requested tier a sign-up sends) and the console '
+      + 'route POST /users/tier that sets a person\'s clearance. Both are persisted or wire names the '
+      + 'console and the pool already carry; renaming either is a migration, not a naming sweep.',
+  },
+  {
     pattern: /\buserTier\b|\bmodelTier\b/,
     why: 'Wire/DTO fields the CHAT UI renders as the user-visible tier badge. Renaming these is a '
       + 'customer-facing change, not an internal one.',
@@ -97,6 +159,12 @@ const EXEMPT: Array<{ pattern: RegExp; why: string }> = [
       + 'error the API actually returns. Exempted as a PATTERN rather than by grandfathering the '
       + 'file, so any genuine classification "tier" in the same file is still caught.',
   },
+  {
+    // The three phrases of the sample's persona prose only, so code beside them is still checked.
+    pattern: / tier \(\{model\}\)|Your capabilities on this tier:|assistant platform with tiered access( \(|\s*$)/,
+    why: 'The sample\'s built-in personas (`lib/config/sample-personas.ts`): what the assistant tells a PERSON '
+      + 'about itself, so "tier" is the customer-facing word, the same class as the 403 a person reads.',
+  },
 ];
 
 /**
@@ -106,23 +174,19 @@ const EXEMPT: Array<{ pattern: RegExp; why: string }> = [
  * without a 2000-line change that nobody could review.
  */
 const GRANDFATHERED = new Set<string>([
-  'backend/lambda/src/admin-conversations.ts',
   'backend/lambda/src/admin-experiments.ts',
   'backend/lambda/src/analytics-aurora/analytics-query.ts',
   'backend/lambda/src/analytics-aurora/schema/008-document-embeddings.sql',
   'backend/lambda/src/analytics-query.ts',
-  'backend/lambda/src/assistant-async-processor.ts',
+
   'backend/lambda/src/channel-battle.ts',
   'backend/lambda/src/channel-flow-processor.ts',
   'backend/lambda/src/create-app-instance-admin.ts',
-  'backend/lambda/src/credential-exchange.ts',
-  'backend/lambda/src/federated-credential-exchange.ts',
   'backend/lambda/src/lib/analytics-metadata.ts',
   'backend/lambda/src/lib/async-processor-core.ts',
   'backend/lambda/src/lib/auth.ts',
   'backend/lambda/src/lib/caller-scope.ts',
   'backend/lambda/src/lib/experiment-manager.ts',
-  'backend/lambda/src/lib/live-drift-flow.ts',
   'backend/lambda/src/lib/onboarding-intake.ts',
   'backend/lambda/src/lib/profile-lifecycle.ts',
   'backend/lambda/src/lib/profile-manifest.ts',
@@ -131,23 +195,21 @@ const GRANDFATHERED = new Set<string>([
   'backend/lambda/src/user-management.ts',
   'backend/lib/config/admin-capabilities.ts',
   'backend/lib/config/profiles.ts',
-  'backend/lib/constructs/membership-audit.ts',
-  'backend/lib/stacks/agent-classification-common.ts',
-  'backend/lib/stacks/analytics-stack-aurora.ts',
-  'backend/lib/stacks/analytics-stack.ts',
+  // live-drift-flow.ts and agent-classification-common.ts left this list on 2026-09-26: their only
+  // offending word was a quoted section title, 'runs on all AE tiers', cited from a spec that has never
+  // had a section by that name. Repointing the citation removed the word, so there is nothing left to
+  // grandfather.
+  'backend/lib/stacks/archive-stack-aurora.ts',
+  'backend/lib/stacks/archive-stack.ts',
   'backend/lib/stacks/assistant-profile-stack.ts',
   // `battle-stack.ts` left this list 2026-08-16: its last offending token was a citation of
   // `SPEC-PER-TIER-OWNERSHIP`, a document renamed to `SPEC-PER-PROFILE-OWNERSHIP` by the
   // tier→classification work. Repointing the citation at the document that exists cleaned the file,
   // and the ratchet caught that the list had gone stale in the same motion.
   'backend/lib/stacks/channel-flow-stack.ts',
-  'backend/lib/stacks/cognito-auth-stack.ts',
-  'backend/lib/stacks/experiments-stack.ts',
-  'backend/lib/stacks/foundations-stack.ts',
+  'backend/lib/stacks/identity-stack.ts',
   'backend/scripts/backfill-analytics-placeholders.mjs',
   'backend/scripts/backfill-channel-classification-tags.mjs',
-  'backend/scripts/backfill-channel-flow.mjs',
-  'backend/scripts/backfill-tier-groups.mjs',
   'backend/scripts/concurrency-check.ts',
   'backend/scripts/deny-test-credential-exchange.mjs',
   'backend/scripts/deploy.mjs',

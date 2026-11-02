@@ -1,16 +1,21 @@
 /**
  * Routing State Helper
  *
- * Manages the pending-drift-suggestion state that persists across Lex turns.
- * State has two stores:
+ * Manages the pending drift offer between the turn that makes it and the turn that answers it.
  *
- *   1. Lex sessionAttributes (primary, in-flight). Fast, ephemeral, gets
- *      reset when the Lex session expires.
+ * ONE STORE: Aurora `conversation_creation_tasks`, read at the start of every drift turn. Rows expire
+ * after 30 minutes via `expires_at`.
  *
- *   2. Aurora `conversation_creation_tasks` (backup, durable). Read on
- *      session-reset paths so a Lex session timeout doesn't lose pending
- *      drift state. Rows expire after 30 minutes via the spec's
- *      `expires_at` column.
+ * NOT THE AMAZON LEX SESSION, which this used to treat as the primary copy. That session exists only
+ * when Lex is the entry: a turn the channel flow answers starts with it empty and its writes are
+ * discarded, and Lex drops it after five idle minutes on its own. A pending offer that lives there is
+ * one that some turns cannot see - a "yes" that reaches the flow's entry finds nothing to confirm, and
+ * an ordinary message fires a second offer beside the first. Turn state belongs to AgentEchelon, not to
+ * one of the ways a turn can arrive.
+ *
+ * Declines are not tracked here either. A declined offer's subject becomes a topic of the
+ * conversation (`adoptOfferedTopic`, migration 044), so it stops being drift rather than being
+ * suppressed by distance.
  *
  * The pending state captures what we offered the user, so when their next
  * message arrives we can decide:
@@ -18,7 +23,7 @@
  *   - "no" / decline → record the cosine-distance band so we don't re-ask
  *   - ambiguous → ask once, then default to "continue here"
  *
- * Per SPEC-DRIFT-CONVERGENCE.md "Clarification Routing in Multi-Bot
+ * Per SPEC-DRIFT-CONVERGENCE, the live-suggestion flow (clarification routing in multi-assistant
  * Channels": only one pending suggestion per (channel, user) at a time.
  * A new suggestion replaces the previous pending state.
  */
@@ -30,60 +35,18 @@ export type SuggestionKind = 'confirm' | 'redirect';
 export interface PendingSuggestion {
   taskId: string;
   channelArn: string;
-  userSub: string;
+  personId: string;
   kind: SuggestionKind;
   rivalConversationArn?: string;
   originatingMessageId: string;
-  /**
-   * The text of the message that caused the drift, carried so the new conversation's welcome can quote it
-   * back to the person.
-   *
-   * Carried HERE rather than re-read at confirm time because the confirm arrives on a LATER turn ("yes"),
-   * by which point the triggering message is no longer the turn's input. Session-scoped and short-lived:
-   * it exists only between the suggestion and the answer.
-   */
-  originatingMessageText?: string;
   cosineDistance?: number;
   correlationId: string;
-  driftEventId?: string;        // The drift_events row id (set after recordDriftFire)
+  /**
+   * The drift_events row this offer fired, so its outcome can be recorded when it is answered. Stored on
+   * the durable row (migration 044): without it an answered offer left its drift event unresolved.
+   */
+  driftEventId?: string;
   createdAt: string;
-}
-
-export interface RoutingSessionAttributes {
-  pendingDriftSuggestion?: PendingSuggestion;
-  declinedDistances?: number[];  // capped at last 3 declines
-}
-
-const MAX_DECLINED_DISTANCES = 3;
-
-// ---------------------------------------------------------------------------
-// Lex sessionAttributes serialization
-//
-// Lex sessionAttributes is a Record<string, string>. We serialize the whole
-// routing state under a single key to avoid colliding with other consumers
-// of the same session.
-// ---------------------------------------------------------------------------
-
-const ROUTING_KEY = 'agentEchelonRouting';
-
-export function readRoutingFromSession(
-  sessionAttributes: Record<string, string> | undefined,
-): RoutingSessionAttributes {
-  if (!sessionAttributes || !sessionAttributes[ROUTING_KEY]) return {};
-  try {
-    const parsed = JSON.parse(sessionAttributes[ROUTING_KEY]);
-    if (typeof parsed !== 'object' || parsed === null) return {};
-    return parsed as RoutingSessionAttributes;
-  } catch {
-    return {};
-  }
-}
-
-export function writeRoutingToSession(
-  sessionAttributes: Record<string, string>,
-  routing: RoutingSessionAttributes,
-): Record<string, string> {
-  return { ...sessionAttributes, [ROUTING_KEY]: JSON.stringify(routing) };
 }
 
 // ---------------------------------------------------------------------------
@@ -92,50 +55,49 @@ export function writeRoutingToSession(
 
 export async function savePendingSuggestion(input: {
   channelArn: string;
-  userSub: string;
+  personId: string;
   kind: SuggestionKind;
   rivalConversationArn?: string;
   originatingMessageId: string;
   cosineDistance?: number;
   correlationId: string;
+  driftEventId?: string;
 }): Promise<PendingSuggestion> {
-  // Aurora write — durable backup.
   const rows = await query<{ task_id: string; created_at: string }>(
     `INSERT INTO conversation_creation_tasks (
-       user_sub, channel_arn, suggestion_kind, rival_conversation_arn,
-       originating_message_id, cosine_distance, correlation_id, status
-     ) VALUES ($1, $2, $3, $4, $5, $6, $7, 'pending')
-     RETURNING task_id::text AS task_id, created_at::text AS created_at`,
+       person_id, channel_arn, suggestion_kind, rival_conversation_arn,
+       originating_message_id, cosine_distance, correlation_id, drift_event_id, status
+     ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, 'pending')
+     RETURNING task_id::text AS task_id, to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at`,
     [
-      input.userSub,
+      input.personId,
       input.channelArn,
       input.kind,
       input.rivalConversationArn || null,
       input.originatingMessageId,
       input.cosineDistance ?? null,
       input.correlationId,
+      input.driftEventId || null,
     ],
   );
   const row = rows.rows[0];
   return {
     taskId: row.task_id,
     channelArn: input.channelArn,
-    userSub: input.userSub,
+    personId: input.personId,
     kind: input.kind,
     rivalConversationArn: input.rivalConversationArn,
     originatingMessageId: input.originatingMessageId,
     cosineDistance: input.cosineDistance,
     correlationId: input.correlationId,
+    ...(input.driftEventId ? { driftEventId: input.driftEventId } : {}),
     createdAt: row.created_at,
   };
 }
 
-/**
- * Read the pending suggestion for a (user, channel) pair from Aurora.
- * Used on Lex session-reset paths where the in-memory session state was lost.
- */
+/** The open drift offer for a (user, channel) pair, or null. Read at the start of every drift turn. */
 export async function readPendingSuggestion(input: {
-  userSub: string;
+  personId: string;
   channelArn: string;
 }): Promise<PendingSuggestion | null> {
   const rows = await query<{
@@ -145,6 +107,7 @@ export async function readPendingSuggestion(input: {
     originating_message_id: string;
     cosine_distance: string | null;
     correlation_id: string;
+    drift_event_id: string | null;
     created_at: string;
   }>(
     `SELECT task_id::text AS task_id,
@@ -153,24 +116,26 @@ export async function readPendingSuggestion(input: {
             originating_message_id,
             cosine_distance::text AS cosine_distance,
             correlation_id::text AS correlation_id,
-            created_at::text AS created_at
+            drift_event_id,
+            to_char(created_at AT TIME ZONE 'UTC', 'YYYY-MM-DD"T"HH24:MI:SS.MS"Z"') AS created_at
        FROM conversation_creation_tasks
-      WHERE user_sub = $1 AND channel_arn = $2 AND status = 'pending' AND expires_at > NOW()
+      WHERE person_id = $1 AND channel_arn = $2 AND status = 'pending' AND expires_at > NOW()
       ORDER BY created_at DESC
       LIMIT 1`,
-    [input.userSub, input.channelArn],
+    [input.personId, input.channelArn],
   );
   const row = rows.rows[0];
   if (!row) return null;
   return {
     taskId: row.task_id,
     channelArn: input.channelArn,
-    userSub: input.userSub,
+    personId: input.personId,
     kind: row.suggestion_kind,
     rivalConversationArn: row.rival_conversation_arn || undefined,
     originatingMessageId: row.originating_message_id,
     cosineDistance: row.cosine_distance != null ? Number(row.cosine_distance) : undefined,
     correlationId: row.correlation_id,
+    ...(row.drift_event_id ? { driftEventId: row.drift_event_id } : {}),
     createdAt: row.created_at,
   };
 }
@@ -187,19 +152,6 @@ export async function resolvePendingSuggestion(input: {
         AND status = 'pending'`,
     [input.outcome, input.taskId],
   );
-}
-
-// ---------------------------------------------------------------------------
-// Decline-suppression: tracks recently-declined cosine distances
-// ---------------------------------------------------------------------------
-
-export function recordDecline(
-  routing: RoutingSessionAttributes,
-  cosineDistance: number,
-): RoutingSessionAttributes {
-  const declined = routing.declinedDistances || [];
-  const next = [cosineDistance, ...declined].slice(0, MAX_DECLINED_DISTANCES);
-  return { ...routing, pendingDriftSuggestion: undefined, declinedDistances: next };
 }
 
 // ---------------------------------------------------------------------------

@@ -14,7 +14,8 @@
  * and reported them fixed. Every one of those renames had SURVIVING references in `tests/` -
  * `SPEC-SEPARATE-ADMIN-APP` in eight e2e specs, `SPEC-CONTEXT-SOURCE-CATALOG` in two,
  * `SPEC-PORTABLE-VERSIONED-PROFILES` in one. The fix's scope was set by where someone happened to
- * look, which is exactly the failure this tracker's rule 2 exists for.
+ * look, which is exactly the failure a fix must guard against: its scope is every instance of the
+ * defect, found by search, not the instances someone happened to see.
  *
  * THREE THINGS THAT ARE DELIBERATELY *NOT* FAILURES, each learned from a real false positive:
  *
@@ -30,7 +31,7 @@
  *     substring the scanner would otherwise read as a document of its own; the lookbehind stops it
  *     inventing one from the tail of a real name. That mechanism was strong enough that the
  *     hand-written exemption for it was redundant, and the ratchet below said so on the first run -
- *     which is the behaviour the ratchet exists for, arriving immediately.
+ *     which is the behavior the ratchet exists for, arriving immediately.
  *
  * The allow-list is the only way to silence this check and every entry carries a reason, so an
  * unjustified one is visible as debt rather than as absence. Resolving a citation REMOVES a line here
@@ -72,18 +73,13 @@ const ALLOWED: Record<string, string> = {
 
   // --- Found by the docs->docs sweep on its first run. Each is real debt, not a mis-citation. ---
 
-  'SPEC-ASSISTANT-TEMPLATE':
-    'UNWRITTEN. Cited as `templates/SPEC-ASSISTANT-TEMPLATE.md`, a directory that does not exist in '
-    + 'this repository. SPEC-ASSISTANT-MEETINGS calls itself "a worked exemplar" of it, so the '
-    + 'exemplar is published and the pattern it exemplifies is not.',
+  // `SPEC-ASSISTANT-TEMPLATE` and `DESIGN-ASSISTANT-TEMPLATE` were both here and are both retired:
+  // nothing cites either any more. They named a `templates/` directory that has never existed, and
+  // the three documents that leaned on them - the meetings pair and DESIGN-MULTI-AGENT-ORCHESTRATION -
+  // were each making a claim that survives without the path. A citation of an unwritten document
+  // reads as a pointer to somewhere the reader has not looked yet, which is worse than no pointer.
 
-  'DESIGN-ASSISTANT-TEMPLATE':
-    'UNWRITTEN, the design-tier counterpart of SPEC-ASSISTANT-TEMPLATE and cited the same way. '
-    + 'DESIGN-MULTI-AGENT-ORCHESTRATION leans on it twice for where per-assistant delegation config '
-    + 'is declared, so the split it defines is load-bearing for a doc that IS published.',
-
-
-  'docs/specs/applications/SPEC-ASSISTANT-MEETINGS.md::SPEC-ASSISTANT':
+  'docs/specs/interaction/assistants/SPEC-ASSISTANT-MEETINGS.md::SPEC-ASSISTANT':
     'NOT A CITATION: the document\'s own H1 is "# SPEC-ASSISTANT: Meetings assistant", a title prefix '
     + 'naming the per-assistant document family. File-scoped, so the bare name used as a real citation '
     + 'anywhere else is still checked.',
@@ -343,17 +339,12 @@ const ANCHOR_DEBT: Record<string, string> = {
     '3 citations naming a section by TITLE rather than number. SPEC-BATTLE has eight numbered headings '
     + 'and none of them is Analytics, so the title is stale rather than the form being unsupported - '
     + 'this guard resolves title anchors against heading text and still cannot find it.',
-  'SPEC-BATTLE §413':
-    '1 citation. No such section; the document numbers 1 to 8. Most likely a mangled 4.1.3 or a '
-    + 'requirement id that lost its punctuation. Needs whoever wrote the surrounding comment, which is '
-    + 'why it is debt rather than a mechanical fix.',
   'SPEC-ADMIN-IDENTITY §8':
     '2 citations. The document stops short of 8. An off-by-N from a restructure.',
   'SPEC-CONFIGURABLE-ASSISTANTS §2':
     '2 citations. The document carries no numbered section 2. Same shape as the entry above.',
   'DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT §6.5': IAM_REASON,
   'DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT §10': IAM_REASON,
-  'DESIGN-ADMIN-ACTION-IAM-ENFORCEMENT §11': IAM_REASON,
 };
 
 /**
@@ -364,8 +355,13 @@ const ANCHOR_DEBT: Record<string, string> = {
  * to `[w.-]`, so it matched nothing anywhere. **The sweep then reported zero findings, which reads
  * exactly like a clean repository.** Only the non-vacuity assertion told the difference between "no
  * dangling anchors" and "no anchors examined". A literal cannot be corrupted that way.
+ *
+ * A BACKTICK IS A SEPARATOR, and leaving it out was the same failure one citation at a time. Docs
+ * write the filename in code style, so `SPEC-FOO.md` section 3 puts a backtick between the name and
+ * the anchor; without it in the class the whole citation was invisible and resolved nothing. Three
+ * dangling anchors were hiding behind exactly that, in two documents, while the sweep reported clean.
  */
-const ANCHORED = /(?<![A-Z-])((?:SPEC|DESIGN|GUIDE|HOW-TO|ADR)-[A-Z0-9]+(?:-[A-Z0-9]+)*)(?:\.md)?[\s,(:]*(?:§+\s*([\w.-]+)|[Ss]ection\s+([\w.-]+))/g;
+const ANCHORED = /(?<![A-Z-])((?:SPEC|DESIGN|GUIDE|HOW-TO|ADR)-[A-Z0-9]+(?:-[A-Z0-9]+)*)(?:\.md)?[\s,(:`]*(?:§+\s*([\w.-]+)|[Ss]ection\s+([\w.-]+))/g;
 
 interface AnchorFinding { key: string; file: string }
 

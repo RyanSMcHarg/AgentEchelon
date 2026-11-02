@@ -38,7 +38,7 @@ export async function backfillProfileAttribution(input: ProfileBackfillInput): P
     const res = await query(
       `UPDATE messages
           SET metadata = COALESCE(metadata, '{}'::jsonb) || ${built}
-        WHERE agent_type = $1
+        WHERE assistant = $1
           AND (metadata->>'profileName') IS NULL`,
       params,
     );

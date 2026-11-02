@@ -1,14 +1,14 @@
 /**
  * Every correlation id this codebase can MINT must be readable by the code that READS it.
  *
- * WHY THIS EXISTS (tracker rows 100 and 103). A bot message carrying `<!--corr:{id}-->` is a
+ * WHY THIS EXISTS. A bot message carrying `<!--corr:{id}-->` is a
  * placeholder, and `turn-events-backfill.ts` - the ONLY writer of `agent_final_at` - finds it with a
  * bounded pattern, `[A-Za-z0-9._-]{1,64}`. An id longer than 64 characters is not rejected at mint
  * time. It is posted, shown to the user as "One moment...", and then cannot be read back by anything.
  * The turn can never close, and no error is raised anywhere: the reader simply returns null, which is
  * indistinguishable from "this was never a placeholder".
  *
- * That is exactly the population row 103 was opened for. The unclosed-turn split classifies 26 rows as
+ * That is exactly the population at stake. The unclosed-turn split classifies 26 rows as
  * `no_placeholder` - "never carried a marker" - on the strength of that same predicate, and those 26
  * DO contain the literal `<!--corr:` substring. "No marker at all" is benign, because nobody was
  * promised an answer. "A marker the reader cannot see" means someone WAS told to wait and the platform
@@ -61,7 +61,7 @@ describe('the reader can see what the writers mint', () => {
 
   it('a battle id is readable even when the bot ARN segment is service-assigned', () => {
     // THE REGRESSION THIS FILE WAS WRITTEN FOR. Pre-fix this produced 67 characters and the assertion
-    // below failed, which is what turned row 103's "26 assumed" into a mechanism.
+    // below failed, which is what turned the "26 assumed" into a mechanism.
     for (const round of ['r1', 'r1c', 'r2']) {
       const id = battleCorrelationId({ botArn: REAL_BOT_ARN, round, nowMs: 1755000000000, suffix: 'abc123' });
       expect(isReadableCorrelationId(id)).toBe(true);
@@ -145,7 +145,7 @@ describe('the bound has one definition', () => {
       const text = fs.readFileSync(path.join(SRC, rel), 'utf8');
       const matches = [...text.matchAll(/<!--corr:\(\[A-Za-z0-9._-\]\{1,(\d+)\}\)-->/g)];
       // Each reader must actually contain the pattern; a file that stopped matching would pass this
-      // loop silently while having changed its definition to something unrecognised.
+      // loop silently while having changed its definition to something unrecognized.
       expect(matches.length).toBeGreaterThan(0);
       for (const m of matches) seen.push(`${rel}:{1,${m[1]}}`);
       for (const m of matches) {

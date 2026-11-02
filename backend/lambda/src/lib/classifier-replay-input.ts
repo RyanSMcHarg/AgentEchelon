@@ -14,6 +14,8 @@
  */
 
 import { modelCatalogKeys } from '../../../lib/config/model-strategy.js';
+import { modelFits } from '../../../lib/config/model-availability.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
 
 export const DEFAULT_WINDOW_DAYS = 30;
 export const DEFAULT_LIMIT = 200;
@@ -24,6 +26,17 @@ export const MAX_WINDOW_DAYS = 180;
 export interface ReplayRequest {
   incumbentModel?: string;
   challengerModel?: string;
+  /**
+   * The classification the replay runs in (tenet D12, ADR-054 decision 5). It decides which exchanges are
+   * read, which models may be compared, and which replay function runs the work: each classification has
+   * its own, on a role that can invoke only that classification's models.
+   */
+  classification?: string;
+  /**
+   * The assistant whose classifier is compared. Its exchanges are the corpus and its served intent pack
+   * is the taxonomy both candidates classify against. Absent ⇒ the classification's primary.
+   */
+  assistant?: string;
   windowDays?: number;
   limit?: number;
 }
@@ -31,9 +44,30 @@ export interface ReplayRequest {
 export interface ValidatedReplayRequest {
   incumbentModel: string;
   challengerModel: string;
+  classification: string;
+  assistant: string;
   windowStart: Date;
   windowEnd: Date;
   limit: number;
+}
+
+/** An assistant name as the profile registry spells one (`/assistant/{name}`). */
+const ASSISTANT_NAME = /^[a-z0-9][a-z0-9-]{0,62}$/;
+
+/**
+ * The classification a replay names, checked: one this deployment declares and that holds conversations,
+ * since a replay reads conversations. Throws with the reason otherwise.
+ */
+export function replayClassification(value: string | undefined): string {
+  const classification = (value || '').trim();
+  if (!classification) throw new Error('[classifier-replay] classification is required: a replay runs in one classification');
+  if (!profiles.isKnownClassification(classification) || !profiles.isConversational(classification)) {
+    throw new Error(
+      `[classifier-replay] '${classification}' is not a conversational classification of this deployment; one of: `
+      + profiles.classificationValues().filter((c) => profiles.isConversational(c)).map((c) => `'${c}'`).join(', '),
+    );
+  }
+  return classification;
 }
 
 /** Shared validation + window derivation, so the open and the execute cannot disagree about either. */
@@ -43,7 +77,7 @@ export function validateReplayInput(input: ReplayRequest): ValidatedReplayReques
   if (!incumbentModel || !challengerModel) {
     throw new Error('[classifier-replay] both incumbentModel and challengerModel are required');
   }
-  // CATALOG KEYS, NOT BEDROCK IDS (owner, 2026-08-10).
+  // CATALOG KEYS, NOT BEDROCK IDS (maintainer, 2026-08-10).
   //
   // This took free text and passed it to `ConverseCommand`, so a run only SUCCEEDED if the operator typed
   // a real Bedrock model id. Everything else in the system - profiles and experiment variants alike -
@@ -71,9 +105,30 @@ export function validateReplayInput(input: ReplayRequest): ValidatedReplayReques
     // itself produces a corpus of agreements and an "indistinguishable" verdict that says nothing.
     throw new Error('[classifier-replay] incumbentModel and challengerModel must differ');
   }
+  const classification = replayClassification(input.classification);
+  // THE ONE MODEL RULE (ADR-054, `modelFits`): both candidates are text models this classification allows.
+  // The replay function's role is granted only this classification's models, so a model outside the list
+  // would be refused at the model call anyway; refusing here says why, while the operator is listening.
+  for (const [label, value] of [['incumbentModel', incumbentModel], ['challengerModel', challengerModel]] as const) {
+    const misfit = modelFits(value, classification, 'text');
+    if (misfit) throw new Error(`[classifier-replay] ${label}: ${misfit}`);
+  }
+  const assistant = (input.assistant || '').trim() || profiles.profileFor(classification)?.name || '';
+  if (!ASSISTANT_NAME.test(assistant)) {
+    throw new Error(`[classifier-replay] '${assistant}' is not an assistant name`);
+  }
   const windowDays = Math.min(Math.max(Number(input.windowDays) || DEFAULT_WINDOW_DAYS, 1), MAX_WINDOW_DAYS);
   const limit = Math.min(Math.max(Number(input.limit) || DEFAULT_LIMIT, 1), MAX_LIMIT);
   const windowEnd = new Date();
   const windowStart = new Date(windowEnd.getTime() - windowDays * 24 * 60 * 60 * 1000);
-  return { incumbentModel, challengerModel, windowStart, windowEnd, limit };
+  return { incumbentModel, challengerModel, classification, assistant, windowStart, windowEnd, limit };
+}
+
+/**
+ * The environment variable that holds the replay function ARN for one classification. One function per
+ * classification, so "which classification may this run reach" is an invoke target and a role, never a
+ * field the payload fills in (the turn data plane's shape, `archive-stack-aurora.ts`).
+ */
+export function replayArnEnvName(classification: string): string {
+  return `CLASSIFIER_REPLAY_ARN_${classification.toUpperCase().replace(/[^A-Z0-9]/g, '_')}`;
 }

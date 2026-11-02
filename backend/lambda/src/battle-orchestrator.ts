@@ -12,8 +12,9 @@
  *      writer raced ahead — return; the late writer will fire when its
  *      transition lands.)
  *   3. tryClaimOrchestratorFire — exactly-one wins; the rest no-op.
- *   4. For each bot: send a round-2 placeholder, invoke the premium async
- *      processor with battleContext.round=2 + the rival's round-1 reply.
+ *   4. For each bot: hand the round to the duel classification's router, which
+ *      posts the side's round-2 placeholder and dispatches its processor with
+ *      battleContext.round=2 + the rival's round-1 reply.
  *   5. The async processor may emit NO_REBUTTAL to skip its rebuttal; on
  *      receipt the processor deletes its own placeholder.
  *
@@ -26,21 +27,15 @@
  *  - Async processor crashes mid-round-1: the row never transitions. Rather
  *    than wait for the silent row TTL (B2 "fail loud"), the orchestrator
  *    gives round 1 a deadline: once a stalled (non-terminal) participant is
- *    past it, it stops deferring, posts an explicit "<Name> didn't finish in
- *    time" turn, and either runs a DEGRADED round 2 for the survivor(s) or —
+ *    past it, it stops deferring, names an explicit "<Name> didn't finish in
+ *    time" notice to the router, and either runs a DEGRADED round 2 for the survivor(s) or —
  *    when nobody finished — closes the battle with a message. Either way it
  *    ends by writing a terminal 'battle complete' marker (B4) so consumers get
  *    an explicit done signal instead of inferring it from TTL absence.
  */
 
-import {
-  ChimeSDKMessagingClient,
-  SendChannelMessageCommand,
-  ChannelMessageType,
-  ChannelMessagePersistenceType,
-} from '@aws-sdk/client-chime-sdk-messaging';
+import { ChimeSDKMessagingClient } from '@aws-sdk/client-chime-sdk-messaging';
 import { LambdaClient, InvokeCommand, InvocationType } from '@aws-sdk/client-lambda';
-import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
 import { DynamoDBClient } from '@aws-sdk/client-dynamodb';
 import { DynamoDBDocumentClient, PutCommand } from '@aws-sdk/lib-dynamodb';
 import {
@@ -52,17 +47,33 @@ import {
   clearActiveBattle,
   isPastDeadline,
   COMPLETE_SENTINEL,
+  loadChannelBattleConfig,
   type BattleStateRow,
 } from './lib/battle-state.js';
-import {
-  resolveBattleVariantBySlotArn,
-  resolveBattleControlVariantByAltSlotArn,
-} from './lib/experiment-manager.js';
+import { resolveBattleSides } from './lib/experiment-manager.js';
+import { duelChallengerOf } from './lib/alt-assignment.js';
 import { battleCorrelationId } from './lib/correlation.js';
+import { variantGrantOf } from './lib/assistant-grant.js';
+import { primaryAssistantOf } from './lib/conversation-primary.js';
+import { resolveRouterArn } from './lib/router-arn.js';
+import { sayThroughRouter } from './lib/say-through-router.js';
+import { defaultProfileRegistry as profiles } from '../../lib/profile-registry';
+import type { InteractionKind } from './lib/interaction-kinds.js';
+import { chimeMessagingClient } from './lib/chime/clients.js';
+import { loadProfileRegistry } from '../../lib/profile-registry';
 
-const messagingClient = new ChimeSDKMessagingClient({});
+/**
+ * THE ORCHESTRATOR SPEAKS AS NO ASSISTANT.
+ *
+ * Every line a duel puts in the conversation outside a turn is the router's to say: each side's round-2
+ * placeholder is posted by the duel classification's router when it takes the round (`aeRebuttal`), a
+ * side that did not finish and a duel that closes are notices it names (`sayThroughRouter`), and an ended
+ * duel's waiting markers are taken down by the router too (`aeClearMarkers`, asked by `endBattle`). So this
+ * role holds no vend, writes no routing record, and sends nothing bearing a bot.
+ */
 const lambdaClient = new LambdaClient({});
-const ssmClient = new SSMClient({});
+/** Reads a room's tags only, to find its primary (`roomPrimaryReadStatements`). This role sends nothing on it. */
+const tagReader = chimeMessagingClient({});
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({}), {
   marshallOptions: { removeUndefinedValues: true },
 });
@@ -73,79 +84,29 @@ const BATTLE_STATE_TABLE = process.env.BATTLE_STATE_TABLE || '';
 // resolution. Overridable; defaults well under the row TTL.
 const ROUND1_DEADLINE_MS = Number(process.env.BATTLE_ROUND1_DEADLINE_MS) || 180_000;
 
-// The premium classification processor ARN is resolved at RUNTIME from SSM (the
-// AgentEchelonClassification-Premium stack publishes it). Resolving here — not at deploy via
-// valueForStringParameter — keeps this orchestrator decoupled from the premium
-// classification stack at deploy time (no fresh-deploy ordering cycle). A literal env
-// override is honored first for tests / special wiring.
-const PROCESSOR_ARN_PARAMS: Record<string, string | undefined> = {
-  premium: process.env.PREMIUM_PROCESSOR_ARN_PARAM,
-  standard: process.env.STANDARD_PROCESSOR_ARN_PARAM,
-  basic: process.env.BASIC_PROCESSOR_ARN_PARAM,
-};
-const PROCESSOR_ARN_ENVS: Record<string, string | undefined> = {
-  premium: process.env.PREMIUM_ASYNC_PROCESSOR_ARN,
-  standard: process.env.ASYNC_PROCESSOR_ARN,
-  basic: process.env.BASIC_ASYNC_PROCESSOR_ARN,
-};
-const cachedArns: Record<string, string> = {};
-
 /**
- * The processor for a ROUND-2 rebuttal, resolved from the duel's classification.
+ * ROUND 2 ANSWERS AT THE DUEL'S CLASSIFICATION, through that classification's router (Phase 1c).
  *
- * IT USED TO BE HARDCODED TO PREMIUM, and that was an escalation rather than a simplification.
- * `battleEligible` is a per-profile flag an operator can turn on for any classification (the admin
- * console edits it), so premium-only is a DEFAULT and not a guarantee. Flip it on standard and round
- * 1 answered on the standard processor while round 2 answered on the premium one - the premium model,
- * the premium guardrail and the premium `context/` S3 scope, which are IAM-enforced classification
- * boundaries. That is precisely the cross-classification leak the round-1 routing fix exists to
- * prevent, and half of every duel still had it.
- *
- * Fail-safe rules are IDENTICAL to the channel flow's on purpose: `basic` NEVER falls back up (that
- * is the leak), `premium` may fall back DOWN to standard (a downgrade, safe), anything else is
- * standard. Two routing tables that disagreed would put the two rounds of one duel on two
- * classifications, which is the defect this replaces.
+ * It was once hardcoded to premium, an escalation: `battleEligible` is a per-profile flag an operator can
+ * turn on for any classification, so a standard duel answered round 2 with premium's model, guardrail and
+ * `context/` scope. The round now goes to the router of the duel's own classification, which dispatches
+ * only its own processor and refuses a round naming another classification, so the rounds of one duel can
+ * never answer at two classifications. An unpublished router means the round does not fire: there is no
+ * fallback to another classification's router, upward or downward.
  */
 /**
  * The classification this duel runs as.
  *
- * ONE function, used for BOTH the worker ARN and the analytics attribution, so the two can never
- * disagree. They did: `c8552bb` routed the worker from the duel's classification and left the payload's
- * `userType` hardcoded to `'premium'` one line below, so a round-2 rebuttal archived as premium
- * whatever it actually ran as - including on an ordinary premium duel whose SENDER was downgraded,
- * since round 1 archives `min(user, channel)`. Half a duel attributed to the wrong classification is
- * not cosmetic: it is the join key the battle rollup slices on.
+ * ONE function, used for BOTH the router chosen and the payload's `classification`, so the two can never
+ * disagree. A round-2 rebuttal whose payload named a different classification from the router that
+ * recorded it is refused there, and archiving half a duel under the wrong classification would break the
+ * join key the battle rollup slices on.
  *
- * Absent resolves to standard, which is a downgrade for a premium duel and never an escalation.
+ * A classification is set or not (ADR-046). An absent value, or one this deployment does not declare,
+ * resolves to `undefined` and the round does not fire; it never becomes some other classification.
  */
-function classificationKeyFor(classification: string | undefined): 'premium' | 'standard' | 'basic' {
-  return classification === 'premium' || classification === 'basic' ? classification : 'standard';
-}
-
-async function getProcessorArnForClassification(classification: string | undefined): Promise<string> {
-  const key = classificationKeyFor(classification);
-  if (cachedArns[key]) return cachedArns[key];
-
-  const resolve = async (k: string): Promise<string> => {
-    const literal = PROCESSOR_ARN_ENVS[k];
-    if (literal) return literal;
-    const param = PROCESSOR_ARN_PARAMS[k];
-    if (!param) return '';
-    try {
-      const resp = await ssmClient.send(new GetParameterCommand({ Name: param }));
-      return resp.Parameter?.Value || '';
-    } catch (err) {
-      console.error('[BattleOrchestrator] failed to resolve processor ARN from SSM', { classification: k, err });
-      return '';
-    }
-  };
-
-  let arn = await resolve(key);
-  // premium may degrade to standard; basic must not degrade UP, so it stays empty and the caller
-  // declines to dispatch rather than answering above the channel's clearance.
-  if (!arn && key === 'premium') arn = await resolve('standard');
-  if (arn) cachedArns[key] = arn;
-  return arn;
+function classificationKeyFor(classification: string | undefined): string | undefined {
+  return profiles.resolveClassification(classification);
 }
 
 export interface BattleOrchestratorEvent {
@@ -160,22 +121,40 @@ export interface BattleOrchestratorEvent {
   originatingMessageId: string;
   /**
    * The CHANNEL's classification, carried from the side that fired the round. Round 2 answers at the
-   * duel's own classification; absent (an in-flight invoke from before this field existed) resolves
-   * to standard, which is a downgrade for a premium duel and never an escalation for a premium one.
+   * duel's own classification; absent or undeclared, round 2 does not fire.
    */
   classification?: string;
 }
 
 export async function handler(event: BattleOrchestratorEvent): Promise<void> {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   const { battleId, channelArn, userMessage, originatingMessageId } = event;
   console.log('[BattleOrchestrator] Invoked', { battleId, channelArn });
 
-  // Round 2 answers at the DUEL'S classification, not a hardwired premium one (see the resolver).
-  const roundProcessorArn = await getProcessorArnForClassification(event.classification);
-  if (!roundProcessorArn) {
-    console.error('[BattleOrchestrator] no processor resolved for this duel; round 2 will not fire', {
-      classification: event.classification ?? '(absent, treated as standard)',
+  // Round 2 answers at the DUEL'S classification, through its router (see classificationKeyFor). Resolved
+  // before anything is read or posted, so an unpublished router leaves no placeholder waiting on nothing.
+  //
+  // EITHER WAY THE DUEL IS ENDED, not left running. Both declines record the terminal state the other
+  // degraded paths record (`emitBattleComplete`), which releases the channel's active-battle pointer, so
+  // the room is not held by a duel that will never finish. No notice is named: with no declared
+  // classification or no wired router there is no router to say one, and the closing line
+  // (`battleNoneFinished`) would not be true of either case.
+  const duelClassification = classificationKeyFor(event.classification);
+  if (!duelClassification) {
+    console.error('[BattleOrchestrator][SecurityEvent] the duel names no declared classification; round 2 will not fire and the duel is ended', {
+      battleId,
+      classification: event.classification ?? '(absent)',
     });
+    await emitBattleComplete(battleId, 'closed:no-classification', channelArn);
+    return;
+  }
+  const roundRouterArn = await resolveRouterArn(duelClassification);
+  if (!roundRouterArn) {
+    console.error('[BattleOrchestrator] no router published for this duel; round 2 will not fire and the duel is ended', {
+      classification: duelClassification,
+    });
+    await emitBattleComplete(battleId, 'closed:no-router', channelArn);
     return;
   }
 
@@ -201,7 +180,7 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
   //    by stranding silently until the row TTL sweeps it.
   //
   //    Closing it needs a TIME-based trigger, not another event: the missing signal
-  //    is the ABSENCE of a transition, which cannot be event-sourced (TENETS 7,
+  //    is the ABSENCE of a transition, which cannot be event-sourced (TENETS D6,
   //    which blesses a low-frequency reconcile sweep behind an event path for
   //    exactly this shape). That means a scheduled sweep over battles with a
   //    non-terminal row past deadline, firing this handler - new infrastructure the
@@ -244,24 +223,28 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
   // normal engine"): resolve each side's experiment variant ONCE here and stamp
   // it into the round-2 battleContext, so the worker runs a normal request for
   // the variant with no second resolution. Also used for the fail-loud display
-  // names. The alt-slot bot is whichever row resolves via the slot-keyed
-  // resolver; the other row is the default/control side. control = variants[0];
+  // names. The challenger is the duel classification's alt, named by assistant id and found by the bot
+  // its assignment record names; the other row is the control side. control = variants[0];
   // treatment = variants[1]. Best-effort: a resolver hiccup leaves fields unset.
-  let altSlotArn = '';
-  for (const row of bots) {
-    if (await resolveBattleVariantBySlotArn(row.botArn)) {
-      altSlotArn = row.botArn;
-      break;
-    }
-  }
-  const [controlVariant, treatmentVariant] = altSlotArn
-    ? await Promise.all([
-        resolveBattleControlVariantByAltSlotArn(altSlotArn),
-        resolveBattleVariantBySlotArn(altSlotArn),
-      ])
-    : [null, null];
+  const challenger = await duelChallengerOf(duelClassification).catch((err) => {
+    console.warn('[BattleOrchestrator] the challenger\'s record could not be read; names stay unset', err);
+    return null;
+  });
+  const challengerBotArn = challenger && bots.some((r) => r.botArn === challenger.botArn) ? challenger.botArn : '';
+  // ONE READ OF THE EXPERIMENT for both sides, by the id the conversation's battle config bound at enable
+  // (`resolveBattleSides`); the config read is the cached one, and a failed read leaves the names unset.
+  const boundExperimentId = challenger && challengerBotArn
+    ? (await loadChannelBattleConfig(channelArn).catch(() => null))?.experimentId
+    : undefined;
+  const { control: controlVariant, treatment: treatmentVariant } = challenger && challengerBotArn
+    ? await resolveBattleSides(challenger.assistant, boundExperimentId ? { experimentId: boundExperimentId } : {})
+      .catch((err) => {
+        console.warn('[BattleOrchestrator] the duel\'s experiment could not be read; names stay unset', err);
+        return { control: null, treatment: null };
+      })
+    : { control: null, treatment: null };
   const displayNameFor = (botArn: string): string | undefined =>
-    (botArn === altSlotArn ? treatmentVariant : controlVariant)?.displayName;
+    (botArn === challengerBotArn ? treatmentVariant : controlVariant)?.displayName;
 
   // 4. Fail loud (B2): any bot that did NOT finish round 1 — FAILED, or still
   //    non-terminal past the deadline — gets an explicit "<Name> didn't finish
@@ -276,17 +259,18 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
   // narrow case where the claim was already lost and the abandon landed afterwards.
   const notFinishedBots = bots.filter((b) => b.state !== 'COMPLETED' && b.state !== 'ABANDONED');
   for (const b of notFinishedBots) {
-    await postDidNotFinish(channelArn, b.botArn, displayNameFor(b.botArn));
+    await postDidNotFinish(channelArn, b.botArn, duelClassification, displayNameFor(b.botArn));
   }
 
   // If nobody finished there is nothing to rebut — close the battle with a
   // message (never a silent TTL) and emit the terminal marker.
   if (completedBots.length === 0) {
-    await postBattleMessage(
-      channelArn,
-      bots[0].botArn,
-      "This battle couldn't be completed. No assistant finished in time. Try /battle again.",
-    );
+    // A LINE ABOUT THE DUEL, SAID FOR THE ROOM, so the room's primary says it (§3.8), not whichever side's
+    // row came first. Falls back to the first side only when the room has no resolvable primary, so the
+    // duel still closes with a message.
+    const closer = await primaryAssistantOf(channelArn, tagReader, '[BattleOrchestrator]')
+      .then((p) => p.botArn, () => bots[0].botArn);
+    await sayThroughRouter(duelClassification, { kind: 'battleNoneFinished', channelArn, botArn: closer, to: [] });
     await emitBattleComplete(battleId, 'closed:no-completion', channelArn);
     console.log('[BattleOrchestrator] Battle closed — no completed bots', { battleId });
     return;
@@ -294,8 +278,12 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
 
   const degraded = completedBots.length < bots.length;
 
-  // 5. For each bot that FINISHED round 1, send a round-2 placeholder + invoke
-  //    async with the rival's round-1 reply. In a degraded battle only the
+  // THE INSTANT ROUND TWO WAS TRIGGERED, declared on every rebuttal of this duel. See
+  // `roundTwoTriggeredAtMs`: it is what each rebuttal's end to end and acknowledgment are measured from.
+  const roundTwoTriggeredAt = terminal ? roundTwoTriggeredAtMs(bots) : undefined;
+
+  // 5. For each bot that FINISHED round 1, hand the round to the router, which posts the side's round-2
+  //    placeholder and dispatches it with the rival's round-1 reply. In a degraded battle only the
   //    survivor(s) run round 2 (the "didn't finish" note above is the visible
   //    degradation signal); the survivor responds independently — its rival
   //    reply is '' and rivalDidNotFinish is set so the rebuttal can say so.
@@ -306,32 +294,29 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
       const rivalReplyMsgId = rivalRow?.round1MessageId;
       const rivalCompleted =
         !!rivalRow && completedBots.some((r) => r.botArn === rivalRow.botArn);
-      const isAltSlot = selfRow.botArn === altSlotArn;
-      const selfVariant = isAltSlot ? treatmentVariant : controlVariant;
-      const rivalVariant = isAltSlot ? controlVariant : treatmentVariant;
+      const isChallenger = selfRow.botArn === challengerBotArn;
+      const selfVariant = isChallenger ? treatmentVariant : controlVariant;
+      const rivalVariant = isChallenger ? controlVariant : treatmentVariant;
 
       const correlationId = battleCorrelationId({ botArn: selfRow.botArn, round: 'r2' });
 
+      // ── THE ROUND IS THE CLASSIFICATION ROUTER'S (DESIGN-SEPARATE-ASSISTANTS-AND-DELEGATION, Phase 1c; step 36) ──
+      //
+      // The router validates the side against the duel's state, posts the round's placeholder as that side
+      // on a speak route of its own (markers from `battlePlaceholderContent`, built from this payload's
+      // correlation id and battle context), then records the round and dispatches the processor. This
+      // orchestrator speaks as no assistant, so no shared principal holds a speak session or a turn's.
       try {
-        await sendPlaceholder({
-          channelArn,
-          botArn: selfRow.botArn,
-          correlationId,
-          battleId,
-          rivalArn: rivalRow?.botArn || '',
-          rivalReplyMsgId,
-        });
-      } catch (err) {
-        console.warn('[BattleOrchestrator] placeholder send failed for', selfRow.botArn, err);
-        return;
-      }
-
-      try {
-        await lambdaClient.send(
+        // HANDED TO THE ROUTER, which validates the side, posts its placeholder, records the round and
+        // dispatches the processor with this payload unchanged (`aeRebuttal` in router-agent-handler.ts).
+        // Synchronous, so a refused round is logged here rather than lost.
+        const dispatch = await lambdaClient.send(
           new InvokeCommand({
-            FunctionName: roundProcessorArn,
-            InvocationType: InvocationType.Event,
-            Payload: Buffer.from(JSON.stringify({
+            FunctionName: roundRouterArn,
+            InvocationType: InvocationType.RequestResponse,
+            Payload: Buffer.from(JSON.stringify({ aeRebuttal: {
+              // This side's variant, so the vend narrows the round's session to what the side serves.
+              routedVariant: variantGrantOf({ modelKey: selfVariant?.modelKey, imageModelKey: selfVariant?.imageGenModelKey, profile: selfVariant?.variantProfile }),
               channelArn,
               correlationId,
               userMessage,
@@ -339,10 +324,19 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
               // rebuttal turn archives trigger_kind NULL and is read as user-caused, mis-charging
               // orchestrator-origin latency to user experience. This is the other producer the
               // 'orchestrator' enum value shipped without.
-              trigger: 'orchestrator',
+              // NAMED BY INTERACTION. 'orchestrator' named the dispatcher, which made a rebuttal and
+              // a post-processing repair the same value - and they answer opposite questions about
+              // whether a person is waiting. A rebuttal answers the RIVAL; nobody is watching for it,
+              // so it must stay out of the perceived-latency SLO while still being measured.
+              trigger: 'rebuttal' as InteractionKind,
+              // THE INSTANT ROUND TWO WAS TRIGGERED is what this turn is measured from: its
+              // acknowledgment and its end to end both start there (`roundTwoTriggeredAtMs`). The same
+              // value for every side of the duel, because one event triggered the round for all of
+              // them. Omitted when it cannot be read, and the metrics are then NULL for the turn.
+              ...(roundTwoTriggeredAt !== undefined ? { triggerAtMs: roundTwoTriggeredAt } : {}),
               // The DUEL'S classification, resolved by the same function as the worker ARN above so
               // the attribution can never disagree with the processor that actually answered.
-              userType: classificationKeyFor(event.classification),
+              classification: duelClassification,
               botArn: selfRow.botArn,
               senderArn: event.senderArn,
               // INHERITED FROM ROUND 1, never declared here. A duel's two rounds answer the same user
@@ -357,6 +351,21 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
               // the stored intent archives nothing there, which is honest; a fallback would put a
               // value nobody derived back into the analytics and re-create the defect quietly.
               ...(selfRow.intent && { intent: selfRow.intent }),
+              // ── A REBUTTAL OPENS NO WORK, AND THAT IS A DECISION RATHER THAN AN OVERSIGHT ──
+              //
+              // Round 2 is commentary: the side reacts to what its rival produced. Nobody asked for
+              // it and nobody is waiting on it (which is also why it has no TTFF - LATENCY-TARGETS
+              // excludes it by construction), so there is nothing for a task to track and no person
+              // to carry a multi-step chain for.
+              //
+              // WHY IT IS WRITTEN DOWN HERE. The workflow selection gates what may be OPENED, and it
+              // is applied at the two doors that open work: the ordinary intent path and the round-1
+              // duel side (ADR-047). Round 2 needs no gate only because this literal means it can
+              // never reach a door - it carries a fixed non-task delivery and calls no `createTask`.
+              // Resolving a delivery option here instead, or forwarding round 1's, would make this a
+              // THIRD door, ungated, reachable by a duel - and it would still answer, so nothing
+              // would error. `a-rebuttal-opens-no-work.test.ts` refuses that change rather than
+              // leaving the next reader to notice.
               deliveryOption: 'PLACEHOLDER_UPDATE',
               // EXPERIMENT ATTRIBUTION — the same fields, for the same reason, as the round-1 fan-out
               // (channel-flow-processor). `buildAnalyticsMetadata` stamps `experiment_id`/`variant_id`
@@ -369,6 +378,8 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
               // SPEC-PORTABLE §6: this side's whole profile VERSION for a profileRef variant, so the
               // rebuttal round runs the same assistant round 1 did. Absent for a modelKey variant.
               ...(selfVariant?.variantProfile && { variantProfile: selfVariant.variantProfile }),
+              // And its number, so the rebuttal is attributed to the version it is.
+              ...(selfVariant?.variantProfile && selfVariant.variantVersion !== undefined && { variantVersion: selfVariant.variantVersion }),
               battleContext: {
                 battleId,
                 round: 2,
@@ -381,22 +392,25 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
                 // Fail-loud: tell the worker the rival didn't finish so the
                 // rebuttal can acknowledge it rather than pretend there was one.
                 ...(!rivalCompleted && { rivalDidNotFinish: true }),
-                // Resolve-once: this side's variant + the rival's display name
-                // (woven into the rebuttal note). Unset fields fall back to the
-                // worker's normal resolution.
-                ...(selfVariant?.modelKey && { variantModelKey: selfVariant.modelKey }),
-                ...(selfVariant?.systemPromptAddendum && { variantAddendum: selfVariant.systemPromptAddendum }),
-                ...(selfVariant?.displayName && { selfDisplayName: selfVariant.displayName }),
-                // Phase-2: this side's image model, so the round-2 rebuttal also runs the normal image
-                // path for an image battle (each side does its normal thing). Unset for a text battle.
-                ...(selfVariant?.imageGenModelKey && { variantImageModelKey: selfVariant.imageGenModelKey }),
-                ...(rivalVariant?.displayName && { rivalDisplayName: rivalVariant.displayName }),
+                // NOTHING ABOUT THIS SIDE'S VARIANT RIDES HERE (DESIGN-SEPARATE-ASSISTANTS §3.7): the side
+                // serves its pinned version, carried above as `variantProfile`. The rival's name is the one
+                // fact about the OTHER side the rebuttal note needs, from its profile (`battleSideNames`).
+                ...(rivalVariant?.displayName && { rivalName: rivalVariant.displayName }),
               },
-            })),
+            } })),
           }),
         );
+        const answer = dispatch.Payload
+          ? JSON.parse(Buffer.from(dispatch.Payload).toString() || '{}') as { dispatched?: boolean; reason?: string; placeholderMessageId?: string }
+          : {};
+        if (dispatch.FunctionError || !answer.dispatched) {
+          console.error('[BattleOrchestrator] the router did not dispatch the rebuttal round', {
+            botArn: selfRow.botArn, correlationId, reason: answer.reason, functionError: dispatch.FunctionError,
+            placeholderMessageId: answer.placeholderMessageId,
+          });
+        }
       } catch (err) {
-        console.error('[BattleOrchestrator] async-processor invoke failed for', selfRow.botArn, err);
+        console.error('[BattleOrchestrator] rebuttal round hand-off failed for', selfRow.botArn, err);
       }
     }),
   );
@@ -408,6 +422,40 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
   //    instead of inferring it from the state TTL aging out.
   await emitBattleComplete(battleId, degraded ? 'round2:degraded' : 'round2:full', channelArn);
   console.log('[BattleOrchestrator] Round 2 fan-out complete', { battleId, degraded });
+}
+
+/**
+ * The instant round two was triggered, epoch ms, or undefined when it cannot be read.
+ *
+ * WHAT TRIGGERS ROUND TWO. Each side records its round-1 terminal state as it finishes, and the side
+ * whose write makes every row terminal is the one that fires this orchestrator
+ * (`recordBattleTerminalAndFireOrchestrator`). So the trigger is that last terminal transition: the
+ * latest `enteredStateAt` across the duel's rows, which every transition stamps. It is the same
+ * instant for every side, because one event started the round for all of them.
+ *
+ * WHY NOT THE RIVAL'S COMPLETION. For the side that finished first the two coincide. For the side that
+ * finished second the rival's completion is earlier than its own, so measuring from it counts that
+ * side's own round-1 generation as round-2 time.
+ *
+ * WHY NOT NOW. The dispatch happens after the async invoke, the read of the duel's rows and the claim,
+ * and anchoring there would hide that coordination gap inside a figure that reads as instant.
+ *
+ * CALLED ONLY WHEN EVERY ROW IS TERMINAL. On the deadline path the round is triggered by a deadline
+ * passing rather than by a transition, and no row records that instant, so the caller declares none.
+ *
+ * ALL ROWS OR NOTHING. If any row has no readable stamp, the latest readable one may be earlier than
+ * the real trigger, so the answer is undefined rather than a partial maximum. The metric is then NULL
+ * for the turn, which is honest; an earlier instant would report a slower round than ran.
+ */
+export function roundTwoTriggeredAtMs(rows: ReadonlyArray<Pick<BattleStateRow, 'enteredStateAt'>>): number | undefined {
+  if (rows.length === 0) return undefined;
+  let latest = -Infinity;
+  for (const row of rows) {
+    const at = row.enteredStateAt ? Date.parse(row.enteredStateAt) : NaN;
+    if (!Number.isFinite(at)) return undefined;
+    if (at > latest) latest = at;
+  }
+  return latest;
 }
 
 /**
@@ -433,51 +481,20 @@ export async function handler(event: BattleOrchestratorEvent): Promise<void> {
 // the orchestrator and from the single-active-battle guard.
 
 /**
- * Fail-loud (B2): post an explicit "<Name> didn't finish in time" turn
- * attributed to the stalled/failed bot, so the user is never left staring at a
- * silent placeholder. Best-effort — a send failure must not abort the rest of
- * the resolution.
+ * Fail-loud (B2): an explicit "<Name> didn't finish in time" line, said by the stalled or failed side, so
+ * the user is never left staring at a silent placeholder. A notice the router says in that side's own words
+ * (`battleSideDidNotFinish`, or `battleSideDidNotFinishUnnamed` when the duel carries no display name for
+ * it). Best-effort: `sayThroughRouter` never throws, and a refused notice must not abort the resolution.
  */
 async function postDidNotFinish(
   channelArn: string,
   botArn: string,
+  classification: string,
   displayName?: string,
 ): Promise<void> {
-  const name = displayName || 'One assistant';
-  try {
-    await messagingClient.send(
-      new SendChannelMessageCommand({
-        ChannelArn: channelArn,
-        Content: `${name} didn't finish in time.`,
-        Type: ChannelMessageType.STANDARD,
-        Persistence: ChannelMessagePersistenceType.PERSISTENT,
-        ChimeBearer: botArn,
-      }),
-    );
-  } catch (err) {
-    console.warn('[BattleOrchestrator] postDidNotFinish failed for', botArn, err);
-  }
-}
-
-/** Post a plain battle-level message (e.g. the close notice) as a bot. Best-effort. */
-async function postBattleMessage(
-  channelArn: string,
-  botArn: string,
-  content: string,
-): Promise<void> {
-  try {
-    await messagingClient.send(
-      new SendChannelMessageCommand({
-        ChannelArn: channelArn,
-        Content: content,
-        Type: ChannelMessageType.STANDARD,
-        Persistence: ChannelMessagePersistenceType.PERSISTENT,
-        ChimeBearer: botArn,
-      }),
-    );
-  } catch (err) {
-    console.warn('[BattleOrchestrator] postBattleMessage failed for', botArn, err);
-  }
+  await sayThroughRouter(classification, displayName
+    ? { kind: 'battleSideDidNotFinish', channelArn, botArn, to: [], vars: { name: displayName } }
+    : { kind: 'battleSideDidNotFinishUnnamed', channelArn, botArn, to: [] });
 }
 
 /**
@@ -527,26 +544,6 @@ async function emitBattleComplete(battleId: string, reason: string, channelArn?:
       console.warn('[BattleOrchestrator] emitBattleComplete failed (non-fatal):', err);
     }
   }
-}
-
-async function sendPlaceholder(args: {
-  channelArn: string;
-  botArn: string;
-  correlationId: string;
-  battleId: string;
-  rivalArn: string;
-  rivalReplyMsgId?: string;
-}): Promise<void> {
-  const rivalRef = args.rivalReplyMsgId ? `,rivalReplyMsgId=${args.rivalReplyMsgId}` : '';
-  await messagingClient.send(
-    new SendChannelMessageCommand({
-      ChannelArn: args.channelArn,
-      Content: `One moment... <!--corr:${args.correlationId}--><!--battle:battleId=${args.battleId},round=2,total=2,rivalArn=${args.rivalArn}${rivalRef}-->`,
-      Type: ChannelMessageType.STANDARD,
-      Persistence: ChannelMessagePersistenceType.PERSISTENT,
-      ChimeBearer: args.botArn,
-    }),
-  );
 }
 
 // Export for the unit tests so they can call orchestrator pieces in isolation.

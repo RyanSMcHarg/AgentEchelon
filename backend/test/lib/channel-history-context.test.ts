@@ -26,6 +26,7 @@ const mockMessagingSend = jest.fn();
 jest.mock('@aws-sdk/client-bedrock-runtime', () => ({
   BedrockRuntimeClient: jest.fn().mockImplementation(() => ({ send: jest.fn() })),
   ConverseCommand: jest.fn(),
+  InvokeModelCommand: jest.fn(),
 }), { virtual: true });
 
 jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
@@ -34,6 +35,8 @@ jest.mock('@aws-sdk/client-chime-sdk-messaging', () => ({
   GetChannelMessageCommand: jest.fn(),
   UpdateChannelMessageCommand: jest.fn(),
   SendChannelMessageCommand: jest.fn(),
+  DescribeChannelCommand: jest.fn(),
+  UpdateChannelCommand: jest.fn(),
 }), { virtual: true });
 
 jest.mock('@aws-sdk/client-s3', () => ({
@@ -128,6 +131,27 @@ function entry(role: 'user' | 'assistant', content: string, sender: string): Con
 }
 
 describe('loadChannelHistory', () => {
+  // A history image is re-read from S3 for a round-2 rebuttal, and its key is whatever the message's
+  // Metadata says. Only a key belonging to this conversation and to the message's sender is kept.
+  it('keeps only history images that belong to this conversation and the message that carried them', async () => {
+    const RIVAL = 'arn:aws:chime:us-east-1:111:app-instance/i/bot/rival';
+    const meta = (fileKey: string) => JSON.stringify({ attachment: { fileKey, type: 'image/png' } });
+    mockMessagingSend.mockResolvedValueOnce({
+      ChannelMessages: [
+        { Sender: { Arn: USER }, Content: 'and this one', Metadata: meta('attachments/conv-other/sub-victim/1-secret.png') },
+        { Sender: { Arn: USER }, Content: 'my upload', Metadata: meta('attachments/conv-1/sub-1/1-mine.png') },
+        { Sender: { Arn: RIVAL }, Content: 'Generated an image with Rival.', Metadata: meta('battle-images/conv-1/1700000000-0.png') },
+      ],
+    });
+
+    const history = await loadChannelHistory(CHANNEL, BOT, 'Which is better?');
+
+    const imagesOf = (content: string) => history.find(m => m.content.includes(content))?.images;
+    expect(imagesOf('Generated an image')).toEqual([{ fileKey: 'battle-images/conv-1/1700000000-0.png', contentType: 'image/png' }]);
+    expect(imagesOf('my upload')).toEqual([{ fileKey: 'attachments/conv-1/sub-1/1-mine.png', contentType: 'image/png' }]);
+    expect(history.flatMap(m => m.images ?? []).map(i => i.fileKey)).not.toContain('attachments/conv-other/sub-victim/1-secret.png');
+  });
+
   it('keeps an assistant reply that contains an ellipsis', async () => {
     queueMessages([
       { sender: USER, content: 'I am reviewing the billing migration and the cutover date is March 14.' },
@@ -178,6 +202,80 @@ describe('loadChannelHistory', () => {
     const history = await loadChannelHistory(CHANNEL, BOT, 'Anything else?');
 
     expect(history).toEqual<ConversationMessage[]>([entry('user', 'Hello', USER)]);
+  });
+
+  /**
+   * HISTORY ENDS AT THE TURN'S OWN MESSAGE (live 2026-09-14).
+   *
+   * The turn answering "What is AgentEchelon?" loaded the three messages queued behind it
+   * (`roles: 'auuu'`), answered them, and the reading then proposed work that was already done.
+   */
+  describe('bounded at the message this turn answers', () => {
+    const withIds = (messages: Array<{ id: string; sender: string; content: string }>) => {
+      mockMessagingSend.mockResolvedValueOnce({
+        ChannelMessages: [...messages].reverse()
+          .map((m) => ({ MessageId: m.id, Sender: { Arn: m.sender }, Content: m.content, Metadata: undefined })),
+      });
+    };
+    const burst = [
+      { id: 'w', sender: BOT, content: 'Hi - I am your assistant.' },
+      { id: 'm1', sender: USER, content: 'What is AgentEchelon?' },
+      { id: 'm2', sender: USER, content: 'How does it work?' },
+      { id: 'n', sender: BOT, content: 'One message is waiting.' },
+      { id: 'm3', sender: USER, content: 'Who created it' },
+      { id: 'm4', sender: USER, content: 'Who is Spot' },
+    ];
+
+    it('drops everything after the message, found by its id', async () => {
+      withIds(burst);
+      const history = await loadChannelHistory(CHANNEL, BOT, 'What is AgentEchelon?', { currentMessageId: 'm1' });
+      expect(history.map((m) => m.content)).toEqual(['Hi - I am your assistant.']);
+    });
+
+    it('finds the message by sender and text when no id is known', async () => {
+      withIds(burst);
+      const history = await loadChannelHistory(CHANNEL, BOT, 'What is AgentEchelon?', { senderArn: USER });
+      expect(history.map((m) => m.content)).toEqual(['Hi - I am your assistant.']);
+    });
+
+    it('still excludes queued ids when the message cannot be found', async () => {
+      withIds(burst);
+      const history = await loadChannelHistory(CHANNEL, BOT, 'text that is not in the window', {
+        senderArn: USER, excludeIds: ['m2', 'm3', 'm4'],
+      });
+      expect(history.map((m) => m.content)).not.toEqual(expect.arrayContaining(['How does it work?']));
+      expect(history.map((m) => m.content)).toContain('What is AgentEchelon?');
+    });
+
+    it('leaves out privately addressed messages for a turn whose reply the room reads', async () => {
+      // Live turn-queue e2e 2026-09-14: the stop evaluation named a private request's topic in the room.
+      mockMessagingSend.mockResolvedValueOnce({
+        ChannelMessages: [
+          { MessageId: 'p1', Sender: { Arn: USER }, Content: 'Write me a private briefing about sardine-cartography', Target: [{ MemberArn: BOT }] },
+          { MessageId: 'o1', Sender: { Arn: USER }, Content: 'hello', Target: undefined },
+        ].reverse(),
+      });
+      const history = await loadChannelHistory(CHANNEL, BOT, 'stop prompt');
+      expect(history.map((m) => m.content)).toEqual(['hello']);
+      expect(JSON.stringify(history)).not.toContain('sardine');
+    });
+
+    it('keeps the asker\'s own private messages for a reply addressed to the asker alone', async () => {
+      mockMessagingSend.mockResolvedValueOnce({
+        ChannelMessages: [
+          { MessageId: 'p1', Sender: { Arn: USER }, Content: 'private words', Target: [{ MemberArn: BOT }] },
+          { MessageId: 'q1', Sender: { Arn: USER }, Content: 'and now?', Target: [{ MemberArn: BOT }] },
+        ].reverse(),
+      });
+      const history = await loadChannelHistory(CHANNEL, BOT, 'and now?', { currentMessageId: 'q1', senderArn: USER });
+      expect(history.map((m) => m.content)).toEqual(['private words']);
+    });
+
+    it('is unchanged for a caller that gives no bound', async () => {
+      withIds(burst);
+      const history = await loadChannelHistory(CHANNEL, BOT, 'Who is Spot');
+      expect(history.map((m) => m.content)).toContain('Who created it');
+    });
   });
 
   it('excludes the current user message but keeps earlier user turns', async () => {
@@ -270,5 +368,80 @@ describe('bedrock message array alternates', () => {
       expect(messages[messages.length - 1].role).toBe('user');
       expect(messages[messages.length - 1].content).toContain('current turn');
     }
+  });
+});
+
+/**
+ * THE TURN'S OWN MESSAGE IS RECOGNIZED BY ITS ID, NOT BY ITS WORDS.
+ *
+ * `loadChannelHistory` has to leave out the message being answered, because it is added to the prompt
+ * separately and would otherwise reach the model twice. It did that by comparing stored text against
+ * the current message.
+ *
+ * IDENTICAL TEXT IS NOT IDENTITY. A person who asks the same thing twice has the EARLIER message
+ * deleted from the history of the later one - real context, dropped, because it happened to use the
+ * same words. And any change that altered the string on one side but not the other silently stopped
+ * skipping anything at all: stamping the inbound message id into the body would have done exactly
+ * that, since what is stored carries the marker and what the router dispatches does not.
+ *
+ * The anchor above has read the id first since it was added. This is the same question asked the same
+ * way in the one place that still asked it differently.
+ */
+describe('history leaves out the message being answered', () => {
+  const sameQuestion = 'what is the cutover date?';
+
+  it('keeps an EARLIER message with identical text, which the text compare deleted', () => {
+    // The case the words could never get right: both messages are real, one is being answered, and
+    // the other is context the person expects the assistant to still have.
+    mockMessagingSend.mockResolvedValueOnce({
+      ChannelMessages: [
+        { MessageId: 'm3', Sender: { Arn: USER }, Content: sameQuestion },
+        { MessageId: 'm2', Sender: { Arn: BOT }, Content: 'The 14th.' },
+        { MessageId: 'm1', Sender: { Arn: USER }, Content: sameQuestion },
+      ],
+    });
+
+    return loadChannelHistory(CHANNEL, BOT, sameQuestion, {
+      currentMessageId: 'm3',
+      senderArn: USER,
+    }).then((history) => {
+      const userTurns = history.filter((h) => h.role === 'user');
+      expect(userTurns).toHaveLength(1);
+      expect(userTurns[0].content).toContain('cutover date');
+      // And the answer between them survives, so the pair is intact.
+      expect(history.some((h) => h.role === 'assistant' && h.content.includes('14th'))).toBe(true);
+    });
+  });
+
+  it('still leaves out the message being answered, so the model is not handed it twice', () => {
+    // NON-VACUITY for the case above: keeping the earlier one must not mean keeping BOTH.
+    mockMessagingSend.mockResolvedValueOnce({
+      ChannelMessages: [
+        { MessageId: 'm2', Sender: { Arn: USER }, Content: sameQuestion },
+        { MessageId: 'm1', Sender: { Arn: BOT }, Content: 'Earlier reply.' },
+      ],
+    });
+
+    return loadChannelHistory(CHANNEL, BOT, sameQuestion, {
+      currentMessageId: 'm2',
+      senderArn: USER,
+    }).then((history) => {
+      expect(history.some((h) => h.role === 'user' && h.content.includes('cutover'))).toBe(false);
+    });
+  });
+
+  it('falls back to the words when there is no id to use', () => {
+    // A turn with no message id of its own - a proactive turn, or a message older than the listed
+    // window - has no better option, and no skip at all would be worse than a weak one.
+    mockMessagingSend.mockResolvedValueOnce({
+      ChannelMessages: [
+        { MessageId: 'm2', Sender: { Arn: USER }, Content: sameQuestion },
+        { MessageId: 'm1', Sender: { Arn: BOT }, Content: 'Earlier reply.' },
+      ],
+    });
+
+    return loadChannelHistory(CHANNEL, BOT, sameQuestion).then((history) => {
+      expect(history.some((h) => h.role === 'user' && h.content.includes('cutover'))).toBe(false);
+    });
   });
 });

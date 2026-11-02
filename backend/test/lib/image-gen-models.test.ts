@@ -1,7 +1,7 @@
 /**
  * image-gen-models unit tests (SPEC-BATTLE.md Generation-Out, Phase 4B).
  * Pure shaping — the load-bearing bits are the per-model caps clamp
- * (cost guard) and the honest empty-on-unrecognised parse.
+ * (cost guard) and the honest empty-on-unrecognized parse.
  */
 import {
   IMAGE_GEN_MODELS,
@@ -52,7 +52,7 @@ describe('shapeImageGenRequest', () => {
     expect((b2.imageGenerationConfig as Record<string, number>).width % 64).toBe(0); // /64
   });
 
-  it('Phase-4D cap only LOWERS the registry ceiling, never raises it', () => {
+  it('Phase-4D cap only LOWERS the registry maximum, never raises it', () => {
     // maxDimension registry cap = 1024. A deployer cap of 512 lowers it.
     const lowered = shapeImageGenRequest(TITAN, 'x', { maxDimensionCap: 512 }) as Record<
       string,

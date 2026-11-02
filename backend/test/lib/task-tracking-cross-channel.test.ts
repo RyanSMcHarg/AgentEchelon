@@ -2,8 +2,8 @@
  * Cross-channel task continuity (P2.4) — pins the new lookup paths
  * and the prompt-hint shape.
  *
- *   - getActiveTask(userSub, taskType, { channelArn }) — scoped resume
- *   - getActiveTasksForUser(userSub, opts?) — cross-channel discovery
+ *   - getActiveTask(personId, taskType, { channelArn }) — scoped resume
+ *   - getActiveTasksForUser(personId, opts?) — cross-channel discovery
  *   - buildCrossChannelTasksHint(currentChannelArn, allActive) — prompt fragment
  *
  * Mock + module-reset pattern matches battle-task.test.ts in this dir.
@@ -34,7 +34,7 @@ describe('getActiveTask — channel scope option (P2.4)', () => {
   it('queries the GSI WITHOUT a channel filter by default (back-compat)', async () => {
     mockSend.mockResolvedValueOnce({
       Items: [
-        { userSub: USER_SUB, taskId: 't-1', taskType: 'report_generation', channelArn: CHANNEL_A, status: 'in_progress' },
+        { principalId: USER_SUB, taskId: 't-1', taskType: 'report_generation', channelArn: CHANNEL_A, status: 'in_progress' },
       ],
     });
     const { getActiveTask } = await import('../../lambda/src/lib/task-tracking');
@@ -44,7 +44,7 @@ describe('getActiveTask — channel scope option (P2.4)', () => {
     const call = mockSend.mock.calls[0][0];
     expect(call.input.FilterExpression).toBe('#status IN (:pending, :inProgress)');
     expect(call.input.ExpressionAttributeValues[':channelArn']).toBeUndefined();
-    expect(call.input.IndexName).toBe('userSub-taskType-index');
+    expect(call.input.IndexName).toBe('principalId-taskType-index');
   });
 
   it('adds a channelArn FilterExpression when opts.channelArn is supplied', async () => {
@@ -71,7 +71,7 @@ describe('getActiveTask — channel scope option (P2.4)', () => {
     // Second call = strongly-consistent base-table query → the recent task IS visible.
     mockSend.mockResolvedValueOnce({
       Items: [
-        { userSub: USER_SUB, taskId: 't-recent', taskType: 'data_extraction', channelArn: CHANNEL_A, status: 'in_progress', createdAt: '2026-07-20T22:00:00Z' },
+        { principalId: USER_SUB, taskId: 't-recent', taskType: 'data_extraction', channelArn: CHANNEL_A, status: 'in_progress', createdAt: '2026-07-20T22:00:00Z' },
       ],
     });
     const { getActiveTask } = await import('../../lambda/src/lib/task-tracking');
@@ -81,12 +81,57 @@ describe('getActiveTask — channel scope option (P2.4)', () => {
     expect(mockSend).toHaveBeenCalledTimes(2);
     const gsiCall = mockSend.mock.calls[0][0];
     const consistentCall = mockSend.mock.calls[1][0];
-    expect(gsiCall.input.IndexName).toBe('userSub-taskType-index');
+    expect(gsiCall.input.IndexName).toBe('principalId-taskType-index');
     expect(gsiCall.input.ConsistentRead).toBeUndefined();
     // The fallback is the base table (no index) with a strongly-consistent read + taskType in the filter.
     expect(consistentCall.input.IndexName).toBeUndefined();
     expect(consistentCall.input.ConsistentRead).toBe(true);
     expect(consistentCall.input.FilterExpression).toContain('taskType = :taskType');
+  });
+
+  it('LIMIT BEFORE FILTER: finds an active task on a later page when the first page filtered to nothing', async () => {
+    // DynamoDB counts `Limit` against items READ, not matched. A first page whose rows are all ended
+    // comes back EMPTY with a LastEvaluatedKey, and the live task is on the next page. `Limit: 1` on
+    // the GSI returned null here and the flow started a duplicate task.
+    mockSend
+      .mockResolvedValueOnce({ Items: [], LastEvaluatedKey: { principalId: USER_SUB, taskId: 't-done' } })
+      .mockResolvedValueOnce({
+        Items: [
+          { principalId: USER_SUB, taskId: 't-live', taskType: 'report_generation', channelArn: CHANNEL_A, status: 'in_progress', updatedAt: '2026-09-01T10:00:00Z' },
+        ],
+      });
+    const { getActiveTask } = await import('../../lambda/src/lib/task-tracking');
+    const result = await getActiveTask(USER_SUB, 'report_generation', { channelArn: CHANNEL_A });
+
+    expect(result?.taskId).toBe('t-live');
+    expect(mockSend).toHaveBeenCalledTimes(2);
+    const [first, second] = mockSend.mock.calls.map((c) => c[0].input);
+    expect(first.Limit).toBeUndefined();
+    expect(second.IndexName).toBe('principalId-taskType-index');
+    expect(second.ExclusiveStartKey).toEqual({ principalId: USER_SUB, taskId: 't-done' });
+  });
+
+  it('the consistent fallback reads every page with no Limit and returns the newest match', async () => {
+    mockSend
+      .mockResolvedValueOnce({ Items: [] }) // GSI: nothing yet
+      .mockResolvedValueOnce({
+        Items: [
+          { principalId: USER_SUB, taskId: 't-older', taskType: 'data_extraction', channelArn: CHANNEL_A, status: 'pending', updatedAt: '2026-09-01T09:00:00Z' },
+        ],
+        LastEvaluatedKey: { principalId: USER_SUB, taskId: 't-older' },
+      })
+      .mockResolvedValueOnce({ Items: [], LastEvaluatedKey: { principalId: USER_SUB, taskId: 't-x' } })
+      .mockResolvedValueOnce({
+        Items: [
+          { principalId: USER_SUB, taskId: 't-newer', taskType: 'data_extraction', channelArn: CHANNEL_A, status: 'in_progress', updatedAt: '2026-09-01T11:00:00Z' },
+        ],
+      });
+    const { getActiveTask } = await import('../../lambda/src/lib/task-tracking');
+    const result = await getActiveTask(USER_SUB, 'data_extraction', { channelArn: CHANNEL_A });
+
+    expect(result?.taskId).toBe('t-newer');
+    expect(mockSend).toHaveBeenCalledTimes(4);
+    for (const c of mockSend.mock.calls) expect(c[0].input.Limit).toBeUndefined();
   });
 
   it('returns null and does not throw when the DDB query errors', async () => {
@@ -100,11 +145,11 @@ describe('getActiveTask — channel scope option (P2.4)', () => {
 });
 
 describe('getActiveTasksForUser — cross-channel discovery', () => {
-  it('queries the table by PK userSub (NOT the GSI) and filters to active statuses', async () => {
+  it('queries the table by PK principalId (NOT the GSI) and filters to active statuses', async () => {
     mockSend.mockResolvedValueOnce({
       Items: [
-        { userSub: USER_SUB, taskId: 't-1', taskType: 'report_generation', channelArn: CHANNEL_A, status: 'in_progress', updatedAt: '2026-05-22T10:00:00Z' },
-        { userSub: USER_SUB, taskId: 't-2', taskType: 'data_extraction', channelArn: CHANNEL_B, status: 'pending', updatedAt: '2026-05-22T11:00:00Z' },
+        { principalId: USER_SUB, taskId: 't-1', taskType: 'report_generation', channelArn: CHANNEL_A, status: 'in_progress', updatedAt: '2026-05-22T10:00:00Z' },
+        { principalId: USER_SUB, taskId: 't-2', taskType: 'data_extraction', channelArn: CHANNEL_B, status: 'pending', updatedAt: '2026-05-22T11:00:00Z' },
       ],
     });
     const { getActiveTasksForUser } = await import('../../lambda/src/lib/task-tracking');
@@ -112,7 +157,7 @@ describe('getActiveTasksForUser — cross-channel discovery', () => {
 
     const call = mockSend.mock.calls[0][0];
     expect(call.input.IndexName).toBeUndefined();
-    expect(call.input.KeyConditionExpression).toBe('userSub = :userSub');
+    expect(call.input.KeyConditionExpression).toBe('principalId = :principalId');
     expect(call.input.FilterExpression).toBe('#status IN (:pending, :inProgress)');
     expect(rows).toHaveLength(2);
     // Sorted by updatedAt desc — t-2 is newer.
@@ -135,14 +180,14 @@ describe('getActiveTasksForUser — cross-channel discovery', () => {
   it('follows LastEvaluatedKey rather than stopping at the first page', async () => {
     // The active rows can sit anywhere in the partition, so one page is not an answer.
     mockSend
-      .mockResolvedValueOnce({ Items: [], LastEvaluatedKey: { userSub: USER_SUB, taskId: 't-40' } })
+      .mockResolvedValueOnce({ Items: [], LastEvaluatedKey: { principalId: USER_SUB, taskId: 't-40' } })
       .mockResolvedValueOnce({
-        Items: [{ userSub: USER_SUB, taskId: 't-99', status: 'in_progress', updatedAt: '2026-08-21T00:00:00Z' }],
+        Items: [{ principalId: USER_SUB, taskId: 't-99', status: 'in_progress', updatedAt: '2026-08-21T00:00:00Z' }],
       });
     const { getActiveTasksForUser } = await import('../../lambda/src/lib/task-tracking');
     const rows = await getActiveTasksForUser(USER_SUB, { limit: 3 });
     expect(mockSend).toHaveBeenCalledTimes(2);
-    expect(mockSend.mock.calls[1][0].input.ExclusiveStartKey).toEqual({ userSub: USER_SUB, taskId: 't-40' });
+    expect(mockSend.mock.calls[1][0].input.ExclusiveStartKey).toEqual({ principalId: USER_SUB, taskId: 't-40' });
     expect(rows.map((r) => r.taskId)).toEqual(['t-99']);
   });
 
@@ -150,7 +195,7 @@ describe('getActiveTasksForUser — cross-channel discovery', () => {
     // The clamp moved from the QUERY to the RESULT, which is where it belongs: it bounds what the
     // caller is handed, and no longer decides how much of the partition is examined.
     const many = Array.from({ length: 60 }, (_, i) => ({
-      userSub: USER_SUB, taskId: `t-${i}`, status: 'in_progress', updatedAt: `2026-08-${10 + (i % 20)}T00:00:00Z`,
+      principalId: USER_SUB, taskId: `t-${i}`, status: 'in_progress', updatedAt: `2026-08-${10 + (i % 20)}T00:00:00Z`,
     }));
     mockSend.mockResolvedValue({ Items: many });
 
@@ -186,7 +231,7 @@ describe('buildCrossChannelTasksHint — prompt fragment shape', () => {
   it('returns empty string when every active task is in the current channel', async () => {
     const { buildCrossChannelTasksHint } = await import('../../lambda/src/lib/task-tracking');
     const tasks = [
-      { userSub: USER_SUB, taskId: 't-1', taskType: 'report_generation', channelArn: CHANNEL_A, status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
+      { principalId: USER_SUB, taskId: 't-1', taskType: 'report_generation', channelArn: CHANNEL_A, status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
     ];
     expect(buildCrossChannelTasksHint(CHANNEL_A, tasks)).toBe('');
   });
@@ -194,9 +239,9 @@ describe('buildCrossChannelTasksHint — prompt fragment shape', () => {
   it('produces an OTHER ACTIVE WORK section when tasks exist in other channels', async () => {
     const { buildCrossChannelTasksHint } = await import('../../lambda/src/lib/task-tracking');
     const tasks = [
-      { userSub: USER_SUB, taskId: 't-1', taskType: 'report_generation', channelArn: CHANNEL_A, status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
-      { userSub: USER_SUB, taskId: 't-2', taskType: 'data_extraction', channelArn: CHANNEL_A, status: 'pending' as const, createdAt: '', updatedAt: '', ttl: 0 },
-      { userSub: USER_SUB, taskId: 't-3', taskType: 'report_generation', channelArn: CHANNEL_B, status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
+      { principalId: USER_SUB, taskId: 't-1', taskType: 'report_generation', channelArn: CHANNEL_A, status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
+      { principalId: USER_SUB, taskId: 't-2', taskType: 'data_extraction', channelArn: CHANNEL_A, status: 'pending' as const, createdAt: '', updatedAt: '', ttl: 0 },
+      { principalId: USER_SUB, taskId: 't-3', taskType: 'report_generation', channelArn: CHANNEL_B, status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
     ];
     const hint = buildCrossChannelTasksHint(CHANNEL_B, tasks);
     expect(hint).toContain('## OTHER ACTIVE WORK');
@@ -211,9 +256,9 @@ describe('buildCrossChannelTasksHint — prompt fragment shape', () => {
   it('aggregates same-type tasks into a single line with the right count + plural', async () => {
     const { buildCrossChannelTasksHint } = await import('../../lambda/src/lib/task-tracking');
     const tasks = [
-      { userSub: USER_SUB, taskId: 't-1', taskType: 'report_generation', channelArn: CHANNEL_A, status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
-      { userSub: USER_SUB, taskId: 't-2', taskType: 'report_generation', channelArn: 'other', status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
-      { userSub: USER_SUB, taskId: 't-3', taskType: 'report_generation', channelArn: 'other2', status: 'pending' as const, createdAt: '', updatedAt: '', ttl: 0 },
+      { principalId: USER_SUB, taskId: 't-1', taskType: 'report_generation', channelArn: CHANNEL_A, status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
+      { principalId: USER_SUB, taskId: 't-2', taskType: 'report_generation', channelArn: 'other', status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
+      { principalId: USER_SUB, taskId: 't-3', taskType: 'report_generation', channelArn: 'other2', status: 'pending' as const, createdAt: '', updatedAt: '', ttl: 0 },
     ];
     const hint = buildCrossChannelTasksHint(CHANNEL_B, tasks);
     expect(hint).toContain('3 active tasks');
@@ -223,7 +268,7 @@ describe('buildCrossChannelTasksHint — prompt fragment shape', () => {
   it('falls back to "general" for tasks missing a taskType', async () => {
     const { buildCrossChannelTasksHint } = await import('../../lambda/src/lib/task-tracking');
     const tasks = [
-      { userSub: USER_SUB, taskId: 't-1', taskType: '', channelArn: CHANNEL_A, status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
+      { principalId: USER_SUB, taskId: 't-1', taskType: '', channelArn: CHANNEL_A, status: 'in_progress' as const, createdAt: '', updatedAt: '', ttl: 0 },
     ];
     const hint = buildCrossChannelTasksHint(CHANNEL_B, tasks);
     expect(hint).toContain('1 general');

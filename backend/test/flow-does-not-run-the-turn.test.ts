@@ -1,7 +1,7 @@
 /**
  * Nothing that bypasses Lex runs the turn. It decides WHO responds.
  *
- * MESSAGE-FLOW §3.1: bypassing Lex is the only sanctioned difference between an `@all` or `/battle`
+ * MESSAGE-FLOW §6.1: bypassing Lex is the only sanctioned difference between an `@all` or `/battle`
  * turn and an ordinary one. Classification, profile resolution, variant resolution, delivery
  * selection, task creation and model selection belong to the handler (`router-agent-handler.ts`),
  * which is the same code Lex fulfills into.
@@ -66,16 +66,12 @@ const PATHS: BypassPath[] = [
     file: 'battle-orchestrator.ts',
     entries: [
       {
-        symbol: 'resolveBattleVariantBySlotArn',
-        sanctioned: 3,
-        reason:
-          'Round 2 resolves the treatment side itself, the same divergence as the round-1 fan-out and for '
-          + 'the same reason: the rebuttal is an ordinary turn, so its variant resolves on the turn path.',
-      },
-      {
-        symbol: 'resolveBattleControlVariantByAltSlotArn',
+        symbol: 'resolveBattleSides',
         sanctioned: 2,
-        reason: 'Round 2 resolves the control side itself. Belongs on the turn path.',
+        reason:
+          'Round 2 resolves both sides itself (one read of the experiment), the same divergence as the round-1 '
+          + 'fan-out and for the same reason: the rebuttal is an ordinary turn, so its variant resolves on the turn path. '
+          + 'The router re-resolves the sides before it dispatches, so these are used only for the names.',
       },
       {
         symbol: 'PLACEHOLDER_UPDATE',
@@ -89,17 +85,8 @@ const PATHS: BypassPath[] = [
         symbol: 'InvokeCommand',
         sanctioned: 2,
         reason:
-          'The import plus the direct worker invoke - a THIRD entry point into the processor, after the '
-          + 'router and the flow. Goes when round 2 dispatches through the handler (ADR-023).',
-      },
-      {
-        symbol: 'getProcessorArnForClassification',
-        sanctioned: 2,
-        reason:
-          'Round 2 now resolves its worker from the DUEL\'S classification, with the same fail-safe rules '
-          + 'the flow uses. It is listed rather than forbidden because round 2 still dispatches a worker '
-          + 'at all; that goes when it dispatches through the handler (ADR-023). Pinning the worker to '
-          + 'premium was an escalation for any duel a battleEligible profile enabled below premium.',
+          'The import plus the hand-off of round 2 to the classification ROUTER (Phase 1c), which records '
+          + 'the round and dispatches its own processor. The orchestrator invokes no worker itself.',
       },
     ],
   },

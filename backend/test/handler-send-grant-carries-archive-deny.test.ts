@@ -25,7 +25,10 @@ const APP_INSTANCE = 'arn:aws:chime:us-east-1:111122223333:app-instance/abc';
 
 /** The rendered statements, as IAM sees them. */
 const render = (actions: string[]) =>
+  // A bot bearer, so this renders the ASSISTANT boundary (ADR-042). The archived-channel Deny these
+  // cases are about is layered the same way for either actor, so the choice does not affect them.
   classificationChannelScopedAllow('standard', APP_INSTANCE, actions, {
+    actor: 'assistant',
     bearerResources: [`${APP_INSTANCE}/bot/*`],
   }).map((s) => s.toStatementJson() as { Effect: string; Action: string | string[] });
 
@@ -57,35 +60,28 @@ describe('the archived-channel Deny follows a message write', () => {
 });
 
 /**
- * The handler can READ the alt-bot slot roster.
+ * The handler can READ the assignment records it sanctions a duel's alt from.
  *
- * FOUND LIVE, not by reasoning. `isSanctionedBattleBot` reads this parameter to validate a
- * caller-supplied bot identity on a `/battle` turn, and it fails CLOSED. The grant was never added
- * when the battle turn entry was built, so on the first deployment the read threw AccessDenied, every
- * alt-slot identity was rejected, and BOTH SIDES OF EVERY DUEL ANSWERED AS THE SAME BOT.
- *
- * The duel still ran, which is exactly why this shipped inert: nothing failed, the UI showed two
- * replies, and only the backend-error guard caught `[battle-turn] alt-bot roster unreadable` in the
- * handler log. A permission whose absence degrades silently needs a test, not a review.
+ * FOUND LIVE, not by reasoning, when the alt was named by a roster: `isSanctionedBattleBot` validates a
+ * caller-supplied bot identity on a `/battle` turn and fails CLOSED, the grant was missing, and BOTH
+ * SIDES OF EVERY DUEL ANSWERED AS THE SAME BOT. The alt is now named by its own assignment record
+ * (§3.7), read through the same classification-scoped subtree grant the handler resolves a Lex bot
+ * with, so the two cannot drift apart. A permission whose absence degrades silently needs a test.
  */
-describe('the handler can read the alt-bot slot roster', () => {
+describe('the handler can read the alt\'s assignment record', () => {
   const src = fs.readFileSync(
     path.join(__dirname, '../lib/stacks/assistant-profile-stack.ts'),
     'utf8',
   );
   const code = stripComments(src);
 
-  it('grants ssm:GetParameter on the roster parameter', () => {
-    // The ARN is built from INSTANCE_SSM so it follows a non-default SSM_ROOT.
-    expect(code).toMatch(/INSTANCE_SSM\.altBotSlotsRoster/);
-    expect(code).toMatch(/parameter\$\{INSTANCE_SSM\.altBotSlotsRoster\}/);
+  it('grants the path read on this classification\'s assignment subtree to the handler', () => {
+    const handlerRole = code.slice(code.indexOf("new iam.Role(this, 'AgentHandlerRole'"));
+    expect(handlerRole).toMatch(/actions: \['ssm:GetParameter', 'ssm:GetParametersByPath'\],\s*resources: \[\s*`arn:aws:ssm:\$\{this\.region\}:\$\{this\.account\}:parameter\$\{SSM_ROOT\}\/assistant-assignments\/\$\{classification\}`,/);
   });
 
-  it('names the parameter in the handler env rather than relying on the hardcoded fallback', () => {
-    // `battle-turn.ts` falls back to `/agent-echelon/alt-bot-slots/roster`, which is correct ONLY at
-    // the default SSM_ROOT. A deployment with its own root would read a parameter that does not exist
-    // and fail closed - the same silent one-bot duel, on a deployment nobody would think to check.
-    expect(code).toMatch(/ALT_BOT_SLOTS_ROSTER_PARAM:\s*INSTANCE_SSM\.altBotSlotsRoster/);
+  it('reads no roster', () => {
+    expect(code).not.toMatch(/alt-bot-slots|altBotSlotsRoster|ALT_BOT_SLOTS_ROSTER_PARAM/);
   });
 });
 
@@ -107,9 +103,21 @@ describe('the handler role grants its send THROUGH the helper', () => {
     // Every occurrence of the action in code must sit within a helper call. A bare
     // `new iam.PolicyStatement({ actions: ['chime:SendChannelMessage'] ... })` would grant the write
     // with no Deny attached, which is the regression this file exists to catch.
+    //
+    // ZERO IS A PASS, and the reason is the stronger property: the handler role holds no send at all.
+    // Everything the router says goes out on the routed assistant's session, whose acting role carries
+    // the archived-channel Deny (asserted below).
     const occurrences = (code.match(/'chime:SendChannelMessage'/g) || []).length;
     const withinHelper = (code.match(/classificationChannelScopedAllow\([^)]*'chime:SendChannelMessage'/gs) || []).length;
-    expect(occurrences).toBeGreaterThan(0);
     expect(withinHelper).toBe(occurrences);
+  });
+
+  it('puts the archived-channel Deny in the boundary of the acting role the assistant posts through', () => {
+    const common = stripComments(fs.readFileSync(path.join(__dirname, '../lib/stacks/agent-classification-common.ts'), 'utf8'));
+    const acting = common.slice(common.indexOf('export function assistantActingRole('));
+    const tagPin = acting.indexOf('const tagPin');
+    // In the boundary, a limit over every grant the role holds; and only there, so one place answers it.
+    expect(acting.slice(0, tagPin)).toContain('archivedChannelReadOnlyDeny(opts.appInstanceArn)');
+    expect(acting.slice(tagPin, acting.indexOf('return { role, boundary }'))).not.toContain('archivedChannelReadOnlyDeny');
   });
 });

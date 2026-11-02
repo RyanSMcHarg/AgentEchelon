@@ -7,15 +7,17 @@
  * one message anywhere whose sender is a bot and whose `Target` names a bot, which is why no loop is
  * possible today. The ADR-023 round-2 nudge would be the FIRST, so the guard lands first.
  *
- * THE LOOP, CONCRETELY. `TargetedMessages: ALL` routes a targeted message to the target bot's Lex
- * (the continuation path denies a message for exactly that reason - see `channel-flow-processor.ts`
- * where the deny is justified). Chime then materialises a reply from the Lex return and targets it
- * back at the inbound's sender. So bot A nudging bot B produces a reply aimed at A, which routes to
- * A's Lex, which produces a reply aimed at B, and nothing in that cycle terminates it. Each hop is a
- * Lex invocation and potentially a model call, in a channel where no human can see any of it.
+ * THE LOOP THIS GUARDS, AND WHY IT CANNOT START TODAY. If a bot-authored message `Target`-ed at another
+ * bot invoked that bot's Lex, Amazon Chime SDK would materialize a reply targeted back at the sender,
+ * and bot A nudging bot B would produce a reply aimed at A, then one aimed at B, with nothing in the
+ * cycle terminating it. It does not invoke: measured 2026-09-15 on a scratch premium channel with no
+ * channel flow, a bot-authored message `Target`-ed at the other bot invoked neither bot's handler in
+ * either direction, while a person's `Target`-ed message invoked the premium handler as the control
+ * (ADR-023 records the same result). So assistant-to-assistant coordination cannot ride `Target` at
+ * all, and this guard is defense in depth for whatever mechanism replaces it.
  *
  * THE TERMINATOR IS THE EMPTY ENVELOPE, AND IT CANNOT BE MARKED. A handler that wants to say nothing
- * returns `messages: []`, and Chime still materialises a message from it (verified live - see the
+ * returns `messages: []`, and Chime still materializes a message from it (verified live - see the
  * duplicate-placeholder guard's comment). That message has no content, so it can carry no marker, so
  * DEFAULT-DENY on an unmarked bot-to-bot message is what actually stops the exchange. That ordering
  * is the whole design: the guard does not depend on any handler behaving correctly.

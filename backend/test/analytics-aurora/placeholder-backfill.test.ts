@@ -2,8 +2,8 @@
  * placeholder-backfill — one-time historical reconciliation unit tests.
  *
  * Pins the contract that the backfill:
- *   - patches CREATE message rows from their `-UPD` rows (COALESCE-guarded);
- *   - patches exchanges' intent from the `-UPD` row's metadata;
+ *   - patches CREATE message rows from each message's latest update row (COALESCE-guarded);
+ *   - patches exchanges' intent from that update row's metadata;
  *   - only clears exchange evaluations when explicitly asked (destructive/opt-in);
  *   - reports the affected-row counts from each statement.
  */
@@ -38,7 +38,11 @@ describe('placeholder-backfill', () => {
 
     const [msgSql] = mockedQuery.mock.calls[0] as [string];
     expect(msgSql).toMatch(/UPDATE messages c/);
-    expect(msgSql).toMatch(/u\.message_id = c\.message_id \|\| '-UPD'/);
+    // Each message's LATEST update (migration 084), one row per message, never an arbitrary one of several.
+    expect(msgSql).toMatch(/u\.base_message_id = c\.message_id/);
+    expect(msgSql).toMatch(/DISTINCT ON \(ux\.channel_arn, ux\.base_message_id\)/);
+    expect(msgSql).toContain('ux.last_updated_at DESC NULLS LAST');
+    expect(msgSql).not.toContain("'-UPD'");
     expect(msgSql).toMatch(/updated_content\s*=\s*COALESCE\(c\.updated_content, u\.content\)/);
 
     const [exSql] = mockedQuery.mock.calls[1] as [string];

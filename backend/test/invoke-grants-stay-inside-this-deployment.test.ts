@@ -16,8 +16,13 @@
  * somewhere else, which is how this one survived beside three sibling grants that already did it
  * correctly. The rule is structural and cheap to state: after `:function:`, a resource pattern may
  * not START with a wildcard. A trailing wildcard is fine and is what the deployment relies on -
- * `${STACK_PREFIX}Classification-*` is a prefix, so it is also safe against the CloudFormation name
- * truncation ADR-030 records, since truncation removes characters from the end.
+ * `${STACK_PREFIX}*-AgentHandler*` starts with the instance prefix, so it is also safe against the
+ * CloudFormation name truncation ADR-030 records, since truncation removes characters from the end.
+ *
+ * A PREFIX IS NOT YET AN INSTANCE BOUND. `AgentEchelon*` also matches every function of an instance
+ * whose prefix starts with this one (`AgentEchelonTwo`), so each pattern grant is conditioned on this
+ * instance's `Instance` tag as well (`ownInstanceFunctions`); `a-pattern-invoke-reaches-only-its-own-instance.test.ts`
+ * checks that condition, and that the functions it reaches carry the tags it reads.
  *
  * Asserted on the SYNTHESIZED template, for the reason the sibling Lex-permission test gives: a grant
  * added by `grantInvoke()` never appears in a source scan, and a construct that fails to render is
@@ -32,18 +37,19 @@
  * the call returns `Environment.Variables`, so the grant read every other product's configuration in
  * this account, and the guard was green beside it. **A guard that names an ACTION gets the scope of
  * that action; the rule it should have named is that no grant here may reach another product's
- * functions.** Row 96 was fixed and swept, and its sibling one action along survived for that reason.
+ * functions.** The `InvokeFunction` over-grant was fixed and swept, and its sibling one action along survived for that reason.
  */
 import * as cdk from 'aws-cdk-lib';
 import { Template } from 'aws-cdk-lib/assertions';
 import { BattleStack } from '../lib/stacks/battle-stack';
 import { ChannelFlowStack } from '../lib/stacks/channel-flow-stack';
 import { PostProcessingStack } from '../lib/stacks/post-processing-stack';
-import { BasicClassificationStack } from '../lib/stacks/basic-classification-stack';
-import { StandardClassificationStack } from '../lib/stacks/standard-classification-stack';
-import { PremiumClassificationStack } from '../lib/stacks/premium-classification-stack';
-import { ExperimentsStack } from '../lib/stacks/experiments-stack';
-import { DEFAULT_PROFILE_MODEL_SELECTION } from '../lib/config/model-strategy';
+import { INSTANCE_NAME, STACK_PREFIX } from '../lib/stacks/agent-classification-common';
+import { INSTANCE_TAG } from '../lib/tagging';
+import { adminAnalyticsTemplate, adminServicesTemplate, assistantAdministrationTemplate, conversationsTemplate, testMessageStream } from './helpers/synth';
+import { assistantsOf } from './helpers/assistants';
+import { assistantClassifications } from '../lib/config/profiles';
+import { classificationReachOf } from './helpers/classification-reach';
 
 const env = { account: '123456789012', region: 'us-east-1' };
 const appInstanceArn = 'arn:aws:chime:us-east-1:123456789012:app-instance/test';
@@ -53,7 +59,6 @@ const classificationProps = {
   appInstanceArn,
   attachmentsBucketName: 'agent-echelon-attachments-test',
   attachmentsBucketArn: 'arn:aws:s3:::agent-echelon-attachments-test',
-  profileModelSelection: DEFAULT_PROFILE_MODEL_SELECTION,
 };
 
 /** Every stack that grants an invoke, each synthesized in its own app. */
@@ -65,25 +70,34 @@ function stacksThatGrantInvoke(): Array<{ name: string; template: Template }> {
   };
 
   add('Battle', (app) => new BattleStack(app, 'AgentEchelonBattle', {
-    env, appInstanceArn, userPoolId: 'us-east-1_testpool', appUrl: 'https://app.example.com',
+    env, appInstanceArn, selfPoolId: 'us-east-1_testpool', appUrl: 'https://app.example.com',
   }));
   add('ChannelFlow', (app) => new ChannelFlowStack(app, 'AgentEchelonChannelFlow', { env, appInstanceArn }));
   add('PostProcessing', (app) => new PostProcessingStack(app, 'AgentEchelonPostProcessing', {
-    env, appInstanceArn, kinesisStreamArn: `arn:aws:kinesis:${env.region}:${env.account}:stream/test`,
+    env, appInstanceArn, messageStream: testMessageStream(app),
+    attachmentsBucketName: 'test-attachments', attachmentsBucketArn: 'arn:aws:s3:::test-attachments',
   }));
-  add('Classification-Basic', (app) => new BasicClassificationStack(app, 'AgentEchelonClassification-Basic', classificationProps));
-  add('Classification-Standard', (app) => new StandardClassificationStack(app, 'AgentEchelonClassification-Standard', classificationProps));
-  add('Classification-Premium', (app) => new PremiumClassificationStack(app, 'AgentEchelonClassification-Premium', classificationProps));
-  // Row 101: this stack grants a lambda READ, not an invoke, which is exactly why it was absent while
-  // the sweep named a single action.
-  add('Experiments', (app) => new ExperimentsStack(app, 'AgentEchelonExperiments', {
-    env, appInstanceArn, userPoolId: 'us-east-1_TESTPOOL',
-  }));
+  add('Assistants-basic', (app) => assistantsOf('basic')(app, 'AgentEchelonAssistants-basic', classificationProps));
+  add('Assistants-standard', (app) => assistantsOf('standard')(app, 'AgentEchelonAssistants-standard', classificationProps));
+  add('Assistants-premium', (app) => assistantsOf('premium')(app, 'AgentEchelonAssistants-premium', classificationProps));
+  out.push({ name: 'Conversations', template: conversationsTemplate() });
+  // The admin backend and its nested stacks. Assistant administration grants a lambda READ, not an
+  // invoke, which is exactly why it was absent while the sweep named a single action.
+  out.push({ name: 'AdminServices', template: adminServicesTemplate() });
+  out.push({ name: 'AdminServices/AssistantAdministration', template: assistantAdministrationTemplate() });
+  out.push({ name: 'AdminServices/Analytics', template: adminAnalyticsTemplate() });
 
   return out;
 }
 
-interface Statement { Action?: unknown; Resource?: unknown }
+interface Statement { Action?: unknown; Resource?: unknown; Condition?: Record<string, Record<string, unknown>> }
+
+/** Conditioned on this instance's tag and a classification (`ownInstanceFunctions`). */
+function boundToThisInstance(s: Statement): boolean {
+  const eq = s.Condition?.StringEquals ?? {};
+  // Its own classifications by value, or (a shared caller) any function that carries one.
+  return eq[`aws:ResourceTag/${INSTANCE_TAG}`] === INSTANCE_NAME && classificationReachOf(s.Condition) !== null;
+}
 
 /**
  * Every IAM statement in a template that grants ANY `lambda:` action, from roles and policies alike.
@@ -94,7 +108,7 @@ interface Statement { Action?: unknown; Resource?: unknown }
  * green beside a live cross-product READ of every other product's configuration.
  *
  * The lesson is the one this repo keeps relearning: **the scope of a guard becomes the scope of the
- * fix.** Row 96 was found, fixed and swept for `InvokeFunction`, and the sibling exposure one action
+ * fix.** The over-grant was found, fixed and swept for `InvokeFunction`, and the sibling exposure one action
  * along survived precisely because the sweep named an action instead of naming the RULE. The rule was
  * never about invoking - it is that no grant in this deployment may name another product's functions.
  */
@@ -164,19 +178,21 @@ describe('invoke grants name this deployment', () => {
     }
   });
 
-  it('the alt-slot handler names this deployment specifically', () => {
-    // Named as well as swept: this is the grant row 96 was filed against, and it is the one that can
-    // reach another product's agent handler. A future stack losing scope should fail the sweep; this
-    // one regressing should be unmistakable.
+  it("the Battle stack invokes only the routers, and only this instance's", () => {
+    // Named as well as swept: this stack's invoke grants were the ones the sweep was first written for,
+    // because a pattern over whole stacks here could reach another product's functions. The battle
+    // orchestrator and the battle administration API reach only the routers, by the router's construct
+    // id on this instance's classification functions (Battle deploys before the classification stacks,
+    // so their ARNs cannot be named), and no vend.
     const battle = stacks.find((s) => s.name === 'Battle')!.template;
-    const patterns = invokeStatements(battle)
-      .flatMap((s) => (Array.isArray(s.Resource) ? s.Resource : [s.Resource]))
-      .map((r) => JSON.stringify(r))
-      .filter((r) => /:function:/.test(r));
-    expect(patterns.length).toBeGreaterThan(0);
-    // Every function-scoped invoke in this stack is prefixed by the deployment's own stack prefix.
-    for (const p of patterns) expect(p).toMatch(/:function:[A-Za-z0-9]/);
-    // And the specific target the alt-slot handler resolves at runtime is reachable.
-    expect(patterns.some((p) => /Classification-\*/.test(p))).toBe(true);
+    const invokes = invokeStatements(battle).filter((s) => (Array.isArray(s.Action) ? s.Action : [s.Action]).includes('lambda:InvokeFunction'));
+    expect(invokes.length).toBeGreaterThan(0);
+    for (const s of invokes) {
+      const resources = (Array.isArray(s.Resource) ? s.Resource : [s.Resource]).map((r) => JSON.stringify(r));
+      const reachesAFunction = resources.some((r) => /:function:/.test(r));
+      if (!reachesAFunction) continue;
+      expect(resources.every((r) => r.includes(`:function:${STACK_PREFIX}*-AgentHandler*`))).toBe(true);
+      expect(boundToThisInstance(s)).toBe(true);
+    }
   });
 });

@@ -38,7 +38,7 @@ jest.mock('@aws-sdk/client-dynamodb', () => ({
 }), { virtual: true });
 
 const BATTLE_ID = 'a1b2c3d4e5f60718';
-const USER_SUB = 'user-sub-123';
+const VOTER = 'person-123';
 
 /**
  * The per-user SET call(s) among the DDB sends — those that write the nested
@@ -71,7 +71,7 @@ describe('recordBattleOutcome', () => {
     const result = await recordBattleOutcome({
       battleId: BATTLE_ID,
       winner: 'B',
-      chosenByUserSub: USER_SUB,
+      chosenByPersonId: VOTER,
     });
     const after = new Date().toISOString();
 
@@ -79,7 +79,7 @@ describe('recordBattleOutcome', () => {
     expect(result).not.toBeNull();
     expect(result!.battleId).toBe(BATTLE_ID);
     expect(result!.winner).toBe('B');
-    expect(result!.chosenByUserSub).toBe(USER_SUB);
+    expect(result!.chosenByPersonId).toBe(VOTER);
     // chosenAt is server-stamped within the call window.
     expect(result!.chosenAt >= before && result!.chosenAt <= after).toBe(true);
 
@@ -99,7 +99,7 @@ describe('recordBattleOutcome', () => {
     const setCalls = perUserSetCalls();
     expect(setCalls).toHaveLength(1);
     const setCmd = setCalls[0];
-    expect(setCmd.input.ExpressionAttributeNames['#u']).toBe(USER_SUB);
+    expect(setCmd.input.ExpressionAttributeNames['#u']).toBe(VOTER);
     expect(setCmd.input.ExpressionAttributeValues[':vote'].winner).toBe('B');
     expect(typeof setCmd.input.ExpressionAttributeValues[':vote'].chosenAt).toBe('string');
     // Per-user overwrite is intentional (re-pick allowed) — no ConditionExpression.
@@ -110,8 +110,8 @@ describe('recordBattleOutcome', () => {
     mockSend.mockResolvedValue({});
     const { recordBattleOutcome } = await import('../../lambda/src/lib/battle-outcome');
 
-    await recordBattleOutcome({ battleId: BATTLE_ID, winner: 'A', chosenByUserSub: USER_SUB });
-    await recordBattleOutcome({ battleId: BATTLE_ID, winner: 'tie', chosenByUserSub: 'user-2' });
+    await recordBattleOutcome({ battleId: BATTLE_ID, winner: 'A', chosenByPersonId: VOTER });
+    await recordBattleOutcome({ battleId: BATTLE_ID, winner: 'tie', chosenByPersonId: 'user-2' });
 
     const setCalls = perUserSetCalls();
     expect(setCalls).toHaveLength(2);
@@ -119,13 +119,13 @@ describe('recordBattleOutcome', () => {
     // Both target the SAME row (battleId) but DISTINCT nested paths (votes.<sub>),
     // so neither write can clobber the other member's retained vote.
     const subs = setCalls.map((c) => c.input.ExpressionAttributeNames['#u']);
-    expect(new Set(subs)).toEqual(new Set([USER_SUB, 'user-2']));
+    expect(new Set(subs)).toEqual(new Set([VOTER, 'user-2']));
     for (const c of setCalls) {
       expect(c.input.Key.battleId).toBe(BATTLE_ID);
       expect(c.input.UpdateExpression).toContain('votes.#u');
     }
 
-    // user-2's pick is 'tie'; USER_SUB's is untouched by it.
+    // user-2's pick is 'tie'; VOTER's is untouched by it.
     const userTwoSet = setCalls.find((c) => c.input.ExpressionAttributeNames['#u'] === 'user-2');
     expect(userTwoSet!.input.ExpressionAttributeValues[':vote'].winner).toBe('tie');
   });
@@ -134,15 +134,15 @@ describe('recordBattleOutcome', () => {
     mockSend.mockResolvedValue({});
     const { recordBattleOutcome } = await import('../../lambda/src/lib/battle-outcome');
 
-    await recordBattleOutcome({ battleId: BATTLE_ID, winner: 'A', chosenByUserSub: USER_SUB });
-    await recordBattleOutcome({ battleId: BATTLE_ID, winner: 'B', chosenByUserSub: USER_SUB });
+    await recordBattleOutcome({ battleId: BATTLE_ID, winner: 'A', chosenByPersonId: VOTER });
+    await recordBattleOutcome({ battleId: BATTLE_ID, winner: 'B', chosenByPersonId: VOTER });
 
     const setCalls = perUserSetCalls();
     expect(setCalls).toHaveLength(2);
     // Both writes hit the SAME nested path (same #u), so the second overwrites
     // just this user's own entry — no other user's vote is involved.
     for (const c of setCalls) {
-      expect(c.input.ExpressionAttributeNames['#u']).toBe(USER_SUB);
+      expect(c.input.ExpressionAttributeNames['#u']).toBe(VOTER);
       expect(c.input.Key.battleId).toBe(BATTLE_ID);
       expect(c.input.ConditionExpression).toBeUndefined();
     }
@@ -158,16 +158,16 @@ describe('recordBattleOutcome', () => {
       // this literal, so @ts-expect-error would be an "unused directive".
       // We deliberately feed an invalid winner to exercise the runtime guard.
       winner: 'C' as 'A' | 'B' | 'tie',
-      chosenByUserSub: USER_SUB,
+      chosenByPersonId: VOTER,
     });
     expect(result).toBeNull();
     expect(mockSend).not.toHaveBeenCalled();
   });
 
-  it('rejects empty battleId / userSub with null and no DDB call', async () => {
+  it('rejects empty battleId / person id with null and no DDB call', async () => {
     const { recordBattleOutcome } = await import('../../lambda/src/lib/battle-outcome');
-    expect(await recordBattleOutcome({ battleId: '', winner: 'A', chosenByUserSub: USER_SUB })).toBeNull();
-    expect(await recordBattleOutcome({ battleId: BATTLE_ID, winner: 'A', chosenByUserSub: '  ' })).toBeNull();
+    expect(await recordBattleOutcome({ battleId: '', winner: 'A', chosenByPersonId: VOTER })).toBeNull();
+    expect(await recordBattleOutcome({ battleId: BATTLE_ID, winner: 'A', chosenByPersonId: '  ' })).toBeNull();
     expect(mockSend).not.toHaveBeenCalled();
   });
 
@@ -177,7 +177,7 @@ describe('recordBattleOutcome', () => {
     const result = await recordBattleOutcome({
       battleId: BATTLE_ID,
       winner: 'A',
-      chosenByUserSub: USER_SUB,
+      chosenByPersonId: VOTER,
     });
     expect(result).toBeNull();
     expect(mockSend).not.toHaveBeenCalled();
@@ -189,7 +189,7 @@ describe('recordBattleOutcome', () => {
     const result = await recordBattleOutcome({
       battleId: BATTLE_ID,
       winner: 'A',
-      chosenByUserSub: USER_SUB,
+      chosenByPersonId: VOTER,
     });
     expect(result).toBeNull();
   });
@@ -202,23 +202,23 @@ describe('readUserBattleOutcome (the live scorecard read)', () => {
     const legacyV1 = {
       battleId: BATTLE_ID,
       winner: 'B',
-      chosenByUserSub: USER_SUB,
+      chosenByUserSub: VOTER,
       chosenAt: '2026-05-15T00:00:00.000Z',
     };
     mockSend.mockResolvedValueOnce({ Item: legacyV1 });
     const { readUserBattleOutcome } = await import('../../lambda/src/lib/battle-outcome');
 
-    const pick = await readUserBattleOutcome(BATTLE_ID, USER_SUB);
+    const pick = await readUserBattleOutcome(BATTLE_ID, VOTER);
     expect(pick).not.toBeNull();
     expect(pick!.winner).toBe('B');
-    expect(pick!.userSub).toBe(USER_SUB);
+    expect(pick!.personId).toBe(VOTER);
     expect(mockSend.mock.calls[0][0].__type).toBe('Get');
   });
 
   it('returns null when there is no row', async () => {
     mockSend.mockResolvedValueOnce({});
     const { readUserBattleOutcome } = await import('../../lambda/src/lib/battle-outcome');
-    expect(await readUserBattleOutcome(BATTLE_ID, USER_SUB)).toBeNull();
+    expect(await readUserBattleOutcome(BATTLE_ID, VOTER)).toBeNull();
   });
 
   it('returns null for a caller who did not vote — never another member pick', async () => {
@@ -232,7 +232,7 @@ describe('readUserBattleOutcome (the live scorecard read)', () => {
       },
     });
     const { readUserBattleOutcome } = await import('../../lambda/src/lib/battle-outcome');
-    expect(await readUserBattleOutcome(BATTLE_ID, USER_SUB)).toBeNull();
+    expect(await readUserBattleOutcome(BATTLE_ID, VOTER)).toBeNull();
   });
 });
 
@@ -243,7 +243,7 @@ describe('readBattleOutcomes (v2 per-user tally)', () => {
       battleId: BATTLE_ID,
       schemaVersion: 2,
       votes: {
-        [USER_SUB]: { winner: 'A', chosenAt: '2026-05-15T00:00:00.000Z' },
+        [VOTER]: { winner: 'A', chosenAt: '2026-05-15T00:00:00.000Z' },
         'user-2': { winner: 'A', chosenAt: '2026-05-15T00:01:00.000Z' },
         'user-3': { winner: 'B', chosenAt: '2026-05-15T00:02:00.000Z' },
       },
@@ -264,8 +264,8 @@ describe('readBattleOutcomes (v2 per-user tally)', () => {
 
 describe('tallyPicks (pure majority tally)', () => {
   // Minimal per-user pick builder — only the fields tallyPicks reads matter.
-  const pick = (userSub: string, winner: 'A' | 'B' | 'tie', chosenAt = ''): PerUserPick => ({
-    userSub,
+  const pick = (personId: string, winner: 'A' | 'B' | 'tie', chosenAt = ''): PerUserPick => ({
+    personId,
     winner,
     chosenAt,
   });

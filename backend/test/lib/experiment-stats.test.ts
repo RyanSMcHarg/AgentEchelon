@@ -492,7 +492,7 @@ describe('evaluateExperimentOutcome — scoring coverage gates a score-backed ob
 
   test('a caller that reports no coverage has none inferred for it', () => {
     // scoredCount is optional, and absent means UNKNOWN rather than zero. A pure function cannot
-    // invent scoring coverage, so the gate stays off and the older behaviour is unchanged.
+    // invent scoring coverage, so the gate stays off and the older behavior is unchanged.
     const out = evaluateExperimentOutcome({
       control: unscored(),
       treatment: unscored(),

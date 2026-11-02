@@ -20,6 +20,10 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
 }));
 
 import { transformToMessageRecord } from '../../lambda/src/analytics-aurora/kinesis-archival';
+import { withTurnDeclaration } from '../../lambda/src/lib/turn-declaration';
+// The names are deployment configuration, so a hardcoded one would fail the day a deployment renamed
+// its profiles - reporting a config change as a contract break.
+import { defaultProfileRegistry } from '../../lib/profile-registry';
 
 const CH = 'arn:aws:chime:us-east-1:1:app-instance/a/channel/c1';
 
@@ -120,5 +124,60 @@ describe('kinesis-archival channel-event parsing', () => {
       Payload: { Name: 'no arn' },
     } as any);
     expect(rec).toBeNull();
+  });
+
+  /**
+   * THE ASSISTANT A LEX-ENTRY ANSWER DECLARED IN ITS CONTENT.
+   *
+   * A Lex-entry answer is materialized by Amazon Chime SDK from the fulfillment return and carries NO
+   * message metadata, so `analytics.agentType` is absent and there is nowhere else for the responder's
+   * identity to ride. Two such returns carry a correlation marker and are therefore COUNTED as turns -
+   * the DIRECT quick answer and the drift-spawned welcome - and both landed with a NULL `agent_type`
+   * that the latency query renders as an unknown assistant.
+   *
+   * Asserted on the record archival builds, not on the parser, because the parser round-trip passed
+   * while this fold did not exist: removing the fallback left every declaration-only turn unattributed
+   * and no test noticed.
+   */
+  describe('the assistant on a turn with no metadata channel', () => {
+    const botMessage = (content: string) => ({
+      EventType: 'CREATE_CHANNEL_MESSAGE',
+      Payload: {
+        MessageId: 'm-direct-1',
+        ChannelArn: CH,
+        Content: content,
+        Sender: { Arn: 'a/bot/assistant-standard', Name: 'Assistant' },
+        CreatedTimestamp: '2026-07-18T00:00:00Z',
+        LastUpdatedTimestamp: '2026-07-18T00:00:00Z',
+        Persistence: 'PERSISTENT',
+        Type: 'STANDARD',
+      },
+    });
+
+    it('folds a declared assistant onto assistant when metadata carries none', async () => {
+      const name = defaultProfileRegistry.profileNames()[0];
+      const rec = await transformToMessageRecord(
+        botMessage(withTurnDeclaration('4', { phase: 'final', assistant: name })) as any,
+      );
+      expect(rec).not.toBeNull();
+      expect(rec!.assistant).toBe(name);
+    });
+
+    it('leaves assistant NULL when nothing declared one, rather than guessing from the ARN', async () => {
+      // The ARN says `assistant-standard`, and substring-matching it is exactly the guess this column
+      // stopped making: it cannot be right about a deployment whose bots are named anything else, and
+      // every miss landed as a row that looked like a measurement.
+      const rec = await transformToMessageRecord(botMessage('plain answer, no declaration') as any);
+      expect(rec).not.toBeNull();
+      expect(rec!.assistant).toBeNull();
+    });
+
+    it('does not accept an assistant this deployment never declared', async () => {
+      const rec = await transformToMessageRecord(
+        botMessage(withTurnDeclaration('hi', { assistant: 'not-a-real-assistant' })) as any,
+      );
+      expect(rec).not.toBeNull();
+      expect(rec!.assistant).toBeNull();
+    });
   });
 });

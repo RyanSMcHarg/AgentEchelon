@@ -1,7 +1,7 @@
 /**
  * The `awaits` boundary — who holds a task while it is blocked on a person.
  *
- * This is the behaviour that makes "waiting on you" one concept across workflows: a report waiting on
+ * This is the behavior that makes "waiting on you" one concept across workflows: a report waiting on
  * scope and a duel's clarifying question are both a task the PERSON owns, so both appear in the same
  * queue (ADR-024 D1/D3, ADR-029). The rules under test:
  *
@@ -37,12 +37,14 @@ const BOT_ID = 'AltSlot0';
 type Cmd = { __type: string; input: Record<string, unknown> };
 
 const cmds = (): Cmd[] => mockSend.mock.calls.map((c) => c[0] as Cmd);
-/** Owner writes land on the tasks table through setTaskOwner; the mirror move is a Put + Delete. */
+/** Owner writes land on the tasks table through setTaskAssignee; the mirror move is a Put + Delete. */
 const ownerWrites = () =>
   cmds()
     .filter((c) => c.__type === 'Update')
     .map((c) => String(c.input.UpdateExpression ?? ''))
-    .filter((e) => e.includes('ownerId'));
+    // The assignee write, under its post-D8 name (ADR-024 D8): this is the field that moves at every
+    // `awaits` boundary, which is what these tests are about.
+    .filter((e) => e.includes('assigneeId'));
 
 function taskInState(taskState: string): Task {
   return {
@@ -52,8 +54,8 @@ function taskInState(taskState: string): Task {
     taskState,
     status: 'in_progress' as const,
     userArn: `arn:aws:chime:us-east-1:111:app-instance/i/user/${USER_SUB}`,
-    ownerId: BOT_ID,
-    ownerType: 'assistant' as const,
+    assigneeId: BOT_ID,
+    assigneeType: 'assistant' as const,
     createdAt: '2026-08-13T00:00:00.000Z',
     updatedAt: '2026-08-13T00:00:00.000Z',
     deliveryOption: DeliveryOption.TASK_MULTI_STEP,
@@ -119,8 +121,8 @@ describe('the awaits hand-over', () => {
     const task = {
       ...taskInState('options_presented'),
       taskType: 'action_item',
-      ownerId: USER_SUB,
-      ownerType: 'user' as const,
+      assigneeId: USER_SUB,
+      assigneeType: 'user' as const,
     };
     mockSend.mockImplementation((cmd: Cmd) =>
       cmd.__type === 'Get' ? Promise.resolve({ Item: task }) : Promise.resolve({}),
@@ -138,8 +140,8 @@ describe('the awaits hand-over', () => {
     const task = {
       ...taskInState('collecting_requirements'),
       taskType: 'data_extraction',
-      ownerId: USER_SUB,
-      ownerType: 'user' as const,
+      assigneeId: USER_SUB,
+      assigneeType: 'user' as const,
     };
     mockSend.mockImplementation((cmd: Cmd) =>
       cmd.__type === 'Get' ? Promise.resolve({ Item: task }) : Promise.resolve({}),

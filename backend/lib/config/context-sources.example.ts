@@ -38,6 +38,8 @@ export function contextSourceCatalog(ctx: CatalogDeploymentContext): ContextSour
       prefix: `context/${ctx.classification}/`,
       trust: 'operator',
       availability: 'always',
+      // The classification's document menu: the same for everyone in the room, so a room message may say it.
+      describesPerson: false,
       maxBytes: 16384,
       fields: {
         digest: {
@@ -60,12 +62,15 @@ export function contextSourceCatalog(ctx: CatalogDeploymentContext): ContextSour
       type: 'dynamodb-table',
       arn: ctx.userProfileTableArn,
       locator: ctx.userProfileTableName,
+      // One record per person, keyed by the requester. A person who has not completed onboarding has
+      // no record, which is normal and is counted as the `no-record` skip rather than a failure.
+      perPerson: true,
       trust: 'platform',
       // NOT readable at WelcomeIntent: that fires on the assistant's channel membership, before the
       // creator's membership settles. Marked so the welcome omits it rather than waiting on it.
       availability: 'identity-settled',
       maxBytes: 4096,
-      // The built-in store writes `{ userSub, onboardedAt, facts: {…}, updatedAt }` - every collected
+      // The built-in store writes `{ personId, onboardedAt, facts: {…}, updatedAt }` - every collected
       // answer lives UNDER `facts`, keyed by the intake field key. So each field names a dotted path.
       // Declaring them top-level (as this once did) found nothing and resolved the whole source to
       // absent on every turn, for every user.
@@ -73,10 +78,13 @@ export function contextSourceCatalog(ctx: CatalogDeploymentContext): ContextSour
       // Which keys exist under `facts` is decided by THIS deployment's onboarding intake config, so
       // adjust these paths to match your own intake fields. A path that is not collected simply
       // resolves absent, which the outcome metric now reports rather than hiding.
+      //
+      // Every field is an onboarding answer, text the person wrote, so each is MEMBER trust (ADR-060 decision 2):
+      // inserted stripped and capped, never deciding, and fenced in the prompt as participant-supplied.
       fields: {
-        displayName: { type: 'string', from: 'facts.name', description: 'Preferred name for addressing them' },
-        company: { type: 'string', optional: true, from: 'facts.company', description: 'Employer they gave at onboarding' },
-        role: { type: 'string', optional: true, from: 'facts.role', description: 'Their job role, not their role in this conversation' },
+        displayName: { type: 'string', from: 'facts.name', trust: 'member', description: 'Preferred name for addressing them' },
+        company: { type: 'string', optional: true, from: 'facts.company', trust: 'member', description: 'Employer they gave at onboarding' },
+        role: { type: 'string', optional: true, from: 'facts.role', trust: 'member', description: 'Their job role, not their role in this conversation' },
       },
       contractVersion: '1.0',
     },

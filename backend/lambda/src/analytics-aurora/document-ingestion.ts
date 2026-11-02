@@ -21,10 +21,12 @@
  *   cross-conversation context + RAG + (future) eval, so RAG adds zero
  *   incremental infra cost.
  *
- * Failure mode is best-effort: a chunk that fails to embed is logged
- * and skipped; the rest of the document still ingests. A file that
- * fails to read aborts the whole event but does not throw — S3 event
- * retries are bounded by Lambda's retry policy.
+ * Failure mode: a chunk that fails to embed is logged and skipped; the
+ * rest of the document still ingests. A record that fails (the read or
+ * a write threw, or no chunk embedded) is logged, the other records are
+ * still processed, and the invocation then throws, so the asynchronous
+ * invoke retries it and keeps the event in the dead-letter queue once
+ * the retries are spent (DOCUMENT_INGESTION_RETRY, archive-stack-aurora.ts).
  */
 
 import { S3Client, GetObjectCommand } from '@aws-sdk/client-s3';
@@ -35,7 +37,8 @@ import {
 import { ensureSchema } from './db-client.js';
 import { withWriterRole } from './classification-boundary.js';
 import { emitDriftCounter, newCorrelationId } from '../lib/emf-metrics.js';
-import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
+import { loadProfileRegistry } from '../../../lib/profile-registry';
 
 const s3 = new S3Client({});
 const bedrock = new BedrockRuntimeClient({});
@@ -50,7 +53,7 @@ const EMBEDDING_TIMEOUT_MS = 5000;
 // markdown/text wiki content.
 const CHUNK_SIZE_CHARS = 1800;     // ~450 tokens at avg 4 chars/token
 const CHUNK_OVERLAP_CHARS = 200;   // ~50 tokens; preserves cross-chunk context
-const MAX_CHUNKS_PER_DOC = 200;    // hard cap; a 360KB doc is the ceiling
+const MAX_CHUNKS_PER_DOC = 200;    // hard cap; a 360KB doc is the maximum
 
 // Source-type derivation: the S3 key prefix immediately under `rag/` is
 // the source_type (e.g., rag/wiki/foo.md → 'wiki'). Falls back to
@@ -64,19 +67,31 @@ function deriveSourceType(s3Key: string): string {
 // renamed its isolation key to `classification`). Without this, no chunk was tagged and the retrieval
 // classification-filter was a no-op — ALL KB content was returned to ALL classifications (leak).
 // Convention: an optional classification segment right after the source-type —
-// `rag/{sourceType}/{classification}/…` where `{classification}` ∈ basic|standard|premium.
-// Content with NO classification segment defaults to `RAG_DEFAULT_CLASSIFICATION` (default
-// `premium` = most-restrictive, **fail-closed**), so untagged content is never exposed to a
-// lower classification; tag content `basic` to publish it to all classifications. Retrieval
+// `rag/{sourceType}/{classification}/…` where `{classification}` is any classification the
+// deployment configures (basic|standard|premium|enterprise by default). Content with NO
+// classification segment defaults to `RAG_DEFAULT_CLASSIFICATION`, or failing that to the
+// MOST RESTRICTIVE configured classification, **fail-closed** — derived, never named, so adding a
+// higher classification tightens this default rather than silently leaving untagged content
+// readable one classification below the top. Untagged content is therefore never exposed to a lower
+// classification; tag content `basic` to publish it to all classifications. Retrieval
 // filters `metadata->>'classification' = ANY(scope)` where a user's scope is their classification and
 // below (router-agent-handler.ts).
 export function deriveContentClassification(s3Key: string): string {
   const seg = s3Key.match(/^rag\/[^/]+\/([^/]+)\//)?.[1];
-  if (seg && profiles.isKnownClassification(seg)) return profiles.resolveClassification(seg);
-  // Untagged content defaults to the MOST restrictive classification (fail-closed) so it is never
-  // exposed to a lower one; an env override applies only if it names a known classification.
+  if (seg && profiles.isKnownClassification(seg)) return profiles.resolveClassification(seg)!;
+  // Untagged content is stamped with the classification the FEWEST holders reach, so it is withheld
+  // from as many principals as possible while still being readable by somebody. That used to be "the
+  // top of the ordinary rank order"; counting reach is the same answer on a ladder and the only one
+  // that means anything between peers. The admin plane is excluded either way: no
+  // user conversation is served there, so a document stamped at it is retrievable by nothing. An env
+  // override applies only if it names a known classification.
+  // CONVERSATIONAL, NOT MERELY KNOWN. The paragraph above says the admin plane is excluded "either
+  // way", and `failClosedContentValue` does exclude it - but `isKnownClassification` does not, so the
+  // override was the one path that could stamp knowledge-base content at the admin plane. Nothing
+  // would have disclosed; the document would simply have been retrievable by nothing, silently, which
+  // is the failure this whole function is written to avoid.
   const dflt = (process.env.RAG_DEFAULT_CLASSIFICATION || '').trim();
-  return profiles.isKnownClassification(dflt) ? dflt : profiles.mostRestrictiveValue;
+  return profiles.isConversational(dflt) ? profiles.resolveClassification(dflt)! : profiles.failClosedContentValue;
 }
 
 // Title derivation: first non-empty H1 line if present, else filename
@@ -188,6 +203,8 @@ export interface IngestResult {
  * record's failure does not abort the others.
  */
 export async function handler(event: S3Event): Promise<{ ingested: IngestResult[] }> {
+  // The deployment's set, read at runtime from the rows its stacks publish (lib/profile-registry.ts).
+  await loadProfileRegistry();
   // Apply any pending migration first - see `summary-updater.ts` for why bundling the schema is not
   // enough. Memoized per instance; pinned by `db-lambdas-apply-migrations.test.ts`.
   await ensureSchema();
@@ -199,11 +216,25 @@ export async function handler(event: S3Event): Promise<{ ingested: IngestResult[
   });
 
   const results: IngestResult[] = [];
+  const failed: string[] = [];
 
   for (const record of event.Records ?? []) {
     const bucket = record.s3?.bucket?.name;
     const key = decodeURIComponent((record.s3?.object?.key ?? '').replace(/\+/g, ' '));
     const etag = (record.s3?.object?.eTag ?? '').replace(/"/g, '');
+
+    // A DELETED OBJECT TAKES ITS CHUNKS WITH IT. The corpus is what an object holds;
+    // an object removed from `rag/` left its embeddings retrievable, so moving or withdrawing a document
+    // meant overwriting it with a stub. The S3 event is the signal (tenet D6).
+    if (bucket && key.startsWith('rag/') && (record.eventName ?? '').startsWith('ObjectRemoved')) {
+      try {
+        await removeObjectChunks(bucket, key);
+      } catch (err) {
+        console.error('[document-ingestion] could not remove the chunks of a deleted object', { key, err });
+        failed.push(key);
+      }
+      continue;
+    }
 
     if (!bucket || !key || !key.startsWith('rag/')) {
       console.warn('[document-ingestion] skipping record: not under rag/ prefix', { key });
@@ -213,12 +244,36 @@ export async function handler(event: S3Event): Promise<{ ingested: IngestResult[
     try {
       const result = await ingestObject(bucket, key, etag, correlationId);
       results.push(result);
+      // An object whose every chunk failed to embed (Bedrock unreachable or refusing) holds nothing
+      // retrievable, which is the same outcome as a read that failed.
+      if (result.chunksAttempted > 0 && result.chunksEmbedded === 0) failed.push(key);
     } catch (err) {
-      console.error('[document-ingestion] record failed (non-fatal):', { key, err });
+      console.error('[document-ingestion] record failed:', { key, err });
+      failed.push(key);
     }
   }
 
+  // A FAILED RECORD FAILS THE INVOCATION, after every other record has been processed, so the asynchronous
+  // invoke retries it and, once the retries are spent, keeps the event in the dead-letter queue
+  // (DOCUMENT_INGESTION_RETRY in archive-stack-aurora.ts). A retry re-processes the records that succeeded
+  // too, which the ETag check makes a read rather than a re-embed.
+  if (failed.length) {
+    throw new Error(`[document-ingestion] ${failed.length} record(s) not ingested: ${failed.join(', ')}`);
+  }
+
   return { ingested: results };
+}
+
+/** Delete the embeddings of an object removed from the bucket, as the classification writer role. */
+export async function removeObjectChunks(bucket: string, key: string): Promise<number> {
+  const sourceId = `s3://${bucket}/${key}`;
+  const result = await withWriterRole((client) => client.query(
+    `DELETE FROM embeddings WHERE source_id = $1 AND source_type = $2`,
+    [sourceId, deriveSourceType(key)],
+  ));
+  const removed = result.rowCount ?? 0;
+  console.log('[document-ingestion] removed the chunks of a deleted object', { sourceId, removed });
+  return removed;
 }
 
 export async function ingestObject(

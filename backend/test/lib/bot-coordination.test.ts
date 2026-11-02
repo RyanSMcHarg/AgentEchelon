@@ -2,13 +2,13 @@
  * The bot-to-bot loop guard.
  *
  * WHAT THIS IS PROTECTING. `TargetedMessages: ALL` routes a targeted message to the target bot's
- * Lex, and Chime materialises the reply targeted back at the sender. Two bots can therefore volley
+ * Lex, and Chime materializes the reply targeted back at the sender. Two bots can therefore volley
  * indefinitely, each hop a Lex invocation and potentially a model call, in a channel where no human
  * can see any of it. No such message exists in the backend today - every targeted send addresses a
  * human - so these tests pin the guard BEFORE the first one is built.
  *
  * THE PROPERTY THAT MATTERS MOST is the last describe block: the guard terminates an exchange
- * WITHOUT relying on any handler behaving correctly. Every other rule here is defence in depth.
+ * WITHOUT relying on any handler behaving correctly. Every other rule here is defense in depth.
  */
 
 import {
@@ -123,7 +123,7 @@ describe('evaluateBotToBot: the bounded exchange', () => {
 describe('the guard terminates an exchange without help from any handler', () => {
   it('denies the empty envelope that ends a healthy exchange, and stays quiet about it', () => {
     // THE LOAD-BEARING CASE. A handler that wants to say nothing returns `messages: []`, and Chime
-    // materialises a message from it anyway - content empty, so no marker is possible. Default-deny
+    // materializes a message from it anyway - content empty, so no marker is possible. Default-deny
     // on an unmarked bot-to-bot message is therefore what actually stops the cycle, and it holds
     // even if every handler rule above it is wrong.
     const v = evaluateBotToBot({ senderArn: BOT_A, targetBotArns: [BOT_B], content: '' });

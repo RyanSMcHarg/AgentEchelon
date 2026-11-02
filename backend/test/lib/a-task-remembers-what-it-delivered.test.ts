@@ -46,7 +46,7 @@ describe('the task prompt carries what has already been delivered', () => {
     const prompt = buildTaskContextForPrompt({
       ...base,
       deliveries: [{ name: 'report-2026-08-20.md', at: '2026-08-20T20:47:35.450Z', fromState: 'generating' }],
-    });
+    }, DEFAULT_TASK_STATE_MACHINES);
 
     expect(prompt).toContain('ALREADY DELIVERED');
     expect(prompt).toContain('report-2026-08-20.md');
@@ -59,7 +59,7 @@ describe('the task prompt carries what has already been delivered', () => {
     const prompt = buildTaskContextForPrompt({
       ...base,
       deliveries: [{ name: 'report.md', at: '2026-08-20T20:47:35.450Z' }],
-    });
+    }, DEFAULT_TASK_STATE_MACHINES);
 
     // The three things the live failure got wrong: it re-generated, it did not close, and it could not
     // answer the question that was actually asked.
@@ -71,7 +71,7 @@ describe('the task prompt carries what has already been delivered', () => {
   it('says nothing at all when the task has delivered nothing', () => {
     // A task mid-collection must not be told it delivered something, and an unchanged prompt is what
     // keeps this from disturbing every other turn.
-    const prompt = buildTaskContextForPrompt({ ...base, taskState: 'collecting_requirements' });
+    const prompt = buildTaskContextForPrompt({ ...base, taskState: 'collecting_requirements' }, DEFAULT_TASK_STATE_MACHINES);
     expect(prompt).not.toContain('ALREADY DELIVERED');
   });
 
@@ -84,7 +84,7 @@ describe('the task prompt carries what has already been delivered', () => {
         { name: 'first.md', at: '2026-08-20T18:00:00.000Z' },
         { name: 'revised.md', at: '2026-08-20T20:00:00.000Z' },
       ],
-    });
+    }, DEFAULT_TASK_STATE_MACHINES);
     expect(prompt).toContain('first.md');
     expect(prompt).toContain('revised.md');
   });
@@ -99,7 +99,7 @@ describe('a delivering step is told that delivering COMPLETES the task', () => {
     // Owner: if the report is delivered it is complete, unless the person objects and asks for changes.
     // That is a rule for the MODEL, not a runtime walker: completion keeps its single path (the
     // advance tool reaching a terminal state) and the model is simply told when to take it.
-    const prompt = buildTaskContextForPrompt({ ...base, taskState: 'generating' });
+    const prompt = buildTaskContextForPrompt({ ...base, taskState: 'generating' }, DEFAULT_TASK_STATE_MACHINES);
 
     expect(prompt).toMatch(/DELIVERING IT COMPLETES IT/);
     expect(prompt).toMatch(/same turn/i);
@@ -111,7 +111,7 @@ describe('a delivering step is told that delivering COMPLETES the task', () => {
   });
 
   it('names what reopens it, so a change request is not read as a refusal to finish', () => {
-    const prompt = buildTaskContextForPrompt({ ...base, taskState: 'generating' });
+    const prompt = buildTaskContextForPrompt({ ...base, taskState: 'generating' }, DEFAULT_TASK_STATE_MACHINES);
     expect(prompt).toMatch(/asking\s+is\s+what\s+reopens\s+it/i);
     expect(prompt).toMatch(/revising step/i);
   });
@@ -119,7 +119,7 @@ describe('a delivering step is told that delivering COMPLETES the task', () => {
   it('says none of it on a step that does not deliver', () => {
     // Collecting requirements produces conversation. Telling it that delivering completes the task
     // would invite it to close work it has not started.
-    const prompt = buildTaskContextForPrompt({ ...base, taskState: 'collecting_requirements' });
+    const prompt = buildTaskContextForPrompt({ ...base, taskState: 'collecting_requirements' }, DEFAULT_TASK_STATE_MACHINES);
     expect(prompt).not.toMatch(/DELIVERING IT COMPLETES IT/);
   });
 });
@@ -129,29 +129,41 @@ describe('the runtime closes a delivering step once it has actually delivered', 
     // The owner's rule: a delivered report is complete unless the person asks for changes. Telling the
     // model that is deployed and did not achieve it - every recent report sat `in_progress` in
     // `generating`, delivered and never advanced - so the fact does the work.
-    expect(terminalStateAfterDelivery('report_generation', 'generating')).toBe('completed');
+    expect(terminalStateAfterDelivery('report_generation', 'generating', DEFAULT_TASK_STATE_MACHINES)).toBe('completed');
   });
 
   it('closes a revised report too: applying the change and re-delivering ends the work', () => {
-    expect(terminalStateAfterDelivery('report_generation', 'revising')).toBe('completed');
+    expect(terminalStateAfterDelivery('report_generation', 'revising', DEFAULT_TASK_STATE_MACHINES)).toBe('completed');
   });
 
   it('REFUSES a step that awaits the person, however much it delivered', () => {
-    // The case the removed walker got wrong, and the reason that ban stands. `validating` delivers a
-    // draft AND expects an answer about it; closing it would throw away the review it just asked for.
+    // The case the removed walker got wrong, and the reason that ban stands. A step that awaits the
+    // person expects an answer about what it showed them; closing it would throw away the review it
+    // just asked for. No VALID machine can declare such a step any more (a state that awaits somebody
+    // cannot deliver, `validateTaskStateMachine`), so the shipped `validating` presents rather than
+    // delivers, and this guard is pinned against a machine that skipped validation.
     const validating = DEFAULT_TASK_STATE_MACHINES.data_extraction?.states?.validating;
-    expect(validating?.delivers).toBe(true);
+    expect(validating?.delivers).toBeUndefined();
     expect(validating?.awaits).toBeTruthy();
-    expect(terminalStateAfterDelivery('data_extraction', 'validating')).toBeUndefined();
+    const unvalidated = {
+      flow: {
+        initial: 'checking',
+        states: {
+          checking: { transitions: ['done'], awaits: { party: 'requester' as const }, produces: 'document' as const },
+          done: { transitions: [], terminal: 'success' as const },
+        },
+      },
+    };
+    expect(terminalStateAfterDelivery('flow', 'checking', unvalidated)).toBeUndefined();
   });
 
   it('refuses a delivering step with no terminal successor', () => {
     // `extracting` delivers and what follows is more work. Neither successor is an ending.
-    expect(terminalStateAfterDelivery('data_extraction', 'extracting')).toBeUndefined();
+    expect(terminalStateAfterDelivery('data_extraction', 'extracting', DEFAULT_TASK_STATE_MACHINES)).toBeUndefined();
   });
 
   it('refuses a step that does not deliver at all', () => {
-    expect(terminalStateAfterDelivery('report_generation', 'collecting_requirements')).toBeUndefined();
+    expect(terminalStateAfterDelivery('report_generation', 'collecting_requirements', DEFAULT_TASK_STATE_MACHINES)).toBeUndefined();
   });
 
   it('refuses to choose when a machine names more than one way to finish', () => {
@@ -161,7 +173,7 @@ describe('the runtime closes a delivering step once it has actually delivered', 
       forked: {
         initial: 'producing',
         states: {
-          producing: { transitions: ['accepted', 'rejected'], delivers: true },
+          producing: { transitions: ['accepted', 'rejected'], produces: 'document' as const },
           accepted: { transitions: [], terminal: 'success' as const },
           rejected: { transitions: [], terminal: 'failure' as const },
         },
@@ -171,7 +183,7 @@ describe('the runtime closes a delivering step once it has actually delivered', 
   });
 
   it('says nothing about a type or state it does not know, so an unknown task is left alone', () => {
-    expect(terminalStateAfterDelivery('a_type_nobody_declared', 'generating')).toBeUndefined();
-    expect(terminalStateAfterDelivery('report_generation', 'a_state_nobody_declared')).toBeUndefined();
+    expect(terminalStateAfterDelivery('a_type_nobody_declared', 'generating', DEFAULT_TASK_STATE_MACHINES)).toBeUndefined();
+    expect(terminalStateAfterDelivery('report_generation', 'a_state_nobody_declared', DEFAULT_TASK_STATE_MACHINES)).toBeUndefined();
   });
 });

@@ -16,7 +16,7 @@
  * an inline emitter inside a long transaction function is one no test can exercise without standing
  * up the whole batch. And CloudWatch rejects a malformed EMF document SILENTLY - the log line is
  * still written, everything looks healthy, and no metric is ever created - which has already cost
- * this repo months of a metric that never materialised. A named function is a thing a test can call.
+ * this repo months of a metric that never materialized. A named function is a thing a test can call.
  */
 
 import { emitEmfMetric } from '../lib/emf-metrics.js';

@@ -34,9 +34,10 @@ COMMENT ON COLUMN messages.cold_start IS
     'is a large share of a small window explains a slow TTFF, and one that stays high on a busy '
     'window is a concurrency finding rather than a latency one.';
 
--- The rate is read per (day, tier, delivery option) alongside the other latency aggregates, and a
--- window scan is what serves it. Partial, because warm is the overwhelming majority and only the cold
--- rows are ever selected FOR - indexing the nulls too would be a bigger index answering nothing.
+-- The rate is read per (day, classification, delivery option) alongside the other latency aggregates,
+-- and a window scan is what serves it. Partial, because warm is the overwhelming majority and only
+-- the cold rows are ever selected FOR - indexing the nulls too would be a bigger index answering
+-- nothing.
 CREATE INDEX IF NOT EXISTS idx_messages_cold_start
     ON messages (created_at DESC)
     WHERE cold_start;

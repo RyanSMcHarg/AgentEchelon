@@ -1,0 +1,10 @@
+{
+  "project": "AgentEchelon",
+  "license": "MIT",
+  "author": "Ryan McHarg",
+  "since": "2025",
+  "repository": "https://github.com/RyanSMcHarg/AgentEchelon",
+  "purpose": "AgentEchelon is a governed, multi-party, multi-channel AI platform you deploy into your own AWS account. This context lets the assistant answer questions about the platform itself - what it is, how it works, and where a topic is documented.",
+  "overview": "AgentEchelon is a governed, multi-party agentic AI platform that runs in your own AWS account and serves internal and customer-facing use cases from one place. A core feature is that agent governance can be enforced with AWS's own identity primitives instead of a bolted-on policy engine. Every user, assistant, and conversation is an AWS resource with an ARN; every actor holds a bearer-pinned ident",
+  "answering_guidance": "Answer what the platform is and what it does, in plain terms, from the overview above. This is all the platform information available here: do not describe how it is built or configured, and say that an internal conversation covers that. The `author`, `since`, `license` and `repository` fields answer who made it and where its source is."
+}

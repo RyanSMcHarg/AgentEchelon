@@ -8,30 +8,31 @@ import * as fs from 'fs';
 import * as path from 'path';
 import {
   resolveModelForIntent,
-  collectArnsForClassification,
-  intentTypeToRouteKey,
+  ANSWERS_THROUGH_GENERAL,
+  retiredRouteKeyError,
   isTrivialTurn,
+  routesAsServedByTheFloor,
 } from '../lambda/src/lib/model-resolver';
 import type {
   BackendModelDefinition,
   BackendModelKey,
   IntentRouteDefinition,
-  ProfileModelSelection,
 } from '../lib/config/model-strategy';
+import type { ClassificationModels } from '../lib/config/profiles';
 
 // Minimal catalog for testing
-const catalog: Record<BackendModelKey, BackendModelDefinition> = {
+const catalog: Record<BackendModelKey, BackendModelDefinition> = <Record<BackendModelKey, BackendModelDefinition>><unknown>{
   haiku: {
     key: 'haiku',
     provider: 'anthropic',
     displayName: 'Haiku',
     bedrockModelId: 'anthropic.claude-3-haiku',
     foundationModelArns: ['arn:aws:bedrock:us-east-1::foundation-model/haiku'],
-    allowedClassifications: ['basic', 'standard', 'premium'],
     strengths: [],
     costClass: 'low',
     latencyClass: 'fast',
     visionCapable: true,
+    output: 'text',
     workingLanguage: 'en',
   },
   sonnet: {
@@ -41,11 +42,11 @@ const catalog: Record<BackendModelKey, BackendModelDefinition> = {
     bedrockModelId: 'anthropic.claude-sonnet',
     foundationModelArns: ['arn:aws:bedrock:us-east-1::foundation-model/sonnet'],
     inferenceProfileArns: ['arn:aws:bedrock:us-east-1:123:inference-profile/sonnet'],
-    allowedClassifications: ['standard', 'premium'],
     strengths: [],
     costClass: 'medium',
     latencyClass: 'balanced',
     visionCapable: true,
+    output: 'text',
     workingLanguage: 'en',
   },
   opus: {
@@ -54,11 +55,11 @@ const catalog: Record<BackendModelKey, BackendModelDefinition> = {
     displayName: 'Opus',
     bedrockModelId: 'anthropic.claude-opus',
     foundationModelArns: ['arn:aws:bedrock:us-east-1::foundation-model/opus'],
-    allowedClassifications: ['premium'],
     strengths: [],
     costClass: 'high',
     latencyClass: 'deep',
     visionCapable: true,
+    output: 'text',
     workingLanguage: 'en',
   },
   titan: {
@@ -67,11 +68,11 @@ const catalog: Record<BackendModelKey, BackendModelDefinition> = {
     displayName: 'Titan',
     bedrockModelId: 'amazon.titan',
     foundationModelArns: ['arn:aws:bedrock:us-east-1::foundation-model/titan'],
-    allowedClassifications: ['basic', 'standard', 'premium'],
     strengths: [],
     costClass: 'low',
     latencyClass: 'fast',
     visionCapable: false,
+    output: 'text',
     workingLanguage: 'en',
   },
   gpt_oss_20b: {
@@ -80,11 +81,11 @@ const catalog: Record<BackendModelKey, BackendModelDefinition> = {
     displayName: 'GPT OSS 20B',
     bedrockModelId: 'openai.gpt-oss-20b',
     foundationModelArns: [],
-    allowedClassifications: ['basic'],
     strengths: [],
     costClass: 'low',
     latencyClass: 'fast',
     visionCapable: false,
+    output: 'text',
     workingLanguage: 'en',
   },
   gpt_oss_120b: {
@@ -93,11 +94,11 @@ const catalog: Record<BackendModelKey, BackendModelDefinition> = {
     displayName: 'GPT OSS 120B',
     bedrockModelId: 'openai.gpt-oss-120b',
     foundationModelArns: [],
-    allowedClassifications: ['premium'],
     strengths: [],
     costClass: 'high',
     latencyClass: 'deep',
     visionCapable: false,
+    output: 'text',
     workingLanguage: 'en',
   },
   deepseek_v3: {
@@ -106,11 +107,11 @@ const catalog: Record<BackendModelKey, BackendModelDefinition> = {
     displayName: 'DeepSeek V3.1',
     bedrockModelId: 'deepseek.v3-v1:0',
     foundationModelArns: ['arn:aws:bedrock:us-east-1::foundation-model/deepseek.v3-v1:0'],
-    allowedClassifications: ['standard', 'premium'],
     strengths: [],
     costClass: 'low',
     latencyClass: 'balanced',
     visionCapable: false,
+    output: 'text',
     workingLanguage: 'zh',
   },
 };
@@ -121,7 +122,6 @@ const strategy: IntentRouteDefinition[] = [
     label: 'Code Gen',
     primaryModel: 'sonnet',
     fallbackModel: 'haiku',
-    preferredClearance: 'standard',
     rationale: 'Sonnet is good at code',
   },
   {
@@ -129,133 +129,187 @@ const strategy: IntentRouteDefinition[] = [
     label: 'Strategy',
     primaryModel: 'opus',
     fallbackModel: 'sonnet',
-    preferredClearance: 'premium',
     rationale: 'Opus for deep thinking',
   },
   {
-    intent: 'general_qa',
+    intent: 'general',
     label: 'General',
     primaryModel: 'haiku',
     fallbackModel: 'titan',
-    preferredClearance: 'basic',
     rationale: 'Fast and cheap',
   },
 ];
 
-const profileDefaults: ProfileModelSelection = {
-  basic: 'haiku',
-  standard: 'sonnet',
-  premium: 'opus',
+/** What each classification selects from the test catalog, and its default. */
+const SELECTIONS: Record<string, ClassificationModels> = {
+  'basic': {
+    'selected': [
+      'haiku',
+      'titan',
+      'gpt_oss_20b'
+    ],
+    'default': 'haiku'
+  },
+  'standard': {
+    'selected': [
+      'haiku',
+      'sonnet',
+      'titan',
+      'deepseek_v3'
+    ],
+    'default': 'sonnet'
+  },
+  'premium': {
+    'selected': [
+      'haiku',
+      'sonnet',
+      'opus',
+      'titan',
+      'gpt_oss_120b',
+      'deepseek_v3'
+    ],
+    'default': 'opus'
+  },
+  'guest': {
+    'selected': [
+      'haiku'
+    ],
+    'default': 'haiku'
+  },
+  'customer': {
+    'selected': [
+      'haiku'
+    ],
+    'default': 'haiku'
+  }
 };
+const sel = (c: string): ClassificationModels | undefined => SELECTIONS[c];
 
 describe('resolveModelForIntent', () => {
   it('returns default for undefined intent', () => {
-    const result = resolveModelForIntent(undefined, 'basic', catalog, strategy, profileDefaults);
+    const result = resolveModelForIntent(undefined, 'basic', catalog, strategy, sel('basic'));
     expect(result.primaryModelId).toBe('anthropic.claude-3-haiku');
     expect(result.resolvedFromStrategy).toBe(false);
-    expect(result.routeKey).toBe('general_qa');
+    expect(result.routeKey).toBe('general');
   });
 
   it('returns default for unknown intent string', () => {
-    const result = resolveModelForIntent('nonsense', 'basic', catalog, strategy, profileDefaults);
+    const result = resolveModelForIntent('nonsense', 'basic', catalog, strategy, sel('basic'));
     expect(result.resolvedFromStrategy).toBe(false);
   });
 
   it('maps classifier intents to strategy keys', () => {
-    // 'general' maps to 'general_qa'
-    const result = resolveModelForIntent('general', 'basic', catalog, strategy, profileDefaults);
-    expect(result.routeKey).toBe('general_qa');
+    // 'general' maps to 'general'
+    const result = resolveModelForIntent('general', 'basic', catalog, strategy, sel('basic'));
+    expect(result.routeKey).toBe('general');
     expect(result.resolvedFromStrategy).toBe(true);
   });
 
-  it('maps data_extraction to document_extraction', () => {
-    // No strategy route for document_extraction in our fixture
-    const result = resolveModelForIntent('data_extraction', 'basic', catalog, strategy, profileDefaults);
+  it('maps data_extraction to data_extraction', () => {
+    // No strategy route for data_extraction in our fixture
+    const result = resolveModelForIntent('data_extraction', 'basic', catalog, strategy, sel('basic'));
     // Should have mapped the key but found no route
-    expect(result.routeKey).toBe('document_extraction');
+    expect(result.routeKey).toBe('data_extraction');
     expect(result.resolvedFromStrategy).toBe(false);
   });
 
-  it('applies the classification floor: a strategy primary weaker than the classification default is raised to the floor', () => {
-    // general_qa → haiku, but standard's floor is sonnet — a non-trivial question
-    // must not drop below the classification default.
-    const result = resolveModelForIntent('general', 'standard', catalog, strategy, profileDefaults);
-    expect(result.primaryModelKey).toBe('sonnet');
-    expect(result.primaryModelId).toBe('arn:aws:bedrock:us-east-1:123:inference-profile/sonnet');
-    expect(result.resolvedFromStrategy).toBe(true);
-  });
-
-  it('applies the classification floor for premium: a general question resolves to Opus, not Haiku', () => {
-    // The core bug this fixes: general_qa → haiku IS allowed for premium, so without
-    // a floor a premium user silently got Haiku. Premium permission ⇒ premium response.
-    const result = resolveModelForIntent('general', 'premium', catalog, strategy, profileDefaults);
-    expect(result.primaryModelKey).toBe('opus');
-    expect(result.primaryModelId).toBe('anthropic.claude-opus');
-    expect(result.resolvedFromStrategy).toBe(true);
-  });
-
-  it('leaves basic at Haiku (its classification floor IS Haiku — lower tiers may degrade)', () => {
-    const result = resolveModelForIntent('general', 'basic', catalog, strategy, profileDefaults);
-    expect(result.primaryModelKey).toBe('haiku');
-  });
-
-  it('trivial intents (greeting) bypass the floor and stay on Haiku even for premium', () => {
-    const result = resolveModelForIntent('greeting', 'premium', catalog, strategy, profileDefaults);
+  it('serves a route as written, even below the base model: there is no silent floor', () => {
+    // general → haiku on a standard version whose base is sonnet: the saved route is what serves.
+    const result = resolveModelForIntent('general', 'standard', catalog, strategy, sel('standard'));
     expect(result.primaryModelKey).toBe('haiku');
     expect(result.primaryModelId).toBe('anthropic.claude-3-haiku');
+    expect(result.resolvedFromStrategy).toBe(true);
   });
 
-  // A TURN THAT CONTINUES LIVE WORK IS NOT TRIVIAL, whatever the message that triggered it looked
-  // like. Live: a person answered "Looks good" mid-report, the message classified as
-  // `acknowledgment`, the bypass below kept the cheap model, and the reply that followed was a full
-  // multi-section board report generated on Haiku for a premium conversation.
-  it('an acknowledgment that CONTINUES a task keeps the classification floor (Opus, not Haiku)', () => {
-    const result = resolveModelForIntent(
-      'acknowledgment', 'premium', catalog, strategy, profileDefaults,
-      { continuesActiveWork: true },
-    );
-    expect(result.primaryModelKey).toBe('opus');
-    expect(result.primaryModelId).toBe('anthropic.claude-opus');
+  it('a premium general question resolves to the route as written, which a migrated or seeded version writes as Opus', () => {
+    expect(resolveModelForIntent('general', 'premium', catalog, strategy, sel('premium')).primaryModelKey).toBe('haiku');
+    const asServed = routesAsServedByTheFloor({ general: { primary: 'haiku', fallback: 'sonnet' } }, 'opus', catalog).byIntent!;
+    const written = Object.entries(asServed).map(([intent, r]) => ({ ...strategy[0], intent, primaryModel: r.primary, fallbackModel: r.fallback ?? r.primary }) as IntentRouteDefinition);
+    expect(resolveModelForIntent('general', 'premium', catalog, written, sel('premium')).primaryModelKey).toBe('opus');
+    // A standalone greeting keeps the route it was answered on; a continuation is answered as general work.
+    expect(resolveModelForIntent('greeting', 'premium', catalog, written, sel('premium')).primaryModelKey).toBe('haiku');
+    expect(resolveModelForIntent('acknowledgment', 'premium', catalog, written, sel('premium'), { continuesActiveWork: true }).primaryModelKey).toBe('opus');
   });
 
-  it('a greeting that continues a task keeps the floor too (the bypass is about the TURN)', () => {
-    const result = resolveModelForIntent(
-      'greeting', 'standard', catalog, strategy, profileDefaults,
-      { continuesActiveWork: true },
-    );
-    expect(result.primaryModelKey).toBe('sonnet');
+  it('an acknowledgment that CONTINUES a task is answered on the general route, never on a greeting route of its own', () => {
+    const own: IntentRouteDefinition[] = [
+      { ...strategy[0], intent: 'acknowledgment' as never, primaryModel: 'haiku', fallbackModel: 'haiku' },
+      { ...strategy[0], intent: 'general' as never, primaryModel: 'opus', fallbackModel: 'sonnet' },
+    ];
+    expect(resolveModelForIntent('acknowledgment', 'premium', catalog, own, sel('premium'), { continuesActiveWork: true }).primaryModelKey).toBe('opus');
+    expect(resolveModelForIntent('acknowledgment', 'premium', catalog, own, sel('premium')).primaryModelKey).toBe('haiku');
+  });
+
+  it('routesAsServedByTheFloor raises exactly the routes the old floor raised, and nothing else', () => {
+    const routes = {
+      general: { primary: 'haiku', fallback: 'sonnet' },
+      code_generation: { primary: 'sonnet', fallback: 'haiku' },
+      strategic_analysis: { primary: 'opus', fallback: 'sonnet' },
+    };
+    const premium = routesAsServedByTheFloor(routes, 'opus', catalog);
+    expect(premium.raised.sort()).toEqual(['acknowledgment', 'code_generation', 'general', 'greeting']);
+    expect(premium.byIntent).toEqual({
+      general: { primary: 'opus', fallback: 'sonnet' },
+      code_generation: { primary: 'opus', fallback: 'haiku' },
+      strategic_analysis: { primary: 'opus', fallback: 'sonnet' },
+      greeting: { primary: 'haiku', fallback: 'sonnet' },
+      acknowledgment: { primary: 'haiku', fallback: 'sonnet' },
+    });
+    // On a basic base (haiku) nothing is cheaper than the base, so nothing changes.
+    expect(routesAsServedByTheFloor(routes, 'haiku', catalog)).toEqual({ byIntent: routes, raised: [] });
+    // Every raised route resolves to exactly what the floor served, for every intent that maps to it.
+    // Every intent resolves to exactly what the old floor served it on a premium base (opus): a non-trivial
+    // turn on the raised route, a standalone greeting or acknowledgment on the general route as written.
+    const asServed: Record<string, string> = { general: 'opus', code_generation: 'opus', platform_question: 'opus', greeting: 'haiku', acknowledgment: 'haiku' };
+    const toStrategy = (b: Record<string, { primary: string; fallback?: string }>) => Object.entries(b)
+      .map(([k, r]) => ({ ...strategy[0], intent: k, primaryModel: r.primary, fallbackModel: r.fallback ?? r.primary }) as IntentRouteDefinition);
+    for (const [intent, expected] of Object.entries(asServed)) {
+      const served = resolveModelForIntent(intent, 'premium', catalog, toStrategy(premium.byIntent!), sel('premium')).primaryModelKey;
+      expect({ intent, served }).toEqual({ intent, served: expected });
+    }
+  });
+
+  it('leaves basic at Haiku', () => {
+    const result = resolveModelForIntent('general', 'basic', catalog, strategy, sel('basic'));
+    expect(result.primaryModelKey).toBe('haiku');
+  });
+
+  it('a greeting with no route of its own is answered on the route its intent maps to', () => {
+    const result = resolveModelForIntent('greeting', 'premium', catalog, strategy, sel('premium'));
+    expect(result.primaryModelKey).toBe('haiku');
+    expect(result.primaryModelId).toBe('anthropic.claude-3-haiku');
   });
 
   it('a STANDALONE acknowledgment still stays on the cheap model (the cost lever is intact)', () => {
     // The bypass exists so "thanks" does not buy a premium invoke. Continuation is the only thing
     // that suspends it; an acknowledgment with no work behind it is unchanged.
     const result = resolveModelForIntent(
-      'acknowledgment', 'premium', catalog, strategy, profileDefaults,
+      'acknowledgment', 'premium', catalog, strategy, sel('premium'),
       { continuesActiveWork: false },
     );
     expect(result.primaryModelKey).toBe('haiku');
-    expect(resolveModelForIntent('acknowledgment', 'premium', catalog, strategy, profileDefaults).primaryModelKey)
+    expect(resolveModelForIntent('acknowledgment', 'premium', catalog, strategy, sel('premium')).primaryModelKey)
       .toBe('haiku');
   });
 
   it('the turn context does not disturb a non-trivial intent', () => {
     // `general` was never subject to the bypass, so the floor applies either way. Guards against the
     // flag becoming a second, differently-shaped routing knob.
-    const withWork = resolveModelForIntent('general', 'premium', catalog, strategy, profileDefaults, { continuesActiveWork: true });
-    const without = resolveModelForIntent('general', 'premium', catalog, strategy, profileDefaults);
+    const withWork = resolveModelForIntent('general', 'premium', catalog, strategy, sel('premium'), { continuesActiveWork: true });
+    const without = resolveModelForIntent('general', 'premium', catalog, strategy, sel('premium'));
     expect(withWork).toEqual(without);
   });
 
   it('downgrades primary model when classification does not allow it', () => {
     // strategic_analysis → opus, but basic classification can't use opus
-    const result = resolveModelForIntent('general', 'basic', catalog, strategy, profileDefaults);
+    const result = resolveModelForIntent('general', 'basic', catalog, strategy, sel('basic'));
     expect(result.primaryModelId).toBe('anthropic.claude-3-haiku');
     expect(result.primaryModelKey).toBe('haiku');
   });
 
   it('sets fallback to null when fallback equals primary', () => {
-    // general_qa → primary: haiku, fallback: titan (both allowed for basic)
-    const result = resolveModelForIntent('general', 'basic', catalog, strategy, profileDefaults);
+    // general → primary: haiku, fallback: titan (both allowed for basic)
+    const result = resolveModelForIntent('general', 'basic', catalog, strategy, sel('basic'));
     // haiku primary, titan fallback — both allowed
     expect(result.fallbackModelId).toBe('amazon.titan');
     expect(result.fallbackModelKey).toBe('titan');
@@ -266,16 +320,15 @@ describe('resolveModelForIntent', () => {
     // So primary falls to classification default (haiku), fallback (sonnet) not allowed for basic
     const customStrategy: IntentRouteDefinition[] = [
       {
-        intent: 'general_qa',
+        intent: 'general',
         label: 'General',
         primaryModel: 'opus',
         fallbackModel: 'sonnet',
-        preferredClearance: 'premium',
         rationale: 'test',
       },
     ];
 
-    const result = resolveModelForIntent('general', 'basic', catalog, customStrategy, profileDefaults);
+    const result = resolveModelForIntent('general', 'basic', catalog, customStrategy, sel('basic'));
     expect(result.primaryModelKey).toBe('haiku'); // downgraded
     expect(result.fallbackModelId).toBeNull(); // sonnet not allowed for basic
   });
@@ -283,16 +336,15 @@ describe('resolveModelForIntent', () => {
   it('premium classification gets full strategy resolution', () => {
     const customStrategy: IntentRouteDefinition[] = [
       {
-        intent: 'general_qa',
+        intent: 'general',
         label: 'General',
         primaryModel: 'opus',
         fallbackModel: 'sonnet',
-        preferredClearance: 'premium',
         rationale: 'test',
       },
     ];
 
-    const result = resolveModelForIntent('general', 'premium', catalog, customStrategy, profileDefaults);
+    const result = resolveModelForIntent('general', 'premium', catalog, customStrategy, sel('premium'));
     // Invoke id prefers the inference-profile ARN when the catalog entry
     // has one (Sonnet/Opus 4.6 can't be invoked on-demand by bare id).
     // opus mock has no profile → bare id; sonnet mock has one → ARN.
@@ -330,83 +382,46 @@ describe('the async processor passes the turn context (wiring ratchet)', () => {
     );
   });
 
-  it('hands it to BOTH resolution paths (the baseline and context routing)', () => {
-    // resolveModelForIntent takes it as the turn context; resolveModelPlan takes it on the
-    // RoutingContext, so the context-routing path cannot resolve cheaper than the path it is meant
-    // to stay backward-compatible with.
-    expect(processorSrc).toMatch(/\{ continuesActiveWork \}/);
-    expect((processorSrc.match(/continuesActiveWork/g) || []).length).toBeGreaterThanOrEqual(3);
-  });
-});
-
-describe('collectArnsForClassification', () => {
-  it('returns only ARNs for models the classification can access', () => {
-    const basicArns = collectArnsForClassification('basic', catalog);
-    expect(basicArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/haiku');
-    expect(basicArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/titan');
-    expect(basicArns).not.toContain('arn:aws:bedrock:us-east-1::foundation-model/opus');
-    expect(basicArns).not.toContain('arn:aws:bedrock:us-east-1::foundation-model/sonnet');
-  });
-
-  it('includes inference profile ARNs', () => {
-    const standardArns = collectArnsForClassification('standard', catalog);
-    expect(standardArns).toContain('arn:aws:bedrock:us-east-1:123:inference-profile/sonnet');
-  });
-
-  it('premium classification gets all models', () => {
-    const premiumArns = collectArnsForClassification('premium', catalog);
-    expect(premiumArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/haiku');
-    expect(premiumArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/sonnet');
-    expect(premiumArns).toContain('arn:aws:bedrock:us-east-1::foundation-model/opus');
+  it('hands it to the one resolution every turn takes (resolveModelPlan, ADR-064)', () => {
+    // On the RoutingContext, so the route's choice and the context rules read the same turn fact.
+    expect(processorSrc).toMatch(/resolveModelPlan\([\s\S]{0,400}continuesActiveWork,/);
+    expect(processorSrc).not.toMatch(/resolveModelForIntent\(/);
   });
 });
 
 /**
- * Every RouteKey the platform offers must be REACHABLE from some classified intent.
- *
- * `code_generation`, `code_review` and `strategic_analysis` were not. No entry in the legacy
- * rename table produced them, and the resolver consulted only that table, so any turn carrying
- * those intents fell through to `general_qa`. The config was operator-facing - the admin
- * Experiments tab lists Code Generation, Code Review and Strategic Analysis as selectable intents -
- * so an operator could pin a model or run an A/B on code generation and it could never fire.
- *
- * `IntentDef.key` is documented as "the classified intent value + INTENT_ROUTE_STRATEGY key", i.e.
- * one namespace. This asserts that contract holds for every route, which is also what lets a
- * per-deployment intent pack (SPEC-CONFIGURABLE-INTENT-PACK) add `code_generation` and have model
- * routing follow without editing platform code.
+ * A ROUTE IS KEYED BY THE INTENT IT SERVES (ADR-064 decision 1): every shipped route is reached by the intent of
+ * the same name, an intent with no route of its own answers through `general` only when it is one of the platform
+ * intents that do (decision A), and every other unrouted intent answers on the base model.
  */
-describe('every RouteKey is reachable from a classified intent', () => {
-  const ALL_ROUTE_KEYS = [
-    'general_qa',
-    'code_generation',
-    'code_review',
-    'document_extraction',
-    'report_generation',
-    'strategic_analysis',
-    'workflow_actions',
-  ] as const;
-
-  it('maps an intent named for a RouteKey to that route, not to general_qa', () => {
-    const unreachable = ALL_ROUTE_KEYS.filter((rk) => intentTypeToRouteKey(rk) !== rk);
-    if (unreachable.length) {
-      throw new Error(
-        `These RouteKeys cannot be selected by any classified intent: ${unreachable.join(', ')}.\n`
-        + 'A model pinned to them is dead config, and the admin Experiments tab offers them as '
-        + 'selectable intents, so an operator can configure an A/B that never fires.',
-      );
+describe('a route is keyed by the intent it serves', () => {
+  it('every shipped route is reached by the intent of its own name', () => {
+    for (const r of strategy) {
+      const resolved = resolveModelForIntent(r.intent, 'premium', catalog, strategy, sel('premium'));
+      expect(resolved.routeKey).toBe(r.intent);
+      expect(resolved.resolvedFromStrategy).toBe(true);
     }
-    expect(unreachable).toEqual([]);
   });
 
-  it('still honours the legacy renames', () => {
-    expect(intentTypeToRouteKey('data_extraction')).toBe('document_extraction');
-    expect(intentTypeToRouteKey('guided_troubleshooting')).toBe('workflow_actions');
-    expect(intentTypeToRouteKey('greeting')).toBe('general_qa');
-    expect(intentTypeToRouteKey('acknowledgment')).toBe('general_qa');
+  it('the intents that answer through general take the general route when they have none of their own', () => {
+    for (const intent of ANSWERS_THROUGH_GENERAL) {
+      const resolved = resolveModelForIntent(intent, 'basic', catalog, strategy, sel('basic'));
+      expect(resolved.routeKey).toBe('general');
+    }
   });
 
-  it('falls through to general_qa for an intent that is neither', () => {
-    expect(intentTypeToRouteKey('recipe_lookup')).toBe('general_qa');
-    expect(intentTypeToRouteKey(undefined)).toBe('general_qa');
+  it('a pack-declared intent with no route answers on the base model, so the open key space grants nothing', () => {
+    const resolved = resolveModelForIntent('recipe_lookup', 'basic', catalog, strategy, sel('basic'));
+    expect(resolved.resolvedFromStrategy).toBe(false);
+    expect(resolved.routeKey).toBe('recipe_lookup');
+  });
+
+  it('a retired route key is refused naming the intent that keys the route now', () => {
+    expect(retiredRouteKeyError('general_qa', "models.byIntent['general_qa']")).toBe(
+      "`models.byIntent['general_qa']` is a retired route key; the route is keyed by the intent, `general`.",
+    );
+    expect(retiredRouteKeyError('workflow_actions', 'intent')).toContain('`guided_troubleshooting`');
+    expect(retiredRouteKeyError('document_extraction', 'intent')).toContain('`data_extraction`');
+    expect(retiredRouteKeyError('general', 'intent')).toBeNull();
   });
 });

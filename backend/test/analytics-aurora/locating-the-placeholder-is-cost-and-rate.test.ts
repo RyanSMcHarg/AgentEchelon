@@ -9,7 +9,7 @@
  *      owner expected ~0 once the id was handed over; the metric was structurally incapable of it.
  *   2. Task turns exceeded every other delivery option by ~100 ms on every day measured (2026-08-21:
  *      222/288/313 against 178). That delta was `updateTaskStatus` - which runs only when the event
- *      carries a task id - showing through a column labelled as a scan.
+ *      carries a task id - showing through a column labeled as a scan.
  *
  * The owner's requirement is the shape of the fix: see what LOCATING cost, and separately how often
  * a scan was needed, since a scan is what moves that cost. So:
@@ -38,6 +38,7 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
 }));
 
 import { handler } from '../../lambda/src/analytics-aurora/analytics-query';
+import { edgeContext } from '../helpers/edge-context';
 
 function postEvent(body: unknown): APIGatewayProxyEvent {
   return {
@@ -45,7 +46,7 @@ function postEvent(body: unknown): APIGatewayProxyEvent {
     path: '/query',
     body: JSON.stringify(body),
     requestContext: {
-      authorizer: { claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' } },
+      authorizer: edgeContext({ claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' } }),
     },
   } as unknown as APIGatewayProxyEvent;
 }

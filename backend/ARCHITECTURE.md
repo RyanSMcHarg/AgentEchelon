@@ -7,17 +7,13 @@ User sends message
   ↓
 Chime SDK Channel
   ↓
-Lex Bot (configured with InvokedBy: StandardMessages = AUTO)
+The assistant's Lex Bot (AppInstanceBot InvokedBy: StandardMessages = NONE, TargetedMessages = ALL; the channel flow takes untargeted turns)
   ↓
-Lambda (Lex fulfillment)
+Lambda (Lex fulfillment: the classification's router)
   ↓
-Bedrock (generate response)
+Router dispatches to the async processor and returns an empty Lex response
   ↓
-Lambda returns Lex response format
-  ↓
-Lex receives response
-  ↓
-Lex sends message back to Chime Channel
+Async processor calls Bedrock and posts / updates the reply in the channel as the assistant
   ↓
 User receives response
 ```
@@ -124,23 +120,17 @@ This combination tells Lex:
 
 ## Implementation Steps
 
-1. **Bot Configuration (create-bot.ts)**
-   - Create AppInstanceBot with Lex configuration
-   - Set `InvokedBy.StandardMessages = 'AUTO'` so bot responds to all messages
+1. **The assistant's identity and Lex bot (`lambda/src/lib/assistant-provisioner.ts`)**, built by the provisioner for every assistant, declared or created in the console (ADR-048, amended 2026-10-23)
+   - Create the Lex bot with `WelcomeIntent` and `FallbackIntent`, both fulfilled by the classification's router
+   - Create the AppInstanceBot with that Lex configuration, `InvokedBy.StandardMessages = 'NONE'`, tagged `provisioner = runtime`
 
-2. **Lex Bot Setup (create-lex-bot.ts)**
-   - Create Lex bot with intents
-   - Configure Lambda fulfillment
-   - Build and deploy bot
-
-3. **Lambda Handler**
-   - Receive Lex event
+2. **Lambda Handler (`lambda/src/router-agent-handler.ts`, the classification's router)**
+   - Receive the Lex event
    - Decode `inputTranscript` (URL-encoded)
-   - Call Bedrock for AI response
-   - Return Lex response format with messages
-   - Let Lex handle sending to Chime
+   - Classify the request and dispatch it to the classification's async processor, which posts and updates the reply in the channel as the assistant
+   - Return a silent Lex response (`formatLexSilentResponse`: `Close`, `Fulfilled`, `messages: []`)
 
-> **Note:** the simplified handler below shows the Lex → Lambda → Chime transport only. In practice the tier handler runs a **self-hosted Converse tool loop** (`lambda/src/lib/async-processor-core.ts`) — it calls Bedrock's Converse API and optionally invokes tools across multiple turns. There is no Bedrock Agent.
+> **Note:** the example handler below shows the bare Lex → Lambda → Chime transport only, the pattern this design grew from. The shipped router does not return its reply through Lex: the async processor runs a **self-hosted Converse tool loop** (`lambda/src/lib/async-processor-core.ts`), calling Bedrock's Converse API and optionally invoking tools across multiple turns, and delivers the reply itself. There is no Bedrock Agent.
 
 ## Common Issues
 
@@ -167,9 +157,10 @@ exports.handler = async (event) => {
   const intentName = event.sessionState.intent.name;
   const channelArn = event.requestAttributes?.['CHIME.channel.arn'];
 
-  // Get model ID from channel metadata (passed via Lex session)
+  // Get model ID from the Lex session (illustrative; the shipped router resolves the model from
+  // the classification's strategy, and its utility model is UTILITY_MODEL_ID in lib/config/model-strategy.ts)
   const modelId = event.sessionState.sessionAttributes?.modelId
-    || 'anthropic.claude-3-haiku-20240307-v1:0';
+    || 'us.anthropic.claude-haiku-4-5-20251001-v1:0';
 
   // Call Bedrock
   const response = await invokeBedrock(modelId, userMessage);

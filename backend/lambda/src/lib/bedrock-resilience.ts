@@ -16,8 +16,9 @@ import {
   invokeBedrock,
   type BedrockImageInput,
   type BedrockDocumentInput,
+  type StepModelChoice,
 } from './async-processor-core.js';
-import type { ConverseStep } from './analytics-metadata.js';
+import type { ConverseStep, ToolCallRecord } from './analytics-metadata.js';
 import type { TaskLoopContext } from './task-tools.js';
 
 // ============================================================
@@ -114,10 +115,18 @@ export interface ResilientInvokeResult {
    *  answer. Structural, flowing through from invokeBedrock via `...result` - consumers must never
    *  re-derive this from the reply's text shape (custom blockedInputMessaging defeats that). */
   inputGuardBlocked?: boolean;
+  /** Which guardrail policies intervened on the INPUT side. See AnalyticsMetadata.guardrailFindings. */
+  guardrailFindings?: string[];
   inputTokens: number;
   outputTokens: number;
   bedrockTime: number;
+  /**
+   * THE MODEL THAT WROTE THE REPLY: the one the loop ended on, which is the primary or the fallback it started on unless
+   * the task entered a step with a model of its own mid-turn (ADR-064 decision B), and then that step's model.
+   */
   modelUsed: string;
+  /** The step's model the loop moved onto mid-turn, with its fallback and the rule that chose it. Flows via `...result`. */
+  enteredStep?: StepModelChoice;
   wasFallback: boolean;
   fallbackReason?: string;
   retryCount: number;
@@ -131,6 +140,10 @@ export interface ResilientInvokeResult {
    *  `...result`; persisted out-of-band by finalizePlaceholderResponse. */
   modelMs?: number;
   toolMs?: number;
+  /** Each tool call with its arguments and a result excerpt, and the tools the turn was offered
+   *  (SPEC-EVALUATION Appendix C3). Flows through via `...result`; persisted out-of-band. */
+  toolCalls?: ToolCallRecord[];
+  toolsOffered?: string[];
 }
 
 interface ResilientInvokeOptions {
@@ -205,7 +218,7 @@ export async function invokeBedrockWithFallback(
       circuitBreaker.recordSuccess(primaryConfig.model);
       return {
         ...result,
-        modelUsed: primaryConfig.model,
+        modelUsed: result.model ?? primaryConfig.model,
         wasFallback: false,
         retryCount: attempt,
       };
@@ -275,7 +288,7 @@ async function tryFallback(
 
   return {
     ...result,
-    modelUsed: fallbackModelId,
+    modelUsed: result.model ?? fallbackModelId,
     wasFallback: true,
     fallbackReason: reason,
     retryCount,

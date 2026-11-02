@@ -53,8 +53,8 @@ function updateRecord(overrides: Record<string, any> = {}): any {
     sender_name: 'Assistant',
     target_arn: null,
     is_bot: true,
-    user_type: 'premium',
-    agent_type: 'premium',
+    conversation_classification: 'premium',
+    assistant: 'premium',
     bedrock_model: 'anthropic.claude-opus',
     input_tokens: 120,
     output_tokens: 340,
@@ -71,7 +71,6 @@ function updateRecord(overrides: Record<string, any> = {}): any {
     last_updated_at: '2026-07-15T00:00:02.000Z',
     intent: 'BUSINESS_QUERY',
     intent_confidence: 'high',
-    original_intent: null,
     was_rerouted: false,
     delivery_option: 'inline',
     task_id: null,
@@ -99,13 +98,17 @@ describe('kinesis-archival backfillFromUpdateEvents', () => {
     );
     expect(messageCall).toBeDefined();
     const [sql, params] = messageCall as [string, any[]];
-    expect(sql).toMatch(/updated_content\s*=\s*COALESCE\(\$1, updated_content\)/);
+    // The update's text, unless a later update of the same message is already stored (migration 084).
+    expect(sql).toMatch(/THEN updated_content\s+ELSE COALESCE\(\$1, updated_content\) END/);
     expect(sql).toMatch(/bedrock_model\s*=\s*COALESCE\(\$2, bedrock_model\)/);
     expect(sql).toContain("event_type = 'CREATE_CHANNEL_MESSAGE'");
     // $1 final content, $2 model, $12 de-suffixed CREATE id, $13 channel.
     expect(params[0]).toBe('The Q2 ARR is $4.2M.');
     expect(params[1]).toBe('anthropic.claude-opus');
     expect(params[11]).toBe('msg-123'); // '-UPD' stripped
+    // $25: the conversation's classification folds onto the canonical row like the rest.
+    expect(sql).toMatch(/conversation_classification\s*=\s*COALESCE\(\$25, conversation_classification\)/);
+    expect(params[24]).toBe('premium');
     expect(params[12]).toBe('arn:aws:chime:...:channel/abc');
   });
 
@@ -121,6 +124,8 @@ describe('kinesis-archival backfillFromUpdateEvents', () => {
     expect(sql).toContain('ex.agent_message_id = am.id');
     expect(sql).toContain('am.message_id = $12');
     expect(params[0]).toBe('BUSINESS_QUERY');
+    expect(sql).toMatch(/conversation_classification\s*=\s*COALESCE\(\$17, ex\.conversation_classification\)/);
+    expect(params[16]).toBe('premium');
     expect(params[11]).toBe('msg-123');
     expect(params[12]).toBe('arn:aws:chime:...:channel/abc');
   });
@@ -142,12 +147,13 @@ describe('kinesis-archival backfillFromUpdateEvents', () => {
     expect(msgParams[15]).toBe(200);
 
     // e2e_ms = agent_final_at - user_message_at (both Chime, skew-free); inbound_ms = processor entry
-    // ($16) - user_message_at (cross-clock), clamped >= 0. Both guarded and idempotent.
+    // ($16) - user_message_at (cross-clock), clamped >= 0. Both guarded and idempotent: a first round
+    // keeps its first stored value, and only a later duel round is recomputed (migration 071).
     const exchangeCall = mockedQuery.mock.calls.find(([sql]) => /UPDATE exchanges/.test(sql as string));
     const [exSql, exParams] = exchangeCall as [string, any[]];
-    expect(exSql).toMatch(/e2e_ms\s*=\s*COALESCE\(ex\.e2e_ms,/);
+    expect(exSql).toMatch(/e2e_ms\s*=\s*COALESCE\(CASE WHEN COALESCE\(ex\.battle_round, am\.battle_round, 1\) > 1 THEN NULL\s+ELSE ex\.e2e_ms END,/);
     expect(exSql).toContain('am.agent_final_at - ex.user_message_at');
-    expect(exSql).toMatch(/inbound_ms\s*=\s*COALESCE\(ex\.inbound_ms,/);
+    expect(exSql).toMatch(/inbound_ms\s*=\s*CASE WHEN COALESCE\(ex\.battle_round, am\.battle_round, 1\) > 1 THEN NULL\s+ELSE COALESCE\(ex\.inbound_ms,/);
     expect(exSql).toContain('GREATEST(0,');
     // $16 is explicitly cast: used only in `IS NOT NULL` + arithmetic, an uncast param makes Postgres
     // fail at execution with "could not determine data type of parameter $16" (caught in live validation,
@@ -224,6 +230,97 @@ describe('kinesis-archival backfillFromUpdateEvents', () => {
     expect(params[14]).toBeNull();
   });
 
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+  // A LATE DECLARATION IS RECORDED, NOT RE-DERIVED.
+  //
+  // Kinesis archival batches on a five second window, so a turn whose time to first feedback exceeds
+  // five seconds cannot have its user message and its placeholder in one batch. The cross-batch sweep
+  // mints the exchange from the placeholder alone, every carrier of the declaration is still NULL at
+  // that moment, and its CASE writes `swept`. The Latency tab excludes a swept pairing from TTFF by
+  // name - correctly, because a genuine sweep searched up to the reply bound for a plausible answer -
+  // so the rows wrongly carrying that label were exactly the slow ones the SLO exists to catch.
+  //
+  // This fold is where the turn's own statement finally arrives. The promotion is a correction to a
+  // provenance claim the sweep made before the evidence existed; it is not a second pairing rule.
+  //
+  // WHAT IS PROVABLE HERE. The unit suite has no Postgres, so what these pin is the statement: which
+  // value each parameter carries, and that the SET clause contains no path that writes `paired_by`
+  // any value other than 'declared'-from-'swept' or the row's own current one. The conditions
+  // themselves are single SQL predicates over one indexed row, asserted character for character.
+  // ────────────────────────────────────────────────────────────────────────────────────────────
+
+  /** The one SET clause under test, isolated so a match cannot be satisfied by prose elsewhere. */
+  const pairedByClause = (sql: string) =>
+    sql.slice(sql.indexOf('paired_by = CASE'), sql.indexOf('END,', sql.indexOf('paired_by = CASE')) + 4)
+      .replace(/--[^\n]*/g, '')
+      .replace(/\s+/g, ' ')
+      .trim();
+
+  const exchangeUpdate = () =>
+    mockedQuery.mock.calls.find(([sql]) => /UPDATE exchanges/.test(sql as string)) as [string, any[]];
+
+  it('promotes a swept pairing to declared when the update names that exchange own user message', async () => {
+    await backfillFromUpdateEvents([updateRecord({ answers_message_id: 'm-the-question' })]);
+
+    const [sql, params] = exchangeUpdate();
+    // $18 is the declaration, folded onto the record by transformToMessageRecord from whichever
+    // carrier the turn had.
+    expect(params[17]).toBe('m-the-question');
+    expect(pairedByClause(sql)).toBe(
+      "paired_by = CASE WHEN ex.paired_by = 'swept' AND $18::text IS NOT NULL AND $18::text = ( "
+      + 'SELECT um.message_id FROM messages um WHERE um.id = ex.user_message_id ) '
+      + "THEN 'declared' ELSE ex.paired_by END,",
+    );
+  });
+
+  it('promotes ONLY on the exact id, so a mismatch is not a pairing', async () => {
+    // A declaration naming a DIFFERENT message is not this pairing being confirmed - it is evidence
+    // the pairing is wrong. The comparison is an equality against the exchange own user message read
+    // through the primary key, so there is no bound, no window and nothing to widen.
+    const [sql] = (await backfillFromUpdateEvents([updateRecord({ answers_message_id: 'm-somebody-else' })]),
+      exchangeUpdate());
+    expect(pairedByClause(sql)).toContain('$18::text = ( SELECT um.message_id FROM messages um');
+    expect(pairedByClause(sql)).not.toMatch(/LIKE|INTERVAL|created_at/);
+  });
+
+  it('never downgrades, and never touches a declared or in_batch row', async () => {
+    // ELSE keeps the row own value, and it is the ONLY other branch. A row already `declared` or
+    // `in_batch` reaches the ELSE and is rewritten to what it already held.
+    const [sql] = (await backfillFromUpdateEvents([updateRecord({ answers_message_id: 'm-the-question' })]),
+      exchangeUpdate());
+    const clause = pairedByClause(sql);
+    expect(clause).toContain("WHEN ex.paired_by = 'swept'");
+    expect(clause).toContain('ELSE ex.paired_by');
+    // Proving it can fail: the unguarded form this would have been.
+    expect(clause).not.toContain("paired_by = 'declared',");
+    // 'declared' is written from exactly one place in the clause, behind the swept guard.
+    expect(clause.match(/'declared'/g)).toHaveLength(1);
+    expect(clause).not.toContain("'swept' END");
+    expect(clause).not.toContain("'in_batch'");
+  });
+
+  it('leaves a genuine sweep alone: no declaration means the promotion cannot fire', async () => {
+    // THE ONE THAT MATTERS MOST. A reconstructed pairing must stay out of a measured population, and
+    // this must not become the door it walks back in through. With no declaration $18 is NULL, the
+    // guard is not TRUE, the ELSE holds, and the row keeps the label the Latency tab excludes.
+    await backfillFromUpdateEvents([updateRecord({ answers_message_id: null })]);
+
+    const [sql, params] = exchangeUpdate();
+    expect(params[17]).toBeNull();
+    expect(pairedByClause(sql)).toContain('$18::text IS NOT NULL');
+  });
+
+  it('adds no parameter ahead of the ones already numbered in the statement comments', async () => {
+    // The position in the params array IS the parameter number, and this statement refers to its
+    // params by number in its own comments. Appending is what keeps a fold from quietly starting to
+    // write the column after the one it means.
+    await backfillFromUpdateEvents([updateRecord({ answers_message_id: 'm-the-question' })]);
+    const [, params] = exchangeUpdate();
+    // 18 numbered before migration 092, then $19-$21 appended (ADR-064); $3 now carries the task type.
+    expect(params).toHaveLength(21);
+    expect(params[16]).toBe('premium'); // $17 conversation_classification, unmoved
+  });
+
   it('skips a record whose id does not carry the -UPD suffix', async () => {
     await backfillFromUpdateEvents([
       updateRecord({ message_id: 'msg-999' }),
@@ -248,9 +345,20 @@ describe('the cross-batch exchange sweep mints one row per (turn, responding bot
   const src = require('fs').readFileSync(
     require('path').join(__dirname, '..', '..', 'lambda', 'src', 'analytics-aurora', 'kinesis-archival.ts'), 'utf8');
 
-  it('takes the EARLIEST bot CREATE per sender, so a duel still pairs both sides', () => {
-    expect(src).toContain('SELECT DISTINCT ON (um.id, am.sender_arn)');
-    expect(src).toContain('ORDER BY um.id, am.sender_arn, am.created_at');
+  it('takes the EARLIEST bot CREATE per sender and round, so a duel pairs both sides every round', () => {
+    // THE ROUND JOINED THE KEY 2026-09-23. It was (turn, sender), which pairs both sides of a normal
+    // duel and caps a multi-round one at two: a side's rebuttal answers the same user message as its
+    // round-1 reply and comes from the same bot, so it collided and was dropped. Of 14 two-round
+    // duels measured, only 3 recorded all four turns.
+    //
+    // The property this case was written for is UNCHANGED and still asserted below: earliest per
+    // group, so a welcome or a continuation chunk cannot claim a turn. The group simply got a third
+    // term. COALESCE to 0 keeps every non-battle turn in one group, because NULLs are distinct from
+    // each other in a DISTINCT ON and a null round would make each ordinary turn its own group.
+    expect(src).toContain('SELECT DISTINCT ON (um.id, am.sender_arn, COALESCE(am_upd.battle_round, am.battle_round, 0))');
+    expect(src).toContain('ORDER BY um.id, am.sender_arn, COALESCE(am_upd.battle_round, am.battle_round, 0), am.created_at');
+    // Still EARLIEST within the group - the half that stops a later message claiming the turn.
+    expect(src).toMatch(/ORDER BY um\.id, am\.sender_arn, COALESCE\([^)]*\), am\.created_at/);
   });
 
   it('keeps the next-user bound that attaches a reply to the prompt that caused it', () => {
@@ -261,7 +369,7 @@ describe('the cross-batch exchange sweep mints one row per (turn, responding bot
 describe('the sweep pairs only real replies, once per (turn, sender), within a bounded window', () => {
   // The pair-level anti-join ran before DISTINCT ON, so a sender's LATER unprompted message became
   // the "earliest surviving" candidate for an already-answered turn and minted a second exchange -
-  // and with no delay ceiling, a briefing hours later paired at ~8-hour "latency". Three bounds,
+  // and with no delay limit, a briefing hours later paired at ~8-hour "latency". Three bounds,
   // pinned together because each alone leaves a mint path open.
   const sweepSrc = require('fs').readFileSync(
     require('path').join(__dirname, '..', '..', 'lambda', 'src', 'analytics-aurora', 'kinesis-archival.ts'), 'utf8');
@@ -275,7 +383,12 @@ describe('the sweep pairs only real replies, once per (turn, sender), within a b
     expect(sweepSrc).toContain("AND am.content LIKE '%<!--corr:%'");
   });
 
-  it('a reply pairs only within an hour of its prompt', () => {
-    expect(sweepSrc).toContain("AND am.created_at <= um.created_at + INTERVAL '1 hour'");
+  it('a reply pairs only within the bound, and both pairers read the same bound', () => {
+    // One definition, interpolated into the query. It was a literal here and absent from the
+    // TypeScript, so the in-batch pairer could not have applied it even once it started trying -
+    // and a later edit would have changed the rule for half the rows with nothing failing.
+    expect(sweepSrc).toContain('const REPLY_BOUND_MINUTES = 60;');
+    expect(sweepSrc).toContain("AND am.created_at <= um.created_at + INTERVAL '${REPLY_BOUND_MINUTES} minutes'");
+    expect(sweepSrc).toContain('if (gapMs > REPLY_BOUND_MS) continue;');
   });
 });

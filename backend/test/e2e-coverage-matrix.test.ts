@@ -2,7 +2,7 @@
  * Every spec document must say which end-to-end test proves it - and the matrix must match.
  *
  * THE FAILURE THIS EXISTS FOR. A `**Status:** Implemented` line is read as a promise that the
- * behaviour works, and nothing connected that promise to a test. That is not a theoretical risk in
+ * behavior works, and nothing connected that promise to a test. That is not a theoretical risk in
  * this repo: `emitEmfMetric` wrote `{name, unit}` where the EMF schema requires `{Name, Unit}`, so
  * CloudWatch discarded every document silently and NO metric in any AgentEchelon namespace had ever
  * existed - after months of drift detection emitting on every turn. All ~1900 unit tests passed
@@ -30,12 +30,18 @@ import {
   parseSpecDoc,
   MATRIX_PATH,
 } from '../lib/docs/spec-coverage';
+import { DENY_TEST_INVENTORY, fileExists, isPresent, type DenyTestRow } from '../lib/docs/deny-test-inventory';
 
 const REPO_ROOT = path.resolve(__dirname, '..', '..');
 
 const specs = readSpecCoverage(REPO_ROOT);
 const e2eSpecs = listE2eSpecs(REPO_ROOT);
-const render = (): string => renderCoverageMatrix(specs, e2eSpecs, (f) => countTests(REPO_ROOT, f));
+const denyTests = {
+  rows: DENY_TEST_INVENTORY,
+  present: (row: DenyTestRow) => isPresent(REPO_ROOT, row),
+  fileExists: (file: string) => fileExists(REPO_ROOT, file),
+};
+const render = (): string => renderCoverageMatrix(specs, e2eSpecs, (f) => countTests(REPO_ROOT, f), denyTests);
 
 describe('spec -> e2e coverage declarations', () => {
   it('finds the corpus at all (guards against a silently empty scan)', () => {
@@ -174,7 +180,7 @@ describe('the generated coverage matrix', () => {
 });
 
 /**
- * A LIVE-BEHAVIOUR CLAIM MUST BE TIED TO AN END-TO-END TEST.
+ * A LIVE-BEHAVIOR CLAIM MUST BE TIED TO AN END-TO-END TEST.
  *
  * The sibling gates ask weaker questions. PA-3 (`docs-drift-guard.test.ts`) asks whether an
  * `Implemented` claim names ANY verifying test - a unit test satisfies it. The `**Coverage:**`
@@ -188,11 +194,11 @@ describe('the generated coverage matrix', () => {
  * driven a request past a threshold. The unit tests could not see it; only reading the deployed
  * handler's env and driving a real turn could.
  *
- * So: a document claiming live behaviour (`Implemented` or `Partial`) must name at least one e2e
+ * So: a document claiming live behavior (`Implemented` or `Partial`) must name at least one e2e
  * spec. The named spec is then also the regression gate - the same test that licensed the claim is
  * what re-proves it on every later change.
  *
- * RATCHET: `GRANDFATHERED_NO_E2E` lists the documents that already claimed live behaviour when this
+ * RATCHET: `GRANDFATHERED_NO_E2E` lists the documents that already claimed live behavior when this
  * gate landed and have no e2e spec yet. It may ONLY SHRINK. Writing the spec and naming it in the
  * document's `**Coverage:**` line means deleting the entry here (the test fails until you do both).
  * Do NOT add entries - that re-opens the hole. Each removal should be backed by a run of that spec
@@ -307,5 +313,82 @@ describe("the README's e2e headline cannot drift from the generated matrix", () 
     const expectedTests = e2eSpecs.reduce((n, f) => n + countTests(REPO_ROOT, f), 0);
     expect({ tests: Number(tests), files: Number(files) })
       .toEqual({ tests: expectedTests, files: expectedFiles });
+  });
+});
+
+/**
+ * THE DENY-TEST INVENTORY, AND A RATCHET ON WHAT IS NOT BUILT.
+ *
+ * Every live refusal the platform claims is a row in `lib/docs/deny-test-inventory.ts`, rendered as the
+ * matrix's last section. `NOT_BUILT_YET` lists the rows whose files do not exist yet, each with the work
+ * that writes them. It may ONLY SHRINK:
+ *  - a row whose files land fails here until its entry is deleted;
+ *  - a row whose files are missing fails here unless it is listed;
+ *  - the list may never grow past `NOT_BUILT_LIMIT`, so a new row cannot be added as missing. Lower
+ *    the limit with each deletion; never raise it.
+ */
+const NOT_BUILT_YET: Record<string, string> = {};
+const NOT_BUILT_LIMIT = 0;
+
+describe('the deny-test inventory', () => {
+  it('names each deny-test once, with files under the scripts or the e2e suite', () => {
+    const ids = DENY_TEST_INVENTORY.map((r) => r.id);
+    expect(new Set(ids).size).toBe(ids.length);
+    for (const row of DENY_TEST_INVENTORY) {
+      expect(row.files.length).toBeGreaterThan(0);
+      for (const f of row.files) expect(f).toMatch(/^(backend\/scripts\/deny-test-[a-z0-9-]+\.mjs|tests\/e2e\/[a-z0-9-]+\.spec\.ts)$/);
+      expect(row.claim.length).toBeGreaterThan(30);
+    }
+  });
+
+  it('names unit evidence only as suites that exist, and never lets it make a row present', () => {
+    for (const row of DENY_TEST_INVENTORY) {
+      for (const f of row.unit ?? []) {
+        expect(f).toMatch(/^backend\/test\/[a-z0-9/-]+\.test\.ts$/);
+        expect({ row: row.id, file: f, exists: fileExists(REPO_ROOT, f) }).toEqual({ row: row.id, file: f, exists: true });
+      }
+      if (row.unit?.length) expect(isPresent(REPO_ROOT, { ...row, unit: undefined })).toBe(isPresent(REPO_ROOT, row));
+    }
+    expect(DENY_TEST_INVENTORY.some((r) => r.unit?.length)).toBe(true);
+  });
+
+  it('finds the deny-tests already built (guards against a silently empty scan)', () => {
+    expect(DENY_TEST_INVENTORY.filter((r) => isPresent(REPO_ROOT, r)).length).toBeGreaterThanOrEqual(8);
+  });
+
+  it('every row is present or listed as not built yet, never both', () => {
+    const problems: string[] = [];
+    for (const row of DENY_TEST_INVENTORY) {
+      const present = isPresent(REPO_ROOT, row);
+      const listed = row.id in NOT_BUILT_YET;
+      if (present && listed) problems.push(`${row.id} is present: delete it from NOT_BUILT_YET and lower NOT_BUILT_LIMIT`);
+      if (!present && !listed) problems.push(`${row.id} names a file that does not exist (or lacks its check): write it, or this row is not a deny-test yet`);
+    }
+    for (const id of Object.keys(NOT_BUILT_YET)) {
+      if (!DENY_TEST_INVENTORY.some((r) => r.id === id)) problems.push(`${id} is in NOT_BUILT_YET but is no row of the inventory`);
+    }
+    expect(problems).toEqual([]);
+  });
+
+  it('only shrinks: what is not built yet stays within the limit, and each entry names the work that builds it', () => {
+    expect(Object.keys(NOT_BUILT_YET).length).toBeLessThanOrEqual(NOT_BUILT_LIMIT);
+    for (const work of Object.values(NOT_BUILT_YET)) expect(work).toMatch(/^W\d+[a-d]?$/);
+  });
+
+  it('judges a row present only when its files exist and hold its check', () => {
+    const base = { id: 'x', claim: 'x', configurations: 'C1' };
+    expect(isPresent(REPO_ROOT, { ...base, files: ['backend/scripts/deny-test-does-not-exist.mjs'] })).toBe(false);
+    expect(isPresent(REPO_ROOT, { ...base, files: ['backend/scripts/deny-test-bearer-pin.mjs'] })).toBe(true);
+    expect(isPresent(REPO_ROOT, { ...base, files: ['backend/scripts/deny-test-bearer-pin.mjs'], contains: 'a phrase no deny-test holds 4f1c' })).toBe(false);
+  });
+
+  it('renders every row into the matrix with its state', () => {
+    const out = render();
+    expect(out).toContain('## Deny-tests');
+    for (const row of DENY_TEST_INVENTORY) {
+      const line = out.split('\n').find((l) => l.startsWith(`| \`${row.id}\` |`));
+      expect(line).toBeDefined();
+      expect(line!.endsWith(isPresent(REPO_ROOT, row) ? '| present |' : '| **NOT BUILT** |')).toBe(true);
+    }
   });
 });

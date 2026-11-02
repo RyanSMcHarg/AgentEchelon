@@ -7,7 +7,7 @@
  *   - the turn id is recorded as `declared` where it genuinely is, and `paired` where it is derived;
  *   - an assistant-initiated response is marked `system`, so it cannot contribute a meaningless TTFF;
  *   - the window is bounded and clamped;
- *   - the comparison reports disagreements rather than summarising them away.
+ *   - the comparison reports disagreements rather than summarizing them away.
  */
 
 jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
@@ -49,7 +49,10 @@ describe('backfillTurnEvents', () => {
       // pairing exists), guarded by `WHERE turn_events.turn_id IS NULL` so a bound anchor is never
       // moved - converging, like the others. DO NOTHING there made the live row win and t0 stay
       // NULL for every live-archived turn.
-      expect(sqlOf(i)).toMatch(/ON CONFLICT (DO NOTHING|\([^)]+\)\s+DO UPDATE SET turn_id = EXCLUDED\.turn_id\s+WHERE turn_events\.turn_id IS NULL)/);
+      // The target may contain an expression - migration 041's arbiter is an expression index - so
+      // one level of nesting is allowed here. The previous pattern forbade it and would have failed
+      // any correct naming of that index.
+      expect(sqlOf(i)).toMatch(/ON CONFLICT (DO NOTHING|\((?:[^()]|\([^()]*\))+\)\s+DO UPDATE SET turn_id = EXCLUDED\.turn_id\s+WHERE turn_events\.turn_id IS NULL)/);
     }
     // And exactly ONE pass is the binding upsert - the anchor pass. More would mean a second writer
     // started moving keys under the same license.
@@ -64,6 +67,27 @@ describe('backfillTurnEvents', () => {
     expect(sqlOf(0)).toContain("'placeholder_posted'");
     expect(sqlOf(0)).toContain('<!--corr:([A-Za-z0-9._-]{1,64})-->');
     expect(sqlOf(0)).toContain("'declared'");
+  });
+
+  it('writes the duel round the same way the live writer does', async () => {
+    // `turn_events.battle_round` was declared end to end and written by nothing, so a round-1 duel
+    // side was pooled with production traffic in every latency population. The two writers have to
+    // agree or a backfilled window and a live window disagree about the same turn: both take the
+    // round off the placeholder's own `<!--battle:-->` marker, both bound it to what the SMALLINT
+    // column holds, and both put it on the placeholder row plus the close beside it.
+    await backfillTurnEvents();
+    for (const pass of [0, 2]) {
+      expect(sqlOf(pass)).toContain('battle_round');
+      expect(sqlOf(pass)).toContain("substring(c.content from '<!--battle:[^>]*?round=([0-9]{1,4})(?![0-9])')::smallint");
+    }
+    // And NOT on the anchor or the moderation rows: neither is a response, so neither has a round.
+    // The anchor pass READS the exchange's round only to refuse binding a rebuttal to the person's
+    // message (the rule migration 064 applies to the view's anchor lateral and 071 keeps), and writes
+    // no round column.
+    const anchorColumns = sqlOf(1).slice(0, sqlOf(1).indexOf('SELECT'));
+    expect(anchorColumns).not.toContain('battle_round');
+    expect(sqlOf(1)).toContain('AND COALESCE(e.battle_round, 1) <= 1');
+    expect(sqlOf(3)).not.toContain('battle_round');
   });
 
   it('records the user-message binding as PAIRED, never as declared', async () => {

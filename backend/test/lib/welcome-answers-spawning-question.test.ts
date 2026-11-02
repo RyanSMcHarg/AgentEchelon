@@ -40,6 +40,7 @@ jest.mock('@aws-sdk/client-lambda', () => ({
 jest.mock('@aws-sdk/client-ssm', () => ({
   SSMClient: jest.fn().mockImplementation(() => ({ send: mockSsmSend })),
   GetParameterCommand: jest.fn().mockImplementation((i) => ({ __t: 'GetParam', i })),
+  GetParametersByPathCommand: jest.fn().mockImplementation((i) => ({ __t: 'GetByPath', i })),
 }), { virtual: true });
 
 jest.mock('../../lambda/src/lib/channel-context-client.js', () => ({
@@ -56,11 +57,19 @@ type Handler = (e: unknown) => Promise<{ messages: Array<{ content: string }> }>
 let handler: Handler;
 
 beforeEach(async () => {
+  // The router is deployed AS a classification; unset, it falls through to reading the channel tag,
+  // which this fixture does not stamp, and an unreadable tag is refused rather than floored (ADR-046).
+  process.env.CLASSIFICATION = 'premium';
   jest.resetModules();
   jest.clearAllMocks();
   process.env.APP_INSTANCE_ARN = 'arn:aws:chime:us-east-1:111:app-instance/a';
   process.env.ASYNC_PROCESSOR_ARN = 'arn:aws:lambda:us-east-1:111:function:standard';
-  mockSsmSend.mockResolvedValue({ Parameter: { Value: 'arn:bot' } });
+  // The bot parameter, and the assignment record naming the assistant that occupies that bot: the
+  // router resolves the turn's assistant from it and declines a turn whose assistant it cannot name.
+  mockSsmSend.mockResolvedValue({
+    Parameter: { Value: 'arn:bot' },
+    Parameters: [{ Value: JSON.stringify({ botArn: 'arn:bot', assistant: 'advisor', role: 'primary', occupancy: 'live' }) }],
+  });
   mockChimeSend.mockResolvedValue({});
   mockLambdaSend.mockResolvedValue({});
   mockDdbSend.mockResolvedValue({});

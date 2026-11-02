@@ -32,6 +32,7 @@ jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
 }));
 
 import { handler } from '../../lambda/src/analytics-aurora/analytics-query';
+import { edgeContext } from '../helpers/edge-context';
 
 function postEvent(body: unknown): APIGatewayProxyEvent {
   return {
@@ -39,7 +40,7 @@ function postEvent(body: unknown): APIGatewayProxyEvent {
     path: '/query',
     body: JSON.stringify(body),
     requestContext: {
-      authorizer: { claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' } },
+      authorizer: edgeContext({ claims: { sub: 'test-admin-sub', 'cognito:groups': 'admins' } }),
     },
   } as unknown as APIGatewayProxyEvent;
 }
@@ -66,15 +67,25 @@ describe('the latency query counts a turn once', () => {
 
   it('still measures the update, via the canonical row', async () => {
     // Guards against the wrong reading of the fix: dropping `e2e_ms` along with the duplicate row
-    // would remove the one metric that describes the wait the person actually experienced.
+    // would remove the one metric that describes the wait the person actually experienced. The
+    // figure now comes from the ledger (v_turn_latency.e2e_ms) rather than from the exchange; what
+    // this test is about is that it is still reported at all, and still once per turn.
     const sql = await latencySql();
-    expect(sql).toMatch(/AVG\(e\.e2e_ms\)/);
-    expect(sql).toMatch(/PERCENTILE_CONT\(0\.95\)[\s\S]*e\.e2e_ms/);
+    expect(sql).toMatch(/AVG\(vl\.e2e_ms\)/);
+    expect(sql).toMatch(/PERCENTILE_CONT\(0\.95\)[\s\S]*vl\.e2e_ms/);
   });
 
-  it('keeps TTFF measured from the exchange, not from the audit row', async () => {
+  it('measures TTFF from the ledger, joined one row per response, not from the audit row', async () => {
     const sql = await latencySql();
-    expect(sql).toMatch(/AVG\(e\.response_latency_ms\)/);
+    expect(sql).toMatch(/AVG\(vl\.ttff_ms\)/);
+    // The join that makes "once per turn" true on this side: v_turn_latency is already grouped on
+    // (response_id, channel_arn), so a plain LEFT JOIN cannot fan out. Joining turn_events directly
+    // would emit one row per EVENT and multiply every average on the row.
+    expect(sql).toMatch(
+      /LEFT JOIN v_turn_latency vl ON vl\.response_id = m\.message_id AND vl\.channel_arn = m\.channel_arn/,
+    );
+    const outer = sql.slice(sql.indexOf('FROM messages m'));
+    expect(outer).not.toMatch(/JOIN turn_events/);
   });
 
   it('REPORTS the compute denominator instead of filtering it away', async () => {
@@ -110,7 +121,7 @@ describe('the latency query counts a turn once', () => {
     mockDbQuery.mockResolvedValueOnce({ rows: [] });
     const res = await handler(postEvent({ queryType: 'latency_metrics', dateRange: { start: '2026-05-13', end: '2026-05-20' } }));
     const cols = JSON.parse(res.body).columns as string[];
-    expect(cols.slice(0, 4)).toEqual(['date', 'agent_type', 'delivery_option', 'exchange_count']);
+    expect(cols.slice(0, 4)).toEqual(['date', 'assistant', 'delivery_option', 'assistant_turn_count']);
     expect(cols).toEqual(expect.arrayContaining(['compute_count', 'direct_count', 'closed_count', 'unclosed_count']));
   });
 

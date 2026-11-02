@@ -75,7 +75,7 @@ export async function backfillModelFromAnalytics(): Promise<ModelBackfillResult>
                 latency_ms    = COALESCE(latency_ms,    $4),
                 total_ms      = COALESCE(total_ms,      $5),
                 poll_ms       = COALESCE(poll_ms,       $6),
-                agent_type    = COALESCE(agent_type,    $7)
+                assistant     = COALESCE(assistant,     $7)
           WHERE channel_arn = $8
             AND message_id = $9
             AND event_type = 'CREATE_CHANNEL_MESSAGE'

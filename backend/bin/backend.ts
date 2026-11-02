@@ -1,34 +1,51 @@
 #!/usr/bin/env node
 import * as cdk from 'aws-cdk-lib';
-import { ChimeMessagingStack } from '../lib/stacks/chime-messaging-stack';
-import { FoundationsStack } from '../lib/stacks/foundations-stack';
-import { S3StorageStack } from '../lib/stacks/s3-storage-stack';
-import { CognitoAuthStack } from '../lib/stacks/cognito-auth-stack';
-import { AdminPlaneStack } from '../lib/stacks/admin-plane-stack';
-import { AdminNotificationStack } from '../lib/stacks/admin-notification-stack';
-import { AnalyticsStack } from '../lib/stacks/analytics-stack';
-import { AnalyticsStackAurora } from '../lib/stacks/analytics-stack-aurora';
-import { IAnalyticsStackOutputs } from '../lib/interfaces/analytics-stack-interface';
-import { NotificationStack } from '../lib/stacks/notification-stack';
+import { MessagingStack } from '../lib/stacks/messaging-stack';
+import { IdentityStack } from '../lib/stacks/identity-stack';
+import { ConversationsStack } from '../lib/stacks/conversations-stack';
+import { ArchiveStack } from '../lib/stacks/archive-stack';
+import { ArchiveStackAurora } from '../lib/stacks/archive-stack-aurora';
+import { IArchiveStackOutputs } from '../lib/interfaces/archive-stack-interface';
+import { TestInboxStack, testInboxStackProps } from '../lib/stacks/test-inbox-stack';
 import { IMAGE_GEN_MODELS } from '../lambda/src/lib/image-gen-models';
-import { RES_PREFIX } from '../lib/stacks/agent-classification-common';
+import { RES_PREFIX, SSM_ROOT } from '../lib/stacks/agent-classification-common';
 import { ImageGuardrailStack } from '../lib/stacks/image-guardrail-stack';
-import { BasicClassificationStack } from '../lib/stacks/basic-classification-stack';
-import { StandardClassificationStack } from '../lib/stacks/standard-classification-stack';
-import { PremiumClassificationStack } from '../lib/stacks/premium-classification-stack';
+import { AssistantsStack, assistantsStackName } from '../lib/stacks/assistant-profile-stack';
 import { ChannelFlowStack } from '../lib/stacks/channel-flow-stack';
 import { PostProcessingStack } from '../lib/stacks/post-processing-stack';
-import { BattleStack } from '../lib/stacks/battle-stack';
-import { ExperimentsStack } from '../lib/stacks/experiments-stack';
-import { FrontendStack } from '../lib/stacks/frontend-stack';
+import { PersonApiStack } from '../lib/stacks/person-api-stack';
+import { isRouteSource, routesFor } from '../lib/constructs/http-api';
+import { describeGap, typeCapabilityGaps } from '../lib/config/type-capabilities';
 import {
   STACK_PREFIX,
   APP_INSTANCE_NAME,
   INSTANCE_NAME,
 } from '../lib/stacks/agent-classification-common';
-import { getModelCatalog, parseProfileModelSelection } from '../lib/config/model-strategy';
-import { DEFAULT_PROFILES_CONFIG, validateProfilesConfig } from '../lib/config/profiles';
+import { deployedAssistantClassifications, resolveDeploymentProfiles } from '../lib/config/profiles';
+import { defaultProfileRegistry, useDeploymentProfiles } from '../lib/profile-registry';
+import { assertClassificationsDeclared } from '../lib/config/declared-classifications';
+import { ProfileRegistryReaders } from '../lib/constructs/profile-registry-readers';
+import { DeploymentLanguagesEnv } from '../lib/constructs/deployment-languages-env';
+import { resolveDeploymentLanguages } from '../lib/config/languages';
+import { assertNoRetiredContext } from '../lib/config/deploy-context';
+import { parseEnvironment } from '../lib/config/environment';
+import { declaresWidgetHost, directoryOf, issuerRegistry, parseIssuersContext } from '../lib/config/issuers';
+import { provisionerIssuers } from '../lib/constructs/subject-provisioner';
+import { splitTestFixtures } from '../lib/config/test-issuers';
+import { TestIssuerStack } from '../lib/stacks/test-issuer-stack';
+import { WidgetHostStack } from '../lib/stacks/widget-host-stack';
+import { buildCapabilities, resolveCapabilities, type CoreStacks, type DeploymentSettings } from '../lib/config/capabilities';
 import { applyStandardTags } from '../lib/tagging';
+import { enforceInlinePolicyBudget } from '../lib/constructs/inline-policy-budget';
+import { publishAlarmNames } from '../lib/constructs/alarm-names';
+import { ExcludeOwnerTeamTag } from '../lib/constructs/exclude-owner-team-tag';
+import { stackIdOf } from '../lib/config/stack-names';
+import { connectorRegistry } from '../lib/config/connectors';
+import { connectorContextOf } from '../lib/constructs/connectors';
+import { connectorGrantsFunctionName } from '../lib/stacks/connectors-stack';
+
+/** A stack id under this instance's prefix, for a name `lib/config/stack-names.json` lists (the one name source). */
+const stackId = (name: string): string => stackIdOf(STACK_PREFIX, name);
 
 /**
  * Parse the `wafAllowedIps` context into a CIDR list. Accepts a JSON array
@@ -54,11 +71,87 @@ function parseWafAllowedIps(raw: unknown): string[] {
 }
 
 const app = new cdk.App();
+// Only the ownership function may write an assistant's `owner-team` tag: every other tag grant in
+// the app is rendered with that key excluded (SPEC-ADMIN-CONSOLE FR47).
+cdk.Aspects.of(app).add(new ExcludeOwnerTeamTag());
 
-// SPEC-CAPABILITY-PROFILES Phase 0: fail the synth loudly on a malformed classifications/profiles
-// config (unique ranks, failClosedTo is the floor, profile refs resolve, no alias collisions).
-// Validates the shipped default today; the per-deployment config source replaces it in a later phase.
-validateProfilesConfig(DEFAULT_PROFILES_CONFIG);
+// THE DEPLOYMENT'S CLASSIFICATIONS AND PROFILES (`profiles` in deploy.config.json, `resolveDeploymentProfiles`
+// in lib/config/profiles.ts): a selection of the shipped catalog, a fully custom set, or, declared as
+// nothing, the shipped catalog minus its outside classifications (`guest`, `customer`). The admin plane is
+// in every set. Refused at synth when malformed (`validateProfilesConfig`: every classification declares
+// grants, grants itself, and declares a set no other classification declares; profile refs resolve; no
+// alias collisions). Installed as the registry every stack reads. Each classification's stack publishes its own
+// row of it, and Identity the admin plane's, and every function the app builds reads those rows at runtime
+// (`ProfileRegistryReaders`), so the stacks and the handlers read one set and no stack carries another's.
+const deploymentProfiles = resolveDeploymentProfiles(app.node.tryGetContext('profiles'));
+useDeploymentProfiles(deploymentProfiles);
+cdk.Aspects.of(app).add(new ProfileRegistryReaders(SSM_ROOT, RES_PREFIX));
+
+// THE LANGUAGES THIS DEPLOYMENT SPEAKS (`languages` in deploy.config.json, `lib/config/languages.ts`): a closed list
+// of catalog tags, its own language first. Refused at synth when a tag is one the platform cannot name. Every function
+// is told the list when it is not the default, so every reader holds one set.
+cdk.Aspects.of(app).add(new DeploymentLanguagesEnv(resolveDeploymentLanguages(app.node.tryGetContext('languages'))));
+
+// A retired context key fails the synth with the name of what replaced it, so nobody deploys
+// believing a removed switch still works (`RETIRED_CONTEXT_KEYS`).
+assertNoRetiredContext((key) => app.node.tryGetContext(key));
+
+// THE DECLARED CAPABILITIES (`lib/config/capabilities.ts`). The required core is always built; every
+// other stack exists because its capability is named here. Refused at synth when a name is unknown, is
+// not built yet, or lacks a capability it requires.
+const capabilities = resolveCapabilities(app.node.tryGetContext('capabilities'));
+
+// THE CLASSIFICATIONS THAT GET AN ASSISTANT STACK: every one the profile registry declares with a
+// topology. Refused when a conversational classification declares none, since no stack would serve it.
+const assistantClassificationValues = deployedAssistantClassifications(deploymentProfiles);
+
+// THE TRUSTED-ISSUER REGISTRY (`lib/config/issuers.ts`): which issuers a person may sign in through, and
+// what each one's people reach. Refused at synth when an entry declares no clearance source, a kind or
+// mode is not built, `admin: true` sits on a kind outside the staff, or the admin capability has no
+// issuer that is not the guest (L18). Absent, the deployment trusts its own pool alone.
+//
+// TEST-FIXTURE ENTRIES (`owner: "test-fixture"`, `lib/config/test-issuers.ts`) are split out first: each
+// gets a pool in the opt-in TestIssuer stack, and joins the registry only once it names that pool. Refused
+// in production.
+const testFixtures = splitTestFixtures(
+  parseIssuersContext(app.node.tryGetContext('issuers')),
+  parseEnvironment(app.node.tryGetContext('environment')),
+);
+if (testFixtures?.pending.length) {
+  console.warn(`\n⚠️  test-fixture issuers ${testFixtures.pending.join(', ')} name no pool yet: TestIssuer creates their pools, `
+    + 'and each is trusted once its entry carries the ids that stack outputs.\n');
+}
+// AN ISSUER OR CONVERSATION TYPE NAMING A CLASSIFICATION THE DEPLOYMENT DOES NOT DECLARE IS REFUSED, naming
+// the classification to declare: the guest issuer needs `guest` and its path B `customer`, an
+// invitation-link issuer every classification a type's link classifications name (lib/config/declared-classifications.ts).
+assertClassificationsDeclared(testFixtures?.trusted, defaultProfileRegistry);
+// In production it also refuses the guest issuer's captcha test keys, any setting its block does not know
+// (there is no bypass) and a per-address limit of 0 (L16).
+const issuers = issuerRegistry(testFixtures?.trusted, defaultProfileRegistry, {
+  capabilities: capabilities.names,
+  environment: parseEnvironment(app.node.tryGetContext('environment')),
+});
+// THE CONNECTOR REGISTRY (`lib/config/connectors.ts`): the vendors this deployment integrates with, beside
+// the `connectors` capability. Refused at synth when an entry is malformed, names a vendor or capability not
+// built, or names an issuer the registry does not declare; and when either is declared without the other.
+const connectors = connectorRegistry(app.node.tryGetContext('connectors'), connectorContextOf(issuers), capabilities.names);
+{
+  // THE GUEST'S PER-PERSON MESSAGE LIMIT IS A LIMIT IN PRODUCTION (L16): a 0 there would limit nothing.
+  const guest = issuers.guest();
+  if (guest && parseEnvironment(app.node.tryGetContext('environment')) === 'production') {
+    for (const c of (guest.clearance as { fixed?: string[] }).fixed ?? []) {
+      if (defaultProfileRegistry.profileFor(c)?.rateLimitPerHour === 0) {
+        throw new Error(`issuers: the guest issuer's classification "${c}" has a message limit of 0, which production refuses`);
+      }
+    }
+  }
+  // A HOST'S CONTEXT CONVERSATIONS ARE CREATED BY THEIR CLASSIFICATION'S CREATOR, which exists for a
+  // classification with an assistant stack only.
+  const context = issuers.contextClassification();
+  if (context && !assistantClassificationValues.includes(context)) {
+    throw new Error(`issuers: oneChannel names "${context}", which this deployment creates no assistant stack for`);
+  }
+}
 
 // Environment configuration
 const env = {
@@ -70,22 +163,13 @@ const env = {
 const analyticsMode: 'athena' | 'aurora' =
   app.node.tryGetContext('analyticsMode') || 'athena';
 
-// /battle feature. The battle infrastructure (alt-slots, orchestrator,
-// channel-battle API) lives in its own AgentEchelonBattle stack. Defaults to ON;
-// deploy with `-c enableBattle=false` to leave /battle out entirely (the tier
-// processors + channel-flow then carry no battle plumbing and fail open).
-// Battle eligibility is per-profile config now (AssistantProfile.battleEligible), not a context knob.
-const enableBattle: boolean =
-  (app.node.tryGetContext('enableBattle') ?? true) !== false
-    && app.node.tryGetContext('enableBattle') !== 'false';
-
 // Live drift detection (SPEC-DRIFT-CONVERGENCE.md + ADR-013): conversation-level
 // + ALL-tier (basic/standard/premium). **OPT-IN, default OFF** — matches
-// docs/AURORA-MODE-GUIDE.md ("Default false ships the analytics-only post-hoc
-// path"). It REQUIRES analyticsMode=aurora; in Athena mode there is no Aurora to
+// docs/guides/admin/AURORA-MODE-GUIDE.md §"Drift detection (Aurora-only)": "Default `false` ships the analytics-only post-hoc
+// path". It REQUIRES analyticsMode=aurora; in Athena mode there is no Aurora to
 // query, so drift is inert regardless.
 //
-// WHY default OFF: it is the documented contract (AURORA-MODE-GUIDE.md, ADR-013
+// WHY default OFF: it is the documented contract (docs/guides/admin/AURORA-MODE-GUIDE.md, ADR-013
 // decision 4) — a plain `cdk deploy -c analyticsMode=aurora` ships the
 // analytics-only post-hoc path, and the live user-facing suggestion is an
 // explicit opt-in. It is NOT off because the live path is broken: the original
@@ -94,7 +178,7 @@ const enableBattle: boolean =
 // subnets, severing its egress to Amazon Chime SDK Messaging so every reply hung
 // to the 30s timeout. That is FIXED: retrieval and drift now run in a dedicated
 // VPC-attached data-plane Lambda and the handler stays non-VPC, invoking it
-// (ADR-013; see TROUBLESHOOTING.md §"live drift returns 429").
+// (ADR-013; see docs/guides/user/TROUBLESHOOTING.md §16 "Live drift returns `{"Code":429}`").
 // Opting in with `-c enableLiveDrift=true` is therefore safe on the current build.
 const enableLiveDrift: boolean =
   analyticsMode === 'aurora'
@@ -149,9 +233,10 @@ const senderEmail = app.node.tryGetContext('senderEmail')
 const appUrl = app.node.tryGetContext('appUrl')
   || process.env.APP_URL
   || 'http://localhost:5173';
-// Single source for the deploy environment. Historically this had TWO defaults (the
-// Aurora prop defaulted 'dev' while the standard tag defaulted 'Production'); collapsed here.
-const environment = (app.node.tryGetContext('environment') || 'dev') as 'dev' | 'prod';
+// THE DEPLOYMENT ENVIRONMENT, one value (`lib/config/environment.ts`): `dev` or `production`, refused
+// at synth when it is anything else. Every stack reads the same value through the same module, so
+// production's RETAIN applies wherever a stack keeps data.
+const environment = parseEnvironment(app.node.tryGetContext('environment'));
 // Set true when senderEmail is already a verified SES identity (or domain-verified
 // / externally managed) — skips creating the per-address EmailIdentity, which CFN
 // cannot do for an identity that already exists.
@@ -160,7 +245,7 @@ const senderEmailPreVerified =
   || app.node.tryGetContext('senderEmailPreVerified') === true
   || process.env.SENDER_EMAIL_PRE_VERIFIED === 'true';
 
-// Frontend WAF (AgentEchelonFrontend / CloudFront).
+// Frontend WAF (AgentEchelonChatApp / CloudFront).
 // - Managed-rules protection is ON BY DEFAULT (AWS Managed Common +
 //   Known-Bad-Inputs + IP-reputation + per-IP rate limit). Opt out with
 //   `--context frontendWaf=false`; tune the rate with `--context wafRateLimit=N`.
@@ -173,20 +258,8 @@ const enableManagedWaf = app.node.tryGetContext('frontendWaf') !== false
 const wafRateLimitCtx = app.node.tryGetContext('wafRateLimit');
 const wafRateLimit = wafRateLimitCtx ? Number(wafRateLimitCtx) : undefined;
 const wafAllowedIps = parseWafAllowedIps(app.node.tryGetContext('wafAllowedIps'));
-// Standalone admin console hosting (DESIGN-SEPARATE-ADMIN-APP.md). OPT-IN: a
-// deployment may run headless or host its own console, so the AgentEchelonAdminFrontend
-// stack (its own S3 + CloudFront origin, serving admin.html) is only created with
-// `--context enableAdminApp=true`. The chat SPA never carries admin code either way.
-const enableAdminApp = app.node.tryGetContext('enableAdminApp') === true
-  || app.node.tryGetContext('enableAdminApp') === 'true';
-const modelCatalog = getModelCatalog(env.region, env.account ?? '');
-const profileModelSelection = parseProfileModelSelection({
-  basic: app.node.tryGetContext('basicModelKey') || process.env.BASIC_MODEL_KEY,
-  standard: app.node.tryGetContext('standardModelKey') || process.env.STANDARD_MODEL_KEY,
-  premium: app.node.tryGetContext('premiumModelKey') || process.env.PREMIUM_MODEL_KEY,
-}, modelCatalog);
 
-// Fail fast if deploying NotificationStack with the placeholder email.
+// Warn when the sender is the placeholder email (the notifications capability, the post-delivery bridge and the alerts send from it).
 // SES rejects unverified identities, so the share-conversation Lambda would
 // swallow every SendEmail call at runtime. Require an explicit value.
 if (senderEmail === PLACEHOLDER_SENDER) {
@@ -197,70 +270,89 @@ if (senderEmail === PLACEHOLDER_SENDER) {
   );
 }
 
-// 1. Chime SDK Messaging Stack - Foundation
-const chimeStack = new ChimeMessagingStack(app, `${STACK_PREFIX}ChimeMessaging`, {
+// ── THE REQUIRED CORE ──────────────────────────────────────────────────────────────────────────────
+//
+// Every deployment stands these up. What else exists is the declared capability list (`capabilities`,
+// resolved above): each capability's stacks come from its registry entry (`lib/config/capabilities.ts`),
+// and a capability that is not declared leaves no stack behind.
+
+// 1. Messaging: the Amazon Chime SDK app instance, and the message stream it publishes to.
+const messagingStack = new MessagingStack(app, stackId('Messaging'), {
   env,
   appInstanceName: APP_INSTANCE_NAME,
-  description: 'Chime SDK Messaging for AgentEchelon',
+  description: 'The Amazon Chime SDK app instance, its service admin and retention, and the message stream',
 });
 
-// SSM param the S3 stack publishes the attachments-bucket ARN to, and the credential exchange
-// (in cognito-auth, created before the S3 stack) resolves at runtime. A plain-string contract
-// between the two stacks, so neither takes a circular CDK dependency on the other.
-const attachmentsBucketArnParam = `/${STACK_PREFIX.toLowerCase()}/shared/attachments-bucket-arn`;
-
-// 2. Cognito Auth Stack - Authentication & Authorization
-const cognitoStack = new CognitoAuthStack(app, `${STACK_PREFIX}CognitoAuth`, {
+// 2. Identity: the credential exchange and its roles, Identities, offboarding, the trail, and this
+// deployment's own user pool when the registry declares an issuer on it (L15). Nothing in it is
+// administration but the admin console's app client on that pool, with `admin`.
+const identityStack = new IdentityStack(app, stackId('Identity'), {
   env,
-  appInstanceArn: chimeStack.appInstanceArn,
-  attachmentsBucketArnParam,
-  // Descriptive only (changes no authorization): names the IdP that actually governs end users, so
-  // the admin console can point operators at it instead of showing a Cognito-only User Management
-  // tab on a deployment that replaced User Pools. See IDENTITY-PROVIDER-GUIDE.md.
-  identityProvider: (app.node.tryGetContext('identityProvider') as string) || 'cognito',
-  description: 'Cognito authentication with SAML/OIDC support',
+  appInstanceArn: messagingStack.appInstanceArn,
+  adminConsoleClient: capabilities.has('admin'),
+  // Offboarding revokes a person's connector grants (K3) when a declared connector takes them.
+  connectorGrantsFunction: connectors.withGrants().length ? connectorGrantsFunctionName() : undefined,
+  // Who may pre-assign a provisioned-only issuer's subject (P-13): the admin backend, and the connector receiver.
+  subjectProvisioners: provisionerIssuers(issuers, connectors, capabilities),
+  // Replies by email (M-8): the reply poster posts on the one-conversation role, so its role is created here.
+  emailReplies: capabilities.has('notifications') && Boolean(String(app.node.tryGetContext('replyDomain') || '').trim()),
+  // Offboarding erases the person named on a conversation's battle setting (the Battle stack's table) with `battle`.
+  battle: capabilities.has('battle'),
+  description: 'Identity: the credential exchange, Identities, offboarding, the platform trail and the user pool',
 });
 
-// Admin conversation READ plane (list / messages / membership-history over the archive). Moved OUT of
-// cognito-auth-stack: it is an admin-plane DATA api, not identity infra. It
-// imports the Identity-Pool sign-on + persona roles by ARN and attaches its execute-api teeth here, so
-// there is no circular dependency (admin-plane → cognito-auth only).
-const adminPlaneStack = new AdminPlaneStack(app, `${STACK_PREFIX}AdminPlane`, {
-  env,
-  appInstanceArn: chimeStack.appInstanceArn,
-  userPool: cognitoStack.userPool,
-  classificationRoleCeilings: cognitoStack.classificationRoleCeilings,
-  adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
-  adminPersonaRoleArns: cognitoStack.adminPersonaRoleArns,
-  description: 'AgentEchelon admin conversation read plane (archive list/messages/membership-history)',
+// Test inbox: a mailbox the e2e suite reads, so a notification test asserts delivery (SPEC-NOTIFICATION-BRIDGE).
+// OPT-IN with `-c testInboxDomain=<a domain used only for tests>`. A deployer who already receives mail into S3
+// declares that bucket beside the domain (`testInboxBucket`, `testInboxPrefix`), and no stack is created: the
+// domain's receipt rule is not this deployment's (README, "Test inbox").
+const testInbox = testInboxStackProps({
+  testInboxDomain: app.node.tryGetContext('testInboxDomain'),
+  testInboxBucket: app.node.tryGetContext('testInboxBucket'),
+  testInboxPrefix: app.node.tryGetContext('testInboxPrefix'),
+  testInboxRuleSet: app.node.tryGetContext('testInboxRuleSet'),
+  testInboxDomainVerified: app.node.tryGetContext('testInboxDomainVerified'),
+  testInboxHostedZoneId: app.node.tryGetContext('testInboxHostedZoneId'),
+  testInboxHostedZoneName: app.node.tryGetContext('testInboxHostedZoneName'),
 });
-adminPlaneStack.addDependency(chimeStack);
-adminPlaneStack.addDependency(cognitoStack);
-
-// Admin notification channel (A6): auto-provision a dedicated admin channel that the membership-audit
-// (Layer 6) and admin-error alert paths post to (in-app message + email fan-out). OPT-IN; when off,
-// those alerts stay log-only unless an operator hand-passes `-c membershipAuditAlertChannelArn`. When
-// on, a custom resource creates the channel as the app-instance-admin, adds the `admins` group as
-// members, and stamps them into the participant roster (the email fan-out reads the roster).
-const enableAdminNotificationChannel: boolean =
-  app.node.tryGetContext('enableAdminNotificationChannel') === true ||
-  app.node.tryGetContext('enableAdminNotificationChannel') === 'true';
-let adminNotificationChannelArn: string | undefined;
-if (enableAdminNotificationChannel) {
-  const adminNotificationStack = new AdminNotificationStack(app, `${STACK_PREFIX}AdminNotification`, {
+if (testInbox) {
+  new TestInboxStack(app, stackId('TestInbox'), {
     env,
-    appInstanceArn: chimeStack.appInstanceArn,
-    appInstanceAdminArn: chimeStack.appInstanceAdminArn,
-    userPoolId: cognitoStack.userPool.userPoolId,
-    userPoolArn: cognitoStack.userPool.userPoolArn,
-    // Honor a host-owned admin group name (ADMIN-INTEGRATION-GUIDE `adminGroupNames`); default 'admins'.
-    adminGroupName:
-      ((app.node.tryGetContext('adminGroupNames') as string | undefined) || '').split(',')[0].trim() || undefined,
-    description: 'AgentEchelon admin notification channel (membership-audit + admin-error alerts)',
+    ...testInbox,
+    description: 'AgentEchelon e2e test inbox (SES receipt rule into S3)',
   });
-  adminNotificationStack.addDependency(chimeStack);
-  adminNotificationStack.addDependency(cognitoStack);
-  adminNotificationChannelArn = adminNotificationStack.channelArn;
+}
+
+// Test issuer: the non-pool people the e2e suite signs in as (D16, the H1 fixture), one pool per registry
+// entry whose owner is `test-fixture`. OPT-IN by declaring such an entry; refused in production
+// (`lib/config/test-issuers.ts`). Nothing depends on it: a fixture entry names its pool by id once this
+// stack has deployed.
+if (testFixtures?.fixtures.length) {
+  new TestIssuerStack(app, stackId('TestIssuer'), {
+    env,
+    fixtures: testFixtures.fixtures,
+    appUrl: String(app.node.tryGetContext('appUrl') || '').trim() || undefined,
+    description: 'AgentEchelon e2e test issuers (one Cognito pool per test-fixture registry entry)',
+  });
+}
+
+// Widget host: the sample page that embeds the widget (`examples/widget-host/`), on its own private bucket
+// and CloudFront distribution. OPT-IN by the guest issuer listing `"widget-host"` in its `allowedOrigins`
+// (`WIDGET_HOST_ORIGIN`), refused in production by the registry and here without the `widget` capability,
+// since there would be nothing to embed. The widget's `frame-ancestors` names this stack's origin by
+// reference, so the domain is never typed into a configuration.
+let widgetHostStack: WidgetHostStack | undefined;
+if (declaresWidgetHost(issuers.entries)) {
+  if (!capabilities.has('widget')) {
+    throw new Error('issuers: an allowedOrigins entry "widget-host" asks for the sample host page, which embeds the widget; '
+      + 'declare "widget" in capabilities, or remove "widget-host"');
+  }
+  widgetHostStack = new WidgetHostStack(app, stackId('WidgetHost'), {
+    env,
+    enableManagedWaf,
+    wafRateLimit,
+    wafAllowedIps,
+    description: 'AgentEchelon sample widget host page (CloudFront + private S3), an origin other than the widget\'s',
+  });
 }
 
 // Cost sleep mode (docs/SPEC-COST-SLEEP-MODE.md): auto-pause Aurora Serverless
@@ -289,171 +381,135 @@ if (app.node.tryGetContext('sleepMode') && analyticsMode !== 'aurora') {
 }
 
 // Layer 6 membership audit (SPEC-CONVERSATION-SECURITY): an ALWAYS-ON near-real-time backstop that
-// flags over-classification channel memberships for review - a standing security guarantee, deployed in
+// flags uncleared channel memberships for review - a standing security guarantee, deployed in
 // both analytics modes. It is NOT opt-in; the only knob is enforcement mode: report-only (flag for
-// review, the default) unless `-c membershipAuditEnforce=true` (auto-revoke the over-tier membership).
+// review, the default) unless `-c membershipAuditEnforce=true` (auto-revoke the uncleared membership).
 const membershipAuditEnforce: boolean =
   app.node.tryGetContext('membershipAuditEnforce') === true ||
   app.node.tryGetContext('membershipAuditEnforce') === 'true';
-// Prefer an explicitly-passed channel ARN; otherwise use the auto-provisioned admin notification
-// channel (A6, above). Both alert paths (membership-audit + admin-error) share this one ARN, so this
-// single value flows to the analytics stack (membership-audit) and the tier stacks (adminErrorAlertWiring).
-const membershipAuditAlertChannelArn =
-  (app.node.tryGetContext('membershipAuditAlertChannelArn') as string | undefined)
-  || adminNotificationChannelArn;
+// Every platform alert, the membership audit's findings included, is an `ae.alert` event on the default
+// EventBridge bus (`lambda/src/lib/admin-notice.ts`). No core stack names the admin channel: the
+// `AdminServices` stack, present with the `admin` capability, owns the one rule that posts alerts into it.
 
-// 3. Analytics Stack - conditionally Athena or Aurora mode
-let analyticsStack: IAnalyticsStackOutputs & cdk.Stack;
-let auroraStackForDrift: AnalyticsStackAurora | undefined;
+// 3. Conversations: the shared conversation state, the attachments bucket and the feedback table, and
+// the routes that create and change them. It takes the roles it grants on its own resources from
+// Identity by reference, so the grants sit with the resources and Identity takes nothing back.
+const conversationsStack = new ConversationsStack(app, stackId('Conversations'), {
+  env,
+  appInstanceArn: messagingStack.appInstanceArn,
+  selfPoolId: identityStack.selfPoolId,
+  offboardingRoleArn: identityStack.offboardingRoleArn,
+  // The guest issuer's grants on this stack's resources (its token kinds, its address rows, its creator).
+  credentialExchangeRoleArn: identityStack.credentialExchangeRoleArn,
+  // Invitations (M-10): the exchange mints each invitee, a declared invitation-link issuer names where a
+  // link session may be vended, and the invitation email comes from the deployment's one sender.
+  credentialExchangeFunctionArn: identityStack.credentialExchangeFunction.functionArn,
+  invitationLinkReach: identityStack.invitationLinkReach,
+  // The invitation and claim emails are sent by Notifications, named to the functions that issue them with `notifications`.
+  transactionalMail: capabilities.has('notifications'),
+  description: 'Conversations: task, profile, context, turn and feedback tables, attachments, and their routes',
+});
+
+// 4. Archive: the conversation archive, Athena or Aurora (`analyticsMode`), under one stack name. It
+// consumes the Messaging stack's stream and emits an `AnalyticsMode` output naming which it is.
+let archiveStack: IArchiveStackOutputs & cdk.Stack;
+let auroraStackForDrift: ArchiveStackAurora | undefined;
 
 if (analyticsMode === 'aurora') {
-  const auroraStack = new AnalyticsStackAurora(app, `${STACK_PREFIX}AnalyticsAurora`, {
+  const auroraStack = new ArchiveStackAurora(app, stackId('Archive'), {
     env,
-    appInstanceArn: chimeStack.appInstanceArn,
-    userPoolId: cognitoStack.userPool.userPoolId,
-    // A14: the admins sign-on role that gets execute-api teeth on the analytics
-    // read plane when adminIamEnforcement is on, plus the opt-in persona roles.
-    adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
-    adminPersonaRoleArns: cognitoStack.adminPersonaRoleArns,
-    // A14 Scoped: role -> ceiling map so the analytics handler resolves the caller's ceiling
-    // from their assumed-role ARN (no Cognito call from the isolated VPC).
-    classificationRoleCeilings: cognitoStack.classificationRoleCeilings,
-    // Thumbs per-variant join: the analytics Lambda scans the feedback table at
-    // read time over the VPC DynamoDB endpoint.
-    feedbackTableName: cognitoStack.feedbackTable.tableName,
-    feedbackTableArn: cognitoStack.feedbackTable.tableArn,
-    // Battle-wins join: fold /battle picks in too when /battle is on.
-    // The BattleOutcome table name is resolved at deploy via the battle SSM
-    // contract; bin adds the battle-stack dependency below so it exists first.
-    userPoolArn: cognitoStack.userPool.userPoolArn,
-    enableBattleJoin: enableBattle,
+    appInstanceArn: messagingStack.appInstanceArn,
+    messageStream: messagingStack.messageStream,
+    userPoolId: identityStack.userPool?.userPoolId,
+    userPoolArn: identityStack.userPool?.userPoolArn,
     // Eval runner scores image turns by fetching the generated image from the attachments bucket.
-    attachmentsBucketArnParam,
+    attachmentsBucketArn: conversationsStack.attachmentsBucket.bucketArn,
     membershipAuditEnforce,
-    membershipAuditAlertChannelArn,
     senderEmail: app.node.tryGetContext('senderEmail') as string | undefined,
     // Cost sleep mode (opt-in): auto-pause Aurora after inactivity + admin wake.
     sleepMode,
     sleepAfterIdle,
     sleepCheckRate,
     sleepRecipients,
-    environment,
     vpcId: analyticsVpcId,
     vpcSubnetType: analyticsVpcSubnetType,
     createVpcEndpoints,
     enableRdsProxy,
-    description: 'Analytics pipeline: Kinesis → Aurora PostgreSQL (VPC)',
+    description: 'The conversation archive, Aurora mode: the message stream into Aurora PostgreSQL (VPC)',
   });
-  analyticsStack = auroraStack;
+  archiveStack = auroraStack;
   auroraStackForDrift = auroraStack;
 } else {
-  const athenaStack = new AnalyticsStack(app, `${STACK_PREFIX}Analytics`, {
+  archiveStack = new ArchiveStack(app, stackId('Archive'), {
     env,
-    appInstanceArn: chimeStack.appInstanceArn,
-    userPool: cognitoStack.userPool,
-    adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
-    classificationRoleCeilings: cognitoStack.classificationRoleCeilings,
+    appInstanceArn: messagingStack.appInstanceArn,
+    messageStream: messagingStack.messageStream,
+    userPool: identityStack.userPool,
+    // The evaluation runner copies a delivered document from the conversation's deliverables into the
+    // archive before grading it (SPEC-EVALUATION FR22).
+    attachmentsBucketArn: conversationsStack.attachmentsBucket.bucketArn,
     membershipAuditEnforce,
-    membershipAuditAlertChannelArn,
     senderEmail: app.node.tryGetContext('senderEmail') as string | undefined,
-    description: 'Analytics pipeline: Kinesis → S3 → Athena',
+    description: 'The conversation archive, Athena mode: the message stream through Firehose into S3 and Athena',
   });
-  analyticsStack = athenaStack as unknown as IAnalyticsStackOutputs & cdk.Stack;
 }
 
-// The Aurora-drift hookup passed to EVERY per-tier stack when drift is on (Aurora
-// mode). Each tier grants its agent handler invoke access to the retrieval +
-// drift data-plane Lambda via `auroraDriftWiring`; the handler stays non-VPC
-// (ADR-013).
-const auroraDriftHookup = enableLiveDrift && auroraStackForDrift
-  ? {
-      dataPlaneArn: auroraStackForDrift.dataPlaneLambdaArn,
-    }
+// The archive in Aurora mode, passed to EVERY assistant stack: each builds its own turn data plane and classifier
+// replay in the archive's VPC, and with live drift grants its agent handler invoke access to its own turn data
+// plane (`auroraDriftWiring`); the handler stays non-VPC (ADR-013).
+const auroraDriftHookup = auroraStackForDrift
+  ? { rdsProxy: enableRdsProxy, liveDrift: enableLiveDrift }
   : undefined;
 
-// 4. S3 Storage Stack - File Attachments
-const s3Stack = new S3StorageStack(app, `${STACK_PREFIX}S3Storage`, {
-  env,
-  appInstanceArn: chimeStack.appInstanceArn,
-  userPool: cognitoStack.userPool,
-  exchangeRoleAdminPlaneArn: cognitoStack.exchangeRoleAdminPlaneArn,
-  attachmentsBucketArnParam,
-  description: 'S3 storage for file attachments with Cognito-authorized API',
-});
+// THE CORE'S DEPLOY ORDER: Messaging, Identity, Conversations, Archive. Every edge but the last is
+// already a construct reference (the app instance, the stream, the pool, the roles); each is declared
+// as well, so the order reads here.
+identityStack.addDependency(messagingStack);
+conversationsStack.addDependency(messagingStack);
+conversationsStack.addDependency(identityStack); // the roles it grants on its resources
+archiveStack.addDependency(messagingStack); // the stream it consumes
+archiveStack.addDependency(identityStack); // the pool the membership audit reads
+// DECLARED, NOT A REFERENCE, IN ATHENA MODE. The Aurora archive references the attachments bucket; the
+// Athena archive reads nothing of Conversations. The edge is declared in both
+// modes so the core deploys in one order whichever archive runs, and a failed first install names the
+// same first stack in either mode.
+archiveStack.addDependency(conversationsStack);
 
-// 5. Foundations Stack — the shared task data plane + create-conversation/add-agent.
-// It hosts no bot; the assistants live in the per-tier AgentEchelonClassification-* stacks,
-// /battle in AgentEchelonBattle, and experiments in AgentEchelonExperiments.
-//
-// NOTE: live-drift (Aurora pgvector) runs in the per-tier user-message path for
-// ALL tiers (conversation-level, on-by-default — NOT premium-only). See
-// docs/SPEC-DRIFT-CONVERGENCE.md.
-const foundationsStack = new FoundationsStack(app, `${STACK_PREFIX}Foundations`, {
-  env,
-  appInstanceArn: chimeStack.appInstanceArn,
-  userPoolId: cognitoStack.userPool.userPoolId,
-  // The feedback API moved here from CognitoAuthStack (D1): it is a product feature with no identity
-  // relationship. It needs the pool only for its authorizer, and the TABLE stays in CognitoAuthStack
-  // because moving a DynamoDB table between stacks replaces it and loses the data.
-  userPool: cognitoStack.userPool,
-  feedbackTable: cognitoStack.feedbackTable,
-  description: 'Shared foundation: task tables + create-conversation/add-agent + user feedback',
-});
-
-// 5b. Experiments Stack — A/B experiments table + admin-experiments API.
-// Always deployed (cheap: one on-demand table + one Lambda). Publishes the
-// experiments SSM contract the per-tier processors/handlers + AgentEchelonBattle
-// resolve.
-const experimentsStack = new ExperimentsStack(app, `${STACK_PREFIX}Experiments`, {
-  env,
-  appInstanceArn: chimeStack.appInstanceArn,
-  userPoolId: cognitoStack.userPool.userPoolId,
+const settings: DeploymentSettings = {
   appUrl,
-  adminSignOnRoleArn: cognitoStack.adminSignOnRoleArn,
-  adminPersonaRoleArns: cognitoStack.adminPersonaRoleArns,
-  // manage-profiles keeps profile personas in the attachments bucket under `profiles/*` so a version's
-  // persona is bounded by its own limit rather than by the SSM parameter it used to live inside.
-  attachmentsBucketArnParam,
-  description: 'A/B experiments table + admin-experiments API (VITE_EXPERIMENTS_API_URL)',
-});
-experimentsStack.addDependency(chimeStack);
-experimentsStack.addDependency(cognitoStack);
-
-// 6. Notification Stack - SES email identity + conversation sharing
-const notificationStack = new NotificationStack(app, `${STACK_PREFIX}Notifications`, {
-  env,
-  appInstanceArn: chimeStack.appInstanceArn,
-  userPoolId: cognitoStack.userPool.userPoolId,
   senderEmail,
   senderEmailPreVerified,
-  appUrl,
-  description: 'Email notifications for conversation sharing',
-});
+  enableManagedWaf,
+  wafRateLimit,
+  wafAllowedIps,
+  // THE EMAIL BRIDGE'S POOLS COME FROM THE TRUSTED-ISSUER REGISTRY: a recipient's contact is resolved in
+  // directory of the issuer they signed in through (C5). The bridge exists with the notifications
+  // capability, when some trusted issuer's directory holds contacts (a pool, or the claims copy).
+  notifyBridge: issuers.entries.some((e) => directoryOf(e) !== 'none'),
+  notifyAdditionalUserPoolIds: issuers.otherPoolIds(),
+  // The group that marks an admin of this deployment's own pool: the registry's `deployment` entry's
+  // `adminGroups` (ADMIN-INTEGRATION-GUIDE); default 'admins'.
+  adminGroupName: issuers.deploymentAdminGroups()?.[0],
+  widgetHostOrigin: widgetHostStack?.origin,
+};
+const core: CoreStacks = {
+  messaging: messagingStack,
+  identity: identityStack,
+  conversations: conversationsStack,
+  archive: archiveStack,
+  aurora: auroraStackForDrift,
+};
+const capabilityStacks = new Map<string, cdk.Stack>();
 
-// 7. (removed) The per-tier IAMPolicies stack was inert scaffolding — its policies gated on
-// aws:PrincipalTag/tier (never populated) with a non-IAM `chime-sdk-messaging:` action prefix, and
-// were attached to no principal. The LIVE Layer-1 boundary is aws:ResourceTag/classification on the
-// per-tier processor + credential-exchange roles (agent-classification-common.classificationChannelScopedAllow); the
-// model allowlist is the processor role's own Bedrock grant. Deleted per SPEC-CAPABILITY-PROFILES §D-2.
 
-// 8b. Per-tier stacks (docs/SPEC-PER-PROFILE-OWNERSHIP.md, ADR-011) — each tier is
-// an independently-deployable stack a separate team can own end-to-end: the
-// async-processor (the assistant — a self-hosted Converse tool loop, no Bedrock
-// Agent) + its tier-scoped context S3 IAM + content guardrail + Lex bot
-// (WelcomeIntent + FallbackIntent → shared router) + AppInstanceBot. SSM
-// publishes /agent-echelon/tier/{tier}/{processor-arn, bot-arn}; the shared
-// router dispatches to the processor and create-conversation adds the right tier
-// bot to a new channel.
+// ── THE ASSISTANT STACKS, ONE PER DECLARED CLASSIFICATION ─────────────────────────────────────────
 //
-// standard/premium resolve the shared task/battle/experiment tables + battle
-// orchestrator from the /agent-echelon/shared/* SSM contract (each tier stack
-// self-resolves at deploy via valueForStringParameter — an SSM dynamic ref, NOT
-// Fn::importValue), so each tier deploys decoupled.
+// Each classification the profile registry declares with a `topology` gets one
+// `Assistants-<classification>` stack (ADR-057), so the set comes from `lib/config/profiles.ts` and is
+// never listed here. Each owns its async processor (a self-hosted Converse tool loop, no Bedrock
+// Agent), its context IAM, content guardrail, Lex bot (WelcomeIntent + FallbackIntent → the router)
+// and AppInstanceBot, and publishes ${SSM_ROOT}/assistant/{classification}/{processor-arn, bot-arn, ...}.
 //
-// Classification-as-class, not classification-as-parameter — each classification is its own file
-// (basic-classification-stack.ts / standard-classification-stack.ts / premium-classification-stack.ts),
-// so a classification-team change reviews + ships only that classification. Shared constants live in
-// lib/stacks/agent-classification-common.ts.
 // ── Image-generation guardrails in the regions the MODELS live in ──────────────
 //
 // Bedrock guardrails are REGIONAL and Bedrock does not offer every image model in every region:
@@ -471,10 +527,10 @@ const imageModelRegions = [...new Set(
 
 const imageGuardrailStacks = imageModelRegions.map((region) => new ImageGuardrailStack(
   app,
-  `${STACK_PREFIX}ImageGuardrail-${region}`,
+  stackId(`ImageGuardrail-${region}`),
   {
     env: { account: env.account, region },
-    // The classification stacks read this stack's outputs across regions; CDK needs this on BOTH
+    // The assistant stacks read this stack's outputs across regions; CDK needs this on BOTH
     // sides to generate the SSM-backed cross-region export.
     crossRegionReferences: true,
     guardrailName: `${RES_PREFIX}-image-guardrail-${region}`,
@@ -491,23 +547,20 @@ imageModelRegions.forEach((region, i) => {
   };
 });
 
-const classificationSharedProps = {
+const assistantsSharedProps = {
   env,
   crossRegionReferences: true,
   imageGuardrailByRegion,
-  appInstanceArn: chimeStack.appInstanceArn,
-  attachmentsBucketName: s3Stack.attachmentsBucket.bucketName,
-  attachmentsBucketArn: s3Stack.attachmentsBucket.bucketArn,
-  profileModelSelection,
-  // Admin error-alert channel (CH parity): the async processor posts a failure here and the
-  // channel flow emails the admin roster. Reuses the same admin conversation as the membership
-  // audit. Undefined/empty ⇒ processor error alerting is log-only.
-  adminErrorAlertChannelArn: membershipAuditAlertChannelArn,
-  // standard/premium resolve the battle SSM contract AgentEchelonBattle publishes
-  // ONLY when /battle is deployed; basic ignores this. False ⇒ no battle plumbing.
-  enableBattle,
-  // Live drift (Aurora mode, on-by-default, all-classification). Undefined in Athena mode ⇒
-  // the classification wires no drift. Each classification VPC-attaches its handler to Aurora.
+  appInstanceArn: messagingStack.appInstanceArn,
+  attachmentsBucketName: conversationsStack.attachmentsBucket.bucketName,
+  attachmentsBucketArn: conversationsStack.attachmentsBucket.bucketArn,
+  // The battle and experiments tables are NAMED to the functions that use them when those capabilities are
+  // declared (`CAPABILITY_RESOURCES`); their stacks deploy after this one and attach the grants.
+  battle: capabilities.has('battle'),
+  experiments: capabilities.has('experiments'),
+  // An observability role reads the alarms of the declared capabilities' stacks beside the core's.
+  capabilities: capabilities.names,
+  // Live drift (Aurora mode, all-classification). Undefined in Athena mode ⇒ no drift wiring.
   auroraDriftHookup,
   // Out-of-band per-message analytics (SPEC-MESSAGE-METADATA-CODEBOOK.md Phase 1).
   // Aurora mode only — the table lives in the Aurora stack (its archival Lambda is
@@ -521,178 +574,99 @@ const classificationSharedProps = {
         tableArn: auroraStackForDrift.messageAnalyticsTableArn,
       }
     : undefined,
+  // Each classification's vend role trusts the credential exchange's own role, and nothing else.
+  credentialExchangeRoleArn: identityStack.credentialExchangeRoleArn,
 };
 
-const classificationBasicStack = new BasicClassificationStack(app, `${STACK_PREFIX}Classification-Basic`, {
-  ...classificationSharedProps,
-  description: 'AgentEchelon basic-classification assistant — async-processor + Lex bot + classification context IAM + guardrail',
+const assistantStacks = assistantClassificationValues.map((classification) => {
+  const stack = new AssistantsStack(app, stackId(assistantsStackName(classification)), {
+    ...assistantsSharedProps,
+    classification,
+    description: `AgentEchelon ${classification}-classification assistants — async-processor + Lex bot + classification context IAM + guardrail`,
+  });
+  // Deploy ordering: the assistant stacks resolve the shared ${SSM_ROOT}/shared/* parameters at deploy
+  // (the task tables from Conversations), so their publisher deploys first. The experiments and battle
+  // stacks deploy AFTER this one: they attach to it.
+  stack.addDependency(conversationsStack);
+  // Its seed asks the provisioner, in Messaging, for its declared assistants at deploy (by the provisioner's fixed
+  // name, so no value crosses): the provisioner exists before any classification deploys.
+  stack.addDependency(messagingStack);
+  return stack;
 });
-const classificationStandardStack = new StandardClassificationStack(app, `${STACK_PREFIX}Classification-Standard`, {
-  ...classificationSharedProps,
-  description: 'AgentEchelon standard-classification assistant — async-processor + Lex bot + classification context IAM + guardrail',
-});
-const classificationPremiumStack = new PremiumClassificationStack(app, `${STACK_PREFIX}Classification-Premium`, {
-  ...classificationSharedProps,
-  description: 'AgentEchelon premium-classification assistant — async-processor (+/battle) + Lex bot + classification context IAM + guardrails',
-});
-
-// Deploy-ordering only: standard/premium consume the shared /agent-echelon/
-// shared/* SSM params — TASK tables from AgentEchelonFoundations, experiments from
-// AgentEchelonExperiments — so both must deploy first. No Fn::importValue on the
-// shared params; these explicit dependencies just guarantee they exist at deploy.
-for (const classificationStack of [classificationBasicStack, classificationStandardStack, classificationPremiumStack]) {
-  classificationStack.addDependency(foundationsStack);
-  classificationStack.addDependency(experimentsStack);
-}
-
-// 8c. Battle Stack (opt-in) — /battle alt-slots, orchestrator, tables, APIs.
-// Deploys AFTER AgentEchelonExperiments (channel-battle reads the experiments SSM it
-// publishes) and BEFORE the per-tier stacks (which consume the battle SSM this publishes).
-const battleStack = enableBattle
-  ? new BattleStack(app, `${STACK_PREFIX}Battle`, {
-      env,
-      appInstanceArn: chimeStack.appInstanceArn,
-      userPoolId: cognitoStack.userPool.userPoolId,
-      appUrl,
-      description: 'AgentEchelon /battle — alt-slots + orchestrator + tables + channel-battle API (opt-in)',
-    })
-  : undefined;
-if (battleStack) {
-  battleStack.addDependency(chimeStack);
-  battleStack.addDependency(cognitoStack); // channel-battle API authorizer
-  battleStack.addDependency(experimentsStack); // channel-battle resolves experiments SSM at deploy
-  // Per-tier stacks consume the battle SSM this stack publishes.
-  classificationStandardStack.addDependency(battleStack);
-  classificationPremiumStack.addDependency(battleStack);
-  // Aurora analytics resolves the BattleOutcome table NAME from the battle SSM
-  // contract at DEPLOY time for the battle-wins join — so battle must deploy
-  // first. (No cycle: battle depends only on chime/cognito/experiments, none of
-  // which depend on Aurora.)
-  if (auroraStackForDrift) {
-    auroraStackForDrift.addDependency(battleStack);
-    // The eval runner reads generated battle images from the attachments bucket; it resolves that
-    // bucket's ARN from the SSM param the S3 stack publishes, so S3 must deploy first (fresh deploys).
-    auroraStackForDrift.addDependency(s3Stack);
-  }
-}
 
 // 9. Channel Flow Stack — @all + /battle routing and message filtering
-const channelFlowStack = new ChannelFlowStack(app, `${STACK_PREFIX}ChannelFlow`, {
+const channelFlowStack = new ChannelFlowStack(app, stackId('ChannelFlow'), {
   env,
-  appInstanceArn: chimeStack.appInstanceArn,
-  // @all + /battle fan-out target the per-tier processors, which ChannelFlow
-  // self-resolves from /agent-echelon/tier/{standard,premium}/processor-arn
-  // (SSM). The battle tables come from the opt-in AgentEchelonBattle stack; when
-  // /battle is off these are undefined and channel-flow runs without battle.
-  battleStateTableName: battleStack?.battleStateTableName,
-  battleStateTableArn: battleStack?.battleStateTableArn,
-  channelBattleConfigTableName: battleStack?.channelBattleConfigTableName,
-  channelBattleConfigTableArn: battleStack?.channelBattleConfigTableArn,
-  // /battle generation-out: the fan-out reads the ExperimentsTable (Scan) to resolve a
-  // battle's per-variant image-gen models. Without it, loadExperiments() returns [] inside
-  // channel-flow and every image battle silently falls through to a text battle.
-  experimentsTableName: experimentsStack.experimentsTableName,
-  experimentsTableArn: experimentsStack.experimentsTableArn,
-  // Notification bridge (SPEC-NOTIFICATION-BRIDGE P1, outbound): the processor resolves
-  // participant emails from the IDP by sub and fans a notify-tagged message out over SES.
-  // Federated users live in the HOST pool (federatedUserPoolId), not the AE platform pool —
-  // a notify-tagged bot message carries host-pool subs, so AdminGetUser must target that pool.
-  // Absent (non-federated deployment) ⇒ bridge stays inert (no env, no IAM).
-  userPoolId: app.node.tryGetContext('federatedUserPoolId') as string | undefined,
-  // Multi-IDP: extra trusted pools whose issuers a notify target may resolve to. Comma-separated
-  // context value; empty for a single-IDP deployment.
-  additionalUserPoolIds: ((app.node.tryGetContext('notifyAdditionalUserPoolIds') as string | undefined) || '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-  senderEmail,
+  appInstanceArn: messagingStack.appInstanceArn,
+  // @all + /battle fan-out target the classifications' routers, which ChannelFlow finds by name at call
+  // time. The battle tables, and the experiments table a duel's fan-out reads for its per-variant
+  // image models, are named to it when declared; their stacks attach the grants to its role.
+  battle: capabilities.has('battle'),
+  experiments: capabilities.has('experiments'),
+  // NO SENDER-CLEARANCE POOL (`userPoolId` absent). The /battle abuse gate meters at the channel's
+  // classification (`channel-flow-processor.ts`), so the flow reads no sender's groups. The notification
+  // fan-out runs on the message stream (ADR-041 decision 7), on the post-processing stack.
+  // The flow resolves the active profile version for the copy of the notices it sends itself, and a
+  // version's persona body lives under `profiles/*` in this bucket.
+  attachmentsBucketName: conversationsStack.attachmentsBucket.bucketName,
+  attachmentsBucketArn: conversationsStack.attachmentsBucket.bucketArn,
   description: 'Channel Flow Processor for @all and /battle routing',
 });
-// The /battle generation-out fan-out reads the ExperimentsTable at runtime; ensure the
-// table exists before ChannelFlow deploys (env var + read grant reference its name/ARN).
-channelFlowStack.addDependency(experimentsStack);
+channelFlowStack.addDependency(messagingStack);
+channelFlowStack.addDependency(conversationsStack); // the shared tables it resolves at deploy (resolveSharedSSM)
+// NOT AFTER THE ASSISTANT STACKS: @all, /battle and the task-service dispatch find each classification's
+// router and task service by name at call time, so no deploy-time value comes from them and a classification
+// is deployed or removed on its own.
 
 // 9b. Post-processing — what the platform does with a message AFTER delivery (ADR-032 tenet 4): one
 // consumer on the message stream, acting on messages delivery did not route. Deliberately NOT in the
 // channel flow, which is synchronous and runs on every message: a correction for a state that should
-// not exist must cost time only in the broken case. It goes AFTER the stacks whose SSM contract it
-// resolves at deploy (the tasks table from Foundations, the router ARNs from the classifications),
-// which is also why it cannot live in the analytics stacks - those deploy before both.
-const postProcessingStack = new PostProcessingStack(app, `${STACK_PREFIX}PostProcessing`, {
+// not exist must cost time only in the broken case. It goes AFTER the stack whose SSM contract it
+// resolves at deploy (the tasks table from Conversations) and finds the routers by name at call time, so it
+// deploys before, or without, any one classification's stack. Email is not here: the email bridge is the Notifications stack's own consumer on the same stream.
+const postProcessingStack = new PostProcessingStack(app, stackId('PostProcessing'), {
   env,
-  appInstanceArn: chimeStack.appInstanceArn,
-  // Both analytics modes create the Chime message stream and push the same streaming configuration,
-  // so this resolves identically whichever mode is deployed.
-  kinesisStreamArn: analyticsStack.kinesisStreamArn,
-  description: 'Post-processing on the message stream: acts on messages delivery did not route',
+  appInstanceArn: messagingStack.appInstanceArn,
+  messageStream: messagingStack.messageStream,
+  attachmentsBucketName: conversationsStack.attachmentsBucket.bucketName,
+  attachmentsBucketArn: conversationsStack.attachmentsBucket.bucketArn,
+  description: 'Post-processing on the message stream: the rules that act on messages delivery did not route',
 });
-postProcessingStack.addDependency(analyticsStack); // the stream it consumes
-postProcessingStack.addDependency(foundationsStack); // the tasks + abuse-controls tables (SSM, at deploy)
-postProcessingStack.addDependency(classificationStandardStack); // the router ARNs it dispatches to
-postProcessingStack.addDependency(classificationPremiumStack);
-postProcessingStack.addDependency(classificationBasicStack);
+postProcessingStack.addDependency(messagingStack); // the stream it consumes
+postProcessingStack.addDependency(conversationsStack); // the tasks + abuse-controls tables (SSM, at deploy)
+// Not after the assistant stacks: the routers it dispatches to are found by name at call time.
 
-// Frontend hosting — the DEFAULT production path for the SPA (CloudFront + S3).
-// Independent of every other stack: it provisions an empty bucket + CloudFront
-// distribution only. The Vite build is synced out-of-band after the rest of
-// the app deploys (it bakes in this app's CDK outputs) via
-// `backend/scripts/deploy-frontend.mjs`. See docs/FRONTEND-DEPLOY.md.
-const frontendStack = new FrontendStack(app, `${STACK_PREFIX}Frontend`, {
+// ── CAPABILITIES ON THE CORE (`surface` stage) ──────────────────────────────────────────────────
+//
+// The chat app, the admin backend and console, and email, each wired to the core and the assistant
+// stacks it reads, and the admin backend to the capabilities it administers. Nothing in the core depends
+// on them.
+buildCapabilities('surface', {
+  app, env, prefix: STACK_PREFIX, declared: capabilities, classifications: assistantClassificationValues,
+  settings, core, assistants: assistantStacks, channelFlow: channelFlowStack,
+}, capabilityStacks);
+
+// ── THE PERSON API (D11) ─────────────────────────────────────────────────────────────────────────────
+//
+// Every route a person calls, on one HTTP API behind the edge authorizer. Built last, on every stack that
+// declares person routes: the core's and each declared capability's. A capability that is not declared
+// has no stack, and so no route here.
+const personRouteSources = [identityStack, conversationsStack, archiveStack, ...capabilityStacks.values()]
+  .filter((s) => isRouteSource(s) && s.routes.some((r) => r.api === 'person'));
+const personApiStack = new PersonApiStack(app, stackId('PersonApi'), {
   env,
-  enableManagedWaf,
-  wafRateLimit,
-  wafAllowedIps,
-  description: 'CloudFront + S3 hosting for the AgentEchelon SPA',
+  routes: routesFor('person', personRouteSources),
+  appInstanceArn: messagingStack.appInstanceArn,
+  selfPoolId: identityStack.selfPoolId,
+  selfClientIds: identityStack.selfClientIds,
+  identities: identityStack.identitiesTable,
+  guestSigningKeys: identityStack.guestSigningKeys,
+  tokens: conversationsStack.tokensTable,
+  // Each conversation type's transports and capabilities against the declared list (T4): a gap degrades and is recorded.
+  conversationTypeGaps: typeCapabilityGaps(capabilities.names).map(describeGap),
+  description: 'The person API: every route a person calls, behind the edge authorizer',
 });
-void frontendStack;
-
-// Admin console hosting — the separate operator-interface origin (layer 4 of the
-// four-layer deploy ordering; DESIGN-SEPARATE-ADMIN-APP.md). Opt-in and independent:
-// its own S3 + CloudFront serving admin.html (dist-admin/), 'Admin*'-prefixed
-// outputs so they don't collide with the chat stack's. The admin UI is synced
-// separately (deploy-frontend.mjs, admin target); after it deploys, redeploy the
-// backend with `--context adminAppUrl=<AdminDistributionUrl>` so the admin APIs'
-// CORS trusts the admin origin.
-const adminFrontendStack = enableAdminApp
-  ? new FrontendStack(app, `${STACK_PREFIX}AdminFrontend`, {
-      env,
-      enableManagedWaf,
-      wafRateLimit,
-      wafAllowedIps,
-      // The admin app is its own workspace package (@ae/admin) and builds a
-      // standard index.html, so the default root document applies.
-      outputPrefix: 'Admin',
-      description: 'CloudFront + S3 hosting for the standalone AgentEchelon admin console',
-    })
-  : undefined;
-void adminFrontendStack;
-
-// Add stack dependencies
-analyticsStack.addDependency(chimeStack);
-cognitoStack.addDependency(chimeStack);
-s3Stack.addDependency(chimeStack);
-foundationsStack.addDependency(chimeStack);
-// ANALYTICS AFTER FOUNDATIONS, and the direction is load-bearing on a FRESH account: the Aurora
-// stack resolves the shared channel-context SSM parameters at deploy time
-// (valueForStringParameter), and Foundations is what CREATES them. The reverse dependency this
-// replaces shipped in the initial commit with no consumer - Foundations takes nothing from
-// analytics - and made every new deployer's first deploy fail with "SSM parameter not available"
-// while staying green on any account whose parameters already existed.
-analyticsStack.addDependency(foundationsStack);
-foundationsStack.addDependency(cognitoStack); // create-conversation reads user groups for tier gate
-channelFlowStack.addDependency(chimeStack);
-channelFlowStack.addDependency(foundationsStack); // create-conversation channel-flow ARN + bot ARN in SSM
-// @all + /battle fan-out resolve the standard/premium tier processor ARNs from
-// SSM at deploy, so those tier stacks must publish first.
-channelFlowStack.addDependency(classificationStandardStack);
-channelFlowStack.addDependency(classificationPremiumStack);
-// The battle tables ChannelFlow reads come from AgentEchelonBattle (cross-stack token
-// reference already implies this edge; explicit for clarity).
-if (battleStack) {
-  channelFlowStack.addDependency(battleStack);
-}
-notificationStack.addDependency(chimeStack);
-notificationStack.addDependency(cognitoStack);
+for (const source of personRouteSources) personApiStack.addDependency(source);
 
 // Standard cost-attribution tags, applied ONCE at the app root. Project is DERIVED from the
 // deployment identity (STACK_PREFIX ← AE_INSTANCE_NAME) so the same platform code deployed as
@@ -705,5 +679,14 @@ applyStandardTags(app, {
   instance: INSTANCE_NAME,
   environment,
 });
+
+// Every alarm the app declares is published by name in the stack that owns it, so the ops assistant reads
+// alarm state by name under a grant scoped to this deployment's alarms (`lib/constructs/alarm-names.ts`).
+publishAlarmNames(app, SSM_ROOT);
+
+// Every role's inline policies stay under IAM's per-role limit, measured on this synth's own template
+// (context, cross-stack tokens and the owner-team aspect included), so a deploy that would cross it fails
+// here rather than mid-update in CloudFormation.
+enforceInlinePolicyBudget(app);
 
 app.synth();

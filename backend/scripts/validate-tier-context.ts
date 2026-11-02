@@ -88,7 +88,7 @@ async function runTier(tier: 'basic' | 'premium'): Promise<void> {
       correlationId,
       userMessage: QUESTION,
       userName: 'Validator',
-      userType: tier,
+      classification: tier,
       botArn: BOT_ARN,
       senderArn: BOT_ARN,
     })),

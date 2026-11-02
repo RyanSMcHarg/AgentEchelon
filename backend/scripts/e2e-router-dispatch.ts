@@ -23,12 +23,14 @@ import {
 } from '@aws-sdk/client-chime-sdk-messaging';
 import { LambdaClient, InvokeCommand } from '@aws-sdk/client-lambda';
 import { randomUUID } from 'crypto';
+import { userArnFor } from '../lambda/src/lib/person-arn.js';
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN!;
 const BOT_ARN = process.env.BOT_ARN!;
 const ROUTER_FN = process.env.ROUTER_FN!;
-const CLASSIFICATION = process.env.CLASSIFICATION || 'basic';
+// No default: a classification is set or not (ADR-046).
+const CLASSIFICATION = (process.env.CLASSIFICATION || '').trim();
 const QUESTION = 'What products does the company offer? Keep it to 2 sentences.';
 
 const chime = new ChimeSDKMessagingClient({ region });
@@ -37,8 +39,8 @@ const lambda = new LambdaClient({ region });
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
 async function main(): Promise<void> {
-  if (!APP_INSTANCE_ARN || !BOT_ARN || !ROUTER_FN) {
-    throw new Error('Set APP_INSTANCE_ARN, BOT_ARN, ROUTER_FN');
+  if (!APP_INSTANCE_ARN || !BOT_ARN || !ROUTER_FN || !CLASSIFICATION) {
+    throw new Error('Set APP_INSTANCE_ARN, BOT_ARN, ROUTER_FN, CLASSIFICATION');
   }
   console.log(`E2E router dispatch — classification=${CLASSIFICATION}\nQ: ${QUESTION}`);
 
@@ -63,7 +65,7 @@ async function main(): Promise<void> {
       sessionState: { intent: { name: 'FallbackIntent' } },
       requestAttributes: {
         'CHIME.channel.arn': channelArn,
-        'CHIME.sender.arn': `${APP_INSTANCE_ARN}/user/e2e-test-user`,
+        'CHIME.sender.arn': userArnFor(APP_INSTANCE_ARN, 'e2e-test-user'),
         'CHIME.message.id': messageId,
       },
     })),

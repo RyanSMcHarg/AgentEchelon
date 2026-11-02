@@ -14,7 +14,7 @@
  * guards nothing. What went wrong here was one CALL SITE omitting one option, so the guard is at the
  * call-site level: every `createTask(` in the router must state the assistant, either directly
  * (`assistantId:`) or through an assistant owner. The e2e that caught it (task-answer.spec.ts:117)
- * remains the behavioural check; this is the cheap ratchet that fails in the same commit that
+ * remains the behavioral check; this is the cheap ratchet that fails in the same commit that
  * reintroduces the omission.
  */
 import * as fs from 'fs';

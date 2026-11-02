@@ -22,41 +22,43 @@
 import {
   LambdaClient,
   InvokeCommand,
-  ListFunctionsCommand,
   GetFunctionConfigurationCommand,
 } from '@aws-sdk/client-lambda';
+import { CloudFormationClient } from '@aws-sdk/client-cloudformation';
+import { createRequire } from 'node:module';
+
+const require = createRequire(import.meta.url);
+const { resolveStackPrefix } = require('./lib/stack-lookup.cjs');
+const { listStackNames, classificationStacksAmong, physicalIdsIn } = require('./lib/stack-resources.cjs');
 
 const REGION = process.env.AWS_REGION || 'us-east-1';
 const lambda = new LambdaClient({ region: REGION });
+const cfn = new CloudFormationClient({ region: REGION });
 
 const args = process.argv.slice(2);
 const resetEvals = args.includes('--reset-evals');
 const arnArg = args.find((a) => a.startsWith('--arn='))?.slice('--arn='.length);
 
 /**
- * Find the data-plane Lambda ARN. Prefer reading it off an AgentEchelon tier
- * handler's AURORA_DATA_PLANE_ARN env (authoritative — it is the ARN the live
- * request path uses). Fall back to a name-scoped function scan.
+ * Find the data-plane Lambda ARN. Prefer the Archive stack's own data-plane function (Aurora mode); else
+ * read it off a classification handler's AURORA_DATA_PLANE_ARN env (the ARN the live request path
+ * uses). Both are read from this deployment's stacks, never matched on generated function names
+ * (scripts/lib/stack-resources.cjs), so another instance in the account is never picked up.
  */
 async function resolveDataPlaneArn() {
   if (arnArg) return arnArg;
 
-  let marker;
-  const candidates = [];
-  do {
-    const page = await lambda.send(
-      new ListFunctionsCommand({ Marker: marker, MaxItems: 50 }),
-    );
-    for (const fn of page.Functions || []) {
-      const name = fn.FunctionName || '';
-      // Multi-project account: scope hard to AgentEchelon to avoid look-alikes.
-      if (!name.includes('AgentEchelon')) continue;
-      if (/AgentHandler|Tier/.test(name)) candidates.push(name);
-      if (/DataPlane/.test(name)) return fn.FunctionArn;
-    }
-    marker = page.NextMarker;
-  } while (marker);
+  const prefix = resolveStackPrefix(process.env);
+  const fnArn = async (name) =>
+    (await lambda.send(new GetFunctionConfigurationCommand({ FunctionName: name }))).FunctionArn;
 
+  const [dataPlane] = await physicalIdsIn(cfn, [`${prefix}Archive`], {
+    type: 'AWS::Lambda::Function', logicalId: /^DataPlaneLambda/,
+  }).catch(() => []);
+  if (dataPlane) return fnArn(dataPlane);
+
+  const stacks = classificationStacksAmong(await listStackNames(cfn), prefix);
+  const candidates = await physicalIdsIn(cfn, stacks, { type: 'AWS::Lambda::Function', logicalId: /^AgentHandler/ });
   for (const name of candidates) {
     const cfg = await lambda.send(
       new GetFunctionConfigurationCommand({ FunctionName: name }),

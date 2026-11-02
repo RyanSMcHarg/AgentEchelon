@@ -12,13 +12,13 @@
  * The lightweight `modelKey` variant still exists for model-only experiments and is unaffected; the two
  * are mutually exclusive per variant (validated in experiment-manager).
  *
- * Both the router (A/B resolution) and the battle path (alt-slot) call this. READ-ONLY on the assistant
+ * Both the router (A/B resolution) and the battle path (the challenger) call this. READ-ONLY on the assistant
  * definition namespace — reading a definition is behavior, not a boundary (§7), so it never escalates.
  *
  * Fail-safe: any failure (ref missing, param/version absent, malformed) returns null and the caller
  * skips the profileRef variant (falls back to the deterministic default) rather than erroring the turn.
  *
- * NOTE the caller's obligation: §6's classification ceiling binds on the WHOLE definition, not just its
+ * NOTE the caller's obligation: §6's classification boundary binds on the WHOLE definition, not just its
  * model. A version's tools, guardrail selection and context sources must each be checked against the
  * channel's classification before the definition is served, or a variant becomes a way to widen access
  * inside a channel. This module reads; it does not authorize.
@@ -70,6 +70,22 @@ export async function lookupProfileVersion(
     // A definition with no model and no attribution key is not a runnable variant.
     if (!def?.modelKey || !def?.configId) return null;
     return def;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * The concrete version number a ref names: its own `version`, or the version the `active` label points
+ * at now. Null when the profile has no active version or the read fails. Used to PIN a ref that tracks
+ * the label, so what it serves cannot change when someone activates a new version later.
+ */
+export async function concreteProfileVersion(ssm: SSMClient, ssmRoot: string, ref: ProfileRef): Promise<number | null> {
+  if (!ref?.profileName) return null;
+  if (ref.version !== undefined) return ref.version;
+  try {
+    const resp = await ssm.send(new GetParameterCommand({ Name: `${definitionParamName(ssmRoot, ref.profileName)}:active` }));
+    return resp.Parameter?.Version ?? null;
   } catch {
     return null;
   }

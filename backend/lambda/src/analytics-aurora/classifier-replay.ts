@@ -16,12 +16,41 @@
  *    quiet reuse the request was meant to prevent.
  *  - **Fast-path messages are excluded**, because no model is consulted for them (see `fastPathIntent`).
  *  - **Messages with no readable content** cannot be classified at all.
+ *
+ * ── ONE CLASSIFICATION PER RUN, ON THAT CLASSIFICATION'S OWN REACH (tenet D12, ADR-054 decision 5) ──
+ *
+ * A run names its classification and the assistant whose classifier it compares. It reads only that
+ * classification's exchanges answered by that assistant, both candidates must be text models the
+ * classification allows (`modelFits`), and it executes on the classification's own replay function
+ * (`REPLAY_CLASSIFICATION`), whose role can invoke only that classification's models. A function refuses a
+ * run of any other classification, so the payload cannot widen what it reaches. Both candidates classify
+ * against the assistant's served intent pack, recorded on the run when it is opened, which is the
+ * taxonomy a live turn of that assistant classifies against.
  */
 
 import { query } from './db-client.js';
+import { ARCHIVAL_SUFFIX_SQL } from './update-events.js';
 import { classifyIntent, fastPathIntent } from '../lib/intent-classifier.js';
+import type { IntentPack } from '../lib/intent-pack.js';
 import { validateReplayInput, DEFAULT_LIMIT, MAX_LIMIT } from '../lib/classifier-replay-input.js';
 import { getModelCatalog, bedrockInvokeId } from '../../../lib/config/model-strategy.js';
+import { modelFits } from '../../../lib/config/model-availability.js';
+
+/**
+ * The classification this function serves, from its own environment. Read per call so a test can set it.
+ * Empty means the function was deployed without one, and then it runs nothing.
+ */
+const ownClassification = (): string => (process.env.REPLAY_CLASSIFICATION || '').trim();
+
+/** Refuse a run this function may not execute: a different classification, or none at all. */
+function assertOwnClassification(classification: string | null | undefined): string {
+  const own = ownClassification();
+  if (!own) throw new Error('[classifier-replay] this function serves no classification (REPLAY_CLASSIFICATION is unset)');
+  if (classification !== own) {
+    throw new Error(`[classifier-replay] this function runs ${own} replays only; the run is for ${classification || 'no classification'}`);
+  }
+  return own;
+}
 
 /** How many messages to classify at once. Two model calls each, so this is 2x in flight. */
 const REPLAY_CONCURRENCY = 4;
@@ -29,6 +58,12 @@ const REPLAY_CONCURRENCY = 4;
 export interface StartReplayInput {
   incumbentModel: string;
   challengerModel: string;
+  /** The classification the run is in; must be this function's own. */
+  classification: string;
+  /** The assistant whose classifier is compared. Absent ⇒ the classification's primary. */
+  assistant?: string;
+  /** That assistant's served intent pack, resolved by the starter (outside the VPC, where SSM is reachable). */
+  intentPack: IntentPack;
   /**
    * The id to open the run UNDER, minted by the caller that already answered the operator's click.
    * Absent ⇒ the database mints one.
@@ -46,6 +81,9 @@ export interface ReplayRunSummary {
   experimentId: string | null;
   incumbentModel: string;
   challengerModel: string;
+  /** Null on a run opened before runs named one (migration 078). */
+  classification: string | null;
+  assistant: string | null;
   windowStart: string;
   windowEnd: string;
   messagesConsidered: number;
@@ -77,11 +115,18 @@ interface CandidateRow {
  *
  * Retracted rows are returned FLAGGED rather than filtered out, so the run can report how many it
  * declined to replay instead of quietly shrinking.
+ *
+ * ONE CLASSIFICATION AND ONE ASSISTANT. Only exchanges that ran in the run's classification and were
+ * answered by the assistant under test are read: the corpus is that assistant's traffic, and no other
+ * classification's content reaches this function. Both are bound parameters, and the classification is the
+ * function's own (`assertOwnClassification`), not a value the payload chose.
  */
 async function selectCandidates(
   windowStart: string,
   windowEnd: string,
   limit: number,
+  classification: string,
+  assistant: string,
 ): Promise<CandidateRow[]> {
   const res = await query<CandidateRow>(
     `SELECT e.id AS exchange_id,
@@ -92,16 +137,18 @@ async function selectCandidates(
                WHERE x.channel_arn = mu.channel_arn
                  AND x.event_type IN ('REDACT_CHANNEL_MESSAGE','DELETE_CHANNEL_MESSAGE')
                  AND x.message_id IN (
-                       regexp_replace(mu.message_id, '-(UPD|RED|DEL)$', '') || '-RED',
-                       regexp_replace(mu.message_id, '-(UPD|RED|DEL)$', '') || '-DEL')
+                       regexp_replace(mu.message_id, ${ARCHIVAL_SUFFIX_SQL}, '') || '-RED',
+                       regexp_replace(mu.message_id, ${ARCHIVAL_SUFFIX_SQL}, '') || '-DEL')
             ) AS retracted
        FROM exchanges e
        JOIN messages mu ON e.user_message_id = mu.id
       WHERE e.created_at >= $1::timestamptz
         AND e.created_at < $2::timestamptz
+        AND e.conversation_classification = $4
+        AND e.assistant = $5
       ORDER BY e.created_at DESC
       LIMIT $3`,
-    [windowStart, windowEnd, limit],
+    [windowStart, windowEnd, limit, classification, assistant],
   );
   return res.rows || [];
 }
@@ -138,7 +185,15 @@ async function mapLimited<T, R>(items: T[], limit: number, worker: (item: T) => 
  * caller-supplied id there is nothing to return from a fire-and-forget invocation.
  */
 export async function openClassifierReplay(input: StartReplayInput): Promise<ReplayRunSummary> {
-  const { incumbentModel, challengerModel, windowStart, windowEnd, limit } = validateReplayInput(input);
+  const { incumbentModel, challengerModel, classification, assistant, windowStart, windowEnd, limit } = validateReplayInput(input);
+  // Opened only by the function of the run's own classification, so a run can never be recorded under
+  // one classification and executed with another's reach.
+  assertOwnClassification(classification);
+  if (!input.intentPack || !Array.isArray(input.intentPack.intents) || input.intentPack.intents.length === 0) {
+    // The deployment pack would classify against a taxonomy the assistant does not serve, and the
+    // concordance would read as clean while measuring a task neither model performs in production.
+    throw new Error('[classifier-replay] no intent pack: a run classifies against the assistant\'s served pack');
+  }
 
   // `COALESCE($7::uuid, uuid_generate_v4())` rather than two statements: a caller-supplied id is used
   // as given, and the database still mints one when nobody supplied it (matching the column's own
@@ -146,8 +201,10 @@ export async function openClassifierReplay(input: StartReplayInput): Promise<Rep
   // duplicate-key crash that would record a perfectly good run as failed.
   const runRes = await query<{ id: string }>(
     `INSERT INTO classifier_replay_runs
-       (id, experiment_id, incumbent_model, challenger_model, window_start, window_end, started_by, status)
-     VALUES (COALESCE($7::uuid, uuid_generate_v4()), $1, $2, $3, $4::timestamptz, $5::timestamptz, $6, 'running')
+       (id, experiment_id, incumbent_model, challenger_model, window_start, window_end, started_by, status,
+        classification, assistant, intent_pack)
+     VALUES (COALESCE($7::uuid, uuid_generate_v4()), $1, $2, $3, $4::timestamptz, $5::timestamptz, $6, 'running',
+             $8, $9, $10::jsonb)
      ON CONFLICT (id) DO NOTHING
      RETURNING id`,
     [
@@ -158,6 +215,9 @@ export async function openClassifierReplay(input: StartReplayInput): Promise<Rep
       windowEnd.toISOString(),
       input.startedBy || null,
       input.runId || null,
+      classification,
+      assistant,
+      JSON.stringify(input.intentPack),
     ],
   );
   // No RETURNING row means the id was already there (a redelivery). The run exists, which is what
@@ -170,6 +230,8 @@ export async function openClassifierReplay(input: StartReplayInput): Promise<Rep
     experimentId: input.experimentId || null,
     incumbentModel,
     challengerModel,
+    classification,
+    assistant,
     windowStart: windowStart.toISOString(),
     windowEnd: windowEnd.toISOString(),
     messagesConsidered: 0,
@@ -184,22 +246,33 @@ export async function openClassifierReplay(input: StartReplayInput): Promise<Rep
 /**
  * Do the work for an already-open run: replay its window through both classifiers and close it.
  *
- * Reads the run's OWN stored window and models rather than taking them again from the caller, so an
- * async invocation cannot replay a different window from the one the console recorded and showed.
+ * Reads the run's OWN stored window, models, classification, assistant and pack rather than taking them
+ * again from the caller, so an async invocation cannot replay a different window, or another
+ * classification's traffic, from the one the console recorded and showed.
+ *
+ * REFUSES a run of another classification, and a run that names none (one opened before runs did): the
+ * function cannot reach another classification's models, and guessing a classification for an old run
+ * would replay a corpus nobody asked for.
  */
 export async function executeClassifierReplay(runId: string, limit = DEFAULT_LIMIT): Promise<ReplayRunSummary> {
   const res = await query<any>(
-    `SELECT id, experiment_id, incumbent_model, challenger_model, window_start, window_end
+    `SELECT id, experiment_id, incumbent_model, challenger_model, window_start, window_end,
+            classification, assistant, intent_pack
        FROM classifier_replay_runs WHERE id = $1`,
     [runId],
   );
   const r = (res.rows || [])[0];
   if (!r) throw new Error(`[classifier-replay] no such run: ${runId}`);
+  const classification = assertOwnClassification(r.classification ?? null);
+  const intentPack = (typeof r.intent_pack === 'string' ? JSON.parse(r.intent_pack) : r.intent_pack) as IntentPack | null;
   return runReplayBody({
     runId: String(r.id),
     experimentId: r.experiment_id ?? null,
     incumbentModel: String(r.incumbent_model),
     challengerModel: String(r.challenger_model),
+    classification,
+    assistant: String(r.assistant ?? ''),
+    intentPack,
     windowStart: new Date(r.window_start),
     windowEnd: new Date(r.window_end),
     limit: Math.min(Math.max(Number(limit) || DEFAULT_LIMIT, 1), MAX_LIMIT),
@@ -219,6 +292,9 @@ export async function startClassifierReplay(input: StartReplayInput): Promise<Re
     experimentId: opened.experimentId,
     incumbentModel: opened.incumbentModel,
     challengerModel: opened.challengerModel,
+    classification: String(opened.classification),
+    assistant: String(opened.assistant),
+    intentPack: input.intentPack,
     windowStart: new Date(opened.windowStart),
     windowEnd: new Date(opened.windowEnd),
     limit: opened.limit ?? DEFAULT_LIMIT,
@@ -231,16 +307,21 @@ async function runReplayBody(ctx: {
   experimentId: string | null;
   incumbentModel: string;
   challengerModel: string;
+  classification: string;
+  assistant: string;
+  intentPack: IntentPack | null;
   windowStart: Date;
   windowEnd: Date;
   limit: number;
 }): Promise<ReplayRunSummary> {
-  const { runId, incumbentModel, challengerModel, windowStart, windowEnd, limit } = ctx;
+  const { runId, incumbentModel, challengerModel, classification, assistant, intentPack, windowStart, windowEnd, limit } = ctx;
   const base: ReplayRunSummary = {
     runId,
     experimentId: ctx.experimentId,
     incumbentModel,
     challengerModel,
+    classification,
+    assistant,
     windowStart: windowStart.toISOString(),
     windowEnd: windowEnd.toISOString(),
     messagesConsidered: 0,
@@ -251,7 +332,17 @@ async function runReplayBody(ctx: {
   };
 
   try {
-    const candidates = await selectCandidates(windowStart.toISOString(), windowEnd.toISOString(), limit);
+    // CHECKED AGAIN AT EXECUTION, not only when the run was opened: the catalog's allowed classifications
+    // can change between the two, and the role is granted only what the classification allows today.
+    for (const key of [incumbentModel, challengerModel]) {
+      const misfit = modelFits(key, classification, 'text');
+      if (misfit) throw new Error(`[classifier-replay] ${misfit}`);
+    }
+    if (!assistant) throw new Error('[classifier-replay] the run names no assistant');
+    if (!intentPack || !Array.isArray(intentPack.intents) || intentPack.intents.length === 0) {
+      throw new Error('[classifier-replay] the run recorded no intent pack, so there is no taxonomy to classify against');
+    }
+    const candidates = await selectCandidates(windowStart.toISOString(), windowEnd.toISOString(), limit, classification, assistant);
     const considered = candidates.length;
     const retracted = candidates.filter((c) => c.retracted).length;
 
@@ -282,9 +373,12 @@ async function runReplayBody(ctx: {
       const content = String(row.content);
       // Both candidates see the SAME message. That pairing is the whole point: it removes
       // between-sample variance, which is why this design needs far less traffic than a split.
+      // AND THE SAME TAXONOMY, the assistant's served pack, which is what a live turn of that assistant
+      // classifies against. A classification candidate differs from its control only in
+      // `models.classifier`, so the pack is the same for both by the experiment's recipe.
       const [incumbent, challenger] = await Promise.all([
-        classifyIntent(content, { modelId: incumbentModelId }),
-        classifyIntent(content, { modelId: challengerModelId }),
+        classifyIntent(content, { modelId: incumbentModelId, pack: intentPack }),
+        classifyIntent(content, { modelId: challengerModelId, pack: intentPack }),
       ]);
       await query(
         `INSERT INTO classifier_replay_labels
@@ -396,7 +490,7 @@ export interface AdjudicateInput {
  * proposal cannot become the answer by being displayed next to one.
  *
  * A CONCORDANT pair cannot be adjudicated at all. It carries no comparative signal whatever the
- * truth, so a ruling on one would be labelling effort that changes no number, and accepting it would
+ * truth, so a ruling on one would be labeling effort that changes no number, and accepting it would
  * imply the queue was incomplete.
  */
 export async function adjudicateReplayLabel(input: AdjudicateInput): Promise<{ updated: boolean }> {
@@ -417,11 +511,11 @@ export async function adjudicateReplayLabel(input: AdjudicateInput): Promise<{ u
 /** A run plus every label it holds, the shape `evaluateClassifierGate` consumes. */
 export async function getReplayRun(runId: string): Promise<{
   run: ReplayRunSummary | null;
-  labels: Array<{ incumbentLabel: string; challengerLabel: string; trueLabel: string | null }>;
+  labels: Array<{ incumbentLabel: string; challengerLabel: string; trueLabel: string | null; conversationId: string | null }>;
 }> {
   const runRes = await query<any>(
     `SELECT id, experiment_id, incumbent_model, challenger_model, window_start, window_end,
-            messages_considered, messages_replayed, messages_retracted, messages_fast_path,
+            messages_considered, messages_replayed, messages_retracted, messages_fast_path, classification, assistant,
             status, error
        FROM classifier_replay_runs WHERE id = $1`,
     [runId],
@@ -429,9 +523,13 @@ export async function getReplayRun(runId: string): Promise<{
   const r = (runRes.rows || [])[0];
   if (!r) return { run: null, labels: [] };
 
+  // The conversation rides along so the gate clusters McNemar's interval by conversation: two messages
+  // of one conversation are one person on one topic, not two independent labels.
   const labelRes = await query<any>(
-    `SELECT incumbent_label, challenger_label, true_label
-       FROM classifier_replay_labels WHERE run_id = $1`,
+    `SELECT l.incumbent_label, l.challenger_label, l.true_label, e.channel_arn
+       FROM classifier_replay_labels l
+       LEFT JOIN exchanges e ON e.id = l.exchange_id
+      WHERE l.run_id = $1`,
     [runId],
   );
   return {
@@ -440,6 +538,8 @@ export async function getReplayRun(runId: string): Promise<{
       experimentId: r.experiment_id ?? null,
       incumbentModel: String(r.incumbent_model),
       challengerModel: String(r.challenger_model),
+      classification: r.classification ?? null,
+      assistant: r.assistant ?? null,
       windowStart: String(r.window_start),
       windowEnd: String(r.window_end),
       messagesConsidered: Number(r.messages_considered) || 0,
@@ -453,6 +553,7 @@ export async function getReplayRun(runId: string): Promise<{
       incumbentLabel: String(l.incumbent_label),
       challengerLabel: String(l.challenger_label),
       trueLabel: l.true_label ?? null,
+      conversationId: l.channel_arn ?? null,
     })),
   };
 }
@@ -461,7 +562,7 @@ export async function getReplayRun(runId: string): Promise<{
 export async function listReplayRuns(experimentId?: string): Promise<ReplayRunSummary[]> {
   const res = await query<any>(
     `SELECT id, experiment_id, incumbent_model, challenger_model, window_start, window_end,
-            messages_considered, messages_replayed, messages_retracted, messages_fast_path,
+            messages_considered, messages_replayed, messages_retracted, messages_fast_path, classification, assistant,
             status, error
        FROM classifier_replay_runs
        ${experimentId ? 'WHERE experiment_id = $1' : ''}
@@ -474,6 +575,8 @@ export async function listReplayRuns(experimentId?: string): Promise<ReplayRunSu
     experimentId: r.experiment_id ?? null,
     incumbentModel: String(r.incumbent_model),
     challengerModel: String(r.challenger_model),
+    classification: r.classification ?? null,
+    assistant: r.assistant ?? null,
     windowStart: String(r.window_start),
     windowEnd: String(r.window_end),
     messagesConsidered: Number(r.messages_considered) || 0,

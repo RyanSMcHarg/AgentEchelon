@@ -47,6 +47,7 @@ import {
   ListChannelMembershipsCommand,
   SearchChannelsCommand,
 } from '@aws-sdk/client-chime-sdk-messaging';
+import { rosterOf } from './person-arn.js';
 
 /**
  * The most human members we will build a MEMBERS filter from.
@@ -59,7 +60,7 @@ import {
 const MAX_MEMBERS_IN_FILTER = 10;
 
 /**
- * How many HUMANS may be in the filter, given the serving assistant occupies one of the slots.
+ * How many HUMANS may be in the filter, given the serving assistant takes one of the places.
  *
  * The assistant is an intersection term (see resolveScopedChannelArns), so a 10-human room would build
  * an 11-value filter. Budgeting for it here rather than at the call site keeps the cap honest: the
@@ -67,6 +68,22 @@ const MAX_MEMBERS_IN_FILTER = 10;
  * as an outage rather than as the deliberate "too many members to express" case.
  */
 const MAX_HUMANS_IN_FILTER = MAX_MEMBERS_IN_FILTER - 1;
+
+/**
+ * The most `SearchChannels` pages one scope may read (50 conversations a page).
+ *
+ * The cost of a scope otherwise grows with the history the room shares with the assistant, without
+ * bound: 597 shared conversations measured 12 sequential searches (2026-10-05), and a person with
+ * thousands would pay dozens on a live turn, inside the router's time budget and against the
+ * service's rate.
+ *
+ * STOPPING EARLY CAN ONLY NARROW. Every page holds conversations that satisfy the full filter, so a
+ * truncated scope is a SUBSET of the true intersection: it may miss a related conversation, and it can
+ * never include one somebody in the room cannot open. That is the direction FR9 allows. Which subset
+ * is the service's page order, which it does not document, so a long history may lose a match that
+ * would have been suggested.
+ */
+export const MAX_SCOPE_PAGES = 10;
 
 export interface ScopeInput {
   currentChannelArn: string;
@@ -86,9 +103,8 @@ async function humanMemberArns(input: ScopeInput): Promise<string[]> {
       MaxResults: 50,
       NextToken: nextToken,
     }));
-    for (const m of res.ChannelMemberships || []) {
-      const arn = m.Member?.Arn || '';
-      if (arn && arn.includes('/user/')) arns.push(arn);
+    for (const m of rosterOf(res.ChannelMemberships)) {
+      if (m.kind === 'person') arns.push(m.arn);
     }
     nextToken = res.NextToken;
   } while (nextToken);
@@ -118,7 +134,7 @@ export async function resolveScopedChannelArns(input: ScopeInput): Promise<strin
   if (humans.length > MAX_HUMANS_IN_FILTER) {
     console.warn(
       `[scoped-channels] ${humans.length} human members exceeds the ${MAX_HUMANS_IN_FILTER}-human `
-      + `filter cap (the serving assistant occupies one of the ${MAX_MEMBERS_IN_FILTER} slots); `
+      + `filter cap (the serving assistant takes one of the ${MAX_MEMBERS_IN_FILTER} places); `
       + 'suggesting nothing rather than scoping on a subset of the room.',
     );
     return [];
@@ -142,65 +158,111 @@ export async function resolveScopedChannelArns(input: ScopeInput): Promise<strin
   // an ignored term would leave every count at 29, and an OR would never go below it.
   const values = [...humans, input.bearerArn];
 
-  // The bearer must be one of the MEMBERS (the service rejects any other: "AppInstanceUser must
-  // include its own ARN for MEMBERS field"), and a bot is not an AppInstanceUser - so a HUMAN bears
-  // the search while the assistant rides along as a filter term.
+  // THE ASSISTANT BEARS THE SEARCH.
   //
-  // WHICH human is bearer does not change the answer: every member of the intersection is in every
-  // channel it contains. But only the BEARER is limit-checked, so when one member is too heavy we
-  // simply ask a different one. Measured on this deployment: the search refuses at 1038 channels.
-  const failures: string[] = [];
-  for (const searchBearer of humans) {
-    try {
-      const arns: string[] = [];
-      let nextToken: string | undefined;
-      do {
-        const res = await input.client.send(new SearchChannelsCommand({
-          ChimeBearer: searchBearer,
-          Fields: [{ Key: 'MEMBERS', Values: values, Operator: 'INCLUDES' }],
-          MaxResults: 50,
-          NextToken: nextToken,
-        }));
-        for (const ch of res.Channels || []) {
-          if (ch.ChannelArn) arns.push(ch.ChannelArn);
-        }
-        nextToken = res.NextToken;
-      } while (nextToken);
-      return arns;
-    } catch (err) {
-      const e = err as Error;
-      // Only the membership limit is worth trying another bearer for; it is a property of that PERSON.
-      // Anything else is about the request itself and would fail identically for every member.
-      if (/exceeds channel membership limit/i.test(e.message || '')) {
-        failures.push(`${searchBearer.split('/').pop()}: over the membership limit`);
-        continue;
+  // This used to rotate over the humans, on the stated ground that "a bot is not an AppInstanceUser"
+  // and so cannot bear. MEASURED AGAINST THE LIVE API 2026-09-30 AND THAT IS NOT TRUE: a bot bears
+  // `SearchChannels` and AND-filters exactly as a human bearer does. The error the old comment cited,
+  // "AppInstanceUser must include its own ARN for MEMBERS field", is about the BEARER needing its own
+  // ARN among the values - which the assistant already satisfies, because it is an intersection term.
+  //
+  // Same app instance, same filter, counted to exhaustion rather than to a page:
+  //   bot bearer, bot only          388 channels
+  //   bot bearer, bot AND human     265
+  //   human bearer, bot AND human   265   <- the bearer does not change the answer
+  //   human bearer, human only      265
+  // The middle pair is the control: switching the bearer is behavior-preserving, and the first line
+  // is the AND doing its work.
+  //
+  // THE LIMIT, AND WHY A HUMAN BACKS IT UP. Only the BEARER is limit-checked, and the assistant is
+  // the principal that grows fastest: one membership per conversation of its classification, where a
+  // person grows only as fast as they are invited. It was at 388 against a refusal measured at 1038 on
+  // this deployment. So the assistant asks first and, IF AND ONLY IF the service refuses it for the
+  // membership limit, a human asks the same question instead.
+  //
+  // THIS IS NOT THE FALLBACK THAT WAS REJECTED, and the difference is the whole of why it is safe. The
+  // rejected one intersected each member's own channel list, which could not carry the assistant term,
+  // so it answered a WIDER question on exactly the heaviest accounts - less safe than the path it
+  // backed up. Changing the BEARER changes only who asks: `values` still carries the assistant, so the
+  // filter is identical and the answer is identical. Measured above, line for line: human bearer with
+  // [human, bot] returned the same 265 as bot bearer with [human, bot].
+  //
+  // ONLY THE LIMIT ERROR FALLS BACK. Anything else is a property of the REQUEST and would fail the same
+  // way for every bearer, so retrying would multiply one failure instead of answering.
+  const searchAs = async (bearer: string): Promise<string[]> => {
+    const arns: string[] = [];
+    let nextToken: string | undefined;
+    let pages = 0;
+    do {
+      if (pages === MAX_SCOPE_PAGES) {
+        console.warn(
+          `[scoped-channels] scope stopped at ${MAX_SCOPE_PAGES} pages (${arns.length} conversations) with `
+          + 'more available; suggesting from that subset, which can only narrow the scope.',
+          { bearer, channel: input.currentChannelArn },
+        );
+        break;
       }
-      // Log the MESSAGE, not just the name. Three DIFFERENT causes have surfaced here as
-      // BadRequestException, and the message is what distinguished them each time; `err.name` alone
-      // reduced them all to one unattributable line and cost a session per occurrence.
+      pages += 1;
+      const res = await input.client.send(new SearchChannelsCommand({
+        ChimeBearer: bearer,
+        Fields: [{ Key: 'MEMBERS', Values: values, Operator: 'INCLUDES' }],
+        MaxResults: 50,
+        NextToken: nextToken,
+      }));
+      for (const ch of res.Channels || []) {
+        if (ch.ChannelArn) arns.push(ch.ChannelArn);
+      }
+      nextToken = res.NextToken;
+    } while (nextToken);
+    return arns;
+  };
+  const isOverLimit = (e: Error) => /exceeds channel membership limit/i.test(e.message || '');
+
+  try {
+    return await searchAs(input.bearerArn);
+  } catch (err) {
+    const e = err as Error;
+    if (isOverLimit(e)) {
+      // The assistant is too heavy to bear its own search. Ask a human the SAME question: the filter
+      // is unchanged, so this narrows nothing and widens nothing, and only the bearer is limit-checked.
       console.warn(
-        `[scoped-channels] channel search failed; suggesting nothing (fail closed): ${e.name}: ${e.message}`,
-        { bearer: searchBearer, memberCount: humans.length, channel: input.currentChannelArn },
+        '[scoped-channels] the serving assistant is over the channel membership limit; re-asking the '
+        + 'identical filter as a human member.',
+        { bearer: input.bearerArn, humans: humans.length, channel: input.currentChannelArn },
+      );
+      const refused: string[] = [];
+      for (const human of humans) {
+        try {
+          return await searchAs(human);
+        } catch (retryErr) {
+          const re = retryErr as Error;
+          // Only the limit is worth asking somebody else about; it is a property of that PERSON.
+          if (isOverLimit(re)) { refused.push(human.split('/').pop() || human); continue; }
+          console.warn(
+            `[scoped-channels] fallback search failed; suggesting nothing (fail closed): ${re.name}: ${re.message}`,
+            { bearer: human, channel: input.currentChannelArn },
+          );
+          return [];
+        }
+      }
+      // THE ASSISTANT AND EVERY HUMAN ARE OVER THE LIMIT. Worth an error rather than a warning: the
+      // assistant being over it takes drift out everywhere at once, and it arrives as silence.
+      console.error(
+        '[scoped-channels] THE SERVING ASSISTANT IS OVER THE CHANNEL MEMBERSHIP LIMIT and so is every '
+        + 'human member, so this conversation can scope nothing. While the assistant stays over it, '
+        + 'every conversation it serves depends on a human under it. Suggesting nothing (fail closed).',
+        { bearer: input.bearerArn, refused, channel: input.currentChannelArn },
       );
       return [];
     }
+    // Log the MESSAGE, not just the name. Three DIFFERENT causes have surfaced here as
+    // BadRequestException, and the message is what distinguished them each time; `err.name` alone
+    // reduced them all to one unattributable line and cost a session per occurrence.
+    console.warn(
+      `[scoped-channels] channel search failed; suggesting nothing (fail closed): ${e.name}: ${e.message}`,
+      { bearer: input.bearerArn, memberCount: humans.length, channel: input.currentChannelArn },
+    );
+    return [];
   }
-
-  // EVERY human is over the limit. Fail closed.
-  //
-  // There IS a way to compute this without the search - intersect each member's own channel list - and
-  // it was built and deployed on 2026-08-08. It is deliberately NOT used, for two reasons. It shipped
-  // inert (the role carried no `chime:ListChannelMembershipsForAppInstanceUser` grant, so it threw
-  // AccessDenied on first contact), and more importantly it intersected HUMANS ONLY: it could not
-  // apply the assistant term above, so it would answer a WIDER question than the primary path on
-  // exactly the heaviest accounts. A fallback that is less safe than the path it backs up is worse
-  // than no fallback. Reinstating it requires a way to apply the assistant term.
-  console.warn(
-    '[scoped-channels] every human member exceeds the search membership limit; suggesting nothing '
-    + '(fail closed). A per-member intersection cannot currently apply the assistant term, so it '
-    + 'would widen the scope rather than narrow it.',
-    { channel: input.currentChannelArn, members: failures },
-  );
-  return [];
 }
 

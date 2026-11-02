@@ -25,7 +25,7 @@
  * - nothing in this codebase invokes the router; Lex does. That shape is what at-least-once delivery
  * looks like. Confirming the trigger needs Lex conversation logs.
  *
- * ON THE RATE, because this comment carried a wrong one and it travelled. The figure this file used to
+ * ON THE RATE, because this comment carried a wrong one and it traveled. The figure this file used to
  * give was derived from a 52-turn window and counted the E2E RETRY TEST'S OWN PROBES as organic
  * duplicates: 13 of the 14 "duplicate fulfillment" log lines were `Retry probe ...` messages the suite
  * sends deliberately. Over four days of logs the organic rate is roughly **1 turn in 1000**. The
@@ -34,7 +34,7 @@
  * wrong. (`docs-drift-guard` bans the retracted figure, so it is not restated here.)
  *
  * The number matters because it sets the stakes: at 1 in 1000, enabling Lex conversation logs to chase
- * the trigger is a bigger commitment than the defect, which is why row 30 is a decision rather than a
+ * the trigger is a bigger commitment than the defect, which is why enabling them is a decision rather than a
  * fix. A measurement that includes the measurer's own traffic is not a measurement.
  *
  * THE PRACTICAL CONSEQUENCE. Because it is not a timeout, making the handler faster does not reduce
@@ -63,7 +63,7 @@ export const TURN_CORRELATION_WINDOW_SECONDS = 90;
  * Stable across a retried fulfillment of the same turn, distinct between turns. The time bucket bounds
  * how long two identical turns collide; it is quantised so a retry seconds later lands in the same
  * bucket, and `previousBucket` lets a caller check the adjacent one so a retry that straddles a
- * boundary is still recognised.
+ * boundary is still recognized.
  *
  * EVERY INPUT IS ONE A RETRY PROVABLY REPLAYS, which is the property the whole control rests on. The
  * channel and sender arrive as request attributes of the same message. The transcript is replayed
@@ -186,6 +186,162 @@ export function correlationMarkerOf(content: string): string | null {
  * This path can key on the message id directly because the channel flow dispatches it, and the flow
  * DOES receive a stable `MessageId` on every message. The Lex path cannot: see above.
  */
+/**
+ * The correlation id for a reading dispatched by arrival triage.
+ *
+ * IT IS ALSO THE TRIAGE CLAIM, deliberately: arrival triage names its turn by the claim it holds, so
+ * the handover can recognize "this turn was the reading" by comparing the two. The depth is part of
+ * it so a redelivery of the same notice builds the same id and stays idempotent, while a notice whose
+ * depth moved builds a different one and correctly loses to the reading already in flight.
+ *
+ * FITTED, BECAUSE IT IS ALSO A PLACEHOLDER MARKER AND WAS OVERFLOWING IT (maintainer, 2026-09-02). Built
+ * inline this read `arrival-${MessageId}-${depth}`, and an Amazon Chime SDK message id is opaque and
+ * commonly 64 characters, which made the id 74 - ten over what a reader accepts. The consequences
+ * were invisible because everything still worked, slowly:
+ *
+ *   - `channel-flow-processor.ts` reads the marker to write the placeholder mapping. It never
+ *     matched, so no mapping was ever written for a triage turn.
+ *   - the processor therefore polled for a mapping that could not arrive, eight attempts with
+ *     backoff, MEASURED LIVE AT 6.9 SECONDS, on a path section 7.4 budgets at 1.5 to 4 seconds
+ *     end to end.
+ *   - it then fell back to a billed `ListChannelMessages` scan.
+ *   - and the duplicate-placeholder denial in that same branch never ran for a triage turn either.
+ *
+ * This is the identical defect `mentionCorrelationId` and `battleCorrelationId` were already fixed
+ * for. The arrival id is the one that never got the treatment, which is why it is here now rather
+ * than interpolated at the call site: a bound nothing enforces is a bound every new call site breaks.
+ *
+ * The DEPTH is what gets the remaining budget, never truncated, because it is what separates one
+ * notice from the next. The message id keeps its tail, where an opaque id's discriminating bytes are.
+ */
+export function arrivalTriageCorrelationId(args: {
+  messageId?: string;
+  /** Used only when there is no message id, and an ARN is long, so it is fitted the same way. */
+  channelArn: string;
+  depth: number;
+}): string {
+  const suffix = `-${Math.max(0, Math.floor(args.depth))}`;
+  const prefix = 'arrival-';
+  const budget = CORRELATION_ID_MAX_LENGTH - prefix.length - suffix.length;
+  const source = args.messageId || args.channelArn;
+  return `${prefix}${fitSegment(source, Math.max(0, budget))}${suffix}`;
+}
+
+/**
+ * The correlation id for the reading a finishing turn hands the conversation to.
+ *
+ * SAME DEFECT AS THE ARRIVAL ID, AND IT COMPOUNDED. Built inline this was
+ * `triage-handover-${correlationId}`, so handing over from an arrival reading produced roughly 90
+ * characters, and because it re-prefixed the id it was given, a chain of handovers grew by 16
+ * characters per link. Every one of them was unreadable as a marker, so every handover reading also
+ * paid the mapping poll and the billed scan. Observed live as
+ * `triage-handover-arrival-b13ea666...-1`, logging `No placeholder mapping yet`.
+ *
+ * THE PASS CARRIES THE DISTINCTNESS, not a stacked prefix. Each link increments it, so link 2 and
+ * link 3 differ without either being longer, and the id stays derivable from the turn handing over
+ * rather than accumulating its history. That also keeps it STABLE: the handover runs once at the end
+ * of a turn, and a re-run derives the same id rather than minting a second reader.
+ *
+ * It must differ from the id it is derived from, because `handOverLock` moves the lock FROM one TO
+ * the other and a self-handover is a lock nothing releases. The prefix guarantees that.
+ */
+export function handoverCorrelationId(correlationId: string, pass: number): string {
+  const prefix = `th${Math.max(1, Math.floor(pass))}-`;
+  return `${prefix}${fitSegment(correlationId, Math.max(0, CORRELATION_ID_MAX_LENGTH - prefix.length))}`;
+}
+
+/**
+ * The correlation id for the question a `/stop` asks back.
+ *
+ * SAME DEFECT AS THE TWO ABOVE, and the last inline one. Written at the call site as
+ * `${correlationId}-stopeval`, it inherited whatever it was handed and added nine characters, so a
+ * stop aimed at a turn already running under a long id - an arrival reading, or any handover of one -
+ * produced a marker past the bound. The placeholder that question posts could then never be matched,
+ * which on THIS path means a person who just typed `/stop` is asked which work to stop and never sees
+ * the answer resolve.
+ *
+ * A SUFFIX, unlike its siblings, because the stop is about the turn it names and reads better ending
+ * in what it is. `fitSegment` keeps the tail of what it trims, so the discriminating end of the id
+ * being stopped survives; only its prefix is spent.
+ */
+export function stopEvaluationCorrelationId(correlationId: string): string {
+  const suffix = '-stopeval';
+  return `${fitSegment(correlationId, Math.max(0, CORRELATION_ID_MAX_LENGTH - suffix.length))}${suffix}`;
+}
+/**
+ * THE KEY THE DEDUP GUARD CLAIMS, which is NOT the turn's correlation id (maintainer, 2026-09-02).
+ *
+ * Two different questions had been sharing one string, and the collision made a bounded loop
+ * unable to take its second iteration.
+ *
+ * CONVERSATION IDENTITY is `correlationId` itself. Arrival triage names its turn by the triage claim
+ * it holds, so for a reading turn that id IS `triagedBy`, and `turn-handover.ts` recognizes "this
+ * turn was the reading" by comparing the two. It must stay stable across passes: a pass carrying a
+ * fresh id is not recognized, falls through to the branch that hands the conversation onward, and
+ * hands it to a turn that has already ended - which nothing then releases.
+ *
+ * DELIVERY IDENTITY is this. The guard asks only "is this the same delivery arriving twice?", which
+ * is what at-least-once delivery requires and all it requires. A triage pass 2 is not a redelivery
+ * of pass 1; it is the next iteration of the loop DESIGN 2.3 step 3 describes. Keyed on the bare id
+ * it was indistinguishable from a duplicate and was dropped every time, so a queue that moved under
+ * a reading was never re-read: the drain released the conversation still holding it. Measured live
+ * as `reading it again  pass: 2, read: 1, arrived: 2`, then `Duplicate invocation, skipping`, then
+ * `releasing now that it is done  stillQueued: 3`.
+ *
+ * AN AMENDMENT FOLD IS THE OTHER RE-ENTRY, and it is the same defect one path along. When a reading
+ * judges that something arriving mid-turn changes the work rather than starting new work,
+ * `dispatchAmendedTurn` re-invokes on the SAME correlation id - deliberately, because the placeholder
+ * and the lock have to carry over to the answer that replaces them. The router already scopes its
+ * duplicate-fulfillment claim to the fold (`deliveryAttemptSuffix`, `#f{n}`), so the fold reaches
+ * this side; keyed on the bare id here it was then read as a redelivery of the turn it amends and
+ * dropped, with `clearAmendments` already run and the placeholder and lock still held. That is the
+ * `bd3444ecd844c285` symptom the router-side fix records, surviving on the half that was not fixed.
+ *
+ * PASS 1 WITH NO FOLD KEYS ON THE BARE ID, so every turn that is neither a re-read nor a fold - which
+ * is all of them outside triage - claims exactly what it claimed before. This adds keys, it does not
+ * change any existing one.
+ *
+ * AND THE RECOVERY RE-ENTERS TWICE MORE, on the same correlation id and for the same reason: the
+ * turn keeps its identity so the lock and the placeholder carry over. `turn-lock-release-on-failure`
+ * re-invokes the processor with `{...payload, turnAttempt: n+1}` up to three times, and then once
+ * with `{...payload, announceFailure: true}`. Every one of those spreads the ORIGINAL correlation id,
+ * and the turn that just died had already claimed it. Against a 300s dedup TTL and a 30-90s function
+ * timeout the claim is always still held, so keyed on the bare id: every retry was skipped as a
+ * duplicate and RETURNED SUCCESS - which is also why Lambda's own async retries never escalated to
+ * the failure destination - and the apology, the one path whose whole job is to succeed where the
+ * expensive path did not, was skipped too. The person was never told anything had gone wrong.
+ *
+ * The announcement is a delivery in its own right, not attempt n+1 of the turn: it does different
+ * work, and a redelivery of the announcement still has to dedup against the announcement.
+ *
+ * The suffixes stay inside the reader's character class even though a delivery key never travels in a
+ * placeholder marker. It costs nothing, and an id shape that is legal everywhere cannot become a
+ * trap for the next caller who does put it somewhere that parses.
+ */
+export function deliveryCorrelationId(
+  correlationId: string,
+  triagePass?: number,
+  amendedFold?: number,
+  recovery?: { turnAttempt?: number; announceFailure?: boolean },
+): string {
+  // FINITE AND POSITIVE OR ABSENT, on both discriminators. A malformed value must leave the key it
+  // would have qualified untouched rather than append a `NaN` segment that no retry can reproduce -
+  // a key nothing else ever derives again dedups against nothing.
+  const pass = Number.isFinite(Number(triagePass)) && Number(triagePass) > 1
+    ? `.p${Math.floor(Number(triagePass))}`
+    : '';
+  const fold = Number.isFinite(Number(amendedFold)) && Number(amendedFold) > 0
+    ? `.f${Math.floor(Number(amendedFold))}`
+    : '';
+  // Attempt 1 is the ordinary turn and adds nothing, so an instance that never fails keys exactly
+  // as it always has.
+  const attempt = Number.isFinite(Number(recovery?.turnAttempt)) && Number(recovery?.turnAttempt) > 1
+    ? `.a${Math.floor(Number(recovery?.turnAttempt))}`
+    : '';
+  const announcement = recovery?.announceFailure ? '.fail' : '';
+  return `${correlationId}${pass}${fold}${attempt}${announcement}`;
+}
+
 export function mentionCorrelationId(messageId?: string): string {
   // The Amazon Chime SDK `MessageId` is opaque and the service permits up to 128 characters, so
   // `mention-${messageId}` could exceed the reader's bound and produce a placeholder that never

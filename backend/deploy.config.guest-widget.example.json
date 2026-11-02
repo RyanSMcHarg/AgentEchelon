@@ -1,0 +1,32 @@
+{
+  "_comment": "THE GUEST WIDGET DEPLOYMENT: a deployment of its own, beside the main one, where the embeddable widget, the guest issuer, the two upgrade paths and invitation links are exercised (tests/e2e/guest-widget.spec.ts and the guest deny-tests). Copy it to deploy.config.json in a checkout used only for this deployment and deploy with its own instance name, so no stack, SSM path or table is shared with the main deployment: AE_INSTANCE_NAME=ae-guest npm run deploy. Every key not listed here takes its default; deploy.config.example.json documents each one. deploy.mjs compares this file against that example and refuses only a missing key whose absence removes something (DESTRUCTIVE_IF_ABSENT in lib/config/deploy-context.ts), so the rest only warn.",
+
+  "_instance": "Not a context key: the instance is the AE_INSTANCE_NAME environment variable (lib/stacks/agent-classification-common.ts). ae-guest gives stacks named AeGuest<Stack> and the SSM root /ae-guest.",
+
+  "environment": "dev",
+  "analyticsMode": "athena",
+  "senderEmail": "you@example.com",
+
+  "_capabilities": "widget is the frame visitors talk in; chat is where path A's visitor signs in (the guest issuer's GuestSignInUrl is the chat app); admin is the console that approves registrations and shows the guest-to-customer funnel; notifications sends path B's claim email (it needs the standard classification, below).",
+  "capabilities": ["widget", "chat", "admin", "notifications"],
+
+  "_profiles": "guest and customer deploy only when declared: guest is the visitor's classification, and customer is where path B's claim opens its customer-engagement conversation. basic and standard are the accounts' own. Nothing a member holds reaches guest or customer: an outside classification grants only itself, and synth refuses a member classification that grants it.",
+  "profiles": ["basic", "standard", "guest", "customer"],
+
+  "_issuers": "deployment: this deployment's own pool, the accounts path A binds a visit to, and the console's admins. guest: the platform's own issuer for an anonymous visitor (docs/guides/admin/GUEST-ISSUER.md); outside production a guest with no captcha uses the vendor's test keys. Its allowedOrigins names \"widget-host\", the sample host page (examples/widget-host/): the CDK app stands up the WidgetHost stack (a private bucket behind its own CloudFront distribution) and names that distribution's origin in the widget's frame-ancestors, read from the stack, so no domain is typed here. customers: a test-fixture pool (lib/config/test-issuers.ts) for path B's customer, whose classifications are all outside; the TestIssuer stack creates its pool on the first deploy, and the entry is trusted once its pool and audience are set from that stack's TestIssuerCustomersPoolId and TestIssuerCustomersClientId outputs.",
+  "issuers": [
+    { "id": "deployment", "kind": "cognito-pool", "pool": "self", "clearance": { "groups": true, "classifications": ["basic", "standard", "admin"] }, "admin": true, "displayName": { "en": "Sign in" } },
+    { "id": "guest", "kind": "guest", "clearance": { "fixed": ["guest"], "classifications": ["guest"] }, "allowedOrigins": ["widget-host"] },
+    { "id": "customers", "kind": "cognito-pool", "owner": "test-fixture", "pool": "", "audience": [], "clearance": { "fixed": ["customer"], "classifications": ["customer"] }, "displayName": { "en": "Customer sign-in" } }
+  ],
+  "connectors": [],
+
+  "_urls": "appUrl and adminAppUrl are derived by deploy.mjs from the live distributions; leave them empty. widgetUrl, the widget frame's own origin that PersonApi admits in CORS, is derived the same way from the Widget stack's WidgetDistributionUrl output; leave it empty too. The chat app needs no setting for the widget: gen-frontend-env.mjs writes that same output into the chat app's VITE_WIDGET_ORIGIN, and path A's hand-off is taken only from that origin.",
+  "appUrl": "",
+  "adminAppUrl": "",
+  "widgetUrl": "",
+
+  "enableLiveDrift": false,
+  "imageGenKeysSecretArn": "",
+  "membershipAuditEnforce": false
+}

@@ -17,4 +17,3 @@ cdk.context.json
 # handler and breaks ALL auth). Keep them tracked.
 !lambda/cognito-triggers/*.js
 cdk.out.diff/
-scripts/teardown.mjs

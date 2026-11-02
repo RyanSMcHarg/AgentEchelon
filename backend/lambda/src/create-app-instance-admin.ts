@@ -23,15 +23,17 @@ import {
   CreateAppInstanceAdminCommand,
 } from '@aws-sdk/client-chime-sdk-identity';
 import type { CloudFormationCustomResourceEvent } from 'aws-lambda';
+import { userArnFor } from './lib/person-arn.js';
+import { chimeIdentityClient } from './lib/chime/clients.js';
 
 const region = process.env.AWS_REGION || 'us-east-1';
-const identityClient = new ChimeSDKIdentityClient({ region });
+const identityClient = chimeIdentityClient({ region });
 
 const APP_INSTANCE_ARN = process.env.APP_INSTANCE_ARN || '';
 const ADMIN_USER_ID = process.env.ADMIN_USER_ID || 'agent-echelon-admin';
 
 function adminUserArn(): string {
-  return `${APP_INSTANCE_ARN}/user/${ADMIN_USER_ID}`;
+  return userArnFor(APP_INSTANCE_ARN, ADMIN_USER_ID);
 }
 
 export const handler = async (event: CloudFormationCustomResourceEvent) => {

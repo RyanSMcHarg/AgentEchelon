@@ -1,6 +1,6 @@
 /**
  * Unit tests for the abuse-controls plane (SPEC-ABUSE-CONTROLS): request dedup + spend budget.
- * Mocks the DynamoDB doc client; asserts fail-open vs fail-safe policy.
+ * Mocks the DynamoDB doc client; asserts that every limit fails closed and that dedup fails open.
  */
 const send = jest.fn();
 const ssmSend = jest.fn().mockResolvedValue({});
@@ -77,29 +77,29 @@ describe('abuse-controls', () => {
     it('still counts admins against the GLOBAL budget and blocks them once it is exceeded', async () => {
       process.env.BEDROCK_USER_HOURLY_BUDGET = '2';
       process.env.BEDROCK_GLOBAL_HOURLY_BUDGET = '10';
-      send.mockResolvedValueOnce({ Attributes: { count: 11 } }); // global bump, over the ceiling
+      send.mockResolvedValueOnce({ Attributes: { count: 11 } }); // global bump, over the limit
       const { checkAndConsumeBudget } = await load();
-      // The global ceiling protects the account, so even an exempt admin is blocked when it is crossed;
+      // The global limit protects the account, so even an exempt admin is blocked when it is crossed;
       // the per-user counter is still skipped, so only the global bump happened.
       expect(await checkAndConsumeBudget('user-1', { isAdmin: true })).toEqual({ allowed: false, reason: 'global' });
       expect(send).toHaveBeenCalledTimes(1);
     });
 
-    it('allows while under the global ceiling', async () => {
+    it('allows while under the global limit', async () => {
       process.env.BEDROCK_GLOBAL_HOURLY_BUDGET = '10';
       send.mockResolvedValueOnce({ Attributes: { count: 3 } }); // global bump
       const { checkAndConsumeBudget } = await load();
       expect(await checkAndConsumeBudget('user-1')).toEqual({ allowed: true });
     });
 
-    it('blocks when the global ceiling is exceeded', async () => {
+    it('blocks when the global limit is exceeded', async () => {
       process.env.BEDROCK_GLOBAL_HOURLY_BUDGET = '10';
       send.mockResolvedValueOnce({ Attributes: { count: 11 } });
       const { checkAndConsumeBudget } = await load();
       expect(await checkAndConsumeBudget('user-1')).toEqual({ allowed: false, reason: 'global' });
     });
 
-    it('blocks when the per-user ceiling is exceeded (global under)', async () => {
+    it('blocks when the per-user limit is exceeded (global under)', async () => {
       process.env.BEDROCK_GLOBAL_HOURLY_BUDGET = '100';
       process.env.BEDROCK_USER_HOURLY_BUDGET = '5';
       send
@@ -109,18 +109,49 @@ describe('abuse-controls', () => {
       expect(await checkAndConsumeBudget('user-1')).toEqual({ allowed: false, reason: 'user' });
     });
 
-    it('FAILS SAFE (blocks) on error when a global budget is set', async () => {
+    it('refuses on a store error when a global budget is set', async () => {
       process.env.BEDROCK_GLOBAL_HOURLY_BUDGET = '10';
       send.mockRejectedValueOnce(new Error('DynamoDB down'));
       const { checkAndConsumeBudget } = await load();
       expect(await checkAndConsumeBudget('user-1')).toEqual({ allowed: false, reason: 'global' });
     });
 
-    it('fails OPEN on error when only a per-user budget is set', async () => {
+    it('refuses on a store error when only a per-user budget is set', async () => {
       process.env.BEDROCK_USER_HOURLY_BUDGET = '5';
       send.mockRejectedValueOnce(new Error('DynamoDB down'));
       const { checkAndConsumeBudget } = await load();
-      expect(await checkAndConsumeBudget('user-1')).toEqual({ allowed: true });
+      expect(await checkAndConsumeBudget('user-1')).toEqual({ allowed: false, reason: 'user' });
+    });
+
+    it('refuses when a budget is set and its table is not', async () => {
+      delete process.env.ABUSE_CONTROLS_TABLE;
+      process.env.BEDROCK_USER_HOURLY_BUDGET = '5';
+      let mod = await load();
+      expect(await mod.checkAndConsumeBudget('user-1')).toEqual({ allowed: false, reason: 'user' });
+      jest.resetModules();
+      process.env.BEDROCK_GLOBAL_HOURLY_BUDGET = '10';
+      mod = await load();
+      expect(await mod.checkAndConsumeBudget('user-1')).toEqual({ allowed: false, reason: 'global' });
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('admits when every budget is 0, with or without a table', async () => {
+      process.env.BEDROCK_USER_HOURLY_BUDGET = '0';
+      process.env.BEDROCK_GLOBAL_HOURLY_BUDGET = '0';
+      let mod = await load();
+      expect(await mod.checkAndConsumeBudget('user-1')).toEqual({ allowed: true });
+      jest.resetModules();
+      delete process.env.ABUSE_CONTROLS_TABLE;
+      mod = await load();
+      expect(await mod.checkAndConsumeBudget('user-1')).toEqual({ allowed: true });
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('admits an exempt admin with no table when only a per-user budget is set, since no limit applies', async () => {
+      delete process.env.ABUSE_CONTROLS_TABLE;
+      process.env.BEDROCK_USER_HOURLY_BUDGET = '5';
+      const { checkAndConsumeBudget } = await load();
+      expect(await checkAndConsumeBudget('user-1', { isAdmin: true })).toEqual({ allowed: true });
     });
 
     it('trips the circuit (SSM PutParameter) once the global count crosses the threshold', async () => {
@@ -137,7 +168,7 @@ describe('abuse-controls', () => {
   });
 
   describe('checkRateLimit', () => {
-    it('allows under the ceiling and reports remaining', async () => {
+    it('allows under the limit and reports remaining', async () => {
       send.mockResolvedValueOnce({ Attributes: { count: 3 } });
       const { checkRateLimit } = await load();
       const r = await checkRateLimit('user-1', 10);
@@ -145,7 +176,7 @@ describe('abuse-controls', () => {
       expect(r.remaining).toBe(7);
     });
 
-    it('blocks once the count exceeds the ceiling', async () => {
+    it('blocks once the count exceeds the limit', async () => {
       send.mockResolvedValueOnce({ Attributes: { count: 11 } });
       const { checkRateLimit } = await load();
       expect((await checkRateLimit('user-1', 10)).allowed).toBe(false);
@@ -158,10 +189,25 @@ describe('abuse-controls', () => {
       expect(send).not.toHaveBeenCalled();
     });
 
-    it('fails OPEN on error', async () => {
+    it('refuses on a store error', async () => {
       send.mockRejectedValueOnce(new Error('DynamoDB down'));
       const { checkRateLimit } = await load();
-      expect((await checkRateLimit('user-1', 10)).allowed).toBe(true);
+      const r = await checkRateLimit('user-1', 10);
+      expect(r.allowed).toBe(false);
+      expect(r.remaining).toBe(0);
+    });
+
+    it('refuses when a limit is set and its table is not', async () => {
+      delete process.env.ABUSE_CONTROLS_TABLE;
+      const { checkRateLimit } = await load();
+      expect((await checkRateLimit('user-1', 10)).allowed).toBe(false);
+      expect(send).not.toHaveBeenCalled();
+    });
+
+    it('admits a limit of 0 with no table, since 0 is off', async () => {
+      delete process.env.ABUSE_CONTROLS_TABLE;
+      const { checkRateLimit } = await load();
+      expect((await checkRateLimit('user-1', 0)).allowed).toBe(true);
     });
   });
 
@@ -188,9 +234,9 @@ describe('abuse-controls', () => {
 
     it('blocks on the rate limit FIRST and never consumes budget', async () => {
       process.env.BEDROCK_USER_HOURLY_BUDGET = '10';
-      send.mockResolvedValueOnce(bump(6)); // rate counter over the ceiling (5)
+      send.mockResolvedValueOnce(bump(6)); // rate counter over the limit (5)
       const { evaluateAbuseGate } = await load();
-      const res = await evaluateAbuseGate({ userSub: 'u1', rateCeiling: 5, isAdmin: false });
+      const res = await evaluateAbuseGate({ personId: 'u1', rateLimit: 5, isAdmin: false });
       expect(res.allowed).toBe(false);
       expect(res).toMatchObject({ reason: 'rate' });
       expect((res as { message: string }).message).toBeTruthy();
@@ -203,7 +249,7 @@ describe('abuse-controls', () => {
         .mockResolvedValueOnce(bump(1))  // rate ok (1 <= 5)
         .mockResolvedValueOnce(bump(11)); // user budget over (11 > 10)
       const { evaluateAbuseGate } = await load();
-      const res = await evaluateAbuseGate({ userSub: 'u1', rateCeiling: 5, isAdmin: false });
+      const res = await evaluateAbuseGate({ personId: 'u1', rateLimit: 5, isAdmin: false });
       expect(res).toMatchObject({ allowed: false, reason: 'budget' });
     });
 
@@ -213,13 +259,33 @@ describe('abuse-controls', () => {
         .mockResolvedValueOnce(bump(1))  // rate ok
         .mockResolvedValueOnce(bump(1)); // budget ok
       const { evaluateAbuseGate } = await load();
-      expect(await evaluateAbuseGate({ userSub: 'u1', rateCeiling: 5, isAdmin: false })).toEqual({ allowed: true });
+      expect(await evaluateAbuseGate({ personId: 'u1', rateLimit: 5, isAdmin: false })).toEqual({ allowed: true });
     });
 
-    it('an exempt admin passes the per-user rate limit even over the ceiling', async () => {
-      // isAdmin skips the per-user rate counter entirely (no bump), so an over-ceiling admin still passes.
+    it('an exempt admin passes the per-user rate limit even over the limit', async () => {
+      // isAdmin skips the per-user rate counter entirely (no bump), so an admin over the limit still passes.
       const { evaluateAbuseGate } = await load();
-      expect(await evaluateAbuseGate({ userSub: 'admin', rateCeiling: 1, isAdmin: true })).toEqual({ allowed: true });
+      expect(await evaluateAbuseGate({ personId: 'admin', rateLimit: 1, isAdmin: true })).toEqual({ allowed: true });
+    });
+
+    it('a turn nobody asked for spends no person\'s rate limit or per-user budget, and the GLOBAL budget still counts it', async () => {
+      // A join recap: `personId` is the person it is FOR, who asked for nothing.
+      process.env.BEDROCK_USER_HOURLY_BUDGET = '1';
+      process.env.BEDROCK_GLOBAL_HOURLY_BUDGET = '10';
+      send.mockResolvedValueOnce(bump(3)); // the global counter, within its limit
+      const { evaluateAbuseGate } = await load();
+      expect(await evaluateAbuseGate({ personId: 'u-new', rateLimit: 1, isAdmin: false, machineWritten: true })).toEqual({ allowed: true });
+      const keys = send.mock.calls.map((c) => JSON.stringify(c[0].Key));
+      expect(keys).toEqual([expect.stringContaining('budget#global#')]);
+      expect(keys.join()).not.toContain('u-new');
+    });
+
+    it('the global budget refuses a turn nobody asked for, as it refuses every other', async () => {
+      process.env.BEDROCK_GLOBAL_HOURLY_BUDGET = '10';
+      send.mockResolvedValueOnce(bump(11));
+      const { evaluateAbuseGate } = await load();
+      expect(await evaluateAbuseGate({ personId: 'u-new', rateLimit: 1, isAdmin: false, machineWritten: true }))
+        .toMatchObject({ allowed: false, reason: 'budget', notice: { kind: 'budgetExhausted' } });
     });
   });
 });

@@ -1,108 +1,80 @@
 /**
- * routing-state — manages the pending drift-suggestion state across
- * Lex turns (in-flight in sessionAttributes, durable in Aurora).
+ * routing-state - the pending drift offer between the turn that makes it and the turn that answers it.
  *
- * The Aurora-backed paths (`savePendingSuggestion`, `readPendingSuggestion`,
- * `resolvePendingSuggestion`) require a live database — they're covered
- * by the e2e drift flow integration test, not unit-tested here.
+ * ONE STORE: Aurora `conversation_creation_tasks`. The offer used to ride the Amazon Lex session first,
+ * which a turn the channel flow answers does not have, so nothing here reads or writes a session.
  *
- * The pure paths (session serialization, decline-suppression bookkeeping,
- * yes/no reply classification) are tested below. These are the bits that
- * a Lex Lambda boundary failure would silently break, so a unit gate
- * matters even though they look trivial.
+ * The durable row is tested against a mocked query: what matters at this layer is that the row carries
+ * everything the answering turn needs, including the drift event its outcome is recorded on. The yes/no
+ * reply classification is tested below.
  */
 
+const mockQuery = jest.fn();
+jest.mock('../../lambda/src/analytics-aurora/db-client', () => ({
+  query: (...a: unknown[]) => mockQuery(...a),
+}));
+
+import * as routingState from '../../lambda/src/lib/routing-state';
 import {
-  readRoutingFromSession,
-  writeRoutingToSession,
-  recordDecline,
   classifyConfirmDeclineReply,
-  type PendingSuggestion,
-  type RoutingSessionAttributes,
+  savePendingSuggestion,
+  readPendingSuggestion,
 } from '../../lambda/src/lib/routing-state';
 
 describe('routing-state', () => {
-  describe('readRoutingFromSession', () => {
-    it('returns empty when sessionAttributes is undefined', () => {
-      expect(readRoutingFromSession(undefined)).toEqual({});
-    });
+  beforeEach(() => mockQuery.mockReset());
 
-    it('returns empty when the routing key is absent', () => {
-      expect(readRoutingFromSession({ someOtherKey: 'foo' })).toEqual({});
-    });
-
-    it('round-trips a pendingDriftSuggestion through write→read', () => {
-      const pending: PendingSuggestion = {
-        taskId: 't-1',
-        channelArn: 'arn:aws:chime:us-east-1:1:app-instance/i/channel/c1',
-        userSub: 'sub-1',
-        kind: 'confirm',
-        originatingMessageId: 'msg-1',
-        cosineDistance: 0.42,
-        correlationId: 'corr-1',
-        createdAt: '2026-05-22T00:00:00Z',
-      };
-      const written = writeRoutingToSession({}, { pendingDriftSuggestion: pending });
-      const read = readRoutingFromSession(written);
-      expect(read.pendingDriftSuggestion).toEqual(pending);
-    });
-
-    it('returns empty when the routing payload is malformed JSON', () => {
-      // Lex sessionAttributes is mutable across handlers — a buggy
-      // upstream could write a non-JSON value. Treat as missing.
-      const result = readRoutingFromSession({ agentEchelonRouting: '{broken' });
-      expect(result).toEqual({});
-    });
-
-    it('returns empty when the routing payload parses to a non-object', () => {
-      expect(readRoutingFromSession({ agentEchelonRouting: 'null' })).toEqual({});
-      expect(readRoutingFromSession({ agentEchelonRouting: '42' })).toEqual({});
-      expect(readRoutingFromSession({ agentEchelonRouting: '"oops"' })).toEqual({});
+  describe('no Amazon Lex session state', () => {
+    it('exports nothing that reads or writes a session', () => {
+      // The session helpers and the declined-distance list are gone: an open offer is read from Aurora,
+      // and a declined subject becomes a topic of the conversation (migration 044).
+      expect(Object.keys(routingState)).not.toEqual(expect.arrayContaining(['readRoutingFromSession']));
+      expect(Object.keys(routingState)).not.toEqual(expect.arrayContaining(['writeRoutingToSession']));
+      expect(Object.keys(routingState)).not.toEqual(expect.arrayContaining(['recordDecline']));
     });
   });
 
-  describe('writeRoutingToSession', () => {
-    it('preserves any non-routing keys in sessionAttributes', () => {
-      const result = writeRoutingToSession(
-        { foo: 'bar', baz: 'qux' },
-        { declinedDistances: [0.4] },
-      );
-      expect(result.foo).toBe('bar');
-      expect(result.baz).toBe('qux');
-      expect(result.agentEchelonRouting).toBeDefined();
+  describe('the durable offer carries its drift event', () => {
+    it('saves the drift event id on the row', async () => {
+      mockQuery.mockResolvedValueOnce({ rows: [{ task_id: 't-1', created_at: '2026-09-12T00:00:00Z' }] });
+
+      const saved = await savePendingSuggestion({
+        channelArn: 'arn:chan', personId: 'u1', kind: 'confirm', originatingMessageId: 'msg-1',
+        cosineDistance: 0.5, correlationId: 'corr-1', driftEventId: 'evt-1',
+      });
+
+      const [sql, params] = mockQuery.mock.calls[0];
+      expect(String(sql)).toContain('drift_event_id');
+      expect(params).toContain('evt-1');
+      expect(saved.driftEventId).toBe('evt-1');
     });
 
-    it('overwrites a previous routing payload', () => {
-      const first = writeRoutingToSession({}, { declinedDistances: [0.1] });
-      const second = writeRoutingToSession(first, { declinedDistances: [0.9] });
-      const read = readRoutingFromSession(second);
-      expect(read.declinedDistances).toEqual([0.9]);
-    });
-  });
+    it('reads it back, so the answering turn can record the outcome', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          task_id: 't-1', suggestion_kind: 'confirm', rival_conversation_arn: null, originating_message_id: 'msg-1',
+          cosine_distance: '0.5000', correlation_id: 'corr-1', drift_event_id: 'evt-1', created_at: '2026-09-12T00:00:00Z',
+        }],
+      });
 
-  describe('recordDecline', () => {
-    it('prepends the new distance + clears any pendingDriftSuggestion', () => {
-      const before: RoutingSessionAttributes = {
-        pendingDriftSuggestion: { taskId: 't', channelArn: 'a', userSub: 's', kind: 'confirm', originatingMessageId: 'm', correlationId: 'c', createdAt: 'now' },
-        declinedDistances: [0.5],
-      };
-      const after = recordDecline(before, 0.4);
-      expect(after.declinedDistances).toEqual([0.4, 0.5]);
-      expect(after.pendingDriftSuggestion).toBeUndefined();
+      const pending = await readPendingSuggestion({ personId: 'u1', channelArn: 'arn:chan' });
+
+      expect(pending).toEqual(expect.objectContaining({
+        taskId: 't-1', correlationId: 'corr-1', driftEventId: 'evt-1', originatingMessageId: 'msg-1',
+      }));
     });
 
-    it('caps the declined list at 3 entries (oldest evicted)', () => {
-      let routing: RoutingSessionAttributes = {};
-      routing = recordDecline(routing, 0.10);
-      routing = recordDecline(routing, 0.20);
-      routing = recordDecline(routing, 0.30);
-      routing = recordDecline(routing, 0.40);
-      expect(routing.declinedDistances).toEqual([0.40, 0.30, 0.20]);
-    });
+    it('an offer from before migration 044 simply has no drift event', async () => {
+      mockQuery.mockResolvedValueOnce({
+        rows: [{
+          task_id: 't-0', suggestion_kind: 'confirm', rival_conversation_arn: null, originating_message_id: 'msg-0',
+          cosine_distance: null, correlation_id: 'corr-0', drift_event_id: null, created_at: '2026-09-01T00:00:00Z',
+        }],
+      });
 
-    it('initialises declinedDistances when previously absent', () => {
-      const after = recordDecline({}, 0.42);
-      expect(after.declinedDistances).toEqual([0.42]);
+      const pending = await readPendingSuggestion({ personId: 'u1', channelArn: 'arn:chan' });
+
+      expect(pending).not.toHaveProperty('driftEventId');
     });
   });
 

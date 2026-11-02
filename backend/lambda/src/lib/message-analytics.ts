@@ -33,6 +33,8 @@ const MESSAGE_ANALYTICS_TABLE = process.env.MESSAGE_ANALYTICS_TABLE || '';
 // margin for replay/backfill, not a retention policy (Aurora is the durable store).
 const MESSAGE_ANALYTICS_TTL_DAYS = 7;
 
+// THE PROCESSOR'S OWN RECORD, ON ITS OWN ROLE: bookkeeping about a turn,
+// not something the assistant does, so it never goes out on the assistant's session.
 const ddb = DynamoDBDocumentClient.from(new DynamoDBClient({ region: AWS_REGION }), {
   marshallOptions: { removeUndefinedValues: true },
 });

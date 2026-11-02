@@ -3,7 +3,7 @@
  * (the "feedback join").
  *
  * Thumbs live in DynamoDB (the always-deployed UserFeedback table, owned by
- * the CognitoAuth stack), while the per-variant experiment metrics
+ * the Conversations stack), while the per-variant experiment metrics
  * (avg_score, latency, cost, …) come from Aurora. Rather than pipe thumbs into
  * Aurora via a second write path, they are aggregated at read time inside the
  * analytics-query Lambda: it already runs in the Aurora
@@ -103,6 +103,7 @@ export function selectVariantFeedbackRecords(
   sinceMs: number,
   includeBattle: boolean,
   variantId?: string | null,
+  untilMs = Infinity,
 ): FeedbackRecord[] {
   const wanted = (variantId ?? '').trim();
   return latestVotePerVoter(items)
@@ -112,7 +113,7 @@ export function selectVariantFeedbackRecords(
       if (!experimentId || !variant) return false;
       if (wanted && variant !== wanted) return false;
       const created = Date.parse(String(item.createdAt ?? ''));
-      if (!Number.isFinite(created) || created < sinceMs) return false;
+      if (!Number.isFinite(created) || created < sinceMs || created >= untilMs) return false;
       if (!includeBattle && item.assignmentMode === 'battle') return false;
       return item.feedback === 'up' || item.feedback === 'down';
     })
@@ -159,11 +160,13 @@ export function feedbackKey(experimentId: string, variantId: string, intent: str
  * @param items         scanned UserFeedback records (already projected)
  * @param sinceMs       epoch ms floor; records older than this are dropped
  * @param includeBattle when false, assignmentMode==='battle' records are dropped
+ * @param untilMs       epoch ms bound, exclusive; records at or after it are dropped
  */
 export function aggregateVariantFeedback(
   items: FeedbackItem[],
   sinceMs: number,
   includeBattle: boolean,
+  untilMs = Infinity,
 ): Map<string, VariantFeedback> {
   const map = new Map<string, VariantFeedback>();
   for (const item of latestVotePerVoter(items)) {
@@ -173,7 +176,7 @@ export function aggregateVariantFeedback(
     if (!experimentId || !variantId) continue;
 
     const created = Date.parse(String(item.createdAt ?? ''));
-    if (!Number.isFinite(created) || created < sinceMs) continue;
+    if (!Number.isFinite(created) || created < sinceMs || created >= untilMs) continue;
 
     if (!includeBattle && item.assignmentMode === 'battle') continue;
 
@@ -343,6 +346,7 @@ export function selectBattlePicks(
   items: BattleOutcomeItem[],
   sinceMs: number,
   variantId?: string | null,
+  untilMs = Infinity,
 ): BattleOutcomeItem[] {
   const wanted = (variantId ?? '').trim();
   return items
@@ -352,12 +356,16 @@ export function selectBattlePicks(
       if (!experimentId || !variant) return false;
       if (wanted && variant !== wanted) return false;
       const chosen = Date.parse(String(item.chosenAt ?? ''));
-      return Number.isFinite(chosen) && chosen >= sinceMs;
+      return Number.isFinite(chosen) && chosen >= sinceMs && chosen < untilMs;
     })
     .sort((a, b) => Date.parse(String(b.chosenAt ?? '')) - Date.parse(String(a.chosenAt ?? '')));
 }
 
-export function aggregateBattleWinsByVariant(items: BattleOutcomeItem[], sinceMs: number): Map<string, number> {
+export function aggregateBattleWinsByVariant(
+  items: BattleOutcomeItem[],
+  sinceMs: number,
+  untilMs = Infinity,
+): Map<string, number> {
   const map = new Map<string, number>();
   for (const item of items) {
     const experimentId = (item.experimentId ?? '').trim();
@@ -366,10 +374,93 @@ export function aggregateBattleWinsByVariant(items: BattleOutcomeItem[], sinceMs
     if (!experimentId || !variantId) continue;
 
     const chosen = Date.parse(String(item.chosenAt ?? ''));
-    if (!Number.isFinite(chosen) || chosen < sinceMs) continue;
+    if (!Number.isFinite(chosen) || chosen < sinceMs || chosen >= untilMs) continue;
 
     const key = battleWinKey(experimentId, variantId);
     map.set(key, (map.get(key) || 0) + 1);
   }
   return map;
+}
+
+// ---------------------------------------------------------------------------
+// The unit each human signal is tested in (DESIGN-EXPERIMENTS-BATTLE-DECISION-LOOP §4.2)
+//
+// A vote is one person's judgment of one reply, and a conversation holds many replies by the same version
+// to the same person, so votes inside one conversation are not independent. A pick is one person's judgment
+// of one DUEL, and several people may judge the same duel, so picks inside one duel are not independent
+// either. These group the counted votes and picks into those clusters; the tests in `experiment-stats.ts`
+// widen their intervals by the clustering (a design effect) without changing the rates.
+// ---------------------------------------------------------------------------
+
+/** One cluster of a binary signal: `successes` of its `n` counted observations. */
+export interface SignalCluster {
+  successes: number;
+  n: number;
+}
+
+/**
+ * The counted votes per (experiment, variant), grouped by CONVERSATION, under the same predicate the
+ * approval rate counts on (`selectVariantFeedbackRecords`). A vote with no conversation is its own cluster.
+ * Keyed by `battleWinKey(experimentId, variantId)`.
+ */
+export function approvalClustersByVariant(
+  items: FeedbackRecord[],
+  sinceMs: number,
+  includeBattle: boolean,
+  untilMs = Infinity,
+): Map<string, SignalCluster[]> {
+  const byVariant = new Map<string, Map<string, SignalCluster>>();
+  selectVariantFeedbackRecords(items, sinceMs, includeBattle, null, untilMs).forEach((item, i) => {
+    const key = battleWinKey(String(item.experimentId).trim(), String(item.variantId).trim());
+    const conversation = (item.channelArn ?? '').trim() || `#${i}`;
+    const clusters = byVariant.get(key) || new Map<string, SignalCluster>();
+    const c = clusters.get(conversation) || { successes: 0, n: 0 };
+    c.n += 1;
+    if (item.feedback === 'up') c.successes += 1;
+    clusters.set(conversation, c);
+    byVariant.set(key, clusters);
+  });
+  const out = new Map<string, SignalCluster[]>();
+  for (const [key, clusters] of byVariant) out.set(key, [...clusters.values()]);
+  return out;
+}
+
+/** The picks of one experiment grouped by DUEL, for the human axis. */
+export interface DuelPickClusters {
+  /** One cluster per duel: `successes` picks for the treatment, `n` decisive picks. */
+  clusters: SignalCluster[];
+  /** Decisive picks counted. */
+  picks: number;
+  /** Duels those picks judged. */
+  duels: number;
+}
+
+/**
+ * The decisive picks of one experiment, grouped by the duel they judged (`battleId`), under the same
+ * predicate `battle_wins` counts on (`selectBattlePicks`: ties and unattributed picks excluded, the date
+ * window applied). A pick with no `battleId` is its own duel. Only picks crediting `treatmentVariant` or
+ * `controlVariant` count.
+ */
+export function duelPickClusters(
+  items: BattleOutcomeItem[],
+  experimentId: string,
+  sinceMs: number,
+  untilMs = Infinity,
+  treatmentVariant = 'treatment',
+  controlVariant = 'control',
+): DuelPickClusters {
+  const byDuel = new Map<string, SignalCluster>();
+  let picks = 0;
+  selectBattlePicks(items, sinceMs, null, untilMs).forEach((p, i) => {
+    if ((p.experimentId ?? '').trim() !== experimentId) return;
+    const variant = (p.variantId ?? '').trim();
+    if (variant !== treatmentVariant && variant !== controlVariant) return;
+    const duel = (p.battleId ?? '').trim() || `#${i}`;
+    const c = byDuel.get(duel) || { successes: 0, n: 0 };
+    c.n += 1;
+    if (variant === treatmentVariant) c.successes += 1;
+    byDuel.set(duel, c);
+    picks += 1;
+  });
+  return { clusters: [...byDuel.values()], picks, duels: byDuel.size };
 }

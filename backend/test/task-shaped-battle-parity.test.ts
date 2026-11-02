@@ -1,14 +1,14 @@
 /**
  * A task-shaped duel is dispatched with everything a placeholder-shaped one gets (ADR-026).
  *
- * WHY A RATCHET AND NOT A BEHAVIOURAL TEST. The defect was a SECOND COPY of a worker payload: the
+ * WHY A RATCHET AND NOT A BEHAVIORAL TEST. The defect was a SECOND COPY of a worker payload: the
  * `TASK_MULTI_STEP` branch was written before the round-1 handoff and never caught up, so it omitted
  * `battleContext`, `variantProfile`, `placeholderMessageId` and the attachment. Every one of those
  * omissions is silent - the duel still answers, nothing errors, no test fails - and the consequences
  * only show up as a duel that closes with "didn't finish in time" for both sides, or as an experiment
  * reporting "indistinguishable" because both arms quietly ran the profile's active version.
  *
- * A behavioural test would pin ONE payload field at a time and pass while the next one was dropped.
+ * A behavioral test would pin ONE payload field at a time and pass while the next one was dropped.
  * What actually prevents recurrence is that the payload has ONE definition, so this asserts the shape
  * of the code: defined once, spread into both dispatches, never inlined again.
  *
@@ -75,7 +75,16 @@ describe('a duel side keeps its state transitions', () => {
     // while carrying a chain's continuation. Guarding the lookups on `battleCtx` did not cover the duel
     // case either - a flow-callback turn carries no battle context - so the gate admits any turn in a
     // conversation, and the short-message saving is the requester-keyed fallback below it.
-    expect(code).toContain('if (battleCtx || channelArn || !shortAcknowledgment) {');
+    // The gate admits any turn in a conversation. It now also EXCLUDES a turn this system dispatched
+    // to itself, which is not a person answering anything and which this region was misrouting: a
+    // triage re-dispatch matched the chain-resume path and was sent on as an ordinary turn, so the
+    // reading never ran. Asserted as two facts rather than one literal, so a rewording of the
+    // condition does not fail this while a change of MEANING still does.
+    expect(code).toMatch(/battleCtx || channelArn || !shortAcknowledgment/);
+    // WIDENED to isMachineWrittenTurn (triage OR a stop evaluation): a stop evaluation is also
+    // machine-written and was excluded nowhere, so a /stop applied the machine prompt as the person
+    // answer to an awaiting task. The rule asserted here is unchanged; the set it covers is larger.
+    expect(code).toContain('&& !isMachineWrittenTurn(event)) {');
     expect(code).toMatch(/const shortAcknowledgment = classification\.intent === IntentType\.GREETING/);
   });
 
@@ -85,7 +94,7 @@ describe('a duel side keeps its state transitions', () => {
     // DIRECT so the task branch is skipped, and the exchange is attributed to the wrong intent.
     const correctedAt = code.indexOf('if (resumedWaitingWork && shortAcknowledgment) {');
     const relabelledAt = code.indexOf('classification.intent = IntentType.GENERAL;', correctedAt);
-    const quickReplyAt = code.indexOf('getQuickResponse(lexIntentName, userMessage)');
+    const quickReplyAt = code.indexOf('quickReply(classification, await turnWords())');
     expect(correctedAt).toBeGreaterThan(-1);
     expect(relabelledAt).toBeGreaterThan(correctedAt);
     // And it is corrected BEFORE anything reads it, which is what makes one correction enough.
@@ -141,9 +150,24 @@ describe('a duel side keeps its state transitions', () => {
   it('a task-shaped duel side returns a placeholder carrying the battle marker', () => {
     // Without the marker the frontend does not render the turn as a duel side, so a task-shaped duel
     // showed two ordinary task placeholders and no scorecard. Both return paths compose it through the
-    // one helper.
-    expect(count('battlePlaceholderContent({')).toBe(2);
+    // one helper. The third call is the round-2 placeholder the router posts as the side for a rebuttal
+    // (`dispatchRebuttalRound`), which composes its markers through the same helper.
+    expect(count('battlePlaceholderContent({')).toBe(3);
     expect(code).toContain('lead: getTaskPlaceholder(');
+  });
+
+  it('BOTH duel-side placeholders declare the message they answer, from the one id the turn holds', () => {
+    // The task-shaped branch is the one a behavioral test does not reach without a task-classifying
+    // model, and it is exactly the branch that has been written once and left behind before (the
+    // `battleContext`, `variantProfile` and attachment omissions this file exists for). Pinned as a
+    // count so a third duel return path cannot be added that quietly declares nothing.
+    //
+    // Through `declaredAnswerId()`, which is the handover message when the turn was handed over and
+    // `knownInboundMessageId` otherwise - never a fresh lookup: the declaration may never buy a channel
+    // read, which is the rule `placeholderContent` states directly above these branches.
+    expect(count('answersMessageId: declaredAnswerId()')).toBe(2);
+    expect(code).toContain('const declaredAnswerId = (): string => handoverMessageIdForTurn || knownInboundMessageId;');
+    expect(code).not.toContain('answersMessageId: (await inboundMessage())');
   });
 });
 
@@ -153,7 +177,7 @@ describe('a task-shaped side waits for its chain before the next round', () => {
   );
 
   it('the WAITING branch is checked BEFORE the round-1 terminal transition', () => {
-    // Ordering is the behaviour: reaching `recordBattleTerminalAndFireOrchestrator` first would complete
+    // Ordering is the behavior: reaching `recordBattleTerminalAndFireOrchestrator` first would complete
     // the side and fire round 2 against a half-finished chain, which is the rebuttal-of-a-half-report
     // case ADR-026 exists to stop.
     //
@@ -198,10 +222,25 @@ describe('silence is only safe when something else will finish', () => {
     expect(code).toMatch(/BYPASS_PLACEHOLDER_ATTR\]\s*&&\s*spoke\.dispatched/);
   });
 
-  it('every dispatch records that it dispatched', () => {
-    // One per `invokeAsync`. A dispatch that forgets makes the entry post a duplicate message.
-    expect(count('spoke.dispatched = true')).toBe(2);
-    expect(count('await invokeAsync(asyncProcessorArn, {')).toBe(2);
+  it('every dispatch records WHAT THE INVOKE DID, never a literal true', () => {
+    // One per `invokeAsync`. A dispatch that forgets to record makes the entry post a duplicate
+    // message, which is why the count is pinned.
+    //
+    // ── AND THE VALUE MATTERS AS MUCH AS THE COUNT (code review, 2026-09-11) ──────────────────
+    //
+    // This asserted `spoke.dispatched = true` and was green while the flag LIED. `invokeAsync`
+    // returns whether the processor was handed the turn, and the line above each of these already
+    // uses that result to decide whether the lock is released - then the flag was set true anyway.
+    // A throttled Invoke therefore reported a running worker, both silent-return guards believed
+    // it, and the entry returned silence for a turn nothing was running.
+    //
+    // Pinned at zero literals so the flag cannot drift back to a constant: the two values have to
+    // agree by construction, because the failure they disagree about is invisible - the turn
+    // returns successfully and simply never answers.
+    expect(count('spoke.dispatched = dispatched')).toBe(2);
+    expect(count('spoke.dispatched = true')).toBe(0);
+    // Each dispatch runs beside the room's naming, so it is awaited inside the `Promise.all` that starts both.
+    expect(count('await Promise.all([invokeAsync(asyncProcessorArn, {')).toBe(2);
   });
 });
 
@@ -219,5 +258,17 @@ describe('a waiting duel side resumes on every path that can answer it', () => {
     // duel (fail-open when unrecorded), same as the chain branch above it.
     expect(code).toMatch(/if \(!activeTask && !battleCtx && channelArn\) \{/);
     expect(code).toMatch(/const waitingOn = duel\?\.initiatorUserSub;/);
+  });
+
+  it('a resumed side names the message it parked on, so its answer control comes down', () => {
+    // The side's `waitingMessageId` carries the `<!--battlewaiting-->` marker the chat app draws the
+    // "Reply to this side" control from. The resumed turn clears it (`clearWaitingMarkerMessageId`),
+    // so a side that has its answer stops offering to take one.
+    const resume = code.slice(
+      code.indexOf('async function resumeDuelSideIfWaiting('),
+      code.indexOf('function handedOverFrom('),
+    );
+    expect(resume).toMatch(/\.waitingMessageId;/);
+    expect(resume).toMatch(/clearWaitingMarkerMessageId: waitingMessageId/);
   });
 });

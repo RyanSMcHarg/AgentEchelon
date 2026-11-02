@@ -1,11 +1,12 @@
 /**
  * Document Retrieval — RAG proof-point retriever.
  *
- * Companion to `document-ingestion.ts`. Embeds a query, runs a
- * pgvector cosine-NN against the `embeddings` table (schema migration
- * 008), filters by `source_type` and (optionally) classification metadata, and
- * returns top-K chunks plus citations in a shape the async processor
- * can fold into the system prompt.
+ * Companion to `document-ingestion.ts`. Embeds a query and ranks the `embeddings` table (schema
+ * migration 008) two ways in one statement: a pgvector cosine-NN (the vector leg) and a keyword match
+ * over the `content_tsv` lexical index (the lexical leg, schema migration 081). Both legs filter by
+ * `source_type` and classification metadata. The two rankings are fused by reciprocal rank fusion
+ * (`fuseRetrievalLegs`) into the top-K chunks plus citations, in a shape the async processor can fold
+ * into the system prompt.
  *
  * ADR-001 + ADR-002 anchoring:
  *   - Aurora pgvector as the KB backing (no Bedrock KB on OpenSearch)
@@ -20,7 +21,7 @@ import {
   BedrockRuntimeClient,
   InvokeModelCommand,
 } from '@aws-sdk/client-bedrock-runtime';
-import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry.js';
+import { defaultProfileRegistry as profiles } from '../../../lib/profile-registry';
 import { withReaderRole } from './classification-boundary.js';
 
 const bedrock = new BedrockRuntimeClient({});
@@ -48,12 +49,30 @@ export interface RetrieveContextInput {
    * Minimum cosine similarity (0..1) for a chunk to be returned.
    * Default 0.35 — below that, content is too tangentially related to
    * justify spending prompt budget on. Tunable per-deployment.
+   *
+   * It admits a chunk through EITHER leg: a chunk the lexical leg found that also clears this floor is
+   * admitted like any other. A lexical hit below it is admitted only on `minLexicalCoverage`.
    */
   minSimilarity?: number;
   /**
-   * REQUIRED classification filter — the caller's classification and everything below it, as
-   * `profiles.scopeAtOrBelow(classification)`. Restricts chunks to those whose `metadata.classification` is in
+   * Minimum lexical coverage (0..1) for a chunk the lexical leg found to be admitted although its
+   * cosine similarity is below `minSimilarity`. Coverage is the share of the query's term weight the
+   * chunk contains, each term weighted by its rarity in the scoped corpus (see `retrieveContext`).
+   * Default 0.5: a lexical-only passage has to carry at least half of what is informative in the
+   * question. A chunk that shares only words most chunks contain stays out, which is the same
+   * "too tangential to spend prompt budget on" judgment the similarity floor makes.
+   */
+  minLexicalCoverage?: number;
+  /**
+   * REQUIRED classification filter — the classifications the caller's classification may reach, as
+   * `profiles.grantsFor(classification)`. Restricts chunks to those whose `metadata.classification` is in
    * this list. Implements ADR-007 (KB permission filters).
+   *
+   * THE GRANT SET, NOT THE RANK LADDER. The reader role this query runs as is scoped by `grantsFor`
+   * (`scopeFunctionSql`), and so are the S3 context prefixes (`contextPrefixesGranted`). This filter
+   * and the check below compared against `grantsFor`, which is the same list for a pure ladder and
+   * a different one for a non-contiguous grant set: the filter then named classifications the role
+   * withholds, so the two controls stopped describing one boundary.
    *
    * Required, and separately re-checked at runtime, because this is a read boundary: it used to be
    * optional, and an omitted scope produced NO filter at all rather than no results, so a single caller
@@ -64,7 +83,7 @@ export interface RetrieveContextInput {
   /**
    * REQUIRED. The caller's OWN classification - the immutable channel tag the router resolved, not a
    * derived list. It selects the database reader role this query runs as (ADR-028), which is the
-   * boundary; `classificationScope` above is the query filter, which is defence in depth.
+   * boundary; `classificationScope` above is the query filter, which is defense in depth.
    *
    * WHY BOTH, when one is derivable from the other. It is NOT safely derivable: taking the top of
    * `classificationScope` would mean a caller that built a too-wide scope also got a too-privileged
@@ -81,8 +100,17 @@ export interface RetrievedChunk {
   title: string | null;
   chunkIndex: number | null;
   content: string;
+  /** Cosine similarity to the query, for every chunk whichever leg found it. */
   similarity: number;
+  /**
+   * Which retrieval legs admitted this chunk, vector first. Always set by `retrieveContext`; optional
+   * so a chunk built elsewhere (a fixture, a cached result) need not invent one.
+   */
+  foundBy?: RetrievalLeg[];
 }
+
+/** The two rankings retrieval fuses. */
+export type RetrievalLeg = 'vector' | 'lexical';
 
 export interface Citation {
   index: number;
@@ -100,6 +128,116 @@ export interface RetrieveContextResult {
 
 const EMPTY: RetrieveContextResult = { chunks: [], citations: [], signalAvailable: true };
 
+/** How many candidates each leg contributes to the fusion. Twice the largest topK, so a chunk ranked
+ *  moderately by both legs can still outscore one ranked highly by a single leg. */
+const CANDIDATES_PER_LEG = 20;
+/** The most query terms the lexical leg weighs and matches; each costs one index scan. */
+const MAX_QUERY_TERMS = 32;
+/** A query term at least this long is matched as a prefix of an indexed token. */
+const PREFIX_MIN_CHARS = 4;
+/** The most query characters the lexical leg tokenizes (the embedding reads up to 8000). */
+const MAX_LEXICAL_QUERY_CHARS = 2000;
+/**
+ * The reciprocal rank fusion constant. 60 is the value Cormack, Clarke and Buettcher (SIGIR 2009)
+ * found robust across collections; it flattens the head of each ranking so that agreement between
+ * the legs outweighs a single leg's first place.
+ */
+export const RRF_K = 60;
+
+interface HybridCandidateRow {
+  source_id: string;
+  source_type: string;
+  title: string | null;
+  chunk_index: number | null;
+  content: string;
+  similarity: number;
+  /** 1-based rank in the vector leg's candidates; null when the vector leg did not return the chunk. */
+  vector_rank: number | null;
+  /** 1-based rank in the lexical leg's candidates; null when the lexical leg did not return the chunk. */
+  lexical_rank: number | null;
+  /** Share of the query's term weight the chunk contains, 0..1; null when not a lexical candidate. */
+  lexical_coverage: number | null;
+}
+
+/** One chunk as a candidate for fusion: what each leg said about it. */
+export interface RetrievalCandidate {
+  chunk: Omit<RetrievedChunk, 'foundBy'>;
+  vectorRank: number | null;
+  lexicalRank: number | null;
+  lexicalCoverage: number | null;
+}
+
+/**
+ * Fuse the two legs' candidates into the final top-K, by reciprocal rank fusion.
+ *
+ * ADMISSION, per leg, before any ranking:
+ *  - the vector leg admits a chunk whose cosine similarity is at least `minSimilarity` (the floor
+ *    retrieval has always applied);
+ *  - the lexical leg admits a chunk that clears that same floor, OR whose lexical coverage is at least
+ *    `minLexicalCoverage`. The second condition is what lets an exact identifier the embedding
+ *    underrates through, and it is a coverage floor rather than "any match" so that a chunk sharing
+ *    only common words with the question is still kept out.
+ * A chunk neither leg admits is dropped. Ranks are then re-counted among the admitted candidates of
+ * each leg, so a dropped chunk does not hold a rank.
+ *
+ * SCORE: the sum over the legs that admitted the chunk of 1 / (RRF_K + rank). Ranks, not scores, are
+ * fused because cosine similarity and the lexical weight are on unrelated scales.
+ *
+ * ORDER, with ties broken deterministically: higher fused score; then the better vector rank (a chunk
+ * the vector leg admitted before one it did not); then the better lexical rank; then source, type and
+ * chunk index. Breaking ties on the vector leg first is also what makes an empty lexical leg return
+ * exactly the vector leg's order.
+ *
+ * Pure, so the fusion rule is tested without a database.
+ */
+export function fuseRetrievalLegs(
+  candidates: RetrievalCandidate[],
+  opts: { topK: number; minSimilarity: number; minLexicalCoverage: number },
+): RetrievedChunk[] {
+  const admitted = candidates.map((c) => {
+    const passesFloor = c.chunk.similarity >= opts.minSimilarity;
+    const vector = c.vectorRank != null && passesFloor;
+    const lexical = c.lexicalRank != null
+      && (passesFloor || (c.lexicalCoverage ?? 0) >= opts.minLexicalCoverage);
+    return { c, vector, lexical };
+  }).filter((a) => a.vector || a.lexical);
+
+  // Code-unit order rather than localeCompare, so the tie-break does not depend on the runtime's locale.
+  const byCodeUnit = (x: string, y: string) => (x < y ? -1 : x > y ? 1 : 0);
+  const byKey = (x: RetrievalCandidate, y: RetrievalCandidate) =>
+    byCodeUnit(x.chunk.sourceId, y.chunk.sourceId)
+    || byCodeUnit(x.chunk.sourceType, y.chunk.sourceType)
+    || ((x.chunk.chunkIndex ?? -1) - (y.chunk.chunkIndex ?? -1));
+  const rankOrLast = (r: number | null) => (r == null ? Number.POSITIVE_INFINITY : r);
+
+  const reRank = (leg: 'vector' | 'lexical'): Map<RetrievalCandidate, number> => {
+    const rankOf = (c: RetrievalCandidate) => (leg === 'vector' ? c.vectorRank : c.lexicalRank);
+    const inLeg = admitted.filter((a) => a[leg]).map((a) => a.c);
+    inLeg.sort((x, y) => (rankOrLast(rankOf(x)) - rankOrLast(rankOf(y))) || byKey(x, y));
+    return new Map(inLeg.map((c, i) => [c, i + 1]));
+  };
+  const vectorRanks = reRank('vector');
+  const lexicalRanks = reRank('lexical');
+
+  const scored = admitted.map(({ c }) => {
+    const vr = vectorRanks.get(c) ?? null;
+    const lr = lexicalRanks.get(c) ?? null;
+    const score = (vr != null ? 1 / (RRF_K + vr) : 0) + (lr != null ? 1 / (RRF_K + lr) : 0);
+    const foundBy: RetrievalLeg[] = [];
+    if (vr != null) foundBy.push('vector');
+    if (lr != null) foundBy.push('lexical');
+    return { c, vr, lr, score, foundBy };
+  });
+
+  scored.sort((a, b) =>
+    (b.score - a.score)
+    || (rankOrLast(a.vr) - rankOrLast(b.vr))
+    || (rankOrLast(a.lr) - rankOrLast(b.lr))
+    || byKey(a.c, b.c));
+
+  return scored.slice(0, opts.topK).map((s) => ({ ...s.c.chunk, foundBy: s.foundBy }));
+}
+
 export async function retrieveContext(
   input: RetrieveContextInput,
 ): Promise<RetrieveContextResult> {
@@ -113,7 +251,7 @@ export async function retrieveContext(
   if (!Array.isArray(input.classificationScope) || input.classificationScope.length === 0) {
     throw new Error(
       '[document-retrieval] classificationScope is required and must be non-empty: retrieval is '
-      + 'classification-scoped (ADR-007) and will not run unscoped. Pass profiles.scopeAtOrBelow(classification).',
+      + 'classification-scoped (ADR-007) and will not run unscoped. Pass profiles.grantsFor(classification).',
     );
   }
 
@@ -131,7 +269,7 @@ export async function retrieveContext(
   // The filter and the privilege must describe the same ladder. If they disagree, one of them is
   // wrong and there is no way to tell which - so neither is used. This is the check that keeps the
   // two controls independent instead of letting the wider one win.
-  const expectedScope = profiles.scopeAtOrBelow(input.classification);
+  const expectedScope = profiles.grantsFor(input.classification);
   const scopeMatches = input.classificationScope.length === expectedScope.length
     && [...input.classificationScope].sort().join(',') === [...expectedScope].sort().join(',');
   if (!scopeMatches) {
@@ -147,6 +285,7 @@ export async function retrieveContext(
 
   const topK = Math.max(1, Math.min(input.topK ?? 4, 10));
   const minSim = input.minSimilarity ?? 0.35;
+  const minLexicalCoverage = input.minLexicalCoverage ?? 0.5;
   const sourceTypes = input.sourceTypes ?? ['wiki', 'doc'];
 
   // Embed the query.
@@ -157,12 +296,8 @@ export async function retrieveContext(
 
   const vectorLiteral = `[${queryEmbedding.join(',')}]`;
 
-  // pgvector cosine-distance NN. `<=>` is the cosine-distance operator;
-  // similarity = 1 - distance. Filter by source_type at SQL level (not
-  // post-filter) so the HNSW index can prune correctly. Optionally
-  // filter by classification metadata.
   // FAIL-CLOSED classification gate: a chunk is returned only if its `metadata.classification` is in
-  // the caller's scope (their classification and below). An untagged chunk is NOT returned — the
+  // the caller's scope (what their classification grants). An untagged chunk is NOT returned — the
   // previous `IS NULL OR …` made every untagged chunk visible to every classification, and since
   // ingestion tagged nothing, that leaked ALL KB content to ALL classifications. Ingestion now stamps
   // the `classification` metadata key (document-ingestion.ts, fail-closed default); legacy rows
@@ -173,11 +308,16 @@ export async function retrieveContext(
   // which withholds content rather than leaking it. Accepting both names via COALESCE would have been
   // more forgiving and would have kept a second spelling alive on a security boundary indefinitely.
   // Scope was validated at the top of the function, so the filter is unconditional here.
-  const classificationClause = `AND metadata->>'classification' = ANY($3::text[])`;
-  const params: unknown[] = [vectorLiteral, sourceTypes, input.classificationScope];
+  //
+  // EVERY READ OF `embeddings` IN THE STATEMENT BELOW CARRIES IT: both legs, the corpus count and the
+  // per-term document counts the lexical weights come from, and the final fetch. A term weight computed
+  // over chunks the caller cannot read would leak how often a word occurs at another classification.
+  const scopeFilter = (alias: string) =>
+    `${alias}source_type = ANY($2::text[]) AND ${alias}metadata->>'classification' = ANY($3::text[])`;
+  const params: unknown[] = [vectorLiteral, sourceTypes, input.classificationScope, text.slice(0, MAX_LEXICAL_QUERY_CHARS)];
 
   // ADR-028: the query runs as this classification's READER ROLE, not as the shared owner. Row-level
-  // security admits only rows at or below that role's ladder, so the clause above becomes defence in
+  // security admits only rows at or below that role's ladder, so the clause above becomes defense in
   // depth rather than the boundary itself - if it were deleted tomorrow, this query would still not
   // see a premium chunk on a basic turn.
   //
@@ -185,38 +325,106 @@ export async function retrieveContext(
   // pooled `query()` for a specific reason: `query()` opens no transaction, and a bare `SET ROLE`
   // there would persist on the pooled connection into the NEXT invocation - possibly a different
   // classification - which is the leak this control exists to prevent.
-  const result = await withReaderRole(input.classification, (client) => client.query<{
-    source_id: string;
-    source_type: string;
-    title: string | null;
-    chunk_index: number | null;
-    content: string;
-    similarity: number;
-  }>(
-    `SELECT source_id,
-            source_type,
-            title,
-            chunk_index,
-            content,
-            1 - (embedding <=> $1::vector) AS similarity
-       FROM embeddings
-      WHERE source_type = ANY($2::text[])
-        ${classificationClause}
-      ORDER BY embedding <=> $1::vector
-      LIMIT ${topK}`,
+  //
+  // ONE STATEMENT, BOTH LEGS. The two rankings are CTEs of a single query, so hybrid retrieval costs
+  // the same one round trip under the same role that vector-only retrieval did.
+  //
+  //  - vector_leg: pgvector cosine-distance NN. `<=>` is the cosine-distance operator; similarity =
+  //    1 - distance. Filtered by source_type and scope at SQL level (not post-filter), ordered by
+  //    distance with a LIMIT so the HNSW index serves it.
+  //  - query_terms: the query tokenized by the SAME parser and configuration as `content_tsv`
+  //    (`to_tsvector('simple', ...)`), so a term means exactly what the index means by it. A term of
+  //    PREFIX_MIN_CHARS or more is matched as a prefix (`persona:*` reaches `personaref`); a shorter one
+  //    exactly, because a one- or two-character prefix matches nearly everything. A lexeme carrying a
+  //    quote or a backslash is skipped rather than escaped into tsquery syntax. At most MAX_QUERY_TERMS
+  //    terms, the longest first, so a pasted page cannot turn one retrieval into hundreds of index scans.
+  //  - term_weights: each term weighted by its rarity in the caller's scoped corpus, the BM25 inverse
+  //    document frequency ln(1 + (N - df + 0.5) / (df + 0.5)). This is what keeps "the", "de"
+  //    and every other common word from ranking a chunk, without a stop-word list chosen for one
+  //    language: a word most chunks contain weighs almost nothing in any language. A term no chunk
+  //    contains keeps the full weight, so a question about something absent cannot be carried by its
+  //    common words.
+  //  - lexical_leg: chunks matching any term, scored by the summed weight of the terms they contain.
+  //    `lexical_coverage` is that score over the summed weight of every query term, 0..1.
+  const result = await withReaderRole(input.classification, (client) => client.query<HybridCandidateRow>(
+    `WITH vector_leg AS (
+       SELECT id, (row_number() OVER (ORDER BY distance, id))::int AS vector_rank
+         FROM (SELECT id, embedding <=> $1::vector AS distance
+                 FROM embeddings
+                WHERE ${scopeFilter('')}
+                ORDER BY embedding <=> $1::vector
+                LIMIT ${CANDIDATES_PER_LEG}) nearest
+     ),
+     query_terms AS (
+       SELECT chr(39) || lexeme || chr(39)
+                || CASE WHEN char_length(lexeme) >= ${PREFIX_MIN_CHARS} THEN ':*' ELSE '' END AS term
+         FROM unnest(tsvector_to_array(to_tsvector('simple'::regconfig, $4::text))) AS lexeme
+        WHERE strpos(lexeme, chr(39)) = 0 AND strpos(lexeme, chr(92)) = 0
+        ORDER BY char_length(lexeme) DESC, lexeme
+        LIMIT ${MAX_QUERY_TERMS}
+     ),
+     scoped_corpus AS (
+       SELECT count(*)::float8 AS n
+         FROM embeddings
+        WHERE ${scopeFilter('')}
+     ),
+     term_weights AS (
+       SELECT to_tsquery('simple'::regconfig, t.term) AS tq,
+              ln(1 + (c.n - d.df + 0.5) / (d.df + 0.5)) AS weight
+         FROM query_terms t
+         CROSS JOIN scoped_corpus c
+         CROSS JOIN LATERAL (
+           SELECT count(*)::float8 AS df
+             FROM embeddings
+            WHERE content_tsv @@ to_tsquery('simple'::regconfig, t.term)
+              AND ${scopeFilter('')}
+         ) d
+     ),
+     lexical_leg AS (
+       SELECT id,
+              lexical_score / NULLIF((SELECT sum(weight) FROM term_weights), 0) AS lexical_coverage,
+              (row_number() OVER (ORDER BY lexical_score DESC, id))::int AS lexical_rank
+         FROM (SELECT m.id,
+                      (SELECT sum(w.weight) FROM term_weights w WHERE m.content_tsv @@ w.tq) AS lexical_score
+                 FROM embeddings m
+                WHERE m.content_tsv @@ (SELECT to_tsquery('simple'::regconfig, string_agg(term, ' | ')) FROM query_terms)
+                  AND ${scopeFilter('m.')}
+                ORDER BY lexical_score DESC, m.id
+                LIMIT ${CANDIDATES_PER_LEG}) matched
+     )
+     SELECT e.source_id,
+            e.source_type,
+            e.title,
+            e.chunk_index,
+            e.content,
+            1 - (e.embedding <=> $1::vector) AS similarity,
+            v.vector_rank,
+            l.lexical_rank,
+            l.lexical_coverage
+       FROM (SELECT id FROM vector_leg UNION SELECT id FROM lexical_leg) candidate
+       JOIN embeddings e ON e.id = candidate.id
+       LEFT JOIN vector_leg v ON v.id = candidate.id
+       LEFT JOIN lexical_leg l ON l.id = candidate.id
+      WHERE ${scopeFilter('e.')}`,
     params,
   ));
 
-  const chunks: RetrievedChunk[] = result.rows
-    .filter((r) => r.similarity >= minSim)
-    .map((r) => ({
-      sourceId: r.source_id,
-      sourceType: r.source_type,
-      title: r.title,
-      chunkIndex: r.chunk_index,
-      content: r.content,
-      similarity: r.similarity,
-    }));
+  const chunks: RetrievedChunk[] = fuseRetrievalLegs(
+    result.rows.map((r) => ({
+      chunk: {
+        sourceId: r.source_id,
+        sourceType: r.source_type,
+        title: r.title,
+        chunkIndex: r.chunk_index,
+        content: r.content,
+        similarity: r.similarity,
+      },
+      vectorRank: r.vector_rank,
+      lexicalRank: r.lexical_rank,
+      lexicalCoverage: r.lexical_coverage,
+    })),
+    { topK, minSimilarity: minSim, minLexicalCoverage },
+  );
 
   // Citations: deduplicate by sourceId so multiple chunks from the same
   // doc share one citation index. The chunk text in the prompt carries

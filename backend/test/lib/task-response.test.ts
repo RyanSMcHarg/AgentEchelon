@@ -47,7 +47,7 @@ const stateWrites = () =>
 const ownerWrites = () =>
   cmds().filter((c) => c.__type === 'Update')
     .map((c) => String(c.input.UpdateExpression ?? ''))
-    .filter((e) => e.includes('ownerId'));
+    .filter((e) => e.includes('assigneeId'));
 
 function task(over: Partial<Task> = {}): Task {
   return {
@@ -57,8 +57,8 @@ function task(over: Partial<Task> = {}): Task {
     taskState: 'collecting_requirements',
     status: 'in_progress',
     userArn: `arn:aws:chime:us-east-1:111:app-instance/i/user/${USER_SUB}`,
-    ownerId: USER_SUB,
-    ownerType: 'user',
+    assigneeId: USER_SUB,
+    assigneeType: 'user',
     deliveryOption: DeliveryOption.TASK_MULTI_STEP,
     createdAt: '2026-08-13T00:00:00.000Z',
     updatedAt: '2026-08-13T00:00:00.000Z',
@@ -104,7 +104,7 @@ describe('applyUserResponseToTask', () => {
     const { applyUserResponseToTask } = await import('../../lambda/src/lib/task-tracking');
     // `extracting` is the assistant's own work. A remark while it runs is conversation, not a response,
     // and advancing on it would skip a step nobody completed.
-    withTask(task({ taskState: 'extracting', ownerId: BOT_ID, ownerType: 'assistant' }));
+    withTask(task({ taskState: 'extracting', assigneeId: BOT_ID, assigneeType: 'assistant' }));
 
     const r = await applyUserResponseToTask({
       taskId: 't1', channelArn: CHANNEL, assistantId: BOT_ID,

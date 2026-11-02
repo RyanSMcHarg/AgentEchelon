@@ -16,15 +16,24 @@
  * boundary; the negative assertions in tests/e2e/classification-context.spec.ts are what prove the
  * boundary actually holds.
  */
-import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA } from '../demo/personas';
+import { BASIC_PERSONA, STANDARD_PERSONA, PREMIUM_PERSONA, OPS_PERSONA } from '../demo/personas';
 import { serializeSeedDefinition } from '../lambda/src/lib/active-profile';
 import { SSM_STANDARD_TIER_MAX } from '../lambda/src/lib/seed-profile-definitions';
+import { defaultProfileRegistry } from '../lib/profile-registry';
 
+// THE PROFILE NAMES COME FROM THE REGISTRY, not from a literal. They were `basic`/`standard`/
+// `premium` here, which is the same coincidence the config itself carried: a profile named after the
+// classification it serves. When the config renamed them, `serializeSeedDefinition` returned null for
+// every unknown name and this reported a budget failure rather than a stale fixture. Reading the
+// registry means a future rename moves this test with it.
 const PERSONAS = [
-  { name: 'basic', persona: BASIC_PERSONA },
-  { name: 'standard', persona: STANDARD_PERSONA },
-  { name: 'premium', persona: PREMIUM_PERSONA },
-] as const;
+  { classification: 'basic', persona: BASIC_PERSONA },
+  { classification: 'standard', persona: STANDARD_PERSONA },
+  { classification: 'premium', persona: PREMIUM_PERSONA },
+].map(({ classification, persona }) => ({
+  name: defaultProfileRegistry.requireProfileFor(classification).name,
+  persona,
+}));
 
 describe('demo personas', () => {
   describe('fit the parameter budget', () => {
@@ -99,5 +108,126 @@ describe('demo personas', () => {
       // complies, or opens with "as an AI assistant".
       expect(p).toContain('as an ai assistant');
     });
+  });
+});
+
+/**
+ * AN ASSISTANT DECIDES ONCE: IT ANSWERS, OR IT DECLINES.
+ *
+ * Observed live on a standard conversation. Asked what causes tides, the assistant answered in full -
+ * "the gravitational pull of the Moon on Earth's oceans, with the Sun playing a secondary role" - and
+ * THEN said "This is outside my scope as Stratum's assistant".
+ *
+ * Two gaps produced that, and only one of them was about ordering.
+ *
+ *  1. The rule was one-directional. It said "never refuse and then comply", which is the opposite
+ *     failure. Complying and then refusing is the worse of the two: the answer is already given, so
+ *     the disclaimer only tells the person the assistant knew it should not have given it.
+ *
+ *  2. Scope was defined entirely in terms of ACCESS - what this tier may read of the company corpus.
+ *     Nothing said what to do with a question that has no relationship to the company at all. The
+ *     model had no instruction covering tides, so it did the natural thing and answered, then noticed
+ *     it was off-brief and appended a disclaimer.
+ */
+describe('a persona decides once rather than doing both', () => {
+  const personas: Array<[string, string]> = [
+    ['basic', BASIC_PERSONA],
+    ['standard', STANDARD_PERSONA],
+    ['premium', PREMIUM_PERSONA],
+  ];
+
+  it.each(personas)('%s forbids answering and declining in the same reply, in either order', (_n, persona) => {
+    expect(persona).toMatch(/DECIDE ONCE, THEN COMMIT/);
+    // The ordering must be named in BOTH directions, or the rule reads as covering only the one that
+    // was written down first - which is exactly how this shipped.
+    expect(persona).toMatch(/never both in one reply, in either order/i);
+  });
+
+  it.each(personas)('%s carries no scope rule of its own: scope comes from the intent pack', (_n, persona) => {
+    // The off-topic rule moved to the answering prompt, derived from the pack (`intentAnswerPrompt`):
+    // the pack lists what the assistant offers and the prompt says to decline anything else, briefly,
+    // and never answer it first. A persona that restated scope could contradict the pack - which is how
+    // a code request the pack offered was declined as "outside my lane".
+    expect(persona).not.toMatch(/nothing to do with Stratum or the platform/i);
+  });
+
+  // The ops assistant keeps the same three rules, so it is asserted here rather than in a parallel
+  // block. Its OFF-TOPIC rule points the other way and is checked in the ops describe below.
+  it.each([['ops', OPS_PERSONA]] as Array<[string, string]>)('%s keeps the decide-once rule', (_n, persona) => {
+    expect(persona).toMatch(/DECIDE ONCE, THEN COMMIT/);
+    expect(persona).toMatch(/never both in one reply, in either order/i);
+  });
+});
+
+describe('the off-topic rule rides the pack-derived prompt, for every assistant', () => {
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { intentAnswerPrompt } = require('../lambda/src/lib/intent-answer');
+  // eslint-disable-next-line @typescript-eslint/no-var-requires
+  const { DEFAULT_INTENT_PACK } = require('../lambda/src/lib/intent-pack');
+
+  it('declines what the pack does not offer, briefly, and never answers it first', () => {
+    const text = intentAnswerPrompt('general', DEFAULT_INTENT_PACK);
+    expect(text).toMatch(/not what you are here for/i);
+    expect(text).toMatch(/not an access problem/i);
+    expect(text).toMatch(/Do not answer it first/i);
+  });
+});
+
+/**
+ * THE `ops` ROLE'S PERSONA, which is the first persona in this tree that belongs to an ASSISTANT rather
+ * than to a classification.
+ *
+ * It has to be authored, and the absence was not cosmetic. `ops-premium` runs on premium's async
+ * processor, so with no persona of its own the resolution chain (version persona ->
+ * ASSISTANT_SYSTEM_PROMPT[_PARAM] -> `defaultPersonaFor(CLASSIFICATION)`) landed on premium's built-in
+ * tier prose - premium is `systemPromptParam: false`, so the middle step does not exist for it. An
+ * operations assistant was therefore introducing itself as a general premium-tier assistant.
+ *
+ * These assert the four things that make it an OPERATIONS persona rather than another business one: what
+ * it reads, what it must say when it cannot read it, that it reports rather than acts, and that its
+ * off-topic rule sends Stratum questions away instead of keeping them.
+ */
+describe('the ops persona', () => {
+  const p = OPS_PERSONA.toLowerCase();
+
+  it('fits the definition parameter it is seeded into', () => {
+    const def = serializeSeedDefinition('ops-premium', OPS_PERSONA);
+    expect(def).not.toBeNull();
+    expect((def as string).length).toBeLessThanOrEqual(SSM_STANDARD_TIER_MAX);
+  });
+
+  it('names the deployment it assesses and the telemetry it reads', () => {
+    expect(p).toContain('this deployment');
+    expect(p).toContain('cloudwatch');
+    // The four measurements the tool actually returns. A persona promising more than the read carries
+    // is what produces a confident answer about something nobody measured.
+    for (const metric of ['invocations', 'errors', 'throttles', 'duration']) {
+      expect(p).toContain(metric);
+    }
+  });
+
+  it('says an unavailable figure is said plainly, never estimated', () => {
+    expect(p).toContain('unavailable');
+    expect(p).toMatch(/never estimate/);
+  });
+
+  it('reports rather than acts, and says so', () => {
+    // Nothing below the prompt enforces this: the role's boundary grants READS, so an assistant that
+    // claims to have restarted something is not refused - it has just said something untrue.
+    expect(OPS_PERSONA).toMatch(/YOU REPORT, YOU DO NOT ACT/);
+    expect(p).toMatch(/restart/);
+  });
+
+  it('leaves its off-topic direction to its intent pack', () => {
+    // A Stratum business question is outside what the ops pack offers, so the pack-derived prompt
+    // declines it; a roommate that offers it is handed the question by the router.
+    expect(p).not.toContain("stratum's business - a revenue figure");
+  });
+
+  it('does not claim the business corpus the premium assistant reads', () => {
+    // A persona that offered financials would be promising material this assistant has no reason to
+    // load and every reason to leave to the advisor sitting in the same conversation.
+    expect(p).not.toMatch(/state the exact figure/);
+    expect(p).toContain('is not yours');
   });
 });

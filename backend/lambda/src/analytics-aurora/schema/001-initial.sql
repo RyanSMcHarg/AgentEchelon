@@ -91,6 +91,11 @@ CREATE TABLE IF NOT EXISTS messages (
     -- divergence is a fact about the container rather than prose in a doc. FALSE-by-absence: only a
     -- cold turn writes it, so a NULL is warm.
     cold_start BOOLEAN,
+    -- When the thing that CAUSED this turn happened, declared by the dispatcher that knows it: the
+    -- rival's completion for a battle rebuttal, the person's send for a post-processing repair. NULL
+    -- on an ordinary user turn, which anchors on its own user message instead. Never defaulted - an
+    -- invented instant reports the fastest possible reaction for the turns least understood.
+    trigger_at TIMESTAMPTZ,
     persistence VARCHAR(32) DEFAULT 'PERSISTENT',
     task_id VARCHAR(64),
     task_status VARCHAR(32),

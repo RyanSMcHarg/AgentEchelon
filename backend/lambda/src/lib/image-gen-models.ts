@@ -29,9 +29,11 @@
  * shaping functions + registry entries; nothing else changes.
  *
  * Pure shaping is unit-tested; `invokeImageGenModel` adds the Bedrock
- * `InvokeModel` call (retry on throttle/quota only — no cross-model
- * fallback by design: the two models are a head-to-head, not a
- * fallback pair). S3 persistence + IAM wiring are later bricks.
+ * `InvokeModel` call for ONE model (retry on throttle/quota only).
+ * `invokeImageGenWithFallback` serves an image ROUTE: the primary, then
+ * the route's fallback model once when the primary failed on the model
+ * side (`isImageGenFallbackEligible`). A content refusal or an
+ * input-validation error is final and is never routed to another model.
  */
 
 import {
@@ -39,18 +41,12 @@ import {
   InvokeModelCommand,
   type InvokeModelCommandInput,
 } from '@aws-sdk/client-bedrock-runtime';
-import {
-  SecretsManagerClient,
-  GetSecretValueCommand,
-} from '@aws-sdk/client-secrets-manager';
+import { SecretsManagerClient } from '@aws-sdk/client-secrets-manager';
+import { SecretUnavailable, readCachedSecret } from './secret-cache.js';
+import { sessionClient } from './assistant-session.js';
+import { imageModelsAllowedFor, type ImageGenModelKey } from '../../../lib/config/model-availability.js';
 
-export type ImageGenModelKey =
-  | 'titan_image'
-  | 'nova_canvas'
-  | 'stability_image_core'
-  | 'stability_image_ultra'
-  | 'openai_gpt_image_1'
-  | 'fal_flux_pro_1_1';
+export type { ImageGenModelKey };
 
 /**
  * Wire-format family the model expects. Adding a new family = adding
@@ -145,9 +141,11 @@ export interface ImageGenModelDef {
   /** Hard caps the shaper clamps to (cost guard; tightened in 4D). */
   maxImages: number;
   maxDimension: number;
+  /** What it is for: an image model serves only an intent that needs an image (`modelFits`). */
+  output: 'image';
 }
 
-export const IMAGE_GEN_MODELS: Record<ImageGenModelKey, ImageGenModelDef> = {
+const IMAGE_GEN_MODEL_ENTRIES: Record<ImageGenModelKey, Omit<ImageGenModelDef, 'output'>> = {
   titan_image: {
     key: 'titan_image',
     displayName: 'Amazon Titan Image G1 v2 (legacy)',
@@ -230,6 +228,45 @@ export const IMAGE_GEN_MODELS: Record<ImageGenModelKey, ImageGenModelDef> = {
   },
 };
 
+/** The image registry, each entry carrying its purpose. Which classifications use one is their own selection. */
+export const IMAGE_GEN_MODELS: Record<ImageGenModelKey, ImageGenModelDef> = Object.fromEntries(
+  (Object.entries(IMAGE_GEN_MODEL_ENTRIES) as Array<[ImageGenModelKey, Omit<ImageGenModelDef, 'output'>]>)
+    .map(([key, def]) => [key, { ...def, output: 'image' as const }]),
+) as Record<ImageGenModelKey, ImageGenModelDef>;
+
+/**
+ * THE BEDROCK IMAGE MODELS A CLASSIFICATION IS GRANTED, as foundation-model ARNs, derived from the same
+ * selection the write path and the resolver read (`models` on its registry entry). A classification allowed none gets no
+ * image grant, no image guardrail and no image edge (`assistant-profile-stack.ts`).
+ */
+export function imageModelArnsForClassification(classification: string): Record<string, string> {
+  return Object.fromEntries(Object.values(IMAGE_GEN_MODELS)
+    .filter((m) => m.hosting === 'aws-bedrock' && imageModelsAllowedFor(classification).includes(m.key))
+    .map((m) => [m.key, `arn:aws:bedrock:*::foundation-model/${m.bedrockModelId}`]));
+}
+
+/**
+ * THE PROVIDER KEYS A CLASSIFICATION HOLDS: the `authEnvVar` of each image model hosted outside AWS that it
+ * selects, and no other. The stack sets these as `IMAGE_GEN_KEY_FIELDS` on the processor, and the processor
+ * reads only these fields of the shared key secret into its environment (`imageGenKeysFromSecret`).
+ */
+export function externalImageKeyFieldsFor(classification: string): string[] {
+  return [...new Set(Object.values(IMAGE_GEN_MODELS)
+    .filter((m) => m.hosting === 'external-http' && m.authEnvVar && imageModelsAllowedFor(classification).includes(m.key))
+    .map((m) => m.authEnvVar as string))].sort();
+}
+
+/**
+ * The fields of the parsed key secret this processor may read: those named in `fields` (the comma list the stack
+ * sets as `IMAGE_GEN_KEY_FIELDS`), each a non-empty string. No list reads nothing, so a secret that holds every
+ * provider's key puts only the selected providers' keys into a classification's environment.
+ */
+export function imageGenKeysFromSecret(parsed: Record<string, unknown>, fields: string | undefined): Record<string, string> {
+  const allowed = new Set((fields ?? '').split(',').map((f) => f.trim()).filter(Boolean));
+  return Object.fromEntries(Object.entries(parsed)
+    .filter((e): e is [string, string] => allowed.has(e[0]) && typeof e[1] === 'string' && !!e[1]));
+}
+
 /** APPROXIMATE USD per generated image, keyed by model. Reasonable
  *  defaults a deployer reviews against current Bedrock pricing (same
  *  honesty contract as MODEL_RATE_TABLE — edit in one place). */
@@ -299,9 +336,9 @@ export interface ImageGenRequestOptions {
   seed?: number;
   /**
    * Phase-4D deployer cost cap (per-battle count guard). Only ever
-   * *lowers* the effective ceiling — `min(registry, cap)`. A cap above
+   * *lowers* the effective maximum — `min(registry, cap)`. A cap above
    * the per-model registry hard cap is ignored (a deployer fat-finger
-   * can never raise cost past the model's safe ceiling). Absent ⇒
+   * can never raise cost past the model's safe maximum). Absent ⇒
    * registry behavior unchanged. The processor sources these from
    * `BATTLE_IMAGE_MAX_IMAGES` / `BATTLE_IMAGE_MAX_DIMENSION`.
    */
@@ -331,9 +368,9 @@ export function shapeImageGenRequest(
   const def = IMAGE_GEN_MODELS[key];
 
   // Deployer cap only ever lowers the registry hard cap (cost-safety:
-  // an out-of-range / above-registry cap can never raise the ceiling).
-  const effMaxImages = capCeiling(def.maxImages, opts.maxImagesCap, 1);
-  const effMaxDim = capCeiling(def.maxDimension, opts.maxDimensionCap, 256);
+  // an out-of-range / above-registry cap can never raise the maximum).
+  const effMaxImages = limitByCap(def.maxImages, opts.maxImagesCap, 1);
+  const effMaxDim = limitByCap(def.maxDimension, opts.maxDimensionCap, 256);
 
   const count = clampInt(opts.count ?? 1, 1, effMaxImages);
   // Bedrock image dims must be multiples of 64.
@@ -405,7 +442,7 @@ export function shapeImageGenRequest(
 
 /**
  * Pure. Extract base64 PNG strings from an image-gen response.
- * Recognises the four current shapes:
+ * Recognizes the four current shapes:
  *
  *   - Titan family:    `{ images: ["base64", ...] }`
  *   - Stability family: `{ images: ["base64", ...], finish_reasons:
@@ -418,7 +455,7 @@ export function shapeImageGenRequest(
  *                       inline data: URL or a hosted https: URL; we
  *                       strip the data: prefix and pass through.
  *
- * Returns [] on any unrecognised shape (caller treats empty as a
+ * Returns [] on any unrecognized shape (caller treats empty as a
  * generation failure, never a fabricated image).
  *
  * For provider-specific behavior the caller can pass `providerHint`;
@@ -485,13 +522,13 @@ function clampInt(n: number, lo: number, hi: number): number {
 }
 
 /**
- * Phase-4D deployer cost cap. The effective ceiling is the registry
+ * Phase-4D deployer cost cap. The effective maximum is the registry
  * hard cap, optionally *lowered* by a deployer cap. A missing/invalid
  * cap, or one ≥ the registry cap, leaves the registry cap intact (a
  * fat-fingered or hostile value can never raise cost); a cap below the
  * safe `floor` is pinned to the floor.
  */
-function capCeiling(registry: number, cap: number | undefined, floor: number): number {
+function limitByCap(registry: number, cap: number | undefined, floor: number): number {
   if (cap == null || !Number.isFinite(cap)) return registry;
   const c = Math.floor(cap);
   if (c < floor) return floor;
@@ -524,7 +561,8 @@ export interface ImageGenInvokeOptions extends ImageGenRequestOptions {
    */
   guardrailIdentifier?: string;
   guardrailVersion?: string;
-  /** Throttle/quota retry budget (default 2). NO cross-model fallback. */
+  /** Throttle/quota retry budget (default 2), for this one model. A route's fallback model is
+   *  `invokeImageGenWithFallback`'s concern. */
   maxRetries?: number;
   /** Backoff base in ms (default 200 → 200ms, 800ms). Pass 0 in tests. */
   baseDelayMs?: number;
@@ -533,9 +571,10 @@ export interface ImageGenInvokeOptions extends ImageGenRequestOptions {
    * are slow by design; a *hung* one is the long-running cost vector —
    * with no SDK timeout it would burn Lambda billed-seconds up to the
    * caller's Lambda timeout. At this bound the call is aborted and
-   * FAILS FAST: never retried (retrying a timeout only spends more
-   * Lambda + Bedrock) and never falls back. Keep it under the caller
-   * Lambda's timeout so the failure can still be delivered. Distinct
+   * FAILS FAST: never retried on the same model (retrying a timeout only
+   * spends more Lambda + Bedrock); a route with a fallback tries that
+   * model once. Keep the route's total (primary plus fallback) under the
+   * caller Lambda's timeout so the failure can still be delivered. Distinct
    * from the per-image count/dimension caps (those cap spend per call;
    * this caps time).
    */
@@ -624,7 +663,7 @@ function defaultSendClient(def?: ImageGenModelDef): ImageGenSendClient {
   const region = imageGenRegionFor(def);
   let c = _clients.get(region);
   if (!c) {
-    c = new BedrockRuntimeClient({ region });
+    c = sessionClient(BedrockRuntimeClient, { region });
     _clients.set(region, c);
   }
   const client = c;
@@ -634,7 +673,7 @@ function defaultSendClient(def?: ImageGenModelDef): ImageGenSendClient {
   };
 }
 
-/** Throttle/quota only — the sole retryable class (no fallback by design). */
+/** Throttle/quota only — the sole class retried on the SAME model. */
 function isThrottle(error: unknown): boolean {
   const name = (error as { name?: string })?.name || '';
   const code = (error as { $metadata?: { httpStatusCode?: number } })?.$metadata?.httpStatusCode;
@@ -654,6 +693,46 @@ function isLegacyLockoutError(error: unknown): boolean {
   return name === 'ResourceNotFoundException' || name === 'AccessDeniedException';
 }
 
+/**
+ * The failures that belong to the MODEL, not to the request: the model is unavailable or not
+ * accessible to this account, the service failed, the model failed or did not answer in time, or
+ * throttling outlasted the retry budget. An image route's fallback serves exactly these.
+ *
+ * Everything else is final, by name: a `ValidationException` (a malformed request, and also how
+ * Bedrock reports a prompt its content filters blocked), a guardrail intervention (returned as a
+ * result, not thrown), an external provider's 400/422 (its content-policy refusal), and the local
+ * shaper's refusals (unknown model, empty prompt). Another model must never be asked to answer a
+ * prompt the first one refused.
+ */
+const MODEL_SIDE_ERROR_NAMES: ReadonlySet<string> = new Set([
+  'ResourceNotFoundException',
+  'AccessDeniedException',
+  'ModelNotReadyException',
+  'ModelTimeoutException',
+  'ModelErrorException',
+  'ServiceUnavailableException',
+  'InternalServerException',
+  'ThrottlingException',
+  'ServiceQuotaExceededException',
+]);
+
+/** Marks an error this module raises for a model-side failure (a timeout, a provider not configured). */
+function modelSideError(message: string): Error {
+  return Object.assign(new Error(message), { imageGenModelSide: true });
+}
+
+/** True when an image route may try its fallback model after this error (see {@link MODEL_SIDE_ERROR_NAMES}). */
+export function isImageGenFallbackEligible(error: unknown): boolean {
+  for (let e: unknown = error, depth = 0; e && depth < 3; e = (e as { cause?: unknown }).cause, depth++) {
+    if ((e as { imageGenModelSide?: boolean }).imageGenModelSide) return true;
+    const name = (e as { name?: string }).name || '';
+    if (MODEL_SIDE_ERROR_NAMES.has(name)) return true;
+    const code = (e as { $metadata?: { httpStatusCode?: number } }).$metadata?.httpStatusCode;
+    if (code === 429 || (typeof code === 'number' && code >= 500)) return true;
+  }
+  return false;
+}
+
 /** Uint8Array JSON → object; {} on absent/undecodable body (never throws). */
 function decodeImageGenBody(body: Uint8Array | undefined): Record<string, unknown> {
   if (!body) return {};
@@ -671,8 +750,8 @@ function decodeImageGenBody(body: Uint8Array | undefined): Record<string, unknow
  * Fails fast/local on an unknown model or empty prompt (shaper throws
  * before any network call). Retries throttle/quota with exponential
  * backoff (200ms, 800ms; `maxRetries` default 2); access/validation/
- * model errors fail fast with no retry and — by locked design — no
- * cross-model fallback (the two image models are a head-to-head). A
+ * model errors fail fast with no retry. This invokes ONE model; an
+ * image route's fallback model is `invokeImageGenWithFallback`. A
  * slow/hung call is aborted at `requestTimeoutMs` (default 60s) and
  * also fails fast — the cost guard for the long-running vector. The
  * returned `images` is honest: [] on a generation failure or a
@@ -712,7 +791,8 @@ const EXTERNAL_HTTP_ENDPOINTS: Record<'openai' | 'fal', {
  * Hydrate external-provider API keys from Secrets Manager into
  * `process.env`, once per warm container. When `IMAGE_GEN_KEYS_SECRET_ARN`
  * is set, the secret is a JSON object keyed by env-var name (e.g.
- * `{ "FAL_KEY": "...", "OPENAI_API_KEY": "..." }`); each key is copied to
+ * `{ "FAL_KEY": "...", "OPENAI_API_KEY": "..." }`); each key named in
+ * `IMAGE_GEN_KEY_FIELDS` (the selected providers') is copied to
  * `process.env` ONLY if not already present, so a real env var still wins
  * and local/test overrides work. No-op (and never throws) when the secret
  * isn't configured — the caller then falls back to a plain env var and, if
@@ -731,20 +811,20 @@ async function hydrateImageGenKeysFromSecret(): Promise<void> {
     _imageGenKeysHydrated = (async () => {
       try {
         if (!_secretsClient) {
-          _secretsClient = new SecretsManagerClient({
+          _secretsClient = sessionClient(SecretsManagerClient, {
             region: process.env.AWS_REGION || 'us-east-1',
           });
         }
-        const out = await _secretsClient.send(
-          new GetSecretValueCommand({ SecretId: secretId }),
-        );
-        const raw = out.SecretString;
+        // Through the shared five-minute cache (`lib/secret-cache.ts`); an empty secret reads as nothing.
+        const raw = await readCachedSecret({ secretId }, { secrets: _secretsClient }).catch((err) => {
+          if (err instanceof SecretUnavailable && err.reason === 'empty') return '';
+          throw err;
+        });
         if (!raw) return;
         const parsed = JSON.parse(raw) as Record<string, unknown>;
-        for (const [k, v] of Object.entries(parsed)) {
-          if (typeof v === 'string' && v && process.env[k] == null) {
-            process.env[k] = v;
-          }
+        // Only the selected providers' fields: the secret may hold every provider's key.
+        for (const [k, v] of Object.entries(imageGenKeysFromSecret(parsed, process.env.IMAGE_GEN_KEY_FIELDS))) {
+          if (process.env[k] == null) process.env[k] = v;
         }
       } catch (err) {
         // Best-effort: a fetch/parse failure must not mask the clear
@@ -778,7 +858,7 @@ async function invokeExternalHttp(
   const envVar = def.authEnvVar;
   const apiKey = envVar ? process.env[envVar] : undefined;
   if (!apiKey) {
-    throw new Error(
+    throw modelSideError(
       `invokeImageGenModel: model "${def.bedrockModelId}" requires the ` +
       `${envVar ?? '(unknown)'} env var on the Lambda. Set it to enable ` +
       `this provider, or pick a different active model from the registry.`,
@@ -823,9 +903,10 @@ async function invokeExternalHttp(
           });
         }
         const text = await res.text().catch(() => '');
-        throw new Error(
-          `invokeImageGenModel: ${def.provider} returned HTTP ${res.status}: ${text.slice(0, 500)}`,
-        );
+        const message = `invokeImageGenModel: ${def.provider} returned HTTP ${res.status}: ${text.slice(0, 500)}`;
+        // 401/403/404 say the model is not accessible or not there; any other 4xx is about the request
+        // itself (a 400/422 is how these providers refuse a prompt on content policy).
+        throw [401, 403, 404].includes(res.status) ? modelSideError(message) : new Error(message);
       }
 
       const parsed = (await res.json()) as Record<string, unknown>;
@@ -840,7 +921,7 @@ async function invokeExternalHttp(
       };
     } catch (error) {
       if (timedOut) {
-        throw new Error(`invokeImageGenModel: timed out after ${requestTimeoutMs}ms`);
+        throw modelSideError(`invokeImageGenModel: timed out after ${requestTimeoutMs}ms`);
       }
       lastError = error;
       if (!isThrottle(error) || attempt >= maxRetries) {
@@ -918,14 +999,16 @@ export async function invokeImageGenModel(
         modelId,
       };
     } catch (error) {
-      // The long-running cost vector: abort and FAIL FAST — no retry,
-      // no fallback — so a hung call cannot spend more Lambda/Bedrock.
+      // The long-running cost vector: abort and FAIL FAST with no retry
+      // on this model, so a hung call cannot spend more Lambda/Bedrock.
+      // A route with a fallback tries that model once.
       if (timedOut) {
-        throw new Error(`invokeImageGenModel: timed out after ${requestTimeoutMs}ms`);
+        throw modelSideError(`invokeImageGenModel: timed out after ${requestTimeoutMs}ms`);
       }
       lastError = error;
-      // Only throttle/quota is retryable; everything else (access,
-      // validation, model error) fails fast with no fallback.
+      // Only throttle/quota is retried on this model; everything else
+      // (access, validation, model error) fails fast. Which of those a
+      // route's fallback serves is `isImageGenFallbackEligible`.
       if (!isThrottle(error) || attempt >= maxRetries) {
         // ROADMAP P1.4: when a legacy model returns NotFound/AccessDenied,
         // wrap the SDK error with deployer-actionable context. AWS's
@@ -956,4 +1039,76 @@ export async function invokeImageGenModel(
     }
   }
   throw lastError;
+}
+
+/** The result of an image ROUTE: the model that answered, and whether it was the route's fallback. */
+export interface ImageGenRouteResult extends ImageGenInvokeResult {
+  /** True when the primary failed on the model side and the fallback model produced this result. */
+  wasFallback: boolean;
+  /** The primary's failure, when the fallback answered in its place. */
+  primaryError?: string;
+}
+
+/**
+ * Serve an image ROUTE: the primary model, then the route's fallback model ONCE when the primary failed on
+ * the model side ({@link isImageGenFallbackEligible}). The image counterpart of the text path's
+ * `invokeBedrockWithFallback`.
+ *
+ * - A content refusal is final: a guardrail intervention or an empty result is returned as the answer,
+ *   and a refusal thrown as a `ValidationException` or a provider's 400 is rethrown. Another model is
+ *   never asked to answer a prompt the first one refused.
+ * - `optionsFor` supplies each model's invoke options (its guardrail lives in that model's region), and is
+ *   the one place a model's guardrail is resolved. It returns undefined when the model cannot be called
+ *   safely (no guardrail in its region): for the primary the route is refused, naming that region, and
+ *   nothing is generated; for the fallback the route ends on the primary's error rather than run unguarded.
+ * - The fallback runs only in the time the caller has left: with `remainingMs` given, it is tried only when
+ *   what remains covers its own timeout (`requestTimeoutMs`, default 60s) plus `replyMarginMs` to post the
+ *   reply. Otherwise the route ends on the primary's error, and `onFallbackSkipped` names the reason.
+ * - The result's `modelId` is the model that produced the image, so the turn records the right model.
+ */
+export async function invokeImageGenWithFallback(args: {
+  primaryModelId: string;
+  /** The route's fallback model id; absent or equal to the primary ⇒ the primary's outcome is final. */
+  fallbackModelId?: string;
+  prompt: string;
+  optionsFor: (modelId: string) => ImageGenInvokeOptions | undefined;
+  /** Called once when the fallback is about to run, for the turn's log. */
+  onFallback?: (info: { primaryModelId: string; fallbackModelId: string; error: string }) => void;
+  /** The caller's remaining time in ms (a Lambda's `getRemainingTimeInMillis`). Absent ⇒ no deadline is applied. */
+  remainingMs?: () => number;
+  /** Time kept back after the fallback for posting the reply (default 5000ms). */
+  replyMarginMs?: number;
+  /** Called when an eligible fallback is not tried, with the reason, for the turn's log. */
+  onFallbackSkipped?: (info: { primaryModelId: string; fallbackModelId: string; error: string; reason: string }) => void;
+  /** Injectable for tests; defaults to {@link invokeImageGenModel}. */
+  invoke?: typeof invokeImageGenModel;
+}): Promise<ImageGenRouteResult> {
+  const invoke = args.invoke ?? invokeImageGenModel;
+  const primaryOpts = args.optionsFor(args.primaryModelId);
+  if (!primaryOpts) {
+    const key = imageGenModelIdToKey(args.primaryModelId);
+    throw new Error(`image generation blocked: no content guardrail available in ${imageGenRegionFor(key ? IMAGE_GEN_MODELS[key] : undefined)}`);
+  }
+  try {
+    return { ...(await invoke(args.primaryModelId, args.prompt, primaryOpts)), wasFallback: false };
+  } catch (error) {
+    const fallback = args.fallbackModelId;
+    if (!fallback || fallback === args.primaryModelId || !isImageGenFallbackEligible(error)) throw error;
+    const fallbackOpts = args.optionsFor(fallback);
+    if (!fallbackOpts) throw error;
+    const message = error instanceof Error ? error.message : String(error);
+    if (args.remainingMs) {
+      const needed = (fallbackOpts.requestTimeoutMs ?? 60_000) + (args.replyMarginMs ?? 5_000);
+      const left = args.remainingMs();
+      if (left < needed) {
+        args.onFallbackSkipped?.({
+          primaryModelId: args.primaryModelId, fallbackModelId: fallback, error: message,
+          reason: `${left}ms remain and the fallback needs ${needed}ms (its timeout plus the reply margin)`,
+        });
+        throw error;
+      }
+    }
+    args.onFallback?.({ primaryModelId: args.primaryModelId, fallbackModelId: fallback, error: message });
+    return { ...(await invoke(fallback, args.prompt, fallbackOpts)), wasFallback: true, primaryError: message };
+  }
 }

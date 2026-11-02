@@ -27,8 +27,7 @@
  *
  * WHAT IT DOES NOT PROVE, stated because the gap matters more than the check: that a non-owner is
  * actually refused. That path cannot fire until a duel can reach WAITING_FOR_USER again. The refusal
- * itself is covered by unit tests at the flow seam (backend/test/lib/battle-owner-enforced-live.test.ts),
- * with the real decision function rather than a mock of it.
+ * itself is covered by unit tests on the handler's resume (backend/test/task-shaped-battle-parity.test.ts).
  *
  * Usage:
  *   AWS_PROFILE=<p> node backend/scripts/verify-battle-owner.mjs [--since-minutes 30]
@@ -37,13 +36,16 @@ import { DynamoDBClient, ScanCommand } from '@aws-sdk/client-dynamodb';
 import { CloudFormationClient, DescribeStacksCommand } from '@aws-sdk/client-cloudformation';
 import { LambdaClient, GetFunctionConfigurationCommand } from '@aws-sdk/client-lambda';
 import { SSMClient, GetParameterCommand } from '@aws-sdk/client-ssm';
+import { createRequire } from 'node:module';
+
+const { resolveInstanceName } = createRequire(import.meta.url)('./lib/stack-lookup.cjs');
 
 const region = process.env.AWS_REGION || 'us-east-1';
 const args = process.argv.slice(2);
 const sinceIdx = args.indexOf('--since-minutes');
 const sinceMinutes = sinceIdx !== -1 ? Number(args[sinceIdx + 1]) : 60;
 
-const instance = process.env.E2E_INSTANCE_NAME || process.env.AE_INSTANCE_NAME || 'agent-echelon';
+const instance = resolveInstanceName(process.env);
 const stackPrefix = instance.split(/[-_]/).filter(Boolean)
   .map((p) => p[0].toUpperCase() + p.slice(1)).join('');
 

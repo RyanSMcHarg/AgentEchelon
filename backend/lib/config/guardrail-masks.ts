@@ -39,3 +39,27 @@ export function guardrailMaskToken(filterName: string): string {
 export const GUARDRAIL_MASK_TOKEN_PATTERNS: RegExp[] = INTERNAL_MARKER_MASK_FILTER_NAMES.map(
   (name) => new RegExp(guardrailMaskToken(name).replace(/[.*+?^${}()|[\]\\]/g, '\\$&'), 'g'),
 );
+
+/**
+ * The label a guardrail finding id carries for `filterName`, slugged exactly as the runtime slugs it.
+ *
+ * DECLARED HERE BECAUSE TWO SIDES MUST AGREE ON IT. `summarizeGuardrailFindings` builds the finding id
+ * `guardrail.<side>.<policy>.<label>`, and the compliance rule set has to name the same label to
+ * exclude an internal-marker mask from a sensitive-information breach. Two copies of one slug rule is
+ * how the exclusion silently stops matching the day a filter is renamed.
+ */
+export function guardrailFindingLabel(filterName: string): string {
+  return String(filterName).toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '').slice(0, 48);
+}
+
+/**
+ * The finding ids an internal-marker mask produces on the OUTPUT side.
+ *
+ * These look exactly like a sensitive-information disclosure - the filter is declared in the PII
+ * policy, because that is where Bedrock puts regex filters - but they are the platform masking its
+ * OWN control markers out of a reply. Counting one as a compliance breach flags the assistant for the
+ * scaffolding the platform wrapped around it.
+ */
+export const INTERNAL_MARKER_FINDING_IDS: readonly string[] = INTERNAL_MARKER_MASK_FILTER_NAMES.map(
+  (name) => `guardrail.output.pii.${guardrailFindingLabel(name)}`,
+);
